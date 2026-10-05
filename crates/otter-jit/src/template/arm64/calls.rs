@@ -1227,6 +1227,7 @@ pub(super) fn emit_tail_call(
     threw: DynamicLabel,
     throw_value: DynamicLabel,
     fatal: DynamicLabel,
+    saved_pairs: u8,
 ) -> Result<(), Unsupported> {
     use crate::arm64::js_call::CallTarget;
     let start = ops.offset().0;
@@ -1261,6 +1262,7 @@ pub(super) fn emit_tail_call(
                 function_id: plan.function_id,
             },
             outgrown,
+            saved_pairs,
         )?;
         dynasm!(ops ; .arch aarch64 ; =>generic);
     }
@@ -1279,6 +1281,7 @@ pub(super) fn emit_tail_call(
             argument_registers,
             CallTarget::Native,
             outgrown,
+            saved_pairs,
         )?;
         dynasm!(ops ; .arch aarch64 ; =>generic);
     }
@@ -1290,6 +1293,7 @@ pub(super) fn emit_tail_call(
         argument_registers,
         CallTarget::Generic,
         outgrown,
+        saved_pairs,
     )?;
     dynasm!(ops ; .arch aarch64 ; =>outgrown);
     let mut words = vec![PacketWord::Register(callee)];
@@ -1305,7 +1309,7 @@ pub(super) fn emit_tail_call(
         throw_value,
         fatal,
     )?;
-    crate::arm64::frame::emit_tail_return(ops);
+    crate::arm64::frame::emit_tail_return(ops, saved_pairs);
     if let Some(code_map) = code_map {
         code_map.record(CodeRegion::call_structural(
             "tailCall",
@@ -1352,6 +1356,7 @@ fn emit_tail_path(
     argument_registers: &[u16],
     target: crate::arm64::js_call::CallTarget,
     outgrown: DynamicLabel,
+    saved_pairs: u8,
 ) -> Result<(), Unsupported> {
     let bytes = crate::call_linkage::pushed_argument_bytes(argument_registers.len())?;
     crate::arm64::frame::emit_tail_span_check(ops, bytes / 8, outgrown);
@@ -1366,7 +1371,7 @@ fn emit_tail_path(
     emit_load_reg(ops, 13, callee)?;
     let count = u32::try_from(argument_registers.len())
         .map_err(|_| Unsupported::OperandShape("tail call actual count"))?;
-    crate::arm64::frame::emit_tail_transfer(ops, relocations, table, bytes, count, target);
+    crate::arm64::frame::emit_tail_transfer(ops, relocations, table, bytes, count, target, saved_pairs);
     Ok(())
 }
 

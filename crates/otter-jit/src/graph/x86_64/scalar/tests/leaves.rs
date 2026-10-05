@@ -148,6 +148,7 @@ fn fixture(kind: Kind) -> crate::CompiledCode {
             bytes: slots.bytes(),
             scratch_slot: Some(slots.spill_tagged),
             safepoint: FIRST_SITE_SAFEPOINT,
+        saved_pairs: 0,
         },
         transitions: &transitions,
         deopt_runtime: 0,

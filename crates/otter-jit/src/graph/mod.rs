@@ -9,6 +9,7 @@
 //!   into the graph.
 //! - [`feedback`] — the snapshot's per-site feedback as speculation.
 //! - [`phi_repr`] — unboxed int32 phis.
+//! - [`truncation`] — wrapping int32 additions under truncating uses.
 //! - [`licm`] — loop-invariant checks and loads run once before their loop.
 //! - [`regalloc`] — live intervals, canonical homes and register assignment.
 //! - [`registers`] — backend-supplied physical ownership and fixed call words.
@@ -58,6 +59,7 @@ mod native_leaf;
 pub(crate) mod phi_repr;
 pub(crate) mod regalloc;
 pub(crate) mod registers;
+pub(crate) mod truncation;
 #[cfg(target_arch = "x86_64")]
 pub(crate) mod x86_64;
 
@@ -126,6 +128,14 @@ pub(crate) fn compile(
     let mut built = builder::build(view, &analysis, &baseline, osr_pc)
         .map_err(|_| Unsupported::OperandShape("graph construction"))?;
     phi_repr::untag_phis(&mut built.graph, &built.layout, &built.loop_headers);
+    // An untagged loop phi whose back edge carried only its own retagged
+    // value merges one entry value; drop it before liveness sees it.
+    builder::remove_trivial_phis(&mut built.graph, &built.layout);
+    for header in &mut built.loop_headers {
+        let phis = &built.graph.block(header.block).phis;
+        header.phis.retain(|(_, phi)| phis.contains(phi));
+    }
+    truncation::wrap_truncated_arithmetic(&mut built.graph, &built.layout);
     licm::hoist_invariants(&mut built.graph, &mut built.layout, &built.loop_headers);
     allocation_groups::fold(&mut built.graph, &built.layout, view, &built.inline_views);
     #[cfg(target_arch = "aarch64")]

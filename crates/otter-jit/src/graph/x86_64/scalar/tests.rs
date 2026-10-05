@@ -76,7 +76,7 @@ fn checked_integer_results_commit_after_overflow_and_negative_zero_guards() {
                         7,
                         constant.map_or(Int32Operand::Register(6), Int32Operand::Constant),
                         dst,
-                        exits.overflow,
+                        Some(exits.overflow),
                     );
                 });
                 for a in values {

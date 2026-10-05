@@ -237,6 +237,7 @@ pub(crate) fn emit(
         bytes: slots.bytes(),
         scratch_slot: Some(slots.spill_tagged),
         safepoint: FIRST_SITE_SAFEPOINT,
+        saved_pairs: crate::frame::SpillArea::saved_pairs_for(allocation.used_gp()),
     };
     // A body that never runs a baseline operation on the window leaves it
     // to the exits that rebuild the interpreter frame.
@@ -885,6 +886,34 @@ impl<'a> Codegen<'a> {
                     }
                 } else {
                     self.emit_to_boolean(node, value, destination, negate);
+                }
+            }
+            Kind::Int32AddWrapping | Kind::Int32SubWrapping => {
+                let a = Self::gp(input(0));
+                let operand = self.int32_operand(input(1));
+                let destination = Self::gp(result.expect("a result"));
+                let add = data.kind == Kind::Int32AddWrapping;
+                match operand {
+                    Int32Operand::Constant(value) if (-4095..=4095).contains(&value) => {
+                        let (add, magnitude) = if value < 0 {
+                            (!add, (-value) as u32)
+                        } else {
+                            (add, value as u32)
+                        };
+                        if add {
+                            dynasm!(self.ops ; .arch aarch64 ; add WSP(destination), WSP(a), magnitude);
+                        } else {
+                            dynasm!(self.ops ; .arch aarch64 ; sub WSP(destination), WSP(a), magnitude);
+                        }
+                    }
+                    other => {
+                        let b = self.int32_register(other);
+                        if add {
+                            dynasm!(self.ops ; .arch aarch64 ; add W(destination), W(a), W(b));
+                        } else {
+                            dynasm!(self.ops ; .arch aarch64 ; sub W(destination), W(a), W(b));
+                        }
+                    }
                 }
             }
             Kind::Int32Add | Kind::Int32Sub => {
@@ -3791,6 +3820,7 @@ impl<'a> Codegen<'a> {
                     coercion_slow_paths: &mut coercion_slow_paths,
                     direct_call_events: &mut self.no_direct_call_events,
                     code_map: &mut self.no_code_map,
+                    saved_pairs: self.spill.saved_pairs,
                 },
                 &self.plan.instructions[position],
                 false,

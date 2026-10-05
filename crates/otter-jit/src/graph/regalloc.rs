@@ -134,6 +134,56 @@ impl Allocation {
         &self.nodes[id.0 as usize]
     }
 
+    /// Every general register any node, move or edge names, as a bit mask.
+    pub(crate) fn used_gp(&self) -> u32 {
+        fn mark(mask: &mut u32, location: Location) {
+            if let Location::Gp(register) = location {
+                *mask |= 1 << register;
+            }
+        }
+        let mut mask = 0;
+        for node in &self.nodes {
+            for &location in node
+                .inputs
+                .iter()
+                .chain(node.result.iter())
+                .chain(&node.eager)
+                .chain(&node.lazy)
+            {
+                mark(&mut mask, location);
+            }
+            for &register in &node.gp_temps {
+                mask |= 1 << register;
+            }
+            for movement in node
+                .moves
+                .iter()
+                .chain(&node.eager_spills)
+                .chain(&node.lazy_spills)
+            {
+                mark(&mut mask, movement.from);
+                mark(&mut mask, movement.to);
+            }
+            for &(location, _) in &node.live_registers {
+                mark(&mut mask, location);
+            }
+            for &(register, home) in &node.live_homes {
+                mark(&mut mask, register);
+                mark(&mut mask, home);
+            }
+        }
+        for edge in self.edges.values() {
+            for movement in &edge.moves {
+                mark(&mut mask, movement.from);
+                mark(&mut mask, movement.to);
+            }
+            for &(_, location) in &edge.phi_inputs {
+                mark(&mut mask, location);
+            }
+        }
+        mask
+    }
+
     /// Tagged homes a finalized cold reconstruction recipe reads, ascending.
     /// Native SSA execution is abandoned at this boundary, so its future
     /// reads keep no home alive. Recipes already contain every frame of an

@@ -128,6 +128,7 @@ pub(crate) fn emit(
         bytes: slots.bytes(),
         scratch_slot: Some(slots.spill_tagged),
         safepoint: FIRST_SITE_SAFEPOINT,
+        saved_pairs: 0,
     };
     let lazy_window = !built
         .graph

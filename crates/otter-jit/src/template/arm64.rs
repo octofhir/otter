@@ -435,6 +435,7 @@ fn compile_with_reach(
                 shared_property: &mut shared_property,
                 direct_call_events: &mut direct_call_events,
                 code_map: &mut code_map,
+                saved_pairs: 0,
             },
             instr,
             canonical_boolean_branch,
@@ -886,6 +887,9 @@ pub(crate) struct OperationContext<'c, 'a> {
     pub(crate) shared_property: &'c mut shared_property::SharedPropertyProbes,
     pub(crate) direct_call_events: &'c mut Option<super::DirectCallEvents>,
     pub(crate) code_map: &'c mut Option<CodeMapCapture>,
+    /// Callee-saved pairs the enclosing body saved; a tail transfer that
+    /// releases the frame restores them.
+    pub(crate) saved_pairs: u8,
 }
 
 /// Emit one planned template operation over the register window.
@@ -919,6 +923,7 @@ pub(crate) fn emit_operation<'a>(
         shared_property,
         direct_call_events,
         code_map,
+        saved_pairs,
     } = context;
     let mut call_source = crate::return_sites::ReturnSiteRecorder {
         entries: return_sites,
@@ -1607,6 +1612,7 @@ pub(crate) fn emit_operation<'a>(
                 threw,
                 committed_throw,
                 fatal,
+                saved_pairs,
             )?;
         }
         TemplateOp::CallWithThis {

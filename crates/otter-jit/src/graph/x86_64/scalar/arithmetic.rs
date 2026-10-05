@@ -27,7 +27,15 @@ impl Codegen<'_> {
                     Self::gp(self.loc(node).result.unwrap()),
                 );
                 let overflow = self.eager_exit(node, DeoptReason::Overflow);
-                emit_add_sub(&mut self.ops, kind == Kind::Int32Add, a, b, dst, overflow);
+                emit_add_sub(&mut self.ops, kind == Kind::Int32Add, a, b, dst, Some(overflow));
+            }
+            Kind::Int32AddWrapping | Kind::Int32SubWrapping => {
+                let (a, b, dst) = (
+                    Self::gp(self.loc(node).inputs[0]),
+                    self.scalar_int32_operand(self.loc(node).inputs[1]),
+                    Self::gp(self.loc(node).result.unwrap()),
+                );
+                emit_add_sub(&mut self.ops, kind == Kind::Int32AddWrapping, a, b, dst, None);
             }
             Kind::Int32Mul => {
                 let (a, b, dst) = self.scalar_gp_binary(node);
@@ -181,7 +189,7 @@ pub(super) fn emit_add_sub(
     a: u8,
     b: Int32Operand,
     dst: u8,
-    overflow: DynamicLabel,
+    overflow: Option<DynamicLabel>,
 ) {
     dynasm!(ops ; .arch x64 ; mov r10d, Rd(a));
     match (add, b) {
@@ -190,7 +198,10 @@ pub(super) fn emit_add_sub(
         (true, Int32Operand::Constant(b)) => dynasm!(ops ; .arch x64 ; add r10d, DWORD b),
         (false, Int32Operand::Constant(b)) => dynasm!(ops ; .arch x64 ; sub r10d, DWORD b),
     }
-    dynasm!(ops ; .arch x64 ; jo =>overflow ; mov Rd(dst), r10d);
+    if let Some(overflow) = overflow {
+        dynasm!(ops ; .arch x64 ; jo =>overflow);
+    }
+    dynasm!(ops ; .arch x64 ; mov Rd(dst), r10d);
 }
 
 pub(super) fn emit_mul(

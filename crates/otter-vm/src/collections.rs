@@ -91,8 +91,9 @@ pub enum MapKey {
     Number(f64),
     /// BigInt — compared by exact value.
     BigInt(crate::bigint::BigIntValue),
-    /// Strings compare by code-unit content.
-    String(JsString),
+    /// Strings compare by code-unit content; the second field is their
+    /// content hash.
+    String(JsString, u32),
     /// Symbols compare by handle identity.
     Symbol(JsSymbol),
     /// The original [`Value`] for the object key — kept so iteration
@@ -125,7 +126,7 @@ impl MapKey {
         } else if let Some(b) = value.as_big_int() {
             MapKey::BigInt(b)
         } else if let Some(s) = value.as_string(heap) {
-            MapKey::String(s)
+            MapKey::String(s, s.peek_content_hash(heap))
         } else if let Some(s) = value.as_symbol(heap) {
             MapKey::Symbol(s)
         } else {
@@ -155,11 +156,8 @@ impl MapKey {
                 }
             }
             (MapKey::BigInt(a), MapKey::BigInt(b)) => a == b,
-            (MapKey::String(a), MapKey::String(b)) => {
-                if a.cached_hash() != b.cached_hash() || a.len() != b.len() {
-                    return false;
-                }
-                a.equals(*b, heap)
+            (MapKey::String(a, a_hash), MapKey::String(b, b_hash)) => {
+                a_hash == b_hash && a.equals(*b, heap)
             }
             (MapKey::Symbol(a), MapKey::Symbol(b)) => a.ptr_eq(*b),
             (MapKey::ObjectValue(a), MapKey::ObjectValue(b)) => a == b,
@@ -370,7 +368,7 @@ impl MapKey {
         match self {
             Self::Undefined | Self::Null | Self::Boolean(_) | Self::Number(_) => {}
             Self::BigInt(value) => heap.record_write(parent, &Value::big_int(*value)),
-            Self::String(value) => heap.record_write(parent, &Value::string(*value)),
+            Self::String(value, _) => heap.record_write(parent, &Value::string(*value)),
             Self::Symbol(value) => heap.record_write(parent, &Value::symbol(*value)),
             Self::ObjectValue(value) => heap.record_write(parent, value),
         }
@@ -453,8 +451,8 @@ impl SetBody {
 ///
 /// `NaN` collapses to a single canonical hash so all `NaN` keys land in the
 /// same bucket (SameValueZero treats them equal); `-0`/`+0` were already
-/// collapsed in [`MapKey::from_value`]. Strings use the heap-free content
-/// [`JsString::cached_hash`]. The final avalanche is required because ordered
+/// collapsed in [`MapKey::from_value`]. Strings use the content hash
+/// [`MapKey::from_value`] recorded. The final avalanche is required because ordered
 /// tables select a bucket from the low hash bits: adjacent integral doubles
 /// differ mainly in their high IEEE-754 bits and otherwise collapse into one
 /// small-table bucket. Heap-independent by construction.
@@ -476,9 +474,9 @@ fn map_key_hash(key: &MapKey) -> Option<u64> {
             };
             hash = fx_hash_word(hash, bits);
         }
-        MapKey::String(s) => {
+        MapKey::String(_, string_hash) => {
             hash = fx_hash_word(hash, 4);
-            hash = fx_hash_word(hash, u64::from(s.cached_hash()));
+            hash = fx_hash_word(hash, u64::from(*string_hash));
         }
         MapKey::BigInt(_) | MapKey::Symbol(_) | MapKey::ObjectValue(_) => return None,
     }
@@ -1790,7 +1788,7 @@ impl crate::pelt::PeltField for MapKey {
             MapKey::ObjectValue(value) => value.trace_value_slot_mut(visitor),
             // A string key's body handle moves under a young-gen scavenge, so
             // its slot must be traced too (the equality path reads the body).
-            MapKey::String(s) => s.trace_handle_slot(visitor),
+            MapKey::String(s, _) => s.trace_handle_slot(visitor),
             MapKey::Undefined
             | MapKey::Null
             | MapKey::Boolean(_)

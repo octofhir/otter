@@ -7,7 +7,8 @@
 //! # Invariants
 //! Compiled code receives offsets, representation tags, capacities and an opaque
 //! young header from the VM. It never duplicates enum layout or header flags.
-//! Length/hash live in the cell; generated code does not maintain wrapper caches.
+//! Length lives in the cell; the content hash starts zero and the VM computes it
+//! on first use, so generated code never hashes or maintains wrapper caches.
 //! Children are compressed handles. Every payload/padding byte is initialized
 //! before the shared LAB top is published; no data address crosses a safepoint.
 //!
@@ -33,8 +34,6 @@ pub struct JitStringLayout {
     pub header_word: u64,
     /// Interner identity word; newly concatenated cells initialize it to zero.
     pub id_byte: u32,
-    /// Cell-owned content/structural hash.
-    pub hash_byte: u32,
     /// Compressed optional UTF-16 cache; initialized to null.
     pub cache_byte: u32,
     /// Compressed Cons children, measured by the representation owner.
@@ -49,10 +48,6 @@ pub struct JitStringLayout {
     pub inline_latin1_cap: u8,
     /// Maximum legal Cons depth, checked before candidate writes.
     pub max_rope_depth: u8,
-    /// Exact flat UTF-16 hash seed.
-    pub fnv_offset: u64,
-    /// Exact flat/Cons hash multiplier owned by the VM.
-    pub fnv_prime: u64,
     /// Tags of the six physical representations.
     pub inline_flat_tag: u8,
     /// Sequential UTF-16 tag.
@@ -86,7 +81,6 @@ mod tests {
         let mut ranges = [
             (p.id_byte, 4),
             (p.string_len_byte, 4),
-            (p.hash_byte, 8),
             (p.string_repr_byte, 1),
             (p.cons_left_byte, 4),
             (p.cons_right_byte, 4),

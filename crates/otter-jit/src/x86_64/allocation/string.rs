@@ -83,14 +83,9 @@ pub(crate) fn emit_concat(
         ; inc Rd(r.scratch) ; cmp Rd(r.scratch),p.max_rope_depth as i32 ; ja =>slow);
     initialize(ops, context, p, inputs, r, slow);
     emit_value(ops, 10, a);
-    dynasm!(ops ; .arch x64 ; mov [Rq(r.candidate)+p.cons_left_byte as i32],r10d
-        ; mov Rq(r.scratch),[r10+p.hash_byte as i32]);
+    dynasm!(ops ; .arch x64 ; mov [Rq(r.candidate)+p.cons_left_byte as i32],r10d);
     emit_value(ops, 10, b);
     dynasm!(ops ; .arch x64 ; mov [Rq(r.candidate)+p.cons_right_byte as i32],r10d
-        ; mov Rq(r.end),[r10+p.hash_byte as i32]);
-    emit_load_u64(ops, 10, p.fnv_prime);
-    dynasm!(ops ; .arch x64 ; imul Rq(r.scratch),r10 ; xor Rq(r.scratch),Rq(r.end)
-        ; mov [Rq(r.candidate)+p.hash_byte as i32],Rq(r.scratch)
         ; mov BYTE [Rq(r.candidate)+p.string_repr_byte as i32],p.cons_tag as i8);
     emit_depth(ops, p, a, r.scratch, r.end);
     emit_depth(ops, p, b, r.buffer, r.end);
@@ -174,8 +169,6 @@ fn emit_flat(
     dynasm!(ops ; .arch x64 ; mov BYTE [Rq(r.candidate)+p.string_repr_byte as i32],tag as i8
         ; movq xmm15,Rq(r.candidate)
         ; lea Rq(r.buffer),[Rq(r.candidate)+p.string_repr_payload_byte as i32]);
-    emit_load_u64(ops, r.scratch, p.fnv_offset);
-    emit_load_u64(ops, r.candidate, p.fnv_prime);
     for input in inputs {
         let wide = ops.new_dynamic_label();
         let next = ops.new_dynamic_label();
@@ -188,8 +181,7 @@ fn emit_flat(
         emit_copy_loop(ops, p, r, true, latin);
         dynasm!(ops ; .arch x64 ; =>next);
     }
-    dynasm!(ops ; .arch x64 ; movq Rq(r.candidate),xmm15
-        ; mov [Rq(r.candidate)+p.hash_byte as i32],Rq(r.scratch));
+    dynasm!(ops ; .arch x64 ; movq Rq(r.candidate),xmm15);
     publish(ops, context, p, r);
 }
 fn emit_copy_loop(
@@ -213,7 +205,6 @@ fn emit_copy_loop(
         ; =>inline ; add Rq(r.end),p.string_repr_payload_byte as i32 ; =>start
         ; test Rd(r.size),Rd(r.size) ; jz =>done ; =>copying
         ; movzx r10d,BYTE [Rq(r.end)] ; mov [Rq(r.buffer)],r10b
-        ; xor Rq(r.scratch),r10 ; imul Rq(r.scratch),Rq(r.candidate)
         ; inc Rq(r.end) ; inc Rq(r.buffer));
     if wide {
         dynasm!(ops ; .arch x64 ; movzx r10d,BYTE [Rq(r.end)] ; inc Rq(r.end));
@@ -223,6 +214,5 @@ fn emit_copy_loop(
     if !latin {
         dynasm!(ops ; .arch x64 ; mov [Rq(r.buffer)],r10b ; inc Rq(r.buffer));
     }
-    dynasm!(ops ; .arch x64 ; xor Rq(r.scratch),r10 ; imul Rq(r.scratch),Rq(r.candidate)
-        ; dec Rd(r.size) ; jnz =>copying ; =>done);
+    dynasm!(ops ; .arch x64 ; dec Rd(r.size) ; jnz =>copying ; =>done);
 }

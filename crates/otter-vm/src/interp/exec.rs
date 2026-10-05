@@ -418,7 +418,7 @@ impl Interpreter {
         let extra_roots = otter_gc::ExtraRoots::new(self as &Interpreter);
         let _extra_roots_guard = self.gc_heap.register_extra_roots(extra_roots);
         self.pending_uncaught_throw = None;
-        self.pending_uncaught_frames = None;
+        self.clear_throw_provenance();
         self.ensure_method_feedback_context(context);
         match self.run_inner(context) {
             Ok(v) => Ok(v),
@@ -563,7 +563,7 @@ impl Interpreter {
                 Ok(true) => {
                     let _ = vm.take_pending_uncaught_throw();
                     let _ = vm.take_error_detail();
-                    vm.pending_uncaught_frames = None;
+                    vm.clear_throw_provenance();
                     vm.uncaught_from_promise_rejection = false;
                     Ok(())
                 }
@@ -579,7 +579,7 @@ impl Interpreter {
                     if cause.is_fatal() || matches!(cause, VmError::OutOfMemory { .. }) {
                         return Err(RunError {
                             error: cause,
-                            frames: vm.pending_uncaught_frames.take().unwrap_or_default(),
+                            frames: vm.take_uncaught_frames(),
                             detail: vm.take_error_detail(),
                         });
                     }
@@ -590,7 +590,7 @@ impl Interpreter {
                         vm.set_pending_uncaught_throw(vm.escape_scoped(thrown));
                     }
                     *vm.pending_error_detail.borrow_mut() = error.detail.clone();
-                    vm.pending_uncaught_frames = Some(error.frames.clone());
+                    vm.set_uncaught_frames(error.frames.clone());
                     vm.uncaught_from_promise_rejection = from_rejection;
                     Err(error)
                 }
@@ -600,7 +600,7 @@ impl Interpreter {
                         vm.set_pending_uncaught_throw(vm.escape_scoped(thrown));
                     }
                     *vm.pending_error_detail.borrow_mut() = error.detail.clone();
-                    vm.pending_uncaught_frames = Some(error.frames.clone());
+                    vm.set_uncaught_frames(error.frames.clone());
                     vm.uncaught_from_promise_rejection = from_rejection;
                     Err(error)
                 }
@@ -623,7 +623,7 @@ impl Interpreter {
         // carried over from a prior microtask so we cannot read a
         // foreign reaction's value into this one.
         self.pending_uncaught_throw = None;
-        self.pending_uncaught_frames = None;
+        self.clear_throw_provenance();
         self.uncaught_from_promise_rejection = false;
         let _ = self.take_error_detail();
         // Async-resume tasks bypass callee resolution entirely:
@@ -735,11 +735,7 @@ impl Interpreter {
                         .vm_error_to_throwable_with_stack_roots(context, stack, &error)
                         .map_err(|error| RunError {
                             error,
-                            frames: self.pending_uncaught_frames.take().unwrap_or_else(|| {
-                                context.map_or_else(Vec::new, |context| {
-                                    self.snapshot_active_frames(context, usize::MAX)
-                                })
-                            }),
+                            frames: self.take_uncaught_frames_or_snapshot(context),
                             detail: self.take_error_detail(),
                         })?;
                     self.settle_microtask_capability(
@@ -749,11 +745,7 @@ impl Interpreter {
                         Err(reason),
                     )
                 } else {
-                    let frames = self.pending_uncaught_frames.take().unwrap_or_else(|| {
-                        context.map_or_else(Vec::new, |context| {
-                            self.snapshot_active_frames(context, usize::MAX)
-                        })
-                    });
+                    let frames = self.take_uncaught_frames_or_snapshot(context);
                     Err(RunError {
                         error,
                         frames,
@@ -789,11 +781,7 @@ impl Interpreter {
             .map(|_| ())
             .map_err(|error| RunError {
                 error,
-                frames: self.pending_uncaught_frames.take().unwrap_or_else(|| {
-                    context.map_or_else(Vec::new, |context| {
-                        self.snapshot_active_frames(context, usize::MAX)
-                    })
-                }),
+                frames: self.take_uncaught_frames_or_snapshot(context),
                 detail: self.take_error_detail(),
             })
     }
@@ -890,10 +878,7 @@ impl Interpreter {
                 if let Some(root_idx) = entry_promise_root {
                     self.json_root_pop_to(root_idx);
                 }
-                let frames = self
-                    .pending_uncaught_frames
-                    .take()
-                    .unwrap_or_else(|| self.snapshot_active_frames(context, usize::MAX));
+                let frames = self.take_uncaught_frames_or_snapshot(Some(context));
                 Err((err, frames))
             }
         }

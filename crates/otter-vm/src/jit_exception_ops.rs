@@ -39,7 +39,7 @@ impl Interpreter {
     /// compiled frame, but must not contaminate a later throw from the
     /// handler itself.
     pub fn jit_acknowledge_caught_throw(&mut self) {
-        self.pending_uncaught_frames = None;
+        self.clear_throw_provenance();
         self.pending_uncaught_throw = None;
         let _ = self.take_error_detail();
     }
@@ -54,9 +54,7 @@ impl Interpreter {
         self.record_jit_runtime_stub_class(crate::native_abi::RuntimeStubClass::Reentrant);
         let err = VmError::TemporalDeadZone { local_index };
         let value = self.vm_error_to_throwable_with_stack_roots(Some(context), stack, &err)?;
-        if self.pending_uncaught_frames.is_none() {
-            self.pending_uncaught_frames = Some(self.snapshot_active_frames(context, usize::MAX));
-        }
+        self.record_throw_site();
         Ok(value)
     }
 }

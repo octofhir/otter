@@ -1281,13 +1281,12 @@ pub struct Interpreter {
     /// post-drain `unhandledrejection`/`rejectionhandled` checkpoint. Both
     /// internal lists are GC roots. See [`crate::promise_rejection`].
     rejection_tracker: crate::promise_rejection::RejectionTracker,
-    /// Stack-frame snapshot captured at the moment of the
-    /// originating `Op::Throw` (before [`Self::unwind_throw`]
-    /// pops handler-less frames). Surfaces as [`RunError::frames`]
-    /// for [`VmError::Uncaught`] so embedders see the call site,
-    /// not the empty post-unwind stack. Cleared at every `run_*`
-    /// entry and at every successful catch.
-    pending_uncaught_frames: Option<Vec<StackFrameSnapshot>>,
+    /// Throw-site provenance of the in-flight exception: raw sites recorded
+    /// before any handler-less frame is popped, resolved when the exception
+    /// leaves its dispatch region. Surfaces as [`RunError::frames`] for
+    /// [`VmError::Uncaught`] so embedders see the throw site, not the empty
+    /// post-unwind stack. Cleared at every `run_*` entry and at every catch.
+    pending_throw_provenance: Option<native_stack_snapshot::ThrowProvenance>,
     /// General isolate resource ledger for source, code and external storage.
     /// Exact immutable source ownership belongs to each linked code chunk.
     resource_account: otter_resource::ResourceAccount,

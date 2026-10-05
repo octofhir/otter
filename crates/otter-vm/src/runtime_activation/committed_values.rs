@@ -77,7 +77,7 @@ impl CommittedValueError {
         };
         crate::RunError {
             error,
-            frames: interp.pending_uncaught_frames.take().unwrap_or_default(),
+            frames: interp.take_uncaught_frames(),
             detail: interp.take_error_detail(),
         }
     }
@@ -569,9 +569,8 @@ impl RuntimeCall<'_> {
             let handled_here = self.throw_lands_in_local_handler()?;
             let vm = unsafe { &mut *self.vm.as_ptr() };
             vm.record_jit_runtime_stub_class(crate::native_abi::RuntimeStubClass::Reentrant);
-            if !handled_here && vm.pending_uncaught_frames.is_none() {
-                vm.pending_uncaught_frames =
-                    Some(vm.snapshot_active_frames(&self.context, usize::MAX));
+            if !handled_here {
+                vm.record_throw_site();
             }
             return Ok(value0);
         }

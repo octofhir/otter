@@ -416,11 +416,12 @@ fn restore_execution_failure(interp: &mut Interpreter, failure: crate::RunError)
     interp.pending_uncaught_throw = None;
     if !failure.is_fatal() {
         let _ = interp.take_error_detail();
-        interp.pending_uncaught_frames = None;
+        interp.clear_throw_provenance();
         return VmError::InvalidOperand;
     }
     *interp.pending_error_detail.borrow_mut() = failure.detail;
-    interp.pending_uncaught_frames = (!failure.frames.is_empty()).then_some(failure.frames);
+    interp.pending_throw_provenance = (!failure.frames.is_empty())
+        .then_some(crate::native_stack_snapshot::ThrowProvenance::Frames(failure.frames));
     failure.error
 }
 

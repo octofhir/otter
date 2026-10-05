@@ -379,7 +379,7 @@ mod tests {
 
             source_position: None,
         }];
-        vm.pending_uncaught_frames = Some(nested_frames.clone());
+        vm.set_uncaught_frames(nested_frames.clone());
         let _ = vm.err_uncaught("stale committed detail".into());
 
         let mut stack = crate::test_support::FrameChainFixture::new();
@@ -409,13 +409,13 @@ mod tests {
         assert_eq!(call.take_js_throw(VmError::Uncaught), Ok(exception));
         assert!(vm.pending_uncaught_throw.is_none());
         assert_eq!(
-            vm.pending_uncaught_frames.as_deref(),
+            vm.pending_frames_for_test().map(Vec::as_slice),
             Some(nested_frames.as_slice())
         );
         assert!(vm.error_detail().is_none());
 
         vm.jit_acknowledge_caught_throw();
-        assert!(vm.pending_uncaught_frames.is_none());
+        assert!(vm.pending_throw_provenance.is_none());
 
         let later_exception = Value::number_i32(99);
         let later_frames = vec![crate::StackFrameSnapshot {
@@ -427,17 +427,17 @@ mod tests {
             source_position: None,
         }];
         vm.set_pending_uncaught_throw(later_exception);
-        vm.pending_uncaught_frames = Some(later_frames.clone());
+        vm.set_uncaught_frames(later_frames.clone());
         let mut call =
             unsafe { RuntimeCall::bind(NonNull::from(&mut activation), NonNull::from(&mut frame)) }
                 .expect("runtime call after catch acknowledgement");
         assert_eq!(call.take_js_throw(VmError::Uncaught), Ok(later_exception));
         assert_eq!(
-            vm.pending_uncaught_frames.as_deref(),
+            vm.pending_frames_for_test().map(Vec::as_slice),
             Some(later_frames.as_slice())
         );
         assert_ne!(
-            vm.pending_uncaught_frames.as_deref(),
+            vm.pending_frames_for_test().map(Vec::as_slice),
             Some(nested_frames.as_slice())
         );
     }
@@ -476,7 +476,7 @@ mod tests {
         ));
         assert_eq!(vm.jit_runtime_stats(), before);
         assert!(vm.pending_uncaught_throw.is_none());
-        assert!(vm.pending_uncaught_frames.is_none());
+        assert!(vm.pending_throw_provenance.is_none());
         assert!(vm.error_detail().is_none());
     }
 

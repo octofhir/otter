@@ -200,11 +200,7 @@ fn finish_vm_error(
     ctx: &mut JitCtx,
     error: CommittedValueError,
 ) -> NativeResultPair {
-    if vm.pending_uncaught_frames.is_none() {
-        vm.pending_uncaught_frames = Some(context.map_or_else(Vec::new, |context| {
-            vm.snapshot_active_frames(context, usize::MAX)
-        }));
-    }
+    vm.record_throw_site();
     // The producer owns the disposition: local source semantics materialize
     // once; a completed child or pure admission failure is already terminal.
     let projected = match error {
@@ -246,11 +242,7 @@ fn finish_native_result(
     HostStep::Complete(match result {
         Ok(value) => NativeResultPair::success(value),
         Err(error) => {
-            if vm.pending_uncaught_frames.is_none() {
-                vm.pending_uncaught_frames = Some(context.map_or_else(Vec::new, |context| {
-                    vm.snapshot_active_frames(context, usize::MAX)
-                }));
-            }
+            vm.record_throw_site();
             let projected =
                 crate::error_ops::native_error_to_throwable_with_stack(vm, stack, context, error);
             finish_projection(vm, ctx, projected)
@@ -598,10 +590,12 @@ fn other_entry(turn: &mut HostTurn<'_>, ctx: &mut JitCtx) -> Result<HostStep, Co
         return Err(CommittedValueError::JavaScript(VmError::NotCallable));
     };
     if turn.is_construct() {
+        // §7.3.15 Construct requires IsConstructor; an object without
+        // [[Construct]] is an ordinary TypeError at the `new` site.
         let native = crate::object::constructor_native(object, &turn.vm.gc_heap)
             .and_then(|value| value.as_native_function())
             .ok_or(VmError::NotCallable)
-            .map_err(CommittedValueError::Fatal)?;
+            .map_err(CommittedValueError::JavaScript)?;
         return native_construct_with(turn, ctx, native);
     }
     let native = crate::object::call_native(object, &turn.vm.gc_heap)

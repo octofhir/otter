@@ -645,7 +645,7 @@ impl Interpreter {
                 .take_pending_uncaught_throw()
                 .map(|value| interp.scoped_value(scope, value));
             let detail = interp.take_error_detail();
-            let frames = interp.pending_uncaught_frames.take();
+            let frames = interp.pending_throw_provenance.take();
             interp
                 .state_set(
                     interp.iteration_anchor(st),
@@ -686,7 +686,7 @@ impl Interpreter {
                 interp.set_pending_uncaught_throw(value);
             }
             *interp.pending_error_detail.borrow_mut() = detail;
-            interp.pending_uncaught_frames = frames;
+            interp.pending_throw_provenance = frames;
             Ok(())
         })
     }

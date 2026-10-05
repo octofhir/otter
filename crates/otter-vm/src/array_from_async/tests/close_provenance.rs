@@ -113,11 +113,11 @@ fn close_with_incoming(getter: bool, fatal: bool, incoming: bool) {
             }];
             assert!(vm.pending_uncaught_throw.is_none());
             assert!(vm.error_detail().is_none());
-            assert!(vm.pending_uncaught_frames.is_none());
+            assert!(vm.pending_throw_provenance.is_none());
             if incoming {
                 vm.set_pending_uncaught_throw(vm.escape_scoped(original));
                 let _ = vm.err_uncaught("original completion".into());
-                vm.pending_uncaught_frames = Some(frames.clone());
+                vm.set_uncaught_frames(frames.clone());
             }
             let before = vm.gc_heap.gc_cycle_counts();
             let old_offset = vm.escape_scoped(original).as_object().unwrap().offset();
@@ -149,7 +149,7 @@ fn close_with_incoming(getter: bool, fatal: bool, incoming: bool) {
                 );
                 assert!(vm.pending_uncaught_throw.is_none());
                 assert!(vm.error_detail().is_none());
-                assert_ne!(vm.pending_uncaught_frames.as_ref(), Some(&frames));
+                assert_ne!(vm.pending_frames_for_test(), Some(&frames));
             } else if incoming {
                 result.expect("incoming catchable error wins");
                 assert_eq!(vm.pending_uncaught_throw, Some(current));
@@ -157,7 +157,7 @@ fn close_with_incoming(getter: bool, fatal: bool, incoming: bool) {
                     vm.error_detail(),
                     Some(crate::ErrorDetail::Uncaught("original completion".into()))
                 );
-                assert_eq!(vm.pending_uncaught_frames.as_ref(), Some(&frames));
+                assert_eq!(vm.pending_frames_for_test(), Some(&frames));
             } else {
                 result.expect("ordinary rejection keeps precedence");
                 assert!(
@@ -166,7 +166,7 @@ fn close_with_incoming(getter: bool, fatal: bool, incoming: bool) {
                 );
                 assert!(vm.error_detail().is_none(), "cleanup diagnostic is retired");
                 assert!(
-                    vm.pending_uncaught_frames.is_none(),
+                    vm.pending_throw_provenance.is_none(),
                     "cleanup frames are retired"
                 );
             }

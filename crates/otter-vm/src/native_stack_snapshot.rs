@@ -2,6 +2,8 @@
 //!
 //! # Contents
 //! - [`FrameSite`] — one raw, unresolved activation site.
+//! - [`ThrowProvenance`] — where an in-flight exception was thrown, raw until
+//!   the exception leaves its dispatch region or is reported.
 //! - [`Interpreter::capture_active_sites`] — scalar walk of the published
 //!   chain, innermost first, with no source resolution.
 //! - [`resolve_frame_sites`] — owned snapshots from previously captured sites.
@@ -17,8 +19,9 @@
 //! Inline parents have recipes rather than physical frames. The
 //! walk reads scalar metadata without allocation in the GC heap or JS reentry.
 //! Captured sites name function ids and code positions only; they are
-//! resolved against the same execution context before any code they name can
-//! be reclaimed (a throw resolves them when it leaves its dispatch region).
+//! resolved before any code they name can be reclaimed: a throw settles them
+//! into frames when it leaves its dispatch region, and every report of an
+//! uncaught exception resolves them before its run returns.
 //!
 //! # See also
 //! - [`crate::stack_snapshot`] for source resolution.
@@ -57,7 +60,100 @@ impl FrameSite {
     }
 }
 
+/// Where an in-flight exception was thrown.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ThrowProvenance {
+    /// Raw sites of the activation chain at the throw, innermost first.
+    Sites(Vec<FrameSite>),
+    /// Frames resolved when the exception left a dispatch region, or carried
+    /// by a completed run's failure.
+    Frames(Vec<StackFrameSnapshot>),
+}
+
 impl Interpreter {
+    /// Record the site of a new exception, unless a nested exception that is
+    /// still propagating already owns the provenance.
+    pub(crate) fn record_throw_site(&mut self) {
+        if self.pending_throw_provenance.is_none() {
+            self.pending_throw_provenance = Some(ThrowProvenance::Sites(self.capture_active_sites()));
+        }
+    }
+
+    /// Replace the pending provenance with already resolved frames.
+    pub(crate) fn set_uncaught_frames(&mut self, frames: Vec<StackFrameSnapshot>) {
+        self.pending_throw_provenance = Some(ThrowProvenance::Frames(frames));
+    }
+
+    /// Forget the pending provenance: a handler absorbed its exception.
+    pub(crate) fn clear_throw_provenance(&mut self) {
+        self.pending_throw_provenance = None;
+    }
+
+    /// Resolve pending raw sites into frames while the code they name is live.
+    pub(crate) fn settle_throw_provenance(&mut self, context: &ExecutionContext) {
+        if let Some(ThrowProvenance::Sites(sites)) = &self.pending_throw_provenance {
+            let frames = resolve_frame_sites(context, sites, usize::MAX);
+            self.pending_throw_provenance = Some(ThrowProvenance::Frames(frames));
+        }
+    }
+
+    /// The pending provenance as owned frames, leaving it in place.
+    pub(crate) fn pending_uncaught_frames(&self) -> Vec<StackFrameSnapshot> {
+        match &self.pending_throw_provenance {
+            Some(ThrowProvenance::Sites(sites)) => self.resolve_sites_in_code_space(sites),
+            Some(ThrowProvenance::Frames(frames)) => frames.clone(),
+            None => Vec::new(),
+        }
+    }
+
+    /// Take the pending provenance as owned frames.
+    pub(crate) fn take_uncaught_frames(&mut self) -> Vec<StackFrameSnapshot> {
+        match self.pending_throw_provenance.take() {
+            Some(ThrowProvenance::Sites(sites)) => self.resolve_sites_in_code_space(&sites),
+            Some(ThrowProvenance::Frames(frames)) => frames,
+            None => Vec::new(),
+        }
+    }
+
+    /// Take the pending provenance, or snapshot the live chain when no throw
+    /// recorded one (a failure raised outside any throw site).
+    pub(crate) fn take_uncaught_frames_or_snapshot(
+        &mut self,
+        context: Option<&ExecutionContext>,
+    ) -> Vec<StackFrameSnapshot> {
+        match (&self.pending_throw_provenance, context) {
+            (None, Some(context)) => self.snapshot_active_frames(context, usize::MAX),
+            _ => self.take_uncaught_frames(),
+        }
+    }
+
+    /// Resolved frames pending for the in-flight exception, if any.
+    #[cfg(test)]
+    pub(crate) fn pending_frames_for_test(&self) -> Option<&Vec<StackFrameSnapshot>> {
+        match &self.pending_throw_provenance {
+            Some(ThrowProvenance::Frames(frames)) => Some(frames),
+            _ => None,
+        }
+    }
+
+    /// Resolve sites through the VM's code space, each against the exact live
+    /// chunk that owns its function; a site whose chunk is gone is skipped.
+    fn resolve_sites_in_code_space(&self, sites: &[FrameSite]) -> Vec<StackFrameSnapshot> {
+        let mut frames = Vec::with_capacity(sites.len());
+        for site in sites {
+            let function_id = match *site {
+                FrameSite::Instruction { function_id, .. } | FrameSite::Inline { function_id, .. } => {
+                    function_id
+                }
+            };
+            let Ok(owner) = ExecutionContext::for_function_in(&self.code_space, function_id) else {
+                continue;
+            };
+            frames.extend(resolve_frame_sites(&owner, std::slice::from_ref(site), 1));
+        }
+        frames
+    }
+
     pub(crate) fn snapshot_active_frames(
         &self,
         context: &ExecutionContext,

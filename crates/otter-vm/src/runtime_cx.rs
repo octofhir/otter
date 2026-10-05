@@ -346,7 +346,7 @@ impl<'rt> NativeCtx<'rt> {
             let error = crate::native_to_vm_error_with_stack(interp, activations, error);
             crate::RunError {
                 error,
-                frames: interp.pending_uncaught_frames.take().unwrap_or_default(),
+                frames: interp.take_uncaught_frames(),
                 detail: interp.take_error_detail(),
             }
         })
@@ -951,7 +951,7 @@ impl<'rt> NativeCtx<'rt> {
                 .evaluate_module(stack, &context, url)
                 .map_err(|error| crate::RunError {
                     error,
-                    frames: interp.pending_uncaught_frames.take().unwrap_or_default(),
+                    frames: interp.take_uncaught_frames(),
                     detail: interp.take_error_detail(),
                 })
         })
@@ -1598,7 +1598,7 @@ impl<'rt> NativeCtx<'rt> {
                 let interp = scope.context().interp_mut();
                 // Retain the original diagnostics before the one VM decoder.
                 *interp.pending_error_detail.borrow_mut() = error.detail;
-                interp.pending_uncaught_frames = Some(error.frames);
+                interp.set_uncaught_frames(error.frames);
                 return Err(native_function::vm_to_native_error(
                     interp,
                     error.error,

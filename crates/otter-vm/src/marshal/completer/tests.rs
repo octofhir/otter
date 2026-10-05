@@ -46,7 +46,7 @@ fn deferred_text_job_does_not_consume_a_preceding_turns_moved_throw() {
     vm.gc_heap_mut().set_gc_stress(0, true);
     let (job_root, observation_root) = rooted_pending(&mut vm);
     let old_offset = leave_previous_throw(&mut vm);
-    vm.pending_uncaught_frames = Some(vec![crate::StackFrameSnapshot {
+    vm.set_uncaught_frames(vec![crate::StackFrameSnapshot {
         function_id: 719,
         function_name: "preceding turn".into(),
         module: "<preceding-host-turn>".into(),
@@ -65,7 +65,7 @@ fn deferred_text_job_does_not_consume_a_preceding_turns_moved_throw() {
             .offset(),
         old_offset
     );
-    assert!(vm.pending_uncaught_frames.is_some());
+    assert!(vm.pending_throw_provenance.is_some());
     vm.gc_heap_mut().set_gc_stress(1, true);
     let before_job = vm.gc_heap().gc_cycle_counts();
     let realm_id = vm.active_host_realm_id();
@@ -86,7 +86,7 @@ fn deferred_text_job_does_not_consume_a_preceding_turns_moved_throw() {
     assert!(vm.persistent_root_get(job_root).is_none());
     assert!(vm.pending_uncaught_throw.is_none());
     assert!(
-        vm.pending_uncaught_frames.is_none(),
+        vm.pending_throw_provenance.is_none(),
         "preceding throw provenance is cleared"
     );
     let after_job = vm.gc_heap().gc_cycle_counts();
@@ -172,7 +172,7 @@ fn completion_conversion_consumes_only_its_fresh_synchronous_moved_throw() {
     assert!(after.load(Ordering::SeqCst) != 0);
     assert_ne!(before.load(Ordering::SeqCst), after.load(Ordering::SeqCst));
     assert!(vm.pending_uncaught_throw.is_none());
-    assert!(vm.pending_uncaught_frames.is_none());
+    assert!(vm.pending_throw_provenance.is_none());
     assert!(vm.persistent_root_get(job_root).is_none());
     let promise = vm
         .persistent_root_get(observation_root)

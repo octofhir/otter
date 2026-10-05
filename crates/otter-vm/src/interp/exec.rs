@@ -993,15 +993,9 @@ impl Interpreter {
                             && !stack.is_at_floor(floor)
                             && let Some(thrown) = self.pending_uncaught_throw.take()
                         {
-                            if self.pending_uncaught_frames.is_none() {
-                                self.pending_uncaught_frames =
-                                    Some(self.snapshot_active_frames(context, usize::MAX));
-                            }
                             let unwind =
                                 self.unwind_throw_above(context, stack, floor, thrown, site);
-                            if unwind.is_ok() {
-                                self.pending_uncaught_frames = None;
-                            } else {
+                            if unwind.is_err() {
                                 // No handler in THIS dispatch stack —
                                 // restore the original thrown value so
                                 // an outer dispatch loop (across a
@@ -1036,17 +1030,9 @@ impl Interpreter {
                                 } else {
                                     None
                                 };
-                                if self.pending_uncaught_frames.is_none() {
-                                    self.pending_uncaught_frames =
-                                        Some(self.snapshot_active_frames(context, usize::MAX));
-                                }
-                                let unwind = self.unwind_throw_with_uncaught_above(
+                                self.unwind_throw_with_uncaught_above(
                                     context, stack, floor, thrown, uncaught, site,
-                                );
-                                if unwind.is_ok() {
-                                    self.pending_uncaught_frames = None;
-                                }
-                                unwind?;
+                                )?;
                                 if stack.is_at_floor(floor) {
                                     let result = self
                                         .completed_activation_result

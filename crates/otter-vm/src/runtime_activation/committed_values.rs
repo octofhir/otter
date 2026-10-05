@@ -509,6 +509,22 @@ impl RuntimeCall<'_> {
         )
     }
 
+    /// Whether the static handler table of the throwing function covers the
+    /// published throw instruction.
+    fn throw_lands_in_local_handler(&self) -> Result<bool, CommittedValueError> {
+        let (function_id, pc) = self
+            .semantic_source()
+            .map_err(CommittedValueError::Fatal)?;
+        let owner = self
+            .context
+            .for_function(function_id)
+            .map_err(|_| CommittedValueError::Fatal(VmError::InvalidOperand))?;
+        let function = owner
+            .exec_function(function_id)
+            .ok_or(CommittedValueError::Fatal(VmError::InvalidOperand))?;
+        Ok(function.control_flow().handler_at(pc).is_some())
+    }
+
     /// Complete the exact published scalar site over boxed values.
     pub fn scalar_values(
         &mut self,
@@ -547,9 +563,13 @@ impl RuntimeCall<'_> {
                 .map_err(CommittedValueError::JavaScript);
         }
         if operation == ScalarValueOp::PrepareThrow {
+            // A handler of the throwing function that covers this instruction
+            // absorbs the throw inside this activation, which acknowledges the
+            // catch; only a throw leaving the activation needs its site.
+            let handled_here = self.throw_lands_in_local_handler()?;
             let vm = unsafe { &mut *self.vm.as_ptr() };
             vm.record_jit_runtime_stub_class(crate::native_abi::RuntimeStubClass::Reentrant);
-            if vm.pending_uncaught_frames.is_none() {
+            if !handled_here && vm.pending_uncaught_frames.is_none() {
                 vm.pending_uncaught_frames =
                     Some(vm.snapshot_active_frames(&self.context, usize::MAX));
             }

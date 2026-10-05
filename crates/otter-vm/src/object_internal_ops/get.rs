@@ -1294,15 +1294,8 @@ impl Interpreter {
         }
         // V8-compatible diagnostic: name the base kind and the key being
         // read ("Cannot read properties of undefined (reading 'foo')").
-        let shown_key = key.string_name().unwrap_or("property");
         Err(CommittedValueError::JavaScript(
-            self.err_type(
-                (format!(
-                    "Cannot read properties of {} (reading '{shown_key}')",
-                    crate::value_kind_name(&base)
-                ))
-                .into(),
-            ),
+            self.nullish_read_error(&base, key.string_name()),
         ))
     }
 

@@ -98,9 +98,10 @@ impl Interpreter {
             roots.add_value(&mut result);
         }
         if recv.is_nullish() {
-            return Err(CommittedValueError::JavaScript(self.err_type(
-                ("Cannot read property of null or undefined".to_string()).into(),
-            )));
+            let key = self.element_key_text(idx_value_raw);
+            return Err(CommittedValueError::JavaScript(
+                self.nullish_read_error(&recv, key.as_deref()),
+            ));
         }
         idx_value = self.coerce_property_key_value(stack, context, idx_value_raw)?;
         // Exotic receivers that keep their own-property bag on an expando —

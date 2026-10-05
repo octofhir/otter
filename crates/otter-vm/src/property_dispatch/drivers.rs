@@ -479,9 +479,10 @@ impl Interpreter {
         let top_idx = stack.len() - 1;
         let receiver = self.escape_scoped(receiver_root);
         if receiver.is_nullish() {
-            return Err(CommittedValueError::JavaScript(self.err_type(
-                ("Cannot read property of null or undefined".to_string()).into(),
-            )));
+            let key = self.element_key_text(key_value_raw);
+            return Err(CommittedValueError::JavaScript(
+                self.nullish_read_error(&receiver, key.as_deref()),
+            ));
         }
         let key_value = self.coerce_property_key_value(stack, context, key_value_raw)?;
         write_register(&mut stack[top_idx], key_reg, key_value)

@@ -426,20 +426,28 @@ impl Interpreter {
     /// arguments object of one arity shares a shape and stays IC-cacheable.
     /// Uncached above the arity cap, but still shaped — the transition chain
     /// itself is interned by the shape runtime.
+    ///
+    /// `parameter_map` selects the lineage whose state carries the
+    /// mapped-arguments lookup fact: a sloppy object that aliases at least one
+    /// formal starts from that state's root, so installing its ParameterMap
+    /// never re-derives a private shape chain per object.
     fn arguments_object_shape(
         &mut self,
         stack: &ActivationStack,
         argc: usize,
         mapped: bool,
+        parameter_map: bool,
     ) -> Result<crate::object::ShapeHandle, VmError> {
         const CACHED_ARGC_MAX: usize = 64;
         // An arguments object's prototype is the realm's `%Object.prototype%`
         // (§10.4.4.6 step 2, §10.4.4.7 step 5); its root starts the chain.
         let object_prototype = self.object_prototype_object_opt();
+        let state = crate::object::ShapeState::ORDINARY
+            .with_lookup(crate::object::LookupFact::MappedArguments, parameter_map);
         let mut shape = self.object_root(
             object_prototype,
             crate::object::inline_capacity_for(argc + 2),
-            crate::object::ShapeState::ORDINARY,
+            state,
         )?;
         let key = (argc as u32, mapped, crate::object::shape_body::id_of(shape));
         if argc <= CACHED_ARGC_MAX
@@ -694,7 +702,11 @@ impl Interpreter {
             let iterator_anchor =
                 interp.push_iteration_anchor(iterator_method.unwrap_or(Value::undefined())) - 1;
             let obj = if kind == ArgumentsObjectKind::Mapped {
-                let shape = interp.arguments_object_shape(stack, elements_len, true)?;
+                let parameter_map = mapped
+                    .as_ref()
+                    .is_some_and(|(_, entries)| !entries.is_empty());
+                let shape =
+                    interp.arguments_object_shape(stack, elements_len, true, parameter_map)?;
                 let obj = interp.allocate_arguments_receiver(stack, shape)?;
                 // Allocation can relocate every pending argument. Read the
                 // canonical anchors only after the receiver exists.
@@ -725,7 +737,7 @@ impl Interpreter {
                     shape,
                 )?
             } else {
-                let shape = interp.arguments_object_shape(stack, elements_len, false)?;
+                let shape = interp.arguments_object_shape(stack, elements_len, false, false)?;
                 let thrower = interp.restricted_throw_type_error()?;
                 let thrower_anchor = interp.push_iteration_anchor(thrower) - 1;
                 let obj = interp.allocate_arguments_receiver(stack, shape)?;

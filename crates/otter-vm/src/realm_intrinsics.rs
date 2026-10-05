@@ -368,7 +368,7 @@ mod tests {
 
     #[test]
     fn bootstrap_populates_well_known_slots() {
-        let interp = Interpreter::new();
+        let interp = Interpreter::new().expect("fixture interpreter bootstrap");
         let slots = &interp.realm_intrinsics();
         assert!(
             slots.object_prototype().is_some(),
@@ -402,7 +402,7 @@ mod tests {
 
     #[test]
     fn slot_matches_string_lookup_for_object_prototype() {
-        let mut interp = Interpreter::new();
+        let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
         let slot_proto = interp.realm_intrinsics().object_prototype().unwrap();
         let global = *interp.global_this();
         let walked = resolve_prototype(global, &mut interp.gc_heap, "Object").unwrap();
@@ -415,7 +415,7 @@ mod tests {
 
     #[test]
     fn slot_matches_string_lookup_for_function_prototype() {
-        let mut interp = Interpreter::new();
+        let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
         let slot_proto = interp.realm_intrinsics().function_prototype().unwrap();
         let global = *interp.global_this();
         let walked = resolve_prototype(global, &mut interp.gc_heap, "Function").unwrap();
@@ -428,7 +428,7 @@ mod tests {
 
     #[test]
     fn slots_are_forwarded_by_minor_gc() {
-        let mut interp = Interpreter::new();
+        let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
         let global = *interp.global_this();
 
         collect_minor_with_runtime_roots(&mut interp);
@@ -461,11 +461,14 @@ mod tests {
             "Promise.prototype cache must be forwarded with globalThis"
         );
 
-        let obj = interp
+        let mut obj = interp
             .alloc_host_object_with_roots(&[], &[])
             .expect("alloc object after scavenge");
         let cached_proto = interp.object_prototype_object_opt().unwrap();
-        crate::object::set_prototype(obj, interp.gc_heap_mut(), Some(cached_proto));
+        assert!(
+            crate::object::set_prototype(&mut obj, interp.gc_heap_mut(), Some(cached_proto))
+                .expect("forwarded prototype transition")
+        );
         assert_eq!(
             crate::object::prototype(obj, interp.gc_heap()),
             Some(object_slot),

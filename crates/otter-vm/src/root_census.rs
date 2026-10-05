@@ -302,6 +302,19 @@ impl Interpreter {
             }),
         );
         push(
+            "constructor_layouts",
+            count(|v| {
+                for layout in self.function_constructor_layouts_for_trace() {
+                    if !layout.is_null() {
+                        v(
+                            layout as *const crate::constructor_layout::ConstructorLayout
+                                as *mut otter_gc::raw::RawGc,
+                        );
+                    }
+                }
+            }),
+        );
+        push(
             "store_property_ics",
             count(|v| self.trace_property_ic_roots(v)),
         );

@@ -49,8 +49,7 @@ pub fn async_hooks_cjs_value<'scope>(
 
     otter_runtime::run_builtin_cjs_shim(
         scope,
-        "node:async_hooks",
-        include_str!("async_hooks.js"),
+        &crate::nodelib::embedded::node_async_hooks,
         module,
         require,
     )

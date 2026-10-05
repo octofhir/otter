@@ -4,29 +4,51 @@
 //! - Zero-argument and one-Int32-length Array construction at callee entry.
 //! - Invalid-length exact deoptimization and canonical `RangeError` without replay.
 //! - Moving-GC preservation of live arguments and an earlier Array result.
-//! - Machine direct-call artifacts tying each caller to the exact callee body.
+//! - Independently admitted Graph caller entries, exact call-cell artifacts,
+//!   and complete interpreter traces proving native execution.
+//! - Cold exact-generation and aggregate exit accounting without Template entry.
 //! - Exact ordinary function-constructor field-transition publication.
+//! - Retained first-seven cells and finalized native receiver geometry after full GC.
 //! - Pre-commit extensibility guards and out-of-line field-slab preservation.
 //!
 //! # Invariants
-//! - `ArrayConstruct` is the first effectful operation in each focused callee;
-//!   parameter loads may precede it.
+//! - Successful callee-entry cases allocate before any effectful body work.
+//!   The invalid-length callee records one preceding effect to detect replay.
 //! - Every probe enters that callee through generated stack-owned linkage.
 //! - A successful allocation returns once; pre-effect misses deopt exactly once.
 //! - Completed calls unlink their native roots and leave the caller reusable.
+//! - Template generations count their entries and returns; graph generations
+//!   count only their exits. Graph execution requires exact current call
+//!   artifacts, absent subject interpreter dispatch, typed allocation hits,
+//!   and unchanged installed generations.
 //!
 //! # See also
 //! - `otter_vm::runtime_activation` for stack-owned semantic operations.
-//! - `otter-jit::arm64::js_call` for generated calls.
+//! - The target `otter-jit` JS-call encoder for private generated calls.
 
-#![cfg(target_arch = "aarch64")]
+#![cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 
+use std::collections::BTreeMap;
+use std::sync::{Arc, Mutex};
+
+use otter_bytecode::Op;
 use otter_runtime::{
-    JitArtifactBatch, JitArtifactBundle, JitArtifactFileName, JitDebugRequest, JitDebugTarget,
-    JitDebugTier, JitSelection, Runtime, RuntimeExecutionStats, SourceInput,
+    JitArtifactBatch, JitArtifactBundle, JitArtifactFileName, JitDebugEvent, JitDebugRequest,
+    JitDebugTarget, JitDebugTier, JitSelection, Runtime, RuntimeExecutionStats, SourceInput,
+    inspect::{StepEvent, StepTracer},
+};
+use otter_vm::{
+    JitCodeGenerationSnapshot,
+    native_abi::{CodeLifetimeState, ExitAction, ExitReason, NativeFrameKind},
 };
 
-const MACHINE_IR_HEADER: &[u8] = b"; backend=otter-machine-ir scalar-function\n";
+#[path = "jit_stack_owned_array_construct/receiver.rs"]
+mod receiver;
+
+#[path = "jit_stack_owned_array_construct/first_seven.rs"]
+mod first_seven;
+
+const GRAPH_IR_HEADER: &[u8] = b"; otter graph\n";
 
 const NORMAL_SETUP: &str = r#"
 function arrayZeroAtEntry() {
@@ -270,10 +292,10 @@ struct CounterDelta {
     generated_template_entries: u64,
     generated_template_returns: u64,
     generated_template_deopts: u64,
-    generated_optimizing_entries: u64,
-    generated_optimizing_returns: u64,
     generated_optimizing_deopts: u64,
     optimized_deopts: u64,
+    optimized_osr_entries: u64,
+    code_generations: u64,
     to_rust_call_transitions: u64,
     alloc_value_stub_ok: u64,
     alloc_value_stub_miss: u64,
@@ -295,13 +317,12 @@ impl CounterDelta {
                 - before.jit_generated_template_returns,
             generated_template_deopts: after.jit_generated_template_deopts
                 - before.jit_generated_template_deopts,
-            generated_optimizing_entries: after.jit_generated_optimizing_entries
-                - before.jit_generated_optimizing_entries,
-            generated_optimizing_returns: after.jit_generated_optimizing_returns
-                - before.jit_generated_optimizing_returns,
             generated_optimizing_deopts: after.jit_generated_optimizing_deopts
                 - before.jit_generated_optimizing_deopts,
             optimized_deopts: after.jit_optimized_deopts - before.jit_optimized_deopts,
+            optimized_osr_entries: after.jit_optimized_osr_entries
+                - before.jit_optimized_osr_entries,
+            code_generations: after.jit_code_generations - before.jit_code_generations,
             to_rust_call_transitions: after.jit_to_rust_call_transitions
                 - before.jit_to_rust_call_transitions,
             alloc_value_stub_ok: after.jit_alloc_value_stub_ok - before.jit_alloc_value_stub_ok,
@@ -314,14 +335,6 @@ impl CounterDelta {
             property_store_misses: after.property_store_misses - before.property_store_misses,
             minor_gc_cycles: after.gc_minor_cycles - before.gc_minor_cycles,
         }
-    }
-
-    fn generated_entries(self) -> u64 {
-        self.generated_template_entries + self.generated_optimizing_entries
-    }
-
-    fn generated_returns(self) -> u64 {
-        self.generated_template_returns + self.generated_optimizing_returns
     }
 
     fn generated_deopts(self) -> u64 {
@@ -350,6 +363,254 @@ fn run(runtime: &mut Runtime, source: impl Into<String>, module: &str) -> String
         .unwrap_or_else(|error| panic!("stack-owned ArrayConstruct fixture {module}: {error:?}"))
         .completion_string()
         .to_owned()
+}
+
+#[derive(Debug, Default)]
+struct ArrayProbeTrace {
+    names: BTreeMap<u32, String>,
+    recording: bool,
+    steps: usize,
+    ticks: Vec<(u32, usize, u32, Op)>,
+}
+
+struct ArrayProbeTracer(Arc<Mutex<ArrayProbeTrace>>);
+
+impl StepTracer for ArrayProbeTracer {
+    fn on_step(&mut self, event: &StepEvent<'_>) {
+        let mut trace = self.0.lock().unwrap();
+        trace
+            .names
+            .entry(event.function_id)
+            .or_insert_with(|| event.function_name.to_owned());
+        if trace.recording {
+            trace.steps += 1;
+            if trace.ticks.len() < 256 {
+                trace.ticks.push((
+                    event.function_id,
+                    event.frame_depth,
+                    event.byte_pc,
+                    event.op,
+                ));
+            }
+        }
+    }
+}
+
+fn traced_function_names<'a>(trace: &ArrayProbeTrace, names: &[&'a str]) -> Vec<(&'a str, u32)> {
+    names
+        .iter()
+        .map(|&name| {
+            let (&fid, _) = trace
+                .names
+                .iter()
+                .find(|(_, observed)| observed.as_str() == name)
+                .unwrap_or_else(|| panic!("warm interpreter dispatch must identify {name}"));
+            (name, fid)
+        })
+        .collect()
+}
+
+fn has_current_graph(generation: &JitCodeGenerationSnapshot, fid: u32) -> bool {
+    generation.function_id == fid
+        && generation.tier == NativeFrameKind::Optimizing
+        && generation.lifecycle == CodeLifetimeState::Installed
+        && generation.linked
+}
+
+fn current_graph(runtime: &Runtime, fid: u32) -> JitCodeGenerationSnapshot {
+    let current: Vec<_> = runtime
+        .jit_code_generation_snapshot()
+        .into_iter()
+        .filter(|generation| has_current_graph(generation, fid))
+        .collect();
+    assert_eq!(
+        current.len(),
+        1,
+        "one installed current Graph for fid={fid}; observed={current:?}"
+    );
+    current.into_iter().next().unwrap()
+}
+
+fn admit_normal_graph_entries(
+    runtime: &mut Runtime,
+    artifacts: JitArtifactBatch,
+    names: &[(&str, u32)],
+) -> JitArtifactBatch {
+    admit_graph_entries(
+        runtime,
+        artifacts,
+        names,
+        "callArrayZero(arrayZeroAtEntry);\ncallArrayLength(arrayLengthAtEntry, 4);\n",
+        "jit-stack-owned-array-own-admission",
+    )
+}
+
+fn admit_graph_entries(
+    runtime: &mut Runtime,
+    mut artifacts: JitArtifactBatch,
+    names: &[(&str, u32)],
+    calls: &str,
+    module_prefix: &str,
+) -> JitArtifactBatch {
+    // A compiled warm loop may splice these wrappers and stop crediting their
+    // own source work. Fresh straight-line scripts let their ordinary entries
+    // execute and earn promotion independently. No script contains a backedge.
+    const BATCHES: usize = 128;
+    const PAIRS_PER_BATCH: usize = 16;
+    for batch in 0..=BATCHES {
+        let generations = runtime.jit_code_generation_snapshot();
+        if names.iter().all(|(_, fid)| {
+            generations
+                .iter()
+                .any(|generation| has_current_graph(generation, *fid))
+        }) {
+            assert!(!artifacts.truncated(), "complete own-entry artifacts");
+            return artifacts;
+        }
+        if batch == BATCHES {
+            break;
+        }
+        let mut admission = runtime
+            .run_script(
+                SourceInput::from_javascript(calls.repeat(PAIRS_PER_BATCH)),
+                &format!("{module_prefix}-{batch}.js"),
+            )
+            .expect("independent ordinary ArrayConstruct wrapper admission");
+        artifacts = artifacts.merged(admission.take_jit_artifacts().unwrap());
+    }
+    let generations: Vec<_> = runtime
+        .jit_code_generation_snapshot()
+        .into_iter()
+        .filter(|generation| names.iter().any(|(_, fid)| *fid == generation.function_id))
+        .collect();
+    panic!(
+        "bounded independent calls did not admit every Graph entry; \
+         max_calls_per_wrapper={}; names={names:?}; generations={generations:?}",
+        BATCHES * PAIRS_PER_BATCH
+    );
+}
+
+fn current_graph_entry<'a>(
+    artifacts: &'a JitArtifactBatch,
+    generation: &JitCodeGenerationSnapshot,
+) -> &'a JitArtifactBundle {
+    let bundle = artifacts
+        .bundles()
+        .iter()
+        .find(|bundle| bundle.manifest().code_object_id() == generation.code_object_id)
+        .expect("the exact current generation owns its emitted artifact");
+    assert_eq!(bundle.manifest().function_id(), generation.function_id);
+    assert_eq!(bundle.manifest().entry(), JitDebugTarget::Entry);
+    assert!(is_graph_bundle(bundle));
+    bundle
+}
+
+fn assert_current_graph_call(
+    artifacts: &JitArtifactBatch,
+    caller: &JitCodeGenerationSnapshot,
+    callee: &JitCodeGenerationSnapshot,
+) {
+    let bundle = current_graph_entry(artifacts, caller);
+    current_graph_entry(artifacts, callee);
+    let map = artifact_json(bundle, JitArtifactFileName::CodeMap);
+    let calls: Vec<_> = map["regions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|region| {
+            region["operation"]
+                .as_str()
+                .is_some_and(|operation| operation.contains("CallJs"))
+        })
+        .collect();
+    assert_eq!(
+        calls.len(),
+        1,
+        "the caller retains the callee's own activation"
+    );
+    let call = calls[0];
+    assert_eq!(
+        call["functionId"].as_u64(),
+        Some(u64::from(caller.function_id))
+    );
+    let start = call["startOffset"].as_u64().unwrap();
+    let end = call["endOffset"].as_u64().unwrap();
+    assert!(start < end, "the current own call has emitted instructions");
+    let relocations = artifact_json(bundle, JitArtifactFileName::Relocations);
+    let linkage_bytes = if cfg!(target_arch = "aarch64") { 12 } else { 6 };
+    let entries: Vec<_> = relocations["relocations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|relocation| {
+            relocation["target"]["kind"] == "functionEntryCell"
+                && relocation["target"]["functionId"].as_u64()
+                    == Some(u64::from(callee.function_id))
+                && relocation["startOffset"]
+                    .as_u64()
+                    .is_some_and(|offset| offset >= start)
+                && relocation["endOffset"]
+                    .as_u64()
+                    .is_some_and(|offset| offset + linkage_bytes <= end)
+        })
+        .collect();
+    assert_eq!(
+        entries.len(),
+        1,
+        "the own CallJs loads this callee's permanent entry cell"
+    );
+    let load_offset = entries[0]["endOffset"].as_u64().unwrap();
+    #[cfg(target_arch = "aarch64")]
+    {
+        assert_eq!(entries[0]["register"].as_u64(), Some(8));
+        let assembly = std::str::from_utf8(
+            bundle
+                .file(JitArtifactFileName::Assembly)
+                .unwrap()
+                .contents(),
+        )
+        .unwrap();
+        for (index, instruction) in ["ldr x8, [x8]", "ldr x16, [x8]", "blr x16"]
+            .into_iter()
+            .enumerate()
+        {
+            let prefix = format!("+0x{:08x}:", load_offset + index as u64 * 4);
+            assert!(
+                assembly
+                    .lines()
+                    .any(|line| line.starts_with(&prefix) && line.ends_with(instruction)),
+                "the exact own CallJs must load its current generation: code={} offset={prefix} instruction={instruction}",
+                caller.code_object_id
+            );
+        }
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        assert_eq!(entries[0]["register"].as_u64(), Some(11));
+        let code = bundle.file(JitArtifactFileName::Code).unwrap().contents();
+        let offset = usize::try_from(load_offset).unwrap();
+        assert_eq!(
+            &code[offset..offset + 6],
+            &[0x4d, 0x8b, 0x0b, 0x41, 0xff, 0x11],
+            "the exact own CallJs must load r9 from its cell and call [r9]: code={}",
+            caller.code_object_id
+        );
+    }
+}
+
+fn assert_complete_probe_trace(trace: &ArrayProbeTrace) {
+    assert_eq!(
+        trace.steps,
+        trace.ticks.len(),
+        "complete isolated probe trace"
+    );
+    assert!(trace.ticks.iter().any(|(fid, _, _, op)| {
+        trace.names[fid] == "<main>" && matches!(op, Op::Call | Op::CallWithThis)
+    }));
+    assert!(trace.ticks.iter().any(|(fid, _, _, op)| {
+        trace.names[fid] == "<main>"
+            && matches!(op, Op::Return | Op::ReturnUndefined | Op::ReturnValue)
+    }));
 }
 
 fn artifact_json(bundle: &JitArtifactBundle, file: JitArtifactFileName) -> serde_json::Value {
@@ -435,38 +696,45 @@ fn assert_array_construct_at_entry(
     );
 }
 
-fn assert_machine_direct_edge(
+/// Whether `bundle` holds code from the graph optimizing pipeline.
+fn is_graph_bundle(bundle: &JitArtifactBundle) -> bool {
+    bundle.manifest().tier() == JitDebugTier::Optimizing
+        && bundle
+            .file(JitArtifactFileName::OptimizedIr)
+            .is_some_and(|file| file.contents().starts_with(GRAPH_IR_HEADER))
+}
+
+/// The first optimized-IR line of `bundle`, or `<template>` without one.
+fn backend(bundle: &JitArtifactBundle) -> String {
+    bundle
+        .file(JitArtifactFileName::OptimizedIr)
+        .and_then(|file| std::str::from_utf8(file.contents()).ok())
+        .and_then(|text| text.lines().next())
+        .unwrap_or("<template>")
+        .to_owned()
+}
+
+fn assert_direct_edge(
     artifacts: &JitArtifactBatch,
     module: &str,
     caller_name: &str,
     callee_name: &str,
-    call_kind: &str,
 ) {
     let callee_function_id = function_id(artifacts, module, callee_name);
-    let mut machine_callers = 0;
+    let mut graph_callers = 0;
     let mut matching_edge = false;
     let mut observed_callers = Vec::new();
     for bundle in artifacts.bundles() {
         let manifest = bundle.manifest();
         if manifest.module() == module && manifest.function_name() == caller_name {
-            let backend = bundle
-                .file(JitArtifactFileName::OptimizedIr)
-                .and_then(|file| std::str::from_utf8(file.contents()).ok())
-                .and_then(|text| text.lines().next())
-                .unwrap_or("<template>");
-            observed_callers.push((manifest.tier(), manifest.entry(), backend.to_owned()));
+            observed_callers.push((manifest.tier(), manifest.entry(), backend(bundle)));
         }
         // The caller may also be spliced into the OSR body of its own hot
-        // loop; that body then owns the generated construct edge.
-        if manifest.module() != module
-            || manifest.tier() != JitDebugTier::Optimizing
-            || !bundle
-                .file(JitArtifactFileName::OptimizedIr)
-                .is_some_and(|file| file.contents().starts_with(MACHINE_IR_HEADER))
-        {
+        // loop; that body then owns the generated call edge.
+        if manifest.module() != module || !is_graph_bundle(bundle) {
             continue;
         }
-        machine_callers += 1;
+        graph_callers += 1;
         let relocations = artifact_json(bundle, JitArtifactFileName::Relocations);
         matching_edge |= relocations["relocations"]
             .as_array()
@@ -474,33 +742,19 @@ fn assert_machine_direct_edge(
             .iter()
             .any(|relocation| {
                 let target = &relocation["target"];
-                let direct = &target["directCall"];
-                target["kind"] == "directCallEntryCell"
-                    && direct["callKind"] == call_kind
-                    && direct["argumentMode"] == "fixed"
-                    && direct["targetFunctionId"].as_u64() == Some(u64::from(callee_function_id))
-                    && direct["targetIndex"].as_u64() == Some(0)
-                    && direct["targetCount"].as_u64() == Some(1)
+                target["kind"] == "functionEntryCell"
+                    && target["functionId"].as_u64() == Some(u64::from(callee_function_id))
             });
     }
     assert!(
-        machine_callers > 0,
-        "missing Machine IR artifact in {module}; {caller_name} observed={observed_callers:?}"
+        graph_callers > 0,
+        "missing graph IR artifact in {module}; {caller_name} observed={observed_callers:?}"
     );
     assert!(
         matching_edge,
         "{module}:{caller_name} (or the body inlining it) must directly enter {callee_name} \
-         through one fixed target"
+         through its entry cell"
     );
-}
-
-fn assert_machine_plain_direct_edge(
-    artifacts: &JitArtifactBatch,
-    module: &str,
-    caller_name: &str,
-    callee_name: &str,
-) {
-    assert_machine_direct_edge(artifacts, module, caller_name, callee_name, "plain");
 }
 
 fn assert_stack_owned_array_entry_edge(
@@ -510,103 +764,27 @@ fn assert_stack_owned_array_entry_edge(
     callee_name: &str,
 ) {
     assert_array_construct_at_entry(artifacts, module, callee_name);
-    assert_machine_plain_direct_edge(artifacts, module, caller_name, callee_name);
+    assert_direct_edge(artifacts, module, caller_name, callee_name);
 }
 
-fn assert_array_construct_backend(
-    artifacts: &JitArtifactBatch,
-    module: &str,
-    function_name: &str,
-    expected_tier: JitDebugTier,
-    machine: bool,
-) {
-    let expected_pc = u64::from(array_construct_location(artifacts, module, function_name).1);
-    let mut observed = Vec::new();
+/// Panic unless `module:function_name` has a graph-compiled entry bundle.
+fn assert_graph_entry(artifacts: &JitArtifactBatch, module: &str, function_name: &str) {
+    let mut observed_bundles = Vec::new();
     for bundle in artifacts.bundles().iter().filter(|bundle| {
         let manifest = bundle.manifest();
         manifest.module() == module
             && manifest.function_name() == function_name
             && manifest.entry() == JitDebugTarget::Entry
-            && manifest.tier() == expected_tier
     }) {
-        let is_machine = bundle
-            .file(JitArtifactFileName::OptimizedIr)
-            .is_some_and(|file| file.contents().starts_with(MACHINE_IR_HEADER));
-        let relocations = artifact_json(bundle, JitArtifactFileName::Relocations);
-        let has_stub = relocations["relocations"]
-            .as_array()
-            .expect("ArrayConstruct relocation array")
-            .iter()
-            .any(|relocation| {
-                relocation["target"]["kind"] == "runtimeStub"
-                    && relocation["target"]["name"] == "array_construct_alloc"
-            });
-        observed.push((is_machine, has_stub));
-        if is_machine != machine || !has_stub {
-            continue;
+        if is_graph_bundle(bundle) {
+            return;
         }
-        if machine {
-            let code_map = artifact_json(bundle, JitArtifactFileName::CodeMap);
-            assert!(
-                code_map["regions"]
-                    .as_array()
-                    .expect("Machine ArrayConstruct regions")
-                    .iter()
-                    .any(|region| {
-                        region["kind"] == "machineArrayConstruct"
-                            && region["bytePc"].as_u64() == Some(expected_pc)
-                    }),
-                "Machine ArrayConstruct must retain its exact bytecode region: {code_map}"
-            );
-        }
-        return;
+        observed_bundles.push((bundle.manifest().tier(), backend(bundle)));
     }
-    panic!(
-        "missing {expected_tier:?} ArrayConstruct backend for {module}:{function_name}; \
-         machine={machine} observed={observed:?}"
-    );
+    panic!("missing graph entry bundle for {module}:{function_name}; bundles={observed_bundles:?}");
 }
 
-fn assert_machine_array_field_constructor(
-    artifacts: &JitArtifactBatch,
-    module: &str,
-    function_name: &str,
-) {
-    let array_byte_pc =
-        u64::from(instruction_location(artifacts, module, function_name, "ArrayConstruct").1);
-    let store_byte_pc =
-        u64::from(instruction_location(artifacts, module, function_name, "StoreProperty").1);
-    let bundle = artifacts
-        .bundles()
-        .iter()
-        .find(|bundle| {
-            let manifest = bundle.manifest();
-            manifest.module() == module
-                && manifest.function_name() == function_name
-                && manifest.tier() == JitDebugTier::Optimizing
-                && manifest.entry() == JitDebugTarget::Entry
-                && bundle
-                    .file(JitArtifactFileName::OptimizedIr)
-                    .is_some_and(|file| file.contents().starts_with(MACHINE_IR_HEADER))
-        })
-        .unwrap_or_else(|| panic!("missing Machine constructor bundle for {function_name}"));
-    let code_map = artifact_json(bundle, JitArtifactFileName::CodeMap);
-    let regions = code_map["regions"].as_array().expect("constructor regions");
-    for (kind, byte_pc) in [
-        ("machineArrayConstruct", array_byte_pc),
-        ("machinePropertyStoreDispatch", store_byte_pc),
-        ("machineCacheIrWriteBarrier", store_byte_pc),
-    ] {
-        assert!(
-            regions.iter().any(|region| {
-                region["kind"] == kind && region["bytePc"].as_u64() == Some(byte_pc)
-            }),
-            "{function_name} must retain {kind} at bytePc={byte_pc}: {code_map}"
-        );
-    }
-}
-
-fn assert_machine_constructor_field_regions(
+fn assert_graph_constructor_fields(
     artifacts: &JitArtifactBatch,
     module: &str,
     function_name: &str,
@@ -629,79 +807,34 @@ fn assert_machine_constructor_field_regions(
             .contents(),
     )
     .expect("UTF-8 constructor bytecode artifact");
-    let store_byte_pcs = bytecode
+    let store_count = bytecode
         .lines()
         .filter(|line| line.contains(" StoreProperty "))
-        .map(|instruction| {
-            instruction
-                .split_whitespace()
-                .find_map(|field| field.strip_prefix("byte="))
-                .and_then(|pc| pc.parse::<u32>().ok())
-                .unwrap_or_else(|| panic!("invalid StoreProperty byte PC: {instruction}"))
-        })
-        .collect::<Vec<_>>();
+        .count();
     assert_eq!(
-        store_byte_pcs.len(),
-        expected_store_count,
+        store_count, expected_store_count,
         "unexpected StoreProperty count for {module}:{function_name}: {bytecode}"
     );
-
-    let mut observed_machine_regions = Vec::new();
-    let mut observed_bundles = Vec::new();
-    for bundle in artifacts.bundles().iter().filter(|bundle| {
-        let manifest = bundle.manifest();
-        manifest.module() == module
-            && manifest.function_name() == function_name
-            && manifest.entry() == JitDebugTarget::Entry
-    }) {
-        let manifest = bundle.manifest();
-        let backend = bundle
-            .file(JitArtifactFileName::OptimizedIr)
-            .and_then(|file| std::str::from_utf8(file.contents()).ok())
-            .and_then(|text| text.lines().next())
-            .unwrap_or("<template>");
-        observed_bundles.push((manifest.tier(), backend.to_owned()));
-    }
-    for bundle in artifacts.bundles().iter().filter(|bundle| {
-        let manifest = bundle.manifest();
-        manifest.module() == module
-            && manifest.function_name() == function_name
-            && manifest.tier() == JitDebugTier::Optimizing
-            && manifest.entry() == JitDebugTarget::Entry
-            && bundle
-                .file(JitArtifactFileName::OptimizedIr)
-                .is_some_and(|file| file.contents().starts_with(MACHINE_IR_HEADER))
-    }) {
-        let code_map = artifact_json(bundle, JitArtifactFileName::CodeMap);
-        let regions = code_map["regions"]
-            .as_array()
-            .expect("constructor code-map regions");
-        let store_effect_byte_pcs = regions
-            .iter()
-            .filter(|region| region["kind"] == "machinePropertyStoreDispatch")
-            .filter_map(|region| region["bytePc"].as_u64())
-            .filter_map(|byte_pc| u32::try_from(byte_pc).ok())
-            .collect::<Vec<_>>();
-        if store_byte_pcs.iter().all(|byte_pc| {
-            store_effect_byte_pcs
-                .iter()
-                .any(|effect_pc| effect_pc == byte_pc)
-        }) {
-            return;
-        }
-        observed_machine_regions.push(store_effect_byte_pcs);
-    }
-    panic!(
-        "missing complete Machine constructor field program for {module}:{function_name}; \
-         stores={store_byte_pcs:?} observed={observed_machine_regions:?} \
-         bundles={observed_bundles:?}"
-    );
+    assert_graph_entry(artifacts, module, function_name);
 }
 
-fn assert_clean_generated_returns(delta: CounterDelta, expected_calls: u64) {
-    assert_eq!(delta.generated_calls, expected_calls, "{delta:?}");
-    assert_eq!(delta.generated_entries(), expected_calls, "{delta:?}");
-    assert_eq!(delta.generated_returns(), expected_calls, "{delta:?}");
+/// `template_entries` Template generations were entered and each returned;
+/// nothing exited.
+fn assert_clean_generated_returns(delta: CounterDelta, template_entries: u64) {
+    assert_eq!(delta.generated_calls, template_entries, "{delta:?}");
+    assert_eq!(
+        delta.generated_template_entries, template_entries,
+        "{delta:?}"
+    );
+    assert_eq!(
+        delta.generated_template_returns, template_entries,
+        "{delta:?}"
+    );
+    assert_no_exits(delta);
+}
+
+/// No generated frame exited or crossed into a rooted runtime call.
+fn assert_no_exits(delta: CounterDelta) {
     assert_eq!(delta.generated_call_deopts, 0, "{delta:?}");
     assert_eq!(delta.generated_deopts(), 0, "{delta:?}");
     assert_eq!(delta.optimized_deopts, 0, "{delta:?}");
@@ -728,38 +861,106 @@ fn gc_stress_stride() -> u32 {
 fn zero_and_int32_length_constructs_stay_in_stack_owned_generated_callees() {
     const MODULE: &str = "jit-stack-owned-array-construct-normal.js";
     let mut runtime = runtime();
-    let setup = runtime
+    let trace = Arc::new(Mutex::new(ArrayProbeTrace::default()));
+    runtime.set_tracer(Some(Box::new(ArrayProbeTracer(trace.clone()))));
+    let mut setup = runtime
         .run_script(SourceInput::from_javascript(NORMAL_SETUP), MODULE)
         .expect("normal ArrayConstruct setup");
-    let artifacts = setup.jit_artifacts().expect("normal setup artifacts");
-    assert_stack_owned_array_entry_edge(artifacts, MODULE, "callArrayZero", "arrayZeroAtEntry");
-    assert_stack_owned_array_entry_edge(artifacts, MODULE, "callArrayLength", "arrayLengthAtEntry");
-    assert_array_construct_backend(
-        artifacts,
-        MODULE,
-        "arrayZeroAtEntry",
-        JitDebugTier::Optimizing,
-        true,
+    let names = traced_function_names(
+        &trace.lock().unwrap(),
+        &[
+            "callArrayZero",
+            "arrayZeroAtEntry",
+            "callArrayLength",
+            "arrayLengthAtEntry",
+        ],
     );
-    assert_array_construct_backend(
-        artifacts,
-        MODULE,
-        "arrayLengthAtEntry",
-        JitDebugTier::Optimizing,
-        true,
-    );
+    let artifacts =
+        admit_normal_graph_entries(&mut runtime, setup.take_jit_artifacts().unwrap(), &names);
+    let generations: Vec<_> = names
+        .iter()
+        .map(|(_, fid)| current_graph(&runtime, *fid))
+        .collect();
+    assert_current_graph_call(&artifacts, &generations[0], &generations[1]);
+    assert_current_graph_call(&artifacts, &generations[2], &generations[3]);
+    assert_array_construct_at_entry(&artifacts, MODULE, "arrayZeroAtEntry");
+    assert_array_construct_at_entry(&artifacts, MODULE, "arrayLengthAtEntry");
+    for callee in [&generations[1], &generations[3]] {
+        let relocations = artifact_json(
+            current_graph_entry(&artifacts, callee),
+            JitArtifactFileName::Relocations,
+        );
+        assert!(
+            relocations["relocations"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|relocation| {
+                    relocation["target"]["kind"] == "runtimeStub"
+                        && relocation["target"]["name"] == "array_construct_alloc"
+                })
+        );
+    }
     drop(setup);
 
+    trace.lock().unwrap().recording = true;
     let before = runtime.execution_stats();
-    let completion = run(&mut runtime, NORMAL_PROBE, "jit-stack-owned-array-probe.js");
+    let probe = runtime
+        .run_script(
+            SourceInput::from_javascript(NORMAL_PROBE),
+            "jit-stack-owned-array-probe.js",
+        )
+        .expect("normal ArrayConstruct probe");
     let delta = CounterDelta::between(before, runtime.execution_stats());
-    assert_eq!(completion, "[0,4,0,7]");
-    assert_clean_generated_returns(delta, 4);
-    assert_eq!(delta.generated_template_entries, 0, "{delta:?}");
-    assert!(delta.generated_optimizing_entries > 0, "{delta:?}");
-    assert!(
-        delta.alloc_value_stub_ok >= 4,
-        "each ArrayConstruct must cross its typed allocating boundary: {delta:?}"
+    assert_eq!(probe.completion_string(), "[0,4,0,7]");
+    let trace = trace.lock().unwrap();
+    assert_complete_probe_trace(&trace);
+    assert_eq!(
+        trace
+            .ticks
+            .iter()
+            .filter(|(fid, _, _, op)| trace.names[fid] == "<main>" && *op == Op::Call)
+            .count(),
+        4,
+        "the interpreted probe independently dispatches all four wrapper calls"
+    );
+    for generation in &generations {
+        assert!(
+            !trace
+                .ticks
+                .iter()
+                .any(|(fid, _, _, _)| *fid == generation.function_id),
+            "the exact admitted caller/callee must execute natively: {generation:?}"
+        );
+        let after = current_graph(&runtime, generation.function_id);
+        assert_eq!(after.code_object_id, generation.code_object_id);
+        assert_eq!(after.generated_entries, 0);
+        assert_eq!(after.generated_returns, 0);
+        assert_eq!(after.generated_deopts, generation.generated_deopts);
+        assert_eq!(
+            after.active_count, 0,
+            "completed native calls release their entry leases"
+        );
+    }
+    drop(trace);
+    let report = probe.jit_debug_report().unwrap();
+    assert!(!report.truncated());
+    assert_eq!(report.dropped_events(), 0);
+    assert!(!report.events().iter().any(|event| matches!(
+        event,
+        JitDebugEvent::Bail { .. }
+            | JitDebugEvent::EnteredGenerationDeopt { .. }
+            | JitDebugEvent::InlineDeoptFrame { .. }
+            | JitDebugEvent::CompilePrepared { .. }
+    )));
+    // All four exact own entries are Graph code. Their native execution is
+    // established above; that backend deliberately omits hot entry counters.
+    assert_clean_generated_returns(delta, 0);
+    assert_eq!(delta.code_generations, 0, "{delta:?}");
+    assert_eq!(delta.optimized_osr_entries, 0, "{delta:?}");
+    assert_eq!(
+        delta.alloc_value_stub_ok, 4,
+        "one typed allocation per native callee: {delta:?}"
     );
     assert_eq!(delta.alloc_value_stub_miss, 0, "{delta:?}");
     assert_eq!(delta.alloc_value_stub_out_of_memory, 0, "{delta:?}");
@@ -767,44 +968,126 @@ fn zero_and_int32_length_constructs_stay_in_stack_owned_generated_callees() {
 }
 
 #[test]
-fn invalid_length_throws_range_error_once_and_reuses_the_generated_caller() {
-    const MODULE: &str = "jit-stack-owned-array-invalid-length.js";
+fn invalid_length_throws_once_reuses_graph_caller_and_reconciles_generated_deopts() {
+    const MODULE: &str = "jit-graph-only-array-exit.js";
     let mut runtime = runtime();
+    let trace = Arc::new(Mutex::new(ArrayProbeTrace::default()));
+    runtime.set_tracer(Some(Box::new(ArrayProbeTracer(trace.clone()))));
     let setup = runtime
         .run_script(SourceInput::from_javascript(INVALID_LENGTH_SETUP), MODULE)
-        .expect("invalid-length setup");
-    let artifacts = setup.jit_artifacts().expect("invalid-length artifacts");
-    assert_machine_plain_direct_edge(
-        artifacts,
-        MODULE,
-        "callInvalidArrayLength",
-        "invalidArrayLength",
+        .expect("Graph-only ArrayConstruct setup");
+    let names = traced_function_names(
+        &trace.lock().unwrap(),
+        &["callInvalidArrayLength", "invalidArrayLength"],
     );
-    let _construct_location = array_construct_location(artifacts, MODULE, "invalidArrayLength");
+    let caller_fid = names[0].1;
+    let callee_fid = names[1].1;
+    let caller = current_graph(&runtime, caller_fid);
+    let callee = current_graph(&runtime, callee_fid);
+    assert_eq!(callee.generated_entries, 0);
+    assert_eq!(callee.generated_deopts, 0);
+    let artifacts = setup.jit_artifacts().unwrap();
+    assert!(!artifacts.truncated());
+    assert_current_graph_call(artifacts, &caller, &callee);
+    let (construct_pc, construct_byte_pc) =
+        array_construct_location(artifacts, MODULE, "invalidArrayLength");
     drop(setup);
 
+    trace.lock().unwrap().recording = true;
     let before = runtime.execution_stats();
-    let completion = run(
-        &mut runtime,
-        INVALID_LENGTH_PROBE,
-        "jit-stack-owned-array-invalid-length-probe.js",
+    let probe = runtime
+        .run_script(
+            SourceInput::from_javascript(INVALID_LENGTH_PROBE),
+            "jit-graph-only-array-exit-probe.js",
+        )
+        .expect("Graph-only ArrayConstruct probe");
+    assert_eq!(
+        probe.completion_string(),
+        r#"["RangeError","Invalid array length",1,3,2]"#
     );
     let delta = CounterDelta::between(before, runtime.execution_stats());
-
-    assert_eq!(completion, r#"["RangeError","Invalid array length",1,3,2]"#);
-    assert_eq!(delta.generated_calls, 2, "{delta:?}");
-    assert_eq!(delta.generated_entries(), 2, "{delta:?}");
-    assert_eq!(delta.generated_returns(), 1, "{delta:?}");
-    // The cold-deoptimized callee resumes to a throw; its entry completed
-    // through the deopt, not a return.
-    assert_eq!(delta.generated_call_deopts, 1, "{delta:?}");
-    assert_eq!(delta.generated_deopts(), 1, "{delta:?}");
-    assert_eq!(delta.optimized_deopts, 1, "{delta:?}");
-    assert_eq!(delta.to_rust_call_transitions, 0, "{delta:?}");
-    assert_eq!(delta.alloc_value_stub_ok, 1, "{delta:?}");
-    assert_eq!(delta.alloc_value_stub_miss, 1, "{delta:?}");
-    assert_eq!(delta.alloc_value_stub_out_of_memory, 0, "{delta:?}");
-    assert_eq!(delta.alloc_value_stub_other, 0, "{delta:?}");
+    let trace = trace.lock().unwrap();
+    assert_complete_probe_trace(&trace);
+    assert!(!trace.ticks.iter().any(|(fid, _, _, _)| *fid == caller_fid));
+    let replay: Vec<_> = trace
+        .ticks
+        .iter()
+        .filter(|(fid, _, _, _)| *fid == callee_fid)
+        .collect();
+    assert_eq!(
+        replay.len(),
+        1,
+        "only the pre-effect throwing opcode replays; recovery stays native"
+    );
+    assert_eq!(replay[0].2, construct_byte_pc);
+    assert_eq!(replay[0].3, Op::ArrayConstruct);
+    drop(trace);
+    let report = probe.jit_debug_report().unwrap();
+    assert!(!report.truncated());
+    assert_eq!(report.dropped_events(), 0);
+    let exits: Vec<_> = report
+        .events()
+        .iter()
+        .filter_map(|event| match event {
+            JitDebugEvent::EnteredGenerationDeopt {
+                callee_function_id,
+                callee_code_object_id,
+                callee_tier,
+                callee_resume_pc,
+                exit_reason,
+                exit_action,
+            } => Some((
+                *callee_function_id,
+                *callee_code_object_id,
+                *callee_tier,
+                *callee_resume_pc,
+                *exit_reason,
+                *exit_action,
+            )),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        exits,
+        vec![(
+            callee_fid,
+            callee.code_object_id,
+            JitDebugTier::Optimizing,
+            construct_pc,
+            ExitReason::AllocationMiss,
+            ExitAction::Resume
+        )]
+    );
+    assert!(!report.events().iter().any(|event| matches!(
+        event,
+        JitDebugEvent::Bail { .. }
+            | JitDebugEvent::InlineDeoptFrame { .. }
+            | JitDebugEvent::CompilePrepared { .. }
+    )));
+    let after_caller = current_graph(&runtime, caller_fid);
+    let after_callee = current_graph(&runtime, callee_fid);
+    assert_eq!(after_caller.code_object_id, caller.code_object_id);
+    assert_eq!(after_callee.code_object_id, callee.code_object_id);
+    assert_eq!(after_caller.active_count, 0);
+    assert_eq!(after_callee.active_count, 0);
+    assert_eq!(after_caller.generated_entries, 0);
+    assert_eq!(after_caller.generated_deopts, caller.generated_deopts);
+    assert_eq!(after_callee.generated_entries, 0);
+    assert_eq!(after_callee.generated_deopts, callee.generated_deopts + 1);
+    assert_eq!(delta.generated_calls, 0, "Graph entries remain uncounted");
+    assert_eq!(delta.generated_template_entries, 0);
+    assert_eq!(delta.generated_template_returns, 0);
+    assert_eq!(delta.generated_template_deopts, 0);
+    assert_eq!(delta.generated_call_deopts, 1);
+    assert_eq!(delta.generated_optimizing_deopts, 1);
+    assert_eq!(delta.optimized_deopts, 1);
+    assert_eq!(delta.code_generations, 0);
+    assert_eq!(delta.optimized_osr_entries, 0);
+    assert_eq!(delta.to_rust_call_transitions, 0);
+    assert_eq!(delta.alloc_value_stub_ok, 1);
+    assert_eq!(delta.alloc_value_stub_miss, 1);
+    assert_eq!(delta.alloc_value_stub_out_of_memory, 0);
+    assert_eq!(delta.alloc_value_stub_other, 0);
 }
 
 #[test]
@@ -820,14 +1103,13 @@ fn ordinary_constructor_array_and_field_transition_stay_generated() {
     let artifacts = setup
         .jit_artifacts()
         .expect("ordinary ArrayConstruct constructor artifacts");
-    assert_machine_direct_edge(
+    assert_direct_edge(
         artifacts,
         MODULE,
         "constructOrdinaryArrayField",
         "OrdinaryArrayField",
-        "construct",
     );
-    assert_machine_array_field_constructor(artifacts, MODULE, "OrdinaryArrayField");
+    assert_graph_entry(artifacts, MODULE, "OrdinaryArrayField");
     drop(setup);
 
     let before = runtime.execution_stats();
@@ -866,14 +1148,13 @@ fn ordinary_constructor_transition_cannot_append_to_a_non_extensible_receiver() 
     let artifacts = setup
         .jit_artifacts()
         .expect("non-extensible ordinary constructor artifacts");
-    assert_machine_direct_edge(
+    assert_direct_edge(
         artifacts,
         MODULE,
         "constructNonExtensibleOrdinary",
         "NonExtensibleOrdinaryField",
-        "construct",
     );
-    assert_machine_constructor_field_regions(artifacts, MODULE, "NonExtensibleOrdinaryField", 1);
+    assert_graph_constructor_fields(artifacts, MODULE, "NonExtensibleOrdinaryField", 1);
     drop(setup);
 
     let completion = run(&mut runtime, NON_EXTENSIBLE_CONSTRUCTOR_PROBE, PROBE_MODULE);
@@ -893,14 +1174,13 @@ fn wide_ordinary_constructor_transitions_preserve_the_reserved_slab() {
     let artifacts = setup
         .jit_artifacts()
         .expect("wide ordinary constructor artifacts");
-    assert_machine_direct_edge(
+    assert_direct_edge(
         artifacts,
         MODULE,
         "constructWideOrdinary",
         "WideOrdinaryFields",
-        "construct",
     );
-    assert_machine_constructor_field_regions(artifacts, MODULE, "WideOrdinaryFields", 4);
+    assert_graph_constructor_fields(artifacts, MODULE, "WideOrdinaryFields", 4);
     drop(setup);
 
     let before = runtime.execution_stats();
@@ -932,7 +1212,7 @@ JSON.stringify([value.a, value.b, value.c, value.d, Object.keys(value).join(",")
 }
 
 #[test]
-fn tiny_base_constructor_uses_machine_or_template_without_a_legacy_optimizer() {
+fn tiny_base_constructor_uses_only_template_or_the_graph_optimizer() {
     const MODULE: &str = "jit-tiny-construct-cost-model.js";
     let mut runtime = runtime();
     let setup = runtime
@@ -962,12 +1242,9 @@ fn tiny_base_constructor_uses_machine_or_template_without_a_legacy_optimizer() {
     );
     assert!(
         caller_bundles.iter().all(|bundle| {
-            bundle.manifest().tier() != JitDebugTier::Optimizing
-                || bundle
-                    .file(JitArtifactFileName::OptimizedIr)
-                    .is_some_and(|file| file.contents().starts_with(MACHINE_IR_HEADER))
+            bundle.manifest().tier() != JitDebugTier::Optimizing || is_graph_bundle(bundle)
         }),
-        "every optimizing artifact must come from Machine IR"
+        "every optimizing artifact must come from the graph pipeline"
     );
     drop(setup);
 
@@ -1022,22 +1299,26 @@ checksum;
     let expected_checksum =
         u64::from(iterations) * u64::from(iterations - 1) / 2 + u64::from(iterations) * 4;
     let before = runtime.execution_stats();
-    let completion = run(&mut runtime, probe, "jit-stack-owned-array-gc-probe.js");
+    let result = runtime
+        .run_script(
+            SourceInput::from_javascript(probe),
+            "jit-stack-owned-array-gc-probe.js",
+        )
+        .expect("ArrayConstruct GC probe");
     let delta = CounterDelta::between(before, runtime.execution_stats());
 
-    assert_eq!(completion, expected_checksum.to_string());
+    assert_eq!(result.completion_string(), expected_checksum.to_string());
     // The probe ends on the plain `checksum` completion: an unprofiled call
     // after the OSR-compiled loop would soft-deopt its first execution, which
-    // says nothing about the ArrayConstruct edges this test covers.
-    // Every iteration calls both ArrayConstruct callees through generated
-    // linkage; once the probe loop itself enters OSR code, its two outer calls
-    // are generated as well.
-    let generated = delta.generated_calls;
-    assert!(
-        (u64::from(iterations) * 2..=u64::from(iterations) * 4).contains(&generated),
+    // says nothing about the ArrayConstruct edges this test covers. Once the
+    // probe loop enters OSR code, its callers and their ArrayConstruct callees
+    // run inside it or in graph generations, which count no entries; every
+    // Array still allocates through the generated allocation stub.
+    assert_eq!(
+        delta.generated_template_entries, delta.generated_template_returns,
         "{delta:?}"
     );
-    assert_clean_generated_returns(delta, generated);
+    assert_no_exits_except_checksum_overflow(&result, delta);
     assert!(
         delta.alloc_value_stub_ok >= u64::from(iterations) * 4,
         "both Array results must remain rooted across a second allocation: {delta:?}"
@@ -1065,5 +1346,43 @@ JSON.stringify([
     );
     let reuse_delta = CounterDelta::between(before_reuse, runtime.execution_stats());
     assert_eq!(reused, "[0,4,9]");
-    assert_clean_generated_returns(reuse_delta, 2);
+    assert_eq!(
+        reuse_delta.generated_template_entries, reuse_delta.generated_template_returns,
+        "{reuse_delta:?}"
+    );
+    assert_no_exits(reuse_delta);
+    assert_eq!(reuse_delta.code_generations, 0, "{reuse_delta:?}");
+    assert!(reuse_delta.alloc_value_stub_ok >= 4, "{reuse_delta:?}");
+}
+
+/// The only exit a GC probe may take is the script body's checksum add
+/// leaving int32 once; no ArrayConstruct callee or caller exits.
+fn assert_no_exits_except_checksum_overflow(
+    result: &otter_runtime::ExecutionResult,
+    delta: CounterDelta,
+) {
+    let exits = result
+        .jit_debug_report()
+        .expect("events enabled")
+        .events()
+        .iter()
+        .filter_map(|event| match event {
+            JitDebugEvent::Bail {
+                function_name,
+                exit_reason,
+                ..
+            } => Some((function_name.clone(), *exit_reason)),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        exits.len() <= 1
+            && exits.iter().all(|(name, reason)| name == "<main>"
+                && *reason == otter_vm::native_abi::ExitReason::Int32Overflow),
+        "{exits:?}"
+    );
+    assert_eq!(delta.optimized_deopts, exits.len() as u64, "{delta:?}");
+    assert_eq!(delta.generated_call_deopts, 0, "{delta:?}");
+    assert_eq!(delta.generated_deopts(), 0, "{delta:?}");
+    assert_eq!(delta.to_rust_call_transitions, 0, "{delta:?}");
 }

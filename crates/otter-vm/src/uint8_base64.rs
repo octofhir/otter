@@ -466,13 +466,13 @@ fn set_result(ctx: &mut NativeCtx<'_>, read: usize, written: usize) -> Result<Va
         ctx.heap_mut(),
         "read",
         PropertyDescriptor::data(Value::number_i32(read as i32), true, true, true),
-    );
+    )?;
     object::define_own_property(
         obj,
         ctx.heap_mut(),
         "written",
         PropertyDescriptor::data(Value::number_i32(written as i32), true, true, true),
-    );
+    )?;
     Ok(Value::object(obj))
 }
 
@@ -561,7 +561,7 @@ pub fn install_uint8_base64(
         root: &Value,
     ) -> Result<Value, JsSurfaceError> {
         let f = crate::bootstrap::native_static_with_value_roots(heap, name, length, call, &[root])
-            .map_err(|_| JsSurfaceError::OutOfMemory)?;
+            .map_err(JsSurfaceError::from)?;
         Ok(Value::native_function(f))
     }
 
@@ -571,41 +571,49 @@ pub fn install_uint8_base64(
         heap,
         "fromBase64",
         PropertyDescriptor::data(from_base64, true, false, true),
-    );
+    )?;
     let from_hex = make_fn(heap, "fromHex", 1, u8_from_hex, &ctor_value)?;
     ctor.define_own_property(
         heap,
         "fromHex",
         PropertyDescriptor::data(from_hex, true, false, true),
-    );
+    )?;
     // Methods on Uint8Array.prototype.
     let to_base64 = make_fn(heap, "toBase64", 0, u8_to_base64, &proto_value)?;
-    object::define_own_property(
+    if !object::define_own_property(
         proto,
         heap,
         "toBase64",
         PropertyDescriptor::data(to_base64, true, false, true),
-    );
+    )? {
+        return Err(JsSurfaceError::DefinePropertyFailed("[[BuiltinProperty]]"));
+    };
     let to_hex = make_fn(heap, "toHex", 0, u8_to_hex, &proto_value)?;
-    object::define_own_property(
+    if !object::define_own_property(
         proto,
         heap,
         "toHex",
         PropertyDescriptor::data(to_hex, true, false, true),
-    );
+    )? {
+        return Err(JsSurfaceError::DefinePropertyFailed("[[BuiltinProperty]]"));
+    };
     let set_from_base64 = make_fn(heap, "setFromBase64", 1, u8_set_from_base64, &proto_value)?;
-    object::define_own_property(
+    if !object::define_own_property(
         proto,
         heap,
         "setFromBase64",
         PropertyDescriptor::data(set_from_base64, true, false, true),
-    );
+    )? {
+        return Err(JsSurfaceError::DefinePropertyFailed("[[BuiltinProperty]]"));
+    };
     let set_from_hex = make_fn(heap, "setFromHex", 1, u8_set_from_hex, &proto_value)?;
-    object::define_own_property(
+    if !object::define_own_property(
         proto,
         heap,
         "setFromHex",
         PropertyDescriptor::data(set_from_hex, true, false, true),
-    );
+    )? {
+        return Err(JsSurfaceError::DefinePropertyFailed("[[BuiltinProperty]]"));
+    };
     Ok(())
 }

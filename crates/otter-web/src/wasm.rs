@@ -23,13 +23,17 @@
 //! - [`WasmModule`] / [`WasmMemory`] / [`WasmGlobal`] / [`WasmTable`] /
 //!   [`WasmTag`] / [`WasmException`] — `#[js_class]` host classes relocated
 //!   onto the namespace by `wasm.ns.js`.
+//! - [`boundary`] / [`references`] — typed errors and fallible value conversion.
+//! - [`realm`] — the sole first-use Engine/Store/JSTag owner.
 //! - `wasm.ns.js` — the `Instance` class, `CompileError` / `LinkError` /
-//!   `RuntimeError` subclasses, the streaming forms, the `JSTag` install, the
-//!   `__throw` re-thrower, and the relocation.
+//!   `RuntimeError` intrinsic installation, the streaming forms, the `JSTag`
+//!   install, and the relocation.
 //!
 //! # Model
 //! One shared `Engine` + `Arc<Mutex<Store<StoreState>>>` lives per realm,
-//! created lazily on first use and cached on a hidden global. Every module,
+//! initialized only by a real Wasm operation and cached on a hidden global.
+//! Bootstrap publishes the ordinary namespace and stable JSTag data property
+//! with a symbolic Tag wrapper; reading their descriptors never starts Wasmtime. Every module,
 //! instance, memory, table, and global uses that one store, so a standalone
 //! `new WebAssembly.Memory/Table/Global(...)` can be linked into any
 //! `instantiate(...)` — cross-store imports work. Reference values (`externref`)
@@ -40,9 +44,14 @@
 //! [`NativeCtx`] through a per-call bridge and re-enter the VM.
 //!
 //! # Invariants
+//! - JSTag keeps its originating realm owner; first use publishes Engine, Store
+//!   and the backing tag atomically after successful native initialization.
 //! - The bridge pointer in `StoreState` is live only for the span of a single
-//!   synchronous `Func::call` on this thread; it is cleared before the driver
+//!   synchronous export call or start-function instantiation on this thread;
+//!   it is cleared before the driver
 //!   returns and read only while set.
+//! - Import conversions borrow their existing Caller; no externref conversion
+//!   re-locks the Store already held by the driver.
 //! - The shared store's `Mutex` is non-reentrant: an export call holds the
 //!   guard, so a JS import that re-enters and calls another export cannot
 //!   re-lock it — that surfaces as a `RuntimeError` rather than a deadlock.
@@ -51,9 +60,12 @@
 //! - `Memory.buffer` snapshots the linear memory into a fresh `ArrayBuffer`;
 //!   the VM has no `ArrayBuffer` backed by foreign memory.
 //! - `i64` values marshal to JS `BigInt` (spec-faithful), not `Number`.
-//! - A native cannot set the VM's pending-throw slot, so an exception object
-//!   (or a `JSTag` payload) is re-thrown to JS through the hidden
-//!   `WebAssembly.__throw` helper, which preserves the value's identity.
+//! - Wasmtime carries host failures as the existing owned `JsError` through
+//!   its typed user-error/backtrace chain. Structural/control/OOM errors return
+//!   to the runtime unchanged; only canonical catchable values enter JSTag.
+//! - Actual exception payloads use NativeCtx::throw_value and the one pending
+//!   synchronous throw root. Error classes come from the traced realm Error
+//!   registry and cannot be replaced by changing namespace constructors.
 //! - A `WebAssembly.Exception` holds its `ExnRef` rooted for the store's life;
 //!   its `externref` payload keeps the underlying JS value alive through the
 //!   store's `js_refs` persistent-root side table.
@@ -63,26 +75,30 @@
 //! - <https://webassembly.github.io/exception-handling/js-api/>
 //! - `blob.rs` — the `#[js_class]` host-class exemplar this follows.
 
+mod boundary;
+mod realm;
+mod references;
+
+use boundary::{catchable_value, from_wasmtime, intrinsic, throw_value};
+use realm::{WasmRealm, realm, realm_handle};
+use references::{
+    extern_ref_from_js, extern_ref_to_js, js_to_val, js_to_val_in, val_to_js, val_to_js_in,
+};
 use std::sync::{Arc, Mutex};
 
 use otter_macros::{FromJs, HostClass, js_class, js_namespace};
-use otter_runtime::marshal::{
-    ArrayBuffer, IntoJs, JsError, JsValue, MarshalCx, ValueIdent, class_instance,
-};
+use otter_runtime::marshal::{ArrayBuffer, IntoJs, JsError, JsValue, MarshalCx, ValueIdent};
 use otter_runtime::{
-    RuntimeNativeCall as NativeCall, RuntimeNativeCtx as NativeCtx,
+    RuntimeErrorKind as ErrorKind, RuntimeNativeCall as NativeCall, RuntimeNativeCtx as NativeCtx,
     RuntimeNativeError as NativeError, RuntimeNativeFn,
     RuntimePersistentRootId as PersistentRootId, RuntimeValue as Value, object,
 };
 use wasmtime::{
-    AsContextMut, Caller, Config, Engine, ExnRef, ExnRefPre, ExnType, Extern, ExternRef,
-    ExternType, Func, FuncType, Global as WtGlobal, GlobalType, HeapType, Instance as WtInstance,
-    Linker, Memory as WtMemory, MemoryType, Module as WtModule, Mutability, Ref, RefType, Rooted,
-    Store, Table as WtTable, TableType, Tag as WtTag, TagType, ThrownException, Val, ValType,
+    AsContextMut, Caller, Engine, ExnRef, ExnRefPre, ExnType, Extern, ExternRef, ExternType, Func,
+    FuncType, Global as WtGlobal, GlobalType, HeapType, Instance as WtInstance, Linker,
+    Memory as WtMemory, MemoryType, Module as WtModule, Mutability, Ref, RefType, Rooted, Store,
+    Table as WtTable, TableType, Tag as WtTag, TagType, ThrownException, Val, ValType,
 };
-
-/// Hidden global key caching the per-realm [`WasmRealm`] singleton.
-const REALM_KEY: &str = "__otterWasmRealm";
 
 /// Per-store host state. Holds the address of the active re-entry [`Bridge`]
 /// while a `Func::call` is in flight (`0` when idle), stored as an integer so
@@ -107,147 +123,12 @@ struct Bridge {
 /// Shared, lockable wasmtime store used by every wasm object in one realm.
 type SharedStore = Arc<Mutex<Store<StoreState>>>;
 
-/// Per-realm engine + shared store, cached as a hidden host object on the
-/// global so every `WebAssembly.*` entry point links into the same store.
-/// `js_tag` is the realm-wide well-known `WebAssembly.JSTag`: a `(tag
-/// (param externref))` used to carry a JS value across wasm frames.
-#[derive(Clone, HostClass)]
-pub struct WasmRealm {
-    engine: Engine,
-    store: SharedStore,
-    js_tag: WtTag,
-}
-
-impl IntoJs for WasmRealm {
-    fn into_js<'s>(self, cx: &mut MarshalCx<'_, '_, 's>) -> Result<JsValue<'s>, JsError> {
-        // An internal carrier, not a user-facing class: build a bare host
-        // object (no registered prototype) that only ever round-trips through
-        // `with_host_data`.
-        class_instance(cx, "WebAssembly.__Realm", self)
-    }
-}
-
-/// Build the wasmtime [`Config`] the realm engine uses: enable the
-/// reference-type / typed-function-reference / GC / exception-handling
-/// proposals so `externref` and `funcref` values round-trip and `throw` /
-/// `try_table` modules compile and run.
-fn realm_config() -> Config {
-    let mut config = Config::new();
-    config.wasm_reference_types(true);
-    config.wasm_function_references(true);
-    config.wasm_gc(true);
-    config.wasm_exceptions(true);
-    config
-}
-
 /// Build a `Tag` in the shared store from a list of parameter value types.
 fn make_tag(engine: &Engine, store: &SharedStore, params: &[ValType]) -> Result<WtTag, JsError> {
     let func_ty = FuncType::new(engine, params.iter().cloned(), []);
     let tag_ty = TagType::new(func_ty);
     let mut guard = store.lock().expect("wasm store poisoned");
-    WtTag::new(&mut *guard, &tag_ty)
-        .map_err(|err| JsError::Type(format!("Tag allocation failed: {err}")))
-}
-
-/// Resolve the cached per-realm engine + shared store + well-known JSTag,
-/// creating and caching them on first use. All handles are cheap to clone.
-fn realm_handle(cx: &mut MarshalCx<'_, '_, '_>) -> Result<WasmRealm, JsError> {
-    let global = cx.global_this();
-    let existing = cx.get(global, REALM_KEY)?;
-    if let Ok(realm) = cx.with_host_data::<WasmRealm, WasmRealm>(existing, Clone::clone) {
-        return Ok(realm);
-    }
-    let engine = Engine::new(&realm_config())
-        .map_err(|err| JsError::Type(format!("WebAssembly engine init failed: {err}")))?;
-    let store: SharedStore = Arc::new(Mutex::new(Store::new(&engine, StoreState::default())));
-    let js_tag = make_tag(&engine, &store, &[ValType::EXTERNREF])?;
-    let realm = WasmRealm {
-        engine: engine.clone(),
-        store: store.clone(),
-        js_tag,
-    };
-    let value = realm.clone().into_js(cx)?;
-    // Cache as a non-writable, non-enumerable, non-configurable own property so
-    // user code cannot observe or replace the realm carrier.
-    cx.define(
-        global,
-        REALM_KEY,
-        value,
-        object::PropertyFlags::new(false, false, false),
-    )?;
-    Ok(realm)
-}
-
-/// Resolve the realm engine + shared store (the common case that does not need
-/// the JSTag).
-fn realm(cx: &mut MarshalCx<'_, '_, '_>) -> Result<(Engine, SharedStore), JsError> {
-    let realm = realm_handle(cx)?;
-    Ok((realm.engine, realm.store))
-}
-
-/// A thrown/rejected `WebAssembly` error described independently of the VM:
-/// `kind` is the JS constructor name, `message` the text.
-struct WasmThrow {
-    kind: &'static str,
-    message: String,
-}
-
-impl WasmThrow {
-    fn compile(message: impl Into<String>) -> Self {
-        Self {
-            kind: "CompileError",
-            message: message.into(),
-        }
-    }
-    fn link(message: impl Into<String>) -> Self {
-        Self {
-            kind: "LinkError",
-            message: message.into(),
-        }
-    }
-    fn runtime(message: impl Into<String>) -> Self {
-        Self {
-            kind: "RuntimeError",
-            message: message.into(),
-        }
-    }
-    fn type_error(message: impl Into<String>) -> Self {
-        Self {
-            kind: "TypeError",
-            message: message.into(),
-        }
-    }
-    fn from_js(err: JsError) -> Self {
-        Self::runtime(err.to_string())
-    }
-
-    /// Build the JS error object this describes, parked in the ambient scope.
-    fn to_value<'s>(&self, cx: &mut MarshalCx<'_, '_, 's>) -> JsValue<'s> {
-        let message = cx.string(&self.message).unwrap_or_else(|_| cx.undefined());
-        if let Some(ctor) = error_ctor(cx, self.kind)
-            && cx.is_callable(ctor)
-        {
-            let ctor_raw = cx.escape(ctor);
-            let message_raw = cx.escape(message);
-            if let Ok(err) = cx.ctx().construct(ctor_raw, &[message_raw]) {
-                return cx.park(err);
-            }
-        }
-        message
-    }
-}
-
-/// Resolve the constructor for a JS error class: the `WebAssembly.*` error
-/// subclasses come off the namespace, everything else off the global.
-fn error_ctor<'s>(cx: &mut MarshalCx<'_, '_, 's>, kind: &str) -> Option<JsValue<'s>> {
-    if matches!(kind, "CompileError" | "LinkError" | "RuntimeError") {
-        let namespace = cx.ctx().global_value("WebAssembly")?;
-        let handle = cx.park(namespace);
-        cx.get(handle, kind).ok()
-    } else {
-        let ctor = cx.ctx().global_value(kind)?;
-        Some(cx.park(ctor))
-    }
+    WtTag::new(&mut *guard, &tag_ty).map_err(|error| from_wasmtime(error, ErrorKind::TypeError))
 }
 
 /// `ToUint32`-style reduction to a wasm `i32`.
@@ -256,97 +137,6 @@ fn to_wasm_i32(n: f64) -> i32 {
         return 0;
     }
     (n.trunc().rem_euclid(4_294_967_296.0) as u32) as i32
-}
-
-/// Park a JS value as an `externref`: register it as a persistent root and put
-/// the index in the store's ref table so a later read resolves it back.
-fn extern_ref_from_js(
-    cx: &mut MarshalCx<'_, '_, '_>,
-    store: &SharedStore,
-    value: JsValue<'_>,
-) -> Result<Option<Rooted<ExternRef>>, JsError> {
-    if cx.is_nullish(value) {
-        return Ok(None);
-    }
-    let raw = cx.escape(value);
-    let root = cx.ctx().persistent_root_insert(raw);
-    let mut guard = store.lock().expect("wasm store poisoned");
-    let index = guard.data().js_refs.len();
-    guard.data_mut().js_refs.push(root);
-    let handle = ExternRef::new(&mut *guard, ExternIndex(index))
-        .map_err(|err| JsError::Type(format!("externref allocation failed: {err}")))?;
-    Ok(Some(handle))
-}
-
-/// Resolve an `externref` back to the JS value it parks, via its stored index.
-fn extern_ref_to_js<'s>(
-    cx: &mut MarshalCx<'_, '_, 's>,
-    store: &SharedStore,
-    handle: Option<Rooted<ExternRef>>,
-) -> JsValue<'s> {
-    let Some(handle) = handle else {
-        return cx.null();
-    };
-    let root = {
-        let guard = store.lock().expect("wasm store poisoned");
-        handle
-            .data(&*guard)
-            .ok()
-            .flatten()
-            .and_then(|any| any.downcast_ref::<ExternIndex>().map(|idx| idx.0))
-            .and_then(|index| guard.data().js_refs.get(index).copied())
-    };
-    match root {
-        Some(root) => {
-            let value = cx
-                .ctx()
-                .persistent_root_get(root)
-                .unwrap_or_else(Value::undefined);
-            cx.park(value)
-        }
-        None => cx.null(),
-    }
-}
-
-/// Convert a wasm value into a JS value parked in the ambient scope.
-fn val_to_js<'s>(cx: &mut MarshalCx<'_, '_, 's>, store: &SharedStore, value: &Val) -> JsValue<'s> {
-    match value {
-        Val::I32(x) => cx.number(f64::from(*x)),
-        Val::I64(x) => cx.bigint_i64(*x).unwrap_or_else(|_| cx.undefined()),
-        Val::F32(bits) => cx.number(f64::from(f32::from_bits(*bits))),
-        Val::F64(bits) => cx.number(f64::from_bits(*bits)),
-        Val::ExternRef(handle) => extern_ref_to_js(cx, store, *handle),
-        _ => cx.null(),
-    }
-}
-
-/// Coerce a JS value into a wasm value of the given type.
-fn js_to_val(
-    cx: &mut MarshalCx<'_, '_, '_>,
-    store: &SharedStore,
-    handle: JsValue<'_>,
-    ty: &ValType,
-) -> Result<Val, JsError> {
-    Ok(match ty {
-        ValType::I32 => Val::I32(to_wasm_i32(cx.to_number_spec(handle)?)),
-        ValType::I64 => {
-            let raw = cx.escape(handle);
-            let n = cx.i64_from_bigint(raw).ok_or_else(|| {
-                JsError::Type("cannot convert a non-BigInt value to a wasm i64".to_string())
-            })?;
-            Val::I64(n)
-        }
-        ValType::F32 => Val::F32((cx.to_number_spec(handle)? as f32).to_bits()),
-        ValType::F64 => Val::F64(cx.to_number_spec(handle)?.to_bits()),
-        ValType::Ref(ref_ty) if ref_ty.heap_type().matches(&HeapType::Extern) => {
-            Val::ExternRef(extern_ref_from_js(cx, store, handle)?)
-        }
-        _ => {
-            return Err(JsError::Type(
-                "unsupported reference-type wasm value".to_string(),
-            ));
-        }
-    })
 }
 
 /// Parse a wasm value-type name from a `Global`/`Table` descriptor.
@@ -379,7 +169,7 @@ fn default_val(ty: &ValType) -> Val {
 /// (trap, re-entry guard) rendered as a typed error, or a WebAssembly
 /// exception whose rooted [`ExnRef`] the caller surfaces to JS.
 enum CallFailure {
-    Throw(WasmThrow),
+    Error(wasmtime::Error),
     Exception(Rooted<ExnRef>),
 }
 
@@ -399,9 +189,10 @@ fn drive_call(
         ctx: ctx_ptr as usize,
     };
     let mut guard = store.try_lock().map_err(|_| {
-        CallFailure::Throw(WasmThrow::runtime(
+        CallFailure::Error(wasmtime::Error::new(intrinsic(
+            ErrorKind::WasmRuntimeError,
             "re-entrant WebAssembly call is not supported",
-        ))
+        )))
     })?;
     guard.data_mut().bridge = &bridge as *const Bridge as usize;
     let result = func.call(&mut *guard, inputs, outputs);
@@ -409,12 +200,15 @@ fn drive_call(
     match result {
         Ok(()) => Ok(()),
         Err(err) => {
-            if err.is::<ThrownException>()
-                && let Some(exn) = guard.take_pending_exception()
-            {
-                return Err(CallFailure::Exception(exn));
+            if err.is::<ThrownException>() {
+                return Err(match guard.take_pending_exception() {
+                    Some(exn) => CallFailure::Exception(exn),
+                    None => CallFailure::Error(wasmtime::Error::new(JsError::Native(
+                        NativeError::InvalidOperand,
+                    ))),
+                });
             }
-            Err(CallFailure::Throw(WasmThrow::runtime(err.to_string())))
+            Err(CallFailure::Error(err))
         }
     }
 }
@@ -434,69 +228,60 @@ enum ImportFailure {
 /// marshal the result back into `outputs`. When the callback throws, the
 /// thrown value is parked and returned as [`ImportFailure::JsThrow`].
 fn run_import(
-    store: &SharedStore,
-    bridge_addr: usize,
+    caller: &mut Caller<'_, StoreState>,
     params: &[Val],
     outputs: &mut [Val],
     root: PersistentRootId,
     results: &[ValType],
 ) -> Result<(), ImportFailure> {
+    let bridge_addr = caller.data().bridge;
     if bridge_addr == 0 {
-        return Err(ImportFailure::Fatal(wasmtime::Error::msg(
-            "wasm import invoked without an active JS bridge",
-        )));
+        return Err(ImportFailure::Fatal(wasmtime::Error::new(JsError::Native(
+            NativeError::InvalidOperand,
+        ))));
     }
-    // SAFETY: `bridge_addr` is the address of a `Bridge` on the `drive_call`
-    // frame currently executing this wasm call on this thread; it stays valid
-    // until that call returns, and no two `Func::call`s overlap on one store.
+    // SAFETY: the active synchronous driver owns Bridge and NativeCtx for
+    // exactly this Wasmtime call. No pointer is saved in a deferred job or
+    // retained after drive_call/instantiate clears bridge before returning.
     let bridge = unsafe { &*(bridge_addr as *const Bridge) };
     let ctx: &mut NativeCtx<'_> = unsafe { &mut *(bridge.ctx as *mut NativeCtx<'_>) };
-    let params: Vec<Val> = params.to_vec();
-    let outcome: Result<Vec<Val>, ImportFailure> = ctx.scope(|scope| {
+    ctx.scope(|scope| {
         let mut cx = MarshalCx::new(scope);
-        let callback = cx
-            .ctx()
-            .persistent_root_get(root)
-            .unwrap_or_else(Value::undefined);
-        let callback = cx.park(callback);
-        let this = cx.undefined();
-        let mut argv: Vec<JsValue<'_>> = Vec::with_capacity(params.len());
-        for param in &params {
-            argv.push(val_to_js(&mut cx, store, param));
-        }
-        let returned = match cx.call(callback, this, &argv) {
-            Ok(value) => value,
-            Err(_) => {
-                // The callback threw. Recover the original thrown Value from
-                // the VM's side channel (the rendered `JsError` string dropped
-                // its identity) and park it so the JSTag wrapper can carry it.
-                let thrown = cx
-                    .ctx()
-                    .interp_mut()
-                    .take_pending_uncaught_throw()
-                    .unwrap_or_else(Value::undefined);
-                let root = cx.ctx().persistent_root_insert(thrown);
-                return Err(ImportFailure::JsThrow(root));
+        let outcome: Result<Vec<Val>, JsError> = (|| {
+            let callback = cx
+                .ctx()
+                .persistent_root_get(root)
+                .ok_or(JsError::Native(NativeError::InvalidOperand))?;
+            let callback = cx.park(callback);
+            let this = cx.undefined();
+            let mut argv = Vec::with_capacity(params.len());
+            for param in params {
+                argv.push(val_to_js_in(&mut cx, &mut *caller, param)?);
             }
-        };
-        let mut out = Vec::with_capacity(results.len());
-        match results.len() {
-            0 => {}
-            1 => out.push(
-                js_to_val(&mut cx, store, returned, &results[0])
-                    .map_err(|err| ImportFailure::Fatal(wasmtime::Error::msg(err.to_string())))?,
-            ),
-            _ => {
-                return Err(ImportFailure::Fatal(wasmtime::Error::msg(
-                    "multi-value returns from JS imports are not supported",
-                )));
+            let returned = cx.call(callback, this, &argv)?;
+            match results {
+                [] => Ok(Vec::new()),
+                [single] => Ok(vec![js_to_val_in(&mut cx, &mut *caller, returned, single)?]),
+                _ => Err(JsError::Type(
+                    "multi-value returns from JS imports are not supported".into(),
+                )),
             }
+        })();
+        match outcome {
+            Ok(values) => {
+                outputs[..values.len()].clone_from_slice(&values);
+                Ok(())
+            }
+            Err(error) => match catchable_value(&mut cx, error) {
+                Ok(value) => {
+                    let value = cx.escape(value);
+                    let root = cx.ctx().persistent_root_insert(value);
+                    Err(ImportFailure::JsThrow(root))
+                }
+                Err(error) => Err(ImportFailure::Fatal(wasmtime::Error::new(error))),
+            },
         }
-        Ok(out)
-    });
-    let values = outcome?;
-    outputs[..values.len()].clone_from_slice(&values);
-    Ok(())
+    })
 }
 
 /// Wrap a parked JS value in a fresh `JSTag` exception in the caller's store
@@ -510,8 +295,7 @@ fn throw_js_via_jstag(
 ) -> Result<(), wasmtime::Error> {
     let index = caller.data().js_refs.len();
     caller.data_mut().js_refs.push(parked);
-    let handle = ExternRef::new(&mut *caller, ExternIndex(index))
-        .map_err(|err| wasmtime::Error::msg(format!("externref allocation failed: {err}")))?;
+    let handle = ExternRef::new(&mut *caller, ExternIndex(index))?;
     let tag_ty = js_tag.ty(&*caller);
     let exn_ty = ExnType::from_tag_type(&tag_ty)?;
     let pre = ExnRefPre::new(&mut *caller, exn_ty);
@@ -526,59 +310,31 @@ fn js_tag_payload<'s>(
     store: &SharedStore,
     js_tag: WtTag,
     exn: Rooted<ExnRef>,
-) -> Option<JsValue<'s>> {
+) -> Result<Option<JsValue<'s>>, JsError> {
     let field = {
-        let mut guard = store.lock().expect("wasm store poisoned");
-        let tag = exn.tag(&mut *guard).ok()?;
+        let mut guard = store.try_lock().map_err(|_| {
+            intrinsic(
+                ErrorKind::WasmRuntimeError,
+                "re-entrant WebAssembly call is not supported",
+            )
+        })?;
+        let tag = exn
+            .tag(&mut *guard)
+            .map_err(|error| from_wasmtime(error, ErrorKind::WasmRuntimeError))?;
         if !WtTag::eq(&tag, &js_tag, &*guard) {
-            return None;
+            return Ok(None);
         }
-        exn.field(&mut *guard, 0).ok()?
+        exn.field(&mut *guard, 0)
+            .map_err(|error| from_wasmtime(error, ErrorKind::WasmRuntimeError))?
     };
     match field {
-        Val::ExternRef(handle) => Some(extern_ref_to_js(cx, store, handle)),
-        _ => None,
+        Val::ExternRef(handle) => extern_ref_to_js(cx, store, handle).map(Some),
+        _ => Err(JsError::Native(NativeError::InvalidOperand)),
     }
 }
 
-/// Resolve the hidden `WebAssembly.__throw` re-thrower: `(v) => { throw v; }`.
-/// A native cannot set the VM's pending-throw slot directly, so it calls this
-/// to throw a JS value with its identity preserved.
-fn namespace_thrower<'s>(cx: &mut MarshalCx<'_, '_, 's>) -> Option<JsValue<'s>> {
-    let namespace = cx.ctx().global_value("WebAssembly")?;
-    let handle = cx.park(namespace);
-    let thrower = cx.get(handle, "__throw").ok()?;
-    cx.is_callable(thrower).then_some(thrower)
-}
-
-/// Throw a JS `value` out of a native, preserving its identity. Calls the
-/// `WebAssembly.__throw` re-thrower so the VM parks `value` as the pending
-/// throw; the returned [`NativeError`] then routes through the uncaught path
-/// that surfaces that parked value verbatim.
-fn throw_js_value(
-    cx: &mut MarshalCx<'_, '_, '_>,
-    value: JsValue<'_>,
-    name: &'static str,
-) -> NativeError {
-    let Some(thrower) = namespace_thrower(cx) else {
-        return NativeError::Thrown {
-            name,
-            message: "WebAssembly exception".to_string(),
-        };
-    };
-    let this = cx.undefined();
-    match cx.call(thrower, this, &[value]) {
-        Ok(_) => NativeError::Thrown {
-            name,
-            message: "WebAssembly exception".to_string(),
-        },
-        Err(err) => err.into_native(name),
-    }
-}
-
-/// Surface a failed export call to JS: a plain trap becomes its typed error; a
-/// wasm exception becomes a `WebAssembly.Exception` object (or, for a `JSTag`
-/// exception, the original JS value it carries) thrown with identity intact.
+/// Surface actual host failures unchanged, and actual Wasm traps through the
+/// pinned intrinsic class. Exception payloads use the canonical native throw.
 fn surface_call_failure(
     cx: &mut MarshalCx<'_, '_, '_>,
     store: &SharedStore,
@@ -587,24 +343,24 @@ fn surface_call_failure(
 ) -> NativeError {
     const NAME: &str = "WebAssembly.Instance exported function";
     match failure {
-        CallFailure::Throw(throw) => NativeError::Thrown {
-            name: NAME,
-            message: format!("{}: {}", throw.kind, throw.message),
-        },
+        CallFailure::Error(error) => {
+            from_wasmtime(error, ErrorKind::WasmRuntimeError).into_native(NAME)
+        }
         CallFailure::Exception(exn) => {
             let value = match js_tag_payload(cx, store, js_tag, exn) {
-                Some(value) => value,
-                None => match (WasmException {
+                Ok(Some(value)) => value,
+                Ok(None) => match (WasmException {
                     store: store.clone(),
                     exn,
                 })
                 .into_js(cx)
                 {
                     Ok(value) => value,
-                    Err(err) => return err.into_native(NAME),
+                    Err(error) => return error.into_native(NAME),
                 },
+                Err(error) => return error.into_native(NAME),
             };
-            throw_js_value(cx, value, NAME)
+            throw_value(cx, value, NAME)
         }
     }
 }
@@ -641,13 +397,16 @@ fn make_export_function<'s>(
             }
             let out = match outputs.as_slice() {
                 [] => cx.undefined(),
-                [single] => val_to_js(&mut cx, &store, single),
+                [single] => val_to_js(&mut cx, &store, single)
+                    .map_err(|error| error.into_native("WebAssembly.Instance exported function"))?,
                 many => {
                     let array = cx
                         .array(many.len())
                         .map_err(|err| err.into_native("WebAssembly.Instance exported function"))?;
                     for (index, value) in many.iter().enumerate() {
-                        let element = val_to_js(&mut cx, &store, value);
+                        let element = val_to_js(&mut cx, &store, value).map_err(|error| {
+                            error.into_native("WebAssembly.Instance exported function")
+                        })?;
                         cx.set_index(array, index, element).map_err(|err| {
                             err.into_native("WebAssembly.Instance exported function")
                         })?;
@@ -663,11 +422,13 @@ fn make_export_function<'s>(
 }
 
 /// The `[[Prototype]]` a built `Instance` object must carry.
-fn instance_prototype<'s>(cx: &mut MarshalCx<'_, '_, 's>) -> Option<JsValue<'s>> {
-    let namespace = cx.ctx().global_value("WebAssembly")?;
+fn instance_prototype<'s>(cx: &mut MarshalCx<'_, '_, 's>) -> Result<Option<JsValue<'s>>, JsError> {
+    let Some(namespace) = cx.ctx().global_value("WebAssembly") else {
+        return Ok(None);
+    };
     let namespace = cx.park(namespace);
-    let proto = cx.get(namespace, "__instanceProto").ok()?;
-    cx.is_object(proto).then_some(proto)
+    let proto = cx.get(namespace, "__instanceProto")?;
+    Ok(cx.is_object(proto).then_some(proto))
 }
 
 /// Assemble the exports module-namespace object for an instantiated module.
@@ -676,7 +437,7 @@ fn build_exports<'s>(
     store: &SharedStore,
     js_tag: WtTag,
     instance: WtInstance,
-) -> Result<JsValue<'s>, WasmThrow> {
+) -> Result<JsValue<'s>, JsError> {
     let exports: Vec<(String, Extern)> = {
         let mut guard = store.lock().expect("wasm store poisoned");
         instance
@@ -684,18 +445,15 @@ fn build_exports<'s>(
             .map(|export| (export.name().to_string(), export.into_extern()))
             .collect()
     };
-    let object = cx.object().map_err(WasmThrow::from_js)?;
+    let object = cx.object()?;
     for (name, item) in exports {
         let value = match item {
-            Extern::Func(func) => {
-                make_export_function(cx, store, js_tag, func).map_err(WasmThrow::from_js)?
-            }
+            Extern::Func(func) => make_export_function(cx, store, js_tag, func)?,
             Extern::Memory(memory) => WasmMemory {
                 store: store.clone(),
                 memory,
             }
-            .into_js(cx)
-            .map_err(WasmThrow::from_js)?,
+            .into_js(cx)?,
             Extern::Global(global) => {
                 let content = global
                     .ty(&mut *store.lock().expect("wasm store poisoned"))
@@ -706,24 +464,17 @@ fn build_exports<'s>(
                     global,
                     content,
                 }
-                .into_js(cx)
-                .map_err(WasmThrow::from_js)?
+                .into_js(cx)?
             }
             Extern::Table(table) => WasmTable {
                 store: store.clone(),
                 table,
             }
-            .into_js(cx)
-            .map_err(WasmThrow::from_js)?,
-            Extern::Tag(tag) => WasmTag {
-                store: store.clone(),
-                tag,
-            }
-            .into_js(cx)
-            .map_err(WasmThrow::from_js)?,
+            .into_js(cx)?,
+            Extern::Tag(tag) => WasmTag::ready(store.clone(), tag).into_js(cx)?,
             _ => continue,
         };
-        cx.set(object, &name, value).map_err(WasmThrow::from_js)?;
+        cx.set(object, &name, value)?;
     }
     Ok(object)
 }
@@ -733,16 +484,11 @@ fn build_exports<'s>(
 fn make_instance_object<'s>(
     cx: &mut MarshalCx<'_, '_, 's>,
     exports: JsValue<'s>,
-) -> Result<JsValue<'s>, WasmThrow> {
-    let instance = cx.object().map_err(WasmThrow::from_js)?;
-    cx.set(instance, "exports", exports)
-        .map_err(WasmThrow::from_js)?;
-    if let Some(proto) = instance_prototype(cx) {
-        let proto_raw = cx.escape(proto);
-        let instance_raw = cx.escape(instance);
-        if let Some(object) = instance_raw.as_object() {
-            object::set_prototype_value(object, cx.heap_mut(), Some(proto_raw));
-        }
+) -> Result<JsValue<'s>, JsError> {
+    let instance = cx.object()?;
+    cx.set(instance, "exports", exports)?;
+    if let Some(proto) = instance_prototype(cx)? {
+        cx.set_prototype(instance, Some(proto))?;
     }
     Ok(instance)
 }
@@ -753,16 +499,16 @@ fn resolve_import<'s>(
     import_object: JsValue<'s>,
     module: &str,
     name: &str,
-) -> Option<JsValue<'s>> {
+) -> Result<Option<JsValue<'s>>, JsError> {
     if cx.is_nullish(import_object) {
-        return None;
+        return Ok(None);
     }
-    let submodule = cx.get(import_object, module).ok()?;
+    let submodule = cx.get(import_object, module)?;
     if cx.is_nullish(submodule) {
-        return None;
+        return Ok(None);
     }
-    let value = cx.get(submodule, name).ok()?;
-    (!cx.is_undefined(value)).then_some(value)
+    let value = cx.get(submodule, name)?;
+    Ok((!cx.is_undefined(value)).then_some(value))
 }
 
 /// Instantiate `module` with `import_object`, returning the `Instance` object.
@@ -770,12 +516,8 @@ fn instantiate_core<'s>(
     cx: &mut MarshalCx<'_, '_, 's>,
     module: &WasmModule,
     import_object: JsValue<'s>,
-) -> Result<JsValue<'s>, WasmThrow> {
-    let WasmRealm {
-        engine,
-        store,
-        js_tag,
-    } = realm_handle(cx).map_err(WasmThrow::from_js)?;
+) -> Result<JsValue<'s>, JsError> {
+    let (engine, store, js_tag) = realm_handle(cx)?.resolve()?;
     let mut linker: Linker<StoreState> = Linker::new(&engine);
 
     let imports: Vec<(String, String, ExternType)> = module
@@ -793,77 +535,108 @@ fn instantiate_core<'s>(
     for (module_name, field, ty) in &imports {
         match ty {
             ExternType::Func(func_ty) => {
-                let Some(callback) = resolve_import(cx, import_object, module_name, field) else {
-                    return Err(WasmThrow::link(format!(
-                        "import '{module_name}.{field}' is not provided"
-                    )));
+                let Some(callback) = resolve_import(cx, import_object, module_name, field)? else {
+                    return Err(intrinsic(
+                        ErrorKind::WasmLinkError,
+                        format!("import '{module_name}.{field}' is not provided"),
+                    ));
                 };
                 if !cx.is_callable(callback) {
-                    return Err(WasmThrow::link(format!(
-                        "import '{module_name}.{field}' is not a function"
-                    )));
+                    return Err(intrinsic(
+                        ErrorKind::WasmLinkError,
+                        format!("import '{module_name}.{field}' is not a function"),
+                    ));
                 }
                 let callback_raw = cx.escape(callback);
                 let root = cx.ctx().persistent_root_insert(callback_raw);
                 let results: Vec<ValType> = func_ty.results().collect();
-                let import_store = store.clone();
                 linker
                     .func_new(
                         module_name,
                         field,
                         func_ty.clone(),
-                        move |mut caller: Caller<'_, StoreState>, params, outputs| {
-                            let bridge = caller.data().bridge;
-                            match run_import(&import_store, bridge, params, outputs, root, &results)
-                            {
-                                Ok(()) => Ok(()),
-                                Err(ImportFailure::Fatal(err)) => Err(err),
-                                Err(ImportFailure::JsThrow(parked)) => {
-                                    throw_js_via_jstag(&mut caller, js_tag, parked)
-                                }
+                        move |mut caller: Caller<'_, StoreState>, params, outputs| match run_import(
+                            &mut caller,
+                            params,
+                            outputs,
+                            root,
+                            &results,
+                        ) {
+                            Ok(()) => Ok(()),
+                            Err(ImportFailure::Fatal(err)) => Err(err),
+                            Err(ImportFailure::JsThrow(parked)) => {
+                                throw_js_via_jstag(&mut caller, js_tag, parked)
                             }
                         },
                     )
-                    .map_err(|err| WasmThrow::link(err.to_string()))?;
+                    .map_err(|err| from_wasmtime(err, ErrorKind::WasmLinkError))?;
             }
             ExternType::Memory(_)
             | ExternType::Global(_)
             | ExternType::Table(_)
             | ExternType::Tag(_) => {
-                let Some(provided) = resolve_import(cx, import_object, module_name, field) else {
-                    return Err(WasmThrow::link(format!(
-                        "import '{module_name}.{field}' is not provided"
-                    )));
+                let Some(provided) = resolve_import(cx, import_object, module_name, field)? else {
+                    return Err(intrinsic(
+                        ErrorKind::WasmLinkError,
+                        format!("import '{module_name}.{field}' is not provided"),
+                    ));
                 };
-                let ext = import_extern(cx, provided).ok_or_else(|| {
-                    WasmThrow::link(format!(
+                let ext = import_extern(cx, provided)?.ok_or_else(|| {
+                    intrinsic(ErrorKind::WasmLinkError, format!(
                         "import '{module_name}.{field}' is not a WebAssembly Memory/Table/Global/Tag"
                     ))
                 })?;
                 let mut guard = store.lock().expect("wasm store poisoned");
                 linker
                     .define(&mut *guard, module_name, field, ext)
-                    .map_err(|err| WasmThrow::link(err.to_string()))?;
+                    .map_err(|err| from_wasmtime(err, ErrorKind::WasmLinkError))?;
             }
         }
     }
 
-    let instance = {
+    let outcome = {
         let ctx_ptr: *mut NativeCtx<'_> = cx.ctx();
         let bridge = Bridge {
             ctx: ctx_ptr as usize,
         };
-        let mut guard = store.lock().expect("wasm store poisoned");
+        let mut guard = store.try_lock().map_err(|_| {
+            intrinsic(
+                ErrorKind::WasmRuntimeError,
+                "re-entrant WebAssembly call is not supported",
+            )
+        })?;
         guard.data_mut().bridge = &bridge as *const Bridge as usize;
         let outcome = linker.instantiate(&mut *guard, &module.module);
         guard.data_mut().bridge = 0;
-        outcome.map_err(|err| {
-            if err.downcast_ref::<wasmtime::Trap>().is_some() {
-                WasmThrow::runtime(err.to_string())
+        match outcome {
+            Ok(instance) => Ok(instance),
+            Err(error) if error.is::<ThrownException>() => match guard.take_pending_exception() {
+                Some(exn) => Err(CallFailure::Exception(exn)),
+                None => Err(CallFailure::Error(wasmtime::Error::new(JsError::Native(
+                    NativeError::InvalidOperand,
+                )))),
+            },
+            Err(error) => Err(CallFailure::Error(error)),
+        }
+    };
+    let instance = match outcome {
+        Ok(instance) => instance,
+        Err(CallFailure::Exception(exn)) => {
+            return Err(JsError::Native(surface_call_failure(
+                cx,
+                &store,
+                js_tag,
+                CallFailure::Exception(exn),
+            )));
+        }
+        Err(CallFailure::Error(error)) => {
+            let kind = if error.is::<wasmtime::Trap>() {
+                ErrorKind::WasmRuntimeError
             } else {
-                WasmThrow::link(err.to_string())
-            }
-        })?
+                ErrorKind::WasmLinkError
+            };
+            return Err(from_wasmtime(error, kind));
+        }
     };
 
     let exports = build_exports(cx, &store, js_tag, instance)?;
@@ -872,43 +645,44 @@ fn instantiate_core<'s>(
 
 /// Extract the wasmtime [`Extern`] backing an imported Memory/Table/Global/Tag
 /// JS wrapper (all share the realm store, so the handle is valid).
-fn import_extern(cx: &mut MarshalCx<'_, '_, '_>, value: JsValue<'_>) -> Option<Extern> {
+fn import_extern(
+    cx: &mut MarshalCx<'_, '_, '_>,
+    value: JsValue<'_>,
+) -> Result<Option<Extern>, JsError> {
     if let Ok(memory) = cx.with_host_data::<WasmMemory, WtMemory>(value, |m| m.memory) {
-        return Some(Extern::Memory(memory));
+        return Ok(Some(Extern::Memory(memory)));
     }
     if let Ok(global) = cx.with_host_data::<WasmGlobal, WtGlobal>(value, |g| g.global) {
-        return Some(Extern::Global(global));
+        return Ok(Some(Extern::Global(global)));
     }
     if let Ok(table) = cx.with_host_data::<WasmTable, WtTable>(value, |t| t.table) {
-        return Some(Extern::Table(table));
+        return Ok(Some(Extern::Table(table)));
     }
-    if let Ok(tag) = cx.with_host_data::<WasmTag, WtTag>(value, |t| t.tag) {
-        return Some(Extern::Tag(tag));
+    if let Ok(tag) = cx.with_host_data::<WasmTag, WasmTag>(value, Clone::clone) {
+        return Ok(Some(Extern::Tag(tag.resolve()?.1)));
     }
-    None
+    Ok(None)
 }
 
 /// Compile `bytes` into a `Module` object.
 fn compile_module<'s>(
     cx: &mut MarshalCx<'_, '_, 's>,
     handle: JsValue<'s>,
-) -> Result<JsValue<'s>, WasmThrow> {
+) -> Result<JsValue<'s>, JsError> {
     let bytes = cx
         .buffer_source_bytes(handle)
-        .ok_or_else(|| WasmThrow::type_error("expected a BufferSource of wasm bytes"))?;
-    let (engine, _store) = realm(cx).map_err(WasmThrow::from_js)?;
-    let module =
-        WtModule::new(&engine, &bytes).map_err(|err| WasmThrow::compile(err.to_string()))?;
-    WasmModule { module }
-        .into_js(cx)
-        .map_err(WasmThrow::from_js)
+        .ok_or_else(|| JsError::type_error("expected a BufferSource of wasm bytes"))?;
+    let (engine, _store) = realm(cx)?;
+    let module = WtModule::new(&engine, &bytes)
+        .map_err(|err| from_wasmtime(err, ErrorKind::WasmCompileError))?;
+    WasmModule { module }.into_js(cx)
 }
 
 /// Complete a namespace async method: fulfil with `result` or reject with the
 /// typed error it describes.
 fn settle_promise(
     cx: &mut MarshalCx<'_, '_, '_>,
-    result: Result<JsValue<'_>, WasmThrow>,
+    result: Result<JsValue<'_>, JsError>,
     operation: &'static str,
 ) -> Result<Value, NativeError> {
     match result {
@@ -918,8 +692,9 @@ fn settle_promise(
                 .map_err(|err| err.into_native(operation))?;
             Ok(cx.escape(promise))
         }
-        Err(throw) => {
-            let reason = throw.to_value(cx);
+        Err(error) => {
+            let reason =
+                catchable_value(cx, error).map_err(|error| error.into_native(operation))?;
             let promise = cx
                 .promise_rejected(reason)
                 .map_err(|err| err.into_native(operation))?;
@@ -943,8 +718,14 @@ impl WebAssembly {
                 let v = cx.boolean(false);
                 return Ok(cx.escape(v));
             };
-            let ok = match realm(&mut cx) {
-                Ok((engine, _)) => WtModule::validate(&engine, &bytes).is_ok(),
+            let (engine, _) =
+                realm(&mut cx).map_err(|error| error.into_native("WebAssembly.validate"))?;
+            let ok = match WtModule::validate(&engine, &bytes) {
+                Ok(()) => true,
+                Err(error) if error.is::<wasmtime::OutOfMemory>() => {
+                    return Err(from_wasmtime(error, ErrorKind::WasmCompileError)
+                        .into_native("WebAssembly.validate"));
+                }
                 Err(_) => false,
             };
             let v = cx.boolean(ok);
@@ -984,17 +765,36 @@ impl WebAssembly {
             let imports = cx.park(args.get(1).copied().unwrap_or_else(Value::undefined));
             let module = cx
                 .with_host_data::<WasmModule, WasmModule>(module_handle, Clone::clone)
-                .map_err(|_| NativeError::Thrown {
-                    name: "WebAssembly.Instance",
-                    message: "LinkError: first argument must be a WebAssembly.Module".to_string(),
+                .map_err(|_| {
+                    JsError::Type("first argument must be a WebAssembly.Module".into())
+                        .into_native("WebAssembly.Instance")
                 })?;
-            match instantiate_core(&mut cx, &module, imports) {
-                Ok(instance) => Ok(cx.escape(instance)),
-                Err(throw) => Err(NativeError::Thrown {
-                    name: "WebAssembly.Instance",
-                    message: format!("{}: {}", throw.kind, throw.message),
-                }),
+            let instance = instantiate_core(&mut cx, &module, imports)
+                .map_err(|error| error.into_native("WebAssembly.Instance"))?;
+            Ok(cx.escape(instance))
+        })
+    }
+
+    /// Expose original pinned constructors through the static namespace
+    /// bootstrap. This hook is moved into the private factory bag by the macro.
+    #[method(name = "__errorClasses", length = 0, raw)]
+    fn error_classes(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+        ctx.scope(|mut scope| {
+            let classes = scope.object()?;
+            for kind in [
+                ErrorKind::WasmCompileError,
+                ErrorKind::WasmLinkError,
+                ErrorKind::WasmRuntimeError,
+            ] {
+                let constructor = scope.error_constructor(kind);
+                scope.define(
+                    classes,
+                    kind.class_name(),
+                    constructor,
+                    object::PropertyFlags::new(true, false, true),
+                )?;
             }
+            Ok(scope.finish(classes))
         })
     }
 
@@ -1007,12 +807,9 @@ impl WebAssembly {
             let mut cx = MarshalCx::new(scope);
             let realm =
                 realm_handle(&mut cx).map_err(|err| err.into_native("WebAssembly.JSTag"))?;
-            let value = WasmTag {
-                store: realm.store,
-                tag: realm.js_tag,
-            }
-            .into_js(&mut cx)
-            .map_err(|err| err.into_native("WebAssembly.JSTag"))?;
+            let value = WasmTag::js_tag(realm)
+                .into_js(&mut cx)
+                .map_err(|err| err.into_native("WebAssembly.JSTag"))?;
             Ok(cx.escape(value))
         })
     }
@@ -1023,24 +820,22 @@ fn instantiate_entry<'s>(
     cx: &mut MarshalCx<'_, '_, 's>,
     source: JsValue<'s>,
     imports: JsValue<'s>,
-) -> Result<JsValue<'s>, WasmThrow> {
+) -> Result<JsValue<'s>, JsError> {
     if let Ok(module) = cx.with_host_data::<WasmModule, WasmModule>(source, Clone::clone) {
         return instantiate_core(cx, &module, imports);
     }
     let bytes = cx
         .buffer_source_bytes(source)
-        .ok_or_else(|| WasmThrow::type_error("expected a BufferSource or a WebAssembly.Module"))?;
-    let (engine, _store) = realm(cx).map_err(WasmThrow::from_js)?;
-    let module =
-        WtModule::new(&engine, &bytes).map_err(|err| WasmThrow::compile(err.to_string()))?;
+        .ok_or_else(|| JsError::type_error("expected a BufferSource or a WebAssembly.Module"))?;
+    let (engine, _store) = realm(cx)?;
+    let module = WtModule::new(&engine, &bytes)
+        .map_err(|err| from_wasmtime(err, ErrorKind::WasmCompileError))?;
     let module = WasmModule { module };
     let instance = instantiate_core(cx, &module, imports)?;
-    let module_js = module.into_js(cx).map_err(WasmThrow::from_js)?;
-    let result = cx.object().map_err(WasmThrow::from_js)?;
-    cx.set(result, "module", module_js)
-        .map_err(WasmThrow::from_js)?;
-    cx.set(result, "instance", instance)
-        .map_err(WasmThrow::from_js)?;
+    let module_js = module.into_js(cx)?;
+    let result = cx.object()?;
+    cx.set(result, "module", module_js)?;
+    cx.set(result, "instance", instance)?;
     Ok(result)
 }
 
@@ -1057,17 +852,14 @@ impl WasmModule {
         ctx.scope(|scope| {
             let mut cx = MarshalCx::new(scope);
             let handle = cx.park(args.first().copied().unwrap_or_else(Value::undefined));
-            let bytes = cx
-                .buffer_source_bytes(handle)
-                .ok_or_else(|| NativeError::Thrown {
-                    name: "WebAssembly.Module",
-                    message: "TypeError: expected a BufferSource of wasm bytes".to_string(),
-                })?;
+            let bytes = cx.buffer_source_bytes(handle).ok_or_else(|| {
+                JsError::Type("expected a BufferSource of wasm bytes".into())
+                    .into_native("WebAssembly.Module")
+            })?;
             let (engine, _store) =
-                realm(&mut cx).map_err(|err| err.into_native("WebAssembly.Module"))?;
-            let module = WtModule::new(&engine, &bytes).map_err(|err| NativeError::Thrown {
-                name: "WebAssembly.Module",
-                message: format!("CompileError: {err}"),
+                realm(&mut cx).map_err(|error| error.into_native("WebAssembly.Module"))?;
+            let module = WtModule::new(&engine, &bytes).map_err(|error| {
+                from_wasmtime(error, ErrorKind::WasmCompileError).into_native("WebAssembly.Module")
             })?;
             let value = WasmModule { module }
                 .into_js(&mut cx)
@@ -1113,9 +905,8 @@ impl WasmMemory {
             );
             let memory = {
                 let mut guard = store.lock().expect("wasm store poisoned");
-                WtMemory::new(&mut *guard, ty).map_err(|err| NativeError::Thrown {
-                    name: "WebAssembly.Memory",
-                    message: format!("RangeError: {err}"),
+                WtMemory::new(&mut *guard, ty).map_err(|err| {
+                    from_wasmtime(err, ErrorKind::RangeError).into_native("WebAssembly.Memory")
                 })?
             };
             let value = WasmMemory {
@@ -1141,7 +932,7 @@ impl WasmMemory {
         let previous = self
             .memory
             .grow(&mut *guard, delta as u64)
-            .map_err(|err| JsError::Range(format!("Memory.grow: {err}")))?;
+            .map_err(|err| from_wasmtime(err, ErrorKind::RangeError))?;
         Ok(previous as f64)
     }
 }
@@ -1198,9 +989,8 @@ impl WasmGlobal {
                     GlobalType::new(content.clone(), mutability),
                     value,
                 )
-                .map_err(|err| NativeError::Thrown {
-                    name: "WebAssembly.Global",
-                    message: format!("TypeError: {err}"),
+                .map_err(|err| {
+                    from_wasmtime(err, ErrorKind::TypeError).into_native("WebAssembly.Global")
                 })?
             };
             let out = WasmGlobal {
@@ -1223,7 +1013,8 @@ impl WasmGlobal {
                 let mut guard = store.lock().expect("wasm store poisoned");
                 self.global.get(&mut *guard)
             };
-            let out = val_to_js(&mut cx, &store, &val);
+            let out = val_to_js(&mut cx, &store, &val)
+                .map_err(|error| error.into_native("WebAssembly.Global"))?;
             Ok(cx.escape(out))
         })
     }
@@ -1238,12 +1029,9 @@ impl WasmGlobal {
             let new_value = js_to_val(&mut cx, &store, handle, &content)
                 .map_err(|err| err.into_native("WebAssembly.Global"))?;
             let mut guard = store.lock().expect("wasm store poisoned");
-            self.global
-                .set(&mut *guard, new_value)
-                .map_err(|err| NativeError::Thrown {
-                    name: "WebAssembly.Global",
-                    message: format!("TypeError: {err}"),
-                })?;
+            self.global.set(&mut *guard, new_value).map_err(|err| {
+                from_wasmtime(err, ErrorKind::TypeError).into_native("WebAssembly.Global")
+            })?;
             Ok(Value::undefined())
         })
     }
@@ -1281,11 +1069,10 @@ impl WasmTable {
             let element = parse_val_type(&descriptor.element)
                 .map_err(|err| err.into_native("WebAssembly.Table"))?;
             let ValType::Ref(ref_ty) = &element else {
-                return Err(NativeError::Thrown {
-                    name: "WebAssembly.Table",
-                    message: "TypeError: Table element must be 'funcref' or 'externref'"
-                        .to_string(),
-                });
+                return Err(
+                    JsError::Type("Table element must be 'funcref' or 'externref'".into())
+                        .into_native("WebAssembly.Table"),
+                );
             };
             let (_engine, store) =
                 realm(&mut cx).map_err(|err| err.into_native("WebAssembly.Table"))?;
@@ -1299,9 +1086,8 @@ impl WasmTable {
             );
             let table = {
                 let mut guard = store.lock().expect("wasm store poisoned");
-                WtTable::new(&mut *guard, ty, init_ref).map_err(|err| NativeError::Thrown {
-                    name: "WebAssembly.Table",
-                    message: format!("RangeError: {err}"),
+                WtTable::new(&mut *guard, ty, init_ref).map_err(|err| {
+                    from_wasmtime(err, ErrorKind::RangeError).into_native("WebAssembly.Table")
                 })?
             };
             let out = WasmTable {
@@ -1335,13 +1121,12 @@ impl WasmTable {
                 table.get(&mut *guard, index)
             };
             let out = match cell {
-                Some(Ref::Extern(handle)) => extern_ref_to_js(&mut cx, &store, handle),
+                Some(Ref::Extern(handle)) => extern_ref_to_js(&mut cx, &store, handle)
+                    .map_err(|error| error.into_native("WebAssembly.Table"))?,
                 Some(Ref::Func(_)) | Some(_) => cx.null(),
                 None => {
-                    return Err(NativeError::Thrown {
-                        name: "WebAssembly.Table",
-                        message: "RangeError: Table.get index out of bounds".to_string(),
-                    });
+                    return Err(JsError::Range("Table.get index out of bounds".into())
+                        .into_native("WebAssembly.Table"));
                 }
             };
             Ok(cx.escape(out))
@@ -1366,12 +1151,9 @@ impl WasmTable {
             let new_ref = table_init_ref(&mut cx, &store, ref_ty, value_handle)
                 .map_err(|err| err.into_native("WebAssembly.Table"))?;
             let mut guard = store.lock().expect("wasm store poisoned");
-            table
-                .set(&mut *guard, index, new_ref)
-                .map_err(|err| NativeError::Thrown {
-                    name: "WebAssembly.Table",
-                    message: format!("RangeError: {err}"),
-                })?;
+            table.set(&mut *guard, index, new_ref).map_err(|err| {
+                from_wasmtime(err, ErrorKind::RangeError).into_native("WebAssembly.Table")
+            })?;
             Ok(Value::undefined())
         })
     }
@@ -1418,8 +1200,10 @@ fn read_tag_parameters(
 
 /// Resolve the wasmtime [`Tag`] backing a JS `WebAssembly.Tag` argument.
 fn tag_argument(cx: &mut MarshalCx<'_, '_, '_>, value: JsValue<'_>) -> Result<WtTag, JsError> {
-    cx.with_host_data::<WasmTag, WtTag>(value, |t| t.tag)
-        .map_err(|_| JsError::Type("expected a WebAssembly.Tag".to_string()))
+    let tag = cx
+        .with_host_data::<WasmTag, WasmTag>(value, Clone::clone)
+        .map_err(|_| JsError::Type("expected a WebAssembly.Tag".to_string()))?;
+    Ok(tag.resolve()?.1)
 }
 
 /// `WebAssembly.Tag`: a wasm exception tag in the shared realm store. A `Tag`
@@ -1427,8 +1211,40 @@ fn tag_argument(cx: &mut MarshalCx<'_, '_, '_>, value: JsValue<'_>) -> Result<Wt
 /// identity (`WebAssembly.Exception.prototype.is`).
 #[derive(Clone, HostClass)]
 pub struct WasmTag {
-    store: SharedStore,
-    tag: WtTag,
+    backing: TagBacking,
+}
+
+/// The canonical JSTag shell holds the same first-use realm owner. User and
+/// exported tags already have an actual Store handle; neither path adds a
+/// second tag registry or changes the wrapper's JavaScript identity.
+#[derive(Clone)]
+enum TagBacking {
+    JsTag(WasmRealm),
+    Ready { store: SharedStore, tag: WtTag },
+}
+
+impl WasmTag {
+    fn js_tag(realm: WasmRealm) -> Self {
+        Self {
+            backing: TagBacking::JsTag(realm),
+        }
+    }
+
+    fn ready(store: SharedStore, tag: WtTag) -> Self {
+        Self {
+            backing: TagBacking::Ready { store, tag },
+        }
+    }
+
+    fn resolve(&self) -> Result<(SharedStore, WtTag), JsError> {
+        match &self.backing {
+            TagBacking::JsTag(realm) => {
+                let (_, store, tag) = realm.resolve()?;
+                Ok((store, tag))
+            }
+            TagBacking::Ready { store, tag } => Ok((store.clone(), *tag)),
+        }
+    }
 }
 
 #[js_class(name = "WebAssembly.Tag", feature = WEB)]
@@ -1444,7 +1260,7 @@ impl WasmTag {
                 realm(&mut cx).map_err(|err| err.into_native("WebAssembly.Tag"))?;
             let tag = make_tag(&engine, &store, &params)
                 .map_err(|err| err.into_native("WebAssembly.Tag"))?;
-            let value = WasmTag { store, tag }
+            let value = WasmTag::ready(store, tag)
                 .into_js(&mut cx)
                 .map_err(|err| err.into_native("WebAssembly.Tag"))?;
             Ok(cx.escape(value))
@@ -1455,8 +1271,9 @@ impl WasmTag {
     /// from.
     #[method(name = "type", length = 0, raw)]
     fn type_of(&self, ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
-        let store = self.store.clone();
-        let tag = self.tag;
+        let (store, tag) = self
+            .resolve()
+            .map_err(|error| error.into_native("WebAssembly.Tag"))?;
         ctx.scope(|scope| {
             let mut cx = MarshalCx::new(scope);
             let params: Vec<ValType> = {
@@ -1524,14 +1341,12 @@ impl WasmException {
                 .iterate_to_handles(payload_handle)
                 .map_err(|err| err.into_native("WebAssembly.Exception"))?;
             if payload.len() != param_types.len() {
-                return Err(NativeError::Thrown {
-                    name: "WebAssembly.Exception",
-                    message: format!(
-                        "TypeError: expected {} payload values, got {}",
-                        param_types.len(),
-                        payload.len()
-                    ),
-                });
+                return Err(JsError::Type(format!(
+                    "expected {} payload values, got {}",
+                    param_types.len(),
+                    payload.len()
+                ))
+                .into_native("WebAssembly.Exception"));
             }
             let mut fields: Vec<Val> = Vec::with_capacity(param_types.len());
             for (value, ty) in payload.into_iter().zip(&param_types) {
@@ -1543,14 +1358,11 @@ impl WasmException {
             let exn = {
                 let mut guard = store.lock().expect("wasm store poisoned");
                 let exn_ty = ExnType::from_tag_type(&tag.ty(&*guard)).map_err(|err| {
-                    JsError::Type(err.to_string()).into_native("WebAssembly.Exception")
+                    from_wasmtime(err, ErrorKind::TypeError).into_native("WebAssembly.Exception")
                 })?;
                 let pre = ExnRefPre::new(&mut *guard, exn_ty);
                 ExnRef::new(&mut *guard, &pre, &tag, &fields).map_err(|err| {
-                    NativeError::Thrown {
-                        name: "WebAssembly.Exception",
-                        message: format!("TypeError: {err}"),
-                    }
+                    from_wasmtime(err, ErrorKind::TypeError).into_native("WebAssembly.Exception")
                 })?
             };
             let value = WasmException {
@@ -1575,10 +1387,10 @@ impl WasmException {
                 .map_err(|err| err.into_native("WebAssembly.Exception"))?;
             let matches = {
                 let mut guard = store.lock().expect("wasm store poisoned");
-                match exn.tag(&mut *guard) {
-                    Ok(own) => WtTag::eq(&own, &tag, &*guard),
-                    Err(_) => false,
-                }
+                let own = exn.tag(&mut *guard).map_err(|error| {
+                    from_wasmtime(error, ErrorKind::TypeError).into_native("WebAssembly.Exception")
+                })?;
+                WtTag::eq(&own, &tag, &*guard)
             };
             let out = cx.boolean(matches);
             Ok(cx.escape(out))
@@ -1604,30 +1416,24 @@ impl WasmException {
                 as usize;
             let field = {
                 let mut guard = store.lock().expect("wasm store poisoned");
-                let own = exn.tag(&mut *guard).map_err(|err| NativeError::Thrown {
-                    name: "WebAssembly.Exception",
-                    message: format!("TypeError: {err}"),
+                let own = exn.tag(&mut *guard).map_err(|err| {
+                    from_wasmtime(err, ErrorKind::TypeError).into_native("WebAssembly.Exception")
                 })?;
                 if !WtTag::eq(&own, &tag, &*guard) {
-                    return Err(NativeError::Thrown {
-                        name: "WebAssembly.Exception",
-                        message: "TypeError: getArg called with the wrong tag".to_string(),
-                    });
+                    return Err(JsError::Type("getArg called with the wrong tag".into())
+                        .into_native("WebAssembly.Exception"));
                 }
                 let arity = own.ty(&*guard).ty().params().len();
                 if index >= arity {
-                    return Err(NativeError::Thrown {
-                        name: "WebAssembly.Exception",
-                        message: "RangeError: getArg index out of range".to_string(),
-                    });
+                    return Err(JsError::Range("getArg index out of range".into())
+                        .into_native("WebAssembly.Exception"));
                 }
-                exn.field(&mut *guard, index)
-                    .map_err(|err| NativeError::Thrown {
-                        name: "WebAssembly.Exception",
-                        message: format!("RangeError: {err}"),
-                    })?
+                exn.field(&mut *guard, index).map_err(|err| {
+                    from_wasmtime(err, ErrorKind::RangeError).into_native("WebAssembly.Exception")
+                })?
             };
-            let out = val_to_js(&mut cx, &store, &field);
+            let out = val_to_js(&mut cx, &store, &field)
+                .map_err(|error| error.into_native("WebAssembly.Exception"))?;
             Ok(cx.escape(out))
         })
     }

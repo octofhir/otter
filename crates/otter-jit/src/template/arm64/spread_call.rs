@@ -31,6 +31,7 @@ pub(super) fn emit_spread_call_op(
     ops: &mut Assembler,
     relocations: &mut RelocationCapture,
     transitions: &crate::entry::TransitionTable,
+    return_sites: &mut crate::return_sites::ReturnSiteRecorder<'_>,
     view: &otter_vm::JitCompileSnapshot,
     code_map: Option<&mut CodeMapCapture>,
     opcode: u8,
@@ -73,6 +74,7 @@ pub(super) fn emit_spread_call_op(
         };
     emit_load_reg(ops, 1, array)?;
     dynasm!(ops ; .arch aarch64 ; mov x0, x20);
+    super::emit_cold_call_source(ops, return_sites.logical_pc, return_sites.safepoint_id);
     emit_load_runtime_stub(
         ops,
         relocations,
@@ -94,6 +96,7 @@ pub(super) fn emit_spread_call_op(
         ops,
         relocations,
         transitions,
+        return_sites,
         view,
         code_map,
         view.code_block.id,

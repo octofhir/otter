@@ -16,9 +16,10 @@
 //!   [`Local`] handle parked in the ambient scope; raw
 //!   [`Value`]s appear only at the [`MarshalCx::park`] /
 //!   [`MarshalCx::escape`] boundary.
-//! - Coercions that can re-enter user JS (`to_string` / `to_number` on
-//!   objects, iteration, callback invocation) require the call's
-//!   execution context and report [`JsError::Type`] without one.
+//! - Callable re-entry accepts the call's optional source. Bytecode callees
+//!   resolve their own defining chunk; native-only callbacks retain no source.
+//! - Coercion algorithms that require admitted bytecode metadata retain their
+//!   explicit source domain; this module does not manufacture an ambient one.
 //!
 //! # See also
 //! - [`crate::runtime_cx`] — the underlying native call context.
@@ -286,6 +287,26 @@ impl<'rt, 'cx, 's> MarshalCx<'rt, 'cx, 's> {
         self.typed_array_from_bytes(TypedArrayKind::Uint8, bytes)
     }
 
+    /// Materialize one binding failure through the VM's intrinsic error owner.
+    /// No global constructor is read or invoked. User throws keep their exact
+    /// rooted value; structural/control or materialization OOM returns Err.
+    pub fn error_value(&mut self, error: JsError) -> Result<Local<'s>, JsError> {
+        let context = self.context().cloned();
+        let error = error.into_native("host completion");
+        let value = self.ctx.with_turn_parts(|interp, stack| {
+            crate::error_ops::native_error_to_throwable_with_stack(
+                interp,
+                stack,
+                context.as_ref(),
+                error,
+            )
+        });
+        match value {
+            Ok(value) => Ok(self.park(value)),
+            Err(error) => Err(self.vm_err(error)),
+        }
+    }
+
     /// Allocate a pre-fulfilled promise carrying `value`.
     pub fn promise_fulfilled(&mut self, value: Local<'_>) -> Result<Local<'s>, JsError> {
         let scope = self.scope;
@@ -297,8 +318,9 @@ impl<'rt, 'cx, 's> MarshalCx<'rt, 'cx, 's> {
     /// Allocate a pre-rejected promise carrying `reason`.
     pub fn promise_rejected(&mut self, reason: Local<'_>) -> Result<Local<'s>, JsError> {
         let scope = self.scope;
+        let context = self.context();
         self.interp()
-            .scoped_promise_rejected(scope, reason)
+            .scoped_promise_rejected(scope, reason, context)
             .map_err(|err| self.vm_err(err))
     }
 
@@ -318,6 +340,21 @@ impl<'rt, 'cx, 's> MarshalCx<'rt, 'cx, 's> {
         let scope = self.scope;
         self.interp()
             .scoped_set(scope, obj, key, value)
+            .map_err(|err| self.vm_err(err))
+    }
+
+    /// Set the ordinary object's prototype through scoped handles. `None`
+    /// installs a null prototype. Invalid or rejected transitions and actual
+    /// allocation failures use the existing marshalling error boundary; both
+    /// handles stay collector-traced throughout the canonical transition.
+    pub fn set_prototype(
+        &mut self,
+        object: Local<'_>,
+        prototype: Option<Local<'_>>,
+    ) -> Result<(), JsError> {
+        let scope = self.scope;
+        self.interp()
+            .scoped_set_prototype(scope, object, prototype)
             .map_err(|err| self.vm_err(err))
     }
 
@@ -370,7 +407,8 @@ impl<'rt, 'cx, 's> MarshalCx<'rt, 'cx, 's> {
         let result = self
             .ctx
             .with_turn_parts(|interp, stack| interp.coerce_to_string(stack, context, &value));
-        result.map_err(|err| self.vm_err(err))
+        result
+            .map_err(|err| JsError::from_native(err.into_native(self.ctx.interp_mut(), "marshal")))
     }
 
     /// §7.1.17 `ToString`, returning WTF-16 code units (lone
@@ -389,7 +427,9 @@ impl<'rt, 'cx, 's> MarshalCx<'rt, 'cx, 's> {
         });
         match string {
             Ok(units) => Ok(units),
-            Err(err) => Err(self.vm_err(err)),
+            Err(err) => Err(JsError::from_native(
+                err.into_native(self.ctx.interp_mut(), "marshal"),
+            )),
         }
     }
 
@@ -414,7 +454,7 @@ impl<'rt, 'cx, 's> MarshalCx<'rt, 'cx, 's> {
             .with_turn_parts(|interp, stack| interp.coerce_to_number(stack, context, &value));
         result
             .map(crate::number::NumberValue::as_f64)
-            .map_err(|err| self.vm_err(err))
+            .map_err(|err| JsError::from_native(err.into_native(self.ctx.interp_mut(), "marshal")))
     }
 
     /// §7.1.2 `ToBoolean` (never re-enters).
@@ -447,7 +487,8 @@ impl<'rt, 'cx, 's> MarshalCx<'rt, 'cx, 's> {
         let handles = self.ctx.with_turn_parts(|interp, stack| {
             interp.scoped_iterate_to_handles(stack, scope, context, v)
         });
-        handles.map_err(|err| self.vm_err(err))
+        handles
+            .map_err(|err| JsError::from_native(err.into_native(self.ctx.interp_mut(), "marshal")))
     }
 
     /// Borrow the host data of a branded host object. Reports a
@@ -481,18 +522,14 @@ impl<'rt, 'cx, 's> MarshalCx<'rt, 'cx, 's> {
 
     /// Synchronously invoke the callable handle `callee` with
     /// `this_value` and `args`, parking the completion value in the
-    /// scope. Needs the call's execution context.
+    /// scope. Native-only callbacks need no source; bytecode callbacks resolve
+    /// their own defining chunk through the canonical call owner.
     pub fn call(
         &mut self,
         callee: Local<'_>,
         this_value: Local<'_>,
         args: &[Local<'_>],
     ) -> Result<Local<'s>, JsError> {
-        if self.context().is_none() {
-            return Err(JsError::Type(
-                "cannot invoke a callback without an execution context".to_string(),
-            ));
-        }
         let scope = self.scope;
         // Re-resolve every handle through the arena immediately before the
         // call. `NativeCtx::call_owned` appends above this turn's activation

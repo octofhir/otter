@@ -15,6 +15,7 @@
 //! # See also
 //! - [`crate::Interpreter::private_element_lookup`]
 
+use crate::native_abi::CommittedValueError;
 use otter_bytecode::Op;
 use smallvec::SmallVec;
 
@@ -33,49 +34,58 @@ impl Interpreter {
         dst: u16,
         obj_reg: u16,
         key_reg: u16,
-    ) -> Result<(), VmError> {
-        let receiver = *read_register(&stack[top_idx], obj_reg)?;
-        let key = *read_register(&stack[top_idx], key_reg)?;
+    ) -> Result<(), CommittedValueError> {
+        let receiver = *read_register(&stack[top_idx], obj_reg)
+            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+        let key = *read_register(&stack[top_idx], key_reg)
+            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
         let Some(sym) = key.as_symbol(&self.gc_heap) else {
-            return Err(self.err_type(
-                ("Cannot read private member from an object whose class did not declare it"
-                    .to_string())
-                .into(),
+            return Err(CommittedValueError::JavaScript(
+                self.err_type(
+                    ("Cannot read private member from an object whose class did not declare it"
+                        .to_string())
+                    .into(),
+                ),
             ));
         };
         let found = self.private_element_lookup(stack, context, &receiver, sym)?;
         let result = match found {
             None => {
-                return Err(self.err_type(
+                return Err(CommittedValueError::JavaScript(self.err_type(
                     ("Cannot read private member from an object whose class did not declare it"
                         .to_string())
                     .into(),
-                ));
+                )));
             }
             Some((_, desc)) => match desc.kind {
                 object::DescriptorKind::Data { value } => value,
                 object::DescriptorKind::Accessor { getter, .. } => match getter {
                     Some(getter) => {
-                        let receiver = *read_register(&stack[top_idx], obj_reg)?;
+                        let receiver = *read_register(&stack[top_idx], obj_reg)
+                            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
                         self.run_callable_sync_rooted(
                             stack,
-                            context,
+                            Some(context),
                             &getter,
                             receiver,
                             SmallVec::new(),
-                        )?
+                        )
+                        .map_err(CommittedValueError::completed_call)?
                     }
                     None => {
-                        return Err(
-                            self.err_type(("'#x' was defined without a getter".to_string()).into())
-                        );
+                        return Err(CommittedValueError::JavaScript(self.err_type(
+                            ("'#x' was defined without a getter".to_string()).into(),
+                        )));
                     }
                 },
             },
         };
         let frame = &mut stack[top_idx];
-        write_register(frame, dst, result)?;
-        frame.advance_pc()?;
+        write_register(frame, dst, result)
+            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+        frame
+            .advance_pc()
+            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
         Ok(())
     }
 
@@ -88,47 +98,64 @@ impl Interpreter {
         obj_reg: u16,
         key_reg: u16,
         value_reg: u16,
-    ) -> Result<(), VmError> {
-        let receiver = *read_register(&stack[top_idx], obj_reg)?;
-        let key = *read_register(&stack[top_idx], key_reg)?;
+    ) -> Result<(), CommittedValueError> {
+        let receiver = *read_register(&stack[top_idx], obj_reg)
+            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+        let key = *read_register(&stack[top_idx], key_reg)
+            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
         let Some(sym) = key.as_symbol(&self.gc_heap) else {
-            return Err(self.err_type(
-                ("Cannot write private member to an object whose class did not declare it"
-                    .to_string())
-                .into(),
+            return Err(CommittedValueError::JavaScript(
+                self.err_type(
+                    ("Cannot write private member to an object whose class did not declare it"
+                        .to_string())
+                    .into(),
+                ),
             ));
         };
         let found = self.private_element_lookup(stack, context, &receiver, sym)?;
         match found {
             None => {
-                return Err(self.err_type(
-                    ("Cannot write private member to an object whose class did not declare it"
-                        .to_string())
-                    .into(),
+                return Err(CommittedValueError::JavaScript(
+                    self.err_type(
+                        ("Cannot write private member to an object whose class did not declare it"
+                            .to_string())
+                        .into(),
+                    ),
                 ));
             }
             Some((holder, desc)) => match desc.kind {
                 object::DescriptorKind::Accessor { setter, .. } => match setter {
                     Some(setter) => {
-                        let receiver = *read_register(&stack[top_idx], obj_reg)?;
-                        let value = *read_register(&stack[top_idx], value_reg)?;
+                        let receiver = *read_register(&stack[top_idx], obj_reg)
+                            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                        let value = *read_register(&stack[top_idx], value_reg)
+                            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
                         let argv: SmallVec<[Value; 8]> = smallvec::smallvec![value];
-                        self.run_callable_sync_rooted(stack, context, &setter, receiver, argv)?;
+                        self.run_callable_sync_rooted(
+                            stack,
+                            Some(context),
+                            &setter,
+                            receiver,
+                            argv,
+                        )
+                        .map_err(CommittedValueError::completed_call)?;
                     }
                     None => {
-                        return Err(
-                            self.err_type(("'#x' was defined without a setter".to_string()).into())
-                        );
+                        return Err(CommittedValueError::JavaScript(self.err_type(
+                            ("'#x' was defined without a setter".to_string()).into(),
+                        )));
                     }
                 },
                 object::DescriptorKind::Data { .. } => {
-                    let receiver = *read_register(&stack[top_idx], obj_reg)?;
+                    let receiver = *read_register(&stack[top_idx], obj_reg)
+                        .map_err(|error| CommittedValueError::Fatal(error.into()))?;
                     if holder != receiver || !desc.flags.writable() {
-                        return Err(
-                            self.err_type(("Private method is not writable".to_string()).into())
-                        );
+                        return Err(CommittedValueError::JavaScript(
+                            self.err_type(("Private method is not writable".to_string()).into()),
+                        ));
                     }
-                    let value = *read_register(&stack[top_idx], value_reg)?;
+                    let value = *read_register(&stack[top_idx], value_reg)
+                        .map_err(|error| CommittedValueError::Fatal(error.into()))?;
                     let descriptor = object::PartialPropertyDescriptor {
                         value: Some(value),
                         ..Default::default()
@@ -138,7 +165,9 @@ impl Interpreter {
                 }
             },
         }
-        stack[top_idx].advance_pc()?;
+        stack[top_idx]
+            .advance_pc()
+            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
         Ok(())
     }
 
@@ -150,31 +179,45 @@ impl Interpreter {
         top_idx: usize,
         obj_reg: u16,
         brand_reg: u16,
-    ) -> Result<(), VmError> {
-        let receiver = *read_register(&stack[top_idx], obj_reg)?;
-        let brand = *read_register(&stack[top_idx], brand_reg)?;
+    ) -> Result<(), CommittedValueError> {
+        let receiver = *read_register(&stack[top_idx], obj_reg)
+            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+        let brand = *read_register(&stack[top_idx], brand_reg)
+            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
         let Some(sym) = brand.as_symbol(&self.gc_heap) else {
-            return Err(self.err_type(
-                ("Cannot read private member from an object whose class did not declare it"
-                    .to_string())
-                .into(),
+            return Err(CommittedValueError::JavaScript(
+                self.err_type(
+                    ("Cannot read private member from an object whose class did not declare it"
+                        .to_string())
+                    .into(),
+                ),
             ));
         };
         let key = VmPropertyKey::Symbol(sym);
         let found = if let Some(p) = receiver.as_proxy() {
             self.proxy_private_find(&p, sym).is_some()
         } else {
-            self.ordinary_get_own_property_descriptor_value(stack, context, receiver, &key, 0)?
-                .is_some()
+            self.ordinary_get_own_property_descriptor_value(
+                stack,
+                Some(context),
+                receiver,
+                &key,
+                0,
+            )?
+            .is_some()
         };
         if !found {
-            return Err(self.err_type(
-                ("Cannot read private member from an object whose class did not declare it"
-                    .to_string())
-                .into(),
+            return Err(CommittedValueError::JavaScript(
+                self.err_type(
+                    ("Cannot read private member from an object whose class did not declare it"
+                        .to_string())
+                    .into(),
+                ),
             ));
         }
-        stack[top_idx].advance_pc()?;
+        stack[top_idx]
+            .advance_pc()
+            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
         Ok(())
     }
 
@@ -188,10 +231,10 @@ impl Interpreter {
         arg0: u64,
         arg1: u64,
         arg2: u64,
-    ) -> Result<(), VmError> {
+    ) -> Result<(), CommittedValueError> {
         self.record_jit_runtime_stub_class(crate::native_abi::RuntimeStubClass::Reentrant);
         if frame_index + 1 != stack.len() {
-            return Err(VmError::InvalidOperand);
+            return Err(CommittedValueError::Fatal(VmError::InvalidOperand));
         }
         let saved_pc = stack[frame_index].pc;
         match opcode {
@@ -224,7 +267,7 @@ impl Interpreter {
                     arg1 as u16,
                 )?;
             }
-            _ => return Err(VmError::InvalidOperand),
+            _ => return Err(CommittedValueError::Fatal(VmError::InvalidOperand)),
         }
         stack[frame_index].pc = saved_pc;
         Ok(())

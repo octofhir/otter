@@ -354,17 +354,6 @@ impl<'a> ActiveFrameMut<'a> {
         }
         Ok(())
     }
-    /// Initialize one actual-argument slot before frame publication.
-    pub(crate) fn write_incoming_argument(
-        &mut self,
-        index: usize,
-        value: Value,
-    ) -> Result<(), VmError> {
-        self.incoming
-            .write(index, value)
-            .then_some(())
-            .ok_or(VmError::InvalidOperand)
-    }
     /// Raw window base; no Rust slice may span allocation or JS reentry.
     #[must_use]
     pub fn register_base_ptr(&self) -> *mut Value {
@@ -406,6 +395,22 @@ impl<'a> ActiveFrameMut<'a> {
     pub fn this_value(&self) -> Value {
         self.as_ref().this_value()
     }
+    /// Publish the exact initialized own DerivedThis context under this frame's
+    /// logical mutator ownership. The semantic CreateContext owner proves its
+    /// descriptor before this noncollecting identity-root store.
+    pub(crate) fn publish_derived_this_context(
+        &mut self,
+        source_function_id: u32,
+        context: crate::context::ContextHandle,
+    ) {
+        // SAFETY: this view owns the live record for this single noallocation store.
+        unsafe {
+            self.frame
+                .as_mut()
+                .publish_derived_this_context(source_function_id, context);
+        }
+    }
+
     /// Replace the receiver binding.
     pub fn set_this_value(&mut self, value: Value) {
         // SAFETY: one traced-slot write under logical mutator ownership.
@@ -691,7 +696,7 @@ mod tests {
 
     #[test]
     fn closure_context_reads_self_through_checked_views() {
-        let mut interp = crate::Interpreter::new();
+        let mut interp = crate::Interpreter::new().expect("fixture interpreter bootstrap");
         interp
             .with_handle_scope(|interp, scope| {
                 let context = crate::context::alloc_context_with_roots(

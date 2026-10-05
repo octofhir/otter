@@ -43,6 +43,8 @@
 //! - [`statics`] — JS-visible static method specs installed on the
 //!   `String` constructor object (`fromCharCode`, `fromCodePoint`).
 
+mod code_units;
+mod concat;
 pub mod dispatch;
 pub(crate) mod exotic;
 pub mod gc_body;

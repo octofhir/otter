@@ -3,7 +3,7 @@
 //! # Contents
 //! - [`emit`] validates the cell type, optional instance latch and optional
 //!   active-realm id, then loads the pinned realm prototype used by Template
-//!   and Machine property programs.
+//!   property programs.
 //!
 //! # Invariants
 //! - Receiver checks precede every body read; misses have no effects.

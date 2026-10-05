@@ -86,9 +86,13 @@ impl Interpreter {
                     .exec_function(frame.function_id)
                     .ok_or(VmError::InvalidOperand)?;
                 if frame.entry.is_some() != (index != 0)
-                    || frame.slots.len() != usize::from(function.register_count)
+                    || frame.register_count != function.register_count
+                    || frame
+                        .slots
+                        .iter()
+                        .any(|&(register, _)| register >= frame.register_count)
                     || frame.entry.is_some_and(|entry| {
-                        usize::from(entry.return_register) >= frames[index - 1].slots.len()
+                        entry.return_register >= frames[index - 1].register_count
                     })
                 {
                     return Err(VmError::InvalidOperand);
@@ -115,24 +119,14 @@ impl Interpreter {
             (Some(innermost), Some(&pc)) => (innermost.function_id, pc),
             _ => (outermost.function_id, exit.logical_pc()),
         };
-        self.note_jit_optimized_bail_at(context, outermost.function_id, exit, site_fid, site_pc);
-        // Its own exit profile must also learn the PC so the next bake of that
-        // body, inline or standalone, sees the failed speculation.
-        if let Some(innermost) = frames.last()
-            && frames.len() > 1
-        {
-            self.jit_optimized_exit_profiles
-                .entry((
-                    innermost.function_id,
-                    *resume_pcs.last().ok_or(VmError::InvalidOperand)?,
-                    exit.reason(),
-                ))
-                .and_modify(|profile| profile.action = profile.action.max(exit.action()))
-                .or_insert(crate::jit::JitExitProfile {
-                    action: exit.action(),
-                    count: 0,
-                });
-        }
+        self.note_jit_optimized_bail_at(
+            context,
+            outermost.function_id,
+            u64::from(native.code_object_id),
+            exit,
+            (site_fid, site_pc),
+            false,
+        );
         // The outer recipe writes back into its existing physical activation.
         // Descendants are owned entry inputs until assembly creates their extents.
         // Every frame but the innermost waits on its restored callee: its
@@ -148,7 +142,9 @@ impl Interpreter {
                 Ok(resume_pcs[index])
             }
         };
-        native.registers.copy_from_slice(&outermost.slots);
+        native
+            .registers
+            .copy_from_slice(&outermost.dense(Value::undefined()));
         native.header.pc = standing_pc(0)?;
         if waiting(0) {
             native.header.flags = native
@@ -180,14 +176,14 @@ impl Interpreter {
             if waiting(index + 1) {
                 call.header.flags = call.header.flags.with(NativeFrameFlags::ADVANCE_ON_RESUME);
             }
-            call.initial_registers.extend_from_slice(&deopt.slots);
+            let window = deopt.dense(Value::undefined());
             call.arguments.extend(
-                deopt
-                    .slots
+                window
                     .iter()
                     .copied()
                     .take(usize::from(function.param_count)),
             );
+            call.initial_registers.extend_from_slice(&window);
             call.set_new_target(entry.new_target);
             if !entry.new_target.is_undefined() {
                 if function.is_derived_constructor {
@@ -263,23 +259,26 @@ mod tests {
     }
 
     fn context(functions: Vec<Function>) -> ExecutionContext {
-        ExecutionContext::from_module(BytecodeModule {
-            module: "deopt-materialization-test.js".to_string(),
-            template_sites: Vec::new(),
-            source_kind: SourceKind::JavaScript,
-            functions,
-            constants: Vec::new(),
-            module_resolutions: Vec::new(),
-            module_inits: Vec::new(),
-            function_source: None,
-        })
+        ExecutionContext::from_module(
+            BytecodeModule {
+                module: "deopt-materialization-test.js".to_string(),
+                template_sites: Vec::new(),
+                source_kind: SourceKind::JavaScript,
+                functions,
+                constants: Vec::new(),
+                module_resolutions: Vec::new(),
+                module_inits: Vec::new(),
+                function_source: None,
+            },
+            crate::source_registry::SourceRegistry::default(),
+        )
         .expect("valid bytecode fixture")
     }
 
     #[test]
     fn every_spliced_frame_routes_throws_through_its_handler_table() {
         let context = context(vec![catch_function(0), catch_function(1)]);
-        let mut interpreter = Interpreter::new();
+        let mut interpreter = Interpreter::new().expect("fixture interpreter bootstrap");
         let mut stack = crate::test_support::FrameChainFixture::new();
         let thrown = Value::number_i32(73);
         let mut native = Frame::new(
@@ -299,31 +298,31 @@ mod tests {
         // SAFETY: the frame and initialized window remain stationary through resumption.
         unsafe { interpreter.jit_push_native_frame(&mut native).unwrap() };
         let frames = [
-            crate::deopt::DeoptFrame {
-                function_id: 0,
-                byte_pc: context
+            crate::deopt::DeoptFrame::with_window(
+                0,
+                context
                     .exec_function(0)
                     .unwrap()
                     .instruction_byte_pc(1)
                     .unwrap(),
-                entry: None,
-                slots: Box::new([Value::undefined(), Value::undefined()]),
-            },
-            crate::deopt::DeoptFrame {
-                function_id: 1,
-                byte_pc: context
+                None,
+                [Value::undefined(), Value::undefined()],
+            ),
+            crate::deopt::DeoptFrame::with_window(
+                1,
+                context
                     .exec_function(1)
                     .unwrap()
                     .instruction_byte_pc(1)
                     .unwrap(),
-                entry: Some(crate::deopt::DeoptFrameEntry {
+                Some(crate::deopt::DeoptFrameEntry {
                     return_register: 0,
                     this: Value::undefined(),
                     closure: Value::function(1),
                     new_target: Value::undefined(),
                 }),
-                slots: Box::new([thrown, Value::undefined()]),
-            },
+                [thrown, Value::undefined()],
+            ),
         ];
 
         let result = interpreter
@@ -404,7 +403,7 @@ mod tests {
                     })
                     .collect(),
             );
-            let mut vm = Interpreter::new();
+            let mut vm = Interpreter::new().expect("fixture interpreter bootstrap");
             let mut stack = crate::test_support::FrameChainFixture::new();
             let mut registers = [Value::undefined()];
             let mut native = Frame::new(
@@ -421,27 +420,27 @@ mod tests {
                 let receiver =
                     Value::object(vm.alloc_runtime_rooted_object_with_roots(&[], &[]).unwrap());
                 let frames = [
-                    crate::deopt::DeoptFrame {
-                        function_id: 0,
-                        byte_pc: context
+                    crate::deopt::DeoptFrame::with_window(
+                        0,
+                        context
                             .exec_function(0)
                             .unwrap()
                             .instruction_byte_pc(1)
                             .unwrap(),
-                        entry: None,
-                        slots: Box::new([Value::undefined()]),
-                    },
-                    crate::deopt::DeoptFrame {
-                        function_id: 1,
-                        byte_pc: 0,
-                        entry: Some(crate::deopt::DeoptFrameEntry {
+                        None,
+                        [Value::undefined()],
+                    ),
+                    crate::deopt::DeoptFrame::with_window(
+                        1,
+                        0,
+                        Some(crate::deopt::DeoptFrameEntry {
                             return_register: 0,
                             this: receiver,
                             closure: Value::function(1),
                             new_target: Value::function(2),
                         }),
-                        slots: Box::new([Value::undefined()]),
-                    },
+                        [Value::undefined()],
+                    ),
                 ];
                 vm.prepare_inline_deopt_frames(
                     &context,
@@ -475,7 +474,7 @@ mod tests {
     #[test]
     fn generated_stack_frame_resumes_into_its_handler_table() {
         let context = context(vec![catch_function(0)]);
-        let mut interpreter = Interpreter::new();
+        let mut interpreter = Interpreter::new().expect("fixture interpreter bootstrap");
         let mut stack = crate::test_support::FrameChainFixture::new();
         let thrown = Value::number_i32(91);
         let mut registers = [thrown, Value::undefined()];

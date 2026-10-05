@@ -1,7 +1,7 @@
 //! Schema-owned binding and global-declaration emission for Template AArch64.
 //!
 //! # Contents
-//! - Direct stable global-lexical-cell and guarded global-object hits.
+//! - Shared physical global reads and guards, with binding policy here.
 //! - Checked context-slot accesses complete inline unless the slot is a TDZ
 //!   `hole`; lookup and eval-extension accesses complete through the
 //!   committed cold boundary. The context register is one of its boxed inputs.
@@ -12,6 +12,10 @@
 //! - The published function/PC and opcode schema own names, indices, flags,
 //!   and missing-binding policy; generated calls pass only boxed values.
 //! - A generated write runs the canonical write barrier for a cell value.
+//! - An eligible ordinary global's exact immutable shape fixes lookup state,
+//!   descriptor attributes and prototype role. Dictionary hits prove their
+//!   current state kind and watched descriptor layout instead; stores also
+//!   refuse a live prototype-role shape before effects.
 //! - Every guard miss enters the committed cold sibling. It never deoptimizes
 //!   or replays an accessor, proxy, TDZ, const, eval-chain, or unresolved case.
 //! - Cold JavaScript failure carries its pure exception value to the shared
@@ -19,6 +23,7 @@
 //!
 //! # See also
 //! - `otter_bytecode::opcode_schema::BindingSemantics` — semantic authority.
+//! - `crate::arm64::binding` — physical cell, object and field-bank proof.
 //! - `crate::entry::runtime_ops::reentry` — fixed committed entry functions.
 
 use dynasmrt::{DynamicLabel, DynasmApi, DynasmLabelApi, aarch64::Assembler, dynasm};
@@ -26,20 +31,18 @@ use otter_bytecode::ContextCoord;
 use otter_bytecode::opcode_schema::{
     BindingRead, BindingSemantics, BindingWrite, GlobalDeclarationSemantics,
 };
-use otter_vm::{JitCompileSnapshot, jit::BindingHitProof, native_abi as abi};
+use otter_vm::{JitCompileSnapshot, jit::BindingHitProof, native_abi as abi, object::ShapeState};
 
 use super::context::{CheckedContextAccess, emit_checked_context_slot};
 use super::transitions::TransitionTable;
 use super::values::{
     CellTest, emit_cell_test, emit_load_reg, emit_load_runtime_stub, emit_load_symbol_u64,
-    emit_load_u64, emit_slab_base, emit_store_reg, emit_write_barrier,
+    emit_load_u64, emit_store_reg, emit_write_barrier,
 };
+use crate::arm64::binding as native_binding;
 use crate::artifact::relocation::{RelocationCapture, RelocationTarget};
 use crate::artifact::{CodeMapCapture, CodeRegion};
-use crate::entry::{
-    GLOBAL_THIS_OFFSET_PTR_OFFSET, THREAD_OFFSET, Unsupported, VALUE_HOLE, VALUE_TRUE,
-    VALUE_UNDEFINED, VM_THREAD_GLOBAL_LEXICAL_EPOCH_CELL_OFFSET,
-};
+use crate::entry::{GLOBAL_THIS_OFFSET_PTR_OFFSET, Unsupported, VALUE_TRUE, VALUE_UNDEFINED};
 
 fn record_region(
     capture: &mut Option<&mut CodeMapCapture>,
@@ -53,76 +56,16 @@ fn record_region(
     }
 }
 
-fn emit_global_object_guard(
+/// Dictionary layout identity does not fix the object's current role.
+fn emit_global_dictionary_write_role_guard(
     ops: &mut Assembler,
     relocations: &mut RelocationCapture,
     view: &JitCompileSnapshot,
-    shape: u64,
-    dictionary: bool,
-    global_lexical_epoch: u64,
     miss: DynamicLabel,
 ) {
-    dynasm!(ops
-        ; .arch aarch64
-        ; ldr x14, [x20, THREAD_OFFSET]
-        ; ldr x14, [x14, VM_THREAD_GLOBAL_LEXICAL_EPOCH_CELL_OFFSET]
-        ; cbz x14, =>miss
-        ; ldr x15, [x14]
-    );
-    emit_load_u64(ops, 11, global_lexical_epoch);
-    dynasm!(ops
-        ; .arch aarch64
-        ; cmp x15, x11
-        ; b.ne =>miss
-        ; ldr x14, [x20, GLOBAL_THIS_OFFSET_PTR_OFFSET]
-        ; ldr w12, [x14]
-    );
-    emit_load_symbol_u64(
-        ops,
-        relocations,
-        14,
-        view.cage_base as u64,
-        RelocationTarget::GcCageBase,
-    );
-    dynasm!(ops
-        ; .arch aarch64
-        ; add x13, x14, x12
-        ; ldr w14, [x13, view.object_shape_byte]
-    );
-    if dictionary {
-        emit_load_symbol_u64(
-            ops,
-            relocations,
-            11,
-            view.cage_base as u64,
-            RelocationTarget::GcCageBase,
-        );
-        dynasm!(ops
-            ; .arch aarch64
-            ; add x11, x11, x14
-            ; ldrb w11, [x11, view.shape_kind_byte]
-            ; tbz w11, crate::template::arm64::values::SHAPE_KIND_DICTIONARY_BIT, =>miss
-            ; ldr w14, [x13, view.object_exotic_handle_byte]
-            ; cbz w14, =>miss
-        );
-        emit_load_symbol_u64(
-            ops,
-            relocations,
-            11,
-            view.cage_base as u64,
-            RelocationTarget::GcCageBase,
-        );
-        dynasm!(ops
-            ; .arch aarch64
-            ; add x14, x11, x14
-            ; ldr w14, [x14, view.exotic_dictionary_layout_byte]
-        );
-        emit_load_u64(ops, 11, shape);
-        dynasm!(ops ; .arch aarch64 ; cmp w14, w11 ; b.ne =>miss);
-    } else {
-        emit_load_u64(ops, 11, shape);
-        dynasm!(ops ; .arch aarch64 ; cmp w14, w11 ; b.ne =>miss);
-    }
+    super::values::emit_load_shape_state(ops, relocations, view, 13, 14, 11);
+    dynasm!(ops ; .arch aarch64
+        ; tbnz w14, ShapeState::PROTOTYPE_MASK.trailing_zeros(), =>miss);
 }
 
 fn emit_cell_store(
@@ -135,18 +78,26 @@ fn emit_cell_store(
     source: u16,
     done: DynamicLabel,
 ) -> Result<(), Unsupported> {
+    let store = |ops: &mut Assembler| {
+        if byte_offset <= 32760 && byte_offset.is_multiple_of(8) {
+            dynasm!(ops ; .arch aarch64 ; str x9, [X(address), byte_offset]);
+        } else {
+            emit_load_u64(ops, 11, u64::from(byte_offset));
+            dynasm!(ops ; .arch aarch64 ; str x9, [X(address), x11]);
+        }
+    };
     let primitive = ops.new_dynamic_label();
     emit_load_reg(ops, 9, source)?;
     emit_cell_test(ops, 9, 11, CellTest::IsNotCell, primitive);
-    dynasm!(ops ; .arch aarch64 ; str x9, [X(address), byte_offset]);
+    store(ops);
     emit_write_barrier(ops, relocations, view, parent, 9);
     dynasm!(ops
         ; .arch aarch64
         ; b =>done
         ; =>primitive
-        ; str x9, [X(address), byte_offset]
-        ; b =>done
     );
+    store(ops);
+    dynasm!(ops ; .arch aarch64 ; b =>done);
     Ok(())
 }
 
@@ -171,7 +122,6 @@ pub(super) fn emit_binding_value(
     let guard_start = ops.offset().0;
     let mut guard_end = guard_start;
     let mut hit_end = guard_start;
-    let mut cold_reachable = true;
 
     match semantics {
         BindingSemantics::Read(BindingRead::ContextSlot { .. })
@@ -206,9 +156,9 @@ pub(super) fn emit_binding_value(
             )?;
             hit_end = ops.offset().0;
         }
-        BindingSemantics::Read(BindingRead::GlobalThis { .. }) => {
+        BindingSemantics::Read(BindingRead::GlobalThis { .. }) if view.cage_base != 0 => {
             let dst = result.ok_or(Unsupported::OperandShape("globalThis read result"))?;
-            cold_reachable = false;
+            native_binding::emit_global_realm_guard(ops, view, miss);
             guard_end = ops.offset().0;
             // The isolate publishes the global object as a compressed cage
             // offset; a Value is the full address, so rebase before it can
@@ -233,77 +183,66 @@ pub(super) fn emit_binding_value(
         BindingSemantics::Read(BindingRead::Global { .. } | BindingRead::Exists { .. }) => {
             let dst = result.ok_or(Unsupported::OperandShape("binding read result"))?;
             if let Some(proof) = view.binding_hit_proofs.get(&byte_pc).copied() {
-                match proof {
-                    BindingHitProof::GlobalLexical { cell_offset, .. } => {
-                        if view.cage_base != 0
-                            && let Some(cell_addr) =
-                                view.cage_base.checked_add(cell_offset as usize)
-                        {
-                            emit_load_symbol_u64(
+                if matches!(
+                    semantics,
+                    BindingSemantics::Read(BindingRead::Global { .. })
+                ) {
+                    guard_end = native_binding::emit_global_read(
+                        ops,
+                        relocations,
+                        view,
+                        proof,
+                        byte_pc,
+                        9,
+                        [13, 14],
+                        miss,
+                    )?;
+                    emit_store_reg(ops, 9, dst)?;
+                    dynasm!(ops ; .arch aarch64 ; b =>done);
+                    hit_end = ops.offset().0;
+                } else {
+                    match proof {
+                        BindingHitProof::GlobalLexical { cell_offset, .. } => {
+                            if native_binding::emit_global_cell_address(
                                 ops,
                                 relocations,
+                                view,
+                                cell_offset,
+                                byte_pc,
                                 13,
-                                cell_addr as u64,
-                                RelocationTarget::GlobalLexicalCell {
-                                    function_id: view.code_block.id,
-                                    byte_pc,
-                                },
-                            );
-                            if matches!(
-                                semantics,
-                                BindingSemantics::Read(BindingRead::Global { .. })
+                                miss,
                             ) {
-                                dynasm!(ops
-                                    ; .arch aarch64
-                                    ; ldr x9, [x13, view.global_lexical_value_byte]
-                                );
-                                emit_load_u64(ops, 11, VALUE_HOLE);
-                                dynasm!(ops ; .arch aarch64 ; cmp x9, x11 ; b.eq =>miss);
-                                guard_end = ops.offset().0;
-                                emit_store_reg(ops, 9, dst)?;
-                            } else {
-                                cold_reachable = false;
                                 guard_end = ops.offset().0;
                                 emit_load_u64(ops, 9, VALUE_TRUE);
                                 emit_store_reg(ops, 9, dst)?;
+                                dynasm!(ops ; .arch aarch64 ; b =>done);
+                                hit_end = ops.offset().0;
                             }
-                            dynasm!(ops ; .arch aarch64 ; b =>done);
-                            hit_end = ops.offset().0;
                         }
-                    }
-                    BindingHitProof::GlobalObject {
-                        shape,
-                        dictionary,
-                        value_byte,
-                        global_lexical_epoch,
-                        ..
-                    } if view.cage_base != 0 => {
-                        emit_global_object_guard(
-                            ops,
-                            relocations,
-                            view,
+                        BindingHitProof::GlobalObject {
                             shape,
                             dictionary,
                             global_lexical_epoch,
-                            miss,
-                        );
-                        if matches!(
-                            semantics,
-                            BindingSemantics::Read(BindingRead::Global { .. })
-                        ) {
-                            emit_slab_base(ops, relocations, view, 13, 14);
-                            dynasm!(ops ; .arch aarch64 ; cbz x13, =>miss);
-                            guard_end = ops.offset().0;
-                            dynasm!(ops ; .arch aarch64 ; ldr x9, [x13, value_byte]);
-                        } else {
+                            ..
+                        } if view.cage_base != 0 => {
+                            native_binding::emit_global_object_guard(
+                                ops,
+                                relocations,
+                                view,
+                                shape,
+                                dictionary,
+                                global_lexical_epoch,
+                                [13, 14],
+                                miss,
+                            );
                             guard_end = ops.offset().0;
                             emit_load_u64(ops, 9, VALUE_TRUE);
+                            emit_store_reg(ops, 9, dst)?;
+                            dynasm!(ops ; .arch aarch64 ; b =>done);
+                            hit_end = ops.offset().0;
                         }
-                        emit_store_reg(ops, 9, dst)?;
-                        dynasm!(ops ; .arch aarch64 ; b =>done);
-                        hit_end = ops.offset().0;
+                        _ => {}
                     }
-                    _ => {}
                 }
             }
         }
@@ -323,23 +262,15 @@ pub(super) fn emit_binding_value(
                         cell_offset,
                         writable: true,
                     } => {
-                        if view.cage_base != 0
-                            && let Some(cell_addr) =
-                                view.cage_base.checked_add(cell_offset as usize)
-                        {
-                            emit_load_symbol_u64(
-                                ops,
-                                relocations,
-                                13,
-                                cell_addr as u64,
-                                RelocationTarget::GlobalLexicalCell {
-                                    function_id: view.code_block.id,
-                                    byte_pc,
-                                },
-                            );
-                            dynasm!(ops ; .arch aarch64 ; ldr x9, [x13, view.global_lexical_value_byte]);
-                            emit_load_u64(ops, 11, VALUE_HOLE);
-                            dynasm!(ops ; .arch aarch64 ; cmp x9, x11 ; b.eq =>miss);
+                        if native_binding::emit_global_lexical_guard(
+                            ops,
+                            relocations,
+                            view,
+                            cell_offset,
+                            byte_pc,
+                            13,
+                            miss,
+                        ) {
                             guard_end = ops.offset().0;
                             emit_cell_store(
                                 ops,
@@ -357,25 +288,45 @@ pub(super) fn emit_binding_value(
                     BindingHitProof::GlobalObject {
                         shape,
                         dictionary,
-                        value_byte,
+                        field,
                         global_lexical_epoch,
                         writable: true,
                     } if view.cage_base != 0 => {
-                        emit_global_object_guard(
+                        native_binding::emit_global_object_guard(
                             ops,
                             relocations,
                             view,
                             shape,
                             dictionary,
                             global_lexical_epoch,
+                            [13, 14],
                             miss,
                         );
-                        dynasm!(ops ; .arch aarch64 ; ldrb w14, [x13, view.object_flags_byte] ; tbnz w14, 4, =>miss);
-                        dynasm!(ops ; .arch aarch64 ; mov x12, x13);
-                        emit_slab_base(ops, relocations, view, 13, 14);
-                        dynasm!(ops ; .arch aarch64 ; cbz x13, =>miss);
+                        if dictionary {
+                            // Layout identity does not fix dictionary shape
+                            // state, so current prototype role remains dynamic.
+                            emit_global_dictionary_write_role_guard(ops, relocations, view, miss);
+                        }
+                        native_binding::emit_global_field_bank(
+                            ops,
+                            relocations,
+                            view,
+                            13,
+                            14,
+                            field,
+                            miss,
+                        );
                         guard_end = ops.offset().0;
-                        emit_cell_store(ops, relocations, view, 12, 13, value_byte, source, done)?;
+                        emit_cell_store(
+                            ops,
+                            relocations,
+                            view,
+                            13,
+                            14,
+                            field.byte_offset(),
+                            source,
+                            done,
+                        )?;
                         hit_end = ops.offset().0;
                     }
                     _ => {}
@@ -407,15 +358,6 @@ pub(super) fn emit_binding_value(
         hit_end,
         byte_pc,
     );
-
-    if !cold_reachable {
-        let cold = ops.offset().0;
-        dynasm!(ops ; .arch aarch64 ; =>done);
-        let join = ops.offset().0;
-        record_region(&mut code_map, "templateBindingCold", cold, cold, byte_pc);
-        record_region(&mut code_map, "templateBindingJoin", join, join, byte_pc);
-        return Ok(());
-    }
 
     let cold_start = ops.offset().0;
     dynasm!(ops ; .arch aarch64 ; =>miss ; mov x0, x20);
@@ -515,4 +457,149 @@ pub(super) fn emit_global_declaration_value(
         byte_pc,
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::entry::{THREAD_OFFSET, VM_THREAD_GLOBAL_LEXICAL_EPOCH_CELL_OFFSET};
+
+    fn word(bytes: &mut [u8], offset: usize, value: u64) {
+        bytes[offset..offset + 8].copy_from_slice(&value.to_ne_bytes());
+    }
+
+    #[test]
+    fn native_global_guard_reads_exact_identity_and_every_dictionary_state() {
+        const OBJECT: u32 = 64;
+        const SHAPE: u32 = 128;
+        const EXOTIC: u32 = 192;
+        const LAYOUT: u32 = 69;
+        let mut cage = vec![0_u8; 256].into_boxed_slice();
+        let mut thread = vec![
+            0_u8;
+            VM_THREAD_GLOBAL_LEXICAL_EPOCH_CELL_OFFSET
+                .max(crate::entry::VM_THREAD_ACTIVE_REALM_CELL_OFFSET)
+                as usize
+                + 8
+        ]
+        .into_boxed_slice();
+        let mut context = vec![0_u8; THREAD_OFFSET.max(GLOBAL_THIS_OFFSET_PTR_OFFSET) as usize + 8]
+            .into_boxed_slice();
+        let global = OBJECT;
+        let mut epoch = 0_u64;
+        let realm = 0_u32;
+        word(&mut context, THREAD_OFFSET as usize, thread.as_ptr() as u64);
+        word(
+            &mut context,
+            GLOBAL_THIS_OFFSET_PTR_OFFSET as usize,
+            (&global as *const u32) as u64,
+        );
+        word(
+            &mut thread,
+            VM_THREAD_GLOBAL_LEXICAL_EPOCH_CELL_OFFSET as usize,
+            (&mut epoch as *mut u64) as u64,
+        );
+        word(
+            &mut thread,
+            crate::entry::VM_THREAD_ACTIVE_REALM_CELL_OFFSET as usize,
+            (&realm as *const u32) as u64,
+        );
+        let mut view = JitCompileSnapshot::without_feedback(7, 0, 1, vec![]);
+        view.cage_base = cage.as_ptr() as usize;
+        view.object_shape_byte = 8;
+        view.object_exotic_handle_byte = 16;
+        view.shape_state_byte = 8;
+        view.exotic_dictionary_layout_byte = 8;
+        cage[OBJECT as usize + 8..OBJECT as usize + 12].copy_from_slice(&SHAPE.to_ne_bytes());
+        cage[OBJECT as usize + 16..OBJECT as usize + 20].copy_from_slice(&EXOTIC.to_ne_bytes());
+        word(&mut cage, EXOTIC as usize + 8, u64::from(LAYOUT));
+        for dictionary in [false, true] {
+            for write in [false, true] {
+                for expected_epoch in [0_u64, 1, 0xdead_beef_89ab_cdef, u64::MAX] {
+                    let mut ops = Assembler::new().unwrap();
+                    let entry = ops.offset();
+                    let miss = ops.new_dynamic_label();
+                    let done = ops.new_dynamic_label();
+                    let mut relocations = RelocationCapture::new(false);
+                    dynasm!(ops ; .arch aarch64 ; stp x20, x30, [sp, #-16]! ; mov x20, x0);
+                    native_binding::emit_global_object_guard(
+                        &mut ops,
+                        &mut relocations,
+                        &view,
+                        u64::from(if dictionary { LAYOUT } else { SHAPE }),
+                        dictionary,
+                        expected_epoch,
+                        [13, 14],
+                        miss,
+                    );
+                    if dictionary && write {
+                        emit_global_dictionary_write_role_guard(
+                            &mut ops,
+                            &mut relocations,
+                            &view,
+                            miss,
+                        );
+                    }
+                    dynasm!(ops ; .arch aarch64
+                        ; mov w0, 1 ; b =>done
+                        ; =>miss ; mov w0, wzr
+                        ; =>done ; ldp x20, x30, [sp], #16 ; ret);
+                    let code = crate::CompiledCode::new(ops.finalize().unwrap(), entry);
+                    // SAFETY: the guard reads only live owned byte arenas and
+                    // scalar cells, preserves x20/LR/SP and never calls or publishes
+                    // a VM/GC frame. All pointers outlive the executable mapping.
+                    let run: unsafe extern "C" fn(*const u8) -> u32 =
+                        unsafe { std::mem::transmute(code.entry_ptr()) };
+                    epoch = expected_epoch;
+                    if dictionary {
+                        // Layout identity can survive a state-only shape change.
+                        // Exercise all possible physical state bytes at its live
+                        // owner, including every opaque/provisional combination.
+                        for state in u8::MIN..=u8::MAX {
+                            cage[SHAPE as usize + 8] = state;
+                            let expected = state & ShapeState::DICTIONARY_MASK != 0
+                                && state
+                                    & (ShapeState::OPAQUE_LOOKUP_MASK
+                                        | ShapeState::PROVISIONAL_MASK)
+                                    == 0
+                                && (!write || state & ShapeState::PROTOTYPE_MASK == 0);
+                            let before = cage.to_vec();
+                            // SAFETY: same retained mapping/arena/scalar contract.
+                            assert_eq!(
+                                unsafe { run(context.as_ptr()) },
+                                u32::from(expected),
+                                "state={state:#x}, write={write}, epoch={expected_epoch}"
+                            );
+                            assert_eq!(
+                                cage.as_ref(),
+                                before.as_slice(),
+                                "guard has no heap effects"
+                            );
+                            assert_eq!(epoch, expected_epoch);
+                        }
+                        cage[SHAPE as usize + 8] = ShapeState::DICTIONARY_MASK;
+                    } else {
+                        cage[SHAPE as usize + 8] = ShapeState::ORDINARY.bits();
+                        // SAFETY: same live owned guard fixture.
+                        assert_eq!(unsafe { run(context.as_ptr()) }, 1);
+                        let other = SHAPE + 1;
+                        cage[OBJECT as usize + 8..OBJECT as usize + 12]
+                            .copy_from_slice(&other.to_ne_bytes());
+                        // SAFETY: a mismatch exits before following any shape token.
+                        assert_eq!(unsafe { run(context.as_ptr()) }, 0);
+                        cage[OBJECT as usize + 8..OBJECT as usize + 12]
+                            .copy_from_slice(&SHAPE.to_ne_bytes());
+                    }
+                    epoch = expected_epoch ^ 1;
+                    // SAFETY: the changed scalar remains at the same owned address.
+                    assert_eq!(
+                        unsafe { run(context.as_ptr()) },
+                        0,
+                        "full-word lexical epoch mismatch"
+                    );
+                    assert_eq!(epoch, expected_epoch ^ 1, "guard cannot alter epoch");
+                }
+            }
+        }
+    }
 }

@@ -8,7 +8,7 @@
 //! - An arrow referencing the enclosing activation's `arguments`.
 //! - Live mapped parameters and mutated/materialized argument lists, including
 //!   allocating length coercion and index getters.
-//! - Generated callers follow interpreter destinations and changed targets.
+//! - A generated forwarder follows a changed target without exiting.
 //! - Native polymorphic hits, dynamic actual windows, bounded fallback, moving
 //!   roots and exact exceptions after warmup.
 //! - Saturated native dispatch with fresh/inherited captures and semantic misses.
@@ -20,6 +20,8 @@
 //!   side-exit for it.
 //! - A non-intrinsic `apply` observes exactly the object a materialized
 //!   `arguments` binding would have produced, once per activation.
+//! - An intrinsic forward copies the activation's live actual window in
+//!   generated code and calls without a rooted runtime call.
 //! - Every tier returns the interpreter's completion.
 
 use otter_runtime::{JitDebugEvent, JitDebugRequest, JitSelection, Runtime, SourceInput};
@@ -27,7 +29,7 @@ use otter_runtime::{JitDebugEvent, JitDebugRequest, JitSelection, Runtime, Sourc
 const SOURCE: &str = r#"
 var Class = { create: function() { return function() { this.initialize.apply(this, arguments); }; } };
 var Point = Class.create();
-Point.prototype.initialize = function(x, y, z) { this.x = x; this.y = y; this.z = z === undefined ? 0 : z; this.n = arguments.length; };
+Point.prototype.initialize = function initialize(x, y, z) { this.x = x; this.y = y; this.z = z === undefined ? 0 : z; this.n = arguments.length; };
 function twice(a, b) {
   seen.length = 0;
   first.apply(this, arguments);
@@ -237,7 +239,7 @@ fn forwarded_arguments_read_live_mappings_and_materialized_objects() {
 }
 
 #[test]
-fn generated_interpreter_destinations_follow_a_changed_forward_target() {
+fn generated_forwarder_follows_a_changed_target_without_exiting() {
     let source = r#"
 function first(value) { return value + 1; }
 function second(value) { return value + 2; }
@@ -263,30 +265,36 @@ sum;
             .expect("forwarded target switch");
         assert_eq!(result.completion_string(), "25010000", "{selection:?}");
         let report = result.jit_debug_report().expect("events");
-        let interpreter_edges = report
+        let forward_id = report
             .events()
             .iter()
-            .filter(|event| {
-                matches!(
-                    event,
-                    JitDebugEvent::DirectCallLowered {
-                        outcome: otter_runtime::JitDirectCallLoweringOutcome::Generated {
-                            code_object_id: 0,
-                            target_tier: otter_runtime::JitDebugTier::Interpreter,
-                            ..
-                        },
-                        ..
-                    }
-                )
+            .find_map(|event| match event {
+                JitDebugEvent::CompilePrepared {
+                    function_id,
+                    function_name,
+                    ..
+                } if function_name == "forward" => Some(*function_id),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("{selection:?}: the forwarder must compile"));
+        let forward_exits = report
+            .events()
+            .iter()
+            .filter(|event| match event {
+                JitDebugEvent::Bail { function_id, .. } => *function_id == forward_id,
+                JitDebugEvent::EnteredGenerationDeopt {
+                    callee_function_id, ..
+                } => *callee_function_id == forward_id,
+                _ => false,
             })
             .count();
-        assert!(
-            interpreter_edges > 0,
-            "{selection:?}: generated callers must enter the permanent interpreter destination"
+        assert_eq!(
+            forward_exits, 0,
+            "{selection:?}: a changed target must not force the forwarder out of generated code"
         );
         assert!(
             runtime.execution_stats().jit_generated_calls > 0,
-            "{selection:?}: the linked destination must actually execute"
+            "{selection:?}: generated callers must actually execute"
         );
     }
 }
@@ -301,7 +309,6 @@ fn native_forwarding_copies_full_live_windows_and_preserves_hot_throws() {
     ] {
         let mut runtime = Runtime::builder()
             .jit_selection(selection)
-            .jit_debug(JitDebugRequest::artifacts().with_events(true))
             .build()
             .expect("runtime");
         let result = runtime
@@ -318,30 +325,16 @@ fn native_forwarding_copies_full_live_windows_and_preserves_hot_throws() {
         if selection == JitSelection::InterpreterOnly {
             continue;
         }
-        let mut dynamic = false;
-        let mut polymorphic = false;
-        let mut count_target = false;
-        for bundle in result.jit_artifacts().expect("artifacts").bundles() {
-            if bundle.manifest().function_name() != "forward" {
-                continue;
-            }
-            let Some(file) = bundle.file(otter_runtime::JitArtifactFileName::CodeMap) else {
-                continue;
-            };
-            let code_map = std::str::from_utf8(file.contents()).expect("code map UTF-8");
-            if code_map.contains("\"argumentMode\": \"forward\"") {
-                dynamic |= code_map.contains("\"linkageBytes\": null")
-                    && code_map.contains("\"reservedStackBytes\": null");
-                polymorphic |= code_map.contains("\"targetCount\": 2");
-                count_target |= code_map.contains("\"targetCount\": 3");
-            }
-        }
-        assert!(
-            dynamic && polymorphic && count_target,
-            "{selection:?}: forward must publish dynamic windows, both native candidates and the warmed arity target"
-        );
         let stats = runtime.execution_stats();
         assert!(stats.jit_generated_calls > 0, "{selection:?}");
+        // The 6144 intrinsic forwards copy the live window in generated
+        // code; the 1024 forwards through an overridden `apply` stage
+        // through the runtime.
+        assert!(
+            stats.jit_to_rust_call_transitions < 1024 + 64,
+            "{selection:?}: rooted calls={}",
+            stats.jit_to_rust_call_transitions
+        );
     }
 }
 
@@ -381,8 +374,10 @@ checksum;
         let runtime_calls =
             after.jit_to_rust_call_transitions - before.jit_to_rust_call_transitions;
         let native_calls = after.jit_generated_calls - before.jit_generated_calls;
+        // Only Template generations count their entries; an optimizing
+        // callee's hits are uncounted.
         assert!(
-            native_calls >= 256,
+            selection != JitSelection::Template || native_calls >= 256,
             "{selection:?}: native calls={native_calls}"
         );
         assert!(
@@ -427,8 +422,10 @@ siblingSum;
         let after = runtime.execution_stats();
         let native_calls = after.jit_generated_calls - before.jit_generated_calls;
         let rooted_calls = after.jit_to_rust_call_transitions - before.jit_to_rust_call_transitions;
+        // Only Template generations count their entries; an optimizing
+        // callee's hits are uncounted.
         assert!(
-            native_calls >= 256,
+            selection != JitSelection::Template || native_calls >= 256,
             "{selection:?}: sibling native calls={native_calls}"
         );
         assert!(
@@ -439,7 +436,7 @@ siblingSum;
 }
 
 #[test]
-fn saturated_forwarding_preserves_live_arguments_and_reports_distinct_feedback() {
+fn saturated_forwarding_preserves_live_arguments() {
     let source = include_str!("../../otter-difftest/corpus/forward_arguments_saturated.js");
     for selection in [
         JitSelection::InterpreterOnly,
@@ -448,7 +445,6 @@ fn saturated_forwarding_preserves_live_arguments_and_reports_distinct_feedback()
     ] {
         let mut runtime = Runtime::builder()
             .jit_selection(selection)
-            .jit_debug(JitDebugRequest::events())
             .build()
             .expect("runtime");
         let result = runtime
@@ -458,32 +454,6 @@ fn saturated_forwarding_preserves_live_arguments_and_reports_distinct_feedback()
             result.completion_string(),
             "[314496,135420]",
             "{selection:?}"
-        );
-        if selection == JitSelection::InterpreterOnly {
-            continue;
-        }
-        let report = result.jit_debug_report().expect("events");
-        let forward_id = report
-            .events()
-            .iter()
-            .find_map(|event| match event {
-                JitDebugEvent::CompilePrepared {
-                    function_id,
-                    function_name,
-                    ..
-                } if function_name == "forward" => Some(*function_id),
-                _ => None,
-            })
-            .expect("compiled forwarding body");
-        assert!(
-            report.events().iter().any(|event| matches!(event,
-                JitDebugEvent::InlineCandidate {
-                    caller_function_id,
-                    bake_rejection: Some(otter_runtime::JitInlineRejectionReason::Megamorphic),
-                    ..
-                } if *caller_function_id == forward_id
-            )),
-            "{selection:?}: saturated ordinary feedback must not be reported as bounded polymorphism"
         );
     }
 }
@@ -502,30 +472,12 @@ nativeSum;
     for selection in [JitSelection::Template, JitSelection::ProductionTiered] {
         let mut runtime = Runtime::builder()
             .jit_selection(selection)
-            .jit_debug(JitDebugRequest::artifacts())
             .build()
             .expect("runtime");
         let warm = runtime
             .run_script(SourceInput::from_javascript(setup), "saturated-setup.js")
             .expect("warm saturated targets");
         assert_eq!(warm.completion_string(), "[314496,135420]");
-        assert!(
-            warm.jit_artifacts()
-                .expect("artifacts")
-                .bundles()
-                .iter()
-                .any(|bundle| {
-                    bundle.manifest().function_name() == "forward"
-                        && bundle
-                            .file(otter_runtime::JitArtifactFileName::CodeMap)
-                            .is_some_and(|file| {
-                                std::str::from_utf8(file.contents())
-                                    .expect("code map")
-                                    .contains("runtimeForwardCallNativeEntry")
-                            })
-                }),
-            "{selection:?}: runtime-selected entry must be emitted in the forwarder"
-        );
         let before = runtime.execution_stats();
         let result = runtime
             .run_script(SourceInput::from_javascript(probe), "saturated-native.js")
@@ -534,8 +486,10 @@ nativeSum;
         let after = runtime.execution_stats();
         let native_calls = after.jit_generated_calls - before.jit_generated_calls;
         let rooted_calls = after.jit_to_rust_call_transitions - before.jit_to_rust_call_transitions;
+        // Only Template generations count their entries; an optimizing
+        // callee's hits are uncounted.
         assert!(
-            native_calls >= 512,
+            selection != JitSelection::Template || native_calls >= 512,
             "{selection:?}: native calls={native_calls}"
         );
         assert!(
@@ -546,7 +500,7 @@ nativeSum;
 }
 
 #[test]
-fn machine_forwarding_keeps_saturated_native_hits_and_live_bindings() {
+fn optimizing_forwarding_keeps_saturated_native_hits_and_live_bindings() {
     let mut runtime = Runtime::builder()
         .jit_selection(JitSelection::ProductionTiered)
         .jit_debug(JitDebugRequest::artifacts().with_events(true))
@@ -557,24 +511,24 @@ fn machine_forwarding_keeps_saturated_native_hits_and_live_bindings() {
             SourceInput::from_javascript(include_str!(
                 "../../otter-difftest/corpus/forward_arguments_saturated.js"
             )),
-            "machine-forward-setup.js",
+            "optimizing-forward-setup.js",
         )
         .expect("warm saturated callables");
     let result = runtime
         .run_script(
             SourceInput::from_javascript(
                 r#"
-var machineSum = 0;
-for (var machineI = 0; machineI < 16000; machineI++) {
-  selected = targets[machineI % targets.length];
-  machineSum += forward(machineI, 2, {value: 7});
+var hotSum = 0;
+for (var hotI = 0; hotI < 16000; hotI++) {
+  selected = targets[hotI % targets.length];
+  hotSum += forward(hotI, 2, {value: 7});
 }
-machineSum;
+hotSum;
 "#,
             ),
-            "machine-forward-hot.js",
+            "optimizing-forward-hot.js",
         )
-        .expect("Machine forwards");
+        .expect("optimizing forwards");
     assert_eq!(result.completion_string(), "128164432");
     let compiled = [&warm, &result].into_iter().any(|run| {
         run.jit_artifacts()
@@ -586,18 +540,11 @@ machineSum;
                     && bundle
                         .file(otter_runtime::JitArtifactFileName::OptimizedIr)
                         .is_some()
-                    && bundle
-                        .file(otter_runtime::JitArtifactFileName::CodeMap)
-                        .is_some_and(|file| {
-                            std::str::from_utf8(file.contents())
-                                .expect("code map")
-                                .contains("machineForwardCall")
-                        })
             })
     });
     assert!(
         compiled,
-        "forward must reach Machine: {:?}",
+        "forward must reach the optimizing tier: {:?}",
         result.jit_debug_report()
     );
     let before = runtime.execution_stats();
@@ -605,22 +552,30 @@ machineSum;
         .run_script(
             SourceInput::from_javascript(
                 r#"
-var settledMachineSum = 0;
+var settledSum = 0;
 for (var settledI = 0; settledI < 512; settledI++) {
   selected = targets[settledI % targets.length];
-  settledMachineSum += forward(settledI, 2, {value: 7});
+  settledSum += forward(settledI, 2, {value: 7});
 }
-settledMachineSum;
+settledSum;
 "#,
             ),
-            "machine-forward-settled.js",
+            "optimizing-forward-settled.js",
         )
-        .expect("settled Machine forwards");
+        .expect("settled optimizing forwards");
     assert_eq!(probe.completion_string(), "136324");
     let after = runtime.execution_stats();
-    let native = after.jit_generated_calls - before.jit_generated_calls;
+    // Optimizing generations count no entries; settled hits show as the
+    // absence of exits.
+    assert_eq!(
+        (after.jit_optimized_deopts, after.jit_generated_call_deopts),
+        (
+            before.jit_optimized_deopts,
+            before.jit_generated_call_deopts
+        ),
+        "settled forwards must not exit"
+    );
     let rooted = after.jit_to_rust_call_transitions - before.jit_to_rust_call_transitions;
-    assert!(native >= 512, "native={native}");
     assert!(rooted < 64, "rooted={rooted}");
     let custom = runtime
         .run_script(
@@ -638,14 +593,14 @@ for (var customI = 0; customI < 128; customI++) customSum += customCaller(custom
 JSON.stringify([customSum, customApplyCalls]);
 "#,
             ),
-            "machine-forward-custom-apply.js",
+            "optimizing-forward-custom-apply.js",
         )
         .expect("materialize before custom apply");
     assert_eq!(custom.completion_string(), "[9536,128]");
 }
 
 #[test]
-fn machine_forwarding_commits_native_and_cold_throws_into_machine_caller() {
+fn optimizing_forwarding_commits_native_and_cold_throws_into_optimized_caller() {
     let mut runtime = Runtime::builder()
         .jit_selection(JitSelection::ProductionTiered)
         .jit_debug(JitDebugRequest::artifacts().with_events(true))
@@ -674,7 +629,7 @@ for (var warmI = 0; warmI < 56000; warmI++) warmResult += catchingForward(warmI)
 warmResult;
 "#,
             ),
-            "machine-forward-catch-warm.js",
+            "optimizing-forward-catch-warm.js",
         )
         .expect("warm catch forwarder");
     assert_eq!(warm.completion_string(), "1568028000");
@@ -688,13 +643,8 @@ warmResult;
                     && bundle
                         .file(otter_runtime::JitArtifactFileName::OptimizedIr)
                         .is_some()
-                    && bundle
-                        .file(otter_runtime::JitArtifactFileName::CodeMap)
-                        .is_some_and(|file| std::str::from_utf8(file.contents())
-                            .expect("code map")
-                            .contains("machineForwardCall"))
             ),
-        "throwing forwarder must reach Machine: {:?}",
+        "throwing forwarder must reach the optimizing tier: {:?}",
         warm.jit_debug_report()
     );
     assert!(
@@ -708,7 +658,7 @@ warmResult;
                         .file(otter_runtime::JitArtifactFileName::OptimizedIr)
                         .is_some()
             ),
-        "catching caller must reach Machine: {:?}",
+        "catching caller must reach the optimizing tier: {:?}",
         warm.jit_debug_report()
     );
     let result = runtime
@@ -725,7 +675,7 @@ for (var coldI = 0; coldI < 128; coldI++) caughtSum += catchingForward(throwingN
 JSON.stringify([caughtSum, coercionEffects, callEffects]);
 "#,
             ),
-            "machine-forward-catch-probe.js",
+            "optimizing-forward-catch-probe.js",
         )
         .expect("native/cold catch completion");
     assert_eq!(result.completion_string(), "[640000,128,56512]");

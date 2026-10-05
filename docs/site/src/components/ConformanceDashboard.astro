@@ -1,15 +1,11 @@
 ---
-// Interactive conformance dashboard, shared by every suite Otter tracks.
-//
-// Renders client-side from a baseline JSON with `{totals, by_section,
-// failing_tests, engine_commit, ran_at}` plus the corpus commit named by
-// `commitField`: test262 (`otter-test262 merge`, refreshed by `just
-// test262-site`) and Node.js (`cargo run -p otter-node-compat`) both emit
-// that shape. Drill-down group tree with stacked pass/fail bars, lazy
-// failing-test tables with reasons, live path filter, and per-test links
-// into the pinned corpus commit.
+// Shared rendering with explicit independent corpus contracts.
+// Test262 consumes canonical test rows and validates all derived counts.
+// Node.js consumes its own aggregate reporter; it is not a Test262 fallback.
 
 interface Props {
+  /** Explicit corpus contract; never inferred from report fields. */
+  corpus: "test262" | "nodejs";
   /** Baseline JSON, relative to the site base URL. */
   dataPath: string;
   /** Payload field holding the corpus commit, e.g. `test262_commit`. */
@@ -24,12 +20,13 @@ interface Props {
   filterHint: string;
 }
 
-const { dataPath, commitField, repo, repoTestRoot, suiteLabel, filterHint } =
+const { corpus, dataPath, commitField, repo, repoTestRoot, suiteLabel, filterHint } =
   Astro.props;
 ---
 
 <div
   class="conf-dash"
+  data-corpus={corpus}
   data-path={dataPath}
   data-commit-field={commitField}
   data-repo={repo}
@@ -101,6 +98,7 @@ const { dataPath, commitField, repo, repoTestRoot, suiteLabel, filterHint } =
 </style>
 
 <script>
+  import { conformanceModel } from "../scripts/conformance-model.mjs";
   const dash = document.querySelector(".conf-dash") as HTMLElement;
   const CFG = dash.dataset;
   const base = import.meta.env.BASE_URL.replace(/\/$/, "");
@@ -114,6 +112,12 @@ const { dataPath, commitField, repo, repoTestRoot, suiteLabel, filterHint } =
     throw new Error(`conformance baseline missing at ${CFG.path}`);
   }
   const DATA = await resp.json();
+  let model;
+  try { model = conformanceModel(CFG.corpus!, DATA); }
+  catch (error) {
+    document.getElementById("conf-tree")!.textContent = "Baseline rejected: canonical test identities or counts are invalid.";
+    throw error;
+  }
 
   function emptyTotals() {
     return { total: 0, passed: 0, failed: 0, skipped: 0, crashed: 0, timed_out: 0, oom: 0 };
@@ -122,7 +126,7 @@ const { dataPath, commitField, repo, repoTestRoot, suiteLabel, filterHint } =
     for (const k of Object.keys(a)) a[k] += b[k] || 0;
   }
   const root: any = { name: "", totals: emptyTotals(), kids: new Map() };
-  for (const [section, t] of Object.entries(DATA.by_section || {})) {
+  for (const [section, t] of Object.entries(model.by_section)) {
     addTotals(root.totals, t);
     let node = root;
     for (const seg of section.split("/")) {
@@ -132,7 +136,7 @@ const { dataPath, commitField, repo, repoTestRoot, suiteLabel, filterHint } =
     }
   }
   const fails = new Map<string, any[]>();
-  for (const f of DATA.failing_tests || []) {
+  for (const f of model.failures) {
     const seg = f.path.split("/");
     const key = seg.slice(0, Math.min(3, seg.length)).join("/");
     if (!fails.has(key)) fails.set(key, []);
@@ -178,7 +182,12 @@ const { dataPath, commitField, repo, repoTestRoot, suiteLabel, filterHint } =
       a.href = testUrl(f.path); a.target = "_blank"; a.rel = "noopener";
       a.appendChild(el("code", undefined, f.path));
       td2.appendChild(a); tr.appendChild(td2);
-      tr.appendChild(el("td", "reason", f.reason));
+      const detail = el("td", "reason", f.reason);
+      if (f.stack) {
+        const stack = el("details"); stack.appendChild(el("summary", undefined, "Engine stack"));
+        stack.appendChild(el("pre", undefined, f.stack)); detail.appendChild(stack);
+      }
+      tr.appendChild(detail);
       body.appendChild(tr);
     }
     tb.appendChild(body);
@@ -222,7 +231,7 @@ const { dataPath, commitField, repo, repoTestRoot, suiteLabel, filterHint } =
     let shown = 0;
     for (const name of [...root.kids.keys()].sort()) {
       if (filter) {
-        const any = Object.keys(DATA.by_section || {}).some((s) => s.startsWith(name) && s.includes(filter));
+        const any = Object.keys(model.by_section).some((s) => s.startsWith(name) && s.includes(filter));
         if (!any) continue;
       }
       tree.appendChild(renderNode(root.kids.get(name), name));
@@ -231,13 +240,10 @@ const { dataPath, commitField, repo, repoTestRoot, suiteLabel, filterHint } =
     if (!shown) tree.appendChild(el("div", "empty", "No sections match the filter."));
   }
 
-  const t = DATA.totals || emptyTotals();
+  const t = model.totals;
   const hero = document.getElementById("conf-hero")!;
   const meta = el("p", "conf-meta");
-  meta.innerHTML =
-    "Engine <code>" + String(DATA.engine_commit || "?").slice(0, 12) +
-    "</code> · " + CFG.suiteLabel + " <code>" + String(corpusCommit || "?").slice(0, 12) +
-    "</code> · " + (DATA.ran_at || "");
+  meta.textContent = `Engine ${String(DATA.engine_commit).slice(0,12)} · ${CFG.suiteLabel} ${String(corpusCommit).slice(0,12)} · ${DATA.ran_at}`;
   hero.appendChild(meta);
   const heroRow = el("div", "hero-row");
   heroRow.appendChild(el("span", "rate", passRate(t).toFixed(2) + "%"));

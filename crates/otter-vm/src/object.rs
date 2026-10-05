@@ -12,9 +12,10 @@
 //!
 //! Every read / write / write-barrier path takes an explicit
 //! `&otter_gc::GcHeap` (or `&mut`) so the single-mutator invariant is visible in
-//! the type system. Method signatures are of the shape `obj.get(heap, key)` and
-//! `obj.set(heap, key, value)` — the heap is **not** thread-local. No
-//! thread-local heap lookup is permitted in this module.
+//! the type system. Assignment takes the actual mutable receiver slot and
+//! returns `Result<bool, OutOfMemory>`: rejection and allocator refusal remain
+//! distinct. Construction enters descriptor installation with explicit flags.
+//! No thread-local heap lookup is permitted in this module.
 //!
 //! `JsObject` is therefore a 4-byte compressed offset
 //! ([`otter_gc::Gc<ObjectBody>`]); cloning a handle is `Copy`.
@@ -32,8 +33,10 @@
 //! - [`StorePropertyTransition`] / [`StorePropertyTransitionKind`] and
 //!   guarded StoreProperty replay records and
 //!   their allocation-free native subset.
-//! - [`ShapeCacheMode`] — fast-shape eligibility marker for current and future
-//!   dictionary-compatible object storage.
+//! - [`ShapeState`] / [`LookupFact`] — immutable hidden-class semantics.
+//! - `ordinary_set` and `descriptor_install` — assignment gates and the sole
+//!   rooted descriptor publication owner.
+//! - `symbol_table` — one managed ordered descriptor table for objects/arrays.
 //! - [`JsObject`] / [`ObjectBody`] / [`Properties`] — the public object handle,
 //!   the GC-allocated storage, and the read-only view used by JSON
 //!   serialisation and `Object.keys` enumeration.
@@ -49,8 +52,9 @@
 //!   object is non-extensible (writable may still be true).
 //! - Accessor descriptors never carry a `writable` bit — its slot is
 //!   reused as a discriminator (always `false`).
-//! - Hidden-class ICs may cache only [`ShapeCacheMode::Fast`] objects;
-//!   string-keyed delete moves an object to dictionary-compatible mode.
+//! - Runtime ICs and native guards treat provisional lineages as ordinary
+//!   shaped layouts; only allocation plans reject a provisional root. Delete
+//!   changes the actual shape or dictionary identity without a separate latch.
 //! - Generated shape proofs reject opaque chain links: non-ordinary
 //!   prototypes, String-wrapper virtual keys, and host payloads whose property
 //!   semantics can substitute values outside the ordinary slot table.
@@ -61,8 +65,14 @@
 //!   (V8 maps, JSC structures): a keyed shape of its prototype's lineage, or
 //!   that lineage's dictionary shape in dictionary mode. A prototype change is
 //!   a shape change; nothing else stores the prototype.
+//! - A shape fixes inline capacity as well as prototype. Overflow slabs hold
+//!   only the suffix; inline prefix words never migrate. Capacity roots are
+//!   cached per prototype, capacity and complete immutable state.
 //! - GC shape bodies are immutable after allocation; transition tables and
 //!   offset maps live in interpreter-owned side caches.
+//! - Dictionary string-slot redefinitions and bulk integrity changes retire
+//!   the structural identity and any changed watched-slot layout proof before
+//!   publishing descriptors. A bulk change retires each proof domain once.
 //! - Every store of a `Gc<…>`-bearing `Value` into a slot, every
 //!   prototype-changing shape install, and every symbol-property write records
 //!   the store through [`otter_gc::GcHeap::record_write`] so the
@@ -95,15 +105,33 @@ use smallvec::SmallVec;
 
 mod descriptor;
 mod descriptor_core;
+pub(crate) use descriptor_core::validate_descriptor_partial;
+mod descriptor_install;
+mod descriptor_mutation;
+mod field_location;
+mod ordinary_set;
+pub(crate) mod symbol_table;
+pub use field_location::{FieldLayout, FieldLocation};
+use symbol_table::{SymbolPropsBody, SymbolPropsHandle, body_of as symbol_props_body_of};
+mod integrity_transition;
 mod key_order;
 mod lookup;
+#[cfg(test)]
+mod persistent_fields_tests;
 pub(crate) mod prototype_validity;
 pub(crate) mod shape_body;
 mod shape_cache;
 #[cfg(test)]
 mod shape_lookup_tests;
 mod shape_runtime;
+mod shape_state;
+mod state_transition;
+pub use shape_state::{LookupFact, ShapeState};
 mod shape_transition;
+#[cfg(test)]
+mod shaped_fixtures;
+#[cfg(test)]
+pub(crate) use shaped_fixtures::append_shaped_data_for_fixture;
 pub mod slot_slab;
 
 pub use descriptor::{
@@ -115,10 +143,9 @@ pub(crate) use shape_body::ShapeBody;
 pub(crate) use shape_body::ShapeHandle;
 pub(crate) use shape_body::shape_offset_of_str;
 pub(crate) use shape_body::{
-    SHAPE_BODY_ID_OFFSET, SHAPE_BODY_KIND_OFFSET, SHAPE_BODY_PROPERTY_COUNT_OFFSET,
-    SHAPE_BODY_PROTOTYPE_OFFSET, SHAPE_KIND_DICTIONARY,
+    SHAPE_BODY_ID_OFFSET, SHAPE_BODY_INLINE_CAPACITY_OFFSET, SHAPE_BODY_PROPERTY_COUNT_OFFSET,
+    SHAPE_BODY_PROTOTYPE_OFFSET, SHAPE_BODY_STATE_OFFSET,
 };
-pub(crate) use shape_cache::{ShapeCacheInvalidation, ShapeCacheMode};
 pub(crate) use shape_runtime::ShapeRuntime;
 #[cfg(test)]
 pub(crate) use shape_transition::capture_store_property_transition;
@@ -512,7 +539,7 @@ struct SlotMeta {
     /// `true` when the flat value at this index is an [`AccessorCellBody`]
     /// handle rather than a data value. The hidden class records the same
     /// discriminator (`own_is_accessor`); this per-slot copy is the
-    /// authoritative source for attribute-overridden and dictionary-mode
+    /// authoritative source for dictionary-mode
     /// objects whose slots have diverged from the shape.
     is_accessor: bool,
     /// `true` once a compiled proof reads this dictionary slot's value
@@ -546,14 +573,6 @@ struct SlotData {
 }
 
 impl SlotData {
-    fn data_default(value: Value) -> Self {
-        Self {
-            flags: PropertyFlags::data_default(),
-            kind: SlotKind::Data,
-            value,
-        }
-    }
-
     fn from_descriptor(desc: PropertyDescriptor) -> Self {
         match desc.kind {
             DescriptorKind::Data { value } => Self {
@@ -702,18 +721,6 @@ pub(crate) struct AtomOwnPropertyHit {
     pub(crate) is_data: bool,
 }
 
-impl AtomOwnPropertyHit {
-    /// Filler for an empty cache way. Its shape id matches no object, so it
-    /// can only ever be read after the owning entry's own key compare fails.
-    pub(crate) const PLACEHOLDER: Self = Self {
-        shape_id: ShapeId::UNASSIGNED,
-        shape: ShapeHandle::null(),
-        atom_id: AtomId::NONE,
-        slot: 0,
-        is_data: false,
-    };
-}
-
 /// Own-property slot metadata for non-atomized named-property ICs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct OwnPropertySlotHit {
@@ -744,26 +751,25 @@ pub const OBJECT_BODY_TYPE_TAG: u8 = 0x11;
 ///
 /// Per ECMA-262 §10.1, ordinary objects carry a hidden-class
 /// [`Shape`], an aligned slot table, an optional `[[Prototype]]`,
-/// a list of symbol-keyed own properties, and an `[[Extensible]]`
-/// flag. Mutation flows through [`otter_gc::GcHeap::with_payload`]
+/// a list of symbol-keyed own properties. Its hidden class owns immutable
+/// extensibility and lookup facts. Mutation flows through [`otter_gc::GcHeap::with_payload`]
 /// (writers) and reads through [`otter_gc::GcHeap::read_payload`]
 /// (readers). Every store of a `Gc<…>`-bearing field is recorded through
 /// [`otter_gc::GcHeap::record_write`].
 ///
-/// The fixed body is 16 bytes — shape, slab, prototype and sidecar handles —
+/// The fixed body is 16 bytes — shape, slab and sidecar handles plus padding —
 /// and is followed in the same cell by [`Self::inline_capacity`] in-object
 /// value slots, sized per allocation site (object literals by their property
 /// count, constructor receivers by the learned field count): the JSC
-/// `JSFinalObject` / V8 in-object layout. The [`ObjectFlags`] byte and the
-/// in-object capacity live in the two body-owned GC-header bytes
-/// ([`otter_gc::header::HEADER_BODY_BYTES_OFFSET`]), as JSC keeps per-cell
-/// flags in its cell header. The live slot count is the shape's property
+/// `JSFinalObject` / V8 in-object layout. The shape owns immutable capacity;
+/// immutable semantic state lives in its hidden class; GC body-owned bytes are zero
+/// ([`otter_gc::header::HEADER_BODY_BYTES_OFFSET`]). The live slot count is the shape's property
 /// count, or the sidecar's dictionary slot count for a dictionary-mode
 /// object, so appending to a shaped object stores a slot and a shape and
 /// nothing else.
-/// String-keyed slot `i` lives in those in-object slots while the object has
-/// no out-of-line slab, and at word `i` of the slab once it has one; the
-/// first store past the in-object capacity moves every slot to the slab.
+/// String-keyed slot `i` stays inline when `i < shape.inline_capacity`.
+/// Otherwise it occupies suffix word `i - shape.inline_capacity`. Slab growth
+/// never moves or copies the inline prefix.
 ///
 /// # Spec
 ///
@@ -776,13 +782,13 @@ pub struct ObjectBody {
     /// ([`OBJECT_BODY_SHAPE_OFFSET`]) for monomorphic guard checks.
     shape: ShapeHandle,
     /// Out-of-line string-keyed own-property values once the object grows
-    /// past its in-object capacity, indexed by shape slot offset. A data slot
+    /// past its in-object capacity, indexed relative to the overflow suffix. A data slot
     /// stores its `[[Value]]` directly; an accessor slot stores a handle to
     /// its [`AccessorCellBody`]. Slot flags and data/accessor kind live in
     /// the shape for ordinary shaped objects, or in materialized metadata
-    /// for dictionary/attribute-overridden objects.
+    /// for dictionary objects.
     ///
-    /// Null while the slots are in-object. The slab is a GC body carrying its
+    /// Null until an overflow suffix is needed. The slab is a GC body carrying its
     /// words in the same cell ([`slot_slab`]), not a `Vec`: an object that
     /// owned malloc storage could not be captured into a page image, and a
     /// restored copy would alias the original buffer.
@@ -796,49 +802,11 @@ pub struct ObjectBody {
     exotic: ExoticSlot,
 }
 
-/// Bits of an ordinary object's flag byte, the first body-owned GC-header
-/// byte.
-///
-/// A fresh ordinary object carries exactly [`ObjectFlags::EXTENSIBLE`], so
-/// generated receiver allocation writes one constant byte.
-pub(crate) struct ObjectFlags;
-
-impl ObjectFlags {
-    /// `[[Extensible]]` internal slot. New keys are rejected when clear.
-    pub(crate) const EXTENSIBLE: u8 = 1 << 0;
-    /// An in-place attribute mutation (defineProperty on an existing slot,
-    /// `seal`, `freeze`) changed a shaped slot's flags/kind without
-    /// transitioning the hidden class. While clear, a shaped object's
-    /// per-slot attributes are guaranteed to match the shape, so attribute
-    /// reads short-circuit to the shape. Once set, the materialized
-    /// [`ExoticSlots::slots`] are the only authoritative attribute source.
-    /// Always clear for dictionary-mode objects (their dictionary shape
-    /// lists no slots, so reads use the materialized slots regardless).
-    pub(crate) const SLOT_ATTRS_OVERRIDDEN: u8 = 1 << 1;
-    /// The object cannot serve as a guarded link of a prototype chain: its
-    /// `[[Prototype]]` is a Proxy or another non-ordinary object its shape
-    /// holds as a value (the shape's compressed prototype word is then null
-    /// without meaning `null`), or it is a String wrapper whose index
-    /// and `length` keys live outside its shape, or it owns host data that
-    /// can supply namespace properties or mapped argument values outside its
-    /// ordinary slots. Chain capture and generated receiver guards test this
-    /// bit, so a shape match proves ordinary key/slot lookup only on objects
-    /// whose shape fully describes it. Symbol properties and native call
-    /// metadata alone do not make a link opaque.
-    pub(crate) const CHAIN_LINK_OPAQUE: u8 = 1 << 2;
-    /// [`ShapeCacheMode::DictionaryCompatible`]: deleting string-keyed own
-    /// properties marks the object so future dictionary storage keeps the
-    /// same invalidation contract without installing stale ICs.
-    pub(crate) const DICTIONARY_COMPATIBLE: u8 = 1 << 3;
-    /// Stores must invalidate the prototype's dependent chain proofs.
-    pub(crate) const USED_AS_PROTOTYPE: u8 = 1 << 4;
-}
-
 impl ObjectBody {
     /// Retire dependent proofs before changing a watched prototype.
     #[inline]
     fn invalidate_prototype_proofs(&self) {
-        if self.flags() & ObjectFlags::USED_AS_PROTOTYPE != 0 {
+        if self.state().is_prototype() {
             self.exotic()
                 .expect("prototype sidecar")
                 .prototype_watchpoints
@@ -847,16 +815,14 @@ impl ObjectBody {
     }
 
     pub(crate) fn visit_function_ids(&self, visitor: &mut dyn FnMut(u32)) {
-        if self.slab.is_null() {
-            for value in &self.inline_values()[..self.slot_count()] {
-                crate::code_liveness::visit_value(value, visitor);
-            }
+        for value in &self.inline_values()[..self.slot_count().min(self.inline_capacity())] {
+            crate::code_liveness::visit_value(value, visitor);
         }
     }
 
     /// The cell header in front of this body. Valid only for a body that
-    /// lives in its heap cell; a pending body carries its header bytes in
-    /// [`PendingObject`].
+    /// lives in its heap cell. Pending object bodies never use this accessor;
+    /// allocation initializes the two body-owned header bytes to zero.
     #[inline]
     fn cell_header(&self) -> *mut otter_gc::GcHeader {
         // SAFETY: address computation only; every heap-resident body follows
@@ -870,91 +836,38 @@ impl ObjectBody {
         }
     }
 
-    /// The [`ObjectFlags`] byte.
+    /// Immutable semantic facts of this exact hidden class.
     #[inline]
-    fn flags(&self) -> u8 {
-        // SAFETY: a heap-resident body's header precedes it.
-        unsafe { (*self.cell_header()).body_bytes()[0] }
+    pub fn state(&self) -> ShapeState {
+        shape_body::state_of(self.shape)
     }
 
-    /// `[[Extensible]]`.
+    /// `[[Extensible]]`, owned by the hidden class.
     #[inline]
     pub(crate) fn extensible(&self) -> bool {
-        self.flags() & ObjectFlags::EXTENSIBLE != 0
+        self.state().is_extensible()
     }
 
-    #[inline]
-    pub(crate) fn set_extensible(&mut self, extensible: bool) {
-        self.set_flag(ObjectFlags::EXTENSIBLE, extensible);
-    }
-
-    /// See [`ObjectFlags::SLOT_ATTRS_OVERRIDDEN`].
-    #[inline]
-    pub(crate) fn slot_attrs_overridden(&self) -> bool {
-        self.flags() & ObjectFlags::SLOT_ATTRS_OVERRIDDEN != 0
-    }
-
-    #[inline]
-    pub(crate) fn set_slot_attrs_overridden(&mut self, overridden: bool) {
-        self.set_flag(ObjectFlags::SLOT_ATTRS_OVERRIDDEN, overridden);
-    }
-
-    /// See [`ObjectFlags::CHAIN_LINK_OPAQUE`].
+    /// Whether ordinary named-slot lookup is insufficient for this object.
     #[inline]
     pub(crate) fn chain_link_opaque(&self) -> bool {
-        self.flags() & ObjectFlags::CHAIN_LINK_OPAQUE != 0
-    }
-
-    #[inline]
-    pub(crate) fn set_chain_link_opaque(&mut self, opaque: bool) {
-        self.set_flag(ObjectFlags::CHAIN_LINK_OPAQUE, opaque);
-    }
-
-    /// Whether string-keyed shape assumptions are IC-compatible.
-    #[inline]
-    pub(crate) fn shape_cache_mode(&self) -> ShapeCacheMode {
-        if self.flags() & ObjectFlags::DICTIONARY_COMPATIBLE != 0 {
-            ShapeCacheMode::DictionaryCompatible
-        } else {
-            ShapeCacheMode::Fast
-        }
-    }
-
-    #[inline]
-    pub(crate) fn set_shape_cache_mode(&mut self, mode: ShapeCacheMode) {
-        self.set_flag(
-            ObjectFlags::DICTIONARY_COMPATIBLE,
-            mode == ShapeCacheMode::DictionaryCompatible,
-        );
-    }
-
-    #[inline]
-    fn set_flag(&mut self, bit: u8, on: bool) {
-        self.invalidate_prototype_proofs();
-        let header = self.cell_header();
-        // SAFETY: a heap-resident body's header precedes it; the mutator is
-        // the only writer of the body-owned header bytes.
-        unsafe {
-            let [flags, capacity] = (*header).body_bytes();
-            let flags = if on { flags | bit } else { flags & !bit };
-            otter_gc::GcHeader::set_body_bytes(header, [flags, capacity]);
-        }
+        self.state().is_opaque()
     }
 
     /// Number of in-object value slots in this cell.
     #[inline]
     pub(crate) fn inline_capacity(&self) -> usize {
-        // SAFETY: a heap-resident body's header precedes it.
-        usize::from(unsafe { (*self.cell_header()).body_bytes()[1] })
+        shape_body::inline_capacity_of(self.shape)
     }
 
     /// Write the header bytes of a freshly allocated cell, before any
     /// collection can observe it.
     #[inline]
-    fn init_cell_bytes(&mut self, flags: u8, capacity: u8) {
+    fn init_cell_bytes(&mut self) {
         // SAFETY: called by the allocation initializer on the body's final
         // address.
-        unsafe { otter_gc::GcHeader::set_body_bytes(self.cell_header(), [flags, capacity]) };
+        unsafe { otter_gc::GcHeader::set_body_bytes(self.cell_header(), [0, 0]) };
+        self.debug_verify_field_layout();
     }
 
     /// Base of the in-object slots trailing the fixed body.
@@ -962,27 +875,30 @@ impl ObjectBody {
     fn inline_values_ptr(&self) -> *mut Value {
         // SAFETY: computes the tail address only; every allocation path
         // reserves `inline_capacity` words after the fixed body.
-        unsafe { (self as *const Self).add(1).cast_mut().cast::<Value>() }
+        unsafe {
+            self.cell_header()
+                .cast::<u8>()
+                .add(FieldLayout::current().inline_values_byte as usize)
+                .cast()
+        }
     }
 
-    /// The in-object slots, whether or not they hold the live slots.
+    /// Persistent in-object words; only the counted prefix holds live fields.
     #[inline]
     fn inline_values(&self) -> &[Value] {
         // SAFETY: an allocated body owns `inline_capacity` words after the
-        // fixed part; words past the slot count hold stale or zero bits that
-        // are never traced or read as slots.
+        // fixed part. All spare words start as undefined; only live fields
+        // are traced or read as slots.
         unsafe { std::slice::from_raw_parts(self.inline_values_ptr(), self.inline_capacity()) }
     }
 }
 
-/// Largest in-object capacity an allocation site may request (JSC's
-/// `JSFinalObject::maxInlineCapacity` is of the same order). A site that
-/// needs more starts with an out-of-line slab.
+/// Largest shape-owned persistent inline prefix. Larger objects retain this
+/// prefix and keep only the remaining fields in an overflow slab.
 pub(crate) const MAX_INLINE_CAPACITY: usize = 64;
 
-/// In-object capacity of an empty object created without a size hint —
-/// `{}`, `Object.create`, runtime-built records. V8's object function
-/// initial map reserves four in-object properties for the same case.
+/// Persistent prefix capacity for empty objects without a size hint:
+/// `{}`, `Object.create`, and incrementally built runtime records.
 pub(crate) const DEFAULT_INLINE_CAPACITY: usize = 4;
 
 /// In-object capacity for an allocation site that knows its property count.
@@ -1007,9 +923,7 @@ pub(crate) fn receiver_inline_capacity(fields: usize) -> usize {
 /// header included.
 #[inline]
 pub(crate) const fn object_cell_bytes(capacity: usize) -> usize {
-    otter_gc::header::HEADER_SIZE
-        + std::mem::size_of::<ObjectBody>()
-        + capacity * std::mem::size_of::<Value>()
+    FieldLayout::current().cell_bytes(capacity)
 }
 
 /// Rarely-used `ObjectBody` slots, boxed out of the hot object so plain
@@ -1077,8 +991,7 @@ pub struct ExoticSlots {
     dictionary_keys: DictKeysHandle,
     /// Materialized per-slot metadata (flags + `is_accessor` discriminator),
     /// index-aligned with the flat value array. Present and authoritative only
-    /// for dictionary-mode objects (null shape) and attribute-overridden
-    /// objects (`ObjectBody::slot_attrs_overridden`). Null for the common
+    /// for dictionary-mode objects. Null for ordinary shape-owned attributes in the common
     /// shaped object, which derives per-slot attributes from the hidden
     /// class. Holds no GC handles; the handle is traced so the table
     /// relocates with the graph.
@@ -1575,23 +1488,28 @@ pub(crate) type ErrorStackHandle = otter_gc::Gc<ErrorStackBody>;
 #[derive(Clone, Copy)]
 struct ErrorFrameRecord {
     function_id: u32,
-    name_offset: u32,
-    name_len: u32,
-    module_offset: u32,
-    module_len: u32,
+    name_offset: usize,
+    name_len: usize,
+    module_offset: usize,
+    module_len: usize,
     span_lo: u32,
     span_hi: u32,
+    has_source: bool,
+    line_number: u32,
+    start_column: u32,
+    source_offset: usize,
+    source_len: usize,
 }
 
 /// Captured `Error` stack frames: fixed records followed by a UTF-8
-/// arena holding every frame's function and module name. Written once
+/// arena holding every frame's function/module name and exact captured source line. Written once
 /// at capture, never mutated, no GC references — the page image
 /// carries it whole where the old `Vec<StackFrameSnapshot>` (owned
 /// `String`s) could not ride at all.
 #[repr(C, align(8))]
 pub struct ErrorStackBody {
-    frame_count: u32,
-    byte_len: u32,
+    frame_count: usize,
+    byte_len: usize,
 }
 
 impl ErrorStackBody {
@@ -1617,7 +1535,7 @@ impl ErrorStackBody {
         }
     }
 
-    fn str_at(&self, offset: u32, len: u32) -> &str {
+    fn str_at(&self, offset: usize, len: usize) -> &str {
         // SAFETY: written from `&str` at capture; inside `byte_len`.
         unsafe {
             std::str::from_utf8_unchecked(std::slice::from_raw_parts(
@@ -1627,21 +1545,41 @@ impl ErrorStackBody {
         }
     }
 
-    /// Reconstruct the captured frames.
-    fn to_frames(&self) -> Vec<crate::run_control::StackFrameSnapshot> {
-        (0..self.frame_count as usize)
+    /// Reconstruct owned frames, admitting copied source lines before retention.
+    /// SharedSource clones then keep one charge per actual copied allocation.
+    fn to_frames(
+        &self,
+        account: &otter_resource::ResourceAccount,
+    ) -> Result<Vec<crate::run_control::StackFrameSnapshot>, otter_resource::SharedSourceError>
+    {
+        (0..self.frame_count)
             .map(|i| {
-                // SAFETY: `i < frame_count`; records were fully written
-                // before the body became reachable.
+                // SAFETY: i is inside the fully published immutable record extent.
                 let record = unsafe { *self.records_ptr().add(i) };
-                crate::run_control::StackFrameSnapshot {
+                let module = self
+                    .str_at(record.module_offset, record.module_len)
+                    .to_owned();
+                let source_position = if record.has_source {
+                    Some(crate::ErrorSourcePosition {
+                        script_name: module.clone(),
+                        line_number: record.line_number,
+                        start_column: record.start_column,
+                        source_line: otter_resource::SharedSource::read_utf8(
+                            account,
+                            self.str_at(record.source_offset, record.source_len)
+                                .as_bytes(),
+                        )?,
+                    })
+                } else {
+                    None
+                };
+                Ok(crate::run_control::StackFrameSnapshot {
                     function_id: record.function_id,
                     function_name: self.str_at(record.name_offset, record.name_len).to_owned(),
-                    module: self
-                        .str_at(record.module_offset, record.module_len)
-                        .to_owned(),
+                    module,
                     span: (record.span_lo, record.span_hi),
-                }
+                    source_position,
+                })
             })
             .collect()
     }
@@ -1677,153 +1615,6 @@ fn error_stack_body_of(handle: ErrorStackHandle) -> Option<*mut ErrorStackBody> 
 pub const EXOTIC_SLOTS_SYMBOL_PROPS_BYTE: u32 =
     (otter_gc::header::HEADER_SIZE + std::mem::offset_of!(ExoticSlots, symbol_props)) as u32;
 
-/// Reserved [`otter_gc::Traceable::TYPE_TAG`] for [`SymbolPropsBody`].
-pub const SYMBOL_PROPS_BODY_TYPE_TAG: u8 = 0x3b;
-
-/// Handle to an object's symbol-keyed property table.
-pub(crate) type SymbolPropsHandle = otter_gc::Gc<SymbolPropsBody>;
-
-/// One symbol-keyed own property.
-type SymbolProp = (crate::symbol::JsSymbol, SlotData);
-
-/// Header for an object's symbol-keyed own properties; the
-/// `(symbol, slot)` records follow it in the same cell. Symbols are
-/// compared by identity and kept alive by the realm's well-known /
-/// registry roots, so only each slot's values are traced — the same
-/// contract the sidecar's `Vec` had.
-#[repr(C, align(8))]
-pub struct SymbolPropsBody {
-    /// Records the trailing array can hold.
-    capacity: u32,
-    /// Records written, and therefore traced.
-    len: u32,
-}
-
-impl SymbolPropsBody {
-    /// Trailing bytes a table of `capacity` records needs.
-    #[must_use]
-    fn trailing_bytes(capacity: usize) -> usize {
-        capacity * std::mem::size_of::<SymbolProp>()
-    }
-
-    fn new(capacity: usize) -> Self {
-        Self {
-            capacity: u32::try_from(capacity).expect("symbol prop capacity exceeds u32"),
-            len: 0,
-        }
-    }
-
-    fn capacity(&self) -> usize {
-        self.capacity as usize
-    }
-
-    fn len(&self) -> usize {
-        self.len as usize
-    }
-
-    fn entries_ptr(&self) -> *mut SymbolProp {
-        // SAFETY: the allocation reserved `trailing_bytes(capacity)`
-        // immediately after this header.
-        unsafe {
-            (self as *const Self as *mut u8)
-                .add(std::mem::size_of::<Self>())
-                .cast()
-        }
-    }
-
-    /// The written records.
-    fn entries(&self) -> &[SymbolProp] {
-        // SAFETY: the first `len` records were written before the table
-        // became reachable.
-        unsafe { std::slice::from_raw_parts(self.entries_ptr().cast_const(), self.len()) }
-    }
-
-    /// The written records, mutably.
-    fn entries_mut(&mut self) -> &mut [SymbolProp] {
-        // SAFETY: as in `entries`.
-        unsafe { std::slice::from_raw_parts_mut(self.entries_ptr(), self.len()) }
-    }
-
-    /// Append a record. The caller must have reserved capacity: growth
-    /// allocates, and a payload borrow has no heap to allocate from.
-    fn push(&mut self, entry: SymbolProp) {
-        let index = self.len();
-        debug_assert!(
-            index < self.capacity(),
-            "symbol prop push without a reservation"
-        );
-        // SAFETY: `index < capacity`, so the slot is inside the table.
-        unsafe { self.entries_ptr().add(index).write(entry) };
-        self.len += 1;
-    }
-
-    /// Remove the record at `index`, sliding later records down.
-    fn remove(&mut self, index: usize) {
-        let len = self.len();
-        debug_assert!(index < len);
-        for i in index..len - 1 {
-            // SAFETY: both slots are inside the written prefix.
-            unsafe {
-                let next = self.entries_ptr().add(i + 1).read();
-                self.entries_ptr().add(i).write(next);
-            }
-        }
-        self.len -= 1;
-    }
-}
-
-const _: () = assert!(
-    std::mem::size_of::<SymbolPropsBody>().is_multiple_of(std::mem::align_of::<SymbolProp>())
-);
-
-impl otter_gc::SafeTraceable for SymbolPropsBody {
-    const TYPE_TAG: u8 = SYMBOL_PROPS_BODY_TYPE_TAG;
-
-    fn trace_slots_safe(&mut self, v: &mut SlotVisitor<'_>) {
-        for (sym, slot) in self.entries_mut() {
-            // The key's symbol handle (and its description string) must
-            // relocate with the table: symbol property lookup is handle
-            // identity, so an unvisited key would compare unequal to the
-            // relocated well-known symbol after a snapshot restore.
-            sym.trace_value_slots(v);
-            match &mut slot.kind {
-                SlotKind::Data => slot.value.trace_value_slot_mut(v),
-                SlotKind::Accessor(pair) => {
-                    if let Some(g) = &mut pair.getter {
-                        g.trace_value_slot_mut(v);
-                    }
-                    if let Some(s) = &mut pair.setter {
-                        s.trace_value_slot_mut(v);
-                    }
-                }
-            }
-        }
-    }
-
-    /// The trailing array lives in the heap cell, not in this body, so a
-    /// pending copy on the stack has nothing to trace: everything
-    /// `trace_slots_safe` walks is storage that does not exist yet.
-    fn trace_pending_slots_safe(&mut self, _visitor: &mut SlotVisitor<'_>) {}
-}
-
-impl SymbolPropsBody {
-    pub(crate) fn visit_function_ids(&self, visitor: &mut dyn FnMut(u32)) {
-        for (_, slot) in self.entries() {
-            match &slot.kind {
-                SlotKind::Data => crate::code_liveness::visit_value(&slot.value, visitor),
-                SlotKind::Accessor(pair) => {
-                    if let Some(value) = &pair.getter {
-                        crate::code_liveness::visit_value(value, visitor);
-                    }
-                    if let Some(value) = &pair.setter {
-                        crate::code_liveness::visit_value(value, visitor);
-                    }
-                }
-            }
-        }
-    }
-}
-
 /// Reserved [`otter_gc::Traceable::TYPE_TAG`] for [`SlotMetaBody`].
 pub const SLOT_META_BODY_TYPE_TAG: u8 = 0x3c;
 
@@ -1833,7 +1624,7 @@ pub(crate) type SlotMetaHandle = otter_gc::Gc<SlotMetaBody>;
 /// Header for materialized per-slot attribute metadata; the
 /// [`SlotMeta`] records follow it in the same cell. Metadata holds no
 /// GC references, so the body traces nothing — it exists purely so a
-/// dictionary-mode or attribute-overridden object owns its metadata
+/// dictionary-mode object owns its metadata
 /// inside the cage.
 #[repr(C)]
 pub struct SlotMetaBody {
@@ -1963,23 +1754,6 @@ fn slot_meta_table_from(
     Ok(table)
 }
 
-/// The table payload behind `handle`, or `None` for a null handle.
-#[must_use]
-fn symbol_props_body_of(handle: SymbolPropsHandle) -> Option<*mut SymbolPropsBody> {
-    if handle.is_null() {
-        return None;
-    }
-    let header = handle.as_header_ptr();
-    // SAFETY: a non-null handle names a live cell whose payload is a
-    // `SymbolPropsBody` one header past the start.
-    Some(unsafe {
-        header
-            .cast::<u8>()
-            .add(std::mem::size_of::<otter_gc::GcHeader>())
-            .cast::<SymbolPropsBody>()
-    })
-}
-
 /// Make room for one more symbol property on `object`.
 ///
 /// Ensures the sidecar and grows the symbol table when it is full, with
@@ -1996,67 +1770,20 @@ fn reserve_symbol_prop_capacity(
     external_visit: &mut RootSlotVisitor<'_>,
 ) -> Result<(), otter_gc::OutOfMemory> {
     ensure_exotic_with_roots(object, heap, external_visit)?;
-    let sidecar = heap.read_payload(*object, |body| body.exotic.get());
-    // SAFETY: `ensure_exotic` above guarantees a live sidecar.
-    let (current, len, capacity) = {
-        let exotic = exotic_body_of(sidecar).expect("sidecar reserved above");
-        // SAFETY: live sidecar payload; read-only peek.
-        let handle = unsafe { (*exotic).symbol_props };
-        match symbol_props_body_of(handle) {
-            // SAFETY: non-null handle names a live table.
-            Some(table) => unsafe { (handle, (*table).len(), (*table).capacity()) },
-            None => (handle, 0, 0),
-        }
-    };
-    if len < capacity {
-        return Ok(());
-    }
-    let grown = (capacity * 2).max(2);
-    let owner_slot = std::ptr::addr_of_mut!(*object);
+    let mut table = heap.read_payload(*object, |body| {
+        body.exotic().expect("reserved sidecar").symbol_props
+    });
+    let old = table;
+    let owner_slot = std::ptr::from_mut(object).cast::<RawGc>();
     let mut visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
         external_visit(visitor);
-        visitor(owner_slot.cast::<RawGc>());
+        visitor(owner_slot);
     };
-    let table: SymbolPropsHandle = heap.alloc_variable_with_roots(
-        SymbolPropsBody::new(grown),
-        SymbolPropsBody::trailing_bytes(grown),
-        &mut visit,
-    )?;
-    // Carry the old records over and install the new table. The old
-    // table did not move (old space), so `current` still names it.
-    if let Some(old) = symbol_props_body_of(current) {
-        // SAFETY: both tables are live; the new one has room for every
-        // old record.
-        unsafe {
-            let new_body = symbol_props_body_of(table).expect("fresh table");
-            for entry in (*old).entries() {
-                (*new_body).push(entry.clone());
-            }
-        }
-    }
-    let owner = *object;
-    let sidecar = heap.read_payload(owner, |body| body.exotic.get());
-    heap.with_payload(sidecar, |exotic| {
-        exotic.symbol_props = table;
-        true
-    });
-    heap.record_write(sidecar, &table);
-    // The copied-in records hold edges the barrier never saw.
-    if let Some(new_body) = symbol_props_body_of(table) {
-        // SAFETY: live table payload.
-        let entries: Vec<SymbolProp> = unsafe { (*new_body).entries().to_vec() };
-        for (sym, slot) in entries {
-            heap.record_write(table, &sym);
-            heap.record_write(table, &slot.value);
-            if let SlotKind::Accessor(pair) = &slot.kind {
-                if let Some(g) = &pair.getter {
-                    heap.record_write(table, g);
-                }
-                if let Some(s) = &pair.setter {
-                    heap.record_write(table, s);
-                }
-            }
-        }
+    symbol_table::reserve_table(&mut table, heap, &mut visit)?;
+    if table != old {
+        let sidecar = heap.read_payload(*object, |body| body.exotic.get());
+        heap.with_payload(sidecar, |exotic| exotic.symbol_props = table);
+        heap.record_write(sidecar, &table);
     }
     Ok(())
 }
@@ -2091,7 +1818,7 @@ where
         // SAFETY: live sidecar payload; read-only peek at the handle.
         let table = unsafe { (*exotic).symbol_props };
         if !table.is_null() {
-            heap.record_write(table, value);
+            symbol_table::record_write(heap, table, value);
         }
     }
 }
@@ -2199,23 +1926,6 @@ where
 /// JIT reads the shape handle here for the monomorphic IC guard.
 pub(crate) const OBJECT_BODY_SHAPE_OFFSET: usize = std::mem::offset_of!(ObjectBody, shape);
 
-/// Byte offset of the first in-object slot, right after the fixed body.
-/// While the slab handle is null, string-keyed slot `i` is the word at
-/// `OBJECT_BODY_INLINE_VALUES_OFFSET + 8 * i`.
-pub(crate) const OBJECT_BODY_INLINE_VALUES_OFFSET: usize = std::mem::size_of::<ObjectBody>();
-
-/// Byte offset of the out-of-line slab handle. The JIT reads it to branch
-/// in-object vs out-of-line: a null handle means the slots live in-object.
-/// The slot count cannot decide this — the capacity model can move an
-/// object's slots out of line before they outgrow the in-object capacity (an
-/// existing-slot slow store reserves ahead), and a spilled slab that shrinks
-/// back stays out of line.
-pub(crate) const OBJECT_BODY_SLAB_HANDLE_OFFSET: usize = std::mem::offset_of!(ObjectBody, slab);
-/// Cell offset (from the GC header) of the [`ObjectFlags`] byte.
-pub(crate) const OBJECT_CELL_FLAGS_BYTE: usize = otter_gc::header::HEADER_BODY_BYTES_OFFSET;
-/// Cell offset (from the GC header) of the in-object capacity byte.
-pub(crate) const OBJECT_CELL_INLINE_CAPACITY_BYTE: usize =
-    otter_gc::header::HEADER_BODY_BYTES_OFFSET + 1;
 /// Byte offset of a dictionary-mode object's slot-layout epoch inside its
 /// [`ExoticSlots`] payload. Generated proofs about one existing key of a
 /// dictionary-mode object compare this `u32` after proving the shape is a
@@ -2238,13 +1948,15 @@ pub(crate) const OBJECT_BODY_EXOTIC_HANDLE_OFFSET: usize =
 // compile error rather than a frozen JIT baking garbage. Update these literals
 // deliberately, in lockstep with the JIT, when the body changes.
 const _: () = assert!(OBJECT_BODY_SHAPE_OFFSET == 0);
-const _: () = assert!(OBJECT_BODY_SLAB_HANDLE_OFFSET == 4);
+const _: () = assert!(FieldLayout::current().slab_handle_byte == 12);
 const _: () = assert!(OBJECT_BODY_EXOTIC_HANDLE_OFFSET == 8);
-const _: () = assert!(OBJECT_CELL_FLAGS_BYTE == 2);
-const _: () = assert!(OBJECT_CELL_INLINE_CAPACITY_BYTE == 3);
-const _: () = assert!(OBJECT_BODY_INLINE_VALUES_OFFSET == 16);
+const _: () = assert!(FieldLayout::current().inline_values_byte == 24);
 // The in-object slots must stay 8-aligned for the JIT's word loads.
-const _: () = assert!(OBJECT_BODY_INLINE_VALUES_OFFSET.is_multiple_of(8));
+const _: () = assert!(
+    FieldLayout::current()
+        .inline_values_byte
+        .is_multiple_of(FieldLocation::WORD_BYTES)
+);
 const _: () = assert!(std::mem::align_of::<ObjectBody>() == 8);
 const _: () = assert!(MAX_INLINE_CAPACITY <= u8::MAX as usize);
 
@@ -2256,7 +1968,7 @@ const _: () = assert!(std::mem::size_of::<ObjectBody>() == 16);
 impl ObjectBody {
     /// Enter (or stay in) dictionary mode for a key-set change: carry the
     /// live slot count into the sidecar, assign a fresh structural id, and
-    /// clear the shape.
+    /// publish the prepared dictionary shape with the same capacity and state.
     ///
     /// `append` marks a change that only appends a new key: when the object
     /// is already in dictionary mode every existing key keeps its slot, kind
@@ -2342,24 +2054,16 @@ impl ObjectBody {
             u32::try_from(count).expect("slot count exceeds u32");
     }
 
-    /// Whether the slab is held inline in the body (small object) rather than
-    /// in an out-of-line [`slot_slab::SlotSlabBody`].
-    #[inline]
-    fn slab_is_inline(&self) -> bool {
-        self.slab.is_null()
-    }
-
-    /// Words the current slot buffer can hold without growing.
+    /// Total logical slots reserved by the persistent prefix and suffix slab.
     #[inline]
     fn slab_capacity(&self) -> usize {
-        if self.slab.is_null() {
-            self.inline_capacity()
-        } else {
-            // SAFETY: a non-null slab handle addresses a live
-            // `SlotSlabBody`; reading its capacity field touches only the
-            // body header.
-            unsafe { (*self.slab_body_ptr()).capacity() }
-        }
+        self.inline_capacity()
+            + if self.slab.is_null() {
+                0
+            } else {
+                // SAFETY: the non-null handle names the live suffix slab.
+                unsafe { (*self.slab_body_ptr()).capacity() }
+            }
     }
 
     /// Raw pointer to the out-of-line slab body. Only valid when
@@ -2376,26 +2080,66 @@ impl ObjectBody {
         }
     }
 
-    /// Base of the live slot buffer: the in-object slots while the slab is
-    /// null, the slab's words once the object has spilled.
+    /// Select the immutable storage bank of one shape-owned location.
     #[inline]
-    fn values_base(&self) -> *mut Value {
-        if self.slab_is_inline() {
+    fn field_ptr(&self, field: FieldLocation) -> *mut Value {
+        let base = if field.is_inline() {
             self.inline_values_ptr()
         } else {
-            // SAFETY: the handle is non-null, so it addresses a live slab
-            // whose words follow its header.
+            // SAFETY: every live overflow field has a reserved suffix slab.
             unsafe { (*self.slab_body_ptr()).words_ptr() }
+        };
+        // SAFETY: caller supplies a live/reserved location in this bank.
+        unsafe { field.word_ptr(base) }
+    }
+
+    #[inline]
+    fn location_for_slot(&self, index: usize) -> FieldLocation {
+        FieldLocation::for_slot(
+            u32::try_from(index).expect("slot exceeds u32"),
+            self.inline_capacity(),
+        )
+    }
+
+    /// Check storage bounds in a stable mutator view. Collector and image
+    /// visitors must first finish rewriting fixed handles and do not call it.
+    #[inline]
+    fn debug_verify_field_layout(&self) {
+        #[cfg(debug_assertions)]
+        {
+            debug_assert_object_shape_handle(self.shape, "field layout verification");
+            shape_body::debug_verify_field_locations(self.shape);
+            // SAFETY: this method is called only for a resident object while
+            // the mutator owns its stable fixed handles.
+            let header = unsafe { &*self.cell_header() };
+            assert_eq!(header.type_tag(), OBJECT_BODY_TYPE_TAG);
+            let slab = if self.slab.is_null() {
+                None
+            } else {
+                // SAFETY: the resident slab handle names its live header and
+                // payload. No allocation or collection occurs in this check.
+                let slab_header = unsafe { &*self.slab.as_header_ptr() };
+                assert_eq!(slab_header.type_tag(), slot_slab::SLOT_SLAB_BODY_TYPE_TAG);
+                let capacity = unsafe { (*self.slab_body_ptr()).capacity() };
+                Some((capacity, slab_header.size_bytes() as usize))
+            };
+            FieldLayout::current().debug_verify(
+                self.inline_capacity(),
+                header.size_bytes() as usize,
+                self.slot_count(),
+                slab,
+            );
         }
     }
 
     /// Read the value word for string-keyed slot `i`.
     #[inline]
     fn slot_word(&self, i: usize) -> Value {
+        self.debug_verify_field_layout();
         debug_assert!(i < self.slot_count(), "slab read out of range");
         // SAFETY: `i` is below the live slot count, which never exceeds the
         // active buffer's capacity.
-        unsafe { *self.values_base().add(i) }
+        unsafe { *self.field_ptr(self.location_for_slot(i)) }
     }
 
     /// Read the data value for string-keyed slot `i`.
@@ -2407,20 +2151,22 @@ impl ObjectBody {
     /// Write a value into string-keyed slot `i`.
     #[inline]
     fn set_data_value(&mut self, i: usize, value: Value) {
+        self.debug_verify_field_layout();
         self.invalidate_prototype_proofs();
         debug_assert!(i < self.slot_count(), "slab write out of range");
         // SAFETY: same in-range word as `slot_word`.
-        unsafe { *self.values_base().add(i) = value };
+        unsafe { *self.field_ptr(self.location_for_slot(i)) = value };
     }
 
     /// Write slot word `index` of an append into the active buffer. The
     /// caller reserved the room through [`reserve_slot_capacity`], which
-    /// moves every slot to a slab when the in-object capacity is exhausted.
+    /// grows only the suffix when the shape-owned capacity is exhausted.
     /// A shaped object's count follows from the shape its caller installs
     /// (before or after this write, with no safepoint between); a
     /// dictionary object's count advances here.
     #[inline]
     fn push_slab_word(&mut self, index: usize, value: Value) {
+        self.debug_verify_field_layout();
         self.invalidate_prototype_proofs();
         debug_assert!(
             index < self.slab_capacity(),
@@ -2430,7 +2176,7 @@ impl ObjectBody {
         );
         // SAFETY: the append index is inside the reserved capacity of the
         // active buffer.
-        unsafe { *self.values_base().add(index) = value };
+        unsafe { *self.field_ptr(self.location_for_slot(index)) = value };
         if self.is_dictionary() {
             debug_assert_eq!(self.slot_count(), index, "dictionary append desynced");
             self.set_dictionary_slot_count(index + 1);
@@ -2443,25 +2189,23 @@ impl ObjectBody {
         }
     }
 
-    /// Remove the slot word at `i` of a dictionary-mode object, shifting
-    /// later words down. Stays out of line once spilled (delete normalizes to
-    /// dictionary mode, an uncommon path).
+    /// Remove a dictionary slot and shift later words across the inline/suffix
+    /// boundary without changing the shape-owned allocation geometry.
     #[inline]
     fn remove_slab_word(&mut self, i: usize) {
         self.invalidate_prototype_proofs();
         debug_assert!(self.is_dictionary(), "only dictionary objects remove slots");
         let len = self.slot_count();
-        // SAFETY: `i < len <= capacity`; the shift stays inside the live
-        // words of whichever buffer is active.
-        unsafe {
-            let base = self.values_base();
-            std::ptr::copy(base.add(i + 1), base.add(i), len - i - 1);
-            *base.add(len - 1) = Value::default();
+        // A dictionary shift can cross the persistent-prefix boundary.
+        for index in i..len - 1 {
+            let value = self.slot_word(index + 1);
+            unsafe { *self.field_ptr(self.location_for_slot(index)) = value };
         }
+        unsafe { *self.field_ptr(self.location_for_slot(len - 1)) = Value::undefined() };
         self.set_dictionary_slot_count(len - 1);
     }
 
-    /// Install a larger out-of-line slab, copying the live words across.
+    /// Install a fully initialized larger out-of-line slab.
     ///
     /// The body never grows its own storage: growth is an allocation, and
     /// an allocation inside a property store is where an object gets moved
@@ -2470,27 +2214,14 @@ impl ObjectBody {
     /// capacity that already exists.
     fn adopt_slab(&mut self, slab: slot_slab::SlotSlabHandle) {
         debug_assert!(!slab.is_null(), "adopting a null slab");
-        let live = self.slot_count();
-        let source = self.values_base();
-        // SAFETY: the new slab was allocated with capacity for at least
-        // `live` words and does not overlap the current buffer.
-        unsafe {
-            let target = (*(((slab.as_header_ptr() as *mut u8)
-                .add(otter_gc::header::HEADER_SIZE))
-            .cast::<slot_slab::SlotSlabBody>()))
-            .words_ptr();
-            if live != 0 {
-                std::ptr::copy_nonoverlapping(source, target, live);
-            }
-        }
         self.slab = slab;
+        self.debug_verify_field_layout();
     }
 
     /// Append a new string-keyed own slot at flat index `index` (the pre-append
-    /// property count). For a shaped, non-overridden object the hidden class
-    /// already records the slot's attributes, so only the flat value is
-    /// written; a materialized object (dictionary-mode or attribute-overridden)
-    /// also pushes `meta` onto its per-slot metadata vector so it stays
+    /// property count). For a shaped object the hidden class records all slot
+    /// attributes, so only the flat value is written. Dictionary storage also
+    /// pushes `meta` onto its per-slot metadata table so it stays
     /// index-aligned with the value array. For an accessor slot `value` is the
     /// [`AccessorCellBody`] handle produced by [`SlotData::into_flat`].
     fn push_slot(&mut self, index: usize, meta: SlotMeta, value: Value) {
@@ -2501,18 +2232,9 @@ impl ObjectBody {
         }
     }
 
-    /// Overwrite the string-keyed slot at `i` with new metadata + flat value.
-    ///
-    /// Used by the `defineProperty`-on-existing merge paths, which change a
-    /// slot's attributes or data↔accessor kind. `attr_shape` is the
-    /// attribute-encoding hidden class the object transitions to so the shape
-    /// keeps recording the slot's attributes (the common, fast case): a shaped,
-    /// non-overridden object stores nothing per-slot. A previously
-    /// attribute-overridden object keeps its materialized metadata in lockstep.
-    /// `None` — only for dictionary-mode (null shape) or internal construction
-    /// paths without a shape runtime — keeps the materialized metadata
-    /// authoritative; the caller must have materialized it first
-    /// ([`materialize_slots`]).
+    /// Store a descriptor and flat value. A prepared attribute shape owns
+    /// ordinary descriptors; the no-shape path requires normalized dictionary
+    /// metadata and retires watched proofs before descriptor publication.
     fn set_slot(
         &mut self,
         i: usize,
@@ -2520,61 +2242,42 @@ impl ObjectBody {
         value: Value,
         attr_shape: Option<ShapeHandle>,
     ) {
-        self.set_data_value(i, value);
         match attr_shape {
             Some(shape) => {
+                self.set_data_value(i, value);
                 debug_assert_object_shape_handle(shape, "slot attribute shape install");
                 debug_assert_object_shape_handle(shape, "shape-slot store");
                 self.shape = shape;
-                // A previously overridden object keeps reading from its
-                // materialized metadata, so keep that entry current; a
-                // non-overridden object reads the rebuilt shape and stores none.
-                if self.slot_attrs_overridden() {
-                    self.slots_mut().entries_mut()[i] = meta;
-                }
+                assert!(
+                    !self.is_dictionary(),
+                    "attribute shape owns all descriptors"
+                );
             }
             None => {
-                if !self.is_dictionary() {
-                    self.set_slot_attrs_overridden(true);
-                }
+                assert!(
+                    self.is_dictionary(),
+                    "in-place attributes require dictionary storage"
+                );
                 debug_assert!(
                     self.slots_materialized(),
                     "set_slot(None) needs materialized slots"
                 );
-                let entry = &mut self.slots_mut().entries_mut()[i];
-                let redefined = entry.flags != meta.flags || entry.is_accessor != meta.is_accessor;
-                let retires_proofs = redefined && entry.watched;
-                *entry = SlotMeta {
-                    watched: entry.watched && !redefined,
+                let previous = self.slots()[i];
+                let changes = descriptor_mutation::DescriptorChanges::for_slot(previous, meta);
+                changes.retire(self);
+                self.set_data_value(i, value);
+                self.slots_mut().entries_mut()[i] = SlotMeta {
+                    watched: previous.watched && !changes.changed(),
                     ..meta
                 };
-                // A dictionary object's structural id stands for its whole
-                // key/slot/attribute layout, as a hidden class does for a
-                // shaped object: changing a slot's kind or attributes in place
-                // must retire every guard captured under the old id. Only a
-                // slot some compiled proof reads directly moves the slot-layout
-                // epoch those proofs guard.
-                if redefined && self.is_dictionary() {
-                    self.exotic_mut().dictionary_shape_id = next_shape_id();
-                    if retires_proofs {
-                        self.advance_dictionary_layout();
-                    }
-                }
             }
         }
     }
 
-    /// Per-slot `(flags, is_accessor)` for the string-keyed slot at `i`.
-    ///
-    /// Reads from the hidden class for a shaped object whose attributes have
-    /// not diverged (the common case — every shaped slot recorded its
-    /// attributes on the transition that created it), and falls back to the
-    /// authoritative materialized metadata for dictionary-mode or
-    /// attribute-overridden objects.
+    /// Read descriptor facts from their sole shape or dictionary owner.
     #[inline]
     fn slot_attrs(&self, heap: &otter_gc::GcHeap, i: usize) -> (PropertyFlags, bool) {
         if !self.is_dictionary()
-            && !self.slot_attrs_overridden()
             && let Some(attrs) = shape_body::shape_slot_attrs(heap, self.shape, i as u32)
         {
             return attrs;
@@ -2810,16 +2513,17 @@ impl ObjectBody {
     }
 
     /// `true` when per-slot metadata is materialized in [`ExoticSlots::slots`]
-    /// and is the authoritative attribute source. Dictionary-mode (null shape)
-    /// and attribute-overridden objects materialize; the common shaped object
+    /// and is the authoritative attribute source. Dictionary-mode objects
+    /// materialize; the common shaped object
     /// derives attributes from the hidden class and carries none.
     #[inline]
     fn slots_materialized(&self) -> bool {
-        self.is_dictionary() || self.slot_attrs_overridden()
+        self.is_dictionary()
     }
 
-    /// Materialized per-slot metadata as a slice (`&[]` when the shape is the
-    /// authoritative source).
+    /// Per-slot metadata as a slice (`&[]` when no table exists). A prepared
+    /// integrity transaction can populate its tables immediately before
+    /// publishing dictionary state, without exposing a second lookup owner.
     #[inline]
     fn slots(&self) -> &[SlotMeta] {
         self.exotic()
@@ -2829,9 +2533,9 @@ impl ObjectBody {
             .map_or(&[], |table| unsafe { (*table).entries() })
     }
 
-    /// Exclusive ref to the materialized per-slot metadata vector, allocating
-    /// the exotic box on first use. Callers must only reach this on a
-    /// materialized object (dictionary-mode or attribute-overridden).
+    /// Exclusive access to a pre-reserved metadata table. This never allocates;
+    /// callers own dictionary storage or a nonallocating integrity publication
+    /// transaction which installs its final dictionary state before returning.
     #[inline]
     fn slots_mut(&mut self) -> &mut SlotMetaBody {
         let table = self
@@ -2851,7 +2555,7 @@ impl std::fmt::Debug for ObjectBody {
         f.debug_struct("ObjectBody")
             .field("has_shape", &!self.is_dictionary())
             .field("dictionary_len", &self.dict_key_count())
-            .field("shape_cache_mode", &self.shape_cache_mode())
+            .field("shape_state", &self.state())
             .field("slot_count", &self.slots().len())
             .field(
                 "has_prototype",
@@ -2927,18 +2631,12 @@ impl otter_gc::SafeTraceable for ObjectBody {
     /// body: a remembered old object is re-traced on a scavenge, and the young
     /// values its slot stores recorded may sit in an old slab the scavenge
     /// never visits on its own. Once an object has spilled, its in-object
-    /// words are stale and never traced.
+    /// words remain live and are traced independently of the overflow suffix.
     fn trace_slots_safe(&mut self, v: &mut SlotVisitor<'_>) {
         self.trace_fixed_slots(v);
-        let base = self.values_base();
-        // The fixed handles are visited first, so a relocating visitor has
-        // already rewritten the shape and sidecar handles the count reads.
+        // Fixed handles have been rewritten before capacity/count are read.
         for i in 0..self.slot_count() {
-            // SAFETY: `i` is below the slot count, a live word of the active
-            // buffer.
-            // `Value` skips immediates and rewrites the low-word GC offset of
-            // cells in place.
-            unsafe { (*base.add(i)).trace_value_slot_mut(v) };
+            unsafe { (*self.field_ptr(self.location_for_slot(i))).trace_value_slot_mut(v) };
         }
     }
 
@@ -3012,24 +2710,56 @@ pub(crate) fn reserve_slot_capacity(
             unsafe { (*pending_base.add(index)).trace_value_slot_mut(visitor) };
         }
     };
-    let slab = slot_slab::alloc_slot_slab(heap, grown, &mut visit)?;
+    let inline_capacity = heap.read_payload(*object, ObjectBody::inline_capacity);
+    let suffix_capacity = grown - inline_capacity;
+    let slab = heap.alloc_variable_with_roots_initialized(
+        slot_slab::SlotSlabBody::new(suffix_capacity),
+        slot_slab::SlotSlabBody::trailing_bytes(suffix_capacity),
+        &mut visit,
+        |target| {
+            // The allocator has already rewritten the rooted owner. Read its
+            // live suffix now; no interior pointer crosses the collection.
+            // SAFETY: object_slot is the rooted ordinary owner's handle.
+            let owner = unsafe { (*object_slot).cast::<ObjectBody>() };
+            let body = unsafe {
+                &*owner
+                    .as_header_ptr()
+                    .cast::<u8>()
+                    .add(otter_gc::header::HEADER_SIZE)
+                    .cast::<ObjectBody>()
+            };
+            let live = body.slot_count().saturating_sub(inline_capacity);
+            debug_assert!(live <= suffix_capacity);
+            if live != 0 {
+                // Copy only suffix words before the allocation's edge scan;
+                // the new slab owns the copied young/marking edges itself.
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        (*body.slab_body_ptr()).words_ptr(),
+                        target.words_ptr(),
+                        live,
+                    )
+                };
+            }
+            for index in live..suffix_capacity {
+                unsafe { *target.words_ptr().add(index) = Value::undefined() };
+            }
+        },
+    )?;
     let owner = *object;
     heap.with_payload(owner, |body| {
         body.adopt_slab(slab);
         true
     });
-    // The slab handle was installed by a raw payload write, so record the
-    // old-to-young edge the mutator barrier would have. The child of that
-    // edge is the slab: naming the owner as its own child makes the barrier
-    // read the owner's generation, find it old, and record nothing, leaving
-    // an old object pointing at a young slab the next scavenge never visits.
+    // Record publication of the new slab independently of its initialized
+    // child edges. The allocator scanned those edges before returning.
     heap.record_write(owner, &slab);
     Ok(())
 }
 
 /// Make room for `needed` materialized per-slot metadata records.
 ///
-/// A no-op for the shaped, non-overridden object that keeps its
+/// A no-op for the shaped object that keeps its
 /// attributes in the hidden class. The records are plain bits, so only
 /// `object` and the caller's pending words need rooting.
 ///
@@ -3139,6 +2869,7 @@ pub fn register_gc_traceables(heap: &mut otter_gc::GcHeap) {
     heap.set_post_mark_processor(crate::weak_refs::post_mark_processor);
     heap.register_host_release::<crate::native_function::NativeFunctionBody>();
     heap.register_sever_restored::<ExoticSlots>();
+    heap.register_sever_restored::<crate::constructor_layout::ConstructorLayoutBody>();
     heap.register_sever_restored::<crate::array::ArrayExoticSlots>();
     heap.register_sever_restored::<crate::weak_refs::WeakRefBody>();
     heap.register_sever_restored::<crate::binary::typed_array::TypedArrayBodyGc>();
@@ -3156,6 +2887,7 @@ pub fn register_gc_traceables(heap: &mut otter_gc::GcHeap) {
         crate::class_constructor::ClassConstructorBody,
         crate::closure::JsClosureBody,
         crate::closure_construct::ClosureRareBody,
+        crate::constructor_layout::ConstructorLayoutBody,
         crate::collections::MapBody,
         crate::collections::table::OrderedTableBody<crate::collections::MapEntry>,
         crate::collections::SetBody,
@@ -3194,42 +2926,29 @@ pub fn register_gc_traceables(heap: &mut otter_gc::GcHeap) {
     }
 }
 
-/// An object body about to be allocated, with the flag and capacity bytes
-/// its allocation writes into the cell header.
+/// An object body about to be allocated. State lives only in the hidden class;
+/// its immutable shape determines the trailing inline allocation size.
 struct PendingObject {
     body: ObjectBody,
-    flags: u8,
-    capacity: u8,
 }
 
 impl PendingObject {
     /// Trailing in-object slot bytes of the cell.
     fn trailing_bytes(&self) -> usize {
-        usize::from(self.capacity) * std::mem::size_of::<Value>()
+        FieldLocation::words_bytes(shape_body::inline_capacity_of(self.body.shape))
     }
 }
 
 /// An empty body with `shape` installed: a keyed or root shape, or a
 /// dictionary shape. The shape fixes the object's prototype.
-fn empty_object_body(shape: ShapeHandle, capacity: usize) -> PendingObject {
-    debug_assert!(capacity <= MAX_INLINE_CAPACITY);
+fn empty_object_body(shape: ShapeHandle) -> PendingObject {
     debug_assert_object_shape_handle(shape, "object allocation shape");
-    let opaque = matches!(
-        shape_body::prototype_of(shape),
-        shape_body::ShapePrototype::Value(_)
-    );
     PendingObject {
         body: ObjectBody {
             shape,
             slab: otter_gc::Gc::null(),
             exotic: ExoticSlot::null(),
         },
-        flags: if opaque {
-            ObjectFlags::EXTENSIBLE | ObjectFlags::CHAIN_LINK_OPAQUE
-        } else {
-            ObjectFlags::EXTENSIBLE
-        },
-        capacity: capacity as u8,
     }
 }
 
@@ -3259,13 +2978,15 @@ fn alloc_object_body_with_roots(
     external_visit: &mut RootSlotVisitor<'_>,
 ) -> Result<JsObject, otter_gc::OutOfMemory> {
     let extra = pending.trailing_bytes();
-    let PendingObject {
-        body,
-        flags,
-        capacity,
-    } = pending;
+    let PendingObject { body } = pending;
     heap.alloc_trailing_with_roots_initialized(body, extra, external_visit, |body| {
-        body.init_cell_bytes(flags, capacity);
+        body.init_cell_bytes();
+        for index in 0..body.inline_capacity() {
+            unsafe {
+                *FieldLocation::inline(index as u32).word_ptr(body.inline_values_ptr()) =
+                    Value::undefined()
+            };
+        }
     })
 }
 
@@ -3275,14 +2996,16 @@ fn alloc_object_body_old(
     pending: PendingObject,
 ) -> Result<JsObject, otter_gc::OutOfMemory> {
     let extra = pending.trailing_bytes();
-    let PendingObject {
-        body,
-        flags,
-        capacity,
-    } = pending;
+    let PendingObject { body } = pending;
     let mut no_roots = |_visitor: &mut dyn FnMut(*mut RawGc)| {};
     heap.alloc_variable_with_roots_initialized(body, extra, &mut no_roots, |body| {
-        body.init_cell_bytes(flags, capacity);
+        body.init_cell_bytes();
+        for index in 0..body.inline_capacity() {
+            unsafe {
+                *FieldLocation::inline(index as u32).word_ptr(body.inline_values_ptr()) =
+                    Value::undefined()
+            };
+        }
     })
 }
 
@@ -3294,7 +3017,7 @@ pub(crate) fn alloc_object_old_for_fixture(
     heap: &mut GcHeap,
 ) -> Result<JsObject, otter_gc::OutOfMemory> {
     let root = fixture_root_shape(heap)?;
-    alloc_object_body_old(heap, empty_object_body(root, DEFAULT_INLINE_CAPACITY))
+    alloc_object_body_old(heap, empty_object_body(root))
 }
 
 /// The heap's `null`-prototype root for raw GC fixtures, created and
@@ -3306,6 +3029,9 @@ pub(crate) fn fixture_root_shape(heap: &mut GcHeap) -> Result<ShapeHandle, otter
         let root = shape_body::alloc_root_shape_body_with_roots(
             heap,
             shape_body::ShapePrototype::Null,
+            DEFAULT_INLINE_CAPACITY,
+            ShapeHandle::null(),
+            ShapeState::ORDINARY,
             &mut no_roots,
         )?;
         shape_body::set_null_root(heap, root);
@@ -3344,7 +3070,7 @@ pub(crate) fn alloc_object_old(
     heap: &mut GcHeap,
     root: ShapeHandle,
 ) -> Result<JsObject, otter_gc::OutOfMemory> {
-    alloc_object_body_old(heap, empty_object_body(root, DEFAULT_INLINE_CAPACITY))
+    alloc_object_body_old(heap, empty_object_body(root))
 }
 
 /// Allocate a fresh empty object of `root`'s lineage — whose prototype the
@@ -3357,11 +3083,7 @@ pub(crate) fn alloc_object_with_roots(
     root: ShapeHandle,
     external_visit: &mut RootSlotVisitor<'_>,
 ) -> Result<JsObject, otter_gc::OutOfMemory> {
-    alloc_object_body_with_roots(
-        heap,
-        empty_object_body(root, DEFAULT_INLINE_CAPACITY),
-        external_visit,
-    )
+    alloc_object_body_with_roots(heap, empty_object_body(root), external_visit)
 }
 
 /// Allocate a fresh empty dictionary-mode object with a `null` prototype:
@@ -3375,19 +3097,15 @@ pub(crate) fn alloc_dictionary_object_with_roots(
     alloc_object_with_roots(heap, shape, external_visit)
 }
 
-/// Allocate a fresh empty object with the given hidden class installed and
-/// room for `capacity` in-object slots.
+/// Allocate a fresh object using exactly its hidden class's inline capacity.
+/// Counted fields are initialized before publication; overflow is suffix-only.
 pub(crate) fn alloc_object_with_shape_roots(
     heap: &mut GcHeap,
     shape: ShapeHandle,
-    capacity: usize,
     external_visit: &mut RootSlotVisitor<'_>,
 ) -> Result<JsObject, otter_gc::OutOfMemory> {
-    alloc_object_body_with_roots(
-        heap,
-        empty_object_body(shape, inline_capacity_for(capacity)),
-        external_visit,
-    )
+    let mut values = vec![Value::undefined(); shape_property_count(shape, heap) as usize];
+    alloc_object_with_shape_and_values_roots(heap, shape, &mut values, external_visit)
 }
 
 /// Allocate a fresh shaped object whose complete data-slot prefix is installed
@@ -3411,51 +3129,59 @@ pub(crate) fn alloc_object_with_shape_and_values_roots(
     );
 
     let shape_slot = std::ptr::addr_of_mut!(shape).cast::<RawGc>();
+    let all_values = values.as_mut_ptr();
+    let all_values_len = values.len();
     let mut visit_owner_roots = |visitor: &mut dyn FnMut(*mut RawGc)| {
         external_visit(visitor);
         visitor(shape_slot);
+        for index in 0..all_values_len {
+            unsafe { (*all_values.add(index)).trace_value_slot_mut(visitor) };
+        }
     };
 
-    let fits_inline = values.len() <= MAX_INLINE_CAPACITY;
-    let slab = if fits_inline {
+    let capacity = shape_body::inline_capacity_of(shape);
+    let prefix = values.len().min(capacity);
+    let slab = if values.len() <= capacity {
         slot_slab::SlotSlabHandle::null()
     } else {
-        slot_slab::alloc_slot_slab_with_values(heap, values.len(), values, &mut visit_owner_roots)?
+        slot_slab::alloc_slot_slab_with_values(
+            heap,
+            values.len() - capacity,
+            &mut values[capacity..],
+            &mut visit_owner_roots,
+        )?
     };
-
-    let capacity = if fits_inline { values.len() } else { 0 };
-    let PendingObject {
-        mut body,
-        flags,
-        capacity: capacity_byte,
-    } = empty_object_body(shape, capacity);
+    let PendingObject { mut body } = empty_object_body(shape);
     body.slab = slab;
-
-    let slab_slot = (!slab.is_null()).then(|| std::ptr::addr_of!(slab).cast_mut().cast::<RawGc>());
     let values_base = values.as_mut_ptr();
     let values_len = values.len();
     let mut visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
         external_visit(visitor);
-        if let Some(slab_slot) = slab_slot {
-            visitor(slab_slot);
-        }
+        // The pending body owns and traces the slab handle. Only the input
+        // buffer needs extra roots; do not expose an immutable local as a
+        // collector-writable root.
         for index in 0..values_len {
-            // SAFETY: `index < values_len`; the caller-owned pending buffer
-            // outlives this allocation and is rewritten in place.
             unsafe { (*values_base.add(index)).trace_value_slot_mut(visitor) };
         }
     };
-    let extra = capacity * std::mem::size_of::<Value>();
-    heap.alloc_trailing_with_roots_initialized(body, extra, &mut visit, |body| {
-        body.init_cell_bytes(flags, capacity_byte);
-        if fits_inline {
-            // SAFETY: the rooted buffer was rewritten by any collection the
-            // allocation ran; the cell holds `values_len` in-object words.
-            unsafe {
-                std::ptr::copy_nonoverlapping(values_base, body.inline_values_ptr(), values_len);
+    heap.alloc_trailing_with_roots_initialized(
+        body,
+        FieldLocation::words_bytes(capacity),
+        &mut visit,
+        |body| {
+            body.init_cell_bytes();
+            for index in 0..capacity {
+                let value = if index < prefix {
+                    unsafe { *values_base.add(index) }
+                } else {
+                    Value::undefined()
+                };
+                unsafe {
+                    *FieldLocation::inline(index as u32).word_ptr(body.inline_values_ptr()) = value
+                };
             }
-        }
-    })
+        },
+    )
 }
 
 /// Install `shape` on a fresh, slotless object together with a value for
@@ -3493,12 +3219,19 @@ pub(crate) fn install_fresh_shape_with_slots(
             "shape install requires a fresh object"
         );
         body.invalidate_prototype_proofs();
-        let base = body.values_base();
+        assert_eq!(
+            body.inline_capacity(),
+            shape_body::inline_capacity_of(shape)
+        );
         for (index, &value) in stored.iter().enumerate() {
-            // SAFETY: the reservation above made room for every index.
-            unsafe { *base.add(index) = value };
+            unsafe { *body.field_ptr(body.location_for_slot(index)) = value };
         }
         body.invalidate_prototype_proofs();
+        assert_eq!(
+            body.inline_capacity(),
+            shape_body::inline_capacity_of(shape),
+            "shape transition changed object footprint"
+        );
         body.shape = shape;
     });
     for &value in &stored {
@@ -3517,22 +3250,26 @@ pub(crate) fn reserve_fresh_object_slot_capacity(
     reserve_slot_capacity(obj, heap, capacity, &mut [])
 }
 
-/// Try to allocate a fresh shaped object with `capacity` in-object slots
-/// without running a GC safepoint.
+/// Try a fresh shape-owned inline allocation without a GC safepoint.
+/// A shape whose live fields need overflow is declined before allocation.
 pub(crate) fn try_alloc_object_with_shape_no_collect(
     heap: &mut GcHeap,
     shape: ShapeHandle,
-    capacity: usize,
 ) -> Option<JsObject> {
-    let pending = empty_object_body(shape, inline_capacity_for(capacity));
+    if shape_body::property_count_of(shape) as usize > shape_body::inline_capacity_of(shape) {
+        return None;
+    }
+    let pending = empty_object_body(shape);
     let extra = pending.trailing_bytes();
-    let PendingObject {
-        body,
-        flags,
-        capacity,
-    } = pending;
+    let PendingObject { body } = pending;
     heap.try_alloc_trailing_no_collect_or_return(body, extra, |body| {
-        body.init_cell_bytes(flags, capacity);
+        body.init_cell_bytes();
+        for index in 0..body.inline_capacity() {
+            unsafe {
+                *FieldLocation::inline(index as u32).word_ptr(body.inline_values_ptr()) =
+                    Value::undefined()
+            };
+        }
     })
     .ok()
 }
@@ -3556,29 +3293,35 @@ pub(crate) fn alloc_diagnostic_object(
     heap: &mut GcHeap,
     root: ShapeHandle,
 ) -> Result<JsObject, otter_gc::OutOfMemory> {
-    let PendingObject {
-        body,
-        flags,
-        capacity,
-    } = empty_object_body(root, DEFAULT_INLINE_CAPACITY);
-    let extra = usize::from(capacity) * std::mem::size_of::<Value>();
+    let PendingObject { body } = empty_object_body(root);
+    let extra = FieldLocation::words_bytes(shape_body::inline_capacity_of(root));
     let object = heap.alloc_old_diagnostic_trailing(body, extra)?;
     // No safepoint separates the allocation from this write.
-    heap.with_payload(object, |body| body.init_cell_bytes(flags, capacity));
+    heap.with_payload(object, |body| {
+        body.init_cell_bytes();
+        for index in 0..body.inline_capacity() {
+            unsafe {
+                *FieldLocation::inline(index as u32).word_ptr(body.inline_values_ptr()) =
+                    Value::undefined()
+            };
+        }
+    });
     Ok(object)
 }
 
 /// A host object body over `sidecar`: opaque as a prototype-chain link,
 /// since its host data can supply properties outside its slots.
 fn host_object_body(shape: ShapeHandle, sidecar: ExoticSlot) -> PendingObject {
+    assert!(
+        shape_body::state_of(shape).is_opaque(),
+        "host shape prepared before allocation"
+    );
     PendingObject {
         body: ObjectBody {
             shape,
             slab: otter_gc::Gc::null(),
             exotic: sidecar,
         },
-        flags: ObjectFlags::EXTENSIBLE | ObjectFlags::CHAIN_LINK_OPAQUE,
-        capacity: DEFAULT_INLINE_CAPACITY as u8,
     }
 }
 
@@ -3595,6 +3338,14 @@ pub(crate) fn alloc_host_object_with_roots<T: HostObjectData>(
     data: T,
     external_visit: &mut RootSlotVisitor<'_>,
 ) -> Result<JsObject, otter_gc::OutOfMemory> {
+    let shape = shape_body::dictionary_of(fixture_root_shape(heap)?);
+    // SAFETY: this scope ends before the heap and no Local escapes.
+    let scope = unsafe { otter_gc::HandleScope::from_ptr(heap.handle_stack_ptr()) };
+    let source = scope.local(shape);
+    let host_state = shape_body::state_of(source.get()).with_lookup(LookupFact::HostLookup, true);
+    let shape =
+        state_transition::prepare_state_shape(heap, source.get(), host_state, external_visit)?;
+    let shape = scope.local(shape);
     let mut sidecar: ExoticHandle =
         heap.alloc_variable_with_roots(ExoticSlots::default(), 0, external_visit)?;
     let sidecar_slot = std::ptr::addr_of_mut!(sidecar);
@@ -3604,9 +3355,8 @@ pub(crate) fn alloc_host_object_with_roots<T: HostObjectData>(
     };
     let mut slot = ExoticSlot::null();
     slot.set(sidecar);
-    let dictionary = shape_body::dictionary_of(fixture_root_shape(heap)?);
     let object =
-        alloc_object_body_with_roots(heap, host_object_body(dictionary, slot), &mut visit)?;
+        alloc_object_body_with_roots(heap, host_object_body(shape.get(), slot), &mut visit)?;
     heap.with_payload(sidecar, |exotic| {
         exotic.host_data = Some(HostData::Untraced(Box::new(data)));
         exotic.dictionary_layout = 1;
@@ -3624,6 +3374,13 @@ pub(crate) fn alloc_host_object_with_shape_roots<T: HostObjectData>(
     data: T,
     external_visit: &mut RootSlotVisitor<'_>,
 ) -> Result<JsObject, otter_gc::OutOfMemory> {
+    // SAFETY: the heap's arena outlives preparation and no Local escapes.
+    let scope = unsafe { otter_gc::HandleScope::from_ptr(heap.handle_stack_ptr()) };
+    let source = scope.local(shape);
+    let host_state = shape_body::state_of(source.get()).with_lookup(LookupFact::HostLookup, true);
+    let shape =
+        state_transition::prepare_state_shape(heap, source.get(), host_state, external_visit)?;
+    let shape = scope.local(shape);
     // The sidecar is allocated before the object exists, so installing
     // the host payload needs no second allocation point inside a borrow.
     let mut sidecar: ExoticHandle =
@@ -3635,7 +3392,8 @@ pub(crate) fn alloc_host_object_with_shape_roots<T: HostObjectData>(
     };
     let mut slot = ExoticSlot::null();
     slot.set(sidecar);
-    let object = alloc_object_body_with_roots(heap, host_object_body(shape, slot), &mut visit)?;
+    let object =
+        alloc_object_body_with_roots(heap, host_object_body(shape.get(), slot), &mut visit)?;
     heap.with_payload(sidecar, |exotic| {
         exotic.host_data = Some(HostData::Untraced(Box::new(data)));
         true
@@ -3652,18 +3410,30 @@ pub(crate) fn alloc_traced_host_object_with_shape_roots<T: TracedHostObjectData>
     mut data: T,
     external_visit: &mut RootSlotVisitor<'_>,
 ) -> Result<JsObject, otter_gc::OutOfMemory> {
+    // SAFETY: the heap's arena outlives preparation and no Local escapes.
+    let scope = unsafe { otter_gc::HandleScope::from_ptr(heap.handle_stack_ptr()) };
+    let source = scope.local(shape);
+    let mut pending_roots = |visitor: &mut dyn FnMut(*mut RawGc)| {
+        external_visit(visitor);
+        data.trace_gc_slots(&mut HostDataTracer { visitor });
+    };
+    let host_state = shape_body::state_of(source.get()).with_lookup(LookupFact::HostLookup, true);
+    let shape =
+        state_transition::prepare_state_shape(heap, source.get(), host_state, &mut pending_roots)?;
+    let shape = scope.local(shape);
     // The sidecar is allocated before the object exists, so installing
     // the host payload needs no second allocation point inside a borrow.
     let mut sidecar: ExoticHandle =
-        heap.alloc_variable_with_roots(ExoticSlots::default(), 0, external_visit)?;
+        heap.alloc_variable_with_roots(ExoticSlots::default(), 0, &mut pending_roots)?;
     let sidecar_slot = std::ptr::addr_of_mut!(sidecar);
     let mut visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
-        external_visit(visitor);
+        pending_roots(visitor);
         visitor(sidecar_slot.cast::<RawGc>());
     };
     let mut slot = ExoticSlot::null();
     slot.set(sidecar);
-    let object = alloc_object_body_with_roots(heap, host_object_body(shape, slot), &mut visit)?;
+    let object =
+        alloc_object_body_with_roots(heap, host_object_body(shape.get(), slot), &mut visit)?;
     // The sidecar is an old-space body from birth, so the host slots just
     // installed never crossed the mutator write barrier. Record each
     // child edge now, or an old(sidecar)→young(child) reference is
@@ -3699,13 +3469,17 @@ pub(crate) fn alloc_traced_host_object_with_shape_roots<T: TracedHostObjectData>
 /// emit the spec `"Arguments"` builtin tag per §20.1.3.6 step 14.b.
 /// Called from `arguments_object::initialize_{mapped,unmapped}` after
 /// the body's slot table is set up.
-pub fn mark_as_arguments_object(obj: &mut JsObject, heap: &mut otter_gc::GcHeap) {
+pub fn mark_as_arguments_object(
+    obj: &mut JsObject,
+    heap: &mut otter_gc::GcHeap,
+) -> Result<(), otter_gc::OutOfMemory> {
     // The sidecar allocation may move the object; the caller's handle
     // is updated in place.
-    ensure_exotic(obj, heap).expect("exotic sidecar");
+    ensure_exotic(obj, heap)?;
     heap.with_payload(*obj, |body| {
         body.exotic_mut().is_arguments_object = true;
     });
+    Ok(())
 }
 
 /// `true` when the object was tagged as an arguments-exotic body by
@@ -3742,44 +3516,37 @@ pub(crate) fn arguments_direct_snapshot(
 /// `mapped.context` must be rooted across every allocation that preceded
 /// this call (the arguments object and its shape).
 pub(crate) fn install_mapped_arguments(
-    obj: JsObject,
-    heap: &mut otter_gc::GcHeap,
+    obj: &mut JsObject,
+    heap: &mut GcHeap,
     mapped: MappedArguments,
-) {
+) -> Result<(), otter_gc::OutOfMemory> {
+    use crate::rooting::RootScopeExt;
     let MappedArguments {
         mut context,
         entries,
     } = mapped;
-    // The sidecar allocates, so it is reserved here, outside the payload
-    // borrow below. This may move `obj` and the young context, so both ride
-    // through the allocation as roots.
-    let mut obj = obj;
-    {
-        let mut scope = otter_gc::RootScope::new(heap);
-        // SAFETY: `context` is a local declared before the scope and outlives it.
-        unsafe {
-            scope
-                .add_raw_slot((&mut context as *mut crate::context::ContextHandle).cast::<RawGc>());
-        }
-        ensure_exotic(&mut obj, heap).expect("exotic sidecar");
-    }
     if entries.is_empty() {
-        return;
+        return Ok(());
     }
-    heap.with_payload(obj, |body| {
-        body.set_chain_link_opaque(true);
+    let mut roots = otter_gc::RootScope::new(heap);
+    // SAFETY: both live slots precede the scope and stay stationary until the
+    // sidecar owns the map. Cap-triggered collection can rewrite both in place.
+    unsafe {
+        roots.add_object(obj);
+        roots.add_raw_slot(std::ptr::addr_of_mut!(context).cast::<RawGc>());
+    }
+    ensure_exotic(obj, heap)?;
+    let target = state(*obj, heap).with_lookup(LookupFact::MappedArguments, true);
+    state_transition::transition_state(obj, heap, target)?;
+    heap.with_payload(*obj, |body| {
         body.exotic_mut().host_data = Some(HostData::Untraced(Box::new(MappedArgumentsData {
             context,
             entries: entries.into_boxed_slice(),
         })));
     });
-    // The context is held by the sidecar, which is its own body, so the edge
-    // a scavenge has to re-trace starts there and not at the object:
-    // re-tracing the object finds one edge to the sidecar and stops before it
-    // ever reaches the context. Recording the object instead leaves a young
-    // context unevacuated and the sidecar holding its pre-move offset.
-    let sidecar = heap.read_payload(obj, |body| body.exotic.get());
+    let sidecar = heap.read_payload(*obj, |body| body.exotic.get());
     heap.record_write(sidecar, &context);
+    Ok(())
 }
 
 fn mapped_argument_cell(body: &ObjectBody, key: &str) -> Option<MappedCell> {
@@ -3866,6 +3633,12 @@ fn apply_mapped_arguments_partial_define(
         }
         heap.with_payload(obj, |body| remove_mapped_argument(body, key));
     }
+}
+
+/// Immutable semantic state of an object's exact hidden class.
+#[must_use]
+pub fn state(obj: JsObject, heap: &GcHeap) -> ShapeState {
+    heap.read_payload(obj, ObjectBody::state)
 }
 
 // ---------- read accessors -----------------------------------------------
@@ -4227,22 +4000,16 @@ pub(crate) fn load_own_data_slot_atom(
             body_key_matches(heap, body, offset, key.name()),
             "shape-id hit resolved to a slot whose key differs from the request"
         );
-        // Use the same ordinary-state proof as generated named loads. Symbol
+        // Use the same immutable ordinary-state proof as generated named loads. Symbol
         // and native-call sidecars preserve shape-derived slot semantics;
-        // opaque host/mapped/String state and overridden descriptors do not.
+        // opaque host/mapped/String state does not.
         // A matching fast shape fixes the slot kind and bounds, so neither
         // per-slot attributes nor the property count need consulting.
         //
         // Accessor-ness is part of the shape, and `hit.is_data` was recorded
-        // against this very shape handle, so a matched shape with unoverridden
-        // attributes cannot have turned the slot into an accessor. Asserting
+        // against this very shape handle, so a matched shape cannot have turned the slot into an accessor. Asserting
         // that keeps the release hit off the shape body entirely.
-        if shaped
-            && hit.is_data
-            && matches!(body.shape_cache_mode(), ShapeCacheMode::Fast)
-            && !body.chain_link_opaque()
-            && !body.slot_attrs_overridden()
-        {
+        if shaped && hit.is_data && !body.chain_link_opaque() {
             debug_assert!(
                 !body.slot_attrs(heap, offset).1,
                 "shape-matched data hit resolved to an accessor slot"
@@ -4279,7 +4046,7 @@ fn shaped_hit_matches(shape: ShapeHandle, hit: &AtomOwnPropertyHit) -> bool {
 /// monomorphic method-call IC, whose cached `hit` was recorded against this same
 /// shape: the hot path is a single offset compare plus a slab read, with no atom
 /// resolution and no stub walk. It shares the generated ordinary-state proof:
-/// fast shape mode, no opaque lookup and no overridden slot attributes. Benign
+/// ordinary immutable lookup state. Benign
 /// symbol/native sidecars remain eligible; a miss uses full method resolution.
 pub(crate) fn load_own_data_slot_by_shape(
     obj: JsObject,
@@ -4290,9 +4057,7 @@ pub(crate) fn load_own_data_slot_by_shape(
         if body.is_dictionary()
             || !shaped_hit_matches(body.shape, &hit)
             || !hit.is_data
-            || !matches!(body.shape_cache_mode(), ShapeCacheMode::Fast)
             || body.chain_link_opaque()
-            || body.slot_attrs_overridden()
         {
             return None;
         }
@@ -4335,8 +4100,8 @@ pub(crate) fn store_own_data_slot_atom(
         // Store hits are installed only for a writable data slot, and a
         // matching fast shape fixes every slot's attributes, so neither the
         // chain walk for this slot's attributes nor the bounds need
-        // consulting. Dictionary storage and overridden descriptors still do.
-        if !body.is_dictionary() && !body.slot_attrs_overridden() {
+        // consulting. Dictionary storage still does.
+        if !body.is_dictionary() {
             return true;
         }
         let key_matches = !body.is_dictionary() || body_key_matches(heap, body, offset, key.name());
@@ -4622,13 +4387,18 @@ pub fn constructor_native(obj: JsObject, heap: &otter_gc::GcHeap) -> Option<Valu
 }
 
 /// Store the `[[BooleanData]]` internal slot for a Boolean wrapper.
-pub fn set_boolean_data(obj: &mut JsObject, heap: &mut otter_gc::GcHeap, value: bool) {
+pub fn set_boolean_data(
+    obj: &mut JsObject,
+    heap: &mut otter_gc::GcHeap,
+    value: bool,
+) -> Result<(), otter_gc::OutOfMemory> {
     // The sidecar allocation may move the object; the caller's handle
     // is updated in place.
-    ensure_exotic(obj, heap).expect("exotic sidecar");
+    ensure_exotic(obj, heap)?;
     heap.with_payload(*obj, |body| {
         body.exotic_mut().boolean_data = Some(value);
     });
+    Ok(())
 }
 
 /// Read the `[[BooleanData]]` internal slot for a Boolean wrapper.
@@ -4638,13 +4408,18 @@ pub fn boolean_data(obj: JsObject, heap: &otter_gc::GcHeap) -> Option<bool> {
 }
 
 /// Store the `[[NumberData]]` internal slot for a Number wrapper.
-pub fn set_number_data(obj: &mut JsObject, heap: &mut otter_gc::GcHeap, value: NumberValue) {
+pub fn set_number_data(
+    obj: &mut JsObject,
+    heap: &mut otter_gc::GcHeap,
+    value: NumberValue,
+) -> Result<(), otter_gc::OutOfMemory> {
     // The sidecar allocation may move the object; the caller's handle
     // is updated in place.
-    ensure_exotic(obj, heap).expect("exotic sidecar");
+    ensure_exotic(obj, heap)?;
     heap.with_payload(*obj, |body| {
         body.exotic_mut().number_data = Some(value);
     });
+    Ok(())
 }
 
 /// Read the `[[NumberData]]` internal slot for a Number wrapper.
@@ -4654,22 +4429,29 @@ pub fn number_data(obj: JsObject, heap: &otter_gc::GcHeap) -> Option<NumberValue
 }
 
 /// Store the `[[StringData]]` internal slot for a String wrapper.
-pub fn set_string_data(obj: &mut JsObject, heap: &mut otter_gc::GcHeap, value: JsString) {
-    // The sidecar allocation may move both the object and the string;
-    // the caller's handle is updated in place and the string rides the
-    // pending-root list.
-    let mut pending = [Value::string(value)];
-    ensure_exotic_with_pending_values(obj, heap, &mut pending).expect("exotic sidecar");
-    let value = pending[0]
+pub fn set_string_data(
+    obj: &mut JsObject,
+    heap: &mut GcHeap,
+    value: JsString,
+) -> Result<(), otter_gc::OutOfMemory> {
+    use crate::rooting::RootScopeExt;
+    let mut pending = Value::string(value);
+    let mut roots = otter_gc::RootScope::new(heap);
+    // SAFETY: both stationary slots precede the scope. Shape preparation and
+    // sidecar allocation may collect, rewriting the actual caller receiver.
+    unsafe {
+        roots.add_object(obj);
+        roots.add_value(&mut pending);
+    }
+    ensure_exotic(obj, heap)?;
+    let target = state(*obj, heap).with_lookup(LookupFact::StringWrapper, true);
+    state_transition::transition_state(obj, heap, target)?;
+    let value = pending
         .as_string(heap)
-        .expect("pending string survives rooting");
-    heap.with_payload(*obj, |body| {
-        body.exotic_mut().string_data = Some(value);
-        body.set_chain_link_opaque(true);
-    });
-    // The slot lives in the old-space sidecar: remember the sidecar, not
-    // just the object, or a scavenge strands a young string.
+        .expect("rooted pending String value");
+    heap.with_payload(*obj, |body| body.exotic_mut().string_data = Some(value));
     record_exotic_write(heap, *obj, &value);
+    Ok(())
 }
 
 /// Read the `[[StringData]]` internal slot for a String wrapper.
@@ -4683,12 +4465,12 @@ pub fn set_symbol_data(
     obj: &mut JsObject,
     heap: &mut otter_gc::GcHeap,
     value: crate::symbol::JsSymbol,
-) {
+) -> Result<(), otter_gc::OutOfMemory> {
     // The sidecar allocation may move both the object and the symbol;
     // the caller's handle is updated in place and the symbol rides the
     // pending-root list.
     let mut pending = [Value::symbol(value)];
-    ensure_exotic_with_pending_values(obj, heap, &mut pending).expect("exotic sidecar");
+    ensure_exotic_with_pending_values(obj, heap, &mut pending)?;
     let value = pending[0]
         .as_symbol(heap)
         .expect("pending symbol survives rooting");
@@ -4697,6 +4479,7 @@ pub fn set_symbol_data(
     });
     // The slot lives in the old-space sidecar.
     record_exotic_write(heap, *obj, &value);
+    Ok(())
 }
 
 /// Read the `[[SymbolData]]` internal slot for a Symbol wrapper.
@@ -4706,12 +4489,16 @@ pub fn symbol_data(obj: JsObject, heap: &otter_gc::GcHeap) -> Option<crate::symb
 }
 
 /// Store the `[[BigIntData]]` internal slot for a BigInt wrapper.
-pub fn set_bigint_data(obj: &mut JsObject, heap: &mut otter_gc::GcHeap, value: BigIntValue) {
+pub fn set_bigint_data(
+    obj: &mut JsObject,
+    heap: &mut otter_gc::GcHeap,
+    value: BigIntValue,
+) -> Result<(), otter_gc::OutOfMemory> {
     // The sidecar allocation may move both the object and the bigint;
     // the caller's handle is updated in place and the bigint rides the
     // pending-root list.
     let mut pending = [Value::big_int(value)];
-    ensure_exotic_with_pending_values(obj, heap, &mut pending).expect("exotic sidecar");
+    ensure_exotic_with_pending_values(obj, heap, &mut pending)?;
     let value = pending[0]
         .as_big_int()
         .expect("pending bigint survives rooting");
@@ -4720,6 +4507,7 @@ pub fn set_bigint_data(obj: &mut JsObject, heap: &mut otter_gc::GcHeap, value: B
     });
     // The slot lives in the old-space sidecar.
     record_exotic_write(heap, *obj, &Value::big_int(value));
+    Ok(())
 }
 
 /// Read the `[[BigIntData]]` internal slot for a BigInt wrapper.
@@ -4766,13 +4554,17 @@ pub fn date_data(obj: JsObject, heap: &otter_gc::GcHeap) -> Option<f64> {
 
 /// Mark an object as carrying the `[[ErrorData]]` internal slot
 /// (§20.5) — set when an error constructor produces the instance.
-pub fn set_error_data(obj: &mut JsObject, heap: &mut otter_gc::GcHeap) {
+pub fn set_error_data(
+    obj: &mut JsObject,
+    heap: &mut otter_gc::GcHeap,
+) -> Result<(), otter_gc::OutOfMemory> {
     // The sidecar allocation may move the object; the caller's handle
     // is updated in place.
-    ensure_exotic(obj, heap).expect("exotic sidecar");
+    ensure_exotic(obj, heap)?;
     heap.with_payload(*obj, |body| {
         body.exotic_mut().error_data = true;
     });
+    Ok(())
 }
 
 /// `true` when the object has the `[[ErrorData]]` internal slot. Unlike
@@ -4787,86 +4579,164 @@ pub fn has_error_data(obj: JsObject, heap: &otter_gc::GcHeap) -> bool {
 /// (top-of-stack first). Replaces any previously captured frames, as
 /// `Error.captureStackTrace` may re-capture onto an existing target.
 pub fn set_error_stack_frames(
-    obj: JsObject,
+    obj: &mut JsObject,
     heap: &mut otter_gc::GcHeap,
     frames: Vec<crate::run_control::StackFrameSnapshot>,
-) {
-    // The sidecar and the frame body allocate, so both happen here,
-    // outside the payload borrow below. This may move `obj`, which is
-    // why the local is `mut`. The frames are plain owned data — no
-    // rooting needed beyond the receiver.
-    let mut obj = obj;
-    ensure_exotic(&mut obj, heap).expect("exotic sidecar");
-    let bytes: usize = frames
-        .iter()
-        .map(|f| f.function_name.len() + f.module.len())
-        .sum();
-    let object_slot = std::ptr::addr_of_mut!(obj);
+) -> Result<(), otter_gc::OutOfMemory> {
+    // Exact UTF-8 line bytes are part of the managed variable allocation,
+    // admitted by the heap before publication. Owned snapshots share the
+    // original source lease; the managed body has no source or code handle.
+    let bytes = frames.iter().fold(0u64, |bytes, frame| {
+        bytes
+            .saturating_add(frame.function_name.len() as u64)
+            .saturating_add(frame.module.len() as u64)
+            .saturating_add(
+                frame
+                    .source_position
+                    .as_ref()
+                    .map_or(0, |position| position.source_line.len() as u64),
+            )
+    });
+    let records =
+        (frames.len() as u64).saturating_mul(std::mem::size_of::<ErrorFrameRecord>() as u64);
+    let unaligned = bytes
+        .saturating_add(records)
+        .saturating_add(std::mem::size_of::<ErrorStackBody>() as u64)
+        .saturating_add(std::mem::size_of::<otter_gc::GcHeader>() as u64);
+    let alignment = otter_gc::OBJECT_ALIGNMENT as u64;
+    let requested = unaligned.saturating_add(alignment - 1) & !(alignment - 1);
+    let max_bytes = u64::from(u32::MAX) & !(alignment - 1);
+    if requested > max_bytes {
+        return Err(otter_gc::OutOfMemory::AllocationTooLarge {
+            requested_bytes: requested,
+            max_bytes,
+        });
+    }
+    let bytes = bytes as usize;
+    ensure_exotic(obj, heap)?;
+    let object_slot = std::ptr::from_mut(obj);
     let mut visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
         visitor(object_slot.cast::<RawGc>());
     };
-    let Ok(stack) = heap.alloc_variable_with_roots::<ErrorStackBody>(
+    let stack = heap.alloc_variable_with_roots::<ErrorStackBody>(
         ErrorStackBody {
-            frame_count: frames.len() as u32,
-            byte_len: bytes as u32,
+            frame_count: frames.len(),
+            byte_len: bytes,
         },
         ErrorStackBody::trailing_bytes(frames.len(), bytes),
         &mut visit,
-    ) else {
-        // Out of memory capturing a stack leaves the error without one;
-        // the throw itself still proceeds.
-        return;
-    };
-    // SAFETY: the handle names the body just allocated; capacity covers
-    // every record and byte written below.
+    )?;
+    // SAFETY: exact record and UTF-8 extents were admitted before allocation;
+    // initialization performs no JS allocation or collection.
     unsafe {
         let body = error_stack_body_of(stack).expect("fresh stack body");
-        let mut offset: u32 = 0;
+        let mut offset = 0;
         for (i, frame) in frames.iter().enumerate() {
             let name_offset = offset;
             std::ptr::copy_nonoverlapping(
                 frame.function_name.as_ptr(),
-                (*body).bytes_ptr().add(offset as usize),
+                (*body).bytes_ptr().add(offset),
                 frame.function_name.len(),
             );
-            offset += frame.function_name.len() as u32;
+            offset += frame.function_name.len();
             let module_offset = offset;
             std::ptr::copy_nonoverlapping(
                 frame.module.as_ptr(),
-                (*body).bytes_ptr().add(offset as usize),
+                (*body).bytes_ptr().add(offset),
                 frame.module.len(),
             );
-            offset += frame.module.len() as u32;
+            offset += frame.module.len();
+            let source_offset = offset;
+            let source_len = frame
+                .source_position
+                .as_ref()
+                .map_or(0, |position| position.source_line.len());
+            if let Some(position) = &frame.source_position {
+                std::ptr::copy_nonoverlapping(
+                    position.source_line.as_ptr(),
+                    (*body).bytes_ptr().add(offset),
+                    source_len,
+                );
+                offset += source_len;
+            }
             (*body).records_ptr().add(i).write(ErrorFrameRecord {
                 function_id: frame.function_id,
                 name_offset,
-                name_len: frame.function_name.len() as u32,
+                name_len: frame.function_name.len(),
                 module_offset,
-                module_len: frame.module.len() as u32,
+                module_len: frame.module.len(),
                 span_lo: frame.span.0,
                 span_hi: frame.span.1,
+                has_source: frame.source_position.is_some(),
+                line_number: frame
+                    .source_position
+                    .as_ref()
+                    .map_or(0, |position| position.line_number),
+                start_column: frame
+                    .source_position
+                    .as_ref()
+                    .map_or(0, |position| position.start_column),
+                source_offset,
+                source_len,
             });
         }
+        debug_assert_eq!(offset, bytes);
     }
-    let owner = obj;
-    heap.with_payload(owner, |body| {
-        body.exotic_mut().error_stack_frames = stack;
-    });
-    let sidecar = heap.read_payload(owner, |body| body.exotic.get());
+    heap.with_payload(*obj, |body| body.exotic_mut().error_stack_frames = stack);
+    let sidecar = heap.read_payload(*obj, |body| body.exotic.get());
     heap.record_write(sidecar, &stack);
+    Ok(())
 }
 
-/// Read a clone of the captured stack frames, if any were recorded.
-#[must_use]
+/// Read owned captured frames. Source-line copies are admitted before return;
+/// a resource failure leaves the immutable managed snapshot unchanged.
 pub fn error_stack_frames(
     obj: JsObject,
     heap: &otter_gc::GcHeap,
-) -> Option<Vec<crate::run_control::StackFrameSnapshot>> {
+    account: &otter_resource::ResourceAccount,
+) -> Result<Option<Vec<crate::run_control::StackFrameSnapshot>>, otter_resource::SharedSourceError>
+{
     heap.read_payload(obj, |body| {
         body.exotic()
             .and_then(|e| error_stack_body_of(e.error_stack_frames))
-            // SAFETY: a non-null handle names a live body.
-            .map(|stack| unsafe { (*stack).to_frames() })
+            // SAFETY: a non-null handle names a live immutable body. Source
+            // admission allocates only Rust-owned data, never a GC heap cell.
+            .map(|stack| unsafe { (*stack).to_frames(account) })
+            .transpose()
+    })
+}
+
+/// Visit the one managed captured stack without retaining copied source lines.
+/// The immutable arena stays borrowed for the callback; callers cannot collect
+/// through the shared heap reference. This is the diagnostic formatting path,
+/// not an unaccounted reconstruction of the owned source-position API.
+pub(crate) fn visit_error_stack_frames(
+    obj: JsObject,
+    heap: &otter_gc::GcHeap,
+    mut visitor: impl FnMut(&str, &str, Option<(u32, u32)>),
+) -> bool {
+    heap.read_payload(obj, |body| {
+        let Some(stack) = body
+            .exotic()
+            .and_then(|e| error_stack_body_of(e.error_stack_frames))
+        else {
+            return false;
+        };
+        // SAFETY: the sidecar owns this live immutable managed body. No mutable
+        // heap access or GC allocation occurs while the borrowed arena is read.
+        let stack = unsafe { &*stack };
+        for index in 0..stack.frame_count {
+            // SAFETY: fully initialized records lie inside the published extent.
+            let record = unsafe { *stack.records_ptr().add(index) };
+            visitor(
+                stack.str_at(record.name_offset, record.name_len),
+                stack.str_at(record.module_offset, record.module_len),
+                record
+                    .has_source
+                    .then_some((record.line_number, record.start_column)),
+            );
+        }
+        stack.frame_count != 0
     })
 }
 
@@ -4878,13 +4748,22 @@ pub fn has_error_stack_frames(obj: JsObject, heap: &otter_gc::GcHeap) -> bool {
 
 /// Tag an object as carrying the `[[IsRawJSON]]` internal slot
 /// (§25.5.3 `JSON.rawJSON`).
-pub fn set_is_raw_json(obj: &mut JsObject, heap: &mut otter_gc::GcHeap, value: bool) {
+///
+/// # Errors
+///
+/// Preserves the actual sidecar allocation refusal before slot publication.
+pub fn set_is_raw_json(
+    obj: &mut JsObject,
+    heap: &mut otter_gc::GcHeap,
+    value: bool,
+) -> Result<(), otter_gc::OutOfMemory> {
     // The sidecar allocation may move the object; the caller's handle
-    // is updated in place.
-    ensure_exotic(obj, heap).expect("exotic sidecar");
+    // is updated in place before the nonallocating slot publication.
+    ensure_exotic(obj, heap)?;
     heap.with_payload(*obj, |body| {
         body.exotic_mut().is_raw_json = value;
     });
+    Ok(())
 }
 
 /// `true` when `obj` carries the `[[IsRawJSON]]` internal slot.
@@ -5199,238 +5078,37 @@ fn record_slot_write(heap: &mut otter_gc::GcHeap, obj: JsObject, slot: Value) {
     heap.record_write(obj, &slot);
 }
 
-/// Records the GC store when `value` carries a `Gc<…>` handle so the
-/// marker / scavenger see the new edge.
-/// Store `value` under string key `key` on `obj`, taking `obj` to dictionary
-/// mode if the key is new.
+/// The data-write half of ordinary `[[Set]]` after resolver selection.
 ///
-/// `obj` is a `&mut` handle because sidecar or slab allocation can trigger a
-/// moving GC that relocates a young receiver. The relocation is reflected back
-/// into the caller's handle so a sequence of `set` calls on a freshly allocated
-/// object never writes through a stale handle.
-pub fn set(obj: &mut JsObject, heap: &mut otter_gc::GcHeap, key: &str, value: Value) {
-    set_inner(obj, heap, key, None, value);
-}
-
-/// [`set`] with an isolate atom for shaped-object presence lookup.
-///
-/// Dictionary append and storage retain the spelling because dictionary keys
-/// are owned strings. Existing shaped slots, however, resolve through the
-/// shape's atom chain and never compare property text.
-pub(crate) fn set_atomized(
-    obj: &mut JsObject,
-    heap: &mut otter_gc::GcHeap,
-    key: AtomizedPropertyKey<'_>,
-    value: Value,
-) {
-    set_inner(obj, heap, key.name(), Some(key), value);
-}
-
-fn set_inner(
-    obj: &mut JsObject,
-    heap: &mut otter_gc::GcHeap,
-    key: &str,
-    atomized: Option<AtomizedPropertyKey<'_>>,
-    value: Value,
-) {
-    let mut stored = value;
-    let existing_offset = heap.read_payload(*obj, |body| match atomized {
-        Some(atomized) => body_offset_of_atom(heap, body, atomized),
-        None => body_offset_of(heap, body, key),
-    });
-    if existing_offset.is_none() {
-        // A fresh key demotes this object to dictionary mode, and the
-        // key list and slot metadata demotion writes live in the
-        // sidecar. Reserved here, outside every payload borrow, because
-        // creating it allocates — and only for the append that will
-        // actually write it: an in-place update never touches the
-        // sidecar, and reserving on every store gave most of the
-        // bootstrap graph a sidecar it never used.
-        ensure_exotic_with_pending_values(obj, heap, std::slice::from_mut(&mut stored))
-            .expect("exotic sidecar");
-    }
-    if let Some(offset) = existing_offset {
-        let i = offset as usize;
-        // Overwriting an accessor slot with a data value diverges this slot
-        // from its hidden class (which still records the accessor) without a
-        // shape transition, so per-slot metadata must be materialized and the
-        // shape can no longer be trusted for attribute reads.
-        let is_accessor = heap.read_payload(*obj, |body| body.slot_attrs(heap, i).1);
-        if is_accessor {
-            materialize_slots(*obj, heap);
-        }
-        heap.with_payload(*obj, |body| {
-            if is_accessor {
-                body.slots_mut().entries_mut()[i].is_accessor = false;
-            }
-            body.set_data_value(i, stored);
-        });
-        record_slot_write(heap, *obj, stored);
-        return;
-    }
-    let dictionary_keys = dictionary_keys_for_shape_transition(heap, *obj, existing_offset);
-    let slot_metas = slot_metas_for_shape_transition(heap, *obj, existing_offset);
-    let index = heap.read_payload(*obj, |body| body_property_count(heap, body));
-    if reserve_slot_capacity(obj, heap, index + 1, std::slice::from_mut(&mut stored)).is_err() {
-        return;
-    }
-    let Ok(slot_meta_table) = slot_meta_table_for_install(
-        obj,
-        heap,
-        &slot_metas,
-        index + 1,
-        std::slice::from_mut(&mut stored),
-    ) else {
-        return;
-    };
-    let Ok(dict_table) = dict_keys_table_for_install(
-        obj,
-        heap,
-        &dictionary_keys,
-        key,
-        std::slice::from_mut(&mut stored),
-    ) else {
-        return;
-    };
-    heap.with_payload(*obj, |body| {
-        body.enter_dictionary_mode(true);
-        if let Some(table) = dict_table {
-            body.exotic_mut().dictionary_keys = table;
-        }
-        if let Some(table) = slot_meta_table {
-            body.exotic_mut().slots = table;
-        }
-        dict_push_key(body, key.to_owned());
-        body.push_slot(index, SlotMeta::data_default(), stored);
-    });
-    let sidecar = heap.read_payload(*obj, |body| body.exotic.get());
-    if let Some(table) = slot_meta_table {
-        heap.record_write(sidecar, &table);
-    }
-    if let Some(table) = dict_table {
-        heap.record_write(sidecar, &table);
-    }
-    record_slot_write(heap, *obj, stored);
-}
-
-/// Construction-time data store for callers that already allocated the next
-/// GC-managed hidden class. `append_index` is the slot the new property
-/// occupies — the object's property count before the append, which the caller
-/// already knows from the shape it transitioned from — so the hot append path
-/// performs no extra shape read.
-pub(crate) fn set_with_shape(
-    obj: JsObject,
-    heap: &mut otter_gc::GcHeap,
-    key: &str,
-    value: Value,
-    next_shape: ShapeHandle,
-    append_index: usize,
-) {
-    let mut obj = obj;
-    let stored = value;
-    let existing_offset = heap.read_payload(obj, |body| body_offset_of(heap, body, key));
-    if let Some(offset) = existing_offset {
-        let i = offset as usize;
-        // Overwriting an accessor slot with a data value diverges this slot
-        // from its hidden class (which still records the accessor) without a
-        // shape transition, so per-slot metadata must be materialized and the
-        // shape can no longer be trusted for attribute reads.
-        let is_accessor = heap.read_payload(obj, |body| body.slot_attrs(heap, i).1);
-        if is_accessor {
-            materialize_slots(obj, heap);
-        }
-        heap.with_payload(obj, |body| {
-            if is_accessor {
-                body.slots_mut().entries_mut()[i].is_accessor = false;
-            }
-            body.set_data_value(i, stored);
-        });
-        record_slot_write(heap, obj, stored);
-        return;
-    }
-    let index = append_index;
-    debug_assert_eq!(
-        index,
-        shape_body::shape_property_count(heap, next_shape) as usize - 1
-    );
-    let mut stored = stored;
-    if reserve_slot_capacity(&mut obj, heap, index + 1, std::slice::from_mut(&mut stored)).is_err()
-    {
-        return;
-    }
-    heap.with_payload(obj, |body| {
-        debug_assert_object_shape_handle(next_shape, "shape-slot store");
-        body.invalidate_prototype_proofs();
-        body.shape = next_shape;
-        body.push_slot(index, SlotMeta::data_default(), stored);
-    });
-    record_slot_write(heap, obj, stored);
-    heap.record_write(obj, &next_shape);
-    #[cfg(debug_assertions)]
-    debug_assert_appended_shape_slot(obj, heap);
-}
-
-/// Apply the data-write half of ordinary `[[Set]]` after
-/// [`resolve_set`] has selected [`SetOutcome::AssignData`].
-///
-/// Existing own data properties keep their current attributes and
-/// only replace `[[Value]]`. Missing properties are created with
-/// default ordinary data attributes, but only when the receiver is
-/// extensible. Accessor slots and non-writable data slots reject.
-///
-/// This is the runtime assignment path. Construction/bootstrap code
-/// that owns a fresh object may still use [`set`] to seed internal
-/// scaffolding; user-visible assignment should route through this
-/// function after the `[[Set]]` resolver.
+/// Existing writable data keeps its attributes; an accessor or readonly data
+/// rejects. A missing property receives default data attributes only when the
+/// receiver is extensible. The receiver slot is refreshed across collection.
+/// Allocation failure retains its actual cause independently from rejection.
 ///
 /// # Spec
-///
 /// - <https://tc39.es/ecma262/#sec-ordinarysetwithowndescriptor>
 pub fn ordinary_set_data_property(
-    obj: JsObject,
-    heap: &mut otter_gc::GcHeap,
+    obj: &mut JsObject,
+    heap: &mut GcHeap,
     key: &str,
     value: Value,
-) -> bool {
-    let mapped_cell = heap.read_payload(obj, |body| mapped_argument_cell(body, key));
-    let success = descriptor_core::ordinary_set_data_property(obj, heap, key, value);
-    if success && let Some(cell) = mapped_cell {
-        mapped_write(heap, cell, value);
-    }
-    success
+) -> Result<bool, otter_gc::OutOfMemory> {
+    ordinary_set::string(obj, heap, key, value, None)
 }
 
+/// Ordinary data assignment with a previously prepared append shape.
+/// The shape owns the slot index and is rooted by descriptor preparation.
 pub(crate) fn ordinary_set_data_property_with_shape(
-    obj: JsObject,
-    heap: &mut otter_gc::GcHeap,
+    obj: &mut JsObject,
+    heap: &mut GcHeap,
     key: &str,
     value: Value,
     next_shape: ShapeHandle,
-    append_index: usize,
-) -> bool {
-    let mut obj = obj;
-    let mapped_cell = heap.read_payload(obj, |body| mapped_argument_cell(body, key));
-    let success = descriptor_core::ordinary_set_data_property_with_shape(
-        &mut obj,
-        heap,
-        key,
-        value,
-        next_shape,
-        append_index,
-    );
-    if success && let Some(cell) = mapped_cell {
-        mapped_write(heap, cell, value);
-    }
-    #[cfg(debug_assertions)]
-    if success {
-        // `obj` was relocated in place if slot growth scavenged; the assertion
-        // reads the live handle.
-        debug_assert_appended_shape_slot(obj, heap);
-    }
-    success
+) -> Result<bool, otter_gc::OutOfMemory> {
+    ordinary_set::string(obj, heap, key, value, Some(next_shape))
 }
 
-/// The root shape cached on the prototype `proto` for its instances.
+/// Head of the traced immutable capacity-root chain cached on `proto`.
 #[must_use]
 pub(crate) fn cached_instance_root(
     proto: JsObject,
@@ -5447,14 +5125,21 @@ pub(crate) fn cached_instance_root(
 /// be allocated, moving `proto`.
 pub(crate) fn cache_instance_root(
     proto: &mut JsObject,
-    heap: &mut otter_gc::GcHeap,
-    root: ShapeHandle,
+    heap: &mut GcHeap,
+    mut root: ShapeHandle,
 ) -> Result<(), otter_gc::OutOfMemory> {
+    use crate::rooting::RootScopeExt;
+    let mut roots = otter_gc::RootScope::new(heap);
+    // SAFETY: the receiver and prepared root slots precede this registration
+    // and remain stationary until both publications and barriers complete.
+    unsafe {
+        roots.add_object(proto);
+        roots.add_raw_slot(std::ptr::addr_of_mut!(root).cast::<RawGc>());
+    }
     ensure_exotic(proto, heap)?;
-    heap.with_payload(*proto, |body| {
-        body.set_flag(ObjectFlags::USED_AS_PROTOTYPE, true);
-        body.exotic_mut().instance_root = root;
-    });
+    let target = state(*proto, heap).with_prototype_role(true);
+    state_transition::transition_state(proto, heap, target)?;
+    heap.with_payload(*proto, |body| body.exotic_mut().instance_root = root);
     let sidecar = heap.read_payload(*proto, |body| body.exotic.get());
     heap.record_write(sidecar, &root);
     Ok(())
@@ -5554,17 +5239,15 @@ pub(crate) fn install_prototype_shape(
             "a prototype change keeps the object's slots",
         );
         body.invalidate_prototype_proofs();
+        assert_eq!(
+            body.inline_capacity(),
+            shape_body::inline_capacity_of(shape),
+            "shape transition changed object footprint"
+        );
         body.shape = shape;
         if dictionary {
             body.enter_dictionary_mode_as(next_shape_id(), true);
         }
-        let opaque_prototype = matches!(
-            shape_body::prototype_of(shape),
-            shape_body::ShapePrototype::Value(_)
-        );
-        body.set_chain_link_opaque(
-            body.string_data().is_some() || body.host_data_ref().is_some() || opaque_prototype,
-        );
     });
     // The new lineage may be unmarked while the object is already marked.
     heap.record_write(obj, &shape);
@@ -5584,56 +5267,87 @@ pub(crate) fn install_prototype_shape(
 ///
 /// - <https://tc39.es/ecma262/#sec-ordinarysetprototypeof>
 pub fn set_prototype_value(
-    obj: JsObject,
-    heap: &mut otter_gc::GcHeap,
+    obj: &mut JsObject,
+    heap: &mut GcHeap,
     proto: Option<Value>,
-) -> bool {
-    let new_proto = match prototype_change(obj, heap, proto) {
-        PrototypeChange::Unchanged => return true,
-        PrototypeChange::Rejected => return false,
+) -> Result<bool, otter_gc::OutOfMemory> {
+    use crate::rooting::RootScopeExt;
+    let mut new_proto = proto.unwrap_or(Value::null());
+    let mut roots = otter_gc::RootScope::new(heap);
+    // SAFETY: the caller receiver and prototype value remain stationary for the
+    // whole operation, including shape/table allocations and final publication.
+    unsafe {
+        roots.add_object(obj);
+        roots.add_value(&mut new_proto);
+    }
+    let new_proto = match prototype_change(*obj, heap, Some(new_proto)) {
+        PrototypeChange::Unchanged => return Ok(true),
+        PrototypeChange::Rejected => return Ok(false),
         PrototypeChange::To(prototype) => prototype,
     };
-    // Heap-only callers hold bare handles: nothing here may collect.
-    let _no_collection = heap.always_allocate_scope();
-    let root = heap_instance_root(&new_proto, heap).expect("prototype root shape");
-    let shape = shape(obj, heap);
-    if !shape_body::is_dictionary_of(shape) && shape_body::property_count_of(shape) == 0 {
-        // An object with no keys yet moves to the new lineage's root.
-        install_prototype_shape(obj, heap, root);
-        return true;
+    let source = shape(*obj, heap);
+    let target = shape_body::state_of(source).with_dictionary(false);
+    let root = heap_instance_root(
+        new_proto,
+        heap,
+        shape_body::inline_capacity_of(source),
+        target,
+        &mut |_| {},
+    )?;
+    // The prepared root stays alive through dictionary table allocations.
+    // SAFETY: the heap arena outlives this scope and no Local escapes.
+    let scope = unsafe { otter_gc::HandleScope::from_ptr(heap.handle_stack_ptr()) };
+    let root = scope.local(root);
+    if !shape_body::is_dictionary_of(source) && shape_body::property_count_of(source) == 0 {
+        install_prototype_shape(*obj, heap, root.get());
+        return Ok(true);
     }
-    let mut obj = obj;
-    normalize_to_dictionary(&mut obj, heap);
-    install_prototype_shape(obj, heap, shape_body::dictionary_of(root));
-    true
+    normalize_to_dictionary(obj, heap)?;
+    install_prototype_shape(*obj, heap, shape_body::dictionary_of(root.get()));
+    Ok(true)
 }
 
 /// [`set_prototype_value`] for an ordinary object or `null` prototype.
-pub fn set_prototype(obj: JsObject, heap: &mut otter_gc::GcHeap, proto: Option<JsObject>) {
-    set_prototype_value(obj, heap, proto.map(Value::object));
+pub fn set_prototype(
+    obj: &mut JsObject,
+    heap: &mut GcHeap,
+    proto: Option<JsObject>,
+) -> Result<bool, otter_gc::OutOfMemory> {
+    set_prototype_value(obj, heap, proto.map(Value::object))
 }
 
 /// The root shape of objects created with the ordinary `prototype` (or
-/// `null`) in a heap-only context. Nothing here collects.
+/// `null`) in a heap-only context. Explicit roots cover collecting allocation.
 pub(crate) fn root_for_prototype(
-    heap: &mut otter_gc::GcHeap,
+    heap: &mut GcHeap,
     prototype: Option<JsObject>,
+    state: ShapeState,
+    external_visit: &mut RootSlotVisitor<'_>,
 ) -> Result<ShapeHandle, otter_gc::OutOfMemory> {
-    let _no_collection = heap.always_allocate_scope();
     heap_instance_root(
-        &prototype.map_or(ObjectPrototype::Null, ObjectPrototype::Object),
+        prototype.map_or(ObjectPrototype::Null, ObjectPrototype::Object),
         heap,
+        DEFAULT_INLINE_CAPACITY,
+        state,
+        external_visit,
     )
 }
 
 /// The root shape of objects created with the prototype value `proto`
-/// (`None` or `null` for none) in a heap-only context. Nothing here collects.
+/// (`None` or `null` for none) in a heap-only context with explicit roots.
 pub(crate) fn root_for_prototype_value(
-    heap: &mut otter_gc::GcHeap,
+    heap: &mut GcHeap,
     proto: Option<Value>,
+    state: ShapeState,
+    external_visit: &mut RootSlotVisitor<'_>,
 ) -> Result<ShapeHandle, otter_gc::OutOfMemory> {
-    let _no_collection = heap.always_allocate_scope();
-    heap_instance_root(&object_prototype_of_value(proto), heap)
+    heap_instance_root(
+        object_prototype_of_value(proto),
+        heap,
+        DEFAULT_INLINE_CAPACITY,
+        state,
+        external_visit,
+    )
 }
 
 /// The prototype value `proto` (`None`, `null` or `undefined` for none, else
@@ -5658,52 +5372,108 @@ pub(crate) fn object_prototype_of_value(proto: Option<Value>) -> ObjectPrototype
 /// root, the one cached on an ordinary prototype (created and cached on first
 /// use), or a fresh root. The runtime registers such a root when it next
 /// meets it.
-fn heap_instance_root(
-    prototype: &ObjectPrototype,
-    heap: &mut otter_gc::GcHeap,
+pub(crate) fn heap_instance_root(
+    prototype: ObjectPrototype,
+    heap: &mut GcHeap,
+    capacity: usize,
+    state: ShapeState,
+    external_visit: &mut RootSlotVisitor<'_>,
 ) -> Result<ShapeHandle, otter_gc::OutOfMemory> {
-    let mut no_roots = |_visitor: &mut dyn FnMut(*mut RawGc)| {};
-    let shape_prototype = match *prototype {
-        ObjectPrototype::Null => return Ok(shape_body::null_root(heap)),
-        ObjectPrototype::Object(mut proto) => {
-            if let Some(root) = cached_instance_root(proto, heap) {
-                return Ok(root);
-            }
-            let root = shape_body::alloc_root_shape_body_with_roots(
-                heap,
-                shape_body::ShapePrototype::Object(proto),
-                &mut no_roots,
-            )?;
-            cache_instance_root(&mut proto, heap, root)?;
+    use crate::rooting::RootScopeExt;
+    let mut prototype_value = match prototype {
+        ObjectPrototype::Null => Value::null(),
+        ObjectPrototype::Object(object) => Value::object(object),
+        ObjectPrototype::Proxy(proxy) => Value::proxy(proxy),
+        ObjectPrototype::Value(value) => value,
+    };
+    let mut ordinary_proto = prototype_value.as_object().unwrap_or_else(JsObject::null);
+    let mut roots = otter_gc::RootScope::new(heap);
+    // SAFETY: both local slots precede the scope and stay stationary; pending
+    // shape allocation can collect and rewrites these exact values in place.
+    unsafe {
+        roots.add_value(&mut prototype_value);
+        roots.add_object(&mut ordinary_proto);
+    }
+    let state = state.with_dictionary(false).with_lookup(
+        LookupFact::NonOrdinaryPrototype,
+        !prototype_value.is_null() && ordinary_proto.is_null(),
+    );
+    if state.is_provisional() {
+        let prototype = if prototype_value.is_null() {
+            shape_body::ShapePrototype::Null
+        } else if !ordinary_proto.is_null() {
+            shape_body::ShapePrototype::Object(ordinary_proto)
+        } else {
+            shape_body::ShapePrototype::Value(prototype_value)
+        };
+        return shape_body::alloc_root_shape_body_with_roots(
+            heap,
+            prototype,
+            capacity,
+            ShapeHandle::null(),
+            state,
+            external_visit,
+        );
+    }
+    if prototype_value.is_null() {
+        let head = shape_body::null_root_head(heap);
+        if let Some(root) = shape_body::root_for_layout(head, capacity, state) {
             return Ok(root);
         }
-        ObjectPrototype::Value(value) => shape_body::ShapePrototype::Value(value),
-        ObjectPrototype::Proxy(proxy) => shape_body::ShapePrototype::Value(Value::proxy(proxy)),
-    };
-    shape_body::alloc_root_shape_body_with_roots(heap, shape_prototype, &mut no_roots)
+        let root = shape_body::alloc_root_shape_body_with_roots(
+            heap,
+            shape_body::ShapePrototype::Null,
+            capacity,
+            head,
+            state,
+            external_visit,
+        )?;
+        shape_body::set_null_root(heap, root);
+        return Ok(root);
+    }
+    if !ordinary_proto.is_null() {
+        let previous = cached_instance_root(ordinary_proto, heap).unwrap_or_else(ShapeHandle::null);
+        if let Some(root) = shape_body::root_for_layout(previous, capacity, state) {
+            return Ok(root);
+        }
+        let root = shape_body::alloc_root_shape_body_with_roots(
+            heap,
+            shape_body::ShapePrototype::Object(ordinary_proto),
+            capacity,
+            previous,
+            state,
+            external_visit,
+        )?;
+        cache_instance_root(&mut ordinary_proto, heap, root)?;
+        return Ok(root);
+    }
+    shape_body::alloc_root_shape_body_with_roots(
+        heap,
+        shape_body::ShapePrototype::Value(prototype_value),
+        capacity,
+        ShapeHandle::null(),
+        state,
+        external_visit,
+    )
+}
+
+/// A shape prototype in the ordinary mutation owner's representation.
+fn object_prototype_of_shape(prototype: shape_body::ShapePrototype) -> ObjectPrototype {
+    match prototype {
+        shape_body::ShapePrototype::Null => ObjectPrototype::Null,
+        shape_body::ShapePrototype::Object(object) => ObjectPrototype::Object(object),
+        shape_body::ShapePrototype::Value(value) => object_prototype_of_value(Some(value)),
+    }
 }
 
 /// Move a keyed object's string-keyed properties into dictionary storage,
 /// keeping their order, values and attributes. A dictionary object is left
 /// as is.
-fn normalize_to_dictionary(obj: &mut JsObject, heap: &mut otter_gc::GcHeap) {
-    if is_dictionary(*obj, heap) {
-        return;
-    }
-    let keys = heap.read_payload(*obj, |body| string_keys_in_shape_order(heap, body));
-    materialize_slots(*obj, heap);
-    let table = dict_keys_table_for_install(obj, heap, &Some(keys), "", &mut [])
-        .expect("dictionary key table");
-    heap.with_payload(*obj, |body| {
-        body.enter_dictionary_mode(false);
-        if let Some(table) = table {
-            body.exotic_mut().dictionary_keys = table;
-        }
-    });
-    if let Some(table) = table {
-        let sidecar = heap.read_payload(*obj, |body| body.exotic.get());
-        heap.record_write(sidecar, &table);
-    }
+fn normalize_to_dictionary(
+    obj: &mut JsObject,
+    heap: &mut GcHeap,
+) -> Result<(), otter_gc::OutOfMemory> {
+    materialize_slots_with_pending_values(obj, heap, &mut [])
 }
 
 fn prototype_same(a: &ObjectPrototype, b: &ObjectPrototype) -> bool {
@@ -5734,56 +5504,55 @@ fn same_prototype_value(a: &Value, b: &Value) -> bool {
 /// # Spec
 ///
 /// - <https://tc39.es/ecma262/#sec-ordinarydelete>
-pub fn delete(obj: JsObject, heap: &mut otter_gc::GcHeap, key: &str) -> bool {
-    let existing_offset = heap.read_payload(obj, |body| body_offset_of(heap, body, key));
-    let replacement_keys = heap.read_payload(obj, |body| {
-        let mut keys = string_keys_in_shape_order(heap, body);
-        if let Some(offset) = existing_offset {
-            let offset = offset as usize;
-            if offset < keys.len() {
-                keys.remove(offset);
-            }
-        }
-        keys
-    });
-    // Delete normalizes to dictionary storage, which keeps per-slot metadata
-    // materialized; snapshot the shaped object's attributes from the hidden
-    // class before the in-place removal so the configurability check and the
-    // value-array shift operate on a populated metadata vector.
-    if existing_offset.is_some() {
-        materialize_slots(obj, heap);
-    }
-    let mut obj_for_table = obj;
-    let Ok(replacement_table) = dict_keys_table_for_install(
-        &mut obj_for_table,
-        heap,
-        &Some(replacement_keys),
-        "",
-        &mut [],
-    ) else {
-        return false;
+pub fn delete(
+    obj: &mut JsObject,
+    heap: &mut GcHeap,
+    key: &str,
+) -> Result<bool, otter_gc::OutOfMemory> {
+    let Some(offset) = heap.read_payload(*obj, |body| body_offset_of(heap, body, key)) else {
+        return Ok(true);
     };
-    let obj = obj_for_table;
-    heap.with_payload(obj, |body| {
-        let Some(offset) = existing_offset else {
-            // Spec step 2: missing → true.
-            return true;
-        };
-        if !body.slots()[offset as usize].flags.configurable() {
-            return false;
-        }
+    let (flags, _) = heap.read_payload(*obj, |body| body.slot_attrs(heap, offset as usize));
+    if !flags.configurable() {
+        return Ok(false);
+    }
+    let source = shape(*obj, heap);
+    if !shape_body::is_dictionary_of(source) && offset + 1 == shape_body::property_count_of(source)
+    {
+        let parent = heap.read_payload(source, shape_body::ShapeBody::parent);
+        assert!(
+            !parent.is_null(),
+            "a counted final property has a shape parent"
+        );
+        heap.with_payload(*obj, |body| {
+            body.invalidate_prototype_proofs();
+            // No counted slot can ever retain the deleted moving child.
+            unsafe {
+                *body.field_ptr(body.location_for_slot(offset as usize)) = Value::undefined();
+            }
+            body.shape = parent;
+            remove_mapped_argument(body, key);
+            body.debug_verify_field_layout();
+        });
+        heap.record_write(*obj, &parent);
+        return Ok(true);
+    }
+    // Non-final deletion compacts actual key/value/descriptor order. All tables
+    // are prepared with the receiver rooted; no state latch survives migration.
+    materialize_slots(obj, heap)?;
+    let mut keys = heap.read_payload(*obj, |body| string_keys_in_shape_order(heap, body));
+    keys.remove(offset as usize);
+    let table = dict_keys_table_for_install(obj, heap, &Some(keys), "", &mut [])?
+        .expect("Some keys prepare a replacement table");
+    heap.with_payload(*obj, |body| {
         body.enter_dictionary_mode(false);
         body.remove_slot(offset as usize);
-        if let Some(table) = replacement_table {
-            body.exotic_mut().dictionary_keys = table;
-        }
-        shape_cache::invalidate_fast_shape_assumptions(
-            body,
-            ShapeCacheInvalidation::DeleteOwnProperty,
-        );
+        body.exotic_mut().dictionary_keys = table;
         remove_mapped_argument(body, key);
-        true
-    })
+    });
+    let sidecar = heap.read_payload(*obj, |body| body.exotic.get());
+    heap.record_write(sidecar, &table);
+    Ok(true)
 }
 
 /// Force-remove an own data property only while it still holds `expected`.
@@ -5797,20 +5566,27 @@ pub fn delete(obj: JsObject, heap: &mut otter_gc::GcHeap, key: &str) -> bool {
 ///
 /// Accessor properties never match, so rollback does not invoke user code.
 pub(crate) fn delete_if_same_data(
-    obj: JsObject,
+    obj: &mut JsObject,
     heap: &mut otter_gc::GcHeap,
     key: &str,
-    expected: Value,
-) -> bool {
-    let existing_offset = heap.read_payload(obj, |body| body_offset_of(heap, body, key));
+    mut expected: Value,
+) -> Result<bool, otter_gc::OutOfMemory> {
+    use crate::rooting::RootScopeExt;
+    let mut roots = otter_gc::RootScope::new(heap);
+    // SAFETY: both receiver and pending comparison value remain stationary
+    // through metadata allocation and the guarded transaction rollback.
+    unsafe {
+        roots.add_object(obj);
+        roots.add_value(&mut expected);
+    }
+    let existing_offset = heap.read_payload(*obj, |body| body_offset_of(heap, body, key));
     let Some(offset) = existing_offset else {
-        return false;
+        return Ok(false);
     };
 
-    materialize_slots(obj, heap);
-    let matches_expected = heap.read_payload(obj, |body| {
+    let matches_expected = heap.read_payload(*obj, |body| {
         let offset = offset as usize;
-        !body.slots()[offset].is_accessor
+        !body.slot_attrs(heap, offset).1
             && crate::abstract_ops::is_strictly_equal(
                 &body.data_value(heap, offset),
                 &expected,
@@ -5818,10 +5594,11 @@ pub(crate) fn delete_if_same_data(
             )
     });
     if !matches_expected {
-        return false;
+        return Ok(false);
     }
+    materialize_slots(obj, heap)?;
 
-    let replacement_keys = heap.read_payload(obj, |body| {
+    let replacement_keys = heap.read_payload(*obj, |body| {
         let mut keys = string_keys_in_shape_order(heap, body);
         let offset = offset as usize;
         if offset < keys.len() {
@@ -5829,30 +5606,21 @@ pub(crate) fn delete_if_same_data(
         }
         keys
     });
-    let mut obj_for_table = obj;
-    let Ok(replacement_table) = dict_keys_table_for_install(
-        &mut obj_for_table,
-        heap,
-        &Some(replacement_keys),
-        "",
-        &mut [],
-    ) else {
-        return false;
-    };
-    let obj = obj_for_table;
-    heap.with_payload(obj, |body| {
+    let replacement_table =
+        dict_keys_table_for_install(obj, heap, &Some(replacement_keys), "", &mut [])?;
+    heap.with_payload(*obj, |body| {
         body.enter_dictionary_mode(false);
         body.remove_slot(offset as usize);
         if let Some(table) = replacement_table {
             body.exotic_mut().dictionary_keys = table;
         }
-        shape_cache::invalidate_fast_shape_assumptions(
-            body,
-            ShapeCacheInvalidation::DeleteOwnProperty,
-        );
         remove_mapped_argument(body, key);
     });
-    true
+    if let Some(table) = replacement_table {
+        let sidecar = heap.read_payload(*obj, |body| body.exotic.get());
+        heap.record_write(sidecar, &table);
+    }
+    Ok(true)
 }
 
 /// Set or overwrite a symbol-keyed own data property through the
@@ -5860,8 +5628,13 @@ pub(crate) fn delete_if_same_data(
 ///
 /// Fires the GC write barrier when `value` carries a `Gc<…>`
 /// handle.
-pub fn set_symbol(obj: JsObject, heap: &mut otter_gc::GcHeap, key: JsSymbol, value: Value) -> bool {
-    descriptor_core::ordinary_set_symbol_data_property(obj, heap, key, value)
+pub fn ordinary_set_symbol_data_property(
+    obj: &mut JsObject,
+    heap: &mut GcHeap,
+    key: JsSymbol,
+    value: Value,
+) -> Result<bool, otter_gc::OutOfMemory> {
+    ordinary_set::symbol(obj, heap, key, value)
 }
 
 /// Remove a symbol-keyed own property.
@@ -5918,124 +5691,8 @@ pub fn define_own_property_partial(
     heap: &mut otter_gc::GcHeap,
     key: &str,
     descriptor: PartialPropertyDescriptor,
-) -> bool {
-    // The sidecar allocates, so it is reserved here, outside the payload
-    // borrow below. This may move the receiver; every relocation below is
-    // reflected back through `obj_ref` so the caller's handle stays live.
-    let mut descriptor = descriptor;
-    {
-        let descriptor_slot = &mut descriptor;
-        let mut roots = |visitor: &mut dyn FnMut(*mut RawGc)| {
-            crate::pelt::PeltField::pelt_trace(&mut *descriptor_slot, visitor);
-        };
-        ensure_exotic_with_roots(obj_ref, heap, &mut roots).expect("exotic sidecar");
-    }
-    let completed = descriptor.complete_for_new_property();
-    let existing_offset = heap.read_payload(*obj_ref, |body| body_offset_of(heap, body, key));
-    let dictionary_keys = dictionary_keys_for_shape_transition(heap, *obj_ref, existing_offset);
-    let slot_metas = slot_metas_for_shape_transition(heap, *obj_ref, existing_offset);
-    let append_index = heap.read_payload(*obj_ref, |body| body_property_count(heap, body));
-    // §10.1.6.3 ValidateAndApplyPropertyDescriptor runs outside the
-    // mutable body borrow so the BigInt-BigInt SameValue arm can
-    // read both bodies through `heap`. Distinct GC handles holding
-    // the same numeric value must compare equal per spec.
-    let merged_for_existing = if let Some(offset) = existing_offset {
-        let existing = heap.read_payload(*obj_ref, |body| body.slot_data(heap, offset as usize));
-        match descriptor_core::validate_and_apply_partial(&existing, &descriptor, heap) {
-            Some(merged) => Some(merged),
-            None => return false,
-        }
-    } else {
-        None
-    };
-    // Lower the slot to its flat `(meta, value)` form before taking the body
-    // borrow: an accessor allocates its cell here (rooting the receiver), so
-    // the mutation closure never allocates.
-    let slot_source = match merged_for_existing {
-        Some(merged) => merged,
-        None => SlotData::from_descriptor(completed),
-    };
-    let (meta, stored) = match slot_source.into_flat(heap, obj_ref) {
-        Ok(parts) => parts,
-        Err(_) => return false,
-    };
-    let mut stored = stored;
-    // Redefining an existing shaped slot without a shape transition diverges
-    // its attributes from the hidden class. Materialization allocates, so keep
-    // the flattened direct value rooted while it runs.
-    if existing_offset.is_some() {
-        materialize_slots_with_pending_values(obj_ref, heap, std::slice::from_mut(&mut stored));
-    }
-    if reserve_slot_capacity(
-        obj_ref,
-        heap,
-        append_index + 1,
-        std::slice::from_mut(&mut stored),
-    )
-    .is_err()
-    {
-        return false;
-    }
-    let Ok(slot_meta_table) = slot_meta_table_for_install(
-        obj_ref,
-        heap,
-        &slot_metas,
-        append_index + 1,
-        std::slice::from_mut(&mut stored),
-    ) else {
-        return false;
-    };
-    let dict_table = if existing_offset.is_none() {
-        let Ok(table) = dict_keys_table_for_install(
-            obj_ref,
-            heap,
-            &dictionary_keys,
-            key,
-            std::slice::from_mut(&mut stored),
-        ) else {
-            return false;
-        };
-        table
-    } else {
-        None
-    };
-    let success = heap.with_payload(*obj_ref, |body| {
-        if let Some(offset) = existing_offset {
-            body.set_slot(offset as usize, meta, stored, None);
-            true
-        } else {
-            if !body.extensible() {
-                return false;
-            }
-            body.enter_dictionary_mode(true);
-            if let Some(table) = dict_table {
-                body.exotic_mut().dictionary_keys = table;
-            }
-            if let Some(table) = slot_meta_table {
-                body.exotic_mut().slots = table;
-            }
-            dict_push_key(body, key.to_owned());
-            body.push_slot(append_index, meta, stored);
-            true
-        }
-    });
-    let sidecar = heap.read_payload(*obj_ref, |body| body.exotic.get());
-    if let Some(table) = slot_meta_table {
-        heap.record_write(sidecar, &table);
-    }
-    if let Some(table) = dict_table {
-        heap.record_write(sidecar, &table);
-    }
-    if success {
-        // Mapped arguments only consume a present data `[[Value]]`; keep that
-        // field synchronized with the collector-rewritten slot word.
-        if descriptor.value.is_some() && !meta.is_accessor {
-            descriptor.value = Some(stored);
-        }
-        apply_mapped_arguments_partial_define(*obj_ref, heap, key, descriptor, existing_offset);
-        record_slot_write(heap, *obj_ref, stored);
-    }
-    success
+) -> Result<bool, otter_gc::OutOfMemory> {
+    descriptor_install::define_string(obj_ref, heap, key, descriptor)
 }
 
 pub(crate) fn define_own_property_partial_with_shape(
@@ -6044,340 +5701,61 @@ pub(crate) fn define_own_property_partial_with_shape(
     key: &str,
     descriptor: PartialPropertyDescriptor,
     next_shape: ShapeHandle,
-) -> bool {
-    let completed = descriptor.complete_for_new_property();
-    let existing_offset = heap.read_payload(*obj_ref, |body| body_offset_of(heap, body, key));
-    let merged_for_existing = if let Some(offset) = existing_offset {
-        let existing = heap.read_payload(*obj_ref, |body| body.slot_data(heap, offset as usize));
-        match descriptor_core::validate_and_apply_partial(&existing, &descriptor, heap) {
-            Some(merged) => Some(merged),
-            None => return false,
-        }
-    } else {
-        None
-    };
-    let slot_source = match merged_for_existing {
-        Some(merged) => merged,
-        None => SlotData::from_descriptor(completed),
-    };
-    let (meta, stored) = match slot_source.into_flat(heap, obj_ref) {
-        Ok(parts) => parts,
-        Err(_) => return false,
-    };
-    // The appended slot's flat index is the new shape's last offset.
-    let append_index = shape_body::shape_property_count(heap, next_shape) as usize - 1;
-    let mut stored = stored;
-    if reserve_slot_capacity(
-        obj_ref,
-        heap,
-        append_index + 1,
-        std::slice::from_mut(&mut stored),
-    )
-    .is_err()
-    {
-        return false;
-    }
-    let success = heap.with_payload(*obj_ref, |body| {
-        if let Some(offset) = existing_offset {
-            // Redefine: `next_shape` is the attribute-encoding class that
-            // records this slot's new flags/kind (computed by the caller).
-            body.set_slot(offset as usize, meta, stored, Some(next_shape));
-            true
-        } else {
-            if !body.extensible() {
-                return false;
-            }
-            debug_assert_object_shape_handle(next_shape, "shape-slot store");
-            body.invalidate_prototype_proofs();
-            body.shape = next_shape;
-            body.push_slot(append_index, meta, stored);
-            true
-        }
-    });
-    if success {
-        apply_mapped_arguments_partial_define(*obj_ref, heap, key, descriptor, existing_offset);
-        record_slot_write(heap, *obj_ref, stored);
-        record_exotic_write(heap, *obj_ref, &next_shape);
-        #[cfg(debug_assertions)]
-        if existing_offset.is_none() {
-            debug_assert_appended_shape_slot(*obj_ref, heap);
-        }
-    }
-    success
+) -> Result<bool, otter_gc::OutOfMemory> {
+    descriptor_install::define_string_with_shape(obj_ref, heap, key, descriptor, next_shape)
 }
 
 /// Field-presence-aware §10.1.6.3 for symbol-keyed properties.
+/// Allocation failures preserve their typed cause; `false` means rejection.
 pub fn define_own_symbol_property_partial(
     obj_ref: &mut JsObject,
     heap: &mut otter_gc::GcHeap,
     key: JsSymbol,
     descriptor: PartialPropertyDescriptor,
-) -> bool {
-    // The sidecar and the symbol table allocate, so both are reserved
-    // here, outside the payload borrow below. This may move the receiver;
-    // the relocation is reflected back through `obj_ref` so the caller's
-    // handle stays live. The descriptor's values are rooted across the
-    // reservation.
-    let mut descriptor = descriptor;
-    {
-        let descriptor_slot = &mut descriptor;
-        let mut roots = |visitor: &mut dyn FnMut(*mut RawGc)| {
-            crate::pelt::PeltField::pelt_trace(&mut *descriptor_slot, visitor);
-        };
-        reserve_symbol_prop_capacity(obj_ref, heap, &mut roots).expect("symbol prop table");
-    }
-    let obj = *obj_ref;
-    let completed = descriptor.complete_for_new_property();
-    let barrier_descriptor = completed.clone();
-    let existing_pos_and_slot = heap.read_payload(obj, |body| {
-        body.symbol_props()
-            .iter()
-            .position(|(k, _)| k.ptr_eq(key))
-            .map(|pos| (pos, body.symbol_props()[pos].1.clone()))
-    });
-    let merged_for_existing = if let Some((_, ref existing)) = existing_pos_and_slot {
-        match descriptor_core::validate_and_apply_partial(existing, &descriptor, heap) {
-            Some(merged) => Some(merged),
-            None => return false,
-        }
-    } else {
-        None
-    };
-    let existing_pos = existing_pos_and_slot.as_ref().map(|(p, _)| *p);
-    let success = heap.with_payload(obj, |body| {
-        if let Some(pos) = existing_pos {
-            body.symbol_props_mut()
-                .expect("existing symbol slot implies a table")
-                .entries_mut()[pos]
-                .1 = merged_for_existing.unwrap();
-            true
-        } else {
-            if !body.extensible() {
-                return false;
-            }
-            body.symbol_props_mut()
-                .expect("symbol table reserved before the borrow")
-                .push((key, SlotData::from_descriptor(completed.clone())));
-            true
-        }
-    });
-    if success {
-        record_symbol_entry_write(heap, obj, &key, &barrier_descriptor);
-    }
-    success
+) -> Result<bool, otter_gc::OutOfMemory> {
+    descriptor_install::define_symbol(obj_ref, heap, key, descriptor)
 }
 
-/// §10.1.6.3 OrdinaryDefineOwnProperty for a fully-specified
-/// descriptor. Legacy entry point — prefer
-/// [`define_own_property_partial`] for new callers so field-presence
-/// is preserved.
+/// §10.1.6.3 for a fully specified string-keyed descriptor.
+/// Both full and partial forms use the same field-presence validation owner.
 pub fn define_own_property(
     obj: JsObject,
     heap: &mut otter_gc::GcHeap,
     key: &str,
     descriptor: PropertyDescriptor,
-) -> bool {
-    let mut obj = obj;
-    define_own_property_in_place(&mut obj, heap, key, descriptor)
+) -> Result<bool, otter_gc::OutOfMemory> {
+    define_own_property_in_place(&mut { obj }, heap, key, descriptor)
 }
 
-/// Like [`define_own_property`], but reflects any relocation the write's own
-/// allocation drove back into the caller's handle.
-///
-/// Sidecar or slab growth can move a young receiver; the caller's `obj` must be
-/// refreshed so a following write on the same builder (for example,
-/// [`crate::ObjectBuilder`] chaining several properties) never dereferences a
-/// vacated cell.
+/// Define a full descriptor and update the caller's moving receiver slot.
+/// Allocation failures preserve their typed cause; `false` means rejection.
 pub fn define_own_property_in_place(
     obj_ref: &mut JsObject,
     heap: &mut otter_gc::GcHeap,
     key: &str,
     descriptor: PropertyDescriptor,
-) -> bool {
-    let mut descriptor = descriptor;
-    let existing_offset = heap.read_payload(*obj_ref, |body| body_offset_of(heap, body, key));
-    if existing_offset.is_none() {
-        // A fresh key demotes this object to dictionary mode, and the
-        // key list and slot metadata demotion writes live in the
-        // sidecar. Reserved here, outside every payload borrow, because
-        // creating it allocates. Redefinition of an existing slot goes
-        // through `materialize_slots`, which reserves for itself.
-        let descriptor_slot = &mut descriptor;
-        let mut roots = |visitor: &mut dyn FnMut(*mut RawGc)| {
-            crate::pelt::PeltField::pelt_trace(&mut *descriptor_slot, visitor);
-        };
-        ensure_exotic_with_roots(obj_ref, heap, &mut roots).expect("exotic sidecar");
-    }
-    let mut obj = *obj_ref;
-    let map_is_data = descriptor.is_data();
-    let map_writable = descriptor.writable();
-    let dictionary_keys = dictionary_keys_for_shape_transition(heap, obj, existing_offset);
-    let slot_metas = slot_metas_for_shape_transition(heap, obj, existing_offset);
-    let append_index = heap.read_payload(obj, |body| body_property_count(heap, body));
-    let merged_for_existing = if let Some(offset) = existing_offset {
-        let existing = heap.read_payload(obj, |body| body.slot_data(heap, offset as usize));
-        match descriptor_core::validate_and_apply(&existing, &descriptor, heap) {
-            Some(merged) => Some(merged),
-            None => return false,
-        }
-    } else {
-        None
-    };
-    let slot_source = match merged_for_existing {
-        Some(merged) => merged,
-        None => SlotData::from_descriptor(descriptor),
-    };
-    let (meta, stored) = match slot_source.into_flat(heap, &mut obj) {
-        Ok(parts) => parts,
-        Err(_) => {
-            // `into_flat` may have relocated the receiver before failing; reflect
-            // it so the caller's handle is never left pointing at a vacated cell.
-            *obj_ref = obj;
-            return false;
-        }
-    };
-    let mut stored = stored;
-    // Materialization may allocate; the flattened direct value has not entered
-    // the object yet, so keep it in the pending-root slice.
-    if existing_offset.is_some() {
-        materialize_slots_with_pending_values(&mut obj, heap, std::slice::from_mut(&mut stored));
-    }
-    if reserve_slot_capacity(
-        &mut obj,
+) -> Result<bool, otter_gc::OutOfMemory> {
+    define_own_property_partial(
+        obj_ref,
         heap,
-        append_index + 1,
-        std::slice::from_mut(&mut stored),
+        key,
+        PartialPropertyDescriptor::from_full(&descriptor),
     )
-    .is_err()
-    {
-        return false;
-    }
-    let Ok(slot_meta_table) = slot_meta_table_for_install(
-        &mut obj,
-        heap,
-        &slot_metas,
-        append_index + 1,
-        std::slice::from_mut(&mut stored),
-    ) else {
-        return false;
-    };
-    let dict_table = if existing_offset.is_none() {
-        let Ok(table) = dict_keys_table_for_install(
-            &mut obj,
-            heap,
-            &dictionary_keys,
-            key,
-            std::slice::from_mut(&mut stored),
-        ) else {
-            return false;
-        };
-        table
-    } else {
-        None
-    };
-    let success = heap.with_payload(obj, |body| {
-        if let Some(offset) = existing_offset {
-            body.set_slot(offset as usize, meta, stored, None);
-            true
-        } else {
-            if !body.extensible() {
-                return false;
-            }
-            body.enter_dictionary_mode(true);
-            if let Some(table) = dict_table {
-                body.exotic_mut().dictionary_keys = table;
-            }
-            if let Some(table) = slot_meta_table {
-                body.exotic_mut().slots = table;
-            }
-            dict_push_key(body, key.to_owned());
-            body.push_slot(append_index, meta, stored);
-            true
-        }
-    });
-    let sidecar = heap.read_payload(obj, |body| body.exotic.get());
-    if let Some(table) = slot_meta_table {
-        heap.record_write(sidecar, &table);
-    }
-    if let Some(table) = dict_table {
-        heap.record_write(sidecar, &table);
-    }
-    if success {
-        let mapped_cell = heap.read_payload(obj, |body| mapped_argument_cell(body, key));
-        if let Some(cell) = mapped_cell {
-            if map_is_data {
-                mapped_write(heap, cell, stored);
-                if !map_writable {
-                    heap.with_payload(obj, |body| remove_mapped_argument(body, key));
-                }
-            } else {
-                heap.with_payload(obj, |body| remove_mapped_argument(body, key));
-            }
-        }
-        record_slot_write(heap, obj, stored);
-    }
-    // Reflect any relocation the write drove back into the caller's handle.
-    *obj_ref = obj;
-    success
 }
 
-/// Symbol-keyed counterpart to [`define_own_property`].
+/// Define a full symbol descriptor through the same partial validation owner.
 pub fn define_own_symbol_property(
     obj: JsObject,
     heap: &mut otter_gc::GcHeap,
     key: JsSymbol,
     descriptor: PropertyDescriptor,
-) -> bool {
-    // The sidecar and the symbol table allocate, so both are reserved
-    // here, outside the payload borrow below. This may move `obj`,
-    // which is why the local is `mut`; the descriptor's values are
-    // rooted across the reservation.
-    let mut obj = obj;
-    let mut descriptor = descriptor;
-    {
-        let descriptor_slot = &mut descriptor;
-        let mut roots = |visitor: &mut dyn FnMut(*mut RawGc)| {
-            crate::pelt::PeltField::pelt_trace(&mut *descriptor_slot, visitor);
-        };
-        reserve_symbol_prop_capacity(&mut obj, heap, &mut roots).expect("symbol prop table");
-    }
-    let barrier_descriptor = descriptor.clone();
-    let existing_pos_and_slot = heap.read_payload(obj, |body| {
-        body.symbol_props()
-            .iter()
-            .position(|(k, _)| k.ptr_eq(key))
-            .map(|pos| (pos, body.symbol_props()[pos].1.clone()))
-    });
-    let merged_for_existing = if let Some((_, ref existing)) = existing_pos_and_slot {
-        match descriptor_core::validate_and_apply(existing, &descriptor, heap) {
-            Some(merged) => Some(merged),
-            None => return false,
-        }
-    } else {
-        None
-    };
-    let existing_pos = existing_pos_and_slot.as_ref().map(|(p, _)| *p);
-    let success = heap.with_payload(obj, |body| {
-        if let Some(pos) = existing_pos {
-            body.symbol_props_mut()
-                .expect("existing symbol slot implies a table")
-                .entries_mut()[pos]
-                .1 = merged_for_existing.unwrap();
-            true
-        } else {
-            if !body.extensible() {
-                return false;
-            }
-            body.symbol_props_mut()
-                .expect("symbol table reserved before the borrow")
-                .push((key, SlotData::from_descriptor(descriptor)));
-            true
-        }
-    });
-    if success {
-        record_symbol_entry_write(heap, obj, &key, &barrier_descriptor);
-    }
-    success
+) -> Result<bool, otter_gc::OutOfMemory> {
+    define_own_symbol_property_partial(
+        &mut { obj },
+        heap,
+        key,
+        PartialPropertyDescriptor::from_full(&descriptor),
+    )
 }
 
 /// Validate one descriptor update against an existing descriptor using
@@ -6611,8 +5989,12 @@ pub fn resolve_symbol_set(obj: JsObject, heap: &otter_gc::GcHeap, key: JsSymbol)
 ///
 /// # See also
 /// - <https://tc39.es/ecma262/#sec-ordinarypreventextensions>
-pub fn prevent_extensions(obj: JsObject, heap: &mut otter_gc::GcHeap) {
-    heap.with_payload(obj, |body| body.set_extensible(false));
+pub fn prevent_extensions(
+    obj: &mut JsObject,
+    heap: &mut GcHeap,
+) -> Result<(), otter_gc::OutOfMemory> {
+    let target = state(*obj, heap).with_extensible(false);
+    state_transition::transition_state(obj, heap, target)
 }
 
 /// `Object.seal(o)` core — clears `[[Extensible]]` and toggles
@@ -6620,75 +6002,33 @@ pub fn prevent_extensions(obj: JsObject, heap: &mut otter_gc::GcHeap) {
 ///
 /// # See also
 /// - <https://tc39.es/ecma262/#sec-setintegritylevel>
-pub fn seal(obj: JsObject, heap: &mut otter_gc::GcHeap) {
-    // In-place fallback (dictionary mode, or callers without a shape runtime):
-    // materialize per-slot metadata so the attribute change is recorded on a
-    // populated vector instead of diverging silently from the hidden class.
-    materialize_slots(obj, heap);
-    heap.with_payload(obj, |body| {
-        body.set_extensible(false);
-        if let Some(exotic) = exotic_body_of(body.exotic.get()).map(|e|
-            // SAFETY: a non-null handle names a live sidecar payload.
-            unsafe { &mut *e })
-        {
-            for slot in slot_meta_body_of(exotic.slots)
-                // SAFETY: a non-null handle names a live table.
-                .map_or(&mut [][..], |table| unsafe { (*table).entries_mut() })
-                .iter_mut()
-            {
-                slot.flags = slot.flags.with_configurable(false);
-            }
-            for (key, slot) in symbol_props_body_of(exotic.symbol_props)
-                // SAFETY: a non-null handle names a live table.
-                .map_or(&mut [][..], |table| unsafe { (*table).entries_mut() })
-                .iter_mut()
-            {
-                // §6.2.12 — Private Name carriers are not properties;
-                // SetIntegrityLevel never touches them.
-                if key.is_private_name() {
-                    continue;
-                }
-                slot.flags = slot.flags.with_configurable(false);
-            }
-        }
-    });
+pub fn seal(obj: &mut JsObject, heap: &mut GcHeap) -> Result<(), otter_gc::OutOfMemory> {
+    integrity_transition::apply(obj, heap, descriptor_mutation::IntegrityLevel::Sealed)
 }
 
 /// `Object.seal` for a shaped object, transitioning to `new_shape` — the
-/// attribute-encoding hidden class that records every slot as
-/// non-configurable. A non-overridden shaped object stores no per-slot
-/// metadata, so the shape transition alone records the change; a previously
-/// overridden object keeps reading from its materialized metadata, which is
-/// updated in lockstep. Symbol-keyed slots (not part of the shape) mutate in
-/// place.
+/// attribute-encoding hidden class that records every slot as non-configurable
+/// and carries non-extensible state. Shape descriptors are the only ordinary
+/// attribute authority; symbol-keyed slots mutate through the retirement owner.
 pub(crate) fn seal_with_shape(obj: JsObject, heap: &mut otter_gc::GcHeap, new_shape: ShapeHandle) {
     heap.with_payload(obj, |body| {
-        body.set_extensible(false);
         debug_assert_object_shape_handle(new_shape, "shape-slot store");
-        body.invalidate_prototype_proofs();
-        body.shape = new_shape;
-        if let Some(exotic) = exotic_body_of(body.exotic.get()).map(|e|
-            // SAFETY: a non-null handle names a live sidecar payload.
-            unsafe { &mut *e })
-        {
-            for slot in slot_meta_body_of(exotic.slots)
-                // SAFETY: a non-null handle names a live table.
-                .map_or(&mut [][..], |table| unsafe { (*table).entries_mut() })
-                .iter_mut()
-            {
-                slot.flags = slot.flags.with_configurable(false);
-            }
-            for (key, slot) in symbol_props_body_of(exotic.symbol_props)
-                // SAFETY: a non-null handle names a live table.
-                .map_or(&mut [][..], |table| unsafe { (*table).entries_mut() })
-                .iter_mut()
-            {
-                // §6.2.12 — Private Name carriers are not properties.
-                if key.is_private_name() {
-                    continue;
-                }
-                slot.flags = slot.flags.with_configurable(false);
-            }
+        assert!(
+            !shape_body::state_of(new_shape).is_extensible(),
+            "integrity shape is non-extensible"
+        );
+        assert_eq!(
+            body.inline_capacity(),
+            shape_body::inline_capacity_of(new_shape),
+            "shape transition changed object footprint"
+        );
+        descriptor_mutation::apply_integrity_level(
+            body,
+            descriptor_mutation::IntegrityLevel::Sealed,
+        );
+        if body.shape != new_shape {
+            body.invalidate_prototype_proofs();
+            body.shape = new_shape;
         }
     });
     heap.record_write(obj, &new_shape);
@@ -6700,87 +6040,37 @@ pub(crate) fn seal_with_shape(obj: JsObject, heap: &mut otter_gc::GcHeap, new_sh
 ///
 /// # See also
 /// - <https://tc39.es/ecma262/#sec-setintegritylevel>
-pub fn freeze(obj: JsObject, heap: &mut otter_gc::GcHeap) {
-    // In-place fallback: materialize per-slot metadata first (see [`seal`]).
-    materialize_slots(obj, heap);
-    heap.with_payload(obj, |body| {
-        body.set_extensible(false);
-        if let Some(exotic) = exotic_body_of(body.exotic.get()).map(|e|
-            // SAFETY: a non-null handle names a live sidecar payload.
-            unsafe { &mut *e })
-        {
-            for slot in slot_meta_body_of(exotic.slots)
-                // SAFETY: a non-null handle names a live table.
-                .map_or(&mut [][..], |table| unsafe { (*table).entries_mut() })
-                .iter_mut()
-            {
-                slot.flags = slot.flags.with_configurable(false);
-                if !slot.is_accessor {
-                    slot.flags = slot.flags.with_writable(false);
-                }
-            }
-            for (key, slot) in symbol_props_body_of(exotic.symbol_props)
-                // SAFETY: a non-null handle names a live table.
-                .map_or(&mut [][..], |table| unsafe { (*table).entries_mut() })
-                .iter_mut()
-            {
-                // §6.2.12 — Private Name carriers are not properties.
-                if key.is_private_name() {
-                    continue;
-                }
-                slot.flags = slot.flags.with_configurable(false);
-                if slot.kind.is_data() {
-                    slot.flags = slot.flags.with_writable(false);
-                }
-            }
-        }
-    });
+pub fn freeze(obj: &mut JsObject, heap: &mut GcHeap) -> Result<(), otter_gc::OutOfMemory> {
+    integrity_transition::apply(obj, heap, descriptor_mutation::IntegrityLevel::Frozen)
 }
 
 /// `Object.freeze` for a shaped object, transitioning to `new_shape` — the
 /// attribute-encoding hidden class that records data slots as
-/// non-writable/non-configurable and accessor slots as non-configurable. A
-/// non-overridden shaped object stores no per-slot metadata (the shape
-/// transition records the change); a previously overridden object keeps its
-/// materialized metadata current. Symbol-keyed slots mutate in place.
+/// non-writable/non-configurable and accessor slots as non-configurable, with
+/// immutable non-extensible state. Symbols use the common retirement owner.
 pub(crate) fn freeze_with_shape(
     obj: JsObject,
     heap: &mut otter_gc::GcHeap,
     new_shape: ShapeHandle,
 ) {
     heap.with_payload(obj, |body| {
-        body.set_extensible(false);
         debug_assert_object_shape_handle(new_shape, "shape-slot store");
-        body.invalidate_prototype_proofs();
-        body.shape = new_shape;
-        if let Some(exotic) = exotic_body_of(body.exotic.get()).map(|e|
-            // SAFETY: a non-null handle names a live sidecar payload.
-            unsafe { &mut *e })
-        {
-            for slot in slot_meta_body_of(exotic.slots)
-                // SAFETY: a non-null handle names a live table.
-                .map_or(&mut [][..], |table| unsafe { (*table).entries_mut() })
-                .iter_mut()
-            {
-                slot.flags = slot.flags.with_configurable(false);
-                if !slot.is_accessor {
-                    slot.flags = slot.flags.with_writable(false);
-                }
-            }
-            for (key, slot) in symbol_props_body_of(exotic.symbol_props)
-                // SAFETY: a non-null handle names a live table.
-                .map_or(&mut [][..], |table| unsafe { (*table).entries_mut() })
-                .iter_mut()
-            {
-                // §6.2.12 — Private Name carriers are not properties.
-                if key.is_private_name() {
-                    continue;
-                }
-                slot.flags = slot.flags.with_configurable(false);
-                if slot.kind.is_data() {
-                    slot.flags = slot.flags.with_writable(false);
-                }
-            }
+        assert!(
+            !shape_body::state_of(new_shape).is_extensible(),
+            "integrity shape is non-extensible"
+        );
+        assert_eq!(
+            body.inline_capacity(),
+            shape_body::inline_capacity_of(new_shape),
+            "shape transition changed object footprint"
+        );
+        descriptor_mutation::apply_integrity_level(
+            body,
+            descriptor_mutation::IntegrityLevel::Frozen,
+        );
+        if body.shape != new_shape {
+            body.invalidate_prototype_proofs();
+            body.shape = new_shape;
         }
     });
     heap.record_write(obj, &new_shape);
@@ -6997,7 +6287,7 @@ pub(crate) fn dictionary_ordered_slot_attrs(
     heap: &otter_gc::GcHeap,
 ) -> Option<Vec<(String, PropertyFlags, bool)>> {
     heap.read_payload(obj, |body| {
-        if !body.is_dictionary() || !shape_cache::supports_fast_property_ic(body) {
+        if !body.is_dictionary() || body.state().is_opaque() {
             return None;
         }
         let count = body.dict_key_count();
@@ -7037,8 +6327,12 @@ pub(crate) fn adopt_fast_shape(obj: JsObject, heap: &mut otter_gc::GcHeap, shape
     );
     heap.with_payload(obj, |body| {
         body.invalidate_prototype_proofs();
+        assert_eq!(
+            body.inline_capacity(),
+            shape_body::inline_capacity_of(shape),
+            "shape transition changed object footprint"
+        );
         body.shape = shape;
-        body.set_slot_attrs_overridden(false);
         if let Some(exotic) = exotic_body_of(body.exotic.get()).map(|e|
             // SAFETY: a non-null handle names a live sidecar payload.
             unsafe { &mut *e })
@@ -7142,45 +6436,62 @@ fn materialized_slot_metas(heap: &otter_gc::GcHeap, body: &ObjectBody) -> Vec<Sl
         .collect()
 }
 
-/// Ensure per-slot metadata is materialized in [`ExoticSlots::slots`] and the
-/// object reads attributes from it (sets `slot_attrs_overridden`).
-///
-/// No-op when the object is already materialized — dictionary mode (null
-/// shape) or a prior override. Otherwise it snapshots the shaped object's
-/// per-slot attributes from the hidden class, so it must run *before* an
-/// in-place attribute mutation that does not transition the class
-/// (construction accessor→data overwrite, the no-shape `defineProperty` /
-/// `freeze` / `seal` fallbacks, `delete`).
-fn materialize_slots(obj: JsObject, heap: &mut otter_gc::GcHeap) {
-    let mut obj = obj;
-    materialize_slots_with_pending_values(&mut obj, heap, &mut []);
+/// Normalize a shaped object to its same-geometry dictionary companion before
+/// a no-shape descriptor mutation. Values stay in their existing field banks.
+fn materialize_slots(obj: &mut JsObject, heap: &mut GcHeap) -> Result<(), otter_gc::OutOfMemory> {
+    materialize_slots_with_pending_values(obj, heap, &mut [])
 }
 
-/// [`materialize_slots`], reflecting receiver relocation and tracing values
-/// which have not entered the object yet across sidecar/table allocation.
+/// Prepare dictionary tables with actual receiver/pending roots before one
+/// nonallocating publication. OOM leaves the old shape and descriptors intact.
 fn materialize_slots_with_pending_values(
     obj: &mut JsObject,
-    heap: &mut otter_gc::GcHeap,
+    heap: &mut GcHeap,
     pending: &mut [Value],
-) {
-    // The sidecar allocates, so it is reserved here, outside the payload
-    // borrow below. This may move `obj` and every pending cell value.
-    ensure_exotic_with_pending_values(obj, heap, pending).expect("exotic sidecar");
-    let metas = heap.read_payload(*obj, |body| {
-        (!body.slots_materialized()).then(|| materialized_slot_metas(heap, body))
+) -> Result<(), otter_gc::OutOfMemory> {
+    let Some((slots, keys)) = prepare_dictionary_tables(obj, heap, pending)? else {
+        return Ok(());
+    };
+    heap.with_payload(*obj, |body| {
+        body.enter_dictionary_mode(false);
+        body.exotic_mut().slots = slots;
+        body.exotic_mut().dictionary_keys = keys;
     });
-    if let Some(metas) = metas {
-        let metas_for_install = Some(metas);
-        let table = slot_meta_table_for_install(obj, heap, &metas_for_install, 0, pending)
-            .expect("slot meta table")
-            .expect("metas present");
-        heap.with_payload(*obj, |body| {
-            body.exotic_mut().slots = table;
-            body.set_slot_attrs_overridden(true);
-        });
-        let sidecar = heap.read_payload(*obj, |body| body.exotic.get());
-        heap.record_write(sidecar, &table);
+    let sidecar = heap.read_payload(*obj, |body| body.exotic.get());
+    heap.record_write(sidecar, &slots);
+    heap.record_write(sidecar, &keys);
+    Ok(())
+}
+
+/// Prepare same-geometry dictionary tables without publishing descriptor or
+/// storage state. The caller roots their returned handles before allocating.
+fn prepare_dictionary_tables(
+    obj: &mut JsObject,
+    heap: &mut GcHeap,
+    pending: &mut [Value],
+) -> Result<Option<(SlotMetaHandle, DictKeysHandle)>, otter_gc::OutOfMemory> {
+    if is_dictionary(*obj, heap) {
+        return Ok(None);
     }
+    ensure_exotic_with_pending_values(obj, heap, pending)?;
+    let (keys, metas, count) = heap.read_payload(*obj, |body| {
+        (
+            string_keys_in_shape_order(heap, body),
+            materialized_slot_metas(heap, body),
+            body_property_count(heap, body),
+        )
+    });
+    let mut slots = slot_meta_table_for_install(obj, heap, &Some(metas), count, pending)?
+        .expect("Some metadata always prepares a table");
+    let mut prepared = otter_gc::RootScope::new(heap);
+    // SAFETY: this stationary local precedes the scope and is returned without
+    // another allocation. The next key-table allocation may full-collect it.
+    unsafe {
+        prepared.add_raw_slot(std::ptr::addr_of_mut!(slots).cast::<RawGc>());
+    }
+    let keys = dict_keys_table_for_install(obj, heap, &Some(keys), "", pending)?
+        .expect("Some keys always prepare a table");
+    Ok(Some((slots, keys)))
 }
 
 fn order_string_key_entries(entries: Vec<(String, usize)>) -> Vec<(String, usize)> {
@@ -7306,17 +6617,20 @@ mod tests {
 
     #[test]
     fn jit_semantic_guard_layout_is_frozen() {
-        assert_eq!(OBJECT_CELL_FLAGS_BYTE, 2);
-        assert_eq!(OBJECT_CELL_INLINE_CAPACITY_BYTE, 3);
+        assert_eq!(std::mem::size_of::<ShapeState>(), 1);
         assert_eq!(OBJECT_BODY_EXOTIC_HANDLE_OFFSET, 8);
         assert_eq!(std::mem::size_of::<ExoticHandle>(), 4);
         let bits = [
-            ObjectFlags::EXTENSIBLE,
-            ObjectFlags::SLOT_ATTRS_OVERRIDDEN,
-            ObjectFlags::CHAIN_LINK_OPAQUE,
-            ObjectFlags::DICTIONARY_COMPATIBLE,
+            ShapeState::DICTIONARY_MASK,
+            ShapeState::EXTENSIBLE_MASK,
+            ShapeState::PROTOTYPE_MASK,
+            ShapeState::STRING_WRAPPER_MASK,
+            ShapeState::MAPPED_ARGUMENTS_MASK,
+            ShapeState::HOST_LOOKUP_MASK,
+            ShapeState::OPAQUE_PROTOTYPE_MASK,
+            ShapeState::PROVISIONAL_MASK,
         ];
-        assert_eq!(bits.iter().fold(0u8, |all, bit| all | bit).count_ones(), 4);
+        assert_eq!(bits.iter().fold(0u8, |all, bit| all | bit), u8::MAX);
         assert_eq!(object_cell_bytes(2), 40);
     }
 
@@ -7331,7 +6645,7 @@ mod tests {
 
     #[test]
     fn runtime_object_allocation_installs_shape_root() {
-        let mut interp = crate::Interpreter::new();
+        let mut interp = crate::Interpreter::new().expect("fixture interpreter bootstrap");
         let o = interp
             .alloc_runtime_rooted_object_with_roots(&[], &[])
             .expect("object");
@@ -7341,39 +6655,49 @@ mod tests {
 
     #[test]
     fn runtime_data_assignment_advances_shape() {
-        let mut interp = crate::Interpreter::new();
-        let o = interp
-            .alloc_runtime_rooted_object_with_roots(&[], &[])
-            .expect("object");
+        let mut interp = crate::Interpreter::new().expect("fixture interpreter bootstrap");
+        interp.with_handle_scope(|interp, scope| {
+            let receiver = interp.scoped_object_bare(scope).expect("object");
+            let o = interp
+                .escape_scoped(receiver)
+                .as_object()
+                .expect("object receiver");
 
-        assert!(
-            interp
-                .ordinary_set_data_property(o, "x", Value::boolean(true))
-                .expect("set")
-        );
+            assert!(
+                interp
+                    .ordinary_set_data_property(o, "x", Value::boolean(true))
+                    .expect("set")
+            );
 
-        let shape_handle = shape(o, interp.gc_heap());
-        assert_eq!(interp.shape_offset_of(shape_handle, "x"), Some(0));
-        assert_eq!(
-            interp
-                .gc_heap()
-                .read_payload(o, |body| body.dict_key_count()),
-            0
-        );
+            // Assignment takes a value copy; the handle remains the current
+            // receiver authority after a collecting hidden-class transition.
+            let o = interp
+                .escape_scoped(receiver)
+                .as_object()
+                .expect("current object receiver");
+            let shape_handle = shape(o, interp.gc_heap());
+            assert_eq!(interp.shape_offset_of(shape_handle, "x"), Some(0));
+            assert_eq!(
+                interp
+                    .gc_heap()
+                    .read_payload(o, |body| body.dict_key_count()),
+                0
+            );
+        });
     }
 
     #[test]
     fn runtime_construction_set_advances_shape() {
-        let mut interp = crate::Interpreter::new();
-        let o = interp
+        let mut interp = crate::Interpreter::new().expect("fixture interpreter bootstrap");
+        let mut o = interp
             .alloc_runtime_rooted_object_with_roots(&[], &[])
             .expect("object");
 
         interp
-            .set_property(o, "value", Value::number_i32(1))
+            .create_data_property(&mut o, "value", Value::number_i32(1))
             .expect("set value");
         interp
-            .set_property(o, "done", Value::boolean(false))
+            .create_data_property(&mut o, "done", Value::boolean(false))
             .expect("set done");
 
         let shape_handle = shape(o, interp.gc_heap());
@@ -7389,7 +6713,7 @@ mod tests {
 
     #[test]
     fn runtime_construction_set_preserves_slots_when_fast_shape_overflows() {
-        let mut interp = crate::Interpreter::new();
+        let mut interp = crate::Interpreter::new().expect("fixture interpreter bootstrap");
         let mut o = interp
             .alloc_runtime_rooted_object_with_roots(&[], &[])
             .expect("object");
@@ -7397,16 +6721,19 @@ mod tests {
         for i in 0..MAX_FAST_PROPERTIES {
             let key = format!("p{i}");
             interp
-                .set_property(o, &key, Value::number_i32(i as i32))
+                .create_data_property(&mut o, &key, Value::number_i32(i as i32))
                 .expect("set fast property");
         }
         assert!(!is_dictionary(o, interp.gc_heap()));
 
-        set(
-            &mut o,
-            interp.gc_heap_mut(),
-            "overflow",
-            Value::boolean(true),
+        assert!(
+            define_own_property_in_place(
+                &mut o,
+                interp.gc_heap_mut(),
+                "overflow",
+                PropertyDescriptor::data(Value::boolean(true), true, true, true)
+            )
+            .expect("fixture property allocation")
         );
 
         assert!(is_dictionary(o, interp.gc_heap()));
@@ -7432,7 +6759,7 @@ mod tests {
 
     #[test]
     fn dictionary_redefinition_retires_its_structural_id() {
-        let mut interp = crate::Interpreter::new();
+        let mut interp = crate::Interpreter::new().expect("fixture interpreter bootstrap");
         let mut prototype = interp
             .realm_intrinsics
             .string_prototype()
@@ -7443,11 +6770,14 @@ mod tests {
         );
         let original = shape_id(prototype, interp.gc_heap());
 
-        set(
-            &mut prototype,
-            interp.gc_heap_mut(),
-            "charCodeAt",
-            Value::number_i32(1),
+        assert!(
+            ordinary_set_data_property(
+                &mut prototype,
+                interp.gc_heap_mut(),
+                "charCodeAt",
+                Value::number_i32(1)
+            )
+            .expect("fixture assignment allocation")
         );
         assert_eq!(
             shape_id(prototype, interp.gc_heap()),
@@ -7455,12 +6785,15 @@ mod tests {
             "a same-slot value write keeps the key/slot/attribute layout"
         );
 
-        assert!(define_own_property(
-            prototype,
-            interp.gc_heap_mut(),
-            "charCodeAt",
-            PropertyDescriptor::data(Value::number_i32(2), false, false, true),
-        ));
+        assert!(
+            define_own_property(
+                prototype,
+                interp.gc_heap_mut(),
+                "charCodeAt",
+                PropertyDescriptor::data(Value::number_i32(2), false, false, true),
+            )
+            .expect("descriptor fixture allocation")
+        );
         assert_ne!(
             shape_id(prototype, interp.gc_heap()),
             original,
@@ -7470,13 +6803,13 @@ mod tests {
 
     #[test]
     fn shape_id_prefers_installed_shape() {
-        let mut interp = crate::Interpreter::new();
-        let o = interp
+        let mut interp = crate::Interpreter::new().expect("fixture interpreter bootstrap");
+        let mut o = interp
             .alloc_runtime_rooted_object_with_roots(&[], &[])
             .expect("object");
 
         interp
-            .set_property(o, "x", Value::boolean(true))
+            .create_data_property(&mut o, "x", Value::boolean(true))
             .expect("set x");
 
         let shape_handle = shape(o, interp.gc_heap());
@@ -7488,13 +6821,13 @@ mod tests {
 
     #[test]
     fn own_property_reads_prefer_installed_shape_offsets() {
-        let mut interp = crate::Interpreter::new();
+        let mut interp = crate::Interpreter::new().expect("fixture interpreter bootstrap");
         let mut o = interp
             .alloc_runtime_rooted_object_with_roots(&[], &[])
             .expect("object");
 
         interp
-            .set_property(o, "x", Value::boolean(true))
+            .create_data_property(&mut o, "x", Value::boolean(true))
             .expect("set x");
         interp.gc_heap_mut().with_payload(o, |body| {
             dict_clear_keys(body);
@@ -7515,7 +6848,10 @@ mod tests {
         });
         assert_eq!(keys, vec!["x"]);
 
-        set(&mut o, interp.gc_heap_mut(), "x", Value::boolean(false));
+        assert!(
+            ordinary_set_data_property(&mut o, interp.gc_heap_mut(), "x", Value::boolean(false))
+                .expect("fixture assignment allocation")
+        );
 
         assert_eq!(
             get_own(o, interp.gc_heap(), "x"),
@@ -7529,7 +6865,7 @@ mod tests {
 
     #[test]
     fn runtime_define_property_advances_shape() {
-        let mut interp = crate::Interpreter::new();
+        let mut interp = crate::Interpreter::new().expect("fixture interpreter bootstrap");
         let mut o = interp
             .alloc_runtime_rooted_object_with_roots(&[], &[])
             .expect("object");
@@ -7559,21 +6895,23 @@ mod tests {
 
     #[test]
     fn runtime_delete_invalidates_shape() {
-        let mut interp = crate::Interpreter::new();
-        let o = interp
+        let mut interp = crate::Interpreter::new().expect("fixture interpreter bootstrap");
+        let mut o = interp
             .alloc_runtime_rooted_object_with_roots(&[], &[])
             .expect("object");
 
         interp
-            .set_property(o, "a", Value::boolean(true))
+            .create_data_property(&mut o, "a", Value::boolean(true))
             .expect("set a");
-        interp.set_property(o, "b", Value::null()).expect("set b");
+        interp
+            .create_data_property(&mut o, "b", Value::null())
+            .expect("set b");
 
         let before = shape(o, interp.gc_heap());
         assert!(!before.is_null());
         assert_eq!(interp.shape_offset_of(before, "b"), Some(1));
 
-        assert!(delete(o, interp.gc_heap_mut(), "a"));
+        assert!(delete(&mut o, interp.gc_heap_mut(), "a").expect("delete fixture"));
 
         assert!(is_dictionary(o, interp.gc_heap()));
         assert!(get(o, interp.gc_heap(), "a").is_none());
@@ -7582,7 +6920,7 @@ mod tests {
 
     #[test]
     fn runtime_store_transition_invalidates_shape() {
-        let mut interp = crate::Interpreter::new();
+        let mut interp = crate::Interpreter::new().expect("fixture interpreter bootstrap");
         let key = AtomizedPropertyKey::new(
             crate::property_atom::PropertyAtom::new(AtomId::from_global(7)),
             "x",
@@ -7618,7 +6956,12 @@ mod tests {
                 second,
                 interp.gc_heap_mut(),
                 key,
-                &transition,
+                transition.from_shape_id,
+                transition.atom_id,
+                transition.to_shape_id,
+                || transition.to_shape.get(),
+                &transition.kind,
+                transition.slot,
                 &Value::null(),
             )
             .expect("transition replay allocation"),
@@ -7631,13 +6974,16 @@ mod tests {
 
     #[test]
     fn raw_set_invalidates_shape_for_new_property() {
-        let mut interp = crate::Interpreter::new();
+        let mut interp = crate::Interpreter::new().expect("fixture interpreter bootstrap");
         let mut o = interp
             .alloc_runtime_rooted_object_with_roots(&[], &[])
             .expect("object");
         assert_eq!(shape(o, interp.gc_heap()), interp.null_prototype_root());
 
-        set(&mut o, interp.gc_heap_mut(), "x", Value::boolean(true));
+        assert!(
+            ordinary_set_data_property(&mut o, interp.gc_heap_mut(), "x", Value::boolean(true))
+                .expect("fixture assignment allocation")
+        );
 
         assert!(is_dictionary(o, interp.gc_heap()));
         assert_eq!(
@@ -7648,18 +6994,16 @@ mod tests {
 
     #[test]
     fn raw_ordinary_set_invalidates_shape_for_new_property() {
-        let mut interp = crate::Interpreter::new();
-        let o = interp
+        let mut interp = crate::Interpreter::new().expect("fixture interpreter bootstrap");
+        let mut o = interp
             .alloc_runtime_rooted_object_with_roots(&[], &[])
             .expect("object");
         assert_eq!(shape(o, interp.gc_heap()), interp.null_prototype_root());
 
-        assert!(ordinary_set_data_property(
-            o,
-            interp.gc_heap_mut(),
-            "x",
-            Value::boolean(true)
-        ));
+        assert!(
+            ordinary_set_data_property(&mut o, interp.gc_heap_mut(), "x", Value::boolean(true))
+                .expect("fixture assignment allocation")
+        );
 
         assert!(is_dictionary(o, interp.gc_heap()));
         assert_eq!(
@@ -7670,18 +7014,21 @@ mod tests {
 
     #[test]
     fn raw_define_property_invalidates_shape_for_new_property() {
-        let mut interp = crate::Interpreter::new();
+        let mut interp = crate::Interpreter::new().expect("fixture interpreter bootstrap");
         let o = interp
             .alloc_runtime_rooted_object_with_roots(&[], &[])
             .expect("object");
         assert_eq!(shape(o, interp.gc_heap()), interp.null_prototype_root());
 
-        assert!(define_own_property(
-            o,
-            interp.gc_heap_mut(),
-            "x",
-            PropertyDescriptor::data(Value::boolean(true), true, true, true),
-        ));
+        assert!(
+            define_own_property(
+                o,
+                interp.gc_heap_mut(),
+                "x",
+                PropertyDescriptor::data(Value::boolean(true), true, true, true),
+            )
+            .expect("descriptor fixture allocation")
+        );
 
         assert!(is_dictionary(o, interp.gc_heap()));
         assert_eq!(
@@ -7692,7 +7039,7 @@ mod tests {
 
     #[test]
     fn raw_define_property_partial_invalidates_shape_for_new_property() {
-        let mut interp = crate::Interpreter::new();
+        let mut interp = crate::Interpreter::new().expect("fixture interpreter bootstrap");
         let mut o = interp
             .alloc_runtime_rooted_object_with_roots(&[], &[])
             .expect("object");
@@ -7705,12 +7052,10 @@ mod tests {
             ..PartialPropertyDescriptor::default()
         };
 
-        assert!(define_own_property_partial(
-            &mut o,
-            interp.gc_heap_mut(),
-            "x",
-            descriptor,
-        ));
+        assert!(
+            define_own_property_partial(&mut o, interp.gc_heap_mut(), "x", descriptor,)
+                .expect("descriptor fixture allocation")
+        );
 
         assert!(is_dictionary(o, interp.gc_heap()));
         assert_eq!(
@@ -7723,7 +7068,10 @@ mod tests {
     fn set_then_get_roundtrip() {
         let mut heap = fresh_heap();
         let mut o = alloc_object_old_for_fixture(&mut heap).unwrap();
-        set(&mut o, &mut heap, "x", Value::boolean(true));
+        assert!(
+            ordinary_set_data_property(&mut o, &mut heap, "x", Value::boolean(true))
+                .expect("fixture assignment allocation")
+        );
         assert!(get(o, &heap, "x").is_some_and(|v| v.as_boolean() == Some(true)));
     }
 
@@ -7731,7 +7079,15 @@ mod tests {
     fn atom_lookup_reports_shape_and_slot_metadata() {
         let mut heap = fresh_heap();
         let mut o = alloc_object_old_for_fixture(&mut heap).unwrap();
-        set(&mut o, &mut heap, "x", Value::boolean(true));
+        assert!(
+            define_own_property_in_place(
+                &mut o,
+                &mut heap,
+                "x",
+                PropertyDescriptor::data(Value::boolean(true), true, true, true)
+            )
+            .expect("fixture property allocation")
+        );
         let shape = shape_id(o, &heap);
         let key = AtomizedPropertyKey::new(
             crate::property_atom::PropertyAtom::new(AtomId::from_global(7)),
@@ -7744,8 +7100,8 @@ mod tests {
             hit.hit,
             Some(AtomOwnPropertyHit {
                 shape_id: shape,
-                // `set` of a new key moves the object to dictionary mode
-                // (null shape handle).
+                // Heap-only descriptor construction normalizes the object to
+                // dictionary mode (no keyed shape handle).
                 shape: ShapeHandle::null(),
                 atom_id: key.atom().id(),
                 slot: 0,
@@ -7762,7 +7118,15 @@ mod tests {
     fn atom_slot_guard_rejects_shape_change() {
         let mut heap = fresh_heap();
         let mut o = alloc_object_old_for_fixture(&mut heap).unwrap();
-        set(&mut o, &mut heap, "x", Value::boolean(true));
+        assert!(
+            define_own_property_in_place(
+                &mut o,
+                &mut heap,
+                "x",
+                PropertyDescriptor::data(Value::boolean(true), true, true, true)
+            )
+            .expect("fixture property allocation")
+        );
         let key = AtomizedPropertyKey::new(
             crate::property_atom::PropertyAtom::new(AtomId::from_global(7)),
             "x",
@@ -7773,7 +7137,15 @@ mod tests {
             Some(Value::boolean(true))
         );
 
-        set(&mut o, &mut heap, "y", Value::null());
+        assert!(
+            define_own_property_in_place(
+                &mut o,
+                &mut heap,
+                "y",
+                PropertyDescriptor::data(Value::null(), true, true, true)
+            )
+            .expect("fixture property allocation")
+        );
 
         assert_eq!(load_own_data_slot_atom(o, &heap, key, hit), None);
     }
@@ -7782,7 +7154,15 @@ mod tests {
     fn atom_slot_store_updates_guarded_data_slot() {
         let mut heap = fresh_heap();
         let mut o = alloc_object_old_for_fixture(&mut heap).unwrap();
-        set(&mut o, &mut heap, "x", Value::boolean(true));
+        assert!(
+            define_own_property_in_place(
+                &mut o,
+                &mut heap,
+                "x",
+                PropertyDescriptor::data(Value::boolean(true), true, true, true)
+            )
+            .expect("fixture property allocation")
+        );
         let key = AtomizedPropertyKey::new(
             crate::property_atom::PropertyAtom::new(AtomId::from_global(7)),
             "x",
@@ -7806,7 +7186,15 @@ mod tests {
             Some(1.25)
         );
 
-        set(&mut o, &mut heap, "y", Value::null());
+        assert!(
+            define_own_property_in_place(
+                &mut o,
+                &mut heap,
+                "y",
+                PropertyDescriptor::data(Value::null(), true, true, true)
+            )
+            .expect("fixture property allocation")
+        );
 
         let allocations_before_miss = total_allocations(&mut heap);
         assert_eq!(
@@ -7820,14 +7208,42 @@ mod tests {
         );
     }
 
+    /// Install one ordinary shape slot through the real transition owner.
+    /// Build the actual immutable append; the dictionary-only test helper
+    /// intentionally cannot supply this ordinary IC premise.
+    fn shaped_data_fixture(
+        object: JsObject,
+        heap: &mut otter_gc::GcHeap,
+        name: &str,
+        value: Value,
+    ) {
+        let atom = match name {
+            "own" => 6,
+            "x" => 7,
+            "y" => 8,
+            "z" => 9,
+            _ => panic!("fixture atom name"),
+        };
+        append_shaped_data_for_fixture(
+            object,
+            heap,
+            AtomizedPropertyKey::new(
+                crate::property_atom::PropertyAtom::new(AtomId::from_global(atom)),
+                name,
+            ),
+            value,
+        );
+    }
+
     #[test]
     fn raw_atom_add_transition_rejects_unshared_dictionary_shape() {
         let mut heap = fresh_heap();
         let proto = alloc_object_old_for_fixture(&mut heap).unwrap();
         let mut first = alloc_object_old_for_fixture(&mut heap).unwrap();
-        set_prototype(first, &mut heap, Some(proto));
-        // A raw key store moves each receiver to its own dictionary layout.
-        set(&mut first, &mut heap, "own", Value::null());
+        set_prototype(&mut first, &mut heap, Some(proto)).expect("set_prototype fixture");
+        // Install the proof on an ordinary receiver; the replay target below
+        // genuinely enters its own unshared dictionary layout.
+        shaped_data_fixture(first, &mut heap, "own", Value::null());
         let key = AtomizedPropertyKey::new(
             crate::property_atom::PropertyAtom::new(AtomId::from_global(7)),
             "x",
@@ -7841,15 +7257,34 @@ mod tests {
         ));
 
         let mut second = alloc_object_old_for_fixture(&mut heap).unwrap();
-        set_prototype(second, &mut heap, Some(proto));
-        set(&mut second, &mut heap, "own", Value::null());
+        set_prototype(&mut second, &mut heap, Some(proto)).expect("set_prototype fixture");
+        assert!(
+            define_own_property_in_place(
+                &mut second,
+                &mut heap,
+                "own",
+                PropertyDescriptor::data(Value::null(), true, true, true)
+            )
+            .expect("fixture property allocation")
+        );
+        assert!(is_dictionary(second, &heap));
+        assert_eq!(get_own(second, &heap, "own"), Some(Value::null()));
+        assert!(
+            capture_store_property_transition(second, &mut heap, key, &Value::null()).is_none(),
+            "an unshared dictionary cannot supply a new ordinary transition"
+        );
 
         assert_eq!(
             replay_store_property_transition(
                 second,
                 &mut heap,
                 key,
-                &transition,
+                transition.from_shape_id,
+                transition.atom_id,
+                transition.to_shape_id,
+                || transition.to_shape.get(),
+                &transition.kind,
+                transition.slot,
                 &Value::boolean(false),
             )
             .expect("transition replay allocation"),
@@ -7862,8 +7297,8 @@ mod tests {
     fn atom_add_transition_rejects_changed_direct_prototype_shape() {
         let mut heap = fresh_heap();
         let mut proto = alloc_object_old_for_fixture(&mut heap).unwrap();
-        let first = alloc_object_old_for_fixture(&mut heap).unwrap();
-        set_prototype(first, &mut heap, Some(proto));
+        let mut first = alloc_object_old_for_fixture(&mut heap).unwrap();
+        set_prototype(&mut first, &mut heap, Some(proto)).expect("set_prototype fixture");
         let key = AtomizedPropertyKey::new(
             crate::property_atom::PropertyAtom::new(AtomId::from_global(7)),
             "x",
@@ -7871,10 +7306,18 @@ mod tests {
         let transition =
             capture_store_property_transition(first, &mut heap, key, &Value::boolean(true))
                 .expect("transition install");
-        set(&mut proto, &mut heap, "x", Value::null());
+        assert!(
+            define_own_property_in_place(
+                &mut proto,
+                &mut heap,
+                "x",
+                PropertyDescriptor::data(Value::null(), true, true, true)
+            )
+            .expect("fixture property allocation")
+        );
 
-        let second = alloc_object_old_for_fixture(&mut heap).unwrap();
-        set_prototype(second, &mut heap, Some(proto));
+        let mut second = alloc_object_old_for_fixture(&mut heap).unwrap();
+        set_prototype(&mut second, &mut heap, Some(proto)).expect("set_prototype fixture");
 
         let allocations_before_miss = total_allocations(&mut heap);
         assert_eq!(
@@ -7882,7 +7325,12 @@ mod tests {
                 second,
                 &mut heap,
                 key,
-                &transition,
+                transition.from_shape_id,
+                transition.atom_id,
+                transition.to_shape_id,
+                || transition.to_shape.get(),
+                &transition.kind,
+                transition.slot,
                 &Value::number_f64(1.25),
             )
             .expect("transition replay allocation"),
@@ -7898,9 +7346,9 @@ mod tests {
     #[test]
     fn atom_add_transition_rejects_deeper_prototype_after_mutation() {
         let mut heap = fresh_heap();
-        let proto = alloc_object_old_for_fixture(&mut heap).unwrap();
-        let first = alloc_object_old_for_fixture(&mut heap).unwrap();
-        set_prototype(first, &mut heap, Some(proto));
+        let mut proto = alloc_object_old_for_fixture(&mut heap).unwrap();
+        let mut first = alloc_object_old_for_fixture(&mut heap).unwrap();
+        set_prototype(&mut first, &mut heap, Some(proto)).expect("set_prototype fixture");
         let key = AtomizedPropertyKey::new(
             crate::property_atom::PropertyAtom::new(AtomId::from_global(7)),
             "x",
@@ -7909,17 +7357,22 @@ mod tests {
             capture_store_property_transition(first, &mut heap, key, &Value::boolean(true))
                 .expect("transition install");
         let deep_proto = alloc_object_old_for_fixture(&mut heap).unwrap();
-        set_prototype(proto, &mut heap, Some(deep_proto));
+        set_prototype(&mut proto, &mut heap, Some(deep_proto)).expect("set_prototype fixture");
 
-        let second = alloc_object_old_for_fixture(&mut heap).unwrap();
-        set_prototype(second, &mut heap, Some(proto));
+        let mut second = alloc_object_old_for_fixture(&mut heap).unwrap();
+        set_prototype(&mut second, &mut heap, Some(proto)).expect("set_prototype fixture");
 
         assert_eq!(
             replay_store_property_transition(
                 second,
                 &mut heap,
                 key,
-                &transition,
+                transition.from_shape_id,
+                transition.atom_id,
+                transition.to_shape_id,
+                || transition.to_shape.get(),
+                &transition.kind,
+                transition.slot,
                 &Value::boolean(false),
             )
             .expect("transition replay allocation"),
@@ -7931,11 +7384,13 @@ mod tests {
     fn raw_atom_add_transition_rejects_unshared_inherited_dictionary_shape() {
         let mut heap = fresh_heap();
         let mut proto = alloc_object_old_for_fixture(&mut heap).unwrap();
-        set(&mut proto, &mut heap, "x", Value::boolean(true));
+        shaped_data_fixture(proto, &mut heap, "x", Value::boolean(true));
         let mut first = alloc_object_old_for_fixture(&mut heap).unwrap();
-        set_prototype(first, &mut heap, Some(proto));
-        // A raw key store moves each receiver to its own dictionary layout.
-        set(&mut first, &mut heap, "own", Value::null());
+        set_prototype(&mut first, &mut heap, Some(proto)).expect("set_prototype fixture");
+        // Install the proof on an ordinary receiver; the replay target below
+        // genuinely enters its own unshared dictionary layout.
+        shaped_data_fixture(first, &mut heap, "own", Value::null());
+        let source = shape(first, &heap);
         let key = AtomizedPropertyKey::new(
             crate::property_atom::PropertyAtom::new(AtomId::from_global(7)),
             "x",
@@ -7948,13 +7403,51 @@ mod tests {
             StorePropertyTransitionKind::DirectPrototypeWritableData { .. }
         ));
 
-        let mut second = alloc_object_old_for_fixture(&mut heap).unwrap();
-        set_prototype(second, &mut heap, Some(proto));
-        set(&mut second, &mut heap, "own", Value::null());
+        let mut second = alloc_object_old(&mut heap, source).expect("same actual ordinary shape");
+        assert!(
+            define_own_property_in_place(
+                &mut second,
+                &mut heap,
+                "own",
+                PropertyDescriptor::data(Value::null(), true, true, true)
+            )
+            .expect("fixture property allocation")
+        );
+        assert_eq!(
+            shape_id(second, &heap),
+            transition.from_shape_id,
+            "the receiver still satisfies the original ordinary shape proof"
+        );
+        assert!(
+            define_own_property_in_place(
+                &mut proto,
+                &mut heap,
+                "dictionary-marker",
+                PropertyDescriptor::data(Value::null(), true, true, true)
+            )
+            .expect("fixture property allocation")
+        );
+        assert!(is_dictionary(proto, &heap));
+        assert!(!is_dictionary(second, &heap));
+        assert!(
+            capture_store_property_transition(second, &mut heap, key, &Value::null()).is_none(),
+            "an inherited dictionary cannot supply a new ordinary transition"
+        );
 
         assert_eq!(
-            replay_store_property_transition(second, &mut heap, key, &transition, &Value::null(),)
-                .expect("transition replay allocation"),
+            replay_store_property_transition(
+                second,
+                &mut heap,
+                key,
+                transition.from_shape_id,
+                transition.atom_id,
+                transition.to_shape_id,
+                || transition.to_shape.get(),
+                &transition.kind,
+                transition.slot,
+                &Value::null(),
+            )
+            .expect("transition replay allocation"),
             None
         );
         assert_eq!(get_own(second, &heap, "x"), None);
@@ -7964,10 +7457,10 @@ mod tests {
     #[test]
     fn atom_add_transition_rejects_inherited_data_after_writable_change() {
         let mut heap = fresh_heap();
-        let mut proto = alloc_object_old_for_fixture(&mut heap).unwrap();
-        set(&mut proto, &mut heap, "x", Value::boolean(true));
-        let first = alloc_object_old_for_fixture(&mut heap).unwrap();
-        set_prototype(first, &mut heap, Some(proto));
+        let proto = alloc_object_old_for_fixture(&mut heap).unwrap();
+        shaped_data_fixture(proto, &mut heap, "x", Value::boolean(true));
+        let mut first = alloc_object_old_for_fixture(&mut heap).unwrap();
+        set_prototype(&mut first, &mut heap, Some(proto)).expect("set_prototype fixture");
         let key = AtomizedPropertyKey::new(
             crate::property_atom::PropertyAtom::new(AtomId::from_global(7)),
             "x",
@@ -7975,19 +7468,33 @@ mod tests {
         let transition =
             capture_store_property_transition(first, &mut heap, key, &Value::boolean(false))
                 .expect("transition install");
-        assert!(define_own_property(
-            proto,
-            &mut heap,
-            "x",
-            PropertyDescriptor::data(Value::boolean(true), false, true, true),
-        ));
+        assert!(
+            define_own_property(
+                proto,
+                &mut heap,
+                "x",
+                PropertyDescriptor::data(Value::boolean(true), false, true, true),
+            )
+            .expect("descriptor fixture allocation")
+        );
 
-        let second = alloc_object_old_for_fixture(&mut heap).unwrap();
-        set_prototype(second, &mut heap, Some(proto));
+        let mut second = alloc_object_old_for_fixture(&mut heap).unwrap();
+        set_prototype(&mut second, &mut heap, Some(proto)).expect("set_prototype fixture");
 
         assert_eq!(
-            replay_store_property_transition(second, &mut heap, key, &transition, &Value::null(),)
-                .expect("transition replay allocation"),
+            replay_store_property_transition(
+                second,
+                &mut heap,
+                key,
+                transition.from_shape_id,
+                transition.atom_id,
+                transition.to_shape_id,
+                || transition.to_shape.get(),
+                &transition.kind,
+                transition.slot,
+                &Value::null(),
+            )
+            .expect("transition replay allocation"),
             None
         );
     }
@@ -7996,14 +7503,17 @@ mod tests {
     fn atom_add_transition_rejects_inherited_non_writable_data() {
         let mut heap = fresh_heap();
         let proto = alloc_object_old_for_fixture(&mut heap).unwrap();
-        assert!(define_own_property(
-            proto,
-            &mut heap,
-            "x",
-            PropertyDescriptor::data(Value::boolean(true), false, true, true),
-        ));
-        let receiver = alloc_object_old_for_fixture(&mut heap).unwrap();
-        set_prototype(receiver, &mut heap, Some(proto));
+        assert!(
+            define_own_property(
+                proto,
+                &mut heap,
+                "x",
+                PropertyDescriptor::data(Value::boolean(true), false, true, true),
+            )
+            .expect("descriptor fixture allocation")
+        );
+        let mut receiver = alloc_object_old_for_fixture(&mut heap).unwrap();
+        set_prototype(&mut receiver, &mut heap, Some(proto)).expect("set_prototype fixture");
         let key = AtomizedPropertyKey::new(
             crate::property_atom::PropertyAtom::new(AtomId::from_global(7)),
             "x",
@@ -8020,9 +7530,15 @@ mod tests {
         let mut heap = fresh_heap();
         let mut o = alloc_object_old_for_fixture(&mut heap).unwrap();
         let empty = shape_id(o, &heap);
-        set(&mut o, &mut heap, "x", Value::boolean(true));
+        assert!(
+            ordinary_set_data_property(&mut o, &mut heap, "x", Value::boolean(true))
+                .expect("fixture assignment allocation")
+        );
         let with_x = shape_id(o, &heap);
-        set(&mut o, &mut heap, "x", Value::boolean(false));
+        assert!(
+            ordinary_set_data_property(&mut o, &mut heap, "x", Value::boolean(false))
+                .expect("fixture assignment allocation")
+        );
 
         assert_ne!(empty, with_x);
         assert_eq!(shape_id(o, &heap), with_x);
@@ -8039,9 +7555,33 @@ mod tests {
     fn insertion_order_is_preserved() {
         let mut heap = fresh_heap();
         let mut o = alloc_object_old_for_fixture(&mut heap).unwrap();
-        set(&mut o, &mut heap, "a", Value::boolean(true));
-        set(&mut o, &mut heap, "b", Value::boolean(false));
-        set(&mut o, &mut heap, "c", Value::null());
+        assert!(
+            define_own_property_in_place(
+                &mut o,
+                &mut heap,
+                "a",
+                PropertyDescriptor::data(Value::boolean(true), true, true, true)
+            )
+            .expect("fixture property allocation")
+        );
+        assert!(
+            define_own_property_in_place(
+                &mut o,
+                &mut heap,
+                "b",
+                PropertyDescriptor::data(Value::boolean(false), true, true, true)
+            )
+            .expect("fixture property allocation")
+        );
+        assert!(
+            define_own_property_in_place(
+                &mut o,
+                &mut heap,
+                "c",
+                PropertyDescriptor::data(Value::null(), true, true, true)
+            )
+            .expect("fixture property allocation")
+        );
         let keys: Vec<String> =
             with_properties(o, &heap, |p| p.keys().map(str::to_string).collect());
         assert_eq!(keys, vec!["a", "b", "c"]);
@@ -8051,13 +7591,69 @@ mod tests {
     fn integer_index_keys_sort_before_strings() {
         let mut heap = fresh_heap();
         let mut o = alloc_object_old_for_fixture(&mut heap).unwrap();
-        set(&mut o, &mut heap, "b", Value::boolean(true));
-        set(&mut o, &mut heap, "10", Value::boolean(true));
-        set(&mut o, &mut heap, "2", Value::boolean(true));
-        set(&mut o, &mut heap, "a", Value::boolean(true));
-        set(&mut o, &mut heap, "1", Value::boolean(true));
-        set(&mut o, &mut heap, "01", Value::boolean(true));
-        set(&mut o, &mut heap, "4294967295", Value::boolean(true));
+        assert!(
+            define_own_property_in_place(
+                &mut o,
+                &mut heap,
+                "b",
+                PropertyDescriptor::data(Value::boolean(true), true, true, true)
+            )
+            .expect("fixture property allocation")
+        );
+        assert!(
+            define_own_property_in_place(
+                &mut o,
+                &mut heap,
+                "10",
+                PropertyDescriptor::data(Value::boolean(true), true, true, true)
+            )
+            .expect("fixture property allocation")
+        );
+        assert!(
+            define_own_property_in_place(
+                &mut o,
+                &mut heap,
+                "2",
+                PropertyDescriptor::data(Value::boolean(true), true, true, true)
+            )
+            .expect("fixture property allocation")
+        );
+        assert!(
+            define_own_property_in_place(
+                &mut o,
+                &mut heap,
+                "a",
+                PropertyDescriptor::data(Value::boolean(true), true, true, true)
+            )
+            .expect("fixture property allocation")
+        );
+        assert!(
+            define_own_property_in_place(
+                &mut o,
+                &mut heap,
+                "1",
+                PropertyDescriptor::data(Value::boolean(true), true, true, true)
+            )
+            .expect("fixture property allocation")
+        );
+        assert!(
+            define_own_property_in_place(
+                &mut o,
+                &mut heap,
+                "01",
+                PropertyDescriptor::data(Value::boolean(true), true, true, true)
+            )
+            .expect("fixture property allocation")
+        );
+        assert!(
+            define_own_property_in_place(
+                &mut o,
+                &mut heap,
+                "4294967295",
+                PropertyDescriptor::data(Value::boolean(true), true, true, true)
+            )
+            .expect("fixture property allocation")
+        );
 
         let keys: Vec<String> =
             with_properties(o, &heap, |p| p.keys().map(str::to_string).collect());
@@ -8068,12 +7664,20 @@ mod tests {
     fn delete_removes_property() {
         let mut heap = fresh_heap();
         let mut o = alloc_object_old_for_fixture(&mut heap).unwrap();
-        set(&mut o, &mut heap, "x", Value::boolean(true));
-        assert!(delete(o, &mut heap, "x"));
+        assert!(
+            define_own_property_in_place(
+                &mut o,
+                &mut heap,
+                "x",
+                PropertyDescriptor::data(Value::boolean(true), true, true, true)
+            )
+            .expect("fixture property allocation")
+        );
+        assert!(delete(&mut o, &mut heap, "x").expect("delete fixture"));
         assert!(get(o, &heap, "x").is_none());
         // §10.1.10 — deleting a missing property still reports
         // success (returns true).
-        assert!(delete(o, &mut heap, "x"));
+        assert!(delete(&mut o, &mut heap, "x").expect("delete fixture"));
     }
 
     #[test]
@@ -8081,7 +7685,15 @@ mod tests {
         let mut heap = fresh_heap();
         let mut a = alloc_object_old_for_fixture(&mut heap).unwrap();
         let b = a; // Copy
-        set(&mut a, &mut heap, "x", Value::boolean(true));
+        assert!(
+            define_own_property_in_place(
+                &mut a,
+                &mut heap,
+                "x",
+                PropertyDescriptor::data(Value::boolean(true), true, true, true)
+            )
+            .expect("fixture property allocation")
+        );
         assert_eq!(a, b);
         assert!(get(b, &heap, "x").is_some_and(|v| v.as_boolean() == Some(true)));
     }
@@ -8139,42 +7751,102 @@ mod tests {
     fn overwrite_does_not_grow_shape() {
         let mut heap = fresh_heap();
         let mut o = alloc_object_old_for_fixture(&mut heap).unwrap();
-        set(&mut o, &mut heap, "x", Value::boolean(true));
+        assert!(
+            define_own_property_in_place(
+                &mut o,
+                &mut heap,
+                "x",
+                PropertyDescriptor::data(Value::boolean(true), true, true, true)
+            )
+            .expect("fixture property allocation")
+        );
         let s1 = shape_id(o, &heap);
-        set(&mut o, &mut heap, "x", Value::null());
+        assert!(
+            ordinary_set_data_property(&mut o, &mut heap, "x", Value::null())
+                .expect("fixture assignment allocation")
+        );
         let s2 = shape_id(o, &heap);
         assert_eq!(s1, s2);
         assert_eq!(len(o, &heap), 1);
     }
 
     #[test]
-    fn delete_switches_to_dictionary_shape() {
-        let mut heap = fresh_heap();
-        let mut o = alloc_object_old_for_fixture(&mut heap).unwrap();
-        set(&mut o, &mut heap, "a", Value::boolean(true));
-        set(&mut o, &mut heap, "b", Value::null());
-        let before = shape_id(o, &heap);
-        assert!(supports_fast_property_ic(o, &heap));
-        delete(o, &mut heap, "a");
-        let after = shape_id(o, &heap);
-        assert_ne!(before, after);
-        assert!(!supports_fast_property_ic(o, &heap));
-        assert_eq!(len(o, &heap), 1);
-        assert!(get(o, &heap, "a").is_none());
-        assert!(get(o, &heap, "b").is_some_and(|v| v.is_null()));
+    fn middle_delete_normalizes_and_migration_restores_ordinary_eligibility() {
+        let mut interp = crate::Interpreter::new().expect("fixture interpreter bootstrap");
+        let mut o = alloc_object_old_for_fixture(interp.gc_heap_mut()).unwrap();
+        interp
+            .create_data_property(&mut o, "a", Value::boolean(true))
+            .unwrap();
+        interp
+            .create_data_property(&mut o, "b", Value::null())
+            .unwrap();
+        let before = shape_id(o, interp.gc_heap());
+        assert!(supports_fast_property_ic(o, interp.gc_heap()));
+        assert!(delete(&mut o, interp.gc_heap_mut(), "a").expect("middle delete"));
+        assert_ne!(shape_id(o, interp.gc_heap()), before);
+        assert!(!supports_fast_property_ic(o, interp.gc_heap()));
+        assert_eq!(len(o, interp.gc_heap()), 1);
+        assert!(get(o, interp.gc_heap(), "a").is_none());
+        assert!(get(o, interp.gc_heap(), "b").is_some_and(|v| v.is_null()));
+        interp.migrate_slow_to_fast(&mut o);
+        assert!(
+            supports_fast_property_ic(o, interp.gc_heap()),
+            "delete leaves no permanent eligibility latch"
+        );
+        assert_eq!(get(o, interp.gc_heap(), "b"), Some(Value::null()));
     }
 
     #[test]
     fn delete_middle_preserves_later_dictionary_offsets() {
         let mut heap = fresh_heap();
         let mut o = alloc_object_old_for_fixture(&mut heap).unwrap();
-        set(&mut o, &mut heap, "locale", Value::number_i32(1));
-        set(&mut o, &mut heap, "style", Value::number_i32(2));
-        set(&mut o, &mut heap, "type", Value::number_i32(3));
-        set(&mut o, &mut heap, "fallback", Value::number_i32(4));
-        set(&mut o, &mut heap, "languageDisplay", Value::number_i32(5));
+        assert!(
+            define_own_property_in_place(
+                &mut o,
+                &mut heap,
+                "locale",
+                PropertyDescriptor::data(Value::number_i32(1), true, true, true)
+            )
+            .expect("fixture property allocation")
+        );
+        assert!(
+            define_own_property_in_place(
+                &mut o,
+                &mut heap,
+                "style",
+                PropertyDescriptor::data(Value::number_i32(2), true, true, true)
+            )
+            .expect("fixture property allocation")
+        );
+        assert!(
+            define_own_property_in_place(
+                &mut o,
+                &mut heap,
+                "type",
+                PropertyDescriptor::data(Value::number_i32(3), true, true, true)
+            )
+            .expect("fixture property allocation")
+        );
+        assert!(
+            define_own_property_in_place(
+                &mut o,
+                &mut heap,
+                "fallback",
+                PropertyDescriptor::data(Value::number_i32(4), true, true, true)
+            )
+            .expect("fixture property allocation")
+        );
+        assert!(
+            define_own_property_in_place(
+                &mut o,
+                &mut heap,
+                "languageDisplay",
+                PropertyDescriptor::data(Value::number_i32(5), true, true, true)
+            )
+            .expect("fixture property allocation")
+        );
 
-        assert!(delete(o, &mut heap, "style"));
+        assert!(delete(&mut o, &mut heap, "style").expect("delete fixture"));
 
         assert!(get(o, &heap, "style").is_none());
         assert_eq!(
@@ -8195,15 +7867,61 @@ mod tests {
     fn overwrite_then_delete_middle_preserves_later_dictionary_offsets() {
         let mut heap = fresh_heap();
         let mut o = alloc_object_old_for_fixture(&mut heap).unwrap();
-        set(&mut o, &mut heap, "locale", Value::number_i32(1));
-        set(&mut o, &mut heap, "style", Value::number_i32(2));
-        set(&mut o, &mut heap, "type", Value::number_i32(3));
-        set(&mut o, &mut heap, "fallback", Value::number_i32(4));
-        set(&mut o, &mut heap, "languageDisplay", Value::number_i32(5));
+        assert!(
+            define_own_property_in_place(
+                &mut o,
+                &mut heap,
+                "locale",
+                PropertyDescriptor::data(Value::number_i32(1), true, true, true)
+            )
+            .expect("fixture property allocation")
+        );
+        assert!(
+            define_own_property_in_place(
+                &mut o,
+                &mut heap,
+                "style",
+                PropertyDescriptor::data(Value::number_i32(2), true, true, true)
+            )
+            .expect("fixture property allocation")
+        );
+        assert!(
+            define_own_property_in_place(
+                &mut o,
+                &mut heap,
+                "type",
+                PropertyDescriptor::data(Value::number_i32(3), true, true, true)
+            )
+            .expect("fixture property allocation")
+        );
+        assert!(
+            define_own_property_in_place(
+                &mut o,
+                &mut heap,
+                "fallback",
+                PropertyDescriptor::data(Value::number_i32(4), true, true, true)
+            )
+            .expect("fixture property allocation")
+        );
+        assert!(
+            define_own_property_in_place(
+                &mut o,
+                &mut heap,
+                "languageDisplay",
+                PropertyDescriptor::data(Value::number_i32(5), true, true, true)
+            )
+            .expect("fixture property allocation")
+        );
 
-        set(&mut o, &mut heap, "style", Value::number_i32(20));
-        set(&mut o, &mut heap, "style", Value::number_i32(2));
-        assert!(delete(o, &mut heap, "style"));
+        assert!(
+            ordinary_set_data_property(&mut o, &mut heap, "style", Value::number_i32(20))
+                .expect("fixture assignment allocation")
+        );
+        assert!(
+            ordinary_set_data_property(&mut o, &mut heap, "style", Value::number_i32(2))
+                .expect("fixture assignment allocation")
+        );
+        assert!(delete(&mut o, &mut heap, "style").expect("delete fixture"));
 
         assert!(get(o, &heap, "style").is_none());
         assert_eq!(
@@ -8224,13 +7942,53 @@ mod tests {
     fn sequential_middle_deletes_preserve_later_dictionary_offsets() {
         let mut heap = fresh_heap();
         let mut o = alloc_object_old_for_fixture(&mut heap).unwrap();
-        set(&mut o, &mut heap, "locale", Value::number_i32(1));
-        set(&mut o, &mut heap, "style", Value::number_i32(2));
-        set(&mut o, &mut heap, "type", Value::number_i32(3));
-        set(&mut o, &mut heap, "fallback", Value::number_i32(4));
-        set(&mut o, &mut heap, "languageDisplay", Value::number_i32(5));
+        assert!(
+            define_own_property_in_place(
+                &mut o,
+                &mut heap,
+                "locale",
+                PropertyDescriptor::data(Value::number_i32(1), true, true, true)
+            )
+            .expect("fixture property allocation")
+        );
+        assert!(
+            define_own_property_in_place(
+                &mut o,
+                &mut heap,
+                "style",
+                PropertyDescriptor::data(Value::number_i32(2), true, true, true)
+            )
+            .expect("fixture property allocation")
+        );
+        assert!(
+            define_own_property_in_place(
+                &mut o,
+                &mut heap,
+                "type",
+                PropertyDescriptor::data(Value::number_i32(3), true, true, true)
+            )
+            .expect("fixture property allocation")
+        );
+        assert!(
+            define_own_property_in_place(
+                &mut o,
+                &mut heap,
+                "fallback",
+                PropertyDescriptor::data(Value::number_i32(4), true, true, true)
+            )
+            .expect("fixture property allocation")
+        );
+        assert!(
+            define_own_property_in_place(
+                &mut o,
+                &mut heap,
+                "languageDisplay",
+                PropertyDescriptor::data(Value::number_i32(5), true, true, true)
+            )
+            .expect("fixture property allocation")
+        );
 
-        assert!(delete(o, &mut heap, "style"));
+        assert!(delete(&mut o, &mut heap, "style").expect("delete fixture"));
         assert_eq!(
             get(o, &heap, "type").and_then(|v| v.as_number()),
             Some(NumberValue::from_i32(3))
@@ -8239,7 +7997,7 @@ mod tests {
             get(o, &heap, "fallback").and_then(|v| v.as_number()),
             Some(NumberValue::from_i32(4))
         );
-        assert!(delete(o, &mut heap, "type"));
+        assert!(delete(&mut o, &mut heap, "type").expect("delete fixture"));
 
         assert!(get(o, &heap, "style").is_none());
         assert!(get(o, &heap, "type").is_none());
@@ -8257,13 +8015,45 @@ mod tests {
     fn sequential_middle_deletes_preserve_later_offsets_without_tail_optional() {
         let mut heap = fresh_heap();
         let mut o = alloc_object_old_for_fixture(&mut heap).unwrap();
-        set(&mut o, &mut heap, "locale", Value::number_i32(1));
-        set(&mut o, &mut heap, "style", Value::number_i32(2));
-        set(&mut o, &mut heap, "type", Value::number_i32(3));
-        set(&mut o, &mut heap, "fallback", Value::number_i32(4));
+        assert!(
+            define_own_property_in_place(
+                &mut o,
+                &mut heap,
+                "locale",
+                PropertyDescriptor::data(Value::number_i32(1), true, true, true)
+            )
+            .expect("fixture property allocation")
+        );
+        assert!(
+            define_own_property_in_place(
+                &mut o,
+                &mut heap,
+                "style",
+                PropertyDescriptor::data(Value::number_i32(2), true, true, true)
+            )
+            .expect("fixture property allocation")
+        );
+        assert!(
+            define_own_property_in_place(
+                &mut o,
+                &mut heap,
+                "type",
+                PropertyDescriptor::data(Value::number_i32(3), true, true, true)
+            )
+            .expect("fixture property allocation")
+        );
+        assert!(
+            define_own_property_in_place(
+                &mut o,
+                &mut heap,
+                "fallback",
+                PropertyDescriptor::data(Value::number_i32(4), true, true, true)
+            )
+            .expect("fixture property allocation")
+        );
 
-        assert!(delete(o, &mut heap, "style"));
-        assert!(delete(o, &mut heap, "type"));
+        assert!(delete(&mut o, &mut heap, "style").expect("delete fixture"));
+        assert!(delete(&mut o, &mut heap, "type").expect("delete fixture"));
 
         assert!(get(o, &heap, "style").is_none());
         assert!(get(o, &heap, "type").is_none());
@@ -8277,19 +8067,57 @@ mod tests {
     fn overwrite_between_middle_deletes_preserves_later_dictionary_offsets() {
         let mut heap = fresh_heap();
         let mut o = alloc_object_old_for_fixture(&mut heap).unwrap();
-        set(&mut o, &mut heap, "locale", Value::number_i32(1));
-        set(&mut o, &mut heap, "style", Value::number_i32(2));
-        set(&mut o, &mut heap, "type", Value::number_i32(3));
-        set(&mut o, &mut heap, "fallback", Value::number_i32(4));
+        assert!(
+            define_own_property_in_place(
+                &mut o,
+                &mut heap,
+                "locale",
+                PropertyDescriptor::data(Value::number_i32(1), true, true, true)
+            )
+            .expect("fixture property allocation")
+        );
+        assert!(
+            define_own_property_in_place(
+                &mut o,
+                &mut heap,
+                "style",
+                PropertyDescriptor::data(Value::number_i32(2), true, true, true)
+            )
+            .expect("fixture property allocation")
+        );
+        assert!(
+            define_own_property_in_place(
+                &mut o,
+                &mut heap,
+                "type",
+                PropertyDescriptor::data(Value::number_i32(3), true, true, true)
+            )
+            .expect("fixture property allocation")
+        );
+        assert!(
+            define_own_property_in_place(
+                &mut o,
+                &mut heap,
+                "fallback",
+                PropertyDescriptor::data(Value::number_i32(4), true, true, true)
+            )
+            .expect("fixture property allocation")
+        );
 
-        assert!(delete(o, &mut heap, "style"));
-        set(&mut o, &mut heap, "type", Value::number_i32(30));
-        set(&mut o, &mut heap, "type", Value::number_i32(3));
+        assert!(delete(&mut o, &mut heap, "style").expect("delete fixture"));
+        assert!(
+            ordinary_set_data_property(&mut o, &mut heap, "type", Value::number_i32(30))
+                .expect("fixture assignment allocation")
+        );
+        assert!(
+            ordinary_set_data_property(&mut o, &mut heap, "type", Value::number_i32(3))
+                .expect("fixture assignment allocation")
+        );
         assert_eq!(
             get(o, &heap, "fallback").and_then(|v| v.as_number()),
             Some(NumberValue::from_i32(4))
         );
-        assert!(delete(o, &mut heap, "type"));
+        assert!(delete(&mut o, &mut heap, "type").expect("delete fixture"));
 
         assert!(get(o, &heap, "style").is_none());
         assert!(get(o, &heap, "type").is_none());
@@ -8304,7 +8132,9 @@ mod tests {
         let mut heap = fresh_heap();
         let o = alloc_object_old_for_fixture(&mut heap).unwrap();
         let desc = PropertyDescriptor::data(Value::boolean(true), false, false, false);
-        assert!(define_own_property(o, &mut heap, "x", desc));
+        assert!(
+            define_own_property(o, &mut heap, "x", desc).expect("descriptor fixture allocation")
+        );
         let got = get_own_descriptor(o, &heap, "x").unwrap();
         assert!(got.is_data());
         assert!(!got.writable());
@@ -8321,29 +8151,34 @@ mod tests {
             &mut heap,
             "x",
             PropertyDescriptor::data(Value::boolean(true), true, true, false),
-        );
+        )
+        .expect("descriptor fixture allocation");
         // Try to switch the data slot to an accessor — must fail.
         let accessor = PropertyDescriptor::accessor(None, None, true, false);
-        assert!(!define_own_property(o, &mut heap, "x", accessor));
+        assert!(
+            !define_own_property(o, &mut heap, "x", accessor)
+                .expect("descriptor fixture allocation")
+        );
     }
 
     #[test]
     fn ordinary_set_data_property_preserves_existing_attrs() {
         let mut heap = fresh_heap();
-        let o = alloc_object_old_for_fixture(&mut heap).unwrap();
-        assert!(define_own_property(
-            o,
-            &mut heap,
-            "x",
-            PropertyDescriptor::data(Value::boolean(false), true, false, false),
-        ));
+        let mut o = alloc_object_old_for_fixture(&mut heap).unwrap();
+        assert!(
+            define_own_property(
+                o,
+                &mut heap,
+                "x",
+                PropertyDescriptor::data(Value::boolean(false), true, false, false),
+            )
+            .expect("descriptor fixture allocation")
+        );
 
-        assert!(ordinary_set_data_property(
-            o,
-            &mut heap,
-            "x",
-            Value::boolean(true)
-        ));
+        assert!(
+            ordinary_set_data_property(&mut o, &mut heap, "x", Value::boolean(true))
+                .expect("fixture assignment allocation")
+        );
 
         let got = get_own_descriptor(o, &heap, "x").unwrap();
         assert!(get(o, &heap, "x").is_some_and(|v| v.as_boolean() == Some(true)));
@@ -8355,20 +8190,21 @@ mod tests {
     #[test]
     fn ordinary_set_data_property_rejects_non_writable_data() {
         let mut heap = fresh_heap();
-        let o = alloc_object_old_for_fixture(&mut heap).unwrap();
-        assert!(define_own_property(
-            o,
-            &mut heap,
-            "x",
-            PropertyDescriptor::data(Value::boolean(false), false, true, true),
-        ));
+        let mut o = alloc_object_old_for_fixture(&mut heap).unwrap();
+        assert!(
+            define_own_property(
+                o,
+                &mut heap,
+                "x",
+                PropertyDescriptor::data(Value::boolean(false), false, true, true),
+            )
+            .expect("descriptor fixture allocation")
+        );
 
-        assert!(!ordinary_set_data_property(
-            o,
-            &mut heap,
-            "x",
-            Value::boolean(true)
-        ));
+        assert!(
+            !ordinary_set_data_property(&mut o, &mut heap, "x", Value::boolean(true))
+                .expect("fixture assignment allocation")
+        );
 
         assert!(get(o, &heap, "x").is_some_and(|v| v.as_boolean() == Some(false)));
     }
@@ -8376,18 +8212,19 @@ mod tests {
     #[test]
     fn ordinary_set_data_property_respects_extensibility_for_new_keys() {
         let mut heap = fresh_heap();
-        let o = alloc_object_old_for_fixture(&mut heap).unwrap();
+        let mut o = alloc_object_old_for_fixture(&mut heap).unwrap();
 
-        assert!(ordinary_set_data_property(o, &mut heap, "x", Value::null()));
+        assert!(
+            ordinary_set_data_property(&mut o, &mut heap, "x", Value::null())
+                .expect("fixture assignment allocation")
+        );
         assert!(get(o, &heap, "x").is_some_and(|v| v.is_null()));
 
-        prevent_extensions(o, &mut heap);
-        assert!(!ordinary_set_data_property(
-            o,
-            &mut heap,
-            "y",
-            Value::boolean(true)
-        ));
+        prevent_extensions(&mut o, &mut heap).expect("prevent_extensions fixture");
+        assert!(
+            !ordinary_set_data_property(&mut o, &mut heap, "y", Value::boolean(true))
+                .expect("fixture assignment allocation")
+        );
         assert!(get(o, &heap, "y").is_none());
     }
 
@@ -8395,8 +8232,16 @@ mod tests {
     fn freeze_makes_object_non_writable() {
         let mut heap = fresh_heap();
         let mut o = alloc_object_old_for_fixture(&mut heap).unwrap();
-        set(&mut o, &mut heap, "x", Value::boolean(true));
-        freeze(o, &mut heap);
+        assert!(
+            define_own_property_in_place(
+                &mut o,
+                &mut heap,
+                "x",
+                PropertyDescriptor::data(Value::boolean(true), true, true, true)
+            )
+            .expect("fixture property allocation")
+        );
+        freeze(&mut o, &mut heap).expect("freeze fixture");
         assert!(is_frozen(o, &heap));
         assert!(is_sealed(o, &heap));
         assert!(!is_extensible(o, &heap));
@@ -8415,8 +8260,16 @@ mod tests {
     fn seal_blocks_new_properties() {
         let mut heap = fresh_heap();
         let mut o = alloc_object_old_for_fixture(&mut heap).unwrap();
-        set(&mut o, &mut heap, "a", Value::null());
-        seal(o, &mut heap);
+        assert!(
+            define_own_property_in_place(
+                &mut o,
+                &mut heap,
+                "a",
+                PropertyDescriptor::data(Value::null(), true, true, true)
+            )
+            .expect("fixture property allocation")
+        );
+        seal(&mut o, &mut heap).expect("seal fixture");
         assert!(is_sealed(o, &heap));
         assert!(!is_frozen(o, &heap));
         match resolve_set(o, &heap, "b") {
@@ -8430,14 +8283,15 @@ mod tests {
     #[test]
     fn delete_respects_configurable() {
         let mut heap = fresh_heap();
-        let o = alloc_object_old_for_fixture(&mut heap).unwrap();
+        let mut o = alloc_object_old_for_fixture(&mut heap).unwrap();
         define_own_property(
             o,
             &mut heap,
             "x",
             PropertyDescriptor::data(Value::boolean(true), true, true, false),
-        );
-        assert!(!delete(o, &mut heap, "x"));
+        )
+        .expect("descriptor fixture allocation");
+        assert!(!delete(&mut o, &mut heap, "x").expect("delete fixture"));
         assert!(get(o, &heap, "x").is_some());
     }
 
@@ -8455,22 +8309,22 @@ mod tests {
             &mut heap,
             "module",
             PropertyDescriptor::data(record_value, true, true, false),
+        )
+        .expect("descriptor fixture allocation");
+        assert!(
+            delete_if_same_data(&mut cache, &mut heap, "module", record_value)
+                .expect("delete_if_same_data fixture")
         );
-        assert!(delete_if_same_data(
-            cache,
-            &mut heap,
-            "module",
-            record_value
-        ));
         assert!(get(cache, &heap, "module").is_none());
 
-        set(&mut cache, &mut heap, "module", replacement_value);
-        assert!(!delete_if_same_data(
-            cache,
-            &mut heap,
-            "module",
-            record_value
-        ));
+        assert!(
+            ordinary_set_data_property(&mut cache, &mut heap, "module", replacement_value)
+                .expect("fixture assignment allocation")
+        );
+        assert!(
+            !delete_if_same_data(&mut cache, &mut heap, "module", record_value)
+                .expect("delete_if_same_data fixture")
+        );
         assert_eq!(get(cache, &heap, "module"), Some(replacement_value));
     }
 
@@ -8482,3 +8336,17 @@ mod tests {
         assert!(delete_symbol(o, &mut heap, sym));
     }
 }
+
+/// Resolve one logical slot against the exact immutable shape layout.
+pub(crate) fn field_location(shape: ShapeHandle, slot: u32) -> FieldLocation {
+    FieldLocation::for_slot(slot, shape_body::inline_capacity_of(shape))
+}
+
+/// Resolve a dictionary or shaped object's immutable prefix layout.
+pub(crate) fn field_location_at(object: JsObject, heap: &GcHeap, slot: u32) -> FieldLocation {
+    field_location(self::shape(object, heap), slot)
+}
+
+#[cfg(test)]
+#[path = "object/error_stack_source_tests.rs"]
+mod error_stack_source_tests;

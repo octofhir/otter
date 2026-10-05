@@ -8,9 +8,9 @@
 //!   callers.
 //!
 //! # Invariants
-//! - The generated caller publishes every actual argument after the callee's
-//!   register window, so the callee's `arguments` object sees the exact
-//!   call-site list without a materialized interpreter frame.
+//! - The generated caller passes exactly its actual arguments; the callee
+//!   publishes that span separately from its initialized register window,
+//!   so `arguments` sees the exact call-site list, including extra arguments.
 //! - Every such site receives an available direct-call plan; the callee never
 //!   side exits merely because it materializes `arguments`.
 //! - Every tier returns the interpreter's completion.

@@ -105,7 +105,7 @@ pub fn snapshot_runtime(
 
 /// Outcome of [`run_with_watchdog`] when the engine call returned.
 ///
-/// Distinct from [`crate::runner::Outcome`] so the per-test driver
+/// Distinct from [`crate::results::Outcome`] so the per-test driver
 /// can layer extra metadata (negative-test inversion, peak heap,
 /// etc.) on top.
 #[derive(Debug)]

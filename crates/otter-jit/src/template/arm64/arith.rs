@@ -348,7 +348,7 @@ pub(super) fn emit_fused_numeric_chain(
 }
 
 /// Emit `+` with the full ECMAScript semantics: the inline numeric paths of
-/// [`emit_binary_arith`], then the allocating string-concat runtime call
+/// [`emit_binary_arith`], then a shared native string LAB fit, then the allocating runtime call
 /// rooted at `concat_safepoint`, then the interpreter-completing delegate for
 /// every remaining coercive case. Non-number operands never side-exit — `+`
 /// stays resident in compiled code.
@@ -356,6 +356,7 @@ pub(super) fn emit_fused_numeric_chain(
 pub(super) fn emit_add_generic(
     ops: &mut Assembler,
     relocations: &mut RelocationCapture,
+    view: &JitCompileSnapshot,
     table: &TransitionTable,
     dst: u16,
     lhs: u16,
@@ -401,6 +402,9 @@ pub(super) fn emit_add_generic(
     // The inline concatenation handles two strings; any other operand reaches
     // the delegate, whose completion records it.
     emit_record_arith(ops, relocations, site, otter_vm::jit_feedback::ARITH_STRING);
+    let collecting = ops.new_dynamic_label();
+    super::primitive_strings::emit_concat_fit(ops, view, dst, lhs, rhs, collecting, done)?;
+    dynasm!(ops ; .arch aarch64 ; =>collecting);
     emit_string_concat_alloc_call(
         ops,
         relocations,
@@ -489,6 +493,7 @@ pub(super) fn emit_compare(
     kind: CompareKind,
     site: Option<ArithSite>,
     bail: DynamicLabel,
+    fatal: DynamicLabel,
     slow_paths: &mut Vec<NumericSlowPath>,
 ) -> Result<(), Unsupported> {
     let relational_slow = match kind {
@@ -527,6 +532,12 @@ pub(super) fn emit_compare(
         CompareKind::Eq | CompareKind::Ne => None,
     };
     let numeric_miss = relational_slow.map_or(bail, |(entry, _)| entry);
+    let primitive = ops.new_dynamic_label();
+    let number_miss = if relational_slow.is_some() {
+        primitive
+    } else {
+        numeric_miss
+    };
     emit_load_reg(ops, 9, lhs)?;
     emit_load_reg(ops, 10, rhs)?;
     let float_path = ops.new_dynamic_label();
@@ -646,10 +657,17 @@ pub(super) fn emit_compare(
             ; =>number_path
         );
     }
-    emit_num_to_double(ops, 9, 0, numeric_miss);
-    emit_num_to_double(ops, 10, 1, numeric_miss);
+    emit_num_to_double(ops, 9, 0, number_miss);
+    emit_num_to_double(ops, 10, 1, number_miss);
     dynasm!(ops ; .arch aarch64 ; fcmp d0, d1);
     emit_cset(ops, kind, FloatCondition);
+    if relational_slow.is_some() {
+        dynasm!(ops ; .arch aarch64 ; b =>have_bool ; =>primitive);
+        // Reload the original operands after the numeric classification.
+        emit_load_reg(ops, 9, lhs)?;
+        emit_load_reg(ops, 10, rhs)?;
+        super::primitive_strings::emit_order(ops, relocations, kind, numeric_miss, fatal);
+    }
     dynasm!(ops ; .arch aarch64 ; =>have_bool);
     emit_box_bool(ops, 13, 12);
     emit_store_reg(ops, 13, dst)?;

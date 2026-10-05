@@ -24,6 +24,9 @@
 //!   change, and cells are never repurposed for newer native code.
 //! - At a native-activation epoch boundary, executable ownership may retire
 //!   only after the cell is unlinked and `active_count == 0`.
+//! - Template call entries count native entries for tiering; Graph entries
+//!   omit that hot-path accounting and record only their cold deopts. These
+//!   cells therefore cannot prove ordinary or OSR entry into Graph code.
 //!
 //! # See also
 //! - [`super::CodeObjectMetadata`] — immutable compiled-object identity.
@@ -162,20 +165,18 @@ pub struct CodeEntryCell {
     /// It completes the header's second word, so linkage copies register
     /// shape, tier, flags and generation with one load/store pair.
     pub native_frame_code_object_id: u32,
-    /// Entry count at which the next generated entry asks the cold optimizing
-    /// policy for promotion. It starts at the function's break-even, derived
-    /// from its size and calibrated coefficients; a decision that does not
-    /// promote moves it one interval further, like an interrupt budget.
-    pub generated_tiering_break_even: Cell<u64>,
+    /// Absolute canonical source-work target at which a Template entry asks
+    /// cold policy for promotion. The policy owns the feedback-epoch origin;
+    /// deferral preserves already observed work.
+    pub generated_tiering_work_target: Cell<u64>,
     /// Whether this baseline generation may request optimizing compilation.
     /// Cold policy clears it after a cached compile outcome; a replacement
     /// generation starts fresh. Optimizing generations never request promotion.
     pub generated_tiering_enabled: Cell<u32>,
-    /// Entries between two promotion requests: the initial break-even.
-    pub generated_tiering_interval: u32,
-    /// Generated native entries observed for tiering/introspection. Normal
-    /// completions are derived as `entries - deopts` during cold
-    /// reconciliation, so the hot path owns no redundant return counter.
+    /// Template generated native entries observed for tiering/introspection.
+    /// The Graph backend omits entry accounting. Template normal completions
+    /// are derived as `entries - deopts` during cold reconciliation, so the hot
+    /// path owns no redundant return counter.
     ///
     /// The isolate has one mutator and reconciles feedback only after native
     /// activation returns, so these counters deliberately use ordinary
@@ -196,9 +197,8 @@ impl CodeEntryCell {
             active_count: AtomicU32::new(0),
             native_frame_header: VmFrameHeader::interpreter(function_id, register_count),
             native_frame_code_object_id: 0,
-            generated_tiering_break_even: Cell::new(0),
+            generated_tiering_work_target: Cell::new(u64::MAX),
             generated_tiering_enabled: Cell::new(0),
-            generated_tiering_interval: 0,
             generated_entries: Cell::new(0),
             generated_deopts: Cell::new(0),
         }
@@ -212,7 +212,7 @@ impl CodeEntryCell {
         function_id: u32,
         register_count: u16,
         flags: u32,
-        generated_tiering_break_even: u64,
+        generated_tiering_work_target: Option<u64>,
     ) -> Self {
         debug_assert_ne!(entry_addr, 0);
         debug_assert_ne!(code_object_id, 0);
@@ -240,13 +240,13 @@ impl CodeEntryCell {
             },
             native_frame_code_object_id: u32::try_from(code_object_id)
                 .expect("code object ids fit the frame record's generation field"),
-            generated_tiering_break_even: Cell::new(generated_tiering_break_even),
-            generated_tiering_interval: u32::try_from(generated_tiering_break_even)
-                .unwrap_or(u32::MAX),
+            generated_tiering_work_target: Cell::new(
+                generated_tiering_work_target.unwrap_or(u64::MAX),
+            ),
             generated_entries: Cell::new(0),
             generated_deopts: Cell::new(0),
             generated_tiering_enabled: Cell::new(u32::from(
-                flags & CODE_ENTRY_OPTIMIZING_TIER == 0,
+                flags & CODE_ENTRY_OPTIMIZING_TIER == 0 && generated_tiering_work_target.is_some(),
             )),
         }
     }
@@ -303,6 +303,7 @@ impl CodeEntryCell {
     }
 
     /// Cumulative generated-call feedback for this exact code generation.
+    /// Graph generations report cold deopts but zero entries and returns.
     #[must_use]
     pub fn generated_feedback(&self) -> (u64, u64, u64) {
         let entries = self.generated_entries.get();
@@ -350,9 +351,8 @@ const _: [(); 20] = [(); FUNCTION_ENTRY_REALM_OFFSET];
 const _: [(); 24] = [(); FUNCTION_ENTRY_INTERPRETER_OFFSET];
 
 const _: [(); 72] = [(); std::mem::size_of::<CodeEntryCell>()];
-const _: [(); 40] = [(); std::mem::offset_of!(CodeEntryCell, generated_tiering_break_even)];
+const _: [(); 40] = [(); std::mem::offset_of!(CodeEntryCell, generated_tiering_work_target)];
 const _: [(); 48] = [(); std::mem::offset_of!(CodeEntryCell, generated_tiering_enabled)];
-const _: [(); 52] = [(); std::mem::offset_of!(CodeEntryCell, generated_tiering_interval)];
 const _: [(); 8] = [(); std::mem::align_of::<CodeEntryCell>()];
 const _: [(); 0] = [(); std::mem::offset_of!(CodeEntryCell, entry_addr)];
 const _: [(); 8] = [(); std::mem::offset_of!(CodeEntryCell, code_object_id)];
@@ -368,7 +368,7 @@ mod tests {
     use super::*;
 
     fn cell() -> CodeEntryCell {
-        CodeEntryCell::new(0x1234, 7, 9, 12, CODE_ENTRY_HAS_SAFEPOINTS, 321)
+        CodeEntryCell::new(0x1234, 7, 9, 12, CODE_ENTRY_HAS_SAFEPOINTS, Some(321))
     }
 
     #[test]
@@ -414,3 +414,10 @@ mod tests {
         assert_eq!(std::mem::offset_of!(CodeEntryCell, native_frame_header), 24);
     }
 }
+
+/// Bit zero of the private JS generation input identifies a trampoline-staged
+/// request. The code cell itself remains the sole aligned generation owner;
+/// entries clear this bit before any generation-cell dereference and consume
+/// the request's genuine caller return address before publishing their frame.
+pub const CODE_ENTRY_STAGED_REQUEST_MASK: u64 = 1;
+const _: () = assert!(std::mem::align_of::<CodeEntryCell>() > 1);

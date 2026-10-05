@@ -303,7 +303,7 @@ pub(crate) fn relative_time_format_format(
     });
     let value = number
         .map(|n| n.as_f64())
-        .map_err(|e| crate::native_function::vm_to_native_error(ctx.interp_mut(), e, "format"))?;
+        .map_err(|error| error.into_native(ctx.interp_mut(), "format"))?;
     if !value.is_finite() {
         return Err(NativeError::RangeError {
             name: "format",
@@ -317,9 +317,7 @@ pub(crate) fn relative_time_format_format(
         let string = ctx.with_turn_parts(|interp, stack| {
             crate::coerce::to_string_or_throw(interp, stack, &exec, &unit_v)
         });
-        string.map_err(|e| {
-            crate::native_function::vm_to_native_error(ctx.interp_mut(), e, "format")
-        })?
+        string.map_err(|e| e.into_native(ctx.interp_mut(), "format"))?
     };
     if !is_valid_unit(&unit) {
         return Err(NativeError::RangeError {
@@ -354,9 +352,9 @@ pub(crate) fn relative_time_format_format_to_parts(
     let number = ctx.with_turn_parts(|interp, stack| {
         crate::coerce::to_number_or_throw(interp, stack, &exec, &first)
     });
-    let value = number.map(|n| n.as_f64()).map_err(|e| {
-        crate::native_function::vm_to_native_error(ctx.interp_mut(), e, "formatToParts")
-    })?;
+    let value = number
+        .map(|n| n.as_f64())
+        .map_err(|e| e.into_native(ctx.interp_mut(), "formatToParts"))?;
     if !value.is_finite() {
         return Err(NativeError::RangeError {
             name: "formatToParts",
@@ -368,9 +366,7 @@ pub(crate) fn relative_time_format_format_to_parts(
         let string = ctx.with_turn_parts(|interp, stack| {
             crate::coerce::to_string_or_throw(interp, stack, &exec, &unit_v)
         });
-        string.map_err(|e| {
-            crate::native_function::vm_to_native_error(ctx.interp_mut(), e, "formatToParts")
-        })?
+        string.map_err(|e| e.into_native(ctx.interp_mut(), "formatToParts"))?
     };
     if !is_valid_unit(&unit) {
         return Err(NativeError::RangeError {

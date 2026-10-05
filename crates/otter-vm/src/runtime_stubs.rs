@@ -22,7 +22,8 @@
 //!   [`crate::native_abi::NativeResultPair`]; no unpacked result DTO exists.
 //! - Signature families are never mixed behind one untyped address array.
 //! - `LeafNoAlloc` stubs must not allocate, trigger GC, call JS, flatten
-//!   strings, or mutate heap state.
+//!   strings, or retain unrooted inputs. Explicitly mutating leaves perform
+//!   their own barriers; scalar constructor feedback reuses admitted cells.
 //! - `Alloc` stubs must publish their current safepoint roots before any
 //!   allocation and must not hold untracked raw `Value` bits across GC.
 //!
@@ -38,16 +39,15 @@ use crate::native_abi::{
     STUB_COLLECTION_MAP_HAS_ALLOC, STUB_COLLECTION_MAP_HAS_LEAF, STUB_COLLECTION_MAP_SET_ALLOC,
     STUB_COLLECTION_MAP_SET_MUTATING, STUB_COLLECTION_SET_ADD_ALLOC,
     STUB_COLLECTION_SET_DELETE_ALLOC, STUB_COLLECTION_SET_HAS_ALLOC, STUB_COLLECTION_SET_HAS_LEAF,
-    STUB_COPY_CONTEXT_ALLOC, STUB_CREATE_CONTEXT_ALLOC, STUB_MATH_ABS_LEAF, STUB_MATH_FLOOR_LEAF,
-    STUB_MATH_MAX_LEAF, STUB_MATH_MIN_LEAF, STUB_MATH_SQRT_LEAF, STUB_NUMBER_POW_F64_LEAF,
-    STUB_NUMBER_REM_F64_LEAF, STUB_NUMBER_REM_LEAF, STUB_NUMBER_TO_INT32_F64_LEAF,
-    STUB_PARSE_INT_I32_LEAF, STUB_STRICT_EQ_LEAF, STUB_STRING_CHAR_CODE_AT_LEAF,
-    STUB_STRING_CODE_POINT_AT_LEAF, STUB_STRING_CONCAT_ALLOC, STUB_STRING_ENDS_WITH_LEAF,
-    STUB_STRING_INCLUDES_LEAF, STUB_STRING_INDEX_OF_LEAF, STUB_STRING_STARTS_WITH_LEAF,
-    STUB_TO_BOOLEAN_LEAF, STUB_TYPEOF_TEST_LEAF, SafepointId, SafepointRecord, TaggedLocationKind,
-    validate_stub_descriptor,
+    STUB_COPY_CONTEXT_ALLOC, STUB_CREATE_CONTEXT_ALLOC, STUB_JIT_MAKE_CLOSURE, STUB_JIT_MAKE_FN,
+    STUB_MATH_ABS_LEAF, STUB_MATH_FLOOR_LEAF, STUB_MATH_MAX_LEAF, STUB_MATH_MIN_LEAF,
+    STUB_MATH_SQRT_LEAF, STUB_NUMBER_POW_F64_LEAF, STUB_NUMBER_REM_F64_LEAF, STUB_NUMBER_REM_LEAF,
+    STUB_NUMBER_TO_INT32_F64_LEAF, STUB_PARSE_INT_I32_LEAF, STUB_STRICT_EQ_LEAF,
+    STUB_STRING_CHAR_CODE_AT_LEAF, STUB_STRING_CODE_POINT_AT_LEAF, STUB_STRING_CONCAT_ALLOC,
+    STUB_STRING_ENDS_WITH_LEAF, STUB_STRING_INCLUDES_LEAF, STUB_STRING_INDEX_OF_LEAF,
+    STUB_STRING_STARTS_WITH_LEAF, STUB_TO_BOOLEAN_LEAF, STUB_TYPEOF_TEST_LEAF, SafepointId,
+    SafepointRecord, validate_stub_descriptor,
 };
-use crate::rooting::RootScopeExt;
 use crate::{Interpreter, Value, collections};
 use std::cell::UnsafeCell;
 
@@ -94,6 +94,13 @@ impl LeafNoAllocStub2 {
         (self.entry)(heap, a0_bits, a1_bits)
     }
 }
+
+/// Read-only actual-family admission through the existing boxed leaf ABI.
+/// The private numeric result is borrowed until the no-GC ticket publication.
+pub const CONSTRUCTOR_RECEIVER_PROBE: LeafNoAllocStub2 = LeafNoAllocStub2 {
+    descriptor: crate::native_abi::STUB_CONSTRUCTOR_RECEIVER_PROBE,
+    entry: crate::constructor_layout::constructor_receiver_probe,
+};
 
 /// Pure two-argument unboxed binary64 runtime stub ABI.
 pub type Float64LeafStub2Fn = extern "C" fn(f64, f64) -> f64;
@@ -321,23 +328,8 @@ pub enum AllocSafepointRootError {
         /// Requested safepoint id.
         id: SafepointId,
     },
-    /// The context packet does not include a frame-slot root window.
-    MissingFrameSlots,
-    /// The safepoint names a root class this frame-window publisher cannot
-    /// trace yet.
-    UnsupportedLocation {
-        /// Unsupported location class.
-        kind: TaggedLocationKind,
-        /// Location index from the safepoint map.
-        index: u16,
-    },
-    /// A frame-slot root points outside the context packet's slot window.
-    FrameSlotOutOfBounds {
-        /// Safepoint frame-slot index.
-        index: u16,
-        /// Slot count supplied by the context packet.
-        frame_slot_count: u16,
-    },
+    /// No current frame is published.
+    MissingFrame,
     /// A safepoint names a native spill-slot root but the packet exposes no
     /// spill/save-area window.
     MissingSpillSlots,
@@ -382,13 +374,14 @@ pub unsafe fn alloc_safepoint_record(
     Ok(unsafe { &*record })
 }
 
-/// Validate that `safepoint` can be published from `ctx`'s frame and native
-/// spill windows.
+/// Validate that `safepoint` can be published from `ctx`'s native spill
+/// window.
 ///
-/// Baseline names interpreter-visible frame slots. Machine IR names only its
-/// allocator-driven native save homes after copying register/spill roots into
-/// the packet's rewriteable spill window. Raw machine-register roots remain
-/// invalid because the collector cannot rewrite a live register directly.
+/// Every allocating-stub packet requires a published frame, whose canonical
+/// window the collector traces itself. A record names only initialized
+/// canonical homes in the packet's rewriteable spill window. Raw register
+/// roots remain invalid because the collector cannot rewrite a live register
+/// directly.
 pub fn validate_alloc_safepoint_frame_roots(
     ctx: &RuntimeStubAllocContext,
     safepoint: &SafepointRecord,
@@ -396,39 +389,20 @@ pub fn validate_alloc_safepoint_frame_roots(
     if safepoint.id == NO_SAFEPOINT {
         return Err(AllocSafepointRootError::NoSafepoint);
     }
-    if !ctx.has_frame_slots() {
-        return Err(AllocSafepointRootError::MissingFrameSlots);
+    let frame = ctx.current_frame();
+    if frame.is_null() {
+        return Err(AllocSafepointRootError::MissingFrame);
     }
-    // SAFETY: `has_frame_slots` verified the thread-published frame/window.
-    let frame = unsafe { &*ctx.current_frame() };
-    let frame_slot_count = frame.header.register_count;
-    for location in &safepoint.tagged_locations {
-        match location.kind {
-            TaggedLocationKind::FrameSlot => {
-                if location.index >= frame_slot_count {
-                    return Err(AllocSafepointRootError::FrameSlotOutOfBounds {
-                        index: location.index,
-                        frame_slot_count,
-                    });
-                }
-            }
-            TaggedLocationKind::SpillSlot => {
-                if !ctx.has_spill_slots() {
-                    return Err(AllocSafepointRootError::MissingSpillSlots);
-                }
-                if location.index >= ctx.spill_slot_count {
-                    return Err(AllocSafepointRootError::SpillSlotOutOfBounds {
-                        index: location.index,
-                        spill_slot_count: ctx.spill_slot_count,
-                    });
-                }
-            }
-            kind => {
-                return Err(AllocSafepointRootError::UnsupportedLocation {
-                    kind,
-                    index: location.index,
-                });
-            }
+    let end = safepoint.spill_roots.end();
+    if end != 0 {
+        if !ctx.has_spill_slots() {
+            return Err(AllocSafepointRootError::MissingSpillSlots);
+        }
+        if end > usize::from(ctx.spill_slot_count) {
+            return Err(AllocSafepointRootError::SpillSlotOutOfBounds {
+                index: (end - 1) as u16,
+                spill_slot_count: ctx.spill_slot_count,
+            });
         }
     }
     Ok(())
@@ -438,8 +412,8 @@ pub fn validate_alloc_safepoint_frame_roots(
 /// native spill slots.
 ///
 /// This type is the VM-native equivalent of the ad hoc native-call root scopes:
-/// it exposes the active frame-window slots named by a [`SafepointRecord`] to
-/// the moving collector, so a GC can both trace and rewrite those slots while an
+/// it exposes each frame or spill slot named by a [`SafepointRecord`] to the
+/// moving collector, so a GC can both trace and rewrite those slots while an
 /// `Alloc` stub is executing.
 pub struct AllocSafepointFrameRoots<'a> {
     ctx: &'a RuntimeStubAllocContext,
@@ -451,18 +425,42 @@ impl<'a> AllocSafepointFrameRoots<'a> {
     ///
     /// # Safety
     ///
-    /// `ctx`'s current frame must publish a live, writable tagged window for the
-    /// duration of any heap registration created from this value.
+    /// `ctx` must retain its published current frame and every writable frame
+    /// or spill window named by the record for the entire root registration.
     pub unsafe fn new(
         ctx: &'a RuntimeStubAllocContext,
         safepoint: &'a SafepointRecord,
     ) -> Result<Self, AllocSafepointRootError> {
-        // Every record location is bounds-consistent by construction — both tiers
-        // build the table from `frame_slot_window(register_count)` and the running
-        // frame's slot window is exactly that register count — so the bounds walk
-        // is redundant on the per-allocation path. Keep it as a debug assertion;
-        // the release path trusts the compiler-emitted table.
-        debug_assert!(validate_alloc_safepoint_frame_roots(ctx, safepoint).is_ok());
+        // Each encoder publishes the exact window named by its record: frame
+        // slots for baseline, initialized canonical spill homes for Graph. The
+        // release path trusts that compiler contract. Diagnose a debug failure
+        // with one validation walk and the actual published source/window shape.
+        #[cfg(debug_assertions)]
+        {
+            let validation = validate_alloc_safepoint_frame_roots(ctx, safepoint);
+            // SAFETY: this constructor requires a live thread-published frame;
+            // a null frame remains observable as None for failure diagnostics.
+            let frame = unsafe { ctx.current_frame().as_ref() };
+            debug_assert!(
+                validation.is_ok(),
+                "allocation safepoint roots: {validation:?}; safepoint={}; frame={:?}; inline_source={:?}; spill_present={}; spill_count={}",
+                safepoint.id,
+                frame.map(|frame| (
+                    frame.header.function_id,
+                    frame.header.pc,
+                    frame.header.kind,
+                    frame.header.register_count,
+                    frame.register_base() != 0,
+                    frame.call_site,
+                )),
+                safepoint
+                    .inline_frames
+                    .last()
+                    .map(|source| (source.function_id, source.byte_pc,)),
+                !ctx.spill_slots.is_null(),
+                ctx.spill_slot_count,
+            );
+        }
         Ok(Self { ctx, safepoint })
     }
 
@@ -475,29 +473,14 @@ impl<'a> AllocSafepointFrameRoots<'a> {
 
 impl otter_gc::ExtraRootSource for AllocSafepointFrameRoots<'_> {
     fn visit_extra_roots(&self, visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)) {
-        for location in &self.safepoint.tagged_locations {
-            // SAFETY: construction validated a live published frame.
-            let frame = unsafe { &*self.ctx.current_frame() };
-            // SAFETY: construction validated every location's storage class and
-            // bounds and requires callers to keep the writable frame and spill
-            // windows alive while this root source is registered. A moving
-            // collector both traces and rewrites the pointer in place through the
-            // `&mut Value`, so a call-crossing pointer saved in the native spill
-            // area is updated exactly like one held in the interpreter window.
-            let base = match location.kind {
-                TaggedLocationKind::FrameSlot => {
-                    debug_assert!(location.index < frame.header.register_count);
-                    frame.register_base() as *mut u64
-                }
-                TaggedLocationKind::SpillSlot => {
-                    debug_assert!(location.index < self.ctx.spill_slot_count);
-                    self.ctx.spill_slots
-                }
-                // A machine-register root class is rejected at validation; the
-                // register-map safepoint saves the value to a spill slot first.
-                TaggedLocationKind::MachineRegister => unreachable!("validated away"),
-            };
-            let value = unsafe { &mut *(base.add(location.index as usize) as *mut Value) };
+        for slot in self.safepoint.spill_roots.iter() {
+            debug_assert!(slot < self.ctx.spill_slot_count);
+            // SAFETY: construction validated every rooted slot against the
+            // spill window, which callers keep alive and writable while this
+            // root source is registered. A moving collector both traces and
+            // rewrites the pointer in place through the `&mut Value`.
+            let value =
+                unsafe { &mut *(self.ctx.spill_slots.add(usize::from(slot)) as *mut Value) };
             value.trace_value_slot_mut(visitor);
         }
     }
@@ -753,6 +736,36 @@ pub const ARRAY_CONSTRUCT_ALLOC: AllocValueStub = AllocValueStub {
     entry: Some(array_construct_alloc),
 };
 
+mod string;
+pub use string::{primitive_string_order, string_concat_alloc};
+mod allocation_group;
+pub use allocation_group::alloc_group_ensure;
+
+/// Callable canonical allocation-group admission Probe.
+pub const ALLOC_GROUP_ENSURE: AllocValueStub = AllocValueStub {
+    descriptor: crate::native_abi::STUB_ALLOC_GROUP_ENSURE,
+    entry: Some(alloc_group_ensure),
+};
+/// Callable pure primitive comparison Probe.
+pub const PRIMITIVE_STRING_ORDER: LeafNoAllocStub2 = LeafNoAllocStub2 {
+    descriptor: crate::native_abi::STUB_PRIMITIVE_STRING_ORDER,
+    entry: primitive_string_order,
+};
+
+mod closure;
+pub use closure::{make_closure_alloc, make_function_alloc};
+
+/// ABI descriptor for capture-free function allocation.
+pub const MAKE_FUNCTION_ALLOC: AllocValueStub = AllocValueStub {
+    descriptor: STUB_JIT_MAKE_FN,
+    entry: Some(make_function_alloc),
+};
+/// ABI descriptor for explicit lexical closure allocation.
+pub const MAKE_CLOSURE_ALLOC: AllocValueStub = AllocValueStub {
+    descriptor: STUB_JIT_MAKE_CLOSURE,
+    entry: Some(make_closure_alloc),
+};
+
 /// ABI descriptor for `CreateContext` allocation.
 pub const CREATE_CONTEXT_ALLOC: AllocValueStub = AllocValueStub {
     descriptor: STUB_CREATE_CONTEXT_ALLOC,
@@ -884,6 +897,12 @@ pub const fn leaf_no_alloc_stub2_by_id(id: RuntimeStubId) -> Option<LeafNoAllocS
         id if id == STUB_STRING_INCLUDES_LEAF.id => Some(STRING_INCLUDES_LEAF),
         id if id == STUB_STRING_STARTS_WITH_LEAF.id => Some(STRING_STARTS_WITH_LEAF),
         id if id == STUB_STRING_ENDS_WITH_LEAF.id => Some(STRING_ENDS_WITH_LEAF),
+        id if id == crate::native_abi::STUB_PRIMITIVE_STRING_ORDER.id => {
+            Some(PRIMITIVE_STRING_ORDER)
+        }
+        id if id == crate::native_abi::STUB_CONSTRUCTOR_RECEIVER_PROBE.id => {
+            Some(CONSTRUCTOR_RECEIVER_PROBE)
+        }
         _ => None,
     }
 }
@@ -919,7 +938,10 @@ pub const fn alloc_value_stub_by_id(id: RuntimeStubId) -> Option<AllocValueStub>
         id if id == STUB_COLLECTION_MAP_DELETE_ALLOC.id => Some(COLLECTION_MAP_DELETE_ALLOC),
         id if id == STUB_COLLECTION_SET_DELETE_ALLOC.id => Some(COLLECTION_SET_DELETE_ALLOC),
         id if id == STUB_STRING_CONCAT_ALLOC.id => Some(STRING_CONCAT_ALLOC),
+        id if id == crate::native_abi::STUB_ALLOC_GROUP_ENSURE.id => Some(ALLOC_GROUP_ENSURE),
         id if id == STUB_ARRAY_CONSTRUCT_ALLOC.id => Some(ARRAY_CONSTRUCT_ALLOC),
+        id if id == STUB_JIT_MAKE_FN.id => Some(MAKE_FUNCTION_ALLOC),
+        id if id == STUB_JIT_MAKE_CLOSURE.id => Some(MAKE_CLOSURE_ALLOC),
         id if id == STUB_CREATE_CONTEXT_ALLOC.id => Some(CREATE_CONTEXT_ALLOC),
         id if id == STUB_COPY_CONTEXT_ALLOC.id => Some(COPY_CONTEXT_ALLOC),
         id if id == STUB_ARRAY_UNSHIFT_ALLOC.id => Some(ARRAY_UNSHIFT_ALLOC),
@@ -1162,21 +1184,6 @@ pub extern "C" fn collection_set_delete_alloc(
     )
 }
 
-/// Allocating primitive string-concat stub for `+`.
-#[must_use]
-pub extern "C" fn string_concat_alloc(
-    ctx: *mut RuntimeStubAllocContext,
-    safepoint: SafepointId,
-    lhs_bits: u64,
-    rhs_bits: u64,
-    unused_bits: u64,
-) -> NativeResultPair {
-    record_alloc_value_stub_result(
-        ctx,
-        string_concat_alloc_inner(ctx, safepoint, lhs_bits, rhs_bits, unused_bits),
-    )
-}
-
 /// Allocating `Array(length)` stub for an exact nonnegative int32 length.
 #[must_use]
 pub extern "C" fn array_construct_alloc(
@@ -1283,8 +1290,31 @@ fn create_context_alloc_inner(
     let _call_roots_guard = interp
         .gc_heap
         .register_extra_roots(otter_gc::ExtraRoots::new(&roots));
+    let owns_this = crate::context_ops::with_scope(
+        execution_context,
+        function_id,
+        match u16::try_from(scope_index) {
+            Ok(index) => index,
+            Err(_) => return NativeResultPair::miss(),
+        },
+        crate::context_ops::derived_this_slot,
+    );
+    let Ok(Ok(owns_this)) = owns_this else {
+        return NativeResultPair::miss();
+    };
     match interp.create_context_value(execution_context, function_id, scope_index, roots.value(0)) {
-        Ok(context) => NativeResultPair::success(context),
+        Ok(value) => {
+            if owns_this.is_some() {
+                // SAFETY: the typed call root provider keeps this current frame
+                // published. Allocation finished; this store cannot GC/reenter.
+                if let Some(frame) = unsafe { ctx.current_frame().as_mut() } {
+                    if let Some(handle) = value.as_context() {
+                        frame.publish_derived_this_context(function_id, handle);
+                    }
+                }
+            }
+            NativeResultPair::success(value)
+        }
         Err(crate::VmError::OutOfMemory { .. }) => NativeResultPair::out_of_memory(),
         Err(_) => NativeResultPair::miss(),
     }
@@ -2299,102 +2329,6 @@ fn collection_set_delete_alloc_inner(
     })()
 }
 
-fn string_concat_alloc_inner(
-    ctx: *mut RuntimeStubAllocContext,
-    safepoint: SafepointId,
-    lhs_bits: u64,
-    rhs_bits: u64,
-    unused_bits: u64,
-) -> NativeResultPair {
-    let Some(ctx) = alloc_context_mut(ctx) else {
-        return NativeResultPair::miss();
-    };
-    let Some(interp) = alloc_interpreter_mut(ctx) else {
-        return NativeResultPair::miss();
-    };
-    // SAFETY: `ctx` is the current allocating-stub call packet. Its safepoint
-    // table and frame-slot window must remain live for this call.
-    let Ok(roots) = (unsafe {
-        alloc_value_stub_call_roots(
-            ctx,
-            safepoint,
-            [
-                Value::from_abi_bits(lhs_bits),
-                Value::from_abi_bits(rhs_bits),
-                Value::from_abi_bits(unused_bits),
-            ],
-        )
-    }) else {
-        return NativeResultPair::miss();
-    };
-    let _roots_guard = interp
-        .gc_heap
-        .register_extra_roots(otter_gc::ExtraRoots::new(&roots));
-    (|| {
-        // One-allocation fast path for `<short flat latin1 string> + <int32>`
-        // and its mirror. It must run only after the generated frame slots are
-        // published: the result allocation may scavenge either string operand.
-        let lhs = roots.value(0);
-        let rhs = roots.value(1);
-        if let Some(fast) = interp.try_concat_string_int32(lhs, rhs) {
-            return match fast {
-                Ok(value) => NativeResultPair::success(value),
-                Err(_) => NativeResultPair::out_of_memory(),
-            };
-        }
-        let mut lhs_string_root = Value::undefined();
-        let mut rhs_string_root = Value::undefined();
-        let mut string_roots = otter_gc::RootScope::new(&mut interp.gc_heap);
-        // SAFETY: both slots precede the scope and remain stationary through
-        // coercion, which can allocate, and the final rope allocation.
-        unsafe {
-            string_roots.add_value(&mut lhs_string_root);
-            string_roots.add_value(&mut rhs_string_root);
-        }
-        let lhs = roots.value(0);
-        let rhs = roots.value(1);
-        if lhs.as_string(&interp.gc_heap).is_none() && rhs.as_string(&interp.gc_heap).is_none() {
-            return NativeResultPair::miss();
-        }
-        let Ok(lhs_string) = (if let Some(string) = lhs.as_string(&interp.gc_heap) {
-            Ok(string)
-        } else {
-            interp.js_string_for_concat(lhs)
-        }) else {
-            return NativeResultPair::miss();
-        };
-        lhs_string_root = Value::string(lhs_string);
-        // The left conversion may scavenge. Reload the right ABI operand from
-        // its published safepoint slot before inspecting or converting it.
-        let rhs = roots.value(1);
-        let Ok(rhs_string) = (if let Some(string) = rhs.as_string(&interp.gc_heap) {
-            Ok(string)
-        } else {
-            interp.js_string_for_concat(rhs)
-        }) else {
-            return NativeResultPair::miss();
-        };
-        rhs_string_root = Value::string(rhs_string);
-        let lhs_string = lhs_string_root
-            .as_string(&interp.gc_heap)
-            .expect("rooted concat lhs is a string");
-        let rhs_string = rhs_string_root
-            .as_string(&interp.gc_heap)
-            .expect("rooted concat rhs is a string");
-        match crate::string::JsString::concat(lhs_string, rhs_string, &mut interp.gc_heap) {
-            Ok(result) => NativeResultPair::success(Value::string(result)),
-            // The generated caller owns the exact source FrameState. A logical
-            // length overflow is therefore a pre-effect miss: deopt/replay lets
-            // the canonical interpreter raise one catchable RangeError. It is
-            // not heap exhaustion and must never increment the OOM outcome.
-            Err(crate::string::StringConcatError::StringTooLong { .. }) => NativeResultPair::miss(),
-            Err(crate::string::StringConcatError::OutOfMemory(_)) => {
-                NativeResultPair::out_of_memory()
-            }
-        }
-    })()
-}
-
 fn array_construct_alloc_inner(
     ctx: *mut RuntimeStubAllocContext,
     safepoint: SafepointId,
@@ -2732,8 +2666,8 @@ fn leaf_key_is_materialized(heap: &otter_gc::GcHeap, key: Value) -> bool {
 mod tests {
     use super::*;
     use crate::native_abi::{
-        Frame, NO_FRAME_STATE, NativeFrameFlags, NativeFrameKind, NativeResultStatus,
-        TaggedLocation, TaggedLocationKind, VmFrameHeader, VmThread,
+        Frame, NO_FRAME_STATE, NativeFrameFlags, NativeFrameKind, NativeResultStatus, SpillRoots,
+        VmFrameHeader, VmThread,
     };
     use otter_gc::ExtraRootSource;
 
@@ -2795,6 +2729,7 @@ mod tests {
             resolve_safepoint: resolve_test_safepoint as *const () as u64,
             function_entries: 0,
             function_entry_count: 0,
+            resolve_return_pc: 0,
         }));
         let reentry = Box::leak(Box::new(crate::jit::VmRuntimeActivation::for_test(vm)));
         let native_frame = Frame::new(
@@ -2811,6 +2746,13 @@ mod tests {
         );
         let frame = Box::leak(Box::new(native_frame));
         frame.code_object_id = 1;
+        if !vm.is_null() {
+            // Production publishes the calling frame; the collector traces
+            // its canonical window, which no safepoint record names.
+            // SAFETY: the leaked frame and the caller's slot window outlive
+            // every collection the test runs through this interpreter.
+            unsafe { (*vm).jit_push_native_frame(frame) }.expect("publish fixture frame");
+        }
         let cell = Box::leak(Box::new(std::ptr::from_mut(frame) as u64));
         let mut thread = VmThread::empty();
         thread.frame_cell = std::ptr::from_mut(cell) as u64;
@@ -2977,41 +2919,6 @@ mod tests {
     }
 
     #[test]
-    fn alloc_safepoint_frame_roots_publish_value_slots() {
-        let mut heap = otter_gc::GcHeap::new().expect("gc heap");
-        let map = collections::alloc_map(&mut heap).expect("map");
-        let mut slots = [Value::map(map).to_abi_bits(), n(7).to_abi_bits()];
-        let safepoint = SafepointRecord {
-            inline_frames: Box::default(),
-            call_pc: crate::native_abi::NO_CALL_PC,
-            id: 12,
-            frame_state: NO_FRAME_STATE,
-            tagged_locations: vec![TaggedLocation::frame_slot(0), TaggedLocation::frame_slot(1)],
-        };
-        let safepoints = [safepoint.clone()];
-        let ctx = test_alloc_context(std::ptr::null_mut(), &mut slots, &safepoints, 12);
-
-        assert_eq!(
-            validate_alloc_safepoint_frame_roots(&ctx, &safepoint),
-            Ok(())
-        );
-        // SAFETY: `safepoints` is alive for the lookup.
-        assert_eq!(
-            unsafe { alloc_safepoint_record(&ctx, 12) },
-            Ok(&safepoints[0])
-        );
-        // SAFETY: `slots` is a live writable `Value` bit window for the root
-        // publisher's full lifetime.
-        let roots = unsafe { AllocSafepointFrameRoots::new(&ctx, &safepoint) }.expect("roots");
-        assert_eq!(roots.safepoint_id(), 12);
-
-        let mut seen = Vec::new();
-        roots.visit_extra_roots(&mut |slot| seen.push(slot));
-        assert_eq!(seen.len(), 1);
-        assert_eq!(seen[0], slots.as_mut_ptr().cast::<otter_gc::raw::RawGc>());
-    }
-
-    #[test]
     fn alloc_value_stub_roots_survive_minor_relocation() {
         let mut heap = otter_gc::GcHeap::new().expect("gc heap");
         let frame_value = young_object_value(&mut heap);
@@ -3019,10 +2926,15 @@ mod tests {
         let frame_before = frame_value.as_raw_gc().expect("frame raw");
         let arg_before = arg_value.as_raw_gc().expect("arg raw");
 
-        let safepoint = SafepointRecord::frame_slot_window(31, NO_FRAME_STATE, 1);
+        let safepoint = SafepointRecord {
+            spill_roots: SpillRoots::from_slots([0]),
+            ..SafepointRecord::window(31, NO_FRAME_STATE)
+        };
         let safepoints = [safepoint.clone()];
+        let mut frame = [];
         let mut slots = [frame_value.to_abi_bits()];
-        let ctx = test_alloc_context(std::ptr::null_mut(), &mut slots, &safepoints, 31);
+        let ctx = test_alloc_context(std::ptr::null_mut(), &mut frame, &safepoints, 31)
+            .with_spill_area(slots.as_mut_ptr(), slots.len() as u16);
         // SAFETY: `slots` and `safepoints` remain alive while roots are used.
         let frame_roots = unsafe { AllocSafepointFrameRoots::new(&ctx, &safepoint) }.unwrap();
         let roots = AllocValueStubCallRoots::new(
@@ -3049,7 +2961,7 @@ mod tests {
             call_pc: crate::native_abi::NO_CALL_PC,
             id: NO_SAFEPOINT,
             frame_state: NO_FRAME_STATE,
-            tagged_locations: vec![TaggedLocation::frame_slot(0)],
+            spill_roots: SpillRoots::from_slots([0]),
         };
         assert_eq!(
             validate_alloc_safepoint_frame_roots(&ctx, &no_safepoint),
@@ -3062,7 +2974,7 @@ mod tests {
             Err(AllocSafepointRootError::UnknownSafepoint { id: 1 })
         );
 
-        let safepoints = [SafepointRecord::frame_slot_window(7, NO_FRAME_STATE, 1)];
+        let safepoints = [SafepointRecord::window(7, NO_FRAME_STATE)];
         let table_ctx = test_alloc_context(std::ptr::null_mut(), &mut slots, &safepoints, 9);
         // SAFETY: `safepoints` is alive for the lookup.
         assert_eq!(
@@ -3076,43 +2988,19 @@ mod tests {
         );
 
         let missing_slots_ctx = RuntimeStubAllocContext::new(std::ptr::null_mut(), 1);
-        let valid_safepoint = SafepointRecord::frame_slot_window(1, NO_FRAME_STATE, 1);
+        let valid_safepoint = SafepointRecord::window(1, NO_FRAME_STATE);
         assert_eq!(
             validate_alloc_safepoint_frame_roots(&missing_slots_ctx, &valid_safepoint),
-            Err(AllocSafepointRootError::MissingFrameSlots)
-        );
-
-        let out_of_bounds = SafepointRecord::frame_slot_window(2, NO_FRAME_STATE, 2);
-        assert_eq!(
-            validate_alloc_safepoint_frame_roots(&ctx, &out_of_bounds),
-            Err(AllocSafepointRootError::FrameSlotOutOfBounds {
-                index: 1,
-                frame_slot_count: 1,
-            })
-        );
-
-        let unsupported = SafepointRecord {
-            inline_frames: Box::default(),
-            call_pc: crate::native_abi::NO_CALL_PC,
-            id: 3,
-            frame_state: NO_FRAME_STATE,
-            tagged_locations: vec![TaggedLocation::machine_register(0)],
-        };
-        assert_eq!(
-            validate_alloc_safepoint_frame_roots(&ctx, &unsupported),
-            Err(AllocSafepointRootError::UnsupportedLocation {
-                kind: TaggedLocationKind::MachineRegister,
-                index: 0,
-            })
+            Err(AllocSafepointRootError::MissingFrame)
         );
     }
 
     #[test]
     fn map_set_alloc_entry_mutates_and_returns_receiver() {
-        let mut interp = Interpreter::new();
+        let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
         let map = collections::alloc_map(interp.gc_heap_mut()).expect("map");
         let key = crate::string::JsString::from_str("k", interp.gc_heap_mut()).expect("key");
-        let safepoints = [SafepointRecord::frame_slot_window(21, NO_FRAME_STATE, 3)];
+        let safepoints = [SafepointRecord::window(21, NO_FRAME_STATE)];
         let mut slots = [
             Value::map(map).to_abi_bits(),
             Value::string(key).to_abi_bits(),
@@ -3134,10 +3022,10 @@ mod tests {
 
     #[test]
     fn set_add_alloc_entry_mutates_and_returns_receiver() {
-        let mut interp = Interpreter::new();
+        let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
         let set = collections::alloc_set(interp.gc_heap_mut()).expect("set");
         let value = crate::string::JsString::from_str("v", interp.gc_heap_mut()).expect("value");
-        let safepoints = [SafepointRecord::frame_slot_window(22, NO_FRAME_STATE, 3)];
+        let safepoints = [SafepointRecord::window(22, NO_FRAME_STATE)];
         let mut slots = [
             Value::set(set).to_abi_bits(),
             Value::string(value).to_abi_bits(),
@@ -3160,9 +3048,9 @@ mod tests {
 
     #[test]
     fn string_concat_alloc_entry_concats_primitive_string_operands() {
-        let mut interp = Interpreter::new();
+        let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
         let lhs = crate::string::JsString::from_str("k", interp.gc_heap_mut()).expect("lhs");
-        let safepoints = [SafepointRecord::frame_slot_window(24, NO_FRAME_STATE, 3)];
+        let safepoints = [SafepointRecord::window(24, NO_FRAME_STATE)];
         let mut slots = [
             Value::string(lhs).to_abi_bits(),
             n(7).to_abi_bits(),
@@ -3178,7 +3066,9 @@ mod tests {
         let string = value.as_string(interp.gc_heap()).expect("string value");
         assert_eq!(string.to_lossy_string(interp.gc_heap()), "k7");
 
-        slots[1] = Value::boolean(true).to_abi_bits();
+        // The typed native Probe admits only Number/String. Canonical Add
+        // remains the owner of Boolean/object coercion after a pre-effect miss.
+        slots[1] = Value::number_f64(0.25).to_abi_bits();
         let pair = STRING_CONCAT_ALLOC
             .invoke_raw(&mut ctx, 24, slots[0], slots[1], slots[2])
             .expect("entry");
@@ -3186,13 +3076,13 @@ mod tests {
         let string = probe_value(pair)
             .and_then(|value| value.as_string(interp.gc_heap()))
             .expect("string value");
-        assert_eq!(string.to_lossy_string(interp.gc_heap()), "ktrue");
+        assert_eq!(string.to_lossy_string(interp.gc_heap()), "k0.25");
 
         // The left conversion allocates before the generated-stub boundary
         // reads the right string. The right operand must be reloaded from the
         // safepoint slot after that scavenge.
         let lhs_bits = slots[0];
-        slots[0] = Value::boolean(false).to_abi_bits();
+        slots[0] = Value::number_f64(-0.25).to_abi_bits();
         slots[1] = lhs_bits;
         let pair = STRING_CONCAT_ALLOC
             .invoke_raw(&mut ctx, 24, slots[0], slots[1], slots[2])
@@ -3201,7 +3091,26 @@ mod tests {
         let string = probe_value(pair)
             .and_then(|value| value.as_string(interp.gc_heap()))
             .expect("string value");
-        assert_eq!(string.to_lossy_string(interp.gc_heap()), "falsek");
+        assert_eq!(string.to_lossy_string(interp.gc_heap()), "-0.25k");
+
+        // Both unsupported Boolean orderings leave the heap and safepoint
+        // operands unchanged before canonical source coercion can execute.
+        let before = interp.gc_heap_mut().gc_stats().clone();
+        let before_slots = slots;
+        for [lhs, rhs] in [
+            [slots[1], Value::boolean(true).to_abi_bits()],
+            [Value::boolean(false).to_abi_bits(), slots[1]],
+        ] {
+            let pair = STRING_CONCAT_ALLOC
+                .invoke_raw(&mut ctx, 24, lhs, rhs, slots[2])
+                .expect("entry");
+            assert_eq!(probe_status(pair), NativeResultStatus::SideExit);
+        }
+        let after = interp.gc_heap_mut().gc_stats().clone();
+        assert_eq!(after.alloc_bytes_total, before.alloc_bytes_total);
+        assert_eq!(after.minor_gc_cycles, before.minor_gc_cycles);
+        assert_eq!(after.gc_cycles, before.gc_cycles);
+        assert_eq!(slots, before_slots);
 
         let pair = STRING_CONCAT_ALLOC
             .invoke_raw(
@@ -3217,8 +3126,8 @@ mod tests {
 
     #[test]
     fn array_construct_alloc_entry_builds_empty_and_dense_hole_arrays() {
-        let mut interp = Interpreter::new();
-        let safepoints = [SafepointRecord::frame_slot_window(25, NO_FRAME_STATE, 3)];
+        let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
+        let safepoints = [SafepointRecord::window(25, NO_FRAME_STATE)];
         let mut slots = [
             n(0).to_abi_bits(),
             Value::undefined().to_abi_bits(),
@@ -3249,8 +3158,8 @@ mod tests {
 
     #[test]
     fn array_construct_alloc_entry_misses_invalid_length_before_allocation() {
-        let mut interp = Interpreter::new();
-        let safepoints = [SafepointRecord::frame_slot_window(26, NO_FRAME_STATE, 3)];
+        let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
+        let safepoints = [SafepointRecord::window(26, NO_FRAME_STATE)];
         let mut slots = [
             n(0).to_abi_bits(),
             Value::undefined().to_abi_bits(),
@@ -3274,8 +3183,9 @@ mod tests {
 
     #[test]
     fn array_construct_alloc_entry_reports_dense_backing_oom() {
-        let mut interp = Interpreter::with_string_heap_cap(2 * 1024 * 1024);
-        let safepoints = [SafepointRecord::frame_slot_window(27, NO_FRAME_STATE, 3)];
+        let mut interp = Interpreter::with_string_heap_cap(2 * 1024 * 1024)
+            .expect("fixture interpreter bootstrap");
+        let safepoints = [SafepointRecord::window(27, NO_FRAME_STATE)];
         let mut slots = [
             n(1_048_576).to_abi_bits(),
             Value::undefined().to_abi_bits(),
@@ -3293,16 +3203,17 @@ mod tests {
     fn spill_slot_safepoint_root_is_traced_and_validated() {
         let mut heap = otter_gc::GcHeap::new().expect("gc heap");
         let obj = young_object_value(&mut heap);
-        // Frame window holds a non-pointer; the tagged pointer lives only in the
-        // native spill/save area, named by a spill-slot safepoint location.
-        let mut frame = [n(3).to_abi_bits()];
+        let before = obj.as_raw_gc().expect("young spill root");
+        // The actual Graph lazy-frame geometry has no interpreter register
+        // window. This young pointer lives only in its canonical spill home.
+        let mut frame = [];
         let mut spill = [obj.to_abi_bits()];
         let record = SafepointRecord {
             inline_frames: Box::default(),
             call_pc: crate::native_abi::NO_CALL_PC,
             id: 1,
             frame_state: NO_FRAME_STATE,
-            tagged_locations: vec![TaggedLocation::spill_slot(0)],
+            spill_roots: SpillRoots::from_slots([0]),
         };
         let ctx = test_alloc_context(
             std::ptr::null_mut(),
@@ -3311,12 +3222,44 @@ mod tests {
             1,
         )
         .with_spill_area(spill.as_mut_ptr(), spill.len() as u16);
+        // SAFETY: the test context owns this live fixture frame for the test.
+        let published = unsafe { &mut *ctx.current_frame() };
+        published.header.kind = NativeFrameKind::Optimizing;
+        published.registers = crate::RegisterWindow::attached(std::ptr::null_mut(), 0);
+        published.machine_roots = spill.as_mut_ptr() as u64;
+        published.call_site = record.id;
+        assert_eq!(published.header.register_count, 0);
+        assert_eq!(published.register_base(), 0);
+        assert!(!ctx.has_frame_slots());
+        assert!(ctx.has_spill_slots());
 
         validate_alloc_safepoint_frame_roots(&ctx, &record).expect("spill root validates");
         let roots = unsafe { AllocSafepointFrameRoots::new(&ctx, &record) }.expect("publisher");
         let mut visited = 0usize;
         roots.visit_extra_roots(&mut |_p| visited += 1);
         assert_eq!(visited, 1, "the spill-slot pointer is traced exactly once");
+        heap.collect_minor_with_roots(&mut |visitor| roots.visit_extra_roots(visitor))
+            .expect("real moving collection through the lazy frame's spill map");
+        let moved = Value::from_abi_bits(spill[0]);
+        assert_ne!(
+            moved.as_raw_gc().expect("collector-rewritten spill root"),
+            before,
+            "the only retained young pointer relocates in the canonical spill home"
+        );
+        let object = moved.as_object().expect("same object value after movement");
+        assert_eq!(
+            heap.read_payload(object, crate::object::ObjectBody::slot_count),
+            0,
+            "the rewritten root names its live object payload"
+        );
+
+        // A spill window never substitutes for publication of the current frame.
+        let missing_frame = RuntimeStubAllocContext::new(std::ptr::null_mut(), 1)
+            .with_spill_area(spill.as_mut_ptr(), spill.len() as u16);
+        assert_eq!(
+            validate_alloc_safepoint_frame_roots(&missing_frame, &record),
+            Err(AllocSafepointRootError::MissingFrame)
+        );
 
         // A spill-slot location without a published spill window is rejected, and
         // a machine-register location remains unsupported (spilled first).
@@ -3330,18 +3273,15 @@ mod tests {
             validate_alloc_safepoint_frame_roots(&no_spill, &record),
             Err(AllocSafepointRootError::MissingSpillSlots)
         );
-        let reg_record = SafepointRecord {
-            inline_frames: Box::default(),
-            call_pc: crate::native_abi::NO_CALL_PC,
-            id: 1,
-            frame_state: NO_FRAME_STATE,
-            tagged_locations: vec![TaggedLocation::machine_register(0)],
+        let out_of_bounds = SafepointRecord {
+            spill_roots: SpillRoots::from_slots([1]),
+            ..record.clone()
         };
         assert_eq!(
-            validate_alloc_safepoint_frame_roots(&ctx, &reg_record),
-            Err(AllocSafepointRootError::UnsupportedLocation {
-                kind: TaggedLocationKind::MachineRegister,
-                index: 0,
+            validate_alloc_safepoint_frame_roots(&ctx, &out_of_bounds),
+            Err(AllocSafepointRootError::SpillSlotOutOfBounds {
+                index: 1,
+                spill_slot_count: 1,
             })
         );
     }
@@ -3357,8 +3297,8 @@ mod tests {
         );
         assert_eq!(probe_status(pair), NativeResultStatus::SideExit);
 
-        let mut interp = Interpreter::new();
-        let safepoints = [SafepointRecord::frame_slot_window(1, NO_FRAME_STATE, 1)];
+        let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
+        let safepoints = [SafepointRecord::window(1, NO_FRAME_STATE)];
         let mut slots = [Value::undefined().to_abi_bits()];
         let mut ctx = test_alloc_context(&mut interp, &mut slots, &safepoints, 1);
         let pair = collection_set_add_alloc(
@@ -3418,7 +3358,7 @@ mod tests {
 
     #[test]
     fn collection_lookup_alloc_entries_materialize_rope_keys() {
-        let mut interp = Interpreter::new();
+        let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
         let map = collections::alloc_map(interp.gc_heap_mut()).expect("map");
         let set = collections::alloc_set(interp.gc_heap_mut()).expect("set");
         // Short concatenations flatten in place; long operands keep the keys
@@ -3442,7 +3382,7 @@ mod tests {
         let lookup_rope =
             crate::string::JsString::concat(lookup_left, lookup_right, interp.gc_heap_mut())
                 .expect("lookup rope");
-        let safepoints = [SafepointRecord::frame_slot_window(23, NO_FRAME_STATE, 3)];
+        let safepoints = [SafepointRecord::window(23, NO_FRAME_STATE)];
 
         let mut insert_map_slots = [
             Value::map(map).to_abi_bits(),
@@ -3610,7 +3550,6 @@ mod tests {
                         | crate::native_abi::RuntimeStubSignature::ReentrantValueSpan
                         | crate::native_abi::RuntimeStubSignature::CommittedValue2
                         | crate::native_abi::RuntimeStubSignature::RouteThrow1
-                        | crate::native_abi::RuntimeStubSignature::AcknowledgeCaughtThrow0
                         | crate::native_abi::RuntimeStubSignature::ExecutionEntry0
                         | crate::native_abi::RuntimeStubSignature::JsCall
                 ));
@@ -3657,7 +3596,7 @@ mod tests {
 
     #[test]
     fn jit_binding_installation_validates_inventory_without_persistent_table() {
-        let mut interp = Interpreter::new();
+        let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
         assert!(!interp.jit_compiler_installed());
         interp.set_jit_compiler(Some(std::sync::Arc::new(BindingHook(all_jit_bindings()))));
         assert!(interp.jit_compiler_installed());
@@ -3670,7 +3609,9 @@ mod tests {
     fn jit_binding_with_wrong_signature_family_panics() {
         let mut binding = poll_binding();
         binding.signature = crate::native_abi::RuntimeStubSignature::LeafValue2;
-        Interpreter::new().set_jit_compiler(Some(std::sync::Arc::new(BindingHook(vec![binding]))));
+        Interpreter::new()
+            .expect("fixture interpreter bootstrap")
+            .set_jit_compiler(Some(std::sync::Arc::new(BindingHook(vec![binding]))));
     }
 
     #[test]
@@ -3682,13 +3623,17 @@ mod tests {
             signature: descriptor.signature,
             entry_addr: 0x1000,
         };
-        Interpreter::new().set_jit_compiler(Some(std::sync::Arc::new(BindingHook(vec![binding]))));
+        Interpreter::new()
+            .expect("fixture interpreter bootstrap")
+            .set_jit_compiler(Some(std::sync::Arc::new(BindingHook(vec![binding]))));
     }
 
     #[test]
     #[should_panic(expected = "left vacant")]
     fn jit_installation_requires_complete_inventory() {
-        Interpreter::new().set_jit_compiler(Some(std::sync::Arc::new(BindingHook(Vec::new()))));
+        Interpreter::new()
+            .expect("fixture interpreter bootstrap")
+            .set_jit_compiler(Some(std::sync::Arc::new(BindingHook(Vec::new()))));
     }
 
     #[test]
@@ -3696,6 +3641,8 @@ mod tests {
     fn jit_installation_rejects_duplicate_bindings() {
         let mut bindings = all_jit_bindings();
         bindings.push(bindings[0]);
-        Interpreter::new().set_jit_compiler(Some(std::sync::Arc::new(BindingHook(bindings))));
+        Interpreter::new()
+            .expect("fixture interpreter bootstrap")
+            .set_jit_compiler(Some(std::sync::Arc::new(BindingHook(bindings))));
     }
 }

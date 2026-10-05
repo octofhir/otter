@@ -9,6 +9,8 @@
 //! - Moving primitive payloads are re-read from a handle after every wrapper
 //!   allocation; raw string, symbol, and bigint handles never cross a GC point.
 //! - Sloppy receiver boxing preserves the caller's stack/runtime root domain.
+//! - Nullish sloppy receivers use their function's actual linked global; a
+//!   disposed source realm fails admission without an ambient substitution.
 //!
 //! # See also
 //! - `crate::allocation_ops` — rooted object allocation helpers.
@@ -656,13 +658,13 @@ impl Interpreter {
             let proto = self.primitive_wrapper_prototype("Boolean")?;
             let mut obj =
                 self.alloc_runtime_rooted_object_with_proto(proto, &[&this_value], slice_roots)?;
-            object::set_boolean_data(&mut obj, &mut self.gc_heap, value);
+            object::set_boolean_data(&mut obj, &mut self.gc_heap, value)?;
             obj
         } else if let Some(value) = this_value.as_number() {
             let proto = self.primitive_wrapper_prototype("Number")?;
             let mut obj =
                 self.alloc_runtime_rooted_object_with_proto(proto, &[&this_value], slice_roots)?;
-            object::set_number_data(&mut obj, &mut self.gc_heap, value);
+            object::set_number_data(&mut obj, &mut self.gc_heap, value)?;
             obj
         } else if this_value.as_string(&self.gc_heap).is_some() {
             self.with_handle_scope(|interp, scope| -> Result<JsObject, VmError> {
@@ -674,7 +676,7 @@ impl Interpreter {
                     .escape_scoped(rooted)
                     .as_string(&interp.gc_heap)
                     .ok_or(VmError::InvalidOperand)?;
-                object::set_string_data(&mut obj, &mut interp.gc_heap, value);
+                object::set_string_data(&mut obj, &mut interp.gc_heap, value)?;
                 Ok(obj)
             })?
         } else if this_value.as_symbol(&self.gc_heap).is_some() {
@@ -687,7 +689,7 @@ impl Interpreter {
                     .escape_scoped(rooted)
                     .as_symbol(&interp.gc_heap)
                     .ok_or(VmError::InvalidOperand)?;
-                object::set_symbol_data(&mut obj, &mut interp.gc_heap, value);
+                object::set_symbol_data(&mut obj, &mut interp.gc_heap, value)?;
                 Ok(obj)
             })?
         } else if this_value.as_big_int().is_some() {
@@ -700,7 +702,7 @@ impl Interpreter {
                     .escape_scoped(rooted)
                     .as_big_int()
                     .ok_or(VmError::InvalidOperand)?;
-                object::set_bigint_data(&mut obj, &mut interp.gc_heap, value);
+                object::set_bigint_data(&mut obj, &mut interp.gc_heap, value)?;
                 Ok(obj)
             })?
         } else {
@@ -723,7 +725,7 @@ impl Interpreter {
                 &[&this_value],
                 slice_roots,
             )?;
-            object::set_boolean_data(&mut obj, &mut self.gc_heap, value);
+            object::set_boolean_data(&mut obj, &mut self.gc_heap, value)?;
             obj
         } else if let Some(value) = this_value.as_number() {
             let proto = self.primitive_wrapper_prototype("Number")?;
@@ -733,7 +735,7 @@ impl Interpreter {
                 &[&this_value],
                 slice_roots,
             )?;
-            object::set_number_data(&mut obj, &mut self.gc_heap, value);
+            object::set_number_data(&mut obj, &mut self.gc_heap, value)?;
             obj
         } else if this_value.as_string(&self.gc_heap).is_some() {
             self.with_handle_scope(|interp, scope| -> Result<JsObject, VmError> {
@@ -745,7 +747,7 @@ impl Interpreter {
                     .escape_scoped(rooted)
                     .as_string(&interp.gc_heap)
                     .ok_or(VmError::InvalidOperand)?;
-                object::set_string_data(&mut obj, &mut interp.gc_heap, value);
+                object::set_string_data(&mut obj, &mut interp.gc_heap, value)?;
                 Ok(obj)
             })?
         } else if this_value.as_symbol(&self.gc_heap).is_some() {
@@ -758,7 +760,7 @@ impl Interpreter {
                     .escape_scoped(rooted)
                     .as_symbol(&interp.gc_heap)
                     .ok_or(VmError::InvalidOperand)?;
-                object::set_symbol_data(&mut obj, &mut interp.gc_heap, value);
+                object::set_symbol_data(&mut obj, &mut interp.gc_heap, value)?;
                 Ok(obj)
             })?
         } else if this_value.as_big_int().is_some() {
@@ -771,7 +773,7 @@ impl Interpreter {
                     .escape_scoped(rooted)
                     .as_big_int()
                     .ok_or(VmError::InvalidOperand)?;
-                object::set_bigint_data(&mut obj, &mut interp.gc_heap, value);
+                object::set_bigint_data(&mut obj, &mut interp.gc_heap, value)?;
                 Ok(obj)
             })?
         } else {
@@ -788,12 +790,12 @@ impl Interpreter {
         let object = if let Some(v) = value.as_boolean() {
             let proto = self.primitive_wrapper_prototype("Boolean")?;
             let mut obj = self.alloc_stack_rooted_object_with_proto(stack, proto, &[value], &[])?;
-            object::set_boolean_data(&mut obj, &mut self.gc_heap, v);
+            object::set_boolean_data(&mut obj, &mut self.gc_heap, v)?;
             obj
         } else if let Some(v) = value.as_number() {
             let proto = self.primitive_wrapper_prototype("Number")?;
             let mut obj = self.alloc_stack_rooted_object_with_proto(stack, proto, &[value], &[])?;
-            object::set_number_data(&mut obj, &mut self.gc_heap, v);
+            object::set_number_data(&mut obj, &mut self.gc_heap, v)?;
             obj
         } else if value.as_string(&self.gc_heap).is_some() {
             let proto = self.primitive_wrapper_prototype("String")?;
@@ -803,7 +805,7 @@ impl Interpreter {
             let v = value
                 .as_string(&self.gc_heap)
                 .ok_or(VmError::InvalidOperand)?;
-            object::set_string_data(&mut obj, &mut self.gc_heap, v);
+            object::set_string_data(&mut obj, &mut self.gc_heap, v)?;
             obj
         } else if value.is_symbol() {
             let proto = self.primitive_wrapper_prototype("Symbol")?;
@@ -831,7 +833,7 @@ impl Interpreter {
             return Ok(this_value);
         }
         if this_value.is_undefined() || this_value.is_null() {
-            Ok(Value::object(self.global_this_for_function(function.id)))
+            Ok(Value::object(self.global_this_for_function(function.id)?))
         } else {
             self.box_sloppy_this_primitive_stack_rooted(stack, this_value, slice_roots)
         }
@@ -863,7 +865,7 @@ impl Interpreter {
             &mut self.gc_heap,
             spec.constructor.name,
             descriptor,
-        ) {
+        )? {
             Ok(())
         } else {
             Err(JsSurfaceError::DefinePropertyFailed(spec.constructor.name))

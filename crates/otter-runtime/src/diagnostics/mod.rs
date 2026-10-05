@@ -10,7 +10,9 @@
 //! - [`StackFrame`] — runtime stack-frame metadata.
 //!
 //! # Invariants
-//! - DTOs are owned and serializable; parser/VM internals never cross the
+//! - DTOs are owned and serializable. Captured positions share the original
+//!   accounted source owner, so they are not deserialized without admission.
+//!   Parser/VM internals never cross the
 //!   public runtime boundary.
 //! - `range` and `span` are byte offsets into `source_url`; both are kept while
 //!   older callers still consume `span`.
@@ -29,7 +31,7 @@ pub use codes::{DiagnosticCategory, DiagnosticCode};
 use serde::{Deserialize, Serialize};
 
 /// Stable diagnostic shape (foundation subset).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct Diagnostic {
     /// ECMAScript-thrown class for runtime diagnostics
     /// (`TypeError` / `RangeError` / …) or one of the host-side
@@ -226,7 +228,7 @@ pub enum DiagnosticKind {
 }
 
 /// Single stack frame.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct StackFrame {
     /// Function name; `"<main>"` for the script entry.
     pub function: String,
@@ -234,4 +236,8 @@ pub struct StackFrame {
     pub module: String,
     /// Source span within `module`.
     pub span: Option<(u32, u32)>,
+    /// Exact defining-source position captured before code reclamation. Clones
+    /// share its accounted text allocation; no executable chunk is retained.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_position: Option<otter_vm::ErrorSourcePosition>,
 }

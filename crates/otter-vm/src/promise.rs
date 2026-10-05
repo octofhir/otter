@@ -98,6 +98,8 @@ pub struct PromiseReaction {
     /// time so host-driven settlement (e.g. cross-thread promise
     /// resolution) can resume on the right module.
     pub context: Option<ExecutionContext>,
+    /// Realm selected from this handler by GetFunctionRealm at admission.
+    pub realm_id: u32,
     /// Otter-specific: async context current when this reaction was
     /// registered. The job restores it, so a store entered before `then` is
     /// still current inside the handler.
@@ -118,6 +120,7 @@ impl otter_gc::GcStore for PromiseReaction {
     fn visit_gc_edges(&self, visitor: &mut dyn FnMut(otter_gc::GcEdge)) {
         self.capability.visit_gc_edges(visitor);
         self.handler.visit_gc_edges(visitor);
+        self.async_context.visit_gc_edges(visitor);
     }
 }
 
@@ -283,15 +286,6 @@ pub trait JsPromise: std::fmt::Debug {
     /// Mark rejected. No-op if already settled.
     fn reject(&self, heap: &mut otter_gc::GcHeap, reason: Value) -> PromiseSettleJobs;
 
-    /// `PerformPromiseThen` (§27.2.5.4).
-    fn perform_then(
-        &self,
-        heap: &mut otter_gc::GcHeap,
-        on_fulfilled: Option<Value>,
-        on_rejected: Option<Value>,
-        capability: PromiseCapability,
-    ) -> PromiseThenOutcome;
-
     /// `PerformPromiseThen` with explicit context ownership for the
     /// queued reaction job.
     fn perform_then_with_context(
@@ -302,6 +296,8 @@ pub trait JsPromise: std::fmt::Debug {
         capability: PromiseCapability,
         context: Option<ExecutionContext>,
         async_context: Value,
+        fulfill_realm_id: u32,
+        reject_realm_id: u32,
     ) -> PromiseThenOutcome;
 
     /// `true` once any reaction has been attached.
@@ -552,9 +548,16 @@ impl PurePromise {
         owner: Option<crate::generator::JsGenerator>,
         context: Option<ExecutionContext>,
         async_context: Value,
+        realm_id: u32,
     ) -> PromiseThenOutcome {
-        let outcome =
-            self.perform_then_internal(heap, capability, context, async_context, |kind| {
+        let outcome = self.perform_then_internal(
+            heap,
+            capability,
+            context,
+            async_context,
+            realm_id,
+            realm_id,
+            |kind| {
                 let fulfilled = kind == ReactionKind::Fulfill;
                 match owner {
                     Some(owner) => PromiseReactionHandler::AsyncGenResume {
@@ -569,7 +572,8 @@ impl PurePromise {
                         fulfilled,
                     },
                 }
-            });
+            },
+        );
         self.finish_then_outcome(heap, outcome)
     }
 
@@ -579,9 +583,11 @@ impl PurePromise {
         capability: PromiseCapability,
         context: Option<ExecutionContext>,
         async_context: Value,
+        fulfill_realm_id: u32,
+        reject_realm_id: u32,
         mut handler_for: impl FnMut(ReactionKind) -> PromiseReactionHandler,
     ) -> ThenOutcomeInternal {
-        let reaction_context = context.or_else(|| capability.context.clone());
+        let reaction_context = context;
         heap.with_payload(self.inner, |body| {
             body.is_handled = true;
             match body.state.clone() {
@@ -590,6 +596,7 @@ impl PurePromise {
                         capability: capability.clone(),
                         handler: handler_for(ReactionKind::Fulfill),
                         kind: ReactionKind::Fulfill,
+                        realm_id: fulfill_realm_id,
                         context: reaction_context.clone(),
                         async_context,
                     };
@@ -597,6 +604,7 @@ impl PurePromise {
                         capability,
                         handler: handler_for(ReactionKind::Reject),
                         kind: ReactionKind::Reject,
+                        realm_id: reject_realm_id,
                         context: reaction_context,
                         async_context,
                     };
@@ -612,6 +620,7 @@ impl PurePromise {
                         capability,
                         handler: handler_for(ReactionKind::Fulfill),
                         kind: ReactionKind::Fulfill,
+                        realm_id: fulfill_realm_id,
                         context: reaction_context,
                         async_context,
                     };
@@ -625,6 +634,7 @@ impl PurePromise {
                         capability,
                         handler: handler_for(ReactionKind::Reject),
                         kind: ReactionKind::Reject,
+                        realm_id: reject_realm_id,
                         context: reaction_context,
                         async_context,
                     };
@@ -706,23 +716,6 @@ impl JsPromise for PurePromise {
         }
     }
 
-    fn perform_then(
-        &self,
-        heap: &mut otter_gc::GcHeap,
-        on_fulfilled: Option<Value>,
-        on_rejected: Option<Value>,
-        capability: PromiseCapability,
-    ) -> PromiseThenOutcome {
-        self.perform_then_with_context(
-            heap,
-            on_fulfilled,
-            on_rejected,
-            capability,
-            None,
-            Value::undefined(),
-        )
-    }
-
     fn perform_then_with_context(
         &self,
         heap: &mut otter_gc::GcHeap,
@@ -731,12 +724,16 @@ impl JsPromise for PurePromise {
         capability: PromiseCapability,
         context: Option<ExecutionContext>,
         async_context: Value,
+        fulfill_realm_id: u32,
+        reject_realm_id: u32,
     ) -> PromiseThenOutcome {
         let outcome = self.perform_then_internal(
             heap,
             capability,
             context,
             async_context,
+            fulfill_realm_id,
+            reject_realm_id,
             |kind| match kind {
                 ReactionKind::Fulfill => PromiseReactionHandler::Call(on_fulfilled),
                 ReactionKind::Reject => PromiseReactionHandler::Call(on_rejected),
@@ -913,29 +910,9 @@ impl JsPromiseHandle {
         }
     }
 
-    /// Attach explicit parked-frame reactions for `await`.
-    pub fn perform_async_resume_then(
-        &self,
-        heap: &mut otter_gc::GcHeap,
-        parked: crate::generator::ParkedFrame,
-        await_dst: u16,
-        capability: PromiseCapability,
-        owner: Option<crate::generator::JsGenerator>,
-    ) -> PromiseThenOutcome {
-        self.perform_async_resume_then_with_context(
-            heap,
-            parked,
-            await_dst,
-            capability,
-            owner,
-            None,
-            Value::undefined(),
-        )
-    }
-
     /// Attach parked-frame reactions for `await` with explicit
     /// context ownership.
-    pub fn perform_async_resume_then_with_context(
+    pub fn perform_async_resume_then(
         &self,
         heap: &mut otter_gc::GcHeap,
         parked: crate::generator::ParkedFrame,
@@ -944,6 +921,7 @@ impl JsPromiseHandle {
         owner: Option<crate::generator::JsGenerator>,
         context: Option<ExecutionContext>,
         async_context: Value,
+        realm_id: u32,
     ) -> PromiseThenOutcome {
         match self.inner {
             PromiseRepr::Pure(p) => p.perform_async_resume_then(
@@ -954,6 +932,7 @@ impl JsPromiseHandle {
                 owner,
                 context,
                 async_context,
+                realm_id,
             ),
         }
     }
@@ -978,18 +957,6 @@ impl JsPromise for JsPromiseHandle {
         }
     }
 
-    fn perform_then(
-        &self,
-        heap: &mut otter_gc::GcHeap,
-        on_fulfilled: Option<Value>,
-        on_rejected: Option<Value>,
-        capability: PromiseCapability,
-    ) -> PromiseThenOutcome {
-        match self.inner {
-            PromiseRepr::Pure(p) => p.perform_then(heap, on_fulfilled, on_rejected, capability),
-        }
-    }
-
     fn perform_then_with_context(
         &self,
         heap: &mut otter_gc::GcHeap,
@@ -998,6 +965,8 @@ impl JsPromise for JsPromiseHandle {
         capability: PromiseCapability,
         context: Option<ExecutionContext>,
         async_context: Value,
+        fulfill_realm_id: u32,
+        reject_realm_id: u32,
     ) -> PromiseThenOutcome {
         match self.inner {
             PromiseRepr::Pure(p) => p.perform_then_with_context(
@@ -1007,6 +976,8 @@ impl JsPromise for JsPromiseHandle {
                 capability,
                 context,
                 async_context,
+                fulfill_realm_id,
+                reject_realm_id,
             ),
         }
     }
@@ -1035,7 +1006,7 @@ impl JsPromise for JsPromiseHandle {
 ///
 /// Turns a queued [`PromiseReaction`] record into a [`Microtask`] the
 /// drain can run. Spec returns a `{ [[Job]], [[Realm]] }` record;
-/// Otter inlines `[[Realm]]` into the microtask's execution context
+/// Otter stores `[[Realm]]` separately from the admitted source context
 /// and returns the job directly.
 ///
 /// The async-resume reaction variants are Otter extensions that
@@ -1076,6 +1047,7 @@ pub fn new_promise_reaction_job(
                 this_value: Value::undefined(),
                 args: smallvec![value],
                 context: reaction.context,
+                realm_id: reaction.realm_id,
                 result_capability,
                 kind: MicrotaskKind::Call,
                 async_context,
@@ -1092,6 +1064,7 @@ pub fn new_promise_reaction_job(
                 this_value: Value::undefined(),
                 args: smallvec![value],
                 context: reaction.context,
+                realm_id: reaction.realm_id,
                 result_capability: None,
                 kind: MicrotaskKind::AsyncResume {
                     frame,
@@ -1114,6 +1087,7 @@ pub fn new_promise_reaction_job(
                 this_value: Value::undefined(),
                 args: smallvec![value],
                 context: reaction.context,
+                realm_id: reaction.realm_id,
                 result_capability: None,
                 async_context,
                 kind: MicrotaskKind::AsyncGenResume {
@@ -1155,8 +1129,11 @@ mod tests {
     }
 
     fn empty_context() -> ExecutionContext {
-        ExecutionContext::from_module(crate::test_support::minimal_bytecode_module("promise-test"))
-            .expect("valid bytecode fixture")
+        ExecutionContext::from_module(
+            crate::test_support::minimal_bytecode_module("promise-test"),
+            crate::source_registry::SourceRegistry::default(),
+        )
+        .expect("valid bytecode fixture")
     }
 
     #[test]
@@ -1194,7 +1171,8 @@ mod tests {
         let mut heap = otter_gc::GcHeap::new().expect("heap");
         let p = PurePromise::pending(&mut heap).expect("promise");
         let cap = cap_for(&mut heap);
-        let outcome = p.perform_then(&mut heap, None, None, cap);
+        let outcome =
+            p.perform_then_with_context(&mut heap, None, None, cap, None, Value::undefined(), 0, 0);
         assert!(outcome.immediate_job.is_none());
         assert!(p.is_handled(&heap));
     }
@@ -1204,19 +1182,48 @@ mod tests {
         let mut heap = otter_gc::GcHeap::new().expect("heap");
         let p = PurePromise::fulfilled(&mut heap, n(42)).expect("promise");
         let cap = cap_for(&mut heap);
-        let outcome = p.perform_then(&mut heap, None, None, cap);
+        let outcome =
+            p.perform_then_with_context(&mut heap, None, None, cap, None, Value::undefined(), 0, 0);
         assert!(outcome.immediate_job.is_some());
     }
 
     #[test]
-    fn capability_context_flows_into_reaction_job() {
+    fn reaction_context_is_explicit_and_not_inferred_from_capability() {
         let mut heap = otter_gc::GcHeap::new().expect("heap");
         let p = PurePromise::fulfilled(&mut heap, n(42)).expect("promise");
         let mut cap = cap_for(&mut heap);
         cap.context = Some(empty_context());
-        let outcome = p.perform_then(&mut heap, None, None, cap);
+        let outcome =
+            p.perform_then_with_context(&mut heap, None, None, cap, None, Value::undefined(), 0, 0);
         let job = outcome.immediate_job.expect("reaction job");
-        assert!(job.context.is_some());
+        assert!(
+            job.context.is_none(),
+            "native-only reaction retains explicit None"
+        );
+        // The capability keeps its own context; a handler-less pass-through
+        // settles that capability directly instead of adopting its context.
+        assert!(
+            job.result_capability.is_none(),
+            "handler-less pass-through settles the capability directly"
+        );
+        let cap = cap_for(&mut heap);
+        let outcome = p.perform_then_with_context(
+            &mut heap,
+            None,
+            None,
+            cap,
+            Some(empty_context()),
+            Value::undefined(),
+            0,
+            0,
+        );
+        assert!(
+            outcome
+                .immediate_job
+                .expect("explicit reaction job")
+                .context
+                .is_some()
+        );
     }
 
     #[test]
@@ -1224,9 +1231,9 @@ mod tests {
         let mut heap = otter_gc::GcHeap::new().expect("heap");
         let p = PurePromise::pending(&mut heap).expect("promise");
         let cap = cap_for(&mut heap);
-        p.perform_then(&mut heap, None, None, cap);
+        p.perform_then_with_context(&mut heap, None, None, cap, None, Value::undefined(), 0, 0);
         let cap = cap_for(&mut heap);
-        p.perform_then(&mut heap, None, None, cap);
+        p.perform_then_with_context(&mut heap, None, None, cap, None, Value::undefined(), 0, 0);
         let jobs = p.fulfill(&mut heap, n(11));
         assert_eq!(jobs.jobs.len(), 2);
     }
@@ -1246,7 +1253,7 @@ mod tests {
             // we can assert per-job identity after the drain.
             cap.resolve = n(tag);
             caps.push(cap.clone());
-            p.perform_then(&mut heap, None, None, cap);
+            p.perform_then_with_context(&mut heap, None, None, cap, None, Value::undefined(), 0, 0);
         }
         let jobs = p.fulfill(&mut heap, n(99));
         assert_eq!(jobs.jobs.len(), caps.len());

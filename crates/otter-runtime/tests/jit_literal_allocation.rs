@@ -3,7 +3,8 @@
 //! # Contents
 //! - Empty, sparse and dense literals with aliased moving references.
 //! - Dense encoding limit and incremental construction above that limit.
-//! - Machine allocation with unrelated live values and mixed tagged elements.
+//! - Optimizing-tier allocation with unrelated live values and mixed tagged
+//!   elements.
 //!
 //! # Invariants
 //! - Compiled results match the interpreter and allocation does not turn a
@@ -13,7 +14,7 @@
 use otter_runtime::{JitArtifactFileName, JitDebugRequest, JitSelection, Runtime, SourceInput};
 
 #[test]
-fn machine_literal_spans_publish_live_roots_and_preserve_holes() {
+fn optimizing_literal_allocation_keeps_live_roots_and_preserves_holes() {
     let source = r#"
 function allocate(input) {
   const empty = {};
@@ -36,44 +37,19 @@ JSON.stringify([
     ] {
         let mut runtime = Runtime::builder()
             .jit_selection(selection)
-            .jit_debug(JitDebugRequest::artifacts().with_events(true))
             .build()
-            .expect("Machine literal runtime");
+            .expect("optimizing literal runtime");
         let result = runtime
-            .run_script(SourceInput::from_javascript(source), "machine-literals.js")
-            .expect("Machine literal allocation");
+            .run_script(
+                SourceInput::from_javascript(source),
+                "optimizing-literals.js",
+            )
+            .expect("optimizing literal allocation");
         assert_eq!(
             result.completion_string(),
-            "[true,true,true,5,false,41,1.5,true,42]"
+            "[true,true,true,5,false,41,1.5,true,42]",
+            "{selection:?}"
         );
-        if selection == JitSelection::ProductionTiered {
-            assert!(
-                result
-                    .jit_artifacts()
-                    .is_some_and(|batch| batch.bundles().iter().any(|bundle| {
-                        bundle.manifest().function_name() == "allocate"
-                            && bundle.manifest().tier() == otter_runtime::JitDebugTier::Optimizing
-                            && bundle
-                                .file(JitArtifactFileName::CodeMap)
-                                .is_some_and(|file| {
-                                    let map: serde_json::Value =
-                                        serde_json::from_slice(file.contents())
-                                            .expect("Machine code map");
-                                    map["regions"]
-                                        .as_array()
-                                        .expect("Machine regions")
-                                        .iter()
-                                        .filter(|region| {
-                                            region["kind"] == "machineLiteralAllocation"
-                                        })
-                                        .count()
-                                        == 3
-                                })
-                    })),
-                "literal fixture must compile through Machine: {:?}",
-                result.jit_debug_report()
-            );
-        }
         runtime
             .force_gc()
             .expect("literal roots must unlink on return");

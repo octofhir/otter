@@ -142,7 +142,7 @@ fn to_integer_or_infinity_arg(
         .ok_or_else(|| type_error("missing execution context"))?;
     let number = ctx.with_turn_parts(|interp, stack| {
         crate::coerce::to_number_or_throw(interp, stack, &exec, value)
-            .map_err(|e| crate::native_function::vm_to_native_error(interp, e, name))
+            .map_err(|e| e.into_native(interp, name))
     })?;
     let n = number.as_f64();
     if n.is_nan() {
@@ -181,9 +181,8 @@ fn integer_index_arg(
         .ok_or_else(|| type_error("missing execution context"))?;
     let n = ctx
         .with_turn_parts(|interp, stack| {
-            crate::coerce::to_number_or_throw(interp, stack, &exec, v).map_err(|e| {
-                crate::native_function::vm_to_native_error(interp, e, "TypedArray.prototype")
-            })
+            crate::coerce::to_number_or_throw(interp, stack, &exec, v)
+                .map_err(|e| e.into_native(interp, "TypedArray.prototype"))
         })?
         .as_f64();
     if n.is_nan() {
@@ -225,9 +224,8 @@ fn ta_set_offset(ctx: &mut NativeCtx<'_>, arg: Option<&Value>) -> Result<f64, Na
         .cloned()
         .ok_or_else(|| type_error("missing execution context"))?;
     let number = ctx.with_turn_parts(|interp, stack| {
-        crate::coerce::to_number_or_throw(interp, stack, &exec, value).map_err(|e| {
-            crate::native_function::vm_to_native_error(interp, e, "TypedArray.prototype.set")
-        })
+        crate::coerce::to_number_or_throw(interp, stack, &exec, value)
+            .map_err(|e| e.into_native(interp, "TypedArray.prototype.set"))
     })?;
     let n = number.as_f64();
     Ok(if n.is_nan() { 0.0 } else { n.trunc() })
@@ -535,13 +533,8 @@ fn impl_join(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeErr
                         reason: "missing execution context".to_string(),
                     })?;
             ctx.with_turn_parts(|interp, stack| {
-                crate::coerce::to_string_or_throw(interp, stack, &exec_ctx, v).map_err(|e| {
-                    crate::native_function::vm_to_native_error(
-                        interp,
-                        e,
-                        "TypedArray.prototype.join",
-                    )
-                })
+                crate::coerce::to_string_or_throw(interp, stack, &exec_ctx, v)
+                    .map_err(|e| e.into_native(interp, "TypedArray.prototype.join"))
             })?
         }
     };
@@ -609,7 +602,7 @@ fn impl_to_locale_string(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Valu
         let rendered = ctx.call(method, element, &forwarded)?;
         let s = ctx.with_turn_parts(|interp, stack| {
             crate::coerce::to_string_or_throw(interp, stack, &exec, &rendered)
-                .map_err(|e| crate::native_function::vm_to_native_error(interp, e, NAME))
+                .map_err(|e| e.into_native(interp, NAME))
         })?;
         parts.push(s);
     }
@@ -756,15 +749,23 @@ fn ta_get(
         .execution_context()
         .cloned()
         .ok_or_else(|| type_error("missing execution context"))?;
-    let outcome = ctx.with_turn_parts(|interp, stack| {
-        interp
-            .ordinary_get_value(stack, &exec, source, source, &key, 0)
-            .map_err(|e| crate::native_function::vm_to_native_error(interp, e, NAME))
-    })?;
-    match outcome {
-        crate::VmGetOutcome::Value(v) => Ok(v),
-        crate::VmGetOutcome::InvokeGetter { getter } => ctx.call(getter, source, &[]),
-    }
+    ctx.scope(|mut scope| {
+        let receiver = scope.value(source);
+        let current = scope.raw(receiver);
+        let outcome = scope.with_turn_parts(|interp, stack| {
+            interp
+                .ordinary_get_value(stack, Some(&exec), current, current, &key, 0)
+                .map_err(|error| error.into_native(interp, NAME))
+        })?;
+        match outcome {
+            crate::VmGetOutcome::Value(value) => Ok(value),
+            crate::VmGetOutcome::InvokeGetter { getter } => {
+                let getter = scope.value(getter);
+                let result = scope.call(getter, receiver, &[])?;
+                Ok(scope.finish(result))
+            }
+        }
+    })
 }
 
 /// §7.3.20 LengthOfArrayLike — `ToLength(Get(source, "length"))`.
@@ -776,7 +777,7 @@ fn ta_array_like_length(ctx: &mut NativeCtx<'_>, source: Value) -> Result<usize,
         .ok_or_else(|| type_error("missing execution context"))?;
     let number = ctx.with_turn_parts(|interp, stack| {
         crate::coerce::to_number_or_throw(interp, stack, &exec, &len_value)
-            .map_err(|e| crate::native_function::vm_to_native_error(interp, e, NAME))
+            .map_err(|e| e.into_native(interp, NAME))
     })?;
     let n = number.as_f64();
     let len = if n.is_nan() || n <= 0.0 {
@@ -803,13 +804,13 @@ fn ta_coerce_value(
     let converted = if kind.is_bigint() {
         let big = ctx.with_turn_parts(|interp, stack| {
             crate::coerce::to_big_int_or_throw(interp, stack, &exec, value)
-                .map_err(|e| crate::native_function::vm_to_native_error(interp, e, NAME))
+                .map_err(|e| e.into_native(interp, NAME))
         })?;
         Value::big_int(big)
     } else {
         let number = ctx.with_turn_parts(|interp, stack| {
             crate::coerce::to_number_or_throw(interp, stack, &exec, value)
-                .map_err(|e| crate::native_function::vm_to_native_error(interp, e, NAME))
+                .map_err(|e| e.into_native(interp, NAME))
         })?;
         number_value(number.as_f64())
     };
@@ -925,13 +926,7 @@ fn sort_with_comparefn(
                         .with_turn_parts(|interp, stack| {
                             interp
                                 .coerce_to_number(stack, &exec_ctx, &raw)
-                                .map_err(|e| {
-                                    crate::native_function::vm_to_native_error(
-                                        interp,
-                                        e,
-                                        "TypedArray.prototype.sort",
-                                    )
-                                })
+                                .map_err(|e| e.into_native(interp, "TypedArray.prototype.sort"))
                         })?
                         .as_f64();
                     if detach_watch && receiver(ctx)?.buffer(ctx.heap()).is_detached(ctx.heap()) {
@@ -993,9 +988,7 @@ fn impl_with(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeErr
     let value = ctx.with_turn_parts(|interp, stack| {
         interp
             .typed_array_coerce_element(stack, &exec, kind, raw_value)
-            .map_err(|e| {
-                crate::native_function::vm_to_native_error(interp, e, "TypedArray.prototype.with")
-            })
+            .map_err(|e| e.into_native(interp, "TypedArray.prototype.with"))
     })?;
     // §23.2.3.36 step 9 — IsValidIntegerIndex(O, actualIndex) is
     // re-checked against the CURRENT state: the value's coercion can
@@ -1198,7 +1191,7 @@ mod tests {
 
     #[test]
     fn typed_array_entries_uses_old_iterator_state_allocation() {
-        let mut interp = Interpreter::new();
+        let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
         let receiver = {
             let heap = interp.gc_heap_mut();
             let buffer = JsArrayBuffer::new(heap, 2).expect("array buffer");
@@ -1225,7 +1218,7 @@ mod tests {
 
     #[test]
     fn typed_array_slice_uses_native_rooted_backing_store() {
-        let mut interp = Interpreter::new();
+        let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
         let receiver = {
             let heap = interp.gc_heap_mut();
             let buffer = JsArrayBuffer::new(heap, 4).expect("array buffer");

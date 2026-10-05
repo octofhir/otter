@@ -208,7 +208,7 @@ mod tests {
 
     #[test]
     fn every_declaration_resolves_a_leaf_that_fits_its_operand_words() {
-        let interpreter = crate::Interpreter::new();
+        let interpreter = crate::Interpreter::new().expect("fixture interpreter bootstrap");
         for row in JIT_LEAF_BUILTINS {
             let shape = crate::runtime_stubs::leaf_entry_shape(row.leaf_stub_id);
             assert!(

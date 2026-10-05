@@ -9,7 +9,7 @@ use crate::Value;
 use crate::collections::{MAP_BODY_TYPE_TAG, SET_BODY_TYPE_TAG};
 
 fn assert_map_self_value_reaped() {
-    let mut interp = Interpreter::new();
+    let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
 
     interp.force_gc().expect("force GC");
     let baseline = interp.gc_heap_mut().gc_stats().by_type[MAP_BODY_TYPE_TAG as usize].live_bytes;
@@ -39,7 +39,7 @@ fn assert_map_self_value_reaped() {
 }
 
 fn assert_set_self_value_reaped() {
-    let mut interp = Interpreter::new();
+    let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
 
     interp.force_gc().expect("force GC");
     let baseline = interp.gc_heap_mut().gc_stats().by_type[SET_BODY_TYPE_TAG as usize].live_bytes;

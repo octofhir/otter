@@ -18,6 +18,10 @@
 //! - The hint argument MUST be `"string"`, `"default"`, or
 //!   `"number"`; any other value throws `TypeError`.
 //!
+//!
+//! Native coercion and callback failures finish through the existing committed
+//! completion owner: local allocation refusals retain their authored native OOM
+//! facts, while completed terminal failures retain exact detail and source frames.
 //! # See also
 //! - <https://tc39.es/ecma262/#sec-date.prototype-@@toprimitive>
 //! - <https://tc39.es/ecma262/#sec-ordinarytoprimitive>
@@ -27,7 +31,7 @@ use crate::bootstrap::native_static_with_value_roots;
 use crate::js_surface::JsSurfaceError;
 use crate::object::{self, JsObject, PartialPropertyDescriptor};
 use crate::symbol::WellKnown;
-use crate::{NativeCtx, NativeError, Value, VmError};
+use crate::{NativeCtx, NativeError, Value};
 
 /// Install `Date.prototype[@@toPrimitive]` per §21.4.4.45.
 pub fn install_date_well_knowns_post_bootstrap(
@@ -57,7 +61,7 @@ pub fn install_date_well_knowns_post_bootstrap(
     };
 
     if let Some(to_utc_string) = object::get(prototype, heap, "toUTCString") {
-        object::define_own_property_partial(
+        if !object::define_own_property_partial(
             &mut prototype,
             heap,
             "toGMTString",
@@ -68,7 +72,9 @@ pub fn install_date_well_knowns_post_bootstrap(
                 configurable: Some(true),
                 ..Default::default()
             },
-        );
+        )? {
+            return Err(JsSurfaceError::DefinePropertyFailed("[[BuiltinProperty]]"));
+        };
     }
 
     let global_root = Value::object(global);
@@ -81,10 +87,10 @@ pub fn install_date_well_knowns_post_bootstrap(
         date_proto_to_primitive,
         &[&global_root, &date_ctor_root, &prototype_root],
     )
-    .map_err(|_| JsSurfaceError::OutOfMemory)?;
+    .map_err(JsSurfaceError::from)?;
 
     let to_primitive_sym = well_known.get(WellKnown::ToPrimitive);
-    object::define_own_symbol_property_partial(
+    if !object::define_own_symbol_property_partial(
         &mut prototype,
         heap,
         to_primitive_sym,
@@ -95,7 +101,9 @@ pub fn install_date_well_knowns_post_bootstrap(
             configurable: Some(true),
             ..Default::default()
         },
-    );
+    )? {
+        return Err(JsSurfaceError::DefinePropertyFailed("[[SymbolProperty]]"));
+    };
     Ok(())
 }
 
@@ -145,42 +153,5 @@ fn date_proto_to_primitive(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Va
     let result = ctx.with_turn_parts(|interp, stack| {
         interp.evaluate_ordinary_to_primitive(stack, &exec, &receiver, try_first)
     });
-    let interp = ctx.interp_mut();
-    match result {
-        Ok(v) => Ok(v),
-        Err(VmError::Uncaught) => {
-            let value = match interp.take_error_detail() {
-                Some(crate::run_control::ErrorDetail::Uncaught(m)) => m,
-                _ => Default::default(),
-            };
-            Err(NativeError::Thrown {
-                name: NAME,
-                message: value.into(),
-            })
-        }
-        Err(VmError::TypeError) => {
-            let message = match interp.take_error_detail() {
-                Some(crate::run_control::ErrorDetail::Message(m)) => m,
-                _ => Default::default(),
-            };
-            Err(NativeError::TypeError {
-                name: NAME,
-                reason: message.into(),
-            })
-        }
-        Err(VmError::RangeError) => {
-            let message = match interp.take_error_detail() {
-                Some(crate::run_control::ErrorDetail::Message(m)) => m,
-                _ => Default::default(),
-            };
-            Err(NativeError::RangeError {
-                name: NAME,
-                reason: message.into(),
-            })
-        }
-        Err(other) => Err(NativeError::TypeError {
-            name: NAME,
-            reason: other.to_string(),
-        }),
-    }
+    result.map_err(|error| error.into_native(ctx.interp_mut(), NAME))
 }

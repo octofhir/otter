@@ -197,7 +197,10 @@ pub enum NativeResultStatus {
     /// The owning isolate rotated its cooperative work slice. This is a raw
     /// backedge-poll status only and is never valid in a boxed result pair.
     Yield = 5,
-    /// Structural engine failure parked in the active runtime context.
+    /// Final engine/control/materialization failure parked in the active
+    /// runtime context. Callers preserve it without another throw projection.
+    /// Raw prepublication StackOverflow is normalized only by the published
+    /// interpreter caller, since no child error boundary existed yet.
     Fatal = 6,
 }
 

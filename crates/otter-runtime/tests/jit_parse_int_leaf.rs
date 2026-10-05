@@ -3,8 +3,8 @@
 //! # Contents
 //! - Exact int32 identity plus string, double, and object coercion misses.
 //! - Bootstrap identity sharing and observable global replacement.
-//! - Static-native lowering diagnostics and artifact structure, including an
-//!   exact-arity rejection for an explicit radix.
+//! - Template static-native lowering diagnostics and artifact structure,
+//!   including an exact-arity rejection for an explicit radix.
 //!
 //! # Invariants
 //! - Only the exact bootstrap callable with exactly one int32-tagged argument
@@ -160,9 +160,8 @@ fn bundle_has_parse_int_leaf(bundle: &JitArtifactBundle) -> bool {
     .expect("valid code-map JSON");
     let has_region = code_map["regions"].as_array().is_some_and(|regions| {
         regions.iter().any(|region| {
-            ((region["kind"] == "nativeLeafCall"
-                && region["nativeLeafCall"] == "parse_int_i32_leaf")
-                || region["kind"] == "machineNativeLeafCall")
+            region["kind"] == "nativeLeafCall"
+                && region["nativeLeafCall"] == "parse_int_i32_leaf"
                 && region["bytePc"].is_u64()
         })
     });
@@ -220,8 +219,10 @@ fn exact_bootstrap_identity_guards_observable_global_replacement() {
 
 #[test]
 fn artifacts_and_events_expose_one_leaf_and_reject_explicit_radix() {
+    // The leaf call region is a Template lowering; the optimizing tier keeps
+    // the call as the baseline operation and reports no lowering of its own.
     let mut runtime = Runtime::builder()
-        .jit_selection(JitSelection::ProductionTiered)
+        .jit_selection(JitSelection::Template)
         .jit_debug(JitDebugRequest::artifacts().with_events(true))
         .build()
         .expect("parseInt artifact runtime");
@@ -238,7 +239,7 @@ fn artifacts_and_events_expose_one_leaf_and_reject_explicit_radix() {
         report.events().iter().any(|event| matches!(
             event,
             JitDebugEvent::StaticNativeCallLowered {
-                tier: JitDebugTier::Optimizing,
+                tier: JitDebugTier::Template,
                 target: "parse_int_i32_leaf",
                 outcome: JitStaticNativeCallLoweringOutcome::Generated,
                 ..
@@ -265,10 +266,9 @@ fn artifacts_and_events_expose_one_leaf_and_reject_explicit_radix() {
     let artifacts = result.jit_artifacts().expect("enabled JIT artifacts");
     assert!(
         artifacts.bundles().iter().any(|bundle| {
-            bundle.manifest().tier() == JitDebugTier::Optimizing
-                && bundle_has_parse_int_leaf(bundle)
+            bundle.manifest().tier() == JitDebugTier::Template && bundle_has_parse_int_leaf(bundle)
         }),
-        "an optimizing bundle must join the parseInt leaf region to its shared stub relocation: {artifacts:?}"
+        "a Template bundle must join the parseInt leaf region to its shared stub relocation: {artifacts:?}"
     );
 }
 

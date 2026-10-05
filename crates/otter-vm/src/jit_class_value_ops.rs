@@ -19,6 +19,7 @@
 //! - [`crate::Interpreter::run_eval_operands`]
 //! - [`crate::coerce::to_number_or_throw`]
 
+use crate::native_abi::CommittedValueError;
 use otter_bytecode::{Op, Operand};
 use smallvec::SmallVec;
 
@@ -106,10 +107,10 @@ impl Interpreter {
         arg0: u64,
         arg1: u64,
         arg2: u64,
-    ) -> Result<(), VmError> {
+    ) -> Result<(), CommittedValueError> {
         self.record_jit_runtime_stub_class(crate::native_abi::RuntimeStubClass::Reentrant);
         if frame_index + 1 != stack.len() {
-            return Err(VmError::InvalidOperand);
+            return Err(CommittedValueError::Fatal(VmError::InvalidOperand));
         }
         let saved_pc = stack[frame_index].pc;
         let lane = |packed: u64, index: usize| ((packed >> (index * 16)) & 0xffff) as u16;
@@ -123,7 +124,8 @@ impl Interpreter {
                     lane(arg0, 2),
                     lane(arg0, 3),
                     Some(arg1 as u16),
-                )?;
+                )
+                .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
             }
             value if value == Op::NewFunction as u8 => {
                 let argc = lane(arg0, 1) as usize;
@@ -142,7 +144,8 @@ impl Interpreter {
                     frame_index,
                     arg0 as u16,
                     arg1 as u32,
-                )?;
+                )
+                .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
             }
             value if value == Op::GetTemplateObject as u8 => {
                 self.run_get_template_object_reg(
@@ -151,15 +154,17 @@ impl Interpreter {
                     frame_index,
                     arg0 as u16,
                     arg1 as u32,
-                )?;
+                )
+                .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
             }
             value if value == Op::IsEvalIntrinsic as u8 => {
-                self.run_is_eval_intrinsic_reg(stack, frame_index, lane(arg0, 0), lane(arg0, 1))?;
+                self.run_is_eval_intrinsic_reg(stack, frame_index, lane(arg0, 0), lane(arg0, 1))
+                    .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
             }
             value if value == Op::ToNumber as u8 => {
                 self.run_to_number_regs(context, stack, frame_index, lane(arg0, 0), lane(arg0, 1))?;
             }
-            _ => return Err(VmError::InvalidOperand),
+            _ => return Err(CommittedValueError::Fatal(VmError::InvalidOperand)),
         }
         stack[frame_index].pc = saved_pc;
         let _ = arg2;

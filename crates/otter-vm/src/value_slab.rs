@@ -295,7 +295,7 @@ mod tests {
 
     #[test]
     fn a_fresh_slab_is_empty_and_sized() {
-        let mut interp = Interpreter::new();
+        let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
         let slab = alloc_value_slab(interp.gc_heap_mut(), 8, &mut |_| {}).expect("slab");
         assert_eq!(capacity_of(slab), 8);
         assert_eq!(interp.gc_heap().read_payload(slab, ValueSlabBody::len), 0);
@@ -303,7 +303,7 @@ mod tests {
 
     #[test]
     fn values_round_trip_through_the_trailing_array() {
-        let mut interp = Interpreter::new();
+        let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
         let slab = alloc_value_slab(interp.gc_heap_mut(), 4, &mut |_| {}).expect("slab");
         let base = values_base(slab);
         // SAFETY: the slab is live and has room for four values.

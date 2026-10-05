@@ -344,8 +344,7 @@ struct HostCompletionTask {
 
 impl RuntimeTask for HostCompletionTask {
     fn run(self: Box<Self>, runtime: &mut crate::Runtime) -> Result<(), OtterError> {
-        runtime.run_host_completion(self.job);
-        Ok(())
+        runtime.run_host_completion(self.job)
     }
 
     fn cancel(self: Box<Self>, runtime: &mut crate::Runtime) {

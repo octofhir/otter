@@ -1,15 +1,17 @@
 let prototypeGets = 0;
 const instancePrototype = { marker: "machine-construct" };
 
-function Base(value) {
+function BaseTarget(value) {
   this.value = value;
   this.targetMatches = new.target === Base;
   return 17;
 }
 
-Object.defineProperty(Base, "prototype", {
-  configurable: true,
-  get() {
+// Ordinary functions have a nonconfigurable prototype property. A proxy
+// observes constructor preparation without changing that descriptor.
+const Base = new Proxy(BaseTarget, {
+  get(target, key, receiver) {
+    if (key !== "prototype") return Reflect.get(target, key, receiver);
     prototypeGets++;
     return instancePrototype;
   }

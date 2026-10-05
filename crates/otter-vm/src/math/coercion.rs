@@ -66,11 +66,7 @@ pub(super) fn coerce_math_args(
                 match result {
                     Ok(primitive) => primitive,
                     Err(error) => {
-                        return Err(crate::native_function::vm_to_native_error(
-                            scope.context().interp_mut(),
-                            error,
-                            "Math",
-                        ));
+                        return Err(error.into_native(scope.context().interp_mut(), "Math"));
                     }
                 }
             } else {

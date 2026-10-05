@@ -674,7 +674,8 @@ mod tests {
 
     #[test]
     fn array_buffer_constructor_with_roots_accounts_backing_store() {
-        let mut interp = crate::Interpreter::with_string_heap_cap(1024 * 1024);
+        let mut interp = crate::Interpreter::with_string_heap_cap(1024 * 1024)
+            .expect("fixture interpreter bootstrap");
         let args = [Value::number(NumberValue::from_i32(64))];
         let mut external_visit = |_visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {};
 
@@ -707,7 +708,8 @@ mod tests {
 
     #[test]
     fn typed_array_constructor_with_roots_accounts_backing_store() {
-        let mut interp = crate::Interpreter::with_string_heap_cap(1024 * 1024);
+        let mut interp = crate::Interpreter::with_string_heap_cap(1024 * 1024)
+            .expect("fixture interpreter bootstrap");
         let args = [Value::number(NumberValue::from_i32(4))];
         let mut external_visit = |_visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {};
 
@@ -734,7 +736,8 @@ mod tests {
 
     #[test]
     fn shared_array_buffer_constructor_uses_rooted_dispatch_boundary() {
-        let mut interp = crate::Interpreter::with_string_heap_cap(1024 * 1024);
+        let mut interp = crate::Interpreter::with_string_heap_cap(1024 * 1024)
+            .expect("fixture interpreter bootstrap");
         let args = [Value::number(NumberValue::from_i32(64))];
         let mut visited_roots = false;
         let mut external_visit = |visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
@@ -773,14 +776,23 @@ mod tests {
 
     #[test]
     fn shared_array_buffer_growable_accounts_max_backing_store() {
-        let mut interp = crate::Interpreter::with_string_heap_cap(1024 * 1024);
+        let mut interp = crate::Interpreter::with_string_heap_cap(1024 * 1024)
+            .expect("fixture interpreter bootstrap");
         let mut options =
             crate::object::alloc_object_old_for_fixture(interp.gc_heap_mut()).expect("options");
-        crate::object::set(
-            &mut options,
-            interp.gc_heap_mut(),
-            "maxByteLength",
-            Value::number(NumberValue::from_i32(128)),
+        assert!(
+            crate::object::define_own_property_in_place(
+                &mut options,
+                interp.gc_heap_mut(),
+                "maxByteLength",
+                crate::object::PropertyDescriptor::data(
+                    Value::number(NumberValue::from_i32(128)),
+                    true,
+                    true,
+                    true
+                )
+            )
+            .expect("fixture property allocation")
         );
         let args = [
             Value::number(NumberValue::from_i32(64)),

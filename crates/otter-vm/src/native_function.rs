@@ -13,8 +13,8 @@
 //! - [`NativeFastFn`] / [`NativeCall`] — static and dynamic native
 //!   dispatch targets.
 //! - [`NativeFn`] — the dynamic closure signature.
-//! - [`NativeError`] — failure outcome the dispatcher converts to
-//!   `VmError`.
+//! - [`NativeError`] — authored failures and owned completed execution failures
+//!   projected by the published Host owner.
 //!
 //! # Invariants
 //! - Every allocation receives an explicit [`otter_gc::GcHeap`]; active
@@ -262,6 +262,8 @@ pub struct NativeFunctionBody {
     /// Realm global associated with this native function. `None`
     /// means the default active interpreter realm.
     realm_global: Option<JsObject>,
+    /// Native callable identity is this GC body, never its shared entry pointer.
+    constructor_layouts: crate::constructor_layout::ConstructorLayout,
 }
 
 /// One body layout for VM invocation, generated guards and callee dispatch.
@@ -407,6 +409,22 @@ impl std::fmt::Debug for NativeFunction {
 fn no_roots(_: &mut dyn FnMut(*mut RawGc)) {}
 
 impl NativeFunction {
+    /// Traced family head of this exact constructor object.
+    pub(crate) fn constructor_layouts(
+        self,
+        heap: &otter_gc::GcHeap,
+    ) -> crate::constructor_layout::ConstructorLayout {
+        heap.read_payload(self.inner, |body| body.constructor_layouts)
+    }
+    pub(crate) fn set_constructor_layouts(
+        self,
+        heap: &mut otter_gc::GcHeap,
+        layouts: crate::constructor_layout::ConstructorLayout,
+    ) {
+        heap.with_payload(self.inner, |body| body.constructor_layouts = layouts);
+        heap.record_write(self.inner, &layouts);
+    }
+
     fn allocate_with_roots(
         heap: &mut otter_gc::GcHeap,
         name: &'static str,
@@ -431,12 +449,12 @@ impl NativeFunction {
             };
             JsString::from_str_with_roots(name, heap, &mut visit)?
         };
-        let name_root = Value::string(name_string);
+        let mut name_root = Value::string(name_string);
         // Call payload ownership and external identity are published together.
         // Dynamic entries move their Arc to the host table; the body owns its
         // index and releases it when collected.
         let call_header = NativeCallHeader::allocate(heap, call, metadata, length);
-        let own_properties = {
+        let mut own_properties = {
             let mut visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
                 external_visit(visitor);
                 name_root.trace_value_slots(visitor);
@@ -447,7 +465,15 @@ impl NativeFunction {
             crate::object::alloc_dictionary_object_with_roots(heap, &mut visit)?
         };
         if !metadata.extensible {
-            crate::object::prevent_extensions(own_properties, heap);
+            use crate::rooting::RootScopeExt;
+            let mut pending = otter_gc::RootScope::new(heap);
+            // SAFETY: captures/name are actual stationary payload slots; this
+            // scope closes before captures moves into its slab below.
+            unsafe {
+                pending.add_value(&mut name_root);
+                pending.add_value_smallvec(&mut captures);
+            }
+            crate::object::prevent_extensions(&mut own_properties, heap)?;
         }
         let own_properties_root = Value::object(own_properties);
         // The captures move into a slab body of their own; the shell
@@ -491,6 +517,7 @@ impl NativeFunction {
                     own_properties,
                     prototype_override: None,
                     realm_global: None,
+                    constructor_layouts: crate::constructor_layout::ConstructorLayout::null(),
                 },
                 &mut visit,
             )?,
@@ -862,10 +889,21 @@ impl NativeFunction {
     }
 
     /// Native callable `[[PreventExtensions]]`.
-    pub(crate) fn prevent_extensions(&self, heap: &mut otter_gc::GcHeap) {
-        let own_properties = heap.read_payload(self.inner, |body| body.own_properties);
-        crate::object::prevent_extensions(own_properties, heap);
-        heap.with_payload(self.inner, |body| body.call_header.prevent_extensions());
+    pub(crate) fn prevent_extensions(
+        &self,
+        heap: &mut otter_gc::GcHeap,
+    ) -> Result<(), otter_gc::OutOfMemory> {
+        let mut owner = self.inner;
+        let mut roots = otter_gc::RootScope::new(heap);
+        // SAFETY: the native shell is old-space; this stationary root keeps it
+        // live through preparation, and no body borrow crosses the allocation.
+        unsafe {
+            roots.add_raw_slot(std::ptr::addr_of_mut!(owner).cast::<RawGc>());
+        }
+        let mut own_properties = heap.read_payload(owner, |body| body.own_properties);
+        crate::object::prevent_extensions(&mut own_properties, heap)?;
+        heap.with_payload(owner, |body| body.call_header.prevent_extensions());
+        Ok(())
     }
 
     /// `Object.isSealed` for native callable values.
@@ -1035,27 +1073,12 @@ impl NativeFunction {
         heap: &mut otter_gc::GcHeap,
         key: &str,
         descriptor: PropertyDescriptor,
-    ) -> bool {
-        let mut target = Value::native_function(*self);
-        let mut descriptor = descriptor;
-        let native = target
-            .as_native_function()
-            .expect("native function value must decode");
-        let existing = {
-            let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
-                target.trace_value_slot_mut(visitor);
-                crate::pelt::PeltField::pelt_trace(&mut descriptor, visitor);
-            };
-            native.own_property_descriptor_with_roots(heap, key, &mut external_visit)
-        };
-        let existing = match existing {
-            Ok(existing) => existing,
-            Err(_) => return false,
-        };
-        let native = target
-            .as_native_function()
-            .expect("rooted native function value must decode");
-        native.define_own_property_with_current(heap, key, existing, descriptor)
+    ) -> Result<bool, otter_gc::OutOfMemory> {
+        self.define_own_property_partial(
+            heap,
+            key,
+            PartialPropertyDescriptor::from_full(&descriptor),
+        )
     }
 
     /// Rooted partial-descriptor entry used by the VM's
@@ -1068,6 +1091,13 @@ impl NativeFunction {
     ) -> Result<bool, otter_gc::OutOfMemory> {
         let mut target = Value::native_function(*self);
         let mut descriptor = descriptor;
+        let mut roots = otter_gc::RootScope::new(heap);
+        // SAFETY: these actual local slots remain stationary through descriptor
+        // materialization and ordinary property-bag allocation.
+        unsafe {
+            crate::rooting::RootScopeExt::add_value(&mut roots, &mut target);
+            crate::rooting::RootScopeExt::add_pelt(&mut roots, &mut descriptor);
+        }
         let native = target
             .as_native_function()
             .expect("native function value must decode");
@@ -1085,7 +1115,7 @@ impl NativeFunction {
         let native = target
             .as_native_function()
             .expect("rooted native function value must decode");
-        Ok(native.define_own_property_with_current(heap, key, existing, completed))
+        native.define_own_property_with_current(heap, key, existing, completed)
     }
 
     fn define_own_property_with_current(
@@ -1094,15 +1124,15 @@ impl NativeFunction {
         key: &str,
         existing: Option<PropertyDescriptor>,
         descriptor: PropertyDescriptor,
-    ) -> bool {
+    ) -> Result<bool, otter_gc::OutOfMemory> {
         let descriptor = match existing {
             Some(existing) => {
                 match crate::object::validate_descriptor_update(&existing, &descriptor, heap) {
                     Some(merged) => merged,
-                    None => return false,
+                    None => return Ok(false),
                 }
             }
-            None if !self.is_extensible(heap) => return false,
+            None if !self.is_extensible(heap) => return Ok(false),
             None if key == "name" || key == "length" => descriptor,
             None => {
                 let obj = heap.read_payload(self.inner, |body| body.own_properties);
@@ -1133,7 +1163,7 @@ impl NativeFunction {
         if success {
             heap.record_write(self.inner, &barrier_descriptor);
         }
-        success
+        Ok(success)
     }
 
     /// Define or redefine a symbol-keyed own property on the native
@@ -1143,18 +1173,34 @@ impl NativeFunction {
         heap: &mut otter_gc::GcHeap,
         key: crate::symbol::JsSymbol,
         descriptor: crate::object::PartialPropertyDescriptor,
-    ) -> bool {
-        let mut obj = heap.read_payload(self.inner, |body| body.own_properties);
+    ) -> Result<bool, otter_gc::OutOfMemory> {
+        let mut owner = self.inner;
+        let mut roots = otter_gc::RootScope::new(heap);
+        // SAFETY: the actual old shell handle remains live through table growth.
+        unsafe {
+            roots.add_raw_slot(std::ptr::addr_of_mut!(owner).cast::<RawGc>());
+        }
+        let mut obj = heap.read_payload(owner, |body| body.own_properties);
         crate::object::define_own_symbol_property_partial(&mut obj, heap, key, descriptor)
     }
 
     /// Delete a configurable own metadata property.
-    pub(crate) fn delete_own_property(&self, heap: &mut otter_gc::GcHeap, key: &str) -> bool {
+    pub(crate) fn delete_own_property(
+        &self,
+        heap: &mut otter_gc::GcHeap,
+        key: &str,
+    ) -> Result<bool, otter_gc::OutOfMemory> {
         if key != "name" && key != "length" {
-            let own_properties = heap.read_payload(self.inner, |body| body.own_properties);
-            return crate::object::delete(own_properties, heap, key);
+            let mut owner = self.inner;
+            let mut roots = otter_gc::RootScope::new(heap);
+            // SAFETY: this old shell remains live through dictionary/table allocation.
+            unsafe {
+                roots.add_raw_slot(std::ptr::addr_of_mut!(owner).cast::<RawGc>());
+            }
+            let mut own_properties = heap.read_payload(owner, |body| body.own_properties);
+            return crate::object::delete(&mut own_properties, heap, key);
         }
-        heap.with_payload(self.inner, |body| {
+        Ok(heap.with_payload(self.inner, |body| {
             let slot = match key {
                 "name" => &mut body.name_property,
                 "length" => &mut body.length_property,
@@ -1174,7 +1220,7 @@ impl NativeFunction {
             }
             *slot = NativeOwnProperty::Deleted;
             true
-        })
+        }))
     }
 
     /// Delete a configurable symbol-keyed own property from the
@@ -1509,9 +1555,28 @@ fn native_own_property_is_frozen(property: &NativeOwnProperty, builtin_configura
 /// Failure outcome from a native call. The runtime mapper routes
 /// these outcomes through the same VM error path as bytecode throws
 /// and allocation failures.
-#[derive(Debug, Clone, thiserror::Error)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum NativeError {
+    /// A completed VM failure imported by synchronous re-entry or marshalling.
+    /// Only structural/control failure and escaping OOM are legal here; a
+    /// catchable value is already represented by the existing throw owner.
+    /// Owned detail and source frames survive nested native/Wasm transport.
+    #[error(transparent)]
+    ExecutionFailure(crate::RunError),
+    /// Malformed bytecode or an invalid private engine operand. Never catchable.
+    #[error("invalid operand")]
+    InvalidOperand,
+    /// A bytecode body completed without its required return. Never catchable.
+    #[error("function did not RETURN")]
+    MissingReturn,
+    /// Exact engine resource-admission refusal. Never a JavaScript throw.
+    /// Carries the existing ledger payload unchanged across owned boundaries.
+    #[error("{error}")]
+    Resource {
+        /// Actual resource class, requested amount and physical headroom.
+        error: otter_resource::ResourceError,
+    },
     /// A user-thrown JS value escaped the native body. The
     /// dispatcher will route this through the same path as
     /// `Op::Throw` — i.e. into the function's handler table.
@@ -1519,7 +1584,11 @@ pub enum NativeError {
     Thrown {
         /// Display name of the offending native (for diagnostics).
         name: &'static str,
-        /// The thrown value. Foundation: rendered to a string.
+        /// Owned host diagnostic text. A JavaScript value thrown during VM
+        /// reentry retains its identity in the interpreter's one traced
+        /// pending-throw owner during immediate synchronous propagation only.
+        /// A deferred worker result transports this text, not that JS identity;
+        /// this payload never carries a raw GC handle.
         message: String,
     },
     /// A host ABI requested a catchable ordinary JavaScript `Error` with an
@@ -1574,8 +1643,9 @@ pub enum NativeError {
         errno: i32,
     },
     /// Type or value error inside the native body that does not
-    /// originate as a `throw` (e.g. wrong arity). Surfaces as
-    /// `VmError::TypeMismatch`.
+    /// originate as a `throw` (e.g. wrong arity). The dispatcher constructs
+    /// its intrinsic TypeError and routes the value through the normal throw
+    /// owner; allocation failure remains its exact typed cause.
     #[error("native function {name}: {reason}")]
     TypeError {
         /// Display name of the native.
@@ -1646,11 +1716,10 @@ pub enum NativeError {
         /// Human-readable resource that exhausted its finite budget.
         reason: String,
     },
-    /// Heap-limit exhaustion surfaced from inside a native body. Kept
-    /// distinct from [`NativeError::TypeError`] so it round-trips to
-    /// [`crate::VmError::OutOfMemory`] — a catchable JS `RangeError`
-    /// that still records the host-visible `OutOfMemory` cause — rather
-    /// than collapsing into a misleading `TypeError`.
+    /// Explicitly authored allocation-failure data from a native body.
+    /// With diagnostic headroom this projects once to a catchable RangeError.
+    /// Imported VM allocation or completed reentry failures use ExecutionFailure
+    /// and cannot start another JavaScript error build.
     #[error("native function {name}: out of memory")]
     OutOfMemory {
         /// Display name of the native.
@@ -1662,22 +1731,55 @@ pub enum NativeError {
     },
 }
 
+impl NativeError {
+    /// Pure completion classification, with no allocation or VM mutation.
+    /// An invalid ExecutionFailure payload is itself a structural rejection;
+    /// the canonical VM projection validates its exact owned discriminant.
+    #[must_use]
+    pub const fn is_fatal(&self) -> bool {
+        matches!(
+            self,
+            Self::Resource { .. }
+                | Self::MissingReturn
+                | Self::InvalidOperand
+                | Self::Interrupted
+                | Self::BudgetExceeded { .. }
+                | Self::Exit { .. }
+                | Self::ExecutionFailure(_)
+        )
+    }
+
+    /// Pure control payload access after a completed native call.
+    ///
+    /// Imported execution failures retain their exact VM exit code. This does
+    /// not classify or materialize catchable errors; disposition remains owned
+    /// by `is_fatal` and the validated ExecutionFailure transport.
+    #[must_use]
+    pub fn exit_code(&self) -> Option<u8> {
+        match self {
+            Self::Exit { code } => Some(*code),
+            Self::ExecutionFailure(failure) => match failure.error {
+                crate::VmError::Exit { code } => Some(code),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+}
+
+// The owned completion boundary transports no VM handles or thread-local state.
+const _: fn() = || {
+    fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<NativeError>();
+    assert_send_sync::<crate::RunError>();
+};
+
 impl From<otter_gc::OutOfMemory> for NativeError {
     fn from(err: otter_gc::OutOfMemory) -> Self {
-        match crate::oom_to_vm(err) {
-            crate::VmError::OutOfMemory {
-                requested_bytes,
-                heap_limit_bytes,
-            } => Self::OutOfMemory {
-                name: "native",
-                requested_bytes,
-                heap_limit_bytes,
-            },
-            _ => Self::OutOfMemory {
-                name: "native",
-                requested_bytes: 0,
-                heap_limit_bytes: 0,
-            },
+        Self::OutOfMemory {
+            name: "native",
+            requested_bytes: err.requested_bytes(),
+            heap_limit_bytes: err.heap_limit_bytes(),
         }
     }
 }
@@ -1687,7 +1789,8 @@ impl From<otter_gc::OutOfMemory> for NativeError {
 /// `VmError::Uncaught` carries a user-thrown JS value and is preserved
 /// as [`NativeError::Thrown`] so callbacks that `throw` surface intact;
 /// the spec error classes map to their `NativeError` counterparts and
-/// everything else falls back to a `TypeError` with the rendered cause.
+/// structural failures and runtime control keep their exact identity. Each
+/// catchable VM family selects its specified error class explicitly.
 pub fn vm_to_native_error(
     interp: &crate::Interpreter,
     err: crate::VmError,
@@ -1705,6 +1808,15 @@ pub fn vm_to_native_error(
         _ => err.to_string(),
     };
     match err {
+        // ResourceLimit and its exact detail are published together. Missing
+        // or wrong detail is malformed engine state, never a fabricated ledger
+        // cause or a catchable JavaScript error.
+        crate::VmError::ResourceLimit => match detail {
+            Some(ErrorDetail::Resource(error)) => NativeError::Resource { error },
+            _ => NativeError::InvalidOperand,
+        },
+        crate::VmError::MissingReturn => NativeError::MissingReturn,
+        crate::VmError::InvalidOperand => NativeError::InvalidOperand,
         crate::VmError::Uncaught => NativeError::Thrown {
             name,
             message: message(),
@@ -1723,14 +1835,18 @@ pub fn vm_to_native_error(
                 code: payload.code,
                 message: payload.message,
             },
-            _ => NativeError::TypeError {
-                name,
-                reason: err.to_string(),
+            _ => NativeError::SpecError {
+                kind: crate::ErrorKind::Error,
+                message: err.to_string(),
             },
         },
-        crate::VmError::TypeError | crate::VmError::TypeMismatchAt => NativeError::TypeError {
+        crate::VmError::TypeError => NativeError::TypeError {
             name,
             reason: message(),
+        },
+        crate::VmError::TypeMismatchAt => NativeError::TypeError {
+            name,
+            reason: interp.render_vm_error(&err),
         },
         crate::VmError::RangeError => NativeError::RangeError {
             name,
@@ -1755,19 +1871,16 @@ pub fn vm_to_native_error(
         }
         crate::VmError::Interrupted => NativeError::Interrupted,
         crate::VmError::BudgetExceeded => NativeError::BudgetExceeded { reason: message() },
-        // Heap exhaustion must keep its identity across the native
-        // boundary: a generic `TypeError` fallback would render OOM as
-        // an uncatchable-looking type error and lose the host's
-        // `OutOfMemory` cause. Preserve it so it round-trips to a
-        // catchable `RangeError`.
-        crate::VmError::OutOfMemory {
-            requested_bytes,
-            heap_limit_bytes,
-        } => NativeError::OutOfMemory {
-            name,
-            requested_bytes,
-            heap_limit_bytes,
-        },
+        // A failure that already escaped VM execution is final. Importing it
+        // must not turn it into an authored allocation OOM and initiate a
+        // second JavaScript error allocation in the enclosing native body.
+        crate::VmError::OutOfMemory { .. } => NativeError::ExecutionFailure(crate::RunError {
+            error: err,
+            frames: interp.pending_uncaught_frames.clone().unwrap_or_default(),
+            // OOM has only its exact scalar cause; older dynamic detail cannot
+            // describe this allocation refusal.
+            detail: None,
+        }),
         // `process.exit(code)` must keep its identity across the native
         // boundary so a host (e.g. the CommonJS loader) can surface a clean
         // process termination instead of an uncatchable-looking TypeError.
@@ -1778,19 +1891,42 @@ pub fn vm_to_native_error(
             name,
             reason: message(),
         },
-        crate::VmError::UnknownIntrinsic | crate::VmError::InvalidRegExp => {
-            NativeError::TypeError {
-                name,
-                reason: message(),
+        crate::VmError::InvalidRegExp => NativeError::SyntaxError {
+            name,
+            reason: message(),
+        },
+        crate::VmError::JsonError => {
+            let (kind, reason) = match detail {
+                Some(ErrorDetail::Json(payload)) => (
+                    if payload.code == "JSON_PARSE" {
+                        crate::ErrorKind::SyntaxError
+                    } else {
+                        crate::ErrorKind::TypeError
+                    },
+                    payload.message,
+                ),
+                _ => (crate::ErrorKind::TypeError, err.to_string()),
+            };
+            NativeError::SpecError {
+                kind,
+                message: reason,
             }
         }
+        crate::VmError::UnknownIntrinsic => NativeError::TypeError {
+            name,
+            reason: message(),
+        },
         // Everything else raises no detail. The isolate's slot holds one
         // error's detail at a time and is only emptied where an error
         // surfaces, so reading it here would pin whatever was raised last
         // onto this error — and, since the result is raised in turn, the next
         // detail-less error would inherit that, and the one after it both.
         // Each renders its own text instead.
-        _ => NativeError::TypeError {
+        crate::VmError::StackOverflow { limit } => NativeError::RangeError {
+            name,
+            reason: format!("maximum call stack size exceeded (limit {limit})"),
+        },
+        crate::VmError::TypeMismatch | crate::VmError::NotCallable => NativeError::TypeError {
             name,
             reason: err.to_string(),
         },
@@ -1814,7 +1950,7 @@ mod tests {
         ) -> Result<Value, NativeError> {
             Ok(captures[0])
         }
-        let mut interp = crate::Interpreter::new();
+        let mut interp = crate::Interpreter::new().expect("fixture interpreter bootstrap");
         let layout = jit_call_layout();
         let cases = [
             (NativeEntryKind::Static, NativeCallStorage::Static(plain)),
@@ -1908,7 +2044,9 @@ mod tests {
                     },
                 );
             }
-            native.prevent_extensions(interp.gc_heap_mut());
+            native
+                .prevent_extensions(interp.gc_heap_mut())
+                .expect("native fixture prevent extensions");
             assert!(!native.is_extensible(interp.gc_heap()));
             assert!(native.is_constructable(interp.gc_heap()));
             assert_eq!(native.length(interp.gc_heap()), 3);
@@ -1920,7 +2058,7 @@ mod tests {
         fn entry(_: &mut NativeCtx<'_>, _: &[Value]) -> Result<Value, NativeError> {
             Ok(Value::UNDEFINED)
         }
-        let mut interp = crate::Interpreter::new();
+        let mut interp = crate::Interpreter::new().expect("fixture interpreter bootstrap");
         let mut roots = no_roots;
         let native =
             NativeFunction::throw_type_error_with_roots(interp.gc_heap_mut(), entry, &mut roots)
@@ -1933,7 +2071,11 @@ mod tests {
                 .unwrap()
                 .unwrap();
             assert!(!descriptor.configurable());
-            assert!(!native.delete_own_property(interp.gc_heap_mut(), property));
+            assert!(
+                !native
+                    .delete_own_property(interp.gc_heap_mut(), property)
+                    .expect("restricted descriptor deletion")
+            );
         }
     }
 
@@ -1942,7 +2084,7 @@ mod tests {
     /// old (full sweep) — and survive while the body is rooted.
     #[test]
     fn dynamic_native_host_ref_slot_is_released_when_the_body_dies() {
-        let mut interp = crate::Interpreter::new();
+        let mut interp = crate::Interpreter::new().expect("fixture interpreter bootstrap");
         let baseline = interp.gc_heap().host_refs().len();
         let f = native_value(interp.gc_heap_mut(), "closure", |_, _, _| {
             Ok(Value::undefined())
@@ -1956,12 +2098,16 @@ mod tests {
         // Rooted across a full collection: the slot must survive. The
         // native rides a global handle so the interpreter's own root
         // walk keeps it, alongside the bootstrap graph.
-        interp.set_global("__host_ref_probe", f);
+        interp
+            .set_global("__host_ref_probe", f)
+            .expect("fixture global descriptor");
         interp.force_gc().expect("force GC");
         assert_eq!(interp.gc_heap().host_refs().len(), baseline + 1);
         // Unrooted: the next full collection reclaims the body and the
         // slot, while the bootstrap graph's own entries stay put.
-        interp.set_global("__host_ref_probe", Value::undefined());
+        interp
+            .set_global("__host_ref_probe", Value::undefined())
+            .expect("fixture global descriptor");
         interp.force_gc().expect("force GC");
         assert_eq!(
             interp.gc_heap().host_refs().len(),
@@ -1974,7 +2120,7 @@ mod tests {
     /// index, so restored bodies resolve without rewriting.
     #[test]
     fn host_ref_clone_preserves_indices() {
-        let mut interp = crate::Interpreter::new();
+        let mut interp = crate::Interpreter::new().expect("fixture interpreter bootstrap");
         let _f = native_value(interp.gc_heap_mut(), "cloned", |_, _, _| {
             Ok(Value::undefined())
         })
@@ -1998,7 +2144,7 @@ mod tests {
 
     #[test]
     fn native_value_dispatches() {
-        let mut interp = crate::Interpreter::new();
+        let mut interp = crate::Interpreter::new().expect("fixture interpreter bootstrap");
         let f = native_value(interp.gc_heap_mut(), "identity", |_, args, _captures| {
             Ok(args.first().cloned().unwrap_or(Value::undefined()))
         })
@@ -2018,7 +2164,7 @@ mod tests {
 
     #[test]
     fn rejects_arity_via_typeerror() {
-        let mut interp = crate::Interpreter::new();
+        let mut interp = crate::Interpreter::new().expect("fixture interpreter bootstrap");
         let f = native_value(
             interp.gc_heap_mut(),
             "require_one_arg",
@@ -2052,7 +2198,7 @@ mod tests {
             Ok(args.first().cloned().unwrap_or(Value::undefined()))
         }
 
-        let mut interp = crate::Interpreter::new();
+        let mut interp = crate::Interpreter::new().expect("fixture interpreter bootstrap");
         let f = native_value_static(interp.gc_heap_mut(), "id", 1, id).expect("native");
         let native = f.as_native_function().expect("expected NativeFunction");
         assert!(native.is_static_call(interp.gc_heap()));

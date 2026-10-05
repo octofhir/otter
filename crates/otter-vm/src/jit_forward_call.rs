@@ -16,6 +16,7 @@
 //! - [`crate::forward_arguments`] — native window copying and binding metadata.
 //! - [`crate::runtime_activation`] — validated engine-private operand boundary.
 
+use crate::native_abi::CommittedValueError;
 use crate::{ActivationStack, ActiveFrameRef, ExecutionContext, Interpreter, Value, VmError};
 use otter_bytecode::ArgumentBindingStorage;
 use smallvec::SmallVec;
@@ -29,12 +30,13 @@ impl Interpreter {
         stack: &mut ActivationStack,
         source: &ActiveFrameRef<'_>,
         values: &[Value],
-    ) -> Result<(Value, Value, SmallVec<[Value; 8]>), VmError> {
+    ) -> Result<(Value, Value, SmallVec<[Value; 8]>), CommittedValueError> {
         let function_id = source.function_id();
         let call_pc = source.pc();
         let function = context
             .exec_function(function_id)
-            .ok_or(VmError::InvalidOperand)?;
+            .ok_or(VmError::InvalidOperand)
+            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
         self.record_call_attempt_feedback(function, call_pc, function_id);
         self.record_jit_runtime_stub_class(crate::native_abi::RuntimeStubClass::Reentrant);
         let intrinsic = crate::method_ops::is_function_prototype_intrinsic_value(
@@ -49,7 +51,7 @@ impl Interpreter {
         let result = (|| {
             let (callee, receiver, arguments) = if intrinsic {
                 if !self.is_callable_runtime(&self.iteration_anchor(base + 1)) {
-                    return Err(VmError::NotCallable);
+                    return Err(CommittedValueError::JavaScript(VmError::NotCallable));
                 }
                 let existing = source.native_arguments_object().map(Value::object);
                 let arguments = if let Some(object) = existing {
@@ -57,10 +59,14 @@ impl Interpreter {
                 } else {
                     let count = self
                         .elided_forward_argument_count(source)
-                        .ok_or(VmError::InvalidOperand)? as usize;
+                        .ok_or(VmError::InvalidOperand)
+                        .map_err(|error| CommittedValueError::Fatal(error.into()))?
+                        as usize;
                     let mut arguments = SmallVec::<[Value; 8]>::with_capacity(count);
                     for index in 0..count {
-                        let value = source.incoming_argument(index)?;
+                        let value = source
+                            .incoming_argument(index)
+                            .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
                         arguments.push(value);
                     }
                     let register_words = function
@@ -85,9 +91,11 @@ impl Interpreter {
                                 let context = self
                                     .iteration_anchor(context_word)
                                     .as_context()
-                                    .ok_or(VmError::InvalidOperand)?;
+                                    .ok_or(VmError::InvalidOperand)
+                                    .map_err(|error| CommittedValueError::Fatal(error.into()))?;
                                 crate::context::read_slot(&self.gc_heap, context, slot)
-                                    .ok_or(VmError::InvalidOperand)?
+                                    .ok_or(VmError::InvalidOperand)
+                                    .map_err(|error| CommittedValueError::Fatal(error.into()))?
                             }
                         };
                         if let Some(slot) = arguments.get_mut(usize::from(index)) {
@@ -108,7 +116,8 @@ impl Interpreter {
                         frame.function_id == source.function_id()
                             && frame.registers.as_ptr() == source.register_base_ptr()
                     })
-                    .ok_or(VmError::InvalidOperand)?;
+                    .ok_or(VmError::InvalidOperand)
+                    .map_err(|error| CommittedValueError::Fatal(error.into()))?;
                 // Publish current SSA aliases before observable arguments creation.
                 // Every write ends before allocation; the canonical window roots
                 // the live context and register bindings through moving collection.
@@ -118,7 +127,9 @@ impl Interpreter {
                         *stack[index]
                             .registers
                             .get_mut(usize::from(reg))
-                            .ok_or(VmError::InvalidOperand)? = self.iteration_anchor(word);
+                            .ok_or(VmError::InvalidOperand)
+                            .map_err(|error| CommittedValueError::Fatal(error.into()))? =
+                            self.iteration_anchor(word);
                         word += 1;
                     }
                 }
@@ -126,9 +137,13 @@ impl Interpreter {
                     *stack[index]
                         .registers
                         .get_mut(usize::from(register))
-                        .ok_or(VmError::InvalidOperand)? = self.iteration_anchor(word);
+                        .ok_or(VmError::InvalidOperand)
+                        .map_err(|error| CommittedValueError::Fatal(error.into()))? =
+                        self.iteration_anchor(word);
                 }
-                let object = self.materialize_frame_arguments_object(context, stack, index)?;
+                let object = self
+                    .materialize_frame_arguments_object(context, stack, index)
+                    .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
                 (
                     self.iteration_anchor(base),
                     self.iteration_anchor(base + 1),

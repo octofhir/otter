@@ -14,10 +14,12 @@
 //! - `call_attempted` is recorded before callable lookup, method lookup, getter
 //!   invocation, or callee entry. A throwing call is therefore never confused
 //!   with a never-taken branch.
+//! - A method call records the independent property attempt before lookup,
+//!   including receivers and getters whose result cannot enter the call cache.
 //! - The typed `Op::Call` / `Op::New` payload owns the bounded target
 //!   population; no interpreter-side `(function_id, pc)` map mirrors it.
-//! - Bytecode and supported static-native identities share one coherent target
-//!   population and one transition epoch.
+//! - Bytecode, exact leaf and general native-kind observations share one coherent
+//!   target population and one transition epoch. A native kind stores no handle.
 //! - The first attempt and first resolved target are independent material
 //!   facts. Each advances the feedback epoch once; repeated attempts and hits
 //!   do not.
@@ -42,9 +44,16 @@ impl Interpreter {
         instruction_pc: u32,
         caller_function_id: u32,
     ) -> bool {
-        let changed = code_block
+        let call_changed = code_block
             .feedback_recorder_at(instruction_pc as usize)
             .is_some_and(|feedback| feedback.record_call_attempted());
+        let property_changed = code_block
+            .property_feedback_at(
+                instruction_pc as usize,
+                crate::property_ic::PropertyIcKind::Load,
+            )
+            .is_some_and(|slot| slot.record_attempt());
+        let changed = call_changed || property_changed;
         if changed {
             self.evict_compiled_for_reopt(caller_function_id);
         }
@@ -96,9 +105,34 @@ impl Interpreter {
             .map(OrdinaryCallTarget::FunctionPrototypeCall)
     }
 
+    /// Stable feedback selected without allocation or user code.
+    pub(crate) fn native_call_target(&self, callee: crate::Value) -> Option<OrdinaryCallTarget> {
+        callee.as_native_function().map(|native| {
+            crate::jit_static_native::jit_static_call_target(native, &self.gc_heap)
+                .map(|entry| OrdinaryCallTarget::StaticNative(entry.leaf_stub_id))
+                .unwrap_or(OrdinaryCallTarget::Native)
+        })
+    }
+
+    /// Resolve the one current kind/identity population before a call can collect.
+    pub(crate) fn resolved_call_target(
+        &self,
+        callee: crate::Value,
+        receiver: crate::Value,
+    ) -> Option<OrdinaryCallTarget> {
+        self.function_prototype_call_target(callee, receiver)
+            .or_else(|| callee.as_function().map(OrdinaryCallTarget::Bytecode))
+            .or_else(|| {
+                callee
+                    .as_closure(&self.gc_heap)
+                    .map(|closure| OrdinaryCallTarget::Bytecode(closure.function_id()))
+            })
+            .or_else(|| self.native_call_target(callee))
+    }
+
     /// Publish an already-resolved callable at a generated call site.
     /// This leaf observation never allocates in the GC heap or invokes user
-    /// code. Only exact declared bootstrap natives have a static-native target,
+    /// code. Exact declared bootstrap leaves retain priority over general native kind,
     /// and `%Function.prototype.call%` records the function it runs.
     pub(crate) fn record_resolved_call_feedback(
         &mut self,
@@ -108,22 +142,7 @@ impl Interpreter {
         callee: crate::Value,
         receiver: crate::Value,
     ) {
-        let target = self
-            .function_prototype_call_target(callee, receiver)
-            .or_else(|| callee.as_function().map(OrdinaryCallTarget::Bytecode))
-            .or_else(|| {
-                callee
-                    .as_closure(&self.gc_heap)
-                    .map(|closure| OrdinaryCallTarget::Bytecode(closure.function_id()))
-            })
-            .or_else(|| {
-                callee
-                    .as_native_function()
-                    .and_then(|native| {
-                        crate::jit_static_native::jit_static_call_target(native, &self.gc_heap)
-                    })
-                    .map(|entry| OrdinaryCallTarget::StaticNative(entry.leaf_stub_id))
-            });
+        let target = self.resolved_call_target(callee, receiver);
         let Some(target) = target else {
             return;
         };
@@ -259,7 +278,7 @@ mod tests {
     #[test]
     fn ordinary_call_epoch_tracks_each_distinct_target_and_saturation_once() {
         let code_block = call_code_block();
-        let mut interpreter = Interpreter::new();
+        let mut interpreter = Interpreter::new().expect("fixture interpreter bootstrap");
 
         for fid in 0..PROFILED_CALL_TARGET_CAPACITY as u32 {
             let transition = interpreter.record_ordinary_call_feedback(
@@ -319,7 +338,7 @@ mod tests {
     #[test]
     fn first_attempt_is_frozen_and_repeat_attempt_is_inert() {
         let code_block = call_code_block();
-        let mut interpreter = Interpreter::new();
+        let mut interpreter = Interpreter::new().expect("fixture interpreter bootstrap");
 
         assert!(!code_block.jit_compile_snapshot().instructions[0].call_attempted);
         assert!(interpreter.record_call_attempt_feedback(&code_block, 0, 42));
@@ -351,11 +370,79 @@ mod tests {
     #[test]
     fn method_population_transition_advances_epoch_only_when_material() {
         let code_block = call_code_block();
-        let mut interpreter = Interpreter::new();
+        let mut interpreter = Interpreter::new().expect("fixture interpreter bootstrap");
 
         assert!(interpreter.commit_method_call_feedback_transition(&code_block, 42, true));
         assert_eq!(code_block.feedback_epoch(), 1);
         assert!(!interpreter.commit_method_call_feedback_transition(&code_block, 42, false));
         assert_eq!(code_block.feedback_epoch(), 1);
+    }
+    #[test]
+    fn general_native_kind_is_one_target_across_live_static_and_dynamic_bodies() {
+        fn static_body(
+            _ctx: &mut crate::NativeCtx<'_>,
+            _args: &[crate::Value],
+        ) -> Result<crate::Value, crate::NativeError> {
+            Ok(crate::Value::number_i32(1))
+        }
+        let mut interpreter = Interpreter::new().expect("fixture interpreter bootstrap");
+        let code = call_code_block();
+        let first = crate::NativeFunction::new_static(
+            &mut interpreter.gc_heap,
+            "kindStatic",
+            0,
+            static_body,
+        )
+        .expect("static native fixture");
+        let first_target = interpreter.native_call_target(crate::Value::native_function(first));
+        assert_eq!(first_target, Some(OrdinaryCallTarget::Native));
+        // Only scalar feedback remains live while this second native allocates.
+        let second = crate::NativeFunction::new(
+            &mut interpreter.gc_heap,
+            "kindDynamic",
+            |_ctx, _args, _captures| Ok(crate::Value::number_i32(2)),
+        )
+        .expect("dynamic native fixture");
+        let second_target = interpreter.native_call_target(crate::Value::native_function(second));
+        assert_eq!(second_target, first_target);
+        assert_eq!(
+            interpreter.record_ordinary_call_feedback(&code, 0, first_target.unwrap()),
+            CallTargetTransition::BecameMonomorphic
+        );
+        assert_eq!(
+            interpreter.record_ordinary_call_feedback(&code, 0, second_target.unwrap()),
+            CallTargetTransition::Unchanged
+        );
+        assert_eq!(code.feedback_epoch(), 1);
+        assert_eq!(
+            code.call_distribution_at(0),
+            Some(CallSiteDistribution::Mono(CallTargetCount {
+                target: OrdinaryCallTarget::Native,
+                hits: 2,
+            }))
+        );
+        assert_eq!(
+            interpreter.record_ordinary_call_feedback(&code, 0, OrdinaryCallTarget::Bytecode(19)),
+            CallTargetTransition::BecamePolymorphic
+        );
+        assert_eq!(code.feedback_epoch(), 2);
+    }
+
+    #[test]
+    fn exact_declared_leaf_has_priority_over_general_native_kind() {
+        let mut interpreter = Interpreter::new().expect("fixture interpreter bootstrap");
+        let leaf = crate::NativeFunction::new_static(
+            &mut interpreter.gc_heap,
+            "exactAbs",
+            1,
+            crate::math::native_abs,
+        )
+        .expect("declared static native fixture");
+        assert_eq!(
+            interpreter.native_call_target(crate::Value::native_function(leaf)),
+            Some(OrdinaryCallTarget::StaticNative(
+                crate::native_abi::STUB_MATH_ABS_LEAF.id
+            ))
+        );
     }
 }

@@ -12,19 +12,6 @@ use otter_runtime::{
 };
 use sha2::{Digest, Sha224, Sha256, Sha384, Sha512};
 
-const SHIM: &str = include_str!("crypto.js");
-
-/// CommonJS export: the `crypto` namespace built by `crypto.js`.
-pub fn crypto_cjs_value<'scope>(
-    scope: &mut NativeScope<'scope, '_>,
-    _caps: &CapabilitySet,
-    _runtime_task_spawner: Option<RuntimeTaskSpawner>,
-    module: Local<'scope>,
-    require: Local<'scope>,
-) -> Result<Local<'scope>, NativeError> {
-    otter_runtime::run_builtin_cjs_shim(scope, "node:crypto", SHIM, module, require)
-}
-
 /// Hidden CommonJS row supplying the pure native crypto primitives.
 pub fn crypto_native_cjs_value<'scope>(
     scope: &mut NativeScope<'scope, '_>,

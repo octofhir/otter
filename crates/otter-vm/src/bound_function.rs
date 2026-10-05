@@ -86,6 +86,8 @@ pub struct BoundFunctionBody {
     /// lands here. `None` means the %Function.prototype% default; a
     /// stored `Value::null()` is an explicit null [[Prototype]].
     pub(crate) prototype_override: Option<Value>,
+    /// Reflect.construct keeps this actual wrapper as its new.target owner.
+    pub(crate) constructor_layouts: crate::constructor_layout::ConstructorLayout,
 }
 
 /// Byte offset of the target callable in [`BoundFunctionBody`]'s payload.
@@ -123,6 +125,22 @@ pub struct BoundFunction {
 }
 
 impl BoundFunction {
+    /// Traced family head of this exact constructor object.
+    pub(crate) fn constructor_layouts(
+        self,
+        heap: &otter_gc::GcHeap,
+    ) -> crate::constructor_layout::ConstructorLayout {
+        heap.read_payload(self.inner, |body| body.constructor_layouts)
+    }
+    pub(crate) fn set_constructor_layouts(
+        self,
+        heap: &mut otter_gc::GcHeap,
+        layouts: crate::constructor_layout::ConstructorLayout,
+    ) {
+        heap.with_payload(self.inner, |body| body.constructor_layouts = layouts);
+        heap.record_write(self.inner, &layouts);
+    }
+
     /// Raw handle used by root tracing and write barriers.
     #[must_use]
     pub(crate) fn raw(&self) -> RawGc {
@@ -233,6 +251,7 @@ impl Interpreter {
                     .as_object()
                     .expect("bound callable property bag"),
                 prototype_override: prototype.map(|value| interp.escape_scoped(value)),
+                constructor_layouts: crate::constructor_layout::ConstructorLayout::null(),
             };
             // The allocator traces the pending body, including its slab handle,
             // before publishing it. No allocation separates slab and body setup.

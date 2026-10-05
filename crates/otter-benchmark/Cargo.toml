@@ -21,8 +21,10 @@ engine = [
     "dep:otter-vm",
     "dep:smallvec",
     "dep:sysinfo",
+    "dep:sha2",
 ]
 rss = ["dep:sysinfo"]
+warm-harness = ["dep:otter-syntax", "dep:oxc_ast", "dep:oxc_ast_visit", "dep:oxc_span", "dep:sha2"]
 
 [dependencies]
 clap = { workspace = true }
@@ -32,6 +34,10 @@ otter-jit = { workspace = true, optional = true }
 otter-runtime = { workspace = true, optional = true }
 otter-syntax = { workspace = true, optional = true }
 otter-vm = { workspace = true, optional = true }
+oxc_ast = { workspace = true, optional = true }
+oxc_ast_visit = { workspace = true, optional = true }
+oxc_span = { workspace = true, optional = true }
+sha2 = { workspace = true, optional = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 smallvec = { workspace = true, optional = true }
@@ -47,6 +53,11 @@ path = "src/bin/engine.rs"
 required-features = ["engine"]
 
 [[bin]]
+name = "otter-warm-harness"
+path = "src/bin/warm_harness.rs"
+required-features = ["warm-harness"]
+
+[[bin]]
 name = "otter-allocation-probe"
 path = "src/bin/allocation_probe.rs"
 required-features = ["engine"]
@@ -54,4 +65,9 @@ required-features = ["engine"]
 [[bin]]
 name = "otter-engine-baseline"
 path = "src/bin/baseline.rs"
+required-features = ["engine"]
+
+[[bin]]
+name = "otter-resource-probe"
+path = "src/bin/resource_probe.rs"
 required-features = ["engine"]

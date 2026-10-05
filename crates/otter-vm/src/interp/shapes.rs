@@ -2,7 +2,7 @@
 //!
 //! # Contents
 //! `shape_root`/`shape_child` (with rooted object/value transitions),
-//! data-property stores (`set_property`, `ordinary_set_data_property`),
+//! data-property creation (`create_data_property`) and ordinary assignment,
 //! partial descriptor definition, freeze/seal, and shape-from-slots rebuild.
 //!
 //! # Invariants
@@ -12,6 +12,7 @@
 //! # See also
 //! `object::prototype_validity` for dependencies on prepared prototype chains.
 #![allow(unused_imports)]
+use crate::rooting::RootScopeExt;
 use crate::*;
 
 impl Interpreter {
@@ -22,7 +23,12 @@ impl Interpreter {
         parent: object::ShapeHandle,
         key: &str,
     ) -> Result<object::ShapeHandle, VmError> {
-        let _no_collection = self.gc_heap.always_allocate_scope();
+        let _runtime_roots = self.scope_runtime_roots_guard();
+        let mut parent = parent;
+        let mut pending = otter_gc::RootScope::new(&mut self.gc_heap);
+        // SAFETY: the parent slot precedes this registration and survives
+        // collecting allocation through the complete child lookup.
+        unsafe { pending.add_raw_slot(std::ptr::addr_of_mut!(parent).cast::<RawGc>()) };
         let mut external_visit = |_: &mut dyn FnMut(*mut RawGc)| {};
         self.shape_runtime
             .child_with_roots(
@@ -56,15 +62,17 @@ impl Interpreter {
         ) {
             return Ok(child);
         }
-        // A new transition allocates without collecting (a full nursery
-        // spills to old space, where long-lived shapes belong), so it never
-        // needs the whole runtime root set, which is huge in large programs.
-        let _no_collection = self.gc_heap.always_allocate_scope();
-        let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
-            let p = obj as *mut object::JsObject as *mut RawGc;
-            visitor(p);
-            value.trace_value_slot_mut(visitor);
-        };
+        let _runtime_roots = self.scope_runtime_roots_guard();
+        let mut parent = parent;
+        let mut pending = otter_gc::RootScope::new(&mut self.gc_heap);
+        // SAFETY: caller receiver/value slots and this parent slot remain
+        // stationary across lookup, allocation and return to their owner.
+        unsafe {
+            pending.add_object(obj);
+            pending.add_value(value);
+            pending.add_raw_slot(std::ptr::addr_of_mut!(parent).cast::<RawGc>());
+        }
+        let mut external_visit = |_: &mut dyn FnMut(*mut RawGc)| {};
         self.shape_runtime
             .child_with_roots(
                 &mut self.gc_heap,
@@ -91,12 +99,16 @@ impl Interpreter {
         {
             return Ok(child);
         }
-        // See `shape_child_rooting_object_value`.
-        let _no_collection = self.gc_heap.always_allocate_scope();
-        let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
-            let p = obj as *mut object::JsObject as *mut RawGc;
-            visitor(p);
-        };
+        let _runtime_roots = self.scope_runtime_roots_guard();
+        let mut parent = parent;
+        let mut pending = otter_gc::RootScope::new(&mut self.gc_heap);
+        // SAFETY: these slots survive every collecting transition allocation;
+        // the caller anchors the descriptor's values in the handle arena.
+        unsafe {
+            pending.add_object(obj);
+            pending.add_raw_slot(std::ptr::addr_of_mut!(parent).cast::<RawGc>());
+        }
+        let mut external_visit = |_: &mut dyn FnMut(*mut RawGc)| {};
         self.shape_runtime
             .child_with_roots(
                 &mut self.gc_heap,
@@ -124,9 +136,9 @@ impl Interpreter {
         &mut self,
         mut obj: object::JsObject,
         key: &str,
-    ) {
+    ) -> Result<(), VmError> {
         let Some(index) = object::array_index_property_name(key) else {
-            return;
+            return Ok(());
         };
         // An indexed property on a realm prototype becomes visible through
         // every ordinary dense array's holes, so the element fast paths that
@@ -140,7 +152,7 @@ impl Interpreter {
             self.activate_array_index_accessor_protector();
         }
         if self.realm_intrinsics.array_prototype() != Some(obj) {
-            return;
+            return Ok(());
         }
         let new_len = f64::from(index) + 1.0;
         let current = object::get(obj, &self.gc_heap, "length")
@@ -148,13 +160,16 @@ impl Interpreter {
             .map(|number| number.as_f64())
             .unwrap_or(0.0);
         if new_len > current {
-            object::set(
+            if !object::ordinary_set_data_property(
                 &mut obj,
                 &mut self.gc_heap,
                 "length",
                 Value::number(NumberValue::from_f64(new_len)),
-            );
+            )? {
+                return Err(VmError::TypeMismatch);
+            }
         }
+        Ok(())
     }
 
     /// Descriptor-aware data assignment that advances the object's GC-managed
@@ -165,11 +180,11 @@ impl Interpreter {
         key: &str,
         mut value: Value,
     ) -> Result<bool, VmError> {
+        let _runtime_roots = self.scope_runtime_roots_guard();
         let shape = object::shape(obj, &self.gc_heap);
         // Past the fast-property cap, stop extending the transition
         // chain and let `object::ordinary_set_data_property` normalize
-        // the object to dictionary storage (shape → null). Otherwise a
-        // growing chain makes every lookup O(n) and bulk addition
+        // the object to its immutable dictionary shape. Otherwise a growing chain makes every lookup O(n) and bulk addition
         // O(n²).
         let old_count = object::shape_property_count(shape, &self.gc_heap) as usize;
         let should_add_shape =
@@ -182,46 +197,58 @@ impl Interpreter {
 
         let ok = if let Some(next_shape) = next_shape {
             object::ordinary_set_data_property_with_shape(
-                obj,
+                &mut obj,
                 &mut self.gc_heap,
                 key,
                 value,
                 next_shape,
-                old_count,
-            )
+            )?
         } else {
-            object::ordinary_set_data_property(obj, &mut self.gc_heap, key, value)
+            object::ordinary_set_data_property(&mut obj, &mut self.gc_heap, key, value)?
         };
         if ok {
-            self.update_array_prototype_length_after_index_store(obj, key);
+            self.update_array_prototype_length_after_index_store(obj, key)?;
         }
         Ok(ok)
     }
 
     /// Construction-time data store that advances the object's GC-managed
     /// hidden class when a new own data property is created.
-    pub(crate) fn set_property(
+    pub(crate) fn create_data_property(
         &mut self,
-        mut obj: object::JsObject,
+        obj: &mut object::JsObject,
         key: &str,
         mut value: Value,
     ) -> Result<(), VmError> {
-        let shape = object::shape(obj, &self.gc_heap);
+        let _runtime_roots = self.scope_runtime_roots_guard();
+        let shape = object::shape(*obj, &self.gc_heap);
         let old_count = object::shape_property_count(shape, &self.gc_heap) as usize;
         let should_add_shape =
-            self.should_add_property(obj, key) && (old_count as u32) < object::MAX_FAST_PROPERTIES;
+            self.should_add_property(*obj, key) && (old_count as u32) < object::MAX_FAST_PROPERTIES;
         let next_shape = if should_add_shape {
-            Some(self.shape_child_rooting_object_value(shape, key, &mut obj, &mut value)?)
+            Some(self.shape_child_rooting_object_value(shape, key, obj, &mut value)?)
         } else {
             None
         };
 
-        if let Some(next_shape) = next_shape {
-            object::set_with_shape(obj, &mut self.gc_heap, key, value, next_shape, old_count);
+        let descriptor = object::PartialPropertyDescriptor::from_full(
+            &object::PropertyDescriptor::data(value, true, true, true),
+        );
+        let accepted = if let Some(next_shape) = next_shape {
+            object::define_own_property_partial_with_shape(
+                obj,
+                &mut self.gc_heap,
+                key,
+                descriptor,
+                next_shape,
+            )?
         } else {
-            object::set(&mut obj, &mut self.gc_heap, key, value);
+            object::define_own_property_partial(obj, &mut self.gc_heap, key, descriptor)?
+        };
+        if !accepted {
+            return Err(VmError::TypeMismatch);
         }
-        self.update_array_prototype_length_after_index_store(obj, key);
+        self.update_array_prototype_length_after_index_store(*obj, key)?;
         Ok(())
     }
 
@@ -246,17 +273,18 @@ impl Interpreter {
             let (next_shape, descriptor) = self.with_descriptor_anchored(descriptor, |this| {
                 this.shape_child_rooting_object_descriptor(shape, key, obj_ref, flags, is_accessor)
             })?;
-            return Ok(object::define_own_property_partial_with_shape(
+            return object::define_own_property_partial_with_shape(
                 obj_ref,
                 &mut self.gc_heap,
                 key,
                 descriptor,
                 next_shape,
-            ));
+            )
+            .map_err(VmError::from);
         }
         // Redefine an existing slot on a shaped object: rebuild the hidden
-        // class with the merged attributes so the shape keeps recording them
-        // instead of flagging a per-object override.
+        // class with the merged attributes. The final shape remains the sole
+        // ordinary descriptor owner.
         if !object::shape_body::is_dictionary_of(shape)
             && let Some((flags, is_accessor, offset)) =
                 object::redefine_merged_attrs(*obj_ref, &self.gc_heap, key, &descriptor)
@@ -273,22 +301,20 @@ impl Interpreter {
             let (redefine_shape, descriptor) =
                 self.with_descriptor_anchored(descriptor, |this| {
                     let mut no_extra_roots = |_: &mut dyn FnMut(*mut RawGc)| {};
-                    this.rebuild_shape_from_slots(obj_ref, &ordered, &mut no_extra_roots)
+                    let state = object::state(*obj_ref, &this.gc_heap).with_dictionary(false);
+                    this.rebuild_shape_from_slots(obj_ref, &ordered, state, &mut no_extra_roots)
                 })?;
-            return Ok(object::define_own_property_partial_with_shape(
+            return object::define_own_property_partial_with_shape(
                 obj_ref,
                 &mut self.gc_heap,
                 key,
                 descriptor,
                 redefine_shape,
-            ));
+            )
+            .map_err(VmError::from);
         }
-        Ok(object::define_own_property_partial(
-            obj_ref,
-            &mut self.gc_heap,
-            key,
-            descriptor,
-        ))
+        object::define_own_property_partial(obj_ref, &mut self.gc_heap, key, descriptor)
+            .map_err(VmError::from)
     }
 
     /// Give a dictionary-mode object — and every dictionary-mode object on its
@@ -318,15 +344,20 @@ impl Interpreter {
                     object::dictionary_ordered_slot_attrs(current, &interp.gc_heap)
                 {
                     let mut no_extra_roots = |_: &mut dyn FnMut(*mut RawGc)| {};
+                    let state = object::state(current, &interp.gc_heap).with_dictionary(false);
                     let Ok(shape) = interp.rebuild_shape_from_slots(
                         &mut current,
                         &ordered,
+                        state,
                         &mut no_extra_roots,
                     ) else {
                         break;
                     };
                     object::adopt_fast_shape(current, &mut interp.gc_heap, shape);
                 }
+                interp
+                    .shape_runtime
+                    .register_shape(&interp.gc_heap, object::shape(current, &interp.gc_heap));
                 let Some(next) = object::prototype(current, &interp.gc_heap) else {
                     break;
                 };
@@ -345,85 +376,125 @@ impl Interpreter {
         &mut self,
         obj: &mut object::JsObject,
         ordered: &[(String, object::PropertyFlags, bool)],
+        state: object::ShapeState,
         extra_visit: &mut otter_gc::heap::RootSlotVisitor<'_>,
     ) -> Result<object::ShapeHandle, VmError> {
-        // See `shape_child_rooting_object_value`.
-        let _no_collection = self.gc_heap.always_allocate_scope();
+        use crate::rooting::RootScopeExt;
+        let _runtime_roots = self.scope_runtime_roots_guard();
+        let mut roots = otter_gc::RootScope::new(&mut self.gc_heap);
+        // SAFETY: the receiver slot is caller-owned and stationary throughout
+        // state preparation and replay, and outlives this registration.
+        unsafe {
+            roots.add_object(obj);
+        }
         let current = object::shape(*obj, &self.gc_heap);
         let root = object::shape_body::lineage_root_of(&self.gc_heap, current);
+        let object_slot = (obj as *mut object::JsObject).cast::<RawGc>();
+        let mut visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
+            visitor(object_slot);
+            extra_visit(visitor);
+        };
+        let root = self.shape_runtime.state_with_roots(
+            &mut self.gc_heap,
+            root,
+            state.with_dictionary(false),
+            &mut visit,
+        )?;
         self.replay_slots_from(root, obj, ordered, extra_visit)
     }
 
     /// Replay `ordered` slots onto `shape` (a lineage root), rooting `obj`.
     pub(crate) fn replay_slots_from(
         &mut self,
-        mut shape: object::ShapeHandle,
+        shape: object::ShapeHandle,
         obj: &mut object::JsObject,
         ordered: &[(String, object::PropertyFlags, bool)],
         extra_visit: &mut otter_gc::heap::RootSlotVisitor<'_>,
     ) -> Result<object::ShapeHandle, VmError> {
-        let _no_collection = self.gc_heap.always_allocate_scope();
+        let _runtime_roots = self.scope_runtime_roots_guard();
+        // SAFETY: the heap arena outlives replay; no Local escapes. Holding the
+        // current partial root closes the key-interning collection window.
+        let scope = unsafe { otter_gc::HandleScope::from_ptr(self.gc_heap.handle_stack_ptr()) };
+        let mut current = scope.local(shape);
         for (key, flags, is_accessor) in ordered {
             let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
                 let p = obj as *mut object::JsObject as *mut RawGc;
                 visitor(p);
                 extra_visit(visitor);
             };
-            shape = self
+            let next = self
                 .shape_runtime
                 .child_with_roots(
                     &mut self.gc_heap,
-                    shape,
+                    current.get(),
                     key,
                     *flags,
                     *is_accessor,
                     &mut external_visit,
                 )
                 .map_err(VmError::from)?;
+            current = scope.local(next);
         }
-        Ok(shape)
+        Ok(current.get())
     }
 
     /// `Object.freeze` core: for a shaped object, transition to the
     /// attribute-encoding class recording every data slot as
     /// non-writable/non-configurable and accessor slots as non-configurable;
     /// dictionary-mode objects fall back to the in-place path.
-    pub(crate) fn freeze_object(&mut self, mut obj: object::JsObject) -> Result<(), VmError> {
-        let shape = object::shape(obj, &self.gc_heap);
-        if object::shape_body::is_dictionary_of(shape) {
-            object::freeze(obj, &mut self.gc_heap);
-            return Ok(());
-        }
-        let mut ordered = object::shape_ordered_slot_attrs(&self.gc_heap, shape);
-        for (_, flags, is_accessor) in ordered.iter_mut() {
-            *flags = flags.with_configurable(false);
-            if !*is_accessor {
-                *flags = flags.with_writable(false);
+    pub(crate) fn freeze_object(&mut self, obj: object::JsObject) -> Result<(), VmError> {
+        self.with_handle_scope(|this, scope| {
+            let owner = this.scoped_value(scope, Value::object(obj));
+            let mut obj = this
+                .escape_scoped(owner)
+                .as_object()
+                .expect("rooted object");
+            let shape = object::shape(obj, &this.gc_heap);
+            if object::shape_body::is_dictionary_of(shape) {
+                object::freeze(&mut obj, &mut this.gc_heap)?;
+                return Ok(());
             }
-        }
-        let mut no_extra = |_visitor: &mut dyn FnMut(*mut RawGc)| {};
-        let new_shape = self.rebuild_shape_from_slots(&mut obj, &ordered, &mut no_extra)?;
-        object::freeze_with_shape(obj, &mut self.gc_heap, new_shape);
-        Ok(())
+            let mut ordered = object::shape_ordered_slot_attrs(&this.gc_heap, shape);
+            for (_, flags, is_accessor) in &mut ordered {
+                *flags = flags.with_configurable(false);
+                if !*is_accessor {
+                    *flags = flags.with_writable(false);
+                }
+            }
+            let target = object::shape_body::state_of(shape).with_extensible(false);
+            let new_shape =
+                this.rebuild_shape_from_slots(&mut obj, &ordered, target, &mut |_| {})?;
+            object::freeze_with_shape(obj, &mut this.gc_heap, new_shape);
+            Ok(())
+        })
     }
 
     /// `Object.seal` core: for a shaped object, transition to the
     /// attribute-encoding class recording every slot as non-configurable;
     /// dictionary-mode objects fall back to the in-place path.
-    pub(crate) fn seal_object(&mut self, mut obj: object::JsObject) -> Result<(), VmError> {
-        let shape = object::shape(obj, &self.gc_heap);
-        if object::shape_body::is_dictionary_of(shape) {
-            object::seal(obj, &mut self.gc_heap);
-            return Ok(());
-        }
-        let mut ordered = object::shape_ordered_slot_attrs(&self.gc_heap, shape);
-        for (_, flags, _) in ordered.iter_mut() {
-            *flags = flags.with_configurable(false);
-        }
-        let mut no_extra = |_visitor: &mut dyn FnMut(*mut RawGc)| {};
-        let new_shape = self.rebuild_shape_from_slots(&mut obj, &ordered, &mut no_extra)?;
-        object::seal_with_shape(obj, &mut self.gc_heap, new_shape);
-        Ok(())
+    pub(crate) fn seal_object(&mut self, obj: object::JsObject) -> Result<(), VmError> {
+        self.with_handle_scope(|this, scope| {
+            let owner = this.scoped_value(scope, Value::object(obj));
+            let mut obj = this
+                .escape_scoped(owner)
+                .as_object()
+                .expect("rooted object");
+            let shape = object::shape(obj, &this.gc_heap);
+            if object::shape_body::is_dictionary_of(shape) {
+                object::seal(&mut obj, &mut this.gc_heap)?;
+                return Ok(());
+            }
+            let mut ordered = object::shape_ordered_slot_attrs(&this.gc_heap, shape);
+            for (_, flags, is_accessor) in &mut ordered {
+                *flags = flags.with_configurable(false);
+                let _ = is_accessor;
+            }
+            let target = object::shape_body::state_of(shape).with_extensible(false);
+            let new_shape =
+                this.rebuild_shape_from_slots(&mut obj, &ordered, target, &mut |_| {})?;
+            object::seal_with_shape(obj, &mut this.gc_heap, new_shape);
+            Ok(())
+        })
     }
 
     /// Look up a property slot in a GC-managed hidden-class shape.

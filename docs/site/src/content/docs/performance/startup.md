@@ -81,6 +81,21 @@ The bytecode compile cache is separate. Cached bytecode passes the mandatory
 bounded verifier and enters the VM through its immutable proof carrier; it
 never restores heap pages or bypasses runtime bootstrap invariants.
 
+Builtin modules never touch that cache. Every JavaScript builtin of
+`otter-node` (the vendored Node `lib/` files, their compat stand-ins and the
+small `node:` shims, all rows of `crates/otter-node/src/builtin_table.rs`) and
+the Node realm installer are compiled when the product is built
+(`crates/otter-node/build/builtins.rs`) and embedded with their exact wrapper
+text. A builtin is verified and linked on its first `require` only, and its
+source registers as program-image text without a copy. A configured compile
+hook still compiles that same text instead.
+
+The global console does not build `process.stdout`/`process.stderr` (and the
+streams stack behind them) to print: until something could observe a stream —
+the console's `_stdout`/`_stderr` read or assigned, or the process stream built
+or assigned before the console's first line — each line is written to the
+descriptor synchronously, as the stream would write it.
+
 ## Current Budgets
 
 The local 2026-05-06 ratchet values are:

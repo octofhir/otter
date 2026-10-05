@@ -4,7 +4,9 @@
 
 use crate::bootstrap::BootstrapFeatures;
 use crate::intrinsic_install::BuiltinIntrinsic;
-use crate::js_surface::{Attr, JsSurfaceError, MethodSpec, NamespaceBuilder, NamespaceSpec};
+use crate::js_surface::{
+    Attr, JsSurfaceError, MethodSpec, NamespaceBuilder, NamespaceSpec, ObjectBuilder,
+};
 use crate::native_function::NativeCall;
 use crate::object::{self, JsObject};
 use crate::rooting::RootScopeExt;
@@ -26,7 +28,7 @@ impl BuiltinIntrinsic for Intrinsic {
         // SAFETY: `temporal_value` is declared before the scope and remains the
         // single canonical handle while the nested class installers allocate.
         unsafe { temporal_scope.add_value(&mut temporal_value) };
-        crate::bootstrap::define_global_value(global, heap, Self::NAME, temporal_value);
+        crate::bootstrap::define_global_value(global, heap, Self::NAME, temporal_value)?;
 
         crate::temporal::instant::InstantIntrinsic::install(heap, global)?;
         crate::temporal::duration::DurationIntrinsic::install(heap, global)?;
@@ -50,12 +52,14 @@ impl BuiltinIntrinsic for Intrinsic {
         // {writable, non-enumerable, configurable}. Its
         // %Object.prototype% link installs in `install_well_knowns`,
         // after the Object intrinsics exist.
-        object::define_own_property(
+        if !object::define_own_property(
             temporal,
             heap,
             NOW_SPEC.name,
             crate::object::PropertyDescriptor::data(Value::object(now), true, false, true),
-        );
+        )? {
+            return Err(JsSurfaceError::DefinePropertyFailed("[[BuiltinProperty]]"));
+        };
         Ok(())
     }
 
@@ -81,57 +85,60 @@ fn install_temporal_well_knowns(
     well_known: &crate::symbol::WellKnownSymbols,
 ) -> Result<(), JsSurfaceError> {
     use crate::intrinsic_install::BuiltinIntrinsic;
-    use crate::object::PartialPropertyDescriptor;
-    use crate::symbol::WellKnown;
 
-    let tag_sym = well_known.get(WellKnown::ToStringTag);
-
-    let install =
-        |heap: &mut otter_gc::GcHeap, mut obj: JsObject, tag: &str| -> Result<(), JsSurfaceError> {
-            let value = crate::string::JsString::from_str(tag, heap)
-                .map_err(|_| JsSurfaceError::OutOfMemory)?;
-            object::define_own_symbol_property_partial(
-                &mut obj,
-                heap,
-                tag_sym,
-                PartialPropertyDescriptor {
-                    value: Some(Value::string(value)),
-                    writable: Some(false),
-                    enumerable: Some(false),
-                    configurable: Some(true),
-                    ..Default::default()
-                },
-            );
-            Ok(())
-        };
-
-    let Some(temporal) = object::get(global, heap, "Temporal").and_then(|v| v.as_object()) else {
+    let Some(mut temporal) =
+        object::get(global, heap, "Temporal").and_then(|value| value.as_object())
+    else {
         return Ok(());
     };
-    install(heap, temporal, "Temporal")?;
-
-    // §Temporal and §Temporal.Now are ordinary objects with
-    // %Object.prototype% (the Object constructor is a native function,
-    // so its `prototype` reads through the descriptor table).
-    let object_proto = object::get(global, heap, "Object")
-        .and_then(|ctor| ctor.as_native_function())
-        .and_then(|ctor| {
-            ctor.own_property_descriptor(heap, "prototype")
-                .ok()
-                .flatten()
-        })
-        .and_then(|descriptor| match descriptor.kind {
-            crate::object::DescriptorKind::Data { value } => value.as_object(),
-            crate::object::DescriptorKind::Accessor { .. } => None,
-        });
-    if let Some(object_proto) = object_proto {
-        object::set_prototype(temporal, heap, Some(object_proto));
+    let mut prototype = match object::get(global, heap, "Object")
+        .and_then(|constructor| constructor.as_native_function())
+    {
+        Some(constructor) => constructor
+            .own_property_descriptor(heap, "prototype")?
+            .and_then(|descriptor| match descriptor.kind {
+                object::DescriptorKind::Data { value } => Some(value),
+                object::DescriptorKind::Accessor { .. } => None,
+            })
+            .unwrap_or_else(Value::null),
+        None => Value::null(),
+    };
+    let mut roots = otter_gc::RootScope::new(heap);
+    // SAFETY: these actual slots precede the scope and all allocating owners
+    // reload them after collection. The per-realm well-known table is rooted
+    // by the bootstrap caller.
+    unsafe {
+        roots.add_object(&mut temporal);
+        roots.add_value(&mut prototype);
     }
-
-    if let Some(now) = object::get(temporal, heap, "Now").and_then(|v| v.as_object()) {
-        install(heap, now, "Temporal.Now")?;
-        if let Some(object_proto) = object_proto {
-            object::set_prototype(now, heap, Some(object_proto));
+    let mut builder = ObjectBuilder::from_object_with_value_roots(
+        heap,
+        temporal,
+        vec![Value::object(global), prototype],
+    );
+    builder.to_string_tag(well_known, "Temporal")?;
+    temporal = builder.build();
+    if let Some(prototype) = prototype.as_object()
+        && !object::set_prototype(&mut temporal, heap, Some(prototype))?
+    {
+        return Err(JsSurfaceError::DefinePropertyFailed(
+            "Temporal.[[Prototype]]",
+        ));
+    }
+    if let Some(mut now) = object::get(temporal, heap, "Now").and_then(|value| value.as_object()) {
+        let mut builder = ObjectBuilder::from_object_with_value_roots(
+            heap,
+            now,
+            vec![Value::object(global), Value::object(temporal), prototype],
+        );
+        builder.to_string_tag(well_known, "Temporal.Now")?;
+        now = builder.build();
+        if let Some(prototype) = prototype.as_object()
+            && !object::set_prototype(&mut now, heap, Some(prototype))?
+        {
+            return Err(JsSurfaceError::DefinePropertyFailed(
+                "Temporal.Now.[[Prototype]]",
+            ));
         }
     }
 

@@ -13,8 +13,9 @@
 //!   sidecars, and weak subscriptions cannot keep a dead proof alive.
 //! - Capture and mutation run on the mutator. The atomic validity word is the
 //!   only state a compiler worker or generated guard may read.
-//! - Capture neither allocates GC cells nor invokes JavaScript. Every ordinary
-//!   prototype already owns a sidecar installed with its instance root.
+//! - Capture neither allocates GC cells nor invokes JavaScript. Acquired
+//!   immutable prototype-role state proves the sidecar/watchpoint registration
+//!   published with its instance root; opaque links refuse the proof.
 //! - Snapshot restore starts with empty watchpoints; cells and subscriptions
 //!   are owned by one isolate and never copied from a captured heap image.
 //!
@@ -149,7 +150,10 @@ pub(crate) fn chain_validity(
             return None;
         }
         let next = heap.read_payload(current, |body| {
-            if body.chain_link_opaque() || body.exotic()?.instance_root.is_null() {
+            if !body.state().is_prototype()
+                || body.chain_link_opaque()
+                || body.exotic()?.instance_root.is_null()
+            {
                 return None;
             }
             Some(body.prototype())
@@ -219,23 +223,24 @@ mod tests {
 
     #[test]
     fn restored_prototypes_own_independent_watchpoints() {
-        let mut donor = crate::Interpreter::new();
+        let mut donor = crate::Interpreter::new().expect("fixture interpreter bootstrap");
         donor.gc_heap_mut().set_tenure_all(true);
         let mut prototype = donor.realm_intrinsics.object_prototype().unwrap();
         donor.migrate_slow_to_fast(&mut prototype);
         let original = chain_validity(prototype, donor.gc_heap()).unwrap();
         let snapshot = donor.capture_isolate_snapshot().unwrap();
         for _ in 0..3 {
-            let mut restored = crate::Interpreter::from_isolate_snapshot(&snapshot).unwrap();
+            let mut restored = crate::Interpreter::from_isolate_snapshot(
+                &snapshot,
+                &otter_resource::ResourceAccount::default(),
+            )
+            .unwrap();
             let mut prototype = restored.realm_intrinsics.object_prototype().unwrap();
             let proof = chain_validity(prototype, restored.gc_heap()).unwrap();
             assert!(!Arc::ptr_eq(&proof, &original));
-            super::super::set(
-                &mut prototype,
-                restored.gc_heap_mut(),
-                "restoredProof",
-                crate::Value::boolean(true),
-            );
+            restored
+                .create_data_property(&mut prototype, "restoredProof", crate::Value::boolean(true))
+                .expect("restored prototype property construction");
             assert!(!proof.is_valid());
             assert!(original.is_valid());
             drop(restored);

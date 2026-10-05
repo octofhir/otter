@@ -23,6 +23,9 @@
 //!   walk. Lives on the [`Interpreter`].
 //!
 //! # Invariants
+//! - Every allocating constructor initializes its wrapper cache and barrier
+//!   from the completed body, whose pending description may have moved during
+//!   the old-space allocation. Copied preallocation operands are not reused.
 //! - `JsSymbol::ptr_eq` is the only correctness-bearing equality —
 //!   description text is informational, never compared for identity.
 //! - Well-known symbols are NOT placed in the [`SymbolRegistry`];
@@ -72,7 +75,9 @@ pub fn alloc_symbol(
         registered,
         private_name: false,
     })?;
-    if let Some(description) = description {
+    // The collecting old allocation may rewrite the pending body's young
+    // description. Its completed body owns the current barrier operand.
+    if let Some(description) = heap.read_payload(inner, |body| body.description) {
         heap.record_write(inner, &description.handle());
     }
     Ok(inner)
@@ -91,7 +96,9 @@ pub fn alloc_private_name_symbol(
         registered: false,
         private_name: true,
     })?;
-    if let Some(description) = description {
+    // The collecting old allocation may rewrite the pending body's young
+    // description. Its completed body owns the current barrier operand.
+    if let Some(description) = heap.read_payload(inner, |body| body.description) {
         heap.record_write(inner, &description.handle());
     }
     Ok(inner)
@@ -169,13 +176,7 @@ impl JsSymbol {
         description: Option<JsString>,
     ) -> Result<Self, otter_gc::OutOfMemory> {
         let inner = alloc_symbol(heap, description, None, false)?;
-        Ok(Self {
-            inner,
-            description,
-            well_known: None,
-            registered: false,
-            private_name: false,
-        })
+        Ok(Self::from_handle(heap, inner))
     }
 
     /// Construct a well-known symbol singleton. Used by
@@ -218,13 +219,7 @@ impl JsSymbol {
         description: JsString,
     ) -> Result<Self, otter_gc::OutOfMemory> {
         let inner = alloc_symbol(heap, Some(description), Some(tag), false)?;
-        Ok(Self {
-            inner,
-            description: Some(description),
-            well_known: Some(tag),
-            registered: false,
-            private_name: false,
-        })
+        Ok(Self::from_handle(heap, inner))
     }
 
     /// Construct a registered symbol — `Symbol.for` step 4. The
@@ -239,13 +234,7 @@ impl JsSymbol {
         description: JsString,
     ) -> Result<Self, otter_gc::OutOfMemory> {
         let inner = alloc_symbol(heap, Some(description), None, true)?;
-        Ok(Self {
-            inner,
-            description: Some(description),
-            well_known: None,
-            registered: true,
-            private_name: false,
-        })
+        Ok(Self::from_handle(heap, inner))
     }
 
     /// Construct a Private Name carrier (`Op::NewPrivateName`).
@@ -257,13 +246,7 @@ impl JsSymbol {
         description: Option<JsString>,
     ) -> Result<Self, otter_gc::OutOfMemory> {
         let inner = alloc_private_name_symbol(heap, description)?;
-        Ok(Self {
-            inner,
-            description,
-            well_known: None,
-            registered: false,
-            private_name: true,
-        })
+        Ok(Self::from_handle(heap, inner))
     }
 
     /// Whether this symbol came from `Symbol.for`.
@@ -775,3 +758,7 @@ mod tests {
         assert!(reg.key_for(iter).is_none());
     }
 }
+
+#[cfg(test)]
+#[path = "symbol/allocation_tests.rs"]
+mod allocation_tests;

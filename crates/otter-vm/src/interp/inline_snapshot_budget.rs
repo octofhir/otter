@@ -1,37 +1,44 @@
-//! Shared resource bound for plain and method inline snapshot trees.
+//! Shared resource bound for owned plain and method inline snapshot trees.
 //!
 //! # Contents
-//! - Ancestry rejection, maximum nesting, and a per-root body budget.
+//! - Maximum nesting and a per-root preparation budget.
 //!
 //! # Invariants
 //! - Every candidate consumes the same budget before preparing its descendants.
 //! - Rejected or failed candidates never replenish work already performed.
-//! - Function recursion cannot build cyclic snapshots.
+//! - Each body is a fresh owned snapshot; depth bounds recursive preparation.
+//! - Graph lowering independently charges its existing depth and byte budgets.
+//!
+//! # See also
+//! - `jit_compile::bake_inline_body` owns each descendant's source and feedback.
 
 pub(super) struct InlineSnapshotBudget {
-    ancestry: Vec<u32>,
+    depth: u8,
     remaining: usize,
 }
 
 impl InlineSnapshotBudget {
-    pub(super) fn new(root: u32) -> Self {
+    pub(super) fn new() -> Self {
         Self {
-            ancestry: vec![root],
+            depth: 0,
             remaining: 64,
         }
     }
 
-    pub(super) fn enter(&mut self, function_id: u32) -> bool {
-        if self.remaining == 0 || self.ancestry.len() > 3 || self.ancestry.contains(&function_id) {
+    pub(super) fn enter(&mut self) -> bool {
+        if self.remaining == 0 || self.depth >= 3 {
             return false;
         }
         self.remaining -= 1;
-        self.ancestry.push(function_id);
+        self.depth += 1;
         true
     }
 
     pub(super) fn leave(&mut self) {
-        self.ancestry.pop();
+        self.depth = self
+            .depth
+            .checked_sub(1)
+            .expect("inline preparation leaves an entered body");
     }
 }
 
@@ -40,22 +47,19 @@ mod tests {
     use super::*;
 
     #[test]
-    fn snapshot_work_is_bounded_across_siblings_and_recursion() {
-        let mut budget = InlineSnapshotBudget::new(1);
-        assert!(!budget.enter(1));
-        assert!(budget.enter(2));
-        assert!(!budget.enter(1));
-        assert!(!budget.enter(2));
-        assert!(budget.enter(3));
-        assert!(budget.enter(4));
-        assert!(!budget.enter(5));
+    fn snapshot_work_is_bounded_across_siblings_and_nesting() {
+        let mut budget = InlineSnapshotBudget::new();
+        assert!(budget.enter());
+        assert!(budget.enter());
+        assert!(budget.enter());
+        assert!(!budget.enter());
         budget.leave();
         budget.leave();
         budget.leave();
         for _ in 0..61 {
-            assert!(budget.enter(2));
+            assert!(budget.enter());
             budget.leave();
         }
-        assert!(!budget.enter(2));
+        assert!(!budget.enter());
     }
 }

@@ -29,6 +29,15 @@ use crate::{
 };
 use smallvec::SmallVec;
 
+/// The callee identity a method-site distribution records.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MethodFeedbackTarget {
+    /// A bytecode function id.
+    Function(u32),
+    /// A declared native leaf entry.
+    NativeLeaf(crate::native_abi::RuntimeStubId),
+}
+
 /// Isolate-local method-feedback directory. Property programs and counters are
 /// owned directly by CodeBlock slots and never enter this structure.
 #[derive(Default)]
@@ -143,6 +152,57 @@ impl MethodFeedbackDirectory {
         self.method_targets.get(site)?.clone()
     }
 
+    /// Whether the site's bounded distribution already names `recv_shape`
+    /// resolving to `target` under a still-valid lookup proof, counting the
+    /// hit. Recording that call again would change nothing.
+    fn records_method_target(
+        &mut self,
+        site: usize,
+        recv_shape: crate::object::ShapeId,
+        target: MethodFeedbackTarget,
+    ) -> bool {
+        if !self
+            .address(site)
+            .is_some_and(FeedbackSlotAddress::is_method)
+        {
+            return false;
+        }
+        let live = |proof: &crate::MethodLookupProof| {
+            proof.validity.as_ref().is_none_or(|cell| cell.is_valid())
+        };
+        match (self.method_targets.get_mut(site), target) {
+            (
+                Some(Some(MethodCallFeedback::Mono {
+                    method_fid,
+                    recv_shape: seen,
+                    prototype,
+                    ..
+                })),
+                MethodFeedbackTarget::Function(fid),
+            ) => *method_fid == fid && *seen == recv_shape && live(prototype),
+            (
+                Some(Some(MethodCallFeedback::MonoNativeLeaf {
+                    stub_id,
+                    recv_shape: seen,
+                    prototype,
+                    ..
+                })),
+                MethodFeedbackTarget::NativeLeaf(id),
+            ) => *stub_id == id && *seen == recv_shape && live(prototype),
+            (
+                Some(Some(MethodCallFeedback::Poly(targets))),
+                MethodFeedbackTarget::Function(fid),
+            ) => targets
+                .iter_mut()
+                .find(|seen| {
+                    seen.method_fid == fid && seen.recv_shape == recv_shape && live(&seen.prototype)
+                })
+                .map(|seen| seen.hits = seen.hits.saturating_add(1))
+                .is_some(),
+            _ => false,
+        }
+    }
+
     fn method_targets_saturated(&self, site: usize) -> bool {
         self.address(site)
             .is_some_and(FeedbackSlotAddress::is_method)
@@ -216,7 +276,7 @@ fn record_method_native_leaf_distribution(
                 stub_id,
                 recv_shape: method_site.recv_shape,
                 prototype: method_site.prototype,
-                method_value_byte: method_site.method_value_byte,
+                method_field: method_site.method_field,
             });
             true
         }
@@ -224,13 +284,13 @@ fn record_method_native_leaf_distribution(
             stub_id: seen_stub,
             recv_shape,
             prototype,
-            method_value_byte,
+            method_field,
             ..
         }) => {
             if *seen_stub != stub_id
                 || *recv_shape != method_site.recv_shape
                 || !prototype.same(&method_site.prototype)
-                || *method_value_byte != method_site.method_value_byte
+                || *method_field != method_site.method_field
             {
                 *feedback = Some(MethodCallFeedback::Megamorphic);
                 true
@@ -257,7 +317,7 @@ fn record_method_distribution(
         method_fid,
         recv_shape: site.recv_shape,
         prototype: site.prototype.clone(),
-        method_value_byte: site.method_value_byte,
+        method_field: site.method_field,
         hits: 1,
     };
     match feedback {
@@ -266,7 +326,7 @@ fn record_method_distribution(
                 method_fid,
                 recv_shape: site.recv_shape,
                 prototype: site.prototype.clone(),
-                method_value_byte: site.method_value_byte,
+                method_field: site.method_field,
             });
             true
         }
@@ -274,18 +334,18 @@ fn record_method_distribution(
             method_fid: seen_fid,
             recv_shape: seen_shape,
             prototype: seen_prototype,
-            method_value_byte: seen_value_byte,
+            method_field: seen_value_byte,
         }) => {
             let same = *seen_fid == method_fid
                 && *seen_shape == site.recv_shape
                 && seen_prototype.same(&site.prototype)
-                && *seen_value_byte == site.method_value_byte;
+                && *seen_value_byte == site.method_field;
             if !same {
                 let prior = PolyMethodTarget {
                     method_fid: *seen_fid,
                     recv_shape: *seen_shape,
                     prototype: seen_prototype.clone(),
-                    method_value_byte: *seen_value_byte,
+                    method_field: *seen_value_byte,
                     hits: 1,
                 };
                 let mut targets: SmallVec<[PolyMethodTarget; MAX_POLY_METHOD_TARGETS]> =
@@ -363,6 +423,18 @@ impl Interpreter {
         self.method_feedback.saturate_method_targets(site);
     }
 
+    /// Whether a call on `recv_shape` resolving to `target` is already in
+    /// the site's distribution, so its layout capture can be skipped.
+    pub(crate) fn method_feedback_records(
+        &mut self,
+        site: usize,
+        recv_shape: crate::object::ShapeId,
+        target: MethodFeedbackTarget,
+    ) -> bool {
+        self.method_feedback
+            .records_method_target(site, recv_shape, target)
+    }
+
     pub(crate) fn record_method_target_feedback(
         &mut self,
         site: usize,
@@ -383,7 +455,7 @@ mod tests {
         MethodSite {
             recv_shape: ShapeId::for_test(raw),
             prototype: MethodLookupProof::own(),
-            method_value_byte: raw as u32 * 8,
+            method_field: crate::object::FieldLocation::overflow(raw as u32),
         }
     }
 

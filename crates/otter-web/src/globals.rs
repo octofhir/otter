@@ -1,6 +1,6 @@
 //! Standard Web-platform function globals: `atob`, `btoa`, `queueMicrotask`,
 //! `structuredClone`, `fetch`, plus the JS-implemented class globals in
-//! [`WEB_BOOTSTRAP`] (Event/EventTarget/DOMException/TextEncoder/Decoder/
+//! the static bootstrap bundle (Event/EventTarget/DOMException/TextEncoder/Decoder/
 //! AbortController/AbortSignal/MessageEvent/…).
 //!
 //! These belong to the Web platform (not Node), so they live here and are
@@ -18,24 +18,6 @@ use otter_runtime::{
     RuntimeValue as Value, SourceInput, runtime_arg_to_string, runtime_string_value,
     runtime_type_error,
 };
-
-/// Pure-JS Web Platform globals — the sources live in the `romp!`
-/// declaration ([`crate::WEB_EXTENSION`]); these test-only copies feed
-/// the def-scan honesty check below.
-#[cfg(test)]
-const WEB_BOOTSTRAP: &str = include_str!("web_bootstrap.js");
-
-#[cfg(test)]
-const WEB_STREAMS: &str = include_str!("web_streams.js");
-
-#[cfg(test)]
-const WEB_FETCH: &str = include_str!("web_fetch.js");
-
-#[cfg(test)]
-const WEB_URLPATTERN: &str = include_str!("web_urlpattern.js");
-
-#[cfg(test)]
-const WEB_CONSOLE: &str = include_str!("web_console.js");
 
 /// Installer for the Web function globals. Registered by `with_web_apis`.
 #[must_use]
@@ -78,12 +60,10 @@ fn install(runtime: &mut RuntimeExtensionContext<'_>) -> Result<(), OtterError> 
 /// are exposed as plain settable ([Replaceable]-equivalent) globals rather than
 /// through `addEventListener`. They and the VM-invoked reporter are installed
 /// **eagerly** — the on* attributes must be assignable before any Web global is
-/// touched (and a later lazy materialization of `web_bootstrap.js` must not
-/// clobber a user-set handler), and the reporter must exist whenever the VM's
-/// HostPromiseRejectionTracker checkpoint runs. The reporter references
-/// `PromiseRejectionEvent` and `reportError` lazily, so those stay in the
-/// deferred `web_bootstrap.js` group and materialize the first time the reporter
-/// actually fires.
+/// touched, and the reporter must exist whenever the VM's
+/// HostPromiseRejectionTracker checkpoint runs. Its `PromiseRejectionEvent` and
+/// `reportError` references resolve when invoked, after the complete Web bundle
+/// has installed those globals.
 fn install_promise_rejection_handling(
     runtime: &mut RuntimeExtensionContext<'_>,
 ) -> Result<(), OtterError> {
@@ -346,57 +326,4 @@ fn stream_codec(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Native
         .global_value("Uint8Array")
         .ok_or_else(|| runtime_type_error("CompressionStream", "Uint8Array is unavailable"))?;
     ctx.construct(ctor, &[Value::array_buffer(buffer)])
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{WEB_BOOTSTRAP, WEB_CONSOLE, WEB_FETCH, WEB_STREAMS, WEB_URLPATTERN};
-    use std::collections::BTreeSet;
-
-    /// Scan one literal global-install pattern. This is deliberately not a JS
-    /// parser: the honesty check only recognizes the two explicit declaration
-    /// spellings accepted by these controlled bootstrap sources.
-    fn names_after(src: &str, needle: &[u8]) -> BTreeSet<String> {
-        let mut out = BTreeSet::new();
-        let bytes = src.as_bytes();
-        let mut i = 0;
-        while i + needle.len() < bytes.len() {
-            if &bytes[i..i + needle.len()] == needle {
-                let start = i + needle.len();
-                if let Some(end_rel) = src[start..].find('\'') {
-                    out.insert(src[start..start + end_rel].to_string());
-                }
-                i = start;
-            } else {
-                i += 1;
-            }
-        }
-        out
-    }
-
-    fn installed_global_names(src: &str) -> BTreeSet<String> {
-        let mut out = names_after(src, b"def('");
-        out.extend(names_after(src, b"Object.defineProperty(globalThis, '"));
-        out
-    }
-
-    /// The romp! declaration's `defines` lists must match the
-    /// `def('…')` globals each shim source actually installs — the
-    /// build-time honesty check for declaration-derived lazy names.
-    #[test]
-    fn lazy_global_names_match_shim_def_calls() {
-        let mut from_shims = installed_global_names(WEB_BOOTSTRAP);
-        from_shims.extend(installed_global_names(WEB_STREAMS));
-        from_shims.extend(installed_global_names(WEB_FETCH));
-        from_shims.extend(installed_global_names(WEB_URLPATTERN));
-        from_shims.extend(installed_global_names(WEB_CONSOLE));
-        let declared: BTreeSet<String> = crate::WEB_EXTENSION
-            .lazy_names()
-            .map(str::to_string)
-            .collect();
-        assert_eq!(
-            from_shims, declared,
-            "romp! `defines` lists must match the def('...') globals installed by the shim sources"
-        );
-    }
 }

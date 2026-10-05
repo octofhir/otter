@@ -16,6 +16,7 @@
 //! - [`crate::Interpreter::run_load_super_property`]
 //! - [`crate::Interpreter::run_store_super_property`]
 
+use crate::native_abi::CommittedValueError;
 use otter_bytecode::Op;
 
 use crate::{
@@ -36,10 +37,10 @@ impl Interpreter {
         arg0: u64,
         arg1: u64,
         arg2: u64,
-    ) -> Result<(), VmError> {
+    ) -> Result<(), CommittedValueError> {
         self.record_jit_runtime_stub_class(crate::native_abi::RuntimeStubClass::Reentrant);
         if frame_index + 1 != stack.len() {
-            return Err(VmError::InvalidOperand);
+            return Err(CommittedValueError::Fatal(VmError::InvalidOperand));
         }
         let saved_pc = stack[frame_index].pc;
         let strict = context.function_is_strict(stack[frame_index].function_id);
@@ -50,9 +51,11 @@ impl Interpreter {
                 // chunk (a generated direct call can cross chunks).
                 let atom = context
                     .property_atom_for_function(stack[frame_index].function_id, arg2 as u32)
-                    .ok_or(VmError::InvalidOperand)?;
+                    .ok_or(VmError::InvalidOperand)
+                    .map_err(|error| CommittedValueError::Fatal(error.into()))?;
                 let name = atom.name();
-                let home = *read_register(&stack[frame_index], arg1 as u16)?;
+                let home = *read_register(&stack[frame_index], arg1 as u16)
+                    .map_err(|error| CommittedValueError::Fatal(error.into()))?;
                 self.run_load_super_property(
                     context,
                     stack,
@@ -64,8 +67,10 @@ impl Interpreter {
             }
             value if value == Op::LoadSuperElement as u8 => {
                 let dst = arg0 as u16;
-                let home = *read_register(&stack[frame_index], arg1 as u16)?;
-                let key_raw = *read_register(&stack[frame_index], arg2 as u16)?;
+                let home = *read_register(&stack[frame_index], arg1 as u16)
+                    .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                let key_raw = *read_register(&stack[frame_index], arg2 as u16)
+                    .map_err(|error| CommittedValueError::Fatal(error.into()))?;
                 self.run_load_super_property(
                     context,
                     stack,
@@ -78,10 +83,13 @@ impl Interpreter {
             value if value == Op::SetSuperProperty as u8 => {
                 let atom = context
                     .property_atom_for_function(stack[frame_index].function_id, arg1 as u32)
-                    .ok_or(VmError::InvalidOperand)?;
+                    .ok_or(VmError::InvalidOperand)
+                    .map_err(|error| CommittedValueError::Fatal(error.into()))?;
                 let name = atom.name();
-                let home = *read_register(&stack[frame_index], arg0 as u16)?;
-                let value = *read_register(&stack[frame_index], arg2 as u16)?;
+                let home = *read_register(&stack[frame_index], arg0 as u16)
+                    .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                let value = *read_register(&stack[frame_index], arg2 as u16)
+                    .map_err(|error| CommittedValueError::Fatal(error.into()))?;
                 self.run_store_super_property(
                     context,
                     stack,
@@ -93,9 +101,12 @@ impl Interpreter {
                 )?;
             }
             value if value == Op::SetSuperElement as u8 => {
-                let home = *read_register(&stack[frame_index], arg0 as u16)?;
-                let key_raw = *read_register(&stack[frame_index], arg1 as u16)?;
-                let value = *read_register(&stack[frame_index], arg2 as u16)?;
+                let home = *read_register(&stack[frame_index], arg0 as u16)
+                    .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                let key_raw = *read_register(&stack[frame_index], arg1 as u16)
+                    .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                let value = *read_register(&stack[frame_index], arg2 as u16)
+                    .map_err(|error| CommittedValueError::Fatal(error.into()))?;
                 self.run_store_super_property(
                     context,
                     stack,
@@ -106,7 +117,7 @@ impl Interpreter {
                     strict,
                 )?;
             }
-            _ => return Err(VmError::InvalidOperand),
+            _ => return Err(CommittedValueError::Fatal(VmError::InvalidOperand)),
         }
         stack[frame_index].pc = saved_pc;
         Ok(())

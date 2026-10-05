@@ -18,7 +18,9 @@
 //!   stack.
 //! - Rejected awaits re-enter through the same throw-unwind path as
 //!   synchronous `throw`.
-//! - Async frames absorb unhandled throws by rejecting their result promise.
+//! - Async frames absorb unhandled JavaScript throws by rejecting their
+//!   result promise. Completed terminal failures leave through the existing
+//!   owned RunError without rejection projection.
 //! - Every resume exit releases frames, cold records, and register windows back
 //!   to the activation floor while that stack is still published as a GC root.
 //!
@@ -30,6 +32,7 @@
 use crate::activation_stack::{ActivationFloor, ActivationStack, ThrowSite};
 
 use crate::promise::JsPromise;
+use crate::runtime_activation::CommittedValueError;
 use crate::{ExecutionContext, Frame, Interpreter, RunError, Value, VmError, promise_dispatch};
 
 impl Interpreter {
@@ -44,13 +47,15 @@ impl Interpreter {
         context: &ExecutionContext,
         stack: &mut ActivationStack,
         value: Value,
-    ) -> Result<crate::promise::JsPromiseHandle, VmError> {
+    ) -> Result<crate::promise::JsPromiseHandle, CommittedValueError> {
         // §27.2.4.7 PromiseResolve — a promise is handed back as itself
         // only once its `constructor` proves to be this realm's; that read
         // is observable, and skipping it also skipped the ticks a
         // mismatched constructor costs.
-        let promise = self.promise_resolve_value(stack, context, value)?;
-        promise.as_promise().ok_or(VmError::InvalidOperand)
+        let promise = self.promise_resolve_value(stack, Some(context), value)?;
+        promise
+            .as_promise()
+            .ok_or(CommittedValueError::Fatal(VmError::InvalidOperand))
     }
 
     /// Handle [`otter_bytecode::Op::Await`]: park the current
@@ -63,17 +68,11 @@ impl Interpreter {
     ///    plain value settles on the next microtask tick.
     /// 2. Advance the parked frame's pc past the `Await`
     ///    instruction so resumption continues with the next op.
-    /// 3. Pop the frame off the active stack and box it; share the
-    ///    box between the resume / reject closures via an
-    ///    `Rc<Cell<Option<_>>>` so whichever reaction fires first
-    ///    consumes the parked frame and the other reaction falls
-    ///    through as a no-op (matching spec idempotency for
-    ///    `then`'s twin reactions).
-    /// 4. Build native `resume_fulfill` / `resume_reject` closures
-    ///    that enqueue a [`crate::microtask::MicrotaskKind::AsyncResume`]
-    ///    microtask when invoked. Attach them with `perform_then` so the
-    ///    drain delivers the awaited value into the parked frame's
-    ///    `dst` register on resume.
+    /// 3. Move the frame and cold state into the canonical managed parked
+    ///    frame. The first settling reaction consumes it; its twin is a no-op.
+    /// 4. Register resume reactions carrying the exact source, origin realm
+    ///    and traced async context. The queued resume delivers the completion
+    ///    into the parked frame's `dst` register.
     ///
     /// # Invariants
     /// - The frame at the top of `stack` MUST have async ownership in its cold
@@ -94,63 +93,82 @@ impl Interpreter {
         context: &ExecutionContext,
         dst: u16,
         awaited: Value,
-    ) -> Result<(), VmError> {
-        let top_idx = stack.len() - 1;
-        // §27.6 Async-generator body — the running frame has no
-        // regular async-function state, but its cold record carries a
-        // generator owner whose body was flagged
-        // async. Park the frame on a dedicated resume native that
-        // re-enters the generator body and either settles the
-        // front queued request from a subsequent `Op::Yield` /
-        // completion, or chains another `Op::Await`.
-        if !self.frame_has_async_state(&stack[top_idx]) {
-            if let Some(owner) = self.frame_generator_owner(&stack[top_idx])
-                && owner.is_async(&self.gc_heap)
-            {
-                return self.do_await_async_gen(stack, context, dst, awaited, owner);
+    ) -> Result<(), CommittedValueError> {
+        self.with_handle_scope(|vm, scope| {
+            let top_idx = stack.len() - 1;
+            // §27.6 Async-generator body — the running frame has no
+            // regular async-function state, but its cold record carries a
+            // generator owner whose body was flagged
+            // async. Park the frame on a dedicated resume native that
+            // re-enters the generator body and either settles the
+            // front queued request from a subsequent `Op::Yield` /
+            // completion, or chains another `Op::Await`.
+            if !vm.frame_has_async_state(&stack[top_idx]) {
+                if let Some(owner) = vm.frame_generator_owner(&stack[top_idx])
+                    && owner.is_async(&vm.gc_heap)
+                {
+                    return vm.do_await_async_gen(stack, context, dst, awaited, owner);
+                }
+                return Err(CommittedValueError::Fatal(VmError::InvalidOperand));
             }
-            return Err(VmError::InvalidOperand);
-        }
-        // Advance past the Await before parking so resumption
-        // continues at the next instruction.
-        stack[top_idx].advance_pc()?;
-        // The continuation belongs to the context that awaited, so capture it
-        // before the frame parks.
-        let async_context = self.async_context();
-        let promise = self.await_promise_resolve(context, stack, awaited)?;
-        // The capability and parked-frame allocations below move the awaited
-        // promise; it rides an anchor slot and is re-read before the resume
-        // reactions register, so they land on the live promise rather than
-        // its vacated slot.
-        let promise_slot = self.push_iteration_anchor(Value::promise(promise)) - 1;
-        let outcome = (|this: &mut Self| -> Result<(), VmError> {
-            let capability = promise_dispatch::PromiseBuilder::with_context(context.clone())
-                .capability_stack_rooted(this, stack, &[], &[])?;
-            let parked = stack.pop().expect("top frame existed");
-            let detached_cold = this.frame_detach_cold(parked);
-            let parked = this.park_active_frame(parked);
-            let parked =
-                crate::generator::alloc_parked_frame(&mut this.gc_heap, parked, detached_cold)?;
-            let promise = this
-                .iteration_anchor(promise_slot)
-                .as_promise()
-                .expect("anchored awaited promise survives the park allocations");
-            let outcome = promise.perform_async_resume_then_with_context(
-                &mut this.gc_heap,
-                parked,
-                dst,
-                capability,
-                None,
-                Some(context.clone()),
-                async_context,
-            );
-            if let Some(job) = outcome.immediate_job {
-                this.microtasks.enqueue(job);
-            }
-            Ok(())
-        })(self);
-        self.pop_iteration_anchors_to(promise_slot);
-        outcome
+            // Advance past the Await before parking so resumption
+            // continues at the next instruction.
+            stack[top_idx]
+                .advance_pc()
+                .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+            // The continuation belongs to the context that awaited, so capture it
+            // before the frame parks.
+            let async_context = vm.scoped_value(scope, vm.async_context());
+            let realm_id = vm.active_host_realm_id();
+            let promise = vm.await_promise_resolve(context, stack, awaited)?;
+            // The capability and parked-frame allocations below move the awaited
+            // promise; it rides an anchor slot and is re-read before the resume
+            // reactions register, so they land on the live promise rather than
+            // its vacated slot.
+            let promise_slot = vm.push_iteration_anchor(Value::promise(promise)) - 1;
+            let outcome = (|this: &mut Self| -> Result<(), CommittedValueError> {
+                let capability =
+                    promise_dispatch::PromiseBuilder::with_context(Some(context.clone()))
+                        .capability_stack_rooted(this, stack, &[], &[])
+                        .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                let capability_promise = this.scoped_value(scope, capability.promise);
+                let capability_resolve = this.scoped_value(scope, capability.resolve);
+                let capability_reject = this.scoped_value(scope, capability.reject);
+                let parked = stack.pop().expect("top frame existed");
+                let detached_cold = this.frame_detach_cold(parked);
+                let parked = this.park_active_frame(parked);
+                let parked =
+                    crate::generator::alloc_parked_frame(&mut this.gc_heap, parked, detached_cold)
+                        .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                let promise = this
+                    .iteration_anchor(promise_slot)
+                    .as_promise()
+                    .expect("anchored awaited promise survives the park allocations");
+                let capability = crate::promise::PromiseCapability {
+                    promise: this.escape_scoped(capability_promise),
+                    resolve: this.escape_scoped(capability_resolve),
+                    reject: this.escape_scoped(capability_reject),
+                    context: capability.context,
+                };
+                let async_context = this.escape_scoped(async_context);
+                let outcome = promise.perform_async_resume_then(
+                    &mut this.gc_heap,
+                    parked,
+                    dst,
+                    capability,
+                    None,
+                    Some(context.clone()),
+                    async_context,
+                    realm_id,
+                );
+                if let Some(job) = outcome.immediate_job {
+                    this.microtasks.enqueue(job);
+                }
+                Ok(())
+            })(vm);
+            vm.pop_iteration_anchors_to(promise_slot);
+            outcome
+        })
     }
 
     /// §27.6.3 — `Op::Await` inside an async-generator body. Parks
@@ -165,62 +183,92 @@ impl Interpreter {
         dst: u16,
         awaited: Value,
         owner: crate::generator::JsGenerator,
-    ) -> Result<(), VmError> {
-        let top_idx = stack.len() - 1;
-        stack[top_idx].advance_pc()?;
-        // The continuation belongs to the context that awaited, so capture it
-        // before the frame parks.
-        let async_context = self.async_context();
-        let promise = self.await_promise_resolve(context, stack, awaited)?;
-        // Same anchoring as the regular-await path: the park allocations
-        // below move the awaited promise.
-        let promise_slot = self.push_iteration_anchor(Value::promise(promise)) - 1;
-        let capability = match promise_dispatch::PromiseBuilder::with_context(context.clone())
-            .capability_stack_rooted(self, stack, &[], &[])
-        {
-            Ok(capability) => capability,
-            Err(err) => {
-                self.pop_iteration_anchors_to(promise_slot);
-                return Err(err.into());
-            }
-        };
-        let parked = stack.pop().expect("top frame existed");
-        let detached_cold = self.frame_detach_cold(parked);
-        let parked = self.park_active_frame(parked);
-        let parked =
-            match crate::generator::alloc_parked_frame(&mut self.gc_heap, parked, detached_cold) {
+    ) -> Result<(), CommittedValueError> {
+        self.with_handle_scope(|vm, scope| {
+            let owner_root = vm.scoped_value(scope, Value::generator(owner));
+            let top_idx = stack.len() - 1;
+            stack[top_idx]
+                .advance_pc()
+                .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+            // The continuation belongs to the context that awaited, so capture it
+            // before the frame parks.
+            let async_context = vm.scoped_value(scope, vm.async_context());
+            let realm_id = vm.active_host_realm_id();
+            let promise = vm.await_promise_resolve(context, stack, awaited)?;
+            // Same anchoring as the regular-await path: the park allocations
+            // below move the awaited promise.
+            let promise_slot = vm.push_iteration_anchor(Value::promise(promise)) - 1;
+            let capability =
+                match promise_dispatch::PromiseBuilder::with_context(Some(context.clone()))
+                    .capability_stack_rooted(vm, stack, &[], &[])
+                {
+                    Ok(capability) => capability,
+                    Err(err) => {
+                        vm.pop_iteration_anchors_to(promise_slot);
+                        return Err(CommittedValueError::JavaScript(err.into()));
+                    }
+                };
+            let capability_promise = vm.scoped_value(scope, capability.promise);
+            let capability_resolve = vm.scoped_value(scope, capability.resolve);
+            let capability_reject = vm.scoped_value(scope, capability.reject);
+            let parked = stack.pop().expect("top frame existed");
+            let detached_cold = vm.frame_detach_cold(parked);
+            let parked = vm.park_active_frame(parked);
+            let parked = match crate::generator::alloc_parked_frame(
+                &mut vm.gc_heap,
+                parked,
+                detached_cold,
+            ) {
                 Ok(parked) => parked,
                 Err(err) => {
-                    self.pop_iteration_anchors_to(promise_slot);
-                    return Err(err.into());
+                    vm.pop_iteration_anchors_to(promise_slot);
+                    return Err(CommittedValueError::JavaScript(err.into()));
                 }
             };
-        let promise = self
-            .iteration_anchor(promise_slot)
-            .as_promise()
-            .expect("anchored awaited promise survives the park allocations");
-        self.pop_iteration_anchors_to(promise_slot);
-        let outcome = promise.perform_async_resume_then_with_context(
-            &mut self.gc_heap,
-            parked,
-            dst,
-            capability,
-            Some(owner),
-            Some(context.clone()),
-            async_context,
-        );
-        // The body is parked on the awaited promise. The state is the ONLY
-        // reliable awaiting signal: the request queue also holds the plain
-        // `.next()` that is waiting on this turn, so queue-emptiness cannot
-        // distinguish an await from a completed body.
-        owner.set_async_state(
-            &mut self.gc_heap,
-            crate::generator::AsyncGeneratorState::Awaiting,
-        );
-        if let Some(job) = outcome.immediate_job {
-            self.microtasks.enqueue(job);
-        }
-        Ok(())
+            let promise = vm
+                .iteration_anchor(promise_slot)
+                .as_promise()
+                .expect("anchored awaited promise survives the park allocations");
+            vm.pop_iteration_anchors_to(promise_slot);
+            let capability = crate::promise::PromiseCapability {
+                promise: vm.escape_scoped(capability_promise),
+                resolve: vm.escape_scoped(capability_resolve),
+                reject: vm.escape_scoped(capability_reject),
+                context: capability.context,
+            };
+            let owner = vm
+                .escape_scoped(owner_root)
+                .as_generator()
+                .ok_or(VmError::InvalidOperand)
+                .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+            let async_context = vm.escape_scoped(async_context);
+            let outcome = promise.perform_async_resume_then(
+                &mut vm.gc_heap,
+                parked,
+                dst,
+                capability,
+                Some(owner),
+                Some(context.clone()),
+                async_context,
+                realm_id,
+            );
+            // The body is parked on the awaited promise. The state is the ONLY
+            // reliable awaiting signal: the request queue also holds the plain
+            // `.next()` that is waiting on this turn, so queue-emptiness cannot
+            // distinguish an await from a completed body.
+            vm.escape_scoped(owner_root)
+                .as_generator()
+                .ok_or(VmError::InvalidOperand)
+                .map_err(|error| CommittedValueError::Fatal(error.into()))?
+                .set_async_state(
+                    &mut vm.gc_heap,
+                    crate::generator::AsyncGeneratorState::Awaiting,
+                );
+            if let Some(job) = outcome.immediate_job {
+                vm.microtasks.enqueue(job);
+            }
+            Ok(())
+        })
     }
 
     /// Resume an async-generator body whose `Op::Await` parked
@@ -296,46 +344,48 @@ impl Interpreter {
                         // Body completed: settle the front request with
                         // the final return value as `done: true`.
                         interp
-                            .async_generator_complete_step(context, &owner, Ok(value), true)
+                            .async_generator_complete_step(Some(context), &owner, Ok(value), true)
                             .map_err(RunError::bare)?;
                         owner.mark_done(&mut interp.gc_heap);
                         interp
-                            .async_generator_drain_done(stack, context, &owner)
-                            .map_err(RunError::bare)?;
+                            .async_generator_drain_done(stack, Some(context), &owner)
+                            .map_err(|error| error.into_run_error(interp))?;
                         Ok(())
                     }
                     Err(error) => {
                         owner.mark_done(&mut interp.gc_heap);
-                        if matches!(error, VmError::MissingReturn) {
-                            interp
-                                .async_generator_drain_done(stack, context, &owner)
-                                .map_err(RunError::bare)?;
-                            return Ok(());
-                        }
-                        let rejection = if let Some(thrown) = interp.pending_uncaught_throw.take() {
-                            Some(thrown)
-                        } else {
-                            interp.vm_error_to_throwable_with_stack_roots(
-                                Some(context),
-                                stack,
-                                &error,
-                            )
+                        let completion = CommittedValueError::completed_call(error);
+                        let CommittedValueError::JavaScript(error) = completion else {
+                            return Err(completion.into_run_error(interp));
                         };
-                        if let Some(reason) = rejection {
-                            interp
-                                .async_generator_complete_step(context, &owner, Err(reason), true)
-                                .map_err(RunError::bare)?;
-                            interp
-                                .async_generator_drain_done(stack, context, &owner)
-                                .map_err(RunError::bare)?;
-                            Ok(())
-                        } else {
-                            let frames = interp.snapshot_active_frames(context, usize::MAX);
-                            Err(RunError {
-                                error,
-                                frames,
-                                detail: interp.take_error_detail(),
-                            })
+                        let rejection = interp.vm_error_to_throwable_with_stack_roots(
+                            Some(context),
+                            stack,
+                            &error,
+                        );
+                        match rejection {
+                            Ok(reason) => {
+                                interp
+                                    .async_generator_complete_step(
+                                        Some(context),
+                                        &owner,
+                                        Err(reason),
+                                        true,
+                                    )
+                                    .map_err(RunError::bare)?;
+                                interp
+                                    .async_generator_drain_done(stack, Some(context), &owner)
+                                    .map_err(|error| error.into_run_error(interp))?;
+                                Ok(())
+                            }
+                            Err(error) => {
+                                let frames = interp.snapshot_active_frames(context, usize::MAX);
+                                Err(RunError {
+                                    error,
+                                    frames,
+                                    detail: interp.take_error_detail(),
+                                })
+                            }
                         }
                     }
                 }
@@ -514,6 +564,7 @@ impl Interpreter {
             // result promise as a rejection — spec §27.7.5.3 step 1.h.iii.
             if self.frame_has_async_state(stack.last().expect("frame still present")) {
                 let popped = stack.pop().expect("frame existed at last");
+                self.complete_interpreted_retraining_activation(popped);
                 let result_promise = self
                     .frame_take_async_state(popped)
                     .expect("async ownership checked just above")
@@ -522,13 +573,14 @@ impl Interpreter {
                 // The rejected promise is the activation's completion.
                 self.completed_activation_result = Some(Value::promise(result_promise));
                 let jobs = result_promise.reject(&mut self.gc_heap, value);
-                self.note_settle_rejection(&jobs);
+                self.note_settle_rejection(&jobs, Some(context));
                 for j in jobs.jobs {
                     self.microtasks.enqueue(j);
                 }
                 return Ok(());
             }
             let popped = stack.pop().expect("frame still present");
+            self.complete_interpreted_retraining_activation(popped);
             self.frame_release_cold(popped);
         }
     }
@@ -564,9 +616,10 @@ mod tests {
     use crate::frame_state::{AsyncFrameState, ParkedFrameState};
 
     fn empty_context() -> ExecutionContext {
-        ExecutionContext::from_module(crate::test_support::minimal_bytecode_module(
-            "async-ops-test.js",
-        ))
+        ExecutionContext::from_module(
+            crate::test_support::minimal_bytecode_module("async-ops-test.js"),
+            crate::source_registry::SourceRegistry::default(),
+        )
         .expect("valid bytecode fixture")
     }
 
@@ -585,7 +638,7 @@ mod tests {
         Box<ParkedFrameState>,
         Option<Box<crate::cold_frame::ColdFrame>>,
     ) {
-        let result_promise = promise_dispatch::PromiseBuilder::with_context(context.clone())
+        let result_promise = promise_dispatch::PromiseBuilder::with_context(Some(context.clone()))
             .pending_runtime_rooted(interp, &[], &[])
             .unwrap();
         interp.frame_set_async_state(&mut frame, AsyncFrameState { result_promise });
@@ -623,7 +676,7 @@ mod tests {
 
     #[test]
     fn async_resume_invalid_destination_releases_cold_record_and_window() {
-        let mut interp = Interpreter::new();
+        let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
         let context = empty_context();
         let frame = interp.test_frame_for_function(&function(1)).unwrap();
         let (parked, cold) = park_regular_async_frame(&mut interp, &context, frame);
@@ -639,7 +692,7 @@ mod tests {
 
     #[test]
     fn async_generator_resume_invalid_destination_releases_cold_record_and_window() {
-        let mut interp = Interpreter::new();
+        let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
         let context = empty_context();
         let frame = interp.test_frame_for_function(&function(1)).unwrap();
         let (parked, cold, owner) = park_async_generator_frame(&mut interp, frame);
@@ -655,7 +708,7 @@ mod tests {
 
     #[test]
     fn floor_unwind_preserves_caller_frame_window_and_thrown_identity() {
-        let mut interp = Interpreter::new();
+        let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
         let context = empty_context();
         let mut stack = crate::test_support::FrameChainFixture::new();
 

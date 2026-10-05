@@ -245,6 +245,7 @@ stride).
 # Build
 cargo build                          # Debug build
 cargo build --release -p otter-cli     # Release CLI binary
+cargo build --profile checked -p otter-cli # Optimized binary with invariant checks
 
 # Test
 cargo test --all --all-features      # Run all tests
@@ -272,6 +273,13 @@ Fast iteration tips:
   These incremental checks default to stress stride 1 and preserve an explicit
   stress value and Cargo target. Run the full gate and required targeted
   Test262 checks once the coherent change is ready, rather than after each edit.
+- For closing moving-GC checks, use `target/checked/otter` with
+  `python3 scripts/dev/gc-stress.py target/checked/otter benchmarks/results/<fresh-dir> --all --strides 1-16`.
+  `--repeat 100` repeats every corpus/tier/stride case for flake diagnosis;
+  `runs.jsonl` preserves each completed observation during an interrupted run.
+  Console output and printed completion are compared with the unstressed
+  interpreter, including programs whose only observable result is their final value.
+  `results.json` must report `status: passed` before the run counts as a gate.
 - Run VM tests: `cargo test -p otter-vm`
 - Run runtime tests: `cargo test -p otter-runtime`
 - Run a single active support crate after porting work there: `cargo test -p otter-modules`, `cargo test -p otter-web`, etc.
@@ -341,6 +349,12 @@ handle-scope API; do not reuse JIT frame or status layouts as a second GC entry.
 Physically identical engine carriers must have one owner and one type. Express
 different legal status subsets through descriptor-domain validation, not
 parallel structs, aliases, constructors, decoders, or duplicate test matrices.
+On x86_64, generated JavaScript calls retain the private actual-only stack ABI;
+Rust helpers and external tier/OSR entries use the platform C boundary. Use
+`x86_64::call_abi` at C call sites, including Microsoft shadow space and hidden
+pair results; do not route private `JsCall` entry-cell or tail transfers through
+it. Shared frame emitters initialize canonical roots before publication and
+restore prior interpreter root words on every tier exit.
 
 ## Platform Support
 
@@ -375,12 +389,19 @@ Pure Rust implementation - no external JavaScript engine dependencies.
     `cargo run -p otter-cli -- --jit-events=/tmp/otter-jit-events.json run <file>`
   - `--jit-events=-` writes the JSON report to stderr. Prefer a file when the
     program itself uses stderr or when `--json` is active.
-  - The current report contains typed compile,
+  - The current report contains typed compile, post-hook installation refusal,
     inlining, direct-call plan/final-lowering, bail, generated-call-deopt, and
     inline-deopt events. Bounded method chains expose `targetIndex` /
-    `targetCount`; `inlineLowered` reports the parent/callee, depth, weighted
-    budget cost, and exact complete-pipeline rejection when a candidate cannot
-    be spliced; `compilePrepared` reports `directConstructs`, `directMethodSites` and
+    `targetCount`; Graph `inlineLowered` reports actual accepted splices with
+    parent/callee, depth and their charged encoded-bytecode-byte budget cost.
+    `inlineCandidate` reports VM bake refusals; Graph does not currently emit
+    backend splice rejections. Template direct-call lowering retains its typed
+    final outcomes. A reached site without proven function-cell linkage reports
+    `backendUnsupported`, including the current x86 method resolver/generic path.
+    `installDeclined` identifies the exact code object and
+    reports `invalidCode` or the full resource requirement and available
+    physical headroom. `compilePrepared.sourceWork` reports entered source-opcode
+    attempts visible before the hook; `compilePrepared` reports `directConstructs`, `directMethodSites` and
     `directMethodTargets` separately from body-inline candidate counts, while
   `bindingSites` counts schema-typed global, captured, dynamic, and shadowed
   binding accesses; `bindingHitProofs` counts stable global-declarative cells
@@ -407,23 +428,24 @@ Pure Rust implementation - no external JavaScript engine dependencies.
     portable semantic `code-normalized.bin`, typed `relocations.json`,
     annotated ARM64 `asm.txt`, `bytecode.txt`, tier input, `code-map.json`,
     `safepoints.json`, and optimizer `deopt.json` when applicable.
-  - Direct global-lexical reads expose `globalLexicalCell` relocations keyed by
-    byte PC. Exact addresses are redacted; the generated hit reads the live
-    permanent cell and a TDZ hole retains the canonical throwing transition.
-  Guarded global-object accesses prove the realm epoch, dictionary shape,
-  descriptor flags, and property slot before reading or writing the live value.
-  Scalar Machine IR exposes the whole binding family as
-  `machineBindingGuard`, `machineBindingHit`, `machineBindingCold`, and
-  `machineBindingJoin`. A failed TDZ, const, epoch, shape, slab, accessor,
-  Proxy, or unresolved proof enters the single committed boxed-value sibling;
-  it never deoptimizes and replays the binding operation. Loop accesses retain
-  explicit guards and live loads; no global-object raw address is cached across
-  a backedge, collection, or JavaScript reentry.
-  - Scalar Machine IR represents `x == null`, `x != null`, and their
-    `undefined`-literal counterparts with `machineTaggedNullishEqual`. Null,
-    undefined, and non-cell primitives complete without reentry. Every
-    non-nullish Cell exact-deoptimizes before the Boolean destination is
-    defined so the canonical path remains authoritative for HTMLDDA objects.
+  - Named property probes in Template and Graph use the VM's one shared
+    property action table (`propertyActionCacheTable` relocation). Each
+    receiver shape and atom key retains independent load and store facts,
+    including an inherited holder slot and a different own addition slot.
+    Template probes it after a CacheIR miss; Graph retains its current
+    feedback admission. Live shape, descriptor, chain, bank-capacity and
+    traced target-shape proofs precede effects. A miss completes the
+    original source operation once through its committed runtime owner.
+  - Template and Graph share one native global-binding guard and bank reader
+    per architecture. `globalLexicalCell` relocations identify the exact source
+    function and byte PC; reads use the live permanent traced cell. Eligible
+    Graph reads use effectful `LoadGlobalBinding` nodes and preserve their full
+    inlined source-frame chain. The active realm must match the source realm;
+    global-object hits also prove the declarative epoch, live shape or dictionary
+    layout, descriptor flags, and current slot capacity. A mismatch or TDZ hole
+    exits before the read to the canonical source operation. Foreign-source
+    proof baking and body inlining decline; committed cold operations enter the
+    source realm, and a disposed source realm fails without an ambient fallback.
   - String literals are canonicalized before the compile snapshot and expose
     `stringConstantCell` relocations keyed by
     function id and byte PC. Exact addresses are redacted. Generated code reads
@@ -431,115 +453,40 @@ Pure Rust implementation - no external JavaScript engine dependencies.
     rewrites that cell in place, and no moving string handle is baked into code.
     If a cold literal cannot be materialized with active frame roots, optional
     compilation declines without publishing a code object or JavaScript error.
-  - Every optimizing `optimized-ir.txt` starts with
-    `; backend=otter-machine-ir scalar-function` and contains normalized
-    Machine IR plus allocation. Its code map uses the
-    `machineScalarFunction` structural region. A function that Machine cannot
-    compile stays on the Template tier; there is no second optimizing IR,
-    allocator, or emitter fallback.
-    Machine indexed access is attributed by `machineElementView`,
-    `machineElementAddress`, `machineElementValueLoad`,
-    `machineElementValueGuard`, and `machineElementValueStore`; named access
-    uses the `machineCacheIr*` regions. Each carries `bytePc`; direct captured/global cell reads
-  and writes use the `machineBinding*` family, while prepared literals use
-    `machineStringConstantLoad`. Ordinary packed-double Array operations prove
-    receiver/view identity, exact index/bounds, and element representation in
-  separate SSA nodes. Speculative numeric loads produce Int32, Uint32 or
-  Float64 directly; committed fast/cold joins remain tagged. Every Machine
-  element operation owns its complete immutable layout, independent of source
-  byte PC. Equivalent view proofs may be commoned inside one block and memory
-  epoch. Scalar indices stay unboxed, with an exact Float64-to-Uint32 check;
-  cold calls alone box numeric arguments. Fractions, negatives, NaN,
-    values beyond Uint32, holes and detached/resized views fail before an
-    effect. Speculative sites exact-deopt at the access; previously exited,
-    protected and unprepared sites enter the one committed boxed-value
-    `[[Get]]` / `[[Set]]` sibling. That
-    sibling publishes precise moving roots and exposes
-    Success/Throw/Fatal control before register allocation. A store occurs only
-    after every miss-capable proof and is never replayed. Local catches consume
-    the pure exception SSA edge directly.
-    Reducible non-reentrant loops expose `LoopPreheader` on every selected
-    external entry, including OSR. `optimized-ir.txt` reports
-    `licm-hoisted=<N> versioned-loops=<N>` and starts its normalized graph with
-    `machine-ir explicit-loop-preheaders`. Hoisted scalar values are explicit
-    loop-header SSA arguments. Packed element base/length addresses are derived
-    inside the iteration and never retained across a generated backedge, collection, or
-    JavaScript reentry.
-    Named-property regions transpile immutable CacheIR snapshots into explicit
-    `machineCacheIr*` guards, prototype loads, field accesses, publication, and
-    barrier operations. A code-owned `propertySourceCell` carries only
-    function/logical-PC identity for the fixed boxed-value
-    `jit_load_property_value` / `jit_store_property_value` boundary; it never
-    caches semantic proof data. A generated add transition proves the parent
-    shape, complete supported prototype topology, receiver extensibility, exact
-    append position, and existing storage capacity before storing the value and
-    publishing the child shape. Dictionary and allocation-requiring transitions
-    stay on the canonical store boundary. Runtime success or throw commits exactly
-    once; a committed property miss never deoptimizes and replays the source
-    operation.
-    A settled monomorphic own-data load (one `GuardShape` [+ `GuardAtomSlot`] +
-    `LoadField` program, no local catch, not megamorphic or exotic `.length`)
-    instead lowers to `machinePropertyShapeProof`, one `GuardCondition`
-    `shapeGuard`/`recompile` exit at the `LoadProperty` itself, and
-    `machinePropertySlotLoad`; it does not end its HIR block. The exit precedes
-    every effect, so the interpreter performs the access once. A site whose
-    earlier generation exited with `shapeGuard` keeps the committed form
-    (`property_speculation::speculated_load`). GVN commons identical proofs and
-    LICM may hoist a proof; the header's OSR entry leads the split preheader,
-    so OSR performs the hoisted proof itself.
-    Binary arithmetic/relational sites with non-Number feedback are committed
-    `ObjectProtocolValueOp::Binary` operations (`otter_vm::BinaryOperator`),
-    never a Machine decline; except `%`/`**` they carry a
-    `machineBinaryNumberProbe` Number fast path (`ProbeKind::BinaryNumber`,
-    `TargetClobberSet::NumberProbe`). A primitive-String `+` concat node that
-    exited with `typeMismatch` is rebuilt generic. Only Number-only feedback
-    types a parameter as Number.
-    Other named loads and stores expose their probe, hit edge,
-    `machinePropertyLoadCold` / `machinePropertyStoreCold` call,
-    Success/Throw/Fatal control and join before register allocation.
-    Megamorphic accesses expose `machineMegamorphicPropertyLoad` /
-    `machineMegamorphicPropertyStore` and a symbolic
-    `propertyLookupCacheTable` relocation to the isolate's existing fixed
-    shape/atom table. Positive own/direct-prototype hits validate live ordinary
-    state, the full key, holder shape and storage bounds before reading the
-    current slot. Stores additionally require an own writable data slot, commit
-    once, and use the existing generated value barrier. Entries hold pinned
-    shape metadata, never moving object or value pointers. Negative, inherited,
-    read-only and exotic store entries use the same rooted cold store. Table
-    fills do not recompile the body.
-    Local catches receive the pure exception payload through SSA landing edges
-    without deopt or replay. The probe has no safepoint; only the cold call owns
-    moving roots. Its stable untraced IC address must originate in a property
-    probe. Named stores protected by local catches remain on Template until
-    their HIR exception operands are admitted. Plain named-load/store callee
-    bodies can be spliced into Machine SSA. Their cold instructions expose
-    `inline-frames` recipes in `optimized-ir.txt`: descendant register/this/closure/new.target
-    values are boxed only in cold CFG and retained as explicit safepoint roots.
-    Enclosing helper splices keep residual generated calls. Their
-    `safepoints.json` records own `inlineFrames`: the parents are never
-    published as NativeFrames; stack walks describe them from the call site's
-    recipe, and runtime decoders do not reconstruct them. The direct-call
-    source function can differ from its code-object owner. Callee deopt
-    validates the physical caller's call site and the recipe's source chain,
-    including the innermost parent's call byte PC, before changing policy.
-    The code-owned safepoint record owns root-index recipes tied to the code
-    generation and safepoint. The fixed property boundary reads the current published roots,
-    publishes canonical callee NativeFrames, and normalizes throws before scope
-    cleanup. The existing caller is neither copied nor interpreted; its PC names
-    the original call while every callee keeps its own source position.
-    Primitive-string and dense-array `.length` share the property-load region;
-    unsigned lengths outside int32 exit to canonical Number boxing. A fixed
-    TypedArray view over a resizable ArrayBuffer also guards its complete baked
-    extent against the backing store's live byte length before direct element
-    access; shrink misses enter the committed element cold sibling before a load or store
-    effect. `machineElementLoadFast` / `machineElementLoadCold` and
-    `machineElementStoreFast` / `machineElementStoreCold` expose that boundary;
-    cold completion does not deopt or replay the operation.
-    Zero-argument and exact-Int32 `ArrayConstruct` inside a Machine body uses
-    the `machineArrayConstruct` region at the source `bytePc` and relocates to
-    the shared `array_construct_alloc` stub. Template code uses the same stub
-    with a frame-slot-window safepoint. A non-Int32 or negative length misses
-    before allocation and resumes the canonical constructor exactly once.
+  - The optimizing tier (`crates/otter-jit/src/graph/`) builds a graph from
+    bytecode and feedback. Every bytecode operation has a node; one without a
+    specialized lowering runs its baseline operation as a Generic node, so a
+    function is never declined as a whole. Checks leave by eager deopt to the
+    instruction they guard. Calls may be inlined under a proof of the
+    callee's identity; an exit inside an inlined body rebuilds the whole
+    chain of interpreter frames. The tier emits native AArch64 and x86_64 code
+    from one Graph, allocator and reconstruction model; unsupported targets
+    run Template code only.
+  - Native context/closure allocation uses the VM-owned `allocValue3` Probe
+    boundary on both targets. Context, lexical `this` and `new.target` are
+    explicit boxed operands; the innermost published source owns the callable
+    constant. LAB fits publish only initialized cells. Collecting Graph misses
+    restore updated canonical homes before rebuilding an interpreter frame.
+    Focused runtime proof: `cargo test -p otter-runtime --test jit_native_context_closure`;
+    it earns normal-policy native admission, observes fits, then arms moving GC
+    in the same installed generation. Keep its exact source/inline/realm
+    assertions when changing allocation lowering.
+  - Every optimizing `optimized-ir.txt` starts with `; otter graph`, declares
+    constants in node-id order, then lists the blocks in layout order: each
+    phi and node with its inputs,
+    representation and frame states. The code map has one `instruction`
+    region per emitted node (`operation` is `v<id> <Kind>`, `operationIndex`
+    the node id, `functionId` its owning source body, and `logicalPc`/`bytePc`
+    its instruction in that body, including nested inline callees) and one
+    `out-of-line` structural region for exits, slow paths and the return
+    path.
+  - `deopt.json` lists each exit's frames outermost first, with their resume
+  PCs and value locations. `safepoints.json` gives, per point that may
+  collect, the tagged locations the collector scans, the inlined frames it runs
+  in (`inlineFrames`) and the outer call PC (`callPc`).
+  Graph code uses one initialized tagged spill region and separate untagged
+  homes. Collecting slow paths save control-flow-live registers into canonical
+  homes; cold deopt exits materialize register-only values into those same homes.
   - Exact code may contain process addresses and is not a portable golden.
     Compare `code-normalized.bin` across processes; its relocation tokens and
     branch targets are symbolic, and it is not executable. `relocations.json`
@@ -553,8 +500,17 @@ Pure Rust implementation - no external JavaScript engine dependencies.
     fallback. Join a process-local profiler PC to `runtimeAddressRange`, then
     use assembly offsets and `code-map.json` to reach bytecode/tier operations.
     The hexadecimal range exists only under explicit artifact capture and is
-    not portable or callable. Inspect `deopt.json` or `safepoints.json` as
-    applicable; safepoint `nativeReturnOffset` is currently explicitly `null`.
+    not portable or callable. `code-map.json` records actual `callEntryOffset`
+    (null for a body without a private-JS entry) separately from the tier
+    `entryOffset`; the manifest entry label describes the compile trigger.
+    The owned generation snapshot's `call_entry_offset` and `current_entry`
+    independently prove retained capability and current function-cell selection.
+    Inspect `deopt.json` or `safepoints.json` as
+    applicable. `safepoints.json` contains `{records, returnSites}`: each actual
+    generated JS CALL/BLR return offset references the existing source/root
+    record by `safepointId`. Join suspended callers through their exact retained
+    code object; a tail branch adds no return association. Active C helpers
+    continue to publish their current PC and collecting root recipe.
   - Template plain-call and method inlines expose `inlineCall*` /
     `inlineMethod*` guard, body, hit-epilogue, and deopt-teardown regions plus
     shared `inlineScratchSetup` and per-op `inlineInstruction` regions.
@@ -564,38 +520,34 @@ Pure Rust implementation - no external JavaScript engine dependencies.
     values. A zero-width
     `inlineInstruction` is an intentionally coalesced operation, not missing
     capture.
-  - Optimizing Int32 `Math.abs`, `Math.max`, and `Math.min` method and resolved-call hits expose
-    `machineMethodIntrinsic` for the arithmetic probe and result. Receiver,
-    holder, and slot proofs use the shared `machineCacheIr*` operations;
-    `machineNativeLeafIdentity` checks the live callable. The hit constructs no
-    transition frame and publishes no VM PC. The explicit miss edge enters the
-    canonical method or resolved call with precise roots and joins its tagged
-    result, without deopt or replay. Proven Int32 `CallMethodValue` and separately
-    evaluated `LoadProperty` plus `CallWithThis` share the arithmetic CFG.
-    Explicit calls guard the already-loaded callee after argument evaluation;
-    their cold sibling retains that callee and receiver without another lookup.
-  - Other guarded `CallMethodValue` sites whose declared entry is a
+  - Guarded `CallMethodValue` sites whose declared entry is a
     no-allocation leaf (String `indexOf`/`charCodeAt`/…, Map `get`/`has`,
-    Set `has`) expose `machineNativeLeafProbe`: the receiver and at most one
-    argument sit in the leaf ABI registers and the entry is called directly,
-    with no root record, safepoint, VM PC or status decode. An exotic receiver
-    is proven by `machineCacheIrLoadIntrinsicPrototype`; its pinned holder by
-    `machineCacheIrGuardShape` plus ordinary state when fast, or by
-    `machineCacheIrGuardDictionaryLayout` (null shape plus unchanged
-    `dictionary_shape_id`) when in dictionary mode, which is always the case
-    for the String-wrapper `%String.prototype%`. `JitGuardedMethodCall::holder`
-    (`Receiver` / `Shape` / `Dictionary`) is the one holder contract; Template
-    guards the same layout. A proof or leaf miss enters the committed method
-    call once, without deopt or replay.
-  - Explicit-receiver calls (`LoadProperty` + `CallWithThis`) whose loaded
-    callee is a `jit_static_native` declaration use the same
-    `machineNativeLeafProbe` after `machineNativeLeafIdentity`; Template
-    AArch64 emits `nativeLeafCall` for them. A declaration with
-    `this_operand` (String search/charCode methods, Map `get`/`has`, Set
-    `has`) receives `this` as its first word and proves it itself; plain calls
-    and shaped method sites pass no receiver word and never lower it. Int32
-    Math with non-Int32 operands takes the tagged leaf instead of the generic
-    call. Misses enter the ordinary call once, never a bail.
+    Set `has`) call the entry directly from Template code: the receiver and at
+    most one argument sit in the leaf ABI registers, with no root record,
+    safepoint, VM PC or status decode. An exotic receiver's pinned holder is
+    proven through `JitCacheIrOp::LoadIntrinsicPrototype` and either its shape
+    plus ordinary state or, in dictionary mode, an unchanged
+    `dictionary_shape_id` (`JitCacheIrOp::GuardDictionaryLayout`), which is
+    always the case for the String-wrapper `%String.prototype%`.
+    `JitGuardedMethodCall::holder` (`Receiver` / `Shape` / `Dictionary`) is
+    the one holder contract. A proof or leaf miss enters the committed method
+    call once, without deopt or replay. The graph tier keeps such calls as
+    their baseline operation.
+  - Template AArch64 emits `nativeLeafCall` for explicit-receiver calls
+    (`LoadProperty` + `CallWithThis`) whose loaded callee is a
+    `jit_static_native` declaration. A declaration with `this_operand`
+    (String search/charCode methods, Map `get`/`has`, Set `has`) receives
+    `this` as its first word and proves it itself; plain calls and shaped
+    method sites pass no receiver word and never lower it. Misses enter the
+    ordinary call once, never a bail.
+  - Both native Graph encoders lower exact-arity pure declarations at actual
+    `CallWithThis` sites to `CheckNative` plus `NativeLeaf`. The two boxed
+    operands use the existing heap/value/value C ABI. All live and eager-only
+    values have canonical homes before this noncollecting call. A pre-effect
+    miss resumes that exact call with its loaded callable, receiver and
+    evaluated arguments; preceding property loads and argument work do not
+    replay. Mutating, plain-call and guarded-holder sites retain their current
+    paths. No leaf-hit safepoint, frame interop or source stamp is emitted.
   - `Interpreter::note_jit_optimized_bail_at` is the one owner of optimizing
     exits: an `Int32Overflow` / `NegativeZero` exit from `Add`, `Sub`, `Mul`,
     `Neg`, `Increment`, `AddImm` or `SubImm` (the innermost site for inlined
@@ -607,147 +559,33 @@ Pure Rust implementation - no external JavaScript engine dependencies.
     barrier), e.g. Map `set` overwriting an existing key; a mutating probe
     writes the heap and is never commoned or hoisted.
     Separately evaluated Map/Set named property loads use
-    `machineCacheIrLoadIntrinsicPrototype`: exact type and the existing clean
+    `JitCacheIrOp::LoadIntrinsicPrototype`: exact type and the existing clean
     instance latch select the pinned realm prototype, followed by ordinary
-    live shape/descriptor/slot guards. Template and Machine share the proof on
-    both backends. Same-slot replacements are read live; accessors, shadows
-    and prototype overrides use the committed cold load once. The generated
-    hit has no allocation, runtime call or safepoint, and preserves the loaded
-    callable across later argument evaluation. Primitive String named loads use
-    the same proof plus `machineCacheIrGuardDictionaryLayout`
-    (`JitCacheIrOp::GuardDictionaryLayout`) on `%String.prototype%`; `length`
+    live shape/descriptor/slot guards. Same-slot replacements are read live;
+    accessors, shadows and prototype overrides use the committed cold load
+    once. The generated hit has no allocation, runtime call or safepoint, and
+    preserves the loaded callable across later argument evaluation. Primitive
+    String named loads use the same proof plus
+    `JitCacheIrOp::GuardDictionaryLayout` on `%String.prototype%`; `length`
     and index names never read the prototype. Every in-place descriptor change
     of a dictionary-mode object assigns a fresh `dictionary_shape_id`.
     Collection `size` retains its existing path.
-  - Optimizing plain/method scalar/named-load splices use the same HIR and allocator.
-    The caller owns the identity/this guard; named accesses retain the callee's
-    source program and cold activation recipes in `optimized-ir.txt`.
-    Property and global-read cold calls resolve one code-owned safepoint recipe
-    through the active registry generation. `safepoints.json` exposes
-    `inlineFrames`: slots and entry this/closure/newTarget are spill-root indices, with
-    null meaning undefined. Property source cells own identity only; immutable
-    CacheIR snapshots own compiled proof programs.
-    Suspended outer root records never supply a callee's recipe; getter/error
-    normalization runs before inline frames are removed.
-    `deopt.json` records the complete outermost-first caller/callee chain.
-    `machineInlineMethodGuard` reuses the shared receiver/prototype/slot proof,
-    returns the current callable and rejects bound-this/runtime-setup/eval-env
-    closures before effects. Its receiver supplies the inlined this value.
-    Bounded nested plain/method bodies share the snapshot tree and remap every
-    descendant this/closure, property source and method guard into the caller.
-    Source bodies remain bounded; recursive ancestry and residual unsupported
-    calls decline the enclosing splice. Method, global-object, property, and
-    element accesses retain explicit guards and live loads when a loop contains
-    an invalidating boundary. Effect-aware LICM moves a proof only when its
-    inputs are invariant and no overlapping write, allocation, safepoint, or
-    JavaScript reentry invalidates it. There are no activation-local method or
-    global raw-address caches or cache-clear pseudo-operations. Packed element
-    base and length addresses are derived per access and never retained across
-    a generated backedge, collection, or JavaScript reentry.
-  - Fixed-arity ordinary and class base-constructor bodies can splice into the
-    caller's SSA. `InlineConstructGuard` proves the live underlying callable;
-    `machineConstructReceiver` probes the shared nursery allocator at the call's
-    byte PC. A hit supplies the callee's this and newTarget entry recipe. A
-    pre-effect allocation miss branches to the existing full construct call,
-    so nursery refills do not repeatedly deopt the caller. Parameter guards
-    run after successful allocation and resume that same receiver on failure.
-    `BaseConstructResult` selects an object return or the base receiver and
-    joins with the full-call result. Constructor field transitions own their
-    source program through HIR remapping and Machine selection; emission never
-    looks them up in the outer caller snapshot. Derived/spread/arguments bodies
-    and enclosing splices with residual construct calls remain separate work.
-  - Side-effect-free optimizing loops may version invariant property reads.
-    Activation requires every site to produce an own-data Number IC hit in one
-    complete iteration. Any miss, accessor/proxy path, or non-number keeps the
-    original property operation; cached slots contain no GC references and are
-    reset on every non-backedge loop entry and OSR activation.
-  - Compiler-generated plain, method, fixed-argument constructor, and spread
-    call-family operations expose `directCallGuard`, `directCallFrameSetup`,
-    `directCallNativeEntry`, `directCallReturn`, `directCallCleanup`, and
-    `directCallEntryReject`; methods additionally expose `directMethodGuard`,
-    while constructors expose `directConstructPrepare` with nested
-    `directConstructPrepareFast` and `directConstructPrepareObservable`
-    regions. Exact class wrappers inside the fast region expose nested
-    `directConstructReceiverAllocFast` and `directConstructReceiverAllocCold`
-    regions. The former allocates from the collector-published nursery window;
-    guard, space, GC, stress, heap-cap, and OOM misses use the rooted cold
-    allocator before effects. Conservative straight-line base initializers also
-    reuse the VM final-shape cache: when every field is absent from the selected
-    prototype chain, fixed, spread, and generated-super receivers start with
-    undefined own slots and their bodies perform ordinary existing-slot stores.
-    The observable region is the pre-effect miss fallback.
-    When Machine deliberately declines a construct plan for code-size or
-    profitability reasons, the function remains on Template;
-    `directCallLowered` reports `unprofitable` instead of presenting that
-    decision as a layout failure.
-    Non-simple class-chain fields and exact ordinary function-constructor
-    fields use the same `machineCacheIrGuardShape`,
-    `machineCacheIrGuardExtensible`, `machineCacheIrLoadPrototype`,
-    `machineCacheIrGuardPrototypeNull`, `machineCacheIrStoreField`,
-    `machineCacheIrPublishShape`, and `machineCacheIrWriteBarrier` operations
-    as other named stores. Every guard precedes the no-fail store, publication,
-    and barriers at the original `StoreProperty`. Ordinary functions are
-    admitted only when `new.target` is
-    the entered function; a distinct ordinary target retains the canonical
-    path. Generated
-    constructor semantics additionally expose `machineClassSuperLoad`,
-    `machineDerivedThisBindFast` / `machineDerivedThisBindCold`, and
-    `directConstructResultFast` / `directConstructResultThrow`. The fast result
-    region performs base substitution and valid derived selection without a
-    runtime stub; the throwing region is the cold invalid-result sibling.
-    A scalar Machine method site may emit a complete dense chain of one to four
-    candidates. It exposes one `machineDirectMethodGuard` and one
-    `machineDirectMethodCandidate` region per candidate while sharing a single
-    descriptor, root publication, safepoint, and deopt state. The final guard
-    miss exits before method lookup or call effects. A never-executed plain or
-    method branch may instead expose `machineColdCallExit`; its first real
-    attempt records feedback and evicts the obsolete caller generation before
-    canonical execution, so the exit cannot become a permanent deopt loop.
-    `functionId` is the caller. Typed `directCall` metadata names call kind,
-    target function, `targetIndex`, `targetCount`,
-    planning-time `targetCodeObjectId`, tier, `thisMode`, `argumentMode`,
-    captured callee-native-frame bytes, caller linkage bytes, captured total
-    reservation, register count, `ownUpvalueCount`, and
-    `inheritedUpvalueCount`. Fresh capture cells occupy a caller-reserved
-    stack spine; inherited closure cells follow in the same spine before the
-    callee frame is published. `argumentMode` is `fixed`, `spread`, or `forward`;
-    forwarded intrinsic apply uses shared Template linkage with live mapped
-    bindings and complete actuals. Dynamic actual windows report null
-    `linkageBytes` / `reservedStackBytes` and assembly annotations show `dynamic`.
-    Materialized arguments, custom apply and pre-entry misses retain committed
-    canonical completion. Saturated target dispatch and Machine forwarding
-    coverage remain outside this bounded Template path;
-    spread arguments are copied from the rooted dense array into the same
-    unpublished callee frame through the leaf/no-allocation runtime stub.
-    Compiler-generated default-Array iterator collection inside a generated
-    spread wrapper remains on the published stack-owned activation; observable
-    iterator overrides side-exit before effects to the materialized path.
-    Optimizing calls to the exact bootstrap `Math.abs`, `Math.max`, and
-    `Math.min` complete directly for proven Int32 operands after the same
-    static or method identity guard as the declared leaf call. Extracted static
-    calls use the `machineNativeInt32MathIntrinsic` code-map region and carry no
-    relocation for the replaced Math leaf. The exact bootstrap `parseInt` with
-    one Int32 argument uses the same static-native planning boundary and an
-    allocation-free `parse_int_i32_leaf`; other tags, arities, explicit radix
-    calls, and global replacement retain the canonical call before observable
-    coercion.
-    Generated code links through the permanent function cell and reads the
-    selected generation's actual code-object id, tier, and frame reservation
-    before entry; tier publication does not recompile callers. Eager target
-    preparation is bounded to two observed call-graph edges so one nested hot
-    closure target can be sealed without unbounded recursive compilation.
-    `methodGuard`
-    names the receiver register, receiver/prototype shapes, method function,
-    and slot byte. Portable normalized code excludes generation-local
-    `targetCodeObjectId`; call kind, argument mode, captured target tier,
-    `thisMode`, and layout semantics remain portable. Construct generation
-    validation precedes observable prototype lookup; pre-entry misses deopt at
-    the original opcode and started callees are never replayed.
   - Assembly decoding and formatting run only when `--jit-artifacts` is
     requested. The disabled path does not clone code, disassemble it, or build
     artifact text.
   - Full workflow and output-shape notes:
     `docs/site/src/content/docs/engine/jit-debugging.md`.
+- Collection-service observation (default-off):
+  - `Runtime::start_gc_pause_capture(capacity)` / `take_gc_pause_capture()`
+    expose owned bounded records at a quiescent boundary.
+  - `otter-resource-probe` (`otter-benchmark --features engine`) exports actual
+    per-service Chrome Trace Event JSON after capture and separate forced-full
+    retention component snapshots. Overflow/errors/split coverage are explicit.
+  - Full service includes nested minor work and trigger accounting. Do not add
+    existing full/minor cumulative counters or label them per-cycle tails.
+  - Enforce watchdog/source/binary identities in the capture driver; use an idle
+    native host. Service time is not whole allocation latency or a proven Bun
+    whole-mutator comparison. See `docs/site/src/content/docs/engine/gc-observation.md`.
 - CPU profile + folded flamegraph stacks:
   - `cargo run -p otter-cli -- run <file> --cpu-prof --cpu-prof-dir /tmp/otter-prof`
   - Optional: `--cpu-prof-interval 1000 --cpu-prof-name my-run`
@@ -763,6 +601,8 @@ Pure Rust implementation - no external JavaScript engine dependencies.
   - `cargo run -p otter-test262 -- run --filter "<pattern>" --timeout 20000`
   - `--timeout` is milliseconds (maximum 30000). Timeouts are recorded in the
     result; failure/timeout trace capture is planned but not yet implemented.
+- NativeScope::object_allocation_bytes reads the actual ordinary-object cell
+  footprint from a current handle, without JS allocation or raw-header access.
 - Embedder-only inspector APIs currently expose IC, shape-transition, frame,
   heap-summary, and Chrome `.heapsnapshot` snapshots. See the docs-site
   [Step Trace](docs/site/src/content/docs/engine/step-trace.md) page.

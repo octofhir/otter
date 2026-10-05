@@ -24,7 +24,7 @@
 //! - `crate::native_stack_snapshot` for the common physical and inline frame walk.
 //! - [`crate::run_control::StackFrameSnapshot`]
 
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 
 use crate::{ExecutionContext, StackFrameSnapshot};
 
@@ -40,7 +40,7 @@ const CPU_PROFILE_MAX_FRAMES: usize = 255;
 const CPU_PROFILE_SAMPLE_OVERHEAD_BYTES: usize = 128;
 
 /// Owned VM stack profile captured during one run.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct CpuProfile {
     /// Bytecode dispatch ticks between sample attempts.
     pub interval: u64,
@@ -276,6 +276,8 @@ fn capture_sample(
             function_name,
             module,
             span: frame.span,
+
+            source_position: None,
         });
         true
     });

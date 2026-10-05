@@ -22,6 +22,7 @@
 //! - [`crate::string::dispatch`]
 
 use crate::activation_stack::ActivationStack;
+use crate::native_abi::CommittedValueError;
 use smallvec::SmallVec;
 
 use crate::{
@@ -117,12 +118,16 @@ impl Interpreter {
         frame_index: usize,
         dst: u16,
         src: u16,
-    ) -> Result<(), VmError> {
-        let input = *read_register(&stack[frame_index], src)?;
+    ) -> Result<(), CommittedValueError> {
+        let input = *read_register(&stack[frame_index], src)
+            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
         let value = self.coerce_to_number(stack, context, &input)?;
         let frame = &mut stack[frame_index];
-        write_register(frame, dst, Value::number(value))?;
-        frame.advance_pc()?;
+        write_register(frame, dst, Value::number(value))
+            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+        frame
+            .advance_pc()
+            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
         Ok(())
     }
 
@@ -161,15 +166,20 @@ impl Interpreter {
         stack: &mut ActivationStack,
         context: &ExecutionContext,
         operands: impl crate::executable::OperandSource,
-    ) -> Result<bool, VmError> {
-        let dst = register_operand(operands.first())?;
-        let src = register_operand(operands.get(1))?;
-        let hint_idx = const_operand(operands.get(2))?;
+    ) -> Result<bool, CommittedValueError> {
+        let dst = register_operand(operands.first())
+            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+        let src = register_operand(operands.get(1))
+            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+        let hint_idx = const_operand(operands.get(2))
+            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
         let hint_token = context
             .string_constant_str(hint_idx)
-            .ok_or(VmError::InvalidOperand)?;
-        let hint =
-            abstract_ops::ToPrimitiveHint::from_token(hint_token).ok_or(VmError::InvalidOperand)?;
+            .ok_or(VmError::InvalidOperand)
+            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+        let hint = abstract_ops::ToPrimitiveHint::from_token(hint_token)
+            .ok_or(VmError::InvalidOperand)
+            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
 
         let top_idx = stack.len() - 1;
         let pc = stack[top_idx].pc;
@@ -183,20 +193,24 @@ impl Interpreter {
             .filter(|s| s.pc == pc && s.dst == dst)
             .cloned();
         if let Some(state) = resume {
-            let produced = *read_register(&stack[top_idx], dst)?;
+            let produced = *read_register(&stack[top_idx], dst)
+                .map_err(|error| CommittedValueError::Fatal(error.into()))?;
             if abstract_ops::is_primitive(&produced) {
                 if let Some(cold) = self.frame_cold_mut(&mut stack[top_idx]) {
                     cold.pending_to_primitive = None;
                 }
-                stack[top_idx].advance_pc()?;
+                stack[top_idx]
+                    .advance_pc()
+                    .map_err(|error| CommittedValueError::Fatal(error.into()))?;
                 return Ok(false);
             }
             if state.stage == ToPrimitiveStage::SymbolResult {
                 if let Some(cold) = self.frame_cold_mut(&mut stack[top_idx]) {
                     cold.pending_to_primitive = None;
                 }
-                return Err(self
-                    .err_type(("Symbol.toPrimitive returned a non-primitive".to_string()).into()));
+                return Err(CommittedValueError::JavaScript(self.err_type(
+                    ("Symbol.toPrimitive returned a non-primitive".to_string()).into(),
+                )));
             }
             // Non-primitive — advance to the next stage.
             return self.drive_to_primitive_stage(
@@ -210,10 +224,14 @@ impl Interpreter {
         }
 
         // 2. Fresh entry — primitive fast path.
-        let recv = *read_register(&stack[top_idx], src)?;
+        let recv = *read_register(&stack[top_idx], src)
+            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
         if abstract_ops::is_primitive(&recv) {
-            write_register(&mut stack[top_idx], dst, recv)?;
-            stack[top_idx].advance_pc()?;
+            write_register(&mut stack[top_idx], dst, recv)
+                .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+            stack[top_idx]
+                .advance_pc()
+                .map_err(|error| CommittedValueError::Fatal(error.into()))?;
             return Ok(false);
         }
 
@@ -459,13 +477,13 @@ impl Interpreter {
         context: &ExecutionContext,
         base: &Value,
         name: &str,
-    ) -> Result<Option<Value>, VmError> {
+    ) -> Result<Option<Value>, CommittedValueError> {
         self.with_handle_scope(|interp, scope| {
             let base_handle = interp.scoped_value(scope, *base);
             let base = interp.escape_scoped(base_handle);
             match interp.ordinary_get_value(
                 stack,
-                context,
+                Some(context),
                 base,
                 base,
                 &VmPropertyKey::String(name),
@@ -475,13 +493,15 @@ impl Interpreter {
                 VmGetOutcome::Value(value) => Ok(Some(value)),
                 VmGetOutcome::InvokeGetter { getter } => {
                     let receiver = interp.escape_scoped(base_handle);
-                    let value = interp.run_callable_sync_rooted(
-                        stack,
-                        context,
-                        &getter,
-                        receiver,
-                        SmallVec::new(),
-                    )?;
+                    let value = interp
+                        .run_callable_sync_rooted(
+                            stack,
+                            Some(context),
+                            &getter,
+                            receiver,
+                            SmallVec::new(),
+                        )
+                        .map_err(CommittedValueError::completed_call)?;
                     Ok(Some(value))
                 }
             }
@@ -495,13 +515,13 @@ impl Interpreter {
         context: &ExecutionContext,
         base: &Value,
         sym: symbol::JsSymbol,
-    ) -> Result<Option<Value>, VmError> {
+    ) -> Result<Option<Value>, CommittedValueError> {
         self.with_handle_scope(|interp, scope| {
             let base_handle = interp.scoped_value(scope, *base);
             let base = interp.escape_scoped(base_handle);
             match interp.ordinary_get_value(
                 stack,
-                context,
+                Some(context),
                 base,
                 base,
                 &VmPropertyKey::Symbol(sym),
@@ -511,13 +531,15 @@ impl Interpreter {
                 VmGetOutcome::Value(value) => Ok(Some(value)),
                 VmGetOutcome::InvokeGetter { getter } => {
                     let receiver = interp.escape_scoped(base_handle);
-                    let value = interp.run_callable_sync_rooted(
-                        stack,
-                        context,
-                        &getter,
-                        receiver,
-                        SmallVec::new(),
-                    )?;
+                    let value = interp
+                        .run_callable_sync_rooted(
+                            stack,
+                            Some(context),
+                            &getter,
+                            receiver,
+                            SmallVec::new(),
+                        )
+                        .map_err(CommittedValueError::completed_call)?;
                     Ok(Some(value))
                 }
             }
@@ -536,169 +558,215 @@ impl Interpreter {
         obj: Value,
         hint: abstract_ops::ToPrimitiveHint,
         mut stage: ToPrimitiveStage,
-    ) -> Result<bool, VmError> {
-        loop {
-            match stage {
-                ToPrimitiveStage::SymbolToPrim => {
-                    let to_prim_sym = self.well_known_symbols.get(symbol::WellKnown::ToPrimitive);
-                    match self.get_symbol_for_to_primitive(stack, context, &obj, to_prim_sym)? {
-                        Some(v) if v.is_nullish() => {
-                            stage = ToPrimitiveStage::OrdinaryFirst;
-                        }
-                        None => {
-                            stage = ToPrimitiveStage::OrdinaryFirst;
-                        }
-                        Some(callee) if self.is_callable_runtime(&callee) => {
-                            let hint_str = JsString::from_str(hint.as_token(), &mut self.gc_heap)?;
-                            let mut args: SmallVec<[Value; 8]> = SmallVec::new();
-                            args.push(Value::string(hint_str));
-                            return self.push_to_primitive_call(
-                                stack,
-                                context,
-                                dst,
-                                obj,
-                                hint,
-                                ToPrimitiveStage::SymbolResult,
-                                &callee,
-                                obj,
-                                args,
-                            );
-                        }
-                        Some(_) => {
-                            return Err(self.err_type(
-                                ("Symbol.toPrimitive method is not callable".to_string()).into(),
-                            ));
-                        }
-                    }
-                }
-                ToPrimitiveStage::OrdinaryFirst => {
-                    let method = ordinary_method_for(hint, stage);
-                    let callee = self.get_string_for_to_primitive(stack, context, &obj, method)?;
-                    if let Some(callee) = &callee
-                        && self.is_callable_runtime(callee)
-                    {
-                        // OrdinaryToPrimitive calls valueOf /
-                        // toString with `this = obj` and no args.
-                        let args: SmallVec<[Value; 8]> = SmallVec::new();
-                        return self.push_to_primitive_call(
+    ) -> Result<bool, CommittedValueError> {
+        self.with_handle_scope(|interp, scope| {
+            let receiver_root = interp.scoped_value(scope, obj);
+
+            loop {
+                match stage {
+                    ToPrimitiveStage::SymbolToPrim => {
+                        let to_prim_sym = interp
+                            .well_known_symbols
+                            .get(symbol::WellKnown::ToPrimitive);
+                        match interp.get_symbol_for_to_primitive(
                             stack,
                             context,
-                            dst,
-                            obj,
-                            hint,
-                            ToPrimitiveStage::OrdinarySecond,
-                            callee,
-                            obj,
-                            args,
-                        );
-                    }
-                    // Fallback: when the prototype chain has no
-                    // own / inherited callable for `method`, fall
-                    // back to the synthetic Object.prototype
-                    // intercept (the same one the call dispatcher
-                    // routes plain `obj.valueOf()` / `obj.toString()`
-                    // through). This keeps behaviour consistent
-                    // for plain object literals which never receive
-                    // a real Object.prototype linkage.
-                    if callee.is_none()
-                        && let Some(o) = obj.as_object()
-                    {
-                        let no_args: SmallVec<[Value; 8]> = SmallVec::new();
-                        let fn_proto = self.function_prototype_object().ok();
-                        if let Some(v) = object_prototype_intercept(
-                            &o,
-                            method,
-                            &no_args,
-                            &mut self.gc_heap,
-                            fn_proto,
-                        )? && abstract_ops::is_primitive(&v)
-                        {
-                            let top_idx = stack.len() - 1;
-                            if let Some(cold) = self.frame_cold_mut(&mut stack[top_idx]) {
-                                cold.pending_to_primitive = None;
+                            &interp.escape_scoped(receiver_root),
+                            to_prim_sym,
+                        )? {
+                            Some(v) if v.is_nullish() => {
+                                stage = ToPrimitiveStage::OrdinaryFirst;
                             }
-                            write_register(&mut stack[top_idx], dst, v)?;
-                            stack[top_idx].advance_pc()?;
-                            return Ok(false);
+                            None => {
+                                stage = ToPrimitiveStage::OrdinaryFirst;
+                            }
+                            Some(callee) if interp.is_callable_runtime(&callee) => {
+                                let callee_root = interp.scoped_value(scope, callee);
+                                let hint_str =
+                                    JsString::from_str(hint.as_token(), &mut interp.gc_heap)
+                                        .map_err(|error| {
+                                            CommittedValueError::JavaScript(error.into())
+                                        })?;
+                                let mut args: SmallVec<[Value; 8]> = SmallVec::new();
+                                args.push(Value::string(hint_str));
+                                return interp
+                                    .push_to_primitive_call(
+                                        stack,
+                                        context,
+                                        dst,
+                                        interp.escape_scoped(receiver_root),
+                                        hint,
+                                        ToPrimitiveStage::SymbolResult,
+                                        &interp.escape_scoped(callee_root),
+                                        interp.escape_scoped(receiver_root),
+                                        args,
+                                    )
+                                    .map_err(|error| {
+                                        CommittedValueError::JavaScript(error.into())
+                                    });
+                            }
+                            Some(_) => {
+                                return Err(CommittedValueError::JavaScript(
+                                    interp.err_type(
+                                        ("Symbol.toPrimitive method is not callable".to_string())
+                                            .into(),
+                                    ),
+                                ));
+                            }
                         }
                     }
-                    stage = ToPrimitiveStage::OrdinarySecond;
-                }
-                ToPrimitiveStage::OrdinarySecond => {
-                    let method = ordinary_method_for(hint, stage);
-                    let callee = self.get_string_for_to_primitive(stack, context, &obj, method)?;
-                    if let Some(callee) = &callee
-                        && self.is_callable_runtime(callee)
-                    {
-                        let args: SmallVec<[Value; 8]> = SmallVec::new();
-                        // After OrdinarySecond the only spec-legal
-                        // outcomes are: primitive result (resume
-                        // path writes it) or non-primitive →
-                        // throw. Park the stage as `Exhausted` so
-                        // the resume re-entry can't loop back into
-                        // this slot.
-                        return self.push_to_primitive_call(
+                    ToPrimitiveStage::OrdinaryFirst => {
+                        let method = ordinary_method_for(hint, stage);
+                        let callee = interp.get_string_for_to_primitive(
                             stack,
                             context,
-                            dst,
-                            obj,
-                            hint,
-                            ToPrimitiveStage::Exhausted,
-                            callee,
-                            obj,
-                            args,
-                        );
-                    }
-                    // Same prototype-intercept fallback as
-                    // OrdinaryFirst above — runs the second method
-                    // (`toString` for hint=number, `valueOf` for
-                    // hint=string) when the chain has nothing
-                    // callable.
-                    if callee.is_none()
-                        && let Some(o) = obj.as_object()
-                    {
-                        let no_args: SmallVec<[Value; 8]> = SmallVec::new();
-                        let fn_proto = self.function_prototype_object().ok();
-                        if let Some(v) = object_prototype_intercept(
-                            &o,
+                            &interp.escape_scoped(receiver_root),
                             method,
-                            &no_args,
-                            &mut self.gc_heap,
-                            fn_proto,
-                        )? && abstract_ops::is_primitive(&v)
+                        )?;
+                        if let Some(callee) = &callee
+                            && interp.is_callable_runtime(callee)
                         {
-                            let top_idx = stack.len() - 1;
-                            if let Some(cold) = self.frame_cold_mut(&mut stack[top_idx]) {
-                                cold.pending_to_primitive = None;
-                            }
-                            write_register(&mut stack[top_idx], dst, v)?;
-                            stack[top_idx].advance_pc()?;
-                            return Ok(false);
+                            // OrdinaryToPrimitive calls valueOf /
+                            // toString with `this = obj` and no args.
+                            let args: SmallVec<[Value; 8]> = SmallVec::new();
+                            return interp
+                                .push_to_primitive_call(
+                                    stack,
+                                    context,
+                                    dst,
+                                    interp.escape_scoped(receiver_root),
+                                    hint,
+                                    ToPrimitiveStage::OrdinarySecond,
+                                    callee,
+                                    interp.escape_scoped(receiver_root),
+                                    args,
+                                )
+                                .map_err(|error| CommittedValueError::JavaScript(error.into()));
                         }
+                        // Fallback: when the prototype chain has no
+                        // own / inherited callable for `method`, fall
+                        // back to the synthetic Object.prototype
+                        // intercept (the same one the call dispatcher
+                        // routes plain `obj.valueOf()` / `obj.toString()`
+                        // through). This keeps behaviour consistent
+                        // for plain object literals which never receive
+                        // a real Object.prototype linkage.
+                        if callee.is_none()
+                            && let Some(o) = interp.escape_scoped(receiver_root).as_object()
+                        {
+                            let no_args: SmallVec<[Value; 8]> = SmallVec::new();
+                            let fn_proto = interp.function_prototype_object().ok();
+                            if let Some(v) = object_prototype_intercept(
+                                &o,
+                                method,
+                                &no_args,
+                                &mut interp.gc_heap,
+                                fn_proto,
+                            )
+                            .map_err(|error| CommittedValueError::JavaScript(error.into()))?
+                                && abstract_ops::is_primitive(&v)
+                            {
+                                let top_idx = stack.len() - 1;
+                                if let Some(cold) = interp.frame_cold_mut(&mut stack[top_idx]) {
+                                    cold.pending_to_primitive = None;
+                                }
+                                write_register(&mut stack[top_idx], dst, v)
+                                    .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                                stack[top_idx]
+                                    .advance_pc()
+                                    .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                                return Ok(false);
+                            }
+                        }
+                        stage = ToPrimitiveStage::OrdinarySecond;
                     }
-                    stage = ToPrimitiveStage::Exhausted;
-                }
-                ToPrimitiveStage::Exhausted => {
-                    // §7.1.1.1 step 6 — TypeError. Task 25 will
-                    // upgrade `VmError::TypeMismatch` to a real
-                    // `TypeError` Error object.
-                    let top_idx = stack.len() - 1;
-                    if let Some(cold) = self.frame_cold_mut(&mut stack[top_idx]) {
-                        cold.pending_to_primitive = None;
+                    ToPrimitiveStage::OrdinarySecond => {
+                        let method = ordinary_method_for(hint, stage);
+                        let callee = interp.get_string_for_to_primitive(
+                            stack,
+                            context,
+                            &interp.escape_scoped(receiver_root),
+                            method,
+                        )?;
+                        if let Some(callee) = &callee
+                            && interp.is_callable_runtime(callee)
+                        {
+                            let args: SmallVec<[Value; 8]> = SmallVec::new();
+                            // After OrdinarySecond the only spec-legal
+                            // outcomes are: primitive result (resume
+                            // path writes it) or non-primitive →
+                            // throw. Park the stage as `Exhausted` so
+                            // the resume re-entry can't loop back into
+                            // this slot.
+                            return interp
+                                .push_to_primitive_call(
+                                    stack,
+                                    context,
+                                    dst,
+                                    interp.escape_scoped(receiver_root),
+                                    hint,
+                                    ToPrimitiveStage::Exhausted,
+                                    callee,
+                                    interp.escape_scoped(receiver_root),
+                                    args,
+                                )
+                                .map_err(|error| CommittedValueError::JavaScript(error.into()));
+                        }
+                        // Same prototype-intercept fallback as
+                        // OrdinaryFirst above — runs the second method
+                        // (`toString` for hint=number, `valueOf` for
+                        // hint=string) when the chain has nothing
+                        // callable.
+                        if callee.is_none()
+                            && let Some(o) = interp.escape_scoped(receiver_root).as_object()
+                        {
+                            let no_args: SmallVec<[Value; 8]> = SmallVec::new();
+                            let fn_proto = interp.function_prototype_object().ok();
+                            if let Some(v) = object_prototype_intercept(
+                                &o,
+                                method,
+                                &no_args,
+                                &mut interp.gc_heap,
+                                fn_proto,
+                            )
+                            .map_err(|error| CommittedValueError::JavaScript(error.into()))?
+                                && abstract_ops::is_primitive(&v)
+                            {
+                                let top_idx = stack.len() - 1;
+                                if let Some(cold) = interp.frame_cold_mut(&mut stack[top_idx]) {
+                                    cold.pending_to_primitive = None;
+                                }
+                                write_register(&mut stack[top_idx], dst, v)
+                                    .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                                stack[top_idx]
+                                    .advance_pc()
+                                    .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                                return Ok(false);
+                            }
+                        }
+                        stage = ToPrimitiveStage::Exhausted;
                     }
-                    return Err(VmError::TypeMismatch);
-                }
-                ToPrimitiveStage::SymbolResult => {
-                    let top_idx = stack.len() - 1;
-                    if let Some(cold) = self.frame_cold_mut(&mut stack[top_idx]) {
-                        cold.pending_to_primitive = None;
+                    ToPrimitiveStage::Exhausted => {
+                        // §7.1.1.1 step 6 — the current source operation
+                        // materializes this local semantic TypeError once.
+                        let top_idx = stack.len() - 1;
+                        if let Some(cold) = interp.frame_cold_mut(&mut stack[top_idx]) {
+                            cold.pending_to_primitive = None;
+                        }
+                        return Err(CommittedValueError::JavaScript(VmError::TypeMismatch));
                     }
-                    return Err(self.err_type(
-                        ("Symbol.toPrimitive returned a non-primitive".to_string()).into(),
-                    ));
+                    ToPrimitiveStage::SymbolResult => {
+                        let top_idx = stack.len() - 1;
+                        if let Some(cold) = interp.frame_cold_mut(&mut stack[top_idx]) {
+                            cold.pending_to_primitive = None;
+                        }
+                        return Err(CommittedValueError::JavaScript(interp.err_type(
+                            ("Symbol.toPrimitive returned a non-primitive".to_string()).into(),
+                        )));
+                    }
                 }
             }
-        }
+        })
     }
 
     /// Park `Op::ToPrimitive` ladder state on the running frame and

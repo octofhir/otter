@@ -3,7 +3,7 @@
 //! # Contents
 //! - [`Interpreter::note_entered_generation_deopt`] — validates one exact
 //!   generated code generation, emits its structured deopt event, and feeds
-//!   the shared cost policy.
+//!   the shared source-site exit policy and outer feedback transaction.
 //!
 //! # Invariants
 //! - This module runs only after a generation entered through the call
@@ -14,8 +14,11 @@
 //!   must agree with it before diagnostics or policy state changes.
 //! - The exit is charged to the generation that took it; the caller that
 //!   entered it is not consulted.
-//! - Exit cost is applied once per still-linked generation; later deopts from
-//!   already-active frames cannot invalidate an already-unlinked cell.
+//! - Counted cold exits mark the existing outer feedback transaction pending,
+//!   including Graph-only chains without hot entry accounting.
+//! - Only a current exact generation charges exit policy. Old active exits
+//!   still report history and new source widening, which retires changed
+//!   source guards rather than unrelated replacement bodies.
 //! - Event construction remains lazy and allocation-free while JIT event
 //!   capture is disabled.
 //!
@@ -41,10 +44,11 @@ impl Interpreter {
         if callee_code_object_id == 0 {
             return Err(VmError::InvalidOperand);
         }
-        let Some(state) = self
-            .jit_code_registry
-            .generated_deopt_state(callee_code_object_id)
-        else {
+        let Some(state) = self.jit_code_registry.generated_deopt_state(
+            callee_code_object_id,
+            callee.header.function_id,
+            callee.header.kind,
+        ) else {
             return Err(VmError::InvalidOperand);
         };
         if state.function_id != callee.header.function_id || state.tier != callee.header.kind {
@@ -58,6 +62,9 @@ impl Interpreter {
                 return Err(VmError::InvalidOperand);
             }
         };
+        // Graph entries omit hot entry accounting and its dirty store. This
+        // counted cold exit must still reach the outer reconciliation pass.
+        self.jit_generated_feedback_pending = true;
         let callee_function_id = callee.header.function_id;
         let callee_resume_pc = callee.header.pc;
         self.record_jit_debug_event(|| JitDebugEvent::EnteredGenerationDeopt {
@@ -96,11 +103,18 @@ impl Interpreter {
                     })
                 })
                 .collect::<smallvec::SmallVec<[crate::Value; 8]>>();
-            self.widen_exited_parameters(callee_function_id, exit, &parameters);
+            let parameters_widened =
+                self.widen_exited_parameters(callee_function_id, exit, &parameters);
             // The shared optimizing-exit owner also applies the one-way
             // arithmetic widening, so a later generation cannot repeat an
             // overflow or negative-zero speculation.
-            self.note_jit_optimized_bail(context, callee_function_id, exit);
+            self.note_jit_optimized_bail(
+                context,
+                callee_function_id,
+                callee_code_object_id,
+                exit,
+                parameters_widened,
+            );
             return Ok(());
         }
 

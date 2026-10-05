@@ -3,7 +3,9 @@
 // behind the vendored string_decoder.js. State lives in a 7-byte Buffer the
 // JS wrapper allocates: bytes [0,4) hold the buffered partial character,
 // then missing-byte count, buffered-byte count, and the encoding id.
-const { Buffer } = require('buffer');
+// `buffer` loads with the first decode or flush: `internal/util` reads only
+// the encodings table from this binding.
+let Buffer;
 
 const encodings = [
   'ascii', 'utf8', 'base64', 'ucs2', 'hex', 'binary', 'latin1',
@@ -137,6 +139,7 @@ function decodeBase64(state, chunk, name) {
 }
 
 function decode(state, view) {
+  Buffer ??= require('buffer').Buffer;
   const chunk = toBuffer(view);
   switch (encodings[state[kEncodingField]]) {
     case 'utf8':
@@ -156,6 +159,7 @@ function decode(state, view) {
 }
 
 function flush(state) {
+  Buffer ??= require('buffer').Buffer;
   const buffered = state[kBufferedBytes];
   const name = encodings[state[kEncodingField]];
   state[kBufferedBytes] = 0;

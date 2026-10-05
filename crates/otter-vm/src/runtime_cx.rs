@@ -18,6 +18,9 @@
 //! - [`NativeCtx`] — high-level native binding API for the current turn.
 //! - [`NativeScope`] — allocation-safe handle scope for native builders.
 //! - `NativeCallRoots` — exact collector-rewritten native-call boundary slots.
+//! - Scoped named global reads with lexical, TDZ and observable `Get` semantics.
+//! - `inspection` — nonallocating scalar reads through current scoped values.
+//! - `scoped_completion` — rooted async/throw handoff and fresh error extents.
 //!
 //! # Invariants
 //!
@@ -42,6 +45,9 @@
 //! - <https://tc39.es/ecma262/#sec-agents> (one mutator per agent).
 //! - [Event loop](../../../docs/book/src/engine/event-loop.md).
 //! - [GC API](../../../docs/book/src/engine/gc-api.md).
+
+mod inspection;
+mod scoped_completion;
 
 use std::marker::PhantomData;
 
@@ -119,12 +125,6 @@ impl<'rt> RuntimeTurn<'rt> {
             activations,
             _marker: PhantomData,
         }
-    }
-
-    /// Borrow the owning interpreter.
-    #[must_use]
-    pub(crate) fn interp(&self) -> &Interpreter {
-        self.interp
     }
 
     /// Borrow the current materialized activation stack.
@@ -334,6 +334,24 @@ impl<'rt> NativeCtx<'rt> {
         })
     }
 
+    /// Complete a native failure with its existing owned execution diagnostic.
+    ///
+    /// The one native-to-VM projector preserves an in-flight `Thrown` value in
+    /// its traced pending slot, restores an imported terminal `ExecutionFailure`,
+    /// and materializes only genuinely native specification errors. This method
+    /// then consumes that completion's exact source frames and error detail.
+    /// It never invents a source context or changes direct-source OOM policy.
+    pub fn take_native_error(&mut self, error: NativeError) -> crate::RunError {
+        self.cx.with_parts(|interp, activations| {
+            let error = crate::native_to_vm_error_with_stack(interp, activations, error);
+            crate::RunError {
+                error,
+                frames: interp.pending_uncaught_frames.take().unwrap_or_default(),
+                detail: interp.take_error_detail(),
+            }
+        })
+    }
+
     /// Run host-side native work in a fresh empty activation turn.
     ///
     /// This is the public replacement for constructing a `NativeCtx` from a
@@ -424,30 +442,28 @@ impl<'rt> NativeCtx<'rt> {
         let sites: Vec<crate::CallSiteInfo> = frames
             .into_iter()
             .map(|frame| {
-                let (line, column) = self
-                    .cx
-                    .interp()
-                    .source_line_col(&frame.module, frame.span.0)
-                    .unwrap_or((0, 0));
-                let source_line = self
-                    .cx
-                    .interp()
-                    .source_line_text(&frame.module, line)
-                    .map(ToOwned::to_owned);
+                let owner = context.for_function(frame.function_id).ok();
+                let source = owner
+                    .as_deref()
+                    .and_then(|owner| owner.source(&frame.module));
+                let (line, column) = frame.source_position.as_ref().map_or((0, 0), |position| {
+                    (position.line_number, position.start_column + 1)
+                });
+                let source_line = frame
+                    .source_position
+                    .as_ref()
+                    .map(|position| position.source_line.to_string());
                 let source_line_before = line
                     .checked_sub(1)
-                    .and_then(|line| self.cx.interp().source_line_text(&frame.module, line))
+                    .and_then(|line| source.and_then(|source| source.line_text(line)))
                     .map(ToOwned::to_owned);
-                let source_line_after = self
-                    .cx
-                    .interp()
-                    .source_line_text(&frame.module, line.saturating_add(1))
+                let source_line_after = source
+                    .and_then(|source| source.line_text(line.saturating_add(1)))
                     .map(ToOwned::to_owned);
                 let source_lines_after = (1..=8)
                     .filter_map(|offset| {
-                        self.cx
-                            .interp()
-                            .source_line_text(&frame.module, line.saturating_add(offset))
+                        source
+                            .and_then(|source| source.line_text(line.saturating_add(offset)))
                             .map(ToOwned::to_owned)
                     })
                     .collect::<Vec<_>>();
@@ -476,20 +492,29 @@ impl<'rt> NativeCtx<'rt> {
     /// Reads the structured snapshot rather than the rendered `stack`
     /// string, so the answer does not depend on whether anything has
     /// looked at `stack` yet.
-    #[must_use]
-    pub fn error_source_position(&self, error: &Value) -> Option<ErrorSourcePosition> {
-        let object = error.as_object()?;
-        let frames = crate::object::error_stack_frames(object, self.heap())?;
-        let frame = frames.first()?;
-        let interp = self.cx.interp();
-        let (line, column) = interp.source_line_col(&frame.module, frame.span.0)?;
-        let source_line = interp.source_line_text(&frame.module, line)?.to_owned();
-        Some(ErrorSourcePosition {
-            script_name: frame.module.clone(),
-            line_number: line,
-            start_column: column.saturating_sub(1),
-            source_line,
-        })
+    pub fn error_source_position(
+        &self,
+        error: &Value,
+    ) -> Result<Option<ErrorSourcePosition>, NativeError> {
+        let Some(object) = error.as_object() else {
+            return Ok(None);
+        };
+        let frames = crate::object::error_stack_frames(
+            object,
+            self.heap(),
+            &self.cx.interp.resource_account,
+        )
+        .map_err(|error| {
+            let error = self.cx.interp.err_owned_source(error);
+            crate::native_function::vm_to_native_error(
+                self.cx.interp,
+                error,
+                "error source position",
+            )
+        })?;
+        Ok(frames
+            .and_then(|frames| frames.into_iter().next())
+            .and_then(|frame| frame.source_position))
     }
 
     /// Borrow the owning interpreter together with the current
@@ -641,10 +666,9 @@ impl<'rt> NativeCtx<'rt> {
     ) -> Result<object::JsObject, otter_gc::OutOfMemory> {
         // OrdinaryObjectCreate(%Object.prototype%) — natives building
         // JS-visible objects (resolvedOptions, formatToParts entries, …)
-        // expect `hasOwnProperty` & friends to resolve. The root fixes the
-        // prototype; finding it never collects.
+        // expect `hasOwnProperty` & friends to resolve. Root preparation may
+        // collect, so pending values enter the same visitor as body allocation.
         let prototype = self.cx.interp.object_prototype_object_opt();
-        let root = self.cx.interp.object_root(prototype)?;
         let roots = self.collect_native_roots();
         let this_value = self.call_info.this_value;
         let new_target = self.call_info.new_target;
@@ -658,12 +682,21 @@ impl<'rt> NativeCtx<'rt> {
                 slice_roots,
             );
         };
-        object::alloc_object_with_shape_roots(
+        let root = object::heap_instance_root(
+            prototype.map_or(
+                object::ObjectPrototype::Null,
+                object::ObjectPrototype::Object,
+            ),
             self.heap_mut(),
-            root,
-            crate::object::DEFAULT_INLINE_CAPACITY,
+            object::DEFAULT_INLINE_CAPACITY,
+            object::ShapeState::ORDINARY,
             &mut external_visit,
-        )
+        )?;
+        self.cx
+            .interp
+            .shape_runtime
+            .register_shape(&self.cx.interp.gc_heap, root);
+        object::alloc_object_with_shape_roots(self.heap_mut(), root, &mut external_visit)
     }
 
     /// Allocate a host-data object through the native root contract.
@@ -783,49 +816,15 @@ impl<'rt> NativeCtx<'rt> {
         let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
             visit_native_roots(visitor, &roots, &this_value, new_target.as_ref(), &[], &[]);
         };
-        native_function::native_value_with_captures_and_roots(
+        let value = native_function::native_value_with_captures_and_roots(
             self.heap_mut(),
             name,
             length,
             captures,
             &mut external_visit,
             call,
-        )
-    }
-
-    /// VM-internal captured native allocation with additional transient roots.
-    pub(crate) fn native_value_with_captures<F>(
-        &mut self,
-        name: &'static str,
-        captures: smallvec::SmallVec<[Value; 4]>,
-        value_roots: &[&Value],
-        slice_roots: &[&[Value]],
-        call: F,
-    ) -> Result<Value, otter_gc::OutOfMemory>
-    where
-        F: for<'call> Fn(&mut NativeCtx<'call>, &[Value], &[Value]) -> Result<Value, NativeError>
-            + 'static,
-    {
-        let roots = self.collect_native_roots();
-        let this_value = self.call_info.this_value;
-        let new_target = self.call_info.new_target;
-        let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
-            visit_native_roots(
-                visitor,
-                &roots,
-                &this_value,
-                new_target.as_ref(),
-                value_roots,
-                slice_roots,
-            );
-        };
-        native_function::native_value_with_captures_unchecked_with_roots(
-            self.heap_mut(),
-            name,
-            captures,
-            &mut external_visit,
-            call,
-        )
+        )?;
+        Ok(self.cx.interp.stamp_native_creation_realm(value))
     }
 
     /// Allocate a `Map` body through the native root contract.
@@ -865,16 +864,10 @@ impl<'rt> NativeCtx<'rt> {
         target: Value,
         args: smallvec::SmallVec<[Value; 8]>,
     ) -> Result<Value, NativeError> {
-        let context = self
-            .context
-            .cloned()
-            .ok_or_else(|| NativeError::TypeError {
-                name: "construct",
-                reason: "missing execution context".to_string(),
-            })?;
+        let context = self.context.cloned().ok_or(NativeError::InvalidOperand)?;
         self.cx.with_parts(|interp, stack| {
             interp
-                .run_construct_sync_rooted(stack, &context, &target, target, args)
+                .run_construct_sync_rooted(stack, &context, &target, target, args, 0)
                 .map_err(|err| native_function::vm_to_native_error(interp, err, "construct"))
         })
     }
@@ -922,17 +915,16 @@ impl<'rt> NativeCtx<'rt> {
     ///
     /// The synthesized module executes above an activation floor on this
     /// context's shared stack, so nested `require` never publishes a detached
-    /// frame stack. A `builtin` body is byte-identical on every launch, so its
-    /// compile may be served from the host's compile cache.
+    /// frame stack. An embedded builtin links its build-produced module after
+    /// host verification instead of compiling.
     pub fn create_commonjs_wrapper(
         &mut self,
         module_url: &str,
-        body: &str,
-        builtin: bool,
+        body: crate::CommonJsBody<'_>,
     ) -> Result<Value, NativeError> {
         self.cx.with_parts(|interp, stack| {
             interp
-                .create_commonjs_wrapper(stack, module_url, body, builtin)
+                .create_commonjs_wrapper(stack, module_url, body)
                 .map_err(|error| {
                     native_function::vm_to_native_error(interp, error, "CommonJS wrapper")
                 })
@@ -943,14 +935,26 @@ impl<'rt> NativeCtx<'rt> {
     ///
     /// Host loaders open one [`NativeCtx::with_host_context`] boundary; module
     /// init, top-level await, and nested dynamic import then share its exact
-    /// activation stack.
+    /// activation stack. A failure transfers the completed extent's original
+    /// source frames and error detail into the existing owned RunError. The
+    /// pending JavaScript throw remains rooted for catchable module rejection.
     pub fn evaluate_module(
         &mut self,
         url: &str,
-    ) -> Result<Option<crate::promise::JsPromiseHandle>, VmError> {
-        let context = self.context.cloned().ok_or(VmError::InvalidOperand)?;
-        self.cx
-            .with_parts(|interp, stack| interp.evaluate_module(stack, &context, url))
+    ) -> Result<Option<crate::promise::JsPromiseHandle>, crate::RunError> {
+        let context = self
+            .context
+            .cloned()
+            .ok_or_else(|| crate::RunError::bare(VmError::InvalidOperand))?;
+        self.cx.with_parts(|interp, stack| {
+            interp
+                .evaluate_module(stack, &context, url)
+                .map_err(|error| crate::RunError {
+                    error,
+                    frames: interp.pending_uncaught_frames.take().unwrap_or_default(),
+                    detail: interp.take_error_detail(),
+                })
+        })
     }
 
     pub(crate) fn call_owned(
@@ -959,16 +963,10 @@ impl<'rt> NativeCtx<'rt> {
         this_value: Value,
         args: smallvec::SmallVec<[Value; 8]>,
     ) -> Result<Value, NativeError> {
-        let context = self
-            .context
-            .cloned()
-            .ok_or_else(|| NativeError::TypeError {
-                name: "call",
-                reason: "missing execution context".to_string(),
-            })?;
+        let context = self.context.cloned();
         self.cx.with_parts(|interp, stack| {
             interp
-                .run_callable_sync_rooted(stack, &context, &target, this_value, args)
+                .run_callable_sync_rooted(stack, context.as_ref(), &target, this_value, args)
                 .map_err(|err| native_function::vm_to_native_error(interp, err, "call"))
         })
     }
@@ -979,14 +977,7 @@ impl<'rt> NativeCtx<'rt> {
     /// retaining them across any later allocation must immediately place them
     /// in scoped or persistent roots.
     pub fn promise_capability(&mut self) -> Result<(Value, Value, Value), NativeError> {
-        let context = self
-            .context
-            .cloned()
-            .ok_or_else(|| NativeError::TypeError {
-                name: "Promise",
-                reason: "missing execution context".to_string(),
-            })?;
-        let builder = crate::promise_dispatch::PromiseBuilder::with_context(context);
+        let builder = crate::promise_dispatch::PromiseBuilder::with_context(self.context.cloned());
         builder
             .construct_native_rooted(self, &[], &[])
             .map(|(promise, resolve, reject)| (Value::promise(promise), resolve, reject))
@@ -1047,17 +1038,11 @@ impl<'rt> NativeCtx<'rt> {
         value: Value,
         constructor: Value,
     ) -> Result<bool, NativeError> {
-        let context = self
-            .context
-            .cloned()
-            .ok_or_else(|| NativeError::TypeError {
-                name: "instanceof",
-                reason: "missing execution context".to_string(),
-            })?;
+        let context = self.context.cloned().ok_or(NativeError::InvalidOperand)?;
         self.cx.with_parts(|interp, stack| {
             interp
                 .ordinary_has_instance(stack, &context, &constructor, &value)
-                .map_err(|err| native_function::vm_to_native_error(interp, err, "instanceof"))
+                .map_err(|err| err.into_native(interp, "instanceof"))
         })
     }
 
@@ -1089,17 +1074,43 @@ impl<'rt> NativeCtx<'rt> {
     /// Perform ordinary/exotic JavaScript `Get(receiver, key)` through the
     /// active execution context.
     pub fn get_value_property(&mut self, receiver: Value, key: &str) -> Result<Value, NativeError> {
-        let context = self
-            .context
-            .cloned()
-            .ok_or_else(|| NativeError::TypeError {
-                name: "get property",
-                reason: "missing execution context".to_string(),
+        let context = self.context.cloned();
+        self.scope(|mut scope| {
+            let receiver = scope.value(receiver);
+            let raw = scope.raw(receiver);
+            let outcome = scope.with_turn_parts(|interp, stack| {
+                interp
+                    .ordinary_get_value(
+                        stack,
+                        context.as_ref(),
+                        raw,
+                        raw,
+                        &crate::VmPropertyKey::String(key),
+                        0,
+                    )
+                    .map_err(|error| error.into_native(interp, "get property"))
             })?;
-        self.cx.with_parts(|interp, stack| {
-            interp
-                .get_property(stack, &context, receiver, key)
-                .map_err(|err| native_function::vm_to_native_error(interp, err, "get property"))
+            match outcome {
+                crate::VmGetOutcome::Value(value) => Ok(value),
+                crate::VmGetOutcome::InvokeGetter { getter } => {
+                    let getter = scope.value(getter);
+                    let getter = scope.raw(getter);
+                    let receiver = scope.raw(receiver);
+                    scope.with_turn_parts(|interp, stack| {
+                        interp
+                            .run_callable_sync_rooted(
+                                stack,
+                                context.as_ref(),
+                                &getter,
+                                receiver,
+                                smallvec::SmallVec::new(),
+                            )
+                            .map_err(|error| {
+                                native_function::vm_to_native_error(interp, error, "get property")
+                            })
+                    })
+                }
+            }
         })
     }
 
@@ -1109,19 +1120,11 @@ impl<'rt> NativeCtx<'rt> {
         &mut self,
         target: Value,
     ) -> Result<Vec<String>, NativeError> {
-        let context = self
-            .context
-            .cloned()
-            .ok_or_else(|| NativeError::TypeError {
-                name: "enumerate properties",
-                reason: "missing execution context".to_string(),
-            })?;
+        let context = self.context.cloned().ok_or(NativeError::InvalidOperand)?;
         self.cx.with_parts(|interp, stack| {
             interp
                 .enumerable_own_string_keys_for_value(stack, &context, target, 0)
-                .map_err(|err| {
-                    native_function::vm_to_native_error(interp, err, "enumerate properties")
-                })
+                .map_err(|err| err.into_native(interp, "enumerate properties"))
         })
     }
 
@@ -1133,13 +1136,7 @@ impl<'rt> NativeCtx<'rt> {
         key: &str,
         value: Value,
     ) -> Result<(), NativeError> {
-        let context = self
-            .context
-            .cloned()
-            .ok_or_else(|| NativeError::TypeError {
-                name: "set property",
-                reason: "missing execution context".to_string(),
-            })?;
+        let context = self.context.cloned().ok_or(NativeError::InvalidOperand)?;
         let ok = self.cx.with_parts(|interp, stack| {
             interp
                 .ordinary_set_data_value(
@@ -1151,7 +1148,7 @@ impl<'rt> NativeCtx<'rt> {
                     receiver,
                     0,
                 )
-                .map_err(|err| native_function::vm_to_native_error(interp, err, "set property"))
+                .map_err(|err| err.into_native(interp, "set property"))
         })?;
         if ok {
             Ok(())
@@ -1216,6 +1213,11 @@ impl<'rt> NativeCtx<'rt> {
         value_roots: &[&Value],
         slice_roots: &[&[Value]],
     ) -> Result<weak_refs::JsFinalizationRegistry, crate::VmError> {
+        let realm_id = self
+            .cx
+            .interp
+            .reaction_realm(Some(cleanup_callback), self.cx.interp.active_realm_id)?;
+        let async_context = self.cx.interp.async_context();
         let roots = self.collect_native_roots();
         let this_value = self.call_info.this_value;
         let new_target = self.call_info.new_target;
@@ -1233,6 +1235,8 @@ impl<'rt> NativeCtx<'rt> {
             self.heap_mut(),
             cleanup_callback,
             cleanup_context,
+            realm_id,
+            async_context,
             &mut external_visit,
         )
     }
@@ -1293,18 +1297,18 @@ impl<'rt> NativeCtx<'rt> {
             name: "make Set readonly",
             reason: "value is not a Set".to_string(),
         })?;
-        collections::set_make_readonly(set, self.heap_mut());
+        collections::set_make_readonly(set, self.heap_mut())?;
         Ok(())
     }
 
     /// `Object.freeze` an object a native built, so a host surface that is
     /// constant to the program reads as constant to it.
     pub fn freeze_object(&mut self, value: Value) -> Result<(), NativeError> {
-        let object = value.as_object().ok_or_else(|| NativeError::TypeError {
+        let mut object = value.as_object().ok_or_else(|| NativeError::TypeError {
             name: "freeze",
             reason: "value is not an object".to_string(),
         })?;
-        object::freeze(object, self.heap_mut());
+        object::freeze(&mut object, self.heap_mut())?;
         Ok(())
     }
 
@@ -1399,7 +1403,7 @@ impl<'rt> NativeCtx<'rt> {
         };
         let array =
             array::from_elements_with_roots(self.heap_mut(), elements, &mut external_visit)?;
-        self.cx.interp.register_array_prototype_override(array);
+        let array = self.cx.interp.register_array_prototype_override(array)?;
         Ok(array)
     }
 
@@ -1430,10 +1434,19 @@ impl<'rt> NativeCtx<'rt> {
     /// Install a per-instance `[[Prototype]]` override on an array unless the
     /// override is redundant: the default realm's `%Array.prototype%` is
     /// already what an unstamped array resolves to, and stamping it would
-    /// materialize the exotic sidecar that disqualifies the array from every
-    /// dense fast path. A subclass prototype (or any non-default-realm proto)
-    /// is always installed.
-    pub fn set_array_prototype_override_checked(&mut self, array: array::JsArray, proto: Value) {
+    /// materialize the exotic sidecar that disqualifies whole-array bulk
+    /// fast paths. Guarded present own tagged/packed-double slots may still
+    /// use a prototype-only sidecar; holes retain prototype lookup semantics.
+    /// A subclass prototype (or any non-default-realm proto) is always installed.
+    ///
+    /// # Errors
+    /// Returns an allocation failure if the array's exotic sidecar cannot be
+    /// created under the heap cap.
+    pub fn set_array_prototype_override_checked(
+        &mut self,
+        array: array::JsArray,
+        proto: Value,
+    ) -> Result<(), otter_gc::OutOfMemory> {
         if !self.cx.interp.active_realm_is_extra
             && self
                 .cx
@@ -1442,9 +1455,9 @@ impl<'rt> NativeCtx<'rt> {
                 .array_prototype()
                 .is_some_and(|p| Value::object(p).to_bits() == proto.to_bits())
         {
-            return;
+            return Ok(());
         }
-        array::set_prototype_override(array, self.heap_mut(), Some(proto));
+        array::set_prototype_override(array, self.heap_mut(), Some(proto))
     }
 
     /// Store an array element through the native root contract.
@@ -1575,31 +1588,36 @@ impl<'rt> NativeCtx<'rt> {
         let Some(promise) = value.as_promise() else {
             return Ok(value);
         };
-        let context = self
-            .context
-            .cloned()
-            .ok_or_else(|| NativeError::TypeError {
-                name,
-                reason: "missing execution context".to_string(),
-            })?;
-        self.cx
-            .interp
-            .drain_microtasks(&context)
-            .map_err(|err| NativeError::TypeError {
-                name,
-                reason: err.to_string(),
-            })?;
-        match promise.state(self.heap()) {
-            PromiseState::Fulfilled(value) => Ok(value),
-            PromiseState::Rejected(reason) => Err(NativeError::Thrown {
-                name,
-                message: reason.display_string(self.heap()),
-            }),
-            PromiseState::Pending => Err(NativeError::TypeError {
-                name,
-                reason: "promise is still pending after microtask drain".to_string(),
-            }),
-        }
+        self.scope(|mut scope| {
+            let promise_root = scope.value(Value::promise(promise));
+            if let Err(error) = scope
+                .context()
+                .interp_mut()
+                .drain_microtasks(|_, _| Ok(false))
+            {
+                let interp = scope.context().interp_mut();
+                // Retain the original diagnostics before the one VM decoder.
+                *interp.pending_error_detail.borrow_mut() = error.detail;
+                interp.pending_uncaught_frames = Some(error.frames);
+                return Err(native_function::vm_to_native_error(
+                    interp,
+                    error.error,
+                    name,
+                ));
+            }
+            let promise = scope
+                .raw(promise_root)
+                .as_promise()
+                .expect("rooted promise");
+            match promise.state(scope.context().heap()) {
+                PromiseState::Fulfilled(value) => Ok(value),
+                PromiseState::Rejected(reason) => Err(scope.context().throw_value(name, reason)),
+                PromiseState::Pending => Err(NativeError::TypeError {
+                    name,
+                    reason: "promise is still pending after microtask drain".to_string(),
+                }),
+            }
+        })
     }
 
     /// Allocate a fixed-length `ArrayBuffer` backing store.
@@ -1690,18 +1708,34 @@ impl<'rt> NativeCtx<'rt> {
             });
         }
         let context = self
-            .context
-            .cloned()
-            .ok_or_else(|| crate::NativeError::TypeError {
-                name: "NativeCtx::queue_microtask",
-                reason: "missing execution context".to_string(),
+            .cx
+            .interp
+            .callable_context(self.context, callee)
+            .map_err(|error| {
+                native_function::vm_to_native_error(
+                    self.cx.interp,
+                    error,
+                    "NativeCtx::queue_microtask",
+                )
+            })?;
+        let realm_id = self
+            .cx
+            .interp
+            .reaction_realm(Some(callee), self.cx.interp.active_host_realm_id())
+            .map_err(|error| {
+                native_function::vm_to_native_error(
+                    self.cx.interp,
+                    error,
+                    "NativeCtx::queue_microtask",
+                )
             })?;
         let async_context = self.cx.interp.async_context();
         self.cx.interp.microtasks_mut().enqueue(crate::Microtask {
             callee,
             this_value: Value::undefined(),
             args: args.into_iter().collect(),
-            context: Some(context),
+            context,
+            realm_id,
             result_capability: None,
             kind: crate::microtask::MicrotaskKind::Call,
             async_context,
@@ -1731,7 +1765,7 @@ impl<'rt> NativeCtx<'rt> {
     /// # fn main() -> Result<(), otter_vm::NativeError> {
     /// use otter_vm::{Interpreter, NativeCallInfo, NativeCtx, Value};
     ///
-    /// let mut interp = Interpreter::new();
+    /// let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
     /// let port: u16 = 8080;
     /// let object_value = NativeCtx::with_host_context(
     ///     &mut interp,
@@ -1973,11 +2007,11 @@ impl<'scope, 'rt> NativeScope<'scope, 'rt> {
     /// Like [`Self::promise_fulfilled`], this keeps both the settlement payload
     /// and the returned Promise in the current handle scope.
     pub fn promise_rejected(&mut self, reason: Local<'_>) -> Result<Local<'scope>, NativeError> {
-        let result = self
-            .ctx
-            .cx
-            .interp
-            .scoped_promise_rejected(self.token, reason);
+        let result =
+            self.ctx
+                .cx
+                .interp
+                .scoped_promise_rejected(self.token, reason, self.ctx.context);
         result.map_err(|error| self.vm_error(error, "NativeScope::promise_rejected"))
     }
 
@@ -2026,7 +2060,10 @@ impl<'scope, 'rt> NativeScope<'scope, 'rt> {
         } else {
             promise.fulfill(self.ctx.cx.interp.gc_heap_mut(), payload)
         };
-        self.ctx.cx.interp.note_settle_rejection(&jobs);
+        self.ctx
+            .cx
+            .interp
+            .note_settle_rejection(&jobs, self.ctx.context);
         for job in jobs.jobs {
             self.ctx.cx.interp.microtasks_mut().enqueue(job);
         }
@@ -2618,30 +2655,6 @@ impl<'scope, 'rt> NativeScope<'scope, 'rt> {
     /// in this scope's collector-rewritten arena throughout any nested getter
     /// call.
     pub fn get(&mut self, receiver: Local<'_>, key: &str) -> Result<Local<'scope>, NativeError> {
-        if self.ctx.context.is_none() {
-            let raw = self.raw(receiver);
-            if raw.as_object().is_some() {
-                let result = self.ctx.cx.interp.scoped_get(self.token, receiver, key);
-                return result.map_err(|error| self.vm_error(error, "NativeScope::get"));
-            }
-            if let Some(native) = raw.as_native_function() {
-                let descriptor = native
-                    .own_property_descriptor(self.ctx.heap_mut(), key)
-                    .map_err(|error| self.vm_error(VmError::from(error), "NativeScope::get"))?;
-                let value = match descriptor.map(|descriptor| descriptor.kind) {
-                    Some(object::DescriptorKind::Data { value }) => value,
-                    Some(object::DescriptorKind::Accessor { .. }) => {
-                        return Err(NativeError::TypeError {
-                            name: "NativeScope::get",
-                            reason: "cannot invoke an accessor without an execution context"
-                                .to_string(),
-                        });
-                    }
-                    None => Value::undefined(),
-                };
-                return Ok(self.value(value));
-            }
-        }
         let receiver = self.raw(receiver);
         let result = self.ctx.get_value_property(receiver, key)?;
         Ok(self.value(result))
@@ -2771,20 +2784,33 @@ impl<'scope, 'rt> NativeScope<'scope, 'rt> {
     }
 
     /// Store a string-keyed property through the rooted object path.
+    ///
+    /// Plain objects and arrays keep the direct scoped store and a native
+    /// function its own property bag. Every other receiver kind (RegExp,
+    /// functions, collections, Proxies, ...) performs the canonical
+    /// `Set(receiver, key, value, true)` under the active execution context.
     pub fn set(
         &mut self,
         object: Local<'_>,
         key: &str,
         value: Local<'_>,
     ) -> Result<(), NativeError> {
+        let receiver = self.raw(object);
+        if receiver.as_object().is_none()
+            && receiver.as_array().is_none()
+            && receiver.as_native_function().is_none()
+            && self.ctx.context.is_some()
+        {
+            let value = self.raw(value);
+            return self.ctx.set_value_property(receiver, key, value);
+        }
         // A captured native function stores host-written own properties in
-        // its ordinary property bag, mirroring the native-function branch of
-        // [`Self::get`]. Plain objects and arrays keep the direct scoped
-        // store.
-        if let Some(native) = self.raw(object).as_native_function() {
+        // its ordinary property bag. Plain objects and arrays keep the direct
+        // scoped store.
+        if let Some(native) = receiver.as_native_function() {
             let stored = self.raw(value);
             let descriptor = object::PropertyDescriptor::data(stored, true, true, true);
-            if native.define_own_property(self.ctx.heap_mut(), key, descriptor) {
+            if native.define_own_property(self.ctx.heap_mut(), key, descriptor)? {
                 return Ok(());
             }
             return Err(NativeError::TypeError {
@@ -2849,6 +2875,11 @@ impl<'scope, 'rt> NativeScope<'scope, 'rt> {
 
     /// Define an accessor property with explicit descriptor flags. Pass the
     /// scope's `undefined` for an absent getter or setter.
+    ///
+    /// An ordinary object takes the heap-only scoped define. Every other
+    /// receiver kind (arrays, functions, class constructors, Proxies, typed
+    /// arrays) runs the canonical `[[DefineOwnProperty]]` under the active
+    /// execution context, which roots the target and descriptor itself.
     pub fn define_accessor(
         &mut self,
         object: Local<'_>,
@@ -2857,6 +2888,34 @@ impl<'scope, 'rt> NativeScope<'scope, 'rt> {
         setter: Local<'_>,
         flags: crate::object::PropertyFlags,
     ) -> Result<(), NativeError> {
+        if self.raw(object).as_object().is_none()
+            && let Some(context) = self.ctx.context.cloned()
+        {
+            let target = self.raw(object);
+            let descriptor = object::PartialPropertyDescriptor {
+                get: Some(self.raw(getter)),
+                set: Some(self.raw(setter)),
+                enumerable: Some(flags.enumerable()),
+                configurable: Some(flags.configurable()),
+                ..Default::default()
+            };
+            let defined = self.with_turn_parts(|interp, stack| {
+                interp
+                    .define_own_property_value(
+                        stack,
+                        &context,
+                        &target,
+                        &crate::VmPropertyKey::String(key),
+                        descriptor,
+                    )
+                    .map_err(|error| error.into_native(interp, "NativeScope::define_accessor"))
+            })?;
+            return if defined {
+                Ok(())
+            } else {
+                Err(self.vm_error(VmError::TypeMismatch, "NativeScope::define_accessor"))
+            };
+        }
         let result = self
             .ctx
             .cx
@@ -2902,12 +2961,8 @@ impl<'scope, 'rt> NativeScope<'scope, 'rt> {
                 reason: "expected an ordinary object".to_string(),
             })?;
         let expected = self.raw(expected);
-        Ok(object::delete_if_same_data(
-            object,
-            self.ctx.heap_mut(),
-            key,
-            expected,
-        ))
+        object::delete_if_same_data(&mut { object }, self.ctx.heap_mut(), key, expected)
+            .map_err(NativeError::from)
     }
 
     /// Define a symbol-keyed data property with explicit descriptor flags.
@@ -3054,18 +3109,20 @@ impl<'scope, 'rt> NativeScope<'scope, 'rt> {
         module_url: &str,
         body: &str,
     ) -> Result<Local<'scope>, NativeError> {
-        let wrapper = self.ctx.create_commonjs_wrapper(module_url, body, false)?;
+        let wrapper = self
+            .ctx
+            .create_commonjs_wrapper(module_url, crate::CommonJsBody::File(body))?;
         Ok(self.value(wrapper))
     }
 
-    /// [`Self::commonjs_wrapper`] for a builtin module body, whose compile
-    /// the host may serve from its compile cache.
-    pub fn builtin_commonjs_wrapper(
+    /// [`Self::commonjs_wrapper`] for a builtin the product build compiled.
+    pub fn embedded_commonjs_wrapper(
         &mut self,
-        module_url: &str,
-        body: &str,
+        unit: &'static crate::EmbeddedCommonJs,
     ) -> Result<Local<'scope>, NativeError> {
-        let wrapper = self.ctx.create_commonjs_wrapper(module_url, body, true)?;
+        let wrapper = self
+            .ctx
+            .create_commonjs_wrapper(unit.url, crate::CommonJsBody::Embedded(unit))?;
         Ok(self.value(wrapper))
     }
 
@@ -3392,6 +3449,15 @@ impl<'scope, 'rt> NativeScope<'scope, 'rt> {
             .is_some_and(|object| object::has_error_data(object, self.ctx.heap()))
     }
 
+    /// Root the original realm intrinsic Error constructor. This accessor is
+    /// used by namespace bootstrap; replacing JavaScript bindings does not
+    /// change the constructor or prototype selected by engine failures.
+    #[must_use]
+    pub fn error_constructor(&mut self, kind: crate::error_classes::ErrorKind) -> Local<'scope> {
+        let constructor = self.ctx.cx.interp.error_classes.constructor(kind);
+        self.value(Value::object(constructor))
+    }
+
     /// Allocate a canonical Error instance without consulting mutable globals.
     ///
     /// The intrinsic prototype comes from the interpreter-owned error-class
@@ -3413,7 +3479,7 @@ impl<'scope, 'rt> NativeScope<'scope, 'rt> {
                 name: "NativeScope::error",
                 reason: "Error shell is not an ordinary object".to_string(),
             })?;
-        object::set_error_data(&mut object, self.ctx.heap_mut());
+        object::set_error_data(&mut object, self.ctx.heap_mut())?;
         let message = self.string(message)?;
         self.define(
             instance,
@@ -3458,6 +3524,51 @@ impl<'scope, 'rt> NativeScope<'scope, 'rt> {
     pub fn global(&mut self, name: &str) -> Option<Local<'scope>> {
         let value = self.ctx.global_value(name)?;
         Some(self.value(value))
+    }
+
+    /// Read and root an ordinary identifier from the active global environment.
+    /// Script lexical bindings precede object-record properties; TDZ and
+    /// unresolvable names throw ReferenceError. Getters run normally.
+    pub fn global_binding(&mut self, name: &str) -> Result<Local<'scope>, NativeError> {
+        let context = self.ctx.context.cloned();
+        let result = self.with_turn_parts(|interp, stack| {
+            interp.load_global_binding_name(
+                context.as_ref(),
+                stack,
+                name,
+                crate::global_ops::GlobalBindingRead::Identifier,
+                None,
+            )
+        });
+        match result {
+            Ok(value) => Ok(self.value(value)),
+            Err(error) => Err(error.into_native(self.ctx.cx.interp, "NativeScope::global_binding")),
+        }
+    }
+
+    /// Apply `typeof` to a named global binding, including observable getters.
+    /// Only an unresolvable name yields Undefined; lexical TDZ still throws.
+    /// The returned classifier owns no moving value and invokes no extra Get.
+    pub fn global_binding_typeof(
+        &mut self,
+        name: &str,
+    ) -> Result<otter_bytecode::TypeOfKind, NativeError> {
+        let context = self.ctx.context.cloned();
+        let result = self.with_turn_parts(|interp, stack| {
+            interp.load_global_binding_name(
+                context.as_ref(),
+                stack,
+                name,
+                crate::global_ops::GlobalBindingRead::Typeof,
+                None,
+            )
+        });
+        match result {
+            Ok(value) => Ok(value.typeof_kind_with_heap(self.ctx.heap())),
+            Err(error) => {
+                Err(error.into_native(self.ctx.cx.interp, "NativeScope::global_binding_typeof"))
+            }
+        }
     }
 
     /// Root the active realm's `globalThis` object itself.
@@ -3515,7 +3626,7 @@ impl<'scope, 'rt> NativeScope<'scope, 'rt> {
         this_value: Local<'_>,
         args: &[Local<'_>],
     ) -> Result<Local<'scope>, VmError> {
-        let context = self.ctx.context.ok_or(VmError::InvalidOperand)?;
+        let context = self.ctx.context;
         let target = self.raw(target);
         let this_value = self.raw(this_value);
         let args: smallvec::SmallVec<[Value; 8]> =
@@ -3657,7 +3768,7 @@ mod tests {
 
     #[test]
     fn native_ctx_object_allocation_uses_young_space() {
-        let mut interp = Interpreter::new();
+        let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
         let before = interp.gc_heap().stats().new_allocated_bytes;
         with_default_ctx(&mut interp, |ctx| {
             let _object = ctx.alloc_object().expect("native object allocation");
@@ -3671,7 +3782,7 @@ mod tests {
 
     #[test]
     fn native_ctx_array_allocation_uses_young_space() {
-        let mut interp = Interpreter::new();
+        let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
         let before = interp.gc_heap().stats().new_allocated_bytes;
         with_ctx(
             &mut interp,
@@ -3714,14 +3825,15 @@ mod tests {
             return;
         }
 
-        let mut interp = Interpreter::new();
+        let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
         // Invoking the captured function needs a dispatch context; a minimal
         // verified module provides one without changing what the test
         // exercises.
         let context = interp
-            .link_module(crate::test_support::minimal_bytecode_module(
-                "native-capture-test.js",
-            ))
+            .link_module(
+                crate::test_support::minimal_bytecode_module("native-capture-test.js"),
+                crate::source_registry::SourceRegistry::default(),
+            )
             .expect("minimal fixture module");
         NativeCtx::with_host_context(
             &mut interp,
@@ -3768,7 +3880,7 @@ mod tests {
 
     #[test]
     fn native_call_info_slots_follow_moving_gc() {
-        let mut interp = Interpreter::new();
+        let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
         let receiver = with_default_ctx(&mut interp, |ctx| {
             Value::object(ctx.alloc_object().expect("native receiver allocation"))
         });
@@ -3810,7 +3922,7 @@ mod tests {
 
     #[test]
     fn native_ctx_collection_allocation_uses_young_space() {
-        let mut interp = Interpreter::new();
+        let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
         let before = interp.gc_heap().stats().new_allocated_bytes;
         with_ctx(
             &mut interp,
@@ -3845,7 +3957,7 @@ mod tests {
             Ok(Value::undefined())
         }
 
-        let mut interp = Interpreter::new();
+        let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
         let cleanup =
             native_value_static(interp.gc_heap_mut(), "cleanup", 0, cleanup).expect("cleanup");
         let before = interp.gc_heap().stats().new_allocated_bytes;
@@ -3871,7 +3983,7 @@ mod tests {
 
     #[test]
     fn weak_persistent_root_releases_unreachable_target() {
-        let mut interp = Interpreter::new();
+        let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
         let weak_root = with_default_ctx(&mut interp, |ctx| {
             let target = Value::object(ctx.alloc_object().expect("weak target"));
             ctx.persistent_root_insert_weak(target)
@@ -3889,7 +4001,7 @@ mod tests {
 
     #[test]
     fn weak_persistent_root_observes_strongly_rooted_target() {
-        let mut interp = Interpreter::new();
+        let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
         let (weak_root, strong_root) = with_default_ctx(&mut interp, |ctx| {
             let target = Value::object(ctx.alloc_object().expect("shared target"));
             let strong_root = ctx.persistent_root_insert(target);
@@ -3923,7 +4035,7 @@ mod tests {
         }
         impl crate::object::HostObjectData for HostState {}
 
-        let mut interp = Interpreter::new();
+        let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
         with_default_ctx(&mut interp, |ctx| {
             ctx.scope(|mut scope| {
                 let host = scope
@@ -3957,7 +4069,7 @@ mod tests {
     fn native_scope_buffer_source_returns_owned_copy() {
         use crate::binary::typed_array::{JsTypedArray, TypedArrayKind};
 
-        let mut interp = Interpreter::new();
+        let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
         with_default_ctx(&mut interp, |ctx| {
             let buffer = ctx
                 .array_buffer_from_bytes(vec![1, 2, 3, 4])
@@ -3996,7 +4108,7 @@ mod tests {
     /// offset stale.
     #[test]
     fn native_ctx_scope_builds_nested_value_across_minor_gc() {
-        let mut interp = Interpreter::new();
+        let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
         let ok = with_default_ctx(&mut interp, |ctx| {
             ctx.scope(|mut scope| {
                 let obj = scope.object().unwrap();
@@ -4074,7 +4186,7 @@ mod tests {
             Ok(Value::undefined())
         }
 
-        let mut interp = Interpreter::new();
+        let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
         with_default_ctx(&mut interp, |ctx| {
             ctx.scope(|mut scope| {
                 let function = scope
@@ -4132,7 +4244,7 @@ mod tests {
     /// interpreter-level `scoped_object_survives_and_moves_under_minor_gc`).
     #[test]
     fn native_ctx_scoped_object_relocates_under_minor_gc() {
-        let mut interp = Interpreter::new();
+        let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
         let (moved, content) = with_default_ctx(&mut interp, |ctx| {
             ctx.scope(|mut scope| {
                 let obj = scope.object().unwrap();

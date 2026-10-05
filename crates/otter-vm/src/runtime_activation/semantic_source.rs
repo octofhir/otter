@@ -7,7 +7,8 @@
 //! # Invariants
 //! A published safepoint owns its suspended call PC and logical descendants.
 //! The physical frame PC is the exact side-exit resume field. A boundary with
-//! no call recipe uses that canonical frame PC. Logical descendants name their
+//! no suspended edge uses that canonical frame PC. An active Template helper
+//! uses its current PC even if an earlier stage left a source-bearing record. Logical descendants name their
 //! own operation without materializing or replaying a caller.
 //! Registry borrows end before exclusive VM access, allocation or reentry.
 //!
@@ -17,7 +18,7 @@
 use super::RuntimeCall;
 use crate::{
     ExecutionContext, Interpreter, VmError,
-    native_abi::{Frame, NO_CALL_PC, NO_SAFEPOINT, NativeFrameKind},
+    native_abi::{Frame, NO_CALL_PC},
 };
 use otter_bytecode::Op;
 
@@ -26,30 +27,11 @@ pub(crate) fn frame_semantic_source(
     context: &ExecutionContext,
     frame: &Frame,
 ) -> Result<(u32, u32), VmError> {
-    if frame.call_site == NO_SAFEPOINT || frame.header.kind != NativeFrameKind::Optimizing {
+    let Some(record) = vm.jit_frame_safepoint(frame)? else {
         return Ok((frame.header.function_id, frame.header.pc));
-    }
-    let record = vm
-        .jit_code_registry
-        .safepoint_record(u64::from(frame.code_object_id), frame.call_site)
-        .ok_or(VmError::InvalidOperand)?;
-    if record.id != frame.call_site
-        || vm
-            .jit_code_registry
-            .generation_function_id(u64::from(frame.code_object_id))
-            != Some(frame.header.function_id)
-    {
-        return Err(VmError::InvalidOperand);
-    }
+    };
     if record.inline_frames.is_empty() {
-        // Generated calls retain their suspended source PC in the immutable
-        // safepoint record. The frame PC is the exact side-exit resume field;
-        // it need not mirror that call while generated code is executing.
-        let pc = if record.call_pc == NO_CALL_PC {
-            frame.header.pc
-        } else {
-            record.call_pc
-        };
+        let pc = vm.jit_frame_source_pc(frame, Some(record));
         return Ok((frame.header.function_id, pc));
     }
     if record.call_pc == NO_CALL_PC {

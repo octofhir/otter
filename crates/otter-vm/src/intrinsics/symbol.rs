@@ -11,6 +11,10 @@
 //! fixups that depend on the per-realm `WellKnownSymbols` singleton
 //! live in [`install_symbol_well_knowns_post_bootstrap`].
 //!
+//!
+//! Native coercion and callback failures finish through the existing committed
+//! completion owner: local allocation refusals retain their authored native OOM
+//! facts, while completed terminal failures retain exact detail and source frames.
 //! # See also
 //! - <https://tc39.es/ecma262/#sec-symbol-constructor>
 
@@ -18,8 +22,9 @@ use crate::Value;
 use crate::bootstrap::{
     install_iterator_well_knowns_post_bootstrap, native_static_with_value_roots,
 };
-use crate::js_surface::JsSurfaceError;
+use crate::js_surface::{JsSurfaceError, ObjectBuilder};
 use crate::object::{self, JsObject, PropertyDescriptor};
+use crate::rooting::RootScopeExt;
 use crate::{NativeCtx, NativeError};
 
 otter_macros::couch! {
@@ -62,51 +67,14 @@ fn symbol_ctor_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Na
                     })?;
             let result = ctx
                 .with_turn_parts(|interp, stack| interp.coerce_to_string(stack, &context, other));
-            let coerced = match result {
-                Ok(s) => s,
-                Err(crate::VmError::TypeError) => {
-                    let message = match ctx.cx.interp.take_error_detail() {
-                        Some(crate::run_control::ErrorDetail::Message(m)) => m,
-                        _ => Default::default(),
-                    };
-                    return Err(NativeError::TypeError {
-                        name: "Symbol",
-                        reason: message.into(),
-                    });
-                }
-                Err(crate::VmError::Uncaught) => {
-                    let value = match ctx.cx.interp.take_error_detail() {
-                        Some(crate::run_control::ErrorDetail::Uncaught(m)) => m,
-                        _ => Default::default(),
-                    };
-                    return Err(NativeError::Thrown {
-                        name: "Symbol",
-                        message: value.into(),
-                    });
-                }
-                Err(other) => {
-                    return Err(NativeError::TypeError {
-                        name: "Symbol",
-                        reason: other.to_string(),
-                    });
-                }
-            };
-            let rendered =
-                crate::string::JsString::from_str(&coerced, ctx.heap_mut()).map_err(|_| {
-                    NativeError::TypeError {
-                        name: "Symbol",
-                        reason: "out of memory".to_string(),
-                    }
-                })?;
+            let coerced = result.map_err(|error| error.into_native(ctx.interp_mut(), "Symbol"))?;
+            let rendered = crate::string::JsString::from_str(&coerced, ctx.heap_mut())
+                .map_err(NativeError::from)?;
             Some(rendered)
         }
     };
-    let sym = crate::symbol::JsSymbol::new(ctx.interp_mut().gc_heap_mut(), description).map_err(
-        |_| NativeError::TypeError {
-            name: "Symbol",
-            reason: "out of memory".to_string(),
-        },
-    )?;
+    let sym = crate::symbol::JsSymbol::new(ctx.interp_mut().gc_heap_mut(), description)
+        .map_err(NativeError::from)?;
     Ok(Value::symbol(sym))
 }
 
@@ -128,43 +96,14 @@ fn symbol_for_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Nat
                     })?;
             let result = ctx
                 .with_turn_parts(|interp, stack| interp.coerce_to_string(stack, &context, other));
-            match result {
-                Ok(s) => s,
-                Err(crate::VmError::TypeError) => {
-                    let message = match ctx.cx.interp.take_error_detail() {
-                        Some(crate::run_control::ErrorDetail::Message(m)) => m,
-                        _ => Default::default(),
-                    };
-                    return Err(NativeError::TypeError {
-                        name: "Symbol.for",
-                        reason: message.into(),
-                    });
-                }
-                Err(crate::VmError::Uncaught) => {
-                    let value = match ctx.cx.interp.take_error_detail() {
-                        Some(crate::run_control::ErrorDetail::Uncaught(m)) => m,
-                        _ => Default::default(),
-                    };
-                    return Err(NativeError::Thrown {
-                        name: "Symbol.for",
-                        message: value.into(),
-                    });
-                }
-                Err(other) => {
-                    return Err(NativeError::TypeError {
-                        name: "Symbol.for",
-                        reason: other.to_string(),
-                    });
-                }
-            }
+            result.map_err(|error| error.into_native(ctx.interp_mut(), "Symbol.for"))?
         }
     };
     let sym = ctx
         .interp_mut()
         .symbol_for_key(&key)
-        .map_err(|_| NativeError::TypeError {
-            name: "Symbol.for",
-            reason: "out of memory".to_string(),
+        .map_err(|error| match error {
+            crate::symbol::SymbolRegistryError::OutOfMemory(error) => NativeError::from(error),
         })?;
     Ok(Value::symbol(sym))
 }
@@ -293,7 +232,7 @@ pub fn install_symbol_well_knowns_post_bootstrap(
     for (name, tag) in well_known_pairs {
         let sym = well_known.get(*tag);
         let desc = PropertyDescriptor::data(Value::symbol(sym), false, false, false);
-        if !symbol_ctor.define_own_property(heap, name, desc) {
+        if !symbol_ctor.define_own_property(heap, name, desc)? {
             return Err(JsSurfaceError::DefinePropertyFailed("well-known symbol"));
         }
     }
@@ -301,7 +240,7 @@ pub fn install_symbol_well_knowns_post_bootstrap(
     // Symbol.prototype[@@toPrimitive] — ECMA-262 §20.4.3.5.
     let proto_desc = symbol_ctor
         .own_property_descriptor(heap, "prototype")
-        .map_err(|_| JsSurfaceError::OutOfMemory)?;
+        .map_err(JsSurfaceError::from)?;
     let mut prototype = match proto_desc.and_then(|d| match d.kind {
         crate::object::DescriptorKind::Data { value } => value.as_object(),
         _ => None,
@@ -310,7 +249,11 @@ pub fn install_symbol_well_knowns_post_bootstrap(
         None => return Ok(()),
     };
     let symbol_ctor_root = Value::native_function(symbol_ctor);
-    let prototype_root = Value::object(prototype);
+    let mut prototype_root = Value::object(prototype);
+    let mut roots = otter_gc::RootScope::new(heap);
+    // SAFETY: the canonical prototype slot stays stationary until the entire
+    // allocating post-bootstrap wiring pass returns.
+    unsafe { roots.add_value(&mut prototype_root) };
     let to_prim_fn = native_static_with_value_roots(
         heap,
         "[Symbol.toPrimitive]",
@@ -318,11 +261,14 @@ pub fn install_symbol_well_knowns_post_bootstrap(
         symbol_proto_to_primitive,
         &[&symbol_ctor_root, &prototype_root],
     )
-    .map_err(|_| JsSurfaceError::OutOfMemory)?;
+    .map_err(JsSurfaceError::from)?;
+    prototype = prototype_root
+        .as_object()
+        .expect("Symbol prototype stays rooted");
     let to_primitive_sym = well_known.get(WellKnown::ToPrimitive);
     let to_prim_desc =
         PropertyDescriptor::data(Value::native_function(to_prim_fn), false, false, true);
-    if !object::define_own_symbol_property(prototype, heap, to_primitive_sym, to_prim_desc) {
+    if !object::define_own_symbol_property(prototype, heap, to_primitive_sym, to_prim_desc)? {
         return Err(JsSurfaceError::DefinePropertyFailed(
             "Symbol.prototype[@@toPrimitive]",
         ));
@@ -335,58 +281,55 @@ pub fn install_symbol_well_knowns_post_bootstrap(
     // §25.5.1 / §28.1 so inherited reads (`Math.hasOwnProperty`,
     // `Object.prototype.value` shadowing during `ToPropertyDescriptor`)
     // resolve correctly.
-    let to_string_tag_sym = well_known.get(WellKnown::ToStringTag);
-    let object_proto = object::get(global, heap, "Object").and_then(|v| {
-        if let Some(ctor) = v.as_native_function() {
-            ctor.own_property_descriptor(heap, "prototype")
-                .ok()
-                .flatten()
-                .and_then(|d| match d.kind {
-                    crate::object::DescriptorKind::Data { value } => value.as_object(),
-                    _ => None,
-                })
-        } else if let Some(ctor) = v.as_object() {
-            object::get(ctor, heap, "prototype").and_then(|v| v.as_object())
-        } else {
-            None
+    let mut object_proto = match object::get(global, heap, "Object") {
+        Some(constructor) if constructor.as_native_function().is_some() => constructor
+            .as_native_function()
+            .unwrap()
+            .own_property_descriptor(heap, "prototype")?
+            .and_then(|descriptor| match descriptor.kind {
+                object::DescriptorKind::Data { value } => Some(value),
+                object::DescriptorKind::Accessor { .. } => None,
+            })
+            .unwrap_or_else(Value::null),
+        Some(constructor) if constructor.as_object().is_some() => {
+            object::get(constructor.as_object().unwrap(), heap, "prototype")
+                .unwrap_or_else(Value::null)
         }
-    });
-    for ns_name in ["Math", "JSON", "Reflect", "Atomics"] {
-        if let Some(mut ns) = object::get(global, heap, ns_name).and_then(|v| v.as_object()) {
-            if let Some(proto) = object_proto {
-                object::set_prototype(ns, heap, Some(proto));
+        _ => Value::null(),
+    };
+    let mut namespace_roots = otter_gc::RootScope::new(heap);
+    // SAFETY: this prototype slot precedes the guard and survives every
+    // namespace state transition and to-string-tag allocation.
+    unsafe { namespace_roots.add_value(&mut object_proto) };
+    for name in ["Math", "JSON", "Reflect", "Atomics"] {
+        if let Some(mut namespace) =
+            object::get(global, heap, name).and_then(|value| value.as_object())
+        {
+            if let Some(prototype) = object_proto.as_object()
+                && !object::set_prototype(&mut namespace, heap, Some(prototype))?
+            {
+                return Err(JsSurfaceError::DefinePropertyFailed(name));
             }
-            let tag = crate::string::JsString::from_str(ns_name, heap)
-                .map_err(|_| JsSurfaceError::OutOfMemory)?;
-            object::define_own_symbol_property_partial(
-                &mut ns,
+            let mut builder = ObjectBuilder::from_object_with_value_roots(
                 heap,
-                to_string_tag_sym,
-                crate::object::PartialPropertyDescriptor {
-                    value: Some(Value::string(tag)),
-                    writable: Some(false),
-                    enumerable: Some(false),
-                    configurable: Some(true),
-                    ..Default::default()
-                },
+                namespace,
+                vec![Value::object(global), object_proto, prototype_root],
             );
+            builder.to_string_tag(well_known, name)?;
+            let _current = builder.build();
         }
     }
-    // §20.4.3.5 — install `Symbol.prototype[@@toStringTag] = "Symbol"`.
-    let symbol_tag = crate::string::JsString::from_str("Symbol", heap)
-        .map_err(|_| JsSurfaceError::OutOfMemory)?;
-    object::define_own_symbol_property_partial(
-        &mut prototype,
+    prototype = prototype_root
+        .as_object()
+        .expect("Symbol prototype stays rooted");
+    let mut builder = ObjectBuilder::from_object_with_value_roots(
         heap,
-        to_string_tag_sym,
-        crate::object::PartialPropertyDescriptor {
-            value: Some(Value::string(symbol_tag)),
-            writable: Some(false),
-            enumerable: Some(false),
-            configurable: Some(true),
-            ..Default::default()
-        },
+        prototype,
+        vec![Value::object(global), symbol_ctor_root],
     );
+    builder.to_string_tag(well_known, "Symbol")?;
+    prototype_root = Value::object(builder.build());
+    debug_assert!(prototype_root.is_object());
     crate::bootstrap_collections::install_collection_well_knowns_post_bootstrap(
         heap, global, well_known,
     )?;
@@ -453,7 +396,7 @@ fn install_constructor_species_accessor(
         species_get,
         &[&global_root, &ctor_root],
     )
-    .map_err(|_| JsSurfaceError::OutOfMemory)?;
+    .map_err(JsSurfaceError::from)?;
     let species_sym = well_known.get(WellKnown::Species);
     let installed = if let Some(f) = ctor_value.as_native_function() {
         f.define_own_symbol_property(
@@ -465,7 +408,7 @@ fn install_constructor_species_accessor(
                 configurable: Some(true),
                 ..Default::default()
             },
-        )
+        )?
     } else if let Some(mut obj) = ctor_value.as_object() {
         crate::object::define_own_symbol_property_partial(
             &mut obj,
@@ -477,7 +420,7 @@ fn install_constructor_species_accessor(
                 configurable: Some(true),
                 ..Default::default()
             },
-        );
+        )?;
         true
     } else {
         return Ok(());

@@ -132,7 +132,7 @@ fn template_osr_emits_ordered_compile_events() {
 
     assert_eq!(result.completion_string(), "4560");
     assert_ordered_template_compile(report.events());
-    let (bytecode_instruction_count, entry_count, exit_count) = report
+    let (bytecode_instruction_count, source_work, exit_count) = report
         .events()
         .iter()
         .find_map(|event| match event {
@@ -140,15 +140,18 @@ fn template_osr_emits_ordered_compile_events() {
                 tier: JitDebugTier::Template,
                 target: JitDebugTarget::Osr { .. },
                 bytecode_instruction_count,
-                entry_count,
+                source_work,
                 exit_count,
                 ..
-            } => Some((*bytecode_instruction_count, *entry_count, *exit_count)),
+            } => Some((*bytecode_instruction_count, *source_work, *exit_count)),
             _ => None,
         })
         .expect("template compile inputs");
     assert!(bytecode_instruction_count > 0);
-    assert_eq!(entry_count, 0, "script roots do not cross a call boundary");
+    assert!(
+        source_work > 0,
+        "the script root's own loop work requests OSR without a call boundary"
+    );
     assert_eq!(exit_count, 0);
     assert!(
         report.events().iter().any(|event| matches!(

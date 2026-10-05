@@ -2,7 +2,8 @@
 # Run the full test262 suite in per-directory batches so a native crash
 # (SIGABRT/SIGSEGV/SIGKILL) in one subtree doesn't take down the whole
 # run. Crashed batches are split one directory level deeper and retried
-# so only the crashing subtree's results are lost. Results are merged
+# to retain diagnostics. Any unresolved batch or missing path prevents publication.
+# Results are merged
 # into one baseline JSON + Markdown + HTML dashboard at the end.
 #
 # Usage:
@@ -13,6 +14,7 @@
 #   MAX_HEAP_BYTES=536870912    # Otter per-test heap cap (512 MB default)
 #   ULIMIT_VIRTUAL_KB=4194304   # OS virtual-memory cap in KB (4 GB default, Linux only)
 #   RESULTS_DIR=test262_results # where to write batch/merged JSON
+#   BATCH_TIMEOUT=3600          # finite external watchdog per serial batch (seconds)
 #
 # Safety: each child process gets two independent memory caps:
 #   - Inner cap: --max-heap-bytes (Otter heap limit, catchable RangeError)
@@ -32,6 +34,12 @@ TEST_DIR="vendor/test262/test"
 MAX_HEAP_BYTES="${MAX_HEAP_BYTES:-536870912}"
 ULIMIT_VIRTUAL_KB="${ULIMIT_VIRTUAL_KB:-4194304}"
 TIMEOUT_MS=$((TIMEOUT * 1000))
+BATCH_TIMEOUT="${BATCH_TIMEOUT:-3600}"
+
+if [ -n "${EXCLUDE_DIRS:-}" ]; then
+    echo "EXCLUDE_DIRS is invalid for a full-corpus publication; use targeted runner filters." >&2
+    exit 1
+fi
 
 mkdir -p "$RESULTS_DIR"
 rm -f "$RESULTS_DIR"/batch_*.json "$RESULTS_DIR"/batch_*.md "$RESULTS_DIR"/batch_*.log
@@ -65,22 +73,7 @@ done
 [ -d "$TEST_DIR/staging" ] && DIRS+=("staging/")
 [ -d "$TEST_DIR/intl402" ] && DIRS+=("intl402/")
 
-# Optional space-separated list of directory batches to skip (exact match
-# against the "built-ins/Name/" entries), e.g.
-#   EXCLUDE_DIRS="built-ins/Atomics/" bash scripts/test262-full-run.sh
-# Used to drop timeout-grinding subtrees (Atomics agent/wait tests) from a
-# conformance-gating run without losing the rest of the suite.
-if [ -n "${EXCLUDE_DIRS:-}" ]; then
-    FILTERED=()
-    for d in "${DIRS[@]}"; do
-        skip=0
-        for ex in $EXCLUDE_DIRS; do
-            [ "$d" = "$ex" ] && skip=1 && break
-        done
-        [ "$skip" -eq 0 ] && FILTERED+=("$d")
-    done
-    DIRS=("${FILTERED[@]}")
-fi
+# Full publication cannot exclude paths; use `run --filter` for targeted reports.
 
 TOTAL=${#DIRS[@]}
 echo "Found $TOTAL directory batches"
@@ -96,7 +89,8 @@ run_filter() {
     local log_file="$RESULTS_DIR/$stem.log"
     (
         ulimit -v "$ULIMIT_VIRTUAL_KB" 2>/dev/null || true
-        "$TEST262_BIN" run \
+        python3 scripts/test262-watchdog.py --seconds "$BATCH_TIMEOUT" -- "$TEST262_BIN" run \
+            --jobs 1 \
             --filter "^$prefix" \
             --timeout "$TIMEOUT_MS" \
             --max-heap-bytes "$MAX_HEAP_BYTES" \
@@ -117,7 +111,7 @@ describe_result() {
                 failed=$(grep -o '"failed":[[:space:]]*[0-9]*' "$batch_file" | head -1 | grep -o '[0-9]*$' || echo "?")
                 printf " ok (%s pass, %s fail)\n" "$passed" "$failed"
             else
-                printf " ok (no report — check %s)\n" "$log_file"
+                printf " FAILED (missing report — check %s)\n" "$log_file"
             fi
             ;;
         134|139|6)  printf " CRASHED (signal exit %d, see %s)\n" "$exit_code" "$log_file" ;;
@@ -145,8 +139,7 @@ for dir in "${DIRS[@]}"; do
 
     if is_crash_exit "$EXIT_CODE"; then
         # The whole batch report is lost on a native crash. Split one
-        # directory level deeper and retry so only the crashing
-        # subtree's results stay missing.
+        # directory level deeper and retry. Missing rows remain fatal at merge.
         rm -f "$RESULTS_DIR/$STEM.json"
         SUB=0
         # Subdirectories first...
@@ -159,7 +152,7 @@ for dir in "${DIRS[@]}"; do
             run_filter "$subrel" "$SUBSTEM"
             SUB_EXIT=$?
             describe_result "$SUB_EXIT" "$SUBSTEM"
-            if is_crash_exit "$SUB_EXIT"; then
+            if [ "$SUB_EXIT" -ne 0 ] && [ "$SUB_EXIT" -ne 1 ] || [ ! -f "$RESULTS_DIR/$SUBSTEM.json" ]; then
                 rm -f "$RESULTS_DIR/$SUBSTEM.json"
                 FAILED_BATCHES=$((FAILED_BATCHES + 1))
             fi
@@ -175,13 +168,21 @@ for dir in "${DIRS[@]}"; do
             run_filter "$subrel" "$SUBSTEM"
             SUB_EXIT=$?
             describe_result "$SUB_EXIT" "$SUBSTEM"
-            if is_crash_exit "$SUB_EXIT"; then
+            if [ "$SUB_EXIT" -ne 0 ] && [ "$SUB_EXIT" -ne 1 ] || [ ! -f "$RESULTS_DIR/$SUBSTEM.json" ]; then
                 rm -f "$RESULTS_DIR/$SUBSTEM.json"
                 FAILED_BATCHES=$((FAILED_BATCHES + 1))
             fi
         done
+    elif [ "$EXIT_CODE" -ne 0 ] && [ "$EXIT_CODE" -ne 1 ] || [ ! -f "$RESULTS_DIR/$STEM.json" ]; then
+        rm -f "$RESULTS_DIR/$STEM.json"
+        FAILED_BATCHES=$((FAILED_BATCHES + 1))
     fi
 done
+
+if [ "$FAILED_BATCHES" -gt 0 ]; then
+    echo "Refusing publication: $FAILED_BATCHES unresolved batch(es). Diagnostics retained in $RESULTS_DIR." >&2
+    exit 1
+fi
 
 echo ""
 echo "=== Merging batch results ==="
@@ -194,17 +195,13 @@ echo ""
 echo "=== Generating HTML dashboard ==="
 "$TEST262_BIN" site "$MERGED" --output "$RESULTS_DIR/site/index.html" || {
     echo "Site generation failed" >&2
+    exit 1
 }
 # Keep the doc-site dashboard data in sync so the published site
 # always renders the latest baseline.
-if [ -d docs/site/public/conformance ] && [ -f "$MERGED" ]; then
-    cp "$MERGED" docs/site/public/conformance/data.json
-    echo "Baseline copied to docs/site/public/conformance/data.json"
-fi
+mkdir -p docs/site/public/conformance || exit 1
+cp "$MERGED" docs/site/public/conformance/data.json || exit 1
+echo "Baseline copied to docs/site/public/conformance/data.json"
 
 echo ""
-if [ "$FAILED_BATCHES" -gt 0 ]; then
-    echo "Done (with $FAILED_BATCHES crashed sub-batch(es) — their results are missing). Results in $MERGED, dashboard in $RESULTS_DIR/site/index.html"
-else
-    echo "Done. Results in $MERGED, dashboard in $RESULTS_DIR/site/index.html"
-fi
+echo "Done. Complete canonical results in $MERGED, dashboard in $RESULTS_DIR/site/index.html"

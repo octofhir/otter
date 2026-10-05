@@ -3,7 +3,7 @@
 //! GC-managed [`super::shape_body::ShapeBody`] nodes stay immutable and contain
 //! only collector handles plus numeric layout metadata. This module owns the
 //! mutable runtime state around those nodes: string-key interning, transition
-//! reuse, and flattened offset caches. Keeping those tables off-GC mirrors the
+//! reuse, immutable state-variant reuse, and flattened offset caches. Keeping those tables off-GC mirrors the
 //! VM's single-mutator model while preserving a simple traced payload shape.
 //!
 //! # Contents
@@ -11,7 +11,7 @@
 //!   it creates the `null`-prototype root.
 //! - [`ShapeRuntime::new_root`] — a prototype's root and dictionary shapes.
 //! - [`ShapeRuntime::trace_roots`] — root walker for the strong handles: the
-//!   interned key strings and the shapes pinned for the current turn.
+//!   interned key strings and distinct shapes pinned for the current turn.
 //! - [`ShapeRuntime::sweep_dead`] — the full collection's weak pass over the
 //!   id and transition tables.
 //!
@@ -34,7 +34,7 @@
 //!   never resolve to it.
 //! - Every lineage starts at a prototype's root (V8's per-prototype initial
 //!   maps): the heap's embedder root slot keeps the `null`-prototype root
-//!   (`super::shape_body::null_root`), an ordinary prototype
+//!   (`super::shape_body::null_root_head`), an ordinary prototype
 //!   keeps its instances' root on itself, and a non-ordinary prototype's root
 //!   lives as long as the objects built from it.
 //! - No table borrow is held across an allocation — the collection it may
@@ -43,7 +43,9 @@
 //!   outermost turn ends: Rust code holds new shapes in locals across the
 //!   allocations that precede installing them into an object, and the pin
 //!   keeps every such window sound without rooting each local. Shapes
-//!   become collectable at the next full collection after their turn.
+//!   become collectable at the next full collection after their turn. Repeated
+//!   registration pins each stable shape identity once, so root traversal is
+//!   bounded by distinct shapes rather than allocation or lookup count.
 //! - Caches are derived data and can be cleared without semantic changes.
 //! - Shape bodies themselves remain mutation-free after allocation.
 //!
@@ -64,12 +66,12 @@ use crate::inspect::{ShapeTransitionEvent, ShapeTransitionObserver};
 use crate::property_atom::{AtomId, NameInterner};
 use crate::string::{JsStringHandle, JsStringId, alloc_flat_string_body_with_roots};
 
-use super::ShapeId;
 use super::descriptor::PropertyFlags;
 use super::shape_body::{
     ShapeBody, ShapeHandle, alloc_child_shape_body_with_roots, alloc_root_shape_body_with_roots,
     shape_atoms_ordered,
 };
+use super::{ShapeId, ShapeState};
 
 /// Record a root under its id. Its dictionary shape stays unnamed: every
 /// dictionary object of the lineage shares it whatever its keys, so no
@@ -109,8 +111,24 @@ struct WeakShapeTables {
     handles_by_id: FxHashMap<ShapeId, ShapeHandle>,
     transitions: FxHashMap<TransitionKey, ShapeHandle>,
     offset_cache: FxHashMap<ShapeId, FxHashMap<AtomId, u32>>,
-    /// Shapes created during the current outermost runtime turn — strong.
-    pinned: Vec<ShapeHandle>,
+    /// Rooted state variants are weak and keyed by stable source identity.
+    state_variants: FxHashMap<(ShapeId, ShapeState), ShapeHandle>,
+    /// Distinct shapes pinned during the current outermost turn, in first-pin order.
+    /// The stable id is only an index; the handle is the sole strong root slot.
+    pinned: indexmap::IndexMap<
+        ShapeId,
+        ShapeHandle,
+        std::hash::BuildHasherDefault<rustc_hash::FxHasher>,
+    >,
+}
+
+impl WeakShapeTables {
+    /// Retain a shape once per turn. Shapes are non-moving and their ids are
+    /// never reused; ending a turn clears this same strong-root authority.
+    fn pin(&mut self, heap: &GcHeap, shape: ShapeHandle) {
+        let id = heap.read_payload(shape, ShapeBody::id);
+        self.pinned.entry(id).or_insert(shape);
+    }
 }
 
 /// Mutable side tables for GC-managed hidden classes.
@@ -152,6 +170,9 @@ impl ShapeRuntime {
         let root = alloc_root_shape_body_with_roots(
             heap,
             super::shape_body::ShapePrototype::Null,
+            super::DEFAULT_INLINE_CAPACITY,
+            ShapeHandle::null(),
+            ShapeState::ORDINARY,
             &mut roots,
         )?;
         let mut tables = WeakShapeTables::default();
@@ -187,13 +208,39 @@ impl ShapeRuntime {
             .collect()
     }
 
-    /// Record `root` under its id when a heap-only path created it without
-    /// this runtime.
-    pub(crate) fn register_root(&self, heap: &GcHeap, root: ShapeHandle) {
-        let id = heap.read_payload(root, ShapeBody::id);
+    /// Register a live ordinary lineage created by a heap-only state producer.
+    /// Every entry stays weak after the current turn; dictionary IDs never name
+    /// ordinary layout assumptions. No payload or table borrow crosses allocation.
+    ///
+    /// A shape already pinned this turn was registered with its lineage (its
+    /// pin keeps every ancestor alive through the traced parent edges), so a
+    /// repeated registration is O(1) instead of a lineage walk.
+    pub(crate) fn register_shape(&self, heap: &GcHeap, shape: ShapeHandle) {
+        if !super::shape_body::is_dictionary_of(shape) {
+            let id = heap.read_payload(shape, ShapeBody::id);
+            let tables = self.tables.borrow();
+            if tables.pinned.get(&id) == Some(&shape)
+                && tables.handles_by_id.get(&id) == Some(&shape)
+            {
+                return;
+            }
+        }
+        let root = super::shape_body::lineage_root_of(heap, shape);
+        let dictionary = super::shape_body::dictionary_of(root);
         let mut tables = self.tables.borrow_mut();
-        if !tables.handles_by_id.contains_key(&id) {
-            register_root(heap, &mut tables, root);
+        register_root(heap, &mut tables, root);
+        tables.pin(heap, root);
+        tables.pin(heap, dictionary);
+        if super::shape_body::is_dictionary_of(shape) {
+            return;
+        }
+        let mut current = shape;
+        while !heap.read_payload(current, ShapeBody::is_root) {
+            tables
+                .handles_by_id
+                .insert(heap.read_payload(current, ShapeBody::id), current);
+            tables.pin(heap, current);
+            current = heap.read_payload(current, ShapeBody::parent);
         }
     }
 
@@ -203,18 +250,65 @@ impl ShapeRuntime {
         &self,
         heap: &mut GcHeap,
         prototype: super::shape_body::ShapePrototype,
+        inline_capacity: usize,
+        previous_layout_root: ShapeHandle,
+        state: ShapeState,
         external_visit: &mut RootSlotVisitor<'_>,
     ) -> Result<ShapeHandle, otter_gc::OutOfMemory> {
         let mut visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
             self.trace_roots(visitor);
             external_visit(visitor);
         };
-        let root = alloc_root_shape_body_with_roots(heap, prototype, &mut visit)?;
+        let root = alloc_root_shape_body_with_roots(
+            heap,
+            prototype,
+            inline_capacity,
+            previous_layout_root,
+            state,
+            &mut visit,
+        )?;
         let mut tables = self.tables.borrow_mut();
         register_root(heap, &mut tables, root);
         let dictionary = heap.read_payload(root, |body| body.dictionary(root));
-        tables.pinned.extend([root, dictionary]);
+        tables.pin(heap, root);
+        tables.pin(heap, dictionary);
         Ok(root)
+    }
+
+    /// Prepare a same-geometry immutable state variant without retaining a
+    /// table or payload borrow across allocation. Runtime IC eligibility and
+    /// native bakeability remain separate facts of the resulting shape.
+    pub(crate) fn state_with_roots(
+        &self,
+        heap: &mut GcHeap,
+        source: ShapeHandle,
+        state: ShapeState,
+        external_visit: &mut RootSlotVisitor<'_>,
+    ) -> Result<ShapeHandle, otter_gc::OutOfMemory> {
+        if super::shape_body::state_of(source) == state {
+            return Ok(source);
+        }
+        let source_id = heap.read_payload(source, ShapeBody::id);
+        if let Some(shape) = self
+            .tables
+            .borrow()
+            .state_variants
+            .get(&(source_id, state))
+            .copied()
+        {
+            return Ok(shape);
+        }
+        let mut visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
+            self.trace_roots(visitor);
+            external_visit(visitor);
+        };
+        let result = super::state_transition::prepare_state_shape(heap, source, state, &mut visit)?;
+        self.register_shape(heap, result);
+        self.tables
+            .borrow_mut()
+            .state_variants
+            .insert((source_id, state), result);
+        Ok(result)
     }
 
     /// Remove every side-table entry before heap teardown.
@@ -251,7 +345,7 @@ impl ShapeRuntime {
             let p = key.handle.as_ptr() as *mut RawGc;
             visitor(p);
         }
-        for shape in &self.tables.borrow().pinned {
+        for shape in self.tables.borrow().pinned.values() {
             // Shapes never move, so the slot is never rewritten.
             visitor(std::ptr::from_ref(shape).cast_mut().cast::<RawGc>());
         }
@@ -264,15 +358,15 @@ impl ShapeRuntime {
     }
 
     /// The full collection's weak pass: forget every shape the marking left
-    /// unreached, and return their compressed offsets so the owner can drop
-    /// every cache entry that names one before the sweep frees the cells.
-    pub(crate) fn sweep_dead(&self, heap: &GcHeap) -> FxHashSet<u32> {
+    /// unreached before the sweep frees the cells.
+    pub(crate) fn sweep_dead(&self, heap: &GcHeap) {
         let mut dead = FxHashSet::default();
         let mut tables = self.tables.borrow_mut();
         let WeakShapeTables {
             handles_by_id,
             transitions,
             offset_cache,
+            state_variants,
             ..
         } = &mut *tables;
         handles_by_id.retain(|_, shape| {
@@ -282,12 +376,14 @@ impl ShapeRuntime {
             }
             live
         });
+        state_variants.retain(|(source, _), result| {
+            handles_by_id.contains_key(source) && heap.is_marked(result.raw())
+        });
         if dead.is_empty() {
-            return dead;
+            return;
         }
         transitions.retain(|_, child| !dead.contains(&child.offset()));
         offset_cache.retain(|id, _| handles_by_id.contains_key(id));
-        dead
     }
 
     /// Resolve stable feedback identity back to the isolate-local GC handle.
@@ -418,7 +514,7 @@ impl ShapeRuntime {
         let mut tables = self.tables.borrow_mut();
         tables.handles_by_id.insert(child_id, child);
         tables.transitions.insert(transition_key, child);
-        tables.pinned.push(child);
+        tables.pin(heap, child);
         drop(tables);
         self.notify_observer(heap, parent_id, child, key, false);
         Ok(child)
@@ -503,8 +599,49 @@ mod tests {
     }
 
     #[test]
+    fn repeated_registration_pins_each_shape_once_and_reopens_after_a_turn() {
+        let mut heap = GcHeap::new().expect("heap");
+        let mut runtime = ShapeRuntime::new(&mut heap, Arc::default()).expect("runtime");
+        let root = super::super::shape_body::null_root(&heap);
+        let dictionary = super::super::shape_body::dictionary_of(root);
+        let mut roots = |_visitor: &mut dyn FnMut(*mut RawGc)| {};
+        let child = runtime
+            .child_with_roots(
+                &mut heap,
+                root,
+                "retained",
+                PropertyFlags::data_default(),
+                false,
+                &mut roots,
+            )
+            .expect("child");
+        for _ in 0..10_000 {
+            runtime.register_shape(&heap, child);
+            runtime.register_shape(&heap, dictionary);
+        }
+        let mut expected = [root, dictionary, child];
+        expected.sort_by_key(|shape| heap.read_payload(*shape, ShapeBody::id).raw());
+        let pinned = || {
+            let mut values: Vec<_> = runtime.tables.borrow().pinned.values().copied().collect();
+            values.sort_by_key(|shape| heap.read_payload(*shape, ShapeBody::id).raw());
+            values
+        };
+        assert_eq!(pinned(), expected);
+        let mut slots = 0;
+        runtime.trace_roots(&mut |_| slots += 1);
+        assert_eq!(slots, expected.len() + runtime.interned_key_count());
+        let dictionary_id = heap.read_payload(dictionary, ShapeBody::id);
+        assert!(runtime.handle_for_id(dictionary_id).is_none());
+
+        runtime.unpin_turn_shapes();
+        assert!(pinned().is_empty());
+        runtime.register_shape(&heap, child);
+        assert_eq!(pinned(), expected);
+    }
+
+    #[test]
     fn interpreter_roots_shape_runtime_across_force_gc() {
-        let mut interp = crate::Interpreter::new();
+        let mut interp = crate::Interpreter::new().expect("fixture interpreter bootstrap");
         let root = interp.null_prototype_root();
         let first = interp.shape_child(root, "x").expect("child");
         let first_id = interp.gc_heap.read_payload(first, ShapeBody::id);
@@ -521,23 +658,23 @@ mod tests {
 
     #[test]
     fn unnamed_shapes_are_collected_after_their_turn() {
-        let mut interp = crate::Interpreter::new();
+        let mut interp = crate::Interpreter::new().expect("fixture interpreter bootstrap");
         let root = interp.null_prototype_root();
         let unused = interp.shape_child(root, "only_in_tables").expect("child");
         let unused_id = interp.gc_heap.read_payload(unused, ShapeBody::id);
         let kept = interp.shape_child(root, "kept").expect("child");
         let kept_id = interp.gc_heap.read_payload(kept, ShapeBody::id);
         assert_ne!(kept_id, unused_id);
-        let object = interp
+        let mut object = interp
             .alloc_runtime_rooted_object_with_roots(&[], &[])
             .expect("object");
         interp
-            .set_property(object, "kept", crate::Value::boolean(true))
+            .create_data_property(&mut object, "kept", crate::Value::boolean(true))
             .expect("store");
         // The global object keeps the object, and so its shape, alive.
-        let global = interp.global_this;
+        let mut global = interp.global_this;
         interp
-            .set_property(global, "holder", crate::Value::object(object))
+            .create_data_property(&mut global, "holder", crate::Value::object(object))
             .expect("hold object");
 
         // Pinned while the (implicit) turn that created them is open.

@@ -14,6 +14,7 @@
 //! # Contents
 //! - [`ARRAY_PROTOTYPE_METHODS`] — JS-visible native method specs.
 //! - `native_array_method` — null/undefined guard then driver dispatch.
+//! - [`push`] — handle-scoped append and generic `Set` across slab growth.
 //! - `Interpreter::array_*` drivers for live generic Array semantics.
 //!
 //! # Invariants
@@ -22,6 +23,8 @@
 //! - Live drivers use VM property operations so accessors, inherited
 //!   indices, proxies, callbacks, and comparator calls re-enter through
 //!   the active [`ExecutionContext`].
+//! - Push receivers and every pending argument stay in handle slots through
+//!   slab growth, length coercions, and reentrant setters.
 //! - Species-created arrays and their receivers stay in the interpreter handle
 //!   arena across every allocating property operation.
 //! - Callback and comparator paths append above the current activation floor;
@@ -30,6 +33,13 @@
 //! - Pathological array-like lengths are guarded before any dense
 //!   materialisation.
 
+mod push;
+
+#[cfg(test)]
+mod species_rooting_tests;
+
+use crate::native_abi::CommittedValueError;
+use push::native_push;
 use smallvec::SmallVec;
 
 use otter_bytecode::Op;
@@ -558,9 +568,9 @@ pub(crate) fn install_array_well_knowns_post_bootstrap(
         native_values_iter,
         &[&global_root, &prototype_root],
     )
-    .map_err(|_| JsSurfaceError::OutOfMemory)?;
+    .map_err(JsSurfaceError::from)?;
     let values_value = Value::native_function(values_fn);
-    object::define_own_property_partial(
+    if !object::define_own_property_partial(
         &mut prototype,
         heap,
         "values",
@@ -571,8 +581,10 @@ pub(crate) fn install_array_well_knowns_post_bootstrap(
             configurable: Some(true),
             ..Default::default()
         },
-    );
-    object::define_own_symbol_property_partial(
+    )? {
+        return Err(JsSurfaceError::DefinePropertyFailed("[[BuiltinProperty]]"));
+    };
+    if !object::define_own_symbol_property_partial(
         &mut prototype,
         heap,
         well_known.get(WellKnown::Iterator),
@@ -583,7 +595,9 @@ pub(crate) fn install_array_well_knowns_post_bootstrap(
             configurable: Some(true),
             ..Default::default()
         },
-    );
+    )? {
+        return Err(JsSurfaceError::DefinePropertyFailed("[[SymbolProperty]]"));
+    };
     install_array_unscopables(heap, prototype, well_known)?;
     Ok(())
 }
@@ -620,10 +634,14 @@ fn install_array_unscopables(
     let prototype_root = Value::object(prototype);
     let mut list =
         crate::intrinsics::shared::alloc_object_with_value_roots_pub(heap, &[&prototype_root])
-            .map_err(|_| JsSurfaceError::OutOfMemory)?;
-    object::set_prototype(list, heap, None);
+            .map_err(JsSurfaceError::from)?;
+    if !object::set_prototype(&mut list, heap, None)? {
+        return Err(JsSurfaceError::DefinePropertyFailed(
+            "@@unscopables.[[Prototype]]",
+        ));
+    }
     for name in UNSCOPABLES {
-        object::define_own_property_partial(
+        if !object::define_own_property_partial(
             &mut list,
             heap,
             name,
@@ -634,9 +652,11 @@ fn install_array_unscopables(
                 configurable: Some(true),
                 ..Default::default()
             },
-        );
+        )? {
+            return Err(JsSurfaceError::DefinePropertyFailed("[[BuiltinProperty]]"));
+        };
     }
-    object::define_own_symbol_property_partial(
+    if !object::define_own_symbol_property_partial(
         &mut prototype,
         heap,
         well_known.get(WellKnown::Unscopables),
@@ -647,7 +667,9 @@ fn install_array_unscopables(
             configurable: Some(true),
             ..Default::default()
         },
-    );
+    )? {
+        return Err(JsSurfaceError::DefinePropertyFailed("[[SymbolProperty]]"));
+    };
     Ok(())
 }
 
@@ -694,7 +716,7 @@ fn native_array_method(
     ctx.with_turn_parts(|interp, stack| {
         interp
             .array_live_method_dispatch(stack, &exec, tag, receiver, args, &[args])
-            .map_err(|err| crate::native_function::vm_to_native_error(interp, err, name))
+            .map_err(|err| err.into_native(interp, name))
     })
 }
 macro_rules! native_array {
@@ -705,7 +727,6 @@ macro_rules! native_array {
     };
 }
 
-native_array!(native_push, "push");
 native_array!(native_pop, "pop");
 native_array!(native_shift, "shift");
 native_array!(native_unshift, "unshift");
@@ -927,7 +948,7 @@ pub(crate) fn length_of_array_like(
     stack: &mut ActivationStack,
     context: &ExecutionContext,
     o: &Value,
-) -> Result<usize, VmError> {
+) -> Result<usize, CommittedValueError> {
     if let Some(obj) = o.as_object()
         && let Some(s) = crate::object::string_data(obj, interp.gc_heap())
     {
@@ -955,6 +976,7 @@ pub(crate) fn length_of_array_like(
         len_val
     };
     crate::to_length(&len_val, interp.gc_heap())
+        .map_err(|error| CommittedValueError::JavaScript(error.into()))
 }
 
 /// §23.1.3.17 / §23.1.3.22 live search for `indexOf` and `lastIndexOf`.
@@ -966,7 +988,7 @@ pub(crate) fn array_linear_search(
     name: &str,
     search: Value,
     from_arg: Option<Value>,
-) -> Result<i64, VmError> {
+) -> Result<i64, CommittedValueError> {
     let anchor_base = interp.push_iteration_anchor(o) - 1;
     let search_anchor = interp.push_iteration_anchor(search) - 1;
     let has_from_arg = from_arg.is_some();
@@ -1001,7 +1023,7 @@ pub(crate) fn array_linear_search(
         let probe = |interp: &mut Interpreter,
                      stack: &mut ActivationStack,
                      k: i64|
-         -> Result<Option<i64>, VmError> {
+         -> Result<Option<i64>, CommittedValueError> {
             // String primitives / `String` wrappers expose code-unit indices
             // through `[[StringData]]`, which the ordinary `[[Get]]` /
             // `[[HasProperty]]` ladder may not surface.
@@ -1016,7 +1038,8 @@ pub(crate) fn array_linear_search(
                     return Ok(None);
                 };
                 let ch = crate::string::JsString::from_utf16_units(&[unit], interp.gc_heap_mut())
-                    .map(Value::string)?;
+                    .map(Value::string)
+                    .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
                 let search = interp.iteration_anchor(search_anchor);
                 return Ok(
                     if crate::abstract_ops::is_strictly_equal(&ch, &search, interp.gc_heap()) {
@@ -1029,7 +1052,7 @@ pub(crate) fn array_linear_search(
             let key = k.to_string();
             let has = interp.ordinary_has_property_value(
                 stack,
-                context,
+                Some(context),
                 o,
                 &crate::VmPropertyKey::String(&key),
                 0,
@@ -1092,7 +1115,7 @@ pub(crate) fn array_includes(
     o: Value,
     search: Value,
     from_arg: Option<Value>,
-) -> Result<bool, VmError> {
+) -> Result<bool, CommittedValueError> {
     let anchor_base = interp.push_iteration_anchor(o) - 1;
     let search_anchor = interp.push_iteration_anchor(search) - 1;
     let has_from_arg = from_arg.is_some();
@@ -1121,12 +1144,14 @@ pub(crate) fn array_includes(
             let v = interp.iteration_anchor(from_anchor);
             // §7.1.4 ToNumber — Symbol / BigInt fromIndex throws TypeError.
             if v.is_symbol() {
-                return Err(interp
-                    .err_type(("Cannot convert a Symbol value to a number".to_string()).into()));
+                return Err(CommittedValueError::JavaScript(interp.err_type(
+                    ("Cannot convert a Symbol value to a number".to_string()).into(),
+                )));
             }
             if v.is_big_int() {
-                return Err(interp
-                    .err_type(("Cannot convert a BigInt value to a number".to_string()).into()));
+                return Err(CommittedValueError::JavaScript(interp.err_type(
+                    ("Cannot convert a BigInt value to a number".to_string()).into(),
+                )));
             }
             let f = crate::number::parse::to_number_value(&v, interp.gc_heap());
             if f.is_nan() { 0.0 } else { f.trunc() }
@@ -1151,7 +1176,8 @@ pub(crate) fn array_includes(
                 match s.char_code_at(k as u32, interp.gc_heap()) {
                     Some(unit) => {
                         crate::string::JsString::from_utf16_units(&[unit], interp.gc_heap_mut())
-                            .map(Value::string)?
+                            .map(Value::string)
+                            .map_err(|error| CommittedValueError::JavaScript(error.into()))?
                     }
                     None => Value::undefined(),
                 }
@@ -1182,11 +1208,12 @@ impl Interpreter {
         search: Value,
         from_arg: Option<Value>,
         roots: &[&[Value]],
-    ) -> Result<Value, VmError> {
+    ) -> Result<Value, CommittedValueError> {
         let o = if receiver.is_object_type() {
             receiver
         } else {
-            self.box_sloppy_this_primitive_runtime_rooted(receiver, roots)?
+            self.box_sloppy_this_primitive_runtime_rooted(receiver, roots)
+                .map_err(|error| CommittedValueError::JavaScript(error.into()))?
         };
         if name == "includes" {
             let found = array_includes(self, stack, context, o, search, from_arg)?;
@@ -1206,7 +1233,7 @@ impl Interpreter {
         receiver: Value,
         args: &[Value],
         roots: &[&[Value]],
-    ) -> Result<Value, VmError> {
+    ) -> Result<Value, CommittedValueError> {
         // A primitive receiver is boxed up front: every arm below copies
         // argument Values out of `args`, and boxing allocates — a copy taken
         // before the box would carry a pre-move handle into the method. The
@@ -1225,7 +1252,7 @@ impl Interpreter {
                         .collect();
                     self.array_live_method_dispatch(stack, context, tag, boxed, &args_now, roots)
                 }
-                Err(err) => Err(err),
+                Err(err) => Err(CommittedValueError::JavaScript(err)),
             };
             self.pop_iteration_anchors_to(base);
             return outcome;
@@ -1287,9 +1314,15 @@ impl Interpreter {
                 let value = args.get(1).copied().unwrap_or_else(Value::undefined);
                 self.array_with(stack, context, receiver, index, value, roots)
             }
-            T::Keys => self.array_iterator_method(context, receiver, "keys", roots),
-            T::Values => self.array_iterator_method(context, receiver, "values", roots),
-            T::Entries => self.array_iterator_method(context, receiver, "entries", roots),
+            T::Keys => self
+                .array_iterator_method(context, receiver, "keys", roots)
+                .map_err(|error| CommittedValueError::JavaScript(error.into())),
+            T::Values => self
+                .array_iterator_method(context, receiver, "values", roots)
+                .map_err(|error| CommittedValueError::JavaScript(error.into())),
+            T::Entries => self
+                .array_iterator_method(context, receiver, "entries", roots)
+                .map_err(|error| CommittedValueError::JavaScript(error.into())),
         }
     }
 
@@ -1301,11 +1334,12 @@ impl Interpreter {
         receiver: Value,
         index: Value,
         roots: &[&[Value]],
-    ) -> Result<Value, VmError> {
+    ) -> Result<Value, CommittedValueError> {
         let o = if receiver.is_object_type() {
             receiver
         } else {
-            self.box_sloppy_this_primitive_runtime_rooted(receiver, roots)?
+            self.box_sloppy_this_primitive_runtime_rooted(receiver, roots)
+                .map_err(|error| CommittedValueError::JavaScript(error.into()))?
         };
         let len = length_of_array_like(self, stack, context, &o)?;
         let n = self.coerce_to_number(stack, context, &index)?.as_f64();
@@ -1334,11 +1368,12 @@ impl Interpreter {
         context: &ExecutionContext,
         receiver: Value,
         roots: &[&[Value]],
-    ) -> Result<Value, VmError> {
+    ) -> Result<Value, CommittedValueError> {
         let o = if receiver.is_object_type() {
             receiver
         } else {
-            self.box_sloppy_this_primitive_runtime_rooted(receiver, roots)?
+            self.box_sloppy_this_primitive_runtime_rooted(receiver, roots)
+                .map_err(|error| CommittedValueError::JavaScript(error.into()))?
         };
         let len = length_of_array_like(self, stack, context, &o)?;
         if len < 2 {
@@ -1389,11 +1424,12 @@ impl Interpreter {
         value: Value,
         args: &[Value],
         roots: &[&[Value]],
-    ) -> Result<Value, VmError> {
+    ) -> Result<Value, CommittedValueError> {
         let o = if receiver.is_object_type() {
             receiver
         } else {
-            self.box_sloppy_this_primitive_runtime_rooted(receiver, roots)?
+            self.box_sloppy_this_primitive_runtime_rooted(receiver, roots)
+                .map_err(|error| CommittedValueError::JavaScript(error.into()))?
         };
         let len = length_of_array_like(self, stack, context, &o)?;
         let start = self.array_relative_index(stack, context, args.get(1), 0.0, len)?;
@@ -1401,7 +1437,9 @@ impl Interpreter {
         let bounded_end = end.min(start.saturating_add(MAX_ARRAY_LIKE_PROBE_LEN));
         if let Some(arr) = o.as_array()
             && crate::array::can_fast_fill_dense_range(arr, self.gc_heap(), start, bounded_end)
-            && !self.array_prototype_chain_has_indexed_property(start, bounded_end)?
+            && !self
+                .array_prototype_chain_has_indexed_property(start, bounded_end)
+                .map_err(|error| CommittedValueError::JavaScript(error.into()))?
         {
             let receiver_root = o;
             let value_root = value;
@@ -1422,7 +1460,8 @@ impl Interpreter {
                 value,
                 &mut external_visit,
             )
-            .map_err(|_| self.err_range(("Invalid array length".to_string()).into()))?;
+            .map_err(|_| self.err_range(("Invalid array length".to_string()).into()))
+            .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
             return Ok(o);
         }
         for k in start..bounded_end {
@@ -1485,46 +1524,62 @@ impl Interpreter {
         receiver: Value,
         depth_arg: Value,
         roots: &[&[Value]],
-    ) -> Result<Value, VmError> {
-        let o = if receiver.is_object_type() {
-            receiver
-        } else {
-            self.box_sloppy_this_primitive_runtime_rooted(receiver, roots)?
-        };
-        let source_len =
-            length_of_array_like(self, stack, context, &o)?.min(MAX_ARRAY_LIKE_PROBE_LEN);
-        let depth = if depth_arg.is_undefined() {
-            1
-        } else {
-            let n = self.coerce_to_number(stack, context, &depth_arg)?.as_f64();
-            if n.is_nan() || n <= 0.0 {
-                0
-            } else if n.is_infinite() {
-                i64::MAX
+    ) -> Result<Value, CommittedValueError> {
+        self.with_handle_scope(|interp, scope| {
+            let receiver = interp.scoped_value(scope, receiver);
+            let depth_arg = interp.scoped_value(scope, depth_arg);
+            for values in roots {
+                for value in *values {
+                    let _argument = interp.scoped_value(scope, *value);
+                }
+            }
+            // ToObject, LengthOfArrayLike and depth coercion may collect or
+            // call user code. All pending inputs are rooted before the first
+            // operation and each value is resolved at its next point of use.
+            let current_receiver = interp.escape_scoped(receiver);
+            let o = if current_receiver.is_object_type() {
+                current_receiver
             } else {
-                n.trunc() as i64
-            }
-        };
-        // The species create runs a user constructor: `o` rides an anchor
-        // slot across it and is re-read before the flatten.
-        let o_slot = self.push_iteration_anchor(o) - 1;
-        let created = self.array_species_create(stack, context, o, 0, roots);
-        let o = self.iteration_anchor(o_slot);
-        let a = match created {
-            Ok(a) => a,
-            Err(err) => {
-                self.pop_iteration_anchors_to(o_slot);
-                return Err(err);
-            }
-        };
-        let a_slot = self.push_iteration_anchor(a) - 1;
-        let result = self.flatten_into_array(stack, context, a, o, source_len, 0, depth, None);
-        // The flatten allocates; re-read the result array from its anchor
-        // before popping so the returned handle is current.
-        let a = self.iteration_anchor(a_slot);
-        self.pop_iteration_anchors_to(o_slot);
-        result?;
-        Ok(a)
+                interp
+                    .box_sloppy_this_primitive_runtime_rooted(current_receiver, &[])
+                    .map_err(CommittedValueError::JavaScript)?
+            };
+            let o = interp.scoped_value(scope, o);
+            let source = interp.escape_scoped(o);
+            let source_len = length_of_array_like(interp, stack, context, &source)?
+                .min(MAX_ARRAY_LIKE_PROBE_LEN);
+            let current_depth = interp.escape_scoped(depth_arg);
+            let depth = if current_depth.is_undefined() {
+                1
+            } else {
+                let n = interp
+                    .coerce_to_number(stack, context, &current_depth)?
+                    .as_f64();
+                if n.is_nan() || n <= 0.0 {
+                    0
+                } else if n.is_infinite() {
+                    i64::MAX
+                } else {
+                    n.trunc() as i64
+                }
+            };
+            let source = interp.escape_scoped(o);
+            let target = interp.array_species_create(stack, context, source, 0, &[])?;
+            let target = interp.scoped_value(scope, target);
+            let current_target = interp.escape_scoped(target);
+            let current_source = interp.escape_scoped(o);
+            interp.flatten_into_array(
+                stack,
+                context,
+                current_target,
+                current_source,
+                source_len,
+                0,
+                depth,
+                None,
+            )?;
+            Ok(interp.escape_scoped(target))
+        })
     }
 
     /// §7.2.2 `IsArray`: an Array exotic object, or a non-revoked
@@ -1569,7 +1624,7 @@ impl Interpreter {
         start: usize,
         depth: i64,
         mapper: Option<(Value, Value)>,
-    ) -> Result<usize, VmError> {
+    ) -> Result<usize, CommittedValueError> {
         // 2^53 - 1: a CreateDataPropertyOrThrow target index past the
         // safe-integer limit is a §23.1.3.13.1 step 4.c.ii TypeError.
         const MAX_SAFE_INTEGER: f64 = 9_007_199_254_740_991.0;
@@ -1586,7 +1641,7 @@ impl Interpreter {
                 self.push_iteration_anchor(map_this) - 1,
             )
         });
-        let outcome = (|this: &mut Self| -> Result<usize, VmError> {
+        let outcome = (|this: &mut Self| -> Result<usize, CommittedValueError> {
             let mut target_index = start;
             for source_index in 0..source_len {
                 let key = format_index_key(source_index as f64);
@@ -1597,7 +1652,7 @@ impl Interpreter {
                 let source = this.iteration_anchor(source_slot);
                 let element = this.array_method_get_property(stack, context, source, &key)?;
                 let element_slot = this.push_iteration_anchor(element) - 1;
-                let step = (|this: &mut Self| -> Result<(), VmError> {
+                let step = (|this: &mut Self| -> Result<(), CommittedValueError> {
                     if let Some((mapper_fn_slot, map_this_slot)) = mapper_slots {
                         let mapper_fn = this.iteration_anchor(mapper_fn_slot);
                         let map_this = this.iteration_anchor(map_this_slot);
@@ -1608,13 +1663,23 @@ impl Interpreter {
                             Value::number_f64(source_index as f64),
                             source,
                         ];
-                        let mapped = this.run_callable_sync_rooted(
-                            stack, context, &mapper_fn, map_this, cb_args,
-                        )?;
+                        let mapped = this
+                            .run_callable_sync_rooted(
+                                stack,
+                                Some(context),
+                                &mapper_fn,
+                                map_this,
+                                cb_args,
+                            )
+                            .map_err(CommittedValueError::completed_call)?;
                         this.set_iteration_anchor(element_slot, mapped);
                     }
                     let element = this.iteration_anchor(element_slot);
-                    if depth > 0 && this.is_array_spec(&element)? {
+                    if depth > 0
+                        && this
+                            .is_array_spec(&element)
+                            .map_err(|error| CommittedValueError::JavaScript(error.into()))?
+                    {
                         let element = this.iteration_anchor(element_slot);
                         let element_len = length_of_array_like(this, stack, context, &element)?
                             .min(MAX_ARRAY_LIKE_PROBE_LEN);
@@ -1632,9 +1697,12 @@ impl Interpreter {
                         )?;
                     } else {
                         if target_index as f64 >= MAX_SAFE_INTEGER {
-                            return Err(this.err_type(
-                                ("flatten target index exceeds maximum safe integer".to_string())
+                            return Err(CommittedValueError::JavaScript(
+                                this.err_type(
+                                    ("flatten target index exceeds maximum safe integer"
+                                        .to_string())
                                     .into(),
+                                ),
                             ));
                         }
                         let target = this.iteration_anchor(target_slot);
@@ -1743,12 +1811,13 @@ impl Interpreter {
         receiver: Value,
         separator_arg: Option<Value>,
         roots: &[&[Value]],
-    ) -> Result<Value, VmError> {
+    ) -> Result<Value, CommittedValueError> {
         // §23.1.3.16 step 1 — O = ToObject(this value).
         let mut o = if receiver.is_object_type() {
             receiver
         } else {
-            self.box_sloppy_this_primitive_runtime_rooted(receiver, roots)?
+            self.box_sloppy_this_primitive_runtime_rooted(receiver, roots)
+                .map_err(|error| CommittedValueError::JavaScript(error.into()))?
         };
         // `undefined` and an absent separator both select ",".
         let mut separator_value = separator_arg.unwrap_or(Value::undefined());
@@ -1779,7 +1848,10 @@ impl Interpreter {
         // multi-gigabyte parts buffer.
         let cap = len.min(MAX_ARRAY_LIKE_PROBE_LEN);
         if cap == 0 {
-            return Ok(Value::string(JsString::from_str("", self.gc_heap_mut())?));
+            return Ok(Value::string(
+                JsString::from_str("", self.gc_heap_mut())
+                    .map_err(|error| CommittedValueError::JavaScript(error.into()))?,
+            ));
         }
         // §23.1.3.16 steps 4-8 visit EVERY index 0..len through
         // `[[Get]]` — a pre-collected present-index walk is unsound
@@ -1860,10 +1932,10 @@ impl Interpreter {
             }
             joined.extend_from_slice(part);
         }
-        Ok(Value::string(JsString::from_utf16_units(
-            &joined,
-            self.gc_heap_mut(),
-        )?))
+        Ok(Value::string(
+            JsString::from_utf16_units(&joined, self.gc_heap_mut())
+                .map_err(|error| CommittedValueError::JavaScript(error.into()))?,
+        ))
     }
 
     /// §23.1.3.36 `Array.prototype.toString`. Reads `Get(O, "join")`
@@ -1877,15 +1949,18 @@ impl Interpreter {
         context: &ExecutionContext,
         receiver: Value,
         roots: &[&[Value]],
-    ) -> Result<Value, VmError> {
+    ) -> Result<Value, CommittedValueError> {
         let o = if receiver.is_object_type() {
             receiver
         } else {
-            self.box_sloppy_this_primitive_runtime_rooted(receiver, roots)?
+            self.box_sloppy_this_primitive_runtime_rooted(receiver, roots)
+                .map_err(|error| CommittedValueError::JavaScript(error.into()))?
         };
         let func = self.get_property_value_for_call(stack, context, o, "join")?;
         if self.is_callable_runtime(&func) {
-            return self.run_callable_sync_rooted(stack, context, &func, o, SmallVec::new());
+            return self
+                .run_callable_sync_rooted(stack, Some(context), &func, o, SmallVec::new())
+                .map_err(CommittedValueError::completed_call);
         }
         self.ordinary_object_to_string(stack, context, o)
     }
@@ -1898,30 +1973,45 @@ impl Interpreter {
         stack: &mut ActivationStack,
         context: &ExecutionContext,
         o: Value,
-    ) -> Result<Value, VmError> {
-        let tag_sym = self.well_known_symbols().get(WellKnown::ToStringTag);
-        let explicit = match self.ordinary_get_value(
-            stack,
-            context,
-            o,
-            o,
-            &crate::VmPropertyKey::Symbol(tag_sym),
-            0,
-        )? {
-            crate::VmGetOutcome::Value(v) => v,
-            crate::VmGetOutcome::InvokeGetter { getter } => {
-                self.run_callable_sync_rooted(stack, context, &getter, o, SmallVec::new())?
-            }
-        };
-        let tag = explicit
-            .as_string(self.gc_heap())
-            .map(|s| s.to_lossy_string(self.gc_heap()))
-            .unwrap_or_else(|| crate::object_statics::builtin_to_string_tag_value(o, self));
-        let display = format!("[object {tag}]");
-        Ok(Value::string(JsString::from_str(
-            &display,
-            self.gc_heap_mut(),
-        )?))
+    ) -> Result<Value, CommittedValueError> {
+        self.with_handle_scope(|interp, scope| {
+            let receiver_root = interp.scoped_value(scope, o);
+
+            let tag_sym = interp.well_known_symbols().get(WellKnown::ToStringTag);
+            let explicit = match interp.ordinary_get_value(
+                stack,
+                Some(context),
+                o,
+                o,
+                &crate::VmPropertyKey::Symbol(tag_sym),
+                0,
+            )? {
+                crate::VmGetOutcome::Value(v) => v,
+                crate::VmGetOutcome::InvokeGetter { getter } => interp
+                    .run_callable_sync_rooted(
+                        stack,
+                        Some(context),
+                        &getter,
+                        interp.escape_scoped(receiver_root),
+                        SmallVec::new(),
+                    )
+                    .map_err(CommittedValueError::completed_call)?,
+            };
+            let tag = explicit
+                .as_string(interp.gc_heap())
+                .map(|s| s.to_lossy_string(interp.gc_heap()))
+                .unwrap_or_else(|| {
+                    crate::object_statics::builtin_to_string_tag_value(
+                        interp.escape_scoped(receiver_root),
+                        interp,
+                    )
+                });
+            let display = format!("[object {tag}]");
+            Ok(Value::string(
+                JsString::from_str(&display, interp.gc_heap_mut())
+                    .map_err(|error| CommittedValueError::JavaScript(error.into()))?,
+            ))
+        })
     }
 
     /// §23.1.3.32 `Array.prototype.toLocaleString`. Unlike `toString`
@@ -1938,67 +2028,106 @@ impl Interpreter {
         receiver: Value,
         args: &[Value],
         roots: &[&[Value]],
-    ) -> Result<Value, VmError> {
-        // step 1 — array = ? ToObject(this value).
-        let o = if receiver.is_object_type() {
-            receiver
-        } else {
-            self.box_sloppy_this_primitive_runtime_rooted(receiver, roots)?
-        };
-        // step 2 — len = ? LengthOfArrayLike(array).
-        let len = length_of_array_like(self, stack, context, &o)?;
-        // The list separator is implementation-defined; ECMA-402 absent,
-        // use "," so `["",""].toLocaleString()` reports it consistently.
-        const SEPARATOR: &str = ",";
-        let cap = len.min(MAX_ARRAY_LIKE_PROBE_LEN);
-        let mut r = String::new();
-        for k in 0..cap {
-            if k > 0 {
-                r.push_str(SEPARATOR);
-            }
-            // step 12.b — element = ? Get(array, ToString(k)).
-            let element = self.get_property_value_for_call(stack, context, o, &k.to_string())?;
-            if element.is_undefined() || element.is_null() {
-                continue;
-            }
-            // step 12.e — Invoke(element, "toLocaleString"): GetV resolves
-            // the method (boxing a primitive only for the lookup), then
-            // Call passes the original element as `this`.
-            let method = match self.ordinary_get_value(
-                stack,
-                context,
-                element,
-                element,
-                &crate::VmPropertyKey::String("toLocaleString"),
-                0,
-            )? {
-                crate::VmGetOutcome::Value(v) => v,
-                crate::VmGetOutcome::InvokeGetter { getter } => self.run_callable_sync_rooted(
+    ) -> Result<Value, CommittedValueError> {
+        self.with_handle_scope(|interp, scope| {
+            let receiver_root = interp.scoped_value(scope, receiver);
+            let argument_roots: Vec<_> = args
+                .iter()
+                .map(|value| interp.scoped_value(scope, *value))
+                .collect();
+
+            // step 1 — array = ? ToObject(this value).
+            let o = if receiver.is_object_type() {
+                receiver
+            } else {
+                interp
+                    .box_sloppy_this_primitive_runtime_rooted(
+                        interp.escape_scoped(receiver_root),
+                        roots,
+                    )
+                    .map_err(|error| CommittedValueError::JavaScript(error.into()))?
+            };
+            let array_root = interp.scoped_value(scope, o);
+            // step 2 — len = ? LengthOfArrayLike(array).
+            let current_array = interp.escape_scoped(array_root);
+            let len = length_of_array_like(interp, stack, context, &current_array)?;
+            // The list separator is implementation-defined; ECMA-402 absent,
+            // use "," so `["",""].toLocaleString()` reports it consistently.
+            const SEPARATOR: &str = ",";
+            let cap = len.min(MAX_ARRAY_LIKE_PROBE_LEN);
+            let mut r = String::new();
+            for k in 0..cap {
+                if k > 0 {
+                    r.push_str(SEPARATOR);
+                }
+                // step 12.b — element = ? Get(array, ToString(k)).
+                let element = interp.get_property_value_for_call(
                     stack,
                     context,
-                    &getter,
+                    interp.escape_scoped(array_root),
+                    &k.to_string(),
+                )?;
+                if element.is_undefined() || element.is_null() {
+                    continue;
+                }
+                let element_root = interp.scoped_value(scope, element);
+                // step 12.e — Invoke(element, "toLocaleString"): GetV resolves
+                // the method (boxing a primitive only for the lookup), then
+                // Call passes the original element as `this`.
+                let method = match interp.ordinary_get_value(
+                    stack,
+                    Some(context),
                     element,
-                    SmallVec::new(),
-                )?,
-            };
-            if !crate::abstract_ops::is_callable(&method) {
-                return Err(
-                    self.err_type(("element's toLocaleString is not callable".to_string()).into())
-                );
+                    element,
+                    &crate::VmPropertyKey::String("toLocaleString"),
+                    0,
+                )? {
+                    crate::VmGetOutcome::Value(v) => v,
+                    crate::VmGetOutcome::InvokeGetter { getter } => interp
+                        .run_callable_sync_rooted(
+                            stack,
+                            Some(context),
+                            &getter,
+                            interp.escape_scoped(element_root),
+                            SmallVec::new(),
+                        )
+                        .map_err(CommittedValueError::completed_call)?,
+                };
+                if !crate::abstract_ops::is_callable(&method) {
+                    return Err(CommittedValueError::JavaScript(interp.err_type(
+                        ("element's toLocaleString is not callable".to_string()).into(),
+                    )));
+                }
+                // ECMA-402 §18.5.1 — the locales and options arguments are
+                // forwarded to each element's toLocaleString, always as two
+                // arguments (absent ones read as undefined).
+                let forwarded: SmallVec<[Value; 8]> = smallvec::smallvec![
+                    argument_roots
+                        .first()
+                        .map(|root| interp.escape_scoped(*root))
+                        .unwrap_or(Value::undefined()),
+                    argument_roots
+                        .get(1)
+                        .map(|root| interp.escape_scoped(*root))
+                        .unwrap_or(Value::undefined()),
+                ];
+                let result = interp
+                    .run_callable_sync_rooted(
+                        stack,
+                        Some(context),
+                        &method,
+                        interp.escape_scoped(element_root),
+                        forwarded,
+                    )
+                    .map_err(CommittedValueError::completed_call)?;
+                let s = interp.coerce_to_string(stack, context, &result)?;
+                r.push_str(&s);
             }
-            // ECMA-402 §18.5.1 — the locales and options arguments are
-            // forwarded to each element's toLocaleString, always as two
-            // arguments (absent ones read as undefined).
-            let forwarded: SmallVec<[Value; 8]> = smallvec::smallvec![
-                args.first().copied().unwrap_or(Value::undefined()),
-                args.get(1).copied().unwrap_or(Value::undefined()),
-            ];
-            let result =
-                self.run_callable_sync_rooted(stack, context, &method, element, forwarded)?;
-            let s = self.coerce_to_string(stack, context, &result)?;
-            r.push_str(&s);
-        }
-        Ok(Value::string(JsString::from_str(&r, self.gc_heap_mut())?))
+            Ok(Value::string(
+                JsString::from_str(&r, interp.gc_heap_mut())
+                    .map_err(|error| CommittedValueError::JavaScript(error.into()))?,
+            ))
+        })
     }
 
     /// §22.1.3.10.1 IsConcatSpreadable(O): a non-object is never spread;
@@ -2009,36 +2138,44 @@ impl Interpreter {
         stack: &mut ActivationStack,
         context: &ExecutionContext,
         e: Value,
-    ) -> Result<bool, VmError> {
-        if !e.is_object_type() {
-            return Ok(false);
-        }
-        let sym = self.well_known_symbols.get(WellKnown::IsConcatSpreadable);
-        let spread = match self.ordinary_get_value(
-            stack,
-            context,
-            e,
-            e,
-            &crate::VmPropertyKey::Symbol(sym),
-            0,
-        )? {
-            crate::VmGetOutcome::Value(v) => v,
-            crate::VmGetOutcome::InvokeGetter { getter } => self.run_callable_sync_rooted(
+    ) -> Result<bool, CommittedValueError> {
+        self.with_handle_scope(|interp, scope| {
+            let receiver_root = interp.scoped_value(scope, e);
+
+            if !e.is_object_type() {
+                return Ok(false);
+            }
+            let sym = interp.well_known_symbols.get(WellKnown::IsConcatSpreadable);
+            let spread = match interp.ordinary_get_value(
                 stack,
-                context,
-                &getter,
+                Some(context),
                 e,
-                smallvec::SmallVec::new(),
-            )?,
-        };
-        if spread.is_undefined() {
-            // §22.1.3.1.1 step 3 — fall back to IsArray(O), which per
-            // §7.2.2 unwraps a Proxy to its target (throwing for a
-            // revoked proxy) rather than only matching a bare Array.
-            self.is_array_spec(&e)
-        } else {
-            Ok(spread.to_boolean(self.gc_heap()))
-        }
+                e,
+                &crate::VmPropertyKey::Symbol(sym),
+                0,
+            )? {
+                crate::VmGetOutcome::Value(v) => v,
+                crate::VmGetOutcome::InvokeGetter { getter } => interp
+                    .run_callable_sync_rooted(
+                        stack,
+                        Some(context),
+                        &getter,
+                        interp.escape_scoped(receiver_root),
+                        smallvec::SmallVec::new(),
+                    )
+                    .map_err(CommittedValueError::completed_call)?,
+            };
+            if spread.is_undefined() {
+                // §22.1.3.1.1 step 3 — fall back to IsArray(O), which per
+                // §7.2.2 unwraps a Proxy to its target (throwing for a
+                // revoked proxy) rather than only matching a bare Array.
+                interp
+                    .is_array_spec(&interp.escape_scoped(receiver_root))
+                    .map_err(|error| CommittedValueError::JavaScript(error.into()))
+            } else {
+                Ok(spread.to_boolean(interp.gc_heap()))
+            }
+        })
     }
 
     /// §23.1.3.1 concat loop body, appending directly onto the
@@ -2060,7 +2197,7 @@ impl Interpreter {
         e_anchor: usize,
         a_anchor: usize,
         mut n: u64,
-    ) -> Result<u64, VmError> {
+    ) -> Result<u64, CommittedValueError> {
         const MAX_SAFE: f64 = 9_007_199_254_740_991.0;
         const TOO_LONG: &str = "concatenated array length exceeds the maximum safe integer";
         let e = self.iteration_anchor(e_anchor);
@@ -2068,14 +2205,16 @@ impl Interpreter {
             let e = self.iteration_anchor(e_anchor);
             let len = length_of_array_like(self, stack, context, &e)? as u64;
             if (n as f64) + (len as f64) > MAX_SAFE {
-                return Err(self.err_type(TOO_LONG.to_string().into()));
+                return Err(CommittedValueError::JavaScript(
+                    self.err_type(TOO_LONG.to_string().into()),
+                ));
             }
             for k in 0..len {
                 let key = k.to_string();
                 let e = self.iteration_anchor(e_anchor);
                 if self.ordinary_has_property_value(
                     stack,
-                    context,
+                    Some(context),
                     e,
                     &crate::VmPropertyKey::String(&key),
                     0,
@@ -2089,7 +2228,9 @@ impl Interpreter {
             }
         } else {
             if n as f64 >= MAX_SAFE {
-                return Err(self.err_type(TOO_LONG.to_string().into()));
+                return Err(CommittedValueError::JavaScript(
+                    self.err_type(TOO_LONG.to_string().into()),
+                ));
             }
             let e = self.iteration_anchor(e_anchor);
             let a = self.iteration_anchor(a_anchor);
@@ -2107,45 +2248,60 @@ impl Interpreter {
         receiver: Value,
         args: &[Value],
         roots: &[&[Value]],
-    ) -> Result<Value, VmError> {
-        let o = if receiver.is_object_type() {
-            receiver
-        } else {
-            self.box_sloppy_this_primitive_runtime_rooted(receiver, roots)?
-        };
-        // §23.1.3.1 step 2 — A = ArraySpeciesCreate(O, 0) runs (and its
-        // observable `@@species` lookup / construction) before any
-        // element is read; elements are then appended via
-        // CreateDataProperty so a custom species object / proxy
-        // observes each define.
-        // Anchor the receiver, every argument, and (below) the species
-        // result: each append step is reentrant and allocating, so a moving
-        // scavenge relocates any of them; the anchors are collector-rewritten
-        // slots the loop re-reads.
-        let o_anchor = self.push_iteration_anchor(o) - 1;
-        for &item in args {
-            self.push_iteration_anchor(item);
-        }
-        let a = self.array_species_create(stack, context, o, 0, roots)?;
-        let a_anchor = self.push_iteration_anchor(a) - 1;
-        let result = (|| {
-            let mut n: u64 = self.concat_append_to(stack, context, o_anchor, a_anchor, 0)?;
-            for index in 0..args.len() {
-                n = self.concat_append_to(stack, context, o_anchor + 1 + index, a_anchor, n)?;
+    ) -> Result<Value, CommittedValueError> {
+        self.with_handle_scope(|interp, scope| {
+            let receiver = interp.scoped_value(scope, receiver);
+            let arguments: Vec<_> = args
+                .iter()
+                .map(|value| interp.scoped_value(scope, *value))
+                .collect();
+            for values in roots {
+                for value in *values {
+                    let _argument = interp.scoped_value(scope, *value);
+                }
             }
-            // §23.1.3.1 step 4 — Set(A, "length", n).
-            let a = self.iteration_anchor(a_anchor);
-            self.array_set_property_throwing(
-                stack,
-                context,
-                a,
-                "length",
-                Value::number(NumberValue::from_f64(n as f64)),
-            )?;
-            Ok(self.iteration_anchor(a_anchor))
-        })();
-        self.pop_iteration_anchors_to(o_anchor);
-        result
+            let current_receiver = interp.escape_scoped(receiver);
+            let o = if current_receiver.is_object_type() {
+                current_receiver
+            } else {
+                interp
+                    .box_sloppy_this_primitive_runtime_rooted(current_receiver, &[])
+                    .map_err(CommittedValueError::JavaScript)?
+            };
+            // The established concat loop consumes anchor indices. Keep its
+            // entire species/append/length extent inside the cleanup outcome,
+            // including an abrupt species lookup or constructor completion.
+            let o_anchor = interp.push_iteration_anchor(o) - 1;
+            for argument in &arguments {
+                interp.push_iteration_anchor(interp.escape_scoped(*argument));
+            }
+            let result = (|| {
+                let current_receiver = interp.iteration_anchor(o_anchor);
+                let a = interp.array_species_create(stack, context, current_receiver, 0, &[])?;
+                let a_anchor = interp.push_iteration_anchor(a) - 1;
+                let mut n = interp.concat_append_to(stack, context, o_anchor, a_anchor, 0)?;
+                for index in 0..arguments.len() {
+                    n = interp.concat_append_to(
+                        stack,
+                        context,
+                        o_anchor + 1 + index,
+                        a_anchor,
+                        n,
+                    )?;
+                }
+                let a = interp.iteration_anchor(a_anchor);
+                interp.array_set_property_throwing(
+                    stack,
+                    context,
+                    a,
+                    "length",
+                    Value::number(NumberValue::from_f64(n as f64)),
+                )?;
+                Ok(interp.iteration_anchor(a_anchor))
+            })();
+            interp.pop_iteration_anchors_to(o_anchor);
+            result
+        })
     }
 
     /// §23.1.3.30.1 SortCompare(x, y, comparefn). `undefined` sorts to
@@ -2159,7 +2315,7 @@ impl Interpreter {
         y_anchor: usize,
         comparefn_anchor: usize,
         fast_path: Option<SortComparatorFastPath>,
-    ) -> Result<std::cmp::Ordering, VmError> {
+    ) -> Result<std::cmp::Ordering, CommittedValueError> {
         use std::cmp::Ordering;
         let x = self.iteration_anchor(x_anchor);
         let y = self.iteration_anchor(y_anchor);
@@ -2182,13 +2338,15 @@ impl Interpreter {
                 return Ok(order);
             }
             let args: smallvec::SmallVec<[Value; 8]> = smallvec::smallvec![x, y];
-            let r = self.run_callable_sync_rooted(
-                stack,
-                context,
-                &comparefn,
-                Value::undefined(),
-                args,
-            )?;
+            let r = self
+                .run_callable_sync_rooted(
+                    stack,
+                    Some(context),
+                    &comparefn,
+                    Value::undefined(),
+                    args,
+                )
+                .map_err(CommittedValueError::completed_call)?;
             let f = if let Some(f) = r.as_f64() {
                 f
             } else {
@@ -2233,7 +2391,7 @@ impl Interpreter {
         items: Vec<usize>,
         comparefn_anchor: usize,
         fast_path: Option<SortComparatorFastPath>,
-    ) -> Result<Vec<usize>, VmError> {
+    ) -> Result<Vec<usize>, CommittedValueError> {
         use std::cmp::Ordering;
         let n = items.len();
         if n <= 1 {
@@ -2321,12 +2479,12 @@ impl Interpreter {
         receiver: Value,
         comparefn: Value,
         roots: &[&[Value]],
-    ) -> Result<Value, VmError> {
+    ) -> Result<Value, CommittedValueError> {
         // §23.1.3.30 step 1 — comparefn must be undefined or callable.
         if !comparefn.is_undefined() && !self.is_callable_runtime(&comparefn) {
-            return Err(self.err_type(
+            return Err(CommittedValueError::JavaScript(self.err_type(
                 ("Array.prototype.sort comparator is not a function".to_string()).into(),
-            ));
+            )));
         }
         // Root the comparator before boxing a primitive receiver: wrapper
         // allocation can scavenge a young closure before `O` exists.
@@ -2336,6 +2494,7 @@ impl Interpreter {
             Ok(receiver)
         } else {
             self.box_sloppy_this_primitive_runtime_rooted(receiver, roots)
+                .map_err(|error| CommittedValueError::JavaScript(error.into()))
         };
         let o = match o {
             Ok(o) => o,
@@ -2362,7 +2521,7 @@ impl Interpreter {
                 let o = self.iteration_anchor(o_anchor);
                 if self.ordinary_has_property_value(
                     stack,
-                    context,
+                    Some(context),
                     o,
                     &crate::VmPropertyKey::String(&key),
                     0,
@@ -2393,9 +2552,9 @@ impl Interpreter {
                     true
                 };
                 if !ok {
-                    return Err(self.err_type(
+                    return Err(CommittedValueError::JavaScript(self.err_type(
                         (format!("Cannot assign to read only property '{key}' during sort")).into(),
-                    ));
+                    )));
                 }
             }
             for k in item_count..cap {
@@ -2409,8 +2568,9 @@ impl Interpreter {
                     0,
                 )?;
                 if !deleted {
-                    return Err(self
-                        .err_type((format!("Cannot delete property '{key}' during sort")).into()));
+                    return Err(CommittedValueError::JavaScript(self.err_type(
+                        (format!("Cannot delete property '{key}' during sort")).into(),
+                    )));
                 }
             }
             Ok(self.iteration_anchor(o_anchor))
@@ -2427,12 +2587,12 @@ impl Interpreter {
         context: &ExecutionContext,
         o: Value,
         len: f64,
-    ) -> Result<(), VmError> {
+    ) -> Result<(), CommittedValueError> {
         if let Some(arr) = o.as_array() {
             if !crate::array::length_writable(arr, self.gc_heap()) {
-                return Err(self.err_type(
+                return Err(CommittedValueError::JavaScript(self.err_type(
                     ("Cannot assign to read only property 'length' of object".to_string()).into(),
-                ));
+                )));
             }
         } else {
             return self.array_set_property_throwing(
@@ -2455,9 +2615,9 @@ impl Interpreter {
         if ok {
             Ok(())
         } else {
-            Err(self.err_type(
+            Err(CommittedValueError::JavaScript(self.err_type(
                 ("Cannot assign to read only property 'length' of object".to_string()).into(),
-            ))
+            )))
         }
     }
 
@@ -2468,23 +2628,26 @@ impl Interpreter {
         o: Value,
         key: &str,
         value: Value,
-    ) -> Result<(), VmError> {
+    ) -> Result<(), CommittedValueError> {
         if let Some(arr) = o.as_array()
             && crate::object::array_index_property_name(key).is_some()
             && crate::array::get_named_property(arr, self.gc_heap(), key).is_none()
         {
-            let proto = self.constructor_prototype_value("Array")?;
+            let proto = self
+                .constructor_prototype_value("Array")
+                .map_err(|error| CommittedValueError::Fatal(error.into()))?;
             if let Some(proto) = proto.as_object() {
                 match crate::object::resolve_set(proto, self.gc_heap(), key) {
                     crate::object::SetOutcome::InvokeSetter { setter } => {
                         let args: SmallVec<[Value; 8]> = smallvec::smallvec![value];
-                        self.run_callable_sync_rooted(stack, context, &setter, o, args)?;
+                        self.run_callable_sync_rooted(stack, Some(context), &setter, o, args)
+                            .map_err(CommittedValueError::completed_call)?;
                         return Ok(());
                     }
                     crate::object::SetOutcome::Reject { .. } => {
-                        return Err(
-                            self.err_type((format!("Cannot assign to property '{key}'")).into())
-                        );
+                        return Err(CommittedValueError::JavaScript(
+                            self.err_type((format!("Cannot assign to property '{key}'")).into()),
+                        ));
                     }
                     crate::object::SetOutcome::AssignData => {}
                     // ordinary_set_data_value below dispatches
@@ -2497,13 +2660,14 @@ impl Interpreter {
             match crate::object::resolve_set(obj, self.gc_heap(), key) {
                 crate::object::SetOutcome::InvokeSetter { setter } => {
                     let args: SmallVec<[Value; 8]> = smallvec::smallvec![value];
-                    self.run_callable_sync_rooted(stack, context, &setter, o, args)?;
+                    self.run_callable_sync_rooted(stack, Some(context), &setter, o, args)
+                        .map_err(CommittedValueError::completed_call)?;
                     return Ok(());
                 }
                 crate::object::SetOutcome::Reject { .. } => {
-                    return Err(
-                        self.err_type((format!("Cannot assign to property '{key}'")).into())
-                    );
+                    return Err(CommittedValueError::JavaScript(
+                        self.err_type((format!("Cannot assign to property '{key}'")).into()),
+                    ));
                 }
                 crate::object::SetOutcome::AssignData => {}
                 crate::object::SetOutcome::ExoticParent { .. } => {}
@@ -2521,9 +2685,9 @@ impl Interpreter {
         if ok {
             Ok(())
         } else {
-            Err(self.err_type(
+            Err(CommittedValueError::JavaScript(self.err_type(
                 (format!("Cannot assign to read only property '{key}' of object")).into(),
-            ))
+            )))
         }
     }
 
@@ -2533,13 +2697,15 @@ impl Interpreter {
         context: &ExecutionContext,
         o: Value,
         key: &str,
-    ) -> Result<(), VmError> {
+    ) -> Result<(), CommittedValueError> {
         let deleted =
             self.ordinary_delete_value(stack, context, o, &crate::VmPropertyKey::String(key), 0)?;
         if deleted {
             Ok(())
         } else {
-            Err(self.err_type((format!("Cannot delete property '{key}'")).into()))
+            Err(CommittedValueError::JavaScript(self.err_type(
+                (format!("Cannot delete property '{key}'")).into(),
+            )))
         }
     }
 
@@ -2550,7 +2716,7 @@ impl Interpreter {
         arg: Option<&Value>,
         default: f64,
         len: usize,
-    ) -> Result<usize, VmError> {
+    ) -> Result<usize, CommittedValueError> {
         let n = match arg {
             None => default,
             Some(v) if v.is_undefined() => default,
@@ -2581,7 +2747,7 @@ impl Interpreter {
         context: &ExecutionContext,
         arg: &Value,
         max: usize,
-    ) -> Result<usize, VmError> {
+    ) -> Result<usize, CommittedValueError> {
         let n = self.coerce_to_number(stack, context, arg)?.as_f64();
         if n.is_nan() || n <= 0.0 {
             return Ok(0);
@@ -2606,13 +2772,14 @@ impl Interpreter {
         arr: crate::array::JsArray,
         key: &str,
         value: Value,
-    ) -> Result<bool, VmError> {
+    ) -> Result<bool, CommittedValueError> {
         if let Some((_getter, setter)) = crate::array::get_accessor(arr, self.gc_heap(), key) {
             return match setter {
                 Some(s) if crate::abstract_ops::is_callable(&s) => {
                     let mut a: SmallVec<[Value; 8]> = SmallVec::new();
                     a.push(value);
-                    self.run_callable_sync_rooted(stack, context, &s, Value::array(arr), a)?;
+                    self.run_callable_sync_rooted(stack, Some(context), &s, Value::array(arr), a)
+                        .map_err(CommittedValueError::completed_call)?;
                     Ok(true)
                 }
                 _ => Ok(false),
@@ -2632,7 +2799,9 @@ impl Interpreter {
         } else {
             // Absent own — consult the prototype chain for an inherited
             // setter or non-writable shadow before installing a new slot.
-            let proto = self.constructor_prototype_value("Array")?;
+            let proto = self
+                .constructor_prototype_value("Array")
+                .map_err(|error| CommittedValueError::Fatal(error.into()))?;
             if let Some(proto_obj) = proto.as_object() {
                 match crate::object::resolve_set(proto_obj, self.gc_heap(), key) {
                     crate::object::SetOutcome::InvokeSetter { setter } => {
@@ -2640,11 +2809,12 @@ impl Interpreter {
                         a.push(value);
                         self.run_callable_sync_rooted(
                             stack,
-                            context,
+                            Some(context),
                             &setter,
                             Value::array(arr),
                             a,
-                        )?;
+                        )
+                        .map_err(CommittedValueError::completed_call)?;
                         return Ok(true);
                     }
                     crate::object::SetOutcome::Reject { .. } => return Ok(false),
@@ -2659,102 +2829,15 @@ impl Interpreter {
         }
         match idx {
             Some(i) => crate::array::define_index_value(arr, self.gc_heap_mut(), i, value)
-                .map_err(crate::oom_to_vm)?,
+                .map_err(crate::oom_to_vm)
+                .map_err(|error| CommittedValueError::JavaScript(error.into()))?,
             None => {
                 crate::array::set_named_property(arr, self.gc_heap_mut(), key, value)
-                    .map_err(crate::oom_to_vm)?;
+                    .map_err(crate::oom_to_vm)
+                    .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
             }
         }
         Ok(true)
-    }
-
-    pub(crate) fn array_push(
-        &mut self,
-        stack: &mut ActivationStack,
-        context: &ExecutionContext,
-        receiver: Value,
-        args: &[Value],
-        roots: &[&[Value]],
-    ) -> Result<Value, VmError> {
-        let o = if receiver.is_object_type() {
-            receiver
-        } else {
-            self.box_sloppy_this_primitive_runtime_rooted(receiver, roots)?
-        };
-        // Dense fast path: a plain extensible array with a writable `length`,
-        // the default `%Array.prototype%` (no inherited integer setter), and no
-        // accessor/attribute override across the appended range appends straight
-        // to the dense element slab — no `ToString(index)` key, no per-element
-        // ordinary-set protocol. Anything else (sealed/frozen, non-writable
-        // length, prototype override, accessor in range, oversize) returns
-        // `false` from the guard and falls to the spec-generic path below.
-        if let Some(arr) = o.as_array() {
-            let cur = crate::array::len(arr, self.gc_heap());
-            let end = cur + args.len();
-            // `push` creates a *new* index `cur`, so `Set` would consult the
-            // prototype chain for an inherited setter / non-writable data
-            // property at that index. The protector is tripped whenever an
-            // indexed accessor is installed anywhere (most relevantly
-            // `%Array.prototype%`), so gating on it keeps the polluted-prototype
-            // case on the spec-generic path. `can_fast_fill_dense_range` covers
-            // the array's own accessor/attribute overrides + extensibility.
-            if !self.array_index_accessor_protector
-                && crate::array::length_writable(arr, self.gc_heap())
-                && crate::array::can_fast_fill_dense_range(arr, self.gc_heap(), cur, end)
-            {
-                for (i, &arg) in args.iter().enumerate() {
-                    let rest = &args[i + 1..];
-                    let mut visit = |v: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
-                        for slice in roots {
-                            for val in *slice {
-                                val.trace_value_slots(v);
-                            }
-                        }
-                        for val in rest {
-                            val.trace_value_slots(v);
-                        }
-                    };
-                    crate::array::push_with_roots(arr, self.gc_heap_mut(), arg, &mut visit)
-                        .map_err(VmError::from)?;
-                }
-                return Ok(Value::number(NumberValue::from_f64(end as f64)));
-            }
-        }
-        let len = length_of_array_like(self, stack, context, &o)? as f64;
-        let arg_count = args.len() as f64;
-        // §23.1.3.23 step 4 — len + argCount must stay a safe integer.
-        if len + arg_count > 9_007_199_254_740_991.0 {
-            return Err(
-                self.err_type(("Pushing too many elements onto an array-like".to_string()).into())
-            );
-        }
-        let mut n = len;
-        for &arg in args {
-            let key = format_index_key(n);
-            // §23.1.3.23 step 6.c — Set(O, ToString(n), E, true): a real
-            // array honours inherited setters / writability and throws on
-            // failure; a generic array-like routes through the throwing
-            // property setter.
-            if let Some(arr) = o.as_array() {
-                if !self.array_ordinary_set_own(stack, context, arr, &key, arg)? {
-                    // A non-extensible (sealed / frozen) array fails to
-                    // create the fresh index — V8 reports this as an
-                    // "add property" failure, distinct from assigning a
-                    // read-only existing property.
-                    let message = if crate::array::is_extensible(arr, self.gc_heap()) {
-                        format!("Cannot assign to read only property '{key}'")
-                    } else {
-                        format!("Cannot add property {key}, object is not extensible")
-                    };
-                    return Err(self.err_type(message.into()));
-                }
-            } else {
-                self.array_set_property_throwing(stack, context, o, &key, arg)?;
-            }
-            n += 1.0;
-        }
-        self.array_set_length_throwing(stack, context, o, n)?;
-        Ok(Value::number(NumberValue::from_f64(n)))
     }
 
     /// §23.1.3.21 live `Array.prototype.pop` over a generic array-like receiver.
@@ -2764,11 +2847,12 @@ impl Interpreter {
         context: &ExecutionContext,
         receiver: Value,
         roots: &[&[Value]],
-    ) -> Result<Value, VmError> {
+    ) -> Result<Value, CommittedValueError> {
         let o = if receiver.is_object_type() {
             receiver
         } else {
-            self.box_sloppy_this_primitive_runtime_rooted(receiver, roots)?
+            self.box_sloppy_this_primitive_runtime_rooted(receiver, roots)
+                .map_err(|error| CommittedValueError::JavaScript(error.into()))?
         };
         // Dense fast path (symmetric with `array_push`): a plain extensible
         // array with a writable `length` and no accessor/attribute override on
@@ -2802,7 +2886,9 @@ impl Interpreter {
         let deleted =
             self.ordinary_delete_value(stack, context, o, &crate::VmPropertyKey::String(&key), 0)?;
         if !deleted {
-            return Err(self.err_type((format!("Cannot delete property '{key}'")).into()));
+            return Err(CommittedValueError::JavaScript(
+                self.err_type((format!("Cannot delete property '{key}'")).into()),
+            ));
         }
         self.array_set_length_throwing(stack, context, o, new_len)?;
         Ok(element)
@@ -2815,11 +2901,12 @@ impl Interpreter {
         context: &ExecutionContext,
         receiver: Value,
         roots: &[&[Value]],
-    ) -> Result<Value, VmError> {
+    ) -> Result<Value, CommittedValueError> {
         let o = if receiver.is_object_type() {
             receiver
         } else {
-            self.box_sloppy_this_primitive_runtime_rooted(receiver, roots)?
+            self.box_sloppy_this_primitive_runtime_rooted(receiver, roots)
+                .map_err(|error| CommittedValueError::JavaScript(error.into()))?
         };
         // Dense fast path (symmetric with `array_pop`): a fully dense array with
         // a writable `length` and no accessor/attribute override slides the
@@ -2849,7 +2936,7 @@ impl Interpreter {
             let to = (k - 1).to_string();
             let has = self.ordinary_has_property_value(
                 stack,
-                context,
+                Some(context),
                 o,
                 &crate::VmPropertyKey::String(&from),
                 0,
@@ -2875,11 +2962,12 @@ impl Interpreter {
         receiver: Value,
         args: &[Value],
         roots: &[&[Value]],
-    ) -> Result<Value, VmError> {
+    ) -> Result<Value, CommittedValueError> {
         let o = if receiver.is_object_type() {
             receiver
         } else {
-            self.box_sloppy_this_primitive_runtime_rooted(receiver, roots)?
+            self.box_sloppy_this_primitive_runtime_rooted(receiver, roots)
+                .map_err(|error| CommittedValueError::JavaScript(error.into()))?
         };
         // Dense fast path (symmetric with `array_push`): inserting at the head
         // of a fully dense array slides the element buffer up directly. Like
@@ -2918,7 +3006,8 @@ impl Interpreter {
                         arg,
                         &mut visit,
                     )
-                    .map_err(VmError::from)?;
+                    .map_err(VmError::from)
+                    .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
                 }
                 return Ok(Value::number(NumberValue::from_f64(new_len as f64)));
             }
@@ -2931,8 +3020,9 @@ impl Interpreter {
         }
         let new_len = len as f64 + arg_count as f64;
         if new_len > 9_007_199_254_740_991.0 {
-            return Err(self
-                .err_type(("Unshifting too many elements onto an array-like".to_string()).into()));
+            return Err(CommittedValueError::JavaScript(self.err_type(
+                ("Unshifting too many elements onto an array-like".to_string()).into(),
+            )));
         }
 
         if len <= MAX_ARRAY_LIKE_PROBE_LEN {
@@ -2940,7 +3030,9 @@ impl Interpreter {
                 self.unshift_move_index(stack, context, o, k, arg_count)?;
             }
         } else {
-            let mut candidates = self.unshift_sparse_candidates(o, len, arg_count)?;
+            let mut candidates = self
+                .unshift_sparse_candidates(o, len, arg_count)
+                .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
             while let Some(k) = candidates.pop_last() {
                 self.unshift_move_index(stack, context, o, k, arg_count)?;
             }
@@ -2960,12 +3052,12 @@ impl Interpreter {
         o: Value,
         from_index: usize,
         arg_count: usize,
-    ) -> Result<(), VmError> {
+    ) -> Result<(), CommittedValueError> {
         let from = format_index_key(from_index as f64);
         let to = format_index_key((from_index + arg_count) as f64);
         let has = self.ordinary_has_property_value(
             stack,
-            context,
+            Some(context),
             o,
             &crate::VmPropertyKey::String(&from),
             0,
@@ -3022,11 +3114,12 @@ impl Interpreter {
         receiver: Value,
         args: &[Value],
         roots: &[&[Value]],
-    ) -> Result<Value, VmError> {
+    ) -> Result<Value, CommittedValueError> {
         let o = if receiver.is_object_type() {
             receiver
         } else {
-            self.box_sloppy_this_primitive_runtime_rooted(receiver, roots)?
+            self.box_sloppy_this_primitive_runtime_rooted(receiver, roots)
+                .map_err(|error| CommittedValueError::JavaScript(error.into()))?
         };
         let len = length_of_array_like(self, stack, context, &o)?;
         let to = self.array_relative_index(stack, context, args.first(), 0.0, len)?;
@@ -3050,7 +3143,9 @@ impl Interpreter {
                 }
             }
         } else {
-            let mut offsets = self.copy_within_sparse_offsets(o, len, from, to, count)?;
+            let mut offsets = self
+                .copy_within_sparse_offsets(o, len, from, to, count)
+                .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
             if backwards {
                 while let Some(offset) = offsets.pop_last() {
                     self.copy_within_move_index(stack, context, o, from + offset, to + offset)?;
@@ -3071,7 +3166,7 @@ impl Interpreter {
         o: Value,
         from_index: usize,
         to_index: usize,
-    ) -> Result<(), VmError> {
+    ) -> Result<(), CommittedValueError> {
         let from = format_index_key(from_index as f64);
         let to = format_index_key(to_index as f64);
         let has = self.array_method_has_property(stack, context, o, &from)?;
@@ -3089,15 +3184,23 @@ impl Interpreter {
         context: &ExecutionContext,
         o: Value,
         key: &str,
-    ) -> Result<bool, VmError> {
+    ) -> Result<bool, CommittedValueError> {
         let property_key = crate::VmPropertyKey::String(key);
-        if self.ordinary_has_property_value(stack, context, o, &property_key, 0)? {
+        if self.ordinary_has_property_value(stack, Some(context), o, &property_key, 0)? {
             return Ok(true);
         }
         if o.is_array() {
-            let proto = self.get_prototype_for_op(&o)?;
+            let proto = self
+                .get_prototype_for_op(&o)
+                .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
             if !proto.is_nullish() {
-                return self.ordinary_has_property_value(stack, context, proto, &property_key, 0);
+                return self.ordinary_has_property_value(
+                    stack,
+                    Some(context),
+                    proto,
+                    &property_key,
+                    0,
+                );
             }
         }
         Ok(false)
@@ -3109,13 +3212,14 @@ impl Interpreter {
         context: &ExecutionContext,
         o: Value,
         key: &str,
-    ) -> Result<Value, VmError> {
+    ) -> Result<Value, CommittedValueError> {
         if let Some(arr) = o.as_array() {
             if let Some((getter, _setter)) = crate::array::get_accessor(arr, self.gc_heap(), key) {
                 return match getter {
                     Some(getter) if crate::abstract_ops::is_callable(&getter) => {
                         let args: SmallVec<[Value; 8]> = SmallVec::new();
-                        self.run_callable_sync_rooted(stack, context, &getter, o, args)
+                        self.run_callable_sync_rooted(stack, Some(context), &getter, o, args)
+                            .map_err(CommittedValueError::completed_call)
                     }
                     _ => Ok(Value::undefined()),
                 };
@@ -3128,11 +3232,13 @@ impl Interpreter {
             if let Some(value) = crate::array::get_named_property(arr, self.gc_heap(), key) {
                 return Ok(value);
             }
-            let proto = self.get_prototype_for_op(&o)?;
+            let proto = self
+                .get_prototype_for_op(&o)
+                .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
             if !proto.is_nullish()
                 && self.ordinary_has_property_value(
                     stack,
-                    context,
+                    Some(context),
                     proto,
                     &crate::VmPropertyKey::String(key),
                     0,
@@ -3188,11 +3294,12 @@ impl Interpreter {
         receiver: Value,
         args: &[Value],
         roots: &[&[Value]],
-    ) -> Result<Value, VmError> {
+    ) -> Result<Value, CommittedValueError> {
         let o = if receiver.is_object_type() {
             receiver
         } else {
-            self.box_sloppy_this_primitive_runtime_rooted(receiver, roots)?
+            self.box_sloppy_this_primitive_runtime_rooted(receiver, roots)
+                .map_err(|error| CommittedValueError::JavaScript(error.into()))?
         };
         // Length/index coercion, species construction, and every copy
         // iteration can allocate and move the receiver and the result
@@ -3217,7 +3324,10 @@ impl Interpreter {
                 }
             } else {
                 let o_now = interp.escape_scoped(o_handle);
-                for n in interp.slice_sparse_offsets(o_now, len, start, count)? {
+                for n in interp
+                    .slice_sparse_offsets(o_now, len, start, count)
+                    .map_err(|error| CommittedValueError::JavaScript(error.into()))?
+                {
                     let o_now = interp.escape_scoped(o_handle);
                     let a_now = interp.escape_scoped(a_handle);
                     interp.slice_copy_index(stack, context, o_now, a_now, start + n, n)?;
@@ -3243,7 +3353,7 @@ impl Interpreter {
         to_object: Value,
         from_index: usize,
         to_index: usize,
-    ) -> Result<(), VmError> {
+    ) -> Result<(), CommittedValueError> {
         // The has/get probes can run proxy traps and getters, and the
         // final define can grow the target — all allocating. Re-read
         // both objects (and the fetched value) from rooted slots
@@ -3273,65 +3383,110 @@ impl Interpreter {
         original: Value,
         length: usize,
         roots: &[&[Value]],
-    ) -> Result<Value, VmError> {
-        if !self.array_species_is_array(context, original)? {
-            return self.array_create_with_length(original, length, roots);
-        }
-        let default_ctor = crate::object::get(self.global_this, &self.gc_heap, "Array")
-            .ok_or_else(|| self.err_type(("%Array% intrinsic is missing".to_string()).into()))?;
-        // §7.3.22 steps 5-6 — C = Get(original, "constructor"); when C
-        // IS another realm's %Array% constructor it counts as the
-        // default (the @@species read is skipped) and the result array
-        // is created in the CURRENT realm. An explicit @@species value
-        // is honoured verbatim even when it names a foreign %Array%.
-        let c = self.get_property_value_for_call(stack, context, original, "constructor")?;
-        if let Some(native) = c.as_native_function()
-            && let Some(realm_global) = native.realm_global(&self.gc_heap)
-            && realm_global != self.global_this
-            && crate::object::get(realm_global, &self.gc_heap, "Array")
-                .is_some_and(|other| crate::abstract_ops::same_value(&other, &c, &self.gc_heap))
-        {
-            return self.array_create_with_length(original, length, roots);
-        }
-        let constructor = if c.is_undefined() {
-            default_ctor
-        } else if !c.is_object_type() {
-            return Err(self.err_type(("constructor property is not an object".to_string()).into()));
-        } else {
-            let species_sym = self
-                .well_known_symbols()
-                .get(crate::symbol::WellKnown::Species);
-            let s = match self.ordinary_get_value(
+    ) -> Result<Value, CommittedValueError> {
+        self.with_handle_scope(|interp, scope| {
+            let original_root = interp.scoped_value(scope, original);
+            for values in roots {
+                for value in *values {
+                    let _argument = interp.scoped_value(scope, *value);
+                }
+            }
+
+            if !interp
+                .array_species_is_array(context, interp.escape_scoped(original_root))
+                .map_err(|error| CommittedValueError::JavaScript(error.into()))?
+            {
+                return interp
+                    .array_create_with_length(interp.escape_scoped(original_root), length, &[])
+                    .map_err(|error| CommittedValueError::JavaScript(error.into()));
+            }
+            let default_ctor = crate::object::get(interp.global_this, &interp.gc_heap, "Array")
+                .ok_or_else(|| interp.err_type(("%Array% intrinsic is missing".to_string()).into()))
+                .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+            let default_ctor_root = interp.scoped_value(scope, default_ctor);
+            // §7.3.22 steps 5-6 — C = Get(original, "constructor"); when C
+            // IS another realm's %Array% constructor it counts as the
+            // default (the @@species read is skipped) and the result array
+            // is created in the CURRENT realm. An explicit @@species value
+            // is honoured verbatim even when it names a foreign %Array%.
+            let c = interp.get_property_value_for_call(
                 stack,
                 context,
-                c,
-                c,
-                &crate::VmPropertyKey::Symbol(species_sym),
-                0,
-            )? {
-                crate::VmGetOutcome::Value(value) => value,
-                crate::VmGetOutcome::InvokeGetter { getter } => {
-                    self.run_callable_sync_rooted(stack, context, &getter, c, SmallVec::new())?
+                interp.escape_scoped(original_root),
+                "constructor",
+            )?;
+            if let Some(native) = c.as_native_function()
+                && let Some(realm_global) = native.realm_global(&interp.gc_heap)
+                && realm_global != interp.global_this
+                && crate::object::get(realm_global, &interp.gc_heap, "Array").is_some_and(|other| {
+                    crate::abstract_ops::same_value(&other, &c, &interp.gc_heap)
+                })
+            {
+                return interp
+                    .array_create_with_length(interp.escape_scoped(original_root), length, &[])
+                    .map_err(|error| CommittedValueError::JavaScript(error.into()));
+            }
+            let constructor = if c.is_undefined() {
+                interp.escape_scoped(default_ctor_root)
+            } else if !c.is_object_type() {
+                return Err(CommittedValueError::JavaScript(interp.err_type(
+                    ("constructor property is not an object".to_string()).into(),
+                )));
+            } else {
+                let constructor_root = interp.scoped_value(scope, c);
+                let species_sym = interp
+                    .well_known_symbols()
+                    .get(crate::symbol::WellKnown::Species);
+                let s = match interp.ordinary_get_value(
+                    stack,
+                    Some(context),
+                    c,
+                    c,
+                    &crate::VmPropertyKey::Symbol(species_sym),
+                    0,
+                )? {
+                    crate::VmGetOutcome::Value(value) => value,
+                    crate::VmGetOutcome::InvokeGetter { getter } => interp
+                        .run_callable_sync_rooted(
+                            stack,
+                            Some(context),
+                            &getter,
+                            interp.escape_scoped(constructor_root),
+                            SmallVec::new(),
+                        )
+                        .map_err(CommittedValueError::completed_call)?,
+                };
+                if s.is_nullish() {
+                    interp.escape_scoped(default_ctor_root)
+                } else if crate::abstract_ops::is_constructor(&s, context, &interp.gc_heap) {
+                    s
+                } else {
+                    return Err(CommittedValueError::JavaScript(interp.err_type(
+                        ("Symbol.species value is not a constructor".to_string()).into(),
+                    )));
                 }
             };
-            if s.is_nullish() {
-                default_ctor
-            } else if crate::abstract_ops::is_constructor(&s, context, &self.gc_heap) {
-                s
-            } else {
-                return Err(
-                    self.err_type(("Symbol.species value is not a constructor".to_string()).into())
-                );
+            if crate::abstract_ops::same_value(
+                &constructor,
+                &interp.escape_scoped(default_ctor_root),
+                &interp.gc_heap,
+            ) {
+                return interp
+                    .array_create_with_length(interp.escape_scoped(original_root), length, &[])
+                    .map_err(|error| CommittedValueError::JavaScript(error.into()));
             }
-        };
-        if crate::abstract_ops::same_value(&constructor, &default_ctor, &self.gc_heap) {
-            return self.array_create_with_length(original, length, roots);
-        }
-        let argv: SmallVec<[Value; 8]> =
-            smallvec::smallvec![Value::number(NumberValue::from_f64(length as f64))];
-        self.run_construct_sync_rooted(stack, context, &constructor, constructor, argv)
+            let argv: SmallVec<[Value; 8]> =
+                smallvec::smallvec![Value::number(NumberValue::from_f64(length as f64))];
+            interp
+                .run_construct_sync_rooted(stack, context, &constructor, constructor, argv, 0)
+                .map_err(CommittedValueError::completed_call)
+        })
     }
 
+    /// Default ArraySpeciesCreate storage uses the same rooted array owner as
+    /// native builders. The original receiver and pending argument values enter
+    /// the arena before prototype installation or length reservation can collect.
+    /// The returned value is resolved after growth; no pre-growth body copy escapes.
     fn array_create_with_length(
         &mut self,
         receiver_root: Value,
@@ -3341,20 +3496,16 @@ impl Interpreter {
         if length > u32::MAX as usize {
             return Err(self.err_range(("Invalid array length".to_string()).into()));
         }
-        let mut external_visit = |visit: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
-            receiver_root.trace_value_slots(visit);
-            for root in roots {
-                for value in *root {
-                    value.trace_value_slots(visit);
+        self.with_handle_scope(|interp, scope| {
+            let _receiver = interp.scoped_value(scope, receiver_root);
+            for values in roots {
+                for value in *values {
+                    let _argument = interp.scoped_value(scope, *value);
                 }
             }
-        };
-        let arr = crate::array::alloc_array_with_roots(&mut self.gc_heap, &mut external_visit)
-            .map_err(|_| self.err_range(("Invalid array length".to_string()).into()))?;
-        self.register_array_prototype_override(arr);
-        crate::array::set_length(arr, &mut self.gc_heap, length)
-            .map_err(|_| self.err_range(("Invalid array length".to_string()).into()))?;
-        Ok(Value::array(arr))
+            let array = interp.scoped_array(scope, length)?;
+            Ok(interp.escape_scoped(array))
+        })
     }
 
     fn array_species_is_array(
@@ -3401,7 +3552,7 @@ impl Interpreter {
         target: Value,
         idx: usize,
         value: Value,
-    ) -> Result<(), VmError> {
+    ) -> Result<(), CommittedValueError> {
         // The fast path is only sound for a genuinely fresh index: an extensible
         // ordinary array, no accessors, and nothing already at `idx`. A
         // pre-existing slot (e.g. an `@@species` result with a non-writable
@@ -3413,7 +3564,8 @@ impl Interpreter {
             && !crate::array::has_own_element(arr, self.gc_heap(), idx)
         {
             crate::array::define_index_value(arr, self.gc_heap_mut(), idx, value)
-                .map_err(VmError::from)?;
+                .map_err(VmError::from)
+                .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
             return Ok(());
         }
         let key = format_index_key(idx as f64);
@@ -3427,7 +3579,7 @@ impl Interpreter {
         target: Value,
         key: &str,
         value: Value,
-    ) -> Result<(), VmError> {
+    ) -> Result<(), CommittedValueError> {
         let descriptor = PartialPropertyDescriptor {
             value: Some(value),
             writable: Some(true),
@@ -3445,7 +3597,9 @@ impl Interpreter {
         if ok {
             Ok(())
         } else {
-            Err(self.err_type((format!("Cannot create property '{key}'")).into()))
+            Err(CommittedValueError::JavaScript(self.err_type(
+                (format!("Cannot create property '{key}'")).into(),
+            )))
         }
     }
 
@@ -3489,49 +3643,71 @@ impl Interpreter {
         receiver: Value,
         args: &[Value],
         roots: &[&[Value]],
-    ) -> Result<Value, VmError> {
-        let o = if receiver.is_object_type() {
-            receiver
-        } else {
-            self.box_sloppy_this_primitive_runtime_rooted(receiver, roots)?
-        };
-        let len = length_of_array_like(self, stack, context, &o)?;
-        let actual_start = if args.is_empty() {
-            0
-        } else {
-            self.array_relative_index(stack, context, args.first(), 0.0, len)?
-        };
-        let insert_count = args.len().saturating_sub(2);
-        let actual_delete_count = match args.len() {
-            0 => 0,
-            1 => len.saturating_sub(actual_start),
-            _ => self.array_clamped_count(
-                stack,
-                context,
-                &args[1],
-                len.saturating_sub(actual_start),
-            )?,
-        };
-        let new_len = len
-            .checked_sub(actual_delete_count)
-            .and_then(|n| n.checked_add(insert_count))
-            .ok_or_else(|| self.err_type(("Invalid array length".to_string()).into()))?;
-        if new_len > 9_007_199_254_740_991usize {
-            return Err(self.err_type(("Invalid array length".to_string()).into()));
-        }
-
-        // `ArraySpeciesCreate` and every property operation below can
-        // scavenge. Adopt the receiver and result into the high-level handle
-        // arena, then resolve each immediately before use.
+    ) -> Result<Value, CommittedValueError> {
         self.with_handle_scope(|interp, scope| {
+            let original_receiver = interp.scoped_value(scope, receiver);
+            let arguments: Vec<_> = args
+                .iter()
+                .map(|value| interp.scoped_value(scope, *value))
+                .collect();
+            for values in roots {
+                for value in *values {
+                    let _argument = interp.scoped_value(scope, *value);
+                }
+            }
+            // Length and start/delete-count coercion precede species creation
+            // and may re-enter JavaScript. Retain the receiver and every pending
+            // insertion before any of those observable operations.
+            let current_receiver = interp.escape_scoped(original_receiver);
+            let o = if current_receiver.is_object_type() {
+                current_receiver
+            } else {
+                interp
+                    .box_sloppy_this_primitive_runtime_rooted(current_receiver, &[])
+                    .map_err(CommittedValueError::JavaScript)?
+            };
             let receiver = interp.scoped_value(scope, o);
+            let current_receiver = interp.escape_scoped(receiver);
+            let len = length_of_array_like(interp, stack, context, &current_receiver)?;
+            let start_arg = arguments
+                .first()
+                .map(|argument| interp.escape_scoped(*argument));
+            let actual_start = if arguments.is_empty() {
+                0
+            } else {
+                interp.array_relative_index(stack, context, start_arg.as_ref(), 0.0, len)?
+            };
+            let insert_count = arguments.len().saturating_sub(2);
+            let actual_delete_count = match arguments.len() {
+                0 => 0,
+                1 => len.saturating_sub(actual_start),
+                _ => {
+                    let count = interp.escape_scoped(arguments[1]);
+                    interp.array_clamped_count(
+                        stack,
+                        context,
+                        &count,
+                        len.saturating_sub(actual_start),
+                    )?
+                }
+            };
+            let new_len = len
+                .checked_sub(actual_delete_count)
+                .and_then(|n| n.checked_add(insert_count))
+                .ok_or_else(|| interp.err_type(("Invalid array length".to_string()).into()))
+                .map_err(CommittedValueError::JavaScript)?;
+            if new_len > 9_007_199_254_740_991usize {
+                return Err(CommittedValueError::JavaScript(
+                    interp.err_type(("Invalid array length".to_string()).into()),
+                ));
+            }
             let current_receiver = interp.escape_scoped(receiver);
             let removed = interp.array_species_create(
                 stack,
                 context,
                 current_receiver,
                 actual_delete_count,
-                roots,
+                &[],
             )?;
             let removed = interp.scoped_value(scope, removed);
             if actual_delete_count <= MAX_ARRAY_LIKE_PROBE_LEN
@@ -3552,12 +3728,9 @@ impl Interpreter {
                 }
             } else {
                 let current_receiver = interp.escape_scoped(receiver);
-                let offsets = interp.splice_sparse_offsets(
-                    current_receiver,
-                    len,
-                    actual_start,
-                    actual_delete_count,
-                )?;
+                let offsets = interp
+                    .splice_sparse_offsets(current_receiver, len, actual_start, actual_delete_count)
+                    .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
                 for n in offsets {
                     let current_receiver = interp.escape_scoped(receiver);
                     let current_removed = interp.escape_scoped(removed);
@@ -3604,7 +3777,8 @@ impl Interpreter {
                 )?;
             }
 
-            for (offset, value) in args.iter().skip(2).copied().enumerate() {
+            for (offset, argument) in arguments.iter().skip(2).enumerate() {
+                let value = interp.escape_scoped(*argument);
                 let key = format_index_key((actual_start + offset) as f64);
                 let current_receiver = interp.escape_scoped(receiver);
                 interp.array_set_property_throwing(
@@ -3629,7 +3803,7 @@ impl Interpreter {
         to_object: Value,
         from_index: usize,
         to_index: usize,
-    ) -> Result<(), VmError> {
+    ) -> Result<(), CommittedValueError> {
         // The has/get probes can run proxy traps and getters, and the
         // final define can grow the target — all allocating. Re-read
         // both objects (and the fetched value) from rooted slots
@@ -3661,7 +3835,7 @@ impl Interpreter {
         actual_start: usize,
         actual_delete_count: usize,
         insert_count: usize,
-    ) -> Result<(), VmError> {
+    ) -> Result<(), CommittedValueError> {
         let shift = actual_delete_count - insert_count;
         let tail_count = len.saturating_sub(actual_start + actual_delete_count);
         // Every move/delete step is reentrant and allocating; park the
@@ -3689,13 +3863,15 @@ impl Interpreter {
             }
 
             let o_now = interp.escape_scoped(o_handle);
-            let candidates = interp.splice_shift_candidates(
-                o_now,
-                len,
-                actual_start,
-                actual_delete_count,
-                insert_count,
-            )?;
+            let candidates = interp
+                .splice_shift_candidates(
+                    o_now,
+                    len,
+                    actual_start,
+                    actual_delete_count,
+                    insert_count,
+                )
+                .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
             for k in candidates {
                 let o_now = interp.escape_scoped(o_handle);
                 interp.splice_move_or_delete(
@@ -3707,7 +3883,9 @@ impl Interpreter {
                 )?;
             }
             let o_now = interp.escape_scoped(o_handle);
-            let own_indices = interp.splice_own_indices(o_now, len)?;
+            let own_indices = interp
+                .splice_own_indices(o_now, len)
+                .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
             for k in own_indices.range((len - shift)..len) {
                 let key = format_index_key(*k as f64);
                 let o_now = interp.escape_scoped(o_handle);
@@ -3726,7 +3904,7 @@ impl Interpreter {
         actual_start: usize,
         actual_delete_count: usize,
         insert_count: usize,
-    ) -> Result<(), VmError> {
+    ) -> Result<(), CommittedValueError> {
         let tail_count = len.saturating_sub(actual_start + actual_delete_count);
         // Same rooting contract as `splice_shift_left`: each step allocates,
         // so the receiver is re-read from the arena before every use.
@@ -3747,13 +3925,15 @@ impl Interpreter {
             }
 
             let o_now = interp.escape_scoped(o_handle);
-            let candidates = interp.splice_shift_candidates(
-                o_now,
-                len,
-                actual_start,
-                actual_delete_count,
-                insert_count,
-            )?;
+            let candidates = interp
+                .splice_shift_candidates(
+                    o_now,
+                    len,
+                    actual_start,
+                    actual_delete_count,
+                    insert_count,
+                )
+                .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
             for k in candidates.into_iter().rev() {
                 let o_now = interp.escape_scoped(o_handle);
                 interp.splice_move_or_delete(
@@ -3775,7 +3955,7 @@ impl Interpreter {
         o: Value,
         from_index: usize,
         to_index: usize,
-    ) -> Result<(), VmError> {
+    ) -> Result<(), CommittedValueError> {
         let from = format_index_key(from_index as f64);
         let to = format_index_key(to_index as f64);
         // The has/get/set triple is reentrant and allocating; the receiver
@@ -3877,20 +4057,23 @@ impl Interpreter {
         context: &ExecutionContext,
         receiver: Value,
         roots: &[&[Value]],
-    ) -> Result<Value, VmError> {
+    ) -> Result<Value, CommittedValueError> {
         let o = if receiver.is_object_type() {
             receiver
         } else {
-            self.box_sloppy_this_primitive_runtime_rooted(receiver, roots)?
+            self.box_sloppy_this_primitive_runtime_rooted(receiver, roots)
+                .map_err(|error| CommittedValueError::JavaScript(error.into()))?
         };
         let len = length_of_array_like(self, stack, context, &o)?;
-        self.ensure_change_by_copy_len(len)?;
+        self.ensure_change_by_copy_len(len)
+            .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
         let mut out = Vec::with_capacity(len);
         for k in 0..len {
             let from = format_index_key((len - k - 1) as f64);
             out.push(self.array_method_get_property(stack, context, o, &from)?);
         }
         self.array_create_from_dense_values(out)
+            .map_err(|error| CommittedValueError::JavaScript(error.into()))
     }
 
     /// §23.1.3.40 live `Array.prototype.toSpliced`.
@@ -3901,11 +4084,12 @@ impl Interpreter {
         receiver: Value,
         args: &[Value],
         roots: &[&[Value]],
-    ) -> Result<Value, VmError> {
+    ) -> Result<Value, CommittedValueError> {
         let o = if receiver.is_object_type() {
             receiver
         } else {
-            self.box_sloppy_this_primitive_runtime_rooted(receiver, roots)?
+            self.box_sloppy_this_primitive_runtime_rooted(receiver, roots)
+                .map_err(|error| CommittedValueError::JavaScript(error.into()))?
         };
         let len = length_of_array_like(self, stack, context, &o)?;
         let actual_start = self.array_relative_index(stack, context, args.first(), 0.0, len)?;
@@ -3923,11 +4107,15 @@ impl Interpreter {
         let new_len = len
             .checked_sub(skip_count)
             .and_then(|n| n.checked_add(insert_count))
-            .ok_or_else(|| self.err_type(("Invalid array length".to_string()).into()))?;
+            .ok_or_else(|| self.err_type(("Invalid array length".to_string()).into()))
+            .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
         if new_len > MAX_SAFE_ARRAY_LENGTH {
-            return Err(self.err_type(("Invalid array length".to_string()).into()));
+            return Err(CommittedValueError::JavaScript(
+                self.err_type(("Invalid array length".to_string()).into()),
+            ));
         }
-        self.ensure_change_by_copy_len(new_len)?;
+        self.ensure_change_by_copy_len(new_len)
+            .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
 
         let mut out = Vec::with_capacity(new_len);
         for k in 0..actual_start {
@@ -3948,6 +4136,7 @@ impl Interpreter {
             )?);
         }
         self.array_create_from_dense_values(out)
+            .map_err(|error| CommittedValueError::JavaScript(error.into()))
     }
 
     /// §23.1.3.41 live `Array.prototype.toSorted`.
@@ -3958,11 +4147,11 @@ impl Interpreter {
         receiver: Value,
         comparefn: Value,
         roots: &[&[Value]],
-    ) -> Result<Value, VmError> {
+    ) -> Result<Value, CommittedValueError> {
         if !comparefn.is_undefined() && !self.is_callable_runtime(&comparefn) {
-            return Err(self.err_type(
+            return Err(CommittedValueError::JavaScript(self.err_type(
                 ("Array.prototype.toSorted comparator is not a function".to_string()).into(),
-            ));
+            )));
         }
         let anchor_base = self.push_iteration_anchor(comparefn) - 1;
         let comparefn_anchor = anchor_base;
@@ -3970,6 +4159,7 @@ impl Interpreter {
             Ok(receiver)
         } else {
             self.box_sloppy_this_primitive_runtime_rooted(receiver, roots)
+                .map_err(|error| CommittedValueError::JavaScript(error.into()))
         };
         let o = match o {
             Ok(o) => o,
@@ -3982,7 +4172,8 @@ impl Interpreter {
         let result = (|| {
             let o = self.iteration_anchor(o_anchor);
             let len = length_of_array_like(self, stack, context, &o)?;
-            self.ensure_change_by_copy_len(len)?;
+            self.ensure_change_by_copy_len(len)
+                .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
             // `toSorted` reads every index (holes become undefined). Keep
             // each result directly traced and sort stable anchor indices.
             let mut items = Vec::with_capacity(len);
@@ -4003,6 +4194,7 @@ impl Interpreter {
                 .map(|anchor| self.iteration_anchor(anchor))
                 .collect();
             self.array_create_from_dense_values(values)
+                .map_err(|error| CommittedValueError::JavaScript(error.into()))
         })();
         self.pop_iteration_anchors_to(anchor_base);
         result
@@ -4017,14 +4209,16 @@ impl Interpreter {
         index: Value,
         value: Value,
         roots: &[&[Value]],
-    ) -> Result<Value, VmError> {
+    ) -> Result<Value, CommittedValueError> {
         let o = if receiver.is_object_type() {
             receiver
         } else {
-            self.box_sloppy_this_primitive_runtime_rooted(receiver, roots)?
+            self.box_sloppy_this_primitive_runtime_rooted(receiver, roots)
+                .map_err(|error| CommittedValueError::JavaScript(error.into()))?
         };
         let len = length_of_array_like(self, stack, context, &o)?;
-        self.ensure_change_by_copy_len(len)?;
+        self.ensure_change_by_copy_len(len)
+            .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
         let actual = self.array_relative_index_strict(stack, context, &index, len)?;
         let mut out = Vec::with_capacity(len);
         for k in 0..len {
@@ -4040,6 +4234,7 @@ impl Interpreter {
             }
         }
         self.array_create_from_dense_values(out)
+            .map_err(|error| CommittedValueError::JavaScript(error.into()))
     }
 
     fn ensure_change_by_copy_len(&self, len: usize) -> Result<(), VmError> {
@@ -4055,7 +4250,7 @@ impl Interpreter {
         context: &ExecutionContext,
         arg: &Value,
         len: usize,
-    ) -> Result<usize, VmError> {
+    ) -> Result<usize, CommittedValueError> {
         let n = self.coerce_to_number(stack, context, arg)?.as_f64();
         let relative = if n.is_nan() {
             0.0
@@ -4070,7 +4265,9 @@ impl Interpreter {
             relative
         };
         if !actual.is_finite() || actual < 0.0 || actual >= len as f64 {
-            return Err(self.err_range(("index out of range".to_string()).into()));
+            return Err(CommittedValueError::JavaScript(
+                self.err_range(("index out of range".to_string()).into()),
+            ));
         }
         Ok(actual as usize)
     }
@@ -4298,11 +4495,7 @@ pub(crate) fn array_callback_native_dispatch(
             Ok(len) => len,
             Err(err) => {
                 interp.pop_iteration_anchors_to(species_anchor);
-                return Err(crate::native_function::vm_to_native_error(
-                    interp,
-                    err,
-                    "Array.prototype callback",
-                ));
+                return Err(err.into_native(interp, "Array.prototype callback"));
             }
         };
         // §23.1.3.* step 3 — `if IsCallable(callbackfn) is false, throw a
@@ -4328,11 +4521,7 @@ pub(crate) fn array_callback_native_dispatch(
                     Ok(created) => Some(created),
                     Err(err) => {
                         interp.pop_iteration_anchors_to(species_anchor);
-                        return Err(crate::native_function::vm_to_native_error(
-                            interp,
-                            err,
-                            "Array.prototype callback",
-                        ));
+                        return Err(err.into_native(interp, "Array.prototype callback"));
                     }
                 }
             }
@@ -4365,9 +4554,7 @@ pub(crate) fn array_callback_native_dispatch(
             // anchor before popping so the returned handle is current.
             let target = interp.iteration_anchor(anchor_base);
             interp.pop_iteration_anchors_to(anchor_base);
-            result.map_err(|err| {
-                crate::native_function::vm_to_native_error(interp, err, "flatMap")
-            })?;
+            result.map_err(|err| err.into_native(interp, "flatMap"))?;
             return Ok(target);
         }
         // `find` family visits every index `0..len` (an absent slot yields
@@ -4547,28 +4734,20 @@ pub(crate) fn array_callback_native_dispatch(
                             || {
                                 let has_result = interp.ordinary_has_property_value(
                                     stack,
-                                    &context,
+                                    Some(&context),
                                     receiver,
                                     &crate::VmPropertyKey::String(&key),
                                     0,
                                 );
                                 has_result.map_err(|err| {
-                                    crate::native_function::vm_to_native_error(
-                                        interp,
-                                        err,
-                                        "Array.prototype callback",
-                                    )
+                                    err.into_native(interp, "Array.prototype callback")
                                 })?
                             };
                         if present {
                             let get_result =
                                 interp.get_property_value_for_call(stack, &context, receiver, &key);
                             let v = get_result.map_err(|err| {
-                                crate::native_function::vm_to_native_error(
-                                    interp,
-                                    err,
-                                    "Array.prototype callback",
-                                )
+                                err.into_native(interp, "Array.prototype callback")
                             })?;
                             (true, v)
                         } else {
@@ -4579,28 +4758,18 @@ pub(crate) fn array_callback_native_dispatch(
                     let key = idx.to_string();
                     let has_result = interp.ordinary_has_property_value(
                         stack,
-                        &context,
+                        Some(&context),
                         receiver,
                         &crate::VmPropertyKey::String(&key),
                         0,
                     );
-                    let has = has_result.map_err(|err| {
-                        crate::native_function::vm_to_native_error(
-                            interp,
-                            err,
-                            "Array.prototype callback",
-                        )
-                    })?;
+                    let has = has_result
+                        .map_err(|err| err.into_native(interp, "Array.prototype callback"))?;
                     if has {
                         let get_result =
                             interp.get_property_value_for_call(stack, &context, receiver, &key);
-                        let v = get_result.map_err(|err| {
-                            crate::native_function::vm_to_native_error(
-                                interp,
-                                err,
-                                "Array.prototype callback",
-                            )
-                        })?;
+                        let v = get_result
+                            .map_err(|err| err.into_native(interp, "Array.prototype callback"))?;
                         (true, v)
                     } else {
                         (false, Value::undefined())
@@ -4647,7 +4816,13 @@ pub(crate) fn array_callback_native_dispatch(
                     } else {
                         smallvec::smallvec![v, Value::number_f64(idx as f64), receiver]
                     };
-                    interp.run_callable_sync_rooted(stack, &context, &callback, cb_this, cb_args)
+                    interp.run_callable_sync_rooted(
+                        stack,
+                        Some(&context),
+                        &callback,
+                        cb_this,
+                        cb_args,
+                    )
                 };
                 let result = cb_result.map_err(|err| {
                     crate::native_function::vm_to_native_error(
@@ -4670,9 +4845,7 @@ pub(crate) fn array_callback_native_dispatch(
                         }
                         let create_result = interp
                             .create_data_property_array_index(stack, &context, target, idx, result);
-                        create_result.map_err(|err| {
-                            crate::native_function::vm_to_native_error(interp, err, "map")
-                        })?;
+                        create_result.map_err(|err| err.into_native(interp, "map"))?;
                     }
                     ArrayCallbackKind::Filter if result.to_boolean(interp.gc_heap()) => {
                         let target = interp.iteration_anchor(anchor_base + A_OUTPUT);
@@ -4689,9 +4862,7 @@ pub(crate) fn array_callback_native_dispatch(
                             target_index,
                             v,
                         );
-                        create_result.map_err(|err| {
-                            crate::native_function::vm_to_native_error(interp, err, "filter")
-                        })?;
+                        create_result.map_err(|err| err.into_native(interp, "filter"))?;
                         target_index += 1;
                     }
                     ArrayCallbackKind::Find | ArrayCallbackKind::FindLast
@@ -5141,20 +5312,23 @@ mod tests {
     }
 
     fn context_for(function: Function) -> ExecutionContext {
-        ExecutionContext::from_module(BytecodeModule {
-            module: "sort-comparator-test.js".to_string(),
-            template_sites: Vec::new(),
-            source_kind: BcSourceKind::JavaScript,
-            functions: vec![function],
-            // The synthetic bodies reference `ConstIndex(0)` as a coercion
-            // hint; the verifier requires a String slot there.
-            constants: vec![otter_bytecode::Constant::String {
-                utf16: "number".encode_utf16().collect(),
-            }],
-            module_resolutions: Vec::new(),
-            module_inits: Vec::new(),
-            function_source: None,
-        })
+        ExecutionContext::from_module(
+            BytecodeModule {
+                module: "sort-comparator-test.js".to_string(),
+                template_sites: Vec::new(),
+                source_kind: BcSourceKind::JavaScript,
+                functions: vec![function],
+                // The synthetic bodies reference `ConstIndex(0)` as a coercion
+                // hint; the verifier requires a String slot there.
+                constants: vec![otter_bytecode::Constant::String {
+                    utf16: "number".encode_utf16().collect(),
+                }],
+                module_resolutions: Vec::new(),
+                module_inits: Vec::new(),
+                function_source: None,
+            },
+            crate::source_registry::SourceRegistry::default(),
+        )
         .expect("valid bytecode fixture")
     }
 

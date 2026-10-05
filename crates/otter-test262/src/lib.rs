@@ -1,27 +1,32 @@
-//! Test262 conformance runner for the new-engine
-//! (`crates/*`) Otter stack.
+//! Test262 conformance runner for the active Otter stack.
 //!
 //! This crate speaks the active `otter-runtime` / `otter-vm` ABI and
 //! is the single source of truth for ECMA-262 conformance numbers
 //! reported by the project.
 //!
-//! # Layout (target shape — slices 101 → 105)
+//! # Contents
 //!
 //! - [`runner`]          — corpus traversal + per-test driver.
+//! - [`results`]         — sole owned rows and typed skip causes.
 //! - [`metadata`]        — `/*--- ... ---*/` YAML frontmatter
-//!   parser (slice 102).
+//!   parser.
 //! - [`harness`]         — `assert.js` / `sta.js` / `includes`
-//!   loader (slice 102).
+//!   loader.
 //! - [`feature_map`]     — Test262 `features:` token →
-//!   engine-readiness bucket (slice 102).
-//! - [`config`]          — `test262_config.toml` loader (the
-//!   format the project has been on since the legacy runner).
-//! - [`report`]          — JSON + Markdown writers (slice 104).
+//!   engine-readiness bucket.
+//! - [`config`]          — `test262_config.toml` policy loader.
+//! - [`provenance`]      — actual executable and effective policy identity.
+//! - [`report`]          — complete JSON rows, validation and Markdown.
 //! - [`site`]            — static HTML conformance dashboard.
-//! - [`diff`]            — baseline diff (slice 104).
-//! - [`shard`]           — `--shard N/M` traversal (slice 104).
-//! - [`isolation`]       — fresh-runtime factory (slice 103).
+//! - [`diff`]            — baseline diff.
+//! - [`shard`]           — `--shard N/M` traversal.
+//! - [`isolation`]       — fresh-runtime factory.
 //!
+//! # Invariants
+//! Every canonical report retains all selected test paths exactly once.
+//! Rollups derive from those rows; absent paths never imply a passing test.
+//!
+//! # See also
 //! Spec links:
 //! - <https://tc39.es/ecma262/>
 //! - <https://github.com/tc39/test262/blob/main/INTERPRETING.md>
@@ -35,7 +40,9 @@ pub mod feature_map;
 pub mod harness;
 pub mod isolation;
 pub mod metadata;
+pub mod provenance;
 pub mod report;
+pub mod results;
 pub mod runner;
 pub mod shard;
 pub mod site;

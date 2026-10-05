@@ -1,41 +1,38 @@
-//! Measured, deterministic native-tier cost policy.
+//! Deterministic native-tier admission from actually entered source opcodes.
 //!
 //! # Contents
-//! - [`TierCostModel`] evaluates promotion and replacement from scalar costs.
-//! - [`TierCostInput`] is the pure, synthetic-testable policy input.
-//! - [`TierPolicy`] retains the execution point of the latest material
-//!   feedback change for each function.
-//! - [`Interpreter::optimizing_tier_decision_for`] applies the model to a live
-//!   function without compiling or installing code.
+//! - [`TierWorkModel`] converts immutable compiler geometry to opcode work.
+//! - [`TierPolicy`] owns feedback origins, compiler attempts and retraining.
+//! - [`crate::native_abi::SourceWork`] is the one shared execution scalar.
 //!
 //! # Invariants
-//! - A compile is admitted only when expected saved execution time is greater
-//!   than predicted compile time, cumulative recompilation cost, and the code
-//!   memory charge.
-//! - Decisions are monotonic in executions while all other inputs are fixed.
-//! - Feedback changes restart the stable execution observation; there is no
-//!   sample-count stability threshold.
-//! - Coefficients come from the checked-in Step 6 census and derivation script.
-//!   They are engine policy, never environment or embedder knobs.
-//! - The executable-memory resource limit is a separately named hard cap, not
-//!   a profitability threshold.
+//! - Interpreter dispatch and Template source paths charge each entered opcode
+//!   attempt once. Entries, backedges and static spans never create work.
+//! - Static geometry predicts compiler work and code-memory cost only.
+//! - Wall-clock durations are diagnostics and never enter policy.
+//! - Feedback changes restart the stable work origin; wakeup targets name that
+//!   origin plus required work, preserving already observed work.
+//! - Retraining additionally requires interpreted work and a complete fresh
+//!   activation or loop iteration of its exact generation.
+//! - Code objects retain the same scalar allocation through active retirement.
 //!
 //! # See also
-//! - `benchmarks/tiering/README.md`
-//! - [`crate::executable::CodeBlock::feedback_epoch`]
+//! - `benchmarks/tiering/README.md` for calibrated integer-work provenance.
+//! - [`crate::executable::CodeBlock`] for executable and feedback ownership.
 
+use crate::{Interpreter, executable::CodeBlock, native_abi::SourceWork};
 use rustc_hash::FxHashMap;
+use std::sync::Arc;
 
-use crate::Interpreter;
-
-/// Hard per-isolate executable-code resource cap.
+/// Per-isolate cap on requested executable mappings and owned generation
+/// payloads, including permanent entry cells; not a total RSS bound.
 ///
-/// The complete pre-policy V8-v7/Octane census peaked at 21.4 MiB of emitted
+/// The checked-in tier census peaked at 21.4 MiB of emitted
 /// code in one workload. Three times that observed high-water mark leaves room
-/// for live replacement generations while bounding executable mappings.
+/// for live replacement generations while bounding retained mappings and their generation payloads.
 pub(crate) const JIT_CODE_RESOURCE_LIMIT_BYTES: u64 = 64 * 1024 * 1024;
 
-/// Property programs retained per site. The Step 6 census observed 22,857
+/// Property programs retained per site. The tier census observed 22,857
 /// compiled property sites: 93.7% monomorphic and 99.6% at three ways or less;
 /// the fourth way covered the remaining observed tail before its memory cost
 /// exceeded another guard's measured hit contribution.
@@ -43,394 +40,374 @@ pub(crate) const PROFILED_PROPERTY_PIC_CAPACITY: usize = 4;
 
 /// Ordinary call targets retained per site. The generated-plan census reached
 /// four targets, but that stream excludes non-generated polymorphic ordinary
-/// sites. The V8-v7 holdout regressed when those slots were truncated to four;
+/// sites. The holdout regressed when those slots were truncated to four;
 /// the measured eight-record layout is therefore retained until an uncensored
 /// runtime target-cardinality histogram justifies a smaller allocation.
 pub(crate) const PROFILED_CALL_TARGET_CAPACITY: usize = 8;
 
-/// Native tier whose next code object is being costed.
+/// Native tier whose compiler work is being budgeted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum CostedTier {
     Template,
     Optimizing,
 }
 
-/// Dynamic observation that would trigger compilation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum TierTrigger {
-    /// Entries through the call trampoline, from any caller tier.
-    FunctionEntry,
-    LoopBackedge {
-        /// Static instruction span between the loop header and latch. This is
-        /// the generated work one successful OSR iteration avoids.
-        span_instructions: u64,
-    },
+impl CostedTier {
+    const fn index(self) -> usize {
+        match self {
+            Self::Template => 0,
+            Self::Optimizing => 1,
+        }
+    }
 }
 
-/// Why the pure model admitted or deferred a compile.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum TierCostReason {
-    Profitable,
-    InsufficientPayoff,
+pub(crate) enum TierWorkReason {
+    Affordable,
+    InsufficientWork,
     CodeMemoryBudget,
 }
 
-/// Complete scalar input to one deterministic policy decision.
+/// Pure scalar input; all execution evidence is actual opcode attempts.
+/// Available code bytes are canonical retained-mapping and host-account headroom.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct TierCostInput {
+pub(crate) struct TierWorkInput {
     pub(crate) tier: CostedTier,
-    pub(crate) trigger: TierTrigger,
-    /// Stable executions already observed; also the conservative estimate of
-    /// remaining executions.
-    pub(crate) executions: u64,
-    /// Exits charged to the current generation when considering replacement.
-    pub(crate) exits: u64,
+    pub(crate) observed_work: u64,
     pub(crate) bytecode_instructions: u64,
     pub(crate) register_count: u64,
     pub(crate) parameter_count: u64,
-    pub(crate) resident_code_bytes: u64,
-    /// Actual duration of earlier compiles for this function. This makes a
-    /// repeatedly rebuilt body progressively harder to justify without a
-    /// fixed reoptimization count.
-    pub(crate) cumulative_compile_ns: u64,
+    pub(crate) available_code_bytes: u64,
+    pub(crate) previous_compile_attempts: u64,
 }
 
-/// Auditable arithmetic behind one decision.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct TierCostDecision {
-    reason: TierCostReason,
-    pub(crate) expected_remaining_executions: u64,
-    pub(crate) estimated_saved_ns: u64,
-    pub(crate) estimated_compile_ns: u64,
+pub(crate) struct TierWorkDecision {
+    reason: TierWorkReason,
+    pub(crate) observed_work: u64,
+    pub(crate) required_work: u64,
     pub(crate) estimated_code_bytes: u64,
-    pub(crate) code_memory_charge_ns: u64,
+    /// Absolute target in the canonical source scalar, or unreachable.
+    pub(crate) work_target: Option<u64>,
 }
 
-impl TierCostDecision {
+impl TierWorkDecision {
     #[must_use]
     pub(crate) const fn should_compile(self) -> bool {
-        matches!(self.reason, TierCostReason::Profitable)
+        matches!(self.reason, TierWorkReason::Affordable)
     }
-
-    #[must_use]
+    pub(crate) const fn resource_blocked(self) -> bool {
+        matches!(self.reason, TierWorkReason::CodeMemoryBudget)
+    }
     #[cfg(test)]
-    pub(crate) const fn reason(self) -> TierCostReason {
+    pub(crate) const fn reason(self) -> TierWorkReason {
         self.reason
     }
 }
 
-/// Integer coefficient set fitted by `benchmarks/tiering/fit_cost_model.py`.
+/// Fixed integer source-work costs, reproduced by the checked-in fit script.
+/// Conservative historical per-op calibration is converted once, rounding
+/// compiler costs upward. No duration or entry/loop model exists at runtime.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct TierCostModel {
-    template_compile_base_ns: u64,
-    template_compile_per_instruction_ns: u64,
-    optimizing_compile_base_ns: u64,
-    optimizing_compile_per_instruction_ns: u64,
-    compile_per_register_ns: u64,
-    compile_per_parameter_ns: u64,
-    template_code_base_bytes: u64,
-    template_code_per_instruction_bytes: u64,
-    optimizing_code_base_bytes: u64,
-    optimizing_code_per_instruction_bytes: u64,
-    code_per_register_bytes: u64,
-    template_entry_saved_per_instruction_ns: u64,
-    /// One interpreter activation turn a compiled destination avoids: every
-    /// caller enters through the call trampoline, which runs a compiled
-    /// generation directly and the interpreter through a Rust turn.
-    interpreter_entry_saved_ns: u64,
-    optimizing_entry_saved_per_instruction_ns: u64,
-    template_backedge_saved_per_instruction_ns: u64,
-    optimizing_backedge_saved_per_instruction_ns: u64,
-    exit_penalty_ns: u64,
-    code_memory_charge_per_byte_ns: u64,
-    entry_continuation_multiplier: u64,
-    loop_continuation_multiplier: u64,
-}
+pub(crate) struct TierWorkModel;
 
-impl TierCostModel {
-    /// Current coefficient set, generated from the checked-in census.
-    #[must_use]
+impl TierWorkModel {
     pub(crate) const fn calibrated() -> Self {
-        Self {
-            template_compile_base_ns: 4_000,
-            template_compile_per_instruction_ns: 270,
-            optimizing_compile_base_ns: 15_000,
-            optimizing_compile_per_instruction_ns: 1_750,
-            compile_per_register_ns: 40,
-            compile_per_parameter_ns: 80,
-            template_code_base_bytes: 560,
-            template_code_per_instruction_bytes: 56,
-            optimizing_code_base_bytes: 320,
-            optimizing_code_per_instruction_bytes: 38,
-            code_per_register_bytes: 16,
-            template_entry_saved_per_instruction_ns: 12,
-            interpreter_entry_saved_ns: 1_450,
-            optimizing_entry_saved_per_instruction_ns: 20,
-            template_backedge_saved_per_instruction_ns: 103,
-            optimizing_backedge_saved_per_instruction_ns: 108,
-            exit_penalty_ns: 192,
-            code_memory_charge_per_byte_ns: 4,
-            entry_continuation_multiplier: 1,
-            loop_continuation_multiplier: 1,
-        }
+        Self
     }
 
-    const fn continuation_multiplier(self, trigger: TierTrigger) -> u64 {
-        match trigger {
-            TierTrigger::FunctionEntry => self.entry_continuation_multiplier,
-            TierTrigger::LoopBackedge { .. } => self.loop_continuation_multiplier,
-        }
+    pub(crate) fn minimum_required_work(self, input: TierWorkInput) -> u64 {
+        self.decide(input).required_work
     }
 
-    const fn saved_per_execution(
-        self,
-        tier: CostedTier,
-        trigger: TierTrigger,
-        bytecode_instructions: u64,
-    ) -> u64 {
-        match (tier, trigger) {
-            // Template and optimizing generations are entered alike, so only
-            // the template replaces an interpreter turn.
-            (CostedTier::Template, TierTrigger::FunctionEntry) => self
-                .template_entry_saved_per_instruction_ns
-                .saturating_mul(bytecode_instructions)
-                .saturating_add(self.interpreter_entry_saved_ns),
-            (CostedTier::Optimizing, TierTrigger::FunctionEntry) => self
-                .optimizing_entry_saved_per_instruction_ns
-                .saturating_mul(bytecode_instructions),
-            (CostedTier::Template, TierTrigger::LoopBackedge { span_instructions }) => self
-                .template_backedge_saved_per_instruction_ns
-                .saturating_mul(span_instructions),
-            (CostedTier::Optimizing, TierTrigger::LoopBackedge { span_instructions }) => self
-                .optimizing_backedge_saved_per_instruction_ns
-                .saturating_mul(span_instructions),
-        }
-    }
-
-    /// Smallest execution count that can have positive payoff for these static
-    /// inputs. Generated linkage uses this only as a cold-policy wakeup point;
-    /// the VM re-evaluates the complete live decision before compiling.
-    #[must_use]
-    pub(crate) fn minimum_profitable_executions(self, mut input: TierCostInput) -> u64 {
-        input.executions = 0;
-        input.exits = 0;
-        let decision = self.decide(input);
-        let saved = self
-            .saved_per_execution(input.tier, input.trigger, input.bytecode_instructions)
-            .saturating_mul(self.continuation_multiplier(input.trigger));
-        decision
-            .estimated_compile_ns
-            .saturating_add(input.cumulative_compile_ns)
-            .saturating_add(decision.code_memory_charge_ns)
-            .checked_div(saved)
-            .unwrap_or(u64::MAX)
-            .saturating_add(1)
-    }
-
-    /// Evaluate promotion or generation replacement with saturating integer
-    /// arithmetic. `exits` adds recovered deopt round-trip cost; it cannot make
-    /// an otherwise profitable decision less profitable.
-    #[must_use]
-    pub(crate) fn decide(self, input: TierCostInput) -> TierCostDecision {
-        let (compile_base, compile_per_instruction, code_base, code_per_instruction) =
+    pub(crate) fn decide(self, input: TierWorkInput) -> TierWorkDecision {
+        let (base, instruction, register, parameter, code_base, code_instruction, memory_divisor) =
             match input.tier {
-                CostedTier::Template => (
-                    self.template_compile_base_ns,
-                    self.template_compile_per_instruction_ns,
-                    self.template_code_base_bytes,
-                    self.template_code_per_instruction_bytes,
-                ),
-                CostedTier::Optimizing => (
-                    self.optimizing_compile_base_ns,
-                    self.optimizing_compile_per_instruction_ns,
-                    self.optimizing_code_base_bytes,
-                    self.optimizing_code_per_instruction_bytes,
-                ),
+                CostedTier::Template => (334u64, 23u64, 4u64, 7u64, 560u64, 56u64, 3u64),
+                CostedTier::Optimizing => (750u64, 88u64, 2u64, 4u64, 320u64, 38u64, 5u64),
             };
-        let saved_per_execution =
-            self.saved_per_execution(input.tier, input.trigger, input.bytecode_instructions);
-        let estimated_compile_ns = compile_base
-            .saturating_add(compile_per_instruction.saturating_mul(input.bytecode_instructions))
-            .saturating_add(
-                self.compile_per_register_ns
-                    .saturating_mul(input.register_count),
-            )
-            .saturating_add(
-                self.compile_per_parameter_ns
-                    .saturating_mul(input.parameter_count),
-            );
+        let compile_work = base
+            .saturating_add(instruction.saturating_mul(input.bytecode_instructions))
+            .saturating_add(register.saturating_mul(input.register_count))
+            .saturating_add(parameter.saturating_mul(input.parameter_count));
         let estimated_code_bytes = code_base
-            .saturating_add(code_per_instruction.saturating_mul(input.bytecode_instructions))
-            .saturating_add(
-                self.code_per_register_bytes
-                    .saturating_mul(input.register_count),
-            );
-        let code_memory_charge_ns =
-            estimated_code_bytes.saturating_mul(self.code_memory_charge_per_byte_ns);
-        let expected_remaining_executions = input
-            .executions
-            .saturating_mul(self.continuation_multiplier(input.trigger));
-        let estimated_saved_ns = expected_remaining_executions
-            .saturating_mul(saved_per_execution)
-            .saturating_add(input.exits.saturating_mul(self.exit_penalty_ns));
-        let total_cost = estimated_compile_ns
-            .saturating_add(input.cumulative_compile_ns)
-            .saturating_add(code_memory_charge_ns);
-        let reason = if input
-            .resident_code_bytes
-            .saturating_add(estimated_code_bytes)
-            > JIT_CODE_RESOURCE_LIMIT_BYTES
-        {
-            TierCostReason::CodeMemoryBudget
-        } else if estimated_saved_ns > total_cost {
-            TierCostReason::Profitable
+            .saturating_add(code_instruction.saturating_mul(input.bytecode_instructions))
+            .saturating_add(16u64.saturating_mul(input.register_count));
+        let memory_work = estimated_code_bytes / memory_divisor
+            + u64::from(estimated_code_bytes % memory_divisor != 0);
+        let cost = compile_work
+            .saturating_mul(input.previous_compile_attempts.saturating_add(1))
+            .saturating_add(memory_work);
+        let required_work = cost.saturating_add(1);
+        let reason = if estimated_code_bytes > input.available_code_bytes {
+            TierWorkReason::CodeMemoryBudget
+        } else if input.observed_work > cost {
+            TierWorkReason::Affordable
         } else {
-            TierCostReason::InsufficientPayoff
+            TierWorkReason::InsufficientWork
         };
-        TierCostDecision {
+        TierWorkDecision {
             reason,
-            expected_remaining_executions,
-            estimated_saved_ns,
-            estimated_compile_ns,
+            observed_work: input.observed_work,
+            required_work,
             estimated_code_bytes,
-            code_memory_charge_ns,
+            work_target: (reason != TierWorkReason::CodeMemoryBudget)
+                .then(|| cost.checked_add(1))
+                .flatten(),
         }
     }
 }
 
-/// Optimizing-tier candidacy for one bytecode function.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Optimizer admission from the function's canonical source-work budget.
 pub enum OptimizingDecision {
-    /// No feedback or insufficient stable execution evidence.
+    /// Some work is visible, but work or resource admission remains unfunded.
     Cold,
-    /// The first observation establishes the current feedback epoch.
+    /// No source attempts are visible in the current feedback-work epoch.
     Warming,
-    /// Material feedback changed and restarted the execution observation.
+    /// Changed feedback has not yet earned a funded stable-work window.
     FeedbackUnstable,
-    /// The measured payoff exceeds compilation and code-memory cost.
+    /// Exact source work and physical headroom permit a compiler invocation.
     Promote,
 }
 
 #[derive(Debug, Default)]
 struct FunctionTierState {
+    /// Bound once at source admission or a source-owned deopt. A policy token
+    /// may precede available executable storage; it cannot fund compilation
+    /// until the canonical source has been bound.
+    work: Option<Arc<SourceWork>>,
     last_feedback_epoch: Option<u32>,
-    stable_since_execution: u64,
+    stable_work_origin: u64,
     observed_feedback_change: bool,
+    compile_attempts: [u64; 2],
+    /// Exact resource demand learned only from a compiled mapping's refused
+    /// admission. Same-epoch retries require this physical headroom.
+    refused_code_bytes: [u64; 2],
+    retraining_generation: u64,
+    retraining: Option<RetrainingState>,
 }
 
-impl FunctionTierState {
-    fn stable_executions(&mut self, executions: u64, epoch: u32) -> u64 {
-        match self.last_feedback_epoch {
-            None => {
-                self.last_feedback_epoch = Some(epoch);
-                self.stable_since_execution = executions;
-            }
-            Some(previous) if previous == epoch => {}
-            Some(_) => {
-                self.last_feedback_epoch = Some(epoch);
-                self.stable_since_execution = executions;
-                self.observed_feedback_change = true;
-            }
+#[derive(Debug)]
+struct RetrainingState {
+    remaining_work: u64,
+    completed_path: bool,
+}
+
+/// Evidence carried by one interpreter activation, independently of recursion.
+/// No GC values or physical frame addresses enter the policy.
+#[derive(Debug, Clone)]
+pub(crate) struct RetrainingActivation {
+    pub(crate) generation: u64,
+    fresh: bool,
+    seen_loop_headers: Vec<u32>,
+}
+
+impl RetrainingActivation {
+    pub(crate) fn new(generation: u64, fresh: bool) -> Self {
+        Self {
+            generation,
+            fresh,
+            seen_loop_headers: Vec::new(),
         }
-        executions.saturating_sub(self.stable_since_execution)
+    }
+
+    pub(crate) fn is_fresh(&self) -> bool {
+        self.fresh
+    }
+
+    /// The first backedge may finish only a deopt suffix. Returning to the
+    /// same header again proves a whole interpreted iteration of this frame.
+    pub(crate) fn observe_backedge(&mut self, header: u32) -> bool {
+        let completed = self.seen_loop_headers.contains(&header);
+        if !completed {
+            self.seen_loop_headers.push(header);
+        }
+        completed
     }
 }
 
-/// Isolate-local feedback-change history and measured compile-cost ledger.
 #[derive(Debug, Default)]
 pub(crate) struct TierPolicy {
     functions: FxHashMap<u32, FunctionTierState>,
-    cumulative_compile_ns: FxHashMap<(u32, CostedTier), u64>,
-    last_compile_ns: FxHashMap<(u32, CostedTier), u64>,
+    retraining_functions: usize,
 }
 
 impl TierPolicy {
-    /// Establish the feedback/execution baseline owned by the first installed
-    /// Template generation. Generated entries can then measure stability from
-    /// that real snapshot without making an unrelated first policy sample
-    /// retroactively treat all bootstrap executions as stable.
-    pub(crate) fn observe_template_generation(
-        &mut self,
-        function_id: u32,
-        executions: u64,
-        feedback_epoch: Option<u32>,
-    ) {
-        let Some(epoch) = feedback_epoch else {
+    pub(crate) fn bind_source(&mut self, function: &CodeBlock) {
+        let state = self.functions.entry(function.id).or_default();
+        if let Some(work) = &state.work {
+            assert!(
+                Arc::ptr_eq(work, function.source_work()),
+                "one function owns one work scalar"
+            );
+        } else {
+            state.work = Some(Arc::clone(function.source_work()));
+        }
+    }
+
+    pub(crate) fn begin_retraining(&mut self, function_id: u32, work: u64) {
+        let state = self.functions.entry(function_id).or_default();
+        if state.retraining.is_none() {
+            self.retraining_functions += 1;
+        }
+        state.retraining_generation = state
+            .retraining_generation
+            .checked_add(1)
+            .expect("function retraining generation overflow");
+        state.retraining = Some(RetrainingState {
+            remaining_work: work.max(1),
+            completed_path: false,
+        });
+        state.last_feedback_epoch = None;
+        state.observed_feedback_change = false;
+    }
+    #[inline]
+    pub(crate) fn has_retraining(&self) -> bool {
+        self.retraining_functions != 0
+    }
+    #[inline]
+    pub(crate) fn retraining_generation(&self, fid: u32) -> Option<u64> {
+        if !self.has_retraining() {
+            return None;
+        }
+        let state = self.functions.get(&fid)?;
+        state
+            .retraining
+            .as_ref()
+            .map(|_| state.retraining_generation)
+    }
+    pub(crate) fn note_interpreted_work(&mut self, fid: u32, generation: u64) {
+        self.update_retraining(fid, generation, false);
+    }
+    pub(crate) fn note_completed_interpreted_path(&mut self, fid: u32, generation: u64) {
+        self.update_retraining(fid, generation, true);
+    }
+    fn update_retraining(&mut self, fid: u32, generation: u64, completed: bool) {
+        let Some(state) = self.functions.get_mut(&fid) else {
             return;
         };
-        let state = self.functions.entry(function_id).or_default();
+        if state.retraining_generation != generation {
+            return;
+        }
+        let Some(retraining) = state.retraining.as_mut() else {
+            return;
+        };
+        if completed {
+            retraining.completed_path = true;
+        } else {
+            retraining.remaining_work = retraining.remaining_work.saturating_sub(1);
+        }
+        if retraining.remaining_work == 0 && retraining.completed_path {
+            state.retraining = None;
+            self.retraining_functions -= 1;
+        }
+    }
+
+    pub(crate) fn observe_template_generation(&mut self, function: &CodeBlock) {
+        self.bind_source(function);
+        let state = self.functions.get_mut(&function.id).expect("bound source");
         if state.last_feedback_epoch.is_none() {
-            state.last_feedback_epoch = Some(epoch);
-            state.stable_since_execution = executions;
+            state.last_feedback_epoch = Some(function.feedback_epoch());
+            state.stable_work_origin = function.source_work().total();
         }
     }
 
     pub(crate) fn evict_function_range(&mut self, start: u32, end: u32) {
+        self.retraining_functions -= self
+            .functions
+            .iter()
+            .filter(|(fid, state)| **fid >= start && **fid < end && state.retraining.is_some())
+            .count();
         self.functions
-            .retain(|function_id, _| !(*function_id >= start && *function_id < end));
-        self.cumulative_compile_ns
-            .retain(|(function_id, _), _| !(*function_id >= start && *function_id < end));
-        self.last_compile_ns
-            .retain(|(function_id, _), _| !(*function_id >= start && *function_id < end));
+            .retain(|fid, _| !(*fid >= start && *fid < end));
     }
-
-    pub(crate) fn record_compile_duration(
+    pub(crate) fn record_compile_attempt(&mut self, fid: u32, tier: CostedTier) {
+        let attempts = &mut self.functions.entry(fid).or_default().compile_attempts[tier.index()];
+        *attempts = attempts.saturating_add(1);
+    }
+    pub(crate) fn record_resource_refusal(
         &mut self,
-        function_id: u32,
+        function: &CodeBlock,
         tier: CostedTier,
-        duration_ns: u64,
+        retained_bytes: u64,
     ) {
-        let total = self
-            .cumulative_compile_ns
-            .entry((function_id, tier))
-            .or_insert(0);
-        *total = total.saturating_add(duration_ns);
-        self.last_compile_ns
-            .insert((function_id, tier), duration_ns);
+        self.bind_source(function);
+        let state = self.functions.get_mut(&function.id).expect("bound source");
+        state.refused_code_bytes[tier.index()] =
+            state.refused_code_bytes[tier.index()].max(retained_bytes);
     }
 
-    /// Withdraw the latest generation's compile time from the break-even
-    /// ledger. A generation replaced only because it predates its feedback
-    /// did not waste that work, so it must not raise the next threshold.
-    pub(crate) fn forgive_last_compile(&mut self, function_id: u32, tier: CostedTier) {
-        let Some(last) = self.last_compile_ns.remove(&(function_id, tier)) else {
-            return;
-        };
-        if let Some(total) = self.cumulative_compile_ns.get_mut(&(function_id, tier)) {
-            *total = total.saturating_sub(last);
-        }
+    pub(crate) fn compile_attempts(&self, fid: u32, tier: CostedTier) -> u64 {
+        self.functions
+            .get(&fid)
+            .map_or(0, |state| state.compile_attempts[tier.index()])
     }
 
-    pub(crate) fn cumulative_compile_ns(&self, function_id: u32, tier: CostedTier) -> u64 {
-        self.cumulative_compile_ns
-            .get(&(function_id, tier))
-            .copied()
-            .unwrap_or(0)
-    }
-
-    fn sample_and_decide(
+    pub(crate) fn decide(
         &mut self,
-        function_id: u32,
-        executions: u64,
-        feedback_epoch: Option<u32>,
-        mut input: TierCostInput,
-    ) -> OptimizingDecision {
-        let Some(epoch) = feedback_epoch else {
-            return OptimizingDecision::Cold;
+        function: &CodeBlock,
+        tier: CostedTier,
+        available_code_bytes: u64,
+    ) -> TierWorkDecision {
+        self.bind_source(function);
+        let state = self.functions.get_mut(&function.id).expect("bound source");
+        let total = function.source_work().total();
+        let epoch = function.feedback_epoch();
+        match state.last_feedback_epoch {
+            None => {
+                state.last_feedback_epoch = Some(epoch);
+                state.stable_work_origin = total;
+            }
+            Some(previous) if previous == epoch => {}
+            Some(_) => {
+                state.last_feedback_epoch = Some(epoch);
+                state.stable_work_origin = total;
+                state.observed_feedback_change = true;
+                state.refused_code_bytes = [0; 2];
+            }
+        }
+        let origin = match tier {
+            CostedTier::Template => 0,
+            CostedTier::Optimizing => state.stable_work_origin,
         };
-        let state = self.functions.entry(function_id).or_default();
-        let stable_executions = state.stable_executions(executions, epoch);
-        input.executions = stable_executions;
-        input.cumulative_compile_ns = self
-            .cumulative_compile_ns
-            .get(&(function_id, input.tier))
-            .copied()
-            .unwrap_or(0);
-        if TierCostModel::calibrated().decide(input).should_compile() {
+        let mut decision = TierWorkModel::calibrated().decide(TierWorkInput {
+            tier,
+            observed_work: total.saturating_sub(origin),
+            bytecode_instructions: function.code.len() as u64,
+            register_count: u64::from(function.register_count),
+            parameter_count: u64::from(function.param_count),
+            available_code_bytes,
+            previous_compile_attempts: state.compile_attempts[tier.index()],
+        });
+        if state.refused_code_bytes[tier.index()] > available_code_bytes {
+            decision.reason = TierWorkReason::CodeMemoryBudget;
+            decision.work_target = None;
+        }
+        decision.work_target = decision
+            .work_target
+            .and_then(|required| origin.checked_add(required));
+        if state.retraining.is_some()
+            || (decision.work_target.is_none()
+                && decision.reason != TierWorkReason::CodeMemoryBudget)
+        {
+            decision.reason = TierWorkReason::InsufficientWork;
+        }
+        decision
+    }
+
+    pub(crate) fn optimizing_decision(
+        &mut self,
+        function: &CodeBlock,
+        available_code_bytes: u64,
+    ) -> OptimizingDecision {
+        let decision = self.decide(function, CostedTier::Optimizing, available_code_bytes);
+        let state = self.functions.get(&function.id).expect("bound source");
+        if decision.should_compile() {
             OptimizingDecision::Promote
         } else if state.observed_feedback_change {
             OptimizingDecision::FeedbackUnstable
-        } else if stable_executions == 0 {
+        } else if decision.observed_work == 0 {
             OptimizingDecision::Warming
         } else {
             OptimizingDecision::Cold
@@ -442,35 +419,11 @@ impl Interpreter {
     #[must_use]
     pub(crate) fn optimizing_tier_decision_for(
         &mut self,
-        function_id: u32,
-        bytecode_instructions: u64,
-        register_count: u64,
-        parameter_count: u64,
-        resident_code_bytes: u64,
+        function: &CodeBlock,
+        available_code_bytes: u64,
     ) -> OptimizingDecision {
-        let generated_entries = self
-            .jit_code_registry
-            .generated_entries_for_function(function_id);
-        let executions = u64::from(self.jit_call_counts.get(&function_id).copied().unwrap_or(0))
-            .saturating_add(generated_entries);
-        let trigger = TierTrigger::FunctionEntry;
-        let feedback_epoch = self.code_space.feedback_epoch(function_id);
-        self.optimizing_tier_policy.sample_and_decide(
-            function_id,
-            executions,
-            feedback_epoch,
-            TierCostInput {
-                tier: CostedTier::Optimizing,
-                trigger,
-                executions: 0,
-                exits: 0,
-                bytecode_instructions,
-                register_count,
-                parameter_count,
-                resident_code_bytes,
-                cumulative_compile_ns: 0,
-            },
-        )
+        self.optimizing_tier_policy
+            .optimizing_decision(function, available_code_bytes)
     }
 }
 
@@ -479,103 +432,207 @@ mod tests {
     use super::*;
 
     #[test]
-    fn cost_model_promotion_is_monotonic_in_expected_execution() {
-        let model = TierCostModel::calibrated();
-        let mut promoted = false;
-
-        for executions in 0..=100_000 {
-            let decision = model.decide(TierCostInput {
-                tier: CostedTier::Optimizing,
-                trigger: TierTrigger::FunctionEntry,
-                executions,
-                exits: 0,
-                bytecode_instructions: 96,
-                register_count: 12,
-                parameter_count: 3,
-                resident_code_bytes: 0,
-                cumulative_compile_ns: 0,
-            });
-            if decision.should_compile() {
-                promoted = true;
-            }
-            assert!(
-                !promoted || decision.should_compile(),
-                "more expected executions must not reverse a profitable decision"
-            );
-        }
-
-        assert!(promoted, "a sufficiently hot bounded function must promote");
+    fn retraining_loop_completion_survives_alternating_nested_headers() {
+        let mut activation = RetrainingActivation::new(1, false);
+        assert!(!activation.observe_backedge(10));
+        assert!(!activation.observe_backedge(20));
+        assert!(activation.observe_backedge(10));
+        assert!(activation.observe_backedge(20));
     }
 
     #[test]
-    fn cost_model_rejects_code_memory_budget_before_profitability() {
-        let model = TierCostModel::calibrated();
-        let decision = model.decide(TierCostInput {
-            tier: CostedTier::Template,
-            trigger: TierTrigger::LoopBackedge {
-                span_instructions: 24,
-            },
-            executions: u64::MAX,
-            exits: 0,
-            bytecode_instructions: 64,
+    fn retraining_requires_exact_work_and_completed_path() {
+        let mut policy = TierPolicy::default();
+        policy.begin_retraining(7, 3);
+        let generation = policy.retraining_generation(7).unwrap();
+        for _ in 0..3 {
+            policy.note_interpreted_work(7, generation);
+        }
+        assert_eq!(
+            policy.retraining_generation(7),
+            Some(generation),
+            "a suffix alone is insufficient"
+        );
+        policy.note_completed_interpreted_path(7, generation);
+        assert!(!policy.has_retraining());
+
+        policy.begin_retraining(7, 3);
+        let generation = policy.retraining_generation(7).unwrap();
+        policy.note_completed_interpreted_path(7, generation);
+        for _ in 0..2 {
+            policy.note_interpreted_work(7, generation);
+        }
+        assert!(
+            policy.has_retraining(),
+            "completion cannot erase unpaid work"
+        );
+        policy.note_interpreted_work(7, generation);
+        assert!(!policy.has_retraining());
+    }
+
+    #[test]
+    fn new_retraining_generation_rejects_older_recursive_evidence_and_evicts() {
+        let mut policy = TierPolicy::default();
+        policy.begin_retraining(7, 1);
+        let old = policy.retraining_generation(7).unwrap();
+        policy.begin_retraining(7, 1);
+        let current = policy.retraining_generation(7).unwrap();
+        assert_ne!(old, current);
+        policy.note_completed_interpreted_path(7, old);
+        policy.note_interpreted_work(7, old);
+        assert_eq!(policy.retraining_generation(7), Some(current));
+        policy.note_interpreted_work(7, current);
+        assert!(policy.has_retraining());
+        policy.note_completed_interpreted_path(7, current);
+        assert!(!policy.has_retraining());
+
+        policy.begin_retraining(7, 1);
+        policy.begin_retraining(8, 1);
+        policy.evict_function_range(7, 8);
+        assert!(policy.has_retraining());
+        assert!(policy.retraining_generation(7).is_none());
+        policy.evict_function_range(8, 9);
+        assert!(!policy.has_retraining());
+    }
+
+    fn input(tier: CostedTier) -> TierWorkInput {
+        TierWorkInput {
+            tier,
+            observed_work: 0,
+            bytecode_instructions: 32,
             register_count: 8,
             parameter_count: 2,
-            resident_code_bytes: JIT_CODE_RESOURCE_LIMIT_BYTES,
-            cumulative_compile_ns: 0,
-        });
-
-        assert_eq!(decision.reason(), TierCostReason::CodeMemoryBudget);
-        assert!(!decision.should_compile());
+            available_code_bytes: JIT_CODE_RESOURCE_LIMIT_BYTES,
+            previous_compile_attempts: 0,
+        }
+    }
+    #[test]
+    fn work_admission_has_exact_monotone_boundary() {
+        for tier in [CostedTier::Template, CostedTier::Optimizing] {
+            let mut value = input(tier);
+            let target = TierWorkModel::calibrated().minimum_required_work(value);
+            value.observed_work = target - 1;
+            assert!(!TierWorkModel::calibrated().decide(value).should_compile());
+            for work in [target, target + 1, u64::MAX] {
+                value.observed_work = work;
+                assert!(TierWorkModel::calibrated().decide(value).should_compile());
+            }
+        }
+    }
+    #[test]
+    fn work_geometry_never_creates_execution_and_resource_cap_remains_hard() {
+        let mut value = input(CostedTier::Template);
+        for instructions in [1, 32, 1_000_000] {
+            value.bytecode_instructions = instructions;
+            assert!(!TierWorkModel::calibrated().decide(value).should_compile());
+        }
+        value.observed_work = u64::MAX;
+        value.available_code_bytes = 0;
+        assert_eq!(
+            TierWorkModel::calibrated().decide(value).reason(),
+            TierWorkReason::CodeMemoryBudget
+        );
+        value.available_code_bytes = JIT_CODE_RESOURCE_LIMIT_BYTES;
+        value.previous_compile_attempts = u64::MAX;
+        assert!(
+            !TierWorkModel::calibrated().decide(value).should_compile(),
+            "saturated cost cannot be funded"
+        );
+    }
+    #[test]
+    fn feedback_origin_and_wakeup_preserve_already_observed_work() {
+        use otter_bytecode::Op;
+        let function = CodeBlock::jit_test_stub(
+            7,
+            0,
+            1,
+            &[crate::jit::JitTestInstruction::new(
+                Op::ReturnUndefined,
+                0,
+                0,
+                vec![],
+            )],
+            &[],
+        );
+        let mut policy = TierPolicy::default();
+        function.source_work().charge(100);
+        let first = policy.decide(
+            &function,
+            CostedTier::Optimizing,
+            JIT_CODE_RESOURCE_LIMIT_BYTES,
+        );
+        assert_eq!(first.observed_work, 0);
+        let target = first.work_target.unwrap();
+        function.source_work().charge(first.required_work / 2);
+        let halfway = policy.decide(
+            &function,
+            CostedTier::Optimizing,
+            JIT_CODE_RESOURCE_LIMIT_BYTES,
+        );
+        assert_eq!(halfway.work_target, Some(target));
+        assert!(halfway.observed_work > 0);
+        function.bump_feedback_epoch();
+        let changed = policy.decide(
+            &function,
+            CostedTier::Optimizing,
+            JIT_CODE_RESOURCE_LIMIT_BYTES,
+        );
+        assert_eq!(changed.observed_work, 0);
+        assert_eq!(
+            changed.work_target,
+            function
+                .source_work()
+                .total()
+                .checked_add(changed.required_work)
+        );
+    }
+    #[test]
+    fn source_work_resource_requirement_is_exact_epoch_scoped_and_headroom_reversible() {
+        let function = CodeBlock::jit_test_stub(7, 0, 1, &[], &[]);
+        let mut policy = TierPolicy::default();
+        function.source_work().charge(1_000_000);
+        assert!(
+            policy
+                .decide(&function, CostedTier::Template, 2048)
+                .should_compile()
+        );
+        policy.record_compile_attempt(7, CostedTier::Template);
+        policy.record_resource_refusal(&function, CostedTier::Template, 4096);
+        let blocked = policy.decide(&function, CostedTier::Template, 2048);
+        assert!(blocked.resource_blocked());
+        assert_eq!(blocked.work_target, None);
+        assert!(
+            policy
+                .decide(&function, CostedTier::Template, 4096)
+                .should_compile(),
+            "unchanged work can compile after real headroom is restored"
+        );
+        function.bump_feedback_epoch();
+        assert!(
+            policy
+                .decide(&function, CostedTier::Template, 2048)
+                .should_compile(),
+            "changed feedback can produce a different finalized mapping"
+        );
+        assert_eq!(policy.compile_attempts(7, CostedTier::Template), 1);
     }
 
     #[test]
-    fn feedback_change_resets_execution_evidence_without_sample_window() {
+    fn compiler_attempts_share_function_ownership_and_eviction() {
         let mut policy = TierPolicy::default();
-        let base = TierCostInput {
-            tier: CostedTier::Optimizing,
-            trigger: TierTrigger::FunctionEntry,
-            executions: 0,
-            exits: 0,
-            bytecode_instructions: 24,
-            register_count: 1,
-            parameter_count: 0,
-            resident_code_bytes: 0,
-            cumulative_compile_ns: 0,
-        };
-        assert_eq!(
-            policy.sample_and_decide(7, 10_000, Some(1), base),
-            OptimizingDecision::Warming
-        );
-        assert_eq!(
-            policy.sample_and_decide(7, 20_000, Some(1), base),
-            OptimizingDecision::Promote
-        );
-        assert_eq!(
-            policy.sample_and_decide(7, 20_001, Some(2), base),
-            OptimizingDecision::FeedbackUnstable
-        );
-    }
-
-    #[test]
-    fn template_generation_seeds_generated_entry_stability() {
-        let mut policy = TierPolicy::default();
-        let input = TierCostInput {
-            tier: CostedTier::Optimizing,
-            trigger: TierTrigger::FunctionEntry,
-            executions: 0,
-            exits: 0,
-            bytecode_instructions: 17,
-            register_count: 14,
-            parameter_count: 1,
-            resident_code_bytes: 0,
-            cumulative_compile_ns: 0,
-        };
-        let break_even = TierCostModel::calibrated().minimum_profitable_executions(input);
-        policy.observe_template_generation(8, 34, Some(1));
-
-        assert_eq!(
-            policy.sample_and_decide(8, 34 + break_even, Some(1), input),
-            OptimizingDecision::Promote
-        );
+        let initial =
+            TierWorkModel::calibrated().minimum_required_work(input(CostedTier::Template));
+        for attempt in 1..=4 {
+            policy.record_compile_attempt(7, CostedTier::Template);
+            assert_eq!(policy.compile_attempts(7, CostedTier::Template), attempt);
+            assert_eq!(policy.compile_attempts(7, CostedTier::Optimizing), 0);
+            let mut value = input(CostedTier::Template);
+            value.previous_compile_attempts = attempt;
+            assert!(TierWorkModel::calibrated().minimum_required_work(value) > initial);
+        }
+        policy.record_compile_attempt(8, CostedTier::Template);
+        policy.evict_function_range(7, 8);
+        assert_eq!(policy.compile_attempts(7, CostedTier::Template), 0);
+        assert_eq!(policy.compile_attempts(8, CostedTier::Template), 1);
     }
 }

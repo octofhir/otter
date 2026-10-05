@@ -40,6 +40,9 @@
 //!   list re-mints identical [`crate::property_atom::AtomId`]s.
 //! - `global_lexicals` is sorted by name so two captures of the same
 //!   build compare equal.
+//! - Code capture admits independent mutable execution tables and directory
+//!   metadata on the current resource account; immutable compiler/source owners
+//!   retain their existing shared leases without pinning donor payloads.
 //! - All restoration-capable fields are crate-private. Public methods expose
 //!   owned-data diagnostics only, never raw heap handles or mutable carriers.
 //!
@@ -148,7 +151,7 @@ impl crate::Interpreter {
             });
         }
         let image = self.capture_heap_image()?;
-        let code_space = self.snapshot_code_space();
+        let code_space = self.snapshot_code_space()?;
         let dynamic_natives = crate::native_function::snapshot_dynamic_natives(self.gc_heap());
         let fixed_roots = self.capture_snapshot_roots();
         let mut iterator_prototype_roots = [RawGc::NULL; ITERATOR_PROTOTYPE_ROOT_COUNT];

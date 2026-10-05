@@ -250,13 +250,17 @@ pub fn construct_instance<'s, T: HostAncestry>(
     let instance = cx
         .ctx()
         .alloc_host_object(instance)
-        .map_err(|err| JsError::Type(err.to_string()))?;
+        .map_err(|error| JsError::from_native(crate::NativeError::from(error)))?;
     let handle = cx.park(Value::object(instance));
     if let Some(proto) = proto {
         let raw_proto = cx.escape(proto);
         let raw_instance = cx.escape(handle);
         if let Some(object) = raw_instance.as_object() {
-            object::set_prototype_value(object, cx.heap_mut(), Some(raw_proto));
+            if !object::set_prototype_value(&mut { object }, cx.heap_mut(), Some(raw_proto))
+                .map_err(|error| JsError::from_native(crate::NativeError::from(error)))?
+            {
+                return Err(JsError::Type("host instance prototype rejected".into()));
+            }
         }
     }
     Ok(handle)
@@ -278,7 +282,7 @@ fn charged_instance<T: HostAncestry>(
         let external = cx
             .heap_mut()
             .reserve_external(len as u64)
-            .map_err(|err| JsError::Type(err.to_string()))?;
+            .map_err(|error| JsError::from_native(crate::NativeError::from(error)))?;
         instance.set_external_charge(external);
     }
     Ok(instance)
@@ -349,13 +353,17 @@ pub fn class_instance<'s, T: HostAncestry>(
     let instance = cx
         .ctx()
         .alloc_host_object(instance)
-        .map_err(|err| JsError::Type(err.to_string()))?;
+        .map_err(|error| JsError::from_native(crate::NativeError::from(error)))?;
     let handle = cx.park(Value::object(instance));
     if let Some(proto) = proto {
         let raw_proto = cx.escape(proto);
         let raw_instance = cx.escape(handle);
         if let Some(object) = raw_instance.as_object() {
-            object::set_prototype_value(object, cx.heap_mut(), Some(raw_proto));
+            if !object::set_prototype_value(&mut { object }, cx.heap_mut(), Some(raw_proto))
+                .map_err(|error| JsError::from_native(crate::NativeError::from(error)))?
+            {
+                return Err(JsError::Type("host instance prototype rejected".into()));
+            }
         }
     }
     Ok(handle)

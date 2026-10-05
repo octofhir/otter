@@ -74,22 +74,25 @@ fn new_object_named_store_loop(iterations: i32) -> ExecutionContext {
         instr(9, Op::Jump, [Operand::Imm32(-6)]),
         instr(10, Op::ReturnUndefined, []),
     ];
-    ExecutionContext::from_module(BytecodeModule {
-        module: "property-gc-new-object-store-bench.js".to_string(),
-        template_sites: Vec::new(),
-        source_kind: SourceKind::JavaScript,
-        functions: vec![Function {
-            id: 0,
-            name: "<main>".to_string(),
-            scratch: 9,
-            code: code.into(),
-            ..Function::default()
-        }],
-        constants: vec![string_constant("foo")],
-        module_resolutions: Vec::new(),
-        module_inits: Vec::new(),
-        function_source: None,
-    })
+    ExecutionContext::from_module(
+        BytecodeModule {
+            module: "property-gc-new-object-store-bench.js".to_string(),
+            template_sites: Vec::new(),
+            source_kind: SourceKind::JavaScript,
+            functions: vec![Function {
+                id: 0,
+                name: "<main>".to_string(),
+                scratch: 9,
+                code: code.into(),
+                ..Function::default()
+            }],
+            constants: vec![string_constant("foo")],
+            module_resolutions: Vec::new(),
+            module_inits: Vec::new(),
+            function_source: None,
+        },
+        crate::source_registry::SourceRegistry::default(),
+    )
     .expect("valid bytecode fixture")
 }
 
@@ -151,22 +154,25 @@ fn new_object_two_named_stores_loop(iterations: i32) -> ExecutionContext {
         instr(11, Op::Jump, [Operand::Imm32(-7)]),
         instr(12, Op::ReturnUndefined, []),
     ];
-    ExecutionContext::from_module(BytecodeModule {
-        module: "property-gc-new-object-two-stores-bench.js".to_string(),
-        template_sites: Vec::new(),
-        source_kind: SourceKind::JavaScript,
-        functions: vec![Function {
-            id: 0,
-            name: "<main>".to_string(),
-            scratch: 9,
-            code: code.into(),
-            ..Function::default()
-        }],
-        constants: vec![string_constant("foo"), string_constant("bar")],
-        module_resolutions: Vec::new(),
-        module_inits: Vec::new(),
-        function_source: None,
-    })
+    ExecutionContext::from_module(
+        BytecodeModule {
+            module: "property-gc-new-object-two-stores-bench.js".to_string(),
+            template_sites: Vec::new(),
+            source_kind: SourceKind::JavaScript,
+            functions: vec![Function {
+                id: 0,
+                name: "<main>".to_string(),
+                scratch: 9,
+                code: code.into(),
+                ..Function::default()
+            }],
+            constants: vec![string_constant("foo"), string_constant("bar")],
+            module_resolutions: Vec::new(),
+            module_inits: Vec::new(),
+            function_source: None,
+        },
+        crate::source_registry::SourceRegistry::default(),
+    )
     .expect("valid bytecode fixture")
 }
 
@@ -234,22 +240,25 @@ fn inherited_writable_data_store_loop(iterations: i32) -> ExecutionContext {
         instr(13, Op::Jump, [Operand::Imm32(-7)]),
         instr(14, Op::ReturnUndefined, []),
     ];
-    ExecutionContext::from_module(BytecodeModule {
-        module: "property-gc-inherited-data-store-bench.js".to_string(),
-        template_sites: Vec::new(),
-        source_kind: SourceKind::JavaScript,
-        functions: vec![Function {
-            id: 0,
-            name: "<main>".to_string(),
-            scratch: 10,
-            code: code.into(),
-            ..Function::default()
-        }],
-        constants: vec![string_constant("foo")],
-        module_resolutions: Vec::new(),
-        module_inits: Vec::new(),
-        function_source: None,
-    })
+    ExecutionContext::from_module(
+        BytecodeModule {
+            module: "property-gc-inherited-data-store-bench.js".to_string(),
+            template_sites: Vec::new(),
+            source_kind: SourceKind::JavaScript,
+            functions: vec![Function {
+                id: 0,
+                name: "<main>".to_string(),
+                scratch: 10,
+                code: code.into(),
+                ..Function::default()
+            }],
+            constants: vec![string_constant("foo")],
+            module_resolutions: Vec::new(),
+            module_inits: Vec::new(),
+            function_source: None,
+        },
+        crate::source_registry::SourceRegistry::default(),
+    )
     .expect("valid bytecode fixture")
 }
 
@@ -343,26 +352,29 @@ fn inherited_non_writable_data_store_loop(iterations: i32) -> ExecutionContext {
         instr(17, Op::Jump, [Operand::Imm32(-7)]),
         instr(18, Op::ReturnUndefined, []),
     ];
-    ExecutionContext::from_module(BytecodeModule {
-        module: "property-gc-inherited-nonwritable-store-bench.js".to_string(),
-        template_sites: Vec::new(),
-        source_kind: SourceKind::JavaScript,
-        functions: vec![Function {
-            id: 0,
-            name: "<main>".to_string(),
-            scratch: 12,
-            code: code.into(),
-            ..Function::default()
-        }],
-        constants: vec![
-            string_constant("foo"),
-            string_constant("value"),
-            string_constant("writable"),
-        ],
-        module_resolutions: Vec::new(),
-        module_inits: Vec::new(),
-        function_source: None,
-    })
+    ExecutionContext::from_module(
+        BytecodeModule {
+            module: "property-gc-inherited-nonwritable-store-bench.js".to_string(),
+            template_sites: Vec::new(),
+            source_kind: SourceKind::JavaScript,
+            functions: vec![Function {
+                id: 0,
+                name: "<main>".to_string(),
+                scratch: 12,
+                code: code.into(),
+                ..Function::default()
+            }],
+            constants: vec![
+                string_constant("foo"),
+                string_constant("value"),
+                string_constant("writable"),
+            ],
+            module_resolutions: Vec::new(),
+            module_inits: Vec::new(),
+            function_source: None,
+        },
+        crate::source_registry::SourceRegistry::default(),
+    )
     .expect("valid bytecode fixture")
 }
 
@@ -419,22 +431,25 @@ fn direct_prototype_missing_store_loop(iterations: i32) -> ExecutionContext {
         instr(11, Op::Jump, [Operand::Imm32(-7)]),
         instr(12, Op::ReturnUndefined, []),
     ];
-    ExecutionContext::from_module(BytecodeModule {
-        module: "property-gc-direct-prototype-missing-store-bench.js".to_string(),
-        template_sites: Vec::new(),
-        source_kind: SourceKind::JavaScript,
-        functions: vec![Function {
-            id: 0,
-            name: "<main>".to_string(),
-            scratch: 10,
-            code: code.into(),
-            ..Function::default()
-        }],
-        constants: vec![string_constant("foo")],
-        module_resolutions: Vec::new(),
-        module_inits: Vec::new(),
-        function_source: None,
-    })
+    ExecutionContext::from_module(
+        BytecodeModule {
+            module: "property-gc-direct-prototype-missing-store-bench.js".to_string(),
+            template_sites: Vec::new(),
+            source_kind: SourceKind::JavaScript,
+            functions: vec![Function {
+                id: 0,
+                name: "<main>".to_string(),
+                scratch: 10,
+                code: code.into(),
+                ..Function::default()
+            }],
+            constants: vec![string_constant("foo")],
+            module_resolutions: Vec::new(),
+            module_inits: Vec::new(),
+            function_source: None,
+        },
+        crate::source_registry::SourceRegistry::default(),
+    )
     .expect("valid bytecode fixture")
 }
 
@@ -485,27 +500,30 @@ fn primitive_boolean_store_loop(iterations: i32) -> ExecutionContext {
         instr(9, Op::Jump, [Operand::Imm32(-5)]),
         instr(10, Op::ReturnUndefined, []),
     ];
-    ExecutionContext::from_module(BytecodeModule {
-        module: "property-gc-primitive-boolean-store-bench.js".to_string(),
-        template_sites: Vec::new(),
-        source_kind: SourceKind::JavaScript,
-        functions: vec![Function {
-            id: 0,
-            name: "<main>".to_string(),
-            scratch: 9,
-            code: code.into(),
-            ..Function::default()
-        }],
-        constants: vec![string_constant("foo")],
-        module_resolutions: Vec::new(),
-        module_inits: Vec::new(),
-        function_source: None,
-    })
+    ExecutionContext::from_module(
+        BytecodeModule {
+            module: "property-gc-primitive-boolean-store-bench.js".to_string(),
+            template_sites: Vec::new(),
+            source_kind: SourceKind::JavaScript,
+            functions: vec![Function {
+                id: 0,
+                name: "<main>".to_string(),
+                scratch: 9,
+                code: code.into(),
+                ..Function::default()
+            }],
+            constants: vec![string_constant("foo")],
+            module_resolutions: Vec::new(),
+            module_inits: Vec::new(),
+            function_source: None,
+        },
+        crate::source_registry::SourceRegistry::default(),
+    )
     .expect("valid bytecode fixture")
 }
 
 fn run_gc_measured_iters(context: &ExecutionContext, iters: u64) -> std::time::Duration {
-    let mut interp = Interpreter::new();
+    let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
     interp.run(context).expect("warm property GC loop");
     interp.force_gc().expect("force GC");
     let mut runs_since_gc = 0_u32;

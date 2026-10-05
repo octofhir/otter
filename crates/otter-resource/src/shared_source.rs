@@ -14,6 +14,10 @@
 //! # Invariants
 //! - The source text and its non-cloneable lease live in the same private
 //!   `Arc` allocation and cannot be separated through the public API.
+//! - UTF-8 slice handles share that allocation and charge; a short line may
+//!   retain its full original source until the last slice drops.
+//! - Text embedded in the program image ([`SharedSource::from_static`]) is
+//!   not an allocation: it is shared without a copy and carries no charge.
 //! - Every live source allocation is charged exactly once, regardless of how
 //!   many [`SharedSource`] handles refer to it.
 //! - A builder's lease always equals its retained byte length. Capacity is
@@ -27,11 +31,11 @@
 //! - [`crate::ResourceLease`] provides the non-cloneable RAII charge carried
 //!   by each physical source allocation.
 
-use std::collections::TryReserveError;
+use std::borrow::Cow;
 use std::error::Error;
 use std::fmt;
 use std::io::{self, Read};
-use std::ops::Deref;
+use std::ops::{Deref, Range};
 use std::str::Utf8Error;
 use std::sync::Arc;
 
@@ -47,12 +51,14 @@ const READ_CHUNK_BYTES: usize = 16 * 1024;
 #[derive(Clone)]
 pub struct SharedSource {
     inner: Arc<SharedSourceInner>,
+    range: Range<usize>,
 }
 
 struct SharedSourceInner {
     // Field order is intentional: release the physical text before its charge.
-    text: Box<str>,
-    _lease: ResourceLease,
+    text: Cow<'static, str>,
+    // `None` exactly for static program-image text, which retains nothing.
+    _lease: Option<ResourceLease>,
 }
 
 impl SharedSource {
@@ -91,16 +97,47 @@ impl SharedSource {
         builder.finish_utf8()
     }
 
+    /// Share text that lives in the program image, such as a builtin module
+    /// embedded at product build time.
+    ///
+    /// The text is neither copied nor charged: it is not a retained
+    /// allocation, and it outlives every handle.
+    #[must_use]
+    pub fn from_static(text: &'static str) -> Self {
+        Self {
+            range: 0..text.len(),
+            inner: Arc::new(SharedSourceInner {
+                text: Cow::Borrowed(text),
+                _lease: None,
+            }),
+        }
+    }
+
     /// Return the UTF-8 byte length of this source.
     #[must_use]
     pub fn len(&self) -> usize {
-        self.inner.text.len()
+        self.range.len()
     }
 
     /// Return whether this source is empty.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.inner.text.is_empty()
+        self.range.is_empty()
+    }
+
+    /// Share a UTF-8 byte range within this view without copying source text.
+    ///
+    /// Returns `None` for an out-of-bounds range or a boundary inside a UTF-8
+    /// code point. A slice retains the complete original allocation and its
+    /// one exact charge until its final handle is dropped; it never retains
+    /// executable code or creates a second resource lease.
+    #[must_use]
+    pub fn slice(&self, range: Range<usize>) -> Option<Self> {
+        self.as_ref().get(range.clone())?;
+        Some(Self {
+            inner: self.inner.clone(),
+            range: self.range.start + range.start..self.range.start + range.end,
+        })
     }
 
     fn from_parts(text: Box<str>, lease: ResourceLease) -> Self {
@@ -109,10 +146,12 @@ impl SharedSource {
             lease.amount()
         );
         debug_assert_eq!(lease.class(), ResourceClass::SourceModuleBytes);
+        let range = 0..text.len();
         Self {
+            range,
             inner: Arc::new(SharedSourceInner {
-                text,
-                _lease: lease,
+                text: Cow::Owned(text.into_string()),
+                _lease: Some(lease),
             }),
         }
     }
@@ -120,7 +159,7 @@ impl SharedSource {
 
 impl AsRef<str> for SharedSource {
     fn as_ref(&self) -> &str {
-        &self.inner.text
+        &self.inner.text[self.range.clone()]
     }
 }
 
@@ -129,6 +168,12 @@ impl Deref for SharedSource {
 
     fn deref(&self) -> &Self::Target {
         self.as_ref()
+    }
+}
+
+impl serde::Serialize for SharedSource {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_ref())
     }
 }
 
@@ -174,7 +219,7 @@ impl SharedSourceBuilder {
     ///
     /// # Errors
     /// Returns [`SharedSourceError::Resource`] when the new exact total exceeds
-    /// its resource limit, [`SharedSourceError::Allocation`] when retained
+    /// its resource limit, an actual [`ResourceError::Allocation`] when retained
     /// capacity cannot be allocated, or [`SharedSourceError::LengthOverflow`]
     /// when the combined length is not representable.
     pub fn push_bytes(&mut self, chunk: &[u8]) -> Result<(), SharedSourceError> {
@@ -195,7 +240,12 @@ impl SharedSourceBuilder {
             self.lease
                 .resize(previous_amount)
                 .expect("shrinking to the previously admitted amount cannot fail");
-            return Err(SharedSourceError::Allocation(error));
+            return Err(SharedSourceError::Resource(ResourceError::Allocation {
+                class: ResourceClass::SourceModuleBytes,
+                capacity: new_len,
+                requested: new_amount,
+                cause: error,
+            }));
         }
         self.bytes.extend_from_slice(chunk);
         Ok(())
@@ -324,8 +374,6 @@ pub enum SharedSourceError {
     Resource(ResourceError),
     /// A streaming source provider returned an I/O error.
     Io(io::Error),
-    /// Retained byte capacity could not be allocated without panicking.
-    Allocation(TryReserveError),
     /// The complete source byte stream was not valid UTF-8.
     InvalidUtf8(Utf8Error),
     /// The source byte length cannot be represented by this target or ledger.
@@ -337,12 +385,6 @@ impl fmt::Display for SharedSourceError {
         match self {
             Self::Resource(error) => write!(formatter, "source resource admission failed: {error}"),
             Self::Io(error) => write!(formatter, "failed to read source bytes: {error}"),
-            Self::Allocation(error) => {
-                write!(
-                    formatter,
-                    "failed to allocate retained source bytes: {error}"
-                )
-            }
             Self::InvalidUtf8(error) => write!(formatter, "source is not valid UTF-8: {error}"),
             Self::LengthOverflow => formatter.write_str("source byte length overflowed"),
         }
@@ -354,7 +396,6 @@ impl Error for SharedSourceError {
         match self {
             Self::Resource(error) => Some(error),
             Self::Io(error) => Some(error),
-            Self::Allocation(error) => Some(error),
             Self::InvalidUtf8(error) => Some(error),
             Self::LengthOverflow => None,
         }

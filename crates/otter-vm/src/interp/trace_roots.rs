@@ -14,6 +14,10 @@ use crate::*;
 
 impl Interpreter {
     pub(crate) fn visit_root_function_ids(&self, visitor: &mut dyn FnMut(u32)) {
+        self.rejection_tracker.visit_function_ids(visitor);
+        for realm in &self.extra_realms {
+            realm.rejection_tracker.visit_function_ids(visitor);
+        }
         for value in self.template_objects.values() {
             crate::code_liveness::visit_value(value, visitor);
         }
@@ -307,10 +311,10 @@ impl Interpreter {
     }
 
     /// Trace cached transition shapes through live CodeBlock-owned IC slots
-    /// and the shared megamorphic transition table.
+    /// and the shared key/action table's actual child words.
     pub(crate) fn trace_property_ic_roots(&self, visitor: &mut otter_gc::raw::SlotVisitor<'_>) {
         self.code_space.trace_property_ic_roots(visitor);
-        self.store_transition_cache.trace_roots(visitor);
+        self.property_cache.trace_roots(visitor);
     }
 }
 
@@ -418,5 +422,13 @@ impl Interpreter {
     /// writes it back through here when it decides the throw still escapes.
     pub fn set_pending_uncaught_throw(&mut self, value: Value) {
         self.pending_uncaught_throw = Some(value);
+    }
+}
+
+impl Interpreter {
+    pub(crate) fn function_constructor_layouts_for_trace(
+        &self,
+    ) -> impl Iterator<Item = &crate::constructor_layout::ConstructorLayout> {
+        self.function_constructor_layouts.values()
     }
 }

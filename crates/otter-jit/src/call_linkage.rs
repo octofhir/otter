@@ -2,6 +2,7 @@
 //!
 //! # Contents
 //! - [`CallTarget`] — where a generated call goes.
+//! - [`ForwardedBinding`] — one mapped actual value recipe for both encoders.
 //! - [`EntryShape`] — static call semantics of one compiled function and its
 //!   record's second header word.
 //! - [`pushed_argument_bytes`] — the caller-stack bytes of one actual span.
@@ -10,12 +11,14 @@
 //! - One call ABI enters every bytecode function generation: the context,
 //!   the callee, the receiver as given, `new.target` (`undefined` exactly for
 //!   `[[Call]]`), the actual count and the actual span on the caller's stack,
-//!   padded with `undefined` to the callee's formal count. A compiled
+//!   containing exactly the actual arguments with alignment slack unread.
+//!   The callee initializes its missing formals to `undefined`. A compiled
 //!   generation's entry builds, publishes and retires its one native frame;
 //!   the caller pops the span.
 //! - A caller that proved its callee enters the current generation through
-//!   the target's permanent `FunctionEntryCell`; any other callee enters the
-//!   generic entry, which classifies it in the call trampoline.
+//!   the target's permanent `FunctionEntryCell`. A proved NativeFunction enters
+//!   the canonical Host native kernel through its selected kind convention;
+//!   every other callee is classified in the call trampoline.
 //! - Receiver binding belongs to the callee: an arrow's lexical `this`, a
 //!   strict or unobserved receiver as given, a sloppy object as given and any
 //!   other sloppy receiver through activation preparation; a base
@@ -23,6 +26,8 @@
 //!   hole.
 //! - The completion is `Success`, `Throw` or `Fatal`; side exits never cross
 //!   a call.
+//! - Both baseline encoders reload mapped formals from their traced window
+//!   or parameter context; Graph passes its current SSA binding locations.
 //!
 //! # See also
 //! - `crate::arm64::js_call` — the AArch64 caller.
@@ -50,8 +55,59 @@ pub(crate) enum CallTarget {
         /// The target's function id, the cell's relocation identity.
         function_id: u32,
     },
+    /// A proved NativeFunction, using the canonical Host native kernel.
+    Native,
     /// Classification of any callee.
     Generic,
+}
+
+/// Source-owned selector for the private JS call convention.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CallPlan {
+    /// No specialized callee proof.
+    Generic,
+    /// Exact bytecode identity and its permanent current-generation cell.
+    Bytecode(otter_vm::jit::JitDirectCallPlan),
+    /// Native kind only; its live body selects every semantic policy.
+    Native,
+}
+
+impl CallPlan {
+    /// Select from one current snapshot after any body-inline decision.
+    pub(crate) fn for_site(
+        view: &JitCompileSnapshot,
+        byte_pc: u32,
+        bytecode: Option<otter_vm::jit::JitDirectCallPlan>,
+    ) -> Self {
+        if let Some(plan) = bytecode {
+            Self::Bytecode(plan)
+        } else if matches!(
+            view.native_calls.get(&byte_pc),
+            Some(otter_vm::JitNativeCall::Native)
+        ) {
+            Self::Native
+        } else {
+            Self::Generic
+        }
+    }
+}
+
+/// Where a forwarded call reads the current value of one mapped formal.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum ForwardedBinding {
+    /// The value is in this register.
+    Register(u8),
+    /// The value is the word at `offset` from register `base`.
+    Load { base: u8, offset: u32 },
+    /// The value is slot word `slot_byte` of the context at `offset` from
+    /// register `base`, read by either baseline encoder.
+    ContextSlot {
+        base: u8,
+        offset: u32,
+        slot_byte: u32,
+    },
+    /// The value is this immediate.
+    Immediate(u64),
 }
 
 /// Largest caller-stack actual span one call pushes.
@@ -80,10 +136,10 @@ pub(crate) struct EntryShape {
     pub(crate) derived: bool,
     pub(crate) lexical_this: bool,
     pub(crate) converts_receiver: bool,
-    /// The entry leaves the register window unpublished and its body reads
-    /// the formals from the actual span; an exit that rebuilds the
-    /// interpreter frame publishes the window first.
-    #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
+    /// Adequate-actual entries leave the register window unpublished and read
+    /// formals from the actual span. Underarity entries initialize and publish
+    /// the reserved window before entering the body or allocating helpers;
+    /// an exit that rebuilds an unpublished interpreter window publishes it.
     pub(crate) lazy_window: bool,
 }
 
@@ -112,8 +168,7 @@ impl EntryShape {
         })
     }
 
-    /// The same shape with the window published only by an exit.
-    #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
+    /// The same shape with a window published only for underarity or an exit.
     pub(crate) fn with_lazy_window(self, lazy_window: bool) -> Self {
         Self {
             lazy_window,
@@ -137,11 +192,6 @@ impl EntryShape {
     /// through activation preparation.
     pub(crate) fn sloppy_receiver(self) -> bool {
         self.converts_receiver && !self.lexical_this && !self.derived
-    }
-
-    /// Whether a return can owe constructor completion.
-    pub(crate) fn completes_construct(self) -> bool {
-        self.constructible || self.derived
     }
 
     /// The record's second header word: register count, tier, flags and

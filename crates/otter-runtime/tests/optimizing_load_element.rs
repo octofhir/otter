@@ -254,12 +254,15 @@ fn call(
 }
 
 fn run(selection: JitSelection) -> (Value, Value, Value, Value, String, JitRuntimeStats) {
-    let mut interp = Interpreter::new();
+    let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
     if !matches!(selection, JitSelection::InterpreterOnly) {
         interp.set_jit_compiler(Some(Arc::new(OtterJitCompiler::production_tiered())));
     }
     let context = interp
-        .link_module(fixture_module())
+        .link_module(
+            fixture_module(),
+            otter_vm::source_registry::SourceRegistry::default(),
+        )
         .expect("valid bytecode fixture");
     let array = Value::array(
         interp
@@ -414,10 +417,13 @@ fn optimized_element_values_and_throw_match_interpreter() {
 
 #[test]
 fn float_array_loop_enters_optimized_code() {
-    let mut interp = Interpreter::new();
+    let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
     interp.set_jit_compiler(Some(Arc::new(OtterJitCompiler::production_tiered())));
     let context = interp
-        .link_module(fixture_module())
+        .link_module(
+            fixture_module(),
+            otter_vm::source_registry::SourceRegistry::default(),
+        )
         .expect("valid bytecode fixture");
     let array = Value::array(
         interp
@@ -454,10 +460,13 @@ fn float_array_loop_enters_optimized_code() {
 
 #[test]
 fn several_live_arrays_enter_optimized_code() {
-    let mut interp = Interpreter::new();
+    let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
     interp.set_jit_compiler(Some(Arc::new(OtterJitCompiler::production_tiered())));
     let context = interp
-        .link_module(fixture_module())
+        .link_module(
+            fixture_module(),
+            otter_vm::source_registry::SourceRegistry::default(),
+        )
         .expect("valid bytecode fixture");
     let arrays = [[1, 2, 3, 4], [10, 20, 30, 40], [2, 4, 6, 8], [1, 2, 3, 4]].map(|elements| {
         let array = Value::array(

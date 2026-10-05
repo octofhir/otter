@@ -24,8 +24,9 @@
 //! 4. Finalize and drop every unforwarded from-space body.
 //! 5. Set every to-space page's `age_mark` to its bump top: everything
 //!    copied there survived this scavenge.
-//! 6. Flip from↔to. The new from-space is recycled and starts
-//!    fresh; the new to-space is the prior from-space.
+//! 6. Flip from↔to. Survivor pages become the new from-space; the
+//!    mutator allocates above their age marks. Prior from-space becomes
+//!    the new to-space, whose evacuated/dead input storage is recycled.
 //!
 //! # Promotion
 //!
@@ -55,7 +56,11 @@
 //! - Roots and newly copied bodies receive complete strong-slot walks.
 //! - Remembered old parents may use type-owned mutation ranges, but every
 //!   remaining young edge is retained for the following collection.
-//! - Promotion space is admitted before the first forwarding write.
+//! - Promotion space is admitted before the first forwarding write. A failed
+//!   preflight makes no forwarding write and publishes no reclamation commit.
+//! - Exact aligned nursery input equals copied + promoted + reclaimed bytes.
+//!   The input byte total uses maintained physical allocation counters; the
+//!   promotion page reservation is a separate capacity upper bound.
 //!
 //! # See also
 //!
@@ -75,10 +80,14 @@ use crate::trace::TraceTable;
 /// Stats returned by [`scavenge`].
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct ScavengeStats {
-    /// Bytes copied to to-space (survived but not promoted).
+    /// Physical aligned cell bytes copied to to-space (not promoted).
     pub copied_bytes: usize,
-    /// Bytes promoted to old-space.
+    /// Physical aligned cell bytes promoted to old-space.
     pub promoted_bytes: usize,
+    /// Physical nursery bytes reclaimed after successful evacuation. The
+    /// preflight already totals exact allocated input bytes; copied/promoted
+    /// cells retain their aligned header sizes and are deducted once.
+    pub reclaimed_bytes: usize,
     /// Slot updates performed.
     pub slot_updates: usize,
     /// Minor-GC pause time in nanoseconds. Populated by the heap
@@ -189,7 +198,7 @@ pub unsafe fn scavenge(
     // when a remembered parent can reach any nursery page) need that 2× bound
     // in old space. Non-promoted pages use to-space first; reserve only their
     // possible overflow beyond the existing to-space page count.
-    let (active_pages, max_promotion_bytes) =
+    let (active_pages, allocated_nursery_bytes) =
         new_space
             .from_pages()
             .iter()
@@ -215,7 +224,7 @@ pub unsafe fn scavenge(
     let reserve_count = promotion_pages
         .saturating_mul(2)
         .saturating_add(copy_overflow);
-    old_space.reserve_promotion_pages(reserve_count, max_promotion_bytes)?;
+    old_space.reserve_promotion_pages(reserve_count, allocated_nursery_bytes)?;
 
     // Snapshot the remembered parents recorded by the mutator since the last
     // scavenge, then leave the live buffer empty so `remember_parent` can
@@ -291,8 +300,16 @@ pub unsafe fn scavenge(
         h.age_mark = h.bump_cursor;
     }
 
-    // 9) Flip from↔to.
+    // 9) Flip from↔to. The preflight's allocated-byte total is the exact
+    // physical input, not the larger page-capacity reservation bound. Every
+    // survivor contributes its aligned header size to exactly one counter.
     ctx.new_space().flip();
+    let retained_nursery_bytes = ctx
+        .stats
+        .copied_bytes
+        .saturating_add(ctx.stats.promoted_bytes);
+    debug_assert!(retained_nursery_bytes <= allocated_nursery_bytes);
+    ctx.stats.reclaimed_bytes = allocated_nursery_bytes.saturating_sub(retained_nursery_bytes);
 
     Ok(ctx.stats)
 }
@@ -712,10 +729,10 @@ unsafe fn evacuate(ctx: &mut ScavCtx, header: *mut GcHeader) -> u32 {
         let dest_header = dest_ptr as *mut GcHeader;
         if promoted {
             (*dest_header).promote_to_old();
-            ctx.stats.promoted_bytes += size;
+            ctx.stats.promoted_bytes += aligned;
             ctx.promoted_unscanned.push(new_offset);
         } else {
-            ctx.stats.copied_bytes += size;
+            ctx.stats.copied_bytes += aligned;
         }
 
         // Install forwarding pointer at the original location.

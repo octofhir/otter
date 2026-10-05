@@ -4,8 +4,6 @@
 //! - Direct `Map.get(Int32)` and existing-key `Map.set(Int32, value)`.
 //! - Missing keys, tombstones, growth, SameValueZero fallback, and barriers.
 //! - Method replacement and own-method shadowing after tier-up.
-//! - Artifact proof that an explicit-receiver `Map.get` calls its declared
-//!   no-allocation leaf with no published transition frame.
 //!
 //! # Invariants
 //! - Optimizing results match the interpreter oracle exactly.
@@ -111,60 +109,5 @@ fn optimizing_map_intrinsics_match_oracle_and_preserve_fallbacks() {
     assert!(
         _optimized_entries > 0,
         "fixture must enter optimized Map callers before fallback cases"
-    );
-}
-
-#[cfg(target_arch = "aarch64")]
-#[test]
-fn optimizing_map_artifacts_expose_frame_free_machine_hits() {
-    use otter_runtime::{JitArtifactFileName, JitDebugRequest, JitDebugTier};
-
-    let mut runtime = Runtime::builder()
-        .jit_selection(JitSelection::ProductionTiered)
-        .jit_debug(JitDebugRequest::artifacts())
-        .build()
-        .expect("Map artifact runtime");
-    let result = runtime
-        .run_script(
-            SourceInput::from_javascript(MAP_MATRIX),
-            "optimizing-map-artifacts.js",
-        )
-        .expect("Map artifact matrix");
-    let artifacts = result.jit_artifacts().expect("enabled artifact batch");
-    let optimizing: Vec<_> = artifacts
-        .bundles()
-        .iter()
-        .filter(|bundle| bundle.manifest().tier() == JitDebugTier::Optimizing)
-        .collect();
-
-    assert!(optimizing.len() >= 2, "both Map callers must optimize");
-    let relocations = optimizing
-        .iter()
-        .filter_map(|bundle| bundle.file(JitArtifactFileName::Relocations))
-        .map(|file| std::str::from_utf8(file.contents()).expect("relocations are UTF-8"))
-        .collect::<Vec<_>>()
-        .join("\n");
-    assert!(
-        relocations.contains("collection_map_get_leaf"),
-        "Map.get must call its declared no-allocation leaf: {relocations}"
-    );
-    let leaf_probes = optimizing
-        .iter()
-        .filter_map(|bundle| bundle.file(JitArtifactFileName::CodeMap))
-        .map(|file| {
-            let map: serde_json::Value =
-                serde_json::from_slice(file.contents()).expect("valid code-map JSON");
-            map["regions"].as_array().map_or(0, |regions| {
-                regions
-                    .iter()
-                    .filter(|region| region["kind"] == "machineNativeLeafProbe")
-                    .count()
-            })
-        })
-        .sum::<usize>();
-    // `set` may insert and allocate, so it keeps the committed call.
-    assert!(
-        leaf_probes >= 1,
-        "the loaded Map.get callee must complete in a frame-free leaf probe"
     );
 }

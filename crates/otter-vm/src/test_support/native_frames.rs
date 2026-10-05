@@ -32,7 +32,7 @@ pub(crate) fn resume_prepared_frame(
     if ctx.is_null() || unsafe { (*ctx).native_frame } != frame {
         return Err(VmError::InvalidOperand);
     }
-    let mut activation = crate::jit::VmRuntimeActivation::new(vm, stack, context);
+    let mut activation = crate::jit::VmRuntimeActivation::new(vm, stack, Some(context));
     let mut thread = crate::native_abi::VmThread::empty();
     thread.runtime_context = std::ptr::from_mut(&mut activation) as u64;
     thread.code_registry = vm.jit_code_registry_view_addr();
@@ -86,7 +86,7 @@ pub(crate) fn complete_staged_call(
 ) -> Result<(), VmError> {
     let request = stack.staged_request_mut().ok_or(VmError::InvalidOperand)?;
     let destination = std::mem::replace(&mut request.return_destination, u32::MAX);
-    let value = vm.execute_prepared_call(context, stack)?;
+    let value = vm.execute_prepared_call(Some(context), stack)?;
     if let Ok(register) = u16::try_from(destination) {
         let top = stack.len().checked_sub(1).ok_or(VmError::InvalidOperand)?;
         crate::write_register(&mut stack[top], register, value)?;

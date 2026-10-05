@@ -230,7 +230,7 @@ impl<'a> InlineLeafPlan<'a> {
                 TemplateOp::LoadProperty { dst, object, .. } => {
                     let method = method?;
                     if read_kind(&kinds, object)? != InlineValueKind::Receiver
-                        || !method.prop_offsets.contains_key(&instruction.byte_pc)
+                        || !method.prop_fields.contains_key(&instruction.byte_pc)
                         || method.prop_shapes.contains_key(&instruction.byte_pc)
                     {
                         return None;

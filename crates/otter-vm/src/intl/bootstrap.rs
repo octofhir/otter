@@ -28,6 +28,7 @@
 use crate::intl::payload::IntlKind;
 use crate::js_surface::{Attr, JsSurfaceError, NamespaceBuilder, NamespaceSpec};
 use crate::object::{self, JsObject};
+use crate::rooting::RootScopeExt;
 use crate::{NativeCtx, NativeError, Value};
 
 /// `install_on` resolver for the per-kind constructors: returns the
@@ -44,27 +45,31 @@ pub fn install(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), JsSu
     use crate::intrinsic_install::BuiltinIntrinsic;
 
     let global_root = Value::object(global);
-    let intl = NamespaceBuilder::from_spec_with_value_roots(heap, &INTL_SPEC, vec![global_root])?
-        .build()?;
-    // §8.1 — the Intl namespace object's [[Prototype]] is
-    // %Object.prototype% (the builder allocates with no prototype link;
-    // the Object constructor is a native function, so its `prototype`
-    // reads through the descriptor table).
-    let object_prototype = crate::object::get(global, heap, "Object")
-        .and_then(|ctor| ctor.as_native_function())
-        .and_then(|ctor| {
-            ctor.own_property_descriptor(heap, "prototype")
-                .ok()
-                .flatten()
-        })
-        .and_then(|descriptor| match descriptor.kind {
-            crate::object::DescriptorKind::Data { value } => value.as_object(),
-            crate::object::DescriptorKind::Accessor { .. } => None,
-        });
-    if let Some(object_prototype) = object_prototype {
-        crate::object::set_prototype(intl, heap, Some(object_prototype));
+    let mut intl =
+        NamespaceBuilder::from_spec_with_value_roots(heap, &INTL_SPEC, vec![global_root])?
+            .build()?;
+    let mut roots = otter_gc::RootScope::new(heap);
+    // SAFETY: the namespace slot stays stationary through root preparation and
+    // global descriptor publication; the global is a registered realm root.
+    unsafe { roots.add_object(&mut intl) };
+    // §8.1 — the namespace inherits the canonical realm Object prototype.
+    let object_prototype = match object::get(global, heap, "Object")
+        .and_then(|constructor| constructor.as_native_function())
+    {
+        Some(constructor) => constructor
+            .own_property_descriptor(heap, "prototype")?
+            .and_then(|descriptor| match descriptor.kind {
+                object::DescriptorKind::Data { value } => value.as_object(),
+                object::DescriptorKind::Accessor { .. } => None,
+            }),
+        None => None,
+    };
+    if let Some(prototype) = object_prototype
+        && !object::set_prototype(&mut intl, heap, Some(prototype))?
+    {
+        return Err(JsSurfaceError::DefinePropertyFailed("Intl.[[Prototype]]"));
     }
-    crate::bootstrap::define_global_value(global, heap, "Intl", Value::object(intl));
+    crate::bootstrap::define_global_value(global, heap, "Intl", Value::object(intl))?;
 
     CollatorIntrinsic::install(heap, global)?;
     NumberFormatIntrinsic::install(heap, global)?;
@@ -225,7 +230,12 @@ fn intl_construct(
                         reason: "out of memory".to_string(),
                     })?;
             let descriptor = crate::object::PropertyDescriptor::data(value, false, false, false);
-            crate::object::define_own_symbol_property(receiver, ctx.heap_mut(), symbol, descriptor);
+            crate::object::define_own_symbol_property(
+                receiver,
+                ctx.heap_mut(),
+                symbol,
+                descriptor,
+            )?;
             return Ok(this);
         }
     }

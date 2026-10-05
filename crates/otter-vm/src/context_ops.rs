@@ -34,6 +34,7 @@
 //! - [`crate::eval_env`] — eval extensions.
 //! - [`crate::eval_ops`] — direct eval, which consumes the caller chain.
 
+use crate::native_abi::CommittedValueError;
 use otter_bytecode::{
     BindingStoreFallback, ContextCoord, EvalCallerChain, EvalCallerScope, LookupGlobalMode,
     LookupRefTarget, ScopeDescriptor, SlotKind, StoreRefMode, opcode_schema::BindingMissing,
@@ -91,6 +92,21 @@ pub(crate) fn with_scope<R>(
         .get(scope_index as usize)
         .ok_or(VmError::InvalidOperand)?;
     Ok(f(scope))
+}
+
+/// Exact DerivedThis slot from an immutable verified scope descriptor.
+/// Multiple such slots are malformed metadata, never an ownership heuristic.
+pub(crate) fn derived_this_slot(scope: &ScopeDescriptor) -> Result<Option<u16>, VmError> {
+    let mut result = None;
+    for (index, slot) in scope.slots.iter().enumerate() {
+        if slot.kind == SlotKind::DerivedThis {
+            if result.is_some() {
+                return Err(VmError::InvalidOperand);
+            }
+            result = Some(u16::try_from(index).map_err(|_| VmError::InvalidOperand)?);
+        }
+    }
+    Ok(result)
 }
 
 impl Interpreter {
@@ -174,8 +190,22 @@ impl Interpreter {
     ) -> Result<(), VmError> {
         let parent = frame.read(parent_reg)?;
         let function_id = frame.function_id();
+        let owns_this = with_scope(
+            context,
+            function_id,
+            u16::try_from(scope_index).map_err(|_| VmError::InvalidOperand)?,
+            derived_this_slot,
+        )??
+        .is_some();
         let created = self.create_context_value(context, function_id, scope_index, parent)?;
-        frame.write(dst, created)
+        frame.write(dst, created)?;
+        if owns_this {
+            frame.publish_derived_this_context(
+                function_id,
+                created.as_context().ok_or(VmError::InvalidOperand)?,
+            );
+        }
+        Ok(())
     }
 
     /// `CopyContext dst, src` (§14.7.4.4 CreatePerIterationEnvironment).
@@ -478,14 +508,18 @@ impl Interpreter {
         name_idx: u32,
         depth: i32,
         missing: BindingMissing,
-    ) -> Result<Value, VmError> {
-        let depth = decode_depth(depth)?;
-        let name = Self::lookup_name(context, function_id, name_idx)?;
-        if let Some(extension) =
-            context::probe_extensions(&self.gc_heap, context_operand(ctx)?, depth, name)
-        {
+    ) -> Result<Value, CommittedValueError> {
+        let depth = decode_depth(depth).map_err(CommittedValueError::Fatal)?;
+        let name = Self::lookup_name(context, function_id, name_idx)
+            .map_err(CommittedValueError::Fatal)?;
+        if let Some(extension) = context::probe_extensions(
+            &self.gc_heap,
+            context_operand(ctx).map_err(CommittedValueError::Fatal)?,
+            depth,
+            name,
+        ) {
             return eval_env::extension_get(&self.gc_heap, extension, name)
-                .ok_or(VmError::InvalidOperand);
+                .ok_or(CommittedValueError::Fatal(VmError::InvalidOperand));
         }
         match missing {
             BindingMissing::Throw => {
@@ -508,12 +542,18 @@ impl Interpreter {
         name_idx: u32,
         mode: i32,
         value: Value,
-    ) -> Result<(), VmError> {
-        let mode = LookupGlobalMode::from_imm32(mode).ok_or(VmError::InvalidOperand)?;
-        let name = Self::lookup_name(context, function_id, name_idx)?;
-        if let Some(extension) =
-            context::probe_extensions(&self.gc_heap, context_operand(ctx)?, mode.depth, name)
-        {
+    ) -> Result<(), CommittedValueError> {
+        let mode = LookupGlobalMode::from_imm32(mode)
+            .ok_or(VmError::InvalidOperand)
+            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+        let name = Self::lookup_name(context, function_id, name_idx)
+            .map_err(CommittedValueError::Fatal)?;
+        if let Some(extension) = context::probe_extensions(
+            &self.gc_heap,
+            context_operand(ctx).map_err(CommittedValueError::Fatal)?,
+            mode.depth,
+            name,
+        ) {
             eval_env::extension_set_existing(&mut self.gc_heap, extension, name, value);
             return Ok(());
         }
@@ -543,7 +583,7 @@ impl Interpreter {
             // not a configurable property: `delete identifier` is `false`.
             false
         } else {
-            crate::object::delete(self.global_this, &mut self.gc_heap, name)
+            crate::object::delete(&mut self.global_this, &mut self.gc_heap, name)?
         };
         Ok(Value::boolean(removed))
     }
@@ -590,30 +630,33 @@ impl Interpreter {
         name_idx: u32,
         mode: i32,
         value: Value,
-    ) -> Result<(), VmError> {
-        let mode = StoreRefMode::from_imm32(mode).ok_or(VmError::InvalidOperand)?;
-        let name = Self::lookup_name(context, function_id, name_idx)?;
+    ) -> Result<(), CommittedValueError> {
+        let mode = StoreRefMode::from_imm32(mode)
+            .ok_or(VmError::InvalidOperand)
+            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+        let name = Self::lookup_name(context, function_id, name_idx)
+            .map_err(CommittedValueError::Fatal)?;
         if let Some(extension) = reference.as_eval_extension() {
             if eval_env::extension_set_existing(&mut self.gc_heap, extension, name, value) {
                 return Ok(());
             }
             // §9.1.1.1.5 step 1: the right-hand side deleted the binding.
             if mode.strict {
-                return Err(self.err_undefined_ident(name.into()));
+                return Err(CommittedValueError::JavaScript(
+                    self.err_undefined_ident(name.into()),
+                ));
             }
             eval_env::extension_set_or_insert(&mut self.gc_heap, extension, name, value);
             return Ok(());
         }
         if let Some(target) = reference.as_context() {
-            let slot = mode.slot.ok_or(VmError::InvalidOperand)?;
-            return self.store_slot_with_fallback(
-                context,
-                target,
-                slot,
-                mode.fallback,
-                value,
-                name,
-            );
+            let slot = mode
+                .slot
+                .ok_or(VmError::InvalidOperand)
+                .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+            return self
+                .store_slot_with_fallback(context, target, slot, mode.fallback, value, name)
+                .map_err(|error| CommittedValueError::JavaScript(error.into()));
         }
         if reference.is_undefined() {
             return self.store_global_binding_value(
@@ -625,7 +668,7 @@ impl Interpreter {
                 mode.strict,
             );
         }
-        Err(VmError::InvalidOperand)
+        Err(CommittedValueError::Fatal(VmError::InvalidOperand))
     }
 
     /// The eval extension of the context at hop `var_depth` from `*ctx`,

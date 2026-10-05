@@ -53,9 +53,7 @@ impl Interpreter {
     ) -> Result<Value, VmError> {
         self.record_jit_runtime_stub_class(crate::native_abi::RuntimeStubClass::Reentrant);
         let err = VmError::TemporalDeadZone { local_index };
-        let value = self
-            .vm_error_to_throwable_with_stack_roots(Some(context), stack, &err)
-            .ok_or(err)?;
+        let value = self.vm_error_to_throwable_with_stack_roots(Some(context), stack, &err)?;
         if self.pending_uncaught_frames.is_none() {
             self.pending_uncaught_frames = Some(self.snapshot_active_frames(context, usize::MAX));
         }

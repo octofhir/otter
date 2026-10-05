@@ -47,9 +47,13 @@
 //!   preserves this, closure and new.target with register-slot location bounds.
 //! - Literal recipes are not physical locations and may be shared by any
 //!   number of slots. They let optimized code omit values needed only by deopt.
+//! - Physical recipes read canonical tagged or untagged homes. Eager/lazy
+//!   exit materialization precedes writeback; no register dump crosses this ABI.
 //! - Virtual objects are part of the same authoritative frame state. Dense ids
 //!   and backward-only object references make materialization order explicit,
 //!   acyclic, and independent of target emission.
+//! - Retained recipe accounting includes reserved table capacity, absent ids,
+//!   resume-PC slices, and every nested owned frame and virtual-field slice.
 //! - A [`StackMap`] indexes the same compiled slots the frame state locates;
 //!   bit `i` set means slot `i` holds a tagged pointer the collector relocates.
 
@@ -62,11 +66,9 @@ use crate::number::NumberValue;
 pub struct DeoptVerifyLimits {
     /// Maximum number of interpreter-register slots in one frame state.
     pub max_frame_slots: usize,
-    /// Number of machine registers addressable by [`DeoptLocation::Register`].
-    pub machine_register_count: u16,
-    /// Smallest valid frame-pointer-relative stack-slot byte offset.
+    /// Smallest valid compiled-slot-base-relative canonical-home byte offset.
     pub min_stack_slot_offset: i32,
-    /// Largest valid frame-pointer-relative stack-slot byte offset.
+    /// Largest valid compiled-slot-base-relative canonical-home byte offset.
     pub max_stack_slot_offset: i32,
 }
 
@@ -88,17 +90,6 @@ pub enum DeoptVerifyError {
         max: usize,
         /// Stored slot count.
         actual: usize,
-    },
-    /// A machine-register location exceeds the declared register file.
-    MachineRegisterOutOfRange {
-        /// Frame state's exact byte-PC.
-        byte_pc: u32,
-        /// Interpreter slot containing the location.
-        slot: usize,
-        /// Invalid machine-register id.
-        register: u16,
-        /// Declared machine-register count.
-        register_count: u16,
     },
     /// A stack-slot byte offset exceeds the declared frame range.
     StackSlotOutOfRange {
@@ -128,6 +119,13 @@ pub enum DeoptVerifyError {
     InvalidFrameEntry {
         /// Index in the outermost-first chain.
         frame_index: usize,
+    },
+    /// A reconstructed register lies outside the frame's window or repeats.
+    InvalidFrameRegister {
+        /// Frame state's exact byte-PC.
+        byte_pc: u32,
+        /// Out-of-range or out-of-order register index.
+        register: u16,
     },
     /// A nested result destination lies outside its caller's register window.
     InvalidReturnRegister {
@@ -222,9 +220,7 @@ impl DeoptRepr {
 /// Where a value lives at a deopt point, relative to the optimized frame.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum DeoptLocation {
-    /// A machine register, by the optimizing tier's register id.
-    Register(u16),
-    /// A spill stack slot, by signed byte offset from the frame pointer.
+    /// A canonical home, by signed byte offset from the compiled slot base.
     StackSlot(i32),
     /// A compile-time raw literal rematerialized only when this exit runs.
     /// [`DeoptSlot::repr`] defines how the bits become a tagged VM value.
@@ -331,8 +327,11 @@ pub struct DeoptFrameEntry<Slot = DeoptSlot> {
 /// One interpreter frame to rebuild at a deopt point.
 ///
 /// Rebuilding it means materializing each [`DeoptSlot`] (read the raw bits at
-/// its location, [`DeoptRepr::reconstitute`]) into the interpreter register of
-/// the same index, and resuming that frame at `byte_pc`.
+/// its location, [`DeoptRepr::reconstitute`]) into the interpreter register it
+/// names, every other register of the window resuming `undefined`, and
+/// resuming that frame at `byte_pc`. A recipe stores only the registers whose
+/// value is not the literal `undefined`, the way an optimized-out translation
+/// slot costs nothing: a frame's size is its live state, not its window.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DeoptFrame<Slot = DeoptSlot> {
@@ -343,9 +342,52 @@ pub struct DeoptFrame<Slot = DeoptSlot> {
     /// How this frame was entered; `None` only for the outermost frame, which
     /// the compiled entry itself owns.
     pub entry: Option<DeoptFrameEntry<Slot>>,
-    /// One slot per interpreter virtual register the frame defines, in
-    /// register-index order.
-    pub slots: Box<[Slot]>,
+    /// Interpreter virtual registers the rebuilt window defines.
+    pub register_count: u16,
+    /// The registers this state reconstructs, strictly ascending by index.
+    pub slots: Box<[(u16, Slot)]>,
+}
+
+impl<Slot> DeoptFrame<Slot> {
+    /// A recipe listing every register of its window, in order.
+    #[must_use]
+    pub fn with_window(
+        function_id: u32,
+        byte_pc: u32,
+        entry: Option<DeoptFrameEntry<Slot>>,
+        window: impl IntoIterator<Item = Slot>,
+    ) -> Self {
+        let slots: Box<[(u16, Slot)]> = window
+            .into_iter()
+            .enumerate()
+            .map(|(register, slot)| {
+                (
+                    u16::try_from(register).expect("a window fits the register space"),
+                    slot,
+                )
+            })
+            .collect();
+        Self {
+            function_id,
+            byte_pc,
+            entry,
+            register_count: u16::try_from(slots.len()).expect("a window fits the register space"),
+            slots,
+        }
+    }
+}
+
+impl<Slot: Clone> DeoptFrame<Slot> {
+    /// The complete register window: each reconstructed register's slot,
+    /// `fill` everywhere else.
+    #[must_use]
+    pub fn dense(&self, fill: Slot) -> Vec<Slot> {
+        let mut window = vec![fill; usize::from(self.register_count)];
+        for (register, slot) in self.slots.iter() {
+            window[usize::from(*register)] = slot.clone();
+        }
+        window
+    }
 }
 
 /// The interpreter-state reconstruction record for one deopt point.
@@ -412,7 +454,7 @@ impl FrameState {
                 return Err(DeoptVerifyError::InvalidFrameEntry { frame_index: index });
             }
             if let Some(entry) = &frame.entry
-                && usize::from(entry.return_register) >= self.frames[index - 1].slots.len()
+                && entry.return_register >= self.frames[index - 1].register_count
             {
                 return Err(DeoptVerifyError::InvalidReturnRegister {
                     frame_index: index,
@@ -475,21 +517,37 @@ impl DeoptFrame {
         limits: DeoptVerifyLimits,
         virtual_object_count: usize,
     ) -> Result<(), DeoptVerifyError> {
-        if self.slots.len() > limits.max_frame_slots {
+        if usize::from(self.register_count) > limits.max_frame_slots {
             return Err(DeoptVerifyError::FrameSlotCountOutOfRange {
                 byte_pc: self.byte_pc,
                 max: limits.max_frame_slots,
-                actual: self.slots.len(),
+                actual: usize::from(self.register_count),
             });
+        }
+        let mut next = 0u32;
+        for &(register, _) in self.slots.iter() {
+            if u32::from(register) < next || register >= self.register_count {
+                return Err(DeoptVerifyError::InvalidFrameRegister {
+                    byte_pc: self.byte_pc,
+                    register,
+                });
+            }
+            next = u32::from(register) + 1;
         }
 
         // Activation-only operands obey exactly the same location bounds as
         // register slots. Diagnostic indices append this/closure after the window.
+        let register_slots = self
+            .slots
+            .iter()
+            .map(|(register, slot)| (usize::from(*register), slot));
         let entry_slots = self
             .entry
             .iter()
-            .flat_map(|entry| [&entry.this, &entry.closure, &entry.new_target]);
-        for (slot_index, slot) in self.slots.iter().chain(entry_slots).enumerate() {
+            .flat_map(|entry| [&entry.this, &entry.closure, &entry.new_target])
+            .enumerate()
+            .map(|(index, slot)| (usize::from(self.register_count) + index, slot));
+        for (slot_index, slot) in register_slots.chain(entry_slots) {
             verify_slot(slot, limits, self.byte_pc, slot_index, virtual_object_count)?;
         }
         Ok(())
@@ -519,14 +577,6 @@ fn verify_slot(
         }
         location => {
             match location {
-                DeoptLocation::Register(register) if register >= limits.machine_register_count => {
-                    return Err(DeoptVerifyError::MachineRegisterOutOfRange {
-                        byte_pc,
-                        slot: slot_index,
-                        register,
-                        register_count: limits.machine_register_count,
-                    });
-                }
                 DeoptLocation::StackSlot(offset)
                     if offset < limits.min_stack_slot_offset
                         || offset > limits.max_stack_slot_offset =>
@@ -548,9 +598,7 @@ fn verify_slot(
                         offset,
                     });
                 }
-                DeoptLocation::Register(_)
-                | DeoptLocation::StackSlot(_)
-                | DeoptLocation::Literal(_) => {}
+                DeoptLocation::StackSlot(_) | DeoptLocation::Literal(_) => {}
                 DeoptLocation::VirtualObject(_) => unreachable!(),
             }
             match slot.repr {
@@ -657,13 +705,17 @@ pub struct DeoptExitDescriptor {
     /// frames do not speak; this is the same sequence in their namespace.
     /// Index `0` is the compiled function's own frame.
     pub resume_pcs: Box<[u32]>,
+    /// The code object's safepoint record rooting exactly this recipe's
+    /// tagged homes, which writeback publishes before anything may collect;
+    /// [`crate::native_abi::NO_SAFEPOINT`] when the recipe reads no home.
+    pub safepoint: crate::native_abi::SafepointId,
 }
 
 /// Deopt metadata a generated exit reads at run time.
 ///
 /// A generated exit site is two instructions: an exit index and a branch to
-/// one shared handler, which dumps the machine registers and calls the
-/// writeback stub with this record's baked address. Interpreter-state
+/// one shared handler, which calls the writeback stub with this record's baked
+/// address after the exit has materialized its canonical homes. Interpreter-state
 /// reconstruction is therefore data walked by the stub, never per-exit code.
 /// The allocation's address is baked into the generated handler, so it must
 /// live exactly as long as the code — the same ownership contract as the
@@ -675,21 +727,26 @@ pub struct DeoptRuntime {
     /// Per-exit-site descriptors, indexed by the site index generated code
     /// passes to the writeback stub.
     pub exits: Box<[DeoptExitDescriptor]>,
-    /// GPR budget of the allocation the table's register ids refer to; ids at
-    /// or past it name FP registers.
-    pub gpr_budget: u16,
 }
 
 impl DeoptRuntime {
     /// Bytes this deopt metadata retains for the code object's lifetime:
-    /// the exit descriptors, every frame state, its frame chain, and each
-    /// frame's slot table. Saturating: a saturated total still exceeds any
-    /// real budget and fails generated-code admission closed.
+    /// the owning box, reserved table capacity (including absent ids), exit
+    /// descriptors and resume PCs, every frame chain and slot table, and
+    /// virtual-object recipes. This measures requested owned payload backing,
+    /// excluding allocator bookkeeping. Saturation fails admission closed.
     #[must_use]
     pub fn retained_bytes(&self) -> u64 {
         let mut total = std::mem::size_of::<Self>() as u64;
+        total = total.saturating_add(
+            (self.table.entries.capacity() as u64)
+                .saturating_mul(std::mem::size_of::<Option<FrameState>>() as u64),
+        );
         total = total
             .saturating_add(std::mem::size_of_val::<[DeoptExitDescriptor]>(&self.exits) as u64);
+        for exit in &self.exits {
+            total = total.saturating_add(std::mem::size_of_val(exit.resume_pcs.as_ref()) as u64);
+        }
         for state in self.table.entries() {
             total =
                 total.saturating_add(std::mem::size_of_val::<[DeoptFrame]>(&state.frames) as u64);
@@ -697,8 +754,9 @@ impl DeoptRuntime {
                 &state.virtual_objects,
             ) as u64);
             for frame in &state.frames {
-                total =
-                    total.saturating_add(std::mem::size_of_val::<[DeoptSlot]>(&frame.slots) as u64);
+                total = total.saturating_add(std::mem::size_of_val::<[(u16, DeoptSlot)]>(
+                    &frame.slots,
+                ) as u64);
             }
             for object in &state.virtual_objects {
                 total = total
@@ -810,10 +868,77 @@ mod tests {
     fn verify_limits() -> DeoptVerifyLimits {
         DeoptVerifyLimits {
             max_frame_slots: 4,
-            machine_register_count: 8,
             min_stack_slot_offset: -64,
             max_stack_slot_offset: 64,
         }
+    }
+
+    #[test]
+    fn retained_bytes_count_reserved_states_resume_pcs_and_nested_recipes() {
+        let literal = DeoptSlot::physical(
+            DeoptLocation::Literal(Value::undefined().to_bits()),
+            DeoptRepr::Tagged,
+        );
+        let state = FrameState {
+            frames: Box::new([
+                DeoptFrame::with_window(7, 11, None, [literal; 3]),
+                DeoptFrame::with_window(
+                    8,
+                    12,
+                    Some(DeoptFrameEntry {
+                        return_register: 0,
+                        this: literal,
+                        closure: literal,
+                        new_target: literal,
+                    }),
+                    [literal; 2],
+                ),
+            ]),
+            virtual_objects: Box::new([VirtualObject {
+                id: VirtualObjectId(0),
+                kind: VirtualObjectKind::FixedArray,
+                fields: Box::new([literal; 2]),
+            }]),
+        };
+        state.verify(verify_limits()).unwrap();
+        let mut entries = Vec::with_capacity(16);
+        entries.push(None);
+        entries.push(Some(state));
+        let capacity = entries.capacity();
+        let mut runtime = DeoptRuntime {
+            table: DeoptTable::from_indexed_states(entries),
+            exits: Box::new([DeoptExitDescriptor {
+                state: 1,
+                reason: ExitReason::RuntimeTransition,
+                action: ExitAction::Resume,
+                resume_pcs: Box::new([1, 2]),
+                safepoint: crate::native_abi::NO_SAFEPOINT,
+            }]),
+        };
+        let expected = std::mem::size_of::<DeoptRuntime>()
+            + capacity * std::mem::size_of::<Option<FrameState>>()
+            + std::mem::size_of::<DeoptExitDescriptor>()
+            + 2 * std::mem::size_of::<u32>()
+            + 2 * std::mem::size_of::<DeoptFrame>()
+            + 5 * std::mem::size_of::<(u16, DeoptSlot)>()
+            + 2 * std::mem::size_of::<DeoptSlot>()
+            + std::mem::size_of::<VirtualObject<DeoptSlot>>();
+        assert_eq!(runtime.retained_bytes(), expected as u64);
+        runtime.table.entries.push(None);
+        assert_eq!(runtime.retained_bytes(), expected as u64);
+        runtime.exits[0].resume_pcs = Box::default();
+        assert_eq!(
+            runtime.retained_bytes(),
+            (expected - 2 * std::mem::size_of::<u32>()) as u64,
+        );
+        let before = runtime.retained_bytes();
+        runtime.table.entries.reserve(64);
+        let extra_capacity = runtime.table.entries.capacity() - capacity;
+        assert!(extra_capacity > 0);
+        assert_eq!(
+            runtime.retained_bytes() - before,
+            (extra_capacity * std::mem::size_of::<Option<FrameState>>()) as u64,
+        );
     }
 
     #[test]
@@ -899,12 +1024,7 @@ mod tests {
     /// inlined into it produces.
     fn single_frame(byte_pc: u32, slots: Vec<DeoptSlot>) -> FrameState {
         FrameState {
-            frames: Box::new([DeoptFrame {
-                function_id: 7,
-                byte_pc,
-                entry: None,
-                slots: slots.into(),
-            }]),
+            frames: Box::new([DeoptFrame::with_window(7, byte_pc, None, slots)]),
             virtual_objects: Box::default(),
         }
     }
@@ -915,16 +1035,11 @@ mod tests {
             location: DeoptLocation::Literal(0),
             repr: DeoptRepr::Tagged,
         };
-        let outer = DeoptFrame {
-            function_id: 0,
-            byte_pc: 8,
-            entry: None,
-            slots: Box::new([slot]),
-        };
-        let inner = DeoptFrame {
-            function_id: 1,
-            byte_pc: 0,
-            entry: Some(DeoptFrameEntry {
+        let outer = DeoptFrame::with_window(0, 8, None, [slot]);
+        let inner = DeoptFrame::with_window(
+            1,
+            0,
+            Some(DeoptFrameEntry {
                 new_target: DeoptSlot {
                     location: DeoptLocation::Literal(Value::undefined().to_bits()),
                     repr: DeoptRepr::Tagged,
@@ -933,8 +1048,8 @@ mod tests {
                 this: slot,
                 closure: slot,
             }),
-            slots: Box::new([slot]),
-        };
+            [slot],
+        );
         let valid = FrameState {
             frames: Box::new([outer, inner]),
             virtual_objects: Box::default(),
@@ -948,10 +1063,10 @@ mod tests {
                 1 => &mut entry.closure,
                 _ => &mut entry.new_target,
             };
-            operand.location = DeoptLocation::Register(u16::MAX);
+            operand.location = DeoptLocation::StackSlot(72);
             assert!(matches!(
                 invalid.verify(verify_limits()),
-                Err(DeoptVerifyError::MachineRegisterOutOfRange { .. })
+                Err(DeoptVerifyError::StackSlotOutOfRange { .. })
             ));
         }
         let mut invalid = valid.clone();
@@ -980,23 +1095,18 @@ mod tests {
     #[test]
     fn an_inlined_chain_shares_locations_across_frames() {
         // A callee's parameter is the caller's argument value, so both frames
-        // read it from the same immutable machine-state snapshot.
+        // read it from the same canonical home.
         let shared = DeoptSlot {
-            location: DeoptLocation::Register(3),
+            location: DeoptLocation::StackSlot(24),
             repr: DeoptRepr::Tagged,
         };
         let chained = FrameState {
             frames: Box::new([
-                DeoptFrame {
-                    function_id: 7,
-                    byte_pc: 12,
-                    entry: None,
-                    slots: vec![shared].into(),
-                },
-                DeoptFrame {
-                    function_id: 9,
-                    byte_pc: 0,
-                    entry: Some(DeoptFrameEntry {
+                DeoptFrame::with_window(7, 12, None, vec![shared]),
+                DeoptFrame::with_window(
+                    9,
+                    0,
+                    Some(DeoptFrameEntry {
                         new_target: DeoptSlot {
                             location: DeoptLocation::Literal(Value::undefined().to_bits()),
                             repr: DeoptRepr::Tagged,
@@ -1005,8 +1115,8 @@ mod tests {
                         this: shared,
                         closure: shared,
                     }),
-                    slots: vec![shared].into(),
-                },
+                    vec![shared],
+                ),
             ]),
             virtual_objects: Box::default(),
         };
@@ -1036,7 +1146,7 @@ mod tests {
     #[test]
     fn deopt_table_is_keyed_by_exit_id() {
         let slot = DeoptSlot {
-            location: DeoptLocation::Register(3),
+            location: DeoptLocation::StackSlot(24),
             repr: DeoptRepr::Int32,
         };
         // Two exits may resume the same PC — a body can guard one instruction
@@ -1048,7 +1158,7 @@ mod tests {
         table.verify(verify_limits()).unwrap();
         assert_eq!(table.len(), 2);
         assert_eq!(
-            table.lookup(1).unwrap().innermost().slots[0].location,
+            table.lookup(1).unwrap().innermost().slots[0].1.location,
             slot.location
         );
         assert!(table.lookup(2).is_none());
@@ -1060,7 +1170,7 @@ mod tests {
             12,
             vec![
                 DeoptSlot {
-                    location: DeoptLocation::Register(3),
+                    location: DeoptLocation::StackSlot(24),
                     repr: DeoptRepr::Tagged,
                 },
                 DeoptSlot {
@@ -1083,11 +1193,11 @@ mod tests {
             12,
             vec![
                 DeoptSlot {
-                    location: DeoptLocation::Register(3),
+                    location: DeoptLocation::StackSlot(24),
                     repr: DeoptRepr::Tagged,
                 },
                 DeoptSlot {
-                    location: DeoptLocation::Register(3),
+                    location: DeoptLocation::StackSlot(24),
                     repr: DeoptRepr::Int32,
                 },
             ],
@@ -1156,12 +1266,8 @@ mod tests {
         let mut limits = verify_limits();
         limits.max_frame_slots = 0;
         assert!(matches!(
-            state_with(DeoptLocation::Register(0)).verify(limits),
+            state_with(DeoptLocation::StackSlot(0)).verify(limits),
             Err(DeoptVerifyError::FrameSlotCountOutOfRange { .. })
-        ));
-        assert!(matches!(
-            state_with(DeoptLocation::Register(8)).verify(verify_limits()),
-            Err(DeoptVerifyError::MachineRegisterOutOfRange { .. })
         ));
         assert!(matches!(
             state_with(DeoptLocation::StackSlot(72)).verify(verify_limits()),
@@ -1184,7 +1290,7 @@ mod tests {
     #[test]
     fn deopt_table_verifies_every_exit() {
         let bad_slot = DeoptSlot {
-            location: DeoptLocation::Register(99),
+            location: DeoptLocation::StackSlot(792),
             repr: DeoptRepr::Tagged,
         };
         let table = DeoptTable::from_states(vec![

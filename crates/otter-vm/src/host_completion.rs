@@ -23,6 +23,12 @@
 //! - A [`HostCompletionJob`] carries only owned `Send` data; every
 //!   GC value it needs must travel as a persistent-root id and be
 //!   re-resolved on the isolate thread.
+//! - Each run starts one fresh synchronous exception extent; a previous
+//!   turn's pending throw/provenance/report origin cannot be consumed by an owned worker error.
+//!   Native lifecycle admission uses the same reset through NativeCtx.
+//! - Running a job returns the complete turn's Result, including conversion,
+//!   settlement and reaction-drain failures, to the runtime's existing task owner.
+//! - Cancellation performs isolate-root cleanup only and never executes JavaScript.
 //!
 //! # See also
 //! - [`crate::marshal`] — `PromiseCompleter` / `promise_from_future`,
@@ -34,20 +40,32 @@ use std::any::Any;
 use std::future::Future;
 use std::pin::Pin;
 
-use crate::Interpreter;
+use crate::{Interpreter, RunError};
+
+/// Begin the sole fresh synchronous completion extent shared by host jobs
+/// and native lifecycle callbacks. No collection, JavaScript or queue mutation
+/// occurs; an operation's new error/provenance is retained after this reset.
+pub(crate) fn clear_pending_error(interp: &mut Interpreter) {
+    let _ = interp.take_pending_uncaught_throw();
+    let _ = interp.pending_uncaught_frames.take();
+    let _ = interp.take_error_detail();
+    let _ = interp.take_uncaught_from_promise_rejection();
+}
 
 /// A completion job: runs on the isolate thread with full interpreter
 /// access. Built by the marshalling layer; carries only owned `Send`
 /// data.
 pub struct HostCompletionJob {
-    run: Option<Box<dyn FnOnce(&mut Interpreter) + Send>>,
+    run: Option<Box<dyn FnOnce(&mut Interpreter) -> Result<(), RunError> + Send>>,
     cancel: Option<Box<dyn FnOnce(&mut Interpreter) + Send>>,
 }
 
 impl HostCompletionJob {
     /// Wrap a closure as a completion job.
     #[must_use]
-    pub fn new(job: impl FnOnce(&mut Interpreter) + Send + 'static) -> Self {
+    pub fn new(
+        job: impl FnOnce(&mut Interpreter) -> Result<(), RunError> + Send + 'static,
+    ) -> Self {
         Self {
             run: Some(Box::new(job)),
             cancel: None,
@@ -58,7 +76,7 @@ impl HostCompletionJob {
     /// suppressed after process exit.
     #[must_use]
     pub fn new_with_cancel(
-        job: impl FnOnce(&mut Interpreter) + Send + 'static,
+        job: impl FnOnce(&mut Interpreter) -> Result<(), RunError> + Send + 'static,
         cancel: impl FnOnce(&mut Interpreter) + Send + 'static,
     ) -> Self {
         Self {
@@ -68,9 +86,11 @@ impl HostCompletionJob {
     }
 
     /// Run the job against the isolate's interpreter.
-    pub fn run(mut self, interp: &mut Interpreter) {
-        if let Some(job) = self.run.take() {
-            job(interp);
+    pub fn run(mut self, interp: &mut Interpreter) -> Result<(), RunError> {
+        clear_pending_error(interp);
+        match self.run.take() {
+            Some(job) => job(interp),
+            None => Ok(()),
         }
     }
 
@@ -78,6 +98,35 @@ impl HostCompletionJob {
     pub fn cancel(mut self, interp: &mut Interpreter) {
         if let Some(cancel) = self.cancel.take() {
             cancel(interp);
+        }
+    }
+}
+
+/// Run a rooted completion only inside its live source realm. The existing
+/// realm owner performs the swap; a disposed or refused origin releases the
+/// completion root before returning. Ok(None) means disposed-origin
+/// cancellation and does not invoke the operation. Once invoked, the operation
+/// must consume its persistent root before any success or error return. It can
+/// retain its RunError while source-realm detail is still active, without a
+/// second error carrier.
+pub(crate) fn with_rooted_origin_realm<R>(
+    interp: &mut Interpreter,
+    root: crate::PersistentRootId,
+    realm_id: u32,
+    operation: impl FnOnce(&mut Interpreter, crate::PersistentRootId) -> R,
+) -> Result<Option<R>, crate::VmError> {
+    if realm_id != 0
+        && realm_id != interp.active_host_realm_id()
+        && !interp.has_host_realm(crate::HostRealmId(realm_id))
+    {
+        interp.persistent_root_remove(root);
+        return Ok(None);
+    }
+    match interp.with_host_realm_id(realm_id, move |interp| Ok(operation(interp, root))) {
+        Ok(result) => Ok(Some(result)),
+        Err(error) => {
+            interp.persistent_root_remove(root);
+            Err(error)
         }
     }
 }

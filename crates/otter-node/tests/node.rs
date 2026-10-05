@@ -949,3 +949,6 @@ fn async_generator_completion_settles_the_pending_next() {
         .unwrap();
     runtime.run_module(&main).unwrap();
 }
+
+#[path = "node/primordials.rs"]
+mod primordials;

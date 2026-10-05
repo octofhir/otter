@@ -31,7 +31,7 @@ use std::fmt::Write as _;
 use otter_vm::{
     JitArtifactMetadata, JitDebugTarget, JitDebugTier,
     deopt::DeoptTable,
-    native_abi::{SafepointRecord, TaggedLocationKind},
+    native_abi::{SafepointEntry, SafepointRecord},
 };
 use yaxpeax_arch::{Arch, Decoder, U8Reader};
 use yaxpeax_arm::armv8::a64::ARMv8;
@@ -40,6 +40,7 @@ use super::relocation::{
     DirectBranch, DirectBranchKind, GuardedHeapComponent, PropertySourceAccess, RelocationTarget,
     ValidatedRelocation, ValidatedRelocations, decode_direct_branch,
 };
+use super::return_sites::render_return_site_summary;
 use super::{
     CodeMapCapture, CodeRegion, InlineScratchEntryArtifact, InlineScratchLayoutArtifact,
     OsrCodeEntry,
@@ -56,6 +57,7 @@ pub(super) fn render(
     relocations: &ValidatedRelocations,
     deopt_table: Option<&DeoptTable>,
     safepoints: &[SafepointRecord],
+    return_sites: &[SafepointEntry],
 ) -> String {
     let mut output = String::with_capacity(code.len().saturating_mul(32));
     output.push_str(HEADER);
@@ -85,6 +87,7 @@ pub(super) fn render(
 
     render_deopt_summary(&mut output, deopt_table);
     render_safepoint_summary(&mut output, safepoints);
+    render_return_site_summary(&mut output, return_sites);
     output.push('\n');
 
     let labels = collect_labels(code, entry_offset, code_map, relocations);
@@ -186,35 +189,21 @@ fn render_safepoint_summary(output: &mut String, safepoints: &[SafepointRecord])
     for record in records {
         write!(
             output,
-            "; safepoint id={} native-offset=unavailable frame-state={} tagged=",
+            "; safepoint id={} frame-state={} tagged=",
             record.id, record.frame_state
         )
         .expect("writing to String cannot fail");
-        if record.tagged_locations.is_empty() {
+        if record.spill_roots.is_empty() {
             output.push_str("none");
         } else {
-            for (index, location) in record.tagged_locations.iter().enumerate() {
+            for (index, slot) in record.spill_roots.iter().enumerate() {
                 if index != 0 {
                     output.push(',');
                 }
-                write!(
-                    output,
-                    "{}:{}",
-                    tagged_location_name(location.kind),
-                    location.index
-                )
-                .expect("writing to String cannot fail");
+                write!(output, "spillSlot:{slot}").expect("writing to String cannot fail");
             }
         }
         output.push('\n');
-    }
-}
-
-fn tagged_location_name(kind: TaggedLocationKind) -> &'static str {
-    match kind {
-        TaggedLocationKind::FrameSlot => "frameSlot",
-        TaggedLocationKind::MachineRegister => "machineRegister",
-        TaggedLocationKind::SpillSlot => "spillSlot",
     }
 }
 
@@ -319,13 +308,13 @@ fn render_region_annotation(
     if let Some(method_guard) = &region.method_guard {
         write!(
             output,
-            " method-guard-receiver-register={} method-guard-function={} method-guard-receiver-shape={} method-guard-prototype-validity={:?} method-guard-holder-root={} method-guard-value-byte={}",
+            " method-guard-receiver-register={} method-guard-function={} method-guard-receiver-shape={} method-guard-prototype-validity={:?} method-guard-holder-root={} method-guard-field={:?}",
             method_guard.receiver_register,
             method_guard.method_function_id,
             method_guard.receiver_shape,
             method_guard.prototype_validity,
             method_guard.holder_root,
-            method_guard.method_value_byte,
+            method_guard.method_field,
         )
         .expect("writing to String cannot fail");
     }
@@ -477,8 +466,7 @@ fn symbolic_target(target: &RelocationTarget) -> String {
             format!("prototypeValidityCell identity={identity}")
         }
         RelocationTarget::GcCageBase => "gcCageBase".to_string(),
-        RelocationTarget::PropertyLookupCacheTable => "propertyLookupCacheTable".to_string(),
-        RelocationTarget::StoreTransitionCacheTable => "storeTransitionCacheTable".to_string(),
+        RelocationTarget::PropertyActionCacheTable => "propertyActionCacheTable".to_string(),
         RelocationTarget::DeoptRuntimeData => "deoptRuntimeData".to_string(),
         RelocationTarget::GlobalLexicalCell {
             function_id,
@@ -516,6 +504,9 @@ fn symbolic_target(target: &RelocationTarget) -> String {
         } => format!("calleeIdentityCell(function={function_id},callPc={call_pc})"),
         RelocationTarget::ArithFeedbackCell { function_id, pc } => {
             format!("arithFeedbackCell(function={function_id},pc={pc})")
+        }
+        RelocationTarget::SourceWorkCell { function_id } => {
+            format!("sourceWorkCell(function={function_id})")
         }
     }
 }
@@ -601,7 +592,7 @@ mod tests {
     use otter_vm::{
         JitDebugTarget, JitDebugTier,
         deopt::{DeoptFrame, DeoptLocation, DeoptRepr, DeoptSlot, FrameState},
-        native_abi::TaggedLocation,
+        native_abi::SpillRoots,
     };
 
     use super::*;
@@ -692,16 +683,16 @@ mod tests {
         code_map.record(deopt_region);
         code_map.record_osr(2, 4, 8);
         let deopt = DeoptTable::from_states(vec![FrameState {
-            frames: vec![DeoptFrame {
-                entry: None,
-                function_id: 7,
-                byte_pc: 19,
-                slots: vec![DeoptSlot {
-                    location: DeoptLocation::Register(3),
+            frames: vec![DeoptFrame::with_window(
+                7,
+                19,
+                None,
+                vec![DeoptSlot {
+                    location: DeoptLocation::StackSlot(24),
                     repr: DeoptRepr::Tagged,
                 }]
                 .into_boxed_slice(),
-            }]
+            )]
             .into_boxed_slice(),
             virtual_objects: Box::default(),
         }]);
@@ -710,7 +701,7 @@ mod tests {
             call_pc: otter_vm::native_abi::NO_CALL_PC,
             id: 3,
             frame_state: 0,
-            tagged_locations: vec![TaggedLocation::frame_slot(1)],
+            spill_roots: SpillRoots::from_slots([1]),
         }];
 
         let first = render(
@@ -721,6 +712,7 @@ mod tests {
             &relocations.validated,
             Some(&deopt),
             &safepoints,
+            &[],
         );
         let second = render(
             &metadata(),
@@ -730,6 +722,7 @@ mod tests {
             &relocations.validated,
             Some(&deopt),
             &safepoints,
+            &[],
         );
         assert_eq!(first, second);
         assert!(first.starts_with(HEADER));
@@ -739,8 +732,8 @@ mod tests {
         assert!(first.contains("tier-op=\"Move { dst: 1, src: 0 }\""));
         assert!(first.contains("frame-state=0 frames=1"));
         assert!(first.contains("deopt-exit=0 deopt-frames=1 deopt-slots=1"));
-        assert!(first.contains("safepoint id=3 native-offset=unavailable"));
-        assert!(first.contains("tagged=frameSlot:1"));
+        assert!(first.contains("safepoint id=3 frame-state=0"));
+        assert!(first.contains("tagged=spillSlot:1"));
         assert!(first.contains("L00000000:"));
     }
 
@@ -781,6 +774,7 @@ mod tests {
             &relocations.validated,
             None,
             &[],
+            &[],
         );
         let line = assembly
             .lines()
@@ -815,6 +809,7 @@ mod tests {
             &relocations.validated,
             None,
             &[],
+            &[],
         );
         assert!(assembly.contains("functionEntryCell(function=11)"));
     }
@@ -842,6 +837,7 @@ mod tests {
             &relocations.validated,
             None,
             &[],
+            &[],
         );
         assert!(assembly.contains("L00000020:"));
         assert!(assembly.contains("b L00000020"));
@@ -868,6 +864,7 @@ mod tests {
             &CodeMapCapture::default(),
             &relocations.validated,
             None,
+            &[],
             &[],
         );
         assert!(assembly.contains(&format!(".word 0x{invalid:08x}")));

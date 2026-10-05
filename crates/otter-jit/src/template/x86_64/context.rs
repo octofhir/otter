@@ -4,7 +4,7 @@
 //! - `LoadClosureContext`: SELF's closure context word.
 //! - Unchecked `LoadContextSlot` / `StoreContextSlot` over a static hop count.
 //! - The inline hit path of the checked (TDZ) slot accesses.
-//! - `CreateContext` / `CopyContext` carved inline from the linear
+//! - Context and explicit lexical closure construction carved from the linear
 //!   allocation buffer, with the VM-owned allocating ABI as the slow path.
 //!
 //! # Invariants
@@ -21,6 +21,8 @@
 //!   safepoint; a refused allocation exits before any effect at the original
 //!   opcode, which the interpreter re-executes (and which owns the
 //!   heap-limit `RangeError`).
+//! - The allocating slow path passes five physical words through the shared
+//!   platform C boundary and restores its stack-owned allocation context.
 //! - A checked access completes inline when its slot holds a value; only the
 //!   `hole` (TDZ) outcome branches to the committed binding boundary, which
 //!   owns the `ReferenceError`. Lookup accesses always complete there.
@@ -178,13 +180,14 @@ pub(super) fn emit_checked_context_slot(
     depth: u16,
     slot: u16,
     miss: DynamicLabel,
-) -> Result<(), Unsupported> {
+) -> Result<usize, Unsupported> {
     let offset = slot_offset(view, slot)?;
     emit_load_reg(ops, 10, context);
     emit_parent_hops(ops, view, 10, depth)?;
     dynasm!(ops ; .arch x64 ; mov rax, [r10 + offset]);
     emit_load_u64(ops, 11, VALUE_HOLE);
     dynasm!(ops ; .arch x64 ; cmp rax, r11 ; je =>miss);
+    let guard_end = ops.offset().0;
     match access {
         CheckedContextAccess::Load { dst } => emit_store_reg(ops, 0, dst),
         CheckedContextAccess::Store { src } => {
@@ -193,112 +196,132 @@ pub(super) fn emit_checked_context_slot(
             emit_template_value_barrier(ops, relocations, view, 10, 2);
         }
     }
-    Ok(())
+    Ok(guard_end)
 }
 
-/// Which context allocation one call performs.
+/// One context or closure construction through the typed allocating boundary.
 #[derive(Debug, Clone, Copy)]
 pub(super) enum ContextAllocation {
-    /// `CreateContext`: a fresh context of this function's scope `scope`
-    /// under the context (or `undefined`) in register `parent`.
     Create { parent: u16, scope: u32 },
-    /// `CopyContext`: a per-iteration copy of the context in register
-    /// `source`.
     Copy { source: u16 },
+    Function,
+    Closure { context: u16 },
 }
 
-/// Allocate one context and commit it to `r<dst>`: carved inline from the
-/// linear allocation buffer when it fits, otherwise through the
-/// `AllocValue3` boundary. A refused allocation exits at the original opcode
-/// before any effect.
+/// Fully initialize a native LAB fit or call the canonical rooted Probe stub.
+/// The published source PC owns function constants; refused allocations leave
+/// through the original before-state without assigning the destination.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn emit_context_allocation(
     ops: &mut Assembler,
     relocations: &mut RelocationCapture,
     view: &JitCompileSnapshot,
+    pc: u32,
+    byte_pc: u32,
     dst: u16,
     allocation: ContextAllocation,
     safepoint: abi::SafepointId,
     miss: DynamicLabel,
+    fatal: DynamicLabel,
 ) -> Result<(), Unsupported> {
+    use crate::allocation::{AllocationValue, LabRegisters};
+    let owns_this = match allocation {
+        ContextAllocation::Create { scope, .. } => view
+            .context_allocations
+            .get(&(view.code_block.id, scope))
+            .is_some_and(|plan| plan.derived_this_slot.is_some()),
+        _ => false,
+    };
     let descriptor = match allocation {
         ContextAllocation::Create { .. } => abi::STUB_CREATE_CONTEXT_ALLOC,
         ContextAllocation::Copy { .. } => abi::STUB_COPY_CONTEXT_ALLOC,
+        ContextAllocation::Function => abi::STUB_JIT_MAKE_FN,
+        ContextAllocation::Closure { .. } => abi::STUB_JIT_MAKE_CLOSURE,
     };
     let stub_addr = alloc_value_stub_by_id(descriptor.id)
         .and_then(|stub| stub.entry_addr())
-        .ok_or(Unsupported::OperandShape("context allocating stub entry"))?;
+        .ok_or(Unsupported::OperandShape("lexical allocating stub entry"))?;
     let slow = ops.new_dynamic_label();
     let done = ops.new_dynamic_label();
+    let regs = LabRegisters {
+        buffer: 11,
+        candidate: 0,
+        end: 10,
+        scratch: 7,
+        size: 9,
+    };
+    let context_register = 15;
     match allocation {
         ContextAllocation::Create { parent, scope } => {
-            let Some(plan) = view.context_allocations.get(&(view.code_block.id, scope)) else {
-                return emit_context_allocation_call(
+            if let Some(plan) = view.context_allocations.get(&(view.code_block.id, scope)) {
+                emit_load_reg(ops, 2, parent);
+                crate::x86_64::allocation::emit_create_context(
                     ops,
-                    relocations,
                     view,
-                    dst,
-                    allocation,
-                    descriptor,
-                    stub_addr,
-                    safepoint,
-                    miss,
+                    plan,
+                    context_register,
+                    AllocationValue::Register(2),
+                    regs,
+                    slow,
                 );
-            };
-            emit_load_reg(ops, 2, parent);
-            crate::x86_64::allocation::emit_create_context(ops, view, plan, slow);
+            } else {
+                dynasm!(ops ; .arch x64 ; jmp =>slow);
+            }
         }
         ContextAllocation::Copy { source } => {
             emit_load_reg(ops, 2, source);
-            crate::x86_64::allocation::emit_copy_context(ops, view, slow);
+            crate::x86_64::allocation::emit_copy_context(
+                ops,
+                view,
+                context_register,
+                AllocationValue::Register(2),
+                regs,
+                slow,
+            );
+        }
+        ContextAllocation::Function | ContextAllocation::Closure { .. } => {
+            if let Some(&plan) = view.closure_allocations.get(&byte_pc) {
+                let values = match allocation {
+                    ContextAllocation::Closure { context } => {
+                        emit_load_reg(ops, 2, context);
+                        dynasm!(ops ; .arch x64 ; mov rsi, [r14 + crate::entry::NATIVE_FRAME_THIS_OFFSET as i32] ; mov r8, [r14 + crate::entry::NATIVE_FRAME_NEW_TARGET_OFFSET as i32]);
+                        [
+                            AllocationValue::Register(2),
+                            AllocationValue::Register(6),
+                            AllocationValue::Register(8),
+                        ]
+                    }
+                    _ => [AllocationValue::Constant(crate::entry::VALUE_UNDEFINED); 3],
+                };
+                crate::x86_64::allocation::emit_closure(
+                    ops,
+                    view,
+                    plan,
+                    context_register,
+                    values,
+                    regs,
+                    slow,
+                );
+            } else {
+                dynasm!(ops ; .arch x64 ; jmp =>slow);
+            }
         }
     }
-    emit_store_reg(ops, 0, dst);
+    emit_store_reg(ops, regs.candidate, dst);
     dynasm!(ops ; .arch x64 ; jmp =>done ; =>slow);
-    emit_context_allocation_call(
-        ops,
-        relocations,
-        view,
-        dst,
-        allocation,
-        descriptor,
-        stub_addr,
-        safepoint,
-        miss,
-    )?;
-    dynasm!(ops ; .arch x64 ; =>done);
-    Ok(())
-}
-
-/// The allocating-call half of [`emit_context_allocation`].
-#[allow(clippy::too_many_arguments)]
-fn emit_context_allocation_call(
-    ops: &mut Assembler,
-    relocations: &mut RelocationCapture,
-    view: &JitCompileSnapshot,
-    dst: u16,
-    allocation: ContextAllocation,
-    descriptor: abi::RuntimeStubDescriptor,
-    stub_addr: usize,
-    safepoint: abi::SafepointId,
-    miss: DynamicLabel,
-) -> Result<(), Unsupported> {
-    dynasm!(ops
-        ; .arch x64
-        ; sub rsp, ALLOC_CTX_STACK_SIZE as i32
-        ; mov r11, [r15 + THREAD_OFFSET as i32]
+    dynasm!(ops ; .arch x64 ; mov DWORD [r14 + crate::entry::NATIVE_FRAME_PC_OFFSET as i32], pc as i32
+        ; sub rsp, ALLOC_CTX_STACK_SIZE as i32 ; mov r11, [r15 + THREAD_OFFSET as i32]
         ; mov [rsp + ALLOC_CTX_THREAD_OFFSET as i32], r11
         ; mov DWORD [rsp + ALLOC_CTX_SAFEPOINT_ID_OFFSET as i32], safepoint as i32
         ; mov QWORD [rsp + ALLOC_CTX_SPILL_SLOTS_OFFSET as i32], 0
         ; mov WORD [rsp + ALLOC_CTX_SPILL_SLOT_COUNT_OFFSET as i32], 0
-        ; mov rdi, rsp
-        ; mov esi, safepoint as i32
-    );
+        ; mov rdi, rsp ; mov esi, safepoint as i32);
     match allocation {
         ContextAllocation::Create { parent, scope } => {
             let function_id = i32::try_from(view.code_block.id)
-                .map_err(|_| Unsupported::OperandShape("CreateContext function id"))?;
+                .map_err(|_| Unsupported::OperandShape("context source function id"))?;
             let scope = i32::try_from(scope)
-                .map_err(|_| Unsupported::OperandShape("CreateContext scope index"))?;
+                .map_err(|_| Unsupported::OperandShape("context scope index"))?;
             emit_load_reg(ops, 2, parent);
             emit_load_u64(ops, 1, otter_vm::Value::number_i32(function_id).to_bits());
             emit_load_u64(ops, 8, otter_vm::Value::number_i32(scope).to_bits());
@@ -308,15 +331,35 @@ fn emit_context_allocation_call(
             emit_load_u64(ops, 1, VALUE_UNDEFINED);
             emit_load_u64(ops, 8, VALUE_UNDEFINED);
         }
+        ContextAllocation::Function => {
+            emit_load_u64(ops, 2, VALUE_UNDEFINED);
+            emit_load_u64(ops, 1, VALUE_UNDEFINED);
+            emit_load_u64(ops, 8, VALUE_UNDEFINED);
+        }
+        ContextAllocation::Closure { context } => {
+            emit_load_reg(ops, 2, context);
+            dynasm!(ops ; .arch x64 ; mov rcx, [r14 + crate::entry::NATIVE_FRAME_THIS_OFFSET as i32] ; mov r8, [r14 + crate::entry::NATIVE_FRAME_NEW_TARGET_OFFSET as i32]);
+        }
     }
     emit_load_runtime_stub(ops, relocations, stub_addr as u64, descriptor);
-    dynasm!(ops
-        ; .arch x64
-        ; call r11
-        ; add rsp, ALLOC_CTX_STACK_SIZE as i32
-        ; test rdx, rdx
-        ; jne =>miss
-    );
+    crate::x86_64::call_abi::emit_runtime_call(ops, descriptor);
+    let success = ops.new_dynamic_label();
+    dynasm!(ops ; .arch x64 ; add rsp, ALLOC_CTX_STACK_SIZE as i32 ; test rdx, rdx ; jz =>success
+        ; cmp rdx, abi::NativeResultStatus::SideExit as i32 ; je =>miss
+        ; cmp rdx, abi::NativeResultStatus::OutOfMemory as i32 ; je =>miss ; jmp =>fatal ; =>success);
     emit_store_reg(ops, 0, dst);
+    dynasm!(ops ; .arch x64 ; =>done);
+    if owns_this {
+        // Reload from the just-committed window for both fit and collecting
+        // success; no stale pre-call input or interior pointer is retained.
+        emit_load_reg(ops, 0, dst);
+        crate::x86_64::allocation::emit_publish_derived_this_context(
+            ops,
+            14,
+            0,
+            view.code_block.id,
+            [10, 11],
+        );
+    }
     Ok(())
 }

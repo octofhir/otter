@@ -6,7 +6,7 @@
 //!
 //! # Contents
 //! - Ordinary call entry and shared callable invocation.
-//! - Constructor call entry, receiver/prototype setup and learned slot capacity.
+//! - Constructor call entry and family-owned receiver/prototype setup.
 //! - Spread and explicit-`this` call forms.
 //! - Same-stack synchronous re-entry and reusable lean callback frames.
 //! - Dispatch-local owner resolution for cross-chunk callees.
@@ -25,15 +25,16 @@
 //! - Derived bytecode constructors enter with no receiver and preserve the
 //!   caller's stable argument window; their direct `super(...)` dispatch owns
 //!   the single prototype lookup and receiver allocation.
-//! - Receiver observations are untraced and consumed before GC movement;
-//!   no constructor profile retains an instance graph across collection.
-//! - Constructor samples contain only scalar data; the constructing closure
-//!   is resolved from a rewritten root after receiver allocation.
+//! - The canonical construction packet/frame owns the allocated receiver
+//!   and exact family ticket until terminal completion. Constructor layouts
+//!   retain no receivers and require no pre-GC observation flush.
 //! - Forwarded-call operands are reloaded after arguments materialization;
 //!   the committed method lookup is never replayed.
 //! - Generated receiver allocation uses the same VM-planned shape/capacity
 //!   contract as the ordinary allocator; a nursery-window miss returns here
 //!   while all constructor inputs remain rooted and no effect has started.
+//! - Raw native invocation retains its `NativeError` until the published Host
+//!   owner projects it once inside the native's creation realm.
 //! - Nested call/construct dispatch appends above an `ActivationFloor` on the
 //!   current rooted stack; native boundary slots are collector-rewritten in
 //!   their original storage.
@@ -50,20 +51,20 @@
 //! - [`crate::Frame`]
 //! - [`crate::executable`]
 
+mod constructor;
+
 use std::cell::UnsafeCell;
 
-use crate::constructor_profile::ConstructorProfileSample;
-
 use crate::activation_stack::ActivationStack;
+use crate::runtime_activation::CommittedValueError;
 use otter_gc::raw::RawGc;
 use smallvec::SmallVec;
 
 use crate::{
-    CodeBlock, ExecutionContext, Interpreter, JsObject, NativeCallInfo, NativeCtx, NativeFunction,
-    Value, VmError, VmGetOutcome, VmPropertyKey,
+    CodeBlock, ExecutionContext, Interpreter, NativeCallInfo, NativeCtx, NativeFunction, Value,
+    VmError, VmGetOutcome, VmPropertyKey,
     argument_window::{ArgumentOperands, BytecodeArgumentWindow},
     executable::OperandView,
-    native_to_vm_error_with_stack,
     operand_decode::register_operand,
     read_register,
     runtime_cx::NativeCallRoots,
@@ -110,6 +111,7 @@ pub(crate) struct SyncJsCallRoots {
     args: UnsafeCell<SmallVec<[Value; 8]>>,
     scratch_0: JsCallRootSlot,
     scratch_1: JsCallRootSlot,
+    construct_layout: UnsafeCell<crate::constructor_layout::ConstructorLayout>,
 }
 
 impl SyncJsCallRoots {
@@ -122,6 +124,7 @@ impl SyncJsCallRoots {
             args: UnsafeCell::new(args),
             scratch_0: JsCallRootSlot::new(Value::undefined()),
             scratch_1: JsCallRootSlot::new(Value::undefined()),
+            construct_layout: UnsafeCell::new(crate::constructor_layout::ConstructorLayout::null()),
         }
     }
 
@@ -134,6 +137,7 @@ impl SyncJsCallRoots {
             args: UnsafeCell::new(args),
             scratch_0: JsCallRootSlot::new(Value::undefined()),
             scratch_1: JsCallRootSlot::new(Value::undefined()),
+            construct_layout: UnsafeCell::new(crate::constructor_layout::ConstructorLayout::null()),
         }
     }
 
@@ -166,6 +170,20 @@ impl SyncJsCallRoots {
         }
     }
 
+    pub(crate) fn set_construct_layout(
+        &self,
+        layout: crate::constructor_layout::ConstructorLayout,
+    ) {
+        // SAFETY: a short single-mutator nonallocating assignment.
+        unsafe {
+            *self.construct_layout.get() = layout;
+        }
+    }
+    pub(crate) fn construct_layout(&self) -> crate::constructor_layout::ConstructorLayout {
+        // SAFETY: no reference escapes and this scalar read cannot collect.
+        unsafe { *self.construct_layout.get() }
+    }
+
     pub(crate) fn args_len(&self) -> usize {
         // SAFETY: this short read cannot allocate or overlap root tracing.
         unsafe { (&*self.args.get()).len() }
@@ -187,6 +205,11 @@ impl SyncJsCallRoots {
 impl otter_gc::ExtraRootSource for SyncJsCallRoots {
     fn visit_extra_roots(&self, visitor: &mut dyn FnMut(*mut RawGc)) {
         self.current.trace(visitor);
+        // SAFETY: the registered provider owns this initialized canonical slot
+        // during collection. A layout is a strong old-space handle.
+        if !unsafe { (*self.construct_layout.get()).is_null() } {
+            visitor(self.construct_layout.get().cast::<RawGc>());
+        }
         self.receiver.trace(visitor);
         self.new_target.trace(visitor);
         self.proxy_target.trace(visitor);
@@ -205,13 +228,12 @@ impl otter_gc::ExtraRootSource for SyncJsCallRoots {
 pub(crate) fn invoke_native_call_with_roots(
     interp: &mut Interpreter,
     stack: &mut ActivationStack,
-    context: &ExecutionContext,
+    context: Option<&ExecutionContext>,
     call: crate::native_function::NativeCallTarget,
-    realm_global: Option<JsObject>,
     this_value: Value,
     value_roots: &[&Value],
     args: &[Value],
-) -> Result<Value, VmError> {
+) -> Result<Value, crate::NativeError> {
     let call_info = NativeCallInfo::call(this_value);
     let slice_roots = [args];
     let roots = NativeCallRoots::new(&call_info, value_roots, &slice_roots);
@@ -221,19 +243,9 @@ pub(crate) fn invoke_native_call_with_roots(
         .gc_heap
         .register_extra_roots(otter_gc::ExtraRoots::new(&roots));
     debug_assert!(interp.gc_heap.has_frame_root_providers());
-    if let Some(global) = realm_global {
-        interp.with_host_realm_global(global, |interp| {
-            let turn = crate::runtime_cx::RuntimeTurn::from_rooted_parts(interp, stack);
-            let mut ctx = NativeCtx::from_runtime_turn(turn, &call_info, Some(context));
-            let raw = call.invoke(&mut ctx, args);
-            raw.map_err(|e| native_to_vm_error_with_stack(interp, stack, e))
-        })
-    } else {
-        let turn = crate::runtime_cx::RuntimeTurn::from_rooted_parts(interp, stack);
-        let mut ctx = NativeCtx::from_runtime_turn(turn, &call_info, Some(context));
-        let raw = call.invoke(&mut ctx, args);
-        raw.map_err(|e| native_to_vm_error_with_stack(interp, stack, e))
-    }
+    let turn = crate::runtime_cx::RuntimeTurn::from_rooted_parts(interp, stack);
+    let mut ctx = NativeCtx::from_runtime_turn(turn, &call_info, context);
+    call.invoke(&mut ctx, args)
 }
 
 impl Interpreter {
@@ -259,620 +271,6 @@ impl Interpreter {
             .jit_runtime_stats
             .class_super_resolution_transitions
             .saturating_add(1);
-    }
-
-    /// Try the non-observable half of generated base-constructor receiver
-    /// preparation.
-    ///
-    /// A hit requires an already materialized own data `prototype` on an
-    /// ordinary function/closure, or the intrinsic prototype held by a class
-    /// constructor. Accessors, proxies, bound functions, missing lazy
-    /// prototypes, and every other uncertain shape miss before effects so the
-    /// caller can enter [`Self::jit_prepare_base_construct_receiver`].
-    pub fn jit_try_prepare_base_construct_receiver(
-        &mut self,
-        context: &ExecutionContext,
-        function_id: u32,
-        callee: Value,
-        new_target: Value,
-    ) -> Result<Option<Value>, VmError> {
-        self.record_jit_runtime_stub_class(crate::native_abi::RuntimeStubClass::Alloc);
-
-        let prototype = if let Some(function_id) = new_target.as_function().or_else(|| {
-            new_target
-                .as_closure(&self.gc_heap)
-                .map(|closure| closure.cached_function_id)
-        }) {
-            let owner = new_target.as_closure(&self.gc_heap);
-            match self.function_prototype_slot(context, owner, function_id) {
-                Some((value, _)) if !value.is_hole() => value,
-                _ => return Ok(None),
-            }
-        } else if let Some(class) = new_target.as_class_constructor() {
-            Value::object(class.prototype(&self.gc_heap))
-        } else {
-            return Ok(None);
-        };
-
-        self.jit_runtime_stats.runtime_constructs =
-            self.jit_runtime_stats.runtime_constructs.saturating_add(1);
-        let roots = SyncJsCallRoots::construct(callee, new_target, SmallVec::new());
-        let _roots_guard = self
-            .gc_heap
-            .register_extra_roots(otter_gc::ExtraRoots::new(&roots));
-        roots.scratch_0.set(if prototype.is_object_type() {
-            prototype
-        } else {
-            self.constructor_prototype_value("Object")?
-        });
-        Ok(Some(self.allocate_bytecode_constructor_receiver(
-            context,
-            function_id,
-            &roots,
-        )?))
-    }
-
-    /// Allocate the receiver one bytecode constructor body will initialize:
-    /// OrdinaryCreateFromConstructor plus this engine's constructor feedback.
-    ///
-    /// Every construct path — generated linkage, the runtime construct
-    /// boundary, and the interpreter's own `New` — hands the constructor body
-    /// the same receiver contract through this one function: the body's
-    /// baked field-transition program has its slab capacity reserved ahead
-    /// of the first store, and a simple constructor receives its final hidden
-    /// class with undefined slots, which its straight-line writes overwrite
-    /// in source order before anything can observe them. `roots.scratch_0`
-    /// holds the resolved prototype and `roots.new_target` the construct's
-    /// `new.target`; the returned value is also left in `roots.receiver`.
-    ///
-    /// Storage is reserved for the larger of the baked transition program and
-    /// the instance size learned from the previous receiver prepared for the
-    /// same constructor pair, so fields the body adds through a callee still
-    /// land in pre-reserved slots instead of growing the slab store by store.
-    fn allocate_bytecode_constructor_receiver(
-        &mut self,
-        context: &ExecutionContext,
-        function_id: u32,
-        roots: &SyncJsCallRoots,
-    ) -> Result<Value, VmError> {
-        // The receiver is created on its prototype's lineage
-        // (OrdinaryCreateFromConstructor); finding the root never collects.
-        let root = self.value_root(roots.scratch_0.get())?;
-        let (reserved_field_count, profile) =
-            self.constructor_receiver_reservation(context, function_id, roots, root)?;
-        let simple_shape = self.jit_simple_constructor_shape(
-            context,
-            function_id,
-            roots.scratch_0.get(),
-            root,
-            roots,
-        )?;
-        let field_count = simple_shape
-            .map_or(0, |(_, fields)| fields)
-            .max(reserved_field_count);
-        let receiver = self.alloc_runtime_rooted_object_with_capacity(
-            root,
-            crate::object::receiver_inline_capacity(field_count),
-            &[],
-            &[],
-        )?;
-        roots.receiver.set(Value::object(receiver));
-        if let Some((shape, initial_fields)) = simple_shape {
-            let receiver = roots
-                .receiver
-                .get()
-                .as_object()
-                .ok_or(VmError::InvalidOperand)?;
-            let mut slots = SmallVec::<[Value; 8]>::new();
-            slots.resize(initial_fields, Value::undefined());
-            crate::object::install_fresh_shape_with_slots(
-                receiver,
-                &mut self.gc_heap,
-                shape,
-                slots.as_slice(),
-                field_count,
-            );
-        } else if field_count > crate::object::MAX_INLINE_CAPACITY {
-            // Fields that fit the in-object slots need no slab; reserving one
-            // would move every slot out of line for nothing.
-            let mut receiver = roots
-                .receiver
-                .get()
-                .as_object()
-                .ok_or(VmError::InvalidOperand)?;
-            crate::object::reserve_fresh_object_slot_capacity(
-                &mut receiver,
-                &mut self.gc_heap,
-                reserved_field_count,
-            )
-            .map_err(VmError::from)?;
-            roots.receiver.set(Value::object(receiver));
-        }
-        let receiver = roots
-            .receiver
-            .get()
-            .as_object()
-            .ok_or(VmError::InvalidOperand)?;
-        self.note_constructor_receiver(profile, roots.new_target.get(), receiver);
-        Ok(roots.receiver.get())
-    }
-
-    /// Slot capacity a constructor's receiver must start with: the baked
-    /// transition program folded with the instance size learned from the
-    /// previous receiver prepared by the same constructor. Returns the
-    /// profile the caller records the allocated receiver into.
-    /// `roots.new_target` and `roots.scratch_0` (the prototype) must be set.
-    fn constructor_receiver_reservation(
-        &mut self,
-        context: &ExecutionContext,
-        function_id: u32,
-        roots: &SyncJsCallRoots,
-        root: crate::object::ShapeHandle,
-    ) -> Result<(usize, ConstructorProfileSample), VmError> {
-        let baked_field_count = self.prepare_constructor_field_transitions(
-            context,
-            function_id,
-            roots.new_target.get(),
-            roots.scratch_0.get(),
-            root,
-            roots,
-        )?;
-        let sample = self.sample_constructor_profile(function_id, roots.new_target.get());
-        Ok((baked_field_count.max(sample.learned), sample))
-    }
-
-    /// Resolve the hidden class a conservative generated constructor can own
-    /// before its body begins.
-    ///
-    /// The matcher admits only straight-line own data writes to `this` followed
-    /// by `return undefined`. Every matching name must also be absent from the
-    /// selected prototype chain. Installing the final shape with undefined
-    /// slots is therefore unobservable: the constructor cannot expose or
-    /// inspect its receiver before overwriting those slots in source order.
-    fn jit_simple_constructor_shape(
-        &mut self,
-        context: &ExecutionContext,
-        function_id: u32,
-        prototype: Value,
-        root: crate::object::ShapeHandle,
-        roots: &SyncJsCallRoots,
-    ) -> Result<Option<(crate::object::ShapeHandle, usize)>, VmError> {
-        let Ok(owner) = context.for_function(function_id) else {
-            return Ok(None);
-        };
-        let context = &*owner;
-        let Some(function) = context.exec_function(function_id) else {
-            return Ok(None);
-        };
-        let Some(init) = self.simple_constructor_init(context, function_id, function) else {
-            return Ok(None);
-        };
-        let Some(proto_obj) = prototype.as_object() else {
-            return Ok(None);
-        };
-        // The field names stay absent from the chain while the chain's
-        // current proof is the one they were found absent under.
-        let proof = crate::object::prototype_validity::chain_validity(proto_obj, &self.gc_heap);
-        let proven = proof.as_ref().is_some_and(|proof| {
-            self.simple_constructor_absence
-                .get(&function_id)
-                .is_some_and(|known| std::sync::Arc::ptr_eq(known, proof) && known.is_valid())
-        });
-        if !proven {
-            if init.fields.iter().any(|field| {
-                !matches!(
-                    crate::object::lookup(proto_obj, &self.gc_heap, &field.name),
-                    crate::object::PropertyLookup::Absent
-                )
-            }) {
-                self.simple_constructor_absence.remove(&function_id);
-                return Ok(None);
-            }
-            if let Some(proof) = proof {
-                self.simple_constructor_absence.insert(function_id, proof);
-            }
-        }
-        let field_count = init.fields.len();
-        let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
-            otter_gc::ExtraRootSource::visit_extra_roots(roots, visitor);
-        };
-        let shape = self.simple_constructor_shape_with_roots(
-            function_id,
-            root,
-            &init,
-            &mut external_visit,
-        )?;
-        Ok(Some((shape, field_count)))
-    }
-
-    fn simple_constructor_init(
-        &mut self,
-        context: &ExecutionContext,
-        function_id: u32,
-        function: &CodeBlock,
-    ) -> Option<crate::constructor_fast_path::SimpleConstructorInit> {
-        if let Some(cached) = self.simple_constructor_init_cache.get(&function_id) {
-            return cached.clone();
-        }
-        let init = crate::constructor_fast_path::match_simple_constructor_init(context, function);
-        self.simple_constructor_init_cache
-            .insert(function_id, init.clone());
-        init
-    }
-
-    /// The final hidden class of a simple constructor's receivers on
-    /// `root`'s lineage, cached per constructor and prototype root.
-    fn simple_constructor_shape_with_roots(
-        &mut self,
-        function_id: u32,
-        root: crate::object::ShapeHandle,
-        init: &crate::constructor_fast_path::SimpleConstructorInit,
-        external_visit: &mut dyn FnMut(&mut dyn FnMut(*mut RawGc)),
-    ) -> Result<crate::object::ShapeHandle, VmError> {
-        let root_id = self.shape_runtime.id_for_handle(&self.gc_heap, root);
-        if let Some(shape) = self
-            .simple_constructor_shape_cache
-            .get(&(function_id, root_id))
-        {
-            return Ok(*shape);
-        }
-
-        let mut shape = root;
-        for field in &init.fields {
-            if let Some(child) = self.shape_runtime.child_if_cached(
-                &self.gc_heap,
-                shape,
-                &field.name,
-                crate::object::PropertyFlags::data_default(),
-                false,
-            ) {
-                shape = child;
-                continue;
-            }
-            shape = self
-                .shape_runtime
-                .child_with_roots(
-                    &mut self.gc_heap,
-                    shape,
-                    &field.name,
-                    crate::object::PropertyFlags::data_default(),
-                    false,
-                    external_visit,
-                )
-                .map_err(VmError::from)?;
-        }
-        self.simple_constructor_shape_cache
-            .insert((function_id, root_id), shape);
-        Ok(shape)
-    }
-
-    /// Prepare the receiver for one compiler-generated base constructor.
-    ///
-    /// The dynamic callable has already passed the generated identity guard.
-    /// This owns the observable `new.target.prototype` lookup and
-    /// `OrdinaryCreateFromConstructor` allocation, but does not start the
-    /// constructor body. The caller's call-site root homes keep its arguments
-    /// live while this local root provider protects the callable, prototype,
-    /// and freshly allocated receiver across reentrant accessors and moving GC.
-    pub fn jit_prepare_base_construct_receiver(
-        &mut self,
-        stack: &mut ActivationStack,
-        context: &ExecutionContext,
-        function_id: u32,
-        callee: Value,
-        new_target: Value,
-    ) -> Result<Value, VmError> {
-        self.record_jit_runtime_stub_class(crate::native_abi::RuntimeStubClass::Reentrant);
-        self.jit_runtime_stats.runtime_constructs =
-            self.jit_runtime_stats.runtime_constructs.saturating_add(1);
-        let roots = SyncJsCallRoots::construct(callee, new_target, SmallVec::new());
-        let _roots_guard = self
-            .gc_heap
-            .register_extra_roots(otter_gc::ExtraRoots::new(&roots));
-        let new_target = roots.new_target.get();
-        let proto = self
-            .construct_prototype_for_callee(stack, context, &new_target)?
-            .unwrap_or(self.constructor_prototype_value("Object")?);
-        roots.scratch_0.set(proto);
-        self.allocate_bytecode_constructor_receiver(context, function_id, &roots)
-    }
-
-    /// Build guarded, pre-reserved field-transition programs for one exact
-    /// base→derived construction chain.
-    ///
-    /// Shape publication remains at each original `StoreProperty`. This phase
-    /// only interns the child shapes and reserves hidden slab capacity while
-    /// the selected prototype and `new.target` are rooted. A prototype field,
-    /// proxy/value prototype, duplicate name, or excessive chain stops the
-    /// plan before generated code can perform an effect.
-    /// Learn the exact base-to-derived field chain from a class wrapper without
-    /// performing an observable `prototype` lookup. This lets a legacy
-    /// materialized `New` caller seed the replacement backend before the
-    /// canonical construct runs; only receivers that fit the in-body slab are
-    /// admitted because this observation does not reserve an out-of-line slab.
-    /// [`Self::observe_class_constructor_field_transitions`] for a construct
-    /// whose operands are raw locals: observing allocates shapes, so the
-    /// callee, `new.target` and arguments ride the traced anchor stack across
-    /// it and are written back relocated.
-    pub(crate) fn observe_class_constructor_field_transitions_rooted(
-        &mut self,
-        context: &ExecutionContext,
-        callee: &mut Value,
-        new_target: &mut Value,
-        args: &mut [Value],
-    ) -> Result<(), VmError> {
-        let anchor = self.push_iteration_anchor(*callee) - 1;
-        self.push_iteration_anchor(*new_target);
-        for &arg in args.iter() {
-            self.push_iteration_anchor(arg);
-        }
-        let observed = self.observe_class_constructor_field_transitions(context, *new_target);
-        *callee = self.iteration_anchor(anchor);
-        *new_target = self.iteration_anchor(anchor + 1);
-        for (index, arg) in args.iter_mut().enumerate() {
-            *arg = self.iteration_anchor(anchor + 2 + index);
-        }
-        self.pop_iteration_anchors_to(anchor);
-        observed
-    }
-
-    pub(crate) fn observe_class_constructor_field_transitions(
-        &mut self,
-        context: &ExecutionContext,
-        new_target: Value,
-    ) -> Result<(), VmError> {
-        let Some(class) = new_target.as_class_constructor() else {
-            return Ok(());
-        };
-        let super_constructor = class.ctor_proto(&self.gc_heap);
-        let class_callable = class.ctor(&self.gc_heap);
-        let base_callable = if super_constructor.is_undefined() {
-            class_callable
-        } else {
-            super_constructor
-                .as_class_constructor()
-                .map(|class| class.ctor(&self.gc_heap))
-                .unwrap_or(super_constructor)
-        };
-        let Some(base_function_id) = base_callable.as_function().or_else(|| {
-            base_callable
-                .as_closure(&self.gc_heap)
-                .map(|closure| closure.function_id())
-        }) else {
-            return Ok(());
-        };
-        let derived_callable = class_callable;
-        let Some(derived_function_id) = derived_callable.as_function().or_else(|| {
-            derived_callable
-                .as_closure(&self.gc_heap)
-                .map(|closure| closure.function_id())
-        }) else {
-            return Ok(());
-        };
-        let mut chain_functions = smallvec::SmallVec::<[u32; 2]>::new();
-        chain_functions.push(base_function_id);
-        if derived_function_id != base_function_id {
-            chain_functions.push(derived_function_id);
-        }
-        let mut store_count = 0usize;
-        for function_id in chain_functions {
-            let Ok(owner) = context.for_function(function_id) else {
-                continue;
-            };
-            let Some(function) = owner.exec_function(function_id) else {
-                continue;
-            };
-            store_count +=
-                crate::constructor_fast_path::match_constructor_shape_stores(&owner, function)
-                    .len();
-        }
-        if store_count == 0 || store_count > crate::object::MAX_INLINE_CAPACITY {
-            return Ok(());
-        }
-
-        let roots = SyncJsCallRoots::construct(base_callable, new_target, SmallVec::new());
-        roots
-            .scratch_0
-            .set(Value::object(class.prototype(&self.gc_heap)));
-        let _roots_guard = self
-            .gc_heap
-            .register_extra_roots(otter_gc::ExtraRoots::new(&roots));
-        let root = self.value_root(roots.scratch_0.get())?;
-        self.prepare_constructor_field_transitions(
-            context,
-            base_function_id,
-            roots.new_target.get(),
-            roots.scratch_0.get(),
-            root,
-            &roots,
-        )?;
-        Ok(())
-    }
-
-    fn prepare_constructor_field_transitions(
-        &mut self,
-        context: &ExecutionContext,
-        base_function_id: u32,
-        new_target: Value,
-        prototype: Value,
-        root: crate::object::ShapeHandle,
-        roots: &SyncJsCallRoots,
-    ) -> Result<usize, VmError> {
-        // Class wrappers and an exact ordinary `new.target` both provide the
-        // stable constructor identity generated linkage needs. The latter is
-        // important for non-simple function constructors: their first
-        // `this.x = value` is an add-property transition, not an existing-slot
-        // StoreProperty IC, so leaving it out would compile a body that exits
-        // at that store on every generated entry. Distinct ordinary
-        // `new.target` calls keep the canonical Reflect.construct preparation.
-        let class_new_target = new_target.is_class_constructor();
-        let callable_new_target = new_target
-            .as_class_constructor()
-            .map(|class| class.ctor(&self.gc_heap))
-            .unwrap_or(new_target);
-        let new_target_function_id = callable_new_target.as_function().or_else(|| {
-            callable_new_target
-                .as_closure(&self.gc_heap)
-                .map(|closure| closure.function_id())
-        });
-        if !class_new_target && new_target_function_id != Some(base_function_id) {
-            return Ok(0);
-        }
-        let derived_function_id = new_target_function_id.filter(|&function_id| {
-            function_id != base_function_id
-                && context
-                    .for_function(function_id)
-                    .ok()
-                    .and_then(|owner| {
-                        owner
-                            .exec_function(function_id)
-                            .map(|function| function.is_derived_constructor)
-                    })
-                    .unwrap_or(false)
-        });
-        let chain_key = (
-            base_function_id,
-            derived_function_id.unwrap_or(base_function_id),
-        );
-        let root_id = self.shape_runtime.id_for_handle(&self.gc_heap, root);
-        let proof_key = (chain_key.0, chain_key.1, root_id);
-        if let Some(&capacity) = self.constructor_field_capacity_cache.get(&chain_key)
-            && self
-                .constructor_prototype_validity_cache
-                .get(&proof_key)
-                .is_some_and(|validity| validity.is_valid())
-        {
-            return Ok(capacity);
-        }
-        let Some(mut prototype_object) = prototype.as_object() else {
-            return Ok(0);
-        };
-        // Class prototypes are initially assembled in dictionary storage. A
-        // generated guard cannot name that mutable identity, so converge the
-        // selected prototype chain onto the ordinary hidden-class path before
-        // recording it. The migration roots and refreshes `prototype_object`.
-        self.migrate_slow_to_fast(&mut prototype_object);
-        roots.scratch_0.set(Value::object(prototype_object));
-        let Some(prototype_validity) =
-            crate::object::prototype_validity::chain_validity(prototype_object, &self.gc_heap)
-        else {
-            return Ok(0);
-        };
-
-        let mut functions = smallvec::SmallVec::<[u32; 2]>::new();
-        functions.push(base_function_id);
-        if let Some(function_id) = derived_function_id {
-            functions.push(function_id);
-        }
-
-        let mut shape = root;
-        let mut slot = 0u16;
-        let mut seen = rustc_hash::FxHashSet::default();
-        let mut reopt_functions = smallvec::SmallVec::<[u32; 2]>::new();
-        for function_id in functions {
-            let Ok(owner) = context.for_function(function_id) else {
-                break;
-            };
-            let Some(function) = owner.exec_function(function_id) else {
-                break;
-            };
-            let stores =
-                crate::constructor_fast_path::match_constructor_shape_stores(&owner, function);
-            let simple_init = (function_id == base_function_id)
-                .then(|| {
-                    crate::constructor_fast_path::match_simple_constructor_init(&owner, function)
-                })
-                .flatten();
-            let receiver_is_pre_shaped = simple_init.is_some();
-            for store in stores {
-                // Each transition below allocates a shape; the prototype is
-                // read back from its rooted slot every step.
-                let Some(prototype_object) = roots.scratch_0.get().as_object() else {
-                    return Ok(usize::from(slot));
-                };
-                if !seen.insert(store.name.clone())
-                    || !matches!(
-                        crate::object::lookup(prototype_object, &self.gc_heap, &store.name),
-                        crate::object::PropertyLookup::Absent
-                    )
-                {
-                    return Ok(usize::from(slot));
-                }
-                let from_shape = shape;
-                let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
-                    otter_gc::ExtraRootSource::visit_extra_roots(roots, visitor);
-                };
-                shape = if let Some(child) = self.shape_runtime.child_if_cached(
-                    &self.gc_heap,
-                    shape,
-                    &store.name,
-                    crate::object::PropertyFlags::data_default(),
-                    false,
-                ) {
-                    child
-                } else {
-                    self.shape_runtime
-                        .child_with_roots(
-                            &mut self.gc_heap,
-                            shape,
-                            &store.name,
-                            crate::object::PropertyFlags::data_default(),
-                            false,
-                            &mut external_visit,
-                        )
-                        .map_err(VmError::from)?
-                };
-                let transition = crate::jit::JitConstructorFieldTransitionPlan {
-                    from_shape: self.shape_runtime.id_for_handle(&self.gc_heap, from_shape),
-                    to_shape: self.shape_runtime.id_for_handle(&self.gc_heap, shape),
-                    prototype_validity: prototype_validity.clone(),
-                    slot,
-                };
-                if !receiver_is_pre_shaped {
-                    let transitions = self
-                        .constructor_field_transition_cache
-                        .entry(function_id)
-                        .or_default();
-                    let stale = transitions
-                        .get(&store.byte_pc)
-                        .is_none_or(|existing| !existing.prototype_validity.is_valid());
-                    if stale {
-                        transitions.insert(store.byte_pc, transition);
-                        self.jit_runtime_stats.constructor_field_transition_installs = self
-                            .jit_runtime_stats
-                            .constructor_field_transition_installs
-                            .saturating_add(1);
-                        if !reopt_functions.contains(&function_id) {
-                            reopt_functions.push(function_id);
-                        }
-                    }
-                }
-                slot = slot.checked_add(1).ok_or(VmError::InvalidOperand)?;
-            }
-            if let Some(init) = simple_init {
-                self.simple_constructor_init_cache
-                    .insert(function_id, Some(init));
-                let root_id = self.shape_runtime.id_for_handle(&self.gc_heap, root);
-                self.simple_constructor_shape_cache
-                    .insert((function_id, root_id), shape);
-            }
-        }
-        // The first generated receiver preparation can discover these plans
-        // after an earlier hot loop already compiled the constructor. Retire
-        // that stale generation once; permanent function cells and generation
-        // leases keep the already-selected current call safe, while the next
-        // entry recompiles against the richer transition snapshot.
-        let capacity = usize::from(slot);
-        self.constructor_field_capacity_cache
-            .entry(chain_key)
-            .and_modify(|reserved| *reserved = (*reserved).max(capacity))
-            .or_insert(capacity);
-        self.constructor_prototype_validity_cache
-            .insert(proof_key, prototype_validity);
-        for function_id in reopt_functions {
-            self.evict_compiled_for_reopt(function_id);
-        }
-        Ok(capacity)
     }
 
     /// Apply the derived-constructor return rules to one generated callee.
@@ -973,32 +371,13 @@ impl Interpreter {
         new_target: &Value,
         used_object_prototype_fallback: bool,
         args: &[Value],
-    ) -> Result<Value, VmError> {
-        // A cross-realm `new` runs under the constructor's realm, exactly
-        // like the call path: intrinsics and default prototypes resolve
-        // there.
-        if let Some(global) = self.native_target_realm_global(&native)
-            && global != self.global_this
-        {
-            return self.with_host_realm_global(global, |interp| {
-                interp.invoke_native_construct_rooted(
-                    stack,
-                    context,
-                    native,
-                    this_value,
-                    new_target,
-                    used_object_prototype_fallback,
-                    args,
-                )
-            });
-        }
+    ) -> Result<Value, crate::NativeError> {
         let call = native.call_target(&self.gc_heap);
         let call_info = NativeCallInfo::construct_with_receiver(
             *this_value,
             Some(*new_target),
             used_object_prototype_fallback,
         );
-        self.record_runtime_native_call()?;
         // Same root coverage as the call path (`invoke_native_call_with_roots`):
         // trace the interpreter's full root set (crucially the scope-handle
         // arena, so a native constructor's `Local` handles stay live) and
@@ -1014,8 +393,8 @@ impl Interpreter {
         let mut ctx = NativeCtx::from_runtime_turn(turn, &call_info, Some(context));
         let raw = call.invoke(&mut ctx, args);
         let rooted_this = *ctx.this_value();
-        let (interp, stack) = ctx.cx.into_parts();
-        let result = raw.map_err(|e| native_to_vm_error_with_stack(interp, stack, e))?;
+        let (interp, _) = ctx.cx.into_parts();
+        let result = raw?;
         // The constructor ran under its own realm. A body-slot exotic it
         // built carries no `[[Prototype]]`, so stamp the realm's
         // intrinsic before the value escapes into another one.
@@ -1105,12 +484,16 @@ impl Interpreter {
         let frame = &stack[top_idx];
         let tail_safe = !self.frame_has_suspension_owner(frame) && !frame.is_construct();
         let return_destination = frame.return_destination;
+        let return_anchor = (frame.caller, frame.caller_return_pc);
         self.do_call_inner(stack, ArgumentOperands::execution(function, instruction))?;
         if tail_safe && let Some(request) = stack.staged_request_mut() {
             request.return_destination = return_destination;
+            request.caller = return_anchor.0;
+            request.caller_return_pc = return_anchor.1;
             request.header.flags = crate::native_abi::NativeFrameFlags::from_bits(
                 request.header.flags.bits() | crate::native_abi::NativeFrameFlags::TAIL_CALL,
             );
+            self.complete_interpreted_retraining_activation(&mut stack[top_idx]);
             self.frame_release_cold(&mut stack[top_idx]);
         }
         Ok(())
@@ -1218,7 +601,12 @@ impl Interpreter {
         let args = BytecodeArgumentWindow::from_operands(&stack[top_idx], operands, 3, argc)
             .to_smallvec8()?;
         stack[top_idx].advance_pc()?;
+        let origin = std::ptr::from_mut(&mut stack[top_idx]) as u64;
         self.stage_construct(stack, callee, new_target, args, dst);
+        stack
+            .staged_request_mut()
+            .ok_or(VmError::InvalidOperand)?
+            .super_origin = origin;
         Ok(())
     }
 
@@ -1260,7 +648,12 @@ impl Interpreter {
         let new_target = Self::super_new_target(&stack[top_idx], callee);
         let args = self.spread_call_arguments(*read_register(&stack[top_idx], args_reg)?)?;
         stack[top_idx].advance_pc()?;
+        let origin = std::ptr::from_mut(&mut stack[top_idx]) as u64;
         self.stage_construct(stack, callee, new_target, args, dst);
+        stack
+            .staged_request_mut()
+            .ok_or(VmError::InvalidOperand)?
+            .super_origin = origin;
         Ok(())
     }
 
@@ -1319,7 +712,7 @@ impl Interpreter {
         let mut activations = ActivationStack::new();
         self.with_runtime_turn(&mut activations, |turn| {
             let (interp, stack) = turn.into_parts();
-            interp.run_callable_sync_rooted(stack, context, callee, this_value, args)
+            interp.run_callable_sync_rooted(stack, Some(context), callee, this_value, args)
         })
     }
 
@@ -1330,7 +723,7 @@ impl Interpreter {
     pub(crate) fn run_callable_sync_rooted(
         &mut self,
         stack: &mut ActivationStack,
-        context: &ExecutionContext,
+        context: Option<&ExecutionContext>,
         callee: &Value,
         this_value: Value,
         args: SmallVec<[Value; 8]>,
@@ -1338,10 +731,11 @@ impl Interpreter {
         if !stack.is_runtime_rooted_by(self) {
             return Err(VmError::InvalidOperand);
         }
+        let source = self.callable_context(context, *callee)?;
         self.enter_sync_reentry()?;
         let floor = stack.floor();
         stack.stage_call(*callee, this_value, None, args, None);
-        let result = self.execute_prepared_call(context, stack);
+        let result = self.execute_prepared_call(source.as_ref(), stack);
         self.release_frames_above(stack, floor);
         self.leave_sync_reentry();
         result
@@ -1355,6 +749,7 @@ impl Interpreter {
         target: &Value,
         new_target: Value,
         args: SmallVec<[Value; 8]>,
+        super_origin: u64,
     ) -> Result<Value, VmError> {
         if !stack.is_runtime_rooted_by(self) {
             return Err(VmError::InvalidOperand);
@@ -1362,7 +757,12 @@ impl Interpreter {
         self.enter_sync_reentry()?;
         let floor = stack.floor();
         stack.stage_call(*target, Value::undefined(), Some(new_target), args, None);
-        let result = self.execute_prepared_call(context, stack);
+        let Some(request) = stack.staged_request_mut() else {
+            self.leave_sync_reentry();
+            return Err(VmError::InvalidOperand);
+        };
+        request.super_origin = super_origin;
+        let result = self.execute_prepared_call(Some(context), stack);
         self.release_frames_above(stack, floor);
         self.leave_sync_reentry();
         result
@@ -1373,7 +773,7 @@ impl Interpreter {
         stack: &mut ActivationStack,
         context: &ExecutionContext,
         callee: &Value,
-    ) -> Result<Option<Value>, VmError> {
+    ) -> Result<Option<Value>, CommittedValueError> {
         let function_id = callee.as_function().or_else(|| {
             callee
                 .as_closure(&self.gc_heap)
@@ -1419,7 +819,8 @@ impl Interpreter {
                         }
                         _ => None,
                     })
-                });
+                })
+                .map_err(|error| CommittedValueError::JavaScript(error.into()));
         }
         Ok(None)
     }
@@ -1429,19 +830,27 @@ impl Interpreter {
         stack: &mut ActivationStack,
         context: &ExecutionContext,
         callee: &Value,
-    ) -> Result<Option<Value>, VmError> {
+    ) -> Result<Option<Value>, CommittedValueError> {
         let callee_anchor = self.push_iteration_anchor(*callee) - 1;
         let anchor_base = callee_anchor;
-        let result = (|| -> Result<Option<Value>, VmError> {
+        let result = (|| -> Result<Option<Value>, CommittedValueError> {
             let key = VmPropertyKey::String("prototype");
             let callee = self.iteration_anchor(callee_anchor);
-            let proto = match self.ordinary_get_value(stack, context, callee, callee, &key, 0)? {
-                VmGetOutcome::Value(value) => value,
-                VmGetOutcome::InvokeGetter { getter } => {
-                    let callee = self.iteration_anchor(callee_anchor);
-                    self.run_callable_sync_rooted(stack, context, &getter, callee, SmallVec::new())?
-                }
-            };
+            let proto =
+                match self.ordinary_get_value(stack, Some(context), callee, callee, &key, 0)? {
+                    VmGetOutcome::Value(value) => value,
+                    VmGetOutcome::InvokeGetter { getter } => {
+                        let callee = self.iteration_anchor(callee_anchor);
+                        self.run_callable_sync_rooted(
+                            stack,
+                            Some(context),
+                            &getter,
+                            callee,
+                            SmallVec::new(),
+                        )
+                        .map_err(CommittedValueError::completed_call)?
+                    }
+                };
             // The getter may have collected or revoked a Proxy. Reload the
             // callee from the anchor before consulting its post-Get state.
             let revoked_proxy = self
@@ -1449,9 +858,9 @@ impl Interpreter {
                 .as_proxy()
                 .is_some_and(|proxy| proxy.is_revoked(&self.gc_heap));
             if !proto.is_object_type() && revoked_proxy {
-                return Err(
-                    self.err_type(("Cannot get prototype from a revoked proxy".to_string()).into())
-                );
+                return Err(CommittedValueError::JavaScript(self.err_type(
+                    ("Cannot get prototype from a revoked proxy".to_string()).into(),
+                )));
             }
             Ok(proto.is_object_type().then_some(proto))
         })();
@@ -1527,29 +936,35 @@ impl Interpreter {
         context: &ExecutionContext,
         function: &CodeBlock,
         instruction: &crate::CodeBlockInstruction,
-    ) -> Result<(), VmError> {
+    ) -> Result<(), CommittedValueError> {
         let dst = function
             .register(instruction, 0)
-            .ok_or(VmError::InvalidOperand)?;
+            .ok_or(VmError::InvalidOperand)
+            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
         let method_reg = function
             .register(instruction, 1)
-            .ok_or(VmError::InvalidOperand)?;
+            .ok_or(VmError::InvalidOperand)
+            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
         let callee_reg = function
             .register(instruction, 2)
-            .ok_or(VmError::InvalidOperand)?;
+            .ok_or(VmError::InvalidOperand)
+            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
         let this_reg = function
             .register(instruction, 3)
-            .ok_or(VmError::InvalidOperand)?;
+            .ok_or(VmError::InvalidOperand)
+            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
         let top_idx = stack.len() - 1;
-        let method = *read_register(&stack[top_idx], method_reg)?;
-        let callee = *read_register(&stack[top_idx], callee_reg)?;
+        let method = *read_register(&stack[top_idx], method_reg)
+            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+        let callee = *read_register(&stack[top_idx], callee_reg)
+            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
         if crate::method_ops::is_function_prototype_intrinsic_value(
             method,
             &self.gc_heap,
             crate::native_function::VmIntrinsicFunction::FunctionPrototypeApply,
         ) {
             if !self.is_callable_runtime(&callee) {
-                return Err(VmError::NotCallable);
+                return Err(CommittedValueError::JavaScript(VmError::NotCallable));
             }
             let existing = stack[top_idx].arguments_object().map(Value::object);
             let forwarded = if let Some(arguments) = existing {
@@ -1559,27 +974,43 @@ impl Interpreter {
                 let count = view.incoming_argument_count();
                 let mut forwarded: SmallVec<[Value; 8]> = (0..count)
                     .map(|index| view.incoming_argument(index))
-                    .collect::<Result<_, _>>()?;
+                    .collect::<Result<_, _>>()
+                    .map_err(CommittedValueError::Fatal)?;
                 self.refresh_mapped_argument_values(
                     function,
                     &crate::ActiveFrameRef::from_frame(&stack[top_idx]),
                     &mut forwarded,
-                )?;
+                )
+                .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
                 forwarded
             };
-            let callee = *read_register(&stack[top_idx], callee_reg)?;
-            let this_value = *read_register(&stack[top_idx], this_reg)?;
-            stack[top_idx].advance_pc()?;
-            return self.invoke(stack, context, &callee, this_value, forwarded, dst);
+            let callee = *read_register(&stack[top_idx], callee_reg)
+                .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+            let this_value = *read_register(&stack[top_idx], this_reg)
+                .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+            stack[top_idx]
+                .advance_pc()
+                .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+            return self
+                .invoke(stack, context, &callee, this_value, forwarded, dst)
+                .map_err(|error| CommittedValueError::JavaScript(error.into()));
         }
-        let arguments_object = self.materialize_frame_arguments_object(context, stack, top_idx)?;
+        let arguments_object = self
+            .materialize_frame_arguments_object(context, stack, top_idx)
+            .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
         // Materialization can move a getter-produced method and both operands.
         // Their register slots retain the committed lookup without replaying it.
-        let method = *read_register(&stack[top_idx], method_reg)?;
-        let callee = *read_register(&stack[top_idx], callee_reg)?;
-        let this_value = *read_register(&stack[top_idx], this_reg)?;
-        stack[top_idx].advance_pc()?;
+        let method = *read_register(&stack[top_idx], method_reg)
+            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+        let callee = *read_register(&stack[top_idx], callee_reg)
+            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+        let this_value = *read_register(&stack[top_idx], this_reg)
+            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+        stack[top_idx]
+            .advance_pc()
+            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
         let args: SmallVec<[Value; 8]> = [this_value, arguments_object].into_iter().collect();
         self.invoke(stack, context, &method, callee, args, dst)
+            .map_err(|error| CommittedValueError::JavaScript(error.into()))
     }
 }

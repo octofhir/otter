@@ -1,5 +1,5 @@
 //! Out-of-line closure state: the own-property bag, the function's
-//! `prototype` slot, the constructor's learned instance size, and a
+//! `prototype` slot, constructor-owned layout families, and a
 //! `[[Prototype]]` override.
 //!
 //! # Contents
@@ -27,14 +27,13 @@
 //!   handle; a null handle is a guard miss.
 //!
 //! # See also
-//! - `constructor_profile` — sampling and pre-collection flushing.
+//! - `crate::constructor_layout` — seven terminal construction samples.
 //! - `closure` — the closure body and its rare handle.
 
 use crate::{JsObject, Value};
 use otter_gc::heap::RootSlotVisitor;
 use otter_gc::raw::SlotVisitor;
 use otter_gc::{GcHeap, OutOfMemory};
-use std::cell::Cell;
 
 /// Reserved [`otter_gc::Traceable::TYPE_TAG`] for [`ClosureRareBody`].
 pub const CLOSURE_RARE_BODY_TYPE_TAG: u8 = 0x30;
@@ -43,14 +42,14 @@ pub const CLOSURE_RARE_BODY_TYPE_TAG: u8 = 0x30;
 pub type ClosureRareHandle = otter_gc::Gc<ClosureRareBody>;
 
 /// Out-of-line closure state. `#[repr(C)]`: generated construct and
-/// `instanceof` code reads the bag, the `prototype` slot and the learned size
+/// `instanceof` code reads the bag and the `prototype` slot; construct code reads the layout head
 /// at fixed offsets.
 #[repr(C)]
 #[derive(Debug)]
 pub struct ClosureRareBody {
     pub(crate) own_props: JsObject,
     pub(crate) prototype_writable: bool,
-    pub(crate) learned_instance_fields: Cell<u16>,
+    pub(crate) constructor_layouts: crate::constructor_layout::ConstructorLayout,
     pub(crate) prototype: Value,
     pub(crate) proto_override: Value,
 }
@@ -59,16 +58,16 @@ pub struct ClosureRareBody {
 pub const CLOSURE_RARE_OWN_PROPS_OFFSET: usize = std::mem::offset_of!(ClosureRareBody, own_props);
 /// Byte offset of the `prototype` slot (hole until allocated) in the payload.
 pub const CLOSURE_RARE_PROTOTYPE_OFFSET: usize = std::mem::offset_of!(ClosureRareBody, prototype);
-/// Byte offset of the learned instance size in the payload.
-pub const CLOSURE_RARE_LEARNED_INSTANCE_FIELDS_OFFSET: usize =
-    std::mem::offset_of!(ClosureRareBody, learned_instance_fields);
+/// Byte offset of the traced constructor family head.
+pub(crate) const CLOSURE_RARE_CONSTRUCTOR_LAYOUTS_OFFSET: usize =
+    std::mem::offset_of!(ClosureRareBody, constructor_layouts);
 
 impl Default for ClosureRareBody {
     fn default() -> Self {
         Self {
             own_props: JsObject::null(),
             prototype_writable: true,
-            learned_instance_fields: Cell::new(0),
+            constructor_layouts: crate::constructor_layout::ConstructorLayout::null(),
             prototype: Value::hole(),
             proto_override: Value::undefined(),
         }
@@ -81,6 +80,7 @@ impl otter_gc::SafeTraceable for ClosureRareBody {
     fn trace_slots_safe(&mut self, visitor: &mut SlotVisitor<'_>) {
         use crate::pelt::PeltField as _;
         self.own_props.pelt_trace(visitor);
+        self.constructor_layouts.pelt_trace(visitor);
         self.prototype.pelt_trace(visitor);
         self.proto_override.pelt_trace(visitor);
     }

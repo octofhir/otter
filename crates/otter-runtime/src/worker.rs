@@ -18,9 +18,11 @@
 //! # Invariants
 //!
 //! - Every worker owns a separate admitted runtime; no ordinary VM value,
-//!   moving GC handle, or [`ExecutionContext`] crosses a `Send` boundary.
+//!   moving GC handle, or [`otter_vm::ExecutionContext`] crosses a `Send` boundary.
 //!   Parent- and child-side dispatch state lives inside the owning isolate
-//!   and is reacquired from `&mut Runtime` or persistent roots.
+//!   and is reacquired from `&mut Runtime` or persistent roots. Neither parent
+//!   bindings nor child readiness retain an entry context: bytecode handlers
+//!   resolve their admitted function/source owner at the canonical boundary.
 //! - Delivery is wake-driven: parent and child exchange typed tasks through
 //!   their bounded inboxes. There is no polling channel and no poll timer.
 //! - Every message passes validate/measure → admission → fallible clone →
@@ -51,8 +53,8 @@ use otter_vm::binary::array_buffer::SharedBody;
 use otter_vm::binary::{JsArrayBuffer, TypedArrayKind};
 use otter_vm::host_completion::{HostCompletionAdmission, HostCompletionOutcome};
 use otter_vm::{
-    ExecutionContext, Local, NativeCall, NativeCtx, NativeError, NativeFn, NativeScope,
-    PersistentRootId, Value, array, collections, object,
+    Local, NativeCall, NativeCtx, NativeError, NativeFn, NativeScope, PersistentRootId, Value,
+    array, collections, object,
 };
 use smallvec::smallvec;
 
@@ -185,15 +187,13 @@ impl WorkerFamily {
     }
 }
 
-/// Parent-isolate dispatch state for one worker: the rooted worker object,
-/// the rooted hidden listener store, and the execution context that
-/// constructed the worker. Persistent root ids are only dereferenced on the
-/// parent isolate thread.
+/// Parent-isolate dispatch state for one worker: the rooted worker object
+/// and hidden listener store. Persistent root ids are only dereferenced on the
+/// parent isolate thread; callbacks resolve their own admitted source owner.
 #[derive(Clone)]
 struct WorkerParentBinding {
     worker_root: PersistentRootId,
     listeners_root: PersistentRootId,
-    context: ExecutionContext,
 }
 
 struct WorkerRecord {
@@ -365,15 +365,9 @@ fn worker_constructor_call(
         let specifier = value_to_string(ctx, args.first().unwrap_or(&Value::undefined()))?;
         // Validate the narrowing request before any spawn effect.
         let requested_capabilities = parse_worker_capability_request(ctx, args.get(1))?;
-        let parent_context = ctx.execution_context().cloned().ok_or_else(|| {
-            type_err(
-                "Worker",
-                "Worker construction requires an execution context".to_string(),
-            )
-        })?;
         let record =
             spawn_managed_worker(&host, &parent_spawner, specifier, requested_capabilities)?;
-        let result = build_worker_object(ctx, &host, &record, parent_context);
+        let result = build_worker_object(ctx, &host, &record);
         if result.is_err()
             && let Some(record) = host.remove(record.id.get())
         {
@@ -583,7 +577,6 @@ fn build_worker_object(
     ctx: &mut NativeCtx<'_>,
     host: &Arc<WorkerHostState>,
     record: &Arc<WorkerRecord>,
-    parent_context: ExecutionContext,
 ) -> Result<Value, NativeError> {
     let id = record.id.get();
     let post_host = host.clone();
@@ -690,7 +683,6 @@ fn build_worker_object(
                 .replace(WorkerParentBinding {
                     worker_root,
                     listeners_root,
-                    context: parent_context,
                 });
             Ok(worker_value)
         }
@@ -807,29 +799,31 @@ fn dispatch_worker_event_on_parent(
 ) -> Result<(), OtterError> {
     let worker_root = binding.worker_root;
     let listeners_root = binding.listeners_root;
-    runtime.run_native_event(&binding.context, move |ctx| {
-        // Materialize first; the root re-reads below stay fresh because no
-        // allocation happens between them and the dispatch call.
-        let event_value = worker_event_to_value(ctx, event)?;
-        let Some(event_obj) = event_value.as_object() else {
-            return Ok(Value::undefined());
-        };
-        let Some(worker) = ctx
-            .persistent_root_get(worker_root)
-            .and_then(|value| value.as_object())
-        else {
-            return Ok(Value::undefined());
-        };
-        let listeners = ctx
-            .persistent_root_get(listeners_root)
-            .and_then(|value| value.as_object());
-        dispatch_event_object(ctx, worker, listeners, event_obj)?;
-        Ok(Value::undefined())
+    runtime.with_direct_timeout(move |runtime| {
+        runtime.run_native_event_unbounded(None, move |ctx| {
+            // Materialize first; the root re-reads below stay fresh because no
+            // allocation happens between them and the dispatch call.
+            let event_value = worker_event_to_value(ctx, event)?;
+            let Some(event_obj) = event_value.as_object() else {
+                return Ok(Value::undefined());
+            };
+            let Some(worker) = ctx
+                .persistent_root_get(worker_root)
+                .and_then(|value| value.as_object())
+            else {
+                return Ok(Value::undefined());
+            };
+            let listeners = ctx
+                .persistent_root_get(listeners_root)
+                .and_then(|value| value.as_object());
+            dispatch_event_object(ctx, worker, listeners, event_obj)?;
+            Ok(Value::undefined())
+        })
     })
 }
 
 /// First task on a fresh worker isolate: installs the worker globals, runs
-/// the entry, and retains the entry context for later message dispatch. The
+/// the entry, and publishes readiness for later message dispatch. The
 /// bounded child inbox is FIFO, so a `postMessage` issued right after the
 /// constructor is dispatched only after the entry completed.
 struct WorkerEntryTask {
@@ -845,8 +839,8 @@ impl RuntimeTask for WorkerEntryTask {
             return Ok(());
         }
         match run_worker_entry(runtime, &specifier) {
-            Ok((_result, context)) => {
-                runtime.worker_child_context = Some(context);
+            Ok(_result) => {
+                runtime.worker_child_ready = true;
             }
             Err(err) => {
                 post_worker_terminal(&shared, Some(err.to_string()));
@@ -879,12 +873,12 @@ impl RuntimeTask for WorkerChildMessageTask {
         if shared.closed.load(Ordering::SeqCst) {
             return Ok(());
         }
-        let Some(context) = runtime.worker_child_context.clone() else {
+        if !runtime.worker_child_ready {
             return Ok(());
-        };
-        if let Err(err) = runtime.dispatch_worker_message_event(&context, |ctx| {
-            materialize_worker_payload(ctx, &payload)
-        }) {
+        }
+        if let Err(err) =
+            runtime.dispatch_worker_message_event(|ctx| materialize_worker_payload(ctx, &payload))
+        {
             let event = match err {
                 crate::MessageEventDispatchError::Materialize(err) => {
                     WorkerEvent::MessageError(err.to_string())
@@ -1187,22 +1181,21 @@ fn worker_event_listeners(ctx: &NativeCtx<'_>, store: object::JsObject, ty: &str
         .collect()
 }
 
-fn run_worker_entry(
-    runtime: &mut Runtime,
-    specifier: &str,
-) -> Result<(ExecutionResult, ExecutionContext), OtterError> {
+fn run_worker_entry(runtime: &mut Runtime, specifier: &str) -> Result<ExecutionResult, OtterError> {
     // A `file:` URL names the same file its path form names. Path-shaped
     // specifiers run as files; everything else resolves as a module. The
     // choice is syntactic: probing the filesystem before the capability
     // boundary would leak existence information and race the actual open.
     if let Some(path) = file_url_path(specifier) {
-        return runtime.run_file_with_context(path);
+        return runtime.run_file_inner(path);
     }
     let path = Path::new(specifier);
     if path.is_absolute() || specifier.starts_with("./") || specifier.starts_with("../") {
-        runtime.run_file_with_context(PathBuf::from(specifier))
+        runtime.run_file_inner(PathBuf::from(specifier))
     } else {
-        runtime.run_module_with_context(PathBuf::from(specifier))
+        runtime
+            .run_module_with_context(PathBuf::from(specifier))
+            .map(|(result, _)| result)
     }
 }
 
@@ -1266,9 +1259,9 @@ fn install_worker_scope_natives(
         Ok(Value::undefined())
     });
     runtime.install_native_global_call("close", 0, NativeCall::Dynamic(close))?;
-    runtime.set_global("self", runtime.global_this_value());
-    runtime.set_global("onmessage", Value::null());
-    runtime.set_global("onerror", Value::null());
+    runtime.set_global("self", runtime.global_this_value())?;
+    runtime.set_global("onmessage", Value::null())?;
+    runtime.set_global("onerror", Value::null())?;
     Ok(())
 }
 

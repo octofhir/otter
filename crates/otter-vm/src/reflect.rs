@@ -28,6 +28,8 @@
 //! - Type-of-Object checks accept any heap-bound value
 //!   ([`is_type_object`]) so Reflect mirrors the spec's `Object`
 //!   type, not just plain objects.
+//! - VM failures cross the sole native error projection, preserving structural,
+//!   control, typed allocation and existing user-throw outcomes.
 //! - Property-key coercion (§7.1.19 ToPropertyKey) stringifies primitive
 //!   keys directly, passes symbols through, and drives the observable
 //!   `[[ToPrimitive]]` ladder for object keys.
@@ -35,6 +37,7 @@
 //! # See also
 //! - <https://tc39.es/ecma262/#sec-reflect-object>
 
+use crate::native_abi::CommittedValueError;
 use smallvec::SmallVec;
 
 use crate::ExecutionContext;
@@ -56,7 +59,7 @@ pub fn call(
     context: &ExecutionContext,
     method: otter_bytecode::method_id::ReflectMethod,
     args: &[Value],
-) -> Result<Value, VmError> {
+) -> Result<Value, CommittedValueError> {
     use otter_bytecode::method_id::ReflectMethod as M;
     match method {
         // §28.1.2 Reflect.apply(target, thisArgument, argumentsList)
@@ -64,25 +67,29 @@ pub fn call(
         M::Apply => {
             let target = args.first().cloned().unwrap_or(Value::undefined());
             if !is_callable(&target, interp.gc_heap()) {
-                return Err(VmError::NotCallable);
+                return Err(CommittedValueError::JavaScript(VmError::NotCallable));
             }
             let this_value = args.get(1).cloned().unwrap_or(Value::undefined());
             let argv = create_list_from_array_like(interp, stack, context, args.get(2))?;
-            interp.run_callable_sync_rooted(stack, context, &target, this_value, argv)
+            interp
+                .run_callable_sync_rooted(stack, Some(context), &target, this_value, argv)
+                .map_err(CommittedValueError::completed_call)
         }
         // §28.1.3 Reflect.construct(target, argumentsList[, newTarget])
         // <https://tc39.es/ecma262/#sec-reflect.construct>
         M::Construct => {
             let target = args.first().cloned().unwrap_or(Value::undefined());
             if !is_constructor(&target, context, interp.gc_heap()) {
-                return Err(VmError::NotCallable);
+                return Err(CommittedValueError::JavaScript(VmError::NotCallable));
             }
             let new_target = args.get(2).cloned().unwrap_or(target);
             if !is_constructor(&new_target, context, interp.gc_heap()) {
-                return Err(VmError::NotCallable);
+                return Err(CommittedValueError::JavaScript(VmError::NotCallable));
             }
             let argv = create_list_from_array_like(interp, stack, context, args.get(1))?;
-            interp.run_construct_sync_rooted(stack, context, &target, new_target, argv)
+            interp
+                .run_construct_sync_rooted(stack, context, &target, new_target, argv, 0)
+                .map_err(CommittedValueError::completed_call)
         }
         // §28.1.4 Reflect.defineProperty(target, propertyKey, attributes)
         // <https://tc39.es/ecma262/#sec-reflect.defineproperty>
@@ -91,11 +98,14 @@ pub fn call(
             // order), but the key coercion can run user code and move
             // the heap — re-read the target from the rooted argument
             // slot afterwards so the local copy is never stale.
-            expect_object_value(args.first())?;
+            expect_object_value(args.first())
+                .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
             let key = coerce_property_key(interp, stack, context, args.get(1))?;
-            let target = expect_object_value(args.first())?;
+            let target = expect_object_value(args.first())
+                .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
             let attributes = args.get(2).cloned().unwrap_or(Value::undefined());
-            let descriptor = interp.evaluate_to_property_descriptor(stack, context, &attributes)?;
+            let descriptor =
+                interp.evaluate_to_property_descriptor(stack, Some(context), &attributes)?;
             let ok = interp.define_own_property_value(stack, context, &target, &key, descriptor)?;
             Ok(Value::boolean(ok))
         }
@@ -106,9 +116,11 @@ pub fn call(
             // order), but the key coercion can run user code and move
             // the heap — re-read the target from the rooted argument
             // slot afterwards so the local copy is never stale.
-            expect_object_value(args.first())?;
+            expect_object_value(args.first())
+                .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
             let key = coerce_property_key(interp, stack, context, args.get(1))?;
-            let target = expect_object_value(args.first())?;
+            let target = expect_object_value(args.first())
+                .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
             let removed = interp.ordinary_delete_value(stack, context, target, &key, 0)?;
             Ok(Value::boolean(removed))
         }
@@ -119,15 +131,19 @@ pub fn call(
             // order), but the key coercion can run user code and move
             // the heap — re-read the target from the rooted argument
             // slot afterwards so the local copy is never stale.
-            expect_object_value(args.first())?;
+            expect_object_value(args.first())
+                .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
             let key = coerce_property_key(interp, stack, context, args.get(1))?;
-            let target = expect_object_value(args.first())?;
+            let target = expect_object_value(args.first())
+                .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
             let receiver = args.get(2).cloned().unwrap_or(target);
-            match interp.ordinary_get_value(stack, context, target, receiver, &key, 0)? {
+            match interp.ordinary_get_value(stack, Some(context), target, receiver, &key, 0)? {
                 VmGetOutcome::Value(v) => Ok(v),
                 VmGetOutcome::InvokeGetter { getter } => {
                     let argv: SmallVec<[Value; 8]> = SmallVec::new();
-                    interp.run_callable_sync_rooted(stack, context, &getter, receiver, argv)
+                    interp
+                        .run_callable_sync_rooted(stack, Some(context), &getter, receiver, argv)
+                        .map_err(CommittedValueError::completed_call)
                 }
             }
         }
@@ -138,15 +154,23 @@ pub fn call(
             // order), but the key coercion can run user code and move
             // the heap — re-read the target from the rooted argument
             // slot afterwards so the local copy is never stale.
-            expect_object_value(args.first())?;
+            expect_object_value(args.first())
+                .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
             let key = coerce_property_key(interp, stack, context, args.get(1))?;
-            let target = expect_object_value(args.first())?;
-            match interp
-                .ordinary_get_own_property_descriptor_value(stack, context, target, &key, 0)?
-            {
+            let target = expect_object_value(args.first())
+                .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+            match interp.ordinary_get_own_property_descriptor_value(
+                stack,
+                Some(context),
+                target,
+                &key,
+                0,
+            )? {
                 None => Ok(Value::undefined()),
                 Some(desc) => interp.with_handle_scope(|interp, scope| {
-                    let result = interp.scoped_descriptor_object(scope, &desc)?;
+                    let result = interp
+                        .scoped_descriptor_object(scope, &desc)
+                        .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
                     Ok(interp.escape_scoped(result))
                 }),
             }
@@ -154,7 +178,8 @@ pub fn call(
         // §28.1.8 Reflect.getPrototypeOf(target)
         // <https://tc39.es/ecma262/#sec-reflect.getprototypeof>
         M::GetPrototypeOf => {
-            let target = expect_object_value(args.first())?;
+            let target = expect_object_value(args.first())
+                .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
             interp.ordinary_get_prototype_value(stack, context, target, 0)
         }
         // §28.1.9 Reflect.has(target, propertyKey)
@@ -164,37 +189,45 @@ pub fn call(
             // order), but the key coercion can run user code and move
             // the heap — re-read the target from the rooted argument
             // slot afterwards so the local copy is never stale.
-            expect_object_value(args.first())?;
+            expect_object_value(args.first())
+                .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
             let key = coerce_property_key(interp, stack, context, args.get(1))?;
-            let target = expect_object_value(args.first())?;
-            let present = interp.ordinary_has_property_value(stack, context, target, &key, 0)?;
+            let target = expect_object_value(args.first())
+                .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+            let present =
+                interp.ordinary_has_property_value(stack, Some(context), target, &key, 0)?;
             Ok(Value::boolean(present))
         }
         // §28.1.10 Reflect.isExtensible(target)
         // <https://tc39.es/ecma262/#sec-reflect.isextensible>
         M::IsExtensible => {
-            let target = expect_object_value(args.first())?;
-            let ext = interp.is_extensible_value(stack, context, &target)?;
+            let target = expect_object_value(args.first())
+                .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+            let ext = interp.is_extensible_value(stack, Some(context), &target)?;
             Ok(Value::boolean(ext))
         }
         // §28.1.11 Reflect.ownKeys(target)
         // <https://tc39.es/ecma262/#sec-reflect.ownkeys>
         M::OwnKeys => {
-            let target = expect_object_value(args.first())?;
+            let target = expect_object_value(args.first())
+                .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
             let keys = interp.own_property_keys_value(stack, context, &target)?;
             Ok(Value::array(
-                interp.alloc_stack_rooted_array_from_values_with_root_slices(
-                    stack,
-                    keys,
-                    &[&target],
-                    &[args],
-                )?,
+                interp
+                    .alloc_stack_rooted_array_from_values_with_root_slices(
+                        stack,
+                        keys,
+                        &[&target],
+                        &[args],
+                    )
+                    .map_err(|error| CommittedValueError::JavaScript(error.into()))?,
             ))
         }
         // §28.1.12 Reflect.preventExtensions(target)
         // <https://tc39.es/ecma262/#sec-reflect.preventextensions>
         M::PreventExtensions => {
-            let target = expect_object_value(args.first())?;
+            let target = expect_object_value(args.first())
+                .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
             let ok = interp.prevent_extensions_value(stack, context, &target)?;
             Ok(Value::boolean(ok))
         }
@@ -205,9 +238,11 @@ pub fn call(
             // order), but the key coercion can run user code and move
             // the heap — re-read the target from the rooted argument
             // slot afterwards so the local copy is never stale.
-            expect_object_value(args.first())?;
+            expect_object_value(args.first())
+                .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
             let key = coerce_property_key(interp, stack, context, args.get(1))?;
-            let target = expect_object_value(args.first())?;
+            let target = expect_object_value(args.first())
+                .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
             let value = args.get(2).cloned().unwrap_or(Value::undefined());
             let receiver = args.get(3).cloned().unwrap_or(target);
             // §10.1.9 OrdinarySet with receiver semantics for ordinary
@@ -235,7 +270,9 @@ pub fn call(
                             return Ok(Value::boolean(false));
                         }
                         let argv: SmallVec<[Value; 8]> = smallvec::smallvec![value];
-                        interp.run_callable_sync_rooted(stack, context, &setter, receiver, argv)?;
+                        interp
+                            .run_callable_sync_rooted(stack, Some(context), &setter, receiver, argv)
+                            .map_err(CommittedValueError::completed_call)?;
                         return Ok(Value::boolean(true));
                     }
                     crate::object::SetOutcome::Reject { .. } => {
@@ -258,12 +295,17 @@ pub fn call(
                         // receiver.
                         let target_has_own = interp
                             .ordinary_get_own_property_descriptor_value(
-                                stack, context, target, &key, 0,
+                                stack,
+                                Some(context),
+                                target,
+                                &key,
+                                0,
                             )?
                             .is_some();
                         if !target_has_own
-                            && let Some(proxy_proto) =
-                                interp.first_proxy_in_prototype_chain(target)?
+                            && let Some(proxy_proto) = interp
+                                .first_proxy_in_prototype_chain(target)
+                                .map_err(|error| CommittedValueError::JavaScript(error.into()))?
                         {
                             let ok = interp.ordinary_set_data_value(
                                 stack,
@@ -292,13 +334,14 @@ pub fn call(
         // §28.1.14 Reflect.setPrototypeOf(target, prototype)
         // <https://tc39.es/ecma262/#sec-reflect.setprototypeof>
         M::SetPrototypeOf => {
-            let target = expect_object_value(args.first())?;
+            let target = expect_object_value(args.first())
+                .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
             // §28.1.14 step 2 — a missing `proto` is `undefined`, which is
             // neither an Object nor null, so it is a TypeError just like an
             // explicit non-object/non-null argument.
             let proto = match args.get(1).copied().unwrap_or(Value::undefined()) {
                 v if is_type_object(&v) || v.is_null() => v,
-                _ => return Err(VmError::TypeMismatch),
+                _ => return Err(CommittedValueError::JavaScript(VmError::TypeMismatch)),
             };
             let ok = interp.set_prototype_value_proxy_aware(stack, context, &target, &proto)?;
             Ok(Value::boolean(ok))
@@ -324,7 +367,7 @@ fn set_data_on_receiver(
     key: &VmPropertyKey,
     value: Value,
     receiver: &Value,
-) -> Result<bool, VmError> {
+) -> Result<bool, CommittedValueError> {
     let _ = _target;
     interp.ordinary_set_on_receiver(stack, context, key, value, receiver)
 }
@@ -366,7 +409,7 @@ fn coerce_property_key(
     stack: &mut ActivationStack,
     context: &ExecutionContext,
     arg: Option<&Value>,
-) -> Result<VmPropertyKey<'static>, VmError> {
+) -> Result<VmPropertyKey<'static>, CommittedValueError> {
     let Some(v) = arg else {
         return Ok(VmPropertyKey::String("undefined"));
     };
@@ -403,7 +446,7 @@ fn create_list_from_array_like(
     stack: &mut ActivationStack,
     context: &ExecutionContext,
     arg: Option<&Value>,
-) -> Result<SmallVec<[Value; 8]>, VmError> {
+) -> Result<SmallVec<[Value; 8]>, CommittedValueError> {
     if let Some(arr) = arg.and_then(|v| v.as_array()) {
         // §7.3.18 step 4–5 — substitute holes with `undefined`.
         return Ok(crate::array::with_elements(
@@ -422,7 +465,9 @@ fn create_list_from_array_like(
     {
         return interp.create_list_from_array_like(stack, context, *v);
     }
-    Err(interp.err_type(("argumentsList must be an object".to_string()).into()))
+    Err(CommittedValueError::JavaScript(interp.err_type(
+        ("argumentsList must be an object".to_string()).into(),
+    )))
 }
 
 // Static namespace spec installed by bootstrap. Every method is
@@ -553,79 +598,11 @@ fn invoke(
     let context = ctx
         .execution_context()
         .cloned()
-        .ok_or_else(|| NativeError::TypeError {
-            name: "Reflect",
-            reason: "no active execution context".to_string(),
-        })?;
+        .ok_or(NativeError::InvalidOperand)?;
     let result = ctx.with_turn_parts(|interp, stack| call(interp, stack, &context, method, args));
     match result {
         Ok(v) => Ok(v),
-        Err(e) => Err(vm_to_native(ctx.interp_mut(), e)),
-    }
-}
-
-fn vm_to_native(interp: &mut Interpreter, err: VmError) -> NativeError {
-    match err {
-        VmError::TypeMismatch => NativeError::TypeError {
-            name: "Reflect",
-            reason: "type mismatch".to_string(),
-        },
-        VmError::TypeError => {
-            let message = match interp.take_error_detail() {
-                Some(crate::run_control::ErrorDetail::Message(m)) => m,
-                _ => Default::default(),
-            };
-            NativeError::TypeError {
-                name: "Reflect",
-                reason: message.into(),
-            }
-        }
-        VmError::SyntaxError => {
-            let message = match interp.take_error_detail() {
-                Some(crate::run_control::ErrorDetail::Message(m)) => m,
-                _ => Default::default(),
-            };
-            NativeError::SyntaxError {
-                name: "Reflect",
-                reason: message.into(),
-            }
-        }
-        VmError::RangeError => {
-            let message = match interp.take_error_detail() {
-                Some(crate::run_control::ErrorDetail::Message(m)) => m,
-                _ => Default::default(),
-            };
-            NativeError::RangeError {
-                name: "Reflect",
-                reason: message.into(),
-            }
-        }
-        VmError::NotCallable => NativeError::TypeError {
-            name: "Reflect",
-            reason: "value is not a function".to_string(),
-        },
-        VmError::Uncaught => {
-            let value = match interp.take_error_detail() {
-                Some(crate::run_control::ErrorDetail::Uncaught(m)) => m,
-                _ => Default::default(),
-            };
-            NativeError::Thrown {
-                name: "Reflect",
-                message: value.into(),
-            }
-        }
-        VmError::OutOfMemory { .. } => NativeError::TypeError {
-            name: "Reflect",
-            reason: "out of memory".to_string(),
-        },
-        VmError::Exit { code } => NativeError::Exit { code },
-        // Interruption keeps its class: wrapping it as a JS TypeError would
-        // surface shutdown teardown as a user-visible throw.
-        VmError::Interrupted => NativeError::Interrupted,
-        other => NativeError::TypeError {
-            name: "Reflect",
-            reason: other.to_string(),
-        },
+        Err(e) => Err(e.into_native(ctx.interp_mut(), "Reflect")),
     }
 }
 
@@ -654,68 +631,79 @@ mod tests {
     };
 
     fn empty_context() -> ExecutionContext {
-        ExecutionContext::from_module(BytecodeModule {
-            module: "reflect-test.ts".to_string(),
-            template_sites: Vec::new(),
-            source_kind: BcSourceKind::TypeScript,
-            functions: vec![Function {
-                id: 0,
-                name: "<main>".to_string(),
-                span: (0, 0),
-                locals: 0,
-                scratch: 0,
-                param_count: 0,
-                length: 0,
-                scopes: Vec::new(),
-                is_strict: false,
-                is_arrow: false,
-                is_method: false,
-                has_rest: false,
-                is_async: false,
-                is_generator: false,
-                is_async_generator: false,
-                is_derived_constructor: false,
-                is_module: false,
-                needs_arguments: false,
-                uses_arguments_callee: false,
-                arguments_object_kind: crate::ArgumentsObjectKind::Unmapped,
-                mapped_argument_bindings: Vec::new(),
-                source_text_range: None,
-                source_text_span: None,
-                module_url: String::new(),
-                contains_direct_eval: false,
-                code: vec![Instruction {
-                    pc: 0,
-                    op: otter_bytecode::Op::ReturnUndefined,
-                    operands: vec![],
-                }]
-                .into(),
-                spans: vec![SpanEntry {
-                    pc: 0,
+        ExecutionContext::from_module(
+            BytecodeModule {
+                module: "reflect-test.ts".to_string(),
+                template_sites: Vec::new(),
+                source_kind: BcSourceKind::TypeScript,
+                functions: vec![Function {
+                    id: 0,
+                    name: "<main>".to_string(),
                     span: (0, 0),
+                    locals: 0,
+                    scratch: 0,
+                    param_count: 0,
+                    length: 0,
+                    scopes: Vec::new(),
+                    is_strict: false,
+                    is_arrow: false,
+                    is_method: false,
+                    has_rest: false,
+                    is_async: false,
+                    is_generator: false,
+                    is_async_generator: false,
+                    is_derived_constructor: false,
+                    is_module: false,
+                    needs_arguments: false,
+                    uses_arguments_callee: false,
+                    arguments_object_kind: crate::ArgumentsObjectKind::Unmapped,
+                    mapped_argument_bindings: Vec::new(),
+                    source_text_range: None,
+                    source_text_span: None,
+                    module_url: String::new(),
+                    contains_direct_eval: false,
+                    code: vec![Instruction {
+                        pc: 0,
+                        op: otter_bytecode::Op::ReturnUndefined,
+                        operands: vec![],
+                    }]
+                    .into(),
+                    spans: vec![SpanEntry {
+                        pc: 0,
+                        span: (0, 0),
+                    }],
+                    handlers: Vec::new(),
+                    number_hint_sites: Vec::new(),
+                    class_hint_sites: Vec::new(),
                 }],
-                handlers: Vec::new(),
-                number_hint_sites: Vec::new(),
-                class_hint_sites: Vec::new(),
-            }],
-            constants: Vec::new(),
-            module_resolutions: Vec::new(),
-            module_inits: Vec::new(),
-            function_source: None,
-        })
+                constants: Vec::new(),
+                module_resolutions: Vec::new(),
+                module_inits: Vec::new(),
+                function_source: None,
+            },
+            crate::source_registry::SourceRegistry::default(),
+        )
         .expect("valid bytecode fixture")
     }
 
     #[test]
     fn get_own_property_descriptor_uses_runtime_rooted_object_allocation() {
-        let mut interp = Interpreter::new();
+        let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
         let mut target =
             crate::object::alloc_object_old_for_fixture(interp.gc_heap_mut()).expect("target");
-        crate::object::set(
-            &mut target,
-            interp.gc_heap_mut(),
-            "answer",
-            Value::number(crate::NumberValue::from_i32(42)),
+        assert!(
+            crate::object::define_own_property_in_place(
+                &mut target,
+                interp.gc_heap_mut(),
+                "answer",
+                crate::object::PropertyDescriptor::data(
+                    Value::number(crate::NumberValue::from_i32(42)),
+                    true,
+                    true,
+                    true
+                )
+            )
+            .expect("fixture property allocation")
         );
         let context = empty_context();
         let key =
@@ -742,10 +730,18 @@ mod tests {
 
     #[test]
     fn own_keys_uses_runtime_rooted_array_allocation() {
-        let mut interp = Interpreter::new();
+        let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
         let mut target =
             crate::object::alloc_object_old_for_fixture(interp.gc_heap_mut()).expect("target");
-        crate::object::set(&mut target, interp.gc_heap_mut(), "a", Value::boolean(true));
+        assert!(
+            crate::object::define_own_property_in_place(
+                &mut target,
+                interp.gc_heap_mut(),
+                "a",
+                crate::object::PropertyDescriptor::data(Value::boolean(true), true, true, true)
+            )
+            .expect("fixture property allocation")
+        );
         let context = empty_context();
         let before = interp.gc_heap().stats().new_allocated_bytes;
         let mut stack = ActivationStack::new();

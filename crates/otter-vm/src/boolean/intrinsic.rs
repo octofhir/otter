@@ -37,7 +37,7 @@ fn pin_boolean_data(
 ) -> Result<(), JsSurfaceError> {
     let descriptor = ctor
         .own_property_descriptor(heap, "prototype")
-        .map_err(|_| JsSurfaceError::OutOfMemory)?;
+        .map_err(JsSurfaceError::from)?;
     let mut prototype = match descriptor.and_then(|d| match d.kind {
         crate::object::DescriptorKind::Data { value } => value.as_object(),
         _ => None,
@@ -45,7 +45,7 @@ fn pin_boolean_data(
         Some(p) => p,
         None => return Ok(()),
     };
-    object::set_boolean_data(&mut prototype, heap, false);
+    object::set_boolean_data(&mut prototype, heap, false)?;
     Ok(())
 }
 
@@ -55,7 +55,7 @@ fn boolean_ctor_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, N
     if ctx.is_construct_call() {
         let this = *ctx.this_value();
         if let Some(mut obj) = this.as_object() {
-            crate::object::set_boolean_data(&mut obj, ctx.heap_mut(), value);
+            crate::object::set_boolean_data(&mut obj, ctx.heap_mut(), value)?;
             Ok(Value::object(obj))
         } else {
             Err(NativeError::TypeError {

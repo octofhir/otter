@@ -14,6 +14,7 @@
 //! - [`runtime_stubs`] — classified descriptor inventory and call packets.
 //! - [`safepoints`] — frame/spill maps and safepoint entries.
 //! - [`metadata`] — code-object metadata and dependencies.
+//! - [`source_work`] — canonical saturating source-opcode work storage.
 //!
 //! # Invariants
 //! - There is one native ABI. No tier owns a private frame, status, or
@@ -31,8 +32,10 @@ mod code_entry;
 mod dispatch;
 mod frame;
 mod metadata;
+mod return_pc;
 mod runtime_stubs;
 mod safepoints;
+mod source_work;
 
 pub use call_thread::*;
 pub use call_trampoline::*;
@@ -40,8 +43,10 @@ pub use code_entry::*;
 pub use dispatch::*;
 pub use frame::*;
 pub use metadata::*;
+pub(crate) use return_pc::*;
 pub use runtime_stubs::*;
 pub use safepoints::*;
+pub use source_work::*;
 
 // Reentrant runtime-call surface re-exported beside the stub descriptors, so
 // generated-code entry points import one ABI namespace.
@@ -66,3 +71,8 @@ pub const NO_FRAME_STATE: FrameStateId = u32::MAX;
 const _: [(); 4] = [(); std::mem::size_of::<FrameStateId>()];
 const _: [(); 4] = [(); std::mem::size_of::<SafepointId>()];
 const _: [(); 4] = [(); std::mem::size_of::<RuntimeStubId>()];
+
+/// Private engine terminal constructor entry; the existing compiled pair is
+/// retained by the emitted caller's aligned packet until this leaf returns.
+#[doc(hidden)]
+pub use crate::constructor_layout::{constructor_receiver_commit, constructor_terminal};

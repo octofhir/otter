@@ -21,7 +21,9 @@
 //! - Builders are lifetime-bound to a mutable heap borrow and carry
 //!   a raw-pointer marker so they remain `!Send + !Sync`.
 //! - Every object store goes through [`crate::object`] descriptor
-//!   APIs so write barriers fire.
+//!   APIs so write barriers fire; allocation failures remain typed.
+//! - Realm string tags root their receiver, symbol and string through the
+//!   same builder allocation and descriptor boundary.
 //! - Static builtins use [`crate::NativeCall::Static`] by default;
 //!   dynamic closures are opt-in for embedder state.
 //!
@@ -464,12 +466,64 @@ impl<'rt> ObjectBuilder<'rt> {
         unsafe {
             roots.add_value(&mut self.object.slot);
             roots.add_value_vec(&mut self.value_roots);
+            for &slot in &self.raw_roots {
+                roots.add_raw_slot(slot);
+            }
             roots.add_value(&mut value);
         }
         let mut object = self.object.get();
         define_data_in_place(&mut object, self.heap, name, value, attrs)?;
         self.object.store(object);
         Ok(self)
+    }
+
+    /// Install the realm's `@@toStringTag` with standard namespace attributes.
+    ///
+    /// The receiver, symbol and string remain rooted through allocation and
+    /// descriptor installation. Allocation failure is distinct from a rejected
+    /// property definition.
+    pub fn to_string_tag(
+        &mut self,
+        well_known: &crate::symbol::WellKnownSymbols,
+        tag: &str,
+    ) -> Result<&mut Self, JsSurfaceError> {
+        let mut symbol_root = Value::symbol(well_known.get(crate::symbol::WellKnown::ToStringTag));
+        let mut value_root = Value::undefined();
+        let mut roots = otter_gc::RootScope::new(self.heap);
+        // SAFETY: the builder fields, locals and audited runtime slots remain
+        // stationary for this whole allocating operation and its descriptor write.
+        unsafe {
+            roots.add_value(&mut self.object.slot);
+            roots.add_value_vec(&mut self.value_roots);
+            roots.add_value(&mut symbol_root);
+            roots.add_value(&mut value_root);
+            for &slot in &self.raw_roots {
+                roots.add_raw_slot(slot);
+            }
+        }
+        value_root = Value::string(crate::JsString::from_str(tag, self.heap)?);
+        let symbol = symbol_root
+            .as_symbol(self.heap)
+            .expect("rooted well-known symbol");
+        let mut object = self.object.get();
+        let accepted = object::define_own_symbol_property_partial(
+            &mut object,
+            self.heap,
+            symbol,
+            object::PartialPropertyDescriptor {
+                value: Some(value_root),
+                writable: Some(false),
+                enumerable: Some(false),
+                configurable: Some(true),
+                ..Default::default()
+            },
+        )?;
+        self.object.store(object);
+        if accepted {
+            Ok(self)
+        } else {
+            Err(JsSurfaceError::DefinePropertyFailed("@@toStringTag"))
+        }
     }
 
     /// Define a property from a static spec.
@@ -492,6 +546,9 @@ impl<'rt> ObjectBuilder<'rt> {
         unsafe {
             roots.add_value(&mut self.object.slot);
             roots.add_value_vec(&mut self.value_roots);
+            for &slot in &self.raw_roots {
+                roots.add_raw_slot(slot);
+            }
             roots.add_value(&mut native_root);
         }
         native_root = Value::native_function(self.alloc_native(name, length, call)?);
@@ -517,6 +574,9 @@ impl<'rt> ObjectBuilder<'rt> {
         unsafe {
             roots.add_value(&mut self.object.slot);
             roots.add_value_vec(&mut self.value_roots);
+            for &slot in &self.raw_roots {
+                roots.add_raw_slot(slot);
+            }
             roots.add_value(&mut getter_root);
             roots.add_value(&mut setter_root);
         }
@@ -537,7 +597,7 @@ impl<'rt> ObjectBuilder<'rt> {
             spec.attrs.configurable,
         );
         let mut object = self.object.get();
-        if object::define_own_property_in_place(&mut object, self.heap, spec.name, descriptor) {
+        if object::define_own_property_in_place(&mut object, self.heap, spec.name, descriptor)? {
             self.object.store(object);
             Ok(self)
         } else {
@@ -549,6 +609,21 @@ impl<'rt> ObjectBuilder<'rt> {
     #[must_use]
     pub fn build(self) -> JsObject {
         self.object.get()
+    }
+}
+
+impl crate::Interpreter {
+    /// Define a host object's realm `@@toStringTag` through the rooted builder.
+    pub fn define_to_string_tag(&mut self, value: Value, tag: &str) -> Result<(), JsSurfaceError> {
+        self.with_runtime_roots(|interp| {
+            let Some(object) = value.as_object() else {
+                return Ok(());
+            };
+            let mut builder = ObjectBuilder::from_object(&mut interp.gc_heap, object);
+            builder.to_string_tag(&interp.well_known_symbols, tag)?;
+            let _ = builder.build();
+            Ok(())
+        })
     }
 }
 
@@ -923,16 +998,16 @@ impl<'rt> NamespaceBuilder<'rt> {
 #[non_exhaustive]
 pub enum JsSurfaceError {
     /// GC allocation failed.
-    #[error("out of memory while installing JS surface")]
-    OutOfMemory,
+    #[error("out of memory while installing JS surface: {0}")]
+    OutOfMemory(#[source] otter_gc::OutOfMemory),
     /// OrdinaryDefineOwnProperty rejected a descriptor.
     #[error("failed to define JS property {0}")]
     DefinePropertyFailed(&'static str),
 }
 
 impl From<otter_gc::OutOfMemory> for JsSurfaceError {
-    fn from(_: otter_gc::OutOfMemory) -> Self {
-        Self::OutOfMemory
+    fn from(error: otter_gc::OutOfMemory) -> Self {
+        Self::OutOfMemory(error)
     }
 }
 
@@ -961,7 +1036,7 @@ fn define_data_in_place(
         kind: crate::object::DescriptorKind::Data { value },
         flags: attrs.to_flags(),
     };
-    if object::define_own_property_in_place(object, heap, name, descriptor) {
+    if object::define_own_property_in_place(object, heap, name, descriptor)? {
         Ok(())
     } else {
         Err(JsSurfaceError::DefinePropertyFailed(name))
@@ -1107,3 +1182,6 @@ mod tests {
         assert!(accessor.configurable());
     }
 }
+
+#[cfg(test)]
+mod tag_tests;

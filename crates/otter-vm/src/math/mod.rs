@@ -609,8 +609,6 @@ enum SumState {
 /// round-half-to-even, back to an `f64`. Non-finite values and signed
 /// zero are tracked by the state machine, never by the accumulator.
 fn native_sum_precise(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-    use crate::native_function::vm_to_native_error;
-
     let items = args.first().copied().unwrap_or_else(Value::undefined);
     let exec = ctx
         .execution_context()
@@ -623,8 +621,7 @@ fn native_sum_precise(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, 
         // step — GetIterator(items, sync). Rejects non-iterables (and the
         // `Math.sumPrecise()` / `{}` cases) with a TypeError.
         let iter_result = interp.get_iterator_sync(stack, &exec, &items);
-        let (iterator, next) =
-            iter_result.map_err(|e| vm_to_native_error(interp, e, "Math.sumPrecise"))?;
+        let (iterator, next) = iter_result.map_err(|e| e.into_native(interp, "Math.sumPrecise"))?;
 
         let mut state = SumState::MinusZero;
         let mut acc = num_bigint::BigInt::from(0);
@@ -637,7 +634,9 @@ fn native_sum_precise(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, 
                     count += 1;
                     // step — count is bounded by 2^53 - 1.
                     if count >= (1u64 << 53) {
-                        let _ = interp.iterator_close_sync(stack, &exec, &iterator);
+                        interp
+                            .iterator_close_discarding_completion(stack, Some(&exec), &iterator)
+                            .map_err(|error| error.into_native(interp, "Math.sumPrecise"))?;
                         return Err(NativeError::RangeError {
                             name: "Math.sumPrecise",
                             reason: "input exceeds 2^53 - 1 elements".to_string(),
@@ -647,7 +646,9 @@ fn native_sum_precise(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, 
                     // any state transition and without coercion. A non-Number
                     // closes the iterator, then throws.
                     let Some(n) = value.as_number() else {
-                        let _ = interp.iterator_close_sync(stack, &exec, &iterator);
+                        interp
+                            .iterator_close_discarding_completion(stack, Some(&exec), &iterator)
+                            .map_err(|error| error.into_native(interp, "Math.sumPrecise"))?;
                         return Err(NativeError::TypeError {
                             name: "Math.sumPrecise",
                             reason: "every element must be a Number".to_string(),
@@ -681,7 +682,7 @@ fn native_sum_precise(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, 
                 }
                 // IteratorStepValue threw: the record is already closed by
                 // the protocol; propagate without re-closing.
-                Err(e) => return Err(vm_to_native_error(interp, e, "Math.sumPrecise")),
+                Err(error) => return Err(error.into_native(interp, "Math.sumPrecise")),
             }
         }
 

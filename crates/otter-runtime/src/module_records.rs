@@ -22,6 +22,16 @@
 //! - The VM module-env registry is the sole owner/root of allocated
 //!   environments. Runtime records retain the owning [`ExecutionContext`] for
 //!   their initializer id, but never retain raw VM handles.
+//! - Native namespace preparation runs in the importing graph's context, which
+//!   enumerating a CommonJS-backed builtin's exports needs. Embedded CommonJS
+//!   wrappers enter through their actual admitted function id and source; the
+//!   final module record publishes its actual rebased initializer id and owning
+//!   context together, immediately after the environment is registered.
+//! - Allocation and installer failures stay in the existing native completion
+//!   domain until the entry owner maps or materializes them in this realm.
+//!   No installer error becomes a host-text diagnostic inside this allocator.
+//! - A CommonJS-backed namespace requires a discovered builtin: only discovery
+//!   absence becomes the named import TypeError; installation errors pass through.
 //! - Cycle support: a module that the loader has already started
 //!   instantiating is in [`RuntimeModuleRecordState::Instantiated`] (or
 //!   later) by the time a back-edge revisits it. The host treats the
@@ -34,11 +44,10 @@
 //! - <https://tc39.es/ecma262/#sec-cyclic-module-records>
 //! - <https://tc39.es/ecma262/#sec-InnerModuleEvaluation>
 
-use otter_bytecode::ModuleInit;
 use otter_vm::{ExecutionContext, Interpreter, NativeCallInfo, NativeCtx, NativeError};
 use std::collections::BTreeMap;
 
-use crate::{CapabilitySet, HostedModule, OtterError, RuntimeTaskSpawner};
+use crate::{CapabilitySet, HostedModule, RuntimeTaskSpawner};
 
 /// Lifecycle phases per ECMA-262 §16.2 Cyclic Module Records.
 ///
@@ -83,8 +92,8 @@ pub(crate) struct RuntimeModuleRecord {
     pub(crate) function_id: u32,
     /// Current lifecycle state.
     pub(crate) state: RuntimeModuleRecordState,
-    /// Owning linked chunk for `function_id` once the bytecode is admitted.
-    context: Option<ExecutionContext>,
+    /// Actual admitted chunk whose rebased function table owns `function_id`.
+    context: ExecutionContext,
 }
 
 /// Per-realm tables of allocated module records owned by one runtime.
@@ -109,47 +118,34 @@ impl RuntimeModuleRecords {
     /// observes the same environment and is not evaluated twice. Every new
     /// allocation, hosted installer, cache publication, and registry
     /// publication runs in one native handle scope; after registration the VM
-    /// registry is the environment's sole root.
+    /// registry is the environment's sole root. Native preparation runs in the
+    /// supplied graph context; each invoked embedded CommonJS wrapper resolves
+    /// its own admitted source/function owner through the canonical call path.
+    /// Failures remain typed native completions, including original thrown
+    /// identity and imported terminal detail, until the active-realm consumer
+    /// performs its canonical runtime or rejection projection. The supplied
+    /// context has already passed verified linking and function-id rebasing;
+    /// every successfully registered environment immediately retains that
+    /// owner, even if a later installer in this graph fails.
     pub(crate) fn allocate_for_module_inits(
         &mut self,
         interp: &mut Interpreter,
-        module_inits: &[ModuleInit],
+        context: &ExecutionContext,
         hosted_modules: &[HostedModule],
         capabilities: &CapabilitySet,
         runtime_task_spawner: Option<RuntimeTaskSpawner>,
-    ) -> Result<(), OtterError> {
+    ) -> Result<(), NativeError> {
         let realm_id = interp.active_host_realm_id();
-        // Synthesizing a namespace from a CommonJS builtin runs JavaScript (the
-        // module's own wrapper and `require` graph), which needs a linked
-        // context to dispatch into. Build one only when a module in this batch
-        // actually needs it.
-        let needs_javascript = module_inits.iter().any(|init| {
-            hosted_modules.iter().any(|hosted| {
-                hosted.specifier() == init.url && hosted.commonjs_value_install().is_some()
-            })
-        });
-        let host_context = if needs_javascript {
-            let empty = otter_compiler::compile_script_source(
-                "",
-                otter_syntax::SourceKind::JavaScript,
-                "<hosted-namespace-root>",
-            )
-            .map_err(|error| OtterError::HostedModule {
-                specifier: "<hosted-namespace-root>".to_string(),
-                message: format!("{error:?}"),
-            })?;
-            Some(interp.link_module(empty)?)
-        } else {
-            None
-        };
         let records = self.realms.entry(realm_id).or_default();
+        // The importing graph's context: a CommonJS-only builtin's namespace
+        // is synthesized by running its loader and enumerating its exports.
         NativeCtx::with_host_context(
             interp,
             NativeCallInfo::default_call(),
-            host_context.as_ref(),
+            Some(context),
             |ctx| {
                 ctx.scope(|mut scope| {
-                    for init in module_inits {
+                    for init in context.module_inits() {
                         if records.contains_key(&init.url) {
                             continue;
                         }
@@ -179,47 +175,25 @@ impl RuntimeModuleRecords {
                                             runtime_task_spawner.clone(),
                                         )?
                                     } else {
-                                        let install =
-                                            hosted.namespace_install().ok_or_else(|| {
-                                                OtterError::HostedModule {
-                                                    specifier: init.url.clone(),
-                                                    message: "module exposes neither a namespace \
-                                                          nor a CommonJS value"
-                                                        .to_string(),
-                                                }
-                                            })?;
+                                        let install = hosted
+                                            .namespace_install()
+                                            .ok_or(NativeError::InvalidOperand)?;
                                         let namespace = install(
                                             &mut scope,
                                             capabilities,
                                             runtime_task_spawner.clone(),
-                                        )
-                                        .map_err(|error| OtterError::HostedModule {
-                                            specifier: init.url.clone(),
-                                            message: error.to_string(),
-                                        })?;
-                                        scope.set(namespace, "default", namespace).map_err(
-                                            |error| OtterError::HostedModule {
-                                                specifier: init.url.clone(),
-                                                message: error.to_string(),
-                                            },
                                         )?;
+                                        scope.set(namespace, "default", namespace)?;
                                         namespace
                                     };
-                                    scope
-                                        .cache_host_module_env(init.url.as_str(), env)
-                                        .map_err(|error| OtterError::HostedModule {
-                                            specifier: init.url.clone(),
-                                            message: error.to_string(),
-                                        })?;
+                                    scope.cache_host_module_env(init.url.as_str(), env)?;
                                     env
                                 }
                             }
                         } else {
-                            scope.bare_object().map_err(module_allocation_error)?
+                            scope.bare_object()?
                         };
-                        scope
-                            .register_module_env(init.url.as_str(), env)
-                            .map_err(module_allocation_error)?;
+                        scope.register_module_env(init.url.as_str(), env)?;
                         // The graph load + linker pipeline has already done
                         // resolve + compile + linking by the time we get here.
                         records.insert(
@@ -227,7 +201,7 @@ impl RuntimeModuleRecords {
                             RuntimeModuleRecord {
                                 function_id: init.function_id,
                                 state: RuntimeModuleRecordState::Instantiated,
-                                context: None,
+                                context: context.clone(),
                             },
                         );
                     }
@@ -235,25 +209,6 @@ impl RuntimeModuleRecords {
                 })
             },
         )
-    }
-
-    /// Retain the linked chunk that owns newly allocated module records.
-    ///
-    /// Existing records from an earlier graph keep their original context:
-    /// their canonical URL may also occur in this graph with a different
-    /// linker-assigned function id.
-    pub(crate) fn retain_linked_context(&mut self, realm_id: u32, context: &ExecutionContext) {
-        let Some(records) = self.realms.get_mut(&realm_id) else {
-            return;
-        };
-        for init in context.module_inits() {
-            let Some(record) = records.get_mut(&init.url) else {
-                continue;
-            };
-            if record.function_id == init.function_id && record.context.is_none() {
-                record.context = Some(context.clone());
-            }
-        }
     }
 
     /// Mark all instantiated records as evaluating. Called once
@@ -291,6 +246,7 @@ impl RuntimeModuleRecords {
     pub(crate) fn for_each_record(&self, realm_id: u32, mut f: impl FnMut(&str, u32)) {
         if let Some(records) = self.realms.get(&realm_id) {
             for (url, record) in records {
+                debug_assert!(record.context.function(record.function_id).is_some());
                 f(url, record.function_id);
             }
         }
@@ -327,7 +283,7 @@ fn synthesize_commonjs_namespace<'scope>(
     hosted_modules: &[HostedModule],
     capabilities: &CapabilitySet,
     runtime_task_spawner: Option<RuntimeTaskSpawner>,
-) -> Result<otter_vm::Local<'scope>, OtterError> {
+) -> Result<otter_vm::Local<'scope>, NativeError> {
     let cfg = std::sync::Arc::new(crate::commonjs::CjsConfig {
         capabilities: capabilities.clone(),
         hosted: hosted_modules.to_vec(),
@@ -335,45 +291,19 @@ fn synthesize_commonjs_namespace<'scope>(
         addon_loader: None,
         report_watch_dependencies: crate::commonjs::watch_reporting_requested(),
     });
-    let hosted_error = |error: otter_vm::NativeError| OtterError::HostedModule {
-        specifier: specifier.to_string(),
-        message: error.to_string(),
-    };
-
-    let exports =
-        crate::commonjs::cjs_load_builtin(scope, &cfg, specifier).map_err(hosted_error)?;
-    let namespace = scope.bare_object().map_err(hosted_error)?;
-    scope
-        .set(namespace, "default", exports)
-        .map_err(hosted_error)?;
-    for key in scope
-        .enumerable_own_string_keys(exports)
-        .map_err(hosted_error)?
-    {
+    let exports = crate::commonjs::cjs_load_builtin(scope, &cfg, specifier)?.ok_or_else(|| {
+        crate::runtime_type_error("import", format!("no builtin module named '{specifier}'"))
+    })?;
+    let namespace = scope.bare_object()?;
+    scope.set(namespace, "default", exports)?;
+    for key in scope.enumerable_own_string_keys(exports)? {
         if key == "default" {
             continue;
         }
-        let value = scope.get(exports, &key).map_err(hosted_error)?;
-        scope.set(namespace, &key, value).map_err(hosted_error)?;
+        let value = scope.get(exports, &key)?;
+        scope.set(namespace, &key, value)?;
     }
     Ok(namespace)
-}
-
-fn module_allocation_error(error: NativeError) -> OtterError {
-    match error {
-        NativeError::OutOfMemory {
-            requested_bytes,
-            heap_limit_bytes,
-            ..
-        } => OtterError::OutOfMemory {
-            requested_bytes,
-            heap_limit_bytes,
-        },
-        error => OtterError::Internal {
-            code: "MODULE_ENV_INSTALL".to_string(),
-            message: error.to_string(),
-        },
-    }
 }
 
 #[cfg(test)]
@@ -420,3 +350,6 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod completion_tests;

@@ -7,6 +7,7 @@
 //! - [`Repr`] — the machine representation of a node's result.
 //! - [`Kind`] — every node operation, value and control alike.
 //! - [`Node`], [`Block`], [`FrameState`], [`Graph`] — the arena.
+//! - [`super::dump`] — opt-in complete constant and block declarations.
 //! - [`InlineCaller`] / [`InlinedBody`] — how an inlined body's frames and
 //!   nodes name the call they run for.
 //! - [`Properties`] / [`Kind::properties`] — what a node may do (call,
@@ -59,8 +60,9 @@ pub(crate) enum Repr {
     Int32,
     /// An unboxed double in a floating-point register.
     Float64,
-    /// A raw machine word that is never a GC root: an address inside a
-    /// non-moving body, a length, a bit pattern.
+    /// A raw machine word that is never a GC root: a length, bit pattern, or
+    /// transient storage address. A movable storage address must be consumed
+    /// before a collecting call and reloaded from its rooted owner afterward.
     Word,
 }
 
@@ -70,7 +72,7 @@ impl Repr {
     }
 }
 
-/// A condition on two int32 or two float64 operands.
+/// A condition on numeric operands or the VM primitive ordering result.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum Condition {
     Equal,
@@ -127,7 +129,7 @@ pub(crate) enum BranchKind {
     Truthy,
     /// `input0 cond input1` on int32 operands.
     Int32(Condition),
-    /// `input0 cond input1` on float64 operands; unordered is false.
+    /// `input0 cond input1` on float64 operands; unordered satisfies only `!=`.
     Float64(Condition),
     /// `input0` and `input1` are the same tagged word.
     TaggedEqual,
@@ -153,19 +155,45 @@ pub(crate) enum Kind {
     InitialRegister(u16),
     /// The frame's `this` binding from the record.
     LoadThis,
+    /// This activation's explicit new.target binding.
+    LoadNewTarget,
     /// The callee (SELF) from the record.
     LoadClosure,
     /// The primitive string constant of the `LoadString` at this byte PC,
     /// read from its isolate-owned cell.
     LoadStringConstant(u32),
-    /// `new.target` from the record.
-    LoadNewTarget,
+    /// Live global binding at this source body's byte PC. A pre-effect
+    /// guard resumes the canonical binding operation at that exact site.
+    LoadGlobalBinding(u32),
     /// Read a window-resident register.
     LoadWindow(u16),
-    /// Write a window-resident register.
-    StoreWindow(u16),
     /// A merge of one value per predecessor.
     Phi,
+
+    // ---- Allocation ----
+    /// One post-LICM fixed-shell group, preserving the first original source id.
+    AllocationGroup(u32),
+    /// Tagged cell at this byte offset from a fully published group first cell.
+    AllocationProjection(u32),
+    /// Fresh ordinary empty object in this exact source body's realm.
+    NewObject,
+    /// Fresh empty array shell; extra realms use the committed sidecar allocator.
+    NewArrayEmpty,
+    /// Static own-property values initialized from canonical tagged homes.
+    NewObjectLiteral,
+    /// Dense source-order elements initialized from canonical tagged homes.
+    NewArrayLiteral,
+    /// Fresh lexical environment for this source function's scope.
+    NativeNewContext(u32),
+    /// Per-iteration environment copy from a rooted context operand.
+    CopyContext,
+    /// Fresh callable; exact source owns the template, inputs bind context/this/new.target.
+    NewClosure,
+
+    /// Number/String primitive addition with a collecting string miss.
+    PrimitiveAdd,
+    /// Primitive Number/String order, including unordered numeric operands.
+    PrimitiveCompare(Condition),
 
     // ---- Int32 arithmetic ----
     /// Checked add; eager deopt on overflow.
@@ -201,7 +229,7 @@ pub(crate) enum Kind {
     Float64Negate,
     /// `fmod` through a leaf call.
     Float64Mod,
-    /// Float64 compare producing a tagged boolean; unordered is false.
+    /// Float64 compare producing a tagged boolean; unordered satisfies only `!=`.
     Float64Compare(Condition),
 
     // ---- Conversions ----
@@ -225,8 +253,6 @@ pub(crate) enum Kind {
     /// An element index from a double holding an integer in the int32 range
     /// (`-0` is `0`). Eager deopt otherwise.
     CheckedFloat64ToIndex,
-    /// Strict equality of two tagged words producing a tagged boolean.
-    TaggedEqual,
     /// `input0 === input1` (or `!==` when `negate`) on any two tagged values,
     /// producing a tagged boolean: numbers by value, strings and BigInts by
     /// content through a leaf probe, everything else by identity.
@@ -239,8 +265,6 @@ pub(crate) enum Kind {
     LogicalNot,
 
     // ---- Checks ----
-    /// Eager deopt unless input0 is a heap cell.
-    CheckHeapObject,
     /// Eager deopt unless input0 is a Number.
     CheckNumber,
     /// Eager deopt unless input0 is an ordinary object with one of the
@@ -251,8 +275,6 @@ pub(crate) enum Kind {
         shapes: SmallVec<[u32; 4]>,
         writable: bool,
     },
-    /// Eager deopt unless input0 is exactly this tagged word.
-    CheckValue(u64),
     /// Eager deopt unless the int32 index input0 lies in `0..input1`, where
     /// input1 is a `Word` element count.
     CheckBounds,
@@ -276,8 +298,10 @@ pub(crate) enum Kind {
     CheckHoleyElementPresent(JitHoleBitmap),
 
     // ---- Memory ----
-    /// The base address of input0's named slots: in-object or slab.
-    LoadSlotBase,
+    /// Read input0's shape-owned field without exposing a movable storage address.
+    LoadOwnField(otter_vm::object::FieldLocation),
+    /// Store input1 into input0's shape-owned field; a separate node owns its barrier.
+    StoreOwnField(otter_vm::object::FieldLocation),
     /// The named property of receiver input0 the load site at this byte PC
     /// reads through its feedback programs: one of their receivers, then one
     /// data slot of the receiver or of its guarded holder. Eager deopt when no
@@ -290,16 +314,17 @@ pub(crate) enum Kind {
     /// own barrier is a separate node.
     StoreNamedProperty(u32),
     /// `[[Get]]` of the named property at the load site `pc` from receiver
-    /// input0: an own or prototype data slot found in the isolate's shared
-    /// lookup table for `atom`, else the full operation in the runtime.
+    /// input0: an own or prototype data slot proved by the load fact in the
+    /// isolate's shared property action table for `atom`, else the committed
+    /// source operation in the runtime.
     LoadPropertyCached {
         pc: u32,
         atom: Option<u32>,
     },
     /// `[[Set]]` of input1 as the named property of receiver input0 at the
-    /// store site `pc`: an existing writable own slot found in the shared
-    /// lookup table, or an add transition found in the shared transition
-    /// table, for `atom`; else the full operation in the runtime.
+    /// store site `pc`: an existing writable own slot or an addition proved
+    /// by the independent store fact in the shared property action table for
+    /// `atom`; else the committed source operation in the runtime.
     StorePropertyCached {
         pc: u32,
         atom: Option<u32>,
@@ -309,8 +334,6 @@ pub(crate) enum Kind {
     LoadTaggedField(i32),
     /// Store input1 (tagged) at `[input0 + offset]`.
     StoreTaggedField(i32),
-    /// Store the compressed shape handle into object input0.
-    StoreShape(u32),
     /// Generational write barrier for storing input1 into object input0.
     WriteBarrier,
     /// Barrier for the tagged value input2 just stored at index input1 of the
@@ -348,15 +371,19 @@ pub(crate) enum Kind {
     StoreElement(JitElementRepr),
 
     // ---- Calls ----
+    /// Exact two boxed operands of a pure declared native leaf. A pre-effect
+    /// miss eagerly resumes this CallWithThis with its evaluated inputs.
+    /// The C call clobbers registers but cannot collect or reenter.
+    NativeLeaf(otter_vm::native_abi::RuntimeStubId),
     /// `[[Call]]` of input0 with `undefined` as receiver and the remaining
     /// inputs as arguments, through the JavaScript call ABI, or with
     /// `construct` its `[[Construct]]` with input0 as `new.target`. With a
     /// `plan`, a callee proved to be the plan's function is entered through
     /// its current generation; any other callee through the generic entry.
-    /// The bytecode instruction at `pc` is published while the callee runs.
+    /// Its actual return site names the source record while the callee runs.
     CallJs {
         pc: u32,
-        plan: Option<otter_vm::jit::JitDirectCallPlan>,
+        plan: crate::call_linkage::CallPlan,
         construct: bool,
         /// Input1 is the receiver; otherwise the receiver is `undefined`.
         receiver: bool,
@@ -365,11 +392,29 @@ pub(crate) enum Kind {
         /// does not prepare one in the runtime.
         allocation: Option<otter_vm::jit::JitReceiverAllocationPlan>,
     },
+    /// `[[Call]]` of input0 with input1 as receiver and the activation's own
+    /// actual arguments, as `callee.apply(this, arguments)` passes them over
+    /// an `arguments` object the body never materializes. The remaining
+    /// inputs are the current values of the mapped formals at the argument
+    /// indices `bindings`, which replace the actuals they alias. With a
+    /// `plan`, a callee proved to be the plan's function is entered through
+    /// its current generation; any other callee through the generic entry.
+    CallForward {
+        pc: u32,
+        plan: crate::call_linkage::CallPlan,
+        bindings: Box<[u16]>,
+    },
     /// Eager deopt unless the callee of the call site at this byte PC is
     /// `%Function.prototype.call%`: input0 itself for an explicit-receiver
     /// call, or the `call` a method call reads from its closure receiver
     /// input0 through the pinned `%Function.prototype%`.
     CheckFunctionPrototypeCall(u32),
+    /// Eager deopt unless input0 is the native function whose external
+    /// reference index is the immediate.
+    CheckNative(u32),
+    /// Eager deopt once the activation has materialized its arguments
+    /// object: its actual arguments are then that object's elements.
+    CheckArgumentsElided,
     /// Eager deopt unless input0 is the function `function_id`: its
     /// function-id immediate, or a closure of it that needs no runtime setup.
     /// `cell`, when not zero, holds the last value proved here, which a
@@ -398,6 +443,8 @@ pub(crate) enum Kind {
     /// The compressed shape of input0 when it is an ordinary object that
     /// looks its properties up through its shape; zero otherwise.
     LoadReceiverShape,
+    /// `ToNumber` of the tagged boolean input0 as an int32: 1 or 0.
+    BooleanToInt32,
     /// The baseline operation for the bytecode instruction at `pc`, run on
     /// the frame window: input `i` is stored to window register
     /// `registers[i]` first, and the instruction's written registers are read
@@ -435,8 +482,8 @@ pub(crate) struct Properties {
     /// Must stay even when its value is unused.
     pub(crate) effectful: bool,
     /// Not a call, but its slow path enters the runtime, which may collect
-    /// or run JavaScript: live registers are saved in rooted snapshot slots
-    /// around it and its safepoint roots every live tagged slot.
+    /// or run JavaScript: exact-live registers are preserved through canonical
+    /// homes and the safepoint roots the initialized tagged region.
     pub(crate) may_collect: bool,
 }
 
@@ -447,8 +494,17 @@ pub(crate) enum InputPolicy {
     Register,
     /// Register, spill slot, or constant.
     Any,
+    /// The value's canonical representation-specific home, or a rematerialized
+    /// constant. Bulk consumers do not reserve an input register per value.
+    Home,
+    /// A constant stays one, for the instruction to encode; any other value
+    /// is in a register.
+    RegisterOrConstant,
     /// This general register.
     FixedGp(u8),
+    /// Encode a constant directly; otherwise use this general register.
+    /// A constant does not reserve or displace the named register.
+    FixedGpOrConstant(u8),
 }
 
 /// Where the allocator must put the result.
@@ -457,8 +513,6 @@ pub(crate) enum ResultPolicy {
     None,
     Register,
     FixedGp(u8),
-    /// The same register as input `index`, which must die here.
-    SameAsInput(u8),
 }
 
 /// Register-allocation contract of one node.
@@ -468,6 +522,10 @@ pub(crate) struct Constraints {
     pub(crate) result: ResultPolicy,
     pub(crate) gp_temps: u8,
     pub(crate) fp_temps: u8,
+    /// Implicit writes by the operation, reserved and evicted before inputs
+    /// are assigned. A fixed result may occupy one of these registers only
+    /// after the operation's guards have consumed the preserved inputs.
+    pub(crate) fixed_gp_clobbers: SmallVec<[u8; 2]>,
 }
 
 impl Kind {
@@ -476,8 +534,8 @@ impl Kind {
         matches!(
             self,
             Self::Int32Compare(_)
+                | Self::PrimitiveCompare(_)
                 | Self::Float64Compare(_)
-                | Self::TaggedEqual
                 | Self::StrictEqual { .. }
                 | Self::ToBoolean
                 | Self::LogicalNot
@@ -488,13 +546,6 @@ impl Kind {
         matches!(
             self,
             Self::ConstTagged(_) | Self::ConstInt32(_) | Self::ConstFloat64(_)
-        )
-    }
-
-    pub(crate) fn is_control(&self) -> bool {
-        matches!(
-            self,
-            Self::Jump(_) | Self::JumpLoop(_) | Self::Branch { .. } | Self::Return | Self::Deopt(_)
         )
     }
 
@@ -509,12 +560,12 @@ impl Kind {
             | Self::ConstInt32(_)
             | Self::ConstFloat64(_)
             | Self::InitialRegister(_)
-            | Self::LoadThis
+            | Self::LoadNewTarget
             | Self::LoadClosure
             | Self::LoadStringConstant(_)
-            | Self::LoadNewTarget
             | Self::LoadWindow(_)
             | Self::Phi
+            | Self::AllocationProjection(_)
             | Self::Int32BitAnd
             | Self::Int32BitOr
             | Self::Int32BitXor
@@ -533,17 +584,17 @@ impl Kind {
             | Self::Float64ToTagged
             | Self::Int32ToFloat64
             | Self::TruncateFloat64ToInt32
-            | Self::TaggedEqual
             | Self::StrictEqual { .. }
             | Self::ToBoolean
             | Self::LogicalNot
-            | Self::LoadSlotBase
+            | Self::LoadOwnField(_)
             | Self::LoadTaggedField(_)
             | Self::LoadContextParent
             | Self::LoadClosureContext
             | Self::LoadElementsLength { .. }
             | Self::LoadElementsBase(_)
             | Self::LoadReceiverShape
+            | Self::BooleanToInt32
             | Self::LoadElementUint32ToFloat64 => pure,
             Self::LoadElement(element) => {
                 if matches!(element, JitElementRepr::Boxed | JitElementRepr::Uint32) {
@@ -565,12 +616,12 @@ impl Kind {
             | Self::CheckedFloat64ToInt32
             | Self::CheckedTaggedToIndex
             | Self::CheckedFloat64ToIndex
-            | Self::CheckHeapObject
             | Self::CheckNumber
             | Self::CheckShapes { .. }
-            | Self::CheckValue(_)
             | Self::CheckBounds
             | Self::CheckFunctionPrototypeCall(_)
+            | Self::CheckNative(_)
+            | Self::CheckArgumentsElided
             | Self::CheckFunction { .. }
             | Self::CheckNotHole
             | Self::LoadGuardedMethod { .. }
@@ -579,6 +630,29 @@ impl Kind {
             | Self::CheckElementPresent
             | Self::CheckHoleyElementPresent(_)
             | Self::LoadHoleyFloat64Element(_) => eager,
+            // A derived constructor changes its physical this binding at
+            // super(); lexical capture must read the current binding here.
+            Self::LoadThis => Properties {
+                effectful: true,
+                ..Properties::default()
+            },
+            Self::LoadGlobalBinding(_) => Properties {
+                eager_deopt: true,
+                effectful: true,
+                ..Properties::default()
+            },
+            Self::PrimitiveCompare(_) => eager,
+            Self::AllocationGroup(_)
+            | Self::PrimitiveAdd
+            | Self::NativeNewContext(_)
+            | Self::CopyContext
+            | Self::NewClosure => Properties {
+                eager_deopt: true,
+                writes: true,
+                effectful: true,
+                may_collect: true,
+                ..Properties::default()
+            },
             Self::StoreNamedProperty(_) => Properties {
                 eager_deopt: true,
                 writes: true,
@@ -587,7 +661,11 @@ impl Kind {
             },
             Self::LoadPropertyCached { .. }
             | Self::StorePropertyCached { .. }
-            | Self::Instanceof => Properties {
+            | Self::Instanceof
+            | Self::NewObject
+            | Self::NewArrayEmpty
+            | Self::NewObjectLiteral
+            | Self::NewArrayLiteral => Properties {
                 eager_deopt: true,
                 can_throw: true,
                 writes: true,
@@ -595,9 +673,8 @@ impl Kind {
                 may_collect: true,
                 ..Properties::default()
             },
-            Self::StoreWindow(_)
+            Self::StoreOwnField(_)
             | Self::StoreTaggedField(_)
-            | Self::StoreShape(_)
             | Self::StoreElement(_)
             | Self::WriteBarrier
             | Self::ElementWriteBarrier => Properties {
@@ -605,7 +682,13 @@ impl Kind {
                 effectful: true,
                 ..Properties::default()
             },
-            Self::CallJs { .. } | Self::Generic { .. } => Properties {
+            Self::NativeLeaf(_) => Properties {
+                call: true,
+                eager_deopt: true,
+                effectful: true,
+                ..Properties::default()
+            },
+            Self::CallJs { .. } | Self::CallForward { .. } | Self::Generic { .. } => Properties {
                 call: true,
                 eager_deopt: true,
                 lazy_deopt: true,
@@ -627,8 +710,12 @@ impl Kind {
     }
 
     /// The allocation contract for a node with `input_count` inputs.
-    pub(crate) fn constraints(&self, input_count: usize) -> Constraints {
-        use InputPolicy::{Any, FixedGp, Register};
+    pub(crate) fn constraints(
+        &self,
+        input_count: usize,
+        target: &super::registers::RegisterContract,
+    ) -> Constraints {
+        use InputPolicy::{Any, FixedGp, FixedGpOrConstant, Register, RegisterOrConstant};
         let registers =
             |count: usize| -> SmallVec<[InputPolicy; 4]> { (0..count).map(|_| Register).collect() };
         let simple = |inputs: usize, result: ResultPolicy| Constraints {
@@ -636,6 +723,7 @@ impl Kind {
             result,
             gp_temps: 0,
             fp_temps: 0,
+            fixed_gp_clobbers: SmallVec::new(),
         };
         match self {
             Self::ConstTagged(_) | Self::ConstInt32(_) | Self::ConstFloat64(_) | Self::Phi => {
@@ -644,32 +732,96 @@ impl Kind {
                     result: ResultPolicy::Register,
                     gp_temps: 0,
                     fp_temps: 0,
+                    fixed_gp_clobbers: SmallVec::new(),
                 }
             }
+            Self::PrimitiveAdd => Constraints {
+                inputs: (0..input_count).map(|_| InputPolicy::Home).collect(),
+                result: ResultPolicy::Register,
+                gp_temps: 4,
+                fp_temps: 1,
+                fixed_gp_clobbers: SmallVec::new(),
+            },
+            Self::PrimitiveCompare(_) => simple(2, ResultPolicy::Register),
+            Self::AllocationProjection(_) => simple(1, ResultPolicy::Register),
+            Self::AllocationGroup(_) | Self::NewObject | Self::NewArrayEmpty => Constraints {
+                inputs: SmallVec::new(),
+                result: ResultPolicy::Register,
+                gp_temps: 4,
+                fp_temps: 0,
+                fixed_gp_clobbers: SmallVec::new(),
+            },
+            Self::NewObjectLiteral
+            | Self::NewArrayLiteral
+            | Self::NativeNewContext(_)
+            | Self::CopyContext
+            | Self::NewClosure => Constraints {
+                inputs: (0..input_count).map(|_| InputPolicy::Home).collect(),
+                result: ResultPolicy::Register,
+                gp_temps: 4,
+                fp_temps: 0,
+                fixed_gp_clobbers: SmallVec::new(),
+            },
+            Self::LoadGlobalBinding(_) => Constraints {
+                inputs: SmallVec::new(),
+                result: ResultPolicy::Register,
+                gp_temps: 2,
+                fp_temps: 0,
+                fixed_gp_clobbers: SmallVec::new(),
+            },
             Self::InitialRegister(_)
             | Self::LoadThis
+            | Self::LoadNewTarget
             | Self::LoadClosure
             | Self::LoadStringConstant(_)
-            | Self::LoadNewTarget
             | Self::LoadWindow(_) => simple(0, ResultPolicy::Register),
-            Self::StoreWindow(_) => simple(1, ResultPolicy::None),
+            // The right operand may be a constant, encoded in the
+            // instruction when it fits.
             Self::Int32Add
             | Self::Int32Sub
-            | Self::Int32Mul
             | Self::Int32BitAnd
             | Self::Int32BitOr
             | Self::Int32BitXor
-            | Self::Int32ShiftLeft
-            | Self::Int32ShiftRight
-            | Self::Int32ShiftRightLogical
-            | Self::Uint32ShiftRightToFloat64
-            | Self::Int32Compare(_)
+            | Self::Int32Compare(_) => Constraints {
+                inputs: smallvec::smallvec![Register, RegisterOrConstant],
+                result: ResultPolicy::Register,
+                gp_temps: 0,
+                fp_temps: 0,
+                fixed_gp_clobbers: SmallVec::new(),
+            },
+            Self::Int32ShiftLeft | Self::Int32ShiftRight | Self::Int32ShiftRightLogical => {
+                Constraints {
+                    inputs: smallvec::smallvec![
+                        Register,
+                        target
+                            .variable_shift_count
+                            .map_or(RegisterOrConstant, FixedGpOrConstant)
+                    ],
+                    result: ResultPolicy::Register,
+                    gp_temps: 0,
+                    fp_temps: 0,
+                    fixed_gp_clobbers: SmallVec::new(),
+                }
+            }
+            Self::Uint32ShiftRightToFloat64 => Constraints {
+                // ARM consumes a register even for a constant count.
+                inputs: smallvec::smallvec![
+                    Register,
+                    target
+                        .variable_shift_count
+                        .map_or(Register, FixedGpOrConstant)
+                ],
+                result: ResultPolicy::Register,
+                gp_temps: 0,
+                fp_temps: 0,
+                fixed_gp_clobbers: SmallVec::new(),
+            },
+            Self::Int32Mul
             | Self::Float64Add
             | Self::Float64Sub
             | Self::Float64Mul
             | Self::Float64Div
             | Self::Float64Compare(_)
-            | Self::TaggedEqual
             | Self::LoadElement(_)
             | Self::LoadElementUint32ToFloat64 => simple(2, ResultPolicy::Register),
             Self::LoadHoleyFloat64Element(_) => Constraints {
@@ -677,6 +829,7 @@ impl Kind {
                 result: ResultPolicy::Register,
                 gp_temps: 0,
                 fp_temps: 1,
+                fixed_gp_clobbers: SmallVec::new(),
             },
             Self::CheckBounds | Self::CheckElementPresent | Self::CheckHoleyElementPresent(_) => {
                 simple(2, ResultPolicy::None)
@@ -687,61 +840,92 @@ impl Kind {
                 result: ResultPolicy::None,
                 gp_temps: 1,
                 fp_temps: 0,
+                fixed_gp_clobbers: SmallVec::new(),
             },
-            Self::CheckFunction { .. } | Self::CheckNotHole => simple(1, ResultPolicy::None),
+            Self::CheckFunction { .. } | Self::CheckNotHole | Self::CheckNative(_) => {
+                simple(1, ResultPolicy::None)
+            }
+            Self::CheckArgumentsElided => simple(0, ResultPolicy::None),
             Self::LoadGuardedMethod { .. } => Constraints {
                 inputs: registers(1),
                 result: ResultPolicy::Register,
                 gp_temps: 1,
                 fp_temps: 0,
+                fixed_gp_clobbers: SmallVec::new(),
             },
             Self::LoadNamedProperty(_) => Constraints {
                 inputs: registers(1),
                 result: ResultPolicy::Register,
                 gp_temps: 2,
                 fp_temps: 0,
+                fixed_gp_clobbers: SmallVec::new(),
             },
             Self::StoreNamedProperty(_) => Constraints {
                 inputs: registers(2),
                 result: ResultPolicy::None,
                 gp_temps: 2,
                 fp_temps: 0,
+                fixed_gp_clobbers: SmallVec::new(),
             },
             Self::Instanceof => Constraints {
                 inputs: registers(2),
                 result: ResultPolicy::Register,
                 gp_temps: 5,
                 fp_temps: 0,
+                fixed_gp_clobbers: SmallVec::new(),
             },
             Self::LoadPropertyCached { .. } => Constraints {
                 inputs: registers(1),
                 result: ResultPolicy::Register,
                 gp_temps: 4,
                 fp_temps: 0,
+                fixed_gp_clobbers: SmallVec::new(),
             },
             Self::StorePropertyCached { .. } => Constraints {
                 inputs: registers(2),
                 result: ResultPolicy::None,
                 gp_temps: 4,
                 fp_temps: 0,
+                fixed_gp_clobbers: SmallVec::new(),
             },
-            Self::Int32Div | Self::Int32Mod => Constraints {
-                inputs: registers(2),
-                result: ResultPolicy::Register,
-                gp_temps: 1,
-                fp_temps: 0,
-            },
+            Self::Int32Div | Self::Int32Mod => {
+                if let Some(pair) = target.integer_division {
+                    Constraints {
+                        // Both original operands remain readable by eager
+                        // guards while implicit division writes its pair.
+                        inputs: registers(2),
+                        result: ResultPolicy::FixedGp(if matches!(self, Self::Int32Div) {
+                            pair.quotient
+                        } else {
+                            pair.remainder
+                        }),
+                        gp_temps: 0,
+                        fp_temps: 0,
+                        fixed_gp_clobbers: smallvec::smallvec![pair.quotient, pair.remainder],
+                    }
+                } else {
+                    Constraints {
+                        inputs: registers(2),
+                        result: ResultPolicy::Register,
+                        gp_temps: 1,
+                        fp_temps: 0,
+                        fixed_gp_clobbers: SmallVec::new(),
+                    }
+                }
+            }
             Self::StrictEqual { .. } => Constraints {
                 inputs: registers(2),
                 result: ResultPolicy::Register,
                 gp_temps: 0,
                 fp_temps: 1,
+                fixed_gp_clobbers: SmallVec::new(),
             },
             Self::Float64Mod => Constraints {
                 inputs: registers(2),
                 result: ResultPolicy::Register,
                 gp_temps: 0,
                 fp_temps: 0,
+                fixed_gp_clobbers: SmallVec::new(),
             },
             Self::Int32Negate
             | Self::Int32BitNot
@@ -752,55 +936,89 @@ impl Kind {
             | Self::TruncateFloat64ToInt32
             | Self::CheckedFloat64ToInt32
             | Self::CheckedFloat64ToIndex
-            | Self::LoadSlotBase
+            | Self::LoadOwnField(_)
             | Self::LoadTaggedField(_)
             | Self::LoadContextParent
             | Self::LoadClosureContext
             | Self::LoadElementsLength { .. }
             | Self::LoadElementsBase(_)
-            | Self::LoadReceiverShape => simple(1, ResultPolicy::Register),
+            | Self::LoadReceiverShape
+            | Self::BooleanToInt32 => simple(1, ResultPolicy::Register),
             Self::CheckedTaggedToFloat64 | Self::Float64ToTagged | Self::CheckedTaggedToIndex => {
                 Constraints {
                     inputs: registers(1),
                     result: ResultPolicy::Register,
                     gp_temps: 0,
                     fp_temps: 1,
+                    fixed_gp_clobbers: SmallVec::new(),
                 }
             }
             Self::ToBoolean | Self::LogicalNot => simple(1, ResultPolicy::Register),
-            Self::CheckHeapObject | Self::CheckNumber | Self::CheckValue(_) => {
-                simple(1, ResultPolicy::None)
-            }
+            Self::CheckNumber => simple(1, ResultPolicy::None),
             Self::CheckShapes { .. } | Self::CheckElements { .. } => simple(1, ResultPolicy::None),
-            Self::StoreTaggedField(_) => simple(2, ResultPolicy::None),
-            Self::StoreShape(_) => simple(1, ResultPolicy::None),
+            Self::StoreOwnField(_) | Self::StoreTaggedField(_) => simple(2, ResultPolicy::None),
             Self::WriteBarrier => simple(2, ResultPolicy::None),
+            Self::NativeLeaf(_) => Constraints {
+                inputs: (0..input_count).map(|_| InputPolicy::Home).collect(),
+                result: ResultPolicy::FixedGp(target.call_result),
+                gp_temps: 0,
+                fp_temps: 0,
+                fixed_gp_clobbers: SmallVec::new(),
+            },
             Self::CallJs { receiver, .. } => {
-                let mut inputs: SmallVec<[InputPolicy; 4]> = smallvec::smallvec![FixedGp(1)];
+                let mut inputs: SmallVec<[InputPolicy; 4]> =
+                    smallvec::smallvec![FixedGp(target.call_callee)];
                 if *receiver {
-                    inputs.push(FixedGp(2));
+                    inputs.push(FixedGp(target.call_receiver));
                 }
                 inputs.extend((inputs.len()..input_count).map(|_| Any));
                 Constraints {
                     inputs,
-                    result: ResultPolicy::FixedGp(0),
+                    result: ResultPolicy::FixedGp(target.call_result),
                     gp_temps: 0,
                     fp_temps: 0,
+                    fixed_gp_clobbers: SmallVec::new(),
+                }
+            }
+            Self::CallForward { .. } => {
+                let mut inputs: SmallVec<[InputPolicy; 4]> =
+                    smallvec::smallvec![FixedGp(target.call_callee), FixedGp(target.call_receiver)];
+                inputs.extend((inputs.len()..input_count).map(|_| Any));
+                // The old stack pointer and the actual span's source survive
+                // the copy that fills the span.
+                Constraints {
+                    inputs,
+                    result: ResultPolicy::FixedGp(target.call_result),
+                    gp_temps: 2,
+                    fp_temps: 0,
+                    fixed_gp_clobbers: SmallVec::new(),
                 }
             }
             Self::Generic { .. } => Constraints {
                 inputs: (0..input_count).map(|_| Any).collect(),
-                result: ResultPolicy::FixedGp(0),
+                result: ResultPolicy::FixedGp(target.call_result),
                 gp_temps: 0,
                 fp_temps: 0,
+                fixed_gp_clobbers: SmallVec::new(),
             },
             Self::Jump(_) | Self::JumpLoop(_) | Self::Deopt(_) => simple(0, ResultPolicy::None),
-            Self::Branch { .. } => simple(input_count, ResultPolicy::None),
-            Self::Return => Constraints {
-                inputs: smallvec::smallvec![FixedGp(0)],
+            Self::Branch {
+                kind: BranchKind::Int32(_),
+                ..
+            } => Constraints {
+                inputs: smallvec::smallvec![Register, RegisterOrConstant],
                 result: ResultPolicy::None,
                 gp_temps: 0,
                 fp_temps: 0,
+                fixed_gp_clobbers: SmallVec::new(),
+            },
+            Self::Branch { .. } => simple(input_count, ResultPolicy::None),
+            Self::Return => Constraints {
+                inputs: smallvec::smallvec![FixedGp(target.call_result)],
+                result: ResultPolicy::None,
+                gp_temps: 0,
+                fp_temps: 0,
+                fixed_gp_clobbers: SmallVec::new(),
             },
         }
     }
@@ -913,6 +1131,7 @@ pub(crate) struct InlinedBody {
 #[derive(Debug, Default)]
 pub(crate) struct Graph {
     pub(crate) nodes: Vec<Node>,
+    pub(crate) allocation_groups: Vec<super::allocation_groups::Group>,
     pub(crate) blocks: Vec<Block>,
     pub(crate) frame_states: Vec<FrameState>,
     constants: rustc_hash::FxHashMap<(u8, u64), NodeId>,
@@ -1058,61 +1277,5 @@ impl Graph {
         let id = self.add_node(kind, &[], repr);
         self.constants.insert(key, id);
         id
-    }
-
-    /// Constant value of `id`, if it is a constant node.
-    pub(crate) fn constant_int32(&self, id: NodeId) -> Option<i32> {
-        match self.node(id).kind {
-            Kind::ConstInt32(value) => Some(value),
-            _ => None,
-        }
-    }
-}
-
-impl Graph {
-    /// A readable listing of the blocks in `layout`, for tests and
-    /// diagnostics.
-    pub(crate) fn dump(&self, layout: &[BlockId]) -> String {
-        use std::fmt::Write;
-        let mut out = String::new();
-        for &block in layout {
-            let data = self.block(block);
-            let _ = writeln!(
-                out,
-                "b{}{} preds={:?}",
-                block.0,
-                if data.is_loop { " loop" } else { "" },
-                data.predecessors.iter().map(|b| b.0).collect::<Vec<_>>()
-            );
-            for &node in data
-                .phis
-                .iter()
-                .chain(&data.body)
-                .chain(data.control.iter())
-            {
-                let n = self.node(node);
-                let _ = writeln!(
-                    out,
-                    "  v{} = {:?} {:?} {:?}{}",
-                    node.0,
-                    n.kind,
-                    n.inputs.iter().map(|i| i.0).collect::<Vec<_>>(),
-                    n.repr,
-                    n.eager.map_or(String::new(), |s| format!(
-                        " eager={:?}",
-                        self.state_chain(s)
-                            .iter()
-                            .map(|&state| self
-                                .frame_state(state)
-                                .registers
-                                .iter()
-                                .map(|(r, v)| (*r, v.0))
-                                .collect::<Vec<_>>())
-                            .collect::<Vec<_>>()
-                    ))
-                );
-            }
-        }
-        out
     }
 }

@@ -11,13 +11,13 @@
 //!   intrinsic prototype.
 //! - [`named_store_programs`] — any store whose every program writes an
 //!   existing writable slot of an ordinary receiver or appends one through
-//!   a guarded shape transition.
+//!   a guarded shape transition into its persistent inline capacity.
 //!
 //! # Invariants
 //! - A site is speculated only when every installed program is understood;
 //!   one unknown program keeps the whole site generic.
-//! - Offsets are relative to the receiver's slot base (in-object or slab),
-//!   exactly as the snapshot's programs state them.
+//! - Every accepted program agrees on the entire shape-owned FieldLocation:
+//!   both storage bank and relative word index, not only the byte displacement.
 //!
 //! # See also
 //! - `otter_vm::jit::JitCacheIrProgram` — the program format read here.
@@ -32,8 +32,8 @@ use smallvec::SmallVec;
 pub(crate) struct OwnDataLoad {
     /// Compressed shape handles.
     pub(crate) shapes: SmallVec<[u32; 4]>,
-    /// Byte offset of the slot from the receiver's slot base.
-    pub(crate) offset: i32,
+    /// Immutable storage bank and bank-relative word index.
+    pub(crate) field: otter_vm::object::FieldLocation,
 }
 
 /// The own-data load the site at `byte_pc` observed, if every program is
@@ -44,37 +44,37 @@ pub(crate) fn own_data_load(view: &JitCompileSnapshot, byte_pc: u32) -> Option<O
         return None;
     }
     let mut shapes = SmallVec::new();
-    let mut offset = None;
+    let mut location = None;
     for program in programs {
         let [
             JitCacheIrOp::GuardShape { object: 0, shape },
             JitCacheIrOp::GuardAtomSlot {
                 object: 0,
-                value_byte,
+                field,
                 writable: false,
                 ..
             },
             JitCacheIrOp::LoadField {
                 object: 0,
-                value_byte: load_byte,
+                field: load_byte,
             },
         ] = &*program.ops
         else {
             return None;
         };
-        if value_byte != load_byte {
+        if field != load_byte {
             return None;
         }
-        let byte = i32::try_from(*value_byte).ok()?;
-        if offset.is_some_and(|known| known != byte) {
+        i32::try_from(field.byte_offset()).ok()?;
+        if location.is_some_and(|known| known != *field) {
             return None;
         }
-        offset = Some(byte);
+        location = Some(*field);
         shapes.push(*shape);
     }
     Some(OwnDataLoad {
         shapes,
-        offset: offset?,
+        field: location?,
     })
 }
 
@@ -86,37 +86,37 @@ pub(crate) fn own_data_store(view: &JitCompileSnapshot, byte_pc: u32) -> Option<
         return None;
     }
     let mut shapes = SmallVec::new();
-    let mut offset = None;
+    let mut location = None;
     for program in programs {
         let [
             JitCacheIrOp::GuardShape { object: 0, shape },
             JitCacheIrOp::GuardAtomSlot {
                 object: 0,
-                value_byte,
+                field,
                 writable: true,
                 ..
             },
             JitCacheIrOp::StoreField {
                 object: 0,
-                value_byte: store_byte,
+                field: store_byte,
             },
         ] = &*program.ops
         else {
             return None;
         };
-        if value_byte != store_byte {
+        if field != store_byte {
             return None;
         }
-        let byte = i32::try_from(*value_byte).ok()?;
-        if offset.is_some_and(|known| known != byte) {
+        i32::try_from(field.byte_offset()).ok()?;
+        if location.is_some_and(|known| known != *field) {
             return None;
         }
-        offset = Some(byte);
+        location = Some(*field);
         shapes.push(*shape);
     }
     Some(OwnDataLoad {
         shapes,
-        offset: offset?,
+        field: location?,
     })
 }
 
@@ -183,6 +183,12 @@ pub(crate) fn named_load_programs(
 /// slot, or appends the slot within the receiver's storage and publishes the
 /// child shape, with its prototype chain proved by validity cell, holder
 /// shapes or a null link.
+///
+/// An overflow append may need to allocate or grow the suffix slab: a
+/// receiver shape alone does not prove resident storage. The committed cached
+/// store owns that collecting miss; the noncollecting named specialization
+/// accepts only inline appends. Existing suffix-slot overwrites still
+/// specialize directly.
 pub(crate) fn named_store_programs(
     view: &JitCompileSnapshot,
     byte_pc: u32,
@@ -217,10 +223,8 @@ pub(crate) fn named_store_programs(
                     writable: true,
                     ..
                 } if !stored => {}
-                JitCacheIrOp::GuardExtensible {
-                    object: 0,
-                    value_byte,
-                } if !stored && value_byte % 8 == 0 => {}
+                JitCacheIrOp::GuardExtensible { object: 0, field }
+                    if !stored && field.is_inline() => {}
                 JitCacheIrOp::StoreField { object: 0, .. } if !stored => stored = true,
                 JitCacheIrOp::PublishShape { object: 0, .. } if stored => published = true,
                 _ => return None,
@@ -231,4 +235,47 @@ pub(crate) fn named_store_programs(
         }
     }
     Some(programs)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use otter_vm::object::FieldLocation;
+
+    #[test]
+    fn equal_displacements_in_different_banks_are_not_one_own_slot() {
+        let mut view = JitCompileSnapshot::without_feedback(1, 0, 1, Vec::new());
+        let program = |shape, field| otter_vm::JitCacheIrProgram {
+            ops: vec![
+                JitCacheIrOp::GuardShape { object: 0, shape },
+                JitCacheIrOp::GuardAtomSlot {
+                    object: 0,
+                    atom: 1,
+                    field,
+                    writable: false,
+                },
+                JitCacheIrOp::LoadField { object: 0, field },
+            ]
+            .into_boxed_slice(),
+        };
+        view.property_programs.insert(
+            0,
+            vec![
+                program(8, FieldLocation::inline(0)),
+                program(16, FieldLocation::overflow(0)),
+            ],
+        );
+        assert!(own_data_load(&view, 0).is_none());
+        view.property_programs.insert(
+            0,
+            vec![
+                program(8, FieldLocation::inline(0)),
+                program(16, FieldLocation::inline(0)),
+            ],
+        );
+        assert_eq!(
+            own_data_load(&view, 0).expect("same bank").field,
+            FieldLocation::inline(0)
+        );
+    }
 }

@@ -84,7 +84,7 @@ fn ctor_to_index(ctx: &mut NativeCtx<'_>, value: Option<&Value>) -> Result<usize
         })?;
     let number = ctx.with_turn_parts(|interp, stack| {
         crate::coerce::to_number_or_throw(interp, stack, &exec, value)
-            .map_err(|e| crate::native_function::vm_to_native_error(interp, e, "DataView"))
+            .map_err(|e| e.into_native(interp, "DataView"))
     })?;
     let n = number.as_f64();
     let integer = if n.is_nan() { 0.0 } else { n.trunc() };

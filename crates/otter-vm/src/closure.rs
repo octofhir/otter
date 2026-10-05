@@ -16,7 +16,7 @@
 //! - [`ClosureCallHeader`] — stable machine-facing call ABI prefix.
 //! - [`ClosureCallState`] — allocation-neutral VM call metadata.
 //! - [`JsClosureBody`] — GC body: the ABI prefix, the rare handle, the
-//!   constructor's last-receiver observation, then the bound values.
+//!   alignment padding, then the bound values.
 //! - [`JsClosure`] — 8-byte handle plus cached function id.
 //! - [`alloc_closure`] / [`alloc_closure_with_roots`] — allocators.
 //! - [`JS_CLOSURE_BODY_TYPE_TAG`] — reserved
@@ -25,8 +25,8 @@
 //! # Invariants
 //!
 //! - The machine-facing prefix is `#[repr(C)]`: native linkage reads
-//!   [`ClosureCallHeader`], the bound `this` word, the rare handle and the
-//!   last-receiver word only.
+//!   [`ClosureCallHeader`], the bound `this` word and traced rare handle;
+//!   the final four bytes are alignment padding.
 //! - [`ClosureCallHeader::context`] is a full 8-byte `Value` word holding a
 //!   context or `undefined`, fixed at creation. Generated code loads it with
 //!   one instruction and follows it without cage-base arithmetic.
@@ -41,7 +41,7 @@
 //! - The context, the rare handle and the bound values are traced; the
 //!   pending body carries the context and rare handle, and the allocator
 //!   roots the bound values until they are copied into the cell. The
-//!   last-receiver word is a weak observation cleared by every trace.
+//!   constructor layout families live in the rare record and contain no receiver.
 //!
 //! # See also
 //!
@@ -63,7 +63,6 @@ use otter_gc::GcHeap;
 use otter_gc::OutOfMemory;
 use otter_gc::heap::RootSlotVisitor;
 use otter_gc::raw::{RawGc, SlotVisitor};
-use std::cell::Cell;
 
 /// Reserved [`otter_gc::Traceable::TYPE_TAG`] for [`JsClosureBody`].
 pub const JS_CLOSURE_BODY_TYPE_TAG: u8 = 0x23;
@@ -170,11 +169,6 @@ pub struct JsClosureBody {
     pub call_header: ClosureCallHeader,
     /// Out-of-line state; null until the closure needs it.
     rare: ClosureRareHandle,
-    /// Weak observation of the receiver this closure last constructed, never
-    /// a root. Nonzero requires an entry in the pending-constructor ledger;
-    /// every trace clears it before movement. Generated allocation may
-    /// replace it only while that entry exists.
-    last_instance: Cell<JsObject>,
 }
 
 /// [`ClosureCallHeader::flags`] named-lookup bit: the function kind's default
@@ -245,9 +239,6 @@ pub const CLOSURE_BODY_CONTEXT_OFFSET: usize =
     CLOSURE_BODY_CALL_HEADER_OFFSET + CLOSURE_CALL_HEADER_CONTEXT_OFFSET;
 /// Byte offset of the rare-record handle in [`JsClosureBody`]'s payload.
 pub const CLOSURE_BODY_RARE_OFFSET: usize = std::mem::offset_of!(JsClosureBody, rare);
-/// Byte offset of the last-receiver observation in [`JsClosureBody`]'s payload.
-pub const CLOSURE_BODY_LAST_INSTANCE_OFFSET: usize =
-    std::mem::offset_of!(JsClosureBody, last_instance);
 /// Byte offset of the trailing bound `this` word, valid only when
 /// [`CLOSURE_CALL_FLAG_BOUND_THIS`] is set.
 pub const CLOSURE_BODY_BOUND_THIS_OFFSET: usize = std::mem::size_of::<JsClosureBody>();
@@ -269,7 +260,6 @@ const _: [(); 4] = [(); CLOSURE_CALL_HEADER_FLAGS_OFFSET];
 const _: [(); 8] = [(); CLOSURE_CALL_HEADER_CONTEXT_OFFSET];
 const _: [(); 0] = [(); CLOSURE_BODY_CALL_HEADER_OFFSET];
 const _: [(); 16] = [(); CLOSURE_BODY_RARE_OFFSET];
-const _: [(); 20] = [(); CLOSURE_BODY_LAST_INSTANCE_OFFSET];
 const _: [(); 24] = [(); CLOSURE_BODY_BOUND_THIS_OFFSET];
 const _: [(); 24] = [(); std::mem::size_of::<JsClosureBody>()];
 // The named-lookup byte is the flags word's top byte on a little-endian host.
@@ -292,7 +282,6 @@ impl JsClosureBody {
         Self {
             call_header: ClosureCallHeader::new(function_id, context, bound_this, bound_new_target),
             rare: ClosureRareHandle::null(),
-            last_instance: Cell::new(JsObject::null()),
         }
     }
 
@@ -306,7 +295,6 @@ impl JsClosureBody {
 
     fn trace_fixed_fields(&mut self, visitor: &mut SlotVisitor<'_>) {
         use crate::pelt::PeltField as _;
-        self.last_instance.set(JsObject::null());
         self.call_header.context.pelt_trace(visitor);
         if !self.rare.is_null() {
             visitor(&mut self.rare as *mut ClosureRareHandle as *mut RawGc);
@@ -358,24 +346,6 @@ impl JsClosureBody {
         } else {
             self.call_header.flags &= !flag;
         }
-    }
-
-    /// The constructor's last-receiver observation, if any.
-    pub(crate) fn observed_receiver(&self) -> Option<JsObject> {
-        let receiver = self.last_instance.get();
-        (!receiver.is_null()).then_some(receiver)
-    }
-
-    /// Take the last-receiver observation, leaving none.
-    pub(crate) fn take_receiver(&self) -> Option<JsObject> {
-        let receiver = self.last_instance.replace(JsObject::null());
-        (!receiver.is_null()).then_some(receiver)
-    }
-
-    /// Record `receiver` as the last one constructed; returns whether an
-    /// observation was already present.
-    pub(crate) fn replace_receiver(&self, receiver: JsObject) -> bool {
-        !self.last_instance.replace(receiver).is_null()
     }
 }
 
@@ -578,24 +548,25 @@ impl JsClosure {
         heap.with_payload(rare, |rare| rare.prototype_writable = false);
     }
 
-    /// The learned instance size recorded for this constructor closure.
-    pub(crate) fn learned_instance_fields(self, heap: &GcHeap) -> u16 {
-        self.with_rare(heap, |rare| rare.learned_instance_fields.get())
-            .unwrap_or(0)
+    /// Actual function-object constructor families. Sibling closures of the
+    /// same template own independent heads.
+    pub(crate) fn constructor_layouts(
+        self,
+        heap: &GcHeap,
+    ) -> crate::constructor_layout::ConstructorLayout {
+        self.with_rare(heap, |rare| rare.constructor_layouts)
+            .unwrap_or_else(crate::constructor_layout::ConstructorLayout::null)
     }
-
-    /// Raise the learned instance size; a closure without a rare record keeps
-    /// none (the function-keyed profile still records it).
-    pub(crate) fn raise_learned_instance_fields(self, heap: &GcHeap, learned: u16) {
-        let _ = self.with_rare(heap, |rare| {
-            rare.learned_instance_fields
-                .set(rare.learned_instance_fields.get().max(learned));
-        });
-    }
-
-    /// Overwrite the learned instance size.
-    pub(crate) fn set_learned_instance_fields(self, heap: &GcHeap, learned: u16) {
-        let _ = self.with_rare(heap, |rare| rare.learned_instance_fields.set(learned));
+    pub(crate) fn set_constructor_layouts(
+        self,
+        heap: &mut GcHeap,
+        layouts: crate::constructor_layout::ConstructorLayout,
+    ) {
+        let rare = self
+            .rare(heap)
+            .expect("constructor layout owner has a rare record");
+        heap.with_payload(rare, |body| body.constructor_layouts = layouts);
+        heap.record_write(rare, &layouts);
     }
 
     /// §10.1.3 `[[IsExtensible]]` for this closure instance.
@@ -976,7 +947,11 @@ mod tests {
         assert_eq!(CLOSURE_BODY_CALL_FLAGS_OFFSET, 4);
         assert_eq!(CLOSURE_BODY_CONTEXT_OFFSET, 8);
         assert_eq!(CLOSURE_BODY_RARE_OFFSET, 16);
-        assert_eq!(CLOSURE_BODY_LAST_INSTANCE_OFFSET, 20);
+        assert_eq!(
+            std::mem::size_of::<JsClosureBody>(),
+            CLOSURE_BODY_RARE_OFFSET + 8,
+            "the rare handle is followed only by immutable alignment padding"
+        );
         assert_eq!(CLOSURE_BODY_BOUND_THIS_OFFSET, 24);
         assert_eq!(CLOSURE_BODY_BOUND_NEW_TARGET_OFFSET, 32);
     }

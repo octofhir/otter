@@ -41,6 +41,7 @@
 
 use crate::abstract_ops::{self, ToPrimitiveHint};
 use crate::bigint::BigIntValue;
+use crate::native_abi::CommittedValueError;
 use crate::number::NumberValue;
 use crate::string::JsString;
 use crate::{ActivationStack, ExecutionContext, Interpreter, Value, VmError};
@@ -52,7 +53,7 @@ impl Interpreter {
         stack: &mut ActivationStack,
         context: &ExecutionContext,
         input: &Value,
-    ) -> Result<String, VmError> {
+    ) -> Result<String, CommittedValueError> {
         to_string_or_throw(self, stack, context, input)
     }
 
@@ -63,7 +64,7 @@ impl Interpreter {
         stack: &mut ActivationStack,
         context: &ExecutionContext,
         input: &Value,
-    ) -> Result<NumberValue, VmError> {
+    ) -> Result<NumberValue, CommittedValueError> {
         to_number_or_throw(self, stack, context, input)
     }
 
@@ -74,7 +75,7 @@ impl Interpreter {
         stack: &mut ActivationStack,
         context: &ExecutionContext,
         input: &Value,
-    ) -> Result<NumberValue, VmError> {
+    ) -> Result<NumberValue, CommittedValueError> {
         to_number_for_number_ctor(self, stack, context, input)
     }
 
@@ -86,7 +87,7 @@ impl Interpreter {
         context: &ExecutionContext,
         input: &Value,
         hint: ToPrimitiveHint,
-    ) -> Result<Value, VmError> {
+    ) -> Result<Value, CommittedValueError> {
         to_primitive_or_throw(self, stack, context, input, hint)
     }
 }
@@ -100,7 +101,7 @@ pub(crate) fn to_primitive_or_throw(
     context: &ExecutionContext,
     input: &Value,
     hint: ToPrimitiveHint,
-) -> Result<Value, VmError> {
+) -> Result<Value, CommittedValueError> {
     if abstract_ops::is_primitive(input) {
         return Ok(*input);
     }
@@ -120,13 +121,14 @@ pub(crate) fn to_string_or_throw(
     stack: &mut ActivationStack,
     context: &ExecutionContext,
     input: &Value,
-) -> Result<String, VmError> {
+) -> Result<String, CommittedValueError> {
     let primitive = if abstract_ops::is_primitive(input) {
         *input
     } else {
         interp.evaluate_to_primitive(stack, context, input, ToPrimitiveHint::String)?
     };
     primitive_to_string_lossy(interp, &primitive)
+        .map_err(|error| CommittedValueError::JavaScript(error.into()))
 }
 
 /// §7.1.17 `ToString` restricted to primitive operands — the re-entry-free
@@ -172,25 +174,26 @@ pub(crate) fn to_js_string_units(
     stack: &mut ActivationStack,
     context: Option<&ExecutionContext>,
     input: &Value,
-) -> Result<Vec<u16>, VmError> {
+) -> Result<Vec<u16>, CommittedValueError> {
     let primitive = if abstract_ops::is_primitive(input) {
         *input
     } else if let Some(context) = context {
         interp.evaluate_to_primitive(stack, context, input, ToPrimitiveHint::String)?
     } else {
-        return Err(interp.err_type(
+        return Err(CommittedValueError::JavaScript(interp.err_type(
             ("cannot coerce an object to a string without an execution context".to_string()).into(),
-        ));
+        )));
     };
     if primitive.is_symbol() {
-        return Err(
-            interp.err_type(("Cannot convert a Symbol value to a string".to_string()).into())
-        );
+        return Err(CommittedValueError::JavaScript(interp.err_type(
+            ("Cannot convert a Symbol value to a string".to_string()).into(),
+        )));
     }
     if let Some(s) = primitive.as_string(&interp.gc_heap) {
         return Ok(s.with_utf16(&interp.gc_heap, <[u16]>::to_vec));
     }
-    let rendered = primitive_to_string_lossy(interp, &primitive)?;
+    let rendered = primitive_to_string_lossy(interp, &primitive)
+        .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
     Ok(rendered.encode_utf16().collect())
 }
 
@@ -203,16 +206,16 @@ pub(crate) fn to_js_string_or_throw(
     stack: &mut ActivationStack,
     context: &ExecutionContext,
     input: &Value,
-) -> Result<JsString, VmError> {
+) -> Result<JsString, CommittedValueError> {
     let primitive = if abstract_ops::is_primitive(input) {
         *input
     } else {
         interp.evaluate_to_primitive(stack, context, input, ToPrimitiveHint::String)?
     };
     if primitive.is_symbol() {
-        return Err(
-            interp.err_type(("Cannot convert a Symbol value to a string".to_string()).into())
-        );
+        return Err(CommittedValueError::JavaScript(interp.err_type(
+            ("Cannot convert a Symbol value to a string".to_string()).into(),
+        )));
     }
     if let Some(s) = primitive.as_string(&interp.gc_heap) {
         return Ok(s);
@@ -230,7 +233,8 @@ pub(crate) fn to_js_string_or_throw(
     } else {
         primitive.display_string(&interp.gc_heap)
     };
-    JsString::from_str(&rendered, interp.gc_heap_mut()).map_err(Into::into)
+    JsString::from_str(&rendered, interp.gc_heap_mut())
+        .map_err(|error| CommittedValueError::JavaScript(error.into()))
 }
 
 /// §7.1.4 `ToNumber(argument)`. Symbol and BigInt operands surface
@@ -241,13 +245,14 @@ pub(crate) fn to_number_or_throw(
     stack: &mut ActivationStack,
     context: &ExecutionContext,
     input: &Value,
-) -> Result<NumberValue, VmError> {
+) -> Result<NumberValue, CommittedValueError> {
     let primitive = if abstract_ops::is_primitive(input) {
         *input
     } else {
         interp.evaluate_to_primitive(stack, context, input, ToPrimitiveHint::Number)?
     };
     primitive_to_number(interp, &primitive)
+        .map_err(|error| CommittedValueError::JavaScript(error.into()))
 }
 
 /// §7.1.3 `ToNumeric(value)`: a Number or BigInt value. Objects flow
@@ -257,7 +262,7 @@ pub(crate) fn to_numeric_or_throw(
     stack: &mut ActivationStack,
     context: &ExecutionContext,
     input: &Value,
-) -> Result<Value, VmError> {
+) -> Result<Value, CommittedValueError> {
     if input.is_number() || input.is_big_int() {
         return Ok(*input);
     }
@@ -269,7 +274,9 @@ pub(crate) fn to_numeric_or_throw(
     if primitive.is_number() || primitive.is_big_int() {
         return Ok(primitive);
     }
-    primitive_to_number(interp, &primitive).map(Value::number)
+    primitive_to_number(interp, &primitive)
+        .map(Value::number)
+        .map_err(|error| CommittedValueError::JavaScript(error.into()))
 }
 
 /// §7.1.4 `ToNumber` restricted to primitive operands — the
@@ -303,11 +310,11 @@ pub(crate) fn to_number_for_number_ctor(
     stack: &mut ActivationStack,
     context: &ExecutionContext,
     input: &Value,
-) -> Result<NumberValue, VmError> {
+) -> Result<NumberValue, CommittedValueError> {
     if input.is_symbol() {
-        return Err(
-            interp.err_type(("Cannot convert a Symbol value to a number".to_string()).into())
-        );
+        return Err(CommittedValueError::JavaScript(interp.err_type(
+            ("Cannot convert a Symbol value to a number".to_string()).into(),
+        )));
     }
     if let Some(b) = input.as_big_int() {
         let f = b
@@ -322,9 +329,9 @@ pub(crate) fn to_number_for_number_ctor(
         interp.evaluate_to_primitive(stack, context, input, ToPrimitiveHint::Number)?
     };
     if primitive.is_symbol() {
-        return Err(
-            interp.err_type(("Cannot convert a Symbol value to a number".to_string()).into())
-        );
+        return Err(CommittedValueError::JavaScript(interp.err_type(
+            ("Cannot convert a Symbol value to a number".to_string()).into(),
+        )));
     }
     if let Some(b) = primitive.as_big_int() {
         let f = b
@@ -356,7 +363,7 @@ pub(crate) fn to_length_or_throw(
     stack: &mut ActivationStack,
     context: &crate::ExecutionContext,
     value: &crate::Value,
-) -> Result<usize, crate::VmError> {
+) -> Result<usize, CommittedValueError> {
     let number = to_number_or_throw(interp, stack, context, value)?;
     let n = number.as_f64();
     if n.is_nan() || n <= 0.0 {
@@ -370,7 +377,7 @@ pub(crate) fn to_big_int_or_throw(
     stack: &mut ActivationStack,
     context: &ExecutionContext,
     input: &Value,
-) -> Result<BigIntValue, VmError> {
+) -> Result<BigIntValue, CommittedValueError> {
     let primitive = if abstract_ops::is_primitive(input) {
         *input
     } else {
@@ -381,22 +388,31 @@ pub(crate) fn to_big_int_or_throw(
     }
     if let Some(b) = primitive.as_boolean() {
         return BigIntValue::from_i32(&mut interp.gc_heap, if b { 1 } else { 0 })
-            .map_err(crate::oom_to_vm);
+            .map_err(crate::oom_to_vm)
+            .map_err(|error| CommittedValueError::JavaScript(error.into()));
     }
     if let Some(s) = primitive.as_string(&interp.gc_heap) {
         let text = s.to_lossy_string(&interp.gc_heap);
-        let parsed = abstract_ops::string_to_big_int(&text).ok_or_else(|| {
-            interp.err_syntax((format!("Cannot convert {text:?} to a BigInt")).into())
-        })?;
-        return BigIntValue::from_inner(&mut interp.gc_heap, parsed).map_err(crate::oom_to_vm);
+        let parsed = abstract_ops::string_to_big_int(&text)
+            .ok_or_else(|| {
+                interp.err_syntax((format!("Cannot convert {text:?} to a BigInt")).into())
+            })
+            .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+        return BigIntValue::from_inner(&mut interp.gc_heap, parsed)
+            .map_err(crate::oom_to_vm)
+            .map_err(|error| CommittedValueError::JavaScript(error.into()));
     }
     if primitive.is_number() {
-        return Err(interp.err_type(("Cannot convert a Number to a BigInt".to_string()).into()));
+        return Err(CommittedValueError::JavaScript(interp.err_type(
+            ("Cannot convert a Number to a BigInt".to_string()).into(),
+        )));
     }
     if primitive.is_symbol() {
-        return Err(
-            interp.err_type(("Cannot convert a Symbol value to a BigInt".to_string()).into())
-        );
+        return Err(CommittedValueError::JavaScript(interp.err_type(
+            ("Cannot convert a Symbol value to a BigInt".to_string()).into(),
+        )));
     }
-    Err(interp.err_type(("Cannot convert value to a BigInt".to_string()).into()))
+    Err(CommittedValueError::JavaScript(interp.err_type(
+        ("Cannot convert value to a BigInt".to_string()).into(),
+    )))
 }

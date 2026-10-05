@@ -181,6 +181,12 @@ pub enum RemoteModuleResponse {
 #[derive(Debug, Clone, thiserror::Error, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum RemoteModuleError {
+    /// The original resource refusal while retaining the streamed source.
+    #[error("{error}")]
+    Resource {
+        /// Exact shared-ledger cause.
+        error: otter_resource::ResourceError,
+    },
     /// The runtime or caller cancelled the operation.
     #[error("remote module load cancelled")]
     Cancelled,
@@ -192,6 +198,18 @@ pub enum RemoteModuleError {
         /// Owned provider diagnostic.
         message: String,
     },
+}
+
+impl RemoteModuleError {
+    pub(crate) fn source_error(url: &str, error: otter_resource::SharedSourceError) -> Self {
+        match error {
+            otter_resource::SharedSourceError::Resource(error) => Self::Resource { error },
+            error => Self::Fetch {
+                url: url.to_owned(),
+                message: error.to_string(),
+            },
+        }
+    }
 }
 
 /// Boxed provider future carrying owned data only.
@@ -314,16 +332,23 @@ pub(crate) fn read_file_bytes_accounted(
     let mut builder = otter_resource::SharedSourceBuilder::new(account);
     builder
         .read_from(&mut file)
-        .map_err(|error| LoaderError::Load {
-            url: url.to_string(),
-            message: format!("bounded read failed: {error}"),
-        })?;
+        .map_err(|error| LoaderError::source_error(url, error))?;
     Ok(builder.finish_bytes())
 }
 
 impl LoaderError {
     /// Map into the public runtime error through the shared graph-error
     /// diagnostics path.
+    pub(crate) fn source_error(url: &str, error: otter_resource::SharedSourceError) -> Self {
+        match error {
+            otter_resource::SharedSourceError::Resource(error) => Self::Resource { error },
+            error => Self::Load {
+                url: url.to_owned(),
+                message: format!("source admission failed: {error}"),
+            },
+        }
+    }
+
     pub(crate) fn into_otter_error(self) -> crate::OtterError {
         crate::map_graph_error(crate::module_graph::GraphError::Loader(self))
     }
@@ -335,10 +360,8 @@ pub(crate) fn admit_source(
     url: &str,
     text: String,
 ) -> Result<otter_resource::SharedSource, LoaderError> {
-    otter_resource::SharedSource::admit(account, text).map_err(|error| LoaderError::Load {
-        url: url.to_string(),
-        message: format!("source admission failed: {error}"),
-    })
+    otter_resource::SharedSource::admit(account, text)
+        .map_err(|error| LoaderError::source_error(url, error))
 }
 
 /// Percent-decode a `data:` payload, leaving anything that is not a valid
@@ -650,6 +673,12 @@ pub enum LoaderPackageDependencyKind {
 #[derive(Debug, Clone, thiserror::Error, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum LoaderError {
+    /// The shared ledger refused the exact retained source request.
+    #[error("{error}")]
+    Resource {
+        /// Original owned resource cause; no JavaScript error is synthesized.
+        error: otter_resource::ResourceError,
+    },
     /// Specifier shape is not supported by this loader (e.g. bare
     /// `lodash` against the foundation file-only loader).
     #[error("unsupported specifier shape: {specifier}")]
@@ -1251,13 +1280,8 @@ impl ModuleLoader {
             url: url.clone(),
             message: e.to_string(),
         })?;
-        let text =
-            otter_resource::SharedSource::read_utf8(&account, &mut file).map_err(|error| {
-                LoaderError::Load {
-                    url: url.clone(),
-                    message: format!("bounded source read failed: {error}"),
-                }
-            })?;
+        let text = otter_resource::SharedSource::read_utf8(&account, &mut file)
+            .map_err(|error| LoaderError::source_error(&url, error))?;
         Ok(ResolvedSource {
             url,
             kind,

@@ -11,7 +11,7 @@
 //!
 //! # Contents
 //!
-//! - [`render_html`] — the only public entry point: `Baseline → String`.
+//! - [`render_html`] — the only public entry point: validated `Baseline → HTML`.
 //!
 //! # Invariants
 //!
@@ -28,13 +28,13 @@
 
 use std::fmt::Write as _;
 
-use crate::report::Baseline;
+use crate::report::{Baseline, ReportError};
 
-/// Render the whole dashboard page.
-#[must_use]
-pub fn render_html(baseline: &Baseline) -> String {
+/// Render the whole dashboard page, rejecting an invalid canonical report.
+pub fn render_html(baseline: &Baseline) -> Result<String, ReportError> {
+    baseline.validate()?;
     let json = serde_json::to_string(baseline)
-        .unwrap_or_else(|_| "{}".to_string())
+        .map_err(ReportError::Json)?
         // Keep report text from terminating the data island.
         .replace("</", "<\\/");
 
@@ -54,7 +54,7 @@ pub fn render_html(baseline: &Baseline) -> String {
     );
     out.push_str(SCRIPT);
     out.push_str("</script>\n</body>\n</html>\n");
-    out
+    Ok(out)
 }
 
 const STYLE: &str = r#"
@@ -108,7 +108,7 @@ const DATA = JSON.parse(document.getElementById("data").textContent);
 function emptyTotals(){return {total:0,passed:0,failed:0,skipped:0,crashed:0,timed_out:0,oom:0};}
 function addTotals(a,b){for(const k of Object.keys(a))a[k]+=b[k]||0;}
 const root={name:"",totals:emptyTotals(),kids:new Map()};
-for(const [section,t] of Object.entries(DATA.by_section||{})){
+for(const [section,t] of Object.entries(DATA.by_section)){
   addTotals(root.totals,t);
   let node=root;
   for(const seg of section.split("/")){
@@ -119,7 +119,10 @@ for(const [section,t] of Object.entries(DATA.by_section||{})){
 }
 // Failing tests grouped by their (three-segment) section.
 const fails=new Map();
-for(const f of DATA.failing_tests||[]){
+for(const test of DATA.tests){
+  const outcome=test.outcome;
+  if(outcome.kind==="pass"||outcome.kind==="skipped")continue;
+  const f={path:test.path,outcome:outcome.kind==="out_of_memory"?"oom":outcome.kind,reason:outcome.kind==="fail"?outcome.reason:outcome.kind==="crash"?outcome.panic:outcome.kind==="timeout"?`timeout after ${outcome.ms} ms`:`oom: ${outcome.bytes} bytes requested`,stack:outcome.stack};
   const seg=f.path.split("/");
   const key=seg.slice(0,Math.min(3,seg.length)).join("/");
   if(!fails.has(key))fails.set(key,[]);
@@ -148,7 +151,9 @@ function failTable(rows){
     const td1=el("td");td1.appendChild(el("span","badge o-"+f.outcome,f.outcome));tr.appendChild(td1);
     const td2=el("td");const a=el("a");a.href=testUrl(f.path);a.target="_blank";a.rel="noopener";
     const cd=el("code",null,f.path);a.appendChild(cd);td2.appendChild(a);tr.appendChild(td2);
-    tr.appendChild(el("td","reason",f.reason));
+    const detail=el("td","reason",f.reason);
+    if(f.stack){const stack=el("details");stack.appendChild(el("summary",null,"Engine stack"));stack.appendChild(el("pre",null,f.stack));detail.appendChild(stack);}
+    tr.appendChild(detail);
     body.appendChild(tr);
   }
   tb.appendChild(body);
@@ -206,7 +211,7 @@ function renderTree(filter){
 
 // ---- header ----------------------------------------------------------
 (function(){
-  const t=DATA.totals||emptyTotals();
+  const t=DATA.totals;
   const hero=document.getElementById("hero");
   const meta=el("p","meta");
   meta.innerHTML="Engine <code>"+String(DATA.engine_commit||"?").slice(0,12)
@@ -239,25 +244,45 @@ mod tests {
     use crate::report::Baseline;
 
     fn synth() -> Baseline {
-        let json = r#"{
-            "test262_commit": "abc",
-            "engine_commit": "def",
-            "ran_at": "2026-06-04T00:00:00Z",
-            "totals": {"total": 3, "passed": 1, "failed": 1, "skipped": 1, "crashed": 0, "timed_out": 0, "oom": 0},
-            "by_section": {
-                "built-ins/Math/abs": {"total": 2, "passed": 1, "failed": 1, "skipped": 0, "crashed": 0, "timed_out": 0, "oom": 0},
-                "language/expressions/addition": {"total": 1, "passed": 0, "failed": 0, "skipped": 1, "crashed": 0, "timed_out": 0, "oom": 0}
-            },
-            "failing_tests": [
-                {"path": "built-ins/Math/abs/nan.js", "outcome": "fail", "reason": "expected </script><b>NaN</b>"}
-            ]
-        }"#;
-        serde_json::from_str(json).unwrap()
+        use crate::results::{Outcome, SkipReason, TestResult};
+        let rows = [
+            ("built-ins/Math/abs/finite.js", Outcome::Pass),
+            (
+                "built-ins/Math/abs/nan.js",
+                Outcome::Fail {
+                    reason: "expected </script><b>NaN</b>".to_owned(),
+                    stack: Some("full stack".to_owned()),
+                },
+            ),
+            (
+                "language/expressions/addition/skip.js",
+                Outcome::Skipped {
+                    reason: SkipReason::MissingFrontmatter,
+                },
+            ),
+        ]
+        .into_iter()
+        .map(|(path, outcome)| TestResult {
+            path: path.to_owned(),
+            esid: None,
+            features: vec![],
+            outcome,
+            wall_ms: 1,
+        })
+        .collect();
+        Baseline::from_results(
+            rows,
+            crate::provenance::synthetic(),
+            "abc",
+            "def",
+            "2026-06-04T00:00:00Z",
+        )
+        .unwrap()
     }
 
     #[test]
     fn embeds_report_as_escaped_data_island() {
-        let html = render_html(&synth());
+        let html = render_html(&synth()).unwrap();
         // Data island present and `</` is escaped so the reason text
         // cannot terminate the script element.
         assert!(html.contains(r#"<script id="data" type="application/json">"#));
@@ -266,8 +291,15 @@ mod tests {
     }
 
     #[test]
+    fn invalid_report_cannot_publish_an_empty_dashboard() {
+        let mut baseline = synth();
+        baseline.totals.passed += 1;
+        assert!(render_html(&baseline).is_err());
+    }
+
+    #[test]
     fn page_is_self_contained() {
-        let html = render_html(&synth());
+        let html = render_html(&synth()).unwrap();
         assert!(!html.contains("src=\"http"));
         assert!(!html.contains("href=\"http"));
         assert!(!html.contains("@import"));
@@ -276,7 +308,7 @@ mod tests {
 
     #[test]
     fn sections_and_totals_reach_the_client_model() {
-        let html = render_html(&synth());
+        let html = render_html(&synth()).unwrap();
         assert!(html.contains("built-ins/Math/abs"));
         assert!(html.contains("\"passed\":1"));
     }

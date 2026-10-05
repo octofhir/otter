@@ -10,6 +10,10 @@
 //! Number.parseInt`) plus the legacy `globalThis.eval` / `escape`
 //! reflective bindings.
 //!
+//!
+//! Native coercion and callback failures finish through the existing committed
+//! completion owner: local allocation refusals retain their authored native OOM
+//! facts, while completed terminal failures retain exact detail and source frames.
 //! # See also
 //! - <https://tc39.es/ecma262/#sec-number-objects>
 
@@ -63,7 +67,7 @@ fn pin_number_data_and_globals(
 ) -> Result<(), JsSurfaceError> {
     let descriptor = ctor
         .own_property_descriptor(heap, "prototype")
-        .map_err(|_| JsSurfaceError::OutOfMemory)?;
+        .map_err(JsSurfaceError::from)?;
     let mut prototype = match descriptor.and_then(|d| match d.kind {
         crate::object::DescriptorKind::Data { value } => value.as_object(),
         _ => None,
@@ -75,7 +79,7 @@ fn pin_number_data_and_globals(
         &mut prototype,
         heap,
         crate::number::NumberValue::from_i32(0),
-    );
+    )?;
 
     let global_root = Value::object(global);
     let global_methods: &[(&'static str, u8, crate::native_function::NativeFastFn)] = &[
@@ -113,7 +117,7 @@ fn pin_number_data_and_globals(
             // Overwrite the static with the global binding so identity
             // holds. Configurable so the redefine succeeds.
             let desc = crate::object::PropertyDescriptor::data(global_fn, true, false, true);
-            if !ctor.define_own_property(heap, shared, desc) {
+            if !ctor.define_own_property(heap, shared, desc)? {
                 return Err(JsSurfaceError::DefinePropertyFailed(shared));
             }
         }
@@ -139,40 +143,12 @@ fn number_ctor_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Na
         let result = ctx.with_turn_parts(|interp, stack| {
             interp.number_for_number_ctor(stack, &context, &args[0])
         });
-        match result {
-            Ok(v) => v,
-            Err(crate::VmError::TypeError) => {
-                let message = match ctx.cx.interp.take_error_detail() {
-                    Some(crate::run_control::ErrorDetail::Message(m)) => m,
-                    _ => Default::default(),
-                };
-                return Err(NativeError::TypeError {
-                    name: "Number",
-                    reason: message.into(),
-                });
-            }
-            Err(crate::VmError::Uncaught) => {
-                let value = match ctx.cx.interp.take_error_detail() {
-                    Some(crate::run_control::ErrorDetail::Uncaught(m)) => m,
-                    _ => Default::default(),
-                };
-                return Err(NativeError::Thrown {
-                    name: "Number",
-                    message: value.into(),
-                });
-            }
-            Err(other) => {
-                return Err(NativeError::TypeError {
-                    name: "Number",
-                    reason: other.to_string(),
-                });
-            }
-        }
+        result.map_err(|error| error.into_native(ctx.interp_mut(), "Number"))?
     };
     if ctx.is_construct_call() {
         let this = *ctx.this_value();
         if let Some(mut obj) = this.as_object() {
-            crate::object::set_number_data(&mut obj, ctx.heap_mut(), value);
+            crate::object::set_number_data(&mut obj, ctx.heap_mut(), value)?;
             Ok(Value::object(obj))
         } else {
             Err(NativeError::TypeError {
@@ -233,7 +209,7 @@ pub(crate) fn number_parse_int_native(
     let s = ctx.with_turn_parts(|interp, stack| {
         interp
             .coerce_to_string(stack, &context, &arg)
-            .map_err(|e| crate::native_function::vm_to_native_error(interp, e, "parseInt"))
+            .map_err(|e| e.into_native(interp, "parseInt"))
     })?;
     // §19.2.5 step 4: `R = ? ToInt32(radix)` — coerce the radix after
     // the string so a user `valueOf` on the radix fires in spec order.
@@ -243,7 +219,7 @@ pub(crate) fn number_parse_int_native(
             let num = ctx.with_turn_parts(|interp, stack| {
                 interp
                     .coerce_to_number(stack, &context, radix)
-                    .map_err(|e| crate::native_function::vm_to_native_error(interp, e, "parseInt"))
+                    .map_err(|e| e.into_native(interp, "parseInt"))
             })?;
             crate::number::bitwise::to_int32(num)
         }
@@ -262,7 +238,7 @@ fn number_parse_float_native(
     let s = ctx.with_turn_parts(|interp, stack| {
         interp
             .coerce_to_string(stack, &context, &arg)
-            .map_err(|e| crate::native_function::vm_to_native_error(interp, e, "parseFloat"))
+            .map_err(|e| e.into_native(interp, "parseFloat"))
     })?;
     Ok(Value::number(crate::number::parse::parse_float(&s)))
 }
@@ -312,7 +288,7 @@ fn coerce_first_to_string_value(
                 &arg,
                 crate::abstract_ops::ToPrimitiveHint::String,
             )
-            .map_err(|e| crate::native_function::vm_to_native_error(interp, e, name))
+            .map_err(|e| e.into_native(interp, name))
     })?;
     if prim.is_symbol() {
         return Err(NativeError::TypeError {
@@ -419,7 +395,7 @@ fn global_is_nan(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Nativ
     let num = ctx.with_turn_parts(|interp, stack| {
         interp
             .coerce_to_number(stack, &context, &arg)
-            .map_err(|e| crate::native_function::vm_to_native_error(interp, e, "isNaN"))
+            .map_err(|e| e.into_native(interp, "isNaN"))
     })?;
     Ok(Value::boolean(num.as_f64().is_nan()))
 }
@@ -433,7 +409,7 @@ fn global_is_finite(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Na
     let num = ctx.with_turn_parts(|interp, stack| {
         interp
             .coerce_to_number(stack, &context, &arg)
-            .map_err(|e| crate::native_function::vm_to_native_error(interp, e, "isFinite"))
+            .map_err(|e| e.into_native(interp, "isFinite"))
     })?;
     Ok(Value::boolean(num.as_f64().is_finite()))
 }

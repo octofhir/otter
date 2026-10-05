@@ -6,19 +6,35 @@ Test262 conformance runner for the new-engine
 This crate speaks the active `otter-runtime` / `otter-vm` ABI and is the
 project's Test262 runner.
 
-## Status
+## Reports and publication
 
-- **Slice 101 (this slice)** — corpus traversal, `--dry-run`,
-  refusal-to-launch when `vendor/test262/` is missing.
-- **Slice 102** — YAML frontmatter parser, harness loader,
-  `feature_map.rs`, `parse` subcommand.
-- **Slice 103** — per-test driver, `Outcome` enum, watchdog +
-  heap-cap + `catch_unwind` hardening, worker process isolation,
-  curated bring-up subset.
-- **Slice 104** — JSON + Markdown writers, `diff <previous>`,
-  sharding (`--shard N/M`), supervisor + cursor persistence.
-- **Slice 105** — GitHub Actions integration, PR-comment template,
-  baseline-bump workflow.
+The one current JSON report owns `tests: Vec<TestResult>`, with every selected
+path, esid, features, complete outcome diagnostics and elapsed milliseconds.
+`totals` and `by_section` derive from those rows and are checked on loading.
+Skips contain a typed `reason`: feature, flag, ignored pattern, known-panic
+pattern, source-size bound, missing frontmatter or no strictness variant.
+There is no aggregate-only reader or inferred pass for an absent path.
+
+`runner` identifies the actual worker executable by SHA-256, Cargo target and
+Rust debug assertions. `semantic_config` records effective timeout, heap cap,
+tier, snapshot mode and ordered skip lists; whitelisted inherited GC controls
+are represented by value digests. No arbitrary environment values are saved.
+The parent freezes config before worker launch and rejects malformed JSONL,
+wrong indices or paths, duplicate rows and unexpected holes in a worker prefix.
+
+`merge`, `site` and `conformance` require the exact full pinned corpus, matching
+runner provenance and unique paths across every outcome. `just test262-site`
+and `just test262-conformance` both use the same release runner as full-run.
+For a checked capture, invoke `site` or `conformance` with the retained checked
+runner directly; rebuilding or selecting another profile requires a new capture. A missing/crashed batch
+prevents publication. The full-run script uses `--jobs 1` and a finite outer
+batch watchdog (`BATCH_TIMEOUT`, default 3600 seconds). `diff` compares exact identical selections and semantic
+conditions, retains both executable identities, and rejects new/changed skips
+as regressions. Intentional engine binary changes remain comparable.
+
+The old public aggregate report is unpublished until a genuine complete report
+is generated. Historical numbers in `ES_CONFORMANCE.md` remain historical
+measurements; omitted rows are not fabricated.
 
 ## Quick start
 
@@ -26,9 +42,8 @@ project's Test262 runner.
 # One-time: vendor the test262 corpus (a git submodule).
 git submodule update --init --recursive vendor/test262
 
-# Walk the corpus without executing anything (slice 101).
+# Walk the corpus without executing anything .
 cargo run -p otter-test262 -- run --dry-run
-# total: 51234
 
 # `just` shortcut.
 just test262-dry
@@ -67,7 +82,7 @@ The runner runs under three layers of protection:
 1. **In-engine cooperative cancellation.** Per-test wall-clock
    budget; a watchdog thread trips
    `Interpreter::interrupt_handle().interrupt()` on fire. Defaults:
-   5 s for development, 30 s in CI. Override via `--timeout` /
+   5 s by default, up to 30 s. Override via `--timeout` /
    `OTTER_TEST262_TIMEOUT_MS`.
 2. **Per-test heap cap.** Default 512 MiB. Surfaces as a catchable
    `RangeError("out of memory: heap limit exceeded")` per the
@@ -75,7 +90,7 @@ The runner runs under three layers of protection:
    `--max-heap-bytes` / `OTTER_TEST262_HEAP_BYTES`.
 3. **Process-level wall + memory backstop.** Workers are forked
    processes; `bash scripts/test262-safe.sh` applies `ulimit -v`
-   on Linux. A hard-kill backstop fires at `2 × timeout`.
+   on Linux. The supervisor bounds both startup and periods without a completed test.
 
 Operator rules (ported from `MEMORY.md`):
 
@@ -83,8 +98,8 @@ Operator rules (ported from `MEMORY.md`):
   the host memory budget.
 - **Never** run with timeouts longer than 30 s per test unless
   explicitly asked (`feedback_no_long_test262.md`).
-- The runner refuses to launch on debug builds without
-  `--allow-debug` (slice 105).
+- Capture production evidence with the intended release or checked binary;
+  the report exposes its effective assertion setting.
 
 ## Spec links
 

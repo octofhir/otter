@@ -1,9 +1,12 @@
 //! Runtime-boundary coverage for owned, default-off JIT artifact bundles.
 //!
 //! # Contents
-//! - Template and optimizing OSR bundle contents.
+//! - Template and optimizing OSR bundle contents, including the join from
+//!   optimizing code-map instructions to their `optimized-ir.txt` nodes.
+//! - A self-consistent graph-pipeline bundle for a hot `Math.abs` loop.
 //! - Template method-inline guard/body/deopt subregions and compact scratch
 //!   layout metadata.
+//! - The single shared property action relocation across native probes.
 //! - Abrupt completion followed by explicit bundle draining.
 //! - Bundle ownership across full GC, later allocation, and nested JIT entry.
 //! - Async [`otter_runtime::Otter`] success and abrupt-failure transport.
@@ -34,7 +37,7 @@ function hot(limit) {
   }
   return total;
 }
-hot(96);
+hot(4096);
 "#;
 
 const NESTED_JIT: &str = r#"
@@ -46,7 +49,7 @@ function inner(limit) {
 
 function outer(limit) {
   let total = 0;
-  for (let i = 0; i < 12; i++) total += inner(limit + i);
+  for (let i = 0; i < 400; i++) total += inner(limit + i);
   return total;
 }
 
@@ -56,14 +59,14 @@ outer(48);
 const OPTIMIZING_OSR: &str = r#"
 function onceOverflow(limit) {
   let index = 0;
-  let total = 2147483000;
+  let total = 2147475455;
   while (index < limit) {
-    total = total + 100;
+    total = total + 1;
     index = index + 1;
   }
   return total;
 }
-String(onceOverflow(96));
+String(onceOverflow(16384));
 "#;
 
 const OPTIMIZING_MATH: &str = r#"
@@ -74,7 +77,7 @@ function sumAbsoluteOffsets(limit) {
   }
   return total;
 }
-String(sumAbsoluteOffsets(96));
+String(sumAbsoluteOffsets(4096));
 "#;
 
 #[cfg(target_arch = "aarch64")]
@@ -152,15 +155,9 @@ fn assert_assembly_is_symbolic(bundle: &JitArtifactBundle) {
         }),
         "instructions must carry exact code.bin offsets:\n{assembly}"
     );
-    let map = code_map(bundle);
-    let has_machine_scalar_region = map["regions"].as_array().is_some_and(|regions| {
-        regions
-            .iter()
-            .any(|region| region["kind"] == "machineScalarFunction")
-    });
     assert!(
-        (assembly.contains("pc=") && assembly.contains("tier-op=")) || has_machine_scalar_region,
-        "assembly must retain operation annotations or a Machine IR structural region:\n{assembly}"
+        assembly.contains("pc=") && assembly.contains("tier-op="),
+        "assembly must retain operation annotations:\n{assembly}"
     );
     let relocation_lines = assembly
         .lines()
@@ -266,6 +263,24 @@ fn first_tier_bundle(batch: &JitArtifactBatch, tier: JitDebugTier) -> &JitArtifa
         .unwrap_or_else(|| panic!("missing {tier:?} bundle in {batch:?}"))
 }
 
+fn own_bundle<'a>(
+    batch: &'a JitArtifactBatch,
+    tier: JitDebugTier,
+    function: &str,
+    module: &str,
+) -> &'a JitArtifactBundle {
+    batch
+        .bundles()
+        .iter()
+        .find(|bundle| {
+            let manifest = bundle.manifest();
+            manifest.tier() == tier
+                && manifest.function_name() == function
+                && manifest.module() == module
+        })
+        .unwrap_or_else(|| panic!("missing own {tier:?} {function} bundle in {batch:?}"))
+}
+
 fn bundle_relocation_target_kinds(bundle: &JitArtifactBundle) -> BTreeSet<String> {
     let document: serde_json::Value = serde_json::from_slice(
         bundle
@@ -287,7 +302,6 @@ fn bundle_relocation_target_kinds(bundle: &JitArtifactBundle) -> BTreeSet<String
         .collect()
 }
 
-#[cfg(target_arch = "aarch64")]
 fn relocation_target_kinds(batch: &JitArtifactBatch) -> BTreeSet<String> {
     batch
         .bundles()
@@ -306,9 +320,14 @@ fn template_osr_returns_a_current_owned_bundle_without_events() {
         )
         .expect("template OSR fixture");
     let batch = result.jit_artifacts().expect("enabled artifact batch");
-    let bundle = first_tier_bundle(batch, JitDebugTier::Template);
+    let bundle = own_bundle(
+        batch,
+        JitDebugTier::Template,
+        "hot",
+        "jit-artifact-template.js",
+    );
 
-    assert_eq!(result.completion_string(), "4560");
+    assert_eq!(result.completion_string(), "8386560");
     assert!(result.jit_debug_report().is_none());
     assert_eq!(bundle.manifest().module(), "jit-artifact-template.js");
     assert!(matches!(
@@ -565,9 +584,14 @@ fn optimizing_osr_returns_ir_deopt_and_safepoint_payloads() {
         )
         .expect("optimizing OSR fixture");
     let batch = result.jit_artifacts().expect("enabled artifact batch");
-    let bundle = first_tier_bundle(batch, JitDebugTier::Optimizing);
+    let bundle = own_bundle(
+        batch,
+        JitDebugTier::Optimizing,
+        "onceOverflow",
+        "jit-artifact-optimizing.js",
+    );
 
-    assert_eq!(result.completion_string(), "2147492600");
+    assert_eq!(result.completion_string(), "2147491839");
     assert!(matches!(
         bundle.manifest().entry(),
         JitDebugTarget::Osr { .. }
@@ -599,18 +623,8 @@ fn optimizing_osr_returns_ir_deopt_and_safepoint_payloads() {
                 .as_u64()
                 .expect("optimizer instruction operation index");
             assert!(
-                optimized_ir.contains(&format!("op={operation_index:04} ")),
+                optimized_ir.contains(&format!("  v{operation_index} = ")),
                 "code-map operation must join to optimized-ir.txt: {region}"
-            );
-        }
-        if region["kind"] == "blockPrelude" {
-            assert!(region["block"].is_u64(), "block prelude identity: {region}");
-        }
-        if region["kind"] == "fallthroughEdge" {
-            assert!(region["block"].is_u64(), "edge source identity: {region}");
-            assert!(
-                region["targetBlock"].is_u64(),
-                "edge target identity: {region}"
             );
         }
     }
@@ -618,7 +632,7 @@ fn optimizing_osr_returns_ir_deopt_and_safepoint_payloads() {
 }
 
 #[test]
-fn optimizing_math_artifact_inlines_guarded_int32_abs() {
+fn optimizing_math_artifact_comes_from_the_graph_pipeline() {
     let mut runtime = runtime_with_artifacts(JitSelection::ProductionTiered);
     let result = runtime
         .run_script(
@@ -627,41 +641,31 @@ fn optimizing_math_artifact_inlines_guarded_int32_abs() {
         )
         .expect("optimizing Math fixture");
     let batch = result.jit_artifacts().expect("enabled artifact batch");
-    let bundle = first_tier_bundle(batch, JitDebugTier::Optimizing);
-    let kinds = bundle_relocation_target_kinds(bundle);
-    let relocations = std::str::from_utf8(
-        bundle
-            .file(JitArtifactFileName::Relocations)
-            .expect("optimizing Math relocations")
-            .contents(),
-    )
-    .expect("optimizing Math relocations are UTF-8");
+    let bundle = own_bundle(
+        batch,
+        JitDebugTier::Optimizing,
+        "sumAbsoluteOffsets",
+        "jit-artifact-optimizing-math.js",
+    );
     let optimized_ir = std::str::from_utf8(
         bundle
             .file(JitArtifactFileName::OptimizedIr)
             .expect("optimizing Math IR")
             .contents(),
-    );
+    )
+    .expect("optimizing Math IR is UTF-8");
 
-    assert_eq!(result.completion_string(), "2544");
-    let optimized_ir = optimized_ir.expect("optimizing Math IR is UTF-8");
+    let expected: i64 = (0..4096_i64).map(|index| (index - 32).abs()).sum();
+    assert_eq!(result.completion_string(), expected.to_string());
     assert!(
-        optimized_ir.starts_with("; backend=otter-machine-ir scalar-function\n"),
-        "optimizing Math must use the current Machine pipeline: {}",
+        optimized_ir.starts_with("; otter graph\n"),
+        "optimizing Math must use the graph pipeline: {}",
         optimized_ir.lines().next().unwrap_or("<empty>")
     );
-    assert!(
-        kinds.contains("runtimeStub"),
-        "optimizing Math code still needs unrelated runtime entries: {kinds:?}"
-    );
-    assert!(
-        !relocations.contains("math_abs_leaf"),
-        "guarded Int32 Math.abs must complete without the Rust leaf ABI: {relocations}"
-    );
+    assert_bundle_is_self_consistent(bundle);
 }
 
 #[test]
-#[cfg(target_arch = "aarch64")]
 fn template_artifacts_type_every_active_non_stub_address_class() {
     let mut runtime = runtime_with_artifacts(JitSelection::Template);
     let result = runtime
@@ -676,13 +680,16 @@ function sumMany(a, b, c, d, e, f, g) {
   return a + b + c + d + e + f + g;
 }
 
-for (let warm = 0; warm < 64; warm++) {
+for (let warm = 0; warm < 5000; warm++) {
   sumMany(1, 2, 3, 4, 5, 6, 7);
 }
 
 // Seven construct arguments exceed the packed register lanes, so the
 // generic construct reads them from a template operand slice.
 function Wide(a, b, c, d, e, f, g) { this.sum = a + b + c + d + e + f + g; }
+for (let warm = 0; warm < 5000; warm++) {
+  new Wide(1, 2, 3, 4, 5, 6, 7);
+}
 
 function hot(limit) {
   const bias = 2;
@@ -692,7 +699,8 @@ function hot(limit) {
     const row = [1, 2, 3];
     total += receiver.value;
     total += row[0];
-    total += entries.get("key");
+    const get = entries.get;
+    total += get.call(entries, "key");
     total += addBias(i);
     total += sumMany(1, 2, 3, 4, 5, 6, 7);
     total += new Wide(1, 2, 3, 4, 5, 6, 7).sum;
@@ -700,7 +708,7 @@ function hot(limit) {
   return total;
 }
 
-String(hot(48));
+String(hot(4096));
 "#,
             ),
             "jit-artifact-target-classes.js",
@@ -708,20 +716,54 @@ String(hot(48));
         .expect("rich template relocation fixture");
     let batch = result.jit_artifacts().expect("enabled artifact batch");
     let kinds = relocation_target_kinds(batch);
+    let hot = own_bundle(
+        batch,
+        JitDebugTier::Template,
+        "hot",
+        "jit-artifact-target-classes.js",
+    );
+    let sum = own_bundle(
+        batch,
+        JitDebugTier::Template,
+        "sumMany",
+        "jit-artifact-target-classes.js",
+    );
+    assert_eq!(result.completion_string(), "8660992");
+    let relocations: serde_json::Value = serde_json::from_slice(
+        hot.file(JitArtifactFileName::Relocations)
+            .unwrap()
+            .contents(),
+    )
+    .unwrap();
+    assert!(
+        relocations["relocations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|relocation| {
+                relocation["target"]["kind"] == "functionEntryCell"
+                    && relocation["target"]["functionId"].as_u64()
+                        == Some(u64::from(sum.manifest().function_id()))
+            }),
+        "hot's Known edge must link the exact warmed sumMany function"
+    );
 
     for expected in [
         "runtimeStub",
-        "directCallEntryCell",
+        "functionEntryCell",
         "gcCageBase",
         "globalLexicalCell",
         "propertySourceCell",
-        "templateOperandSlice",
+        "propertyActionCacheTable",
         "guardedHeapReference",
     ] {
         assert!(
             kinds.contains(expected),
             "missing relocation target {expected}: {kinds:?}"
         );
+    }
+    for bundle in batch.bundles() {
+        assert_bundle_is_self_consistent(bundle);
     }
 }
 

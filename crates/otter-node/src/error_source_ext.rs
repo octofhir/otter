@@ -34,12 +34,12 @@ fn get_error_source_positions(
     args: &[Value],
 ) -> Result<Value, NativeError> {
     let error = args.first().copied().unwrap_or_else(Value::undefined);
-    let position = ctx.error_source_position(&error);
+    let position = ctx.error_source_position(&error)?;
     ctx.scope(|mut scope| {
         let result = scope.object()?;
         let (source_line, script_name, line_number, start_column) = match &position {
             Some(position) => (
-                position.source_line.as_str(),
+                position.source_line.as_ref(),
                 position.script_name.as_str(),
                 position.line_number,
                 position.start_column,

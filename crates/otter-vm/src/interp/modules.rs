@@ -7,7 +7,9 @@
 //!
 //! # Invariants
 //! Namespace objects are created lazily and cached per URL; module
-//! environments registered here are GC roots via the trace surface.
+//! environments registered here are GC roots via the trace surface. Namespace
+//! allocation failures retain their allocator cause and never publish a cache
+//! entry; absence means an unknown environment, not a failed allocation.
 //! Module init re-entry always appends above an [`ActivationFloor`] on the
 //! caller's rooted [`ActivationStack`]; it never publishes a second frame stack
 //! or snapshots register roots.
@@ -143,7 +145,7 @@ impl Interpreter {
             }
             stack.push(frame);
             let init_promise = if function.is_async {
-                let result = promise_dispatch::PromiseBuilder::with_context(context.clone())
+                let result = promise_dispatch::PromiseBuilder::with_context(Some(context.clone()))
                     .pending_stack_rooted(interp, stack, &[&env_value, &import_meta_value], &[])?;
                 let frame = stack.pending_mut().expect("init inputs were just queued");
                 interp.prepared_set_async_state(
@@ -208,8 +210,9 @@ impl Interpreter {
                         let interp = ncx.interp_mut();
                         let namespace = interp
                             .get_or_create_module_namespace(&url)
-                            .map(Value::object)
-                            .unwrap_or_else(Value::undefined);
+                            .map_err(NativeError::from)?
+                            .ok_or(NativeError::InvalidOperand)?;
+                        let namespace = Value::object(namespace);
                         let _ = interp.settle_dynamic_import(token, Ok(namespace));
                         Ok(Value::undefined())
                     },
@@ -228,7 +231,7 @@ impl Interpreter {
                     },
                 )?;
             let rejected_slot = this.push_iteration_anchor(on_rejected) - 1;
-            let capability = promise_dispatch::PromiseBuilder::with_context(context.clone())
+            let capability = promise_dispatch::PromiseBuilder::with_context(Some(context.clone()))
                 .capability_runtime_rooted(this, &[], &[])?;
             let gate = this
                 .iteration_anchor(gate_slot)
@@ -236,16 +239,13 @@ impl Interpreter {
                 .expect("anchored dynamic-import gate survives reaction allocation");
             let on_fulfilled = this.iteration_anchor(fulfilled_slot);
             let on_rejected = this.iteration_anchor(rejected_slot);
-            let async_context = this.async_context();
-            let outcome = crate::JsPromise::perform_then_with_context(
-                &gate,
-                &mut this.gc_heap,
+            let outcome = this.register_promise_reactions(
+                gate,
                 Some(on_fulfilled),
                 Some(on_rejected),
                 capability,
                 Some(context.clone()),
-                async_context,
-            );
+            )?;
             if let Some(job) = outcome.immediate_job {
                 this.microtasks.enqueue(job);
             }
@@ -372,24 +372,32 @@ impl Interpreter {
     /// environment of `target_url`, created on first use and cached so
     /// every `import * as ns` / re-export of the same module yields the
     /// identical object.
-    pub fn get_or_create_module_namespace(&mut self, target_url: &str) -> Option<JsObject> {
+    /// An unknown module environment returns `Ok(None)`. Allocation failure
+    /// retains the exact allocator cause and leaves the namespace cache empty.
+    ///
+    /// # Errors
+    /// Returns the actual namespace object's allocation error.
+    pub fn get_or_create_module_namespace(
+        &mut self,
+        target_url: &str,
+    ) -> Result<Option<JsObject>, otter_gc::OutOfMemory> {
         let target_rc: std::sync::Arc<str> = std::sync::Arc::from(target_url);
         if let Some(ns) = self.module_namespaces.get(&target_rc) {
-            return Some(*ns);
+            return Ok(Some(*ns));
         }
-        let env = *self.module_environments.get(&target_rc)?;
-        let ns = self
-            .alloc_module_namespace_object(env, target_rc.clone())
-            .ok()?;
+        let Some(env) = self.module_environments.get(&target_rc).copied() else {
+            return Ok(None);
+        };
+        let ns = self.alloc_module_namespace_object(env, target_rc.clone())?;
         self.module_namespaces.insert(target_rc, ns);
-        Some(ns)
+        Ok(Some(ns))
     }
 
     /// §10.4.6 namespace string-key resolution. Resolves `name` through
     /// `ns_obj`'s module §16.2.1.6 ResolveExport table to the live
-    /// binding value. Returns `Some(value)` when `name` is an exported
+    /// binding value. Returns `Ok(Some(value))` when `name` is an exported
     /// binding — the value may be the TDZ hole, which the caller maps to
-    /// a `ReferenceError` (§10.4.6.8 step 9). Returns `None` when `name`
+    /// a `ReferenceError` (§10.4.6.8 step 9). Returns `Ok(None)` when `name`
     /// is not exported. A re-exported / star-exported name resolves to
     /// the *defining* module's live environment, not a snapshot. The
     /// `"*namespace*"` binding (`export * as ns`) resolves to the
@@ -399,39 +407,51 @@ impl Interpreter {
         &mut self,
         ns_obj: JsObject,
         name: &str,
-    ) -> Option<Value> {
-        let url = crate::object::module_namespace_url(ns_obj, &self.gc_heap)?;
+    ) -> Result<Option<Value>, VmError> {
+        let Some(url) = crate::object::module_namespace_url(ns_obj, &self.gc_heap) else {
+            return Ok(None);
+        };
         self.resolve_module_binding(&url, name)
     }
 
     /// §16.2.1.6 ResolveExport + §9.1.1.5 GetBindingValue for one
     /// `(module_url, exported name)` pair. Returns the defining module's
     /// live binding value (possibly the TDZ hole), the defining module's
-    /// namespace object for the `"*namespace*"` sentinel, or `None` when
+    /// namespace object for the `"*namespace*"` sentinel, or `Ok(None)` when
     /// the name is not exported. Backs both the namespace MOP forks and
     /// [`Op::LoadImportBinding`]. Unmodeled (host) modules with no table
-    /// read their environment directly by name.
-    pub(crate) fn resolve_module_binding(&mut self, module_url: &str, name: &str) -> Option<Value> {
+    /// read their environment directly by name. Namespace creation failures
+    /// propagate as local allocation errors rather than becoming absent exports.
+    pub(crate) fn resolve_module_binding(
+        &mut self,
+        module_url: &str,
+        name: &str,
+    ) -> Result<Option<Value>, VmError> {
         if let Some(table) = self.module_resolved_exports.get(module_url) {
-            let (defmod, binding) = table.get(name)?.clone();
+            let Some((defmod, binding)) = table.get(name).cloned() else {
+                return Ok(None);
+            };
             if binding == "*namespace*" {
-                return self
-                    .get_or_create_module_namespace(&defmod)
-                    .map(Value::object);
+                return Ok(self
+                    .get_or_create_module_namespace(&defmod)?
+                    .map(Value::object));
             }
             if binding == "*deferred-namespace*" {
                 return self
                     .get_or_create_deferred_namespace(defmod)
-                    .ok()
-                    .map(Value::object);
+                    .map(|namespace| Some(Value::object(namespace)));
             }
-            let env = *self.module_environments.get(&defmod)?;
-            return Some(
+            let Some(env) = self.module_environments.get(&defmod).copied() else {
+                return Ok(None);
+            };
+            return Ok(Some(
                 crate::object::get(env, &self.gc_heap, &binding).unwrap_or_else(Value::hole),
-            );
+            ));
         }
-        let env = *self.module_environments.get(module_url)?;
-        crate::object::get(env, &self.gc_heap, name)
+        let Some(env) = self.module_environments.get(module_url).copied() else {
+            return Ok(None);
+        };
+        Ok(crate::object::get(env, &self.gc_heap, name))
     }
 
     /// Exported string names a namespace exposes — its ResolveExport
@@ -451,3 +471,7 @@ impl Interpreter {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "modules/namespace_tests.rs"]
+mod namespace_tests;

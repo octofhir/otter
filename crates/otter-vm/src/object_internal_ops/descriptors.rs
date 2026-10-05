@@ -8,10 +8,14 @@
 //!
 //! # Invariants
 //! - Proxy descriptor operations dispatch through their canonical traps.
+//! - GetOwnProperty and IsExtensible retain the actual optional source; each
+//!   bytecode function resolves its admitted owner without an ambient context.
+//!   Only actual unpopulated deferred namespace evaluation requires a source.
 //! - The receiver phase of `[[Set]]` roots receiver and value across the
 //!   potentially reentrant `[[GetOwnProperty]]` before defining the property.
 
 use crate::activation_stack::ActivationStack;
+use crate::native_abi::CommittedValueError;
 use crate::{
     ExecutionContext, Interpreter, Value, VmError, VmPropertyKey, abstract_ops, array,
     function_metadata, object, string,
@@ -22,25 +26,34 @@ impl Interpreter {
     pub(crate) fn ordinary_get_own_property_descriptor_value(
         &mut self,
         stack: &mut ActivationStack,
-        context: &ExecutionContext,
+        context: Option<&ExecutionContext>,
         target: Value,
         key: &VmPropertyKey,
         hops: usize,
-    ) -> Result<Option<object::PropertyDescriptor>, VmError> {
+    ) -> Result<Option<object::PropertyDescriptor>, CommittedValueError> {
         if hops >= object::PROTO_CHAIN_HARD_CAP {
             return Ok(None);
         }
-        let target = self.with_handle_scope(|interp, scope| -> Result<Value, VmError> {
-            let target = interp.scoped_value(scope, target);
-            let current = interp.escape_scoped(target);
-            interp.ensure_deferred_namespace_ready(
-                stack,
-                context,
-                &current,
-                !Self::deferred_key_is_symbol_like(key),
-            )?;
-            Ok(interp.escape_scoped(target))
-        })?;
+        let target =
+            self.with_handle_scope(|interp, scope| -> Result<Value, CommittedValueError> {
+                let target = interp.scoped_value(scope, target);
+                let current = interp.escape_scoped(target);
+                if let Some(object) = current.as_object()
+                    && object::deferred_namespace_target(object, &interp.gc_heap).is_some()
+                    && !Self::deferred_key_is_symbol_like(key)
+                    && !object::deferred_namespace_is_populated(object, &interp.gc_heap)
+                {
+                    interp.ensure_deferred_namespace_ready(
+                        stack,
+                        context
+                            .ok_or(VmError::InvalidOperand)
+                            .map_err(|error| CommittedValueError::Fatal(error.into()))?,
+                        &current,
+                        true,
+                    )?;
+                }
+                Ok(interp.escape_scoped(target))
+            })?;
         // §10.4.6.5 [[GetOwnProperty]] — namespace string keys report
         // `{writable:true, enumerable:true, configurable:false}` data
         // descriptors resolved through the environment; symbol keys
@@ -49,18 +62,25 @@ impl Interpreter {
             && object::module_namespace_env(obj, &self.gc_heap).is_some()
             && let Some(name) = key.string_name()
         {
-            return match self.module_namespace_get_binding(obj, name) {
+            return match self
+                .module_namespace_get_binding(obj, name)
+                .map_err(CommittedValueError::JavaScript)?
+            {
                 // §10.4.6.5 step 7 — an uninitialized binding's
                 // descriptor query is a ReferenceError (TDZ).
-                Some(v) if v.is_hole() => Err(self.err_this_uninit(
-                    (format!("Cannot access '{name}' before initialization")).into(),
-                )),
+                Some(v) if v.is_hole() => {
+                    Err(CommittedValueError::JavaScript(self.err_this_uninit(
+                        (format!("Cannot access '{name}' before initialization")).into(),
+                    )))
+                }
                 Some(v) => Ok(Some(object::PropertyDescriptor::data(v, true, true, false))),
                 None => Ok(None),
             };
         }
         if let Some(proxy) = target.as_proxy() {
-            let key_value = self.vm_property_key_to_value(key)?;
+            let key_value = self
+                .vm_property_key_to_value(key)
+                .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
             let trap_args: SmallVec<[Value; 8]> =
                 smallvec::smallvec![proxy.target(&self.gc_heap), key_value];
             return match self.invoke_proxy_trap(
@@ -82,7 +102,8 @@ impl Interpreter {
                         &proxy.target(&self.gc_heap),
                         target_desc.as_ref(),
                         None,
-                    )?;
+                    )
+                    .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
                     Ok(None)
                 }
                 crate::object_internal_ops::ProxyTrap::Trapped(v)
@@ -104,14 +125,19 @@ impl Interpreter {
                         &proxy.target(&self.gc_heap),
                         target_desc.as_ref(),
                         Some(&desc),
-                    )?;
+                    )
+                    .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
                     Ok(Some(desc))
                 }
-                crate::object_internal_ops::ProxyTrap::Trapped(_) => Err(self.err_type(
-                    ("Proxy getOwnPropertyDescriptor trap returned non-object descriptor"
-                        .to_string())
-                    .into(),
-                )),
+                crate::object_internal_ops::ProxyTrap::Trapped(_) => {
+                    Err(CommittedValueError::JavaScript(
+                        self.err_type(
+                            ("Proxy getOwnPropertyDescriptor trap returned non-object descriptor"
+                                .to_string())
+                            .into(),
+                        ),
+                    ))
+                }
                 crate::object_internal_ops::ProxyTrap::NoTrap {
                     target: fallthrough_target,
                 } => self.ordinary_get_own_property_descriptor_value(
@@ -124,7 +150,10 @@ impl Interpreter {
             };
         }
         if let Some(obj) = target.as_object() {
-            if let Some(desc) = self.string_object_exotic_descriptor(obj, key)? {
+            if let Some(desc) = self
+                .string_object_exotic_descriptor(obj, key)
+                .map_err(|error| CommittedValueError::JavaScript(error.into()))?
+            {
                 return Ok(Some(desc));
             }
             return Ok(if let Some(key) = key.string_name() {
@@ -136,7 +165,8 @@ impl Interpreter {
             });
         }
         if let Some(value) = target.as_string(&self.gc_heap) {
-            return string::exotic::descriptor_for_key(value, key, &mut self.gc_heap);
+            return string::exotic::descriptor_for_key(value, key, &mut self.gc_heap)
+                .map_err(|error| CommittedValueError::JavaScript(error.into()));
         }
         if let Some(arr) = target.as_array() {
             // §10.4.2 — own symbol-keyed properties live in a
@@ -145,18 +175,7 @@ impl Interpreter {
             // `Object.getOwnPropertyDescriptor(arr, sym)` and
             // `hasOwnProperty(sym)` observe the spec shape.
             if let VmPropertyKey::Symbol(sym) = key {
-                if let Some((getter, setter)) = array::get_symbol_accessor(arr, &self.gc_heap, *sym)
-                {
-                    return Ok(Some(object::PropertyDescriptor::accessor(
-                        getter, setter, true, true,
-                    )));
-                }
-                if let Some(value) = array::get_symbol_property(arr, &self.gc_heap, *sym) {
-                    return Ok(Some(object::PropertyDescriptor::data(
-                        value, true, true, true,
-                    )));
-                }
-                return Ok(None);
+                return Ok(array::get_symbol_descriptor(arr, &self.gc_heap, *sym));
             }
             let Some(key) = key.string_name() else {
                 return Ok(None);
@@ -233,7 +252,11 @@ impl Interpreter {
                                 n,
                             ) {
                                 Some(idx) => Some(object::PropertyDescriptor::data(
-                                    t.get(&mut self.gc_heap, idx).map_err(crate::oom_to_vm)?,
+                                    t.get(&mut self.gc_heap, idx)
+                                        .map_err(crate::oom_to_vm)
+                                        .map_err(|error| {
+                                            CommittedValueError::JavaScript(error.into())
+                                        })?,
                                     true,
                                     true,
                                     true,
@@ -342,6 +365,10 @@ impl Interpreter {
                 .map(|c| c.cached_function_id)
         });
         if let Some(function_id) = function_id {
+            let owner_context = self
+                .function_context(context, function_id)
+                .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+            let context = &owner_context;
             let owner = target.as_closure(&self.gc_heap);
             if let VmPropertyKey::Symbol(sym) = key {
                 let Some(bag) = self.callable_bag_read(owner, function_id) else {
@@ -368,20 +395,19 @@ impl Interpreter {
                     let owner = interp
                         .escape_scoped(target_handle)
                         .as_closure(&interp.gc_heap);
-                    interp.ordinary_function_own_property_descriptor(
-                        Some(context),
-                        owner,
-                        function_id,
-                        key,
-                    )
+                    interp
+                        .ordinary_function_own_property_descriptor(
+                            Some(context),
+                            owner,
+                            function_id,
+                            key,
+                        )
+                        .map_err(|error| CommittedValueError::JavaScript(error.into()))
                 });
             }
-            return self.ordinary_function_own_property_descriptor(
-                Some(context),
-                owner,
-                function_id,
-                key,
-            );
+            return self
+                .ordinary_function_own_property_descriptor(Some(context), owner, function_id, key)
+                .map_err(|error| CommittedValueError::JavaScript(error.into()));
         }
         if let Some(bound) = target.as_bound_function() {
             let Some(key) = key.string_name() else {
@@ -391,7 +417,9 @@ impl Interpreter {
                 &bound,
                 &mut self.gc_heap,
                 key,
-            );
+            )
+            .map_err(VmError::from)
+            .map_err(|error| CommittedValueError::JavaScript(error.into()));
         }
         if let Some(native) = target.as_native_function() {
             return Ok(if let VmPropertyKey::Symbol(sym) = key {
@@ -400,7 +428,9 @@ impl Interpreter {
                 let key = key
                     .string_name()
                     .expect("non-symbol key has string spelling");
-                native.own_property_descriptor(&mut self.gc_heap, key)?
+                native
+                    .own_property_descriptor(&mut self.gc_heap, key)
+                    .map_err(|error| CommittedValueError::JavaScript(error.into()))?
             });
         }
         if let Some(class) = target.as_class_constructor() {
@@ -433,22 +463,23 @@ impl Interpreter {
                 .or_else(|| ctor.as_closure(&self.gc_heap).map(|c| c.cached_function_id))
             {
                 let owner = ctor.as_closure(&self.gc_heap);
-                return self.ordinary_function_own_property_descriptor(
-                    Some(context),
-                    owner,
-                    function_id,
-                    key,
-                );
+                return self
+                    .ordinary_function_own_property_descriptor(context, owner, function_id, key)
+                    .map_err(|error| CommittedValueError::JavaScript(error.into()));
             }
             if let Some(native) = ctor.as_native_function() {
-                return Ok(native.own_property_descriptor(&mut self.gc_heap, key)?);
+                return Ok(native
+                    .own_property_descriptor(&mut self.gc_heap, key)
+                    .map_err(|error| CommittedValueError::JavaScript(error.into()))?);
             }
             if let Some(bound) = ctor.as_bound_function() {
                 return function_metadata::bound_own_property_descriptor(
                     &bound,
                     &mut self.gc_heap,
                     key,
-                );
+                )
+                .map_err(VmError::from)
+                .map_err(|error| CommittedValueError::JavaScript(error.into()));
             }
         }
         Ok(None)
@@ -459,11 +490,11 @@ impl Interpreter {
         stack: &mut ActivationStack,
         context: &ExecutionContext,
         target: &Value,
-    ) -> Result<Option<Value>, VmError> {
+    ) -> Result<Option<Value>, CommittedValueError> {
         // §10.5.1 step 8 — IsExtensible(target) is the target's own
         // internal method: for a Proxy target the `isExtensible` trap
         // fires (observable, may throw) before any prototype read.
-        if self.is_extensible_value(stack, context, target)? {
+        if self.is_extensible_value(stack, Some(context), target)? {
             return Ok(None);
         }
         Ok(Some(self.ordinary_get_prototype_value(
@@ -477,7 +508,7 @@ impl Interpreter {
         context: &ExecutionContext,
         value: Value,
         hops: usize,
-    ) -> Result<Value, VmError> {
+    ) -> Result<Value, CommittedValueError> {
         if hops >= object::PROTO_CHAIN_HARD_CAP {
             return Ok(Value::null());
         }
@@ -485,16 +516,16 @@ impl Interpreter {
             let trap_args: SmallVec<[Value; 8]> = smallvec::smallvec![proxy.target(&self.gc_heap)];
             return match self.invoke_proxy_trap(
                 stack,
-                context,
+                Some(context),
                 &proxy,
                 "getPrototypeOf",
                 trap_args,
             )? {
                 crate::object_internal_ops::ProxyTrap::Trapped(result) => {
                     if !Self::proxy_get_prototype_result_is_object_or_null(&result) {
-                        return Err(self.err_type(
+                        return Err(CommittedValueError::JavaScript(self.err_type(
                             ("Proxy getPrototypeOf trap returned non-object".to_string()).into(),
-                        ));
+                        )));
                     }
                     if let Some(target_proto) = self.proxy_get_prototype_invariant_target_proto(
                         stack,
@@ -502,10 +533,12 @@ impl Interpreter {
                         &proxy.target(&self.gc_heap),
                     )? && !abstract_ops::same_value(&result, &target_proto, &self.gc_heap)
                     {
-                        return Err(self.err_type(
-                            ("Proxy getPrototypeOf trap returned incompatible prototype"
-                                .to_string())
-                            .into(),
+                        return Err(CommittedValueError::JavaScript(
+                            self.err_type(
+                                ("Proxy getPrototypeOf trap returned incompatible prototype"
+                                    .to_string())
+                                .into(),
+                            ),
                         ));
                     }
                     Ok(result)
@@ -524,15 +557,19 @@ impl Interpreter {
             return Ok(self.intl_kind_prototype_value(intl.kind().class_name()));
         }
         if value.is_object_type() {
-            return self.get_prototype_for_op(&value);
+            return self
+                .get_prototype_for_op(&value)
+                .map_err(|error| CommittedValueError::JavaScript(error.into()));
         }
         // §B.2.2.1.1 step 1 — ToObject(this value): a primitive
         // receiver reports its wrapper's [[Prototype]] without
         // allocating the wrapper.
         if !value.is_nullish() {
-            return self.get_prototype_for_op(&value);
+            return self
+                .get_prototype_for_op(&value)
+                .map_err(|error| CommittedValueError::JavaScript(error.into()));
         }
-        Err(VmError::TypeMismatch)
+        Err(CommittedValueError::JavaScript(VmError::TypeMismatch))
     }
 
     pub(crate) fn proxy_get_prototype_result_is_object_or_null(value: &Value) -> bool {
@@ -551,9 +588,9 @@ impl Interpreter {
     pub(crate) fn is_extensible_value(
         &mut self,
         stack: &mut ActivationStack,
-        context: &ExecutionContext,
+        context: Option<&ExecutionContext>,
         value: &Value,
-    ) -> Result<bool, VmError> {
+    ) -> Result<bool, CommittedValueError> {
         // Deferred namespaces report non-extensible (§28.3 [[IsExtensible]]
         // → false) even before population, when the backing object is
         // still internally extensible so export properties can be added.
@@ -564,9 +601,12 @@ impl Interpreter {
         }
         if let Some(proxy) = value.as_proxy() {
             if proxy.is_revoked(&self.gc_heap) {
-                return Err(self.err_type(
-                    ("Cannot perform 'isExtensible' on a proxy that has been revoked".to_string())
+                return Err(CommittedValueError::JavaScript(
+                    self.err_type(
+                        ("Cannot perform 'isExtensible' on a proxy that has been revoked"
+                            .to_string())
                         .into(),
+                    ),
                 ));
             }
             let trap_args: SmallVec<[Value; 8]> = smallvec::smallvec![proxy.target(&self.gc_heap)];
@@ -582,10 +622,12 @@ impl Interpreter {
                     let target_ext =
                         self.is_extensible_value(stack, context, &proxy.target(&self.gc_heap))?;
                     if trap != target_ext {
-                        return Err(self.err_type(
-                            ("Proxy isExtensible trap returned value inconsistent with target"
-                                .to_string())
-                            .into(),
+                        return Err(CommittedValueError::JavaScript(
+                            self.err_type(
+                                ("Proxy isExtensible trap returned value inconsistent with target"
+                                    .to_string())
+                                .into(),
+                            ),
                         ));
                     }
                     Ok(trap)
@@ -710,7 +752,7 @@ impl Interpreter {
         key: &VmPropertyKey,
         value: Value,
         receiver: &Value,
-    ) -> Result<bool, VmError> {
+    ) -> Result<bool, CommittedValueError> {
         if !crate::reflect::is_type_object_value(receiver) {
             return Ok(false);
         }
@@ -718,8 +760,13 @@ impl Interpreter {
         let scope = scope_frame.token();
         let receiver_root = self.scoped_value(&scope, *receiver);
         let value_root = self.scoped_value(&scope, value);
-        let existing =
-            self.ordinary_get_own_property_descriptor_value(stack, context, *receiver, key, 0)?;
+        let existing = self.ordinary_get_own_property_descriptor_value(
+            stack,
+            Some(context),
+            *receiver,
+            key,
+            0,
+        )?;
         // A Proxy's descriptor trap (including its absent-trap path) may
         // allocate or reenter. The caller's rooted argument slots do not
         // update these copied operands; reload before the defining effect.
@@ -877,7 +924,7 @@ impl Interpreter {
         context: &ExecutionContext,
         receiver: &Value,
         sym: crate::symbol::JsSymbol,
-    ) -> Result<Option<(Value, object::PropertyDescriptor)>, VmError> {
+    ) -> Result<Option<(Value, object::PropertyDescriptor)>, CommittedValueError> {
         self.with_handle_scope(|interp, scope| {
             let receiver_handle = interp.scoped_value(scope, *receiver);
             let receiver = interp.escape_scoped(receiver_handle);
@@ -922,7 +969,7 @@ impl Interpreter {
                     let proto_value = interp.escape_scoped(proto);
                     if let Some(desc) = interp.ordinary_get_own_property_descriptor_value(
                         stack,
-                        context,
+                        Some(context),
                         proto_value,
                         &key,
                         0,
@@ -938,9 +985,13 @@ impl Interpreter {
             let mut hops = 0;
             loop {
                 let current = interp.escape_scoped(current_handle);
-                if let Some(desc) = interp
-                    .ordinary_get_own_property_descriptor_value(stack, context, current, &key, 0)?
-                {
+                if let Some(desc) = interp.ordinary_get_own_property_descriptor_value(
+                    stack,
+                    Some(context),
+                    current,
+                    &key,
+                    0,
+                )? {
                     return Ok(Some((interp.escape_scoped(current_handle), desc)));
                 }
                 if hops >= object::PROTO_CHAIN_HARD_CAP {
@@ -988,7 +1039,7 @@ impl Interpreter {
                     }
                     if let Some(desc) = interp.ordinary_get_own_property_descriptor_value(
                         stack,
-                        context,
+                        Some(context),
                         proto_value,
                         &key,
                         0,

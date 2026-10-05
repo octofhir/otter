@@ -28,6 +28,10 @@
 //!   functional replacers and the `$$` / `$&` / `` $` `` / `$'`
 //!   substitution patterns.
 //!
+//!
+//! Native coercion and callback failures finish through the existing committed
+//! completion owner: local allocation refusals retain their authored native OOM
+//! facts, while completed terminal failures retain exact detail and source frames.
 //! # See also
 //! - <https://tc39.es/ecma262/#sec-properties-of-the-string-prototype-object>
 
@@ -1694,47 +1698,6 @@ fn impl_to_locale_upper_case(
     )?))
 }
 
-/// Map a [`crate::VmError`] from an interpreter re-entry onto the
-/// native error surface, preserving thrown user values.
-fn vm_err(interp: &crate::Interpreter, err: crate::VmError, name: &'static str) -> NativeError {
-    match err {
-        crate::VmError::Uncaught => {
-            let value = match interp.take_error_detail() {
-                Some(crate::run_control::ErrorDetail::Uncaught(m)) => m,
-                _ => Default::default(),
-            };
-            NativeError::Thrown {
-                name,
-                message: value.into(),
-            }
-        }
-        crate::VmError::TypeError => {
-            let message = match interp.take_error_detail() {
-                Some(crate::run_control::ErrorDetail::Message(m)) => m,
-                _ => Default::default(),
-            };
-            NativeError::TypeError {
-                name,
-                reason: message.into(),
-            }
-        }
-        crate::VmError::RangeError => {
-            let message = match interp.take_error_detail() {
-                Some(crate::run_control::ErrorDetail::Message(m)) => m,
-                _ => Default::default(),
-            };
-            NativeError::RangeError {
-                name,
-                reason: message.into(),
-            }
-        }
-        other => NativeError::TypeError {
-            name,
-            reason: other.to_string(),
-        },
-    }
-}
-
 /// `? Get(value, key)` honouring accessor getters; used for the
 /// `@@`-symbol method probe and `flags` read.
 fn get_value(
@@ -1751,11 +1714,11 @@ fn get_value(
         let receiver = scope.value(value);
         let receiver_value = scope.raw(receiver);
         let outcome = scope.with_turn_parts(|interp, stack| {
-            interp.ordinary_get_value(stack, &exec, receiver_value, receiver_value, key, 0)
+            interp.ordinary_get_value(stack, Some(&exec), receiver_value, receiver_value, key, 0)
         });
         let outcome = match outcome {
             Ok(outcome) => outcome,
-            Err(error) => return Err(vm_err(scope.context().interp_mut(), error, name)),
+            Err(error) => return Err(error.into_native(scope.context().interp_mut(), name)),
         };
         let result = match outcome {
             VmGetOutcome::Value(value) => value,
@@ -1766,7 +1729,7 @@ fn get_value(
                 let result = scope.with_turn_parts(|interp, stack| {
                     interp.run_callable_sync_rooted(
                         stack,
-                        &exec,
+                        Some(&exec),
                         &getter_value,
                         receiver_value,
                         SmallVec::new(),
@@ -1774,7 +1737,10 @@ fn get_value(
                 });
                 match result {
                     Ok(value) => value,
-                    Err(error) => return Err(vm_err(scope.context().interp_mut(), error, name)),
+                    Err(error) => {
+                        return Err(crate::CommittedValueError::completed_call(error)
+                            .into_native(scope.context().interp_mut(), name));
+                    }
                 }
             }
         };
@@ -1854,7 +1820,7 @@ fn value_to_string(
     let string = ctx.with_turn_parts(|interp, stack| {
         crate::coerce::to_js_string_or_throw(interp, stack, &exec, &value)
     });
-    string.map_err(|error| vm_err(ctx.interp_mut(), error, name))
+    string.map_err(|error| error.into_native(ctx.interp_mut(), name))
 }
 
 /// §22.1.3.17.1 GetSubstitution over UTF-16 units for a string-search
@@ -1957,7 +1923,8 @@ fn string_replace_spec(
                 let result = match scope.call_vm(method, search, &[this, replace_value]) {
                     Ok(value) => value,
                     Err(error) => {
-                        return Err(vm_err(scope.context().interp_mut(), error, name));
+                        return Err(crate::CommittedValueError::completed_call(error)
+                            .into_native(scope.context().interp_mut(), name));
                     }
                 };
                 return Ok(scope.finish(result));
@@ -2023,7 +1990,8 @@ fn string_replace_spec(
                     ) {
                         Ok(value) => value,
                         Err(error) => {
-                            return Err(vm_err(callback_scope.context().interp_mut(), error, name));
+                            return Err(crate::CommittedValueError::completed_call(error)
+                                .into_native(callback_scope.context().interp_mut(), name));
                         }
                     };
                     let result_value = callback_scope.raw(result);
@@ -2582,7 +2550,8 @@ fn invoke_regexp_string_fallback(
         let result = match scope.call_vm(method, rx, &[string]) {
             Ok(value) => value,
             Err(error) => {
-                return Err(vm_err(scope.context().interp_mut(), error, name));
+                return Err(crate::CommittedValueError::completed_call(error)
+                    .into_native(scope.context().interp_mut(), name));
             }
         };
         Ok(scope.finish(result))
@@ -2841,7 +2810,7 @@ fn native_string_method(
             let result = scope.with_turn_parts(|interp, stack| {
                 interp.run_callable_sync_rooted(
                     stack,
-                    &exec,
+                    Some(&exec),
                     &splitter_value,
                     separator_value,
                     cb_args,
@@ -2850,7 +2819,8 @@ fn native_string_method(
             let result = match result {
                 Ok(value) => value,
                 Err(error) => {
-                    return Err(vm_err(scope.context().interp_mut(), error, "split"));
+                    return Err(crate::CommittedValueError::completed_call(error)
+                        .into_native(scope.context().interp_mut(), "split"));
                 }
             };
             let result = scope.value(result);
@@ -2917,11 +2887,20 @@ fn native_string_method(
             let arg_value = scope.raw(arg);
             let cb_args: SmallVec<[Value; 8]> = smallvec::smallvec![scope.raw(this)];
             let result = scope.with_turn_parts(|interp, stack| {
-                interp.run_callable_sync_rooted(stack, &exec, &method_value, arg_value, cb_args)
+                interp.run_callable_sync_rooted(
+                    stack,
+                    Some(&exec),
+                    &method_value,
+                    arg_value,
+                    cb_args,
+                )
             });
             let result = match result {
                 Ok(value) => value,
-                Err(error) => return Err(vm_err(scope.context().interp_mut(), error, name)),
+                Err(error) => {
+                    return Err(crate::CommittedValueError::completed_call(error)
+                        .into_native(scope.context().interp_mut(), name));
+                }
             };
             let result = scope.value(result);
             Ok(Some(scope.finish(result)))
@@ -2956,7 +2935,7 @@ fn native_string_method(
                 let string = match string {
                     Ok(string) => string,
                     Err(error) => {
-                        return Err(vm_err(scope.context().interp_mut(), error, name));
+                        return Err(error.into_native(scope.context().interp_mut(), name));
                     }
                 };
                 scope.value(Value::string(string))
@@ -2976,11 +2955,7 @@ fn native_string_method(
                 interp.coerce_string_method_args(stack, &exec, name, &mut coerced_args)
             });
             if let Err(error) = result {
-                return Err(crate::native_function::vm_to_native_error(
-                    scope.context().interp_mut(),
-                    error,
-                    name,
-                ));
+                return Err(error.into_native(scope.context().interp_mut(), name));
             }
         }
         let impl_fn = intrinsic_impl(name).ok_or_else(|| NativeError::TypeError {
@@ -3085,7 +3060,7 @@ mod tests {
     /// `Value::Number`) or quoted forms — the helper auto-detects
     /// to keep the existing test cases readable.
     fn call(method: &str, recv: &str, args: &[&str]) -> String {
-        let mut interp = Interpreter::new();
+        let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
         let mut recv_v = Value::undefined();
         let mut arg_vs: Vec<Value> = Vec::with_capacity(args.len());
         let mut roots = otter_gc::RootScope::new(interp.gc_heap_mut());
@@ -3176,7 +3151,7 @@ mod tests {
 
     #[test]
     fn bad_receiver_rejects() {
-        let mut interp = Interpreter::new();
+        let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
         let err = invoke_raw("length", &Value::undefined(), &[], &mut interp).unwrap_err();
         assert!(matches!(err, NativeError::TypeError { .. }));
     }
@@ -3191,7 +3166,7 @@ mod tests {
     /// the raw [`Value`] so the caller can inspect non-string
     /// outputs (booleans, numbers, arrays).
     fn call_v(method: &str, recv: &str, args: &[A]) -> Value {
-        let mut interp = Interpreter::new();
+        let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
         call_v_with_interp(method, recv, args, &mut interp)
     }
 
@@ -3216,7 +3191,7 @@ mod tests {
     }
 
     fn call_s(method: &str, recv: &str, args: &[A]) -> String {
-        let mut interp = Interpreter::new();
+        let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
         call_v_with_interp(method, recv, args, &mut interp).display_string(interp.gc_heap())
     }
 
@@ -3248,7 +3223,7 @@ mod tests {
         // §22.1.3.5 — `for each next of arguments: nextString = ?
         // ToString(next)`. Numbers, Booleans, etc. coerce instead
         // of rejecting.
-        let mut interp = Interpreter::new();
+        let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
         let recv = Value::string(JsString::from_str("a", interp.gc_heap_mut()).unwrap());
         let result = invoke_raw(
             "concat",
@@ -3272,7 +3247,7 @@ mod tests {
 
     #[test]
     fn repeat_rejects_negative() {
-        let mut interp = Interpreter::new();
+        let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
         let recv = Value::string(JsString::from_str("abc", interp.gc_heap_mut()).unwrap());
         let err = invoke_raw(
             "repeat",
@@ -3338,7 +3313,7 @@ mod tests {
     #[test]
     fn code_point_at_combines_surrogates() {
         // U+10000 = '𐀀' = 0xD800 0xDC00
-        let mut interp = Interpreter::new();
+        let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
         let units: [u16; 3] = [0xD800, 0xDC00, b'a' as u16];
         let recv = Value::string(JsString::from_utf16_units(&units, interp.gc_heap_mut()).unwrap());
         let r = invoke_raw(
@@ -3367,7 +3342,7 @@ mod tests {
         assert_eq!(call_s("toLowerCase", "Hello, World!", &[]), "hello, world!");
         // Non-ASCII folds per the Unicode default case mapping.
         let units: [u16; 3] = [0x00C9, b'a' as u16, b'b' as u16]; // 'É' + "ab"
-        let mut interp = Interpreter::new();
+        let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
         let recv = Value::string(JsString::from_utf16_units(&units, interp.gc_heap_mut()).unwrap());
         let r = invoke_raw("toLowerCase", &recv, &[], &mut interp).unwrap();
         let Some(s) = r.as_string(interp.gc_heap()) else {
@@ -3409,7 +3384,7 @@ mod tests {
 
     #[test]
     fn split_basic() {
-        let mut interp = Interpreter::new();
+        let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
         let v = call_v_with_interp("split", "a,b,c", &[A::S(",")], &mut interp);
         let Some(a) = v.as_array() else {
             panic!("expected array");
@@ -3431,7 +3406,7 @@ mod tests {
 
     #[test]
     fn split_consecutive_separators_yield_empty_chunks() {
-        let mut interp = Interpreter::new();
+        let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
         let v = call_v_with_interp("split", "a,,b", &[A::S(",")], &mut interp);
         let Some(a) = v.as_array() else {
             panic!("expected array");
@@ -3453,7 +3428,7 @@ mod tests {
 
     #[test]
     fn split_empty_separator_yields_code_units() {
-        let mut interp = Interpreter::new();
+        let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
         let v = call_v_with_interp("split", "abc", &[A::S("")], &mut interp);
         let Some(a) = v.as_array() else {
             panic!("expected array");
@@ -3475,7 +3450,7 @@ mod tests {
 
     #[test]
     fn split_with_limit() {
-        let mut interp = Interpreter::new();
+        let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
         let v = call_v_with_interp("split", "a,b,c,d", &[A::S(","), A::N(2)], &mut interp);
         let Some(a) = v.as_array() else {
             panic!("expected array");
@@ -3493,7 +3468,7 @@ mod tests {
 
     #[test]
     fn split_no_match_returns_singleton() {
-        let mut interp = Interpreter::new();
+        let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
         let v = call_v_with_interp("split", "abc", &[A::S(",")], &mut interp);
         let Some(a) = v.as_array() else {
             panic!("expected array");
@@ -3508,7 +3483,7 @@ mod tests {
     #[test]
     fn split_empty_receiver() {
         // "".split(",") === [""]
-        let mut interp = Interpreter::new();
+        let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
         let v = call_v_with_interp("split", "", &[A::S(",")], &mut interp);
         let Some(a) = v.as_array() else {
             panic!("expected array");
@@ -3532,7 +3507,7 @@ mod tests {
     #[test]
     fn split_undefined_separator_returns_singleton() {
         // "abc".split() === ["abc"]
-        let mut interp = Interpreter::new();
+        let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
         let recv = Value::string(JsString::from_str("abc", interp.gc_heap_mut()).unwrap());
         let r = invoke_raw("split", &recv, &[], &mut interp).unwrap();
         let Some(a) = r.as_array() else {

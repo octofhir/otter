@@ -51,10 +51,10 @@ const TARGET_FUNCTION_ENTRY_CELL: u8 = 8;
 const TARGET_GLOBAL_LEXICAL_CELL: u8 = 10;
 const TARGET_DEOPT_RUNTIME_DATA: u8 = 11;
 const TARGET_STRING_CONSTANT_CELL: u8 = 12;
-const TARGET_PROPERTY_LOOKUP_CACHE_TABLE: u8 = 13;
-const TARGET_STORE_TRANSITION_CACHE_TABLE: u8 = 14;
+const TARGET_PROPERTY_ACTION_CACHE_TABLE: u8 = 13;
 const TARGET_CALLEE_IDENTITY_CELL: u8 = 16;
 const TARGET_ARITH_FEEDBACK_CELL: u8 = 17;
+const TARGET_SOURCE_WORK_CELL: u8 = 18;
 const TARGET_PROTOTYPE_VALIDITY_CELL: u8 = 15;
 
 /// Whether a property source-identity cell serves a load or a store site.
@@ -93,10 +93,9 @@ pub(crate) enum RelocationTarget {
         signature: &'static str,
     },
     GcCageBase,
-    /// The isolate's fixed megamorphic property table; never a cached GC value.
-    PropertyLookupCacheTable,
-    /// The isolate's fixed add-property transition table.
-    StoreTransitionCacheTable,
+    /// The isolate's one property action table with independent load/store facts.
+    /// Its traced roots stay live; the relocation never embeds a cached GC value.
+    PropertyActionCacheTable,
     /// A retained ordinary-chain validity word, identified by its root shape.
     PrototypeValidityCell {
         identity: u64,
@@ -139,6 +138,10 @@ pub(crate) enum RelocationTarget {
         function_id: u32,
         call_pc: u32,
     },
+    /// Canonical non-GC opcode-work scalar retained by emitted Template code.
+    SourceWorkCell {
+        function_id: u32,
+    },
     /// Live arithmetic observation byte of one instruction, which baseline
     /// code records into.
     ArithFeedbackCell {
@@ -176,7 +179,6 @@ fn runtime_stub_signature_name(signature: RuntimeStubSignature) -> &'static str 
         RuntimeStubSignature::ReentrantValueSpan => "reentrantValueSpan",
         RuntimeStubSignature::CommittedValue2 => "committedValue2",
         RuntimeStubSignature::RouteThrow1 => "routeThrow1",
-        RuntimeStubSignature::AcknowledgeCaughtThrow0 => "acknowledgeCaughtThrow0",
         RuntimeStubSignature::ExecutionEntry0 => "executionEntry0",
         RuntimeStubSignature::JsCall => "jsCall",
     }
@@ -1197,11 +1199,8 @@ fn encode_target(target: &RelocationTarget, output: &mut Vec<u8>) -> Result<(), 
             put_text(output, "runtimeStub.signature", signature)?;
         }
         RelocationTarget::GcCageBase => output.push(TARGET_GC_CAGE_BASE),
-        RelocationTarget::PropertyLookupCacheTable => {
-            output.push(TARGET_PROPERTY_LOOKUP_CACHE_TABLE)
-        }
-        RelocationTarget::StoreTransitionCacheTable => {
-            output.push(TARGET_STORE_TRANSITION_CACHE_TABLE)
+        RelocationTarget::PropertyActionCacheTable => {
+            output.push(TARGET_PROPERTY_ACTION_CACHE_TABLE)
         }
         RelocationTarget::PrototypeValidityCell { identity } => {
             output.push(TARGET_PROTOTYPE_VALIDITY_CELL);
@@ -1256,6 +1255,10 @@ fn encode_target(target: &RelocationTarget, output: &mut Vec<u8>) -> Result<(), 
             output.push(TARGET_CALLEE_IDENTITY_CELL);
             put_u32(output, *function_id);
             put_u32(output, *call_pc);
+        }
+        RelocationTarget::SourceWorkCell { function_id } => {
+            output.push(TARGET_SOURCE_WORK_CELL);
+            put_u32(output, *function_id);
         }
         RelocationTarget::ArithFeedbackCell { function_id, pc } => {
             output.push(TARGET_ARITH_FEEDBACK_CELL);
@@ -1662,7 +1665,7 @@ mod tests {
         assert_eq!(
             RelocationTarget::runtime_stub(otter_vm::native_abi::STUB_JIT_CALL_GENERIC),
             RelocationTarget::RuntimeStub {
-                id: 91,
+                id: 89,
                 name: "jit_call_generic",
                 signature: "jsCall",
             }

@@ -19,7 +19,7 @@
 //!   pending closure body carries it through the allocation, so a collection
 //!   rewrites it before the copy into the cell.
 //! - Arrow closures snapshot the enclosing activation's `this` and
-//!   `new.target` values at construction; both are immutable per activation.
+//!   `new.target` values from their exact lexical source at construction.
 //! - Function property-descriptor results remain in a handle-arena slot across
 //!   every field write; shape allocation never leaves the builder with a stale
 //!   raw object handle.
@@ -31,6 +31,7 @@
 //! - [`crate::Frame`]
 
 use crate::activation_stack::ActivationStack;
+use crate::runtime_activation::CommittedValueError;
 use otter_bytecode::Operand;
 use smallvec::SmallVec;
 
@@ -102,19 +103,14 @@ impl Interpreter {
         context: &ExecutionContext,
         idx: u32,
     ) -> Result<Value, VmError> {
-        let function_id = context
-            .function_id_constant(idx)
-            .ok_or(VmError::InvalidOperand)?;
-        let closure = crate::closure::alloc_closure(
-            &mut self.gc_heap,
-            function_id,
+        self.make_callable_value(
+            context,
+            idx,
             Value::undefined(),
-            None,
-            None,
+            Value::undefined(),
+            Value::undefined(),
+            false,
         )
-        .map_err(crate::oom_to_vm)?;
-        self.mark_closure_lookup(context, closure);
-        Ok(Value::closure(closure))
     }
 
     /// `MakeClosure dst, fn, ctx` over a materialized frame.
@@ -152,39 +148,60 @@ impl Interpreter {
         let closure_context = frame.read(context_reg)?;
         let closure = self.make_closure_value(
             context,
-            frame,
             function_index,
             closure_context,
-            lexical_new_target,
+            frame.this_value(),
+            lexical_new_target.unwrap_or_else(Value::undefined),
         )?;
         frame.write(dst, closure)?;
         frame.advance_pc()?;
         Ok(())
     }
 
-    /// Create the closure one `MakeClosure` site denotes in `frame`, over
-    /// `closure_context` (a context or `undefined`).
+    /// Construct a closure from explicit lexical bindings, independent of the
+    /// physical frame that happens to execute this source operation.
     pub(crate) fn make_closure_value(
         &mut self,
         context: &ExecutionContext,
-        frame: &mut ActiveFrameMut<'_>,
         function_index: u32,
         closure_context: Value,
-        lexical_new_target: Option<Value>,
+        lexical_this: Value,
+        lexical_new_target: Value,
+    ) -> Result<Value, VmError> {
+        self.make_callable_value(
+            context,
+            function_index,
+            closure_context,
+            lexical_this,
+            lexical_new_target,
+            true,
+        )
+    }
+
+    fn make_callable_value(
+        &mut self,
+        context: &ExecutionContext,
+        function_index: u32,
+        closure_context: Value,
+        lexical_this: Value,
+        lexical_new_target: Value,
+        capture_lexical: bool,
     ) -> Result<Value, VmError> {
         let function_id = context
             .function_id_constant(function_index)
             .ok_or(VmError::InvalidOperand)?;
         crate::context_ops::context_operand(closure_context)?;
-        // Arrow closures bind `this` and `new.target` lexically: every later
-        // invocation ignores the call site and uses the creating activation's
-        // values.
-        let (bound_this, bound_new_target) = if context.function_is_arrow(function_id) {
-            (Some(frame.this_value()), lexical_new_target)
-        } else {
-            (None, None)
-        };
-        // The context and bound values ride in the pending closure body.
+        let (bound_this, bound_new_target) =
+            if capture_lexical && context.function_is_arrow(function_id) {
+                (
+                    Some(lexical_this),
+                    (!lexical_new_target.is_undefined()).then_some(lexical_new_target),
+                )
+            } else {
+                (None, None)
+            };
+        // All boxed inputs ride in the pending body and are rewritten by a
+        // collection before the initialized cell is published.
         let closure = crate::closure::alloc_closure(
             &mut self.gc_heap,
             function_id,
@@ -231,6 +248,12 @@ impl Interpreter {
             statics,
             &mut external_visit,
         )?;
+        let mut class_root = Value::class_constructor(class);
+        let mut pending_roots = otter_gc::RootScope::new(&mut self.gc_heap);
+        // SAFETY: the new class slot remains stationary through state-root
+        // preparation. Its constructor/prototype/statics children are traced
+        // even before the VM destination is published.
+        unsafe { pending_roots.add_value(&mut class_root) };
         // §15.7.14 — a static member named `name`/`length` suppresses
         // the constructor's virtual metadata property entirely (the
         // class never receives the implicit own `name`): mark it
@@ -286,15 +309,20 @@ impl Interpreter {
             // Re-read `statics` from its GC-rooted register: the class
             // construction above may have scavenged and relocated it, leaving
             // the bare `statics` local read before the allocation stale.
-            let statics = read_register(&stack[frame_idx], statics_reg)?
+            let mut statics = read_register(&stack[frame_idx], statics_reg)?
                 .as_object()
                 .ok_or(VmError::TypeMismatch)?;
-            object::set_prototype(statics, &mut self.gc_heap, Some(function_prototype));
+            if !object::set_prototype(&mut statics, &mut self.gc_heap, Some(function_prototype))? {
+                return Err(VmError::TypeError);
+            }
         }
         // Publish the constructor to its destination register first: the
         // shape-advancing `constructor` install below may scavenge while
         // allocating a hidden-class child, and the register slot is GC-rooted
         // (the bare `class` local is not), so it is forwarded across the move.
+        let class = class_root
+            .as_class_constructor()
+            .ok_or(VmError::TypeMismatch)?;
         write_register(&mut stack[frame_idx], dst, Value::class_constructor(class))?;
         // §15.7.10 ClassDefinitionEvaluation step 24 — install
         // `C.prototype.constructor = C` so reflective probes
@@ -349,33 +377,45 @@ impl Interpreter {
         stack: &mut ActivationStack,
         context: &ExecutionContext,
         operands: impl crate::executable::OperandSource,
-    ) -> Result<(), VmError> {
-        let dst = register_operand(operands.first())?;
+    ) -> Result<(), CommittedValueError> {
+        let dst = register_operand(operands.first())
+            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
         if let Some(result) = self.continue_pending_bind_function(stack, context, dst) {
             return result;
         }
 
         let top_idx = stack.len() - 1;
         let pc = stack[top_idx].pc;
-        let callee_reg = register_operand(operands.get(1))?;
-        let this_reg = register_operand(operands.get(2))?;
+        let callee_reg = register_operand(operands.get(1))
+            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+        let this_reg = register_operand(operands.get(2))
+            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
         let argc = match operands.get(3) {
             Some(Operand::ConstIndex(n)) => n as usize,
-            _ => return Err(VmError::InvalidOperand),
+            _ => return Err(CommittedValueError::Fatal(VmError::InvalidOperand)),
         };
-        let target = *read_register(&stack[top_idx], callee_reg)?;
+        let target = *read_register(&stack[top_idx], callee_reg)
+            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
         if !self.is_callable_runtime(&target) {
-            return Err(VmError::NotCallable);
+            return Err(CommittedValueError::JavaScript(VmError::NotCallable));
         }
-        let bound_this = *read_register(&stack[top_idx], this_reg)?;
+        let bound_this = *read_register(&stack[top_idx], this_reg)
+            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
         let mut bound_args: SmallVec<[Value; 4]> = SmallVec::with_capacity(argc);
         for i in 0..argc {
-            let r = register_operand(operands.get(4 + i))?;
-            bound_args.push(*read_register(&stack[top_idx], r)?);
+            let r = register_operand(operands.get(4 + i))
+                .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+            bound_args.push(
+                *read_register(&stack[top_idx], r)
+                    .map_err(|error| CommittedValueError::Fatal(error.into()))?,
+            );
         }
         // §20.2.3.2 — `length` is read (HasOwnProperty + Get) BEFORE
         // `name`.
-        match self.callable_bind_metadata_get(context, &target, "length")? {
+        match self
+            .callable_bind_metadata_get(context, &target, "length")
+            .map_err(|error| CommittedValueError::JavaScript(error.into()))?
+        {
             BindMetadataGet::Value(target_length) => self.continue_bind_function_after_length(
                 stack,
                 context,
@@ -397,6 +437,7 @@ impl Interpreter {
                     target_length: None,
                 });
                 self.invoke(stack, context, &getter, target, SmallVec::new(), dst)
+                    .map_err(|error| CommittedValueError::JavaScript(error.into()))
             }
         }
     }
@@ -406,7 +447,7 @@ impl Interpreter {
         stack: &mut ActivationStack,
         context: &ExecutionContext,
         dst: u16,
-    ) -> Option<Result<(), VmError>> {
+    ) -> Option<Result<(), CommittedValueError>> {
         let top_idx = stack.len() - 1;
         let pc = stack[top_idx].pc;
         let state = self
@@ -416,7 +457,7 @@ impl Interpreter {
             .cloned()?;
         let produced = match read_register(&stack[top_idx], dst) {
             Ok(value) => *value,
-            Err(err) => return Some(Err(err)),
+            Err(err) => return Some(Err(CommittedValueError::Fatal(err))),
         };
         Some(match state.stage {
             PendingBindStage::Length => self.continue_bind_function_after_length(
@@ -431,7 +472,7 @@ impl Interpreter {
             PendingBindStage::Name => {
                 let target_length = match state.target_length {
                     Some(value) => value,
-                    None => return Some(Err(VmError::InvalidOperand)),
+                    None => return Some(Err(CommittedValueError::Fatal(VmError::InvalidOperand))),
                 };
                 if let Some(cold) = self.frame_cold_mut(&mut stack[top_idx]) {
                     cold.pending_bind_function = None;
@@ -470,6 +511,7 @@ impl Interpreter {
                     target_length,
                     proto,
                 )
+                .map_err(|error| CommittedValueError::JavaScript(error.into()))
             }
         })
     }
@@ -483,7 +525,7 @@ impl Interpreter {
         bound_this: Value,
         bound_args: SmallVec<[Value; 4]>,
         target_length: Value,
-    ) -> Result<(), VmError> {
+    ) -> Result<(), CommittedValueError> {
         let top_idx = stack.len() - 1;
         let pc = stack[top_idx].pc;
         // Reading `name` can materialize a string: every value the bind
@@ -502,7 +544,7 @@ impl Interpreter {
             .map(|index| self.iteration_anchor(anchor + 3 + index))
             .collect();
         self.pop_iteration_anchors_to(anchor);
-        match name? {
+        match name.map_err(CommittedValueError::JavaScript)? {
             BindMetadataGet::Value(target_name) => {
                 if let Some(cold) = self.frame_cold_mut(&mut stack[top_idx]) {
                     cold.pending_bind_function = None;
@@ -533,6 +575,7 @@ impl Interpreter {
                     target_length,
                     proto,
                 )
+                .map_err(|error| CommittedValueError::JavaScript(error.into()))
             }
             BindMetadataGet::Getter(getter) => {
                 self.frame_ensure_cold(&mut stack[top_idx])
@@ -546,6 +589,7 @@ impl Interpreter {
                     target_length: Some(target_length),
                 });
                 self.invoke(stack, context, &getter, target, SmallVec::new(), dst)
+                    .map_err(|error| CommittedValueError::JavaScript(error.into()))
             }
         }
     }
@@ -560,9 +604,11 @@ impl Interpreter {
         context: &ExecutionContext,
         values: &mut [&mut Value],
         target: &Value,
-    ) -> Result<Value, VmError> {
+    ) -> Result<Value, CommittedValueError> {
         if !target.is_proxy() {
-            return self.get_prototype_for_op(target);
+            return self
+                .get_prototype_for_op(target)
+                .map_err(|error| CommittedValueError::JavaScript(error.into()));
         }
         let base = self.push_iteration_anchor(*target) - 1;
         for v in values.iter() {
@@ -632,10 +678,11 @@ impl Interpreter {
         callee_reg: u16,
         this_reg: u16,
         arg_regs: &[u16],
-    ) -> Result<(), VmError> {
-        let target = *read_register(&stack[top_idx], callee_reg)?;
+    ) -> Result<(), CommittedValueError> {
+        let target = *read_register(&stack[top_idx], callee_reg)
+            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
         if !self.is_callable_runtime(&target) {
-            return Err(VmError::NotCallable);
+            return Err(CommittedValueError::JavaScript(VmError::NotCallable));
         }
 
         // §10.4.1.3 step 1 — BoundFunctionCreate resolves the target's
@@ -643,19 +690,32 @@ impl Interpreter {
         let target_proto = if target.is_proxy() {
             self.ordinary_get_prototype_value(stack, context, target, 0)?
         } else {
-            self.get_prototype_for_op(&target)?
+            self.get_prototype_for_op(&target)
+                .map_err(|error| CommittedValueError::JavaScript(error.into()))?
         };
         let proto_anchor = self.push_iteration_anchor(target_proto) - 1;
 
         // §20.2.3.2 — read `length`, then `name`. Each may be an accessor whose
         // getter runs `this = target`; the frame source registers stay live
         // roots, so re-read the target after every reentrant call.
-        let target = *read_register(&stack[top_idx], callee_reg)?;
-        let target_length = match self.callable_bind_metadata_get(context, &target, "length")? {
+        let target = *read_register(&stack[top_idx], callee_reg)
+            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+        let target_length = match self
+            .callable_bind_metadata_get(context, &target, "length")
+            .map_err(|error| CommittedValueError::JavaScript(error.into()))?
+        {
             BindMetadataGet::Value(value) => value,
             BindMetadataGet::Getter(getter) => {
-                let receiver = *read_register(&stack[top_idx], callee_reg)?;
-                self.run_callable_sync_rooted(stack, context, &getter, receiver, SmallVec::new())?
+                let receiver = *read_register(&stack[top_idx], callee_reg)
+                    .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                self.run_callable_sync_rooted(
+                    stack,
+                    Some(context),
+                    &getter,
+                    receiver,
+                    SmallVec::new(),
+                )
+                .map_err(CommittedValueError::completed_call)?
             }
         };
 
@@ -663,12 +723,24 @@ impl Interpreter {
         // function allocation so a moving collection cannot strand it.
         let length_anchor = self.push_iteration_anchor(target_length) - 1;
 
-        let target = *read_register(&stack[top_idx], callee_reg)?;
-        let target_name = match self.callable_bind_metadata_get(context, &target, "name")? {
+        let target = *read_register(&stack[top_idx], callee_reg)
+            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+        let target_name = match self
+            .callable_bind_metadata_get(context, &target, "name")
+            .map_err(|error| CommittedValueError::JavaScript(error.into()))?
+        {
             BindMetadataGet::Value(value) => value,
             BindMetadataGet::Getter(getter) => {
-                let receiver = *read_register(&stack[top_idx], callee_reg)?;
-                self.run_callable_sync_rooted(stack, context, &getter, receiver, SmallVec::new())?
+                let receiver = *read_register(&stack[top_idx], callee_reg)
+                    .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                self.run_callable_sync_rooted(
+                    stack,
+                    Some(context),
+                    &getter,
+                    receiver,
+                    SmallVec::new(),
+                )
+                .map_err(CommittedValueError::completed_call)?
             }
         };
         let name_anchor = self.push_iteration_anchor(target_name) - 1;
@@ -676,11 +748,16 @@ impl Interpreter {
         let target_proto = self.iteration_anchor(proto_anchor);
         let target_name = self.iteration_anchor(name_anchor);
         let target_length = self.iteration_anchor(length_anchor);
-        let target = *read_register(&stack[top_idx], callee_reg)?;
-        let bound_this = *read_register(&stack[top_idx], this_reg)?;
+        let target = *read_register(&stack[top_idx], callee_reg)
+            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+        let bound_this = *read_register(&stack[top_idx], this_reg)
+            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
         let mut bound_args: SmallVec<[Value; 4]> = SmallVec::with_capacity(arg_regs.len());
         for &reg in arg_regs {
-            bound_args.push(*read_register(&stack[top_idx], reg)?);
+            bound_args.push(
+                *read_register(&stack[top_idx], reg)
+                    .map_err(|error| CommittedValueError::Fatal(error.into()))?,
+            );
         }
         let result = self.finish_bind_function(
             stack,
@@ -693,7 +770,7 @@ impl Interpreter {
             target_proto,
         );
         self.pop_iteration_anchors_to(proto_anchor);
-        result
+        result.map_err(CommittedValueError::JavaScript)
     }
 
     /// Complete one `Op::BindFunction` for a published compiled frame.
@@ -709,10 +786,10 @@ impl Interpreter {
         frame_index: usize,
         packed_meta: u64,
         packed_args: u64,
-    ) -> Result<(), VmError> {
+    ) -> Result<(), CommittedValueError> {
         self.record_jit_runtime_stub_class(crate::native_abi::RuntimeStubClass::Reentrant);
         if frame_index + 1 != stack.len() {
-            return Err(VmError::InvalidOperand);
+            return Err(CommittedValueError::Fatal(VmError::InvalidOperand));
         }
         let saved_pc = stack[frame_index].pc;
         let dst = packed_meta as u16;
@@ -743,9 +820,9 @@ impl Interpreter {
         intrinsic: VmIntrinsicFunction,
         this_value: Value,
         args: SmallVec<[Value; 8]>,
-    ) -> Result<Value, VmError> {
+    ) -> Result<Value, CommittedValueError> {
         if !stack.is_runtime_rooted_by(self) {
-            return Err(VmError::InvalidOperand);
+            return Err(CommittedValueError::Fatal(VmError::InvalidOperand));
         }
         // Intrinsics can allocate before forwarding to their terminal callee
         // (`apply` materializes an argument list; `bind` performs observable
@@ -767,11 +844,11 @@ impl Interpreter {
         context: &ExecutionContext,
         intrinsic: VmIntrinsicFunction,
         roots: &crate::call_ops::SyncJsCallRoots,
-    ) -> Result<Value, VmError> {
+    ) -> Result<Value, CommittedValueError> {
         match intrinsic {
             VmIntrinsicFunction::FunctionPrototypeCall => {
                 if !self.is_callable_runtime(&roots.target()) {
-                    return Err(VmError::NotCallable);
+                    return Err(CommittedValueError::JavaScript(VmError::NotCallable));
                 }
                 let mut forwarded = roots.take_args();
                 let receiver = if forwarded.is_empty() {
@@ -780,11 +857,12 @@ impl Interpreter {
                     forwarded.remove(0)
                 };
                 let target = roots.target();
-                self.run_callable_sync_rooted(stack, context, &target, receiver, forwarded)
+                self.run_callable_sync_rooted(stack, Some(context), &target, receiver, forwarded)
+                    .map_err(CommittedValueError::completed_call)
             }
             VmIntrinsicFunction::FunctionPrototypeApply => {
                 if !self.is_callable_runtime(&roots.target()) {
-                    return Err(VmError::NotCallable);
+                    return Err(CommittedValueError::JavaScript(VmError::NotCallable));
                 }
                 let mut inputs = roots.take_args().into_iter();
                 let receiver = inputs.next().unwrap_or(Value::undefined());
@@ -799,11 +877,12 @@ impl Interpreter {
                 };
                 let target = roots.target();
                 let receiver = roots.receiver_value();
-                self.run_callable_sync_rooted(stack, context, &target, receiver, forwarded)
+                self.run_callable_sync_rooted(stack, Some(context), &target, receiver, forwarded)
+                    .map_err(CommittedValueError::completed_call)
             }
             VmIntrinsicFunction::FunctionPrototypeBind => {
                 if !self.is_callable_runtime(&roots.target()) {
-                    return Err(VmError::NotCallable);
+                    return Err(CommittedValueError::JavaScript(VmError::NotCallable));
                 }
                 let mut bound_args = roots.take_args();
                 let receiver = if bound_args.is_empty() {
@@ -822,7 +901,8 @@ impl Interpreter {
                     if target.is_proxy() {
                         self.ordinary_get_prototype_value(stack, context, target, 0)?
                     } else {
-                        self.get_prototype_for_op(&target)?
+                        self.get_prototype_for_op(&target)
+                            .map_err(|error| CommittedValueError::JavaScript(error.into()))?
                     }
                 };
                 roots.set_scratch(0, target_proto);
@@ -834,7 +914,11 @@ impl Interpreter {
                     let target = roots.target();
                     let key = VmPropertyKey::String("length");
                     let own = self.ordinary_get_own_property_descriptor_value(
-                        stack, context, target, &key, 0,
+                        stack,
+                        Some(context),
+                        target,
+                        &key,
+                        0,
                     )?;
                     if own.is_some() {
                         self.get_property_value_for_call(stack, context, target, "length")?
@@ -860,18 +944,20 @@ impl Interpreter {
                 let target = roots.target();
                 let receiver = roots.receiver_value();
                 let target_proto = roots.scratch(0);
-                let bound = self.alloc_bound_function(
-                    target,
-                    receiver,
-                    &bound_args,
-                    metadata,
-                    Some(target_proto),
-                )?;
+                let bound = self
+                    .alloc_bound_function(
+                        target,
+                        receiver,
+                        &bound_args,
+                        metadata,
+                        Some(target_proto),
+                    )
+                    .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
                 Ok(Value::bound_function(bound))
             }
             VmIntrinsicFunction::FunctionPrototypeToString => {
                 if !self.is_callable_runtime(&roots.target()) {
-                    return Err(VmError::NotCallable);
+                    return Err(CommittedValueError::JavaScript(VmError::NotCallable));
                 }
                 let display = {
                     let target = roots.target();
@@ -887,7 +973,8 @@ impl Interpreter {
                     function_metadata::callable_to_string(&mut ctx, &target)
                 };
                 let s = JsString::from_str(&display, &mut self.gc_heap)
-                    .map_err(|_| VmError::TypeMismatch)?;
+                    .map_err(|_| VmError::TypeMismatch)
+                    .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
                 Ok(Value::string(s))
             }
             VmIntrinsicFunction::FunctionPrototypeSymbolHasInstance => {
@@ -918,7 +1005,7 @@ impl Interpreter {
         context: &ExecutionContext,
         c: &Value,
         o: &Value,
-    ) -> Result<bool, VmError> {
+    ) -> Result<bool, CommittedValueError> {
         let mut constructor = *c;
         let mut object = *o;
         let mut prototype = Value::undefined();
@@ -950,9 +1037,12 @@ impl Interpreter {
         };
         prototype = resolved_prototype;
         if !(prototype.is_object_type() || prototype.is_proxy()) {
-            return Err(self.err_type(
-                ("Function has non-object prototype 'undefined' in instanceof check".to_string())
+            return Err(CommittedValueError::JavaScript(
+                self.err_type(
+                    ("Function has non-object prototype 'undefined' in instanceof check"
+                        .to_string())
                     .into(),
+                ),
             ));
         }
         self.value_has_proxy_aware_prototype(stack, context, object, &prototype)
@@ -968,7 +1058,7 @@ impl Interpreter {
         context: &ExecutionContext,
         v: &Value,
         target: &Value,
-    ) -> Result<bool, VmError> {
+    ) -> Result<bool, CommittedValueError> {
         let mut value = *v;
         let mut target = *target;
         let mut handler = Value::undefined();
@@ -983,20 +1073,23 @@ impl Interpreter {
         }
 
         if !target.is_object_type() {
-            return Err(self
-                .err_type(("Right-hand side of instanceof is not an object".to_string()).into()));
+            return Err(CommittedValueError::JavaScript(self.err_type(
+                ("Right-hand side of instanceof is not an object".to_string()).into(),
+            )));
         }
         let has_instance_sym = self.well_known_symbols.get(symbol::WellKnown::HasInstance);
         let key = VmPropertyKey::Symbol(has_instance_sym);
-        handler = match self.ordinary_get_value(stack, context, target, target, &key, 0)? {
+        handler = match self.ordinary_get_value(stack, Some(context), target, target, &key, 0)? {
             VmGetOutcome::Value(v) => v,
-            VmGetOutcome::InvokeGetter { getter } => {
-                self.run_callable_sync_rooted(stack, context, &getter, target, SmallVec::new())?
-            }
+            VmGetOutcome::InvokeGetter { getter } => self
+                .run_callable_sync_rooted(stack, Some(context), &getter, target, SmallVec::new())
+                .map_err(CommittedValueError::completed_call)?,
         };
         if !handler.is_nullish() {
             if !self.is_callable_runtime(&handler) {
-                return Err(self.err_type(("@@hasInstance must be callable".to_string()).into()));
+                return Err(CommittedValueError::JavaScript(
+                    self.err_type(("@@hasInstance must be callable".to_string()).into()),
+                ));
             }
             if let Some(native) = handler.as_native_function()
                 && native.is_vm_intrinsic(
@@ -1008,13 +1101,15 @@ impl Interpreter {
             }
             let mut args: SmallVec<[Value; 8]> = SmallVec::new();
             args.push(value);
-            let result = self.run_callable_sync_rooted(stack, context, &handler, target, args)?;
+            let result = self
+                .run_callable_sync_rooted(stack, Some(context), &handler, target, args)
+                .map_err(CommittedValueError::completed_call)?;
             return Ok(result.to_boolean(&self.gc_heap));
         }
         if !self.is_callable_runtime(&target) {
-            return Err(
-                self.err_type(("Right-hand side of instanceof is not callable".to_string()).into())
-            );
+            return Err(CommittedValueError::JavaScript(self.err_type(
+                ("Right-hand side of instanceof is not callable".to_string()).into(),
+            )));
         }
         self.ordinary_has_instance(stack, context, &target, &value)
     }
@@ -1036,7 +1131,11 @@ impl Interpreter {
         else {
             return None;
         };
-        let root = crate::object::cached_instance_root(prototype, &self.gc_heap)?;
+        let root = crate::object::shape_body::root_for_layout(
+            crate::object::cached_instance_root(prototype, &self.gc_heap)?,
+            crate::object::shape_body::inline_capacity_of(shape),
+            crate::object::ShapeState::ORDINARY,
+        )?;
         let root_id = crate::object::shape_body::id_of(root);
         let canonical = [true, false].into_iter().any(|mapped| {
             self.arguments_shape_cache
@@ -1064,7 +1163,7 @@ impl Interpreter {
         stack: &mut ActivationStack,
         context: &ExecutionContext,
         value: Value,
-    ) -> Result<SmallVec<[Value; 8]>, VmError> {
+    ) -> Result<SmallVec<[Value; 8]>, CommittedValueError> {
         if let Some(arr) = value.as_array() {
             // §7.3.18 step 4-5 — substitute holes with `undefined`.
             return Ok(crate::array::with_elements(
@@ -1089,9 +1188,9 @@ impl Interpreter {
         // `[[Get]]` ladder (RegExp, ArrayBuffer, DataView,
         // TypedArray, collections, etc.).
         if !value.is_object_type() {
-            return Err(self.err_type(
+            return Err(CommittedValueError::JavaScript(self.err_type(
                 ("Function.prototype.apply argument list must be object-like".to_string()).into(),
-            ));
+            )));
         }
         self.with_handle_scope(|interp, scope| {
             let source = interp.scoped_value(scope, value);
@@ -1100,7 +1199,8 @@ impl Interpreter {
             // Retain both the array-like source and all earlier result values
             // in the arena until the complete argument list is ready.
             let length_num = interp.coerce_to_number(stack, context, &length)?;
-            let len = to_length(&Value::number(length_num), &interp.gc_heap)?;
+            let len = to_length(&Value::number(length_num), &interp.gc_heap)
+                .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
             let mut values = SmallVec::<[_; 8]>::new();
             for index in 0..len {
                 let key = index.to_string();
@@ -1132,7 +1232,7 @@ impl Interpreter {
         context: &ExecutionContext,
         receiver: Value,
         key: &str,
-    ) -> Result<Value, VmError> {
+    ) -> Result<Value, CommittedValueError> {
         self.get_property_value_for_call(stack, context, receiver, key)
     }
 
@@ -1142,14 +1242,31 @@ impl Interpreter {
         context: &ExecutionContext,
         receiver: Value,
         key: &str,
-    ) -> Result<Value, VmError> {
-        let property_key = VmPropertyKey::String(key);
-        match self.ordinary_get_value(stack, context, receiver, receiver, &property_key, 0)? {
-            VmGetOutcome::Value(value) => Ok(value),
-            VmGetOutcome::InvokeGetter { getter } => {
-                self.run_callable_sync_rooted(stack, context, &getter, receiver, SmallVec::new())
+    ) -> Result<Value, CommittedValueError> {
+        self.with_handle_scope(|interp, scope| {
+            let receiver_root = interp.scoped_value(scope, receiver);
+
+            let property_key = VmPropertyKey::String(key);
+            match interp.ordinary_get_value(
+                stack,
+                Some(context),
+                receiver,
+                receiver,
+                &property_key,
+                0,
+            )? {
+                VmGetOutcome::Value(value) => Ok(value),
+                VmGetOutcome::InvokeGetter { getter } => interp
+                    .run_callable_sync_rooted(
+                        stack,
+                        Some(context),
+                        &getter,
+                        interp.escape_scoped(receiver_root),
+                        SmallVec::new(),
+                    )
+                    .map_err(CommittedValueError::completed_call),
             }
-        }
+        })
     }
 
     /// §7.3.22 `SpeciesConstructor(O, defaultConstructor)`. Reads
@@ -1163,37 +1280,58 @@ impl Interpreter {
         context: &ExecutionContext,
         obj: &Value,
         default_ctor: &Value,
-    ) -> Result<Value, VmError> {
-        let c = self.get_property_value_for_call(stack, context, *obj, "constructor")?;
-        if c.is_undefined() {
-            return Ok(*default_ctor);
-        }
-        if !c.is_object_type() {
-            return Err(self.err_type(("constructor property is not an object".to_string()).into()));
-        }
-        let species_sym = self
-            .well_known_symbols()
-            .get(crate::symbol::WellKnown::Species);
-        let s = match self.ordinary_get_value(
-            stack,
-            context,
-            c,
-            c,
-            &VmPropertyKey::Symbol(species_sym),
-            0,
-        )? {
-            VmGetOutcome::Value(value) => value,
-            VmGetOutcome::InvokeGetter { getter } => {
-                self.run_callable_sync_rooted(stack, context, &getter, c, SmallVec::new())?
+    ) -> Result<Value, CommittedValueError> {
+        self.with_handle_scope(|interp, scope| {
+            let object_root = interp.scoped_value(scope, *obj);
+            let default_root = interp.scoped_value(scope, *default_ctor);
+
+            let c = interp.get_property_value_for_call(
+                stack,
+                context,
+                interp.escape_scoped(object_root),
+                "constructor",
+            )?;
+            let constructor_root = interp.scoped_value(scope, c);
+            if c.is_undefined() {
+                return Ok(interp.escape_scoped(default_root));
             }
-        };
-        if s.is_nullish() {
-            return Ok(*default_ctor);
-        }
-        if abstract_ops::is_constructor(&s, context, &self.gc_heap) {
-            return Ok(s);
-        }
-        Err(self.err_type(("Symbol.species value is not a constructor".to_string()).into()))
+            if !c.is_object_type() {
+                return Err(CommittedValueError::JavaScript(interp.err_type(
+                    ("constructor property is not an object".to_string()).into(),
+                )));
+            }
+            let species_sym = interp
+                .well_known_symbols()
+                .get(crate::symbol::WellKnown::Species);
+            let s = match interp.ordinary_get_value(
+                stack,
+                Some(context),
+                c,
+                c,
+                &VmPropertyKey::Symbol(species_sym),
+                0,
+            )? {
+                VmGetOutcome::Value(value) => value,
+                VmGetOutcome::InvokeGetter { getter } => interp
+                    .run_callable_sync_rooted(
+                        stack,
+                        Some(context),
+                        &getter,
+                        interp.escape_scoped(constructor_root),
+                        SmallVec::new(),
+                    )
+                    .map_err(CommittedValueError::completed_call)?,
+            };
+            if s.is_nullish() {
+                return Ok(interp.escape_scoped(default_root));
+            }
+            if abstract_ops::is_constructor(&s, context, &interp.gc_heap) {
+                return Ok(s);
+            }
+            Err(CommittedValueError::JavaScript(interp.err_type(
+                ("Symbol.species value is not a constructor".to_string()).into(),
+            )))
+        })
     }
     pub(crate) fn callable_bind_metadata_get(
         &mut self,
@@ -1839,7 +1977,7 @@ impl Interpreter {
                 &mut this.gc_heap,
                 key,
                 descriptor,
-            );
+            )?;
             if ok && let Some(metadata_key) = function_metadata::ordinary_function_metadata_key(key)
             {
                 match this.iteration_anchor(owner_slot).as_closure(&this.gc_heap) {
@@ -1862,34 +2000,38 @@ impl Interpreter {
         function_id: u32,
         key: &str,
         has_prototype_property: bool,
-    ) -> bool {
-        // §10.2.4 — an ordinary function's implicit `prototype` slot is
-        // non-configurable: [[Delete]] refuses it.
+    ) -> Result<bool, otter_gc::OutOfMemory> {
         if key == "prototype" && has_prototype_property {
-            return false;
+            return Ok(false);
         }
+        let _runtime_roots = self.scope_runtime_roots_guard();
+        let mut owner_value = owner.map_or_else(|| Value::function(function_id), Value::closure);
+        let mut roots = otter_gc::RootScope::new(&mut self.gc_heap);
+        // SAFETY: the actual callable slot precedes the guard and is reloaded
+        // after the allocating dictionary owner returns.
+        unsafe { roots.add_value(&mut owner_value) };
         let Some(metadata_key) = function_metadata::ordinary_function_metadata_key(key) else {
-            return self
-                .callable_bag_read(owner, function_id)
-                .map(|bag| crate::object::delete(bag, &mut self.gc_heap, key))
-                .unwrap_or(true);
+            return match self.callable_bag_read(owner_value.as_closure(&self.gc_heap), function_id)
+            {
+                Some(mut bag) => crate::object::delete(&mut bag, &mut self.gc_heap, key),
+                None => Ok(true),
+            };
         };
-        if let Some(bag) = self.callable_bag_read(owner, function_id)
+        if let Some(mut bag) =
+            self.callable_bag_read(owner_value.as_closure(&self.gc_heap), function_id)
             && crate::object::get_own_descriptor(bag, &self.gc_heap, key).is_some()
-            && !crate::object::delete(bag, &mut self.gc_heap, key)
+            && !crate::object::delete(&mut bag, &mut self.gc_heap, key)?
         {
-            return false;
+            return Ok(false);
         }
-        // A closure instance records the deletion on its own body —
-        // sibling closures of the same template are unaffected.
-        match owner {
-            Some(c) => c.set_metadata_deleted(&mut self.gc_heap, metadata_key, true),
+        match owner_value.as_closure(&self.gc_heap) {
+            Some(closure) => closure.set_metadata_deleted(&mut self.gc_heap, metadata_key, true),
             None => {
                 self.function_deleted_metadata
                     .insert((function_id, metadata_key));
             }
         }
-        true
+        Ok(true)
     }
 
     pub(crate) fn try_function_object_static_call(
@@ -1898,7 +2040,7 @@ impl Interpreter {
         context: Option<&ExecutionContext>,
         method: otter_bytecode::method_id::ObjectMethod,
         args: &[Value],
-    ) -> Result<Option<Value>, VmError> {
+    ) -> Result<Option<Value>, CommittedValueError> {
         use otter_bytecode::method_id::ObjectMethod as M;
         let Some(mut target) = args.first().cloned() else {
             return Ok(None);
@@ -1907,7 +2049,7 @@ impl Interpreter {
             && matches!(method, M::Freeze | M::Seal | M::IsFrozen | M::IsSealed)
         {
             let Some(context) = context else {
-                return Err(VmError::InvalidOperand);
+                return Err(CommittedValueError::Fatal(VmError::InvalidOperand));
             };
             match method {
                 M::Freeze => {
@@ -1917,7 +2059,9 @@ impl Interpreter {
                         &mut target,
                         crate::object_internal_ops::ObjectIntegrityLevel::Frozen,
                     )? {
-                        return Err(self.err_type(("Object.freeze failed".to_string()).into()));
+                        return Err(CommittedValueError::JavaScript(
+                            self.err_type(("Object.freeze failed".to_string()).into()),
+                        ));
                     }
                     return Ok(Some(target));
                 }
@@ -1928,7 +2072,9 @@ impl Interpreter {
                         &mut target,
                         crate::object_internal_ops::ObjectIntegrityLevel::Sealed,
                     )? {
-                        return Err(self.err_type(("Object.seal failed".to_string()).into()));
+                        return Err(CommittedValueError::JavaScript(
+                            self.err_type(("Object.seal failed".to_string()).into()),
+                        ));
                     }
                     return Ok(Some(target));
                 }
@@ -1967,7 +2113,7 @@ impl Interpreter {
         {
             let Some(context) = context else {
                 return if target.is_proxy() {
-                    Err(VmError::InvalidOperand)
+                    Err(CommittedValueError::Fatal(VmError::InvalidOperand))
                 } else {
                     Ok(None)
                 };
@@ -1985,12 +2131,10 @@ impl Interpreter {
                     .into_iter()
                     .filter(|v| v.is_string())
                     .collect();
-                return Ok(Some(Value::array(self.function_static_array_from_values(
-                    &*stack,
-                    values,
-                    &[&target],
-                    &[args],
-                )?)));
+                return Ok(Some(Value::array(
+                    self.function_static_array_from_values(&*stack, values, &[&target], &[args])
+                        .map_err(|error| CommittedValueError::JavaScript(error.into()))?,
+                )));
             }
             if matches!(method, M::Keys) {
                 // For Proxy targets, route through the full §10.5.11
@@ -2013,7 +2157,7 @@ impl Interpreter {
                             let current = interp.escape_scoped(root);
                             let desc = interp.ordinary_get_own_property_descriptor_value(
                                 stack,
-                                context,
+                                Some(context),
                                 current,
                                 &VmPropertyKey::OwnedString(name.clone()),
                                 0,
@@ -2022,12 +2166,18 @@ impl Interpreter {
                                 enumerable.push(name);
                             }
                         }
-                        Ok::<_, VmError>(enumerable)
+                        Ok::<_, CommittedValueError>(enumerable)
                     })?;
-                    return Ok(Some(self.scoped_key_strings(&names)?));
+                    return Ok(Some(
+                        self.scoped_key_strings(&names)
+                            .map_err(|error| CommittedValueError::JavaScript(error.into()))?,
+                    ));
                 }
                 let keys = self.enumerable_own_string_keys_for_value(stack, context, target, 0)?;
-                return Ok(Some(self.scoped_key_strings(&keys)?));
+                return Ok(Some(
+                    self.scoped_key_strings(&keys)
+                        .map_err(|error| CommittedValueError::JavaScript(error.into()))?,
+                ));
             }
             let desc =
                 self.get_own_property_descriptor_for_value(stack, context, target, args.get(1))?;
@@ -2036,7 +2186,8 @@ impl Interpreter {
             }
             return match desc {
                 Some(desc) => Ok(Some(Value::object(
-                    self.function_static_descriptor_to_object(&desc, &[&target], args)?,
+                    self.function_static_descriptor_to_object(&desc, &[&target], args)
+                        .map_err(|error| CommittedValueError::JavaScript(error.into()))?,
                 ))),
                 None => Ok(Some(Value::undefined())),
             };
@@ -2060,14 +2211,16 @@ impl Interpreter {
                 let desc_slot = self
                     .push_iteration_anchor(args.get(2).copied().unwrap_or_else(Value::undefined))
                     - 1;
-                let outcome = (|this: &mut Self| -> Result<Option<Value>, VmError> {
-                    let key = Self::coerce_vm_property_key(args.get(1), &this.gc_heap)?;
+                let outcome = (|this: &mut Self| -> Result<Option<Value>, CommittedValueError> {
+                    let key = Self::coerce_vm_property_key(args.get(1), &this.gc_heap)
+                        .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
                     let desc_obj = this
                         .iteration_anchor(desc_slot)
                         .as_object()
-                        .ok_or(VmError::TypeMismatch)?;
-                    let descriptor =
-                        object_statics::coerce_to_descriptor(&desc_obj, &this.gc_heap)?;
+                        .ok_or(VmError::TypeMismatch)
+                        .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                    let descriptor = object_statics::coerce_to_descriptor(&desc_obj, &this.gc_heap)
+                        .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
                     let completed = descriptor.complete_for_new_property();
                     // The coercions above may have moved the receiver; the
                     // closure handle is re-derived from the anchor.
@@ -2080,35 +2233,44 @@ impl Interpreter {
                                 *sym,
                             ) && !this.ordinary_function_is_extensible(owner, function_id)
                             {
-                                return Err(VmError::TypeMismatch);
+                                return Err(CommittedValueError::JavaScript(VmError::TypeMismatch));
                             }
-                            let mut bag = this.function_user_bag(stack, owner, function_id, &[])?;
+                            let mut bag = this
+                                .function_user_bag(stack, owner, function_id, &[])
+                                .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
                             // Creating the bag allocates, which can move the
                             // descriptor's values: coerce it again from the
                             // anchored descriptor object.
                             let desc_obj = this
                                 .iteration_anchor(desc_slot)
                                 .as_object()
-                                .ok_or(VmError::TypeMismatch)?;
+                                .ok_or(VmError::TypeMismatch)
+                                .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
                             let descriptor =
-                                object_statics::coerce_to_descriptor(&desc_obj, &this.gc_heap)?;
+                                object_statics::coerce_to_descriptor(&desc_obj, &this.gc_heap)
+                                    .map_err(|error| {
+                                        CommittedValueError::JavaScript(error.into())
+                                    })?;
                             crate::object::define_own_symbol_property_partial(
                                 &mut bag,
                                 &mut this.gc_heap,
                                 *sym,
                                 descriptor,
                             )
+                            .map_err(|error| CommittedValueError::JavaScript(error.into()))?
                         }
-                        (Some(function_id), _) => this.ordinary_function_define_own_property(
-                            stack,
-                            context,
-                            owner,
-                            function_id,
-                            key.string_name()
-                                .expect("non-symbol key has string spelling"),
-                            Some(desc_obj),
-                            completed,
-                        )?,
+                        (Some(function_id), _) => this
+                            .ordinary_function_define_own_property(
+                                stack,
+                                context,
+                                owner,
+                                function_id,
+                                key.string_name()
+                                    .expect("non-symbol key has string spelling"),
+                                Some(desc_obj),
+                                completed,
+                            )
+                            .map_err(|error| CommittedValueError::JavaScript(error.into()))?,
                         (None, VmPropertyKey::Symbol(_)) => false,
                         (None, _) => {
                             let target = this.iteration_anchor(target_slot);
@@ -2122,10 +2284,11 @@ impl Interpreter {
                                     .expect("non-symbol key has string spelling"),
                                 completed,
                             )
+                            .map_err(|error| CommittedValueError::JavaScript(error.into()))?
                         }
                     };
                     if !ok {
-                        return Err(VmError::TypeMismatch);
+                        return Err(CommittedValueError::JavaScript(VmError::TypeMismatch));
                     }
                     Ok(Some(this.iteration_anchor(target_slot)))
                 })(self);
@@ -2133,7 +2296,8 @@ impl Interpreter {
                 outcome
             }
             M::GetOwnPropertyDescriptor => {
-                let key = Self::coerce_vm_property_key(args.get(1), &self.gc_heap)?;
+                let key = Self::coerce_vm_property_key(args.get(1), &self.gc_heap)
+                    .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
                 let desc = match (function_id, &key) {
                     (Some(function_id), VmPropertyKey::Symbol(sym)) => {
                         let Some(bag) = self.callable_bag_read(owner, function_id) else {
@@ -2142,13 +2306,15 @@ impl Interpreter {
                         crate::object::get_own_symbol_descriptor(bag, &self.gc_heap, *sym)
                     }
                     (Some(function_id), _) => {
-                        let desc = self.ordinary_function_own_property_descriptor(
-                            context,
-                            owner,
-                            function_id,
-                            key.string_name()
-                                .expect("non-symbol key has string spelling"),
-                        )?;
+                        let desc = self
+                            .ordinary_function_own_property_descriptor(
+                                context,
+                                owner,
+                                function_id,
+                                key.string_name()
+                                    .expect("non-symbol key has string spelling"),
+                            )
+                            .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
                         // An unallocated default `prototype` takes the
                         // generic path, which allocates it.
                         if desc.as_ref().is_some_and(|desc| {
@@ -2168,18 +2334,21 @@ impl Interpreter {
                             &mut self.gc_heap,
                             key.string_name()
                                 .expect("non-symbol key has string spelling"),
-                        )?
+                        )
+                        .map_err(|error| CommittedValueError::JavaScript(error.into()))?
                     }
                 };
                 match desc {
                     Some(desc) => Ok(Some(Value::object(
-                        self.function_static_descriptor_to_object(&desc, &[&target], args)?,
+                        self.function_static_descriptor_to_object(&desc, &[&target], args)
+                            .map_err(|error| CommittedValueError::JavaScript(error.into()))?,
                     ))),
                     None => Ok(Some(Value::undefined())),
                 }
             }
             M::HasOwn => {
-                let key = Self::coerce_vm_property_key(args.get(1), &self.gc_heap)?;
+                let key = Self::coerce_vm_property_key(args.get(1), &self.gc_heap)
+                    .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
                 let present = match (function_id, &key) {
                     (Some(function_id), VmPropertyKey::Symbol(sym)) => self
                         .callable_bag_read(owner, function_id)
@@ -2333,7 +2502,7 @@ impl Interpreter {
         owner: Option<crate::closure::JsClosure>,
         function_id: u32,
         name: &str,
-    ) -> Result<Value, VmError> {
+    ) -> Result<Value, CommittedValueError> {
         self.function_property_get_with_receiver(stack, context, owner, function_id, None, name)
     }
 
@@ -2488,13 +2657,13 @@ impl Interpreter {
                     &mut self.gc_heap,
                     index.to_string().as_str(),
                     desc,
-                );
+                )?;
             }
             let length = Value::number(crate::NumberValue::from_i32(args.len() as i32));
             let desc = crate::object::PropertyDescriptor::data(length, true, false, true);
-            crate::object::define_own_property(obj, &mut self.gc_heap, "length", desc);
+            crate::object::define_own_property(obj, &mut self.gc_heap, "length", desc)?;
             let desc = crate::object::PropertyDescriptor::data(callee_root, true, false, true);
-            crate::object::define_own_property(obj, &mut self.gc_heap, "callee", desc);
+            crate::object::define_own_property(obj, &mut self.gc_heap, "callee", desc)?;
         }
         Ok(Value::object(obj))
     }
@@ -2506,7 +2675,7 @@ impl Interpreter {
         owner: Option<crate::closure::JsClosure>,
         function_id: u32,
         name: &str,
-    ) -> Result<Value, VmError> {
+    ) -> Result<Value, CommittedValueError> {
         if let Some(bag) = self.callable_bag_read(owner, function_id) {
             match object::lookup_own(bag, &self.gc_heap, name) {
                 object::PropertyLookup::Data { value, .. } => return Ok(value),
@@ -2515,13 +2684,15 @@ impl Interpreter {
                         .map(Value::closure)
                         .unwrap_or_else(|| Value::function(function_id));
                     return match getter {
-                        Some(getter) => self.run_callable_sync_rooted(
-                            stack,
-                            context,
-                            &getter,
-                            receiver,
-                            SmallVec::new(),
-                        ),
+                        Some(getter) => self
+                            .run_callable_sync_rooted(
+                                stack,
+                                Some(context),
+                                &getter,
+                                receiver,
+                                SmallVec::new(),
+                            )
+                            .map_err(CommittedValueError::completed_call),
                         None => Ok(Value::undefined()),
                     };
                 }
@@ -2532,7 +2703,10 @@ impl Interpreter {
             let receiver = owner
                 .map(Value::closure)
                 .unwrap_or_else(|| Value::function(function_id));
-            if let Some(value) = self.legacy_restricted_property(stack, context, receiver, name)? {
+            if let Some(value) = self
+                .legacy_restricted_property(stack, context, receiver, name)
+                .map_err(|error| CommittedValueError::JavaScript(error.into()))?
+            {
                 return Ok(value);
             }
         }
@@ -2557,7 +2731,8 @@ impl Interpreter {
                     &mut ctx,
                     function_id,
                     name,
-                );
+                )
+                .map_err(|error| CommittedValueError::JavaScript(error.into()));
             }
         }
         // §10.1.8 OrdinaryGet continues at [[Prototype]] — a user-mutated
@@ -2581,18 +2756,20 @@ impl Interpreter {
             return self.with_handle_scope(|interp, scope| {
                 let receiver_handle = interp.scoped_value(scope, receiver);
                 let outcome =
-                    interp.ordinary_get_value(stack, context, parent, receiver, &key, 0)?;
+                    interp.ordinary_get_value(stack, Some(context), parent, receiver, &key, 0)?;
                 match outcome {
                     VmGetOutcome::Value(v) => Ok(v),
                     VmGetOutcome::InvokeGetter { getter } => {
                         let receiver = interp.escape_scoped(receiver_handle);
-                        interp.run_callable_sync_rooted(
-                            stack,
-                            context,
-                            &getter,
-                            receiver,
-                            SmallVec::new(),
-                        )
+                        interp
+                            .run_callable_sync_rooted(
+                                stack,
+                                Some(context),
+                                &getter,
+                                receiver,
+                                SmallVec::new(),
+                            )
+                            .map_err(CommittedValueError::completed_call)
                     }
                 }
             });
@@ -2620,10 +2797,11 @@ impl Interpreter {
         function_id: u32,
         receiver: Option<Value>,
         name: &str,
-    ) -> Result<Value, VmError> {
+    ) -> Result<Value, CommittedValueError> {
         let owner_context = context
             .for_function(function_id)
-            .map_err(|_| VmError::InvalidOperand)?;
+            .map_err(|_| VmError::InvalidOperand)
+            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
         let context = &*owner_context;
         if name != "prototype" {
             return self.function_property_get_non_prototype(
@@ -2637,7 +2815,9 @@ impl Interpreter {
         // §10.2.5 — the implicit property lives in its own slot, never in the
         // bag.
         if context.function_has_prototype_property(function_id) {
-            return self.function_prototype_value(stack, context, owner, function_id, receiver);
+            return self
+                .function_prototype_value(stack, context, owner, function_id, receiver)
+                .map_err(|error| CommittedValueError::JavaScript(error.into()));
         }
         // Arrows, methods and async (non-generator) functions have no implicit
         // `prototype`; a user-created one is an ordinary bag property, and an
@@ -2650,7 +2830,14 @@ impl Interpreter {
                     return match getter {
                         Some(g) if abstract_ops::is_callable(&g) => {
                             let recv = receiver.unwrap_or_else(|| Value::function(function_id));
-                            self.run_callable_sync_rooted(stack, context, &g, recv, SmallVec::new())
+                            self.run_callable_sync_rooted(
+                                stack,
+                                Some(context),
+                                &g,
+                                recv,
+                                SmallVec::new(),
+                            )
+                            .map_err(CommittedValueError::completed_call)
                         }
                         _ => Ok(Value::undefined()),
                     };
@@ -2666,37 +2853,31 @@ impl Interpreter {
         context: &ExecutionContext,
         function_id: u32,
         proto: JsObject,
-        mut parent: JsObject,
+        parent: JsObject,
     ) -> Result<(), VmError> {
-        if let Some(iterator_proto) = self
-            .constructor_prototype_value("Iterator")
-            .ok()
-            .and_then(|v| v.as_object())
-        {
-            object::set_prototype(parent, &mut self.gc_heap, Some(iterator_proto));
-        }
-        let tag_name = match context.function(function_id) {
-            Some(function) if function.is_async_generator => "AsyncGenerator",
-            _ => "Generator",
-        };
-        let tag = JsString::from_str(tag_name, self.gc_heap_mut())?;
-        let tag_sym = self
-            .well_known_symbols()
-            .get(symbol::WellKnown::ToStringTag);
-        object::define_own_symbol_property_partial(
-            &mut parent,
-            &mut self.gc_heap,
-            tag_sym,
-            object::PartialPropertyDescriptor {
-                value: Some(Value::string(tag)),
-                writable: Some(false),
-                enumerable: Some(false),
-                configurable: Some(true),
-                ..Default::default()
-            },
-        );
-        object::set_prototype(proto, &mut self.gc_heap, Some(parent));
-        Ok(())
+        self.with_handle_scope(|interp, scope| {
+            let prototype = interp.scoped_value(scope, Value::object(proto));
+            let parent = interp.scoped_value(scope, Value::object(parent));
+            let iterator = interp.constructor_prototype_value("Iterator")?;
+            if iterator.as_object().is_some() {
+                let iterator = interp.scoped_value(scope, iterator);
+                interp.scoped_set_prototype(scope, parent, Some(iterator))?;
+            }
+            let tag_name = match context.function(function_id) {
+                Some(function) if function.is_async_generator => "AsyncGenerator",
+                _ => "Generator",
+            };
+            interp
+                .define_to_string_tag(interp.escape_scoped(parent), tag_name)
+                .map_err(|error| match error {
+                    crate::js_surface::JsSurfaceError::OutOfMemory(error) => VmError::from(error),
+                    crate::js_surface::JsSurfaceError::DefinePropertyFailed(_) => {
+                        VmError::TypeError
+                    }
+                })?;
+            interp.scoped_set_prototype(scope, prototype, Some(parent))?;
+            Ok(())
+        })
     }
 
     pub(crate) fn load_global_prototype_method(

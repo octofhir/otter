@@ -102,12 +102,17 @@ fn module(functions: Vec<Function>, constants: Vec<Constant>) -> BytecodeModule 
 }
 
 fn run_on(interp: &mut Interpreter, module: BytecodeModule) -> Result<Value, RunError> {
-    let context = interp.link_module(module).expect("verified fixture");
+    let context = interp
+        .link_module(module, crate::source_registry::SourceRegistry::default())
+        .expect("verified fixture");
     interp.run(&context)
 }
 
 fn run(module: BytecodeModule) -> Result<Value, RunError> {
-    run_on(&mut Interpreter::new(), module)
+    run_on(
+        &mut Interpreter::new().expect("fixture interpreter bootstrap"),
+        module,
+    )
 }
 
 fn error_text(error: &RunError) -> String {
@@ -225,7 +230,7 @@ fn a_closure_updates_its_captured_slot_through_its_context() {
 #[test]
 fn contexts_survive_a_scavenge_or_full_collection_at_every_allocation() {
     for full in [false, true] {
-        let mut interp = Interpreter::new();
+        let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
         interp.gc_heap_mut().set_gc_stress(1, full);
         let result = run_on(&mut interp, closure_counter_module()).expect("program runs");
         interp.gc_heap_mut().set_gc_stress(0, false);
@@ -551,7 +556,7 @@ fn return_derived_yields_the_bound_this_an_object_or_an_error() {
     ];
     body.extend(raw_this_and_return(Operand::Register(4)));
     // Heap values are inspected while their interpreter is alive.
-    let mut interp = Interpreter::new();
+    let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
     let result =
         run_on(&mut interp, derived_constructor_module(body)).expect("construction completes");
     assert!(result.is_object(), "{result:?}");
@@ -559,7 +564,7 @@ fn return_derived_yields_the_bound_this_an_object_or_an_error() {
     // An object completion wins even without super().
     let mut body = vec![(Op::NewObject, vec![Operand::Register(4)])];
     body.extend(raw_this_and_return(Operand::Register(4)));
-    let mut interp = Interpreter::new();
+    let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
     let result = run_on(&mut interp, derived_constructor_module(body)).expect("object completion");
     assert!(result.is_object(), "{result:?}");
 
@@ -1031,9 +1036,12 @@ fn the_eval_caller_chain_lists_descriptors_extensions_and_the_var_scope() {
         scopes.clone(),
         vec![(Op::ReturnUndefined, Vec::new())],
     );
-    let mut interp = Interpreter::new();
+    let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
     let context = interp
-        .link_module(module(vec![main], vec![string("e")]))
+        .link_module(
+            module(vec![main], vec![string("e")]),
+            crate::source_registry::SourceRegistry::default(),
+        )
         .expect("verified fixture");
     let function_id = context.exec_main().id;
     let outer = interp

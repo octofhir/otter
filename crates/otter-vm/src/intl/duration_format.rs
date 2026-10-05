@@ -131,8 +131,7 @@ fn coerce_to_string(ctx: &mut NativeCtx<'_>, value: Value) -> Result<String, Nat
         let prim = ctx.with_turn_parts(|interp, stack| {
             interp.to_primitive_string_hint_sync(stack, &exec, value)
         });
-        let prim =
-            prim.map_err(|e| crate::native_function::vm_to_native_error(ctx.cx.interp, e, CLASS))?;
+        let prim = prim.map_err(|e| e.into_native(ctx.cx.interp, CLASS))?;
         if let Some(s) = prim.as_string(ctx.heap()) {
             return Ok(s.to_lossy_string(ctx.heap()));
         }

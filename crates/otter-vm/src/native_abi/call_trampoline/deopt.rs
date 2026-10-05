@@ -134,13 +134,14 @@ mod tests {
 
     #[test]
     fn native_deopt_entry_rejects_pc_and_payload_before_frame_transition() {
-        let context = ExecutionContext::from_module(crate::test_support::minimal_bytecode_module(
-            "deopt-entry-validation.js",
-        ))
+        let context = ExecutionContext::from_module(
+            crate::test_support::minimal_bytecode_module("deopt-entry-validation.js"),
+            crate::source_registry::SourceRegistry::default(),
+        )
         .unwrap();
-        let mut vm = Interpreter::new();
+        let mut vm = Interpreter::new().expect("fixture interpreter bootstrap");
         let mut stack = ActivationStack::new();
-        let mut activation = VmRuntimeActivation::new(&mut vm, &mut stack, &context);
+        let mut activation = VmRuntimeActivation::new(&mut vm, &mut stack, Some(&context));
         let mut thread = VmThread::empty();
         thread.runtime_context = std::ptr::from_mut(&mut activation) as u64;
         let mut registers = [Value::number_i32(91)];

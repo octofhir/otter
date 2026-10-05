@@ -8,10 +8,14 @@
 //! # Invariants
 //! - Coercion may call user code, so every entry here re-reads its receiver
 //!   from a rooted slot after the call rather than caching it across.
+//! - ToPropertyDescriptor forwards an actual optional source through the sole
+//!   Get/Has owners. Native callbacks require no fabricated dispatch context;
+//!   bytecode callbacks resolve their own admitted FunctionID.
 
 use super::*;
 use crate::activation_stack::ActivationStack;
 use crate::handles::HandleScope;
+use crate::native_abi::CommittedValueError;
 use crate::{
     ExecutionContext, Interpreter, Local, Value, VmError, VmGetOutcome, VmPropertyKey,
     abstract_ops, array, function_metadata, object, symbol, to_length,
@@ -33,7 +37,7 @@ impl Interpreter {
         context: &ExecutionContext,
         input: &Value,
         hint: abstract_ops::ToPrimitiveHint,
-    ) -> Result<Value, VmError> {
+    ) -> Result<Value, CommittedValueError> {
         if abstract_ops::is_primitive(input) {
             return Ok(*input);
         }
@@ -48,43 +52,50 @@ impl Interpreter {
             let current_input = interp.escape_scoped(input_handle);
             let exotic = match interp.ordinary_get_value(
                 stack,
-                context,
+                Some(context),
                 current_input,
                 current_input,
                 &VmPropertyKey::Symbol(to_prim_sym),
                 0,
             )? {
                 VmGetOutcome::Value(value) => value,
-                VmGetOutcome::InvokeGetter { getter } => interp.run_callable_sync_rooted(
-                    stack,
-                    context,
-                    &getter,
-                    interp.escape_scoped(input_handle),
-                    SmallVec::new(),
-                )?,
+                VmGetOutcome::InvokeGetter { getter } => interp
+                    .run_callable_sync_rooted(
+                        stack,
+                        Some(context),
+                        &getter,
+                        interp.escape_scoped(input_handle),
+                        SmallVec::new(),
+                    )
+                    .map_err(CommittedValueError::completed_call)?,
             };
             let exotic_handle = interp.scoped_value(scope, exotic);
             if !interp.escape_scoped(exotic_handle).is_nullish() {
                 if !interp.is_callable_runtime(&interp.escape_scoped(exotic_handle)) {
-                    return Err(interp.err_type(
+                    return Err(CommittedValueError::JavaScript(interp.err_type(
                         ("Symbol.toPrimitive method is not callable".to_string()).into(),
-                    ));
+                    )));
                 }
-                let hint_handle = interp.scoped_string(scope, hint.as_token())?;
+                let hint_handle = interp
+                    .scoped_string(scope, hint.as_token())
+                    .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
                 let args: SmallVec<[Value; 8]> =
                     smallvec::smallvec![interp.escape_scoped(hint_handle)];
-                let result = interp.run_callable_sync_rooted(
-                    stack,
-                    context,
-                    &interp.escape_scoped(exotic_handle),
-                    interp.escape_scoped(input_handle),
-                    args,
-                )?;
+                let result = interp
+                    .run_callable_sync_rooted(
+                        stack,
+                        Some(context),
+                        &interp.escape_scoped(exotic_handle),
+                        interp.escape_scoped(input_handle),
+                        args,
+                    )
+                    .map_err(CommittedValueError::completed_call)?;
                 if abstract_ops::is_primitive(&result) {
                     return Ok(result);
                 }
-                return Err(interp
-                    .err_type(("Symbol.toPrimitive returned a non-primitive".to_string()).into()));
+                return Err(CommittedValueError::JavaScript(interp.err_type(
+                    ("Symbol.toPrimitive returned a non-primitive".to_string()).into(),
+                )));
             }
             let current_input = interp.escape_scoped(input_handle);
             interp.evaluate_ordinary_to_primitive(stack, context, &current_input, hint)
@@ -106,7 +117,7 @@ impl Interpreter {
         context: &ExecutionContext,
         input: &Value,
         hint: abstract_ops::ToPrimitiveHint,
-    ) -> Result<Value, VmError> {
+    ) -> Result<Value, CommittedValueError> {
         self.with_handle_scope(|interp, scope| {
             let input_handle = interp.scoped_value(scope, *input);
             let names: [&str; 2] = match hint {
@@ -117,39 +128,43 @@ impl Interpreter {
                 let current_input = interp.escape_scoped(input_handle);
                 let method = match interp.ordinary_get_value(
                     stack,
-                    context,
+                    Some(context),
                     current_input,
                     current_input,
                     &VmPropertyKey::String(name),
                     0,
                 )? {
                     VmGetOutcome::Value(value) => value,
-                    VmGetOutcome::InvokeGetter { getter } => interp.run_callable_sync_rooted(
-                        stack,
-                        context,
-                        &getter,
-                        interp.escape_scoped(input_handle),
-                        SmallVec::new(),
-                    )?,
+                    VmGetOutcome::InvokeGetter { getter } => interp
+                        .run_callable_sync_rooted(
+                            stack,
+                            Some(context),
+                            &getter,
+                            interp.escape_scoped(input_handle),
+                            SmallVec::new(),
+                        )
+                        .map_err(CommittedValueError::completed_call)?,
                 };
                 let method_handle = interp.scoped_value(scope, method);
                 if !interp.is_callable_runtime(&interp.escape_scoped(method_handle)) {
                     continue;
                 }
-                let result = interp.run_callable_sync_rooted(
-                    stack,
-                    context,
-                    &interp.escape_scoped(method_handle),
-                    interp.escape_scoped(input_handle),
-                    SmallVec::new(),
-                )?;
+                let result = interp
+                    .run_callable_sync_rooted(
+                        stack,
+                        Some(context),
+                        &interp.escape_scoped(method_handle),
+                        interp.escape_scoped(input_handle),
+                        SmallVec::new(),
+                    )
+                    .map_err(CommittedValueError::completed_call)?;
                 if abstract_ops::is_primitive(&result) {
                     return Ok(result);
                 }
             }
-            Err(interp.err_type(
+            Err(CommittedValueError::JavaScript(interp.err_type(
                 ("OrdinaryToPrimitive could not convert object to primitive".to_string()).into(),
-            ))
+            )))
         })
     }
 
@@ -158,22 +173,25 @@ impl Interpreter {
     /// Reads every spec-named field (`enumerable`, `configurable`,
     /// `value`, `writable`, `get`, `set`) via the full `[[Get]]`
     /// ladder so accessor getters on the source object are invoked
-    /// observably and `HasProperty` walks the prototype chain.
+    /// observably and `HasProperty` walks the prototype chain. Native-only
+    /// descriptor reads keep None; each bytecode callback resolves its own
+    /// source by FunctionID through the canonical callable owner.
     ///
     /// # See also
     /// - <https://tc39.es/ecma262/#sec-topropertydescriptor>
     pub(crate) fn evaluate_to_property_descriptor(
         &mut self,
         stack: &mut ActivationStack,
-        context: &ExecutionContext,
+        context: Option<&ExecutionContext>,
         attributes: &Value,
-    ) -> Result<object::PartialPropertyDescriptor, VmError> {
+    ) -> Result<object::PartialPropertyDescriptor, CommittedValueError> {
         // Step 1 — `Type(Obj) is not Object → throw TypeError`. We
         // gate via the broader "type Object" check that includes
         // proxies / exotic value kinds.
         if !attributes.is_object_type() {
-            return Err(self
-                .err_type(("ToPropertyDescriptor argument must be an Object".to_string()).into()));
+            return Err(CommittedValueError::JavaScript(self.err_type(
+                ("ToPropertyDescriptor argument must be an Object".to_string()).into(),
+            )));
         }
 
         self.with_handle_scope(|interp, scope| {
@@ -181,7 +199,7 @@ impl Interpreter {
             let read_field = |interp: &mut Self,
                               stack: &mut ActivationStack,
                               name: &str|
-             -> Result<Option<Value>, VmError> {
+             -> Result<Option<Value>, CommittedValueError> {
                 let key = VmPropertyKey::String(name);
                 let current = interp.escape_scoped(attributes);
                 if !interp.ordinary_has_property_value(stack, context, current, &key, 0)? {
@@ -191,13 +209,15 @@ impl Interpreter {
                 let value =
                     match interp.ordinary_get_value(stack, context, current, current, &key, 0)? {
                         VmGetOutcome::Value(v) => v,
-                        VmGetOutcome::InvokeGetter { getter } => interp.run_callable_sync_rooted(
-                            stack,
-                            context,
-                            &getter,
-                            interp.escape_scoped(attributes),
-                            SmallVec::new(),
-                        )?,
+                        VmGetOutcome::InvokeGetter { getter } => interp
+                            .run_callable_sync_rooted(
+                                stack,
+                                context,
+                                &getter,
+                                interp.escape_scoped(attributes),
+                                SmallVec::new(),
+                            )
+                            .map_err(CommittedValueError::completed_call)?,
                     };
                 Ok(Some(value))
             };
@@ -213,18 +233,18 @@ impl Interpreter {
             if let Some(get) = get {
                 let current = interp.escape_scoped(get);
                 if !current.is_undefined() && !interp.is_callable_runtime(&current) {
-                    return Err(interp.err_type(
+                    return Err(CommittedValueError::JavaScript(interp.err_type(
                         ("Property descriptor `get` is not callable".to_string()).into(),
-                    ));
+                    )));
                 }
             }
             let set = read_field(interp, stack, "set")?.map(|v| interp.scoped_value(scope, v));
             if let Some(set) = set {
                 let current = interp.escape_scoped(set);
                 if !current.is_undefined() && !interp.is_callable_runtime(&current) {
-                    return Err(interp.err_type(
+                    return Err(CommittedValueError::JavaScript(interp.err_type(
                         ("Property descriptor `set` is not callable".to_string()).into(),
-                    ));
+                    )));
                 }
             }
 
@@ -237,9 +257,9 @@ impl Interpreter {
                 configurable,
             };
             if descriptor.is_accessor() && descriptor.is_data() {
-                return Err(interp.err_type(
+                return Err(CommittedValueError::JavaScript(interp.err_type(
                     ("Property descriptor mixes accessor + data fields".to_string()).into(),
-                ));
+                )));
             }
             Ok(descriptor)
         })
@@ -256,7 +276,7 @@ impl Interpreter {
         stack: &mut ActivationStack,
         context: &ExecutionContext,
         input: &Value,
-    ) -> Result<VmPropertyKey<'static>, VmError> {
+    ) -> Result<VmPropertyKey<'static>, CommittedValueError> {
         let primitive = self.evaluate_to_primitive(
             stack,
             context,
@@ -354,13 +374,14 @@ impl Interpreter {
         stack: &mut ActivationStack,
         context: &ExecutionContext,
         target: &Value,
-    ) -> Result<Vec<Value>, VmError> {
-        let target = self.with_handle_scope(|interp, scope| -> Result<Value, VmError> {
-            let target = interp.scoped_value(scope, *target);
-            let current = interp.escape_scoped(target);
-            interp.ensure_deferred_namespace_ready(stack, context, &current, true)?;
-            Ok(interp.escape_scoped(target))
-        })?;
+    ) -> Result<Vec<Value>, CommittedValueError> {
+        let target =
+            self.with_handle_scope(|interp, scope| -> Result<Value, CommittedValueError> {
+                let target = interp.scoped_value(scope, *target);
+                let current = interp.escape_scoped(target);
+                interp.ensure_deferred_namespace_ready(stack, context, &current, true)?;
+                Ok(interp.escape_scoped(target))
+            })?;
         // Own a mutable copy of the receiver so `push_own_key_string` can refresh
         // it after each key allocation: a moving collection during key building
         // relocates the receiver, and the branches below re-read it to gather
@@ -384,10 +405,14 @@ impl Interpreter {
                 &mut target,
                 &mut [],
                 names.iter().map(String::as_str),
-            )?;
+            )
+            .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
             // Re-read the receiver: the key allocations above may have moved
             // it; `target` is rewritten in place by the rooted visitor.
-            let obj = target.as_object().ok_or(VmError::InvalidOperand)?;
+            let obj = target
+                .as_object()
+                .ok_or(VmError::InvalidOperand)
+                .map_err(|error| CommittedValueError::Fatal(error.into()))?;
             let symbols: Vec<Value> = object::with_properties(obj, &self.gc_heap, |p| {
                 p.symbol_keys()
                     .filter(|k| !k.is_private_name())
@@ -399,9 +424,11 @@ impl Interpreter {
         }
         if let Some(proxy) = target.as_proxy() {
             if proxy.is_revoked(&self.gc_heap) {
-                return Err(self.err_type(
-                    ("Cannot perform 'ownKeys' on a proxy that has been revoked".to_string())
-                        .into(),
+                return Err(CommittedValueError::JavaScript(
+                    self.err_type(
+                        ("Cannot perform 'ownKeys' on a proxy that has been revoked".to_string())
+                            .into(),
+                    ),
                 ));
             }
             // The trap, the result's element getters, and the target's own
@@ -410,9 +437,13 @@ impl Interpreter {
                 let proxy_handle = interp.scoped_value(scope, Value::proxy(proxy));
                 let trap_args: SmallVec<[Value; 8]> =
                     smallvec::smallvec![proxy.target(&interp.gc_heap)];
-                let trap_result = match interp
-                    .invoke_proxy_trap(stack, context, &proxy, "ownKeys", trap_args)?
-                {
+                let trap_result = match interp.invoke_proxy_trap(
+                    stack,
+                    Some(context),
+                    &proxy,
+                    "ownKeys",
+                    trap_args,
+                )? {
                     crate::object_internal_ops::ProxyTrap::Trapped(trap_result) => trap_result,
                     crate::object_internal_ops::ProxyTrap::NoTrap {
                         target: fallthrough_target,
@@ -443,12 +474,14 @@ impl Interpreter {
                     &mut target,
                     &mut [],
                     names.iter().map(String::as_str),
-                )?;
+                )
+                .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
             }
             // Re-read the receiver after the index-key allocations above.
             let t = target
                 .as_typed_array(&self.gc_heap)
-                .ok_or(VmError::InvalidOperand)?;
+                .ok_or(VmError::InvalidOperand)
+                .map_err(|error| CommittedValueError::Fatal(error.into()))?;
             if let Some(bag) = t.expando(&self.gc_heap) {
                 let (strings, mut symbols): (Vec<String>, Vec<Value>) =
                     object::with_properties(bag, &self.gc_heap, |p| {
@@ -465,7 +498,8 @@ impl Interpreter {
                     &mut target,
                     &mut symbols,
                     strings.iter().map(String::as_str),
-                )?;
+                )
+                .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
                 keys.extend(symbols);
             }
             return Ok(keys);
@@ -485,12 +519,16 @@ impl Interpreter {
                 keys.reserve(value.len() as usize + 1);
                 for idx in 0..value.len() {
                     let key = idx.to_string();
-                    self.push_own_key_string(&mut keys, &mut target, &mut [], &key)?;
+                    self.push_own_key_string(&mut keys, &mut target, &mut [], &key)
+                        .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
                 }
             }
             let is_string_exotic = string_data.is_some();
             // Re-read the receiver after the index-key allocations above.
-            let obj = target.as_object().ok_or(VmError::InvalidOperand)?;
+            let obj = target
+                .as_object()
+                .ok_or(VmError::InvalidOperand)
+                .map_err(|error| CommittedValueError::Fatal(error.into()))?;
             let (ordinary_strings, mut symbols): (Vec<String>, Vec<Value>) =
                 object::with_properties(obj, &self.gc_heap, |p| {
                     (
@@ -527,14 +565,16 @@ impl Interpreter {
                         .map(String::as_str)
                         .chain(std::iter::once("length"))
                         .chain(non_index_strings.iter().map(String::as_str)),
-                )?;
+                )
+                .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
             } else {
                 self.push_own_key_strings(
                     &mut keys,
                     &mut target,
                     &mut symbols,
                     ordinary_strings.iter().map(String::as_str),
-                )?;
+                )
+                .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
             }
             keys.extend(symbols);
             return Ok(keys);
@@ -553,12 +593,16 @@ impl Interpreter {
                     .map(String::as_str)
                     .chain(std::iter::once("length"))
                     .chain(string_keys.iter().map(String::as_str)),
-            )?;
+            )
+            .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
             // §10.4.2 — own symbol-keyed properties follow the
             // string keys per §7.3.22 OrdinaryOwnPropertyKeys
             // ordering. Re-read the receiver after the key
             // allocations above.
-            let arr = target.as_array().ok_or(VmError::InvalidOperand)?;
+            let arr = target
+                .as_array()
+                .ok_or(VmError::InvalidOperand)
+                .map_err(|error| CommittedValueError::Fatal(error.into()))?;
             for sym in array::own_symbol_keys(arr, &self.gc_heap) {
                 keys.push(Value::symbol(sym));
             }
@@ -578,7 +622,8 @@ impl Interpreter {
                 &mut target,
                 &mut [],
                 names.iter().map(String::as_str),
-            )?;
+            )
+            .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
             return Ok(keys);
         }
         if let Some(native) = target.as_native_function() {
@@ -589,7 +634,8 @@ impl Interpreter {
                 &mut target,
                 &mut [],
                 names.iter().map(String::as_str),
-            )?;
+            )
+            .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
             return Ok(keys);
         }
         if let Some(bound) = target.as_bound_function() {
@@ -600,25 +646,30 @@ impl Interpreter {
                 &mut target,
                 &mut [],
                 names.iter().map(String::as_str),
-            )?;
+            )
+            .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
             return Ok(keys);
         }
         if let Some(class) = target.as_class_constructor() {
-            let names = self.class_constructor_own_property_keys(Some(context), class)?;
+            let names = self
+                .class_constructor_own_property_keys(Some(context), class)
+                .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
             let mut keys: Vec<Value> = Vec::with_capacity(names.len());
             self.push_own_key_strings(
                 &mut keys,
                 &mut target,
                 &mut [],
                 names.iter().map(String::as_str),
-            )?;
+            )
+            .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
             // §10.1.11 — symbol keys follow the string keys. A class
             // constructor's own symbol-keyed properties (e.g. a static
             // `[sym]() {}` method) live on its statics object. Re-read
             // the constructor after the key allocations above.
             let class = target
                 .as_class_constructor()
-                .ok_or(VmError::InvalidOperand)?;
+                .ok_or(VmError::InvalidOperand)
+                .map_err(|error| CommittedValueError::Fatal(error.into()))?;
             let statics = class.statics(&self.gc_heap);
             let symbols: Vec<Value> = object::with_properties(statics, &self.gc_heap, |p| {
                 p.symbol_keys()
@@ -631,9 +682,13 @@ impl Interpreter {
         }
         if target.as_regexp().is_some() {
             let mut keys = Vec::new();
-            self.push_own_key_string(&mut keys, &mut target, &mut [], "lastIndex")?;
+            self.push_own_key_string(&mut keys, &mut target, &mut [], "lastIndex")
+                .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
             // Re-read the receiver after the key allocation above.
-            let regexp = target.as_regexp().ok_or(VmError::InvalidOperand)?;
+            let regexp = target
+                .as_regexp()
+                .ok_or(VmError::InvalidOperand)
+                .map_err(|error| CommittedValueError::Fatal(error.into()))?;
             if let Some(expando) = regexp.expando(&self.gc_heap) {
                 let (strings, mut symbols): (Vec<String>, Vec<Value>) =
                     object::with_properties(expando, &self.gc_heap, |p| {
@@ -646,7 +701,8 @@ impl Interpreter {
                         )
                     });
                 for key in strings {
-                    self.push_own_key_string(&mut keys, &mut target, &mut symbols, &key)?;
+                    self.push_own_key_string(&mut keys, &mut target, &mut symbols, &key)
+                        .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
                 }
                 keys.extend(symbols);
             }
@@ -668,7 +724,8 @@ impl Interpreter {
                         )
                     });
                 for key in strings {
-                    self.push_own_key_string(&mut keys, &mut target, &mut symbols, &key)?;
+                    self.push_own_key_string(&mut keys, &mut target, &mut symbols, &key)
+                        .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
                 }
                 keys.extend(symbols);
             }
@@ -690,7 +747,8 @@ impl Interpreter {
                         )
                     });
                 for key in strings {
-                    self.push_own_key_string(&mut keys, &mut target, &mut symbols, &key)?;
+                    self.push_own_key_string(&mut keys, &mut target, &mut symbols, &key)
+                        .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
                 }
                 keys.extend(symbols);
             }
@@ -712,7 +770,8 @@ impl Interpreter {
                         )
                     });
                 for key in strings {
-                    self.push_own_key_string(&mut keys, &mut target, &mut symbols, &key)?;
+                    self.push_own_key_string(&mut keys, &mut target, &mut symbols, &key)
+                        .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
                 }
                 keys.extend(symbols);
             }
@@ -735,7 +794,8 @@ impl Interpreter {
                         )
                     });
                 for key in strings {
-                    self.push_own_key_string(&mut keys, &mut target, &mut symbols, &key)?;
+                    self.push_own_key_string(&mut keys, &mut target, &mut symbols, &key)
+                        .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
                 }
                 keys.extend(symbols);
             }
@@ -753,11 +813,11 @@ impl Interpreter {
         context: &ExecutionContext,
         scope: &'s HandleScope,
         list_value: Value,
-    ) -> Result<Vec<Local<'s>>, VmError> {
+    ) -> Result<Vec<Local<'s>>, CommittedValueError> {
         if !(list_value.is_object() || list_value.is_array() || list_value.is_proxy()) {
-            return Err(
-                self.err_type(("Proxy ownKeys trap result is not an Object".to_string()).into())
-            );
+            return Err(CommittedValueError::JavaScript(self.err_type(
+                ("Proxy ownKeys trap result is not an Object".to_string()).into(),
+            )));
         }
         // Every element read can run a getter; the list and each element
         // are parked before the next one.
@@ -765,7 +825,7 @@ impl Interpreter {
         let list_value = self.escape_scoped(list);
         let len_value = match self.ordinary_get_value(
             stack,
-            context,
+            Some(context),
             list_value,
             list_value,
             &VmPropertyKey::String("length"),
@@ -775,27 +835,38 @@ impl Interpreter {
             VmGetOutcome::InvokeGetter { getter } => {
                 let args: SmallVec<[Value; 8]> = SmallVec::new();
                 let list_value = self.escape_scoped(list);
-                self.run_callable_sync_rooted(stack, context, &getter, list_value, args)?
+                self.run_callable_sync_rooted(stack, Some(context), &getter, list_value, args)
+                    .map_err(CommittedValueError::completed_call)?
             }
         };
-        let len = to_length(&len_value, &self.gc_heap)?;
+        let len = to_length(&len_value, &self.gc_heap)
+            .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
         let mut out: Vec<Local<'s>> = Vec::with_capacity(len);
         for i in 0..len {
             let key = VmPropertyKey::OwnedString(i.to_string());
             let list_value = self.escape_scoped(list);
-            let element =
-                match self.ordinary_get_value(stack, context, list_value, list_value, &key, 0)? {
-                    VmGetOutcome::Value(v) => v,
-                    VmGetOutcome::InvokeGetter { getter } => {
-                        let args: SmallVec<[Value; 8]> = SmallVec::new();
-                        let list_value = self.escape_scoped(list);
-                        self.run_callable_sync_rooted(stack, context, &getter, list_value, args)?
-                    }
-                };
+            let element = match self.ordinary_get_value(
+                stack,
+                Some(context),
+                list_value,
+                list_value,
+                &key,
+                0,
+            )? {
+                VmGetOutcome::Value(v) => v,
+                VmGetOutcome::InvokeGetter { getter } => {
+                    let args: SmallVec<[Value; 8]> = SmallVec::new();
+                    let list_value = self.escape_scoped(list);
+                    self.run_callable_sync_rooted(stack, Some(context), &getter, list_value, args)
+                        .map_err(CommittedValueError::completed_call)?
+                }
+            };
             if !(element.is_string() || element.is_symbol()) {
-                return Err(self.err_type(
-                    ("Proxy ownKeys trap result contains a non-property-key entry".to_string())
-                        .into(),
+                return Err(CommittedValueError::JavaScript(
+                    self.err_type(
+                        ("Proxy ownKeys trap result contains a non-property-key entry".to_string())
+                            .into(),
+                    ),
                 ));
             }
             out.push(self.scoped_value(scope, element));
@@ -817,7 +888,7 @@ impl Interpreter {
         scope: &'s HandleScope,
         proxy: Local<'s>,
         trap_keys: &[Local<'s>],
-    ) -> Result<Vec<Value>, VmError> {
+    ) -> Result<Vec<Value>, CommittedValueError> {
         // Step 9 — reject duplicates. String keys hash into a set
         // (the spec requires linear behaviour here — see V8's
         // ownKeys-linear regression); symbol keys are compared
@@ -839,10 +910,12 @@ impl Interpreter {
                 match snap {
                     Some(name) => {
                         if !seen.insert(name.as_str()) {
-                            return Err(self.err_type(
-                                ("Proxy ownKeys trap result contains duplicate entries"
-                                    .to_string())
-                                .into(),
+                            return Err(CommittedValueError::JavaScript(
+                                self.err_type(
+                                    ("Proxy ownKeys trap result contains duplicate entries"
+                                        .to_string())
+                                    .into(),
+                                ),
                             ));
                         }
                     }
@@ -856,9 +929,12 @@ impl Interpreter {
                         &self.escape_scoped(trap_keys[symbol_indices[b]]),
                         &self.gc_heap,
                     ) {
-                        return Err(self.err_type(
-                            ("Proxy ownKeys trap result contains duplicate entries".to_string())
+                        return Err(CommittedValueError::JavaScript(
+                            self.err_type(
+                                ("Proxy ownKeys trap result contains duplicate entries"
+                                    .to_string())
                                 .into(),
+                            ),
                         ));
                     }
                 }
@@ -874,12 +950,13 @@ impl Interpreter {
             let proxy = self
                 .escape_scoped(proxy)
                 .as_proxy()
-                .ok_or(VmError::InvalidOperand)?;
+                .ok_or(VmError::InvalidOperand)
+                .map_err(|error| CommittedValueError::Fatal(error.into()))?;
             let target = proxy.target(&self.gc_heap);
             self.scoped_value(scope, target)
         };
         let target_value = self.escape_scoped(target);
-        let extensible_target = self.is_extensible_value(stack, context, &target_value)?;
+        let extensible_target = self.is_extensible_value(stack, Some(context), &target_value)?;
         let target_value = self.escape_scoped(target);
         let target_keys: Vec<Local<'s>> = self
             .own_property_keys_value(stack, context, &target_value)?
@@ -889,11 +966,12 @@ impl Interpreter {
         let mut target_configurable: Vec<Local<'s>> = Vec::new();
         let mut target_nonconfigurable: Vec<Local<'s>> = Vec::new();
         for key in target_keys {
-            let vm_key = property_key_from_value(&self.escape_scoped(key), &self.gc_heap)?;
+            let vm_key = property_key_from_value(&self.escape_scoped(key), &self.gc_heap)
+                .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
             let target_value = self.escape_scoped(target);
             let desc = self.ordinary_get_own_property_descriptor_value(
                 stack,
-                context,
+                Some(context),
                 target_value,
                 &vm_key,
                 0,
@@ -946,10 +1024,12 @@ impl Interpreter {
         for key in &target_nonconfigurable {
             let key = self.escape_scoped(*key);
             if !consume(&key, &mut consumed, &mut remaining, &self.gc_heap) {
-                return Err(self.err_type(
-                    ("Proxy ownKeys trap result omits a non-configurable target own key"
-                        .to_string())
-                    .into(),
+                return Err(CommittedValueError::JavaScript(
+                    self.err_type(
+                        ("Proxy ownKeys trap result omits a non-configurable target own key"
+                            .to_string())
+                        .into(),
+                    ),
                 ));
             }
         }
@@ -959,17 +1039,17 @@ impl Interpreter {
         for key in &target_configurable {
             let key = self.escape_scoped(*key);
             if !consume(&key, &mut consumed, &mut remaining, &self.gc_heap) {
-                return Err(self.err_type((
+                return Err(CommittedValueError::JavaScript(self.err_type((
                         "Proxy ownKeys trap result omits a target own key while target is non-extensible"
-                            .to_string()).into()));
+                            .to_string()).into())));
             }
         }
         if remaining != 0 {
-            return Err(self.err_type(
+            return Err(CommittedValueError::JavaScript(self.err_type(
                 ("Proxy ownKeys trap result includes extra keys while target is non-extensible"
                     .to_string())
                 .into(),
-            ));
+            )));
         }
         Ok(trap_result)
     }
@@ -983,7 +1063,7 @@ impl Interpreter {
         context: &ExecutionContext,
         target: &Value,
         proto: &Value,
-    ) -> Result<bool, VmError> {
+    ) -> Result<bool, CommittedValueError> {
         // Deferred namespaces have an immutable null [[Prototype]]
         // (§28.3 [[SetPrototypeOf]] = SetImmutablePrototype): succeed
         // only when the requested prototype is also null.
@@ -995,17 +1075,19 @@ impl Interpreter {
         }
         if let Some(proxy) = target.as_proxy() {
             if proxy.is_revoked(&self.gc_heap) {
-                return Err(self.err_type(
-                    ("Cannot perform 'setPrototypeOf' on a proxy that has been revoked"
-                        .to_string())
-                    .into(),
+                return Err(CommittedValueError::JavaScript(
+                    self.err_type(
+                        ("Cannot perform 'setPrototypeOf' on a proxy that has been revoked"
+                            .to_string())
+                        .into(),
+                    ),
                 ));
             }
             let trap_args: SmallVec<[Value; 8]> =
                 smallvec::smallvec![proxy.target(&self.gc_heap), *proto];
             return match self.invoke_proxy_trap(
                 stack,
-                context,
+                Some(context),
                 &proxy,
                 "setPrototypeOf",
                 trap_args,
@@ -1017,14 +1099,14 @@ impl Interpreter {
                     }
                     let target_value = proxy.target(&self.gc_heap);
                     let target_extensible =
-                        self.is_extensible_value(stack, context, &target_value)?;
+                        self.is_extensible_value(stack, Some(context), &target_value)?;
                     if !target_extensible {
                         let target_proto =
                             self.ordinary_get_prototype_value(stack, context, target_value, 0)?;
                         if !abstract_ops::same_value(proto, &target_proto, &self.gc_heap) {
-                            return Err(self.err_type((
+                            return Err(CommittedValueError::JavaScript(self.err_type((
                                     "Proxy setPrototypeOf invariant violated: target is non-extensible and prototypes differ"
-                                        .to_string()).into()));
+                                        .to_string()).into())));
                         }
                     }
                     Ok(true)
@@ -1102,10 +1184,14 @@ impl Interpreter {
             }
             let proto_opt = if proto.is_null() { None } else { Some(*proto) };
             let mut obj = obj;
-            return self.set_ordinary_prototype(&mut obj, proto_opt);
+            return self
+                .set_ordinary_prototype(&mut obj, proto_opt)
+                .map_err(|error| CommittedValueError::JavaScript(error.into()));
         }
         if let Some(arr) = target.as_array() {
-            let current_proto = self.get_prototype_for_op(target)?;
+            let current_proto = self
+                .get_prototype_for_op(target)
+                .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
             if abstract_ops::same_value(proto, &current_proto, &self.gc_heap) {
                 return Ok(true);
             }
@@ -1122,7 +1208,8 @@ impl Interpreter {
             } else {
                 return Ok(false);
             };
-            array::set_prototype_override(arr, &mut self.gc_heap, proto_opt);
+            array::set_prototype_override(arr, &mut self.gc_heap, proto_opt)
+                .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
             return Ok(true);
         }
         // §10.1.2 OrdinarySetPrototypeOf for interned functions and
@@ -1135,7 +1222,9 @@ impl Interpreter {
             .as_function()
             .or_else(|| owner.map(|c| c.cached_function_id));
         if let Some(function_id) = fid {
-            let current = self.get_prototype_for_op(target)?;
+            let current = self
+                .get_prototype_for_op(target)
+                .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
             if abstract_ops::same_value(proto, &current, &self.gc_heap) {
                 return Ok(true);
             }
@@ -1151,7 +1240,9 @@ impl Interpreter {
         // §10.4.1 bound function exotic objects use OrdinarySetPrototypeOf;
         // the override rides a body slot every prototype walk consults.
         if let Some(bound) = target.as_bound_function() {
-            let current = self.get_prototype_for_op(target)?;
+            let current = self
+                .get_prototype_for_op(target)
+                .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
             if abstract_ops::same_value(proto, &current, &self.gc_heap) {
                 return Ok(true);
             }
@@ -1168,11 +1259,13 @@ impl Interpreter {
         // `ObjectBody`, but the algorithm is the ordinary one: the
         // no-op case succeeds, a non-extensible object refuses, and a
         // chain that would run back into the target refuses.
-        let current = self.get_prototype_for_op(target)?;
+        let current = self
+            .get_prototype_for_op(target)
+            .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
         if abstract_ops::same_value(proto, &current, &self.gc_heap) {
             return Ok(true);
         }
-        if !self.is_extensible_value(stack, context, target)? {
+        if !self.is_extensible_value(stack, Some(context), target)? {
             return Ok(false);
         }
         let mut p = *proto;

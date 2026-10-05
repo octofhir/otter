@@ -7,6 +7,7 @@
 //! - `new Error(message)` object allocation.
 //! - Native error constructor allocation (`TypeError`, `RangeError`, ...).
 //! - Native error constructor loading for identifier reads.
+//! - One-shot native completion projection for direct semantic opcodes.
 //!
 //! # Invariants
 //! - Error kind names are compiler-emitted string constants.
@@ -18,13 +19,28 @@
 //! - Message coercion and error allocation share one rooted value kernel.
 //!   Construction stacks include published native frames and deopt owners once.
 //! - Native failures synthesized inside a runtime turn retain that turn's
-//!   activation stack as the allocation root set.
+//!   activation stack as the allocation root set; their uncaught display is
+//!   the materialized error's own rendering, class name included. Final owned
+//!   execution failures restore their original detail/frames without
+//!   materialization.
+//! - Direct-source VM OOM retains its catchable RangeError projection. A
+//!   completed execution failure bypasses projection, while explicitly authored
+//!   native OOM projects once; failure of that build escapes unchanged.
 //!
 //! # See also
 //! - [`crate::error_classes`]
 //! - [`crate::executable`]
 
+#[cfg(test)]
+mod boundary_tests;
+#[cfg(test)]
+mod completion_tests;
+#[cfg(test)]
+mod semantic_completion_tests;
+mod throwable;
+
 use crate::activation_stack::ActivationStack;
+use crate::native_abi::CommittedValueError;
 use crate::rooting::RootScopeExt;
 
 use crate::{
@@ -40,13 +56,17 @@ impl Interpreter {
         top_idx: usize,
         dst: u16,
         msg_reg: u16,
-    ) -> Result<(), VmError> {
+    ) -> Result<(), CommittedValueError> {
         let frame = &stack[top_idx];
-        let value = *read_register(frame, msg_reg)?;
+        let value = *read_register(frame, msg_reg)
+            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
         let value = self.new_error_value(context, stack, ErrorKind::Error, value)?;
         let frame = &mut stack[top_idx];
-        write_register(frame, dst, value)?;
-        frame.advance_pc()?;
+        write_register(frame, dst, value)
+            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+        frame
+            .advance_pc()
+            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
         Ok(())
     }
 
@@ -58,20 +78,27 @@ impl Interpreter {
         dst: u16,
         kind_idx: u32,
         msg_reg: u16,
-    ) -> Result<(), VmError> {
+    ) -> Result<(), CommittedValueError> {
         // Resolve the kind constant against the frame's own function so a
         // reentrant compiled cross-chunk entry decodes it against the owning
         // chunk, not the caller's constant pool.
         let kind_name = context
             .string_constant_str_for_function(stack[top_idx].function_id, kind_idx)
-            .ok_or(VmError::InvalidOperand)?;
-        let kind = ErrorKind::from_class_name(kind_name).ok_or(VmError::InvalidOperand)?;
+            .ok_or(VmError::InvalidOperand)
+            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+        let kind = ErrorKind::from_class_name(kind_name)
+            .ok_or(VmError::InvalidOperand)
+            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
         let frame = &stack[top_idx];
-        let value = *read_register(frame, msg_reg)?;
+        let value = *read_register(frame, msg_reg)
+            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
         let value = self.new_error_value(context, stack, kind, value)?;
         let frame = &mut stack[top_idx];
-        write_register(frame, dst, value)?;
-        frame.advance_pc()?;
+        write_register(frame, dst, value)
+            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+        frame
+            .advance_pc()
+            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
         Ok(())
     }
 
@@ -83,16 +110,18 @@ impl Interpreter {
         stack: &mut ActivationStack,
         kind: ErrorKind,
         mut message: Value,
-    ) -> Result<Value, VmError> {
+    ) -> Result<Value, CommittedValueError> {
         let mut roots = otter_gc::RootScope::new(&mut self.gc_heap);
         // SAFETY: message predates the scope and stays stationary until return.
         unsafe {
             roots.add_value(&mut message);
         }
         let owned_message = self.coerce_error_message(stack, context, &message)?;
-        let obj =
-            self.make_error_instance_with_stack_roots(stack, kind, owned_message, &message)?;
-        self.capture_error_stack_frames(context, obj);
+        let mut obj = self
+            .make_error_instance_with_stack_roots(stack, kind, owned_message, &message)
+            .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+        self.capture_error_stack_frames(context, &mut obj)
+            .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
         Ok(Value::object(obj))
     }
 
@@ -100,15 +129,20 @@ impl Interpreter {
     /// bounded by `Error.stackTraceLimit`) onto a freshly built error
     /// instance for `Error.prototype.stack`. No-op when the limit is 0
     /// or the stack is empty.
-    fn capture_error_stack_frames(&mut self, context: &ExecutionContext, obj: object::JsObject) {
+    fn capture_error_stack_frames(
+        &mut self,
+        context: &ExecutionContext,
+        obj: &mut object::JsObject,
+    ) -> Result<(), VmError> {
         let limit = self.current_stack_trace_limit();
         if limit == 0 {
-            return;
+            return Ok(());
         }
         let frames = self.snapshot_active_frames(context, limit);
         if !frames.is_empty() {
-            object::set_error_stack_frames(obj, self.gc_heap_mut(), frames);
+            object::set_error_stack_frames(obj, self.gc_heap_mut(), frames)?;
         }
+        Ok(())
     }
 
     /// §20.5.1.1 step 3 — coerce the `message` argument through full
@@ -121,7 +155,7 @@ impl Interpreter {
         stack: &mut ActivationStack,
         context: &ExecutionContext,
         value: &Value,
-    ) -> Result<Option<String>, VmError> {
+    ) -> Result<Option<String>, CommittedValueError> {
         if value.is_undefined() {
             return Ok(None);
         }
@@ -160,9 +194,11 @@ impl Interpreter {
             roots.add_object(&mut obj);
             roots.add_value(&mut message_gc_value);
         }
-        object::set_prototype(obj, &mut self.gc_heap, Some(proto));
+        if !object::set_prototype(&mut obj, &mut self.gc_heap, Some(proto))? {
+            return Err(VmError::TypeError);
+        }
         // §20.5.* — mark the `[[ErrorData]]` internal slot.
-        object::set_error_data(&mut obj, &mut self.gc_heap);
+        object::set_error_data(&mut obj, &mut self.gc_heap)?;
         if has_message {
             // §20.5.1.1 step 4.c — `msgDesc` is `{ [[Value]]: msg,
             // [[Writable]]: true, [[Enumerable]]: false,
@@ -174,7 +210,7 @@ impl Interpreter {
                 &mut self.gc_heap,
                 "message",
                 object::PropertyDescriptor::data(message_gc_value, true, false, true),
-            );
+            )?;
         }
         drop(roots);
         Ok(obj)
@@ -226,313 +262,6 @@ impl Interpreter {
             &message_root,
         )?;
         Ok(Value::object(obj))
-    }
-
-    /// `Error` instance. Returns `None` for variants that should
-    /// keep propagating as host errors (StackOverflow, etc.).
-    pub(crate) fn vm_error_to_throwable_with_stack_roots(
-        &mut self,
-        context: Option<&ExecutionContext>,
-        stack: &ActivationStack,
-        err: &VmError,
-    ) -> Option<Value> {
-        let error_realm_id = stack
-            .last()
-            .and_then(|frame| self.function_realm_ids.get(&frame.function_id))
-            .copied()
-            .unwrap_or(self.active_realm_id);
-        if error_realm_id != self.active_realm_id {
-            return self
-                .with_host_realm_id(error_realm_id, |interp| {
-                    Ok(interp.vm_error_to_throwable_with_stack_roots(context, stack, err))
-                })
-                .ok()
-                .flatten();
-        }
-        use crate::run_control::ErrorDetail;
-        let is_oom = matches!(err, VmError::OutOfMemory { .. });
-        // Node-style `.code` to stamp on the instance after it is built.
-        let mut node_code: Option<&'static str> = None;
-        // `VmError` is `Copy`; its dynamic message/payload lives in the isolate
-        // pending-error slot. Pull it out once, paired with the discriminant.
-        let detail = self.error_detail();
-        let msg_detail = || match &detail {
-            Some(ErrorDetail::Message(m)) => m.to_string(),
-            Some(ErrorDetail::Name(m)) => m.to_string(),
-            Some(ErrorDetail::Uncaught(m)) => m.to_string(),
-            _ => String::new(),
-        };
-        // System-call properties (`errno`, `syscall`, `path`, `dest`) to stamp
-        // alongside the code.
-        let mut syscall_detail: Option<crate::run_control::VmSyscallError> = None;
-        let dynamic_message: String;
-        let (kind, message): (error_classes::ErrorKind, &str) = match err {
-            VmError::Coded => {
-                if let Some(ErrorDetail::Syscall(payload)) = &detail {
-                    node_code = Some(payload.code);
-                    dynamic_message = payload.message.clone();
-                    syscall_detail = Some(payload.clone());
-                    (error_classes::ErrorKind::Error, dynamic_message.as_str())
-                } else if let Some(ErrorDetail::Coded(payload)) = &detail {
-                    node_code = Some(payload.code);
-                    dynamic_message = payload.message.clone();
-                    (payload.kind, dynamic_message.as_str())
-                } else {
-                    dynamic_message = msg_detail();
-                    (error_classes::ErrorKind::Error, dynamic_message.as_str())
-                }
-            }
-            VmError::TypeMismatch => (
-                error_classes::ErrorKind::TypeError,
-                "type mismatch: this operation does not accept a value of this type",
-            ),
-            VmError::TypeMismatchAt => {
-                dynamic_message = match &detail {
-                    Some(ErrorDetail::Mismatch(p)) => {
-                        format!("{}: cannot operate on a value of type {}", p.op, p.kind)
-                    }
-                    _ => "TypeError".to_string(),
-                };
-                (
-                    error_classes::ErrorKind::TypeError,
-                    dynamic_message.as_str(),
-                )
-            }
-            VmError::TypeError => {
-                dynamic_message = msg_detail();
-                (
-                    error_classes::ErrorKind::TypeError,
-                    dynamic_message.as_str(),
-                )
-            }
-            VmError::RangeError => {
-                dynamic_message = msg_detail();
-                (
-                    error_classes::ErrorKind::RangeError,
-                    dynamic_message.as_str(),
-                )
-            }
-            VmError::SyntaxError => {
-                dynamic_message = msg_detail();
-                (
-                    error_classes::ErrorKind::SyntaxError,
-                    dynamic_message.as_str(),
-                )
-            }
-            VmError::URIError => {
-                dynamic_message = msg_detail();
-                (error_classes::ErrorKind::URIError, dynamic_message.as_str())
-            }
-            VmError::NotCallable => (
-                error_classes::ErrorKind::TypeError,
-                "value is not a function",
-            ),
-            VmError::TemporalDeadZone { .. } => (
-                error_classes::ErrorKind::ReferenceError,
-                "cannot access binding before initialization",
-            ),
-            VmError::ThisUninitialized => {
-                dynamic_message = msg_detail();
-                (
-                    error_classes::ErrorKind::ReferenceError,
-                    dynamic_message.as_str(),
-                )
-            }
-            VmError::UndefinedIdentifier => {
-                dynamic_message = match &detail {
-                    Some(ErrorDetail::Name(name)) => format!("{name} is not defined"),
-                    _ => "identifier is not defined".to_string(),
-                };
-                (
-                    error_classes::ErrorKind::ReferenceError,
-                    dynamic_message.as_str(),
-                )
-            }
-            VmError::UnknownIntrinsic => (
-                error_classes::ErrorKind::TypeError,
-                "unknown intrinsic method",
-            ),
-            VmError::OutOfMemory { .. } => {
-                dynamic_message = err.to_string();
-                (
-                    error_classes::ErrorKind::RangeError,
-                    dynamic_message.as_str(),
-                )
-            }
-            // §25.5 JSON.parse / JSON.stringify spec-mandated
-            // exception classes:
-            //   parse failures → SyntaxError (§25.5.1.1 step 2),
-            //   cyclic / BigInt / depth / bad-arg → TypeError.
-            VmError::JsonError => {
-                let (jkind, jmsg) = match &detail {
-                    Some(ErrorDetail::Json(payload)) => {
-                        let kind = if payload.code == "JSON_PARSE" {
-                            error_classes::ErrorKind::SyntaxError
-                        } else {
-                            error_classes::ErrorKind::TypeError
-                        };
-                        (kind, payload.message.clone())
-                    }
-                    _ => (error_classes::ErrorKind::TypeError, String::new()),
-                };
-                dynamic_message = jmsg;
-                (jkind, dynamic_message.as_str())
-            }
-            // A blown call stack is a `RangeError` user code can catch, the
-            // way V8 answers one — Node's own stdlib and its tests recurse
-            // until it throws and then carry on. The instance is built by
-            // native allocation alone, so it needs none of the frames the
-            // exhausted stack can no longer hand out.
-            VmError::StackOverflow { .. } => (
-                error_classes::ErrorKind::RangeError,
-                "Maximum call stack size exceeded",
-            ),
-            // Hard / structural errors stay as host failures so the
-            // caller surfaces them through `RunError` rather than
-            // catching them as `try { ... } catch`.
-            _ => return None,
-        };
-        let mut obj = if is_oom {
-            let proto = match crate::object::get(
-                self.error_classes.constructor(kind),
-                &self.gc_heap,
-                "prototype",
-            ) {
-                Some(v) if let Some(proto) = v.as_object() => proto,
-                _ => self.error_classes.prototype(kind),
-            };
-            // Error prototypes carry their instances' root from bootstrap on,
-            // so finding it allocates nothing on an exhausted heap.
-            let root = crate::object::root_for_prototype(&mut self.gc_heap, Some(proto)).ok()?;
-            crate::object::alloc_diagnostic_object(&mut self.gc_heap, root).ok()?
-        } else {
-            self.make_error_instance_with_stack_roots(
-                stack,
-                kind,
-                Some(message.to_string()),
-                &Value::undefined(),
-            )
-            .ok()?
-        };
-        // Build the diagnostic `message` / `code` / `info` properties inside a
-        // handle scope. `obj` is a young object; each `from_str` and the nested
-        // `info` allocation can relocate it, so writing through the raw local
-        // would target a vacated cell. The scope parks `obj`, resolves it
-        // through the arena for every write, and hands back its post-relocation
-        // offset for the stack-frame capture below. String-allocation failures
-        // skip the individual property, matching the original best-effort build.
-        obj = self.with_handle_scope(|interp, scope| {
-            let obj_h = interp.scoped_value(scope, Value::object(obj));
-            if is_oom && let Ok(message_h) = interp.scoped_string(scope, message) {
-                let _ = interp.scoped_set(scope, obj_h, "message", message_h);
-            }
-            // Stamp the Node-style `.code` as an own, non-enumerable, writable,
-            // configurable property (matches Node's error.code descriptor).
-            if let Some(code) = node_code {
-                if let Ok(code_h) = interp.scoped_string(scope, code) {
-                    let _ = interp.scoped_define_data(
-                        scope,
-                        obj_h,
-                        "code",
-                        code_h,
-                        crate::object::PropertyFlags::new(true, false, true),
-                    );
-                }
-                // Node's `ERR_*` classes render as `Name [CODE]: message`
-                // from `toString()` while `.name` stays clean. Syscall codes
-                // (`EPERM`, `ENOENT`, ...) are plain errors and keep the
-                // default rendering.
-                if code.starts_with("ERR_")
-                    && let Ok(to_string) = crate::native_function::native_value_static(
-                        &mut interp.gc_heap,
-                        "toString",
-                        0,
-                        coded_error_to_string,
-                    )
-                {
-                    let to_string_h = interp.scoped_value(scope, to_string);
-                    let _ = interp.scoped_define_data(
-                        scope,
-                        obj_h,
-                        "toString",
-                        to_string_h,
-                        crate::object::PropertyFlags::new(true, false, true),
-                    );
-                }
-                if let Some(payload) = &syscall_detail {
-                    // Node reports the platform errno negated, and names the
-                    // call plus the paths it was given.
-                    let errno = interp.scoped_value(
-                        scope,
-                        Value::number(crate::NumberValue::from_f64(f64::from(payload.errno))),
-                    );
-                    let _ = interp.scoped_define_data(
-                        scope,
-                        obj_h,
-                        "errno",
-                        errno,
-                        crate::object::PropertyFlags::new(true, false, true),
-                    );
-                    if let Ok(syscall_h) = interp.scoped_string(scope, payload.syscall) {
-                        let _ = interp.scoped_define_data(
-                            scope,
-                            obj_h,
-                            "syscall",
-                            syscall_h,
-                            crate::object::PropertyFlags::new(true, false, true),
-                        );
-                    }
-                    for (name, value) in [("path", &payload.path), ("dest", &payload.dest)] {
-                        let Some(value) = value else { continue };
-                        if let Ok(value_h) = interp.scoped_string(scope, value) {
-                            let _ = interp.scoped_define_data(
-                                scope,
-                                obj_h,
-                                name,
-                                value_h,
-                                crate::object::PropertyFlags::new(true, false, true),
-                            );
-                        }
-                    }
-                }
-                if code == "ERR_SYSTEM_ERROR" {
-                    if let Ok(name_h) = interp.scoped_string(scope, "SystemError") {
-                        let _ = interp.scoped_define_data(
-                            scope,
-                            obj_h,
-                            "name",
-                            name_h,
-                            crate::object::PropertyFlags::new(true, false, true),
-                        );
-                    }
-                    if let Ok(info_h) = interp.scoped_object_bare(scope) {
-                        if let Ok(info_code_h) =
-                            interp.scoped_string(scope, system_error_code(message))
-                        {
-                            let _ = interp.scoped_set(scope, info_h, "code", info_code_h);
-                        }
-                        let _ = interp.scoped_define_data(
-                            scope,
-                            obj_h,
-                            "info",
-                            info_h,
-                            crate::object::PropertyFlags::new(true, false, true),
-                        );
-                    }
-                }
-            }
-            interp
-                .escape_scoped(obj_h)
-                .as_object()
-                .expect("error object handle resolves to an object")
-        });
-        // Engine-raised errors carry the same construction-site call stack
-        // as user `new Error(...)` instances, so `e.stack` shows frames for
-        // a VM TypeError exactly like V8/JSC.
-        if let Some(context) = context {
-            self.capture_error_stack_frames(context, obj);
-        }
-        Some(Value::object(obj))
     }
 }
 
@@ -640,6 +369,61 @@ pub(crate) fn native_to_vm_error(interp: &mut crate::Interpreter, err: NativeErr
     native_to_vm_error_with_stack(interp, &ActivationStack::new(), err)
 }
 
+/// Project one native failure into an exception value using the existing VM
+/// error owner. An allocation that failed while synthesizing the native error
+/// must escape as its exact OOM, rather than initiate another rejection build.
+/// An original native OOM follows ordinary catchable RangeError projection;
+/// deferred-result owners apply their own no-materialization OOM policy.
+pub(crate) fn native_error_to_throwable_with_stack(
+    interp: &mut Interpreter,
+    stack: &ActivationStack,
+    context: Option<&ExecutionContext>,
+    error: NativeError,
+) -> Result<Value, VmError> {
+    if let NativeError::ExecutionFailure(failure) = error {
+        return Err(restore_execution_failure(interp, failure));
+    }
+    let original_oom = matches!(error, NativeError::OutOfMemory { .. });
+    let error = native_to_vm_error_with_stack(interp, stack, error);
+    if error.is_fatal() || (!original_oom && matches!(error, VmError::OutOfMemory { .. })) {
+        return Err(error);
+    }
+    interp.vm_error_to_throwable_with_stack_roots(context, stack, &error)
+}
+
+/// Finish a native operation at its live source/root boundary exactly once.
+///
+/// A boxed exception follows source handlers through `Uncaught`. An imported
+/// execution failure or refusal while building that exception is already
+/// terminal; its exact pending detail/frames must bypass source materialization.
+pub(crate) fn native_error_to_committed_with_stack(
+    interp: &mut Interpreter,
+    stack: &ActivationStack,
+    context: Option<&ExecutionContext>,
+    error: NativeError,
+) -> crate::CommittedValueError {
+    match native_error_to_throwable_with_stack(interp, stack, context, error) {
+        Ok(exception) => {
+            interp.set_pending_uncaught_throw(exception);
+            crate::CommittedValueError::JavaScript(VmError::Uncaught)
+        }
+        Err(error) => crate::CommittedValueError::Fatal(error),
+    }
+}
+
+/// Restore the one owned execution failure without rematerializing a value.
+fn restore_execution_failure(interp: &mut Interpreter, failure: crate::RunError) -> VmError {
+    interp.pending_uncaught_throw = None;
+    if !failure.is_fatal() {
+        let _ = interp.take_error_detail();
+        interp.pending_uncaught_frames = None;
+        return VmError::InvalidOperand;
+    }
+    *interp.pending_error_detail.borrow_mut() = failure.detail;
+    interp.pending_uncaught_frames = (!failure.frames.is_empty()).then_some(failure.frames);
+    failure.error
+}
+
 /// Convert a native failure while retaining the current activation stack as an
 /// allocation root for the synthesized JavaScript error object.
 pub(crate) fn native_to_vm_error_with_stack(
@@ -660,14 +444,22 @@ pub(crate) fn native_to_vm_error_with_stack(
             &Value::undefined(),
         ) {
             Ok(obj) => {
-                interp.set_pending_uncaught_throw(Value::object(obj));
-                interp.err_uncaught(message.into())
+                let thrown = Value::object(obj);
+                interp.set_pending_uncaught_throw(thrown);
+                // The uncaught display is the thrown value's own rendering,
+                // `Name: message` first, as for every other escaping throw.
+                let display = interp.render_thrown(&thrown);
+                interp.err_uncaught(display.into())
             }
             Err(err) => err,
         }
     }
 
     match err {
+        NativeError::Resource { error } => interp.err_resource(error),
+        NativeError::ExecutionFailure(failure) => restore_execution_failure(interp, failure),
+        NativeError::MissingReturn => VmError::MissingReturn,
+        NativeError::InvalidOperand => VmError::InvalidOperand,
         NativeError::Thrown { name: _, message } => interp.err_uncaught(message.into()),
         NativeError::Error { message } => {
             native_spec_error(interp, stack, ErrorKind::Error, message)
@@ -739,22 +531,6 @@ pub(crate) fn native_to_vm_error_with_stack(
     }
 }
 
-/// Convert a `VmError` into a JS `Value` used as a rejection
-/// reason for promise reactions. Foundation: a plain string is
-/// fine; once the full Error hierarchy is in we'll synthesize a
-/// real `TypeError` / `RangeError` instance.
-pub(crate) fn vm_err_to_value(interp: &mut crate::Interpreter, err: &VmError) -> Value {
-    let message = interp.render_vm_error(err);
-    let heap = interp.gc_heap_mut();
-    Value::string(
-        crate::JsString::from_str(&message, heap).unwrap_or_else(|_| {
-            // Allocator failure here is exceptional; substitute
-            // an empty string rather than panicking.
-            crate::JsString::from_str("", heap).expect("empty string allocates")
-        }),
-    )
-}
-
 impl crate::Interpreter {
     /// Render a thrown JS value for diagnostics, with a
     /// constructor-name fallback over the heap-only
@@ -782,13 +558,22 @@ impl crate::Interpreter {
                     return rendered;
                 }
             }
-            if crate::object::has_error_data(obj, heap)
-                && let Some(frames) = crate::object::error_stack_frames(obj, heap)
-                && !frames.is_empty()
-            {
+            if crate::object::has_error_data(obj, heap) {
                 let mut rendered = error_classes::render_error_to_string(value, heap);
-                if !rendered.is_empty() {
-                    error_classes::append_stack_frames(&mut rendered, &frames, self);
+                if !rendered.is_empty()
+                    && crate::object::visit_error_stack_frames(
+                        obj,
+                        heap,
+                        |name, module, position| {
+                            error_classes::append_stack_frame(
+                                &mut rendered,
+                                name,
+                                module,
+                                position,
+                            );
+                        },
+                    )
+                {
                     return rendered;
                 }
             }

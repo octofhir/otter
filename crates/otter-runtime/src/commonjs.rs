@@ -29,6 +29,9 @@
 //!   [`NativeScope`] arena. Its cache, module record, exports, dependency
 //!   values, require closure, and wrapper stay collector-rewritten until the
 //!   result is published, and the arena is released on every exit.
+//! - Builtin discovery returns `None` before cache preparation or installation.
+//!   A discovered builtin retains every installer/allocation error unchanged;
+//!   only a caller whose contract permits absence may consume `None`.
 //! - Hosted namespace and CommonJS-value installers run directly in the
 //!   loader's existing handle scope. Namespace cache publication and
 //!   `require.cache` publication happen before that scope closes.
@@ -142,30 +145,31 @@ fn report_watch_dependency(ctx: &mut NativeCtx<'_>, filename: &str) {
     });
 }
 
-/// Run an embedded JavaScript shim as a CommonJS module and return its
+/// Run a builtin CommonJS module the product build compiled and return its
 /// `module.exports`. For builtin modules whose natural implementation is a
 /// self-contained JS class or helper set (e.g. `events`, `node:test`).
 ///
-/// The shim runs through the same wrapper as a file module
-/// (`(function (exports, require, module, __filename, __dirname) { ... })`).
-/// The supplied `module` is the live record already present in the shared
-/// cache and `require` is the importing module's canonical resolver. A shim's
-/// dependency loads and `module.exports` replacements therefore participate in
-/// exactly the same singleton and circular-loading semantics as file modules.
-/// `__filename`/`__dirname` use `name` for diagnostics.
+/// The builtin's wrapper text is exactly a file module's
+/// (`(function (exports, require, module, __filename, __dirname) { ... })`),
+/// and its embedded module links after host verification, on its first
+/// `require` only. The supplied `module` is the live record already present
+/// in the shared cache and `require` is the importing module's canonical
+/// resolver. A builtin's dependency loads and `module.exports` replacements
+/// therefore participate in exactly the same singleton and circular-loading
+/// semantics as file modules. `__filename`/`__dirname` use the builtin's URL
+/// for diagnostics.
 ///
 /// # Errors
-/// Returns a native error on allocation, compile, or runtime failure.
+/// Returns a native error on allocation, verification, or runtime failure.
 pub fn run_builtin_cjs_shim<'scope>(
     scope: &mut NativeScope<'scope, '_>,
-    name: &str,
-    source: &str,
+    unit: &'static otter_vm::EmbeddedCommonJs,
     module: Local<'scope>,
     require: Local<'scope>,
 ) -> Result<Local<'scope>, NativeError> {
     let exports = scope.get(module, "exports")?;
-    let module_name = scope.string(name)?;
-    let wrapper = scope.builtin_commonjs_wrapper(name, source)?;
+    let module_name = scope.string(unit.url)?;
+    let wrapper = scope.embedded_commonjs_wrapper(unit)?;
     scope.call(
         wrapper,
         exports,
@@ -673,17 +677,19 @@ pub(crate) fn cjs_load(
 /// return, and that object can only be produced by running the installer with
 /// a working `require` in hand.
 ///
+/// Returns `None` when discovery finds no hosted builtin, before cache
+/// preparation or installation.
+///
 /// # Errors
-/// Returns a native error when the specifier is not a hosted builtin, or when
-/// the installer fails.
+/// Returns the original native error from cache preparation or installation.
 pub(crate) fn cjs_load_builtin<'scope>(
     scope: &mut NativeScope<'scope, '_>,
     cfg: &Arc<CjsConfig>,
     specifier: &str,
-) -> Result<Local<'scope>, NativeError> {
-    let hosted = resolve_builtin(cfg, specifier, false).ok_or_else(|| {
-        runtime_type_error("import", format!("no builtin module named '{specifier}'"))
-    })?;
+) -> Result<Option<Local<'scope>>, NativeError> {
+    let Some(hosted) = resolve_builtin(cfg, specifier, false) else {
+        return Ok(None);
+    };
     let key = hosted.specifier().to_string();
     let resolution = CjsResolution {
         filename: key.clone(),
@@ -692,7 +698,7 @@ pub(crate) fn cjs_load_builtin<'scope>(
         target: CjsTarget::Hosted(hosted),
     };
     let cache = canonical_cache(scope)?;
-    load_resolved_scoped(scope, cfg, cache, &resolution, None)
+    load_resolved_scoped(scope, cfg, cache, &resolution, None).map(Some)
 }
 
 /// The realm's one require cache. Every load path — the CommonJS entry

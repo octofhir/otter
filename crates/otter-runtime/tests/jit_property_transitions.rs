@@ -7,7 +7,7 @@
 //! - A receiver whose slab was reserved ahead of its length, so an inline
 //!   slot index meets a non-null slab handle: a compiled caller constructs
 //!   through the generated direct-construct boundary, whose receiver
-//!   preparation reserves the whole transition program's capacity before the
+//!   preparation reserves the source-proven field capacity before the
 //!   first store, and the constructor's non-scalar field values keep it off
 //!   the pre-shaped simple-constructor path.
 //! - The runtime property-stub count, which must stay bounded by the slab
@@ -20,9 +20,9 @@
 //! - Appending slot zero to a receiver that already owns an out-of-line slab
 //!   leaves its value base on that slab; every later slab-relative store must
 //!   land in the slab, never in the body.
-//! - A constructor body proves its receiver's storage capacity before every
-//!   baked field transition; a receiver that arrived without the program's
-//!   reservation (a foreign `new.target`) exits to the canonical store instead
+//! - Executable property CacheIR and shared transition probes prove storage
+//!   before a generated store; a receiver that arrived without source-proven
+//!   reservation (a foreign `new.target`) takes the canonical store instead
 //!   of writing past the inline words.
 
 use otter_runtime::{JitSelection, Runtime, SourceInput};
@@ -195,8 +195,8 @@ fn run_unreserved_receiver(selection: JitSelection) -> (String, u64) {
 
 #[test]
 fn constructor_field_transitions_prove_storage_for_any_receiver() {
-    // `warm` promotes the constructor to the optimizing tier with baked field
-    // transitions. `foreign` then constructs it through a `new.target` that
+    // `warm` promotes the constructor with executable property feedback.
+    // `foreign` then constructs it through a `new.target` that
     // receiver preparation does not reserve for, and `runtime` through the
     // runtime construct boundary; the generated body must prove every slab
     // slot's storage (deopting to the canonical store that grows the slab)

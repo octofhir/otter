@@ -19,10 +19,12 @@
 //! roots for the entire call. Binding/declaration/object-protocol/scalar entries
 //! receive only boxed values; the published function/PC selects a typed
 //! operation before semantics begin. Their JavaScript throws return as pure
-//! exception values, while only structural `Fatal` failures remain parked.
+//! exception values, while structural and completed terminal failures remain
+//! parked as `Fatal` results.
 //! Inlined operations keep their logical sources in code-owned safepoint
 //! recipes; committed calls publish no temporary inline Frame records.
 //! Numeric/load/class opcode words are decoded exactly once at their ABI edge.
+//! Packed bind and superclass entries accept only their actual physical operands.
 //! Built-in Array spread collection accepts both materialized and stack-owned
 //! frames; observable iterator overrides bail before effects.
 //! Static stack-owned catch entry/removal use verified CodeBlock regions;
@@ -60,7 +62,7 @@ pub(crate) fn park_jit_error(ctx: &mut JitCtx, err: VmError) {
 /// Encode one effect-once value completion. Catchable failures become a pure
 /// JavaScript exception value with no parked propagation state; structural
 /// host failures stay parked and use the distinct fatal status.
-fn committed_value_result(
+pub(super) fn committed_value_result(
     ctx: &mut JitCtx,
     result: Result<Value, CommittedValueError>,
 ) -> NativeResultPair {
@@ -143,8 +145,7 @@ fn route_throw_value(ctx: &mut JitCtx, exception: Value) -> NativeResultPair {
 /// Materialized Template frames may consume it in a local catch/finally and
 /// stack-owned Template frames in a static catch, selecting the committed
 /// landing PC. Unhandled frames publish the
-/// value as the canonical uncaught throw. Machine local landings bypass this
-/// entry and consume the exception value directly in SSA.
+/// value as the canonical uncaught throw.
 pub(crate) extern "C" fn jit_route_throw_stub(
     ctx: *mut JitCtx,
     exception_bits: u64,
@@ -153,20 +154,6 @@ pub(crate) extern "C" fn jit_route_throw_stub(
     let ctx = unsafe { &mut *ctx };
     let exception = Value::from_bits(exception_bits);
     route_throw_value(ctx, exception)
-}
-
-/// Clear diagnostic throw provenance after a Machine local catch absorbs the
-/// exception SSA value. This leaf is called only on the exceptional edge.
-pub(crate) extern "C" fn jit_acknowledge_caught_throw_stub(ctx: *mut JitCtx) -> u64 {
-    // SAFETY: the live `JitCtx` reentry contract.
-    let ctx = unsafe { &mut *ctx };
-    let Some(activation) = ctx.checked_activation() else {
-        park_jit_error(ctx, VmError::InvalidOperand);
-        return NativeResultStatus::Fatal as u64;
-    };
-    // SAFETY: the compiled activation owns exclusive isolate execution.
-    unsafe { &mut *activation.vm_ptr() }.jit_acknowledge_caught_throw();
-    NativeResultStatus::Success as u64
 }
 
 /// Normalize one parked error at a compiled frame's canonical final
@@ -235,7 +222,8 @@ pub(crate) extern "C" fn jit_exception_op_stub(
 }
 
 /// Complete one iterator-lifecycle opcode. `Success` means the VM committed
-/// the opcode, `SideExit` is pre-effect, and `Throw` reports a parked error.
+/// the opcode, `SideExit` is pre-effect, `Throw` reports a parked source error,
+/// and `Fatal` preserves an already completed terminal failure.
 pub(crate) extern "C" fn jit_iterator_op_stub(
     ctx: *mut JitCtx,
     opcode: u64,
@@ -279,9 +267,13 @@ pub(crate) extern "C" fn jit_iterator_op_stub(
     let context = &owner;
     match vm.jit_runtime_iterator_op(context, stack, frame_index, opcode as u8, arg0, arg1, arg2) {
         Ok(()) => NativeResultStatus::Success as u64,
-        Err(err) => {
+        Err(otter_vm::CommittedValueError::JavaScript(err)) => {
             park_jit_error(ctx, err);
             NativeResultStatus::Throw as u64
+        }
+        Err(otter_vm::CommittedValueError::Fatal(err)) => {
+            park_jit_error(ctx, err);
+            NativeResultStatus::Fatal as u64
         }
     }
 }
@@ -393,14 +385,10 @@ pub(crate) extern "C" fn jit_class_value_op_stub(
         return NativeResultStatus::Throw as u64;
     };
     let context = &owner;
-    match vm.jit_runtime_class_value_op(context, stack, frame_index, opcode as u8, arg0, arg1, arg2)
-    {
-        Ok(()) => NativeResultStatus::Success as u64,
-        Err(err) => {
-            park_jit_error(ctx, err);
-            NativeResultStatus::Throw as u64
-        }
-    }
+    super::park_result(
+        ctx,
+        vm.jit_runtime_class_value_op(context, stack, frame_index, opcode as u8, arg0, arg1, arg2),
+    )
 }
 
 /// Complete one synchronous module-family opcode. Promise-producing module
@@ -430,18 +418,15 @@ pub(crate) extern "C" fn jit_module_op_stub(
         return NativeResultStatus::Throw as u64;
     };
     let context = &owner;
-    match vm.jit_runtime_module_op(context, stack, frame_index, opcode as u8, arg0, arg1, arg2) {
-        Ok(()) => NativeResultStatus::Success as u64,
-        Err(err) => {
-            park_jit_error(ctx, err);
-            NativeResultStatus::Throw as u64
-        }
-    }
+    super::park_result(
+        ctx,
+        vm.jit_runtime_module_op(context, stack, frame_index, opcode as u8, arg0, arg1, arg2),
+    )
 }
 
 /// Complete one variadic construction opcode (`ArrayConstruct`, `ArrayFrom`,
 /// `ArrayOf`, `QueueMicrotask`). Returns committed `Success`, pre-effect
-/// `SideExit`, or parked `Throw`.
+/// `SideExit`, parked `Throw`, or completed `Fatal`.
 pub(crate) extern "C" fn jit_variadic_op_stub(
     ctx: *mut JitCtx,
     opcode: u64,
@@ -477,9 +462,13 @@ pub(crate) extern "C" fn jit_variadic_op_stub(
         packed_args,
     ) {
         Ok(()) => NativeResultStatus::Success as u64,
-        Err(err) => {
-            park_jit_error(ctx, err);
+        Err(CommittedValueError::JavaScript(error)) => {
+            park_jit_error(ctx, error);
             NativeResultStatus::Throw as u64
+        }
+        Err(CommittedValueError::Fatal(error)) => {
+            park_jit_error(ctx, error);
+            NativeResultStatus::Fatal as u64
         }
     }
 }
@@ -554,18 +543,14 @@ pub(crate) extern "C" fn jit_structural_op_stub(
         return NativeResultStatus::Throw as u64;
     };
     let context = &owner;
-    match vm.jit_runtime_structural_op(context, stack, frame_index, opcode as u8, arg0, arg1, arg2)
-    {
-        Ok(()) => NativeResultStatus::Success as u64,
-        Err(err) => {
-            park_jit_error(ctx, err);
-            NativeResultStatus::Throw as u64
-        }
-    }
+    super::park_result(
+        ctx,
+        vm.jit_runtime_structural_op(context, stack, frame_index, opcode as u8, arg0, arg1, arg2),
+    )
 }
 
 /// Complete one allocating-construction opcode (`CollectRest`, `ArrayPush`). Returns committed `Success`, pre-effect
-/// `SideExit`, or parked `Throw`.
+/// `SideExit`, parked `Throw`, or completed `Fatal`.
 pub(crate) extern "C" fn jit_construct_op_stub(
     ctx: *mut JitCtx,
     opcode: u64,
@@ -697,13 +682,10 @@ pub(crate) extern "C" fn jit_private_op_stub(
         return NativeResultStatus::Throw as u64;
     };
     let context = &owner;
-    match vm.jit_runtime_private_op(context, stack, frame_index, opcode as u8, arg0, arg1, arg2) {
-        Ok(()) => NativeResultStatus::Success as u64,
-        Err(err) => {
-            park_jit_error(ctx, err);
-            NativeResultStatus::Throw as u64
-        }
-    }
+    super::park_result(
+        ctx,
+        vm.jit_runtime_private_op(context, stack, frame_index, opcode as u8, arg0, arg1, arg2),
+    )
 }
 
 /// Complete one `super` property opcode (`LoadSuperProperty`,
@@ -734,13 +716,10 @@ pub(crate) extern "C" fn jit_super_op_stub(
         return NativeResultStatus::Throw as u64;
     };
     let context = &owner;
-    match vm.jit_runtime_super_op(context, stack, frame_index, opcode as u8, arg0, arg1, arg2) {
-        Ok(()) => NativeResultStatus::Success as u64,
-        Err(err) => {
-            park_jit_error(ctx, err);
-            NativeResultStatus::Throw as u64
-        }
-    }
+    super::park_result(
+        ctx,
+        vm.jit_runtime_super_op(context, stack, frame_index, opcode as u8, arg0, arg1, arg2),
+    )
 }
 
 /// Complete the exact published scalar operation from two boxed values.
@@ -820,14 +799,9 @@ pub(crate) extern "C" fn jit_delete_op_stub(
     }
     let result = ctx
         .runtime_call()
+        .map_err(CommittedValueError::Fatal)
         .and_then(|mut runtime| runtime.delete_op(opcode as u8, arg0, arg1, arg2));
-    match result {
-        Ok(()) => NativeResultStatus::Success as u64,
-        Err(err) => {
-            park_jit_error(ctx, err);
-            NativeResultStatus::Throw as u64
-        }
-    }
+    super::park_result(ctx, result)
 }
 
 /// Complete the exact published object-protocol operation from two boxed
@@ -860,8 +834,6 @@ pub(crate) extern "C" fn jit_bind_function_stub(
     ctx: *mut JitCtx,
     packed_meta: u64,
     packed_args: u64,
-    _reserved0: u64,
-    _reserved1: u64,
 ) -> u64 {
     // SAFETY: the live `JitCtx` reentry contract.
     let ctx = unsafe { &mut *ctx };
@@ -881,22 +853,16 @@ pub(crate) extern "C" fn jit_bind_function_stub(
         return NativeResultStatus::Throw as u64;
     };
     let context = &owner;
-    match vm.jit_runtime_bind_function(context, stack, frame_index, packed_meta, packed_args) {
-        Ok(()) => NativeResultStatus::Success as u64,
-        Err(err) => {
-            park_jit_error(ctx, err);
-            NativeResultStatus::Throw as u64
-        }
-    }
+    super::park_result(
+        ctx,
+        vm.jit_runtime_bind_function(context, stack, frame_index, packed_meta, packed_args),
+    )
 }
 
 /// Read the live superclass from an exact class wrapper; hole means guard miss.
 pub(crate) extern "C" fn jit_class_super_constructor_stub(
     ctx: *mut JitCtx,
     value_bits: u64,
-    _reserved0: u64,
-    _reserved1: u64,
-    _reserved2: u64,
 ) -> u64 {
     // SAFETY: the leaf receives the current generated activation.
     if let Some(activation) = unsafe { &mut *ctx }.checked_activation() {
@@ -943,21 +909,18 @@ pub(crate) extern "C" fn jit_loose_eq_stub(
         return NativeResultStatus::Throw as u64;
     };
     let context = &owner;
-    match vm.jit_runtime_loose_equal_in_place(
-        stack,
-        context,
-        dst as u16,
-        lhs as u16,
-        rhs as u16,
-        negate != 0,
-        regs,
-    ) {
-        Ok(()) => NativeResultStatus::Success as u64,
-        Err(err) => {
-            park_jit_error(ctx, err);
-            NativeResultStatus::Throw as u64
-        }
-    }
+    super::park_result(
+        ctx,
+        vm.jit_runtime_loose_equal_in_place(
+            stack,
+            context,
+            dst as u16,
+            lhs as u16,
+            rhs as u16,
+            negate != 0,
+            regs,
+        ),
+    )
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -981,8 +944,8 @@ fn complete_unary_coercion(
     dst: u16,
     src: u16,
     request: AbiUnaryCoercion,
-) -> Result<(), VmError> {
-    let mut runtime = ctx.runtime_call()?;
+) -> Result<(), CommittedValueError> {
+    let mut runtime = ctx.runtime_call().map_err(CommittedValueError::Fatal)?;
     match request {
         AbiUnaryCoercion::ToNumeric => runtime.coerce_unary(dst, src, UnaryCoercionOp::ToNumeric),
         AbiUnaryCoercion::ToPrimitive { hint_index } => {
@@ -992,7 +955,8 @@ fn complete_unary_coercion(
 }
 
 /// Complete one `ToPrimitive`/`ToNumeric` opcode in the VM. Returns `Success`
-/// after writing the destination or `Throw` after decoding/coercion fails. A
+/// after writing the destination, `Throw` for source coercion failures, and
+/// `Fatal` for invalid ABI/activation or a completed terminal failure. A
 /// published canonical activation is part of the operation contract.
 pub(crate) extern "C" fn jit_coerce_unary_stub(
     ctx: *mut JitCtx,
@@ -1006,18 +970,12 @@ pub(crate) extern "C" fn jit_coerce_unary_stub(
     let result = (|| {
         complete_unary_coercion(
             ctx,
-            decode_register(dst)?,
-            decode_register(src)?,
-            decode_unary_coercion(numeric, hint_index)?,
+            decode_register(dst).map_err(CommittedValueError::Fatal)?,
+            decode_register(src).map_err(CommittedValueError::Fatal)?,
+            decode_unary_coercion(numeric, hint_index).map_err(CommittedValueError::Fatal)?,
         )
     })();
-    match result {
-        Ok(()) => NativeResultStatus::Success as u64,
-        Err(err) => {
-            park_jit_error(ctx, err);
-            NativeResultStatus::Throw as u64
-        }
-    }
+    super::park_result(ctx, result)
 }
 
 fn complete_numeric_op(
@@ -1025,15 +983,17 @@ fn complete_numeric_op(
     dst: u16,
     lhs: u16,
     operation: NumericRuntimeOp,
-) -> Result<(), VmError> {
-    ctx.runtime_call()?.numeric(dst, lhs, operation)
+) -> Result<(), CommittedValueError> {
+    ctx.runtime_call()
+        .map_err(CommittedValueError::Fatal)?
+        .numeric(dst, lhs, operation)
 }
 
 /// Complete one numeric-family opcode in the VM. Returns `Success` after
-/// committing the destination or `Throw` after decoding/execution fails. This path has no
-/// isolate-less/ActivationStack bailout mode: a published
-/// [`Frame`](otter_vm::native_abi::Frame) and VM activation are
-/// part of the runtime-op contract.
+/// committing the destination, `Throw` for source numeric failures, and `Fatal`
+/// for invalid ABI/activation or a completed terminal failure. A published
+/// [`Frame`](otter_vm::native_abi::Frame) and VM activation are required;
+/// there is no activation-less bailout or replay.
 pub(crate) extern "C" fn jit_numeric_op_stub(
     ctx: *mut JitCtx,
     dst: u64,
@@ -1043,45 +1003,16 @@ pub(crate) extern "C" fn jit_numeric_op_stub(
 ) -> u64 {
     // SAFETY: the live `JitCtx` reentry contract.
     let ctx = unsafe { &mut *ctx };
-    let decoded = (|| {
-        Ok((
-            decode_register(dst)?,
-            decode_register(lhs)?,
-            NumericRuntimeOp::decode_abi(opcode, rhs_or_delta)?,
-        ))
+    let result = (|| {
+        complete_numeric_op(
+            ctx,
+            decode_register(dst).map_err(CommittedValueError::Fatal)?,
+            decode_register(lhs).map_err(CommittedValueError::Fatal)?,
+            NumericRuntimeOp::decode_abi(opcode, rhs_or_delta)
+                .map_err(CommittedValueError::Fatal)?,
+        )
     })();
-    let (dst, lhs, operation) = match decoded {
-        Ok(decoded) => decoded,
-        Err(err) => {
-            park_jit_error(ctx, err);
-            return NativeResultStatus::Throw as u64;
-        }
-    };
-    match complete_numeric_op(ctx, dst, lhs, operation) {
-        Ok(()) => NativeResultStatus::Success as u64,
-        Err(err) => {
-            park_jit_error(ctx, err);
-            NativeResultStatus::Throw as u64
-        }
-    }
-}
-
-/// Runtime stub: build a `MakeFunction` closure from compiled code. Returns
-/// `Success` or parks the construction error and returns `Throw`.
-pub(crate) extern "C" fn jit_make_fn_stub(ctx: *mut JitCtx, dst: u64, idx: u64) -> u64 {
-    // SAFETY: the live `JitCtx` reentry contract.
-    let ctx = unsafe { &mut *ctx };
-    let result = ctx.runtime_call().and_then(|mut runtime| {
-        let function_id = runtime.function_id();
-        runtime.make_function(function_id, dst as u16, idx as u32)
-    });
-    match result {
-        Ok(()) => NativeResultStatus::Success as u64,
-        Err(err) => {
-            park_jit_error(ctx, err);
-            NativeResultStatus::Throw as u64
-        }
-    }
+    super::park_result(ctx, result)
 }
 
 /// Poll VM interrupts and runtime budget on compiled back-edges. Mirrors the
@@ -1102,8 +1033,8 @@ pub(crate) extern "C" fn jit_backedge_poll_stub(ctx: *mut JitCtx) -> u64 {
     match result {
         Ok(otter_vm::BackedgePollOutcome::Continue) => NativeResultStatus::Success as u64,
         Ok(otter_vm::BackedgePollOutcome::Yield) => NativeResultStatus::Yield as u64,
-        // Baseline frames only: resume the interpreter at the loop header.
-        Ok(otter_vm::BackedgePollOutcome::EnterOptimizing) => NativeResultStatus::SideExit as u64,
+        // The generation was invalidated, or baseline requested optimizing OSR.
+        Ok(otter_vm::BackedgePollOutcome::ResumeInterpreter) => NativeResultStatus::SideExit as u64,
         Err(err) => {
             park_jit_error(ctx, err);
             NativeResultStatus::Throw as u64
@@ -1202,16 +1133,16 @@ mod tests {
             let value = Value::number_i32(41);
             let runtime = DeoptRuntime {
                 table: DeoptTable::from_states(vec![FrameState {
-                    frames: vec![DeoptFrame {
-                        function_id: 7,
-                        byte_pc: 91,
-                        entry: None,
-                        slots: vec![DeoptSlot {
+                    frames: vec![DeoptFrame::with_window(
+                        7,
+                        91,
+                        None,
+                        vec![DeoptSlot {
                             location: DeoptLocation::Literal(value.to_bits()),
                             repr: DeoptRepr::Tagged,
                         }]
                         .into_boxed_slice(),
-                    }]
+                    )]
                     .into_boxed_slice(),
                     virtual_objects: Box::default(),
                 }]),
@@ -1220,9 +1151,9 @@ mod tests {
                     reason: otter_vm::native_abi::ExitReason::UnsupportedOperation,
                     action: otter_vm::native_abi::ExitAction::Recompile,
                     resume_pcs: vec![37].into_boxed_slice(),
+                    safepoint: otter_vm::native_abi::NO_SAFEPOINT,
                 }]
                 .into_boxed_slice(),
-                gpr_budget: 0,
             };
             // SAFETY: the fixture owns the one-slot published window.
             let window = unsafe { (*ctx.native_frame).register_base() };
@@ -1231,7 +1162,6 @@ mod tests {
                     ctx,
                     0,
                     std::ptr::from_ref(&runtime),
-                    std::ptr::null(),
                     0,
                     window,
                 )
@@ -1245,6 +1175,89 @@ mod tests {
             assert_eq!(unsafe { *(window as *const Value) }, value);
             assert!(ctx_error(ctx).is_none());
         });
+    }
+
+    #[test]
+    fn canonical_home_writeback_reconstitutes_each_repr_through_the_current_native_abi() {
+        use otter_vm::deopt::{
+            DeoptExitDescriptor, DeoptFrame, DeoptLocation, DeoptRepr, DeoptRuntime, DeoptSlot,
+            DeoptTable, DeoptVerifyLimits, FrameState,
+        };
+
+        for (repr, payload, expected) in [
+            (
+                DeoptRepr::Tagged,
+                Value::number_i32(41).to_bits(),
+                Value::number_i32(41),
+            ),
+            (
+                DeoptRepr::Int32,
+                u64::from(-7i32 as u32),
+                Value::number_i32(-7),
+            ),
+            (
+                DeoptRepr::Uint32,
+                u64::from(u32::MAX),
+                Value::number_f64(f64::from(u32::MAX)),
+            ),
+            (
+                DeoptRepr::Float64,
+                (-0.0f64).to_bits(),
+                Value::number_f64(-0.0),
+            ),
+            (DeoptRepr::Boolean, 1, Value::boolean(true)),
+        ] {
+            with_frameless_ctx(|ctx| {
+                let homes = [0xdead_beef_dead_beefu64, payload, 0x1234_5678_9abc_def0];
+                let runtime = DeoptRuntime {
+                    table: DeoptTable::from_states(vec![FrameState {
+                        frames: Box::new([DeoptFrame::with_window(
+                            7,
+                            91,
+                            None,
+                            [DeoptSlot::physical(DeoptLocation::StackSlot(8), repr)],
+                        )]),
+                        virtual_objects: Box::default(),
+                    }]),
+                    exits: Box::new([DeoptExitDescriptor {
+                        state: 0,
+                        reason: otter_vm::native_abi::ExitReason::UnsupportedOperation,
+                        action: otter_vm::native_abi::ExitAction::Resume,
+                        resume_pcs: Box::new([37]),
+                        safepoint: otter_vm::native_abi::NO_SAFEPOINT,
+                    }]),
+                };
+                runtime
+                    .table
+                    .verify(DeoptVerifyLimits {
+                        max_frame_slots: 1,
+                        min_stack_slot_offset: 0,
+                        max_stack_slot_offset: 16,
+                    })
+                    .unwrap();
+                // SAFETY: fixture context, metadata, separately addressed source
+                // homes and one-slot destination remain live for this native
+                // entry. The verified recipe reads only homes[1]; no GC runs.
+                let (result, restored) = unsafe {
+                    let window = (*ctx.native_frame).register_base();
+                    let result = super::super::deopt::jit_deopt_writeback_entry(
+                        ctx,
+                        0,
+                        std::ptr::from_ref(&runtime),
+                        homes.as_ptr() as u64,
+                        window,
+                    );
+                    (result, *(window as *const Value))
+                };
+                assert_eq!(
+                    result.validate(NativeResultDomain::Compiled),
+                    Some(otter_vm::native_abi::NativeResultStatus::SideExit)
+                );
+                assert_eq!(result.logical_pc(), Some(37));
+                assert_eq!(restored, expected, "exact canonical {repr:?} payload");
+                assert!(ctx_error(ctx).is_none());
+            });
+        }
     }
 
     #[test]
@@ -1274,6 +1287,24 @@ mod tests {
             );
             assert!(matches!(ctx_error(ctx), Some(VmError::InvalidOperand)));
         });
+    }
+
+    #[test]
+    fn numeric_abi_and_activation_failures_are_fatal_before_semantics() {
+        for (dst, opcode) in [
+            (u64::MAX, Op::Sub as u64),
+            (0, u64::MAX),
+            (0, Op::Sub as u64),
+        ] {
+            with_frameless_ctx(|ctx| {
+                let status = jit_numeric_op_stub(ctx, dst, 0, 0, opcode);
+                assert_eq!(status, NativeResultStatus::Fatal as u64);
+                assert!(matches!(ctx_error(ctx), Some(VmError::InvalidOperand)));
+                // No numeric destination is committed before a legal activation.
+                let current = unsafe { *((*ctx.native_frame).register_base() as *const Value) };
+                assert_eq!(current, Value::undefined());
+            });
+        }
     }
 
     #[test]

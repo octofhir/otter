@@ -142,8 +142,9 @@ pub type TimerSchedulerHandle = Arc<dyn TimerScheduler>;
 
 /// Stored callback for one outstanding `setTimeout` / `setInterval`.
 ///
-/// The entry owns the scheduling [`ExecutionContext`] so a later
-/// timer task can dispatch through the same function table. This
+/// The entry owns its optional admitted source and scheduling realm. A later
+/// bytecode callback resolves its exact defining FunctionID; native-only
+/// callbacks retain honest absent source. This
 /// is intentionally isolate-local state, not VM state crossing to
 /// the host scheduler: the entry stays on the isolate side and
 /// only the opaque token leaves the VM.
@@ -156,10 +157,10 @@ pub struct TimerEntry {
     /// Extra positional arguments forwarded to the callback per
     /// HTML §8.1.5.5.4 (`setTimeout(handler, delay, ...arguments)`).
     pub extra_args: SmallVec<[Value; 4]>,
-    /// Execution context that produced the callback. Timer
-    /// callbacks may run after another script has executed, so the
-    /// entry owns the context needed for dispatch.
-    pub context: ExecutionContext,
+    /// Optional admitted source of the scheduling operation. Native-only
+    /// admission retains None. A bytecode callback resolves its own exact
+    /// FunctionID through the canonical call owner when this timer fires.
+    pub context: Option<ExecutionContext>,
     /// `Some(ms)` for `setInterval`; `None` for `setTimeout`.
     /// Re-arming is the host's job — the VM only inspects this
     /// field to keep the entry alive after firing instead of
@@ -409,13 +410,7 @@ pub(crate) fn schedule_timer_entry(
                 reason,
             })?;
     let extra_args: SmallVec<[Value; 4]> = extra_args.iter().cloned().collect();
-    let context = ctx
-        .execution_context()
-        .ok_or_else(|| NativeError::TypeError {
-            name: native_name,
-            reason: "timer callback is missing its execution context".to_string(),
-        })?
-        .clone();
+    let context = ctx.execution_context().cloned();
     let interp = ctx.interp_mut();
     let async_context = interp.async_context();
     let token = scheduler

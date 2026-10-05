@@ -1,20 +1,16 @@
 //! `JSON` namespace — hand-rolled `stringify` and `parse`.
 //!
-//! Slice 32 picks the hot-path implementation deliberately: we
-//! **do not** depend on `serde_json`. Serde's parser is general-
-//! purpose and ~3–5× slower than a focused byte-cursor parser on
-//! the JS shapes we actually serialize. Stringify and parse both
-//! own their own buffer/cursor so we can keep them branch-free on
-//! the common case (ASCII strings, small integers, dense arrays).
+//! The byte-cursor parser and iterative serializers own their buffers and
+//! preserve deterministic property order. Native entry points run observable
+//! coercion, reviver, replacer and accessor work through the live VM context.
 //!
 //! # Contents
 //! - [`JSON_SPEC`] — static namespace spec used by bootstrap.
-//! - [`call`] — internal dispatcher shared by the `JSON.parse` and
-//!   `JSON.stringify` native function entry points.
+//! - [`call`] — internal heap-only parser/serializer dispatcher.
+//! - Native parse/stringify/rawJSON entries and their canonical error projection.
 //! - [`stringify`] / [`parse`] — public entry points.
 //! - [`stringify_with_options`] — programmable `space` + `replacer`.
-//! - [`JsonError`] — failure mode the dispatcher converts to
-//!   `VmError`.
+//! - [`JsonError`] / [`ParseError`] — typed syntax and allocation failures.
 //!
 //! # Invariants
 //! - **No recursion.** Both serializer and parser walk an explicit
@@ -25,6 +21,9 @@
 //! - **Deterministic key order.** Object properties enumerate in
 //!   shape insertion order (`JsObject::borrow_props`).
 //! - **NaN / ±Infinity / -0 → `null`** per spec §25.5.2.4.
+//! - Allocator refusals retain their original typed cause and project to native
+//!   OutOfMemory; only malformed input projects to SyntaxError. Reviver
+//!   failures use the single canonical VM-to-native completion projection.
 //! - **BigInt → `TypeError`-equivalent** ([`JsonError::BigInt`]).
 //! - **Strict parse.** Trailing commas, comments, single quotes,
 //!   leading zeros, leading `+`, NaN/Infinity literals — all
@@ -100,14 +99,9 @@ pub enum JsonError {
     /// `BigInt` cannot be serialised per spec §25.5.2.4.
     #[error("JSON.stringify cannot serialize BigInt values.")]
     BigInt,
-    /// Underlying string-heap allocation failed.
-    #[error("out of memory: requested {requested_bytes} bytes, heap limit {heap_limit_bytes}")]
-    OutOfMemory {
-        /// Bytes requested.
-        requested_bytes: u64,
-        /// Heap cap (`0` = unlimited).
-        heap_limit_bytes: u64,
-    },
+    /// Original collector allocation failure during parse or stringify.
+    #[error(transparent)]
+    OutOfMemory(#[from] otter_gc::OutOfMemory),
     /// Strict-mode parse failure.
     #[error("JSON.parse: {message} at byte {position}")]
     ParseFailed {
@@ -118,21 +112,34 @@ pub enum JsonError {
     },
 }
 
-impl From<otter_gc::OutOfMemory> for JsonError {
-    fn from(err: otter_gc::OutOfMemory) -> Self {
-        Self::OutOfMemory {
-            requested_bytes: err.requested_bytes(),
-            heap_limit_bytes: err.heap_limit_bytes(),
+impl From<ParseError> for JsonError {
+    fn from(err: ParseError) -> Self {
+        match err {
+            ParseError::Syntax { message, position } => Self::ParseFailed { message, position },
+            ParseError::OutOfMemory(error) => Self::OutOfMemory(error),
         }
     }
 }
 
-impl From<ParseError> for JsonError {
-    fn from(err: ParseError) -> Self {
-        Self::ParseFailed {
-            message: err.message,
-            position: err.position,
-        }
+fn native_json_error(error: JsonError, name: &'static str) -> NativeError {
+    match error {
+        JsonError::ParseFailed { message, position } => NativeError::SyntaxError {
+            name,
+            reason: format!("JSON Parse error: {message} at byte {position}"),
+        },
+        JsonError::OutOfMemory(error) => NativeError::OutOfMemory {
+            name,
+            requested_bytes: error.requested_bytes(),
+            heap_limit_bytes: error.heap_limit_bytes(),
+        },
+        error @ (JsonError::UnknownMember(_)
+        | JsonError::BadArgument { .. }
+        | JsonError::Cyclic
+        | JsonError::TooDeep { .. }
+        | JsonError::BigInt) => NativeError::TypeError {
+            name,
+            reason: error.to_string(),
+        },
     }
 }
 
@@ -168,111 +175,59 @@ pub(crate) fn call_with_roots(
 }
 
 fn native_parse(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-    let coerced = coerce_json_parse_args(ctx, args)?;
-    // §25.5.1 results expose the realm `%Object.prototype%`. Hand it to the
-    // parser so each object is constructed with that prototype in place, instead
-    // of walking the whole result tree afterwards to install it.
-    let object_proto = ctx
-        .interp_mut()
-        .object_prototype_object_opt()
-        .map(Value::object);
-    let unfiltered = native_json_call(
-        ctx,
-        otter_bytecode::method_id::JsonMethod::Parse,
-        &coerced,
-        object_proto,
-    )?;
+    // One native handle scope owns the observable coercion input, the reviver,
+    // the resulting source string and parsed result through Internalize. A
+    // ToString hook can collect before parsing has even started.
+    ctx.scope(|mut scope| {
+        let input = scope.value(args.first().copied().unwrap_or_else(Value::undefined));
+        let reviver = scope.value(args.get(1).copied().unwrap_or_else(Value::undefined));
+        // §25.5.1 step 1 also coerces a missing argument: undefined becomes
+        // "undefined", then the strict parser reports a syntax failure.
+        let input_value = scope.raw(input);
+        let text = coerce_text_to_string(scope.context(), input_value, "parse")?;
+        let text = scope.value(Value::string(text));
+        let object_proto = scope
+            .context()
+            .interp_mut()
+            .object_prototype_object_opt()
+            .map(Value::object);
+        let source = [scope.raw(text)];
+        let unfiltered = native_json_call(
+            scope.context(),
+            otter_bytecode::method_id::JsonMethod::Parse,
+            &source,
+            object_proto,
+        )?;
+        let unfiltered = scope.value(unfiltered);
 
-    // §25.5.1 steps 7–9 — a callable reviver drives InternalizeJSONProperty.
-    let reviver = args.get(1).copied().unwrap_or_else(Value::undefined);
-    if !reviver.is_callable() {
-        return Ok(unfiltered);
-    }
-    let context = ctx
-        .execution_context()
-        .cloned()
-        .ok_or_else(|| NativeError::TypeError {
-            name: "parse",
-            reason: "missing execution context".to_string(),
-        })?;
-    // §25.5.1 `json-parse-with-source` — record the source-span tree so
-    // the reviver's `context.source` argument is populated for leaves.
-    let source_tree = coerced
-        .first()
-        .and_then(|v| v.as_string(ctx.heap()))
-        .map(|s| s.to_lossy_string(ctx.heap()))
-        .and_then(|text| parse::parse_source_tree(&text));
-    let result = ctx.with_turn_parts(|interp, stack| {
-        interp.json_internalize_root(stack, &context, unfiltered, reviver, source_tree.as_ref())
-    });
-    match result {
-        Ok(v) => Ok(v),
-        Err(err) => Err(vm_to_native_parse(ctx.interp_mut(), err)),
-    }
-}
-
-/// Map a reviver-path [`VmError`] onto the native surface, preserving
-/// user exceptions (`Uncaught` → `Thrown`).
-fn vm_to_native_parse(interp: &crate::Interpreter, err: VmError) -> NativeError {
-    match err {
-        VmError::Uncaught => {
-            let value = match interp.take_error_detail() {
-                Some(crate::run_control::ErrorDetail::Uncaught(m)) => m,
-                _ => Default::default(),
-            };
-            NativeError::Thrown {
-                name: "parse",
-                message: value.into(),
-            }
+        // §25.5.1 steps 7–9 — a callable reviver drives InternalizeJSONProperty.
+        if !scope.raw(reviver).is_callable() {
+            return Ok(scope.raw(unfiltered));
         }
-        VmError::RangeError => {
-            let message = match interp.take_error_detail() {
-                Some(crate::run_control::ErrorDetail::Message(m)) => m,
-                _ => Default::default(),
-            };
-            NativeError::RangeError {
-                name: "parse",
-                reason: message.into(),
+        let context = match scope.context().execution_context().cloned() {
+            Some(context) => context,
+            None => {
+                return Err(crate::native_function::vm_to_native_error(
+                    scope.context().interp_mut(),
+                    VmError::InvalidOperand,
+                    "parse",
+                ));
             }
-        }
-        VmError::Exit { code } => NativeError::Exit { code },
-        VmError::TypeError => {
-            let message = match interp.take_error_detail() {
-                Some(crate::run_control::ErrorDetail::Message(m)) => m,
-                _ => Default::default(),
-            };
-            NativeError::TypeError {
-                name: "parse",
-                reason: message.into(),
-            }
-        }
-        other => NativeError::TypeError {
-            name: "parse",
-            reason: other.to_string(),
-        },
-    }
-}
-
-/// §25.5.1 step 1 — `JText = ? ToString(text)`. Non-string `text`
-/// arguments coerce through the spec ToPrimitive (hint:string) +
-/// ToString ladder so a `JSON.parse({ toString(){ return '...' } })`
-/// observes the user hook.
-fn coerce_json_parse_args(
-    ctx: &mut NativeCtx<'_>,
-    args: &[Value],
-) -> Result<smallvec::SmallVec<[Value; 4]>, NativeError> {
-    let mut out: smallvec::SmallVec<[Value; 4]> = args.iter().cloned().collect();
-    // §25.5.1 step 1 runs `ToString(text)` even for a missing argument:
-    // `JSON.parse()` coerces `undefined` → `"undefined"` and parses it
-    // (yielding a SyntaxError), rather than a TypeError on a bad arg.
-    if out.is_empty() {
-        out.push(Value::undefined());
-    }
-    if let Some(slot) = out.first_mut() {
-        let s = coerce_text_to_string(ctx, *slot, "parse")?;
-        *slot = Value::string(s);
-    }
-    Ok(out)
+        };
+        // The source-span tree is owned Rust data. Read the current source
+        // handle after parsing, which may have relocated its input.
+        let source_tree = scope
+            .raw(text)
+            .as_string(scope.context().heap())
+            .map(|text| text.to_lossy_string(scope.context().heap()))
+            .and_then(|text| parse::parse_source_tree(&text));
+        let unfiltered = scope.raw(unfiltered);
+        let reviver = scope.raw(reviver);
+        let result = scope.context().with_turn_parts(|interp, stack| {
+            interp.json_internalize_root(stack, &context, unfiltered, reviver, source_tree.as_ref())
+        });
+        result.map_err(|error| error.into_native(scope.context().interp_mut(), "parse"))
+    })
 }
 
 /// §7.1.17 `ToString(text)` for JSON text inputs. Strings pass
@@ -285,18 +240,20 @@ fn coerce_text_to_string(
     value: Value,
     name: &'static str,
 ) -> Result<JsString, NativeError> {
-    let exec = ctx
-        .execution_context()
-        .cloned()
-        .ok_or_else(|| NativeError::TypeError {
-            name,
-            reason: "missing execution context".to_string(),
-        })?;
+    let exec = match ctx.execution_context().cloned() {
+        Some(context) => context,
+        None => {
+            return Err(crate::native_function::vm_to_native_error(
+                ctx.interp_mut(),
+                VmError::InvalidOperand,
+                name,
+            ));
+        }
+    };
     let result = ctx.with_turn_parts(|interp, stack| {
         crate::coerce::to_js_string_or_throw(interp, stack, &exec, &value)
     });
-    result
-        .map_err(|error| crate::native_function::vm_to_native_error(ctx.interp_mut(), error, name))
+    result.map_err(|error| error.into_native(ctx.interp_mut(), name))
 }
 
 /// §25.5.3 `JSON.rawJSON(text)`.
@@ -331,23 +288,22 @@ fn native_raw_json(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Nat
                 });
             }
             Ok(_) => {}
-            Err(err) => {
-                return Err(NativeError::SyntaxError {
-                    name: "rawJSON",
-                    reason: format!("JSON Parse error: {} at byte {}", err.message, err.position),
-                });
-            }
+            Err(err) => return Err(native_json_error(err.into(), "rawJSON")),
         }
 
         // §25.5.3 steps 5–7 — null-proto object, own "rawJSON" data
         // property, [[IsRawJSON]] slot, then frozen.
         let obj = scope.bare_object()?;
-        scope.set(obj, "rawJSON", raw_value)?;
+        scope.define(
+            obj,
+            "rawJSON",
+            raw_value,
+            crate::object::PropertyFlags::data_default(),
+        )?;
         let obj_value = scope.raw(obj);
         let mut obj_handle = obj_value.as_object().expect("bare object handle");
-        crate::object::set_is_raw_json(&mut obj_handle, scope.context().heap_mut(), true);
-        let obj_handle = scope.raw(obj).as_object().expect("rooted rawJSON object");
-        crate::object::freeze(obj_handle, scope.context().heap_mut());
+        crate::object::set_is_raw_json(&mut obj_handle, scope.context().heap_mut(), true)?;
+        scope.freeze(obj)?;
         Ok(scope.finish(obj))
     })
 }
@@ -364,73 +320,21 @@ fn native_is_raw_json(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, 
 fn native_stringify(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     // §25.5.2.1 — the full algorithm needs a live execution context so
     // `toJSON`, the replacer, and accessor `[[Get]]` are observable.
-    let context = ctx
-        .execution_context()
-        .cloned()
-        .ok_or_else(|| NativeError::TypeError {
-            name: "stringify",
-            reason: "missing execution context".to_string(),
-        })?;
+    let context = match ctx.execution_context().cloned() {
+        Some(context) => context,
+        None => {
+            return Err(crate::native_function::vm_to_native_error(
+                ctx.interp_mut(),
+                VmError::InvalidOperand,
+                "stringify",
+            ));
+        }
+    };
     let result =
         ctx.with_turn_parts(|interp, stack| interp.json_stringify_spec(stack, &context, args));
     match result {
         Ok(v) => Ok(v),
-        Err(err) => Err(vm_to_native_stringify(ctx.interp_mut(), err)),
-    }
-}
-
-/// Map a serializer [`VmError`] to the native error surface. A user
-/// exception thrown from a getter / `toJSON` / replacer must surface
-/// verbatim (`VmError::Uncaught` → `NativeError::Thrown`) so its
-/// original constructor is observable; only the serializer's own
-/// synthetic failures (cyclic, BigInt, depth) become `TypeError`s.
-fn vm_to_native_stringify(interp: &crate::Interpreter, err: VmError) -> NativeError {
-    match err {
-        VmError::Uncaught => {
-            let value = match interp.take_error_detail() {
-                Some(crate::run_control::ErrorDetail::Uncaught(m)) => m,
-                _ => Default::default(),
-            };
-            NativeError::Thrown {
-                name: "stringify",
-                message: value.into(),
-            }
-        }
-        VmError::SyntaxError => {
-            let message = match interp.take_error_detail() {
-                Some(crate::run_control::ErrorDetail::Message(m)) => m,
-                _ => Default::default(),
-            };
-            NativeError::SyntaxError {
-                name: "stringify",
-                reason: message.into(),
-            }
-        }
-        VmError::RangeError => {
-            let message = match interp.take_error_detail() {
-                Some(crate::run_control::ErrorDetail::Message(m)) => m,
-                _ => Default::default(),
-            };
-            NativeError::RangeError {
-                name: "stringify",
-                reason: message.into(),
-            }
-        }
-        VmError::Exit { code } => NativeError::Exit { code },
-        VmError::TypeError => {
-            let message = match interp.take_error_detail() {
-                Some(crate::run_control::ErrorDetail::Message(m)) => m,
-                _ => Default::default(),
-            };
-            NativeError::TypeError {
-                name: "stringify",
-                reason: message.into(),
-            }
-        }
-        other => NativeError::TypeError {
-            name: "stringify",
-            reason: other.to_string(),
-        },
+        Err(err) => Err(err.into_native(ctx.interp_mut(), "stringify")),
     }
 }
 
@@ -455,22 +359,7 @@ fn native_json_call(
         &mut external_visit,
         object_proto,
     )
-    .map_err(|err| {
-        // §25.5.1 step 5 — `JSON.parse` reports malformed input as
-        // `SyntaxError`. Every other failure (cycles, BigInt,
-        // depth overflow, bad arguments, OOM) flows through
-        // `TypeError` per spec.
-        match err {
-            JsonError::ParseFailed { message, position } => NativeError::SyntaxError {
-                name: method.name(),
-                reason: format!("JSON Parse error: {message} at byte {position}"),
-            },
-            other => NativeError::TypeError {
-                name: method.name(),
-                reason: other.to_string(),
-            },
-        }
-    })
+    .map_err(|error| native_json_error(error, method.name()))
 }
 
 fn json_stringify(args: &[Value], gc_heap: &mut otter_gc::GcHeap) -> Result<Value, JsonError> {
@@ -557,8 +446,24 @@ mod tests {
     fn stringify_object_preserves_insertion_order() {
         let mut heap = make_heap();
         let mut obj = crate::object::alloc_object_old_for_fixture(&mut heap).unwrap();
-        crate::object::set(&mut obj, &mut heap, "b", n(1));
-        crate::object::set(&mut obj, &mut heap, "a", n(2));
+        assert!(
+            crate::object::define_own_property_in_place(
+                &mut obj,
+                &mut heap,
+                "b",
+                crate::object::PropertyDescriptor::data(n(1), true, true, true)
+            )
+            .expect("fixture property allocation")
+        );
+        assert!(
+            crate::object::define_own_property_in_place(
+                &mut obj,
+                &mut heap,
+                "a",
+                crate::object::PropertyDescriptor::data(n(2), true, true, true)
+            )
+            .expect("fixture property allocation")
+        );
         let s = stringify(&Value::object(obj), &mut heap).unwrap().unwrap();
         assert_eq!(s, "{\"b\":1,\"a\":2}");
     }
@@ -632,7 +537,15 @@ mod tests {
         let mut heap = make_heap();
         let mut obj = crate::object::alloc_object_old_for_fixture(&mut heap).unwrap();
         let self_ref = Value::object(obj);
-        crate::object::set(&mut obj, &mut heap, "self", self_ref);
+        assert!(
+            crate::object::define_own_property_in_place(
+                &mut obj,
+                &mut heap,
+                "self",
+                crate::object::PropertyDescriptor::data(self_ref, true, true, true)
+            )
+            .expect("fixture property allocation")
+        );
         let err = stringify(&Value::object(obj), &mut heap).unwrap_err();
         assert!(matches!(err, JsonError::Cyclic));
         assert_eq!(
@@ -655,7 +568,13 @@ mod tests {
         // Parse with byte position.
         let mut gc_heap = make_heap();
         let err = parse("[1, 2,]", &mut gc_heap).unwrap_err();
-        assert_eq!(err.position, 6);
-        assert_eq!(err.message, "trailing comma");
+        assert!(matches!(err, ParseError::Syntax { position: 6, message }
+            if message == "trailing comma"));
     }
 }
+
+#[cfg(test)]
+mod allocation_error_tests;
+
+#[cfg(test)]
+mod reviver_error_tests;

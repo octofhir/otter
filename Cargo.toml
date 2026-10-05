@@ -38,7 +38,6 @@ license = "MIT"
 
 [workspace.dependencies]
 rustc-hash      = "2.1"
-regalloc2       = "0.15.1"
 oxc_allocator   = "0.139"
 oxc_span        = "0.139"
 oxc_syntax      = "0.139"
@@ -192,6 +191,11 @@ inherits = "release"
 lto = false
 codegen-units = 16
 strip = false
+
+# Optimized execution with collector and VM invariant checks enabled.
+[profile.checked]
+inherits = "release"
+debug-assertions = true
 
 # Dev profile keeps debug info for flamegraph / lldb work.
 [profile.dev]

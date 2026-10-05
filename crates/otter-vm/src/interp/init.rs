@@ -17,8 +17,11 @@
 //!   scope or by the interpreter's ordinary traced realm graph.
 //! - Root providers are dropped before their stack slots move into the
 //!   interpreter, and no GC allocation occurs during that move.
-//! - A half-built interpreter is never observable outside this module.
+//! - A half-built interpreter is never observable outside this module;
+//!   canonical construction returns the actual surface or allocation failure.
 //! - No realm-owned GC handle remains in an unswapped isolate-global cache.
+//! - Linked function realm identity survives disposal; source-global lookup
+//!   refuses a disposed realm instead of substituting the active global.
 //! - Protector and shape epochs start at zero and are isolate-local plain data,
 //!   not GC roots.
 #![allow(unused_imports)]
@@ -52,7 +55,7 @@ impl Interpreter {
     /// a no-cap string heap, the default stack-depth limit, and a
     /// fresh GC heap.
     #[must_use]
-    pub fn new() -> Self {
+    pub fn new() -> Result<Self, crate::js_surface::JsSurfaceError> {
         Self::with_string_heap_cap(0)
     }
 
@@ -69,10 +72,9 @@ impl Interpreter {
     /// unlimited). The same cap is honoured by the interpreter's
     /// GC heap.
     #[must_use]
-    pub fn with_string_heap_cap(cap_bytes: u64) -> Self {
+    pub fn with_string_heap_cap(cap_bytes: u64) -> Result<Self, crate::js_surface::JsSurfaceError> {
         let startup_timer = StartupPhaseTimer::from_env();
-        let mut gc_heap = otter_gc::GcHeap::with_max_heap_bytes(cap_bytes)
-            .expect("GcHeap construction never fails on the default cage");
+        let mut gc_heap = otter_gc::GcHeap::with_max_heap_bytes(cap_bytes)?;
         // The builtin surface built below — every intrinsic, prototype,
         // native callable and shape the realm starts with — lives as long as
         // the isolate does. Allocating it young makes the first scavenges
@@ -86,11 +88,14 @@ impl Interpreter {
         // First: every allocation after this creates objects on the heap's
         // `null`-prototype root, which the shape runtime installs.
         let names = std::sync::Arc::new(crate::property_atom::NameInterner::default());
-        let shape_runtime = object::ShapeRuntime::new(&mut gc_heap, std::sync::Arc::clone(&names))
-            .expect("shape root fits within any positive cap");
+        let shape_runtime = object::ShapeRuntime::new(&mut gc_heap, std::sync::Arc::clone(&names))?;
         startup_timer.mark("vm_shape_runtime");
-        let mut well_known_symbols = WellKnownSymbols::new(&mut gc_heap)
-            .expect("well-known symbol descriptions + bodies fit within any positive cap");
+        let mut well_known_symbols =
+            WellKnownSymbols::new(&mut gc_heap).map_err(|error| match error {
+                crate::symbol::WellKnownInitError::OutOfMemory(error) => {
+                    crate::js_surface::JsSurfaceError::OutOfMemory(error)
+                }
+            })?;
         let mut well_known_scope = otter_gc::RootScope::new(&mut gc_heap);
         // SAFETY: the table precedes the scope and the scope is explicitly
         // dropped before the table moves into `Interpreter`.
@@ -101,8 +106,7 @@ impl Interpreter {
             );
         }
         startup_timer.mark("vm_well_known_symbols");
-        let mut error_classes = ErrorClassRegistry::new(&mut gc_heap)
-            .expect("error class prototypes fit within any positive cap");
+        let mut error_classes = ErrorClassRegistry::new(&mut gc_heap)?;
         let mut error_scope = otter_gc::RootScope::new(&mut gc_heap);
         // SAFETY: the registry precedes the scope and remains stationary until
         // the scope is dropped immediately before the struct move.
@@ -113,8 +117,7 @@ impl Interpreter {
             );
         }
         startup_timer.mark("vm_error_classes");
-        let mut global_this = bootstrap::build_global_this(&mut gc_heap, &well_known_symbols)
-            .expect("global_this fits within any positive cap");
+        let mut global_this = bootstrap::build_global_this(&mut gc_heap, &well_known_symbols)?;
         let mut global_scope = otter_gc::RootScope::new(&mut gc_heap);
         // SAFETY: the global handle precedes the scope and stays stationary
         // until the explicit drop below.
@@ -129,8 +132,7 @@ impl Interpreter {
             &mut gc_heap,
             global_this,
             &well_known_symbols,
-        )
-        .expect("Symbol well-known properties fit within any positive cap");
+        )?;
         // §20.2.3.6 — install `Function.prototype[@@hasInstance]`.
         // Bootstrap can't see `WellKnownSymbols`, so we wire the
         // realm-local @@hasInstance after both Function.prototype
@@ -145,8 +147,7 @@ impl Interpreter {
                 function_proto,
                 has_instance,
                 &[&global_root],
-            )
-            .expect("Function.prototype[@@hasInstance] fits within any positive cap");
+            )?;
             // The installer can allocate and relocate the young prototype.
             // Resolve it again through the rooted global graph instead of
             // returning the pre-allocation copy.
@@ -168,7 +169,7 @@ impl Interpreter {
                 function_prototype,
                 object_prototype,
                 global_this,
-            );
+            )?;
         }
         // No GC allocation occurs between these drops and the struct move.
         // Dropping in reverse registration order keeps the frame-root stack
@@ -202,19 +203,15 @@ impl Interpreter {
             code_eviction_high_water_bytes: Self::DEFAULT_CODE_EVICTION_HIGH_WATER_BYTES,
             code_eviction_stats: CodeEvictionStats::default(),
             names,
-            property_cache: crate::property_cache::PropertyLookupCache::default(),
-            store_transition_cache: crate::property_cache::StoreTransitionCache::default(),
+            property_cache: crate::property_cache::PropertyActionCache::default(),
             realm_context: None,
             shape_runtime,
             simple_constructor_init_cache: rustc_hash::FxHashMap::default(),
             simple_constructor_absence: rustc_hash::FxHashMap::default(),
             simple_constructor_shape_cache: rustc_hash::FxHashMap::default(),
             object_literal_layouts: rustc_hash::FxHashMap::default(),
-            constructor_field_transition_cache: rustc_hash::FxHashMap::default(),
-            constructor_field_capacity_cache: rustc_hash::FxHashMap::default(),
-            constructor_instance_profiles: rustc_hash::FxHashMap::default(),
-            pending_constructor_samples: std::cell::RefCell::new(Vec::new()),
-            constructor_prototype_validity_cache: rustc_hash::FxHashMap::default(),
+            function_constructor_layouts: rustc_hash::FxHashMap::default(),
+            constructor_families: Default::default(),
             arguments_shape_cache: rustc_hash::FxHashMap::default(),
             max_stack_depth: DEFAULT_MAX_STACK_DEPTH,
             sync_reentry_depth: 0,
@@ -240,12 +237,9 @@ impl Interpreter {
             jit_hook: None,
             jit_debug: crate::jit_debug::JitDebugState::default(),
             jit_artifacts: crate::jit_artifact::JitArtifactState::default(),
-            jit_call_counts: rustc_hash::FxHashMap::default(),
             optimizing_tier_policy: tier_policy::TierPolicy::default(),
             jit_entry_bail_counts: rustc_hash::FxHashMap::default(),
             jit_osr_disabled: rustc_hash::FxHashSet::default(),
-            jit_osr_counts: rustc_hash::FxHashMap::default(),
-            jit_osr_trigger: None,
             jit_code: rustc_hash::FxHashMap::default(),
             jit_template_osr_fids: rustc_hash::FxHashSet::default(),
             jit_template_compiling: rustc_hash::FxHashSet::default(),
@@ -262,7 +256,7 @@ impl Interpreter {
             runtime_turn_depth: 0,
             jit_generated_feedback_pending: false,
             jit_next_code_object_id: 1,
-            jit_frame_cell: None,
+            jit_context: None,
             jit_detached_frame: 0,
             work_budget: WorkBudget::default(),
             work_budget_stats: WorkBudgetStats::default(),
@@ -286,7 +280,7 @@ impl Interpreter {
             async_context: Value::undefined(),
             iteration_anchors: Vec::new(),
             pending_uncaught_frames: None,
-            module_sources: source_registry::SourceRegistry::default(),
+            resource_account: otter_resource::ResourceAccount::default(),
             function_user_props: std::collections::HashMap::new(),
             function_prototype_overrides: std::collections::HashMap::new(),
             function_prototype_slots: std::collections::HashMap::new(),
@@ -323,18 +317,18 @@ impl Interpreter {
             tracer: None,
             cpu_profiler: None,
         };
-        interp.prime_realm_caches();
+        interp.prime_realm_caches()?;
         // The realm is complete; anything allocated from here is mutator work
         // and belongs in the nursery, where most of it dies.
         interp.gc_heap.set_tenure_all(false);
-        interp
+        Ok(interp)
     }
 
     /// Post-bootstrap realm cache priming, shared by the ordinary
-    /// constructor and the snapshot restore path: populate the typed
+    /// constructor: populate the typed
     /// intrinsic slots from the global graph, build the per-kind
     /// iterator prototypes, and install the function-kind prototypes.
-    pub(crate) fn prime_realm_caches(&mut self) {
+    pub(crate) fn prime_realm_caches(&mut self) -> Result<(), crate::js_surface::JsSurfaceError> {
         let interp = self;
         let global_this = interp.global_this;
         // Cache typed handles for the well-known constructors and
@@ -369,8 +363,7 @@ impl Interpreter {
                     &mut interp.gc_heap,
                     iter_proto,
                     &interp.well_known_symbols,
-                )
-                .expect("per-kind iterator prototypes fit within any positive cap");
+                )?;
             let built = [
                 Value::object(protos.array),
                 Value::object(protos.map),
@@ -384,7 +377,7 @@ impl Interpreter {
                 *slot = value;
             }
         }
-        interp.install_function_kind_prototypes_post_bootstrap();
+        interp.install_function_kind_prototypes_post_bootstrap()?;
         drop(iterator_scope);
         let completed: [Option<JsObject>; 7] = iterator_roots.map(|value| value.as_object());
         for (slot, value) in [
@@ -411,6 +404,7 @@ impl Interpreter {
             slot.set(value);
         }
         drop(extra_roots_guard);
+        Ok(())
     }
 
     fn swap_active_realm_state(&mut self, state: &mut RealmState) {
@@ -513,13 +507,25 @@ impl Interpreter {
         );
     }
 
+    fn bootstrap_surface_error(
+        &mut self,
+        error: crate::js_surface::JsSurfaceError,
+        owner: &'static str,
+    ) -> VmError {
+        match error {
+            crate::js_surface::JsSurfaceError::OutOfMemory(error) => VmError::from(error),
+            error => self.err_type(format!("createRealm {owner} bootstrap failed: {error}").into()),
+        }
+    }
+
     fn build_realm_state(&mut self, id: u32) -> Result<usize, VmError> {
         // Building the new realm's error registry can collect before the
         // provisional RealmState is published below. Keep every already-live
         // interpreter/realm root visible during that bootstrap window.
         let existing_roots = otter_gc::ExtraRoots::new(&*self);
         let existing_roots_guard = self.gc_heap.register_extra_roots(existing_roots);
-        let error_classes = ErrorClassRegistry::new(&mut self.gc_heap).map_err(crate::oom_to_vm)?;
+        let error_classes = ErrorClassRegistry::new(&mut self.gc_heap)
+            .map_err(|error| self.bootstrap_surface_error(error, "Error"))?;
         drop(existing_roots_guard);
         let state_index = self.extra_realms.len();
         self.extra_realms.push(RealmState {
@@ -574,18 +580,14 @@ impl Interpreter {
         let runtime_roots = otter_gc::ExtraRoots::new(&*self);
         let _runtime_roots_guard = self.gc_heap.register_extra_roots(runtime_roots);
         let global_this = bootstrap::build_global_this(&mut self.gc_heap, &self.well_known_symbols)
-            .map_err(|err| {
-                self.err_type((format!("createRealm bootstrap failed: {err}")).into())
-            })?;
+            .map_err(|err| self.bootstrap_surface_error(err, "globalThis"))?;
         self.extra_realms[state_index].global_this = global_this;
         crate::intrinsics::symbol::install_symbol_well_knowns_post_bootstrap(
             &mut self.gc_heap,
             self.extra_realms[state_index].global_this,
             &self.well_known_symbols,
         )
-        .map_err(|err| {
-            self.err_type((format!("createRealm Symbol bootstrap failed: {err}")).into())
-        })?;
+        .map_err(|err| self.bootstrap_surface_error(err, "Symbol"))?;
         let global_this = self.extra_realms[state_index].global_this;
         let function_prototype = resolve_ctor_prototype(&mut self.gc_heap, global_this, "Function");
         if let Some(function_prototype) = function_prototype {
@@ -599,9 +601,7 @@ impl Interpreter {
                 has_instance,
                 &[&global_root],
             )
-            .map_err(|err| {
-                self.err_type((format!("createRealm Function bootstrap failed: {err}")).into())
-            })?;
+            .map_err(|err| self.bootstrap_surface_error(err, "Function"))?;
             // The installer above allocates. Re-read both objects from the
             // rooted realm graph instead of using pre-safepoint raw handles.
             let global_this = self.extra_realms[state_index].global_this;
@@ -647,9 +647,7 @@ impl Interpreter {
                     iter_proto,
                     &self.well_known_symbols,
                 )
-                .map_err(|err| {
-                    self.err_type((format!("createRealm Iterator bootstrap failed: {err}")).into())
-                })?;
+                .map_err(|err| self.bootstrap_surface_error(err, "Iterator"))?;
             let state = &mut self.extra_realms[state_index];
             state.array_iterator_prototype = Some(protos.array);
             state.map_iterator_prototype = Some(protos.map);
@@ -766,8 +764,8 @@ impl Interpreter {
                         .prototype(ErrorKind::Error),
                 ),
             );
-            let _ = interp.scoped_set_prototype(scope, error_constructor, Some(function_prototype));
-            let _ = interp.scoped_set_prototype(scope, error_prototype, Some(object_prototype));
+            interp.scoped_set_prototype(scope, error_constructor, Some(function_prototype))?;
+            interp.scoped_set_prototype(scope, error_prototype, Some(object_prototype))?;
             for kind in [
                 ErrorKind::TypeError,
                 ErrorKind::RangeError,
@@ -776,6 +774,9 @@ impl Interpreter {
                 ErrorKind::URIError,
                 ErrorKind::EvalError,
                 ErrorKind::AggregateError,
+                ErrorKind::WasmCompileError,
+                ErrorKind::WasmLinkError,
+                ErrorKind::WasmRuntimeError,
             ] {
                 let constructor = interp.scoped_value(
                     scope,
@@ -785,7 +786,7 @@ impl Interpreter {
                             .constructor(kind),
                     ),
                 );
-                let _ = interp.scoped_set_prototype(scope, constructor, Some(error_constructor));
+                interp.scoped_set_prototype(scope, constructor, Some(error_constructor))?;
             }
             Ok::<(), VmError>(())
         })?;
@@ -820,6 +821,17 @@ impl Interpreter {
                     object::PropertyFlags::new(true, false, true),
                 )
             })?;
+        }
+        // Registry-only namespace intrinsics are not reachable from the
+        // global graph before Web installation. Stamp their canonical native
+        // call/construct entry too: an unstamped native selects the default
+        // realm even when invoked while this additional realm is active.
+        let global = self.extra_realms[state_index].global_this;
+        for &kind in ErrorKind::all() {
+            let constructor = self.extra_realms[state_index]
+                .error_classes
+                .constructor(kind);
+            self.tag_native_value_realm(Value::object(constructor), global);
         }
         Ok(())
     }
@@ -884,7 +896,10 @@ impl Interpreter {
         self.realm_intrinsics.array_prototype().map(Value::object)
     }
 
-    pub(crate) fn register_array_prototype_override(&mut self, array: crate::array::JsArray) {
+    pub(crate) fn register_array_prototype_override(
+        &mut self,
+        array: crate::array::JsArray,
+    ) -> Result<crate::array::JsArray, otter_gc::OutOfMemory> {
         // Stamp the per-instance `[[Prototype]]` only for arrays minted while
         // a non-default realm is active. A default-realm array resolves
         // through the active realm's %Array.prototype% anyway, and stamping
@@ -893,10 +908,25 @@ impl Interpreter {
         // builtin dispatch) — one boxed side-table per array, traced on every
         // scavenge.
         if !self.active_realm_is_extra {
-            return;
+            return Ok(array);
         }
-        let prototype = self.current_array_prototype_override();
-        crate::array::set_prototype_override(array, &mut self.gc_heap, prototype);
+        self.with_handle_scope(|vm, scope| {
+            let root = vm.scoped_value(scope, Value::array(array));
+            let prototype = vm.current_array_prototype_override();
+            let array = vm
+                .handle_arena
+                .get(root.index())
+                .as_array()
+                .expect("rooted array");
+            crate::array::set_prototype_override(array, &mut vm.gc_heap, prototype)?;
+            // Sidecar allocation can relocate the shell: return the arena's
+            // rewritten value, never the raw pre-allocation handle.
+            Ok(vm
+                .handle_arena
+                .get(root.index())
+                .as_array()
+                .expect("rooted array"))
+        })
     }
 
     fn tag_iterator_realm_natives(&mut self, global: JsObject) {
@@ -1127,7 +1157,7 @@ impl Interpreter {
     /// an unregistered function belongs to the default realm.
     #[inline]
     pub(crate) fn foreign_function_realm(&self, function_id: u32) -> Option<u32> {
-        if self.extra_realms.is_empty() && self.active_realm_id == 0 {
+        if self.function_realm_ids.is_empty() && self.active_realm_id == 0 {
             return None;
         }
         let realm_id = self
@@ -1140,16 +1170,18 @@ impl Interpreter {
 
     /// The global object a bytecode function's realm exposes — its own
     /// realm's global when it differs from the active one, otherwise the
-    /// active global.
+    /// active global. A disposed source realm is structural admission failure;
+    /// it never substitutes the caller's ambient global.
     #[inline]
-    pub(crate) fn global_this_for_function(&self, function_id: u32) -> JsObject {
+    pub(crate) fn global_this_for_function(&self, function_id: u32) -> Result<JsObject, VmError> {
         match self.foreign_function_realm(function_id) {
             Some(realm_id) => self
                 .extra_realms
                 .iter()
                 .find(|realm| realm.id == realm_id)
-                .map_or(self.global_this, |realm| realm.global_this),
-            None => self.global_this,
+                .map(|realm| realm.global_this)
+                .ok_or(VmError::InvalidOperand),
+            None => Ok(self.global_this),
         }
     }
 

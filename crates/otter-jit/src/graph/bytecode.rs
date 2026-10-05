@@ -187,12 +187,8 @@ pub(crate) struct Analysis {
     pub(crate) order: Vec<usize>,
     /// Loop facts keyed by header block.
     pub(crate) loops: rustc_hash::FxHashMap<usize, LoopInfo>,
-    /// Headers reached through an edge their dominator relation does not
-    /// admit; such a header is entered only through a deopt.
-    pub(crate) irreducible: rustc_hash::FxHashSet<usize>,
     /// Registers live before each instruction.
     pub(crate) live_in: Vec<RegisterSet>,
-    pub(crate) register_count: u16,
 }
 
 /// Why a bytecode body cannot be analysed at all.
@@ -440,7 +436,8 @@ impl Analysis {
         };
 
         let mut loops = rustc_hash::FxHashMap::default();
-        let mut irreducible = rustc_hash::FxHashSet::default();
+        // A retreating edge whose target does not dominate its source makes
+        // the target irreducible; the builder enters it only through a deopt.
         for &block in &order {
             for &successor in &blocks[block].successors.clone() {
                 if rank[successor] > rank[block] {
@@ -451,8 +448,6 @@ impl Analysis {
                         assigned: RegisterSet::new(usize::from(register_count)),
                         body: Vec::new(),
                     });
-                } else {
-                    irreducible.insert(successor);
                 }
             }
         }
@@ -493,9 +488,7 @@ impl Analysis {
             block_of,
             order,
             loops,
-            irreducible,
             live_in,
-            register_count,
         })
     }
 

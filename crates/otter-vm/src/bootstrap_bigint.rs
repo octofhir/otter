@@ -144,7 +144,7 @@ fn coerce_bigint_call_args(
                             &value,
                             crate::abstract_ops::ToPrimitiveHint::Number,
                         )
-                        .map_err(|error| vm_to_native(interp, error, name))
+                        .map_err(|error| error.into_native(interp, name))
                 })?;
                 outputs.push(scope.value(primitive));
             } else {
@@ -198,7 +198,7 @@ fn bigint_proto_to_string(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Val
                 })?;
             let number = scope.with_turn_parts(|interp, stack| {
                 crate::coerce::to_number_or_throw(interp, stack, &exec, &value)
-                    .map_err(|err| vm_to_native(interp, err, "BigInt.prototype.toString"))
+                    .map_err(|err| err.into_native(interp, "BigInt.prototype.toString"))
             })?;
             let f = number.as_f64();
             let trunc = if f.is_nan() { 0.0 } else { f.trunc() };

@@ -34,6 +34,8 @@
 //! - The atom text is borrowed from a frozen [`AtomTable`], which lives as long
 //!   as its linked chunk.
 //! - Computed property keys and symbols do not pass through this layer.
+//! - Decoded atom arrays and spellings are prepared fallibly after the owning
+//!   payload admits their physical geometry; allocator refusal publishes no IDs.
 //!
 //! # See also
 //! - [`crate::execution_context`]
@@ -224,9 +226,9 @@ struct AtomSlot {
 
 /// Transient builder for [`AtomTable`].
 ///
-/// The builder may allocate and decode freely while an
-/// [`crate::ExecutionContext`] is being constructed. Runtime dispatch receives
-/// only the frozen table.
+/// The owning chunk admits array/spelling geometry before this builder
+/// prepares buffers fallibly. Runtime dispatch receives only the frozen table;
+/// no atom identity is published by preparation.
 #[derive(Debug, Default)]
 pub(crate) struct AtomTableBuilder {
     slots: Vec<AtomSlot>,
@@ -235,25 +237,35 @@ pub(crate) struct AtomTableBuilder {
 impl AtomTableBuilder {
     /// Build atom metadata from a bytecode constant pool.
     #[must_use]
-    pub(crate) fn from_constants(constants: &[Constant]) -> Self {
+    pub(crate) fn from_constants(
+        constants: &[Constant],
+        lease: &mut otter_resource::ResourceLease,
+    ) -> Result<Self, otter_resource::ResourceError> {
         let mut builder = Self {
-            slots: Vec::with_capacity(constants.len()),
+            slots: crate::executable::allocation::try_vec(constants.len(), lease)?,
         };
         for constant in constants {
-            builder.push(constant);
+            builder.push(constant, lease)?;
         }
-        builder
+        Ok(builder)
     }
 
-    fn push(&mut self, constant: &Constant) {
+    fn push(
+        &mut self,
+        constant: &Constant,
+        lease: &mut otter_resource::ResourceLease,
+    ) -> Result<(), otter_resource::ResourceError> {
         let text = match constant {
-            Constant::String { utf16 } => Some(String::from_utf16_lossy(utf16)),
+            Constant::String { utf16 } => {
+                Some(crate::executable::allocation::try_utf16(utf16, lease)?)
+            }
             _ => None,
         };
         self.slots.push(AtomSlot {
             text,
             id: AtomicU32::new(AtomId::UNRESOLVED),
         });
+        Ok(())
     }
 
     /// Seal the transient buffers into an immutable execution table whose atom
@@ -275,8 +287,24 @@ pub(crate) struct AtomTable {
 impl AtomTable {
     /// Build and freeze an unresolved atom table from a bytecode constant pool.
     #[must_use]
-    pub(crate) fn from_constants(constants: &[Constant]) -> Self {
-        AtomTableBuilder::from_constants(constants).freeze()
+    pub(crate) fn from_constants(
+        constants: &[Constant],
+        lease: &mut otter_resource::ResourceLease,
+    ) -> Result<Self, otter_resource::ResourceError> {
+        Ok(AtomTableBuilder::from_constants(constants, lease)?.freeze())
+    }
+
+    /// Requested physical metadata geometry before any decoding allocation.
+    pub(crate) fn allocation_bytes(constants: &[Constant]) -> u64 {
+        constants.iter().fold(
+            crate::executable::allocation::array_bytes::<AtomSlot>(constants.len()),
+            |bytes, constant| {
+                bytes.saturating_add(match constant {
+                    Constant::String { utf16 } => crate::executable::allocation::utf16_bytes(utf16),
+                    _ => 0,
+                })
+            },
+        )
     }
 
     /// Heap bytes this table retains for the owning chunk's lifetime: the
@@ -285,8 +313,8 @@ impl AtomTable {
     pub(crate) fn retained_bytes(&self) -> u64 {
         let mut total = std::mem::size_of_val::<[AtomSlot]>(&self.slots) as u64;
         for slot in &self.slots {
-            if let Some(text) = slot.text.as_deref() {
-                total = total.saturating_add(text.len() as u64);
+            if let Some(text) = &slot.text {
+                total = total.saturating_add(text.capacity() as u64);
             }
         }
         total
@@ -338,6 +366,20 @@ impl AtomTable {
 mod tests {
     use super::*;
 
+    fn atom_builder(constants: &[Constant]) -> AtomTableBuilder {
+        let mut lease = otter_resource::ResourceAccount::default()
+            .reserve_exact(
+                otter_resource::ResourceClass::SourceModuleBytes,
+                AtomTable::allocation_bytes(constants),
+            )
+            .expect("admit atom fixture metadata");
+        AtomTableBuilder::from_constants(constants, &mut lease).expect("prepare atom fixture")
+    }
+
+    fn atom_table(constants: &[Constant]) -> AtomTable {
+        atom_builder(constants).freeze()
+    }
+
     static_assertions::assert_impl_all!(NameInterner: Send, Sync);
 
     fn utf16(s: &str) -> Vec<u16> {
@@ -359,7 +401,7 @@ mod tests {
         ];
 
         let names = NameInterner::default();
-        let table = AtomTableBuilder::from_constants(&constants).freeze();
+        let table = atom_builder(&constants).freeze();
         table.resolve(&names);
 
         assert_eq!(table.string_constant_str(0), None);
@@ -375,11 +417,11 @@ mod tests {
     #[test]
     fn one_name_has_one_id_across_chunks() {
         let names = NameInterner::default();
-        let first = AtomTable::from_constants(&[
+        let first = atom_table(&[
             Constant::String { utf16: utf16("y") },
             Constant::String { utf16: utf16("x") },
         ]);
-        let second = AtomTable::from_constants(&[Constant::String { utf16: utf16("x") }]);
+        let second = atom_table(&[Constant::String { utf16: utf16("x") }]);
         first.resolve(&names);
         second.resolve(&names);
 
@@ -398,7 +440,7 @@ mod tests {
     #[test]
     fn duplicate_constants_share_one_atom() {
         let names = NameInterner::default();
-        let table = AtomTable::from_constants(&[
+        let table = atom_table(&[
             Constant::String { utf16: utf16("x") },
             Constant::String { utf16: utf16("x") },
         ]);
@@ -413,7 +455,7 @@ mod tests {
 
     #[test]
     fn resolution_rekeys_to_the_adopting_interner() {
-        let table = AtomTable::from_constants(&[Constant::String { utf16: utf16("x") }]);
+        let table = atom_table(&[Constant::String { utf16: utf16("x") }]);
         let first = NameInterner::default();
         let second = NameInterner::default();
         // Give the second interner a different id for the same spelling.
@@ -434,7 +476,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "no interpreter has linked or adopted")]
     fn unresolved_table_refuses_to_hand_out_an_atom() {
-        let table = AtomTable::from_constants(&[Constant::String { utf16: utf16("x") }]);
+        let table = atom_table(&[Constant::String { utf16: utf16("x") }]);
         let _ = table.property_atom(0);
     }
 

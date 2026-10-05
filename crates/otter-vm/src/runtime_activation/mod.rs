@@ -25,7 +25,7 @@ mod deopt;
 mod exceptions;
 mod forward_arguments;
 mod iterators;
-mod semantic_source;
+pub(crate) mod semantic_source;
 mod value_loads;
 mod value_ops;
 
@@ -80,16 +80,17 @@ impl<'a> RuntimeCall<'a> {
         let activation = unsafe { activation.as_ref() };
         let vm = NonNull::new(activation.vm).ok_or(VmError::InvalidOperand)?;
         let stack = NonNull::new(activation.stack).ok_or(VmError::InvalidOperand)?;
-        let ambient = unsafe { activation.context.as_ref() }.ok_or(VmError::InvalidOperand)?;
+
         // Validate both published windows before exposing any semantic method.
         // SAFETY: the entry contract retains the initialized raw descriptor for
         // `'a`; ActiveFrameRef itself stores no native Rust reference.
         unsafe { ActiveFrameRef::from_ptr(frame.as_ptr()) }.map_err(|_| VmError::InvalidOperand)?;
         let function_id = unsafe { frame.as_ref().header.function_id };
-        let context = ambient
-            .for_function(function_id)
-            .map_err(|_| VmError::InvalidOperand)?;
-        let context = (*context).clone();
+        // A host-only entry may have no admitted source. Once a bytecode
+        // frame is published, its own live FunctionID is the authoritative
+        // metadata owner, including transparent Proxy/Bound child entries.
+        let context =
+            unsafe { activation.owner_context(function_id) }.ok_or(VmError::InvalidOperand)?;
         Ok(Self {
             vm,
             stack,
@@ -148,13 +149,15 @@ impl<'a> RuntimeCall<'a> {
         arg0: u64,
         arg1: u64,
         arg2: u64,
-    ) -> Result<(), VmError> {
-        let frame_index = self.frame_index()?;
+    ) -> Result<(), CommittedValueError> {
+        let frame_index = self
+            .frame_index()
+            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
         let vm = unsafe { &mut *self.vm.as_ptr() };
         let stack = unsafe { &mut *self.stack.as_ptr() };
         let context = self.context.clone();
         self.with_frame(|frame| {
-            vm.jit_runtime_global_op(
+            Ok(vm.jit_runtime_global_op(
                 &context,
                 stack,
                 frame_index,
@@ -163,8 +166,9 @@ impl<'a> RuntimeCall<'a> {
                 arg0,
                 arg1,
                 arg2,
-            )
+            ))
         })
+        .map_err(CommittedValueError::Fatal)?
     }
 
     /// Complete one materialized `delete` transition against the published
@@ -176,13 +180,15 @@ impl<'a> RuntimeCall<'a> {
         arg0: u64,
         arg1: u64,
         arg2: u64,
-    ) -> Result<(), VmError> {
-        let frame_index = self.frame_index()?;
+    ) -> Result<(), CommittedValueError> {
+        let frame_index = self
+            .frame_index()
+            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
         let vm = unsafe { &mut *self.vm.as_ptr() };
         let stack = unsafe { &mut *self.stack.as_ptr() };
         let context = self.context.clone();
         self.with_frame(|frame| {
-            vm.jit_runtime_delete_op(
+            Ok(vm.jit_runtime_delete_op(
                 &context,
                 stack,
                 frame_index,
@@ -191,8 +197,9 @@ impl<'a> RuntimeCall<'a> {
                 arg0,
                 arg1,
                 arg2,
-            )
+            ))
         })
+        .map_err(CommittedValueError::Fatal)?
     }
 
     /// Run one synchronous direct eval from the materialized caller frame.
@@ -244,29 +251,33 @@ mod tests {
             .into(),
             ..Function::default()
         };
-        let context = ExecutionContext::from_module(crate::BytecodeModule {
-            module: "committed-bind-this-test.js".to_string(),
-            template_sites: Vec::new(),
-            source_kind: SourceKind::JavaScript,
-            functions: vec![function.clone()],
-            constants: Vec::new(),
-            module_resolutions: Vec::new(),
-            module_inits: Vec::new(),
-            function_source: None,
-        })
+        let context = ExecutionContext::from_module(
+            crate::BytecodeModule {
+                module: "committed-bind-this-test.js".to_string(),
+                template_sites: Vec::new(),
+                source_kind: SourceKind::JavaScript,
+                functions: vec![function.clone()],
+                constants: Vec::new(),
+                module_resolutions: Vec::new(),
+                module_inits: Vec::new(),
+                function_source: None,
+            },
+            crate::source_registry::SourceRegistry::default(),
+        )
         .expect("valid bytecode fixture");
         (context, function)
     }
 
     #[test]
     fn identity_is_decoded_once_and_slot_access_is_checked() {
-        let mut vm = Interpreter::new();
+        let mut vm = Interpreter::new().expect("fixture interpreter bootstrap");
         let mut stack = crate::test_support::FrameChainFixture::new();
-        let context = ExecutionContext::from_module(crate::test_support::minimal_bytecode_module(
-            "runtime-call-test.js",
-        ))
+        let context = ExecutionContext::from_module(
+            crate::test_support::minimal_bytecode_module("runtime-call-test.js"),
+            crate::source_registry::SourceRegistry::default(),
+        )
         .expect("valid bytecode fixture");
-        let mut activation = VmRuntimeActivation::new(&mut vm, &mut stack, &context);
+        let mut activation = VmRuntimeActivation::new(&mut vm, &mut stack, Some(&context));
         let mut registers = [Value::number_i32(3), Value::undefined()];
         let mut frame = Frame::new(
             VmFrameHeader {
@@ -295,11 +306,12 @@ mod tests {
 
     #[test]
     fn binding_rejects_an_unknown_function_identity() {
-        let mut vm = Interpreter::new();
+        let mut vm = Interpreter::new().expect("fixture interpreter bootstrap");
         let mut stack = crate::test_support::FrameChainFixture::new();
-        let context = ExecutionContext::from_module(crate::test_support::minimal_bytecode_module(
-            "runtime-call-unknown-function-test.js",
-        ))
+        let context = ExecutionContext::from_module(
+            crate::test_support::minimal_bytecode_module("runtime-call-unknown-function-test.js"),
+            crate::source_registry::SourceRegistry::default(),
+        )
         .expect("valid bytecode fixture");
         let mut registers = [Value::undefined()];
         let mut frame = Frame::new(
@@ -314,7 +326,7 @@ mod tests {
             Value::function(u32::MAX),
             Value::undefined(),
         );
-        let mut activation = VmRuntimeActivation::new(&mut vm, &mut stack, &context);
+        let mut activation = VmRuntimeActivation::new(&mut vm, &mut stack, Some(&context));
 
         assert!(matches!(
             // SAFETY: pointers are live; the test deliberately supplies a
@@ -327,7 +339,7 @@ mod tests {
     #[test]
     fn runtime_call_uses_the_physical_frame_without_writeback() {
         let (context, function) = bind_this_fixture();
-        let mut vm = Interpreter::new();
+        let mut vm = Interpreter::new().expect("fixture interpreter bootstrap");
         let arguments = vm.alloc_host_object_with_roots(&[], &[]).unwrap();
         let mut frame = vm.test_frame_for_function(&function).unwrap();
         frame.set_new_target(Value::function(99));
@@ -335,7 +347,7 @@ mod tests {
         let mut stack = crate::test_support::FrameChainFixture::new();
         stack.push(frame);
         let physical = std::ptr::from_mut(&mut stack[0]);
-        let mut activation = VmRuntimeActivation::new(&mut vm, &mut stack, &context);
+        let mut activation = VmRuntimeActivation::new(&mut vm, &mut stack, Some(&context));
         let mut call = unsafe {
             RuntimeCall::bind(
                 NonNull::from(&mut activation),
@@ -356,7 +368,7 @@ mod tests {
 
     #[test]
     fn committed_throw_preserves_nested_frames_until_local_catch_acknowledges_it() {
-        let mut vm = Interpreter::new();
+        let mut vm = Interpreter::new().expect("fixture interpreter bootstrap");
         let exception = Value::number_i32(73);
         vm.set_pending_uncaught_throw(exception);
         let nested_frames = vec![crate::StackFrameSnapshot {
@@ -364,16 +376,19 @@ mod tests {
             function_name: "nestedGetter".to_string(),
             module: "runtime-call-throw-test.js".to_string(),
             span: (11, 19),
+
+            source_position: None,
         }];
         vm.pending_uncaught_frames = Some(nested_frames.clone());
         let _ = vm.err_uncaught("stale committed detail".into());
 
         let mut stack = crate::test_support::FrameChainFixture::new();
-        let context = ExecutionContext::from_module(crate::test_support::minimal_bytecode_module(
-            "runtime-call-throw-test.js",
-        ))
+        let context = ExecutionContext::from_module(
+            crate::test_support::minimal_bytecode_module("runtime-call-throw-test.js"),
+            crate::source_registry::SourceRegistry::default(),
+        )
         .expect("valid bytecode fixture");
-        let mut activation = VmRuntimeActivation::new(&mut vm, &mut stack, &context);
+        let mut activation = VmRuntimeActivation::new(&mut vm, &mut stack, Some(&context));
         let mut registers = [Value::undefined()];
         let mut frame = Frame::new(
             VmFrameHeader {
@@ -408,6 +423,8 @@ mod tests {
             function_name: "catchBody".to_string(),
             module: "runtime-call-throw-test.js".to_string(),
             span: (23, 29),
+
+            source_position: None,
         }];
         vm.set_pending_uncaught_throw(later_exception);
         vm.pending_uncaught_frames = Some(later_frames.clone());
@@ -427,14 +444,15 @@ mod tests {
 
     #[test]
     fn wrong_committed_site_is_fatal_before_semantic_entry() {
-        let mut vm = Interpreter::new();
+        let mut vm = Interpreter::new().expect("fixture interpreter bootstrap");
         let before = vm.jit_runtime_stats();
         let mut stack = crate::test_support::FrameChainFixture::new();
-        let context = ExecutionContext::from_module(crate::test_support::minimal_bytecode_module(
-            "runtime-call-wrong-site-test.js",
-        ))
+        let context = ExecutionContext::from_module(
+            crate::test_support::minimal_bytecode_module("runtime-call-wrong-site-test.js"),
+            crate::source_registry::SourceRegistry::default(),
+        )
         .expect("valid bytecode fixture");
-        let mut activation = VmRuntimeActivation::new(&mut vm, &mut stack, &context);
+        let mut activation = VmRuntimeActivation::new(&mut vm, &mut stack, Some(&context));
         let mut registers = [Value::undefined()];
         let mut frame = Frame::new(
             VmFrameHeader {
@@ -465,7 +483,7 @@ mod tests {
     #[test]
     fn committed_bind_this_keeps_the_physical_frame_pc() {
         let (context, function) = bind_this_fixture();
-        let mut vm = Interpreter::new();
+        let mut vm = Interpreter::new().expect("fixture interpreter bootstrap");
         let mut physical = vm
             .test_frame_for_function(&function)
             .expect("derived frame");
@@ -474,7 +492,7 @@ mod tests {
         let mut stack = crate::test_support::FrameChainFixture::new();
         stack.push(physical);
         let native = std::ptr::from_mut(&mut stack[0]);
-        let mut activation = VmRuntimeActivation::new(&mut vm, &mut stack, &context);
+        let mut activation = VmRuntimeActivation::new(&mut vm, &mut stack, Some(&context));
         let bound = Value::number_i32(41);
 
         let mut call = unsafe {
@@ -526,20 +544,23 @@ mod tests {
             .into(),
             ..Function::default()
         };
-        let context = ExecutionContext::from_module(crate::BytecodeModule {
-            module: "committed-lexical-bind-this-test.js".to_string(),
-            template_sites: Vec::new(),
-            source_kind: SourceKind::JavaScript,
-            functions: vec![outer_function.clone(), inner_function.clone()],
-            constants: Vec::new(),
-            module_resolutions: Vec::new(),
-            module_inits: Vec::new(),
-            function_source: None,
-        })
+        let context = ExecutionContext::from_module(
+            crate::BytecodeModule {
+                module: "committed-lexical-bind-this-test.js".to_string(),
+                template_sites: Vec::new(),
+                source_kind: SourceKind::JavaScript,
+                functions: vec![outer_function.clone(), inner_function.clone()],
+                constants: Vec::new(),
+                module_resolutions: Vec::new(),
+                module_inits: Vec::new(),
+                function_source: None,
+            },
+            crate::source_registry::SourceRegistry::default(),
+        )
         .expect("valid bytecode fixture");
         drop(base_context);
 
-        let mut vm = Interpreter::new();
+        let mut vm = Interpreter::new().expect("fixture interpreter bootstrap");
         let mut outer = vm
             .test_frame_for_function(&outer_function)
             .expect("outer derived frame");
@@ -553,7 +574,7 @@ mod tests {
         stack.push(outer);
         stack.push(inner);
         let native = std::ptr::from_mut(&mut stack[1]);
-        let mut activation = VmRuntimeActivation::new(&mut vm, &mut stack, &context);
+        let mut activation = VmRuntimeActivation::new(&mut vm, &mut stack, Some(&context));
         let bound = Value::number_i32(71);
 
         let mut call = unsafe {
@@ -581,7 +602,7 @@ mod tests {
     #[test]
     fn wrong_frame_bind_this_is_fatal_before_a_local_handler_or_effect() {
         let (context, _) = bind_this_fixture();
-        let mut vm = Interpreter::new();
+        let mut vm = Interpreter::new().expect("fixture interpreter bootstrap");
         let before = vm.jit_runtime_stats();
         let mut stack = crate::test_support::FrameChainFixture::new();
         let mut registers = [Value::undefined()];
@@ -598,7 +619,7 @@ mod tests {
             Value::hole(),
         );
 
-        let mut activation = VmRuntimeActivation::new(&mut vm, &mut stack, &context);
+        let mut activation = VmRuntimeActivation::new(&mut vm, &mut stack, Some(&context));
 
         let mut call = unsafe {
             RuntimeCall::bind(NonNull::from(&mut activation), NonNull::from(&mut native))

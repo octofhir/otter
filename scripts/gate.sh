@@ -76,7 +76,7 @@ if [[ "${1:-}" == "--quick" ]]; then
         for test_name in \
             construct_receiver_and_arguments_survive_reentrant_moving_gc \
             spread_array_survives_receiver_preparation_moving_gc; do
-            cargo test -q -p otter-runtime --test jit_machine_direct_call \
+            cargo test -q -p otter-runtime --test jit_constructor_gc \
                 "$test_name" -- --exact
         done
     fi
@@ -86,13 +86,13 @@ if [[ "${1:-}" == "--quick" ]]; then
     fi
     if [[ "$quick_family" == "native" || "$quick_family" == "all" ]]; then
         step "quick explicit native calls (stress=$OTTER_GC_STRESS)"
-        cargo test -q -p otter-runtime --test jit_machine_native_call_with_this
+        cargo test -q -p otter-runtime --test jit_resolved_native_leaves
     fi
     if [[ "$quick_family" == "properties" || "$quick_family" == "all" ]]; then
         step "quick named properties (stress=$OTTER_GC_STRESS)"
         cargo test -q -p otter-runtime \
-            --test jit_machine_generic_properties \
-            --test jit_machine_megamorphic_properties
+            --test jit_speculative_property_loads \
+            --test jit_property_transitions
     fi
     printf '\nQuick checks passed; full closing gate remains required.\n'
     exit 0

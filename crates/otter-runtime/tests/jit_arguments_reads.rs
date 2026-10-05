@@ -1,22 +1,21 @@
 //! Proven local arguments reads across interpreter and generated activations.
 //!
 //! # Contents
-//! - Exact Machine artifact admission and tier parity for local aliases.
+//! - Tier parity for local aliases across interpreter, Template and
+//!   production tiering.
 //! - Cold materialization preserves getter mutations and the iterator intrinsic.
 //!
 //! # Invariants
-//! - Optimized bodies must contain the native argument-window probe.
+//! - Every tier produces the interpreter's result for the same source.
 //! - Heap arguments remain valid through allocations in a live activation.
 //!
 //! # See also
 //! - `otter-difftest/corpus/arguments_local_reads.js` covers escape and key cases.
 
-use otter_runtime::{
-    JitArtifactFileName, JitDebugRequest, JitDebugTier, JitSelection, Runtime, SourceInput,
-};
+use otter_runtime::{JitSelection, Runtime, SourceInput};
 
 #[test]
-fn local_arguments_reads_use_machine_probes_and_preserve_cold_identity() {
+fn local_arguments_reads_keep_tier_parity_and_preserve_cold_identity() {
     let source = r#"
 function sumArguments() {
     var a = arguments, sum = 0;
@@ -46,33 +45,11 @@ sum + ':' + cold;
         JitSelection::Template,
         JitSelection::ProductionTiered,
     ] {
-        let mut runtime = Runtime::builder()
-            .jit_selection(selection)
-            .jit_debug(JitDebugRequest::artifacts().with_events(true))
-            .build()
-            .unwrap();
+        let mut runtime = Runtime::builder().jit_selection(selection).build().unwrap();
         let result = runtime
             .run_script(SourceInput::from_javascript(source), "arguments-reads.js")
             .unwrap();
         assert_eq!(result.completion_string(), "1128750:47", "{selection:?}");
-        if selection == JitSelection::ProductionTiered {
-            let batch = result.jit_artifacts().unwrap();
-            for name in ["sumArguments", "coldArguments"] {
-                let bundle = batch
-                    .bundles()
-                    .iter()
-                    .find(|bundle| {
-                        bundle.manifest().function_name() == name
-                            && bundle.manifest().tier() == JitDebugTier::Optimizing
-                    })
-                    .unwrap_or_else(|| panic!("missing Machine compilation of {name}"));
-                let map = bundle.file(JitArtifactFileName::CodeMap).unwrap();
-                assert!(
-                    String::from_utf8_lossy(map.contents()).contains("machineArgumentsReadProbe"),
-                    "{name}"
-                );
-            }
-        }
     }
 }
 

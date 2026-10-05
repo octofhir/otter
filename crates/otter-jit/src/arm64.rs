@@ -4,6 +4,8 @@
 //! - [`emit_direct_call`] — compiler-generated monomorphic plain-call linkage.
 //! - Guarded static-native leaves for extracted builtins.
 //! - [`allocation`] — nursery carves shared by both tiers.
+//! - [`property_actions`] — one live property-action probe shared by both tiers.
+//! - [`binding`] — source-owned global reads and guards shared by both tiers.
 //! - Shared generated-code policy constants used by multiple native tiers.
 //!
 //! # Invariants
@@ -24,10 +26,12 @@
 
 pub(crate) mod activation;
 pub(crate) mod allocation;
+pub(crate) mod binding;
 pub(crate) mod frame;
 pub(crate) mod inline_guard;
 pub(crate) mod js_call;
 mod method_guard;
+pub(crate) mod property_actions;
 mod receiver_allocation;
 
 /// Whether this CPU implements the ARMv8.3 JavaScript conversion
@@ -47,19 +51,9 @@ pub(crate) fn emit_fjcvtzs(ops: &mut dynasmrt::aarch64::Assembler, source: u8, d
     ops.push_u32(0x1E7E_0000 | (u32::from(source) << 5) | u32::from(destination));
 }
 
-/// Backedges between shared interrupt/fuel-cell probes in generated code.
-///
-/// `x29` holds the activation-local countdown in optimizing and scalar Machine
-/// IR bodies. Both tiers subtract this exact batch from shared VM fuel when the
-/// countdown expires, keeping accounting and interrupt latency aligned.
-pub(crate) use crate::GENERATED_POLL_BATCH;
-
-pub(crate) use method_guard::{
-    MethodGuardSite, emit_method_guard, emit_method_guard_from_tagged_register,
-    emit_method_shape_dispatch, emit_method_target,
-};
+pub(crate) use method_guard::{MethodGuardSite, emit_method_guard};
 pub(crate) use receiver_allocation::{
-    emit_object_type_branch, emit_receiver_candidate_probe, emit_receiver_publication_effect,
+    emit_receiver_candidate_probe, emit_receiver_publication_effect,
 };
 
 pub(crate) mod arguments;

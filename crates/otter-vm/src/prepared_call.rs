@@ -39,6 +39,9 @@ pub(crate) struct PreparedCall {
     pub(crate) this_value: Value,
     pub(crate) new_target_value: Value,
     pub(crate) arguments_object: JsObject,
+    pub(crate) construct_layout: crate::constructor_layout::ConstructorLayout,
+    pub(crate) derived_this_context: crate::context::ContextHandle,
+    pub(crate) construct_receiver: Value,
     pub(crate) return_register: Option<u16>,
     pub(crate) cold: Option<ColdFrameIdx>,
     pub(crate) parameter_count: u16,
@@ -61,6 +64,9 @@ impl PreparedCall {
             this_value,
             new_target_value: Value::UNDEFINED,
             arguments_object: JsObject::null(),
+            construct_layout: crate::constructor_layout::ConstructorLayout::null(),
+            derived_this_context: crate::context::ContextHandle::null(),
+            construct_receiver: Value::UNDEFINED,
             return_register,
             cold: None,
             parameter_count: function.param_count,
@@ -87,6 +93,13 @@ impl PreparedCall {
             return_destination: self.return_register.map_or(u32::MAX, u32::from),
             cold: self.cold,
             arguments_object: self.arguments_object,
+            construct_layout: self.construct_layout,
+            derived_this_context: self.derived_this_context,
+            construct_receiver: self.construct_receiver,
+            // Parked ownership cannot retain an ancestor's native address.
+            super_origin: 0,
+            caller: 0,
+            caller_return_pc: 0,
         }
     }
 
@@ -125,6 +138,17 @@ impl PreparedCall {
         self.self_value.trace_value_slots(visitor);
         self.this_value.trace_value_slots(visitor);
         self.new_target_value.trace_value_slots(visitor);
+        self.construct_receiver.trace_value_slots(visitor);
+        if !self.derived_this_context.is_null() {
+            visitor(
+                std::ptr::addr_of!(self.derived_this_context)
+                    .cast_mut()
+                    .cast(),
+            );
+        }
+        if !self.construct_layout.is_null() {
+            visitor(std::ptr::addr_of!(self.construct_layout).cast_mut().cast());
+        }
         for value in self.arguments.iter().chain(self.initial_registers.iter()) {
             value.trace_value_slots(visitor);
         }

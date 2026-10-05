@@ -2,24 +2,22 @@
 //!
 //! # Contents
 //! - Elided-arguments eligibility/count observation without allocation or JS.
-//! - Copying incoming actuals and captured aliases into a private native callee.
 //! - Shared mapped-parameter refresh for canonical and generated completion.
 //! - Immutable binding reads for native SSA operand and liveness construction.
 //!
 //! # Invariants
 //! - A materialized arguments object is never treated as an incoming window:
 //!   its getters, length and mutations require canonical observable collection.
-//! - Leaf copies read current captured bindings; generated linkage patches
-//!   register aliases from current homes. Together they preserve extra actuals and
-//!   never invent missing arguments. No GC or JS reentry occurs during a copy.
-//! - The destination is unpublished and fully initialized. A rejected copy
-//!   has no JavaScript effect; generated linkage discards that private frame.
+//! - Forwarding preserves extra actuals and refreshes only mapped arguments
+//!   present in that exact actual list. It never invents missing arguments.
+//! - Native callee entries own window construction and missing-formal values;
+//!   forwarding copies no formal register window.
 //!
 //! # See also
 //! - [`crate::jit_spread_call_ops`] — committed runtime completion.
 //! - [`crate::runtime_activation`] — compiled-frame access boundary.
 
-use crate::{ActiveFrameMut, ActiveFrameRef, CodeBlock, Interpreter, Value, VmError};
+use crate::{ActiveFrameRef, CodeBlock, Interpreter, Value, VmError};
 use otter_bytecode::{ArgumentBindingStorage, ArgumentsObjectKind};
 
 impl CodeBlock {
@@ -59,46 +57,6 @@ impl Interpreter {
             return None;
         }
         u32::try_from(frame.incoming_argument_count()).ok()
-    }
-
-    pub(crate) fn copy_forwarded_argument_window(
-        &self,
-        function: &CodeBlock,
-        source: &ActiveFrameRef<'_>,
-        destination: &mut ActiveFrameMut<'_>,
-        parameter_count: u16,
-    ) -> Result<Option<u32>, VmError> {
-        let Some(count) = self.elided_forward_argument_count(source) else {
-            return Ok(None);
-        };
-        let count = count as usize;
-        let incoming = destination.incoming_argument_count();
-        if usize::from(parameter_count) > destination.register_count() || incoming != count {
-            return Ok(None);
-        }
-        let mut write = |index: usize, value: Value| -> Result<(), VmError> {
-            if index < usize::from(parameter_count) {
-                destination.write(index as u16, value)?;
-            }
-            destination.write_incoming_argument(index, value)?;
-            Ok(())
-        };
-        for index in 0..count {
-            let value = source.incoming_argument(index)?;
-            write(index, value)?;
-        }
-        for (argument_index, storage) in function.forwarded_argument_bindings() {
-            let index = usize::from(argument_index);
-            if index < count
-                && let ArgumentBindingStorage::Context { .. } = storage
-            {
-                write(index, self.live_argument_binding(source, storage)?)?;
-            }
-        }
-        // Register mappings belong to the generated caller's current value
-        // homes, which may be SSA roots rather than the entry register window.
-        // Generated linkage patches those values before publishing the callee.
-        Ok(Some(count as u32))
     }
 
     fn live_argument_binding(

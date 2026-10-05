@@ -671,9 +671,17 @@ mod tests {
             "<structured-clone-test>",
         )
         .expect("compile fixture");
-        let mut interp = Interpreter::new();
+        let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
+        let account = interp.resource_account();
+        let text =
+            otter_resource::SharedSource::admit(&account, source.to_owned()).expect("fixture text");
+        let sources = otter_vm::source_registry::SourceRegistry::new(
+            std::collections::BTreeMap::from([("<structured-clone-test>".to_owned(), text)]),
+            &account,
+        )
+        .expect("fixture source index");
         let context = interp
-            .link_module(compiled.bytecode)
+            .link_module(compiled.bytecode, sources)
             .expect("valid bytecode fixture");
         let value = interp.run(&context).expect("run fixture");
         clone_vm_value_with_options(&value, interp.gc_heap(), options)

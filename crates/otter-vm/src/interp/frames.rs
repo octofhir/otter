@@ -9,7 +9,8 @@
 //! The trampoline owns active frames and initialized tagged windows. Logical
 //! completion keeps the physical frame published until assembly releases its
 //! extent. Cold records transfer once on suspension and release once on
-//! completion. A collecting compiled call publishes its safepoint before entry.
+//! completion. Suspended JS callers resolve their child/request return anchor;
+//! active collecting helpers retain explicit publication of their own root map.
 //!
 //! # See also
 //! - [`crate::activation_stack`] for the non-owning activation view.
@@ -17,6 +18,7 @@
 //! - [`crate::frame_state::ParkedFrameState`] for suspended storage.
 
 #![allow(unused_imports)]
+use crate::native_abi::CommittedValueError;
 use crate::*;
 
 impl Interpreter {
@@ -119,7 +121,7 @@ impl Interpreter {
             self.frame_ensure_cold(frame).generator_owner = Some(generator);
         } else if function.is_async {
             let result_promise =
-                crate::promise_dispatch::PromiseBuilder::with_context(owner.clone())
+                crate::promise_dispatch::PromiseBuilder::with_context(Some(owner.clone()))
                     .pending_stack_rooted(self, stack, &[], &[])?;
             let frame = stack.last_mut().ok_or(VmError::InvalidOperand)?;
             self.frame_set_async_state(
@@ -139,13 +141,14 @@ impl Interpreter {
         generator: crate::generator::JsGenerator,
         callee: Value,
         function_id: u32,
-    ) -> Result<Value, VmError> {
+    ) -> Result<Value, CommittedValueError> {
         let generator_anchor = self.push_iteration_anchor(Value::generator(generator)) - 1;
         let callee_anchor = self.push_iteration_anchor(callee) - 1;
-        let result = (|| -> Result<Value, VmError> {
+        let result = (|| -> Result<Value, CommittedValueError> {
             let owner = context
                 .for_function(function_id)
-                .map_err(|_| VmError::InvalidOperand)?;
+                .map_err(|_| VmError::InvalidOperand)
+                .map_err(|error| CommittedValueError::Fatal(error.into()))?;
             let closure = self
                 .iteration_anchor(callee_anchor)
                 .as_closure(&self.gc_heap);
@@ -154,7 +157,8 @@ impl Interpreter {
             let generator = self
                 .iteration_anchor(generator_anchor)
                 .as_generator()
-                .ok_or(VmError::InvalidOperand)?;
+                .ok_or(VmError::InvalidOperand)
+                .map_err(|error| CommittedValueError::Fatal(error.into()))?;
             generator.set_prototype_override(
                 &mut self.gc_heap,
                 proto.as_object().is_some().then_some(proto),
@@ -207,19 +211,19 @@ impl Interpreter {
     #[inline]
     #[must_use]
     pub fn jit_innermost_native_frame(&self) -> *mut crate::native_abi::Frame {
-        let bits = match self.jit_frame_cell {
+        let bits = match self.jit_context {
             // SAFETY: the live compiled entry keeps its frame cell valid until
             // `jit_leave_native_frames` restores the enclosing cell.
-            Some(cell) => unsafe { *cell.as_ptr() },
+            Some(context) => unsafe { (*context.as_ptr()).native_frame as u64 },
             None => self.jit_detached_frame,
         };
         bits as *mut crate::native_abi::Frame
     }
 
     fn set_jit_innermost_native_frame(&mut self, frame: *mut crate::native_abi::Frame) {
-        match self.jit_frame_cell {
+        match self.jit_context {
             // SAFETY: see `jit_innermost_native_frame`.
-            Some(cell) => unsafe { *cell.as_ptr() = frame as u64 },
+            Some(context) => unsafe { (*context.as_ptr()).native_frame = frame },
             None => self.jit_detached_frame = frame as u64,
         }
     }
@@ -230,6 +234,16 @@ impl Interpreter {
     #[must_use]
     pub(crate) fn jit_has_native_frames(&self) -> bool {
         !self.jit_innermost_native_frame().is_null()
+    }
+
+    /// Retire every invalid generation no `Arc` or entry lease still needs,
+    /// at a native-activation retirement epoch: generated callers take no
+    /// per-call executable lease, so any published frame pins the epoch.
+    pub(crate) fn retire_unreferenced_jit_code(&mut self) -> usize {
+        if self.jit_has_native_frames() {
+            return 0;
+        }
+        self.jit_code_registry.retire_unreferenced()
     }
 
     /// Published native frames from the innermost outward.
@@ -299,26 +313,29 @@ impl Interpreter {
     /// the enclosing entry's cell for [`Self::jit_leave_native_frames`].
     ///
     /// # Safety
-    /// `cell` must hold a valid unpublished entry frame and stay live, with
-    /// that frame, until the matching leave.
+    /// `context` must retain a valid unpublished entry frame and stay live,
+    /// with that frame, until the matching leave.
     pub unsafe fn jit_enter_native_frames(
         &mut self,
-        cell: std::ptr::NonNull<u64>,
-    ) -> Result<Option<std::ptr::NonNull<u64>>, VmError> {
+        context: std::ptr::NonNull<crate::native_abi::JitCtx>,
+    ) -> Result<Option<std::ptr::NonNull<crate::native_abi::JitCtx>>, VmError> {
         // SAFETY: forwarded from the entry contract.
-        let frame = unsafe { &mut *(*cell.as_ptr() as *mut crate::native_abi::Frame) };
+        let frame = unsafe { &mut *(*context.as_ptr()).native_frame };
         // SAFETY: as in `jit_push_native_frame`.
         unsafe { crate::ActiveFrameMut::from_ptr(frame) }.map_err(|_| VmError::InvalidOperand)?;
         let caller = self.jit_innermost_native_frame();
         // SAFETY: the innermost published record is live.
         frame.depth = unsafe { caller.as_ref() }.map_or(0, |caller| caller.depth);
         frame.caller = caller as u64;
-        Ok(self.jit_frame_cell.replace(cell))
+        Ok(self.jit_context.replace(context))
     }
 
     /// End the compiled entry begun by [`Self::jit_enter_native_frames`].
-    pub fn jit_leave_native_frames(&mut self, enclosing: Option<std::ptr::NonNull<u64>>) {
-        self.jit_frame_cell = enclosing;
+    pub fn jit_leave_native_frames(
+        &mut self,
+        enclosing: Option<std::ptr::NonNull<crate::native_abi::JitCtx>>,
+    ) {
+        self.jit_context = enclosing;
     }
 
     /// Generated-frame depth bound for a compiled entry starting while
@@ -331,35 +348,128 @@ impl Interpreter {
             .saturating_sub(u32::try_from(interpreter_frames).unwrap_or(u32::MAX))
     }
 
-    /// Trace tagged windows, actuals, frame fields and optimized root homes
-    /// through the one published activation chain.
+    /// Source/root recipe of this exact published frame. Physical children
+    /// (including Host frames) carry their suspended caller's genuine return.
+    /// The one pending request covers the interval before child publication.
+    /// A nonzero anchor which does not resolve is an error, never a PC fallback.
+    pub(crate) fn jit_frame_safepoint(
+        &self,
+        frame: &crate::native_abi::Frame,
+    ) -> Result<Option<&crate::native_abi::SafepointRecord>, VmError> {
+        let anchor = self.jit_frame_return_pc(frame);
+        let code_id = u64::from(frame.code_object_id);
+        if anchor != 0 {
+            if self.jit_code_registry.generation_function_id(code_id)
+                != Some(frame.header.function_id)
+            {
+                return Err(VmError::InvalidOperand);
+            }
+            return self
+                .jit_code_registry
+                .return_pc_record(code_id, anchor)
+                .map(Some)
+                .ok_or(VmError::InvalidOperand);
+        }
+        if frame.call_site == native_abi::NO_SAFEPOINT {
+            return Ok(None);
+        }
+        let record = self
+            .jit_code_registry
+            .safepoint_record(code_id, frame.call_site)
+            .ok_or(VmError::InvalidOperand)?;
+        if record.id != frame.call_site
+            || self.jit_code_registry.generation_function_id(code_id)
+                != Some(frame.header.function_id)
+        {
+            return Err(VmError::InvalidOperand);
+        }
+        Ok(Some(record))
+    }
+
+    /// Derive the one suspended edge from the current synchronous owners.
+    /// Active helpers have no child/request return anchor of their own.
+    pub(crate) fn jit_frame_return_pc(&self, frame: &crate::native_abi::Frame) -> u64 {
+        let address = std::ptr::from_ref(frame).addr() as u64;
+        let mut anchor = 0;
+        if let Some(context) = self.jit_context {
+            let pending = unsafe { &(*context.as_ptr()).pending_call };
+            if pending.caller_return_pc != 0 && pending.caller == address {
+                anchor = pending.caller_return_pc;
+            }
+        }
+        if anchor == 0 {
+            for child in self.jit_native_frames() {
+                let child = unsafe { &*child };
+                if child.caller == address {
+                    anchor = child.caller_return_pc;
+                    break;
+                }
+            }
+        }
+        anchor
+    }
+
+    /// An active Template helper publishes its current header PC, even if an
+    /// earlier cold JS stage left a source-bearing window record in call_site.
+    /// Graph helpers publish their own exact source/inline map. Suspended calls
+    /// always use the actual return association; they never use the header PC.
+    pub(crate) fn jit_frame_source_pc(
+        &self,
+        frame: &crate::native_abi::Frame,
+        record: Option<&crate::native_abi::SafepointRecord>,
+    ) -> u32 {
+        if self.jit_frame_return_pc(frame) != 0
+            || frame.header.kind == native_abi::NativeFrameKind::Optimizing
+        {
+            if let Some(pc) = record
+                .map(|record| record.call_pc)
+                .filter(|pc| *pc != native_abi::NO_CALL_PC)
+            {
+                return pc;
+            }
+        }
+        frame.header.pc
+    }
+
+    /// Trace the one published chain and its exact suspended return recipes.
+    /// Active semantic helpers retain their own stamped recipe; JS callers use
+    /// the actual child/pending anchor even if old PC/call-site words are stale.
     pub(crate) fn trace_native_jit_activations(&self, visitor: &mut dyn FnMut(*mut RawGc)) {
+        if let Some(context) = self.jit_context {
+            let pending = unsafe { &(*context.as_ptr()).pending_call };
+            if pending.caller_return_pc != 0 {
+                assert!(
+                    self.jit_native_frames()
+                        .any(|frame| frame as u64 == pending.caller),
+                    "active pending caller must remain published"
+                );
+                // SAFETY: the stopped native extent retains initialized request
+                // fields and source spans. Admission/classification never hides
+                // these roots behind a stale callable register.
+                unsafe { pending.trace_return_roots(visitor) };
+            }
+        }
         for native in self.jit_native_frames() {
-            // SAFETY: published frames and their windows stay live until
-            // unpublished.
             let frame = unsafe { crate::ActiveFrameRef::from_ptr(native) }
                 .expect("published native frame must remain valid");
             frame.trace_stack_register_slots(visitor);
             frame.trace_non_register_slots(visitor);
-            // SAFETY: as above; only scalar fields are read here.
-            let record = unsafe { &*native };
-            if record.call_site == native_abi::NO_SAFEPOINT {
+            let physical = unsafe { &*native };
+            let Some(safepoint) = self
+                .jit_frame_safepoint(physical)
+                .expect("published native root anchor must resolve exactly")
+            else {
+                continue;
+            };
+            if safepoint.spill_roots.is_empty() {
                 continue;
             }
-            let safepoint = self
-                .jit_code_registry
-                .safepoint_record(u64::from(record.code_object_id), record.call_site)
-                .expect("an optimized frame's call site names a live safepoint");
-            debug_assert_ne!(record.machine_roots, 0);
-            for location in &safepoint.tagged_locations {
-                debug_assert_eq!(location.kind, native_abi::TaggedLocationKind::SpillSlot);
-                // SAFETY: the frame's prologue published its root-home base,
-                // and the call named by `call_site` saved every listed home
-                // before it could collect; the homes live until the frame
-                // returns.
-                let home = unsafe {
-                    (record.machine_roots as *mut crate::Value).add(usize::from(location.index))
-                };
+            assert_ne!(
+                physical.machine_roots, 0,
+                "canonical spill area must be published"
+            );
+            for slot in safepoint.spill_roots.iter() {
+                let home = (physical.machine_roots as *mut Value).wrapping_add(usize::from(slot));
                 unsafe { (&mut *home).trace_value_slot_mut(visitor) };
             }
         }
@@ -536,6 +646,7 @@ impl Interpreter {
         value: Value,
         derived_this: Option<Value>,
     ) -> Result<PoppedCompletion, VmError> {
+        self.complete_interpreted_retraining_activation(popped);
         // An ordinary synchronous frame owns no cold record, so the whole
         // construct/derived/async completion vocabulary resolves from one
         // pool probe rather than from a probe per question.
@@ -614,7 +725,7 @@ mod tests {
 
     #[test]
     fn parked_values_are_owned_and_resume_as_entry_inputs() {
-        let mut interp = Interpreter::new();
+        let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
         let function = otter_bytecode::Function {
             locals: 3,
             ..Default::default()
@@ -635,7 +746,7 @@ mod tests {
 
     #[test]
     fn completion_preserves_the_published_caller() {
-        let mut interp = Interpreter::new();
+        let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
         let function = otter_bytecode::Function {
             locals: 2,
             ..Default::default()

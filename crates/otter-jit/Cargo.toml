@@ -25,7 +25,6 @@ too_many_arguments = "allow"
 otter-bytecode = { workspace = true }
 otter-vm = { workspace = true }
 rustc-hash = { workspace = true }
-regalloc2 = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 smallvec = { workspace = true }

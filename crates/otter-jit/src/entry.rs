@@ -16,12 +16,14 @@
 //!
 //! # Invariants
 //! - Compiled functions return the VM-owned two-word `NativeResultPair`.
-//!   `Return` carries a value, `Bail` carries the exact published logical PC,
-//!   `Throw` carries a pure exception value, and only `Fatal` consults
-//!   `ctx.error`.
-//! - Interpreter-visible registers remain in the published frame window at
-//!   every side exit and allocating/reentrant call; no movable JS pointer is
-//!   kept only in a machine register across a safepoint.
+//!   `Success` carries a value, `SideExit` carries the exact continuation,
+//!   `Throw` carries a pure exception value, and only `Fatal` consults `ctx.error`.
+//! - Collecting calls preserve live tagged values in the published window,
+//!   actual span or canonical tagged home region. Graph leaves unboxed homes
+//!   untraced; no moving pointer survives solely in a machine register.
+//! - Recovery publishes a complete initialized interpreter window from
+//!   canonical homes before resuming bytecode. An adequate actual-only entry
+//!   may leave that window absent while its actual span and homes remain rooted.
 //! - Runtime entries install through validated descriptor bindings; every
 //!   active JIT-owned slot is filled, so emitted and audited stub sets cannot
 //!   drift.
@@ -32,8 +34,12 @@
 //! - `JIT_DESIGN.md` §3.2 (backend), §3.5 (GC contract).
 
 mod abi;
-#[cfg(test)]
+#[cfg(all(test, any(target_arch = "aarch64", target_arch = "x86_64")))]
+mod actual_arguments_tests;
+#[cfg(all(test, any(target_arch = "aarch64", target_arch = "x86_64")))]
 mod call_trampoline_tests;
+#[cfg(all(test, any(target_arch = "aarch64", target_arch = "x86_64")))]
+mod depth_tests;
 mod lowering;
 mod runtime_ops;
 mod value_abi;
@@ -207,6 +213,11 @@ pub(crate) fn runtime_stub_bindings() -> Vec<otter_vm::JitRuntimeStubBinding> {
         },
         {
             let entry: unsafe extern "C" fn(*mut JitCtx) -> abi::NativeResultPair =
+                abi::call_native_entry;
+            binding(abi::STUB_JIT_CALL_NATIVE, entry as *const () as usize)
+        },
+        {
+            let entry: unsafe extern "C" fn(*mut JitCtx) -> abi::NativeResultPair =
                 abi::call_stack_overflow;
             binding(abi::STUB_JIT_CALL_OVERFLOW, entry as *const () as usize)
         },
@@ -231,6 +242,29 @@ pub(crate) fn runtime_stub_bindings() -> Vec<otter_vm::JitRuntimeStubBinding> {
                 entry as *const () as usize,
             )
         },
+        {
+            let entry: unsafe extern "C" fn(
+                *mut JitCtx,
+                *const abi::NativeResultPair,
+            ) -> abi::NativeResultPair = abi::constructor_terminal;
+            binding(
+                abi::STUB_JIT_CONSTRUCTOR_TERMINAL,
+                entry as *const () as usize,
+            )
+        },
+        {
+            const _: () = assert!(abi::STUB_CONSTRUCTOR_RECEIVER_COMMIT.argument_count == 1);
+            const _: () = assert!(matches!(
+                abi::STUB_CONSTRUCTOR_RECEIVER_COMMIT.signature,
+                abi::RuntimeStubSignature::ContextWords
+            ));
+            let entry: unsafe extern "C" fn(*mut JitCtx, u64) -> abi::NativeResultPair =
+                abi::constructor_receiver_commit;
+            binding(
+                abi::STUB_CONSTRUCTOR_RECEIVER_COMMIT,
+                entry as *const () as usize,
+            )
+        },
         binding(
             abi::STUB_JIT_STAGE_SPREAD,
             jit_stage_spread_stub as *const () as usize,
@@ -252,10 +286,6 @@ pub(crate) fn runtime_stub_bindings() -> Vec<otter_vm::JitRuntimeStubBinding> {
             jit_route_throw_stub as *const () as usize,
         ),
         binding(
-            abi::STUB_JIT_ACKNOWLEDGE_CAUGHT_THROW,
-            jit_acknowledge_caught_throw_stub as *const () as usize,
-        ),
-        binding(
             abi::STUB_JIT_DEFINE_DATA_PROPERTY,
             jit_define_data_property_stub as *const () as usize,
         ),
@@ -264,24 +294,12 @@ pub(crate) fn runtime_stub_bindings() -> Vec<otter_vm::JitRuntimeStubBinding> {
             jit_load_builtin_error_stub as *const () as usize,
         ),
         binding(
-            abi::STUB_JIT_MAKE_FN,
-            jit_make_fn_stub as *const () as usize,
-        ),
-        binding(
-            abi::STUB_JIT_MAKE_CLOSURE,
-            jit_make_closure_stub as *const () as usize,
-        ),
-        binding(
             abi::STUB_JIT_NEW_OBJECT,
             jit_new_object_stub as *const () as usize,
         ),
         binding(
             abi::STUB_JIT_COLLECT_ARGUMENTS,
             jit_collect_arguments_stub as *const () as usize,
-        ),
-        binding(
-            abi::STUB_JIT_FORWARD_SOURCE_READY,
-            jit_forward_source_ready_stub as *const () as usize,
         ),
         binding(
             abi::STUB_JIT_NEW_ARRAY,
@@ -854,9 +872,9 @@ mod tests {
         let ret = plan.instructions[6].return_derived_operands().unwrap();
         assert_eq!((ret.value, ret.context, ret.depth, ret.slot), (4, 2, 0, 1));
         // Both context allocations own a full-window allocating safepoint.
-        assert_eq!(plan.context_alloc_safepoints.len(), 2);
+        assert_eq!(plan.lexical_alloc_safepoints.len(), 2);
         for index in [1, 4] {
-            let id = plan.context_alloc_safepoints[&plan.instructions[index].byte_pc];
+            let id = plan.lexical_alloc_safepoints[&plan.instructions[index].byte_pc];
             assert!(plan.safepoint_records.iter().any(|record| record.id == id));
         }
     }
@@ -899,3 +917,7 @@ mod tests {
         assert_eq!(plan.register_tail(method.arguments), Ok(&[2][..]));
     }
 }
+
+#[cfg(test)]
+#[path = "entry/native_kind_tests.rs"]
+mod native_kind_tests;

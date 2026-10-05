@@ -112,13 +112,13 @@ fn install_regexp_legacy_accessors(
                 legacy_accessor_getter,
                 captures,
             )
-            .map_err(|_| JsSurfaceError::OutOfMemory)?,
+            .map_err(JsSurfaceError::from)?,
         );
         let ctor = ctor_root
             .as_native_function()
             .expect("RegExp constructor remains rooted");
         let desc = PropertyDescriptor::accessor(Some(getter_root), None, false, true);
-        if !ctor.define_own_property(heap, name, desc) {
+        if !ctor.define_own_property(heap, name, desc)? {
             return Err(JsSurfaceError::DefinePropertyFailed(name));
         }
         Ok(())
@@ -154,7 +154,7 @@ fn install_regexp_legacy_accessors(
                 legacy_accessor_getter,
                 g_captures,
             )
-            .map_err(|_| JsSurfaceError::OutOfMemory)?,
+            .map_err(JsSurfaceError::from)?,
         );
         let s_captures: smallvec::SmallVec<[Value; 4]> = smallvec::smallvec![ctor_root];
         setter_root = Value::native_function(
@@ -165,13 +165,13 @@ fn install_regexp_legacy_accessors(
                 legacy_accessor_setter,
                 s_captures,
             )
-            .map_err(|_| JsSurfaceError::OutOfMemory)?,
+            .map_err(JsSurfaceError::from)?,
         );
         let ctor = ctor_root
             .as_native_function()
             .expect("RegExp constructor remains rooted");
         let desc = PropertyDescriptor::accessor(Some(getter_root), Some(setter_root), false, true);
-        if !ctor.define_own_property(heap, name, desc) {
+        if !ctor.define_own_property(heap, name, desc)? {
             return Err(JsSurfaceError::DefinePropertyFailed(name));
         }
         Ok(())
@@ -327,7 +327,7 @@ pub fn install_regexp_well_knowns_post_bootstrap(
     };
     let descriptor = ctor
         .own_property_descriptor(heap, "prototype")
-        .map_err(|_| JsSurfaceError::OutOfMemory)?;
+        .map_err(JsSurfaceError::from)?;
     let prototype = match descriptor.and_then(|d| match d.kind {
         crate::object::DescriptorKind::Data { value } => value.as_object(),
         _ => None,
@@ -370,7 +370,7 @@ pub fn install_regexp_well_knowns_post_bootstrap(
             crate::regexp_prototype::native_regexp_symbol_match,
             &[],
         )
-        .map_err(|_| JsSurfaceError::OutOfMemory)?,
+        .map_err(JsSurfaceError::from)?,
     );
     search_root = Value::native_function(
         crate::bootstrap::native_static_with_value_roots(
@@ -380,7 +380,7 @@ pub fn install_regexp_well_knowns_post_bootstrap(
             crate::regexp_prototype::native_regexp_symbol_search,
             &[],
         )
-        .map_err(|_| JsSurfaceError::OutOfMemory)?,
+        .map_err(JsSurfaceError::from)?,
     );
     replace_root = Value::native_function(
         crate::bootstrap::native_static_with_value_roots(
@@ -390,7 +390,7 @@ pub fn install_regexp_well_knowns_post_bootstrap(
             crate::regexp_prototype::native_regexp_symbol_replace,
             &[],
         )
-        .map_err(|_| JsSurfaceError::OutOfMemory)?,
+        .map_err(JsSurfaceError::from)?,
     );
     split_root = Value::native_function(
         crate::bootstrap::native_static_with_value_roots(
@@ -400,7 +400,7 @@ pub fn install_regexp_well_knowns_post_bootstrap(
             crate::regexp_prototype::native_regexp_symbol_split,
             &[],
         )
-        .map_err(|_| JsSurfaceError::OutOfMemory)?,
+        .map_err(JsSurfaceError::from)?,
     );
     match_all_root = Value::native_function(
         crate::bootstrap::native_static_with_value_roots(
@@ -410,12 +410,12 @@ pub fn install_regexp_well_knowns_post_bootstrap(
             crate::regexp_prototype::native_regexp_symbol_match_all,
             &[],
         )
-        .map_err(|_| JsSurfaceError::OutOfMemory)?,
+        .map_err(JsSurfaceError::from)?,
     );
     let mut prototype = prototype_root
         .as_object()
         .expect("RegExp.prototype remains rooted during symbol bootstrap");
-    object::define_own_symbol_property_partial(
+    if !object::define_own_symbol_property_partial(
         &mut prototype,
         heap,
         match_sym,
@@ -426,8 +426,10 @@ pub fn install_regexp_well_knowns_post_bootstrap(
             configurable: Some(true),
             ..Default::default()
         },
-    );
-    object::define_own_symbol_property_partial(
+    )? {
+        return Err(JsSurfaceError::DefinePropertyFailed("[[SymbolProperty]]"));
+    };
+    if !object::define_own_symbol_property_partial(
         &mut prototype,
         heap,
         search_sym,
@@ -438,8 +440,10 @@ pub fn install_regexp_well_knowns_post_bootstrap(
             configurable: Some(true),
             ..Default::default()
         },
-    );
-    object::define_own_symbol_property_partial(
+    )? {
+        return Err(JsSurfaceError::DefinePropertyFailed("[[SymbolProperty]]"));
+    };
+    if !object::define_own_symbol_property_partial(
         &mut prototype,
         heap,
         replace_sym,
@@ -450,8 +454,10 @@ pub fn install_regexp_well_knowns_post_bootstrap(
             configurable: Some(true),
             ..Default::default()
         },
-    );
-    object::define_own_symbol_property_partial(
+    )? {
+        return Err(JsSurfaceError::DefinePropertyFailed("[[SymbolProperty]]"));
+    };
+    if !object::define_own_symbol_property_partial(
         &mut prototype,
         heap,
         split_sym,
@@ -462,8 +468,10 @@ pub fn install_regexp_well_knowns_post_bootstrap(
             configurable: Some(true),
             ..Default::default()
         },
-    );
-    object::define_own_symbol_property_partial(
+    )? {
+        return Err(JsSurfaceError::DefinePropertyFailed("[[SymbolProperty]]"));
+    };
+    if !object::define_own_symbol_property_partial(
         &mut prototype,
         heap,
         match_all_sym,
@@ -474,7 +482,9 @@ pub fn install_regexp_well_knowns_post_bootstrap(
             configurable: Some(true),
             ..Default::default()
         },
-    );
+    )? {
+        return Err(JsSurfaceError::DefinePropertyFailed("[[SymbolProperty]]"));
+    };
     Ok(())
 }
 

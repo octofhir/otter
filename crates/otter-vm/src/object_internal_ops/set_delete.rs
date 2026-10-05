@@ -10,6 +10,9 @@
 //! - Proxy key materialization and trap reentry keep target, value, receiver,
 //!   and symbol keys in one handle scope until invariant checks complete.
 
+use crate::native_abi::CommittedValueError;
+use crate::rooting::RootScopeExt;
+
 use crate::activation_stack::ActivationStack;
 use crate::{
     ExecutionContext, Interpreter, Value, VmError, VmPropertyKey, abstract_ops, array,
@@ -25,21 +28,34 @@ impl Interpreter {
         target: Value,
         key: &VmPropertyKey,
         hops: usize,
-    ) -> Result<bool, VmError> {
+    ) -> Result<bool, CommittedValueError> {
         if hops >= object::PROTO_CHAIN_HARD_CAP {
             return Ok(true);
         }
-        let target = self.with_handle_scope(|interp, scope| -> Result<Value, VmError> {
-            let target = interp.scoped_value(scope, target);
-            let current = interp.escape_scoped(target);
-            interp.ensure_deferred_namespace_ready(
-                stack,
-                context,
-                &current,
-                !Self::deferred_key_is_symbol_like(key),
-            )?;
-            Ok(interp.escape_scoped(target))
-        })?;
+        let mut target =
+            self.with_handle_scope(|interp, scope| -> Result<Value, CommittedValueError> {
+                let target = interp.scoped_value(scope, target);
+                let current = interp.escape_scoped(target);
+                interp.ensure_deferred_namespace_ready(
+                    stack,
+                    context,
+                    &current,
+                    !Self::deferred_key_is_symbol_like(key),
+                )?;
+                Ok(interp.escape_scoped(target))
+            })?;
+        let _runtime_roots = self.scope_runtime_roots_guard();
+        let mut key_value = match key {
+            VmPropertyKey::Symbol(symbol) => Value::symbol(*symbol),
+            _ => Value::undefined(),
+        };
+        let mut roots = otter_gc::RootScope::new(&mut self.gc_heap);
+        // SAFETY: the actual receiver and optional Symbol-key slots are stable
+        // until [[Delete]] completes, including typed OOM exits.
+        unsafe {
+            roots.add_value(&mut target);
+            roots.add_value(&mut key_value);
+        }
         // §10.4.6.11 [[Delete]] — an exported string name cannot be
         // deleted (returns false); a non-export string succeeds. Symbol
         // keys fall through to the ordinary delete on own properties.
@@ -50,12 +66,14 @@ impl Interpreter {
             return Ok(object::get(env, &self.gc_heap, name).is_none());
         }
         if let Some(proxy) = target.as_proxy() {
-            let key_value = self.vm_property_key_to_value(key)?;
+            let key_value = self
+                .vm_property_key_to_value(key)
+                .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
             let trap_args: SmallVec<[Value; 8]> =
                 smallvec::smallvec![proxy.target(&self.gc_heap), key_value];
             return match self.invoke_proxy_trap(
                 stack,
-                context,
+                Some(context),
                 &proxy,
                 "deleteProperty",
                 trap_args,
@@ -68,23 +86,23 @@ impl Interpreter {
                     let target_value = proxy.target(&self.gc_heap);
                     let target_desc = self.ordinary_get_own_property_descriptor_value(
                         stack,
-                        context,
+                        Some(context),
                         target_value,
                         key,
                         hops + 1,
                     )?;
                     if let Some(desc) = target_desc {
                         if !desc.configurable() {
-                            return Err(self.err_type((
+                            return Err(CommittedValueError::JavaScript(self.err_type((
                                     "Proxy deleteProperty trap returned true but target has the property as non-configurable"
-                                        .to_string()).into()));
+                                        .to_string()).into())));
                         }
                         let target_extensible =
-                            self.is_extensible_value(stack, context, &target_value)?;
+                            self.is_extensible_value(stack, Some(context), &target_value)?;
                         if !target_extensible {
-                            return Err(self.err_type((
+                            return Err(CommittedValueError::JavaScript(self.err_type((
                                     "Proxy deleteProperty trap returned true but target is non-extensible"
-                                        .to_string()).into()));
+                                        .to_string()).into())));
                         }
                     }
                     Ok(true)
@@ -95,13 +113,16 @@ impl Interpreter {
             };
         }
         if let Some(obj) = target.as_object() {
-            if let Some(desc) = self.string_object_exotic_descriptor(obj, key)?
+            if let Some(desc) = self
+                .string_object_exotic_descriptor(obj, key)
+                .map_err(|error| CommittedValueError::JavaScript(error.into()))?
                 && !desc.configurable()
             {
                 return Ok(false);
             }
             return Ok(if let Some(key) = key.string_name() {
-                object::delete(obj, &mut self.gc_heap, key)
+                object::delete(&mut { obj }, &mut self.gc_heap, key)
+                    .map_err(|error| CommittedValueError::JavaScript(error.into()))?
             } else if let VmPropertyKey::Symbol(sym) = key {
                 object::delete_symbol(obj, &mut self.gc_heap, *sym)
             } else {
@@ -127,6 +148,7 @@ impl Interpreter {
             return Ok(if let Some(key) = key.string_name() {
                 let has_prototype = context.function_has_prototype_property(function_id);
                 self.ordinary_function_delete_own_property(owner, function_id, key, has_prototype)
+                    .map_err(|error| CommittedValueError::JavaScript(error.into()))?
             } else if let VmPropertyKey::Symbol(sym) = key {
                 self.callable_bag_read(owner, function_id)
                     .map(|bag| object::delete_symbol(bag, &mut self.gc_heap, *sym))
@@ -137,7 +159,9 @@ impl Interpreter {
         }
         if let Some(native) = target.as_native_function() {
             return Ok(match key.string_name() {
-                Some(key) => native.delete_own_property(&mut self.gc_heap, key),
+                Some(key) => native
+                    .delete_own_property(&mut self.gc_heap, key)
+                    .map_err(|error| CommittedValueError::JavaScript(error.into()))?,
                 None if let VmPropertyKey::Symbol(sym) = key => {
                     native.delete_own_symbol_property(&mut self.gc_heap, *sym)
                 }
@@ -148,6 +172,7 @@ impl Interpreter {
             return Ok(match key.string_name() {
                 Some(key) => {
                     function_metadata::bound_delete_own_property(&bound, &mut self.gc_heap, key)
+                        .map_err(|error| CommittedValueError::JavaScript(error.into()))?
                 }
                 None => true,
             });
@@ -160,7 +185,8 @@ impl Interpreter {
             // own non-configurable internal slots exposed as properties.
             if let Some(bag) = t.expando(&self.gc_heap) {
                 return Ok(if let Some(name) = key.string_name() {
-                    object::delete(bag, &mut self.gc_heap, name)
+                    object::delete(&mut { bag }, &mut self.gc_heap, name)
+                        .map_err(|error| CommittedValueError::JavaScript(error.into()))?
                 } else if let VmPropertyKey::Symbol(sym) = key {
                     object::delete_symbol(bag, &mut self.gc_heap, *sym)
                 } else {
@@ -179,7 +205,8 @@ impl Interpreter {
             // iterator methods are non-own prototype properties.
             if let Some(bag) = self.collection_expando(&target) {
                 return Ok(if let Some(name) = key.string_name() {
-                    object::delete(bag, &mut self.gc_heap, name)
+                    object::delete(&mut { bag }, &mut self.gc_heap, name)
+                        .map_err(|error| CommittedValueError::JavaScript(error.into()))?
                 } else if let VmPropertyKey::Symbol(sym) = key {
                     object::delete_symbol(bag, &mut self.gc_heap, *sym)
                 } else {
@@ -207,12 +234,12 @@ impl Interpreter {
         value: Value,
         receiver: Value,
         hops: usize,
-    ) -> Result<bool, VmError> {
+    ) -> Result<bool, CommittedValueError> {
         if hops >= object::PROTO_CHAIN_HARD_CAP {
             return Ok(false);
         }
-        let (target, value, receiver) =
-            self.with_handle_scope(|interp, scope| -> Result<(Value, Value, Value), VmError> {
+        let (target, value, receiver) = self.with_handle_scope(
+            |interp, scope| -> Result<(Value, Value, Value), CommittedValueError> {
                 let target = interp.scoped_value(scope, target);
                 let value = interp.scoped_value(scope, value);
                 let receiver = interp.scoped_value(scope, receiver);
@@ -228,7 +255,8 @@ impl Interpreter {
                     interp.escape_scoped(value),
                     interp.escape_scoped(receiver),
                 ))
-            })?;
+            },
+        )?;
         // §10.4.6.9 [[Set]] — a Module Namespace Exotic Object never
         // accepts assignment.
         if let Some(obj) = target.as_object()
@@ -243,7 +271,11 @@ impl Interpreter {
         // `true` regardless. With a foreign receiver, an invalid
         // index returns `true` without any write; a valid one falls
         // through to ordinary receiver semantics.
-        if target.as_typed_array(&self.gc_heap).is_some() {
+        if target.as_typed_array(&self.gc_heap).is_some()
+            && !matches!(key, VmPropertyKey::Symbol(_))
+        {
+            // Symbol keys use the shared ordinary descriptor/prototype resolver
+            // below; they must not bypass setters or a foreign receiver.
             // The lazy expando ensure allocates, so the incoming value,
             // receiver, and target ride anchor slots and are re-read after
             // every ensure.
@@ -251,134 +283,123 @@ impl Interpreter {
             let base = value_slot;
             let receiver_slot = self.push_iteration_anchor(receiver) - 1;
             let target_slot = self.push_iteration_anchor(target) - 1;
-            let outcome = (|this: &mut Self| -> Result<bool, VmError> {
+            let outcome = (|this: &mut Self| -> Result<bool, CommittedValueError> {
                 let anchored_ta = |this: &Self| {
                     this.iteration_anchor(target_slot)
                         .as_typed_array(&this.gc_heap)
                         .expect("target stays a typed array across the anchored steps")
                 };
-                match key {
-                    VmPropertyKey::Symbol(sym) => {
-                        let t = anchored_ta(this);
-                        let bag = crate::property_dispatch::typed_array_ensure_expando(this, &t)?;
+
+                let name = key
+                    .string_name()
+                    .expect("non-symbol key has string spelling")
+                    .to_string();
+                let t = anchored_ta(this);
+                if let Some(n) = crate::property_dispatch::canonical_numeric_index_string(&name) {
+                    let receiver = this.iteration_anchor(receiver_slot);
+                    let same_receiver = receiver
+                        .as_typed_array(&this.gc_heap)
+                        .is_some_and(|r| r == t);
+                    if same_receiver {
                         let value = this.iteration_anchor(value_slot);
-                        Ok(object::set_symbol(bag, &mut this.gc_heap, *sym, value))
-                    }
-                    _ => {
-                        let name = key
-                            .string_name()
-                            .expect("non-symbol key has string spelling")
-                            .to_string();
+                        let coerced =
+                            this.typed_array_coerce_element(stack, context, t.kind(), value)?;
                         let t = anchored_ta(this);
-                        if let Some(n) =
-                            crate::property_dispatch::canonical_numeric_index_string(&name)
+                        if let Some(idx) =
+                            crate::property_dispatch::typed_array_valid_index(&t, &this.gc_heap, n)
                         {
-                            let receiver = this.iteration_anchor(receiver_slot);
-                            let same_receiver = receiver
-                                .as_typed_array(&this.gc_heap)
-                                .is_some_and(|r| r == t);
-                            if same_receiver {
-                                let value = this.iteration_anchor(value_slot);
-                                let coerced = this.typed_array_coerce_element(
-                                    stack,
-                                    context,
-                                    t.kind(),
-                                    value,
-                                )?;
-                                let t = anchored_ta(this);
-                                if let Some(idx) = crate::property_dispatch::typed_array_valid_index(
-                                    &t,
-                                    &this.gc_heap,
-                                    n,
-                                ) {
-                                    t.set(&mut this.gc_heap, idx, &coerced);
-                                }
-                                return Ok(true);
-                            }
-                            if crate::property_dispatch::typed_array_valid_index(
-                                &t,
-                                &this.gc_heap,
-                                n,
-                            )
-                            .is_none()
-                            {
-                                return Ok(true);
-                            }
-                            // Valid target index + foreign receiver —
-                            // §10.1.9.2 receiver phase (GetOwnProperty +
-                            // DefineOwnProperty on the receiver, never its
-                            // [[Set]]).
-                            let value = this.iteration_anchor(value_slot);
-                            let receiver = this.iteration_anchor(receiver_slot);
+                            t.set(&mut this.gc_heap, idx, &coerced);
+                        }
+                        return Ok(true);
+                    }
+                    if crate::property_dispatch::typed_array_valid_index(&t, &this.gc_heap, n)
+                        .is_none()
+                    {
+                        return Ok(true);
+                    }
+                    // Valid target index + foreign receiver —
+                    // §10.1.9.2 receiver phase (GetOwnProperty +
+                    // DefineOwnProperty on the receiver, never its
+                    // [[Set]]).
+                    let value = this.iteration_anchor(value_slot);
+                    let receiver = this.iteration_anchor(receiver_slot);
+                    return this.ordinary_set_on_receiver(stack, context, key, value, &receiver);
+                }
+                let mut bag = crate::property_dispatch::typed_array_ensure_expando(this, &t)
+                    .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                // OrdinarySet on the expando: an own non-writable
+                // data property rejects, an own accessor invokes
+                // its setter (receiver = the typed array), and a
+                // fresh key requires the bag to be extensible.
+                let t = anchored_ta(this);
+                let receiver = this.iteration_anchor(receiver_slot);
+                let same_receiver = receiver
+                    .as_typed_array(&this.gc_heap)
+                    .is_some_and(|r| r == t);
+                match object::lookup_own(bag, &this.gc_heap, &name) {
+                    object::PropertyLookup::Data { flags, .. } => {
+                        if !flags.writable() {
+                            return Ok(false);
+                        }
+                        let value = this.iteration_anchor(value_slot);
+                        if !same_receiver {
+                            // §10.1.9.2 — own writable data on the
+                            // chain: the write lands on the
+                            // RECEIVER, never the holder.
                             return this
                                 .ordinary_set_on_receiver(stack, context, key, value, &receiver);
                         }
-                        let mut bag =
-                            crate::property_dispatch::typed_array_ensure_expando(this, &t)?;
-                        // OrdinarySet on the expando: an own non-writable
-                        // data property rejects, an own accessor invokes
-                        // its setter (receiver = the typed array), and a
-                        // fresh key requires the bag to be extensible.
-                        let t = anchored_ta(this);
+                        object::ordinary_set_data_property(
+                            &mut bag,
+                            &mut this.gc_heap,
+                            &name,
+                            value,
+                        )
+                        .map_err(VmError::from)
+                        .map_err(|error| CommittedValueError::JavaScript(error.into()))
+                    }
+                    object::PropertyLookup::Accessor { setter, .. } => {
+                        let Some(setter) = setter else {
+                            return Ok(false);
+                        };
+                        let value = this.iteration_anchor(value_slot);
+                        let argv: SmallVec<[Value; 8]> = smallvec::smallvec![value];
+                        this.run_callable_sync_rooted(
+                            stack,
+                            Some(context),
+                            &setter,
+                            receiver,
+                            argv,
+                        )
+                        .map_err(CommittedValueError::completed_call)?;
+                        Ok(true)
+                    }
+                    object::PropertyLookup::Absent => {
+                        // §10.1.9 step 2 — own miss continues the
+                        // walk through the typed array's
+                        // [[Prototype]] (a setter on
+                        // %TypedArray.prototype% must fire); only
+                        // a fully-absent chain defines on the
+                        // receiver.
+                        let target = this.iteration_anchor(target_slot);
+                        let parent = this
+                            .get_prototype_for_op(&target)
+                            .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                        let value = this.iteration_anchor(value_slot);
                         let receiver = this.iteration_anchor(receiver_slot);
-                        let same_receiver = receiver
-                            .as_typed_array(&this.gc_heap)
-                            .is_some_and(|r| r == t);
-                        match object::lookup_own(bag, &this.gc_heap, &name) {
-                            object::PropertyLookup::Data { flags, .. } => {
-                                if !flags.writable() {
-                                    return Ok(false);
-                                }
-                                let value = this.iteration_anchor(value_slot);
-                                if !same_receiver {
-                                    // §10.1.9.2 — own writable data on the
-                                    // chain: the write lands on the
-                                    // RECEIVER, never the holder.
-                                    return this.ordinary_set_on_receiver(
-                                        stack, context, key, value, &receiver,
-                                    );
-                                }
-                                object::set(&mut bag, &mut this.gc_heap, &name, value);
-                                Ok(true)
-                            }
-                            object::PropertyLookup::Accessor { setter, .. } => {
-                                let Some(setter) = setter else {
-                                    return Ok(false);
-                                };
-                                let value = this.iteration_anchor(value_slot);
-                                let argv: SmallVec<[Value; 8]> = smallvec::smallvec![value];
-                                this.run_callable_sync_rooted(
-                                    stack, context, &setter, receiver, argv,
-                                )?;
-                                Ok(true)
-                            }
-                            object::PropertyLookup::Absent => {
-                                // §10.1.9 step 2 — own miss continues the
-                                // walk through the typed array's
-                                // [[Prototype]] (a setter on
-                                // %TypedArray.prototype% must fire); only
-                                // a fully-absent chain defines on the
-                                // receiver.
-                                let target = this.iteration_anchor(target_slot);
-                                let parent = this.get_prototype_for_op(&target)?;
-                                let value = this.iteration_anchor(value_slot);
-                                let receiver = this.iteration_anchor(receiver_slot);
-                                if parent.is_null() || parent.is_undefined() {
-                                    return this.ordinary_set_on_receiver(
-                                        stack, context, key, value, &receiver,
-                                    );
-                                }
-                                this.ordinary_set_data_value(
-                                    stack,
-                                    context,
-                                    parent,
-                                    key,
-                                    value,
-                                    receiver,
-                                    hops + 1,
-                                )
-                            }
+                        if parent.is_null() || parent.is_undefined() {
+                            return this
+                                .ordinary_set_on_receiver(stack, context, key, value, &receiver);
                         }
+                        this.ordinary_set_data_value(
+                            stack,
+                            context,
+                            parent,
+                            key,
+                            value,
+                            receiver,
+                            hops + 1,
+                        )
                     }
                 }
             })(self);
@@ -395,16 +416,16 @@ impl Interpreter {
                     .as_proxy()
                     .expect("proxy branch keeps a proxy target");
                 if proxy.is_revoked(&interp.gc_heap) {
-                    return Err(interp.err_type(
+                    return Err(CommittedValueError::JavaScript(interp.err_type(
                         ("Cannot perform 'set' on a proxy that has been revoked".to_string())
                             .into(),
-                    ));
+                    )));
                 }
 
                 // ToPropertyKey materialization allocates for named keys. Park
                 // every operand before it so the trap receives relocated
                 // target/value/receiver handles rather than pre-move copies.
-                let key_value = interp.vm_property_key_to_value(key)?;
+                let key_value = interp.vm_property_key_to_value(key).map_err(|error| CommittedValueError::JavaScript(error.into()))?;
                 let key_root = interp.scoped_value(scope, key_value);
                 let proxy = interp
                     .escape_scoped(proxy_root)
@@ -416,7 +437,7 @@ impl Interpreter {
                     interp.escape_scoped(value_root),
                     interp.escape_scoped(receiver_root),
                 ];
-                match interp.invoke_proxy_trap(stack, context, &proxy, "set", trap_args)? {
+                match interp.invoke_proxy_trap(stack, Some(context), &proxy, "set", trap_args)? {
                     crate::object_internal_ops::ProxyTrap::Trapped(result) => {
                         if !result.to_boolean(&interp.gc_heap) {
                             return Ok(false);
@@ -440,7 +461,7 @@ impl Interpreter {
                         };
                         let target_desc = interp.ordinary_get_own_property_descriptor_value(
                             stack,
-                            context,
+                            Some(context),
                             proxy.target(&interp.gc_heap),
                             &live_key,
                             hops + 1,
@@ -457,14 +478,14 @@ impl Interpreter {
                                             &interp.gc_heap,
                                         ) =>
                                 {
-                                    return Err(interp.err_type((
+                                    return Err(CommittedValueError::JavaScript(interp.err_type((
                                             "Proxy set trap reported success but target is non-configurable non-writable with a different value"
-                                                .to_string()).into()));
+                                                .to_string()).into())));
                                 }
                                 object::DescriptorKind::Accessor { setter: None, .. } => {
-                                    return Err(interp.err_type((
+                                    return Err(CommittedValueError::JavaScript(interp.err_type((
                                             "Proxy set trap reported success but target is a non-configurable accessor without a setter"
-                                                .to_string()).into()));
+                                                .to_string()).into())));
                                 }
                                 _ => {}
                             }
@@ -508,7 +529,7 @@ impl Interpreter {
             let target_value = Value::array(arr);
             let desc = self.ordinary_get_own_property_descriptor_value(
                 stack,
-                context,
+                Some(context),
                 target_value,
                 key,
                 hops + 1,
@@ -520,7 +541,14 @@ impl Interpreter {
                             return Ok(false);
                         };
                         let argv: SmallVec<[Value; 8]> = smallvec::smallvec![value];
-                        self.run_callable_sync_rooted(stack, context, &setter, receiver, argv)?;
+                        self.run_callable_sync_rooted(
+                            stack,
+                            Some(context),
+                            &setter,
+                            receiver,
+                            argv,
+                        )
+                        .map_err(CommittedValueError::completed_call)?;
                         Ok(true)
                     }
                     object::DescriptorKind::Data { .. } => {
@@ -531,7 +559,9 @@ impl Interpreter {
                     }
                 };
             }
-            let parent = self.get_prototype_for_op(&target_value)?;
+            let parent = self
+                .get_prototype_for_op(&target_value)
+                .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
             if parent.is_null() || parent.is_undefined() {
                 return self.ordinary_set_on_receiver(stack, context, key, value, &receiver);
             }
@@ -556,11 +586,13 @@ impl Interpreter {
                 && object::get_own_symbol_descriptor(obj, &self.gc_heap, *sym).is_none()
                 && !object::is_extensible(obj, &self.gc_heap)
             {
-                return Err(self.err_type(
+                return Err(CommittedValueError::JavaScript(self.err_type(
                     ("Cannot define private member on a non-extensible object".to_string()).into(),
-                ));
+                )));
             }
-            if let Some(desc) = self.string_object_exotic_descriptor(obj, key)?
+            if let Some(desc) = self
+                .string_object_exotic_descriptor(obj, key)
+                .map_err(|error| CommittedValueError::JavaScript(error.into()))?
                 && !desc.writable()
             {
                 return Ok(false);
@@ -583,7 +615,8 @@ impl Interpreter {
             return match outcome {
                 object::SetOutcome::InvokeSetter { setter } => {
                     let argv: SmallVec<[Value; 8]> = smallvec::smallvec![value];
-                    self.run_callable_sync_rooted(stack, context, &setter, receiver, argv)?;
+                    self.run_callable_sync_rooted(stack, Some(context), &setter, receiver, argv)
+                        .map_err(CommittedValueError::completed_call)?;
                     Ok(true)
                 }
                 object::SetOutcome::Reject { .. } => Ok(false),
@@ -603,14 +636,21 @@ impl Interpreter {
                             .ordinary_set_on_receiver(stack, context, key, value, &receiver);
                     }
                     Ok(if let VmPropertyKey::Symbol(sym) = key {
-                        object::set_symbol(obj, &mut self.gc_heap, *sym, value)
+                        object::ordinary_set_symbol_data_property(
+                            &mut { obj },
+                            &mut self.gc_heap,
+                            *sym,
+                            value,
+                        )
+                        .map_err(|error| CommittedValueError::JavaScript(error.into()))?
                     } else {
                         self.ordinary_set_data_property(
                             obj,
                             key.string_name()
                                 .expect("non-symbol key has string spelling"),
                             value,
-                        )?
+                        )
+                        .map_err(|error| CommittedValueError::JavaScript(error.into()))?
                     })
                 }
             };
@@ -630,7 +670,7 @@ impl Interpreter {
                 regexp_prototype::store_property(&re, &mut self.gc_heap, "lastIndex", value);
                 return Ok(true);
             }
-            if let Some(bag) = re.expando(&self.gc_heap) {
+            if let Some(mut bag) = re.expando(&self.gc_heap) {
                 let lookup = match key {
                     VmPropertyKey::Symbol(sym) => {
                         object::lookup_own_symbol(bag, &self.gc_heap, *sym)
@@ -655,14 +695,21 @@ impl Interpreter {
                                 .ordinary_set_on_receiver(stack, context, key, value, &receiver);
                         }
                         return Ok(if let VmPropertyKey::Symbol(sym) = key {
-                            object::set_symbol(bag, &mut self.gc_heap, *sym, value)
+                            object::ordinary_set_symbol_data_property(
+                                &mut bag,
+                                &mut self.gc_heap,
+                                *sym,
+                                value,
+                            )
+                            .map_err(|error| CommittedValueError::JavaScript(error.into()))?
                         } else {
                             self.ordinary_set_data_property(
                                 bag,
                                 key.string_name()
                                     .expect("non-symbol key has string spelling"),
                                 value,
-                            )?
+                            )
+                            .map_err(|error| CommittedValueError::JavaScript(error.into()))?
                         });
                     }
                     object::PropertyLookup::Accessor { setter, .. } => {
@@ -675,20 +722,24 @@ impl Interpreter {
                             let value = interp.scoped_value(scope, value);
                             let argv: SmallVec<[Value; 8]> =
                                 smallvec::smallvec![interp.escape_scoped(value)];
-                            interp.run_callable_sync_rooted(
-                                stack,
-                                context,
-                                &interp.escape_scoped(setter),
-                                interp.escape_scoped(receiver),
-                                argv,
-                            )?;
+                            interp
+                                .run_callable_sync_rooted(
+                                    stack,
+                                    Some(context),
+                                    &interp.escape_scoped(setter),
+                                    interp.escape_scoped(receiver),
+                                    argv,
+                                )
+                                .map_err(CommittedValueError::completed_call)?;
                             Ok(true)
                         });
                     }
                     object::PropertyLookup::Absent => {}
                 }
             }
-            let parent = self.get_prototype_for_op(&target)?;
+            let parent = self
+                .get_prototype_for_op(&target)
+                .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
             if parent.is_null() || parent.is_undefined() {
                 return self.ordinary_set_on_receiver(stack, context, key, value, &receiver);
             }
@@ -715,12 +766,12 @@ impl Interpreter {
             // / Set.prototype, whose `size` accessor has no setter).
             // The lazy expando allocation can move the collection, the value
             // and the receiver, so all three are re-read from rooted slots.
-            let (bag, target, value, receiver) = self.with_handle_scope(
-                |interp, scope| -> Result<(object::JsObject, Value, Value, Value), VmError> {
+            let (mut bag, target, value, receiver) = self.with_handle_scope(
+                |interp, scope| -> Result<(object::JsObject, Value, Value, Value), CommittedValueError> {
                     let target = interp.scoped_value(scope, target);
                     let value = interp.scoped_value(scope, value);
                     let receiver = interp.scoped_value(scope, receiver);
-                    let bag = interp.collection_ensure_expando(&interp.escape_scoped(target))?;
+                    let bag = interp.collection_ensure_expando(&interp.escape_scoped(target)).map_err(|error| CommittedValueError::JavaScript(error.into()))?;
                     Ok((
                         bag,
                         interp.escape_scoped(target),
@@ -764,14 +815,21 @@ impl Interpreter {
                             .ordinary_set_on_receiver(stack, context, key, value, &receiver);
                     }
                     return Ok(if let VmPropertyKey::Symbol(sym) = key {
-                        object::set_symbol(bag, &mut self.gc_heap, *sym, value)
+                        object::ordinary_set_symbol_data_property(
+                            &mut bag,
+                            &mut self.gc_heap,
+                            *sym,
+                            value,
+                        )
+                        .map_err(|error| CommittedValueError::JavaScript(error.into()))?
                     } else {
                         self.ordinary_set_data_property(
                             bag,
                             key.string_name()
                                 .expect("non-symbol key has string spelling"),
                             value,
-                        )?
+                        )
+                        .map_err(|error| CommittedValueError::JavaScript(error.into()))?
                     });
                 }
                 object::PropertyLookup::Accessor { setter, .. } => {
@@ -784,18 +842,22 @@ impl Interpreter {
                         let value = interp.scoped_value(scope, value);
                         let argv: SmallVec<[Value; 8]> =
                             smallvec::smallvec![interp.escape_scoped(value)];
-                        interp.run_callable_sync_rooted(
-                            stack,
-                            context,
-                            &interp.escape_scoped(setter),
-                            interp.escape_scoped(receiver),
-                            argv,
-                        )?;
+                        interp
+                            .run_callable_sync_rooted(
+                                stack,
+                                Some(context),
+                                &interp.escape_scoped(setter),
+                                interp.escape_scoped(receiver),
+                                argv,
+                            )
+                            .map_err(CommittedValueError::completed_call)?;
                         Ok(true)
                     });
                 }
                 object::PropertyLookup::Absent => {
-                    let parent = self.get_prototype_for_op(&target)?;
+                    let parent = self
+                        .get_prototype_for_op(&target)
+                        .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
                     if parent.is_null() || parent.is_undefined() {
                         return self
                             .ordinary_set_on_receiver(stack, context, key, value, &receiver);
@@ -819,7 +881,8 @@ impl Interpreter {
             // walk through the Temporal instance's real [[Prototype]]
             // (so `dt.year = x`, a getter-only accessor, rejects).
             let mut bag =
-                crate::property_dispatch::temporal_ensure_expando_pub(&mut self.gc_heap, &t)?;
+                crate::property_dispatch::temporal_ensure_expando_pub(&mut self.gc_heap, &t)
+                    .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
             let same_receiver = receiver
                 .as_temporal(&self.gc_heap)
                 .is_some_and(|r| r.ptr_eq(t));
@@ -841,29 +904,38 @@ impl Interpreter {
                         return self
                             .ordinary_set_on_receiver(stack, context, key, value, &receiver);
                     }
-                    if let VmPropertyKey::Symbol(sym) = key {
-                        object::set_symbol(bag, &mut self.gc_heap, *sym, value);
+                    return if let VmPropertyKey::Symbol(sym) = key {
+                        object::ordinary_set_symbol_data_property(
+                            &mut bag,
+                            &mut self.gc_heap,
+                            *sym,
+                            value,
+                        )
+                        .map_err(|error| CommittedValueError::JavaScript(error.into()))
                     } else {
-                        object::set(
+                        object::ordinary_set_data_property(
                             &mut bag,
                             &mut self.gc_heap,
                             key.string_name()
                                 .expect("non-symbol key has string spelling"),
                             value,
-                        );
-                    }
-                    return Ok(true);
+                        )
+                        .map_err(|error| CommittedValueError::JavaScript(error.into()))
+                    };
                 }
                 object::PropertyLookup::Accessor { setter, .. } => {
                     let Some(setter) = setter else {
                         return Ok(false);
                     };
                     let argv: SmallVec<[Value; 8]> = smallvec::smallvec![value];
-                    self.run_callable_sync_rooted(stack, context, &setter, receiver, argv)?;
+                    self.run_callable_sync_rooted(stack, Some(context), &setter, receiver, argv)
+                        .map_err(CommittedValueError::completed_call)?;
                     return Ok(true);
                 }
                 object::PropertyLookup::Absent => {
-                    let parent = self.get_prototype_for_op(&target)?;
+                    let parent = self
+                        .get_prototype_for_op(&target)
+                        .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
                     if parent.is_null() || parent.is_undefined() {
                         return self
                             .ordinary_set_on_receiver(stack, context, key, value, &receiver);
@@ -884,7 +956,10 @@ impl Interpreter {
             // Builtin iterator objects — ordinary objects whose user
             // properties live in the non-GC side-table bag; the
             // prototype walk stays ordinary (§10.1.9).
-            let Some(mut bag) = self.ensure_non_gc_exotic_user_props(&target)? else {
+            let Some(mut bag) = self
+                .ensure_non_gc_exotic_user_props(&target)
+                .map_err(|error| CommittedValueError::JavaScript(error.into()))?
+            else {
                 return Ok(false);
             };
             let same_receiver = receiver
@@ -909,29 +984,38 @@ impl Interpreter {
                         return self
                             .ordinary_set_on_receiver(stack, context, key, value, &receiver);
                     }
-                    if let VmPropertyKey::Symbol(sym) = key {
-                        object::set_symbol(bag, &mut self.gc_heap, *sym, value);
+                    return if let VmPropertyKey::Symbol(sym) = key {
+                        object::ordinary_set_symbol_data_property(
+                            &mut bag,
+                            &mut self.gc_heap,
+                            *sym,
+                            value,
+                        )
+                        .map_err(|error| CommittedValueError::JavaScript(error.into()))
                     } else {
-                        object::set(
+                        object::ordinary_set_data_property(
                             &mut bag,
                             &mut self.gc_heap,
                             key.string_name()
                                 .expect("non-symbol key has string spelling"),
                             value,
-                        );
-                    }
-                    return Ok(true);
+                        )
+                        .map_err(|error| CommittedValueError::JavaScript(error.into()))
+                    };
                 }
                 object::PropertyLookup::Accessor { setter, .. } => {
                     let Some(setter) = setter else {
                         return Ok(false);
                     };
                     let argv: SmallVec<[Value; 8]> = smallvec::smallvec![value];
-                    self.run_callable_sync_rooted(stack, context, &setter, receiver, argv)?;
+                    self.run_callable_sync_rooted(stack, Some(context), &setter, receiver, argv)
+                        .map_err(CommittedValueError::completed_call)?;
                     return Ok(true);
                 }
                 object::PropertyLookup::Absent => {
-                    let parent = self.get_prototype_for_op(&target)?;
+                    let parent = self
+                        .get_prototype_for_op(&target)
+                        .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
                     if parent.is_null() || parent.is_undefined() {
                         return self
                             .ordinary_set_on_receiver(stack, context, key, value, &receiver);
@@ -953,7 +1037,10 @@ impl Interpreter {
             // ordinary own properties. The internal slots live in a
             // non-GC payload, so user properties are stored in a lazy
             // side-table bag and the prototype walk remains ordinary.
-            let Some(mut bag) = self.ensure_non_gc_exotic_user_props(&target)? else {
+            let Some(mut bag) = self
+                .ensure_non_gc_exotic_user_props(&target)
+                .map_err(|error| CommittedValueError::JavaScript(error.into()))?
+            else {
                 return Ok(false);
             };
             let same_receiver = receiver
@@ -979,29 +1066,38 @@ impl Interpreter {
                         return self
                             .ordinary_set_on_receiver(stack, context, key, value, &receiver);
                     }
-                    if let VmPropertyKey::Symbol(sym) = key {
-                        object::set_symbol(bag, &mut self.gc_heap, *sym, value);
+                    return if let VmPropertyKey::Symbol(sym) = key {
+                        object::ordinary_set_symbol_data_property(
+                            &mut bag,
+                            &mut self.gc_heap,
+                            *sym,
+                            value,
+                        )
+                        .map_err(|error| CommittedValueError::JavaScript(error.into()))
                     } else {
-                        object::set(
+                        object::ordinary_set_data_property(
                             &mut bag,
                             &mut self.gc_heap,
                             key.string_name()
                                 .expect("non-symbol key has string spelling"),
                             value,
-                        );
-                    }
-                    return Ok(true);
+                        )
+                        .map_err(|error| CommittedValueError::JavaScript(error.into()))
+                    };
                 }
                 object::PropertyLookup::Accessor { setter, .. } => {
                     let Some(setter) = setter else {
                         return Ok(false);
                     };
                     let argv: SmallVec<[Value; 8]> = smallvec::smallvec![value];
-                    self.run_callable_sync_rooted(stack, context, &setter, receiver, argv)?;
+                    self.run_callable_sync_rooted(stack, Some(context), &setter, receiver, argv)
+                        .map_err(CommittedValueError::completed_call)?;
                     return Ok(true);
                 }
                 object::PropertyLookup::Absent => {
-                    let parent = self.get_prototype_for_op(&target)?;
+                    let parent = self
+                        .get_prototype_for_op(&target)
+                        .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
                     if parent.is_null() || parent.is_undefined() {
                         return self
                             .ordinary_set_on_receiver(stack, context, key, value, &receiver);
@@ -1033,7 +1129,9 @@ impl Interpreter {
                     let name = key
                         .string_name()
                         .expect("non-symbol key has string spelling");
-                    native.own_property_descriptor(&mut self.gc_heap, name)?
+                    native
+                        .own_property_descriptor(&mut self.gc_heap, name)
+                        .map_err(|error| CommittedValueError::JavaScript(error.into()))?
                 }
             };
             return match own {
@@ -1043,7 +1141,14 @@ impl Interpreter {
                             return Ok(false);
                         };
                         let argv: SmallVec<[Value; 8]> = smallvec::smallvec![value];
-                        self.run_callable_sync_rooted(stack, context, &setter, receiver, argv)?;
+                        self.run_callable_sync_rooted(
+                            stack,
+                            Some(context),
+                            &setter,
+                            receiver,
+                            argv,
+                        )
+                        .map_err(CommittedValueError::completed_call)?;
                         Ok(true)
                     }
                     object::DescriptorKind::Data { .. } => {
@@ -1054,7 +1159,9 @@ impl Interpreter {
                     }
                 },
                 None => {
-                    let parent = self.get_prototype_for_op(&target)?;
+                    let parent = self
+                        .get_prototype_for_op(&target)
+                        .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
                     if parent.is_null() || parent.is_undefined() {
                         return self
                             .ordinary_set_on_receiver(stack, context, key, value, &receiver);
@@ -1100,7 +1207,8 @@ impl Interpreter {
                         owner,
                         function_id,
                         name,
-                    )?
+                    )
+                    .map_err(|error| CommittedValueError::JavaScript(error.into()))?
                 }
             };
             return match own {
@@ -1110,7 +1218,14 @@ impl Interpreter {
                             return Ok(false);
                         };
                         let argv: SmallVec<[Value; 8]> = smallvec::smallvec![value];
-                        self.run_callable_sync_rooted(stack, context, &setter, receiver, argv)?;
+                        self.run_callable_sync_rooted(
+                            stack,
+                            Some(context),
+                            &setter,
+                            receiver,
+                            argv,
+                        )
+                        .map_err(CommittedValueError::completed_call)?;
                         Ok(true)
                     }
                     object::DescriptorKind::Data { .. } => {
@@ -1121,7 +1236,9 @@ impl Interpreter {
                     }
                 },
                 None => {
-                    let parent = self.get_prototype_for_op(&target)?;
+                    let parent = self
+                        .get_prototype_for_op(&target)
+                        .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
                     if parent.is_null() || parent.is_undefined() {
                         return self
                             .ordinary_set_on_receiver(stack, context, key, value, &receiver);
@@ -1148,13 +1265,30 @@ impl Interpreter {
                 let target = interp.scoped_value(scope, target);
                 let value = interp.scoped_value(scope, value);
                 let receiver = interp.scoped_value(scope, receiver);
+                let symbol_key = match key {
+                    VmPropertyKey::Symbol(symbol) => {
+                        Some(interp.scoped_value(scope, Value::symbol(*symbol)))
+                    }
+                    _ => None,
+                };
+                let current_key = |interp: &Self| match symbol_key {
+                    Some(symbol) => VmPropertyKey::Symbol(
+                        interp
+                            .escape_scoped(symbol)
+                            .as_symbol(&interp.gc_heap)
+                            .expect("rooted Symbol key remains a Symbol"),
+                    ),
+                    None => VmPropertyKey::String(
+                        key.string_name().expect("non-Symbol key has a spelling"),
+                    ),
+                };
                 // The handle arena owns every moving value here while the
                 // shared activation stack remains the sole frame-root owner.
                 let own = interp.ordinary_get_own_property_descriptor_value(
                     stack,
-                    context,
+                    Some(context),
                     interp.escape_scoped(target),
-                    key,
+                    &current_key(interp),
                     hops + 1,
                 )?;
                 if let Some(desc) = own {
@@ -1163,13 +1297,15 @@ impl Interpreter {
                             let Some(setter) = setter else {
                                 return Ok(false);
                             };
-                            interp.run_callable_sync_rooted(
-                                stack,
-                                context,
-                                &setter,
-                                interp.escape_scoped(receiver),
-                                smallvec::smallvec![interp.escape_scoped(value)],
-                            )?;
+                            interp
+                                .run_callable_sync_rooted(
+                                    stack,
+                                    Some(context),
+                                    &setter,
+                                    interp.escape_scoped(receiver),
+                                    smallvec::smallvec![interp.escape_scoped(value)],
+                                )
+                                .map_err(CommittedValueError::completed_call)?;
                             Ok(true)
                         }
                         object::DescriptorKind::Data { .. } => {
@@ -1179,19 +1315,21 @@ impl Interpreter {
                             interp.ordinary_set_on_receiver(
                                 stack,
                                 context,
-                                key,
+                                &current_key(interp),
                                 interp.escape_scoped(value),
                                 &interp.escape_scoped(receiver),
                             )
                         }
                     };
                 }
-                let parent = interp.get_prototype_for_op(&interp.escape_scoped(target))?;
+                let parent = interp
+                    .get_prototype_for_op(&interp.escape_scoped(target))
+                    .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
                 if parent.is_null() || parent.is_undefined() {
                     return interp.ordinary_set_on_receiver(
                         stack,
                         context,
-                        key,
+                        &current_key(interp),
                         interp.escape_scoped(value),
                         &interp.escape_scoped(receiver),
                     );
@@ -1200,7 +1338,7 @@ impl Interpreter {
                     stack,
                     context,
                     parent,
-                    key,
+                    &current_key(interp),
                     interp.escape_scoped(value),
                     interp.escape_scoped(receiver),
                     hops + 1,

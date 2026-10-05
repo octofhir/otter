@@ -4,6 +4,12 @@
 - **Test262 commit:** `be13516fb6441b950ba8a3df97eb34062c186972`
 - **Captured:** 2026-08-30T12:28:55.998135+00:00
 
+This is historical aggregate evidence from the capture above. Its JSON omitted
+passing and skipped test identities, so it cannot prove exact coverage or serve
+as the current canonical baseline. The former public dashboard data is
+unpublished until a genuine full report with canonical per-test rows and actual
+runner provenance is generated. The recorded counts below remain unchanged.
+
 ## Totals
 
 | Bucket | Count |

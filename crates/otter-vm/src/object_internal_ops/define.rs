@@ -13,6 +13,7 @@
 
 use super::*;
 use crate::activation_stack::ActivationStack;
+use crate::native_abi::CommittedValueError;
 use crate::{
     ExecutionContext, Interpreter, Value, VmError, VmPropertyKey, abstract_ops, array, object,
 };
@@ -24,11 +25,11 @@ impl Interpreter {
     /// hand back the step's result together with the relocated descriptor.
     /// A raw descriptor held across the allocation would carry pre-move
     /// handles into the define that follows.
-    pub(crate) fn with_descriptor_anchored<T>(
+    pub(crate) fn with_descriptor_anchored<T, E>(
         &mut self,
         descriptor: object::PartialPropertyDescriptor,
-        step: impl FnOnce(&mut Self) -> Result<T, VmError>,
-    ) -> Result<(T, object::PartialPropertyDescriptor), VmError> {
+        step: impl FnOnce(&mut Self) -> Result<T, E>,
+    ) -> Result<(T, object::PartialPropertyDescriptor), E> {
         let mut descriptor = descriptor;
         let slots = [
             descriptor.value.map(|v| self.push_iteration_anchor(v) - 1),
@@ -59,7 +60,7 @@ impl Interpreter {
         target: &Value,
         key: &VmPropertyKey,
         descriptor: object::PartialPropertyDescriptor,
-    ) -> Result<bool, VmError> {
+    ) -> Result<bool, CommittedValueError> {
         // §6.2.12 / §7.3.28 — private names: a Proxy receiver keeps
         // them in its own [[PrivateElements]] bag (no traps), and an
         // ordinary add to a non-extensible object is a TypeError.
@@ -80,9 +81,9 @@ impl Interpreter {
                 && !crate::object::is_extensible(obj, &self.gc_heap)
                 && crate::object::get_symbol(obj, &self.gc_heap, *sym).is_none()
             {
-                return Err(self.err_type(
+                return Err(CommittedValueError::JavaScript(self.err_type(
                     ("Cannot define private field on a non-extensible object".to_string()).into(),
-                ));
+                )));
             }
         }
         // Array index protector, tripped by either of two observations and
@@ -112,7 +113,7 @@ impl Interpreter {
             self.activate_array_index_accessor_protector();
         }
         let (target, descriptor) = self.with_handle_scope(
-            |interp, scope| -> Result<(Value, object::PartialPropertyDescriptor), VmError> {
+            |interp, scope| -> Result<(Value, object::PartialPropertyDescriptor), CommittedValueError> {
                 let target_handle = interp.scoped_value(scope, *target);
                 let value_handle = descriptor
                     .value
@@ -165,10 +166,12 @@ impl Interpreter {
         }
         if let Some(proxy) = target.as_proxy() {
             if proxy.is_revoked(&self.gc_heap) {
-                return Err(self.err_type(
-                    ("Cannot perform 'defineProperty' on a proxy that has been revoked"
-                        .to_string())
-                    .into(),
+                return Err(CommittedValueError::JavaScript(
+                    self.err_type(
+                        ("Cannot perform 'defineProperty' on a proxy that has been revoked"
+                            .to_string())
+                        .into(),
+                    ),
                 ));
             }
             let scope_frame = crate::handles::HandleScopeFrame::enter(self);
@@ -187,10 +190,13 @@ impl Interpreter {
                 current.set = set_root.map(|value| interp.escape_scoped(value));
                 current
             };
-            let key_value = self.vm_property_key_to_value(key)?;
+            let key_value = self
+                .vm_property_key_to_value(key)
+                .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
             let key_root = self.scoped_value(&scope, key_value);
-            let descriptor_object =
-                self.partial_descriptor_to_object(&current_descriptor(self), &[])?;
+            let descriptor_object = self
+                .partial_descriptor_to_object(&current_descriptor(self), &[])
+                .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
             let trap_args: SmallVec<[Value; 8]> = smallvec::smallvec![
                 self.escape_scoped(target_root),
                 self.escape_scoped(key_root),
@@ -199,10 +205,11 @@ impl Interpreter {
             let proxy = self
                 .escape_scoped(proxy_root)
                 .as_proxy()
-                .ok_or(VmError::InvalidOperand)?;
+                .ok_or(VmError::InvalidOperand)
+                .map_err(|error| CommittedValueError::Fatal(error.into()))?;
             return match self.invoke_proxy_trap(
                 stack,
-                context,
+                Some(context),
                 &proxy,
                 "defineProperty",
                 trap_args,
@@ -214,7 +221,7 @@ impl Interpreter {
                     }
                     let mut target_desc = self.ordinary_get_own_property_descriptor_value(
                         stack,
-                        context,
+                        Some(context),
                         self.escape_scoped(target_root),
                         key,
                         0,
@@ -228,8 +235,11 @@ impl Interpreter {
                             setter.map(|v| self.scoped_value(&scope, v)),
                         ],
                     });
-                    let extensible =
-                        self.is_extensible_value(stack, context, &self.escape_scoped(target_root))?;
+                    let extensible = self.is_extensible_value(
+                        stack,
+                        Some(context),
+                        &self.escape_scoped(target_root),
+                    )?;
                     if let (Some(desc), Some([first, second])) = (&mut target_desc, target_payloads)
                     {
                         desc.kind = match desc.kind {
@@ -254,49 +264,49 @@ impl Interpreter {
                     match target_desc.as_ref() {
                         None => {
                             if !extensible {
-                                return Err(self.err_type((
+                                return Err(CommittedValueError::JavaScript(self.err_type((
                                             "Proxy defineProperty trap added a property on a non-extensible target"
-                                                .to_string()).into()));
+                                                .to_string()).into())));
                             }
                             if setting_config_false {
-                                return Err(self.err_type((
+                                return Err(CommittedValueError::JavaScript(self.err_type((
                                             "Proxy defineProperty trap added a non-configurable property absent on the target"
-                                                .to_string()).into()));
+                                                .to_string()).into())));
                             }
                         }
                         Some(target_desc) => {
                             let target_configurable = target_desc.configurable();
                             if !target_configurable && matches!(descriptor.configurable, Some(true))
                             {
-                                return Err(self.err_type((
+                                return Err(CommittedValueError::JavaScript(self.err_type((
                                             "Proxy defineProperty trap relaxed a non-configurable target descriptor"
-                                                .to_string()).into()));
+                                                .to_string()).into())));
                             }
                             if target_configurable && matches!(descriptor.configurable, Some(false))
                             {
-                                return Err(self.err_type((
+                                return Err(CommittedValueError::JavaScript(self.err_type((
                                             "Proxy defineProperty trap demoted a configurable target descriptor"
-                                                .to_string()).into()));
+                                                .to_string()).into())));
                             }
                             if !target_configurable
                                 && target_desc.is_data()
                                 && target_desc.writable()
                                 && matches!(descriptor.writable, Some(false))
                             {
-                                return Err(self.err_type((
+                                return Err(CommittedValueError::JavaScript(self.err_type((
                                             "Proxy defineProperty trap narrowed writable on a non-configurable data target"
-                                                .to_string()).into()));
+                                                .to_string()).into())));
                             }
                             if !is_compatible_partial_descriptor(
                                 target_desc,
                                 &descriptor,
                                 &self.gc_heap,
                             ) {
-                                return Err(self.err_type(
+                                return Err(CommittedValueError::JavaScript(self.err_type(
                                     ("Proxy defineProperty trap returned incompatible descriptor"
                                         .to_string())
                                     .into(),
-                                ));
+                                )));
                             }
                         }
                     }
@@ -334,8 +344,12 @@ impl Interpreter {
                     *sym,
                     descriptor,
                 )
+                .map_err(|error| CommittedValueError::JavaScript(error.into()))?
             } else {
-                if let Some(current) = self.string_object_exotic_descriptor(obj, key)? {
+                if let Some(current) = self
+                    .string_object_exotic_descriptor(obj, key)
+                    .map_err(|error| CommittedValueError::JavaScript(error.into()))?
+                {
                     return Ok(is_compatible_partial_descriptor(
                         &current,
                         &descriptor,
@@ -345,17 +359,22 @@ impl Interpreter {
                 let k = key
                     .string_name()
                     .expect("non-symbol key has string spelling");
-                self.define_own_property_partial(&mut obj, k, descriptor)?
+                self.define_own_property_partial(&mut obj, k, descriptor)
+                    .map_err(|error| CommittedValueError::JavaScript(error.into()))?
             });
         }
         if let Some(native) = target.as_native_function() {
             return Ok(if let VmPropertyKey::Symbol(sym) = key {
-                native.define_own_symbol_property(&mut self.gc_heap, *sym, descriptor)
+                native
+                    .define_own_symbol_property(&mut self.gc_heap, *sym, descriptor)
+                    .map_err(|error| CommittedValueError::JavaScript(error.into()))?
             } else {
                 let k = key
                     .string_name()
                     .expect("non-symbol key has string spelling");
-                native.define_own_property_partial(&mut self.gc_heap, k, descriptor)?
+                native
+                    .define_own_property_partial(&mut self.gc_heap, k, descriptor)
+                    .map_err(|error| CommittedValueError::JavaScript(error.into()))?
             });
         }
         if let Some(class) = target.as_class_constructor() {
@@ -367,11 +386,13 @@ impl Interpreter {
                     *sym,
                     descriptor,
                 )
+                .map_err(|error| CommittedValueError::JavaScript(error.into()))?
             } else {
                 let k = key
                     .string_name()
                     .expect("non-symbol key has string spelling");
-                self.define_own_property_partial(&mut statics, k, descriptor)?
+                self.define_own_property_partial(&mut statics, k, descriptor)
+                    .map_err(|error| CommittedValueError::JavaScript(error.into()))?
             });
         }
         let fid = target.as_function().or_else(|| {
@@ -384,13 +405,15 @@ impl Interpreter {
                 let owner = target.as_closure(&self.gc_heap);
                 let (mut bag, descriptor) = self.with_descriptor_anchored(descriptor, |this| {
                     this.function_user_bag(stack, owner, function_id, &[])
+                        .map_err(|error| CommittedValueError::JavaScript(error.into()))
                 })?;
                 return Ok(object::define_own_symbol_property_partial(
                     &mut bag,
                     &mut self.gc_heap,
                     *sym,
                     descriptor,
-                ));
+                )
+                .map_err(|error| CommittedValueError::JavaScript(error.into()))?);
             }
             let Some(k) = key.string_name() else {
                 return Ok(false);
@@ -427,26 +450,30 @@ impl Interpreter {
                 })?;
                 let (current, descriptor) =
                     interp.with_descriptor_anchored(descriptor, |interp| {
-                        interp.ordinary_function_own_property_descriptor(
-                            Some(context),
-                            owner_now(interp),
-                            function_id,
-                            k,
-                        )
+                        interp
+                            .ordinary_function_own_property_descriptor(
+                                Some(context),
+                                owner_now(interp),
+                                function_id,
+                                k,
+                            )
+                            .map_err(|error| CommittedValueError::JavaScript(error.into()))
                     })?;
                 let completed = match current {
                     Some(current) => descriptor.complete_against_current(&current),
                     None => descriptor.complete_for_new_property(),
                 };
-                interp.ordinary_function_define_own_property(
-                    stack,
-                    Some(context),
-                    owner_now(interp),
-                    function_id,
-                    k,
-                    None,
-                    completed,
-                )
+                interp
+                    .ordinary_function_define_own_property(
+                        stack,
+                        Some(context),
+                        owner_now(interp),
+                        function_id,
+                        k,
+                        None,
+                        completed,
+                    )
+                    .map_err(|error| CommittedValueError::JavaScript(error.into()))
             });
         }
         if let Some(regexp) = target.as_regexp() {
@@ -472,6 +499,7 @@ impl Interpreter {
             }
             let (mut bag, descriptor) = self.with_descriptor_anchored(descriptor, |this| {
                 crate::property_dispatch::regexp_ensure_expando_pub(&mut this.gc_heap, &regexp)
+                    .map_err(|error| CommittedValueError::JavaScript(error.into()))
             })?;
             return Ok(if let VmPropertyKey::Symbol(sym) = key {
                 object::define_own_symbol_property_partial(
@@ -480,11 +508,13 @@ impl Interpreter {
                     *sym,
                     descriptor,
                 )
+                .map_err(|error| CommittedValueError::JavaScript(error.into()))?
             } else {
                 let k = key
                     .string_name()
                     .expect("non-symbol key has string spelling");
-                self.define_own_property_partial(&mut bag, k, descriptor)?
+                self.define_own_property_partial(&mut bag, k, descriptor)
+                    .map_err(|error| CommittedValueError::JavaScript(error.into()))?
             });
         }
         if target.is_map()
@@ -495,6 +525,7 @@ impl Interpreter {
         {
             let (mut bag, descriptor) = self.with_descriptor_anchored(descriptor, |this| {
                 this.collection_ensure_expando(target)
+                    .map_err(|error| CommittedValueError::JavaScript(error.into()))
             })?;
             return Ok(if let VmPropertyKey::Symbol(sym) = key {
                 object::define_own_symbol_property_partial(
@@ -503,11 +534,13 @@ impl Interpreter {
                     *sym,
                     descriptor,
                 )
+                .map_err(|error| CommittedValueError::JavaScript(error.into()))?
             } else {
                 let k = key
                     .string_name()
                     .expect("non-symbol key has string spelling");
-                self.define_own_property_partial(&mut bag, k, descriptor)?
+                self.define_own_property_partial(&mut bag, k, descriptor)
+                    .map_err(|error| CommittedValueError::JavaScript(error.into()))?
             });
         }
         if let Some(promise) = target.as_promise() {
@@ -516,6 +549,7 @@ impl Interpreter {
             // resolve path observes) live on a lazily-allocated expando.
             let (mut bag, descriptor) = self.with_descriptor_anchored(descriptor, |this| {
                 crate::property_dispatch::promise_ensure_expando_pub(&mut this.gc_heap, &promise)
+                    .map_err(|error| CommittedValueError::JavaScript(error.into()))
             })?;
             return Ok(if let VmPropertyKey::Symbol(sym) = key {
                 object::define_own_symbol_property_partial(
@@ -524,11 +558,13 @@ impl Interpreter {
                     *sym,
                     descriptor,
                 )
+                .map_err(|error| CommittedValueError::JavaScript(error.into()))?
             } else {
                 let k = key
                     .string_name()
                     .expect("non-symbol key has string spelling");
-                self.define_own_property_partial(&mut bag, k, descriptor)?
+                self.define_own_property_partial(&mut bag, k, descriptor)
+                    .map_err(|error| CommittedValueError::JavaScript(error.into()))?
             });
         }
         if let Some(dv) = target.as_data_view() {
@@ -536,6 +572,7 @@ impl Interpreter {
             // `Object.defineProperty(dv, …)` installs onto the expando.
             let (mut bag, descriptor) = self.with_descriptor_anchored(descriptor, |this| {
                 crate::property_dispatch::data_view_ensure_expando_pub(&mut this.gc_heap, &dv)
+                    .map_err(|error| CommittedValueError::JavaScript(error.into()))
             })?;
             return Ok(if let VmPropertyKey::Symbol(sym) = key {
                 object::define_own_symbol_property_partial(
@@ -544,11 +581,13 @@ impl Interpreter {
                     *sym,
                     descriptor,
                 )
+                .map_err(|error| CommittedValueError::JavaScript(error.into()))?
             } else {
                 let k = key
                     .string_name()
                     .expect("non-symbol key has string spelling");
-                self.define_own_property_partial(&mut bag, k, descriptor)?
+                self.define_own_property_partial(&mut bag, k, descriptor)
+                    .map_err(|error| CommittedValueError::JavaScript(error.into()))?
             });
         }
         if let Some(t) = target.as_temporal(&self.gc_heap) {
@@ -558,6 +597,7 @@ impl Interpreter {
             // the lazy expando bag.
             let (mut bag, descriptor) = self.with_descriptor_anchored(descriptor, |this| {
                 crate::property_dispatch::temporal_ensure_expando_pub(&mut this.gc_heap, &t)
+                    .map_err(|error| CommittedValueError::JavaScript(error.into()))
             })?;
             return Ok(if let VmPropertyKey::Symbol(sym) = key {
                 object::define_own_symbol_property_partial(
@@ -566,16 +606,19 @@ impl Interpreter {
                     *sym,
                     descriptor,
                 )
+                .map_err(|error| CommittedValueError::JavaScript(error.into()))?
             } else {
                 let k = key
                     .string_name()
                     .expect("non-symbol key has string spelling");
-                self.define_own_property_partial(&mut bag, k, descriptor)?
+                self.define_own_property_partial(&mut bag, k, descriptor)
+                    .map_err(|error| CommittedValueError::JavaScript(error.into()))?
             });
         }
         if target.is_intl() || target.is_iterator() {
             let (bag, descriptor) = self.with_descriptor_anchored(descriptor, |this| {
                 this.ensure_non_gc_exotic_user_props(target)
+                    .map_err(|error| CommittedValueError::JavaScript(error.into()))
             })?;
             let Some(mut bag) = bag else {
                 return Ok(false);
@@ -587,30 +630,25 @@ impl Interpreter {
                     *sym,
                     descriptor,
                 )
+                .map_err(|error| CommittedValueError::JavaScript(error.into()))?
             } else {
                 let k = key
                     .string_name()
                     .expect("non-symbol key has string spelling");
-                self.define_own_property_partial(&mut bag, k, descriptor)?
+                self.define_own_property_partial(&mut bag, k, descriptor)
+                    .map_err(|error| CommittedValueError::JavaScript(error.into()))?
             });
         }
         if let Some(arr) = target.as_array() {
             if let VmPropertyKey::Symbol(sym) = key {
-                // §10.4.2.1 — a symbol accessor descriptor installs a
-                // getter/setter pair; a data descriptor stores the value.
-                if descriptor.is_accessor() {
-                    array::set_symbol_accessor(
-                        arr,
-                        &mut self.gc_heap,
-                        *sym,
-                        descriptor.get,
-                        descriptor.set,
-                    );
-                } else {
-                    let value = descriptor.value.unwrap_or(Value::undefined());
-                    array::set_symbol_property(arr, &mut self.gc_heap, *sym, value);
-                }
-                return Ok(true);
+                return array::define_symbol_property_partial(
+                    &mut { arr },
+                    &mut self.gc_heap,
+                    *sym,
+                    descriptor,
+                )
+                .map_err(VmError::from)
+                .map_err(|error| CommittedValueError::JavaScript(error.into()));
             }
             let Some(k) = key.string_name() else {
                 return Ok(false);
@@ -640,7 +678,9 @@ impl Interpreter {
                         let number_len =
                             crate::coerce::to_number_or_throw(this, stack, context, &v)?;
                         if (new_len as f64) != number_len.as_f64() {
-                            return Err(this.err_range(("Invalid array length".to_string()).into()));
+                            return Err(CommittedValueError::JavaScript(
+                                this.err_range(("Invalid array length".to_string()).into()),
+                            ));
                         }
                         Ok(new_len as usize)
                     })(self);
@@ -657,7 +697,10 @@ impl Interpreter {
                 };
                 let array_value = self.iteration_anchor(array_slot);
                 self.pop_iteration_anchors_to(array_slot);
-                let arr = array_value.as_array().ok_or(VmError::TypeMismatch)?;
+                let arr = array_value
+                    .as_array()
+                    .ok_or(VmError::TypeMismatch)
+                    .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
                 // OrdinaryDefineOwnProperty validation against length's fixed
                 // shape — a non-configurable, non-enumerable data property.
                 if descriptor.is_accessor()
@@ -688,7 +731,8 @@ impl Interpreter {
                         return Ok(new_len == old_len && !want_writable_true);
                     }
                     array::set_length_checked(arr, &mut self.gc_heap, new_len)
-                        .map_err(|_| VmError::TypeMismatch)?;
+                        .map_err(|_| VmError::TypeMismatch)
+                        .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
                     if want_writable_false {
                         array::set_length_writable(arr, &mut self.gc_heap, false);
                     }
@@ -699,16 +743,21 @@ impl Interpreter {
                     return Ok(false);
                 }
                 let delete_ok = array::set_length_checked(arr, &mut self.gc_heap, new_len)
-                    .map_err(|_| VmError::TypeMismatch)?;
+                    .map_err(|_| VmError::TypeMismatch)
+                    .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
                 if want_writable_false {
                     array::set_length_writable(arr, &mut self.gc_heap, false);
                 }
                 return Ok(delete_ok);
             }
             if let Some(idx) = object::array_index_property_name(k) {
-                return self.define_array_index_property(arr, k, idx as usize, descriptor);
+                return self
+                    .define_array_index_property(arr, k, idx as usize, descriptor)
+                    .map_err(|error| CommittedValueError::JavaScript(error.into()));
             }
-            return self.define_array_named_property(arr, k, descriptor);
+            return self
+                .define_array_named_property(arr, k, descriptor)
+                .map_err(|error| CommittedValueError::JavaScript(error.into()));
         }
         if let Some(t) = target.as_typed_array(&self.gc_heap) {
             // §10.4.5.3 Integer-Indexed exotic [[DefineOwnProperty]].
@@ -718,13 +767,15 @@ impl Interpreter {
             if let VmPropertyKey::Symbol(sym) = key {
                 let (mut bag, descriptor) = self.with_descriptor_anchored(descriptor, |this| {
                     crate::property_dispatch::typed_array_ensure_expando_pub(&mut this.gc_heap, &t)
+                        .map_err(|error| CommittedValueError::JavaScript(error.into()))
                 })?;
                 return Ok(object::define_own_symbol_property_partial(
                     &mut bag,
                     &mut self.gc_heap,
                     *sym,
                     descriptor,
-                ));
+                )
+                .map_err(|error| CommittedValueError::JavaScript(error.into()))?);
             }
             let Some(name) = key.string_name() else {
                 return Ok(false);
@@ -755,8 +806,11 @@ impl Interpreter {
             }
             let (mut bag, descriptor) = self.with_descriptor_anchored(descriptor, |this| {
                 crate::property_dispatch::typed_array_ensure_expando_pub(&mut this.gc_heap, &t)
+                    .map_err(|error| CommittedValueError::JavaScript(error.into()))
             })?;
-            return self.define_own_property_partial(&mut bag, name, descriptor);
+            return self
+                .define_own_property_partial(&mut bag, name, descriptor)
+                .map_err(|error| CommittedValueError::JavaScript(error.into()));
         }
         // ArrayBuffer / SharedArrayBuffer and DataView are ordinary
         // objects (no exotic [[DefineOwnProperty]]); own properties live
@@ -764,6 +818,7 @@ impl Interpreter {
         if let Some(b) = target.as_array_buffer() {
             let (mut bag, descriptor) = self.with_descriptor_anchored(descriptor, |this| {
                 crate::property_dispatch::array_buffer_ensure_expando_pub(&mut this.gc_heap, &b)
+                    .map_err(|error| CommittedValueError::JavaScript(error.into()))
             })?;
             return match key {
                 VmPropertyKey::Symbol(sym) => Ok(object::define_own_symbol_property_partial(
@@ -771,9 +826,12 @@ impl Interpreter {
                     &mut self.gc_heap,
                     *sym,
                     descriptor,
-                )),
+                )
+                .map_err(|error| CommittedValueError::JavaScript(error.into()))?),
                 _ => match key.string_name() {
-                    Some(name) => self.define_own_property_partial(&mut bag, name, descriptor),
+                    Some(name) => self
+                        .define_own_property_partial(&mut bag, name, descriptor)
+                        .map_err(|error| CommittedValueError::JavaScript(error.into())),
                     None => Ok(false),
                 },
             };
@@ -781,6 +839,7 @@ impl Interpreter {
         if let Some(dv) = target.as_data_view() {
             let (mut bag, descriptor) = self.with_descriptor_anchored(descriptor, |this| {
                 crate::property_dispatch::data_view_ensure_expando_pub(&mut this.gc_heap, &dv)
+                    .map_err(|error| CommittedValueError::JavaScript(error.into()))
             })?;
             return match key {
                 VmPropertyKey::Symbol(sym) => Ok(object::define_own_symbol_property_partial(
@@ -788,9 +847,12 @@ impl Interpreter {
                     &mut self.gc_heap,
                     *sym,
                     descriptor,
-                )),
+                )
+                .map_err(|error| CommittedValueError::JavaScript(error.into()))?),
                 _ => match key.string_name() {
-                    Some(name) => self.define_own_property_partial(&mut bag, name, descriptor),
+                    Some(name) => self
+                        .define_own_property_partial(&mut bag, name, descriptor)
+                        .map_err(|error| CommittedValueError::JavaScript(error.into())),
                     None => Ok(false),
                 },
             };
@@ -813,7 +875,7 @@ impl Interpreter {
         context: &ExecutionContext,
         target: &mut Value,
         level: ObjectIntegrityLevel,
-    ) -> Result<bool, VmError> {
+    ) -> Result<bool, CommittedValueError> {
         self.with_handle_scope(|interp, scope| {
             let target_handle = interp.scoped_value(scope, *target);
             let result = (|| {
@@ -831,7 +893,8 @@ impl Interpreter {
                     .collect::<Vec<_>>();
                 for key_handle in keys {
                     let key_value = interp.escape_scoped(key_handle);
-                    let key = property_key_value_to_vm_key(interp, &key_value, &interp.gc_heap)?;
+                    let key = property_key_value_to_vm_key(interp, &key_value, &interp.gc_heap)
+                        .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
                     let descriptor = match level {
                         ObjectIntegrityLevel::Sealed => object::PartialPropertyDescriptor {
                             configurable: Some(false),
@@ -840,7 +903,11 @@ impl Interpreter {
                         ObjectIntegrityLevel::Frozen => {
                             let live = interp.escape_scoped(target_handle);
                             let current = interp.ordinary_get_own_property_descriptor_value(
-                                stack, context, live, &key, 0,
+                                stack,
+                                Some(context),
+                                live,
+                                &key,
+                                0,
                             )?;
                             let Some(current) = current else {
                                 continue;
@@ -864,9 +931,11 @@ impl Interpreter {
                     // `[[DefineOwnProperty]]` returns false.
                     let live = interp.escape_scoped(target_handle);
                     if !interp.define_own_property_value(stack, context, &live, &key, descriptor)? {
-                        return Err(interp.err_type(
-                            ("Cannot redefine property during SetIntegrityLevel".to_string())
-                                .into(),
+                        return Err(CommittedValueError::JavaScript(
+                            interp.err_type(
+                                ("Cannot redefine property during SetIntegrityLevel".to_string())
+                                    .into(),
+                            ),
                         ));
                     }
                 }
@@ -889,11 +958,11 @@ impl Interpreter {
         context: &ExecutionContext,
         target: &Value,
         level: ObjectIntegrityLevel,
-    ) -> Result<bool, VmError> {
+    ) -> Result<bool, CommittedValueError> {
         self.with_handle_scope(|interp, scope| {
             let target_handle = interp.scoped_value(scope, *target);
             let live = interp.escape_scoped(target_handle);
-            if interp.is_extensible_value(stack, context, &live)? {
+            if interp.is_extensible_value(stack, Some(context), &live)? {
                 return Ok(false);
             }
             let live = interp.escape_scoped(target_handle);
@@ -904,10 +973,16 @@ impl Interpreter {
                 .collect::<Vec<_>>();
             for key_handle in keys {
                 let key_value = interp.escape_scoped(key_handle);
-                let key = property_key_value_to_vm_key(interp, &key_value, &interp.gc_heap)?;
+                let key = property_key_value_to_vm_key(interp, &key_value, &interp.gc_heap)
+                    .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
                 let live = interp.escape_scoped(target_handle);
-                let desc = interp
-                    .ordinary_get_own_property_descriptor_value(stack, context, live, &key, 0)?;
+                let desc = interp.ordinary_get_own_property_descriptor_value(
+                    stack,
+                    Some(context),
+                    live,
+                    &key,
+                    0,
+                )?;
                 let Some(desc) = desc else {
                     continue;
                 };

@@ -15,7 +15,7 @@ fn live_bytes(interp: &mut Interpreter, tag: u8) -> usize {
 
 #[test]
 fn bound_function_roots_target_this_and_args_when_rooted() {
-    let mut interp = Interpreter::new();
+    let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
     let _runtime_roots = interp.scope_runtime_roots_guard();
     let mut global = *interp.global_this();
     let mut target = Value::undefined();
@@ -42,11 +42,14 @@ fn bound_function_roots_target_this_and_args_when_rooted() {
             .expect("bound function"),
     );
 
-    crate::object::set(
-        &mut global,
-        interp.gc_heap_mut(),
-        "__gc_bound_function",
-        bound,
+    assert!(
+        crate::object::define_own_property_in_place(
+            &mut global,
+            interp.gc_heap_mut(),
+            "__gc_bound_function",
+            crate::object::PropertyDescriptor::data(bound, true, true, true)
+        )
+        .expect("fixture property allocation")
     );
 
     interp.force_gc().expect("force GC");
@@ -64,7 +67,7 @@ fn bound_function_roots_target_this_and_args_when_rooted() {
 
 #[test]
 fn native_function_captures_root_gc_values_when_rooted() {
-    let mut interp = Interpreter::new();
+    let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
     let _runtime_roots = interp.scope_runtime_roots_guard();
     let mut global = *interp.global_this();
     let mut captured = Value::undefined();
@@ -87,11 +90,14 @@ fn native_function_captures_root_gc_values_when_rooted() {
         |_, _, _| Ok(Value::undefined()),
     )
     .expect("native");
-    crate::object::set(
-        &mut global,
-        interp.gc_heap_mut(),
-        "__gc_native_function",
-        native,
+    assert!(
+        crate::object::define_own_property_in_place(
+            &mut global,
+            interp.gc_heap_mut(),
+            "__gc_native_function",
+            crate::object::PropertyDescriptor::data(native, true, true, true)
+        )
+        .expect("fixture property allocation")
     );
 
     interp.force_gc().expect("force GC");
@@ -111,16 +117,19 @@ fn native_function_captures_root_gc_values_when_rooted() {
 
 #[test]
 fn regexp_body_survives_force_gc_when_rooted() {
-    let mut interp = Interpreter::new();
+    let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
     let units: Vec<u16> = "ab+c".encode_utf16().collect();
     let re = crate::JsRegExp::compile(interp.gc_heap_mut(), &units, "i").expect("regexp");
 
     let mut global = *interp.global_this();
-    crate::object::set(
-        &mut global,
-        interp.gc_heap_mut(),
-        "__gc_regexp",
-        Value::regexp(re),
+    assert!(
+        crate::object::define_own_property_in_place(
+            &mut global,
+            interp.gc_heap_mut(),
+            "__gc_regexp",
+            crate::object::PropertyDescriptor::data(Value::regexp(re), true, true, true)
+        )
+        .expect("fixture property allocation")
     );
     let _ = re;
     interp.force_gc().expect("force GC");
@@ -143,7 +152,7 @@ fn regexp_body_survives_force_gc_when_rooted() {
 
 #[test]
 fn bound_native_and_regexp_unrooted_graphs_are_reclaimed() {
-    let mut interp = Interpreter::new();
+    let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
     interp.force_gc().expect("force GC");
     let object_baseline = live_bytes(&mut interp, OBJECT_BODY_TYPE_TAG);
     let bound_baseline = live_bytes(&mut interp, BOUND_FUNCTION_BODY_TYPE_TAG);
@@ -159,11 +168,14 @@ fn bound_native_and_regexp_unrooted_graphs_are_reclaimed() {
         &[Value::object(bound_object)],
     )
     .expect("bound");
-    crate::object::set(
-        &mut bound_object,
-        interp.gc_heap_mut(),
-        "back",
-        Value::bound_function(bound),
+    assert!(
+        crate::object::define_own_property_in_place(
+            &mut bound_object,
+            interp.gc_heap_mut(),
+            "back",
+            crate::object::PropertyDescriptor::data(Value::bound_function(bound), true, true, true)
+        )
+        .expect("fixture property allocation")
     );
 
     let mut native_object =
@@ -175,7 +187,15 @@ fn bound_native_and_regexp_unrooted_graphs_are_reclaimed() {
         |_, _, _| Ok(Value::undefined()),
     )
     .expect("native");
-    crate::object::set(&mut native_object, interp.gc_heap_mut(), "back", native);
+    assert!(
+        crate::object::define_own_property_in_place(
+            &mut native_object,
+            interp.gc_heap_mut(),
+            "back",
+            crate::object::PropertyDescriptor::data(native, true, true, true)
+        )
+        .expect("fixture property allocation")
+    );
 
     let re = crate::JsRegExp::compile(
         interp.gc_heap_mut(),
@@ -185,11 +205,14 @@ fn bound_native_and_regexp_unrooted_graphs_are_reclaimed() {
     .expect("regexp");
     let mut regexp_object =
         crate::test_support::alloc_old_object(interp.gc_heap_mut()).expect("object");
-    crate::object::set(
-        &mut regexp_object,
-        interp.gc_heap_mut(),
-        "regexp",
-        Value::regexp(re),
+    assert!(
+        crate::object::define_own_property_in_place(
+            &mut regexp_object,
+            interp.gc_heap_mut(),
+            "regexp",
+            crate::object::PropertyDescriptor::data(Value::regexp(re), true, true, true)
+        )
+        .expect("fixture property allocation")
     );
 
     let _ = bound_object;

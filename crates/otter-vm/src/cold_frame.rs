@@ -60,7 +60,8 @@ impl ColdFrameIdx {
 /// Cold half of a call frame. Pool-allocated and shared via
 /// [`ColdFrameIdx`].
 ///
-/// Ordinary synchronous frames never allocate this record. Suspension ownership
+/// Ordinary synchronous frames allocate this record only for uncommon work,
+/// including interpreted retraining after deopt. Suspension ownership
 /// (`async_state` / `generator_owner`) lives here with the rest of the uncommon
 /// control-flow state instead of inflating every hot [`crate::Frame`].
 #[derive(Debug, Default, Clone)]
@@ -74,6 +75,9 @@ pub struct ColdFrame {
     /// Loop header that initiated the current native OSR entry. Consumed on
     /// compiled completion before interpreter execution resumes.
     pub osr_origin: Option<u32>,
+    /// Complete-path evidence for this physical activation in the current
+    /// function retraining generation. Recursion owns independent records.
+    pub(crate) tier_retraining: Option<crate::tier_policy::RetrainingActivation>,
     /// Result promise owned by a regular async-function invocation. Return and
     /// uncaught-throw paths settle it instead of writing into a caller window.
     pub async_state: Option<AsyncFrameState>,
@@ -117,7 +121,8 @@ impl ColdFrame {
     /// keeping).
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.async_state.is_none()
+        self.tier_retraining.is_none()
+            && self.async_state.is_none()
             && self.generator_owner.is_none()
             && self.pending_to_primitive.is_none()
             && self.pending_bind_function.is_none()

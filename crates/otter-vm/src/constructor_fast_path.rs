@@ -2,8 +2,8 @@
 //!
 //! This module recognizes bytecode constructors whose whole observable body is
 //! a sequence of own data writes to `this` followed by `return undefined`, and
-//! separately locates exact `this` stores whose transition remains at the
-//! original bytecode operation.
+//! separately recognizes exact `this` stores for receiver capacity and shape
+//! preparation. Executable property feedback owns the generated store path.
 //!
 //! # Contents
 //! - [`SimpleConstructorInit`] — ordered property initializers.
@@ -11,14 +11,16 @@
 //! - [`match_constructor_shape_stores`] — effect-tolerant exact-store matcher.
 //!
 //! # Invariants
-//! - Only base, ordinary, non-eval constructors are eligible.
+//! - Simple pre-shaped initialization admits only base, ordinary, non-eval
+//!   constructors; capacity matching may also recognize derived own stores.
 //! - Every property write must target the `this` value loaded in the same body.
 //! - The fast path preserves the normal prototype lookup before allocation.
 //! - Generated linkage may install the final shape with undefined slots before
 //!   entry only after proving every initializer name absent from the selected
 //!   prototype chain; the body overwrites those slots before any observation.
-//! - Derived and non-simple fields guard the receiver and complete prototype
-//!   chain before publishing a VM-baked transition at the original store.
+//! - Derived and non-simple store names reserve physical receiver capacity.
+//!   Property CacheIR and shared transition probes guard the actual store at
+//!   its original operation; this matcher publishes no generated store plan.
 //!
 //! # See also
 //! - [`crate::call_ops`]
@@ -46,7 +48,6 @@ pub(crate) struct SimpleConstructorField {
 /// `this` value at that exact bytecode operation.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ConstructorShapeStore {
-    pub(crate) byte_pc: u32,
     pub(crate) name: String,
 }
 
@@ -145,14 +146,14 @@ pub(crate) fn match_simple_constructor_init(
     None
 }
 
-/// Locate constructor field-add sites without moving their observable timing.
+/// Recognize own constructor field names without moving observable stores.
 ///
 /// Unlike [`match_simple_constructor_init`], this matcher does not require the
-/// complete body to be side-effect free: generated code applies each hidden
-/// class transition at the original `StoreProperty` after guarding the live
-/// receiver and its full prototype chain. Unknown operations only invalidate
-/// registers they declare as outputs, so an intervening value computation
-/// cannot erase a separately loaded `this` identity.
+/// complete body to be side-effect free: it only supplies receiver capacity
+/// and shape metadata. Ordinary property semantics still commit each store
+/// at its source operation. Unknown operations only invalidate registers they
+/// declare as outputs, so an intervening value computation cannot erase a
+/// separately loaded `this` identity.
 pub(crate) fn match_constructor_shape_stores(
     context: &ExecutionContext,
     function: &CodeBlock,
@@ -162,7 +163,7 @@ pub(crate) fn match_constructor_shape_stores(
     }
     let mut registers = vec![RegisterValue::Unknown; function.register_count as usize];
     let mut stores = Vec::new();
-    for (instruction_index, instr) in function.code.iter().enumerate() {
+    for instr in &function.code {
         let op = function.op(instr);
         match op {
             Op::LoadThis => {
@@ -217,10 +218,8 @@ pub(crate) fn match_constructor_shape_stores(
                     && !stores
                         .iter()
                         .any(|store: &ConstructorShapeStore| store.name == name)
-                    && let Some(byte_pc) = function.instruction_byte_pc(instruction_index)
                 {
                     stores.push(ConstructorShapeStore {
-                        byte_pc,
                         name: name.to_owned(),
                     });
                 }
@@ -276,51 +275,54 @@ mod tests {
     }
 
     fn context_for(code: Vec<Instruction>) -> ExecutionContext {
-        ExecutionContext::from_module(BytecodeModule {
-            module: "<ctor-fast-path-test>".to_string(),
-            template_sites: Vec::new(),
-            source_kind: SourceKind::JavaScript,
-            functions: vec![Function {
-                id: 0,
-                name: "Point".to_string(),
-                span: (0, 0),
-                locals: 2,
-                scratch: 11,
-                param_count: 2,
-                length: 2,
-                scopes: Vec::new(),
-                is_strict: true,
-                is_arrow: false,
-                is_method: false,
-                has_rest: false,
-                is_async: false,
-                is_generator: false,
-                is_async_generator: false,
-                is_derived_constructor: false,
-                is_module: false,
-                needs_arguments: false,
-                uses_arguments_callee: false,
-                arguments_object_kind: ArgumentsObjectKind::Unmapped,
-                mapped_argument_bindings: Vec::new(),
-                source_text_range: None,
-                source_text_span: None,
-                module_url: String::new(),
-                contains_direct_eval: false,
-                code: code.into(),
-                spans: Vec::new(),
-                handlers: Vec::new(),
-                number_hint_sites: Vec::new(),
-                class_hint_sites: Vec::new(),
-            }],
-            constants: vec![
-                string_constant("x"),
-                string_constant("y"),
-                string_constant("tag"),
-            ],
-            module_resolutions: Vec::new(),
-            module_inits: Vec::new(),
-            function_source: None,
-        })
+        ExecutionContext::from_module(
+            BytecodeModule {
+                module: "<ctor-fast-path-test>".to_string(),
+                template_sites: Vec::new(),
+                source_kind: SourceKind::JavaScript,
+                functions: vec![Function {
+                    id: 0,
+                    name: "Point".to_string(),
+                    span: (0, 0),
+                    locals: 2,
+                    scratch: 11,
+                    param_count: 2,
+                    length: 2,
+                    scopes: Vec::new(),
+                    is_strict: true,
+                    is_arrow: false,
+                    is_method: false,
+                    has_rest: false,
+                    is_async: false,
+                    is_generator: false,
+                    is_async_generator: false,
+                    is_derived_constructor: false,
+                    is_module: false,
+                    needs_arguments: false,
+                    uses_arguments_callee: false,
+                    arguments_object_kind: ArgumentsObjectKind::Unmapped,
+                    mapped_argument_bindings: Vec::new(),
+                    source_text_range: None,
+                    source_text_span: None,
+                    module_url: String::new(),
+                    contains_direct_eval: false,
+                    code: code.into(),
+                    spans: Vec::new(),
+                    handlers: Vec::new(),
+                    number_hint_sites: Vec::new(),
+                    class_hint_sites: Vec::new(),
+                }],
+                constants: vec![
+                    string_constant("x"),
+                    string_constant("y"),
+                    string_constant("tag"),
+                ],
+                module_resolutions: Vec::new(),
+                module_inits: Vec::new(),
+                function_source: None,
+            },
+            crate::source_registry::SourceRegistry::default(),
+        )
         .expect("valid bytecode fixture")
     }
 

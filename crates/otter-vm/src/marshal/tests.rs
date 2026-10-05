@@ -1,15 +1,23 @@
-//! Unit tests for the marshalling layer.
+//! Scoped marshalling conversions and exact error-family proofs.
 //!
-//! Each test opens a real interpreter + native context + handle scope
-//! and drives conversions end to end against live GC values. Coercion
-//! paths that re-enter user JS (`valueOf` ladders, custom iterators)
-//! are exercised by the runtime-level integration suites; these tests
-//! cover the context-free conversions, the binary builders, and the
-//! error shapes.
+//! # Contents
+//! - Primitive, collection and binary conversions through a live native scope.
+//! - Rooted prototype mutation, physical GC movement and cap refusal.
+//! - Canonical native error carriers for underlying VM/binary failures.
+//!
+//! # Invariants
+//! - Every test uses a real interpreter and production handle scope.
+//! - Coercions that execute JavaScript are also covered by runtime suites.
+//! - Existing `JsError::Native` preserves the exact native family and message;
+//!   a carrier change must not weaken prototype or allocation assertions.
+//!
+//! # See also
+//! - [`super::MarshalCx`] owns scoped conversions.
+//! - [`crate::native_function::vm_to_native_error`] owns native error mapping.
 
 use crate::binary::typed_array::TypedArrayKind;
 use crate::promise::{JsPromise, PromiseState};
-use crate::{Interpreter, NativeCallInfo, NativeCtx, Value};
+use crate::{Interpreter, NativeCallInfo, NativeCtx, NativeError, Value};
 
 use super::{
     ArrayBuffer, BufferSource, DOMString, FromJs, HostRef, IntoJs, JsError, MarshalCx, Sequence,
@@ -17,7 +25,7 @@ use super::{
 };
 
 fn with_cx<R>(f: impl FnOnce(&mut MarshalCx<'_, '_, '_>) -> R) -> R {
-    let mut interp = Interpreter::new();
+    let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
     NativeCtx::with_host_context(
         &mut interp,
         NativeCallInfo::call(Value::undefined()),
@@ -171,7 +179,11 @@ fn typed_array_from_bytes_rejects_misaligned_length() {
         let err = cx
             .typed_array_from_bytes(TypedArrayKind::Uint32, vec![0u8; 6])
             .unwrap_err();
-        assert!(matches!(err, JsError::Type(_)), "got {err:?}");
+        assert!(
+            matches!(&err, JsError::Native(NativeError::TypeError { name: "marshal", reason })
+                if reason == "byte length 6 is not a multiple of Uint32Array element width 4"),
+            "got {err:?}"
+        );
     });
 }
 
@@ -325,26 +337,55 @@ fn construct_instance_without_registered_class_yields_instance() {
 }
 
 #[test]
-fn js_error_lowering_keeps_kinds() {
-    let native = JsError::Range("too big".to_string()).into_native("Test.op");
-    assert!(matches!(
-        native,
-        crate::NativeError::RangeError {
-            name: "Test.op",
-            ..
-        }
-    ));
-    let native = JsError::Dom {
-        name: "NotSupportedError",
-        message: "no".to_string(),
+fn js_error_lowering_keeps_kinds_and_authored_message_text() {
+    for (error, kind, message) in [
+        (
+            JsError::Type("exact type text".into()),
+            crate::ErrorKind::TypeError,
+            "exact type text",
+        ),
+        (
+            JsError::Range("too big".into()),
+            crate::ErrorKind::RangeError,
+            "too big",
+        ),
+        (
+            JsError::Dom {
+                name: "NotSupportedError",
+                message: "no".into(),
+            },
+            crate::ErrorKind::TypeError,
+            "NotSupportedError: no",
+        ),
+    ] {
+        assert_eq!(
+            error.clone().into_native("Test.op"),
+            crate::NativeError::SpecError {
+                kind,
+                message: message.into(),
+            }
+        );
+        with_cx(|cx| {
+            let value = cx.error_value(error).expect("actual class materialization");
+            let current = cx.escape(value).as_object().expect("actual Error instance");
+            let prototype = cx.ctx().interp_mut().error_classes.prototype(kind);
+            assert!(crate::object::has_in_proto_chain(
+                current,
+                cx.heap(),
+                prototype
+            ));
+            let property = cx.get(value, "message").expect("live message descriptor");
+            assert_eq!(cx.as_string_lossy(property).as_deref(), Some(message));
+        });
     }
-    .into_native("Test.op");
-    match native {
-        crate::NativeError::TypeError { reason, .. } => {
-            assert!(reason.contains("NotSupportedError"));
-        }
-        other => panic!("expected TypeError lowering, got {other:?}"),
-    }
+    let imported = crate::NativeError::RangeError {
+        name: "original native",
+        reason: "original reason".into(),
+    };
+    assert_eq!(
+        JsError::from_native(imported.clone()).into_native("outer boundary"),
+        imported
+    );
 }
 
 #[test]
@@ -361,5 +402,108 @@ fn handles_survive_interleaved_allocations() {
         assert_eq!(cx.as_string_lossy(first).as_deref(), Some("first"));
         let src = BufferSource::from_js(cx, bytes, ValueIdent::Argument(0)).unwrap();
         assert_eq!(src.as_ref(), &[1, 2, 3]);
+    });
+}
+
+#[test]
+fn scoped_prototype_transition_moves_live_receiver_and_keeps_both_handles_current() {
+    struct Funding([u64; 16384]);
+    impl otter_gc::SafeTraceable for Funding {
+        const TYPE_TAG: u8 = 0xe6;
+        fn trace_slots_safe(&mut self, _visitor: &mut otter_gc::raw::SlotVisitor<'_>) {
+            let _ = self.0[0];
+        }
+    }
+    let mut interp = Interpreter::with_string_heap_cap(4 * 1024 * 1024)
+        .expect("capped marshal fixture bootstrap");
+    interp.gc_heap.set_gc_stress(0, false);
+    NativeCtx::with_host_context(&mut interp, NativeCallInfo::default_call(), None, |ctx| {
+        ctx.scope(|scope| {
+            let mut cx = MarshalCx::new(scope);
+            let prototype = cx.object().unwrap();
+            let marker = cx.string("prototype-child").unwrap();
+            cx.define(
+                prototype,
+                "marker",
+                marker,
+                crate::object::PropertyFlags::data_default(),
+            )
+            .unwrap();
+            let receiver = cx.object().unwrap();
+            let receiver_alias = cx.park(cx.escape(receiver));
+            let receiver_before = cx.escape(receiver).as_object().unwrap().offset();
+            let prototype_before = cx.escape(prototype).as_object().unwrap().offset();
+            let marker_before = cx.escape(marker).as_string_gc().unwrap().offset();
+            let before = cx.heap().gc_cycle_counts();
+            cx.heap_mut()
+                .alloc_old(Funding([0; 16384]))
+                .expect("reclaimable transition funding");
+            assert_eq!(
+                cx.heap().gc_cycle_counts(),
+                before,
+                "setup cannot age fresh inputs"
+            );
+            let reserved = cx.heap().max_heap_bytes() - cx.heap().tracked_bytes();
+            cx.heap_mut()
+                .reserve_bytes_no_collect(reserved)
+                .expect("fill effective cap without collection");
+            assert_eq!(cx.heap().gc_cycle_counts(), before);
+            cx.set_prototype(receiver, Some(prototype)).unwrap();
+            cx.heap_mut().release_bytes(reserved);
+            assert!(
+                cx.heap().gc_cycle_counts().1 > before.1,
+                "prototype preparation itself must full-collect"
+            );
+            assert_ne!(
+                cx.escape(receiver).as_object().unwrap().offset(),
+                receiver_before
+            );
+            assert_ne!(
+                cx.escape(prototype).as_object().unwrap().offset(),
+                prototype_before
+            );
+            assert_ne!(
+                cx.escape(marker).as_string_gc().unwrap().offset(),
+                marker_before
+            );
+            assert_eq!(cx.escape(receiver), cx.escape(receiver_alias));
+            let actual =
+                crate::object::prototype_value(cx.escape(receiver).as_object().unwrap(), cx.heap());
+            assert_eq!(actual, Some(cx.escape(prototype)));
+            let inherited = cx.get(receiver, "marker").unwrap();
+            assert_eq!(cx.escape(inherited), cx.escape(marker));
+            assert_eq!(
+                cx.as_string_lossy(inherited).as_deref(),
+                Some("prototype-child")
+            );
+            cx.set_prototype(receiver, None).unwrap();
+            assert_eq!(cx.escape(receiver), cx.escape(receiver_alias));
+            assert_eq!(
+                crate::object::prototype_value(cx.escape(receiver).as_object().unwrap(), cx.heap()),
+                None
+            );
+        })
+    });
+}
+
+#[test]
+fn scoped_prototype_transition_rejects_locked_receiver_without_changing_parent() {
+    with_cx(|cx| {
+        let receiver = cx.object().unwrap();
+        let prototype = cx.object().unwrap();
+        let mut object = cx.escape(receiver).as_object().unwrap();
+        crate::object::prevent_extensions(&mut object, cx.heap_mut()).unwrap();
+        let parent =
+            crate::object::prototype_value(cx.escape(receiver).as_object().unwrap(), cx.heap());
+        let error = cx.set_prototype(receiver, Some(prototype)).unwrap_err();
+        assert!(
+            matches!(&error, JsError::Native(NativeError::TypeError { name: "marshal", reason })
+                if reason == &crate::VmError::TypeMismatch.to_string()),
+            "got {error:?}"
+        );
+        assert_eq!(
+            crate::object::prototype_value(cx.escape(receiver).as_object().unwrap(), cx.heap()),
+            parent
+        );
     });
 }

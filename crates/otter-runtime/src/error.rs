@@ -2,9 +2,10 @@
 //!
 //! [`OtterError`] is the **only** error type the public API
 //! surfaces. It is `#[non_exhaustive]`, derives
-//! [`thiserror::Error`] + [`serde::Serialize`] /
-//! [`serde::Deserialize`], and serializes to the current JSON wire
-//! format.
+//! [`thiserror::Error`] + [`serde::Serialize`], and serializes to the
+//! current JSON wire format. Its diagnostic frames may retain admitted source
+//! handles, so decoding requires the source-accounting boundary rather than
+//! an unaccounted Deserialize implementation.
 //!
 //! # Contents
 //! - [`OtterError`] — top-level error enum.
@@ -17,6 +18,8 @@
 //! # Invariants
 //! - Format changes update every producer, consumer, fixture, and document in
 //!   the same patch.
+//! - Bootstrap allocation errors preserve the actual requested bytes and heap
+//!   cap through the same public out-of-memory variant as execution.
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -24,10 +27,10 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::Diagnostic;
+use crate::{Diagnostic, DiagnosticCode};
 
 /// Public error enum.
-#[derive(Debug, Clone, Error, Serialize, Deserialize)]
+#[derive(Debug, Clone, Error, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum OtterError {
@@ -52,12 +55,12 @@ pub enum OtterError {
         /// Stable reason suitable for programmatic handling.
         reason: RealmError,
     },
-    /// A hosted builtin module's namespace installer failed.
-    #[error("hosted module '{specifier}' failed to install: {message}")]
+    /// A hosted builtin module's registration is invalid.
+    #[error("invalid hosted module '{specifier}': {message}")]
     HostedModule {
         /// Module specifier, for example `otter:kv`.
         specifier: String,
-        /// Installer failure detail.
+        /// Registration failure detail.
         message: String,
     },
     /// Filesystem / module loader error.
@@ -233,11 +236,26 @@ impl From<otter_gc::OutOfMemory> for OtterError {
     }
 }
 
+impl From<otter_vm::JsSurfaceError> for OtterError {
+    fn from(error: otter_vm::JsSurfaceError) -> Self {
+        match error {
+            otter_vm::JsSurfaceError::OutOfMemory(error) => Self::from_gc_oom(error),
+            error => Self::Internal {
+                code: DiagnosticCode::GlobalClassBootstrap.as_str().to_string(),
+                message: error.to_string(),
+            },
+        }
+    }
+}
+
 impl From<otter_vm::BytecodeLinkError> for OtterError {
     fn from(error: otter_vm::BytecodeLinkError) -> Self {
-        Self::Internal {
-            code: "VM_BYTECODE_INVALID".to_string(),
-            message: error.to_string(),
+        match error {
+            otter_vm::BytecodeLinkError::RetainedBytes(error) => Self::Resource { error },
+            error => Self::Internal {
+                code: "VM_BYTECODE_INVALID".to_string(),
+                message: error.to_string(),
+            },
         }
     }
 }
@@ -325,36 +343,34 @@ mod tests {
     }
 
     #[test]
-    fn realm_error_round_trips_with_stable_reason() {
+    fn realm_error_serializes_with_exact_reason() {
         let err = OtterError::Realm {
             reason: RealmError::WrongRuntime,
         };
         let json = err.to_json().unwrap();
         assert!(json.contains("\"kind\":\"realm\""));
         assert!(json.contains("\"reason\":\"wrong_runtime\""));
-        let decoded: ErrorEnvelopeOwned = serde_json::from_str(&json).unwrap();
-        assert!(matches!(
-            decoded.error,
-            OtterError::Realm {
-                reason: RealmError::WrongRuntime
-            }
-        ));
+        let decoded: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded["error"]["kind"], "realm");
+        assert_eq!(decoded["error"]["reason"], "wrong_runtime");
     }
 
     #[test]
-    fn config_invalid_stack_depth_round_trip() {
+    fn config_invalid_stack_depth_serializes_with_exact_fields() {
         let err = OtterError::Config {
             reason: ConfigError::InvalidStackDepth {
                 message: "must be > 0".to_string(),
             },
         };
         let json = err.to_json().unwrap();
-        let de: ErrorEnvelopeOwned = serde_json::from_str(&json).unwrap();
-        assert!(matches!(de.error, OtterError::Config { .. }));
+        let decoded: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded["error"]["kind"], "config");
+        assert_eq!(decoded["error"]["reason"]["kind"], "invalid_stack_depth");
+        assert_eq!(decoded["error"]["reason"]["message"], "must be > 0");
     }
 
     #[test]
-    fn resource_error_round_trips_with_typed_fields() {
+    fn resource_error_serializes_with_exact_typed_fields() {
         let err = OtterError::from(otter_resource::ResourceError::Exhausted {
             class: otter_resource::ResourceClass::Isolates,
             requested: 1,
@@ -365,18 +381,13 @@ mod tests {
         assert!(json.contains("\"kind\":\"resource\""));
         assert!(json.contains("\"reason\":\"exhausted\""));
         assert!(json.contains("\"class\":\"isolates\""));
-        let decoded: ErrorEnvelopeOwned = serde_json::from_str(&json).unwrap();
-        assert!(matches!(
-            decoded.error,
-            OtterError::Resource {
-                error: otter_resource::ResourceError::Exhausted {
-                    class: otter_resource::ResourceClass::Isolates,
-                    requested: 1,
-                    in_use: 2,
-                    limit: 2,
-                }
-            }
-        ));
+        let decoded: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded["error"]["kind"], "resource");
+        assert_eq!(decoded["error"]["error"]["reason"], "exhausted");
+        assert_eq!(decoded["error"]["error"]["class"], "isolates");
+        assert_eq!(decoded["error"]["error"]["requested"], 1);
+        assert_eq!(decoded["error"]["error"]["in_use"], 2);
+        assert_eq!(decoded["error"]["error"]["limit"], 2);
     }
 
     #[test]
@@ -389,11 +400,6 @@ mod tests {
             err,
             OtterError::Internal { ref code, .. } if code == "VM_BYTECODE_INVALID"
         ));
-    }
-
-    #[derive(Debug, Deserialize)]
-    struct ErrorEnvelopeOwned {
-        error: OtterError,
     }
 
     #[test]

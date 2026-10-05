@@ -136,15 +136,15 @@ impl FunctionKindPrototypes {
                 let mut visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
                     function_proto_value.trace_value_slots(visitor);
                 };
-                let root = object::root_for_prototype(heap, function_proto_value.as_object())
-                    .map_err(|_| JsSurfaceError::OutOfMemory)?;
-                object::alloc_object_with_shape_roots(
+                let root = object::root_for_prototype(
                     heap,
-                    root,
-                    crate::object::DEFAULT_INLINE_CAPACITY,
+                    function_proto_value.as_object(),
+                    object::ShapeState::ORDINARY,
                     &mut visit,
                 )
-                .map_err(|_| JsSurfaceError::OutOfMemory)?
+                .map_err(JsSurfaceError::from)?;
+                object::alloc_object_with_shape_roots(heap, root, &mut visit)
+                    .map_err(JsSurfaceError::from)?
             });
             let tag_sym_root = tag_sym;
             let tag_string = {
@@ -153,12 +153,12 @@ impl FunctionKindPrototypes {
                     tag_sym_root.trace_value_slots(visitor);
                 };
                 JsString::from_str_with_roots(tag, heap, &mut visit)
-                    .map_err(|_| JsSurfaceError::OutOfMemory)?
+                    .map_err(JsSurfaceError::from)?
             };
             let mut proto = proto_root
                 .as_object()
                 .expect("function-kind prototype stays rooted after tag allocation");
-            object::define_own_symbol_property_partial(
+            if !object::define_own_symbol_property_partial(
                 &mut proto,
                 heap,
                 tag_sym_root,
@@ -169,7 +169,9 @@ impl FunctionKindPrototypes {
                     configurable: Some(true),
                     ..Default::default()
                 },
-            );
+            )? {
+                return Err(JsSurfaceError::DefinePropertyFailed("[[SymbolProperty]]"));
+            };
 
             ctor_root = Value::object({
                 let mut visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
@@ -177,20 +179,12 @@ impl FunctionKindPrototypes {
                     proto_root.trace_value_slots(visitor);
                 };
                 let root = object::shape_body::null_root(heap);
-                object::alloc_object_with_shape_roots(
-                    heap,
-                    root,
-                    crate::object::DEFAULT_INLINE_CAPACITY,
-                    &mut visit,
-                )
-                .map_err(|_| JsSurfaceError::OutOfMemory)?
+                object::alloc_object_with_shape_roots(heap, root, &mut visit)
+                    .map_err(JsSurfaceError::from)?
             });
             let mut ctor = ctor_root
                 .as_object()
                 .expect("function-kind constructor stays rooted");
-            let mut proto = proto_root
-                .as_object()
-                .expect("function-kind prototype stays rooted");
             // §27.4.2 / §27.3.2 / §27.7.2 — the constructor's
             // [[Prototype]] is %Function% itself (these are Function
             // subclasses), falling back to %Function.prototype% in a
@@ -199,25 +193,40 @@ impl FunctionKindPrototypes {
                 let function_proto = function_proto_value
                     .as_object()
                     .expect("Function.prototype stays rooted");
-                object::set_prototype(ctor, heap, Some(function_proto));
+                if !object::set_prototype(&mut ctor, heap, Some(function_proto))? {
+                    return Err(JsSurfaceError::DefinePropertyFailed(
+                        "function-kind [[Prototype]]",
+                    ));
+                }
             } else {
-                object::set_prototype_value(ctor, heap, Some(function_ctor_value));
+                if !object::set_prototype_value(&mut ctor, heap, Some(function_ctor_value))? {
+                    return Err(JsSurfaceError::DefinePropertyFailed(
+                        "function-kind [[Prototype]]",
+                    ));
+                }
             }
-            object::define_own_property_in_place(
+            if !object::define_own_property_in_place(
                 &mut ctor,
                 heap,
                 "prototype",
                 object::PropertyDescriptor::data(proto_root, false, false, false),
-            );
+            )? {
+                return Err(JsSurfaceError::DefinePropertyFailed("[[BuiltinProperty]]"));
+            };
             ctor_root = Value::object(ctor);
+            let mut proto = proto_root
+                .as_object()
+                .expect("function-kind prototype after constructor publication");
             // §27.3.3.1 / §27.4.3.1 / §27.7.3.1 — { [[Writable]]:
             // false, [[Enumerable]]: false, [[Configurable]]: true }.
-            object::define_own_property_in_place(
+            if !object::define_own_property_in_place(
                 &mut proto,
                 heap,
                 "constructor",
                 object::PropertyDescriptor::data(ctor_root, false, false, true),
-            );
+            )? {
+                return Err(JsSurfaceError::DefinePropertyFailed("[[BuiltinProperty]]"));
+            };
             proto_root = Value::object(proto);
             native_root = Value::native_function({
                 let mut visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
@@ -226,7 +235,7 @@ impl FunctionKindPrototypes {
                     proto_root.trace_value_slots(visitor);
                 };
                 NativeFunction::new_constructor_static_with_roots(heap, tag, 1, call, &mut visit)
-                    .map_err(|_| JsSurfaceError::OutOfMemory)?
+                    .map_err(JsSurfaceError::from)?
             });
             ctor = ctor_root
                 .as_object()
@@ -243,24 +252,28 @@ impl FunctionKindPrototypes {
                     proto_root.trace_value_slots(visitor);
                 };
                 JsString::from_str_with_roots(tag, heap, &mut visit)
-                    .map_err(|_| JsSurfaceError::OutOfMemory)?
+                    .map_err(JsSurfaceError::from)?
             });
             ctor = ctor_root
                 .as_object()
                 .expect("function-kind constructor stays rooted after name allocation");
-            object::define_own_property_in_place(
+            if !object::define_own_property_in_place(
                 &mut ctor,
                 heap,
                 "length",
                 object::PropertyDescriptor::data(Value::number_i32(1), false, false, true),
-            );
+            )? {
+                return Err(JsSurfaceError::DefinePropertyFailed("[[BuiltinProperty]]"));
+            };
             ctor_root = Value::object(ctor);
-            object::define_own_property_in_place(
+            if !object::define_own_property_in_place(
                 &mut ctor,
                 heap,
                 "name",
                 object::PropertyDescriptor::data(name_root, false, false, true),
-            );
+            )? {
+                return Err(JsSurfaceError::DefinePropertyFailed("[[BuiltinProperty]]"));
+            };
             ctor_root = Value::object(ctor);
             Ok((
                 ctor_root
@@ -352,9 +365,11 @@ impl FunctionKindPrototypes {
 }
 
 impl Interpreter {
-    pub(crate) fn install_function_kind_prototypes_post_bootstrap(&mut self) {
+    pub(crate) fn install_function_kind_prototypes_post_bootstrap(
+        &mut self,
+    ) -> Result<(), JsSurfaceError> {
         let Some(function_proto) = self.function_prototype_object().ok() else {
-            return;
+            return Ok(());
         };
         let function_ctor = object::get(*self.global_this(), &self.gc_heap, "Function")
             .filter(|v| v.is_object_type());
@@ -363,9 +378,9 @@ impl Interpreter {
             function_proto,
             function_ctor,
             &self.well_known_symbols,
-        )
-        .expect("function-kind prototypes fit within any positive cap");
-        self.install_shared_generator_object_prototypes();
+        )?;
+        self.install_shared_generator_object_prototypes()?;
+        Ok(())
     }
 
     /// §27.5.1 `%GeneratorPrototype%` / §27.6.1 `%AsyncGeneratorPrototype%`:
@@ -374,7 +389,7 @@ impl Interpreter {
     /// enumerable: false, configurable: true) with a back-pointing
     /// `constructor` and the kind's `@@toStringTag`. Every generator
     /// function's own `.prototype` object inherits from it.
-    fn install_shared_generator_object_prototypes(&mut self) {
+    fn install_shared_generator_object_prototypes(&mut self) -> Result<(), JsSurfaceError> {
         use crate::intrinsics::iterator as iter_natives;
         let mut iterator_parent_root = self
             .constructor_prototype_value("Iterator")
@@ -407,9 +422,7 @@ impl Interpreter {
         // §27.1.3 %AsyncIteratorPrototype% — `[[Prototype]]` is
         // %Object.prototype%; carries `@@asyncIterator` returning the
         // receiver. %AsyncGeneratorPrototype% inherits from it.
-        if let Some(proto) = self.build_async_iterator_prototype() {
-            async_iterator_parent_root = Value::object(proto);
-        }
+        async_iterator_parent_root = Value::object(self.build_async_iterator_prototype()?);
         type Methods = [(&'static str, crate::native_function::NativeFastFn); 3];
         let sync_methods: Methods = [
             ("next", iter_natives::generator_proto_next),
@@ -451,35 +464,32 @@ impl Interpreter {
                 iteration_roots.add_value(&mut parent_value);
                 iteration_roots.add_value(&mut shared_value);
             }
-            let Ok(shared) = self.object_root(parent_value.as_object()).and_then(|root| {
-                let mut visit = |_visitor: &mut dyn FnMut(*mut RawGc)| {};
-                object::alloc_object_with_shape_roots(
-                    &mut self.gc_heap,
-                    root,
+            let shared = self
+                .object_root(
+                    parent_value.as_object(),
                     crate::object::DEFAULT_INLINE_CAPACITY,
-                    &mut visit,
+                    object::ShapeState::ORDINARY,
                 )
-            }) else {
-                continue;
-            };
+                .and_then(|root| {
+                    let mut visit = |_visitor: &mut dyn FnMut(*mut RawGc)| {};
+                    object::alloc_object_with_shape_roots(&mut self.gc_heap, root, &mut visit)
+                })?;
             shared_value = Value::object(shared);
             // §27.5.1.2-5 / §27.6.1.2-4 — own `next` / `return` /
             // `throw`, each with `length = 1`, { [[Writable]]: true,
             // [[Enumerable]]: false, [[Configurable]]: true }.
             for (name, call) in methods {
-                let Ok(native) = crate::intrinsics::shared::native_static_with_value_roots(
+                let native = crate::intrinsics::shared::native_static_with_value_roots(
                     &mut self.gc_heap,
                     name,
                     1,
                     call,
                     &[],
-                ) else {
-                    continue;
-                };
+                )?;
                 let shared = shared_value
                     .as_object()
                     .expect("shared generator prototype stays rooted");
-                object::define_own_property(
+                if !object::define_own_property(
                     shared,
                     &mut self.gc_heap,
                     name,
@@ -489,15 +499,15 @@ impl Interpreter {
                         false,
                         true,
                     ),
-                );
+                )? {
+                    return Err(JsSurfaceError::DefinePropertyFailed("[[BuiltinProperty]]"));
+                };
             }
-            let Ok(tag_string) = JsString::from_str(tag, &mut self.gc_heap) else {
-                continue;
-            };
+            let tag_string = JsString::from_str(tag, &mut self.gc_heap)?;
             let mut shared = shared_value
                 .as_object()
                 .expect("shared generator prototype stays rooted");
-            object::define_own_symbol_property_partial(
+            if !object::define_own_symbol_property_partial(
                 &mut shared,
                 &mut self.gc_heap,
                 tag_sym,
@@ -508,22 +518,28 @@ impl Interpreter {
                     configurable: Some(true),
                     ..Default::default()
                 },
-            );
-            object::define_own_property(
+            )? {
+                return Err(JsSurfaceError::DefinePropertyFailed("[[SymbolProperty]]"));
+            };
+            if !object::define_own_property(
                 shared,
                 &mut self.gc_heap,
                 "constructor",
                 object::PropertyDescriptor::data(kind_value, false, false, true),
-            );
+            )? {
+                return Err(JsSurfaceError::DefinePropertyFailed("[[BuiltinProperty]]"));
+            };
             let kind_proto = kind_value
                 .as_object()
                 .expect("function-kind prototype stays rooted");
-            object::define_own_property(
+            if !object::define_own_property(
                 kind_proto,
                 &mut self.gc_heap,
                 "prototype",
                 object::PropertyDescriptor::data(shared_value, false, false, true),
-            );
+            )? {
+                return Err(JsSurfaceError::DefinePropertyFailed("[[BuiltinProperty]]"));
+            };
             if index == 0 {
                 sync_shared_root = shared_value;
             } else {
@@ -533,11 +549,12 @@ impl Interpreter {
         self.function_kind_prototypes.generator_object_prototype = sync_shared_root.as_object();
         self.function_kind_prototypes
             .async_generator_object_prototype = async_shared_root.as_object();
+        Ok(())
     }
 
     /// §27.1.3 — allocate `%AsyncIteratorPrototype%` with its
     /// `@@asyncIterator` self-returner.
-    fn build_async_iterator_prototype(&mut self) -> Option<JsObject> {
+    fn build_async_iterator_prototype(&mut self) -> Result<JsObject, JsSurfaceError> {
         let mut object_proto_root = self
             .object_prototype_object_opt()
             .map(Value::object)
@@ -552,29 +569,27 @@ impl Interpreter {
             roots.add_value(&mut native_root);
         }
         proto_root = Value::object({
-            let root = self.object_root(object_proto_root.as_object()).ok()?;
-            let mut visit = |_visitor: &mut dyn FnMut(*mut RawGc)| {};
-            object::alloc_object_with_shape_roots(
-                &mut self.gc_heap,
-                root,
+            let root = self.object_root(
+                object_proto_root.as_object(),
                 crate::object::DEFAULT_INLINE_CAPACITY,
-                &mut visit,
-            )
-            .ok()?
+                object::ShapeState::ORDINARY,
+            )?;
+            let mut visit = |_visitor: &mut dyn FnMut(*mut RawGc)| {};
+            object::alloc_object_with_shape_roots(&mut self.gc_heap, root, &mut visit)?
         });
-        native_root = Value::native_function(
-            crate::intrinsics::shared::native_static_with_value_roots(
+        native_root =
+            Value::native_function(crate::intrinsics::shared::native_static_with_value_roots(
                 &mut self.gc_heap,
                 "[Symbol.asyncIterator]",
                 0,
                 crate::intrinsics::iterator::async_iterator_proto_symbol_async_iterator,
                 &[&proto_root],
-            )
-            .ok()?,
-        );
+            )?);
         let async_iter_sym = self.well_known_symbols.get(WellKnown::AsyncIterator);
-        let mut proto = proto_root.as_object()?;
-        object::define_own_symbol_property_partial(
+        let mut proto = proto_root
+            .as_object()
+            .expect("rooted async iterator prototype");
+        if !object::define_own_symbol_property_partial(
             &mut proto,
             &mut self.gc_heap,
             async_iter_sym,
@@ -585,8 +600,12 @@ impl Interpreter {
                 configurable: Some(true),
                 ..Default::default()
             },
-        );
-        proto_root.as_object()
+        )? {
+            return Err(JsSurfaceError::DefinePropertyFailed("[[SymbolProperty]]"));
+        };
+        Ok(proto_root
+            .as_object()
+            .expect("rooted async iterator prototype"))
     }
 
     /// Shared `%GeneratorPrototype%` / `%AsyncGeneratorPrototype%` for

@@ -154,8 +154,7 @@ fn parse_instant_arg(
                 reason: "missing execution context".to_string(),
             })?;
         let coerced = ctx.with_turn_parts(|interp, stack| interp.coerce_to_string(stack, &exec, v));
-        let s = coerced
-            .map_err(|e| crate::native_function::vm_to_native_error(ctx.cx.interp, e, CLASS))?;
+        let s = coerced.map_err(|e| e.into_native(ctx.cx.interp, CLASS))?;
         return temporal_rs::Instant::from_utf8(s.as_bytes()).map_err(|e| temporal_err(e, CLASS));
     }
     Err(NativeError::TypeError {

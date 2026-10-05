@@ -2,14 +2,14 @@
 //!
 //! Native parsers and marshallers often see the same record signature many
 //! times: one record-kind atom followed by the same ordered property atoms.
-//! This module bridges opaque host atoms to the isolate's property atoms once
-//! and retains the resulting complete [`ObjectLayout`].
+//! This module retains complete [`ObjectLayout`] tokens keyed by the ordered
+//! host atom identities and the owning realm's root shape.
 //!
 //! # Contents
-//! - [`ObjectLayoutCache`] — host-atom bridge and signature-to-layout table.
+//! - [`ObjectLayoutCache`] — signature-to-layout table.
 //!
 //! # Invariants
-//! - Every cached VM atom was minted by the owning isolate's `NameInterner`.
+//! - Every cached shape belongs to the owning isolate and enters its root walk.
 //! - Property order is part of the signature; tag identity partitions records
 //!   that happen to expose the same keys, and the root shape of the realm's
 //!   `%Object.prototype%` — which a layout's shape fixes — partitions realms.
@@ -22,7 +22,6 @@
 
 use crate::handles::ObjectLayout;
 use crate::host_strings::{HostAtom, HostAtomId};
-use crate::property_atom::{AtomId, NameInterner};
 use rustc_hash::FxHashMap;
 
 #[derive(Debug)]
@@ -35,7 +34,6 @@ struct LayoutEntry {
 /// Derived, non-GC layout state owned by one interpreter.
 #[derive(Debug, Default)]
 pub(crate) struct ObjectLayoutCache {
-    host_atoms: FxHashMap<HostAtomId, AtomId>,
     layouts: FxHashMap<HostAtomId, Vec<LayoutEntry>>,
 }
 
@@ -46,16 +44,6 @@ impl ObjectLayoutCache {
         self.layouts
             .values()
             .flat_map(|entries| entries.iter().map(|entry| entry.layout.shape_id()))
-    }
-
-    /// Translate a host atom into this isolate's permanent property atom.
-    pub(crate) fn atom_id(&mut self, names: &NameInterner, atom: &HostAtom) -> AtomId {
-        if let Some(id) = self.host_atoms.get(&atom.id()) {
-            return *id;
-        }
-        let id = names.intern(atom.as_str());
-        self.host_atoms.insert(atom.id(), id);
-        id
     }
 
     /// Return the complete layout for `tag + keys`, if already learned.

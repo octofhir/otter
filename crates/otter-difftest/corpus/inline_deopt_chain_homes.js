@@ -1,6 +1,6 @@
 // A three-frame inline chain deoptimizes inside its innermost body. One
-// register dump rebuilds every frame at once, so a caller's value and a
-// callee's value must never share a machine home: here the middle frame's
+// canonical-home recipe rebuilds every frame at once, so live caller and
+// callee values must never share a home: here the middle frame's
 // receiver stays live across the spliced inner call, whose own receiver load
 // is the natural next tenant of that register.
 

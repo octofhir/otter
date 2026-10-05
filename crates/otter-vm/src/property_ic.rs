@@ -14,9 +14,15 @@
 //! # Invariants
 //! - ICs are performance hints only; every miss falls back to ordinary
 //!   ECMAScript property semantics.
-//! - Proxies, accessors, symbols, computed keys, dictionary-compatible
-//!   objects are not cached. Ordinary inherited data uses a chain validity cell.
+//! - An attempted site without an attached program is distinct from an
+//!   unexecuted site; compiler admission never infers execution from IC size.
+//! - Proxies, accessors, symbols, computed keys, dictionary
+//!   objects and opaque lookup state are not cached. Ordinary inherited data
+//!   uses a chain validity cell.
 //! - Cache guards include both shape identity and atom id.
+//! - Native snapshots require resident shapes (provisional constructor
+//!   lineages included) before selecting immutable inline or suffix fields.
+//!   Dictionary-only ids cannot stand in for layouts.
 //! - PIC capacity is derived from the checked-in tier census. A new shape that
 //!   cannot fit transitions directly to [`PropertyIcEntry::Megamorphic`];
 //!   there is no independent guard-miss budget or re-probation state.
@@ -100,9 +106,12 @@ impl PropertyIcStats {
 /// Per-site polymorphic inline cache state.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub(crate) enum PropertyIcEntry<T> {
-    /// Site has not installed any IC yet.
+    /// Site has never reached property semantic dispatch.
     #[default]
     Empty,
+    /// Site reached semantic dispatch but has no representable cache program.
+    /// A later cacheable receiver may still attach a program.
+    Uncacheable,
     /// Site holds the profiled guarded program population in install order.
     Polymorphic {
         /// Cached IC records, in install order. Capped at
@@ -115,6 +124,23 @@ pub(crate) enum PropertyIcEntry<T> {
 }
 
 impl<T> PropertyIcEntry<T> {
+    /// Record semantic dispatch before receiver classification or user code.
+    /// Returns whether this was the site's first attempt.
+    pub(crate) fn record_attempt(&mut self) -> bool {
+        if matches!(self, Self::Empty) {
+            *self = Self::Uncacheable;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Whether property semantic dispatch has been attempted at this site.
+    #[must_use]
+    pub(crate) const fn attempted(&self) -> bool {
+        !matches!(self, Self::Empty)
+    }
+
     /// `true` when this site currently holds at least one PIC entry.
     #[must_use]
     #[cfg(test)]
@@ -128,22 +154,23 @@ impl<T> PropertyIcEntry<T> {
         matches!(self, Self::Megamorphic)
     }
 
-    /// Number of installed PIC entries (0 for `Empty` / `Megamorphic`).
+    /// Number of installed PIC entries (zero for cold, uncacheable and
+    /// megamorphic sites).
     #[must_use]
     pub(crate) fn entry_count(&self) -> usize {
         match self {
             Self::Polymorphic { entries, .. } => entries.len(),
-            Self::Empty | Self::Megamorphic => 0,
+            Self::Empty | Self::Uncacheable | Self::Megamorphic => 0,
         }
     }
 
     /// Borrow the cached PIC entries in install order. Empty slice for
-    /// `Empty` / `Megamorphic` sites.
+    /// cold, uncacheable and megamorphic sites.
     #[must_use]
     pub(crate) fn entries(&self) -> &[T] {
         match self {
             Self::Polymorphic { entries, .. } => entries.as_slice(),
-            Self::Empty | Self::Megamorphic => &[],
+            Self::Empty | Self::Uncacheable | Self::Megamorphic => &[],
         }
     }
 
@@ -153,7 +180,7 @@ impl<T> PropertyIcEntry<T> {
     pub(crate) fn install(&mut self, ic: T) {
         match self {
             Self::Megamorphic => {}
-            Self::Empty => {
+            Self::Empty | Self::Uncacheable => {
                 let mut entries = SmallVec::new();
                 entries.push(ic);
                 *self = Self::Polymorphic { entries };
@@ -256,6 +283,93 @@ mod tests {
         AtomizedPropertyKey::new(PropertyAtom::new(AtomId::from_global(7)), name)
     }
 
+    /// Actual shaped append, rather than raw construction's dictionary store.
+    /// Build the actual immutable append; the dictionary-only test helper
+    /// intentionally cannot supply this ordinary IC premise.
+    fn shaped_data_fixture(
+        object: object::JsObject,
+        heap: &mut otter_gc::GcHeap,
+        name: &str,
+        value: Value,
+    ) {
+        let atom = match name {
+            "own" => 6,
+            "x" => 7,
+            "y" => 8,
+            "z" => 9,
+            _ => panic!("fixture atom name"),
+        };
+        object::append_shaped_data_for_fixture(
+            object,
+            heap,
+            AtomizedPropertyKey::new(PropertyAtom::new(AtomId::from_global(atom)), name),
+            value,
+        );
+    }
+
+    /// Install the real mapped-arguments lookup producer on an existing old
+    /// fixture object. Its context is rooted by the production installer while
+    /// sidecar/state preparation allocates; no raw header latch is fabricated.
+    fn install_mapped_lookup(obj: &mut object::JsObject, heap: &mut otter_gc::GcHeap) {
+        // SAFETY: the heap and its handle stack outlive this fixture call;
+        // the scoped receiver cannot escape and is read after allocation.
+        let scope = unsafe { otter_gc::HandleScope::from_ptr(heap.handle_stack_ptr()) };
+        let receiver = scope.local(*obj);
+        let context = crate::context::alloc_context_with_roots(
+            heap,
+            crate::context::ContextShape {
+                scope_function_id: 0,
+                scope_index: 0,
+                slot_count: 1,
+                has_extension: false,
+            },
+            Value::undefined(),
+            |_| false,
+            &mut |_| {},
+        )
+        .expect("mapped parameter context");
+        assert!(crate::context::write_slot(
+            heap,
+            context,
+            0,
+            Value::boolean(true)
+        ));
+        *obj = receiver.get();
+        object::install_mapped_arguments(
+            obj,
+            heap,
+            object::MappedArguments {
+                context,
+                entries: vec![object::MappedArgumentEntry {
+                    key: "virtual".into(),
+                    slot: 0,
+                }],
+            },
+        )
+        .expect("actual mapped lookup installation");
+        assert!(object::state(*obj, heap).is_opaque());
+        assert_ne!(
+            object::state(*obj, heap).bits() & object::ShapeState::MAPPED_ARGUMENTS_MASK,
+            0
+        );
+    }
+
+    #[test]
+    fn attempted_uncacheable_site_is_distinct_from_cold_and_can_later_attach() {
+        let mut entry = PropertyIcEntry::Empty;
+        assert!(!entry.attempted());
+        assert!(entry.record_attempt());
+        assert!(matches!(entry, PropertyIcEntry::Uncacheable));
+        assert!(entry.attempted());
+        assert_eq!(entry.entry_count(), 0);
+        assert!(!entry.record_attempt());
+
+        entry.install(7_u8);
+        assert_eq!(entry.entries(), &[7]);
+        assert!(entry.attempted());
+        assert!(!entry.record_attempt());
+    }
+
     #[test]
     fn pic_grows_until_capacity_then_transitions_to_megamorphic() {
         let mut entry = PropertyIcEntry::Empty;
@@ -339,13 +453,22 @@ mod tests {
     }
 
     #[test]
-    fn direct_prototype_load_ic_rejects_dictionary_compatible_prototype() {
+    fn direct_prototype_load_ic_rejects_dictionary_prototype() {
         let mut heap = fresh_heap();
+        // SAFETY: this scope belongs to the stationary heap and ends before
+        // it; every old fixture cell stays traced through collecting metadata.
+        let fixture_roots = unsafe { otter_gc::HandleScope::from_ptr(heap.handle_stack_ptr()) };
         let mut proto = object::alloc_object_old_for_fixture(&mut heap).unwrap();
-        object::set(&mut proto, &mut heap, "x", Value::boolean(true));
-        object::set(&mut proto, &mut heap, "y", Value::null());
-        let receiver = object::alloc_object_old_for_fixture(&mut heap).unwrap();
-        object::set_prototype(receiver, &mut heap, Some(proto));
+        let _proto_root = fixture_roots.local(proto);
+        shaped_data_fixture(proto, &mut heap, "x", Value::boolean(true));
+        shaped_data_fixture(proto, &mut heap, "y", Value::null());
+        shaped_data_fixture(proto, &mut heap, "z", Value::null());
+        let mut receiver = object::alloc_object_old_for_fixture(&mut heap).unwrap();
+        let _receiver_root = fixture_roots.local(receiver);
+        assert!(
+            object::set_prototype(&mut receiver, &mut heap, Some(proto))
+                .expect("fixture prototype transition")
+        );
         let resolved =
             crate::cache_ir::resolve_atom_data_slot(receiver, &heap, key("x")).expect("load ic");
         let ic = crate::cache_ir::CacheStub::from_resolved_load(
@@ -354,19 +477,36 @@ mod tests {
         );
         assert_eq!(resolved.value, Value::boolean(true));
 
-        assert!(object::delete(proto, &mut heap, "y"));
+        assert!(object::delete(&mut proto, &mut heap, "y").expect("non-final property deletion"));
+        assert!(
+            object::is_dictionary(proto, &heap),
+            "actual dictionary holder"
+        );
+        assert_eq!(
+            object::get_own(proto, &heap, "x"),
+            Some(Value::boolean(true))
+        );
 
         assert_eq!(ic.run_load(receiver, &heap, key("x")), None);
     }
 
     #[test]
-    fn direct_prototype_store_transition_rejects_dictionary_compatible_prototype() {
+    fn direct_prototype_store_transition_rejects_dictionary_prototype() {
         let mut heap = fresh_heap();
+        // SAFETY: this scope belongs to the stationary heap and ends before
+        // it; every old fixture cell stays traced through collecting metadata.
+        let fixture_roots = unsafe { otter_gc::HandleScope::from_ptr(heap.handle_stack_ptr()) };
         let mut proto = object::alloc_object_old_for_fixture(&mut heap).unwrap();
-        object::set(&mut proto, &mut heap, "x", Value::boolean(true));
-        object::set(&mut proto, &mut heap, "y", Value::null());
-        let first = object::alloc_object_old_for_fixture(&mut heap).unwrap();
-        object::set_prototype(first, &mut heap, Some(proto));
+        let _proto_root = fixture_roots.local(proto);
+        shaped_data_fixture(proto, &mut heap, "x", Value::boolean(true));
+        shaped_data_fixture(proto, &mut heap, "y", Value::null());
+        shaped_data_fixture(proto, &mut heap, "z", Value::null());
+        let mut first = object::alloc_object_old_for_fixture(&mut heap).unwrap();
+        let _first_root = fixture_roots.local(first);
+        assert!(
+            object::set_prototype(&mut first, &mut heap, Some(proto))
+                .expect("fixture prototype transition")
+        );
         let transition = object::capture_store_property_transition(
             first,
             &mut heap,
@@ -375,10 +515,22 @@ mod tests {
         )
         .expect("store transition");
         let ic = crate::cache_ir::CacheStub::store_transition(transition);
-        let second = object::alloc_object_old_for_fixture(&mut heap).unwrap();
-        object::set_prototype(second, &mut heap, Some(proto));
+        let mut second = object::alloc_object_old_for_fixture(&mut heap).unwrap();
+        let _second_root = fixture_roots.local(second);
+        assert!(
+            object::set_prototype(&mut second, &mut heap, Some(proto))
+                .expect("fixture prototype transition")
+        );
 
-        assert!(object::delete(proto, &mut heap, "y"));
+        assert!(object::delete(&mut proto, &mut heap, "y").expect("non-final property deletion"));
+        assert!(
+            object::is_dictionary(proto, &heap),
+            "actual dictionary holder"
+        );
+        assert_eq!(
+            object::get_own(proto, &heap, "x"),
+            Some(Value::boolean(true))
+        );
 
         assert_eq!(
             ic.run_store(second, &mut heap, key("x"), &Value::null())
@@ -391,22 +543,38 @@ mod tests {
     #[test]
     fn deep_prototype_proof_is_shared_and_retires_on_shadowing() {
         let mut heap = fresh_heap();
-        let mut holder = object::alloc_object_old_for_fixture(&mut heap).unwrap();
-        object::set(&mut holder, &mut heap, "x", Value::boolean(true));
+        // SAFETY: this scope belongs to the stationary heap and ends before
+        // it; every old fixture cell stays traced through collecting metadata.
+        let fixture_roots = unsafe { otter_gc::HandleScope::from_ptr(heap.handle_stack_ptr()) };
+        let holder = object::alloc_object_old_for_fixture(&mut heap).unwrap();
+        let _holder_root = fixture_roots.local(holder);
+        shaped_data_fixture(holder, &mut heap, "x", Value::boolean(true));
         let mut first = holder;
         let mut middle = holder;
         for depth in 0..12 {
-            let next = object::alloc_object_old_for_fixture(&mut heap).unwrap();
-            object::set_prototype(next, &mut heap, Some(first));
+            let mut next = object::alloc_object_old_for_fixture(&mut heap).unwrap();
+            let _next_root = fixture_roots.local(next);
+            assert!(
+                object::set_prototype(&mut next, &mut heap, Some(first))
+                    .expect("fixture prototype transition")
+            );
             first = next;
             if depth == 5 {
                 middle = next;
             }
         }
-        let receiver = object::alloc_object_old_for_fixture(&mut heap).unwrap();
-        let sibling = object::alloc_object_old_for_fixture(&mut heap).unwrap();
-        object::set_prototype(receiver, &mut heap, Some(first));
-        object::set_prototype(sibling, &mut heap, Some(first));
+        let mut receiver = object::alloc_object_old_for_fixture(&mut heap).unwrap();
+        let _receiver_root = fixture_roots.local(receiver);
+        let mut sibling = object::alloc_object_old_for_fixture(&mut heap).unwrap();
+        let _sibling_root = fixture_roots.local(sibling);
+        assert!(
+            object::set_prototype(&mut receiver, &mut heap, Some(first))
+                .expect("fixture prototype transition")
+        );
+        assert!(
+            object::set_prototype(&mut sibling, &mut heap, Some(first))
+                .expect("fixture prototype transition")
+        );
         let resolved = crate::cache_ir::resolve_atom_data_slot(receiver, &heap, key("x")).unwrap();
         let shared = crate::cache_ir::resolve_atom_data_slot(sibling, &heap, key("x")).unwrap();
         let old = resolved.validity.as_ref().unwrap();
@@ -422,7 +590,15 @@ mod tests {
             ic.run_load(receiver, &heap, key("x")),
             Some(Value::boolean(true))
         );
-        object::set(&mut middle, &mut heap, "x", Value::boolean(false));
+        assert!(
+            object::define_own_property_in_place(
+                &mut middle,
+                &mut heap,
+                "x",
+                crate::object::PropertyDescriptor::data(Value::boolean(false), true, true, true)
+            )
+            .expect("fixture property allocation")
+        );
         assert!(!old.is_valid());
         assert_eq!(ic.run_load(receiver, &heap, key("x")), None);
         // The proof can be rebuilt even when the mutated link has dictionary storage.
@@ -438,33 +614,71 @@ mod tests {
     #[test]
     fn prototype_mutations_retire_dependents_but_preserve_unrelated_chains() {
         let mut heap = fresh_heap();
+        // SAFETY: this scope belongs to the stationary heap and ends before
+        // it; every old fixture cell stays traced through collecting metadata.
+        let fixture_roots = unsafe { otter_gc::HandleScope::from_ptr(heap.handle_stack_ptr()) };
         let mut prototype = object::alloc_object_old_for_fixture(&mut heap).unwrap();
-        object::set(&mut prototype, &mut heap, "x", Value::boolean(true));
-        let receiver = object::alloc_object_old_for_fixture(&mut heap).unwrap();
-        object::set_prototype(receiver, &mut heap, Some(prototype));
+        let _prototype_root = fixture_roots.local(prototype);
+        assert!(
+            object::ordinary_set_data_property(
+                &mut prototype,
+                &mut heap,
+                "x",
+                Value::boolean(true)
+            )
+            .expect("fixture assignment allocation")
+        );
+        let mut receiver = object::alloc_object_old_for_fixture(&mut heap).unwrap();
+        let _receiver_root = fixture_roots.local(receiver);
+        assert!(
+            object::set_prototype(&mut receiver, &mut heap, Some(prototype))
+                .expect("fixture prototype transition")
+        );
         let unrelated = object::alloc_object_old_for_fixture(&mut heap).unwrap();
-        let unrelated_receiver = object::alloc_object_old_for_fixture(&mut heap).unwrap();
-        object::set_prototype(unrelated_receiver, &mut heap, Some(unrelated));
+        let _unrelated_root = fixture_roots.local(unrelated);
+        let mut unrelated_receiver = object::alloc_object_old_for_fixture(&mut heap).unwrap();
+        let _unrelated_receiver_root = fixture_roots.local(unrelated_receiver);
+        assert!(
+            object::set_prototype(&mut unrelated_receiver, &mut heap, Some(unrelated))
+                .expect("fixture prototype transition")
+        );
         let stable = object::prototype_validity::chain_validity(unrelated, &heap).unwrap();
         for mutation in 0..4 {
             let proof = object::prototype_validity::chain_validity(prototype, &heap).unwrap();
             match mutation {
                 0 => {
-                    object::set(&mut prototype, &mut heap, "x", Value::boolean(false));
+                    assert!(
+                        object::ordinary_set_data_property(
+                            &mut prototype,
+                            &mut heap,
+                            "x",
+                            Value::boolean(false)
+                        )
+                        .expect("fixture assignment allocation")
+                    );
                 }
                 1 => {
-                    assert!(object::define_own_property(
-                        prototype,
-                        &mut heap,
-                        "x",
-                        PropertyDescriptor::data(Value::boolean(false), false, true, true)
-                    ));
+                    assert!(
+                        object::define_own_property(
+                            prototype,
+                            &mut heap,
+                            "x",
+                            PropertyDescriptor::data(Value::boolean(false), false, true, true)
+                        )
+                        .expect("descriptor fixture allocation")
+                    );
                 }
                 2 => {
-                    assert!(object::delete(prototype, &mut heap, "x"));
+                    assert!(
+                        object::delete(&mut prototype, &mut heap, "x")
+                            .expect("fixture property deletion")
+                    );
                 }
                 _ => {
-                    object::set_prototype(prototype, &mut heap, Some(unrelated));
+                    assert!(
+                        object::set_prototype(&mut prototype, &mut heap, Some(unrelated))
+                            .expect("fixture prototype transition")
+                    );
                 }
             }
             assert!(!proof.is_valid(), "mutation {mutation}");
@@ -475,15 +689,98 @@ mod tests {
     #[test]
     fn existing_own_store_candidate_rejects_non_writable_data() {
         let mut heap = fresh_heap();
+        // SAFETY: this scope belongs to the stationary heap and ends before
+        // it; every old fixture cell stays traced through collecting metadata.
+        let fixture_roots = unsafe { otter_gc::HandleScope::from_ptr(heap.handle_stack_ptr()) };
         let obj = object::alloc_object_old_for_fixture(&mut heap).unwrap();
-        assert!(object::define_own_property(
-            obj,
-            &mut heap,
-            "x",
-            PropertyDescriptor::data(Value::boolean(true), false, true, true),
-        ));
+        let _obj_root = fixture_roots.local(obj);
+        assert!(
+            object::define_own_property(
+                obj,
+                &mut heap,
+                "x",
+                PropertyDescriptor::data(Value::boolean(true), false, true, true),
+            )
+            .expect("descriptor fixture allocation")
+        );
 
         assert!(crate::cache_ir::CacheStub::install_store_existing(obj, &heap, key("x")).is_none());
+    }
+
+    #[test]
+    fn opaque_lookup_state_rejects_ordinary_slot_attachment_and_replay() {
+        let mut heap = fresh_heap();
+        // SAFETY: this scope belongs to the stationary heap and ends before
+        // it; every old fixture cell stays traced through collecting metadata.
+        let fixture_roots = unsafe { otter_gc::HandleScope::from_ptr(heap.handle_stack_ptr()) };
+        let mut obj = object::alloc_object_old_for_fixture(&mut heap).unwrap();
+        let _obj_root = fixture_roots.local(obj);
+        shaped_data_fixture(obj, &mut heap, "x", Value::boolean(true));
+        assert!(object::supports_fast_property_ic(obj, &heap));
+        let resolved = crate::cache_ir::resolve_atom_data_slot(obj, &heap, key("x")).unwrap();
+        let load =
+            crate::cache_ir::CacheStub::from_resolved_load(object::shape_id(obj, &heap), &resolved);
+        let store =
+            crate::cache_ir::CacheStub::install_store_existing(obj, &heap, key("x")).unwrap();
+
+        // The actual mapped-arguments producer changes immutable shape state;
+        // the retained ordinary cache cannot authorize that new lookup model.
+        let before = object::keyed_shape(obj, &heap);
+        install_mapped_lookup(&mut obj, &mut heap);
+        assert_ne!(object::keyed_shape(obj, &heap), before);
+
+        assert!(!object::supports_fast_property_ic(obj, &heap));
+        assert!(crate::cache_ir::resolve_atom_data_slot(obj, &heap, key("x")).is_none());
+        assert!(crate::cache_ir::CacheStub::install_store_existing(obj, &heap, key("x")).is_none());
+        assert_eq!(load.run_load(obj, &heap, key("x")), None);
+        assert_eq!(
+            store
+                .run_store(obj, &mut heap, key("x"), &Value::boolean(false))
+                .expect("store probe"),
+            None
+        );
+        assert_eq!(object::get_own(obj, &heap, "x"), Some(Value::boolean(true)));
+    }
+
+    #[test]
+    fn ordinary_store_transition_replay_rejects_opaque_receiver() {
+        let mut heap = fresh_heap();
+        // SAFETY: this scope belongs to the stationary heap and ends before
+        // it; every old fixture cell stays traced through collecting metadata.
+        let fixture_roots = unsafe { otter_gc::HandleScope::from_ptr(heap.handle_stack_ptr()) };
+        let first = object::alloc_object_old_for_fixture(&mut heap).unwrap();
+        let _first_root = fixture_roots.local(first);
+        let mut second = object::alloc_object_old_for_fixture(&mut heap).unwrap();
+        let _second_root = fixture_roots.local(second);
+        let transition = object::capture_store_property_transition(
+            first,
+            &mut heap,
+            key("x"),
+            &Value::boolean(true),
+        )
+        .expect("ordinary store transition");
+        assert_eq!(object::shape_id(second, &heap), transition.from_shape_id);
+        let before = object::keyed_shape(second, &heap);
+        install_mapped_lookup(&mut second, &mut heap);
+        assert_ne!(object::keyed_shape(second, &heap), before);
+
+        assert_eq!(
+            object::replay_store_property_transition(
+                second,
+                &mut heap,
+                key("x"),
+                transition.from_shape_id,
+                transition.atom_id,
+                transition.to_shape_id,
+                || transition.to_shape.get(),
+                &transition.kind,
+                transition.slot,
+                &Value::boolean(false),
+            )
+            .expect("store transition probe"),
+            None
+        );
+        assert_eq!(object::get_own(second, &heap, "x"), None);
     }
 
     fn proof_for_test(
@@ -497,12 +794,19 @@ mod tests {
 
     #[test]
     fn cache_ir_snapshot_preserves_own_load_and_store_programs() {
-        let mut heap = fresh_heap();
-        let mut obj = object::alloc_object_old_for_fixture(&mut heap).unwrap();
-        object::set(&mut obj, &mut heap, "x", Value::boolean(true));
-        let shape_id = object::shape_id(obj, &heap);
-        let shape = 101;
-        let resolved = crate::cache_ir::resolve_atom_data_slot(obj, &heap, key("x")).unwrap();
+        let mut interpreter = crate::Interpreter::new().expect("fixture interpreter bootstrap");
+        let mut obj = object::alloc_object_old_for_fixture(interpreter.gc_heap_mut()).unwrap();
+        interpreter
+            .create_data_property(&mut obj, "x", Value::boolean(true))
+            .unwrap();
+        let heap = interpreter.gc_heap();
+        let handle = object::keyed_shape(obj, heap);
+        assert!(!handle.is_null());
+        let shape_id = heap.read_payload(handle, object::ShapeBody::id);
+        let atom = heap.read_payload(handle, object::ShapeBody::transition_atom);
+        let property = AtomizedPropertyKey::new(PropertyAtom::new(atom), "x");
+        let shape = handle.offset();
+        let resolved = crate::cache_ir::resolve_atom_data_slot(obj, heap, property).unwrap();
 
         let load = crate::cache_ir::CacheStub::from_resolved_load(shape_id, &resolved)
             .snapshot_for_jit(|id| (id == shape_id).then_some(shape), proof_for_test)
@@ -513,18 +817,18 @@ mod tests {
                 JitCacheIrOp::GuardShape { object: 0, shape },
                 JitCacheIrOp::GuardAtomSlot {
                     object: 0,
-                    atom: 7,
-                    value_byte: 0,
+                    atom: atom.raw(),
+                    field: crate::object::FieldLocation::inline(0),
                     writable: false,
                 },
                 JitCacheIrOp::LoadField {
                     object: 0,
-                    value_byte: 0,
+                    field: crate::object::FieldLocation::inline(0),
                 },
             ]
         );
 
-        let store = crate::cache_ir::CacheStub::install_store_existing(obj, &heap, key("x"))
+        let store = crate::cache_ir::CacheStub::install_store_existing(obj, heap, property)
             .unwrap()
             .snapshot_for_jit(|id| (id == shape_id).then_some(shape), proof_for_test)
             .expect("complete own-store snapshot");
@@ -534,13 +838,13 @@ mod tests {
                 JitCacheIrOp::GuardShape { object: 0, shape },
                 JitCacheIrOp::GuardAtomSlot {
                     object: 0,
-                    atom: 7,
-                    value_byte: 0,
+                    atom: atom.raw(),
+                    field: crate::object::FieldLocation::inline(0),
                     writable: true,
                 },
                 JitCacheIrOp::StoreField {
                     object: 0,
-                    value_byte: 0,
+                    field: crate::object::FieldLocation::inline(0),
                 },
             ]
         );
@@ -548,25 +852,58 @@ mod tests {
 
     #[test]
     fn cache_ir_snapshot_preserves_prototype_program_order() {
-        let mut heap = fresh_heap();
-        let mut proto = object::alloc_object_old_for_fixture(&mut heap).unwrap();
-        object::set(&mut proto, &mut heap, "x", Value::boolean(true));
-        let receiver = object::alloc_object_old_for_fixture(&mut heap).unwrap();
-        object::set_prototype(receiver, &mut heap, Some(proto));
-        let receiver_id = object::shape_id(receiver, &heap);
-        let receiver_shape = 101;
-        let holder_id = heap.read_payload(
-            object::cached_instance_root(proto, &heap).unwrap(),
-            object::ShapeBody::id,
+        let mut interpreter = crate::Interpreter::new().expect("fixture interpreter bootstrap");
+        let mut proto = object::alloc_object_old_for_fixture(interpreter.gc_heap_mut()).unwrap();
+        interpreter
+            .create_data_property(&mut proto, "x", Value::boolean(true))
+            .unwrap();
+        let mut receiver = object::alloc_object_old_for_fixture(interpreter.gc_heap_mut()).unwrap();
+        assert!(
+            object::set_prototype(&mut receiver, interpreter.gc_heap_mut(), Some(proto))
+                .expect("fixture prototype transition")
         );
-        let holder_shape = receiver_shape;
+        let heap = interpreter.gc_heap();
+        let receiver_handle = object::keyed_shape(receiver, heap);
+        let holder_root = object::cached_instance_root(proto, heap).unwrap();
+        assert!(!receiver_handle.is_null());
+        assert_eq!(holder_root, receiver_handle);
+        let receiver_id = heap.read_payload(receiver_handle, object::ShapeBody::id);
+        let receiver_shape = receiver_handle.offset();
+        let holder_id = heap.read_payload(holder_root, object::ShapeBody::id);
+        let holder_shape = holder_root.offset();
         assert_eq!(holder_id, receiver_id);
-        let resolved = crate::cache_ir::resolve_atom_data_slot(receiver, &heap, key("x")).unwrap();
+        let atom = heap.read_payload(
+            object::keyed_shape(proto, heap),
+            object::ShapeBody::transition_atom,
+        );
+        let property = AtomizedPropertyKey::new(PropertyAtom::new(atom), "x");
+        let resolved = crate::cache_ir::resolve_atom_data_slot(receiver, heap, property).unwrap();
+        let hit_shape = resolved.hit.shape.offset();
+        let hit_id = resolved.hit.shape_id;
+        assert!(!resolved.hit.shape.is_null());
+        assert_ne!(
+            hit_id, receiver_id,
+            "the holder data layout is a distinct real child shape"
+        );
+        assert!(
+            crate::cache_ir::CacheStub::from_resolved_load(receiver_id, &resolved)
+                .snapshot_for_jit(
+                    |id| match id {
+                        id if id == receiver_id => Some(receiver_shape),
+                        id if id == holder_id => Some(holder_shape),
+                        _ => None,
+                    },
+                    proof_for_test,
+                )
+                .is_none(),
+            "a valid chain does not authorize an unresolved native holder layout"
+        );
         let program = crate::cache_ir::CacheStub::from_resolved_load(receiver_id, &resolved)
             .snapshot_for_jit(
                 |id| match id {
                     id if id == receiver_id => Some(receiver_shape),
                     id if id == holder_id => Some(holder_shape),
+                    id if id == hit_id => Some(hit_shape),
                     _ => None,
                 },
                 proof_for_test,
@@ -588,7 +925,7 @@ mod tests {
                 },
                 JitCacheIrOp::LoadField {
                     object: 1,
-                    value_byte: 0,
+                    field: crate::object::FieldLocation::inline(0),
                 },
             ]
         );
@@ -597,7 +934,11 @@ mod tests {
     #[test]
     fn unresolved_transition_rejects_the_complete_cache_ir_program() {
         let mut heap = fresh_heap();
+        // SAFETY: this scope belongs to the stationary heap and ends before
+        // it; every old fixture cell stays traced through collecting metadata.
+        let fixture_roots = unsafe { otter_gc::HandleScope::from_ptr(heap.handle_stack_ptr()) };
         let first = object::alloc_object_old_for_fixture(&mut heap).unwrap();
+        let _first_root = fixture_roots.local(first);
         let transition = object::capture_store_property_transition(
             first,
             &mut heap,
@@ -611,21 +952,43 @@ mod tests {
 
     #[test]
     fn shape_transition_snapshot_preserves_every_pre_effect_guard_and_publication() {
-        let from = object::ShapeId::from_raw(41);
-        let to = object::ShapeId::from_raw(42);
-        let transition = object::StorePropertyTransition {
-            from_shape_id: from,
-            atom_id: AtomId::from_global(7),
-            to_shape_id: to,
-            to_shape: std::cell::Cell::new(object::ShapeHandle::null()),
-            kind: object::StorePropertyTransitionKind::OwnAdd,
-            slot: 1,
-        };
+        let mut interpreter = crate::Interpreter::new().expect("fixture interpreter bootstrap");
+        let mut obj = object::alloc_object_old_for_fixture(interpreter.gc_heap_mut()).unwrap();
+        interpreter
+            .create_data_property(&mut obj, "prefix", Value::boolean(false))
+            .unwrap();
+        let from_handle = object::keyed_shape(obj, interpreter.gc_heap());
+        let mut value = Value::boolean(true);
+        let to_handle = interpreter
+            .shape_child_rooting_object_value(from_handle, "x", &mut obj, &mut value)
+            .unwrap();
+        let atom = interpreter
+            .gc_heap()
+            .read_payload(to_handle, object::ShapeBody::transition_atom);
+        let property = AtomizedPropertyKey::new(PropertyAtom::new(atom), "x");
+        let transition = object::capture_store_property_transition_with_shape(
+            obj,
+            interpreter.gc_heap_mut(),
+            property,
+            &value,
+            to_handle,
+        )
+        .expect("resident own-add transition");
+        assert_eq!(transition.slot, 1);
+        assert!(matches!(
+            transition.kind,
+            object::StorePropertyTransitionKind::OwnAdd
+        ));
+        assert_eq!(transition.to_shape.get(), to_handle);
+        let from = transition.from_shape_id;
+        let to = transition.to_shape_id;
+        let from_shape = from_handle.offset();
+        let to_shape = to_handle.offset();
         let program = crate::cache_ir::CacheStub::store_transition(transition)
             .snapshot_for_jit(
                 |id| match id {
-                    id if id == from => Some(101),
-                    id if id == to => Some(202),
+                    id if id == from => Some(from_shape),
+                    id if id == to => Some(to_shape),
                     _ => None,
                 },
                 proof_for_test,
@@ -636,20 +999,20 @@ mod tests {
             &[
                 JitCacheIrOp::GuardShape {
                     object: 0,
-                    shape: 101,
+                    shape: from_shape,
                 },
                 JitCacheIrOp::GuardPrototypeNull { object: 0 },
                 JitCacheIrOp::GuardExtensible {
                     object: 0,
-                    value_byte: 8,
+                    field: crate::object::FieldLocation::inline(1),
                 },
                 JitCacheIrOp::StoreField {
                     object: 0,
-                    value_byte: 8,
+                    field: crate::object::FieldLocation::inline(1),
                 },
                 JitCacheIrOp::PublishShape {
                     object: 0,
-                    shape: 202,
+                    shape: to_shape,
                 },
             ]
         );

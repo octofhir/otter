@@ -20,6 +20,7 @@
 //! - [`crate::ResourceSnapshot`] exposes copied usage statistics.
 
 use std::array;
+use std::borrow::Borrow;
 use std::fmt;
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -118,10 +119,11 @@ impl ResourceAccount {
     ///
     /// Dropping the returned non-cloneable [`ResourceLeaseSet`] releases every
     /// retained amount together under one ledger lock.
-    pub fn reserve_exact_many(
-        &self,
-        requests: &[(ResourceClass, u64)],
-    ) -> Result<ResourceLeaseSet, ResourceError> {
+    pub fn reserve_exact_many<I, R>(&self, requests: I) -> Result<ResourceLeaseSet, ResourceError>
+    where
+        I: IntoIterator<Item = R>,
+        R: Borrow<(ResourceClass, u64)>,
+    {
         let (amounts, aggregation_overflows) = aggregate_requests(requests);
         let mut state = lock_state(&self.shared);
         let mut next_currents = [0; RESOURCE_CLASS_COUNT];
@@ -277,6 +279,14 @@ pub struct ResourceLease {
 }
 
 impl ResourceLease {
+    /// Whether this lease and `account` charge the same existing ledger.
+    /// Allocation owners use this safe identity query when a uniquely owned
+    /// physical buffer is replaced under a different admission account.
+    #[must_use]
+    pub fn belongs_to(&self, account: &ResourceAccount) -> bool {
+        Arc::ptr_eq(&self.shared, &account.shared)
+    }
+
     /// Return the resource class charged by this lease.
     #[must_use]
     pub const fn class(&self) -> ResourceClass {
@@ -453,16 +463,21 @@ fn reserve_increment(
     Ok(())
 }
 
-fn aggregate_requests(
-    requests: &[(ResourceClass, u64)],
+fn aggregate_requests<I, R>(
+    requests: I,
 ) -> (
     [u64; RESOURCE_CLASS_COUNT],
     [Option<(u64, u64)>; RESOURCE_CLASS_COUNT],
-) {
+)
+where
+    I: IntoIterator<Item = R>,
+    R: Borrow<(ResourceClass, u64)>,
+{
     let mut amounts = [0_u64; RESOURCE_CLASS_COUNT];
     let mut overflows = [None; RESOURCE_CLASS_COUNT];
 
-    for &(class, requested) in requests {
+    for request in requests {
+        let &(class, requested) = request.borrow();
         let index = class.index();
         if overflows[index].is_some() {
             continue;

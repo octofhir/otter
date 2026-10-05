@@ -119,7 +119,7 @@ impl Runtime {
         source: &SourceInput,
         specifier: &str,
     ) -> Result<CompiledProgram, OtterError> {
-        let wrapped = otter_vm::commonjs_wrapper_source(&source.text);
+        let wrapped = otter_bytecode::commonjs::wrapper_source(&source.text);
         let mut module =
             crate::compile_eval_with_options(&wrapped, &otter_vm::EvalCompileOptions::default())
                 .map_err(|err| crate::map_compile_error(err, specifier))?;

@@ -7,8 +7,9 @@
 //! # Invariants
 //! Each physical JavaScript activation is visited once; host frames carry no
 //! source position and are skipped. Every activation's PC identifies its
-//! current source operation: a compiled frame publishes it, and an
-//! interpreter frame waiting on a call stands at the call instruction.
+//! current source operation: suspended compiled callers resolve the exact
+//! child/request return site; active helpers publish their current operation.
+//! Interpreter callers stand at the call instruction.
 //! Inline parents have recipes rather than physical frames. The
 //! walk reads scalar metadata without allocation in the GC heap or JS reentry.
 //!
@@ -32,6 +33,15 @@ impl Interpreter {
                 function_name: frame.function_name.to_owned(),
                 module: frame.module.to_owned(),
                 span: frame.span,
+                source_position: frame.source.and_then(|source| {
+                    let (line, column) = source.line_col(frame.span.0);
+                    Some(crate::ErrorSourcePosition {
+                        script_name: frame.module.to_owned(),
+                        line_number: line,
+                        start_column: column.saturating_sub(1),
+                        source_line: source.line_source(line)?,
+                    })
+                }),
             });
             true
         });
@@ -44,30 +54,20 @@ impl Interpreter {
         limit: usize,
         mut visit: impl FnMut(StackFrameSnapshotView<'_>) -> bool,
     ) {
-        // Host frames are physical boundaries for host bodies, not source
-        // activations.
-        let mut natives: Vec<_> = self
-            .jit_native_frames()
-            .filter(|&frame| {
-                // SAFETY: the published chain remains live for this walk.
-                let kind = unsafe { (*frame).header.kind };
-                kind != crate::native_abi::NativeFrameKind::Host
-            })
-            .collect();
+        // Resolve against the complete physical chain first. A Host child owns
+        // its compiled caller's return anchor even though it has no JS source.
+        let mut natives: Vec<_> = self.jit_native_frames().collect();
         natives.reverse();
         let mut sites = Vec::with_capacity(natives.len());
-        let native_count = natives.len();
-        for (position, address) in natives.into_iter().enumerate() {
-            // SAFETY: the published chain remains live throughout this
-            // metadata-only walk.
+        for address in natives {
             let native = unsafe { &*address };
+            if native.header.kind == crate::native_abi::NativeFrameKind::Host {
+                continue;
+            }
             let call = self
-                .generated_call_record(native)
-                .filter(|record| position + 1 < native_count || !record.inline_frames.is_empty());
-            let pc = call
-                .map(|record| record.call_pc)
-                .filter(|&pc| pc != crate::native_abi::NO_CALL_PC)
-                .unwrap_or(native.header.pc);
+                .jit_frame_safepoint(native)
+                .expect("published source anchor must resolve exactly");
+            let pc = self.jit_frame_source_pc(native, call);
             sites.push((native.header.function_id, pc));
             if let Some(record) = call.filter(|record| !record.inline_frames.is_empty()) {
                 push_virtual_inline_sites(context, record, &mut sites);
@@ -83,17 +83,6 @@ impl Interpreter {
                 break;
             }
         }
-    }
-
-    fn generated_call_record(
-        &self,
-        native: &crate::native_abi::Frame,
-    ) -> Option<&crate::native_abi::SafepointRecord> {
-        if native.call_site == crate::native_abi::NO_SAFEPOINT {
-            return None;
-        }
-        self.jit_code_registry
-            .safepoint_record(u64::from(native.code_object_id), native.call_site)
     }
 }
 

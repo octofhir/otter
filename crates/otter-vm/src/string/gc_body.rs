@@ -27,9 +27,9 @@
 //! - A body length is always exact in `u32`. Concatenation rejects a sum beyond
 //!   that representation before flattening or allocation; it never saturates
 //!   or truncates a rope's logical length.
-//! - `hash` is the FNV-1a hash over the materialised UTF-16 code
-//!   units. Cons / sliced bodies cache the hash at construction so
-//!   later atom-table probes never re-walk the rope.
+//! - Flat and sliced hashes are exact FNV-1a over UTF-16 code units.
+//!   A Cons hash is a cheap structural composition and cannot reject content
+//!   equality; rope equality and ordering stream the immutable code units.
 //! - Cons depth never exceeds [`MAX_ROPE_DEPTH`]; concatenations
 //!   that would exceed it flatten the deeper child eagerly.
 //! - Slicing a flat body is O(1) for either storage width. Slicing a `Cons`
@@ -198,6 +198,55 @@ pub struct JsStringBody {
 
 const _: () = assert!(std::mem::size_of::<JsStringBodyRepr>() <= 32);
 const _: () = assert!(std::mem::size_of::<JsStringBody>() <= 64);
+
+/// Measure native read/allocation geometry from the sole current VM body.
+/// No engine object allocation or GC occurs while constructing this scalar plan.
+pub(crate) fn jit_layout() -> crate::jit::JitStringLayout {
+    let header = otter_gc::header::HEADER_SIZE as u32;
+    let repr = header + std::mem::offset_of!(JsStringBody, repr) as u32;
+    let sample = JsStringBodyRepr::Cons {
+        left: JsStringHandle::null(),
+        right: JsStringHandle::null(),
+        depth: 0,
+    };
+    let base = std::ptr::from_ref(&sample) as usize;
+    let JsStringBodyRepr::Cons { left, right, depth } = &sample else {
+        unreachable!()
+    };
+    let cell_bytes = otter_gc::page::align_up(
+        otter_gc::header::HEADER_SIZE + std::mem::size_of::<JsStringBody>(),
+        otter_gc::page::CELL_SIZE,
+    ) as u32;
+    crate::jit::JitStringLayout {
+        string_type_tag: JS_STRING_BODY_TYPE_TAG,
+        string_len_byte: header + std::mem::offset_of!(JsStringBody, len) as u32,
+        string_repr_byte: repr,
+        string_repr_payload_byte: repr + STRING_REPR_PAYLOAD_BYTE as u32,
+        string_body_size: header + std::mem::size_of::<JsStringBody>() as u32,
+        cell_bytes,
+        header_word: u64::from(JS_STRING_BODY_TYPE_TAG)
+            | (u64::from(crate::jit::JIT_GC_YOUNG_FLAG)
+                << (8 * otter_gc::header::HEADER_FLAGS_BYTE_OFFSET))
+            | (u64::from(cell_bytes) << (8 * otter_gc::header::HEADER_SIZE_BYTES_OFFSET)),
+        id_byte: header + std::mem::offset_of!(JsStringBody, id) as u32,
+        hash_byte: header + std::mem::offset_of!(JsStringBody, hash) as u32,
+        cache_byte: header + std::mem::offset_of!(JsStringBody, utf16_cache) as u32,
+        cons_left_byte: repr + (std::ptr::from_ref(left) as usize - base) as u32,
+        cons_right_byte: repr + (std::ptr::from_ref(right) as usize - base) as u32,
+        cons_depth_byte: repr + (std::ptr::from_ref(depth) as usize - base) as u32,
+        inline_flat_cap: INLINE_FLAT_CAP as u8,
+        inline_latin1_cap: INLINE_LATIN1_CAP as u8,
+        max_rope_depth: MAX_ROPE_DEPTH,
+        fnv_offset: 0xcbf29ce484222325,
+        fnv_prime: 0x100000001b3,
+        inline_flat_tag: STRING_REPR_INLINE_FLAT,
+        seq_flat_tag: STRING_REPR_SEQ_FLAT,
+        inline_latin1_tag: STRING_REPR_INLINE_LATIN1,
+        seq_latin1_tag: STRING_REPR_SEQ_LATIN1,
+        cons_tag: STRING_REPR_CONS,
+        sliced_tag: STRING_REPR_SLICED,
+    }
+}
 
 impl JsStringBody {
     /// Stable interner identity.
@@ -541,10 +590,8 @@ pub fn concat_string_bodies(
 
     let final_depth = left_depth.max(right_depth).saturating_add(1);
 
-    // Compose hashes by re-hashing left bytes then right bytes
-    // through FNV-1a; cheaper than walking the materialised rope on
-    // every later equality probe. This matches `hash_utf16(left ++
-    // right)` because FNV-1a is a streaming hash.
+    // Structural rope hash; exact-content hash rejection excludes Cons.
+    // No traversal or materialization is hidden in the concatenation fit.
     let combined_hash = fnv_combine(left_hash, right_hash, right_len as usize);
 
     Ok(heap.alloc_with_roots(
@@ -1345,7 +1392,7 @@ pub fn equals_string_bodies(heap: &GcHeap, a: JsStringHandle, b: JsStringHandle)
     // throwaway `to_utf16_vec` allocations. `body.hash` matches the FNV-1a of the
     // flattened content only when neither side is a cons rope (cons bodies carry
     // a placeholder hash), so the hash reject is gated on both being non-cons. A
-    // `Cons` / `Sliced` body yields `None` and falls through to the materialising
+    // `Cons` / `Sliced` body yields `None` and falls through to the bounded streaming
     // walk. This reads each body's payload once instead of twice.
     if let Some(answer) = heap.read_payload(a, |ba| {
         heap.read_payload(b, |bb| {
@@ -1383,12 +1430,12 @@ pub fn equals_string_bodies(heap: &GcHeap, a: JsStringHandle, b: JsStringHandle)
             })
         });
     }
-    to_utf16_vec(heap, a) == to_utf16_vec(heap, b)
+    super::code_units::CodeUnits::new(heap, a).eq(super::code_units::CodeUnits::new(heap, b))
 }
 
 /// Lexicographic code-unit ordering of two string bodies. Both sides flat
 /// (inline or side storage, either width) compare in place; a `Cons` /
-/// `Sliced` operand falls back to materialising both sides.
+/// `Sliced` operand streams the immutable rope content with a bounded frontier.
 #[must_use]
 pub fn compare_string_bodies(
     heap: &GcHeap,
@@ -1413,7 +1460,7 @@ pub fn compare_string_bodies(
             })
         });
     }
-    to_utf16_vec(heap, a).cmp(&to_utf16_vec(heap, b))
+    super::code_units::CodeUnits::new(heap, a).cmp(super::code_units::CodeUnits::new(heap, b))
 }
 
 /// Copy a string body's flat Latin-1 bytes into `out` when it is a short,

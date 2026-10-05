@@ -213,12 +213,12 @@ enum Outcome {
 }
 
 fn observe(module: BytecodeModule, jit: bool) -> Outcome {
-    let mut interp = Interpreter::new();
+    let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
     if jit {
         Arc::new(OtterJitCompiler::default()).install(&mut interp);
     }
     let context = interp
-        .link_module(module)
+        .link_module(module, otter_vm::source_registry::SourceRegistry::default())
         .expect("fixture artifact is admitted");
     match interp.run(&context) {
         Ok(value) => Outcome::Returned(describe(&interp, value)),
@@ -269,10 +269,13 @@ fn tiering_actually_happens_for_these_artifacts() {
     // different work than an interpreted one, which the compiler probe
     // reports as at least one compiled entry.
     let probe = otter_jit::JitCompilerProbe::new(Arc::new(OtterJitCompiler::default()));
-    let mut interp = Interpreter::new();
+    let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
     probe.install(&mut interp);
     let context = interp
-        .link_module(hot_loop_module(4_000))
+        .link_module(
+            hot_loop_module(4_000),
+            otter_vm::source_registry::SourceRegistry::default(),
+        )
         .expect("fixture artifact is admitted");
     interp.run(&context).expect("hot loop returns");
     assert!(

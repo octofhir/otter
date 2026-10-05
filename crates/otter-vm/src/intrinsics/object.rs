@@ -65,7 +65,7 @@ fn install_proto_proto_accessor(
         .expect("Object constructor remains rooted");
     let descriptor = ctor
         .own_property_descriptor(heap, "prototype")
-        .map_err(|_| JsSurfaceError::OutOfMemory)?;
+        .map_err(JsSurfaceError::from)?;
     proto_root = match descriptor.and_then(|d| match d.kind {
         crate::object::DescriptorKind::Data { value } => Some(value),
         _ => None,
@@ -83,7 +83,7 @@ fn install_proto_proto_accessor(
             object_statics::native_prototype_proto_get,
             &[],
         )
-        .map_err(|_| JsSurfaceError::OutOfMemory)?,
+        .map_err(JsSurfaceError::from)?,
     );
     setter_root = Value::native_function(
         crate::bootstrap::native_static_with_value_roots(
@@ -93,13 +93,13 @@ fn install_proto_proto_accessor(
             object_statics::native_prototype_proto_set,
             &[],
         )
-        .map_err(|_| JsSurfaceError::OutOfMemory)?,
+        .map_err(JsSurfaceError::from)?,
     );
     let desc = PropertyDescriptor::accessor(Some(getter_root), Some(setter_root), false, true);
     let prototype = proto_root
         .as_object()
         .expect("Object.prototype remains rooted");
-    if !object::define_own_property(prototype, heap, "__proto__", desc) {
+    if !object::define_own_property(prototype, heap, "__proto__", desc)? {
         return Err(JsSurfaceError::DefinePropertyFailed("__proto__"));
     }
     Ok(())
@@ -129,19 +129,10 @@ fn object_ctor_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Na
     }
     let first_is_nullish = args.first().is_none_or(|v| v.is_nullish());
     if first_is_nullish {
-        let obj = ctx.alloc_object().map_err(|_| NativeError::TypeError {
-            name: "Object",
-            reason: "object allocation failed".to_string(),
-        })?;
-        let interp = ctx.interp_mut();
-        if let Some(proto) = interp
-            .constructor_prototype_value("Object")
-            .ok()
-            .and_then(|v| v.as_object())
-        {
-            crate::object::set_prototype(obj, &mut interp.gc_heap, Some(proto));
-        }
-        return Ok(Value::object(obj));
+        return ctx.scope(|mut scope| {
+            let object = scope.object()?;
+            Ok(scope.finish(object))
+        });
     }
     let Some(value) = args.first() else {
         unreachable!("first_is_nullish covers None path");
@@ -153,31 +144,31 @@ fn object_ctor_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Na
     // The wrapped heap primitive is re-read from the rooted value after the
     // wrapper allocation, which can move it.
     if let Some(b) = v.as_boolean() {
-        return wrap_primitive(ctx, "Boolean", v, |mut obj, heap, _| {
-            crate::object::set_boolean_data(&mut obj, heap, b);
+        return wrap_primitive(ctx, "Boolean", v, |obj, heap, _| {
+            crate::object::set_boolean_data(obj, heap, b)
         });
     }
     if let Some(n) = v.as_number() {
-        return wrap_primitive(ctx, "Number", v, |mut obj, heap, _| {
-            crate::object::set_number_data(&mut obj, heap, n);
+        return wrap_primitive(ctx, "Number", v, |obj, heap, _| {
+            crate::object::set_number_data(obj, heap, n)
         });
     }
     if v.as_string(ctx.heap()).is_some() {
-        return wrap_primitive(ctx, "String", v, |mut obj, heap, value| {
+        return wrap_primitive(ctx, "String", v, |obj, heap, value| {
             let s = value.as_string(heap).expect("rooted string primitive");
-            crate::object::set_string_data(&mut obj, heap, s);
+            crate::object::set_string_data(obj, heap, s)
         });
     }
     if v.as_symbol(ctx.heap()).is_some() {
-        return wrap_primitive(ctx, "Symbol", v, |mut obj, heap, value| {
+        return wrap_primitive(ctx, "Symbol", v, |obj, heap, value| {
             let sym = value.as_symbol(heap).expect("rooted symbol primitive");
-            crate::object::set_symbol_data(&mut obj, heap, sym);
+            crate::object::set_symbol_data(obj, heap, sym)
         });
     }
     if v.as_big_int().is_some() {
-        return wrap_primitive(ctx, "BigInt", v, |mut obj, heap, value| {
+        return wrap_primitive(ctx, "BigInt", v, |obj, heap, value| {
             let bigint = value.as_big_int().expect("rooted bigint primitive");
-            crate::object::set_bigint_data(&mut obj, heap, bigint);
+            crate::object::set_bigint_data(obj, heap, bigint)
         });
     }
     Ok(v)
@@ -206,22 +197,30 @@ fn wrap_primitive<F>(
     apply_data_slot: F,
 ) -> Result<Value, NativeError>
 where
-    F: FnOnce(JsObject, &mut otter_gc::GcHeap, Value),
+    F: FnOnce(&mut JsObject, &mut otter_gc::GcHeap, Value) -> Result<(), otter_gc::OutOfMemory>,
 {
-    let interp = ctx.interp_mut();
-    let proto = interp
-        .primitive_wrapper_prototype(wrapper_name)
-        .map_err(|err| NativeError::TypeError {
-            name: "Object",
-            reason: err.to_string(),
+    ctx.scope(|mut scope| {
+        let primitive = scope.value(value);
+        let prototype = scope
+            .context()
+            .interp_mut()
+            .primitive_wrapper_prototype(wrapper_name);
+        let prototype = prototype.map_err(|error| {
+            crate::native_function::vm_to_native_error(
+                scope.context().interp_mut(),
+                error,
+                "Object",
+            )
         })?;
-    let obj = interp
-        .alloc_runtime_rooted_object_with_proto(proto, &[&value], &[])
-        .map_err(|err| NativeError::TypeError {
-            name: "Object",
-            reason: err.to_string(),
-        })?;
-    // `value` rode the allocation as a root and names the moved primitive.
-    apply_data_slot(obj, &mut interp.gc_heap, value);
-    Ok(Value::object(obj))
+        let prototype = scope.value(Value::object(prototype));
+        let object = scope.bare_object()?;
+        scope.set_prototype(object, Some(prototype))?;
+        let mut receiver = scope
+            .raw(object)
+            .as_object()
+            .expect("scoped wrapper object");
+        let current = scope.raw(primitive);
+        apply_data_slot(&mut receiver, scope.context().heap_mut(), current)?;
+        Ok(scope.finish(object))
+    })
 }

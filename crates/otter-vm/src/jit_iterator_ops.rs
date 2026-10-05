@@ -11,6 +11,8 @@
 //!   generated caller only falls through and never replays it.
 //! - A throw out of `next` sets the record's `[[Done]]`, so a handler's
 //!   close leaves it alone (§7.4.8).
+//! - A completed terminal failure retains `Fatal`; the status-only stub never
+//!   sends it through JavaScript throwable materialization again.
 //! - All user callbacks run through the existing ActivationStack/VmThread reentry
 //!   path and values remain rooted by the published frame.
 //!
@@ -22,8 +24,8 @@
 use otter_bytecode::Op;
 
 use crate::{
-    ExecutionContext, Interpreter, VmError, activation_stack::ActivationStack, read_register,
-    write_register,
+    CommittedValueError, ExecutionContext, Interpreter, VmError, activation_stack::ActivationStack,
+    read_register, write_register,
 };
 
 impl Interpreter {
@@ -43,10 +45,10 @@ impl Interpreter {
         arg0: u64,
         arg1: u64,
         arg2: u64,
-    ) -> Result<(), VmError> {
+    ) -> Result<(), CommittedValueError> {
         self.record_jit_runtime_stub_class(crate::native_abi::RuntimeStubClass::Reentrant);
         if frame_index + 1 != stack.len() {
-            return Err(VmError::InvalidOperand);
+            return Err(CommittedValueError::Fatal(VmError::InvalidOperand));
         }
         let saved_pc = stack[frame_index].pc;
         match opcode {
@@ -54,34 +56,39 @@ impl Interpreter {
                 let value_dst = arg0 as u16;
                 let done_dst = arg1 as u16;
                 let iter_reg = arg2 as u16;
-                let iterator = *read_register(&stack[frame_index], iter_reg)?;
+                let iterator = *read_register(&stack[frame_index], iter_reg)
+                    .map_err(CommittedValueError::Fatal)?;
                 if iterator.as_iterator().is_none() {
-                    return Err(VmError::TypeMismatch);
+                    return Err(CommittedValueError::JavaScript(VmError::TypeMismatch));
                 }
 
                 let (value, done) = match iterator.as_iterator() {
                     Some(handle) => self.iterator_next_full(context, stack, &handle),
-                    None => Err(VmError::TypeMismatch),
+                    None => Err(CommittedValueError::JavaScript(VmError::TypeMismatch)),
                 }
                 .inspect_err(|_| self.iterator_mark_done(iterator))?;
-                write_register(&mut stack[frame_index], value_dst, value)?;
+                write_register(&mut stack[frame_index], value_dst, value)
+                    .map_err(CommittedValueError::Fatal)?;
                 write_register(
                     &mut stack[frame_index],
                     done_dst,
                     crate::Value::boolean(done),
-                )?;
+                )
+                .map_err(CommittedValueError::Fatal)?;
                 stack[frame_index].pc = saved_pc;
                 Ok(())
             }
             value if value == Op::IteratorClose as u8 => {
-                let iterator = *read_register(&stack[frame_index], arg0 as u16)?;
-                self.iterator_close_value_sync(stack, context, iterator)?;
+                let iterator = *read_register(&stack[frame_index], arg0 as u16)
+                    .map_err(CommittedValueError::Fatal)?;
+                self.iterator_close_value_sync(stack, Some(context), iterator)?;
                 stack[frame_index].pc = saved_pc;
                 Ok(())
             }
             value if value == Op::IteratorCloseThrow as u8 => {
-                let iterator = *read_register(&stack[frame_index], arg0 as u16)?;
-                self.iterator_close_for_throw(stack, context, iterator)?;
+                let iterator = *read_register(&stack[frame_index], arg0 as u16)
+                    .map_err(CommittedValueError::Fatal)?;
+                self.iterator_close_for_throw(stack, Some(context), iterator)?;
                 stack[frame_index].pc = saved_pc;
                 Ok(())
             }
@@ -101,7 +108,7 @@ impl Interpreter {
                 stack[frame_index].pc = saved_pc;
                 Ok(())
             }
-            _ => Err(VmError::InvalidOperand),
+            _ => Err(CommittedValueError::Fatal(VmError::InvalidOperand)),
         }
     }
 }

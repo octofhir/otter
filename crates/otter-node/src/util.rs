@@ -1,10 +1,8 @@
-//! `node:util` / `util` hosted module.
+//! Native helpers behind Node's `util` surface.
 //!
-//! A practical subset of Node's `util`, implemented as a dependency-free JS
-//! shim ([`SHIM`]) run through [`otter_runtime::run_builtin_cjs_shim`]. `inspect`
-//! (the suite's single most-used helper) and `format` are the focus, alongside
-//! `types`, `promisify`, `inherits`, `isDeepStrictEqual`, `deprecate`, dotenv
-//! parsing, USV-string normalization, and the ANSI/style helpers.
+//! `node:util` itself is vendored Node (`nodelib`); this module owns the
+//! natives its compat realm forwards to through `internal/otter/natives`, and
+//! the `util/types` alias.
 //!
 //! # Invariants
 //! - Live call sites are captured through [`NativeCtx`]'s explicit runtime
@@ -19,9 +17,6 @@ use otter_runtime::{
 };
 use otter_vm::binary::TypedArrayKind;
 use otter_vm::{Attr, NativeCtx, NativeError, Value};
-
-/// Embedded `util` implementation.
-const SHIM: &str = include_str!("util.js");
 
 /// Native backing for `util.getCallSites`: capture the live JS call
 /// stack as a JSON array of call-site records. `args[0]` is the number
@@ -204,8 +199,7 @@ pub fn otter_natives_cjs_value<'scope>(
 ) -> Result<Local<'scope>, NativeError> {
     let export = otter_runtime::run_builtin_cjs_shim(
         scope,
-        "internal/otter/natives",
-        "'use strict'; module.exports = {};",
+        &crate::nodelib::embedded::internal_otter_natives,
         module,
         require,
     )?;
@@ -223,28 +217,6 @@ pub fn otter_natives_cjs_value<'scope>(
     scope.define(export, "typedArraysEqual", typed_arrays_equal, flags)?;
     scope.define(export, "proxyDetails", proxy_details, flags)?;
     scope.define(export, "ownNonIndexKeys", own_non_index_keys, flags)?;
-    Ok(export)
-}
-
-/// CommonJS export: the `util` namespace.
-pub fn util_cjs_value<'scope>(
-    scope: &mut NativeScope<'scope, '_>,
-    _caps: &CapabilitySet,
-    _runtime_task_spawner: Option<RuntimeTaskSpawner>,
-    module: Local<'scope>,
-    require: Local<'scope>,
-) -> Result<Local<'scope>, NativeError> {
-    let export = otter_runtime::run_builtin_cjs_shim(scope, "node:util", SHIM, module, require)?;
-    let callsites = scope.native_method("captureCallSites", 2, capture_call_sites)?;
-    let typed_arrays_equal = scope.native_method("typedArraysEqual", 2, typed_arrays_equal)?;
-    let flags = Attr {
-        writable: false,
-        enumerable: false,
-        configurable: false,
-    }
-    .to_flags();
-    scope.define(export, "__otterCaptureCallSites", callsites, flags)?;
-    scope.define(export, "__otterTypedArraysEqual", typed_arrays_equal, flags)?;
     Ok(export)
 }
 

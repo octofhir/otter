@@ -51,7 +51,12 @@ fn nested_cause_chain_round_trips_through_json() {
     );
 
     let json = serde_json::to_string_pretty(&diag).expect("serialize");
-    let parsed: Diagnostic = serde_json::from_str(&json).expect("deserialize");
+    let parsed: serde_json::Value = serde_json::from_str(&json).expect("deserialize");
+    assert_eq!(
+        parsed["cause"]["cause"]["message"].as_str(),
+        Some(second.message.as_str()),
+        "innermost cause lost in JSON"
+    );
     let re = serde_json::to_string_pretty(&parsed).expect("re-serialize");
     assert_eq!(json, re, "cause chain JSON round-trip diverged");
 }

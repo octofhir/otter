@@ -22,8 +22,8 @@
 //!   tracing visits a conservative dirty interval and retains any slots whose
 //!   targets remain young after relocation. Every write that can introduce or
 //!   move a GC edge updates the interval; generated primitive stores need not.
-//! - Slabs live in old space and never resize. Growth allocates a replacement
-//!   and the owning array republishes its cached base.
+//! - Slabs use the ordinary generational allocation policy and never resize.
+//!   Growth and relocation republish the owning array's cached base.
 //!
 //! # See also
 //! - [`crate::array::ArrayBody`]
@@ -75,7 +75,7 @@ impl DenseElementKind {
     }
 }
 
-/// Handle to one old-space element slab.
+/// Handle to one generational element slab.
 pub(crate) type ElementSlabHandle = otter_gc::Gc<ElementSlabBody>;
 
 /// Header followed by `capacity` eight-byte element words and, for numeric
@@ -95,6 +95,12 @@ pub(crate) struct ElementSlabBody {
 }
 
 const _: () = assert!(std::mem::size_of::<ElementSlabBody>() == 24);
+
+pub(crate) const SLAB_CAPACITY_BYTE: usize = std::mem::offset_of!(ElementSlabBody, capacity);
+pub(crate) const SLAB_LEN_BYTE: usize = std::mem::offset_of!(ElementSlabBody, len);
+pub(crate) const SLAB_HOLE_COUNT_BYTE: usize = std::mem::offset_of!(ElementSlabBody, hole_count);
+pub(crate) const SLAB_KIND_BYTE: usize = std::mem::offset_of!(ElementSlabBody, kind);
+pub(crate) const SLAB_DIRTY_START_BYTE: usize = std::mem::offset_of!(ElementSlabBody, dirty_start);
 
 /// Signed byte offset of a slab's `u32` capacity from its element base, as
 /// generated code locates the hole bitmap that follows the element words.
@@ -518,7 +524,7 @@ pub(crate) fn kind_of(slab: ElementSlabHandle) -> DenseElementKind {
     })
 }
 
-/// Allocate an empty old-space slab. The caller initializes words and then
+/// Allocate an empty slab. The caller initializes words and then
 /// publishes its live length without another allocation.
 pub(crate) fn alloc_element_slab(
     heap: &mut otter_gc::GcHeap,
@@ -527,25 +533,24 @@ pub(crate) fn alloc_element_slab(
     external_visit: &mut RootSlotVisitor<'_>,
 ) -> Result<ElementSlabHandle, otter_gc::OutOfMemory> {
     debug_assert!(capacity != 0);
-    let slab = heap.alloc_variable_with_roots(
+    let slab = heap.alloc_trailing_with_roots_initialized(
         ElementSlabBody::new(capacity, kind),
         ElementSlabBody::trailing_bytes(capacity, kind),
         external_visit,
+        |body| {
+            if kind.is_numeric() {
+                // SAFETY: the reserved numeric tail contains this bitmap;
+                // initialization precedes publication by the allocator.
+                unsafe {
+                    std::ptr::write_bytes(
+                        body.bitmap_ptr(),
+                        0,
+                        ElementSlabBody::bitmap_words_for(capacity),
+                    )
+                };
+            }
+        },
     )?;
-    if kind.is_numeric() {
-        let body = body_of(slab).expect("fresh element slab");
-        // Do not make bitmap initialization depend on allocator zero-fill:
-        // read-modify-write hole updates require every word to be known zero.
-        // SAFETY: the fresh slab is not yet reachable except through this
-        // handle, and its numeric tail reserves exactly this many words.
-        unsafe {
-            std::ptr::write_bytes(
-                (*body).bitmap_ptr(),
-                0,
-                ElementSlabBody::bitmap_words_for(capacity),
-            )
-        };
-    }
     Ok(slab)
 }
 
@@ -556,7 +561,7 @@ mod tests {
 
     #[test]
     fn holes_do_not_alias_nan_or_negative_zero() {
-        let mut interp = Interpreter::new();
+        let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
         let slab = alloc_element_slab(
             interp.gc_heap_mut(),
             4,
@@ -589,7 +594,7 @@ mod tests {
 
     #[test]
     fn filling_last_hole_promotes_to_packed_and_non_number_widens() {
-        let mut interp = Interpreter::new();
+        let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
         let slab = alloc_element_slab(
             interp.gc_heap_mut(),
             2,
@@ -615,7 +620,7 @@ mod tests {
 
     #[test]
     fn widened_slab_traces_a_cell_through_full_collection() {
-        let mut interp = Interpreter::new();
+        let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
         let array = interp
             .array_from_elements_host_rooted([1.25, 2.5, 3.75].map(Value::number_f64), &[], &[])
             .expect("numeric array");
@@ -623,11 +628,14 @@ mod tests {
         let mut child = interp
             .alloc_host_object_with_roots(&[], &[])
             .expect("child object");
-        crate::object::set(
-            &mut child,
-            interp.gc_heap_mut(),
-            "marker",
-            Value::number_i32(73),
+        assert!(
+            crate::object::define_own_property_in_place(
+                &mut child,
+                interp.gc_heap_mut(),
+                "marker",
+                crate::object::PropertyDescriptor::data(Value::number_i32(73), true, true, true)
+            )
+            .expect("fixture property allocation")
         );
 
         let array = interp

@@ -1,3 +1,6 @@
+#[path = "web/wasm_errors.rs"]
+mod wasm_errors;
+
 use otter_runtime::{Runtime, RuntimeHandle, SourceInput};
 use otter_web::blob::Blob;
 use otter_web::url::WebUrl;

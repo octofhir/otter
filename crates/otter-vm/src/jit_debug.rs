@@ -209,6 +209,25 @@ pub enum JitInlineRejectionReason {
     MissingSnapshot,
 }
 
+/// Why a successfully compiled mapping was not published by the registry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+pub enum JitInstallDeclineReason {
+    /// Identity, dependency or finalized layout did not satisfy installation.
+    InvalidCode,
+    /// Exact finalized mapping and metadata exceeded canonical headroom.
+    ResourceBudget {
+        /// Entire finalized admission requirement, including registry payload.
+        required_bytes: u64,
+        /// Canonical physical-lease and host-account headroom after refusal.
+        available_bytes: u64,
+    },
+}
+
 /// Why one observed call target could not bake compiler-generated native
 /// linkage.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -259,6 +278,9 @@ pub enum JitDirectCallPlanOutcome {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub enum JitDirectCallLoweringRejectionReason {
+    /// This backend has no proven function-cell lowering for the reached
+    /// call shape and emits its canonical call path instead.
+    BackendUnsupported,
     /// The exact callee register/native-stack layout exceeds the bounded
     /// generated-call contract.
     LayoutUnsupported,
@@ -360,7 +382,8 @@ pub enum JitCompilerDiagnostic {
         callee_function_id: u32,
         /// Depth below the optimized unit's root.
         depth: u32,
-        /// Weighted cost charged by the inline budget.
+        /// Exact units charged by the backend's inline budget; Graph uses
+        /// the accepted body's encoded bytecode byte length.
         cost: u32,
         /// Complete pipeline decision.
         outcome: JitInlineLoweringOutcome,
@@ -411,8 +434,8 @@ pub enum JitDebugPropertyAccess {
 pub struct JitDebugPropertyProgram {
     /// Hidden-class handle the program's first receiver guard requires.
     pub shape: u32,
-    /// Byte offset of the program's terminal value field.
-    pub value_byte: u32,
+    /// Shape-owned storage bank and relative terminal value location.
+    pub field: crate::object::FieldLocation,
 }
 
 /// One structured JIT diagnostics event.
@@ -442,8 +465,8 @@ pub enum JitDebugEvent {
         parameter_count: u32,
         /// Number of bytecode instructions supplied to this compile.
         bytecode_instruction_count: u64,
-        /// Function entries observed before this compile request.
-        entry_count: u64,
+        /// Entered source-opcode attempts visible before this compile request.
+        source_work: u64,
         /// Reasoned generated or optimizing exits observed before this compile.
         exit_count: u64,
         /// Call sites carrying target feedback.
@@ -466,8 +489,8 @@ pub enum JitDebugEvent {
         direct_method_sites: u32,
         /// Total guarded method targets across those sites.
         direct_method_targets: u32,
-        /// Monomorphic static-native targets available for guarded leaf codegen.
-        static_native_calls: u32,
+        /// Native call sites with an exact leaf or general kind entry plan.
+        native_calls: u32,
         /// Plain-call callee bodies made available to the body inliner.
         inline_callees: u32,
         /// Monomorphic method bodies baked into the snapshot.
@@ -523,7 +546,20 @@ pub enum JitDebugEvent {
         /// size, arity, or tier-specific eligibility constraints.
         bake_rejection: Option<JitInlineRejectionReason>,
     },
-    /// Final optimizing-tier decision for one budget-admitted inline body.
+    /// A compiler hook produced code, but canonical admission did not publish it.
+    InstallDeclined {
+        /// Function whose compiled generation was refused.
+        function_id: u32,
+        /// Exact compiler-produced code object identity.
+        code_object_id: u64,
+        /// Native tier produced by the hook.
+        tier: JitDebugTier,
+        /// Typed final installation decision.
+        reason: JitInstallDeclineReason,
+    },
+    /// Captured optimizing-tier splice, attributed to its actual owning code.
+    /// Graph reports accepted bodies from its finished graph; VM bake refusal
+    /// is an `InlineCandidate` event rather than a guessed backend outcome.
     InlineLowered {
         /// Outermost function whose code object owns the inline unit.
         function_id: u32,
@@ -541,7 +577,8 @@ pub enum JitDebugEvent {
         callee_function_id: u32,
         /// Depth below the optimized unit's root.
         depth: u32,
-        /// Weighted cost charged by the inline budget.
+        /// Exact units charged by the backend's inline budget; Graph uses
+        /// the accepted body's encoded bytecode byte length.
         cost: u32,
         /// Final splice result.
         outcome: JitInlineLoweringOutcome,
@@ -1013,7 +1050,7 @@ mod tests {
             register_count: 8,
             parameter_count: 1,
             bytecode_instruction_count: 9,
-            entry_count: 1_000,
+            source_work: 1_000,
             exit_count: 2,
             call_feedback_sites: 2,
             method_feedback_sites: 3,
@@ -1025,7 +1062,7 @@ mod tests {
             direct_constructs: 2,
             direct_method_sites: 2,
             direct_method_targets: 5,
-            static_native_calls: 1,
+            native_calls: 1,
             inline_callees: 1,
             inline_methods: 0,
         }]);
@@ -1045,7 +1082,7 @@ mod tests {
                     "registerCount": 8,
                     "parameterCount": 1,
                     "bytecodeInstructionCount": 9,
-                    "entryCount": 1000,
+                    "sourceWork": 1000,
                     "exitCount": 2,
                     "callFeedbackSites": 2,
                     "methodFeedbackSites": 3,
@@ -1057,7 +1094,7 @@ mod tests {
                     "directConstructs": 2,
                     "directMethodSites": 2,
                     "directMethodTargets": 5,
-                    "staticNativeCalls": 1,
+                    "nativeCalls": 1,
                     "inlineCallees": 1,
                     "inlineMethods": 0
                 }],
@@ -1065,6 +1102,37 @@ mod tests {
                 "truncated": false
             })
         );
+    }
+
+    #[test]
+    fn install_declined_serialization_reports_the_final_admission_domain() {
+        for (reason, expected) in [
+            (
+                JitInstallDeclineReason::InvalidCode,
+                json!({"kind": "invalidCode"}),
+            ),
+            (
+                JitInstallDeclineReason::ResourceBudget {
+                    required_bytes: 8192,
+                    available_bytes: 4096,
+                },
+                json!({"kind": "resourceBudget", "requiredBytes": 8192, "availableBytes": 4096}),
+            ),
+        ] {
+            let event = JitDebugEvent::InstallDeclined {
+                function_id: 7,
+                code_object_id: 19,
+                tier: JitDebugTier::Template,
+                reason,
+            };
+            assert_eq!(
+                serde_json::to_value(event).unwrap(),
+                json!({
+                    "type": "installDeclined", "functionId": 7, "codeObjectId": 19,
+                    "tier": "template", "reason": expected,
+                })
+            );
+        }
     }
 
     #[test]
@@ -1128,6 +1196,18 @@ mod tests {
                 "kind": "rejected",
                 "reason": "unprofitable"
             })
+        );
+    }
+
+    #[test]
+    fn direct_call_backend_rejection_has_a_stable_typed_name() {
+        let value = serde_json::to_value(JitDirectCallLoweringOutcome::Rejected {
+            reason: JitDirectCallLoweringRejectionReason::BackendUnsupported,
+        })
+        .expect("serialize direct-call lowering");
+        assert_eq!(
+            value,
+            json!({"kind": "rejected", "reason": "backendUnsupported"})
         );
     }
 

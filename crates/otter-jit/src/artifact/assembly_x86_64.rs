@@ -5,6 +5,7 @@
 //!   listing.
 //! - Relocation ranges are rendered symbolically without their process-local
 //!   immediate bytes.
+//! - Exact JS machine returns reference existing source/root records.
 //!
 //! # Invariants
 //! - Every location is relative to the matching `code.bin`.
@@ -19,12 +20,17 @@ use std::{
     fmt::Write as _,
 };
 
-use otter_vm::{JitArtifactMetadata, deopt::DeoptTable, native_abi::SafepointRecord};
+use otter_vm::{
+    JitArtifactMetadata,
+    deopt::DeoptTable,
+    native_abi::{SafepointEntry, SafepointRecord},
+};
 use yaxpeax_arch::LengthedInstruction;
 use yaxpeax_x86::amd64::InstDecoder;
 
 use super::CodeMapCapture;
 use super::relocation::{ValidatedRelocation, ValidatedRelocations};
+use super::return_sites::render_return_site_summary;
 
 pub(super) fn render(
     metadata: &JitArtifactMetadata,
@@ -34,6 +40,7 @@ pub(super) fn render(
     relocations: &ValidatedRelocations,
     deopt_table: Option<&DeoptTable>,
     safepoints: &[SafepointRecord],
+    return_sites: &[SafepointEntry],
 ) -> String {
     let mut output = String::with_capacity(code.len().saturating_mul(24));
     output.push_str("; otter jit x86-64 assembly\n");
@@ -56,6 +63,7 @@ pub(super) fn render(
         safepoints.len()
     )
     .expect("String write");
+    render_return_site_summary(&mut output, return_sites);
     output.push('\n');
 
     let decoder = InstDecoder::default();

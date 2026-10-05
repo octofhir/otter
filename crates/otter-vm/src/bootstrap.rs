@@ -416,23 +416,27 @@ fn build_global_this_impl(
         );
     }
     // §19.1 `globalThis` is writable + configurable but NON-enumerable.
-    object::define_own_property(
+    if !object::define_own_property(
         global,
         heap,
         "globalThis",
         crate::object::PropertyDescriptor::data(Value::object(global), true, false, true),
-    );
+    )? {
+        return Err(JsSurfaceError::DefinePropertyFailed("[[BuiltinProperty]]"));
+    };
     // §19.1 — `NaN`, `Infinity`, `undefined` are own properties of
     // the global object with writable / enumerable / configurable
     // all false. Reflective lookups (`Object.getOwnPropertyDescriptor(
     // globalThis, "NaN")`) observe the exact attributes.
-    object::define_own_property(
+    if !object::define_own_property(
         global,
         heap,
         "NaN",
         crate::object::PropertyDescriptor::data(Value::number_f64(f64::NAN), false, false, false),
-    );
-    object::define_own_property(
+    )? {
+        return Err(JsSurfaceError::DefinePropertyFailed("[[BuiltinProperty]]"));
+    };
+    if !object::define_own_property(
         global,
         heap,
         "Infinity",
@@ -442,13 +446,17 @@ fn build_global_this_impl(
             false,
             false,
         ),
-    );
-    object::define_own_property(
+    )? {
+        return Err(JsSurfaceError::DefinePropertyFailed("[[BuiltinProperty]]"));
+    };
+    if !object::define_own_property(
         global,
         heap,
         "undefined",
         crate::object::PropertyDescriptor::data(Value::undefined(), false, false, false),
-    );
+    )? {
+        return Err(JsSurfaceError::DefinePropertyFailed("[[BuiltinProperty]]"));
+    };
     if let Some(t) = telemetry.as_deref_mut() {
         t.record_global_this();
     }
@@ -483,7 +491,11 @@ fn build_global_this_impl(
             None
         };
         if let Some(object_proto) = object_proto {
-            object::set_prototype(global, heap, Some(object_proto));
+            if !object::set_prototype(&mut global, heap, Some(object_proto))? {
+                return Err(JsSurfaceError::DefinePropertyFailed(
+                    "globalThis.[[Prototype]]",
+                ));
+            }
         }
     }
     if let (Some(t), Some(before)) = (telemetry, before) {

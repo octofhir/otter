@@ -1,7 +1,9 @@
-//! System V x86-64 template code emission.
+//! x86-64 template code emission with the platform C and private JS conventions.
 //!
 //! # Contents
 //! - Whole-function prologue, epilogue, control flow, and OSR trampolines.
+//! - Conservative cold-exit reachability, preserving all shared frame exits.
+//! - [`operation`] emits one reusable baseline operation for either tier.
 //! - Tagged Number arithmetic, comparison, conversion, and truthiness paths.
 //! - Prepared string-cell loads and full `+` semantics through the allocating
 //!   concat packet and coercive runtime delegate.
@@ -10,8 +12,8 @@
 //! - Generated base/super constructor linkage with fixed or spread arguments
 //!   and receiver-allocation fast paths.
 //! - SELF context reads, unchecked context-slot access, and context
-//!   allocation ([`context`]); checked and lookup binding accesses through
-//!   the committed binding boundary.
+//!   allocation ([`context`]); stable lexical cells and guarded global-object
+//!   slots ([`binding`]) with one committed cold owner for binding misses.
 //! - Iterator lifecycle, descriptor definitions, and class-value transitions
 //!   through shared VM descriptors.
 //! - Actual-argument collection and intrinsic-apply forwarding through the
@@ -19,7 +21,8 @@
 //! - Canonical indexed loads and stores through committed element descriptors.
 //! - Named-property CacheIR hits for existing slots and allocation-free shape
 //!   transitions, including receiver storage and write-barrier proofs, plus
-//!   guarded lookup through pinned intrinsic prototypes.
+//!   guarded lookup through pinned intrinsic prototypes. PIC misses share the
+//!   VM property-action table with Graph before one committed runtime miss.
 //! - Structured try/catch/finally operations through the VM-owned exception
 //!   transition protocol.
 //! - Cooperative interrupt/work-budget polling on every generated backedge.
@@ -34,8 +37,8 @@
 //!   the AArch64 backend; operand decoding and branch validation are not
 //!   repeated here.
 //! - `r15` retains `JitCtx`, `r14` the active `Frame`, and `r13` its
-//!   register window. Runtime calls obey the System V integer ABI and return
-//!   two-word native results in `rax`/`rdx`.
+//!   register window. Runtime calls use the platform C boundary; its result is
+//!   normalized to `rax`/`rdx` for the private JavaScript convention.
 //! - Allocating string calls publish the plan-owned safepoint before reentry;
 //!   other coercive `+` cases complete through the shared runtime descriptor.
 //! - Every generated callee entry uses the shared x86 tier-up mailbox protocol;
@@ -44,6 +47,11 @@
 //! - Forwarding probes reject sources requiring caller materialization before
 //!   the committed value-span boundary can perform call effects.
 //! - The stack is 16-byte aligned at every generated call boundary.
+//! - Value immediates use zero-extending 32-bit moves when possible; symbolic
+//!   addresses retain fixed-width 64-bit moves for exact relocation offsets.
+//! - Compact RAX comparisons encode the 64-bit `83 /7 ib` form directly:
+//!   dynasm selects an imm32 form even for an explicitly byte-sized immediate.
+//!   Their checked positive imm8 compares the complete word, never its low byte.
 //!
 //! # See also
 //! - [`super::arm64`] for the peer target emitter.
@@ -53,19 +61,27 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-#[path = "x86_64/activation.rs"]
-mod activation;
+#[path = "x86_64/binding.rs"]
+mod binding;
 #[path = "x86_64/calls.rs"]
 mod calls;
+#[path = "x86_64/cold_exits.rs"]
+mod cold_exits;
 #[path = "x86_64/context.rs"]
 mod context;
 #[path = "x86_64/exceptions.rs"]
 mod exceptions;
+#[path = "x86_64/forward_call.rs"]
+mod forward_call;
 #[path = "x86_64/intrinsic_prototype.rs"]
 pub(crate) mod intrinsic_prototype;
+#[path = "x86_64/native_leaf.rs"]
+mod native_leaf;
+#[path = "x86_64/operation.rs"]
+pub(crate) mod operation;
+mod primitive_strings;
 
 use dynasmrt::{DynamicLabel, DynasmApi, DynasmLabelApi, dynasm, x64::Assembler};
-use otter_bytecode::opcode_schema::{BindingRead, BindingSemantics, BindingWrite};
 use otter_bytecode::scalar_semantics::{Int32ResultPolicy, NegativeZeroCondition};
 use otter_vm::{JitCompileSnapshot, native_abi as abi, runtime_stubs::alloc_value_stub_by_id};
 
@@ -76,21 +92,34 @@ use crate::{
         ArtifactRequest, CodeMapCapture, CodeRegion, NativeCompileOutput, build_bundle,
         relocation::{PropertySourceAccess, RelocationCapture, RelocationTarget},
     },
+    call_linkage::EntryShape,
     entry::{
         ALLOC_CTX_SAFEPOINT_ID_OFFSET, ALLOC_CTX_SPILL_SLOT_COUNT_OFFSET,
         ALLOC_CTX_SPILL_SLOTS_OFFSET, ALLOC_CTX_STACK_SIZE, ALLOC_CTX_THREAD_OFFSET,
-        CANONICAL_NAN_HI16, DOUBLE_OFFSET_HI16, NATIVE_FRAME_PC_OFFSET, NATIVE_FRAME_SELF_OFFSET,
-        NATIVE_FRAME_THIS_OFFSET, NUMBER_TAG_HI16, OBJECT_BODY_TYPE_TAG, THREAD_OFFSET,
-        VALUE_FALSE, VALUE_HOLE, VALUE_NULL, VALUE_TRUE, VALUE_UNDEFINED,
-        VM_THREAD_BACKEDGE_FUEL_CELL_OFFSET, VM_THREAD_GC_HEAP_OFFSET,
+        NATIVE_FRAME_PC_OFFSET, NATIVE_FRAME_SELF_OFFSET, NATIVE_FRAME_THIS_OFFSET,
+        OBJECT_BODY_TYPE_TAG, THREAD_OFFSET, VALUE_FALSE, VALUE_HOLE, VALUE_NULL, VALUE_TRUE,
+        VALUE_UNDEFINED, VM_THREAD_BACKEDGE_FUEL_CELL_OFFSET, VM_THREAD_GC_HEAP_OFFSET,
         VM_THREAD_INTERRUPT_CELL_OFFSET,
+    },
+    frame::{ActivationExits, CallEntryCold, SpillArea},
+    x86_64::{
+        call_abi::{emit_runtime_call, emit_variadic_call},
+        fields::{emit_field_base, emit_load_prototype},
+        frame,
+        values::{
+            DOUBLE_OFFSET, NUMBER_TAG, emit_box_double, emit_box_int32, emit_load_runtime_stub,
+            emit_load_symbol_u64, emit_load_u64,
+        },
     },
 };
 
-const NUMBER_TAG: u64 = (NUMBER_TAG_HI16 as u64) << 48;
-const DOUBLE_OFFSET: u64 = (DOUBLE_OFFSET_HI16 as u64) << 48;
-const CANONICAL_NAN: u64 = (CANONICAL_NAN_HI16 as u64) << 48;
 const NOT_CELL_MASK: u64 = otter_vm::value::tag::NOT_CELL_MASK;
+const _: () = assert!(
+    VALUE_TRUE <= i8::MAX as u64
+        && VALUE_FALSE <= i8::MAX as u64
+        && VALUE_NULL <= i8::MAX as u64
+        && VALUE_UNDEFINED <= i8::MAX as u64
+);
 
 pub(super) fn compile(
     view: &JitCompileSnapshot,
@@ -99,7 +128,13 @@ pub(super) fn compile(
     artifact_request: Option<ArtifactRequest>,
     capture_events: bool,
 ) -> Result<NativeCompileOutput<TemplateCode>, Unsupported> {
-    let plan = TemplatePlan::build(view)?;
+    let mut plan = TemplatePlan::build(view)?;
+    let call_safepoints = crate::return_sites::template_source_safepoints(&mut plan)?;
+    let mut return_sites = Vec::new();
+    let mut call_source_exits = Vec::new();
+    let mut required_exits = plan.instructions.iter().fold(0, |mask, instruction| {
+        mask | cold_exits::required(instruction.op)
+    });
     let tier_input = artifact_request.as_ref().map(|_| plan.render_artifact());
 
     let mut ops = Assembler::new()
@@ -116,7 +151,6 @@ pub(super) fn compile(
     let mut next_load_ic = 0usize;
     let mut next_store_ic = 0usize;
     let type_mismatch = ops.new_dynamic_label();
-    let identity_guard = ops.new_dynamic_label();
     let unsupported = ops.new_dynamic_label();
     let runtime_transition = ops.new_dynamic_label();
     let allocation_miss = ops.new_dynamic_label();
@@ -131,13 +165,13 @@ pub(super) fn compile(
         .iter()
         .map(|instruction| (instruction.pc, ops.new_dynamic_label()))
         .collect();
-    let shape = activation::EntryShape::of(
+    let shape = EntryShape::of(
         view,
         code_object_id,
         abi::NativeFrameKind::Baseline,
         !plan.safepoint_records.is_empty(),
     )?;
-    let activation_exits = activation::ActivationExits {
+    let activation_exits = ActivationExits {
         construct: ops.new_dynamic_label(),
         side_exit: ops.new_dynamic_label(),
     };
@@ -145,10 +179,26 @@ pub(super) fn compile(
     // builds this function's record and window and falls through.
     let entry = ops.offset();
     let body = ops.new_dynamic_label();
-    activation::emit_tier_prologue(&mut ops);
+    frame::emit_tier_prologue(&mut ops, shape.kind, SpillArea::NONE);
     dynasm!(ops ; .arch x64 ; jmp =>body);
-    let call_entry = (!plan.osr_only).then(|| activation::emit_call_entry(&mut ops, view, shape));
+    let call_entry = (!plan.osr_only).then(|| {
+        let cold = CallEntryCold::new(&mut ops, shape);
+        let start = frame::emit_call_entry(
+            &mut ops,
+            &mut relocations,
+            view,
+            shape,
+            SpillArea::NONE,
+            cold,
+        );
+        (start, cold)
+    });
     dynasm!(ops ; .arch x64 ; =>body);
+    if let Some(code_map) = code_map.as_mut()
+        && let Some((offset, _)) = call_entry.as_ref()
+    {
+        code_map.record_call_entry(offset.0);
+    }
     let mut labelled = BTreeSet::new();
 
     for (operation_index, instruction) in plan.instructions.iter().enumerate() {
@@ -157,1232 +207,75 @@ pub(super) fn compile(
             dynasm!(ops ; .arch x64 ; =>label);
         }
         let instruction_start = ops.offset().0;
+        let targets = [
+            type_mismatch,
+            unsupported,
+            runtime_transition,
+            allocation_miss,
+            backedge_relink,
+            returned,
+            committed_throw,
+            threw,
+            fatal,
+        ];
+        // A JS-call operation's abrupt exits publish its call source on a
+        // cold relay before reaching the shared exit.
+        let current = if !super::operation_is_js_call(instruction.op) {
+            targets
+        } else {
+            let labels: [DynamicLabel; 9] = std::array::from_fn(|_| ops.new_dynamic_label());
+            call_source_exits.push((
+                std::array::from_fn::<_, 9, _>(|index| (labels[index], targets[index])),
+                instruction.pc,
+                call_safepoints[&instruction.pc],
+            ));
+            labels
+        };
+        let [
+            type_mismatch,
+            unsupported,
+            runtime_transition,
+            allocation_miss,
+            backedge_relink,
+            returned,
+            committed_throw,
+            threw,
+            fatal,
+        ] = current;
         if requires_pc_stamp(instruction.op) {
             emit_stamp_pc(&mut ops, instruction.pc);
         }
-        match instruction.op {
-            TemplateOp::LoadImmediate { dst, bits } => {
-                emit_load_u64(&mut ops, 0, bits);
-                emit_store_reg(&mut ops, 0, dst);
-            }
-            TemplateOp::Move { dst, src } => {
-                emit_load_reg(&mut ops, 0, src);
-                emit_store_reg(&mut ops, 0, dst);
-            }
-            TemplateOp::Jump { target, back_edge } => {
-                if back_edge {
-                    emit_backedge_poll(
-                        &mut ops,
-                        &mut relocations,
-                        transitions.entry(abi::STUB_JIT_BACKEDGE_POLL),
-                        target,
-                        backedge_relink,
-                        threw,
-                        fatal,
-                    );
-                }
-                let target = labels[&target];
-                dynasm!(ops ; .arch x64 ; jmp =>target);
-            }
-            TemplateOp::Branch {
-                condition,
-                target,
-                when_truthy,
-                back_edge,
-            } => {
-                emit_load_reg(&mut ops, 0, condition);
-                emit_truthiness_bool(&mut ops, type_mismatch);
-                let fallthrough = ops.new_dynamic_label();
-                emit_load_u64(
-                    &mut ops,
-                    11,
-                    if when_truthy { VALUE_FALSE } else { VALUE_TRUE },
-                );
-                dynasm!(ops ; .arch x64 ; cmp rax, r11 ; je =>fallthrough);
-                if back_edge {
-                    emit_backedge_poll(
-                        &mut ops,
-                        &mut relocations,
-                        transitions.entry(abi::STUB_JIT_BACKEDGE_POLL),
-                        target,
-                        backedge_relink,
-                        threw,
-                        fatal,
-                    );
-                }
-                let target = labels[&target];
-                dynasm!(ops ; .arch x64 ; jmp =>target ; =>fallthrough);
-            }
-            TemplateOp::BranchNullish {
-                condition,
-                target,
-                back_edge,
-            } => {
-                emit_load_reg(&mut ops, 0, condition);
-                let taken = ops.new_dynamic_label();
-                let done = ops.new_dynamic_label();
-                emit_load_u64(&mut ops, 11, VALUE_NULL);
-                dynasm!(ops ; .arch x64 ; cmp rax, r11 ; je =>taken);
-                emit_load_u64(&mut ops, 11, VALUE_UNDEFINED);
-                dynasm!(ops ; .arch x64 ; cmp rax, r11 ; jne =>done ; =>taken);
-                if back_edge {
-                    emit_backedge_poll(
-                        &mut ops,
-                        &mut relocations,
-                        transitions.entry(abi::STUB_JIT_BACKEDGE_POLL),
-                        target,
-                        backedge_relink,
-                        threw,
-                        fatal,
-                    );
-                }
-                let target = labels[&target];
-                dynasm!(ops ; .arch x64 ; jmp =>target ; =>done);
-            }
-            TemplateOp::Truthiness { dst, src, negate } => {
-                emit_load_reg(&mut ops, 0, src);
-                emit_truthiness_bool(&mut ops, type_mismatch);
-                if negate {
-                    emit_load_u64(&mut ops, 11, VALUE_TRUE ^ VALUE_FALSE);
-                    dynasm!(ops ; .arch x64 ; xor rax, r11);
-                }
-                emit_store_reg(&mut ops, 0, dst);
-            }
-            // The plan retains the unfused per-operation stream immediately
-            // after this hint. x86-64 deliberately executes that stream until
-            // its own register-pressure measurements justify a fused form.
-            TemplateOp::FusedNumericChain { .. } => {}
-            TemplateOp::BinaryArith {
-                dst,
-                lhs,
-                rhs,
-                kind,
-            } => emit_binary_arith(&mut ops, dst, lhs, rhs, kind, type_mismatch),
-            TemplateOp::AddGeneric {
-                dst,
-                lhs,
-                rhs,
-                concat_safepoint,
-            } => emit_add_generic(
-                &mut ops,
-                &mut relocations,
-                transitions,
-                dst,
-                lhs,
-                rhs,
-                concat_safepoint,
-                threw,
-                fatal,
-            )?,
-            TemplateOp::Compare {
-                dst,
-                lhs,
-                rhs,
-                kind,
-            } => emit_compare(
-                &mut ops,
-                &mut relocations,
-                dst,
-                lhs,
-                rhs,
-                kind,
-                type_mismatch,
-            ),
-            TemplateOp::LooseCompare {
-                dst,
-                lhs,
-                rhs,
-                negate,
-            } => emit_loose_compare(&mut ops, dst, lhs, rhs, negate, type_mismatch),
-            TemplateOp::TestTypeOf { dst, src, test } => {
-                emit_test_typeof(&mut ops, &mut relocations, dst, src, test, type_mismatch)
-            }
-            TemplateOp::IntBitwise {
-                dst,
-                lhs,
-                rhs,
-                kind,
-            } => emit_bitwise(&mut ops, dst, lhs, rhs, kind, type_mismatch),
-            TemplateOp::UnsignedShiftRight { dst, lhs, rhs } => {
-                emit_unsigned_shift(&mut ops, dst, lhs, rhs, type_mismatch)
-            }
-            TemplateOp::Increment { dst, src, delta } => {
-                emit_increment(&mut ops, dst, src, delta, type_mismatch)
-            }
-            TemplateOp::Negate { dst, src } => emit_negate(&mut ops, dst, src, type_mismatch),
-            TemplateOp::BitwiseNot { dst, src } => {
-                emit_load_reg(&mut ops, 0, src);
-                emit_to_int32(&mut ops, 0, 10, type_mismatch);
-                dynasm!(ops ; .arch x64 ; not r10d);
-                emit_box_int32(&mut ops, 10, 0);
-                emit_store_reg(&mut ops, 0, dst);
-            }
-            TemplateOp::ToNumeric { dst, src } => {
-                emit_load_reg(&mut ops, 0, src);
-                emit_guard_number(&mut ops, 0, type_mismatch);
-                emit_store_reg(&mut ops, 0, dst);
-            }
-            TemplateOp::ToPrimitive { dst, src, .. } => {
-                emit_load_reg(&mut ops, 0, src);
-                emit_load_u64(&mut ops, 11, NOT_CELL_MASK);
-                dynasm!(ops
-                    ; .arch x64
-                    ; mov r10, rax
-                    ; and r10, r11
-                    ; test r10, r10
-                    ; jz =>type_mismatch
-                );
-                emit_store_reg(&mut ops, 0, dst);
-            }
-            TemplateOp::LoadThis { dst } => {
-                dynasm!(ops ; .arch x64 ; mov rax, [r14 + NATIVE_FRAME_THIS_OFFSET as i32]);
-                emit_load_u64(&mut ops, 11, VALUE_HOLE);
-                dynasm!(ops ; .arch x64 ; cmp rax, r11 ; je =>type_mismatch);
-                emit_store_reg(&mut ops, 0, dst);
-            }
-            TemplateOp::LoadSelfClosure { dst } => {
-                dynasm!(ops ; .arch x64 ; mov rax, [r14 + NATIVE_FRAME_SELF_OFFSET as i32]);
-                emit_store_reg(&mut ops, 0, dst);
-            }
-            TemplateOp::LoadClosureContext { dst } => {
-                context::emit_load_closure_context(&mut ops, view, dst)?;
-            }
-            TemplateOp::LoadContextSlot {
-                dst,
-                context,
-                depth,
-                slot,
-            } => context::emit_load_context_slot(&mut ops, view, dst, context, depth, slot)?,
-            TemplateOp::StoreContextSlot {
-                src,
-                context,
-                depth,
-                slot,
-            } => context::emit_store_context_slot(
-                &mut ops,
-                &mut relocations,
-                view,
-                src,
-                context,
-                depth,
-                slot,
-            )?,
-            TemplateOp::CreateContext {
-                dst,
-                parent,
-                scope,
-                safepoint,
-            } => context::emit_context_allocation(
-                &mut ops,
-                &mut relocations,
-                view,
-                dst,
-                context::ContextAllocation::Create { parent, scope },
-                safepoint,
-                allocation_miss,
-            )?,
-            TemplateOp::CopyContext {
-                dst,
-                src,
-                safepoint,
-            } => context::emit_context_allocation(
-                &mut ops,
-                &mut relocations,
-                view,
-                dst,
-                context::ContextAllocation::Copy { source: src },
-                safepoint,
-                allocation_miss,
-            )?,
-            TemplateOp::ClassSuperConstructor { dst, class } => {
-                emit_load_reg(&mut ops, 6, class);
-                dynasm!(ops ; .arch x64 ; mov rdi, r15);
-                emit_load_runtime_stub(
-                    &mut ops,
-                    &mut relocations,
-                    transitions.variadic_entry(abi::STUB_JIT_CLASS_SUPER_CONSTRUCTOR),
-                    abi::STUB_JIT_CLASS_SUPER_CONSTRUCTOR,
-                );
-                dynasm!(ops ; .arch x64 ; call r11);
-                emit_load_u64(&mut ops, 11, VALUE_HOLE);
-                dynasm!(ops ; .arch x64 ; cmp rax, r11 ; je =>runtime_transition);
-                emit_store_reg(&mut ops, 0, dst);
-            }
-            TemplateOp::MakeFunction { dst, constant } => {
-                let done = ops.new_dynamic_label();
-                if let Some(&plan) = view.closure_allocations.get(&instruction.byte_pc) {
-                    let slow = ops.new_dynamic_label();
-                    emit_load_u64(&mut ops, 2, VALUE_UNDEFINED);
-                    crate::x86_64::allocation::emit_closure(&mut ops, view, plan, 14, slow);
-                    emit_store_reg(&mut ops, 0, dst);
-                    dynasm!(ops ; .arch x64 ; jmp =>done ; =>slow);
-                }
-                emit_make_function(
-                    &mut ops,
-                    &mut relocations,
-                    transitions,
-                    dst,
-                    constant,
-                    threw,
-                    fatal,
-                );
-                dynasm!(ops ; .arch x64 ; =>done);
-            }
-            TemplateOp::NewObject { dst } => emit_value_packet_transition(
-                &mut ops,
-                &mut relocations,
-                transitions,
-                abi::STUB_JIT_NEW_OBJECT,
-                &[],
-                dst,
-                committed_throw,
-                fatal,
-            )?,
-            TemplateOp::CollectArguments { dst } => {
-                emit_collect_arguments(&mut ops, &mut relocations, transitions, dst, threw, fatal)
-            }
-            TemplateOp::CallForwardArguments {
-                dst,
-                method,
-                receiver,
-                this_value,
-            } => calls::emit_forward_call(
-                &mut ops,
-                &mut relocations,
+        operation::emit_operation(
+            operation::OperationContext {
+                ops: &mut ops,
+                relocations: &mut relocations,
+                return_sites: &mut return_sites,
+                call_safepoint: call_safepoints.get(&instruction.pc).copied().unwrap_or(0),
                 transitions,
                 view,
-                [dst, method, receiver, this_value],
-                committed_throw,
-                threw,
-            )?,
-            TemplateOp::NewArray { dst, elements } => {
-                let words = plan
-                    .register_tail(elements)
-                    .iter()
-                    .copied()
-                    .map(PacketWord::Register)
-                    .collect::<Vec<_>>();
-                emit_value_packet_transition(
-                    &mut ops,
-                    &mut relocations,
-                    transitions,
-                    abi::STUB_JIT_NEW_ARRAY,
-                    &words,
-                    dst,
-                    committed_throw,
-                    fatal,
-                )?;
-            }
-            TemplateOp::NewObjectLiteral { dst, elements } => {
-                let words = plan
-                    .register_tail(elements)
-                    .iter()
-                    .copied()
-                    .map(PacketWord::Register)
-                    .collect::<Vec<_>>();
-                emit_value_packet_transition(
-                    &mut ops,
-                    &mut relocations,
-                    transitions,
-                    abi::STUB_JIT_NEW_OBJECT_LITERAL,
-                    &words,
-                    dst,
-                    committed_throw,
-                    fatal,
-                )?;
-            }
-            TemplateOp::DefineDataProperty { object, key, value } => {
-                dynasm!(ops
-                    ; .arch x64
-                    ; mov rdi, r15
-                    ; mov esi, object as i32
-                    ; mov edx, key as i32
-                    ; mov ecx, value as i32
-                );
-                emit_load_runtime_stub(
-                    &mut ops,
-                    &mut relocations,
-                    transitions.variadic_entry(abi::STUB_JIT_DEFINE_DATA_PROPERTY),
-                    abi::STUB_JIT_DEFINE_DATA_PROPERTY,
-                );
-                dynasm!(ops ; .arch x64 ; call r11);
-                emit_status_word_result(&mut ops, threw, fatal);
-            }
-            TemplateOp::DefineOwnProperty {
-                target,
-                key,
-                descriptor,
-            } => emit_define_own_property(
-                &mut ops,
-                &mut relocations,
-                transitions,
-                target,
-                key,
-                descriptor,
-                threw,
-                fatal,
-            ),
-            TemplateOp::ConstructOp {
-                opcode,
-                arg0,
-                arg1,
-                arg2,
-            } => emit_opcode_transition(
-                &mut ops,
-                &mut relocations,
-                transitions,
-                abi::STUB_JIT_CONSTRUCT_OP,
-                opcode,
-                arg0,
-                arg1,
-                arg2,
-                runtime_transition,
-                threw,
-                fatal,
-            ),
-            TemplateOp::ClassOp {
-                opcode,
-                arg0,
-                arg1,
-                arg2,
-            } => emit_opcode_transition(
-                &mut ops,
-                &mut relocations,
-                transitions,
-                abi::STUB_JIT_CLASS_OP,
-                opcode,
-                arg0,
-                arg1,
-                arg2,
-                runtime_transition,
-                threw,
-                fatal,
-            ),
-            TemplateOp::SpreadCallOp {
-                opcode,
-                arg0,
-                arg1,
-                arg2,
-            } => calls::emit_spread_call_op(
-                &mut ops,
-                &mut relocations,
-                transitions,
-                opcode,
-                arg0,
-                arg1,
-                arg2,
-                committed_throw,
-                threw,
-            )?,
-            TemplateOp::DeleteOp {
-                opcode,
-                arg0,
-                arg1,
-                arg2,
-            } => emit_opcode_transition(
-                &mut ops,
-                &mut relocations,
-                transitions,
-                abi::STUB_JIT_DELETE_OP,
-                opcode,
-                arg0,
-                arg1,
-                arg2,
-                runtime_transition,
-                threw,
-                fatal,
-            ),
-            TemplateOp::SuperOp {
-                opcode,
-                arg0,
-                arg1,
-                arg2,
-            } => emit_opcode_transition(
-                &mut ops,
-                &mut relocations,
-                transitions,
-                abi::STUB_JIT_SUPER_OP,
-                opcode,
-                arg0,
-                arg1,
-                arg2,
-                runtime_transition,
-                threw,
-                fatal,
-            ),
-            TemplateOp::PrivateOp {
-                opcode,
-                arg0,
-                arg1,
-                arg2,
-            } => emit_opcode_transition(
-                &mut ops,
-                &mut relocations,
-                transitions,
-                abi::STUB_JIT_PRIVATE_OP,
-                opcode,
-                arg0,
-                arg1,
-                arg2,
-                runtime_transition,
-                threw,
-                fatal,
-            ),
-            TemplateOp::ValueLoadOp {
-                opcode,
-                arg0,
-                arg1,
-                arg2,
-            } => emit_opcode_transition(
-                &mut ops,
-                &mut relocations,
-                transitions,
-                abi::STUB_JIT_VALUE_LOAD_OP,
-                opcode,
-                arg0,
-                arg1,
-                arg2,
-                runtime_transition,
-                threw,
-                fatal,
-            ),
-            TemplateOp::StructuralOp {
-                opcode,
-                arg0,
-                arg1,
-                arg2,
-            } => emit_opcode_transition(
-                &mut ops,
-                &mut relocations,
-                transitions,
-                abi::STUB_JIT_STRUCTURAL_OP,
-                opcode,
-                arg0,
-                arg1,
-                arg2,
-                runtime_transition,
-                threw,
-                fatal,
-            ),
-            TemplateOp::ModuleOp {
-                opcode,
-                arg0,
-                arg1,
-                arg2,
-            } => emit_opcode_transition(
-                &mut ops,
-                &mut relocations,
-                transitions,
-                abi::STUB_JIT_MODULE_OP,
-                opcode,
-                arg0,
-                arg1,
-                arg2,
-                runtime_transition,
-                threw,
-                fatal,
-            ),
-            TemplateOp::VariadicOp {
-                opcode,
-                prefix,
-                argc,
-                packed_args,
-            } => emit_opcode_transition(
-                &mut ops,
-                &mut relocations,
-                transitions,
-                abi::STUB_JIT_VARIADIC_OP,
-                opcode,
-                u64::from(prefix),
-                u64::from(argc),
-                packed_args,
-                runtime_transition,
-                threw,
-                fatal,
-            ),
-            TemplateOp::StaticCallOp {
-                opcode,
-                packed_head,
-                method,
-                packed_args,
-            } => emit_opcode_transition(
-                &mut ops,
-                &mut relocations,
-                transitions,
-                abi::STUB_JIT_STATIC_CALL_OP,
-                opcode,
-                packed_head,
-                method,
-                packed_args,
-                runtime_transition,
-                threw,
-                fatal,
-            ),
-            TemplateOp::BindFunction {
-                dst,
-                callee,
-                bound_this,
-                argc,
-                packed_args,
-            } => {
-                let packed_meta = u64::from(dst)
-                    | (u64::from(callee) << 16)
-                    | (u64::from(bound_this) << 32)
-                    | (u64::from(argc) << 48);
-                dynasm!(ops ; .arch x64 ; mov rdi, r15);
-                emit_load_u64(&mut ops, 6, packed_meta);
-                emit_load_u64(&mut ops, 2, packed_args);
-                emit_load_runtime_stub(
-                    &mut ops,
-                    &mut relocations,
-                    transitions.variadic_entry(abi::STUB_JIT_BIND_FUNCTION),
-                    abi::STUB_JIT_BIND_FUNCTION,
-                );
-                dynasm!(ops ; .arch x64 ; call r11);
-                emit_side_exit_status_result(&mut ops, runtime_transition, threw, fatal);
-            }
-            TemplateOp::LoadRegExp { dst, constant } => emit_constant_transition(
-                &mut ops,
-                &mut relocations,
-                transitions,
-                abi::STUB_JIT_LOAD_REGEXP,
-                dst,
-                constant,
-                threw,
-                fatal,
-            ),
-            TemplateOp::LoadBuiltinError { dst, constant } => emit_constant_transition(
-                &mut ops,
-                &mut relocations,
-                transitions,
-                abi::STUB_JIT_LOAD_BUILTIN_ERROR,
-                dst,
-                constant,
-                threw,
-                fatal,
-            ),
-            TemplateOp::ArrayConstruct {
-                dst,
-                length,
-                safepoint,
-            } => emit_array_construct_alloc_call(
-                &mut ops,
-                &mut relocations,
-                dst,
-                length,
-                safepoint,
-                allocation_miss,
-            )?,
-            TemplateOp::ClassValueOp {
-                opcode,
-                arg0,
-                arg1,
-                arg2,
-            } => emit_opcode_transition(
-                &mut ops,
-                &mut relocations,
-                transitions,
-                abi::STUB_JIT_CLASS_VALUE_OP,
-                opcode,
-                arg0,
-                arg1,
-                arg2,
-                runtime_transition,
-                threw,
-                fatal,
-            ),
-            TemplateOp::MakeClosure {
-                dst,
-                function,
-                context,
-            } => {
-                let done = ops.new_dynamic_label();
-                if let Some(&plan) = view.closure_allocations.get(&instruction.byte_pc) {
-                    let slow = ops.new_dynamic_label();
-                    emit_load_reg(&mut ops, 2, context);
-                    crate::x86_64::allocation::emit_closure(&mut ops, view, plan, 14, slow);
-                    emit_store_reg(&mut ops, 0, dst);
-                    dynasm!(ops ; .arch x64 ; jmp =>done ; =>slow);
-                }
-                emit_make_closure(
-                    &mut ops,
-                    &mut relocations,
-                    transitions,
-                    view.code_block.id,
-                    dst,
-                    function,
-                    context,
-                    threw,
-                    fatal,
-                );
-                dynasm!(ops ; .arch x64 ; =>done);
-            }
-            TemplateOp::BindingValue {
-                semantics,
-                result,
-                value0,
-                value1,
-                context_coord,
-            } => {
-                let checked = match (semantics, context_coord) {
-                    (BindingSemantics::Read(BindingRead::ContextSlot { .. }), Some(coord)) => {
-                        let dst = result.ok_or(Unsupported::OperandShape("context read result"))?;
-                        Some((context::CheckedContextAccess::Load { dst }, value0, coord))
-                    }
-                    (BindingSemantics::Write(BindingWrite::ContextSlot { .. }), Some(coord)) => {
-                        let src = value0.ok_or(Unsupported::OperandShape("context write value"))?;
-                        Some((context::CheckedContextAccess::Store { src }, value1, coord))
-                    }
-                    _ => None,
-                };
-                let done = ops.new_dynamic_label();
-                if let Some((access, register, coord)) = checked {
-                    let miss = ops.new_dynamic_label();
-                    context::emit_checked_context_slot(
-                        &mut ops,
-                        &mut relocations,
-                        view,
-                        access,
-                        register.ok_or(Unsupported::OperandShape("checked context register"))?,
-                        coord.depth,
-                        coord.slot,
-                        miss,
-                    )?;
-                    dynasm!(ops ; .arch x64 ; jmp =>done ; =>miss);
-                }
-                emit_committed_value2(
-                    &mut ops,
-                    &mut relocations,
-                    transitions,
-                    abi::STUB_JIT_BINDING_VALUE,
-                    result,
-                    value0,
-                    value1,
-                    committed_throw,
-                    fatal,
-                );
-                dynasm!(ops ; .arch x64 ; =>done);
-            }
-            TemplateOp::GlobalDeclarationValue { value0, value1, .. } => {
-                emit_committed_value2(
-                    &mut ops,
-                    &mut relocations,
-                    transitions,
-                    abi::STUB_JIT_GLOBAL_DECLARATION_VALUE,
-                    None,
-                    value0,
-                    value1,
-                    committed_throw,
-                    fatal,
-                );
-            }
-            TemplateOp::ObjectProtocolValue {
-                operation: _,
-                result,
-                value0,
-                value1,
-            } => emit_committed_value2(
-                &mut ops,
-                &mut relocations,
-                transitions,
-                abi::STUB_JIT_OBJECT_PROTOCOL_VALUE,
-                result,
-                Some(value0),
-                value1,
-                committed_throw,
-                fatal,
-            ),
-            TemplateOp::LoadStringConstant { dst } => {
-                let target = view
-                    .string_constant_cells
-                    .get(&instruction.byte_pc)
-                    .ok_or(Unsupported::OperandShape("prepared LoadString stable cell"))?;
-                emit_load_symbol_u64(
-                    &mut ops,
-                    &mut relocations,
-                    11,
-                    target.cell_addr as u64,
-                    RelocationTarget::StringConstantCell {
-                        function_id: view.code_block.id,
-                        byte_pc: instruction.byte_pc,
-                    },
-                );
-                dynasm!(ops ; .arch x64 ; mov rax, [r11]);
-                emit_store_reg(&mut ops, 0, dst);
-            }
-            TemplateOp::LoadProperty { dst, object, .. } => {
-                let ordinal = u32::try_from(next_load_ic)
-                    .map_err(|_| Unsupported::OperandShape("x86-64 property IC ordinal"))?;
-                let cell = load_ic_cells
-                    .get_mut(next_load_ic)
-                    .ok_or(Unsupported::OperandShape("x86-64 property IC inventory"))?;
-                next_load_ic += 1;
-                cell.set_source(view.code_block.id, instruction.pc);
-                emit_load_property(
-                    &mut ops,
-                    &mut relocations,
-                    transitions,
-                    view,
-                    instruction.byte_pc,
-                    dst,
-                    object,
-                    cell as *mut crate::entry::PropertySourceCell as u64,
-                    ordinal,
-                    view.property_programs
-                        .get(&instruction.byte_pc)
-                        .map(Vec::as_slice),
-                    committed_throw,
-                    fatal,
-                );
-            }
-            TemplateOp::StoreProperty { object, value, .. } => {
-                let ordinal = u32::try_from(next_store_ic)
-                    .map_err(|_| Unsupported::OperandShape("x86-64 property IC ordinal"))?;
-                let cell = store_ic_cells
-                    .get_mut(next_store_ic)
-                    .ok_or(Unsupported::OperandShape("x86-64 property IC inventory"))?;
-                next_store_ic += 1;
-                cell.set_source(view.code_block.id, instruction.pc);
-                emit_store_property(
-                    &mut ops,
-                    &mut relocations,
-                    transitions,
-                    view,
-                    object,
-                    value,
-                    cell as *mut crate::entry::PropertySourceCell as u64,
-                    ordinal,
-                    view.property_programs
-                        .get(&instruction.byte_pc)
-                        .map(Vec::as_slice),
-                    committed_throw,
-                    fatal,
-                );
-            }
-            TemplateOp::LoadElement {
-                dst,
-                receiver,
-                index,
-            } => emit_load_element(
-                &mut ops,
-                &mut relocations,
-                transitions,
-                dst,
-                receiver,
-                index,
-                committed_throw,
-                fatal,
-            ),
-            TemplateOp::StoreElement {
-                receiver,
-                index,
-                value,
-            } => emit_store_element(
-                &mut ops,
-                &mut relocations,
-                transitions,
-                receiver,
-                index,
-                value,
-                committed_throw,
-                fatal,
-            ),
-            TemplateOp::Call {
-                dst,
-                callee,
-                argc,
-                packed_args,
-                byte_pc,
-            } => {
-                let arguments = plan.call_argument_registers(argc, packed_args);
-                if let Some(target) = view.static_native_calls.get(&byte_pc) {
-                    let name = abi::runtime_stub_name(target.leaf_stub_id);
-                    if crate::machine::native_leaf::supports_site(view, *target, arguments.len()) {
-                        let start = ops.offset().0;
-                        emit_load_reg(&mut ops, 10, callee);
-                        for (index, &argument) in arguments.iter().enumerate() {
-                            emit_load_reg(&mut ops, if index == 0 { 6 } else { 2 }, argument);
-                        }
-                        crate::machine::native_leaf::x86_64::emit_guard(
-                            &mut ops,
-                            view,
-                            target.builtin_native_ref,
-                            type_mismatch,
-                        );
-                        crate::machine::native_leaf::x86_64::emit_tagged_call(
-                            &mut ops,
-                            &mut relocations,
-                            target.leaf_stub_id,
-                            target.argument_count,
-                            type_mismatch,
-                        )?;
-                        emit_store_reg(&mut ops, 0, dst);
-                        if let Some(code_map) = code_map.as_mut() {
-                            code_map.record(CodeRegion::static_native_structural(
-                                "nativeLeafCall",
-                                start,
-                                ops.offset().0,
-                                view.code_block.id,
-                                instruction.pc,
-                                byte_pc,
-                                name,
-                            ));
-                        }
-                        if let Some(events) = direct_call_events.as_mut() {
-                            events.insert(
-                                (byte_pc, 0),
-                                otter_vm::JitCompilerDiagnostic::StaticNativeCallLowered {
-                                    instruction_pc: instruction.pc,
-                                    byte_pc,
-                                    target: name,
-                                    outcome:
-                                        otter_vm::JitStaticNativeCallLoweringOutcome::Generated,
-                                },
-                            );
-                        }
-                        if let Some(code_map) = code_map.as_mut() {
-                            code_map.record(CodeRegion::instruction(
-                                instruction_start,
-                                ops.offset().0,
-                                None,
-                                None,
-                                view.code_block.id,
-                                instruction.pc,
-                                instruction.byte_pc,
-                                Some(u32::try_from(operation_index).unwrap_or(u32::MAX)),
-                                format!("{:?}", instruction.op),
-                            ));
-                        }
-                        continue;
-                    }
-                    if let Some(events) = direct_call_events.as_mut() {
-                        events.insert(
-                            (byte_pc, 0),
-                            otter_vm::JitCompilerDiagnostic::StaticNativeCallLowered {
-                                instruction_pc: instruction.pc,
-                                byte_pc,
-                                target: name,
-                                outcome:
-                                    otter_vm::JitStaticNativeCallLoweringOutcome::Rejected {
-                                        reason: otter_vm::JitStaticNativeCallLoweringRejectionReason::ArityUnsupported,
-                                    },
-                            },
-                        );
-                    }
-                }
-                let known = view
-                    .direct_callees
-                    .get(&byte_pc)
-                    .filter(|targets| targets.len() == 1)
-                    .map(|targets| targets[0].plan);
-                let start = ops.offset().0;
-                calls::emit_call(
-                    &mut ops,
-                    &mut relocations,
-                    transitions,
-                    view,
-                    Some(callee),
-                    None,
-                    calls::CallNewTarget::None,
-                    &arguments,
-                    known,
-                    instruction.pc,
-                    dst,
-                    committed_throw,
-                    threw,
-                )?;
-                if let Some(code_map) = code_map.as_mut() {
-                    code_map.record(CodeRegion::call_structural(
-                        "callTrampoline",
-                        start,
-                        ops.offset().0,
-                        view.code_block.id,
-                        instruction.pc,
-                        byte_pc,
-                        known.map(|plan| plan.function_id),
-                    ));
-                }
-            }
-            TemplateOp::CallWithThis {
-                dst,
-                callee,
-                this_value,
-                argc,
-                packed_args,
-                byte_pc: _,
-            } => {
-                let arguments = plan.call_argument_registers(argc, packed_args);
-                calls::emit_call(
-                    &mut ops,
-                    &mut relocations,
-                    transitions,
-                    view,
-                    Some(callee),
-                    Some(this_value),
-                    calls::CallNewTarget::None,
-                    &arguments,
-                    None,
-                    instruction.pc,
-                    dst,
-                    committed_throw,
-                    threw,
-                )?;
-            }
-            TemplateOp::Construct {
-                dst,
-                callee,
-                argc,
-                packed_args,
-                super_construct,
-                byte_pc,
-            } => {
-                let arguments = plan.call_argument_registers(argc, packed_args);
-                let known = view
-                    .direct_callees
-                    .get(&byte_pc)
-                    .filter(|targets| targets.len() == 1)
-                    .map(|targets| targets[0].plan);
-                let start = ops.offset().0;
-                calls::emit_call(
-                    &mut ops,
-                    &mut relocations,
-                    transitions,
-                    view,
-                    Some(callee),
-                    None,
-                    if super_construct {
-                        calls::CallNewTarget::Super
-                    } else {
-                        calls::CallNewTarget::Callee
-                    },
-                    &arguments,
-                    known,
-                    instruction.pc,
-                    dst,
-                    committed_throw,
-                    threw,
-                )?;
-                if let Some(code_map) = code_map.as_mut() {
-                    code_map.record(CodeRegion::call_structural(
-                        "callTrampoline",
-                        start,
-                        ops.offset().0,
-                        view.code_block.id,
-                        instruction.pc,
-                        byte_pc,
-                        known.map(|plan| plan.function_id),
-                    ));
-                }
-            }
-            TemplateOp::MethodCall {
-                dst,
-                receiver,
-                arguments,
-                ..
-            } => {
-                let argument_registers = plan.register_tail(arguments);
-                calls::emit_method_call(
-                    &mut ops,
-                    &mut relocations,
-                    transitions,
-                    view,
-                    receiver,
-                    argument_registers,
-                    dst,
-                    committed_throw,
-                    threw,
-                )?;
-            }
-            TemplateOp::Throw { src } => {
-                emit_scalar_value(
-                    &mut ops,
-                    &mut relocations,
-                    transitions,
-                    src,
-                    Some(src),
-                    None,
-                    committed_throw,
-                    fatal,
-                );
-                emit_load_reg(&mut ops, 0, src);
-                dynasm!(ops ; .arch x64 ; jmp =>committed_throw);
-            }
-            TemplateOp::ScalarValue {
-                operation,
-                result,
-                value0,
-                value1,
-            } => {
-                let slow = ops.new_dynamic_label();
-                let done = ops.new_dynamic_label();
-                if matches!(
-                    operation,
-                    abi::ScalarValueOp::LoadArgumentsLength
-                        | abi::ScalarValueOp::LoadArgumentsElement
-                ) {
-                    if let Some(src) = value0 {
-                        emit_load_reg(&mut ops, 9, src);
-                    }
-                    dynasm!(ops ; .arch x64 ; mov r11, r14);
-                    crate::x86_64::arguments::emit(&mut ops, value0.map(|_| 9), slow);
-                    emit_store_reg(&mut ops, 8, result);
-                    dynasm!(ops ; .arch x64 ; jmp =>done);
-                }
-                dynasm!(ops ; .arch x64 ; =>slow);
-                emit_scalar_value(
-                    &mut ops,
-                    &mut relocations,
-                    transitions,
-                    result,
-                    value0,
-                    value1,
-                    committed_throw,
-                    fatal,
-                );
-                dynasm!(ops ; .arch x64 ; =>done);
-            }
-            TemplateOp::TdzError { local_index } => exceptions::emit_exception_op(
-                &mut ops,
-                &mut relocations,
-                transitions,
-                otter_bytecode::Op::TdzError as u8,
-                u64::from(local_index),
-                runtime_transition,
-                committed_throw,
-                fatal,
-            ),
-            TemplateOp::IteratorNext {
-                value_dst,
-                done_dst,
-                iterator,
-            } => emit_opcode_transition(
-                &mut ops,
-                &mut relocations,
-                transitions,
-                abi::STUB_JIT_ITERATOR_OP,
-                otter_bytecode::Op::IteratorNext as u8,
-                u64::from(value_dst),
-                u64::from(done_dst),
-                u64::from(iterator),
-                runtime_transition,
-                threw,
-                fatal,
-            ),
-            TemplateOp::IteratorClose { iterator } => emit_opcode_transition(
-                &mut ops,
-                &mut relocations,
-                transitions,
-                abi::STUB_JIT_ITERATOR_OP,
-                otter_bytecode::Op::IteratorClose as u8,
-                u64::from(iterator),
-                0,
-                0,
-                runtime_transition,
-                threw,
-                fatal,
-            ),
-            TemplateOp::IteratorCloseThrow { iterator } => emit_opcode_transition(
-                &mut ops,
-                &mut relocations,
-                transitions,
-                abi::STUB_JIT_ITERATOR_OP,
-                otter_bytecode::Op::IteratorCloseThrow as u8,
-                u64::from(iterator),
-                0,
-                0,
-                runtime_transition,
-                threw,
-                fatal,
-            ),
-            TemplateOp::NoOp => {}
-            TemplateOp::GetIterator { dst, src } => emit_opcode_transition(
-                &mut ops,
-                &mut relocations,
-                transitions,
-                abi::STUB_JIT_ITERATOR_OP,
-                otter_bytecode::Op::GetIterator as u8,
-                u64::from(dst),
-                u64::from(src),
-                0,
-                runtime_transition,
-                threw,
-                fatal,
-            ),
-            TemplateOp::GetAsyncIterator { dst, src } => emit_opcode_transition(
-                &mut ops,
-                &mut relocations,
-                transitions,
-                abi::STUB_JIT_ITERATOR_OP,
-                otter_bytecode::Op::GetAsyncIterator as u8,
-                u64::from(dst),
-                u64::from(src),
-                0,
-                runtime_transition,
-                threw,
-                fatal,
-            ),
-            TemplateOp::Return { src } => {
-                emit_load_reg(&mut ops, 0, src);
-                dynasm!(ops ; .arch x64 ; jmp =>returned);
-            }
-            TemplateOp::ReturnUndefined => {
-                emit_load_u64(&mut ops, 0, VALUE_UNDEFINED);
-                dynasm!(ops ; .arch x64 ; jmp =>returned);
-            }
-            TemplateOp::ReturnDerived {
-                value,
-                context,
-                depth,
-                slot,
-            } => {
-                // Only `undefined` over a bound receiver completes here; the
-                // receiver is the construct result. Every other shape re-runs
-                // `ReturnDerived` in the interpreter before any effect. Template
-                // never compiles a return that crosses a `finally`, so reading
-                // the `DerivedThis` slot now equals reading it at frame pop.
-                emit_load_reg(&mut ops, 0, value);
-                emit_load_u64(&mut ops, 11, VALUE_UNDEFINED);
-                dynasm!(ops ; .arch x64 ; cmp rax, r11 ; jne =>runtime_transition);
-                context::emit_read_context_slot_rax(&mut ops, view, context, depth, slot)?;
-                emit_load_u64(&mut ops, 11, VALUE_HOLE);
-                dynasm!(ops
-                    ; .arch x64
-                    ; cmp rax, r11
-                    ; je =>runtime_transition
-                    ; jmp =>returned
-                );
-            }
-            TemplateOp::TailCall {
-                dst,
-                callee,
-                argc,
-                packed_args,
-                byte_pc,
-            } => {
-                let arguments = plan.call_argument_registers(argc, packed_args);
-                let known = view
-                    .direct_callees
-                    .get(&byte_pc)
-                    .filter(|targets| targets.len() == 1)
-                    .map(|targets| targets[0].plan);
-                calls::emit_tail_call(
-                    &mut ops,
-                    &mut relocations,
-                    transitions,
-                    view,
-                    callee,
-                    &arguments,
-                    known,
-                    instruction.pc,
-                    dst,
-                    runtime_transition,
+                plan: &plan,
+                labels: &labels,
+                exits: crate::template::operation::OperationExits {
+                    type_mismatch_exit: type_mismatch,
+                    allocation_miss_exit: allocation_miss,
+                    unsupported_exit: unsupported,
+                    runtime_transition_exit: runtime_transition,
+                    backedge_relink_exit: backedge_relink,
+                    returned,
                     committed_throw,
                     threw,
                     fatal,
-                )?;
-            }
-            TemplateOp::UnsupportedBail => dynasm!(ops ; .arch x64 ; jmp =>unsupported),
-        }
+                },
+                frame_kind: shape.kind,
+                load_ic_cells: &mut load_ic_cells,
+                next_load_ic: &mut next_load_ic,
+                store_ic_cells: &mut store_ic_cells,
+                next_store_ic: &mut next_store_ic,
+                direct_call_events: &mut direct_call_events,
+                code_map: &mut code_map,
+            },
+            instruction,
+        )?;
         if let Some(code_map) = code_map.as_mut() {
             code_map.record(CodeRegion::instruction(
                 instruction_start,
@@ -1398,122 +291,125 @@ pub(super) fn compile(
         }
     }
 
-    dynasm!(ops
-        ; .arch x64
-        ; =>returned
-        ; xor edx, edx
-        ; jmp =>pair_exit
-        ; =>committed_throw
-        ; mov rsi, rax
-        ; mov rdi, r15
-    );
-    emit_load_runtime_stub(
-        &mut ops,
-        &mut relocations,
-        transitions.entry(abi::STUB_JIT_ROUTE_THROW),
-        abi::STUB_JIT_ROUTE_THROW,
-    );
-    // A handler of this function landed the throw: its exception register
-    // holds the value and the record names the handler's PC.
+    if !call_source_exits.is_empty() {
+        // Each relay names all nine shared destinations, so all must exist.
+        required_exits = cold_exits::ALL;
+        dynasm!(ops ; .arch x64 ; jmp =>unsupported);
+        for (labels, pc, safepoint_id) in call_source_exits {
+            let publish = ops.new_dynamic_label();
+            for (label, target) in labels {
+                dynasm!(ops ; .arch x64 ; =>label ; lea r11, [=>target] ; jmp =>publish);
+            }
+            dynasm!(ops ; .arch x64 ; =>publish);
+            emit_cold_call_source(&mut ops, pc, safepoint_id);
+            dynasm!(ops ; .arch x64 ; jmp r11);
+        }
+    }
     let caught = ops.new_dynamic_label();
-    dynasm!(ops
-        ; .arch x64
-        ; call r11
-        ; cmp edx, abi::NativeResultStatus::SideExit as i32
-        ; je =>caught
-        ; cmp edx, abi::NativeResultStatus::Throw as i32
-        ; je =>pair_exit
-        ; cmp edx, abi::NativeResultStatus::Fatal as i32
-        ; je =>pair_exit
-        ; jmp =>fatal
-        ; =>pair_exit
-    );
-    activation::emit_epilogue(&mut ops, activation_exits);
-    emit_side_exit(
-        &mut ops,
-        activation_exits.side_exit,
-        type_mismatch,
-        abi::ExitReason::TypeMismatch,
-        abi::ExitAction::Recompile,
-    );
-    emit_side_exit(
-        &mut ops,
-        activation_exits.side_exit,
-        identity_guard,
-        abi::ExitReason::IdentityGuard,
-        abi::ExitAction::Recompile,
-    );
-    emit_side_exit(
-        &mut ops,
-        activation_exits.side_exit,
-        allocation_miss,
-        abi::ExitReason::AllocationMiss,
-        abi::ExitAction::Resume,
-    );
-    emit_side_exit(
-        &mut ops,
-        activation_exits.side_exit,
-        unsupported,
-        abi::ExitReason::UnsupportedOperation,
-        abi::ExitAction::Recompile,
-    );
-    emit_side_exit(
-        &mut ops,
-        activation_exits.side_exit,
-        runtime_transition,
-        abi::ExitReason::RuntimeTransition,
-        abi::ExitAction::Resume,
-    );
-    emit_side_exit(
-        &mut ops,
-        activation_exits.side_exit,
-        backedge_relink,
-        abi::ExitReason::Interrupt,
-        abi::ExitAction::Resume,
-    );
-    dynasm!(ops
-        ; .arch x64
-        ; =>threw
-        ; mov rdi, r15
-    );
-    emit_load_runtime_stub(
-        &mut ops,
-        &mut relocations,
-        transitions.entry(abi::STUB_JIT_FINISH_ERROR),
-        abi::STUB_JIT_FINISH_ERROR,
-    );
-    dynasm!(ops
-        ; .arch x64
-        ; call r11
-        ; cmp edx, abi::NativeResultStatus::SideExit as i32
-        ; je =>caught
-        ; cmp edx, abi::NativeResultStatus::Throw as i32
-        ; je =>pair_exit
-        ; cmp edx, abi::NativeResultStatus::Fatal as i32
-        ; je =>pair_exit
-        ; jmp =>fatal
-    );
-    emit_handler_dispatch(&mut ops, view, &labels, caught, activation_exits.side_exit);
-    dynasm!(ops
-        ; .arch x64
-        ; =>fatal
-    );
-    emit_load_u64(&mut ops, 0, VALUE_UNDEFINED);
-    dynasm!(ops ; .arch x64 ; mov edx, abi::NativeResultStatus::Fatal as i32);
-    activation::emit_epilogue(&mut ops, activation_exits);
-    activation::emit_exits(
+    dynasm!(ops ; .arch x64 ; =>returned ; xor edx, edx ; jmp =>pair_exit);
+    if required_exits & cold_exits::COMMITTED_THROW != 0 {
+        dynasm!(ops ; .arch x64 ; =>committed_throw ; mov rsi, rax ; mov rdi, r15);
+        emit_load_runtime_stub(
+            &mut ops,
+            &mut relocations,
+            transitions.entry(abi::STUB_JIT_ROUTE_THROW),
+            abi::STUB_JIT_ROUTE_THROW,
+        );
+        // A handler lands at the same source PC and initialized exception
+        // register as before; only an unreachable entry is omitted.
+        emit_runtime_call(&mut ops, abi::STUB_JIT_ROUTE_THROW);
+        dynasm!(ops ; .arch x64
+            ; cmp edx, abi::NativeResultStatus::SideExit as i32
+            ; je =>caught
+            ; cmp edx, abi::NativeResultStatus::Throw as i32
+            ; je =>pair_exit
+            ; cmp edx, abi::NativeResultStatus::Fatal as i32
+            ; je =>pair_exit
+            ; jmp =>fatal
+        );
+    }
+    dynasm!(ops ; .arch x64 ; =>pair_exit);
+    frame::emit_epilogue(&mut ops, activation_exits, shape.kind, SpillArea::NONE);
+    for (mask, label, reason, action) in [
+        (
+            cold_exits::TYPE_MISMATCH,
+            type_mismatch,
+            abi::ExitReason::TypeMismatch,
+            abi::ExitAction::Recompile,
+        ),
+        (
+            cold_exits::ALLOCATION_MISS,
+            allocation_miss,
+            abi::ExitReason::AllocationMiss,
+            abi::ExitAction::Resume,
+        ),
+        (
+            cold_exits::UNSUPPORTED,
+            unsupported,
+            abi::ExitReason::UnsupportedOperation,
+            abi::ExitAction::Recompile,
+        ),
+        (
+            cold_exits::RUNTIME_TRANSITION,
+            runtime_transition,
+            abi::ExitReason::RuntimeTransition,
+            abi::ExitAction::Resume,
+        ),
+        (
+            cold_exits::BACKEDGE_RELINK,
+            backedge_relink,
+            abi::ExitReason::Interrupt,
+            abi::ExitAction::Resume,
+        ),
+    ] {
+        if required_exits & mask != 0 {
+            emit_side_exit(&mut ops, activation_exits.side_exit, label, reason, action);
+        }
+    }
+    if required_exits & cold_exits::THREW != 0 {
+        dynasm!(ops ; .arch x64 ; =>threw ; mov rdi, r15);
+        emit_load_runtime_stub(
+            &mut ops,
+            &mut relocations,
+            transitions.entry(abi::STUB_JIT_FINISH_ERROR),
+            abi::STUB_JIT_FINISH_ERROR,
+        );
+        emit_variadic_call(&mut ops, abi::STUB_JIT_FINISH_ERROR, 1);
+        dynasm!(ops ; .arch x64
+            ; cmp edx, abi::NativeResultStatus::SideExit as i32
+            ; je =>caught
+            ; cmp edx, abi::NativeResultStatus::Throw as i32
+            ; je =>pair_exit
+            ; cmp edx, abi::NativeResultStatus::Fatal as i32
+            ; je =>pair_exit
+            ; jmp =>fatal
+        );
+    }
+    if required_exits & (cold_exits::THREW | cold_exits::COMMITTED_THROW) != 0 {
+        emit_handler_dispatch(&mut ops, view, &labels, caught, activation_exits.side_exit);
+    }
+    if required_exits & (cold_exits::FATAL | cold_exits::THREW | cold_exits::COMMITTED_THROW) != 0 {
+        dynasm!(ops ; .arch x64 ; =>fatal);
+        emit_load_u64(&mut ops, 0, VALUE_UNDEFINED);
+        dynasm!(ops ; .arch x64 ; mov edx, abi::NativeResultStatus::Fatal as i32);
+        frame::emit_epilogue(&mut ops, activation_exits, shape.kind, SpillArea::NONE);
+    }
+    frame::emit_exits(
         &mut ops,
         &mut relocations,
         transitions,
         view,
-        shape.derived,
+        shape,
         activation_exits,
+        SpillArea::NONE,
     );
     if let Some((_, cold)) = call_entry {
-        activation::emit_call_entry_cold(
+        frame::emit_call_entry_cold(
             &mut ops,
             &mut relocations,
             transitions,
+            view,
+            shape,
             activation_exits,
             cold,
         );
@@ -1525,7 +421,7 @@ pub(super) fn compile(
             continue;
         };
         let offset = ops.offset().0;
-        activation::emit_tier_prologue(&mut ops);
+        frame::emit_tier_prologue(&mut ops, shape.kind, SpillArea::NONE);
         dynasm!(ops ; .arch x64 ; jmp =>target);
         if let Some(code_map) = code_map.as_mut() {
             code_map.record_osr(header_pc, offset, ops.offset().0);
@@ -1542,6 +438,7 @@ pub(super) fn compile(
         ..
     } = plan;
     safepoint_records.sort_by_key(|record| record.id);
+    return_sites.sort_by_key(|site| site.native_return_offset);
     let compiled_code = CompiledCode::new(buffer, entry);
     if let Some(code_map) = code_map.as_mut() {
         code_map.record(CodeRegion::structural(
@@ -1562,6 +459,7 @@ pub(super) fn compile(
             relocations,
             None,
             &safepoint_records,
+            &return_sites,
         )
     });
     let code = TemplateCode::from_emission(
@@ -1569,10 +467,13 @@ pub(super) fn compile(
         code_object_id,
         view.code_block.id,
         Box::new([]),
+        Box::new([]),
+        super::code::retained_source_work(view, &BTreeSet::new()),
         register_operands,
         load_ic_cells,
         store_ic_cells,
         safepoint_records.into_boxed_slice(),
+        return_sites.into_boxed_slice(),
         osr_entries,
         call_entry.map(|(offset, _)| offset.0),
         osr_only,
@@ -1588,6 +489,9 @@ pub(super) fn compile(
 }
 
 fn requires_pc_stamp(op: TemplateOp) -> bool {
+    if super::operation_is_js_call(op) {
+        return false;
+    }
     !matches!(
         op,
         TemplateOp::LoadImmediate { .. }
@@ -1610,6 +514,14 @@ fn requires_pc_stamp(op: TemplateOp) -> bool {
                 ..
             }
     )
+}
+
+/// Publish only before a committed collecting helper or an abrupt call exit.
+fn emit_cold_call_source(ops: &mut Assembler, pc: u32, safepoint_id: abi::SafepointId) {
+    dynasm!(ops ; .arch x64
+        ; mov DWORD [r14 + NATIVE_FRAME_PC_OFFSET as i32], pc as i32
+        ; mov DWORD [r14 + abi::NATIVE_FRAME_CALL_SITE_OFFSET as i32], safepoint_id as i32
+    );
 }
 
 fn emit_stamp_pc(ops: &mut Assembler, pc: u32) {
@@ -1695,9 +607,9 @@ fn emit_backedge_poll(
     emit_stamp_pc(ops, target);
     dynasm!(ops ; .arch x64 ; mov rdi, r15);
     emit_load_runtime_stub(ops, relocations, poll_entry, abi::STUB_JIT_BACKEDGE_POLL);
+    emit_runtime_call(ops, abi::STUB_JIT_BACKEDGE_POLL);
     dynasm!(ops
         ; .arch x64
-        ; call r11
         ; cmp eax, abi::NativeResultStatus::Success as i32
         ; je =>done
         ; cmp eax, abi::NativeResultStatus::Yield as i32
@@ -1727,14 +639,14 @@ fn emit_truthiness_bool(ops: &mut Assembler, bail: DynamicLabel) {
         ; test r10, r10
         ; jne =>double_case
     );
-    emit_load_u64(ops, 11, VALUE_TRUE);
-    dynasm!(ops ; .arch x64 ; cmp rax, r11 ; je =>truthy);
-    emit_load_u64(ops, 11, VALUE_FALSE);
-    dynasm!(ops ; .arch x64 ; cmp rax, r11 ; je =>falsy);
-    emit_load_u64(ops, 11, VALUE_NULL);
-    dynasm!(ops ; .arch x64 ; cmp rax, r11 ; je =>falsy);
-    emit_load_u64(ops, 11, VALUE_UNDEFINED);
-    dynasm!(ops ; .arch x64 ; cmp rax, r11 ; je =>falsy ; jmp =>bail ; =>int_case);
+    emit_cmp_rax_imm8(ops, VALUE_TRUE);
+    dynasm!(ops ; .arch x64 ; je =>truthy);
+    emit_cmp_rax_imm8(ops, VALUE_FALSE);
+    dynasm!(ops ; .arch x64 ; je =>falsy);
+    emit_cmp_rax_imm8(ops, VALUE_NULL);
+    dynasm!(ops ; .arch x64 ; je =>falsy);
+    emit_cmp_rax_imm8(ops, VALUE_UNDEFINED);
+    dynasm!(ops ; .arch x64 ; je =>falsy ; jmp =>bail ; =>int_case);
     dynasm!(ops ; .arch x64 ; test eax, eax ; jne =>truthy ; jmp =>falsy ; =>double_case);
     emit_load_u64(ops, 11, DOUBLE_OFFSET);
     dynasm!(ops
@@ -1757,6 +669,7 @@ fn emit_truthiness_bool(ops: &mut Assembler, bail: DynamicLabel) {
 
 fn emit_binary_arith(
     ops: &mut Assembler,
+    relocations: &mut RelocationCapture,
     dst: u16,
     lhs: u16,
     rhs: u16,
@@ -1764,7 +677,7 @@ fn emit_binary_arith(
     bail: DynamicLabel,
 ) {
     if kind == ArithKind::Rem {
-        emit_remainder(ops, dst, lhs, rhs, bail);
+        emit_remainder(ops, relocations, dst, lhs, rhs, bail);
         return;
     }
     if kind == ArithKind::Pow {
@@ -1800,7 +713,7 @@ fn emit_binary_arith(
                 ; =>publish
             );
         }
-        emit_box_int32(ops, 10, 0);
+        emit_box_int32(ops, 10, 0, 11);
         emit_store_reg(ops, 0, dst);
         dynasm!(ops ; .arch x64 ; jmp =>done ; =>float_path);
         emit_load_reg(ops, 0, lhs);
@@ -1812,7 +725,7 @@ fn emit_binary_arith(
             ArithKind::Mul => dynasm!(ops ; .arch x64 ; mulsd xmm0, xmm1),
             _ => unreachable!(),
         }
-        emit_box_double(ops, 0, 0);
+        emit_box_double(ops, 0, 0, 11);
         emit_store_reg(ops, 0, dst);
         dynasm!(ops ; .arch x64 ; =>done);
         return;
@@ -1820,7 +733,7 @@ fn emit_binary_arith(
     emit_number_to_double(ops, 0, 0, bail);
     emit_number_to_double(ops, 8, 1, bail);
     dynasm!(ops ; .arch x64 ; divsd xmm0, xmm1);
-    emit_box_double(ops, 0, 0);
+    emit_box_double(ops, 0, 0, 11);
     emit_store_reg(ops, 0, dst);
 }
 
@@ -1828,6 +741,7 @@ fn emit_binary_arith(
 fn emit_add_generic(
     ops: &mut Assembler,
     relocations: &mut RelocationCapture,
+    view: &JitCompileSnapshot,
     transitions: &crate::entry::TransitionTable,
     dst: u16,
     lhs: u16,
@@ -1844,7 +758,7 @@ fn emit_add_generic(
     let done = ops.new_dynamic_label();
     emit_guard_int32_pair(ops, 0, 8, float_path);
     dynasm!(ops ; .arch x64 ; mov r10d, eax ; add r10d, r8d ; jo =>float_path);
-    emit_box_int32(ops, 10, 0);
+    emit_box_int32(ops, 10, 0, 11);
     emit_store_reg(ops, 0, dst);
     dynasm!(ops ; .arch x64 ; jmp =>done ; =>float_path);
     emit_load_reg(ops, 0, lhs);
@@ -1852,9 +766,13 @@ fn emit_add_generic(
     emit_number_to_double(ops, 0, 0, runtime_path);
     emit_number_to_double(ops, 8, 1, runtime_path);
     dynasm!(ops ; .arch x64 ; addsd xmm0, xmm1);
-    emit_box_double(ops, 0, 0);
+    emit_box_double(ops, 0, 0, 11);
     emit_store_reg(ops, 0, dst);
     dynasm!(ops ; .arch x64 ; jmp =>done ; =>runtime_path);
+
+    let collecting = ops.new_dynamic_label();
+    primitive_strings::emit_concat_fit(ops, view, dst, lhs, rhs, collecting, done);
+    dynasm!(ops ; .arch x64 ; =>collecting);
 
     if let Some(stub_addr) =
         alloc_value_stub_by_id(abi::STUB_STRING_CONCAT_ALLOC.id).and_then(|stub| stub.entry_addr())
@@ -1879,9 +797,9 @@ fn emit_add_generic(
             stub_addr as u64,
             abi::STUB_STRING_CONCAT_ALLOC,
         );
+        emit_runtime_call(ops, abi::STUB_STRING_CONCAT_ALLOC);
         dynasm!(ops
             ; .arch x64
-            ; call r11
             ; add rsp, ALLOC_CTX_STACK_SIZE as i32
             ; test rdx, rdx
             ; jne =>delegate_path
@@ -1906,13 +824,20 @@ fn emit_add_generic(
         transitions.variadic_entry(abi::STUB_JIT_ADD),
         abi::STUB_JIT_ADD,
     );
-    dynasm!(ops ; .arch x64 ; call r11);
+    emit_variadic_call(ops, abi::STUB_JIT_ADD, 4);
     emit_status_word_result(ops, threw, fatal);
     dynasm!(ops ; .arch x64 ; =>done);
     Ok(())
 }
 
-fn emit_remainder(ops: &mut Assembler, dst: u16, lhs: u16, rhs: u16, bail: DynamicLabel) {
+fn emit_remainder(
+    ops: &mut Assembler,
+    relocations: &mut RelocationCapture,
+    dst: u16,
+    lhs: u16,
+    rhs: u16,
+    bail: DynamicLabel,
+) {
     emit_load_reg(ops, 0, lhs);
     emit_load_reg(ops, 8, rhs);
     let slow = ops.new_dynamic_label();
@@ -1935,7 +860,7 @@ fn emit_remainder(ops: &mut Assembler, dst: u16, lhs: u16, rhs: u16, bail: Dynam
         ; js =>slow
         ; publish:
     );
-    emit_box_int32(ops, 2, 0);
+    emit_box_int32(ops, 2, 0, 11);
     emit_store_reg(ops, 0, dst);
     dynasm!(ops ; .arch x64 ; jmp =>done ; =>slow);
     emit_load_reg(ops, 6, lhs);
@@ -1944,8 +869,16 @@ fn emit_remainder(ops: &mut Assembler, dst: u16, lhs: u16, rhs: u16, bail: Dynam
         ; .arch x64
         ; mov rdi, [r15 + THREAD_OFFSET as i32]
         ; mov rdi, [rdi + VM_THREAD_GC_HEAP_OFFSET as i32]
-        ; mov r11, QWORD otter_vm::runtime_stubs::NUMBER_REM_LEAF.entry_addr() as i64
-        ; call r11
+    );
+    emit_load_runtime_stub(
+        ops,
+        relocations,
+        otter_vm::runtime_stubs::NUMBER_REM_LEAF.entry_addr() as u64,
+        abi::STUB_NUMBER_REM_LEAF,
+    );
+    emit_runtime_call(ops, abi::STUB_NUMBER_REM_LEAF);
+    dynasm!(ops
+        ; .arch x64
         ; test rdx, rdx
         ; jne =>bail
     );
@@ -1961,6 +894,7 @@ fn emit_compare(
     rhs: u16,
     kind: CompareKind,
     bail: DynamicLabel,
+    fatal: DynamicLabel,
 ) {
     emit_load_reg(ops, 0, lhs);
     emit_load_reg(ops, 8, rhs);
@@ -1968,6 +902,7 @@ fn emit_compare(
     let false_case = ops.new_dynamic_label();
     let true_case = ops.new_dynamic_label();
     let done = ops.new_dynamic_label();
+    let primitive = ops.new_dynamic_label();
     if matches!(kind, CompareKind::Eq | CompareKind::Ne) {
         let lhs_non_number = ops.new_dynamic_label();
         let strict_false = ops.new_dynamic_label();
@@ -2051,10 +986,10 @@ fn emit_compare(
             otter_vm::runtime_stubs::STRICT_EQ_LEAF.entry_addr() as u64,
             abi::STUB_STRICT_EQ_LEAF,
         );
+        emit_runtime_call(ops, abi::STUB_STRICT_EQ_LEAF);
         dynasm!(ops
             ; .arch x64
-            ; call r11
-            ; test rdx, rdx
+                ; test rdx, rdx
             ; jne =>bail
         );
         emit_load_u64(ops, 11, VALUE_TRUE);
@@ -2077,11 +1012,11 @@ fn emit_compare(
             ; mov r10, rax
             ; and r10, r11
             ; test r10, r10
-            ; jz =>bail
+            ; jz =>primitive
             ; mov r10, r8
             ; and r10, r11
             ; test r10, r10
-            ; jz =>bail
+            ; jz =>primitive
             ; jmp =>numbers
         );
     }
@@ -2097,7 +1032,16 @@ fn emit_compare(
         CompareKind::Eq => dynasm!(ops ; .arch x64 ; jp =>false_case ; je =>true_case),
         CompareKind::Ne => dynasm!(ops ; .arch x64 ; jp =>true_case ; jne =>true_case),
     }
-    dynasm!(ops ; .arch x64 ; jmp =>false_case ; =>true_case);
+    dynasm!(ops ; .arch x64 ; jmp =>false_case);
+    if !matches!(kind, CompareKind::Eq | CompareKind::Ne) {
+        dynasm!(ops ; .arch x64 ; =>primitive);
+        emit_load_reg(ops, 0, lhs);
+        emit_load_reg(ops, 8, rhs);
+        primitive_strings::emit_order(ops, relocations, kind, bail, fatal);
+        emit_store_reg(ops, 0, dst);
+        dynasm!(ops ; .arch x64 ; jmp =>done);
+    }
+    dynasm!(ops ; .arch x64 ; =>true_case);
     emit_load_u64(ops, 0, VALUE_TRUE);
     dynasm!(ops ; .arch x64 ; jmp =>done ; =>false_case);
     emit_load_u64(ops, 0, VALUE_FALSE);
@@ -2128,9 +1072,9 @@ fn emit_test_typeof(
         otter_vm::runtime_stubs::TYPEOF_TEST_LEAF.entry_addr() as u64,
         abi::STUB_TYPEOF_TEST_LEAF,
     );
+    emit_runtime_call(ops, abi::STUB_TYPEOF_TEST_LEAF);
     dynasm!(ops
         ; .arch x64
-        ; call r11
         ; test rdx, rdx
         ; jne =>bail
         ; mov [r13 + i32::from(dst) * 8], rax
@@ -2189,7 +1133,7 @@ fn emit_bitwise(
         BitwiseKind::Shl => dynasm!(ops ; .arch x64 ; shl r12d, cl),
         BitwiseKind::Shr => dynasm!(ops ; .arch x64 ; sar r12d, cl),
     }
-    emit_box_int32(ops, 12, 0);
+    emit_box_int32(ops, 12, 0, 11);
     emit_store_reg(ops, 0, dst);
 }
 
@@ -2199,9 +1143,9 @@ fn emit_unsigned_shift(ops: &mut Assembler, dst: u16, lhs: u16, rhs: u16, bail: 
     emit_load_reg(ops, 0, rhs);
     emit_to_int32(ops, 0, 1, bail);
     dynasm!(ops ; .arch x64 ; shr r12d, cl ; mov eax, r12d ; test eax, eax ; js >wide);
-    emit_box_int32(ops, 0, 0);
+    emit_box_int32(ops, 0, 0, 11);
     dynasm!(ops ; .arch x64 ; jmp >done ; wide: ; cvtsi2sd xmm0, rax);
-    emit_box_double(ops, 0, 0);
+    emit_box_double(ops, 0, 0, 11);
     dynasm!(ops ; .arch x64 ; done:);
     emit_store_reg(ops, 0, dst);
 }
@@ -2212,14 +1156,14 @@ fn emit_increment(ops: &mut Assembler, dst: u16, src: u16, delta: i32, bail: Dyn
     let done = ops.new_dynamic_label();
     emit_guard_int32(ops, 0, float_path);
     dynasm!(ops ; .arch x64 ; mov r10d, eax ; add r10d, delta ; jo =>float_path);
-    emit_box_int32(ops, 10, 0);
+    emit_box_int32(ops, 10, 0, 11);
     emit_store_reg(ops, 0, dst);
     dynasm!(ops ; .arch x64 ; jmp =>done ; =>float_path);
     emit_load_reg(ops, 0, src);
     emit_number_to_double(ops, 0, 0, bail);
     emit_load_u64(ops, 11, (delta as f64).to_bits());
     dynasm!(ops ; .arch x64 ; movq xmm1, r11 ; addsd xmm0, xmm1);
-    emit_box_double(ops, 0, 0);
+    emit_box_double(ops, 0, 0, 11);
     emit_store_reg(ops, 0, dst);
     dynasm!(ops ; .arch x64 ; =>done);
 }
@@ -2237,14 +1181,14 @@ fn emit_negate(ops: &mut Assembler, dst: u16, src: u16, bail: DynamicLabel) {
         ; neg r10d
         ; jo =>float_path
     );
-    emit_box_int32(ops, 10, 0);
+    emit_box_int32(ops, 10, 0, 11);
     emit_store_reg(ops, 0, dst);
     dynasm!(ops ; .arch x64 ; jmp =>done ; =>float_path);
     emit_load_reg(ops, 0, src);
     emit_number_to_double(ops, 0, 0, bail);
     emit_load_u64(ops, 11, 1_u64 << 63);
     dynasm!(ops ; .arch x64 ; movq xmm1, r11 ; xorpd xmm0, xmm1);
-    emit_box_double(ops, 0, 0);
+    emit_box_double(ops, 0, 0, 11);
     emit_store_reg(ops, 0, dst);
     dynasm!(ops ; .arch x64 ; =>done);
 }
@@ -2342,55 +1286,9 @@ fn emit_to_int32(ops: &mut Assembler, source: u8, destination: u8, bail: Dynamic
     );
 }
 
-fn emit_box_int32(ops: &mut Assembler, source: u8, destination: u8) {
-    dynasm!(ops ; .arch x64 ; mov Rd(destination), Rd(source));
-    emit_load_u64(ops, 11, NUMBER_TAG);
-    dynasm!(ops ; .arch x64 ; or Rq(destination), r11);
-}
-
-fn emit_box_double(ops: &mut Assembler, source: u8, destination: u8) {
-    let ready = ops.new_dynamic_label();
-    dynasm!(ops
-        ; .arch x64
-        ; movq Rq(destination), Rx(source)
-        ; ucomisd Rx(source), Rx(source)
-        ; jnp =>ready
-    );
-    emit_load_u64(ops, destination, CANONICAL_NAN);
-    dynasm!(ops ; .arch x64 ; =>ready);
-    emit_load_u64(ops, 11, DOUBLE_OFFSET);
-    dynasm!(ops ; .arch x64 ; add Rq(destination), r11);
-}
-
 fn emit_load_reg(ops: &mut Assembler, destination: u8, source: u16) {
     let offset = i32::from(source) * 8;
     dynasm!(ops ; .arch x64 ; mov Rq(destination), [r13 + offset]);
-}
-
-#[allow(clippy::too_many_arguments)]
-fn emit_make_function(
-    ops: &mut Assembler,
-    relocations: &mut RelocationCapture,
-    transitions: &crate::entry::TransitionTable,
-    dst: u16,
-    constant: u32,
-    threw: DynamicLabel,
-    fatal: DynamicLabel,
-) {
-    dynasm!(ops
-        ; .arch x64
-        ; mov rdi, r15
-        ; mov esi, i32::from(dst)
-        ; mov edx, constant as i32
-    );
-    emit_load_runtime_stub(
-        ops,
-        relocations,
-        transitions.variadic_entry(abi::STUB_JIT_MAKE_FN),
-        abi::STUB_JIT_MAKE_FN,
-    );
-    dynasm!(ops ; .arch x64 ; call r11);
-    emit_status_word_result(ops, threw, fatal);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2417,7 +1315,7 @@ fn emit_define_own_property(
         transitions.variadic_entry(abi::STUB_JIT_DEFINE_OWN_PROPERTY),
         abi::STUB_JIT_DEFINE_OWN_PROPERTY,
     );
-    dynasm!(ops ; .arch x64 ; call r11);
+    emit_variadic_call(ops, abi::STUB_JIT_DEFINE_OWN_PROPERTY, 4);
     emit_status_word_result(ops, threw, fatal);
 }
 
@@ -2447,7 +1345,7 @@ fn emit_opcode_transition(
     emit_load_u64(ops, 1, arg1);
     emit_load_u64(ops, 8, arg2);
     emit_load_runtime_stub(ops, relocations, transitions.variadic_entry(stub), stub);
-    dynasm!(ops ; .arch x64 ; call r11);
+    emit_variadic_call(ops, stub, 5);
     emit_side_exit_status_result(ops, bail, threw, fatal);
 }
 
@@ -2490,7 +1388,7 @@ fn emit_constant_transition(
         ; mov edx, constant as i32
     );
     emit_load_runtime_stub(ops, relocations, transitions.variadic_entry(stub), stub);
-    dynasm!(ops ; .arch x64 ; call r11);
+    emit_variadic_call(ops, stub, 3);
     emit_status_word_result(ops, threw, fatal);
 }
 
@@ -2532,47 +1430,15 @@ fn emit_array_construct_alloc_call(
     emit_load_u64(ops, 1, VALUE_UNDEFINED);
     emit_load_u64(ops, 8, VALUE_UNDEFINED);
     emit_load_runtime_stub(ops, relocations, stub_addr as u64, descriptor);
+    emit_runtime_call(ops, descriptor);
     dynasm!(ops
         ; .arch x64
-        ; call r11
         ; add rsp, ALLOC_CTX_STACK_SIZE as i32
         ; test rdx, rdx
         ; jne =>miss
     );
     emit_store_reg(ops, 0, dst);
     Ok(())
-}
-
-/// `MakeClosure dst, fn, ctx`: `esi` the compiling function id, `edx` the
-/// destination, `ecx` the function constant, `r8d` the context register.
-#[allow(clippy::too_many_arguments)]
-fn emit_make_closure(
-    ops: &mut Assembler,
-    relocations: &mut RelocationCapture,
-    transitions: &crate::entry::TransitionTable,
-    code_block_id: u32,
-    dst: u16,
-    function: u32,
-    context: u16,
-    threw: DynamicLabel,
-    fatal: DynamicLabel,
-) {
-    dynasm!(ops
-        ; .arch x64
-        ; mov rdi, r15
-        ; mov esi, code_block_id as i32
-        ; mov edx, i32::from(dst)
-        ; mov ecx, function as i32
-        ; mov r8d, i32::from(context)
-    );
-    emit_load_runtime_stub(
-        ops,
-        relocations,
-        transitions.variadic_entry(abi::STUB_JIT_MAKE_CLOSURE),
-        abi::STUB_JIT_MAKE_CLOSURE,
-    );
-    dynasm!(ops ; .arch x64 ; call r11);
-    emit_status_word_result(ops, threw, fatal);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2597,9 +1463,9 @@ fn emit_committed_value2(
     }
     dynasm!(ops ; .arch x64 ; mov rdi, r15);
     emit_load_runtime_stub(ops, relocations, transitions.entry(descriptor), descriptor);
+    emit_runtime_call(ops, descriptor);
     dynasm!(ops
         ; .arch x64
-        ; call r11
         ; test rdx, rdx
         ; je >completed
         ; cmp edx, abi::NativeResultStatus::Throw as i32
@@ -2618,6 +1484,7 @@ fn emit_store_property(
     relocations: &mut RelocationCapture,
     transitions: &crate::entry::TransitionTable,
     view: &JitCompileSnapshot,
+    byte_pc: u32,
     object: u16,
     value: u16,
     cell_addr: u64,
@@ -2626,10 +1493,50 @@ fn emit_store_property(
     throw_value: DynamicLabel,
     fatal: DynamicLabel,
 ) {
+    let shared = ops.new_dynamic_label();
     let miss = ops.new_dynamic_label();
     let done = ops.new_dynamic_label();
-    emit_existing_property_store(ops, relocations, view, object, value, programs, miss, done);
-    dynasm!(ops ; .arch x64 ; =>miss);
+    let hit = ops.new_dynamic_label();
+    let appended = ops.new_dynamic_label();
+    emit_existing_property_store(
+        ops,
+        relocations,
+        view,
+        object,
+        value,
+        programs,
+        shared,
+        done,
+    );
+    dynasm!(ops ; .arch x64 ; =>shared);
+    emit_load_reg(ops, 0, object);
+    emit_load_reg(ops, 6, value);
+    crate::x86_64::property_actions::emit_action_probe(
+        ops,
+        relocations,
+        view,
+        view.property_action_cache,
+        view.property_accesses.get(&byte_pc).map(|site| site.atom),
+        PropertySourceAccess::Store,
+        0,
+        Some(6),
+        [1, 2, 8, 9],
+        None,
+        miss,
+        hit,
+        appended,
+    );
+    dynasm!(ops ; .arch x64 ; =>appended);
+    // The helper leaves the published compressed child in edx. This existing
+    // barrier cannot collect; subsequent inputs reload from canonical homes.
+    emit_load_u64(ops, 11, 0xffff_ffff_0000_0000);
+    dynasm!(ops ; .arch x64 ; and r11, rax ; mov r8d, edx ; add r8, r11);
+    emit_template_value_barrier(ops, relocations, view, 0, 8);
+    dynasm!(ops ; .arch x64 ; =>hit);
+    emit_load_reg(ops, 0, object);
+    emit_load_reg(ops, 2, value);
+    emit_template_value_barrier(ops, relocations, view, 0, 2);
+    dynasm!(ops ; .arch x64 ; jmp =>done ; =>miss);
     emit_load_reg(ops, 6, object);
     emit_load_reg(ops, 2, value);
     emit_load_symbol_u64(
@@ -2649,9 +1556,9 @@ fn emit_store_property(
         transitions.entry(abi::STUB_JIT_STORE_PROPERTY),
         abi::STUB_JIT_STORE_PROPERTY,
     );
+    emit_runtime_call(ops, abi::STUB_JIT_STORE_PROPERTY);
     dynasm!(ops
         ; .arch x64
-        ; call r11
         ; test rdx, rdx
         ; je >completed
         ; cmp edx, abi::NativeResultStatus::Throw as i32
@@ -2677,6 +1584,7 @@ fn emit_load_property(
     throw_value: DynamicLabel,
     fatal: DynamicLabel,
 ) {
+    let shared = ops.new_dynamic_label();
     let miss = ops.new_dynamic_label();
     let done = ops.new_dynamic_label();
     emit_existing_property_load(
@@ -2686,7 +1594,24 @@ fn emit_load_property(
         byte_pc,
         object,
         programs,
+        shared,
+        done,
+    );
+    dynasm!(ops ; .arch x64 ; =>shared);
+    emit_load_reg(ops, 0, object);
+    crate::x86_64::property_actions::emit_action_probe(
+        ops,
+        relocations,
+        view,
+        view.property_action_cache,
+        view.property_accesses.get(&byte_pc).map(|site| site.atom),
+        PropertySourceAccess::Load,
+        0,
+        None,
+        [1, 2, 8, 9],
+        Some(0),
         miss,
+        done,
         done,
     );
     dynasm!(ops ; .arch x64 ; =>miss);
@@ -2708,9 +1633,9 @@ fn emit_load_property(
         transitions.entry(abi::STUB_JIT_LOAD_PROPERTY),
         abi::STUB_JIT_LOAD_PROPERTY,
     );
+    emit_runtime_call(ops, abi::STUB_JIT_LOAD_PROPERTY);
     dynasm!(ops
         ; .arch x64
-        ; call r11
         ; test rdx, rdx
         ; je >completed
         ; cmp edx, abi::NativeResultStatus::Throw as i32
@@ -2811,22 +1736,9 @@ fn emit_existing_property_load(
                 }
                 otter_vm::JitCacheIrOp::GuardShape { object, shape } => {
                     let header = if object == 0 { 10 } else { 8 };
-                    if intrinsic {
-                        // Realm prototypes may have benign symbol sidecars.
-                        // The live ordinary lookup flags, not sidecar absence,
-                        // determine whether their shape slots remain valid.
-                        emit_template_shape_state_guard(ops, view, header, next);
-                        emit_template_flags_guard(
-                            ops,
-                            view,
-                            header,
-                            otter_vm::jit::JIT_OBJECT_FLAG_SLOT_ATTRS_OVERRIDDEN,
-                            next,
-                        );
-                        emit_template_shape_identity_guard(ops, view, header, shape, next);
-                    } else {
-                        emit_template_shape_guard(ops, view, header, shape, next);
-                    }
+                    // Eligible immutable identity owns lookup state, descriptor
+                    // attributes and bank layout even with benign sidecars.
+                    emit_template_shape_identity_guard(ops, view, header, shape, next);
                 }
                 otter_vm::JitCacheIrOp::GuardDictionaryLayout { object: 1, layout } => {
                     // A dictionary holder keeps its slot-layout epoch in its
@@ -2841,7 +1753,7 @@ fn emit_existing_property_load(
                     dynasm!(ops
                         ; .arch x64
                         ; mov r9d, [r8 + view.object_shape_byte as i32]
-                        ; test BYTE [r11 + r9 + view.shape_kind_byte as i32], otter_vm::jit::JIT_SHAPE_KIND_DICTIONARY as i8
+                        ; test BYTE [r11 + r9 + view.shape_state_byte as i32], otter_vm::object::ShapeState::DICTIONARY_MASK as i8
                         ; jz =>next
                         ; mov r9d, [r8 + view.object_exotic_handle_byte as i32]
                         ; test r9d, r9d
@@ -2855,9 +1767,10 @@ fn emit_existing_property_load(
                 otter_vm::JitCacheIrOp::GuardAtomSlot {
                     writable: false, ..
                 } => {}
-                otter_vm::JitCacheIrOp::LoadField { object, value_byte } => {
+                otter_vm::JitCacheIrOp::LoadField { object, field } => {
+                    let value_byte = field.byte_offset();
                     let header = if object == 0 { 10 } else { 8 };
-                    emit_template_slab_base(ops, relocations, view, header, 11, 9);
+                    emit_field_base(ops, relocations, view, header, 11, 9, field);
                     dynasm!(ops
                         ; .arch x64
                         ; mov rax, [r11 + value_byte as i32]
@@ -2895,11 +1808,12 @@ fn emit_existing_property_store(
     };
     emit_load_reg(ops, 0, object);
     emit_template_object_header(ops, relocations, view, 0, 10, miss);
-    emit_template_flags_guard(
+    emit_template_state_mask_guard(
         ops,
+        relocations,
         view,
         10,
-        otter_vm::jit::JIT_OBJECT_FLAG_USED_AS_PROTOTYPE,
+        otter_vm::object::ShapeState::PROTOTYPE_MASK,
         miss,
     );
     for program in programs {
@@ -2912,13 +1826,6 @@ fn emit_existing_property_store(
         }
         let next = ops.new_dynamic_label();
         let mut terminal = false;
-        let add_transition = program.ops.iter().any(|op| {
-            matches!(
-                op,
-                otter_vm::JitCacheIrOp::GuardExtensible { .. }
-                    | otter_vm::JitCacheIrOp::PublishShape { .. }
-            )
-        });
         for (index, op) in program.ops.iter().enumerate() {
             match *op {
                 otter_vm::JitCacheIrOp::LoadPrototypeHolder { root, result: 1 } => {
@@ -2946,12 +1853,7 @@ fn emit_existing_property_store(
                 }
                 otter_vm::JitCacheIrOp::GuardShape { object, shape } => {
                     let header = if object == 0 { 10 } else { 8 };
-                    if add_transition && object == 1 {
-                        emit_template_shape_state_guard(ops, view, header, next);
-                        emit_template_shape_identity_guard(ops, view, header, shape, next);
-                    } else {
-                        emit_template_shape_guard(ops, view, header, shape, next);
-                    }
+                    emit_template_shape_identity_guard(ops, view, header, shape, next);
                 }
                 otter_vm::JitCacheIrOp::GuardAtomSlot {
                     object,
@@ -2967,57 +1869,39 @@ fn emit_existing_property_store(
                         view.cage_base as u64,
                         RelocationTarget::GcCageBase,
                     );
-                    emit_x64_load_prototype(ops, view, 11, header, 9);
+                    emit_load_prototype(ops, view, 11, header, 9);
                     dynasm!(ops ; .arch x64 ; test r11d, r11d ; jnz =>next);
                 }
-                otter_vm::JitCacheIrOp::GuardExtensible {
-                    object: 0,
-                    value_byte,
-                } => {
-                    let inline = ops.new_dynamic_label();
-                    let storage_fits = ops.new_dynamic_label();
-                    dynasm!(ops
-                        ; .arch x64
-                        ; mov r11d, value_byte as i32
-                        ; test r11d, 7
-                        ; jnz =>next
-                        ; mov r9d, [r10 + view.object_slab_handle_byte as i32]
-                        ; test r9d, r9d
-                        ; jz =>inline
-                    );
-                    emit_load_symbol_u64(
-                        ops,
-                        relocations,
-                        8,
-                        view.cage_base as u64,
-                        RelocationTarget::GcCageBase,
-                    );
-                    dynasm!(ops
-                        ; .arch x64
-                        ; add r8, r9
-                        ; mov r9d, [r8 + view.object_slab_capacity_byte as i32]
-                        ; shr r11d, 3
-                        ; cmp r11d, r9d
-                        ; jae =>next
-                        ; jmp =>storage_fits
-                        ; =>inline
-                        ; shr r11d, 3
-                        ; movzx r9d, BYTE [r10 + view.object_inline_capacity_byte as i32]
-                        ; cmp r11d, r9d
-                        ; jae =>next
-                        ; =>storage_fits
-                        ; test BYTE [r10 + view.object_flags_byte as i32], otter_vm::jit::JIT_OBJECT_FLAG_EXTENSIBLE as i8
-                        ; jz =>next
-                    );
+                otter_vm::JitCacheIrOp::GuardExtensible { object: 0, field } => {
+                    if !field.is_inline() {
+                        let index = field.index();
+                        dynasm!(ops ; .arch x64
+                            ; mov r11d, index as i32
+                            ; mov r9d, [r10 + view.field_layout.slab_handle_byte as i32]
+                            ; test r9d, r9d ; jz =>next);
+                        emit_load_symbol_u64(
+                            ops,
+                            relocations,
+                            8,
+                            view.cage_base as u64,
+                            RelocationTarget::GcCageBase,
+                        );
+                        dynasm!(ops ; .arch x64
+                            ; add r8, r9
+                            ; cmp r11d, [r8 + view.field_layout.slab_capacity_byte as i32]
+                            ; jae =>next);
+                    }
+                    emit_template_shape_address(ops, relocations, view, 10);
+                    dynasm!(ops ; .arch x64
+                        ; test BYTE [r9 + view.shape_state_byte as i32], otter_vm::object::ShapeState::EXTENSIBLE_MASK as i8
+                        ; jz =>next);
                     // The program's receiver shape guard fixes the slot
                     // count at the appended index: the store is the exact
                     // append.
                 }
-                otter_vm::JitCacheIrOp::StoreField {
-                    object: 0,
-                    value_byte,
-                } => {
-                    emit_template_slab_base(ops, relocations, view, 10, 11, 9);
+                otter_vm::JitCacheIrOp::StoreField { object: 0, field } => {
+                    let value_byte = field.byte_offset();
+                    emit_field_base(ops, relocations, view, 10, 11, 9, field);
                     emit_load_reg(ops, 2, value);
                     terminal = true;
                     if !matches!(
@@ -3030,10 +1914,7 @@ fn emit_existing_property_store(
                     }
                 }
                 otter_vm::JitCacheIrOp::PublishShape { object: 0, shape } if terminal => {
-                    let Some(otter_vm::JitCacheIrOp::StoreField {
-                        object: 0,
-                        value_byte,
-                    }) = index
+                    let Some(otter_vm::JitCacheIrOp::StoreField { object: 0, field }) = index
                         .checked_sub(1)
                         .and_then(|index| program.ops.get(index))
                         .copied()
@@ -3041,6 +1922,7 @@ fn emit_existing_property_store(
                         terminal = false;
                         break;
                     };
+                    let value_byte = field.byte_offset();
                     dynasm!(ops
                         ; .arch x64
                         ; mov DWORD [r10 + view.object_shape_byte as i32], shape as i32
@@ -3109,71 +1991,52 @@ fn emit_template_object_header(
         ; cmp BYTE [Rq(header)], OBJECT_BODY_TYPE_TAG as i8
         ; jne =>miss
     );
-    emit_template_fast_state_guard(ops, view, header, miss);
+    // Every successful static ordinary program proves eligible exact receiver
+    // identity before a slot/effect. Inherited loads additionally prove the
+    // complete validity owner and rooted holder link; central snapshot baking
+    // validates that holder's actual finalized shape. Intrinsic dictionary
+    // programs retain their live kind/layout guards instead of this prefix.
 }
 
-fn emit_template_fast_state_guard(
+/// Resolve the current immutable shape address in r9, retaining the object.
+/// r11 is the temporary cage base; neither register may hold the header.
+fn emit_template_shape_address(
     ops: &mut Assembler,
+    relocations: &mut RelocationCapture,
     view: &JitCompileSnapshot,
     header: u8,
-    miss: DynamicLabel,
 ) {
-    emit_template_flags_guard(
+    debug_assert!(header != 9 && header != 11);
+    emit_load_symbol_u64(
         ops,
-        view,
-        header,
-        otter_vm::jit::JIT_OBJECT_FLAG_DICTIONARY_COMPATIBLE
-            | otter_vm::jit::JIT_OBJECT_FLAG_SLOT_ATTRS_OVERRIDDEN,
-        miss,
+        relocations,
+        11,
+        view.cage_base as u64,
+        RelocationTarget::GcCageBase,
     );
-    dynasm!(ops
-        ; .arch x64
-        ; cmp DWORD [Rq(header) + view.object_exotic_handle_byte as i32], 0
-        ; jne =>miss
+    dynasm!(ops ; .arch x64
+        ; mov r9d, [Rq(header) + view.object_shape_byte as i32]
+        ; add r9, r11
     );
 }
 
-/// Branch to `miss` when any bit of `mask` is set in the object's flag byte.
-fn emit_template_flags_guard(
+/// Reject a current shape role before a store, without reading GC metadata.
+fn emit_template_state_mask_guard(
     ops: &mut Assembler,
+    relocations: &mut RelocationCapture,
     view: &JitCompileSnapshot,
     header: u8,
     mask: u8,
     miss: DynamicLabel,
 ) {
-    dynasm!(ops
-        ; .arch x64
-        ; test BYTE [Rq(header) + view.object_flags_byte as i32], mask as i8
+    emit_template_shape_address(ops, relocations, view, header);
+    dynasm!(ops ; .arch x64
+        ; test BYTE [r9 + view.shape_state_byte as i32], mask as i8
         ; jnz =>miss
     );
 }
 
-fn emit_template_shape_guard(
-    ops: &mut Assembler,
-    view: &JitCompileSnapshot,
-    header: u8,
-    shape: u32,
-    miss: DynamicLabel,
-) {
-    emit_template_fast_state_guard(ops, view, header, miss);
-    emit_template_shape_identity_guard(ops, view, header, shape, miss);
-}
-
-fn emit_template_shape_state_guard(
-    ops: &mut Assembler,
-    view: &JitCompileSnapshot,
-    header: u8,
-    miss: DynamicLabel,
-) {
-    emit_template_flags_guard(
-        ops,
-        view,
-        header,
-        otter_vm::jit::JIT_OBJECT_SHAPE_STATE_MASK,
-        miss,
-    );
-}
-
+/// Eligible exact identity fixes attributes, lookup state and field geometry.
 fn emit_template_shape_identity_guard(
     ops: &mut Assembler,
     view: &JitCompileSnapshot,
@@ -3185,67 +2048,6 @@ fn emit_template_shape_identity_guard(
         ; .arch x64
         ; cmp DWORD [Rq(header) + view.object_shape_byte as i32], shape as i32
         ; jne =>miss
-    );
-}
-
-/// Load into `Rd(dst)` the compressed `[[Prototype]]` of the object whose
-/// `GcHeader` pointer is in `Rq(object)`: the prototype word of its shape, an
-/// ordinary object or null. `Rq(cage)` holds the cage base; `dst` may be
-/// `object` but not `cage`.
-pub(crate) fn emit_x64_load_prototype(
-    ops: &mut Assembler,
-    view: &JitCompileSnapshot,
-    dst: u8,
-    object: u8,
-    cage: u8,
-) {
-    debug_assert_ne!(dst, cage);
-    dynasm!(ops
-        ; .arch x64
-        ; mov Rd(dst), [Rq(object) + view.object_shape_byte as i32]
-        ; mov Rd(dst), [Rq(cage) + Rq(dst) + view.shape_prototype_byte as i32]
-    );
-}
-
-/// Compute the slot base of the object whose `GcHeader` pointer is in
-/// `header` into `destination` (`scratch` is clobbered). While the
-/// out-of-line slab handle is null the slots are in-object at
-/// `header + object_inline_values_byte`; a spilled object's slots are its
-/// slab's words: cage base plus the compressed handle plus the slab's fixed
-/// word offset.
-pub(crate) fn emit_template_slab_base(
-    ops: &mut Assembler,
-    relocations: &mut RelocationCapture,
-    view: &JitCompileSnapshot,
-    header: u8,
-    destination: u8,
-    scratch: u8,
-) {
-    debug_assert_ne!(destination, scratch);
-    debug_assert_ne!(header, scratch);
-    let ready = ops.new_dynamic_label();
-    let external = ops.new_dynamic_label();
-    dynasm!(ops
-        ; .arch x64
-        ; mov Rd(scratch), [Rq(header) + view.object_slab_handle_byte as i32]
-        ; test Rd(scratch), Rd(scratch)
-        ; jnz =>external
-        ; lea Rq(destination), [Rq(header) + view.object_inline_values_byte as i32]
-        ; jmp =>ready
-        ; =>external
-    );
-    emit_load_symbol_u64(
-        ops,
-        relocations,
-        destination,
-        view.cage_base as u64,
-        RelocationTarget::GcCageBase,
-    );
-    dynasm!(ops
-        ; .arch x64
-        ; add Rq(destination), Rq(scratch)
-        ; add Rq(destination), view.object_slab_words_byte as i32
-        ; =>ready
     );
 }
 
@@ -3275,7 +2077,8 @@ fn emit_template_value_barrier(
         otter_vm::runtime_stubs::WRITE_BARRIER_MUTATING.entry_addr() as u64,
         abi::STUB_WRITE_BARRIER,
     );
-    dynasm!(ops ; .arch x64 ; call r11 ; =>done);
+    emit_runtime_call(ops, abi::STUB_WRITE_BARRIER);
+    dynasm!(ops ; .arch x64 ; =>done);
     let _ = view;
 }
 
@@ -3310,7 +2113,7 @@ fn emit_collect_arguments(
         transitions.variadic_entry(abi::STUB_JIT_COLLECT_ARGUMENTS),
         abi::STUB_JIT_COLLECT_ARGUMENTS,
     );
-    dynasm!(ops ; .arch x64 ; call r11);
+    emit_variadic_call(ops, abi::STUB_JIT_COLLECT_ARGUMENTS, 2);
     emit_status_word_result(ops, threw, fatal);
 }
 
@@ -3355,7 +2158,7 @@ fn emit_value_packet_transition(
         ; mov edx, packet_words as i32
     );
     emit_load_runtime_stub(ops, relocations, transitions.entry(descriptor), descriptor);
-    dynasm!(ops ; .arch x64 ; call r11);
+    emit_runtime_call(ops, descriptor);
     if packet_bytes != 0 {
         dynasm!(ops ; .arch x64 ; add rsp, packet_bytes as i32);
     }
@@ -3392,9 +2195,9 @@ fn emit_load_element(
         transitions.entry(abi::STUB_JIT_LOAD_ELEMENT),
         abi::STUB_JIT_LOAD_ELEMENT,
     );
+    emit_runtime_call(ops, abi::STUB_JIT_LOAD_ELEMENT);
     dynasm!(ops
         ; .arch x64
-        ; call r11
         ; test rdx, rdx
         ; je >done
         ; cmp edx, abi::NativeResultStatus::Throw as i32
@@ -3428,9 +2231,9 @@ fn emit_store_element(
         transitions.entry(abi::STUB_JIT_STORE_ELEMENT),
         abi::STUB_JIT_STORE_ELEMENT,
     );
+    emit_runtime_call(ops, abi::STUB_JIT_STORE_ELEMENT);
     dynasm!(ops
         ; .arch x64
-        ; call r11
         ; test rdx, rdx
         ; je >done
         ; cmp edx, abi::NativeResultStatus::Throw as i32
@@ -3470,9 +2273,9 @@ fn emit_scalar_value(
         transitions.entry(abi::STUB_JIT_SCALAR_VALUE),
         abi::STUB_JIT_SCALAR_VALUE,
     );
+    emit_runtime_call(ops, abi::STUB_JIT_SCALAR_VALUE);
     dynasm!(ops
         ; .arch x64
-        ; call r11
         ; test rdx, rdx
         ; je >normal
         ; cmp edx, abi::NativeResultStatus::Throw as i32
@@ -3488,34 +2291,144 @@ fn emit_store_reg(ops: &mut Assembler, source: u8, destination: u16) {
     dynasm!(ops ; .arch x64 ; mov [r13 + offset], Rq(source));
 }
 
-fn emit_load_u64(ops: &mut Assembler, register: u8, value: u64) {
-    dynasm!(ops ; .arch x64 ; mov Rq(register), QWORD value as i64);
+/// Compare the complete RAX word to a checked nonnegative sign-extended imm8.
+/// dynasm's CMP matching widens BYTE to imm32; this fixed encoding uses
+/// REX.W, opcode 83 and ModRM /7 with register-direct RAX instead.
+fn emit_cmp_rax_imm8(ops: &mut Assembler, value: u64) {
+    let immediate = i8::try_from(value).expect("compact RAX comparison requires 0..=127");
+    ops.extend([0x48, 0x83, 0xf8, immediate as u8]);
 }
 
-fn emit_load_symbol_u64(
-    ops: &mut Assembler,
-    relocations: &mut RelocationCapture,
-    register: u8,
-    value: u64,
-    target: RelocationTarget,
-) {
-    let start = ops.offset().0;
-    emit_load_u64(ops, register, value);
-    relocations.record_x86_imm64(start, ops.offset().0, register, target);
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-fn emit_load_runtime_stub(
-    ops: &mut Assembler,
-    relocations: &mut RelocationCapture,
-    address: u64,
-    descriptor: abi::RuntimeStubDescriptor,
-) {
-    let start = ops.offset().0;
-    dynasm!(ops ; .arch x64 ; mov r11, QWORD address as i64);
-    relocations.record_x86_imm64(
-        start,
-        ops.offset().0,
-        11,
-        RelocationTarget::runtime_stub(descriptor),
-    );
+    #[test]
+    fn compact_rax_comparison_checks_the_full_word_and_sets_exact_flags() {
+        const FLAGS: u64 = 1 | (1 << 6) | (1 << 7) | (1 << 11); // CF, ZF, SF, OF.
+        for immediate in [0, 1, VALUE_FALSE, VALUE_TRUE, VALUE_UNDEFINED, 127] {
+            let mut ops = Assembler::new().unwrap();
+            let entry = ops.offset();
+            dynasm!(ops ; .arch x64 ; mov rax, rdi);
+            let start = ops.offset().0;
+            emit_cmp_rax_imm8(&mut ops, immediate);
+            assert_eq!(ops.offset().0 - start, 4);
+            dynasm!(ops ; .arch x64 ; pushfq ; pop rax ; ret);
+            let code = CompiledCode::new(ops.finalize().unwrap(), entry);
+            assert_eq!(
+                &code.bytes()[start..start + 4],
+                &[0x48, 0x83, 0xf8, immediate as u8]
+            );
+            // SAFETY: this System V entry accepts and compares one u64,
+            // preserves the stack/callee-saved registers and returns flags.
+            // Its executable mapping remains live through every invocation.
+            let run: extern "sysv64" fn(u64) -> u64 =
+                unsafe { std::mem::transmute(code.entry_ptr()) };
+            for value in [
+                immediate.wrapping_sub(1),
+                immediate,
+                immediate + 1,
+                (1 << 8) | immediate,
+                (1 << 32) | immediate,
+                (1 << 63) | immediate,
+                u64::MAX,
+            ] {
+                let difference = value.wrapping_sub(immediate);
+                let overflow = (value ^ immediate) & (value ^ difference) & (1 << 63) != 0;
+                let expected = u64::from(value < immediate)
+                    | (u64::from(difference == 0) << 6)
+                    | ((difference >> 63) << 7)
+                    | (u64::from(overflow) << 11);
+                assert_eq!(
+                    run(value) & FLAGS,
+                    expected,
+                    "{value:#x} versus {immediate}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn value_immediates_zero_extend_u32_and_preserve_prepared_flags() {
+        for register in [0, 1, 2, 6, 8, 9, 10, 11] {
+            for value in [
+                0,
+                VALUE_TRUE,
+                VALUE_UNDEFINED,
+                i32::MAX as u64,
+                i32::MAX as u64 + 1,
+                u32::MAX as u64,
+                u32::MAX as u64 + 1,
+                NUMBER_TAG,
+                u64::MAX,
+            ] {
+                let mut ops = Assembler::new().unwrap();
+                let entry = ops.offset();
+                let flags_register = if register == 11 { 10 } else { 11 };
+                dynasm!(ops ; .arch x64
+                    ; mov Rq(register), QWORD -1
+                    ; mov Rd(flags_register), DWORD 41
+                    ; cmp Rd(flags_register), BYTE 41
+                );
+                let start = ops.offset().0;
+                emit_load_u64(&mut ops, register, value);
+                let encoded = ops.offset().0 - start;
+                let expected = if value <= u32::MAX as u64 {
+                    5 + usize::from(register >= 8)
+                } else {
+                    10
+                };
+                assert_eq!(encoded, expected, "r{register} immediate {value:#x}");
+                dynasm!(ops ; .arch x64
+                    ; jne >failed
+                    ; mov [rdi], Rq(register)
+                    ; mov eax, 1
+                    ; ret
+                    ; failed:
+                    ; xor eax, eax
+                    ; ret
+                );
+                let code = CompiledCode::new(ops.finalize().unwrap(), entry);
+                // SAFETY: the generated System V entry writes one owned u64,
+                // uses only caller-saved registers, and returns before this
+                // executable mapping is released.
+                let run: extern "sysv64" fn(*mut u64) -> u64 =
+                    unsafe { std::mem::transmute(code.entry_ptr()) };
+                let mut output = !value;
+                assert_eq!(run(&mut output), 1, "MOV must preserve prepared flags");
+                assert_eq!(output, value, "r{register} immediate {value:#x}");
+            }
+        }
+    }
+
+    #[test]
+    fn symbolic_low_addresses_keep_fixed_width_relocation_encoding() {
+        for register in [0, 10] {
+            let mut normalized = None;
+            for value in [0, u32::MAX as u64, u32::MAX as u64 + 1, u64::MAX] {
+                let mut ops = Assembler::new().unwrap();
+                let entry = ops.offset();
+                let mut relocations = RelocationCapture::new(true);
+                let start = ops.offset().0;
+                emit_load_symbol_u64(
+                    &mut ops,
+                    &mut relocations,
+                    register,
+                    value,
+                    RelocationTarget::SourceWorkCell { function_id: 9 },
+                );
+                assert_eq!(ops.offset().0 - start, 10);
+                dynasm!(ops ; .arch x64 ; ret);
+                let code = CompiledCode::new(ops.finalize().unwrap(), entry);
+                let rendered = relocations
+                    .render(code.bytes())
+                    .expect("every symbolic address must validate as an exact imm64 move");
+                if let Some(expected) = &normalized {
+                    assert_eq!(&rendered.normalized_code, expected);
+                } else {
+                    normalized = Some(rendered.normalized_code);
+                }
+            }
+        }
+    }
 }

@@ -39,8 +39,8 @@
 //!   its assigned base before publication. Decoded cache carriers retain the
 //!   same proof through proof-preserving rebasing and executable building.
 //! - A rejected module leaves the registry unchanged; admission constructs the
-//!   immutable executable and atom tables only after every fallible check has
-//!   succeeded.
+//!   immutable executable and atom tables under their admitted physical leases;
+//!   directory growth finishes before any IDs or epoch are published.
 //! - A linked module's `Function::id`, `Constant::FunctionId`, and
 //!   `ModuleInit::function_id` are all rebased before the executable
 //!   view is built, so chunk bytecode only ever materialises global
@@ -50,9 +50,15 @@
 //! - Eviction leaves an immutable tombstone node. Function ids and IC-site
 //!   ranges are never reused, and an evicted id is distinguishable from an id
 //!   that was never linked.
-//! - Every live payload carries the exact `SourceModuleBytes` lease for its
-//!   retained bytecode, executable view, and atom table. Dropping the payload
-//!   drops the physical tables and the charge in the same operation.
+//! - Physical compiler modules, function tables, escaped CodeBlocks and
+//!   source-work cells own their inseparable `SourceModuleBytes` leases. A
+//!   payload owns only its local metadata/atom bytes; snapshots share the
+//!   immutable compiler owner and admit fresh mutable execution state. Its immutable source
+//!   registry owns admitted text/indexes with their exact separate leases;
+//!   contexts and snapshots share that owner without a mutable URL registry.
+//!   Dropping the final table/source owner releases its physical data and charge.
+//!   Persistent tombstone nodes and actual vector capacity remain charged until
+//!   their directory drops; eviction totals describe live payload bytes only.
 //! - IC-site bases keep dense property-IC ids globally unique, so two
 //!   chunks never alias one interpreter IC slot.
 //! - Snapshot restore owns a new directory and fresh mutable execution state.
@@ -74,6 +80,7 @@ use otter_resource::{ResourceAccount, ResourceClass, ResourceError, ResourceLeas
 use crate::ExecutionContext;
 use crate::executable::ExecutableModule;
 use crate::property_atom::AtomTable;
+use crate::source_registry::SourceRegistry;
 
 #[path = "code_space_snapshot.rs"]
 pub(crate) mod snapshot;
@@ -85,9 +92,10 @@ pub(crate) mod snapshot;
 /// registry slot is an exact proof that no context still retains the payload.
 #[derive(Debug)]
 pub(crate) struct ChunkPayload {
-    pub(crate) module: Arc<BytecodeModule>,
+    pub(crate) module: Arc<LinkedBytecode>,
     pub(crate) executable: Arc<ExecutableModule>,
     pub(crate) atoms: Arc<AtomTable>,
+    pub(crate) sources: SourceRegistry,
     retained_bytes: u64,
     /// Drops in the same payload as the retained tables.
     _retained_lease: ResourceLease,
@@ -97,6 +105,87 @@ impl ChunkPayload {
     #[must_use]
     pub(crate) fn retained_bytes(&self) -> u64 {
         self.retained_bytes
+    }
+}
+
+/// One immutable compiler module allocation and its inseparable lease.
+/// Snapshots share this owner without retaining mutable donor execution state.
+#[derive(Debug)]
+pub(crate) struct LinkedBytecode {
+    module: BytecodeModule,
+    _lease: ResourceLease,
+}
+
+impl LinkedBytecode {
+    fn new(module: BytecodeModule, account: &ResourceAccount) -> Result<Arc<Self>, ResourceError> {
+        let bytes = (std::mem::size_of::<Self>() as u64).saturating_add(module.retained_bytes());
+        let lease = account.reserve_exact(ResourceClass::SourceModuleBytes, bytes)?;
+        Ok(Arc::new(Self {
+            module,
+            _lease: lease,
+        }))
+    }
+}
+
+impl std::ops::Deref for LinkedBytecode {
+    type Target = BytecodeModule;
+    fn deref(&self) -> &Self::Target {
+        &self.module
+    }
+}
+
+/// The one code-directory vector and its actual allocated-capacity charge.
+/// Empty directories own no buffer/lease. Growth admits the requested exact
+/// capacity before allocating it, then publishes only the fully built node.
+#[derive(Debug, Default)]
+struct CodeDirectory {
+    chunks: Vec<Arc<CodeChunk>>,
+    lease: Option<ResourceLease>,
+}
+
+impl CodeDirectory {
+    fn push(
+        &mut self,
+        chunk: Arc<CodeChunk>,
+        account: &ResourceAccount,
+    ) -> Result<(), ResourceError> {
+        if self.chunks.len() == self.chunks.capacity() {
+            // Geometric growth preserves amortized linking; charge the actual
+            // requested Rust Vec capacity, not logical published row count.
+            let capacity = self.chunks.capacity().saturating_mul(2).max(1);
+            let bytes =
+                (capacity as u64).saturating_mul(std::mem::size_of::<Arc<CodeChunk>>() as u64);
+            // Both actual buffers coexist during a transactional replacement.
+            // Keep the old physical buffer/lease until every new admission and
+            // allocator operation succeeds, even when both accounts are equal.
+            let mut lease = account.reserve_exact(ResourceClass::SourceModuleBytes, bytes)?;
+            let mut replacement = Vec::new();
+            replacement
+                .try_reserve_exact(capacity)
+                .map_err(|cause| ResourceError::Allocation {
+                    class: ResourceClass::SourceModuleBytes,
+                    capacity,
+                    requested: bytes,
+                    cause,
+                })?;
+            let actual_bytes = (replacement.capacity() as u64)
+                .saturating_mul(std::mem::size_of::<Arc<CodeChunk>>() as u64);
+            lease.resize(actual_bytes)?;
+            replacement.extend(self.chunks.iter().cloned());
+            let old = std::mem::replace(&mut self.chunks, replacement);
+            drop(old);
+            self.lease = Some(lease);
+            debug_assert!(self.chunks.capacity() >= capacity);
+        }
+        self.chunks.push(chunk);
+        Ok(())
+    }
+}
+
+impl std::ops::Deref for CodeDirectory {
+    type Target = Vec<Arc<CodeChunk>>;
+    fn deref(&self) -> &Self::Target {
+        &self.chunks
     }
 }
 
@@ -160,10 +249,11 @@ pub(crate) enum ChunkEvictionResult {
 /// Published chunks live in one vector ordered by `function_base`, so a
 /// function id resolves to its owning node by binary search. Readers hold the
 /// shared lock only for that search; linking appends under the exclusive lock
-/// as its final, infallible step, after every fallible admission check.
+/// as its final transactional step: directory capacity admission and allocation
+/// finish before the published epoch and ID ranges change.
 #[derive(Debug, Default)]
 pub(crate) struct CodeSpace {
-    chunks: RwLock<Vec<Arc<CodeChunk>>>,
+    chunks: RwLock<CodeDirectory>,
     /// Single-writer link lock, held from global-base selection through
     /// publication so two links cannot select the same bases.
     link: Mutex<()>,
@@ -301,19 +391,13 @@ struct CodeChunk {
     property_ic_site_end: u32,
     retention: ChunkRetention,
     payload: RwLock<Option<Arc<ChunkPayload>>>,
+    _directory_node_lease: ResourceLease,
 }
 
-/// Exact bytes one live payload retains.
-fn chunk_retained_bytes(
-    module: &BytecodeModule,
-    executable: &ExecutableModule,
-    atoms: &AtomTable,
-) -> u64 {
+/// Exact physical metadata/atom bytes local to one payload. Compiler,
+/// execution/function tables and escaped blocks each own separate leases.
+fn payload_metadata_bytes(atoms: &AtomTable) -> u64 {
     (std::mem::size_of::<ChunkPayload>() as u64)
-        .saturating_add(std::mem::size_of::<BytecodeModule>() as u64)
-        .saturating_add(module.retained_bytes())
-        .saturating_add(std::mem::size_of::<ExecutableModule>() as u64)
-        .saturating_add(executable.retained_bytes())
         .saturating_add(std::mem::size_of::<AtomTable>() as u64)
         .saturating_add(atoms.retained_bytes())
 }
@@ -365,6 +449,7 @@ fn ensure_property_ic_capacity(
 
 fn build_chunk(
     verified: VerifiedBytecodeModule,
+    sources: SourceRegistry,
     function_base: u32,
     function_count: u32,
     property_ic_base: u32,
@@ -374,17 +459,30 @@ fn build_chunk(
     let executable = Arc::new(ExecutableModule::from_verified_bytecode_with_ic_base(
         &verified,
         property_ic_base,
-    ));
-    let module = verified.into_module();
-    let atoms = Arc::new(AtomTable::from_constants(&module.constants));
-    let retained_bytes = chunk_retained_bytes(&module, &executable, &atoms);
+        account,
+    )?);
+    let module = LinkedBytecode::new(verified.into_module(), account)?;
+    let metadata_bytes = (std::mem::size_of::<ChunkPayload>() as u64)
+        .saturating_add(std::mem::size_of::<AtomTable>() as u64)
+        .saturating_add(AtomTable::allocation_bytes(&module.constants));
+    let mut retained_lease =
+        account.reserve_exact(ResourceClass::SourceModuleBytes, metadata_bytes)?;
+    let atoms = Arc::new(AtomTable::from_constants(
+        &module.constants,
+        &mut retained_lease,
+    )?);
+    let metadata_bytes = payload_metadata_bytes(&atoms);
+    retained_lease.resize(metadata_bytes)?;
+    let retained_bytes = metadata_bytes
+        .saturating_add(module._lease.amount())
+        .saturating_add(executable.retained_bytes());
     // Retained-bytes admission: a rejected budget declines the link before
     // publication and the rejection is visible on the ledger.
-    let retained_lease = account.reserve_exact(ResourceClass::SourceModuleBytes, retained_bytes)?;
     let payload = Arc::new(ChunkPayload {
-        module: Arc::new(module),
+        module,
         executable,
         atoms,
+        sources,
         retained_bytes,
         _retained_lease: retained_lease,
     });
@@ -396,30 +494,42 @@ fn build_chunk(
         property_ic_site_end,
         retention,
         payload: RwLock::new(Some(payload)),
+        _directory_node_lease: account.reserve_exact(
+            ResourceClass::SourceModuleBytes,
+            std::mem::size_of::<CodeChunk>() as u64,
+        )?,
     }))
 }
 
 /// Append a fully built chunk to the index. Called with the link lock held;
 /// the exclusive index lock is taken only for the push itself.
-fn publish_chunk(space: &CodeSpace, chunk: Arc<CodeChunk>) {
-    if chunk.retention == ChunkRetention::Evictable {
-        let retained_bytes = chunk
+fn publish_chunk(
+    space: &CodeSpace,
+    chunk: Arc<CodeChunk>,
+    account: &ResourceAccount,
+) -> Result<(), ResourceError> {
+    let retained_bytes = if chunk.retention == ChunkRetention::Evictable {
+        chunk
             .payload
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .as_ref()
-            .expect("published chunks start with a live payload")
-            .retained_bytes();
-        space
-            .evictable_retained_bytes
-            .fetch_add(retained_bytes, Ordering::AcqRel);
-    }
+            .map_or(0, |payload| payload.retained_bytes())
+    } else {
+        0
+    };
     space
         .chunks
         .write()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .push(chunk);
+        .push(chunk, account)?;
+    // No fallible work remains after node publication. Failed directory growth
+    // drops the unpublished chunk and leaves IDs/epoch/eviction totals intact.
+    space
+        .evictable_retained_bytes
+        .fetch_add(retained_bytes, Ordering::AcqRel);
     space.epoch.fetch_add(1, Ordering::Release);
+    Ok(())
 }
 
 impl CodeSpace {
@@ -437,23 +547,26 @@ impl CodeSpace {
     pub(crate) fn link_module(
         self: &Arc<Self>,
         module: BytecodeModule,
+        sources: SourceRegistry,
         account: &ResourceAccount,
     ) -> Result<ExecutionContext, BytecodeLinkError> {
-        self.link_module_with_retention(module, account, ChunkRetention::Pinned)
+        self.link_module_with_retention(module, sources, account, ChunkRetention::Pinned)
     }
 
     /// Link a chunk that may be reclaimed after an explicit liveness proof.
     pub(crate) fn link_evictable_module(
         self: &Arc<Self>,
         module: BytecodeModule,
+        sources: SourceRegistry,
         account: &ResourceAccount,
     ) -> Result<ExecutionContext, BytecodeLinkError> {
-        self.link_module_with_retention(module, account, ChunkRetention::Evictable)
+        self.link_module_with_retention(module, sources, account, ChunkRetention::Evictable)
     }
 
     fn link_module_with_retention(
         self: &Arc<Self>,
         mut module: BytecodeModule,
+        sources: SourceRegistry,
         account: &ResourceAccount,
         retention: ChunkRetention,
     ) -> Result<ExecutionContext, BytecodeLinkError> {
@@ -470,13 +583,14 @@ impl CodeSpace {
 
         let chunk = build_chunk(
             verified,
+            sources,
             function_base,
             function_count,
             property_ic_base,
             retention,
             account,
         )?;
-        publish_chunk(self, Arc::clone(&chunk));
+        publish_chunk(self, Arc::clone(&chunk), account)?;
         let payload = chunk
             .payload
             .read()
@@ -501,23 +615,26 @@ impl CodeSpace {
     pub(crate) fn link_verified_module(
         self: &Arc<Self>,
         verified: VerifiedBytecodeModule,
+        sources: SourceRegistry,
         account: &ResourceAccount,
     ) -> Result<ExecutionContext, BytecodeLinkError> {
-        self.link_verified_with_retention(verified, account, ChunkRetention::Pinned)
+        self.link_verified_with_retention(verified, sources, account, ChunkRetention::Pinned)
     }
 
     /// [`Self::link_evictable_module`] for a module already verified.
     pub(crate) fn link_evictable_verified_module(
         self: &Arc<Self>,
         verified: VerifiedBytecodeModule,
+        sources: SourceRegistry,
         account: &ResourceAccount,
     ) -> Result<ExecutionContext, BytecodeLinkError> {
-        self.link_verified_with_retention(verified, account, ChunkRetention::Evictable)
+        self.link_verified_with_retention(verified, sources, account, ChunkRetention::Evictable)
     }
 
     fn link_verified_with_retention(
         self: &Arc<Self>,
         verified: VerifiedBytecodeModule,
+        sources: SourceRegistry,
         account: &ResourceAccount,
         retention: ChunkRetention,
     ) -> Result<ExecutionContext, BytecodeLinkError> {
@@ -533,13 +650,14 @@ impl CodeSpace {
         let verified = verified.rebase_to(function_base)?;
         let chunk = build_chunk(
             verified,
+            sources,
             function_base,
             function_count,
             property_ic_base,
             retention,
             account,
         )?;
-        publish_chunk(self, Arc::clone(&chunk));
+        publish_chunk(self, Arc::clone(&chunk), account)?;
         let payload = chunk
             .payload
             .read()
@@ -562,7 +680,7 @@ impl CodeSpace {
         }
     }
 
-    fn chunks(&self) -> RwLockReadGuard<'_, Vec<Arc<CodeChunk>>> {
+    fn chunks(&self) -> RwLockReadGuard<'_, CodeDirectory> {
         self.chunks
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -928,7 +1046,11 @@ mod tests {
     fn first_chunk_links_at_base_zero_unrebased() {
         let space = Arc::new(CodeSpace::default());
         let context = space
-            .link_module(module_with_functions(3), &unlimited())
+            .link_module(
+                module_with_functions(3),
+                crate::source_registry::SourceRegistry::default(),
+                &unlimited(),
+            )
             .expect("valid first chunk links");
         assert_eq!(context.function_base(), 0);
         assert_eq!(context.function_id_constant(0), Some(1));
@@ -941,10 +1063,18 @@ mod tests {
     fn second_chunk_rebases_ids_constants_and_inits() {
         let space = Arc::new(CodeSpace::default());
         let _first = space
-            .link_module(module_with_functions(3), &unlimited())
+            .link_module(
+                module_with_functions(3),
+                crate::source_registry::SourceRegistry::default(),
+                &unlimited(),
+            )
             .expect("valid first chunk links");
         let second = space
-            .link_module(module_with_functions(2), &unlimited())
+            .link_module(
+                module_with_functions(2),
+                crate::source_registry::SourceRegistry::default(),
+                &unlimited(),
+            )
             .expect("valid second chunk links");
         assert_eq!(second.function_base(), 3);
         assert_eq!(second.function_id_constant(0), Some(4));
@@ -966,13 +1096,21 @@ mod tests {
     fn verified_cache_carrier_rebases_without_aliasing_existing_ids() {
         let space = Arc::new(CodeSpace::default());
         space
-            .link_module(module_with_functions(3), &unlimited())
+            .link_module(
+                module_with_functions(3),
+                crate::source_registry::SourceRegistry::default(),
+                &unlimited(),
+            )
             .expect("first chunk links");
         let verified = VerifiedBytecodeModule::new(module_with_functions(2))
             .expect("cache fixture verifies once");
 
         let second = space
-            .link_verified_module(verified, &unlimited())
+            .link_verified_module(
+                verified,
+                crate::source_registry::SourceRegistry::default(),
+                &unlimited(),
+            )
             .expect("retained proof rebases onto the selected range");
         assert_eq!(second.function_base(), 3);
         assert_eq!(second.function(3).map(|function| function.id), Some(3));
@@ -984,10 +1122,18 @@ mod tests {
     fn foreign_ids_resolve_through_any_linked_context() {
         let space = Arc::new(CodeSpace::default());
         let first = space
-            .link_module(module_with_functions(3), &unlimited())
+            .link_module(
+                module_with_functions(3),
+                crate::source_registry::SourceRegistry::default(),
+                &unlimited(),
+            )
             .expect("valid first chunk links");
         let second = space
-            .link_module(module_with_functions(2), &unlimited())
+            .link_module(
+                module_with_functions(2),
+                crate::source_registry::SourceRegistry::default(),
+                &unlimited(),
+            )
             .expect("valid second chunk links");
         let foreign = first.for_function(4).expect("second chunk's id resolves");
         assert_eq!(foreign.function_base(), 3);
@@ -1029,10 +1175,18 @@ mod tests {
         module.module_inits.clear();
         let second_module = module.clone();
         let first = space
-            .link_module(module, &unlimited())
+            .link_module(
+                module,
+                crate::source_registry::SourceRegistry::default(),
+                &unlimited(),
+            )
             .expect("valid first chunk links");
         let second = space
-            .link_module(second_module, &unlimited())
+            .link_module(
+                second_module,
+                crate::source_registry::SourceRegistry::default(),
+                &unlimited(),
+            )
             .expect("valid second chunk links");
         assert_eq!(first.property_ic_site_end(), 1);
         assert_eq!(second.property_ic_site_end(), 2);
@@ -1067,7 +1221,11 @@ mod tests {
         module.module_inits.clear();
 
         let context = space
-            .link_evictable_module(module, &unlimited())
+            .link_evictable_module(
+                module,
+                crate::source_registry::SourceRegistry::default(),
+                &unlimited(),
+            )
             .expect("evictable property chunk links");
         context
             .property_feedback_slot(0, 0, crate::property_ic::PropertyIcKind::Load)
@@ -1096,7 +1254,11 @@ mod tests {
             let space = Arc::clone(&space);
             joins.push(std::thread::spawn(move || {
                 space
-                    .link_module(module_with_functions(2), &unlimited())
+                    .link_module(
+                        module_with_functions(2),
+                        crate::source_registry::SourceRegistry::default(),
+                        &unlimited(),
+                    )
                     .expect("valid concurrent chunk links")
                     .function_base()
             }));
@@ -1123,7 +1285,11 @@ mod tests {
         malformed.functions[0].id = 7;
 
         assert!(matches!(
-            space.link_module(malformed, &unlimited()),
+            space.link_module(
+                malformed,
+                crate::source_registry::SourceRegistry::default(),
+                &unlimited()
+            ),
             Err(BytecodeLinkError::Verify(BytecodeVerifyError::FunctionId {
                 function_index: 0,
                 expected: 0,
@@ -1133,7 +1299,11 @@ mod tests {
         assert!(space.chunks().is_empty());
 
         let context = space
-            .link_module(module_with_functions(2), &unlimited())
+            .link_module(
+                module_with_functions(2),
+                crate::source_registry::SourceRegistry::default(),
+                &unlimited(),
+            )
             .expect("valid module still claims base zero");
         assert_eq!(context.function_base(), 0);
     }
@@ -1159,7 +1329,11 @@ mod tests {
         .into();
 
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            space.link_module(malformed, &unlimited())
+            space.link_module(
+                malformed,
+                crate::source_registry::SourceRegistry::default(),
+                &unlimited(),
+            )
         }));
         assert!(matches!(
             result,
@@ -1176,7 +1350,11 @@ mod tests {
         assert!(space.chunks().is_empty());
 
         let context = space
-            .link_module(module_with_functions(2), &unlimited())
+            .link_module(
+                module_with_functions(2),
+                crate::source_registry::SourceRegistry::default(),
+                &unlimited(),
+            )
             .expect("valid module still claims base zero");
         assert_eq!(context.function_base(), 0);
     }
@@ -1210,7 +1388,11 @@ mod tests {
         assert!(space.chunks().is_empty());
 
         let context = space
-            .link_module(module_with_functions(2), &unlimited())
+            .link_module(
+                module_with_functions(2),
+                crate::source_registry::SourceRegistry::default(),
+                &unlimited(),
+            )
             .expect("failed cache admission leaves base zero available");
         assert_eq!(context.function_base(), 0);
     }
@@ -1243,7 +1425,11 @@ mod tests {
         .into();
 
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            space.link_module(malformed, &unlimited())
+            space.link_module(
+                malformed,
+                crate::source_registry::SourceRegistry::default(),
+                &unlimited(),
+            )
         }));
         assert!(matches!(
             result,
@@ -1266,7 +1452,11 @@ mod tests {
         let space = Arc::new(CodeSpace::default());
         let account = unlimited();
         space
-            .link_module(module_with_functions(2), &account)
+            .link_module(
+                module_with_functions(2),
+                crate::source_registry::SourceRegistry::default(),
+                &account,
+            )
             .expect("valid chunk links against an unlimited account");
         let per_chunk = account
             .snapshot()
@@ -1283,7 +1473,11 @@ mod tests {
         );
         let rejecting_space = Arc::new(CodeSpace::default());
         let error = rejecting_space
-            .link_module(module_with_functions(2), &limited)
+            .link_module(
+                module_with_functions(2),
+                crate::source_registry::SourceRegistry::default(),
+                &limited,
+            )
             .expect_err("budget below one chunk rejects the link");
         assert!(matches!(error, BytecodeLinkError::RetainedBytes(_)));
         assert!(rejecting_space.chunks().is_empty());
@@ -1293,7 +1487,11 @@ mod tests {
 
         // The failed admission leaves base zero claimable.
         rejecting_space
-            .link_module(module_with_functions(2), &unlimited())
+            .link_module(
+                module_with_functions(2),
+                crate::source_registry::SourceRegistry::default(),
+                &unlimited(),
+            )
             .expect("valid module still claims base zero");
 
         // Dropping the registry releases every chunk's charge.
@@ -1314,14 +1512,23 @@ mod tests {
         let space = Arc::new(CodeSpace::default());
         let account = unlimited();
         let pinned = space
-            .link_module(module_with_functions(2), &account)
+            .link_module(
+                module_with_functions(2),
+                crate::source_registry::SourceRegistry::default(),
+                &account,
+            )
             .expect("pinned chunk");
         let baseline = account
             .snapshot()
             .get(ResourceClass::SourceModuleBytes)
             .current();
+        let old_capacity = space.chunks().capacity();
         let evictable = space
-            .link_evictable_module(module_with_functions(2), &account)
+            .link_evictable_module(
+                module_with_functions(2),
+                crate::source_registry::SourceRegistry::default(),
+                &account,
+            )
             .expect("evictable chunk");
         let old_base = evictable.function_base();
         assert_eq!(old_base, 2);
@@ -1362,6 +1569,10 @@ mod tests {
                 .get(ResourceClass::SourceModuleBytes)
                 .current(),
             baseline
+                + std::mem::size_of::<super::CodeChunk>() as u64
+                + ((space.chunks().capacity() - old_capacity)
+                    * std::mem::size_of::<Arc<super::CodeChunk>>()) as u64,
+            "tombstone node and the grown directory capacity stay physically retained",
         );
         assert!(matches!(
             space.resolve_chunk(old_base),
@@ -1380,7 +1591,11 @@ mod tests {
         ));
 
         let later = space
-            .link_module(module_with_functions(2), &account)
+            .link_module(
+                module_with_functions(2),
+                crate::source_registry::SourceRegistry::default(),
+                &account,
+            )
             .expect("later chunk");
         assert_eq!(later.function_base(), 4, "tombstoned ids are never reused");
     }
@@ -1408,3 +1623,11 @@ mod tests {
         assert_send_sync::<crate::ExecutionContext>();
     }
 }
+
+#[cfg(test)]
+#[path = "code_space/source_tests.rs"]
+mod source_tests;
+
+#[cfg(test)]
+#[path = "code_space/directory_tests.rs"]
+mod directory_tests;

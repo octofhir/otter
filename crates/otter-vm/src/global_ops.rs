@@ -7,17 +7,20 @@
 //! - `globalThis` load.
 //! - Throwing global binding lookup with lexical-cell and guarded global-object
 //!   slot caches for ordinary identifier reads.
-//! - Undefined-returning global lookup for `typeof`.
+//! - Named global-environment lookup shared by `typeof` and scoped host reads.
 //! - Global declaration, initialization, assignment, and deletion helpers.
 //!
 //! # Invariants
-//! - Global properties live on the interpreter's `global_this` object.
+//! - Each global operation resolves the linked source function's realm.
+//!   The active or parked RealmState retains that realm's global and lexicals;
+//!   disposed sources never substitute another realm's ambient global.
 //! - A global-object slot cache is valid only while the object's hidden-class
 //!   identity matches and no later global lexical declaration shadows it.
 //! - Missing throwing lookups surface as `UndefinedIdentifier` so the normal
 //!   error path can synthesize a `ReferenceError`.
-//! - Identifier assignment routes through descriptor-aware object `[[Set]]`;
-//!   raw property writes are reserved for declaration/bootstrap paths.
+//! - Identifier assignment and existing var bindings use the actual `[[Set]]`
+//!   ladder with the current activation stack; declaration defines use the sole
+//!   descriptor owner and retain their real allocation failure.
 //! - Bindings a sloppy direct eval creates live in context eval extensions and
 //!   resolve through the `Lookup*` family in [`crate::context_ops`], which
 //!   falls back to these global-record helpers.
@@ -26,6 +29,7 @@
 //! - [`crate::executable`]
 //! - [`crate::object`]
 
+use crate::native_abi::CommittedValueError;
 use smallvec::SmallVec;
 
 use crate::{
@@ -40,6 +44,15 @@ pub(crate) struct GlobalObjectLoadCache {
     slot: u16,
 }
 
+/// Missing-name behavior of the two ECMAScript global identifier reads.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum GlobalBindingRead {
+    /// An unresolvable ordinary identifier raises ReferenceError.
+    Identifier,
+    /// An unresolvable typeof operand yields undefined; TDZ still throws.
+    Typeof,
+}
+
 impl Interpreter {
     pub(crate) fn run_load_global_this_reg(
         &self,
@@ -49,14 +62,7 @@ impl Interpreter {
         // A frame compiled in another realm sees that realm's global
         // (§9.1.1.4.11 GetThisBinding); the parked realm keeps it in
         // `extra_realms` while inactive.
-        let global = match self.foreign_function_realm(frame.function_id) {
-            Some(realm_id) => self
-                .extra_realms
-                .iter()
-                .find(|realm| realm.id == realm_id)
-                .map_or(self.global_this, |realm| realm.global_this),
-            None => self.global_this,
-        };
+        let global = self.global_this_for_function(frame.function_id)?;
         write_register(frame, dst, Value::object(global))?;
         frame.advance_pc()?;
         Ok(())
@@ -69,7 +75,7 @@ impl Interpreter {
         top_idx: usize,
         dst: u16,
         name_idx: u32,
-    ) -> Result<(), VmError> {
+    ) -> Result<(), CommittedValueError> {
         let function_id = stack[top_idx].function_id;
         self.run_load_global_or_throw_reg_for_function(
             context,
@@ -89,11 +95,14 @@ impl Interpreter {
         function_id: u32,
         dst: u16,
         name_idx: u32,
-    ) -> Result<(), VmError> {
+    ) -> Result<(), CommittedValueError> {
         let value = self.load_global_or_throw_value(stack, context, function_id, name_idx)?;
         let frame = &mut stack[top_idx];
-        write_register(frame, dst, value)?;
-        frame.advance_pc()?;
+        write_register(frame, dst, value)
+            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+        frame
+            .advance_pc()
+            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
         Ok(())
     }
 
@@ -110,13 +119,15 @@ impl Interpreter {
         context: &ExecutionContext,
         function_id: u32,
         name_idx: u32,
-    ) -> Result<Value, VmError> {
+    ) -> Result<Value, CommittedValueError> {
         // A frame compiled in another realm resolves its globals there —
         // §9.1.1.4 global environment records are per-realm.
         if let Some(realm_id) = self.foreign_function_realm(function_id) {
-            return self.with_host_realm_id(realm_id, |interp| {
-                interp.load_global_or_throw_value(stack, context, function_id, name_idx)
-            });
+            return self
+                .with_host_realm_id(realm_id, |interp| {
+                    Ok(interp.load_global_or_throw_value(stack, context, function_id, name_idx))
+                })
+                .map_err(CommittedValueError::Fatal)?;
         }
         // A previously-resolved lexical cell for this load site reads directly,
         // skipping the name-string hash and const-table lookup. The cell is
@@ -128,10 +139,11 @@ impl Interpreter {
             }
             let name = context
                 .string_constant_str_for_function(function_id, name_idx)
-                .ok_or(VmError::InvalidOperand)?;
-            return Err(self.err_this_uninit(
+                .ok_or(VmError::InvalidOperand)
+                .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+            return Err(CommittedValueError::JavaScript(self.err_this_uninit(
                 (format!("Cannot access '{name}' before initialization")).into(),
-            ));
+            )));
         }
         // Object-record globals such as constructors and benchmark fixtures
         // dominate identifier reads in script code. A matching hidden class
@@ -151,65 +163,15 @@ impl Interpreter {
         }
         let name = context
             .string_constant_str_for_function(function_id, name_idx)
-            .ok_or(VmError::InvalidOperand)?;
-        // §9.1.1.4 — the global declarative record (script lexicals)
-        // shadows the object record.
-        if let Some((cell, _)) = self.global_lexicals.get(name).copied() {
-            self.global_lexical_load_ic
-                .insert((function_id, name_idx), cell);
-            let value = crate::read_upvalue(&self.gc_heap, cell);
-            if value.is_hole() {
-                return Err(self.err_this_uninit(
-                    (format!("Cannot access '{name}' before initialization")).into(),
-                ));
-            }
-            return Ok(value);
-        }
-        let (own_hit, own_lookup) = object::lookup_own_slot(self.global_this, &self.gc_heap, name);
-        match own_lookup {
-            object::PropertyLookup::Data { value, .. } => {
-                if let Some(hit) = own_hit {
-                    self.global_object_load_ic.insert(
-                        site,
-                        GlobalObjectLoadCache {
-                            shape_id: hit.shape_id,
-                            slot: hit.slot,
-                        },
-                    );
-                }
-                return Ok(value);
-            }
-            object::PropertyLookup::Accessor { getter, .. } => {
-                return match getter {
-                    Some(getter) if crate::abstract_ops::is_callable(&getter) => {
-                        let receiver = Value::object(self.global_this);
-                        self.run_callable_sync_rooted(
-                            stack,
-                            context,
-                            &getter,
-                            receiver,
-                            SmallVec::new(),
-                        )
-                    }
-                    _ => Ok(Value::undefined()),
-                };
-            }
-            object::PropertyLookup::Absent => {}
-        }
-        let receiver = Value::object(self.global_this);
-        let key = VmPropertyKey::String(name);
-        if !self.ordinary_has_property_value(stack, context, receiver, &key, 0)? {
-            return Err(self.err_undefined_ident((name.to_string()).into()));
-        }
-        let receiver = Value::object(self.global_this);
-        let value = match self.ordinary_get_value(stack, context, receiver, receiver, &key, 0)? {
-            VmGetOutcome::Value(value) => value,
-            VmGetOutcome::InvokeGetter { getter } => {
-                let receiver = Value::object(self.global_this);
-                self.run_callable_sync_rooted(stack, context, &getter, receiver, SmallVec::new())?
-            }
-        };
-        Ok(value)
+            .ok_or(VmError::InvalidOperand)
+            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+        self.load_global_binding_name(
+            Some(context),
+            stack,
+            name,
+            GlobalBindingRead::Identifier,
+            Some(site),
+        )
     }
 
     pub(crate) fn run_load_global_or_undefined_reg(
@@ -219,12 +181,15 @@ impl Interpreter {
         top_idx: usize,
         dst: u16,
         name_idx: u32,
-    ) -> Result<(), VmError> {
+    ) -> Result<(), CommittedValueError> {
         let function_id = stack[top_idx].function_id;
         let value = self.load_global_or_undefined_value(context, stack, function_id, name_idx)?;
         let frame = &mut stack[top_idx];
-        write_register(frame, dst, value)?;
-        frame.advance_pc()?;
+        write_register(frame, dst, value)
+            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+        frame
+            .advance_pc()
+            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
         Ok(())
     }
 
@@ -234,42 +199,106 @@ impl Interpreter {
         stack: &mut ActivationStack,
         function_id: u32,
         name_idx: u32,
-    ) -> Result<Value, VmError> {
+    ) -> Result<Value, CommittedValueError> {
         if let Some(realm_id) = self.foreign_function_realm(function_id) {
-            return self.with_host_realm_id(realm_id, |interp| {
-                interp.load_global_or_undefined_value(context, stack, function_id, name_idx)
-            });
+            return self
+                .with_host_realm_id(realm_id, |interp| {
+                    Ok(
+                        interp.load_global_or_undefined_value(
+                            context,
+                            stack,
+                            function_id,
+                            name_idx,
+                        ),
+                    )
+                })
+                .map_err(CommittedValueError::Fatal)?;
         }
         let name = context
             .string_constant_str_for_function(function_id, name_idx)
-            .ok_or(VmError::InvalidOperand)?;
-        // §13.5.3 — `typeof` still raises ReferenceError for a
-        // lexical binding read inside its TDZ; only *unresolvable*
-        // names yield `undefined`.
-        let value = if let Some(value) = self.read_global_lexical(name)? {
-            value
-        } else {
-            // §13.5.3 step 2 — GetValue on the resolved global
-            // reference runs the ordinary [[Get]], so an
-            // accessor-defined global fires its getter (and its
-            // abrupt completion propagates).
-            let receiver = Value::object(self.global_this);
-            let key = crate::VmPropertyKey::String(name);
-            match self.ordinary_get_value(stack, context, receiver, receiver, &key, 0)? {
-                VmGetOutcome::Value(value) => value,
-                VmGetOutcome::InvokeGetter { getter } => {
-                    let receiver = Value::object(self.global_this);
-                    self.run_callable_sync_rooted(
-                        stack,
-                        context,
-                        &getter,
-                        receiver,
-                        SmallVec::new(),
-                    )?
-                }
+            .ok_or(VmError::InvalidOperand)
+            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+        self.load_global_binding_name(Some(context), stack, name, GlobalBindingRead::Typeof, None)
+    }
+
+    /// Read one named global binding through the active realm's environment.
+    /// Only `typeof` suppresses an unresolvable name; every resolved lexical
+    /// TDZ or collecting getter keeps its ordinary abrupt completion. A cached
+    /// bytecode identifier site retains the existing stable-cell/own-slot proof.
+    pub(crate) fn load_global_binding_name(
+        &mut self,
+        context: Option<&ExecutionContext>,
+        stack: &mut ActivationStack,
+        name: &str,
+        read: GlobalBindingRead,
+        cache_site: Option<(u32, u32)>,
+    ) -> Result<Value, CommittedValueError> {
+        if let Some(value) = self
+            .read_global_lexical(name)
+            .map_err(|error| CommittedValueError::JavaScript(error.into()))?
+        {
+            if let Some(site) = cache_site
+                && let Some((cell, _)) = self.global_lexicals.get(name).copied()
+            {
+                self.global_lexical_load_ic.insert(site, cell);
             }
-        };
-        Ok(value)
+            return Ok(value);
+        }
+        // Ordinary identifier reads retain the same own-slot fast lookup and
+        // [[HasProperty]] check as LoadGlobal. A getter may delete the binding
+        // after an earlier typeof read, so an absent identifier must still throw.
+        if matches!(read, GlobalBindingRead::Identifier) {
+            let (own_hit, own_lookup) =
+                object::lookup_own_slot(self.global_this, &self.gc_heap, name);
+            match own_lookup {
+                object::PropertyLookup::Data { value, .. } => {
+                    if let (Some(site), Some(hit)) = (cache_site, own_hit) {
+                        self.global_object_load_ic.insert(
+                            site,
+                            GlobalObjectLoadCache {
+                                shape_id: hit.shape_id,
+                                slot: hit.slot,
+                            },
+                        );
+                    }
+                    return Ok(value);
+                }
+                object::PropertyLookup::Accessor { getter, .. } => {
+                    return match getter {
+                        Some(getter) if crate::abstract_ops::is_callable(&getter) => {
+                            let receiver = Value::object(self.global_this);
+                            self.run_callable_sync_rooted(
+                                stack,
+                                context,
+                                &getter,
+                                receiver,
+                                SmallVec::new(),
+                            )
+                            .map_err(CommittedValueError::completed_call)
+                        }
+                        _ => Ok(Value::undefined()),
+                    };
+                }
+                object::PropertyLookup::Absent => {}
+            }
+            let receiver = Value::object(self.global_this);
+            let key = VmPropertyKey::String(name);
+            if !self.ordinary_has_property_value(stack, context, receiver, &key, 0)? {
+                return Err(CommittedValueError::JavaScript(
+                    self.err_undefined_ident(name.to_owned().into()),
+                ));
+            }
+        }
+        let receiver = Value::object(self.global_this);
+        let key = VmPropertyKey::String(name);
+        match self.ordinary_get_value(stack, context, receiver, receiver, &key, 0)? {
+            VmGetOutcome::Value(value) => Ok(value),
+            VmGetOutcome::InvokeGetter { getter } => {
+                let receiver = Value::object(self.global_this);
+                self.run_callable_sync_rooted(stack, context, &getter, receiver, SmallVec::new())
+                    .map_err(CommittedValueError::completed_call)
+            }
+        }
     }
 
     /// Read a binding from the global declarative record. `Ok(None)`
@@ -293,34 +322,51 @@ impl Interpreter {
     pub(crate) fn run_define_global_var_reg(
         &mut self,
         context: &ExecutionContext,
-        frame: &mut Frame,
+        stack: &mut ActivationStack,
+        frame_index: usize,
         name_idx: u32,
         value_reg: u16,
-    ) -> Result<(), VmError> {
-        let value = *crate::read_register(frame, value_reg)?;
-        self.define_global_var_value(context, frame.function_id, name_idx, value)?;
-        frame.advance_pc()?;
+    ) -> Result<(), CommittedValueError> {
+        let frame = &stack[frame_index];
+        let function_id = frame.function_id;
+        let value = *crate::read_register(frame, value_reg)
+            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+        self.define_global_var_value(context, stack, function_id, name_idx, value)?;
+        stack[frame_index]
+            .advance_pc()
+            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
         Ok(())
     }
 
     pub(crate) fn define_global_var_value(
         &mut self,
         context: &ExecutionContext,
+        stack: &mut ActivationStack,
         function_id: u32,
         name_idx: u32,
         value: Value,
-    ) -> Result<(), VmError> {
+    ) -> Result<(), CommittedValueError> {
         let name = context
             .string_constant_str_for_function(function_id, name_idx)
-            .ok_or(VmError::InvalidOperand)?;
+            .ok_or(VmError::InvalidOperand)
+            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
         // §9.1.1.4.18 SetMutableBinding shape — an existing own
         // property keeps its attributes (enumerability,
         // configurability) and only receives the new value; a
         // non-writable existing property silently absorbs the write
         // in sloppy mode. Only an absent property is defined fresh.
         if object::get_own_descriptor(self.global_this, &self.gc_heap, name).is_some() {
-            object::set(&mut self.global_this, &mut self.gc_heap, name, value);
-            return Ok(());
+            // Existing object-record bindings use the actual [[Set]] ladder:
+            // setters re-enter through this same live activation owner and
+            // sloppy read-only failures preserve the descriptor unchanged.
+            return self.ordinary_set_with_callable_setter(
+                stack,
+                context,
+                self.global_this,
+                name,
+                value,
+                false,
+            );
         }
         let descriptor = object::PartialPropertyDescriptor {
             value: Some(value),
@@ -334,8 +380,12 @@ impl Interpreter {
             &mut self.gc_heap,
             name,
             descriptor,
-        ) {
-            return Err(self.err_type((format!("Cannot declare global var '{name}'")).into()));
+        )
+        .map_err(|error| CommittedValueError::JavaScript(error.into()))?
+        {
+            return Err(CommittedValueError::JavaScript(
+                self.err_type((format!("Cannot declare global var '{name}'")).into()),
+            ));
         }
         Ok(())
     }
@@ -389,7 +439,7 @@ impl Interpreter {
                 &mut self.gc_heap,
                 name,
                 descriptor,
-            ) {
+            )? {
                 return Err(
                     self.err_type((format!("Cannot declare global variable '{name}'")).into())
                 );
@@ -448,7 +498,7 @@ impl Interpreter {
                 &mut self.gc_heap,
                 name,
                 descriptor,
-            ) {
+            )? {
                 return Err(
                     self.err_type((format!("Cannot declare global function '{name}'")).into())
                 );
@@ -464,7 +514,16 @@ impl Interpreter {
                     self.err_type((format!("Cannot declare global function '{name}'")).into())
                 );
             }
-            object::set(&mut self.global_this, &mut self.gc_heap, name, value);
+            if !object::ordinary_set_data_property(
+                &mut self.global_this,
+                &mut self.gc_heap,
+                name,
+                value,
+            )? {
+                return Err(
+                    self.err_type((format!("Cannot declare global function '{name}'")).into())
+                );
+            }
         }
         Ok(())
     }
@@ -645,12 +704,15 @@ impl Interpreter {
         top_idx: usize,
         dst: u16,
         name_idx: u32,
-    ) -> Result<(), VmError> {
+    ) -> Result<(), CommittedValueError> {
         let function_id = stack[top_idx].function_id;
         let exists = self.global_binding_exists_value(stack, context, function_id, name_idx)?;
         let frame = &mut stack[top_idx];
-        crate::write_register(frame, dst, exists)?;
-        frame.advance_pc()?;
+        crate::write_register(frame, dst, exists)
+            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+        frame
+            .advance_pc()
+            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
         Ok(())
     }
 
@@ -660,10 +722,18 @@ impl Interpreter {
         context: &ExecutionContext,
         function_id: u32,
         name_idx: u32,
-    ) -> Result<Value, VmError> {
+    ) -> Result<Value, CommittedValueError> {
+        if let Some(realm_id) = self.foreign_function_realm(function_id) {
+            return self
+                .with_host_realm_id(realm_id, |interp| {
+                    Ok(interp.global_binding_exists_value(stack, context, function_id, name_idx))
+                })
+                .map_err(CommittedValueError::Fatal)?;
+        }
         let name = context
             .string_constant_str_for_function(function_id, name_idx)
-            .ok_or(VmError::InvalidOperand)?;
+            .ok_or(VmError::InvalidOperand)
+            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
         if self.global_lexicals.contains_key(name)
             || object::get_own_descriptor(self.global_this, &self.gc_heap, name).is_some()
         {
@@ -674,7 +744,7 @@ impl Interpreter {
         // its `has` trap — the non-reentrant chain walk cannot.
         let receiver = Value::object(self.global_this);
         let key = VmPropertyKey::String(name);
-        let exists = self.ordinary_has_property_value(stack, context, receiver, &key, 0)?;
+        let exists = self.ordinary_has_property_value(stack, Some(context), receiver, &key, 0)?;
         Ok(Value::boolean(exists))
     }
 
@@ -690,16 +760,20 @@ impl Interpreter {
         value_reg: u16,
         name_idx: u32,
         exists_reg: u16,
-    ) -> Result<(), VmError> {
+    ) -> Result<(), CommittedValueError> {
         let frame = &stack[top_idx];
-        let existed = crate::read_register(frame, exists_reg)?
+        let existed = crate::read_register(frame, exists_reg)
+            .map_err(|error| CommittedValueError::Fatal(error.into()))?
             .as_boolean()
             .unwrap_or(false);
         if !existed {
             let name = context
                 .string_constant_str(name_idx)
-                .ok_or(VmError::InvalidOperand)?;
-            return Err(self.err_undefined_ident((name.to_string()).into()));
+                .ok_or(VmError::InvalidOperand)
+                .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+            return Err(CommittedValueError::JavaScript(
+                self.err_undefined_ident((name.to_string()).into()),
+            ));
         }
         self.run_store_global_binding_reg(context, stack, top_idx, value_reg, name_idx, true)
     }
@@ -712,24 +786,29 @@ impl Interpreter {
         value: Value,
         name_idx: u32,
         existed: bool,
-    ) -> Result<(), VmError> {
+    ) -> Result<(), CommittedValueError> {
         if let Some(realm_id) = self.foreign_function_realm(function_id) {
-            return self.with_host_realm_id(realm_id, |interp| {
-                interp.store_global_checked_value(
-                    context,
-                    stack,
-                    function_id,
-                    value,
-                    name_idx,
-                    existed,
-                )
-            });
+            return self
+                .with_host_realm_id(realm_id, |interp| {
+                    Ok(interp.store_global_checked_value(
+                        context,
+                        stack,
+                        function_id,
+                        value,
+                        name_idx,
+                        existed,
+                    ))
+                })
+                .map_err(CommittedValueError::Fatal)?;
         }
         if !existed {
             let name = context
                 .string_constant_str_for_function(function_id, name_idx)
-                .ok_or(VmError::InvalidOperand)?;
-            return Err(self.err_undefined_ident((name.to_string()).into()));
+                .ok_or(VmError::InvalidOperand)
+                .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+            return Err(CommittedValueError::JavaScript(
+                self.err_undefined_ident((name.to_string()).into()),
+            ));
         }
         self.store_global_binding_value(context, stack, function_id, value, name_idx, true)
     }
@@ -742,11 +821,14 @@ impl Interpreter {
         value_reg: u16,
         name_idx: u32,
         strict: bool,
-    ) -> Result<(), VmError> {
-        let value = *crate::read_register(&stack[top_idx], value_reg)?;
+    ) -> Result<(), CommittedValueError> {
+        let value = *crate::read_register(&stack[top_idx], value_reg)
+            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
         let function_id = stack[top_idx].function_id;
         self.store_global_binding_value(context, stack, function_id, value, name_idx, strict)?;
-        stack[top_idx].advance_pc()?;
+        stack[top_idx]
+            .advance_pc()
+            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
         Ok(())
     }
 
@@ -758,32 +840,35 @@ impl Interpreter {
         value: Value,
         name_idx: u32,
         strict: bool,
-    ) -> Result<(), VmError> {
+    ) -> Result<(), CommittedValueError> {
         if let Some(realm_id) = self.foreign_function_realm(function_id) {
-            return self.with_host_realm_id(realm_id, |interp| {
-                interp.store_global_binding_value(
-                    context,
-                    stack,
-                    function_id,
-                    value,
-                    name_idx,
-                    strict,
-                )
-            });
+            return self
+                .with_host_realm_id(realm_id, |interp| {
+                    Ok(interp.store_global_binding_value(
+                        context,
+                        stack,
+                        function_id,
+                        value,
+                        name_idx,
+                        strict,
+                    ))
+                })
+                .map_err(CommittedValueError::Fatal)?;
         }
         let name = context
             .string_constant_str_for_function(function_id, name_idx)
-            .ok_or(VmError::InvalidOperand)?;
+            .ok_or(VmError::InvalidOperand)
+            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
         if let Some(&(cell, is_const)) = self.global_lexicals.get(name) {
             if is_const {
-                return Err(
-                    self.err_type((format!("Assignment to constant variable `{name}`")).into())
-                );
+                return Err(CommittedValueError::JavaScript(self.err_type(
+                    (format!("Assignment to constant variable `{name}`")).into(),
+                )));
             }
             if crate::read_upvalue(&self.gc_heap, cell).is_hole() {
-                return Err(self.err_this_uninit(
+                return Err(CommittedValueError::JavaScript(self.err_this_uninit(
                     (format!("Cannot access '{name}' before initialization")).into(),
-                ));
+                )));
             }
             crate::store_upvalue(&mut self.gc_heap, cell, value);
             return Ok(());
@@ -797,14 +882,18 @@ impl Interpreter {
         // `has` trap.
         if strict
             && object::get_own_descriptor(self.global_this, &self.gc_heap, name).is_none()
-            && !self.ordinary_has_property_value(stack, context, receiver, &key, 0)?
+            && !self.ordinary_has_property_value(stack, Some(context), receiver, &key, 0)?
         {
-            return Err(self.err_undefined_ident((name.to_string()).into()));
+            return Err(CommittedValueError::JavaScript(
+                self.err_undefined_ident((name.to_string()).into()),
+            ));
         }
         if !self.ordinary_set_data_value(stack, context, receiver, &key, value, receiver, 0)?
             && strict
         {
-            return Err(self.err_type((format!("Cannot assign to property '{name}'")).into()));
+            return Err(CommittedValueError::JavaScript(
+                self.err_type((format!("Cannot assign to property '{name}'")).into()),
+            ));
         }
         Ok(())
     }

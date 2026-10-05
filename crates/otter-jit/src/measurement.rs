@@ -140,7 +140,7 @@ fn elapsed_ns(started: std::time::Instant) -> u64 {
 pub enum JitMeasurementTier {
     /// Template baseline compiler.
     Template,
-    /// Machine IR optimizing compiler.
+    /// Graph optimizing compiler.
     Optimizing,
 }
 
@@ -283,6 +283,14 @@ impl ExactMeasuredCompiler {
         if request.snapshot.code_block.id != self.function_id {
             return Ok(JitCompileStatus::Unsupported {
                 reason: "validation hook exposes only the measured function".into(),
+            });
+        }
+        if request
+            .osr_pc
+            .is_some_and(|pc| self.code.osr_entry_addr(pc).is_none())
+        {
+            return Ok(JitCompileStatus::Unsupported {
+                reason: "the measured artifact has no entry at the requested loop".into(),
             });
         }
         if request.code_object_id != self.code.metadata().id {

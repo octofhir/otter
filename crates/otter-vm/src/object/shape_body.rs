@@ -15,8 +15,9 @@
 //! - [`alloc_root_shape_body_with_roots`] — allocate a prototype's empty root
 //!   shape together with its dictionary shape.
 //! - [`alloc_child_shape_body_with_roots`] — allocate one append transition.
-//! - [`null_root`] / [`set_null_root`] — the `null`-prototype root, kept in
-//!   the heap's embedder root slot so heap-only code reaches it.
+//! - [`null_root`] selects the initial ordinary allocation root.
+//! - [`null_root_head`] / [`set_null_root`] own the cached capacity/state root
+//!   chain in one heap embedder slot, independent of allocation semantics.
 //! - [`shape_offset_of_atom`] / [`shape_offset_of_str`] / [`shape_keys_ordered`]
 //!   — parent-chain readers.
 //!
@@ -24,17 +25,21 @@
 //! - `parent == Gc::null()` and `transition_key == Gc::null()` only for a
 //!   root or a dictionary shape, the only nodes whose `transition_atom` is
 //!   [`AtomId::NONE`].
-//! - Every node of a lineage has its root's prototype and dictionary shape: a
+//! - Every node shares its root's immutable inline capacity, prototype and
+//!   dictionary shape. Normal/dictionary roots partition capacity identities: a
 //!   shape fixes its objects' `[[Prototype]]`, so a prototype change is a
 //!   change of shape. A dictionary shape describes no keys (a dictionary
 //!   object keeps them in its sidecar) and is its own dictionary shape.
 //! - A node's `transition_atom` is the isolate-global atom of its
 //!   `transition_key`; the two never disagree.
-//! - Non-root `own_offset` is the parent's `property_count`.
+//! - A non-root `own_field` has the parent's `property_count` as its logical slot.
 //! - `property_count` is the number of string-keyed own slots represented by
 //!   the full parent chain.
 //! - Shape bodies have no interior mutability; all transition/cache mutation
 //!   belongs to interpreter-owned side tables.
+//! - New null-prototype capacity/state roots prepend to one immutable chain.
+//!   Ordinary allocation always selects its initial ordinary root, so prototype,
+//!   non-extensible or provisional state never leaks from a cache head.
 //! - The C layout exposes only the immutable identity word to generated
 //!   shared-cache probes; shapes live in non-moving old space, so a handle
 //!   never relocates. Shapes are collectable (see
@@ -54,7 +59,7 @@ use crate::property_atom::AtomId;
 use crate::string::{JsStringHandle, eq_str};
 
 use super::descriptor::PropertyFlags;
-use super::{ShapeId, next_shape_id};
+use super::{LookupFact, ShapeId, ShapeState, next_shape_id};
 
 /// Reserved [`otter_gc::Traceable::TYPE_TAG`] for [`ShapeBody`].
 ///
@@ -64,9 +69,6 @@ pub const SHAPE_BODY_TYPE_TAG: u8 = 0x22;
 
 /// GC handle to a hidden-class layout node.
 pub type ShapeHandle = otter_gc::Gc<ShapeBody>;
-
-/// [`ShapeBody::kind`] of a dictionary shape.
-pub(crate) const SHAPE_KIND_DICTIONARY: u8 = 1 << 0;
 
 /// A lineage's `[[Prototype]]`: `null`, an ordinary object (the compressed
 /// handle generated code reads), or a non-ordinary value — a function, an
@@ -98,19 +100,23 @@ pub struct ShapeBody {
     /// Number of string-keyed slots represented by this shape.
     property_count: u32,
     /// Slot assigned to [`Self::transition_key`]. Zero for root.
-    own_offset: u32,
+    own_field: super::FieldLocation,
     /// Attribute bits (`writable`/`enumerable`/`configurable`) of the slot
     /// added by this transition. Default-data for ordinary appends; carries
     /// non-default attributes when the transition was created by a
     /// descriptor/define path. The source of truth for a shaped object's
-    /// per-slot attributes unless the object has overridden them in place.
+    /// per-slot attributes. Dictionary descriptors live only in their sidecar.
     /// Meaningless for the root.
     own_flags: PropertyFlags,
     /// `true` when the slot added by this transition is an accessor rather
     /// than a data property. Meaningless for the root.
     own_is_accessor: bool,
-    /// [`SHAPE_KIND_DICTIONARY`] for a dictionary shape; `0` otherwise.
-    kind: u8,
+    /// Immutable number of persistent in-object words.
+    inline_capacity: u8,
+    /// Previous root for this prototype, capacity and state cache; roots only.
+    previous_layout_root: ShapeHandle,
+    /// Immutable storage, lookup, extensibility, prototype-role and sampling facts.
+    state: ShapeState,
     /// The lineage's ordinary-object `[[Prototype]]`; null for a `null` or a
     /// non-ordinary prototype.
     prototype: super::JsObject,
@@ -128,9 +134,11 @@ pub(crate) const SHAPE_BODY_ID_OFFSET: usize = std::mem::offset_of!(ShapeBody, i
 /// slot count without a compile-time shape.
 pub(crate) const SHAPE_BODY_PROPERTY_COUNT_OFFSET: usize =
     std::mem::offset_of!(ShapeBody, property_count);
+pub(crate) const SHAPE_BODY_INLINE_CAPACITY_OFFSET: usize =
+    std::mem::offset_of!(ShapeBody, inline_capacity);
 
-/// Kind byte generated code tests for a dictionary shape.
-pub(crate) const SHAPE_BODY_KIND_OFFSET: usize = std::mem::offset_of!(ShapeBody, kind);
+/// Sole state byte read by generated dynamic guards.
+pub(crate) const SHAPE_BODY_STATE_OFFSET: usize = std::mem::offset_of!(ShapeBody, state);
 
 /// Compressed ordinary-object prototype generated chain walks read.
 pub(crate) const SHAPE_BODY_PROTOTYPE_OFFSET: usize = std::mem::offset_of!(ShapeBody, prototype);
@@ -139,7 +147,15 @@ impl ShapeBody {
     /// An empty node of `prototype`'s lineage: a root when `dictionary` names
     /// the lineage's dictionary shape, or that dictionary shape itself.
     #[must_use]
-    fn empty(id: ShapeId, prototype: ShapePrototype, kind: u8, dictionary: ShapeHandle) -> Self {
+    fn empty(
+        id: ShapeId,
+        prototype: ShapePrototype,
+        state: ShapeState,
+        dictionary: ShapeHandle,
+        inline_capacity: usize,
+        previous_layout_root: ShapeHandle,
+    ) -> Self {
+        assert!(inline_capacity <= super::MAX_INLINE_CAPACITY);
         let (prototype, prototype_value) = match prototype {
             ShapePrototype::Null => (super::JsObject::null(), crate::Value::undefined()),
             ShapePrototype::Object(object) => (object, crate::Value::undefined()),
@@ -151,10 +167,12 @@ impl ShapeBody {
             transition_key: JsStringHandle::null(),
             transition_atom: AtomId::NONE,
             property_count: 0,
-            own_offset: 0,
+            own_field: super::FieldLocation::for_slot(0, inline_capacity),
             own_flags: PropertyFlags::data_default(),
             own_is_accessor: false,
-            kind,
+            inline_capacity: inline_capacity as u8,
+            previous_layout_root,
+            state,
             prototype,
             prototype_value,
             dictionary,
@@ -185,17 +203,25 @@ impl ShapeBody {
             AtomId::NONE,
             "a non-root shape node names the key it adds",
         );
-        debug_assert_eq!(parent.kind, 0, "a dictionary shape has no children");
+        debug_assert!(
+            !parent.state.is_dictionary(),
+            "a dictionary shape has no children"
+        );
         Self {
             id: next_shape_id(),
             parent: parent_handle,
             transition_key: key,
             transition_atom: atom,
             property_count: parent.property_count + 1,
-            own_offset: parent.property_count,
+            own_field: super::FieldLocation::for_slot(
+                parent.property_count,
+                usize::from(parent.inline_capacity),
+            ),
             own_flags,
             own_is_accessor,
-            kind: 0,
+            inline_capacity: parent.inline_capacity,
+            previous_layout_root: ShapeHandle::null(),
+            state: parent.state,
             prototype: parent.prototype,
             prototype_value: parent.prototype_value,
             dictionary: parent.dictionary,
@@ -235,7 +261,31 @@ impl ShapeBody {
     /// Slot offset assigned by this transition. Meaningful only for non-root.
     #[must_use]
     pub(crate) const fn own_offset(&self) -> u32 {
-        self.own_offset
+        self.own_field.logical_slot(self.inline_capacity as usize)
+    }
+
+    /// Verify the immutable logical field numbering without selecting an
+    /// object's physical storage. Parent shapes are pinned while this node
+    /// keeps them alive.
+    #[cfg(debug_assertions)]
+    fn debug_verify_field_locations(&self) {
+        if self.is_root() {
+            assert_eq!(self.property_count, 0);
+            assert_eq!(
+                self.own_field.logical_slot(self.inline_capacity as usize),
+                0
+            );
+        } else {
+            let parent = body_of(self.parent);
+            assert_eq!(self.inline_capacity, parent.inline_capacity);
+            assert_eq!(self.state, parent.state);
+            assert_eq!(
+                self.own_field.logical_slot(self.inline_capacity as usize),
+                parent.property_count
+            );
+            assert_eq!(self.property_count, parent.property_count + 1);
+            assert!(!self.is_dictionary());
+        }
     }
 
     /// Attribute bits of the slot added by this transition.
@@ -259,7 +309,13 @@ impl ShapeBody {
     /// `true` for a dictionary shape.
     #[must_use]
     pub(crate) const fn is_dictionary(&self) -> bool {
-        self.kind & SHAPE_KIND_DICTIONARY != 0
+        self.state.is_dictionary()
+    }
+
+    /// Immutable semantic and allocation-preparation facts.
+    #[must_use]
+    pub(crate) const fn state(&self) -> ShapeState {
+        self.state
     }
 
     /// The `[[Prototype]]` of every object with this shape.
@@ -308,6 +364,9 @@ impl otter_gc::SafeTraceable for ShapeBody {
             visitor(p);
         }
         self.prototype_value.pelt_trace(visitor);
+        if !self.previous_layout_root.is_null() {
+            visitor((&mut self.previous_layout_root as *mut ShapeHandle).cast::<RawGc>());
+        }
         if !self.dictionary.is_null() {
             let p = &mut self.dictionary as *mut ShapeHandle as *mut RawGc;
             visitor(p);
@@ -326,18 +385,43 @@ impl otter_gc::SafeTraceable for ShapeBody {
 pub(crate) fn alloc_root_shape_body_with_roots(
     heap: &mut GcHeap,
     prototype: ShapePrototype,
+    inline_capacity: usize,
+    previous_layout_root: ShapeHandle,
+    state: ShapeState,
     external_visit: &mut RootSlotVisitor<'_>,
 ) -> Result<ShapeHandle, otter_gc::OutOfMemory> {
+    assert!(
+        !state.is_dictionary(),
+        "root allocation receives normal state"
+    );
+    let state = state.with_lookup(
+        LookupFact::NonOrdinaryPrototype,
+        matches!(prototype, ShapePrototype::Value(_)),
+    );
     // A pending body is traced across its own allocation.
     let root = heap.alloc_old_with_roots(
-        ShapeBody::empty(next_shape_id(), prototype, 0, ShapeHandle::null()),
+        ShapeBody::empty(
+            next_shape_id(),
+            prototype,
+            state,
+            ShapeHandle::null(),
+            inline_capacity,
+            previous_layout_root,
+        ),
         external_visit,
     )?;
     // The root holds the collector-rewritten prototype; shapes never move.
     let prototype = heap.read_payload(root, ShapeBody::prototype);
     remember_prototype(heap, root, prototype);
     let dictionary = heap.alloc_old_with_roots(
-        ShapeBody::empty(next_shape_id(), prototype, SHAPE_KIND_DICTIONARY, root),
+        ShapeBody::empty(
+            next_shape_id(),
+            prototype,
+            state.with_dictionary(true),
+            root,
+            inline_capacity,
+            ShapeHandle::null(),
+        ),
         external_visit,
     )?;
     let prototype = heap.read_payload(dictionary, ShapeBody::prototype);
@@ -348,19 +432,75 @@ pub(crate) fn alloc_root_shape_body_with_roots(
     Ok(root)
 }
 
-/// Heap embedder root slot holding the `null`-prototype root shape.
+/// One heap root slot owns the complete null-prototype layout cache chain.
 const NULL_ROOT_SLOT: usize = 0;
 
-/// The root shape of `null`-prototype objects.
+/// Head of the cached null-prototype capacity/state root chain.
+/// Allocation readers use [`null_root`] instead: the latest cached semantic
+/// variant need not describe an ordinary newly allocated object.
 #[must_use]
-pub(crate) fn null_root(heap: &GcHeap) -> ShapeHandle {
-    // SAFETY: only `set_null_root` fills the slot, and with a shape.
+pub(crate) fn null_root_head(heap: &GcHeap) -> ShapeHandle {
+    // SAFETY: only set_null_root fills this slot, and only with a shape.
     unsafe { heap.embedder_root(NULL_ROOT_SLOT).cast() }
 }
 
-/// Make `root` the isolate's `null`-prototype root; the heap keeps it alive.
+/// Initial ordinary allocation root of the null-prototype lineage.
+///
+/// Every immutable cache prepend traces its previous root. The last node is
+/// the initial ordinary geometry: default capacity in a runtime, or the exact
+/// explicitly selected capacity in raw fixtures. Before bootstrap installs
+/// that initial root, this reader returns null.
+#[must_use]
+pub(crate) fn null_root(heap: &GcHeap) -> ShapeHandle {
+    let mut root = null_root_head(heap);
+    while !root.is_null() {
+        let body = body_of(root);
+        let previous = body.previous_layout_root;
+        if previous.is_null() {
+            assert_eq!(
+                body.state(),
+                super::ShapeState::ORDINARY,
+                "the initial null allocation root is ordinary"
+            );
+            return root;
+        }
+        root = previous;
+    }
+    root
+}
+
+/// Publish the cache head; the sole heap slot traces the complete root chain.
 pub(crate) fn set_null_root(heap: &GcHeap, root: ShapeHandle) {
     heap.set_embedder_root(NULL_ROOT_SLOT, root.raw());
+}
+
+/// Immutable inline capacity of this exact shape and its lineage.
+#[must_use]
+pub(crate) fn inline_capacity_of(shape: ShapeHandle) -> usize {
+    body_of(shape).inline_capacity as usize
+}
+
+/// Immutable state of one live shape.
+#[must_use]
+pub(crate) fn state_of(shape: ShapeHandle) -> ShapeState {
+    body_of(shape).state()
+}
+
+/// Find the exact prototype/capacity/state root in an immutable root chain.
+#[must_use]
+pub(crate) fn root_for_layout(
+    mut root: ShapeHandle,
+    capacity: usize,
+    state: ShapeState,
+) -> Option<ShapeHandle> {
+    while !root.is_null() {
+        let body = body_of(root);
+        if body.inline_capacity as usize == capacity && body.state == state {
+            return Some(root);
+        }
+        root = body.previous_layout_root;
+    }
+    None
 }
 
 /// The root of a live, non-null `shape`'s lineage.
@@ -413,8 +553,10 @@ pub(crate) fn alloc_child_shape_body_with_roots(
     let body = heap.read_payload(parent, |parent_body| {
         ShapeBody::child(parent, parent_body, key, atom, own_flags, own_is_accessor)
     });
-    let prototype = body.prototype();
     let child = heap.alloc_old_with_roots(body, external_visit)?;
+    // The pending body was collector-rewritten during allocation. A local
+    // prototype copied beforehand would still carry the pre-move handle.
+    let prototype = heap.read_payload(child, ShapeBody::prototype);
     remember_prototype(heap, child, prototype);
     Ok(child)
 }
@@ -525,6 +667,12 @@ pub(crate) fn id_of(shape: ShapeHandle) -> ShapeId {
             .cast::<ShapeBody>()))
         .id
     }
+}
+
+/// Check a resident shape while the mutator owns its stable handles.
+#[cfg(debug_assertions)]
+pub(crate) fn debug_verify_field_locations(shape: ShapeHandle) {
+    body_of(shape).debug_verify_field_locations();
 }
 
 /// The live, non-null `shape`'s body, read without the heap.
@@ -708,8 +856,15 @@ mod tests {
     fn root_shape_has_no_parent_or_key() {
         let mut heap = GcHeap::new().expect("heap");
         let mut roots = |_visitor: &mut dyn FnMut(*mut RawGc)| {};
-        let root = alloc_root_shape_body_with_roots(&mut heap, ShapePrototype::Null, &mut roots)
-            .expect("root");
+        let root = alloc_root_shape_body_with_roots(
+            &mut heap,
+            ShapePrototype::Null,
+            crate::object::DEFAULT_INLINE_CAPACITY,
+            ShapeHandle::null(),
+            ShapeState::ORDINARY,
+            &mut roots,
+        )
+        .expect("root");
 
         heap.read_payload(root, |body| {
             assert!(body.is_root());
@@ -738,8 +893,15 @@ mod tests {
             scope.add_raw_slot((&mut sx as *mut ShapeHandle).cast::<RawGc>());
             scope.add_raw_slot((&mut sxy as *mut ShapeHandle).cast::<RawGc>());
         }
-        root = alloc_root_shape_body_with_roots(&mut heap, ShapePrototype::Null, &mut roots)
-            .expect("root");
+        root = alloc_root_shape_body_with_roots(
+            &mut heap,
+            ShapePrototype::Null,
+            crate::object::DEFAULT_INLINE_CAPACITY,
+            ShapeHandle::null(),
+            ShapeState::ORDINARY,
+            &mut roots,
+        )
+        .expect("root");
         x = alloc_key(&mut heap, 1, "x");
         y = alloc_key(&mut heap, 2, "y");
 

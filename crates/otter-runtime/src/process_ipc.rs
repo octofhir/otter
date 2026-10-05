@@ -16,6 +16,8 @@
 //!   serializer of our own.
 //! - A message that cannot be encoded is refused at the send, not dropped
 //!   silently on the way.
+//! - Handle protocols require `child_process`: discovery absence is the named
+//!   import TypeError, while a discovered installer's error is propagated.
 //!
 //! # See also
 //! - [`crate::ipc`] — the channel itself.
@@ -284,7 +286,10 @@ fn install_protocol(
     if scope.is_callable(hook) {
         return Ok(());
     }
-    crate::commonjs::cjs_load_builtin(scope, cfg, "child_process").map(|_| ())
+    crate::commonjs::cjs_load_builtin(scope, cfg, "child_process")?.ok_or_else(|| {
+        crate::runtime_type_error("import", "no builtin module named 'child_process'")
+    })?;
+    Ok(())
 }
 
 /// The text and descriptor a message carrying an open socket crosses as.

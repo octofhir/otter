@@ -13,10 +13,11 @@
 //!   context allocation.
 //!
 //! # Invariants
-//! - Every instruction that can side-exit, transition, or poll stamps its
-//!   canonical resume PC before observable work. Constants, moves, proven
-//!   boolean/nullish forward branches, plain forward jumps, and returns cannot
-//!   exit and therefore need no redundant publication.
+//! - Generated JS entries retain the exact BLR return offset with the caller's
+//!   source record. Collecting C helpers and abrupt call exits publish their
+//!   canonical PC on their committed cold path before entering the runtime.
+//! - Other side exits, runtime transitions and polls publish an active source;
+//!   constants, moves, proven forward branches and returns need no publication.
 //! - Tagged truthiness decides immediate primitives inline and delegates heap
 //!   cells to the total leaf helper without allocating or re-entering JS.
 //! - Boxed-double falsiness is decided by exact bit patterns (`+0.0`, `-0.0`,
@@ -63,10 +64,12 @@ mod functions;
 pub(crate) mod ic_probe;
 mod iterators;
 mod module_op;
+mod primitive_strings;
 mod private_access;
 mod properties;
 mod protocol;
 mod scalar;
+pub(crate) mod shared_property;
 mod spread_call;
 mod static_call;
 mod structural;
@@ -89,6 +92,7 @@ use self::arith::{
     emit_numeric_slow_paths, emit_to_numeric, emit_to_primitive, emit_unsigned_shift_right,
 };
 use self::values::{emit_load_reg, emit_load_runtime_stub, emit_load_u64, emit_store_reg};
+use super::operation::OperationExits;
 use super::{TemplateCode, TemplateOp, TemplatePlan};
 use crate::CompiledCode;
 use crate::artifact::{
@@ -155,7 +159,10 @@ fn compile_with_reach(
     capture_events: bool,
     far_branches: bool,
 ) -> Result<NativeCompileOutput<TemplateCode>, Unsupported> {
-    let plan = TemplatePlan::build(view)?;
+    let mut plan = TemplatePlan::build(view)?;
+    let call_safepoints = crate::return_sites::template_source_safepoints(&mut plan)?;
+    let mut return_sites = Vec::new();
+    let mut call_source_exits = Vec::new();
     let mut code_map = artifact_request.as_ref().map(|_| CodeMapCapture::default());
     let mut relocations = RelocationCapture::new(artifact_request.is_some());
     let mut direct_call_events = capture_events.then(|| super::seed_direct_call_events(view));
@@ -174,6 +181,7 @@ fn compile_with_reach(
     let mut next_store_ic = 0usize;
     let mut coercion_slow_paths = Vec::new();
     let mut numeric_slow_paths = Vec::new();
+    let mut shared_property = shared_property::SharedPropertyProbes::default();
     let mut ops = Assembler::new()
         .map_err(|_| Unsupported::Backend(crate::BackendFailure::AssemblerAllocation))?;
     // Shared exit labels. Each veneer island defines the labels its segment
@@ -241,13 +249,15 @@ fn compile_with_reach(
         })
         .collect::<BTreeSet<_>>();
 
+    let mut spliced_functions = BTreeSet::new();
+
     let shape = crate::arm64::frame::EntryShape::of(
         view,
         code_object_id,
         abi::NativeFrameKind::Baseline,
         !plan.safepoint_records.is_empty(),
     )?;
-    let activation_exits = crate::arm64::frame::ActivationExits {
+    let activation_exits = crate::frame::ActivationExits {
         construct: ops.new_dynamic_label(),
         side_exit: ops.new_dynamic_label(),
     };
@@ -255,27 +265,33 @@ fn compile_with_reach(
     // builds this function's record and window and falls through.
     let entry = ops.offset();
     let body = ops.new_dynamic_label();
-    crate::arm64::frame::emit_tier_prologue(&mut ops, crate::arm64::frame::SpillArea::NONE);
+    crate::arm64::frame::emit_tier_prologue(&mut ops, crate::frame::SpillArea::NONE);
     dynasm!(ops ; .arch aarch64 ; b =>body);
     let call_entry = (!plan.osr_only).then(|| {
-        let cold = crate::arm64::frame::CallEntryCold::new(&mut ops, shape);
+        let cold = crate::frame::CallEntryCold::new(&mut ops, shape);
         crate::arm64::frame::emit_call_entry_cold(
             &mut ops,
             &mut relocations,
             transitions,
+            view,
             activation_exits,
+            shape,
             cold,
         );
         crate::arm64::frame::emit_call_entry(
             &mut ops,
+            &mut relocations,
             view,
             shape,
-            crate::arm64::frame::SpillArea::NONE,
+            crate::frame::SpillArea::NONE,
             cold,
         )
     });
     dynasm!(ops ; .arch aarch64 ; =>body);
     if let Some(code_map) = code_map.as_mut() {
+        if let Some(offset) = call_entry {
+            code_map.record_call_entry(offset.0);
+        }
         code_map.record(CodeRegion::structural(
             "entryPrologue",
             entry.0,
@@ -292,6 +308,7 @@ fn compile_with_reach(
             let island_start = ops.offset().0;
             let resume = ops.new_dynamic_label();
             dynasm!(ops ; .arch aarch64 ; b =>resume);
+            emit_call_source_exits(&mut ops, &mut call_source_exits);
             emit_numeric_slow_paths(
                 &mut ops,
                 &mut relocations,
@@ -368,28 +385,45 @@ fn compile_with_reach(
         if operation_requires_pc_stamp(instr.op, canonical_boolean_branch) {
             emit_stamp_pc(&mut ops, instr.pc);
         }
+        let exits = OperationExits {
+            type_mismatch_exit,
+            identity_guard_exit,
+            allocation_miss_exit,
+            unsupported_exit,
+            runtime_transition_exit,
+            backedge_relink_exit,
+            bail,
+            returned,
+            committed_throw,
+            threw,
+            propagate_throw,
+            fatal,
+        };
+        // A JS-call operation publishes no PC up front; its abrupt exits
+        // publish the call source on a cold relay instead.
+        let exits = if super::operation_is_js_call(instr.op) {
+            call_source_exit_labels(
+                &mut ops,
+                instr.pc,
+                call_safepoints[&instr.pc],
+                exits,
+                &mut call_source_exits,
+            )
+        } else {
+            exits
+        };
         emit_operation(
             OperationContext {
                 ops: &mut ops,
                 relocations: &mut relocations,
+                return_sites: &mut return_sites,
+                call_safepoint: call_safepoints.get(&instr.pc).copied().unwrap_or(0),
                 transitions,
                 view,
                 plan: &plan,
+                spliced_functions: &mut spliced_functions,
                 labels: &labels,
-                exits: OperationExits {
-                    type_mismatch_exit,
-                    identity_guard_exit,
-                    allocation_miss_exit,
-                    unsupported_exit,
-                    runtime_transition_exit,
-                    backedge_relink_exit,
-                    bail,
-                    returned,
-                    committed_throw,
-                    threw,
-                    propagate_throw,
-                    fatal,
-                },
+                exits,
                 poll_entry,
                 far_branches,
                 load_ic_cells: &mut load_ic_cells,
@@ -398,6 +432,7 @@ fn compile_with_reach(
                 next_store_ic: &mut next_store_ic,
                 numeric_slow_paths: &mut numeric_slow_paths,
                 coercion_slow_paths: &mut coercion_slow_paths,
+                shared_property: &mut shared_property,
                 direct_call_events: &mut direct_call_events,
                 code_map: &mut code_map,
             },
@@ -417,6 +452,11 @@ fn compile_with_reach(
                 format!("{:?}", instr.op),
             ));
         }
+    }
+
+    if !call_source_exits.is_empty() {
+        dynasm!(ops ; .arch aarch64 ; b =>unsupported_exit);
+        emit_call_source_exits(&mut ops, &mut call_source_exits);
     }
 
     // The last segment's exits are the final epilogues' own labels once the
@@ -495,11 +535,7 @@ fn compile_with_reach(
         ; =>returned
         ; movz x1, abi::NativeResultStatus::Success as u32
     );
-    crate::arm64::frame::emit_epilogue(
-        &mut ops,
-        activation_exits,
-        crate::arm64::frame::SpillArea::NONE,
-    );
+    crate::arm64::frame::emit_epilogue(&mut ops, activation_exits, crate::frame::SpillArea::NONE);
     if let Some(code_map) = code_map.as_mut() {
         code_map.record(CodeRegion::structural(
             "returnEpilogue",
@@ -627,22 +663,14 @@ fn compile_with_reach(
         ; =>propagate_throw
         ; movz x1, abi::NativeResultStatus::Throw as u32
     );
-    crate::arm64::frame::emit_epilogue(
-        &mut ops,
-        activation_exits,
-        crate::arm64::frame::SpillArea::NONE,
-    );
+    crate::arm64::frame::emit_epilogue(&mut ops, activation_exits, crate::frame::SpillArea::NONE);
     dynasm!(ops
         ; .arch aarch64
         ; =>fatal
     );
     emit_load_u64(&mut ops, 0, VALUE_UNDEFINED);
     dynasm!(ops ; .arch aarch64 ; movz x1, abi::NativeResultStatus::Fatal as u32);
-    crate::arm64::frame::emit_epilogue(
-        &mut ops,
-        activation_exits,
-        crate::arm64::frame::SpillArea::NONE,
-    );
+    crate::arm64::frame::emit_epilogue(&mut ops, activation_exits, crate::frame::SpillArea::NONE);
     crate::arm64::frame::emit_exits(
         &mut ops,
         &mut relocations,
@@ -650,7 +678,7 @@ fn compile_with_reach(
         view,
         shape.derived,
         activation_exits,
-        crate::arm64::frame::SpillArea::NONE,
+        crate::frame::SpillArea::NONE,
     );
     if let Some(code_map) = code_map.as_mut() {
         code_map.record(CodeRegion::structural(
@@ -677,12 +705,31 @@ fn compile_with_reach(
             continue;
         };
         let offset = ops.offset().0;
-        crate::arm64::frame::emit_tier_prologue(&mut ops, crate::arm64::frame::SpillArea::NONE);
+        crate::arm64::frame::emit_tier_prologue(&mut ops, crate::frame::SpillArea::NONE);
         dynasm!(ops ; .arch aarch64 ; b =>target);
         if let Some(code_map) = code_map.as_mut() {
             code_map.record_osr(header_pc, offset, ops.offset().0);
         }
         osr_entries.insert(header_pc, offset);
+    }
+
+    let shared_start = ops.offset().0;
+    shared_property.emit(
+        &mut ops,
+        &mut relocations,
+        transitions,
+        view,
+        load_ic_cells.as_ptr() as usize,
+        store_ic_cells.as_ptr() as usize,
+    );
+    if let Some(code_map) = code_map.as_mut()
+        && ops.offset().0 != shared_start
+    {
+        code_map.record(CodeRegion::structural(
+            "sharedPropertyProbes",
+            shared_start,
+            ops.offset().0,
+        ));
     }
 
     let buf = crate::entry::finalize_assembler(ops)?;
@@ -694,6 +741,7 @@ fn compile_with_reach(
         ..
     } = plan;
     safepoint_records.sort_by_key(|record| record.id);
+    return_sites.sort_by_key(|site| site.native_return_offset);
     let compiled_code = CompiledCode::new(buf, entry);
     let artifact = artifact_request.map(|request| {
         build_bundle(
@@ -707,17 +755,26 @@ fn compile_with_reach(
             relocations,
             None,
             &safepoint_records,
+            &return_sites,
         )
     });
+    let source_work = super::code::retained_source_work(view, &spliced_functions);
     let code = TemplateCode::from_emission(
         compiled_code,
         code_object_id,
         view.code_block.id,
         Box::new([]),
+        spliced_functions
+            .into_iter()
+            .filter(|&fid| fid != view.code_block.id)
+            .collect::<Vec<_>>()
+            .into_boxed_slice(),
+        source_work,
         register_operands,
         load_ic_cells,
         store_ic_cells,
         safepoint_records.into_boxed_slice(),
+        return_sites.into_boxed_slice(),
         osr_entries,
         call_entry.map(|offset| offset.0),
         osr_only,
@@ -732,31 +789,89 @@ fn compile_with_reach(
     })
 }
 
-/// Exit labels one template operation branches to.
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct OperationExits {
-    pub(crate) type_mismatch_exit: DynamicLabel,
-    pub(crate) identity_guard_exit: DynamicLabel,
-    pub(crate) allocation_miss_exit: DynamicLabel,
-    pub(crate) unsupported_exit: DynamicLabel,
-    pub(crate) runtime_transition_exit: DynamicLabel,
-    pub(crate) backedge_relink_exit: DynamicLabel,
-    /// Runtime-transition helpers' shared side exit.
-    pub(crate) bail: DynamicLabel,
-    pub(crate) returned: DynamicLabel,
-    pub(crate) committed_throw: DynamicLabel,
-    pub(crate) threw: DynamicLabel,
-    pub(crate) propagate_throw: DynamicLabel,
-    pub(crate) fatal: DynamicLabel,
+/// The cold exit relay of one JS-call operation. Each private label names
+/// its shared exit target; all of them join one publication of the call
+/// source.
+struct CallSourceExits {
+    labels: [(DynamicLabel, DynamicLabel); 12],
+    pc: u32,
+    safepoint_id: abi::SafepointId,
+}
+
+/// Define the pending relays: each label loads its shared target into `x17`,
+/// the join publishes the call's PC and safepoint, then branches to `x17`.
+fn emit_call_source_exits(ops: &mut Assembler, records: &mut Vec<CallSourceExits>) {
+    for CallSourceExits {
+        labels,
+        pc,
+        safepoint_id,
+    } in std::mem::take(records)
+    {
+        let publish = ops.new_dynamic_label();
+        for (label, target) in labels {
+            dynasm!(ops ; .arch aarch64 ; =>label ; adr x17, =>target ; b =>publish);
+        }
+        dynasm!(ops ; .arch aarch64 ; =>publish);
+        emit_cold_call_source(ops, pc, safepoint_id);
+        dynasm!(ops ; .arch aarch64 ; br x17);
+    }
+}
+
+/// Route every exit of one JS-call operation through a fresh relay that
+/// publishes `(pc, safepoint_id)` before reaching the shared exit.
+fn call_source_exit_labels(
+    ops: &mut Assembler,
+    pc: u32,
+    safepoint_id: abi::SafepointId,
+    exits: OperationExits,
+    records: &mut Vec<CallSourceExits>,
+) -> OperationExits {
+    let targets = [
+        exits.type_mismatch_exit,
+        exits.identity_guard_exit,
+        exits.allocation_miss_exit,
+        exits.unsupported_exit,
+        exits.runtime_transition_exit,
+        exits.backedge_relink_exit,
+        exits.bail,
+        exits.returned,
+        exits.committed_throw,
+        exits.threw,
+        exits.propagate_throw,
+        exits.fatal,
+    ];
+    let labels: [DynamicLabel; 12] = std::array::from_fn(|_| ops.new_dynamic_label());
+    records.push(CallSourceExits {
+        labels: std::array::from_fn(|index| (labels[index], targets[index])),
+        pc,
+        safepoint_id,
+    });
+    OperationExits {
+        type_mismatch_exit: labels[0],
+        identity_guard_exit: labels[1],
+        allocation_miss_exit: labels[2],
+        unsupported_exit: labels[3],
+        runtime_transition_exit: labels[4],
+        backedge_relink_exit: labels[5],
+        bail: labels[6],
+        returned: labels[7],
+        committed_throw: labels[8],
+        threw: labels[9],
+        propagate_throw: labels[10],
+        fatal: labels[11],
+    }
 }
 
 /// Everything one template operation's emission reads or appends to.
-pub(crate) struct OperationContext<'c> {
+pub(crate) struct OperationContext<'c, 'a> {
     pub(crate) ops: &'c mut Assembler,
     pub(crate) relocations: &'c mut RelocationCapture,
-    pub(crate) transitions: &'c crate::entry::TransitionTable,
-    pub(crate) view: &'c JitCompileSnapshot,
+    pub(crate) return_sites: &'c mut Vec<abi::SafepointEntry>,
+    pub(crate) call_safepoint: abi::SafepointId,
+    pub(crate) transitions: &'a crate::entry::TransitionTable,
+    pub(crate) view: &'a JitCompileSnapshot,
     pub(crate) plan: &'c TemplatePlan,
+    pub(crate) spliced_functions: &'c mut BTreeSet<u32>,
     /// Branch targets by logical PC; control operations only.
     pub(crate) labels: &'c BTreeMap<u32, DynamicLabel>,
     pub(crate) exits: OperationExits,
@@ -768,6 +883,7 @@ pub(crate) struct OperationContext<'c> {
     pub(crate) next_store_ic: &'c mut usize,
     pub(crate) numeric_slow_paths: &'c mut Vec<arith::NumericSlowPath>,
     pub(crate) coercion_slow_paths: &'c mut Vec<arith::CoercionSlowPath>,
+    pub(crate) shared_property: &'c mut shared_property::SharedPropertyProbes,
     pub(crate) direct_call_events: &'c mut Option<super::DirectCallEvents>,
     pub(crate) code_map: &'c mut Option<CodeMapCapture>,
 }
@@ -776,17 +892,20 @@ pub(crate) struct OperationContext<'c> {
 ///
 /// The caller has bound the operation's label and stamped its PC when the
 /// operation requires one.
-pub(crate) fn emit_operation(
-    context: OperationContext<'_>,
+pub(crate) fn emit_operation<'a>(
+    context: OperationContext<'_, 'a>,
     instr: &super::plan::TemplateInstr,
     canonical_boolean_branch: bool,
 ) -> Result<(), Unsupported> {
     let OperationContext {
         ops,
         relocations,
+        return_sites,
+        call_safepoint,
         transitions,
         view,
         plan,
+        spliced_functions,
         labels,
         exits,
         poll_entry,
@@ -797,9 +916,17 @@ pub(crate) fn emit_operation(
         next_store_ic,
         numeric_slow_paths,
         coercion_slow_paths,
+        shared_property,
         direct_call_events,
         code_map,
     } = context;
+    let mut call_source = crate::return_sites::ReturnSiteRecorder {
+        entries: return_sites,
+        safepoint_id: call_safepoint,
+        logical_pc: instr.pc,
+    };
+    let return_sites = &mut call_source;
+    super::mark_direct_call_site_reached(direct_call_events.as_mut(), instr.byte_pc);
     let OperationExits {
         type_mismatch_exit,
         identity_guard_exit,
@@ -815,7 +942,6 @@ pub(crate) fn emit_operation(
         fatal,
     } = exits;
     let _ = (propagate_throw, far_branches);
-    let code_block_id = view.code_block.id;
 
     match instr.op {
         TemplateOp::LoadImmediate { dst, bits } => {
@@ -969,6 +1095,7 @@ pub(crate) fn emit_operation(
                 kind,
                 arith::ArithSite::of(view, instr.pc),
                 type_mismatch_exit,
+                fatal,
                 numeric_slow_paths,
             )?;
         }
@@ -1045,6 +1172,7 @@ pub(crate) fn emit_operation(
             emit_add_generic(
                 ops,
                 relocations,
+                view,
                 transitions,
                 dst,
                 lhs,
@@ -1098,10 +1226,13 @@ pub(crate) fn emit_operation(
                 ops,
                 relocations,
                 view,
+                instr.pc,
+                instr.byte_pc,
                 dst,
                 context::ContextAllocation::Create { parent, scope },
                 safepoint,
                 allocation_miss_exit,
+                fatal,
             )?;
         }
         TemplateOp::CopyContext {
@@ -1113,10 +1244,13 @@ pub(crate) fn emit_operation(
                 ops,
                 relocations,
                 view,
+                instr.pc,
+                instr.byte_pc,
                 dst,
                 context::ContextAllocation::Copy { source: src },
                 safepoint,
                 allocation_miss_exit,
+                fatal,
             )?;
         }
         TemplateOp::ClassSuperConstructor { dst, class } => {
@@ -1134,51 +1268,39 @@ pub(crate) fn emit_operation(
             dynasm!(ops ; .arch aarch64 ; cmp x0, x16 ; b.eq =>runtime_transition_exit);
             emit_store_reg(ops, 0, dst)?;
         }
-        TemplateOp::MakeFunction { dst, constant } => {
-            let done = ops.new_dynamic_label();
-            if let Some(&plan) = view.closure_allocations.get(&instr.byte_pc) {
-                let slow = ops.new_dynamic_label();
-                emit_load_u64(ops, 15, VALUE_UNDEFINED);
-                crate::arm64::allocation::emit_closure(ops, view, plan, 20, 21, slow);
-                emit_store_reg(ops, 16, dst)?;
-                dynasm!(ops ; .arch aarch64 ; b =>done ; =>slow);
-            }
-            transitions::emit_make_function(
+        TemplateOp::MakeFunction { dst, safepoint } => {
+            context::emit_context_allocation(
                 ops,
                 relocations,
-                transitions,
+                view,
+                instr.pc,
+                instr.byte_pc,
                 dst,
-                constant,
-                threw,
+                context::ContextAllocation::Function,
+                safepoint,
+                allocation_miss_exit,
                 fatal,
-            );
-            dynasm!(ops ; .arch aarch64 ; =>done);
+            )?;
         }
         TemplateOp::MakeClosure {
             dst,
-            function,
-            context,
+            context: closure_context,
+            safepoint,
         } => {
-            let done = ops.new_dynamic_label();
-            if let Some(&plan) = view.closure_allocations.get(&instr.byte_pc) {
-                let slow = ops.new_dynamic_label();
-                emit_load_reg(ops, 15, context)?;
-                crate::arm64::allocation::emit_closure(ops, view, plan, 20, 21, slow);
-                emit_store_reg(ops, 16, dst)?;
-                dynasm!(ops ; .arch aarch64 ; b =>done ; =>slow);
-            }
-            transitions::emit_make_closure(
+            context::emit_context_allocation(
                 ops,
                 relocations,
-                transitions,
-                code_block_id,
+                view,
+                instr.pc,
+                instr.byte_pc,
                 dst,
-                function,
-                context,
-                threw,
+                context::ContextAllocation::Closure {
+                    context: closure_context,
+                },
+                safepoint,
+                allocation_miss_exit,
                 fatal,
-            );
-            dynasm!(ops ; .arch aarch64 ; =>done);
+            )?;
         }
         TemplateOp::LoadRegExp { dst, constant } => {
             transitions::emit_load_regexp(
@@ -1266,6 +1388,7 @@ pub(crate) fn emit_operation(
                 ops,
                 relocations,
                 transitions,
+                return_sites,
                 view,
                 code_map.as_mut(),
                 instr.pc,
@@ -1378,6 +1501,7 @@ pub(crate) fn emit_operation(
                 ops,
                 relocations,
                 transitions,
+                shared_property,
                 view,
                 dst,
                 object,
@@ -1410,10 +1534,12 @@ pub(crate) fn emit_operation(
                 ops,
                 relocations,
                 transitions,
+                shared_property,
                 view,
                 object,
                 name,
                 value,
+                instr.byte_pc,
                 site,
                 cell_addr,
                 cell_ordinal,
@@ -1436,7 +1562,9 @@ pub(crate) fn emit_operation(
                 ops,
                 relocations,
                 transitions,
+                return_sites,
                 view,
+                spliced_functions,
                 direct_call_events.as_mut(),
                 code_map.as_mut(),
                 dst,
@@ -1462,7 +1590,9 @@ pub(crate) fn emit_operation(
                 ops,
                 relocations,
                 transitions,
+                return_sites,
                 view,
+                spliced_functions,
                 direct_call_events.as_mut(),
                 code_map.as_mut(),
                 dst,
@@ -1491,7 +1621,9 @@ pub(crate) fn emit_operation(
                 ops,
                 relocations,
                 transitions,
+                return_sites,
                 view,
+                spliced_functions,
                 direct_call_events.as_mut(),
                 code_map.as_mut(),
                 dst,
@@ -1519,7 +1651,9 @@ pub(crate) fn emit_operation(
                 ops,
                 relocations,
                 transitions,
+                return_sites,
                 view,
+                direct_call_events.as_mut(),
                 code_map.as_mut(),
                 dst,
                 callee,
@@ -1544,7 +1678,10 @@ pub(crate) fn emit_operation(
                 ops,
                 relocations,
                 transitions,
+                return_sites,
+                shared_property,
                 view,
+                spliced_functions,
                 direct_call_events.as_mut(),
                 code_map.as_mut(),
                 dst,
@@ -1891,6 +2028,7 @@ pub(crate) fn emit_operation(
                 ops,
                 relocations,
                 transitions,
+                return_sites,
                 view,
                 code_map.as_mut(),
                 opcode,
@@ -2052,6 +2190,9 @@ fn emit_handler_dispatch(
 /// Whether an operation can leave native code and therefore needs an exact
 /// resume PC published before it starts.
 fn operation_requires_pc_stamp(op: TemplateOp, canonical_boolean_branch: bool) -> bool {
+    if super::operation_is_js_call(op) {
+        return false;
+    }
     match op {
         TemplateOp::LoadImmediate { .. }
         | TemplateOp::Move { .. }
@@ -2142,6 +2283,14 @@ fn emit_side_exit_epilogue(
         ; orr x0, x0, x16
         ; b =>side_exit
     );
+}
+
+/// Publish only before a committed collecting helper or an abrupt call exit.
+fn emit_cold_call_source(ops: &mut Assembler, pc: u32, safepoint_id: abi::SafepointId) {
+    emit_load_u64(ops, 16, u64::from(pc));
+    dynasm!(ops ; .arch aarch64 ; str w16, [x21, NATIVE_FRAME_PC_OFFSET]);
+    emit_load_u64(ops, 16, u64::from(safepoint_id));
+    dynasm!(ops ; .arch aarch64 ; str w16, [x21, abi::NATIVE_FRAME_CALL_SITE_OFFSET]);
 }
 
 /// Publish the canonical instruction-index PC into the active native frame.

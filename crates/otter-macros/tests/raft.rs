@@ -32,7 +32,7 @@ fn raft_generates_grouped_static_namespace_spec() {
     assert!(RAFT_NS_SPEC.accessors.is_empty());
     assert!(RAFT_NS_SPEC.constants.is_empty());
 
-    let mut interp = Interpreter::new();
+    let mut interp = Interpreter::new().expect("macro fixture bootstrap");
     let ns = NamespaceBuilder::from_spec(interp.gc_heap_mut(), &RAFT_NS_SPEC)
         .expect("builder")
         .build()

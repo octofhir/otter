@@ -5,7 +5,8 @@
 //!   the caller's stack.
 //! - [`emit_call`] — the remaining call ABI registers and the call: the current
 //!   generation of a proven bytecode target through its `FunctionEntryCell`,
-//!   or the generic entry that classifies any other callee.
+//!   a proved NativeFunction through its selected Host convention, or the
+//!   generic entry that classifies any other callee.
 //! - [`emit_staged_call`] / [`emit_enter_staged`] — a call whose span, or
 //!   whole request, a runtime staging entry wrote.
 //! - [`emit_tail_branch`] — the entry jump of a proper tail call.
@@ -16,17 +17,21 @@
 //! - Call ABI: `rdi` context, `rsi` callee, `rdx` receiver, `rcx`
 //!   `new.target` (`undefined` exactly for `[[Call]]`), `r8` actual count,
 //!   `r9` the entered generation; the span sits above the return address,
-//!   padded with `undefined` to a proven target's formal count. The
+//!   containing exactly the actuals; the callee initializes missing formals. The
 //!   completion returns in `rax`/`rdx`.
+//! - Call emitters return the exact offset immediately after CALL, before
+//!   platform result reloads, argument cleanup or completion handling.
 //! - The caller keeps `rsp` 16-byte aligned across the span and the call.
 //! - Emitters clobber every caller-saved register and preserve `rbx`, `rbp`
 //!   and `r12`–`r15`.
+//! - A fully staged request enters the C trampoline through the platform C
+//!   boundary. Known, generic and tail JavaScript targets use the private ABI.
 //!
 //! # See also
 //! - [`crate::call_linkage`] — the architecture-neutral call contract.
 //! - `crate::arm64::js_call` — the AArch64 caller.
 
-use dynasmrt::{DynamicLabel, DynasmApi, DynasmLabelApi, dynasm, x64::Assembler};
+use dynasmrt::{AssemblyOffset, DynamicLabel, DynasmApi, DynasmLabelApi, dynasm, x64::Assembler};
 use otter_vm::native_abi as abi;
 
 use crate::{
@@ -40,6 +45,31 @@ use crate::{
 };
 
 pub(crate) use crate::call_linkage::CallTarget;
+
+/// Prove a full tagged NativeFunction cell before reading its header.
+/// Only R10/R11 and flags are clobbered; the callee must exclude those scratch.
+pub(crate) fn emit_native_kind_guard(ops: &mut Assembler, value: u8, miss: DynamicLabel) {
+    assert!(
+        value != 10 && value != 11,
+        "native callee cannot alias guard scratch"
+    );
+    dynasm!(ops ; .arch x64
+        ; mov r10, QWORD otter_vm::value::tag::NOT_CELL_MASK as i64
+        ; test Rq(value), r10 ; jnz =>miss ; test Rq(value), Rq(value) ; jz =>miss
+        ; cmp BYTE [Rq(value)], otter_vm::native_function::NATIVE_FUNCTION_BODY_TYPE_TAG as i8
+        ; jne =>miss
+    );
+}
+
+/// Clear the sole canonical incoming construction ticket. No callable,
+/// receiver, argument, flags or target register is clobbered.
+pub(crate) fn emit_clear_construct_ticket(ops: &mut Assembler, context: u8) {
+    dynasm!(ops ; .arch x64
+        ; mov QWORD [Rq(context) + (PENDING_CALL_OFFSET + abi::REQUEST_SUPER_ORIGIN_OFFSET) as i32], 0
+        ; mov DWORD [Rq(context) + (PENDING_CALL_OFFSET + abi::REQUEST_CONSTRUCT_LAYOUT_OFFSET) as i32], 0
+        ; mov QWORD [Rq(context) + (PENDING_CALL_OFFSET + abi::REQUEST_CONSTRUCT_RECEIVER_OFFSET) as i32], VALUE_UNDEFINED as i32
+    );
+}
 
 /// Prove the callee in `r9` is `plan`'s function or branch to `bail`.
 ///
@@ -123,11 +153,12 @@ pub(crate) fn emit_call(
     new_target: bool,
     count: u32,
     target: CallTarget,
-) {
+) -> AssemblyOffset {
     if !receiver {
         dynasm!(ops ; .arch x64 ; mov edx, VALUE_UNDEFINED as i32);
     }
     if !new_target {
+        emit_clear_construct_ticket(ops, context);
         dynasm!(ops ; .arch x64 ; mov ecx, VALUE_UNDEFINED as i32);
     }
     dynasm!(ops
@@ -135,6 +166,15 @@ pub(crate) fn emit_call(
         ; mov rdi, Rq(context)
         ; mov r8d, count as i32
     );
+    emit_target_call(ops, relocations, table, target)
+}
+
+fn emit_target_call(
+    ops: &mut Assembler,
+    relocations: &mut RelocationCapture,
+    table: &TransitionTable,
+    target: CallTarget,
+) -> AssemblyOffset {
     match target {
         CallTarget::Known {
             entry_cell,
@@ -154,18 +194,23 @@ pub(crate) fn emit_call(
                 ; call QWORD [r9]
             );
         }
-        CallTarget::Generic => {
+        CallTarget::Generic | CallTarget::Native => {
+            let stub = match target {
+                CallTarget::Native => abi::STUB_JIT_CALL_NATIVE,
+                _ => abi::STUB_JIT_CALL_GENERIC,
+            };
             let start = ops.offset().0;
-            dynasm!(ops ; .arch x64 ; mov r11, QWORD table.entry(abi::STUB_JIT_CALL_GENERIC) as i64);
+            dynasm!(ops ; .arch x64 ; mov r11, QWORD table.entry(stub) as i64);
             relocations.record_x86_imm64(
                 start,
                 ops.offset().0,
                 11,
-                RelocationTarget::runtime_stub(abi::STUB_JIT_CALL_GENERIC),
+                RelocationTarget::runtime_stub(stub),
             );
             dynasm!(ops ; .arch x64 ; call r11);
         }
     }
+    ops.offset()
 }
 
 /// Jump to `target` with the call ABI registers already set and `rsp` on
@@ -196,29 +241,57 @@ pub(crate) fn emit_tail_branch(
                 ; jmp QWORD [r9]
             );
         }
-        CallTarget::Generic => {
+        CallTarget::Generic | CallTarget::Native => {
+            let stub = match target {
+                CallTarget::Native => abi::STUB_JIT_CALL_NATIVE,
+                _ => abi::STUB_JIT_CALL_GENERIC,
+            };
             let start = ops.offset().0;
-            dynasm!(ops ; .arch x64 ; mov r11, QWORD table.entry(abi::STUB_JIT_CALL_GENERIC) as i64);
+            dynasm!(ops ; .arch x64 ; mov r11, QWORD table.entry(stub) as i64);
             relocations.record_x86_imm64(
                 start,
                 ops.offset().0,
                 11,
-                RelocationTarget::runtime_stub(abi::STUB_JIT_CALL_GENERIC),
+                RelocationTarget::runtime_stub(stub),
             );
             dynasm!(ops ; .arch x64 ; jmp r11);
         }
     }
 }
 
-/// Enter the trampoline with the complete request a staging entry wrote.
+/// Publish the generated caller's genuine return coordinate and enter the
+/// trampoline with the complete staged request. Existing nonzero, tier-transfer
+/// and tail-call associations remain owned by their original source extent.
 /// Returns the completion in `rax`/`rdx`.
 pub(crate) fn emit_enter_staged(
     ops: &mut Assembler,
     relocations: &mut RelocationCapture,
     table: &TransitionTable,
     context: u8,
-) {
-    dynasm!(ops ; .arch x64 ; mov rdi, Rq(context));
+) -> AssemblyOffset {
+    let return_to_caller = ops.new_dynamic_label();
+    let origin_ready = ops.new_dynamic_label();
+    let no_generated_caller = ops.new_dynamic_label();
+    dynasm!(ops ; .arch x64
+        ; mov rdi, Rq(context)
+        ; lea r10, [rdi + PENDING_CALL_OFFSET as i32]
+        ; cmp QWORD [r10 + abi::REQUEST_CALLER_RETURN_PC_OFFSET as i32], 0
+        ; jne =>origin_ready
+        ; test BYTE [r10 + REQUEST_FLAGS_OFFSET as i32], (abi::NativeFrameFlags::TIER_ENTRY | abi::NativeFrameFlags::TAIL_CALL) as i8
+        ; jnz =>origin_ready
+        ; mov r11, [rdi + crate::entry::NATIVE_FRAME_OFFSET as i32]
+        ; mov [r10 + abi::REQUEST_CALLER_OFFSET as i32], r11
+        ; test r11, r11
+        ; jz =>no_generated_caller
+        ; cmp DWORD [r11 + abi::NATIVE_FRAME_CODE_OBJECT_ID_OFFSET as i32], 0
+        ; je =>no_generated_caller
+        ; lea r11, [=>return_to_caller]
+        ; mov [r10 + abi::REQUEST_CALLER_RETURN_PC_OFFSET as i32], r11
+        ; jmp =>origin_ready
+        ; =>no_generated_caller
+        ; mov QWORD [r10 + abi::REQUEST_CALLER_RETURN_PC_OFFSET as i32], 0
+        ; =>origin_ready
+    );
     let start = ops.offset().0;
     dynasm!(ops ; .arch x64 ; mov r11, QWORD table.entry(abi::STUB_JIT_CALL) as i64);
     relocations.record_x86_imm64(
@@ -227,7 +300,7 @@ pub(crate) fn emit_enter_staged(
         11,
         RelocationTarget::runtime_stub(abi::STUB_JIT_CALL),
     );
-    dynasm!(ops ; .arch x64 ; call r11);
+    super::call_abi::emit_staged_call(ops, return_to_caller)
 }
 
 /// Write the context's request around a span a staging entry already wrote,
@@ -241,7 +314,8 @@ pub(crate) fn emit_staged_call(
     context: u8,
     receiver: bool,
     new_target: bool,
-) {
+) -> AssemblyOffset {
+    emit_clear_construct_ticket(ops, context);
     let flags = if new_target {
         abi::NativeFrameFlags::CONSTRUCT
     } else {
@@ -272,5 +346,89 @@ pub(crate) fn emit_staged_call(
         ; mov [r10 + REQUEST_REGISTER_SEED_OFFSET as i32], rax
         ; mov QWORD [r10 + REQUEST_REGISTER_SEED_OFFSET as i32 + 8], 0
     );
-    emit_enter_staged(ops, relocations, table, context);
+    emit_enter_staged(ops, relocations, table, context)
+}
+
+/// Forward with the already prepared frame argument count in r8d.
+pub(crate) fn emit_forwarded_call(
+    ops: &mut Assembler,
+    relocations: &mut RelocationCapture,
+    table: &TransitionTable,
+    context: u8,
+    target: CallTarget,
+) -> AssemblyOffset {
+    emit_clear_construct_ticket(ops, context);
+    dynasm!(ops ; .arch x64 ; mov rdi, Rq(context) ; mov ecx, VALUE_UNDEFINED as i32);
+    emit_target_call(ops, relocations, table, target)
+}
+
+/// Copy an activation's exact actual span and replace mapped formals.
+/// Stack-limit refusal precedes writes and page probes precede RSP movement.
+/// Only old_sp/source, R10/R11 and the final r8d count are changed.
+pub(crate) fn emit_push_forwarded(
+    ops: &mut Assembler,
+    frame: u8,
+    [old_sp, source]: [u8; 2],
+    overflow: DynamicLabel,
+    bindings: &[(u16, crate::call_linkage::ForwardedBinding)],
+) {
+    use crate::call_linkage::ForwardedBinding;
+    let probe = ops.new_dynamic_label();
+    let probed = ops.new_dynamic_label();
+    dynasm!(ops ; .arch x64
+        ; mov r10d, [Rq(frame) + abi::NATIVE_FRAME_ARGUMENT_COUNT_OFFSET as i32]
+        ; add r10d, 1 ; and r10d, -2 ; shl r10, 3
+        ; mov Rq(old_sp), rsp ; neg r10 ; add r10, Rq(old_sp)
+        ; cmp r10, [r15 + crate::entry::NATIVE_STACK_LIMIT_OFFSET as i32] ; jb =>overflow
+        ; mov r11, Rq(old_sp) ; =>probe ; sub r11, 4096
+        ; cmp r11, r10 ; jbe =>probed ; mov QWORD [r11], 0 ; jmp =>probe
+        ; =>probed ; mov rsp, r10
+        ; mov Rq(source), [Rq(frame) + abi::NATIVE_FRAME_ACTUALS_OFFSET as i32]
+        ; mov r11d, [Rq(frame) + abi::NATIVE_FRAME_ARGUMENT_COUNT_OFFSET as i32]
+    );
+    let copy = ops.new_dynamic_label();
+    let copied = ops.new_dynamic_label();
+    dynasm!(ops ; .arch x64 ; =>copy ; test r11d, r11d ; jz =>copied
+        ; dec r11d ; mov r10, [Rq(source) + r11 * 8] ; mov [rsp + r11 * 8], r10
+        ; jmp =>copy ; =>copied
+    );
+    for &(index, binding) in bindings {
+        let skip = ops.new_dynamic_label();
+        dynasm!(ops ; .arch x64
+            ; cmp DWORD [Rq(frame) + abi::NATIVE_FRAME_ARGUMENT_COUNT_OFFSET as i32], i32::from(index)
+            ; jbe =>skip
+        );
+        let value = match binding {
+            ForwardedBinding::Register(register) => register,
+            ForwardedBinding::Load { base, offset } => {
+                dynasm!(ops ; .arch x64 ; mov r10, [Rq(base) + offset as i32]);
+                10
+            }
+            ForwardedBinding::ContextSlot {
+                base,
+                offset,
+                slot_byte,
+            } => {
+                dynasm!(ops ; .arch x64
+                    ; mov r10, [Rq(base) + offset as i32]
+                    ; mov r10, [r10 + slot_byte as i32]
+                );
+                10
+            }
+            ForwardedBinding::Immediate(bits) => {
+                super::values::emit_load_u64(ops, 10, bits);
+                10
+            }
+        };
+        dynasm!(ops ; .arch x64 ; mov [rsp + i32::from(index) * 8], Rq(value) ; =>skip);
+    }
+    dynasm!(ops ; .arch x64 ; mov r8d, [Rq(frame) + abi::NATIVE_FRAME_ARGUMENT_COUNT_OFFSET as i32]);
+}
+
+/// Release the span by the caller's unchanged actual count, preserving result.
+pub(crate) fn emit_pop_forwarded(ops: &mut Assembler, frame: u8) {
+    dynasm!(ops ; .arch x64
+        ; mov r10d, [Rq(frame) + abi::NATIVE_FRAME_ARGUMENT_COUNT_OFFSET as i32]
+        ; add r10d, 1 ; and r10d, -2 ; shl r10, 3 ; add rsp, r10
+    );
 }

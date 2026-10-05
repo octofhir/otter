@@ -111,11 +111,7 @@ fn string_raw(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeEr
         let raw_value = match raw_result {
             Ok(value) => value,
             Err(error) => {
-                return Err(crate::native_function::vm_to_native_error(
-                    scope.context().interp_mut(),
-                    error,
-                    "String.raw",
-                ));
+                return Err(error.into_native(scope.context().interp_mut(), "String.raw"));
             }
         };
         let raw = scope.value(raw_value);
@@ -127,11 +123,7 @@ fn string_raw(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeEr
         let length_value = match length_result {
             Ok(value) => value,
             Err(error) => {
-                return Err(crate::native_function::vm_to_native_error(
-                    scope.context().interp_mut(),
-                    error,
-                    "String.raw",
-                ));
+                return Err(error.into_native(scope.context().interp_mut(), "String.raw"));
             }
         };
         let length = scope.value(length_value);
@@ -142,11 +134,7 @@ fn string_raw(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeEr
         let literal_segments = match literal_segments_result {
             Ok(length) => length,
             Err(error) => {
-                return Err(crate::native_function::vm_to_native_error(
-                    scope.context().interp_mut(),
-                    error,
-                    "String.raw",
-                ));
+                return Err(error.into_native(scope.context().interp_mut(), "String.raw"));
             }
         };
         if literal_segments == 0 {
@@ -165,11 +153,7 @@ fn string_raw(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeEr
             let segment_value = match segment_result {
                 Ok(value) => value,
                 Err(error) => {
-                    return Err(crate::native_function::vm_to_native_error(
-                        scope.context().interp_mut(),
-                        error,
-                        "String.raw",
-                    ));
+                    return Err(error.into_native(scope.context().interp_mut(), "String.raw"));
                 }
             };
             let segment = scope.value(segment_value);
@@ -180,11 +164,7 @@ fn string_raw(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeEr
             let text = match text_result {
                 Ok(text) => text,
                 Err(error) => {
-                    return Err(crate::native_function::vm_to_native_error(
-                        scope.context().interp_mut(),
-                        error,
-                        "String.raw",
-                    ));
+                    return Err(error.into_native(scope.context().interp_mut(), "String.raw"));
                 }
             };
             out.push_str(&text);
@@ -198,11 +178,7 @@ fn string_raw(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeEr
                 let text = match text_result {
                     Ok(text) => text,
                     Err(error) => {
-                        return Err(crate::native_function::vm_to_native_error(
-                            scope.context().interp_mut(),
-                            error,
-                            "String.raw",
-                        ));
+                        return Err(error.into_native(scope.context().interp_mut(), "String.raw"));
                     }
                 };
                 out.push_str(&text);
@@ -246,13 +222,7 @@ fn string_from_char_code(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Valu
             crate::coerce::to_number_or_throw(interp, stack, &exec, arg)
         });
         let n = number
-            .map_err(|error| {
-                crate::native_function::vm_to_native_error(
-                    ctx.interp_mut(),
-                    error,
-                    "String.fromCharCode",
-                )
-            })?
+            .map_err(|error| error.into_native(ctx.interp_mut(), "String.fromCharCode"))?
             .as_f64();
         units.push(to_uint16(n));
     }
@@ -300,13 +270,7 @@ fn string_from_code_point(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Val
             crate::coerce::to_number_or_throw(interp, stack, &exec, arg)
         });
         let n = number
-            .map_err(|error| {
-                crate::native_function::vm_to_native_error(
-                    ctx.interp_mut(),
-                    error,
-                    "String.fromCodePoint",
-                )
-            })?
+            .map_err(|error| error.into_native(ctx.interp_mut(), "String.fromCodePoint"))?
             .as_f64();
         if !n.is_finite() || n < 0.0 || n > 0x10FFFF as f64 || n.fract() != 0.0 {
             return Err(NativeError::RangeError {

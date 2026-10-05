@@ -33,6 +33,7 @@
 //! - [`crate::number`]
 //! - [`crate::bigint`]
 
+use crate::native_abi::CommittedValueError;
 use otter_bytecode::Op;
 use otter_bytecode::scalar_semantics::NumericBinaryOp;
 
@@ -215,7 +216,7 @@ impl Interpreter {
         registers: [u16; 3],
         operation: NumericBinaryOp,
         feedback: Option<InstructionFeedbackRecorder<'_>>,
-    ) -> Result<(), VmError> {
+    ) -> Result<(), CommittedValueError> {
         let [dst, lhs, rhs] = registers;
         match operation {
             NumericBinaryOp::Sub => self.run_numeric_regs(
@@ -273,7 +274,7 @@ impl Interpreter {
                 bigint::ops::pow,
                 feedback,
             ),
-            NumericBinaryOp::Add => Err(VmError::InvalidOperand),
+            NumericBinaryOp::Add => Err(CommittedValueError::Fatal(VmError::InvalidOperand)),
         }
     }
 
@@ -290,7 +291,7 @@ impl Interpreter {
         lhs: Value,
         rhs: Value,
         hint: abstract_ops::ToPrimitiveHint,
-    ) -> Result<(Value, Value), VmError> {
+    ) -> Result<(Value, Value), CommittedValueError> {
         if lhs.is_primitive() && rhs.is_primitive() {
             return Ok((lhs, rhs));
         }
@@ -325,7 +326,7 @@ impl Interpreter {
         context: &crate::execution_context::ExecutionContext,
         lhs: Value,
         rhs: Value,
-    ) -> Result<(Value, Value), VmError> {
+    ) -> Result<(Value, Value), CommittedValueError> {
         // A Number or BigInt is its own `ToNumeric` result and runs no user
         // code, so the common shape never opens a scope.
         if (lhs.is_number() || lhs.is_big_int()) && (rhs.is_number() || rhs.is_big_int()) {
@@ -368,11 +369,12 @@ impl Interpreter {
         op: impl Fn(NumberValue, NumberValue) -> NumberValue,
         bigint_op: BigIntBinop,
         feedback: Option<InstructionFeedbackRecorder<'_>>,
-    ) -> Result<(), VmError> {
+    ) -> Result<(), CommittedValueError> {
         // `top_idx` is the executing (top) frame; access it without the `Index`
         // bounds check. SAFETY: dispatch runs with a live top frame and passes
         // `top_idx == stack.len() - 1`.
-        let (dst, lhs, rhs) = binop_values(unsafe { stack.top_unchecked() }, dst, lhs, rhs)?;
+        let (dst, lhs, rhs) = binop_values(unsafe { stack.top_unchecked() }, dst, lhs, rhs)
+            .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
         if let Some(feedback) = feedback {
             feedback.record_arith(lhs, rhs);
         }
@@ -383,10 +385,11 @@ impl Interpreter {
                 unsafe { stack.top_unchecked_mut() },
                 dst,
                 Value::number(op(a, b)),
-            );
+            )
+            .map_err(CommittedValueError::Fatal);
         }
         let result = numeric_binary_value(self, stack, context, lhs, rhs, op, bigint_op)?;
-        commit_frame_result(&mut stack[top_idx], dst, result)
+        commit_frame_result(&mut stack[top_idx], dst, result).map_err(CommittedValueError::Fatal)
     }
 
     pub(crate) fn run_add_regs(
@@ -398,9 +401,10 @@ impl Interpreter {
         lhs: u16,
         rhs: u16,
         feedback: Option<InstructionFeedbackRecorder<'_>>,
-    ) -> Result<(), VmError> {
+    ) -> Result<(), CommittedValueError> {
         // SAFETY: see `run_numeric_regs` — `top_idx` is the live top frame.
-        let (dst, lhs, rhs) = binop_values(unsafe { stack.top_unchecked() }, dst, lhs, rhs)?;
+        let (dst, lhs, rhs) = binop_values(unsafe { stack.top_unchecked() }, dst, lhs, rhs)
+            .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
         if let Some(feedback) = feedback {
             feedback.record_arith(lhs, rhs);
         }
@@ -409,10 +413,11 @@ impl Interpreter {
                 unsafe { stack.top_unchecked_mut() },
                 dst,
                 Value::number(number::add(a, b)),
-            );
+            )
+            .map_err(CommittedValueError::Fatal);
         }
         let result = self.add_value(stack, context, lhs, rhs)?;
-        commit_frame_result(&mut stack[top_idx], dst, result)
+        commit_frame_result(&mut stack[top_idx], dst, result).map_err(CommittedValueError::Fatal)
     }
 
     /// Immediate-right binary operators. The right operand is the `Number`
@@ -430,7 +435,7 @@ impl Interpreter {
         lhs: u16,
         imm: i32,
         feedback: Option<InstructionFeedbackRecorder<'_>>,
-    ) -> Result<(), VmError> {
+    ) -> Result<(), CommittedValueError> {
         // SAFETY: `top_idx` is the live top frame; `lhs` is a verified register.
         let lval =
             unsafe { crate::interp::helpers::read_register_unchecked(stack.top_unchecked(), lhs) };
@@ -442,10 +447,11 @@ impl Interpreter {
                 unsafe { stack.top_unchecked_mut() },
                 dst,
                 Value::number(number::add(a, NumberValue::from_i32(imm))),
-            );
+            )
+            .map_err(CommittedValueError::Fatal);
         }
         let result = self.add_value(stack, context, lval, Value::number_i32(imm))?;
-        commit_frame_result(&mut stack[top_idx], dst, result)
+        commit_frame_result(&mut stack[top_idx], dst, result).map_err(CommittedValueError::Fatal)
     }
 
     pub(crate) fn run_numeric_imm(
@@ -459,7 +465,7 @@ impl Interpreter {
         op: impl Fn(NumberValue, NumberValue) -> NumberValue,
         bigint_op: BigIntBinop,
         feedback: Option<InstructionFeedbackRecorder<'_>>,
-    ) -> Result<(), VmError> {
+    ) -> Result<(), CommittedValueError> {
         // SAFETY: see `run_add_imm`.
         let lval =
             unsafe { crate::interp::helpers::read_register_unchecked(stack.top_unchecked(), lhs) };
@@ -471,7 +477,8 @@ impl Interpreter {
                 unsafe { stack.top_unchecked_mut() },
                 dst,
                 Value::number(op(a, NumberValue::from_i32(imm))),
-            );
+            )
+            .map_err(CommittedValueError::Fatal);
         }
         let result = numeric_binary_value(
             self,
@@ -482,7 +489,7 @@ impl Interpreter {
             op,
             bigint_op,
         )?;
-        commit_frame_result(&mut stack[top_idx], dst, result)
+        commit_frame_result(&mut stack[top_idx], dst, result).map_err(CommittedValueError::Fatal)
     }
 
     pub(crate) fn run_less_than_imm(
@@ -494,7 +501,7 @@ impl Interpreter {
         lhs: u16,
         imm: i32,
         feedback: Option<InstructionFeedbackRecorder<'_>>,
-    ) -> Result<(), VmError> {
+    ) -> Result<(), CommittedValueError> {
         // SAFETY: see `run_add_imm`.
         let lval =
             unsafe { crate::interp::helpers::read_register_unchecked(stack.top_unchecked(), lhs) };
@@ -507,7 +514,8 @@ impl Interpreter {
                 unsafe { stack.top_unchecked_mut() },
                 dst,
                 Value::boolean(truthy),
-            );
+            )
+            .map_err(CommittedValueError::Fatal);
         }
         let result = compare_value(
             self,
@@ -517,7 +525,7 @@ impl Interpreter {
             Value::number_i32(imm),
             Op::LessThan,
         )?;
-        commit_frame_result(&mut stack[top_idx], dst, result)
+        commit_frame_result(&mut stack[top_idx], dst, result).map_err(CommittedValueError::Fatal)
     }
 
     pub(crate) fn run_equal_imm(
@@ -553,7 +561,7 @@ impl Interpreter {
         context: &crate::execution_context::ExecutionContext,
         lhs: Value,
         rhs: Value,
-    ) -> Result<Value, VmError> {
+    ) -> Result<Value, CommittedValueError> {
         // Number + Number is the dominant shape and allocates nothing, so it
         // needs neither the handle scope nor the `ToNumeric` ladder: both
         // operands are already the `Num`/`Num` case below.
@@ -567,7 +575,7 @@ impl Interpreter {
             rhs,
             abstract_ops::ToPrimitiveHint::Default,
         )?;
-        self.with_handle_scope(|interp, scope| {
+        self.with_handle_scope(|interp, scope| -> Result<Value, CommittedValueError> {
             let lhs = interp.scoped_value(scope, lhs);
             let rhs = interp.scoped_value(scope, rhs);
             let lhs_value = interp.escape_scoped(lhs);
@@ -580,31 +588,43 @@ impl Interpreter {
             // to each primitive and fold via the numeric / BigInt rules.
             if lhs_value.is_string() || rhs_value.is_string() {
                 if let Some(fast) = interp.try_concat_string_int32(lhs_value, rhs_value) {
-                    return fast.map_err(oom_to_vm);
+                    return fast
+                        .map_err(oom_to_vm)
+                        .map_err(CommittedValueError::JavaScript);
                 }
 
-                let lhs_string = interp.js_string_for_concat(lhs_value)?;
+                let lhs_string = interp
+                    .js_string_for_concat(lhs_value)
+                    .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
                 let lhs_string = interp.scoped_value(scope, Value::string(lhs_string));
                 let rhs_value = interp.escape_scoped(rhs);
-                let rhs_string = interp.js_string_for_concat(rhs_value)?;
+                let rhs_string = interp
+                    .js_string_for_concat(rhs_value)
+                    .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
                 let rhs_string = interp.scoped_value(scope, Value::string(rhs_string));
                 let lhs_string = interp
                     .escape_scoped(lhs_string)
                     .as_string(&interp.gc_heap)
-                    .ok_or(VmError::TypeMismatch)?;
+                    .ok_or(VmError::TypeMismatch)
+                    .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
                 let rhs_string = interp
                     .escape_scoped(rhs_string)
                     .as_string(&interp.gc_heap)
-                    .ok_or(VmError::TypeMismatch)?;
+                    .ok_or(VmError::TypeMismatch)
+                    .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
                 let result = JsString::concat(lhs_string, rhs_string, interp.gc_heap_mut());
-                result
-                    .map(Value::string)
-                    .map_err(|error| crate::string::concat_error_to_vm(interp, error))
+                result.map(Value::string).map_err(|error| {
+                    CommittedValueError::JavaScript(crate::string::concat_error_to_vm(
+                        interp, error,
+                    ))
+                })
             } else {
                 let lhs_numeric = abstract_ops::to_numeric_kind(&lhs_value, &interp.gc_heap)
-                    .ok_or(VmError::TypeMismatch)?;
+                    .ok_or(VmError::TypeMismatch)
+                    .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
                 let rhs_numeric = abstract_ops::to_numeric_kind(&rhs_value, &interp.gc_heap)
-                    .ok_or(VmError::TypeMismatch)?;
+                    .ok_or(VmError::TypeMismatch)
+                    .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
                 match (lhs_numeric, rhs_numeric) {
                     (abstract_ops::NumericKind::Num(a), abstract_ops::NumericKind::Num(b)) => {
                         Ok(Value::number(number::add(a, b)))
@@ -612,14 +632,15 @@ impl Interpreter {
                     (abstract_ops::NumericKind::Big(a), abstract_ops::NumericKind::Big(b)) => {
                         let sum = bigint::ops::add(&a, &b);
                         let handle = bigint::BigIntValue::from_inner(&mut interp.gc_heap, sum)
-                            .map_err(oom_to_vm)?;
+                            .map_err(oom_to_vm)
+                            .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
                         Ok(Value::big_int(handle))
                     }
                     // §6.1.6.2 Numeric Type Conversion forbids mixing
                     // Number and BigInt operands without an explicit coercion.
                     (abstract_ops::NumericKind::Num(_), abstract_ops::NumericKind::Big(_))
                     | (abstract_ops::NumericKind::Big(_), abstract_ops::NumericKind::Num(_)) => {
-                        Err(VmError::TypeMismatch)
+                        Err(CommittedValueError::JavaScript(VmError::TypeMismatch))
                     }
                 }
             }
@@ -636,7 +657,7 @@ impl Interpreter {
         operator: crate::BinaryOperator,
         lhs: Value,
         rhs: Value,
-    ) -> Result<Value, VmError> {
+    ) -> Result<Value, CommittedValueError> {
         use crate::BinaryOperator as B;
         match operator {
             B::Add => self.add_value(stack, context, lhs, rhs),
@@ -736,9 +757,10 @@ impl Interpreter {
         rhs: u16,
         op: Op,
         feedback: Option<InstructionFeedbackRecorder<'_>>,
-    ) -> Result<(), VmError> {
+    ) -> Result<(), CommittedValueError> {
         // SAFETY: see `run_numeric_regs` — `top_idx` is the live top frame.
-        let (dst, lhs, rhs) = binop_values(unsafe { stack.top_unchecked() }, dst, lhs, rhs)?;
+        let (dst, lhs, rhs) = binop_values(unsafe { stack.top_unchecked() }, dst, lhs, rhs)
+            .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
         if let Some(feedback) = feedback {
             feedback.record_arith(lhs, rhs);
         }
@@ -754,16 +776,17 @@ impl Interpreter {
                 Op::GreaterThan => a > b,
                 Op::LessEq => a <= b,
                 Op::GreaterEq => a >= b,
-                _ => return Err(VmError::InvalidOperand),
+                _ => return Err(CommittedValueError::Fatal(VmError::InvalidOperand)),
             };
             return commit_frame_result(
                 unsafe { stack.top_unchecked_mut() },
                 dst,
                 Value::boolean(truthy),
-            );
+            )
+            .map_err(CommittedValueError::Fatal);
         }
         let result = compare_value(self, stack, context, lhs, rhs, op)?;
-        commit_frame_result(&mut stack[top_idx], dst, result)
+        commit_frame_result(&mut stack[top_idx], dst, result).map_err(CommittedValueError::Fatal)
     }
 
     pub(crate) fn run_ushr_regs(
@@ -775,14 +798,15 @@ impl Interpreter {
         lhs: u16,
         rhs: u16,
         feedback: Option<InstructionFeedbackRecorder<'_>>,
-    ) -> Result<(), VmError> {
+    ) -> Result<(), CommittedValueError> {
         // SAFETY: see `run_numeric_regs` — `top_idx` is the live top frame.
-        let (dst, lhs, rhs) = binop_values(unsafe { stack.top_unchecked() }, dst, lhs, rhs)?;
+        let (dst, lhs, rhs) = binop_values(unsafe { stack.top_unchecked() }, dst, lhs, rhs)
+            .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
         if let Some(feedback) = feedback {
             feedback.record_arith(lhs, rhs);
         }
         let result = ushr_value(self, stack, context, lhs, rhs)?;
-        commit_frame_result(&mut stack[top_idx], dst, result)
+        commit_frame_result(&mut stack[top_idx], dst, result).map_err(CommittedValueError::Fatal)
     }
 
     pub(crate) fn run_neg_regs(
@@ -793,14 +817,15 @@ impl Interpreter {
         dst: u16,
         src: u16,
         feedback: Option<InstructionFeedbackRecorder<'_>>,
-    ) -> Result<(), VmError> {
+    ) -> Result<(), CommittedValueError> {
         // SAFETY: see `run_numeric_regs` — `top_idx` is the live top frame.
-        let value = *read_register(unsafe { stack.top_unchecked() }, src)?;
+        let value = *read_register(unsafe { stack.top_unchecked() }, src)
+            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
         if let Some(feedback) = feedback {
             feedback.record_arith(value, value);
         }
         let result = self.neg_value(stack, context, value)?;
-        commit_frame_result(&mut stack[top_idx], dst, result)
+        commit_frame_result(&mut stack[top_idx], dst, result).map_err(CommittedValueError::Fatal)
     }
 
     pub(crate) fn run_bitwise_not_regs(
@@ -810,11 +835,12 @@ impl Interpreter {
         top_idx: usize,
         dst: u16,
         src: u16,
-    ) -> Result<(), VmError> {
+    ) -> Result<(), CommittedValueError> {
         // SAFETY: see `run_numeric_regs` — `top_idx` is the live top frame.
-        let value = *read_register(unsafe { stack.top_unchecked() }, src)?;
+        let value = *read_register(unsafe { stack.top_unchecked() }, src)
+            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
         let result = self.bitwise_not_value(stack, context, value)?;
-        commit_frame_result(&mut stack[top_idx], dst, result)
+        commit_frame_result(&mut stack[top_idx], dst, result).map_err(CommittedValueError::Fatal)
     }
 
     /// Execute one update-expression numeric step through the same semantic
@@ -829,14 +855,15 @@ impl Interpreter {
         src: u16,
         delta: i32,
         feedback: Option<InstructionFeedbackRecorder<'_>>,
-    ) -> Result<(), VmError> {
+    ) -> Result<(), CommittedValueError> {
         // SAFETY: see `run_numeric_regs` — `top_idx` is the live top frame.
-        let value = *read_register(unsafe { stack.top_unchecked() }, src)?;
+        let value = *read_register(unsafe { stack.top_unchecked() }, src)
+            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
         if let Some(feedback) = feedback {
             feedback.record_arith(value, Value::number_i32(delta));
         }
         let result = self.increment_value(stack, context, value, delta)?;
-        commit_frame_result(&mut stack[top_idx], dst, result)
+        commit_frame_result(&mut stack[top_idx], dst, result).map_err(CommittedValueError::Fatal)
     }
 
     /// Evaluate one decoded native numeric request from already-read values.
@@ -851,8 +878,8 @@ impl Interpreter {
         operation: NumericRuntimeOp,
         lhs: Value,
         rhs: Option<Value>,
-    ) -> Result<Value, VmError> {
-        let binary_rhs = || rhs.ok_or(VmError::InvalidOperand);
+    ) -> Result<Value, CommittedValueError> {
+        let binary_rhs = || rhs.ok_or(CommittedValueError::Fatal(VmError::InvalidOperand));
         match operation {
             NumericRuntimeOp::Sub { .. } => numeric_binary_value(
                 self,
@@ -972,16 +999,20 @@ impl Interpreter {
         stack: &mut ActivationStack,
         context: &crate::execution_context::ExecutionContext,
         value: Value,
-    ) -> Result<Value, VmError> {
+    ) -> Result<Value, CommittedValueError> {
         let numeric = crate::coerce::to_numeric_or_throw(self, stack, context, &value)?;
-        match abstract_ops::to_numeric_kind(&numeric, &self.gc_heap).ok_or(VmError::TypeMismatch)? {
+        match abstract_ops::to_numeric_kind(&numeric, &self.gc_heap)
+            .ok_or(VmError::TypeMismatch)
+            .map_err(|error| CommittedValueError::JavaScript(error.into()))?
+        {
             abstract_ops::NumericKind::Num(number_value) => {
                 Ok(Value::number(number::neg(number_value)))
             }
             abstract_ops::NumericKind::Big(big) => {
                 let negated = bigint::ops::neg(&big);
                 let handle = bigint::BigIntValue::from_inner(&mut self.gc_heap, negated)
-                    .map_err(oom_to_vm)?;
+                    .map_err(oom_to_vm)
+                    .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
                 Ok(Value::big_int(handle))
             }
         }
@@ -994,16 +1025,20 @@ impl Interpreter {
         stack: &mut ActivationStack,
         context: &crate::execution_context::ExecutionContext,
         value: Value,
-    ) -> Result<Value, VmError> {
+    ) -> Result<Value, CommittedValueError> {
         let numeric = crate::coerce::to_numeric_or_throw(self, stack, context, &value)?;
-        match abstract_ops::to_numeric_kind(&numeric, &self.gc_heap).ok_or(VmError::TypeMismatch)? {
+        match abstract_ops::to_numeric_kind(&numeric, &self.gc_heap)
+            .ok_or(VmError::TypeMismatch)
+            .map_err(|error| CommittedValueError::JavaScript(error.into()))?
+        {
             abstract_ops::NumericKind::Num(number_value) => {
                 Ok(Value::number(number::bitwise_not(number_value)))
             }
             abstract_ops::NumericKind::Big(big) => {
                 let inverted = bigint::ops::bitwise_not(&big);
                 let handle = bigint::BigIntValue::from_inner(&mut self.gc_heap, inverted)
-                    .map_err(oom_to_vm)?;
+                    .map_err(oom_to_vm)
+                    .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
                 Ok(Value::big_int(handle))
             }
         }
@@ -1015,10 +1050,11 @@ impl Interpreter {
         context: &crate::execution_context::ExecutionContext,
         value: Value,
         delta: i32,
-    ) -> Result<Value, VmError> {
+    ) -> Result<Value, CommittedValueError> {
         let numeric = crate::coerce::to_numeric_or_throw(self, stack, context, &value)?;
-        let kind =
-            abstract_ops::to_numeric_kind(&numeric, &self.gc_heap).ok_or(VmError::TypeMismatch)?;
+        let kind = abstract_ops::to_numeric_kind(&numeric, &self.gc_heap)
+            .ok_or(VmError::TypeMismatch)
+            .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
         match kind {
             abstract_ops::NumericKind::Num(number_value) => Ok(Value::number(
                 NumberValue::from_f64(number_value.as_f64() + f64::from(delta)),
@@ -1027,7 +1063,8 @@ impl Interpreter {
                 let delta_big = num_bigint::BigInt::from(delta);
                 let sum = bigint::ops::add(&big, &delta_big);
                 let handle = bigint::BigIntValue::from_inner(&mut self.gc_heap, sum)
-                    .map_err(|_| VmError::TypeMismatch)?;
+                    .map_err(|_| VmError::TypeMismatch)
+                    .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
                 Ok(Value::big_int(handle))
             }
         }
@@ -1067,15 +1104,19 @@ impl Interpreter {
         rhs: u16,
         negate: bool,
         feedback: Option<InstructionFeedbackRecorder<'_>>,
-    ) -> Result<(), VmError> {
+    ) -> Result<(), CommittedValueError> {
         // SAFETY: see `run_numeric_regs` — `top_idx` is the live top frame.
-        let (dst, lhs, rhs) = binop_values(unsafe { stack.top_unchecked() }, dst, lhs, rhs)?;
+        let (dst, lhs, rhs) = binop_values(unsafe { stack.top_unchecked() }, dst, lhs, rhs)
+            .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
         if let Some(feedback) = feedback {
             feedback.record_arith(lhs, rhs);
         }
         let eq = self.loose_equal_with_context(stack, context, &lhs, &rhs)?;
-        write_register(&mut stack[top_idx], dst, Value::boolean(eq ^ negate))?;
-        stack[top_idx].advance_pc()?;
+        write_register(&mut stack[top_idx], dst, Value::boolean(eq ^ negate))
+            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+        stack[top_idx]
+            .advance_pc()
+            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
         Ok(())
     }
 
@@ -1090,7 +1131,7 @@ impl Interpreter {
         context: &crate::execution_context::ExecutionContext,
         x: &Value,
         y: &Value,
-    ) -> Result<bool, VmError> {
+    ) -> Result<bool, CommittedValueError> {
         let x_html_dda = x.is_html_dda(&self.gc_heap);
         let y_html_dda = y.is_html_dda(&self.gc_heap);
         if x_html_dda && (y.is_undefined() || y.is_null()) {
@@ -1173,7 +1214,7 @@ fn numeric_binary_value(
     rhs: Value,
     op: impl Fn(NumberValue, NumberValue) -> NumberValue,
     bigint_op: BigIntBinop,
-) -> Result<Value, VmError> {
+) -> Result<Value, CommittedValueError> {
     // Two numbers are already their own `ToNumeric` result; folding them here
     // skips building and matching two `NumericKind` values that each carry a
     // BigInt payload.
@@ -1181,21 +1222,26 @@ fn numeric_binary_value(
         return Ok(Value::number(op(a, b)));
     }
     let (lhs, rhs) = interp.coerce_numeric_operands(stack, context, lhs, rhs)?;
-    let lnum =
-        abstract_ops::to_numeric_kind(&lhs, interp.gc_heap()).ok_or(VmError::TypeMismatch)?;
-    let rnum =
-        abstract_ops::to_numeric_kind(&rhs, interp.gc_heap()).ok_or(VmError::TypeMismatch)?;
+    let lnum = abstract_ops::to_numeric_kind(&lhs, interp.gc_heap())
+        .ok_or(VmError::TypeMismatch)
+        .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+    let rnum = abstract_ops::to_numeric_kind(&rhs, interp.gc_heap())
+        .ok_or(VmError::TypeMismatch)
+        .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
     match (lnum, rnum) {
         (abstract_ops::NumericKind::Num(a), abstract_ops::NumericKind::Num(b)) => {
             Ok(Value::number(op(a, b)))
         }
         (abstract_ops::NumericKind::Big(a), abstract_ops::NumericKind::Big(b)) => {
-            let folded = bigint_op(&a, &b).map_err(|err| bigint_to_vm_error(interp, err))?;
-            let handle =
-                bigint::BigIntValue::from_inner(interp.gc_heap_mut(), folded).map_err(oom_to_vm)?;
+            let folded = bigint_op(&a, &b)
+                .map_err(|err| bigint_to_vm_error(interp, err))
+                .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+            let handle = bigint::BigIntValue::from_inner(interp.gc_heap_mut(), folded)
+                .map_err(oom_to_vm)
+                .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
             Ok(Value::big_int(handle))
         }
-        _ => Err(VmError::TypeMismatch),
+        _ => Err(CommittedValueError::JavaScript(VmError::TypeMismatch)),
     }
 }
 
@@ -1205,16 +1251,20 @@ fn ushr_value(
     context: &crate::execution_context::ExecutionContext,
     lhs: Value,
     rhs: Value,
-) -> Result<Value, VmError> {
+) -> Result<Value, CommittedValueError> {
     let (lhs, rhs) = interp.coerce_numeric_operands(stack, context, lhs, rhs)?;
     let heap = &interp.gc_heap;
-    let lhs = abstract_ops::to_numeric_kind(&lhs, heap).ok_or(VmError::TypeMismatch)?;
-    let rhs = abstract_ops::to_numeric_kind(&rhs, heap).ok_or(VmError::TypeMismatch)?;
+    let lhs = abstract_ops::to_numeric_kind(&lhs, heap)
+        .ok_or(VmError::TypeMismatch)
+        .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+    let rhs = abstract_ops::to_numeric_kind(&rhs, heap)
+        .ok_or(VmError::TypeMismatch)
+        .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
     match (lhs, rhs) {
         (abstract_ops::NumericKind::Num(a), abstract_ops::NumericKind::Num(b)) => {
             Ok(Value::number(number::shr_logical(a, b)))
         }
-        _ => Err(VmError::TypeMismatch),
+        _ => Err(CommittedValueError::JavaScript(VmError::TypeMismatch)),
     }
 }
 
@@ -1231,7 +1281,7 @@ fn compare_value(
     lhs: Value,
     rhs: Value,
     op: Op,
-) -> Result<Value, VmError> {
+) -> Result<Value, CommittedValueError> {
     let (lhs, rhs) = interp.coerce_operand_pair(
         stack,
         context,
@@ -1244,7 +1294,7 @@ fn compare_value(
     // after ToPrimitive(number). Symbols cannot be converted to a
     // numeric value, so all four relational operators throw.
     if lhs.is_symbol() || rhs.is_symbol() {
-        return Err(VmError::TypeMismatch);
+        return Err(CommittedValueError::JavaScript(VmError::TypeMismatch));
     }
     let truthy = match op {
         Op::LessThan => matches!(
@@ -1328,9 +1378,10 @@ mod tests {
     use super::*;
 
     fn empty_context() -> crate::ExecutionContext {
-        crate::ExecutionContext::from_module(crate::test_support::minimal_bytecode_module(
-            "numeric-runtime-test.js",
-        ))
+        crate::ExecutionContext::from_module(
+            crate::test_support::minimal_bytecode_module("numeric-runtime-test.js"),
+            crate::source_registry::SourceRegistry::default(),
+        )
         .expect("valid bytecode fixture")
     }
 
@@ -1366,7 +1417,7 @@ mod tests {
     #[test]
     fn typed_numeric_runtime_dispatch_returns_values_without_frame_state() {
         let context = empty_context();
-        let mut interp = Interpreter::new();
+        let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
         let mut stack = ActivationStack::new();
 
         let difference = interp
@@ -1399,13 +1450,13 @@ mod tests {
                 Value::number_i32(3),
                 None,
             ),
-            Err(VmError::InvalidOperand)
+            Err(CommittedValueError::Fatal(VmError::InvalidOperand))
         ));
     }
 
     #[test]
     fn add_kernel_roots_string_operands_without_frame_storage() {
-        let mut interp = Interpreter::new();
+        let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
         let lhs_text = "rooted-string-value-that-is-longer-than-inline-";
         let lhs = Value::string(
             JsString::from_str(lhs_text, interp.gc_heap_mut()).expect("left string allocation"),
@@ -1413,6 +1464,7 @@ mod tests {
         let mut stack = crate::ActivationStack::new();
         let context = crate::execution_context::ExecutionContext::from_module(
             crate::test_support::minimal_bytecode_module("add-kernel-rooting-test.js"),
+            crate::source_registry::SourceRegistry::default(),
         )
         .expect("valid bytecode fixture");
         let result = interp

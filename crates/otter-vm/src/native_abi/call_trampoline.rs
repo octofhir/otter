@@ -6,6 +6,8 @@
 //! - Architecture bodies resume an entry after a child returns without keeping
 //!   a Rust dispatcher on the stack.
 //! - Tier-entry requests at entry resume the existing published activation.
+//! - Proved NativeFunction entries select the canonical live Host kernel.
+//! - `costs` exposes opt-in scalar instruction spans without new hot work.
 //!
 //! # Invariants
 //! The request and its argument source remain valid until the trampoline has
@@ -13,6 +15,12 @@
 //! is initialized before publishing the frame. Entries consume the completion
 //! before allocating and return only statuses in the execution domain. Stack
 //! checks precede reservation; both the frame and stack pointer are aligned.
+//! Windows C entry/exit preserves all nonvolatile FP registers even when a
+//! selected private JavaScript body clobbers every FP register. Their saved
+//! region stays above callee spans and native helper shadow/result areas.
+//! Diagnostic interior symbols are Mach-O alternate entries of their enclosing
+//! function atom. They must not divide a numeric-branch body into separately
+//! dead-strippable atoms; inspecting costs is never required for live code.
 //! No Rust unwind may cross an entry. The caller's frame is restored before
 //! the trampoline returns, including on abrupt completion. A callee that
 //! returns `Continue` with a `TAIL_CALL` request has retired its own frame:
@@ -23,6 +31,9 @@
 //! - [`super::JitCtx`] for the shared context and continuation mailbox.
 //! - [`super::Frame`] for the single frame layout.
 //! - [`super::NativeResultDomain::Execution`] for entry result validation.
+
+mod costs;
+pub use costs::{NativeEntryCodeSizes, native_entry_code_sizes};
 
 mod deopt;
 pub use crate::interp::host_call::{
@@ -53,7 +64,7 @@ const BODY: usize = otter_gc::header::HEADER_SIZE;
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct CallRequest {
-    /// Selected interpreter or generated entry; zero is an invalid request.
+    /// Selected interpreter, generated or Host entry; zero requests classification.
     pub entry: u64,
     /// Complete callee header, with the full canonical register count.
     pub header: VmFrameHeader,
@@ -81,7 +92,32 @@ pub struct CallRequest {
     pub cold: Option<crate::cold_frame::ColdFrameIdx>,
     /// Observable arguments identity restored from a suspended invocation.
     pub arguments_object: crate::JsObject,
+    /// Exact family carried through canonical construction entry/deopt.
+    pub(crate) construct_layout: crate::constructor_layout::ConstructorLayout,
+    /// Own binding-context identity restored only by a parked invocation.
+    pub(crate) derived_this_context: crate::context::ContextHandle,
+    /// Original allocated receiver carried before any replacement substitution.
+    pub(crate) construct_receiver: Value,
+    /// Published JS source of a synchronous Super operation, or zero.
+    /// Ordinary calls/new and resumed parked invocations have no origin.
+    /// Bound unwrapping and only a default Proxy construct forward retain it.
+    pub(crate) super_origin: u64,
+    /// Published physical caller of an active prepublication return anchor.
+    /// This synchronous transfer mailbox is consumed before child publication.
+    pub caller: u64,
+    /// Genuine machine return address in `caller`, or zero for an inactive
+    /// mailbox. Never copied into prepared or parked invocation state.
+    pub caller_return_pc: u64,
 }
+
+/// Private compiled-engine offset of the canonical incoming family root.
+#[doc(hidden)]
+pub const REQUEST_CONSTRUCT_LAYOUT_OFFSET: u32 =
+    std::mem::offset_of!(CallRequest, construct_layout) as u32;
+/// Private compiled-engine offset of the canonical original receiver root.
+#[doc(hidden)]
+pub const REQUEST_CONSTRUCT_RECEIVER_OFFSET: u32 =
+    std::mem::offset_of!(CallRequest, construct_receiver) as u32;
 
 impl CallRequest {
     /// Empty mailbox. Execution must install a selected entry before calling.
@@ -100,7 +136,64 @@ impl CallRequest {
         return_destination: u32::MAX,
         cold: None,
         arguments_object: crate::JsObject::null(),
+        construct_layout: crate::constructor_layout::ConstructorLayout::null(),
+        derived_this_context: crate::context::ContextHandle::null(),
+        construct_receiver: Value::UNDEFINED,
+        super_origin: 0,
+        caller: 0,
+        caller_return_pc: 0,
     };
+
+    /// Trace a complete active return-anchor request before child publication.
+    ///
+    /// # Safety
+    /// The stopped synchronous owner retains each initialized source span until
+    /// transfer. Pointer/count validation is structural; publishers also prove
+    /// the backing allocation's full readable extent before any collecting step.
+    pub(crate) unsafe fn trace_return_roots(
+        &self,
+        visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc),
+    ) {
+        assert_ne!(self.caller_return_pc, 0);
+        assert_ne!(self.caller, 0);
+        for value in [
+            &self.callee,
+            &self.receiver,
+            &self.new_target,
+            &self.construct_receiver,
+        ] {
+            value.trace_value_slots(visitor);
+        }
+        for slot in [
+            std::ptr::addr_of!(self.arguments_object).cast::<otter_gc::raw::RawGc>(),
+            std::ptr::addr_of!(self.construct_layout).cast(),
+            std::ptr::addr_of!(self.derived_this_context).cast(),
+        ] {
+            if unsafe { (*slot).0 } != 0 {
+                visitor(slot.cast_mut());
+            }
+        }
+        assert!(self.initial_register_count <= u32::from(self.header.register_count));
+        for (pointer, count) in [
+            (self.arguments, self.argument_count),
+            (self.initial_registers, self.initial_register_count),
+        ] {
+            if count == 0 {
+                continue;
+            }
+            assert!(
+                !pointer.is_null() && pointer.addr().is_multiple_of(std::mem::align_of::<Value>())
+            );
+            let bytes = (count as usize)
+                .checked_mul(std::mem::size_of::<Value>())
+                .filter(|bytes| *bytes <= isize::MAX as usize)
+                .expect("initialized request span size");
+            assert!(pointer.addr().checked_add(bytes).is_some());
+            for index in 0..count as usize {
+                unsafe { (&*pointer.add(index)).trace_value_slots(visitor) };
+            }
+        }
+    }
 
     /// Select an entry while retaining the request's complete call state.
     pub fn set_entry(&mut self, entry: JitEntry) {
@@ -122,11 +215,11 @@ impl CallRequest {
 ///
 /// This is the entry of every interpreter destination and of every generated
 /// call whose target is not a proven bytecode generation. A closure or
-/// function id whose current generation is compiled, whose span already
-/// covers its formals and whose call kind it accepts is entered directly:
+/// function id whose current generation is compiled and whose call kind it
+/// accepts is entered directly, including underarity calls:
 /// the caller's frame and span become the callee's. Any other callee is
 /// recorded in the context's request and continues in [`call_trampoline`],
-/// which classifies it, pads its span, and builds every interpreter and host
+/// which classifies it and builds every interpreter and host
 /// frame.
 ///
 /// # Safety
@@ -172,9 +265,6 @@ pub unsafe extern "C" fn call_generic_entry(_ctx: *mut JitCtx) -> NativeResultPa
         "b.eq 3f",
         "tbz w9, #{constructible_bit}, 9f",
         "3:",
-        "ldrh w10, [x13, #{cell_param_count}]",
-        "cmp x4, x10",
-        "b.lo 9f",
         "ldr x8, [x13]",
         "ldr x10, [x8, #{generation_code_object}]",
         "cbz x10, 9f",
@@ -182,13 +272,60 @@ pub unsafe extern "C" fn call_generic_entry(_ctx: *mut JitCtx) -> NativeResultPa
         "br x16",
         // Classification in the trampoline.
         "9:",
+        "mov x16, #0",
+        "b {publisher}",
+        ".if {apple}", ".alt_entry {generic_end}", ".endif",
+        ".global {generic_end}", "{generic_end}:",
+        apple = const cfg!(target_vendor = "apple") as u8,
+        thread = const std::mem::offset_of!(JitCtx, thread),
+        thread_registry = const std::mem::offset_of!(super::VmThread, code_registry),
+        registry_entries = const std::mem::offset_of!(super::CodeRegistryView, function_entries),
+        registry_count = const std::mem::offset_of!(super::CodeRegistryView, function_entry_count),
+        cell_call_flags = const super::FUNCTION_ENTRY_CALL_FLAGS_OFFSET,
+        generation_code_object = const std::mem::offset_of!(super::CodeEntryCell, code_object_id),
+        suspendable_bit = const super::FUNCTION_CALL_SUSPENDABLE.trailing_zeros(),
+        constructible_bit = const super::FUNCTION_CALL_CONSTRUCTIBLE.trailing_zeros(),
+        fid_tag = const crate::value::tag::FUNCTION_ID_TAG,
+        number_tag = const crate::value::tag::NUMBER_TAG,
+        other_tag = const crate::value::tag::OTHER_TAG,
+        closure_tag = const crate::closure::JS_CLOSURE_BODY_TYPE_TAG,
+        closure_fid = const BODY + crate::closure::CLOSURE_BODY_FUNCTION_ID_OFFSET,
+        undefined = const Value::UNDEFINED.to_abi_bits(),
+        publisher = sym call_request_entry,
+        generic_end = sym costs::GENERIC_END,
+    );
+}
+
+// The selected publisher clears the full function-id/PC word before setting
+// Host geometry. Its zero kind is the canonical enum representation.
+const _: () = assert!(super::HostCallKind::Native as u32 == 0);
+
+/// Publish the sole pending request, preserving the original hardware return.
+/// The selected entry in x16 is either zero (classify) or the canonical
+/// Host native kernel. No call, allocation or stack change precedes publication.
+#[cfg(target_arch = "aarch64")]
+#[unsafe(naked)]
+unsafe extern "C" fn call_request_entry(_ctx: *mut JitCtx) -> NativeResultPair {
+    core::arch::naked_asm!(
         "add x9, x0, #{request}",
-        "str xzr, [x9]",
+        "str x16, [x9]",
         "mov x10, #{undefined}",
         "cmp x3, x10",
         "cset w10, ne",
         "lsl w10, w10, #{construct_bit}",
         "strb w10, [x9, #{req_flags}]",
+        "cbz x16, 191f",
+        ".if {apple}", ".alt_entry {header_start}", ".endif",
+        ".global {header_start}", "{header_start}:",
+        "str xzr, [x9, #{req_header}]",
+        "mov x11, #{host_registers}",
+        "movk x11, #{host_kind}, lsl #16",
+        "orr x11, x11, x10, lsl #24",
+        "str x11, [x9, #{req_header} + 8]",
+        "str wzr, [x9, #{req_parameter_count}]",
+        ".if {apple}", ".alt_entry {header_end}", ".endif",
+        ".global {header_end}", "{header_end}:",
+        "191:",
         "stp x1, x2, [x9, #{req_callee}]",
         "str x3, [x9, #{req_new_target}]",
         "mov x10, sp",
@@ -198,22 +335,19 @@ pub unsafe extern "C" fn call_generic_entry(_ctx: *mut JitCtx) -> NativeResultPa
         "mov x10, #-4294967296",
         "str x10, [x9, #{req_initial_count}]",
         "str xzr, [x9, #{req_cold}]",
+        "ldr x11, [x0, #{frame_cell}]",
+        "mov x12, #0",
+        "cbz x11, 190f",
+        "ldr w10, [x11, #{code_object_id}]",
+        "cbz w10, 190f",
+        "mov x12, x30",
+        "190:",
+        "stp x11, x12, [x9, #{req_caller}]",
         "b {trampoline}",
+        ".if {apple}", ".alt_entry {publisher_end}", ".endif",
+        ".global {publisher_end}", "{publisher_end}:",
+        apple = const cfg!(target_vendor = "apple") as u8,
         request = const std::mem::offset_of!(JitCtx, pending_call),
-        thread = const std::mem::offset_of!(JitCtx, thread),
-        thread_registry = const std::mem::offset_of!(super::VmThread, code_registry),
-        registry_entries = const std::mem::offset_of!(super::CodeRegistryView, function_entries),
-        registry_count = const std::mem::offset_of!(super::CodeRegistryView, function_entry_count),
-        cell_call_flags = const super::FUNCTION_ENTRY_CALL_FLAGS_OFFSET,
-        cell_param_count = const super::FUNCTION_ENTRY_PARAM_COUNT_OFFSET,
-        generation_code_object = const std::mem::offset_of!(super::CodeEntryCell, code_object_id),
-        suspendable_bit = const super::FUNCTION_CALL_SUSPENDABLE.trailing_zeros(),
-        constructible_bit = const super::FUNCTION_CALL_CONSTRUCTIBLE.trailing_zeros(),
-        fid_tag = const crate::value::tag::FUNCTION_ID_TAG,
-        number_tag = const crate::value::tag::NUMBER_TAG,
-        other_tag = const crate::value::tag::OTHER_TAG,
-        closure_tag = const crate::closure::JS_CLOSURE_BODY_TYPE_TAG,
-        closure_fid = const BODY + crate::closure::CLOSURE_BODY_FUNCTION_ID_OFFSET,
         undefined = const Value::UNDEFINED.to_abi_bits(),
         construct_bit = const super::NativeFrameFlags::CONSTRUCT.trailing_zeros(),
         req_flags = const REQUEST_FLAGS_OFFSET,
@@ -224,9 +358,46 @@ pub unsafe extern "C" fn call_generic_entry(_ctx: *mut JitCtx) -> NativeResultPa
         req_initial = const std::mem::offset_of!(CallRequest, initial_registers),
         req_initial_count = const std::mem::offset_of!(CallRequest, initial_register_count),
         req_cold = const std::mem::offset_of!(CallRequest, cold),
+        frame_cell = const std::mem::offset_of!(JitCtx,native_frame),
+        code_object_id = const std::mem::offset_of!(super::Frame,code_object_id),
+        req_caller = const REQUEST_CALLER_OFFSET,
         trampoline = sym call_trampoline,
+        req_header = const std::mem::offset_of!(CallRequest, header),
+        req_parameter_count = const std::mem::offset_of!(CallRequest, parameter_count),
+        host_registers = const super::HOST_FRAME_REGISTER_COUNT,
+        host_kind = const super::NativeFrameKind::Host as u8,
+        publisher_end = sym costs::PUBLISHER_END,
+        header_start = sym costs::HEADER_START,
+        header_end = sym costs::HEADER_END,
     );
 }
+
+#[cfg(target_arch = "aarch64")]
+macro_rules! native_entry {
+    ($page:literal, $offset:literal) => {
+        /// Enter a proved NativeFunction through the private actual-only JS convention.
+        /// Its live target, captures, realm and constructability remain Host-kernel data.
+        ///
+        /// # Safety
+        /// The callee must be a NativeFunction and all private JS operands and the
+        /// complete initialized actual span must obey [`call_generic_entry`]'s ABI.
+        /// The original hardware return is transferred before any collecting boundary.
+        #[unsafe(naked)]
+        pub unsafe extern "C" fn call_native_entry(_ctx: *mut JitCtx) -> NativeResultPair {
+            core::arch::naked_asm!($page, $offset, "b {publisher}",
+                ".if {apple}", ".alt_entry {native_end}", ".endif",
+                ".global {native_end}", "{native_end}:",
+                apple = const cfg!(target_vendor = "apple") as u8,
+                host = sym crate::interp::host_call::host_call_entry,
+                publisher = sym call_request_entry,
+                native_end = sym costs::NATIVE_END);
+        }
+    };
+}
+#[cfg(all(target_arch = "aarch64", target_vendor = "apple"))]
+native_entry!("adrp x16, {host}@PAGE", "add x16, x16, {host}@PAGEOFF");
+#[cfg(all(target_arch = "aarch64", not(target_vendor = "apple")))]
+native_entry!("adrp x16, {host}", "add x16, x16, :lo12:{host}");
 
 /// Enter a callable through the JavaScript call ABI, directly into a
 /// compiled current generation or through classification; see the AArch64
@@ -284,23 +455,64 @@ pub unsafe extern "C" fn call_generic_entry(_ctx: *mut JitCtx) -> NativeResultPa
         "test eax, {constructible_flag}",
         "jz 9f",
         "3:",
-        "movzx eax, word ptr [r11 + {cell_param_count}]",
-        "cmp r8, rax",
-        "jb 9f",
         "mov r9, [r11]",
         "cmp qword ptr [r9 + {generation_code_object}], 0",
         "je 9f",
         "jmp qword ptr [r9]",
         // Classification in the trampoline.
         "9:",
+        "xor r9d, r9d",
+        "jmp {publisher}",
+        ".if {apple}", ".alt_entry {generic_end}", ".endif",
+        ".global {generic_end}", "{generic_end}:",
+        apple = const cfg!(target_vendor = "apple") as u8,
+        thread = const std::mem::offset_of!(JitCtx, thread),
+        thread_registry = const std::mem::offset_of!(super::VmThread, code_registry),
+        registry_entries = const std::mem::offset_of!(super::CodeRegistryView, function_entries),
+        registry_count = const std::mem::offset_of!(super::CodeRegistryView, function_entry_count),
+        cell_call_flags = const super::FUNCTION_ENTRY_CALL_FLAGS_OFFSET,
+        generation_code_object = const std::mem::offset_of!(super::CodeEntryCell, code_object_id),
+        suspendable_flag = const super::FUNCTION_CALL_SUSPENDABLE,
+        constructible_flag = const super::FUNCTION_CALL_CONSTRUCTIBLE,
+        fid_tag = const crate::value::tag::FUNCTION_ID_TAG,
+        number_tag = const crate::value::tag::NUMBER_TAG,
+        other_tag = const crate::value::tag::OTHER_TAG,
+        closure_tag = const crate::closure::JS_CLOSURE_BODY_TYPE_TAG,
+        closure_fid = const BODY + crate::closure::CLOSURE_BODY_FUNCTION_ID_OFFSET,
+        undefined = const Value::UNDEFINED.to_abi_bits(),
+        publisher = sym call_request_entry,
+        generic_end = sym costs::GENERIC_END,
+    );
+}
+
+/// Publish the sole pending request, preserving the original hardware return.
+/// The selected entry in r9 is either zero (classify) or the canonical
+/// Host native kernel. No call, allocation or stack change precedes publication.
+#[cfg(target_arch = "x86_64")]
+#[unsafe(naked)]
+unsafe extern "C" fn call_request_entry(_ctx: *mut JitCtx) -> NativeResultPair {
+    core::arch::naked_asm!(
         "lea r10, [rdi + {request}]",
-        "mov qword ptr [r10], 0",
+        "mov [r10], r9",
         "mov rax, {undefined}",
         "xor r11d, r11d",
         "cmp rcx, rax",
         "setne r11b",
         "shl r11d, {construct_bit}",
         "mov byte ptr [r10 + {req_flags}], r11b",
+        "test r9, r9",
+        "jz 191f",
+        ".if {apple}", ".alt_entry {header_start}", ".endif",
+        ".global {header_start}", "{header_start}:",
+        "mov qword ptr [r10 + {req_header}], 0",
+        "mov eax, {host_header_low}",
+        "shl r11d, 24",
+        "or r11d, eax",
+        "mov [r10 + {req_header} + 8], r11",
+        "mov dword ptr [r10 + {req_parameter_count}], 0",
+        ".if {apple}", ".alt_entry {header_end}", ".endif",
+        ".global {header_end}", "{header_end}:",
+        "191:",
         "mov [r10 + {req_callee}], rsi",
         "mov [r10 + {req_receiver}], rdx",
         "mov [r10 + {req_new_target}], rcx",
@@ -311,6 +523,16 @@ pub unsafe extern "C" fn call_generic_entry(_ctx: *mut JitCtx) -> NativeResultPa
         "mov rax, -4294967296",
         "mov [r10 + {req_initial_count}], rax",
         "mov qword ptr [r10 + {req_cold}], 0",
+        "mov r11, [rdi + {frame_cell}]",
+        "xor eax, eax",
+        "test r11, r11",
+        "jz 190f",
+        "cmp dword ptr [r11 + {code_object_id}], 0",
+        "je 190f",
+        "mov rax, [rsp]",
+        "190:",
+        "mov [r10 + {req_caller}], r11",
+        "mov [r10 + {req_caller_return_pc}], rax",
         ".if {windows}",
         "push rbp",
         "mov rbp, rsp",
@@ -325,22 +547,11 @@ pub unsafe extern "C" fn call_generic_entry(_ctx: *mut JitCtx) -> NativeResultPa
         ".else",
         "jmp {trampoline}",
         ".endif",
+        ".if {apple}", ".alt_entry {publisher_end}", ".endif",
+        ".global {publisher_end}", "{publisher_end}:",
+        apple = const cfg!(target_vendor = "apple") as u8,
         windows = const cfg!(target_os = "windows") as u8,
         request = const std::mem::offset_of!(JitCtx, pending_call),
-        thread = const std::mem::offset_of!(JitCtx, thread),
-        thread_registry = const std::mem::offset_of!(super::VmThread, code_registry),
-        registry_entries = const std::mem::offset_of!(super::CodeRegistryView, function_entries),
-        registry_count = const std::mem::offset_of!(super::CodeRegistryView, function_entry_count),
-        cell_call_flags = const super::FUNCTION_ENTRY_CALL_FLAGS_OFFSET,
-        cell_param_count = const super::FUNCTION_ENTRY_PARAM_COUNT_OFFSET,
-        generation_code_object = const std::mem::offset_of!(super::CodeEntryCell, code_object_id),
-        suspendable_flag = const super::FUNCTION_CALL_SUSPENDABLE,
-        constructible_flag = const super::FUNCTION_CALL_CONSTRUCTIBLE,
-        fid_tag = const crate::value::tag::FUNCTION_ID_TAG,
-        number_tag = const crate::value::tag::NUMBER_TAG,
-        other_tag = const crate::value::tag::OTHER_TAG,
-        closure_tag = const crate::closure::JS_CLOSURE_BODY_TYPE_TAG,
-        closure_fid = const BODY + crate::closure::CLOSURE_BODY_FUNCTION_ID_OFFSET,
         undefined = const Value::UNDEFINED.to_abi_bits(),
         construct_bit = const super::NativeFrameFlags::CONSTRUCT.trailing_zeros(),
         req_flags = const REQUEST_FLAGS_OFFSET,
@@ -352,8 +563,38 @@ pub unsafe extern "C" fn call_generic_entry(_ctx: *mut JitCtx) -> NativeResultPa
         req_initial = const std::mem::offset_of!(CallRequest, initial_registers),
         req_initial_count = const std::mem::offset_of!(CallRequest, initial_register_count),
         req_cold = const std::mem::offset_of!(CallRequest, cold),
+        frame_cell = const std::mem::offset_of!(JitCtx,native_frame),
+        code_object_id = const std::mem::offset_of!(super::Frame,code_object_id),
+        req_caller = const REQUEST_CALLER_OFFSET,
+        req_caller_return_pc = const REQUEST_CALLER_RETURN_PC_OFFSET,
         trampoline = sym call_trampoline,
+        req_header = const std::mem::offset_of!(CallRequest, header),
+        req_parameter_count = const std::mem::offset_of!(CallRequest, parameter_count),
+        host_header_low = const (super::HOST_FRAME_REGISTER_COUNT as u32)
+            | ((super::NativeFrameKind::Host as u32) << 16),
+        publisher_end = sym costs::PUBLISHER_END,
+        header_start = sym costs::HEADER_START,
+        header_end = sym costs::HEADER_END,
     );
+}
+
+/// Enter a proved NativeFunction through the private actual-only JS convention.
+/// Its live target, captures, realm and constructability remain Host-kernel data.
+///
+/// # Safety
+/// The callee must be a NativeFunction and all private JS operands and the
+/// complete initialized actual span must obey [`call_generic_entry`]'s ABI.
+/// The original hardware return is transferred before any collecting boundary.
+#[cfg(target_arch = "x86_64")]
+#[unsafe(naked)]
+pub unsafe extern "C" fn call_native_entry(_ctx: *mut JitCtx) -> NativeResultPair {
+    core::arch::naked_asm!("lea r9, [rip + {host}]", "jmp {publisher}",
+        ".if {apple}", ".alt_entry {native_end}", ".endif",
+        ".global {native_end}", "{native_end}:",
+        apple = const cfg!(target_vendor = "apple") as u8,
+        host = sym crate::interp::host_call::host_call_entry,
+        publisher = sym call_request_entry,
+        native_end = sym costs::NATIVE_END);
 }
 
 /// The AArch64 trampoline body; only host-entry address materialization
@@ -387,6 +628,8 @@ macro_rules! arm64_call_trampoline {
             "b 40f",
             // ---- Classification. Nothing below allocates before the copy.
             "10:",
+            ".if {apple}", ".alt_entry {classifier}", ".endif",
+            ".global {classifier}", "{classifier}:",
             "add x9, x19, #{request}",
             "mov x26, #0",
             "mov x27, #0",
@@ -473,8 +716,15 @@ macro_rules! arm64_call_trampoline {
             "tbz w15, #{construct_bit}, 140f",
             "tbz w16, #{constructible_bit}, 84f",
             // A compiled current generation builds its own frame: enter it
-            // through the JavaScript call ABI with the padded actual span.
+            // through the JavaScript call ABI with only the actual span.
             "140:",
+            "ldr x0, [x9, #{req_caller_return_pc}]",
+            "cbz x0, 194f",
+            "ldr x0, [x9, #{req_caller}]",
+            "ldr x1, [x19, #{frame_cell}]",
+            "cmp x0, x1",
+            "b.ne 90f",
+            "194:",
             "tbnz w16, #{suspendable_bit}, 71f",
             "ldar x17, [x13]",
             "ldr x0, [x17, #{generation_code_object}]",
@@ -489,10 +739,7 @@ macro_rules! arm64_call_trampoline {
             "cbz x23, 90f",
             "141:",
             "add x21, x14, x27",
-            "ldrh w7, [x13, #{cell_param_count}]",
-            "cmp x21, x7",
-            "csel x7, x21, x7, hi",
-            "lsl x2, x7, #3",
+            "lsl x2, x21, #3",
             "add x2, x2, #15",
             "and x2, x2, #-16",
             "mov x3, sp",
@@ -525,22 +772,12 @@ macro_rules! arm64_call_trampoline {
             "mov x1, x27",
             "mov x2, x28",
             "bl 160f",
-            // Formals beyond the actuals read `undefined`.
-            "mov x11, #{undefined}",
-            "mov x12, x21",
-            "146:",
-            "cmp x12, x7",
-            "b.hs 147f",
-            "str x11, [x20, x12, lsl #3]",
-            "add x12, x12, #1",
-            "b 146b",
-            "147:",
             "mov x0, x19",
             "mov x1, x26",
             "ldr x2, [x19, #{request_receiver}]",
             "ldr x3, [x19, #{request_new_target}]",
             "mov x4, x21",
-            "mov x8, x24",
+            "orr x8, x24, #1",
             "blr x22",
             "cmp x1, #{continue_status}",
             "b.ne 99f",
@@ -658,7 +895,15 @@ macro_rules! arm64_call_trampoline {
             "str x22, [x9]",
             // ---- Reservation of an interpreter or host frame.
             "12:",
+            ".if {apple}", ".alt_entry {reservation}", ".endif",
+            ".global {reservation}", "{reservation}:",
             "ldr x21, [x19, #{frame_cell}]",
+            "ldr x11, [x9, #{req_caller_return_pc}]",
+            "cbz x11, 193f",
+            "ldr x11, [x9, #{req_caller}]",
+            "cmp x11, x21",
+            "b.ne 90f",
+            "193:",
             "mov w16, #1",
             "cbz x21, 20f",
             "ldr w16, [x21, #{depth}]",
@@ -726,11 +971,24 @@ macro_rules! arm64_call_trampoline {
             "stp x11, x12, [x20, #{self_value}]",
             "add x13, x10, x14, lsl #3",
             "stp x13, x21, [x20, #{actuals}]",
+            "ldr x11, [x9, #{req_caller_return_pc}]",
+            "str x11, [x20, #{caller_return_pc}]",
+            "stp xzr, xzr, [x9, #{req_caller}]",
             "mov x11, #-4294967296",
             "orr x11, x11, x16",
             "stp x11, xzr, [x20, #{depth}]",
             "ldur x11, [x9, #{req_return_destination}]",
             "str x11, [x20, #{continuation}]",
+            "ldr x11, [x9, #{req_construct_layout}]",
+            "str x11, [x20, #{construct_layout}]",
+            "ldr x12, [x9, #{req_construct_receiver}]",
+            "str x12, [x20, #{construct_receiver}]",
+            "ldr x12, [x9, #{req_super_origin}]",
+            "str x12, [x20, #{super_origin}]",
+            "str xzr, [x9, #{req_super_origin}]",
+            "str xzr, [x9, #{req_construct_layout}]",
+            "mov x12, #{undefined}",
+            "str x12, [x9, #{req_construct_receiver}]",
             "mov x11, #{undefined}",
             "mov x12, #0",
             "30:",
@@ -790,6 +1048,8 @@ macro_rules! arm64_call_trampoline {
             "mov x0, #{undefined}",
             "mov x1, #0",
             "40:",
+            ".if {apple}", ".alt_entry {invoke}", ".endif",
+            ".global {invoke}", "{invoke}:",
             "stp x0, x1, [x19, #{completion}]",
             "str w23, [x19, #{completion_destination}]",
             "mov x0, x19",
@@ -880,6 +1140,20 @@ macro_rules! arm64_call_trampoline {
             "mov x0, #{undefined}",
             "mov x1, #{fatal_status}",
             "50:",
+            "cbnz x25, 51f",
+            "ldr w9, [x20, #{construct_layout}]",
+            "ldr x10, [x20, #{super_origin}]",
+            "orr x9, x9, x10",
+            "cbz x9, 51f",
+            "cmp x1, #{continue_status}",
+            "b.eq 51f",
+            "sub sp, sp, #16",
+            "stp x0, x1, [sp]",
+            "mov x1, sp",
+            "mov x0, x19",
+            "bl {constructor_terminal}",
+            "add sp, sp, #16",
+            "51:",
             "cmp x25, #0",
             "csel x9, x25, x21, ne",
             "str x9, [x19, #{frame_cell}]",
@@ -926,6 +1200,9 @@ macro_rules! arm64_call_trampoline {
             "b 160b",
             "164:",
             "ret",
+            ".if {apple}", ".alt_entry {trampoline_end}", ".endif",
+            ".global {trampoline_end}", "{trampoline_end}:",
+            apple = const cfg!(target_vendor = "apple") as u8,
             request = const std::mem::offset_of!(JitCtx, pending_call),
             request_receiver = const std::mem::offset_of!(JitCtx, pending_call) + std::mem::offset_of!(CallRequest, receiver),
             request_new_target = const std::mem::offset_of!(JitCtx, pending_call) + std::mem::offset_of!(CallRequest, new_target),
@@ -948,8 +1225,17 @@ macro_rules! arm64_call_trampoline {
             self_value = const std::mem::offset_of!(super::Frame, self_value),
             actuals = const std::mem::offset_of!(super::Frame, actuals),
             caller = const std::mem::offset_of!(super::Frame, caller),
+            caller_return_pc = const super::NATIVE_FRAME_CALLER_RETURN_PC_OFFSET,
+            req_caller = const REQUEST_CALLER_OFFSET,
+            req_caller_return_pc = const REQUEST_CALLER_RETURN_PC_OFFSET,
             depth = const std::mem::offset_of!(super::Frame, depth),
             continuation = const std::mem::offset_of!(super::Frame, return_destination),
+            construct_layout = const super::NATIVE_FRAME_CONSTRUCT_LAYOUT_OFFSET,
+            construct_receiver = const super::NATIVE_FRAME_CONSTRUCT_RECEIVER_OFFSET,
+            req_construct_layout = const REQUEST_CONSTRUCT_LAYOUT_OFFSET,
+            req_construct_receiver = const REQUEST_CONSTRUCT_RECEIVER_OFFSET,
+            req_super_origin = const REQUEST_SUPER_ORIGIN_OFFSET,
+            super_origin = const super::NATIVE_FRAME_SUPER_ORIGIN_OFFSET,
             tail_header_mask = const ((super::NativeFrameFlags::TAIL_CALL | super::NativeFrameFlags::TIER_ENTRY) as u64) << 24,
             req_header = const std::mem::offset_of!(CallRequest, header),
             req_flags = const REQUEST_FLAGS_OFFSET,
@@ -1026,8 +1312,14 @@ macro_rules! arm64_call_trampoline {
             interp_entry = sym crate::interp::call_dispatch::interpreter_entry,
             prepare = sym crate::interp::host_call::prepare_activation,
             derived_result = sym crate::interp::host_call::derived_construct_result,
+            constructor_terminal = sym crate::constructor_layout::constructor_terminal,
             overflow = sym call_stack_overflow,
             invalid_request = sym invalid_call_request,
+            classifier = sym costs::CLASSIFIER,
+            reservation = sym costs::RESERVATION,
+            invoke = sym costs::INVOKE,
+            trampoline_end = sym costs::TRAMPOLINE_END,
+
         )
     };
 }
@@ -1037,7 +1329,7 @@ macro_rules! arm64_call_trampoline {
 /// unwrapped into the actual span, a class wrapper yields its constructor,
 /// and bytecode functions select their current destination through the
 /// function directory. A compiled generation is entered through the
-/// JavaScript call ABI with the padded span on this stack; its entry builds
+/// JavaScript call ABI with only the actual span on this stack; its entry builds
 /// and owns its frame. An interpreter destination and every other callee get
 /// a frame built here. `Continue` from such a frame's body consumes another
 /// request, invokes that child and resumes the same parent entry with
@@ -1047,7 +1339,11 @@ macro_rules! arm64_call_trampoline {
 ///
 /// # Safety
 /// `ctx` and its services must remain exclusively owned for this call. The
-/// request's entry must obey `JitEntry`, and its source arguments must remain
+/// request owns its caller-return association: generated callers publish the
+/// actual return coordinate, while a Rust semantic helper publishes zero and
+/// retains its active stamped root recipe. This entry never infers a generated
+/// return from its own native C return address.
+/// The request's entry must obey `JitEntry`, and its source arguments must remain
 /// readable until copied. Entries must home their completion before any
 /// safepoint and release cold frame state before returning. The context's
 /// native frame cell must be registered with the collector for allocating
@@ -1088,7 +1384,9 @@ pub unsafe extern "C" fn call_trampoline(_ctx: *mut JitCtx) -> NativeResultPair 
     // [rbp-72] tier-entry frame, [rbp-80] saved generation, [rbp-88] bound
     // actual count, [rbp-96] callee chain head, [rbp-104] parent entry to
     // resume after a tier transfer, [rbp-112] activation-preparation flag or
-    // the compiled callee, [rbp-120] the entered generation.
+    // the compiled callee, [rbp-120] the entered generation. Microsoft C also
+    // saves xmm6–xmm15 at rbp-288 through rbp-128; private JS calls retain
+    // their shared register convention and may clobber that complete FP bank.
     core::arch::naked_asm!(
         "push rbp",
         "mov rbp, rsp",
@@ -1099,7 +1397,19 @@ pub unsafe extern "C" fn call_trampoline(_ctx: *mut JitCtx) -> NativeResultPair 
         "push r15",
         "push rdi",
         "push rsi",
-        "sub rsp, 72",
+        "sub rsp, {fixed_locals}",
+        ".if {windows}",
+        "movdqu [rbp - 288], xmm6",
+        "movdqu [rbp - 272], xmm7",
+        "movdqu [rbp - 256], xmm8",
+        "movdqu [rbp - 240], xmm9",
+        "movdqu [rbp - 224], xmm10",
+        "movdqu [rbp - 208], xmm11",
+        "movdqu [rbp - 192], xmm12",
+        "movdqu [rbp - 176], xmm13",
+        "movdqu [rbp - 160], xmm14",
+        "movdqu [rbp - 144], xmm15",
+        ".endif",
         ".if {windows}",
         "mov r14, rcx", // C aggregate return destination.
         "mov r12, rdx",
@@ -1126,6 +1436,8 @@ pub unsafe extern "C" fn call_trampoline(_ctx: *mut JitCtx) -> NativeResultPair 
         "jmp 40f",
         // ---- Classification. Nothing below allocates before the copy.
         "10:",
+        ".if {apple}", ".alt_entry {classifier}", ".endif",
+        ".global {classifier}", "{classifier}:",
         "lea r8, [r12 + {request}]",
         "mov qword ptr [rbp - 112], 0",
         "mov qword ptr [rbp - 88], 0",
@@ -1227,8 +1539,14 @@ pub unsafe extern "C" fn call_trampoline(_ctx: *mut JitCtx) -> NativeResultPair 
         "test r11d, {constructible_flag}",
         "jz 84f",
         // A compiled current generation builds its own frame: enter it
-        // through the JavaScript call ABI with the padded actual span.
+        // through the JavaScript call ABI with only the actual span.
         "140:",
+        "cmp qword ptr [r8 + {req_caller_return_pc}], 0",
+        "je 194f",
+        "mov rax, [r12 + {frame_cell}]",
+        "cmp [r8 + {req_caller}], rax",
+        "jne 90f",
+        "194:",
         "test r11d, {suspendable_flag}",
         "jnz 71f",
         "mov rsi, [rdi]",
@@ -1248,10 +1566,7 @@ pub unsafe extern "C" fn call_trampoline(_ctx: *mut JitCtx) -> NativeResultPair 
         "141:",
         "mov r13, [rbp - 88]",
         "add r13, rcx",
-        "movzx ebx, word ptr [rdi + {cell_param_count}]",
-        "cmp rbx, r13",
-        "cmovb rbx, r13",
-        "lea rax, [rbx * 8 + 15]",
+        "lea rax, [r13 * 8 + 15]",
         "and rax, -16",
         "mov rdx, rsp",
         "sub rdx, rax",
@@ -1281,28 +1596,19 @@ pub unsafe extern "C" fn call_trampoline(_ctx: *mut JitCtx) -> NativeResultPair 
         "145:",
         "mov r8, rsp",
         "call 160f",
-        // Formals beyond the actuals read `undefined`.
-        "mov rax, {undefined}",
-        "mov rdx, r13",
-        "146:",
-        "cmp rdx, rbx",
-        "jae 147f",
-        "mov [rsp + rdx * 8], rax",
-        "inc rdx",
-        "jmp 146b",
-        "147:",
         "mov rdi, r12",
         "mov rsi, [rbp - 112]",
         "mov rdx, [r12 + {request_receiver}]",
         "mov rcx, [r12 + {request_new_target}]",
         "mov r8, r13",
         "mov r9, [rbp - 120]",
+        "or r9, 1",
         "call r15",
         "cmp rdx, {continue_status}",
         "jne 99f",
         // The callee retired its record for a tail call it staged:
         // classify that request in its place.
-        "lea rsp, [rbp - 128]",
+        "lea rsp, [rbp - {fixed_frame}]",
         "jmp 10b",
         // Interpreter destination: bind the receiver for this frame.
         "71:",
@@ -1421,7 +1727,14 @@ pub unsafe extern "C" fn call_trampoline(_ctx: *mut JitCtx) -> NativeResultPair 
         "mov [r8], r15",
         // ---- Reservation of an interpreter or host frame.
         "12:",
+        ".if {apple}", ".alt_entry {reservation}", ".endif",
+        ".global {reservation}", "{reservation}:",
         "mov r13, [r12 + {frame_cell}]",
+        "cmp qword ptr [r8 + {req_caller_return_pc}], 0",
+        "je 193f",
+        "cmp [r8 + {req_caller}], r13",
+        "jne 90f",
+        "193:",
         "mov r11d, 1",
         "test r13, r13",
         "jz 20f",
@@ -1495,6 +1808,19 @@ pub unsafe extern "C" fn call_trampoline(_ctx: *mut JitCtx) -> NativeResultPair 
         "lea rax, [rdi + rcx * 8]",
         "mov [rbx + {actuals}], rax",
         "mov [rbx + {caller}], r13",
+        "mov rax, [r8 + {req_caller_return_pc}]",
+        "mov [rbx + {caller_return_pc}], rax",
+        "mov qword ptr [r8 + {req_caller}], 0",
+        "mov qword ptr [r8 + {req_caller_return_pc}], 0",
+        "mov rax, [r8 + {req_construct_layout}]",
+        "mov [rbx + {construct_layout}], rax",
+        "mov rax, [r8 + {req_construct_receiver}]",
+        "mov [rbx + {construct_receiver}], rax",
+        "mov rax, [r8 + {req_super_origin}]",
+        "mov [rbx + {super_origin}], rax",
+        "mov qword ptr [r8 + {req_super_origin}], 0",
+        "mov qword ptr [r8 + {req_construct_layout}], 0",
+        "mov qword ptr [r8 + {req_construct_receiver}], {undefined}",
         "mov [rbx + {depth}], r11d",
         "mov dword ptr [rbx + {depth} + 4], -1",
         "mov qword ptr [rbx + {depth} + 8], 0",
@@ -1572,6 +1898,8 @@ pub unsafe extern "C" fn call_trampoline(_ctx: *mut JitCtx) -> NativeResultPair 
         "mov rax, {undefined}",
         "xor edx, edx",
         "40:",
+        ".if {apple}", ".alt_entry {invoke}", ".endif",
+        ".global {invoke}", "{invoke}:",
         "mov [r12 + {completion}], rax",
         "mov [r12 + {completion} + 8], rdx",
         "mov ecx, [rbp - 64]",
@@ -1692,7 +2020,7 @@ pub unsafe extern "C" fn call_trampoline(_ctx: *mut JitCtx) -> NativeResultPair 
         "cmp qword ptr [rbp - 72], 0",
         "jne 49f",
         "mov [r12 + {frame_cell}], r13",
-        "lea rsp, [rbp - 128]",
+        "lea rsp, [rbp - {fixed_frame}]",
         "jmp 10b",
         "49:",
         "xor eax, eax",
@@ -1702,6 +2030,34 @@ pub unsafe extern "C" fn call_trampoline(_ctx: *mut JitCtx) -> NativeResultPair 
         "mov rax, {undefined}",
         "mov edx, {fatal_status}",
         "50:",
+        "cmp qword ptr [rbp - 72], 0",
+        "jne 51f",
+        "cmp dword ptr [rbx + {construct_layout}], 0",
+        "jne 52f",
+        "cmp qword ptr [rbx + {super_origin}], 0",
+        "je 51f",
+        "52:",
+        "cmp rdx, {continue_status}",
+        "je 51f",
+        "sub rsp, 16",
+        "mov [rsp], rax",
+        "mov [rsp + 8], rdx",
+        ".if {windows}",
+        "mov r8, rsp",
+        "mov rdx, r12",
+        "sub rsp, 48",
+        "lea rcx, [rsp + 32]",
+        "call {constructor_terminal}",
+        "mov rax, [rsp + 32]",
+        "mov rdx, [rsp + 40]",
+        "add rsp, 48",
+        ".else",
+        "mov rsi, rsp",
+        "mov rdi, r12",
+        "call {constructor_terminal}",
+        ".endif",
+        "add rsp, 16",
+        "51:",
         "mov rcx, [rbp - 72]",
         "test rcx, rcx",
         "cmovz rcx, r13",
@@ -1709,6 +2065,7 @@ pub unsafe extern "C" fn call_trampoline(_ctx: *mut JitCtx) -> NativeResultPair 
         "jmp 99f",
         "90:",
         ".if {windows}",
+        "sub rsp, {call_area}",
         "lea rcx, [rsp + 32]",
         "mov rdx, r12",
         "call {invalid_request}",
@@ -1721,7 +2078,7 @@ pub unsafe extern "C" fn call_trampoline(_ctx: *mut JitCtx) -> NativeResultPair 
         "jmp 99f",
         "91:",
         ".if {windows}",
-        "lea rsp, [rbp - 128]",
+        "lea rsp, [rbp - {fixed_frame} - {call_area}]",
         "lea rcx, [rsp + 32]",
         "mov rdx, r12",
         "call {overflow}",
@@ -1736,6 +2093,16 @@ pub unsafe extern "C" fn call_trampoline(_ctx: *mut JitCtx) -> NativeResultPair 
         "mov [r14], rax",
         "mov [r14 + 8], rdx",
         "mov rax, r14",
+        "movdqu xmm6, [rbp - 288]",
+        "movdqu xmm7, [rbp - 272]",
+        "movdqu xmm8, [rbp - 256]",
+        "movdqu xmm9, [rbp - 240]",
+        "movdqu xmm10, [rbp - 224]",
+        "movdqu xmm11, [rbp - 208]",
+        "movdqu xmm12, [rbp - 192]",
+        "movdqu xmm13, [rbp - 176]",
+        "movdqu xmm14, [rbp - 160]",
+        "movdqu xmm15, [rbp - 144]",
         ".endif",
         "lea rsp, [rbp - 56]",
         "pop rsi",
@@ -1779,7 +2146,12 @@ pub unsafe extern "C" fn call_trampoline(_ctx: *mut JitCtx) -> NativeResultPair 
         "jmp 161b",
         "164:",
         "ret",
+        ".if {apple}", ".alt_entry {trampoline_end}", ".endif",
+        ".global {trampoline_end}", "{trampoline_end}:",
+        apple = const cfg!(target_vendor = "apple") as u8,
         windows = const cfg!(target_os = "windows") as u8,
+        fixed_locals = const if cfg!(target_os = "windows") { 232 } else { 72 },
+        fixed_frame = const if cfg!(target_os = "windows") { 288 } else { 128 },
         call_area = const if cfg!(target_os = "windows") { 48 } else { 0 },
         request = const std::mem::offset_of!(JitCtx, pending_call),
         request_receiver = const std::mem::offset_of!(JitCtx, pending_call) + std::mem::offset_of!(CallRequest, receiver),
@@ -1803,8 +2175,17 @@ pub unsafe extern "C" fn call_trampoline(_ctx: *mut JitCtx) -> NativeResultPair 
         self_value = const std::mem::offset_of!(super::Frame, self_value),
         actuals = const std::mem::offset_of!(super::Frame, actuals),
         caller = const std::mem::offset_of!(super::Frame, caller),
+        caller_return_pc = const super::NATIVE_FRAME_CALLER_RETURN_PC_OFFSET,
+        req_caller = const REQUEST_CALLER_OFFSET,
+        req_caller_return_pc = const REQUEST_CALLER_RETURN_PC_OFFSET,
         depth = const std::mem::offset_of!(super::Frame, depth),
         continuation = const std::mem::offset_of!(super::Frame, return_destination),
+        construct_layout = const super::NATIVE_FRAME_CONSTRUCT_LAYOUT_OFFSET,
+        construct_receiver = const super::NATIVE_FRAME_CONSTRUCT_RECEIVER_OFFSET,
+        req_construct_layout = const REQUEST_CONSTRUCT_LAYOUT_OFFSET,
+        req_construct_receiver = const REQUEST_CONSTRUCT_RECEIVER_OFFSET,
+        req_super_origin = const REQUEST_SUPER_ORIGIN_OFFSET,
+        super_origin = const super::NATIVE_FRAME_SUPER_ORIGIN_OFFSET,
         persistent_flags = const !(super::NativeFrameFlags::TAIL_CALL | super::NativeFrameFlags::TIER_ENTRY),
         req_header = const std::mem::offset_of!(CallRequest, header),
         req_flags = const REQUEST_FLAGS_OFFSET,
@@ -1879,8 +2260,14 @@ pub unsafe extern "C" fn call_trampoline(_ctx: *mut JitCtx) -> NativeResultPair 
         interp_entry = sym crate::interp::call_dispatch::interpreter_entry,
         prepare = sym crate::interp::host_call::prepare_activation,
         derived_result = sym crate::interp::host_call::derived_construct_result,
+        constructor_terminal = sym crate::constructor_layout::constructor_terminal,
         overflow = sym call_stack_overflow,
         invalid_request = sym invalid_call_request,
+        classifier = sym costs::CLASSIFIER,
+        reservation = sym costs::RESERVATION,
+        invoke = sym costs::INVOKE,
+        trampoline_end = sym costs::TRAMPOLINE_END,
+
     );
 }
 
@@ -1891,6 +2278,18 @@ pub unsafe extern "C" fn call_trampoline(_ctx: *mut JitCtx) -> NativeResultPair 
 pub unsafe extern "C" fn call_stack_overflow(ctx: *mut JitCtx) -> NativeResultPair {
     // SAFETY: the trampoline retains the live context and its error slot.
     let ctx = unsafe { &mut *ctx };
+    ctx.pending_call.super_origin = 0;
+    ctx.pending_call.caller = 0;
+    ctx.pending_call.caller_return_pc = 0;
+    if !ctx.pending_call.construct_layout.is_null() {
+        if let Some(activation) = ctx.checked_activation().copied() {
+            // SAFETY: the failed entry retains its published VM activation. No
+            // allocation/GC occurs while taking and sampling this incoming ticket.
+            if let Some(vm) = unsafe { activation.vm.as_mut() } {
+                vm.complete_unentered_constructor_layout(&mut ctx.pending_call);
+            }
+        }
+    }
     if let Some(error) = unsafe { ctx.error.as_mut() } {
         *error = Some(VmError::StackOverflow {
             limit: ctx.generated_depth_limit.min(u64::from(u32::MAX)) as u32,
@@ -1902,13 +2301,25 @@ pub unsafe extern "C" fn call_stack_overflow(ctx: *mut JitCtx) -> NativeResultPa
 extern "C" fn invalid_call_request(ctx: *mut JitCtx) -> NativeResultPair {
     // SAFETY: the trampoline retains the live context and its error slot.
     let ctx = unsafe { &mut *ctx };
+    ctx.pending_call.super_origin = 0;
+    ctx.pending_call.caller = 0;
+    ctx.pending_call.caller_return_pc = 0;
+    if !ctx.pending_call.construct_layout.is_null() {
+        if let Some(activation) = ctx.checked_activation().copied() {
+            // SAFETY: the failed entry retains its published VM activation. No
+            // allocation/GC occurs while taking and sampling this incoming ticket.
+            if let Some(vm) = unsafe { activation.vm.as_mut() } {
+                vm.complete_unentered_constructor_layout(&mut ctx.pending_call);
+            }
+        }
+    }
     if let Some(error) = unsafe { ctx.error.as_mut() } {
         *error = Some(VmError::InvalidOperand);
     }
     NativeResultPair::fatal_internal()
 }
 
-const _: [(); 88] = [(); std::mem::size_of::<CallRequest>()];
+const _: [(); 128] = [(); std::mem::size_of::<CallRequest>()];
 const _: [(); 8] = [(); std::mem::offset_of!(CallRequest, header)];
 const _: [(); 20] = [(); std::mem::offset_of!(CallRequest, code_object_id)];
 const _: [(); 24] = [(); std::mem::offset_of!(CallRequest, arguments)];
@@ -1920,3 +2331,21 @@ const _: [(); 56] = [(); std::mem::offset_of!(CallRequest, new_target)];
 
 #[cfg(test)]
 mod tests;
+
+/// Private offset of the restored canonical DerivedThis identity root.
+pub const REQUEST_DERIVED_THIS_CONTEXT_OFFSET: u32 =
+    std::mem::offset_of!(CallRequest, derived_this_context) as u32;
+const _: [(); 92] = [(); std::mem::offset_of!(CallRequest, derived_this_context)];
+
+/// Private offset of the pending synchronous Super source address.
+#[doc(hidden)]
+pub const REQUEST_SUPER_ORIGIN_OFFSET: u32 = std::mem::offset_of!(CallRequest, super_origin) as u32;
+const _: [(); 104] = [(); std::mem::offset_of!(CallRequest, super_origin)];
+
+/// Published caller of a prepublication return anchor.
+pub const REQUEST_CALLER_OFFSET: u32 = std::mem::offset_of!(CallRequest, caller) as u32;
+/// Genuine prepublication caller return address.
+pub const REQUEST_CALLER_RETURN_PC_OFFSET: u32 =
+    std::mem::offset_of!(CallRequest, caller_return_pc) as u32;
+const _: [(); 112] = [(); std::mem::offset_of!(CallRequest, caller)];
+const _: [(); 120] = [(); std::mem::offset_of!(CallRequest, caller_return_pc)];

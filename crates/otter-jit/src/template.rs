@@ -16,16 +16,17 @@
 //! - [`inline_leaf`] — deopt-safe call/method leaf validation and compact
 //!   scratch planning.
 //! - [`arm64`] — the AArch64 dynasm backend (first machine target).
-//! - [`x86_64`] — the System V x86-64 dynasm backend.
+//! - [`x86_64`] — the x86-64 dynasm backend with platform C calls.
+//! - [`operation`] — one exit carrier for reusable operations in both tiers.
 //! - [`code`] — finalized [`TemplateCode`] objects and VM entry publication.
 //! - [`compile`] — the whole-function compile entry point.
 //!
 //! # Invariants
-//! - Compiled code publishes the canonical instruction-index PC before every
-//!   operation capable of a side exit, runtime transition, or back-edge poll.
-//!   Pure constants, moves, forward control flow, and returns cannot exit, so
-//!   they inherit the last publication. Every actual interpreter resume still
-//!   names the exact operation and never replays a committed effect.
+//! - Generated JavaScript calls identify suspended caller roots and source
+//!   positions through exact physical return sites retained by the caller code.
+//! - Collecting C helpers, back-edge polls and abrupt call exits publish their
+//!   active canonical source before entering the runtime. Every interpreter
+//!   resume names the exact operation without replaying a committed effect.
 //! - The VM is reached only through `otter_vm::native_abi` records and the
 //!   shared runtime-stub inventory; no template-private frame or status shape
 //!   exists.
@@ -41,6 +42,7 @@ pub(crate) mod arm64;
 pub(crate) mod code;
 #[cfg(any(test, target_arch = "aarch64"))]
 mod inline_leaf;
+pub(crate) mod operation;
 pub(crate) mod plan;
 #[cfg(target_arch = "x86_64")]
 pub(crate) mod x86_64;
@@ -58,13 +60,113 @@ pub(crate) use plan::{ArithKind, BitwiseKind, CompareKind, TemplateOp, TemplateP
 
 use crate::entry::{TransitionTable, Unsupported};
 
+/// Operations with a generated JS entry, including their committed cold arms.
+/// Runtime helper operations retain their explicit active-boundary stamps.
+pub(crate) fn operation_is_js_call(op: TemplateOp) -> bool {
+    matches!(
+        op,
+        TemplateOp::Call { .. }
+            | TemplateOp::TailCall { .. }
+            | TemplateOp::CallWithThis { .. }
+            | TemplateOp::Construct { .. }
+            | TemplateOp::MethodCall { .. }
+            | TemplateOp::CallForwardArguments { .. }
+            | TemplateOp::SpreadCallOp { .. }
+    )
+}
+
 /// Compile-time direct-call and static-native lowering events, keyed by
 /// `(byte_pc, target_index)` so a backend's final decision replaces the seed.
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 pub(crate) type DirectCallEvents =
     std::collections::BTreeMap<(u32, u32), otter_vm::JitCompilerDiagnostic>;
 
-/// Seeds one `Eliminated` event per available plain and method direct-call
+/// A reached site that emits no proven function-cell edge is a backend
+/// refusal, not dead code. Emitters replace this default only after emitting
+/// the corresponding linkage or accepting an inline body.
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+pub(crate) fn mark_direct_call_site_reached(events: Option<&mut DirectCallEvents>, byte_pc: u32) {
+    let Some(events) = events else { return };
+    for (_, diagnostic) in events.range_mut((byte_pc, 0)..=(byte_pc, u32::MAX)) {
+        if let otter_vm::JitCompilerDiagnostic::DirectCallLowered { outcome, .. } = diagnostic {
+            *outcome = otter_vm::JitDirectCallLoweringOutcome::Rejected {
+                reason: otter_vm::JitDirectCallLoweringRejectionReason::BackendUnsupported,
+            };
+        }
+    }
+}
+
+/// Record a proven current-generation link only after its backend emitted it.
+/// An accepted method splice remains the primary outcome when its miss path
+/// also contains ordinary generated linkage.
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn record_generated_direct_call(
+    events: Option<&mut DirectCallEvents>,
+    call_kind: otter_vm::JitDirectCallKind,
+    instruction_pc: u32,
+    byte_pc: u32,
+    target: &otter_vm::jit::JitDirectCallee,
+    target_index: u32,
+    target_count: u32,
+) {
+    let Some(events) = events else { return };
+    let key = (byte_pc, target_index);
+    if matches!(
+        events.get(&key),
+        Some(otter_vm::JitCompilerDiagnostic::DirectCallLowered {
+            outcome: otter_vm::JitDirectCallLoweringOutcome::Inlined,
+            ..
+        })
+    ) {
+        return;
+    }
+    let plan = target.plan;
+    events.insert(
+        key,
+        otter_vm::JitCompilerDiagnostic::DirectCallLowered {
+            call_kind,
+            instruction_pc,
+            byte_pc,
+            callee_function_id: plan.function_id,
+            target_index,
+            target_count,
+            outcome: otter_vm::JitDirectCallLoweringOutcome::Generated {
+                code_object_id: plan.code_object_id,
+                target_tier: match plan.tier {
+                    otter_vm::native_abi::NativeFrameKind::Baseline => {
+                        otter_vm::JitDebugTier::Template
+                    }
+                    otter_vm::native_abi::NativeFrameKind::Optimizing => {
+                        otter_vm::JitDebugTier::Optimizing
+                    }
+                    otter_vm::native_abi::NativeFrameKind::Interpreter
+                    | otter_vm::native_abi::NativeFrameKind::Host => {
+                        otter_vm::JitDebugTier::Interpreter
+                    }
+                },
+                this_mode: plan.this_mode,
+            },
+        },
+    );
+}
+
+/// Classify the constructor semantics represented by one generated link.
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+pub(crate) fn construct_call_kind(
+    super_construct: bool,
+    derived: bool,
+) -> otter_vm::JitDirectCallKind {
+    use otter_vm::JitDirectCallKind as Kind;
+    match (super_construct, derived) {
+        (false, false) => Kind::Construct,
+        (false, true) => Kind::DerivedConstruct,
+        (true, false) => Kind::SuperConstruct,
+        (true, true) => Kind::DerivedSuperConstruct,
+    }
+}
+
+/// Seeds one `Eliminated` event per available plain, constructor and method direct-call
 /// target and per static-native call site. A backend that reaches the site
 /// replaces it with its lowering.
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
@@ -98,6 +200,27 @@ pub(crate) fn seed_direct_call_events(view: &JitCompileSnapshot) -> DirectCallEv
             );
         }
     }
+    for (&byte_pc, target) in &view.direct_constructs {
+        let Some(instruction_pc) = instruction_pc(byte_pc) else {
+            continue;
+        };
+        let super_construct = matches!(
+            view.code_block.op_at(instruction_pc as usize),
+            Some(otter_bytecode::Op::SuperConstruct | otter_bytecode::Op::SuperConstructSpread)
+        );
+        events.insert(
+            (byte_pc, 0),
+            otter_vm::JitCompilerDiagnostic::DirectCallLowered {
+                call_kind: construct_call_kind(super_construct, target.plan.is_derived_constructor),
+                instruction_pc,
+                byte_pc,
+                callee_function_id: target.plan.function_id,
+                target_index: 0,
+                target_count: 1,
+                outcome: eliminated,
+            },
+        );
+    }
     for (&byte_pc, methods) in &view.direct_methods {
         let Some(instruction_pc) = instruction_pc(byte_pc) else {
             continue;
@@ -117,7 +240,10 @@ pub(crate) fn seed_direct_call_events(view: &JitCompileSnapshot) -> DirectCallEv
             );
         }
     }
-    for (&byte_pc, target) in &view.static_native_calls {
+    for (&byte_pc, target) in &view.native_calls {
+        let Some(target) = target.leaf() else {
+            continue;
+        };
         let Some(instruction_pc) = instruction_pc(byte_pc) else {
             continue;
         };
@@ -205,6 +331,14 @@ pub fn compile(
     let _ = (view, code_object_id, transitions);
     Err(Unsupported::OperandShape("template compiler is arm64-only"))
 }
+
+#[cfg(all(test, any(target_arch = "aarch64", target_arch = "x86_64")))]
+#[path = "template/direct_call_diagnostics_tests.rs"]
+mod direct_call_diagnostics_tests;
+
+#[cfg(all(test, any(target_arch = "aarch64", target_arch = "x86_64")))]
+#[path = "template/return_sites_tests.rs"]
+mod return_sites_tests;
 
 #[cfg(all(test, any(target_arch = "aarch64", target_arch = "x86_64")))]
 mod tests {
@@ -333,12 +467,37 @@ mod tests {
         ))
     }
 
+    /// Stands in for the committed numeric/coercion runtime operation, which
+    /// needs a live VM: it raises an error, so a non-number operand leaves
+    /// the fast path through the operation's throw edge and the fixture's
+    /// error finisher reports a side exit at its PC.
+    extern "C" fn fixture_runtime_operation_throws(
+        ctx: *mut JitCtx,
+        _: u64,
+        _: u64,
+        _: u64,
+        _: u64,
+    ) -> u64 {
+        // SAFETY: `exec_entry` owns the context and its error slot.
+        unsafe { *(*ctx).error = Some(otter_vm::VmError::InvalidOperand) };
+        NativeResultStatus::Throw as u64
+    }
+
     fn compile(view: &JitCompileSnapshot) -> Result<TemplateCode, super::Unsupported> {
         let mut transitions = crate::entry::TransitionTable::resolve();
         transitions.replace_entry_for_test(
             otter_vm::native_abi::STUB_JIT_FINISH_ERROR,
             finish_fixture_error_as_side_exit as *const () as usize,
         );
+        for stub in [
+            otter_vm::native_abi::STUB_JIT_NUMERIC_OP,
+            otter_vm::native_abi::STUB_JIT_COERCE_UNARY,
+        ] {
+            transitions.replace_entry_for_test(
+                stub,
+                fixture_runtime_operation_throws as *const () as usize,
+            );
+        }
         super::compile(view, 1, &transitions)
     }
 
@@ -529,12 +688,101 @@ mod tests {
 
     #[test]
     fn code_size_stays_within_the_skeleton_budget() {
-        let code = compile(&countdown_view()).expect("template compiles");
+        let mut transitions = crate::entry::TransitionTable::resolve();
+        transitions.replace_entry_for_test(
+            otter_vm::native_abi::STUB_JIT_FINISH_ERROR,
+            finish_fixture_error_as_side_exit as *const () as usize,
+        );
+        let compiled = super::compile_with_artifacts(
+            &countdown_view(),
+            1,
+            &transitions,
+            Some(crate::artifact::ArtifactRequest {
+                identity: otter_vm::JitArtifactIdentity {
+                    function_name: "countdown".to_string(),
+                    module: "template-size-budget.js".to_string(),
+                },
+                tier: otter_vm::JitDebugTier::Template,
+                entry: otter_vm::JitDebugTarget::Entry,
+            }),
+            false,
+        )
+        .expect("template compiles");
+        let code = compiled.code;
+        let artifact = compiled.artifact.expect("size capture returns a bundle");
+        let map: serde_json::Value = serde_json::from_slice(
+            artifact
+                .file(otter_vm::JitArtifactFileName::CodeMap)
+                .expect("size capture contains native regions")
+                .contents(),
+        )
+        .expect("native region map is valid JSON");
+        let instructions: Vec<_> = map["regions"]
+            .as_array()
+            .expect("native regions are an array")
+            .iter()
+            .filter(|region| region["kind"] == "instruction")
+            .collect();
+        assert_eq!(instructions.len(), 4, "the full countdown body is retained");
+        let body_start = instructions
+            .iter()
+            .map(|region| region["startOffset"].as_u64().unwrap())
+            .min()
+            .unwrap();
+        let body_end = instructions
+            .iter()
+            .map(|region| region["endOffset"].as_u64().unwrap())
+            .max()
+            .unwrap();
+        let osr = map["osrEntries"]
+            .as_array()
+            .expect("OSR entries are an array");
+        assert_eq!(osr.len(), 1, "the countdown OSR entry is retained");
+        assert_eq!(osr[0]["logicalPc"].as_u64(), Some(0));
+        let osr_start = osr[0]["startOffset"].as_u64().unwrap();
+        let total = code.code_len() as u64;
+        assert!(body_start <= body_end && body_end <= osr_start && osr_start <= total);
+        assert_eq!(osr[0]["endOffset"].as_u64(), Some(total));
+        let call_entry = code
+            .call_entry_addr()
+            .expect("the JavaScript call entry is retained")
+            - code.entry_addr().expect("the tier entry is retained");
+        let sizes = format!(
+            "total={total}, entry={}, body={}, cold={}, OSR={}, call-entry={call_entry}",
+            body_start,
+            body_end - body_start,
+            osr_start - body_end,
+            total - osr_start,
+        );
+        eprintln!("countdown mapping bytes: {sizes}");
+        // The call entry charges its source work once per entry (the
+        // interrupt budget's invocation half), replacing per-operation work.
+        // x86-64 encodes the same skeleton in longer variable-length forms.
+        const SKELETON_BUDGET: usize = if cfg!(target_arch = "x86_64") {
+            2368
+        } else {
+            2112
+        };
+        if code.code_len() >= SKELETON_BUDGET {
+            for name in [
+                otter_vm::JitArtifactFileName::Assembly,
+                otter_vm::JitArtifactFileName::CodeMap,
+            ] {
+                let file = artifact
+                    .file(name)
+                    .expect("size capture contains target diagnostics");
+                eprintln!(
+                    "size-budget {}:\n{}",
+                    name.as_str(),
+                    std::str::from_utf8(file.contents()).unwrap()
+                );
+            }
+        }
+
         assert!(code.code_len() > 0);
         assert!(
-            code.code_len() < 2048,
-            "countdown fixture grew to {} bytes",
-            code.code_len()
+            code.code_len() < SKELETON_BUDGET,
+            "countdown fixture exceeds the complete skeleton budget: {sizes}"
         );
     }
 
@@ -545,8 +793,8 @@ mod tests {
         let code = compile(&view).expect("multi-loop Template body compiles");
         assert_eq!(
             code.osr_entries_for_test()
-                .keys()
-                .copied()
+                .iter()
+                .map(|entry| entry.0)
                 .collect::<Vec<_>>(),
             vec![0, 3, 6]
         );
@@ -829,7 +1077,8 @@ mod tests {
             Exit::Bailed(pc) => panic!("-0 remainder bailed at {pc}"),
         }
         expect_binary_f64(Op::Rem, box_f64(7.5), box_i32(2), 1.5);
-        // Non-number operands side-exit for exact coercion.
+        // Non-number operands leave the fast path for the committed runtime
+        // operation (the fixture's stand-in throws).
         assert!(matches!(
             run_binary(Op::Sub, box_i32(1), VALUE_UNDEFINED),
             Exit::Bailed(_)

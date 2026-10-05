@@ -16,6 +16,7 @@
 //! - [`crate::Interpreter::run_for_in_keys_operands`]
 //! - [`crate::Interpreter::run_copy_data_properties_operands`]
 
+use crate::native_abi::CommittedValueError;
 use otter_bytecode::{Op, Operand};
 
 use crate::{ExecutionContext, Interpreter, VmError, activation_stack::ActivationStack};
@@ -32,10 +33,10 @@ impl Interpreter {
         arg0: u64,
         arg1: u64,
         arg2: u64,
-    ) -> Result<(), VmError> {
+    ) -> Result<(), CommittedValueError> {
         self.record_jit_runtime_stub_class(crate::native_abi::RuntimeStubClass::Reentrant);
         if frame_index + 1 != stack.len() {
-            return Err(VmError::InvalidOperand);
+            return Err(CommittedValueError::Fatal(VmError::InvalidOperand));
         }
         let saved_pc = stack[frame_index].pc;
         match opcode {
@@ -54,7 +55,7 @@ impl Interpreter {
                 ];
                 self.run_copy_data_properties_operands(context, stack, &ops)?;
             }
-            _ => return Err(VmError::InvalidOperand),
+            _ => return Err(CommittedValueError::Fatal(VmError::InvalidOperand)),
         }
         stack[frame_index].pc = saved_pc;
         Ok(())

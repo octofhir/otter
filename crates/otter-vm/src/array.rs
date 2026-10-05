@@ -10,6 +10,7 @@
 //! - GC-root-aware growth, mutation, bulk-fill, and structural helpers.
 //! - JIT-visible dense base/length caches plus allocation-free plain-slot
 //!   completion used after guarded native element misses.
+//! - Cached eligibility for present own dense slots with source-realm prototypes.
 //!
 //! # Invariants
 //!
@@ -22,17 +23,23 @@
 //! - Rare array state (sparse/named/accessor/symbol properties,
 //!   descriptor flags, captured JSON source text, and per-instance
 //!   prototype overrides) lives behind one sidecar so plain dense
-//!   arrays keep a small hot body.
+//!   arrays keep a small hot body. Symbol descriptors use the same managed
+//!   insertion-ordered table as ordinary objects.
 //! - Plain-slot completion never grows storage; it may only replace an existing
 //!   dense slot and always records the generational write barrier.
+//! - Native own-element hits admit a prototype-only sidecar after proving the
+//!   slot present; descriptor/accessor/sparse baggage invalidates eligibility.
 //!
 //! # See also
 //!
 //! - <https://tc39.es/ecma262/#sec-array-exotic-objects>
 //! - [GC API](../../../docs/book/src/engine/gc-api.md)
 
+mod dense_guard;
 pub(crate) mod elements;
+mod symbol_properties;
 
+pub(crate) use dense_guard::element_family as dense_element_family;
 pub(crate) use elements::DenseElementKind;
 
 use indexmap::IndexMap;
@@ -44,7 +51,10 @@ use std::cell::Cell;
 
 use crate::Value;
 use crate::number::NumberValue;
-use crate::object::PropertyFlags;
+use crate::object::{
+    PropertyFlags,
+    symbol_table::{self, SymbolPropsBody, SymbolPropsHandle},
+};
 use otter_gc::GcHeap;
 use otter_gc::heap::RootSlotVisitor;
 use otter_gc::raw::{RawGc, SlotVisitor};
@@ -89,8 +99,8 @@ pub struct ArrayBody {
     pub(crate) exotic: ArrayExoticHandle,
     /// Always-current base of the dense element buffer, kept in a fixed body
     /// field so compiled code can address elements without knowing where the
-    /// slab lives. The slab is an old-space body, so a scavenge leaves the
-    /// base valid; only growth and a restore change it, and both refresh it.
+    /// slab lives. Growth and every traced relocation refresh this address;
+    /// compiled code must reload it after an operation that may collect.
     elements_ptr: Cell<*mut u8>,
     /// Live dense length. Authoritative, and sited next to the base pointer
     /// so a compiled bounds check reads it as one 32-bit load. Dense storage
@@ -104,6 +114,10 @@ pub struct ArrayBody {
     /// The slab header is authoritative; this byte is refreshed with the base
     /// and capacity after every adoption or restore.
     dense_kind: Cell<u8>,
+    /// Zero while a proved present dense slot has its default own data
+    /// semantics. A prototype-only sidecar is legal; other exotic state
+    /// blocks native own-slot access. Refreshed by the sidecar mutation owner.
+    dense_own_guard: Cell<u8>,
 }
 
 impl otter_gc::SafeTraceable for ArrayBody {
@@ -136,6 +150,7 @@ impl Default for ArrayBody {
             dense_len: Cell::new(0),
             dense_cap: Cell::new(0),
             dense_kind: Cell::new(DenseElementKind::Empty as u8),
+            dense_own_guard: Cell::new(0),
         }
     }
 }
@@ -151,6 +166,7 @@ impl ArrayBody {
         self.dense_cap
             .set(u32::try_from(elements::capacity_of(self.slab)).unwrap_or(u32::MAX));
         self.dense_kind.set(elements::kind_of(self.slab) as u8);
+        self.refresh_dense_own_guard();
     }
 
     /// Debug verifier for the always-current element cache: the cached
@@ -163,6 +179,7 @@ impl ArrayBody {
             && self.dense_cap.get() as usize == elements::capacity_of(self.slab)
             && self.dense_len.get() as usize == slab_len
             && self.dense_kind() == elements::kind_of(self.slab)
+            && self.dense_own_guard.get() == self.current_dense_own_guard()
     }
 
     /// Read one raw dense slot, including the internal hole sentinel.
@@ -334,6 +351,12 @@ pub(crate) const ARRAY_BODY_DENSE_LEN_OFFSET: usize = std::mem::offset_of!(Array
 
 /// Byte offset of the cached [`DenseElementKind`] discriminant.
 pub(crate) const ARRAY_BODY_DENSE_KIND_OFFSET: usize = std::mem::offset_of!(ArrayBody, dense_kind);
+/// Byte offset of the cached present-own-slot eligibility guard.
+pub(crate) const ARRAY_BODY_DENSE_OWN_GUARD_OFFSET: usize =
+    std::mem::offset_of!(ArrayBody, dense_own_guard);
+
+pub(crate) const ARRAY_BODY_SLAB_OFFSET: usize = std::mem::offset_of!(ArrayBody, slab);
+pub(crate) const ARRAY_BODY_DENSE_CAP_OFFSET: usize = std::mem::offset_of!(ArrayBody, dense_cap);
 
 /// Native guard literal for terminal tagged dense storage.
 pub(crate) const DENSE_ELEMENT_KIND_TAGGED: u32 = DenseElementKind::Tagged as u32;
@@ -383,18 +406,10 @@ pub(crate) struct ArrayExoticSlots {
     /// `Object.defineProperty`. Missing entries use the ordinary
     /// array defaults for data properties.
     property_flags: Option<HashMap<String, PropertyFlags>>,
-    /// Symbol-keyed own properties. Stored as a vector of
-    /// `(JsSymbol, Value)` pairs (mirroring `JsObject::symbol_props`)
-    /// because `JsSymbol` is identity-based — `ptr_eq` is the
-    /// authoritative comparator. Typical arrays have zero entries,
-    /// so the `Option` keeps the inline footprint at one word.
-    symbol_properties: Option<Vec<(crate::symbol::JsSymbol, Value)>>,
-    /// Symbol-keyed accessor descriptors installed via
-    /// `Object.defineProperty(arr, sym, { get, set })`. Kept separate
-    /// from `symbol_properties` (which is data-only); a given symbol is
-    /// in exactly one table. `(getter, setter)` — either may be `None`.
-    /// Spec: §10.4.2.1 ArrayExoticObject [[DefineOwnProperty]].
-    symbol_accessors: Option<Vec<(crate::symbol::JsSymbol, (Option<Value>, Option<Value>))>>,
+    /// Sole managed insertion-ordered symbol descriptor table, shared with
+    /// objects. Kind changes preserve key order; keys and values trace in the
+    /// actual table cell. Growth allocates outside every payload borrow.
+    symbol_properties: SymbolPropsHandle,
     /// Verbatim slice of input text captured by `JSON.parse` for the
     /// lazy stringify memcpy fast-path. `Some` only when the array
     /// originated from `JSON.parse`; the slice spans the closing
@@ -430,41 +445,6 @@ pub const ARRAY_BODY_LENGTH_OFFSET: usize = std::mem::offset_of!(ArrayBody, leng
 // publish — but they do need to stay in the shell rather than behind a hop.
 const _: () = assert!(std::mem::size_of::<ArrayBody>() <= 64);
 
-/// Trace helper for symbol-keyed own properties: only `Value` parts
-/// of each `(JsSymbol, Value)` pair carry GC slots — the `JsSymbol`
-/// wrapper itself flows through ordinary roots / well-known
-/// installation, not through array body trace.
-fn trace_array_symbol_properties(
-    field: &mut Option<Vec<(crate::symbol::JsSymbol, Value)>>,
-    visitor: &mut SlotVisitor<'_>,
-) {
-    if let Some(entries) = field {
-        for (sym, value) in entries {
-            sym.trace_value_slots(visitor);
-            value.trace_value_slot_mut(visitor);
-        }
-    }
-}
-
-/// Trace helper for symbol-keyed accessor descriptors: only the
-/// getter / setter `Value` slots carry GC references.
-fn trace_array_symbol_accessors(
-    field: &mut Option<Vec<(crate::symbol::JsSymbol, (Option<Value>, Option<Value>))>>,
-    visitor: &mut SlotVisitor<'_>,
-) {
-    if let Some(entries) = field {
-        for (sym, (getter, setter)) in entries {
-            sym.trace_value_slots(visitor);
-            if let Some(g) = getter {
-                g.trace_value_slot_mut(visitor);
-            }
-            if let Some(s) = setter {
-                s.trace_value_slot_mut(visitor);
-            }
-        }
-    }
-}
-
 impl ArrayExoticSlots {
     pub(crate) fn visit_function_ids(&self, visitor: &mut dyn FnMut(u32)) {
         if let Some(entries) = &self.sparse_elements {
@@ -487,21 +467,8 @@ impl ArrayExoticSlots {
                 }
             }
         }
-        if let Some(entries) = &self.symbol_properties {
-            for (_, value) in entries {
-                crate::code_liveness::visit_value(value, visitor);
-            }
-        }
-        if let Some(entries) = &self.symbol_accessors {
-            for (_, (getter, setter)) in entries {
-                if let Some(value) = getter {
-                    crate::code_liveness::visit_value(value, visitor);
-                }
-                if let Some(value) = setter {
-                    crate::code_liveness::visit_value(value, visitor);
-                }
-            }
-        }
+        // Managed symbol tables share the one function-id census owner with
+        // objects, so their descriptors are visited by SymbolPropsBody.
         if let Some(value) = &self.prototype_override {
             crate::code_liveness::visit_value(value, visitor);
         }
@@ -544,7 +511,7 @@ impl ArrayExoticSlots {
 
     pub(crate) fn snapshot_content_summary(&self) -> String {
         format!(
-            "sparse:{} named:{:?} accessors:{:?} flags:{:?} sym:{} symacc:{} src:{}",
+            "sparse:{} named:{:?} accessors:{:?} flags:{:?} sym:{} src:{}",
             self.sparse_elements.as_ref().map_or(0, |m| m.len()),
             self.named_properties
                 .as_ref()
@@ -555,8 +522,7 @@ impl ArrayExoticSlots {
             self.property_flags
                 .as_ref()
                 .map(|m| m.keys().cloned().collect::<Vec<_>>()),
-            self.symbol_properties.as_ref().map_or(0, |v| v.len()),
-            self.symbol_accessors.as_ref().map_or(0, |v| v.len()),
+            symbol_table::len_of(self.symbol_properties),
             self.source_bytes.is_some(),
         )
     }
@@ -565,8 +531,7 @@ impl ArrayExoticSlots {
         self.sparse_elements.is_none()
             && self.named_properties.is_none()
             && self.accessors.is_none()
-            && self.symbol_properties.is_none()
-            && self.symbol_accessors.is_none()
+            && self.symbol_properties.is_null()
             && self.source_bytes.is_none()
     }
 }
@@ -584,8 +549,6 @@ impl otter_gc::trace::SeverRestoredPayload for ArrayExoticSlots {
             std::ptr::write(&mut self.named_properties, None);
             std::ptr::write(&mut self.accessors, None);
             std::ptr::write(&mut self.property_flags, None);
-            std::ptr::write(&mut self.symbol_properties, None);
-            std::ptr::write(&mut self.symbol_accessors, None);
             std::ptr::write(&mut self.source_bytes, None);
         }
     }
@@ -617,8 +580,9 @@ impl otter_gc::SafeTraceable for ArrayExoticSlots {
                 }
             }
         }
-        trace_array_symbol_properties(&mut self.symbol_properties, visitor);
-        trace_array_symbol_accessors(&mut self.symbol_accessors, visitor);
+        if !self.symbol_properties.is_null() {
+            visitor(std::ptr::from_mut(&mut self.symbol_properties).cast());
+        }
         if let Some(proto) = &mut self.prototype_override {
             proto.trace_value_slot_mut(visitor);
         }
@@ -725,6 +689,9 @@ impl ArrayBody {
     /// caller that forgot.
     #[inline]
     fn exotic_mut(&mut self) -> &mut ArrayExoticSlots {
+        // Mutable sidecar access can introduce arbitrary baggage. Invalidate
+        // before exposing it; completed mutations refresh their final state.
+        self.dense_own_guard.set(1);
         let body = exotic_body_of(self.exotic)
             .expect("array exotic slots written without ensure_exotic reserving them");
         // SAFETY: as in `exotic`; `&mut self` rules out an aliasing read
@@ -761,15 +728,12 @@ impl ArrayBody {
     }
 
     #[inline]
-    fn symbol_properties(&self) -> Option<&Vec<(crate::symbol::JsSymbol, Value)>> {
-        self.exotic().and_then(|e| e.symbol_properties.as_ref())
-    }
-
-    #[inline]
-    fn symbol_accessors(
-        &self,
-    ) -> Option<&Vec<(crate::symbol::JsSymbol, (Option<Value>, Option<Value>))>> {
-        self.exotic().and_then(|e| e.symbol_accessors.as_ref())
+    fn symbol_properties(&self) -> Option<&SymbolPropsBody> {
+        let table = self.exotic()?.symbol_properties;
+        let body = symbol_table::body_of(table)?;
+        // SAFETY: this array body owns the live managed table for the duration
+        // of its nonallocating payload borrow.
+        Some(unsafe { &*body })
     }
 
     #[inline]
@@ -787,6 +751,7 @@ impl ArrayBody {
         if let Some(exotic) = self.exotic_opt_mut() {
             exotic.dirty = true;
         }
+        self.refresh_dense_own_guard();
     }
 }
 
@@ -813,7 +778,11 @@ pub(crate) fn is_ordinary_dense(arr: JsArray, heap: &GcHeap) -> bool {
 /// fallback.
 ///
 /// <https://tc39.es/ecma262/#sec-array-exotic-objects>
-pub(crate) fn set_prototype_override(arr: JsArray, heap: &mut GcHeap, proto: Option<Value>) {
+pub(crate) fn set_prototype_override(
+    arr: JsArray,
+    heap: &mut GcHeap,
+    proto: Option<Value>,
+) -> Result<(), otter_gc::OutOfMemory> {
     // The sidecar allocates, so it is reserved here, outside the payload
     // borrow below. This may move `arr`, which is why the local is `mut`.
     let mut arr = arr;
@@ -822,14 +791,16 @@ pub(crate) fn set_prototype_override(arr: JsArray, heap: &mut GcHeap, proto: Opt
             value.trace_value_slots(visitor);
         }
     };
-    ensure_exotic(&mut arr, heap, &mut roots).expect("array exotic sidecar");
+    ensure_exotic(&mut arr, heap, &mut roots)?;
     let barrier_value = proto;
     heap.with_payload(arr, |body| {
         body.exotic_mut().prototype_override = proto;
+        body.refresh_dense_own_guard();
     });
     if let Some(value) = &barrier_value {
         record_exotic_array_write(heap, arr, value);
     }
+    Ok(())
 }
 
 /// Allocate an old-space empty array for raw GC fixtures.
@@ -1122,6 +1093,7 @@ pub fn is_empty(arr: JsArray, heap: &otter_gc::GcHeap) -> bool {
 
 /// Current physical representation of the array's dense prefix.
 #[must_use]
+#[cfg(test)]
 pub(crate) fn dense_element_kind(arr: JsArray, heap: &otter_gc::GcHeap) -> DenseElementKind {
     heap.read_payload(arr, ArrayBody::dense_kind)
 }
@@ -1367,7 +1339,6 @@ pub(crate) fn set_with_roots(
     if !has_own_element(arr, heap, idx) && !is_extensible(arr, heap) {
         return Ok(());
     }
-    let barrier_value = value;
     let target_len = idx.saturating_add(1);
     if should_store_sparse(arr, heap, idx) {
         let mut roots = |visitor: &mut dyn FnMut(*mut RawGc)| {
@@ -1384,7 +1355,7 @@ pub(crate) fn set_with_roots(
             body.length = body.length.max(target_len);
             body.mark_dirty();
         });
-        record_exotic_array_write(heap, arr, &barrier_value);
+        record_exotic_array_write(heap, arr, &value);
         return Ok(());
     }
     {
@@ -1415,7 +1386,7 @@ pub(crate) fn set_with_roots(
         body.length = body.length.max(target_len);
         body.mark_dirty();
     });
-    record_array_write(heap, arr, &barrier_value);
+    record_array_write(heap, arr, &value);
     Ok(())
 }
 
@@ -1558,7 +1529,6 @@ pub(crate) fn push_with_roots(
     value: Value,
     external_visit: &mut RootSlotVisitor<'_>,
 ) -> Result<usize, otter_gc::OutOfMemory> {
-    let barrier_value = value;
     let target_len = len(arr, heap).saturating_add(1);
     {
         let mut reserve_roots = |visitor: &mut dyn FnMut(*mut RawGc)| {
@@ -1583,7 +1553,7 @@ pub(crate) fn push_with_roots(
         body.mark_dirty();
         body.length
     });
-    record_array_write(heap, arr, &barrier_value);
+    record_array_write(heap, arr, &value);
     Ok(new_len)
 }
 
@@ -1947,6 +1917,12 @@ pub fn set_integrity_level(arr: JsArray, heap: &mut otter_gc::GcHeap, frozen: bo
         if let Some(named) = body.named_properties() {
             keys.extend(named.keys().map(|k| (k.clone(), false)));
         }
+        let symbols = body.exotic_mut().symbol_properties;
+        if let Some(table) = symbol_table::body_of(symbols) {
+            // SAFETY: the table belongs to this array; integrity publication
+            // cannot allocate or invalidate the payload borrow.
+            unsafe { (*table).set_integrity_level(frozen) };
+        }
         keys.push(("length".to_string(), true));
         let flags = body
             .exotic_mut()
@@ -1986,20 +1962,24 @@ pub fn test_integrity_level(arr: JsArray, heap: &otter_gc::GcHeap, frozen: bool)
             keys.extend(named.keys().cloned());
         }
         keys.push("length".to_string());
-        keys.iter().all(|key| {
-            let entry = body
-                .property_flags()
-                .and_then(|flags| flags.get(key))
-                .copied()
-                .unwrap_or_else(|| {
-                    if key == "length" {
-                        PropertyFlags::new(true, false, false)
-                    } else {
-                        PropertyFlags::new(true, true, true)
-                    }
-                });
-            !entry.configurable() && (!frozen || !entry.writable())
-        })
+        let symbols_match = body
+            .symbol_properties()
+            .is_none_or(|symbols| symbols.test_integrity_level(frozen));
+        symbols_match
+            && keys.iter().all(|key| {
+                let entry = body
+                    .property_flags()
+                    .and_then(|flags| flags.get(key))
+                    .copied()
+                    .unwrap_or_else(|| {
+                        if key == "length" {
+                            PropertyFlags::new(true, false, false)
+                        } else {
+                            PropertyFlags::new(true, true, true)
+                        }
+                    });
+                !entry.configurable() && (!frozen || !entry.writable())
+            })
     })
 }
 
@@ -2027,182 +2007,10 @@ pub fn is_extensible(arr: JsArray, heap: &otter_gc::GcHeap) -> bool {
     heap.read_payload(arr, |body| body.extensible())
 }
 
-/// Install a symbol-keyed own property on the array exotic body.
-/// Replaces the existing slot if the symbol is already present —
-/// matching JsObject's symbol-property semantics. Used by the
-/// `StoreElement` dispatch and reflective `Object.defineProperty`
-/// when the key is a `Symbol`.
-pub fn set_symbol_property(
-    arr: JsArray,
-    heap: &mut otter_gc::GcHeap,
-    key: crate::symbol::JsSymbol,
-    value: Value,
-) {
-    let mut arr = arr;
-    let mut roots = |visitor: &mut dyn FnMut(*mut RawGc)| {
-        value.trace_value_slots(visitor);
-    };
-    ensure_exotic(&mut arr, heap, &mut roots).expect("array exotic sidecar");
-    let barrier_value = value;
-    heap.with_payload(arr, |body| {
-        // A symbol is in exactly one table — installing a data value
-        // removes any accessor previously held for the same key.
-        if let Some(exotic) = body.exotic_opt_mut()
-            && let Some(accessors) = exotic.symbol_accessors.as_mut()
-        {
-            accessors.retain(|(k, _)| !k.ptr_eq(key));
-            if accessors.is_empty() {
-                exotic.symbol_accessors = None;
-            }
-        }
-        let table = body
-            .exotic_mut()
-            .symbol_properties
-            .get_or_insert_with(Vec::new);
-        if let Some(slot) = table.iter_mut().find(|(k, _)| k.ptr_eq(key)) {
-            slot.1 = value;
-        } else {
-            table.push((key, value));
-        }
-        body.mark_dirty();
-    });
-    record_exotic_array_write(heap, arr, &barrier_value);
-}
-
-/// Install a symbol-keyed accessor descriptor, removing any data slot
-/// previously held for the same key (a symbol is in one table only).
-pub fn set_symbol_accessor(
-    arr: JsArray,
-    heap: &mut otter_gc::GcHeap,
-    key: crate::symbol::JsSymbol,
-    getter: Option<Value>,
-    setter: Option<Value>,
-) {
-    let mut arr = arr;
-    let mut roots = |visitor: &mut dyn FnMut(*mut RawGc)| {
-        if let Some(g) = &getter {
-            g.trace_value_slots(visitor);
-        }
-        if let Some(s) = &setter {
-            s.trace_value_slots(visitor);
-        }
-    };
-    ensure_exotic(&mut arr, heap, &mut roots).expect("array exotic sidecar");
-    heap.with_payload(arr, |body| {
-        if let Some(exotic) = body.exotic_opt_mut()
-            && let Some(table) = exotic.symbol_properties.as_mut()
-        {
-            table.retain(|(k, _)| !k.ptr_eq(key));
-            if table.is_empty() {
-                exotic.symbol_properties = None;
-            }
-        }
-        let accessors = body
-            .exotic_mut()
-            .symbol_accessors
-            .get_or_insert_with(Vec::new);
-        if let Some(slot) = accessors.iter_mut().find(|(k, _)| k.ptr_eq(key)) {
-            slot.1 = (getter, setter);
-        } else {
-            accessors.push((key, (getter, setter)));
-        }
-        body.mark_dirty();
-    });
-    if let Some(g) = &getter {
-        record_exotic_array_write(heap, arr, g);
-    }
-    if let Some(s) = &setter {
-        record_exotic_array_write(heap, arr, s);
-    }
-}
-
-/// Read a symbol-keyed accessor descriptor. Returns `None` when no
-/// accessor is installed for `key`.
-#[must_use]
-pub fn get_symbol_accessor(
-    arr: JsArray,
-    heap: &otter_gc::GcHeap,
-    key: crate::symbol::JsSymbol,
-) -> Option<(Option<Value>, Option<Value>)> {
-    heap.read_payload(arr, |body| {
-        body.symbol_accessors()
-            .and_then(|table| table.iter().find(|(k, _)| k.ptr_eq(key)).map(|(_, v)| *v))
-    })
-}
-
-/// Read a symbol-keyed own property. Returns `None` when the slot
-/// is absent.
-#[must_use]
-pub fn get_symbol_property(
-    arr: JsArray,
-    heap: &otter_gc::GcHeap,
-    key: crate::symbol::JsSymbol,
-) -> Option<Value> {
-    heap.read_payload(arr, |body| {
-        body.symbol_properties()
-            .and_then(|table| table.iter().find(|(k, _)| k.ptr_eq(key)).map(|(_, v)| *v))
-    })
-}
-
-/// Remove a symbol-keyed own property. Returns `true` when the
-/// slot was present and removed (matches `OrdinaryDelete`
-/// success). Returns `true` when absent (spec step 2: missing →
-/// success).
-pub fn delete_symbol_property(
-    arr: JsArray,
-    heap: &mut otter_gc::GcHeap,
-    key: crate::symbol::JsSymbol,
-) -> bool {
-    heap.with_payload(arr, |body| {
-        if let Some(exotic) = body.exotic_opt_mut()
-            && let Some(table) = exotic.symbol_properties.as_mut()
-            && let Some(pos) = table.iter().position(|(k, _)| k.ptr_eq(key))
-        {
-            table.remove(pos);
-            if table.is_empty() {
-                exotic.symbol_properties = None;
-            }
-            body.mark_dirty();
-        }
-        if let Some(exotic) = body.exotic_opt_mut()
-            && let Some(table) = exotic.symbol_accessors.as_mut()
-            && let Some(pos) = table.iter().position(|(k, _)| k.ptr_eq(key))
-        {
-            table.remove(pos);
-            if table.is_empty() {
-                exotic.symbol_accessors = None;
-            }
-            body.mark_dirty();
-        }
-        true
-    })
-}
-
-/// Iterate own symbol-keyed property keys in insertion order. Used
-/// by `Object.getOwnPropertySymbols(arr)` and the ownKeys ladder.
-#[must_use]
-pub fn own_symbol_keys(arr: JsArray, heap: &otter_gc::GcHeap) -> Vec<crate::symbol::JsSymbol> {
-    heap.read_payload(arr, |body| {
-        // §6.2.12 — Private Name carriers (a constructor-return
-        // override can brand an array) are not properties.
-        let mut keys: Vec<crate::symbol::JsSymbol> =
-            body.symbol_properties().map_or_else(Vec::new, |t| {
-                t.iter()
-                    .map(|(k, _)| *k)
-                    .filter(|k| !k.is_private_name())
-                    .collect()
-            });
-        if let Some(accessors) = body.symbol_accessors() {
-            keys.extend(
-                accessors
-                    .iter()
-                    .map(|(k, _)| *k)
-                    .filter(|k| !k.is_private_name()),
-            );
-        }
-        keys
-    })
-}
+pub use symbol_properties::{
+    define_symbol_property_partial, delete_symbol_property, get_symbol_accessor,
+    get_symbol_descriptor, get_symbol_property, ordinary_set_symbol_data_property, own_symbol_keys,
+};
 
 /// Set a string-keyed own property. Numeric strings route into dense
 /// indexed storage.
@@ -2937,12 +2745,9 @@ pub fn identity_addr(arr: JsArray) -> *const () {
 
 /// Remember an element write against the body that actually holds it.
 ///
-/// Dense elements live in a separate old-space slab, so the array is not
-/// the parent of its own elements. Remembering only the array would leave
-/// the scavenger re-tracing a body whose sole outgoing edge is the slab
-/// handle — and it stops there, because the slab is old. The array is
-/// remembered too: the same call sites also write exotic state that the
-/// array does own.
+/// Dense elements live in a separate generational slab. Its slots own the
+/// element edges, so barriers remember the slab as well as the array. The
+/// array also owns the slab/sidecar handles and any exotic-state edges.
 fn record_array_write<V>(heap: &mut GcHeap, arr: JsArray, value: &V)
 where
     V: otter_gc::GcStore + ?Sized,

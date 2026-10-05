@@ -17,6 +17,8 @@
 //!   jobs.
 //! - `PromiseNew` advances the caller PC before invoking the executor.
 //! - Variadic helpers read executable operands directly.
+//! - PromiseCall projects its native completion once at the published source;
+//!   completed terminal failures bypass the ordinary source-error materializer.
 //!
 //! # See also
 //! - [`crate::promise_dispatch`]
@@ -26,21 +28,13 @@ use otter_bytecode::Operand;
 use smallvec::SmallVec;
 
 use crate::{
-    ExecutionContext, Frame, Interpreter, Microtask, Value, VmError, microtask, native_to_vm_error,
+    CommittedValueError, ExecutionContext, Frame, Interpreter, Microtask, Value, VmError,
+    microtask,
     operand_decode::{const_operand, register_operand},
     promise_dispatch, read_register, write_register,
 };
 
 impl Interpreter {
-    /// Enqueue every reaction microtask a promise settlement produced,
-    /// recording rejection observations for the unhandled-rejection hook.
-    pub(crate) fn enqueue_promise_settle_jobs(&mut self, jobs: crate::promise::PromiseSettleJobs) {
-        self.note_settle_rejection(&jobs);
-        for job in jobs.jobs {
-            self.microtasks.enqueue(job);
-        }
-    }
-
     pub(crate) fn run_promise_fulfilled_of_regs(
         &mut self,
         context: &ExecutionContext,
@@ -50,7 +44,7 @@ impl Interpreter {
         src: u16,
     ) -> Result<(), VmError> {
         let value = *read_register(&stack[top_idx], src)?;
-        let promise = promise_dispatch::PromiseBuilder::with_context(context.clone())
+        let promise = promise_dispatch::PromiseBuilder::with_context(Some(context.clone()))
             .fulfilled_stack_rooted(self, stack, value, &[], &[])?;
         write_register(&mut stack[top_idx], dst, Value::promise(promise))?;
         stack[top_idx].advance_pc()?;
@@ -69,12 +63,15 @@ impl Interpreter {
             return Err(VmError::NotCallable);
         }
         let args = collect_variadic_args(frame, operands, 1, 2)?;
+        let realm_id = self.reaction_realm(Some(callee), self.active_realm_id)?;
+        let source = self.callable_context(Some(context), callee)?;
         frame.advance_pc()?;
         self.microtasks.enqueue(Microtask {
             callee,
             this_value: Value::undefined(),
             args,
-            context: Some(context.clone()),
+            context: source,
+            realm_id,
             result_capability: None,
             kind: microtask::MicrotaskKind::Call,
             async_context: self.async_context(),
@@ -97,7 +94,7 @@ impl Interpreter {
             return Err(VmError::NotCallable);
         }
         let (handle, resolve, reject) =
-            promise_dispatch::PromiseBuilder::with_context(context.clone())
+            promise_dispatch::PromiseBuilder::with_context(Some(context.clone()))
                 .construct_stack_rooted(self, stack, &[&executor], &[])?;
         write_register(&mut stack[top_idx], dst, Value::promise(handle))?;
         stack[top_idx].advance_pc()?;
@@ -119,14 +116,17 @@ impl Interpreter {
         context: &ExecutionContext,
         stack: &mut ActivationStack,
         operands: impl crate::executable::OperandSource,
-    ) -> Result<(), VmError> {
-        let dst = register_operand(operands.first())?;
-        let method_idx = const_operand(operands.get(1))?;
+    ) -> Result<(), CommittedValueError> {
+        let dst = register_operand(operands.first()).map_err(CommittedValueError::Fatal)?;
+        let method_idx = const_operand(operands.get(1)).map_err(CommittedValueError::Fatal)?;
         let method = otter_bytecode::method_id::PromiseMethod::from_u32(method_idx)
-            .ok_or(VmError::InvalidOperand)?;
+            .ok_or(CommittedValueError::Fatal(VmError::InvalidOperand))?;
         let top_idx = stack.len() - 1;
-        let args = collect_variadic_args(&stack[top_idx], operands, 2, 3)?;
-        stack[top_idx].advance_pc()?;
+        let args = collect_variadic_args(&stack[top_idx], operands, 2, 3)
+            .map_err(CommittedValueError::Fatal)?;
+        // This whole operation is synchronous. Keep its physical source PC
+        // published through callbacks and the one native projection; only a
+        // completed value advances the source instruction.
         let result = promise_dispatch::statics_call(
             self,
             stack,
@@ -135,9 +135,19 @@ impl Interpreter {
             method,
             args.as_slice(),
         )
-        .map_err(|e| native_to_vm_error(self, e))?;
+        .map_err(|error| {
+            crate::error_ops::native_error_to_committed_with_stack(
+                self,
+                stack,
+                Some(context),
+                error,
+            )
+        })?;
         let top_idx = stack.len() - 1;
-        write_register(&mut stack[top_idx], dst, result)
+        write_register(&mut stack[top_idx], dst, result).map_err(CommittedValueError::Fatal)?;
+        stack[top_idx]
+            .advance_pc()
+            .map_err(CommittedValueError::Fatal)
     }
 }
 

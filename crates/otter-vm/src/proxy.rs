@@ -56,6 +56,8 @@ pub struct ProxyBodyGc {
     /// the heap; null until the first private field is installed. Linear
     /// scan, because private name counts are tiny.
     pub private_elements: PrivateSlotsHandle,
+    /// Actual Proxy new.target families; no trap is reread during sampling.
+    pub(crate) constructor_layouts: crate::constructor_layout::ConstructorLayout,
 }
 
 impl ProxyBodyGc {
@@ -237,6 +239,7 @@ pub fn alloc_proxy_with_roots(
             revoked: false,
             callable,
             private_elements: PrivateSlotsHandle::null(),
+            constructor_layouts: crate::constructor_layout::ConstructorLayout::null(),
         },
         external_visit,
     )
@@ -260,6 +263,22 @@ pub struct JsProxy {
 }
 
 impl JsProxy {
+    /// Traced family head of this exact constructor object.
+    pub(crate) fn constructor_layouts(
+        self,
+        heap: &otter_gc::GcHeap,
+    ) -> crate::constructor_layout::ConstructorLayout {
+        heap.read_payload(self.handle, |body| body.constructor_layouts)
+    }
+    pub(crate) fn set_constructor_layouts(
+        self,
+        heap: &mut otter_gc::GcHeap,
+        layouts: crate::constructor_layout::ConstructorLayout,
+    ) {
+        heap.with_payload(self.handle, |body| body.constructor_layouts = layouts);
+        heap.record_write(self.handle, &layouts);
+    }
+
     /// Construct a proxy over `target` with `handler`.
     ///
     /// # Errors

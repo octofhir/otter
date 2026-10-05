@@ -6,6 +6,7 @@
 //! - [`GcHeap`] — the orchestrator the rest of the runtime sees.
 //! - [`RootSlotVisitor`] — caller-supplied root source closure for full GC.
 //! - [`HeapStats`] — tiny snapshot of accounting (used by tests).
+//! - Bounded default-off collection-service captures with exact trigger metadata.
 //! - [`GcHeap::embedder_root`] — strong handles the embedder keeps at fixed
 //!   indices for code that holds only the heap.
 //! - [`MachineAllocationWindow`] — the audited nursery/accounting view exposed
@@ -41,6 +42,13 @@
 //!   is retired before every collection, heap walk publication and direct
 //!   nursery bump, and is refilled only when a plain young cell is legal, so
 //!   the bump itself needs no policy test.
+//! - Successful collection refunds exactly reclaimed physical cells and
+//!   released backing stores before publishing the surviving cap ledger. Minor
+//!   collection uses its existing nursery counters; full collection sums bytes
+//!   during its existing sweep, with no additional object census.
+//! - Cap admission refunds unused charged LAB bytes only when that tail
+//!   would otherwise reject allocation/reservation growth within the effective
+//!   cap. Ordinary admitted growth retains the existing buffer.
 //! - Weak collection tables are registered as type-erased raw
 //!   handles. Every full collection runs the embedder's
 //!   [`PostMarkProcessor`] exactly once between strong marking and sweep
@@ -72,6 +80,10 @@ use crate::header::{GcHeader, MarkColor};
 use crate::lab::LinearAllocationArea;
 use crate::marking::MarkingState;
 
+use crate::observation::{
+    GcPauseCapture, GcPauseCaptureError, GcPauseKind, GcPauseOutcome, GcPauseRecorder,
+    GcPauseTrigger,
+};
 use crate::oom::OutOfMemory;
 use crate::page::{CELL_SIZE, align_up};
 use crate::page::{LARGE_OBJECT_THRESHOLD, PAGE_HEADER_SIZE, page_base_from_offset};
@@ -300,6 +312,8 @@ pub struct GcHeap {
     /// Set after a collection while finalization registries exist; the VM
     /// consumes it at its next job checkpoint to look for emptied cells.
     weak_cleanup_due: bool,
+    /// Default-off bounded collection-service observation; no heap values.
+    pause_recorder: GcPauseRecorder,
     shared_external: Arc<SharedExternalState>,
     /// Optional shared-ledger mirror of [`Self::reserved_bytes`] as
     /// `ExternalBytes`. Growth is admitted on the ledger before any heap
@@ -506,6 +520,7 @@ impl GcHeap {
             weak_finalization: WeakFinalizationRegistry::default(),
             post_mark: None,
             weak_cleanup_due: false,
+            pause_recorder: GcPauseRecorder::default(),
             shared_external: Arc::new(SharedExternalState::default()),
             external_ledger: None,
             stats: HeapStats::default(),
@@ -700,6 +715,11 @@ impl GcHeap {
                     otter_resource::ResourceError::Overflow { in_use, limit, .. } => {
                         (in_use.saturating_add(charged), limit.unwrap_or(u64::MAX))
                     }
+                    otter_resource::ResourceError::Allocation { .. } => {
+                        unreachable!(
+                            "ResourceLease::resize only updates the fixed ledger and never allocates"
+                        )
+                    }
                 };
                 Err(OutOfMemory::ExternalBudgetExceeded {
                     requested_bytes: bytes,
@@ -856,11 +876,10 @@ impl GcHeap {
     /// Reserve off-slot bytes without running an emergency
     /// collection.
     ///
-    /// VM containers use this for capacity growth while their
-    /// roots live in interpreter frames. A heap-local emergency GC
-    /// cannot see those frame roots, so the only sound cap behavior
-    /// at this boundary is to refuse the reservation and let the VM
-    /// synthesize a catchable diagnostic.
+    /// Admission cannot collect. Live cell bytes and existing reservations
+    /// consume the cap; an unused charged LAB tail is refunded only when it
+    /// would otherwise reject growth that the effective cap admits. Ordinary
+    /// reservations that fit the raw charge retain the current LAB.
     ///
     /// # Errors
     ///
@@ -872,6 +891,14 @@ impl GcHeap {
         if self.max_heap_bytes == 0 {
             self.reserved_bytes = self.reserved_bytes.saturating_add(bytes);
             return Ok(());
+        }
+        // The public cap usage excludes bytes reserved by a LAB but not yet
+        // handed to any cell. Preserve a live buffer on the ordinary admitted
+        // path; only an otherwise false refusal publishes/refunds its tail.
+        if self.tracked_bytes.saturating_add(bytes) > self.max_heap_bytes
+            && self.effective_tracked_bytes().saturating_add(bytes) <= self.max_heap_bytes
+        {
+            self.retire_lab();
         }
         let projected = self.tracked_bytes.saturating_add(bytes);
         if projected > self.max_heap_bytes {
@@ -901,14 +928,60 @@ impl GcHeap {
         self.shrink_external_ledger(actual);
     }
 
-    /// Account `bytes` against the cap. Outlined so the alloc
-    /// hot path adds only a single cap-enabled branch when the
-    /// cap is disabled. On overshoot: one emergency full GC,
-    /// retry once, otherwise refuse.
-    ///
     /// Caller pre-checks `self.max_heap_bytes != 0`; this
     /// function is not invoked when the cap is disabled, so the
     /// disabled-cap branch never executes here.
+    /// Rooted, noncharging admission. Only the actual reservation/allocation
+    /// owner charges bytes after this check. Speculative allocation groups
+    /// may refuse without poisoning the source's legal allocation prefix.
+    fn can_admit_with_roots(
+        &mut self,
+        bytes: u64,
+        external_visit: &mut RootSlotVisitor<'_>,
+    ) -> Result<bool, OutOfMemory> {
+        self.drain_shared_external_releases();
+        let cap = self.max_heap_bytes;
+        if cap == 0 {
+            return Ok(true);
+        }
+        // A live LAB may have admitted unused tail bytes. Only a false raw
+        // refusal publishes/refunds that tail; ordinary within-cap admission
+        // keeps the buffer. The allocation owner charges once after success.
+        if self.tracked_bytes.saturating_add(bytes) > cap
+            && self.effective_tracked_bytes().saturating_add(bytes) <= cap
+        {
+            self.retire_lab();
+        }
+        if self.tracked_bytes.saturating_add(bytes) <= cap {
+            return Ok(true);
+        }
+        if self.always_allocate_depth != 0 {
+            return Ok(false);
+        }
+        self.with_gc_pause(
+            GcPauseKind::Full,
+            GcPauseTrigger::HeapCap,
+            |heap| match heap.collect_full(external_visit) {
+                Err(error) => (Err(error), GcPauseOutcome::CollectionFailed),
+                Ok(()) => {
+                    let admitted = heap.tracked_bytes.saturating_add(bytes) <= cap;
+                    (
+                        Ok(admitted),
+                        if admitted {
+                            GcPauseOutcome::Completed
+                        } else {
+                            GcPauseOutcome::CompletedAllocationRefused
+                        },
+                    )
+                }
+            },
+        )
+    }
+
+    /// Canonical charged admission for a cap-enabled allocation owner.
+    /// Callers precheck `max_heap_bytes != 0`; speculative group admission uses
+    /// the noncharging check above even with the cap disabled. On overshoot,
+    /// perform one emergency full GC and retry once before actual refusal.
     #[cold]
     #[inline(never)]
     fn account_or_collect_with_roots(
@@ -916,31 +989,14 @@ impl GcHeap {
         bytes: u64,
         external_visit: &mut RootSlotVisitor<'_>,
     ) -> Result<(), OutOfMemory> {
-        self.drain_shared_external_releases();
-        let cap = self.max_heap_bytes;
-        let projected = self.tracked_bytes.saturating_add(bytes);
-        if projected <= cap {
-            self.tracked_bytes = projected;
-            return Ok(());
-        }
-        if self.always_allocate_depth != 0 {
-            self.oom_flag.store(true, Ordering::Relaxed);
-            return Err(OutOfMemory::HeapCapExceeded {
-                requested_bytes: bytes,
-                heap_limit_bytes: cap,
-            });
-        }
-        self.collect_full(external_visit)?;
-        self.tracked_bytes = self.live_bytes_total().saturating_add(self.reserved_bytes);
-        let projected = self.tracked_bytes.saturating_add(bytes);
-        if projected <= cap {
-            self.tracked_bytes = projected;
+        if self.can_admit_with_roots(bytes, external_visit)? {
+            self.tracked_bytes = self.tracked_bytes.saturating_add(bytes);
             return Ok(());
         }
         self.oom_flag.store(true, Ordering::Relaxed);
         Err(OutOfMemory::HeapCapExceeded {
             requested_bytes: bytes,
-            heap_limit_bytes: cap,
+            heap_limit_bytes: self.max_heap_bytes,
         })
     }
 
@@ -953,17 +1009,6 @@ impl GcHeap {
         // re-enter the heap during a refused allocation.
         let mut noop = |_visitor: &mut dyn FnMut(*mut RawGc)| {};
         self.account_or_collect_with_roots(bytes, &mut noop)
-    }
-
-    /// Sum of allocated bytes across new + old + LOS. Counts
-    /// post-collect retained-page slack as well as live objects;
-    /// strict liveness arrives with task 86's incremental sweep.
-    fn live_bytes_total(&self) -> u64 {
-        self.sync_lab();
-        let new = self.new_space.allocated_bytes() as u64;
-        let old = self.old_space.allocated_bytes() as u64;
-        let los = self.large_space.allocated_bytes() as u64;
-        new.saturating_add(old).saturating_add(los)
     }
 
     /// Register a [`Traceable`] type so allocations of `T` can be
@@ -1302,7 +1347,8 @@ impl GcHeap {
     /// Whether a refilled buffer may serve plain young cells now: not while
     /// marking (new cells are born black), under GC stress (every
     /// allocation reaches the stress counter) or during bootstrap tenuring.
-    fn lab_allowed(&self) -> bool {
+    #[doc(hidden)]
+    pub fn machine_allocation_allowed(&self) -> bool {
         !self.tenure_all && self.gc_stress_stride == 0 && !self.marking.is_marking()
     }
 
@@ -1344,7 +1390,7 @@ impl GcHeap {
     /// bytes from the nursery. Never collects.
     fn refill_lab(&mut self, aligned: usize) -> LabRefill {
         self.retire_lab();
-        if !self.lab_allowed() {
+        if !self.machine_allocation_allowed() {
             return LabRefill::Declined;
         }
         let Some((page, start, mut limit)) = self.new_space.take_tail(aligned) else {
@@ -1370,6 +1416,67 @@ impl GcHeap {
         self.lab_start = start;
         self.lab = LinearAllocationArea { top: start, limit };
         LabRefill::Ready
+    }
+
+    /// Ensure room for a generated fixed allocation group in the one LAB.
+    ///
+    /// No cell is carved or returned here. Success leaves an initialized
+    /// buffer; generated code reloads its owner and current operands after
+    /// the safepoint, initializes every group cell, then publishes top once.
+    /// Disabled policy or group-size admission returns false without an OOM
+    /// latch. The caller resumes the FIRST original allocation so a smaller
+    /// legal prefix can succeed before the actual source OOM, if any.
+    ///
+    /// # Errors
+    /// Collector/cage failures precede forwarding or leave a completed heap
+    /// operation. Canonical roots remain valid for first-source recovery.
+    #[doc(hidden)]
+    pub fn ensure_machine_allocation_with_roots(
+        &mut self,
+        aligned: usize,
+        external_visit: &mut RootSlotVisitor<'_>,
+    ) -> Result<bool, OutOfMemory> {
+        if aligned == 0
+            || !aligned.is_multiple_of(CELL_SIZE)
+            || aligned > crate::page::PAGE_PAYLOAD_SIZE
+            || !self.machine_allocation_allowed()
+            || self.always_allocate_depth != 0
+        {
+            return Ok(false);
+        }
+        if self.lab.remaining() >= aligned {
+            return Ok(true);
+        }
+        // Publish existing objects and refund only the already-admitted unused
+        // tail. A failed search leaves the nursery cursor at its prior page,
+        // so that same tail remains usable by the first smaller source cell.
+        self.retire_lab();
+        self.maybe_major_gc(external_visit)?;
+        if !self.machine_allocation_allowed() {
+            return Ok(false);
+        }
+        if !self.can_admit_with_roots(aligned as u64, external_visit)? {
+            return Ok(false);
+        }
+        if !self.machine_allocation_allowed() {
+            return Ok(false);
+        }
+        match self.refill_lab(aligned) {
+            LabRefill::Ready => return Ok(true),
+            LabRefill::Declined => return Ok(false),
+            LabRefill::NurseryFull => {}
+        }
+        self.collect_minor_observed(external_visit, GcPauseTrigger::NurseryCapacity)?;
+        if !self.machine_allocation_allowed() {
+            return Ok(false);
+        }
+        if !self.can_admit_with_roots(aligned as u64, external_visit)? {
+            return Ok(false);
+        }
+        if !self.machine_allocation_allowed() {
+            return Ok(false);
+        }
+        Ok(self.refill_lab(aligned) == LabRefill::Ready)
     }
 
     /// Write a young cell carved from the linear allocation buffer at
@@ -1652,11 +1759,12 @@ impl GcHeap {
                 self.gc_stress_counter = 0;
                 if self.gc_stress_full {
                     self.in_major_gc = true;
-                    let collect_result = self.collect_full(&mut allocation_roots);
+                    let collect_result =
+                        self.collect_full_observed(&mut allocation_roots, GcPauseTrigger::Stress);
                     self.in_major_gc = false;
                     collect_result?;
                 } else {
-                    self.collect_minor_internal(&mut allocation_roots)?;
+                    self.collect_minor_observed(&mut allocation_roots, GcPauseTrigger::Stress)?;
                 }
             }
         }
@@ -1672,7 +1780,10 @@ impl GcHeap {
         if young {
             let mut refill = self.refill_lab(aligned);
             if refill == LabRefill::NurseryFull && self.always_allocate_depth == 0 {
-                self.collect_minor_internal(&mut allocation_roots)?;
+                self.collect_minor_observed(
+                    &mut allocation_roots,
+                    GcPauseTrigger::NurseryCapacity,
+                )?;
                 scavenged = true;
                 refill = self.refill_lab(aligned);
             }
@@ -1713,7 +1824,10 @@ impl GcHeap {
                     // Trigger scavenge with caller-supplied
                     // external roots; handle stack + globals are
                     // walked internally.
-                    self.collect_minor_internal(&mut allocation_roots)?;
+                    self.collect_minor_observed(
+                        &mut allocation_roots,
+                        GcPauseTrigger::NurseryCapacity,
+                    )?;
                     match self.new_space.alloc(aligned) {
                         Some(off) => off,
                         // Young-gen deadlock: the live survivor set fills
@@ -1882,7 +1996,15 @@ impl GcHeap {
         let out = self.alloc_old_with_roots_inner(value, false, extra_bytes, &mut empty, |_| {})?;
         if self.max_heap_bytes != 0 {
             self.drain_shared_external_releases();
-            self.tracked_bytes = self.live_bytes_total().saturating_add(self.reserved_bytes);
+            let aligned = align_up(
+                std::mem::size_of::<GcHeader>() + std::mem::size_of::<T>() + extra_bytes,
+                CELL_SIZE,
+            );
+            // This allocator bypassed charged admission, not LAB ownership.
+            // Book only its completed physical cell: replacing the ledger with
+            // live page bytes would omit the still-charged unused LAB tail and
+            // let effective tracking refund that tail a second time.
+            self.tracked_bytes = self.tracked_bytes.saturating_add(aligned as u64);
             self.oom_flag.store(true, Ordering::Relaxed);
         }
         Ok(out)
@@ -2054,6 +2176,66 @@ impl GcHeap {
         }
     }
 
+    /// Begin a bounded collection-service capture at a quiescent heap boundary.
+    /// Storage is reserved now; collection never allocates observation records.
+    pub fn start_gc_pause_capture(&mut self, capacity: usize) -> Result<(), GcPauseCaptureError> {
+        if self.marking.is_marking() && !self.pause_recorder.is_capturing() {
+            return Err(GcPauseCaptureError::CollectionInProgress);
+        }
+        self.pause_recorder.start(capacity)
+    }
+
+    /// Stop capture and move out owned scalar records, including overflow and
+    /// incomplete/unsupported split-phase metadata. No heap walk is performed.
+    pub fn take_gc_pause_capture(&mut self) -> Result<GcPauseCapture, GcPauseCaptureError> {
+        self.pause_recorder.take()
+    }
+
+    fn with_gc_pause<R>(
+        &mut self,
+        kind: GcPauseKind,
+        trigger: GcPauseTrigger,
+        work: impl FnOnce(&mut Self) -> (R, GcPauseOutcome),
+    ) -> R {
+        let token = self.pause_recorder.begin(
+            kind,
+            trigger,
+            self.gc_stats.gc_cycles,
+            self.gc_stats.minor_gc_cycles,
+        );
+        let (result, outcome) = work(self);
+        self.pause_recorder.end(
+            token,
+            outcome,
+            self.gc_stats.gc_cycles,
+            self.gc_stats.minor_gc_cycles,
+        );
+        result
+    }
+
+    fn with_gc_pause_result<R>(
+        &mut self,
+        kind: GcPauseKind,
+        trigger: GcPauseTrigger,
+        work: impl FnOnce(&mut Self) -> Result<R, OutOfMemory>,
+    ) -> Result<R, OutOfMemory> {
+        self.with_gc_pause(kind, trigger, |heap| {
+            let full_before = heap.gc_stats.gc_cycles;
+            let result = work(heap);
+            let outcome = if result.is_ok() {
+                GcPauseOutcome::Completed
+            } else if trigger == GcPauseTrigger::HeapCap
+                && heap.gc_stats.gc_cycles > full_before
+                && matches!(result, Err(OutOfMemory::HeapCapExceeded { .. }))
+            {
+                GcPauseOutcome::CompletedAllocationRefused
+            } else {
+                GcPauseOutcome::CollectionFailed
+            };
+            (result, outcome)
+        })
+    }
+
     /// Run a minor GC (Cheney scavenge).
     pub fn collect_minor(&mut self, _roots: EmptyRoots) -> Result<(), OutOfMemory> {
         let empty: fn(&mut dyn FnMut(*mut RawGc)) = |_| {};
@@ -2080,6 +2262,23 @@ impl GcHeap {
     }
 
     fn collect_minor_internal(
+        &mut self,
+        external_visit: &mut RootSlotVisitor<'_>,
+    ) -> Result<(), OutOfMemory> {
+        self.collect_minor_observed(external_visit, GcPauseTrigger::Explicit)
+    }
+
+    fn collect_minor_observed(
+        &mut self,
+        external_visit: &mut RootSlotVisitor<'_>,
+        trigger: GcPauseTrigger,
+    ) -> Result<(), OutOfMemory> {
+        self.with_gc_pause_result(GcPauseKind::Minor, trigger, |heap| {
+            heap.collect_minor_work(external_visit)
+        })
+    }
+
+    fn collect_minor_work(
         &mut self,
         external_visit: &mut RootSlotVisitor<'_>,
     ) -> Result<(), OutOfMemory> {
@@ -2130,6 +2329,15 @@ impl GcHeap {
         self.ephemerons.retain_non_null();
         self.weak_finalization.retain_non_null();
         self.weak_cleanup_due |= self.weak_finalization.has_finalization_registries();
+        if self.max_heap_bytes != 0 {
+            // Successful evacuation preserves copied/promoted bytes; only
+            // doomed physical nursery cells disappear. Failed preflight never
+            // reaches this commit. Payload token drops are drained separately.
+            self.tracked_bytes = self
+                .tracked_bytes
+                .saturating_sub(stats.reclaimed_bytes as u64);
+            self.drain_shared_external_releases();
+        }
         self.stats.last_scavenge = stats;
         self.gc_stats.record_minor(&stats);
         // Per-tag counters drift between scavenges (young
@@ -2150,6 +2358,25 @@ impl GcHeap {
         &mut self,
         external_visit: &mut RootSlotVisitor<'_>,
     ) -> Result<(), OutOfMemory> {
+        self.collect_full_observed(external_visit, GcPauseTrigger::Explicit)
+    }
+
+    /// Collect with exact trigger provenance supplied by the owning runtime.
+    /// This preserves the same collector and canonical root visitors.
+    pub fn collect_full_observed(
+        &mut self,
+        external_visit: &mut RootSlotVisitor<'_>,
+        trigger: GcPauseTrigger,
+    ) -> Result<(), OutOfMemory> {
+        self.with_gc_pause_result(GcPauseKind::Full, trigger, |heap| {
+            heap.collect_full_work(external_visit)
+        })
+    }
+
+    fn collect_full_work(
+        &mut self,
+        external_visit: &mut RootSlotVisitor<'_>,
+    ) -> Result<(), OutOfMemory> {
         let pause_start = Instant::now();
         self.mark_phase(external_visit)?;
         self.run_post_mark_processing();
@@ -2166,6 +2393,13 @@ impl GcHeap {
     /// Run the installed weak-semantics pass after [`Self::mark_phase`] and
     /// before [`Self::sweep_phase`]. [`Self::collect_full`] calls it itself.
     pub fn run_post_mark_processing(&mut self) {
+        self.with_gc_pause(GcPauseKind::SplitWeak, GcPauseTrigger::Explicit, |heap| {
+            heap.run_post_mark_processing_work();
+            ((), GcPauseOutcome::Completed)
+        });
+    }
+
+    fn run_post_mark_processing_work(&mut self) {
         if let Some(processor) = self.post_mark {
             processor(self);
         }
@@ -2223,6 +2457,18 @@ impl GcHeap {
         if self.always_allocate_depth != 0 || !self.major_gc_due() {
             return Ok(());
         }
+        self.with_gc_pause_result(GcPauseKind::Full, GcPauseTrigger::GrowthBudget, |heap| {
+            heap.collect_major_work(external_visit)
+        })
+    }
+
+    fn collect_major_work(
+        &mut self,
+        external_visit: &mut RootSlotVisitor<'_>,
+    ) -> Result<(), OutOfMemory> {
+        if self.always_allocate_depth != 0 || !self.major_gc_due() {
+            return Ok(());
+        }
         let occupancy = self.major_gc_occupancy_bytes();
         self.in_major_gc = true;
         let collect_result = self.collect_full(external_visit);
@@ -2234,11 +2480,8 @@ impl GcHeap {
             .saturating_add(self.large_space.page_count() as u64)
             .saturating_mul(crate::page::PAGE_SIZE as u64);
         let cage_hardcap = (cage_size() as u64) / 256 * MAJOR_GC_CAGE_SOFTCAP_NUM;
-        // Payload tokens dropped by the sweep report through the shared
-        // release channel; reconcile them so the surviving reservation set
-        // — not the pre-GC one — sizes the next budget, and so a capped
-        // heap's tracked total no longer counts the dead slots.
-        self.drain_shared_external_releases();
+        // The completed sweep has already reconciled released backing stores
+        // and the cap ledger. Use only the surviving reservation set here.
         let live_reserved = self.reserved_bytes;
         let live_total = live_pages.saturating_add(live_reserved);
         // Adaptive growth. A collection that reclaims little means the heap is
@@ -2272,9 +2515,6 @@ impl GcHeap {
         self.next_major_gc_bytes = target
             .max(MAJOR_GC_FLOOR_BYTES)
             .min(cage_hardcap.saturating_add(live_reserved));
-        if self.max_heap_bytes != 0 {
-            self.tracked_bytes = self.live_bytes_total().saturating_add(self.reserved_bytes);
-        }
         Ok(())
     }
 
@@ -2326,6 +2566,15 @@ impl GcHeap {
         &mut self,
         external_visit: &mut RootSlotVisitor<'_>,
     ) -> Result<(), OutOfMemory> {
+        self.with_gc_pause_result(GcPauseKind::SplitMark, GcPauseTrigger::Explicit, |heap| {
+            heap.mark_phase_work(external_visit)
+        })
+    }
+
+    fn mark_phase_work(
+        &mut self,
+        external_visit: &mut RootSlotVisitor<'_>,
+    ) -> Result<(), OutOfMemory> {
         self.start_incremental_mark_phase(external_visit)?;
         // SAFETY: STW pause; all pushed headers alive.
         unsafe {
@@ -2360,6 +2609,15 @@ impl GcHeap {
     /// new-object policy so the mutator can run between mark steps without
     /// losing a freshly published edge.
     pub fn start_incremental_mark_phase(
+        &mut self,
+        external_visit: &mut RootSlotVisitor<'_>,
+    ) -> Result<(), OutOfMemory> {
+        self.with_gc_pause_result(GcPauseKind::SplitMark, GcPauseTrigger::Explicit, |heap| {
+            heap.start_incremental_mark_phase_work(external_visit)
+        })
+    }
+
+    fn start_incremental_mark_phase_work(
         &mut self,
         external_visit: &mut RootSlotVisitor<'_>,
     ) -> Result<(), OutOfMemory> {
@@ -2409,6 +2667,18 @@ impl GcHeap {
         if !self.marking.is_marking() {
             return 0;
         }
+        self.with_gc_pause(GcPauseKind::SplitStep, GcPauseTrigger::Explicit, |heap| {
+            (
+                heap.incremental_mark_step_work(budget),
+                GcPauseOutcome::Completed,
+            )
+        })
+    }
+
+    fn incremental_mark_step_work(&mut self, budget: usize) -> usize {
+        if !self.marking.is_marking() {
+            return 0;
+        }
         self.prepare_collection_observations();
         // SAFETY: every header on the worklist was pushed while
         // alive. New old-gen allocations during the cycle are
@@ -2427,6 +2697,13 @@ impl GcHeap {
     /// [`Self::sweep_phase`]), every reachable old-gen object is
     /// black, and the worklist is empty.
     pub fn finish_incremental_mark_phase(&mut self, external_visit: &mut RootSlotVisitor<'_>) {
+        self.with_gc_pause(GcPauseKind::SplitMark, GcPauseTrigger::Explicit, |heap| {
+            heap.finish_incremental_mark_phase_work(external_visit);
+            ((), GcPauseOutcome::Completed)
+        });
+    }
+
+    fn finish_incremental_mark_phase_work(&mut self, external_visit: &mut RootSlotVisitor<'_>) {
         self.prepare_collection_observations();
         // Re-shade roots — the mutator may have rewritten handles
         // or globals between mark steps. The barrier covered every
@@ -2469,6 +2746,15 @@ impl GcHeap {
     /// discovered.
     #[doc(hidden)]
     pub fn mark_additional(&mut self, additions: impl IntoIterator<Item = RawGc>) -> bool {
+        self.with_gc_pause(GcPauseKind::SplitMark, GcPauseTrigger::Explicit, |heap| {
+            (
+                heap.mark_additional_work(additions),
+                GcPauseOutcome::Completed,
+            )
+        })
+    }
+
+    fn mark_additional_work(&mut self, additions: impl IntoIterator<Item = RawGc>) -> bool {
         let mut discovered = false;
         for raw in additions {
             if raw.is_null() || self.is_marked(raw) {
@@ -2539,7 +2825,10 @@ impl GcHeap {
 
     /// Finish a full-GC cycle by sweeping everything left white.
     pub fn sweep_phase(&mut self) {
-        self.sweep_phase_with_pause_start(Instant::now());
+        self.with_gc_pause(GcPauseKind::SplitSweep, GcPauseTrigger::Explicit, |heap| {
+            heap.sweep_phase_with_pause_start(Instant::now());
+            ((), GcPauseOutcome::Completed)
+        });
     }
 
     fn sweep_phase_with_pause_start(&mut self, pause_start: Instant) {
@@ -2563,6 +2852,10 @@ impl GcHeap {
         // stays bounded by the existing sweep work.
         // SAFETY: STW pause.
         let mut reclaimed = 0usize;
+        // Physical retained bytes are accumulated in the sweep's existing
+        // page loops; no second object census is needed for cap accounting.
+        let track_cap = self.max_heap_bytes != 0;
+        let mut retained_bytes = 0u64;
         let mut per_tag_live_count = [0u64; TYPE_TAG_COUNT];
         let mut per_tag_live_bytes = [0usize; TYPE_TAG_COUNT];
         // Free ranges recovered from partially-live old pages this sweep
@@ -2661,6 +2954,9 @@ impl GcHeap {
                     close_run(&mut run_start, &mut run_bytes);
                 }
                 header.allocated_bytes = live_allocated;
+                if track_cap {
+                    retained_bytes = retained_bytes.saturating_add(live_allocated as u64);
+                }
             }
             for page in self.large_space.pages() {
                 page.for_each_object(|h, _| {
@@ -2689,6 +2985,10 @@ impl GcHeap {
                         per_tag_live_bytes[tag] = per_tag_live_bytes[tag].wrapping_add(size);
                     }
                 });
+                if track_cap && page.header().live_bytes != 0 {
+                    retained_bytes =
+                        retained_bytes.saturating_add(page.header().allocated_bytes as u64);
+                }
             }
             // Young from-space is recycled at next scavenge but
             // any survivor still in to-space (after the
@@ -2696,6 +2996,12 @@ impl GcHeap {
             // After the flip, those survivors live in
             // `from_pages()` of the new orientation.
             for page in self.new_space.from_pages() {
+                // These physical survivor cells remain in the nursery until
+                // the next scavenge, regardless of per-type mark statistics.
+                if track_cap {
+                    retained_bytes =
+                        retained_bytes.saturating_add(page.header().allocated_bytes as u64);
+                }
                 page.for_each_object(|h, _| {
                     if (*h).is_marked() {
                         let tag = (*h).type_tag() as usize;
@@ -2738,6 +3044,12 @@ impl GcHeap {
         }
 
         self.marking.finish_cycle();
+        // All dead-cell and backing-store finalizers have completed. This is
+        // the sole ledger commit shared by full, split and incremental sweep.
+        self.drain_shared_external_releases();
+        if self.max_heap_bytes != 0 {
+            self.tracked_bytes = retained_bytes.saturating_add(self.reserved_bytes);
+        }
         self.stats.last_full_reclaimed = reclaimed;
         self.stats.total_full_reclaimed = self.stats.total_full_reclaimed.saturating_add(reclaimed);
         self.gc_stats.last_gc_reclaimed_bytes = reclaimed;
@@ -3112,6 +3424,10 @@ fn raw_is_marked(raw: RawGc) -> bool {
 }
 
 #[cfg(test)]
+#[path = "heap/allocation_group_tests.rs"]
+mod allocation_group_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::test_support::OpaqueLeaf;
@@ -3162,3 +3478,12 @@ mod tests {
         heap.read_payload(handle, |body| assert_eq!(body.payload, 7));
     }
 }
+
+#[cfg(test)]
+mod reservation_tests;
+
+#[cfg(test)]
+mod cap_admission_tests;
+
+#[cfg(test)]
+mod collection_accounting_tests;

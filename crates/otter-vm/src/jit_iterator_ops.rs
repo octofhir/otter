@@ -19,7 +19,7 @@
 //! # See also
 //! - [`crate::Interpreter::get_iterator_full`]
 //! - [`crate::Interpreter::iterator_next_full`]
-//! - [`crate::Interpreter::iterator_close_value_sync`]
+//! - [`crate::Interpreter::iterator_close_op`]
 
 use otter_bytecode::Op;
 
@@ -81,14 +81,14 @@ impl Interpreter {
             value if value == Op::IteratorClose as u8 => {
                 let iterator = *read_register(&stack[frame_index], arg0 as u16)
                     .map_err(CommittedValueError::Fatal)?;
-                self.iterator_close_value_sync(stack, Some(context), iterator)?;
+                self.iterator_close_op(context, stack, frame_index, iterator, false)?;
                 stack[frame_index].pc = saved_pc;
                 Ok(())
             }
             value if value == Op::IteratorCloseThrow as u8 => {
                 let iterator = *read_register(&stack[frame_index], arg0 as u16)
                     .map_err(CommittedValueError::Fatal)?;
-                self.iterator_close_for_throw(stack, Some(context), iterator)?;
+                self.iterator_close_op(context, stack, frame_index, iterator, true)?;
                 stack[frame_index].pc = saved_pc;
                 Ok(())
             }

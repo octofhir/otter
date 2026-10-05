@@ -125,11 +125,12 @@ pub(crate) fn generate(out: &Path) -> Result<(), Box<dyn std::error::Error>> {
         println!("cargo:rerun-if-changed={}", source.path);
     }
     let text = assemble(SOURCES, MAX_SOURCE_BYTES)?;
-    let compiled = otter_compiler::compile_script_source_to_module(
+    let mut compiled = otter_compiler::compile_script_source_to_module(
         &text,
         otter_syntax::SourceKind::JavaScript,
         SPECIFIER,
     )?;
+    compiled.bytecode.mark_primordial_iteration();
     let encoded =
         otter_bytecode::binary::encode_module_bounded(&compiled.bytecode, MAX_BYTECODE_BYTES)?;
     otter_bytecode::binary::decode_module(&encoded)?;

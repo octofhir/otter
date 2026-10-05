@@ -133,7 +133,7 @@ otter_macros::couch! {
 /// receiver unchanged so any iterator value is itself iterable.
 ///
 /// <https://tc39.es/ecma262/#sec-iteratorprototype-%symbol.iterator%>
-fn iterator_proto_symbol_iterator(
+pub(crate) fn iterator_proto_symbol_iterator(
     ctx: &mut crate::NativeCtx<'_>,
     _args: &[Value],
 ) -> Result<Value, crate::NativeError> {
@@ -1807,7 +1807,7 @@ fn require_iterator_helper(
     })
 }
 
-fn iterator_helper_proto_next(
+pub(crate) fn iterator_helper_proto_next(
     ctx: &mut crate::NativeCtx<'_>,
     args: &[Value],
 ) -> Result<Value, crate::NativeError> {
@@ -1815,7 +1815,7 @@ fn iterator_helper_proto_next(
     iterator_proto_next(ctx, args)
 }
 
-fn iterator_helper_proto_return(
+pub(crate) fn iterator_helper_proto_return(
     ctx: &mut crate::NativeCtx<'_>,
     args: &[Value],
 ) -> Result<Value, crate::NativeError> {
@@ -1829,7 +1829,7 @@ fn iterator_helper_proto_return(
 /// particular, no "result is an Object" validation. A wrap that
 /// `Iterator.from` built over a bare `{ next }` object therefore surfaces
 /// whatever that `next` returns, including a non-object.
-fn wrap_for_valid_iterator_next(
+pub(crate) fn wrap_for_valid_iterator_next(
     ctx: &mut crate::NativeCtx<'_>,
     args: &[Value],
 ) -> Result<Value, crate::NativeError> {
@@ -1898,7 +1898,7 @@ fn wrap_for_valid_iterator_next(
 /// Unlike the generic `%IteratorPrototype%.next` helper, this own
 /// method requires the receiver to carry RegExp String Iterator
 /// internal state.
-fn regexp_string_iterator_proto_next(
+pub(crate) fn regexp_string_iterator_proto_next(
     ctx: &mut crate::NativeCtx<'_>,
     _args: &[Value],
 ) -> Result<Value, crate::NativeError> {
@@ -1944,7 +1944,7 @@ fn regexp_string_iterator_proto_next(
 ///
 /// # See also
 /// - <https://tc39.es/ecma262/#sec-%25iteratorprototype%25.return>
-fn iterator_proto_return(
+pub(crate) fn iterator_proto_return(
     ctx: &mut crate::NativeCtx<'_>,
     _args: &[Value],
 ) -> Result<Value, crate::NativeError> {
@@ -2019,7 +2019,7 @@ fn iterator_proto_return(
                     reason: "missing execution context".to_string(),
                 })?;
         let close = ctx.with_turn_parts(|interp, stack| {
-            interp.iterator_close_value_sync(stack, Some(&exec_ctx), iter_value)
+            interp.close_iterator_state(stack, Some(&exec_ctx), iter_value)
         });
         close.map_err(|e| e.into_native(ctx.cx.interp, "Iterator.prototype.return"))?;
     }

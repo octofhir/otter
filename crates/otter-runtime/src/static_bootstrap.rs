@@ -52,7 +52,8 @@ pub(crate) fn prepare(
             jsx: None,
             text,
         };
-        let compiled = hook.compile(RuntimeCompileRequest { source: &source })?;
+        let mut compiled = hook.compile(RuntimeCompileRequest { source: &source })?;
+        compiled.bytecode.mark_primordial_iteration();
         let sources =
             script_source::script_sources(&compiled.bytecode, source.text, specifier, &account)?;
         let context = interp.link_module(compiled.bytecode, sources)?;

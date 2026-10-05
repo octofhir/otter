@@ -206,9 +206,10 @@ impl<'a> RuntimeRealmContext<'a> {
                 jsx: None,
                 text: text.clone(),
             };
-            let bytecode = hook
+            let mut bytecode = hook
                 .compile(crate::RuntimeCompileRequest { source: &resolved })?
                 .bytecode;
+            bytecode.mark_primordial_iteration();
             let sources = crate::script_source::script_sources(
                 &bytecode,
                 text,
@@ -233,12 +234,13 @@ impl<'a> RuntimeRealmContext<'a> {
                 )?;
                 self.interp.link_verified_module(bytecode, sources)?
             } else {
-                let compiled = otter_compiler::compile_script_source_to_module(
+                let mut compiled = otter_compiler::compile_script_source_to_module(
                     text.as_ref(),
                     source.kind,
                     "<realm-installer>",
                 )
                 .map_err(|error| crate::map_compile_error(error, "<realm-installer>"))?;
+                compiled.bytecode.mark_primordial_iteration();
                 if let (Some(cache), Some(key)) = (&cache, &key) {
                     cache.store(key, &compiled.bytecode);
                 }

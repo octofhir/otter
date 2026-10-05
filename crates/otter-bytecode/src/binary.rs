@@ -503,6 +503,7 @@ impl Writer {
             function.needs_arguments,
             function.uses_arguments_callee,
             function.contains_direct_eval,
+            function.primordial_iteration,
         ] {
             self.bool(flag);
         }
@@ -831,6 +832,7 @@ impl<'a> Reader<'a> {
         let needs_arguments = self.bool()?;
         let uses_arguments_callee = self.bool()?;
         let contains_direct_eval = self.bool()?;
+        let primordial_iteration = self.bool()?;
         let arguments_object_kind = match self.u8()? {
             0 => ArgumentsObjectKind::Unmapped,
             1 => ArgumentsObjectKind::Mapped,
@@ -877,6 +879,7 @@ impl<'a> Reader<'a> {
             mapped_argument_bindings,
             module_url,
             contains_direct_eval,
+            primordial_iteration,
             source_text_range,
             source_text_span,
             code,
@@ -1090,6 +1093,7 @@ mod tests {
                 }],
                 module_url: "file:///entry.ts".to_string(),
                 contains_direct_eval: true,
+                primordial_iteration: false,
                 source_text_range: Some((0, 18)),
                 source_text_span: Some((0, 18)),
                 code: code.finish(),

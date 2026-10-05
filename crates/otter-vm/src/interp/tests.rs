@@ -73,6 +73,7 @@ fn test_function(
         source_text_span: None,
         module_url: String::new(),
         contains_direct_eval: false,
+        primordial_iteration: false,
         code: code.into(),
         spans,
         handlers: Vec::new(),
@@ -1189,11 +1190,9 @@ fn get_iterator_user_resume_uses_old_iterator_state_allocation_with_frame_roots(
     let operands = vec![Operand::Register(1), Operand::Register(0)];
 
     let before = interp.gc_heap_mut().stats().old_allocated_bytes;
-    assert!(
-        interp
-            .drive_get_iterator(&mut stack, &context, operands.as_slice())
-            .unwrap()
-    );
+    interp
+        .drive_get_iterator(&mut stack, &context, operands.as_slice())
+        .unwrap();
     let after = interp.gc_heap_mut().stats().old_allocated_bytes;
 
     assert!(
@@ -5418,6 +5417,7 @@ fn unwind_throw_pops_frames_until_handler_or_uncaught() {
         source_text_span: None,
         module_url: String::new(),
         contains_direct_eval: false,
+        primordial_iteration: false,
         code: vec![Instruction {
             pc: 0,
             op: Op::ReturnUndefined,
@@ -5497,6 +5497,7 @@ fn unwind_throw_lands_in_catch_handler() {
         source_text_span: None,
         module_url: String::new(),
         contains_direct_eval: false,
+        primordial_iteration: false,
         code: vec![Instruction {
             pc: 0,
             op: Op::ReturnUndefined,
@@ -6124,6 +6125,7 @@ fn arrow_closure_overrides_call_site_this() {
         source_text_span: None,
         module_url: String::new(),
         contains_direct_eval: false,
+        primordial_iteration: false,
         code: vec![Instruction {
             pc: 0,
             op: Op::ReturnUndefined,
@@ -6164,6 +6166,7 @@ fn arrow_closure_overrides_call_site_this() {
         source_text_span: None,
         module_url: String::new(),
         contains_direct_eval: false,
+        primordial_iteration: false,
         code: vec![
             Instruction {
                 pc: 0,

@@ -700,6 +700,7 @@ mod tests {
                     source_text_span: None,
                     module_url: String::new(),
                     contains_direct_eval: false,
+                    primordial_iteration: false,
                     code: vec![Instruction {
                         pc: 0,
                         op: Op::ReturnUndefined,
@@ -755,6 +756,7 @@ mod tests {
                 source_text_span: None,
                 module_url: String::new(),
                 contains_direct_eval: false,
+                primordial_iteration: false,
                 code: vec![Instruction {
                     pc: 0,
                     op: Op::ReturnUndefined,

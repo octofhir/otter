@@ -85,6 +85,7 @@ impl CodeBlock {
             module_url,
             scopes,
             contains_direct_eval: self.contains_direct_eval,
+            primordial_iteration: self.primordial_iteration,
             code,
             overflow_operand_words,
             bytecode_byte_len: self.bytecode_byte_len,

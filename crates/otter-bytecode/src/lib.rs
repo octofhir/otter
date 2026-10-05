@@ -2046,6 +2046,13 @@ pub struct Function {
     /// not from this flag.
     #[serde(default)]
     pub contains_direct_eval: bool,
+    /// `true` for runtime-internal code (the realm installers and the
+    /// embedded Node library): like Node's primordials, it iterates built-in
+    /// collections and iterators with their intrinsic algorithms even after
+    /// user code replaces `@@iterator`, `next` or `return` on the realm's
+    /// prototypes. Only an embedder sets it; compiled user code never does.
+    #[serde(default)]
+    pub primordial_iteration: bool,
     /// Byte range into [`BytecodeModule::function_source`] for the
     /// function / class definition (§20.2.3.5 [[SourceText]]). Validated
     /// at compile time by slicing the source over `source_text_span` (or
@@ -2564,6 +2571,14 @@ pub struct ModuleInit {
 }
 
 impl BytecodeModule {
+    /// Mark every function runtime-internal code that iterates with
+    /// intrinsic algorithms (see [`Function::primordial_iteration`]).
+    pub fn mark_primordial_iteration(&mut self) {
+        for function in &mut self.functions {
+            function.primordial_iteration = true;
+        }
+    }
+
     /// Convenience accessor for `<main>`.
     #[must_use]
     pub fn main(&self) -> &Function {

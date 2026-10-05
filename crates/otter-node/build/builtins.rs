@@ -148,6 +148,7 @@ fn emit_builtin(src: &Path, dir: &Path, builtin: &Builtin) -> Result<(), BuildEr
         false,
     )?;
     module.module = builtin.url.to_owned();
+    module.mark_primordial_iteration();
     for function in &mut module.functions {
         function.module_url = builtin.url.to_owned();
     }
@@ -163,11 +164,12 @@ fn emit_installer(src: &Path, out: &Path) -> Result<(), BuildError> {
         .iter()
         .map(|path| read(src, path))
         .collect::<Result<String, _>>()?;
-    let compiled = otter_compiler::compile_script_source_to_module(
+    let mut compiled = otter_compiler::compile_script_source_to_module(
         &text,
         otter_syntax::SourceKind::JavaScript,
         INSTALLER_SPECIFIER,
     )?;
+    compiled.bytecode.mark_primordial_iteration();
     let encoded =
         otter_bytecode::binary::encode_module_bounded(&compiled.bytecode, MAX_BYTECODE_BYTES)?;
     otter_bytecode::binary::decode_module(&encoded)?;

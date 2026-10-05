@@ -651,6 +651,7 @@ impl CodeBlock {
             module_url: Box::<str>::from(""),
             scopes: Box::new([]),
             contains_direct_eval: false,
+            primordial_iteration: false,
             code: code.into_boxed_slice(),
             overflow_operand_words: overflow_operand_words.into_boxed_slice(),
             bytecode_byte_len,
@@ -1173,6 +1174,9 @@ pub struct CodeBlock {
     /// `true` when this function's own code contains a direct eval call
     /// site, so its activation stays materialized.
     pub(crate) contains_direct_eval: bool,
+    /// Runtime-internal code iterating with intrinsic algorithms
+    /// (see [`otter_bytecode::Function::primordial_iteration`]).
+    pub(crate) primordial_iteration: bool,
     /// Sole hot instruction stream indexed directly by the frame's canonical PC.
     pub code: Box<[CodeBlockInstruction]>,
     /// Operand words for uncommon instructions wider than four operands.
@@ -1417,6 +1421,7 @@ impl CodeBlock {
             module_url,
             scopes,
             contains_direct_eval: function.contains_direct_eval,
+            primordial_iteration: function.primordial_iteration,
             code,
             overflow_operand_words: overflow_operand_words.into_boxed_slice(),
             bytecode_byte_len: code_byte_len,

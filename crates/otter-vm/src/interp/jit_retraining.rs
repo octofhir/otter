@@ -47,8 +47,30 @@ impl Interpreter {
                 )
             })
             .unwrap_or(1);
-        self.invalidate_jit_function(fid);
+        // Only optimized code embeds the failed speculation: drop it and the
+        // optimized callers that spliced it. The baseline generation stays
+        // installed while the stable cell routes entries to the interpreter.
+        let mut affected = self
+            .jit_code_registry
+            .invalidate_optimizing_for_retraining(fid);
+        self.jit_runtime_stats.caller_invalidations = self
+            .jit_runtime_stats
+            .caller_invalidations
+            .saturating_add(affected.iter().filter(|&&caller| caller != fid).count() as u64);
+        if affected.binary_search(&fid).is_err() {
+            affected.push(fid);
+            affected.sort_unstable();
+        }
+        self.jit_code_registry.set_retraining(fid, true);
+        self.discard_invalidated_jit_state(&affected);
         self.optimizing_tier_policy.begin_retraining(fid, work);
+    }
+
+    /// Restore `fid`'s stable cell once its retraining evidence completes.
+    fn finish_jit_retraining_if_complete(&mut self, fid: u32) {
+        if !self.jit_retraining_blocks(fid) {
+            self.jit_code_registry.set_retraining(fid, false);
+        }
     }
 
     pub(crate) fn jit_retraining_blocks(&self, fid: u32) -> bool {
@@ -85,6 +107,7 @@ impl Interpreter {
         }
         self.optimizing_tier_policy
             .note_interpreted_work(fid, generation);
+        self.finish_jit_retraining_if_complete(fid);
     }
 
     pub(crate) fn note_interpreted_retraining_backedge(&mut self, frame: &mut Frame) {
@@ -103,6 +126,7 @@ impl Interpreter {
         {
             self.optimizing_tier_policy
                 .note_completed_interpreted_path(fid, generation);
+            self.finish_jit_retraining_if_complete(fid);
         }
     }
 
@@ -115,6 +139,7 @@ impl Interpreter {
         {
             self.optimizing_tier_policy
                 .note_completed_interpreted_path(frame.function_id, token.generation);
+            self.finish_jit_retraining_if_complete(frame.function_id);
         }
     }
 }

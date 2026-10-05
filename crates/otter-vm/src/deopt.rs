@@ -622,45 +622,173 @@ fn verify_slot(
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct DeoptExitId(pub u32);
 
+/// One retained frame-state value: location kind and representation in
+/// `tag`, the stack offset, literal-pool index or virtual-object id in
+/// `payload`. A table keeps eight bytes per reconstructed value, as a V8
+/// translation array keeps a compact operand stream; recipes are unpacked
+/// only on the cold exit that uses them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct PackedDeoptSlot {
+    tag: u32,
+    payload: u32,
+}
+
+impl PackedDeoptSlot {
+    const STACK: u32 = 0;
+    const LITERAL: u32 = 1;
+    const VIRTUAL: u32 = 2;
+
+    fn pack(slot: &DeoptSlot, literals: &mut LiteralPool) -> Self {
+        let (kind, payload) = match slot.location {
+            DeoptLocation::StackSlot(offset) => (Self::STACK, offset as u32),
+            DeoptLocation::Literal(bits) => (Self::LITERAL, literals.intern(bits)),
+            DeoptLocation::VirtualObject(VirtualObjectId(id)) => (Self::VIRTUAL, id),
+        };
+        let repr = match slot.repr {
+            DeoptRepr::Tagged => 0,
+            DeoptRepr::Int32 => 1,
+            DeoptRepr::Boolean => 2,
+            DeoptRepr::Uint32 => 3,
+            DeoptRepr::Float64 => 4,
+        };
+        Self {
+            tag: kind | (repr << 2),
+            payload,
+        }
+    }
+
+    fn unpack(self, literals: &[u64]) -> DeoptSlot {
+        let location = match self.tag & 3 {
+            Self::STACK => DeoptLocation::StackSlot(self.payload as i32),
+            Self::LITERAL => DeoptLocation::Literal(literals[self.payload as usize]),
+            _ => DeoptLocation::VirtualObject(VirtualObjectId(self.payload)),
+        };
+        let repr = match self.tag >> 2 {
+            0 => DeoptRepr::Tagged,
+            1 => DeoptRepr::Int32,
+            2 => DeoptRepr::Boolean,
+            3 => DeoptRepr::Uint32,
+            _ => DeoptRepr::Float64,
+        };
+        DeoptSlot { location, repr }
+    }
+}
+
+/// Deduplicated literal bits shared by every state of one table.
+#[derive(Default)]
+struct LiteralPool {
+    bits: Vec<u64>,
+    index: rustc_hash::FxHashMap<u64, u32>,
+}
+
+impl LiteralPool {
+    fn intern(&mut self, bits: u64) -> u32 {
+        *self.index.entry(bits).or_insert_with(|| {
+            self.bits.push(bits);
+            u32::try_from(self.bits.len() - 1).expect("deopt literal pool fits u32")
+        })
+    }
+}
+
+impl<A> FrameState<A> {
+    /// The same recipe with every slot mapped through `f`.
+    fn map_slots<B>(&self, mut f: impl FnMut(&A) -> B) -> FrameState<B> {
+        FrameState {
+            frames: self
+                .frames
+                .iter()
+                .map(|frame| DeoptFrame {
+                    function_id: frame.function_id,
+                    byte_pc: frame.byte_pc,
+                    entry: frame.entry.as_ref().map(|entry| DeoptFrameEntry {
+                        return_register: entry.return_register,
+                        this: f(&entry.this),
+                        closure: f(&entry.closure),
+                        new_target: f(&entry.new_target),
+                    }),
+                    register_count: frame.register_count,
+                    slots: frame
+                        .slots
+                        .iter()
+                        .map(|(register, slot)| (*register, f(slot)))
+                        .collect(),
+                })
+                .collect(),
+            virtual_objects: self
+                .virtual_objects
+                .iter()
+                .map(|object| VirtualObject {
+                    id: object.id,
+                    kind: object.kind,
+                    fields: object.fields.iter().map(&mut f).collect(),
+                })
+                .collect(),
+        }
+    }
+}
+
 /// Per-compiled-function deopt table, indexed by logical [`FrameStateId`].
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DeoptTable {
-    entries: Vec<Option<FrameState>>,
+    entries: Vec<Option<FrameState<PackedDeoptSlot>>>,
+    /// Literal bits every packed literal slot indexes.
+    literals: Box<[u64]>,
 }
 
 impl DeoptTable {
     /// Build a table from dense logical frame states; each id is its index.
     #[must_use]
     pub fn from_states(states: Vec<FrameState>) -> Self {
-        Self {
-            entries: states.into_iter().map(Some).collect(),
-        }
+        Self::from_indexed_states(states.into_iter().map(Some).collect())
     }
 
     /// Build a table in logical frame-state id order. `None` retains an id
     /// used only for GC root derivation and therefore has no deopt recipe.
     #[must_use]
     pub fn from_indexed_states(states: Vec<Option<FrameState>>) -> Self {
-        Self { entries: states }
+        let mut literals = LiteralPool::default();
+        let entries = states
+            .iter()
+            .map(|state| {
+                state
+                    .as_ref()
+                    .map(|state| state.map_slots(|slot| PackedDeoptSlot::pack(slot, &mut literals)))
+            })
+            .collect();
+        Self {
+            entries,
+            literals: literals.bits.into_boxed_slice(),
+        }
     }
 
-    /// The frame chain for `state`, or `None` when the id has no recipe.
+    /// The frame chain for `state`, unpacked, or `None` when the id has no
+    /// recipe.
     #[must_use]
-    pub fn lookup(&self, state: FrameStateId) -> Option<&FrameState> {
-        self.entries.get(state as usize)?.as_ref()
+    pub fn lookup(&self, state: FrameStateId) -> Option<FrameState> {
+        self.entries
+            .get(state as usize)?
+            .as_ref()
+            .map(|state| self.unpack(state))
     }
 
-    /// All reconstructable states in logical-id order.
-    pub fn entries(&self) -> impl Iterator<Item = &FrameState> {
-        self.entries.iter().flatten()
+    fn unpack(&self, state: &FrameState<PackedDeoptSlot>) -> FrameState {
+        state.map_slots(|slot| slot.unpack(&self.literals))
     }
 
-    /// Present concrete states with their stable logical ids.
-    pub fn indexed_entries(&self) -> impl Iterator<Item = (FrameStateId, &FrameState)> {
+    /// All reconstructable states in logical-id order, unpacked.
+    pub fn entries(&self) -> impl Iterator<Item = FrameState> + '_ {
+        self.entries
+            .iter()
+            .flatten()
+            .map(|state| self.unpack(state))
+    }
+
+    /// Present concrete states with their stable logical ids, unpacked.
+    pub fn indexed_entries(&self) -> impl Iterator<Item = (FrameStateId, FrameState)> + '_ {
         self.entries.iter().enumerate().filter_map(|(id, state)| {
             state
                 .as_ref()
-                .map(|state| (u32::try_from(id).unwrap_or(u32::MAX), state))
+                .map(|state| (u32::try_from(id).unwrap_or(u32::MAX), self.unpack(state)))
         })
     }
 
@@ -684,10 +812,38 @@ impl DeoptTable {
                 max: limits.max_stack_slot_offset,
             });
         }
-        for state in self.entries.iter().flatten() {
+        for state in self.entries() {
             state.verify(limits)?;
         }
         Ok(())
+    }
+
+    /// Owned packed recipe bytes: reserved id capacity, frames, slot tables,
+    /// virtual-object fields and the literal pool.
+    fn retained_bytes(&self) -> u64 {
+        let mut total = (self.entries.capacity() as u64)
+            .saturating_mul(std::mem::size_of::<Option<FrameState<PackedDeoptSlot>>>() as u64)
+            .saturating_add(std::mem::size_of_val::<[u64]>(&self.literals) as u64);
+        for state in self.entries.iter().flatten() {
+            total = total
+                .saturating_add(std::mem::size_of_val::<[DeoptFrame<PackedDeoptSlot>]>(
+                    &state.frames,
+                ) as u64)
+                .saturating_add(std::mem::size_of_val::<[VirtualObject<PackedDeoptSlot>]>(
+                    &state.virtual_objects,
+                ) as u64);
+            for frame in &state.frames {
+                total = total.saturating_add(std::mem::size_of_val::<[(u16, PackedDeoptSlot)]>(
+                    &frame.slots,
+                ) as u64);
+            }
+            for object in &state.virtual_objects {
+                total = total.saturating_add(std::mem::size_of_val::<[PackedDeoptSlot]>(
+                    &object.fields,
+                ) as u64);
+            }
+        }
+        total
     }
 }
 
@@ -737,31 +893,11 @@ impl DeoptRuntime {
     /// excluding allocator bookkeeping. Saturation fails admission closed.
     #[must_use]
     pub fn retained_bytes(&self) -> u64 {
-        let mut total = std::mem::size_of::<Self>() as u64;
-        total = total.saturating_add(
-            (self.table.entries.capacity() as u64)
-                .saturating_mul(std::mem::size_of::<Option<FrameState>>() as u64),
-        );
-        total = total
+        let mut total = (std::mem::size_of::<Self>() as u64)
+            .saturating_add(self.table.retained_bytes())
             .saturating_add(std::mem::size_of_val::<[DeoptExitDescriptor]>(&self.exits) as u64);
         for exit in &self.exits {
             total = total.saturating_add(std::mem::size_of_val(exit.resume_pcs.as_ref()) as u64);
-        }
-        for state in self.table.entries() {
-            total =
-                total.saturating_add(std::mem::size_of_val::<[DeoptFrame]>(&state.frames) as u64);
-            total = total.saturating_add(std::mem::size_of_val::<[VirtualObject<DeoptSlot>]>(
-                &state.virtual_objects,
-            ) as u64);
-            for frame in &state.frames {
-                total = total.saturating_add(std::mem::size_of_val::<[(u16, DeoptSlot)]>(
-                    &frame.slots,
-                ) as u64);
-            }
-            for object in &state.virtual_objects {
-                total = total
-                    .saturating_add(std::mem::size_of_val::<[DeoptSlot]>(&object.fields) as u64);
-            }
         }
         total
     }
@@ -904,7 +1040,6 @@ mod tests {
         let mut entries = Vec::with_capacity(16);
         entries.push(None);
         entries.push(Some(state));
-        let capacity = entries.capacity();
         let mut runtime = DeoptRuntime {
             table: DeoptTable::from_indexed_states(entries),
             exits: Box::new([DeoptExitDescriptor {
@@ -915,16 +1050,24 @@ mod tests {
                 safepoint: crate::native_abi::NO_SAFEPOINT,
             }]),
         };
+        let capacity = runtime.table.entries.capacity();
+        // Packed recipes: one deduplicated literal shared by all seven slots.
         let expected = std::mem::size_of::<DeoptRuntime>()
-            + capacity * std::mem::size_of::<Option<FrameState>>()
+            + capacity * std::mem::size_of::<Option<FrameState<PackedDeoptSlot>>>()
+            + std::mem::size_of::<u64>()
             + std::mem::size_of::<DeoptExitDescriptor>()
             + 2 * std::mem::size_of::<u32>()
-            + 2 * std::mem::size_of::<DeoptFrame>()
-            + 5 * std::mem::size_of::<(u16, DeoptSlot)>()
-            + 2 * std::mem::size_of::<DeoptSlot>()
-            + std::mem::size_of::<VirtualObject<DeoptSlot>>();
+            + 2 * std::mem::size_of::<DeoptFrame<PackedDeoptSlot>>()
+            + 5 * std::mem::size_of::<(u16, PackedDeoptSlot)>()
+            + 2 * std::mem::size_of::<PackedDeoptSlot>()
+            + std::mem::size_of::<VirtualObject<PackedDeoptSlot>>();
         assert_eq!(runtime.retained_bytes(), expected as u64);
+        // An absent id is charged as reserved capacity, not as a recipe.
         runtime.table.entries.push(None);
+        let grown = runtime.table.entries.capacity() - capacity;
+        let expected =
+            expected + grown * std::mem::size_of::<Option<FrameState<PackedDeoptSlot>>>();
+        let capacity = runtime.table.entries.capacity();
         assert_eq!(runtime.retained_bytes(), expected as u64);
         runtime.exits[0].resume_pcs = Box::default();
         assert_eq!(
@@ -937,7 +1080,7 @@ mod tests {
         assert!(extra_capacity > 0);
         assert_eq!(
             runtime.retained_bytes() - before,
-            (extra_capacity * std::mem::size_of::<Option<FrameState>>()) as u64,
+            (extra_capacity * std::mem::size_of::<Option<FrameState<PackedDeoptSlot>>>()) as u64,
         );
     }
 

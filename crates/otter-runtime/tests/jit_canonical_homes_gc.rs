@@ -222,7 +222,12 @@ fn assert_pressure_artifact(bundle: &JitArtifactBundle) -> u32 {
     // Join the exact eager (register, SSA value) pairs to their own slots;
     // another live double, such as total, cannot hide a missing xN home.
     for (register, value) in float_values {
-        let slot = &slots[register];
+        // Sparse frames list `[register, slot]` pairs in register order.
+        let slot = slots
+            .iter()
+            .find(|pair| pair[0].as_u64() == Some(register as u64))
+            .map(|pair| &pair[1])
+            .expect("a live float register has a recipe");
         assert_eq!(slot["representation"], "float64");
         assert_eq!(slot["locationKind"], "stackSlot");
         let offset = slot["locationValue"]
@@ -241,27 +246,26 @@ fn assert_pressure_artifact(bundle: &JitArtifactBundle) -> u32 {
         "overlapping values cannot share homes"
     );
     assert!(float_homes.len() >= FLOATS, "{state}");
+    // Records root exact subsets of the tagged homes plus the exception
+    // scratch; every untagged home lies beyond the highest rooted slot.
     let safepoints = json(bundle, JitArtifactFileName::Safepoints);
-    let tagged = safepoints["records"]
+    let tagged_end = safepoints["records"]
         .as_array()
         .expect("safepoints")
         .iter()
         .filter_map(|point| point["taggedLocations"].as_array())
-        .find(|locations| {
-            !locations.is_empty()
-                && locations
-                    .iter()
-                    .all(|location| location["kind"] == "spillSlot")
+        .flatten()
+        .map(|location| {
+            assert_eq!(location["kind"], "spillSlot");
+            location["index"].as_u64().expect("spill index") + 1
         })
-        .expect("canonical tagged region");
-    for (index, location) in tagged.iter().enumerate() {
-        assert_eq!(location["index"].as_u64(), Some(index as u64));
-    }
+        .max()
+        .expect("a rooted exception scratch");
     assert!(
         float_homes
             .iter()
-            .all(|&offset| offset >= tagged.len() as u32 * 8 && offset % 8 == 0),
-        "untagged homes must lie beyond the collector's complete tagged region",
+            .all(|&offset| u64::from(offset) >= tagged_end * 8 && offset % 8 == 0),
+        "untagged homes must lie beyond every collector-rooted home",
     );
 
     let code = bundle
@@ -312,7 +316,7 @@ fn assert_pressure_artifact(bundle: &JitArtifactBundle) -> u32 {
             assert!(
                 touched
                     .iter()
-                    .all(|offset| *offset >= tagged.len() as u32 * 8 && offset % 8 == 0),
+                    .all(|offset| u64::from(*offset) >= tagged_end * 8 && offset % 8 == 0),
                 "floating homes lie outside tagged roots"
             );
             assert!(

@@ -177,6 +177,22 @@ impl Interpreter {
         self.enforce_work_budget_checkpoint()
     }
 
+    /// Backtrack points one RegExp search may explore before a rejecting work
+    /// budget would end the slice; unbounded under any other policy, since a
+    /// search cannot yield midway and an unbudgeted search runs to its answer.
+    pub(crate) fn regex_step_limit(&self) -> u64 {
+        match self.work_budget.max_work_units_per_turn {
+            Some(max)
+                if self.work_budget.enforces_on_exceedance()
+                    && !self.work_budget.yields_on_exceedance() =>
+            {
+                max.saturating_sub(self.work_budget_stats.current_turn_work_units())
+                    .saturating_add(1)
+            }
+            _ => u64::MAX,
+        }
+    }
+
     /// Charge one completed RegExp engine attempt to the current root turn.
     /// The matcher itself is synchronous, so this checkpoint runs immediately
     /// after it returns and before any result becomes JavaScript-visible.

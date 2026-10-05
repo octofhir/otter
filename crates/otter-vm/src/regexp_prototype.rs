@@ -121,9 +121,11 @@ pub(crate) fn exec_once_native(
             let text = input_value
                 .as_string(scope.context().heap())
                 .ok_or_else(|| native_type_error(REGEXP_EXEC_NAME, "input is not a string"))?;
+            let step_limit = scope.context().regex_step_limit();
             let heap = scope.context().heap();
-            let execution =
-                text.with_utf16(heap, |units| re.find_one_from_utf16(heap, units, start));
+            let execution = text.with_utf16(heap, |units| {
+                re.find_one_from_utf16(heap, units, start, step_limit)
+            });
             let matched = crate::regexp::finish_execution(scope.context(), execution)?;
             let matched = match matched {
                 Some(matched) => matched,
@@ -452,7 +454,9 @@ pub fn native_regexp_symbol_match(
                         scope.context().heap(),
                     )
                 {
-                    let execution = re.find_from_utf16(scope.context().heap(), &input_units, 0);
+                    let step_limit = scope.context().regex_step_limit();
+                    let execution =
+                        re.find_from_utf16(scope.context().heap(), &input_units, 0, step_limit);
                     let found = crate::regexp::finish_execution(scope.context(), execution)?;
                     if found.is_empty() {
                         return Ok(Value::null());
@@ -1342,7 +1346,8 @@ pub fn native_regexp_symbol_replace(
                             name,
                             reason: "replace receiver root is not a RegExp".to_string(),
                         })?;
-                    let execution = re.find_from_utf16(ctx.heap(), &s_units, 0);
+                    let execution =
+                        re.find_from_utf16(ctx.heap(), &s_units, 0, ctx.regex_step_limit());
                     let found = crate::regexp::finish_execution(ctx, execution)?;
                     let mut accumulated: Vec<u16> = Vec::new();
                     let mut next_source_position: usize = 0;

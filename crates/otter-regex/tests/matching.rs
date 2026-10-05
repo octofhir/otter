@@ -411,13 +411,17 @@ fn step_budget_aborts_catastrophic_backtracking() {
 }
 
 #[test]
-fn default_execution_budget_is_finite() {
+fn default_execution_decides_exponential_searches() {
+    // Without a host budget the search runs to its answer: no match, never
+    // an early "no match" from an internal ceiling.
     let regex = Regex::compile_str("(a|aa)+b", Flags::default()).expect("pattern");
-    let subject = "a".repeat(32).encode_utf16().collect::<Vec<_>>();
-    assert!(matches!(
-        regex.find_utf16(&subject, 0, ExecConfig::default()).next(),
-        Some(Err(otter_regex::ExecError::StepLimitExceeded))
-    ));
+    let subject = "a".repeat(24).encode_utf16().collect::<Vec<_>>();
+    assert!(
+        regex
+            .find_utf16(&subject, 0, ExecConfig::default())
+            .next()
+            .is_none()
+    );
 }
 
 /// §22.2.2.4 — a lookbehind body matches with direction -1: its alternatives

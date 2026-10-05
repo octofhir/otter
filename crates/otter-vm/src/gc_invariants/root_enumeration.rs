@@ -729,7 +729,7 @@ fn regexp_root_survives_force_gc() {
     };
     let text: Vec<u16> = "aaab".encode_utf16().collect();
     let first = re
-        .find_from_utf16(interp.gc_heap(), &text, 0)
+        .find_from_utf16(interp.gc_heap(), &text, 0, u64::MAX)
         .result
         .expect("within matcher budget")
         .into_iter()

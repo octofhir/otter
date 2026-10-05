@@ -368,14 +368,6 @@ fn bytes_mut(words: &mut [u64]) -> &mut [u8] {
 fn put32(words: &mut [u64], byte: u32, value: u32) {
     bytes_mut(words)[byte as usize..byte as usize + 4].copy_from_slice(&value.to_le_bytes());
 }
-fn hash(layout: JitStringLayout, units: &[u16]) -> u64 {
-    units
-        .iter()
-        .flat_map(|u| u.to_le_bytes())
-        .fold(layout.fnv_offset, |value, byte| {
-            (value ^ u64::from(byte)).wrapping_mul(layout.fnv_prime)
-        })
-}
 fn flat(layout: JitStringLayout, units: &[u16], latin: bool, seq: bool) -> Vec<u64> {
     let payload = if seq {
         layout.string_body_size
@@ -388,7 +380,6 @@ fn flat(layout: JitStringLayout, units: &[u16], latin: bool, seq: bool) -> Vec<u
     let mut words = vec![0; (bytes as usize).div_ceil(8)];
     words[0] = layout.header_word;
     put32(&mut words, layout.string_len_byte, units.len() as u32);
-    words[layout.hash_byte as usize / 8] = hash(layout, units);
     bytes_mut(&mut words)[layout.string_repr_byte as usize] = match (latin, seq) {
         (true, false) => layout.inline_latin1_tag,
         (true, true) => layout.seq_latin1_tag,
@@ -438,8 +429,6 @@ fn strings_execute_exact_flat_cons_identity_and_pre_effect_refusal_payloads() {
                 put32(&mut v, p.string_len_byte, combined.len() as u32);
                 put32(&mut v, p.cons_left_byte, values[0] as u32);
                 put32(&mut v, p.cons_right_byte, values[1] as u32);
-                v[p.hash_byte as usize / 8] = a[p.hash_byte as usize / 8].wrapping_mul(p.fnv_prime)
-                    ^ b[p.hash_byte as usize / 8];
                 bytes_mut(&mut v)[p.string_repr_byte as usize] = p.cons_tag;
                 bytes_mut(&mut v)[p.cons_depth_byte as usize] = 1;
                 v

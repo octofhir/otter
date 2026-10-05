@@ -59,7 +59,8 @@ pub use gc_body::{
     JS_STRING_BODY_TYPE_TAG, JsStringBody, JsStringBodyRepr, JsStringHandle, JsStringId,
     MAX_ROPE_DEPTH as GC_MAX_ROPE_DEPTH, StringConcatError, alloc_flat_string_body_with_roots,
     alloc_latin1_string_body_with_roots, concat_string_bodies, eq_str, equals_string_bodies,
-    flatten_string_body, hash_latin1, hash_utf16, slice_string_body, to_utf16_vec,
+    flatten_string_body, hash_latin1, hash_utf16, peek_string_hash, slice_string_body, string_hash,
+    to_utf16_vec,
 };
 
 /// Maximum depth of an unflattened cons rope. Re-export of
@@ -84,11 +85,9 @@ pub(crate) fn concat_error_to_vm(
 
 /// GC-backed JavaScript string handle.
 ///
-/// 16 bytes (`JsStringHandle` + `u32` len + `u32` cached hash).
-/// `Copy`. Derived [`PartialEq`] / [`Hash`] are handle identity —
-/// spec value equality goes through [`Self::equals`]; the cached
-/// hash exposed by [`Self::cached_hash`] is heap-free and stable
-/// across distinct allocations of the same content.
+/// A handle plus its `u32` length. `Copy`. Derived [`PartialEq`] /
+/// [`Hash`] are handle identity — spec value equality goes through
+/// [`Self::equals`]; [`Self::content_hash`] hashes the content.
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
 pub struct JsString {
     /// Strong handle to the body. Traced through the wrapper at every
@@ -97,18 +96,11 @@ pub struct JsString {
     /// O(1) heap-free length in UTF-16 code units. Primed at
     /// construction from the body and never re-read.
     cached_len: u32,
-    /// O(1) heap-free FNV-1a hash truncated to 32 bits. Distinct
-    /// allocations of the same code-unit content produce the same
-    /// `cached_hash`; collisions are possible but rare.
-    cached_hash: u32,
 }
 
 fn no_extra_roots(_v: &mut dyn FnMut(*mut otter_gc::raw::RawGc)) {}
 
-/// Truncate the body's 64-bit FNV-1a hash to 32 bits. Kept consistent
-/// across every cached-hash priming site so callers comparing
-/// `cached_hash` values get the same answer regardless of which
-/// constructor produced the wrapper.
+/// Truncate the body's 64-bit content hash to 32 bits.
 #[inline]
 const fn hash_to_u32(h: u64) -> u32 {
     ((h ^ (h >> 32)) & 0xFFFF_FFFF) as u32
@@ -141,11 +133,10 @@ impl JsString {
     /// Wrap an existing string body, such as a hidden class's key, without
     /// allocating.
     pub(crate) fn from_handle(handle: JsStringHandle, heap: &GcHeap) -> Self {
-        let (cached_len, cached_hash) = heap.read_payload(handle, |b| (b.len, hash_to_u32(b.hash)));
+        let cached_len = heap.read_payload(handle, |b| b.len);
         Self {
             handle,
             cached_len,
-            cached_hash,
         }
     }
 
@@ -157,7 +148,7 @@ impl JsString {
     }
 
     /// Trace this wrapper's body handle as a GC slot so a moving collector
-    /// rewrites it in place. `cached_len` / `cached_hash` are content-derived
+    /// rewrites it in place. `cached_len` is content-derived
     /// and never change under a move, so only the handle needs updating. Used
     /// where a `JsString` is stored in a collector-visited slot that is not a
     /// `Value` (e.g. `MapKey::String`).
@@ -206,11 +197,9 @@ impl JsString {
             units,
             external_visit,
         )?;
-        let cached_hash = hash_to_u32(gc_body::hash_utf16(units));
         Ok(Self {
             handle,
             cached_len: units.len() as u32,
-            cached_hash,
         })
     }
 
@@ -275,11 +264,9 @@ impl JsString {
             bytes,
             external_visit,
         )?;
-        let cached_hash = hash_to_u32(gc_body::hash_latin1(bytes));
         Ok(Self {
             handle,
             cached_len: bytes.len() as u32,
-            cached_hash,
         })
     }
 
@@ -320,14 +307,17 @@ impl JsString {
         self.cached_len == 0
     }
 
-    /// Heap-free FNV-1a hash truncated to 32 bits. Distinct
-    /// allocations of the same code-unit content share the same value
-    /// — suitable for hashing key projections (e.g. [`crate::MapKey`]).
-    /// Collisions are possible; pair with [`Self::equals`] before
-    /// concluding two strings are equal.
+    /// Content hash truncated to 32 bits, computed on first request and
+    /// cached in the body. Equal content always hashes equal; pair with
+    /// [`Self::equals`] before concluding two strings are equal.
+    pub fn content_hash(self, heap: &mut GcHeap) -> u32 {
+        hash_to_u32(gc_body::string_hash(heap, self.handle))
+    }
+
+    /// [`Self::content_hash`] for a caller holding only a shared heap.
     #[must_use]
-    pub fn cached_hash(self) -> u32 {
-        self.cached_hash
+    pub fn peek_content_hash(self, heap: &GcHeap) -> u32 {
+        hash_to_u32(gc_body::peek_string_hash(heap, self.handle))
     }
 
     /// Concatenate two strings; produces a cons-rope body unless one
@@ -363,11 +353,10 @@ impl JsString {
         }
         let mut roots = no_extra_roots;
         let handle = gc_body::concat_string_bodies(heap, left_handle, right_handle, &mut roots)?;
-        let (cached_len, cached_hash) = heap.read_payload(handle, |b| (b.len, hash_to_u32(b.hash)));
+        let cached_len = heap.read_payload(handle, |b| b.len);
         Ok(Self {
             handle,
             cached_len,
-            cached_hash,
         })
     }
 
@@ -386,11 +375,10 @@ impl JsString {
         }
         let mut roots = no_extra_roots;
         let handle = gc_body::slice_string_body(heap, source, start, length, &mut roots)?;
-        let (cached_len, cached_hash) = heap.read_payload(handle, |b| (b.len, hash_to_u32(b.hash)));
+        let cached_len = heap.read_payload(handle, |b| b.len);
         Ok(Self {
             handle,
             cached_len,
-            cached_hash,
         })
     }
 
@@ -412,7 +400,6 @@ impl JsString {
         Ok(Self {
             handle,
             cached_len: self.cached_len,
-            cached_hash: self.cached_hash,
         })
     }
 
@@ -599,11 +586,6 @@ impl JsString {
         if self.cached_len != other.cached_len {
             return false;
         }
-        // Cannot short-circuit on `cached_hash` mismatch: cons-rope
-        // hashes use a non-FNV composition that does not match the
-        // FNV-1a of the flattened content, so two semantically equal
-        // strings can carry distinct cached hashes. Fall through to
-        // the body walk which compares code units directly.
         gc_body::equals_string_bodies(heap, self.handle, other.handle)
     }
 
@@ -1133,14 +1115,16 @@ mod tests {
         // Include one non-Latin-1 code unit so the constructor must keep a
         // Flat UTF-16 parent; slicing Latin-1 collapses into a fresh compact
         // body and would not exercise the Sliced-over-Flat path.
-        let units = vec![0x0100, b'a' as u16, b'b' as u16, b'c' as u16, b'd' as u16];
+        // A range longer than an inline body stays a view.
+        let mut units = vec![0x0100];
+        units.extend(b"abcdefghijklmnopqrst".iter().map(|&b| u16::from(b)));
         let mut s = JsString::from_utf16_units(&units, &mut heap).unwrap();
         let mut roots = otter_gc::RootScope::new(&mut heap);
         // SAFETY: `s` remains stationary through slice allocation.
         unsafe { root_string(&mut roots, &mut s) };
-        let sliced = s.slice(1, 3, &mut heap).unwrap();
-        assert_eq!(sliced.len(), 3);
-        assert_eq!(sliced.to_lossy_string(&heap), "abc");
+        let sliced = s.slice(1, 20, &mut heap).unwrap();
+        assert_eq!(sliced.len(), 20);
+        assert_eq!(sliced.to_lossy_string(&heap), "abcdefghijklmnopqrst");
         heap.read_payload(sliced.handle(), |body| {
             assert!(matches!(body.repr, JsStringBodyRepr::Sliced { .. }));
         });

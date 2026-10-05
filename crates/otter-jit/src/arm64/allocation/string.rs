@@ -82,15 +82,9 @@ pub(crate) fn emit_concat(
         ; cmp WSP(r.scratch),p.max_rope_depth as u32 ; b.hi =>slow);
     initialize(ops, context, p, inputs, r, slow);
     emit_value(ops, 16, a);
-    dynasm!(ops ; .arch aarch64 ; str w16,[X(r.candidate),p.cons_left_byte]
-        ; ldr X(r.scratch),[x16,p.hash_byte]);
+    dynasm!(ops ; .arch aarch64 ; str w16,[X(r.candidate),p.cons_left_byte]);
     emit_value(ops, 16, b);
-    dynasm!(ops ; .arch aarch64 ; str w16,[X(r.candidate),p.cons_right_byte]
-        ; ldr X(r.end),[x16,p.hash_byte]);
-    emit_load_u64(ops, 16, p.fnv_prime);
-    dynasm!(ops ; .arch aarch64 ; mul X(r.scratch),X(r.scratch),x16
-        ; eor X(r.scratch),X(r.scratch),X(r.end)
-        ; str X(r.scratch),[X(r.candidate),p.hash_byte]);
+    dynasm!(ops ; .arch aarch64 ; str w16,[X(r.candidate),p.cons_right_byte]);
     emit_load_u64(ops, 16, u64::from(p.cons_tag));
     dynasm!(ops ; .arch aarch64 ; strb w16,[X(r.candidate),p.string_repr_byte]);
     emit_depth(ops, p, a, r.scratch, r.end);
@@ -176,8 +170,6 @@ fn emit_flat(
     dynasm!(ops ; .arch aarch64 ; strb w16,[X(r.candidate),p.string_repr_byte]
         ; fmov d31,X(r.candidate)
         ; add XSP(r.buffer),XSP(r.candidate),p.string_repr_payload_byte);
-    emit_load_u64(ops, r.scratch, p.fnv_offset);
-    emit_load_u64(ops, r.candidate, p.fnv_prime);
     for input in inputs {
         let wide = ops.new_dynamic_label();
         let next = ops.new_dynamic_label();
@@ -191,8 +183,7 @@ fn emit_flat(
         emit_copy_loop(ops, p, r, true, latin);
         dynasm!(ops ; .arch aarch64 ; =>next);
     }
-    dynasm!(ops ; .arch aarch64 ; fmov X(r.candidate),d31
-        ; str X(r.scratch),[X(r.candidate),p.hash_byte]);
+    dynasm!(ops ; .arch aarch64 ; fmov X(r.candidate),d31);
     publish(ops, context, p, r);
 }
 fn emit_copy_loop(
@@ -217,7 +208,6 @@ fn emit_copy_loop(
         ; =>inline ; add XSP(r.end),XSP(r.end),p.string_repr_payload_byte ; =>start
         ; cbz W(r.size),=>done ; =>copying
         ; ldrb w16,[X(r.end)] ; strb w16,[X(r.buffer)]
-        ; eor X(r.scratch),X(r.scratch),x16 ; mul X(r.scratch),X(r.scratch),X(r.candidate)
         ; add XSP(r.end),XSP(r.end),1 ; add XSP(r.buffer),XSP(r.buffer),1);
     if wide {
         dynasm!(ops ; .arch aarch64 ; ldrb w16,[X(r.end)] ; add XSP(r.end),XSP(r.end),1);
@@ -227,7 +217,5 @@ fn emit_copy_loop(
     if !latin {
         dynasm!(ops ; .arch aarch64 ; strb w16,[X(r.buffer)] ; add XSP(r.buffer),XSP(r.buffer),1);
     }
-    dynasm!(ops ; .arch aarch64 ; eor X(r.scratch),X(r.scratch),x16
-        ; mul X(r.scratch),X(r.scratch),X(r.candidate)
-        ; subs W(r.size),WSP(r.size),1 ; b.ne =>copying ; =>done);
+    dynasm!(ops ; .arch aarch64 ; subs W(r.size),WSP(r.size),1 ; b.ne =>copying ; =>done);
 }

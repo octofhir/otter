@@ -57,6 +57,7 @@ pub(super) fn emit_forward_call(
     [dst, method, callee, receiver]: [u16; 4],
     throw_value: DynamicLabel,
     threw: DynamicLabel,
+    fatal: DynamicLabel,
 ) -> Result<(), Unsupported> {
     let staged = ops.new_dynamic_label();
     let done = ops.new_dynamic_label();
@@ -138,6 +139,7 @@ pub(super) fn emit_forward_call(
             dst,
             throw_value,
             threw,
+            fatal,
         )?;
         dynasm!(ops ; .arch x64 ; jmp =>done);
     }
@@ -192,6 +194,7 @@ pub(super) fn emit_forward_call(
         dst,
         throw_value,
         threw,
+        fatal,
     )?;
     dynasm!(ops ; .arch x64 ; =>done);
     Ok(())

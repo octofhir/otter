@@ -851,6 +851,7 @@ pub(super) fn emit_call(
     bail: DynamicLabel,
     threw: DynamicLabel,
     throw_value: DynamicLabel,
+    fatal: DynamicLabel,
 ) -> Result<(), Unsupported> {
     emit_call_with_receiver(
         ops,
@@ -871,6 +872,7 @@ pub(super) fn emit_call(
         bail,
         threw,
         throw_value,
+        fatal,
     )
 }
 
@@ -898,6 +900,7 @@ pub(super) fn emit_call_with_receiver(
     bail: DynamicLabel,
     threw: DynamicLabel,
     throw_value: DynamicLabel,
+    fatal: DynamicLabel,
 ) -> Result<(), Unsupported> {
     let done = ops.new_dynamic_label();
     if let Some(receiver) = receiver
@@ -964,6 +967,7 @@ pub(super) fn emit_call_with_receiver(
             dst,
             throw_value,
             threw,
+            fatal,
         )?;
         dynasm!(ops ; .arch aarch64 ; =>hit);
         let name = native_leaf_call_name(target.leaf_stub_id);
@@ -1001,6 +1005,10 @@ pub(super) fn emit_call_with_receiver(
         let name = native_leaf_call_name(stub_id);
         let start = ops.offset().0;
         if native_leaf_call_is_supported(view, stub_id, usize::from(argc)) {
+            // A baseline call never deoptimizes: a callee-identity or leaf
+            // miss (an input the leaf does not cover) performs the ordinary
+            // call once, as the explicit-receiver form does.
+            let miss = ops.new_dynamic_label();
             emit_load_reg(ops, 9, callee)?;
             emit_native_leaf_call(
                 ops,
@@ -1017,14 +1025,36 @@ pub(super) fn emit_call_with_receiver(
                         .ok_or(Unsupported::OperandShape("native leaf call argument"))?;
                     emit_load_reg(ops, register, source)
                 },
-                bail,
+                miss,
             )?;
             emit_store_reg(ops, 0, dst)?;
+            dynasm!(ops ; .arch aarch64 ; b =>done ; =>miss);
+            let leaf_end = ops.offset().0;
+            emit_trampoline_call(
+                ops,
+                relocations,
+                table,
+                return_sites,
+                view,
+                None,
+                view.code_block.id,
+                logical_pc,
+                byte_pc,
+                CallCallee::Register(callee),
+                None,
+                CallNewTarget::None,
+                CallActuals::Fixed(argument_registers),
+                None,
+                dst,
+                throw_value,
+                threw,
+                fatal,
+            )?;
             if let Some(code_map) = code_map.as_deref_mut() {
                 code_map.record(CodeRegion::static_native_structural(
                     "nativeLeafCall",
                     start,
-                    ops.offset().0,
+                    leaf_end,
                     view.code_block.id,
                     logical_pc,
                     byte_pc,
@@ -1042,7 +1072,7 @@ pub(super) fn emit_call_with_receiver(
                     },
                 );
             }
-            dynasm!(ops ; .arch aarch64 ; b =>done ; =>done);
+            dynasm!(ops ; .arch aarch64 ; =>done);
             return Ok(());
         }
         if let Some(events) = direct_call_events.as_deref_mut() {
@@ -1077,6 +1107,7 @@ pub(super) fn emit_call_with_receiver(
             dst,
             throw_value,
             threw,
+            fatal,
         );
     }
     let direct_target = view
@@ -1145,6 +1176,7 @@ pub(super) fn emit_call_with_receiver(
         dst,
         throw_value,
         threw,
+        fatal,
     )?;
     if let Some(target) = generated_target {
         super::super::record_generated_direct_call(
@@ -1304,6 +1336,7 @@ pub(super) fn emit_tail_call(
         bail,
         threw,
         throw_value,
+        fatal,
     )
 }
 
@@ -1338,9 +1371,10 @@ fn emit_tail_path(
 }
 
 /// Deliver a call completion in `x0`/`x1`: success to `dst`, a throw to
-/// `throw_value`, a parked error to `threw`. A callee that retired itself
-/// for a tail call it staged returns `Continue`; that call is entered in its
-/// place and its completion delivered the same way.
+/// `throw_value`, the callee's final failure to `fatal` unchanged and any
+/// other parked error to `threw`. A callee that retired itself for a tail
+/// call it staged returns `Continue`; that call is entered in its place and
+/// its completion delivered the same way.
 pub(super) fn emit_call_completion(
     ops: &mut Assembler,
     relocations: &mut RelocationCapture,
@@ -1349,6 +1383,7 @@ pub(super) fn emit_call_completion(
     dst: u16,
     throw_value: DynamicLabel,
     threw: DynamicLabel,
+    fatal: DynamicLabel,
 ) -> Result<(), Unsupported> {
     let completion = ops.new_dynamic_label();
     let abrupt = ops.new_dynamic_label();
@@ -1381,6 +1416,8 @@ pub(super) fn emit_call_completion(
         ; .arch aarch64
         ; cmp x1, abi::NativeResultStatus::Throw as u32
         ; b.eq =>throw_value
+        ; cmp x1, abi::NativeResultStatus::Fatal as u32
+        ; b.eq =>fatal
         ; b =>threw
         ; =>done
     );
@@ -1445,6 +1482,7 @@ pub(super) fn emit_trampoline_call(
     dst: u16,
     throw_value: DynamicLabel,
     threw: DynamicLabel,
+    fatal: DynamicLabel,
 ) -> Result<(), Unsupported> {
     use crate::arm64::js_call::{
         CallTarget, emit_call, emit_pop_arguments, emit_push_arguments, emit_staged_call,
@@ -1526,6 +1564,7 @@ pub(super) fn emit_trampoline_call(
             dst,
             throw_value,
             threw,
+            fatal,
         )?;
         dynasm!(ops ; .arch aarch64 ; b =>done ; =>generic);
     }
@@ -1578,6 +1617,7 @@ pub(super) fn emit_trampoline_call(
         dst,
         throw_value,
         threw,
+        fatal,
     )?;
     dynasm!(ops ; .arch aarch64 ; =>done);
     if let Some(code_map) = code_map {
@@ -1676,6 +1716,7 @@ pub(super) fn emit_construct(
     byte_pc: u32,
     threw: DynamicLabel,
     throw_value: DynamicLabel,
+    fatal: DynamicLabel,
 ) -> Result<(), Unsupported> {
     emit_trampoline_call(
         ops,
@@ -1701,6 +1742,7 @@ pub(super) fn emit_construct(
         dst,
         throw_value,
         threw,
+        fatal,
     )?;
     if let Some(target) = view
         .direct_constructs
@@ -1934,6 +1976,7 @@ pub(super) fn emit_method_call(
             dst,
             throw_value,
             threw,
+            fatal,
         )?;
         super::super::record_generated_direct_call(
             direct_call_events.as_deref_mut(),
@@ -1996,6 +2039,7 @@ pub(super) fn emit_method_call(
         dst,
         throw_value,
         threw,
+        fatal,
     )?;
     dynasm!(ops ; .arch aarch64 ; =>done);
     Ok(())

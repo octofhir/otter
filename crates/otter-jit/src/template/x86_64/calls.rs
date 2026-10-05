@@ -58,7 +58,8 @@ pub(super) enum CallNewTarget {
 /// Deliver a completion in `rax`/`rdx`: success to `dst`, a throw to
 /// `throw_value`, a parked error to `threw`. A callee that retired itself
 /// for a tail call it staged returns `Continue`; that call is entered in its
-/// place and its completion delivered the same way.
+/// place and its completion delivered the same way. A callee's `Fatal` is
+/// final and reaches `fatal` without another projection.
 pub(super) fn emit_completion(
     ops: &mut Assembler,
     relocations: &mut RelocationCapture,
@@ -67,6 +68,7 @@ pub(super) fn emit_completion(
     dst: u16,
     throw_value: DynamicLabel,
     threw: DynamicLabel,
+    fatal: DynamicLabel,
 ) -> Result<(), Unsupported> {
     let completion = ops.new_dynamic_label();
     let error = ops.new_dynamic_label();
@@ -90,6 +92,8 @@ pub(super) fn emit_completion(
         ; .arch x64
         ; cmp edx, abi::NativeResultStatus::Throw as i32
         ; je =>throw_value
+        ; cmp edx, abi::NativeResultStatus::Fatal as i32
+        ; je =>fatal
         ; jmp =>threw
         ; =>done
     );
@@ -177,6 +181,7 @@ fn emit_target_call(
     dst: u16,
     throw_value: DynamicLabel,
     threw: DynamicLabel,
+    fatal: DynamicLabel,
 ) -> Result<(), Unsupported> {
     let count = u32::try_from(arguments.len())
         .map_err(|_| Unsupported::OperandShape("x86-64 call actual count"))?;
@@ -208,6 +213,7 @@ fn emit_target_call(
         dst,
         throw_value,
         threw,
+        fatal,
     )?;
     Ok(())
 }
@@ -232,6 +238,7 @@ pub(super) fn emit_call(
     dst: u16,
     throw_value: DynamicLabel,
     threw: DynamicLabel,
+    fatal: DynamicLabel,
 ) -> Result<(), Unsupported> {
     let done = ops.new_dynamic_label();
     // `[[Construct]]` enters a proven target directly only when it has the
@@ -289,6 +296,7 @@ pub(super) fn emit_call(
             dst,
             throw_value,
             threw,
+            fatal,
         )?;
         dynasm!(ops ; .arch x64 ; jmp =>done ; =>next);
     }
@@ -424,6 +432,7 @@ pub(super) fn emit_tail_call(
         dst,
         throw_value,
         threw,
+        fatal,
     )
 }
 
@@ -445,6 +454,7 @@ pub(super) fn emit_method_call(
     dst: u16,
     throw_value: DynamicLabel,
     threw: DynamicLabel,
+    fatal: DynamicLabel,
 ) -> Result<(), Unsupported> {
     let done = ops.new_dynamic_label();
     if let Some(targets) = view.direct_methods.get(&byte_pc) {
@@ -469,6 +479,7 @@ pub(super) fn emit_method_call(
                 dst,
                 throw_value,
                 threw,
+                fatal,
             )?;
             crate::template::record_generated_direct_call(
                 direct_call_events.as_deref_mut(),
@@ -576,6 +587,7 @@ pub(super) fn emit_method_call(
         dst,
         throw_value,
         threw,
+        fatal,
     )?;
     dynasm!(ops ; .arch x64 ; =>done);
     Ok(())
@@ -595,6 +607,7 @@ pub(super) fn emit_spread_call_op(
     arg2: u64,
     throw_value: DynamicLabel,
     threw: DynamicLabel,
+    fatal: DynamicLabel,
 ) -> Result<(), Unsupported> {
     let lane = |packed: u64, index: usize| ((packed >> (index * 16)) & 0xffff) as u16;
     let (dst, callee, receiver, array, new_target) =
@@ -666,6 +679,7 @@ pub(super) fn emit_spread_call_op(
         dst,
         throw_value,
         threw,
+        fatal,
     )?;
     Ok(())
 }

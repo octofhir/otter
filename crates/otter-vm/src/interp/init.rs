@@ -790,6 +790,18 @@ impl Interpreter {
             }
             Ok::<(), VmError>(())
         })?;
+        // Cache each instance root before cap enforcement can require an
+        // emergency error, as the default realm's finalizer does. Registry
+        // slots are traced runtime roots and are reloaded for every kind.
+        for &kind in ErrorKind::all() {
+            let prototype = self.extra_realms[state_index].error_classes.prototype(kind);
+            object::root_for_prototype(
+                &mut self.gc_heap,
+                Some(prototype),
+                object::ShapeState::ORDINARY,
+                &mut |_| {},
+            )?;
+        }
         for (name, kind) in [
             ("Error", ErrorKind::Error),
             ("TypeError", ErrorKind::TypeError),

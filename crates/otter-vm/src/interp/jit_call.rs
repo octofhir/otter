@@ -2005,7 +2005,7 @@ mod tests {
             .charge(1_000_000);
         // Deliberately leave caches installed: every selector must consult the
         // same owner even independently of normal invalidation cache cleanup.
-        vm.optimizing_tier_policy.begin_retraining(0, 2);
+        vm.optimizing_tier_policy.begin_retraining(0);
         vm.jit_hook = Some(Arc::new(UnexpectedRetrainingCompile));
         assert!(vm.resolve_jit_code_for_fid(&context, 0).is_none());
         assert!(vm.resolve_optimized_code_for_fid(&context, 0).is_none());

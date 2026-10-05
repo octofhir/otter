@@ -153,6 +153,7 @@ pub(super) fn emit_forward_call(
             dst,
             throw_value,
             threw,
+            fatal,
         )?;
         dynasm!(ops ; .arch aarch64 ; b =>done);
     }
@@ -202,6 +203,7 @@ pub(super) fn emit_forward_call(
         dst,
         throw_value,
         threw,
+        fatal,
     )?;
     dynasm!(ops ; .arch aarch64 ; =>done);
     if let Some(code_map) = code_map {

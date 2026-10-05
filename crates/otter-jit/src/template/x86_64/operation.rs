@@ -361,6 +361,7 @@ pub(crate) fn emit_operation(
             [dst, method, receiver, this_value],
             committed_throw,
             threw,
+            fatal,
         )?,
         TemplateOp::NewArray { dst, elements } => {
             let words = plan
@@ -481,6 +482,7 @@ pub(crate) fn emit_operation(
             arg2,
             committed_throw,
             threw,
+            fatal,
         )?,
         TemplateOp::DeleteOp {
             opcode,
@@ -880,25 +882,49 @@ pub(crate) fn emit_operation(
             {
                 let name = abi::runtime_stub_name(target.leaf_stub_id);
                 if native_leaf::supports_site(view, *target, arguments.len()) {
+                    // A baseline call never deoptimizes: a callee-identity or
+                    // leaf miss performs the ordinary call once.
                     let start = ops.offset().0;
+                    let miss = ops.new_dynamic_label();
+                    let done = ops.new_dynamic_label();
                     emit_load_reg(ops, 10, callee);
                     for (index, &argument) in arguments.iter().enumerate() {
                         emit_load_reg(ops, if index == 0 { 6 } else { 2 }, argument);
                     }
-                    native_leaf::emit_guard(ops, view, target.builtin_native_ref, type_mismatch);
+                    native_leaf::emit_guard(ops, view, target.builtin_native_ref, miss);
                     native_leaf::emit_tagged_call(
                         ops,
                         relocations,
                         target.leaf_stub_id,
                         target.argument_count,
-                        type_mismatch,
+                        miss,
                     )?;
                     emit_store_reg(ops, 0, dst);
+                    dynasm!(ops ; .arch x64 ; jmp =>done ; =>miss);
+                    let leaf_end = ops.offset().0;
+                    calls::emit_call(
+                        ops,
+                        relocations,
+                        transitions,
+                        return_sites,
+                        view,
+                        Some(callee),
+                        None,
+                        calls::CallNewTarget::None,
+                        &arguments,
+                        None,
+                        instruction.pc,
+                        dst,
+                        committed_throw,
+                        threw,
+                        fatal,
+                    )?;
+                    dynasm!(ops ; .arch x64 ; =>done);
                     if let Some(code_map) = code_map.as_mut() {
                         code_map.record(CodeRegion::static_native_structural(
                             "nativeLeafCall",
                             start,
-                            ops.offset().0,
+                            leaf_end,
                             view.code_block.id,
                             instruction.pc,
                             byte_pc,
@@ -954,6 +980,7 @@ pub(crate) fn emit_operation(
                 dst,
                 committed_throw,
                 threw,
+                fatal,
             )?;
             if let Some(target) = view
                 .direct_callees
@@ -1007,6 +1034,7 @@ pub(crate) fn emit_operation(
                 dst,
                 committed_throw,
                 threw,
+                fatal,
             )?;
         }
         TemplateOp::Construct {
@@ -1043,6 +1071,7 @@ pub(crate) fn emit_operation(
                 dst,
                 committed_throw,
                 threw,
+                fatal,
             )?;
             if let Some(target) = view
                 .direct_constructs
@@ -1097,6 +1126,7 @@ pub(crate) fn emit_operation(
                 dst,
                 committed_throw,
                 threw,
+                fatal,
             )?;
         }
         TemplateOp::Throw { src } => {

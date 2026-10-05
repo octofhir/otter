@@ -3574,6 +3574,9 @@ impl<'a> Codegen<'a> {
         let (threw, committed_throw) = self.throw_targets(node);
         let threw = self.cond_target(threw);
         let committed_throw = self.cond_target(committed_throw);
+        // A callee's Fatal is final: no handler may observe it and its parked
+        // error must not be projected into an exception again.
+        let fatal = self.cond_target(self.fatal);
         let completion = self.ops.new_dynamic_label();
         let error = self.ops.new_dynamic_label();
         let done = self.ops.new_dynamic_label();
@@ -3602,6 +3605,8 @@ impl<'a> Codegen<'a> {
         dynasm!(self.ops ; .arch aarch64
             ; cmp x1, abi::NativeResultStatus::Throw as u32
             ; b.eq =>committed_throw
+            ; cmp x1, abi::NativeResultStatus::Fatal as u32
+            ; b.eq =>fatal
             ; b =>threw
             ; =>done
         );

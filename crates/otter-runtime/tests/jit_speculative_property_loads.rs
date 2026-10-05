@@ -821,7 +821,7 @@ JSON.stringify([direct, warmed, first, total, retrained]);
             entry_probe("left", "String(left(original));", "3"),
             entry_probe("right", "String(right(original));", "4"),
         ],
-        &[entry_probe("leaf", "String(leaf(changed));", "6")],
+        &[],
     );
     for caller in ["left", "right"] {
         run.assert_optimized(caller);
@@ -841,7 +841,17 @@ JSON.stringify([direct, warmed, first, total, retrained]);
     assert_eq!(exits.len(), 1, "the callee must retrain once: {exits:?}");
     assert_eq!(exits[0].1, ExitReason::ShapeGuard);
     assert!(run.stats.jit_caller_invalidations >= 2, "{:?}", run.stats);
-    run.assert_recompiled_after_last_exit("leaf");
+    // Retraining ends after one interpreted path; the new shape then reaches
+    // generated code through re-optimized callers that splice `leaf` again.
+    let names = run.function_names();
+    assert!(
+        run.events[exits[0].0..].iter().any(|event| matches!(event,
+            JitDebugEvent::InlineLowered {
+                tier: JitDebugTier::Optimizing, callee_function_id,
+                outcome: otter_vm::JitInlineLoweringOutcome::Inlined, ..
+            } if names.get(callee_function_id).is_some_and(|name| name == "leaf"))),
+        "retrained leaf feedback must reach a replacement generation"
+    );
 }
 
 #[test]

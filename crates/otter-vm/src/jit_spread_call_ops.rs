@@ -86,32 +86,21 @@ impl Interpreter {
             // per-call `[[Get]]` chain walk. The cached steps run no user
             // code and never allocate.
             let mut method = Value::undefined();
-            // A shaped receiver whose resolution the site already records
-            // changes no feedback, so the layout capture (chain migration,
-            // lookup and shape registration) is skipped, as a V8 IC hit
-            // leaves its feedback slot untouched.
             let mut capture = capture_site;
             if capture
                 && let Some(site) = feedback_site
-                && let Some(obj) = receiver.as_object()
-                && !crate::object::keyed_shape(obj, &interp.gc_heap).is_null()
-            {
-                method = interp.cached_method_resolution(
+                && let Some(recorded) = interp.recorded_method_call(
                     context,
                     function_id,
                     name_index,
                     site,
                     property_slot,
-                    obj,
-                );
-                let recv_shape = crate::object::shape_id(obj, &interp.gc_heap);
-                if let Some(target) = interp.method_feedback_target(method, args_len)
-                    && interp.method_feedback_records(site, recv_shape, target)
-                {
-                    capture = false;
-                } else {
-                    method = Value::undefined();
-                }
+                    receiver,
+                    args_len,
+                )
+            {
+                method = recorded;
+                capture = false;
             }
             let method_site = capture
                 .then(|| {
@@ -158,6 +147,7 @@ impl Interpreter {
             // saturation the site would repeat this capture on every call.
             if capture
                 && method_site.is_none()
+                && receiver.as_object().is_some()
                 && let Some(feedback_site) = feedback_site
             {
                 interp.saturate_method_site_feedback(feedback_site);
@@ -218,6 +208,40 @@ impl Interpreter {
         let result = resolve(self, stack);
         self.pop_iteration_anchors_to(receiver_anchor);
         result
+    }
+
+    /// The cached method of a shaped receiver whose resolution `site`
+    /// already records, or `None` when the call would change its feedback.
+    /// A recorded call skips the layout capture (chain migration, lookup and
+    /// shape registration), as a V8 IC hit leaves its feedback slot
+    /// untouched. Runs no user code and never allocates.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn recorded_method_call(
+        &mut self,
+        context: &ExecutionContext,
+        function_id: u32,
+        name_index: u32,
+        site: usize,
+        property_slot: Option<crate::feedback::PropertyFeedbackSlot<'_>>,
+        receiver: Value,
+        args_len: usize,
+    ) -> Option<Value> {
+        let obj = receiver.as_object()?;
+        if crate::object::keyed_shape(obj, &self.gc_heap).is_null() {
+            return None;
+        }
+        let method = self.cached_method_resolution(
+            context,
+            function_id,
+            name_index,
+            site,
+            property_slot,
+            obj,
+        );
+        let recv_shape = crate::object::shape_id(obj, &self.gc_heap);
+        let target = self.method_feedback_target(method, args_len)?;
+        self.method_feedback_records(site, recv_shape, target)
+            .then_some(method)
     }
 
     /// The method a shaped receiver's site caches resolve without user code:

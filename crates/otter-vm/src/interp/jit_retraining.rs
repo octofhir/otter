@@ -1,9 +1,8 @@
 //! Interpreted execution evidence required before replacing deoptimized code.
 //!
 //! # Contents
-//! - Native retirement and deterministic source-work admission for one function.
+//! - Optimized-code retirement and entry routing for one retraining function.
 //! - Fresh-activation and complete-loop evidence carried by cold frame records.
-//! - One work debit for each opcode actually dispatched by the interpreter.
 //!
 //! # Invariants
 //! - The existing tier policy owns all per-function retraining state.
@@ -13,40 +12,23 @@
 //!   same loop header prove a complete iteration even in a non-returning loop.
 //! - Frame evidence names the retraining generation, so an older recursive
 //!   activation cannot complete a newer observation.
+//! - One completed path ends retraining; the re-optimization work window is
+//!   the tier policy's, earned in baseline code as well as interpreted.
 //!
 //! # See also
 //! - [`crate::tier_policy`] for the deterministic work model and state owner.
 //! - [`crate::cold_frame`] for activation-local evidence.
 
-use crate::tier_policy::{CostedTier, RetrainingActivation, TierWorkInput, TierWorkModel};
+use crate::tier_policy::{CostedTier, RetrainingActivation};
 use crate::{ExecutionContext, Frame, Interpreter};
 
 impl Interpreter {
     pub(crate) fn begin_jit_retraining(&mut self, context: &ExecutionContext, fid: u32) {
-        let work = context
-            .for_function(fid)
-            .ok()
-            .and_then(|owner| {
-                let function = owner.exec_function(fid)?;
-                let instructions = u64::try_from(function.code.len())
-                    .unwrap_or(u64::MAX)
-                    .max(1);
-                self.optimizing_tier_policy.bind_source(function);
-                Some(
-                    TierWorkModel::calibrated().minimum_required_work(TierWorkInput {
-                        tier: CostedTier::Optimizing,
-                        observed_work: 0,
-                        bytecode_instructions: instructions,
-                        register_count: u64::from(function.register_count),
-                        parameter_count: u64::from(function.param_count),
-                        available_code_bytes: self.jit_code_registry.available_code_bytes(),
-                        previous_compile_attempts: self
-                            .optimizing_tier_policy
-                            .compile_attempts(fid, CostedTier::Optimizing),
-                    }),
-                )
-            })
-            .unwrap_or(1);
+        if let Ok(owner) = context.for_function(fid)
+            && let Some(function) = owner.exec_function(fid)
+        {
+            self.optimizing_tier_policy.bind_source(function);
+        }
         // Only optimized code embeds the failed speculation: drop it and the
         // optimized callers that spliced it. The baseline generation stays
         // installed while the stable cell routes entries to the interpreter.
@@ -63,13 +45,28 @@ impl Interpreter {
         }
         self.jit_code_registry.set_retraining(fid, true);
         self.discard_invalidated_jit_state(&affected);
-        self.optimizing_tier_policy.begin_retraining(fid, work);
+        self.optimizing_tier_policy.begin_retraining(fid);
     }
 
-    /// Restore `fid`'s stable cell once its retraining evidence completes.
+    /// Restore `fid`'s stable cell once its retraining evidence completes,
+    /// and re-arm the baseline generation's source-work wakeup: its earlier
+    /// optimized outcome suppressed further requests, and the deopt's
+    /// feedback change starts a fresh optimizing work window.
     fn finish_jit_retraining_if_complete(&mut self, fid: u32) {
-        if !self.jit_retraining_blocks(fid) {
-            self.jit_code_registry.set_retraining(fid, false);
+        if self.jit_retraining_blocks(fid) {
+            return;
+        }
+        self.jit_code_registry.set_retraining(fid, false);
+        if let Ok(context) = self.function_context(None, fid)
+            && let Some(function) = context.exec_function(fid)
+        {
+            let decision = self.optimizing_tier_policy.decide(
+                function,
+                CostedTier::Optimizing,
+                self.jit_code_registry.available_code_bytes(),
+            );
+            self.jit_code_registry
+                .defer_generated_tiering(fid, decision.work_target);
         }
     }
 
@@ -90,26 +87,6 @@ impl Interpreter {
             Some(RetrainingActivation::new(generation, true));
     }
 
-    pub(crate) fn note_interpreted_retraining_step(&mut self, frame: &mut Frame) {
-        let Some(generation) = self
-            .optimizing_tier_policy
-            .retraining_generation(frame.function_id)
-        else {
-            return;
-        };
-        let fid = frame.function_id;
-        let token = &mut self.frame_ensure_cold(frame).tier_retraining;
-        if token
-            .as_ref()
-            .is_none_or(|token| token.generation != generation)
-        {
-            *token = Some(RetrainingActivation::new(generation, false));
-        }
-        self.optimizing_tier_policy
-            .note_interpreted_work(fid, generation);
-        self.finish_jit_retraining_if_complete(fid);
-    }
-
     pub(crate) fn note_interpreted_retraining_backedge(&mut self, frame: &mut Frame) {
         let Some(generation) = self
             .optimizing_tier_policy
@@ -118,11 +95,18 @@ impl Interpreter {
             return;
         };
         let (fid, header) = (frame.function_id, frame.pc);
-        let token = self
-            .frame_cold_mut(frame)
-            .and_then(|cold| cold.tier_retraining.as_mut());
+        // A deopt suffix enters without a fresh activation token; its first
+        // backedge starts the loop evidence of this generation.
+        let token = &mut self.frame_ensure_cold(frame).tier_retraining;
         if token
-            .is_some_and(|token| token.generation == generation && token.observe_backedge(header))
+            .as_ref()
+            .is_none_or(|token| token.generation != generation)
+        {
+            *token = Some(RetrainingActivation::new(generation, false));
+        }
+        if token
+            .as_mut()
+            .is_some_and(|token| token.observe_backedge(header))
         {
             self.optimizing_tier_policy
                 .note_completed_interpreted_path(fid, generation);
@@ -155,16 +139,19 @@ mod tests {
             .test_frame_for_function(&otter_bytecode::Function::default())
             .unwrap();
         let fid = frame.function_id;
-        vm.optimizing_tier_policy.begin_retraining(fid, 2);
-        vm.note_interpreted_retraining_step(&mut frame);
+        vm.optimizing_tier_policy.begin_retraining(fid);
         frame.pc = 10;
         vm.note_interpreted_retraining_backedge(&mut frame);
-        assert!(vm.jit_retraining_blocks(fid));
-        vm.note_interpreted_retraining_step(&mut frame);
         assert!(
             vm.jit_retraining_blocks(fid),
-            "exhausted work cannot certify a deopt suffix"
+            "the first backedge may close only a deopt suffix"
         );
+        vm.complete_interpreted_retraining_activation(&mut frame);
+        assert!(
+            vm.jit_retraining_blocks(fid),
+            "a suffix return is no fresh activation"
+        );
+        vm.note_interpreted_retraining_backedge(&mut frame);
         vm.note_interpreted_retraining_backedge(&mut frame);
         assert!(
             !vm.jit_retraining_blocks(fid),
@@ -181,10 +168,11 @@ mod tests {
         let mut inner = vm.test_frame_for_function(&function).unwrap();
         let fid = outer.function_id;
         assert_eq!(inner.function_id, fid);
-        vm.optimizing_tier_policy.begin_retraining(fid, 1);
+        vm.optimizing_tier_policy.begin_retraining(fid);
         vm.begin_interpreted_retraining_activation(&mut outer);
-        vm.optimizing_tier_policy.begin_retraining(fid, 1);
-        vm.note_interpreted_retraining_step(&mut inner);
+        vm.optimizing_tier_policy.begin_retraining(fid);
+        inner.pc = 4;
+        vm.note_interpreted_retraining_backedge(&mut inner);
         vm.complete_interpreted_retraining_activation(&mut outer);
         vm.complete_interpreted_retraining_activation(&mut inner);
         assert!(

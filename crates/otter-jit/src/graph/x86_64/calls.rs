@@ -313,8 +313,13 @@ impl Codegen<'_> {
         dynasm!(self.ops ; .arch x64 ; jmp =>completion ; =>error);
         self.stamp_node_safepoint(node)?;
         self.stamp_pc(node);
+        // A callee's Fatal is final: no handler may observe it and its parked
+        // error must not be projected into an exception again.
+        let fatal = self.fatal;
         dynasm!(self.ops ; .arch x64
-            ; cmp edx, abi::NativeResultStatus::Throw as i32 ; je =>committed ; jmp =>threw ; =>done);
+            ; cmp edx, abi::NativeResultStatus::Throw as i32 ; je =>committed
+            ; cmp edx, abi::NativeResultStatus::Fatal as i32 ; je =>fatal
+            ; jmp =>threw ; =>done);
         Ok(())
     }
     pub(super) fn emit_generic(

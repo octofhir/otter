@@ -138,7 +138,7 @@ fn collecting_return_get_and_call_preserve_incoming_throw_or_exact_absence() {
                             assert!(interp.pending_uncaught_throw.is_none());
                         }
                         assert_eq!(interp.error_detail(), detail);
-                        assert!(interp.pending_uncaught_frames.is_none());
+                        assert!(interp.pending_throw_provenance.is_none());
                         Ok((before, root))
                     })
                 },

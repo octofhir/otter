@@ -172,7 +172,7 @@ fn owned_completed_failures_restore_exact_payload_and_reject_catchable_inputs() 
         Err(VmError::BudgetExceeded),
     );
     assert_eq!(vm.error_detail(), failure.detail);
-    assert_eq!(vm.pending_uncaught_frames, Some(frames));
+    assert_eq!(vm.pending_frames_for_test(), Some(&frames));
     assert_eq!(vm.gc_heap().stats().allocated_bytes, before);
     for error in [
         VmError::SyntaxError,
@@ -194,7 +194,7 @@ fn owned_completed_failures_restore_exact_payload_and_reject_catchable_inputs() 
             Err(VmError::InvalidOperand),
         );
         assert!(vm.error_detail().is_none());
-        assert!(vm.pending_uncaught_frames.is_none());
+        assert!(vm.pending_throw_provenance.is_none());
         assert!(vm.pending_uncaught_throw.is_none());
     }
     assert_eq!(vm.gc_heap().stats().allocated_bytes, before);

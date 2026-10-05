@@ -86,7 +86,7 @@ fn check(fatal: bool) {
                 let interp = scope.context().interp_mut();
                 interp.set_pending_uncaught_throw(current);
                 let _ = interp.err_uncaught("original completion".into());
-                interp.pending_uncaught_frames = Some(frames.clone());
+                interp.set_uncaught_frames(frames.clone());
                 let before = interp.gc_heap().gc_cycle_counts();
                 let result =
                     super::preserving_completion(&mut scope, Some(&context), iterator, "Set");
@@ -118,7 +118,7 @@ fn check(fatal: bool) {
                     );
                     assert!(interp.error_detail().is_none());
                     assert_ne!(
-                        interp.pending_uncaught_frames.as_ref(),
+                        interp.pending_frames_for_test(),
                         Some(&frames),
                         "incoming provenance is not restored over fatal cleanup"
                     );
@@ -129,7 +129,7 @@ fn check(fatal: bool) {
                         interp.error_detail(),
                         Some(crate::ErrorDetail::Uncaught("original completion".into()))
                     );
-                    assert_eq!(interp.pending_uncaught_frames.as_ref(), Some(&frames));
+                    assert_eq!(interp.pending_frames_for_test(), Some(&frames));
                 }
             })
         },

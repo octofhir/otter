@@ -1876,7 +1876,7 @@ pub fn vm_to_native_error(
         // second JavaScript error allocation in the enclosing native body.
         crate::VmError::OutOfMemory { .. } => NativeError::ExecutionFailure(crate::RunError {
             error: err,
-            frames: interp.pending_uncaught_frames.clone().unwrap_or_default(),
+            frames: interp.pending_uncaught_frames(),
             // OOM has only its exact scalar cause; older dynamic detail cannot
             // describe this allocation refusal.
             detail: None,

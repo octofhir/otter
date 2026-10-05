@@ -171,7 +171,7 @@ fn settle_from_root<R: IntoJs>(
         Ok(None) => Ok(()),
         Err(error) => Err(crate::RunError {
             error,
-            frames: interp.pending_uncaught_frames.take().unwrap_or_default(),
+            frames: interp.take_uncaught_frames(),
             detail: interp.take_error_detail(),
         }),
     }
@@ -234,7 +234,7 @@ fn settle_from_root_in_active_realm<R: IntoJs>(
     );
     conversion.map_err(|error| crate::RunError {
         error,
-        frames: interp.pending_uncaught_frames.take().unwrap_or_default(),
+        frames: interp.take_uncaught_frames(),
         detail: interp.take_error_detail(),
     })?;
     // Reactions created during settlement may have no explicit origin. The

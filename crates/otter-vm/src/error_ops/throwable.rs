@@ -40,7 +40,7 @@ impl Interpreter {
         // no longer in flight; a subsequent reaction may fail without setting
         // dynamic detail (for example InvalidOperand).
         let _ = self.take_error_detail();
-        let _ = self.pending_uncaught_frames.take();
+        self.clear_throw_provenance();
         Ok(value)
     }
 

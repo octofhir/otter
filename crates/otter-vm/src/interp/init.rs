@@ -279,7 +279,7 @@ impl Interpreter {
             uncaught_from_promise_rejection: false,
             async_context: Value::undefined(),
             iteration_anchors: Vec::new(),
-            pending_uncaught_frames: None,
+            pending_throw_provenance: None,
             resource_account: otter_resource::ResourceAccount::default(),
             function_user_props: std::collections::HashMap::new(),
             function_prototype_overrides: std::collections::HashMap::new(),

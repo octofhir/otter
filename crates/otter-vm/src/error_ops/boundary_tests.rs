@@ -405,7 +405,7 @@ fn allocating_vm_throwable_failure_consumes_original_detail_but_preserves_source
                 source_position: None,
             }];
             let interp = scope.context().interp_mut();
-            interp.pending_uncaught_frames = Some(frames.clone());
+            interp.set_uncaught_frames(frames.clone());
             let original = interp.err_syntax("m".repeat(cap as usize).into());
             let before = interp.gc_heap().gc_cycle_counts();
             let error = interp
@@ -421,7 +421,7 @@ fn allocating_vm_throwable_failure_consumes_original_detail_but_preserves_source
                 interp.error_detail().is_none(),
                 "OOM cannot inherit the consumed syntax detail"
             );
-            assert_eq!(interp.pending_uncaught_frames.as_ref(), Some(&frames));
+            assert_eq!(interp.pending_frames_for_test(), Some(&frames));
             assert!(interp.pending_uncaught_throw.is_none());
             assert_ne!(scope.raw(child).as_object().unwrap().offset(), old_offset);
             assert_eq!(scope.raw(child), scope.raw(alias));

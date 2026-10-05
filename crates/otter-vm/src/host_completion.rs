@@ -47,7 +47,7 @@ use crate::{Interpreter, RunError};
 /// occurs; an operation's new error/provenance is retained after this reset.
 pub(crate) fn clear_pending_error(interp: &mut Interpreter) {
     let _ = interp.take_pending_uncaught_throw();
-    let _ = interp.pending_uncaught_frames.take();
+    interp.clear_throw_provenance();
     let _ = interp.take_error_detail();
     let _ = interp.take_uncaught_from_promise_rejection();
 }

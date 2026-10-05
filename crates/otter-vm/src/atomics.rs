@@ -816,7 +816,7 @@ fn wait_async_parked(
                     settle_wait_async(interp, root, "ok", context.as_ref()).map_err(|error| {
                         crate::RunError {
                             error,
-                            frames: interp.pending_uncaught_frames.take().unwrap_or_default(),
+                            frames: interp.take_uncaught_frames(),
                             detail: interp.take_error_detail(),
                         }
                     })?;
@@ -827,7 +827,7 @@ fn wait_async_parked(
                 Ok(None) => Ok(()),
                 Err(error) => Err(crate::RunError {
                     error,
-                    frames: interp.pending_uncaught_frames.take().unwrap_or_default(),
+                    frames: interp.take_uncaught_frames(),
                     detail: interp.take_error_detail(),
                 }),
             }

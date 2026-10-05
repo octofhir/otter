@@ -307,7 +307,7 @@ impl Interpreter {
         // handled job diagnostics must not become this hook's completion.
         let _ = self.take_pending_uncaught_throw();
         let _ = self.take_error_detail();
-        self.pending_uncaught_frames = None;
+        self.clear_throw_provenance();
         self.uncaught_from_promise_rejection = false;
         let reason = match promise.state(&self.gc_heap) {
             crate::promise::PromiseState::Rejected(reason) => reason,
@@ -327,7 +327,7 @@ impl Interpreter {
                 let error = crate::native_to_vm_error(self, error);
                 RunError {
                     error,
-                    frames: self.pending_uncaught_frames.take().unwrap_or_default(),
+                    frames: self.take_uncaught_frames(),
                     detail: self.take_error_detail(),
                 }
             });
@@ -364,7 +364,7 @@ impl Interpreter {
                 let detail = self.take_error_detail();
                 let error = RunError {
                     error,
-                    frames: self.pending_uncaught_frames.take().unwrap_or_default(),
+                    frames: self.take_uncaught_frames(),
                     detail,
                 };
                 self.report_microtask_failure(context.as_ref(), error, report)

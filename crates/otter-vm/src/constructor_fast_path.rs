@@ -306,6 +306,7 @@ mod tests {
                     source_text_span: None,
                     module_url: String::new(),
                     contains_direct_eval: false,
+                    primordial_iteration: false,
                     code: code.into(),
                     spans: Vec::new(),
                     handlers: Vec::new(),

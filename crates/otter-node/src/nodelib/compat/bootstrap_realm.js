@@ -1030,8 +1030,15 @@ const uvErrors = [
   ['EPIPE', -32, 'broken pipe'],
   ['ETIMEDOUT', -60, 'connection timed out'],
 ];
-const uvErrmap = new Map(uvErrors.map(([name, code, message]) => [code, [name, message]]));
-const uvNameToCode = new Map(uvErrors.map(([name, code]) => [name, code]));
+// Built without the iteration protocol: this module loads lazily, after user
+// code may have replaced Array or Map iteration.
+const uvErrmap = new Map();
+const uvConstants = {};
+for (let i = 0; i < uvErrors.length; i++) {
+  const { 0: name, 1: code, 2: message } = uvErrors[i];
+  uvErrmap.set(code, [name, message]);
+  uvConstants[`UV_${name}`] = code;
+}
 
 const privateSymbols = {
   arrow_message_private_symbol: Symbol('node:arrowMessage'),
@@ -1084,7 +1091,7 @@ const bindings = {
     },
     getErrorMap() { return uvErrmap; },
     getErrorMessage(code) { return uvErrmap.get(code)?.[1] ?? 'unknown error'; },
-    ...Object.fromEntries(uvErrors.map(([name, code]) => [`UV_${name}`, code])),
+    ...uvConstants,
   },
   constants: {
     os: {

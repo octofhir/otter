@@ -263,6 +263,16 @@ impl CollectionKind {
         }
     }
 
+    /// The built-in adder AddEntriesFromIterable calls.
+    fn builtin_adder(self) -> crate::native_function::NativeFastFn {
+        match self {
+            Self::Map => map_proto_set,
+            Self::Set => set_proto_add,
+            Self::WeakMap => weak_map_proto_set,
+            Self::WeakSet => weak_set_proto_add,
+        }
+    }
+
     const fn is_pair(self) -> bool {
         matches!(self, Self::Map | Self::WeakMap)
     }
@@ -504,14 +514,13 @@ fn apply_collection_new_target_prototype(
 /// `Get`, walk the iterable via §7.4 protocol, call the adder on
 /// each entry. On abrupt completion the iterator is closed.
 ///
-/// Two paths: built-in iterables (`Array` / `Map` / `Set` /
-/// `Generator` / `String`) hit
-/// [`crate::Interpreter::iterator_to_list_sync`]'s fast paths,
-/// which materialise the entries before any adder call. User-
-/// defined iterables (`Value::Object` carrying `@@iterator`) go
-/// through `GetIterator` / `IteratorStep` lazily so spec tests
-/// like `iterator-close-after-set-failure.js` observe the
-/// iterator-close ladder.
+/// Two paths: when no step can run user code — the built-in adder over a
+/// built-in iterable whose protocol is proven (or that runtime-internal
+/// code passed) — the entries are materialised
+/// through [`crate::Interpreter::iterator_to_list_sync`] before any adder
+/// call. Everything else goes through `GetIterator` / `IteratorStep`
+/// lazily so spec tests like `iterator-close-after-set-failure.js` observe
+/// the iterator-close ladder.
 ///
 /// # See also
 /// - <https://tc39.es/ecma262/#sec-add-entries-from-iterable>
@@ -564,22 +573,19 @@ fn add_entries_from_iterable<'s>(
     }
     let adder_h = scope.value(adder);
 
+    let builtin_adder = scope
+        .raw(adder_h)
+        .as_native_function()
+        .is_some_and(|adder| adder.is_static_fn(scope.context().heap(), kind.builtin_adder()));
     let iterable = scope.raw(iterable_h);
-    if iterable_uses_fast_materialization(&iterable) {
+    let intrinsic = builtin_adder
+        && scope.with_turn_parts(|interp, stack| {
+            interp.intrinsic_iterable(&context, stack, iterable)
+        });
+    if intrinsic {
         return add_entries_eager(scope, &context, target_h, iterable_h, kind, adder_h);
     }
     add_entries_lazy(scope, &context, target_h, iterable_h, kind, adder_h)
-}
-
-/// `true` when the iterable matches one of
-/// [`crate::Interpreter::iterator_to_list_sync`]'s fast-path
-/// branches.
-fn iterable_uses_fast_materialization(iterable: &Value) -> bool {
-    iterable.is_array()
-        || iterable.is_string()
-        || iterable.is_map()
-        || iterable.is_set()
-        || iterable.is_generator()
 }
 
 fn add_entries_eager<'s>(
@@ -923,7 +929,7 @@ fn map_proto_values(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, N
     make_map_iterator(ctx, m, MapIterKind::Values)
 }
 
-fn map_proto_entries(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+pub(crate) fn map_proto_entries(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
     let m = receiver_map(ctx, "Map.prototype.entries")?;
     make_map_iterator(ctx, m, MapIterKind::Entries)
 }
@@ -1141,7 +1147,7 @@ fn set_proto_keys(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, Nat
     set_proto_values(ctx, _args)
 }
 
-fn set_proto_values(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+pub(crate) fn set_proto_values(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
     let s = receiver_set(ctx, "Set.prototype.values")?;
     let set_value = Value::set(s);
     let iter = ctx
@@ -2077,7 +2083,11 @@ fn set_record_keys(
                 let slot = push_anchored(ctx, iterator);
                 return Ok(SetRecordKeys::Generator { slot });
             }
-            if iterator.is_iterator() {
+            // A built-in keys iterator whose `next` is proven built-in is
+            // drained directly; proving it may move it, so it is anchored.
+            let iterator_slot = push_anchored(ctx, iterator);
+            if iterator.is_iterator() && ctx.interp_mut().builtin_next_proven(iterator) {
+                let iterator = anchored(ctx, iterator_slot);
                 let values = ctx.with_turn_parts(|interp, stack| {
                     interp
                         .iterator_to_list_sync(context, stack, &iterator)
@@ -2085,6 +2095,7 @@ fn set_record_keys(
                 })?;
                 return Ok(snapshot(ctx, values));
             }
+            let iterator = anchored(ctx, iterator_slot);
             // §24.2.1.2 GetKeysIterator returns the value of `keys()`
             // *as* the iterator: the set methods step it through
             // `Get(keysIter, "next")` and never read `@@iterator`. Do not
@@ -2095,8 +2106,6 @@ fn set_record_keys(
                     reason: "set-like keys did not return an object".to_string(),
                 });
             }
-            let iterator_slot = push_anchored(ctx, iterator);
-            let iterator = anchored(ctx, iterator_slot);
             let next_method = read_property(ctx, context, &iterator, "next", name)?;
             if !ctx.interp_mut().is_callable_runtime(&next_method) {
                 return Err(NativeError::TypeError {

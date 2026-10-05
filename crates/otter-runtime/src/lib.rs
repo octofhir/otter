@@ -1838,7 +1838,10 @@ fn embedded_commonjs_module(
         };
         return hook
             .compile(RuntimeCompileRequest { source: &source })
-            .map(|compiled| otter_vm::CompiledEvalSource::Fresh(compiled.bytecode))
+            .map(|mut compiled| {
+                compiled.bytecode.mark_primordial_iteration();
+                otter_vm::CompiledEvalSource::Fresh(compiled.bytecode)
+            })
             .map_err(|error| error.to_string());
     }
     otter_bytecode::binary::decode_module(unit.bytecode)

@@ -246,6 +246,8 @@ pub(crate) struct RealmIntrinsics {
     array_values: crate::native_function::NativeFunction,
     /// Whether this realm's `%RegExp.prototype%` is built-in, while proven.
     pub(crate) regexp_protocol: Option<crate::regexp_fast::RegExpProtocolProof>,
+    /// Which iteration reads have built-in answers in this realm, while proven.
+    pub(crate) iteration: crate::iteration_protocol::IterationProofs,
 }
 
 impl Default for RealmIntrinsics {
@@ -254,6 +256,7 @@ impl Default for RealmIntrinsics {
             slots: [JsObject::null(); Intrinsic::COUNT],
             array_values: crate::native_function::NativeFunction::from_gc(otter_gc::Gc::null()),
             regexp_protocol: None,
+            iteration: crate::iteration_protocol::IterationProofs::default(),
         }
     }
 }

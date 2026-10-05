@@ -152,6 +152,10 @@ enum IteratorStateSnapshot {
 }
 
 impl Interpreter {
+    /// `GetIterator` for a value whose record needs no observable read (see
+    /// [`Self::unobservable_iterator_record`]); any other value is a
+    /// `TypeMismatch` here.
+    #[cfg(test)]
     pub(crate) fn run_get_iterator_regs(
         &mut self,
         stack: &mut ActivationStack,
@@ -159,51 +163,12 @@ impl Interpreter {
         dst: u16,
         src: u16,
     ) -> Result<(), VmError> {
-        let frame = &stack[top_idx];
-        let value = *read_register(frame, src)?;
-        let state = if let Some(array) = value.as_array() {
-            IteratorState::Array {
-                array,
-                index: 0,
-                origin: crate::BuiltinIteratorOrigin::Array,
-            }
-        } else if let Some(string) = value.as_string(&self.gc_heap) {
-            IteratorState::String { string, index: 0 }
-        } else if let Some(m) = value.as_map() {
-            // `for…of` over a `Map` yields `[key, value]` pairs (Spec
-            // §24.1.3.12 — `@@iterator` aliases `entries`). A live
-            // `MapCollection` iterator walks the backing entry table by
-            // index so additions / deletions during iteration are
-            // observed per §24.1.5.1 CreateMapIterator.
-            IteratorState::MapCollection {
-                map: m,
-                index: 0,
-                kind: crate::MapIteratorKind::Entry,
-            }
-        } else if let Some(s) = value.as_set() {
-            // §24.2.3.11 — `for…of` over a `Set` yields values via a
-            // live `SetCollection` iterator (§24.2.5.1).
-            IteratorState::SetCollection {
-                set: s,
-                index: 0,
-                kind: crate::SetIteratorKind::Value,
-            }
-        } else if let Some(handle) = value.as_generator() {
-            // §27.5 — generator objects are iterable; `[@@iterator]()` returns
-            // the generator itself, and `next()` drives the suspended body.
-            IteratorState::Generator { handle }
-        } else if let Some(rc) = value.as_iterator() {
-            // Already-an-iterator should pass through unchanged.
-            let frame = &mut stack[top_idx];
-            write_register(frame, dst, Value::iterator(rc))?;
-            frame.advance_pc()?;
-            return Ok(());
-        } else {
-            return Err(VmError::TypeMismatch);
-        };
-        let iter = self.alloc_stack_rooted_iterator_state(stack, state, &[&value], &[])?;
+        let value = *read_register(&stack[top_idx], src)?;
+        let record = self
+            .unobservable_iterator_record(stack, value, false)?
+            .ok_or(VmError::TypeMismatch)?;
         let frame = &mut stack[top_idx];
-        write_register(frame, dst, Value::iterator(iter))?;
+        write_register(frame, dst, record)?;
         frame.advance_pc()?;
         Ok(())
     }
@@ -358,9 +323,10 @@ impl Interpreter {
         })
     }
 
-    /// §7.4.2 GetIteratorDirect — wrap the object returned by a user
-    /// `[@@iterator]()` into an iterator `Value`, reading `next` exactly
-    /// once and caching it in the record. Shared by the interpreter's
+    /// §7.4.2 GetIteratorDirect — wrap the object returned by
+    /// `[@@iterator]()` into an iterator record, reading `next` exactly
+    /// once and caching it unless it is the built-in step of a built-in
+    /// iterator. Shared by the interpreter's
     /// frame-push resume path and the synchronous [`Self::get_iterator_full`]
     /// reentrant transition, so both tiers observe identical accessor and
     /// prototype effects.
@@ -369,14 +335,21 @@ impl Interpreter {
         context: &ExecutionContext,
         stack: &mut ActivationStack,
         produced: Value,
+        primordial: bool,
     ) -> Result<Value, CommittedValueError> {
         self.with_handle_scope(|interp, scope| {
             let produced_root = interp.scoped_value(scope, produced);
 
-            // §7.4.3 step 2 — `[@@iterator]()` must return an Object.
-            if let Some(iter) = produced.as_iterator() {
-                return Ok(Value::iterator(iter));
+            // A built-in iterator whose `next` is proven built-in (or that
+            // runtime-internal code steps intrinsically) is its own record.
+            if produced.is_iterator()
+                && (primordial && interp.plain_iterator_origin(produced).is_some()
+                    || interp.builtin_next_proven(produced))
+            {
+                return Ok(interp.escape_scoped(produced_root));
             }
+            let produced = interp.escape_scoped(produced_root);
+            // §7.4.3 step 2 — `[@@iterator]()` must return an Object.
             let iter_state = if let Some(handle) = produced.as_generator() {
                 IteratorState::Generator { handle }
             } else if produced.is_object()
@@ -384,6 +357,7 @@ impl Interpreter {
                 || produced.is_array()
                 || produced.is_map()
                 || produced.is_set()
+                || produced.is_iterator()
             {
                 // `next` is read ONCE here; later `IteratorNext` ticks must not
                 // re-read it (observable via an accessor-defined `next`).
@@ -406,6 +380,9 @@ impl Interpreter {
                         )
                         .map_err(CommittedValueError::completed_call)?,
                 };
+                if interp.is_builtin_next(interp.escape_scoped(produced_root), next_method) {
+                    return Ok(interp.escape_scoped(produced_root));
+                }
                 IteratorState::User {
                     iterator: interp.escape_scoped(produced_root),
                     next_method: Some(next_method),
@@ -428,13 +405,12 @@ impl Interpreter {
     /// Complete one `Op::GetIterator` synchronously for a compiled frame.
     ///
     /// This is the reentrant sibling of the interpreter's frame-push
-    /// [`Self::drive_get_iterator`]: user `[Symbol.iterator]()` methods run
+    /// [`Self::drive_get_iterator`]: a user `[Symbol.iterator]()` method runs
     /// through [`Self::run_callable_sync`] instead of suspending the opcode on
     /// a parked continuation, so the JIT never resumes a partially observed
-    /// GetIterator. Built-in iterables fall through to the shared
-    /// [`Self::run_get_iterator_regs`] fast path. Every observable accessor,
-    /// `@@iterator` call, and GetIteratorDirect `next` read is committed before
-    /// the destination register is written; there is no post-effect side exit.
+    /// GetIterator. Every observable accessor, `@@iterator` call and
+    /// GetIteratorDirect `next` read is committed before the destination
+    /// register is written; there is no post-effect side exit.
     pub(crate) fn get_iterator_full(
         &mut self,
         context: &ExecutionContext,
@@ -447,126 +423,48 @@ impl Interpreter {
             let value = *read_register(&stack[top_idx], src)
                 .map_err(|error| CommittedValueError::Fatal(error.into()))?;
             let value_root = interp.scoped_value(scope, value);
-            let iter_sym = interp.well_known_symbols.get(symbol::WellKnown::Iterator);
-
-            // Arrays with an own or prototype `@@iterator` run the user method;
-            // the plain built-in Array iterator falls through to the fast path.
-            if let Some(arr) = value.as_array() {
-                let own_method = array::get_symbol_property(arr, &interp.gc_heap, iter_sym);
-                let proto = interp
-                    .constructor_prototype_value("Array")
-                    .map_err(|error| CommittedValueError::Fatal(error.into()))?;
-                let proto_root = interp.scoped_value(scope, proto);
-                let proto_has = if own_method.is_none() {
-                    interp.ordinary_has_property_value(
-                        stack,
-                        Some(context),
-                        interp.escape_scoped(proto_root),
-                        &VmPropertyKey::Symbol(iter_sym),
-                        0,
-                    )?
-                } else {
-                    false
-                };
-                if own_method.is_some() || proto_has {
-                    let callee = if let Some(method) = own_method {
-                        method
-                    } else {
-                        match interp.ordinary_get_value(
-                            stack,
-                            Some(context),
-                            interp.escape_scoped(proto_root),
-                            interp.escape_scoped(value_root),
-                            &VmPropertyKey::Symbol(iter_sym),
-                            0,
-                        )? {
-                            VmGetOutcome::Value(v) => v,
-                            VmGetOutcome::InvokeGetter { getter } => interp
-                                .run_callable_sync_rooted(
-                                    stack,
-                                    Some(context),
-                                    &getter,
-                                    interp.escape_scoped(value_root),
-                                    SmallVec::new(),
-                                )
-                                .map_err(CommittedValueError::completed_call)?,
-                        }
-                    };
-                    if callee.is_undefined() || callee.is_null() || !is_callable(&callee) {
-                        return Err(CommittedValueError::JavaScript(VmError::TypeMismatch));
-                    }
-                    let receiver = *read_register(&stack[top_idx], src)
-                        .map_err(|error| CommittedValueError::Fatal(error.into()))?;
-                    let produced = interp
-                        .run_callable_sync_rooted(
-                            stack,
-                            Some(context),
-                            &callee,
-                            receiver,
-                            SmallVec::new(),
-                        )
-                        .map_err(CommittedValueError::completed_call)?;
-                    let wrapped = interp.wrap_iterator_method_result(context, stack, produced)?;
-                    write_register(&mut stack[top_idx], dst, wrapped)
-                        .map_err(|error| CommittedValueError::Fatal(error.into()))?;
-                    return Ok(());
-                }
-                return Err(CommittedValueError::JavaScript(VmError::TypeMismatch));
-            }
-
-            // §23.2.3.32 %TypedArray%.prototype[@@iterator] returns a live array
-            // iterator; a TypedArray is not an ordinary object, so always route it
-            // through its prototype's `@@iterator`.
-            if value.as_typed_array(&interp.gc_heap).is_some() {
-                let callee = match interp.ordinary_get_value(
-                    stack,
-                    Some(context),
-                    value,
-                    value,
-                    &VmPropertyKey::Symbol(iter_sym),
-                    0,
-                )? {
-                    VmGetOutcome::Value(v) => v,
-                    VmGetOutcome::InvokeGetter { getter } => interp
-                        .run_callable_sync_rooted(
-                            stack,
-                            Some(context),
-                            &getter,
-                            interp.escape_scoped(value_root),
-                            SmallVec::new(),
-                        )
-                        .map_err(CommittedValueError::completed_call)?,
-                };
-                if !is_callable(&callee) {
-                    return Err(CommittedValueError::JavaScript(VmError::TypeMismatch));
-                }
-                let receiver = *read_register(&stack[top_idx], src)
-                    .map_err(|error| CommittedValueError::Fatal(error.into()))?;
-                let produced = interp
-                    .run_callable_sync_rooted(
-                        stack,
-                        Some(context),
-                        &callee,
-                        receiver,
-                        SmallVec::new(),
-                    )
-                    .map_err(CommittedValueError::completed_call)?;
-                let wrapped = interp.wrap_iterator_method_result(context, stack, produced)?;
-                write_register(&mut stack[top_idx], dst, wrapped)
+            let primordial = interp.frame_iterates_primordially(context, stack, top_idx);
+            if let Some(record) = interp
+                .unobservable_iterator_record(stack, value, primordial)
+                .map_err(|error| CommittedValueError::JavaScript(error.into()))?
+            {
+                write_register(&mut stack[top_idx], dst, record)
                     .map_err(|error| CommittedValueError::Fatal(error.into()))?;
                 return Ok(());
             }
+            // §7.4.3 GetIterator step 1 — GetMethod(obj, @@iterator) runs the
+            // ordinary [[Get]], so an accessor `@@iterator` fires its getter.
+            let callee =
+                interp.get_iterator_method(stack, context, interp.escape_scoped(value_root))?;
+            let produced = interp
+                .run_callable_sync_rooted(
+                    stack,
+                    Some(context),
+                    &callee,
+                    interp.escape_scoped(value_root),
+                    SmallVec::new(),
+                )
+                .map_err(CommittedValueError::completed_call)?;
+            let wrapped =
+                interp.wrap_iterator_method_result(context, stack, produced, primordial)?;
+            write_register(&mut stack[top_idx], dst, wrapped)
+                .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+            Ok(())
+        })
+    }
 
-            // Non-object, non-proxy sources are the built-in fast path (arrays and
-            // strings handled there); everything callable-iterable goes through
-            // the ordinary `[[Get]]` ladder so an accessor `@@iterator` fires.
-            if value.as_object().is_none() && value.as_proxy().is_none() {
-                return interp
-                    .run_get_iterator_regs(stack, top_idx, dst, src)
-                    .map_err(|error| CommittedValueError::JavaScript(error.into()));
-            }
-
-            let callee = match interp.ordinary_get_value(
+    /// §7.4.3 GetIterator steps 1-2 — `GetMethod(value, @@iterator)`, which
+    /// must be callable.
+    fn get_iterator_method(
+        &mut self,
+        stack: &mut ActivationStack,
+        context: &ExecutionContext,
+        value: Value,
+    ) -> Result<Value, CommittedValueError> {
+        self.with_handle_scope(|interp, scope| {
+            let value_root = interp.scoped_value(scope, value);
+            let iter_sym = interp.well_known_symbols.get(symbol::WellKnown::Iterator);
+            let method = match interp.ordinary_get_value(
                 stack,
                 Some(context),
                 value,
@@ -585,19 +483,10 @@ impl Interpreter {
                     )
                     .map_err(CommittedValueError::completed_call)?,
             };
-            if callee.is_undefined() || callee.is_null() || !is_callable(&callee) {
-                // No `[Symbol.iterator]` — §7.4.3 step 2 throws.
+            if !is_callable(&method) {
                 return Err(CommittedValueError::JavaScript(VmError::TypeMismatch));
             }
-            let receiver = *read_register(&stack[top_idx], src)
-                .map_err(|error| CommittedValueError::Fatal(error.into()))?;
-            let produced = interp
-                .run_callable_sync_rooted(stack, Some(context), &callee, receiver, SmallVec::new())
-                .map_err(CommittedValueError::completed_call)?;
-            let wrapped = interp.wrap_iterator_method_result(context, stack, produced)?;
-            write_register(&mut stack[top_idx], dst, wrapped)
-                .map_err(|error| CommittedValueError::Fatal(error.into()))?;
-            Ok(())
+            Ok(method)
         })
     }
 
@@ -2762,19 +2651,74 @@ impl Interpreter {
         }
     }
 
-    /// Close an iterator for an incoming throw completion using the sole
-    /// rooted completion extent. Catchable cleanup never replaces the throw;
-    /// completed terminal cleanup failures retain their own disposition.
-    pub(crate) fn iterator_close_for_throw(
+    /// §7.4.11 IteratorClose(iterator, normal completion).
+    pub(crate) fn iterator_close_value_sync(
         &mut self,
         stack: &mut ActivationStack,
         context: Option<&ExecutionContext>,
         iterator: Value,
     ) -> Result<(), CommittedValueError> {
-        self.iterator_close_discarding_completion(stack, context, &iterator)
+        self.iterator_close_record(stack, context, iterator, false)
     }
 
-    pub(crate) fn iterator_close_value_sync(
+    /// `Op::IteratorClose` / `Op::IteratorCloseThrow` for the activation at
+    /// `frame_index`: a throw completion keeps its own value over the
+    /// close's catchable failures.
+    pub(crate) fn iterator_close_op(
+        &mut self,
+        context: &ExecutionContext,
+        stack: &mut ActivationStack,
+        frame_index: usize,
+        iterator: Value,
+        throw: bool,
+    ) -> Result<(), CommittedValueError> {
+        let primordial = self.frame_iterates_primordially(context, stack, frame_index);
+        if !throw {
+            return self.iterator_close_record(stack, Some(context), iterator, primordial);
+        }
+        self.with_handle_scope(|interp, scope| {
+            let iterator = interp.scoped_value(scope, iterator);
+            interp.preserving_iterator_throw_completion(|interp| {
+                interp.iterator_close_record(
+                    stack,
+                    Some(context),
+                    interp.escape_scoped(iterator),
+                    primordial,
+                )
+            })
+        })
+    }
+
+    /// IteratorClose of one record. A built-in iterator whose `return` is
+    /// not proven built-in runs the observable `GetMethod(iterator,
+    /// "return")` protocol, unless runtime-internal (`primordial`) code
+    /// closes it.
+    fn iterator_close_record(
+        &mut self,
+        stack: &mut ActivationStack,
+        context: Option<&ExecutionContext>,
+        iterator: Value,
+        primordial: bool,
+    ) -> Result<(), CommittedValueError> {
+        let builtin_object = !primordial && iterator.as_iterator().is_some_and(|handle| {
+            self.gc_heap.read_payload(handle, |state| {
+                !matches!(
+                    state,
+                    IteratorState::User { .. }
+                        | IteratorState::Generator { .. }
+                        | IteratorState::Exhausted { .. }
+                )
+            })
+        });
+        if builtin_object && !self.builtin_return_proven(iterator) {
+            return self.iterator_close_sync(stack, context, &iterator);
+        }
+        self.close_iterator_state(stack, context, iterator)
+    }
+
+    /// The close a built-in iterator's own `return` performs: no
+    /// protocol reads, only the state's semantics.
+    pub(crate) fn close_iterator_state(
         &mut self,
         stack: &mut ActivationStack,
         context: Option<&ExecutionContext>,
@@ -3005,11 +2949,11 @@ impl Interpreter {
     /// §7.4.13 IteratorToList synchronous helper.
     ///
     /// Drives the iterator to exhaustion and returns the collected
-    /// values. Built-in iterables (`Array`, `String`, `Map`, `Set`,
-    /// `Generator`) take a fast path that bypasses the user-visible
-    /// `@@iterator` round-trip; everything else routes through
-    /// `GetIterator` + `IteratorStep`. On abrupt completion mid-walk
-    /// the iterator's `return` method is invoked best-effort.
+    /// values. A built-in iterable or iterator whose protocol is proven
+    /// unmodified (see [`crate::iteration_protocol`]), a built-in iterable
+    /// runtime-internal code passed, and a generator are read directly; everything else routes through `GetIterator` +
+    /// `IteratorStep`. On abrupt completion mid-walk the iterator's `return`
+    /// method is invoked best-effort.
     ///
     /// # See also
     /// - <https://tc39.es/ecma262/#sec-iteratortolist>
@@ -3019,41 +2963,45 @@ impl Interpreter {
         stack: &mut ActivationStack,
         iterable: &Value,
     ) -> Result<Vec<Value>, CommittedValueError> {
-        // Built-in iterable fast paths — §22.1.5.1 ArrayIterator,
-        // §22.1.3.36 String[@@iterator], §24.1.5.1 SetIterator,
-        // §24.3.5.1 MapIterator, §27.5.1.2 Generator step.
-        if let Some(arr) = iterable.as_array() {
-            // Fast materialisation is valid only for a plain dense array
-            // (no exotic sidecar — accessors, sparse storage, prototype
-            // override — and no holes). Anything else walks the real
-            // §7.4 protocol below so index getters fire, holes resolve
-            // through the prototype, and a replaced `next` is honoured.
-            let len = array::len(arr, &self.gc_heap);
-            if let Some(values) = array::plain_dense_prefix_values(arr, &self.gc_heap, len) {
-                return Ok(values);
+        let (iterable, proven, self_iterator) = self.with_handle_scope(|interp, scope| {
+            let root = interp.scoped_value(scope, *iterable);
+            let proven = interp.intrinsic_iterable(context, stack, *iterable);
+            let self_iterator = !proven && interp.proven_self_iterator(interp.escape_scoped(root));
+            (interp.escape_scoped(root), proven, self_iterator)
+        });
+        let iterable = &iterable;
+        if proven {
+            if let Some(arr) = iterable.as_array() {
+                // Bulk reads are exact only for a plain dense array: holes
+                // resolve through the prototype and accessors run, so
+                // anything else steps the built-in iterator below.
+                let len = array::len(arr, &self.gc_heap);
+                if let Some(values) = array::plain_dense_prefix_values(arr, &self.gc_heap, len) {
+                    return Ok(values);
+                }
             }
-        }
-        if let Some(s) = iterable.as_string(&self.gc_heap) {
-            return string_iterator_values(s, &mut self.gc_heap)
-                .map_err(CommittedValueError::JavaScript);
-        }
-        if let Some(s) = iterable.as_set() {
-            return Ok(crate::collections::set_values(s, &self.gc_heap));
-        }
-        if let Some(m) = iterable.as_map() {
-            let pairs = crate::collections::map_entries(m, &self.gc_heap);
-            let mut out = Vec::with_capacity(pairs.len());
-            for (k, v) in pairs {
-                let entry = self
-                    .alloc_runtime_rooted_array_from_values(
-                        [k, v],
-                        &[iterable, &k, &v],
-                        &[out.as_slice()],
-                    )
-                    .map_err(CommittedValueError::JavaScript)?;
-                out.push(Value::array(entry));
+            if let Some(s) = iterable.as_string(&self.gc_heap) {
+                return string_iterator_values(s, &mut self.gc_heap)
+                    .map_err(CommittedValueError::JavaScript);
             }
-            return Ok(out);
+            if let Some(s) = iterable.as_set() {
+                return Ok(crate::collections::set_values(s, &self.gc_heap));
+            }
+            if let Some(m) = iterable.as_map() {
+                let pairs = crate::collections::map_entries(m, &self.gc_heap);
+                let mut out = Vec::with_capacity(pairs.len());
+                for (k, v) in pairs {
+                    let entry = self
+                        .alloc_runtime_rooted_array_from_values(
+                            [k, v],
+                            &[iterable, &k, &v],
+                            &[out.as_slice()],
+                        )
+                        .map_err(CommittedValueError::JavaScript)?;
+                    out.push(Value::array(entry));
+                }
+                return Ok(out);
+            }
         }
         if let Some(handle) = iterable.as_generator() {
             let mut out: Vec<Value> = Vec::new();
@@ -3080,12 +3028,9 @@ impl Interpreter {
                 out.push(value);
             }
         }
-        // §27.5 IteratorRecord drain — `Value::Iterator` wraps a
-        // foundation `IteratorState`. Drive it through
-        // `iterator_next_full` so lazy combinators (Map / Filter
-        // / Take / Drop / FlatMap) and user iterators all share
-        // the same termination contract.
-        if let Some(handle) = iterable.as_iterator() {
+        // A proven built-in iterator is its own record: drive its state
+        // through `iterator_next_full`, which lazy helpers share.
+        if self_iterator && let Some(handle) = iterable.as_iterator() {
             let mut out: Vec<Value> = Vec::new();
             loop {
                 let (v, done) = self.iterator_next_full(context, stack, &handle)?;
@@ -3951,27 +3896,19 @@ impl Interpreter {
         self.release_frames_above(stack, floor);
         result
     }
-    /// Drive one tick of [`Op::GetIterator`] for user objects.
-    ///
-    /// Returns `Ok(true)` when the dispatcher must restart the
-    /// outer loop (frame pushed or pc advanced synchronously),
-    /// `Ok(false)` when the source operand is a built-in iterable
-    /// and the in-frame fast path should run instead.
+    /// Drive one tick of [`Op::GetIterator`] in the interpreter: either the
+    /// pc advances with the record in `dst`, or a frame for `@@iterator` is
+    /// pushed and the opcode resumes when it returns.
     ///
     /// # Algorithm (§7.4.3 `GetIterator`)
-    /// 1. **Resume** — when the running frame's
-    ///    [`Frame::pending_get_iterator`] matches the current pc,
-    ///    read the called function's result from `dst`. The result
-    ///    must be an Object (the iterator). On non-Object, raise
-    ///    `TypeMismatch` (foundation surface for §7.4.3 step 2's
-    ///    TypeError; task 25 upgrades to a real Error).
-    /// 2. **Fresh entry, built-in** — `Value::Array` / `String` /
-    ///    `Map` / `Set` flow through the existing fast path.
-    /// 3. **Fresh entry, user object** — look up
-    ///    `[Symbol.iterator]`; if callable, push a frame to invoke
-    ///    it with `this = obj`, no arguments. Pc stays on the
-    ///    `Op::GetIterator` so resume can wrap the returned
-    ///    iterator object as [`IteratorState::User`].
+    /// 1. **Resume** — when the running frame's pending GetIterator matches
+    ///    the current pc, wrap the called function's result from `dst`
+    ///    (GetIteratorDirect reads `next` once).
+    /// 2. **Fresh entry, unobservable** — a proven built-in iterable or
+    ///    iterator, or a generator, gets its record directly.
+    /// 3. **Fresh entry, observable** — `GetMethod(obj, @@iterator)`, then a
+    ///    pushed frame invokes it with `this = obj`; pc stays on the opcode
+    ///    so the resume can wrap the returned iterator.
     ///
     /// # See also
     /// - <https://tc39.es/ecma262/#sec-getiterator>
@@ -3980,7 +3917,7 @@ impl Interpreter {
         stack: &mut ActivationStack,
         context: &ExecutionContext,
         operands: impl crate::executable::OperandSource,
-    ) -> Result<bool, CommittedValueError> {
+    ) -> Result<(), CommittedValueError> {
         self.with_handle_scope(|interp, scope| {
             let dst = register_operand(operands.first())
                 .map_err(|error| CommittedValueError::Fatal(error.into()))?;
@@ -4002,8 +3939,9 @@ impl Interpreter {
                 // Object; GetIteratorDirect then reads `next` once. Both
                 // are owned by the shared wrap helper. A failure here must
                 // still clear the parked continuation before propagating.
+                let primordial = interp.frame_iterates_primordially(context, stack, top_idx);
                 let produced_value =
-                    match interp.wrap_iterator_method_result(context, stack, produced) {
+                    match interp.wrap_iterator_method_result(context, stack, produced, primordial) {
                         Ok(value) => value,
                         Err(e) => {
                             if let Some(cold) = interp.frame_cold_mut(&mut stack[top_idx]) {
@@ -4020,165 +3958,44 @@ impl Interpreter {
                 stack[top_idx]
                     .advance_pc()
                     .map_err(|error| CommittedValueError::Fatal(error.into()))?;
-                return Ok(true);
+                return Ok(());
             }
 
-            // 2 + 3. Fresh entry — only intercept user objects. The
-            // built-in fast path is the existing in-frame match arm.
+            // 2. Fresh entry whose record needs no observable read.
             let value = *read_register(&stack[top_idx], src)
                 .map_err(|error| CommittedValueError::Fatal(error.into()))?;
             let value_root = interp.scoped_value(scope, value);
-            let iter_sym = interp.well_known_symbols.get(symbol::WellKnown::Iterator);
-            if let Some(arr) = value.as_array() {
-                let own_method = array::get_symbol_property(arr, &interp.gc_heap, iter_sym);
-                let proto = interp
-                    .constructor_prototype_value("Array")
+            let primordial = interp.frame_iterates_primordially(context, stack, top_idx);
+            if let Some(record) = interp
+                .unobservable_iterator_record(stack, value, primordial)
+                .map_err(|error| CommittedValueError::JavaScript(error.into()))?
+            {
+                write_register(&mut stack[top_idx], dst, record)
                     .map_err(|error| CommittedValueError::Fatal(error.into()))?;
-                let proto_root = interp.scoped_value(scope, proto);
-                let proto_has = if own_method.is_none() {
-                    interp.ordinary_has_property_value(
-                        stack,
-                        Some(context),
-                        interp.escape_scoped(proto_root),
-                        &VmPropertyKey::Symbol(iter_sym),
-                        0,
-                    )?
-                } else {
-                    false
-                };
-                if own_method.is_some() || proto_has {
-                    let callee = if let Some(method) = own_method {
-                        method
-                    } else {
-                        match interp.ordinary_get_value(
-                            stack,
-                            Some(context),
-                            interp.escape_scoped(proto_root),
-                            interp.escape_scoped(value_root),
-                            &VmPropertyKey::Symbol(iter_sym),
-                            0,
-                        )? {
-                            VmGetOutcome::Value(v) => v,
-                            VmGetOutcome::InvokeGetter { getter } => interp
-                                .run_callable_sync_rooted(
-                                    stack,
-                                    Some(context),
-                                    &getter,
-                                    interp.escape_scoped(value_root),
-                                    SmallVec::new(),
-                                )
-                                .map_err(CommittedValueError::completed_call)?,
-                        }
-                    };
-                    if callee.is_undefined() || callee.is_null() || !is_callable(&callee) {
-                        return Err(CommittedValueError::JavaScript(VmError::TypeMismatch));
-                    }
-                    interp
-                        .frame_ensure_cold(&mut stack[top_idx])
-                        .pending_get_iterator = Some(PendingGetIterator { pc, dst });
-                    interp
-                        .invoke(
-                            stack,
-                            context,
-                            &callee,
-                            interp.escape_scoped(value_root),
-                            SmallVec::new(),
-                            dst,
-                        )
-                        .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
-                    return Ok(true);
-                }
-                return Err(CommittedValueError::JavaScript(VmError::TypeMismatch));
+                stack[top_idx]
+                    .advance_pc()
+                    .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                return Ok(());
             }
-            // §23.2.3.32 %TypedArray%.prototype[@@iterator] — a TypedArray
-            // is not an ordinary object, so route it through its
-            // prototype's `@@iterator` (which returns a *live* array
-            // iterator that observes element mutations during `for…of`).
-            if value.as_typed_array(&interp.gc_heap).is_some() {
-                let callee = match interp.ordinary_get_value(
-                    stack,
-                    Some(context),
-                    value,
-                    value,
-                    &VmPropertyKey::Symbol(iter_sym),
-                    0,
-                )? {
-                    VmGetOutcome::Value(v) => v,
-                    VmGetOutcome::InvokeGetter { getter } => interp
-                        .run_callable_sync_rooted(
-                            stack,
-                            Some(context),
-                            &getter,
-                            interp.escape_scoped(value_root),
-                            SmallVec::new(),
-                        )
-                        .map_err(CommittedValueError::completed_call)?,
-                };
-                if !is_callable(&callee) {
-                    return Err(CommittedValueError::JavaScript(VmError::TypeMismatch));
-                }
-                interp
-                    .frame_ensure_cold(&mut stack[top_idx])
-                    .pending_get_iterator = Some(PendingGetIterator { pc, dst });
-                interp
-                    .invoke(
-                        stack,
-                        context,
-                        &callee,
-                        interp.escape_scoped(value_root),
-                        SmallVec::new(),
-                        dst,
-                    )
-                    .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
-                return Ok(true);
-            }
-            if value.as_object().is_none() && value.as_proxy().is_none() {
-                return Ok(false);
-            }
-            // §7.4.3 GetIterator step 1 — GetMethod(obj, @@iterator) runs
-            // the ordinary [[Get]] ladder, so an accessor-defined
-            // @@iterator fires its getter (and the getter's abrupt
-            // completion propagates) instead of reading a data slot.
-            let callee = match interp.ordinary_get_value(
-                stack,
-                Some(context),
-                value,
-                value,
-                &VmPropertyKey::Symbol(iter_sym),
-                0,
-            )? {
-                VmGetOutcome::Value(v) => v,
-                VmGetOutcome::InvokeGetter { getter } => interp
-                    .run_callable_sync_rooted(
-                        stack,
-                        Some(context),
-                        &getter,
-                        interp.escape_scoped(value_root),
-                        SmallVec::new(),
-                    )
-                    .map_err(CommittedValueError::completed_call)?,
-            };
-            if callee.is_undefined() || callee.is_null() || !is_callable(&callee) {
-                // No `[Symbol.iterator]` — §7.4.3 step 2 throws.
-                return Err(CommittedValueError::JavaScript(VmError::TypeMismatch));
-            }
+            // 3. Call `@@iterator` in a pushed frame; pc stays on
+            // `Op::GetIterator`, the result lands in `dst` and the resume
+            // guard above wraps it.
+            let callee =
+                interp.get_iterator_method(stack, context, interp.escape_scoped(value_root))?;
             interp
                 .frame_ensure_cold(&mut stack[top_idx])
                 .pending_get_iterator = Some(PendingGetIterator { pc, dst });
-            let args: SmallVec<[Value; 8]> = SmallVec::new();
-            // pc stays on Op::GetIterator; the called frame's result
-            // lands in `dst` and the resume guard above wraps it.
             interp
                 .invoke(
                     stack,
                     context,
                     &callee,
                     interp.escape_scoped(value_root),
-                    args,
+                    SmallVec::new(),
                     dst,
                 )
                 .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
-            Ok(true)
+            Ok(())
         })
     }
 

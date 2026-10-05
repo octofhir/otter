@@ -662,6 +662,7 @@ mod tests {
                     source_text_span: None,
                     module_url: String::new(),
                     contains_direct_eval: false,
+                    primordial_iteration: false,
                     code: vec![Instruction {
                         pc: 0,
                         op: otter_bytecode::Op::ReturnUndefined,

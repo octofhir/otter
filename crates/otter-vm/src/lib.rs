@@ -209,6 +209,7 @@ pub mod realm_intrinsics;
 pub mod reflect;
 pub mod regexp;
 pub(crate) mod regexp_fast;
+pub(crate) mod iteration_protocol;
 pub(crate) mod regexp_legacy;
 pub mod regexp_prototype;
 mod register_window;

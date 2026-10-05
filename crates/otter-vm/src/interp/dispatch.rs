@@ -1134,18 +1134,13 @@ impl Interpreter {
                 // <https://tc39.es/ecma262/#sec-getiterator>
                 Op::GetIterator => {
                     let operands = function.operand_view(instr);
-                    if match self.drive_get_iterator(stack, context, operands) {
-                        Ok(value) => value,
+                    match self.drive_get_iterator(stack, context, operands) {
+                        Ok(()) => {}
                         Err(CommittedValueError::JavaScript(error)) => return Err(error),
                         Err(CommittedValueError::Fatal(error)) => {
                             return Ok(DispatchOutcome::Fatal(error));
                         }
-                    } {
-                        continue;
                     }
-                    let dst = instr.reg(0);
-                    let src = instr.reg(1);
-                    self.run_get_iterator_regs(&mut *stack, top_idx, dst, src)?;
                     continue;
                 }
                 Op::GetAsyncIterator => {
@@ -1200,7 +1195,7 @@ impl Interpreter {
                 // §7.4.11 IteratorClose for a normal completion.
                 Op::IteratorClose => {
                     let iterator = *read_register(&stack[top_idx], instr.reg(0))?;
-                    match self.iterator_close_value_sync(stack, Some(context), iterator) {
+                    match self.iterator_close_op(context, stack, top_idx, iterator, false) {
                         Ok(()) => {}
                         Err(CommittedValueError::JavaScript(error)) => return Err(error),
                         Err(CommittedValueError::Fatal(error)) => {
@@ -1214,7 +1209,7 @@ impl Interpreter {
                 // rethrows its own value next.
                 Op::IteratorCloseThrow => {
                     let iterator = *read_register(&stack[top_idx], instr.reg(0))?;
-                    match self.iterator_close_for_throw(stack, Some(context), iterator) {
+                    match self.iterator_close_op(context, stack, top_idx, iterator, true) {
                         Ok(()) => {}
                         Err(CommittedValueError::JavaScript(error)) => return Err(error),
                         Err(CommittedValueError::Fatal(error)) => {

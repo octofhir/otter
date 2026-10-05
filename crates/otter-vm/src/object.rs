@@ -5712,6 +5712,7 @@ pub fn delete_symbol(obj: JsObject, heap: &mut otter_gc::GcHeap, key: JsSymbol) 
             if !body.symbol_props()[pos].1.flags.configurable() {
                 return false;
             }
+            body.invalidate_prototype_proofs();
             body.symbol_props_mut()
                 .expect("existing symbol slot implies a table")
                 .remove(pos);

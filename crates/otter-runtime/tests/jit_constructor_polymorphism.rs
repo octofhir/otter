@@ -136,9 +136,11 @@ fn installer(
                         let active_code = vm
                             .jit_code_generation_snapshot()
                             .into_iter()
+                            // Generated callers take no entry lease; the
+                            // function cell selects the generation it runs.
                             .find(|generation| {
                                 generation.function_id == fid.load(Ordering::Relaxed)
-                                    && generation.active_count > 0
+                                    && generation.current_entry
                             })
                             .map_or(0, |generation| generation.code_object_id);
                         observations

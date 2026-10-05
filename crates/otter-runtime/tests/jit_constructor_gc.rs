@@ -402,7 +402,12 @@ fn assert_construct_call(proof: &Proof, opcode: Op) {
         .unwrap();
     assert_eq!(record["callPc"].as_u64(), Some(u64::from(pc)));
     assert!(record["inlineFrames"].as_array().unwrap().is_empty());
-    assert!(!record["taggedLocations"].as_array().unwrap().is_empty());
+    // A baseline record roots nothing beyond the window the collector always
+    // traces; an optimized record roots the homes live across the call.
+    assert_eq!(
+        record["taggedLocations"].as_array().unwrap().is_empty(),
+        proof.generation.tier == NativeFrameKind::Baseline
+    );
 }
 
 fn assert_native_target(proof: &Proof) {
@@ -471,10 +476,6 @@ fn assert_observation(observed: &Observation, caller: &Proof, source_line: &str,
     assert_eq!(
         current[0].call_entry_offset,
         caller.generation.call_entry_offset
-    );
-    assert_eq!(
-        current[0].active_count, 1,
-        "the exact own native lease is live"
     );
     assert_eq!(
         current[0].generated_deopts,

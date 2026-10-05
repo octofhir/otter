@@ -157,8 +157,9 @@ pub(crate) fn emit_call(
     if !receiver {
         dynasm!(ops ; .arch x64 ; mov edx, VALUE_UNDEFINED as i32);
     }
+    // Every request consumer clears the construction fields, so an ordinary
+    // call has nothing to clear.
     if !new_target {
-        emit_clear_construct_ticket(ops, context);
         dynasm!(ops ; .arch x64 ; mov ecx, VALUE_UNDEFINED as i32);
     }
     dynasm!(ops

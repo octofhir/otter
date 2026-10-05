@@ -5,9 +5,9 @@
 //!   `(function (exports, require, module, __filename, __dirname) { <body>\n})`.
 //!
 //! # Invariants
-//! - The whole prologue sits on line 1, so body line `N` is wrapped line `N`:
-//!   stack-trace line numbers match the original file, and only line-1
-//!   columns carry the prologue offset (the same quirk Node has).
+//! - The whole prologue sits on line 1, so body line `N` is wrapped line `N`;
+//!   the module's source registers the prologue length, so line-1 columns are
+//!   the file's own too, as Node's `compileFunction` reports them.
 //! - File modules wrapped at run time and builtin modules wrapped at product
 //!   build time use this one text, so positions and
 //!   `Function.prototype.toString` agree between them.

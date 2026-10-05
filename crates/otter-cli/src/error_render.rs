@@ -61,23 +61,41 @@ fn emit_human_diagnostics(err: &OtterError) -> bool {
 }
 
 fn emit_human_diagnostic(diagnostic: &Diagnostic) {
-    // An uncaught exception prints the way Node prints one — the error's own
-    // `Name: message` line followed by its frames — because programs (and the
-    // Node test harness) grep stderr for exactly that shape.
+    // An uncaught exception prints the way Node prints one — the throw site's
+    // `file:line`, its source line and a caret, then the thrown value (an
+    // error's `stack`) — because programs and the Node test harness read
+    // stderr in exactly that shape.
     if diagnostic.code == "UNCAUGHT" {
         let message = diagnostic
             .message
             .strip_prefix("uncaught exception: ")
             .unwrap_or(&diagnostic.message);
-        eprintln!("{message}");
-        for frame in &diagnostic.frames {
-            let function = if frame.function.is_empty() {
-                "<anonymous>"
-            } else {
-                &frame.function
-            };
-            eprintln!("    at {function} ({})", frame.module);
+        if let Some(position) = diagnostic
+            .frames
+            .first()
+            .and_then(|frame| frame.source_position.as_ref())
+        {
+            let script = position
+                .script_name
+                .strip_prefix("file://")
+                .unwrap_or(&position.script_name);
+            let source_line: &str = &position.source_line;
+            // Keep the line's tabs so the caret lines up under the throw.
+            let caret_indent: String = source_line
+                .chars()
+                .take(position.start_column as usize)
+                .map(|c| if c == '\t' { '\t' } else { ' ' })
+                .collect();
+            eprintln!("{script}:{}", position.line_number);
+            eprintln!("{source_line}");
+            eprintln!("{caret_indent}^");
+            // An error's stack follows after a blank line; a thrown
+            // primitive follows the caret directly.
+            if message.contains("\n    at ") {
+                eprintln!();
+            }
         }
+        eprintln!("{message}");
         return;
     }
     match render_human_diagnostic(diagnostic) {

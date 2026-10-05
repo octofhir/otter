@@ -121,6 +121,12 @@ impl FieldLocation {
         self.0
     }
 
+    /// Rebuild a location from its [`Self::cache_key`] word.
+    #[must_use]
+    pub const fn from_cache_key(key: u32) -> Self {
+        Self(key)
+    }
+
     /// Locate a word after the caller selects this location's storage bank.
     ///
     /// # Safety

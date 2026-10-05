@@ -183,7 +183,7 @@ impl<'a> RuntimeState<'a> {
                 );
             }
         }
-        // 7b) Live CodeBlock property slots can retain cached shape transitions.
+        // 7b) The shared property action table retains cached shape transitions.
         interp.trace_property_ic_roots(visitor);
         // 8) Pending throw side-channels retain arbitrary JS values. They are
         //    roots even while no frame or job queue references the thrown

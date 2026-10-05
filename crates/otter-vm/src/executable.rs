@@ -255,24 +255,17 @@ impl ExecutableModule {
         slots
     }
 
-    pub(crate) fn trace_property_ic_roots(&self, visitor: &mut otter_gc::raw::SlotVisitor<'_>) {
+    /// Full-collector weak pass over every property IC of these functions.
+    pub(crate) fn sweep_property_ics(&self, heap: &otter_gc::GcHeap) {
         for code_block in &self.functions {
-            code_block.feedback.trace_property_roots(visitor);
+            code_block.feedback.sweep_property_ics(heap);
         }
     }
 
     pub(crate) fn property_ic_stats(&self) -> crate::property_ic::PropertyIcStats {
         let mut total = crate::property_ic::PropertyIcStats::default();
         for code_block in &self.functions {
-            let stats = code_block.feedback.property_stats();
-            total.load_hits = total.load_hits.saturating_add(stats.load_hits);
-            total.load_misses = total.load_misses.saturating_add(stats.load_misses);
-            total.load_installs = total.load_installs.saturating_add(stats.load_installs);
-            total.load_disables = total.load_disables.saturating_add(stats.load_disables);
-            total.store_hits = total.store_hits.saturating_add(stats.store_hits);
-            total.store_misses = total.store_misses.saturating_add(stats.store_misses);
-            total.store_installs = total.store_installs.saturating_add(stats.store_installs);
-            total.store_disables = total.store_disables.saturating_add(stats.store_disables);
+            total.add(code_block.feedback.property_stats());
         }
         total
     }

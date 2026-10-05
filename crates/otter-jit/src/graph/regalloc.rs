@@ -135,6 +135,7 @@ impl Allocation {
     }
 
     /// Every general register any node, move or edge names, as a bit mask.
+    #[cfg_attr(target_arch = "x86_64", allow(dead_code))]
     pub(crate) fn used_gp(&self) -> u32 {
         fn mark(mask: &mut u32, location: Location) {
             if let Location::Gp(register) = location {

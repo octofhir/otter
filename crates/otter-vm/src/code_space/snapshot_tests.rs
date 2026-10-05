@@ -78,7 +78,7 @@ fn captured_code_shares_compiler_but_not_donor_execution_and_restores_independen
         .link_evictable_module(module(), SourceRegistry::default(), &donor_account)
         .unwrap();
     donor.resolve_atoms(&NameInterner::default());
-    property_slot(&context).install(crate::cache_ir::CacheStub::default());
+    property_slot(&context).install(crate::property_ic::IcHandler::fixture_load(8));
     context.exec_function(0).unwrap().source_work().charge(37);
     let original = payload(&donor);
     let compiler = Arc::downgrade(&original.module);
@@ -148,7 +148,7 @@ fn captured_code_shares_compiler_but_not_donor_execution_and_restores_independen
     let b_context = ExecutionContext::from_chunk_payload(Arc::clone(&b), 0, Arc::clone(&second));
     assert_eq!(property_slot(&a_context).entry_count(), 0);
     assert_eq!(property_slot(&b_context).entry_count(), 0);
-    property_slot(&a_context).install(crate::cache_ir::CacheStub::default());
+    property_slot(&a_context).install(crate::property_ic::IcHandler::fixture_load(8));
     a.executable.function(0).unwrap().source_work().charge(11);
     assert_eq!(property_slot(&a_context).entry_count(), 1);
     assert_eq!(property_slot(&b_context).entry_count(), 0);
@@ -190,7 +190,7 @@ fn failed_capture_and_restore_admission_leave_original_tables_and_ids_unchanged(
     let context = donor
         .link_module(module(), SourceRegistry::default(), &donor_account)
         .unwrap();
-    property_slot(&context).install(crate::cache_ir::CacheStub::default());
+    property_slot(&context).install(crate::property_ic::IcHandler::fixture_load(8));
     context.exec_function(0).unwrap().source_work().charge(37);
     let before = (
         donor.epoch.load(Ordering::Acquire),

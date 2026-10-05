@@ -8,8 +8,10 @@
 //! Restored isolates rebuild feedback and chain dependencies independently.
 //!
 //! # Invariants
-//! Both generated tiers use a cell even when the holder is beyond eight hops.
-//! Invalidated generations never hide a new value or shadowing property.
+//! The baseline reads the site's IC slot, whose prototype-field handler
+//! carries the chain proof; the optimizing tier bakes the cell. Both hold
+//! even when the holder is beyond eight hops. Invalidated proofs never hide
+//! a new value or shadowing property.
 //!
 //! # See also
 //! `otter_vm::object` owns chain dependencies and mutation invalidation.
@@ -44,14 +46,14 @@ sum
             )
             .unwrap();
         assert_eq!(result.completion_string(), "35000");
-        assert!(
+        let relocations_contain = |function: &str, needle: &str| {
             result
                 .jit_artifacts()
                 .unwrap()
                 .bundles()
                 .iter()
                 .any(|bundle| {
-                    bundle.manifest().function_name() == "readDeep"
+                    bundle.manifest().function_name() == function
                         && std::str::from_utf8(
                             bundle
                                 .file(JitArtifactFileName::Relocations)
@@ -59,9 +61,12 @@ sum
                                 .contents(),
                         )
                         .unwrap()
-                        .contains("prototypeValidityCell")
-                }),
-            "{selection:?}: the deep load must generate a validity-cell guard"
+                        .contains(needle)
+                })
+        };
+        assert!(
+            relocations_contain("readDeep", "propertyIcSlot"),
+            "{selection:?}: the deep load must read its IC slot"
         );
         if selection == JitSelection::ProductionTiered {
             assert!(

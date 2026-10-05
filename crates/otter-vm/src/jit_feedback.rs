@@ -32,30 +32,26 @@
 //!   population transition invalidates stale compiled caller plans. Constructor
 //!   families generalize once from unseen to monomorphic to terminal unprepared;
 //!   alternating actual constructors cannot keep advancing that epoch.
-//! - The isolate's VM thread is the sole property-program writer and hot-path
-//!   reader. Structural mutation, immutable snapshots, and GC root tracing are
-//!   serialized by the slot; probes never borrow interpreter-global state.
+//! - The isolate's VM thread is the sole property-IC writer and hot-path
+//!   reader; generated code reads the same native slots on that thread.
 //! - Property attempts precede receiver classification and observable effects.
-//!   A hot accessor, proxy or throwing site without a cache program is never
+//!   A hot accessor, proxy or throwing site without an IC handler is never
 //!   mistaken for an unexecuted branch.
-//! - Property slots may retain traced transition shapes. No `Value`, context,
-//!   closure, or `this` crosses the CodeBlock boundary. Method distributions remain isolate-owned behind
+//! - Property slots name shapes weakly (pruned by the full collector). No
+//!   `Value`, context, closure, or `this` crosses the CodeBlock boundary. Method distributions remain isolate-owned behind
 //!   [`crate::interp::MethodFeedbackDirectory`].
 //!
 //! # See also
 //! - [`crate::CodeBlock`] — owner of the live [`FeedbackVector`].
 
-use std::cell::UnsafeCell;
 use std::hint::spin_loop;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering, fence};
 
 use otter_bytecode::Op;
 use smallvec::SmallVec;
 
 use crate::Value;
-use crate::cache_ir::CacheStub;
-use crate::property_ic::{PropertyIcEntry, PropertyIcKind};
+use crate::property_ic::{IcHandler, InstallOutcome, PropertyIcKind, PropertyIcSlot};
 use crate::tier_policy::PROFILED_CALL_TARGET_CAPACITY;
 
 /// At least one operand was an `int32` fast-path number.
@@ -156,85 +152,11 @@ pub(crate) enum PropertyFeedbackState {
     Empty,
     Uncacheable,
     MonomorphicOwnData {
-        shape_id: crate::object::ShapeId,
+        shape: crate::object::ShapeHandle,
         slot: u16,
     },
     Polymorphic,
     Megamorphic,
-}
-
-/// CodeBlock-owned executable property program and its local counters.
-///
-/// `entry` is read directly only by the isolate VM thread. Mutations, compiler
-/// snapshots, and GC tracing take `structural`, so no off-thread reader can
-/// observe a `SmallVec` transition. A running store probe deliberately does not
-/// hold that lock: it may allocate and synchronously trace this slot's cached
-/// transition shape.
-#[derive(Debug)]
-struct CodeBlockPropertyFeedback {
-    kind: PropertyIcKind,
-    structural: Mutex<()>,
-    entry: UnsafeCell<PropertyIcEntry<CacheStub>>,
-    load_hits: AtomicU64,
-    load_misses: AtomicU64,
-    load_installs: AtomicU64,
-    load_disables: AtomicU64,
-    store_hits: AtomicU64,
-    store_misses: AtomicU64,
-    store_installs: AtomicU64,
-    store_disables: AtomicU64,
-}
-
-// SAFETY: executable property state has one VM-thread writer. Every structural
-// mutation and every cross-thread/collector snapshot is serialized by
-// `structural`; unlocked entry access is exposed only through the non-Send
-// `PropertyFeedbackSlot` view and is read-only while the VM executes a site.
-unsafe impl Sync for CodeBlockPropertyFeedback {}
-// SAFETY: moving the owning CodeBlock between host threads cannot move or
-// access a live isolate's slot concurrently; execution contexts retain the
-// owner, while actual probing remains confined to that isolate thread.
-unsafe impl Send for CodeBlockPropertyFeedback {}
-
-impl CodeBlockPropertyFeedback {
-    fn new(kind: PropertyIcKind) -> Self {
-        Self {
-            kind,
-            structural: Mutex::new(()),
-            entry: UnsafeCell::new(PropertyIcEntry::Empty),
-            load_hits: AtomicU64::new(0),
-            load_misses: AtomicU64::new(0),
-            load_installs: AtomicU64::new(0),
-            load_disables: AtomicU64::new(0),
-            store_hits: AtomicU64::new(0),
-            store_misses: AtomicU64::new(0),
-            store_installs: AtomicU64::new(0),
-            store_disables: AtomicU64::new(0),
-        }
-    }
-
-    fn entry(&self) -> &PropertyIcEntry<CacheStub> {
-        // SAFETY: see the type invariant. This is an isolate-thread read and no
-        // structural mutation can run concurrently on that thread.
-        unsafe { &*self.entry.get() }
-    }
-
-    fn with_entry_mut<R>(&self, f: impl FnOnce(&mut PropertyIcEntry<CacheStub>) -> R) -> R {
-        let _guard = self
-            .structural
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        // SAFETY: `structural` excludes snapshots and the VM-thread invariant
-        // excludes a second writer.
-        f(unsafe { &mut *self.entry.get() })
-    }
-
-    fn snapshot<R>(&self, f: impl FnOnce(&PropertyIcEntry<CacheStub>) -> R) -> R {
-        let _guard = self
-            .structural
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        f(self.entry())
-    }
 }
 
 const CALL_DISTRIBUTION_EMPTY: u8 = 0;
@@ -440,22 +362,20 @@ impl AtomicCallFeedback {
 #[derive(Debug)]
 enum TypedFeedbackSlot {
     None,
-    Property(Box<CodeBlockPropertyFeedback>),
-    Method(Box<CodeBlockPropertyFeedback>, Box<AtomicCallFeedback>),
+    Property(Box<PropertyIcSlot>),
+    Method(Box<PropertyIcSlot>, Box<AtomicCallFeedback>),
     Call(Box<AtomicCallFeedback>),
 }
 
 impl TypedFeedbackSlot {
     fn for_op(op: Op) -> Self {
         match op {
-            Op::LoadProperty => Self::Property(Box::new(CodeBlockPropertyFeedback::new(
-                PropertyIcKind::Load,
-            ))),
-            Op::StoreProperty | Op::StorePropertyStrict => Self::Property(Box::new(
-                CodeBlockPropertyFeedback::new(PropertyIcKind::Store),
-            )),
+            Op::LoadProperty => Self::Property(Box::new(PropertyIcSlot::new(PropertyIcKind::Load))),
+            Op::StoreProperty | Op::StorePropertyStrict => {
+                Self::Property(Box::new(PropertyIcSlot::new(PropertyIcKind::Store)))
+            }
             Op::CallMethodValue => Self::Method(
-                Box::new(CodeBlockPropertyFeedback::new(PropertyIcKind::Load)),
+                Box::new(PropertyIcSlot::new(PropertyIcKind::Load)),
                 Box::default(),
             ),
             Op::Call
@@ -476,20 +396,21 @@ impl TypedFeedbackSlot {
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct PropertyFeedbackSlot<'a> {
     vector: &'a FeedbackVector,
-    feedback: &'a CodeBlockPropertyFeedback,
+    slot: &'a PropertyIcSlot,
     _vm_thread_only: std::marker::PhantomData<std::rc::Rc<()>>,
 }
 
-impl PropertyFeedbackSlot<'_> {
+impl<'a> PropertyFeedbackSlot<'a> {
+    /// The native slot generated code reads.
+    #[must_use]
+    pub(crate) fn native(self) -> &'a PropertyIcSlot {
+        self.slot
+    }
+
     /// Record the first property dispatch, including unsupported and throwing
-    /// receivers. Repeated attempts touch no lock and leave the epoch unchanged.
+    /// receivers. Repeated attempts leave the epoch unchanged.
     pub(crate) fn record_attempt(self) -> bool {
-        if self.feedback.entry().attempted() {
-            return false;
-        }
-        let changed = self
-            .feedback
-            .with_entry_mut(PropertyIcEntry::record_attempt);
+        let changed = self.slot.record_attempt();
         if changed {
             self.vector.bump_epoch();
         }
@@ -498,60 +419,50 @@ impl PropertyFeedbackSlot<'_> {
 
     #[must_use]
     pub(crate) fn attempted(self) -> bool {
-        self.feedback.snapshot(PropertyIcEntry::attempted)
+        self.slot.attempted()
     }
 
     #[must_use]
     pub(crate) fn snapshot_state(self) -> crate::inspect::IcSiteState {
-        self.feedback.snapshot(|entry| match self.feedback.kind {
-            PropertyIcKind::Load => crate::inspect::snapshot_load_state(entry),
-            PropertyIcKind::Store => crate::inspect::snapshot_store_state(entry),
-        })
+        self.slot.snapshot_state()
     }
 
     #[must_use]
     pub(crate) fn state(self) -> PropertyFeedbackState {
-        self.feedback.snapshot(|entry| match entry {
-            PropertyIcEntry::Empty => PropertyFeedbackState::Empty,
-            PropertyIcEntry::Uncacheable => PropertyFeedbackState::Uncacheable,
-            PropertyIcEntry::Megamorphic => PropertyFeedbackState::Megamorphic,
-            PropertyIcEntry::Polymorphic { entries, .. } => match entries.as_slice() {
-                [stub] => {
-                    let hit = match self.feedback.kind {
-                        PropertyIcKind::Load => stub.own_data_hit(),
-                        PropertyIcKind::Store => stub.store_own_data_hit(),
-                    };
-                    hit.map_or(PropertyFeedbackState::Polymorphic, |hit| {
-                        PropertyFeedbackState::MonomorphicOwnData {
-                            shape_id: hit.shape_id,
-                            slot: hit.slot,
-                        }
-                    })
-                }
-                _ => PropertyFeedbackState::Polymorphic,
-            },
-        })
+        if self.slot.is_megamorphic() {
+            return PropertyFeedbackState::Megamorphic;
+        }
+        match self.slot.entry_count() {
+            0 if self.slot.attempted() => PropertyFeedbackState::Uncacheable,
+            0 => PropertyFeedbackState::Empty,
+            _ => self
+                .slot
+                .mono_own_field()
+                .map_or(PropertyFeedbackState::Polymorphic, |(shape, slot)| {
+                    PropertyFeedbackState::MonomorphicOwnData { shape, slot }
+                }),
+        }
     }
 
+    #[cfg(test)]
     #[must_use]
     pub(crate) fn entry_count(self) -> usize {
-        self.feedback.entry().entry_count()
+        self.slot.entry_count()
     }
 
     #[must_use]
     pub(crate) fn is_megamorphic(self) -> bool {
-        self.feedback.entry().is_megamorphic()
+        self.slot.is_megamorphic()
     }
 
-    /// Receiver programs installed so far: the entry count, which only grows,
-    /// or one past the cache's capacity once the site is megamorphic.
+    /// Receiver handlers installed so far, or one past the cache's capacity
+    /// once the site is megamorphic.
     #[must_use]
     pub(crate) fn population(self) -> u32 {
-        let entry = self.feedback.entry();
-        if entry.is_megamorphic() {
+        if self.slot.is_megamorphic() {
             crate::tier_policy::PROFILED_PROPERTY_PIC_CAPACITY as u32 + 1
         } else {
-            entry.entry_count() as u32
+            self.slot.entry_count() as u32
         }
     }
 
@@ -559,13 +470,8 @@ impl PropertyFeedbackSlot<'_> {
         self,
         obj: crate::object::JsObject,
         heap: &otter_gc::GcHeap,
-        key: crate::property_atom::AtomizedPropertyKey<'_>,
     ) -> Option<Value> {
-        self.feedback
-            .entry()
-            .entries()
-            .iter()
-            .find_map(|stub| stub.run_load(obj, heap, key))
+        self.slot.probe_load(obj, heap)
     }
 
     pub(crate) fn probe_store(
@@ -575,117 +481,58 @@ impl PropertyFeedbackSlot<'_> {
         key: crate::property_atom::AtomizedPropertyKey<'_>,
         value: &Value,
     ) -> Result<bool, otter_gc::OutOfMemory> {
-        for stub in self.feedback.entry().entries() {
-            if stub.run_store(obj, heap, key, value)?.is_some() {
-                return Ok(true);
-            }
-        }
-        Ok(false)
+        self.slot.probe_store(obj, heap, key, value)
     }
 
     pub(crate) fn record_hit(self) {
-        match self.feedback.kind {
-            PropertyIcKind::Load => self.feedback.load_hits.fetch_add(1, Ordering::Relaxed),
-            PropertyIcKind::Store => self.feedback.store_hits.fetch_add(1, Ordering::Relaxed),
-        };
+        self.slot.record_hit();
     }
 
-    pub(crate) fn record_guard_miss(self) -> bool {
-        match self.feedback.kind {
-            PropertyIcKind::Load => self.feedback.load_misses.fetch_add(1, Ordering::Relaxed),
-            PropertyIcKind::Store => self.feedback.store_misses.fetch_add(1, Ordering::Relaxed),
-        };
-        self.is_megamorphic()
+    /// Count a miss of an object receiver; whether the site is megamorphic.
+    pub(crate) fn record_miss(self) -> bool {
+        self.slot.record_miss();
+        self.slot.is_megamorphic()
     }
 
-    pub(crate) fn record_uncached_miss(self) {
-        if self.is_megamorphic() {
-            return;
-        }
-        match self.feedback.kind {
-            PropertyIcKind::Load => self.feedback.load_misses.fetch_add(1, Ordering::Relaxed),
-            PropertyIcKind::Store => self.feedback.store_misses.fetch_add(1, Ordering::Relaxed),
-        };
-    }
-
-    pub(crate) fn install(self, stub: CacheStub) {
-        if self.is_megamorphic() {
-            return;
-        }
-        let (installed, disabled) = self.feedback.with_entry_mut(|entry| {
-            if entry.is_megamorphic() {
-                return (false, false);
+    /// Install a handler; material transitions advance the epoch.
+    pub(crate) fn install(self, handler: IcHandler) {
+        match self.slot.install(handler) {
+            InstallOutcome::Installed | InstallOutcome::BecameMegamorphic => {
+                self.vector.bump_epoch();
             }
-            let before = entry.entry_count();
-            entry.install(stub);
-            (
-                !entry.is_megamorphic() && entry.entry_count() > before,
-                entry.is_megamorphic(),
-            )
-        });
-        if installed {
-            match self.feedback.kind {
-                PropertyIcKind::Load => self.feedback.load_installs.fetch_add(1, Ordering::Relaxed),
-                PropertyIcKind::Store => {
-                    self.feedback.store_installs.fetch_add(1, Ordering::Relaxed)
-                }
-            };
-            self.vector.bump_epoch();
-        } else if disabled {
-            match self.feedback.kind {
-                PropertyIcKind::Load => self.feedback.load_disables.fetch_add(1, Ordering::Relaxed),
-                PropertyIcKind::Store => {
-                    self.feedback.store_disables.fetch_add(1, Ordering::Relaxed)
-                }
-            };
-            self.vector.bump_epoch();
+            InstallOutcome::Unchanged => {}
         }
     }
 
+    /// The single own-field load handler as the own-property hit method
+    /// call ICs guard on.
     #[must_use]
-    pub(crate) fn mono_load_own_data_hit(self) -> Option<crate::object::AtomOwnPropertyHit> {
-        let entries = self.feedback.entry().entries();
-        (entries.len() == 1)
-            .then(|| entries[0].own_data_hit())
-            .flatten()
+    pub(crate) fn mono_own_hit(
+        self,
+        atom_id: crate::property_atom::AtomId,
+    ) -> Option<crate::object::AtomOwnPropertyHit> {
+        self.slot
+            .mono_own_field()
+            .map(|(shape, slot)| crate::object::AtomOwnPropertyHit {
+                shape_id: crate::object::shape_body::id_of(shape),
+                shape,
+                atom_id,
+                slot,
+                is_data: true,
+            })
     }
 
-    /// Copy every installed CacheIR program into owned compile metadata.
-    ///
-    /// A program naming a shape code may not embed (one no longer
-    /// registered) describes receivers generated code never specializes on;
-    /// it is dropped, and such a
-    /// receiver misses every remaining guard like any unseen shape. Returning
-    /// `None` rejects the complete site when an installed program contains an
-    /// unsupported op, or when no program remains.
+    /// Copy every lowerable handler into compile metadata; see
+    /// [`PropertyIcSlot::jit_programs`].
     pub(crate) fn jit_programs(
         self,
-        mut resolve_shape: impl FnMut(crate::object::ShapeId) -> Option<u32>,
-        mut resolve_validity: impl FnMut(
+        atom: u32,
+        bake_shape: impl FnMut(crate::object::ShapeHandle) -> Option<u32>,
+        bake_validity: impl FnMut(
             &std::sync::Arc<crate::object::prototype_validity::PrototypeValidity>,
         ) -> Option<crate::jit::JitPrototypeValidity>,
     ) -> Option<Vec<crate::jit::JitCacheIrProgram>> {
-        self.feedback.snapshot(|entry| {
-            let stubs = entry.entries();
-            let mut programs = Vec::with_capacity(stubs.len());
-            for stub in stubs {
-                let mut unbakeable_shape = false;
-                let program = stub.snapshot_for_jit(
-                    |id| {
-                        let shape = resolve_shape(id);
-                        unbakeable_shape |= shape.is_none_or(|shape| shape == 0);
-                        shape
-                    },
-                    &mut resolve_validity,
-                );
-                match program {
-                    Some(program) => programs.push(program),
-                    None if unbakeable_shape => {}
-                    None => return None,
-                }
-            }
-            (!programs.is_empty()).then_some(programs)
-        })
+        self.slot.jit_programs(atom, bake_shape, bake_validity)
     }
 }
 
@@ -1033,10 +880,10 @@ impl FeedbackVector {
             total = total.saturating_add(match slot {
                 TypedFeedbackSlot::None => 0,
                 TypedFeedbackSlot::Property(payload) => {
-                    std::mem::size_of_val::<CodeBlockPropertyFeedback>(payload) as u64
+                    std::mem::size_of_val::<PropertyIcSlot>(payload) as u64
                 }
                 TypedFeedbackSlot::Method(payload, call) => {
-                    (std::mem::size_of_val::<CodeBlockPropertyFeedback>(payload)
+                    (std::mem::size_of_val::<PropertyIcSlot>(payload)
                         + std::mem::size_of_val::<AtomicCallFeedback>(call))
                         as u64
                 }
@@ -1091,10 +938,10 @@ impl FeedbackVector {
         ops.into_iter().fold(0u64, |bytes, op| {
             let payload = match op {
                 Op::LoadProperty | Op::StoreProperty | Op::StorePropertyStrict => {
-                    std::mem::size_of::<CodeBlockPropertyFeedback>()
+                    std::mem::size_of::<PropertyIcSlot>()
                 }
                 Op::CallMethodValue => {
-                    std::mem::size_of::<CodeBlockPropertyFeedback>()
+                    std::mem::size_of::<PropertyIcSlot>()
                         + std::mem::size_of::<AtomicCallFeedback>()
                 }
                 Op::Call
@@ -1142,9 +989,9 @@ impl FeedbackVector {
             }
             _ => return None,
         };
-        (feedback.kind == kind).then_some(PropertyFeedbackSlot {
+        (feedback.kind() == kind).then_some(PropertyFeedbackSlot {
             vector: self,
-            feedback,
+            slot: feedback,
             _vm_thread_only: std::marker::PhantomData,
         })
     }
@@ -1239,72 +1086,34 @@ impl FeedbackVector {
             });
     }
 
+    fn property_ic_slots(&self) -> impl Iterator<Item = &PropertyIcSlot> {
+        self.typed_slots.iter().filter_map(|slot| match slot {
+            TypedFeedbackSlot::Property(feedback) | TypedFeedbackSlot::Method(feedback, _) => {
+                Some(&**feedback)
+            }
+            _ => None,
+        })
+    }
+
     pub(crate) fn property_stats(&self) -> crate::property_ic::PropertyIcStats {
         let mut stats = crate::property_ic::PropertyIcStats::default();
-        for slot in &self.typed_slots {
-            let feedback = match slot {
-                TypedFeedbackSlot::Property(feedback) | TypedFeedbackSlot::Method(feedback, _) => {
-                    feedback
-                }
-                _ => continue,
-            };
-            stats.load_hits = stats
-                .load_hits
-                .saturating_add(feedback.load_hits.load(Ordering::Relaxed));
-            stats.load_misses = stats
-                .load_misses
-                .saturating_add(feedback.load_misses.load(Ordering::Relaxed));
-            stats.load_installs = stats
-                .load_installs
-                .saturating_add(feedback.load_installs.load(Ordering::Relaxed));
-            stats.load_disables = stats
-                .load_disables
-                .saturating_add(feedback.load_disables.load(Ordering::Relaxed));
-            stats.store_hits = stats
-                .store_hits
-                .saturating_add(feedback.store_hits.load(Ordering::Relaxed));
-            stats.store_misses = stats
-                .store_misses
-                .saturating_add(feedback.store_misses.load(Ordering::Relaxed));
-            stats.store_installs = stats
-                .store_installs
-                .saturating_add(feedback.store_installs.load(Ordering::Relaxed));
-            stats.store_disables = stats
-                .store_disables
-                .saturating_add(feedback.store_disables.load(Ordering::Relaxed));
+        for slot in self.property_ic_slots() {
+            stats.add(slot.stats());
         }
         stats
     }
 
     #[cfg(test)]
     pub(crate) fn polymorphic_property_count(&self, kind: PropertyIcKind) -> usize {
-        self.typed_slots
-            .iter()
-            .filter_map(|slot| match slot {
-                TypedFeedbackSlot::Property(feedback) | TypedFeedbackSlot::Method(feedback, _)
-                    if feedback.kind == kind =>
-                {
-                    Some(feedback.entry())
-                }
-                _ => None,
-            })
-            .filter(|entry| entry.is_polymorphic())
+        self.property_ic_slots()
+            .filter(|slot| slot.kind() == kind && slot.entry_count() > 0)
             .count()
     }
 
-    pub(crate) fn trace_property_roots(&self, visitor: &mut otter_gc::raw::SlotVisitor<'_>) {
-        for slot in &self.typed_slots {
-            let feedback = match slot {
-                TypedFeedbackSlot::Property(feedback) | TypedFeedbackSlot::Method(feedback, _) => {
-                    feedback
-                }
-                _ => continue,
-            };
-            let _guard = feedback
-                .structural
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            feedback.entry().trace_roots(visitor);
+    /// Full-collector weak pass over every property IC of this vector.
+    pub(crate) fn sweep_property_ics(&self, heap: &otter_gc::GcHeap) {
+        for slot in self.property_ic_slots() {
+            slot.sweep_dead(heap);
         }
     }
 }
@@ -1669,12 +1478,13 @@ mod tests {
         object::append_shaped_data_for_fixture(obj, &mut heap, key, Value::number_i32(1));
         assert!(!object::is_dictionary(obj, &heap));
         let resolved = crate::cache_ir::resolve_atom_data_slot(obj, &heap, key).expect("load stub");
-        let stub = CacheStub::from_resolved_load(object::shape_id(obj, &heap), &resolved);
+        let handler = IcHandler::load_resolved(object::keyed_shape(obj, &heap), &resolved)
+            .expect("own-field handler");
         let vector = feedback_for([Op::LoadProperty]);
         let slot = vector
             .property_slot(0, PropertyIcKind::Load)
             .expect("typed property slot");
-        slot.install(stub);
+        slot.install(handler);
         assert!(matches!(
             slot.state(),
             PropertyFeedbackState::MonomorphicOwnData { slot: 0, .. }
@@ -1720,25 +1530,47 @@ mod tests {
 
     #[test]
     fn property_slot_owns_state_counters_and_epoch_until_codeblock_drop() {
+        use crate::object;
+        use crate::property_atom::{AtomId, AtomizedPropertyKey, PropertyAtom};
+
+        const NAMES: [&str; 5] = ["p0", "p1", "p2", "p3", "p4"];
+        let mut heap = otter_gc::GcHeap::new().expect("heap");
+        // SAFETY: the scope belongs to the stationary heap and ends before it.
+        let roots = unsafe { otter_gc::HandleScope::from_ptr(heap.handle_stack_ptr()) };
+        let x = AtomizedPropertyKey::new(PropertyAtom::new(AtomId::from_global(1)), "x");
+        let mut handlers = Vec::new();
+        for (index, name) in NAMES.iter().enumerate() {
+            let obj = object::alloc_object_old_for_fixture(&mut heap).expect("object");
+            let _root = roots.local(obj);
+            let distinct = AtomizedPropertyKey::new(
+                PropertyAtom::new(AtomId::from_global(10 + index as u32)),
+                name,
+            );
+            object::append_shaped_data_for_fixture(obj, &mut heap, distinct, Value::null());
+            object::append_shaped_data_for_fixture(obj, &mut heap, x, Value::number_i32(1));
+            let resolved = crate::cache_ir::resolve_atom_data_slot(obj, &heap, x).unwrap();
+            handlers.push(
+                IcHandler::load_resolved(object::keyed_shape(obj, &heap), &resolved).unwrap(),
+            );
+        }
         let vector = feedback_for([Op::LoadProperty]);
         let slot = vector
             .property_slot(0, PropertyIcKind::Load)
             .expect("load property IC");
+        let mut handlers = handlers.into_iter();
         for expected_epoch in 1..=4 {
-            slot.install(CacheStub::default());
+            slot.install(handlers.next().unwrap());
             assert_eq!(vector.epoch(), expected_epoch);
         }
-        for _ in 0..3 {
-            assert!(!slot.record_guard_miss());
+        for _ in 0..4 {
+            assert!(!slot.record_miss());
             assert_eq!(vector.epoch(), 4);
         }
-        assert!(!slot.record_guard_miss());
-        assert_eq!(vector.epoch(), 4);
-        slot.install(CacheStub::default());
+        slot.install(handlers.next().unwrap());
         assert!(slot.is_megamorphic(), "megamorphic is CodeBlock-terminal");
         assert_eq!(vector.epoch(), 5);
         for _ in 0..2048 {
-            slot.record_uncached_miss();
+            slot.record_miss();
         }
         assert_eq!(vector.epoch(), 5);
 

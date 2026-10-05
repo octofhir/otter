@@ -102,9 +102,9 @@ fn inherited_load_and_own_append_preserve_independent_slots_and_writability() {
             object::get_own(prototype, &vm.gc_heap, "shared"),
             Some(Value::number_i32(53))
         );
-        let own = cache_ir::CacheStub::install_store_existing(second, &vm.gc_heap, key).unwrap();
-        vm.property_cache
-            .record_own_store(own.store_own_data_hit().unwrap());
+        let (_, own) =
+            crate::property_ic::IcHandler::store_existing_hit(second, &vm.gc_heap, key).unwrap();
+        vm.property_cache.record_own_store(own);
         assert_eq!(
             vm.property_cache
                 .replay_store(second, &mut vm.gc_heap, key, &Value::number_i32(97))

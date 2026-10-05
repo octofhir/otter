@@ -167,18 +167,6 @@ fn compile_with_reach(
     let mut relocations = RelocationCapture::new(artifact_request.is_some());
     let mut direct_call_events = capture_events.then(|| super::seed_direct_call_events(view));
     let poll_entry = transitions.entry(abi::STUB_JIT_BACKEDGE_POLL);
-    // Identity-only property source cells are address-stable before their
-    // pointers are baked, consumed strictly in emission order, and owned by
-    // the finalized code object. Semantic proof data lives only in the
-    // immutable CacheIR snapshot.
-    let mut load_ic_cells =
-        vec![crate::entry::PropertySourceCell::default(); plan.load_property_count]
-            .into_boxed_slice();
-    let mut store_ic_cells =
-        vec![crate::entry::PropertySourceCell::default(); plan.store_property_count]
-            .into_boxed_slice();
-    let mut next_load_ic = 0usize;
-    let mut next_store_ic = 0usize;
     let mut coercion_slow_paths = Vec::new();
     let mut numeric_slow_paths = Vec::new();
     let mut shared_property = shared_property::SharedPropertyProbes::default();
@@ -426,10 +414,6 @@ fn compile_with_reach(
                 exits,
                 poll_entry,
                 far_branches,
-                load_ic_cells: &mut load_ic_cells,
-                next_load_ic: &mut next_load_ic,
-                store_ic_cells: &mut store_ic_cells,
-                next_store_ic: &mut next_store_ic,
                 numeric_slow_paths: &mut numeric_slow_paths,
                 coercion_slow_paths: &mut coercion_slow_paths,
                 shared_property: &mut shared_property,
@@ -689,13 +673,6 @@ fn compile_with_reach(
         ));
     }
 
-    assert_eq!(next_load_ic, load_ic_cells.len(), "LoadProperty IC count");
-    assert_eq!(
-        next_store_ic,
-        store_ic_cells.len(),
-        "StoreProperty IC count"
-    );
-
     // OSR trampolines: one per verified loop header. Each runs the standard
     // prologue (establishing the shared entry ABI from the ctx argument) and
     // branches to the header's body label, so the VM can enter mid-loop with
@@ -715,14 +692,7 @@ fn compile_with_reach(
     }
 
     let shared_start = ops.offset().0;
-    shared_property.emit(
-        &mut ops,
-        &mut relocations,
-        transitions,
-        view,
-        load_ic_cells.as_ptr() as usize,
-        store_ic_cells.as_ptr() as usize,
-    );
+    shared_property.emit(&mut ops, &mut relocations, transitions, view);
     if let Some(code_map) = code_map.as_mut()
         && ops.offset().0 != shared_start
     {
@@ -772,8 +742,6 @@ fn compile_with_reach(
             .into_boxed_slice(),
         source_work,
         register_operands,
-        load_ic_cells,
-        store_ic_cells,
         safepoint_records.into_boxed_slice(),
         return_sites.into_boxed_slice(),
         osr_entries,
@@ -878,10 +846,6 @@ pub(crate) struct OperationContext<'c, 'a> {
     pub(crate) exits: OperationExits,
     pub(crate) poll_entry: u64,
     pub(crate) far_branches: bool,
-    pub(crate) load_ic_cells: &'c mut [crate::entry::PropertySourceCell],
-    pub(crate) next_load_ic: &'c mut usize,
-    pub(crate) store_ic_cells: &'c mut [crate::entry::PropertySourceCell],
-    pub(crate) next_store_ic: &'c mut usize,
     pub(crate) numeric_slow_paths: &'c mut Vec<arith::NumericSlowPath>,
     pub(crate) coercion_slow_paths: &'c mut Vec<arith::CoercionSlowPath>,
     pub(crate) shared_property: &'c mut shared_property::SharedPropertyProbes,
@@ -914,10 +878,6 @@ pub(crate) fn emit_operation<'a>(
         exits,
         poll_entry,
         far_branches,
-        load_ic_cells,
-        next_load_ic,
-        store_ic_cells,
-        next_store_ic,
         numeric_slow_paths,
         coercion_slow_paths,
         shared_property,
@@ -1492,65 +1452,31 @@ pub(crate) fn emit_operation<'a>(
         TemplateOp::LoadProperty {
             dst,
             object,
-            name,
-            site,
             array_length,
+            ..
         } => {
-            let cell_ordinal =
-                u32::try_from(*next_load_ic).expect("template load IC ordinal fits u32");
-            let cell = &mut load_ic_cells[*next_load_ic];
-            *next_load_ic += 1;
-            cell.set_source(view.code_block.id, instr.pc);
-            let cell_addr = cell as *mut crate::entry::PropertySourceCell as usize;
             properties::emit_load_property(
                 ops,
                 relocations,
-                transitions,
                 shared_property,
                 view,
                 dst,
                 object,
                 instr.byte_pc,
-                name,
-                site,
                 array_length,
-                cell_addr,
-                cell_ordinal,
-                view.property_programs
-                    .get(&instr.byte_pc)
-                    .map(Vec::as_slice),
                 committed_throw,
                 fatal,
             )?;
         }
-        TemplateOp::StoreProperty {
-            object,
-            name,
-            value,
-            site,
-        } => {
-            let cell_ordinal =
-                u32::try_from(*next_store_ic).expect("template store IC ordinal fits u32");
-            let cell = &mut store_ic_cells[*next_store_ic];
-            *next_store_ic += 1;
-            cell.set_source(view.code_block.id, instr.pc);
-            let cell_addr = cell as *mut crate::entry::PropertySourceCell as usize;
+        TemplateOp::StoreProperty { object, value, .. } => {
             properties::emit_store_property(
                 ops,
                 relocations,
-                transitions,
                 shared_property,
                 view,
                 object,
-                name,
                 value,
                 instr.byte_pc,
-                site,
-                cell_addr,
-                cell_ordinal,
-                view.property_programs
-                    .get(&instr.byte_pc)
-                    .map(Vec::as_slice),
                 committed_throw,
                 fatal,
             )?;

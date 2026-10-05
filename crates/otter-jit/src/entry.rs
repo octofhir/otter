@@ -51,8 +51,8 @@ pub use lowering::{BackendFailure, Unsupported};
 pub(crate) use lowering::{
     BaselinePlan, PACKED_REGISTER_LANES, pack_register_lanes, unpack_register_lanes,
 };
+pub(crate) use runtime_ops::jit_backedge_poll_stub;
 use runtime_ops::*;
-pub(crate) use runtime_ops::{PropertySourceCell, jit_backedge_poll_stub};
 pub(crate) use value_abi::*;
 
 /// GC header type tag for an ordinary `ObjectBody` (mirrors

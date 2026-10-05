@@ -32,7 +32,7 @@ use otter_vm::{JitCompileSnapshot, native_abi as abi};
 use super::{emit_load_reg, emit_store_reg};
 use crate::x86_64::{
     frame,
-    values::{emit_load_runtime_stub, emit_load_u64},
+    values::{emit_load_runtime_stub, emit_load_symbol_u64},
 };
 use crate::{
     artifact::relocation::RelocationCapture,
@@ -445,6 +445,7 @@ pub(super) fn emit_method_call(
     table: &crate::entry::TransitionTable,
     return_sites: &mut crate::return_sites::ReturnSiteRecorder<'_>,
     view: &JitCompileSnapshot,
+    shared_property: &mut super::shared_property::SharedPropertyProbes,
     mut direct_call_events: Option<&mut crate::template::DirectCallEvents>,
     mut code_map: Option<&mut crate::artifact::CodeMapCapture>,
     logical_pc: u32,
@@ -505,43 +506,35 @@ pub(super) fn emit_method_call(
         }
     }
     let resolved = ops.new_dynamic_label();
-    // Every other receiver first probes the isolate's shared property-action
-    // table, as a V8 megamorphic call site probes its stub cache; a closure
-    // or native hit is called generically. A miss resolves through the
-    // committed method resolution, which also records call feedback.
+    // Every other receiver runs the site's load IC (its handlers, then the
+    // isolate's shared action table as V8's megamorphic stub cache); a
+    // closure or native hit is called generically. A miss resolves through
+    // the committed method resolution, which also records call feedback and
+    // updates the slot.
     let resolve = ops.new_dynamic_label();
-    if let Some(atom) = view.property_accesses.get(&byte_pc).map(|site| site.atom) {
-        let hit = ops.new_dynamic_label();
-        emit_load_reg(ops, 0, receiver);
-        crate::x86_64::property_actions::emit_action_probe(
+    if let Some(ic_slot) = view
+        .property_accesses
+        .get(&byte_pc)
+        .map(|access| access.ic_slot)
+        .filter(|&slot| slot != 0 && view.cage_base != 0)
+    {
+        use super::shared_property::{LOAD_RECEIVER, LOAD_SLOT};
+        let routine = shared_property.method_label(ops);
+        emit_load_reg(ops, LOAD_RECEIVER, receiver);
+        emit_load_symbol_u64(
             ops,
             relocations,
-            view,
-            view.property_action_cache,
-            Some(atom),
-            crate::artifact::relocation::PropertySourceAccess::Load,
-            0,
-            None,
-            [1, 2, 8, 6],
-            Some(0),
-            resolve,
-            hit,
-            hit,
+            LOAD_SLOT,
+            ic_slot,
+            crate::artifact::relocation::RelocationTarget::PropertyIcSlot {
+                function_id: view.code_block.id,
+                byte_pc,
+            },
         );
-        dynasm!(ops ; .arch x64 ; =>hit);
-        emit_load_u64(ops, 11, otter_vm::value::tag::NOT_CELL_MASK);
-        dynasm!(ops
-            ; .arch x64
-            ; test rax, r11
-            ; jnz =>resolve
-            ; test rax, rax
-            ; jz =>resolve
-            ; movzx r11d, BYTE [rax]
-            ; cmp r11d, i32::from(otter_vm::closure::JS_CLOSURE_BODY_TYPE_TAG)
-            ; je =>resolved
-            ; cmp r11d, i32::from(otter_vm::native_function::NATIVE_FUNCTION_BODY_TYPE_TAG)
-            ; je =>resolved
-        );
+        dynasm!(ops ; .arch x64
+            ; call =>routine
+            ; test rdx, rdx
+            ; jz =>resolved);
     }
     dynasm!(ops ; .arch x64 ; =>resolve);
     emit_load_reg(ops, 0, receiver);

@@ -753,7 +753,7 @@ String(hot(4096));
         "functionEntryCell",
         "gcCageBase",
         "globalLexicalCell",
-        "propertySourceCell",
+        "propertyIcSlot",
         "propertyActionCacheTable",
         "guardedHeapReference",
     ] {

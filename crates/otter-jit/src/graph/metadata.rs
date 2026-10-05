@@ -1,7 +1,7 @@
 //! Source attribution and collector metadata shared by Graph instruction encoders.
 //!
 //! # Contents
-//! - Baseline operation indexing and retained property-source cell counts.
+//! - Baseline operation indexing.
 //! - Source-body lookup and complete inline frame chains at collecting sites.
 //! - Shared validation that baseline Generic nodes own a physical window.
 //! - [`SitePlan`]: exact per-boundary root records, interned by content.
@@ -33,10 +33,9 @@ use otter_vm::deopt::DeoptFrame;
 use otter_vm::native_abi::{self as abi, SafepointRecord, SpillRoots};
 use rustc_hash::FxHashMap;
 
-use super::builder::Built;
 use super::ir::{Graph, Kind, NodeId};
 use super::regalloc::Allocation;
-use crate::template::{TemplateOp, TemplatePlan};
+use crate::template::TemplatePlan;
 
 /// The entry record and first descending id of this code object's own sites.
 pub(crate) const FIRST_SITE_SAFEPOINT: abi::SafepointId = abi::NO_SAFEPOINT - 1;
@@ -64,28 +63,6 @@ pub(crate) fn operation_index(plan: &TemplatePlan) -> FxHashMap<u32, Vec<usize>>
         index.entry(instruction.pc).or_default().push(position);
     }
     index
-}
-
-/// Retained source cells for native shared-table accesses and generic operations.
-pub(crate) fn property_cell_counts(built: &Built, plan: &TemplatePlan) -> (usize, usize) {
-    let (mut loads, mut stores) = (0, 0);
-    for node in &built.graph.nodes {
-        match node.kind {
-            Kind::LoadPropertyCached { .. } => loads += 1,
-            Kind::StorePropertyCached { .. } => stores += 1,
-            Kind::Generic { pc, .. } => {
-                for instruction in plan.instructions.iter().filter(|op| op.pc == pc) {
-                    match instruction.op {
-                        TemplateOp::LoadProperty { .. } => loads += 1,
-                        TemplateOp::StoreProperty { .. } => stores += 1,
-                        _ => {}
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-    (loads, stores)
 }
 
 fn spill_roots(homes: impl IntoIterator<Item = u32>) -> SpillRoots {

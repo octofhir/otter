@@ -27,7 +27,14 @@ impl Codegen<'_> {
                     Self::gp(self.loc(node).result.unwrap()),
                 );
                 let overflow = self.eager_exit(node, DeoptReason::Overflow);
-                emit_add_sub(&mut self.ops, kind == Kind::Int32Add, a, b, dst, Some(overflow));
+                emit_add_sub(
+                    &mut self.ops,
+                    kind == Kind::Int32Add,
+                    a,
+                    b,
+                    dst,
+                    Some(overflow),
+                );
             }
             Kind::Int32AddWrapping | Kind::Int32SubWrapping => {
                 let (a, b, dst) = (
@@ -35,7 +42,14 @@ impl Codegen<'_> {
                     self.scalar_int32_operand(self.loc(node).inputs[1]),
                     Self::gp(self.loc(node).result.unwrap()),
                 );
-                emit_add_sub(&mut self.ops, kind == Kind::Int32AddWrapping, a, b, dst, None);
+                emit_add_sub(
+                    &mut self.ops,
+                    kind == Kind::Int32AddWrapping,
+                    a,
+                    b,
+                    dst,
+                    None,
+                );
             }
             Kind::Int32Mul => {
                 let (a, b, dst) = self.scalar_gp_binary(node);

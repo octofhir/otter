@@ -1267,11 +1267,17 @@ impl Interpreter {
                 .code_block
                 .property_feedback_at(instruction_pc as usize, kind);
             let shared = slot.is_some_and(|slot| slot.is_megamorphic());
+            let atom = key.atom().id().raw();
+            if let Some(slot) = slot {
+                slot.native()
+                    .bind_site(view.code_block.id, instruction_pc, atom);
+            }
             view.property_accesses.insert(
                 byte_pc,
                 jit::JitPropertyAccess {
-                    atom: key.atom().id().raw(),
+                    atom,
                     shared,
+                    ic_slot: slot.map_or(0, |slot| slot.native().address()),
                 },
             );
             let Some(slot) = slot else {
@@ -1282,7 +1288,8 @@ impl Interpreter {
             }
             let mut programs = slot
                 .jit_programs(
-                    |shape_id| self.bake_shape_id(shape_id),
+                    atom,
+                    |shape| self.bake_shape(shape),
                     |cell| self.bake_prototype_validity(cell),
                 )
                 .unwrap_or_default();
@@ -1484,15 +1491,9 @@ impl Interpreter {
             .property_feedback_at(instruction_pc, kind)?
             .state()
         {
-            crate::feedback::PropertyFeedbackState::MonomorphicOwnData { shape_id, slot } => {
-                let shape = self.bake_shape_id(shape_id)?;
-                Some((
-                    shape,
-                    crate::object::field_location(
-                        self.shape_runtime.handle_for_id(shape_id)?,
-                        u32::from(slot),
-                    ),
-                ))
+            crate::feedback::PropertyFeedbackState::MonomorphicOwnData { shape, slot } => {
+                let baked = self.bake_shape(shape)?;
+                Some((baked, crate::object::field_location(shape, u32::from(slot))))
             }
             crate::feedback::PropertyFeedbackState::Empty => {
                 let slot = self.class_annotation_property_slot(context, code_block, instruction)?;

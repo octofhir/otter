@@ -186,15 +186,14 @@ pub enum RuntimeStubSignature {
     ///
     /// This is the three-value form of [`Self::ReentrantValue2`].
     ReentrantValue3 = 10,
-    /// `(jit_ctx, receiver, property_ic_cell) -> NativeResultPair`
+    /// `(jit_ctx, receiver, property_ic_slot) -> NativeResultPair`
     /// reentrant named-property read.
     ///
-    /// The receiver is a boxed JavaScript value. `property_ic_cell` is stable
-    /// compiler-owned metadata rather than a GC value; the published native
-    /// frame supplies the exact function and logical-PC identity from which
-    /// the VM decodes the property name and feedback site.
+    /// The receiver is a boxed JavaScript value. `property_ic_slot` is the
+    /// site's CodeBlock-owned feedback slot rather than a GC value; its bound
+    /// function and logical-PC identity let the VM decode the property name.
     ReentrantNamedLoad = 11,
-    /// `(jit_ctx, receiver, value, property_ic_cell) -> NativeResultPair`
+    /// `(jit_ctx, receiver, value, property_ic_slot) -> NativeResultPair`
     /// reentrant named-property write.
     ///
     /// This is the two-value store counterpart of
@@ -603,11 +602,12 @@ pub const STUB_JIT_DEFINE_OWN_PROPERTY: RuntimeStubDescriptor = descriptor(
     RuntimeStubResultAbi::StatusWord,
     NativeResultDomain::None,
 );
-/// Named-property read over one boxed receiver and stable IC cell.
+/// Named-property read over one boxed receiver and the site's native IC slot
+/// (V8 `LoadIC_Miss`).
 ///
-/// Accessors, proxies, and exotic receivers may re-enter JavaScript. The
-/// immutable source identity in the cell selects `LoadProperty`; success returns
-/// its value and may patch the supplied cell, while failure returns one pure
+/// Accessors, proxies, and exotic receivers may re-enter JavaScript. The site
+/// identity bound in the slot selects `LoadProperty`; success returns its value
+/// and may install a handler in the slot, while failure returns one pure
 /// exception value without replay.
 pub const STUB_JIT_LOAD_PROPERTY: RuntimeStubDescriptor = descriptor(
     17,
@@ -619,8 +619,8 @@ pub const STUB_JIT_LOAD_PROPERTY: RuntimeStubDescriptor = descriptor(
     RuntimeStubResultAbi::NativePair,
     NativeResultDomain::Committed,
 );
-/// Named-property write over boxed receiver/value operands and a stable IC
-/// cell.
+/// Named-property write over boxed receiver/value operands and the site's
+/// native IC slot (V8 `StoreIC_Miss`).
 ///
 /// Shape transitions may allocate and setters or proxy traps may re-enter
 /// JavaScript. Entry commits the complete store exactly once or returns one

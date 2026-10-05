@@ -1,7 +1,8 @@
 //! Property, element, binding, and collection VM slow paths.
 //!
 //! # Contents
-//! - Immutable property source cells and committed cold handlers.
+//! - Named-property IC misses (V8 `LoadIC_Miss` / `StoreIC_Miss`) and
+//!   committed cold handlers.
 //! - Effect-once boxed-span method-call completion.
 //! - Element/global/object runtime operations.
 //!
@@ -10,10 +11,10 @@
 //! and named-property entries instead receive fixed boxed-value operands and
 //! return a committed value/exception pair. Method calls copy their complete receiver/argument
 //! packet before reentry. Named operations derive their immutable property
-//! name and feedback site from the immutable source identity in their source cell;
-//! the published activation supplies execution ownership, not property lookup.
-//! Property source cells contain identity only; semantic CacheIR is transpiled
-//! before allocation and cannot be patched into generated code. Inline frame recipes belong to the code-owned
+//! name from the site identity bound in their native IC slot; the published
+//! activation supplies execution ownership, not property lookup. A miss
+//! updates that slot, which already-published code reads on its next
+//! execution. Inline frame recipes belong to the code-owned
 //! safepoint record selected by the current precise root publication. They
 //! publish descendants only on cold reentry and normalize exceptions before those frames are removed.
 //! Allocating or throwing operations keep precise
@@ -31,40 +32,33 @@ use otter_vm::{
     native_abi::{CommittedValueError, NativeResultPair, NativeResultStatus},
 };
 
-/// Immutable source identity for one compiled named-property site.
-#[repr(C)]
-#[derive(Clone, Copy, Default)]
-pub(crate) struct PropertySourceCell {
-    source: Option<(u32, u32)>,
-}
-
-impl PropertySourceCell {
-    /// Set once during emission, before the code object is published.
-    pub(crate) fn set_source(&mut self, function_id: u32, instruction_pc: u32) {
-        self.source = Some((function_id, instruction_pc));
+/// The `(function id, instruction pc)` of the site whose native IC slot
+/// generated code passed, or a Fatal for a null slot.
+fn property_ic_site(slot: u64) -> Result<(u32, u32), CommittedValueError> {
+    if slot == 0 {
+        return Err(CommittedValueError::Fatal(VmError::InvalidOperand));
     }
+    // SAFETY: generated code passes the slot address its code object's
+    // retained CodeBlock owns (`JitPropertyAccess::ic_slot`).
+    Ok(unsafe { otter_vm::jit::property_ic_site(slot) })
 }
 
-/// Complete the source-owned `LoadProperty` from one boxed receiver.
+/// Complete the source-owned `LoadProperty` from one boxed receiver: V8's
+/// `LoadIC_Miss`.
 ///
-/// The code-owned cell supplies function/logical-PC identity; the VM validates
-/// the opcode and derives its property name and feedback site. Success returns
-/// the loaded value without mutating compiled proof state. Failure returns either a pure
-/// JavaScript exception or a structural Fatal; this boundary never requests
-/// replay or exact deoptimization.
+/// The site's IC slot supplies function/logical-PC identity; the VM validates
+/// the opcode, derives its property name, completes the load and updates the
+/// slot. Failure returns either a pure JavaScript exception or a structural
+/// Fatal; this boundary never requests replay or exact deoptimization.
 pub(crate) extern "C" fn jit_load_property_stub(
     ctx: *mut JitCtx,
     receiver_bits: u64,
-    cell: *mut PropertySourceCell,
+    slot: u64,
 ) -> NativeResultPair {
     // SAFETY: the live `JitCtx` reentry contract.
     let ctx = unsafe { &mut *ctx };
-    // SAFETY: generated code supplies its live code-owned cell, or null for
-    // an invalid boundary invocation. Copy the source before possible reentry.
-    let source = unsafe { cell.as_ref() }.and_then(|cell| cell.source);
     let result = (|| {
-        let (function_id, pc) =
-            source.ok_or(CommittedValueError::Fatal(VmError::InvalidOperand))?;
+        let (function_id, pc) = property_ic_site(slot)?;
         let mut call = ctx.runtime_call().map_err(CommittedValueError::Fatal)?;
         call.load_property_value(function_id, pc, Value::from_bits(receiver_bits))
     })();
@@ -72,7 +66,7 @@ pub(crate) extern "C" fn jit_load_property_stub(
 }
 
 /// Complete the exact published `StoreProperty` from boxed receiver/value
-/// operands.
+/// operands: V8's `StoreIC_Miss`.
 ///
 /// A successful return means the full store committed once; a setter/proxy
 /// exception is returned as a pure exception value without replay.
@@ -80,15 +74,12 @@ pub(crate) extern "C" fn jit_store_property_stub(
     ctx: *mut JitCtx,
     receiver_bits: u64,
     value_bits: u64,
-    cell: *mut PropertySourceCell,
+    slot: u64,
 ) -> NativeResultPair {
     // SAFETY: as `jit_load_property_stub`.
     let ctx = unsafe { &mut *ctx };
-    // SAFETY: the same stable code-owned cell contract as the load boundary.
-    let source = unsafe { cell.as_ref() }.and_then(|cell| cell.source);
     let result = (|| {
-        let (function_id, pc) =
-            source.ok_or(CommittedValueError::Fatal(VmError::InvalidOperand))?;
+        let (function_id, pc) = property_ic_site(slot)?;
         let mut call = ctx.runtime_call().map_err(CommittedValueError::Fatal)?;
         call.store_property_value(
             function_id,
@@ -269,17 +260,10 @@ mod tests {
 
     #[test]
     fn named_property_entries_use_fixed_committed_pair_abi() {
-        let _load_abi: extern "C" fn(
-            *mut JitCtx,
-            u64,
-            *mut PropertySourceCell,
-        ) -> NativeResultPair = jit_load_property_stub;
-        let _store_abi: extern "C" fn(
-            *mut JitCtx,
-            u64,
-            u64,
-            *mut PropertySourceCell,
-        ) -> NativeResultPair = jit_store_property_stub;
+        let _load_abi: extern "C" fn(*mut JitCtx, u64, u64) -> NativeResultPair =
+            jit_load_property_stub;
+        let _store_abi: extern "C" fn(*mut JitCtx, u64, u64, u64) -> NativeResultPair =
+            jit_store_property_stub;
 
         let mut registers = [Value::undefined()];
         let mut frame = Frame::new(
@@ -313,9 +297,7 @@ mod tests {
             runtime_stats: std::ptr::null_mut(),
         };
         unsafe { (*ctx.thread).frame_cell = std::ptr::addr_of_mut!(ctx.native_frame) as u64 };
-        let mut cell = PropertySourceCell::default();
-
-        let loaded = jit_load_property_stub(&mut ctx, Value::undefined().to_bits(), &mut cell);
+        let loaded = jit_load_property_stub(&mut ctx, Value::undefined().to_bits(), 0);
         assert_eq!(
             loaded.validate(NativeResultDomain::Committed),
             Some(NativeResultStatus::Fatal)
@@ -327,7 +309,7 @@ mod tests {
             &mut ctx,
             Value::undefined().to_bits(),
             Value::number_i32(33).to_bits(),
-            &mut cell,
+            0,
         );
         assert_eq!(
             stored.validate(NativeResultDomain::Committed),

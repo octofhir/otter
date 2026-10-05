@@ -1371,7 +1371,15 @@ fn emit_tail_path(
     emit_load_reg(ops, 13, callee)?;
     let count = u32::try_from(argument_registers.len())
         .map_err(|_| Unsupported::OperandShape("tail call actual count"))?;
-    crate::arm64::frame::emit_tail_transfer(ops, relocations, table, bytes, count, target, saved_pairs);
+    crate::arm64::frame::emit_tail_transfer(
+        ops,
+        relocations,
+        table,
+        bytes,
+        count,
+        target,
+        saved_pairs,
+    );
     Ok(())
 }
 
@@ -1994,25 +2002,34 @@ pub(super) fn emit_method_call(
         );
         dynasm!(ops ; .arch aarch64 ; b =>done ; =>next_target);
     }
-    // Every other receiver first probes the isolate's shared property-action
-    // table, as a V8 megamorphic call site probes its stub cache; a callable
-    // hit is called generically. A miss resolves through the committed
-    // method resolution, which also records the site's call feedback.
+    // Every other receiver runs the site's load IC (its handlers, then the
+    // isolate's shared action table as V8's megamorphic stub cache); a
+    // callable hit is called generically. A miss resolves through the
+    // committed method resolution, which also records the site's call
+    // feedback and updates the slot.
     let resolved = ops.new_dynamic_label();
-    let access = view
+    let ic_slot = view
         .property_accesses
         .get(&byte_pc)
-        .filter(|_| view.cage_base != 0);
-    if let Some(access) = access {
-        use super::shared_property::{METHOD_ATOM, METHOD_RECEIVER};
+        .map(|access| access.ic_slot)
+        .filter(|&slot| slot != 0 && view.cage_base != 0);
+    if let Some(ic_slot) = ic_slot {
+        use super::shared_property::{METHOD_RECEIVER, METHOD_SLOT};
         let probe = shared_probes.method_label(ops);
-        let resolve = ops.new_dynamic_label();
         emit_load_reg(ops, METHOD_RECEIVER, receiver)?;
-        super::values::emit_load_u64(ops, METHOD_ATOM, u64::from(access.atom));
+        super::values::emit_load_symbol_u64(
+            ops,
+            relocations,
+            METHOD_SLOT,
+            ic_slot,
+            crate::artifact::relocation::RelocationTarget::PropertyIcSlot {
+                function_id: view.code_block.id,
+                byte_pc,
+            },
+        );
         dynasm!(ops ; .arch aarch64
             ; bl =>probe
-            ; cbz x1, =>resolved
-            ; =>resolve);
+            ; cbz x1, =>resolved);
     }
     super::emit_cold_call_source(ops, return_sites.logical_pc, return_sites.safepoint_id);
     emit_value_packet_transition(

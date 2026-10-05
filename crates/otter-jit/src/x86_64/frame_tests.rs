@@ -30,7 +30,7 @@ const SPILL: SpillArea = SpillArea {
     bytes: 48,
     scratch_slot: Some(1),
     safepoint: SAFEPOINT,
-        saved_pairs: 0,
+    saved_pairs: 0,
 };
 
 #[derive(Default, Debug)]

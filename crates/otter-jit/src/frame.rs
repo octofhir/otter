@@ -53,6 +53,7 @@ impl SpillArea {
     };
 
     /// The callee-saved pairs covering the general registers in `used`.
+    #[cfg_attr(target_arch = "x86_64", allow(dead_code))]
     pub(crate) fn saved_pairs_for(used: u32) -> u8 {
         (0..4u8)
             .filter(|&pair| used & (0b11 << (22 + 2 * pair)) != 0)

@@ -82,12 +82,6 @@ pub struct OptimizedCode {
     /// Exact installed callee generations entered by emitted direct edges.
     dependencies: Box<[CodeDependency]>,
     spliced_functions: Box<[u32]>,
-    /// Per-`LoadProperty`-site inline caches. Their addresses are baked into
-    /// the emitted probes and self-patched by the miss transition, so the
-    /// allocation must live exactly as long as the code.
-    _load_ic_cells: Box<[crate::entry::PropertySourceCell]>,
-    /// Per-`StoreProperty`-site inline caches, same ownership contract.
-    _store_ic_cells: Box<[crate::entry::PropertySourceCell]>,
     /// Operand registers of generic baseline operations whose addresses the
     /// code bakes; same ownership contract.
     _register_operands: Box<[u16]>,
@@ -110,8 +104,6 @@ impl OptimizedCode {
         osr_headers: BTreeSet<u32>,
         dependencies: Box<[CodeDependency]>,
         spliced_functions: Box<[u32]>,
-        load_ic_cells: Box<[crate::entry::PropertySourceCell]>,
-        store_ic_cells: Box<[crate::entry::PropertySourceCell]>,
         register_operands: Box<[u16]>,
         metadata: OptimizedMetadata,
     ) -> Self {
@@ -134,8 +126,6 @@ impl OptimizedCode {
             osr_headers: osr_headers.into_iter().collect(),
             dependencies,
             spliced_functions,
-            _load_ic_cells: load_ic_cells,
-            _store_ic_cells: store_ic_cells,
             _register_operands: register_operands,
             metadata,
             code_metadata,
@@ -195,8 +185,6 @@ impl JitFunctionCode for OptimizedCode {
                 std::mem::size_of_val(self.return_sites.as_ref()),
                 std::mem::size_of_val::<[CodeDependency]>(&self.dependencies),
                 std::mem::size_of_val::<[u32]>(&self.spliced_functions),
-                std::mem::size_of_val::<[crate::entry::PropertySourceCell]>(&self._load_ic_cells),
-                std::mem::size_of_val::<[crate::entry::PropertySourceCell]>(&self._store_ic_cells),
                 std::mem::size_of_val::<[u16]>(&self._register_operands),
                 std::mem::size_of_val(self.osr_headers.as_ref()),
             ],
@@ -307,8 +295,6 @@ mod tests {
             Box::new([roots]),
             Box::new([]),
             [3, 17].into_iter().collect(),
-            Box::default(),
-            Box::default(),
             Box::default(),
             Box::default(),
             Box::new([0; 11]),

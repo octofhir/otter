@@ -656,8 +656,6 @@ pub(crate) struct TemplatePlan {
     #[cfg_attr(target_arch = "x86_64", allow(dead_code))]
     pub(crate) chain_leaves: Box<[u16]>,
     pub(crate) safepoint_records: Vec<SafepointRecord>,
-    pub(crate) load_property_count: usize,
-    pub(crate) store_property_count: usize,
     /// `true` when at least one opcode outside the subset was lowered to an
     /// exact side exit; such code serves loop OSR only.
     pub(crate) osr_only: bool,
@@ -1884,8 +1882,6 @@ impl TemplatePlan {
             register_operands: register_operands.into_boxed_slice(),
             chain_steps: chain_steps.into_boxed_slice(),
             chain_leaves: chain_leaves.into_boxed_slice(),
-            load_property_count: lowering.load_property_count,
-            store_property_count: lowering.store_property_count,
             safepoint_records: lowering.safepoint_records,
             osr_only,
         })
@@ -3011,8 +3007,6 @@ mod tests {
             }
             other => panic!("expected NewArray, got {other:?}"),
         }
-        assert_eq!(plan.load_property_count, 1);
-        assert_eq!(plan.store_property_count, 1);
     }
 
     #[test]

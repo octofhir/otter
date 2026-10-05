@@ -37,7 +37,7 @@ use crate::{
     CodeBlock, CodeBlockInstruction, ExecutionContext, GeneratorResumeKind, Interpreter, JsString,
     NumberValue, PendingBindFunction, PendingBindStage, Value, VmError, VmGetOutcome,
     VmPropertyKey, bigint, boolean::prototype as boolean_prototype, bootstrap_collections,
-    cache_ir, collections_prototype, date, descriptor_value, function_metadata,
+    collections_prototype, date, descriptor_value, function_metadata,
     native_function::VmIntrinsicFunction, number, promise_dispatch,
     property_atom::AtomizedPropertyKey, property_ic::PropertyIcKind, read_register,
     regexp_prototype, require_callable, string::prototype as string_prototype, symbol_prototype,
@@ -599,7 +599,9 @@ impl Interpreter {
             // the shape-guarded fast path above. Only installed while the
             // property load site is monomorphic and the method is an own data
             // slot; prototype methods and polymorphic sites leave it empty.
-            if let Some(hit) = property_slot.and_then(|slot| slot.mono_load_own_data_hit()) {
+            if let Some(hit) =
+                property_slot.and_then(|slot| slot.mono_own_hit(atomized_key.atom().id()))
+            {
                 self.method_feedback
                     .install_method_ic(method_site, MethodCallIc::Ordinary(hit));
             }
@@ -1969,24 +1971,14 @@ impl Interpreter {
                 .resolve_property_data_slot(obj, key)
                 .map(|resolved| resolved.value);
         }
-        if let Some(value) = slot.probe_load(obj, &self.gc_heap, key) {
+        if let Some(value) = slot.probe_load(obj, &self.gc_heap) {
             slot.record_hit();
             return Some(value);
         }
-        if slot.entry_count() > 0 {
-            slot.record_guard_miss();
-        } else {
-            slot.record_uncached_miss();
-        }
-        let resolved = self.resolve_property_data_slot(obj, key)?;
-        if !slot.is_megamorphic() {
-            let ic = cache_ir::CacheStub::from_resolved_load(
-                crate::object::shape_id(obj, &self.gc_heap),
-                &resolved,
-            );
-            slot.install(ic);
-        }
-        Some(resolved.value)
+        slot.record_miss();
+        let resolved = self.resolve_property_data_slot(obj, key);
+        self.update_load_ic(slot, obj, key, resolved.as_ref());
+        Some(resolved?.value)
     }
 
     fn callable_has_own_function_method_shadow(

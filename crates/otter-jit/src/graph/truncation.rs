@@ -54,9 +54,15 @@ pub(crate) fn wrap_truncated_arithmetic(graph: &mut Graph, layout: &[BlockId]) {
     let mut uses: Vec<(NodeId, NodeId)> = Vec::new();
     for &block in layout {
         let data = graph.block(block);
-        for &node in data.phis.iter().chain(&data.body).chain(data.control.iter()) {
+        for &node in data
+            .phis
+            .iter()
+            .chain(&data.body)
+            .chain(data.control.iter())
+        {
             let node_data = graph.node(node);
-            if matches!(node_data.kind, Kind::Int32Add | Kind::Int32Sub) && !observed.contains(&node)
+            if matches!(node_data.kind, Kind::Int32Add | Kind::Int32Sub)
+                && !observed.contains(&node)
             {
                 candidates.insert(node);
             }

@@ -7,24 +7,24 @@
 //! # Invariants
 //! - Every entry completes the whole observable operation, so a miss never
 //!   leaves a half-performed effect for the interpreter to finish.
-//! - Validated CodeBlock CacheIR hits commit directly; canonical `[[Set]]`
-//!   resolution runs only on a miss. New programs affect later immutable
-//!   compile snapshots, never an already-published code object.
+//! - Matched CodeBlock IC handlers commit directly; canonical `[[Set]]`
+//!   resolution runs only on a miss. A miss updates the site's native slot,
+//!   which already-published generated code reads on its next execution.
 //! - Named-property operands live in the shared handle arena. Scope exit
 //!   restores its depth, and every post-allocation read resolves the live slot.
 //! - Every source site records its first attempt before receiver classification
-//!   or user code, including receivers no CacheIR program can describe.
+//!   or user code, including receivers no handler can describe.
 //!
 //! # See also
-//! - `cache_ir` and `object::shape_transition` own the complete store guards.
+//! - `property_ic` and `object::shape_transition` own the complete store guards.
 //! - `handles` owns reusable operand storage and scope cleanup.
 
 use crate::activation_stack::ActivationStack;
 use crate::native_abi::CommittedValueError;
 use crate::{
     ActiveFrameMut, ActiveFrameRef, ExecutionContext, Interpreter, Value, VmError, VmPropertyKey,
-    cache_ir, object, property_atom::AtomizedPropertyKey, property_ic::PropertyIcKind,
-    read_register, rooting::RootScopeExt, value_kind_name,
+    object, property_atom::AtomizedPropertyKey, property_ic::PropertyIcKind, read_register,
+    rooting::RootScopeExt, value_kind_name,
 };
 use otter_bytecode::Op;
 
@@ -117,42 +117,27 @@ impl Interpreter {
             let result = self.load_property_value(context, stack, receiver, atomized_key.name())?;
             return Ok(result);
         }
-        if let Some(value) = slot.probe_load(obj, &self.gc_heap, atomized_key) {
+        if let Some(value) = slot.probe_load(obj, &self.gc_heap) {
             slot.record_hit();
-            // Compute feedback before committing the destination: register
-            // allocation may legally alias `dst` with `obj_reg` (common in an
-            // optimizing OSR transition). Reading the receiver after the write
-            // would then inspect the loaded property value as an object.
-            let result = value;
-            return Ok(result);
+            return Ok(value);
         }
-        if slot.entry_count() > 0 {
-            slot.record_guard_miss();
-        } else {
-            slot.record_uncached_miss();
-        }
+        slot.record_miss();
         // A dictionary-mode receiver has no hidden class for a guard to name, so
-        // no cache program can describe an access on it. Bootstrap namespace
-        // objects are built that way; migrate the receiver onto the shaped path,
-        // then re-read it — the migration allocates and may relocate it.
+        // no handler can describe an access on it. Bootstrap namespace objects
+        // are built that way; migrate the receiver onto the shaped path, then
+        // re-read it — the migration allocates and may relocate it.
         let mut migrating = obj;
         self.migrate_slow_to_fast(&mut migrating);
         receiver = Value::object(migrating);
         self.set_scoped(receiver_root, receiver);
         let obj = migrating;
-        if let Some(resolved) = self.resolve_property_data_slot(obj, atomized_key) {
-            if !slot.is_megamorphic() {
-                let ic = cache_ir::CacheStub::from_resolved_load(
-                    object::shape_id(obj, &self.gc_heap),
-                    &resolved,
-                );
-                slot.install(ic);
-            }
-            let result = resolved.value;
-            return Ok(result);
+        let resolved = self.resolve_property_data_slot(obj, atomized_key);
+        self.update_load_ic(slot, obj, atomized_key, resolved.as_ref());
+        if let Some(resolved) = resolved {
+            return Ok(resolved.value);
         }
-        // Not cache-representable (accessor, opaque lookup, absent):
-        // complete the load in place through the full cascade.
+        // No data slot (accessor, opaque lookup, absent): complete the load in
+        // place through the full cascade.
         let result = self.load_property_value(context, stack, receiver, atomized_key.name())?;
         Ok(result)
     }
@@ -242,11 +227,10 @@ impl Interpreter {
                 )?;
                 return Ok(());
             }
-            let entries_len = slot.entry_count();
-            // An installed stub's guards are the authority for its own outcome
-            // — an own writable data slot or a captured add-transition — so a
-            // probe hit needs no semantic resolution, exactly as on the
-            // interpreter's store path.
+            // An installed handler is the authority for its own outcome — an
+            // own writable data slot or a captured add-transition — so a hit
+            // needs no semantic resolution, exactly as on the interpreter's
+            // store path.
             path = Path::Cached;
             if slot
                 .probe_store(obj, &mut self.gc_heap, atomized_key, &value)
@@ -255,11 +239,7 @@ impl Interpreter {
                 slot.record_hit();
                 return Ok(());
             }
-            if entries_len > 0 {
-                slot.record_guard_miss();
-            } else {
-                slot.record_uncached_miss();
-            }
+            slot.record_miss();
             // A megamorphic site installs no transitions of its own; the
             // shared table replays one another site (or this one) captured
             // for this receiver class, under the same complete guards.
@@ -307,73 +287,39 @@ impl Interpreter {
                 .as_object()
                 .ok_or(VmError::InvalidOperand)
                 .map_err(|error| CommittedValueError::Fatal(error.into()))?;
-            if slot.is_megamorphic() {
-                if let Some(ic) = cache_ir::CacheStub::install_store_existing(
+            if let Some((handler, hit)) = crate::property_ic::IcHandler::store_existing_hit(
+                current_obj,
+                &self.gc_heap,
+                atomized_key,
+            ) {
+                path = Path::InstallExisting;
+                object::store_proven_data_slot(current_obj, &mut self.gc_heap, hit.slot, value);
+                self.property_cache.record_own_store(hit);
+                slot.install(handler);
+                return Ok(());
+            }
+            // Shape interning and slab preparation may collect. The helper
+            // roots the complete stack plus receiver/value and commits the
+            // property exactly once when it returns a transition. Shapes never
+            // move, so the pre-store layout still names the handler.
+            path = Path::InstallTransition;
+            let from_shape = object::keyed_shape(current_obj, &self.gc_heap);
+            if let Some(transition) = self
+                .capture_store_property_transition_with_stack_roots(
+                    stack,
                     current_obj,
-                    &self.gc_heap,
                     atomized_key,
-                ) {
-                    if ic
-                        .run_store(current_obj, &mut self.gc_heap, atomized_key, &value)
-                        .map_err(|error| CommittedValueError::JavaScript(error.into()))?
-                        .is_some()
-                    {
-                        path = Path::InstallExisting;
-                        self.property_cache.record_own_store(
-                            ic.store_own_data_hit().expect("existing-own-store program"),
-                        );
-                        return Ok(());
-                    }
-                } else {
-                    path = Path::InstallTransition;
-                    if let Some(transition) = self
-                        .capture_store_property_transition_with_stack_roots(
-                            stack,
-                            current_obj,
-                            atomized_key,
-                            &value,
-                        )
-                        .map_err(|error| CommittedValueError::JavaScript(error.into()))?
-                    {
-                        self.property_cache.record_store(transition);
-                        return Ok(());
-                    }
-                }
-            } else {
-                if let Some(ic) = cache_ir::CacheStub::install_store_existing(
-                    current_obj,
-                    &self.gc_heap,
-                    atomized_key,
-                ) && ic
-                    .run_store(current_obj, &mut self.gc_heap, atomized_key, &value)
-                    .map_err(|error| CommittedValueError::JavaScript(error.into()))?
-                    .is_some()
+                    &value,
+                )
+                .map_err(|error| CommittedValueError::JavaScript(error.into()))?
+            {
+                if let Some(handler) =
+                    crate::property_ic::IcHandler::store_transition(from_shape, &transition)
                 {
-                    path = Path::InstallExisting;
-                    self.property_cache.record_own_store(
-                        ic.store_own_data_hit().expect("existing-own-store program"),
-                    );
-                    slot.install(ic);
-                    return Ok(());
+                    slot.install(handler);
                 }
-
-                // Shape interning and slab preparation may collect. The helper
-                // roots the complete stack plus receiver/value and commits the
-                // property exactly once when it returns a transition.
-                path = Path::InstallTransition;
-                if let Some(transition) = self
-                    .capture_store_property_transition_with_stack_roots(
-                        stack,
-                        current_obj,
-                        atomized_key,
-                        &value,
-                    )
-                    .map_err(|error| CommittedValueError::JavaScript(error.into()))?
-                {
-                    slot.install(cache_ir::CacheStub::store_transition(transition.clone()));
-                    self.property_cache.record_store(transition);
-                    return Ok(());
-                }
+                self.property_cache.record_store(transition);
+                return Ok(());
             }
 
             // A rejected transition attempt may have collected while interning its

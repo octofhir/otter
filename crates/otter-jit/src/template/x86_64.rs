@@ -80,6 +80,7 @@ mod native_leaf;
 #[path = "x86_64/operation.rs"]
 pub(crate) mod operation;
 mod primitive_strings;
+pub(crate) mod shared_property;
 
 use dynasmrt::{DynamicLabel, DynasmApi, DynasmLabelApi, dynasm, x64::Assembler};
 use otter_bytecode::scalar_semantics::{Int32ResultPolicy, NegativeZeroCondition};
@@ -90,7 +91,7 @@ use crate::{
     CompiledCode, Unsupported,
     artifact::{
         ArtifactRequest, CodeMapCapture, CodeRegion, NativeCompileOutput, build_bundle,
-        relocation::{PropertySourceAccess, RelocationCapture, RelocationTarget},
+        relocation::{RelocationCapture, RelocationTarget},
     },
     call_linkage::EntryShape,
     entry::{
@@ -104,7 +105,7 @@ use crate::{
     frame::{ActivationExits, CallEntryCold, SpillArea},
     x86_64::{
         call_abi::{emit_runtime_call, emit_variadic_call},
-        fields::{emit_field_base, emit_load_prototype},
+        fields::emit_field_base,
         frame,
         values::{
             DOUBLE_OFFSET, NUMBER_TAG, emit_box_double, emit_box_int32, emit_load_runtime_stub,
@@ -142,14 +143,7 @@ pub(super) fn compile(
     let mut relocations = RelocationCapture::new(artifact_request.is_some());
     let mut code_map = artifact_request.as_ref().map(|_| CodeMapCapture::default());
     let mut direct_call_events = capture_events.then(|| super::seed_direct_call_events(view));
-    let mut load_ic_cells =
-        vec![crate::entry::PropertySourceCell::default(); plan.load_property_count]
-            .into_boxed_slice();
-    let mut store_ic_cells =
-        vec![crate::entry::PropertySourceCell::default(); plan.store_property_count]
-            .into_boxed_slice();
-    let mut next_load_ic = 0usize;
-    let mut next_store_ic = 0usize;
+    let mut shared_property = shared_property::SharedPropertyProbes::default();
     let type_mismatch = ops.new_dynamic_label();
     let unsupported = ops.new_dynamic_label();
     let runtime_transition = ops.new_dynamic_label();
@@ -267,10 +261,7 @@ pub(super) fn compile(
                     fatal,
                 },
                 frame_kind: shape.kind,
-                load_ic_cells: &mut load_ic_cells,
-                next_load_ic: &mut next_load_ic,
-                store_ic_cells: &mut store_ic_cells,
-                next_store_ic: &mut next_store_ic,
+                shared_property: &mut shared_property,
                 direct_call_events: &mut direct_call_events,
                 code_map: &mut code_map,
             },
@@ -428,6 +419,7 @@ pub(super) fn compile(
         }
         osr_entries.insert(header_pc, offset);
     }
+    shared_property.emit(&mut ops, &mut relocations, transitions, view);
 
     let buffer = crate::entry::finalize_assembler(ops)?;
     let TemplatePlan {
@@ -470,8 +462,6 @@ pub(super) fn compile(
         Box::new([]),
         super::code::retained_source_work(view, &BTreeSet::new()),
         register_operands,
-        load_ic_cells,
-        store_ic_cells,
         safepoint_records.into_boxed_slice(),
         return_sites.into_boxed_slice(),
         osr_entries,
@@ -1478,271 +1468,175 @@ fn emit_committed_value2(
     }
 }
 
+/// `Rq(slot)` = the site's IC slot address.
+fn emit_slot_address(
+    ops: &mut Assembler,
+    relocations: &mut RelocationCapture,
+    view: &JitCompileSnapshot,
+    byte_pc: u32,
+    slot: u8,
+) -> Result<(), Unsupported> {
+    let ic_slot = view
+        .property_accesses
+        .get(&byte_pc)
+        .map(|access| access.ic_slot)
+        .filter(|&slot| slot != 0 && view.cage_base != 0)
+        .ok_or(Unsupported::OperandShape(
+            "named property site without an IC slot",
+        ))?;
+    emit_load_symbol_u64(
+        ops,
+        relocations,
+        slot,
+        ic_slot,
+        RelocationTarget::PropertyIcSlot {
+            function_id: view.code_block.id,
+            byte_pc,
+        },
+    );
+    Ok(())
+}
+
+/// Inline own-field selection (JSC's baseline DataIC fast path): an ordinary
+/// receiver whose shape equals the slot's own-field pair leaves the field's
+/// bank base in `r8` and bank-relative index in `rax`; anything else jumps
+/// to `miss`. Clobbers `r8`, `r10`, `r11`, `rax`.
+fn emit_inline_own_field(
+    ops: &mut Assembler,
+    view: &JitCompileSnapshot,
+    receiver: u8,
+    slot: u8,
+    miss: DynamicLabel,
+) {
+    let inline = ops.new_dynamic_label();
+    let ready = ops.new_dynamic_label();
+    let layout = view.field_layout;
+    let ic = otter_vm::jit::PROPERTY_IC_LAYOUT;
+    emit_load_u64(ops, 10, NOT_CELL_MASK);
+    dynasm!(ops ; .arch x64
+        ; test Rq(receiver), r10 ; jnz =>miss
+        ; test Rq(receiver), Rq(receiver) ; jz =>miss
+        ; cmp BYTE [Rq(receiver)], OBJECT_BODY_TYPE_TAG as i8 ; jne =>miss
+        ; mov r8d, [Rq(receiver) + view.object_shape_byte as i32]
+        ; cmp r8d, [Rq(slot) + ic.inline_shape_byte as i32] ; jne =>miss
+        ; mov eax, [Rq(slot) + ic.inline_field_byte as i32]
+        ; test eax, eax ; js =>inline
+        ; mov r8d, [Rq(receiver) + layout.slab_handle_byte as i32]
+        ; test r8d, r8d ; jz =>miss);
+    emit_load_u64(ops, 11, 0xffff_ffff_0000_0000);
+    dynasm!(ops ; .arch x64
+        ; and r11, Rq(receiver) ; add r8, r11
+        ; add r8, layout.slab_words_byte as i32 ; jmp =>ready
+        ; =>inline
+        ; and eax, 0x7fff_ffff
+        ; lea r8, [Rq(receiver) + layout.inline_values_byte as i32]
+        ; =>ready);
+}
+
+/// Route a shared routine's `NativeResultPair` status in `rdx`.
+fn emit_pair_status(ops: &mut Assembler, throw_value: DynamicLabel, fatal: DynamicLabel) {
+    dynasm!(ops
+        ; .arch x64
+        ; test rdx, rdx
+        ; je >completed
+        ; cmp edx, abi::NativeResultStatus::Throw as i32
+        ; je =>throw_value
+        ; jmp =>fatal
+        ; completed:
+    );
+}
+
+/// Emit `obj.name = value`: inline own field, then the shared `StoreIC`.
 #[allow(clippy::too_many_arguments)]
 fn emit_store_property(
     ops: &mut Assembler,
     relocations: &mut RelocationCapture,
-    transitions: &crate::entry::TransitionTable,
+    shared_property: &mut shared_property::SharedPropertyProbes,
     view: &JitCompileSnapshot,
     byte_pc: u32,
     object: u16,
     value: u16,
-    cell_addr: u64,
-    cell_ordinal: u32,
-    programs: Option<&[otter_vm::JitCacheIrProgram]>,
     throw_value: DynamicLabel,
     fatal: DynamicLabel,
-) {
+) -> Result<(), Unsupported> {
+    use shared_property::{STORE_RECEIVER, STORE_SLOT, STORE_VALUE};
     let shared = ops.new_dynamic_label();
-    let miss = ops.new_dynamic_label();
     let done = ops.new_dynamic_label();
-    let hit = ops.new_dynamic_label();
-    let appended = ops.new_dynamic_label();
-    emit_existing_property_store(
-        ops,
-        relocations,
-        view,
-        object,
-        value,
-        programs,
-        shared,
-        done,
-    );
-    dynasm!(ops ; .arch x64 ; =>shared);
-    emit_load_reg(ops, 0, object);
-    emit_load_reg(ops, 6, value);
-    crate::x86_64::property_actions::emit_action_probe(
-        ops,
-        relocations,
-        view,
-        view.property_action_cache,
-        view.property_accesses.get(&byte_pc).map(|site| site.atom),
-        PropertySourceAccess::Store,
-        0,
-        Some(6),
-        [1, 2, 8, 9],
-        None,
-        miss,
-        hit,
-        appended,
-    );
-    dynasm!(ops ; .arch x64 ; =>appended);
-    // The helper leaves the published compressed child in edx. This existing
-    // barrier cannot collect; subsequent inputs reload from canonical homes.
-    emit_load_u64(ops, 11, 0xffff_ffff_0000_0000);
-    dynasm!(ops ; .arch x64 ; and r11, rax ; mov r8d, edx ; add r8, r11);
-    emit_template_value_barrier(ops, relocations, view, 0, 8);
-    dynasm!(ops ; .arch x64 ; =>hit);
-    emit_load_reg(ops, 0, object);
-    emit_load_reg(ops, 2, value);
-    emit_template_value_barrier(ops, relocations, view, 0, 2);
-    dynasm!(ops ; .arch x64 ; jmp =>done ; =>miss);
-    emit_load_reg(ops, 6, object);
-    emit_load_reg(ops, 2, value);
-    emit_load_symbol_u64(
-        ops,
-        relocations,
-        1,
-        cell_addr,
-        RelocationTarget::PropertySourceCell {
-            access: PropertySourceAccess::Store,
-            ordinal: cell_ordinal,
-        },
-    );
-    dynasm!(ops ; .arch x64 ; mov rdi, r15);
-    emit_load_runtime_stub(
-        ops,
-        relocations,
-        transitions.entry(abi::STUB_JIT_STORE_PROPERTY),
-        abi::STUB_JIT_STORE_PROPERTY,
-    );
-    emit_runtime_call(ops, abi::STUB_JIT_STORE_PROPERTY);
-    dynasm!(ops
-        ; .arch x64
-        ; test rdx, rdx
-        ; je >completed
-        ; cmp edx, abi::NativeResultStatus::Throw as i32
-        ; je =>throw_value
-        ; jmp =>fatal
-        ; completed:
-        ; =>done
-    );
-}
-
-#[allow(clippy::too_many_arguments)]
-fn emit_load_property(
-    ops: &mut Assembler,
-    relocations: &mut RelocationCapture,
-    transitions: &crate::entry::TransitionTable,
-    view: &JitCompileSnapshot,
-    byte_pc: u32,
-    dst: u16,
-    object: u16,
-    cell_addr: u64,
-    cell_ordinal: u32,
-    programs: Option<&[otter_vm::JitCacheIrProgram]>,
-    throw_value: DynamicLabel,
-    fatal: DynamicLabel,
-) {
-    let shared = ops.new_dynamic_label();
-    let miss = ops.new_dynamic_label();
-    let done = ops.new_dynamic_label();
-    emit_existing_property_load(
-        ops,
-        relocations,
-        view,
-        byte_pc,
-        object,
-        programs,
-        shared,
-        done,
-    );
-    dynasm!(ops ; .arch x64 ; =>shared);
-    emit_load_reg(ops, 0, object);
-    crate::x86_64::property_actions::emit_action_probe(
-        ops,
-        relocations,
-        view,
-        view.property_action_cache,
-        view.property_accesses.get(&byte_pc).map(|site| site.atom),
-        PropertySourceAccess::Load,
-        0,
-        None,
-        [1, 2, 8, 9],
-        Some(0),
-        miss,
-        done,
-        done,
-    );
-    dynasm!(ops ; .arch x64 ; =>miss);
-    emit_load_reg(ops, 6, object);
-    emit_load_symbol_u64(
-        ops,
-        relocations,
-        2,
-        cell_addr,
-        RelocationTarget::PropertySourceCell {
-            access: PropertySourceAccess::Load,
-            ordinal: cell_ordinal,
-        },
-    );
-    dynasm!(ops ; .arch x64 ; mov rdi, r15);
-    emit_load_runtime_stub(
-        ops,
-        relocations,
-        transitions.entry(abi::STUB_JIT_LOAD_PROPERTY),
-        abi::STUB_JIT_LOAD_PROPERTY,
-    );
-    emit_runtime_call(ops, abi::STUB_JIT_LOAD_PROPERTY);
-    dynasm!(ops
-        ; .arch x64
-        ; test rdx, rdx
-        ; je >completed
-        ; cmp edx, abi::NativeResultStatus::Throw as i32
-        ; je =>throw_value
-        ; jmp =>fatal
-        ; completed:
-    );
+    emit_slot_address(ops, relocations, view, byte_pc, STORE_SLOT)?;
+    emit_load_reg(ops, STORE_RECEIVER, object);
+    emit_inline_own_field(ops, view, STORE_RECEIVER, STORE_SLOT, shared);
+    emit_load_reg(ops, STORE_VALUE, value);
+    dynasm!(ops ; .arch x64 ; mov [r8 + rax * 8], Rq(STORE_VALUE));
+    emit_template_value_barrier(ops, relocations, view, STORE_RECEIVER, STORE_VALUE);
+    dynasm!(ops ; .arch x64 ; jmp =>done ; =>shared);
+    let routine = shared_property.label(ops, true);
+    emit_load_reg(ops, STORE_RECEIVER, object);
+    emit_load_reg(ops, STORE_VALUE, value);
+    dynasm!(ops ; .arch x64 ; call =>routine);
+    emit_pair_status(ops, throw_value, fatal);
     dynasm!(ops ; .arch x64 ; =>done);
-    emit_store_reg(ops, 0, dst);
+    Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
-fn emit_existing_property_load(
+/// Static intrinsic-prototype reads: a receiver of an intrinsic body type
+/// (primitive string, closure, collection) reading a data slot of its pinned
+/// realm prototype. These programs describe realm intrinsics, not site
+/// feedback; a miss falls through to the site's IC. A hit leaves the value in
+/// `rax` and jumps to `done`.
+fn emit_intrinsic_loads(
     ops: &mut Assembler,
     relocations: &mut RelocationCapture,
     view: &JitCompileSnapshot,
     byte_pc: u32,
     object: u16,
-    programs: Option<&[otter_vm::JitCacheIrProgram]>,
-    miss: DynamicLabel,
     done: DynamicLabel,
 ) {
-    let Some(programs) = programs.filter(|programs| !programs.is_empty()) else {
-        dynasm!(ops ; .arch x64 ; jmp =>miss);
+    use otter_vm::JitCacheIrOp as Op;
+    let Some(programs) = view.property_programs.get(&byte_pc) else {
         return;
     };
-    emit_load_reg(ops, 0, object);
-    let has_intrinsic = programs.iter().any(|program| {
-        matches!(
-            program.ops.first(),
-            Some(otter_vm::JitCacheIrOp::LoadIntrinsicPrototype { .. })
-        )
-    });
-    if !has_intrinsic {
-        emit_template_object_header(ops, relocations, view, 0, 10, miss);
-    }
     for program in programs {
-        if !program
-            .ops
-            .iter()
-            .any(|op| matches!(op, otter_vm::JitCacheIrOp::LoadField { .. }))
-            || program.ops.iter().any(|op| {
-                matches!(
-                    op,
-                    otter_vm::JitCacheIrOp::StoreField { .. }
-                        | otter_vm::JitCacheIrOp::GuardExtensible { .. }
-                        | otter_vm::JitCacheIrOp::PublishShape { .. }
-                )
-            })
-        {
+        let Some((
+            Op::LoadIntrinsicPrototype {
+                object: 0,
+                result: 1,
+                target,
+            },
+            rest,
+        )) = program.ops.split_first()
+        else {
+            continue;
+        };
+        let Some((&Op::LoadField { object: 1, field }, guards)) = rest.split_last() else {
+            continue;
+        };
+        if !guards.iter().all(|op| {
+            matches!(
+                op,
+                Op::GuardShape { object: 1, .. }
+                    | Op::GuardDictionaryLayout { object: 1, .. }
+                    | Op::GuardAtomSlot {
+                        object: 1,
+                        writable: false,
+                        ..
+                    }
+                    | Op::GuardPrototypeValidity { .. }
+            )
+        }) {
             continue;
         }
         let next = ops.new_dynamic_label();
-        let intrinsic = matches!(
-            program.ops.first(),
-            Some(otter_vm::JitCacheIrOp::LoadIntrinsicPrototype { .. })
-        );
-        if has_intrinsic && !intrinsic {
-            emit_template_object_header(ops, relocations, view, 0, 10, next);
-        }
-        let mut terminal = false;
-        for op in &program.ops {
+        emit_load_reg(ops, 0, object);
+        intrinsic_prototype::emit(ops, relocations, view, *target, byte_pc, 0, next);
+        dynasm!(ops ; .arch x64
+            ; cmp BYTE [r8], OBJECT_BODY_TYPE_TAG as i8
+            ; jne =>next);
+        for op in guards {
             match *op {
-                otter_vm::JitCacheIrOp::LoadIntrinsicPrototype {
-                    object: 0,
-                    result: 1,
-                    target,
-                } => {
-                    intrinsic_prototype::emit(ops, relocations, view, target, byte_pc, 0, next);
-                    dynasm!(ops
-                        ; .arch x64
-                        ; cmp BYTE [r8], OBJECT_BODY_TYPE_TAG as i8
-                        ; jne =>next
-                    );
-                }
-                otter_vm::JitCacheIrOp::LoadPrototypeHolder { root, result: 1 } => {
-                    emit_load_symbol_u64(
-                        ops,
-                        relocations,
-                        9,
-                        view.cage_base as u64,
-                        RelocationTarget::GcCageBase,
-                    );
-                    emit_load_u64(ops, 8, u64::from(root));
-                    dynasm!(ops ; .arch x64 ; mov r8d, [r9 + r8 + view.shape_prototype_byte as i32] ; add r8, r9);
-                }
-                otter_vm::JitCacheIrOp::GuardPrototypeValidity { validity } => {
-                    emit_load_symbol_u64(
-                        ops,
-                        relocations,
-                        9,
-                        validity.address as u64,
-                        RelocationTarget::PrototypeValidityCell {
-                            identity: validity.identity,
-                        },
-                    );
-                    dynasm!(ops ; .arch x64 ; cmp DWORD [r9], 0 ; je =>next);
-                }
-                otter_vm::JitCacheIrOp::GuardShape { object, shape } => {
-                    let header = if object == 0 { 10 } else { 8 };
-                    // Eligible immutable identity owns lookup state, descriptor
-                    // attributes and bank layout even with benign sidecars.
-                    emit_template_shape_identity_guard(ops, view, header, shape, next);
-                }
-                otter_vm::JitCacheIrOp::GuardDictionaryLayout { object: 1, layout } => {
-                    // A dictionary holder keeps its slot-layout epoch in its
-                    // sidecar.
+                Op::GuardShape { shape, .. } => dynasm!(ops ; .arch x64
+                    ; cmp DWORD [r8 + view.object_shape_byte as i32], shape as i32
+                    ; jne =>next),
+                Op::GuardDictionaryLayout { layout, .. } => {
                     emit_load_symbol_u64(
                         ops,
                         relocations,
@@ -1750,8 +1644,7 @@ fn emit_existing_property_load(
                         view.cage_base as u64,
                         RelocationTarget::GcCageBase,
                     );
-                    dynasm!(ops
-                        ; .arch x64
+                    dynasm!(ops ; .arch x64
                         ; mov r9d, [r8 + view.object_shape_byte as i32]
                         ; test BYTE [r11 + r9 + view.shape_state_byte as i32], otter_vm::object::ShapeState::DICTIONARY_MASK as i8
                         ; jz =>next
@@ -1761,85 +1654,9 @@ fn emit_existing_property_load(
                         ; add r9, r11
                         ; mov r11d, layout as u32 as i32
                         ; cmp [r9 + view.exotic_dictionary_layout_byte as i32], r11d
-                        ; jne =>next
-                    );
+                        ; jne =>next);
                 }
-                otter_vm::JitCacheIrOp::GuardAtomSlot {
-                    writable: false, ..
-                } => {}
-                otter_vm::JitCacheIrOp::LoadField { object, field } => {
-                    let value_byte = field.byte_offset();
-                    let header = if object == 0 { 10 } else { 8 };
-                    emit_field_base(ops, relocations, view, header, 11, 9, field);
-                    dynasm!(ops
-                        ; .arch x64
-                        ; mov rax, [r11 + value_byte as i32]
-                        ; jmp =>done
-                    );
-                    terminal = true;
-                }
-                _ => {
-                    terminal = false;
-                    break;
-                }
-            }
-        }
-        if terminal {
-            dynasm!(ops ; .arch x64 ; =>next);
-        }
-    }
-    dynasm!(ops ; .arch x64 ; jmp =>miss);
-}
-
-#[allow(clippy::too_many_arguments)]
-fn emit_existing_property_store(
-    ops: &mut Assembler,
-    relocations: &mut RelocationCapture,
-    view: &JitCompileSnapshot,
-    object: u16,
-    value: u16,
-    programs: Option<&[otter_vm::JitCacheIrProgram]>,
-    miss: DynamicLabel,
-    done: DynamicLabel,
-) {
-    let Some(programs) = programs.filter(|programs| !programs.is_empty()) else {
-        dynasm!(ops ; .arch x64 ; jmp =>miss);
-        return;
-    };
-    emit_load_reg(ops, 0, object);
-    emit_template_object_header(ops, relocations, view, 0, 10, miss);
-    emit_template_state_mask_guard(
-        ops,
-        relocations,
-        view,
-        10,
-        otter_vm::object::ShapeState::PROTOTYPE_MASK,
-        miss,
-    );
-    for program in programs {
-        if !program
-            .ops
-            .iter()
-            .any(|op| matches!(op, otter_vm::JitCacheIrOp::StoreField { .. }))
-        {
-            continue;
-        }
-        let next = ops.new_dynamic_label();
-        let mut terminal = false;
-        for (index, op) in program.ops.iter().enumerate() {
-            match *op {
-                otter_vm::JitCacheIrOp::LoadPrototypeHolder { root, result: 1 } => {
-                    emit_load_symbol_u64(
-                        ops,
-                        relocations,
-                        9,
-                        view.cage_base as u64,
-                        RelocationTarget::GcCageBase,
-                    );
-                    emit_load_u64(ops, 8, u64::from(root));
-                    dynasm!(ops ; .arch x64 ; mov r8d, [r9 + r8 + view.shape_prototype_byte as i32] ; add r8, r9);
-                }
-                otter_vm::JitCacheIrOp::GuardPrototypeValidity { validity } => {
+                Op::GuardPrototypeValidity { validity } => {
                     emit_load_symbol_u64(
                         ops,
                         relocations,
@@ -1851,204 +1668,48 @@ fn emit_existing_property_store(
                     );
                     dynasm!(ops ; .arch x64 ; cmp DWORD [r9], 0 ; je =>next);
                 }
-                otter_vm::JitCacheIrOp::GuardShape { object, shape } => {
-                    let header = if object == 0 { 10 } else { 8 };
-                    emit_template_shape_identity_guard(ops, view, header, shape, next);
-                }
-                otter_vm::JitCacheIrOp::GuardAtomSlot {
-                    object,
-                    writable: true,
-                    ..
-                } if object <= 1 => {}
-                otter_vm::JitCacheIrOp::GuardPrototypeNull { object } => {
-                    let header = if object == 0 { 10 } else { 8 };
-                    emit_load_symbol_u64(
-                        ops,
-                        relocations,
-                        9,
-                        view.cage_base as u64,
-                        RelocationTarget::GcCageBase,
-                    );
-                    emit_load_prototype(ops, view, 11, header, 9);
-                    dynasm!(ops ; .arch x64 ; test r11d, r11d ; jnz =>next);
-                }
-                otter_vm::JitCacheIrOp::GuardExtensible { object: 0, field } => {
-                    if !field.is_inline() {
-                        let index = field.index();
-                        dynasm!(ops ; .arch x64
-                            ; mov r11d, index as i32
-                            ; mov r9d, [r10 + view.field_layout.slab_handle_byte as i32]
-                            ; test r9d, r9d ; jz =>next);
-                        emit_load_symbol_u64(
-                            ops,
-                            relocations,
-                            8,
-                            view.cage_base as u64,
-                            RelocationTarget::GcCageBase,
-                        );
-                        dynasm!(ops ; .arch x64
-                            ; add r8, r9
-                            ; cmp r11d, [r8 + view.field_layout.slab_capacity_byte as i32]
-                            ; jae =>next);
-                    }
-                    emit_template_shape_address(ops, relocations, view, 10);
-                    dynasm!(ops ; .arch x64
-                        ; test BYTE [r9 + view.shape_state_byte as i32], otter_vm::object::ShapeState::EXTENSIBLE_MASK as i8
-                        ; jz =>next);
-                    // The program's receiver shape guard fixes the slot
-                    // count at the appended index: the store is the exact
-                    // append.
-                }
-                otter_vm::JitCacheIrOp::StoreField { object: 0, field } => {
-                    let value_byte = field.byte_offset();
-                    emit_field_base(ops, relocations, view, 10, 11, 9, field);
-                    emit_load_reg(ops, 2, value);
-                    terminal = true;
-                    if !matches!(
-                        program.ops.get(index + 1),
-                        Some(otter_vm::JitCacheIrOp::PublishShape { .. })
-                    ) {
-                        dynasm!(ops ; .arch x64 ; mov [r11 + value_byte as i32], rdx);
-                        emit_template_value_barrier(ops, relocations, view, 10, 2);
-                        dynasm!(ops ; .arch x64 ; jmp =>done);
-                    }
-                }
-                otter_vm::JitCacheIrOp::PublishShape { object: 0, shape } if terminal => {
-                    let Some(otter_vm::JitCacheIrOp::StoreField { object: 0, field }) = index
-                        .checked_sub(1)
-                        .and_then(|index| program.ops.get(index))
-                        .copied()
-                    else {
-                        terminal = false;
-                        break;
-                    };
-                    let value_byte = field.byte_offset();
-                    dynasm!(ops
-                        ; .arch x64
-                        ; mov DWORD [r10 + view.object_shape_byte as i32], shape as i32
-                        ; mov [r11 + value_byte as i32], rdx
-                        ; sub rsp, 16
-                        ; mov [rsp], r10
-                        ; mov [rsp + 8], rdx
-                    );
-                    emit_load_symbol_u64(
-                        ops,
-                        relocations,
-                        8,
-                        view.cage_base as u64,
-                        RelocationTarget::GcCageBase,
-                    );
-                    dynasm!(ops ; .arch x64 ; add r8, shape as i32);
-                    emit_template_value_barrier(ops, relocations, view, 10, 8);
-                    dynasm!(ops
-                        ; .arch x64
-                        ; mov r10, [rsp]
-                        ; mov rdx, [rsp + 8]
-                        ; add rsp, 16
-                    );
-                    emit_template_value_barrier(ops, relocations, view, 10, 2);
-                    dynasm!(ops ; .arch x64 ; jmp =>done);
-                }
-                _ => {
-                    terminal = false;
-                    break;
-                }
+                _ => {}
             }
         }
-        if terminal {
-            dynasm!(ops ; .arch x64 ; =>next);
-        }
+        emit_field_base(ops, relocations, view, 8, 11, 9, field);
+        dynasm!(ops ; .arch x64
+            ; mov rax, [r11 + field.byte_offset() as i32]
+            ; jmp =>done
+            ; =>next);
     }
-    dynasm!(ops ; .arch x64 ; jmp =>miss);
 }
 
-fn emit_template_object_header(
+/// Emit `dst = obj.name`: inline own field, then the shared `LoadIC`.
+#[allow(clippy::too_many_arguments)]
+fn emit_load_property(
     ops: &mut Assembler,
     relocations: &mut RelocationCapture,
+    shared_property: &mut shared_property::SharedPropertyProbes,
     view: &JitCompileSnapshot,
-    value: u8,
-    header: u8,
-    miss: DynamicLabel,
-) {
-    emit_load_u64(ops, 11, NOT_CELL_MASK);
-    dynasm!(ops
-        ; .arch x64
-        ; mov Rq(header), Rq(value)
-        ; test Rq(header), r11
-        ; jnz =>miss
-        ; mov Rd(header), Rd(header)
-    );
-    emit_load_symbol_u64(
-        ops,
-        relocations,
-        9,
-        view.cage_base as u64,
-        RelocationTarget::GcCageBase,
-    );
-    dynasm!(ops
-        ; .arch x64
-        ; add Rq(header), r9
-        ; cmp BYTE [Rq(header)], OBJECT_BODY_TYPE_TAG as i8
-        ; jne =>miss
-    );
-    // Every successful static ordinary program proves eligible exact receiver
-    // identity before a slot/effect. Inherited loads additionally prove the
-    // complete validity owner and rooted holder link; central snapshot baking
-    // validates that holder's actual finalized shape. Intrinsic dictionary
-    // programs retain their live kind/layout guards instead of this prefix.
-}
-
-/// Resolve the current immutable shape address in r9, retaining the object.
-/// r11 is the temporary cage base; neither register may hold the header.
-fn emit_template_shape_address(
-    ops: &mut Assembler,
-    relocations: &mut RelocationCapture,
-    view: &JitCompileSnapshot,
-    header: u8,
-) {
-    debug_assert!(header != 9 && header != 11);
-    emit_load_symbol_u64(
-        ops,
-        relocations,
-        11,
-        view.cage_base as u64,
-        RelocationTarget::GcCageBase,
-    );
+    byte_pc: u32,
+    dst: u16,
+    object: u16,
+    throw_value: DynamicLabel,
+    fatal: DynamicLabel,
+) -> Result<(), Unsupported> {
+    use shared_property::{LOAD_RECEIVER, LOAD_SLOT};
+    let shared = ops.new_dynamic_label();
+    let done = ops.new_dynamic_label();
+    emit_intrinsic_loads(ops, relocations, view, byte_pc, object, done);
+    emit_slot_address(ops, relocations, view, byte_pc, LOAD_SLOT)?;
+    emit_load_reg(ops, LOAD_RECEIVER, object);
+    emit_inline_own_field(ops, view, LOAD_RECEIVER, LOAD_SLOT, shared);
     dynasm!(ops ; .arch x64
-        ; mov r9d, [Rq(header) + view.object_shape_byte as i32]
-        ; add r9, r11
-    );
-}
-
-/// Reject a current shape role before a store, without reading GC metadata.
-fn emit_template_state_mask_guard(
-    ops: &mut Assembler,
-    relocations: &mut RelocationCapture,
-    view: &JitCompileSnapshot,
-    header: u8,
-    mask: u8,
-    miss: DynamicLabel,
-) {
-    emit_template_shape_address(ops, relocations, view, header);
-    dynasm!(ops ; .arch x64
-        ; test BYTE [r9 + view.shape_state_byte as i32], mask as i8
-        ; jnz =>miss
-    );
-}
-
-/// Eligible exact identity fixes attributes, lookup state and field geometry.
-fn emit_template_shape_identity_guard(
-    ops: &mut Assembler,
-    view: &JitCompileSnapshot,
-    header: u8,
-    shape: u32,
-    miss: DynamicLabel,
-) {
-    dynasm!(ops
-        ; .arch x64
-        ; cmp DWORD [Rq(header) + view.object_shape_byte as i32], shape as i32
-        ; jne =>miss
-    );
+        ; mov rax, [r8 + rax * 8]
+        ; jmp =>done
+        ; =>shared);
+    let routine = shared_property.label(ops, false);
+    emit_load_reg(ops, LOAD_RECEIVER, object);
+    dynasm!(ops ; .arch x64 ; call =>routine);
+    emit_pair_status(ops, throw_value, fatal);
+    dynasm!(ops ; .arch x64 ; =>done);
+    emit_store_reg(ops, 0, dst);
+    Ok(())
 }
 
 fn emit_template_value_barrier(

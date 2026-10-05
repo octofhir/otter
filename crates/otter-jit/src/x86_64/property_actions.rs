@@ -34,6 +34,14 @@ use otter_vm::{
 use super::values::{emit_load_symbol_u64, emit_load_u64};
 use crate::artifact::relocation::{PropertySourceAccess, RelocationCapture, RelocationTarget};
 
+/// The probed property key: a compile-time atom, or one held in a register
+/// by a shared per-code-object IC routine that serves many sites.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AtomOperand {
+    Immediate(u32),
+    Register(u8),
+}
+
 /// Probe a key once, then consume only the requested independent action.
 ///
 /// `temps[1]` contains the compressed child on `appended`; the caller emits its
@@ -45,7 +53,7 @@ pub(crate) fn emit_action_probe(
     relocations: &mut RelocationCapture,
     view: &JitCompileSnapshot,
     cache: Option<JitPropertyActionCache>,
-    atom: Option<u32>,
+    atom: Option<AtomOperand>,
     access: PropertySourceAccess,
     receiver: u8,
     value: Option<u8>,
@@ -68,6 +76,13 @@ pub(crate) fn emit_action_probe(
         debug_assert!(value != 10 && value != 11);
     }
     debug_assert!(receiver != 10 && receiver != 11);
+    if let Some(AtomOperand::Register(atom)) = atom {
+        debug_assert!(
+            atom != receiver && !temps.contains(&atom) && atom != 10 && atom != 11,
+            "the atom register survives the probe"
+        );
+        debug_assert!(value != Some(atom));
+    }
     let Some(cache) = cache.filter(|cache| {
         cache.table_addr != 0
             && cache.entry_bytes != 0
@@ -103,11 +118,18 @@ pub(crate) fn emit_action_probe(
 
     emit_load_u64(ops, 11, cache.hash_shape_multiplier);
     dynasm!(ops ; .arch x64 ; mov Rq(entry), Rq(identity) ; imul Rq(entry), r11);
-    emit_load_u64(
-        ops,
-        11,
-        u64::from(atom).wrapping_mul(cache.hash_atom_multiplier),
-    );
+    match atom {
+        AtomOperand::Immediate(atom) => emit_load_u64(
+            ops,
+            11,
+            u64::from(atom).wrapping_mul(cache.hash_atom_multiplier),
+        ),
+        AtomOperand::Register(atom) => {
+            // The register holds the zero-extended 32-bit atom.
+            emit_load_u64(ops, 11, cache.hash_atom_multiplier);
+            dynasm!(ops ; .arch x64 ; mov Rd(atom), Rd(atom) ; imul r11, Rq(atom));
+        }
+    }
     dynasm!(ops ; .arch x64 ; xor Rq(entry), r11 ; shr Rq(entry), cache.hash_shift as i8);
     emit_load_u64(ops, 11, u64::from(cache.set_mask));
     dynasm!(ops ; .arch x64 ; and Rq(entry), r11);
@@ -131,8 +153,15 @@ pub(crate) fn emit_action_probe(
     dynasm!(ops ; .arch x64
         ; mov Rd(base), cache.ways as i32
         ; =>way
-        ; cmp Rq(identity), [Rq(entry) + cache.receiver_shape_id_byte as i32] ; jne =>next
-        ; cmp DWORD [Rq(entry) + cache.atom_byte as i32], atom as i32 ; je =>found
+        ; cmp Rq(identity), [Rq(entry) + cache.receiver_shape_id_byte as i32] ; jne =>next);
+    match atom {
+        AtomOperand::Immediate(atom) => dynasm!(ops ; .arch x64
+            ; cmp DWORD [Rq(entry) + cache.atom_byte as i32], atom as i32),
+        AtomOperand::Register(atom) => dynasm!(ops ; .arch x64
+            ; cmp [Rq(entry) + cache.atom_byte as i32], Rd(atom)),
+    }
+    dynasm!(ops ; .arch x64
+        ; je =>found
         ; =>next
         ; add Rq(entry), cache.entry_bytes as i32
         ; dec Rd(base) ; jnz =>way ; jmp =>miss

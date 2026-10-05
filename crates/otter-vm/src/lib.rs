@@ -1700,6 +1700,7 @@ impl otter_gc::ExtraRootSource for Interpreter {
     fn sweep_weak(&self, heap: &otter_gc::GcHeap) {
         self.shape_runtime.sweep_dead(heap);
         self.property_cache.sweep_dead_holders(heap);
+        self.code_space.sweep_property_ics(heap);
         self.constructor_families.sweep_dead(heap);
     }
     fn visit_extra_roots(&self, visitor: &mut dyn FnMut(*mut RawGc)) {

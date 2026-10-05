@@ -71,10 +71,8 @@ struct Codegen<'a> {
     deopt_runtime: u64,
     plan: &'a crate::template::TemplatePlan,
     plan_index: FxHashMap<u32, Vec<usize>>,
-    load_ic_cells: Box<[crate::entry::PropertySourceCell]>,
-    next_load_ic: usize,
-    store_ic_cells: Box<[crate::entry::PropertySourceCell]>,
-    next_store_ic: usize,
+    /// Shared property routines requested by Generic sites.
+    shared_property: crate::template::x86_64::shared_property::SharedPropertyProbes,
     no_direct_call_events: Option<crate::template::DirectCallEvents>,
     no_code_map: Option<crate::artifact::CodeMapCapture>,
     spliced_functions: std::collections::BTreeSet<u32>,
@@ -105,7 +103,6 @@ pub(crate) fn emit(
     slots.validate(view.code_block.register_count)?;
     let mut ops = Assembler::new()
         .map_err(|_| Unsupported::Backend(crate::BackendFailure::AssemblerAllocation))?;
-    let (loads, stores) = metadata::property_cell_counts(built, plan);
     let labels = built
         .layout
         .iter()
@@ -164,11 +161,7 @@ pub(crate) fn emit(
         deopt_runtime: deopt_runtime as u64,
         plan,
         plan_index: metadata::operation_index(plan),
-        load_ic_cells: vec![crate::entry::PropertySourceCell::default(); loads].into_boxed_slice(),
-        next_load_ic: 0,
-        store_ic_cells: vec![crate::entry::PropertySourceCell::default(); stores]
-            .into_boxed_slice(),
-        next_store_ic: 0,
+        shared_property: Default::default(),
         no_direct_call_events: None,
         no_code_map: None,
         spliced_functions: std::collections::BTreeSet::new(),
@@ -230,6 +223,13 @@ pub(crate) fn emit(
         spill,
     );
     codegen.emit_exit_stubs();
+    let shared_property = std::mem::take(&mut codegen.shared_property);
+    shared_property.emit(
+        &mut codegen.ops,
+        &mut codegen.relocations,
+        transitions,
+        view,
+    );
     codegen
         .return_sites
         .sort_by_key(|site| site.native_return_offset);
@@ -237,8 +237,6 @@ pub(crate) fn emit(
         ops,
         relocations,
         exits,
-        load_ic_cells,
-        store_ic_cells,
         node_offsets,
         sites,
         return_sites,
@@ -251,8 +249,6 @@ pub(crate) fn emit(
         call_entry,
         exits,
         relocations,
-        load_ic_cells,
-        store_ic_cells,
         node_offsets,
         body_end,
         osr_dispatch_end,

@@ -4142,6 +4142,14 @@ pub(crate) fn load_proven_data_slot(obj: JsObject, heap: &GcHeap, slot: u16) -> 
     heap.read_payload(obj, |body| body.slot_word(usize::from(slot)))
 }
 
+/// Write a writable own data slot whose receiver shape an IC handler already
+/// matched. The shape fixes the slot's attributes and storage bank, so the
+/// write needs no descriptor or key check; the generational barrier runs.
+pub(crate) fn store_proven_data_slot(obj: JsObject, heap: &mut GcHeap, slot: u16, value: Value) {
+    heap.with_payload(obj, |body| body.set_data_value(usize::from(slot), value));
+    record_slot_write(heap, obj, value);
+}
+
 /// Probe for a property with full prototype-chain walk. Returns
 /// the first hit's descriptor body; useful for the LoadProperty
 /// dispatch path which needs to know whether to invoke a getter

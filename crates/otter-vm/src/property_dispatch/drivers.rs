@@ -18,7 +18,7 @@
 //!   unsupported or throwing operations remain distinct from cold branches.
 //!
 //! # See also
-//! - `cache_ir` for guarded store completion and allocation-failure handling.
+//! - `property_ic` for guarded store completion and allocation-failure handling.
 
 use crate::native_abi::CommittedValueError;
 use smallvec::SmallVec;
@@ -26,7 +26,7 @@ use smallvec::SmallVec;
 use crate::activation_stack::ActivationStack;
 use crate::{
     ExecutionContext, Frame, Interpreter, JsString, Value, VmError, VmGetOutcome, VmPropertyKey,
-    abstract_ops, cache_ir, function_metadata, is_restricted_function_property, object,
+    abstract_ops, function_metadata, is_restricted_function_property, object,
     operand_decode::{const_operand, register_operand},
     property_atom::AtomizedPropertyKey,
     property_ic::PropertyIcKind,
@@ -70,36 +70,17 @@ impl Interpreter {
         let receiver = *read_register(&stack[top_idx], obj_reg)
             .map_err(|error| CommittedValueError::Fatal(error.into()))?;
         if let Some(obj) = receiver.as_object() {
-            // Fast monomorphic own-data load: one shape-handle compare plus a
-            // direct slab read, skipping the megamorphic query, the stub walk,
-            // and its per-stub atom compare / receiver re-decompress. The shape
-            // match fixes both the slot and the key. Falls through to the full
-            // probe on a shape miss (polymorphic / prototype / dictionary).
-            if let Some(hit) = slot.mono_load_own_data_hit()
-                && let Some(value) =
-                    crate::object::load_own_data_slot_by_shape(obj, &self.gc_heap, hit)
-            {
+            // The site's handlers: one shape compare selects the entry.
+            if let Some(value) = slot.probe_load(obj, &self.gc_heap) {
                 slot.record_hit();
                 Self::finish_property_fast_path_value(&mut stack[top_idx], dst, value)
                     .map_err(|error| CommittedValueError::Fatal(error.into()))?;
                 return Ok(true);
             }
-            let mut site_disabled = slot.is_megamorphic();
-            if let Some(value) = slot.probe_load(obj, &self.gc_heap, atomized_key) {
-                slot.record_hit();
-                Self::finish_property_fast_path_value(&mut stack[top_idx], dst, value)
-                    .map_err(|error| CommittedValueError::Fatal(error.into()))?;
-                return Ok(true);
-            }
-            if slot.entry_count() > 0 {
-                site_disabled = slot.record_guard_miss();
-            } else {
-                slot.record_uncached_miss();
-            }
-            // The IC probing / miss bookkeeping above can materialise a rope
-            // key and scavenge, relocating the receiver; re-read it from its
-            // rooted register before the stub install and the slow-path get
-            // both read its shape.
+            slot.record_miss();
+            // Miss bookkeeping can scavenge, relocating the receiver; re-read
+            // it from its rooted register before the handler install and the
+            // slow-path get both read its shape.
             let mut obj = read_register(&stack[top_idx], obj_reg)
                 .map_err(|error| CommittedValueError::Fatal(error.into()))?
                 .as_object()
@@ -116,18 +97,11 @@ impl Interpreter {
             // collection. Failed optional preparation keeps the ordinary get.
             self.migrate_slow_to_fast(&mut obj);
             // The shared table answers first, so a site re-learning after a
-            // guard miss pays a probe instead of another chain walk, and a
-            // saturated one — which will never build a program of its own —
-            // walks at most once per receiver class and name before its answer,
-            // positive or negative, is on record.
-            if let Some(resolved) = self.resolve_property_data_slot(obj, atomized_key) {
-                if !site_disabled {
-                    let ic = cache_ir::CacheStub::from_resolved_load(
-                        object::shape_id(obj, &self.gc_heap),
-                        &resolved,
-                    );
-                    slot.install(ic);
-                }
+            // miss pays a probe instead of another chain walk; a megamorphic
+            // site walks at most once per receiver class and name.
+            let resolved = self.resolve_property_data_slot(obj, atomized_key);
+            self.update_load_ic(slot, obj, atomized_key, resolved.as_ref());
+            if let Some(resolved) = resolved {
                 Self::finish_property_fast_path_value(&mut stack[top_idx], dst, resolved.value)
                     .map_err(|error| CommittedValueError::Fatal(error.into()))?;
                 return Ok(true);
@@ -1122,10 +1096,6 @@ impl Interpreter {
         if let Some(obj) = receiver.as_object()
             && object::supports_fast_property_ic(obj, &self.gc_heap)
         {
-            let entries_len = property_slot.entry_count();
-            // The CodeBlock-owned stub program is immutable during the probe;
-            // only `gc_heap` is mutated by a store. No per-store clone of the
-            // bounded program bank is needed.
             if property_slot
                 .probe_store(obj, &mut self.gc_heap, atomized_key, &value)
                 .map_err(|error| CommittedValueError::JavaScript(error.into()))?
@@ -1135,11 +1105,7 @@ impl Interpreter {
                     .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
                 return Ok(true);
             }
-            if entries_len > 0 {
-                property_slot.record_guard_miss();
-            } else {
-                property_slot.record_uncached_miss();
-            }
+            property_slot.record_miss();
         }
         // §28.2.4.5 / §10.5.9 Proxy.[[Set]] — invoke the `set` trap
         // when present; otherwise delegate to the target.
@@ -1497,6 +1463,8 @@ impl Interpreter {
                 Ok(true)
             }
             object::SetOutcome::AssignData => {
+                // Shapes never move; the pre-store layout names the handler.
+                let from_shape = object::keyed_shape(obj, &self.gc_heap);
                 let transition = if receiver.is_object()
                     && object::supports_fast_property_ic(obj, &self.gc_heap)
                 {
@@ -1555,15 +1523,19 @@ impl Interpreter {
                     if !property_slot.is_megamorphic()
                         && object::supports_fast_property_ic(obj, &self.gc_heap)
                     {
-                        if let Some(transition) = transition {
-                            property_slot
-                                .install(cache_ir::CacheStub::store_transition(transition));
-                        } else if let Some(ic) = cache_ir::CacheStub::install_store_existing(
-                            obj,
-                            &self.gc_heap,
-                            atomized_key,
-                        ) {
-                            property_slot.install(ic);
+                        let handler = match transition {
+                            Some(transition) => crate::property_ic::IcHandler::store_transition(
+                                from_shape,
+                                &transition,
+                            ),
+                            None => crate::property_ic::IcHandler::store_existing(
+                                obj,
+                                &self.gc_heap,
+                                atomized_key,
+                            ),
+                        };
+                        if let Some(handler) = handler {
+                            property_slot.install(handler);
                         }
                     }
                 }

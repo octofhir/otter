@@ -410,11 +410,11 @@ impl FunctionContext {
     pub(crate) fn push_string_constant_run(&mut self, values: &[&str]) -> u32 {
         let mut module = self.module.borrow_mut();
         let first = module.constants.len() as u32;
-        module
-            .constants
-            .extend(values.iter().map(|value| Constant::String {
+        for value in values {
+            module.push_constant(Constant::String {
                 utf16: value.encode_utf16().collect(),
-            }));
+            });
+        }
         first
     }
 
@@ -425,80 +425,34 @@ impl FunctionContext {
 
     /// Intern a pre-built WTF-16 unit vector.
     pub(crate) fn intern_utf16_string_constant(&mut self, utf16: Vec<u16>) -> u32 {
-        let mut module = self.module.borrow_mut();
-        for (i, c) in module.constants.iter().enumerate() {
-            if let Constant::String { utf16: existing } = c
-                && existing == &utf16
-            {
-                return i as u32;
-            }
-        }
-        module.constants.push(Constant::String { utf16 });
-        (module.constants.len() - 1) as u32
+        self.module
+            .borrow_mut()
+            .intern_constant(Constant::String { utf16 })
     }
 
     pub(crate) fn intern_number_constant(&mut self, value: f64) -> u32 {
-        let bits = value.to_bits();
-        let mut module = self.module.borrow_mut();
-        for (i, c) in module.constants.iter().enumerate() {
-            if let Constant::Number { bits: existing } = c
-                && *existing == bits
-            {
-                return i as u32;
-            }
-        }
-        module.constants.push(Constant::Number { bits });
-        (module.constants.len() - 1) as u32
+        self.module.borrow_mut().intern_constant(Constant::Number {
+            bits: value.to_bits(),
+        })
     }
 
     pub(crate) fn intern_bigint_constant(&mut self, decimal: &str) -> u32 {
-        let mut module = self.module.borrow_mut();
-        for (i, c) in module.constants.iter().enumerate() {
-            if let Constant::BigInt { decimal: existing } = c
-                && existing == decimal
-            {
-                return i as u32;
-            }
-        }
-        module.constants.push(Constant::BigInt {
+        self.module.borrow_mut().intern_constant(Constant::BigInt {
             decimal: decimal.to_string(),
-        });
-        (module.constants.len() - 1) as u32
+        })
     }
 
     pub(crate) fn intern_regexp_constant(&mut self, pattern_utf16: &[u16], flags: &str) -> u32 {
-        let mut module = self.module.borrow_mut();
-        for (i, c) in module.constants.iter().enumerate() {
-            if let Constant::RegExp {
-                pattern_utf16: existing_pat,
-                flags: existing_flags,
-            } = c
-                && existing_pat == pattern_utf16
-                && existing_flags == flags
-            {
-                return i as u32;
-            }
-        }
-        module.constants.push(Constant::RegExp {
+        self.module.borrow_mut().intern_constant(Constant::RegExp {
             pattern_utf16: pattern_utf16.to_vec(),
             flags: flags.to_string(),
-        });
-        (module.constants.len() - 1) as u32
+        })
     }
 
     pub(crate) fn intern_function_id(&mut self, function_id: u32) -> u32 {
-        let mut module = self.module.borrow_mut();
-        for (i, c) in module.constants.iter().enumerate() {
-            if let Constant::FunctionId { index } = c
-                && *index == function_id
-            {
-                return i as u32;
-            }
-        }
-        module
-            .constants
-            .push(Constant::FunctionId { index: function_id });
-        (module.constants.len() - 1) as u32
+        self.module
+            .borrow_mut()
+            .intern_constant(Constant::FunctionId { index: function_id })
     }
 
     /// Emit one instruction. A return emitted into a derived constructor

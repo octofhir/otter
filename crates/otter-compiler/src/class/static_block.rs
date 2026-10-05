@@ -40,16 +40,16 @@ pub(crate) fn compile_static_block(
         .with_module_url(parent.module_url.clone());
     // §15.7.4 — `var` / `let` / `function` declarations inside a
     // static block live in the block's own scope.
-    child.captured_names = capture::analyze_module(body);
+    let unit = Rc::clone(&parent.capture);
+    let facts = unit.static_block(body);
+    child.captured_names = unit.captured(facts, false);
     // §15.7.4 — `super.x` inside a static block resolves through the
     // statics-side home object.
     child.super_home_static = true;
     child.has_home_object = true;
-    child.contains_direct_eval = crate::capture::program_contains_direct_eval(body);
+    child.contains_direct_eval = unit.contains_eval(facts);
     if child.contains_direct_eval {
-        child
-            .captured_names
-            .extend(crate::capture::all_program_names(body));
+        child.captured_names.extend(unit.own_names(facts, false));
     }
     let parent_ctx = parent.innermost_ctx();
     child.closure_context_empty =

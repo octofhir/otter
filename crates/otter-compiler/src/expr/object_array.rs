@@ -132,7 +132,7 @@ pub(crate) fn compile_object_literal(
     // (see `crate::class::SUPER_HOME_NAME`).
     // <https://tc39.es/ecma262/#sec-object-initializer-runtime-semantics-propertydefinitionevaluation>
     // <https://tc39.es/ecma262/#sec-makemethod>
-    let needs_home = object_literal_uses_super_in_methods(obj);
+    let needs_home = object_literal_uses_super_in_methods(&cx.capture, obj);
     if needs_home {
         cx.enter_scope(otter_bytecode::ScopeKind::ObjectHome);
         let storage = cx.declare_forced_slot(
@@ -558,7 +558,7 @@ fn compile_static_object_literal(
 ) -> Result<Option<u16>, CompileError> {
     if obj.properties.is_empty()
         || obj.properties.len() > STATIC_OBJECT_LITERAL_MAX_KEYS
-        || object_literal_uses_super_in_methods(obj)
+        || object_literal_uses_super_in_methods(&cx.capture, obj)
     {
         return Ok(None);
     }
@@ -621,7 +621,10 @@ fn compile_static_object_literal(
 /// transparent because their `super` resolves through the enclosing
 /// method's home. Returns `true` if at least one method body or
 /// parameter initializer needs the `%home` slot.
-fn object_literal_uses_super_in_methods(obj: &ObjectExpression<'_>) -> bool {
+fn object_literal_uses_super_in_methods(
+    unit: &capture::CaptureFacts,
+    obj: &ObjectExpression<'_>,
+) -> bool {
     use oxc_ast_visit::Visit;
 
     struct SuperFinder {
@@ -689,7 +692,7 @@ fn object_literal_uses_super_in_methods(obj: &ObjectExpression<'_>) -> bool {
         if func
             .body
             .as_deref()
-            .is_some_and(|b| capture::body_contains_direct_eval(Some(&func.params), b))
+            .is_some_and(|b| unit.contains_eval(unit.function(b)))
         {
             return true;
         }

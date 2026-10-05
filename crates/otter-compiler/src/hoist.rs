@@ -391,7 +391,7 @@ pub(crate) fn compile_block_statements(
     let mut block_lex: Vec<(String, bool)> = Vec::new();
     hoist_lexical_names(stmts, &mut block_lex);
     let (mut block_captured, nested_eval) =
-        crate::capture::nested_function_refs_in_statements(stmts);
+        cx.capture.nested_refs_in_statements(stmts);
     if nested_eval {
         block_captured.extend(block_lex.iter().map(|(name, _)| name.clone()));
     }
@@ -672,71 +672,13 @@ pub(crate) fn hoist_function_declarations_from(
     Ok(())
 }
 
-/// Walk a non-arrow function body and report whether it references
-/// the `arguments` identifier in a binding that escapes the body's
-/// own arrow / nested-function scopes. Arrow functions inherit
-/// `arguments` lexically per §10.2.1.4 so a reference inside an
-/// arrow within the body still implies the enclosing function
-/// must materialise the object.
-pub(crate) fn body_references_arguments(
-    params: &oxc_ast::ast::FormalParameters<'_>,
-    body: Option<&oxc_ast::ast::FunctionBody<'_>>,
-) -> bool {
-    use oxc_ast_visit::Visit;
-    #[derive(Default)]
-    struct ArgsFinder {
-        nested_function_depth: u32,
-        found: bool,
-    }
-    impl<'a> Visit<'a> for ArgsFinder {
-        fn visit_function(
-            &mut self,
-            it: &oxc_ast::ast::Function<'a>,
-            flags: oxc_syntax::scope::ScopeFlags,
-        ) {
-            // Nested non-arrow function — has its own `arguments`.
-            self.nested_function_depth += 1;
-            oxc_ast_visit::walk::walk_function(self, it, flags);
-            self.nested_function_depth -= 1;
-        }
-        fn visit_class_body(&mut self, it: &oxc_ast::ast::ClassBody<'a>) {
-            // Class methods are functions with their own arguments.
-            self.nested_function_depth += 1;
-            oxc_ast_visit::walk::walk_class_body(self, it);
-            self.nested_function_depth -= 1;
-        }
-        fn visit_identifier_reference(&mut self, id: &oxc_ast::ast::IdentifierReference<'a>) {
-            if self.nested_function_depth == 0 && id.name.as_str() == "arguments" {
-                self.found = true;
-            }
-        }
-    }
-    let mut finder = ArgsFinder::default();
-    // Param defaults can reference `arguments` (sloppy mode); even
-    // in strict mode, `function f(x = arguments) {}` is valid.
-    for p in &params.items {
-        if let Some(init) = p.initializer.as_deref() {
-            finder.visit_expression(init);
-        }
-    }
-    if let Some(rest) = &params.rest {
-        finder.visit_binding_rest_element(&rest.rest);
-    }
-    if let Some(b) = body {
-        for stmt in &b.statements {
-            finder.visit_statement(stmt);
-        }
-    }
-    finder.found
-}
-
 /// `true` when the body names `arguments` and every such reference is the
 /// forwarded argument list of `<callee>.apply(<this>, arguments)`: a plain
 /// call with exactly those two arguments, no spread, not an optional
 /// chain, and not inside an arrow (an arrow forwards the enclosing
 /// activation's object, not its own). Parameter defaults never qualify.
 /// Nested non-arrow functions and class bodies own their own `arguments`
-/// and are skipped, mirroring [`body_references_arguments`].
+/// and are skipped, mirroring the capture analysis.
 ///
 /// Such a body needs no materialized arguments object on the fast path:
 /// each forward hands the activation's actual arguments straight to the
@@ -872,7 +814,7 @@ pub(crate) fn function_declares_name(
 /// `.callee` member or any computed member access on the `arguments`
 /// identifier (the key is a runtime value, so it may be "callee").
 /// Nested non-arrow functions own their own `arguments` and are
-/// skipped, mirroring [`body_references_arguments`].
+/// skipped, mirroring the capture analysis.
 pub(crate) fn body_uses_arguments_callee(
     params: &oxc_ast::ast::FormalParameters<'_>,
     body: Option<&oxc_ast::ast::FunctionBody<'_>>,

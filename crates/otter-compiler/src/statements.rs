@@ -1359,7 +1359,7 @@ pub(crate) fn compile_switch_statement(
         hoist_lexical_names(&case.consequent, &mut case_lex);
     }
     let (mut case_captured, nested_eval) =
-        crate::capture::nested_function_refs_in_statement_refs(&case_stmts);
+        cx.capture.nested_refs_in_statements(case_stmts.iter().copied());
     if nested_eval {
         case_captured.extend(case_lex.iter().map(|(name, _)| name.clone()));
     }

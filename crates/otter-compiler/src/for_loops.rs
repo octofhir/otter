@@ -395,7 +395,7 @@ fn compile_head_rhs(
     if names.is_empty() {
         return compile_expr(cx, rhs, span);
     }
-    let (rhs_refs, rhs_eval) = crate::capture::expression_nested_refs(rhs);
+    let (rhs_refs, rhs_eval) = cx.capture.nested_refs_in_expression(rhs);
     cx.enter_scope(otter_bytecode::ScopeKind::ForHead);
     let result = (|| {
         for (name, is_const) in names {

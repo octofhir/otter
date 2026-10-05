@@ -35,12 +35,17 @@ impl Interpreter {
         stack: &ActivationStack,
         err: &VmError,
     ) -> Result<Value, VmError> {
+        // A pending throw crossing a native boundary is the same exception and
+        // keeps the site it was thrown from; any other failure becomes a new
+        // exception whose site its own throw records.
+        let rethrow = matches!(err, VmError::Uncaught) && self.pending_uncaught_throw.is_some();
         let value = self.materialize_vm_throwable(context, stack, err)?;
-        // This error has become a handled JavaScript value. Its provenance is
-        // no longer in flight; a subsequent reaction may fail without setting
-        // dynamic detail (for example InvalidOperand).
+        // Dynamic detail is consumed by the value; a subsequent reaction may
+        // fail without setting its own (for example InvalidOperand).
         let _ = self.take_error_detail();
-        self.clear_throw_provenance();
+        if !rethrow {
+            self.clear_throw_provenance();
+        }
         Ok(value)
     }
 

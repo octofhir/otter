@@ -390,8 +390,14 @@ pub(crate) fn emit_call_entry(
             ; mov QWORD [r14 + NATIVE_FRAME_REGISTER_BASE_OFFSET as i32 + 8], i32::from(shape.register_count)
         );
     }
+    // Every request consumer clears the construction fields, so an ordinary
+    // call (`new.target` undefined) only initializes its own record.
+    let ordinary = ops.new_dynamic_label();
+    let recorded = ops.new_dynamic_label();
     dynasm!(ops
         ; .arch x64
+        ; cmp rcx, VALUE_UNDEFINED as i32
+        ; je =>ordinary
         ; mov r11d, [r15 + (crate::entry::PENDING_CALL_OFFSET + abi::REQUEST_CONSTRUCT_LAYOUT_OFFSET) as i32]
         ; mov [r14 + abi::NATIVE_FRAME_CONSTRUCT_LAYOUT_OFFSET as i32], r11
         ; mov r11, [r15 + (crate::entry::PENDING_CALL_OFFSET + abi::REQUEST_CONSTRUCT_RECEIVER_OFFSET) as i32]
@@ -401,6 +407,15 @@ pub(crate) fn emit_call_entry(
         ; mov QWORD [r15 + (crate::entry::PENDING_CALL_OFFSET + abi::REQUEST_SUPER_ORIGIN_OFFSET) as i32], 0
         ; mov QWORD [r15 + (crate::entry::PENDING_CALL_OFFSET + abi::REQUEST_CONSTRUCT_LAYOUT_OFFSET) as i32], 0
         ; mov QWORD [r15 + (crate::entry::PENDING_CALL_OFFSET + abi::REQUEST_CONSTRUCT_RECEIVER_OFFSET) as i32], VALUE_UNDEFINED as i32
+        ; jmp =>recorded
+        ; =>ordinary
+        ; mov QWORD [r14 + abi::NATIVE_FRAME_CONSTRUCT_LAYOUT_OFFSET as i32], 0
+        ; mov QWORD [r14 + abi::NATIVE_FRAME_CONSTRUCT_RECEIVER_OFFSET as i32], VALUE_UNDEFINED as i32
+        ; mov QWORD [r14 + abi::NATIVE_FRAME_SUPER_ORIGIN_OFFSET as i32], 0
+        ; =>recorded
+    );
+    dynasm!(ops
+        ; .arch x64
         ; mov [r14 + NATIVE_FRAME_THIS_OFFSET as i32], rdx
         ; mov [r14 + NATIVE_FRAME_THIS_OFFSET as i32 + 8], rcx
         ; mov [r14 + NATIVE_FRAME_SELF_OFFSET as i32], rsi

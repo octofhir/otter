@@ -291,10 +291,9 @@ pub(crate) fn emit_call(
     match new_target {
         Some(3) => {}
         Some(new_target) => dynasm!(ops ; .arch aarch64 ; mov x3, X(new_target)),
-        None => {
-            emit_clear_construct_ticket(ops, context);
-            dynasm!(ops ; .arch aarch64 ; movz x3, VALUE_UNDEFINED as u32);
-        }
+        // Every request consumer clears the construction fields, so an
+        // ordinary call has nothing to clear.
+        None => dynasm!(ops ; .arch aarch64 ; movz x3, VALUE_UNDEFINED as u32),
     }
     if let Some(count) = count {
         emit_load_u64(ops, 4, u64::from(count));

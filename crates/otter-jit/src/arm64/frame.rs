@@ -353,16 +353,10 @@ pub(crate) fn emit_call_entry(
         ; .arch aarch64
         ; stp x2, x3, [x21, (NATIVE_FRAME_THIS_OFFSET) as i32]
         ; stp x1, x4, [x21, (NATIVE_FRAME_SELF_OFFSET) as i32]
-        ; ldr w15, [x20, crate::entry::PENDING_CALL_OFFSET + abi::REQUEST_CONSTRUCT_LAYOUT_OFFSET]
-        ; str x15, [x21, abi::NATIVE_FRAME_CONSTRUCT_LAYOUT_OFFSET]
-        ; ldr x15, [x20, crate::entry::PENDING_CALL_OFFSET + abi::REQUEST_CONSTRUCT_RECEIVER_OFFSET]
-        ; str x15, [x21, abi::NATIVE_FRAME_CONSTRUCT_RECEIVER_OFFSET]
-        ; ldr x15, [x20, crate::entry::PENDING_CALL_OFFSET + abi::REQUEST_SUPER_ORIGIN_OFFSET]
-        ; str x15, [x21, abi::NATIVE_FRAME_SUPER_ORIGIN_OFFSET]
-        ; str xzr, [x20, crate::entry::PENDING_CALL_OFFSET + abi::REQUEST_SUPER_ORIGIN_OFFSET]
-        ; str xzr, [x20, crate::entry::PENDING_CALL_OFFSET + abi::REQUEST_CONSTRUCT_LAYOUT_OFFSET]
-        ; mov x15, VALUE_UNDEFINED
-        ; str x15, [x20, crate::entry::PENDING_CALL_OFFSET + abi::REQUEST_CONSTRUCT_RECEIVER_OFFSET]
+    );
+    emit_construct_request(ops);
+    dynasm!(ops
+        ; .arch aarch64
         ; add x15, x29, 48
         ; stp x15, x10, [x21, (abi::NATIVE_FRAME_ACTUALS_OFFSET) as i32]
     );
@@ -449,6 +443,40 @@ pub(crate) fn emit_publish_lazy_window(ops: &mut Assembler, register_count: u16)
         ; stp x19, x16, [x21, (NATIVE_FRAME_REGISTER_BASE_OFFSET) as i32]
         ; strh w16, [x21, abi::NATIVE_FRAME_REGISTER_COUNT_OFFSET]
         ; =>published
+    );
+}
+
+/// Move the pending construction request into the frame record.
+///
+/// Every consumer of the request (this prologue and the call trampoline)
+/// clears it, so outside a `[[Construct]]` it is already clear and an
+/// ordinary call (`new.target` undefined) only initializes its own record.
+/// Clobbers `x15`–`x17`.
+fn emit_construct_request(ops: &mut Assembler) {
+    const _: () = assert!(
+        abi::NATIVE_FRAME_CONSTRUCT_RECEIVER_OFFSET
+            == abi::NATIVE_FRAME_CONSTRUCT_LAYOUT_OFFSET + 8
+    );
+    let ordinary = ops.new_dynamic_label();
+    let recorded = ops.new_dynamic_label();
+    dynasm!(ops
+        ; .arch aarch64
+        ; movz x15, VALUE_UNDEFINED as u32
+        ; cmp x3, x15
+        ; b.eq =>ordinary
+        ; ldr w16, [x20, crate::entry::PENDING_CALL_OFFSET + abi::REQUEST_CONSTRUCT_LAYOUT_OFFSET]
+        ; ldr x17, [x20, crate::entry::PENDING_CALL_OFFSET + abi::REQUEST_CONSTRUCT_RECEIVER_OFFSET]
+        ; stp x16, x17, [x21, (abi::NATIVE_FRAME_CONSTRUCT_LAYOUT_OFFSET) as i32]
+        ; ldr x16, [x20, crate::entry::PENDING_CALL_OFFSET + abi::REQUEST_SUPER_ORIGIN_OFFSET]
+        ; str x16, [x21, abi::NATIVE_FRAME_SUPER_ORIGIN_OFFSET]
+        ; str xzr, [x20, crate::entry::PENDING_CALL_OFFSET + abi::REQUEST_SUPER_ORIGIN_OFFSET]
+        ; str wzr, [x20, crate::entry::PENDING_CALL_OFFSET + abi::REQUEST_CONSTRUCT_LAYOUT_OFFSET]
+        ; str x15, [x20, crate::entry::PENDING_CALL_OFFSET + abi::REQUEST_CONSTRUCT_RECEIVER_OFFSET]
+        ; b =>recorded
+        ; =>ordinary
+        ; stp xzr, x15, [x21, (abi::NATIVE_FRAME_CONSTRUCT_LAYOUT_OFFSET) as i32]
+        ; str xzr, [x21, abi::NATIVE_FRAME_SUPER_ORIGIN_OFFSET]
+        ; =>recorded
     );
 }
 

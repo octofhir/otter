@@ -200,7 +200,6 @@ fn finish_vm_error(
     ctx: &mut JitCtx,
     error: CommittedValueError,
 ) -> NativeResultPair {
-    vm.record_throw_site();
     // The producer owns the disposition: local source semantics materialize
     // once; a completed child or pure admission failure is already terminal.
     let projected = match error {
@@ -209,6 +208,9 @@ fn finish_vm_error(
         }
         CommittedValueError::Fatal(error) => Err(error),
     };
+    if projected.is_ok() {
+        vm.record_throw_site();
+    }
     finish_projection(vm, ctx, projected)
 }
 
@@ -242,9 +244,11 @@ fn finish_native_result(
     HostStep::Complete(match result {
         Ok(value) => NativeResultPair::success(value),
         Err(error) => {
-            vm.record_throw_site();
             let projected =
                 crate::error_ops::native_error_to_throwable_with_stack(vm, stack, context, error);
+            if projected.is_ok() {
+                vm.record_throw_site();
+            }
             finish_projection(vm, ctx, projected)
         }
     })

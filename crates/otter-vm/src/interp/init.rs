@@ -257,6 +257,7 @@ impl Interpreter {
             jit_generated_feedback_pending: false,
             jit_next_code_object_id: 1,
             jit_context: None,
+            native_stack_floor: None,
             jit_detached_frame: 0,
             work_budget: WorkBudget::default(),
             work_budget_stats: WorkBudgetStats::default(),

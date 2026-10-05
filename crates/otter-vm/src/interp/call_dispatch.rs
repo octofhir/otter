@@ -216,7 +216,13 @@ fn interpreter_turn(ctx: *mut JitCtx, entering: bool) -> NativeResultPair {
     if fresh_entry && !tier_completion && unsafe { (*frame).header.pc } == 0 {
         vm.begin_interpreted_retraining_activation(unsafe { &mut *frame });
     }
-    if fresh_entry && resume_error.is_none() && !stack.has_prepared_call() && vm.jit_hook.is_some()
+    // A compiled body that side-exited at its entry resumes here at PC zero;
+    // entering it again in the same turn would repeat that exit forever.
+    if fresh_entry
+        && !tier_completion
+        && resume_error.is_none()
+        && !stack.has_prepared_call()
+        && vm.jit_hook.is_some()
     {
         match vm.prepare_compiled_entry(stack, context) {
             Ok(Some(entry)) => return tier_request(ctx, entry),

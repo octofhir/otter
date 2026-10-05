@@ -28,6 +28,44 @@
 use crate::*;
 
 const JIT_NATIVE_STACK_BYTES_LIMIT: usize = 512 * 1024;
+/// Native stack kept below the compiled-entry limit for the Rust frames that
+/// run between two trampoline checks (host calls, re-entry, unwinding).
+const NATIVE_STACK_RESERVE_BYTES: usize = 1024 * 1024;
+
+/// Lowest address of the current thread's stack.
+#[cfg(target_os = "macos")]
+fn thread_stack_floor() -> Option<usize> {
+    // SAFETY: both calls read the calling thread's own descriptor.
+    unsafe {
+        let thread = libc::pthread_self();
+        (libc::pthread_get_stackaddr_np(thread) as usize)
+            .checked_sub(libc::pthread_get_stacksize_np(thread))
+    }
+}
+
+/// Lowest address of the current thread's stack.
+#[cfg(target_os = "linux")]
+fn thread_stack_floor() -> Option<usize> {
+    // SAFETY: the attribute object is initialized by `pthread_getattr_np`
+    // before it is read and destroyed exactly once.
+    unsafe {
+        let mut attr = std::mem::MaybeUninit::<libc::pthread_attr_t>::uninit();
+        if libc::pthread_getattr_np(libc::pthread_self(), attr.as_mut_ptr()) != 0 {
+            return None;
+        }
+        let mut address = std::ptr::null_mut();
+        let mut size = 0;
+        let found = libc::pthread_attr_getstack(attr.as_ptr(), &mut address, &mut size) == 0;
+        libc::pthread_attr_destroy(attr.as_mut_ptr());
+        found.then_some(address as usize)
+    }
+}
+
+/// Lowest address of the current thread's stack.
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn thread_stack_floor() -> Option<usize> {
+    None
+}
 
 impl Interpreter {
     /// Run host/runtime construction work while the complete interpreter root
@@ -352,18 +390,37 @@ impl Interpreter {
     /// calls and [`Self::enter_sync_reentry`].
     #[must_use]
     pub fn jit_sync_reentry_limit(&self) -> u32 {
-        self.max_stack_depth.min(DEFAULT_MAX_SYNC_REENTRY_DEPTH)
+        // With the thread's stack floor known, every re-entry's trampoline
+        // checks the real stack pointer against it, as V8's stack guard does;
+        // no re-entry count is needed.
+        if self.native_stack_floor.is_some_and(|floor| floor != 0) {
+            u32::MAX
+        } else {
+            self.max_stack_depth.min(DEFAULT_MAX_SYNC_REENTRY_DEPTH)
+        }
     }
 
-    /// Lowest native-stack address generated code may reserve beneath the
-    /// outer compiled entry's stack marker.
+    /// Lowest native-stack address a compiled entry may reserve down to.
     ///
-    /// AArch64 stacks grow downward. Comparing prospective callee `sp` against
-    /// this immutable address accounts for every caller linkage and compiled
-    /// prologue without shared mutable byte accounting.
+    /// Stacks grow downward. The limit is one absolute address per thread —
+    /// its stack floor plus a reserve for Rust frames — and a nested entry
+    /// inherits its enclosing entry's limit, so re-entry through native code
+    /// can never slide it lower. A platform that cannot report its floor
+    /// bounds each outer entry below its own `outer_stack_marker`.
     #[must_use]
-    pub const fn jit_native_stack_limit(&self, outer_stack_marker: usize) -> usize {
-        outer_stack_marker.saturating_sub(JIT_NATIVE_STACK_BYTES_LIMIT)
+    pub fn jit_native_stack_limit(&mut self, outer_stack_marker: usize) -> usize {
+        if let Some(enclosing) = self.jit_context {
+            // SAFETY: the enclosing entry's context outlives this nested one.
+            return unsafe { enclosing.as_ref().native_stack_limit };
+        }
+        let floor = *self
+            .native_stack_floor
+            .get_or_insert_with(|| thread_stack_floor().unwrap_or(0));
+        if floor == 0 {
+            outer_stack_marker.saturating_sub(JIT_NATIVE_STACK_BYTES_LIMIT)
+        } else {
+            floor.saturating_add(NATIVE_STACK_RESERVE_BYTES)
+        }
     }
 
     /// Install the parse + compile callback used by `Op::Eval` and

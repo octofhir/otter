@@ -1183,6 +1183,9 @@ pub struct Interpreter {
     /// Its native-frame chain and active pending request jointly retain the
     /// synchronous return anchors and tagged inputs before child publication.
     jit_context: Option<std::ptr::NonNull<crate::native_abi::JitCtx>>,
+    /// Lowest address of this isolate thread's native stack, read once at the
+    /// first compiled entry; zero when the platform cannot report it.
+    native_stack_floor: Option<usize>,
     /// Innermost Rust-published frame while no compiled entry runs.
     jit_detached_frame: u64,
     /// Optional per-slice work policy shared by interpreter, JIT, native,

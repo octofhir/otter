@@ -1,15 +1,14 @@
-//! Indexed-element receiver feedback and compiled-caller invalidation.
+//! Indexed-element receiver feedback.
 //!
 //! # Contents
 //! - Recording one receiver family at a `LoadElement` / `StoreElement` site.
-//! - Coupling a material family transition to immediate caller eviction.
 //!
 //! # Invariants
 //! - Classification precedes the indexed operation, so getters, proxies, and
 //!   throwing stores cannot leave a taken site looking unexecuted.
-//! - One feedback-cell transition advances the owning function epoch and
-//!   evicts its installed generation exactly once. Repeated observations are
-//!   no-ops.
+//! - One feedback-cell transition advances the owning function epoch exactly
+//!   once; installed code keeps its own family guards and the next
+//!   compilation reads the new family. Repeated observations are no-ops.
 //! - Template runtime transitions use the logical PC published in their native
 //!   frame, so generated execution enriches the same cell as interpretation.
 //!
@@ -30,24 +29,18 @@ impl Interpreter {
         &mut self,
         code_block: &CodeBlock,
         instruction_pc: u32,
-        caller_function_id: u32,
         receiver: Value,
     ) -> bool {
         let observed = self.element_family_of(receiver);
-        self.commit_element_family_feedback_transition(
-            code_block,
-            instruction_pc,
-            caller_function_id,
-            observed,
-        )
+        self.commit_element_family_feedback_transition(code_block, instruction_pc, observed)
     }
 
-    /// Publish one already-classified element family and invalidate on change.
+    /// Publish one already-classified element family; returns whether the
+    /// site's family changed. Installed code keeps its own family guards.
     fn commit_element_family_feedback_transition(
         &mut self,
         code_block: &CodeBlock,
         instruction_pc: u32,
-        caller_function_id: u32,
         observed: JitElementFamily,
     ) -> bool {
         let Some(instruction) = code_block.instr_at_index(instruction_pc as usize) else {
@@ -62,9 +55,6 @@ impl Interpreter {
         let changed = code_block
             .feedback_recorder_at(instruction_pc as usize)
             .is_some_and(|feedback| feedback.record_element_family(observed));
-        if changed {
-            self.evict_compiled_for_reopt(caller_function_id);
-        }
         changed
     }
 }
@@ -101,25 +91,22 @@ mod tests {
         assert!(interpreter.commit_element_family_feedback_transition(
             &code_block,
             0,
-            42,
-            JitElementFamily::DenseFloat64,
+            JitElementFamily::DenseFloat64
         ));
         assert_eq!(code_block.feedback_epoch(), 1);
         assert!(!interpreter.commit_element_family_feedback_transition(
             &code_block,
             0,
-            42,
-            JitElementFamily::DenseFloat64,
+            JitElementFamily::DenseFloat64
         ));
         assert_eq!(code_block.feedback_epoch(), 1);
 
         // `Unseen` represents Empty/HoleyDouble. It is transient before a
-        // site specializes, but invalidates an already-packed access.
+        // site specializes, but generalizes an already-packed access.
         assert!(interpreter.commit_element_family_feedback_transition(
             &code_block,
             0,
-            42,
-            JitElementFamily::Unseen,
+            JitElementFamily::Unseen
         ));
         assert_eq!(code_block.feedback_epoch(), 2);
         assert_eq!(
@@ -129,8 +116,7 @@ mod tests {
         assert!(!interpreter.commit_element_family_feedback_transition(
             &code_block,
             0,
-            42,
-            JitElementFamily::DenseTagged,
+            JitElementFamily::DenseTagged
         ));
         assert_eq!(code_block.feedback_epoch(), 2);
     }

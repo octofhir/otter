@@ -37,7 +37,7 @@ impl Interpreter {
             .exec_function(function_id)
             .ok_or(VmError::InvalidOperand)
             .map_err(|error| CommittedValueError::Fatal(error.into()))?;
-        self.record_call_attempt_feedback(function, call_pc, function_id);
+        self.record_call_attempt_feedback(function, call_pc);
         self.record_jit_runtime_stub_class(crate::native_abi::RuntimeStubClass::Reentrant);
         let intrinsic = crate::method_ops::is_function_prototype_intrinsic_value(
             values[0],
@@ -154,13 +154,7 @@ impl Interpreter {
                 .jit_runtime_stats
                 .jit_to_rust_call_transitions
                 .saturating_add(1);
-            self.record_resolved_call_feedback(
-                function,
-                call_pc,
-                function_id,
-                callee,
-                Value::undefined(),
-            );
+            self.record_resolved_call_feedback(function, call_pc, callee, Value::undefined());
             Ok((callee, receiver, arguments))
         })();
         self.pop_iteration_anchors_to(base);

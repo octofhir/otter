@@ -345,11 +345,7 @@ impl Interpreter {
                     // exact native identity before execution can collect;
                     // bytecode dispatch still supplies the resolved frame id.
                     if jit_installed {
-                        self.record_call_attempt_feedback(
-                            function,
-                            instr.instruction_pc,
-                            function_id,
-                        );
+                        self.record_call_attempt_feedback(function, instr.instruction_pc);
                     }
                     // `f.call(this, ...)` loaded as a value runs `f`: the site
                     // records that function, read before the call can collect.
@@ -396,14 +392,11 @@ impl Interpreter {
                             native_target
                         }
                     {
-                        let transition = self.record_ordinary_call_feedback(
+                        let _ = self.record_ordinary_call_feedback(
                             function,
                             instr.instruction_pc,
                             target,
                         );
-                        if transition.evict_for_reopt() {
-                            self.evict_compiled_for_reopt(function_id);
-                        }
                     }
                     continue;
                 }
@@ -427,11 +420,7 @@ impl Interpreter {
                         return Err(VmError::Interrupted);
                     }
                     if jit_installed {
-                        self.record_call_attempt_feedback(
-                            function,
-                            instr.instruction_pc,
-                            function_id,
-                        );
+                        self.record_call_attempt_feedback(function, instr.instruction_pc);
                     }
                     self.do_tail_call_exec(stack, function, instr)?;
                     if jit_installed
@@ -440,14 +429,11 @@ impl Interpreter {
                             .map(crate::feedback::OrdinaryCallTarget::Bytecode)
                             .or(native_target)
                     {
-                        let transition = self.record_ordinary_call_feedback(
+                        let _ = self.record_ordinary_call_feedback(
                             function,
                             instr.instruction_pc,
                             target,
                         );
-                        if transition.evict_for_reopt() {
-                            self.evict_compiled_for_reopt(function_id);
-                        }
                     }
                     continue;
                 }
@@ -474,11 +460,7 @@ impl Interpreter {
                         })
                         .flatten();
                     if jit_installed {
-                        self.record_call_attempt_feedback(
-                            function,
-                            instr.instruction_pc,
-                            function_id,
-                        );
+                        self.record_call_attempt_feedback(function, instr.instruction_pc);
                     }
                     (match self.do_call_forward_arguments_exec(stack, context, function, instr) {
                         Ok(value) => value,
@@ -493,24 +475,17 @@ impl Interpreter {
                             .map(crate::feedback::OrdinaryCallTarget::Bytecode)
                             .or(native_target)
                     {
-                        let transition = self.record_ordinary_call_feedback(
+                        let _ = self.record_ordinary_call_feedback(
                             function,
                             instr.instruction_pc,
                             target,
                         );
-                        if transition.evict_for_reopt() {
-                            self.evict_compiled_for_reopt(function_id);
-                        }
                     }
                     continue;
                 }
                 Op::CallMethodValue => {
                     if jit_installed {
-                        self.record_call_attempt_feedback(
-                            function,
-                            instr.instruction_pc,
-                            function_id,
-                        );
+                        self.record_call_attempt_feedback(function, instr.instruction_pc);
                     }
                     let feedback_site = instr.property_ic_site();
                     // Capture the receiver/prototype layout before the call for
@@ -580,24 +555,17 @@ impl Interpreter {
                             self.function_prototype_call_target(callee, receiver)
                         });
                     if let Some(target) = function_call_target {
-                        let transition = self.record_ordinary_call_feedback(
+                        let _ = self.record_ordinary_call_feedback(
                             function,
                             instr.instruction_pc,
                             target,
                         );
-                        if transition.evict_for_reopt() {
-                            self.evict_compiled_for_reopt(function_id);
-                        }
                     } else if jit_installed
                         && let Some(method_fid) = self.staged_bytecode_target(stack)
                     {
                         if let (Some(feedback_site), Some(site)) = (feedback_site, method_site) {
                             let changed = self.note_method_target(feedback_site, method_fid, site);
-                            self.commit_method_call_feedback_transition(
-                                function,
-                                function_id,
-                                changed,
-                            );
+                            self.commit_method_call_feedback_transition(function, changed);
                         }
                     } else if jit_installed
                         && let (Some(feedback_site), Some(site), Some(stub_id)) =
@@ -605,7 +573,7 @@ impl Interpreter {
                     {
                         let changed =
                             self.record_method_native_leaf_feedback(feedback_site, stub_id, site);
-                        self.commit_method_call_feedback_transition(function, function_id, changed);
+                        self.commit_method_call_feedback_transition(function, changed);
                     }
                     continue;
                 }
@@ -628,14 +596,11 @@ impl Interpreter {
                             .map(crate::feedback::OrdinaryCallTarget::Bytecode)
                             .or(native_target)
                     {
-                        let transition = self.record_ordinary_call_feedback(
+                        let _ = self.record_ordinary_call_feedback(
                             function,
                             instr.instruction_pc,
                             target,
                         );
-                        if transition.evict_for_reopt() {
-                            self.evict_compiled_for_reopt(function_id);
-                        }
                     }
                     continue;
                 }
@@ -655,11 +620,7 @@ impl Interpreter {
                         })
                         .flatten();
                     if jit_installed {
-                        self.record_call_attempt_feedback(
-                            function,
-                            instr.instruction_pc,
-                            function_id,
-                        );
+                        self.record_call_attempt_feedback(function, instr.instruction_pc);
                     }
                     let direct_construct_fid = if jit_installed {
                         register_operand(function.operand(instr, 1))
@@ -698,25 +659,19 @@ impl Interpreter {
                         && let Some(function_id) = self.staged_bytecode_target(stack)
                         && direct_construct_fid == Some(function_id)
                     {
-                        let transition = self.record_ordinary_call_feedback(
+                        let _ = self.record_ordinary_call_feedback(
                             function,
                             instr.instruction_pc,
                             crate::feedback::OrdinaryCallTarget::Bytecode(function_id),
                         );
-                        if transition.evict_for_reopt() {
-                            self.evict_compiled_for_reopt(function_id);
-                        }
                     }
 
                     if let Some(target) = native_target {
-                        let transition = self.record_ordinary_call_feedback(
+                        let _ = self.record_ordinary_call_feedback(
                             function,
                             instr.instruction_pc,
                             target,
                         );
-                        if transition.evict_for_reopt() {
-                            self.evict_compiled_for_reopt(function_id);
-                        }
                     }
                     continue;
                 }
@@ -770,25 +725,19 @@ impl Interpreter {
                         && let Some(function_id) = self.staged_bytecode_target(stack)
                         && direct_construct_fid == Some(function_id)
                     {
-                        let transition = self.record_ordinary_call_feedback(
+                        let _ = self.record_ordinary_call_feedback(
                             function,
                             instr.instruction_pc,
                             crate::feedback::OrdinaryCallTarget::Bytecode(function_id),
                         );
-                        if transition.evict_for_reopt() {
-                            self.evict_compiled_for_reopt(function_id);
-                        }
                     }
 
                     if let Some(target) = native_target {
-                        let transition = self.record_ordinary_call_feedback(
+                        let _ = self.record_ordinary_call_feedback(
                             function,
                             instr.instruction_pc,
                             target,
                         );
-                        if transition.evict_for_reopt() {
-                            self.evict_compiled_for_reopt(function_id);
-                        }
                     }
                     continue;
                 }
@@ -839,25 +788,19 @@ impl Interpreter {
                         && let Some(function_id) = self.staged_bytecode_target(stack)
                         && direct_construct_fid == Some(function_id)
                     {
-                        let transition = self.record_ordinary_call_feedback(
+                        let _ = self.record_ordinary_call_feedback(
                             function,
                             instr.instruction_pc,
                             crate::feedback::OrdinaryCallTarget::Bytecode(function_id),
                         );
-                        if transition.evict_for_reopt() {
-                            self.evict_compiled_for_reopt(function_id);
-                        }
                     }
 
                     if let Some(target) = native_target {
-                        let transition = self.record_ordinary_call_feedback(
+                        let _ = self.record_ordinary_call_feedback(
                             function,
                             instr.instruction_pc,
                             target,
                         );
-                        if transition.evict_for_reopt() {
-                            self.evict_compiled_for_reopt(function_id);
-                        }
                     }
                     continue;
                 }
@@ -908,25 +851,19 @@ impl Interpreter {
                         && let Some(function_id) = self.staged_bytecode_target(stack)
                         && direct_construct_fid == Some(function_id)
                     {
-                        let transition = self.record_ordinary_call_feedback(
+                        let _ = self.record_ordinary_call_feedback(
                             function,
                             instr.instruction_pc,
                             crate::feedback::OrdinaryCallTarget::Bytecode(function_id),
                         );
-                        if transition.evict_for_reopt() {
-                            self.evict_compiled_for_reopt(function_id);
-                        }
                     }
 
                     if let Some(target) = native_target {
-                        let transition = self.record_ordinary_call_feedback(
+                        let _ = self.record_ordinary_call_feedback(
                             function,
                             instr.instruction_pc,
                             target,
                         );
-                        if transition.evict_for_reopt() {
-                            self.evict_compiled_for_reopt(function_id);
-                        }
                     }
                     continue;
                 }
@@ -1362,12 +1299,7 @@ impl Interpreter {
                         && let Ok(recv) = read_register(&stack[top_idx], recv_reg)
                     {
                         let recv = *recv;
-                        self.record_element_family_feedback(
-                            function,
-                            instr.instruction_pc,
-                            function_id,
-                            recv,
-                        );
+                        self.record_element_family_feedback(function, instr.instruction_pc, recv);
                     }
                     if match self.drive_load_element(stack, context, operands) {
                         Ok(value) => value,
@@ -1574,12 +1506,7 @@ impl Interpreter {
                     }
                     if jit_installed {
                         let recv = *read_register(&stack[top_idx], recv_reg)?;
-                        self.record_element_family_feedback(
-                            function,
-                            instr.instruction_pc,
-                            function_id,
-                            recv,
-                        );
+                        self.record_element_family_feedback(function, instr.instruction_pc, recv);
                     }
                     // Copy the operands through a short representation-neutral
                     // view, then end the frame borrow before `[[Set]]` can

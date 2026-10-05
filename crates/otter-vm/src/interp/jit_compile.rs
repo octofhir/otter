@@ -1781,23 +1781,6 @@ impl Interpreter {
         })
     }
 
-    /// Drop `fid`'s optimized body so the next tier-up recompiles it. Called
-    /// when call/method feedback for one of its sites matures: a function
-    /// whose hot loop calls out is often optimized by an *earlier* loop in
-    /// the same body, before the callee feedback exists, so its inline sites
-    /// baked nothing. Its baseline body stays installed: unbaked feedback
-    /// reaches baseline sites through the shared caches and committed
-    /// misses, so rebuilding it would only churn code memory. The running
-    /// optimized body, if any, stays alive through its `Arc` until it returns.
-    pub(crate) fn evict_compiled_for_reopt(&mut self, fid: u32) {
-        let mut affected = self.jit_code_registry.invalidate_optimizing_function(fid);
-        if affected.binary_search(&fid).is_err() {
-            affected.push(fid);
-            affected.sort_unstable();
-        }
-        self.discard_invalidated_jit_state(&affected);
-    }
-
     /// Resolve the stable entry cell for one compiler-native call.
     ///
     /// The registry publishes an optimizing generation only when it advertises

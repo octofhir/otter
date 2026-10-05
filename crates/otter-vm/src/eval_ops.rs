@@ -465,11 +465,22 @@ impl Interpreter {
         module_url: &str,
         body: CommonJsBody<'_>,
     ) -> Result<Value, VmError> {
+        // Positions report the file's own lines and columns: the wrapper
+        // header is a prologue on line 1, not part of the module text.
+        let prologue = otter_bytecode::commonjs::WRAPPER_PREFIX.len() as u32;
         let (compiled, sources) = match body {
             CommonJsBody::File(body) => {
                 let source = otter_bytecode::commonjs::wrapper_source(body);
                 let compiled = self.compile_eval_source(&source, EvalCompileOptions::default())?;
-                let sources = self.sources_for_dynamic_body([module_url.to_owned()], source)?;
+                let text = otter_resource::SharedSource::admit(&self.resource_account, source)
+                    .map_err(|error| self.err_owned_source(error))?;
+                let sources = crate::source_registry::SourceRegistry::with_prologue(
+                    module_url.to_owned(),
+                    text,
+                    prologue,
+                    &self.resource_account,
+                )
+                .map_err(|error| self.err_resource(error))?;
                 (compiled, sources)
             }
             CommonJsBody::Embedded(unit) => {
@@ -481,8 +492,10 @@ impl Interpreter {
                 };
                 let compiled = self.compile_eval_source(unit.source, options)?;
                 let text = otter_resource::SharedSource::from_static(unit.source);
-                let sources = crate::source_registry::SourceRegistry::new(
-                    std::collections::BTreeMap::from([(module_url.to_owned(), text)]),
+                let sources = crate::source_registry::SourceRegistry::with_prologue(
+                    module_url.to_owned(),
+                    text,
+                    prologue,
                     &self.resource_account,
                 )
                 .map_err(|error| self.err_resource(error))?;

@@ -1260,14 +1260,11 @@ impl Interpreter {
             context.exec_function(caller_function_id),
             target_function_id,
         ) {
-            let transition = self.record_ordinary_call_feedback(
+            let _ = self.record_ordinary_call_feedback(
                 caller,
                 call_pc,
                 crate::feedback::OrdinaryCallTarget::Bytecode(target_function_id),
             );
-            if transition.evict_for_reopt() {
-                self.evict_compiled_for_reopt(caller_function_id);
-            }
         }
         let mut args: SmallVec<[Value; 8]> = SmallVec::with_capacity(arg_regs.len());
         for &arg in arg_regs {

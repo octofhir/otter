@@ -41,7 +41,10 @@
 //! - Invalid code remains available to safepoint resolution until its last
 //!   external anchor drops and the interpreter reaches a native-activation
 //!   retirement epoch before [`JitCodeRegistry::retire_unreferenced`] removes
-//!   it. Safepoint resolution therefore does not apply the entry check.
+//!   it. A published frame's code id cannot stand in for that epoch: a frame
+//!   resumed in the interpreter after a deopt clears its id while its
+//!   generated machine frame still unwinds through the exit path.
+//!   Safepoint resolution therefore does not apply the entry check.
 //! - Cold generation snapshots derive callable-entry offsets from the one
 //!   retained code mapping and current selection from the permanent function
 //!   cell; compile-trigger labels do not describe callable capability.
@@ -654,25 +657,6 @@ impl JitCodeRegistry {
                             .binary_search(&function_id)
                             .is_ok()))
                 .then_some(code_object_id)
-            })
-            .collect::<Vec<_>>();
-        self.invalidate_code_objects(seeds)
-    }
-
-    /// Unlink the installed optimizing generations compiled from
-    /// `function_id`, leaving its baseline generation and every caller that
-    /// spliced it installed. Feedback a baseline site has not baked reaches
-    /// it through the shared caches and committed misses, so only optimized
-    /// code is rebuilt for richer feedback, as V8 keeps Sparkplug code.
-    pub(crate) fn invalidate_optimizing_function(&mut self, function_id: u32) -> Vec<u32> {
-        let seeds = self
-            .codes
-            .iter()
-            .filter_map(|(&code_object_id, registered)| {
-                (registered.state == CodeLifetimeState::Installed
-                    && registered.code.metadata().code_block_id == function_id
-                    && registered.code.native_frame_kind() == NativeFrameKind::Optimizing)
-                    .then_some(code_object_id)
             })
             .collect::<Vec<_>>();
         self.invalidate_code_objects(seeds)

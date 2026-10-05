@@ -6,9 +6,9 @@
 //! - [`Interpreter::record_ordinary_call_feedback`] — typed recording keyed by
 //!   the canonical instruction index in the supplied CodeBlock.
 //! - [`Interpreter::record_resolved_call_feedback`] — generated-call
-//!   target publication and caller invalidation before committed callee entry.
-//! - [`Interpreter::commit_method_call_feedback_transition`] — publication and
-//!   invalidation for isolate-owned method-target growth.
+//!   target publication before committed callee entry.
+//! - [`Interpreter::commit_method_call_feedback_transition`] — epoch
+//!   publication for isolate-owned method-target growth.
 //!
 //! # Invariants
 //! - `call_attempted` is recorded before callable lookup, method lookup, getter
@@ -22,7 +22,8 @@
 //!   target population and one transition epoch. A native kind stores no handle.
 //! - The first attempt and first resolved target are independent material
 //!   facts. Each advances the feedback epoch once; repeated attempts and hits
-//!   do not.
+//!   do not. No transition discards installed code: compiled bodies keep
+//!   their own guards and later compilations read the new population.
 //!
 //! # See also
 //! - [`crate::feedback`] — compact per-instruction feedback and epochs.
@@ -34,15 +35,14 @@ use crate::{
 };
 
 impl Interpreter {
-    /// Record one plain/method call attempt before any observable operation.
-    ///
-    /// A first attempt invalidates an installed caller whose immutable body may
-    /// have represented this instruction as an unconditional cold exit.
+    /// Record one plain/method call attempt before any observable operation,
+    /// returning whether the site's feedback changed. Installed code is kept:
+    /// a body that represented this instruction as a cold exit leaves through
+    /// that exit, and the next compilation reads the new state.
     pub(crate) fn record_call_attempt_feedback(
         &mut self,
         code_block: &CodeBlock,
         instruction_pc: u32,
-        caller_function_id: u32,
     ) -> bool {
         let call_changed = code_block
             .feedback_recorder_at(instruction_pc as usize)
@@ -54,26 +54,23 @@ impl Interpreter {
             )
             .is_some_and(|slot| slot.record_attempt());
         let changed = call_changed || property_changed;
-        if changed {
-            self.evict_compiled_for_reopt(caller_function_id);
-        }
         changed
     }
 
     /// Publish one isolate-owned method-target population transition.
     ///
-    /// Repeat hits are deliberately ignored. A new shape/target changes the
-    /// immutable optimizing chain, so it advances the caller's shared feedback
-    /// epoch and invalidates that caller for immediate replanning.
+    /// Repeat hits are deliberately ignored. A new shape/target advances the
+    /// caller's shared feedback epoch, so the next optimizing compilation
+    /// replans the chain. Installed optimized code keeps its own guards until
+    /// one fails, as V8 keeps optimized code until a check deoptimizes it;
+    /// discarding it on every new target only churned code memory.
     pub(crate) fn commit_method_call_feedback_transition(
         &mut self,
         code_block: &CodeBlock,
-        caller_function_id: u32,
         changed: bool,
     ) -> bool {
         if changed {
             code_block.bump_feedback_epoch();
-            self.evict_compiled_for_reopt(caller_function_id);
         }
         changed
     }
@@ -138,7 +135,6 @@ impl Interpreter {
         &mut self,
         code_block: &CodeBlock,
         instruction_pc: u32,
-        caller_function_id: u32,
         callee: crate::Value,
         receiver: crate::Value,
     ) {
@@ -146,10 +142,7 @@ impl Interpreter {
         let Some(target) = target else {
             return;
         };
-        let transition = self.record_ordinary_call_feedback(code_block, instruction_pc, target);
-        if transition.evict_for_reopt() {
-            self.evict_compiled_for_reopt(caller_function_id);
-        }
+        let _ = self.record_ordinary_call_feedback(code_block, instruction_pc, target);
     }
 
     /// Record both compact and bounded ordinary-call feedback for one site.
@@ -198,14 +191,10 @@ mod tests {
     fn caller_invalidation_follows_bounded_target_growth() {
         let code_block = call_code_block();
         for target in 0..=PROFILED_CALL_TARGET_CAPACITY as u32 {
-            assert!(code_block.record_call_feedback(0, target).evict_for_reopt());
-            assert!(!code_block.record_call_feedback(0, target).evict_for_reopt());
+            assert!(code_block.record_call_feedback(0, target).state_changed());
+            assert!(!code_block.record_call_feedback(0, target).state_changed());
         }
-        assert!(
-            !code_block
-                .record_call_feedback(0, u32::MAX)
-                .evict_for_reopt()
-        );
+        assert!(!code_block.record_call_feedback(0, u32::MAX).state_changed());
     }
 
     #[test]
@@ -341,7 +330,7 @@ mod tests {
         let mut interpreter = Interpreter::new().expect("fixture interpreter bootstrap");
 
         assert!(!code_block.jit_compile_snapshot().instructions[0].call_attempted);
-        assert!(interpreter.record_call_attempt_feedback(&code_block, 0, 42));
+        assert!(interpreter.record_call_attempt_feedback(&code_block, 0));
         assert_eq!(code_block.feedback_epoch(), 1);
         assert!(code_block.jit_compile_snapshot().instructions[0].call_attempted);
 
@@ -355,7 +344,7 @@ mod tests {
         );
         assert_eq!(code_block.feedback_epoch(), 2);
 
-        assert!(!interpreter.record_call_attempt_feedback(&code_block, 0, 42));
+        assert!(!interpreter.record_call_attempt_feedback(&code_block, 0));
         assert_eq!(
             interpreter.record_ordinary_call_feedback(
                 &code_block,
@@ -372,9 +361,9 @@ mod tests {
         let code_block = call_code_block();
         let mut interpreter = Interpreter::new().expect("fixture interpreter bootstrap");
 
-        assert!(interpreter.commit_method_call_feedback_transition(&code_block, 42, true));
+        assert!(interpreter.commit_method_call_feedback_transition(&code_block, true));
         assert_eq!(code_block.feedback_epoch(), 1);
-        assert!(!interpreter.commit_method_call_feedback_transition(&code_block, 42, false));
+        assert!(!interpreter.commit_method_call_feedback_transition(&code_block, false));
         assert_eq!(code_block.feedback_epoch(), 1);
     }
     #[test]

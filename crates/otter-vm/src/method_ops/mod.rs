@@ -496,7 +496,6 @@ impl Interpreter {
             self.record_resolved_call_feedback(
                 function,
                 instruction.instruction_pc,
-                function.id,
                 method,
                 receiver,
             );

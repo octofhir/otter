@@ -98,9 +98,8 @@ const BRANCH_NOT_TAKEN_SEEN: u8 = 1 << 6;
 
 /// Material transition made while recording an ordinary call target.
 ///
-/// Baseline invalidation reacts only to [`Self::BecameMonomorphic`]. Keeping
-/// that decision distinct from later target-set changes lets the feedback epoch
-/// invalidate optimized assumptions without recompiling on every new target.
+/// A transition never discards installed code; the next compilation reads the
+/// changed state, and installed bodies keep their own target guards.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CallTargetTransition {
     /// The observation was already represented by the typed call slot.
@@ -116,13 +115,6 @@ impl CallTargetTransition {
     #[must_use]
     pub(crate) const fn state_changed(self) -> bool {
         !matches!(self, Self::Unchanged)
-    }
-
-    /// Every new target changes the immutable caller plan. Repeated hits and
-    /// observations after saturation do not invalidate an installed generation.
-    #[must_use]
-    pub(crate) const fn evict_for_reopt(self) -> bool {
-        self.state_changed()
     }
 }
 

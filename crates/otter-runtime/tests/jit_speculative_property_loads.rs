@@ -718,17 +718,21 @@ JSON.stringify([warmed, total]);
         &[entry_probe("walk", "String(walk(0, changed));", "5")],
     );
     run.assert_optimized("walk");
+    // The new shape may first reach an optimized caller that inlined `walk`
+    // and retrains it there, so `walk`'s own body exits at most twice.
     let exits = run.optimizing_exits("walk");
     assert!(
-        !exits.is_empty() && exits.len() <= 2,
+        exits.len() <= 2,
         "recursive deopt must remain bounded: {exits:?}"
     );
     assert!(
         exits
             .iter()
-            .any(|(_, reason)| *reason == ExitReason::ShapeGuard)
+            .all(|(_, reason)| *reason == ExitReason::ShapeGuard)
     );
-    run.assert_recompiled_after_last_exit("walk");
+    if !exits.is_empty() {
+        run.assert_recompiled_after_last_exit("walk");
+    }
 }
 
 #[test]
@@ -866,13 +870,17 @@ JSON.stringify([warmed, total]);
     let run = compare_with_setup(SETUP, SOURCE, "[518000,40003]");
     run.assert_optimized("drive");
     run.assert_spliced("drive", "leaf", None);
-    assert!(run.stats.jit_caller_invalidations >= 1, "{:?}", run.stats);
+    // A callee's feedback change discards no installed caller: the active
+    // generation leaves through its own guard on the new shape (or, when a
+    // dependency invalidated it, at its bounded loop poll), then recompiles.
+    let exits = run.optimizing_exits("drive");
     assert!(
-        run.optimizing_exits("drive")
-            .iter()
-            .any(|(_, reason)| *reason == ExitReason::Interrupt),
-        "the active invalidated generation must leave at its bounded loop poll: {:?}",
-        run.optimizing_exits("drive")
+        !exits.is_empty()
+            && exits.iter().all(|(_, reason)| matches!(
+                reason,
+                ExitReason::ShapeGuard | ExitReason::Interrupt
+            )),
+        "the active generation must leave at its guard or bounded loop poll: {exits:?}"
     );
     run.assert_recompiled_after_last_exit("drive");
     assert!(

@@ -440,7 +440,7 @@ impl Interpreter {
     ) -> Result<Value, CommittedValueError> {
         self.record_jit_runtime_property_stub();
         if let Some(code_block) = context.exec_function(function_id) {
-            self.record_element_family_feedback(code_block, instruction_pc, function_id, receiver);
+            self.record_element_family_feedback(code_block, instruction_pc, receiver);
         }
         self.load_element_values(stack, context, receiver, key)
     }
@@ -598,7 +598,7 @@ impl Interpreter {
     ) -> Result<(), CommittedValueError> {
         self.record_jit_runtime_property_stub();
         if let Some(code_block) = context.exec_function(function_id) {
-            self.record_element_family_feedback(code_block, instruction_pc, function_id, receiver);
+            self.record_element_family_feedback(code_block, instruction_pc, receiver);
         }
         self.store_element_values(
             stack,

@@ -57,7 +57,7 @@ impl Interpreter {
             .exec_function(function_id)
             .ok_or(VmError::InvalidOperand)
             .map_err(|error| CommittedValueError::Fatal(error.into()))?;
-        self.record_call_attempt_feedback(function, call_pc, function_id);
+        self.record_call_attempt_feedback(function, call_pc);
         self.record_jit_runtime_stub_class(crate::native_abi::RuntimeStubClass::Reentrant);
         let receiver_anchor = self.push_iteration_anchor(receiver) - 1;
         let resolve = |interp: &mut Self, stack: &mut ActivationStack| {
@@ -198,7 +198,7 @@ impl Interpreter {
                             false
                         })
                 };
-                interp.commit_method_call_feedback_transition(function, function_id, changed);
+                interp.commit_method_call_feedback_transition(function, changed);
             }
             // `f.call(thisArg, ...)` with the intrinsic `call` runs `f`: the
             // site records that target for the optimizing tier.
@@ -211,10 +211,7 @@ impl Interpreter {
             }) && interp.is_callable_runtime(&receiver)
                 && let Some(target) = interp.function_prototype_call_target(method, receiver)
             {
-                let transition = interp.record_ordinary_call_feedback(function, call_pc, target);
-                if transition.evict_for_reopt() {
-                    interp.evict_compiled_for_reopt(function_id);
-                }
+                let _ = interp.record_ordinary_call_feedback(function, call_pc, target);
             }
             Ok(method)
         };
@@ -336,13 +333,13 @@ impl Interpreter {
         let function = context
             .exec_function(function_id)
             .ok_or(VmError::InvalidOperand)?;
-        self.record_call_attempt_feedback(function, call_pc, function_id);
+        self.record_call_attempt_feedback(function, call_pc);
         self.record_jit_runtime_stub_class(crate::native_abi::RuntimeStubClass::Reentrant);
         self.jit_runtime_stats.jit_to_rust_call_transitions = self
             .jit_runtime_stats
             .jit_to_rust_call_transitions
             .saturating_add(1);
-        self.record_resolved_call_feedback(function, call_pc, function_id, callee, receiver);
+        self.record_resolved_call_feedback(function, call_pc, callee, receiver);
         self.run_rooted_call_values(stack, context, callee, receiver, args)
     }
 
@@ -361,7 +358,7 @@ impl Interpreter {
         let function = context
             .exec_function(function_id)
             .ok_or(VmError::InvalidOperand)?;
-        self.record_call_attempt_feedback(function, call_pc, function_id);
+        self.record_call_attempt_feedback(function, call_pc);
         self.record_jit_runtime_stub_class(crate::native_abi::RuntimeStubClass::Reentrant);
         // §13.3.5.1.1 step 7 — `new` of a value without [[Construct]] throws,
         // exactly as the interpreter's `Op::New`; natives that are callable
@@ -382,14 +379,11 @@ impl Interpreter {
                 .as_closure(&self.gc_heap)
                 .map(|closure| closure.function_id())
         }) {
-            let transition = self.record_ordinary_call_feedback(
+            let _ = self.record_ordinary_call_feedback(
                 function,
                 call_pc,
                 crate::feedback::OrdinaryCallTarget::Bytecode(target_function_id),
             );
-            if transition.evict_for_reopt() {
-                self.evict_compiled_for_reopt(function_id);
-            }
         }
         let mut callee = callee;
         let mut new_target = callee;

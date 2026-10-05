@@ -29,7 +29,9 @@ const {
   SafeMap,
   SafeSet,
   SafeWeakMap,
+  ObjectIs,
   StringPrototypeIncludes,
+  SymbolPrototypeToString,
   StringPrototypeRepeat,
   StringPrototypeSlice,
   Symbol,
@@ -54,6 +56,52 @@ function lazyValidators() {
 let inspectModule;
 function lazyInspect() {
   return inspectModule ??= require('internal/util/inspect');
+}
+// Otter: primitive arguments format without loading util.inspect, exactly as
+// formatWithOptions renders them without colors or numeric separators. Until
+// util.inspect is loaded its defaults cannot have changed.
+const builtinCache = globalThis.__otterRequireCache;
+function formatPrimitivesWithoutInspect(args, opts) {
+  if (opts.colors || opts.numericSeparator ||
+      (builtinCache?.['internal/util/inspect'] !== undefined &&
+       lazyInspect().inspectDefaultOptions.numericSeparator)) {
+    return undefined;
+  }
+  let str = '';
+  for (let i = 0; i < args.length; i++) {
+    const value = args[i];
+    let piece;
+    switch (typeof value) {
+      case 'string':
+        if (i === 0 && args.length > 1 && StringPrototypeIncludes(value, '%')) {
+          return undefined;
+        }
+        piece = value;
+        break;
+      case 'number':
+        piece = ObjectIs(value, -0) ? '-0' : `${value}`;
+        break;
+      case 'bigint':
+        piece = `${value}n`;
+        break;
+      case 'boolean':
+        piece = value ? 'true' : 'false';
+        break;
+      case 'undefined':
+        piece = 'undefined';
+        break;
+      case 'symbol':
+        piece = SymbolPrototypeToString(value);
+        break;
+      default:
+        if (value !== null) {
+          return undefined;
+        }
+        piece = 'null';
+    }
+    str = i === 0 ? piece : `${str} ${piece}`;
+  }
+  return str;
 }
 let typesModule;
 function lazyTypes() {
@@ -443,6 +491,10 @@ ObjectDefineProperties(Console.prototype, {
       // Otter: an unbuilt stream's colors come from its traits.
       const opts = this[kGetInspectOptions](
         unbuiltOutput(this, true) ?? this._stdout);
+      const primitives = formatPrimitivesWithoutInspect(args, opts);
+      if (primitives !== undefined) {
+        return primitives;
+      }
       ArrayPrototypeUnshift(args, opts);
       return ReflectApply(lazyInspect().formatWithOptions, null, args);
     }),
@@ -462,6 +514,10 @@ ObjectDefineProperties(Console.prototype, {
       // Otter: an unbuilt stream's colors come from its traits.
       const opts = this[kGetInspectOptions](
         unbuiltOutput(this, false) ?? this._stderr);
+      const primitives = formatPrimitivesWithoutInspect(args, opts);
+      if (primitives !== undefined) {
+        return primitives;
+      }
       ArrayPrototypeUnshift(args, opts);
       return ReflectApply(lazyInspect().formatWithOptions, null, args);
     }),

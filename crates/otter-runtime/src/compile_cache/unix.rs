@@ -18,6 +18,9 @@
 //! - One nonblocking root lock covers a complete scan/prune and publication.
 //!   An incomplete or over-budget scan never creates a temporary file and
 //!   never publishes the requested entry.
+//! - The lock file holds exactly one size record. It is updated before the
+//!   entry commits, so a failed or replacing publication only overcounts and
+//!   brings the next scan forward; a scan rewrites it with the exact size.
 
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
@@ -25,7 +28,7 @@ use std::ffi::{CStr, CString};
 use std::fs::{DirBuilder, File};
 use std::io::Write;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
-use std::os::unix::fs::DirBuilderExt;
+use std::os::unix::fs::{DirBuilderExt, FileExt};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -42,6 +45,8 @@ use super::{
 };
 
 const LOCK_FILE: &str = ".compile-cache.lock";
+/// Bytes of the lock file's size record: retained bytes, then entries.
+const SIZE_RECORD_BYTES: usize = 16;
 const TEMPORARY_CREATE_ATTEMPTS: usize = 32;
 
 static NEXT_TEMPORARY_ID: AtomicU64 = AtomicU64::new(1);
@@ -58,7 +63,6 @@ pub(super) fn load(root: &Path, key: &CompileCacheKey) -> Option<Vec<u8>> {
 pub(super) fn store(
     root_path: &Path,
     policy: CompileCachePolicy,
-    estimate: &std::sync::Mutex<Option<CacheSize>>,
     key: &CompileCacheKey,
     bytes: &[u8],
 ) {
@@ -75,28 +79,26 @@ pub(super) fn store(
     let Some(root) = open_root(root_path, true) else {
         return;
     };
-    let Some(_lock) = RootLock::acquire(&root) else {
+    let Some(lock) = RootLock::acquire(&root) else {
         return;
     };
-    // The tree is scanned and pruned when this process first publishes and
-    // again whenever its running size would cross a quota; in between, each
-    // publication only adds to that size. Other processes publish
-    // cooperatively, so the size is an estimate the next scan corrects.
-    let mut estimate = estimate
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    match estimate.as_mut() {
+    let size = match lock.size() {
         Some(size)
             if size.bytes.saturating_add(stored_bytes) <= policy.max_bytes
                 && size.entries < policy.max_entries =>
         {
-            size.bytes += stored_bytes;
-            size.entries += 1;
+            CacheSize {
+                bytes: size.bytes + stored_bytes,
+                entries: size.entries + 1,
+            }
         }
         _ => match scan_and_prune(&root, policy, key, stored_bytes) {
-            Some(size) => *estimate = Some(size),
+            Some(size) => size,
             None => return,
         },
+    };
+    if !lock.record(size) {
+        return;
     }
 
     let (prefix, suffix) = split_key(key);
@@ -214,7 +216,7 @@ fn open_private_file(directory: &impl AsFd, name: &CStr) -> Option<File> {
 }
 
 struct RootLock {
-    _descriptor: OwnedFd,
+    file: File,
 }
 
 impl RootLock {
@@ -236,8 +238,29 @@ impl RootLock {
         #[allow(deprecated)]
         nix::fcntl::flock(descriptor.as_raw_fd(), FlockArg::LockExclusiveNonblock).ok()?;
         Some(Self {
-            _descriptor: descriptor,
+            file: File::from(descriptor),
         })
+    }
+
+    /// The recorded tree size, unless the record is missing or malformed.
+    fn size(&self) -> Option<CacheSize> {
+        let mut record = [0; SIZE_RECORD_BYTES + 1];
+        if self.file.read_at(&mut record, 0).ok()? != SIZE_RECORD_BYTES {
+            return None;
+        }
+        let (bytes, entries) = record[..SIZE_RECORD_BYTES].split_at(8);
+        Some(CacheSize {
+            bytes: u64::from_le_bytes(bytes.try_into().ok()?),
+            entries: u64::from_le_bytes(entries.try_into().ok()?),
+        })
+    }
+
+    fn record(&self, size: CacheSize) -> bool {
+        let mut record = [0; SIZE_RECORD_BYTES];
+        record[..8].copy_from_slice(&size.bytes.to_le_bytes());
+        record[8..].copy_from_slice(&size.entries.to_le_bytes());
+        self.file.write_all_at(&record, 0).is_ok()
+            && self.file.set_len(SIZE_RECORD_BYTES as u64).is_ok()
     }
 }
 
@@ -312,10 +335,10 @@ impl Drop for TemporaryEntry<'_> {
     }
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub(super) struct CacheSize {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CacheSize {
     bytes: u64,
-    entries: usize,
+    entries: u64,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -356,6 +379,12 @@ fn scan_and_prune(
         entries: 1,
     };
     let mut retained: BinaryHeap<Reverse<CacheEntryCandidate>> = BinaryHeap::new();
+    // Pruning stops at the low-water mark, leaving a quarter of each quota
+    // for publications that only add to the size record.
+    let (low_bytes, low_entries) = (
+        policy.max_bytes - policy.max_bytes / 4,
+        policy.max_entries - policy.max_entries / 4,
+    );
 
     for prefix in 0_u16..=255 {
         let prefix_name = format!("{prefix:02x}");
@@ -419,8 +448,10 @@ fn scan_and_prune(
                 bytes,
             }));
 
-            while size.bytes > policy.max_bytes || size.entries > policy.max_entries {
-                let Reverse(oldest) = retained.pop()?;
+            while size.bytes > low_bytes || size.entries > low_entries {
+                let Some(Reverse(oldest)) = retained.pop() else {
+                    break;
+                };
                 if !unlink_candidate(root, &oldest) {
                     return None;
                 }
@@ -728,6 +759,39 @@ mod tests {
         let key = key("bounded scan");
         cache.store(&key, &compiled("1 + 1"));
         assert!(cache.load(&key, "").is_none());
+    }
+
+    #[test]
+    fn full_tree_is_pruned_to_low_water_and_later_stores_only_append() {
+        let root = private_tempdir();
+        let cache = CompileCache::with_policy(
+            root.path(),
+            CompileCachePolicy {
+                max_bytes: u64::MAX,
+                max_entries: 4,
+                max_scan_entries: 32,
+            },
+        );
+        let keys: Vec<_> = "012345".chars().map(fixed_key).collect();
+        for key in &keys[..5] {
+            cache.store(key, &compiled("1 + 1"));
+        }
+        let retained = |keys: &[CompileCacheKey]| {
+            keys.iter()
+                .filter(|key| cache.entry_path(key).exists())
+                .count()
+        };
+        assert_eq!(retained(&keys[..5]), 3);
+        assert!(cache.entry_path(&keys[4]).exists());
+
+        let prefix = root.path().join("aa");
+        private_directory(&prefix);
+        let stale = prefix.join(format!(".tmp-{}-123-456", fixed_key('a').as_str()));
+        private_file(&stale, b"stale");
+        cache.store(&keys[5], &compiled("1 + 1"));
+
+        assert!(stale.exists());
+        assert_eq!(retained(&keys), 4);
     }
 
     #[test]

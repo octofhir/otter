@@ -22,11 +22,9 @@ const constructors = { Array, ArrayBuffer, Uint8Array, Uint16Array };
 const namespaces = { Math, Reflect };
 const explicit = { SafeMap, ReflectApply };
 const symbolWells = { SymbolIterator, SymbolToStringTag };
-const cache = new Map();
-function derive(name) { return undefined; }
-const primordials = new Proxy(Object.create(null), {
-  get(_target, name) { return derive(name); },
-});
+function __otterPrimordialBuild(primordials) {}
+const primordials = { __proto__: null };
+__otterPrimordialBuild(primordials);
 module.exports = { primordials };
 "#;
 
@@ -274,7 +272,7 @@ fn generated_helpers_preserve_symbol_fallback_and_apply_receiver_abi() {
             .count();
         assert_eq!(
             functions, 7,
-            "one dispatcher and six shared helpers, no per-case factories"
+            "one build and six shared helpers, no per-case factories"
         );
         Ok(())
     })
@@ -393,9 +391,9 @@ fn emitted_static_lookup_stops_on_undefined_and_has_no_generic_decoder() {
         Ok(())
     })
     .expect("output AST");
-    assert_eq!(
-        shape.guard_authorities,
-        ["explicit", "symbolWells", "constructors", "namespaces"]
+    assert!(
+        shape.guard_authorities.is_empty(),
+        "holder priority is chosen by the producer, not guarded at run time"
     );
     assert_eq!(
         shape.static_calls,
@@ -445,6 +443,21 @@ fn emitted_static_lookup_stops_on_undefined_and_has_no_generic_decoder() {
     assert_eq!(shape.apply_arities, BTreeSet::from([3]));
     assert_eq!(shape.regex_count, 0);
     assert_eq!(shape.entries_count, 0);
+}
+
+#[test]
+fn holder_table_names_read_the_first_holding_table() {
+    let facts = facts();
+    assert_eq!(facts.holder_of("ReflectApply"), Some("explicit"));
+    assert_eq!(facts.holder_of("SymbolIterator"), Some("symbolWells"));
+    assert_eq!(facts.holder_of("Uint8Array"), Some("constructors"));
+    assert_eq!(facts.holder_of("Math"), Some("namespaces"));
+    assert_eq!(facts.holder_of("ArrayIsArray"), None);
+    let output = emit::rewrite(BOOTSTRAP, &[facts.case("ReflectApply")]).expect("emission");
+    assert!(output.contains(
+        r#"value=explicit["ReflectApply"]; if(value!==undefined)primordials["ReflectApply"]=value;"#
+    ));
+    assert!(!output.contains("namespaces[\"Reflect\"]"));
 }
 
 #[test]
@@ -502,7 +515,7 @@ fn current_dispatch_regenerates_and_rejects_private_token_or_helper_escape() {
             .split("const __otterPrimordialMissing")
             .next()
             .unwrap(),
-        BOOTSTRAP.split("function derive").next().unwrap(),
+        BOOTSTRAP.split("function __otterPrimordialBuild").next().unwrap(),
         "every byte before the AST-owned group is preserved"
     );
     assert!(output.ends_with(BOOTSTRAP.split("const primordials").last().unwrap()));
@@ -531,9 +544,9 @@ fn producer_manifest_has_exact_macro_sources_and_deterministic_owned_catalog() {
     let temp = tempfile::tempdir().expect("fixture directory");
     let node = temp.path().join("crates/otter-node/src");
     std::fs::create_dir_all(node.join("nodelib/compat")).expect("fixture source tree");
-    let declarations = "nodelib_module!(bootstrap, \"realm\", compat \"nodelib/compat/bootstrap_realm.js\"); nodelib_module!(consumer, \"actual\", vendored \"nodelib/consumer.js\");";
+    let declarations = "builtin_table! { installer bootstrap \"realm\" plain \"nodelib/compat/bootstrap_realm.js\"; installer consumer \"actual\" vendored \"nodelib/consumer.js\"; installer own \"own\" plain \"own.js\"; }";
     let consumer = "const {ArrayIsArray} = primordials; return primordials.MathMax;";
-    std::fs::write(node.join("nodelib.rs"), declarations).expect("declarations");
+    std::fs::write(node.join("builtin_table.rs"), declarations).expect("declarations");
     let bootstrap = node.join("nodelib/compat/bootstrap_realm.js");
     std::fs::write(&bootstrap, BOOTSTRAP).expect("bootstrap");
     std::fs::write(node.join("nodelib/consumer.js"), consumer).expect("consumer");
@@ -548,7 +561,7 @@ fn producer_manifest_has_exact_macro_sources_and_deterministic_owned_catalog() {
         repeat.manifest_text().unwrap()
     );
     assert_eq!(
-        generated.manifest["sourceSha256"]["../nodelib.rs"],
+        generated.manifest["sourceSha256"]["../builtin_table.rs"],
         digest(declarations)
     );
     assert_eq!(
@@ -573,8 +586,8 @@ fn producer_manifest_has_exact_macro_sources_and_deterministic_owned_catalog() {
     assert_eq!(owner, declarations);
     assert_eq!(paths.len(), 2);
     std::fs::write(
-        node.join("nodelib.rs"),
-        "nodelib_module!(bad, \"bad\", vendored \"../outside.js\");",
+        node.join("builtin_table.rs"),
+        "builtin_table! { installer bad \"bad\" vendored \"../outside.js\"; }",
     )
     .expect("escaping declaration");
     collect::source_paths(temp.path()).expect_err("source owner path escape");
@@ -603,12 +616,12 @@ fn actual_registered_sources_are_a_closed_reproducible_ast_catalog() {
     assert_eq!(
         &current[..before_start],
         &generated.source[..after_start],
-        "captured intrinsics/Safe tables/cache prefix unchanged"
+        "captured intrinsics/Safe tables prefix unchanged"
     );
     assert_eq!(
         &current[before_end..],
         &generated.source[after_end..],
-        "Proxy/cache/bindings/export suffix unchanged"
+        "primordials/bindings/export suffix unchanged"
     );
     assert_eq!(
         generated.manifest["dynamicReads"].as_array().unwrap().len(),
@@ -633,7 +646,7 @@ fn dispatch_span(source: &str) -> (usize, usize) {
         for statement in &program.body {
             match statement {
                 Statement::FunctionDeclaration(function)
-                    if function.id.as_ref().is_some_and(|id| id.name == "derive" || id.name.starts_with("__otterPrimordial")) => spans.push(function.span),
+                    if function.id.as_ref().is_some_and(|id| id.name.starts_with("__otterPrimordial")) => spans.push(function.span),
                 Statement::VariableDeclaration(declaration)
                     if declaration.declarations.iter().any(|binding| matches!(&binding.id, BindingPattern::BindingIdentifier(id) if id.name == "__otterPrimordialMissing")) => spans.push(statement.span()),
                 _ => {}

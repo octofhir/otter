@@ -6,9 +6,10 @@
 //! - Static lookup recipes emitted into the current compat bootstrap.
 //!
 //! # Invariants
-//! The producer never executes JavaScript. Only the existing lazy Map/Proxy
-//! owns runtime values. Unknown names return undefined; there is no generic
-//! name decoder, runtime recipe registry or fallback format.
+//! The producer never executes JavaScript. The bootstrap owns runtime values:
+//! it derives the emitted catalog once into a plain `primordials` object.
+//! Unknown names read undefined; there is no generic name decoder, runtime
+//! recipe registry or fallback format.
 //!
 //! # See also
 //! - `collect` validates ambient bindings and the sole dynamic read proof.
@@ -97,7 +98,7 @@ pub(super) fn generate(repo: &Path, bootstrap: &Path) -> Result<Generated> {
     let mut coverage = Coverage::default();
     coverage
         .sources
-        .insert("../nodelib.rs".to_owned(), digest(&owner));
+        .insert("../builtin_table.rs".to_owned(), digest(&owner));
     for path in paths {
         let relative = path
             .strip_prefix(&base)?

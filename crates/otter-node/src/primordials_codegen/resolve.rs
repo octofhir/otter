@@ -23,6 +23,8 @@ use super::{Result, reject};
 pub(super) struct Facts {
     pub(super) constructors: Vec<String>,
     pub(super) namespaces: Vec<String>,
+    explicit: Vec<String>,
+    symbol_wells: Vec<String>,
     special: Vec<String>,
 }
 
@@ -92,14 +94,14 @@ impl Facts {
         let namespaces = objects
             .remove("namespaces")
             .ok_or("missing namespace authority")?;
-        let mut special = objects
+        let explicit = objects
             .remove("explicit")
             .ok_or("missing explicit authority")?;
-        special.extend(
-            objects
-                .remove("symbolWells")
-                .ok_or("missing symbol authority")?,
-        );
+        let symbol_wells = objects
+            .remove("symbolWells")
+            .ok_or("missing symbol authority")?;
+        let mut special = explicit.clone();
+        special.extend(symbol_wells.iter().cloned());
         special.extend(constructors.iter().cloned());
         special.extend(namespaces.iter().cloned());
         special.sort();
@@ -107,12 +109,29 @@ impl Facts {
         Ok(Self {
             constructors,
             namespaces,
+            explicit,
+            symbol_wells,
             special,
         })
     }
 
     pub(super) fn special_names(&self) -> Vec<String> {
         self.special.clone()
+    }
+
+    /// The holder table a name is read from: the first, in `explicit`,
+    /// `symbolWells`, `constructors`, `namespaces` order, whose static keys
+    /// hold it.
+    pub(super) fn holder_of(&self, name: &str) -> Option<&'static str> {
+        [
+            ("explicit", &self.explicit),
+            ("symbolWells", &self.symbol_wells),
+            ("constructors", &self.constructors),
+            ("namespaces", &self.namespaces),
+        ]
+        .into_iter()
+        .find(|(_, keys)| keys.iter().any(|key| key == name))
+        .map(|(holder, _)| holder)
     }
 
     pub(super) fn typed_arrays(&self) -> Vec<String> {

@@ -4,11 +4,12 @@
 // registry. Vendored files receive both through one injected require of this
 // module, which stands in for the parameters Node's native wrapper passes.
 //
-// `primordials` is a Proxy that derives entries from their names on first
-// use — `ArrayPrototypePush` is the uncurried `Array.prototype.push`,
-// `NumberIsNaN` is `Number.isNaN`, `SymbolAsyncIterator` is the well-known
-// symbol — with an explicit table for the names that do not follow the
-// pattern (Safe* containers, %TypedArray%, uncurryThis itself).
+// `primordials` is built once, before any vendored file runs, from the closed
+// catalog of names those files read: each entry is derived from its name —
+// `ArrayPrototypePush` is the uncurried `Array.prototype.push`, `NumberIsNaN`
+// is `Number.isNaN`, `SymbolAsyncIterator` is the well-known symbol — with an
+// explicit table for the names that do not follow the pattern (Safe*
+// containers, %TypedArray%, uncurryThis itself).
 
 const ReflectApply = Reflect.apply;
 // `uncurryThis(fn)(thisArg, ...args)` is `fn.call(thisArg, ...args)`: a
@@ -140,794 +141,822 @@ const symbolWells = {
 
 
 
-const cache = new Map();
-
 const __otterPrimordialMissing = {};
 
-function derive(name) {
-  // Generated from the current in-repo AST catalog; members remain lazy/live.
-  if (name in explicit) return explicit[name];
-  if (name in symbolWells) return symbolWells[name];
-  if (name in constructors) return constructors[name];
-  if (name in namespaces) return namespaces[name];
+function __otterPrimordialBuild(primordials) {
+  // Generated from the current in-repo AST catalog.
   let value;
-  switch (name) {
-    case "AggregateErrorPrototype":
-      value=__otterPrimordialObject(constructors["AggregateError"]); if(value!==undefined)return value;
-      value=__otterPrimordialStatic(constructors["AggregateError"],"prototype","Prototype"); if(value!==__otterPrimordialMissing)return value;
-      return undefined;
-    case "ArrayBuffer":
-      value=__otterPrimordialStatic(constructors["Array"],"buffer","Buffer"); if(value!==__otterPrimordialMissing)return value;
-      return undefined;
-    case "ArrayBufferIsView":
-      value=__otterPrimordialStatic(constructors["Array"],"bufferIsView","BufferIsView"); if(value!==__otterPrimordialMissing)return value;
-      value=__otterPrimordialStatic(constructors["ArrayBuffer"],"isView","IsView"); if(value!==__otterPrimordialMissing)return value;
-      return undefined;
-    case "ArrayBufferPrototype":
-      value=__otterPrimordialObject(constructors["ArrayBuffer"]); if(value!==undefined)return value;
-      value=__otterPrimordialStatic(constructors["Array"],"bufferPrototype","BufferPrototype"); if(value!==__otterPrimordialMissing)return value;
-      value=__otterPrimordialStatic(constructors["ArrayBuffer"],"prototype","Prototype"); if(value!==__otterPrimordialMissing)return value;
-      return undefined;
-    case "ArrayBufferPrototypeGetByteLength":
-      value=__otterPrimordialHalf(constructors["ArrayBuffer"],"byteLength",null,null,"get"); if(value!==undefined)return value;
-      value=__otterPrimordialMethod(constructors["ArrayBuffer"],"getByteLength",null,null); if(value!==undefined)return value;
-      value=__otterPrimordialStatic(constructors["Array"],"bufferPrototypeGetByteLength","BufferPrototypeGetByteLength"); if(value!==__otterPrimordialMissing)return value;
-      value=__otterPrimordialStatic(constructors["ArrayBuffer"],"prototypeGetByteLength","PrototypeGetByteLength"); if(value!==__otterPrimordialMissing)return value;
-      return undefined;
-    case "ArrayBufferPrototypeSlice":
-      value=__otterPrimordialMethod(constructors["ArrayBuffer"],"slice",null,null); if(value!==undefined)return value;
-      value=__otterPrimordialStatic(constructors["Array"],"bufferPrototypeSlice","BufferPrototypeSlice"); if(value!==__otterPrimordialMissing)return value;
-      value=__otterPrimordialStatic(constructors["ArrayBuffer"],"prototypeSlice","PrototypeSlice"); if(value!==__otterPrimordialMissing)return value;
-      return undefined;
-    case "ArrayFrom":
-      value=__otterPrimordialStatic(constructors["Array"],"from","From"); if(value!==__otterPrimordialMissing)return value;
-      return undefined;
-    case "ArrayFromAsync":
-      value=__otterPrimordialStatic(constructors["Array"],"fromAsync","FromAsync"); if(value!==__otterPrimordialMissing)return value;
-      return undefined;
-    case "ArrayIsArray":
-      value=__otterPrimordialStatic(constructors["Array"],"isArray","IsArray"); if(value!==__otterPrimordialMissing)return value;
-      return undefined;
-    case "ArrayPrototype":
-      value=__otterPrimordialObject(constructors["Array"]); if(value!==undefined)return value;
-      value=__otterPrimordialStatic(constructors["Array"],"prototype","Prototype"); if(value!==__otterPrimordialMissing)return value;
-      return undefined;
-    case "ArrayPrototypeAt":
-      value=__otterPrimordialMethod(constructors["Array"],"at",null,null); if(value!==undefined)return value;
-      value=__otterPrimordialStatic(constructors["Array"],"prototypeAt","PrototypeAt"); if(value!==__otterPrimordialMissing)return value;
-      return undefined;
-    case "ArrayPrototypeEvery":
-      value=__otterPrimordialMethod(constructors["Array"],"every",null,null); if(value!==undefined)return value;
-      value=__otterPrimordialStatic(constructors["Array"],"prototypeEvery","PrototypeEvery"); if(value!==__otterPrimordialMissing)return value;
-      return undefined;
-    case "ArrayPrototypeFill":
-      value=__otterPrimordialMethod(constructors["Array"],"fill",null,null); if(value!==undefined)return value;
-      value=__otterPrimordialStatic(constructors["Array"],"prototypeFill","PrototypeFill"); if(value!==__otterPrimordialMissing)return value;
-      return undefined;
-    case "ArrayPrototypeFilter":
-      value=__otterPrimordialMethod(constructors["Array"],"filter",null,null); if(value!==undefined)return value;
-      value=__otterPrimordialStatic(constructors["Array"],"prototypeFilter","PrototypeFilter"); if(value!==__otterPrimordialMissing)return value;
-      return undefined;
-    case "ArrayPrototypeFind":
-      value=__otterPrimordialMethod(constructors["Array"],"find",null,null); if(value!==undefined)return value;
-      value=__otterPrimordialStatic(constructors["Array"],"prototypeFind","PrototypeFind"); if(value!==__otterPrimordialMissing)return value;
-      return undefined;
-    case "ArrayPrototypeFlatMap":
-      value=__otterPrimordialMethod(constructors["Array"],"flatMap",null,null); if(value!==undefined)return value;
-      value=__otterPrimordialStatic(constructors["Array"],"prototypeFlatMap","PrototypeFlatMap"); if(value!==__otterPrimordialMissing)return value;
-      return undefined;
-    case "ArrayPrototypeForEach":
-      value=__otterPrimordialMethod(constructors["Array"],"forEach",null,null); if(value!==undefined)return value;
-      value=__otterPrimordialStatic(constructors["Array"],"prototypeForEach","PrototypeForEach"); if(value!==__otterPrimordialMissing)return value;
-      return undefined;
-    case "ArrayPrototypeIncludes":
-      value=__otterPrimordialMethod(constructors["Array"],"includes",null,null); if(value!==undefined)return value;
-      value=__otterPrimordialStatic(constructors["Array"],"prototypeIncludes","PrototypeIncludes"); if(value!==__otterPrimordialMissing)return value;
-      return undefined;
-    case "ArrayPrototypeIndexOf":
-      value=__otterPrimordialMethod(constructors["Array"],"indexOf",null,null); if(value!==undefined)return value;
-      value=__otterPrimordialStatic(constructors["Array"],"prototypeIndexOf","PrototypeIndexOf"); if(value!==__otterPrimordialMissing)return value;
-      return undefined;
-    case "ArrayPrototypeJoin":
-      value=__otterPrimordialMethod(constructors["Array"],"join",null,null); if(value!==undefined)return value;
-      value=__otterPrimordialStatic(constructors["Array"],"prototypeJoin","PrototypeJoin"); if(value!==__otterPrimordialMissing)return value;
-      return undefined;
-    case "ArrayPrototypeMap":
-      value=__otterPrimordialMethod(constructors["Array"],"map",null,null); if(value!==undefined)return value;
-      value=__otterPrimordialStatic(constructors["Array"],"prototypeMap","PrototypeMap"); if(value!==__otterPrimordialMissing)return value;
-      return undefined;
-    case "ArrayPrototypePop":
-      value=__otterPrimordialMethod(constructors["Array"],"pop",null,null); if(value!==undefined)return value;
-      value=__otterPrimordialStatic(constructors["Array"],"prototypePop","PrototypePop"); if(value!==__otterPrimordialMissing)return value;
-      return undefined;
-    case "ArrayPrototypePush":
-      value=__otterPrimordialMethod(constructors["Array"],"push",null,null); if(value!==undefined)return value;
-      value=__otterPrimordialStatic(constructors["Array"],"prototypePush","PrototypePush"); if(value!==__otterPrimordialMissing)return value;
-      return undefined;
-    case "ArrayPrototypePushApply":
-      value=__otterPrimordialApply(constructors["Array"],"push"); if(value!==undefined)return value;
-      value=__otterPrimordialStaticApply(constructors["Array"],"prototypePush","PrototypePush"); if(value!==undefined)return value;
-      value=__otterPrimordialMethod(constructors["Array"],"pushApply",null,null); if(value!==undefined)return value;
-      value=__otterPrimordialStatic(constructors["Array"],"prototypePushApply","PrototypePushApply"); if(value!==__otterPrimordialMissing)return value;
-      return undefined;
-    case "ArrayPrototypeReduce":
-      value=__otterPrimordialMethod(constructors["Array"],"reduce",null,null); if(value!==undefined)return value;
-      value=__otterPrimordialStatic(constructors["Array"],"prototypeReduce","PrototypeReduce"); if(value!==__otterPrimordialMissing)return value;
-      return undefined;
-    case "ArrayPrototypeReverse":
-      value=__otterPrimordialMethod(constructors["Array"],"reverse",null,null); if(value!==undefined)return value;
-      value=__otterPrimordialStatic(constructors["Array"],"prototypeReverse","PrototypeReverse"); if(value!==__otterPrimordialMissing)return value;
-      return undefined;
-    case "ArrayPrototypeShift":
-      value=__otterPrimordialMethod(constructors["Array"],"shift",null,null); if(value!==undefined)return value;
-      value=__otterPrimordialStatic(constructors["Array"],"prototypeShift","PrototypeShift"); if(value!==__otterPrimordialMissing)return value;
-      return undefined;
-    case "ArrayPrototypeSlice":
-      value=__otterPrimordialMethod(constructors["Array"],"slice",null,null); if(value!==undefined)return value;
-      value=__otterPrimordialStatic(constructors["Array"],"prototypeSlice","PrototypeSlice"); if(value!==__otterPrimordialMissing)return value;
-      return undefined;
-    case "ArrayPrototypeSome":
-      value=__otterPrimordialMethod(constructors["Array"],"some",null,null); if(value!==undefined)return value;
-      value=__otterPrimordialStatic(constructors["Array"],"prototypeSome","PrototypeSome"); if(value!==__otterPrimordialMissing)return value;
-      return undefined;
-    case "ArrayPrototypeSort":
-      value=__otterPrimordialMethod(constructors["Array"],"sort",null,null); if(value!==undefined)return value;
-      value=__otterPrimordialStatic(constructors["Array"],"prototypeSort","PrototypeSort"); if(value!==__otterPrimordialMissing)return value;
-      return undefined;
-    case "ArrayPrototypeSplice":
-      value=__otterPrimordialMethod(constructors["Array"],"splice",null,null); if(value!==undefined)return value;
-      value=__otterPrimordialStatic(constructors["Array"],"prototypeSplice","PrototypeSplice"); if(value!==__otterPrimordialMissing)return value;
-      return undefined;
-    case "ArrayPrototypeToSorted":
-      value=__otterPrimordialMethod(constructors["Array"],"toSorted",null,null); if(value!==undefined)return value;
-      value=__otterPrimordialStatic(constructors["Array"],"prototypeToSorted","PrototypeToSorted"); if(value!==__otterPrimordialMissing)return value;
-      return undefined;
-    case "ArrayPrototypeUnshift":
-      value=__otterPrimordialMethod(constructors["Array"],"unshift",null,null); if(value!==undefined)return value;
-      value=__otterPrimordialStatic(constructors["Array"],"prototypeUnshift","PrototypeUnshift"); if(value!==__otterPrimordialMissing)return value;
-      return undefined;
-    case "ArrayPrototypeUnshiftApply":
-      value=__otterPrimordialApply(constructors["Array"],"unshift"); if(value!==undefined)return value;
-      value=__otterPrimordialStaticApply(constructors["Array"],"prototypeUnshift","PrototypeUnshift"); if(value!==undefined)return value;
-      value=__otterPrimordialMethod(constructors["Array"],"unshiftApply",null,null); if(value!==undefined)return value;
-      value=__otterPrimordialStatic(constructors["Array"],"prototypeUnshiftApply","PrototypeUnshiftApply"); if(value!==__otterPrimordialMissing)return value;
-      return undefined;
-    case "AsyncIteratorPrototype":
-      value=__otterPrimordialObject(constructors["AsyncIterator"]); if(value!==undefined)return value;
-      return undefined;
-    case "BigIntPrototypeToString":
-      value=__otterPrimordialMethod(constructors["BigInt"],"toString",null,null); if(value!==undefined)return value;
-      value=__otterPrimordialStatic(constructors["BigInt"],"prototypeToString","PrototypeToString"); if(value!==__otterPrimordialMissing)return value;
-      return undefined;
-    case "BigIntPrototypeValueOf":
-      value=__otterPrimordialMethod(constructors["BigInt"],"valueOf",null,null); if(value!==undefined)return value;
-      value=__otterPrimordialStatic(constructors["BigInt"],"prototypeValueOf","PrototypeValueOf"); if(value!==__otterPrimordialMissing)return value;
-      return undefined;
-    case "BooleanPrototype":
-      value=__otterPrimordialObject(constructors["Boolean"]); if(value!==undefined)return value;
-      value=__otterPrimordialStatic(constructors["Boolean"],"prototype","Prototype"); if(value!==__otterPrimordialMissing)return value;
-      return undefined;
-    case "BooleanPrototypeValueOf":
-      value=__otterPrimordialMethod(constructors["Boolean"],"valueOf",null,null); if(value!==undefined)return value;
-      value=__otterPrimordialStatic(constructors["Boolean"],"prototypeValueOf","PrototypeValueOf"); if(value!==__otterPrimordialMissing)return value;
-      return undefined;
-    case "DataViewPrototype":
-      value=__otterPrimordialObject(constructors["DataView"]); if(value!==undefined)return value;
-      value=__otterPrimordialStatic(constructors["DataView"],"prototype","Prototype"); if(value!==__otterPrimordialMissing)return value;
-      return undefined;
-    case "DataViewPrototypeGetBuffer":
-      value=__otterPrimordialHalf(constructors["DataView"],"buffer",null,null,"get"); if(value!==undefined)return value;
-      value=__otterPrimordialMethod(constructors["DataView"],"getBuffer",null,null); if(value!==undefined)return value;
-      value=__otterPrimordialStatic(constructors["DataView"],"prototypeGetBuffer","PrototypeGetBuffer"); if(value!==__otterPrimordialMissing)return value;
-      return undefined;
-    case "DataViewPrototypeGetByteLength":
-      value=__otterPrimordialHalf(constructors["DataView"],"byteLength",null,null,"get"); if(value!==undefined)return value;
-      value=__otterPrimordialMethod(constructors["DataView"],"getByteLength",null,null); if(value!==undefined)return value;
-      value=__otterPrimordialStatic(constructors["DataView"],"prototypeGetByteLength","PrototypeGetByteLength"); if(value!==__otterPrimordialMissing)return value;
-      return undefined;
-    case "DataViewPrototypeGetByteOffset":
-      value=__otterPrimordialHalf(constructors["DataView"],"byteOffset",null,null,"get"); if(value!==undefined)return value;
-      value=__otterPrimordialMethod(constructors["DataView"],"getByteOffset",null,null); if(value!==undefined)return value;
-      value=__otterPrimordialStatic(constructors["DataView"],"prototypeGetByteOffset","PrototypeGetByteOffset"); if(value!==__otterPrimordialMissing)return value;
-      return undefined;
-    case "DateNow":
-      value=__otterPrimordialStatic(constructors["Date"],"now","Now"); if(value!==__otterPrimordialMissing)return value;
-      return undefined;
-    case "DatePrototype":
-      value=__otterPrimordialObject(constructors["Date"]); if(value!==undefined)return value;
-      value=__otterPrimordialStatic(constructors["Date"],"prototype","Prototype"); if(value!==__otterPrimordialMissing)return value;
-      return undefined;
-    case "DatePrototypeGetDate":
-      value=__otterPrimordialHalf(constructors["Date"],"date",null,null,"get"); if(value!==undefined)return value;
-      value=__otterPrimordialMethod(constructors["Date"],"getDate",null,null); if(value!==undefined)return value;
-      value=__otterPrimordialStatic(constructors["Date"],"prototypeGetDate","PrototypeGetDate"); if(value!==__otterPrimordialMissing)return value;
-      return undefined;
-    case "DatePrototypeGetFullYear":
-      value=__otterPrimordialHalf(constructors["Date"],"fullYear",null,null,"get"); if(value!==undefined)return value;
-      value=__otterPrimordialMethod(constructors["Date"],"getFullYear",null,null); if(value!==undefined)return value;
-      value=__otterPrimordialStatic(constructors["Date"],"prototypeGetFullYear","PrototypeGetFullYear"); if(value!==__otterPrimordialMissing)return value;
-      return undefined;
-    case "DatePrototypeGetHours":
-      value=__otterPrimordialHalf(constructors["Date"],"hours",null,null,"get"); if(value!==undefined)return value;
-      value=__otterPrimordialMethod(constructors["Date"],"getHours",null,null); if(value!==undefined)return value;
-      value=__otterPrimordialStatic(constructors["Date"],"prototypeGetHours","PrototypeGetHours"); if(value!==__otterPrimordialMissing)return value;
-      return undefined;
-    case "DatePrototypeGetMinutes":
-      value=__otterPrimordialHalf(constructors["Date"],"minutes",null,null,"get"); if(value!==undefined)return value;
-      value=__otterPrimordialMethod(constructors["Date"],"getMinutes",null,null); if(value!==undefined)return value;
-      value=__otterPrimordialStatic(constructors["Date"],"prototypeGetMinutes","PrototypeGetMinutes"); if(value!==__otterPrimordialMissing)return value;
-      return undefined;
-    case "DatePrototypeGetMonth":
-      value=__otterPrimordialHalf(constructors["Date"],"month",null,null,"get"); if(value!==undefined)return value;
-      value=__otterPrimordialMethod(constructors["Date"],"getMonth",null,null); if(value!==undefined)return value;
-      value=__otterPrimordialStatic(constructors["Date"],"prototypeGetMonth","PrototypeGetMonth"); if(value!==__otterPrimordialMissing)return value;
-      return undefined;
-    case "DatePrototypeGetSeconds":
-      value=__otterPrimordialHalf(constructors["Date"],"seconds",null,null,"get"); if(value!==undefined)return value;
-      value=__otterPrimordialMethod(constructors["Date"],"getSeconds",null,null); if(value!==undefined)return value;
-      value=__otterPrimordialStatic(constructors["Date"],"prototypeGetSeconds","PrototypeGetSeconds"); if(value!==__otterPrimordialMissing)return value;
-      return undefined;
-    case "DatePrototypeGetTime":
-      value=__otterPrimordialHalf(constructors["Date"],"time",null,null,"get"); if(value!==undefined)return value;
-      value=__otterPrimordialMethod(constructors["Date"],"getTime",null,null); if(value!==undefined)return value;
-      value=__otterPrimordialStatic(constructors["Date"],"prototypeGetTime","PrototypeGetTime"); if(value!==__otterPrimordialMissing)return value;
-      return undefined;
-    case "DatePrototypeToISOString":
-      value=__otterPrimordialMethod(constructors["Date"],"toISOString",null,null); if(value!==undefined)return value;
-      value=__otterPrimordialStatic(constructors["Date"],"prototypeToISOString","PrototypeToISOString"); if(value!==__otterPrimordialMissing)return value;
-      return undefined;
-    case "DatePrototypeToLocaleString":
-      value=__otterPrimordialMethod(constructors["Date"],"toLocaleString",null,null); if(value!==undefined)return value;
-      value=__otterPrimordialStatic(constructors["Date"],"prototypeToLocaleString","PrototypeToLocaleString"); if(value!==__otterPrimordialMissing)return value;
-      return undefined;
-    case "DatePrototypeToString":
-      value=__otterPrimordialMethod(constructors["Date"],"toString",null,null); if(value!==undefined)return value;
-      value=__otterPrimordialStatic(constructors["Date"],"prototypeToString","PrototypeToString"); if(value!==__otterPrimordialMissing)return value;
-      return undefined;
-    case "ErrorCaptureStackTrace":
-      value=__otterPrimordialStatic(constructors["Error"],"captureStackTrace","CaptureStackTrace"); if(value!==__otterPrimordialMissing)return value;
-      return undefined;
-    case "ErrorPrototype":
-      value=__otterPrimordialObject(constructors["Error"]); if(value!==undefined)return value;
-      value=__otterPrimordialStatic(constructors["Error"],"prototype","Prototype"); if(value!==__otterPrimordialMissing)return value;
-      return undefined;
-    case "ErrorPrototypeToString":
-      value=__otterPrimordialMethod(constructors["Error"],"toString",null,null); if(value!==undefined)return value;
-      value=__otterPrimordialStatic(constructors["Error"],"prototypeToString","PrototypeToString"); if(value!==__otterPrimordialMissing)return value;
-      return undefined;
-    case "FunctionPrototype":
-      value=__otterPrimordialObject(constructors["Function"]); if(value!==undefined)return value;
-      value=__otterPrimordialStatic(constructors["Function"],"prototype","Prototype"); if(value!==__otterPrimordialMissing)return value;
-      return undefined;
-    case "FunctionPrototypeBind":
-      value=__otterPrimordialMethod(constructors["Function"],"bind",null,null); if(value!==undefined)return value;
-      value=__otterPrimordialStatic(constructors["Function"],"prototypeBind","PrototypeBind"); if(value!==__otterPrimordialMissing)return value;
-      return undefined;
-    case "FunctionPrototypeCall":
-      value=__otterPrimordialMethod(constructors["Function"],"call",null,null); if(value!==undefined)return value;
-      value=__otterPrimordialStatic(constructors["Function"],"prototypeCall","PrototypeCall"); if(value!==__otterPrimordialMissing)return value;
-      return undefined;
-    case "FunctionPrototypeSymbolHasInstance":
-      value=__otterPrimordialMethod(constructors["Function"],"symbolHasInstance","SymbolHasInstance","hasInstance"); if(value!==undefined)return value;
-      value=__otterPrimordialStatic(constructors["Function"],"prototypeSymbolHasInstance","PrototypeSymbolHasInstance"); if(value!==__otterPrimordialMissing)return value;
-      return undefined;
-    case "FunctionPrototypeToString":
-      value=__otterPrimordialMethod(constructors["Function"],"toString",null,null); if(value!==undefined)return value;
-      value=__otterPrimordialStatic(constructors["Function"],"prototypeToString","PrototypeToString"); if(value!==__otterPrimordialMissing)return value;
-      return undefined;
-    case "IteratorPrototype":
-      value=__otterPrimordialObject(constructors["Iterator"]); if(value!==undefined)return value;
-      return undefined;
-    case "JSONParse":
-      value=__otterPrimordialStatic(namespaces["JSON"],"parse","Parse"); if(value!==__otterPrimordialMissing)return value;
-      return undefined;
-    case "JSONStringify":
-      value=__otterPrimordialStatic(namespaces["JSON"],"stringify","Stringify"); if(value!==__otterPrimordialMissing)return value;
-      return undefined;
-    case "MapPrototype":
-      value=__otterPrimordialObject(constructors["Map"]); if(value!==undefined)return value;
-      value=__otterPrimordialStatic(constructors["Map"],"prototype","Prototype"); if(value!==__otterPrimordialMissing)return value;
-      return undefined;
-    case "MapPrototypeEntries":
-      value=__otterPrimordialMethod(constructors["Map"],"entries",null,null); if(value!==undefined)return value;
-      value=__otterPrimordialStatic(constructors["Map"],"prototypeEntries","PrototypeEntries"); if(value!==__otterPrimordialMissing)return value;
-      return undefined;
-    case "MapPrototypeGet":
-      value=__otterPrimordialMethod(constructors["Map"],"get",null,null); if(value!==undefined)return value;
-      value=__otterPrimordialStatic(constructors["Map"],"prototypeGet","PrototypeGet"); if(value!==__otterPrimordialMissing)return value;
-      return undefined;
-    case "MapPrototypeGetSize":
-      value=__otterPrimordialHalf(constructors["Map"],"size",null,null,"get"); if(value!==undefined)return value;
-      value=__otterPrimordialMethod(constructors["Map"],"getSize",null,null); if(value!==undefined)return value;
-      value=__otterPrimordialStatic(constructors["Map"],"prototypeGetSize","PrototypeGetSize"); if(value!==__otterPrimordialMissing)return value;
-      return undefined;
-    case "MapPrototypeValues":
-      value=__otterPrimordialMethod(constructors["Map"],"values",null,null); if(value!==undefined)return value;
-      value=__otterPrimordialStatic(constructors["Map"],"prototypeValues","PrototypeValues"); if(value!==__otterPrimordialMissing)return value;
-      return undefined;
-    case "MathAbs":
-      value=__otterPrimordialStatic(namespaces["Math"],"abs","Abs"); if(value!==__otterPrimordialMissing)return value;
-      return undefined;
-    case "MathCeil":
-      value=__otterPrimordialStatic(namespaces["Math"],"ceil","Ceil"); if(value!==__otterPrimordialMissing)return value;
-      return undefined;
-    case "MathFloor":
-      value=__otterPrimordialStatic(namespaces["Math"],"floor","Floor"); if(value!==__otterPrimordialMissing)return value;
-      return undefined;
-    case "MathImul":
-      value=__otterPrimordialStatic(namespaces["Math"],"imul","Imul"); if(value!==__otterPrimordialMissing)return value;
-      return undefined;
-    case "MathMax":
-      value=__otterPrimordialStatic(namespaces["Math"],"max","Max"); if(value!==__otterPrimordialMissing)return value;
-      return undefined;
-    case "MathMaxApply":
-      value=__otterPrimordialStaticApply(namespaces["Math"],"max","Max"); if(value!==undefined)return value;
-      value=__otterPrimordialStatic(namespaces["Math"],"maxApply","MaxApply"); if(value!==__otterPrimordialMissing)return value;
-      return undefined;
-    case "MathMin":
-      value=__otterPrimordialStatic(namespaces["Math"],"min","Min"); if(value!==__otterPrimordialMissing)return value;
-      return undefined;
-    case "MathRandom":
-      value=__otterPrimordialStatic(namespaces["Math"],"random","Random"); if(value!==__otterPrimordialMissing)return value;
-      return undefined;
-    case "MathRound":
-      value=__otterPrimordialStatic(namespaces["Math"],"round","Round"); if(value!==__otterPrimordialMissing)return value;
-      return undefined;
-    case "MathSqrt":
-      value=__otterPrimordialStatic(namespaces["Math"],"sqrt","Sqrt"); if(value!==__otterPrimordialMissing)return value;
-      return undefined;
-    case "MathTrunc":
-      value=__otterPrimordialStatic(namespaces["Math"],"trunc","Trunc"); if(value!==__otterPrimordialMissing)return value;
-      return undefined;
-    case "NumberIsFinite":
-      value=__otterPrimordialStatic(constructors["Number"],"isFinite","IsFinite"); if(value!==__otterPrimordialMissing)return value;
-      return undefined;
-    case "NumberIsInteger":
-      value=__otterPrimordialStatic(constructors["Number"],"isInteger","IsInteger"); if(value!==__otterPrimordialMissing)return value;
-      return undefined;
-    case "NumberIsNaN":
-      value=__otterPrimordialStatic(constructors["Number"],"isNaN","IsNaN"); if(value!==__otterPrimordialMissing)return value;
-      return undefined;
-    case "NumberIsSafeInteger":
-      value=__otterPrimordialStatic(constructors["Number"],"isSafeInteger","IsSafeInteger"); if(value!==__otterPrimordialMissing)return value;
-      return undefined;
-    case "NumberMAX_SAFE_INTEGER":
-      value=__otterPrimordialStatic(constructors["Number"],"MAX_SAFE_INTEGER",null); if(value!==__otterPrimordialMissing)return value;
-      return undefined;
-    case "NumberMIN_SAFE_INTEGER":
-      value=__otterPrimordialStatic(constructors["Number"],"MIN_SAFE_INTEGER",null); if(value!==__otterPrimordialMissing)return value;
-      return undefined;
-    case "NumberParseFloat":
-      value=__otterPrimordialStatic(constructors["Number"],"parseFloat","ParseFloat"); if(value!==__otterPrimordialMissing)return value;
-      return undefined;
-    case "NumberParseInt":
-      value=__otterPrimordialStatic(constructors["Number"],"parseInt","ParseInt"); if(value!==__otterPrimordialMissing)return value;
-      return undefined;
-    case "NumberPrototype":
-      value=__otterPrimordialObject(constructors["Number"]); if(value!==undefined)return value;
-      value=__otterPrimordialStatic(constructors["Number"],"prototype","Prototype"); if(value!==__otterPrimordialMissing)return value;
-      return undefined;
-    case "NumberPrototypeToFixed":
-      value=__otterPrimordialMethod(constructors["Number"],"toFixed",null,null); if(value!==undefined)return value;
-      value=__otterPrimordialStatic(constructors["Number"],"prototypeToFixed","PrototypeToFixed"); if(value!==__otterPrimordialMissing)return value;
-      return undefined;
-    case "NumberPrototypeToString":
-      value=__otterPrimordialMethod(constructors["Number"],"toString",null,null); if(value!==undefined)return value;
-      value=__otterPrimordialStatic(constructors["Number"],"prototypeToString","PrototypeToString"); if(value!==__otterPrimordialMissing)return value;
-      return undefined;
-    case "NumberPrototypeValueOf":
-      value=__otterPrimordialMethod(constructors["Number"],"valueOf",null,null); if(value!==undefined)return value;
-      value=__otterPrimordialStatic(constructors["Number"],"prototypeValueOf","PrototypeValueOf"); if(value!==__otterPrimordialMissing)return value;
-      return undefined;
-    case "ObjectAssign":
-      value=__otterPrimordialStatic(constructors["Object"],"assign","Assign"); if(value!==__otterPrimordialMissing)return value;
-      return undefined;
-    case "ObjectCreate":
-      value=__otterPrimordialStatic(constructors["Object"],"create","Create"); if(value!==__otterPrimordialMissing)return value;
-      return undefined;
-    case "ObjectDefineProperties":
-      value=__otterPrimordialStatic(constructors["Object"],"defineProperties","DefineProperties"); if(value!==__otterPrimordialMissing)return value;
-      return undefined;
-    case "ObjectDefineProperty":
-      value=__otterPrimordialStatic(constructors["Object"],"defineProperty","DefineProperty"); if(value!==__otterPrimordialMissing)return value;
-      return undefined;
-    case "ObjectEntries":
-      value=__otterPrimordialStatic(constructors["Object"],"entries","Entries"); if(value!==__otterPrimordialMissing)return value;
-      return undefined;
-    case "ObjectFreeze":
-      value=__otterPrimordialStatic(constructors["Object"],"freeze","Freeze"); if(value!==__otterPrimordialMissing)return value;
-      return undefined;
-    case "ObjectGetOwnPropertyDescriptor":
-      value=__otterPrimordialStatic(constructors["Object"],"getOwnPropertyDescriptor","GetOwnPropertyDescriptor"); if(value!==__otterPrimordialMissing)return value;
-      return undefined;
-    case "ObjectGetOwnPropertyDescriptors":
-      value=__otterPrimordialStatic(constructors["Object"],"getOwnPropertyDescriptors","GetOwnPropertyDescriptors"); if(value!==__otterPrimordialMissing)return value;
-      return undefined;
-    case "ObjectGetOwnPropertyNames":
-      value=__otterPrimordialStatic(constructors["Object"],"getOwnPropertyNames","GetOwnPropertyNames"); if(value!==__otterPrimordialMissing)return value;
-      return undefined;
-    case "ObjectGetOwnPropertySymbols":
-      value=__otterPrimordialStatic(constructors["Object"],"getOwnPropertySymbols","GetOwnPropertySymbols"); if(value!==__otterPrimordialMissing)return value;
-      return undefined;
-    case "ObjectGetPrototypeOf":
-      value=__otterPrimordialMethod(constructors["ObjectGet"],"of",null,null); if(value!==undefined)return value;
-      value=__otterPrimordialStatic(constructors["Object"],"getPrototypeOf","GetPrototypeOf"); if(value!==__otterPrimordialMissing)return value;
-      return undefined;
-    case "ObjectHasOwn":
-      value=__otterPrimordialStatic(constructors["Object"],"hasOwn","HasOwn"); if(value!==__otterPrimordialMissing)return value;
-      return undefined;
-    case "ObjectIs":
-      value=__otterPrimordialStatic(constructors["Object"],"is","Is"); if(value!==__otterPrimordialMissing)return value;
-      return undefined;
-    case "ObjectIsExtensible":
-      value=__otterPrimordialStatic(constructors["Object"],"isExtensible","IsExtensible"); if(value!==__otterPrimordialMissing)return value;
-      return undefined;
-    case "ObjectKeys":
-      value=__otterPrimordialStatic(constructors["Object"],"keys","Keys"); if(value!==__otterPrimordialMissing)return value;
-      return undefined;
-    case "ObjectPrototype":
-      value=__otterPrimordialObject(constructors["Object"]); if(value!==undefined)return value;
-      value=__otterPrimordialStatic(constructors["Object"],"prototype","Prototype"); if(value!==__otterPrimordialMissing)return value;
-      return undefined;
-    case "ObjectPrototypeHasOwnProperty":
-      value=__otterPrimordialMethod(constructors["Object"],"hasOwnProperty",null,null); if(value!==undefined)return value;
-      value=__otterPrimordialStatic(constructors["Object"],"prototypeHasOwnProperty","PrototypeHasOwnProperty"); if(value!==__otterPrimordialMissing)return value;
-      return undefined;
-    case "ObjectPrototypeIsPrototypeOf":
-      value=__otterPrimordialMethod(constructors["Object"],"isPrototypeOf",null,null); if(value!==undefined)return value;
-      value=__otterPrimordialStatic(constructors["Object"],"prototypeIsPrototypeOf","PrototypeIsPrototypeOf"); if(value!==__otterPrimordialMissing)return value;
-      return undefined;
-    case "ObjectPrototypePropertyIsEnumerable":
-      value=__otterPrimordialMethod(constructors["Object"],"propertyIsEnumerable",null,null); if(value!==undefined)return value;
-      value=__otterPrimordialStatic(constructors["Object"],"prototypePropertyIsEnumerable","PrototypePropertyIsEnumerable"); if(value!==__otterPrimordialMissing)return value;
-      return undefined;
-    case "ObjectPrototypeToString":
-      value=__otterPrimordialMethod(constructors["Object"],"toString",null,null); if(value!==undefined)return value;
-      value=__otterPrimordialStatic(constructors["Object"],"prototypeToString","PrototypeToString"); if(value!==__otterPrimordialMissing)return value;
-      return undefined;
-    case "ObjectSeal":
-      value=__otterPrimordialStatic(constructors["Object"],"seal","Seal"); if(value!==__otterPrimordialMissing)return value;
-      return undefined;
-    case "ObjectSetPrototypeOf":
-      value=__otterPrimordialMethod(constructors["ObjectSet"],"of",null,null); if(value!==undefined)return value;
-      value=__otterPrimordialStatic(constructors["Object"],"setPrototypeOf","SetPrototypeOf"); if(value!==__otterPrimordialMissing)return value;
-      return undefined;
-    case "ObjectValues":
-      value=__otterPrimordialStatic(constructors["Object"],"values","Values"); if(value!==__otterPrimordialMissing)return value;
-      return undefined;
-    case "PromisePrototype":
-      value=__otterPrimordialObject(constructors["Promise"]); if(value!==undefined)return value;
-      value=__otterPrimordialStatic(constructors["Promise"],"prototype","Prototype"); if(value!==__otterPrimordialMissing)return value;
-      return undefined;
-    case "PromisePrototypeCatch":
-      value=__otterPrimordialMethod(constructors["Promise"],"catch",null,null); if(value!==undefined)return value;
-      value=__otterPrimordialStatic(constructors["Promise"],"prototypeCatch","PrototypeCatch"); if(value!==__otterPrimordialMissing)return value;
-      return undefined;
-    case "PromisePrototypeThen":
-      value=__otterPrimordialMethod(constructors["Promise"],"then",null,null); if(value!==undefined)return value;
-      value=__otterPrimordialStatic(constructors["Promise"],"prototypeThen","PrototypeThen"); if(value!==__otterPrimordialMissing)return value;
-      return undefined;
-    case "PromiseReject":
-      value=__otterPrimordialStatic(constructors["Promise"],"reject","Reject"); if(value!==__otterPrimordialMissing)return value;
-      return undefined;
-    case "PromiseResolve":
-      value=__otterPrimordialStatic(constructors["Promise"],"resolve","Resolve"); if(value!==__otterPrimordialMissing)return value;
-      return undefined;
-    case "PromiseWithResolvers":
-      value=__otterPrimordialStatic(constructors["Promise"],"withResolvers","WithResolvers"); if(value!==__otterPrimordialMissing)return value;
-      return undefined;
-    case "RangeErrorPrototype":
-      value=__otterPrimordialObject(constructors["RangeError"]); if(value!==undefined)return value;
-      value=__otterPrimordialStatic(constructors["RangeError"],"prototype","Prototype"); if(value!==__otterPrimordialMissing)return value;
-      return undefined;
-    case "ReflectApply":
-      value=__otterPrimordialStatic(namespaces["Reflect"],"apply","Apply"); if(value!==__otterPrimordialMissing)return value;
-      return undefined;
-    case "ReflectConstruct":
-      value=__otterPrimordialStatic(namespaces["Reflect"],"construct","Construct"); if(value!==__otterPrimordialMissing)return value;
-      return undefined;
-    case "ReflectDefineProperty":
-      value=__otterPrimordialStatic(namespaces["Reflect"],"defineProperty","DefineProperty"); if(value!==__otterPrimordialMissing)return value;
-      return undefined;
-    case "ReflectGet":
-      value=__otterPrimordialStatic(namespaces["Reflect"],"get","Get"); if(value!==__otterPrimordialMissing)return value;
-      return undefined;
-    case "ReflectGetOwnPropertyDescriptor":
-      value=__otterPrimordialStatic(namespaces["Reflect"],"getOwnPropertyDescriptor","GetOwnPropertyDescriptor"); if(value!==__otterPrimordialMissing)return value;
-      return undefined;
-    case "ReflectOwnKeys":
-      value=__otterPrimordialStatic(namespaces["Reflect"],"ownKeys","OwnKeys"); if(value!==__otterPrimordialMissing)return value;
-      return undefined;
-    case "RegExpPrototype":
-      value=__otterPrimordialObject(constructors["RegExp"]); if(value!==undefined)return value;
-      value=__otterPrimordialStatic(constructors["RegExp"],"prototype","Prototype"); if(value!==__otterPrimordialMissing)return value;
-      return undefined;
-    case "RegExpPrototypeExec":
-      value=__otterPrimordialMethod(constructors["RegExp"],"exec",null,null); if(value!==undefined)return value;
-      value=__otterPrimordialStatic(constructors["RegExp"],"prototypeExec","PrototypeExec"); if(value!==__otterPrimordialMissing)return value;
-      return undefined;
-    case "RegExpPrototypeGetDotAll":
-      value=__otterPrimordialHalf(constructors["RegExp"],"dotAll",null,null,"get"); if(value!==undefined)return value;
-      value=__otterPrimordialMethod(constructors["RegExp"],"getDotAll",null,null); if(value!==undefined)return value;
-      value=__otterPrimordialStatic(constructors["RegExp"],"prototypeGetDotAll","PrototypeGetDotAll"); if(value!==__otterPrimordialMissing)return value;
-      return undefined;
-    case "RegExpPrototypeGetGlobal":
-      value=__otterPrimordialHalf(constructors["RegExp"],"global",null,null,"get"); if(value!==undefined)return value;
-      value=__otterPrimordialMethod(constructors["RegExp"],"getGlobal",null,null); if(value!==undefined)return value;
-      value=__otterPrimordialStatic(constructors["RegExp"],"prototypeGetGlobal","PrototypeGetGlobal"); if(value!==__otterPrimordialMissing)return value;
-      return undefined;
-    case "RegExpPrototypeGetHasIndices":
-      value=__otterPrimordialHalf(constructors["RegExp"],"hasIndices",null,null,"get"); if(value!==undefined)return value;
-      value=__otterPrimordialMethod(constructors["RegExp"],"getHasIndices",null,null); if(value!==undefined)return value;
-      value=__otterPrimordialStatic(constructors["RegExp"],"prototypeGetHasIndices","PrototypeGetHasIndices"); if(value!==__otterPrimordialMissing)return value;
-      return undefined;
-    case "RegExpPrototypeGetIgnoreCase":
-      value=__otterPrimordialHalf(constructors["RegExp"],"ignoreCase",null,null,"get"); if(value!==undefined)return value;
-      value=__otterPrimordialMethod(constructors["RegExp"],"getIgnoreCase",null,null); if(value!==undefined)return value;
-      value=__otterPrimordialStatic(constructors["RegExp"],"prototypeGetIgnoreCase","PrototypeGetIgnoreCase"); if(value!==__otterPrimordialMissing)return value;
-      return undefined;
-    case "RegExpPrototypeGetMultiline":
-      value=__otterPrimordialHalf(constructors["RegExp"],"multiline",null,null,"get"); if(value!==undefined)return value;
-      value=__otterPrimordialMethod(constructors["RegExp"],"getMultiline",null,null); if(value!==undefined)return value;
-      value=__otterPrimordialStatic(constructors["RegExp"],"prototypeGetMultiline","PrototypeGetMultiline"); if(value!==__otterPrimordialMissing)return value;
-      return undefined;
-    case "RegExpPrototypeGetSource":
-      value=__otterPrimordialHalf(constructors["RegExp"],"source",null,null,"get"); if(value!==undefined)return value;
-      value=__otterPrimordialMethod(constructors["RegExp"],"getSource",null,null); if(value!==undefined)return value;
-      value=__otterPrimordialStatic(constructors["RegExp"],"prototypeGetSource","PrototypeGetSource"); if(value!==__otterPrimordialMissing)return value;
-      return undefined;
-    case "RegExpPrototypeGetSticky":
-      value=__otterPrimordialHalf(constructors["RegExp"],"sticky",null,null,"get"); if(value!==undefined)return value;
-      value=__otterPrimordialMethod(constructors["RegExp"],"getSticky",null,null); if(value!==undefined)return value;
-      value=__otterPrimordialStatic(constructors["RegExp"],"prototypeGetSticky","PrototypeGetSticky"); if(value!==__otterPrimordialMissing)return value;
-      return undefined;
-    case "RegExpPrototypeGetUnicode":
-      value=__otterPrimordialHalf(constructors["RegExp"],"unicode",null,null,"get"); if(value!==undefined)return value;
-      value=__otterPrimordialMethod(constructors["RegExp"],"getUnicode",null,null); if(value!==undefined)return value;
-      value=__otterPrimordialStatic(constructors["RegExp"],"prototypeGetUnicode","PrototypeGetUnicode"); if(value!==__otterPrimordialMissing)return value;
-      return undefined;
-    case "RegExpPrototypeSymbolReplace":
-      value=__otterPrimordialMethod(constructors["RegExp"],"symbolReplace","SymbolReplace","replace"); if(value!==undefined)return value;
-      value=__otterPrimordialStatic(constructors["RegExp"],"prototypeSymbolReplace","PrototypeSymbolReplace"); if(value!==__otterPrimordialMissing)return value;
-      return undefined;
-    case "RegExpPrototypeSymbolSplit":
-      value=__otterPrimordialMethod(constructors["RegExp"],"symbolSplit","SymbolSplit","split"); if(value!==undefined)return value;
-      value=__otterPrimordialStatic(constructors["RegExp"],"prototypeSymbolSplit","PrototypeSymbolSplit"); if(value!==__otterPrimordialMissing)return value;
-      return undefined;
-    case "RegExpPrototypeTest":
-      value=__otterPrimordialMethod(constructors["RegExp"],"test",null,null); if(value!==undefined)return value;
-      value=__otterPrimordialStatic(constructors["RegExp"],"prototypeTest","PrototypeTest"); if(value!==__otterPrimordialMissing)return value;
-      return undefined;
-    case "RegExpPrototypeToString":
-      value=__otterPrimordialMethod(constructors["RegExp"],"toString",null,null); if(value!==undefined)return value;
-      value=__otterPrimordialStatic(constructors["RegExp"],"prototypeToString","PrototypeToString"); if(value!==__otterPrimordialMissing)return value;
-      return undefined;
-    case "SafePromisePrototypeFinally":
-      value=__otterPrimordialMethod(constructors["SafePromise"],"finally",null,null); if(value!==undefined)return value;
-      return undefined;
-    case "SafeStringPrototypeSearch":
-      value=__otterPrimordialMethod(constructors["SafeString"],"search",null,null); if(value!==undefined)return value;
-      return undefined;
-    case "SetPrototype":
-      value=__otterPrimordialObject(constructors["Set"]); if(value!==undefined)return value;
-      value=__otterPrimordialStatic(constructors["Set"],"prototype","Prototype"); if(value!==__otterPrimordialMissing)return value;
-      return undefined;
-    case "SetPrototypeGetSize":
-      value=__otterPrimordialHalf(constructors["Set"],"size",null,null,"get"); if(value!==undefined)return value;
-      value=__otterPrimordialMethod(constructors["Set"],"getSize",null,null); if(value!==undefined)return value;
-      value=__otterPrimordialStatic(constructors["Set"],"prototypeGetSize","PrototypeGetSize"); if(value!==__otterPrimordialMissing)return value;
-      return undefined;
-    case "SetPrototypeUnion":
-      value=__otterPrimordialMethod(constructors["Set"],"union",null,null); if(value!==undefined)return value;
-      value=__otterPrimordialStatic(constructors["Set"],"prototypeUnion","PrototypeUnion"); if(value!==__otterPrimordialMissing)return value;
-      return undefined;
-    case "SetPrototypeValues":
-      value=__otterPrimordialMethod(constructors["Set"],"values",null,null); if(value!==undefined)return value;
-      value=__otterPrimordialStatic(constructors["Set"],"prototypeValues","PrototypeValues"); if(value!==__otterPrimordialMissing)return value;
-      return undefined;
-    case "StringFromCharCode":
-      value=__otterPrimordialStatic(constructors["String"],"fromCharCode","FromCharCode"); if(value!==__otterPrimordialMissing)return value;
-      return undefined;
-    case "StringPrototype":
-      value=__otterPrimordialObject(constructors["String"]); if(value!==undefined)return value;
-      value=__otterPrimordialStatic(constructors["String"],"prototype","Prototype"); if(value!==__otterPrimordialMissing)return value;
-      return undefined;
-    case "StringPrototypeCharAt":
-      value=__otterPrimordialMethod(constructors["String"],"charAt",null,null); if(value!==undefined)return value;
-      value=__otterPrimordialStatic(constructors["String"],"prototypeCharAt","PrototypeCharAt"); if(value!==__otterPrimordialMissing)return value;
-      return undefined;
-    case "StringPrototypeCharCodeAt":
-      value=__otterPrimordialMethod(constructors["String"],"charCodeAt",null,null); if(value!==undefined)return value;
-      value=__otterPrimordialStatic(constructors["String"],"prototypeCharCodeAt","PrototypeCharCodeAt"); if(value!==__otterPrimordialMissing)return value;
-      return undefined;
-    case "StringPrototypeCodePointAt":
-      value=__otterPrimordialMethod(constructors["String"],"codePointAt",null,null); if(value!==undefined)return value;
-      value=__otterPrimordialStatic(constructors["String"],"prototypeCodePointAt","PrototypeCodePointAt"); if(value!==__otterPrimordialMissing)return value;
-      return undefined;
-    case "StringPrototypeEndsWith":
-      value=__otterPrimordialMethod(constructors["String"],"endsWith",null,null); if(value!==undefined)return value;
-      value=__otterPrimordialStatic(constructors["String"],"prototypeEndsWith","PrototypeEndsWith"); if(value!==__otterPrimordialMissing)return value;
-      return undefined;
-    case "StringPrototypeIncludes":
-      value=__otterPrimordialMethod(constructors["String"],"includes",null,null); if(value!==undefined)return value;
-      value=__otterPrimordialStatic(constructors["String"],"prototypeIncludes","PrototypeIncludes"); if(value!==__otterPrimordialMissing)return value;
-      return undefined;
-    case "StringPrototypeIndexOf":
-      value=__otterPrimordialMethod(constructors["String"],"indexOf",null,null); if(value!==undefined)return value;
-      value=__otterPrimordialStatic(constructors["String"],"prototypeIndexOf","PrototypeIndexOf"); if(value!==__otterPrimordialMissing)return value;
-      return undefined;
-    case "StringPrototypeLastIndexOf":
-      value=__otterPrimordialMethod(constructors["String"],"lastIndexOf",null,null); if(value!==undefined)return value;
-      value=__otterPrimordialStatic(constructors["String"],"prototypeLastIndexOf","PrototypeLastIndexOf"); if(value!==__otterPrimordialMissing)return value;
-      return undefined;
-    case "StringPrototypeLocaleCompare":
-      value=__otterPrimordialMethod(constructors["String"],"localeCompare",null,null); if(value!==undefined)return value;
-      value=__otterPrimordialStatic(constructors["String"],"prototypeLocaleCompare","PrototypeLocaleCompare"); if(value!==__otterPrimordialMissing)return value;
-      return undefined;
-    case "StringPrototypeNormalize":
-      value=__otterPrimordialMethod(constructors["String"],"normalize",null,null); if(value!==undefined)return value;
-      value=__otterPrimordialStatic(constructors["String"],"prototypeNormalize","PrototypeNormalize"); if(value!==__otterPrimordialMissing)return value;
-      return undefined;
-    case "StringPrototypePadEnd":
-      value=__otterPrimordialMethod(constructors["String"],"padEnd",null,null); if(value!==undefined)return value;
-      value=__otterPrimordialStatic(constructors["String"],"prototypePadEnd","PrototypePadEnd"); if(value!==__otterPrimordialMissing)return value;
-      return undefined;
-    case "StringPrototypePadStart":
-      value=__otterPrimordialMethod(constructors["String"],"padStart",null,null); if(value!==undefined)return value;
-      value=__otterPrimordialStatic(constructors["String"],"prototypePadStart","PrototypePadStart"); if(value!==__otterPrimordialMissing)return value;
-      return undefined;
-    case "StringPrototypeRepeat":
-      value=__otterPrimordialMethod(constructors["String"],"repeat",null,null); if(value!==undefined)return value;
-      value=__otterPrimordialStatic(constructors["String"],"prototypeRepeat","PrototypeRepeat"); if(value!==__otterPrimordialMissing)return value;
-      return undefined;
-    case "StringPrototypeReplace":
-      value=__otterPrimordialMethod(constructors["String"],"replace",null,null); if(value!==undefined)return value;
-      value=__otterPrimordialStatic(constructors["String"],"prototypeReplace","PrototypeReplace"); if(value!==__otterPrimordialMissing)return value;
-      return undefined;
-    case "StringPrototypeReplaceAll":
-      value=__otterPrimordialMethod(constructors["String"],"replaceAll",null,null); if(value!==undefined)return value;
-      value=__otterPrimordialStatic(constructors["String"],"prototypeReplaceAll","PrototypeReplaceAll"); if(value!==__otterPrimordialMissing)return value;
-      return undefined;
-    case "StringPrototypeSlice":
-      value=__otterPrimordialMethod(constructors["String"],"slice",null,null); if(value!==undefined)return value;
-      value=__otterPrimordialStatic(constructors["String"],"prototypeSlice","PrototypeSlice"); if(value!==__otterPrimordialMissing)return value;
-      return undefined;
-    case "StringPrototypeSplit":
-      value=__otterPrimordialMethod(constructors["String"],"split",null,null); if(value!==undefined)return value;
-      value=__otterPrimordialStatic(constructors["String"],"prototypeSplit","PrototypeSplit"); if(value!==__otterPrimordialMissing)return value;
-      return undefined;
-    case "StringPrototypeStartsWith":
-      value=__otterPrimordialMethod(constructors["String"],"startsWith",null,null); if(value!==undefined)return value;
-      value=__otterPrimordialStatic(constructors["String"],"prototypeStartsWith","PrototypeStartsWith"); if(value!==__otterPrimordialMissing)return value;
-      return undefined;
-    case "StringPrototypeSubstring":
-      value=__otterPrimordialMethod(constructors["String"],"substring",null,null); if(value!==undefined)return value;
-      value=__otterPrimordialStatic(constructors["String"],"prototypeSubstring","PrototypeSubstring"); if(value!==__otterPrimordialMissing)return value;
-      return undefined;
-    case "StringPrototypeToLowerCase":
-      value=__otterPrimordialMethod(constructors["String"],"toLowerCase",null,null); if(value!==undefined)return value;
-      value=__otterPrimordialStatic(constructors["String"],"prototypeToLowerCase","PrototypeToLowerCase"); if(value!==__otterPrimordialMissing)return value;
-      return undefined;
-    case "StringPrototypeToUpperCase":
-      value=__otterPrimordialMethod(constructors["String"],"toUpperCase",null,null); if(value!==undefined)return value;
-      value=__otterPrimordialStatic(constructors["String"],"prototypeToUpperCase","PrototypeToUpperCase"); if(value!==__otterPrimordialMissing)return value;
-      return undefined;
-    case "StringPrototypeToWellFormed":
-      value=__otterPrimordialMethod(constructors["String"],"toWellFormed",null,null); if(value!==undefined)return value;
-      value=__otterPrimordialStatic(constructors["String"],"prototypeToWellFormed","PrototypeToWellFormed"); if(value!==__otterPrimordialMissing)return value;
-      return undefined;
-    case "StringPrototypeTrim":
-      value=__otterPrimordialMethod(constructors["String"],"trim",null,null); if(value!==undefined)return value;
-      value=__otterPrimordialStatic(constructors["String"],"prototypeTrim","PrototypeTrim"); if(value!==__otterPrimordialMissing)return value;
-      return undefined;
-    case "StringPrototypeValueOf":
-      value=__otterPrimordialMethod(constructors["String"],"valueOf",null,null); if(value!==undefined)return value;
-      value=__otterPrimordialStatic(constructors["String"],"prototypeValueOf","PrototypeValueOf"); if(value!==__otterPrimordialMissing)return value;
-      return undefined;
-    case "SymbolAsyncDispose":
-      value=__otterPrimordialStatic(constructors["Symbol"],"asyncDispose","AsyncDispose"); if(value!==__otterPrimordialMissing)return value;
-      return undefined;
-    case "SymbolAsyncIterator":
-      value=__otterPrimordialStatic(constructors["Symbol"],"asyncIterator","AsyncIterator"); if(value!==__otterPrimordialMissing)return value;
-      return undefined;
-    case "SymbolDispose":
-      value=__otterPrimordialStatic(constructors["Symbol"],"dispose","Dispose"); if(value!==__otterPrimordialMissing)return value;
-      return undefined;
-    case "SymbolFor":
-      value=__otterPrimordialStatic(constructors["Symbol"],"for","For"); if(value!==__otterPrimordialMissing)return value;
-      return undefined;
-    case "SymbolHasInstance":
-      value=__otterPrimordialStatic(constructors["Symbol"],"hasInstance","HasInstance"); if(value!==__otterPrimordialMissing)return value;
-      return undefined;
-    case "SymbolIterator":
-      value=__otterPrimordialStatic(constructors["Symbol"],"iterator","Iterator"); if(value!==__otterPrimordialMissing)return value;
-      return undefined;
-    case "SymbolKeyFor":
-      value=__otterPrimordialStatic(constructors["Symbol"],"keyFor","KeyFor"); if(value!==__otterPrimordialMissing)return value;
-      return undefined;
-    case "SymbolPrototypeGetDescription":
-      value=__otterPrimordialHalf(constructors["Symbol"],"description",null,null,"get"); if(value!==undefined)return value;
-      value=__otterPrimordialMethod(constructors["Symbol"],"getDescription",null,null); if(value!==undefined)return value;
-      value=__otterPrimordialStatic(constructors["Symbol"],"prototypeGetDescription","PrototypeGetDescription"); if(value!==__otterPrimordialMissing)return value;
-      return undefined;
-    case "SymbolPrototypeToString":
-      value=__otterPrimordialMethod(constructors["Symbol"],"toString",null,null); if(value!==undefined)return value;
-      value=__otterPrimordialStatic(constructors["Symbol"],"prototypeToString","PrototypeToString"); if(value!==__otterPrimordialMissing)return value;
-      return undefined;
-    case "SymbolPrototypeValueOf":
-      value=__otterPrimordialMethod(constructors["Symbol"],"valueOf",null,null); if(value!==undefined)return value;
-      value=__otterPrimordialStatic(constructors["Symbol"],"prototypeValueOf","PrototypeValueOf"); if(value!==__otterPrimordialMissing)return value;
-      return undefined;
-    case "SymbolReplace":
-      value=__otterPrimordialStatic(constructors["Symbol"],"replace","Replace"); if(value!==__otterPrimordialMissing)return value;
-      return undefined;
-    case "SymbolSpecies":
-      value=__otterPrimordialStatic(constructors["Symbol"],"species","Species"); if(value!==__otterPrimordialMissing)return value;
-      return undefined;
-    case "SymbolSplit":
-      value=__otterPrimordialStatic(constructors["Symbol"],"split","Split"); if(value!==__otterPrimordialMissing)return value;
-      return undefined;
-    case "SymbolToPrimitive":
-      value=__otterPrimordialStatic(constructors["Symbol"],"toPrimitive","ToPrimitive"); if(value!==__otterPrimordialMissing)return value;
-      return undefined;
-    case "SymbolToStringTag":
-      value=__otterPrimordialStatic(constructors["Symbol"],"toStringTag","ToStringTag"); if(value!==__otterPrimordialMissing)return value;
-      return undefined;
-    case "TypeErrorPrototype":
-      value=__otterPrimordialObject(constructors["TypeError"]); if(value!==undefined)return value;
-      value=__otterPrimordialStatic(constructors["TypeError"],"prototype","Prototype"); if(value!==__otterPrimordialMissing)return value;
-      return undefined;
-    case "TypedArrayPrototype":
-      value=__otterPrimordialObject((constructors["TypedArray"] ?? TypedArray)); if(value!==undefined)return value;
-      return undefined;
-    case "TypedArrayPrototypeAt":
-      value=__otterPrimordialMethod(TypedArray,"at",null,null); if(value!==undefined)return value;
-      return undefined;
-    case "TypedArrayPrototypeFill":
-      value=__otterPrimordialMethod(TypedArray,"fill",null,null); if(value!==undefined)return value;
-      return undefined;
-    case "TypedArrayPrototypeGetBuffer":
-      value=__otterPrimordialHalf(TypedArray,"buffer",null,null,"get"); if(value!==undefined)return value;
-      value=__otterPrimordialMethod(TypedArray,"getBuffer",null,null); if(value!==undefined)return value;
-      return undefined;
-    case "TypedArrayPrototypeGetByteLength":
-      value=__otterPrimordialHalf(TypedArray,"byteLength",null,null,"get"); if(value!==undefined)return value;
-      value=__otterPrimordialMethod(TypedArray,"getByteLength",null,null); if(value!==undefined)return value;
-      return undefined;
-    case "TypedArrayPrototypeGetByteOffset":
-      value=__otterPrimordialHalf(TypedArray,"byteOffset",null,null,"get"); if(value!==undefined)return value;
-      value=__otterPrimordialMethod(TypedArray,"getByteOffset",null,null); if(value!==undefined)return value;
-      return undefined;
-    case "TypedArrayPrototypeGetLength":
-      value=__otterPrimordialHalf(TypedArray,"length",null,null,"get"); if(value!==undefined)return value;
-      value=__otterPrimordialMethod(TypedArray,"getLength",null,null); if(value!==undefined)return value;
-      return undefined;
-    case "TypedArrayPrototypeGetSymbolToStringTag":
-      value=__otterPrimordialHalf(TypedArray,"symbolToStringTag","SymbolToStringTag","toStringTag","get"); if(value!==undefined)return value;
-      value=__otterPrimordialMethod(TypedArray,"getSymbolToStringTag",null,null); if(value!==undefined)return value;
-      return undefined;
-    case "TypedArrayPrototypeIncludes":
-      value=__otterPrimordialMethod(TypedArray,"includes",null,null); if(value!==undefined)return value;
-      return undefined;
-    case "TypedArrayPrototypeSet":
-      value=__otterPrimordialMethod(TypedArray,"set",null,null); if(value!==undefined)return value;
-      return undefined;
-    case "TypedArrayPrototypeSlice":
-      value=__otterPrimordialMethod(TypedArray,"slice",null,null); if(value!==undefined)return value;
-      return undefined;
-    case "TypedArrayPrototypeSubarray":
-      value=__otterPrimordialMethod(TypedArray,"subarray",null,null); if(value!==undefined)return value;
-      return undefined;
-    case "WeakMapPrototype":
-      value=__otterPrimordialObject(constructors["WeakMap"]); if(value!==undefined)return value;
-      value=__otterPrimordialStatic(constructors["WeakMap"],"prototype","Prototype"); if(value!==__otterPrimordialMissing)return value;
-      return undefined;
-    case "WeakSetPrototype":
-      value=__otterPrimordialObject(constructors["WeakSet"]); if(value!==undefined)return value;
-      value=__otterPrimordialStatic(constructors["WeakSet"],"prototype","Prototype"); if(value!==__otterPrimordialMissing)return value;
-      return undefined;
+  value=constructors["AggregateError"]; if(value!==undefined)primordials["AggregateError"]=value;
+  p1: {
+    value=__otterPrimordialObject(constructors["AggregateError"]); if(value!==undefined){primordials["AggregateErrorPrototype"]=value;break p1;}
+    value=__otterPrimordialStatic(constructors["AggregateError"],"prototype","Prototype"); if(value!==__otterPrimordialMissing){if(value!==undefined)primordials["AggregateErrorPrototype"]=value;break p1;}
   }
-  return undefined;
+  value=constructors["Array"]; if(value!==undefined)primordials["Array"]=value;
+  value=constructors["ArrayBuffer"]; if(value!==undefined)primordials["ArrayBuffer"]=value;
+  p4: {
+    value=__otterPrimordialStatic(constructors["Array"],"bufferIsView","BufferIsView"); if(value!==__otterPrimordialMissing){if(value!==undefined)primordials["ArrayBufferIsView"]=value;break p4;}
+    value=__otterPrimordialStatic(constructors["ArrayBuffer"],"isView","IsView"); if(value!==__otterPrimordialMissing){if(value!==undefined)primordials["ArrayBufferIsView"]=value;break p4;}
+  }
+  p5: {
+    value=__otterPrimordialObject(constructors["ArrayBuffer"]); if(value!==undefined){primordials["ArrayBufferPrototype"]=value;break p5;}
+    value=__otterPrimordialStatic(constructors["Array"],"bufferPrototype","BufferPrototype"); if(value!==__otterPrimordialMissing){if(value!==undefined)primordials["ArrayBufferPrototype"]=value;break p5;}
+    value=__otterPrimordialStatic(constructors["ArrayBuffer"],"prototype","Prototype"); if(value!==__otterPrimordialMissing){if(value!==undefined)primordials["ArrayBufferPrototype"]=value;break p5;}
+  }
+  p6: {
+    value=__otterPrimordialHalf(constructors["ArrayBuffer"],"byteLength",null,null,"get"); if(value!==undefined){primordials["ArrayBufferPrototypeGetByteLength"]=value;break p6;}
+    value=__otterPrimordialMethod(constructors["ArrayBuffer"],"getByteLength",null,null); if(value!==undefined){primordials["ArrayBufferPrototypeGetByteLength"]=value;break p6;}
+    value=__otterPrimordialStatic(constructors["Array"],"bufferPrototypeGetByteLength","BufferPrototypeGetByteLength"); if(value!==__otterPrimordialMissing){if(value!==undefined)primordials["ArrayBufferPrototypeGetByteLength"]=value;break p6;}
+    value=__otterPrimordialStatic(constructors["ArrayBuffer"],"prototypeGetByteLength","PrototypeGetByteLength"); if(value!==__otterPrimordialMissing){if(value!==undefined)primordials["ArrayBufferPrototypeGetByteLength"]=value;break p6;}
+  }
+  p7: {
+    value=__otterPrimordialMethod(constructors["ArrayBuffer"],"slice",null,null); if(value!==undefined){primordials["ArrayBufferPrototypeSlice"]=value;break p7;}
+    value=__otterPrimordialStatic(constructors["Array"],"bufferPrototypeSlice","BufferPrototypeSlice"); if(value!==__otterPrimordialMissing){if(value!==undefined)primordials["ArrayBufferPrototypeSlice"]=value;break p7;}
+    value=__otterPrimordialStatic(constructors["ArrayBuffer"],"prototypeSlice","PrototypeSlice"); if(value!==__otterPrimordialMissing){if(value!==undefined)primordials["ArrayBufferPrototypeSlice"]=value;break p7;}
+  }
+  p8: {
+    value=__otterPrimordialStatic(constructors["Array"],"from","From"); if(value!==__otterPrimordialMissing){if(value!==undefined)primordials["ArrayFrom"]=value;break p8;}
+  }
+  p9: {
+    value=__otterPrimordialStatic(constructors["Array"],"fromAsync","FromAsync"); if(value!==__otterPrimordialMissing){if(value!==undefined)primordials["ArrayFromAsync"]=value;break p9;}
+  }
+  p10: {
+    value=__otterPrimordialStatic(constructors["Array"],"isArray","IsArray"); if(value!==__otterPrimordialMissing){if(value!==undefined)primordials["ArrayIsArray"]=value;break p10;}
+  }
+  p11: {
+    value=__otterPrimordialObject(constructors["Array"]); if(value!==undefined){primordials["ArrayPrototype"]=value;break p11;}
+    value=__otterPrimordialStatic(constructors["Array"],"prototype","Prototype"); if(value!==__otterPrimordialMissing){if(value!==undefined)primordials["ArrayPrototype"]=value;break p11;}
+  }
+  p12: {
+    value=__otterPrimordialMethod(constructors["Array"],"at",null,null); if(value!==undefined){primordials["ArrayPrototypeAt"]=value;break p12;}
+    value=__otterPrimordialStatic(constructors["Array"],"prototypeAt","PrototypeAt"); if(value!==__otterPrimordialMissing){if(value!==undefined)primordials["ArrayPrototypeAt"]=value;break p12;}
+  }
+  p13: {
+    value=__otterPrimordialMethod(constructors["Array"],"every",null,null); if(value!==undefined){primordials["ArrayPrototypeEvery"]=value;break p13;}
+    value=__otterPrimordialStatic(constructors["Array"],"prototypeEvery","PrototypeEvery"); if(value!==__otterPrimordialMissing){if(value!==undefined)primordials["ArrayPrototypeEvery"]=value;break p13;}
+  }
+  p14: {
+    value=__otterPrimordialMethod(constructors["Array"],"fill",null,null); if(value!==undefined){primordials["ArrayPrototypeFill"]=value;break p14;}
+    value=__otterPrimordialStatic(constructors["Array"],"prototypeFill","PrototypeFill"); if(value!==__otterPrimordialMissing){if(value!==undefined)primordials["ArrayPrototypeFill"]=value;break p14;}
+  }
+  p15: {
+    value=__otterPrimordialMethod(constructors["Array"],"filter",null,null); if(value!==undefined){primordials["ArrayPrototypeFilter"]=value;break p15;}
+    value=__otterPrimordialStatic(constructors["Array"],"prototypeFilter","PrototypeFilter"); if(value!==__otterPrimordialMissing){if(value!==undefined)primordials["ArrayPrototypeFilter"]=value;break p15;}
+  }
+  p16: {
+    value=__otterPrimordialMethod(constructors["Array"],"find",null,null); if(value!==undefined){primordials["ArrayPrototypeFind"]=value;break p16;}
+    value=__otterPrimordialStatic(constructors["Array"],"prototypeFind","PrototypeFind"); if(value!==__otterPrimordialMissing){if(value!==undefined)primordials["ArrayPrototypeFind"]=value;break p16;}
+  }
+  p17: {
+    value=__otterPrimordialMethod(constructors["Array"],"flatMap",null,null); if(value!==undefined){primordials["ArrayPrototypeFlatMap"]=value;break p17;}
+    value=__otterPrimordialStatic(constructors["Array"],"prototypeFlatMap","PrototypeFlatMap"); if(value!==__otterPrimordialMissing){if(value!==undefined)primordials["ArrayPrototypeFlatMap"]=value;break p17;}
+  }
+  p18: {
+    value=__otterPrimordialMethod(constructors["Array"],"forEach",null,null); if(value!==undefined){primordials["ArrayPrototypeForEach"]=value;break p18;}
+    value=__otterPrimordialStatic(constructors["Array"],"prototypeForEach","PrototypeForEach"); if(value!==__otterPrimordialMissing){if(value!==undefined)primordials["ArrayPrototypeForEach"]=value;break p18;}
+  }
+  p19: {
+    value=__otterPrimordialMethod(constructors["Array"],"includes",null,null); if(value!==undefined){primordials["ArrayPrototypeIncludes"]=value;break p19;}
+    value=__otterPrimordialStatic(constructors["Array"],"prototypeIncludes","PrototypeIncludes"); if(value!==__otterPrimordialMissing){if(value!==undefined)primordials["ArrayPrototypeIncludes"]=value;break p19;}
+  }
+  p20: {
+    value=__otterPrimordialMethod(constructors["Array"],"indexOf",null,null); if(value!==undefined){primordials["ArrayPrototypeIndexOf"]=value;break p20;}
+    value=__otterPrimordialStatic(constructors["Array"],"prototypeIndexOf","PrototypeIndexOf"); if(value!==__otterPrimordialMissing){if(value!==undefined)primordials["ArrayPrototypeIndexOf"]=value;break p20;}
+  }
+  p21: {
+    value=__otterPrimordialMethod(constructors["Array"],"join",null,null); if(value!==undefined){primordials["ArrayPrototypeJoin"]=value;break p21;}
+    value=__otterPrimordialStatic(constructors["Array"],"prototypeJoin","PrototypeJoin"); if(value!==__otterPrimordialMissing){if(value!==undefined)primordials["ArrayPrototypeJoin"]=value;break p21;}
+  }
+  p22: {
+    value=__otterPrimordialMethod(constructors["Array"],"map",null,null); if(value!==undefined){primordials["ArrayPrototypeMap"]=value;break p22;}
+    value=__otterPrimordialStatic(constructors["Array"],"prototypeMap","PrototypeMap"); if(value!==__otterPrimordialMissing){if(value!==undefined)primordials["ArrayPrototypeMap"]=value;break p22;}
+  }
+  p23: {
+    value=__otterPrimordialMethod(constructors["Array"],"pop",null,null); if(value!==undefined){primordials["ArrayPrototypePop"]=value;break p23;}
+    value=__otterPrimordialStatic(constructors["Array"],"prototypePop","PrototypePop"); if(value!==__otterPrimordialMissing){if(value!==undefined)primordials["ArrayPrototypePop"]=value;break p23;}
+  }
+  p24: {
+    value=__otterPrimordialMethod(constructors["Array"],"push",null,null); if(value!==undefined){primordials["ArrayPrototypePush"]=value;break p24;}
+    value=__otterPrimordialStatic(constructors["Array"],"prototypePush","PrototypePush"); if(value!==__otterPrimordialMissing){if(value!==undefined)primordials["ArrayPrototypePush"]=value;break p24;}
+  }
+  p25: {
+    value=__otterPrimordialApply(constructors["Array"],"push"); if(value!==undefined){primordials["ArrayPrototypePushApply"]=value;break p25;}
+    value=__otterPrimordialStaticApply(constructors["Array"],"prototypePush","PrototypePush"); if(value!==undefined){primordials["ArrayPrototypePushApply"]=value;break p25;}
+    value=__otterPrimordialMethod(constructors["Array"],"pushApply",null,null); if(value!==undefined){primordials["ArrayPrototypePushApply"]=value;break p25;}
+    value=__otterPrimordialStatic(constructors["Array"],"prototypePushApply","PrototypePushApply"); if(value!==__otterPrimordialMissing){if(value!==undefined)primordials["ArrayPrototypePushApply"]=value;break p25;}
+  }
+  p26: {
+    value=__otterPrimordialMethod(constructors["Array"],"reduce",null,null); if(value!==undefined){primordials["ArrayPrototypeReduce"]=value;break p26;}
+    value=__otterPrimordialStatic(constructors["Array"],"prototypeReduce","PrototypeReduce"); if(value!==__otterPrimordialMissing){if(value!==undefined)primordials["ArrayPrototypeReduce"]=value;break p26;}
+  }
+  p27: {
+    value=__otterPrimordialMethod(constructors["Array"],"reverse",null,null); if(value!==undefined){primordials["ArrayPrototypeReverse"]=value;break p27;}
+    value=__otterPrimordialStatic(constructors["Array"],"prototypeReverse","PrototypeReverse"); if(value!==__otterPrimordialMissing){if(value!==undefined)primordials["ArrayPrototypeReverse"]=value;break p27;}
+  }
+  p28: {
+    value=__otterPrimordialMethod(constructors["Array"],"shift",null,null); if(value!==undefined){primordials["ArrayPrototypeShift"]=value;break p28;}
+    value=__otterPrimordialStatic(constructors["Array"],"prototypeShift","PrototypeShift"); if(value!==__otterPrimordialMissing){if(value!==undefined)primordials["ArrayPrototypeShift"]=value;break p28;}
+  }
+  p29: {
+    value=__otterPrimordialMethod(constructors["Array"],"slice",null,null); if(value!==undefined){primordials["ArrayPrototypeSlice"]=value;break p29;}
+    value=__otterPrimordialStatic(constructors["Array"],"prototypeSlice","PrototypeSlice"); if(value!==__otterPrimordialMissing){if(value!==undefined)primordials["ArrayPrototypeSlice"]=value;break p29;}
+  }
+  p30: {
+    value=__otterPrimordialMethod(constructors["Array"],"some",null,null); if(value!==undefined){primordials["ArrayPrototypeSome"]=value;break p30;}
+    value=__otterPrimordialStatic(constructors["Array"],"prototypeSome","PrototypeSome"); if(value!==__otterPrimordialMissing){if(value!==undefined)primordials["ArrayPrototypeSome"]=value;break p30;}
+  }
+  p31: {
+    value=__otterPrimordialMethod(constructors["Array"],"sort",null,null); if(value!==undefined){primordials["ArrayPrototypeSort"]=value;break p31;}
+    value=__otterPrimordialStatic(constructors["Array"],"prototypeSort","PrototypeSort"); if(value!==__otterPrimordialMissing){if(value!==undefined)primordials["ArrayPrototypeSort"]=value;break p31;}
+  }
+  p32: {
+    value=__otterPrimordialMethod(constructors["Array"],"splice",null,null); if(value!==undefined){primordials["ArrayPrototypeSplice"]=value;break p32;}
+    value=__otterPrimordialStatic(constructors["Array"],"prototypeSplice","PrototypeSplice"); if(value!==__otterPrimordialMissing){if(value!==undefined)primordials["ArrayPrototypeSplice"]=value;break p32;}
+  }
+  p33: {
+    value=__otterPrimordialMethod(constructors["Array"],"toSorted",null,null); if(value!==undefined){primordials["ArrayPrototypeToSorted"]=value;break p33;}
+    value=__otterPrimordialStatic(constructors["Array"],"prototypeToSorted","PrototypeToSorted"); if(value!==__otterPrimordialMissing){if(value!==undefined)primordials["ArrayPrototypeToSorted"]=value;break p33;}
+  }
+  p34: {
+    value=__otterPrimordialMethod(constructors["Array"],"unshift",null,null); if(value!==undefined){primordials["ArrayPrototypeUnshift"]=value;break p34;}
+    value=__otterPrimordialStatic(constructors["Array"],"prototypeUnshift","PrototypeUnshift"); if(value!==__otterPrimordialMissing){if(value!==undefined)primordials["ArrayPrototypeUnshift"]=value;break p34;}
+  }
+  p35: {
+    value=__otterPrimordialApply(constructors["Array"],"unshift"); if(value!==undefined){primordials["ArrayPrototypeUnshiftApply"]=value;break p35;}
+    value=__otterPrimordialStaticApply(constructors["Array"],"prototypeUnshift","PrototypeUnshift"); if(value!==undefined){primordials["ArrayPrototypeUnshiftApply"]=value;break p35;}
+    value=__otterPrimordialMethod(constructors["Array"],"unshiftApply",null,null); if(value!==undefined){primordials["ArrayPrototypeUnshiftApply"]=value;break p35;}
+    value=__otterPrimordialStatic(constructors["Array"],"prototypeUnshiftApply","PrototypeUnshiftApply"); if(value!==__otterPrimordialMissing){if(value!==undefined)primordials["ArrayPrototypeUnshiftApply"]=value;break p35;}
+  }
+  value=explicit["AsyncFunction"]; if(value!==undefined)primordials["AsyncFunction"]=value;
+  value=explicit["AsyncGeneratorFunction"]; if(value!==undefined)primordials["AsyncGeneratorFunction"]=value;
+  value=explicit["AsyncIteratorPrototype"]; if(value!==undefined)primordials["AsyncIteratorPrototype"]=value;
+  value=namespaces["Atomics"]; if(value!==undefined)primordials["Atomics"]=value;
+  value=constructors["BigInt"]; if(value!==undefined)primordials["BigInt"]=value;
+  value=constructors["BigInt64Array"]; if(value!==undefined)primordials["BigInt64Array"]=value;
+  p42: {
+    value=__otterPrimordialMethod(constructors["BigInt"],"toString",null,null); if(value!==undefined){primordials["BigIntPrototypeToString"]=value;break p42;}
+    value=__otterPrimordialStatic(constructors["BigInt"],"prototypeToString","PrototypeToString"); if(value!==__otterPrimordialMissing){if(value!==undefined)primordials["BigIntPrototypeToString"]=value;break p42;}
+  }
+  p43: {
+    value=__otterPrimordialMethod(constructors["BigInt"],"valueOf",null,null); if(value!==undefined){primordials["BigIntPrototypeValueOf"]=value;break p43;}
+    value=__otterPrimordialStatic(constructors["BigInt"],"prototypeValueOf","PrototypeValueOf"); if(value!==__otterPrimordialMissing){if(value!==undefined)primordials["BigIntPrototypeValueOf"]=value;break p43;}
+  }
+  value=constructors["BigUint64Array"]; if(value!==undefined)primordials["BigUint64Array"]=value;
+  value=constructors["Boolean"]; if(value!==undefined)primordials["Boolean"]=value;
+  p46: {
+    value=__otterPrimordialObject(constructors["Boolean"]); if(value!==undefined){primordials["BooleanPrototype"]=value;break p46;}
+    value=__otterPrimordialStatic(constructors["Boolean"],"prototype","Prototype"); if(value!==__otterPrimordialMissing){if(value!==undefined)primordials["BooleanPrototype"]=value;break p46;}
+  }
+  p47: {
+    value=__otterPrimordialMethod(constructors["Boolean"],"valueOf",null,null); if(value!==undefined){primordials["BooleanPrototypeValueOf"]=value;break p47;}
+    value=__otterPrimordialStatic(constructors["Boolean"],"prototypeValueOf","PrototypeValueOf"); if(value!==__otterPrimordialMissing){if(value!==undefined)primordials["BooleanPrototypeValueOf"]=value;break p47;}
+  }
+  value=constructors["DataView"]; if(value!==undefined)primordials["DataView"]=value;
+  p49: {
+    value=__otterPrimordialObject(constructors["DataView"]); if(value!==undefined){primordials["DataViewPrototype"]=value;break p49;}
+    value=__otterPrimordialStatic(constructors["DataView"],"prototype","Prototype"); if(value!==__otterPrimordialMissing){if(value!==undefined)primordials["DataViewPrototype"]=value;break p49;}
+  }
+  p50: {
+    value=__otterPrimordialHalf(constructors["DataView"],"buffer",null,null,"get"); if(value!==undefined){primordials["DataViewPrototypeGetBuffer"]=value;break p50;}
+    value=__otterPrimordialMethod(constructors["DataView"],"getBuffer",null,null); if(value!==undefined){primordials["DataViewPrototypeGetBuffer"]=value;break p50;}
+    value=__otterPrimordialStatic(constructors["DataView"],"prototypeGetBuffer","PrototypeGetBuffer"); if(value!==__otterPrimordialMissing){if(value!==undefined)primordials["DataViewPrototypeGetBuffer"]=value;break p50;}
+  }
+  p51: {
+    value=__otterPrimordialHalf(constructors["DataView"],"byteLength",null,null,"get"); if(value!==undefined){primordials["DataViewPrototypeGetByteLength"]=value;break p51;}
+    value=__otterPrimordialMethod(constructors["DataView"],"getByteLength",null,null); if(value!==undefined){primordials["DataViewPrototypeGetByteLength"]=value;break p51;}
+    value=__otterPrimordialStatic(constructors["DataView"],"prototypeGetByteLength","PrototypeGetByteLength"); if(value!==__otterPrimordialMissing){if(value!==undefined)primordials["DataViewPrototypeGetByteLength"]=value;break p51;}
+  }
+  p52: {
+    value=__otterPrimordialHalf(constructors["DataView"],"byteOffset",null,null,"get"); if(value!==undefined){primordials["DataViewPrototypeGetByteOffset"]=value;break p52;}
+    value=__otterPrimordialMethod(constructors["DataView"],"getByteOffset",null,null); if(value!==undefined){primordials["DataViewPrototypeGetByteOffset"]=value;break p52;}
+    value=__otterPrimordialStatic(constructors["DataView"],"prototypeGetByteOffset","PrototypeGetByteOffset"); if(value!==__otterPrimordialMissing){if(value!==undefined)primordials["DataViewPrototypeGetByteOffset"]=value;break p52;}
+  }
+  value=constructors["Date"]; if(value!==undefined)primordials["Date"]=value;
+  p54: {
+    value=__otterPrimordialStatic(constructors["Date"],"now","Now"); if(value!==__otterPrimordialMissing){if(value!==undefined)primordials["DateNow"]=value;break p54;}
+  }
+  p55: {
+    value=__otterPrimordialObject(constructors["Date"]); if(value!==undefined){primordials["DatePrototype"]=value;break p55;}
+    value=__otterPrimordialStatic(constructors["Date"],"prototype","Prototype"); if(value!==__otterPrimordialMissing){if(value!==undefined)primordials["DatePrototype"]=value;break p55;}
+  }
+  p56: {
+    value=__otterPrimordialHalf(constructors["Date"],"date",null,null,"get"); if(value!==undefined){primordials["DatePrototypeGetDate"]=value;break p56;}
+    value=__otterPrimordialMethod(constructors["Date"],"getDate",null,null); if(value!==undefined){primordials["DatePrototypeGetDate"]=value;break p56;}
+    value=__otterPrimordialStatic(constructors["Date"],"prototypeGetDate","PrototypeGetDate"); if(value!==__otterPrimordialMissing){if(value!==undefined)primordials["DatePrototypeGetDate"]=value;break p56;}
+  }
+  p57: {
+    value=__otterPrimordialHalf(constructors["Date"],"fullYear",null,null,"get"); if(value!==undefined){primordials["DatePrototypeGetFullYear"]=value;break p57;}
+    value=__otterPrimordialMethod(constructors["Date"],"getFullYear",null,null); if(value!==undefined){primordials["DatePrototypeGetFullYear"]=value;break p57;}
+    value=__otterPrimordialStatic(constructors["Date"],"prototypeGetFullYear","PrototypeGetFullYear"); if(value!==__otterPrimordialMissing){if(value!==undefined)primordials["DatePrototypeGetFullYear"]=value;break p57;}
+  }
+  p58: {
+    value=__otterPrimordialHalf(constructors["Date"],"hours",null,null,"get"); if(value!==undefined){primordials["DatePrototypeGetHours"]=value;break p58;}
+    value=__otterPrimordialMethod(constructors["Date"],"getHours",null,null); if(value!==undefined){primordials["DatePrototypeGetHours"]=value;break p58;}
+    value=__otterPrimordialStatic(constructors["Date"],"prototypeGetHours","PrototypeGetHours"); if(value!==__otterPrimordialMissing){if(value!==undefined)primordials["DatePrototypeGetHours"]=value;break p58;}
+  }
+  p59: {
+    value=__otterPrimordialHalf(constructors["Date"],"minutes",null,null,"get"); if(value!==undefined){primordials["DatePrototypeGetMinutes"]=value;break p59;}
+    value=__otterPrimordialMethod(constructors["Date"],"getMinutes",null,null); if(value!==undefined){primordials["DatePrototypeGetMinutes"]=value;break p59;}
+    value=__otterPrimordialStatic(constructors["Date"],"prototypeGetMinutes","PrototypeGetMinutes"); if(value!==__otterPrimordialMissing){if(value!==undefined)primordials["DatePrototypeGetMinutes"]=value;break p59;}
+  }
+  p60: {
+    value=__otterPrimordialHalf(constructors["Date"],"month",null,null,"get"); if(value!==undefined){primordials["DatePrototypeGetMonth"]=value;break p60;}
+    value=__otterPrimordialMethod(constructors["Date"],"getMonth",null,null); if(value!==undefined){primordials["DatePrototypeGetMonth"]=value;break p60;}
+    value=__otterPrimordialStatic(constructors["Date"],"prototypeGetMonth","PrototypeGetMonth"); if(value!==__otterPrimordialMissing){if(value!==undefined)primordials["DatePrototypeGetMonth"]=value;break p60;}
+  }
+  p61: {
+    value=__otterPrimordialHalf(constructors["Date"],"seconds",null,null,"get"); if(value!==undefined){primordials["DatePrototypeGetSeconds"]=value;break p61;}
+    value=__otterPrimordialMethod(constructors["Date"],"getSeconds",null,null); if(value!==undefined){primordials["DatePrototypeGetSeconds"]=value;break p61;}
+    value=__otterPrimordialStatic(constructors["Date"],"prototypeGetSeconds","PrototypeGetSeconds"); if(value!==__otterPrimordialMissing){if(value!==undefined)primordials["DatePrototypeGetSeconds"]=value;break p61;}
+  }
+  p62: {
+    value=__otterPrimordialHalf(constructors["Date"],"time",null,null,"get"); if(value!==undefined){primordials["DatePrototypeGetTime"]=value;break p62;}
+    value=__otterPrimordialMethod(constructors["Date"],"getTime",null,null); if(value!==undefined){primordials["DatePrototypeGetTime"]=value;break p62;}
+    value=__otterPrimordialStatic(constructors["Date"],"prototypeGetTime","PrototypeGetTime"); if(value!==__otterPrimordialMissing){if(value!==undefined)primordials["DatePrototypeGetTime"]=value;break p62;}
+  }
+  p63: {
+    value=__otterPrimordialMethod(constructors["Date"],"toISOString",null,null); if(value!==undefined){primordials["DatePrototypeToISOString"]=value;break p63;}
+    value=__otterPrimordialStatic(constructors["Date"],"prototypeToISOString","PrototypeToISOString"); if(value!==__otterPrimordialMissing){if(value!==undefined)primordials["DatePrototypeToISOString"]=value;break p63;}
+  }
+  p64: {
+    value=__otterPrimordialMethod(constructors["Date"],"toLocaleString",null,null); if(value!==undefined){primordials["DatePrototypeToLocaleString"]=value;break p64;}
+    value=__otterPrimordialStatic(constructors["Date"],"prototypeToLocaleString","PrototypeToLocaleString"); if(value!==__otterPrimordialMissing){if(value!==undefined)primordials["DatePrototypeToLocaleString"]=value;break p64;}
+  }
+  p65: {
+    value=__otterPrimordialMethod(constructors["Date"],"toString",null,null); if(value!==undefined){primordials["DatePrototypeToString"]=value;break p65;}
+    value=__otterPrimordialStatic(constructors["Date"],"prototypeToString","PrototypeToString"); if(value!==__otterPrimordialMissing){if(value!==undefined)primordials["DatePrototypeToString"]=value;break p65;}
+  }
+  value=constructors["Error"]; if(value!==undefined)primordials["Error"]=value;
+  p67: {
+    value=__otterPrimordialStatic(constructors["Error"],"captureStackTrace","CaptureStackTrace"); if(value!==__otterPrimordialMissing){if(value!==undefined)primordials["ErrorCaptureStackTrace"]=value;break p67;}
+  }
+  p68: {
+    value=__otterPrimordialObject(constructors["Error"]); if(value!==undefined){primordials["ErrorPrototype"]=value;break p68;}
+    value=__otterPrimordialStatic(constructors["Error"],"prototype","Prototype"); if(value!==__otterPrimordialMissing){if(value!==undefined)primordials["ErrorPrototype"]=value;break p68;}
+  }
+  p69: {
+    value=__otterPrimordialMethod(constructors["Error"],"toString",null,null); if(value!==undefined){primordials["ErrorPrototypeToString"]=value;break p69;}
+    value=__otterPrimordialStatic(constructors["Error"],"prototypeToString","PrototypeToString"); if(value!==__otterPrimordialMissing){if(value!==undefined)primordials["ErrorPrototypeToString"]=value;break p69;}
+  }
+  value=constructors["EvalError"]; if(value!==undefined)primordials["EvalError"]=value;
+  value=constructors["FinalizationRegistry"]; if(value!==undefined)primordials["FinalizationRegistry"]=value;
+  value=constructors["Float32Array"]; if(value!==undefined)primordials["Float32Array"]=value;
+  value=constructors["Float64Array"]; if(value!==undefined)primordials["Float64Array"]=value;
+  value=constructors["Function"]; if(value!==undefined)primordials["Function"]=value;
+  p75: {
+    value=__otterPrimordialObject(constructors["Function"]); if(value!==undefined){primordials["FunctionPrototype"]=value;break p75;}
+    value=__otterPrimordialStatic(constructors["Function"],"prototype","Prototype"); if(value!==__otterPrimordialMissing){if(value!==undefined)primordials["FunctionPrototype"]=value;break p75;}
+  }
+  p76: {
+    value=__otterPrimordialMethod(constructors["Function"],"bind",null,null); if(value!==undefined){primordials["FunctionPrototypeBind"]=value;break p76;}
+    value=__otterPrimordialStatic(constructors["Function"],"prototypeBind","PrototypeBind"); if(value!==__otterPrimordialMissing){if(value!==undefined)primordials["FunctionPrototypeBind"]=value;break p76;}
+  }
+  p77: {
+    value=__otterPrimordialMethod(constructors["Function"],"call",null,null); if(value!==undefined){primordials["FunctionPrototypeCall"]=value;break p77;}
+    value=__otterPrimordialStatic(constructors["Function"],"prototypeCall","PrototypeCall"); if(value!==__otterPrimordialMissing){if(value!==undefined)primordials["FunctionPrototypeCall"]=value;break p77;}
+  }
+  p78: {
+    value=__otterPrimordialMethod(constructors["Function"],"symbolHasInstance","SymbolHasInstance","hasInstance"); if(value!==undefined){primordials["FunctionPrototypeSymbolHasInstance"]=value;break p78;}
+    value=__otterPrimordialStatic(constructors["Function"],"prototypeSymbolHasInstance","PrototypeSymbolHasInstance"); if(value!==__otterPrimordialMissing){if(value!==undefined)primordials["FunctionPrototypeSymbolHasInstance"]=value;break p78;}
+  }
+  p79: {
+    value=__otterPrimordialMethod(constructors["Function"],"toString",null,null); if(value!==undefined){primordials["FunctionPrototypeToString"]=value;break p79;}
+    value=__otterPrimordialStatic(constructors["Function"],"prototypeToString","PrototypeToString"); if(value!==__otterPrimordialMissing){if(value!==undefined)primordials["FunctionPrototypeToString"]=value;break p79;}
+  }
+  value=explicit["GeneratorFunction"]; if(value!==undefined)primordials["GeneratorFunction"]=value;
+  value=constructors["Int16Array"]; if(value!==undefined)primordials["Int16Array"]=value;
+  value=constructors["Int32Array"]; if(value!==undefined)primordials["Int32Array"]=value;
+  value=constructors["Int8Array"]; if(value!==undefined)primordials["Int8Array"]=value;
+  value=explicit["IteratorPrototype"]; if(value!==undefined)primordials["IteratorPrototype"]=value;
+  value=namespaces["JSON"]; if(value!==undefined)primordials["JSON"]=value;
+  p86: {
+    value=__otterPrimordialStatic(namespaces["JSON"],"parse","Parse"); if(value!==__otterPrimordialMissing){if(value!==undefined)primordials["JSONParse"]=value;break p86;}
+  }
+  p87: {
+    value=__otterPrimordialStatic(namespaces["JSON"],"stringify","Stringify"); if(value!==__otterPrimordialMissing){if(value!==undefined)primordials["JSONStringify"]=value;break p87;}
+  }
+  value=constructors["Map"]; if(value!==undefined)primordials["Map"]=value;
+  p89: {
+    value=__otterPrimordialObject(constructors["Map"]); if(value!==undefined){primordials["MapPrototype"]=value;break p89;}
+    value=__otterPrimordialStatic(constructors["Map"],"prototype","Prototype"); if(value!==__otterPrimordialMissing){if(value!==undefined)primordials["MapPrototype"]=value;break p89;}
+  }
+  p90: {
+    value=__otterPrimordialMethod(constructors["Map"],"entries",null,null); if(value!==undefined){primordials["MapPrototypeEntries"]=value;break p90;}
+    value=__otterPrimordialStatic(constructors["Map"],"prototypeEntries","PrototypeEntries"); if(value!==__otterPrimordialMissing){if(value!==undefined)primordials["MapPrototypeEntries"]=value;break p90;}
+  }
+  p91: {
+    value=__otterPrimordialMethod(constructors["Map"],"get",null,null); if(value!==undefined){primordials["MapPrototypeGet"]=value;break p91;}
+    value=__otterPrimordialStatic(constructors["Map"],"prototypeGet","PrototypeGet"); if(value!==__otterPrimordialMissing){if(value!==undefined)primordials["MapPrototypeGet"]=value;break p91;}
+  }
+  p92: {
+    value=__otterPrimordialHalf(constructors["Map"],"size",null,null,"get"); if(value!==undefined){primordials["MapPrototypeGetSize"]=value;break p92;}
+    value=__otterPrimordialMethod(constructors["Map"],"getSize",null,null); if(value!==undefined){primordials["MapPrototypeGetSize"]=value;break p92;}
+    value=__otterPrimordialStatic(constructors["Map"],"prototypeGetSize","PrototypeGetSize"); if(value!==__otterPrimordialMissing){if(value!==undefined)primordials["MapPrototypeGetSize"]=value;break p92;}
+  }
+  p93: {
+    value=__otterPrimordialMethod(constructors["Map"],"values",null,null); if(value!==undefined){primordials["MapPrototypeValues"]=value;break p93;}
+    value=__otterPrimordialStatic(constructors["Map"],"prototypeValues","PrototypeValues"); if(value!==__otterPrimordialMissing){if(value!==undefined)primordials["MapPrototypeValues"]=value;break p93;}
+  }
+  value=namespaces["Math"]; if(value!==undefined)primordials["Math"]=value;
+  p95: {
+    value=__otterPrimordialStatic(namespaces["Math"],"abs","Abs"); if(value!==__otterPrimordialMissing){if(value!==undefined)primordials["MathAbs"]=value;break p95;}
+  }
+  p96: {
+    value=__otterPrimordialStatic(namespaces["Math"],"ceil","Ceil"); if(value!==__otterPrimordialMissing){if(value!==undefined)primordials["MathCeil"]=value;break p96;}
+  }
+  p97: {
+    value=__otterPrimordialStatic(namespaces["Math"],"floor","Floor"); if(value!==__otterPrimordialMissing){if(value!==undefined)primordials["MathFloor"]=value;break p97;}
+  }
+  p98: {
+    value=__otterPrimordialStatic(namespaces["Math"],"imul","Imul"); if(value!==__otterPrimordialMissing){if(value!==undefined)primordials["MathImul"]=value;break p98;}
+  }
+  p99: {
+    value=__otterPrimordialStatic(namespaces["Math"],"max","Max"); if(value!==__otterPrimordialMissing){if(value!==undefined)primordials["MathMax"]=value;break p99;}
+  }
+  p100: {
+    value=__otterPrimordialStaticApply(namespaces["Math"],"max","Max"); if(value!==undefined){primordials["MathMaxApply"]=value;break p100;}
+    value=__otterPrimordialStatic(namespaces["Math"],"maxApply","MaxApply"); if(value!==__otterPrimordialMissing){if(value!==undefined)primordials["MathMaxApply"]=value;break p100;}
+  }
+  p101: {
+    value=__otterPrimordialStatic(namespaces["Math"],"min","Min"); if(value!==__otterPrimordialMissing){if(value!==undefined)primordials["MathMin"]=value;break p101;}
+  }
+  p102: {
+    value=__otterPrimordialStatic(namespaces["Math"],"random","Random"); if(value!==__otterPrimordialMissing){if(value!==undefined)primordials["MathRandom"]=value;break p102;}
+  }
+  p103: {
+    value=__otterPrimordialStatic(namespaces["Math"],"round","Round"); if(value!==__otterPrimordialMissing){if(value!==undefined)primordials["MathRound"]=value;break p103;}
+  }
+  p104: {
+    value=__otterPrimordialStatic(namespaces["Math"],"sqrt","Sqrt"); if(value!==__otterPrimordialMissing){if(value!==undefined)primordials["MathSqrt"]=value;break p104;}
+  }
+  p105: {
+    value=__otterPrimordialStatic(namespaces["Math"],"trunc","Trunc"); if(value!==__otterPrimordialMissing){if(value!==undefined)primordials["MathTrunc"]=value;break p105;}
+  }
+  value=constructors["Number"]; if(value!==undefined)primordials["Number"]=value;
+  p107: {
+    value=__otterPrimordialStatic(constructors["Number"],"isFinite","IsFinite"); if(value!==__otterPrimordialMissing){if(value!==undefined)primordials["NumberIsFinite"]=value;break p107;}
+  }
+  p108: {
+    value=__otterPrimordialStatic(constructors["Number"],"isInteger","IsInteger"); if(value!==__otterPrimordialMissing){if(value!==undefined)primordials["NumberIsInteger"]=value;break p108;}
+  }
+  p109: {
+    value=__otterPrimordialStatic(constructors["Number"],"isNaN","IsNaN"); if(value!==__otterPrimordialMissing){if(value!==undefined)primordials["NumberIsNaN"]=value;break p109;}
+  }
+  p110: {
+    value=__otterPrimordialStatic(constructors["Number"],"isSafeInteger","IsSafeInteger"); if(value!==__otterPrimordialMissing){if(value!==undefined)primordials["NumberIsSafeInteger"]=value;break p110;}
+  }
+  p111: {
+    value=__otterPrimordialStatic(constructors["Number"],"MAX_SAFE_INTEGER",null); if(value!==__otterPrimordialMissing){if(value!==undefined)primordials["NumberMAX_SAFE_INTEGER"]=value;break p111;}
+  }
+  p112: {
+    value=__otterPrimordialStatic(constructors["Number"],"MIN_SAFE_INTEGER",null); if(value!==__otterPrimordialMissing){if(value!==undefined)primordials["NumberMIN_SAFE_INTEGER"]=value;break p112;}
+  }
+  p113: {
+    value=__otterPrimordialStatic(constructors["Number"],"parseFloat","ParseFloat"); if(value!==__otterPrimordialMissing){if(value!==undefined)primordials["NumberParseFloat"]=value;break p113;}
+  }
+  p114: {
+    value=__otterPrimordialStatic(constructors["Number"],"parseInt","ParseInt"); if(value!==__otterPrimordialMissing){if(value!==undefined)primordials["NumberParseInt"]=value;break p114;}
+  }
+  p115: {
+    value=__otterPrimordialObject(constructors["Number"]); if(value!==undefined){primordials["NumberPrototype"]=value;break p115;}
+    value=__otterPrimordialStatic(constructors["Number"],"prototype","Prototype"); if(value!==__otterPrimordialMissing){if(value!==undefined)primordials["NumberPrototype"]=value;break p115;}
+  }
+  p116: {
+    value=__otterPrimordialMethod(constructors["Number"],"toFixed",null,null); if(value!==undefined){primordials["NumberPrototypeToFixed"]=value;break p116;}
+    value=__otterPrimordialStatic(constructors["Number"],"prototypeToFixed","PrototypeToFixed"); if(value!==__otterPrimordialMissing){if(value!==undefined)primordials["NumberPrototypeToFixed"]=value;break p116;}
+  }
+  p117: {
+    value=__otterPrimordialMethod(constructors["Number"],"toString",null,null); if(value!==undefined){primordials["NumberPrototypeToString"]=value;break p117;}
+    value=__otterPrimordialStatic(constructors["Number"],"prototypeToString","PrototypeToString"); if(value!==__otterPrimordialMissing){if(value!==undefined)primordials["NumberPrototypeToString"]=value;break p117;}
+  }
+  p118: {
+    value=__otterPrimordialMethod(constructors["Number"],"valueOf",null,null); if(value!==undefined){primordials["NumberPrototypeValueOf"]=value;break p118;}
+    value=__otterPrimordialStatic(constructors["Number"],"prototypeValueOf","PrototypeValueOf"); if(value!==__otterPrimordialMissing){if(value!==undefined)primordials["NumberPrototypeValueOf"]=value;break p118;}
+  }
+  value=constructors["Object"]; if(value!==undefined)primordials["Object"]=value;
+  p120: {
+    value=__otterPrimordialStatic(constructors["Object"],"assign","Assign"); if(value!==__otterPrimordialMissing){if(value!==undefined)primordials["ObjectAssign"]=value;break p120;}
+  }
+  p121: {
+    value=__otterPrimordialStatic(constructors["Object"],"create","Create"); if(value!==__otterPrimordialMissing){if(value!==undefined)primordials["ObjectCreate"]=value;break p121;}
+  }
+  p122: {
+    value=__otterPrimordialStatic(constructors["Object"],"defineProperties","DefineProperties"); if(value!==__otterPrimordialMissing){if(value!==undefined)primordials["ObjectDefineProperties"]=value;break p122;}
+  }
+  p123: {
+    value=__otterPrimordialStatic(constructors["Object"],"defineProperty","DefineProperty"); if(value!==__otterPrimordialMissing){if(value!==undefined)primordials["ObjectDefineProperty"]=value;break p123;}
+  }
+  p124: {
+    value=__otterPrimordialStatic(constructors["Object"],"entries","Entries"); if(value!==__otterPrimordialMissing){if(value!==undefined)primordials["ObjectEntries"]=value;break p124;}
+  }
+  p125: {
+    value=__otterPrimordialStatic(constructors["Object"],"freeze","Freeze"); if(value!==__otterPrimordialMissing){if(value!==undefined)primordials["ObjectFreeze"]=value;break p125;}
+  }
+  p126: {
+    value=__otterPrimordialStatic(constructors["Object"],"getOwnPropertyDescriptor","GetOwnPropertyDescriptor"); if(value!==__otterPrimordialMissing){if(value!==undefined)primordials["ObjectGetOwnPropertyDescriptor"]=value;break p126;}
+  }
+  p127: {
+    value=__otterPrimordialStatic(constructors["Object"],"getOwnPropertyDescriptors","GetOwnPropertyDescriptors"); if(value!==__otterPrimordialMissing){if(value!==undefined)primordials["ObjectGetOwnPropertyDescriptors"]=value;break p127;}
+  }
+  p128: {
+    value=__otterPrimordialStatic(constructors["Object"],"getOwnPropertyNames","GetOwnPropertyNames"); if(value!==__otterPrimordialMissing){if(value!==undefined)primordials["ObjectGetOwnPropertyNames"]=value;break p128;}
+  }
+  p129: {
+    value=__otterPrimordialStatic(constructors["Object"],"getOwnPropertySymbols","GetOwnPropertySymbols"); if(value!==__otterPrimordialMissing){if(value!==undefined)primordials["ObjectGetOwnPropertySymbols"]=value;break p129;}
+  }
+  p130: {
+    value=__otterPrimordialMethod(constructors["ObjectGet"],"of",null,null); if(value!==undefined){primordials["ObjectGetPrototypeOf"]=value;break p130;}
+    value=__otterPrimordialStatic(constructors["Object"],"getPrototypeOf","GetPrototypeOf"); if(value!==__otterPrimordialMissing){if(value!==undefined)primordials["ObjectGetPrototypeOf"]=value;break p130;}
+  }
+  p131: {
+    value=__otterPrimordialStatic(constructors["Object"],"hasOwn","HasOwn"); if(value!==__otterPrimordialMissing){if(value!==undefined)primordials["ObjectHasOwn"]=value;break p131;}
+  }
+  p132: {
+    value=__otterPrimordialStatic(constructors["Object"],"is","Is"); if(value!==__otterPrimordialMissing){if(value!==undefined)primordials["ObjectIs"]=value;break p132;}
+  }
+  p133: {
+    value=__otterPrimordialStatic(constructors["Object"],"isExtensible","IsExtensible"); if(value!==__otterPrimordialMissing){if(value!==undefined)primordials["ObjectIsExtensible"]=value;break p133;}
+  }
+  p134: {
+    value=__otterPrimordialStatic(constructors["Object"],"keys","Keys"); if(value!==__otterPrimordialMissing){if(value!==undefined)primordials["ObjectKeys"]=value;break p134;}
+  }
+  p135: {
+    value=__otterPrimordialObject(constructors["Object"]); if(value!==undefined){primordials["ObjectPrototype"]=value;break p135;}
+    value=__otterPrimordialStatic(constructors["Object"],"prototype","Prototype"); if(value!==__otterPrimordialMissing){if(value!==undefined)primordials["ObjectPrototype"]=value;break p135;}
+  }
+  p136: {
+    value=__otterPrimordialMethod(constructors["Object"],"hasOwnProperty",null,null); if(value!==undefined){primordials["ObjectPrototypeHasOwnProperty"]=value;break p136;}
+    value=__otterPrimordialStatic(constructors["Object"],"prototypeHasOwnProperty","PrototypeHasOwnProperty"); if(value!==__otterPrimordialMissing){if(value!==undefined)primordials["ObjectPrototypeHasOwnProperty"]=value;break p136;}
+  }
+  p137: {
+    value=__otterPrimordialMethod(constructors["Object"],"isPrototypeOf",null,null); if(value!==undefined){primordials["ObjectPrototypeIsPrototypeOf"]=value;break p137;}
+    value=__otterPrimordialStatic(constructors["Object"],"prototypeIsPrototypeOf","PrototypeIsPrototypeOf"); if(value!==__otterPrimordialMissing){if(value!==undefined)primordials["ObjectPrototypeIsPrototypeOf"]=value;break p137;}
+  }
+  p138: {
+    value=__otterPrimordialMethod(constructors["Object"],"propertyIsEnumerable",null,null); if(value!==undefined){primordials["ObjectPrototypePropertyIsEnumerable"]=value;break p138;}
+    value=__otterPrimordialStatic(constructors["Object"],"prototypePropertyIsEnumerable","PrototypePropertyIsEnumerable"); if(value!==__otterPrimordialMissing){if(value!==undefined)primordials["ObjectPrototypePropertyIsEnumerable"]=value;break p138;}
+  }
+  p139: {
+    value=__otterPrimordialMethod(constructors["Object"],"toString",null,null); if(value!==undefined){primordials["ObjectPrototypeToString"]=value;break p139;}
+    value=__otterPrimordialStatic(constructors["Object"],"prototypeToString","PrototypeToString"); if(value!==__otterPrimordialMissing){if(value!==undefined)primordials["ObjectPrototypeToString"]=value;break p139;}
+  }
+  p140: {
+    value=__otterPrimordialStatic(constructors["Object"],"seal","Seal"); if(value!==__otterPrimordialMissing){if(value!==undefined)primordials["ObjectSeal"]=value;break p140;}
+  }
+  p141: {
+    value=__otterPrimordialMethod(constructors["ObjectSet"],"of",null,null); if(value!==undefined){primordials["ObjectSetPrototypeOf"]=value;break p141;}
+    value=__otterPrimordialStatic(constructors["Object"],"setPrototypeOf","SetPrototypeOf"); if(value!==__otterPrimordialMissing){if(value!==undefined)primordials["ObjectSetPrototypeOf"]=value;break p141;}
+  }
+  p142: {
+    value=__otterPrimordialStatic(constructors["Object"],"values","Values"); if(value!==__otterPrimordialMissing){if(value!==undefined)primordials["ObjectValues"]=value;break p142;}
+  }
+  value=constructors["Promise"]; if(value!==undefined)primordials["Promise"]=value;
+  p144: {
+    value=__otterPrimordialObject(constructors["Promise"]); if(value!==undefined){primordials["PromisePrototype"]=value;break p144;}
+    value=__otterPrimordialStatic(constructors["Promise"],"prototype","Prototype"); if(value!==__otterPrimordialMissing){if(value!==undefined)primordials["PromisePrototype"]=value;break p144;}
+  }
+  value=explicit["PromisePrototypeCatch"]; if(value!==undefined)primordials["PromisePrototypeCatch"]=value;
+  p146: {
+    value=__otterPrimordialMethod(constructors["Promise"],"then",null,null); if(value!==undefined){primordials["PromisePrototypeThen"]=value;break p146;}
+    value=__otterPrimordialStatic(constructors["Promise"],"prototypeThen","PrototypeThen"); if(value!==__otterPrimordialMissing){if(value!==undefined)primordials["PromisePrototypeThen"]=value;break p146;}
+  }
+  p147: {
+    value=__otterPrimordialStatic(constructors["Promise"],"reject","Reject"); if(value!==__otterPrimordialMissing){if(value!==undefined)primordials["PromiseReject"]=value;break p147;}
+  }
+  p148: {
+    value=__otterPrimordialStatic(constructors["Promise"],"resolve","Resolve"); if(value!==__otterPrimordialMissing){if(value!==undefined)primordials["PromiseResolve"]=value;break p148;}
+  }
+  p149: {
+    value=__otterPrimordialStatic(constructors["Promise"],"withResolvers","WithResolvers"); if(value!==__otterPrimordialMissing){if(value!==undefined)primordials["PromiseWithResolvers"]=value;break p149;}
+  }
+  value=constructors["Proxy"]; if(value!==undefined)primordials["Proxy"]=value;
+  value=constructors["RangeError"]; if(value!==undefined)primordials["RangeError"]=value;
+  p152: {
+    value=__otterPrimordialObject(constructors["RangeError"]); if(value!==undefined){primordials["RangeErrorPrototype"]=value;break p152;}
+    value=__otterPrimordialStatic(constructors["RangeError"],"prototype","Prototype"); if(value!==__otterPrimordialMissing){if(value!==undefined)primordials["RangeErrorPrototype"]=value;break p152;}
+  }
+  value=constructors["ReferenceError"]; if(value!==undefined)primordials["ReferenceError"]=value;
+  value=namespaces["Reflect"]; if(value!==undefined)primordials["Reflect"]=value;
+  p155: {
+    value=__otterPrimordialStatic(namespaces["Reflect"],"apply","Apply"); if(value!==__otterPrimordialMissing){if(value!==undefined)primordials["ReflectApply"]=value;break p155;}
+  }
+  p156: {
+    value=__otterPrimordialStatic(namespaces["Reflect"],"construct","Construct"); if(value!==__otterPrimordialMissing){if(value!==undefined)primordials["ReflectConstruct"]=value;break p156;}
+  }
+  p157: {
+    value=__otterPrimordialStatic(namespaces["Reflect"],"defineProperty","DefineProperty"); if(value!==__otterPrimordialMissing){if(value!==undefined)primordials["ReflectDefineProperty"]=value;break p157;}
+  }
+  p158: {
+    value=__otterPrimordialStatic(namespaces["Reflect"],"get","Get"); if(value!==__otterPrimordialMissing){if(value!==undefined)primordials["ReflectGet"]=value;break p158;}
+  }
+  p159: {
+    value=__otterPrimordialStatic(namespaces["Reflect"],"getOwnPropertyDescriptor","GetOwnPropertyDescriptor"); if(value!==__otterPrimordialMissing){if(value!==undefined)primordials["ReflectGetOwnPropertyDescriptor"]=value;break p159;}
+  }
+  p160: {
+    value=__otterPrimordialStatic(namespaces["Reflect"],"ownKeys","OwnKeys"); if(value!==__otterPrimordialMissing){if(value!==undefined)primordials["ReflectOwnKeys"]=value;break p160;}
+  }
+  value=constructors["RegExp"]; if(value!==undefined)primordials["RegExp"]=value;
+  p162: {
+    value=__otterPrimordialObject(constructors["RegExp"]); if(value!==undefined){primordials["RegExpPrototype"]=value;break p162;}
+    value=__otterPrimordialStatic(constructors["RegExp"],"prototype","Prototype"); if(value!==__otterPrimordialMissing){if(value!==undefined)primordials["RegExpPrototype"]=value;break p162;}
+  }
+  p163: {
+    value=__otterPrimordialMethod(constructors["RegExp"],"exec",null,null); if(value!==undefined){primordials["RegExpPrototypeExec"]=value;break p163;}
+    value=__otterPrimordialStatic(constructors["RegExp"],"prototypeExec","PrototypeExec"); if(value!==__otterPrimordialMissing){if(value!==undefined)primordials["RegExpPrototypeExec"]=value;break p163;}
+  }
+  p164: {
+    value=__otterPrimordialHalf(constructors["RegExp"],"dotAll",null,null,"get"); if(value!==undefined){primordials["RegExpPrototypeGetDotAll"]=value;break p164;}
+    value=__otterPrimordialMethod(constructors["RegExp"],"getDotAll",null,null); if(value!==undefined){primordials["RegExpPrototypeGetDotAll"]=value;break p164;}
+    value=__otterPrimordialStatic(constructors["RegExp"],"prototypeGetDotAll","PrototypeGetDotAll"); if(value!==__otterPrimordialMissing){if(value!==undefined)primordials["RegExpPrototypeGetDotAll"]=value;break p164;}
+  }
+  p165: {
+    value=__otterPrimordialHalf(constructors["RegExp"],"global",null,null,"get"); if(value!==undefined){primordials["RegExpPrototypeGetGlobal"]=value;break p165;}
+    value=__otterPrimordialMethod(constructors["RegExp"],"getGlobal",null,null); if(value!==undefined){primordials["RegExpPrototypeGetGlobal"]=value;break p165;}
+    value=__otterPrimordialStatic(constructors["RegExp"],"prototypeGetGlobal","PrototypeGetGlobal"); if(value!==__otterPrimordialMissing){if(value!==undefined)primordials["RegExpPrototypeGetGlobal"]=value;break p165;}
+  }
+  p166: {
+    value=__otterPrimordialHalf(constructors["RegExp"],"hasIndices",null,null,"get"); if(value!==undefined){primordials["RegExpPrototypeGetHasIndices"]=value;break p166;}
+    value=__otterPrimordialMethod(constructors["RegExp"],"getHasIndices",null,null); if(value!==undefined){primordials["RegExpPrototypeGetHasIndices"]=value;break p166;}
+    value=__otterPrimordialStatic(constructors["RegExp"],"prototypeGetHasIndices","PrototypeGetHasIndices"); if(value!==__otterPrimordialMissing){if(value!==undefined)primordials["RegExpPrototypeGetHasIndices"]=value;break p166;}
+  }
+  p167: {
+    value=__otterPrimordialHalf(constructors["RegExp"],"ignoreCase",null,null,"get"); if(value!==undefined){primordials["RegExpPrototypeGetIgnoreCase"]=value;break p167;}
+    value=__otterPrimordialMethod(constructors["RegExp"],"getIgnoreCase",null,null); if(value!==undefined){primordials["RegExpPrototypeGetIgnoreCase"]=value;break p167;}
+    value=__otterPrimordialStatic(constructors["RegExp"],"prototypeGetIgnoreCase","PrototypeGetIgnoreCase"); if(value!==__otterPrimordialMissing){if(value!==undefined)primordials["RegExpPrototypeGetIgnoreCase"]=value;break p167;}
+  }
+  p168: {
+    value=__otterPrimordialHalf(constructors["RegExp"],"multiline",null,null,"get"); if(value!==undefined){primordials["RegExpPrototypeGetMultiline"]=value;break p168;}
+    value=__otterPrimordialMethod(constructors["RegExp"],"getMultiline",null,null); if(value!==undefined){primordials["RegExpPrototypeGetMultiline"]=value;break p168;}
+    value=__otterPrimordialStatic(constructors["RegExp"],"prototypeGetMultiline","PrototypeGetMultiline"); if(value!==__otterPrimordialMissing){if(value!==undefined)primordials["RegExpPrototypeGetMultiline"]=value;break p168;}
+  }
+  p169: {
+    value=__otterPrimordialHalf(constructors["RegExp"],"source",null,null,"get"); if(value!==undefined){primordials["RegExpPrototypeGetSource"]=value;break p169;}
+    value=__otterPrimordialMethod(constructors["RegExp"],"getSource",null,null); if(value!==undefined){primordials["RegExpPrototypeGetSource"]=value;break p169;}
+    value=__otterPrimordialStatic(constructors["RegExp"],"prototypeGetSource","PrototypeGetSource"); if(value!==__otterPrimordialMissing){if(value!==undefined)primordials["RegExpPrototypeGetSource"]=value;break p169;}
+  }
+  p170: {
+    value=__otterPrimordialHalf(constructors["RegExp"],"sticky",null,null,"get"); if(value!==undefined){primordials["RegExpPrototypeGetSticky"]=value;break p170;}
+    value=__otterPrimordialMethod(constructors["RegExp"],"getSticky",null,null); if(value!==undefined){primordials["RegExpPrototypeGetSticky"]=value;break p170;}
+    value=__otterPrimordialStatic(constructors["RegExp"],"prototypeGetSticky","PrototypeGetSticky"); if(value!==__otterPrimordialMissing){if(value!==undefined)primordials["RegExpPrototypeGetSticky"]=value;break p170;}
+  }
+  p171: {
+    value=__otterPrimordialHalf(constructors["RegExp"],"unicode",null,null,"get"); if(value!==undefined){primordials["RegExpPrototypeGetUnicode"]=value;break p171;}
+    value=__otterPrimordialMethod(constructors["RegExp"],"getUnicode",null,null); if(value!==undefined){primordials["RegExpPrototypeGetUnicode"]=value;break p171;}
+    value=__otterPrimordialStatic(constructors["RegExp"],"prototypeGetUnicode","PrototypeGetUnicode"); if(value!==__otterPrimordialMissing){if(value!==undefined)primordials["RegExpPrototypeGetUnicode"]=value;break p171;}
+  }
+  p172: {
+    value=__otterPrimordialMethod(constructors["RegExp"],"symbolReplace","SymbolReplace","replace"); if(value!==undefined){primordials["RegExpPrototypeSymbolReplace"]=value;break p172;}
+    value=__otterPrimordialStatic(constructors["RegExp"],"prototypeSymbolReplace","PrototypeSymbolReplace"); if(value!==__otterPrimordialMissing){if(value!==undefined)primordials["RegExpPrototypeSymbolReplace"]=value;break p172;}
+  }
+  p173: {
+    value=__otterPrimordialMethod(constructors["RegExp"],"symbolSplit","SymbolSplit","split"); if(value!==undefined){primordials["RegExpPrototypeSymbolSplit"]=value;break p173;}
+    value=__otterPrimordialStatic(constructors["RegExp"],"prototypeSymbolSplit","PrototypeSymbolSplit"); if(value!==__otterPrimordialMissing){if(value!==undefined)primordials["RegExpPrototypeSymbolSplit"]=value;break p173;}
+  }
+  p174: {
+    value=__otterPrimordialMethod(constructors["RegExp"],"test",null,null); if(value!==undefined){primordials["RegExpPrototypeTest"]=value;break p174;}
+    value=__otterPrimordialStatic(constructors["RegExp"],"prototypeTest","PrototypeTest"); if(value!==__otterPrimordialMissing){if(value!==undefined)primordials["RegExpPrototypeTest"]=value;break p174;}
+  }
+  p175: {
+    value=__otterPrimordialMethod(constructors["RegExp"],"toString",null,null); if(value!==undefined){primordials["RegExpPrototypeToString"]=value;break p175;}
+    value=__otterPrimordialStatic(constructors["RegExp"],"prototypeToString","PrototypeToString"); if(value!==__otterPrimordialMissing){if(value!==undefined)primordials["RegExpPrototypeToString"]=value;break p175;}
+  }
+  value=explicit["SafeArrayIterator"]; if(value!==undefined)primordials["SafeArrayIterator"]=value;
+  value=explicit["SafeFinalizationRegistry"]; if(value!==undefined)primordials["SafeFinalizationRegistry"]=value;
+  value=explicit["SafeMap"]; if(value!==undefined)primordials["SafeMap"]=value;
+  value=explicit["SafePromiseAll"]; if(value!==undefined)primordials["SafePromiseAll"]=value;
+  value=explicit["SafePromiseAllReturnArrayLike"]; if(value!==undefined)primordials["SafePromiseAllReturnArrayLike"]=value;
+  value=explicit["SafePromiseAllReturnVoid"]; if(value!==undefined)primordials["SafePromiseAllReturnVoid"]=value;
+  value=explicit["SafePromiseAllSettled"]; if(value!==undefined)primordials["SafePromiseAllSettled"]=value;
+  value=explicit["SafePromiseAllSettledReturnVoid"]; if(value!==undefined)primordials["SafePromiseAllSettledReturnVoid"]=value;
+  value=explicit["SafePromisePrototypeFinally"]; if(value!==undefined)primordials["SafePromisePrototypeFinally"]=value;
+  value=explicit["SafePromiseRace"]; if(value!==undefined)primordials["SafePromiseRace"]=value;
+  value=explicit["SafeSet"]; if(value!==undefined)primordials["SafeSet"]=value;
+  value=explicit["SafeStringIterator"]; if(value!==undefined)primordials["SafeStringIterator"]=value;
+  value=explicit["SafeStringPrototypeSearch"]; if(value!==undefined)primordials["SafeStringPrototypeSearch"]=value;
+  value=explicit["SafeWeakMap"]; if(value!==undefined)primordials["SafeWeakMap"]=value;
+  value=explicit["SafeWeakRef"]; if(value!==undefined)primordials["SafeWeakRef"]=value;
+  value=explicit["SafeWeakSet"]; if(value!==undefined)primordials["SafeWeakSet"]=value;
+  value=constructors["Set"]; if(value!==undefined)primordials["Set"]=value;
+  p193: {
+    value=__otterPrimordialObject(constructors["Set"]); if(value!==undefined){primordials["SetPrototype"]=value;break p193;}
+    value=__otterPrimordialStatic(constructors["Set"],"prototype","Prototype"); if(value!==__otterPrimordialMissing){if(value!==undefined)primordials["SetPrototype"]=value;break p193;}
+  }
+  p194: {
+    value=__otterPrimordialHalf(constructors["Set"],"size",null,null,"get"); if(value!==undefined){primordials["SetPrototypeGetSize"]=value;break p194;}
+    value=__otterPrimordialMethod(constructors["Set"],"getSize",null,null); if(value!==undefined){primordials["SetPrototypeGetSize"]=value;break p194;}
+    value=__otterPrimordialStatic(constructors["Set"],"prototypeGetSize","PrototypeGetSize"); if(value!==__otterPrimordialMissing){if(value!==undefined)primordials["SetPrototypeGetSize"]=value;break p194;}
+  }
+  p195: {
+    value=__otterPrimordialMethod(constructors["Set"],"union",null,null); if(value!==undefined){primordials["SetPrototypeUnion"]=value;break p195;}
+    value=__otterPrimordialStatic(constructors["Set"],"prototypeUnion","PrototypeUnion"); if(value!==__otterPrimordialMissing){if(value!==undefined)primordials["SetPrototypeUnion"]=value;break p195;}
+  }
+  p196: {
+    value=__otterPrimordialMethod(constructors["Set"],"values",null,null); if(value!==undefined){primordials["SetPrototypeValues"]=value;break p196;}
+    value=__otterPrimordialStatic(constructors["Set"],"prototypeValues","PrototypeValues"); if(value!==__otterPrimordialMissing){if(value!==undefined)primordials["SetPrototypeValues"]=value;break p196;}
+  }
+  value=constructors["SharedArrayBuffer"]; if(value!==undefined)primordials["SharedArrayBuffer"]=value;
+  value=constructors["String"]; if(value!==undefined)primordials["String"]=value;
+  p199: {
+    value=__otterPrimordialStatic(constructors["String"],"fromCharCode","FromCharCode"); if(value!==__otterPrimordialMissing){if(value!==undefined)primordials["StringFromCharCode"]=value;break p199;}
+  }
+  p200: {
+    value=__otterPrimordialObject(constructors["String"]); if(value!==undefined){primordials["StringPrototype"]=value;break p200;}
+    value=__otterPrimordialStatic(constructors["String"],"prototype","Prototype"); if(value!==__otterPrimordialMissing){if(value!==undefined)primordials["StringPrototype"]=value;break p200;}
+  }
+  p201: {
+    value=__otterPrimordialMethod(constructors["String"],"charAt",null,null); if(value!==undefined){primordials["StringPrototypeCharAt"]=value;break p201;}
+    value=__otterPrimordialStatic(constructors["String"],"prototypeCharAt","PrototypeCharAt"); if(value!==__otterPrimordialMissing){if(value!==undefined)primordials["StringPrototypeCharAt"]=value;break p201;}
+  }
+  p202: {
+    value=__otterPrimordialMethod(constructors["String"],"charCodeAt",null,null); if(value!==undefined){primordials["StringPrototypeCharCodeAt"]=value;break p202;}
+    value=__otterPrimordialStatic(constructors["String"],"prototypeCharCodeAt","PrototypeCharCodeAt"); if(value!==__otterPrimordialMissing){if(value!==undefined)primordials["StringPrototypeCharCodeAt"]=value;break p202;}
+  }
+  p203: {
+    value=__otterPrimordialMethod(constructors["String"],"codePointAt",null,null); if(value!==undefined){primordials["StringPrototypeCodePointAt"]=value;break p203;}
+    value=__otterPrimordialStatic(constructors["String"],"prototypeCodePointAt","PrototypeCodePointAt"); if(value!==__otterPrimordialMissing){if(value!==undefined)primordials["StringPrototypeCodePointAt"]=value;break p203;}
+  }
+  p204: {
+    value=__otterPrimordialMethod(constructors["String"],"endsWith",null,null); if(value!==undefined){primordials["StringPrototypeEndsWith"]=value;break p204;}
+    value=__otterPrimordialStatic(constructors["String"],"prototypeEndsWith","PrototypeEndsWith"); if(value!==__otterPrimordialMissing){if(value!==undefined)primordials["StringPrototypeEndsWith"]=value;break p204;}
+  }
+  p205: {
+    value=__otterPrimordialMethod(constructors["String"],"includes",null,null); if(value!==undefined){primordials["StringPrototypeIncludes"]=value;break p205;}
+    value=__otterPrimordialStatic(constructors["String"],"prototypeIncludes","PrototypeIncludes"); if(value!==__otterPrimordialMissing){if(value!==undefined)primordials["StringPrototypeIncludes"]=value;break p205;}
+  }
+  p206: {
+    value=__otterPrimordialMethod(constructors["String"],"indexOf",null,null); if(value!==undefined){primordials["StringPrototypeIndexOf"]=value;break p206;}
+    value=__otterPrimordialStatic(constructors["String"],"prototypeIndexOf","PrototypeIndexOf"); if(value!==__otterPrimordialMissing){if(value!==undefined)primordials["StringPrototypeIndexOf"]=value;break p206;}
+  }
+  p207: {
+    value=__otterPrimordialMethod(constructors["String"],"lastIndexOf",null,null); if(value!==undefined){primordials["StringPrototypeLastIndexOf"]=value;break p207;}
+    value=__otterPrimordialStatic(constructors["String"],"prototypeLastIndexOf","PrototypeLastIndexOf"); if(value!==__otterPrimordialMissing){if(value!==undefined)primordials["StringPrototypeLastIndexOf"]=value;break p207;}
+  }
+  p208: {
+    value=__otterPrimordialMethod(constructors["String"],"localeCompare",null,null); if(value!==undefined){primordials["StringPrototypeLocaleCompare"]=value;break p208;}
+    value=__otterPrimordialStatic(constructors["String"],"prototypeLocaleCompare","PrototypeLocaleCompare"); if(value!==__otterPrimordialMissing){if(value!==undefined)primordials["StringPrototypeLocaleCompare"]=value;break p208;}
+  }
+  p209: {
+    value=__otterPrimordialMethod(constructors["String"],"normalize",null,null); if(value!==undefined){primordials["StringPrototypeNormalize"]=value;break p209;}
+    value=__otterPrimordialStatic(constructors["String"],"prototypeNormalize","PrototypeNormalize"); if(value!==__otterPrimordialMissing){if(value!==undefined)primordials["StringPrototypeNormalize"]=value;break p209;}
+  }
+  p210: {
+    value=__otterPrimordialMethod(constructors["String"],"padEnd",null,null); if(value!==undefined){primordials["StringPrototypePadEnd"]=value;break p210;}
+    value=__otterPrimordialStatic(constructors["String"],"prototypePadEnd","PrototypePadEnd"); if(value!==__otterPrimordialMissing){if(value!==undefined)primordials["StringPrototypePadEnd"]=value;break p210;}
+  }
+  p211: {
+    value=__otterPrimordialMethod(constructors["String"],"padStart",null,null); if(value!==undefined){primordials["StringPrototypePadStart"]=value;break p211;}
+    value=__otterPrimordialStatic(constructors["String"],"prototypePadStart","PrototypePadStart"); if(value!==__otterPrimordialMissing){if(value!==undefined)primordials["StringPrototypePadStart"]=value;break p211;}
+  }
+  p212: {
+    value=__otterPrimordialMethod(constructors["String"],"repeat",null,null); if(value!==undefined){primordials["StringPrototypeRepeat"]=value;break p212;}
+    value=__otterPrimordialStatic(constructors["String"],"prototypeRepeat","PrototypeRepeat"); if(value!==__otterPrimordialMissing){if(value!==undefined)primordials["StringPrototypeRepeat"]=value;break p212;}
+  }
+  p213: {
+    value=__otterPrimordialMethod(constructors["String"],"replace",null,null); if(value!==undefined){primordials["StringPrototypeReplace"]=value;break p213;}
+    value=__otterPrimordialStatic(constructors["String"],"prototypeReplace","PrototypeReplace"); if(value!==__otterPrimordialMissing){if(value!==undefined)primordials["StringPrototypeReplace"]=value;break p213;}
+  }
+  p214: {
+    value=__otterPrimordialMethod(constructors["String"],"replaceAll",null,null); if(value!==undefined){primordials["StringPrototypeReplaceAll"]=value;break p214;}
+    value=__otterPrimordialStatic(constructors["String"],"prototypeReplaceAll","PrototypeReplaceAll"); if(value!==__otterPrimordialMissing){if(value!==undefined)primordials["StringPrototypeReplaceAll"]=value;break p214;}
+  }
+  p215: {
+    value=__otterPrimordialMethod(constructors["String"],"slice",null,null); if(value!==undefined){primordials["StringPrototypeSlice"]=value;break p215;}
+    value=__otterPrimordialStatic(constructors["String"],"prototypeSlice","PrototypeSlice"); if(value!==__otterPrimordialMissing){if(value!==undefined)primordials["StringPrototypeSlice"]=value;break p215;}
+  }
+  p216: {
+    value=__otterPrimordialMethod(constructors["String"],"split",null,null); if(value!==undefined){primordials["StringPrototypeSplit"]=value;break p216;}
+    value=__otterPrimordialStatic(constructors["String"],"prototypeSplit","PrototypeSplit"); if(value!==__otterPrimordialMissing){if(value!==undefined)primordials["StringPrototypeSplit"]=value;break p216;}
+  }
+  p217: {
+    value=__otterPrimordialMethod(constructors["String"],"startsWith",null,null); if(value!==undefined){primordials["StringPrototypeStartsWith"]=value;break p217;}
+    value=__otterPrimordialStatic(constructors["String"],"prototypeStartsWith","PrototypeStartsWith"); if(value!==__otterPrimordialMissing){if(value!==undefined)primordials["StringPrototypeStartsWith"]=value;break p217;}
+  }
+  p218: {
+    value=__otterPrimordialMethod(constructors["String"],"substring",null,null); if(value!==undefined){primordials["StringPrototypeSubstring"]=value;break p218;}
+    value=__otterPrimordialStatic(constructors["String"],"prototypeSubstring","PrototypeSubstring"); if(value!==__otterPrimordialMissing){if(value!==undefined)primordials["StringPrototypeSubstring"]=value;break p218;}
+  }
+  p219: {
+    value=__otterPrimordialMethod(constructors["String"],"toLowerCase",null,null); if(value!==undefined){primordials["StringPrototypeToLowerCase"]=value;break p219;}
+    value=__otterPrimordialStatic(constructors["String"],"prototypeToLowerCase","PrototypeToLowerCase"); if(value!==__otterPrimordialMissing){if(value!==undefined)primordials["StringPrototypeToLowerCase"]=value;break p219;}
+  }
+  p220: {
+    value=__otterPrimordialMethod(constructors["String"],"toUpperCase",null,null); if(value!==undefined){primordials["StringPrototypeToUpperCase"]=value;break p220;}
+    value=__otterPrimordialStatic(constructors["String"],"prototypeToUpperCase","PrototypeToUpperCase"); if(value!==__otterPrimordialMissing){if(value!==undefined)primordials["StringPrototypeToUpperCase"]=value;break p220;}
+  }
+  p221: {
+    value=__otterPrimordialMethod(constructors["String"],"toWellFormed",null,null); if(value!==undefined){primordials["StringPrototypeToWellFormed"]=value;break p221;}
+    value=__otterPrimordialStatic(constructors["String"],"prototypeToWellFormed","PrototypeToWellFormed"); if(value!==__otterPrimordialMissing){if(value!==undefined)primordials["StringPrototypeToWellFormed"]=value;break p221;}
+  }
+  p222: {
+    value=__otterPrimordialMethod(constructors["String"],"trim",null,null); if(value!==undefined){primordials["StringPrototypeTrim"]=value;break p222;}
+    value=__otterPrimordialStatic(constructors["String"],"prototypeTrim","PrototypeTrim"); if(value!==__otterPrimordialMissing){if(value!==undefined)primordials["StringPrototypeTrim"]=value;break p222;}
+  }
+  p223: {
+    value=__otterPrimordialMethod(constructors["String"],"valueOf",null,null); if(value!==undefined){primordials["StringPrototypeValueOf"]=value;break p223;}
+    value=__otterPrimordialStatic(constructors["String"],"prototypeValueOf","PrototypeValueOf"); if(value!==__otterPrimordialMissing){if(value!==undefined)primordials["StringPrototypeValueOf"]=value;break p223;}
+  }
+  value=constructors["Symbol"]; if(value!==undefined)primordials["Symbol"]=value;
+  value=symbolWells["SymbolAsyncDispose"]; if(value!==undefined)primordials["SymbolAsyncDispose"]=value;
+  value=symbolWells["SymbolAsyncIterator"]; if(value!==undefined)primordials["SymbolAsyncIterator"]=value;
+  value=symbolWells["SymbolDispose"]; if(value!==undefined)primordials["SymbolDispose"]=value;
+  value=symbolWells["SymbolFor"]; if(value!==undefined)primordials["SymbolFor"]=value;
+  value=symbolWells["SymbolHasInstance"]; if(value!==undefined)primordials["SymbolHasInstance"]=value;
+  value=symbolWells["SymbolIterator"]; if(value!==undefined)primordials["SymbolIterator"]=value;
+  value=symbolWells["SymbolKeyFor"]; if(value!==undefined)primordials["SymbolKeyFor"]=value;
+  p232: {
+    value=__otterPrimordialHalf(constructors["Symbol"],"description",null,null,"get"); if(value!==undefined){primordials["SymbolPrototypeGetDescription"]=value;break p232;}
+    value=__otterPrimordialMethod(constructors["Symbol"],"getDescription",null,null); if(value!==undefined){primordials["SymbolPrototypeGetDescription"]=value;break p232;}
+    value=__otterPrimordialStatic(constructors["Symbol"],"prototypeGetDescription","PrototypeGetDescription"); if(value!==__otterPrimordialMissing){if(value!==undefined)primordials["SymbolPrototypeGetDescription"]=value;break p232;}
+  }
+  p233: {
+    value=__otterPrimordialMethod(constructors["Symbol"],"toString",null,null); if(value!==undefined){primordials["SymbolPrototypeToString"]=value;break p233;}
+    value=__otterPrimordialStatic(constructors["Symbol"],"prototypeToString","PrototypeToString"); if(value!==__otterPrimordialMissing){if(value!==undefined)primordials["SymbolPrototypeToString"]=value;break p233;}
+  }
+  p234: {
+    value=__otterPrimordialMethod(constructors["Symbol"],"valueOf",null,null); if(value!==undefined){primordials["SymbolPrototypeValueOf"]=value;break p234;}
+    value=__otterPrimordialStatic(constructors["Symbol"],"prototypeValueOf","PrototypeValueOf"); if(value!==__otterPrimordialMissing){if(value!==undefined)primordials["SymbolPrototypeValueOf"]=value;break p234;}
+  }
+  p235: {
+    value=__otterPrimordialStatic(constructors["Symbol"],"replace","Replace"); if(value!==__otterPrimordialMissing){if(value!==undefined)primordials["SymbolReplace"]=value;break p235;}
+  }
+  value=symbolWells["SymbolSpecies"]; if(value!==undefined)primordials["SymbolSpecies"]=value;
+  p237: {
+    value=__otterPrimordialStatic(constructors["Symbol"],"split","Split"); if(value!==__otterPrimordialMissing){if(value!==undefined)primordials["SymbolSplit"]=value;break p237;}
+  }
+  value=symbolWells["SymbolToPrimitive"]; if(value!==undefined)primordials["SymbolToPrimitive"]=value;
+  value=symbolWells["SymbolToStringTag"]; if(value!==undefined)primordials["SymbolToStringTag"]=value;
+  value=constructors["SyntaxError"]; if(value!==undefined)primordials["SyntaxError"]=value;
+  value=constructors["TypeError"]; if(value!==undefined)primordials["TypeError"]=value;
+  p242: {
+    value=__otterPrimordialObject(constructors["TypeError"]); if(value!==undefined){primordials["TypeErrorPrototype"]=value;break p242;}
+    value=__otterPrimordialStatic(constructors["TypeError"],"prototype","Prototype"); if(value!==__otterPrimordialMissing){if(value!==undefined)primordials["TypeErrorPrototype"]=value;break p242;}
+  }
+  value=explicit["TypedArray"]; if(value!==undefined)primordials["TypedArray"]=value;
+  value=explicit["TypedArrayPrototype"]; if(value!==undefined)primordials["TypedArrayPrototype"]=value;
+  p245: {
+    value=__otterPrimordialMethod(TypedArray,"at",null,null); if(value!==undefined){primordials["TypedArrayPrototypeAt"]=value;break p245;}
+  }
+  p246: {
+    value=__otterPrimordialMethod(TypedArray,"fill",null,null); if(value!==undefined){primordials["TypedArrayPrototypeFill"]=value;break p246;}
+  }
+  p247: {
+    value=__otterPrimordialHalf(TypedArray,"buffer",null,null,"get"); if(value!==undefined){primordials["TypedArrayPrototypeGetBuffer"]=value;break p247;}
+    value=__otterPrimordialMethod(TypedArray,"getBuffer",null,null); if(value!==undefined){primordials["TypedArrayPrototypeGetBuffer"]=value;break p247;}
+  }
+  p248: {
+    value=__otterPrimordialHalf(TypedArray,"byteLength",null,null,"get"); if(value!==undefined){primordials["TypedArrayPrototypeGetByteLength"]=value;break p248;}
+    value=__otterPrimordialMethod(TypedArray,"getByteLength",null,null); if(value!==undefined){primordials["TypedArrayPrototypeGetByteLength"]=value;break p248;}
+  }
+  p249: {
+    value=__otterPrimordialHalf(TypedArray,"byteOffset",null,null,"get"); if(value!==undefined){primordials["TypedArrayPrototypeGetByteOffset"]=value;break p249;}
+    value=__otterPrimordialMethod(TypedArray,"getByteOffset",null,null); if(value!==undefined){primordials["TypedArrayPrototypeGetByteOffset"]=value;break p249;}
+  }
+  p250: {
+    value=__otterPrimordialHalf(TypedArray,"length",null,null,"get"); if(value!==undefined){primordials["TypedArrayPrototypeGetLength"]=value;break p250;}
+    value=__otterPrimordialMethod(TypedArray,"getLength",null,null); if(value!==undefined){primordials["TypedArrayPrototypeGetLength"]=value;break p250;}
+  }
+  p251: {
+    value=__otterPrimordialHalf(TypedArray,"symbolToStringTag","SymbolToStringTag","toStringTag","get"); if(value!==undefined){primordials["TypedArrayPrototypeGetSymbolToStringTag"]=value;break p251;}
+    value=__otterPrimordialMethod(TypedArray,"getSymbolToStringTag",null,null); if(value!==undefined){primordials["TypedArrayPrototypeGetSymbolToStringTag"]=value;break p251;}
+  }
+  p252: {
+    value=__otterPrimordialMethod(TypedArray,"includes",null,null); if(value!==undefined){primordials["TypedArrayPrototypeIncludes"]=value;break p252;}
+  }
+  p253: {
+    value=__otterPrimordialMethod(TypedArray,"set",null,null); if(value!==undefined){primordials["TypedArrayPrototypeSet"]=value;break p253;}
+  }
+  p254: {
+    value=__otterPrimordialMethod(TypedArray,"slice",null,null); if(value!==undefined){primordials["TypedArrayPrototypeSlice"]=value;break p254;}
+  }
+  p255: {
+    value=__otterPrimordialMethod(TypedArray,"subarray",null,null); if(value!==undefined){primordials["TypedArrayPrototypeSubarray"]=value;break p255;}
+  }
+  value=constructors["URIError"]; if(value!==undefined)primordials["URIError"]=value;
+  value=constructors["Uint16Array"]; if(value!==undefined)primordials["Uint16Array"]=value;
+  value=constructors["Uint32Array"]; if(value!==undefined)primordials["Uint32Array"]=value;
+  value=constructors["Uint8Array"]; if(value!==undefined)primordials["Uint8Array"]=value;
+  value=constructors["Uint8ClampedArray"]; if(value!==undefined)primordials["Uint8ClampedArray"]=value;
+  value=constructors["WeakMap"]; if(value!==undefined)primordials["WeakMap"]=value;
+  p262: {
+    value=__otterPrimordialObject(constructors["WeakMap"]); if(value!==undefined){primordials["WeakMapPrototype"]=value;break p262;}
+    value=__otterPrimordialStatic(constructors["WeakMap"],"prototype","Prototype"); if(value!==__otterPrimordialMissing){if(value!==undefined)primordials["WeakMapPrototype"]=value;break p262;}
+  }
+  value=constructors["WeakRef"]; if(value!==undefined)primordials["WeakRef"]=value;
+  value=constructors["WeakSet"]; if(value!==undefined)primordials["WeakSet"]=value;
+  p265: {
+    value=__otterPrimordialObject(constructors["WeakSet"]); if(value!==undefined){primordials["WeakSetPrototype"]=value;break p265;}
+    value=__otterPrimordialStatic(constructors["WeakSet"],"prototype","Prototype"); if(value!==__otterPrimordialMissing){if(value!==undefined)primordials["WeakSetPrototype"]=value;break p265;}
+  }
+  value=explicit["decodeURI"]; if(value!==undefined)primordials["decodeURI"]=value;
+  value=explicit["decodeURIComponent"]; if(value!==undefined)primordials["decodeURIComponent"]=value;
+  value=explicit["encodeURI"]; if(value!==undefined)primordials["encodeURI"]=value;
+  value=explicit["encodeURIComponent"]; if(value!==undefined)primordials["encodeURIComponent"]=value;
+  value=explicit["escape"]; if(value!==undefined)primordials["escape"]=value;
+  value=explicit["globalThis"]; if(value!==undefined)primordials["globalThis"]=value;
+  value=explicit["hardenRegExp"]; if(value!==undefined)primordials["hardenRegExp"]=value;
+  value=explicit["makeSafe"]; if(value!==undefined)primordials["makeSafe"]=value;
+  value=explicit["queueMicrotask"]; if(value!==undefined)primordials["queueMicrotask"]=value;
+  value=explicit["uncurryThis"]; if(value!==undefined)primordials["uncurryThis"]=value;
+  value=explicit["unescape"]; if(value!==undefined)primordials["unescape"]=value;
 }
 
 function __otterPrimordialObject(base) {
@@ -978,22 +1007,10 @@ function __otterPrimordialStaticApply(holder,key0,key1) {
   }
 }
 
-const primordials = new Proxy(Object.create(null), {
-  get(_target, name) {
-    if (typeof name !== 'string') return undefined;
-    if (cache.has(name)) return cache.get(name);
-    const value = derive(name);
-    cache.set(name, value);
-    return value;
-  },
-  has(_target, name) {
-    return typeof name === 'string' && primordials[name] !== undefined;
-  },
-  set(_target, name, value) {
-    cache.set(name, value);
-    return true;
-  },
-});
+// Node builds its per-context primordials eagerly, so every entry is the
+// intrinsic as it was before user code could replace it.
+const primordials = { __proto__: null };
+__otterPrimordialBuild(primordials);
 
 // ---------------------------------------------------------------- bindings --
 

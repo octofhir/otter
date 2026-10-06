@@ -1,17 +1,22 @@
-//! Idempotent AST-span emission of the sole static primordial dispatcher.
+//! Idempotent AST-span emission of the sole static primordial build.
 //!
 //! # Contents
-//! - Compact cases and six shared lookup helpers.
+//! - One build function deriving every catalog name in catalog order, and
+//!   six shared lookup helpers.
 //! - One private missing token and current generated-span ownership.
 //! - Exact UTF-8 byte-span replacement without regex source parsing.
 //!
 //! # Invariants
-//! Static members are read live. A present undefined static property stops
-//! lookup. Helpers create no per-name values until the existing lazy cache
-//! requests them; their bound/apply callable ABI is the original one. One
-//! module-private literal object represents absence without confusing a
-//! present undefined property with a missing member. It cannot escape the
-//! generated span. All-caps static members have exactly one getter read.
+//! The bootstrap derives every catalog name exactly once, before any vendored
+//! file runs, as Node builds its per-context primordials: a holder-table name
+//! from the first table holding it (explicit, symbol wells, constructors,
+//! namespaces), any other name from the first recipe step that yields one. No
+//! name is dispatched at run time. Helper callables keep the original
+//! bound/apply ABI. A present undefined static property stops lookup and
+//! leaves the name absent. One module-private literal object represents
+//! absence without confusing a present undefined property with a missing
+//! member. It cannot escape the generated span. All-caps static members have
+//! exactly one getter read.
 //!
 //! # See also
 //! - `resolve` selects all original stage and prefix-order candidates.
@@ -26,6 +31,7 @@ use super::{
 };
 
 const MISSING: &str = "__otterPrimordialMissing";
+const BUILD: &str = "__otterPrimordialBuild";
 
 const HELPERS: [&str; 6] = [
     "__otterPrimordialObject",
@@ -86,73 +92,104 @@ fn static_keys(property: &str) -> String {
     }
 }
 
-fn dispatch(cases: &[Case]) -> String {
-    let mut out = String::from(
-        "const __otterPrimordialMissing = {};\n\nfunction derive(name) {\n  // Generated from the current in-repo AST catalog; members remain lazy/live.\n  if (name in explicit) return explicit[name];\n  if (name in symbolWells) return symbolWells[name];\n  if (name in constructors) return constructors[name];\n  if (name in namespaces) return namespaces[name];\n  let value;\n  switch (name) {\n",
+fn build(cases: &[Case], facts: &super::resolve::Facts) -> String {
+    let mut out = format!(
+        "const {MISSING} = {{}};\n\nfunction {BUILD}(primordials) {{\n  // Generated from the current in-repo AST catalog.\n  let value;\n"
     );
-    for case in cases {
+    for (index, case) in cases.iter().enumerate() {
+        let name = quote(&case.name);
+        // A holder-table name is read from the table holding it; the holder
+        // keys are static, so the choice is made here.
+        if let Some(holder) = facts.holder_of(&case.name) {
+            out.push_str(&format!(
+                "  value={holder}[{name}]; if(value!==undefined)primordials[{name}]=value;\n"
+            ));
+            continue;
+        }
         if case.steps.is_empty() {
             continue;
         }
-        out.push_str(&format!("    case {}:\n", quote(&case.name)));
+        let label = format!("p{index}");
+        out.push_str(&format!("  {label}: {{\n"));
         for step in &case.steps {
-            let text = match step {
-                Step::PrototypeObject { base: name } => format!(
-                    "value=__otterPrimordialObject({}); if(value!==undefined)return value;",
-                    base(name, true)
+            let (call, found) = match step {
+                Step::PrototypeObject { base: name } => (
+                    format!("__otterPrimordialObject({})", base(name, true)),
+                    "value!==undefined",
                 ),
                 Step::PrototypeHalf {
                     base: name,
                     property,
                     half,
-                } => format!(
-                    "value=__otterPrimordialHalf({},{},{}); if(value!==undefined)return value;",
-                    base(name, false),
-                    symbol_args(property),
-                    quote(half)
+                } => (
+                    format!(
+                        "__otterPrimordialHalf({},{},{})",
+                        base(name, false),
+                        symbol_args(property),
+                        quote(half)
+                    ),
+                    "value!==undefined",
                 ),
                 Step::PrototypeApply {
                     base: name,
                     property,
-                } => format!(
-                    "value=__otterPrimordialApply({},{}); if(value!==undefined)return value;",
-                    base(name, false),
-                    quote(&lower(property))
+                } => (
+                    format!(
+                        "__otterPrimordialApply({},{})",
+                        base(name, false),
+                        quote(&lower(property))
+                    ),
+                    "value!==undefined",
                 ),
                 Step::PrototypeMethod {
                     base: name,
                     property,
-                } => format!(
-                    "value=__otterPrimordialMethod({},{}); if(value!==undefined)return value;",
-                    base(name, false),
-                    symbol_args(property)
+                } => (
+                    format!(
+                        "__otterPrimordialMethod({},{})",
+                        base(name, false),
+                        symbol_args(property)
+                    ),
+                    "value!==undefined",
                 ),
                 Step::StaticApply {
                     authority,
                     base,
                     property,
-                } => format!(
-                    "value=__otterPrimordialStaticApply({authority}[{}],{}); if(value!==undefined)return value;",
-                    quote(base),
-                    static_keys(property)
+                } => (
+                    format!(
+                        "__otterPrimordialStaticApply({authority}[{}],{})",
+                        quote(base),
+                        static_keys(property)
+                    ),
+                    "value!==undefined",
                 ),
+                // A present static member ends the lookup even when undefined.
                 Step::Static {
                     authority,
                     base,
                     property,
-                } => format!(
-                    "value=__otterPrimordialStatic({authority}[{}],{}); if(value!==__otterPrimordialMissing)return value;",
-                    quote(base),
-                    static_keys(property)
+                } => (
+                    format!(
+                        "__otterPrimordialStatic({authority}[{}],{})",
+                        quote(base),
+                        static_keys(property)
+                    ),
+                    "value!==__otterPrimordialMissing",
                 ),
             };
-            out.push_str("      ");
-            out.push_str(&text);
-            out.push('\n');
+            let store = if found == "value!==undefined" {
+                format!("primordials[{name}]=value;")
+            } else {
+                format!("if(value!==undefined)primordials[{name}]=value;")
+            };
+            out.push_str(&format!(
+                "    value={call}; if({found}){{{store}break {label};}}\n"
+            ));
         }
-        out.push_str("      return undefined;\n");
+        out.push_str("  }\n");
     }
-    out.push_str("  }\n  return undefined;\n}\n\n");
+    out.push_str("}\n\n");
     out.push_str(
         "function __otterPrimordialObject(base) {\n  if(base)return base.prototype??base;\n}\n\n",
     );
@@ -190,14 +227,14 @@ impl<'a> Visit<'a> for Refs {
 
 fn edits(program: &Program<'_>) -> Result<Span> {
     let mut spans = Vec::new();
-    let mut derive_count = 0;
+    let mut build_count = 0;
     let mut helpers = std::collections::BTreeSet::new();
     let mut missing = false;
     for statement in &program.body {
         if let Statement::FunctionDeclaration(function) = statement {
             if let Some(identifier) = &function.id {
-                if identifier.name == "derive" {
-                    derive_count += 1;
+                if identifier.name == BUILD {
+                    build_count += 1;
                     spans.push(function.span);
                 } else if HELPERS.contains(&identifier.name.as_str()) {
                     if !helpers.insert(identifier.name.as_str()) {
@@ -233,8 +270,8 @@ fn edits(program: &Program<'_>) -> Result<Span> {
             }
         }
     }
-    if derive_count != 1 {
-        return Err("expected one current derive authority".into());
+    if build_count != 1 {
+        return Err("expected one current build authority".into());
     }
     spans.sort_by_key(|span| span.start);
     let owned = Span::new(
@@ -268,13 +305,14 @@ fn edits(program: &Program<'_>) -> Result<Span> {
 
 pub(super) fn rewrite(source: &str, cases: &[Case]) -> Result<String> {
     let owned = parse(source, edits)?;
+    let facts = parse(source, super::resolve::Facts::read)?;
     let mut output = String::new();
     output.push_str(
         source
             .get(..owned.start as usize)
             .ok_or("invalid source prefix")?,
     );
-    output.push_str(&dispatch(cases));
+    output.push_str(&build(cases, &facts));
     output.push_str(
         source
             .get(owned.end as usize..)

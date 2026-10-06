@@ -1,7 +1,8 @@
 //! Binding-checked primordial uses in the current compiled Node sources.
 //!
 //! # Contents
-//! - Rust macro AST census of every current nodelib source producer.
+//! - Rust macro AST census of every `nodelib/` source the builtin table
+//!   compiles.
 //! - Read-only ambient primordial binding and exact original use spans.
 //! - The typed-array reconstruction's sole finite computed-name proof.
 //!
@@ -11,7 +12,7 @@
 //! spelling as sufficient proof of a primordial use.
 //!
 //! # See also
-//! - `crate::nodelib` owns the current compile-time source declarations.
+//! - `builtin_table.rs` owns the current compile-time source declarations.
 //! - `internal/util/inspect.js` owns the one dynamic typed-array consumer.
 
 use std::{
@@ -29,48 +30,64 @@ use syn::{
 
 use super::{Coverage, Result, Site, parse, reject};
 
-struct Declaration {
-    path: String,
+/// The `builtin_table!` rows: `<role> <name> "<url>" <body> "<path>"...;`.
+struct Table {
+    paths: Vec<String>,
 }
 
-impl Parse for Declaration {
+impl Parse for Table {
     fn parse(input: ParseStream<'_>) -> syn::Result<Self> {
-        let _: syn::Ident = input.parse()?;
-        let _: Token![,] = input.parse()?;
-        let _: syn::LitStr = input.parse()?;
-        let _: Token![,] = input.parse()?;
-        let kind: syn::Ident = input.parse()?;
-        if kind != "compat" && kind != "vendored" {
-            return Err(input.error("unrecognized nodelib source declaration"));
+        let mut paths = Vec::new();
+        while !input.is_empty() {
+            let role: syn::Ident = input.parse()?;
+            if role != "installer" && role != "embedded" {
+                return Err(input.error("unrecognized builtin role"));
+            }
+            let _: syn::Ident = input.parse()?;
+            let _: syn::LitStr = input.parse()?;
+            let body: syn::Ident = input.parse()?;
+            if body != "vendored" && body != "plain" {
+                return Err(input.error("unrecognized builtin body"));
+            }
+            let start = paths.len();
+            while input.peek(syn::LitStr) {
+                paths.push(input.parse::<syn::LitStr>()?.value());
+            }
+            if paths.len() == start {
+                return Err(input.error("builtin row names no source"));
+            }
+            let _: Token![;] = input.parse()?;
         }
-        let path: syn::LitStr = input.parse()?;
-        if !input.is_empty() {
-            return Err(input.error("nodelib declaration has unexpected trailing tokens"));
-        }
-        Ok(Self { path: path.value() })
+        Ok(Self { paths })
     }
 }
 
+/// Every `nodelib/` source the builtin table compiles: the files that run
+/// over the compat realm and may read `primordials`.
 pub(super) fn source_paths(repo: &Path) -> Result<(String, Vec<PathBuf>)> {
-    let owner = repo.join("crates/otter-node/src/nodelib.rs");
+    let owner = repo.join("crates/otter-node/src/builtin_table.rs");
     let source = std::fs::read_to_string(owner)?;
     let ast = syn::parse_file(&source)?;
     let base = repo.join("crates/otter-node/src");
     let mut paths = BTreeSet::new();
     for item in ast.items {
         if let syn::Item::Macro(item) = item
-            && item.mac.path.is_ident("nodelib_module")
+            && item.mac.path.is_ident("builtin_table")
         {
-            let declaration: Declaration = syn::parse2(item.mac.tokens)?;
-            let relative = Path::new(&declaration.path);
-            if relative.is_absolute()
-                || relative
-                    .components()
-                    .any(|p| matches!(p, std::path::Component::ParentDir))
-            {
-                return Err("nodelib producer path escapes its current source owner".into());
+            let table: Table = syn::parse2(item.mac.tokens)?;
+            for path in table.paths {
+                let relative = Path::new(&path);
+                if relative.is_absolute()
+                    || relative
+                        .components()
+                        .any(|p| matches!(p, std::path::Component::ParentDir))
+                {
+                    return Err("nodelib producer path escapes its current source owner".into());
+                }
+                if relative.starts_with("nodelib") {
+                    paths.insert(base.join(relative));
+                }
             }
-            paths.insert(base.join(relative));
         }
     }
     if paths.is_empty() {

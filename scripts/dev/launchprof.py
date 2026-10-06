@@ -7,7 +7,9 @@ instruction (`sample` attaches too late for a short process), exports the
 time-profile table and aggregates, over every run, self samples (leaf frame)
 and inclusive samples (any frame, counted once per sample) by function name,
 for the `otter-isolate` thread unless THREAD names another. Prints the top
-rows of both tables. Traces and exports stay under <out-dir>.
+rows of both tables. FOCUS=<substring> also aggregates the direct callers and
+callees of the outermost frame matching it. Traces and exports stay under
+<out-dir>.
 """
 import collections, os, pathlib, subprocess, sys
 import xml.etree.ElementTree as ET
@@ -17,6 +19,9 @@ runs = int(sys.argv[2])
 command = sys.argv[sys.argv.index("--") + 1:]
 thread_filter = os.environ.get("THREAD", "otter-isolate")
 top = int(os.environ.get("TOP", "40"))
+focus = os.environ.get("FOCUS")
+callers = collections.Counter()
+callees = collections.Counter()
 out.mkdir(parents=True, exist_ok=True)
 
 self_counts = collections.Counter()
@@ -68,6 +73,12 @@ for run in range(runs):
         self_counts[names[0]] += 1
         for name in set(names):
             inclusive[name] += 1
+        if focus:
+            hits = [index for index, name in enumerate(names) if focus in name]
+            if hits:
+                index = hits[-1]
+                callers[names[index + 1] if index + 1 < len(names) else "<root>"] += 1
+                callees[names[index - 1] if index > 0 else "<self>"] += 1
 
 print(f"samples on {thread_filter}: {total} over {runs} runs")
 print("== self")
@@ -76,3 +87,8 @@ for name, count in self_counts.most_common(top):
 print("== inclusive")
 for name, count in inclusive.most_common(top):
     print(f"{count:6d}  {name[:150]}")
+if focus:
+    for title, table in (("callers", callers), ("callees", callees)):
+        print(f"== {title} of {focus}")
+        for name, count in table.most_common(top):
+            print(f"{count:6d}  {name[:150]}")

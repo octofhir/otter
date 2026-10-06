@@ -1176,8 +1176,7 @@ fn verify_function(
             instruction.op,
             Op::LoadArgumentsLength | Op::LoadArgumentsElement
         ) && (!function.needs_arguments
-            || function.param_count != 0
-            || function.has_rest
+            || !function.mapped_argument_bindings.is_empty()
             || function.contains_direct_eval
             || function.is_async
             || function.is_generator
@@ -1621,7 +1620,16 @@ mod tests {
             ));
             module.functions[0].needs_arguments = true;
             verify_module(&module).unwrap();
+            // Formals that do not alias the object read the same actuals.
             module.functions[0].param_count = 1;
+            verify_module(&module).unwrap();
+            module.functions[0]
+                .mapped_argument_bindings
+                .push(MappedArgumentBinding {
+                    argument_index: 0,
+                    formal_name: "a".to_string(),
+                    storage: ArgumentBindingStorage::Register { reg: 0 },
+                });
             assert!(matches!(
                 verify_module(&module),
                 Err(BytecodeVerifyError::ArgumentsReadMetadata { .. })

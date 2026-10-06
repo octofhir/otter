@@ -247,6 +247,19 @@ pub(crate) fn compile_function_impl(
         && (facts.is_some_and(capture::ScopeFacts::uses_arguments) || contains_direct_eval);
     let needs_arguments = body_needs_arguments_object || legacy_arguments_observable;
     let uses_mapped_arguments = body_needs_arguments_object && !function_is_strict && simple_params;
+    // A mapped object aliases the formals only where the aliasing can be
+    // observed: the object escapes or is written, a formal is assigned, or a
+    // direct eval or a legacy `f.arguments` read can reach either. Otherwise
+    // its elements always equal the formals and the formals stay plain.
+    let aliased_formals = uses_mapped_arguments
+        && (contains_direct_eval
+            || parent.dot_arguments_observed
+            || facts.is_none_or(|facts| {
+                facts.arguments_escapes()
+                    || formal_parameter_bound_names(params)
+                        .iter()
+                        .any(|name| unit.assigned(facts, name))
+            }));
     let arguments_forward_only = body_needs_arguments_object
         && !contains_direct_eval
         && !crate::hoist::function_declares_name(params, body, "arguments")
@@ -309,7 +322,7 @@ pub(crate) fn compile_function_impl(
     }
     child.contains_direct_eval = contains_direct_eval;
     child.arguments_forward_only = arguments_forward_only;
-    if uses_mapped_arguments {
+    if aliased_formals {
         child.mapped_argument_names = simple_formal_names(params).into_iter().collect();
     }
 
@@ -361,7 +374,7 @@ pub(crate) fn compile_function_impl(
             derived_this,
             body_needs_arguments_object,
             arguments_forward_only,
-            uses_mapped_arguments,
+            aliased_formals,
             fields,
         },
     );
@@ -375,12 +388,11 @@ pub(crate) fn compile_function_impl(
     };
 
     let mut child = parent.pop();
-    // No mapped formals, eval or suspension can observe hidden identity in
+    // No aliased formal, eval or suspension can observe hidden identity in
     // this admitted family, and without exception handlers every edge is a
     // normal successor. Alias/escape proof uses lowered register flow.
     if needs_arguments
-        && param_count == 0
-        && !has_rest
+        && mapped_argument_bindings.is_empty()
         && !contains_direct_eval
         && !is_async
         && !is_generator
@@ -441,7 +453,7 @@ struct FunctionScopes<'r, 'a> {
     derived_this: bool,
     body_needs_arguments_object: bool,
     arguments_forward_only: bool,
-    uses_mapped_arguments: bool,
+    aliased_formals: bool,
     fields: Option<FieldInjection<'r, 'a>>,
 }
 
@@ -547,7 +559,7 @@ fn compile_function_scopes(
         let storage = parent.declare_binding("arguments", SlotKind::Arguments, span)?;
         let tmp = parent.alloc_scratch();
         let ctx_operand = match parent.scopes[param_scope].context.map(|ctx| ctx.reg) {
-            Some(CtxReg::Reg(reg)) if f.uses_mapped_arguments => reg,
+            Some(CtxReg::Reg(reg)) if f.aliased_formals => reg,
             _ => tmp,
         };
         parent.emit(
@@ -574,7 +586,7 @@ fn compile_function_scopes(
     }
     parent.in_param_init = false;
     crate::type_hints::annotate_formal_parameters(parent, f.params);
-    let mapped_argument_bindings = if f.uses_mapped_arguments {
+    let mapped_argument_bindings = if f.aliased_formals {
         mapped_formal_parameter_bindings(parent, f.params)
     } else {
         Vec::new()

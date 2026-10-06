@@ -394,6 +394,64 @@ impl Interpreter {
             .map_err(|error| CommittedValueError::Fatal(error.into()))
     }
 
+    /// `Op::DefineMember` — a data property (§10.2.8 DefineMethodProperty,
+    /// §7.3.7 for a field) or one accessor half of a `get` / `set` definition
+    /// (§15.4.5). The descriptor is built
+    /// here from the definition, so no descriptor object is allocated or read.
+    pub(crate) fn run_define_member_regs(
+        &mut self,
+        context: &ExecutionContext,
+        stack: &mut ActivationStack,
+        frame_index: usize,
+        target_reg: u16,
+        key_reg: u16,
+        value_reg: u16,
+        definition: otter_bytecode::MemberDefinition,
+    ) -> Result<(), CommittedValueError> {
+        let frame = stack
+            .get(frame_index)
+            .ok_or(VmError::InvalidOperand)
+            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+        let target = *read_register(frame, target_reg)
+            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+        let key_value = *read_register(frame, key_reg)
+            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+        let value = *read_register(frame, value_reg)
+            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+        if !target.is_object_type() {
+            return Err(CommittedValueError::Fatal(VmError::InvalidOperand.into()));
+        }
+        self.with_handle_scope(|interp, scope| {
+            let target = interp.scoped_value(scope, target);
+            let value = interp.scoped_value(scope, value);
+            let key = interp.evaluate_to_property_key(stack, context, &key_value)?;
+            let value = interp.escape_scoped(value);
+            let mut descriptor = object::PartialPropertyDescriptor {
+                enumerable: Some(definition.enumerable),
+                configurable: Some(true),
+                ..object::PartialPropertyDescriptor::default()
+            };
+            match definition.kind {
+                otter_bytecode::MemberKind::Value => {
+                    descriptor.value = Some(value);
+                    descriptor.writable = Some(!definition.read_only);
+                }
+                otter_bytecode::MemberKind::Getter => descriptor.get = Some(value),
+                otter_bytecode::MemberKind::Setter => descriptor.set = Some(value),
+            }
+            let target = interp.escape_scoped(target);
+            if !interp.define_own_property_value(stack, context, &target, &key, descriptor)? {
+                return Err(CommittedValueError::JavaScript(
+                    interp.err_type(("Cannot define property".to_string()).into()),
+                ));
+            }
+            Ok(())
+        })?;
+        stack[frame_index]
+            .advance_pc()
+            .map_err(|error| CommittedValueError::Fatal(error.into()))
+    }
+
     /// Apply a property descriptor through the canonical activation.
     ///
     /// The source values and a symbol key stay in the handle arena while key

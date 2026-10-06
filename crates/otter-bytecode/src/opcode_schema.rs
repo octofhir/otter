@@ -123,6 +123,8 @@ pub enum ImmediateDomain {
     StoreFallback,
     /// A packed [`StoreRefMode`].
     StoreRefMode,
+    /// A packed [`MemberDefinition`].
+    MemberDefinition,
 }
 
 impl ImmediateDomain {
@@ -139,6 +141,7 @@ impl ImmediateDomain {
             Self::LookupGlobalMode => LookupGlobalMode::from_imm32(value).is_some(),
             Self::StoreFallback => BindingStoreFallback::from_imm32(value).is_some(),
             Self::StoreRefMode => StoreRefMode::from_imm32(value).is_some(),
+            Self::MemberDefinition => MemberDefinition::from_imm32(value).is_some(),
         }
     }
 }
@@ -585,6 +588,71 @@ impl LookupGlobalMode {
         Some(Self {
             depth: (bits & Self::DEPTH_BITS) as u16,
             strict: bits & Self::STRICT_BIT != 0,
+        })
+    }
+}
+
+/// What [`crate::Op::DefineMember`] installs.
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq, Hash)]
+pub enum MemberKind {
+    /// A data property: a method or a field value.
+    Value = 0,
+    /// The `[[Get]]` half of an accessor property.
+    Getter = 1,
+    /// The `[[Set]]` half of an accessor property.
+    Setter = 2,
+}
+
+/// Packed immediate of [`crate::Op::DefineMember`].
+///
+/// Bit layout: bits 0–1 [`MemberKind`], bit 2 enumerable, bit 3 read-only
+/// (a value only: a private method is not writable), bits 4–31 zero.
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq, Hash)]
+pub struct MemberDefinition {
+    /// What the definition installs.
+    pub kind: MemberKind,
+    /// `[[Enumerable]]`: fields and object-literal members are, class
+    /// methods and accessors are not.
+    pub enumerable: bool,
+    /// `[[Writable]]` is false. Only a [`MemberKind::Value`] can set it.
+    pub read_only: bool,
+}
+
+impl MemberDefinition {
+    const KIND_BITS: u32 = 0b11;
+    const ENUMERABLE_BIT: u32 = 1 << 2;
+    const READ_ONLY_BIT: u32 = 1 << 3;
+
+    /// Encode with the documented bit layout.
+    #[must_use]
+    pub const fn to_imm32(self) -> i32 {
+        let enumerable = if self.enumerable { Self::ENUMERABLE_BIT } else { 0 };
+        let read_only = if self.read_only { Self::READ_ONLY_BIT } else { 0 };
+        (self.kind as u32 | enumerable | read_only) as i32
+    }
+
+    /// Decode, rejecting reserved bits, an unknown kind and a read-only
+    /// accessor.
+    #[must_use]
+    pub const fn from_imm32(value: i32) -> Option<Self> {
+        let bits = value as u32;
+        if bits & !(Self::KIND_BITS | Self::ENUMERABLE_BIT | Self::READ_ONLY_BIT) != 0 {
+            return None;
+        }
+        let kind = match bits & Self::KIND_BITS {
+            0 => MemberKind::Value,
+            1 => MemberKind::Getter,
+            2 => MemberKind::Setter,
+            _ => return None,
+        };
+        let read_only = bits & Self::READ_ONLY_BIT != 0;
+        if read_only && !matches!(kind, MemberKind::Value) {
+            return None;
+        }
+        Some(Self {
+            kind,
+            enumerable: bits & Self::ENUMERABLE_BIT != 0,
+            read_only,
         })
     }
 }
@@ -1359,6 +1427,7 @@ opcode_schema! {
     (Op::StoreVarScope, 0xBF),
     (Op::TestTypeOf, 0xC0),
     (Op::SpreadAppend, 0xC1),
+    (Op::DefineMember, 0xC2),
 }
 
 /// Return the authoritative schema row for `op`.
@@ -1541,6 +1610,7 @@ const REF_TARGET: OperandSpec = OperandSpec::immediate(ImmediateDomain::LookupRe
 const GLOBAL_MODE: OperandSpec = OperandSpec::immediate(ImmediateDomain::LookupGlobalMode);
 const FALLBACK: OperandSpec = OperandSpec::immediate(ImmediateDomain::StoreFallback);
 const REF_MODE: OperandSpec = OperandSpec::immediate(ImmediateDomain::StoreRefMode);
+const MEMBER_DEFINITION: OperandSpec = OperandSpec::immediate(ImmediateDomain::MemberDefinition);
 const CREATE_CONTEXT: &[OperandSpec] = &[W, R, SCOPE];
 const LOAD_CONTEXT_SLOT: &[OperandSpec] = &[W, R, COORD];
 const STORE_CONTEXT_SLOT: &[OperandSpec] = &[R, R, COORD];
@@ -1711,6 +1781,7 @@ const fn operand_shape(op: Op) -> OperandShape {
         Op::DefineOwnProperty | Op::PrivateSet | Op::DefineDataProperty => {
             OperandShape::Fixed(&[R, R, R])
         }
+        Op::DefineMember => OperandShape::Fixed(&[R, R, R, MEMBER_DEFINITION]),
         Op::Yield | Op::YieldDelegate => OperandShape::Fixed(WRITE_WRITE_READ),
         Op::SetFunctionName => OperandShape::Fixed(&[R, R, CONST]),
         Op::StoreGlobalChecked => OperandShape::Fixed(&[R, CONST, R]),

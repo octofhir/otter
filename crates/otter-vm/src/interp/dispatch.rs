@@ -3383,6 +3383,28 @@ impl Interpreter {
                     });
                     continue;
                 }
+                Op::DefineMember => {
+                    let definition = function
+                        .imm32(instr, 3)
+                        .and_then(otter_bytecode::MemberDefinition::from_imm32)
+                        .ok_or(VmError::InvalidOperand)?;
+                    (match self.run_define_member_regs(
+                        context,
+                        stack,
+                        top_idx,
+                        instr.reg(0),
+                        instr.reg(1),
+                        instr.reg(2),
+                        definition,
+                    ) {
+                        Ok(value) => value,
+                        Err(CommittedValueError::JavaScript(error)) => return Err(error),
+                        Err(CommittedValueError::Fatal(error)) => {
+                            return Ok(DispatchOutcome::Fatal(error));
+                        }
+                    });
+                    continue;
+                }
                 Op::QueueMicrotask => {
                     let operands = function.operand_view(instr);
                     let frame = &mut stack[top_idx];

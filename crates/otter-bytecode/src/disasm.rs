@@ -25,7 +25,8 @@ use std::fmt::Write;
 use crate::opcode_schema::{ImmediateDomain, operand_spec_at};
 use crate::{
     BindingStoreFallback, BytecodeModule, ContextCoord, Function, LookupGlobalMode,
-    LookupRefTarget, Op, Operand, ScopeDescriptor, ScopeKind, SlotKind, SourceKind, StoreRefMode,
+    LookupRefTarget, MemberDefinition, MemberKind, Op, Operand, ScopeDescriptor, ScopeKind,
+    SlotKind, SourceKind, StoreRefMode,
 };
 
 /// Disassemble `module` into the canonical text form.
@@ -167,6 +168,20 @@ fn write_immediate(line: &mut String, domain: ImmediateDomain, value: i32) -> bo
                     strictness(mode.strict)
                 )
             }
+            None => return false,
+        },
+        ImmediateDomain::MemberDefinition => match MemberDefinition::from_imm32(value) {
+            Some(definition) => write!(
+                line,
+                "{}{}{}",
+                match definition.kind {
+                    MemberKind::Value => "method",
+                    MemberKind::Getter => "get",
+                    MemberKind::Setter => "set",
+                },
+                if definition.enumerable { ":enumerable" } else { "" },
+                if definition.read_only { ":read-only" } else { "" },
+            ),
             None => return false,
         },
     };
@@ -605,6 +620,7 @@ mod tests {
             Op::ForInKeys,
             Op::CopyDataProperties,
             Op::DefineOwnProperty,
+            Op::DefineMember,
             Op::NewObjectLiteral,
             Op::LoadLookupSlot,
             Op::StoreLookupSlot,
@@ -815,16 +831,17 @@ mod tests {
 000146 FOR_IN_KEYS\n\
 000147 COPY_DATA_PROPERTIES\n\
 000148 DEFINE_OWN_PROPERTY\n\
-000149 NEW_OBJECT_LITERAL\n\
-000150 LOAD_LOOKUP_SLOT\n\
-000151 STORE_LOOKUP_SLOT\n\
-000152 DELETE_LOOKUP_SLOT\n\
-000153 LOAD_LOOKUP_GLOBAL\n\
-000154 TYPEOF_LOOKUP_GLOBAL\n\
-000155 STORE_LOOKUP_GLOBAL\n\
-000156 DELETE_LOOKUP_GLOBAL\n\
-000157 RESOLVE_LOOKUP_REF\n\
-000158 STORE_REF\n\
-000159 DECLARE_EVAL_VAR\n\
-000160 STORE_VAR_SCOPE\n";
+000149 DEFINE_MEMBER\n\
+000150 NEW_OBJECT_LITERAL\n\
+000151 LOAD_LOOKUP_SLOT\n\
+000152 STORE_LOOKUP_SLOT\n\
+000153 DELETE_LOOKUP_SLOT\n\
+000154 LOAD_LOOKUP_GLOBAL\n\
+000155 TYPEOF_LOOKUP_GLOBAL\n\
+000156 STORE_LOOKUP_GLOBAL\n\
+000157 DELETE_LOOKUP_GLOBAL\n\
+000158 RESOLVE_LOOKUP_REF\n\
+000159 STORE_REF\n\
+000160 DECLARE_EVAL_VAR\n\
+000161 STORE_VAR_SCOPE\n";
 }

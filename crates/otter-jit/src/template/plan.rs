@@ -1597,6 +1597,17 @@ impl TemplatePlan {
                         arg2: 0,
                     }
                 }
+                Op::DefineMember => {
+                    let operands = lowered.define_member_operands()?;
+                    TemplateOp::ClassValueOp {
+                        opcode: Op::DefineMember as u8,
+                        arg0: u64::from(operands.target)
+                            | (u64::from(operands.key) << 16)
+                            | (u64::from(operands.value) << 32),
+                        arg1: operands.definition as u32 as u64,
+                        arg2: 0,
+                    }
+                }
                 Op::Eval => {
                     let operands = lowered.eval_operands()?;
                     TemplateOp::ClassValueOp {

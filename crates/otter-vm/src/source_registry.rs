@@ -1,14 +1,17 @@
 //! Immutable source text and positions owned by one linked code chunk.
 //!
 //! # Contents
-//! - [`ModuleSource`] owns admitted text and its immutable line-start index.
+//! - [`ModuleSource`] owns admitted text and the line-start index its first
+//!   position query builds.
 //! - [`SourceRegistry`] shares the exact source/index owner with linked code
 //!   contexts and frozen code-space snapshots.
 //!
 //! # Invariants
 //! - A URL is a label inside one chunk, never an interpreter-wide identity.
 //! - Every retained text allocation has one [`SharedSource`] charge. Registry
-//!   keys, records and line indexes have one separate metadata lease.
+//!   keys and records have one separate metadata lease; a line index carries
+//!   its own lease from the query that built it. A refused index answers that
+//!   query transiently and retains nothing.
 //! - Cloning a registry shares those immutable allocations and their charges;
 //!   dropping the final owner releases both text and metadata.
 //! - Preparation admits all metadata before publishing a registry. A refusal
@@ -25,45 +28,83 @@
 //! - `crate::object` stores eager diagnostic positions without pinning code.
 
 use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use otter_resource::{ResourceAccount, ResourceClass, ResourceError, ResourceLease, SharedSource};
 
-/// One module's source text with a precomputed line-start index.
+/// One module's source text; its line index is built on first use.
 #[derive(Debug)]
 pub struct ModuleSource {
     text: SharedSource,
-    /// Byte offset of the first character of each line. `line_starts[0]`
-    /// is the length of the host prologue (usually `0`); entry `n` is the
-    /// byte offset just past the `n`th `\n`. Sorted ascending, so a byte
-    /// offset maps to a line by `partition_point`.
-    line_starts: Box<[u32]>,
+    /// Length of the host prologue that opens line 1 (usually `0`).
+    prologue: u32,
+    /// Ledger the line index is charged to when it is built.
+    account: ResourceAccount,
+    /// Built by the first position query, like V8's `Script::line_ends`:
+    /// most loaded sources never report a position.
+    lines: OnceLock<LineIndex>,
+}
+
+#[derive(Debug)]
+struct LineIndex {
+    /// Byte offset of the first character of each line. `starts[0]` is the
+    /// prologue length; entry `n` is the byte offset just past the `n`th
+    /// `\n`. Sorted ascending, so a byte offset maps to a line by
+    /// `partition_point`.
+    starts: Box<[u32]>,
     /// Every byte is ASCII, so a column is a byte distance.
     ascii: bool,
+    /// `None` for a transient index the ledger refused to retain.
+    _lease: Option<ResourceLease>,
+}
+
+impl LineIndex {
+    fn build(text: &str, prologue: u32) -> Self {
+        let mut starts = vec![prologue];
+        starts.extend(
+            text.bytes()
+                .enumerate()
+                .filter(|&(_, byte)| byte == b'\n')
+                .map(|(idx, _)| (idx + 1) as u32),
+        );
+        Self {
+            starts: starts.into_boxed_slice(),
+            ascii: text.is_ascii(),
+            _lease: None,
+        }
+    }
 }
 
 impl ModuleSource {
-    /// Build a source entry whose first `prologue` bytes are a host header on
-    /// line 1, scanning once for line starts.
-    fn new(
-        text: SharedSource,
-        prologue: u32,
-        lease: &mut ResourceLease,
-    ) -> Result<Self, ResourceError> {
-        let capacity = 1 + text.bytes().filter(|&byte| byte == b'\n').count();
-        let mut line_starts = crate::executable::allocation::try_vec(capacity, lease)?;
-        line_starts.push(prologue);
-        for (idx, byte) in text.bytes().enumerate() {
-            if byte == b'\n' {
-                line_starts.push((idx + 1) as u32);
-            }
-        }
-        let ascii = text.is_ascii();
-        Ok(Self {
+    /// A source entry whose first `prologue` bytes are a host header on
+    /// line 1. Its line index is charged to `account` once built.
+    fn new(text: SharedSource, prologue: u32, account: ResourceAccount) -> Self {
+        Self {
             text,
-            line_starts: line_starts.into_boxed_slice(),
-            ascii,
-        })
+            prologue,
+            account,
+            lines: OnceLock::new(),
+        }
+    }
+
+    /// Run `f` over the line index, building and retaining it on first use.
+    /// A ledger refusal answers this query from a transient index.
+    fn with_lines<R>(&self, f: impl FnOnce(&LineIndex) -> R) -> R {
+        if let Some(lines) = self.lines.get() {
+            return f(lines);
+        }
+        let mut lines = LineIndex::build(&self.text, self.prologue);
+        let bytes = std::mem::size_of_val(&*lines.starts) as u64;
+        match self
+            .account
+            .reserve_exact(ResourceClass::SourceModuleBytes, bytes)
+        {
+            Ok(lease) => {
+                lines._lease = Some(lease);
+                f(self.lines.get_or_init(|| lines))
+            }
+            Err(_) => f(&lines),
+        }
     }
 
     /// Resolve a 0-based byte offset into a 1-based `(line, column)`
@@ -76,22 +117,24 @@ impl ModuleSource {
             clamped -= 1;
         }
         let clamped = clamped as u32;
-        // `partition_point` returns the count of line starts `<= clamped`;
-        // since `line_starts[0] == 0`, that count is the 1-based line.
-        let line = self.line_starts.partition_point(|&s| s <= clamped);
-        let line = line.max(1);
-        let line_start = self.line_starts[line - 1] as usize;
-        // An offset inside the host prologue reports the start of line 1.
-        let clamped = clamped.max(line_start as u32);
-        let col_units = if self.ascii {
-            clamped as usize - line_start
-        } else {
-            self.text[line_start..clamped as usize]
-                .chars()
-                .map(char::len_utf16)
-                .sum::<usize>()
-        };
-        (line as u32, (col_units as u32) + 1)
+        self.with_lines(|lines| {
+            // `partition_point` returns the count of line starts `<= clamped`;
+            // since `starts[0]` is at most the prologue, that count is the
+            // 1-based line.
+            let line = lines.starts.partition_point(|&s| s <= clamped).max(1);
+            let line_start = lines.starts[line - 1] as usize;
+            // An offset inside the host prologue reports the start of line 1.
+            let clamped = clamped.max(line_start as u32);
+            let col_units = if lines.ascii {
+                clamped as usize - line_start
+            } else {
+                self.text[line_start..clamped as usize]
+                    .chars()
+                    .map(char::len_utf16)
+                    .sum::<usize>()
+            };
+            (line as u32, (col_units as u32) + 1)
+        })
     }
 
     /// The verbatim source text.
@@ -102,24 +145,29 @@ impl ModuleSource {
     /// Share one exact source line with the original text's physical lease.
     /// The line remains valid after its defining code has been evicted.
     pub fn line_source(&self, line_number: u32) -> Option<SharedSource> {
-        let line = self.line_text(line_number)?;
-        let start = *self.line_starts.get(line_number.checked_sub(1)? as usize)? as usize;
-        self.text.slice(start..start + line.len())
+        let (start, end) = self.line_range(line_number)?;
+        self.text.slice(start..end)
     }
 
     /// Return one 1-based source line without its trailing line break.
     pub fn line_text(&self, line_number: u32) -> Option<&str> {
-        if line_number == 0 {
-            return None;
-        }
-        let idx = (line_number - 1) as usize;
-        let start = *self.line_starts.get(idx)? as usize;
-        let end = self
-            .line_starts
-            .get(idx + 1)
-            .map(|n| *n as usize)
-            .unwrap_or(self.text.len());
-        Some(self.text[start..end].trim_end_matches(['\r', '\n']))
+        let (start, end) = self.line_range(line_number)?;
+        Some(&self.text[start..end])
+    }
+
+    /// Byte range of one 1-based source line without its trailing line break.
+    fn line_range(&self, line_number: u32) -> Option<(usize, usize)> {
+        let idx = line_number.checked_sub(1)? as usize;
+        let (start, end) = self.with_lines(|lines| {
+            let start = *lines.starts.get(idx)? as usize;
+            let end = lines
+                .starts
+                .get(idx + 1)
+                .map_or(self.text.len(), |next| *next as usize);
+            Some((start, end))
+        })?;
+        let line = self.text[start..end].trim_end_matches(['\r', '\n']);
+        Some((start, start + line.len()))
     }
 }
 
@@ -187,18 +235,14 @@ impl SourceRegistry {
         }
         let class = ResourceClass::SourceModuleBytes;
         let amounts = std::iter::once((class, std::mem::size_of::<SourceRegistryInner>() as u64))
-            .chain(entries.iter().flat_map(|(url, text, _)| {
-                std::iter::once((
-                    class,
-                    std::mem::size_of::<(Box<str>, ModuleSource)>() as u64,
-                ))
-                .chain(std::iter::once((class, url.len() as u64)))
-                .chain(std::iter::once((class, std::mem::size_of::<u32>() as u64)))
-                .chain(
-                    text.bytes()
-                        .filter(|&byte| byte == b'\n')
-                        .map(move |_| (class, std::mem::size_of::<u32>() as u64)),
-                )
+            .chain(entries.iter().flat_map(|(url, _, _)| {
+                [
+                    (
+                        class,
+                        std::mem::size_of::<(Box<str>, ModuleSource)>() as u64,
+                    ),
+                    (class, url.len() as u64),
+                ]
             }));
         let mut leases = account.reserve_exact_many(amounts)?;
         let mut metadata_lease = leases.take(class);
@@ -209,7 +253,10 @@ impl SourceRegistry {
         let capacity = entries.len();
         let mut prepared = crate::executable::allocation::try_vec(capacity, lease)?;
         for (url, text, prologue) in entries {
-            prepared.push((url.into_boxed_str(), ModuleSource::new(text, prologue, lease)?));
+            prepared.push((
+                url.into_boxed_str(),
+                ModuleSource::new(text, prologue, account.clone()),
+            ));
         }
         let entries = prepared.into_boxed_slice();
         lease.resize(requested)?;
@@ -236,13 +283,8 @@ impl SourceRegistry {
 mod tests {
     use super::*;
 
-    fn module_source(text: SharedSource) -> Result<ModuleSource, ResourceError> {
-        let capacity = 1 + text.bytes().filter(|&byte| byte == b'\n').count();
-        let mut lease = ResourceAccount::default().reserve_exact(
-            ResourceClass::SourceModuleBytes,
-            (capacity as u64).saturating_mul(std::mem::size_of::<u32>() as u64),
-        )?;
-        ModuleSource::new(text, 0, &mut lease)
+    fn module_source(text: SharedSource) -> ModuleSource {
+        ModuleSource::new(text, 0, ResourceAccount::default())
     }
 
     fn source(text: &str) -> SharedSource {
@@ -252,10 +294,7 @@ mod tests {
     #[test]
     fn prologue_is_not_part_of_line_one() {
         let text = source("(function () { a;\nb;\n})");
-        let mut lease = ResourceAccount::default()
-            .reserve_exact(ResourceClass::SourceModuleBytes, 12)
-            .unwrap();
-        let src = ModuleSource::new(text, 15, &mut lease).unwrap();
+        let src = ModuleSource::new(text, 15, ResourceAccount::default());
         assert_eq!(src.line_col(15), (1, 1));
         assert_eq!(src.line_col(2), (1, 1), "a prologue offset clamps to line 1");
         assert_eq!(src.line_text(1), Some("a;"));
@@ -264,7 +303,7 @@ mod tests {
 
     #[test]
     fn line_col_basic() {
-        let src = module_source(source("ab\ncde\nf")).unwrap();
+        let src = module_source(source("ab\ncde\nf"));
         // offset 0 -> line 1 col 1
         assert_eq!(src.line_col(0), (1, 1));
         // offset 1 -> line 1 col 2
@@ -280,7 +319,7 @@ mod tests {
     #[test]
     fn line_col_utf16_columns() {
         // 'é' is 2 bytes UTF-8, 1 UTF-16 unit. Column after it is 2.
-        let src = module_source(source("é x")).unwrap();
+        let src = module_source(source("é x"));
         // byte offset 2 is the space (after the 2-byte 'é')
         assert_eq!(src.line_col(2), (1, 2));
     }
@@ -306,8 +345,33 @@ mod tests {
     }
 
     #[test]
+    fn a_refused_line_index_answers_without_retaining() {
+        let text = "a\nb\nc";
+        let account = ResourceAccount::new(
+            otter_resource::ResourceLimits::builder()
+                .limit(ResourceClass::SourceModuleBytes, text.len() as u64)
+                .build(),
+        );
+        let src = ModuleSource::new(
+            SharedSource::admit(&account, text.to_owned()).unwrap(),
+            0,
+            account.clone(),
+        );
+        assert_eq!(src.line_col(4), (3, 1));
+        assert_eq!(src.line_text(2), Some("b"));
+        assert!(src.lines.get().is_none());
+        assert_eq!(
+            account
+                .snapshot()
+                .get(ResourceClass::SourceModuleBytes)
+                .current(),
+            text.len() as u64
+        );
+    }
+
+    #[test]
     fn clamps_past_end() {
-        let src = module_source(source("abc")).unwrap();
+        let src = module_source(source("abc"));
         assert_eq!(src.line_col(999), (1, 4));
     }
 
@@ -326,6 +390,9 @@ mod tests {
             .expect("first source bytes");
         let a = SourceRegistry::new(BTreeMap::from([("same.js".to_owned(), a_text)]), &account)
             .expect("first metadata");
+        let before_index = current(&account);
+        assert_eq!(a.get("same.js").unwrap().line_text(2), Some("source A"));
+        assert!(current(&account) > before_index, "the first query charges the index");
         let a_charge = current(&account);
         let snapshot = a.clone();
         assert_eq!(current(&account), a_charge, "clone shares one charge");
@@ -341,13 +408,17 @@ mod tests {
         .expect("second source bytes");
         let b = SourceRegistry::new(BTreeMap::from([("same.js".to_owned(), b_text)]), &account)
             .expect("second metadata");
-        let both = current(&account);
-        assert!(both > a_charge, "independent second allocation is admitted");
-        assert_eq!(a.get("same.js").unwrap().line_text(2), Some("source A"));
         assert_eq!(
             b.get("same.js").unwrap().line_text(2),
             Some("with new geometry")
         );
+        let both = current(&account);
+        assert!(both > a_charge, "independent second allocation is admitted");
+        assert_eq!(
+            snapshot.get("same.js").unwrap().line_text(2),
+            Some("source A")
+        );
+        assert_eq!(current(&account), both, "snapshot shares the built index");
         drop(a);
         assert_eq!(
             current(&account),

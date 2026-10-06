@@ -40,6 +40,8 @@ fn same_url_foreign_owner_and_eager_line_do_not_pin_evicted_executable() {
     let space = Arc::new(CodeSpace::default());
     let text_a = "first A\né𝄞 exact original\nlast A";
     let a_sources = sources(&account, text_a);
+    // A position query builds A's line index, part of A's source charge.
+    assert_eq!(a_sources.get("same.js").unwrap().line_col(0), (1, 1));
     let a_source_charge = current(&account);
     let first = space
         .link_evictable_module(

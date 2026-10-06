@@ -228,7 +228,7 @@ impl otter_gc::ExtraRootSource for SyncJsCallRoots {
 pub(crate) fn invoke_native_call_with_roots(
     interp: &mut Interpreter,
     stack: &mut ActivationStack,
-    context: Option<&ExecutionContext>,
+    context: crate::runtime_cx::NativeContext<'_>,
     call: crate::native_function::NativeCallTarget,
     this_value: Value,
     value_roots: &[&Value],
@@ -244,7 +244,7 @@ pub(crate) fn invoke_native_call_with_roots(
         .register_extra_roots(otter_gc::ExtraRoots::new(&roots));
     debug_assert!(interp.gc_heap.has_frame_root_providers());
     let turn = crate::runtime_cx::RuntimeTurn::from_rooted_parts(interp, stack);
-    let mut ctx = NativeCtx::from_runtime_turn(turn, &call_info, context);
+    let mut ctx = NativeCtx::with_native_context(turn, &call_info, context);
     call.invoke(&mut ctx, args)
 }
 

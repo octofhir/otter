@@ -390,13 +390,7 @@ fn global_unescape(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Nat
 /// `@@toPrimitive`) before the strict NaN test, unlike the strict
 /// `Number.isNaN` (§21.1.2.3) which performs no coercion.
 fn global_is_nan(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-    let arg = args.first().cloned().unwrap_or(Value::undefined());
-    let context = native_context(ctx, "isNaN")?;
-    let num = ctx.with_turn_parts(|interp, stack| {
-        interp
-            .coerce_to_number(stack, &context, &arg)
-            .map_err(|e| e.into_native(interp, "isNaN"))
-    })?;
+    let num = argument_to_number(ctx, args.first(), "isNaN")?;
     Ok(Value::boolean(num.as_f64().is_nan()))
 }
 
@@ -404,14 +398,31 @@ fn global_is_nan(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Nativ
 /// `? ToNumber(number)` before the strict finiteness test, unlike the
 /// strict `Number.isFinite` (§21.1.2.2).
 fn global_is_finite(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-    let arg = args.first().cloned().unwrap_or(Value::undefined());
-    let context = native_context(ctx, "isFinite")?;
-    let num = ctx.with_turn_parts(|interp, stack| {
-        interp
-            .coerce_to_number(stack, &context, &arg)
-            .map_err(|e| e.into_native(interp, "isFinite"))
-    })?;
+    let num = argument_to_number(ctx, args.first(), "isFinite")?;
     Ok(Value::boolean(num.as_f64().is_finite()))
+}
+
+/// `? ToNumber(argument)`. Only an object's `ToPrimitive` runs user code,
+/// so only it needs the caller's execution context.
+fn argument_to_number(
+    ctx: &mut NativeCtx<'_>,
+    argument: Option<&Value>,
+    name: &'static str,
+) -> Result<crate::number::NumberValue, NativeError> {
+    let argument = argument.copied().unwrap_or(Value::undefined());
+    if crate::abstract_ops::is_primitive(&argument) {
+        return ctx.with_turn_parts(|interp, _| {
+            crate::coerce::primitive_to_number(interp, &argument).map_err(|error| {
+                crate::CommittedValueError::JavaScript(error).into_native(interp, name)
+            })
+        });
+    }
+    let context = native_context(ctx, name)?;
+    ctx.with_turn_parts(|interp, stack| {
+        interp
+            .coerce_to_number(stack, &context, &argument)
+            .map_err(|error| error.into_native(interp, name))
+    })
 }
 
 pub(crate) fn global_eval(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {

@@ -20,6 +20,10 @@ use crate::{Local, NativeCtx, NativeError, Value, number::NumberValue};
 use otter_bytecode::method_id::MathMethod;
 use smallvec::SmallVec;
 
+/// Converted Math arguments; every fixed-arity method and most variadic
+/// calls fit inline.
+pub(super) type MathNumbers = SmallVec<[NumberValue; 4]>;
+
 pub(super) fn arguments_for(method: MathMethod, args: &[Value]) -> &[Value] {
     use MathMethod::*;
     let count = match method {
@@ -37,7 +41,7 @@ pub(super) fn coerce_math_args(
     ctx: &mut NativeCtx<'_>,
     name: &'static str,
     args: &[Value],
-) -> Result<Vec<NumberValue>, NativeError> {
+) -> Result<MathNumbers, NativeError> {
     if !args.iter().any(needs_to_primitive) {
         return coerce_all(name, args, ctx.heap()).map_err(native_error);
     }
@@ -51,7 +55,7 @@ pub(super) fn coerce_math_args(
     ctx.scope(|mut scope| {
         let rooted: SmallVec<[Local<'_>; 4]> =
             args.iter().map(|&value| scope.value(value)).collect();
-        let mut numbers = Vec::with_capacity(args.len());
+        let mut numbers = MathNumbers::with_capacity(args.len());
         for (index, argument) in rooted.into_iter().enumerate() {
             let value = scope.raw(argument);
             let primitive = if needs_to_primitive(&value) {
@@ -85,7 +89,7 @@ pub(super) fn coerce_all(
     name: &'static str,
     args: &[Value],
     heap: &otter_gc::GcHeap,
-) -> Result<Vec<NumberValue>, MathError> {
+) -> Result<MathNumbers, MathError> {
     args.iter()
         .enumerate()
         .map(|(index, &value)| number_argument(name, index, value, heap))

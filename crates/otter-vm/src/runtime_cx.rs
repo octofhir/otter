@@ -287,7 +287,17 @@ pub struct NativeCtx<'rt> {
     // `Arc`s + a `FrozenVec` on every native invocation. Owned copies are made
     // only on the rare re-entrant paths that stash the context past the call
     // (microtask enqueue, `interp_mut_and_context`).
-    context: Option<&'rt ExecutionContext>,
+    context: NativeContext<'rt>,
+}
+
+/// The execution context a native body observes.
+#[derive(Clone, Copy)]
+pub(crate) enum NativeContext<'rt> {
+    /// Known to the entry that built the call.
+    Exact(Option<&'rt ExecutionContext>),
+    /// Its innermost JavaScript caller's source owner, resolved only when the
+    /// body first asks for it.
+    Caller(&'rt crate::interp::host_call::CallerContext<'rt>),
 }
 
 /// Allocation-safe contributor view for one native handle scope.
@@ -318,6 +328,16 @@ impl<'rt> NativeCtx<'rt> {
         cx: RuntimeTurn<'rt>,
         call_info: &'rt NativeCallInfo,
         context: Option<&'rt ExecutionContext>,
+    ) -> Self {
+        Self::with_native_context(cx, call_info, NativeContext::Exact(context))
+    }
+
+    /// [`Self::from_runtime_turn`] over a context that may resolve lazily.
+    #[must_use]
+    pub(crate) fn with_native_context(
+        cx: RuntimeTurn<'rt>,
+        call_info: &'rt NativeCallInfo,
+        context: NativeContext<'rt>,
     ) -> Self {
         Self {
             cx,
@@ -379,7 +399,7 @@ impl<'rt> NativeCtx<'rt> {
     /// Return the execution context active for this native call, when present.
     #[must_use]
     pub fn execution_context(&self) -> Option<&ExecutionContext> {
-        self.context
+        self.context_ref()
     }
 
     /// Cancel one timer owned by this isolate without re-entering a mutable
@@ -399,7 +419,10 @@ impl<'rt> NativeCtx<'rt> {
     /// `interp_mut` borrow.
     #[must_use]
     pub(crate) fn context_ref(&self) -> Option<&'rt ExecutionContext> {
-        self.context
+        match self.context {
+            NativeContext::Exact(context) => context,
+            NativeContext::Caller(caller) => caller.get(self.cx.interp),
+        }
     }
 
     /// Snapshot at most `limit` innermost JavaScript activations, top frame
@@ -535,7 +558,8 @@ impl<'rt> NativeCtx<'rt> {
     /// runtime extensions) can re-enter the interpreter without
     /// reimplementing the borrow split.
     pub fn interp_mut_and_context(&mut self) -> (&mut Interpreter, Option<ExecutionContext>) {
-        (self.cx.interp, self.context.cloned())
+        let context = self.context_ref().cloned();
+        (self.cx.interp, context)
     }
 
     /// Return the JavaScript receiver for the active native call.
@@ -873,7 +897,10 @@ impl<'rt> NativeCtx<'rt> {
         target: Value,
         args: smallvec::SmallVec<[Value; 8]>,
     ) -> Result<Value, NativeError> {
-        let context = self.context.cloned().ok_or(NativeError::InvalidOperand)?;
+        let context = self
+            .context_ref()
+            .cloned()
+            .ok_or(NativeError::InvalidOperand)?;
         self.cx.with_parts(|interp, stack| {
             interp
                 .run_construct_sync_rooted(stack, &context, &target, target, args, 0)
@@ -952,7 +979,7 @@ impl<'rt> NativeCtx<'rt> {
         url: &str,
     ) -> Result<Option<crate::promise::JsPromiseHandle>, crate::RunError> {
         let context = self
-            .context
+            .context_ref()
             .cloned()
             .ok_or_else(|| crate::RunError::bare(VmError::InvalidOperand))?;
         self.cx.with_parts(|interp, stack| {
@@ -972,7 +999,7 @@ impl<'rt> NativeCtx<'rt> {
         this_value: Value,
         args: smallvec::SmallVec<[Value; 8]>,
     ) -> Result<Value, NativeError> {
-        let context = self.context.cloned();
+        let context = self.context_ref().cloned();
         self.cx.with_parts(|interp, stack| {
             interp
                 .run_callable_sync_rooted(stack, context.as_ref(), &target, this_value, args)
@@ -986,7 +1013,8 @@ impl<'rt> NativeCtx<'rt> {
     /// retaining them across any later allocation must immediately place them
     /// in scoped or persistent roots.
     pub fn promise_capability(&mut self) -> Result<(Value, Value, Value), NativeError> {
-        let builder = crate::promise_dispatch::PromiseBuilder::with_context(self.context.cloned());
+        let builder =
+            crate::promise_dispatch::PromiseBuilder::with_context(self.context_ref().cloned());
         builder
             .construct_native_rooted(self, &[], &[])
             .map(|(promise, resolve, reject)| (Value::promise(promise), resolve, reject))
@@ -1047,7 +1075,10 @@ impl<'rt> NativeCtx<'rt> {
         value: Value,
         constructor: Value,
     ) -> Result<bool, NativeError> {
-        let context = self.context.cloned().ok_or(NativeError::InvalidOperand)?;
+        let context = self
+            .context_ref()
+            .cloned()
+            .ok_or(NativeError::InvalidOperand)?;
         self.cx.with_parts(|interp, stack| {
             interp
                 .ordinary_has_instance(stack, &context, &constructor, &value)
@@ -1083,7 +1114,7 @@ impl<'rt> NativeCtx<'rt> {
     /// Perform ordinary/exotic JavaScript `Get(receiver, key)` through the
     /// active execution context.
     pub fn get_value_property(&mut self, receiver: Value, key: &str) -> Result<Value, NativeError> {
-        let context = self.context.cloned();
+        let context = self.context_ref().cloned();
         self.scope(|mut scope| {
             let receiver = scope.value(receiver);
             let raw = scope.raw(receiver);
@@ -1129,7 +1160,10 @@ impl<'rt> NativeCtx<'rt> {
         &mut self,
         target: Value,
     ) -> Result<Vec<String>, NativeError> {
-        let context = self.context.cloned().ok_or(NativeError::InvalidOperand)?;
+        let context = self
+            .context_ref()
+            .cloned()
+            .ok_or(NativeError::InvalidOperand)?;
         self.cx.with_parts(|interp, stack| {
             interp
                 .enumerable_own_string_keys_for_value(stack, &context, target, 0)
@@ -1145,7 +1179,10 @@ impl<'rt> NativeCtx<'rt> {
         key: &str,
         value: Value,
     ) -> Result<(), NativeError> {
-        let context = self.context.cloned().ok_or(NativeError::InvalidOperand)?;
+        let context = self
+            .context_ref()
+            .cloned()
+            .ok_or(NativeError::InvalidOperand)?;
         let ok = self.cx.with_parts(|interp, stack| {
             interp
                 .ordinary_set_data_value(
@@ -1724,7 +1761,7 @@ impl<'rt> NativeCtx<'rt> {
         let context = self
             .cx
             .interp
-            .callable_context(self.context, callee)
+            .callable_context(self.context_ref(), callee)
             .map_err(|error| {
                 native_function::vm_to_native_error(
                     self.cx.interp,
@@ -2024,7 +2061,7 @@ impl<'scope, 'rt> NativeScope<'scope, 'rt> {
             self.ctx
                 .cx
                 .interp
-                .scoped_promise_rejected(self.token, reason, self.ctx.context);
+                .scoped_promise_rejected(self.token, reason, self.ctx.context_ref());
         result.map_err(|error| self.vm_error(error, "NativeScope::promise_rejected"))
     }
 
@@ -2076,7 +2113,7 @@ impl<'scope, 'rt> NativeScope<'scope, 'rt> {
         self.ctx
             .cx
             .interp
-            .note_settle_rejection(&jobs, self.ctx.context);
+            .note_settle_rejection(&jobs, self.ctx.context_ref());
         for job in jobs.jobs {
             self.ctx.cx.interp.microtasks_mut().enqueue(job);
         }
@@ -2812,7 +2849,7 @@ impl<'scope, 'rt> NativeScope<'scope, 'rt> {
         if receiver.as_object().is_none()
             && receiver.as_array().is_none()
             && receiver.as_native_function().is_none()
-            && self.ctx.context.is_some()
+            && self.ctx.context_ref().is_some()
         {
             let value = self.raw(value);
             return self.ctx.set_value_property(receiver, key, value);
@@ -2902,7 +2939,7 @@ impl<'scope, 'rt> NativeScope<'scope, 'rt> {
         flags: crate::object::PropertyFlags,
     ) -> Result<(), NativeError> {
         if self.raw(object).as_object().is_none()
-            && let Some(context) = self.ctx.context.cloned()
+            && let Some(context) = self.ctx.context_ref().cloned()
         {
             let target = self.raw(object);
             let descriptor = object::PartialPropertyDescriptor {
@@ -3543,7 +3580,7 @@ impl<'scope, 'rt> NativeScope<'scope, 'rt> {
     /// Script lexical bindings precede object-record properties; TDZ and
     /// unresolvable names throw ReferenceError. Getters run normally.
     pub fn global_binding(&mut self, name: &str) -> Result<Local<'scope>, NativeError> {
-        let context = self.ctx.context.cloned();
+        let context = self.ctx.context_ref().cloned();
         let result = self.with_turn_parts(|interp, stack| {
             interp.load_global_binding_name(
                 context.as_ref(),
@@ -3566,7 +3603,7 @@ impl<'scope, 'rt> NativeScope<'scope, 'rt> {
         &mut self,
         name: &str,
     ) -> Result<otter_bytecode::TypeOfKind, NativeError> {
-        let context = self.ctx.context.cloned();
+        let context = self.ctx.context_ref().cloned();
         let result = self.with_turn_parts(|interp, stack| {
             interp.load_global_binding_name(
                 context.as_ref(),
@@ -3639,7 +3676,7 @@ impl<'scope, 'rt> NativeScope<'scope, 'rt> {
         this_value: Local<'_>,
         args: &[Local<'_>],
     ) -> Result<Local<'scope>, VmError> {
-        let context = self.ctx.context;
+        let context = self.ctx.context_ref();
         let target = self.raw(target);
         let this_value = self.raw(this_value);
         let args: smallvec::SmallVec<[Value; 8]> =

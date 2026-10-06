@@ -208,9 +208,8 @@ fn finish_vm_error(
         }
         CommittedValueError::Fatal(error) => Err(error),
     };
-    if projected.is_ok() {
-        vm.record_throw_site();
-    }
+    // A terminal failure is reported with the frames it left, as a throw is.
+    vm.record_throw_site();
     finish_projection(vm, ctx, projected)
 }
 
@@ -246,9 +245,9 @@ fn finish_native_result(
         Err(error) => {
             let projected =
                 crate::error_ops::native_error_to_throwable_with_stack(vm, stack, context, error);
-            if projected.is_ok() {
-                vm.record_throw_site();
-            }
+            // A terminal failure is reported with the frames it left, as a
+            // throw is; an imported failure already carries its own.
+            vm.record_throw_site();
             finish_projection(vm, ctx, projected)
         }
     })

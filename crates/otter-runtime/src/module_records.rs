@@ -47,7 +47,6 @@
 use otter_vm::{ExecutionContext, Interpreter, NativeCallInfo, NativeCtx, NativeError};
 use std::collections::BTreeMap;
 
-use crate::{CapabilitySet, HostedModule, RuntimeTaskSpawner};
 
 /// Lifecycle phases per ECMA-262 §16.2 Cyclic Module Records.
 ///
@@ -131,9 +130,7 @@ impl RuntimeModuleRecords {
         &mut self,
         interp: &mut Interpreter,
         context: &ExecutionContext,
-        hosted_modules: &[HostedModule],
-        capabilities: &CapabilitySet,
-        runtime_task_spawner: Option<RuntimeTaskSpawner>,
+        commonjs: &std::sync::Arc<crate::commonjs::CjsConfig>,
     ) -> Result<(), NativeError> {
         let realm_id = interp.active_host_realm_id();
         let records = self.realms.entry(realm_id).or_default();
@@ -149,7 +146,8 @@ impl RuntimeModuleRecords {
                         if records.contains_key(&init.url) {
                             continue;
                         }
-                        let env = if let Some(hosted) = hosted_modules
+                        let env = if let Some(hosted) = commonjs
+                            .hosted
                             .iter()
                             .copied()
                             .find(|hosted| hosted.specifier() == init.url)
@@ -170,9 +168,7 @@ impl RuntimeModuleRecords {
                                         synthesize_commonjs_namespace(
                                             &mut scope,
                                             &init.url,
-                                            hosted_modules,
-                                            capabilities,
-                                            runtime_task_spawner.clone(),
+                                            commonjs,
                                         )?
                                     } else {
                                         let install = hosted
@@ -180,8 +176,8 @@ impl RuntimeModuleRecords {
                                             .ok_or(NativeError::InvalidOperand)?;
                                         let namespace = install(
                                             &mut scope,
-                                            capabilities,
-                                            runtime_task_spawner.clone(),
+                                            &commonjs.capabilities,
+                                            commonjs.runtime_task_spawner.clone(),
                                         )?;
                                         scope.set(namespace, "default", namespace)?;
                                         namespace
@@ -280,18 +276,9 @@ impl RuntimeModuleRecords {
 fn synthesize_commonjs_namespace<'scope>(
     scope: &mut otter_vm::NativeScope<'scope, '_>,
     specifier: &str,
-    hosted_modules: &[HostedModule],
-    capabilities: &CapabilitySet,
-    runtime_task_spawner: Option<RuntimeTaskSpawner>,
+    commonjs: &std::sync::Arc<crate::commonjs::CjsConfig>,
 ) -> Result<otter_vm::Local<'scope>, NativeError> {
-    let cfg = std::sync::Arc::new(crate::commonjs::CjsConfig {
-        capabilities: capabilities.clone(),
-        hosted: hosted_modules.to_vec(),
-        runtime_task_spawner,
-        addon_loader: None,
-        report_watch_dependencies: crate::commonjs::watch_reporting_requested(),
-    });
-    let exports = crate::commonjs::cjs_load_builtin(scope, &cfg, specifier)?.ok_or_else(|| {
+    let exports = crate::commonjs::cjs_load_builtin(scope, commonjs, specifier)?.ok_or_else(|| {
         crate::runtime_type_error("import", format!("no builtin module named '{specifier}'"))
     })?;
     let namespace = scope.bare_object()?;

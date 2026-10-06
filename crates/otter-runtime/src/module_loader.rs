@@ -889,7 +889,13 @@ impl ModuleLoader {
             ..ResolveOptions::default()
         };
         let cjs_options = ResolveOptions {
-            extensions: config.extensions.clone(),
+            // `require` also loads native addons by bare file name.
+            extensions: config
+                .extensions
+                .iter()
+                .cloned()
+                .chain([".node".to_owned()])
+                .collect(),
             condition_names: config.cjs_conditions.clone(),
             main_fields: vec!["main".into(), "module".into()],
             tsconfig: Some(TsconfigDiscovery::Auto),
@@ -1036,58 +1042,84 @@ impl ModuleLoader {
             })?;
             return Ok(format!("file://{}", path.display()));
         }
-        if specifier.starts_with("./") || specifier.starts_with("../") {
-            let referrer_path =
-                referrer_dir(referrer).unwrap_or_else(|| self.config.base_dir.clone());
-            let resolver = match kind {
-                ImportKind::Esm => &self.esm_resolver,
-                ImportKind::Cjs => &self.cjs_resolver,
-            };
-            return match resolve_with_oxc(
-                resolver,
-                referrer_file(referrer).as_deref(),
-                &referrer_path,
-                specifier,
-            ) {
-                Ok(resolution) => {
-                    let path = canonicalise(&resolution.full_path()).map_err(|e| {
-                        LoaderError::Resolve {
-                            specifier: specifier.to_string(),
-                            referrer: referrer.unwrap_or("<entry>").to_string(),
-                            message: e,
-                        }
-                    })?;
-                    Ok(format!("file://{}", path.display()))
-                }
-                Err(e) => Err(resolve_error_with_context(
-                    specifier,
-                    referrer,
-                    kind,
-                    match kind {
-                        ImportKind::Esm => &self.config.esm_conditions,
-                        ImportKind::Cjs => &self.config.cjs_conditions,
-                    },
-                    e.to_string(),
-                )),
-            };
+        let dir = referrer_dir(referrer).unwrap_or_else(|| self.config.base_dir.clone());
+        let referrer_file = referrer_file(referrer);
+        let path =
+            self.resolve_file_path(specifier, referrer, referrer_file.as_deref(), &dir, kind)?;
+        Ok(format!("file://{}", path.display()))
+    }
+
+    /// Resolve `require(specifier)` from a CommonJS module in `dir` by Node's
+    /// CommonJS algorithm under the `require` conditions: relative (including
+    /// `.` and `..`), absolute and bare specifiers, `package.json#exports` and
+    /// `#imports`, and the installed package graph. `referrer_file` is the
+    /// requiring module when it is a file.
+    ///
+    /// # Errors
+    /// See [`LoaderError`].
+    pub(crate) fn resolve_require(
+        &self,
+        specifier: &str,
+        referrer_file: Option<&Path>,
+        dir: &Path,
+    ) -> Result<PathBuf, LoaderError> {
+        self.resolve_file_path(specifier, None, referrer_file, dir, ImportKind::Cjs)
+    }
+
+    /// Resolve a relative, absolute-path or bare specifier to the canonical
+    /// path of the file it names. `oxc_resolver` follows symlinks, so its
+    /// result is already the real path.
+    fn resolve_file_path(
+        &self,
+        specifier: &str,
+        referrer: Option<&str>,
+        referrer_file: Option<&Path>,
+        dir: &Path,
+        kind: ImportKind,
+    ) -> Result<PathBuf, LoaderError> {
+        let conditions = match kind {
+            ImportKind::Esm => &self.config.esm_conditions,
+            ImportKind::Cjs => &self.config.cjs_conditions,
+        };
+        let resolver = match kind {
+            ImportKind::Esm => &self.esm_resolver,
+            ImportKind::Cjs => &self.cjs_resolver,
+        };
+        let oxc = |request: &str| {
+            resolve_with_oxc(resolver, referrer_file, dir, request)
+                .map(|resolution| resolution.full_path())
+                .map_err(|error| {
+                    resolve_error_with_context(
+                        specifier,
+                        referrer,
+                        kind,
+                        conditions,
+                        error.to_string(),
+                    )
+                })
+        };
+        let relative = specifier.starts_with("./")
+            || specifier.starts_with("../")
+            || (kind == ImportKind::Cjs && matches!(specifier, "." | ".."));
+        if relative {
+            return oxc(specifier);
         }
         if Path::new(specifier).is_absolute() {
-            let path = canonicalise(Path::new(specifier)).map_err(|e| LoaderError::Resolve {
+            // CommonJS probes extensions and directory entries for an
+            // absolute path too; an ES module names its file exactly.
+            if kind == ImportKind::Cjs {
+                return oxc(specifier);
+            }
+            return canonicalise(Path::new(specifier)).map_err(|e| LoaderError::Resolve {
                 specifier: specifier.to_string(),
                 referrer: referrer.unwrap_or("<entry>").to_string(),
                 message: e,
-            })?;
-            return Ok(format!("file://{}", path.display()));
+            });
         }
         // Bare-specifier path: walk node_modules upward from the
         // importer's directory using oxc_resolver. Unwrap the
         // `npm:` sugar prefix first.
         let bare = specifier.strip_prefix("npm:").unwrap_or(specifier);
-        let dir = referrer_dir(referrer).unwrap_or_else(|| self.config.base_dir.clone());
-        let conditions = match kind {
-            ImportKind::Esm => &self.config.esm_conditions,
-            ImportKind::Cjs => &self.config.cjs_conditions,
-        };
         if bare.starts_with('#')
             && let Some(graph) = &self.config.package_graph
             && let Some(scope_cache) = &self.package_scope_cache
@@ -1096,7 +1128,7 @@ impl ModuleLoader {
                     graph,
                     scope_cache,
                     bare,
-                    &dir,
+                    dir,
                     conditions,
                     &self.config.extensions,
                 )
@@ -1104,7 +1136,7 @@ impl ModuleLoader {
                     resolve_error_with_context(specifier, referrer, kind, conditions, message)
                 })?
         {
-            return Ok(format!("file://{}", path.display()));
+            return Ok(path);
         }
         if let Some(graph) = &self.config.package_graph
             && let Some(scope_cache) = &self.package_scope_cache
@@ -1112,7 +1144,7 @@ impl ModuleLoader {
                 graph,
                 scope_cache,
                 bare,
-                &dir,
+                dir,
                 kind,
                 conditions,
                 &self.config.extensions,
@@ -1121,35 +1153,14 @@ impl ModuleLoader {
                 resolve_error_with_context(specifier, referrer, kind, conditions, message)
             })?
         {
-            return Ok(format!("file://{}", path.display()));
+            return Ok(path);
         }
         if !self.config.enable_node_modules {
             return Err(LoaderError::UnsupportedSpecifier {
                 specifier: specifier.to_string(),
             });
         }
-        let resolver = match kind {
-            ImportKind::Esm => &self.esm_resolver,
-            ImportKind::Cjs => &self.cjs_resolver,
-        };
-        match resolve_with_oxc(resolver, referrer_file(referrer).as_deref(), &dir, bare) {
-            Ok(resolution) => {
-                let path =
-                    canonicalise(&resolution.full_path()).map_err(|e| LoaderError::Resolve {
-                        specifier: specifier.to_string(),
-                        referrer: referrer.unwrap_or("<entry>").to_string(),
-                        message: e,
-                    })?;
-                Ok(format!("file://{}", path.display()))
-            }
-            Err(e) => Err(resolve_error_with_context(
-                specifier,
-                referrer,
-                kind,
-                conditions,
-                e.to_string(),
-            )),
-        }
+        oxc(bare)
     }
 
     fn check_network_capability(

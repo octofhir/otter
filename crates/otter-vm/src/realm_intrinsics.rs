@@ -248,6 +248,9 @@ pub(crate) struct RealmIntrinsics {
     pub(crate) regexp_protocol: Option<crate::regexp_fast::RegExpProtocolProof>,
     /// Which iteration reads have built-in answers in this realm, while proven.
     pub(crate) iteration: crate::iteration_protocol::IterationProofs,
+    /// CreateIteratorResultObject's hidden class: `%Object.prototype%`, then
+    /// `value`, then `done` (V8's iterator result map).
+    pub(crate) iterator_result: Option<crate::ObjectLayout>,
 }
 
 impl Default for RealmIntrinsics {
@@ -257,6 +260,7 @@ impl Default for RealmIntrinsics {
             array_values: crate::native_function::NativeFunction::from_gc(otter_gc::Gc::null()),
             regexp_protocol: None,
             iteration: crate::iteration_protocol::IterationProofs::default(),
+            iterator_result: None,
         }
     }
 }

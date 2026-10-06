@@ -348,16 +348,32 @@ impl Interpreter {
             {
                 return Ok(interp.escape_scoped(produced_root));
             }
+            if produced.is_generator()
+                && (primordial || interp.proven_generator_next(interp.escape_scoped(produced_root)))
+            {
+                let produced = interp.escape_scoped(produced_root);
+                let handle = produced
+                    .as_generator()
+                    .ok_or(CommittedValueError::Fatal(VmError::InvalidOperand))?;
+                let iter = interp
+                    .alloc_stack_rooted_iterator_state(
+                        stack,
+                        IteratorState::Generator { handle },
+                        &[&produced],
+                        &[],
+                    )
+                    .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                return Ok(Value::iterator(iter));
+            }
             let produced = interp.escape_scoped(produced_root);
             // §7.4.3 step 2 — `[@@iterator]()` must return an Object.
-            let iter_state = if let Some(handle) = produced.as_generator() {
-                IteratorState::Generator { handle }
-            } else if produced.is_object()
+            let iter_state = if produced.is_object()
                 || produced.is_proxy()
                 || produced.is_array()
                 || produced.is_map()
                 || produced.is_set()
                 || produced.is_iterator()
+                || produced.is_generator()
             {
                 // `next` is read ONCE here; later `IteratorNext` ticks must not
                 // re-read it (observable via an accessor-defined `next`).
@@ -383,9 +399,15 @@ impl Interpreter {
                 if interp.is_builtin_next(interp.escape_scoped(produced_root), next_method) {
                     return Ok(interp.escape_scoped(produced_root));
                 }
-                IteratorState::User {
-                    iterator: interp.escape_scoped(produced_root),
-                    next_method: Some(next_method),
+                if let Some(handle) = interp.escape_scoped(produced_root).as_generator()
+                    && interp.is_generator_next(next_method)
+                {
+                    IteratorState::Generator { handle }
+                } else {
+                    IteratorState::User {
+                        iterator: interp.escape_scoped(produced_root),
+                        next_method: Some(next_method),
+                    }
                 }
             } else {
                 return Err(CommittedValueError::JavaScript(VmError::TypeMismatch));
@@ -829,11 +851,7 @@ impl Interpreter {
                 let Some(record) = result.as_object() else {
                     return Err(CommittedValueError::JavaScript(VmError::TypeMismatch));
                 };
-                let value = crate::object::get(record, &self.gc_heap, "value")
-                    .unwrap_or(Value::undefined());
-                let done = crate::object::get(record, &self.gc_heap, "done")
-                    .unwrap_or(Value::undefined())
-                    .to_boolean(&self.gc_heap);
+                let (value, done) = self.iterator_result_parts(record);
                 if done {
                     self.gc_heap.with_payload(*iter, |state| state.exhaust());
                 }
@@ -2700,20 +2718,39 @@ impl Interpreter {
         iterator: Value,
         primordial: bool,
     ) -> Result<(), CommittedValueError> {
-        let builtin_object = !primordial && iterator.as_iterator().is_some_and(|handle| {
-            self.gc_heap.read_payload(handle, |state| {
-                !matches!(
-                    state,
-                    IteratorState::User { .. }
-                        | IteratorState::Generator { .. }
-                        | IteratorState::Exhausted { .. }
-                )
-            })
-        });
-        if builtin_object && !self.builtin_return_proven(iterator) {
-            return self.iterator_close_sync(stack, context, &iterator);
+        enum Record {
+            Builtin,
+            Generator(crate::generator::JsGenerator),
+            Other,
         }
-        self.close_iterator_state(stack, context, iterator)
+        let record = match iterator.as_iterator() {
+            Some(handle) if !primordial => self.gc_heap.read_payload(handle, |state| match state {
+                IteratorState::User { .. } | IteratorState::Exhausted { .. } => Record::Other,
+                IteratorState::Generator { handle } => Record::Generator(*handle),
+                _ => Record::Builtin,
+            }),
+            _ => Record::Other,
+        };
+        self.with_handle_scope(|interp, scope| {
+            let root = interp.scoped_value(scope, iterator);
+            match record {
+                Record::Builtin if !interp.builtin_return_proven(iterator) => {
+                    let iterator = interp.escape_scoped(root);
+                    interp.iterator_close_sync(stack, context, &iterator)
+                }
+                Record::Generator(handle) => {
+                    let generator = interp.scoped_value(scope, Value::generator(handle));
+                    if interp.proven_generator_return(Value::generator(handle)) {
+                        return interp.close_iterator_state(stack, context, interp.escape_scoped(root));
+                    }
+                    // The record is done; the generator's own `return` runs.
+                    interp.iterator_mark_done(interp.escape_scoped(root));
+                    let generator = interp.escape_scoped(generator);
+                    interp.iterator_close_sync(stack, context, &generator)
+                }
+                _ => interp.close_iterator_state(stack, context, interp.escape_scoped(root)),
+            }
+        })
     }
 
     /// The close a built-in iterator's own `return` performs: no
@@ -3089,7 +3126,10 @@ impl Interpreter {
         self_iterator: bool,
     ) -> Result<usize, CommittedValueError> {
         let iterable = self.iteration_anchor(base);
-        if iterable.is_generator() {
+        if iterable.is_generator()
+            && (self.caller_iterates_primordially(context, stack)
+                || self.proven_generator_iterable(iterable))
+        {
             let first = base + 1;
             loop {
                 let handle = self
@@ -3107,17 +3147,15 @@ impl Interpreter {
                         ("generator next did not return an object".to_string()).into(),
                     )));
                 };
-                let done = crate::object::get(record, &self.gc_heap, "done")
-                    .unwrap_or(Value::undefined())
-                    .to_boolean(&self.gc_heap);
+                let (value, done) = self.iterator_result_parts(record);
                 if done {
                     return Ok(first);
                 }
-                let value = crate::object::get(record, &self.gc_heap, "value")
-                    .unwrap_or(Value::undefined());
                 self.push_iteration_anchor(value);
             }
         }
+        // Proving the generator above may have moved the iterable.
+        let iterable = self.iteration_anchor(base);
         // A built-in state whose stepping is the built-in `next` runs
         // directly: a proven iterable's fresh state, a proven iterator itself,
         // or the record GetIterator produced with the built-in `next`.

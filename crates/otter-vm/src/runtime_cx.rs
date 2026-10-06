@@ -1947,21 +1947,20 @@ impl<'scope, 'rt> NativeScope<'scope, 'rt> {
         result.map_err(|error| self.vm_error(error, "NativeScope::object"))
     }
 
-    /// Build a rooted CreateIteratorResultObject record.
-    ///
-    /// The receiver stays in this scope while the `value` and `done` shape
-    /// transitions allocate, and every mutation re-reads both operands from
-    /// their handle slots.
+    /// Build a rooted CreateIteratorResultObject record in one allocation of
+    /// the realm's iterator-result hidden class.
     pub fn iterator_result(
         &mut self,
         value: Local<'_>,
         done: bool,
     ) -> Result<Local<'scope>, NativeError> {
-        let result = self.object()?;
-        self.set(result, "value", value)?;
         let done = self.boolean(done);
-        self.set(result, "done", done)?;
-        Ok(result)
+        let result = self
+            .ctx
+            .cx
+            .interp
+            .scoped_iterator_result(self.token, value, done);
+        result.map_err(|error| self.vm_error(error, "NativeScope::iterator_result"))
     }
 
     /// Allocate a null-prototype object.

@@ -501,16 +501,53 @@ impl Interpreter {
                 }
             }
 
-            // §7.4.12 CreateIteratorResultObject —
-            // OrdinaryObjectCreate(%Object.prototype%). Each property write
-            // can allocate a child shape, so the result stays in its canonical
-            // arena slot and is re-read by every scoped mutation.
-            let result = interp.scoped_object(scope)?;
-            interp.scoped_set(scope, result, "value", value)?;
             let done = interp.scoped_boolean(scope, done);
-            interp.scoped_set(scope, result, "done", done)?;
+            let result = interp.scoped_iterator_result(scope, value, done)?;
             Ok(interp.escape_scoped(result))
         })
+    }
+
+    /// `(value, done)` of a generator result record. One of the realm's
+    /// iterator-result hidden class is read by slot; any other object (a
+    /// `yield*` delegate's own record) through ordinary data lookups.
+    pub(crate) fn iterator_result_parts(&self, record: crate::object::JsObject) -> (Value, bool) {
+        let heap = &self.gc_heap;
+        if let Some(layout) = self.realm_intrinsics.iterator_result
+            && crate::object::shape_id(record, heap) == layout.shape_id()
+            && let (Some(value), Some(done)) = (
+                crate::object::data_slot_value_at(record, heap, 0),
+                crate::object::data_slot_value_at(record, heap, 1),
+            )
+        {
+            return (value, done.to_boolean(heap));
+        }
+        let value = crate::object::get(record, heap, "value").unwrap_or(Value::undefined());
+        let done = crate::object::get(record, heap, "done")
+            .unwrap_or(Value::undefined())
+            .to_boolean(heap);
+        (value, done)
+    }
+
+    /// §7.4.12 CreateIteratorResultObject — OrdinaryObjectCreate
+    /// (%Object.prototype%) with `value` and `done`, built in one allocation
+    /// of the realm's cached iterator-result hidden class.
+    pub(crate) fn scoped_iterator_result<'s>(
+        &mut self,
+        scope: &'s crate::handles::HandleScope,
+        value: crate::Local<'_>,
+        done: crate::Local<'_>,
+    ) -> Result<crate::Local<'s>, VmError> {
+        let layout = match self.realm_intrinsics.iterator_result {
+            Some(layout) => layout,
+            None => {
+                let tag = self.host_atom("IteratorResult");
+                let keys = [self.host_atom("value"), self.host_atom("done")];
+                let layout = self.object_layout_for_atoms(&tag, &[&keys[0], &keys[1]])?;
+                self.realm_intrinsics.iterator_result = Some(layout);
+                layout
+            }
+        };
+        self.scoped_object_with_layout(scope, layout, &[value, done])
     }
 
     pub(crate) fn alloc_stack_rooted_object_with_extra_roots(

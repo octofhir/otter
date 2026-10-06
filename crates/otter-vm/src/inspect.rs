@@ -730,6 +730,7 @@ mod tests {
         Op::AsyncIteratorReturn,
         Op::CheckIteratorResult,
         Op::ArrayPush,
+        Op::SpreadAppend,
         Op::CallSpread,
         Op::New,
         Op::NewSpread,

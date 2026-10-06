@@ -455,6 +455,10 @@ pub(crate) enum TemplateOp {
     /// (called synchronously through the shared reentrant path), and
     /// GetIteratorDirect `next` caching all complete in place.
     GetIterator { dst: u16, src: u16 },
+    /// Append every value `iterable` iterates to the array in `array`
+    /// through the VM's IteratorToList (built-in bulk paths, user `next`
+    /// called synchronously through the shared reentrant path).
+    SpreadAppend { array: u16, iterable: u16 },
     /// Obtain an async iterator (including async-from-sync fallback) through
     /// the VM's full observable `@@asyncIterator` transition.
     GetAsyncIterator { dst: u16, src: u16 },
@@ -1313,6 +1317,13 @@ impl TemplatePlan {
                     TemplateOp::GetIterator {
                         dst: operands.dst,
                         src: operands.src,
+                    }
+                }
+                Op::SpreadAppend => {
+                    let operands = lowered.unary_operands()?;
+                    TemplateOp::SpreadAppend {
+                        array: operands.dst,
+                        iterable: operands.src,
                     }
                 }
                 Op::GetAsyncIterator => {

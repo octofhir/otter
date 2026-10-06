@@ -752,11 +752,13 @@ mod tests {
     }
 
     #[test]
-    fn array_literal_spread_emits_array_push_loop() {
+    fn array_literal_spread_appends_each_spread_once() {
         let module = compile_script_src("const inner = [1, 2]; [0, ...inner, 3];");
         let main = module.main();
-        assert!(main.code.iter().any(|i| i.op == Op::GetIterator));
-        assert!(main.code.iter().any(|i| i.op == Op::ArrayPush));
+        let ops: Vec<Op> = main.code.iter().map(|i| i.op).collect();
+        assert_eq!(ops.iter().filter(|op| **op == Op::SpreadAppend).count(), 1);
+        assert_eq!(ops.iter().filter(|op| **op == Op::ArrayPush).count(), 2);
+        assert!(!ops.contains(&Op::GetIterator));
     }
 
     #[test]

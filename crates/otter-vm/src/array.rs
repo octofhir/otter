@@ -1557,6 +1557,47 @@ pub(crate) fn push_with_roots(
     Ok(new_len)
 }
 
+/// Append `values` to the tail with one storage reservation, tracing the
+/// pending values and the caller's roots across it.
+pub(crate) fn extend_with_roots(
+    mut arr: JsArray,
+    heap: &mut otter_gc::GcHeap,
+    values: &[Value],
+    external_visit: &mut RootSlotVisitor<'_>,
+) -> Result<usize, otter_gc::OutOfMemory> {
+    let start = len(arr, heap);
+    let target_len = start.saturating_add(values.len());
+    let kind = values
+        .iter()
+        .map(|value| dense_kind_for_value(*value))
+        .max_by_key(|kind| *kind as u8)
+        .unwrap_or(DenseElementKind::PackedDouble);
+    {
+        let mut reserve_roots = |visitor: &mut dyn FnMut(*mut RawGc)| {
+            external_visit(visitor);
+            for value in values {
+                value.trace_value_slots(visitor);
+            }
+        };
+        reserve_dense_capacity(&mut arr, heap, target_len, kind, &mut reserve_roots)?;
+    }
+    heap.with_payload(arr, |body| {
+        body.refresh_element_cache();
+        while body.dense_len() < start {
+            body_elements_push(body, Value::hole());
+        }
+        for value in values {
+            body_elements_push(body, *value);
+        }
+        body.length = target_len;
+        body.mark_dirty();
+    });
+    for value in values {
+        record_array_write(heap, arr, value);
+    }
+    Ok(target_len)
+}
+
 /// Spec §10.4.2.4 step 17 truncation / step 9 growth of the dense
 /// element storage backing `Array.prototype.length`. Shrinks below
 /// the current length by dropping dense and sparse slots whose index
@@ -2585,13 +2626,69 @@ pub(crate) fn plain_dense_prefix_values(
         if !body.exotic.is_null() || body.length != len || body.dense_len() < len {
             return None;
         }
-        let values = body.dense_values();
-        let prefix = &values[..len];
-        if prefix.iter().any(|value| value.is_hole()) {
-            return None;
-        }
-        Some(prefix.to_vec())
+        (0..len)
+            .map(|index| body.dense_value(index).filter(|value| !value.is_hole()))
+            .collect()
     })
+}
+
+/// Append `src`'s elements to `dst` when `src` is a plain dense array (no
+/// sidecar, no holes, nothing past its dense prefix): one reservation and no
+/// intermediate list. `Ok(false)` leaves both untouched.
+pub(crate) fn append_plain_dense(
+    mut dst: JsArray,
+    mut src: JsArray,
+    heap: &mut otter_gc::GcHeap,
+    external_visit: &mut RootSlotVisitor<'_>,
+) -> Result<bool, otter_gc::OutOfMemory> {
+    let Some((count, kind)) = heap.read_payload(src, |body| {
+        let count = body.dense_len();
+        let plain = body.exotic.is_null()
+            && body.length == count
+            && (0..count).all(|index| body.dense_value(index).is_some_and(|v| !v.is_hole()));
+        plain.then(|| (count, body.dense_kind()))
+    }) else {
+        return Ok(false);
+    };
+    let start = len(dst, heap);
+    let target_len = start.saturating_add(count);
+    {
+        let src_slot = std::ptr::addr_of_mut!(src);
+        let mut reserve_roots = |visitor: &mut dyn FnMut(*mut RawGc)| {
+            external_visit(visitor);
+            visitor(src_slot.cast::<RawGc>());
+        };
+        reserve_dense_capacity(&mut dst, heap, target_len, kind, &mut reserve_roots)?;
+    }
+    const CHUNK: usize = 32;
+    let mut copied = 0;
+    while copied < count {
+        let n = (count - copied).min(CHUNK);
+        let mut chunk = [Value::undefined(); CHUNK];
+        heap.read_payload(src, |body| {
+            for (offset, slot) in chunk[..n].iter_mut().enumerate() {
+                *slot = body.dense_value(copied + offset).expect("plain dense slot");
+            }
+        });
+        heap.with_payload(dst, |body| {
+            body.refresh_element_cache();
+            while body.dense_len() < start {
+                body_elements_push(body, Value::hole());
+            }
+            for value in &chunk[..n] {
+                body_elements_push(body, *value);
+            }
+        });
+        for value in &chunk[..n] {
+            record_array_write(heap, dst, value);
+        }
+        copied += n;
+    }
+    heap.with_payload(dst, |body| {
+        body.length = target_len;
+        body.mark_dirty();
+    });
+    Ok(true)
 }
 
 /// Write a caller-proven plain dense range with per-element values.

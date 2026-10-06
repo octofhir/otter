@@ -466,6 +466,13 @@ pub enum Op {
     /// `Register(arr), Register(value)`. No result. Used by the
     /// spread lowering for array literals.
     ArrayPush,
+    /// Append every value `r<iterable>` iterates to the array in `r<arr>`:
+    /// one `...spread` element of an array literal or argument list
+    /// (§13.2.4.1 ArrayAccumulation). Operands: `Register(arr),
+    /// Register(iterable)`. No result. GetIterator and every step run the
+    /// observable protocol unless it is proven built-in; a spread never
+    /// closes its iterator.
+    SpreadAppend,
     /// Variadic-by-array call. Operands:
     /// `Register(dst), Register(callee), Register(this),
     /// Register(args)`. The args register holds a `Value::Array`
@@ -1536,6 +1543,7 @@ impl Op {
             Op::AsyncIteratorReturn => "ASYNC_ITERATOR_RETURN",
             Op::CheckIteratorResult => "CHECK_ITERATOR_RESULT",
             Op::ArrayPush => "ARRAY_PUSH",
+            Op::SpreadAppend => "SPREAD_APPEND",
             Op::CallSpread => "CALL_SPREAD",
             Op::New => "NEW",
             Op::SuperConstruct => "SUPER_CONSTRUCT",

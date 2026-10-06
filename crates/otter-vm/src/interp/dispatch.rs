@@ -2689,6 +2689,18 @@ impl Interpreter {
                     self.run_array_push_regs(&mut *stack, top_idx, arr_reg, value_reg)?;
                     continue;
                 }
+                Op::SpreadAppend => {
+                    let (array_reg, iterable_reg) = (instr.reg(0), instr.reg(1));
+                    match self.spread_append(context, stack, top_idx, array_reg, iterable_reg) {
+                        Ok(()) => {}
+                        Err(CommittedValueError::JavaScript(error)) => return Err(error),
+                        Err(CommittedValueError::Fatal(error)) => {
+                            return Ok(DispatchOutcome::Fatal(error));
+                        }
+                    }
+                    stack[top_idx].advance_pc()?;
+                    continue;
+                }
                 Op::NewWeakRef => {
                     let dst = instr.reg(0);
                     let target_reg = instr.reg(1);

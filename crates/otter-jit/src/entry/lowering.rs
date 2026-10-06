@@ -873,6 +873,7 @@ impl BaselinePlan {
                 | Op::PrivateBrandCheck
                 | Op::NewError
                 | Op::ArrayPush
+                | Op::SpreadAppend
                 | Op::ForInKeys
                 | Op::CopyDataProperties
                 | Op::StarReexport

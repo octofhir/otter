@@ -38,6 +38,7 @@ use crate::{
         NativeFrameKind, NativeResultDomain, NativeResultPair, NativeResultStatus,
     },
     native_function::{NativeCallTarget, VmIntrinsicFunction},
+    runtime_cx::NativeContext,
 };
 use smallvec::SmallVec;
 
@@ -116,18 +117,43 @@ impl HostTurn<'_> {
             .flags
             .contains(NativeFrameFlags::CONSTRUCT)
     }
+}
 
-    /// §9.4.1 GetActiveScriptOrModule for a native body: the source owner of
-    /// the innermost JavaScript activation below this host frame. Built-in
-    /// frames carry no script, so intermediate Host frames are skipped; a
-    /// generated caller names the inlined function at its exact return anchor.
-    /// `None` keeps the trampoline's admitted context, which already owns that
-    /// function or is the only context of a host-entered activation.
-    fn caller_source_owner(&self) -> Option<ExecutionContext> {
+/// §9.4.1 GetActiveScriptOrModule for a native body, resolved when the body
+/// first asks: the source owner of the innermost JavaScript activation below
+/// its host frame. Built-in frames carry no script, so intermediate Host
+/// frames are skipped; a generated caller names the inlined function at its
+/// exact return anchor. A caller the admitted context already owns, or the
+/// only context of a host-entered activation, keeps the admitted context.
+pub(crate) struct CallerContext<'a> {
+    admitted: Option<&'a ExecutionContext>,
+    frame: *mut Frame,
+    resolved: std::cell::OnceCell<Option<ExecutionContext>>,
+}
+
+impl<'a> CallerContext<'a> {
+    fn new(turn: &HostTurn<'a>) -> Self {
+        Self {
+            admitted: turn.context,
+            frame: turn.frame,
+            resolved: std::cell::OnceCell::new(),
+        }
+    }
+
+    /// The source owner, or the admitted context.
+    pub(crate) fn get(&self, vm: &Interpreter) -> Option<&ExecutionContext> {
+        self.resolved
+            .get_or_init(|| self.resolve(vm))
+            .as_ref()
+            .or(self.admitted)
+    }
+
+    fn resolve(&self, vm: &Interpreter) -> Option<ExecutionContext> {
         let mut child = self.frame;
         loop {
-            // SAFETY: every published record stays live and linked to its
-            // caller while this host frame is published.
+            // SAFETY: the host frame stays published for the whole native
+            // body, and every published record stays live and linked to its
+            // caller meanwhile.
             let callee = unsafe { &*child };
             let caller = callee.caller_frame();
             // SAFETY: as above; a null caller ends the published chain.
@@ -139,19 +165,18 @@ impl HostTurn<'_> {
             let function_id = if frame.code_object_id == 0 || callee.caller_return_pc == 0 {
                 frame.header.function_id
             } else {
-                self.vm
-                    .jit_code_registry
+                vm.jit_code_registry
                     .return_pc_record(u64::from(frame.code_object_id), callee.caller_return_pc)
                     .and_then(|record| record.inline_frames.last())
                     .map_or(frame.header.function_id, |inline| inline.function_id)
             };
             if self
-                .context
+                .admitted
                 .is_some_and(|context| context.covers_function(function_id))
             {
                 return None;
             }
-            return self.vm.function_context(self.context, function_id).ok();
+            return vm.function_context(self.admitted, function_id).ok();
         }
     }
 }
@@ -389,16 +414,12 @@ fn native_call(
         let receiver = turn.frame().this_value;
         let args = turn.actuals();
         let realm_global = turn.vm.native_target_realm_global(&native);
-        let source = turn.caller_source_owner();
-        let (vm, stack, context) = (
-            &mut *turn.vm,
-            &mut *turn.stack,
-            source
-                .as_ref()
-                .or(turn.context)
-                .ok_or(VmError::InvalidOperand)
-                .map_err(|error| CommittedValueError::Fatal(error.into()))?,
-        );
+        let caller = CallerContext::new(turn);
+        let context = caller
+            .get(turn.vm)
+            .ok_or(VmError::InvalidOperand)
+            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+        let (vm, stack) = (&mut *turn.vm, &mut *turn.stack);
         let invoke = |vm: &mut Interpreter| {
             let result = vm.run_vm_intrinsic_sync_rooted(stack, context, intrinsic, receiver, args);
             Ok(HostStep::Complete(match result {
@@ -420,22 +441,24 @@ fn native_call(
     let callee = turn.frame().self_value;
     let receiver = turn.frame().this_value;
     let args = turn.actuals();
-    let source = turn.caller_source_owner();
-    let (vm, stack, context) = (
-        &mut *turn.vm,
-        &mut *turn.stack,
-        source.as_ref().or(turn.context),
-    );
+    let caller = CallerContext::new(turn);
+    let (vm, stack) = (&mut *turn.vm, &mut *turn.stack);
     let invoke = |vm: &mut Interpreter| {
         let result = crate::call_ops::invoke_native_call_with_roots(
             vm,
             stack,
-            context,
+            NativeContext::Caller(&caller),
             call,
             receiver,
             &[&callee],
             args.as_slice(),
         );
+        // Only a failure projects through the caller's source.
+        let context = if result.is_err() {
+            caller.get(vm)
+        } else {
+            None
+        };
         Ok(finish_native_result(vm, stack, context, ctx, result))
     };
     if let Some(global) = realm_global {
@@ -557,15 +580,9 @@ fn invoke_native_construct(
 ) -> Result<HostStep, VmError> {
     turn.vm.record_runtime_native_call()?;
     let realm_global = turn.vm.native_target_realm_global(&native);
-    let source = turn.caller_source_owner();
-    let (vm, stack, context) = (
-        &mut *turn.vm,
-        &mut *turn.stack,
-        source
-            .as_ref()
-            .or(turn.context)
-            .ok_or(VmError::InvalidOperand)?,
-    );
+    let caller = CallerContext::new(turn);
+    let context = caller.get(turn.vm).ok_or(VmError::InvalidOperand)?;
+    let (vm, stack) = (&mut *turn.vm, &mut *turn.stack);
     let mut invoke = |vm: &mut Interpreter| {
         let result = vm.invoke_native_construct_rooted(
             stack,
@@ -612,22 +629,24 @@ fn other_entry(turn: &mut HostTurn<'_>, ctx: &mut JitCtx) -> Result<HostStep, Co
     let realm_global = turn.vm.native_target_realm_global(&native);
     let receiver = turn.frame().this_value;
     let args = turn.actuals();
-    let source = turn.caller_source_owner();
-    let (vm, stack, context) = (
-        &mut *turn.vm,
-        &mut *turn.stack,
-        source.as_ref().or(turn.context),
-    );
+    let caller = CallerContext::new(turn);
+    let (vm, stack) = (&mut *turn.vm, &mut *turn.stack);
     let invoke = |vm: &mut Interpreter| {
         let result = crate::call_ops::invoke_native_call_with_roots(
             vm,
             stack,
-            context,
+            NativeContext::Caller(&caller),
             call,
             receiver,
             &[&callee],
             args.as_slice(),
         );
+        // Only a failure projects through the caller's source.
+        let context = if result.is_err() {
+            caller.get(vm)
+        } else {
+            None
+        };
         Ok(finish_native_result(vm, stack, context, ctx, result))
     };
     if let Some(global) = realm_global {

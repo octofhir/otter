@@ -229,35 +229,48 @@ impl CompileCache {
         key: &CompileCacheKey,
         source: &str,
     ) -> Option<VerifiedBytecodeModule> {
-        #[cfg(unix)]
-        {
-            let bytes = unix::load(&self.root, key)?;
-            otter_bytecode::binary::decode_module_with_source(&bytes, source).ok()
-        }
-        #[cfg(not(unix))]
-        {
-            let _ = (&self.root, key, source);
-            None
-        }
+        let bytes = self.load_bytes(key)?;
+        otter_bytecode::binary::decode_module_with_source(&bytes, source).ok()
     }
 
     /// Store a compiled module under `key` when bounded encoding and a full
     /// locked quota pass both succeed.
     pub(crate) fn store(&self, key: &CompileCacheKey, module: &BytecodeModule) {
+        // Every key covers the exact source, so a hit supplies it again.
+        if let Ok(bytes) = otter_bytecode::binary::encode_module_bounded_detached(
+            module,
+            MAX_COMPILE_CACHE_ENTRY_BYTES,
+        ) {
+            self.store_bytes(key, &bytes);
+        }
+    }
+
+    /// The raw entry stored under `key`. Its reader decodes and checks it;
+    /// a key's specifier names which encoding the entry holds.
+    #[must_use]
+    pub(crate) fn load_bytes(&self, key: &CompileCacheKey) -> Option<Vec<u8>> {
         #[cfg(unix)]
         {
-            // Every key covers the exact source, so a hit supplies it again.
-            let Ok(bytes) = otter_bytecode::binary::encode_module_bounded_detached(
-                module,
-                MAX_COMPILE_CACHE_ENTRY_BYTES,
-            ) else {
-                return;
-            };
-            unix::store(&self.root, self.policy, &self.estimate, key, &bytes);
+            unix::load(&self.root, key)
         }
         #[cfg(not(unix))]
         {
-            let _ = (&self.root, key, module);
+            let _ = (&self.root, key);
+            None
+        }
+    }
+
+    /// Store a raw entry under `key` within the same size bound and quota.
+    pub(crate) fn store_bytes(&self, key: &CompileCacheKey, bytes: &[u8]) {
+        #[cfg(unix)]
+        {
+            if bytes.len() <= MAX_COMPILE_CACHE_ENTRY_BYTES {
+                unix::store(&self.root, self.policy, &self.estimate, key, bytes);
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (&self.root, key, bytes);
         }
     }
 }

@@ -275,43 +275,20 @@ pub(crate) fn compile_object_literal(
                         ],
                         key_span,
                     );
-                    let desc_reg = cx.alloc_scratch();
-                    cx.emit(Op::NewObject, [Operand::Register(desc_reg)], key_span);
-                    let accessor_const = cx.intern_string_constant(accessor_key);
-                    let store_scratch = cx.alloc_scratch();
-                    cx.emit(
-                        Op::StoreProperty,
-                        vec![
-                            Operand::Register(desc_reg),
-                            Operand::ConstIndex(accessor_const),
-                            Operand::Register(function_reg),
-                            Operand::Register(store_scratch),
-                        ],
-                        key_span,
-                    );
-                    let true_reg = cx.alloc_scratch();
-                    cx.emit(Op::LoadTrue, [Operand::Register(true_reg)], key_span);
-                    for attr in ["enumerable", "configurable"] {
-                        let attr_const = cx.intern_string_constant(attr);
-                        let attr_scratch = cx.alloc_scratch();
-                        cx.emit(
-                            Op::StoreProperty,
-                            vec![
-                                Operand::Register(desc_reg),
-                                Operand::ConstIndex(attr_const),
-                                Operand::Register(true_reg),
-                                Operand::Register(attr_scratch),
-                            ],
-                            key_span,
-                        );
-                    }
-                    cx.emit(
-                        Op::DefineOwnProperty,
-                        [
-                            Operand::Register(dst),
-                            Operand::Register(key_reg),
-                            Operand::Register(desc_reg),
-                        ],
+                    emit_define_member(
+                        cx,
+                        dst,
+                        key_reg,
+                        function_reg,
+                        otter_bytecode::MemberDefinition {
+                            kind: if accessor_key == "get" {
+                                otter_bytecode::MemberKind::Getter
+                            } else {
+                                otter_bytecode::MemberKind::Setter
+                            },
+                            enumerable: true,
+                            read_only: false,
+                        },
                         key_span,
                     );
                     continue;

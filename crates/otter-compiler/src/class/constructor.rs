@@ -25,48 +25,7 @@ fn emit_public_field_define(
     value_reg: u16,
     span: (u32, u32),
 ) {
-    let desc_reg = cx.alloc_scratch();
-    cx.emit(Op::NewObject, [Operand::Register(desc_reg)], span);
-
-    let value_const = cx.intern_string_constant("value");
-    let value_scratch = cx.alloc_scratch();
-    cx.emit(
-        Op::StoreProperty,
-        vec![
-            Operand::Register(desc_reg),
-            Operand::ConstIndex(value_const),
-            Operand::Register(value_reg),
-            Operand::Register(value_scratch),
-        ],
-        span,
-    );
-
-    let true_reg = cx.alloc_scratch();
-    cx.emit(Op::LoadTrue, [Operand::Register(true_reg)], span);
-    for attr in ["writable", "enumerable", "configurable"] {
-        let attr_const = cx.intern_string_constant(attr);
-        let attr_scratch = cx.alloc_scratch();
-        cx.emit(
-            Op::StoreProperty,
-            vec![
-                Operand::Register(desc_reg),
-                Operand::ConstIndex(attr_const),
-                Operand::Register(true_reg),
-                Operand::Register(attr_scratch),
-            ],
-            span,
-        );
-    }
-
-    cx.emit(
-        Op::DefineOwnProperty,
-        [
-            Operand::Register(receiver_reg),
-            Operand::Register(key_reg),
-            Operand::Register(desc_reg),
-        ],
-        span,
-    );
+    super::emit_define_member(cx, receiver_reg, key_reg, value_reg, super::FIELD, span);
 }
 
 /// Synthesize the default constructor: an empty base-class body, or

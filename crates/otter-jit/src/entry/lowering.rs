@@ -180,6 +180,15 @@ pub(crate) struct EvalOperands {
     pub(crate) flags: i32,
 }
 
+/// `DefineMember target, key, value, definition`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DefineMemberOperands {
+    pub(crate) target: u16,
+    pub(crate) key: u16,
+    pub(crate) value: u16,
+    pub(crate) definition: i32,
+}
+
 /// Typed unchecked context-slot access. `value` is the loaded destination or
 /// the stored source according to the opcode; `context` holds the context the
 /// packed coordinate's hop count starts from.
@@ -399,6 +408,7 @@ enum LoweredOperands {
     ElementStore(ElementStoreOperands),
     Increment(IncrementOperands),
     Eval(EvalOperands),
+    DefineMember(DefineMemberOperands),
     ContextSlot(ContextSlotOperands),
     CreateContext(CreateContextOperands),
     ReturnDerived(ReturnDerivedOperands),
@@ -522,6 +532,13 @@ impl LoweredInstr {
         match self.operands {
             LoweredOperands::Eval(operands) => Ok(operands),
             _ => Err(Unsupported::OperandShape("lowered Eval operands")),
+        }
+    }
+
+    pub(crate) fn define_member_operands(self) -> Result<DefineMemberOperands, Unsupported> {
+        match self.operands {
+            LoweredOperands::DefineMember(operands) => Ok(operands),
+            _ => Err(Unsupported::OperandShape("lowered DefineMember operands")),
         }
     }
 
@@ -903,6 +920,12 @@ impl BaselinePlan {
                     dst: reg(operands, 0)?,
                     src: reg(operands, 1)?,
                     delta: imm32(operands, 2)?,
+                }),
+                Op::DefineMember => LoweredOperands::DefineMember(DefineMemberOperands {
+                    target: reg(operands, 0)?,
+                    key: reg(operands, 1)?,
+                    value: reg(operands, 2)?,
+                    definition: imm32(operands, 3)?,
                 }),
                 Op::Eval => LoweredOperands::Eval(EvalOperands {
                     dst: reg(operands, 0)?,

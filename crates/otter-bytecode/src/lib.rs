@@ -62,7 +62,8 @@ pub mod verifier;
 pub mod wordcode;
 
 pub use opcode_schema::{
-    BindingStoreFallback, ContextCoord, LookupGlobalMode, LookupRefTarget, StoreRefMode,
+    BindingStoreFallback, ContextCoord, LookupGlobalMode, LookupRefTarget, MemberDefinition,
+    MemberKind, StoreRefMode,
 };
 pub use span_table::{SpanIter, SpanTable};
 pub use verifier::{
@@ -1127,6 +1128,19 @@ pub enum Op {
     /// - <https://tc39.es/ecma262/#sec-ordinarydefineownproperty>
     /// - <https://tc39.es/ecma262/#sec-topropertydescriptor>
     DefineOwnProperty,
+    /// Define a class or object-literal member `r<value>` on `r<target>`
+    /// under the property key `r<key>`: a data property `{ value, writable,
+    /// enumerable, configurable: true }` (§10.2.8 DefineMethodProperty; §7.3.7
+    /// for a field) or one accessor half `{ get | set, enumerable,
+    /// configurable: true }` (§15.4.5), applied by DefinePropertyOrThrow. The descriptor is never
+    /// an object, so nothing is read through `[[Get]]`. Operands:
+    /// `Register(target), Register(key), Register(value),
+    /// Imm32(MemberDefinition)`.
+    ///
+    /// # See also
+    /// - <https://tc39.es/ecma262/#sec-definemethodproperty>
+    /// - <https://tc39.es/ecma262/#sec-method-definitions-runtime-semantics-methoddefinitionevaluation>
+    DefineMember,
     /// `r<dst> = ArrayBuffer(args...)` / `ArrayBuffer.<name>(args...)`.
     /// Operands: `Register(dst), ConstIndex(name), ConstIndex(argc),
     /// Register(arg0), …`.
@@ -1648,6 +1662,7 @@ impl Op {
             Op::ForInKeys => "FOR_IN_KEYS",
             Op::CopyDataProperties => "COPY_DATA_PROPERTIES",
             Op::DefineOwnProperty => "DEFINE_OWN_PROPERTY",
+            Op::DefineMember => "DEFINE_MEMBER",
             Op::ArrayConstruct => "ARRAY_CONSTRUCT",
             Op::ArrayFrom => "ARRAY_FROM",
             Op::ArrayOf => "ARRAY_OF",

@@ -3,8 +3,8 @@
 //! # Contents
 //! - Shared register helpers for template objects, private names, and the
 //!   direct-eval identity probe.
-//! - Packed compiled dispatch for class creation, dynamic functions, direct
-//!   eval, and full `ToNumber` coercion.
+//! - Packed compiled dispatch for class creation, method definition, dynamic
+//!   functions, direct eval, and full `ToNumber` coercion.
 //!
 //! # Invariants
 //! - Interpreter and JIT dispatch call the same VM helpers; no JavaScript
@@ -160,6 +160,19 @@ impl Interpreter {
             value if value == Op::IsEvalIntrinsic as u8 => {
                 self.run_is_eval_intrinsic_reg(stack, frame_index, lane(arg0, 0), lane(arg0, 1))
                     .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+            }
+            value if value == Op::DefineMember as u8 => {
+                let definition = otter_bytecode::MemberDefinition::from_imm32(arg1 as u32 as i32)
+                    .ok_or(CommittedValueError::Fatal(VmError::InvalidOperand))?;
+                self.run_define_member_regs(
+                    context,
+                    stack,
+                    frame_index,
+                    lane(arg0, 0),
+                    lane(arg0, 1),
+                    lane(arg0, 2),
+                    definition,
+                )?;
             }
             value if value == Op::ToNumber as u8 => {
                 self.run_to_number_regs(context, stack, frame_index, lane(arg0, 0), lane(arg0, 1))?;

@@ -34,6 +34,7 @@ pub(crate) use static_block::*;
 pub(crate) use super_ops::*;
 
 use crate::*;
+use otter_bytecode::{MemberDefinition, MemberKind};
 
 /// Lower a `class … { … }` declaration or expression into the
 /// foundation `ClassConstructor` value. The lowering builds:
@@ -584,31 +585,6 @@ fn compile_class_strict(
     {
         let undef_reg = cx.alloc_scratch();
         cx.emit(Op::LoadUndefined, [Operand::Register(undef_reg)], span);
-        let desc_reg = cx.alloc_scratch();
-        cx.emit(Op::NewObject, [Operand::Register(desc_reg)], span);
-        let true_reg = cx.alloc_scratch();
-        cx.emit(Op::LoadTrue, [Operand::Register(true_reg)], span);
-        let false_reg = cx.alloc_scratch();
-        cx.emit(Op::LoadFalse, [Operand::Register(false_reg)], span);
-        for (attr, value_reg) in [
-            ("value", undef_reg),
-            ("writable", true_reg),
-            ("enumerable", false_reg),
-            ("configurable", true_reg),
-        ] {
-            let attr_const = cx.intern_string_constant(attr);
-            let attr_scratch = cx.alloc_scratch();
-            cx.emit(
-                Op::StoreProperty,
-                vec![
-                    Operand::Register(desc_reg),
-                    Operand::ConstIndex(attr_const),
-                    Operand::Register(value_reg),
-                    Operand::Register(attr_scratch),
-                ],
-                span,
-            );
-        }
         let key_reg = cx.alloc_scratch();
         let ctor_key_const = cx.intern_string_constant("constructor");
         cx.emit(
@@ -619,13 +595,16 @@ fn compile_class_strict(
             ],
             span,
         );
-        cx.emit(
-            Op::DefineOwnProperty,
-            [
-                Operand::Register(prototype_reg),
-                Operand::Register(key_reg),
-                Operand::Register(desc_reg),
-            ],
+        emit_define_member(
+            cx,
+            prototype_reg,
+            key_reg,
+            undef_reg,
+            MemberDefinition {
+                kind: MemberKind::Value,
+                enumerable: false,
+                read_only: false,
+            },
             span,
         );
     }
@@ -784,59 +763,22 @@ fn compile_class_strict(
                     method_span,
                 );
             }
-            let desc_reg = cx.alloc_scratch();
-            cx.emit(Op::NewObject, [Operand::Register(desc_reg)], method_span);
-            let accessor_const = cx.intern_string_constant(accessor_key);
-            let store_scratch = cx.alloc_scratch();
-            cx.emit(
-                Op::StoreProperty,
-                vec![
-                    Operand::Register(desc_reg),
-                    Operand::ConstIndex(accessor_const),
-                    Operand::Register(m_reg),
-                    Operand::Register(store_scratch),
-                ],
-                method_span,
-            );
-            // Class accessor descriptors are `enumerable: false,
-            // configurable: true`. Object literals install
-            // `enumerable: true` on the same template — the only
-            // difference between the two surfaces.
-            let true_reg = cx.alloc_scratch();
-            cx.emit(Op::LoadTrue, [Operand::Register(true_reg)], method_span);
-            let false_reg = cx.alloc_scratch();
-            cx.emit(Op::LoadFalse, [Operand::Register(false_reg)], method_span);
-            let enum_const = cx.intern_string_constant("enumerable");
-            let enum_scratch = cx.alloc_scratch();
-            cx.emit(
-                Op::StoreProperty,
-                vec![
-                    Operand::Register(desc_reg),
-                    Operand::ConstIndex(enum_const),
-                    Operand::Register(false_reg),
-                    Operand::Register(enum_scratch),
-                ],
-                method_span,
-            );
-            let cfg_const = cx.intern_string_constant("configurable");
-            let cfg_scratch = cx.alloc_scratch();
-            cx.emit(
-                Op::StoreProperty,
-                vec![
-                    Operand::Register(desc_reg),
-                    Operand::ConstIndex(cfg_const),
-                    Operand::Register(true_reg),
-                    Operand::Register(cfg_scratch),
-                ],
-                method_span,
-            );
-            cx.emit(
-                Op::DefineOwnProperty,
-                [
-                    Operand::Register(target_reg),
-                    Operand::Register(key_reg),
-                    Operand::Register(desc_reg),
-                ],
+            // Class accessors are `enumerable: false, configurable: true`;
+            // object literals install the same half enumerable.
+            emit_define_member(
+                cx,
+                target_reg,
+                key_reg,
+                m_reg,
+                MemberDefinition {
+                    kind: if accessor_key == "get" {
+                        MemberKind::Getter
+                    } else {
+                        MemberKind::Setter
+                    },
+                    enumerable: false,
+                    read_only: false,
+                },
                 method_span,
             );
             continue;
@@ -899,54 +841,20 @@ fn compile_class_strict(
                 method_span,
             );
         }
-        let desc_reg = cx.alloc_scratch();
-        cx.emit(Op::NewObject, [Operand::Register(desc_reg)], method_span);
-        let value_const = cx.intern_string_constant("value");
-        let value_scratch = cx.alloc_scratch();
-        cx.emit(
-            Op::StoreProperty,
-            vec![
-                Operand::Register(desc_reg),
-                Operand::ConstIndex(value_const),
-                Operand::Register(m_reg),
-                Operand::Register(value_scratch),
-            ],
-            method_span,
-        );
-        let true_reg = cx.alloc_scratch();
-        cx.emit(Op::LoadTrue, [Operand::Register(true_reg)], method_span);
-        let false_reg = cx.alloc_scratch();
-        cx.emit(Op::LoadFalse, [Operand::Register(false_reg)], method_span);
         // §7.3.32 — a private method is not writable: `PrivateSet`
         // distinguishes it from a private field by this attribute
         // (static methods live as own data on the statics object,
         // where holder == receiver can't tell them apart).
-        let writable_reg = if is_private { false_reg } else { true_reg };
-        for (attr, value_reg) in [
-            ("writable", writable_reg),
-            ("enumerable", false_reg),
-            ("configurable", true_reg),
-        ] {
-            let attr_const = cx.intern_string_constant(attr);
-            let attr_scratch = cx.alloc_scratch();
-            cx.emit(
-                Op::StoreProperty,
-                vec![
-                    Operand::Register(desc_reg),
-                    Operand::ConstIndex(attr_const),
-                    Operand::Register(value_reg),
-                    Operand::Register(attr_scratch),
-                ],
-                method_span,
-            );
-        }
-        cx.emit(
-            Op::DefineOwnProperty,
-            [
-                Operand::Register(target_reg),
-                Operand::Register(key_reg),
-                Operand::Register(desc_reg),
-            ],
+        emit_define_member(
+            cx,
+            target_reg,
+            key_reg,
+            m_reg,
+            MemberDefinition {
+                kind: MemberKind::Value,
+                enumerable: false,
+                read_only: is_private,
+            },
             method_span,
         );
     }
@@ -1085,45 +993,7 @@ fn compile_class_strict(
                 // §7.3.7 CreateDataPropertyOrThrow on the class —
                 // writable / enumerable / configurable all true,
                 // never invoking inherited setters.
-                let desc_reg = cx.alloc_scratch();
-                cx.emit(Op::NewObject, [Operand::Register(desc_reg)], pspan);
-                let value_const = cx.intern_string_constant("value");
-                let store_scratch = cx.alloc_scratch();
-                cx.emit(
-                    Op::StoreProperty,
-                    vec![
-                        Operand::Register(desc_reg),
-                        Operand::ConstIndex(value_const),
-                        Operand::Register(value_reg),
-                        Operand::Register(store_scratch),
-                    ],
-                    pspan,
-                );
-                let true_reg = cx.alloc_scratch();
-                cx.emit(Op::LoadTrue, [Operand::Register(true_reg)], pspan);
-                for attr in ["writable", "enumerable", "configurable"] {
-                    let attr_const = cx.intern_string_constant(attr);
-                    let attr_scratch = cx.alloc_scratch();
-                    cx.emit(
-                        Op::StoreProperty,
-                        vec![
-                            Operand::Register(desc_reg),
-                            Operand::ConstIndex(attr_const),
-                            Operand::Register(true_reg),
-                            Operand::Register(attr_scratch),
-                        ],
-                        pspan,
-                    );
-                }
-                cx.emit(
-                    Op::DefineOwnProperty,
-                    [
-                        Operand::Register(statics_reg),
-                        Operand::Register(key_reg),
-                        Operand::Register(desc_reg),
-                    ],
-                    pspan,
-                );
+                emit_define_member(cx, statics_reg, key_reg, value_reg, FIELD, pspan);
             }
             oxc_ast::ast::ClassElement::StaticBlock(s) => {
                 // §15.7.4 StaticBlock — a synthesised function with
@@ -1338,4 +1208,35 @@ fn emit_private_symbol_key(
         span,
     );
     Ok(key_reg)
+}
+
+/// A public field: `{ value, writable, enumerable, configurable: true }`
+/// (§7.3.7 CreateDataPropertyOrThrow).
+pub(crate) const FIELD: MemberDefinition = MemberDefinition {
+    kind: MemberKind::Value,
+    enumerable: true,
+    read_only: false,
+};
+
+/// Define `value` on `target` under the property key in `key` as the
+/// data property, getter or setter `definition` names (§10.2.8
+/// DefineMethodProperty, §15.4.5).
+pub(crate) fn emit_define_member(
+    cx: &mut Compiler,
+    target: u16,
+    key: u16,
+    value: u16,
+    definition: MemberDefinition,
+    span: (u32, u32),
+) {
+    cx.emit(
+        Op::DefineMember,
+        [
+            Operand::Register(target),
+            Operand::Register(key),
+            Operand::Register(value),
+            Operand::Imm32(definition.to_imm32()),
+        ],
+        span,
+    );
 }

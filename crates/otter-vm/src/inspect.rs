@@ -811,6 +811,7 @@ mod tests {
         Op::ForInKeys,
         Op::CopyDataProperties,
         Op::DefineOwnProperty,
+        Op::DefineMember,
         Op::DefineGlobalVar,
         Op::DeclareGlobalVar,
         Op::StarReexport,

@@ -32,7 +32,10 @@
 //! # Invariants
 //! - Module URLs are canonical absolute URLs supplied by the loader or
 //!   embedder (`file:`, `http:`, `https:`, or a registered host scheme).
-//! - Each module is parsed and compiled exactly once per run.
+//! - Each module is parsed and compiled at most once per run. An unchanged
+//!   source whose requests still resolve to the targets it was compiled
+//!   against is taken from the compile cache with no parse at all; a CommonJS
+//!   file's export list is cached by its source the same way.
 //! - Literal dynamic-import target failures are deferred into a synthetic
 //!   module init so the eventual `import()` rejects instead of failing the
 //!   entry graph.
@@ -151,6 +154,79 @@ struct ModuleNode {
     deps: Vec<ModuleEdge>,
 }
 
+/// One module's requests resolved against the current loader.
+struct ResolvedRequests {
+    /// The import map the module compiles against.
+    imports: HashMap<ImportRequest, String>,
+    deps: Vec<ModuleEdge>,
+    queued: Vec<(String, SourceKind, otter_resource::SharedSource, bool)>,
+    eager_static_specs: HashSet<String>,
+    dynamic_specs: HashSet<String>,
+}
+
+/// What a compiled-module cache entry records beside its bytecode: the
+/// requests the module makes and the compiler metadata linking reads. The
+/// function spans are left out; the fragment carries them.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct CachedModule {
+    requests: Vec<ModuleRequest>,
+    metadata: CompiledModuleMetadata,
+}
+
+/// Decode an entry: a little-endian `u32` length, that many bytes of
+/// [`CachedModule`] JSON, then the module encoded without its source.
+fn load_cached_module(
+    cache: &crate::compile_cache::CompileCache,
+    key: &crate::compile_cache::CompileCacheKey,
+    source: &str,
+) -> Option<(CachedModule, BytecodeModule)> {
+    let bytes = cache.load_bytes(key)?;
+    let (len, rest) = bytes.split_first_chunk::<4>()?;
+    let (aux, module) = rest.split_at_checked(u32::from_le_bytes(*len) as usize)?;
+    let cached = serde_json::from_slice(aux).ok()?;
+    let module = otter_bytecode::binary::decode_module_with_source(module, source).ok()?;
+    Some((cached, module.into_module()))
+}
+
+fn store_cached_module(
+    cache: &crate::compile_cache::CompileCache,
+    key: &crate::compile_cache::CompileCacheKey,
+    requests: Vec<ModuleRequest>,
+    compiled: &otter_compiler::CompiledModule,
+) {
+    let mut metadata = compiled.metadata.clone();
+    metadata.function_spans = Vec::new();
+    let Ok(aux) = serde_json::to_vec(&CachedModule { requests, metadata }) else {
+        return;
+    };
+    let Ok(len) = u32::try_from(aux.len()) else {
+        return;
+    };
+    let Ok(module) = otter_bytecode::binary::encode_module_bounded_detached(
+        &compiled.bytecode,
+        crate::compile_cache::MAX_COMPILE_CACHE_ENTRY_BYTES,
+    ) else {
+        return;
+    };
+    let mut entry = Vec::with_capacity(4 + aux.len() + module.len());
+    entry.extend_from_slice(&len.to_le_bytes());
+    entry.extend_from_slice(&aux);
+    entry.extend_from_slice(&module);
+    cache.store_bytes(key, &entry);
+}
+
+/// Whether every import edge a fragment was compiled with still resolves to
+/// the same target.
+fn resolutions_match(edges: &[ModuleResolution], imports: &HashMap<ImportRequest, String>) -> bool {
+    edges.len() == imports.len()
+        && edges.iter().all(|edge| {
+            imports.get(&ImportRequest::new(
+                edge.specifier.clone(),
+                edge.attr_type.clone(),
+            )) == Some(&edge.target)
+        })
+}
+
 #[derive(Debug)]
 struct ModuleEdge {
     target: String,
@@ -214,6 +290,8 @@ struct ModuleGraphBuilder<'a> {
     /// Whether the entry is the program the caller asked to run, rather than a
     /// module some other code imported.
     entry_is_program: bool,
+    /// Compiled modules and CommonJS export lists from earlier runs.
+    cache: Option<crate::compile_cache::CompileCache>,
 }
 
 impl<'a> ModuleGraphBuilder<'a> {
@@ -233,6 +311,7 @@ impl<'a> ModuleGraphBuilder<'a> {
             timings: None,
             interrupt: None,
             entry_is_program: true,
+            cache: crate::compile_cache::CompileCache::user_default(),
         }
     }
 
@@ -416,24 +495,15 @@ impl<'a> ModuleGraphBuilder<'a> {
         let text = if url.ends_with(".mjs") || is_entry || in_module_package || is_data {
             text
         } else {
-            let shim = with_program(&text, kind, |program| {
-                Ok::<Option<String>, GraphError>(if crate::program_looks_like_module(program) {
-                    None
-                } else {
-                    Some(commonjs_module_shim(&url, &commonjs_export_names(program)))
-                })
-            })
-            .map_err(|error| GraphError::Parse {
-                url: url.clone(),
-                error,
-            })??;
-            match shim {
+            match self.commonjs_exports(&url, &text, kind)? {
                 // The CommonJS wrapper is a synthesized retained source:
                 // admit it, releasing the original file's charge with `text`.
-                Some(shim) => {
-                    crate::module_loader::admit_source(self.loader.resource_account(), &url, shim)
-                        .map_err(GraphError::Loader)?
-                }
+                Some(names) => crate::module_loader::admit_source(
+                    self.loader.resource_account(),
+                    &url,
+                    commonjs_module_shim(&url, &names),
+                )
+                .map_err(GraphError::Loader)?,
                 None => text,
             }
         };
@@ -444,113 +514,44 @@ impl<'a> ModuleGraphBuilder<'a> {
         // `with_program` consumes `text`.
         self.module_sources.insert(url.clone(), text.clone());
 
+        let key = self
+            .cache
+            .as_ref()
+            .map(|_| crate::compile_cache::cache_key(&text, kind, &format!("<module>{url}")));
+        if let (Some(cache), Some(key)) = (&self.cache, &key)
+            && let Some((cached, fragment)) = load_cached_module(cache, key, &text)
+        {
+            let resolved = self.resolve_requests(&url, &cached.requests, optional_dynamic)?;
+            // The fragment names its imports' targets as constants, so it
+            // stands only for the resolution it was compiled against.
+            if resolutions_match(&fragment.module_resolutions, &resolved.imports)
+                && let Ok(spans) = CompiledModuleMetadata::span_only_from_bytecode(&fragment)
+            {
+                let mut metadata = cached.metadata;
+                metadata.function_spans = spans.function_spans;
+                self.queue.extend(resolved.queued);
+                self.nodes.insert(
+                    nodes_key_for(&fragment),
+                    ModuleNode {
+                        fragment,
+                        metadata,
+                        deps: resolved.deps,
+                    },
+                );
+                return Ok(());
+            }
+        }
+
         let timing_enabled = self.timings.is_some();
         let compile_program = |program: &Program<'_>| {
             let requests = collect_module_requests(program);
-            let mut resolved_imports: HashMap<ImportRequest, String> = HashMap::new();
-            let mut deps: Vec<ModuleEdge> = Vec::with_capacity(requests.len());
-            let mut queued: Vec<(String, SourceKind, otter_resource::SharedSource, bool)> =
-                Vec::new();
-            let mut eager_static_specs: HashSet<String> = HashSet::new();
-            let mut dynamic_specs: HashSet<String> = HashSet::new();
-            for request in &requests {
-                self.check_interrupted()?;
-                // An import attribute names the format outright, so it
-                // decides how the file is read whatever it is called. The
-                // attribute is part of the module-map key, so each type gets
-                // its own marker URL and its own synthesised module node.
-                // Resolution accepts extension-less fixture paths the normal
-                // probing resolver would reject.
-                if let Some(kind) = request.attr_type.as_deref() {
-                    let format =
-                        crate::data_modules::DataFormat::from_attribute(kind).ok_or_else(|| {
-                            GraphError::Loader(LoaderError::Load {
-                                url: url.clone(),
-                                message: format!(
-                                    "unsupported import attribute type {kind:?} for '{}'",
-                                    request.specifier
-                                ),
-                            })
-                        })?;
-                    let base = match self.resolve(&request.specifier, Some(&url)) {
-                        Ok(target) => target,
-                        Err(_) => resolve_plain_relative_file(&request.specifier, &url)
-                            .ok_or_else(|| {
-                                GraphError::Loader(LoaderError::Resolve {
-                                    specifier: request.specifier.clone(),
-                                    referrer: url.clone(),
-                                    message: "data module not found".to_string(),
-                                })
-                            })?,
-                    };
-                    let target = format!("{base}{MODULE_TYPE_MARKER}{kind}");
-                    resolved_imports.insert(
-                        ImportRequest::new(request.specifier.clone(), request.attr_type.clone()),
-                        target.clone(),
-                    );
-                    if !request.deferred && !request.dynamic {
-                        eager_static_specs.insert(request.specifier.clone());
-                    }
-                    deps.push(ModuleEdge {
-                        target: target.clone(),
-                        deferred: request.deferred,
-                    });
-                    if !self.nodes.contains_key(&target) {
-                        let raw = self.read_data_file(&base)?;
-                        let shim = crate::data_modules::data_module_source(format, &raw).map_err(
-                            |error| {
-                                GraphError::Loader(LoaderError::Load {
-                                    url: base.clone(),
-                                    message: error.message,
-                                })
-                            },
-                        )?;
-                        let shim = crate::module_loader::admit_source(
-                            self.loader.resource_account(),
-                            &target,
-                            shim,
-                        )
-                        .map_err(GraphError::Loader)?;
-                        queued.push((
-                            target,
-                            SourceKind::JavaScript,
-                            shim,
-                            optional_dynamic || request.dynamic,
-                        ));
-                    }
-                    continue;
-                }
-                let requested_target = self.resolve(&request.specifier, Some(&url))?;
-                let (target, loaded) = if self.nodes.contains_key(&requested_target) {
-                    (requested_target, None)
-                } else {
-                    let loaded = self.load_resolved(requested_target)?;
-                    (loaded.url.clone(), Some(loaded))
-                };
-                resolved_imports.insert(
-                    ImportRequest::plain(request.specifier.clone()),
-                    target.clone(),
-                );
-                if request.dynamic {
-                    dynamic_specs.insert(request.specifier.clone());
-                } else if !request.deferred {
-                    eager_static_specs.insert(request.specifier.clone());
-                }
-                deps.push(ModuleEdge {
-                    target: target.clone(),
-                    deferred: request.deferred,
-                });
-                if !self.nodes.contains_key(&target)
-                    && let Some(loaded) = loaded
-                {
-                    queued.push((
-                        loaded.url,
-                        loaded.kind,
-                        loaded.text,
-                        optional_dynamic || request.dynamic,
-                    ));
-                }
-            }
+            let ResolvedRequests {
+                imports: resolved_imports,
+                deps,
+                queued,
+                eager_static_specs,
+                dynamic_specs,
+            } = self.resolve_requests(&url, &requests, optional_dynamic)?;
             let host = ModuleHostInfo {
                 module_url: url.clone(),
                 resolved_imports,
@@ -593,7 +594,7 @@ impl<'a> ModuleGraphBuilder<'a> {
                     .copied()
                     .unwrap_or(usize::MAX)
             });
-            Ok::<_, GraphError>((compiled, deps, queued))
+            Ok::<_, GraphError>((compiled, deps, queued, requests))
         };
         let parsed = if timing_enabled {
             let (parsed, parse_time) =
@@ -611,7 +612,10 @@ impl<'a> ModuleGraphBuilder<'a> {
                 error,
             })?
         };
-        let (compiled, deps, queued) = parsed?;
+        let (compiled, deps, queued, requests) = parsed?;
+        if let (Some(cache), Some(key)) = (&self.cache, &key) {
+            store_cached_module(cache, key, requests, &compiled);
+        }
 
         self.queue.extend(queued);
         self.nodes.insert(
@@ -623,6 +627,163 @@ impl<'a> ModuleGraphBuilder<'a> {
             },
         );
         Ok(())
+    }
+
+    /// Resolve one module's requests: the import map it compiles against,
+    /// its dependency edges, and the sources still to load.
+    fn resolve_requests(
+        &mut self,
+        url: &str,
+        requests: &[ModuleRequest],
+        optional_dynamic: bool,
+    ) -> Result<ResolvedRequests, GraphError> {
+        let mut resolved_imports: HashMap<ImportRequest, String> = HashMap::new();
+        let mut deps: Vec<ModuleEdge> = Vec::with_capacity(requests.len());
+        let mut queued: Vec<(String, SourceKind, otter_resource::SharedSource, bool)> = Vec::new();
+        let mut eager_static_specs: HashSet<String> = HashSet::new();
+        let mut dynamic_specs: HashSet<String> = HashSet::new();
+        for request in requests {
+            self.check_interrupted()?;
+            // An import attribute names the format outright, so it
+            // decides how the file is read whatever it is called. The
+            // attribute is part of the module-map key, so each type gets
+            // its own marker URL and its own synthesised module node.
+            // Resolution accepts extension-less fixture paths the normal
+            // probing resolver would reject.
+            if let Some(kind) = request.attr_type.as_deref() {
+                let format =
+                    crate::data_modules::DataFormat::from_attribute(kind).ok_or_else(|| {
+                        GraphError::Loader(LoaderError::Load {
+                            url: url.to_string(),
+                            message: format!(
+                                "unsupported import attribute type {kind:?} for '{}'",
+                                request.specifier
+                            ),
+                        })
+                    })?;
+                let base = match self.resolve(&request.specifier, Some(url)) {
+                    Ok(target) => target,
+                    Err(_) => {
+                        resolve_plain_relative_file(&request.specifier, url).ok_or_else(|| {
+                            GraphError::Loader(LoaderError::Resolve {
+                                specifier: request.specifier.clone(),
+                                referrer: url.to_string(),
+                                message: "data module not found".to_string(),
+                            })
+                        })?
+                    }
+                };
+                let target = format!("{base}{MODULE_TYPE_MARKER}{kind}");
+                resolved_imports.insert(
+                    ImportRequest::new(request.specifier.clone(), request.attr_type.clone()),
+                    target.clone(),
+                );
+                if !request.deferred && !request.dynamic {
+                    eager_static_specs.insert(request.specifier.clone());
+                }
+                deps.push(ModuleEdge {
+                    target: target.clone(),
+                    deferred: request.deferred,
+                });
+                if !self.nodes.contains_key(&target) {
+                    let raw = self.read_data_file(&base)?;
+                    let shim =
+                        crate::data_modules::data_module_source(format, &raw).map_err(|error| {
+                            GraphError::Loader(LoaderError::Load {
+                                url: base.clone(),
+                                message: error.message,
+                            })
+                        })?;
+                    let shim = crate::module_loader::admit_source(
+                        self.loader.resource_account(),
+                        &target,
+                        shim,
+                    )
+                    .map_err(GraphError::Loader)?;
+                    queued.push((
+                        target,
+                        SourceKind::JavaScript,
+                        shim,
+                        optional_dynamic || request.dynamic,
+                    ));
+                }
+                continue;
+            }
+            let requested_target = self.resolve(&request.specifier, Some(url))?;
+            let (target, loaded) = if self.nodes.contains_key(&requested_target) {
+                (requested_target, None)
+            } else {
+                let loaded = self.load_resolved(requested_target)?;
+                (loaded.url.clone(), Some(loaded))
+            };
+            resolved_imports.insert(
+                ImportRequest::plain(request.specifier.clone()),
+                target.clone(),
+            );
+            if request.dynamic {
+                dynamic_specs.insert(request.specifier.clone());
+            } else if !request.deferred {
+                eager_static_specs.insert(request.specifier.clone());
+            }
+            deps.push(ModuleEdge {
+                target: target.clone(),
+                deferred: request.deferred,
+            });
+            if !self.nodes.contains_key(&target)
+                && let Some(loaded) = loaded
+            {
+                queued.push((
+                    loaded.url,
+                    loaded.kind,
+                    loaded.text,
+                    optional_dynamic || request.dynamic,
+                ));
+            }
+        }
+        Ok(ResolvedRequests {
+            imports: resolved_imports,
+            deps,
+            queued,
+            eager_static_specs,
+            dynamic_specs,
+        })
+    }
+
+    /// The names to re-export when `text` is a CommonJS file, or `None` when
+    /// it has module syntax. Keyed by the source alone, so an unchanged file
+    /// is classified without being parsed.
+    fn commonjs_exports(
+        &self,
+        url: &str,
+        text: &str,
+        kind: SourceKind,
+    ) -> Result<Option<Vec<String>>, GraphError> {
+        let key = self
+            .cache
+            .as_ref()
+            .map(|_| crate::compile_cache::cache_key(text, kind, "<commonjs-exports>"));
+        if let (Some(cache), Some(key)) = (&self.cache, &key)
+            && let Some(bytes) = cache.load_bytes(key)
+            && let Ok(names) = serde_json::from_slice::<Option<Vec<String>>>(&bytes)
+        {
+            return Ok(names);
+        }
+        let names = with_program(text, kind, |program| {
+            Ok::<_, GraphError>(
+                (!crate::program_looks_like_module(program))
+                    .then(|| commonjs_export_names(program)),
+            )
+        })
+        .map_err(|error| GraphError::Parse {
+            url: url.to_string(),
+            error,
+        })??;
+        if let (Some(cache), Some(key)) = (&self.cache, &key)
+            && let Ok(bytes) = serde_json::to_vec(&names)
+        {
+            cache.store_bytes(key, &bytes);
+        }
+        Ok(names)
     }
 
     fn insert_dynamic_failure_node(
@@ -760,7 +921,7 @@ struct ModuleRequestVisitor {
     seen: HashSet<(String, bool)>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct ModuleRequest {
     specifier: String,
     deferred: bool,
@@ -2199,6 +2360,70 @@ mod tests {
         assert_eq!(linked.module.functions[0].name, "<entry>");
         assert_eq!(linked.module.module_inits.len(), 2);
         assert_eq!(linked.metadata.len(), 2);
+    }
+
+    #[test]
+    fn unchanged_modules_load_from_the_compile_cache_while_their_imports_resolve_alike() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cache_dir = tempfile::tempdir().expect("cache dir");
+        // The cache publishes only into an owner-private root.
+        std::fs::set_permissions(
+            cache_dir.path(),
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .expect("private cache root");
+        let entry_path = dir.path().join("entry.ts");
+        std::fs::write(
+            &entry_path,
+            "import { value } from './dep'; export const out = value;",
+        )
+        .expect("write entry");
+        std::fs::write(dir.path().join("dep.js"), "export const value = 1;").expect("write dep");
+        let entry_url = format!(
+            "file://{}",
+            std::fs::canonicalize(&entry_path).unwrap().display()
+        );
+        // Each build is a fresh run: a new loader, so no file-system lookup
+        // survives from the previous one.
+        let build = || {
+            let loader = ModuleLoader::new(dir.path().to_path_buf());
+            let entry_text = crate::module_loader::admit_source(
+                loader.resource_account(),
+                &entry_url,
+                std::fs::read_to_string(&entry_path).unwrap(),
+            )
+            .unwrap();
+            let mut builder = ModuleGraphBuilder::new_profiled(
+                &loader,
+                entry_url.clone(),
+                SourceKind::TypeScript,
+                entry_text,
+                ModulePhaseTimings::default(),
+            );
+            builder.cache = Some(crate::compile_cache::CompileCache::new(cache_dir.path()));
+            let (graph, timings) = builder.build_with_timings().expect("build graph");
+            let targets: Vec<String> = graph.nodes[&entry_url]
+                .fragment
+                .module_resolutions
+                .iter()
+                .map(|edge| edge.target.rsplit('/').next().unwrap().to_owned())
+                .collect();
+            (targets, timings.expect("profiled"))
+        };
+
+        let (targets, cold) = build();
+        assert_eq!(targets, ["dep.js"]);
+        assert!(cold.parse_time_ns > 0 && cold.compile_time_ns > 0);
+        let (targets, warm) = build();
+        assert_eq!(targets, ["dep.js"]);
+        assert_eq!((warm.parse_time_ns, warm.compile_time_ns), (0, 0));
+
+        // A sibling the resolver now prefers changes the entry's import
+        // target: its cached fragment names the old one and is recompiled.
+        std::fs::write(dir.path().join("dep.ts"), "export const value = 2;").expect("write dep");
+        let (targets, retargeted) = build();
+        assert_eq!(targets, ["dep.ts"]);
+        assert!(retargeted.compile_time_ns > 0);
     }
 
     #[test]

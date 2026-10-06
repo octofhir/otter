@@ -427,10 +427,10 @@ fn run_nested_jit_require(selection: JitSelection) -> JitRequireResult {
         }
 
         const probe = { value: 1 };
-        let checksum = 0;
-        for (let i = 0; i < 640; i++) {
-            checksum += loadFromHotFunction(null, probe);
-        }
+        // Warm through a native iteration: no bytecode back-edge, so the
+        // caller tiers by whole-function entry and nothing enters by OSR.
+        let checksum = Array.from({ length: 640 }, () => loadFromHotFunction(null, probe))
+            .reduce((sum, value) => sum + value, 0);
 
         // Prove the installed template body actually executes: a different
         // receiver shape must take exactly one property transition before the

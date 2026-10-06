@@ -370,7 +370,9 @@ enum TypedFeedbackSlot {
 impl TypedFeedbackSlot {
     fn for_op(op: Op) -> Self {
         match op {
-            Op::LoadProperty => Self::Property(Box::new(PropertyIcSlot::new(PropertyIcKind::Load))),
+            Op::LoadProperty | Op::HasNamedProperty => {
+                Self::Property(Box::new(PropertyIcSlot::new(PropertyIcKind::Load)))
+            }
             Op::StoreProperty | Op::StorePropertyStrict => {
                 Self::Property(Box::new(PropertyIcSlot::new(PropertyIcKind::Store)))
             }
@@ -472,6 +474,14 @@ impl<'a> PropertyFeedbackSlot<'a> {
         heap: &otter_gc::GcHeap,
     ) -> Option<Value> {
         self.slot.probe_load(obj, heap)
+    }
+
+    pub(crate) fn probe_has(
+        self,
+        obj: crate::object::JsObject,
+        heap: &otter_gc::GcHeap,
+    ) -> Option<bool> {
+        self.slot.probe_has(obj, heap)
     }
 
     pub(crate) fn probe_store(

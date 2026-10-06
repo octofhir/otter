@@ -704,6 +704,21 @@ impl PropertyIcSlot {
         self.probe_load_from(obj, object::shape(obj, heap).offset(), heap)
     }
 
+    /// Whether the load handler of `obj`'s shape finds the key: a field of the
+    /// object or its chain (`true`) or a proven absence (`false`). `None` on a
+    /// miss. Presence reads no value, so the entry that answers `[[Get]]`
+    /// answers `in` too.
+    #[must_use]
+    pub(crate) fn probe_has(&self, obj: JsObject, heap: &otter_gc::GcHeap) -> Option<bool> {
+        let entry = self.matching(object::shape(obj, heap).offset())?;
+        match entry.kind() {
+            IcHandlerKind::OwnField => Some(true),
+            IcHandlerKind::PrototypeField => entry.proof_holds().then_some(true),
+            IcHandlerKind::NonExistent => entry.proof_holds().then_some(false),
+            _ => None,
+        }
+    }
+
     /// Run the load handler of a function receiver whose property bag is
     /// `bag`. `None` on a miss.
     #[must_use]

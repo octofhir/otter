@@ -49,6 +49,63 @@ impl Interpreter {
         Ok(())
     }
 
+    /// `Op::HasNamedProperty` — `name in object` for a constant name
+    /// (§13.10.1). An ordinary receiver asks the site's load inline cache,
+    /// whose handler answers presence; a miss resolves the name without
+    /// reading it and installs the handler a load would. A receiver no
+    /// handler describes (exotic, proxy, accessor holder) takes the full
+    /// `[[HasProperty]]`.
+    pub(crate) fn run_has_named_property_reg(
+        &mut self,
+        context: &ExecutionContext,
+        stack: &mut ActivationStack,
+        frame_index: usize,
+        dst: u16,
+        obj_reg: u16,
+        key: AtomizedPropertyKey<'_>,
+        slot: Option<crate::feedback::PropertyFeedbackSlot<'_>>,
+    ) -> Result<(), CommittedValueError> {
+        let receiver = *read_register(&stack[frame_index], obj_reg)
+            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+        if !receiver.is_object_type() {
+            return Err(CommittedValueError::JavaScript(crate::VmError::TypeMismatch));
+        }
+        let cached = match (receiver.as_object(), slot) {
+            (Some(obj), Some(slot)) => {
+                if let Some(found) = slot.probe_has(obj, &self.gc_heap) {
+                    slot.record_hit();
+                    Some(found)
+                } else {
+                    slot.record_miss();
+                    let load = self.resolve_property_load(obj, key);
+                    self.update_load_ic(slot, obj, &load);
+                    match load {
+                        crate::property_cache::PropertyLoad::Data(_) => Some(true),
+                        crate::property_cache::PropertyLoad::Absent(_) => Some(false),
+                        crate::property_cache::PropertyLoad::Other => None,
+                    }
+                }
+            }
+            _ => None,
+        };
+        let found = match cached {
+            Some(found) => found,
+            None => self.ordinary_has_property_value(
+                stack,
+                Some(context),
+                receiver,
+                &VmPropertyKey::String(key.name()),
+                0,
+            )?,
+        };
+        let frame = &mut stack[frame_index];
+        write_register(frame, dst, Value::boolean(found))
+            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+        frame
+            .advance_pc()
+            .map_err(|error| CommittedValueError::Fatal(error.into()))
+    }
+
     /// Full string-keyed `[[Get]]` over any receiver value: the complete
     /// interpreter resolution cascade (ordinary objects, every exotic
     /// receiver family, primitives, and the proxy-aware fallback), including

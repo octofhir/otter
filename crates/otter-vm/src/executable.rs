@@ -94,7 +94,11 @@ impl FeedbackSlotAddress {
 fn has_property_ic_site(op: Op) -> bool {
     matches!(
         op,
-        Op::LoadProperty | Op::StoreProperty | Op::StorePropertyStrict | Op::CallMethodValue
+        Op::LoadProperty
+            | Op::HasNamedProperty
+            | Op::StoreProperty
+            | Op::StorePropertyStrict
+            | Op::CallMethodValue
     )
 }
 
@@ -261,7 +265,7 @@ impl ExecutableModule {
                     continue;
                 };
                 let (kind, inspect_kind) = match code_block.op(instruction) {
-                    Op::LoadProperty | Op::CallMethodValue => (
+                    Op::LoadProperty | Op::HasNamedProperty | Op::CallMethodValue => (
                         crate::property_ic::PropertyIcKind::Load,
                         crate::inspect::IcSiteKind::Load,
                     ),
@@ -477,7 +481,7 @@ impl CodeBlock {
                         .feedback_at(index)
                         .is_some_and(crate::feedback::InstructionFeedback::call_attempted),
                     property_attempted: match self.op_at(index) {
-                        Some(Op::LoadProperty | Op::CallMethodValue) => self
+                        Some(Op::LoadProperty | Op::HasNamedProperty | Op::CallMethodValue) => self
                             .property_feedback_at(index, crate::property_ic::PropertyIcKind::Load),
                         Some(Op::StoreProperty | Op::StorePropertyStrict) => self
                             .property_feedback_at(index, crate::property_ic::PropertyIcKind::Store),
@@ -698,7 +702,9 @@ impl CodeBlock {
     #[must_use]
     pub(crate) fn property_site_population(&self, index: usize) -> Option<u32> {
         let kind = match self.op_at(index)? {
-            Op::LoadProperty | Op::CallMethodValue => crate::property_ic::PropertyIcKind::Load,
+            Op::LoadProperty | Op::HasNamedProperty | Op::CallMethodValue => {
+                crate::property_ic::PropertyIcKind::Load
+            }
             Op::StoreProperty | Op::StorePropertyStrict => {
                 crate::property_ic::PropertyIcKind::Store
             }

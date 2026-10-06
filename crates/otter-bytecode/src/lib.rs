@@ -1141,6 +1141,16 @@ pub enum Op {
     /// - <https://tc39.es/ecma262/#sec-definemethodproperty>
     /// - <https://tc39.es/ecma262/#sec-method-definitions-runtime-semantics-methoddefinitionevaluation>
     DefineMember,
+    /// `r<dst> = name in r<object>` for a constant, non-index property name:
+    /// §13.10.1 with `HasProperty(object, name)`, a TypeError when `object`
+    /// is not an Object. The site owns a load inline cache, whose handler
+    /// for the receiver's shape answers presence without reading the value
+    /// (V8's `KeyedHasIC` on a constant key). Operands:
+    /// `Register(dst), Register(object), ConstIndex(name)`.
+    ///
+    /// # See also
+    /// - <https://tc39.es/ecma262/#sec-relational-operators-runtime-semantics-evaluation>
+    HasNamedProperty,
     /// `r<dst> = ArrayBuffer(args...)` / `ArrayBuffer.<name>(args...)`.
     /// Operands: `Register(dst), ConstIndex(name), ConstIndex(argc),
     /// Register(arg0), …`.
@@ -1663,6 +1673,7 @@ impl Op {
             Op::CopyDataProperties => "COPY_DATA_PROPERTIES",
             Op::DefineOwnProperty => "DEFINE_OWN_PROPERTY",
             Op::DefineMember => "DEFINE_MEMBER",
+            Op::HasNamedProperty => "HAS_NAMED_PROPERTY",
             Op::ArrayConstruct => "ARRAY_CONSTRUCT",
             Op::ArrayFrom => "ARRAY_FROM",
             Op::ArrayOf => "ARRAY_OF",
@@ -1810,7 +1821,9 @@ impl Op {
             // [gate_dst, url_const]
             Op::EvaluateModule => pos == 1,
             // [reg, reg, const]
-            Op::LoadProperty | Op::DeleteProperty | Op::ToPrimitive => pos == 2,
+            Op::LoadProperty | Op::HasNamedProperty | Op::DeleteProperty | Op::ToPrimitive => {
+                pos == 2
+            }
             // [dst, url_const, name_const]
             Op::LoadImportBinding => pos == 1 || pos == 2,
             // [reg, kind_const, reg]

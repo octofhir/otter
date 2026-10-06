@@ -1744,6 +1744,7 @@ impl<'a> Builder<'a> {
                 self.visit_compare(instruction, Some(immediate));
             }
             Op::LoadProperty => self.visit_load_property(instruction),
+            Op::HasNamedProperty => self.visit_has_named_property(instruction),
             Op::StoreProperty | Op::StorePropertyStrict => self.visit_store_property(instruction),
             Op::Call => self.visit_call(instruction, false),
             Op::New => self.visit_call(instruction, true),
@@ -2303,6 +2304,22 @@ impl<'a> Builder<'a> {
         let value = self.add(Kind::LoadOwnField(access.field), &[object], Repr::Tagged);
         self.known.fields.insert(key, value);
         self.write(instruction.writes[0], value);
+    }
+
+    /// `name in object` at a site whose receivers all owned the key: their
+    /// shapes fix the answer, so it is `true` behind the shape check. Any
+    /// other site keeps the baseline operation.
+    fn visit_has_named_property(&mut self, instruction: &Instruction) {
+        let Some(shapes) = (!self.exited_for(ExitReason::ShapeGuard))
+            .then(|| super::feedback::own_key_shapes(self.view, instruction.byte_pc))
+            .flatten()
+        else {
+            return self.generic(instruction);
+        };
+        let object = self.read(instruction.reads[0]);
+        let object = self.tagged(object);
+        self.check_shapes(object, &shapes, false);
+        self.set_constant(instruction, tag::OTHER_TAG | tag::BOOL_TAG | 1);
     }
 
     /// A named load that is not one own data slot: a load through its

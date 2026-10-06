@@ -174,6 +174,26 @@ impl Interpreter {
                     definition,
                 )?;
             }
+            value if value == Op::HasNamedProperty as u8 => {
+                let function_id = stack[frame_index].function_id;
+                let key = context
+                    .property_atom(arg1 as u32)
+                    .ok_or(CommittedValueError::Fatal(VmError::InvalidOperand))?;
+                let slot = context.property_feedback_slot(
+                    function_id,
+                    saved_pc,
+                    crate::property_ic::PropertyIcKind::Load,
+                );
+                self.run_has_named_property_reg(
+                    context,
+                    stack,
+                    frame_index,
+                    lane(arg0, 0),
+                    lane(arg0, 1),
+                    key,
+                    slot,
+                )?;
+            }
             value if value == Op::ToNumber as u8 => {
                 self.run_to_number_regs(context, stack, frame_index, lane(arg0, 0), lane(arg0, 1))?;
             }

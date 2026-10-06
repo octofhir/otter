@@ -297,6 +297,32 @@ fn compile_binary_to(
         // <https://tc39.es/ecma262/#sec-relational-operators-runtime-semantics-evaluation>
         BinaryOperator::In => Op::HasProperty,
     };
+    // `"name" in object` with a literal, non-index name is V8's KeyedHasIC
+    // on a constant key: a named site whose load inline cache answers
+    // presence by the receiver's shape. The literal has no effect and its
+    // ToPropertyKey is itself, so only the object operand is evaluated.
+    if op == Op::HasProperty
+        && let Expression::StringLiteral(name) = &b.left
+        && is_named_key(name.value.as_str())
+    {
+        let object = compile_expr(cx, &b.right, span)?;
+        cx.reset_scratch(mark);
+        let dst = match destination {
+            Some(dst) => dst,
+            None => crate::expr::unary::distinct_result_register(cx, object),
+        };
+        let name = cx.intern_string_constant(name.value.as_str());
+        cx.emit(
+            Op::HasNamedProperty,
+            [
+                Operand::Register(dst),
+                Operand::Register(object),
+                Operand::ConstIndex(name),
+            ],
+            span,
+        );
+        return Ok(dst);
+    }
     // `typeof x === "kind"` (and `!==`, `==`, `!=`, either side) against one
     // of the eight `typeof` spellings is a type test, not a string compare:
     // no result string is produced (V8's `TestTypeOf`). The literal side has
@@ -464,4 +490,14 @@ fn typeof_literal_pair<'a, 'b>(
         Some((unary.as_ref(), kind))
     };
     pair(left, right).or_else(|| pair(right, left))
+}
+
+/// Whether a literal key is a named property rather than an array index,
+/// spelled exactly (a lone surrogate reaches the lossy oxc spelling as
+/// U+FFFD and keeps the general path).
+fn is_named_key(key: &str) -> bool {
+    !key.contains('\u{FFFD}')
+        && !key
+            .parse::<u32>()
+            .is_ok_and(|index| index != u32::MAX && index.to_string() == key)
 }

@@ -515,6 +515,15 @@ impl<'a, 'b> ProgramParts<'a, 'b> {
     }
 }
 
+/// Seal per-function facts derived from the finished bodies: the
+/// `[[SourceText]]` ranges and whether each body ignores its `this`.
+fn finish_bytecode(module: &mut BytecodeModule, source: &str) {
+    attach_source_text(module, source);
+    for function in &mut module.functions {
+        function.ignores_this = !function.body_observes_this();
+    }
+}
+
 /// Attach §20.2.3.5 [[SourceText]] to every compiled function as a
 /// validated range into one shared module-level source snapshot. The
 /// `<main>` script/eval/module entry (function 0) is skipped — it is
@@ -523,7 +532,7 @@ impl<'a, 'b> ProgramParts<'a, 'b> {
 /// functions) leave the range `None`, so `toString` keeps the
 /// `NativeFunction` form for them. The snapshot is retained once per
 /// module instead of one owned slice per function.
-pub(crate) fn attach_source_text(module: &mut BytecodeModule, source: &str) {
+fn attach_source_text(module: &mut BytecodeModule, source: &str) {
     let mut any_range = false;
     for function in module.functions.iter_mut().skip(1) {
         // A method / accessor reports its `MethodDefinition` source,
@@ -1048,7 +1057,7 @@ pub(crate) fn compile_program_parts(
         module_inits: Vec::new(),
         function_source: None,
     };
-    attach_source_text(&mut bytecode, source_text);
+    finish_bytecode(&mut bytecode, source_text);
     Ok(bytecode)
 }
 
@@ -1692,7 +1701,7 @@ pub fn compile_module_program(
         module_inits: Vec::new(),
         function_source: None,
     };
-    attach_source_text(&mut bytecode, program.source_text);
+    finish_bytecode(&mut bytecode, program.source_text);
     Ok(bytecode)
 }
 

@@ -2061,6 +2061,12 @@ pub struct Function {
     /// prototypes. Only an embedder sets it; compiled user code never does.
     #[serde(default)]
     pub primordial_iteration: bool,
+    /// `true` when the body never reads its `this` binding (see
+    /// [`Self::body_observes_this`]): a call then skips OrdinaryCallBindThis
+    /// receiver conversion. The verifier rejects a body that contradicts it;
+    /// `false` is always sound.
+    #[serde(default)]
+    pub ignores_this: bool,
     /// Byte range into [`BytecodeModule::function_source`] for the
     /// function / class definition (§20.2.3.5 [[SourceText]]). Validated
     /// at compile time by slicing the source over `source_text_span` (or
@@ -2668,6 +2674,29 @@ impl BytecodeModule {
 }
 
 impl Function {
+    /// Whether the body can read its `this` binding: `LoadThis`, a nested
+    /// function or class creation that may capture it, or a direct eval.
+    #[must_use]
+    pub fn body_observes_this(&self) -> bool {
+        self.contains_direct_eval
+            || self.code.iter().any(|instruction| {
+                matches!(
+                    instruction.op,
+                    Op::LoadThis | Op::MakeFunction | Op::MakeClosure
+                )
+            })
+    }
+
+    /// Register-window width: parameters, then locals, then scratch. `None`
+    /// when it exceeds the `u16` frame header; module admission rejects that,
+    /// so an admitted function always has one.
+    #[must_use]
+    pub fn register_count(&self) -> Option<u16> {
+        self.param_count
+            .checked_add(self.locals)?
+            .checked_add(self.scratch)
+    }
+
     /// Heap bytes this compiled function retains: name, wordcode body, span
     /// table, exception handlers, scope descriptors, mapped-arguments table,
     /// and annotation-hint tables, including retained Vec/String capacity. Excludes `size_of::<Self>()`, which the owning function table

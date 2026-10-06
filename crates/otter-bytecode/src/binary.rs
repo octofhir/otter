@@ -635,6 +635,7 @@ impl Writer {
             function.uses_arguments_callee,
             function.contains_direct_eval,
             function.primordial_iteration,
+            function.ignores_this,
         ] {
             self.bool(flag);
         }
@@ -1019,6 +1020,7 @@ impl<'a> Reader<'a> {
         let uses_arguments_callee = self.bool()?;
         let contains_direct_eval = self.bool()?;
         let primordial_iteration = self.bool()?;
+        let ignores_this = self.bool()?;
         let arguments_object_kind = match self.u8()? {
             0 => ArgumentsObjectKind::Unmapped,
             1 => ArgumentsObjectKind::Mapped,
@@ -1071,6 +1073,7 @@ impl<'a> Reader<'a> {
             module_url,
             contains_direct_eval,
             primordial_iteration,
+            ignores_this,
             source_text_range,
             source_text_span,
             code,
@@ -1285,6 +1288,7 @@ mod tests {
                 module_url: "file:///entry.ts".to_string(),
                 contains_direct_eval: true,
                 primordial_iteration: false,
+                ignores_this: false,
                 source_text_range: Some((0, 18)),
                 source_text_span: Some((0, 18)),
                 code: code.finish(),
@@ -1501,7 +1505,12 @@ mod tests {
             let decoded = std::panic::catch_unwind(|| decode_module(&mutated));
             let decoded =
                 decoded.unwrap_or_else(|_| panic!("decoder panicked after mutating byte {index}"));
-            if let Ok(module) = decoded {
+            // A decoded module may still reject a function when its proof is
+            // asked for; once every proof is handed out, the whole module
+            // must verify.
+            if let Ok(module) = decoded
+                && (0..module.module().functions.len()).all(|function| module.function(function).is_ok())
+            {
                 crate::verify_module_at_base(module.module(), module.function_base())
                     .unwrap_or_else(|error| panic!("decoder admitted byte {index}: {error}"));
             }

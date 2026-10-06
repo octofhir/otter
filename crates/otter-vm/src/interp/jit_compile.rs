@@ -1066,7 +1066,7 @@ impl Interpreter {
         context: &ExecutionContext,
         fid: u32,
     ) -> Option<()> {
-        let realm_id = self.function_realm_ids.get(&fid).copied().unwrap_or(0);
+        let realm_id = self.function_realm_id(fid);
         view.literal_allocations.realm_id = realm_id;
         view.literal_allocations.group_allowed = self.gc_heap.machine_allocation_allowed();
         for (pc, instruction) in view.instructions.iter().enumerate() {

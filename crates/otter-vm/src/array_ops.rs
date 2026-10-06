@@ -701,6 +701,7 @@ mod tests {
                     module_url: String::new(),
                     contains_direct_eval: false,
                     primordial_iteration: false,
+                    ignores_this: false,
                     code: vec![Instruction {
                         pc: 0,
                         op: Op::ReturnUndefined,
@@ -757,6 +758,7 @@ mod tests {
                 module_url: String::new(),
                 contains_direct_eval: false,
                 primordial_iteration: false,
+                ignores_this: false,
                 code: vec![Instruction {
                     pc: 0,
                     op: Op::ReturnUndefined,

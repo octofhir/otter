@@ -271,7 +271,7 @@ impl Interpreter {
         interp.jit_code_registry.set_account(account.clone());
         interp
             .code_space
-            .visit_live_functions(|function| interp.jit_code_registry.link_function(function, 0));
+            .visit_linked_functions(|function| interp.jit_code_registry.link_function(function, 0));
 
         // Write the captured fixed roots back through the same walk that
         // collected them, relocated to the restored pages.

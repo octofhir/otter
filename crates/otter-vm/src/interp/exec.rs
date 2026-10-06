@@ -350,10 +350,7 @@ impl Interpreter {
         function_count: u32,
     ) -> Result<ExecutionContext, crate::BytecodeLinkError> {
         context.resolve_atoms(&self.names);
-        for function_id in context.function_base()..context.function_base() + function_count {
-            let function = context
-                .exec_function(function_id)
-                .expect("verified linked function");
+        for function in context.linked_functions() {
             self.jit_code_registry
                 .link_function(function, self.active_realm_id);
         }
@@ -392,15 +389,8 @@ impl Interpreter {
         if !std::sync::Arc::ptr_eq(&self.code_space, context.space()) {
             self.code_space = std::sync::Arc::clone(context.space());
             self.code_space.resolve_atoms(&self.names);
-            for function_id in context.function_base()..context.function_end() {
-                let function = context
-                    .exec_function(function_id)
-                    .expect("verified adopted function");
-                let realm_id = self
-                    .function_realm_ids
-                    .get(&function_id)
-                    .copied()
-                    .unwrap_or(0);
+            for function in context.linked_functions() {
+                let realm_id = self.function_realm_id(function.id);
                 self.jit_code_registry.link_function(function, realm_id);
             }
         }

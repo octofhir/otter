@@ -1165,6 +1165,16 @@ impl Interpreter {
         result
     }
 
+    /// The realm a bytecode function was linked in; an unregistered function
+    /// belongs to the default realm.
+    #[inline]
+    pub(crate) fn function_realm_id(&self, function_id: u32) -> u32 {
+        self.function_realm_ids
+            .get(&function_id)
+            .copied()
+            .unwrap_or(0)
+    }
+
     /// The realm a bytecode frame's globals resolve in, when it differs from
     /// the active realm. `None` on the overwhelmingly common same-realm path;
     /// an unregistered function belongs to the default realm.
@@ -1173,11 +1183,7 @@ impl Interpreter {
         if self.function_realm_ids.is_empty() && self.active_realm_id == 0 {
             return None;
         }
-        let realm_id = self
-            .function_realm_ids
-            .get(&function_id)
-            .copied()
-            .unwrap_or(0);
+        let realm_id = self.function_realm_id(function_id);
         (realm_id != self.active_realm_id).then_some(realm_id)
     }
 

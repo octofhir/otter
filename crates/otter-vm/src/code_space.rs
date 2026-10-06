@@ -108,29 +108,39 @@ impl ChunkPayload {
     }
 }
 
-/// One immutable compiler module allocation and its inseparable lease.
+/// One immutable admitted module allocation and its inseparable lease: the
+/// function table executable code is built from, function by function.
 /// Snapshots share this owner without retaining mutable donor execution state.
 #[derive(Debug)]
 pub(crate) struct LinkedBytecode {
-    module: BytecodeModule,
+    verified: VerifiedBytecodeModule,
     _lease: ResourceLease,
 }
 
 impl LinkedBytecode {
-    fn new(module: BytecodeModule, account: &ResourceAccount) -> Result<Arc<Self>, ResourceError> {
-        let bytes = (std::mem::size_of::<Self>() as u64).saturating_add(module.retained_bytes());
+    pub(crate) fn new(
+        verified: VerifiedBytecodeModule,
+        account: &ResourceAccount,
+    ) -> Result<Arc<Self>, ResourceError> {
+        let bytes = (std::mem::size_of::<Self>() as u64)
+            .saturating_add(verified.module().retained_bytes());
         let lease = account.reserve_exact(ResourceClass::SourceModuleBytes, bytes)?;
         Ok(Arc::new(Self {
-            module,
+            verified,
             _lease: lease,
         }))
+    }
+
+    /// The admitted module with its per-function proofs.
+    pub(crate) fn verified(&self) -> &VerifiedBytecodeModule {
+        &self.verified
     }
 }
 
 impl std::ops::Deref for LinkedBytecode {
     type Target = BytecodeModule;
     fn deref(&self) -> &Self::Target {
-        &self.module
+        self.verified.module()
     }
 }
 
@@ -456,12 +466,15 @@ fn build_chunk(
     retention: ChunkRetention,
     account: &ResourceAccount,
 ) -> Result<Arc<CodeChunk>, BytecodeLinkError> {
-    let executable = Arc::new(ExecutableModule::from_verified_bytecode_with_ic_base(
-        &verified,
+    // `<main>` runs as soon as the chunk links, so its proof is established
+    // here; every other function is verified when it is first built.
+    verified.function(0)?;
+    let module = LinkedBytecode::new(verified, account)?;
+    let executable = Arc::new(ExecutableModule::lazy(
+        Arc::clone(&module),
         property_ic_base,
         account,
     )?);
-    let module = LinkedBytecode::new(verified.into_module(), account)?;
     let metadata_bytes = (std::mem::size_of::<ChunkPayload>() as u64)
         .saturating_add(std::mem::size_of::<AtomTable>() as u64)
         .saturating_add(AtomTable::allocation_bytes(&module.constants));
@@ -753,26 +766,17 @@ impl CodeSpace {
             .map(crate::executable::CodeBlock::feedback_epoch)
     }
 
-    /// Visit live immutable function layouts while the linked directory is held.
-    /// The visitor must neither enter JavaScript nor mutate this code space.
-    pub(crate) fn visit_live_functions(
-        &self,
-        mut visitor: impl FnMut(&crate::executable::CodeBlock),
-    ) {
+    /// Visit every live chunk's admitted functions while the linked directory
+    /// is held. The visitor must neither enter JavaScript nor mutate this code
+    /// space.
+    pub(crate) fn visit_linked_functions(&self, mut visitor: impl FnMut(&otter_bytecode::Function)) {
         for chunk in self.chunks().iter() {
             let payload = chunk
                 .payload
                 .read()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             if let Some(payload) = payload.as_ref() {
-                for index in 0..chunk.function_count {
-                    visitor(
-                        payload
-                            .executable
-                            .function(index)
-                            .expect("verified linked function"),
-                    );
-                }
+                payload.module.functions.iter().for_each(&mut visitor);
             }
         }
     }
@@ -1372,12 +1376,25 @@ mod tests {
         .into();
         let bytes = otter_bytecode::binary::encode_module(&malformed);
 
-        let decoded = std::panic::catch_unwind(|| otter_bytecode::binary::decode_module(&bytes));
+        // Module-level admission passes; the corrupt body is refused when its
+        // proof is asked for, and linking (which proves `<main>`) publishes
+        // nothing.
+        let decoded = std::panic::catch_unwind(|| otter_bytecode::binary::decode_module(&bytes))
+            .expect("decoding never panics")
+            .expect("module-level records are well formed");
         assert!(matches!(
-            decoded,
-            Ok(Err(otter_bytecode::binary::ModuleDecodeError::Verify(
+            decoded.function(0),
+            Err(BytecodeVerifyError::RegisterOperand { .. })
+        ));
+        assert!(matches!(
+            space.link_verified_module(
+                decoded,
+                crate::source_registry::SourceRegistry::default(),
+                &unlimited(),
+            ),
+            Err(BytecodeLinkError::Verify(
                 BytecodeVerifyError::RegisterOperand { .. }
-            )))
+            ))
         ));
         assert!(space.chunks().is_empty());
 
@@ -1389,6 +1406,38 @@ mod tests {
             )
             .expect("failed cache admission leaves base zero available");
         assert_eq!(context.function_base(), 0);
+    }
+
+    #[test]
+    fn hostile_function_body_never_becomes_code() {
+        let space = Arc::new(CodeSpace::default());
+        let mut module = module_with_functions(2);
+        module.functions[1].code = vec![
+            Instruction {
+                pc: 0,
+                op: Op::LoadUndefined,
+                operands: vec![Operand::Register(16)],
+            },
+            Instruction {
+                pc: 1,
+                op: Op::ReturnUndefined,
+                operands: Vec::new(),
+            },
+        ]
+        .into();
+        let context = space
+            .link_module(
+                module,
+                crate::source_registry::SourceRegistry::default(),
+                &unlimited(),
+            )
+            .expect("module-level records and <main> are admitted");
+        let base = context.function_base();
+        assert!(context.exec_function(base).is_some());
+        assert!(
+            context.exec_function(base + 1).is_none(),
+            "an unverifiable body never yields a CodeBlock"
+        );
     }
 
     #[test]

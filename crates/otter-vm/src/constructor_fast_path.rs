@@ -307,6 +307,7 @@ mod tests {
                     module_url: String::new(),
                     contains_direct_eval: false,
                     primordial_iteration: false,
+                    ignores_this: false,
                     code: code.into(),
                     spans: Vec::new(),
                     handlers: Vec::new(),

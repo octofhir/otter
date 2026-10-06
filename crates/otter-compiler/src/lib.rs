@@ -1136,6 +1136,28 @@ mod tests {
     }
 
     #[test]
+    fn functions_that_never_read_this_ignore_it() {
+        let module = compile_script_src(
+            "function plain() { return 1; }
+             function reads() { return this; }
+             function captures() { return () => this; }
+             function evaluates() { return eval('1'); }",
+        );
+        let ignores = |name: &str| {
+            module
+                .functions
+                .iter()
+                .find(|function| function.name == name)
+                .unwrap()
+                .ignores_this
+        };
+        assert!(ignores("plain"));
+        assert!(!ignores("reads"));
+        assert!(!ignores("captures"));
+        assert!(!ignores("evaluates"));
+    }
+
+    #[test]
     fn duplicate_string_literals_share_constant() {
         let module = compile_script_src("(\"abc\"); (\"abc\");");
         assert_eq!(module.constants.len(), 1);

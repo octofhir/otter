@@ -5,9 +5,8 @@
 //! named-property IC sites from one record while byte coordinates stay cold.
 //!
 //! # Contents
-//! - [`ExecutableModuleBuilder`] — transient builder over retained bytecode
-//!   admission proofs.
-//! - [`ExecutableModule`] — VM-owned frozen function table.
+//! - [`ExecutableModule`] — VM-owned function table whose CodeBlocks are
+//!   verified and built on first use.
 //! - [`CodeBlock`] — one verified function body: immutable wordcode/control
 //!   flow plus dense advisory feedback cells keyed by logical PC.
 //! - [`CodeBlockInstruction`] — the sole VM execution record: opcode, verified
@@ -29,8 +28,12 @@
 //!   wordcode array or per-instruction reference count remains.
 //! - Branch-class `Imm32` operands hold instruction-index deltas relative to
 //!   the next instruction.
-//! - Named property IC sites receive dense VM-local ids during build; the
-//!   bytecode JSON dump stays unchanged.
+//! - Named property IC sites receive dense VM-local ids counted per function
+//!   at link time, so a function built later gets the same ids; the bytecode
+//!   JSON dump stays unchanged.
+//! - A function's CodeBlock exists only after the function was asked for; it
+//!   is built from its admitted bytecode once its own proof is established.
+//!   Passes over a module's code (IC sweeps, statistics) see built blocks only.
 //! - A tier-neutral [`crate::feedback::FeedbackVector`] owns both dense
 //!   instruction cells and their monotonic material-transition epoch.
 //! - Execution feedback belongs to one isolate. Snapshot copies preserve
@@ -52,166 +55,140 @@ mod executable_snapshot;
 
 use otter_bytecode::{
     ArgumentBindingStorage, ArgumentsObjectKind, Function, FunctionCode, FunctionCodeBuilder, Op,
-    Operand, SpanEntry, VerifiedBytecodeModule, VerifiedFunction,
+    Operand, SpanEntry, VerifiedFunction,
     encoding::measure_wordcode_function,
 };
 use otter_resource::{ResourceAccount, ResourceClass, ResourceError, ResourceLease};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use code_block_cfg::CodeBlockControlFlow;
 
 pub(crate) const NO_PROPERTY_IC_SITE: u32 = u32::MAX;
 
-/// Transient builder for [`ExecutableModule`].
-///
-/// The builder owns dense IC-site assignment while the VM creates an
-/// [`crate::ExecutionContext`]. Dispatch receives only the frozen
-/// [`ExecutableModule`] produced by [`Self::freeze`].
-#[derive(Debug)]
-pub(crate) struct ExecutableModuleBuilder {
-    functions: Vec<Arc<CodeBlock>>,
-    next_property_ic_site: u32,
-    table_lease: ResourceLease,
-}
-
-impl ExecutableModuleBuilder {
-    /// Build a transient executable view from the compiler/debug module DTO.
-    #[cfg(test)]
-    #[must_use]
-    pub(crate) fn from_bytecode(module: &otter_bytecode::BytecodeModule) -> Self {
-        let verified = VerifiedBytecodeModule::new(module.clone())
-            .expect("executable test fixture must be valid bytecode");
-        Self::from_verified_bytecode_with_ic_base(&verified, 0, &ResourceAccount::default())
-            .expect("admit executable fixture")
-    }
-
-    /// Build a transient executable view from a retained admission proof.
-    /// Dense property-IC site ids start at `property_ic_base`, keeping sites
-    /// globally unique across chunks linked into one interpreter.
-    #[must_use]
-    pub(crate) fn from_verified_bytecode_with_ic_base(
-        verified: &VerifiedBytecodeModule,
-        property_ic_base: u32,
-        account: &ResourceAccount,
-    ) -> Result<Self, ResourceError> {
-        let module = verified.module();
-        let mut table_lease = account.reserve_exact(
-            ResourceClass::SourceModuleBytes,
-            (std::mem::size_of::<ExecutableModule>() as u64).saturating_add(
-                allocation::array_bytes::<Arc<CodeBlock>>(module.functions.len()),
-            ),
-        )?;
-        let functions = allocation::try_vec(module.functions.len(), &mut table_lease)?;
-        let mut builder = Self {
-            functions,
-            next_property_ic_site: property_ic_base,
-            table_lease,
-        };
-        for (index, function) in module.functions.iter().enumerate() {
-            let proof = verified
-                .function(index)
-                .expect("verified carrier has one proof per function");
-            builder.push_function(function, proof, &module.module, account)?;
-        }
-        Ok(builder)
-    }
-
-    fn push_function(
-        &mut self,
-        function: &Function,
-        proof: &VerifiedFunction,
-        module_url: &str,
-        account: &ResourceAccount,
-    ) -> Result<(), ResourceError> {
-        let function = Arc::new(CodeBlock::from_verified_bytecode(
-            function,
-            proof,
-            module_url,
-            &mut self.next_property_ic_site,
-            account,
-        )?);
-        self.functions.push(function);
-        Ok(())
-    }
-
-    /// Seal mutable build buffers into the VM-owned frozen execution product.
-    #[must_use]
-    pub(crate) fn freeze(self) -> Result<ExecutableModule, ResourceError> {
-        let functions = self.functions.into_boxed_slice();
-        let mut lease = self.table_lease;
-        lease.resize(
-            (std::mem::size_of::<ExecutableModule>() as u64)
-                .saturating_add(allocation::array_bytes::<Arc<CodeBlock>>(functions.len())),
-        )?;
-        Ok(ExecutableModule {
-            functions,
-            property_ic_site_end: self.next_property_ic_site,
-            _table_lease: lease,
-        })
-    }
-}
-
-/// VM-owned executable view of a bytecode module.
+/// VM-owned executable view of a bytecode module: one [`CodeBlock`] per
+/// function, verified and built the first time the function is asked for.
 #[derive(Debug)]
 pub(crate) struct ExecutableModule {
-    functions: Box<[Arc<CodeBlock>]>,
+    functions: Box<[OnceLock<Arc<CodeBlock>>]>,
+    bytecode: Arc<crate::code_space::LinkedBytecode>,
+    /// First dense property-IC site id of each function.
+    ic_bases: Box<[u32]>,
     property_ic_site_end: u32,
+    /// The account every built block's lease is charged to.
+    account: ResourceAccount,
     _table_lease: ResourceLease,
 }
 
-/// Stable directory entry mapping a globally dense method site id back to its
-/// owning CodeBlock method marker.
+/// Directory entry naming a globally dense method-call site.
 #[derive(Debug, Clone)]
-pub(crate) struct FeedbackSlotAddress {
-    code_block: Arc<CodeBlock>,
-    instruction_index: usize,
-}
+pub(crate) struct FeedbackSlotAddress;
 
 impl FeedbackSlotAddress {
     #[must_use]
     pub(crate) fn is_method(&self) -> bool {
-        self.code_block
-            .feedback
-            .is_method_slot(self.instruction_index)
+        true
     }
 }
 
+/// Whether `op` owns a dense named-property IC site.
+fn has_property_ic_site(op: Op) -> bool {
+    matches!(
+        op,
+        Op::LoadProperty | Op::StoreProperty | Op::StorePropertyStrict | Op::CallMethodValue
+    )
+}
+
 impl ExecutableModule {
-    /// Build a frozen execution view from the compiler/debug module DTO.
+    /// Build a lazy execution view from the compiler/debug module DTO.
     #[cfg(test)]
     #[must_use]
     pub(crate) fn from_bytecode(module: &otter_bytecode::BytecodeModule) -> Self {
-        ExecutableModuleBuilder::from_bytecode(module)
-            .freeze()
-            .expect("admit executable fixture table")
+        let verified = otter_bytecode::VerifiedBytecodeModule::new(module.clone())
+            .expect("executable test fixture must be valid bytecode");
+        let account = ResourceAccount::default();
+        let linked = crate::code_space::LinkedBytecode::new(verified, &account)
+            .expect("admit executable fixture bytecode");
+        Self::lazy(linked, 0, &account).expect("admit executable fixture table")
     }
 
-    /// Build a frozen execution view from a retained admission proof. Dense
-    /// property-IC site ids start at `property_ic_base`.
-    #[must_use]
-    pub(crate) fn from_verified_bytecode_with_ic_base(
-        verified: &VerifiedBytecodeModule,
+    /// The execution view of an admitted module whose dense property-IC
+    /// site ids start at `property_ic_base`. Every function's sites are
+    /// counted now, so ids stay stable however the functions are built.
+    pub(crate) fn lazy(
+        bytecode: Arc<crate::code_space::LinkedBytecode>,
         property_ic_base: u32,
         account: &ResourceAccount,
     ) -> Result<Self, ResourceError> {
-        ExecutableModuleBuilder::from_verified_bytecode_with_ic_base(
-            verified,
-            property_ic_base,
-            account,
-        )?
-        .freeze()
+        let count = bytecode.functions.len();
+        let table_lease = account.reserve_exact(
+            ResourceClass::SourceModuleBytes,
+            (std::mem::size_of::<ExecutableModule>() as u64)
+                .saturating_add(allocation::array_bytes::<OnceLock<Arc<CodeBlock>>>(count))
+                .saturating_add(allocation::array_bytes::<u32>(count)),
+        )?;
+        let mut next = property_ic_base;
+        let ic_bases = bytecode
+            .functions
+            .iter()
+            .map(|function| {
+                let base = next;
+                let sites = function
+                    .code
+                    .iter()
+                    .filter(|instruction| has_property_ic_site(instruction.op))
+                    .count();
+                next = next
+                    .checked_add(u32::try_from(sites).expect("property IC sites exceed u32"))
+                    .expect("property IC site table exceeds u32");
+                base
+            })
+            .collect();
+        Ok(Self {
+            functions: (0..count).map(|_| OnceLock::new()).collect(),
+            bytecode,
+            ic_bases,
+            property_ic_site_end: next,
+            account: account.clone(),
+            _table_lease: table_lease,
+        })
     }
 
-    /// Function-table lookup by chunk-local function index.
+    /// Function-table lookup by chunk-local function index, building the
+    /// function's CodeBlock on first use. `None` for a missing index or a
+    /// function that fails verification or admission.
     #[must_use]
     pub(crate) fn function(&self, local_index: u32) -> Option<&CodeBlock> {
-        self.functions.get(local_index as usize).map(Arc::as_ref)
+        self.function_slot(local_index).map(Arc::as_ref)
     }
 
     /// Shared immutable CodeBlock handle for native compilation.
     #[must_use]
     pub(crate) fn function_arc(&self, local_index: u32) -> Option<Arc<CodeBlock>> {
-        self.functions.get(local_index as usize).cloned()
+        self.function_slot(local_index).cloned()
+    }
+
+    fn function_slot(&self, local_index: u32) -> Option<&Arc<CodeBlock>> {
+        let slot = self.functions.get(local_index as usize)?;
+        if let Some(block) = slot.get() {
+            return Some(block);
+        }
+        let index = local_index as usize;
+        let proof = self.bytecode.verified().function(index).ok()?;
+        let mut site = self.ic_bases[index];
+        let block = CodeBlock::from_verified_bytecode(
+            &self.bytecode.functions[index],
+            proof,
+            &self.bytecode.module,
+            &mut site,
+            &self.account,
+        )
+        .ok()?;
+        Some(slot.get_or_init(|| Arc::new(block)))
+    }
+
+    /// The CodeBlocks built so far.
+    fn built(&self) -> impl Iterator<Item = &Arc<CodeBlock>> {
+        self.functions.iter().filter_map(OnceLock::get)
     }
 
     /// One past the highest dense named-property IC site id in this
@@ -225,31 +202,27 @@ impl ExecutableModule {
     /// allocations. A block/counter keeps its charge after this table drops.
     #[must_use]
     pub(crate) fn retained_bytes(&self) -> u64 {
-        self.functions
-            .iter()
-            .fold(self._table_lease.amount(), |total, block| {
-                total
-                    .saturating_add(block._lease.amount())
-                    .saturating_add(block.source_work.retained_bytes())
-            })
+        self.built().fold(self._table_lease.amount(), |total, block| {
+            total
+                .saturating_add(block._lease.amount())
+                .saturating_add(block.source_work.retained_bytes())
+        })
     }
 
-    /// Build directory entries for method sites in this chunk.
+    /// Directory entries for the method-call sites in this chunk, read off
+    /// the bytecode so no function has to be built.
     pub(crate) fn feedback_slot_addresses(&self) -> Vec<(usize, FeedbackSlotAddress)> {
         let mut slots = Vec::new();
-        for code_block in &self.functions {
-            for (instruction_index, instruction) in code_block.code.iter().enumerate() {
-                if code_block.op(instruction) == Op::CallMethodValue
-                    && let Some(site) = instruction.property_ic_site()
-                {
-                    slots.push((
-                        site,
-                        FeedbackSlotAddress {
-                            code_block: Arc::clone(code_block),
-                            instruction_index,
-                        },
-                    ));
+        for (function, &base) in self.bytecode.functions.iter().zip(&*self.ic_bases) {
+            let mut site = base as usize;
+            for instruction in function.code.iter() {
+                if !has_property_ic_site(instruction.op) {
+                    continue;
                 }
+                if instruction.op == Op::CallMethodValue {
+                    slots.push((site, FeedbackSlotAddress));
+                }
+                site += 1;
             }
         }
         slots
@@ -257,14 +230,14 @@ impl ExecutableModule {
 
     /// Full-collector weak pass over every property IC of these functions.
     pub(crate) fn sweep_property_ics(&self, heap: &otter_gc::GcHeap) {
-        for code_block in &self.functions {
+        for code_block in self.built() {
             code_block.feedback.sweep_property_ics(heap);
         }
     }
 
     pub(crate) fn property_ic_stats(&self) -> crate::property_ic::PropertyIcStats {
         let mut total = crate::property_ic::PropertyIcStats::default();
-        for code_block in &self.functions {
+        for code_block in self.built() {
             total.add(code_block.feedback.property_stats());
         }
         total
@@ -275,15 +248,14 @@ impl ExecutableModule {
         &self,
         kind: crate::property_ic::PropertyIcKind,
     ) -> usize {
-        self.functions
-            .iter()
+        self.built()
             .map(|code_block| code_block.feedback.polymorphic_property_count(kind))
             .sum()
     }
 
     pub(crate) fn property_ic_snapshots(&self) -> Vec<crate::inspect::IcSiteSnapshot> {
         let mut out = Vec::new();
-        for code_block in &self.functions {
+        for code_block in self.built() {
             for (instruction_index, instruction) in code_block.code.iter().enumerate() {
                 let Some(site) = instruction.property_ic_site() else {
                     continue;
@@ -1152,9 +1124,9 @@ pub struct CodeBlock {
     /// `true` when this function body contains an `Op::MakeFunction` or
     /// `Op::MakeClosure`.
     pub(crate) makes_function: bool,
-    /// Whether an activation's `this` binding is observable: the body reads
-    /// it (`LoadThis`), creates a closure (an arrow captures it) or holds a
-    /// direct eval. Generated callers skip receiver conversion otherwise.
+    /// Whether an activation's `this` binding is observable: the bytecode
+    /// does not declare it ignored ([`Function::ignores_this`], checked
+    /// against the body). Callers skip receiver conversion otherwise.
     pub(crate) observes_this: bool,
     /// `true` when this function body needs an `arguments` object.
     pub(crate) needs_arguments: bool,
@@ -1216,6 +1188,51 @@ pub struct CodeBlock {
     _lease: ResourceLease,
 }
 
+/// `FUNCTION_CALL_*` bits of an admitted bytecode function: exactly the
+/// bits [`CodeBlock::call_flags`] reports once its body is built, so module
+/// linking publishes them without building it.
+pub(crate) fn bytecode_call_flags(function: &Function) -> u32 {
+    call_flags(
+        function.is_strict,
+        function.is_arrow,
+        function.is_method,
+        !function.ignores_this,
+        function.is_derived_constructor,
+        function.is_async || function.is_generator || function.is_async_generator,
+    )
+}
+
+const fn call_flags(
+    is_strict: bool,
+    is_arrow: bool,
+    is_method: bool,
+    observes_this: bool,
+    is_derived_constructor: bool,
+    suspendable: bool,
+) -> u32 {
+    use crate::native_abi::{
+        FUNCTION_CALL_CONSTRUCTIBLE, FUNCTION_CALL_DERIVED_CONSTRUCTOR, FUNCTION_CALL_LEXICAL_THIS,
+        FUNCTION_CALL_NO_RECEIVER_CONVERSION, FUNCTION_CALL_SUSPENDABLE,
+    };
+    let mut flags = 0;
+    if is_strict || is_arrow || !observes_this {
+        flags |= FUNCTION_CALL_NO_RECEIVER_CONVERSION;
+    }
+    if is_derived_constructor {
+        flags |= FUNCTION_CALL_DERIVED_CONSTRUCTOR;
+    }
+    if !is_arrow && !is_method && !suspendable {
+        flags |= FUNCTION_CALL_CONSTRUCTIBLE;
+    }
+    if suspendable {
+        flags |= FUNCTION_CALL_SUSPENDABLE;
+    }
+    if is_arrow {
+        flags |= FUNCTION_CALL_LEXICAL_THIS;
+    }
+    flags
+}
+
 impl CodeBlock {
     /// Immutable call flags of this function, the `FUNCTION_CALL_*` bits
     /// its [`crate::native_abi::FunctionEntryCell`] publishes: receiver
@@ -1224,29 +1241,14 @@ impl CodeBlock {
     /// The call trampoline and every generated call entry bind by these bits.
     #[must_use]
     pub fn call_flags(&self) -> u32 {
-        use crate::native_abi::{
-            FUNCTION_CALL_CONSTRUCTIBLE, FUNCTION_CALL_DERIVED_CONSTRUCTOR,
-            FUNCTION_CALL_LEXICAL_THIS, FUNCTION_CALL_NO_RECEIVER_CONVERSION,
-            FUNCTION_CALL_SUSPENDABLE,
-        };
-        let suspendable = self.is_async || self.is_generator || self.is_async_generator;
-        let mut flags = 0;
-        if self.is_strict || self.is_arrow || !self.observes_this {
-            flags |= FUNCTION_CALL_NO_RECEIVER_CONVERSION;
-        }
-        if self.is_derived_constructor {
-            flags |= FUNCTION_CALL_DERIVED_CONSTRUCTOR;
-        }
-        if !self.is_arrow && !self.is_method && !suspendable {
-            flags |= FUNCTION_CALL_CONSTRUCTIBLE;
-        }
-        if suspendable {
-            flags |= FUNCTION_CALL_SUSPENDABLE;
-        }
-        if self.is_arrow {
-            flags |= FUNCTION_CALL_LEXICAL_THIS;
-        }
-        flags
+        call_flags(
+            self.is_strict,
+            self.is_arrow,
+            self.is_method,
+            self.observes_this,
+            self.is_derived_constructor,
+            self.is_async || self.is_generator || self.is_async_generator,
+        )
     }
 
     fn from_verified_bytecode(
@@ -1319,18 +1321,14 @@ impl CodeBlock {
         let mut overflow_operand_words = allocation::try_vec(overflow_count, &mut lease)?;
         let mut code = allocation::try_vec(count, &mut lease)?;
         for (idx, instruction) in function.code.iter().enumerate() {
-            let property_ic_site = match instruction.op {
-                Op::LoadProperty
-                | Op::StoreProperty
-                | Op::StorePropertyStrict
-                | Op::CallMethodValue => {
-                    let site = *next_property_ic_site;
-                    *next_property_ic_site = next_property_ic_site
-                        .checked_add(1)
-                        .expect("property IC site table exceeds u32");
-                    site
-                }
-                _ => NO_PROPERTY_IC_SITE,
+            let property_ic_site = if has_property_ic_site(instruction.op) {
+                let site = *next_property_ic_site;
+                *next_property_ic_site = next_property_ic_site
+                    .checked_add(1)
+                    .expect("property IC site table exceeds u32");
+                site
+            } else {
+                NO_PROPERTY_IC_SITE
             };
             code.push(CodeBlockInstruction::from_wordcode(
                 &function.code,
@@ -1396,9 +1394,7 @@ impl CodeBlock {
             .code
             .iter()
             .any(|instr| matches!(instr.op, Op::MakeFunction | Op::MakeClosure));
-        let observes_this = makes_function
-            || function.contains_direct_eval
-            || function.code.iter().any(|instr| instr.op == Op::LoadThis);
+        let observes_this = !function.ignores_this;
         let mut body = Self {
             _lease: lease,
             id: function.id,
@@ -1966,10 +1962,11 @@ mod tests {
         let module = module(function);
 
         let executable = ExecutableModule::from_bytecode(&module);
-        let view = executable.functions[0].jit_compile_snapshot();
+        let block = executable.function_arc(0).unwrap();
+        let view = block.jit_compile_snapshot();
 
         assert_eq!(view.code_block.id, 0);
-        assert!(Arc::ptr_eq(&view.code_block, &executable.functions[0]));
+        assert!(Arc::ptr_eq(&view.code_block, &block));
         assert_eq!(view.instructions.len(), 3);
         assert_eq!(view.instructions[0].op(&view.code_block), Op::LoadProperty);
         assert_eq!(view.instructions[0].byte_pc, 0);
@@ -1994,7 +1991,7 @@ mod tests {
         );
         assert!(std::ptr::eq::<CodeBlockInstruction>(
             view.instructions[0].resolve(&view.code_block),
-            &executable.functions[0].code[0]
+            &block.code[0]
         ));
     }
 
@@ -2023,11 +2020,9 @@ mod tests {
         ]);
         let module = module(function);
 
-        let builder = ExecutableModuleBuilder::from_bytecode(&module);
-        assert_eq!(builder.functions.len(), 1);
-        assert_eq!(builder.next_property_ic_site, 1);
-
-        let executable = builder.freeze().unwrap();
+        let executable = ExecutableModule::from_bytecode(&module);
+        assert_eq!(executable.functions.len(), 1);
+        assert!(executable.functions[0].get().is_none(), "built on first use");
         let exec_fn = executable.function(0).unwrap();
         assert_eq!(exec_fn.code.len(), 3);
         assert_eq!(executable.property_ic_site_end(), 1);

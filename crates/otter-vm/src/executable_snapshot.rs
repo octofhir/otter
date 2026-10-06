@@ -15,27 +15,34 @@
 
 use super::{CodeBlock, ExecutableModule, allocation};
 use otter_resource::{ResourceAccount, ResourceClass, ResourceError};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 impl ExecutableModule {
     pub(crate) fn fresh_isolate_copy(
         &self,
         account: &ResourceAccount,
     ) -> Result<Self, ResourceError> {
-        let mut table_lease =
+        let table_lease =
             account.reserve_exact(ResourceClass::SourceModuleBytes, self._table_lease.amount())?;
-        let mut functions = allocation::try_vec(self.functions.len(), &mut table_lease)?;
-        for function in &self.functions {
-            functions.push(Arc::new(function.fresh_isolate_copy(account)?));
-        }
-        let functions = functions.into_boxed_slice();
-        table_lease.resize(
-            (std::mem::size_of::<Self>() as u64)
-                .saturating_add(allocation::array_bytes::<Arc<CodeBlock>>(functions.len())),
-        )?;
+        // Blocks the donor built are copied; the rest stay unbuilt and build
+        // from the shared bytecode on this isolate's account.
+        let functions = self
+            .functions
+            .iter()
+            .map(|slot| -> Result<OnceLock<Arc<CodeBlock>>, ResourceError> {
+                let copy = OnceLock::new();
+                if let Some(block) = slot.get() {
+                    let _ = copy.set(Arc::new(block.fresh_isolate_copy(account)?));
+                }
+                Ok(copy)
+            })
+            .collect::<Result<Box<[_]>, _>>()?;
         Ok(Self {
             functions,
+            bytecode: Arc::clone(&self.bytecode),
+            ic_bases: self.ic_bases.clone(),
             property_ic_site_end: self.property_ic_site_end,
+            account: account.clone(),
             _table_lease: table_lease,
         })
     }

@@ -1106,9 +1106,14 @@ fn assert_admission_holds(seed: &str, mutation: &str, bytes: &[u8]) {
     let Ok(module) = decoded else {
         return;
     };
-    otter_bytecode::verify_module_at_base(module.module(), module.function_base()).unwrap_or_else(
-        |error| panic!("{seed}: admitted an unverifiable module on {mutation}: {error}"),
-    );
+    // A function's proof is established when it is first asked for; the
+    // boundary holds when no proof is handed out for an unverifiable module.
+    if (0..module.module().functions.len()).all(|function| module.function(function).is_ok()) {
+        otter_bytecode::verify_module_at_base(module.module(), module.function_base())
+            .unwrap_or_else(|error| {
+                panic!("{seed}: admitted an unverifiable module on {mutation}: {error}")
+            });
+    }
 }
 
 #[test]
@@ -1462,10 +1467,15 @@ fn structural_mutations_are_typed_rejections() {
         let bytes = encode_module(&module);
         let decoded = std::panic::catch_unwind(|| decode_module(&bytes))
             .unwrap_or_else(|_| panic!("{name}: decoder panicked"));
-        assert!(
-            matches!(decoded, Err(ModuleDecodeError::Verify(_))),
-            "{name}: expected a typed verification rejection"
-        );
+        // Module-level records reject at decode; a function body rejects
+        // when its proof is first asked for.
+        let rejected = match decoded {
+            Err(ModuleDecodeError::Verify(_)) => true,
+            Ok(module) => (0..module.module().functions.len())
+                .any(|function| module.function(function).is_err()),
+            Err(_) => false,
+        };
+        assert!(rejected, "{name}: expected a typed verification rejection");
     }
 }
 

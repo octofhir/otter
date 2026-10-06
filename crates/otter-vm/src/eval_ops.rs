@@ -155,6 +155,7 @@ impl Interpreter {
                     super_call_allowed,
                     function_constructor: false,
                     embedded: None,
+                    commonjs_file: false,
                 },
                 ctx_reg,
                 in_class_field_initializer,
@@ -471,7 +472,11 @@ impl Interpreter {
         let (compiled, sources) = match body {
             CommonJsBody::File(body) => {
                 let source = otter_bytecode::commonjs::wrapper_source(body);
-                let compiled = self.compile_eval_source(&source, EvalCompileOptions::default())?;
+                let options = EvalCompileOptions {
+                    commonjs_file: true,
+                    ..EvalCompileOptions::default()
+                };
+                let compiled = self.compile_eval_source(&source, options)?;
                 let text = otter_resource::SharedSource::admit(&self.resource_account, source)
                     .map_err(|error| self.err_owned_source(error))?;
                 let sources = crate::source_registry::SourceRegistry::with_prologue(
@@ -689,7 +694,8 @@ pub struct EmbeddedCommonJs {
     pub url: &'static str,
     /// The complete wrapper text the bytecode was compiled from.
     pub source: &'static str,
-    /// Current-codec module compiled from `source`.
+    /// Current-codec module the product build compiled from `source` and
+    /// verified; it is decoded without repeating the verifier.
     pub bytecode: &'static [u8],
 }
 

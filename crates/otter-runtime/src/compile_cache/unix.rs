@@ -58,6 +58,7 @@ pub(super) fn load(root: &Path, key: &CompileCacheKey) -> Option<Vec<u8>> {
 pub(super) fn store(
     root_path: &Path,
     policy: CompileCachePolicy,
+    estimate: &std::sync::Mutex<Option<CacheSize>>,
     key: &CompileCacheKey,
     bytes: &[u8],
 ) {
@@ -77,8 +78,25 @@ pub(super) fn store(
     let Some(_lock) = RootLock::acquire(&root) else {
         return;
     };
-    if scan_and_prune(&root, policy, key, stored_bytes).is_none() {
-        return;
+    // The tree is scanned and pruned when this process first publishes and
+    // again whenever its running size would cross a quota; in between, each
+    // publication only adds to that size. Other processes publish
+    // cooperatively, so the size is an estimate the next scan corrects.
+    let mut estimate = estimate
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    match estimate.as_mut() {
+        Some(size)
+            if size.bytes.saturating_add(stored_bytes) <= policy.max_bytes
+                && size.entries < policy.max_entries =>
+        {
+            size.bytes += stored_bytes;
+            size.entries += 1;
+        }
+        _ => match scan_and_prune(&root, policy, key, stored_bytes) {
+            Some(size) => *estimate = Some(size),
+            None => return,
+        },
     }
 
     let (prefix, suffix) = split_key(key);
@@ -295,7 +313,7 @@ impl Drop for TemporaryEntry<'_> {
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-struct CacheSize {
+pub(super) struct CacheSize {
     bytes: u64,
     entries: usize,
 }
@@ -550,9 +568,11 @@ mod tests {
         let key = key("globalThis.x = 41 + 1;");
         let module = compiled("globalThis.x = 41 + 1;");
 
-        assert!(cache.load(&key).is_none());
+        assert!(cache.load(&key, "").is_none());
         cache.store(&key, &module);
-        let restored = cache.load(&key).expect("stored module");
+        let restored = cache
+            .load(&key, "globalThis.x = 41 + 1;")
+            .expect("stored module");
         assert_eq!(
             otter_bytecode::dump::to_json_pretty(restored.module()).unwrap(),
             otter_bytecode::dump::to_json_pretty(&module).unwrap()
@@ -607,7 +627,7 @@ mod tests {
         let cache = CompileCache::new(root.path());
         let key = key("1 + 1");
         cache.store(&key, &compiled("1 + 1"));
-        assert!(cache.load(&key).is_none());
+        assert!(cache.load(&key, "").is_none());
         assert!(!cache.entry_path(&key).exists());
     }
 
@@ -622,7 +642,7 @@ mod tests {
 
         cache.store(&key, &compiled("1 + 1"));
 
-        assert!(cache.load(&key).is_none());
+        assert!(cache.load(&key, "").is_none());
         assert!(std::fs::read_dir(outside.path()).unwrap().next().is_none());
         assert!(
             std::fs::symlink_metadata(root)
@@ -646,7 +666,7 @@ mod tests {
 
         cache.store(&key, &compiled("1 + 1"));
 
-        assert!(cache.load(&key).is_none());
+        assert!(cache.load(&key, "").is_none());
         assert_eq!(std::fs::read(&outside_lock).unwrap(), b"outside lock");
         let after = std::fs::metadata(&outside_lock).unwrap();
         assert_eq!(after.len(), before.len());
@@ -670,8 +690,8 @@ mod tests {
         first.store(&first_key, &compiled("globalThis.x = 1"));
         second.store(&second_key, &compiled("globalThis.x = 2"));
 
-        assert!(first.load(&first_key).is_none());
-        assert!(second.load(&second_key).is_some());
+        assert!(first.load(&first_key, "").is_none());
+        assert!(second.load(&second_key, "").is_some());
     }
 
     #[test]
@@ -687,7 +707,7 @@ mod tests {
         );
         let key = key("byte quota");
         cache.store(&key, &compiled("1 + 1"));
-        assert!(cache.load(&key).is_none());
+        assert!(cache.load(&key, "").is_none());
     }
 
     #[test]
@@ -707,7 +727,7 @@ mod tests {
         );
         let key = key("bounded scan");
         cache.store(&key, &compiled("1 + 1"));
-        assert!(cache.load(&key).is_none());
+        assert!(cache.load(&key, "").is_none());
     }
 
     #[test]
@@ -727,7 +747,7 @@ mod tests {
 
         assert!(!stale.exists());
         assert_eq!(std::fs::read(near_miss).unwrap(), b"keep");
-        assert!(cache.load(&key).is_some());
+        assert!(cache.load(&key, "").is_some());
     }
 
     #[test]
@@ -759,11 +779,11 @@ mod tests {
         let key = key("locked");
 
         second.store(&key, &compiled("1 + 1"));
-        assert!(first.load(&key).is_none());
+        assert!(first.load(&key, "").is_none());
         drop(child.stdin.take().expect("child stdin"));
         assert!(child.wait().expect("lock holder exits").success());
         second.store(&key, &compiled("1 + 1"));
-        assert!(first.load(&key).is_some());
+        assert!(first.load(&key, "").is_some());
     }
 
     #[test]
@@ -790,7 +810,7 @@ mod tests {
         let path = cache.entry_path(&key);
         private_directory(path.parent().unwrap());
         nix::unistd::mkfifo(&path, Mode::S_IRUSR | Mode::S_IWUSR).unwrap();
-        assert!(cache.load(&key).is_none());
+        assert!(cache.load(&key, "").is_none());
     }
 
     #[test]
@@ -805,7 +825,7 @@ mod tests {
         private_file(&target, b"not cache data");
         symlink(&target, &path).unwrap();
 
-        assert!(cache.load(&key).is_none());
+        assert!(cache.load(&key, "").is_none());
         assert_eq!(std::fs::read(target).unwrap(), b"not cache data");
     }
 
@@ -830,7 +850,7 @@ mod tests {
                 .file_type()
                 .is_symlink()
         );
-        assert!(cache.load(&key).is_some());
+        assert!(cache.load(&key, "").is_some());
     }
 
     #[test]
@@ -850,7 +870,7 @@ mod tests {
 
         assert!(!poisoned_path.exists());
         assert_eq!(std::fs::read(target).unwrap(), b"outside");
-        assert!(cache.load(&key).is_some());
+        assert!(cache.load(&key, "").is_some());
     }
 
     #[test]
@@ -863,7 +883,7 @@ mod tests {
 
         cache.store(&key, &compiled("1 + 1"));
 
-        assert!(cache.load(&key).is_none());
+        assert!(cache.load(&key, "").is_none());
         assert!(std::fs::read_dir(outside.path()).unwrap().next().is_none());
     }
 
@@ -923,7 +943,7 @@ mod tests {
             .modified()
             .unwrap();
 
-        assert!(cache.load(&linked_key).is_none());
+        assert!(cache.load(&linked_key, "").is_none());
         let stored_key = fixed_key('b');
         cache.store(&stored_key, &compiled("1 + 1"));
 
@@ -936,7 +956,7 @@ mod tests {
                 .unwrap(),
             before
         );
-        assert!(cache.load(&stored_key).is_some());
+        assert!(cache.load(&stored_key, "").is_some());
     }
 
     #[test]
@@ -947,7 +967,7 @@ mod tests {
         let corrupt_path = cache.entry_path(&corrupt);
         private_directory(corrupt_path.parent().unwrap());
         private_file(&corrupt_path, b"not bytecode");
-        assert!(cache.load(&corrupt).is_none());
+        assert!(cache.load(&corrupt, "").is_none());
 
         let oversized = fixed_key('b');
         let oversized_path = cache.entry_path(&oversized);
@@ -960,7 +980,7 @@ mod tests {
             .unwrap();
         file.set_len(MAX_COMPILE_CACHE_ENTRY_BYTES as u64 + 1)
             .unwrap();
-        assert!(cache.load(&oversized).is_none());
+        assert!(cache.load(&oversized, "").is_none());
     }
 
     #[test]
@@ -968,6 +988,6 @@ mod tests {
         let cache = CompileCache::new("/proc/nonexistent-otter-cache");
         let key = key("unwritable");
         cache.store(&key, &compiled("1 + 1"));
-        assert!(cache.load(&key).is_none());
+        assert!(cache.load(&key, "").is_none());
     }
 }

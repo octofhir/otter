@@ -31,7 +31,8 @@ use otter_vm::{ExecutionContext, Interpreter};
 pub struct ExtensionJs {
     /// Complete original source, including separators between constituent files.
     pub source: &'static str,
-    /// Current-codec bytecode emitted from that exact source.
+    /// Current-codec bytecode the product build emitted from that exact source
+    /// and verified; it is decoded without repeating the verifier.
     pub bytecode: &'static [u8],
     /// Global names defined by the bundle, in declaration order.
     pub defines: &'static [&'static str],
@@ -59,7 +60,8 @@ pub(crate) fn prepare(
         let context = interp.link_module(compiled.bytecode, sources)?;
         return Ok((context, compiled.metadata));
     }
-    let mut verified = otter_bytecode::binary::decode_module(script.bytecode).map_err(|error| {
+    // The build verified these exact bytes; they are part of the binary.
+    let mut verified = otter_bytecode::binary::decode_build_artifact(script.bytecode).map_err(|error| {
         OtterError::Internal {
             code: DiagnosticCode::GlobalClassBootstrap.as_str().to_owned(),
             message: format!("invalid static extension bytecode: {error}"),

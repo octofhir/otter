@@ -62,6 +62,11 @@ impl Instruction {
         }
     }
 
+    /// The overflow offset of a record whose operands are all inline.
+    pub(crate) const fn inline_offset() -> u32 {
+        NO_OVERFLOW_OPERANDS
+    }
+
     /// The words a flat encoding stores, in the order it stores them.
     pub(crate) const fn raw_parts(self) -> (Op, u8, [u32; INLINE_OPERAND_WORDS], u32) {
         (

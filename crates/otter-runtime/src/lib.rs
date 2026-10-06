@@ -1805,6 +1805,9 @@ fn standard_eval_hook(
         if let Some(unit) = options.embedded {
             return embedded_commonjs_module(unit, compile_hook.as_deref());
         }
+        if options.commonjs_file && compile_hook.is_none() {
+            return commonjs_file_module(source, &options);
+        }
         // §16.1.6 ScriptEvaluation — host-requested script
         // execution ($262.evalScript) compiles under script
         // GDI semantics, not eval semantics.
@@ -1844,9 +1847,34 @@ fn embedded_commonjs_module(
             })
             .map_err(|error| error.to_string());
     }
-    otter_bytecode::binary::decode_module(unit.bytecode)
+    // The build verified these exact bytes; they are part of the binary.
+    otter_bytecode::binary::decode_build_artifact(unit.bytecode)
         .map(otter_vm::CompiledEvalSource::Verified)
         .map_err(|error| format!("invalid embedded bytecode for '{}': {error}", unit.url))
+}
+
+/// A file module's CommonJS wrapper: a compile kept from an earlier run of
+/// the same text when the compile cache holds one, else a fresh compile that
+/// is kept for the next run. Package code is loaded again on every launch, so
+/// unlike one-off scripts its entries are read back.
+fn commonjs_file_module(
+    source: &str,
+    options: &EvalCompileOptions,
+) -> Result<otter_vm::CompiledEvalSource, String> {
+    let cache = compile_cache::CompileCache::user_default();
+    let key = cache
+        .as_ref()
+        .map(|_| compile_cache::cache_key(source, SourceKind::JavaScript, "<commonjs>"));
+    if let (Some(cache), Some(key)) = (&cache, &key)
+        && let Some(verified) = cache.load(key, source)
+    {
+        return Ok(otter_vm::CompiledEvalSource::Verified(verified));
+    }
+    let module = compile_eval_with_options(source, options).map_err(compile_error_message)?;
+    if let (Some(cache), Some(key)) = (&cache, &key) {
+        cache.store(key, &module);
+    }
+    Ok(otter_vm::CompiledEvalSource::Fresh(module))
 }
 
 /// Compile eval-goal `source` the way the VM's compile requests ask for it.
@@ -5672,7 +5700,7 @@ impl Runtime {
             .as_ref()
             .map(|_| compile_cache::cache_key(&source.text, source.kind, &specifier));
         if let (Some(cache), Some(key)) = (&cache, &key)
-            && let Some(bytecode) = cache.load(key)
+            && let Some(bytecode) = cache.load(key, &source.text)
             && let Ok(metadata) = CompiledModuleMetadata::span_only_from_bytecode_with_budget(
                 bytecode.module(),
                 metadata_budget,
@@ -7992,7 +8020,7 @@ mod tests {
         let seed = compile_script_source_to_module(source, SourceKind::JavaScript, &specifier)
             .expect("default compiler seed");
         cache.store(&key, &seed.bytecode);
-        assert!(cache.load(&key).is_some());
+        assert!(cache.load(&key, "").is_some());
 
         for marker in [1_u32, 2] {
             let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -8017,7 +8045,7 @@ mod tests {
             assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 1);
         }
 
-        let retained = cache.load(&key).expect("default cache entry remains");
+        let retained = cache.load(&key, "").expect("default cache entry remains");
         assert_eq!(
             otter_bytecode::binary::encode_module(retained.module()),
             otter_bytecode::binary::encode_module(&seed.bytecode)
@@ -8037,7 +8065,7 @@ mod tests {
         let mut cold = Runtime::builder().build().expect("cold runtime");
         cold.run_bootstrap_script_with_cache(name, source, Some(cache.clone()))
             .expect("cold bootstrap");
-        assert!(cache.load(&key).is_some());
+        assert!(cache.load(&key, "").is_some());
         let cold_maps = cold.source_maps.by_module_url.borrow().clone();
         let functions = cold_maps.get(&specifier).expect("cold source map");
         let (&function_id, spans) = functions
@@ -8085,7 +8113,7 @@ mod tests {
         .expect("hostile cache seed compiles");
         hostile.bytecode.functions[0].name = "cached".repeat(1_024);
         cache.store(&key, &hostile.bytecode);
-        assert!(cache.load(&key).is_some());
+        assert!(cache.load(&key, "").is_some());
 
         let mut expected = Runtime::builder().build().expect("reference runtime");
         expected

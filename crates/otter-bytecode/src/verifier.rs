@@ -44,7 +44,8 @@
 //! - [`crate::binary`]
 
 use crate::encoding::{
-    FunctionLayout, VerifyError, layout_wordcode_function, verify_exception_handlers,
+    FunctionLayout, VerifyError, layout_wordcode_function, measure_wordcode_function,
+    verify_exception_handlers,
 };
 use std::collections::HashSet;
 
@@ -139,6 +140,49 @@ impl VerifiedBytecodeModule {
         Ok(Self {
             module,
             function_base,
+            functions,
+        })
+    }
+
+    /// Own a module the product build compiled and fully verified, whose
+    /// encoded bytes are part of this executable. Its proofs (byte-PC layout
+    /// and register window) are measured again; the admission checks the build
+    /// already ran on these exact bytes are not repeated. Bytes read or
+    /// received at runtime must go through [`Self::new`].
+    ///
+    /// # Errors
+    /// Returns a rejection when the bytes do not even have a measurable shape.
+    pub fn from_build_artifact(module: BytecodeModule) -> Result<Self, BytecodeVerifyError> {
+        let functions = module
+            .functions
+            .iter()
+            .enumerate()
+            .map(|(function_index, function)| {
+                let register_count = function
+                    .param_count
+                    .checked_add(function.locals)
+                    .and_then(|count| count.checked_add(function.scratch))
+                    .ok_or(BytecodeVerifyError::RegisterWindowOverflow {
+                        function_index,
+                        parameters: function.param_count,
+                        locals: function.locals,
+                        scratch: function.scratch,
+                    })?;
+                let layout = measure_wordcode_function(&function.code).map_err(|error| {
+                    BytecodeVerifyError::Wordcode {
+                        function_index,
+                        error,
+                    }
+                })?;
+                Ok(VerifiedFunction {
+                    layout,
+                    register_count,
+                })
+            })
+            .collect::<Result<_, _>>()?;
+        Ok(Self {
+            module,
+            function_base: 0,
             functions,
         })
     }

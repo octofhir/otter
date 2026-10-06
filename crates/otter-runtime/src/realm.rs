@@ -224,7 +224,7 @@ impl<'a> RuntimeRealmContext<'a> {
                 crate::compile_cache::cache_key(text.as_ref(), source.kind, "<realm-installer>")
             });
             if let (Some(cache), Some(key)) = (&cache, &key)
-                && let Some(bytecode) = cache.load(key)
+                && let Some(bytecode) = cache.load(key, text.as_ref())
             {
                 let sources = crate::script_source::script_sources(
                     bytecode.module(),

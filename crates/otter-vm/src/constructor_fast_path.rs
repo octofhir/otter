@@ -309,7 +309,7 @@ mod tests {
                     primordial_iteration: false,
                     ignores_this: false,
                     code: code.into(),
-                    spans: Vec::new(),
+                    spans: otter_bytecode::SpanTable::default(),
                     handlers: Vec::new(),
                     number_hint_sites: Vec::new(),
                     class_hint_sites: Vec::new(),

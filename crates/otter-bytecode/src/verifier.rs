@@ -453,6 +453,11 @@ pub enum BytecodeVerifyError {
         /// Encoded scratch count.
         scratch: u16,
     },
+    /// A function's span table does not decode to its declared entries.
+    MalformedSpans {
+        /// Owning function table index.
+        function_index: usize,
+    },
     /// A function declared `ignores_this` reads its `this` binding.
     ObservedIgnoredThis {
         /// Owning function table index.
@@ -754,6 +759,9 @@ impl std::fmt::Display for BytecodeVerifyError {
                 f,
                 "function {function_index} register window overflows u16: parameters={parameters} locals={locals} scratch={scratch}"
             ),
+            Self::MalformedSpans { function_index } => {
+                write!(f, "function {function_index} has a malformed span table")
+            }
             Self::ObservedIgnoredThis { function_index } => write!(
                 f,
                 "function {function_index} is declared to ignore `this` but reads it"
@@ -1248,6 +1256,9 @@ fn verify_function(
     verify_source_span(function_index, "function", function.span)?;
     if let Some(span) = function.source_text_span {
         verify_source_span(function_index, "source-text", span)?;
+    }
+    if !function.spans.well_formed() {
+        return Err(BytecodeVerifyError::MalformedSpans { function_index });
     }
     let mut previous_span_pc = None;
     for (span_index, span) in function.spans.iter().enumerate() {
@@ -1918,15 +1929,15 @@ mod tests {
     #[test]
     fn metadata_pc_span_and_template_shape_are_rejected() {
         let mut module = returning_module();
-        module.functions[0].spans.push(SpanEntry {
+        module.functions[0].spans = crate::SpanTable::new(&[SpanEntry {
             pc: 1,
             span: (0, 1),
-        });
+        }]);
         assert!(matches!(
             verify_module(&module),
             Err(BytecodeVerifyError::MetadataPc { .. })
         ));
-        module.functions[0].spans.clear();
+        module.functions[0].spans = crate::SpanTable::default();
         module.template_sites.push(TemplateSite {
             cooked: vec![Some("x".to_string())],
             raw: Vec::new(),

@@ -252,10 +252,10 @@ mod tests {
                     operands: vec![Operand::Register(0)],
                 }]
                 .into(),
-                spans: vec![SpanEntry {
+                spans: crate::SpanTable::new(&[SpanEntry {
                     pc: 0,
                     span: (0, 0),
-                }],
+                }]),
                 ..Function::default()
             }],
             constants: vec![],

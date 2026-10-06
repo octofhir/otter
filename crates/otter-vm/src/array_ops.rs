@@ -708,10 +708,10 @@ mod tests {
                         operands: vec![],
                     }]
                     .into(),
-                    spans: vec![SpanEntry {
+                    spans: otter_bytecode::SpanTable::new(&[SpanEntry {
                         pc: 0,
                         span: (0, 0),
-                    }],
+                    }]),
                     handlers: Vec::new(),
                     number_hint_sites: Vec::new(),
                     class_hint_sites: Vec::new(),
@@ -765,10 +765,10 @@ mod tests {
                     operands: vec![],
                 }]
                 .into(),
-                spans: vec![SpanEntry {
+                spans: otter_bytecode::SpanTable::new(&[SpanEntry {
                     pc: 0,
                     span: (0, 0),
-                }],
+                }]),
                 handlers: Vec::new(),
                 number_hint_sites: Vec::new(),
                 class_hint_sites: Vec::new(),

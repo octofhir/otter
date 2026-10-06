@@ -1069,7 +1069,7 @@ fn hosted_module_fragment(url: &str) -> BytecodeModule {
             is_module: true,
             module_url: url.to_string(),
             code: code.finish(),
-            spans: Vec::new(),
+            spans: otter_bytecode::SpanTable::default(),
             ..Default::default()
         }],
         constants: Vec::new(),
@@ -1827,7 +1827,7 @@ fn link(nodes: &BTreeMap<String, ModuleNode>, order: &[String], entry_url: &str)
     // evaluation root, awaited when the graph evaluates async.
     let entry_body = build_entry_body(nodes, order, entry_url, &mut constants);
     functions[0].code = entry_body.code;
-    functions[0].spans = entry_body.spans;
+    functions[0].spans = otter_bytecode::SpanTable::new(&entry_body.spans);
     functions[0].locals = 0;
     functions[0].scratch = entry_body.scratch;
     functions[0].param_count = 0;

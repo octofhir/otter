@@ -177,10 +177,10 @@ fn seed_rich() -> BytecodeModule {
                 locals: 3,
                 code: outer.finish(),
                 module_url: "file:///rich.js".to_string(),
-                spans: vec![SpanEntry {
+                spans: otter_bytecode::SpanTable::new(&[SpanEntry {
                     pc: 0,
                     span: (0, 4),
-                }],
+                }]),
                 number_hint_sites: vec![1],
                 class_hint_sites: vec![ClassHintSite {
                     pc: 3,
@@ -1269,7 +1269,9 @@ fn structural_mutations_are_typed_rejections() {
     };
     let out_of_range_span = {
         let mut module = seed_rich();
-        module.functions[0].spans[0].pc = 4_000;
+        let mut spans: Vec<_> = module.functions[0].spans.iter().collect();
+        spans[0].pc = 4_000;
+        module.functions[0].spans = otter_bytecode::SpanTable::new(&spans);
         module
     };
     let closure_context_out_of_window = {

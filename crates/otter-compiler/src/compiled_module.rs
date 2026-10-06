@@ -431,7 +431,7 @@ fn compiled_spans_from_bytecode(
                 requested_bytes: materialized_bytes,
             }
         })?;
-        spans.extend_from_slice(&function.spans);
+        spans.extend(function.spans.iter());
         function_spans.push(CompiledFunctionSpans {
             function_id: function.id,
             function_name: try_clone_metadata_string(&function.name, materialized_bytes)?,
@@ -789,7 +789,7 @@ mod tests {
                     } else {
                         function.module_url.as_str()
                     },
-                    function.spans.as_slice(),
+                    function.spans.iter().collect::<Vec<_>>(),
                 )
             })
             .collect();
@@ -801,7 +801,7 @@ mod tests {
                     function.function_id,
                     function.function_name.as_str(),
                     function.module_url.as_str(),
-                    function.spans.as_slice(),
+                    function.spans.clone(),
                 )
             })
             .collect();

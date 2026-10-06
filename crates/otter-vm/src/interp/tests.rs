@@ -76,7 +76,7 @@ fn test_function(
         primordial_iteration: false,
         ignores_this: false,
         code: code.into(),
-        spans,
+        spans: otter_bytecode::SpanTable::new(&spans),
         handlers: Vec::new(),
         number_hint_sites: Vec::new(),
         class_hint_sites: Vec::new(),
@@ -5374,10 +5374,10 @@ fn missing_return_is_rejected_at_verification() {
         operands: vec![],
     }]
     .into();
-    module.functions[0].spans = vec![SpanEntry {
+    module.functions[0].spans = otter_bytecode::SpanTable::new(&[SpanEntry {
         pc: 0,
         span: (0, 0),
-    }];
+    }]);
     let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
     let error = interp
         .link_module(module, crate::source_registry::SourceRegistry::default())
@@ -5426,10 +5426,10 @@ fn unwind_throw_pops_frames_until_handler_or_uncaught() {
             operands: vec![],
         }]
         .into(),
-        spans: vec![SpanEntry {
+        spans: otter_bytecode::SpanTable::new(&[SpanEntry {
             pc: 0,
             span: (0, 0),
-        }],
+        }]),
         handlers: Vec::new(),
         number_hint_sites: Vec::new(),
         class_hint_sites: Vec::new(),
@@ -5507,10 +5507,10 @@ fn unwind_throw_lands_in_catch_handler() {
             operands: vec![],
         }]
         .into(),
-        spans: vec![SpanEntry {
+        spans: otter_bytecode::SpanTable::new(&[SpanEntry {
             pc: 0,
             span: (0, 0),
-        }],
+        }]),
         handlers: Vec::new(),
         number_hint_sites: Vec::new(),
         class_hint_sites: Vec::new(),
@@ -6136,10 +6136,10 @@ fn arrow_closure_overrides_call_site_this() {
             operands: vec![],
         }]
         .into(),
-        spans: vec![SpanEntry {
+        spans: otter_bytecode::SpanTable::new(&[SpanEntry {
             pc: 0,
             span: (0, 0),
-        }],
+        }]),
         handlers: Vec::new(),
         number_hint_sites: Vec::new(),
         class_hint_sites: Vec::new(),
@@ -6185,10 +6185,10 @@ fn arrow_closure_overrides_call_site_this() {
             },
         ]
         .into(),
-        spans: vec![SpanEntry {
+        spans: otter_bytecode::SpanTable::new(&[SpanEntry {
             pc: 0,
             span: (0, 0),
-        }],
+        }]),
         handlers: Vec::new(),
         number_hint_sites: Vec::new(),
         class_hint_sites: Vec::new(),

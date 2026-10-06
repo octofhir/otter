@@ -57,12 +57,14 @@ pub mod method_id;
 pub mod opcode_audit;
 pub mod opcode_schema;
 pub mod scalar_semantics;
+pub mod span_table;
 pub mod verifier;
 pub mod wordcode;
 
 pub use opcode_schema::{
     BindingStoreFallback, ContextCoord, LookupGlobalMode, LookupRefTarget, StoreRefMode,
 };
+pub use span_table::{SpanIter, SpanTable};
 pub use verifier::{
     BytecodeConstantKind, BytecodeRebaseError, BytecodeVerifyError, ScopeDescriptorDefect,
     VerifiedBytecodeModule, VerifiedFunction, verify_module, verify_module_at_base,
@@ -2090,8 +2092,8 @@ pub struct Function {
     /// lands in the first entry whose range covers `pc`.
     #[serde(default)]
     pub handlers: Vec<ExceptionHandler>,
-    /// `pc -> source span` table.
-    pub spans: Vec<SpanEntry>,
+    /// `pc -> source span` table, delta-encoded.
+    pub spans: SpanTable,
     /// Instruction PCs of arithmetic / comparison sites whose operands are
     /// both statically annotated (or provably) TypeScript `number`.
     ///
@@ -2725,10 +2727,7 @@ impl Function {
                 (self.handlers.capacity() as u64)
                     .saturating_mul(std::mem::size_of::<ExceptionHandler>() as u64),
             )
-            .saturating_add(
-                (self.spans.capacity() as u64)
-                    .saturating_mul(std::mem::size_of::<SpanEntry>() as u64),
-            )
+            .saturating_add(self.spans.retained_bytes())
             .saturating_add(
                 (self.number_hint_sites.capacity() as u64)
                     .saturating_mul(std::mem::size_of::<u32>() as u64),

@@ -12,9 +12,10 @@
 //! straight walk over the bytes into pre-sized vectors — no visitor
 //! indirection, no reallocation, no per-node dispatch. Scalars are written
 //! little-endian at a known width, except the two streams that dominate a
-//! module's size: instruction operand words are LEB128 varints, and source
-//! spans are deltas from the previous span. A function compiled from its
-//! module's own URL does not repeat it.
+//! module's size: instruction operand words are LEB128 varints, and a span
+//! table is its delta-encoded bytes, copied verbatim (see
+//! [`crate::span_table`]). A function compiled from its module's own URL does
+//! not repeat it.
 //!
 //! # Contents
 //! - [`encode_module`] — a module as flat bytes.
@@ -46,7 +47,7 @@ use crate::wordcode::{FunctionCode, INLINE_OPERAND_WORDS, Instruction};
 use crate::{
     ArgumentBindingStorage, ArgumentsObjectKind, BytecodeModule, ClassHintSite, Constant,
     ExceptionHandler, Function, MappedArgumentBinding, ModuleInit, ModuleResolution,
-    ScopeDescriptor, ScopeFlags, ScopeKind, SlotDescriptor, SlotKind, SourceKind, SpanEntry,
+    ScopeDescriptor, ScopeFlags, ScopeKind, SlotDescriptor, SlotKind, SourceKind, SpanTable,
     TemplateSite,
     encoding::{op_from_byte, op_to_byte},
     verifier::{BytecodeVerifyError, VerifiedBytecodeModule},
@@ -384,12 +385,6 @@ impl Writer {
         self.append(&buffer[..len]);
     }
 
-    /// Signed difference `to - from` of two `u32`s, zigzag LEB128 (33 bits).
-    fn delta(&mut self, from: u32, to: u32) {
-        let difference = i64::from(to) - i64::from(from);
-        self.varint_wide(((difference << 1) ^ (difference >> 63)) as u64);
-    }
-
     fn span(&mut self, span: (u32, u32)) {
         self.u32(span.0);
         self.u32(span.1);
@@ -510,24 +505,16 @@ impl Writer {
         self.u32(init.function_id);
     }
 
-    /// Spans run in PC order, so each is written as deltas from the one
-    /// before it: PC, start, then the length.
-    fn spans(&mut self, spans: &[SpanEntry]) {
-        let Some(len) = self.wire_len(spans.len()) else {
+    fn spans(&mut self, spans: &SpanTable) {
+        let (Some(count), Some(len)) = (
+            self.wire_len(spans.len()),
+            self.wire_len(spans.as_bytes().len()),
+        ) else {
             return;
         };
+        self.u32(count);
         self.u32(len);
-        let (mut pc, mut start) = (0, 0);
-        for entry in spans {
-            if self.has_failed() {
-                break;
-            }
-            self.delta(pc, entry.pc);
-            self.delta(start, entry.span.0);
-            self.delta(entry.span.0, entry.span.1);
-            pc = entry.pc;
-            start = entry.span.0;
-        }
+        self.append(spans.as_bytes());
     }
 
     fn class_hint_site(&mut self, site: &ClassHintSite) {
@@ -749,13 +736,6 @@ impl<'a> Reader<'a> {
         None
     }
 
-    /// `from` plus a zigzag difference the writer produced, as a `u32`.
-    fn delta(&mut self, from: u32) -> Option<u32> {
-        let zigzag = self.varint_wide()?;
-        let difference = ((zigzag >> 1) as i64) ^ -((zigzag & 1) as i64);
-        u32::try_from(i64::from(from) + difference).ok()
-    }
-
     fn u32(&mut self) -> Option<u32> {
         Some(u32::from_le_bytes(self.bytes(4)?.try_into().ok()?))
     }
@@ -885,21 +865,18 @@ impl<'a> Reader<'a> {
         })
     }
 
-    fn spans(&mut self) -> Option<Vec<SpanEntry>> {
+    /// The table bytes are taken as stored; the verifier checks they decode
+    /// before the function runs.
+    fn spans(&mut self) -> Option<SpanTable> {
+        let count = self.u32()?;
+        let len = self.u32()? as usize;
         // Each entry occupies at least three one-byte deltas.
-        let count = self.count(3)?;
-        let mut spans = self.vec_with_exact_capacity(count)?;
-        let (mut pc, mut start) = (0, 0);
-        for _ in 0..count {
-            pc = self.delta(pc)?;
-            start = self.delta(start)?;
-            let end = self.delta(start)?;
-            spans.push(SpanEntry {
-                pc,
-                span: (start, end),
-            });
+        if (count as usize).checked_mul(3)? > len {
+            return None;
         }
-        Some(spans)
+        self.charge_allocation(len)?;
+        let bytes = self.bytes(len)?;
+        Some(SpanTable::from_parts(count, bytes.into()))
     }
 
     fn class_hint_site(&mut self) -> Option<ClassHintSite> {
@@ -1298,10 +1275,10 @@ mod tests {
                     target: 1,
                     exception: 0,
                 }],
-                spans: vec![SpanEntry {
+                spans: SpanTable::new(&[crate::SpanEntry {
                     pc: 0,
                     span: (0, 4),
-                }],
+                }]),
                 number_hint_sites: vec![0, 1],
                 class_hint_sites: vec![ClassHintSite {
                     pc: 1,

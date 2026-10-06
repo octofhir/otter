@@ -998,6 +998,7 @@ impl FeedbackVector {
 
     /// Whether this instruction owns isolate-local method feedback in the
     /// [`crate::interp::MethodFeedbackDirectory`].
+    #[cfg(test)]
     #[must_use]
     pub(crate) fn is_method_slot(&self, index: usize) -> bool {
         matches!(

@@ -3798,11 +3798,7 @@ impl Interpreter {
             None => context.cloned(),
         };
         if let Some(function_id) = source_function {
-            let realm = self
-                .function_realm_ids
-                .get(&function_id)
-                .copied()
-                .unwrap_or(0);
+            let realm = self.function_realm_id(function_id);
             if !self.job_realm_is_live(realm) {
                 return Err(CommittedValueError::Fatal(VmError::InvalidOperand));
             }

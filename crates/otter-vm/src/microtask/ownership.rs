@@ -104,11 +104,7 @@ impl Interpreter {
                     .map(|closure| closure.cached_function_id)
             }) {
                 self.function_context(None, function_id)?;
-                return Ok(self
-                    .function_realm_ids
-                    .get(&function_id)
-                    .copied()
-                    .unwrap_or(0));
+                return Ok(self.function_realm_id(function_id));
             }
             let native = callable
                 .as_native_function()

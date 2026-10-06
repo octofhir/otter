@@ -8,8 +8,8 @@
 //! - [`verify_module`] — verify an ordinary base-zero compiler/cache module.
 //! - [`verify_module_at_base`] — verify a module already rebased for a code
 //!   space.
-//! - [`VerifiedBytecodeModule`] — immutable admitted module plus retained
-//!   per-function proofs.
+//! - [`VerifiedBytecodeModule`] — immutable admitted module whose
+//!   per-function proofs are established on first use and retained.
 //! - [`BytecodeVerifyError`] — typed rejection diagnostics.
 //!
 //! # Invariants
@@ -37,6 +37,12 @@
 //!   return family.
 //! - A [`VerifiedBytecodeModule`] exposes no mutable access to its module, and
 //!   proof-preserving rebasing changes only function-id-bearing records.
+//! - A [`VerifiedBytecodeModule`] admits module-level records and every
+//!   function header (dense id, register window) on construction, and hands
+//!   out a function's proof only after verifying that function (or, for a
+//!   build artifact, measuring it). Only admitted headers reach a VM consumer
+//!   before the body is verified.
+//! - A function declared `ignores_this` never reads its `this` binding.
 //! - Successful verification does not publish runtime state.
 //!
 //! # See also
@@ -48,6 +54,7 @@ use crate::encoding::{
     verify_exception_handlers,
 };
 use std::collections::HashSet;
+use std::sync::OnceLock;
 
 use crate::opcode_schema::{ImmediateDomain, RegisterAccess, operand_spec_at, register_access_at};
 use crate::{
@@ -112,11 +119,20 @@ impl VerifiedFunction {
 /// proof is retained. This is the only type flat decoding returns, allowing a
 /// cache to carry verification through VM linking and executable construction
 /// without repeating it.
+///
+/// Module-level admission (the function table, function-id ranges of
+/// constants and module inits, template sites) runs on construction. Each
+/// function's own proof is established the first time it is asked for, so a
+/// function that never runs is never verified; no unverified function body
+/// can be handed out.
 #[derive(Debug, Clone)]
 pub struct VerifiedBytecodeModule {
     module: BytecodeModule,
     function_base: u32,
-    functions: Box<[VerifiedFunction]>,
+    functions: Box<[OnceLock<VerifiedFunction>]>,
+    /// The product build verified these bytes; a function's proof is only
+    /// measured.
+    build_artifact: bool,
 }
 
 impl VerifiedBytecodeModule {
@@ -136,12 +152,18 @@ impl VerifiedBytecodeModule {
         module: BytecodeModule,
         function_base: u32,
     ) -> Result<Self, BytecodeVerifyError> {
-        let functions = verify_module_with_proofs(&module, function_base)?;
-        Ok(Self {
+        admit_module(&module, function_base)?;
+        Ok(Self::unproven(module, function_base, false))
+    }
+
+    fn unproven(module: BytecodeModule, function_base: u32, build_artifact: bool) -> Self {
+        let functions = (0..module.functions.len()).map(|_| OnceLock::new()).collect();
+        Self {
             module,
             function_base,
             functions,
-        })
+            build_artifact,
+        }
     }
 
     /// Own a module the product build compiled and fully verified, whose
@@ -153,38 +175,10 @@ impl VerifiedBytecodeModule {
     /// # Errors
     /// Returns a rejection when the bytes do not even have a measurable shape.
     pub fn from_build_artifact(module: BytecodeModule) -> Result<Self, BytecodeVerifyError> {
-        let functions = module
-            .functions
-            .iter()
-            .enumerate()
-            .map(|(function_index, function)| {
-                let register_count = function
-                    .param_count
-                    .checked_add(function.locals)
-                    .and_then(|count| count.checked_add(function.scratch))
-                    .ok_or(BytecodeVerifyError::RegisterWindowOverflow {
-                        function_index,
-                        parameters: function.param_count,
-                        locals: function.locals,
-                        scratch: function.scratch,
-                    })?;
-                let layout = measure_wordcode_function(&function.code).map_err(|error| {
-                    BytecodeVerifyError::Wordcode {
-                        function_index,
-                        error,
-                    }
-                })?;
-                Ok(VerifiedFunction {
-                    layout,
-                    register_count,
-                })
-            })
-            .collect::<Result<_, _>>()?;
-        Ok(Self {
-            module,
-            function_base: 0,
-            functions,
-        })
+        if module.functions.is_empty() {
+            return Err(BytecodeVerifyError::EmptyFunctionTable);
+        }
+        Ok(Self::unproven(module, 0, true))
     }
 
     /// Immutable access to the admitted module DTO.
@@ -199,10 +193,35 @@ impl VerifiedBytecodeModule {
         self.function_base
     }
 
-    /// Retained proof corresponding to one dense function-table index.
-    #[must_use]
-    pub fn function(&self, index: usize) -> Option<&VerifiedFunction> {
-        self.functions.get(index)
+    /// The proof of one dense function-table index, established on first
+    /// use.
+    ///
+    /// # Errors
+    /// Returns the function's first structural rejection, or a missing index.
+    pub fn function(&self, index: usize) -> Result<&VerifiedFunction, BytecodeVerifyError> {
+        let slot = self
+            .functions
+            .get(index)
+            .ok_or(BytecodeVerifyError::MissingFunction {
+                function_index: index,
+            })?;
+        if let Some(proof) = slot.get() {
+            return Ok(proof);
+        }
+        let function = &self.module.functions[index];
+        let proof = if self.build_artifact {
+            measure_function(function, index)?
+        } else {
+            let function_end = self.function_base + self.module.functions.len() as u32;
+            verify_function(
+                &self.module,
+                function,
+                index,
+                self.function_base,
+                function_end,
+            )?
+        };
+        Ok(slot.get_or_init(|| proof))
     }
 
     /// Name the source the module was compiled from on the module and every
@@ -392,7 +411,8 @@ fn translate_verified_function_id(
 #[derive(Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum BytecodeVerifyError {
-    /// Activation-window arguments reads require an unsuspended zero-formal function.
+    /// Activation-window arguments reads require arguments metadata, no
+    /// aliased formal, no eval and no suspension.
     ArgumentsReadMetadata {
         /// Owning function table index.
         function_index: usize,
@@ -401,6 +421,11 @@ pub enum BytecodeVerifyError {
     },
     /// A module must contain `<main>` at function index zero.
     EmptyFunctionTable,
+    /// A proof was asked for a function index the module does not have.
+    MissingFunction {
+        /// Requested function table index.
+        function_index: usize,
+    },
     /// Function count or its rebased end does not fit the u32 id space.
     FunctionRangeOverflow {
         /// Requested first function id.
@@ -427,6 +452,11 @@ pub enum BytecodeVerifyError {
         locals: u16,
         /// Encoded scratch count.
         scratch: u16,
+    },
+    /// A function declared `ignores_this` reads its `this` binding.
+    ObservedIgnoredThis {
+        /// Owning function table index.
+        function_index: usize,
     },
     /// Wordcode storage, shape, or control flow is invalid.
     Wordcode {
@@ -694,9 +724,12 @@ impl std::fmt::Display for BytecodeVerifyError {
                 instruction_pc,
             } => write!(
                 f,
-                "function {function_index} instruction {instruction_pc} arguments read requires zero formals, arguments metadata, and no rest, eval or suspension"
+                "function {function_index} instruction {instruction_pc} arguments read requires arguments metadata and no aliased formal, eval or suspension"
             ),
             Self::EmptyFunctionTable => write!(f, "bytecode module has no <main> function"),
+            Self::MissingFunction { function_index } => {
+                write!(f, "bytecode module has no function {function_index}")
+            }
             Self::FunctionRangeOverflow {
                 base,
                 function_count,
@@ -720,6 +753,10 @@ impl std::fmt::Display for BytecodeVerifyError {
             } => write!(
                 f,
                 "function {function_index} register window overflows u16: parameters={parameters} locals={locals} scratch={scratch}"
+            ),
+            Self::ObservedIgnoredThis { function_index } => write!(
+                f,
+                "function {function_index} is declared to ignore `this` but reads it"
             ),
             Self::Wordcode {
                 function_index,
@@ -1054,10 +1091,43 @@ pub fn verify_module_at_base(
     verify_module_with_proofs(module, expected_base).map(drop)
 }
 
+/// A build artifact's proof: its byte-PC layout and register window, measured
+/// without the admission checks the build already ran.
+fn measure_function(
+    function: &Function,
+    function_index: usize,
+) -> Result<VerifiedFunction, BytecodeVerifyError> {
+    let register_count = register_window(function, function_index)?;
+    let layout = measure_wordcode_function(&function.code).map_err(|error| {
+        BytecodeVerifyError::Wordcode {
+            function_index,
+            error,
+        }
+    })?;
+    Ok(VerifiedFunction {
+        layout,
+        register_count,
+    })
+}
+
 fn verify_module_with_proofs(
     module: &BytecodeModule,
     expected_base: u32,
 ) -> Result<Box<[VerifiedFunction]>, BytecodeVerifyError> {
+    let function_end = admit_module(module, expected_base)?;
+    module
+        .functions
+        .iter()
+        .enumerate()
+        .map(|(function_index, function)| {
+            verify_function(module, function, function_index, expected_base, function_end)
+        })
+        .collect()
+}
+
+/// Module-level admission: the function table and every function-id-bearing
+/// module record. Returns the end of the dense function-id range.
+fn admit_module(module: &BytecodeModule, expected_base: u32) -> Result<u32, BytecodeVerifyError> {
     if module.functions.is_empty() {
         return Err(BytecodeVerifyError::EmptyFunctionTable);
     }
@@ -1105,7 +1175,6 @@ fn verify_module_with_proofs(
             }
         })?;
     }
-    let mut verified_functions = Vec::with_capacity(module.functions.len());
     for (function_index, function) in module.functions.iter().enumerate() {
         let expected = expected_base.checked_add(function_index as u32).ok_or(
             BytecodeVerifyError::FunctionRangeOverflow {
@@ -1120,15 +1189,21 @@ fn verify_module_with_proofs(
                 actual: function.id,
             });
         }
-        verified_functions.push(verify_function(
-            module,
-            function,
-            function_index,
-            expected_base,
-            function_end,
-        )?);
+        register_window(function, function_index)?;
     }
-    Ok(verified_functions.into_boxed_slice())
+    Ok(function_end)
+}
+
+/// The function's admitted register-window width.
+fn register_window(function: &Function, function_index: usize) -> Result<u16, BytecodeVerifyError> {
+    function
+        .register_count()
+        .ok_or(BytecodeVerifyError::RegisterWindowOverflow {
+            function_index,
+            parameters: function.param_count,
+            locals: function.locals,
+            scratch: function.scratch,
+        })
 }
 
 fn verify_function(
@@ -1138,16 +1213,10 @@ fn verify_function(
     function_base: u32,
     function_end: u32,
 ) -> Result<VerifiedFunction, BytecodeVerifyError> {
-    let register_count = u32::from(function.param_count)
-        .checked_add(u32::from(function.locals))
-        .and_then(|count| count.checked_add(u32::from(function.scratch)))
-        .filter(|count| *count <= u32::from(u16::MAX))
-        .ok_or(BytecodeVerifyError::RegisterWindowOverflow {
-            function_index,
-            parameters: function.param_count,
-            locals: function.locals,
-            scratch: function.scratch,
-        })?;
+    let register_count = u32::from(register_window(function, function_index)?);
+    if function.ignores_this && function.body_observes_this() {
+        return Err(BytecodeVerifyError::ObservedIgnoredThis { function_index });
+    }
     let layout = layout_wordcode_function(&function.code).map_err(|error| {
         BytecodeVerifyError::Wordcode {
             function_index,
@@ -1742,6 +1811,33 @@ mod tests {
                 base: u32::MAX,
                 function_count: 1,
             }
+        );
+    }
+
+    #[test]
+    fn function_headers_are_admitted_before_any_body() {
+        let mut module = returning_module();
+        module.functions[0].scratch = u16::MAX;
+        assert!(matches!(
+            VerifiedBytecodeModule::new(module),
+            Err(BytecodeVerifyError::RegisterWindowOverflow { .. })
+        ));
+    }
+
+    #[test]
+    fn a_body_declared_to_ignore_this_never_reads_it() {
+        let mut module = returning_module();
+        module.functions[0].ignores_this = true;
+        verify_module(&module).expect("a body without `this` may ignore it");
+        let mut code = FunctionCodeBuilder::new();
+        code.push(Op::LoadThis, &[Operand::Register(0)]);
+        code.push(Op::ReturnUndefined, &[]);
+        let mut module = module_with(code.finish());
+        verify_module(&module).expect("observing `this` is always sound");
+        module.functions[0].ignores_this = true;
+        assert_eq!(
+            verify_module(&module),
+            Err(BytecodeVerifyError::ObservedIgnoredThis { function_index: 0 })
         );
     }
 

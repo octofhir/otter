@@ -74,6 +74,7 @@ fn test_function(
         module_url: String::new(),
         contains_direct_eval: false,
         primordial_iteration: false,
+        ignores_this: false,
         code: code.into(),
         spans,
         handlers: Vec::new(),
@@ -5418,6 +5419,7 @@ fn unwind_throw_pops_frames_until_handler_or_uncaught() {
         module_url: String::new(),
         contains_direct_eval: false,
         primordial_iteration: false,
+        ignores_this: false,
         code: vec![Instruction {
             pc: 0,
             op: Op::ReturnUndefined,
@@ -5498,6 +5500,7 @@ fn unwind_throw_lands_in_catch_handler() {
         module_url: String::new(),
         contains_direct_eval: false,
         primordial_iteration: false,
+        ignores_this: false,
         code: vec![Instruction {
             pc: 0,
             op: Op::ReturnUndefined,
@@ -6126,6 +6129,7 @@ fn arrow_closure_overrides_call_site_this() {
         module_url: String::new(),
         contains_direct_eval: false,
         primordial_iteration: false,
+        ignores_this: false,
         code: vec![Instruction {
             pc: 0,
             op: Op::ReturnUndefined,
@@ -6167,6 +6171,7 @@ fn arrow_closure_overrides_call_site_this() {
         module_url: String::new(),
         contains_direct_eval: false,
         primordial_iteration: false,
+        ignores_this: false,
         code: vec![
             Instruction {
                 pc: 0,
@@ -6348,19 +6353,16 @@ fn snapshot_restore_republishes_owned_interpreter_destinations() {
     let restored =
         Interpreter::from_isolate_snapshot(&snapshot, &otter_resource::ResourceAccount::default())
             .unwrap();
-    let mut visited = 0;
-    restored.code_space.visit_live_functions(|function| {
-        let plan = restored.current_direct_callee_plan(function).unwrap();
-        assert_eq!(plan.function_id, function.id);
-        assert_eq!(plan.tier, native_abi::NativeFrameKind::Interpreter);
-        assert_eq!(plan.code_object_id, 0);
-        assert_ne!(plan.entry_cell, donor.entry_cell);
-        // SAFETY: restoration owns fresh permanent function and entry cells.
-        let cell = unsafe { &*(plan.entry_cell as *const native_abi::FunctionEntryCell) };
-        assert_eq!(cell.register_count, function.register_count);
-        assert_eq!(cell.param_count, function.param_count);
-        assert_ne!(cell.current_generation(), 0);
-        visited += 1;
-    });
-    assert_eq!(visited, 1);
+    let restored_context = restored.function_context(None, 0).unwrap();
+    let function = restored_context.exec_function(0).unwrap();
+    let plan = restored.current_direct_callee_plan(function).unwrap();
+    assert_eq!(plan.function_id, function.id);
+    assert_eq!(plan.tier, native_abi::NativeFrameKind::Interpreter);
+    assert_eq!(plan.code_object_id, 0);
+    assert_ne!(plan.entry_cell, donor.entry_cell);
+    // SAFETY: restoration owns fresh permanent function and entry cells.
+    let cell = unsafe { &*(plan.entry_cell as *const native_abi::FunctionEntryCell) };
+    assert_eq!(cell.register_count, function.register_count);
+    assert_eq!(cell.param_count, function.param_count);
+    assert_ne!(cell.current_generation(), 0);
 }

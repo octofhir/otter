@@ -168,9 +168,10 @@ impl ExecutionContext {
         self.function_base
     }
 
-    /// Exclusive end of this linked chunk's verified function range.
-    pub(crate) fn function_end(&self) -> u32 {
-        self.function_base + self.payload.module.functions.len() as u32
+    /// This chunk's admitted functions in id order; their headers are
+    /// admitted, their bodies verify on first use.
+    pub(crate) fn linked_functions(&self) -> &[Function] {
+        &self.payload.module.functions
     }
 
     /// Stable cache key prefix for constant-pool values owned by this linked
@@ -506,7 +507,7 @@ impl ExecutionContext {
     /// `true` when the function id points at an arrow function.
     #[must_use]
     pub fn function_is_arrow(&self, function_id: u32) -> bool {
-        self.exec_function(function_id).is_some_and(|f| f.is_arrow)
+        self.function(function_id).is_some_and(|f| f.is_arrow)
     }
 
     /// `true` when this function id carries an implicit `prototype`
@@ -518,14 +519,14 @@ impl ExecutionContext {
     /// never receive one.
     #[must_use]
     pub fn function_has_prototype_property(&self, function_id: u32) -> bool {
-        self.exec_function(function_id)
+        self.function(function_id)
             .is_none_or(|f| f.is_generator || (!f.is_arrow && !f.is_method && !f.is_async))
     }
 
     /// `true` when the function id points at a strict function.
     #[must_use]
     pub fn function_is_strict(&self, function_id: u32) -> bool {
-        self.exec_function(function_id).is_some_and(|f| f.is_strict)
+        self.function(function_id).is_some_and(|f| f.is_strict)
     }
 
     /// Resolve a function-id constant.
@@ -764,6 +765,7 @@ mod tests {
                 module_url: String::new(),
                 contains_direct_eval: false,
                 primordial_iteration: false,
+                ignores_this: false,
                 code: code.into(),
                 spans: Vec::new(),
                 handlers: Vec::new(),

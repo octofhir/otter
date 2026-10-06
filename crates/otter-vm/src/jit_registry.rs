@@ -188,12 +188,17 @@ impl JitCodeRegistry {
     }
 
     /// Publish permanent linkage for a bytecode function at module linking.
-    pub(crate) fn link_function(&mut self, function: &crate::executable::CodeBlock, realm_id: u32) {
+    ///
+    /// The cell is built from the function's admitted header alone, so
+    /// linking never verifies or builds a body; the first call does.
+    pub(crate) fn link_function(&mut self, function: &otter_bytecode::Function, realm_id: u32) {
         self.ensure_function_entry(
             function.id,
             function.param_count,
-            function.register_count,
-            function.call_flags(),
+            function
+                .register_count()
+                .expect("admitted function header has a register window"),
+            crate::executable::bytecode_call_flags(function),
             realm_id,
         );
     }

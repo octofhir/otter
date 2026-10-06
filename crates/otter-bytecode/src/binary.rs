@@ -8,15 +8,20 @@
 //! near-linear pass, and JSC's bytecode cache is a flat buffer of records read
 //! back by offset.
 //!
-//! This is that shape. Every value is written little-endian at a known width,
-//! every sequence is length-prefixed, and decoding is a straight walk over the
-//! bytes into pre-sized vectors — no visitor indirection, no reallocation, no
-//! per-node dispatch.
+//! This is that shape. Every sequence is length-prefixed and decoding is a
+//! straight walk over the bytes into pre-sized vectors — no visitor
+//! indirection, no reallocation, no per-node dispatch. Scalars are written
+//! little-endian at a known width, except the two streams that dominate a
+//! module's size: instruction operand words are LEB128 varints, and source
+//! spans are deltas from the previous span. A function compiled from its
+//! module's own URL does not repeat it.
 //!
 //! # Contents
 //! - [`encode_module`] — a module as flat bytes.
 //! - [`encode_module_bounded`] — the same encoding with a hard output budget.
 //! - [`decode_module`] — flat bytes into an immutable verified carrier.
+//! - [`encode_module_bounded_detached`] / [`decode_module_with_source`] — the
+//!   pair for a store keyed by the compile input, which leaves that input out.
 //!
 //! # Invariants
 //! - Encoding validates every wire-length conversion. The bounded entry point
@@ -80,20 +85,49 @@ pub fn encode_module_bounded(
     encode_module_with_limit(module, max_bytes)
 }
 
+/// [`encode_module_bounded`] for a store keyed by the module's own compile
+/// input: the function source text, which is that input, is left out and
+/// marked detached, so [`decode_module_with_source`] must supply it again.
+///
+/// # Errors
+/// See [`encode_module_bounded`].
+pub fn encode_module_bounded_detached(
+    module: &BytecodeModule,
+    max_bytes: usize,
+) -> Result<Vec<u8>, ModuleEncodeError> {
+    encode_module_into(module, max_bytes, true)
+}
+
 fn encode_module_with_limit(
     module: &BytecodeModule,
     max_bytes: usize,
+) -> Result<Vec<u8>, ModuleEncodeError> {
+    encode_module_into(module, max_bytes, false)
+}
+
+/// The tag of a function source left out by a detached encoding.
+const DETACHED_FUNCTION_SOURCE: u8 = 2;
+
+fn encode_module_into(
+    module: &BytecodeModule,
+    max_bytes: usize,
+    detach_source: bool,
 ) -> Result<Vec<u8>, ModuleEncodeError> {
     let mut out = Writer::new(max_bytes);
     out.bytes(MAGIC);
     out.string(&module.module);
     out.u8(source_kind_tag(module.source_kind));
     out.seq(&module.template_sites, Writer::template_site);
-    out.seq(&module.functions, Writer::function);
+    out.seq(&module.functions, |out, function| {
+        out.function(function, &module.module);
+    });
     out.seq(&module.constants, Writer::constant);
     out.seq(&module.module_resolutions, Writer::module_resolution);
     out.seq(&module.module_inits, Writer::module_init);
-    out.optional_string(module.function_source.as_ref());
+    match &module.function_source {
+        Some(_) if detach_source => out.u8(DETACHED_FUNCTION_SOURCE),
+        source => out.optional_string(source.as_ref()),
+    }
     out.finish()
 }
 
@@ -150,6 +184,20 @@ impl std::error::Error for ModuleDecodeError {
     }
 }
 
+/// Decode a base-zero module the product build produced and verified, whose
+/// bytes are embedded in this executable (see
+/// [`VerifiedBytecodeModule::from_build_artifact`]). Never for bytes read or
+/// received at runtime: those go through [`decode_module`].
+///
+/// # Errors
+/// Returns [`ModuleDecodeError`] for malformed bytes.
+pub fn decode_build_artifact(
+    bytes: &'static [u8],
+) -> Result<VerifiedBytecodeModule, ModuleDecodeError> {
+    let module = decode_unverified_module(bytes).ok_or(ModuleDecodeError::MalformedEncoding)?;
+    VerifiedBytecodeModule::from_build_artifact(module).map_err(ModuleDecodeError::Verify)
+}
+
 /// Decode and verify a normal base-zero module.
 ///
 /// # Errors
@@ -160,7 +208,25 @@ pub fn decode_module(bytes: &[u8]) -> Result<VerifiedBytecodeModule, ModuleDecod
     VerifiedBytecodeModule::new(module).map_err(ModuleDecodeError::Verify)
 }
 
+/// [`decode_module`] for bytes [`encode_module_bounded_detached`] wrote:
+/// `source` is the compile input the store keyed them by, and becomes the
+/// function source again.
+///
+/// # Errors
+/// See [`decode_module`].
+pub fn decode_module_with_source(
+    bytes: &[u8],
+    source: &str,
+) -> Result<VerifiedBytecodeModule, ModuleDecodeError> {
+    let module = decode_module_parts(bytes, Some(source)).ok_or(ModuleDecodeError::MalformedEncoding)?;
+    VerifiedBytecodeModule::new(module).map_err(ModuleDecodeError::Verify)
+}
+
 fn decode_unverified_module(bytes: &[u8]) -> Option<BytecodeModule> {
+    decode_module_parts(bytes, None)
+}
+
+fn decode_module_parts(bytes: &[u8], detached_source: Option<&str>) -> Option<BytecodeModule> {
     let mut input = Reader::new(bytes);
     if input.bytes(MAGIC.len())? != MAGIC {
         return None;
@@ -168,11 +234,20 @@ fn decode_unverified_module(bytes: &[u8]) -> Option<BytecodeModule> {
     let module = input.string()?;
     let source_kind = source_kind_from_tag(input.u8()?)?;
     let template_sites = input.seq(Reader::template_site)?;
-    let functions = input.seq(Reader::function)?;
+    let functions = input.seq(|input| input.function(&module))?;
     let constants = input.seq(Reader::constant)?;
     let module_resolutions = input.seq(Reader::module_resolution)?;
     let module_inits = input.seq(Reader::module_init)?;
-    let function_source = input.optional_string()?;
+    let function_source = match input.u8()? {
+        0 => None,
+        1 => Some(input.string()?),
+        DETACHED_FUNCTION_SOURCE => {
+            let source = detached_source?;
+            input.charge_allocation(source.len())?;
+            Some(source.to_owned())
+        }
+        _ => return None,
+    };
     if !input.is_at_end() {
         return None;
     }
@@ -284,6 +359,35 @@ impl Writer {
 
     fn u64(&mut self, value: u64) {
         self.append(&value.to_le_bytes());
+    }
+
+    /// Unsigned LEB128.
+    fn varint(&mut self, value: u32) {
+        self.varint_wide(u64::from(value));
+    }
+
+    /// Unsigned LEB128 of a value of at most 35 bits.
+    fn varint_wide(&mut self, mut value: u64) {
+        let mut buffer = [0u8; 5];
+        let mut len = 0;
+        loop {
+            let byte = (value & 0x7f) as u8;
+            value >>= 7;
+            if value == 0 {
+                buffer[len] = byte;
+                len += 1;
+                break;
+            }
+            buffer[len] = byte | 0x80;
+            len += 1;
+        }
+        self.append(&buffer[..len]);
+    }
+
+    /// Signed difference `to - from` of two `u32`s, zigzag LEB128 (33 bits).
+    fn delta(&mut self, from: u32, to: u32) {
+        let difference = i64::from(to) - i64::from(from);
+        self.varint_wide(((difference << 1) ^ (difference >> 63)) as u64);
     }
 
     fn span(&mut self, span: (u32, u32)) {
@@ -406,9 +510,24 @@ impl Writer {
         self.u32(init.function_id);
     }
 
-    fn span_entry(&mut self, entry: &SpanEntry) {
-        self.u32(entry.pc);
-        self.span(entry.span);
+    /// Spans run in PC order, so each is written as deltas from the one
+    /// before it: PC, start, then the length.
+    fn spans(&mut self, spans: &[SpanEntry]) {
+        let Some(len) = self.wire_len(spans.len()) else {
+            return;
+        };
+        self.u32(len);
+        let (mut pc, mut start) = (0, 0);
+        for entry in spans {
+            if self.has_failed() {
+                break;
+            }
+            self.delta(pc, entry.pc);
+            self.delta(start, entry.span.0);
+            self.delta(entry.span.0, entry.span.1);
+            pc = entry.pc;
+            start = entry.span.0;
+        }
     }
 
     fn class_hint_site(&mut self, site: &ClassHintSite) {
@@ -473,15 +592,27 @@ impl Writer {
             // operands then decode against the wrong schema row.
             self.u8(op_to_byte(op).unwrap_or(u8::MAX));
             self.u8(operand_count);
-            for word in inline {
-                self.u32(word);
+            // Inline operands write only their own words; every other record
+            // writes its full raw form.
+            let used = usize::from(operand_count).min(INLINE_OPERAND_WORDS);
+            if instruction.operands_are_inline() && inline[used..].iter().all(|word| *word == 0)
+            {
+                self.u8(0);
+                for word in &inline[..used] {
+                    self.varint(*word);
+                }
+            } else {
+                self.u8(1);
+                for word in inline {
+                    self.varint(word);
+                }
+                self.varint(overflow_offset);
             }
-            self.u32(overflow_offset);
         }
         self.u32_seq(overflow);
     }
 
-    fn function(&mut self, function: &Function) {
+    fn function(&mut self, function: &Function, module_url: &str) {
         self.u32(function.id);
         self.string(&function.name);
         self.span(function.span);
@@ -515,7 +646,12 @@ impl Writer {
             &function.mapped_argument_bindings,
             Self::mapped_argument_binding,
         );
-        self.string(&function.module_url);
+        if function.module_url == module_url {
+            self.bool(true);
+        } else {
+            self.bool(false);
+            self.string(&function.module_url);
+        }
         match function.source_text_range {
             Some(range) => {
                 self.bool(true);
@@ -532,7 +668,7 @@ impl Writer {
         }
         self.function_code(&function.code);
         self.seq(&function.handlers, Self::exception_handler);
-        self.seq(&function.spans, Self::span_entry);
+        self.spans(&function.spans);
         self.u32_seq(&function.number_hint_sites);
         self.seq(&function.class_hint_sites, Self::class_hint_site);
     }
@@ -588,6 +724,35 @@ impl<'a> Reader<'a> {
 
     fn u16(&mut self) -> Option<u16> {
         Some(u16::from_le_bytes(self.bytes(2)?.try_into().ok()?))
+    }
+
+    /// Canonical unsigned LEB128 of a `u32`.
+    fn varint(&mut self) -> Option<u32> {
+        u32::try_from(self.varint_wide()?).ok()
+    }
+
+    /// Canonical unsigned LEB128 of at most five bytes: no redundant trailing
+    /// zero group.
+    fn varint_wide(&mut self) -> Option<u64> {
+        let mut value = 0u64;
+        for index in 0..5 {
+            let byte = self.u8()?;
+            value |= u64::from(byte & 0x7f) << (7 * index);
+            if byte & 0x80 == 0 {
+                if index > 0 && byte == 0 {
+                    return None;
+                }
+                return Some(value);
+            }
+        }
+        None
+    }
+
+    /// `from` plus a zigzag difference the writer produced, as a `u32`.
+    fn delta(&mut self, from: u32) -> Option<u32> {
+        let zigzag = self.varint_wide()?;
+        let difference = ((zigzag >> 1) as i64) ^ -((zigzag & 1) as i64);
+        u32::try_from(i64::from(from) + difference).ok()
     }
 
     fn u32(&mut self) -> Option<u32> {
@@ -719,11 +884,21 @@ impl<'a> Reader<'a> {
         })
     }
 
-    fn span_entry(&mut self) -> Option<SpanEntry> {
-        Some(SpanEntry {
-            pc: self.u32()?,
-            span: self.span()?,
-        })
+    fn spans(&mut self) -> Option<Vec<SpanEntry>> {
+        // Each entry occupies at least three one-byte deltas.
+        let count = self.count(3)?;
+        let mut spans = self.vec_with_exact_capacity(count)?;
+        let (mut pc, mut start) = (0, 0);
+        for _ in 0..count {
+            pc = self.delta(pc)?;
+            start = self.delta(start)?;
+            let end = self.delta(start)?;
+            spans.push(SpanEntry {
+                pc,
+                span: (start, end),
+            });
+        }
+        Some(spans)
     }
 
     fn class_hint_site(&mut self) -> Option<ClassHintSite> {
@@ -788,18 +963,29 @@ impl<'a> Reader<'a> {
     }
 
     fn function_code(&mut self) -> Option<FunctionCode> {
-        // One instruction occupies opcode + operand count + four inline words
-        // + one overflow offset.
-        let count = self.count(2 + INLINE_OPERAND_WORDS * 4 + 4)?;
+        // One instruction occupies at least opcode + operand count + form.
+        let count = self.count(3)?;
         let mut instructions = self.vec_with_exact_capacity(count)?;
         for _ in 0..count {
             let op = op_from_byte(self.u8()?)?;
             let operand_count = self.u8()?;
             let mut inline = [0u32; INLINE_OPERAND_WORDS];
-            for word in &mut inline {
-                *word = self.u32()?;
-            }
-            let overflow_offset = self.u32()?;
+            let overflow_offset = match self.u8()? {
+                0 => {
+                    let used = usize::from(operand_count).min(INLINE_OPERAND_WORDS);
+                    for word in &mut inline[..used] {
+                        *word = self.varint()?;
+                    }
+                    Instruction::inline_offset()
+                }
+                1 => {
+                    for word in &mut inline {
+                        *word = self.varint()?;
+                    }
+                    self.varint()?
+                }
+                _ => return None,
+            };
             instructions.push(Instruction::from_raw_parts(
                 op,
                 operand_count,
@@ -811,7 +997,7 @@ impl<'a> Reader<'a> {
         Some(FunctionCode::from_raw_parts(instructions, overflow))
     }
 
-    fn function(&mut self) -> Option<Function> {
+    fn function(&mut self, module_url: &str) -> Option<Function> {
         let id = self.u32()?;
         let name = self.string()?;
         let span = self.span()?;
@@ -839,7 +1025,12 @@ impl<'a> Reader<'a> {
             _ => return None,
         };
         let mapped_argument_bindings = self.seq(Self::mapped_argument_binding)?;
-        let module_url = self.string()?;
+        let module_url = if self.bool()? {
+            self.charge_allocation(module_url.len())?;
+            module_url.to_owned()
+        } else {
+            self.string()?
+        };
         let source_text_range = if self.bool()? {
             Some(self.span()?)
         } else {
@@ -852,7 +1043,7 @@ impl<'a> Reader<'a> {
         };
         let code = self.function_code()?;
         let handlers = self.seq(Self::exception_handler)?;
-        let spans = self.seq(Self::span_entry)?;
+        let spans = self.spans()?;
         let number_hint_sites = self.u32_seq()?;
         let class_hint_sites = self.seq(Self::class_hint_site)?;
         Some(Function {

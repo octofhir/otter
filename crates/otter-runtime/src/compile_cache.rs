@@ -26,6 +26,9 @@
 //!   large module is never fully encoded and rejected afterwards.
 //! - Every hit passes the mandatory bytecode verifier before it can reach the
 //!   VM. Every cache failure degrades silently to normal compilation.
+//! - Quotas are enforced by a locked scan-and-prune pass when a process first
+//!   publishes and whenever its running size estimate would cross a quota;
+//!   other publications only add to that estimate.
 //! - The cache is owner-trusted, cooperative storage, not a semantic
 //!   authenticity boundary against another process running as the same user.
 //!   The verifier protects VM safety; the private root, build fingerprint,
@@ -137,6 +140,9 @@ pub(crate) struct CompileCache {
     root: PathBuf,
     #[cfg(unix)]
     policy: CompileCachePolicy,
+    /// This process's running size of the tree, shared by every clone.
+    #[cfg(unix)]
+    estimate: std::sync::Arc<std::sync::Mutex<Option<unix::CacheSize>>>,
 }
 
 #[cfg(unix)]
@@ -169,6 +175,8 @@ impl CompileCache {
             root: root.into(),
             #[cfg(unix)]
             policy: CompileCachePolicy::default(),
+            #[cfg(unix)]
+            estimate: std::sync::Arc::default(),
         }
     }
 
@@ -177,6 +185,7 @@ impl CompileCache {
         Self {
             root: root.into(),
             policy,
+            estimate: std::sync::Arc::default(),
         }
     }
 
@@ -209,17 +218,22 @@ impl CompileCache {
         self.root.join(prefix).join(rest)
     }
 
-    /// Read and verify a compiled module stored under this exact key.
+    /// Read and verify a compiled module stored under this exact key, whose
+    /// compile input is `source`.
     #[must_use]
-    pub(crate) fn load(&self, key: &CompileCacheKey) -> Option<VerifiedBytecodeModule> {
+    pub(crate) fn load(
+        &self,
+        key: &CompileCacheKey,
+        source: &str,
+    ) -> Option<VerifiedBytecodeModule> {
         #[cfg(unix)]
         {
             let bytes = unix::load(&self.root, key)?;
-            otter_bytecode::binary::decode_module(&bytes).ok()
+            otter_bytecode::binary::decode_module_with_source(&bytes, source).ok()
         }
         #[cfg(not(unix))]
         {
-            let _ = (&self.root, key);
+            let _ = (&self.root, key, source);
             None
         }
     }
@@ -229,13 +243,14 @@ impl CompileCache {
     pub(crate) fn store(&self, key: &CompileCacheKey, module: &BytecodeModule) {
         #[cfg(unix)]
         {
-            let Ok(bytes) = otter_bytecode::binary::encode_module_bounded(
+            // Every key covers the exact source, so a hit supplies it again.
+            let Ok(bytes) = otter_bytecode::binary::encode_module_bounded_detached(
                 module,
                 MAX_COMPILE_CACHE_ENTRY_BYTES,
             ) else {
                 return;
             };
-            unix::store(&self.root, self.policy, key, &bytes);
+            unix::store(&self.root, self.policy, &self.estimate, key, &bytes);
         }
         #[cfg(not(unix))]
         {

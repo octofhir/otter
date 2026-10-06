@@ -1765,6 +1765,10 @@ pub struct EvalCompileOptions {
     /// verifying it, or with its own configured compiler's output for the
     /// same text; `None` compiles afresh.
     pub embedded: Option<&'static EmbeddedCommonJs>,
+    /// The source is the CommonJS wrapper of a file module. Its compile
+    /// depends only on that text, so the host may answer with a compile it
+    /// kept from an earlier run.
+    pub commonjs_file: bool,
 }
 
 /// Where an error's captured stack points, resolved against the source the

@@ -36,6 +36,7 @@ use oxc_ast::ast::{
     FunctionBody, Statement,
 };
 use oxc_ast_visit::{Visit, walk};
+use oxc_span::GetSpan;
 use rustc_hash::{FxHashMap, FxHashSet};
 
 type NameId = u32;
@@ -65,6 +66,13 @@ pub(crate) struct ScopeFacts {
     /// `arguments` is referenced outside nested non-arrow functions and
     /// class bodies.
     uses_arguments: bool,
+    /// The scope's `arguments` object is used other than by `.length` and
+    /// element reads in its own code: written, called through, deleted from,
+    /// referenced bare or from an arrow.
+    arguments_escapes: bool,
+    /// Names assigned in the scope's code or in a nested scope that does not
+    /// bind them, by spelling (block shadowing only over-reports).
+    assigned: FxHashSet<NameId>,
     /// Source range of the parameters and body.
     range: (u32, u32),
 }
@@ -83,6 +91,12 @@ impl ScopeFacts {
     /// The scope reads its own `arguments` (arrows included).
     pub(crate) fn uses_arguments(&self) -> bool {
         self.uses_arguments
+    }
+
+    /// The scope's `arguments` object is used beyond `.length` and element
+    /// reads in its own code.
+    pub(crate) fn arguments_escapes(&self) -> bool {
+        self.arguments_escapes
     }
 }
 
@@ -167,6 +181,14 @@ impl CaptureFacts {
             .chain(arguments)
             .map(|id| self.names[id as usize].to_string())
             .collect()
+    }
+
+    /// Whether the scope's code, or a nested scope not binding it, may assign
+    /// `name`.
+    pub(crate) fn assigned(&self, scope: &ScopeFacts, name: &str) -> bool {
+        self.ids
+            .get(name)
+            .is_some_and(|id| scope.assigned.contains(id))
     }
 
     /// Whether a function nested in the scope references `name`.
@@ -256,6 +278,8 @@ struct Frame {
     bound: FxHashSet<NameId>,
     /// `var`s at any block depth, static blocks included.
     vars: FxHashSet<NameId>,
+    /// Names assigned in the scope and not bound by a nested scope.
+    writes: FxHashSet<NameId>,
     class_depth: u32,
     class_body_depth: u32,
     /// Inside a class field initializer or computed field key.
@@ -272,6 +296,7 @@ impl Frame {
             refs: FxHashSet::default(),
             bound: FxHashSet::default(),
             vars: FxHashSet::default(),
+            writes: FxHashSet::default(),
             class_depth: 0,
             class_body_depth: 0,
             field_depth: 0,
@@ -284,6 +309,9 @@ impl Frame {
 struct Builder {
     facts: CaptureFacts,
     frames: Vec<Frame>,
+    /// Start of the `arguments` reference that is the object of the member
+    /// read being visited.
+    arguments_read: Option<u32>,
 }
 
 impl Builder {
@@ -361,6 +389,14 @@ impl Builder {
             frame.bound.extend(frame.vars.iter().copied());
         }
         frame.refs.retain(|id| !frame.bound.contains(id));
+        parent.writes.extend(
+            frame
+                .writes
+                .iter()
+                .copied()
+                .filter(|id| !frame.bound.contains(id)),
+        );
+        frame.facts.assigned = std::mem::take(&mut frame.writes);
         let escape_eval = frame.facts.nested_eval && !frame.bound.contains(&EVAL);
         parent.refs.extend(frame.refs.iter().copied());
         parent.facts.inner.extend(frame.refs.iter().copied());
@@ -372,17 +408,39 @@ impl Builder {
     }
 
     /// `arguments` read in the innermost scope reaches through arrows to the
-    /// nearest non-arrow function, unless a class body intervenes.
-    fn note_arguments(&mut self) {
+    /// nearest non-arrow function, unless a class body intervenes. A read
+    /// through an arrow, or any use but a member read, escapes the object.
+    fn note_arguments(&mut self, member_read: bool) {
+        let mut escapes = !member_read;
         for frame in self.frames.iter_mut().rev() {
             if frame.class_body_depth > 0 {
                 return;
             }
             frame.facts.uses_arguments = true;
             if frame.kind != FrameKind::Arrow {
+                frame.facts.arguments_escapes |= escapes;
+                return;
+            }
+            escapes = true;
+        }
+    }
+
+    /// A use of the innermost `arguments` object other than a read.
+    fn note_arguments_escape(&mut self) {
+        for frame in self.frames.iter_mut().rev() {
+            if frame.class_body_depth > 0 {
+                return;
+            }
+            if frame.kind != FrameKind::Arrow {
+                frame.facts.arguments_escapes = true;
                 return;
             }
         }
+    }
+
+    fn note_write(&mut self, name: &str) {
+        let id = self.facts.intern(name);
+        self.top().writes.insert(id);
     }
 }
 
@@ -390,6 +448,9 @@ impl<'a> Visit<'a> for Builder {
     fn visit_function(&mut self, it: &Function<'a>, _flags: oxc_syntax::scope::ScopeFlags) {
         if let Some(id) = &it.id {
             self.own(&id.name);
+            if it.is_declaration() {
+                self.note_write(&id.name);
+            }
         }
         // A body-less declaration (an overload signature) has no runtime scope.
         if let Some(body) = it.body.as_deref() {
@@ -461,7 +522,72 @@ impl<'a> Visit<'a> for Builder {
 
     fn visit_variable_declarator(&mut self, it: &oxc_ast::ast::VariableDeclarator<'a>) {
         self.own_pattern(&it.id);
+        if it.init.is_some() {
+            pattern_leaves(&it.id, &mut |name| self.note_write(name));
+        }
         walk::walk_variable_declarator(self, it);
+    }
+
+    fn visit_for_in_statement(&mut self, it: &oxc_ast::ast::ForInStatement<'a>) {
+        if let oxc_ast::ast::ForStatementLeft::VariableDeclaration(declaration) = &it.left {
+            for declarator in &declaration.declarations {
+                pattern_leaves(&declarator.id, &mut |name| self.note_write(name));
+            }
+        }
+        walk::walk_for_in_statement(self, it);
+    }
+
+    fn visit_for_of_statement(&mut self, it: &oxc_ast::ast::ForOfStatement<'a>) {
+        if let oxc_ast::ast::ForStatementLeft::VariableDeclaration(declaration) = &it.left {
+            for declarator in &declaration.declarations {
+                pattern_leaves(&declarator.id, &mut |name| self.note_write(name));
+            }
+        }
+        walk::walk_for_of_statement(self, it);
+    }
+
+    fn visit_simple_assignment_target(&mut self, it: &oxc_ast::ast::SimpleAssignmentTarget<'a>) {
+        match it {
+            oxc_ast::ast::SimpleAssignmentTarget::AssignmentTargetIdentifier(id) => {
+                self.note_write(&id.name);
+            }
+            _ => {
+                if it
+                    .as_member_expression()
+                    .is_some_and(|member| is_arguments(member.object()))
+                {
+                    self.note_arguments_escape();
+                }
+            }
+        }
+        walk::walk_simple_assignment_target(self, it);
+    }
+
+    fn visit_assignment_target_property_identifier(
+        &mut self,
+        it: &oxc_ast::ast::AssignmentTargetPropertyIdentifier<'a>,
+    ) {
+        self.note_write(&it.binding.name);
+        walk::walk_assignment_target_property_identifier(self, it);
+    }
+
+    fn visit_unary_expression(&mut self, it: &oxc_ast::ast::UnaryExpression<'a>) {
+        if it.operator == oxc_syntax::operator::UnaryOperator::Delete
+            && member_of_arguments(&it.argument)
+        {
+            self.note_arguments_escape();
+        }
+        walk::walk_unary_expression(self, it);
+    }
+
+    fn visit_tagged_template_expression(
+        &mut self,
+        it: &oxc_ast::ast::TaggedTemplateExpression<'a>,
+    ) {
+        if member_of_arguments(&it.tag) {
+            self.note_arguments_escape();
+        }
+        walk::walk_tagged_template_expression(self, it);
     }
 
     fn visit_catch_parameter(&mut self, it: &oxc_ast::ast::CatchParameter<'a>) {
@@ -482,11 +608,16 @@ impl<'a> Visit<'a> for Builder {
             frame.facts.inner.insert(id);
         }
         if id == ARGUMENTS {
-            self.note_arguments();
+            let member_read = self.arguments_read.take() == Some(it.span.start);
+            self.note_arguments(member_read);
         }
     }
 
     fn visit_call_expression(&mut self, it: &oxc_ast::ast::CallExpression<'a>) {
+        // A method called on `arguments` receives it as `this`.
+        if member_of_arguments(&it.callee) {
+            self.note_arguments_escape();
+        }
         if callee_is_direct_eval(&it.callee) {
             self.facts.evals.push(it.span.start);
             let frame = self.top();
@@ -506,6 +637,9 @@ impl<'a> Visit<'a> for Builder {
         if it.property.name == "arguments" {
             self.facts.reads_dot_arguments = true;
         }
+        if it.property.name == "length" && is_arguments(&it.object) {
+            self.arguments_read = Some(it.object.span().start);
+        }
         walk::walk_static_member_expression(self, it);
     }
 
@@ -515,6 +649,9 @@ impl<'a> Visit<'a> for Builder {
     ) {
         if matches!(&it.expression, Expression::StringLiteral(key) if key.value == "arguments") {
             self.facts.reads_dot_arguments = true;
+        }
+        if is_arguments(&it.object) {
+            self.arguments_read = Some(it.object.span().start);
         }
         walk::walk_computed_member_expression(self, it);
     }
@@ -767,6 +904,21 @@ struct DirectEvalFinder {
 /// §13.3.6.1 — a callee that is the bare `eval` identifier, possibly
 /// wrapped in parentheses (`(eval)`, `((eval))`), is a direct eval. A
 /// non-trivial parenthesized callee such as `(1, eval)` is indirect.
+/// `arguments`, possibly parenthesized.
+fn is_arguments(expr: &Expression<'_>) -> bool {
+    matches!(expr.without_parentheses(), Expression::Identifier(id) if id.name == "arguments")
+}
+
+/// A member access on `arguments`, possibly parenthesized or optional.
+fn member_of_arguments(expr: &Expression<'_>) -> bool {
+    let expr = expr.without_parentheses();
+    let member = match expr {
+        Expression::ChainExpression(chain) => chain.expression.as_member_expression(),
+        _ => expr.as_member_expression(),
+    };
+    member.is_some_and(|member| is_arguments(member.object()))
+}
+
 fn callee_is_direct_eval(callee: &oxc_ast::ast::Expression<'_>) -> bool {
     match callee {
         oxc_ast::ast::Expression::Identifier(id) => id.name.as_str() == "eval",

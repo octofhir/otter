@@ -377,6 +377,42 @@ impl Interpreter {
                     .map_err(|error| CommittedValueError::JavaScript(error.into()))?
             });
         }
+        if target.as_bound_function().is_some() {
+            let Some(k) = key.string_name() else {
+                return Ok(false);
+            };
+            // Reading a builtin `name` materializes a string, so the target
+            // and the descriptor's values are rooted across it.
+            return self
+                .with_handle_scope(|interp, scope| {
+                    let target_handle = interp.scoped_value(scope, *target);
+                    let bound_now = |interp: &Self| {
+                        interp
+                            .escape_scoped(target_handle)
+                            .as_bound_function()
+                            .expect("rooted bound function")
+                    };
+                    let (current, descriptor) =
+                        interp.with_descriptor_anchored(descriptor, |interp| {
+                            function_metadata::bound_own_property_descriptor(
+                                &bound_now(interp),
+                                &mut interp.gc_heap,
+                                k,
+                            )
+                        })?;
+                    let completed = match current {
+                        Some(current) => descriptor.complete_against_current(&current),
+                        None => descriptor.complete_for_new_property(),
+                    };
+                    function_metadata::bound_define_own_property(
+                        &bound_now(interp),
+                        &mut interp.gc_heap,
+                        k,
+                        completed,
+                    )
+                })
+                .map_err(|error| CommittedValueError::JavaScript(error.into()));
+        }
         if let Some(class) = target.as_class_constructor() {
             let mut statics = class.statics(&self.gc_heap);
             return Ok(if let VmPropertyKey::Symbol(sym) = key {

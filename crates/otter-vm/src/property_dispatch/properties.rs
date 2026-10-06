@@ -68,7 +68,9 @@ impl Interpreter {
         let receiver = *read_register(&stack[frame_index], obj_reg)
             .map_err(|error| CommittedValueError::Fatal(error.into()))?;
         if !receiver.is_object_type() {
-            return Err(CommittedValueError::JavaScript(crate::VmError::TypeMismatch));
+            return Err(CommittedValueError::JavaScript(
+                crate::VmError::TypeMismatch,
+            ));
         }
         let cached = match (receiver.as_object(), slot) {
             (Some(obj), Some(slot)) => {
@@ -374,12 +376,16 @@ impl Interpreter {
                             None => Value::undefined(),
                         },
                     },
-                    // §10.1.8 — a native constructor with an explicit
-                    // [[Prototype]] (Int8Array → %TypedArray%) walks that
-                    // chain (inherited statics like `from` / `of`) before
-                    // the %Function.prototype% fallback.
-                    None => match native.prototype_override(&interp.gc_heap) {
-                        Some(parent) => {
+                    // §10.1.8 — the walk continues at the callable's
+                    // [[Prototype]]: an explicit one (Int8Array →
+                    // %TypedArray%, or null), else %Function.prototype%.
+                    None => {
+                        let parent = interp
+                            .get_prototype_for_op(&receiver)
+                            .map_err(CommittedValueError::JavaScript)?;
+                        if parent.is_null() {
+                            Value::undefined()
+                        } else {
                             let key = VmPropertyKey::String(name);
                             match interp.ordinary_get_value(
                                 stack,
@@ -401,33 +407,7 @@ impl Interpreter {
                                     .map_err(CommittedValueError::completed_call)?,
                             }
                         }
-                        None => {
-                            if let Ok(proto) = interp.function_prototype_object() {
-                                let key = VmPropertyKey::String(name);
-                                match interp.ordinary_get_value(
-                                    stack,
-                                    Some(context),
-                                    Value::object(proto),
-                                    receiver,
-                                    &key,
-                                    0,
-                                )? {
-                                    VmGetOutcome::Value(value) => value,
-                                    VmGetOutcome::InvokeGetter { getter } => interp
-                                        .run_callable_sync_rooted(
-                                            stack,
-                                            Some(context),
-                                            &getter,
-                                            interp.escape_scoped(receiver_root),
-                                            SmallVec::new(),
-                                        )
-                                        .map_err(CommittedValueError::completed_call)?,
-                                }
-                            } else {
-                                Value::undefined()
-                            }
-                        }
-                    },
+                    }
                 }
             } else if let Some(bound) = receiver.as_bound_function() {
                 let bound = &bound;

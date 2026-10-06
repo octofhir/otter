@@ -127,10 +127,14 @@ impl Interpreter {
             if method.is_undefined()
                 && let Some(slot) = property_slot
                 && let Some(key) = context.property_atom_for_function(function_id, name_index)
-                && let Some(found) = interp.array_receiver_load(slot, receiver, key)
-                && interp.is_callable_runtime(&found)
             {
-                method = found;
+                if let Some(found) = interp.lookup_start_load(slot, receiver, key)
+                    && interp.is_callable_runtime(&found)
+                {
+                    method = found;
+                }
+                // Preparing a function's bag can relocate the receiver.
+                receiver = interp.iteration_anchor(receiver_anchor);
             }
             if method.is_undefined() {
                 let method_key = context

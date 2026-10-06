@@ -46,9 +46,10 @@ fn distinct(registers: &[u8]) -> bool {
 
 /// Select the entry of the receiver's map in the slot at `Rq(slot)`:
 /// `Rq(entry)` addresses it on fall-through. An ordinary object's map is its
-/// shape. With `start` given, a closure receiver whose property bag carries
-/// its own `[[Prototype]]` (bag present, no override, default realm active)
-/// selects by its bag's shape keyed with the function bit, and `Rq(start)`
+/// shape. With `start` given, a closure or native function receiver whose
+/// property bag carries its own `[[Prototype]]` (bag present, no override,
+/// default realm active) selects by its bag's shape keyed with the
+/// lookup-start bit, and `Rq(start)`
 /// becomes the lookup-start object (the receiver itself for an ordinary
 /// object). A megamorphic slot jumps to `megamorphic`, anything else to
 /// `miss`. Clobbers `Rq(entry)`, `Rq(scratch)`, `r10`, `r11`.
@@ -79,7 +80,10 @@ pub(crate) fn emit_select_entry(
             ; mov r11d, [Rq(receiver) + view.object_shape_byte as i32]),
         Some(start) => {
             let function = ops.new_dynamic_label();
+            let native = ops.new_dynamic_label();
+            let bag = ops.new_dynamic_label();
             let layout = view.closure_call_layout;
+            let native_layout = view.native_call_layout;
             let qualifying = i32::from(
                 otter_vm::closure::CLOSURE_LOOKUP_OWN_PROPS
                     | otter_vm::closure::CLOSURE_LOOKUP_PROTO_OVERRIDE,
@@ -90,23 +94,37 @@ pub(crate) fn emit_select_entry(
                 ; mov Rq(start), Rq(receiver)
                 ; jmp =>keyed
                 ; =>function
+                ; cmp BYTE [Rq(receiver)], otter_vm::native_function::NATIVE_FUNCTION_BODY_TYPE_TAG as i8
+                ; je =>native
                 ; cmp BYTE [Rq(receiver)], otter_vm::closure::JS_CLOSURE_BODY_TYPE_TAG as i8
                 ; jne =>miss
                 ; movzx r10d, BYTE [Rq(receiver) + otter_vm::closure::CLOSURE_NAMED_LOOKUP_BYTE as i32]
                 ; and r10d, qualifying
                 ; cmp r10d, i32::from(otter_vm::closure::CLOSURE_LOOKUP_OWN_PROPS)
                 ; jne =>miss
-                ; mov r10, [r15 + THREAD_OFFSET as i32]
-                ; mov r10, [r10 + VM_THREAD_ACTIVE_REALM_CELL_OFFSET as i32]
-                ; test r10, r10 ; jz =>miss
-                ; cmp DWORD [r10], 0 ; jne =>miss
                 ; mov r10d, [Rq(receiver) + layout.rare_byte as i32]
                 ; test r10d, r10d ; jz =>miss);
             emit_load_u64(ops, 11, CAGE_MASK);
             dynasm!(ops ; .arch x64
                 ; and r11, Rq(receiver) ; add r10, r11
                 ; mov Rd(start), [r10 + layout.own_props_byte as i32]
+                ; jmp =>bag
+                ; =>native
+                ; test BYTE [Rq(receiver) + native_layout.flags_byte as i32],
+                    native_layout.prototype_override_flag as i8
+                ; jnz =>miss
+                ; mov Rd(start), [Rq(receiver) + native_layout.own_props_byte as i32]
+                // The bag of either function kind: present, in the default
+                // realm, keyed by its shape.
+                ; =>bag
                 ; test Rd(start), Rd(start) ; jz =>miss
+                ; mov r10, [r15 + THREAD_OFFSET as i32]
+                ; mov r10, [r10 + VM_THREAD_ACTIVE_REALM_CELL_OFFSET as i32]
+                ; test r10, r10 ; jz =>miss
+                ; cmp DWORD [r10], 0 ; jne =>miss);
+            emit_load_u64(ops, 11, CAGE_MASK);
+            dynasm!(ops ; .arch x64
+                ; and r11, Rq(receiver)
                 ; add Rq(start), r11
                 ; mov r11d, [Rq(start) + view.object_shape_byte as i32]
                 ; or r11d, LOOKUP_START_KEY_BIT as i32);

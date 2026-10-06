@@ -218,6 +218,13 @@ pub(crate) fn bound_own_property_is_enumerable(
     })
 }
 
+/// The bag holding a bound function's ordinary own properties and its
+/// `[[Extensible]]` flag.
+#[must_use]
+pub(crate) fn bound_own_properties(bound: &BoundFunction, gc_heap: &otter_gc::GcHeap) -> JsObject {
+    gc_heap.read_payload(bound.inner, |body| body.own_properties)
+}
+
 /// Test whether a bound function still owns a metadata property.
 #[must_use]
 pub(crate) fn bound_has_own_property(

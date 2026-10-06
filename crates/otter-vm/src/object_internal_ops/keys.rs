@@ -1246,7 +1246,9 @@ impl Interpreter {
             if abstract_ops::same_value(proto, &current, &self.gc_heap) {
                 return Ok(true);
             }
-            if abstract_ops::same_value(proto, target, &self.gc_heap) {
+            if !self.is_extensible_non_proxy(target)
+                || abstract_ops::same_value(proto, target, &self.gc_heap)
+            {
                 return Ok(false);
             }
             bound.set_prototype_override(&mut self.gc_heap, *proto);
@@ -1288,9 +1290,6 @@ impl Interpreter {
             hops += 1;
             p = object::prototype_value(candidate, &self.gc_heap).unwrap_or(Value::null());
         }
-        if self.set_exotic_prototype_override(target, *proto) {
-            return Ok(true);
-        }
-        Ok(true)
+        Ok(self.set_exotic_prototype_override(target, *proto))
     }
 }

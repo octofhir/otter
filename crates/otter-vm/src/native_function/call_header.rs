@@ -63,6 +63,9 @@ impl NativeCallHeader {
     pub(super) const LENGTH_CONFIGURABLE: u8 = 1 << 1;
     pub(super) const CONSTRUCTABLE: u8 = 1 << 2;
     pub(super) const EXTENSIBLE: u8 = 1 << 3;
+    /// A `[[Prototype]]` override is installed; without one the callable
+    /// inherits from `%Function.prototype%`.
+    pub(super) const PROTOTYPE_OVERRIDE: u8 = 1 << 4;
 
     pub(super) fn allocate(
         heap: &mut otter_gc::GcHeap,
@@ -135,6 +138,11 @@ impl NativeCallHeader {
 
     pub(super) fn prevent_extensions(&mut self) {
         self.flags &= !Self::EXTENSIBLE;
+    }
+
+    pub(super) fn set_prototype_overridden(&mut self, overridden: bool) {
+        self.flags = self.flags & !Self::PROTOTYPE_OVERRIDE
+            | u8::from(overridden) * Self::PROTOTYPE_OVERRIDE;
     }
 
     pub(super) fn host_ref(self) -> Option<u32> {

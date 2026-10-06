@@ -69,11 +69,14 @@ impl Interpreter {
         let top_idx = stack.len() - 1;
         let receiver = *read_register(&stack[top_idx], obj_reg)
             .map_err(|error| CommittedValueError::Fatal(error.into()))?;
-        if let Some(value) = self.array_receiver_load(slot, receiver, atomized_key) {
+        if let Some(value) = self.lookup_start_load(slot, receiver, atomized_key) {
             Self::finish_property_fast_path_value(&mut stack[top_idx], dst, value)
                 .map_err(|error| CommittedValueError::Fatal(error.into()))?;
             return Ok(true);
         }
+        // Preparing a function's bag can scavenge; re-read the rooted register.
+        let receiver = *read_register(&stack[top_idx], obj_reg)
+            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
         if let Some(obj) = receiver.as_object() {
             // The site's handlers: one shape compare selects the entry.
             if let Some(value) = slot.probe_load(obj, &self.gc_heap) {

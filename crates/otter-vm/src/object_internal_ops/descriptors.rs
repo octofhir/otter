@@ -662,6 +662,10 @@ impl Interpreter {
         if let Some(native) = value.as_native_function() {
             return native.is_extensible(&self.gc_heap);
         }
+        if let Some(bound) = value.as_bound_function() {
+            let bag = crate::function_metadata::bound_own_properties(&bound, &self.gc_heap);
+            return object::is_extensible(bag, &self.gc_heap);
+        }
         if let Some(class) = value.as_class_constructor() {
             return object::is_extensible(class.statics(&self.gc_heap), &self.gc_heap);
         }

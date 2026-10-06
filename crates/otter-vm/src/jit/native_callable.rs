@@ -25,10 +25,15 @@ pub struct JitNativeCallLayout {
     pub payload_byte: u32,
     /// Compressed ValueSlab handle containing all traced captures.
     pub captures_byte: u32,
+    /// Compressed handle of the own-property bag, which carries the
+    /// callable's own `[[Prototype]]` once a lookup-start load prepared it.
+    pub own_props_byte: u32,
     /// Flag granting this callable [[Construct]].
     pub constructable_flag: u8,
     /// Flag granting ordinary extension of the native callable's own properties.
     pub extensible_flag: u8,
+    /// Flag marking an installed `[[Prototype]]` override.
+    pub prototype_override_flag: u8,
 }
 
 impl JitNativeCallLayout {

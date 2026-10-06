@@ -13,6 +13,9 @@
 //! # Invariants
 //! - Key components are individually length-prefixed. Embedded NUL bytes or
 //!   component-boundary shifts cannot create the same preimage.
+//! - A key is a 128-bit XXH3 digest: it tells any edited input apart, at
+//!   memory bandwidth, but is no defence against a crafted collision (see the
+//!   trust boundary below).
 //! - Build time embeds a deterministic compiler/cache-schema fingerprint over
 //!   sorted producer sources, manifests, the dependency lock, toolchain, and
 //!   target/profile/cfg/features. Runtime executable paths and metadata are
@@ -65,8 +68,8 @@ pub(crate) const MAX_COMPILE_CACHE_ENTRIES: usize = 4_096;
 #[cfg(unix)]
 const MAX_COMPILE_CACHE_SCAN_ENTRIES: usize = 65_536;
 
-/// Lowercase hexadecimal length of a BLAKE3 digest.
-const COMPILE_CACHE_KEY_BYTES: usize = 64;
+/// Lowercase hexadecimal length of a 128-bit XXH3 digest.
+const COMPILE_CACHE_KEY_BYTES: usize = 32;
 
 /// Build-time compiler, bytecode-format, and cache-schema identity.
 const COMPILER_CACHE_FINGERPRINT: &str = env!("OTTER_COMPILER_CACHE_FINGERPRINT");
@@ -80,13 +83,13 @@ pub(crate) const MAX_COMPILE_CACHE_ENTRY_BYTES: usize = (256 * 1024 * 1024 - 64 
 
 static USER_DEFAULT_CACHE: OnceLock<Option<CompileCache>> = OnceLock::new();
 
-/// Proof that a compile-cache key is one canonical BLAKE3 hex digest.
+/// Proof that a compile-cache key is one canonical 128-bit hex digest.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct CompileCacheKey(Box<str>);
 
 impl CompileCacheKey {
-    fn from_hash(hash: blake3::Hash) -> Self {
-        Self(hash.to_hex().as_str().into())
+    fn from_digest(digest: u128) -> Self {
+        Self(format!("{digest:032x}").into())
     }
 
     /// Canonical lowercase hexadecimal spelling.
@@ -104,7 +107,7 @@ impl std::fmt::Display for InvalidCompileCacheKey {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "compile-cache key must be exactly 64 lowercase hexadecimal bytes"
+            "compile-cache key must be exactly 32 lowercase hexadecimal bytes"
         )
     }
 }
@@ -277,7 +280,7 @@ fn cache_key_with_fingerprint(
     specifier: &str,
     fingerprint: &[u8],
 ) -> CompileCacheKey {
-    let mut hasher = blake3::Hasher::new();
+    let mut hasher = xxhash_rust::xxh3::Xxh3::new();
     for component in [
         b"otter-compile-cache-key".as_slice(),
         env!("CARGO_PKG_VERSION").as_bytes(),
@@ -288,10 +291,10 @@ fn cache_key_with_fingerprint(
     ] {
         hash_framed(&mut hasher, component);
     }
-    CompileCacheKey::from_hash(hasher.finalize())
+    CompileCacheKey::from_digest(hasher.digest128())
 }
 
-fn hash_framed(hasher: &mut blake3::Hasher, component: &[u8]) {
+fn hash_framed(hasher: &mut xxhash_rust::xxh3::Xxh3, component: &[u8]) {
     hasher.update(&component.len().to_le_bytes());
     hasher.update(component);
 }
@@ -382,7 +385,8 @@ mod tests {
 
     #[test]
     fn embedded_compiler_fingerprint_is_one_canonical_digest() {
-        assert_eq!(COMPILER_CACHE_FINGERPRINT.len(), COMPILE_CACHE_KEY_BYTES);
+        // build.rs spells the fingerprint as a BLAKE3 hex digest.
+        assert_eq!(COMPILER_CACHE_FINGERPRINT.len(), 64);
         assert!(
             COMPILER_CACHE_FINGERPRINT
                 .bytes()

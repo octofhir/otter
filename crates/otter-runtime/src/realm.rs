@@ -632,7 +632,7 @@ impl crate::Runtime {
             self.source_maps.record_compiled_metadata(metadata);
         }
         let config = self.config.clone();
-        let task_spawner = self.runtime_task_spawner.clone();
+        let commonjs = std::sync::Arc::clone(&self.commonjs);
         let records = &mut self.module_records;
         let started = std::time::Instant::now();
         let result = self
@@ -642,7 +642,7 @@ impl crate::Runtime {
                     interp,
                     records,
                     &config,
-                    task_spawner,
+                    &commonjs,
                     linked,
                     started,
                 ))
@@ -674,7 +674,7 @@ fn execute_linked_module_in_active_realm(
     interp: &mut otter_vm::Interpreter,
     records: &mut crate::module_records::RuntimeModuleRecords,
     config: &RuntimeConfig,
-    task_spawner: Option<RuntimeTaskSpawner>,
+    commonjs: &std::sync::Arc<crate::commonjs::CjsConfig>,
     linked: crate::module_graph::LinkedProgram,
     started: std::time::Instant,
 ) -> Result<crate::ExecutionResult, OtterError> {
@@ -689,13 +689,7 @@ fn execute_linked_module_in_active_realm(
     .map_err(OtterError::from)?;
     let context = interp.link_module(module, sources)?;
     records
-        .allocate_for_module_inits(
-            interp,
-            &context,
-            &config.hosted_modules,
-            &config.capabilities,
-            task_spawner,
-        )
+        .allocate_for_module_inits(interp, &context, commonjs)
         .map_err(|error| crate::hosted_completion::into_runtime(interp, error))?;
     for metadata in &linked.metadata {
         if metadata.source_url.is_empty() || metadata.resolved_exports.is_empty() {

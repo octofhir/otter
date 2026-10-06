@@ -2027,15 +2027,34 @@ impl RuntimeModuleLoaderState {
         hooks: &RuntimeHooks,
         resource_account: &ResourceAccount,
     ) -> module_loader::ModuleLoader {
+        let base_dir = entry_path
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+        self.for_base_dir(
+            base_dir,
+            hosted_modules,
+            package_manager,
+            capabilities,
+            hooks,
+            resource_account,
+        )
+    }
+
+    /// A loader whose referrer-less requests resolve from `base_dir`, unless
+    /// the embedder configured its own.
+    fn for_base_dir(
+        &self,
+        base_dir: PathBuf,
+        hosted_modules: &[HostedModule],
+        package_manager: &RuntimePackageManagerHandle,
+        capabilities: &CapabilitySet,
+        hooks: &RuntimeHooks,
+        resource_account: &ResourceAccount,
+    ) -> module_loader::ModuleLoader {
         let mut cfg = match &self.configured {
             Some(cfg) => cfg.clone(),
-            None => {
-                let base_dir = entry_path
-                    .parent()
-                    .map(Path::to_path_buf)
-                    .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
-                module_loader::LoaderConfig::new(base_dir)
-            }
+            None => module_loader::LoaderConfig::new(base_dir),
         };
         cfg.hosted_specifiers.extend(
             hosted_modules
@@ -2053,6 +2072,31 @@ impl RuntimeModuleLoaderState {
         cfg.resource_account = resource_account.clone();
         module_loader::ModuleLoader::with_config(cfg)
     }
+}
+
+/// The one CommonJS configuration every `require` of a runtime shares, so
+/// they resolve through one loader and its file-system cache.
+fn commonjs_config(
+    config: &RuntimeConfig,
+    module_loader: &RuntimeModuleLoaderState,
+    package_manager: &RuntimePackageManagerHandle,
+    runtime_task_spawner: Option<RuntimeTaskSpawner>,
+) -> Arc<commonjs::CjsConfig> {
+    Arc::new(commonjs::CjsConfig {
+        capabilities: config.capabilities.clone(),
+        hosted: config.hosted_modules.clone(),
+        runtime_task_spawner,
+        addon_loader: config.commonjs_addon_loader,
+        report_watch_dependencies: commonjs::watch_reporting_requested(),
+        resolver: module_loader.for_base_dir(
+            config.process_cwd.clone(),
+            &config.hosted_modules,
+            package_manager,
+            &config.capabilities,
+            &config.hooks,
+            &config.resource_account,
+        ),
+    })
 }
 
 #[derive(Debug, Default)]
@@ -2935,6 +2979,12 @@ impl Runtime {
         );
         let package_manager =
             RuntimePackageManagerHandle::from_loader_config(config.loader.as_ref());
+        let commonjs = commonjs_config(
+            &config,
+            &module_loader,
+            &package_manager,
+            runtime_task_spawner.clone(),
+        );
         let mut interp = Interpreter::from_isolate_snapshot_capped(
             snapshot,
             config.max_heap_bytes,
@@ -3002,6 +3052,7 @@ impl Runtime {
             package_manager,
             layer_a_dynamic_imports,
             runtime_task_spawner,
+            commonjs,
             pending_exit_code: None,
             worker_child_ready: false,
             admission_leases: None,
@@ -3034,6 +3085,12 @@ impl Runtime {
         );
         let package_manager =
             RuntimePackageManagerHandle::from_loader_config(config.loader.as_ref());
+        let commonjs = commonjs_config(
+            &config,
+            &module_loader,
+            &package_manager,
+            runtime_task_spawner.clone(),
+        );
         // The interpreter owns both per-isolate heaps; the string and GC
         // allocators honor the configured cap.
         let mut interp = Interpreter::with_string_heap_cap(config.max_heap_bytes)?;
@@ -3134,13 +3191,7 @@ impl Runtime {
                         &config.warning_options,
                         config.process_title.as_deref(),
                         runtime_task_spawner.as_ref(),
-                        &std::sync::Arc::new(crate::commonjs::CjsConfig {
-                            capabilities: config.capabilities.clone(),
-                            hosted: config.hosted_modules.clone(),
-                            runtime_task_spawner: runtime_task_spawner.clone(),
-                            addon_loader: config.commonjs_addon_loader,
-                            report_watch_dependencies: crate::commonjs::watch_reporting_requested(),
-                        }),
+                        &commonjs,
                     )?;
                 }
                 if config.expose_gc {
@@ -3177,6 +3228,7 @@ impl Runtime {
             package_manager,
             layer_a_dynamic_imports,
             runtime_task_spawner,
+            commonjs,
             pending_exit_code: None,
             worker_child_ready: false,
             restored_from_snapshot: false,
@@ -3324,6 +3376,8 @@ pub struct Runtime {
     layer_a_dynamic_imports: LayerADynamicImportQueue,
     /// Sender for owned tasks that must run on the isolate event loop.
     runtime_task_spawner: Option<RuntimeTaskSpawner>,
+    /// The CommonJS configuration every `require` of this runtime shares.
+    commonjs: Arc<commonjs::CjsConfig>,
     /// Exit requested by JavaScript from a host-driven callback — a timer
     /// fire, a native event delivery, or an `uncaughtException` handler —
     /// after the entry evaluation already completed. An exit is not an
@@ -3954,14 +4008,14 @@ impl Runtime {
         let target_url = target_url.to_string();
         let records = &mut self.module_records;
         let config = &self.config;
-        let task_spawner = self.runtime_task_spawner.clone();
+        let commonjs = &self.commonjs;
         self.interp
             .with_dynamic_import_realm(token, move |interp| {
                 Ok(evaluate_and_settle_dynamic_linked_module_on(
                     interp,
                     records,
                     config,
-                    task_spawner,
+                    commonjs,
                     token,
                     &target_url,
                     linked,
@@ -4213,13 +4267,7 @@ impl Runtime {
         // their installers when needed); plain modules get fresh
         // environments — the same records pipeline the static loader uses.
         self.module_records
-            .allocate_for_module_inits(
-                &mut self.interp,
-                &context,
-                &self.config.hosted_modules,
-                &self.config.capabilities,
-                self.runtime_task_spawner.clone(),
-            )
+            .allocate_for_module_inits(&mut self.interp, &context, &self.commonjs)
             .map_err(|error| hosted_completion::into_dynamic(&mut self.interp, error))?;
         self.register_resolved_exports(&linked.metadata);
         self.report_watch_imports(&linked.module_sources);
@@ -6030,13 +6078,7 @@ impl Runtime {
         }
         let instantiate_started = timings.is_some().then(std::time::Instant::now);
         self.module_records
-            .allocate_for_module_inits(
-                &mut self.interp,
-                &context,
-                &self.config.hosted_modules,
-                &self.config.capabilities,
-                self.runtime_task_spawner.clone(),
-            )
+            .allocate_for_module_inits(&mut self.interp, &context, &self.commonjs)
             .map_err(|error| hosted_completion::into_runtime(&mut self.interp, error))?;
         // Only real registered environments precede export-table publication.
         self.register_resolved_exports(&linked.metadata);
@@ -7239,7 +7281,7 @@ fn evaluate_and_settle_dynamic_linked_module_on(
     interp: &mut Interpreter,
     records: &mut module_records::RuntimeModuleRecords,
     config: &RuntimeConfig,
-    task_spawner: Option<RuntimeTaskSpawner>,
+    commonjs: &Arc<commonjs::CjsConfig>,
     token: u64,
     target_url: &str,
     linked: module_graph::LinkedProgram,
@@ -7248,7 +7290,7 @@ fn evaluate_and_settle_dynamic_linked_module_on(
         interp,
         records,
         config,
-        task_spawner,
+        commonjs,
         target_url,
         linked,
     );
@@ -7325,7 +7367,7 @@ fn evaluate_dynamic_linked_module_on(
     interp: &mut Interpreter,
     records: &mut module_records::RuntimeModuleRecords,
     config: &RuntimeConfig,
-    task_spawner: Option<RuntimeTaskSpawner>,
+    commonjs: &Arc<commonjs::CjsConfig>,
     target_url: &str,
     linked: module_graph::LinkedProgram,
 ) -> Result<DynamicModuleLoad, DynLoadError> {
@@ -7349,13 +7391,7 @@ fn evaluate_dynamic_linked_module_on(
         .link_evictable_module(linked.module, sources)
         .map_err(|error| DynLoadError::Fatal(OtterError::from(error)))?;
     records
-        .allocate_for_module_inits(
-            interp,
-            &context,
-            &config.hosted_modules,
-            &config.capabilities,
-            task_spawner,
-        )
+        .allocate_for_module_inits(interp, &context, commonjs)
         .map_err(|error| hosted_completion::into_dynamic(interp, error))?;
     for metadata in &linked.metadata {
         if metadata.source_url.is_empty() || metadata.resolved_exports.is_empty() {

@@ -123,7 +123,7 @@ fn completed_dynamic_module_keeps_exact_source_refusal_in_default_and_additional
             Some(realm) => {
                 let records = &mut runtime.module_records;
                 let config = &runtime.config;
-                let task_spawner = runtime.runtime_task_spawner.clone();
+                let commonjs = &runtime.commonjs;
                 runtime
                     .interp
                     .with_host_realm(realm.realm, |interp| {
@@ -131,7 +131,7 @@ fn completed_dynamic_module_keeps_exact_source_refusal_in_default_and_additional
                             interp,
                             records,
                             config,
-                            task_spawner,
+                            commonjs,
                             url,
                             linked,
                         ))

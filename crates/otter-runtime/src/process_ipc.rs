@@ -398,13 +398,7 @@ impl crate::RuntimeTask for ProcessIpcEvent {
         let Some(context) = runtime.realm_execution_context() else {
             return Ok(());
         };
-        let cjs_config = Arc::new(crate::commonjs::CjsConfig {
-            capabilities: runtime.config.capabilities.clone(),
-            hosted: runtime.config.hosted_modules.clone(),
-            runtime_task_spawner: runtime.runtime_task_spawner.clone(),
-            addon_loader: runtime.config.commonjs_addon_loader,
-            report_watch_dependencies: crate::commonjs::watch_reporting_requested(),
-        });
+        let cjs_config = Arc::clone(&runtime.commonjs);
         runtime.run_native_event(&context, move |ctx| {
             ctx.scope(|mut scope| {
                 let globals = scope.global_this();

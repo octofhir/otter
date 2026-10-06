@@ -8,10 +8,12 @@
 //! dependencies.
 //!
 //! # Contents
-//! - [`CjsConfig`] - capability snapshot + hosted-module list shared by all
-//!   `require` closures in a run.
+//! - [`CjsConfig`] - capability snapshot, hosted-module list and resolver
+//!   shared by every `require` of a runtime.
 //! - [`cjs_instantiate_file`] - compile + execute one CommonJS entry file.
-//! - `resolve_module` - canonical hosted/file resolution and cache keys.
+//! - `resolve_module` - hosted lookup, then Node's CommonJS resolution through
+//!   the runtime's module loader (`exports` / `imports`, package graph), and
+//!   cache keys.
 //! - `cjs_load` - load hosted modules, files, and native addons through the
 //!   shared module-record cache.
 //! - [`SCHEME_ONLY_BUILTINS`] - builtins a user module reaches only as
@@ -35,9 +37,10 @@
 //! - Hosted namespace and CommonJS-value installers run directly in the
 //!   loader's existing handle scope. Namespace cache publication and
 //!   `require.cache` publication happen before that scope closes.
-//! - Filesystem capabilities are checked before any module or package manifest
-//!   is read; native addons additionally pass through the configured loader's
-//!   FFI capability check.
+//! - Filesystem capabilities are checked before any module file is read.
+//!   Package manifests are resolution metadata the shared resolver reads, as
+//!   for `import`. Native addons additionally pass through the configured
+//!   loader's FFI capability check.
 //! - A bare specifier names a builtin only when the requester is allowed to
 //!   spell it that way: builtins require each other bare, while a user module
 //!   naming a [`SCHEME_ONLY_BUILTINS`] entry gets `node_modules` resolution.
@@ -59,14 +62,19 @@ use crate::{
     RuntimeTaskSpawner, runtime_type_error,
 };
 
-/// Shared configuration for a CommonJS run: capability snapshot, hosted
-/// modules, task spawner, and optional native-addon loader.
-#[derive(Clone)]
+/// The CommonJS configuration a runtime's `require` functions share:
+/// capability snapshot, hosted modules, task spawner, optional native-addon
+/// loader, and the resolver.
+#[derive(Debug)]
 pub(crate) struct CjsConfig {
     pub(crate) capabilities: CapabilitySet,
     pub(crate) hosted: Vec<HostedModule>,
     pub(crate) runtime_task_spawner: Option<RuntimeTaskSpawner>,
     pub(crate) addon_loader: Option<CommonJsAddonLoader>,
+    /// Node's CommonJS resolution over the runtime's loader configuration:
+    /// the same package graph, `exports` / `imports` maps and extensions as
+    /// `import`, under the `require` conditions.
+    pub(crate) resolver: crate::module_loader::ModuleLoader,
     /// Whether this run reports each file it requires to a watching
     /// parent. Set once per run, from the environment the parent spawned
     /// it with; see [`watch_reporting_requested`].
@@ -256,60 +264,17 @@ impl CjsResolution {
             target: CjsTarget::File(path),
         }
     }
-}
 
-/// Resolve a file/directory candidate using Node's CommonJS extension and
-/// package-main probes.
-fn resolve_path(base: &Path, capabilities: &CapabilitySet) -> Option<PathBuf> {
-    let candidates = [
-        base.to_path_buf(),
-        base.with_extension("js"),
-        base.with_extension("cjs"),
-        base.with_extension("json"),
-        base.with_extension("node"),
-    ];
-    for candidate in candidates {
-        if candidate.is_file() {
-            return std::fs::canonicalize(&candidate).ok().or(Some(candidate));
+    /// The referrer this module's own `require` resolves from.
+    fn referrer(&self) -> CjsReferrer {
+        CjsReferrer {
+            dir: self.dir.clone(),
+            file: match &self.target {
+                CjsTarget::File(path) => Some(path.clone()),
+                CjsTarget::Hosted(_) => None,
+            },
         }
     }
-    if base.is_dir() {
-        let package_json = base.join("package.json");
-        if capabilities.read.matches_path(&package_json)
-            && let Ok(source) = std::fs::read_to_string(&package_json)
-            && let Ok(package) = serde_json::from_str::<serde_json::Value>(&source)
-            && let Some(main) = package.get("main").and_then(|value| value.as_str())
-            && let Some(resolved) = resolve_path(&base.join(main), capabilities)
-        {
-            return Some(resolved);
-        }
-        for index in ["index.js", "index.cjs", "index.json", "index.node"] {
-            let candidate = base.join(index);
-            if candidate.is_file() {
-                return std::fs::canonicalize(&candidate).ok().or(Some(candidate));
-            }
-        }
-    }
-    None
-}
-
-/// Resolve relative, absolute, and bare package specifiers. Bare packages walk
-/// ancestor `node_modules` directories, including scoped package names and
-/// subpaths (`@scope/pkg/subpath`).
-fn resolve_file(dir: &Path, spec: &str, capabilities: &CapabilitySet) -> Option<PathBuf> {
-    if Path::new(spec).is_absolute() {
-        return resolve_path(Path::new(spec), capabilities);
-    }
-    if spec.starts_with('.') {
-        return resolve_path(&dir.join(spec), capabilities);
-    }
-    for ancestor in dir.ancestors() {
-        let candidate = ancestor.join("node_modules").join(spec);
-        if let Some(resolved) = resolve_path(&candidate, capabilities) {
-            return Some(resolved);
-        }
-    }
-    None
 }
 
 /// Resolve one specifier and derive its sole cache key.
@@ -319,7 +284,7 @@ fn resolve_file(dir: &Path, spec: &str, capabilities: &CapabilitySet) -> Option<
 /// registered specifier. Files use their canonical absolute path.
 fn resolve_module(
     cfg: &CjsConfig,
-    dir: &Path,
+    referrer: &CjsReferrer,
     spec: &str,
     from_builtin: bool,
 ) -> Result<CjsResolution, NativeError> {
@@ -328,11 +293,14 @@ fn resolve_module(
         return Ok(CjsResolution {
             filename: key.clone(),
             key,
-            dir: dir.to_path_buf(),
+            dir: referrer.dir.clone(),
             target: CjsTarget::Hosted(hosted),
         });
     }
-    let path = resolve_file(dir, spec, &cfg.capabilities).ok_or_else(|| {
+    let path = cfg
+        .resolver
+        .resolve_require(spec, referrer.file.as_deref(), &referrer.dir)
+        .map_err(|_| {
         // Node reports an unresolvable specifier as a plain `Error`
         // carrying `MODULE_NOT_FOUND`; callers branch on the code.
         NativeError::Coded {
@@ -344,18 +312,26 @@ fn resolve_module(
     Ok(CjsResolution::file(path))
 }
 
-/// Build a per-module `require` native function bound to `dir`. The shared cache
-/// object is passed as a traced VM capture; the directory and config are moved
-/// into the Rust closure.
+/// The module a `require` resolves from: its directory, and its file when it
+/// has one (a hosted builtin has none).
+#[derive(Debug, Clone)]
+struct CjsReferrer {
+    dir: PathBuf,
+    file: Option<PathBuf>,
+}
+
+/// Build a per-module `require` native function bound to its referrer. The
+/// shared cache object is passed as a traced VM capture; the referrer and
+/// config are moved into the Rust closure.
 fn make_require<'scope>(
     scope: &mut NativeScope<'scope, '_>,
     cfg: Arc<CjsConfig>,
     cache: Local<'_>,
-    dir: PathBuf,
+    referrer: CjsReferrer,
     from_builtin: bool,
 ) -> Result<Local<'scope>, NativeError> {
     let cfg_for_resolve = Arc::clone(&cfg);
-    let dir_for_resolve = dir.clone();
+    let referrer_for_resolve = referrer.clone();
     let closure = move |ctx: &mut NativeCtx<'_>,
                         args: &[Value],
                         captures: &[Value]|
@@ -371,16 +347,17 @@ fn make_require<'scope>(
                 "module specifier is required",
             ));
         }
-        cjs_load(ctx, &cfg, cache, &dir, &spec, from_builtin)
+        cjs_load(ctx, &cfg, cache, &referrer, &spec, from_builtin)
     };
     let require = scope.native_closure("require", 1, &[cache], closure)?;
     scope.define(require, "cache", cache, Attr::data().to_flags())?;
-    let resolve = make_require_resolve(scope, cfg_for_resolve, dir_for_resolve, from_builtin)?;
+    let resolve =
+        make_require_resolve(scope, cfg_for_resolve, referrer_for_resolve, from_builtin)?;
     scope.define(require, "resolve", resolve, Attr::data().to_flags())?;
     Ok(require)
 }
 
-/// Build `require.resolve` for one module directory.
+/// Build `require.resolve` for one referrer.
 ///
 /// It answers with the same resolution `require` itself would take — a
 /// builtin reports its registered specifier, a file its canonical path —
@@ -389,10 +366,10 @@ fn make_require<'scope>(
 fn make_require_resolve<'scope>(
     scope: &mut NativeScope<'scope, '_>,
     cfg: Arc<CjsConfig>,
-    dir: PathBuf,
+    referrer: CjsReferrer,
     from_builtin: bool,
 ) -> Result<Local<'scope>, NativeError> {
-    let paths_dir = dir.clone();
+    let paths_dir = referrer.dir.clone();
     let resolve = scope.native_closure("resolve", 1, &[], move |ctx, args, _captures| {
         let spec = crate::runtime_arg_to_string(args, 0, ctx.heap());
         if spec.is_empty() {
@@ -401,7 +378,7 @@ fn make_require_resolve<'scope>(
                 "module specifier is required",
             ));
         }
-        let resolution = resolve_module(&cfg, &dir, &spec, from_builtin)?;
+        let resolution = resolve_module(&cfg, &referrer, &spec, from_builtin)?;
         ctx.scope(|mut scope| {
             let filename = scope.string(&resolution.filename)?;
             Ok(scope.finish(filename))
@@ -514,7 +491,7 @@ fn load_resolved_scoped<'scope>(
             scope,
             cfg.clone(),
             cache,
-            resolution.dir.clone(),
+            resolution.referrer(),
             matches!(resolution.target, CjsTarget::Hosted(_)),
         )?;
         match &resolution.target {
@@ -653,17 +630,17 @@ fn load_resolved_scoped<'scope>(
     }
 }
 
-/// Resolve and load a module by specifier from `dir`. Returns the module's
-/// exports value.
-pub(crate) fn cjs_load(
+/// Resolve and load a module by specifier from `referrer`. Returns the
+/// module's exports value.
+fn cjs_load(
     ctx: &mut NativeCtx<'_>,
     cfg: &Arc<CjsConfig>,
     cache: object::JsObject,
-    dir: &Path,
+    referrer: &CjsReferrer,
     spec: &str,
     from_builtin: bool,
 ) -> Result<Value, NativeError> {
-    let resolution = resolve_module(cfg, dir, spec, from_builtin)?;
+    let resolution = resolve_module(cfg, referrer, spec, from_builtin)?;
     if cfg.report_watch_dependencies
         && let CjsTarget::File(path) = &resolution.target
     {

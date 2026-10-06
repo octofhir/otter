@@ -87,13 +87,7 @@ impl Runtime {
     ) -> Result<ExecutionResult, OtterError> {
         let start = std::time::Instant::now();
         let abs = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-        let cfg = std::sync::Arc::new(commonjs::CjsConfig {
-            capabilities: self.config.capabilities.clone(),
-            hosted: self.config.hosted_modules.clone(),
-            runtime_task_spawner: self.runtime_task_spawner.clone(),
-            addon_loader: self.config.commonjs_addon_loader,
-            report_watch_dependencies: crate::commonjs::watch_reporting_requested(),
-        });
+        let cfg = std::sync::Arc::clone(&self.commonjs);
         let load = otter_vm::NativeCtx::with_host_context(
             &mut self.interp,
             otter_vm::NativeCallInfo::default_call(),

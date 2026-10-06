@@ -1582,11 +1582,15 @@ impl RuntimeHandle {
                 message: e.to_string(),
             })?;
         let (interrupt, atomics_wait_agent, budget_telemetry) = match interrupt_rx.recv() {
-            Ok(handles) => handles,
+            Ok(Ok(handles)) => handles,
+            // Join the finished runner so a failed construction never leaves
+            // a detached isolate thread behind.
+            Ok(Err(error)) => {
+                let _ = runner.join();
+                return Err(error);
+            }
             Err(_) => {
-                // Bootstrap failed before publishing the interrupt handle.
-                // Join the finished runner so a failed construction never
-                // leaves a detached isolate thread behind.
+                // The runner died before publishing either outcome.
                 let _ = runner.join();
                 return Err(OtterError::Internal {
                     code: DiagnosticCode::IsolateStart.as_str().to_string(),
@@ -2513,11 +2517,16 @@ fn run_isolate(
     admitted: AdmittedRuntimeConfig,
     rx: mpsc::Receiver<RuntimeMessage>,
     counters: Arc<RuntimeCounters>,
-    interrupt_tx: SyncSender<(
-        otter_vm::InterruptFlag,
-        otter_vm::atomics_wait::WaitAgentHandle,
-        WorkBudgetTelemetry,
-    )>,
+    interrupt_tx: SyncSender<
+        Result<
+            (
+                otter_vm::InterruptFlag,
+                otter_vm::atomics_wait::WaitAgentHandle,
+                WorkBudgetTelemetry,
+            ),
+            OtterError,
+        >,
+    >,
     inbox: InboxSender,
     event_loop: TokioEventLoop,
     module_preparation: ModulePreparation,
@@ -2541,7 +2550,10 @@ fn run_isolate(
     let mut runtime =
         match Runtime::from_config_with_task_spawner(admitted, Some(runtime_task_spawner)) {
             Ok(runtime) => runtime,
-            Err(_) => return,
+            Err(error) => {
+                let _ = interrupt_tx.send(Err(error));
+                return;
+            }
         };
     let timer_scheduler = Arc::new(InboxTimerScheduler {
         inbox: inbox.clone(),
@@ -2563,11 +2575,11 @@ fn run_isolate(
         completion_pool: completion_pool.clone(),
     });
     runtime.install_dynamic_import_loader(dynamic_import_loader);
-    let _ = interrupt_tx.send((
+    let _ = interrupt_tx.send(Ok((
         runtime.interrupt_handle().raw_flag(),
         runtime.atomics_wait_agent_handle(),
         runtime.budget_telemetry(),
-    ));
+    )));
     let mut runner = IsolateRunner {
         runtime,
         rx,

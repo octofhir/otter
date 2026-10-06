@@ -1267,6 +1267,31 @@ impl Interpreter {
                 // it must run outside the in-frame mutable borrow
                 // below.
                 // <https://tc39.es/ecma262/#sec-ordinaryget>
+                Op::HasNamedProperty => {
+                    let key = context
+                        .property_atom(instr.const_word(2))
+                        .ok_or(VmError::InvalidOperand)?;
+                    let slot = function.property_feedback_at(
+                        instr.instruction_pc as usize,
+                        crate::property_ic::PropertyIcKind::Load,
+                    );
+                    (match self.run_has_named_property_reg(
+                        context,
+                        stack,
+                        top_idx,
+                        instr.reg(0),
+                        instr.reg(1),
+                        key,
+                        slot,
+                    ) {
+                        Ok(value) => value,
+                        Err(CommittedValueError::JavaScript(error)) => return Err(error),
+                        Err(CommittedValueError::Fatal(error)) => {
+                            return Ok(DispatchOutcome::Fatal(error));
+                        }
+                    });
+                    continue;
+                }
                 Op::LoadProperty => {
                     let dst = instr.reg(0);
                     let obj_reg = instr.reg(1);

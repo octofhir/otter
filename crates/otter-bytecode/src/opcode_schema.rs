@@ -1428,6 +1428,7 @@ opcode_schema! {
     (Op::TestTypeOf, 0xC0),
     (Op::SpreadAppend, 0xC1),
     (Op::DefineMember, 0xC2),
+    (Op::HasNamedProperty, 0xC3),
 }
 
 /// Return the authoritative schema row for `op`.
@@ -1782,6 +1783,7 @@ const fn operand_shape(op: Op) -> OperandShape {
             OperandShape::Fixed(&[R, R, R])
         }
         Op::DefineMember => OperandShape::Fixed(&[R, R, R, MEMBER_DEFINITION]),
+        Op::HasNamedProperty => OperandShape::Fixed(WRITE_READ_CONST),
         Op::Yield | Op::YieldDelegate => OperandShape::Fixed(WRITE_WRITE_READ),
         Op::SetFunctionName => OperandShape::Fixed(&[R, R, CONST]),
         Op::StoreGlobalChecked => OperandShape::Fixed(&[R, CONST, R]),

@@ -403,6 +403,7 @@ pub(crate) const fn opcode_work_units(op: Op) -> u8 {
         | Op::LoadElement
         | Op::StoreElement
         | Op::HasProperty
+        | Op::HasNamedProperty
         | Op::DeleteProperty
         | Op::GetIterator
         | Op::IteratorNext => 4,

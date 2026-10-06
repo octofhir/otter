@@ -7,6 +7,9 @@
 //!   compiled transition.
 //! - Young bound targets, Proxy operands, ToPropertyKey hooks, and prototype
 //!   traps surviving allocation at every moving-GC stress stride.
+//! - A constant-name `in` site whose inline cache follows every way an
+//!   answer changes: adding, deleting and inheriting the key, a new
+//!   prototype, a getter it must not run, and a non-object operand.
 //!
 //! # Invariants
 //! - Each protocol opcode completes in machine code through the shared
@@ -203,4 +206,42 @@ fn committed_protocol_roots_young_proxy_and_bound_intermediates() {
         native_calls >= 288,
         "every rooted protocol operation must cross the native boundary: {native_calls}"
     );
+}
+
+const NAMED_HAS_SOURCE: &str = r#"
+let getterRuns = 0;
+const proto = { inherited: 1 };
+Object.defineProperty(proto, "accessor", { get() { getterRuns++; return 1; } });
+function probe(o) {
+  return ["own" in o, "inherited" in o, "accessor" in o, "later" in o].join("");
+}
+const log = [];
+let last;
+const o = Object.create(proto);
+o.own = 1;
+for (let round = 0; round < 300; round++) {
+  if (round === 100) o.later = 1;
+  if (round === 150) delete proto.inherited;
+  if (round === 200) Object.setPrototypeOf(o, { inherited: 2 });
+  if (round === 250) delete o.own;
+  const answer = probe(o);
+  if (answer !== last) log.push(round + ":" + answer);
+  last = answer;
+}
+let thrown;
+try { "own" in 1; } catch (error) { thrown = error instanceof TypeError; }
+JSON.stringify([log, getterRuns, thrown]);
+"#;
+
+#[test]
+fn constant_name_in_follows_every_change_to_its_answer() {
+    let expected = r#"[["0:truetruetruefalse","100:truetruetruetrue","150:truefalsetruetrue","200:truetruefalsetrue","250:falsetruefalsetrue"],0,true]"#;
+    for selection in [
+        JitSelection::InterpreterOnly,
+        JitSelection::Template,
+        JitSelection::default(),
+    ] {
+        let (completion, _, _, _) = run_source(selection, NAMED_HAS_SOURCE, "named-has.js");
+        assert_eq!(completion, expected, "{selection:?}");
+    }
 }

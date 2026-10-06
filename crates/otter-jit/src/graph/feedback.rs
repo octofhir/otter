@@ -78,6 +78,27 @@ pub(crate) fn own_data_load(view: &JitCompileSnapshot, byte_pc: u32) -> Option<O
     })
 }
 
+/// The receiver shapes of a named site whose every program found the key
+/// as the receiver's own data field: each shape fixes that the key is
+/// present, whatever slot holds it.
+pub(crate) fn own_key_shapes(view: &JitCompileSnapshot, byte_pc: u32) -> Option<SmallVec<[u32; 4]>> {
+    let programs = view.property_programs.get(&byte_pc)?;
+    if programs.is_empty() || programs.len() > 4 {
+        return None;
+    }
+    programs
+        .iter()
+        .map(|program| match &*program.ops {
+            [
+                JitCacheIrOp::GuardShape { object: 0, shape },
+                JitCacheIrOp::GuardAtomSlot { object: 0, .. },
+                JitCacheIrOp::LoadField { object: 0, .. },
+            ] => Some(*shape),
+            _ => None,
+        })
+        .collect()
+}
+
 /// The existing writable own data slot every receiver shape the store site
 /// at `byte_pc` observed writes, if all agree on its offset.
 pub(crate) fn own_data_store(view: &JitCompileSnapshot, byte_pc: u32) -> Option<OwnDataLoad> {

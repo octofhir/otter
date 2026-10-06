@@ -1233,7 +1233,10 @@ impl Interpreter {
             .filter(|instr| {
                 matches!(
                     instr.op(&view.code_block),
-                    Op::LoadProperty | Op::StoreProperty | Op::CallMethodValue
+                    Op::LoadProperty
+                        | Op::HasNamedProperty
+                        | Op::StoreProperty
+                        | Op::CallMethodValue
                 )
             })
             .map(|instr| {
@@ -1242,7 +1245,7 @@ impl Interpreter {
                     instr.instruction_pc(&view.code_block),
                     instr.op(&view.code_block),
                     match instr.op(&view.code_block) {
-                        Op::LoadProperty | Op::CallMethodValue => {
+                        Op::LoadProperty | Op::HasNamedProperty | Op::CallMethodValue => {
                             instr.const_index(&view.code_block, 2)
                         }
                         Op::StoreProperty => instr.const_index(&view.code_block, 1),

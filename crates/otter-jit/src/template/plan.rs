@@ -1597,6 +1597,15 @@ impl TemplatePlan {
                         arg2: 0,
                     }
                 }
+                Op::HasNamedProperty => {
+                    let operands = lowered.property_load_operands()?;
+                    TemplateOp::ClassValueOp {
+                        opcode: Op::HasNamedProperty as u8,
+                        arg0: u64::from(operands.dst) | (u64::from(operands.object) << 16),
+                        arg1: u64::from(operands.name),
+                        arg2: 0,
+                    }
+                }
                 Op::DefineMember => {
                     let operands = lowered.define_member_operands()?;
                     TemplateOp::ClassValueOp {

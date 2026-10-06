@@ -16,6 +16,8 @@
 //! - [`Interpreter::builtin_next_proven`] / [`Interpreter::builtin_return_proven`]
 //!   — a built-in iterator's `next` / `return` is the one its state implements.
 //! - [`Interpreter::is_builtin_next`] — an observed `next` is that built-in.
+//! - The same proofs for sync generators over their own prototype chain
+//!   (the generator function's `.prototype`, then `%GeneratorPrototype%`).
 //!
 //! # Invariants
 //! - A proof is the prototype-chain validity cell of the prototype it
@@ -92,6 +94,9 @@ impl<T: Copy> Proof<T> {
 pub(crate) struct IterationProofs {
     iterables: [Option<Proof<bool>>; 4],
     iterators: [Option<Proof<IteratorFacts>>; 7],
+    /// The prototype chain of the last sync generator checked: a generator
+    /// function's `.prototype` and `%GeneratorPrototype%` above it.
+    generator: Option<Proof<IteratorFacts>>,
 }
 
 fn origin_index(origin: BuiltinIteratorOrigin) -> usize {
@@ -194,6 +199,10 @@ impl Interpreter {
                 || interp.proven_self_iterator(value)
             {
                 return Ok(Some(interp.escape_scoped(root)));
+            }
+            let value = interp.escape_scoped(root);
+            if !value.is_generator() || !(primordial || interp.proven_generator_iterable(value)) {
+                return Ok(None);
             }
             let value = interp.escape_scoped(root);
             let Some(handle) = value.as_generator() else {
@@ -300,6 +309,81 @@ impl Interpreter {
     /// allocate the chain's prototype roles once.
     fn iterable_proven(&mut self, kind: Iterable) -> bool {
         self.iterable_is_builtin(kind) && self.iterator_facts(kind.origin()).next
+    }
+
+    /// Whether a sync generator is proven to be its own GetIterator record,
+    /// stepped by `%GeneratorPrototype%.next`.
+    pub(crate) fn proven_generator_iterable(&mut self, generator: Value) -> bool {
+        self.generator_facts(generator)
+            .is_some_and(|facts| facts.iterable && facts.next)
+    }
+
+    /// Whether `Get(generator, "next")` is `%GeneratorPrototype%.next`.
+    pub(crate) fn proven_generator_next(&mut self, generator: Value) -> bool {
+        self.generator_facts(generator).is_some_and(|facts| facts.next)
+    }
+
+    /// Whether `GetMethod(generator, "return")` is
+    /// `%GeneratorPrototype%.return`.
+    pub(crate) fn proven_generator_return(&mut self, generator: Value) -> bool {
+        self.generator_facts(generator).is_some_and(|facts| facts.close)
+    }
+
+    /// Whether an observed `next` is `%GeneratorPrototype%.next`.
+    pub(crate) fn is_generator_next(&self, next: Value) -> bool {
+        is_static(
+            &self.gc_heap,
+            Some(Some(next)),
+            crate::intrinsics::iterator::generator_proto_next,
+        )
+    }
+
+    /// What a sync generator's prototype chain answers, when the generator
+    /// has no own properties. The proof is cached for the last chain.
+    fn generator_facts(&mut self, generator: Value) -> Option<IteratorFacts> {
+        let handle = generator.as_generator()?;
+        let heap = &self.gc_heap;
+        if handle.is_async(heap) || handle.expando(heap).is_some() {
+            return None;
+        }
+        let prototype = match handle.prototype_override(heap) {
+            Some(link) => link.as_object()?,
+            None => self.shared_generator_object_prototype(false)?,
+        };
+        if let Some(proof) = &self.realm_intrinsics.iteration.generator
+            && proof.validity.is_valid()
+            && chain_validity(prototype, &self.gc_heap)
+                .is_some_and(|cell| Arc::ptr_eq(&cell, &proof.validity))
+        {
+            return Some(proof.facts);
+        }
+        self.with_handle_scope(|interp, scope| {
+            let root = interp.scoped_value(scope, Value::object(prototype));
+            let (validity, first) =
+                interp.prove_chain(|interp| interp.escape_scoped(root).as_object())?;
+            let heap = &interp.gc_heap;
+            let symbol = interp.well_known_symbols.get(WellKnown::Iterator);
+            use crate::intrinsics::iterator as it;
+            let facts = IteratorFacts {
+                next: is_static(
+                    heap,
+                    chain_data(heap, first, Key::Name("next")),
+                    it::generator_proto_next,
+                ),
+                close: is_static(
+                    heap,
+                    chain_data(heap, first, Key::Name("return")),
+                    it::generator_proto_return,
+                ),
+                iterable: is_static(
+                    heap,
+                    chain_data(heap, first, Key::Symbol(symbol)),
+                    it::iterator_proto_symbol_iterator,
+                ),
+            };
+            interp.realm_intrinsics.iteration.generator = Some(Proof { validity, facts });
+            Some(facts)
+        })
     }
 
     /// Whether `Get(iterator, "next")` is the built-in step of its state.

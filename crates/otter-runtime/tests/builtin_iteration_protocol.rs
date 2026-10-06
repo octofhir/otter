@@ -94,3 +94,32 @@ fn removed_array_iterator_makes_arrays_not_iterable() {
     "#);
     assert_eq!(out, "true,2");
 }
+
+#[test]
+fn replaced_generator_protocol_is_called() {
+    let out = run(r#"
+        var log = [];
+        function* g() { try { yield 1; yield 2; yield 3; } finally { log.push("finally"); } }
+        var GP = Object.getPrototypeOf(g.prototype);
+        var next = GP.next, ret = GP.return;
+        for (var x of g()) { log.push(x); if (x === 2) break; }
+        GP.next = function () { log.push("n"); return next.call(this); };
+        for (var y of g()) log.push(y);
+        GP.next = next;
+        GP.return = function () { log.push("r"); return ret.call(this); };
+        for (var z of g()) break;
+        GP.return = ret;
+        var own = g();
+        own.next = function () { log.push("own"); return { done: true }; };
+        for (var w of own) log.push(w);
+        g.prototype.next = function () { log.push("fnproto"); return { done: true }; };
+        for (var v of g()) log.push(v);
+        delete g.prototype.next;
+        log.push([...g()].length, new Set(g()).size);
+        log.join(",");
+    "#);
+    assert_eq!(
+        out,
+        "1,2,finally,n,1,n,2,n,3,n,finally,r,finally,own,fnproto,finally,finally,3,3"
+    );
+}

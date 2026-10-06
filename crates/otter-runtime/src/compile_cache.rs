@@ -29,9 +29,10 @@
 //!   large module is never fully encoded and rejected afterwards.
 //! - Every hit passes the mandatory bytecode verifier before it can reach the
 //!   VM. Every cache failure degrades silently to normal compilation.
-//! - Quotas are enforced by a locked scan-and-prune pass when a process first
-//!   publishes and whenever its running size estimate would cross a quota;
-//!   other publications only add to that estimate.
+//! - The root's lock file records the tree's size. A publication adds itself
+//!   to that record; only a missing record or one that would cross a quota
+//!   triggers the locked scan-and-prune pass, which evicts the oldest entries
+//!   down to three quarters of each quota so the passes stay rare.
 //! - The cache is owner-trusted, cooperative storage, not a semantic
 //!   authenticity boundary against another process running as the same user.
 //!   The verifier protects VM safety; the private root, build fingerprint,
@@ -60,7 +61,7 @@ const CACHE_DIRECTORY: &str = "compiled";
 pub(crate) const MAX_COMPILE_CACHE_TOTAL_BYTES: u64 = 512 * 1024 * 1024;
 
 /// Default hard quota for retained entries in one compile-cache root.
-pub(crate) const MAX_COMPILE_CACHE_ENTRIES: usize = 4_096;
+pub(crate) const MAX_COMPILE_CACHE_ENTRIES: u64 = 4_096;
 
 /// Maximum directory entries one maintenance pass will inspect.
 ///
@@ -143,16 +144,13 @@ pub(crate) struct CompileCache {
     root: PathBuf,
     #[cfg(unix)]
     policy: CompileCachePolicy,
-    /// This process's running size of the tree, shared by every clone.
-    #[cfg(unix)]
-    estimate: std::sync::Arc<std::sync::Mutex<Option<unix::CacheSize>>>,
 }
 
 #[cfg(unix)]
 #[derive(Debug, Clone, Copy)]
 struct CompileCachePolicy {
     max_bytes: u64,
-    max_entries: usize,
+    max_entries: u64,
     max_scan_entries: usize,
 }
 
@@ -178,8 +176,6 @@ impl CompileCache {
             root: root.into(),
             #[cfg(unix)]
             policy: CompileCachePolicy::default(),
-            #[cfg(unix)]
-            estimate: std::sync::Arc::default(),
         }
     }
 
@@ -188,7 +184,6 @@ impl CompileCache {
         Self {
             root: root.into(),
             policy,
-            estimate: std::sync::Arc::default(),
         }
     }
 
@@ -265,7 +260,7 @@ impl CompileCache {
         #[cfg(unix)]
         {
             if bytes.len() <= MAX_COMPILE_CACHE_ENTRY_BYTES {
-                unix::store(&self.root, self.policy, &self.estimate, key, bytes);
+                unix::store(&self.root, self.policy, key, bytes);
             }
         }
         #[cfg(not(unix))]

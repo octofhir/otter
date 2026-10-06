@@ -192,12 +192,12 @@ impl Interpreter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::property_atom::{NameInterner, PropertyAtom};
+    use crate::property_atom::PropertyAtom;
 
     #[test]
     fn ordinary_eligibility_preserves_intrinsic_collection_and_string_proofs() {
         let mut interpreter = Interpreter::new().expect("fixture interpreter bootstrap");
-        let names = NameInterner::default();
+        let names = std::sync::Arc::clone(&interpreter.names);
         let key = |name: &'static str| {
             AtomizedPropertyKey::new(PropertyAtom::new(names.intern(name)), name)
         };
@@ -214,19 +214,15 @@ mod tests {
                 interpreter.realm_intrinsics.set_prototype().unwrap(),
             ),
         ] {
-            let initial_state = object::state(prototype, &interpreter.gc_heap);
-            assert!(initial_state.is_dictionary() && !initial_state.is_opaque());
-            assert!(!object::supports_fast_property_ic(
-                prototype,
-                &interpreter.gc_heap
-            ));
-            let programs = interpreter.jit_intrinsic_property_programs(key(name));
+            // Bootstrap gives every intrinsic prototype its hidden class.
+            let shape = object::keyed_shape(prototype, &interpreter.gc_heap);
+            assert!(!shape.is_null());
             assert!(object::supports_fast_property_ic(
                 prototype,
                 &interpreter.gc_heap
             ));
-            let shape = object::keyed_shape(prototype, &interpreter.gc_heap);
-            assert!(!shape.is_null());
+            let programs = interpreter.jit_intrinsic_property_programs(key(name));
+            assert_eq!(object::keyed_shape(prototype, &interpreter.gc_heap), shape);
             assert!(!object::state(prototype, &interpreter.gc_heap).is_provisional());
             assert!(
                 programs.iter().any(|program| matches!(
@@ -237,7 +233,7 @@ mod tests {
                     op, JitCacheIrOp::GuardShape { object: 1, shape: baked }
                         if *baked == shape.offset()
                 ))),
-                "ordinary dictionary preparation publishes the exact migrated holder proof"
+                "the program guards the prototype's bootstrap hidden class"
             );
         }
 
@@ -263,7 +259,7 @@ mod tests {
     #[test]
     fn collection_size_has_no_intrinsic_property_program() {
         let mut interpreter = Interpreter::new().expect("fixture interpreter bootstrap");
-        let names = NameInterner::default();
+        let names = std::sync::Arc::clone(&interpreter.names);
         let key = |name: &'static str| {
             AtomizedPropertyKey::new(PropertyAtom::new(names.intern(name)), name)
         };

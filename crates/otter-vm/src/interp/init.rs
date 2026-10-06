@@ -338,6 +338,14 @@ impl Interpreter {
         interp
             .realm_intrinsics
             .populate(&mut interp.gc_heap, global_this);
+        // The intrinsic prototypes get their hidden classes now, before any
+        // inline cache or generated guard records the shape of one: a later
+        // migration would move every receiver class keyed on it at once.
+        for slot in crate::realm_intrinsics::Intrinsic::ALL {
+            if let Some(mut prototype) = interp.realm_intrinsics.get(slot) {
+                interp.migrate_slow_to_fast(&mut prototype);
+            }
+        }
         let extra_roots = otter_gc::ExtraRoots::new(&*interp);
         let extra_roots_guard = interp.gc_heap.register_extra_roots(extra_roots);
         let mut iterator_roots = [Value::undefined(); 7];

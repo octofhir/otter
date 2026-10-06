@@ -21,12 +21,14 @@
 //!   transition target died before those cells can be reused, so a handle
 //!   compare is an exact layout proof. Only fast ordinary shapes are
 //!   installed; dictionary and opaque objects never match an entry.
-//! - A function receiver's map is its property bag's shape, keyed with the
-//!   low bit set (shape handles are 8-aligned, so the key never equals an
-//!   ordinary receiver's shape): the bag carries the function's own
-//!   `[[Prototype]]`, so the bag's shape fixes the function's ordinary lookup
-//!   for every key the function does not synthesize. Its handlers act on the
-//!   bag as their lookup-start object (V8's `lookup_start_object`).
+//! - A receiver whose named lookup starts at another object is keyed by that
+//!   lookup-start object's shape with the low bit set (shape handles are
+//!   8-aligned, so the key never equals an ordinary receiver's shape), and
+//!   its handlers act on the lookup-start object (V8's
+//!   `lookup_start_object`): a function's property bag, which carries the
+//!   function's own `[[Prototype]]`, for every key the function does not
+//!   synthesize; an ordinary dense array's prototype, for every named key
+//!   but `length`.
 //! - A matched receiver shape fixes the object's lookup state, own keys,
 //!   attributes, prototype and storage banks. Prototype-field and
 //!   nonexistent handlers additionally require their chain proof; a
@@ -151,9 +153,9 @@ pub enum TransitionGuard {
 /// separate emptiness test.
 pub const EMPTY_SHAPE: u32 = u32::MAX;
 
-/// Key bit of a function receiver's map: its property bag's shape handle with
-/// the low bit set.
-pub const FUNCTION_RECEIVER_KEY_BIT: u32 = 1;
+/// Key bit of a receiver whose named lookup starts at another object: that
+/// lookup-start object's shape handle with the low bit set.
+pub const LOOKUP_START_KEY_BIT: u32 = 1;
 
 const STATE_COUNT_MASK: u32 = 0xff;
 const STATE_ATTEMPTED: u32 = 1 << 8;
@@ -242,11 +244,11 @@ impl IcEntry {
     fn shape_handle(&self) -> ShapeHandle {
         // SAFETY: entry keys hold shape handles (plus the function bit)
         // published by `write`; the weak pass clears dead ones.
-        unsafe { ShapeHandle::from_offset(self.shape() & !FUNCTION_RECEIVER_KEY_BIT) }
+        unsafe { ShapeHandle::from_offset(self.shape() & !LOOKUP_START_KEY_BIT) }
     }
 
-    fn function_receiver(&self) -> bool {
-        self.shape() != EMPTY_SHAPE && self.shape() & FUNCTION_RECEIVER_KEY_BIT != 0
+    fn lookup_start(&self) -> bool {
+        self.shape() != EMPTY_SHAPE && self.shape() & LOOKUP_START_KEY_BIT != 0
     }
 
     /// Move `other`'s contents (including its proof count) into `self`.
@@ -299,7 +301,7 @@ impl IcEntry {
 #[derive(Debug, Clone)]
 pub(crate) struct IcHandler {
     receiver_shape: ShapeHandle,
-    function_receiver: bool,
+    lookup_start: bool,
     kind: IcHandlerKind,
     field: FieldLocation,
     slot: u16,
@@ -334,7 +336,7 @@ impl IcHandler {
             }
             return Some(Self {
                 receiver_shape,
-                function_receiver: false,
+                lookup_start: false,
                 kind: IcHandlerKind::OwnField,
                 field,
                 slot: resolved.hit.slot,
@@ -348,7 +350,7 @@ impl IcHandler {
         }
         Some(Self {
             receiver_shape,
-            function_receiver: false,
+            lookup_start: false,
             kind: IcHandlerKind::PrototypeField,
             field,
             slot: resolved.hit.slot,
@@ -366,7 +368,7 @@ impl IcHandler {
     ) -> Option<Self> {
         Self::eligible_receiver(receiver_shape).then(|| Self {
             receiver_shape,
-            function_receiver: false,
+            lookup_start: false,
             kind: IcHandlerKind::NonExistent,
             field: FieldLocation::from_cache_key(0),
             slot: 0,
@@ -376,19 +378,23 @@ impl IcHandler {
         })
     }
 
-    /// This load handler, serving a function receiver whose property bag has
-    /// the handler's receiver shape: the bag is the lookup-start object.
+    /// This load handler, serving a receiver whose lookup-start object has the
+    /// handler's receiver shape: a function's property bag or an ordinary
+    /// dense array's prototype.
     #[must_use]
-    pub(crate) fn for_function_receiver(mut self) -> Self {
-        debug_assert!(!self.kind.is_store(), "function receivers take loads only");
-        self.function_receiver = true;
+    pub(crate) fn for_lookup_start(mut self) -> Self {
+        debug_assert!(
+            !self.kind.is_store(),
+            "lookup-start receivers take loads only"
+        );
+        self.lookup_start = true;
         self
     }
 
     fn key(&self) -> u32 {
         self.receiver_shape.offset()
-            | if self.function_receiver {
-                FUNCTION_RECEIVER_KEY_BIT
+            | if self.lookup_start {
+                LOOKUP_START_KEY_BIT
             } else {
                 0
             }
@@ -427,7 +433,7 @@ impl IcHandler {
             (
                 Self {
                     receiver_shape,
-                    function_receiver: false,
+                    lookup_start: false,
                     kind: IcHandlerKind::StoreField,
                     field: object::field_location(receiver_shape, u32::from(hit.slot)),
                     slot: hit.slot,
@@ -471,7 +477,7 @@ impl IcHandler {
         };
         Some(Self {
             receiver_shape: from_shape,
-            function_receiver: false,
+            lookup_start: false,
             kind: IcHandlerKind::StoreTransition,
             field,
             slot: transition.slot,
@@ -490,7 +496,7 @@ impl IcHandler {
         Self {
             // SAFETY: the fixture handle is never dereferenced.
             receiver_shape: unsafe { ShapeHandle::from_offset(shape_offset) },
-            function_receiver: false,
+            lookup_start: false,
             kind: IcHandlerKind::OwnField,
             field: FieldLocation::inline(0),
             slot: 0,
@@ -676,7 +682,7 @@ impl PropertyIcSlot {
         let entry = self
             .live()
             .iter()
-            .find(|entry| entry.kind() == own && !entry.function_receiver());
+            .find(|entry| entry.kind() == own && !entry.lookup_start());
         match entry {
             Some(entry) => {
                 self.inline_field
@@ -719,19 +725,19 @@ impl PropertyIcSlot {
         }
     }
 
-    /// Run the load handler of a function receiver whose property bag is
-    /// `bag`. `None` on a miss.
+    /// Run the load handler of a receiver whose named lookup starts at
+    /// `start`. `None` on a miss.
     #[must_use]
-    pub(crate) fn probe_function_load(
+    pub(crate) fn probe_lookup_start_load(
         &self,
-        bag: JsObject,
+        start: JsObject,
         heap: &otter_gc::GcHeap,
     ) -> Option<Value> {
-        let shape = object::keyed_shape(bag, heap);
+        let shape = object::keyed_shape(start, heap);
         if shape.is_null() {
             return None;
         }
-        self.probe_load_from(bag, shape.offset() | FUNCTION_RECEIVER_KEY_BIT, heap)
+        self.probe_load_from(start, shape.offset() | LOOKUP_START_KEY_BIT, heap)
     }
 
     /// Run the load handler keyed `key` with `obj` as lookup-start object.
@@ -883,7 +889,7 @@ impl PropertyIcSlot {
             heap.is_marked(unsafe { ShapeHandle::from_offset(handle) }.raw())
         };
         self.retain(|entry| {
-            live(entry.shape() & !FUNCTION_RECEIVER_KEY_BIT)
+            live(entry.shape() & !LOOKUP_START_KEY_BIT)
                 && (entry.aux.load(Ordering::Relaxed) == 0
                     || live(entry.aux.load(Ordering::Relaxed)))
         });
@@ -895,7 +901,7 @@ impl PropertyIcSlot {
         let [entry] = self.live() else {
             return None;
         };
-        (entry.kind() == IcHandlerKind::OwnField && !entry.function_receiver())
+        (entry.kind() == IcHandlerKind::OwnField && !entry.lookup_start())
             .then(|| (entry.shape_handle(), entry.slot()))
     }
 
@@ -1006,9 +1012,9 @@ impl PropertyIcSlot {
         use crate::jit::JitCacheIrOp;
         let mut programs = Vec::with_capacity(self.entry_count());
         for entry in self.live() {
-            // Function receivers have no CacheIR lowering in the optimizing
+            // Lookup-start receivers have no CacheIR lowering in the optimizing
             // tier; they reach its generic node like unseen shapes.
-            if entry.function_receiver() {
+            if entry.lookup_start() {
                 continue;
             }
             let receiver = entry.shape_handle();

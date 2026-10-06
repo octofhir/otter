@@ -549,6 +549,63 @@ impl crate::Interpreter {
         }
     }
 
+    /// A named load on an ordinary dense array through the site's load
+    /// cache, with the array's `[[Prototype]]` as lookup-start object (V8's
+    /// `lookup_start_object`): the prototype's handlers answer it exactly as
+    /// they answer a load on the prototype itself. `None` means the caller
+    /// completes the load.
+    pub(crate) fn array_receiver_load(
+        &mut self,
+        slot: crate::feedback::PropertyFeedbackSlot<'_>,
+        receiver: crate::Value,
+        key: AtomizedPropertyKey<'_>,
+    ) -> Option<crate::Value> {
+        let proto = self.array_lookup_start(receiver, key.name())?;
+        if let Some(value) = slot.native().probe_lookup_start_load(proto, &self.gc_heap) {
+            slot.record_hit();
+            return Some(value);
+        }
+        slot.record_miss();
+        let load = self.resolve_property_load(proto, key);
+        let shape = object::keyed_shape(proto, &self.gc_heap);
+        let (handler, value) = match load {
+            PropertyLoad::Data(resolved) => (
+                crate::property_ic::IcHandler::load_resolved(shape, &resolved),
+                resolved.value,
+            ),
+            PropertyLoad::Absent(proof) => (
+                crate::property_ic::IcHandler::load_nonexistent(shape, proof),
+                crate::Value::undefined(),
+            ),
+            PropertyLoad::Other => return None,
+        };
+        if !slot.is_megamorphic()
+            && let Some(handler) = handler
+        {
+            slot.install(handler.for_lookup_start());
+        }
+        Some(value)
+    }
+
+    /// Where a named lookup on `receiver` starts when the receiver is an
+    /// ordinary dense array: its `%Array.prototype%`. Such an array owns no
+    /// named property but `length`, so every other non-index name resolves on
+    /// the prototype chain alone.
+    pub(crate) fn array_lookup_start(
+        &self,
+        receiver: crate::Value,
+        name: &str,
+    ) -> Option<JsObject> {
+        let arr = receiver.as_array()?;
+        if name == "length"
+            || object::array_index_property_name(name).is_some()
+            || !crate::array::is_ordinary_dense(arr, &self.gc_heap)
+        {
+            return None;
+        }
+        self.realm_intrinsics.array_prototype()
+    }
+
     /// Complete a named load on a closure through its site's function-map
     /// handlers, installing one on a miss: V8 serves `f.call`, constructor
     /// statics and function expandos through the function's map alike.
@@ -571,7 +628,7 @@ impl crate::Interpreter {
         if closure.proto_override(&self.gc_heap).is_some() || self.active_realm_id != 0 {
             return None;
         }
-        if let Some(value) = slot.native().probe_function_load(bag, &self.gc_heap) {
+        if let Some(value) = slot.native().probe_lookup_start_load(bag, &self.gc_heap) {
             slot.record_hit();
             return Some(value);
         }
@@ -615,7 +672,7 @@ impl crate::Interpreter {
         if !slot.is_megamorphic()
             && let Some(handler) = handler
         {
-            slot.install(handler.for_function_receiver());
+            slot.install(handler.for_lookup_start());
         }
         Some(value)
     }

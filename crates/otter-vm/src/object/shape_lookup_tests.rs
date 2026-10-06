@@ -181,7 +181,7 @@ fn shaped_own_slot_fixture() -> (crate::Interpreter, JsObject) {
 #[test]
 fn own_data_hits_allow_symbols_and_retire_when_descriptor_authority_changes() {
     let (mut interpreter, mut object) = shaped_own_slot_fixture();
-    let names = crate::property_atom::NameInterner::default();
+    let names = std::sync::Arc::clone(&interpreter.names);
     let atom = crate::property_atom::PropertyAtom::new(names.intern("0"));
     let key = AtomizedPropertyKey::new(atom, "0");
     let hit = lookup_own_atom(object, interpreter.gc_heap(), key)
@@ -235,7 +235,7 @@ fn own_data_hits_allow_symbols_and_retire_when_descriptor_authority_changes() {
 #[test]
 fn own_data_hits_preserve_mapped_argument_values() {
     let (mut interpreter, mut object) = shaped_own_slot_fixture();
-    let names = crate::property_atom::NameInterner::default();
+    let names = std::sync::Arc::clone(&interpreter.names);
     let atom = crate::property_atom::PropertyAtom::new(names.intern("0"));
     let key = AtomizedPropertyKey::new(atom, "0");
     let hit = lookup_own_atom(object, interpreter.gc_heap(), key)

@@ -26,7 +26,7 @@
 use dynasmrt::{DynamicLabel, DynasmApi, DynasmLabelApi, dynasm, x64::Assembler};
 use otter_vm::JitCompileSnapshot;
 use otter_vm::jit::{
-    PROPERTY_IC_FUNCTION_RECEIVER_KEY_BIT as FUNCTION_RECEIVER_KEY_BIT, PROPERTY_IC_LAYOUT as IC,
+    PROPERTY_IC_LAYOUT as IC, PROPERTY_IC_LOOKUP_START_KEY_BIT as LOOKUP_START_KEY_BIT,
     PropertyIcHandlerKind as Kind,
 };
 
@@ -109,7 +109,7 @@ pub(crate) fn emit_select_entry(
                 ; test Rd(start), Rd(start) ; jz =>miss
                 ; add Rq(start), r11
                 ; mov r11d, [Rq(start) + view.object_shape_byte as i32]
-                ; or r11d, FUNCTION_RECEIVER_KEY_BIT as i32);
+                ; or r11d, LOOKUP_START_KEY_BIT as i32);
         }
     }
     dynasm!(ops ; .arch x64

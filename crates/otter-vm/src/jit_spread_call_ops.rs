@@ -124,6 +124,14 @@ impl Interpreter {
                     obj,
                 );
             }
+            if method.is_undefined()
+                && let Some(slot) = property_slot
+                && let Some(key) = context.property_atom_for_function(function_id, name_index)
+                && let Some(found) = interp.array_receiver_load(slot, receiver, key)
+                && interp.is_callable_runtime(&found)
+            {
+                method = found;
+            }
             if method.is_undefined() {
                 let method_key = context
                     .property_atom_for_function(function_id, name_index)

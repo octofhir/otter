@@ -1260,10 +1260,9 @@ pub(crate) fn compile_spread_call_args(
     Ok(dst)
 }
 
-/// Append every element of `iterable` (already materialised as an
-/// expression) into the array in `dst_reg`. Lowered as a tight
-/// `IteratorNext` loop over a fresh iterator. Shared between the
-/// array-literal spread path and the call-argument spread path.
+/// Append every value `iterable` iterates into the array in `dst_reg`:
+/// one [`Op::SpreadAppend`]. Shared between the array-literal spread path
+/// and the call-argument spread path.
 pub(crate) fn emit_spread_into_array(
     cx: &mut Compiler,
     dst_reg: u16,
@@ -1271,32 +1270,10 @@ pub(crate) fn emit_spread_into_array(
     span: (u32, u32),
 ) -> Result<(), CompileError> {
     let iterable_reg = compile_expr(cx, iterable, span)?;
-    let iter_reg = cx.alloc_scratch();
     cx.emit(
-        Op::GetIterator,
-        [Operand::Register(iter_reg), Operand::Register(iterable_reg)],
+        Op::SpreadAppend,
+        [Operand::Register(dst_reg), Operand::Register(iterable_reg)],
         span,
     );
-    let value_reg = cx.alloc_scratch();
-    let done_reg = cx.alloc_scratch();
-    let loop_top = cx.next_pc();
-    cx.emit(
-        Op::IteratorNext,
-        vec![
-            Operand::Register(value_reg),
-            Operand::Register(done_reg),
-            Operand::Register(iter_reg),
-        ],
-        span,
-    );
-    let exit = cx.emit_branch_placeholder(Op::JumpIfTrue, Some(done_reg), span);
-    cx.emit(
-        Op::ArrayPush,
-        [Operand::Register(dst_reg), Operand::Register(value_reg)],
-        span,
-    );
-    let back = cx.emit_branch_placeholder(Op::Jump, None, span);
-    cx.patch_branch(back, loop_top);
-    cx.patch_branch_to_here(exit);
     Ok(())
 }

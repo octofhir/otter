@@ -2946,14 +2946,74 @@ impl Interpreter {
         self.iterator_close_discarding_completion(stack, context, &Value::iterator(*handle))
     }
 
-    /// §7.4.13 IteratorToList synchronous helper.
+    /// `Op::SpreadAppend` — §13.2.4.1 ArrayAccumulation for one
+    /// SpreadElement: append IteratorToList(GetIterator(iterable)) to the
+    /// array in `array_reg`. A spread never closes its iterator.
+    pub(crate) fn spread_append(
+        &mut self,
+        context: &ExecutionContext,
+        stack: &mut ActivationStack,
+        frame_index: usize,
+        array_reg: u16,
+        iterable_reg: u16,
+    ) -> Result<(), CommittedValueError> {
+        let iterable = *read_register(&stack[frame_index], iterable_reg)
+            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+        let operands = |stack: &ActivationStack| -> Result<(Value, Value), CommittedValueError> {
+            let frame = &stack[frame_index];
+            Ok((
+                *read_register(frame, array_reg)
+                    .map_err(|error| CommittedValueError::Fatal(error.into()))?,
+                *read_register(frame, iterable_reg)
+                    .map_err(|error| CommittedValueError::Fatal(error.into()))?,
+            ))
+        };
+        // A proven plain dense array copies straight across. Proving may
+        // move both operands; their registers are roots.
+        if iterable.is_array() && self.intrinsic_iterable(context, stack, iterable) {
+            let (array, source) = operands(stack)?;
+            let (Some(array), Some(source)) = (array.as_array(), source.as_array()) else {
+                return Err(CommittedValueError::Fatal(VmError::InvalidOperand));
+            };
+            let roots = self.collect_allocation_roots(stack);
+            let mut external_visit = |visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
+                for &slot in &roots {
+                    visitor(slot);
+                }
+            };
+            if array::append_plain_dense(array, source, &mut self.gc_heap, &mut external_visit)
+                .map_err(|error| CommittedValueError::JavaScript(VmError::from(error)))?
+            {
+                return Ok(());
+            }
+        }
+        let (_, iterable) = operands(stack)?;
+        let values = self.iterator_to_list_sync(context, stack, &iterable)?;
+        let array = read_register(&stack[frame_index], array_reg)
+            .map_err(|error| CommittedValueError::Fatal(error.into()))?
+            .as_array()
+            .ok_or(CommittedValueError::Fatal(VmError::InvalidOperand))?;
+        let roots = self.collect_allocation_roots(stack);
+        let mut external_visit = |visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
+            for &slot in &roots {
+                visitor(slot);
+            }
+        };
+        array::extend_with_roots(array, &mut self.gc_heap, &values, &mut external_visit)
+            .map_err(|error| CommittedValueError::JavaScript(VmError::from(error)))?;
+        Ok(())
+    }
+
+    /// §7.4.13 IteratorToList(GetIterator(iterable, sync)).
     ///
-    /// Drives the iterator to exhaustion and returns the collected
-    /// values. A built-in iterable or iterator whose protocol is proven
-    /// unmodified (see [`crate::iteration_protocol`]), a built-in iterable
-    /// runtime-internal code passed, and a generator are read directly; everything else routes through `GetIterator` +
-    /// `IteratorStep`. On abrupt completion mid-walk the iterator's `return`
-    /// method is invoked best-effort.
+    /// A built-in iterable or iterator whose protocol is proven unmodified
+    /// (see [`crate::iteration_protocol`]), or a built-in iterable that
+    /// runtime-internal code passed, is read directly; a generator and a
+    /// built-in iterator stepped by its built-in `next` run their states.
+    /// Everything else runs `GetIterator` + `IteratorStepValue`. Values
+    /// collected across steps that can run code are parked on the anchor
+    /// stack. As the spec's IteratorToList, a throwing step propagates
+    /// without closing the iterator.
     ///
     /// # See also
     /// - <https://tc39.es/ecma262/#sec-iteratortolist>
@@ -2969,7 +3029,6 @@ impl Interpreter {
             let self_iterator = !proven && interp.proven_self_iterator(interp.escape_scoped(root));
             (interp.escape_scoped(root), proven, self_iterator)
         });
-        let iterable = &iterable;
         if proven {
             if let Some(arr) = iterable.as_array() {
                 // Bulk reads are exact only for a plain dense array: holes
@@ -2988,14 +3047,20 @@ impl Interpreter {
                 return Ok(crate::collections::set_values(s, &self.gc_heap));
             }
             if let Some(m) = iterable.as_map() {
-                let pairs = crate::collections::map_entries(m, &self.gc_heap);
-                let mut out = Vec::with_capacity(pairs.len());
-                for (k, v) in pairs {
+                // Every pending key and value stays traced while the entry
+                // arrays allocate.
+                let pending: Vec<Value> = crate::collections::map_entries(m, &self.gc_heap)
+                    .into_iter()
+                    .flat_map(|(key, value)| [key, value])
+                    .collect();
+                let mut out = Vec::with_capacity(pending.len() / 2);
+                for index in 0..pending.len() / 2 {
+                    let (key, value) = (pending[2 * index], pending[2 * index + 1]);
                     let entry = self
                         .alloc_runtime_rooted_array_from_values(
-                            [k, v],
-                            &[iterable, &k, &v],
-                            &[out.as_slice()],
+                            [key, value],
+                            &[&iterable],
+                            &[out.as_slice(), &pending[2 * index..]],
                         )
                         .map_err(CommittedValueError::JavaScript)?;
                     out.push(Value::array(entry));
@@ -3003,9 +3068,34 @@ impl Interpreter {
                 return Ok(out);
             }
         }
-        if let Some(handle) = iterable.as_generator() {
-            let mut out: Vec<Value> = Vec::new();
+        let base = self.push_iteration_anchor(iterable) - 1;
+        let result = self
+            .drain_iterable(context, stack, base, proven, self_iterator)
+            .map(|first| self.iteration_anchors[first..].to_vec());
+        self.pop_iteration_anchors_to(base);
+        result
+    }
+
+    /// Step the iterable anchored at `base` to exhaustion. The record it
+    /// steps is anchored right above it and every value above that; returns
+    /// the anchor index of the first value. Each step re-reads the record
+    /// from its anchor, since a step can run code and move it.
+    fn drain_iterable(
+        &mut self,
+        context: &ExecutionContext,
+        stack: &mut ActivationStack,
+        base: usize,
+        proven: bool,
+        self_iterator: bool,
+    ) -> Result<usize, CommittedValueError> {
+        let iterable = self.iteration_anchor(base);
+        if iterable.is_generator() {
+            let first = base + 1;
             loop {
+                let handle = self
+                    .iteration_anchor(base)
+                    .as_generator()
+                    .ok_or(CommittedValueError::Fatal(VmError::InvalidOperand))?;
                 let result = self.resume_generator(
                     stack,
                     Some(context),
@@ -3021,59 +3111,62 @@ impl Interpreter {
                     .unwrap_or(Value::undefined())
                     .to_boolean(&self.gc_heap);
                 if done {
-                    return Ok(out);
+                    return Ok(first);
                 }
                 let value = crate::object::get(record, &self.gc_heap, "value")
                     .unwrap_or(Value::undefined());
-                out.push(value);
+                self.push_iteration_anchor(value);
             }
         }
-        // A proven built-in iterator is its own record: drive its state
-        // through `iterator_next_full`, which lazy helpers share.
-        if self_iterator && let Some(handle) = iterable.as_iterator() {
-            let mut out: Vec<Value> = Vec::new();
-            loop {
-                let (v, done) = self.iterator_next_full(context, stack, &handle)?;
-                if done {
-                    return Ok(out);
-                }
-                out.push(v);
+        // A built-in state whose stepping is the built-in `next` runs
+        // directly: a proven iterable's fresh state, a proven iterator itself,
+        // or the record GetIterator produced with the built-in `next`.
+        let builtin = if proven {
+            let state = crate::iteration_protocol::proven_iterator_state(iterable, &self.gc_heap)
+                .ok_or(CommittedValueError::Fatal(VmError::InvalidOperand))?;
+            let handle = self
+                .alloc_stack_rooted_iterator_state(stack, state, &[&iterable], &[])
+                .map_err(CommittedValueError::JavaScript)?;
+            self.push_iteration_anchor(Value::iterator(handle));
+            true
+        } else if self_iterator {
+            self.push_iteration_anchor(iterable);
+            true
+        } else {
+            let (iterator, next_method) = self.get_iterator_sync(stack, context, &iterable)?;
+            let builtin = self.is_builtin_next(iterator, next_method);
+            self.push_iteration_anchor(iterator);
+            if !builtin {
+                self.push_iteration_anchor(next_method);
             }
-        }
-
-        let (iterator, next_method) = self.get_iterator_sync(stack, context, iterable)?;
-        // §7.4.13 — drive `IteratorStep` through the user iterator.
-        // Each step calls into JS (the user's `next`), which can
-        // trigger GC. Park the iterator + next-method handles on
-        // the GC-traced anchor stack so a collection inside the
-        // user code cannot reclaim them. The pop-to depth captured
-        // here matches the LIFO push order even when the inner
-        // body recurses into another `iterator_to_list_sync`.
-        let anchor_depth = self.push_iteration_anchor(iterator);
-        self.push_iteration_anchor(next_method);
-        let mut values: Vec<Value> = Vec::new();
-        let result = loop {
-            match self.iterator_step_sync(stack, context, &iterator, &next_method) {
-                Ok(Some(value)) => values.push(value),
-                Ok(None) => break Ok(values),
-                Err(err) => {
-                    if matches!(&err, CommittedValueError::Fatal(_)) {
-                        break Err(err);
-                    }
-                    // A catchable cleanup throw preserves the original;
-                    // terminal child completion never runs another JS close.
-                    // Both paths release the iteration anchors below.
-                    let closed = self.iterator_close_discarding_completion(
-                        stack,
-                        Some(context),
-                        &self.iteration_anchor(anchor_depth - 1),
-                    );
-                    break closed.and(Err(err));
-                }
-            }
+            builtin
         };
-        self.pop_iteration_anchors_to(anchor_depth - 1);
-        result
+        let record = base + 1;
+        if builtin {
+            let first = record + 1;
+            loop {
+                let handle = self
+                    .iteration_anchor(record)
+                    .as_iterator()
+                    .ok_or(CommittedValueError::Fatal(VmError::InvalidOperand))?;
+                let (value, done) = self.iterator_next_full(context, stack, &handle)?;
+                if done {
+                    return Ok(first);
+                }
+                self.push_iteration_anchor(value);
+            }
+        }
+        let first = record + 2;
+        loop {
+            let iterator = self.iteration_anchor(record);
+            let next_method = self.iteration_anchor(record + 1);
+            match self.iterator_step_sync(stack, context, &iterator, &next_method)? {
+                Some(value) => {
+                    self.push_iteration_anchor(value);
+                }
+                None => return Ok(first),
+            }
+        }
     }
 
     /// §27.6.3.8 AsyncGeneratorYield step 5 — `Set value to ? Await(value)`.

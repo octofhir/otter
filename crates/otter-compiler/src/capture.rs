@@ -10,10 +10,12 @@
 //! # Contents
 //! - [`CaptureFacts`] — one post-order pass over a compile unit. For every
 //!   function body, static block and the unit itself it records the names the
-//!   scope declares, the names its nested functions reference, how far a
-//!   direct eval reaches and whether the scope reads `arguments`; for the
-//!   whole unit, the source position of every identifier reference and direct
-//!   eval, answering "does this range mention `x`" by binary search.
+//!   scope declares, the names its nested functions reference, the names it
+//!   or a nested scope assigns, how far a direct eval reaches, whether the
+//!   scope reads `arguments` and whether that object escapes beyond `.length`
+//!   and element reads; for the whole unit, the source position of every
+//!   identifier reference and direct eval, answering "does this range mention
+//!   `x`" by binary search.
 //! - [`CaptureFacts::nested_refs_in_statements`] and friends — region queries
 //!   for block, `switch` and loop-head predeclaration.
 //! - Single-construct finders: derived `this`, `with` reachability,

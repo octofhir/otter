@@ -5,6 +5,7 @@
 //!   `[Symbol.iterator]()` methods driven through the shared reentrant path.
 //! - Full `IteratorNext` completion through the VM iterator engine.
 //! - Iterator close for normal and throw completions.
+//! - `SpreadAppend`: one spread element appended through IteratorToList.
 //!
 //! # Invariants
 //! - Every successful transition has committed its source opcode; the
@@ -89,6 +90,11 @@ impl Interpreter {
                 let iterator = *read_register(&stack[frame_index], arg0 as u16)
                     .map_err(CommittedValueError::Fatal)?;
                 self.iterator_close_op(context, stack, frame_index, iterator, true)?;
+                stack[frame_index].pc = saved_pc;
+                Ok(())
+            }
+            value if value == Op::SpreadAppend as u8 => {
+                self.spread_append(context, stack, frame_index, arg0 as u16, arg1 as u16)?;
                 stack[frame_index].pc = saved_pc;
                 Ok(())
             }

@@ -2030,6 +2030,20 @@ pub(crate) fn emit_operation<'a>(
                 fatal,
             );
         }
+        TemplateOp::SpreadAppend { array, iterable } => {
+            iterators::emit_iterator_op(
+                ops,
+                relocations,
+                transitions,
+                Op::SpreadAppend as u8,
+                u64::from(array),
+                u64::from(iterable),
+                0,
+                bail,
+                threw,
+                fatal,
+            );
+        }
         TemplateOp::GetAsyncIterator { dst, src } => {
             iterators::emit_iterator_op(
                 ops,

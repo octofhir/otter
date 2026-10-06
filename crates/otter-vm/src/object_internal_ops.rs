@@ -605,6 +605,11 @@ impl Interpreter {
             native.prevent_extensions(&mut self.gc_heap)?;
             return Ok(true);
         }
+        if let Some(bound) = value.as_bound_function() {
+            let bag = crate::function_metadata::bound_own_properties(&bound, &self.gc_heap);
+            object::prevent_extensions(&mut { bag }, &mut self.gc_heap)?;
+            return Ok(true);
+        }
         // A class constructor's own (static) properties live on its statics
         // object, so that is where [[Extensible]] has to live too — otherwise
         // `preventExtensions` on a class is silently a no-op and static fields

@@ -549,25 +549,37 @@ impl crate::Interpreter {
         }
     }
 
-    /// A named load on an ordinary dense array through the site's load
-    /// cache, with the array's `[[Prototype]]` as lookup-start object (V8's
-    /// `lookup_start_object`): the prototype's handlers answer it exactly as
-    /// they answer a load on the prototype itself. `None` means the caller
-    /// completes the load.
-    pub(crate) fn array_receiver_load(
+    /// Complete a named load on a receiver whose lookup starts at another
+    /// object (V8's `lookup_start_object`) through the site's handlers,
+    /// installing one on a miss. That object's shape, keyed with the
+    /// lookup-start bit, fixes the receiver's whole ordinary lookup:
+    /// - an ordinary dense array owns no named property but `length`, so
+    ///   every other non-index name starts at `%Array.prototype%`;
+    /// - a closure or native function without a `[[Prototype]]` override, in
+    ///   the default realm, starts at its own-property bag, whose prototype
+    ///   mirrors the function's, for every name it does not synthesize
+    ///   (`name` and `length` of a native; a closure's `prototype`, and its
+    ///   `name`, `length`, `caller` and `arguments` unless the bag owns them).
+    ///
+    /// A native's bag starts as a prototype-less dictionary. Its first miss
+    /// gives it the function's prototype and a hidden class, which allocates:
+    /// a caller that continues after `None` re-reads its receiver from a
+    /// root.
+    pub(crate) fn lookup_start_load(
         &mut self,
         slot: crate::feedback::PropertyFeedbackSlot<'_>,
         receiver: crate::Value,
         key: AtomizedPropertyKey<'_>,
     ) -> Option<crate::Value> {
-        let proto = self.array_lookup_start(receiver, key.name())?;
-        if let Some(value) = slot.native().probe_lookup_start_load(proto, &self.gc_heap) {
+        let start = self.lookup_start_object(receiver)?;
+        if let Some(value) = slot.native().probe_lookup_start_load(start, &self.gc_heap) {
             slot.record_hit();
             return Some(value);
         }
         slot.record_miss();
-        let load = self.resolve_property_load(proto, key);
-        let shape = object::keyed_shape(proto, &self.gc_heap);
+        let start = self.admit_lookup_start(receiver, start, key)?;
+        let load = self.resolve_property_load(start, key);
+        let shape = object::keyed_shape(start, &self.gc_heap);
         let (handler, value) = match load {
             PropertyLoad::Data(resolved) => (
                 crate::property_ic::IcHandler::load_resolved(shape, &resolved),
@@ -587,94 +599,73 @@ impl crate::Interpreter {
         Some(value)
     }
 
-    /// Where a named lookup on `receiver` starts when the receiver is an
-    /// ordinary dense array: its `%Array.prototype%`. Such an array owns no
-    /// named property but `length`, so every other non-index name resolves on
-    /// the prototype chain alone.
-    pub(crate) fn array_lookup_start(
-        &self,
-        receiver: crate::Value,
-        name: &str,
-    ) -> Option<JsObject> {
-        let arr = receiver.as_array()?;
-        if name == "length"
-            || object::array_index_property_name(name).is_some()
-            || !crate::array::is_ordinary_dense(arr, &self.gc_heap)
-        {
+    /// The object a named lookup on `receiver` starts at, whatever the key,
+    /// or `None` when the receiver's own lookup is not a bag or array.
+    fn lookup_start_object(&self, receiver: crate::Value) -> Option<JsObject> {
+        if let Some(array) = receiver.as_array() {
+            return if crate::array::is_ordinary_dense(array, &self.gc_heap) {
+                self.realm_intrinsics.array_prototype()
+            } else {
+                None
+            };
+        }
+        if self.active_realm_id != 0 {
             return None;
         }
-        self.realm_intrinsics.array_prototype()
+        if let Some(native) = receiver.as_native_function() {
+            return (!native.has_prototype_override(&self.gc_heap))
+                .then(|| native.own_properties_bag(&self.gc_heap));
+        }
+        let closure = receiver.as_closure(&self.gc_heap)?;
+        if closure.proto_override(&self.gc_heap).is_some() {
+            return None;
+        }
+        closure.own_props(&self.gc_heap)
     }
 
-    /// Complete a named load on a closure through its site's function-map
-    /// handlers, installing one on a miss: V8 serves `f.call`, constructor
-    /// statics and function expandos through the function's map alike.
-    ///
-    /// The closure's property bag is the lookup-start object. It qualifies
-    /// only while the closure has no `[[Prototype]]` override, the default
-    /// realm is active and the bag's prototype is the closure's own, so the
-    /// bag's shape fixes the whole ordinary lookup. Keys the function
-    /// synthesizes (`prototype`; `name`, `length`, `caller`, `arguments`
-    /// unless the bag owns them) are left to the full `[[Get]]`. `None`
-    /// means the caller completes the load.
-    pub(crate) fn closure_receiver_load(
+    /// `start` as the lookup start of `key` on `receiver`, once the key is
+    /// one the receiver does not synthesize and a function's bag mirrors its
+    /// prototype.
+    fn admit_lookup_start(
         &mut self,
-        slot: crate::feedback::PropertyFeedbackSlot<'_>,
         receiver: crate::Value,
+        mut start: JsObject,
         key: AtomizedPropertyKey<'_>,
-    ) -> Option<crate::Value> {
-        let closure = receiver.as_closure(&self.gc_heap)?;
-        let bag = closure.own_props(&self.gc_heap)?;
-        if closure.proto_override(&self.gc_heap).is_some() || self.active_realm_id != 0 {
-            return None;
-        }
-        if let Some(value) = slot.native().probe_lookup_start_load(bag, &self.gc_heap) {
-            slot.record_hit();
-            return Some(value);
-        }
+    ) -> Option<JsObject> {
         let name = key.name();
-        let synthesized = match name {
-            "prototype" => return None,
-            "name" | "length" | "caller" | "arguments" => true,
-            _ => false,
+        if receiver.as_array().is_some() {
+            return (name != "length" && object::array_index_property_name(name).is_none())
+                .then_some(start);
+        }
+        let native = receiver.as_native_function().is_some();
+        let admitted = match name {
+            "name" | "length" if native => false,
+            "prototype" if !native => false,
+            "name" | "length" | "caller" | "arguments" if !native => {
+                object::lookup_own_atom(start, &self.gc_heap, key)
+                    .hit
+                    .is_some()
+            }
+            _ => true,
         };
-        let own = object::lookup_own_atom(bag, &self.gc_heap, key)
-            .hit
-            .is_some();
-        if synthesized && !own {
+        if !admitted {
             return None;
         }
         let prototype = self.get_prototype_for_op(&receiver).ok()?;
-        let bag_prototype = object::prototype(bag, &self.gc_heap);
-        let mirrored = match (bag_prototype, prototype.as_object()) {
-            (Some(bag_proto), Some(proto)) => bag_proto == proto,
-            (None, None) => {
-                prototype.is_null() && object::prototype_value(bag, &self.gc_heap).is_none()
-            }
-            _ => false,
+        let mirrored = match object::prototype_value(start, &self.gc_heap) {
+            Some(bag_prototype) => bag_prototype == prototype,
+            None => prototype.is_null(),
         };
         if !mirrored {
-            return None;
+            let prototype = prototype.as_object().filter(|_| native)?;
+            if !object::set_prototype(&mut start, &mut self.gc_heap, Some(prototype)).ok()? {
+                return None;
+            }
         }
-        let load = self.resolve_property_load(bag, key);
-        let shape = object::keyed_shape(bag, &self.gc_heap);
-        let (handler, value) = match load {
-            PropertyLoad::Data(resolved) => (
-                crate::property_ic::IcHandler::load_resolved(shape, &resolved),
-                resolved.value,
-            ),
-            PropertyLoad::Absent(proof) => (
-                crate::property_ic::IcHandler::load_nonexistent(shape, proof),
-                crate::Value::undefined(),
-            ),
-            PropertyLoad::Other => return None,
-        };
-        if !slot.is_megamorphic()
-            && let Some(handler) = handler
-        {
-            slot.install(handler.for_lookup_start());
+        if native && object::state(start, &self.gc_heap).is_dictionary() {
+            self.migrate_slow_to_fast(&mut start);
         }
-        Some(value)
+        Some(start)
     }
 
     /// V8 `LoadIC::UpdateCaches` for an ordinary receiver that missed its

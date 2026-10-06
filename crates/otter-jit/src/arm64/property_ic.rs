@@ -4,7 +4,8 @@
 //! # Contents
 //! - [`emit_select_entry`] — V8 `TryMonomorphicCase` / `HandlePolymorphicCase`:
 //!   the receiver's map selects its slot entry — an ordinary object's shape,
-//!   or a closure's property-bag shape keyed with the function bit.
+//!   or a closure's or native function's property-bag shape keyed with the
+//!   lookup-start bit.
 //! - [`emit_slot_load`] — own field, prototype field under its chain proof,
 //!   nonexistent key.
 //! - [`emit_slot_store`] — own-field store and add-transition (write, shape
@@ -43,9 +44,10 @@ fn distinct(registers: &[u8]) -> bool {
 
 /// Select the entry of the receiver's map in the slot at `X(slot)`:
 /// `X(entry)` addresses it on fall-through. An ordinary object's map is its
-/// shape. With `start` given, a closure receiver whose property bag carries
-/// its own `[[Prototype]]` (bag present, no override, default realm active)
-/// selects by its bag's shape keyed with the function bit, and `X(start)`
+/// shape. With `start` given, a closure or native function receiver whose
+/// property bag carries its own `[[Prototype]]` (bag present, no override,
+/// default realm active) selects by its bag's shape keyed with the
+/// lookup-start bit, and `X(start)`
 /// becomes the lookup-start object (the receiver itself for an ordinary
 /// object). A megamorphic slot branches to `megamorphic`, anything else to
 /// `miss`. Clobbers `X(entry)`, `X(scratch)`, `x16`, `x17`.
@@ -78,7 +80,10 @@ pub(crate) fn emit_select_entry(
         ),
         Some(start) => {
             let function = ops.new_dynamic_label();
+            let native = ops.new_dynamic_label();
+            let bag = ops.new_dynamic_label();
             let layout = view.closure_call_layout;
+            let native_layout = view.native_call_layout;
             let qualifying = u32::from(
                 otter_vm::closure::CLOSURE_LOOKUP_OWN_PROPS
                     | otter_vm::closure::CLOSURE_LOOKUP_PROTO_OVERRIDE,
@@ -89,23 +94,35 @@ pub(crate) fn emit_select_entry(
                 ; mov X(start), X(receiver)
                 ; b =>keyed
                 ; =>function
+                ; cmp w16, u32::from(otter_vm::native_function::NATIVE_FUNCTION_BODY_TYPE_TAG)
+                ; b.eq =>native
                 ; cmp w16, u32::from(otter_vm::closure::JS_CLOSURE_BODY_TYPE_TAG)
                 ; b.ne =>miss
                 ; ldrb w16, [X(receiver), otter_vm::closure::CLOSURE_NAMED_LOOKUP_BYTE]
                 ; and w16, w16, #qualifying
                 ; cmp w16, u32::from(otter_vm::closure::CLOSURE_LOOKUP_OWN_PROPS)
                 ; b.ne =>miss
-                ; ldr x16, [x20, THREAD_OFFSET]
-                ; ldr x16, [x16, VM_THREAD_ACTIVE_REALM_CELL_OFFSET]
-                ; cbz x16, =>miss
-                ; ldr w16, [x16]
-                ; cbnz w16, =>miss
                 ; ldr w16, [X(receiver), layout.rare_byte]
                 ; cbz w16, =>miss
                 ; and x17, X(receiver), #0xffff_ffff_0000_0000
                 ; add x16, x17, x16
                 ; ldr W(start), [x16, layout.own_props_byte]
+                ; b =>bag
+                ; =>native
+                ; ldrb w16, [X(receiver), native_layout.flags_byte]
+                ; tst w16, u32::from(native_layout.prototype_override_flag)
+                ; b.ne =>miss
+                ; ldr W(start), [X(receiver), native_layout.own_props_byte]
+                // The bag of either function kind: present, in the default
+                // realm, keyed by its shape.
+                ; =>bag
                 ; cbz W(start), =>miss
+                ; ldr x16, [x20, THREAD_OFFSET]
+                ; ldr x16, [x16, VM_THREAD_ACTIVE_REALM_CELL_OFFSET]
+                ; cbz x16, =>miss
+                ; ldr w16, [x16]
+                ; cbnz w16, =>miss
+                ; and x17, X(receiver), #0xffff_ffff_0000_0000
                 ; add X(start), x17, X(start)
                 ; ldr w17, [X(start), view.object_shape_byte]
                 ; orr w17, w17, #LOOKUP_START_KEY_BIT

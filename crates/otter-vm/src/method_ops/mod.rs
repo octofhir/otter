@@ -2241,11 +2241,17 @@ impl Interpreter {
                     .map(|desc| descriptor_value(&desc))
                 {
                     Some(value) => value,
-                    // §10.1.8 — explicit [[Prototype]] chain (per-kind
-                    // TypedArray ctor → %TypedArray%) resolves inherited
-                    // statics before the %Function.prototype% fallback.
-                    None => match native.prototype_override(&interp.gc_heap) {
-                        Some(parent) => {
+                    // §10.1.8 — the walk continues at the callable's
+                    // [[Prototype]]: an explicit one (per-kind TypedArray
+                    // ctor → %TypedArray%, or null), else
+                    // %Function.prototype%.
+                    None => {
+                        let parent = interp
+                            .get_prototype_for_op(&recv_value)
+                            .map_err(CommittedValueError::JavaScript)?;
+                        if parent.is_null() {
+                            Value::undefined()
+                        } else {
                             let key = VmPropertyKey::String(name);
                             match interp.ordinary_get_value(
                                 stack,
@@ -2267,11 +2273,7 @@ impl Interpreter {
                                     .map_err(CommittedValueError::completed_call)?,
                             }
                         }
-                        None => interp
-                            .load_function_prototype_method(name)
-                            .or_else(|| interp.load_object_prototype_method(name))
-                            .unwrap_or_else(Value::undefined),
-                    },
+                    }
                 };
                 return Ok(Some(value));
             }

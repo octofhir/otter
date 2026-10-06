@@ -2050,7 +2050,14 @@ impl Interpreter {
         let Some(mut target) = args.first().cloned() else {
             return Ok(None);
         };
-        if (target.is_array() || target.is_function() || target.is_closure() || target.is_regexp())
+        // Every callable keeps its own properties outside an ordinary
+        // `ObjectBody`, so integrity levels run over its internal methods.
+        if (target.is_array()
+            || target.is_function()
+            || target.is_closure()
+            || target.is_regexp()
+            || target.as_native_function().is_some()
+            || target.as_bound_function().is_some())
             && matches!(method, M::Freeze | M::Seal | M::IsFrozen | M::IsSealed)
         {
             let Some(context) = context else {

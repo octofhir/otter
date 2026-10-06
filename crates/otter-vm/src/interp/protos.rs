@@ -238,6 +238,10 @@ impl Interpreter {
             regexp.set_prototype_override(&mut self.gc_heap, Some(proto));
             return true;
         }
+        if let Some(native) = value.as_native_function() {
+            native.set_prototype_override(&mut self.gc_heap, Some(proto));
+            return true;
+        }
         false
     }
 

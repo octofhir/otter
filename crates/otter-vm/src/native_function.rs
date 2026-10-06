@@ -277,8 +277,12 @@ pub(crate) fn jit_call_layout() -> crate::jit::JitNativeCallLayout {
         payload_byte: header + call_header::PAYLOAD_OFFSET as u32,
         captures_byte: (otter_gc::header::HEADER_SIZE
             + std::mem::offset_of!(NativeFunctionBody, captures)) as u32,
+        own_props_byte: (otter_gc::header::HEADER_SIZE
+            + std::mem::offset_of!(NativeFunctionBody, own_properties))
+            as u32,
         constructable_flag: NativeCallHeader::CONSTRUCTABLE,
         extensible_flag: NativeCallHeader::EXTENSIBLE,
+        prototype_override_flag: NativeCallHeader::PROTOTYPE_OVERRIDE,
     }
 }
 
@@ -531,6 +535,7 @@ impl NativeFunction {
         let proto_clone = proto;
         let success = heap.with_payload(self.inner, |body| {
             body.prototype_override = proto;
+            body.call_header.set_prototype_overridden(proto.is_some());
             true
         });
         if success && let Some(p) = proto_clone {
@@ -561,6 +566,12 @@ impl NativeFunction {
     #[must_use]
     pub(crate) fn own_properties_bag(&self, heap: &otter_gc::GcHeap) -> JsObject {
         heap.read_payload(self.inner, |body| body.own_properties)
+    }
+
+    /// Whether a `[[Prototype]]` override is installed.
+    #[must_use]
+    pub(crate) fn has_prototype_override(&self, heap: &otter_gc::GcHeap) -> bool {
+        heap.read_payload(self.inner, |body| body.prototype_override.is_some())
     }
 
     /// Current `[[Prototype]]` override, if set.

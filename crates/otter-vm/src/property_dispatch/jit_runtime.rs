@@ -102,12 +102,10 @@ impl Interpreter {
         // complete through the full resolution cascade below; the IC layers
         // only serve cache-representable ordinary-object loads.
         let Some(obj) = receiver.as_object() else {
-            if let Some(value) = self
-                .closure_receiver_load(slot, receiver, atomized_key)
-                .or_else(|| self.array_receiver_load(slot, receiver, atomized_key))
-            {
+            if let Some(value) = self.lookup_start_load(slot, receiver, atomized_key) {
                 return Ok(value);
             }
+            let receiver = self.escape_scoped(receiver_root);
             let result = self.load_property_value(context, stack, receiver, atomized_key.name())?;
             return Ok(result);
         };

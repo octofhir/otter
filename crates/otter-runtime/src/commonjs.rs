@@ -475,12 +475,23 @@ fn begin_module_record<'scope>(
     })
 }
 
+/// Publish a host-produced `exports` value on the module and mark it loaded.
 fn finish_module<'scope>(
     scope: &mut NativeScope<'scope, '_>,
     module: Local<'_>,
     exports: Local<'_>,
 ) -> Result<Local<'scope>, NativeError> {
     scope.set(module, "exports", exports)?;
+    finish_evaluated_module(scope, module)
+}
+
+/// Mark a module whose own code ran as loaded and answer its
+/// `module.exports`. The code owns that property — it may have replaced it
+/// with an accessor — so the loader only reads it, as Node's does.
+fn finish_evaluated_module<'scope>(
+    scope: &mut NativeScope<'scope, '_>,
+    module: Local<'_>,
+) -> Result<Local<'scope>, NativeError> {
     let loaded = scope.boolean(true);
     scope.set(module, "loaded", loaded)?;
     scope.get(module, "exports")
@@ -604,8 +615,7 @@ fn load_resolved_scoped<'scope>(
                         record.exports,
                         &[record.exports, require, record.module, record.id, dirname],
                     )?;
-                    let exports = scope.get(record.module, "exports")?;
-                    return finish_module(scope, record.module, exports);
+                    return finish_evaluated_module(scope, record.module);
                 }
                 let owned_source;
                 let source = if let Some(source) = entry_source {
@@ -629,8 +639,7 @@ fn load_resolved_scoped<'scope>(
                     record.exports,
                     &[record.exports, require, record.module, record.id, dirname],
                 )?;
-                let exports = scope.get(record.module, "exports")?;
-                finish_module(scope, record.module, exports)
+                finish_evaluated_module(scope, record.module)
             }
         }
     })();

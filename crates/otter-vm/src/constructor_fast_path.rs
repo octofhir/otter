@@ -28,7 +28,7 @@
 
 use otter_bytecode::{
     Op,
-    opcode_schema::{RegisterAccess, RegisterSource, opcode_schema},
+    opcode_schema::{RegisterSource, opcode_schema},
 };
 
 use crate::ExecutionContext;
@@ -229,7 +229,7 @@ pub(crate) fn match_constructor_shape_stores(
 
         if let Some(specs) = opcode_schema(op).operand_shape.prefix() {
             for (operand, spec) in specs.iter().enumerate() {
-                if spec.register_access != RegisterAccess::Write {
+                if !spec.register_access.writes() {
                     continue;
                 }
                 let register = match spec.register_source {
@@ -241,8 +241,11 @@ pub(crate) fn match_constructor_shape_stores(
                         .and_then(|value| usize::try_from(value).ok()),
                     None => None,
                 };
-                if let Some(slot) = register.and_then(|register| registers.get_mut(register)) {
-                    *slot = RegisterValue::Unknown;
+                if let Some(register) = register {
+                    let width = usize::from(spec.register_access.width());
+                    for slot in registers.iter_mut().skip(register).take(width) {
+                        *slot = RegisterValue::Unknown;
+                    }
                 }
             }
         }

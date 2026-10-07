@@ -428,11 +428,14 @@ pub enum Op {
     /// prologue. No operands.
     GeneratorStart,
 
-    /// `r<dst> = GetIterator(r<src>)`. Operands:
-    /// `Register(dst), Register(src)`. The runtime produces an
-    /// internal iterator value over the source: `Array` walks
-    /// elements, `String` walks code units, and user objects route
-    /// through `[@@iterator]`.
+    /// `r<dst>, r<dst + 1> = GetIterator(r<src>)`. Operands:
+    /// `Register(dst), Register(src)`. Writes the iterator record into the
+    /// register pair at `dst`. An ordinary Array whose iteration is not
+    /// observable keeps the array in `dst` and an int32 cursor in `dst + 1`,
+    /// with no iterator object (JSC's fast-array iteration mode). Any other
+    /// source keeps an internal iterator value in `dst` (`String` walks code
+    /// units, user objects route through `[@@iterator]`) and `undefined` in
+    /// `dst + 1`.
     GetIterator,
     /// `r<dst> = GetAsyncIterator(r<src>)`. Operands:
     /// `Register(dst), Register(src)`. The runtime first observes
@@ -440,19 +443,21 @@ pub enum Op {
     /// iterator value for async-from-sync delegation.
     GetAsyncIterator,
     /// Drive an iterator one step. Operands:
-    /// `Register(value_dst), Register(done_dst), Register(iter)`.
-    /// Writes the next value into `value_dst` and a `Boolean` into
-    /// `done_dst`; once `done_dst` is `true` the value is
-    /// `undefined` and further calls keep returning `done = true`.
+    /// `Register(value_dst), Register(done_dst), Register(iter)`, where
+    /// `iter` names a [`Op::GetIterator`] register pair. Writes the next
+    /// value into `value_dst` and a `Boolean` into `done_dst`; once
+    /// `done_dst` is `true` the value is `undefined` and further calls keep
+    /// returning `done = true`. A fast-array record advances its cursor in
+    /// place and holds `true` as its cursor once exhausted.
     IteratorNext,
     /// §7.4.11 IteratorClose for a normal completion: a done iterator is
     /// left alone; otherwise its `return` runs and must produce an Object.
-    /// Operands: `Register(iter)`.
+    /// Operands: `Register(iter)`, an iterator register pair.
     IteratorClose,
     /// §7.4.11 IteratorClose for a throw completion: a done iterator is
     /// left alone; otherwise its `return` runs and every error it raises
     /// is discarded, so the caller rethrows the original value. Operands:
-    /// `Register(iter)`.
+    /// `Register(iter)`, an iterator register pair.
     IteratorCloseThrow,
     /// §7.4.11 AsyncIteratorClose steps 3-5: read the iterator's
     /// `return`, and call it when it is neither `undefined` nor `null`.

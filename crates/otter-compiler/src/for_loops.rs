@@ -49,7 +49,11 @@ pub(crate) fn compile_for_of_statement(
     // the head's `let` / `const` names in their TDZ.
     let head_names = per_iteration_head_names(&s.left);
     let iterable_reg = compile_head_rhs(cx, &head_names, &s.right, span)?;
-    let iter_reg = cx.alloc_scratch();
+    let iter_reg = if is_for_await {
+        cx.alloc_scratch()
+    } else {
+        cx.alloc_iterator_record()
+    };
     if is_for_await {
         cx.emit(
             Op::GetAsyncIterator,
@@ -299,7 +303,7 @@ pub(crate) fn compile_for_in_statement(
         span,
     );
 
-    let iter_reg = cx.alloc_scratch();
+    let iter_reg = cx.alloc_iterator_record();
     cx.emit(
         Op::GetIterator,
         [Operand::Register(iter_reg), Operand::Register(keys_reg)],

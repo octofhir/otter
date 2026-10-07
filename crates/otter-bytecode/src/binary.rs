@@ -219,7 +219,8 @@ pub fn decode_module_with_source(
     bytes: &[u8],
     source: &str,
 ) -> Result<VerifiedBytecodeModule, ModuleDecodeError> {
-    let module = decode_module_parts(bytes, Some(source)).ok_or(ModuleDecodeError::MalformedEncoding)?;
+    let module =
+        decode_module_parts(bytes, Some(source)).ok_or(ModuleDecodeError::MalformedEncoding)?;
     VerifiedBytecodeModule::new(module).map_err(ModuleDecodeError::Verify)
 }
 
@@ -582,8 +583,7 @@ impl Writer {
             // Inline operands write only their own words; every other record
             // writes its full raw form.
             let used = usize::from(operand_count).min(INLINE_OPERAND_WORDS);
-            if instruction.operands_are_inline() && inline[used..].iter().all(|word| *word == 0)
-            {
+            if instruction.operands_are_inline() && inline[used..].iter().all(|word| *word == 0) {
                 self.u8(0);
                 for word in &inline[..used] {
                     self.varint(*word);
@@ -1486,7 +1486,8 @@ mod tests {
             // asked for; once every proof is handed out, the whole module
             // must verify.
             if let Ok(module) = decoded
-                && (0..module.module().functions.len()).all(|function| module.function(function).is_ok())
+                && (0..module.module().functions.len())
+                    .all(|function| module.function(function).is_ok())
             {
                 crate::verify_module_at_base(module.module(), module.function_base())
                     .unwrap_or_else(|error| panic!("decoder admitted byte {index}: {error}"));

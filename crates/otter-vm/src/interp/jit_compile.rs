@@ -1306,7 +1306,8 @@ impl Interpreter {
     }
 
     /// Describe how each `LoadElement` / `StoreElement` site addresses its
-    /// receiver's elements.
+    /// receiver's elements, and an `IteratorNext` site the array its fast
+    /// record steps.
     ///
     /// The family comes from what the site observed, so a typed view and a
     /// dense array are the same program over different declared offsets. A
@@ -1320,7 +1321,7 @@ impl Interpreter {
                 let op = instr.op(&view.code_block);
                 matches!(
                     op,
-                    Op::LoadElement | Op::StoreElement | Op::StoreElementStrict
+                    Op::LoadElement | Op::StoreElement | Op::StoreElementStrict | Op::IteratorNext
                 )
                 .then_some((instr.byte_pc, instr.instruction_pc(&view.code_block)))
             })

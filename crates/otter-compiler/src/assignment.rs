@@ -1151,7 +1151,7 @@ pub(crate) fn assign_array_pattern(
 ) -> Result<(), CompileError> {
     emit_require_object_coercible(cx, value_reg, span);
 
-    let iter_reg = cx.alloc_scratch();
+    let iter_reg = cx.alloc_iterator_record();
     cx.emit(
         Op::GetIterator,
         [Operand::Register(iter_reg), Operand::Register(value_reg)],

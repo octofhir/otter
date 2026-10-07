@@ -232,7 +232,7 @@ pub(crate) fn destructure_array_inner(
     span: (u32, u32),
     assign_existing: bool,
 ) -> Result<(), CompileError> {
-    let iter_reg = parent.alloc_scratch();
+    let iter_reg = parent.alloc_iterator_record();
     parent.emit(
         Op::GetIterator,
         [Operand::Register(iter_reg), Operand::Register(src_reg)],

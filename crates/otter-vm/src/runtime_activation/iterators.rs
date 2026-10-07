@@ -1,18 +1,18 @@
 //! Stack-owned iterator and spread-collection operations.
 //!
 //! # Contents
-//! - Built-in Array iterator acquisition and stepping for generated callees.
+//! - Fast Array iterator records opened and stepped for generated callees.
 //! - Dense spread-result appends through the published native root window.
 //! - Exact pre-effect refusal for observable/custom iterator protocols.
 //!
 //! # Invariants
-//! - The fast path runs only while `%Array.prototype%[@@iterator]` is the
-//!   original `values` builtin and the receiver has no exotic override.
-//! - A refused operation has performed no allocation, callback, iterator
-//!   mutation, or destination write, so generated code may side-exit at the
-//!   original opcode.
-//! - Iterator handles are allocated in old space and every input remains
-//!   rooted through the published runtime activation during collection.
+//! - A fast record opens only while the realm proves the Array's GetIterator
+//!   and `next` built-in, and steps only over plain dense elements.
+//! - A refused operation has run no callback and written no iterator or
+//!   destination register, so generated code may side-exit at the original
+//!   opcode.
+//! - Every input remains rooted through the published runtime activation
+//!   during collection.
 //! - No materialized interpreter frame or raw register window escapes this
 //!   typed boundary.
 //!
@@ -22,7 +22,8 @@
 
 use otter_bytecode::Op;
 
-use crate::{BuiltinIteratorOrigin, IteratorState, Value, VmError, array, object, step_iterator};
+use crate::iterator_record::RecordCursor;
+use crate::{BuiltinIteratorOrigin, IteratorState, Value, VmError, array, step_iterator};
 
 use super::RuntimeCall;
 
@@ -73,66 +74,77 @@ impl RuntimeCall<'_> {
         Ok(())
     }
 
+    /// Open a fast Array record (see [`crate::iterator_record`]) while the
+    /// realm proves GetIterator and `next` built-in. Without a frame the
+    /// caller's primordial iteration is unknown, so only the proof opens one.
     fn get_builtin_array_iterator(
         &mut self,
         destination: u16,
         source: u16,
     ) -> Result<IteratorRuntimeOutcome, VmError> {
         let source_value = self.read(source)?;
-        let Some(array) = source_value.as_array() else {
+        if !source_value.is_array() {
             return Ok(IteratorRuntimeOutcome::Bail);
-        };
+        }
         // SAFETY: RuntimeCall owns exclusive mutator access for this operation.
         let vm = unsafe { &mut *self.vm.as_ptr() };
-        let iterator_symbol = vm
-            .well_known_symbols
-            .get(crate::symbol::WellKnown::Iterator);
-        if array::prototype_override(array, &vm.gc_heap).is_some()
-            || array::get_symbol_property(array, &vm.gc_heap, iterator_symbol).is_some()
-            || array::get_symbol_accessor(array, &vm.gc_heap, iterator_symbol).is_some()
-        {
+        let proven = {
+            // Proving the chain caches its prototype roles once.
+            let _roots = vm.scope_runtime_roots_guard();
+            vm.fast_array_iterable(source_value, false)
+        };
+        if !proven {
             return Ok(IteratorRuntimeOutcome::Bail);
         }
-        let Some(prototype) = vm
-            .current_array_prototype_override()
-            .and_then(Value::as_object)
-        else {
-            return Ok(IteratorRuntimeOutcome::Bail);
-        };
-        let object::PropertyLookup::Data { value: method, .. } =
-            object::lookup_symbol(prototype, &vm.gc_heap, iterator_symbol)
-        else {
-            return Ok(IteratorRuntimeOutcome::Bail);
-        };
-        if !crate::array_prototype::ArrayMethodTag::Values.matches_builtin(method, &vm.gc_heap) {
-            return Ok(IteratorRuntimeOutcome::Bail);
-        }
-
-        vm.record_jit_runtime_stub_class(crate::native_abi::RuntimeStubClass::Alloc);
-        let iterator = vm.alloc_runtime_rooted_iterator_state(
-            IteratorState::Array {
-                array,
-                index: 0,
-                origin: BuiltinIteratorOrigin::Array,
-            },
-            &[&source_value],
-            &[],
-        )?;
-        self.write(destination, Value::iterator(iterator))?;
+        let array = self.read(source)?;
+        self.write(destination, array)?;
+        self.write(destination + 1, Value::number_i32(0))?;
         Ok(IteratorRuntimeOutcome::Completed)
     }
 
+    /// Step a fast Array record whose element is one plain dense value, or a
+    /// built-in Array iterator value; anything observable is refused first.
     fn step_builtin_iterator(
         &mut self,
         value_destination: u16,
         done_destination: u16,
-        iterator_register: u16,
+        record: u16,
     ) -> Result<IteratorRuntimeOutcome, VmError> {
-        let Some(iterator) = self.read(iterator_register)?.as_iterator() else {
-            return Ok(IteratorRuntimeOutcome::Bail);
-        };
         // SAFETY: RuntimeCall owns exclusive mutator access for this operation.
         let vm = unsafe { &mut *self.vm.as_ptr() };
+        match RecordCursor::of(self.read(record + 1)?) {
+            RecordCursor::Exhausted => {
+                self.write(value_destination, Value::undefined())?;
+                self.write(done_destination, Value::boolean(true))?;
+                return Ok(IteratorRuntimeOutcome::Completed);
+            }
+            RecordCursor::Fast(index) => {
+                let array = self
+                    .read(record)?
+                    .as_array()
+                    .ok_or(VmError::InvalidOperand)?;
+                if index as usize >= array::len(array, &vm.gc_heap) {
+                    self.write(record + 1, Value::boolean(true))?;
+                    self.write(value_destination, Value::undefined())?;
+                    self.write(done_destination, Value::boolean(true))?;
+                    return Ok(IteratorRuntimeOutcome::Completed);
+                }
+                let (Some(value), Ok(next)) = (
+                    array::plain_dense_element(array, &vm.gc_heap, index as usize),
+                    i32::try_from(index + 1),
+                ) else {
+                    return Ok(IteratorRuntimeOutcome::Bail);
+                };
+                self.write(record + 1, Value::number_i32(next))?;
+                self.write(value_destination, value)?;
+                self.write(done_destination, Value::boolean(false))?;
+                return Ok(IteratorRuntimeOutcome::Completed);
+            }
+            RecordCursor::Generic => {}
+        }
+        let Some(iterator) = self.read(record)?.as_iterator() else {
+            return Ok(IteratorRuntimeOutcome::Bail);
+        };
         let is_builtin_array = vm.gc_heap.read_payload(iterator, |state| {
             matches!(
                 state,

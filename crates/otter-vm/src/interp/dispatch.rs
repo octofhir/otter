@@ -1166,6 +1166,31 @@ impl Interpreter {
                     // of the result's getters sets the record's [[Done]], so
                     // a handler's IteratorClose leaves it alone.
                     let iter_reg = instr.reg(2);
+                    let cursor =
+                        crate::iterator_record::RecordCursor::read(&stack[top_idx], iter_reg)?;
+                    if cursor != crate::iterator_record::RecordCursor::Generic {
+                        if let crate::iterator_record::RecordCursor::Fast(_) = cursor {
+                            let array = *read_register(&stack[top_idx], iter_reg)?;
+                            self.record_element_family_feedback(
+                                function,
+                                instr.instruction_pc,
+                                array,
+                            );
+                        }
+                        let (value, done) =
+                            match self.step_fast_array_record(context, stack, top_idx, iter_reg) {
+                                Ok(step) => step,
+                                Err(CommittedValueError::JavaScript(error)) => return Err(error),
+                                Err(CommittedValueError::Fatal(error)) => {
+                                    return Ok(DispatchOutcome::Fatal(error));
+                                }
+                            };
+                        let frame = &mut stack[top_idx];
+                        write_register(frame, instr.reg(0), value)?;
+                        write_register(frame, instr.reg(1), Value::boolean(done))?;
+                        frame.advance_pc()?;
+                        continue;
+                    }
                     let iterator = *read_register(&stack[top_idx], iter_reg)?;
                     let operands = function.operand_view(instr);
                     match self.drive_iterator_next(stack, context, operands) {
@@ -1194,8 +1219,7 @@ impl Interpreter {
                 }
                 // §7.4.11 IteratorClose for a normal completion.
                 Op::IteratorClose => {
-                    let iterator = *read_register(&stack[top_idx], instr.reg(0))?;
-                    match self.iterator_close_op(context, stack, top_idx, iterator, false) {
+                    match self.close_iterator_record(context, stack, top_idx, instr.reg(0), false) {
                         Ok(()) => {}
                         Err(CommittedValueError::JavaScript(error)) => return Err(error),
                         Err(CommittedValueError::Fatal(error)) => {
@@ -1208,8 +1232,7 @@ impl Interpreter {
                 // §7.4.11 IteratorClose for a throw completion: the handler
                 // rethrows its own value next.
                 Op::IteratorCloseThrow => {
-                    let iterator = *read_register(&stack[top_idx], instr.reg(0))?;
-                    match self.iterator_close_op(context, stack, top_idx, iterator, true) {
+                    match self.close_iterator_record(context, stack, top_idx, instr.reg(0), true) {
                         Ok(()) => {}
                         Err(CommittedValueError::JavaScript(error)) => return Err(error),
                         Err(CommittedValueError::Fatal(error)) => {

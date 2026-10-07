@@ -157,7 +157,9 @@ impl VerifiedBytecodeModule {
     }
 
     fn unproven(module: BytecodeModule, function_base: u32, build_artifact: bool) -> Self {
-        let functions = (0..module.functions.len()).map(|_| OnceLock::new()).collect();
+        let functions = (0..module.functions.len())
+            .map(|_| OnceLock::new())
+            .collect();
         Self {
             module,
             function_base,
@@ -1128,7 +1130,13 @@ fn verify_module_with_proofs(
         .iter()
         .enumerate()
         .map(|(function_index, function)| {
-            verify_function(module, function, function_index, expected_base, function_end)
+            verify_function(
+                module,
+                function,
+                function_index,
+                expected_base,
+                function_end,
+            )
         })
         .collect()
 }
@@ -1325,13 +1333,16 @@ fn verify_function(
                     operand_index,
                 },
             )?;
-            if register_access_at(instruction.op, operand_index) != RegisterAccess::None {
+            let access = register_access_at(instruction.op, operand_index);
+            if access != RegisterAccess::None {
                 let register = match operand {
                     Operand::Register(register) => i64::from(register),
                     Operand::Imm32(register) => i64::from(register),
                     Operand::ConstIndex(register) => i64::from(register),
                 };
-                if register < 0 || register >= i64::from(register_count) {
+                // A register pair's second register must be in the window too.
+                let last = register + i64::from(access.width()) - 1;
+                if register < 0 || last >= i64::from(register_count) {
                     return Err(BytecodeVerifyError::RegisterOperand {
                         function_index,
                         instruction_pc,

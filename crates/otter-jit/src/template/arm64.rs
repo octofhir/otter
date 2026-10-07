@@ -1137,7 +1137,7 @@ pub(crate) fn emit_operation<'a>(
             emit_add_generic(
                 ops,
                 relocations,
-                view,
+                shared_property,
                 transitions,
                 dst,
                 lhs,

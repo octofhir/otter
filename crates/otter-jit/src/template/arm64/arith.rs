@@ -356,7 +356,7 @@ pub(super) fn emit_fused_numeric_chain(
 pub(super) fn emit_add_generic(
     ops: &mut Assembler,
     relocations: &mut RelocationCapture,
-    view: &JitCompileSnapshot,
+    shared: &mut super::shared_property::SharedPropertyProbes,
     table: &TransitionTable,
     dst: u16,
     lhs: u16,
@@ -403,7 +403,7 @@ pub(super) fn emit_add_generic(
     // the delegate, whose completion records it.
     emit_record_arith(ops, relocations, site, otter_vm::jit_feedback::ARITH_STRING);
     let collecting = ops.new_dynamic_label();
-    super::primitive_strings::emit_concat_fit(ops, view, dst, lhs, rhs, collecting, done)?;
+    super::primitive_strings::emit_concat_fit(ops, shared, dst, lhs, rhs, collecting, done)?;
     dynasm!(ops ; .arch aarch64 ; =>collecting);
     emit_string_concat_alloc_call(
         ops,

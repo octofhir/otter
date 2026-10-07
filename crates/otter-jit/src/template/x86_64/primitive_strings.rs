@@ -15,35 +15,22 @@
 //! - `otter_vm::runtime_stubs::PRIMITIVE_STRING_ORDER` owns ordering semantics.
 
 use super::*;
-use crate::allocation::{AllocationValue, LabRegisters};
 
 pub(super) fn emit_concat_fit(
     ops: &mut Assembler,
-    view: &JitCompileSnapshot,
+    shared: &mut super::shared_property::SharedPropertyProbes,
     dst: u16,
     lhs: u16,
     rhs: u16,
     slow: DynamicLabel,
     done: DynamicLabel,
 ) {
-    emit_load_reg(ops, 0, lhs);
-    emit_load_reg(ops, 8, rhs);
-    let regs = LabRegisters {
-        buffer: 6,
-        candidate: 7,
-        end: 9,
-        scratch: 1,
-        size: 11,
-    };
-    crate::x86_64::allocation::emit_concat(
-        ops,
-        15,
-        view.string_layout,
-        [AllocationValue::Register(0), AllocationValue::Register(8)],
-        regs,
-        slow,
-    );
-    emit_store_reg(ops, regs.candidate, dst);
+    use super::shared_property::{CONCAT_LHS, CONCAT_RESULT, CONCAT_RHS};
+    emit_load_reg(ops, CONCAT_LHS, lhs);
+    emit_load_reg(ops, CONCAT_RHS, rhs);
+    let routine = shared.concat_label(ops);
+    dynasm!(ops ; .arch x64 ; call =>routine ; test edx, edx ; jnz =>slow);
+    emit_store_reg(ops, CONCAT_RESULT, dst);
     dynasm!(ops ; .arch x64 ; jmp =>done);
 }
 

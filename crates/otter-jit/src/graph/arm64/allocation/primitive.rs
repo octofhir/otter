@@ -89,22 +89,80 @@ impl Codegen<'_> {
         dynasm!(self.ops ; .arch aarch64 ; =>done);
         Ok(())
     }
-    /// A BigInt binary operator through the allocating Probe; a non-BigInt
-    /// operand or an operator failure exits to the source instruction.
+    /// A BigInt binary operator. Operands that fit `i64` take the inline
+    /// BigInt64 path (V8's), whose result is carved in the buffer; every other
+    /// case, and any overflow, reaches the allocating Probe, which exits to
+    /// the source instruction for a non-BigInt operand or a throwing operator.
     pub(in crate::graph::arm64) fn emit_bigint_binary(
         &mut self,
         node: NodeId,
         operator: otter_vm::bigint::ops::Operator,
     ) -> Result<(), crate::Unsupported> {
+        use otter_vm::bigint::ops::Operator;
         let [lhs, rhs] = self.primitive_inputs(node)?;
-        let destination = Self::gp(self.allocation.node(node).result.expect("bigint result"));
+        let a = self.allocation.node(node);
+        let destination = Self::gp(a.result.expect("bigint result"));
+        let [x, y, result, candidate, scratch] = [
+            a.gp_temps[0],
+            a.gp_temps[1],
+            a.gp_temps[2],
+            a.gp_temps[3],
+            a.gp_temps[4],
+        ];
+        let slow = self.ops.new_dynamic_label();
+        let done = self.ops.new_dynamic_label();
+        if !matches!(operator, Operator::Shl | Operator::Shr) {
+            crate::arm64::allocation::emit_value(&mut self.ops, x, lhs);
+            crate::arm64::allocation::emit_value(&mut self.ops, y, rhs);
+            crate::arm64::allocation::emit_unbox_bigint64(&mut self.ops, x, 16, slow);
+            crate::arm64::allocation::emit_unbox_bigint64(&mut self.ops, y, 16, slow);
+            match operator {
+                Operator::Add => dynasm!(self.ops ; .arch aarch64
+                    ; adds X(result), X(x), X(y) ; b.vs =>slow),
+                Operator::Sub => dynasm!(self.ops ; .arch aarch64
+                    ; subs X(result), X(x), X(y) ; b.vs =>slow),
+                Operator::Mul => dynasm!(self.ops ; .arch aarch64
+                    ; mul X(result), X(x), X(y) ; smulh x16, X(x), X(y)
+                    ; cmp x16, X(result), asr 63 ; b.ne =>slow),
+                // Zero divisors throw and `i64::MIN / -1` leaves `i64`.
+                Operator::Div => dynasm!(self.ops ; .arch aarch64
+                    ; cbz X(y), =>slow ; cmn XSP(y), 1 ; b.ne >divide
+                    ; negs x16, X(x) ; b.vs =>slow
+                    ; divide: ; sdiv X(result), X(x), X(y)),
+                Operator::Rem => dynasm!(self.ops ; .arch aarch64
+                    ; cbz X(y), =>slow ; sdiv x16, X(x), X(y)
+                    ; msub X(result), x16, X(y), X(x)),
+                Operator::BitwiseAnd => {
+                    dynasm!(self.ops ; .arch aarch64 ; and X(result), X(x), X(y))
+                }
+                Operator::BitwiseOr => {
+                    dynasm!(self.ops ; .arch aarch64 ; orr X(result), X(x), X(y))
+                }
+                Operator::BitwiseXor => {
+                    dynasm!(self.ops ; .arch aarch64 ; eor X(result), X(x), X(y))
+                }
+                Operator::Shl | Operator::Shr => unreachable!("shifts take the Probe"),
+            }
+            let regs = LabRegisters {
+                buffer: x,
+                candidate,
+                end: y,
+                scratch,
+                size: 17,
+            };
+            crate::arm64::allocation::emit_bigint64(&mut self.ops, 20, result, 16, regs, slow);
+            dynasm!(self.ops ; .arch aarch64 ; mov X(destination), X(candidate) ; b =>done);
+        }
+        dynasm!(self.ops ; .arch aarch64 ; =>slow);
         let code = otter_vm::Value::number_i32(i32::from(operator as u8)).to_bits();
         self.emit_probe_allocation(
             node,
             abi::STUB_BIGINT_BINARY_ALLOC,
             [lhs, rhs, AllocationValue::Constant(code)],
             Some(destination),
-        )
+        )?;
+        dynasm!(self.ops ; .arch aarch64 ; =>done);
+        Ok(())
     }
     pub(in crate::graph::arm64) fn emit_primitive_compare(
         &mut self,

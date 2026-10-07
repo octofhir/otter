@@ -756,7 +756,7 @@ impl Kind {
             Self::BigIntBinary(_) => Constraints {
                 inputs: (0..input_count).map(|_| InputPolicy::Home).collect(),
                 result: ResultPolicy::Register,
-                gp_temps: 0,
+                gp_temps: 5,
                 fp_temps: 0,
                 fixed_gp_clobbers: SmallVec::new(),
             },

@@ -42,6 +42,12 @@ pub struct BigIntBody {
     negative: bool,
 }
 
+/// Byte offset of the length word inside the body; the sign byte follows it
+/// at [`BIG_INT_NEGATIVE_OFFSET`] and the digits start after the body.
+pub const BIG_INT_LEN_OFFSET: usize = std::mem::offset_of!(BigIntBody, len);
+/// Byte offset of the sign byte inside the body.
+pub const BIG_INT_NEGATIVE_OFFSET: usize = std::mem::offset_of!(BigIntBody, negative);
+
 /// 4-byte compressed handle to a [`BigIntBody`]. `Copy`.
 pub type BigIntHandle = otter_gc::Gc<BigIntBody>;
 

@@ -342,31 +342,7 @@ impl Interpreter {
         name: &str,
         args: &mut [Value],
     ) -> Result<(), CommittedValueError> {
-        // Each entry is `(arg index, is_int)` in the exact order the spec
-        // coerces the operands, so observable side effects (and abrupt
-        // completions) fire in spec order — e.g. `lastIndexOf` runs
-        // ToString(searchString=arg0) before ToNumber(position=arg1)
-        // (§22.1.3.9 steps 3-4), whereas `split` coerces ToUint32(limit=
-        // arg1) before ToString(separator=arg0) (§22.1.3.21 steps 6-7).
-        let order: &[(usize, bool)] = match name {
-            "indexOf" | "lastIndexOf" => &[(0, false), (1, true)],
-            // includes/startsWith/endsWith must run IsRegExp(searchString)
-            // (and throw) before ToString, so the raw search argument has
-            // to reach the impl uncoerced; only the position is pre-coerced.
-            "includes" | "startsWith" | "endsWith" => &[(1, true)],
-            "slice" | "substring" | "substr" => &[(0, true), (1, true)],
-            "at" | "charAt" | "charCodeAt" | "codePointAt" => &[(0, true)],
-            "repeat" => &[(0, true)],
-            "padStart" | "padEnd" => &[(0, true), (1, false)],
-            "replace" | "replaceAll" => &[(0, false)],
-            "split" => &[(1, true), (0, false)],
-            "concat" => &[(0, false), (1, false), (2, false), (3, false)],
-            "match" | "matchAll" | "search" | "normalize" => &[(0, false)],
-            // §22.1.3.10 step 3 — `That = ? ToString(that)`.
-            "localeCompare" => &[(0, false)],
-            "anchor" | "fontcolor" | "fontsize" | "link" => &[(0, false)],
-            _ => &[],
-        };
+        let order = string_method_coercion_order(name);
         if order.is_empty() {
             return Ok(());
         }
@@ -3420,4 +3396,52 @@ impl Interpreter {
             )),
         }
     }
+}
+
+/// `(argument index, is_int)` pairs a `String.prototype` method coerces before
+/// its body runs, in the exact order the spec coerces them, so observable side
+/// effects (and abrupt completions) fire in spec order — e.g. `lastIndexOf`
+/// runs ToString(searchString=arg0) before ToNumber(position=arg1)
+/// (§22.1.3.9 steps 3-4), whereas `split` coerces ToUint32(limit=arg1) before
+/// ToString(separator=arg0) (§22.1.3.21 steps 6-7).
+fn string_method_coercion_order(name: &str) -> &'static [(usize, bool)] {
+    match name {
+        "indexOf" | "lastIndexOf" => &[(0, false), (1, true)],
+        // includes/startsWith/endsWith must run IsRegExp(searchString)
+        // (and throw) before ToString, so the raw search argument has
+        // to reach the impl uncoerced; only the position is pre-coerced.
+        "includes" | "startsWith" | "endsWith" => &[(1, true)],
+        "slice" | "substring" | "substr" => &[(0, true), (1, true)],
+        "at" | "charAt" | "charCodeAt" | "codePointAt" => &[(0, true)],
+        "repeat" => &[(0, true)],
+        "padStart" | "padEnd" => &[(0, true), (1, false)],
+        "replace" | "replaceAll" => &[(0, false)],
+        "split" => &[(1, true), (0, false)],
+        "concat" => &[(0, false), (1, false), (2, false), (3, false)],
+        "match" | "matchAll" | "search" | "normalize" => &[(0, false)],
+        // §22.1.3.10 step 3 — `That = ? ToString(that)`.
+        "localeCompare" => &[(0, false)],
+        "anchor" | "fontcolor" | "fontsize" | "link" => &[(0, false)],
+        _ => &[],
+    }
+}
+
+/// Whether any argument of `name` needs a coercion that can run user code or
+/// convert a non-number primitive; a call without one reaches its body with
+/// the arguments as they are.
+pub(crate) fn string_method_args_need_coercion(name: &str, args: &[Value]) -> bool {
+    string_method_coercion_order(name)
+        .iter()
+        .any(|&(index, is_int)| {
+            args.get(index).is_some_and(|value| {
+                if is_int {
+                    !(value.is_number()
+                        || value.is_boolean()
+                        || value.is_null()
+                        || value.is_undefined())
+                } else {
+                    !crate::abstract_ops::is_primitive(value)
+                }
+            })
+        })
 }

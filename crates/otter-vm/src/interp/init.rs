@@ -89,6 +89,8 @@ impl Interpreter {
         // `null`-prototype root, which the shape runtime installs.
         let names = std::sync::Arc::new(crate::property_atom::NameInterner::default());
         let shape_runtime = object::ShapeRuntime::new(&mut gc_heap, std::sync::Arc::clone(&names))?;
+        // Before any string: the empty and one-unit strings are shared.
+        crate::JsString::install_unit_strings(&mut gc_heap)?;
         startup_timer.mark("vm_shape_runtime");
         let mut well_known_symbols =
             WellKnownSymbols::new(&mut gc_heap).map_err(|error| match error {

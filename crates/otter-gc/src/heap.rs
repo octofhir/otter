@@ -113,7 +113,7 @@ pub fn empty() -> EmptyRoots {
 }
 
 /// Number of [`GcHeap::embedder_root`] slots.
-pub const EMBEDDER_ROOT_SLOTS: usize = 1;
+pub const EMBEDDER_ROOT_SLOTS: usize = 2;
 
 /// Growth-ratio major-GC trigger (used only when no hard cap is
 /// set). After a full GC the next trigger is `live × NUM / DEN`.

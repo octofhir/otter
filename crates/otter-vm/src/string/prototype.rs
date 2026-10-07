@@ -2910,6 +2910,16 @@ fn native_string_method(
             return Ok(result);
         }
     }
+    // A string receiver whose arguments need no coercion reaches the body
+    // as is: no handle scope, and no caller context unless the body asks.
+    let receiver = *ctx.this_value();
+    if receiver.is_string() && !crate::method_ops::string_method_args_need_coercion(name, args) {
+        let impl_fn = intrinsic_impl(name).ok_or_else(|| NativeError::TypeError {
+            name,
+            reason: "unknown String.prototype method".to_string(),
+        })?;
+        return impl_fn(ctx, &receiver, args);
+    }
     ctx.scope(|mut scope| {
         let receiver = scope.this();
         // §22.1.3 — every `String.prototype` method (other than

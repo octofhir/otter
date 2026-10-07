@@ -2140,12 +2140,17 @@ impl<'a> Builder<'a> {
             return;
         };
         let feedback = self.feedback();
-        let int32 = feedback.speculates_int32() && !self.exited_before();
         let lhs = self.read(instruction.reads[0]);
         let rhs = match immediate {
             Some(value) => self.constant_int32(value),
             None => self.read(instruction.reads[1]),
         };
+        // Operands already held as int32 compare as int32 whatever the site
+        // saw elsewhere: no conversion, no speculation.
+        let held_int32 = [lhs, rhs]
+            .iter()
+            .all(|&value| self.graph.node(value).repr == Repr::Int32);
+        let int32 = held_int32 || (feedback.speculates_int32() && !self.exited_before());
         // Loose equality of two Numbers is their strict equality.
         let proved_numbers = self.is_number(lhs) && self.is_number(rhs);
         let numeric = feedback.is_numeric_only() || int32 || proved_numbers;
@@ -3160,7 +3165,14 @@ impl<'a> Builder<'a> {
             &[receiver],
             Repr::Word,
         );
-        let base = self.add(Kind::LoadElementsBase(base_byte), &[receiver], Repr::Word);
+        let base = self.add(
+            Kind::LoadElementsBase {
+                byte: base_byte,
+                off_heap: cached_base.is_some(),
+            },
+            &[receiver],
+            Repr::Word,
+        );
         let storage = ElementStorage { length, base };
         let info = self.known.entry(receiver);
         info.elements = Some(access);

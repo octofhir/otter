@@ -12,8 +12,10 @@
 //!   length changes while the loop runs: generated element stores never
 //!   transition a layout or grow storage, they leave instead. A shape check
 //!   also needs a loop that changes no shape; a context slot load needs a
-//!   loop that stores to no slot at its offset. Context parents never
-//!   change.
+//!   loop that stores to no slot at its offset; a global binding read needs
+//!   a loop that stores no object property. Only an off-heap element base
+//!   moves: a raw base into a movable slab must not live across the
+//!   back edge's poll. Context parents never change.
 //! - A moved node reads only values defined before the loop, values moved
 //!   before it, or a header phi the loop never changes, which it reads as
 //!   the value entering the loop.
@@ -85,6 +87,9 @@ fn loop_body(graph: &Graph, header: BlockId) -> FxHashSet<BlockId> {
 struct Clobbers {
     shapes: bool,
     lengths: bool,
+    /// Whether the loop stores any object property, the global object's
+    /// included.
+    properties: bool,
     slot_offsets: FxHashSet<i32>,
 }
 
@@ -92,6 +97,7 @@ fn clobbers(graph: &Graph, body: &FxHashSet<BlockId>) -> Option<Clobbers> {
     let mut clobbers = Clobbers {
         shapes: false,
         lengths: false,
+        properties: false,
         slot_offsets: FxHashSet::default(),
     };
     for &block in body {
@@ -105,7 +111,9 @@ fn clobbers(graph: &Graph, body: &FxHashSet<BlockId>) -> Option<Clobbers> {
                 Kind::StoreNamedProperty(_) | Kind::StorePropertyCached { .. } => {
                     clobbers.shapes = true;
                     clobbers.lengths = true;
+                    clobbers.properties = true;
                 }
+                Kind::StoreOwnField(_) => clobbers.properties = true,
                 Kind::StoreTaggedField(offset) => {
                     clobbers.slot_offsets.insert(*offset);
                 }
@@ -160,6 +168,9 @@ fn hoist_loop(
                 Kind::CheckElements { .. } | Kind::LoadContextParent => true,
                 Kind::CheckShapes { .. } => !clobbers.shapes,
                 Kind::LoadElementsLength { .. } => !clobbers.lengths,
+                // A movable slab base must not live across the loop's poll.
+                Kind::LoadElementsBase { off_heap, .. } => *off_heap && !clobbers.lengths,
+                Kind::LoadGlobalBinding(_) => !clobbers.properties,
                 Kind::LoadTaggedField(offset) => {
                     data.inputs
                         .first()

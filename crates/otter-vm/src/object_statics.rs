@@ -696,6 +696,33 @@ fn native_prototype_has_own_property(
     args: &[Value],
 ) -> Result<Value, NativeError> {
     let this_value = *ctx.this_value();
+    // A string or symbol key on an object whose own lookup is its named
+    // slots runs no user code and needs no caller context.
+    if let (Some(obj), Some(key)) = (this_value.as_object(), args.first())
+        && (key.is_string() || key.is_symbol())
+        && has_ordinary_own_lookup(obj, ctx.heap())
+    {
+        let heap = ctx.heap();
+        // An ASCII key is read in place, as the `&str` it already is.
+        if let Some(present) = key.as_string(heap).and_then(|string| {
+            string.with_latin1(heap, |bytes| {
+                std::str::from_utf8(bytes)
+                    .ok()
+                    .filter(|_| bytes.is_ascii())
+                    .map(|name| {
+                        !matches!(
+                            crate::object::lookup_own(obj, heap, name),
+                            PropertyLookup::Absent
+                        )
+                    })
+            })?
+        }) {
+            return Ok(Value::boolean(present));
+        }
+        let present = has_own_property(obj, ctx.heap(), Some(key))
+            .map_err(|err| object_native_error(ctx.cx.interp, "hasOwnProperty", err))?;
+        return Ok(Value::boolean(present));
+    }
     if let Some(context) = ctx.execution_context().cloned() {
         let key_result = ctx.with_turn_parts(|interp, stack| {
             interp.to_property_key_sync(
@@ -2600,6 +2627,18 @@ fn native_to_property_key(
         crate::VmPropertyKey::String(s) => Ok(PropertyKey::String(s.to_string())),
         crate::VmPropertyKey::OwnedString(s) => Ok(PropertyKey::String(s)),
     }
+}
+
+/// Whether `target`'s own properties are exactly its named slots: no string
+/// wrapper indices, mapped arguments, host lookup or module namespace.
+fn has_ordinary_own_lookup(target: JsObject, gc_heap: &otter_gc::GcHeap) -> bool {
+    use crate::object::ShapeState;
+    let exotic = ShapeState::STRING_WRAPPER_MASK
+        | ShapeState::MAPPED_ARGUMENTS_MASK
+        | ShapeState::HOST_LOOKUP_MASK;
+    crate::object::state(target, gc_heap).bits() & exotic == 0
+        && crate::object::module_namespace_env(target, gc_heap).is_none()
+        && crate::object::deferred_namespace_target(target, gc_heap).is_none()
 }
 
 fn has_own_property(

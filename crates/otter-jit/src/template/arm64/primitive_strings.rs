@@ -15,40 +15,27 @@
 //! - `otter_vm::runtime_stubs::PRIMITIVE_STRING_ORDER` owns ordering semantics.
 
 use super::values::{emit_load_reg, emit_load_runtime_stub, emit_store_reg};
-use crate::allocation::{AllocationValue, LabRegisters};
 use crate::artifact::relocation::RelocationCapture;
 use crate::entry::{THREAD_OFFSET, Unsupported, VM_THREAD_GC_HEAP_OFFSET};
 use crate::template::CompareKind;
 use dynasmrt::{DynamicLabel, DynasmApi, DynasmLabelApi, aarch64::Assembler, dynasm};
-use otter_vm::{JitCompileSnapshot, native_abi as abi};
+use otter_vm::native_abi as abi;
 
 pub(super) fn emit_concat_fit(
     ops: &mut Assembler,
-    view: &JitCompileSnapshot,
+    shared: &mut super::shared_property::SharedPropertyProbes,
     dst: u16,
     lhs: u16,
     rhs: u16,
     slow: DynamicLabel,
     done: DynamicLabel,
 ) -> Result<(), Unsupported> {
-    emit_load_reg(ops, 9, lhs)?;
-    emit_load_reg(ops, 10, rhs)?;
-    let regs = LabRegisters {
-        buffer: 11,
-        candidate: 12,
-        end: 13,
-        scratch: 15,
-        size: 17,
-    };
-    crate::arm64::allocation::emit_concat(
-        ops,
-        20,
-        view.string_layout,
-        [AllocationValue::Register(9), AllocationValue::Register(10)],
-        regs,
-        slow,
-    );
-    emit_store_reg(ops, regs.candidate, dst)?;
+    use super::shared_property::{CONCAT_LHS, CONCAT_RESULT, CONCAT_RHS};
+    emit_load_reg(ops, CONCAT_LHS, lhs)?;
+    emit_load_reg(ops, CONCAT_RHS, rhs)?;
+    let routine = shared.concat_label(ops);
+    dynasm!(ops ; .arch aarch64 ; bl =>routine ; cbnz x1, =>slow);
+    emit_store_reg(ops, CONCAT_RESULT, dst)?;
     dynasm!(ops ; .arch aarch64 ; b =>done);
     Ok(())
 }

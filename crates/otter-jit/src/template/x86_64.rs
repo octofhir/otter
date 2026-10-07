@@ -731,7 +731,7 @@ fn emit_binary_arith(
 fn emit_add_generic(
     ops: &mut Assembler,
     relocations: &mut RelocationCapture,
-    view: &JitCompileSnapshot,
+    shared: &mut shared_property::SharedPropertyProbes,
     transitions: &crate::entry::TransitionTable,
     dst: u16,
     lhs: u16,
@@ -761,7 +761,7 @@ fn emit_add_generic(
     dynasm!(ops ; .arch x64 ; jmp =>done ; =>runtime_path);
 
     let collecting = ops.new_dynamic_label();
-    primitive_strings::emit_concat_fit(ops, view, dst, lhs, rhs, collecting, done);
+    primitive_strings::emit_concat_fit(ops, shared, dst, lhs, rhs, collecting, done);
     dynasm!(ops ; .arch x64 ; =>collecting);
 
     if let Some(stub_addr) =

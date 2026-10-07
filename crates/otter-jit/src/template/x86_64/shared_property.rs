@@ -14,6 +14,8 @@
 //!   publication, both barriers), then the shared table, then the miss.
 //! - Method: the load selection without a miss call; it returns only a
 //!   callable hit.
+//! - Concat: the nursery string-concatenation fit every `Add` site shares
+//!   instead of inlining it.
 //!
 //! # Invariants
 //! - Inputs arrive in the System V argument registers the miss passes on:
@@ -53,12 +55,19 @@ pub(crate) const STORE_SLOT: u8 = 1;
 
 const CAGE_MASK: u64 = 0xffff_ffff_0000_0000;
 
-/// The shared property routines one code object's sites requested.
+/// Concat routine inputs: the two operands.
+pub(crate) const CONCAT_LHS: u8 = 0;
+pub(crate) const CONCAT_RHS: u8 = 8;
+/// Concat routine result on a fit.
+pub(crate) const CONCAT_RESULT: u8 = 7;
+
+/// The shared routines one code object's sites requested.
 #[derive(Default)]
 pub(crate) struct SharedPropertyProbes {
     load: Option<DynamicLabel>,
     store: Option<DynamicLabel>,
     method: Option<DynamicLabel>,
+    concat: Option<DynamicLabel>,
 }
 
 impl SharedPropertyProbes {
@@ -75,6 +84,11 @@ impl SharedPropertyProbes {
     /// The probe-only routine serving method-call sites.
     pub(crate) fn method_label(&mut self, ops: &mut Assembler) -> DynamicLabel {
         *self.method.get_or_insert_with(|| ops.new_dynamic_label())
+    }
+
+    /// The string-concatenation fit serving `Add` sites.
+    pub(crate) fn concat_label(&mut self, ops: &mut Assembler) -> DynamicLabel {
+        *self.concat.get_or_insert_with(|| ops.new_dynamic_label())
     }
 
     /// Emit every requested routine once, after the body.
@@ -94,7 +108,43 @@ impl SharedPropertyProbes {
         if let Some(label) = self.method {
             emit_method(ops, relocations, view, label);
         }
+        if let Some(label) = self.concat {
+            emit_concat(ops, view, label);
+        }
     }
+}
+
+/// The nursery fit of `CONCAT_LHS + CONCAT_RHS` for two strings: `edx` is
+/// zero with the new string in `CONCAT_RESULT`, or one when it does not fit
+/// and nothing was published. Neither collects nor calls out.
+fn emit_concat(ops: &mut Assembler, view: &JitCompileSnapshot, label: DynamicLabel) {
+    let miss = ops.new_dynamic_label();
+    dynasm!(ops ; .arch x64 ; =>label);
+    crate::x86_64::allocation::emit_concat(
+        ops,
+        15,
+        view.string_layout,
+        [
+            crate::allocation::AllocationValue::Register(CONCAT_LHS),
+            crate::allocation::AllocationValue::Register(CONCAT_RHS),
+        ],
+        crate::allocation::LabRegisters {
+            buffer: 6,
+            candidate: CONCAT_RESULT,
+            end: 9,
+            scratch: 1,
+            size: 11,
+        },
+        miss,
+    );
+    dynasm!(ops
+        ; .arch x64
+        ; xor edx, edx
+        ; ret
+        ; =>miss
+        ; mov edx, 1
+        ; ret
+    );
 }
 
 /// Load dispatch shared by the load and method routines; a hit leaves the

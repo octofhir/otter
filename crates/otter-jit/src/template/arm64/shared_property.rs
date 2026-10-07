@@ -17,6 +17,8 @@
 //! - Method: the load selection without a miss call; it returns only a
 //!   callable hit, and its site resolves every other receiver through its own
 //!   committed method resolution, which also records call feedback.
+//! - Concat: the nursery string-concatenation fit every `Add` site shares
+//!   instead of inlining it.
 //!
 //! # Invariants
 //! - A site passes its receiver (and value) boxed from the rooted window plus
@@ -59,12 +61,13 @@ pub(crate) const STORE_RECEIVER: u8 = 12;
 pub(crate) const STORE_VALUE: u8 = 9;
 pub(crate) const STORE_SLOT: u8 = 10;
 
-/// The shared property routines one code object's sites requested.
+/// The shared routines one code object's sites requested.
 #[derive(Default)]
 pub(crate) struct SharedPropertyProbes {
     load: Option<DynamicLabel>,
     store: Option<DynamicLabel>,
     method: Option<DynamicLabel>,
+    concat: Option<DynamicLabel>,
 }
 
 impl SharedPropertyProbes {
@@ -81,6 +84,11 @@ impl SharedPropertyProbes {
     /// The probe-only routine serving method-call sites.
     pub(crate) fn method_label(&mut self, ops: &mut Assembler) -> DynamicLabel {
         *self.method.get_or_insert_with(|| ops.new_dynamic_label())
+    }
+
+    /// The string-concatenation fit serving `Add` sites.
+    pub(crate) fn concat_label(&mut self, ops: &mut Assembler) -> DynamicLabel {
+        *self.concat.get_or_insert_with(|| ops.new_dynamic_label())
     }
 
     /// Emit every requested routine once, after the body.
@@ -100,7 +108,49 @@ impl SharedPropertyProbes {
         if let Some(label) = self.method {
             emit_method(ops, relocations, view, label);
         }
+        if let Some(label) = self.concat {
+            emit_concat(ops, view, label);
+        }
     }
+}
+
+/// Concat routine inputs: the two operands.
+pub(crate) const CONCAT_LHS: u8 = 9;
+pub(crate) const CONCAT_RHS: u8 = 10;
+/// Concat routine result on a fit.
+pub(crate) const CONCAT_RESULT: u8 = 12;
+
+/// The nursery fit of `CONCAT_LHS + CONCAT_RHS` for two strings: `x1` is
+/// zero with the new string in `CONCAT_RESULT`, or one when it does not fit
+/// and nothing was published. Neither collects nor calls Rust.
+fn emit_concat(ops: &mut Assembler, view: &JitCompileSnapshot, label: DynamicLabel) {
+    let miss = ops.new_dynamic_label();
+    dynasm!(ops ; .arch aarch64 ; =>label);
+    crate::arm64::allocation::emit_concat(
+        ops,
+        20,
+        view.string_layout,
+        [
+            crate::allocation::AllocationValue::Register(CONCAT_LHS),
+            crate::allocation::AllocationValue::Register(CONCAT_RHS),
+        ],
+        crate::allocation::LabRegisters {
+            buffer: 11,
+            candidate: CONCAT_RESULT,
+            end: 13,
+            scratch: 15,
+            size: 17,
+        },
+        miss,
+    );
+    dynasm!(ops
+        ; .arch aarch64
+        ; mov x1, xzr
+        ; ret
+        ; =>miss
+        ; mov x1, #1
+        ; ret
+    );
 }
 
 /// The load dispatch shared by the load and method routines: on a hit `x0`

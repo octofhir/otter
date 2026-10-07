@@ -2199,11 +2199,21 @@ impl VmRuntimeActivation {
     /// # Safety
     /// The activation's context must remain live for this call.
     #[must_use]
-    pub unsafe fn owner_context(self, function_id: u32) -> Option<crate::ExecutionContext> {
-        // SAFETY: forwarded from the caller's liveness contract.
-        let vm = unsafe { self.vm.as_ref() }?;
-        vm.function_context(unsafe { self.context.as_ref() }, function_id)
-            .ok()
+    pub unsafe fn owner_context<'a>(
+        self,
+        function_id: u32,
+    ) -> Option<crate::code_space::ResolvedCtx<'a>> {
+        // SAFETY: forwarded from the caller's liveness contract; the admitted
+        // context outlives every transition of this activation.
+        match unsafe { self.context.as_ref() } {
+            Some(context) => context.for_function(function_id).ok(),
+            None => {
+                let vm = unsafe { self.vm.as_ref() }?;
+                vm.function_context(None, function_id)
+                    .ok()
+                    .map(crate::code_space::ResolvedCtx::Owned)
+            }
+        }
     }
 
     /// Current VM-owned execution context for this dynamic entry.

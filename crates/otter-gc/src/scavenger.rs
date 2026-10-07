@@ -21,7 +21,8 @@
 //! 3. Cheney scan: walk to-space pages and freshly-promoted
 //!    bytes in old-space pages; trace each newly-copied object
 //!    and evacuate children. Iterate until convergence.
-//! 4. Finalize and drop every unforwarded from-space body.
+//! 4. Finalize and drop the unforwarded bodies the new space tracks for
+//!    reclamation; untracked dead cells are never visited.
 //! 5. Set every to-space page's `age_mark` to its bump top: everything
 //!    copied there survived this scavenge.
 //! 6. Flip from↔to. Survivor pages become the new from-space; the
@@ -314,13 +315,17 @@ pub unsafe fn scavenge(
     Ok(ctx.stats)
 }
 
-/// Run reclamation hooks for every young body that was not evacuated.
+/// Run reclamation hooks for every tracked young body that was not
+/// evacuated, and keep tracking the ones that stayed young.
 ///
-/// A copying collector transfers ownership of a survivor's payload with the
-/// byte copy in [`evacuate`]; only an unforwarded source remains a valid Rust
-/// value. Its finalizer follows the same ordering as old-space sweep, then its
-/// `Drop` implementation releases owned buffers and host resources before the
-/// semispace pages are reset.
+/// Only bodies whose type has a hook are tracked, at allocation; the dead
+/// cells around them are never visited (V8 keeps the same side lists for
+/// young array buffers and external strings). A copying collector transfers
+/// ownership of a survivor's payload with the byte copy in [`evacuate`]; only
+/// an unforwarded source remains a valid Rust value. Its finalizer follows
+/// the same ordering as old-space sweep, then its `Drop` implementation
+/// releases owned buffers and host resources before the semispace pages are
+/// reset. A promoted survivor leaves the list: old-space sweep owns it.
 ///
 /// # Safety
 ///
@@ -329,22 +334,55 @@ pub unsafe fn scavenge(
 unsafe fn finalize_and_drop_dead_from_space(ctx: &mut ScavCtx) {
     // SAFETY: per docstring; the trace table matches every allocated tag.
     unsafe {
+        #[cfg(debug_assertions)]
+        verify_cleanup_tracked(ctx);
         let trace_table = &*ctx.trace_table.as_ptr();
         let mut host_refs = ctx.host_refs;
-        for page in ctx.new_space().from_pages() {
+        let tracked = ctx.new_space().take_cleanup();
+        for offset in tracked {
+            let header = cage_base().add(offset as usize).cast::<GcHeader>();
+            if (*header).is_forwarded() {
+                let target = GcHeader::read_forwarding_offset(header);
+                if (*cage_base().add(target as usize).cast::<GcHeader>()).is_young() {
+                    ctx.new_space().track_cleanup(target);
+                }
+                continue;
+            }
+            let tag = (*header).type_tag();
+            if let Some(release) = trace_table.get_host_release(tag) {
+                release(header, host_refs.as_mut());
+            }
+            if let Some(finalize) = trace_table.get_finalize(tag) {
+                finalize(header);
+            }
+            if let Some(drop_fn) = trace_table.get_drop(tag) {
+                drop_fn(header);
+            }
+        }
+    }
+}
+
+/// Debug check that every from-space body needing reclamation is tracked.
+///
+/// # Safety
+///
+/// As [`finalize_and_drop_dead_from_space`], before it takes the list.
+#[cfg(debug_assertions)]
+unsafe fn verify_cleanup_tracked(ctx: &mut ScavCtx) {
+    // SAFETY: forwarded from the caller.
+    unsafe {
+        let trace_table = &*ctx.trace_table.as_ptr();
+        let new_space = &*ctx.new_space.as_ptr();
+        for page in new_space.from_pages() {
             page.for_each_object(|header, _| {
-                if (*header).is_forwarded() {
-                    return;
-                }
                 let tag = (*header).type_tag();
-                if let Some(release) = trace_table.get_host_release(tag) {
-                    release(header, host_refs.as_mut());
-                }
-                if let Some(finalize) = trace_table.get_finalize(tag) {
-                    finalize(header);
-                }
-                if let Some(drop_fn) = trace_table.get_drop(tag) {
-                    drop_fn(header);
+                if !(*header).is_forwarded() && trace_table.needs_cleanup(tag) {
+                    let offset = (header as usize - cage_base() as usize) as u32;
+                    debug_assert!(
+                        new_space.tracks_cleanup(offset),
+                        "young {:?} at {offset:#x} has a reclamation hook but is untracked",
+                        trace_table.name(tag),
+                    );
                 }
             });
         }

@@ -1516,6 +1516,9 @@ impl GcHeap {
             }
             initialize(&mut *payload_ptr);
         }
+        if self.trace_table.needs_cleanup(T::TYPE_TAG) {
+            self.new_space.track_cleanup(offset);
+        }
         let row = &mut self.gc_stats.by_type[T::TYPE_TAG as usize];
         row.live_bytes = row.live_bytes.wrapping_add(aligned);
         row.alloc_count_total = row.alloc_count_total.wrapping_add(1);
@@ -1872,6 +1875,9 @@ impl GcHeap {
             } else {
                 GcHeader::new_young(T::TYPE_TAG, aligned as u32)
             };
+            if !placed_in_old && self.trace_table.needs_cleanup(T::TYPE_TAG) {
+                self.new_space.track_cleanup(offset);
+            }
             std::ptr::write(header_ptr, header);
             std::ptr::write(payload_ptr, value);
             if extra_bytes != 0 {

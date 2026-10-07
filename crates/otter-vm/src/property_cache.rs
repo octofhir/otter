@@ -555,6 +555,11 @@ impl crate::Interpreter {
     /// lookup-start bit, fixes the receiver's whole ordinary lookup:
     /// - an ordinary dense array owns no named property but `length`, so
     ///   every other non-index name starts at `%Array.prototype%`;
+    /// - a Map, Set, WeakMap, WeakSet, DataView, ArrayBuffer, TypedArray,
+    ///   Promise or RegExp keeps user-defined own properties in a lazy
+    ///   expando bag; without one it owns no named key but the ones its kind
+    ///   defines (a TypedArray's numeric keys, a RegExp's `lastIndex`), so
+    ///   every other name starts at its `[[Prototype]]`;
     /// - a closure or native function without a `[[Prototype]]` override, in
     ///   the default realm, starts at its own-property bag, whose prototype
     ///   mirrors the function's, for every name it does not synthesize
@@ -609,6 +614,9 @@ impl crate::Interpreter {
                 None
             };
         }
+        if let Some(start) = self.exotic_lookup_start(receiver) {
+            return start;
+        }
         if self.active_realm_id != 0 {
             return None;
         }
@@ -621,6 +629,81 @@ impl crate::Interpreter {
             return None;
         }
         closure.own_props(&self.gc_heap)
+    }
+
+    /// The lookup start of a bag-backed exotic receiver: `Some(None)` while
+    /// its expando bag or a non-object prototype makes it own its lookup,
+    /// `None` when the receiver is no such exotic.
+    #[allow(clippy::option_option)]
+    fn exotic_lookup_start(&self, receiver: crate::Value) -> Option<Option<JsObject>> {
+        use crate::collections;
+        use crate::realm_intrinsics::Intrinsic;
+        let heap = &self.gc_heap;
+        let (expando, prototype, intrinsic) = if let Some(map) = receiver.as_map() {
+            (
+                collections::map_expando(map, heap),
+                collections::map_prototype_override(map, heap),
+                Intrinsic::MapPrototype,
+            )
+        } else if let Some(set) = receiver.as_set() {
+            (
+                collections::set_expando(set, heap),
+                collections::set_prototype_override(set, heap),
+                Intrinsic::SetPrototype,
+            )
+        } else if let Some(map) = receiver.as_weak_map() {
+            (
+                collections::weak_map_expando(map, heap),
+                collections::weak_map_prototype_override(map, heap),
+                Intrinsic::WeakMapPrototype,
+            )
+        } else if let Some(set) = receiver.as_weak_set() {
+            (
+                collections::weak_set_expando(set, heap),
+                collections::weak_set_prototype_override(set, heap),
+                Intrinsic::WeakSetPrototype,
+            )
+        } else if let Some(view) = receiver.as_data_view() {
+            (
+                view.expando(heap),
+                view.custom_proto(heap),
+                Intrinsic::DataViewPrototype,
+            )
+        } else if let Some(buffer) = receiver.as_array_buffer() {
+            let intrinsic = if buffer.is_shared() {
+                Intrinsic::SharedArrayBufferPrototype
+            } else {
+                Intrinsic::ArrayBufferPrototype
+            };
+            (buffer.expando(heap), buffer.custom_proto(heap), intrinsic)
+        } else if let Some(array) = receiver.as_typed_array(heap) {
+            (
+                array.expando(heap),
+                array.custom_proto(heap),
+                Intrinsic::typed_array_prototype(array.kind()),
+            )
+        } else if let Some(promise) = receiver.as_promise() {
+            (
+                promise.expando(heap),
+                promise.prototype_override(heap),
+                Intrinsic::PromisePrototype,
+            )
+        } else if let Some(regexp) = receiver.as_regexp() {
+            (
+                regexp.expando(heap),
+                regexp.prototype_override(heap),
+                Intrinsic::RegExpPrototype,
+            )
+        } else {
+            return None;
+        };
+        if expando.is_some() {
+            return Some(None);
+        }
+        Some(match prototype {
+            Some(prototype) => prototype.as_object(),
+            None => self.realm_intrinsics.get(intrinsic),
+        })
     }
 
     /// `start` as the lookup start of `key` on `receiver`, once the key is
@@ -636,6 +719,17 @@ impl crate::Interpreter {
         if receiver.as_array().is_some() {
             return (name != "length" && object::array_index_property_name(name).is_none())
                 .then_some(start);
+        }
+        if receiver.as_typed_array(&self.gc_heap).is_some() {
+            return crate::property_dispatch::canonical_numeric_index_string(name)
+                .is_none()
+                .then_some(start);
+        }
+        if receiver.as_regexp().is_some() {
+            return (name != "lastIndex").then_some(start);
+        }
+        if receiver.as_native_function().is_none() && receiver.as_closure(&self.gc_heap).is_none() {
+            return Some(start);
         }
         let native = receiver.as_native_function().is_some();
         let admitted = match name {

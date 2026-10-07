@@ -1680,32 +1680,30 @@ pub(crate) fn emit_operation<'a>(
             )?;
         }
         TemplateOp::IteratorClose { iterator } => {
-            iterators::emit_iterator_op(
+            iterators::emit_iterator_close(
                 ops,
                 relocations,
                 transitions,
-                Op::IteratorClose as u8,
-                u64::from(iterator),
-                0,
-                0,
+                view,
+                Op::IteratorClose,
+                iterator,
                 bail,
                 threw,
                 fatal,
-            );
+            )?;
         }
         TemplateOp::IteratorCloseThrow { iterator } => {
-            iterators::emit_iterator_op(
+            iterators::emit_iterator_close(
                 ops,
                 relocations,
                 transitions,
-                Op::IteratorCloseThrow as u8,
-                u64::from(iterator),
-                0,
-                0,
+                view,
+                Op::IteratorCloseThrow,
+                iterator,
                 bail,
                 threw,
                 fatal,
-            );
+            )?;
         }
         TemplateOp::BindFunction {
             dst,
@@ -2018,18 +2016,17 @@ pub(crate) fn emit_operation<'a>(
         }
         TemplateOp::NoOp => {}
         TemplateOp::GetIterator { dst, src } => {
-            iterators::emit_iterator_op(
+            iterators::emit_get_iterator(
                 ops,
                 relocations,
                 transitions,
-                Op::GetIterator as u8,
-                u64::from(dst),
-                u64::from(src),
-                0,
+                view,
+                dst,
+                src,
                 bail,
                 threw,
                 fatal,
-            );
+            )?;
         }
         TemplateOp::SpreadAppend { array, iterable } => {
             iterators::emit_iterator_op(

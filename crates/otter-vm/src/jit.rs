@@ -389,6 +389,27 @@ pub struct JitPrototypeValidity {
     pub identity: u64,
 }
 
+/// The cells generated code tests to open and close fast Array iterator
+/// records (see `crate::iterator_record`) in place of the realm's proofs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct JitArrayIteration {
+    /// Valid while `%Array.prototype%[@@iterator]` is the built-in `values`.
+    pub iterable: JitPrototypeValidity,
+    /// Valid while `%ArrayIteratorPrototype%`'s chain answers as proven.
+    pub iterator: JitPrototypeValidity,
+    /// Whether that chain proves `return` absent or built-in, so a close of a
+    /// live record runs nothing.
+    pub close: bool,
+    /// Realm whose proofs these are; generated code runs them only while it
+    /// is the active realm.
+    pub realm: u32,
+    /// Array cell `GcHeader::type_tag`.
+    pub array_type_tag: u8,
+    /// Byte offset of the array's exotic sidecar handle: zero for an ordinary
+    /// array with no own symbol property and no prototype override.
+    pub array_exotic_byte: u32,
+}
+
 /// One GC-movement-stable receiver allocation program.
 ///
 /// The program reads the live class or guarded closure prototype, proves its
@@ -598,6 +619,10 @@ pub struct JitCompileSnapshot {
     /// layout never reaches the emitter, so a second element-bearing family
     /// costs a declaration.
     pub element_accesses: rustc_hash::FxHashMap<u32, JitElementAccess>,
+    /// The active realm's Array iteration proof, when the function opens or
+    /// closes a synchronous iterator record and the proof holds at compile
+    /// time (see [`JitArrayIteration`]).
+    pub array_iteration: Option<JitArrayIteration>,
     /// Byte-PCs of indexed sites that have never executed. An optimizing
     /// compile deoptimizes when it reaches one ("insufficient feedback"), so
     /// the next generation specializes it instead of calling cold forever.
@@ -1882,6 +1907,7 @@ impl JitCompileSnapshot {
             cage_base: 0,
             array_layout: JitArrayLayout::default(),
             element_accesses: rustc_hash::FxHashMap::default(),
+            array_iteration: None,
             unseen_element_sites: rustc_hash::FxHashSet::default(),
             string_layout: JitStringLayout::default(),
             object_shape_byte: 0,

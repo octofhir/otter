@@ -233,25 +233,25 @@ pub(crate) extern "C" fn jit_iterator_op_stub(
 ) -> u64 {
     // SAFETY: the live `JitCtx` reentry contract.
     let ctx = unsafe { &mut *ctx };
-    let frame_index = match ctx.frame_index() {
-        Ok(index) => index,
-        Err(_) => {
-            let result = match ctx.try_runtime_call() {
-                Ok(Some(mut runtime)) => {
-                    runtime.iterator_op(opcode as u8, arg0 as u16, arg1 as u16, arg2 as u16)
-                }
-                Ok(None) => return NativeResultStatus::SideExit as u64,
-                Err(err) => Err(err),
-            };
-            return match result {
-                Ok(IteratorRuntimeOutcome::Completed) => NativeResultStatus::Success as u64,
-                Ok(IteratorRuntimeOutcome::Bail) => NativeResultStatus::SideExit as u64,
-                Err(err) => {
-                    park_jit_error(ctx, err);
-                    NativeResultStatus::Throw as u64
-                }
-            };
+    // The stack-owned subset (fast Array records) needs neither a
+    // materialized activation nor its source context.
+    let stack_owned = match ctx.try_runtime_call() {
+        Ok(Some(mut runtime)) => {
+            Some(runtime.iterator_op(opcode as u8, arg0 as u16, arg1 as u16, arg2 as u16))
         }
+        Ok(None) => None,
+        Err(err) => Some(Err(err)),
+    };
+    match stack_owned {
+        Some(Ok(IteratorRuntimeOutcome::Completed)) => return NativeResultStatus::Success as u64,
+        Some(Err(err)) => {
+            park_jit_error(ctx, err);
+            return NativeResultStatus::Throw as u64;
+        }
+        Some(Ok(IteratorRuntimeOutcome::Bail)) | None => {}
+    }
+    let Ok(frame_index) = ctx.frame_index() else {
+        return NativeResultStatus::SideExit as u64;
     };
     let Some(activation) = ctx.checked_activation() else {
         return NativeResultStatus::SideExit as u64;

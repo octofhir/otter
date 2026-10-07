@@ -1115,6 +1115,16 @@ impl<'a> Codegen<'a> {
                         let count = (count & 31) as u32;
                         dynasm!(self.ops ; .arch aarch64 ; lsr W(destination), W(a), count);
                     }
+                    // `x >>> 0` is `x` unless its sign bit makes it a uint32
+                    // past the int32 range.
+                    Int32Operand::Constant(_) => {
+                        let exit = self.eager_exit(node, DeoptReason::LostPrecision);
+                        // `b.cond` reaches a far exit; `tbnz` cannot.
+                        dynasm!(self.ops ; .arch aarch64 ; tst W(a), 0x8000_0000 ; b.ne =>exit);
+                        if destination != a {
+                            dynasm!(self.ops ; .arch aarch64 ; mov W(destination), W(a));
+                        }
+                    }
                     other => {
                         let b = self.int32_register(other);
                         let exit = self.eager_exit(node, DeoptReason::LostPrecision);
@@ -1424,7 +1434,7 @@ impl<'a> Codegen<'a> {
                     }
                 }
             }
-            Kind::LoadElementsBase(byte) => {
+            Kind::LoadElementsBase { byte, .. } => {
                 let receiver = Self::gp(input(0));
                 let destination = Self::gp(result.expect("a result"));
                 let byte = *byte;

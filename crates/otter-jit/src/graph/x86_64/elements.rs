@@ -41,7 +41,7 @@ impl Codegen<'_> {
                 byte,
                 width,
             ),
-            Kind::LoadElementsBase(byte) => self.emit_body_load(
+            Kind::LoadElementsBase { byte, .. } => self.emit_body_load(
                 Self::gp(input(0)),
                 Self::gp(assigned.result.expect("element base")),
                 byte,

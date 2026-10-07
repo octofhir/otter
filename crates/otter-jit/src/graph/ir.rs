@@ -359,9 +359,13 @@ pub(crate) enum Kind {
         byte: u32,
         width: JitGuardWidth,
     },
-    /// The element base of a proved receiver input0, a word at this byte
-    /// offset of its body.
-    LoadElementsBase(u32),
+    /// The element base of a proved receiver input0, a word at `byte` of its
+    /// body. `off_heap` marks a typed view's cached base into a backing store
+    /// the collector never moves; any other base names a movable slab.
+    LoadElementsBase {
+        byte: u32,
+        off_heap: bool,
+    },
     /// The element at `input0 + input1 << stride` in the element's
     /// representation: a tagged value (eager deopt on a hole), an int32, or a
     /// double. A `Uint32` element deopts eagerly above `i32::MAX`.
@@ -602,7 +606,7 @@ impl Kind {
             | Self::LoadContextParent
             | Self::LoadClosureContext
             | Self::LoadElementsLength { .. }
-            | Self::LoadElementsBase(_)
+            | Self::LoadElementsBase { .. }
             | Self::LoadReceiverShape
             | Self::BooleanToInt32
             | Self::LoadElementUint32ToFloat64 => pure,
@@ -961,7 +965,7 @@ impl Kind {
             | Self::LoadContextParent
             | Self::LoadClosureContext
             | Self::LoadElementsLength { .. }
-            | Self::LoadElementsBase(_)
+            | Self::LoadElementsBase { .. }
             | Self::LoadReceiverShape
             | Self::BooleanToInt32 => simple(1, ResultPolicy::Register),
             Self::CheckedTaggedToFloat64 | Self::Float64ToTagged | Self::CheckedTaggedToIndex => {

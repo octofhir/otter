@@ -87,7 +87,7 @@ fn bases(built: &Built) -> Vec<NodeId> {
         .iter()
         .enumerate()
         .filter_map(|(index, node)| {
-            matches!(node.kind, Kind::LoadElementsBase(_)).then_some(NodeId(index as u32))
+            matches!(node.kind, Kind::LoadElementsBase { .. }).then_some(NodeId(index as u32))
         })
         .collect()
 }

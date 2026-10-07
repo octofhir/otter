@@ -600,7 +600,7 @@ impl Interpreter {
         let mut shape = root;
         let mut slot = 0u16;
         let mut seen = rustc_hash::FxHashSet::default();
-        for function_id in functions {
+        'functions: for function_id in functions {
             let Ok(owner) = context.for_function(function_id) else {
                 return Ok(usize::from(slot));
             };
@@ -620,13 +620,16 @@ impl Interpreter {
                 let Some(prototype_object) = roots.scratch_0.get().as_object() else {
                     return Ok(usize::from(slot));
                 };
+                // The prepared prefix ends at a repeated name or one the
+                // prototype chain already has; it is published as it stands,
+                // guarded by the chain's validity like any other preparation.
                 if !seen.insert(store.name.clone())
                     || !matches!(
                         crate::object::lookup(prototype_object, &self.gc_heap, &store.name),
                         crate::object::PropertyLookup::Absent
                     )
                 {
-                    return Ok(usize::from(slot));
+                    break 'functions;
                 }
                 let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
                     otter_gc::ExtraRootSource::visit_extra_roots(roots, visitor);

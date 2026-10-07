@@ -232,6 +232,35 @@ const _: () = {
     );
 };
 
+/// Bytes of the BigInt cell generated code carves: header, body and one
+/// digit, rounded to the cell size.
+pub const JIT_BIGINT64_CELL_BYTES: u32 = ((otter_gc::header::HEADER_SIZE
+    + std::mem::size_of::<crate::bigint::BigIntBody>()
+    + std::mem::size_of::<u64>())
+.next_multiple_of(otter_gc::page::CELL_SIZE)) as u32;
+/// GC header word of a young [`JIT_BIGINT64_CELL_BYTES`] BigInt cell.
+pub const JIT_YOUNG_BIGINT64_HEADER_WORD: u64 = crate::bigint::BIG_INT_BODY_TYPE_TAG as u64
+    | ((JIT_GC_YOUNG_FLAG as u64) << (8 * otter_gc::header::HEADER_FLAGS_BYTE_OFFSET))
+    | ((JIT_BIGINT64_CELL_BYTES as u64) << (8 * otter_gc::header::HEADER_SIZE_BYTES_OFFSET));
+/// Cell byte of a BigInt's shape word: the digit count in the low half and
+/// the sign byte at bit 32.
+pub const JIT_BIGINT_SHAPE_BYTE: u32 =
+    (otter_gc::header::HEADER_SIZE + crate::bigint::gc_body::BIG_INT_LEN_OFFSET) as u32;
+/// Cell byte of a BigInt's sign byte.
+pub const JIT_BIGINT_NEGATIVE_BYTE: u32 =
+    (otter_gc::header::HEADER_SIZE + crate::bigint::gc_body::BIG_INT_NEGATIVE_OFFSET) as u32;
+/// Cell byte of a BigInt's least significant digit.
+pub const JIT_BIGINT_DIGIT_BYTE: u32 =
+    (otter_gc::header::HEADER_SIZE + std::mem::size_of::<crate::bigint::BigIntBody>()) as u32;
+
+const _: () = {
+    assert!(crate::bigint::gc_body::BIG_INT_LEN_OFFSET == 0);
+    assert!(crate::bigint::gc_body::BIG_INT_NEGATIVE_OFFSET == 4);
+    assert!(std::mem::size_of::<crate::bigint::BigIntBody>() == 8);
+    // The carve's digit is the cell's last word.
+    assert!(JIT_BIGINT_DIGIT_BYTE + 8 == JIT_BIGINT64_CELL_BYTES);
+};
+
 /// Everything generated code needs to carve the closure one `MakeClosure`
 /// or `MakeFunction` site creates from the linear allocation buffer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

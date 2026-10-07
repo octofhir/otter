@@ -8,6 +8,7 @@
 //! - [`emit_copy_context`]: `CopyContext` carved from the live source cell.
 //! - [`emit_closure`]: `MakeClosure` / `MakeFunction` carved from a
 //!   [`otter_vm::jit::JitClosureAllocationPlan`].
+//! - [`emit_bigint64`]: a one-digit BigInt carved from an `i64`.
 //! - Empty/static literal shells and dense slabs use the same LAB probe.
 //! - Constructor receivers prove their live finalized family and current
 //!   prototype, then use the shared LAB owner before callee publication.
@@ -76,6 +77,9 @@ pub(crate) use receiver_dynamic::emit_dynamic_construct_receiver;
 
 mod string;
 pub(crate) use string::emit_concat;
+
+mod bigint;
+pub(crate) use bigint::{emit_bigint64, emit_unbox_bigint64};
 
 mod empty;
 pub(crate) use empty::emit_empty_literal;

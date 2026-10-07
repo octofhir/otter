@@ -987,8 +987,9 @@ impl Interpreter {
         let name = context
             .function(fid)
             .map_or_else(|| "<unknown>".to_string(), |function| function.name.clone());
+        let id = code.metadata().id;
         self.jit_debug
-            .record_perf_map(address, code.code_len(), &format!("JS:{name} [{tier}]"));
+            .record_perf_map(address, code.code_len(), &format!("JS:{name} [{tier} c{id}]"));
     }
 
     /// Name `shape` in the code being compiled and return the compressed

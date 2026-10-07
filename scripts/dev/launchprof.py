@@ -11,7 +11,10 @@ rows of both tables. FOCUS=<substring> also aggregates the direct callers and
 callees of the outermost frame matching it. Traces and exports stay under
 <out-dir>. Run otter with `--perf-basic-prof` to name generated code: the
 launch's `/tmp/perf-<pid>.map` is kept beside its export and resolves bare
-JIT addresses to `JS:<function> [<tier>]`.
+JIT addresses to `JS:<function> [<tier> c<code-object>]`; OFFSETS=1 keeps the
+code offset (`+0x..`) to read against that run's `--jit-artifacts` listing.
+BOUNDARY=1 also counts, per sample, the native frame the innermost generated
+frame called: the runtime entries compiled code pays for.
 """
 import bisect, collections, glob, os, pathlib, shutil, subprocess, sys, time
 import xml.etree.ElementTree as ET
@@ -34,7 +37,8 @@ def symbolize(name, ranges, starts):
     address = int(name, 16)
     index = bisect.bisect_right(starts, address) - 1
     if index >= 0 and address < ranges[index][1]:
-        return ranges[index][2]
+        start, _, symbol = ranges[index]
+        return f"{symbol}+{address - start:#x}" if offsets else symbol
     return name
 
 out = pathlib.Path(sys.argv[1])
@@ -43,6 +47,8 @@ command = sys.argv[sys.argv.index("--") + 1:]
 thread_filter = os.environ.get("THREAD", "otter-isolate")
 top = int(os.environ.get("TOP", "40"))
 focus = os.environ.get("FOCUS")
+offsets = os.environ.get("OFFSETS") == "1"
+boundary = collections.Counter() if os.environ.get("BOUNDARY") == "1" else None
 callers = collections.Counter()
 callees = collections.Counter()
 out.mkdir(parents=True, exist_ok=True)
@@ -102,6 +108,11 @@ for run in range(runs):
             continue
         total += 1
         self_counts[names[0]] += 1
+        if boundary is not None:
+            generated = [index for index, name in enumerate(names) if name.startswith("JS:")]
+            if generated:
+                index = generated[0]
+                boundary[names[index - 1] if index > 0 else "<generated>"] += 1
         for name in set(names):
             inclusive[name] += 1
         if focus:
@@ -118,6 +129,10 @@ for name, count in self_counts.most_common(top):
 print("== inclusive")
 for name, count in inclusive.most_common(top):
     print(f"{count:6d}  {name[:150]}")
+if boundary is not None:
+    print("== runtime entries called by generated code")
+    for name, count in boundary.most_common(top):
+        print(f"{count:6d}  {name[:150]}")
 if focus:
     for title, table in (("callers", callers), ("callees", callees)):
         print(f"== {title} of {focus}")

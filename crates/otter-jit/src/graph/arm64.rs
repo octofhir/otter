@@ -88,6 +88,9 @@ type Deferred<'a> = Box<dyn FnOnce(&mut Codegen<'a>) + 'a>;
 
 struct Codegen<'a> {
     ops: Assembler,
+    /// Literal-pool label of each float64 constant a move loads, emitted
+    /// after the code.
+    float_pool: FxHashMap<u64, DynamicLabel>,
     relocations: RelocationCapture,
     view: &'a JitCompileSnapshot,
     /// The snapshot of each inlined body, by origin minus one.
@@ -284,6 +287,7 @@ pub(crate) fn emit(
         far,
         island_base: 0,
         exits_flushed: 0,
+        float_pool: FxHashMap::default(),
         veneers: Vec::new(),
     };
     let tier_entry = codegen.ops.offset().0;
@@ -362,6 +366,7 @@ pub(crate) fn emit(
         transitions,
         view,
     );
+    codegen.emit_float_pool();
     codegen
         .return_sites
         .sort_by_key(|site| site.native_return_offset);
@@ -445,6 +450,19 @@ impl<'a> Codegen<'a> {
             Kind::ConstInt32(value) => (u64::from(value as u32), false),
             Kind::ConstFloat64(bits) => (bits, true),
             _ => unreachable!("not a constant"),
+        }
+    }
+
+    /// The float64 literal pool, after every instruction of the function.
+    fn emit_float_pool(&mut self) {
+        if self.float_pool.is_empty() {
+            return;
+        }
+        let mut pool: Vec<(u64, DynamicLabel)> = self.float_pool.drain().collect();
+        pool.sort_unstable_by_key(|&(bits, _)| bits);
+        dynasm!(self.ops ; .arch aarch64 ; .align 8);
+        for (bits, label) in pool {
+            dynasm!(self.ops ; .arch aarch64 ; =>label ; .u64 bits);
         }
     }
 
@@ -564,9 +582,15 @@ impl<'a> Codegen<'a> {
                 let (bits, _) = self.constant_bits(node);
                 if bits == 0 {
                     dynasm!(self.ops ; .arch aarch64 ; fmov D(b), xzr);
+                } else if let Some(value) = fmov_immediate(bits) {
+                    dynasm!(self.ops ; .arch aarch64 ; fmov D(b), value as f32);
                 } else {
-                    self.load_immediate(16, bits);
-                    dynasm!(self.ops ; .arch aarch64 ; fmov D(b), x16);
+                    // One PC-relative load from the pool after the code.
+                    let label = *self
+                        .float_pool
+                        .entry(bits)
+                        .or_insert_with(|| self.ops.new_dynamic_label());
+                    dynasm!(self.ops ; .arch aarch64 ; ldr D(b), =>label);
                 }
             }
             (Location::Constant(node), slot) => {
@@ -4499,4 +4523,13 @@ impl super::moves::Emitter for Codegen<'_> {
     fn unpark(&mut self, to: Location) {
         self.emit_unpark(to);
     }
+}
+
+/// The float64 `bits` as an `fmov` immediate: `±(1 + m/16) × 2^e` with
+/// `m` in 0..=15 and `e` in -3..=4.
+fn fmov_immediate(bits: u64) -> Option<f64> {
+    let value = f64::from_bits(bits);
+    let exponent = ((bits >> 52) & 0x7ff) as i64 - 1023;
+    let fraction = bits & ((1 << 52) - 1);
+    ((-3..=4).contains(&exponent) && fraction & ((1 << 48) - 1) == 0).then_some(value)
 }

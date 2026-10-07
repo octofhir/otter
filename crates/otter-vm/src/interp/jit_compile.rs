@@ -676,6 +676,7 @@ impl Interpreter {
                 if installed {
                     self.jit_runtime_stats.code_generations =
                         self.jit_runtime_stats.code_generations.saturating_add(1);
+                    self.record_jit_perf_map(context, fid, code.as_ref(), "optimizing");
                 }
                 installed.then_some(code)
             }
@@ -956,6 +957,7 @@ impl Interpreter {
                         self.jit_runtime_stats.code_generations.saturating_add(1);
                     self.optimizing_tier_policy
                         .observe_template_generation(&function);
+                    self.record_jit_perf_map(context, fid, code.as_ref(), "template");
                 }
                 if installed {
                     TemplateCompileOutcome::Installed(code)
@@ -966,6 +968,27 @@ impl Interpreter {
             Ok(jit::JitCompileStatus::Unsupported { .. }) => TemplateCompileOutcome::Unsupported,
             Ok(jit::JitCompileStatus::Unavailable) | Err(_) => TemplateCompileOutcome::Deferred,
         }
+    }
+
+    /// Name one installed code object in the perf map, when requested.
+    fn record_jit_perf_map(
+        &mut self,
+        context: &ExecutionContext,
+        fid: u32,
+        code: &dyn jit::JitFunctionCode,
+        tier: &str,
+    ) {
+        if !self.jit_debug.request().perf_map_enabled() {
+            return;
+        }
+        let Some(address) = code.native_code_address() else {
+            return;
+        };
+        let name = context
+            .function(fid)
+            .map_or_else(|| "<unknown>".to_string(), |function| function.name.clone());
+        self.jit_debug
+            .record_perf_map(address, code.code_len(), &format!("JS:{name} [{tier}]"));
     }
 
     /// Name `shape` in the code being compiled and return the compressed

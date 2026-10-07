@@ -38,6 +38,7 @@ pub(crate) struct CliExecutionConfig {
     warning_options: WarningOptions,
     process_title: Option<String>,
     expose_gc: bool,
+    perf_map: bool,
     expose_internals: bool,
     /// How much stack a call may use, in kilobytes, as `--stack-size` named it.
     stack_size: Option<u32>,
@@ -56,6 +57,7 @@ impl Default for CliExecutionConfig {
             warning_options: WarningOptions::default(),
             process_title: None,
             expose_gc: false,
+            perf_map: false,
             expose_internals: false,
             stack_size: None,
             flag_spellings: Vec::new(),
@@ -82,6 +84,7 @@ impl CliExecutionConfig {
             warning_options: WarningOptions::default(),
             process_title: None,
             expose_gc: false,
+            perf_map: false,
             expose_internals: false,
             stack_size: None,
             flag_spellings: Vec::new(),
@@ -103,6 +106,11 @@ impl CliExecutionConfig {
     /// Enable the global `gc()` captured from `--expose-gc`.
     pub(crate) fn set_expose_gc(&mut self, expose: bool) {
         self.expose_gc = expose;
+    }
+
+    /// Name installed compiled code in the perf map.
+    pub(crate) fn set_perf_map(&mut self, enabled: bool) {
+        self.perf_map = enabled;
     }
 
     /// How much stack a call may use, as `--stack-size` named it.
@@ -372,6 +380,7 @@ impl CliExecutionConfig {
         JitDebugRequest::disabled()
             .with_events(self.jit_events_target.is_some())
             .with_artifacts(self.jit_artifacts_target.is_some())
+            .with_perf_map(self.perf_map)
     }
 }
 
@@ -419,6 +428,7 @@ mod tests {
             warning_options: WarningOptions::default(),
             process_title: None,
             expose_gc: false,
+            perf_map: false,
             expose_internals: false,
             stack_size: None,
             flag_spellings: Vec::new(),
@@ -443,6 +453,7 @@ mod tests {
             warning_options: WarningOptions::default(),
             process_title: None,
             expose_gc: false,
+            perf_map: false,
             expose_internals: false,
             stack_size: None,
             flag_spellings: Vec::new(),
@@ -471,6 +482,7 @@ mod tests {
             warning_options: WarningOptions::default(),
             process_title: None,
             expose_gc: false,
+            perf_map: false,
             expose_internals: false,
             stack_size: None,
             flag_spellings: Vec::new(),
@@ -490,6 +502,7 @@ mod tests {
             warning_options: WarningOptions::default(),
             process_title: None,
             expose_gc: false,
+            perf_map: false,
             expose_internals: false,
             stack_size: None,
             flag_spellings: Vec::new(),

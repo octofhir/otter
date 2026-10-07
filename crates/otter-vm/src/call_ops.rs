@@ -225,18 +225,19 @@ impl otter_gc::ExtraRootSource for SyncJsCallRoots {
     }
 }
 
-pub(crate) fn invoke_native_call_with_roots(
+/// Run a native body for a published host frame. The frame traces its
+/// callee and its actuals, which `args` reads in place; only the call info's
+/// copy of the receiver is rooted here.
+pub(crate) fn invoke_frame_native_call(
     interp: &mut Interpreter,
     stack: &mut ActivationStack,
     context: crate::runtime_cx::NativeContext<'_>,
     call: crate::native_function::NativeCallTarget,
     this_value: Value,
-    value_roots: &[&Value],
     args: &[Value],
 ) -> Result<Value, crate::NativeError> {
     let call_info = NativeCallInfo::call(this_value);
-    let slice_roots = [args];
-    let roots = NativeCallRoots::new(&call_info, value_roots, &slice_roots);
+    let roots = NativeCallRoots::new(&call_info, &[], &[]);
     // Pushed (not installed) so any outer scope's value/slice roots
     // stay visible to scavenges triggered inside this native.
     let _roots_guard = interp

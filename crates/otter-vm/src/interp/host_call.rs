@@ -102,6 +102,18 @@ impl HostTurn<'_> {
         self.frame().actuals
     }
 
+    /// The frame's actuals in place. The published frame traces them, so a
+    /// collection rewrites them where this slice reads them.
+    fn frame_actuals<'s>(&self) -> &'s [Value] {
+        let count = self.frame().argument_count as usize;
+        if count == 0 {
+            return &[];
+        }
+        // SAFETY: the trampoline initialized `argument_count` actual slots,
+        // which stay in this frame's window while the host body runs.
+        unsafe { std::slice::from_raw_parts(self.actuals_ptr(), count) }
+    }
+
     fn actuals(&self) -> SmallVec<[Value; 8]> {
         let count = self.frame().argument_count as usize;
         // SAFETY: the trampoline initialized `argument_count` actual slots.
@@ -438,20 +450,18 @@ fn native_call(
         .record_runtime_native_call()
         .map_err(|error| CommittedValueError::Fatal(error.into()))?;
     let realm_global = turn.vm.native_target_realm_global(&native);
-    let callee = turn.frame().self_value;
     let receiver = turn.frame().this_value;
-    let args = turn.actuals();
+    let args = turn.frame_actuals();
     let caller = CallerContext::new(turn);
     let (vm, stack) = (&mut *turn.vm, &mut *turn.stack);
     let invoke = |vm: &mut Interpreter| {
-        let result = crate::call_ops::invoke_native_call_with_roots(
+        let result = crate::call_ops::invoke_frame_native_call(
             vm,
             stack,
             NativeContext::Caller(&caller),
             call,
             receiver,
-            &[&callee],
-            args.as_slice(),
+            args,
         );
         // Only a failure projects through the caller's source.
         let context = if result.is_err() {
@@ -628,18 +638,17 @@ fn other_entry(turn: &mut HostTurn<'_>, ctx: &mut JitCtx) -> Result<HostStep, Co
         .map_err(CommittedValueError::Fatal)?;
     let realm_global = turn.vm.native_target_realm_global(&native);
     let receiver = turn.frame().this_value;
-    let args = turn.actuals();
+    let args = turn.frame_actuals();
     let caller = CallerContext::new(turn);
     let (vm, stack) = (&mut *turn.vm, &mut *turn.stack);
     let invoke = |vm: &mut Interpreter| {
-        let result = crate::call_ops::invoke_native_call_with_roots(
+        let result = crate::call_ops::invoke_frame_native_call(
             vm,
             stack,
             NativeContext::Caller(&caller),
             call,
             receiver,
-            &[&callee],
-            args.as_slice(),
+            args,
         );
         // Only a failure projects through the caller's source.
         let context = if result.is_err() {

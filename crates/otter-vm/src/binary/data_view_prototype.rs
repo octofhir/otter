@@ -72,14 +72,19 @@ fn ensure_within(
 /// `RangeError`. Returning the abrupt completion verbatim preserves a
 /// user `throw` (e.g. a `Test262Error` from a poisoned `valueOf`).
 fn to_index_or_throw(ctx: &mut NativeCtx<'_>, value: &Value) -> Result<usize, NativeError> {
-    let exec = ctx
-        .execution_context()
-        .cloned()
-        .ok_or_else(|| bad("missing execution context"))?;
-    let number = ctx.with_turn_parts(|interp, stack| {
-        crate::coerce::to_number_or_throw(interp, stack, &exec, value)
-            .map_err(|e| e.into_native(interp, NAME))
-    })?;
+    let number = match value.as_number() {
+        Some(number) => number,
+        None => {
+            let exec = ctx
+                .execution_context()
+                .cloned()
+                .ok_or_else(|| bad("missing execution context"))?;
+            ctx.with_turn_parts(|interp, stack| {
+                crate::coerce::to_number_or_throw(interp, stack, &exec, value)
+                    .map_err(|e| e.into_native(interp, NAME))
+            })?
+        }
+    };
     let n = number.as_f64();
     let integer = if n.is_nan() { 0.0 } else { n.trunc() };
     if !(0.0..=9_007_199_254_740_991.0).contains(&integer) {
@@ -98,6 +103,13 @@ fn convert_set_value(
     is_bigint: bool,
     value: &Value,
 ) -> Result<Value, NativeError> {
+    // A value already of the element's numeric type converts to itself.
+    if is_bigint && value.is_big_int() {
+        return Ok(*value);
+    }
+    if let Some(number) = value.as_number().filter(|_| !is_bigint) {
+        return Ok(number_value(number.as_f64()));
+    }
     let exec = ctx
         .execution_context()
         .cloned()
@@ -137,10 +149,11 @@ where
     ensure_within(&view, ctx.heap(), offset, byte_count)?;
     let abs_offset = view.byte_offset(ctx.heap()) + offset;
     let buffer = view.buffer(ctx.heap());
-    let snapshot: Vec<u8> = buffer.with_bytes(ctx.heap(), |b| {
-        b[abs_offset..abs_offset + byte_count].to_vec()
+    let mut snapshot = [0u8; 8];
+    buffer.with_bytes(ctx.heap(), |b| {
+        snapshot[..byte_count].copy_from_slice(&b[abs_offset..abs_offset + byte_count]);
     });
-    f(&snapshot, little_endian, ctx.heap_mut())
+    f(&snapshot[..byte_count], little_endian, ctx.heap_mut())
 }
 
 fn write_view<F>(
@@ -164,12 +177,13 @@ where
     let little_endian = to_little_endian_flag(args.get(2), ctx.heap());
     check_in_bounds(&view, ctx.heap())?;
     ensure_within(&view, ctx.heap(), offset, byte_count)?;
-    let mut staging = vec![0u8; byte_count];
-    f(&mut staging, &value, little_endian, ctx.heap());
+    let mut staging = [0u8; 8];
+    let staging = &mut staging[..byte_count];
+    f(staging, &value, little_endian, ctx.heap());
     let abs_offset = view.byte_offset(ctx.heap()) + offset;
     let buffer = view.buffer(ctx.heap());
     buffer.with_bytes_mut(ctx.heap_mut(), |buf| {
-        buf[abs_offset..abs_offset + byte_count].copy_from_slice(&staging);
+        buf[abs_offset..abs_offset + byte_count].copy_from_slice(staging);
     });
     Ok(Value::undefined())
 }

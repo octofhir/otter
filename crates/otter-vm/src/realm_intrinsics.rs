@@ -224,6 +224,25 @@ impl Intrinsic {
         }
     }
 
+    /// The prototype slot of a TypedArray kind's constructor.
+    pub(crate) const fn typed_array_prototype(kind: crate::binary::TypedArrayKind) -> Self {
+        use crate::binary::TypedArrayKind as Kind;
+        match kind {
+            Kind::Int8 => Self::Int8ArrayPrototype,
+            Kind::Uint8 => Self::Uint8ArrayPrototype,
+            Kind::Uint8Clamped => Self::Uint8ClampedArrayPrototype,
+            Kind::Int16 => Self::Int16ArrayPrototype,
+            Kind::Uint16 => Self::Uint16ArrayPrototype,
+            Kind::Int32 => Self::Int32ArrayPrototype,
+            Kind::Uint32 => Self::Uint32ArrayPrototype,
+            Kind::Float16 => Self::Float16ArrayPrototype,
+            Kind::Float32 => Self::Float32ArrayPrototype,
+            Kind::Float64 => Self::Float64ArrayPrototype,
+            Kind::BigInt64 => Self::BigInt64ArrayPrototype,
+            Kind::BigUint64 => Self::BigUint64ArrayPrototype,
+        }
+    }
+
     /// The slot whose `.prototype` a global constructor name fills, if
     /// the registry caches one. Lets every
     /// `OrdinaryCreateFromConstructor`-style lookup read the realm's

@@ -542,6 +542,19 @@ fn render_branch(branch: DirectBranch) -> String {
         DirectBranchKind::Adr { register } => {
             format!("adr {}, {label}", register_name(register, true))
         }
+        DirectBranchKind::LoadLiteral {
+            opc,
+            vector,
+            register,
+        } => match (vector, opc) {
+            (true, width) => format!(
+                "ldr {}{register}, {label}",
+                ["s", "d", "q", "?"][usize::from(width & 3)]
+            ),
+            (false, 2) => format!("ldrsw {}, {label}", register_name(register, true)),
+            (false, 3) => format!("prfm #{register}, {label}"),
+            (false, width) => format!("ldr {}, {label}", register_name(register, width == 1)),
+        },
     }
 }
 

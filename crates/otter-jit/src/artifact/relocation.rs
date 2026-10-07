@@ -42,6 +42,8 @@ const ITEM_RAW_INSTRUCTION: u8 = 0;
 const ITEM_RELOCATION: u8 = 1;
 #[cfg(not(target_arch = "x86_64"))]
 const ITEM_DIRECT_BRANCH: u8 = 2;
+#[cfg(not(target_arch = "x86_64"))]
+const ITEM_DATA_WORD: u8 = 4;
 
 const TARGET_RUNTIME_STUB: u8 = 1;
 const TARGET_GC_CAGE_BASE: u8 = 2;
@@ -201,6 +203,8 @@ struct RelocationRecord {
 pub(crate) struct RelocationCapture {
     enabled: bool,
     records: Vec<RelocationRecord>,
+    /// Byte ranges of in-code data (literal pools), never instructions.
+    data: Vec<(usize, usize)>,
 }
 
 impl RelocationCapture {
@@ -209,6 +213,16 @@ impl RelocationCapture {
         Self {
             enabled,
             records: Vec::new(),
+            data: Vec::new(),
+        }
+    }
+
+    /// Records one in-code data range (a literal pool) that `ldr (literal)`
+    /// instructions address.
+    #[cfg(not(target_arch = "x86_64"))]
+    pub(crate) fn record_data(&mut self, start: usize, end: usize) {
+        if self.enabled {
+            self.data.push((start, end));
         }
     }
 
@@ -272,7 +286,7 @@ impl RelocationCapture {
             let validated = ValidatedRelocations {
                 records: validate_relocations(&self.records, code)?,
             };
-            let logical_items = build_logical_items(&validated.records, code);
+            let logical_items = build_logical_items(&validated.records, &self.data, code);
             let normalized_code = render_normalized(&validated.records, &logical_items, code)?;
             let json = render_json(&validated.records);
             Ok(RenderedRelocations {
@@ -693,8 +707,16 @@ pub(super) struct ValidatedRelocations {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg(not(target_arch = "x86_64"))]
 enum LogicalItem {
-    RawInstruction { offset: usize },
-    Relocation { index: usize },
+    RawInstruction {
+        offset: usize,
+    },
+    Relocation {
+        index: usize,
+    },
+    #[cfg(not(target_arch = "x86_64"))]
+    DataWord {
+        offset: usize,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -892,12 +914,24 @@ fn decode_mov_wide(instruction: u32) -> Option<DecodedMovWide> {
 }
 
 #[cfg(not(target_arch = "x86_64"))]
-fn build_logical_items(relocations: &[ValidatedRelocation], code: &[u8]) -> Vec<LogicalItem> {
+fn build_logical_items(
+    relocations: &[ValidatedRelocation],
+    data: &[(usize, usize)],
+    code: &[u8],
+) -> Vec<LogicalItem> {
     let mut items = Vec::new();
     let mut offset = 0;
     let mut relocation_index = 0;
     while offset < code.len() {
-        if relocation_index < relocations.len() && relocations[relocation_index].start() == offset {
+        if data
+            .iter()
+            .any(|&(start, end)| (start..end).contains(&offset))
+        {
+            items.push(LogicalItem::DataWord { offset });
+            offset += 4;
+        } else if relocation_index < relocations.len()
+            && relocations[relocation_index].start() == offset
+        {
             items.push(LogicalItem::Relocation {
                 index: relocation_index,
             });
@@ -942,7 +976,7 @@ fn render_normalized(
     let mut offsets = Vec::with_capacity(items.len());
     for item in items {
         offsets.push(match item {
-            LogicalItem::RawInstruction { offset } => *offset,
+            LogicalItem::RawInstruction { offset } | LogicalItem::DataWord { offset } => *offset,
             LogicalItem::Relocation { index } => relocations[*index].start(),
         });
     }
@@ -959,6 +993,10 @@ fn render_normalized(
                 output.push(relocation.register);
                 output.push(relocation.width_bits);
                 encode_target(&relocation.target, &mut output)?;
+            }
+            LogicalItem::DataWord { offset } => {
+                output.push(ITEM_DATA_WORD);
+                output.extend_from_slice(&code[*offset..*offset + 4]);
             }
             LogicalItem::RawInstruction { offset } => {
                 let instruction = read_instruction(code, *offset);
@@ -1055,6 +1093,13 @@ pub(super) enum DirectBranchKind {
     Adr {
         register: u8,
     },
+    /// Code-relative literal load or prefetch (`ldr (literal)`): `opc`
+    /// and the vector bit name the access, `register` its target.
+    LoadLiteral {
+        opc: u8,
+        vector: bool,
+        register: u8,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1102,6 +1147,16 @@ impl DirectBranch {
             }
             DirectBranchKind::Adr { register } => {
                 output.push(7);
+                output.push(register);
+            }
+            DirectBranchKind::LoadLiteral {
+                opc,
+                vector,
+                register,
+            } => {
+                output.push(8);
+                output.push(opc);
+                output.push(u8::from(vector));
                 output.push(register);
             }
         }
@@ -1159,6 +1214,16 @@ pub(super) fn decode_direct_branch(instruction: u32, offset: usize) -> Option<Di
             target: offset as i64 + sign_extend(immediate, 21),
         });
     }
+    if instruction & 0x3b00_0000 == 0x1800_0000 {
+        return Some(DirectBranch {
+            kind: DirectBranchKind::LoadLiteral {
+                opc: (instruction >> 30) as u8,
+                vector: instruction & (1 << 26) != 0,
+                register: (instruction & 0x1f) as u8,
+            },
+            target: offset as i64 + (sign_extend((instruction >> 5) & 0x7ffff, 19) << 2),
+        });
+    }
     if instruction & 0x7e00_0000 == 0x3600_0000 {
         let displacement = sign_extend((instruction >> 5) & 0x3fff, 14) << 2;
         let is_nonzero = instruction & (1 << 24) != 0;
@@ -1180,9 +1245,6 @@ pub(super) fn decode_direct_branch(instruction: u32, offset: usize) -> Option<Di
 fn unsupported_pc_relative(instruction: u32) -> Option<&'static str> {
     if instruction & 0x9f00_0000 == 0x9000_0000 {
         return Some("ADRP");
-    }
-    if instruction & 0x3b00_0000 == 0x1800_0000 {
-        return Some("literal load/prefetch");
     }
     if instruction & 0xff00_0000 == 0x5400_0000 && instruction & 0x10 != 0 {
         return Some("BC.cond");
@@ -1928,12 +1990,7 @@ mod tests {
     #[cfg(target_arch = "aarch64")]
     #[test]
     fn rejects_unsupported_pc_relative_instructions() {
-        for (instruction, name) in [
-            (0x9000_0000, "ADRP"),
-            (0x5800_0000, "literal load/prefetch"),
-            (0xd800_0000, "literal load/prefetch"),
-            (0x5400_0010, "BC.cond"),
-        ] {
+        for (instruction, name) in [(0x9000_0000, "ADRP"), (0x5400_0010, "BC.cond")] {
             let code = instructions(&[instruction]);
             assert_eq!(
                 RelocationCapture::default().render(&code).unwrap_err(),
@@ -1943,6 +2000,19 @@ mod tests {
                 }
             );
         }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn literal_loads_address_recorded_data_words() {
+        // ldr d0, #8 ; ret ; one pool word that would decode as `b`.
+        let code = instructions(&[0x5c00_0040, RET, 0x1400_0000, 0]);
+        let mut capture = RelocationCapture::new(true);
+        capture.record_data(8, 16);
+        let rendered = capture.render(&code).expect("a literal pool renders");
+        let tail = &rendered.normalized_code[14..];
+        assert_eq!(tail[..6], [ITEM_DIRECT_BRANCH, 8, 1, 1, 0, 2]);
+        assert!(tail.ends_with(&[ITEM_DATA_WORD, 0, 0, 0, 0x14, ITEM_DATA_WORD, 0, 0, 0, 0]));
     }
 
     #[cfg(target_arch = "aarch64")]

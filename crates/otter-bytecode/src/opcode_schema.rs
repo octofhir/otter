@@ -90,6 +90,37 @@ pub enum RegisterAccess {
     Read,
     /// The instruction writes the identified register.
     Write,
+    /// The instruction reads the identified register and the next one.
+    ReadPair,
+    /// The instruction writes the identified register and the next one.
+    WritePair,
+    /// The instruction reads and writes the identified register and the next
+    /// one.
+    ReadWritePair,
+}
+
+impl RegisterAccess {
+    /// Whether the instruction reads the named registers.
+    #[must_use]
+    pub const fn reads(self) -> bool {
+        matches!(self, Self::Read | Self::ReadPair | Self::ReadWritePair)
+    }
+
+    /// Whether the instruction writes the named registers.
+    #[must_use]
+    pub const fn writes(self) -> bool {
+        matches!(self, Self::Write | Self::WritePair | Self::ReadWritePair)
+    }
+
+    /// Consecutive registers the operand names, from its register number up.
+    #[must_use]
+    pub const fn width(self) -> u16 {
+        match self {
+            Self::None => 0,
+            Self::Read | Self::Write => 1,
+            Self::ReadPair | Self::WritePair | Self::ReadWritePair => 2,
+        }
+    }
 }
 
 /// How a register number is represented by an operand.
@@ -626,8 +657,16 @@ impl MemberDefinition {
     /// Encode with the documented bit layout.
     #[must_use]
     pub const fn to_imm32(self) -> i32 {
-        let enumerable = if self.enumerable { Self::ENUMERABLE_BIT } else { 0 };
-        let read_only = if self.read_only { Self::READ_ONLY_BIT } else { 0 };
+        let enumerable = if self.enumerable {
+            Self::ENUMERABLE_BIT
+        } else {
+            0
+        };
+        let read_only = if self.read_only {
+            Self::READ_ONLY_BIT
+        } else {
+            0
+        };
         (self.kind as u32 | enumerable | read_only) as i32
     }
 
@@ -1567,6 +1606,10 @@ fn verify_operand_specs(
 
 const W: OperandSpec = OperandSpec::register(RegisterAccess::Write);
 const R: OperandSpec = OperandSpec::register(RegisterAccess::Read);
+/// A synchronous iterator record: the iterator, then its cursor.
+const ITER_R: OperandSpec = OperandSpec::register(RegisterAccess::ReadPair);
+const ITER_W: OperandSpec = OperandSpec::register(RegisterAccess::WritePair);
+const ITER_RW: OperandSpec = OperandSpec::register(RegisterAccess::ReadWritePair);
 const IMM: OperandSpec = OperandSpec::value(OperandKind::Imm32);
 const CONST: OperandSpec = OperandSpec::value(OperandKind::ConstIndex);
 const LOCAL_R: OperandSpec = OperandSpec::local_index(RegisterAccess::Read);
@@ -1691,9 +1734,10 @@ const fn operand_shape(op: Op) -> OperandShape {
         Op::LoadProperty | Op::DeleteProperty => OperandShape::Fixed(WRITE_READ_CONST),
         Op::StoreProperty => OperandShape::Fixed(READ_CONST_READ_WRITE),
         Op::StorePropertyStrict => OperandShape::Fixed(READ_CONST_READ_WRITE),
-        Op::GetPrototype | Op::ArrayLength | Op::GetIterator | Op::GetAsyncIterator => {
+        Op::GetPrototype | Op::ArrayLength | Op::GetAsyncIterator => {
             OperandShape::Fixed(WRITE_READ)
         }
+        Op::GetIterator => OperandShape::Fixed(&[ITER_W, R]),
         Op::SetPrototype | Op::ArrayPush | Op::SpreadAppend => OperandShape::Fixed(READ_READ),
         Op::CopyDataProperties => OperandShape::Fixed(READ_READ_READ),
         Op::LoadElement | Op::DeleteElement | Op::HasProperty | Op::Instanceof => {
@@ -1701,10 +1745,9 @@ const fn operand_shape(op: Op) -> OperandShape {
         }
         Op::StoreElement => OperandShape::Fixed(READ_READ_READ),
         Op::StoreElementStrict => OperandShape::Fixed(READ_READ_READ),
-        Op::IteratorNext => OperandShape::Fixed(WRITE_WRITE_READ),
-        Op::IteratorClose | Op::IteratorCloseThrow | Op::CheckIteratorResult => {
-            OperandShape::Fixed(&[R])
-        }
+        Op::IteratorNext => OperandShape::Fixed(&[W, W, ITER_RW]),
+        Op::IteratorClose | Op::IteratorCloseThrow => OperandShape::Fixed(&[ITER_R]),
+        Op::CheckIteratorResult => OperandShape::Fixed(&[R]),
         Op::AsyncIteratorReturn => OperandShape::Fixed(WRITE_WRITE_READ),
         Op::ForInKeys => OperandShape::Fixed(WRITE_READ),
         Op::CreateContext => OperandShape::Fixed(CREATE_CONTEXT),

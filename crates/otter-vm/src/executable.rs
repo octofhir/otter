@@ -55,8 +55,7 @@ mod executable_snapshot;
 
 use otter_bytecode::{
     ArgumentBindingStorage, ArgumentsObjectKind, Function, FunctionCode, FunctionCodeBuilder, Op,
-    Operand, SpanEntry, VerifiedFunction,
-    encoding::measure_wordcode_function,
+    Operand, SpanEntry, VerifiedFunction, encoding::measure_wordcode_function,
 };
 use otter_resource::{ResourceAccount, ResourceClass, ResourceError, ResourceLease};
 use std::sync::{Arc, OnceLock};
@@ -206,11 +205,12 @@ impl ExecutableModule {
     /// allocations. A block/counter keeps its charge after this table drops.
     #[must_use]
     pub(crate) fn retained_bytes(&self) -> u64 {
-        self.built().fold(self._table_lease.amount(), |total, block| {
-            total
-                .saturating_add(block._lease.amount())
-                .saturating_add(block.source_work.retained_bytes())
-        })
+        self.built()
+            .fold(self._table_lease.amount(), |total, block| {
+                total
+                    .saturating_add(block._lease.amount())
+                    .saturating_add(block.source_work.retained_bytes())
+            })
     }
 
     /// Directory entries for the method-call sites in this chunk, read off
@@ -1634,9 +1634,9 @@ mod tests {
         let mut max_register = 0u32;
         for instruction in &code {
             for index in 0..instruction.operands.len() {
-                if otter_bytecode::opcode_schema::register_access_at(instruction.op, index)
-                    == otter_bytecode::opcode_schema::RegisterAccess::None
-                {
+                let access =
+                    otter_bytecode::opcode_schema::register_access_at(instruction.op, index);
+                if access == otter_bytecode::opcode_schema::RegisterAccess::None {
                     continue;
                 }
                 let register = match instruction.operands[index] {
@@ -1644,7 +1644,7 @@ mod tests {
                     Operand::Imm32(value) => u32::try_from(value).unwrap_or(0),
                     Operand::ConstIndex(value) => value,
                 };
-                max_register = max_register.max(register + 1);
+                max_register = max_register.max(register + u32::from(access.width()));
             }
         }
         code.push(Instruction {
@@ -2028,7 +2028,10 @@ mod tests {
 
         let executable = ExecutableModule::from_bytecode(&module);
         assert_eq!(executable.functions.len(), 1);
-        assert!(executable.functions[0].get().is_none(), "built on first use");
+        assert!(
+            executable.functions[0].get().is_none(),
+            "built on first use"
+        );
         let exec_fn = executable.function(0).unwrap();
         assert_eq!(exec_fn.code.len(), 3);
         assert_eq!(executable.property_ic_site_end(), 1);

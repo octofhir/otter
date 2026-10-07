@@ -265,6 +265,14 @@ impl FunctionContext {
         self.captured_names.contains(name) || self.mapped_argument_names.contains(name)
     }
 
+    /// The first of two consecutive registers holding a synchronous iterator
+    /// record: the iterator, then its cursor (see `Op::GetIterator`).
+    pub(crate) fn alloc_iterator_record(&mut self) -> u16 {
+        let iterator = self.alloc_scratch();
+        self.alloc_scratch();
+        iterator
+    }
+
     pub(crate) fn alloc_scratch(&mut self) -> u16 {
         let r = self.scratch;
         match self.scratch.checked_add(1) {

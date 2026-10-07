@@ -19,9 +19,7 @@
 
 use std::collections::VecDeque;
 
-use otter_bytecode::opcode_schema::{
-    ControlFlow, RegisterAccess, SuccessorSpec, opcode_schema, operand_spec_at,
-};
+use otter_bytecode::opcode_schema::{ControlFlow, SuccessorSpec, opcode_schema, operand_spec_at};
 use otter_bytecode::{Constant, FunctionCodeBuilder, Op, Operand};
 
 const ORDINARY: u8 = 1;
@@ -106,9 +104,12 @@ pub(crate) fn analyze(
             _ => None,
         };
         for index in 0..code.operand_count(pc as u32)? {
-            if operand_spec_at(op, index)?.register_access == RegisterAccess::Write {
+            let access = operand_spec_at(op, index)?.register_access;
+            if access.writes() {
                 let dst = register(code.operand(pc as u32, index)?)?;
-                *output.get_mut(dst)? = ORDINARY;
+                for written in dst..dst + usize::from(access.width()) {
+                    *output.get_mut(written)? = ORDINARY;
+                }
             }
         }
         if op == Op::CollectArguments {
@@ -143,13 +144,14 @@ pub(crate) fn analyze(
         }
         let op = code.op(pc as u32)?;
         for index in 0..code.operand_count(pc as u32)? {
-            if operand_spec_at(op, index)?.register_access != RegisterAccess::Read
-                || closure_context_operands.contains(&(pc as u32, index))
-            {
+            let access = operand_spec_at(op, index)?.register_access;
+            if !access.reads() || closure_context_operands.contains(&(pc as u32, index)) {
                 continue;
             }
             let src = register(code.operand(pc as u32, index)?)?;
-            let value = *state.get(src)?;
+            let value = (src..src + usize::from(access.width()))
+                .map(|read| state.get(read).copied())
+                .try_fold(0, |all, value| Some(all | value?))?;
             if value & ARGUMENTS == 0 {
                 continue;
             }

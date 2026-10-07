@@ -57,6 +57,19 @@ impl Interpreter {
                 let value_dst = arg0 as u16;
                 let done_dst = arg1 as u16;
                 let iter_reg = arg2 as u16;
+                if crate::iterator_record::RecordCursor::read(&stack[frame_index], iter_reg)
+                    .map_err(CommittedValueError::Fatal)?
+                    != crate::iterator_record::RecordCursor::Generic
+                {
+                    let (value, done) =
+                        self.step_fast_array_record(context, stack, frame_index, iter_reg)?;
+                    let frame = &mut stack[frame_index];
+                    write_register(frame, value_dst, value).map_err(CommittedValueError::Fatal)?;
+                    write_register(frame, done_dst, crate::Value::boolean(done))
+                        .map_err(CommittedValueError::Fatal)?;
+                    frame.pc = saved_pc;
+                    return Ok(());
+                }
                 let iterator = *read_register(&stack[frame_index], iter_reg)
                     .map_err(CommittedValueError::Fatal)?;
                 if iterator.as_iterator().is_none() {
@@ -80,16 +93,12 @@ impl Interpreter {
                 Ok(())
             }
             value if value == Op::IteratorClose as u8 => {
-                let iterator = *read_register(&stack[frame_index], arg0 as u16)
-                    .map_err(CommittedValueError::Fatal)?;
-                self.iterator_close_op(context, stack, frame_index, iterator, false)?;
+                self.close_iterator_record(context, stack, frame_index, arg0 as u16, false)?;
                 stack[frame_index].pc = saved_pc;
                 Ok(())
             }
             value if value == Op::IteratorCloseThrow as u8 => {
-                let iterator = *read_register(&stack[frame_index], arg0 as u16)
-                    .map_err(CommittedValueError::Fatal)?;
-                self.iterator_close_op(context, stack, frame_index, iterator, true)?;
+                self.close_iterator_record(context, stack, frame_index, arg0 as u16, true)?;
                 stack[frame_index].pc = saved_pc;
                 Ok(())
             }

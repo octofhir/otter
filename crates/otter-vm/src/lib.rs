@@ -140,6 +140,7 @@ pub mod intl;
 pub mod intrinsic_install;
 pub mod intrinsics;
 mod iterator_ops;
+mod iterator_record;
 pub mod iterator_state;
 pub mod jit;
 pub mod jit_artifact;

@@ -1665,18 +1665,19 @@ pub(crate) fn emit_operation<'a>(
             done_dst,
             iterator,
         } => {
-            iterators::emit_iterator_op(
+            iterators::emit_iterator_next(
                 ops,
                 relocations,
                 transitions,
-                Op::IteratorNext as u8,
-                u64::from(value_dst),
-                u64::from(done_dst),
-                u64::from(iterator),
+                view,
+                instr.byte_pc,
+                value_dst,
+                done_dst,
+                iterator,
                 bail,
                 threw,
                 fatal,
-            );
+            )?;
         }
         TemplateOp::IteratorClose { iterator } => {
             iterators::emit_iterator_op(

@@ -1,7 +1,8 @@
 //! Indexed-element receiver feedback.
 //!
 //! # Contents
-//! - Recording one receiver family at a `LoadElement` / `StoreElement` site.
+//! - Recording one receiver family at a `LoadElement` / `StoreElement` site,
+//!   or the array a fast iterator record steps at an `IteratorNext` site.
 //!
 //! # Invariants
 //! - Classification precedes the indexed operation, so getters, proxies, and
@@ -48,7 +49,7 @@ impl Interpreter {
         };
         if !matches!(
             code_block.op(instruction),
-            Op::LoadElement | Op::StoreElement | Op::StoreElementStrict
+            Op::LoadElement | Op::StoreElement | Op::StoreElementStrict | Op::IteratorNext
         ) {
             return false;
         }

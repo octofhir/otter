@@ -33,7 +33,7 @@
 //! - [`super::arm64`] — the first machine-code consumer of these operations.
 
 use otter_bytecode::opcode_schema::{
-    BindingSemantics, GlobalDeclarationSemantics, RegisterAccess, opcode_schema, register_access_at,
+    BindingSemantics, GlobalDeclarationSemantics, opcode_schema, register_access_at,
 };
 use otter_bytecode::scalar_semantics::{NumericBinaryOp, numeric_binary_semantics};
 use otter_bytecode::{Op, Operand};
@@ -1963,7 +1963,8 @@ fn read_registers_at(view: &JitCompileSnapshot, instruction_pc: u32, out: &mut V
     let op = meta.op(code_block);
     let operands = meta.operand_view(code_block);
     for index in 0..operands.len() {
-        if register_access_at(op, index) != RegisterAccess::Read {
+        let access = register_access_at(op, index);
+        if !access.reads() {
             continue;
         }
         let register = match operands.get(index) {
@@ -1974,7 +1975,7 @@ fn read_registers_at(view: &JitCompileSnapshot, instruction_pc: u32, out: &mut V
             },
             _ => continue,
         };
-        out.push(register);
+        out.extend((0..access.width()).map(|offset| register + offset));
     }
 }
 

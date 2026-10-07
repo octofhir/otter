@@ -442,6 +442,12 @@ impl Interpreter {
         src: u16,
     ) -> Result<(), CommittedValueError> {
         self.with_handle_scope(|interp, scope| {
+            if interp
+                .open_fast_array_record(context, stack, top_idx, dst, src)
+                .map_err(|error| CommittedValueError::JavaScript(error.into()))?
+            {
+                return Ok(());
+            }
             let value = *read_register(&stack[top_idx], src)
                 .map_err(|error| CommittedValueError::Fatal(error.into()))?;
             let value_root = interp.scoped_value(scope, value);
@@ -450,7 +456,7 @@ impl Interpreter {
                 .unobservable_iterator_record(stack, value, primordial)
                 .map_err(|error| CommittedValueError::JavaScript(error.into()))?
             {
-                write_register(&mut stack[top_idx], dst, record)
+                Self::write_iterator_record(&mut stack[top_idx], dst, record)
                     .map_err(|error| CommittedValueError::Fatal(error.into()))?;
                 return Ok(());
             }
@@ -469,7 +475,7 @@ impl Interpreter {
                 .map_err(CommittedValueError::completed_call)?;
             let wrapped =
                 interp.wrap_iterator_method_result(context, stack, produced, primordial)?;
-            write_register(&mut stack[top_idx], dst, wrapped)
+            Self::write_iterator_record(&mut stack[top_idx], dst, wrapped)
                 .map_err(|error| CommittedValueError::Fatal(error.into()))?;
             Ok(())
         })
@@ -2741,7 +2747,11 @@ impl Interpreter {
                 Record::Generator(handle) => {
                     let generator = interp.scoped_value(scope, Value::generator(handle));
                     if interp.proven_generator_return(Value::generator(handle)) {
-                        return interp.close_iterator_state(stack, context, interp.escape_scoped(root));
+                        return interp.close_iterator_state(
+                            stack,
+                            context,
+                            interp.escape_scoped(root),
+                        );
                     }
                     // The record is done; the generator's own `return` runs.
                     interp.iterator_mark_done(interp.escape_scoped(root));
@@ -4067,17 +4077,18 @@ impl Interpreter {
                 // are owned by the shared wrap helper. A failure here must
                 // still clear the parked continuation before propagating.
                 let primordial = interp.frame_iterates_primordially(context, stack, top_idx);
-                let produced_value =
-                    match interp.wrap_iterator_method_result(context, stack, produced, primordial) {
-                        Ok(value) => value,
-                        Err(e) => {
-                            if let Some(cold) = interp.frame_cold_mut(&mut stack[top_idx]) {
-                                cold.pending_get_iterator = None;
-                            }
-                            return Err(e);
+                let produced_value = match interp
+                    .wrap_iterator_method_result(context, stack, produced, primordial)
+                {
+                    Ok(value) => value,
+                    Err(e) => {
+                        if let Some(cold) = interp.frame_cold_mut(&mut stack[top_idx]) {
+                            cold.pending_get_iterator = None;
                         }
-                    };
-                write_register(&mut stack[top_idx], dst, produced_value)
+                        return Err(e);
+                    }
+                };
+                Self::write_iterator_record(&mut stack[top_idx], dst, produced_value)
                     .map_err(|error| CommittedValueError::Fatal(error.into()))?;
                 if let Some(cold) = interp.frame_cold_mut(&mut stack[top_idx]) {
                     cold.pending_get_iterator = None;
@@ -4088,7 +4099,17 @@ impl Interpreter {
                 return Ok(());
             }
 
-            // 2. Fresh entry whose record needs no observable read.
+            // 2. Fresh entry whose record needs no observable read: a fast
+            // Array record, or a built-in iterator value.
+            if interp
+                .open_fast_array_record(context, stack, top_idx, dst, src)
+                .map_err(|error| CommittedValueError::JavaScript(error.into()))?
+            {
+                stack[top_idx]
+                    .advance_pc()
+                    .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                return Ok(());
+            }
             let value = *read_register(&stack[top_idx], src)
                 .map_err(|error| CommittedValueError::Fatal(error.into()))?;
             let value_root = interp.scoped_value(scope, value);
@@ -4097,7 +4118,7 @@ impl Interpreter {
                 .unobservable_iterator_record(stack, value, primordial)
                 .map_err(|error| CommittedValueError::JavaScript(error.into()))?
             {
-                write_register(&mut stack[top_idx], dst, record)
+                Self::write_iterator_record(&mut stack[top_idx], dst, record)
                     .map_err(|error| CommittedValueError::Fatal(error.into()))?;
                 stack[top_idx]
                     .advance_pc()

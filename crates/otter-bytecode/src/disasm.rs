@@ -179,8 +179,16 @@ fn write_immediate(line: &mut String, domain: ImmediateDomain, value: i32) -> bo
                     MemberKind::Getter => "get",
                     MemberKind::Setter => "set",
                 },
-                if definition.enumerable { ":enumerable" } else { "" },
-                if definition.read_only { ":read-only" } else { "" },
+                if definition.enumerable {
+                    ":enumerable"
+                } else {
+                    ""
+                },
+                if definition.read_only {
+                    ":read-only"
+                } else {
+                    ""
+                },
             ),
             None => return false,
         },

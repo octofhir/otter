@@ -319,7 +319,12 @@ fn generator_source_and_disposed_realm_admission_are_not_suppressed_by_throw_clo
                     let current_generator = scope.raw(generator);
                     let iterator = scope
                         .with_turn_parts(|interp, stack| {
-                            interp.wrap_iterator_method_result(&context, stack, current_generator, false)
+                            interp.wrap_iterator_method_result(
+                                &context,
+                                stack,
+                                current_generator,
+                                false,
+                            )
                         })
                         .map_err(|error| {
                             error.into_native(

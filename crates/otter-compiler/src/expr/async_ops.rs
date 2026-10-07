@@ -68,8 +68,10 @@ pub(crate) fn compile_yield(
         // the async-from-sync adapter. A sync `yield*` reads `@@iterator`
         // itself rather than through `Op::GetIterator`, whose internal
         // record hides the iterator's own `next` / `throw` / `return` from
-        // the delegation loop.
-        let iter_reg = cx.alloc_scratch();
+        // the delegation loop. The raw iterator still takes an iterator
+        // record's register pair, with `undefined` as its cursor, since the
+        // missing-`throw` path closes it through `Op::IteratorClose`.
+        let iter_reg = cx.alloc_iterator_record();
         if is_async {
             cx.emit(
                 Op::GetAsyncIterator,
@@ -113,6 +115,7 @@ pub(crate) fn compile_yield(
                 span,
             );
         }
+        cx.emit(Op::LoadUndefined, [Operand::Register(iter_reg + 1)], span);
         // §7.4.3 GetIterator step 3 — the `next` method is read once
         // and cached in the iterator record.
         let next_m = cx.alloc_scratch();

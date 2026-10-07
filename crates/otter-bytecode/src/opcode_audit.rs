@@ -29,6 +29,8 @@ pub struct RegisterReference {
     pub operand_index: usize,
     /// How the operand encodes the register number.
     pub source: RegisterSource,
+    /// Consecutive registers named from that number up.
+    pub width: u16,
 }
 
 /// Exact counted register tail in a variadic operand shape.
@@ -122,7 +124,7 @@ pub struct OpcodeAudit {
 
 fn register_references(
     schema: &crate::opcode_schema::OpcodeSchema,
-    access: RegisterAccess,
+    role: fn(RegisterAccess) -> bool,
 ) -> Vec<RegisterReference> {
     schema
         .operand_shape
@@ -130,12 +132,13 @@ fn register_references(
         .into_iter()
         .flatten()
         .enumerate()
-        .filter(|(_, spec)| spec.register_access == access)
+        .filter(|(_, spec)| role(spec.register_access))
         .map(|(operand_index, spec)| RegisterReference {
             operand_index,
             source: spec
                 .register_source
                 .expect("register access always declares its source"),
+            width: spec.register_access.width(),
         })
         .collect()
 }
@@ -186,8 +189,8 @@ pub fn opcode_inventory() -> Vec<OpcodeAudit> {
                 operand_format: schema.operand_format,
                 registers_read: "schema-authoritative: see register_reads_exact",
                 registers_written: "schema-authoritative: see register_writes_exact",
-                register_reads_exact: register_references(schema, RegisterAccess::Read),
-                register_writes_exact: register_references(schema, RegisterAccess::Write),
+                register_reads_exact: register_references(schema, RegisterAccess::reads),
+                register_writes_exact: register_references(schema, RegisterAccess::writes),
                 register_read_variadic_tails: variadic_register_references(
                     schema,
                     RegisterAccess::Read,
@@ -269,6 +272,7 @@ mod tests {
             vec![RegisterReference {
                 operand_index: 1,
                 source: RegisterSource::Imm32RegisterIndex,
+                width: 1,
             }]
         );
         assert_eq!(load_local.register_writes_exact[0].operand_index, 0);
@@ -312,6 +316,7 @@ mod tests {
             vec![RegisterReference {
                 operand_index: 1,
                 source: RegisterSource::RegisterOperand,
+                width: 1,
             }]
         );
         assert_eq!(load_context_slot.register_writes_exact[0].operand_index, 0);
@@ -331,15 +336,17 @@ mod tests {
         assert!(store_context_slot.may_write_heap && !store_context_slot.may_throw);
 
         let iterator_next = row(&inventory, "ITERATOR_NEXT");
+        // The iterator record is a register pair that the step advances.
         assert_eq!(
             iterator_next
                 .register_writes_exact
                 .iter()
-                .map(|reference| reference.operand_index)
+                .map(|reference| (reference.operand_index, reference.width))
                 .collect::<Vec<_>>(),
-            vec![0, 1]
+            vec![(0, 1), (1, 1), (2, 2)]
         );
         assert_eq!(iterator_next.register_reads_exact[0].operand_index, 2);
+        assert_eq!(iterator_next.register_reads_exact[0].width, 2);
     }
 
     #[test]
@@ -355,6 +362,7 @@ mod tests {
             vec![RegisterReference {
                 operand_index: 1,
                 source: RegisterSource::RegisterOperand,
+                width: 1,
             }]
         );
         assert_eq!(call.register_writes_exact[0].operand_index, 0);

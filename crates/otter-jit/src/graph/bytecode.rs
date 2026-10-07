@@ -237,13 +237,18 @@ impl Analysis {
                     }
                     _ => return Err(AnalysisError::MalformedOperand { pc }),
                 };
-                if register >= register_count {
+                let access = spec.register_access;
+                let last = u32::from(register) + u32::from(access.width()) - 1;
+                if last >= u32::from(register_count) {
                     return Err(AnalysisError::MalformedOperand { pc });
                 }
-                match spec.register_access {
-                    RegisterAccess::Read => reads.push(register),
-                    RegisterAccess::Write => writes.push(register),
-                    RegisterAccess::None => {}
+                for named in register..register + access.width() {
+                    if access.reads() {
+                        reads.push(named);
+                    }
+                    if access.writes() {
+                        writes.push(named);
+                    }
                 }
             }
             if op == Op::CallForwardArguments {

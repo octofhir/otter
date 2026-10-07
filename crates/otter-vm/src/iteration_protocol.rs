@@ -165,7 +165,11 @@ fn chain_data(heap: &otter_gc::GcHeap, first: JsObject, key: Key) -> Option<Opti
     None
 }
 
-fn is_static(heap: &otter_gc::GcHeap, answer: Option<Option<Value>>, expected: NativeFastFn) -> bool {
+fn is_static(
+    heap: &otter_gc::GcHeap,
+    answer: Option<Option<Value>>,
+    expected: NativeFastFn,
+) -> bool {
     matches!(answer, Some(Some(value))
         if value.as_native_function().is_some_and(|f| f.is_static_fn(heap, expected)))
 }
@@ -295,6 +299,21 @@ impl Interpreter {
         (!own && self.has_realm_prototype(link, intrinsic)).then_some(kind)
     }
 
+    /// Whether GetIterator over `value` may open a fast Array record: an
+    /// ordinary Array whose GetIterator and `next` are proven built-in, or
+    /// any Array iterated by runtime-internal code. May allocate the chain's
+    /// prototype roles once; the caller roots `value`.
+    pub(crate) fn fast_array_iterable(&mut self, value: Value, primordial: bool) -> bool {
+        matches!(self.plain_iterable(value), Some(Iterable::Array))
+            && (primordial || self.iterable_proven(Iterable::Array))
+    }
+
+    /// Whether closing an Array iterator runs nothing: its `return` is
+    /// proven absent or built-in.
+    pub(crate) fn array_iterator_close_proven(&mut self) -> bool {
+        self.iterator_facts(BuiltinIteratorOrigin::Array).close
+    }
+
     /// Whether a built-in iterator is proven to be its own GetIterator
     /// record, stepped by its built-in `next`.
     pub(crate) fn proven_self_iterator(&mut self, value: Value) -> bool {
@@ -320,13 +339,15 @@ impl Interpreter {
 
     /// Whether `Get(generator, "next")` is `%GeneratorPrototype%.next`.
     pub(crate) fn proven_generator_next(&mut self, generator: Value) -> bool {
-        self.generator_facts(generator).is_some_and(|facts| facts.next)
+        self.generator_facts(generator)
+            .is_some_and(|facts| facts.next)
     }
 
     /// Whether `GetMethod(generator, "return")` is
     /// `%GeneratorPrototype%.return`.
     pub(crate) fn proven_generator_return(&mut self, generator: Value) -> bool {
-        self.generator_facts(generator).is_some_and(|facts| facts.close)
+        self.generator_facts(generator)
+            .is_some_and(|facts| facts.close)
     }
 
     /// Whether an observed `next` is `%GeneratorPrototype%.next`.
@@ -433,7 +454,8 @@ impl Interpreter {
     }
 
     fn iterable_is_builtin(&mut self, kind: Iterable) -> bool {
-        if let Some(builtin) = Proof::current(&self.realm_intrinsics.iteration.iterables[kind as usize])
+        if let Some(builtin) =
+            Proof::current(&self.realm_intrinsics.iteration.iterables[kind as usize])
         {
             return builtin;
         }
@@ -453,8 +475,14 @@ impl Interpreter {
             Iterable::Array => matches!(method, Some(Some(value))
                 if value.as_native_function().map(|f| f.raw())
                     == self.realm_intrinsics.array_values().and_then(|v| v.as_native_function()).map(|f| f.raw())),
-            Iterable::Map => is_static(heap, method, crate::bootstrap_collections::map_proto_entries),
-            Iterable::Set => is_static(heap, method, crate::bootstrap_collections::set_proto_values),
+            Iterable::Map => is_static(
+                heap,
+                method,
+                crate::bootstrap_collections::map_proto_entries,
+            ),
+            Iterable::Set => {
+                is_static(heap, method, crate::bootstrap_collections::set_proto_values)
+            }
             Iterable::String => is_static(heap, method, crate::string_proto_iterator),
         };
         self.realm_intrinsics.iteration.iterables[kind as usize] = Some(Proof {
@@ -478,7 +506,11 @@ impl Interpreter {
         let symbol = self.well_known_symbols.get(WellKnown::Iterator);
         let close = chain_data(heap, first, Key::Name("return"));
         let facts = IteratorFacts {
-            next: is_static(heap, chain_data(heap, first, Key::Name("next")), builtin_next(origin)),
+            next: is_static(
+                heap,
+                chain_data(heap, first, Key::Name("next")),
+                builtin_next(origin),
+            ),
             close: match builtin_return(origin) {
                 Some(expected) => is_static(heap, close, expected),
                 None => close == Some(None),
@@ -525,7 +557,10 @@ impl Interpreter {
 
 /// The record GetIterator returns for a plain built-in iterable: what its
 /// built-in `@@iterator` creates.
-pub(crate) fn proven_iterator_state(value: Value, heap: &otter_gc::GcHeap) -> Option<IteratorState> {
+pub(crate) fn proven_iterator_state(
+    value: Value,
+    heap: &otter_gc::GcHeap,
+) -> Option<IteratorState> {
     if let Some(array) = value.as_array() {
         return Some(IteratorState::Array {
             array,

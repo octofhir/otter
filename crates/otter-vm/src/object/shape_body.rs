@@ -125,6 +125,10 @@ pub struct ShapeBody {
     /// The lineage's dictionary shape; in the dictionary shape itself, which
     /// is its own, the lineage's root.
     dictionary: ShapeHandle,
+    /// The keys `for-in` visits on this shape's objects (V8's enum cache):
+    /// an array of the enumerable string keys in own-key order, filled on
+    /// first need and never changed; `undefined` until then.
+    enum_cache: crate::Value,
 }
 
 /// Identity word read by generated probes of the shared property lookup table.
@@ -176,6 +180,7 @@ impl ShapeBody {
             prototype,
             prototype_value,
             dictionary,
+            enum_cache: crate::Value::undefined(),
         }
     }
 
@@ -225,6 +230,7 @@ impl ShapeBody {
             prototype: parent.prototype,
             prototype_value: parent.prototype_value,
             dictionary: parent.dictionary,
+            enum_cache: crate::Value::undefined(),
         }
     }
 
@@ -371,6 +377,7 @@ impl otter_gc::SafeTraceable for ShapeBody {
             let p = &mut self.dictionary as *mut ShapeHandle as *mut RawGc;
             visitor(p);
         }
+        self.enum_cache.pelt_trace(visitor);
     }
 }
 
@@ -838,6 +845,63 @@ pub(crate) fn shape_keys_ordered(
     }
     reversed.reverse();
     reversed
+}
+
+/// A live, non-null `shape`'s cached `for-in` keys, or `undefined`.
+#[must_use]
+pub(crate) fn enum_cache_of(shape: ShapeHandle) -> crate::Value {
+    body_of(shape).enum_cache
+}
+
+/// Fill a live `shape`'s `for-in` key cache, once.
+pub(crate) fn set_enum_cache(heap: &mut GcHeap, shape: ShapeHandle, keys: crate::Value) {
+    heap.with_payload(shape, |body| {
+        debug_assert!(
+            body.enum_cache.is_undefined(),
+            "an enum cache is filled once"
+        );
+        body.enum_cache = keys;
+    });
+    heap.record_write(shape, &keys);
+}
+
+/// The enumerable string keys of `shape`'s objects in own-key order: array
+/// indices ascending, then the other keys in insertion order. Reads the
+/// shape's own key strings in place; nothing is allocated on the heap.
+pub(crate) fn shape_enumerable_keys(heap: &GcHeap, mut shape: ShapeHandle) -> Vec<JsStringHandle> {
+    let mut reversed = Vec::new();
+    while !shape.is_null() {
+        let body = body_of(shape);
+        if !body.is_root() && body.own_flags.enumerable() {
+            reversed.push(body.transition_key);
+        }
+        shape = body.parent;
+    }
+    let mut indices = Vec::new();
+    let mut names = Vec::with_capacity(reversed.len());
+    for key in reversed.into_iter().rev() {
+        let index = crate::string::gc_body::with_latin1(
+            heap,
+            key,
+            super::key_order::array_index_property_bytes,
+        )
+        .unwrap_or_else(|| {
+            let units = crate::string::to_utf16_vec(heap, key);
+            let bytes: Option<Vec<u8>> =
+                units.iter().map(|&unit| u8::try_from(unit).ok()).collect();
+            bytes.and_then(|bytes| super::key_order::array_index_property_bytes(&bytes))
+        });
+        match index {
+            Some(index) => indices.push((index, key)),
+            None => names.push(key),
+        }
+    }
+    indices.sort_by_key(|&(index, _)| index);
+    indices
+        .into_iter()
+        .map(|(_, key)| key)
+        .chain(names)
+        .collect()
 }
 
 #[cfg(test)]

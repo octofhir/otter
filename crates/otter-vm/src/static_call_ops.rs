@@ -210,6 +210,13 @@ impl Interpreter {
                 .map_err(|error| CommittedValueError::Fatal(error.into()))?;
             (dst, target)
         };
+        if let Some(keys) = self
+            .for_in_cached_keys(target)
+            .map_err(|error| CommittedValueError::JavaScript(error.into()))?
+        {
+            return finish_static_call(&mut stack[top_idx], dst, keys)
+                .map_err(CommittedValueError::Fatal);
+        }
         let keys = self.enumerable_for_in_string_keys_for_value(stack, context, target)?;
         let names = self
             .scoped_key_strings(&keys)

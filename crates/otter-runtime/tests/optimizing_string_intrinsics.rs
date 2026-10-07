@@ -248,7 +248,7 @@ fn nested_target_eager_literal_prewarm_survives_snapshot_gc_and_executes() {
         .collect::<Vec<_>>()
         .join("\n");
     assert!(
-        relocations.contains("stringConstantCell"),
+        relocations.contains("literalCell"),
         "nested literal must use a symbolic traced-cell relocation: {relocations}"
     );
     drop(setup);

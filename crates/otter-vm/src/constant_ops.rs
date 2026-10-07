@@ -5,7 +5,7 @@
 //! `lib.rs`.
 //!
 //! # Contents
-//! - BigInt literal materialisation.
+//! - BigInt literal materialisation into the shared literal cells.
 //!
 //! # Invariants
 //! - Constant indexes are already decoded from executable operands.
@@ -37,8 +37,11 @@ impl Interpreter {
         idx: u32,
     ) -> Result<Value, VmError> {
         let key = context.constant_cache_key(idx);
-        if let Some(value) = self.bigint_constant_cache.get(&key) {
-            return Ok(*value);
+        if let Some(value) = self.literal_cells.get(&key) {
+            if !value.is_big_int() {
+                return Err(VmError::InvalidOperand);
+            }
+            return Ok(**value);
         }
         let decimal = context
             .bigint_decimal_constant(idx)
@@ -47,7 +50,8 @@ impl Interpreter {
             .ok_or(VmError::InvalidOperand)?
             .map_err(crate::oom_to_vm)?;
         let value = Value::big_int(value);
-        self.bigint_constant_cache.insert(key, value);
+        let replaced = self.literal_cells.insert(key, Box::new(value));
+        debug_assert!(replaced.is_none(), "literals canonicalize once");
         Ok(value)
     }
 }

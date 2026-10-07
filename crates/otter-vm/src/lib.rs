@@ -156,6 +156,7 @@ pub use feedback as jit_feedback;
 mod array_from_async;
 mod async_from_sync_iterator;
 mod forward_arguments;
+pub(crate) mod iteration_protocol;
 mod jit_call_admission;
 mod jit_forward_call;
 mod jit_global_ops;
@@ -210,7 +211,6 @@ pub mod realm_intrinsics;
 pub mod reflect;
 pub mod regexp;
 pub(crate) mod regexp_fast;
-pub(crate) mod iteration_protocol;
 pub(crate) mod regexp_legacy;
 pub mod regexp_prototype;
 mod register_window;
@@ -278,7 +278,6 @@ use otter_bytecode::ArgumentsObjectKind;
 use otter_bytecode::{BytecodeModule, Op};
 use smallvec::SmallVec;
 
-use arithmetic_dispatch::{bigint_and_op, bigint_or_op, bigint_sub_op, bigint_xor_op};
 pub(crate) use error_ops::{native_to_vm_error, native_to_vm_error_with_stack, symbol_to_vm_error};
 pub use executable::code_block_cfg::CodeBlockControlFlowView;
 pub use executable::{CodeBlock, CodeBlockInstruction, OperandView};
@@ -811,13 +810,14 @@ pub struct Interpreter {
     /// template-strings object per tagged-template site, keyed by
     /// `(chunk function_base, site index)`.
     template_objects: rustc_hash::FxHashMap<(u32, u32), Value>,
-    /// Per-context string constant cells. JIT preparation canonicalizes every
-    /// `LoadString` literal before taking a compile snapshot, then publishes
-    /// the shared address-stable box to each site that uses the constant.
-    /// Values are traced from
-    /// [`RuntimeState::trace_roots`] so moving collection rewrites prepared
-    /// handles in place without invalidating code relocations.
-    string_constant_cells: rustc_hash::FxHashMap<(usize, u32), Box<Value>>,
+    /// Per-context literal cells for `LoadString` and `LoadBigInt`, keyed by
+    /// linked chunk identity and constant-pool index. Both primitives are
+    /// immutable with value semantics, so each literal materializes once; JIT
+    /// preparation canonicalizes every literal of a function before taking a
+    /// compile snapshot, then publishes the shared address-stable box to each
+    /// site. Values are traced from [`RuntimeState::trace_roots`] so moving
+    /// collection rewrites them in place without invalidating relocations.
+    literal_cells: rustc_hash::FxHashMap<(usize, u32), Box<Value>>,
     /// Decimal strings for small non-negative integers, served on demand
     /// (JSC `SmallStrings` / V8 number-string-cache idea, adapted). Integer →
     /// string is one of the most repeated allocations in real code (`"" + n`,
@@ -826,11 +826,6 @@ pub struct Interpreter {
     /// body every conversion. Lazily filled; entries are traced from
     /// [`RuntimeState::trace_roots`] so a moving collection rewrites them.
     small_int_string_cache: Box<[Option<Value>]>,
-    /// Per-context BigInt constant cache. BigInt primitives are immutable and
-    /// have numeric, not object-identity, semantics, so `LoadBigInt` can parse
-    /// and allocate each bytecode literal once per linked chunk identity and
-    /// constant-pool index. Cached handles are traced with other runtime roots.
-    bigint_constant_cache: rustc_hash::FxHashMap<(usize, u32), Value>,
     /// Prepared bytecode callback metadata for native loops that repeatedly
     /// call the same JS function. Entries are a strict stack: acquisition
     /// pushes the exact callable and scalar closure state, release pops it.
@@ -1489,35 +1484,21 @@ impl Interpreter {
         self.template_objects.values()
     }
 
-    /// Root-tracing view of prepared string-constant cells.
-    pub(crate) fn string_constant_cells_for_trace(&self) -> impl Iterator<Item = &Value> {
-        self.string_constant_cells.values().map(Box::as_ref)
-    }
-
-    /// Root-tracing view of cached BigInt constants.
-    pub(crate) fn bigint_constants_for_trace(&self) -> impl Iterator<Item = &Value> {
-        self.bigint_constant_cache.values()
+    /// Root-tracing view of the literal cells.
+    pub(crate) fn literal_cells_for_trace(&self) -> impl Iterator<Item = &Value> {
+        self.literal_cells.values().map(Box::as_ref)
     }
 
     #[cfg(test)]
-    fn string_constant_cell_count_for_test(&self) -> usize {
-        self.string_constant_cells.len()
+    fn literal_cell_count_for_test(&self) -> usize {
+        self.literal_cells.len()
     }
 
     #[cfg(test)]
-    fn string_constant_cell_addr_for_test(
-        &self,
-        context: &ExecutionContext,
-        idx: u32,
-    ) -> Option<usize> {
-        self.string_constant_cells
+    fn literal_cell_addr_for_test(&self, context: &ExecutionContext, idx: u32) -> Option<usize> {
+        self.literal_cells
             .get(&context.constant_cache_key(idx))
             .map(|cell| std::ptr::from_ref::<Value>(cell.as_ref()) as usize)
-    }
-
-    #[cfg(test)]
-    fn bigint_constant_cache_len_for_test(&self) -> usize {
-        self.bigint_constant_cache.len()
     }
 
     /// Trace every live scope-handle slot as a GC root. Called from the runtime
@@ -1532,7 +1513,7 @@ impl Interpreter {
         idx: u32,
     ) -> Result<Value, VmError> {
         let key = context.constant_cache_key(idx);
-        if let Some(value) = self.string_constant_cells.get(&key) {
+        if let Some(value) = self.literal_cells.get(&key) {
             if !value.is_string() {
                 return Err(VmError::InvalidOperand);
             }
@@ -1543,8 +1524,8 @@ impl Interpreter {
             .ok_or_else(|| VmError::InvalidOperand)?;
         let string = JsString::from_utf16_units(units, self.gc_heap_mut())?;
         let value = Value::string(string);
-        let replaced = self.string_constant_cells.insert(key, Box::new(value));
-        debug_assert!(replaced.is_none(), "string constants canonicalize once");
+        let replaced = self.literal_cells.insert(key, Box::new(value));
+        debug_assert!(replaced.is_none(), "literals canonicalize once");
         Ok(value)
     }
 

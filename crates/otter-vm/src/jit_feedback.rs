@@ -679,6 +679,12 @@ impl ArithFeedback {
         self.0 & ARITH_STRING != 0 && self.0 & (ARITH_BIGINT | ARITH_OTHER) == 0
     }
 
+    /// `true` when every operand this site saw was a BigInt.
+    #[must_use]
+    pub const fn is_bigint_only(self) -> bool {
+        self.0 == ARITH_BIGINT
+    }
+
     /// `true` when this site has no interpreter observation. This does not
     /// prove that the operation is cold: a compiled lower tier may already
     /// execute it without updating this cell. Consumers must either keep the

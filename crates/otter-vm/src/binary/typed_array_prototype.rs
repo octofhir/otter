@@ -1099,7 +1099,7 @@ fn sort_default(values: &mut [Value], bigint_kind: bool, heap: &otter_gc::GcHeap
     if bigint_kind {
         values.sort_by(|a, b| {
             if let (Some(x), Some(y)) = (a.as_big_int(), b.as_big_int()) {
-                x.with_inner(heap, |xb| y.with_inner(heap, |yb| xb.cmp(yb)))
+                x.compare(y, heap)
             } else {
                 std::cmp::Ordering::Equal
             }

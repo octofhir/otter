@@ -406,7 +406,7 @@ Pure Rust implementation - no external JavaScript engine dependencies.
   `bindingSites` counts schema-typed global, captured, dynamic, and shadowed
   binding accesses; `bindingHitProofs` counts stable global-declarative cells
   and guarded global-object slots available for generated hits;
-  `stringConstantCells` counts eagerly prepared stable traced literal cells. Capture is
+  `literalCells` counts eagerly prepared stable traced string and BigInt literal cells. Capture is
     default-off and bounded to 16,384 events per top-level run; `truncated`
     and `droppedEvents` report overflow without constructing further payloads.
   - Abrupt VM completion (for example, a thrown exception after tier-up) still

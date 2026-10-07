@@ -90,20 +90,15 @@ impl<'a> RuntimeState<'a> {
         for value in interp.template_objects_for_trace() {
             value.trace_value_slots(visitor);
         }
-        // Primitive string constants materialized from bytecode constant pools.
-        // Immutable strings can be reused across executions, but cached GC
+        // String and BigInt literals materialized from bytecode constant pools.
+        // Immutable primitives can be reused across executions, but the cached
         // handles must move with the heap.
-        for value in interp.string_constant_cells_for_trace() {
+        for value in interp.literal_cells_for_trace() {
             value.trace_value_slots(visitor);
         }
         // Cached small-integer decimal strings (`SmallStrings`-style). Immutable
         // shared handles that must move with the heap.
         for value in interp.small_int_strings_for_trace() {
-            value.trace_value_slots(visitor);
-        }
-        // Immutable BigInt constants use the same bytecode-literal cache shape
-        // as strings. The cached primitive handle must move with the heap.
-        for value in interp.bigint_constants_for_trace() {
             value.trace_value_slots(visitor);
         }
         // 2b-quater) Shared scope-handle arena — native value-building and

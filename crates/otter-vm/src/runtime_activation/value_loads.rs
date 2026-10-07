@@ -1,7 +1,7 @@
 //! Stack-owned static value loads.
 //!
 //! # Contents
-//! - [`ValueLoadRuntimeOp`] describes namespace, literal, and string-index loads.
+//! - [`ValueLoadRuntimeOp`] describes namespace and string-index loads.
 //! - [`RuntimeCall::value_load_op`] resolves and commits them through one rooted
 //!   activation boundary.
 //!
@@ -9,7 +9,7 @@
 //! - Constant indexes are resolved against the active function context.
 //! - Allocating results are committed only after successful construction.
 //! - Receiver and index inputs remain rooted in the published register window
-//!   across BigInt and string allocation.
+//!   across string allocation.
 //!
 //! # See also
 //! - [`crate::static_load_ops`]
@@ -42,13 +42,6 @@ pub enum ValueLoadRuntimeOp {
         dst: u16,
         /// Context string-constant index from the legacy encoding.
         name_index: u32,
-    },
-    /// Materialize one BigInt literal.
-    BigInt {
-        /// Destination register.
-        dst: u16,
-        /// BigInt constant-pool index.
-        constant_index: u32,
     },
     /// Load one UTF-16 code unit from a string.
     StringIndex {
@@ -89,10 +82,6 @@ impl RuntimeCall<'_> {
                 (dst, value)
             }
             ValueLoadRuntimeOp::Temporal { .. } => return Err(VmError::InvalidOperand),
-            ValueLoadRuntimeOp::BigInt {
-                dst,
-                constant_index,
-            } => (dst, vm.load_bigint_constant_value(context, constant_index)?),
             ValueLoadRuntimeOp::StringIndex {
                 dst,
                 receiver,

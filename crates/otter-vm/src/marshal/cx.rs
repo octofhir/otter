@@ -205,15 +205,7 @@ impl<'rt, 'cx, 's> MarshalCx<'rt, 'cx, 's> {
     #[must_use]
     pub fn i64_from_bigint(&self, value: crate::Value) -> Option<i64> {
         let bigint = value.as_big_int()?;
-        Some(bigint.with_inner(self.heap(), |bi| {
-            let low = bi.iter_u64_digits().next().unwrap_or(0);
-            let bits = if bi.sign() == num_bigint::Sign::Minus {
-                low.wrapping_neg()
-            } else {
-                low
-            };
-            bits as i64
-        }))
+        Some(bigint.to_i64_wrapping(self.heap()))
     }
 
     /// Allocate a JS string from UTF-8 text.

@@ -765,17 +765,17 @@ pub(crate) fn emit_operation(
             committed_throw,
             fatal,
         ),
-        TemplateOp::LoadStringConstant { dst } => {
+        TemplateOp::LoadLiteral { dst } => {
             let target = view
-                .string_constant_cells
+                .literal_cells
                 .get(&instruction.byte_pc)
-                .ok_or(Unsupported::OperandShape("prepared LoadString stable cell"))?;
+                .ok_or(Unsupported::OperandShape("prepared literal stable cell"))?;
             emit_load_symbol_u64(
                 ops,
                 relocations,
                 11,
                 target.cell_addr as u64,
-                RelocationTarget::StringConstantCell {
+                RelocationTarget::LiteralCell {
                     function_id: view.code_block.id,
                     byte_pc: instruction.byte_pc,
                 },

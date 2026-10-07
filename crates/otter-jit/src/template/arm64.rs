@@ -1783,8 +1783,8 @@ pub(crate) fn emit_operation<'a>(
                 fatal,
             )?;
         }
-        TemplateOp::LoadStringConstant { dst } => {
-            scalar::emit_string_constant(ops, relocations, view, instr.byte_pc, dst)?;
+        TemplateOp::LoadLiteral { dst } => {
+            scalar::emit_literal(ops, relocations, view, instr.byte_pc, dst)?;
         }
         TemplateOp::SuperOp {
             opcode,

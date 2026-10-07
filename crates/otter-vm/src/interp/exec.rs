@@ -119,9 +119,7 @@ impl Interpreter {
         let outside = |function_id: &u32| *function_id < start || *function_id >= end;
         self.template_objects
             .retain(|(function_base, _), _| *function_base != start);
-        self.string_constant_cells
-            .retain(|(identity, _), _| *identity != candidate.module_identity);
-        self.bigint_constant_cache
+        self.literal_cells
             .retain(|(identity, _), _| *identity != candidate.module_identity);
         self.simple_constructor_init_cache
             .retain(|id, _| outside(id));
@@ -1159,10 +1157,10 @@ mod tests {
             vm.extra_realms[0]
                 .template_objects
                 .insert((context.function_base(), 0), Value::boolean(false));
-            vm.string_constant_cells
+            vm.literal_cells
                 .insert(context.constant_cache_key(0), Box::new(Value::undefined()));
-            vm.bigint_constant_cache
-                .insert(context.constant_cache_key(1), Value::undefined());
+            vm.literal_cells
+                .insert(context.constant_cache_key(1), Box::new(Value::undefined()));
             vm.ensure_method_feedback_context(context);
             for (site, address) in context.feedback_slot_addresses() {
                 assert!(address.is_method());
@@ -1273,10 +1271,9 @@ mod tests {
         assert_eq!(vm.jit_parameter_widening.len(), 2);
         assert_eq!(vm.template_objects.len(), 2);
         assert_eq!(vm.extra_realms[0].template_objects.len(), 2);
-        assert_eq!(vm.string_constant_cells.len(), 2);
-        assert_eq!(vm.bigint_constant_cache.len(), 2);
-        assert!(!vm.string_constant_cells.contains_key(&evicted_constants[0]));
-        assert!(!vm.bigint_constant_cache.contains_key(&evicted_constants[1]));
+        assert_eq!(vm.literal_cells.len(), 4);
+        assert!(!vm.literal_cells.contains_key(&evicted_constants[0]));
+        assert!(!vm.literal_cells.contains_key(&evicted_constants[1]));
         macro_rules! outside_keys {
             ($map:expr, $expected:expr) => {
                 assert_eq!(

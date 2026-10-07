@@ -120,8 +120,8 @@ pub(crate) struct FusedChainStep {
 pub(crate) enum TemplateOp {
     /// Store the boxed `Value` bit pattern into frame register `dst`.
     LoadImmediate { dst: u16, bits: u64 },
-    /// Read one prepared primitive-string literal from its stable traced cell.
-    LoadStringConstant { dst: u16 },
+    /// Read one prepared string or BigInt literal from its stable traced cell.
+    LoadLiteral { dst: u16 },
     /// Copy frame register `src` into frame register `dst`.
     Move { dst: u16, src: u16 },
     /// Unconditional branch to the canonical instruction PC `target`.
@@ -514,7 +514,7 @@ pub(crate) enum TemplateOp {
         arg2: u64,
     },
     /// Complete one static value-load opcode (`MathLoad`, `SymbolLoad`,
-    /// `TemporalLoad`, `LoadBigInt`, `GetStringIndex`) through the shared
+    /// `TemporalLoad`, `GetStringIndex`) through the shared
     /// reentrant value-load transition. `arg0`/`arg1`/`arg2` name the
     /// destination plus a constant name index or receiver/index registers.
     ValueLoadOp {
@@ -1065,9 +1065,9 @@ impl TemplatePlan {
                 Op::LoadThis => TemplateOp::LoadThis {
                     dst: lowered.destination_operands()?.dst,
                 },
-                Op::LoadString => {
+                Op::LoadString | Op::LoadBigInt => {
                     let operands = lowered.constant_operands()?;
-                    TemplateOp::LoadStringConstant { dst: operands.dst }
+                    TemplateOp::LoadLiteral { dst: operands.dst }
                 }
                 Op::LoadRegExp => {
                     let operands = lowered.constant_operands()?;
@@ -1378,7 +1378,7 @@ impl TemplatePlan {
                         arg2: 0,
                     }
                 }
-                Op::MathLoad | Op::SymbolLoad | Op::TemporalLoad | Op::LoadBigInt => {
+                Op::MathLoad | Op::SymbolLoad | Op::TemporalLoad => {
                     let operands = lowered.constant_operands()?;
                     TemplateOp::ValueLoadOp {
                         opcode: lowered.op as u8,

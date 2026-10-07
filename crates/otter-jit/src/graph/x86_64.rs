@@ -406,11 +406,11 @@ impl<'a> Codegen<'a> {
                 dynasm!(self.ops ; .arch x64 ; mov Rq(dst), [r14 + offset as i32]);
             }
             Kind::LoadGlobalBinding(byte_pc) => self.emit_global_binding(node, *byte_pc)?,
-            Kind::LoadStringConstant(byte_pc) => {
+            Kind::LoadLiteral(byte_pc) => {
                 let byte_pc = *byte_pc;
                 let source = self.view_of(node);
                 let cell = source
-                    .string_constant_cells
+                    .literal_cells
                     .get(&byte_pc)
                     .ok_or(Unsupported::OperandShape("graph string cell"))?
                     .cell_addr;
@@ -420,7 +420,7 @@ impl<'a> Codegen<'a> {
                     &mut self.relocations,
                     dst,
                     cell as u64,
-                    RelocationTarget::StringConstantCell {
+                    RelocationTarget::LiteralCell {
                         function_id: source.code_block.id,
                         byte_pc,
                     },
@@ -431,6 +431,7 @@ impl<'a> Codegen<'a> {
             Kind::AllocationProjection(byte) => self.emit_allocation_projection(node, *byte),
             Kind::NativeLeaf(stub) => self.emit_native_leaf(node, *stub)?,
             Kind::PrimitiveAdd => self.emit_primitive_add(node)?,
+            Kind::BigIntBinary(operator) => self.emit_bigint_binary(node, *operator)?,
             Kind::PrimitiveCompare(condition) => self.emit_primitive_compare(node, *condition)?,
             Kind::NewObject | Kind::NewArrayEmpty => self.emit_empty_allocation(node)?,
             Kind::NewObjectLiteral | Kind::NewArrayLiteral => self.emit_literal_allocation(node)?,

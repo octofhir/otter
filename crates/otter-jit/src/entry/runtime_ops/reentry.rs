@@ -624,10 +624,6 @@ pub(crate) extern "C" fn jit_value_load_op_stub(
             dst: arg0 as u16,
             name_index: arg1 as u32,
         },
-        value if value == otter_bytecode::Op::LoadBigInt as u8 => ValueLoadRuntimeOp::BigInt {
-            dst: arg0 as u16,
-            constant_index: arg1 as u32,
-        },
         value if value == otter_bytecode::Op::GetStringIndex as u8 => {
             ValueLoadRuntimeOp::StringIndex {
                 dst: arg0 as u16,

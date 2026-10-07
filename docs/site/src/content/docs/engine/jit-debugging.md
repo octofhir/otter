@@ -128,8 +128,8 @@ a missing native way alone does not identify its exact lowering rejection.
 `compilePrepared` summarizes the snapshot a compile consumes.
 `globalLexicalLoads` counts global lexical reads carrying one permanent
 direct-cell target, and `globalObjectLoads` counts global-object reads carrying
-one epoch-and-shape guarded own slot. `stringConstantCells` counts eagerly
-prepared stable traced literal cells available as relocation loads.
+one epoch-and-shape guarded own slot. `literalCells` counts eagerly
+prepared stable traced string and BigInt literal cells available as relocation loads.
 `directCallees`, `directConstructs`,
 `directMethodSites`, and `directMethodTargets` report stable function links
 whose current generations were available for generated plain, base-construct,

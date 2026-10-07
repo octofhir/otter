@@ -512,10 +512,10 @@ impl CodeBlock {
             // live global declarative record. Raw snapshots carry no GC cell
             // identity.
             global_lexical_loads: rustc_hash::FxHashMap::default(),
-            // Baked by `Interpreter::bake_string_constant_cells`, which owns
+            // Baked by `Interpreter::bake_literal_cells`, which owns
             // the address-stable traced literal cells. Raw snapshots carry no
             // process-local cell identity.
-            string_constant_cells: rustc_hash::FxHashMap::default(),
+            literal_cells: rustc_hash::FxHashMap::default(),
             // Baked by `Interpreter::bake_global_lexical_loads`, which owns
             // the live global declarative record and global object.
             global_object_loads: rustc_hash::FxHashMap::default(),

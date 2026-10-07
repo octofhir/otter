@@ -30,8 +30,8 @@ use super::values::{
 use crate::artifact::relocation::{RelocationCapture, RelocationTarget};
 use crate::entry::{Unsupported, VALUE_FALSE, VALUE_TRUE, VALUE_UNDEFINED};
 
-/// Load one eagerly prepared primitive-string literal through its traced cell.
-pub(super) fn emit_string_constant(
+/// Load one eagerly prepared string or BigInt literal through its traced cell.
+pub(super) fn emit_literal(
     ops: &mut Assembler,
     relocations: &mut RelocationCapture,
     view: &JitCompileSnapshot,
@@ -39,15 +39,15 @@ pub(super) fn emit_string_constant(
     result: u16,
 ) -> Result<(), Unsupported> {
     let target = view
-        .string_constant_cells
+        .literal_cells
         .get(&byte_pc)
-        .ok_or(Unsupported::OperandShape("prepared LoadString stable cell"))?;
+        .ok_or(Unsupported::OperandShape("prepared literal stable cell"))?;
     emit_load_symbol_u64(
         ops,
         relocations,
         13,
         target.cell_addr as u64,
-        RelocationTarget::StringConstantCell {
+        RelocationTarget::LiteralCell {
             function_id: view.code_block.id,
             byte_pc,
         },

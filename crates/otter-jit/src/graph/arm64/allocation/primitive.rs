@@ -2,6 +2,7 @@
 //!
 //! # Contents
 //! - Native string LAB fits and Number addition on one source operation.
+//! - BigInt binary operators through their allocating Probe.
 //! - Typed UTF-16/numeric ordering through the VM's NoAlloc boundary.
 //!
 //! # Invariants
@@ -87,6 +88,23 @@ impl Codegen<'_> {
         )?;
         dynasm!(self.ops ; .arch aarch64 ; =>done);
         Ok(())
+    }
+    /// A BigInt binary operator through the allocating Probe; a non-BigInt
+    /// operand or an operator failure exits to the source instruction.
+    pub(in crate::graph::arm64) fn emit_bigint_binary(
+        &mut self,
+        node: NodeId,
+        operator: otter_vm::bigint::ops::Operator,
+    ) -> Result<(), crate::Unsupported> {
+        let [lhs, rhs] = self.primitive_inputs(node)?;
+        let destination = Self::gp(self.allocation.node(node).result.expect("bigint result"));
+        let code = otter_vm::Value::number_i32(i32::from(operator as u8)).to_bits();
+        self.emit_probe_allocation(
+            node,
+            abi::STUB_BIGINT_BINARY_ALLOC,
+            [lhs, rhs, AllocationValue::Constant(code)],
+            Some(destination),
+        )
     }
     pub(in crate::graph::arm64) fn emit_primitive_compare(
         &mut self,

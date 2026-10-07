@@ -20,9 +20,6 @@
 //! - <https://tc39.es/ecma262/#sec-getvaluefrombuffer>
 //! - <https://tc39.es/ecma262/#sec-setvaluefrombuffer>
 
-use num_bigint::BigInt;
-use num_traits::ToPrimitive;
-
 use crate::Value;
 use crate::bigint::BigIntValue;
 use crate::number::{NumberValue, bitwise};
@@ -169,7 +166,7 @@ impl TypedArrayKind {
         if offset + bpe > bytes.len() {
             return match self {
                 Self::BigInt64 | Self::BigUint64 => {
-                    let handle = BigIntValue::from_inner(heap, BigInt::from(0))?;
+                    let handle = BigIntValue::from_i32(heap, 0)?;
                     Ok(Value::big_int(handle))
                 }
                 _ => Ok(Value::number_i32(0)),
@@ -212,14 +209,14 @@ impl TypedArrayKind {
                 let mut buf = [0u8; 8];
                 buf.copy_from_slice(slice);
                 let v = i64::from_le_bytes(buf);
-                let handle = BigIntValue::from_inner(heap, BigInt::from(v))?;
+                let handle = BigIntValue::from_i64(heap, v)?;
                 Value::big_int(handle)
             }
             Self::BigUint64 => {
                 let mut buf = [0u8; 8];
                 buf.copy_from_slice(slice);
                 let v = u64::from_le_bytes(buf);
-                let handle = BigIntValue::from_inner(heap, BigInt::from(v))?;
+                let handle = BigIntValue::from_u64(heap, v)?;
                 Value::big_int(handle)
             }
         })
@@ -434,42 +431,16 @@ fn value_to_number(value: &Value, heap: &otter_gc::GcHeap) -> NumberValue {
 /// values fall through `ToBigInt` (here approximated by 0 for
 /// non-coercible inputs; the dispatcher rejects bad types upstream).
 fn value_to_bigint64(value: &Value, heap: &otter_gc::GcHeap) -> i64 {
-    let big = if let Some(b) = value.as_big_int() {
-        b.clone_inner(heap)
-    } else if let Some(b) = value.as_boolean() {
-        BigInt::from(if b { 1 } else { 0 })
-    } else {
-        return 0;
-    };
-    let modulus: BigInt = BigInt::from(1u64) << 64;
-    let mut wrapped: BigInt = &big % &modulus;
-    use num_traits::Signed;
-    if wrapped.is_negative() {
-        wrapped += &modulus;
-    }
-    let half: BigInt = BigInt::from(1u64) << 63;
-    if wrapped >= half {
-        wrapped -= modulus;
-    }
-    wrapped.to_i64().unwrap_or(0)
+    value_to_biguint64(value, heap) as i64
 }
 
 /// §6.1.6.2.5 `BigInt::toUint64`.
 fn value_to_biguint64(value: &Value, heap: &otter_gc::GcHeap) -> u64 {
-    let big = if let Some(b) = value.as_big_int() {
-        b.clone_inner(heap)
-    } else if let Some(b) = value.as_boolean() {
-        BigInt::from(if b { 1 } else { 0 })
+    if let Some(b) = value.as_big_int() {
+        b.to_u64_wrapping(heap)
     } else {
-        return 0;
-    };
-    let modulus: BigInt = BigInt::from(1u64) << 64;
-    let mut wrapped: BigInt = &big % &modulus;
-    use num_traits::Signed;
-    if wrapped.is_negative() {
-        wrapped += &modulus;
+        value.as_boolean().map_or(0, u64::from)
     }
-    wrapped.to_u64().unwrap_or(0)
 }
 
 /// Reserved [`otter_gc::Traceable::TYPE_TAG`] for [`TypedArrayBodyGc`].

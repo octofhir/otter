@@ -2252,14 +2252,16 @@ mod tests {
 
     #[test]
     fn symbol_gc_round_trip_via_real_heap_and_disambiguates_from_bigint() {
-        use crate::bigint::alloc_big_int;
+        use crate::bigint::BigIntValue;
         use crate::symbol::{WellKnown, alloc_symbol};
         use num_bigint::BigInt;
         use otter_gc::GcHeap;
 
         let mut heap = GcHeap::new().expect("heap");
         let sym = alloc_symbol(&mut heap, None, Some(WellKnown::Iterator), false).expect("sym");
-        let big = alloc_big_int(&mut heap, BigInt::from(7)).expect("big");
+        let big = BigIntValue::from_num(&mut heap, &BigInt::from(7))
+            .map(BigIntValue::handle)
+            .expect("big");
 
         let vsym = Value::symbol_gc(sym);
         let vbig = Value::big_int_gc(big);
@@ -2281,13 +2283,15 @@ mod tests {
 
     #[test]
     fn big_int_gc_round_trip_via_real_heap() {
-        use crate::bigint::alloc_big_int;
+        use crate::bigint::BigIntValue;
         use num_bigint::BigInt;
         use otter_gc::GcHeap;
 
         let mut heap = GcHeap::new().expect("heap");
         let payload = BigInt::from(2_i128.pow(70));
-        let handle = alloc_big_int(&mut heap, payload.clone()).expect("alloc");
+        let handle = BigIntValue::from_num(&mut heap, &payload)
+            .map(BigIntValue::handle)
+            .expect("alloc");
         let v = Value::big_int_gc(handle);
         assert!(v.is_other_primitive());
         assert!(v.is_big_int_gc());
@@ -2298,7 +2302,7 @@ mod tests {
         assert!(!v.is_callable());
         assert!(!v.is_object_like());
         // Payload survives round-trip.
-        heap.read_payload(handle, |body| assert_eq!(body.inner, payload));
+        assert_eq!(BigIntValue::from_handle(handle).to_num(&heap), payload);
     }
 
     #[test]
@@ -2469,7 +2473,7 @@ mod tests {
         assert_eq!(Value::number_f64(f64::NAN).kind(), ValueKind::Number);
         assert_eq!(Value::function_id(0).kind(), ValueKind::FunctionId);
 
-        use crate::bigint::alloc_big_int;
+        use crate::bigint::BigIntValue;
         use crate::object::alloc_fixture_object_with_roots as alloc_object_with_roots;
         use crate::string::{JsStringId, alloc_flat_string_body_with_roots};
         use crate::{Value as LegacyValue, alloc_closure};
@@ -2488,7 +2492,9 @@ mod tests {
             &mut roots,
         )
         .expect("string");
-        let big = alloc_big_int(&mut heap, BigInt::from(7)).expect("big");
+        let big = BigIntValue::from_num(&mut heap, &BigInt::from(7))
+            .map(BigIntValue::handle)
+            .expect("big");
         assert_eq!(Value::object(obj).kind(), ValueKind::PtrObject);
         assert_eq!(Value::string_gc(body).kind(), ValueKind::PtrString);
         assert_eq!(Value::closure(closure).kind(), ValueKind::PtrFunction);

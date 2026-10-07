@@ -266,8 +266,7 @@ fn coerce_element_value(
         if let Some(b) = primitive.as_big_int() {
             Ok(Value::big_int(b))
         } else if let Some(b) = primitive.as_boolean() {
-            let handle = BigIntValue::from_inner(heap, num_bigint::BigInt::from(i64::from(b)))
-                .map_err(NativeError::from)?;
+            let handle = BigIntValue::from_i32(heap, i32::from(b)).map_err(NativeError::from)?;
             Ok(Value::big_int(handle))
         } else if let Some(s) = s_opt {
             let txt = s.to_lossy_string(heap);
@@ -275,7 +274,7 @@ fn coerce_element_value(
             let parsed = trimmed.parse::<num_bigint::BigInt>().map_err(|_| {
                 type_err(method_name, format!("cannot convert {trimmed:?} to BigInt"))
             })?;
-            let handle = BigIntValue::from_inner(heap, parsed).map_err(NativeError::from)?;
+            let handle = BigIntValue::from_num(heap, &parsed).map_err(NativeError::from)?;
             Ok(Value::big_int(handle))
         } else if primitive.is_number() {
             Err(type_err(
@@ -400,14 +399,14 @@ fn modify_op(
     if ta.kind().is_bigint() {
         let prev_b = prev
             .as_big_int()
-            .map(|b| b.clone_inner(heap))
+            .map(|b| b.to_num(heap))
             .unwrap_or_else(|| num_bigint::BigInt::from(0));
         let v_b = coerced
             .as_big_int()
-            .map(|b| b.clone_inner(heap))
+            .map(|b| b.to_num(heap))
             .unwrap_or_else(|| num_bigint::BigInt::from(0));
         let new_b = op_big(&prev_b, &v_b);
-        let handle = BigIntValue::from_inner(heap, new_b).map_err(NativeError::from)?;
+        let handle = BigIntValue::from_num(heap, &new_b).map_err(NativeError::from)?;
         ta.set(heap, idx, &Value::big_int(handle));
     } else {
         let prev_n = prev.as_number().map(|n| n.as_f64() as i64).unwrap_or(0);

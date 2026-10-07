@@ -2984,7 +2984,7 @@ impl Interpreter {
                         lhs,
                         imm,
                         number::sub,
-                        bigint_sub_op,
+                        bigint::ops::sub,
                         feedback,
                     ) {
                         Ok(value) => value,
@@ -3006,7 +3006,7 @@ impl Interpreter {
                         lhs,
                         imm,
                         number::bitwise_and,
-                        bigint_and_op,
+                        bigint::ops::bitwise_and,
                         feedback,
                     ) {
                         Ok(value) => value,
@@ -3089,7 +3089,7 @@ impl Interpreter {
                         lhs,
                         rhs,
                         number::bitwise_and,
-                        bigint_and_op,
+                        bigint::ops::bitwise_and,
                         feedback,
                     ) {
                         Ok(value) => value,
@@ -3110,7 +3110,7 @@ impl Interpreter {
                         lhs,
                         rhs,
                         number::bitwise_or,
-                        bigint_or_op,
+                        bigint::ops::bitwise_or,
                         feedback,
                     ) {
                         Ok(value) => value,
@@ -3131,7 +3131,7 @@ impl Interpreter {
                         lhs,
                         rhs,
                         number::bitwise_xor,
-                        bigint_xor_op,
+                        bigint::ops::bitwise_xor,
                         feedback,
                     ) {
                         Ok(value) => value,

@@ -671,8 +671,7 @@ fn slice_view(
     external_visit: &mut RootSlotVisitor<'_>,
 ) -> Result<JsStringHandle, otter_gc::OutOfMemory> {
     let repr = heap.read_payload(parent, |body| {
-        match flat_content_range(body, start, length)
-            .expect("slice parent has contiguous content")
+        match flat_content_range(body, start, length).expect("slice parent has contiguous content")
         {
             FlatContent::Latin1(bytes) if bytes.len() <= INLINE_LATIN1_CAP => {
                 let mut inline = [0u8; INLINE_LATIN1_CAP];
@@ -1453,17 +1452,17 @@ const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
 /// FNV-1a over UTF-16 code units, one code unit per step.
 #[must_use]
 pub fn hash_utf16(units: &[u16]) -> u64 {
-    units
-        .iter()
-        .fold(FNV_OFFSET, |hash, &unit| (hash ^ u64::from(unit)).wrapping_mul(FNV_PRIME))
+    units.iter().fold(FNV_OFFSET, |hash, &unit| {
+        (hash ^ u64::from(unit)).wrapping_mul(FNV_PRIME)
+    })
 }
 
 /// [`hash_utf16`] of the zero-extended Latin-1 bytes.
 #[must_use]
 pub fn hash_latin1(bytes: &[u8]) -> u64 {
-    bytes
-        .iter()
-        .fold(FNV_OFFSET, |hash, &byte| (hash ^ u64::from(byte)).wrapping_mul(FNV_PRIME))
+    bytes.iter().fold(FNV_OFFSET, |hash, &byte| {
+        (hash ^ u64::from(byte)).wrapping_mul(FNV_PRIME)
+    })
 }
 
 /// Content hash of `string`, computed on first request and cached in the
@@ -1502,8 +1501,9 @@ fn content_hash(heap: &GcHeap, string: JsStringHandle) -> u64 {
                 FlatContent::Wide(units) => hash_utf16(units),
             }
         }),
-        None => super::code_units::CodeUnits::new(heap, string)
-            .fold(FNV_OFFSET, |hash, unit| (hash ^ u64::from(unit)).wrapping_mul(FNV_PRIME)),
+        None => super::code_units::CodeUnits::new(heap, string).fold(FNV_OFFSET, |hash, unit| {
+            (hash ^ u64::from(unit)).wrapping_mul(FNV_PRIME)
+        }),
     };
     hash.max(1)
 }

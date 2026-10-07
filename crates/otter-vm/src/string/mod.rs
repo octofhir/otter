@@ -30,6 +30,9 @@
 //!   materialization retains the existing traced source and write barrier.
 //! - Concatenation preserves the exact `u32` UTF-16 length contract. A wider
 //!   sum returns [`StringConcatError::StringTooLong`] before allocation.
+//! - The empty string and every one-unit Latin-1 string exist once per heap
+//!   (V8's single-character string table): once [`JsString::install_unit_strings`]
+//!   has run, constructors return those shared bodies instead of allocating.
 //!
 //! # See also
 //! - <https://tc39.es/ecma262/#sec-ecmascript-language-types-string-type>
@@ -100,6 +103,11 @@ pub struct JsString {
 
 fn no_extra_roots(_v: &mut dyn FnMut(*mut otter_gc::raw::RawGc)) {}
 
+/// Heap embedder root slot holding the shared unit strings.
+const UNIT_STRINGS_SLOT: usize = 1;
+/// Slab index of the empty string, after the 256 Latin-1 code units.
+const EMPTY_STRING_INDEX: usize = 256;
+
 /// Truncate the body's 64-bit content hash to 32 bits.
 #[inline]
 const fn hash_to_u32(h: u64) -> u32 {
@@ -134,10 +142,7 @@ impl JsString {
     /// allocating.
     pub(crate) fn from_handle(handle: JsStringHandle, heap: &GcHeap) -> Self {
         let cached_len = heap.read_payload(handle, |b| b.len);
-        Self {
-            handle,
-            cached_len,
-        }
+        Self { handle, cached_len }
     }
 
     /// Strong handle to the underlying body. Used by GC tracing and by
@@ -188,6 +193,9 @@ impl JsString {
         heap: &mut GcHeap,
         external_visit: &mut otter_gc::heap::RootSlotVisitor<'_>,
     ) -> Result<Self, OutOfMemory> {
+        if let Some(shared) = Self::shared_unit_string(units.len(), units.first().copied(), heap) {
+            return Ok(shared);
+        }
         if let Some(bytes) = latin1_bytes_from_utf16(units) {
             return Self::from_latin1_with_roots(&bytes, heap, external_visit);
         }
@@ -258,6 +266,10 @@ impl JsString {
         heap: &mut GcHeap,
         external_visit: &mut otter_gc::heap::RootSlotVisitor<'_>,
     ) -> Result<Self, OutOfMemory> {
+        let first = bytes.first().map(|&byte| u16::from(byte));
+        if let Some(shared) = Self::shared_unit_string(bytes.len(), first, heap) {
+            return Ok(shared);
+        }
         let handle = gc_body::alloc_latin1_string_body_with_roots(
             heap,
             JsStringId::new(0),
@@ -268,6 +280,68 @@ impl JsString {
             handle,
             cached_len: bytes.len() as u32,
         })
+    }
+
+    /// The shared body of an empty or one-unit Latin-1 string, once installed.
+    fn shared_unit_string(len: usize, first: Option<u16>, heap: &GcHeap) -> Option<Self> {
+        let index = match (len, first) {
+            (0, _) => EMPTY_STRING_INDEX,
+            (1, Some(unit)) if unit <= u16::from(u8::MAX) => usize::from(unit),
+            _ => return None,
+        };
+        let raw = heap.embedder_root(UNIT_STRINGS_SLOT);
+        if raw.is_null() {
+            return None;
+        }
+        // SAFETY: only `install_unit_strings` fills this slot, with a value
+        // slab whose first `len()` entries are published strings.
+        let body = crate::value_slab::body_of(unsafe { raw.cast() })?;
+        // SAFETY: `body_of` names the live slab payload.
+        let value = unsafe {
+            if index >= (*body).len() {
+                return None;
+            }
+            *(*body).values_ptr().add(index)
+        };
+        value.as_string(heap)
+    }
+
+    /// Allocate the heap's shared empty and one-unit Latin-1 strings, once.
+    /// Each string is published into the rooted slab before the next
+    /// allocation, so a collection meanwhile keeps every one.
+    ///
+    /// # Errors
+    /// Surfaces [`OutOfMemory`] verbatim.
+    pub(crate) fn install_unit_strings(heap: &mut GcHeap) -> Result<(), OutOfMemory> {
+        if !heap.embedder_root(UNIT_STRINGS_SLOT).is_null() {
+            return Ok(());
+        }
+        let slab =
+            crate::value_slab::alloc_value_slab(heap, EMPTY_STRING_INDEX + 1, &mut no_extra_roots)?;
+        heap.set_embedder_root(UNIT_STRINGS_SLOT, slab.raw());
+        for index in 0..=EMPTY_STRING_INDEX {
+            let unit = [index as u8];
+            let bytes: &[u8] = if index == EMPTY_STRING_INDEX {
+                &[]
+            } else {
+                &unit
+            };
+            let string = Self::from_latin1(bytes, heap)?;
+            // SAFETY: the slot holds the slab installed above, rewritten by
+            // any collection the allocation ran.
+            let slab: crate::value_slab::ValueSlabHandle =
+                unsafe { heap.embedder_root(UNIT_STRINGS_SLOT).cast() };
+            let body = crate::value_slab::body_of(slab).expect("installed slab");
+            let value = crate::Value::string(string);
+            // SAFETY: `index` is below the slab's capacity, and the entry is
+            // written before the length publishes it.
+            unsafe {
+                *(*body).values_ptr().add(index) = value;
+                (*body).set_len(index + 1);
+            }
+            heap.record_write(slab, &value);
+        }
+        Ok(())
     }
 
     /// Empty string convenience constructor.
@@ -354,10 +428,7 @@ impl JsString {
         let mut roots = no_extra_roots;
         let handle = gc_body::concat_string_bodies(heap, left_handle, right_handle, &mut roots)?;
         let cached_len = heap.read_payload(handle, |b| b.len);
-        Ok(Self {
-            handle,
-            cached_len,
-        })
+        Ok(Self { handle, cached_len })
     }
 
     /// O(1) substring view over either flat storage width. Cons sources
@@ -376,10 +447,7 @@ impl JsString {
         let mut roots = no_extra_roots;
         let handle = gc_body::slice_string_body(heap, source, start, length, &mut roots)?;
         let cached_len = heap.read_payload(handle, |b| b.len);
-        Ok(Self {
-            handle,
-            cached_len,
-        })
+        Ok(Self { handle, cached_len })
     }
 
     /// Realise a rope into a flat body. Returns `self` unchanged when

@@ -89,6 +89,16 @@ impl<T: Copy> Proof<T> {
     }
 }
 
+/// The cells behind one realm's Array iteration proofs.
+pub(crate) struct ArrayIterationCells {
+    /// Valid while `%Array.prototype%[@@iterator]` is the built-in `values`.
+    pub(crate) iterable: Arc<PrototypeValidity>,
+    /// Valid while `%ArrayIteratorPrototype%`'s chain answers as proven.
+    pub(crate) iterator: Arc<PrototypeValidity>,
+    /// Whether that chain proves `return` absent or built-in.
+    pub(crate) close: bool,
+}
+
 /// Per-realm iteration proofs, each valid while its cell is.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct IterationProofs {
@@ -306,6 +316,29 @@ impl Interpreter {
     pub(crate) fn fast_array_iterable(&mut self, value: Value, primordial: bool) -> bool {
         matches!(self.plain_iterable(value), Some(Iterable::Array))
             && (primordial || self.iterable_proven(Iterable::Array))
+    }
+
+    /// The validity cells of the active realm's Array iteration proofs, while
+    /// both GetIterator and `next` are proven built-in, with whether `return`
+    /// is proven absent. Generated code tests the cells in place of the
+    /// proofs. May allocate the chains' prototype roles once.
+    pub(crate) fn array_iteration_cells(&mut self) -> Option<ArrayIterationCells> {
+        if !self.iterable_proven(Iterable::Array) {
+            return None;
+        }
+        let close = self.iterator_facts(BuiltinIteratorOrigin::Array).close;
+        let proofs = &self.realm_intrinsics.iteration;
+        Some(ArrayIterationCells {
+            iterable: proofs.iterables[Iterable::Array as usize]
+                .as_ref()?
+                .validity
+                .clone(),
+            iterator: proofs.iterators[origin_index(BuiltinIteratorOrigin::Array)]
+                .as_ref()?
+                .validity
+                .clone(),
+            close,
+        })
     }
 
     /// Whether closing an Array iterator runs nothing: its `return` is

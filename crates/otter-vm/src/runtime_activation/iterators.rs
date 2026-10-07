@@ -51,6 +51,9 @@ impl RuntimeCall<'_> {
             value if value == Op::IteratorNext as u8 => {
                 self.step_builtin_iterator(arg0, arg1, arg2)
             }
+            value if value == Op::IteratorClose as u8 || value == Op::IteratorCloseThrow as u8 => {
+                self.close_fast_record(arg0)
+            }
             _ => Ok(IteratorRuntimeOutcome::Bail),
         }
     }
@@ -102,6 +105,28 @@ impl RuntimeCall<'_> {
         Ok(IteratorRuntimeOutcome::Completed)
     }
 
+    /// Close a fast Array record that is done, or whose `return` the realm
+    /// proves absent; anything that may run `return` is refused first.
+    fn close_fast_record(&mut self, record: u16) -> Result<IteratorRuntimeOutcome, VmError> {
+        // SAFETY: RuntimeCall owns exclusive mutator access for this operation.
+        let vm = unsafe { &mut *self.vm.as_ptr() };
+        Ok(match RecordCursor::of(self.read(record + 1)?) {
+            RecordCursor::Exhausted => IteratorRuntimeOutcome::Completed,
+            RecordCursor::Fast(_) => {
+                let proven = {
+                    let _roots = vm.scope_runtime_roots_guard();
+                    vm.array_iterator_close_proven()
+                };
+                if proven {
+                    IteratorRuntimeOutcome::Completed
+                } else {
+                    IteratorRuntimeOutcome::Bail
+                }
+            }
+            RecordCursor::Generic => IteratorRuntimeOutcome::Bail,
+        })
+    }
+
     /// Step a fast Array record whose element is one plain dense value, or a
     /// built-in Array iterator value; anything observable is refused first.
     fn step_builtin_iterator(
@@ -145,16 +170,22 @@ impl RuntimeCall<'_> {
         let Some(iterator) = self.read(record)?.as_iterator() else {
             return Ok(IteratorRuntimeOutcome::Bail);
         };
-        let is_builtin_array = vm.gc_heap.read_payload(iterator, |state| {
-            matches!(
-                state,
-                IteratorState::Array {
-                    origin: BuiltinIteratorOrigin::Array,
-                    ..
-                }
-            )
+        let position = vm.gc_heap.read_payload(iterator, |state| match state {
+            IteratorState::Array {
+                array,
+                index,
+                origin: BuiltinIteratorOrigin::Array,
+            } => Some((*array, *index)),
+            _ => None,
         });
-        if !is_builtin_array {
+        // A hole, an accessor or a sparse element needs the observable
+        // `[[Get]]` the materialized step runs.
+        let Some((array, index)) = position else {
+            return Ok(IteratorRuntimeOutcome::Bail);
+        };
+        if index < array::len(array, &vm.gc_heap)
+            && array::plain_dense_element(array, &vm.gc_heap, index).is_none()
+        {
             return Ok(IteratorRuntimeOutcome::Bail);
         }
         let (value, done) = step_iterator(iterator, &mut vm.gc_heap)?;

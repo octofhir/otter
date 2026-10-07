@@ -1314,6 +1314,7 @@ impl Interpreter {
     /// store additionally guards that the value already has the view's
     /// representation, because coercing it could run user code.
     pub(crate) fn bake_element_accesses(&mut self, view: &mut jit::JitCompileSnapshot) {
+        self.bake_array_iteration(view);
         let sites: Vec<_> = view
             .instructions
             .iter()
@@ -1355,6 +1356,39 @@ impl Interpreter {
             };
             view.element_accesses.insert(byte_pc, access);
         }
+    }
+
+    /// The realm's Array iteration proof cells, for a function that opens or
+    /// closes a synchronous iterator record while the proof holds.
+    fn bake_array_iteration(&mut self, view: &mut jit::JitCompileSnapshot) {
+        let iterates = view.instructions.iter().any(|instr| {
+            matches!(
+                instr.op(&view.code_block),
+                Op::GetIterator | Op::IteratorClose | Op::IteratorCloseThrow
+            )
+        });
+        if !iterates {
+            return;
+        }
+        let Some(cells) = self.array_iteration_cells() else {
+            return;
+        };
+        let (Some(iterable), Some(iterator)) = (
+            self.bake_prototype_validity(&cells.iterable),
+            self.bake_prototype_validity(&cells.iterator),
+        ) else {
+            return;
+        };
+        view.array_iteration = Some(jit::JitArrayIteration {
+            iterable,
+            iterator,
+            close: cells.close,
+            realm: self.active_realm_id,
+            array_type_tag: crate::array::ARRAY_BODY_TYPE_TAG,
+            array_exotic_byte: (otter_gc::header::HEADER_SIZE
+                + std::mem::offset_of!(crate::array::ArrayBody, exotic))
+                as u32,
+        });
     }
 
     /// Describe one exact present-own array representation behind the body's

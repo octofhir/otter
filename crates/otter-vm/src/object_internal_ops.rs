@@ -52,6 +52,7 @@ use crate::{
 
 mod define;
 mod descriptors;
+mod for_in;
 mod get;
 pub(crate) use get::byte_view_expando;
 mod keys;

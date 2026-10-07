@@ -189,6 +189,11 @@ pub(crate) enum Kind {
     CopyContext,
     /// Fresh callable; exact source owns the template, inputs bind context/this/new.target.
     NewClosure,
+    /// The receiver of an inlined `[[Construct]]` whose new.target is
+    /// input0: the plan's shape and in-object slots, all `undefined`, once
+    /// the live family and prototype are proved. A failed proof, or a
+    /// buffer the collector cannot refill, resumes the construct.
+    NewReceiver(otter_vm::jit::JitReceiverAllocationPlan),
 
     /// Number/String primitive addition with a collecting string miss.
     PrimitiveAdd,
@@ -661,7 +666,8 @@ impl Kind {
             | Self::BigIntBinary(_)
             | Self::NativeNewContext(_)
             | Self::CopyContext
-            | Self::NewClosure => Properties {
+            | Self::NewClosure
+            | Self::NewReceiver(_) => Properties {
                 eager_deopt: true,
                 writes: true,
                 effectful: true,
@@ -784,6 +790,16 @@ impl Kind {
                 fp_temps: 0,
                 fixed_gp_clobbers: SmallVec::new(),
             },
+            Self::NewReceiver(_) => {
+                let fixed = target.receiver_allocation;
+                Constraints {
+                    inputs: smallvec::smallvec![FixedGp(fixed.new_target)],
+                    result: ResultPolicy::FixedGp(fixed.result),
+                    gp_temps: 0,
+                    fp_temps: 0,
+                    fixed_gp_clobbers: fixed.clobbers.iter().copied().collect(),
+                }
+            }
             Self::LoadGlobalBinding(_) => Constraints {
                 inputs: SmallVec::new(),
                 result: ResultPolicy::Register,

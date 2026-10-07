@@ -444,6 +444,15 @@ const MAX_INLINED_BYTECODE_CUMULATIVE: u32 = 920;
 /// The deepest chain of inlined calls.
 const MAX_INLINE_DEPTH: u8 = 3;
 
+/// How an inlined body binds `this`.
+#[derive(Clone, Copy)]
+enum InlineThis {
+    /// A call's actual receiver.
+    Bound(NodeId),
+    /// A construct's receiver, allocated in place as this plan describes.
+    Construct(otter_vm::jit::JitReceiverAllocationPlan),
+}
+
 /// The call an inlined body runs for.
 struct InlineFrame {
     /// The caller state and entry bindings every frame state of the body
@@ -456,6 +465,9 @@ struct InlineFrame {
     continuation: BlockId,
     /// Each return: its block, its value and the facts that hold there.
     returns: Vec<(BlockId, NodeId, Known)>,
+    /// The receiver of an inlined `[[Construct]]`: the result of every
+    /// return of a value that is not an Object.
+    receiver: Option<NodeId>,
     /// The body needs something only an activation of its own provides.
     abandoned: bool,
 }
@@ -812,6 +824,38 @@ impl<'a> Builder<'a> {
         this: NodeId,
         arguments: &[NodeId],
     ) -> bool {
+        let this = InlineThis::Bound(this);
+        self.inline_frame(instruction, body, plan, closure, this, arguments)
+    }
+
+    /// Build `body` in place of the `new` at the current instruction, whose
+    /// callee is proved to be `closure` and is its own new.target: the
+    /// receiver `allocation` describes is allocated in place, bound as
+    /// `this`, and is the result unless the body returns an Object.
+    fn inline_construct(
+        &mut self,
+        instruction: &Instruction,
+        body: &'a Arc<JitCompileSnapshot>,
+        plan: otter_vm::jit::JitDirectCallPlan,
+        allocation: otter_vm::jit::JitReceiverAllocationPlan,
+        closure: NodeId,
+        arguments: &[NodeId],
+    ) -> bool {
+        let this = InlineThis::Construct(allocation);
+        self.inline_frame(instruction, body, plan, closure, this, arguments)
+    }
+
+    /// The shared body of [`Self::inline_call`] and
+    /// [`Self::inline_construct`].
+    fn inline_frame(
+        &mut self,
+        instruction: &Instruction,
+        body: &'a Arc<JitCompileSnapshot>,
+        plan: otter_vm::jit::JitDirectCallPlan,
+        closure: NodeId,
+        this: InlineThis,
+        arguments: &[NodeId],
+    ) -> bool {
         let cell = plan.callee_cell;
         let Some(block) = self.current else {
             return false;
@@ -837,6 +881,23 @@ impl<'a> Builder<'a> {
             &[closure],
             Repr::None,
         );
+        // A construct's receiver exists before its body runs; a failed proof
+        // or refill resumes the whole construct.
+        let (this, new_target, receiver) = match this {
+            InlineThis::Bound(this) => (this, self.undefined, None),
+            InlineThis::Construct(allocation) => {
+                let receiver = self.add(Kind::NewReceiver(allocation), &[closure], Repr::Tagged);
+                let shape = match allocation.receiver_shape {
+                    0 => allocation.prototype_root,
+                    shape => shape,
+                };
+                let info = self.known.entry(receiver);
+                info.shapes = Some(smallvec::smallvec![shape]);
+                info.writable = true;
+                info.heap_object = true;
+                (receiver, closure, Some(receiver))
+            }
+        };
         let destination = instruction.writes[0];
         // The caller resumes after the call; the call's register is written
         // by the return, so its old value is never restored.
@@ -891,12 +952,13 @@ impl<'a> Builder<'a> {
                     return_register: destination,
                     this,
                     closure,
-                    new_target: self.undefined,
+                    new_target,
                 },
                 depth,
                 loops,
                 continuation,
                 returns: Vec::new(),
+                receiver,
                 abandoned: false,
             })),
         };
@@ -956,6 +1018,19 @@ impl<'a> Builder<'a> {
         true
     }
 
+    /// Whether `value` is an ECMAScript Object along this path, when the
+    /// graph proves it either way.
+    fn is_object(&self, value: NodeId) -> Option<bool> {
+        if self.known.get(value).is_some_and(|info| info.heap_object) {
+            return Some(true);
+        }
+        match self.graph.node(value).kind {
+            Kind::ConstTagged(bits) => Some(otter_vm::Value::from_bits(bits).as_object().is_some()),
+            _ if self.graph.node(value).repr != Repr::Tagged => Some(false),
+            _ => None,
+        }
+    }
+
     /// The tagged form of `value` at the end of `block`, before its control
     /// node, as the facts `known` of that block provide or a box placed
     /// there.
@@ -992,10 +1067,21 @@ impl<'a> Builder<'a> {
         boxed
     }
 
-    /// Leave an inlined body with `value` as the call's result.
+    /// Leave an inlined body with `value` as the call's result. A construct
+    /// returns its receiver for a value that is not an Object; a value not
+    /// proved either way needs the activation's own completion.
     fn inline_return(&mut self, value: NodeId) {
         let Some(block) = self.current else {
             return;
+        };
+        let receiver = self.inline.as_ref().and_then(|inline| inline.receiver);
+        let value = match receiver.map(|receiver| (receiver, self.is_object(value))) {
+            None | Some((_, Some(true))) => value,
+            Some((receiver, Some(false))) => receiver,
+            Some((_, None)) => {
+                self.inline.as_mut().expect("an inlined body").abandoned = true;
+                return self.deopt(DeoptReason::Unsupported);
+            }
         };
         let known = self.known.clone();
         let inline = self.inline.as_mut().expect("an inlined body");
@@ -2419,8 +2505,19 @@ impl<'a> Builder<'a> {
     }
 
     fn visit_store_property(&mut self, instruction: &Instruction) {
+        let receiver = self.read(instruction.reads[0]);
+        let receivers = self
+            .known
+            .get(receiver)
+            .and_then(|info| info.shapes.clone());
         let Some(access) = (!self.exited_for(ExitReason::ShapeGuard))
-            .then(|| super::feedback::own_data_store(self.view, instruction.byte_pc))
+            .then(|| {
+                super::feedback::own_data_store(
+                    self.view,
+                    instruction.byte_pc,
+                    receivers.as_deref(),
+                )
+            })
             .flatten()
         else {
             return self.visit_named_store(instruction);
@@ -2646,6 +2743,22 @@ impl<'a> Builder<'a> {
             if self.binds_this_as_is(body, plan, undefined)
                 && self.inline_call(instruction, body, plan, callee, undefined, &values)
             {
+                return;
+            }
+        }
+        // A closure constructing itself allocates its receiver in place when
+        // generated code may allocate at all.
+        if let Some(plan) = plan
+            && let Some(allocation) = allocation
+            && !allocation.new_target_is_class
+            && self.view.literal_allocations.group_allowed
+            && let Some(body) = self.inline_body(instruction.byte_pc, plan.function_id)
+        {
+            let values: SmallVec<[NodeId; 8]> = arguments
+                .iter()
+                .map(|&register| self.read(register))
+                .collect();
+            if self.inline_construct(instruction, body, plan, allocation, callee, &values) {
                 return;
             }
         }

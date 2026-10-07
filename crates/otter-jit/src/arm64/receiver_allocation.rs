@@ -52,13 +52,28 @@ fn emit_receiver_candidate(
     space_miss: DynamicLabel,
     ready: DynamicLabel,
 ) {
+    crate::arm64::js_call::emit_clear_construct_ticket(ops, context_register);
+    emit_increment_runtime_counter(ops, context_register, RECEIVER_ALLOC_ATTEMPTS_OFFSET);
+    emit_receiver_guards(ops, relocations, view, plan, guard_miss);
+    emit_receiver_fit(ops, view, plan, context_register, space_miss);
+    dynasm!(ops ; .arch aarch64 ; b =>ready);
+}
+
+/// Prove the live new.target in `x2` constructs `plan`'s receiver: its exact
+/// finalized family, and a live prototype the receiver's shape fixes. Every
+/// failure branches to `miss` before any effect. Preserves `x2`; clobbers
+/// `x4`, `x11`, `x12`, `x14`, `x15` and `x17`.
+pub(crate) fn emit_receiver_guards(
+    ops: &mut Assembler,
+    relocations: &mut RelocationCapture,
+    view: &JitCompileSnapshot,
+    plan: otter_vm::jit::JitReceiverAllocationPlan,
+    guard_miss: DynamicLabel,
+) {
     assert_ne!(
         plan.family_id, 0,
         "receiver requires an exact finalized family"
     );
-    crate::arm64::js_call::emit_clear_construct_ticket(ops, context_register);
-    emit_increment_runtime_counter(ops, context_register, RECEIVER_ALLOC_ATTEMPTS_OFFSET);
-
     let closure = ops.new_dynamic_label();
     let prototype_ready = ops.new_dynamic_label();
     emit_cell_test(ops, 2, 11, CellTest::IsNotCell, guard_miss);
@@ -100,7 +115,7 @@ fn emit_receiver_candidate(
     emit_finalized_family_guard(ops, view, plan, guard_miss);
     dynasm!(ops ; .arch aarch64
         ; ldr w4, [x2, view.class_constructor_layout.prototype_byte]
-        ; cbz w4, =>guard_miss ; add x13, x12, x4 ; b =>prototype_ready
+        ; cbz w4, =>guard_miss ; b =>prototype_ready
         ; =>closure
         ; ldr w11, [x2, view.closure_call_layout.function_id_byte]
     );
@@ -122,7 +137,7 @@ fn emit_receiver_candidate(
     emit_cell_test(ops, 4, 11, CellTest::IsNotCell, guard_miss);
     dynasm!(ops ; .arch aarch64
         ; ldrb w14, [x4] ; cmp w14, OBJECT_BODY_TYPE_TAG ; b.ne =>guard_miss
-        ; mov x13, x4 ; mov w4, w4
+        ; mov w4, w4
         ; =>prototype_ready
     );
     if let Some(validity) = plan.prototype_validity {
@@ -142,8 +157,6 @@ fn emit_receiver_candidate(
     dynasm!(ops ; .arch aarch64 ; add x14, x12, x14
         ; ldr w14, [x14, view.shape_prototype_byte]
         ; cmp w14, w4 ; b.ne =>guard_miss);
-    // The receiver's shape, into `w4` (the live prototype is no longer needed
-    // once its lineage is proven).
     if plan.receiver_shape != 0 {
         emit_load_u64(ops, 14, u64::from(plan.receiver_shape));
         dynasm!(ops
@@ -153,10 +166,27 @@ fn emit_receiver_candidate(
             ; cmp w14, w4
             ; b.ne =>guard_miss
         );
-        emit_load_u64(ops, 4, u64::from(plan.receiver_shape));
-    } else {
-        emit_load_u64(ops, 4, u64::from(plan.prototype_root));
     }
+}
+
+/// Initialize `plan`'s receiver at the top of the context's buffer, after
+/// [`emit_receiver_guards`] proved it. A fit returns the unpublished cell
+/// in `x0` and its buffer in `x1`; no fit branches to `space_miss` before
+/// any write. Reads only the context register; clobbers `x0`, `x1`, `x4`
+/// and `x13`–`x16`.
+pub(crate) fn emit_receiver_fit(
+    ops: &mut Assembler,
+    view: &JitCompileSnapshot,
+    plan: otter_vm::jit::JitReceiverAllocationPlan,
+    context_register: u8,
+    space_miss: DynamicLabel,
+) {
+    let shape = if plan.receiver_shape != 0 {
+        plan.receiver_shape
+    } else {
+        plan.prototype_root
+    };
+    emit_load_u64(ops, 4, u64::from(shape));
 
     // Only a complete cell fit below the buffer limit may mutate the nursery.
     // `x13` keeps the buffer for publication; the candidate lives at `top`.
@@ -193,12 +223,7 @@ fn emit_receiver_candidate(
             dynasm!(ops ; .arch aarch64 ; str x14, [x16, offset]);
         }
     }
-    dynasm!(ops
-        ; .arch aarch64
-        ; mov x0, x16
-        ; mov x1, x13
-        ; b =>ready
-    );
+    dynasm!(ops ; .arch aarch64 ; mov x0, x16 ; mov x1, x13);
 }
 
 /// Read the head in w17, preserving new.target and the cage base. All
@@ -249,6 +274,13 @@ fn emit_receiver_publication(ops: &mut Assembler, context_register: u8) {
     dynasm!(ops ; .arch aarch64
         ; str x0, [X(context_register), crate::entry::PENDING_CALL_OFFSET + otter_vm::native_abi::REQUEST_CONSTRUCT_RECEIVER_OFFSET]
     );
+    emit_receiver_bump(ops, context_register);
+    emit_increment_runtime_counter(ops, context_register, RECEIVER_ALLOC_GENERATED_OFFSET);
+}
+
+/// Publish the fit in `x0`/`x1` by bumping its buffer and accounting the
+/// cell; the receiver stays in `x0`. Clobbers `x13`–`x17`.
+pub(crate) fn emit_receiver_bump(ops: &mut Assembler, context_register: u8) {
     dynasm!(ops
         ; .arch aarch64
         ; mov x16, x0
@@ -265,7 +297,6 @@ fn emit_receiver_publication(ops: &mut Assembler, context_register: u8) {
         13,
         14,
     );
-    emit_increment_runtime_counter(ops, context_register, RECEIVER_ALLOC_GENERATED_OFFSET);
     dynasm!(ops ; .arch aarch64 ; mov x0, x16);
 }
 

@@ -54,7 +54,8 @@ pub(crate) fn emit_fjcvtzs(ops: &mut dynasmrt::aarch64::Assembler, source: u8, d
 
 pub(crate) use method_guard::{MethodGuardSite, emit_method_guard};
 pub(crate) use receiver_allocation::{
-    emit_receiver_candidate_probe, emit_receiver_publication_effect,
+    emit_receiver_bump, emit_receiver_candidate_probe, emit_receiver_fit, emit_receiver_guards,
+    emit_receiver_publication_effect,
 };
 
 pub(crate) mod arguments;

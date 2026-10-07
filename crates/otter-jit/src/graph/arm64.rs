@@ -461,9 +461,11 @@ impl<'a> Codegen<'a> {
         let mut pool: Vec<(u64, DynamicLabel)> = self.float_pool.drain().collect();
         pool.sort_unstable_by_key(|&(bits, _)| bits);
         dynasm!(self.ops ; .arch aarch64 ; .align 8);
+        let start = self.ops.offset().0;
         for (bits, label) in pool {
             dynasm!(self.ops ; .arch aarch64 ; =>label ; .u64 bits);
         }
+        self.relocations.record_data(start, self.ops.offset().0);
     }
 
     /// Materialize `bits` into general register `register`.

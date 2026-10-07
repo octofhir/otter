@@ -1653,6 +1653,7 @@ impl<'a> Codegen<'a> {
                 let destination = Self::gp(result.expect("an allocation result"));
                 self.emit_literal_allocation(node, destination)?;
             }
+            Kind::NewReceiver(plan) => self.emit_new_receiver(node, *plan)?,
             Kind::NativeNewContext(_) | Kind::CopyContext | Kind::NewClosure => {
                 let destination = Self::gp(result.expect("lexical allocation result"));
                 self.emit_lexical_allocation(node, destination)?;

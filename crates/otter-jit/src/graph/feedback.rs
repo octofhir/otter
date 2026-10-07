@@ -100,8 +100,14 @@ pub(crate) fn own_key_shapes(view: &JitCompileSnapshot, byte_pc: u32) -> Option<
 }
 
 /// The existing writable own data slot every receiver shape the store site
-/// at `byte_pc` observed writes, if all agree on its offset.
-pub(crate) fn own_data_store(view: &JitCompileSnapshot, byte_pc: u32) -> Option<OwnDataLoad> {
+/// at `byte_pc` observed writes, if all agree on its offset. With
+/// `receivers`, the shapes the receiver is already proved to have, only the
+/// programs of those shapes count.
+pub(crate) fn own_data_store(
+    view: &JitCompileSnapshot,
+    byte_pc: u32,
+    receivers: Option<&[u32]>,
+) -> Option<OwnDataLoad> {
     let programs = view.property_programs.get(&byte_pc)?;
     if programs.is_empty() || programs.len() > 4 {
         return None;
@@ -109,6 +115,12 @@ pub(crate) fn own_data_store(view: &JitCompileSnapshot, byte_pc: u32) -> Option<
     let mut shapes = SmallVec::new();
     let mut location = None;
     for program in programs {
+        if let (Some(receivers), Some(JitCacheIrOp::GuardShape { object: 0, shape })) =
+            (receivers, program.ops.first())
+            && !receivers.contains(shape)
+        {
+            continue;
+        }
         let [
             JitCacheIrOp::GuardShape { object: 0, shape },
             JitCacheIrOp::GuardAtomSlot {

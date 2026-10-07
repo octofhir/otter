@@ -3,6 +3,7 @@
 //! # Contents
 //! - [`RegisterContract`] describes allocation pools, calls and arithmetic words.
 //! - [`IntDivisionRegisters`] names the quotient and remainder registers.
+//! - [`ReceiverAllocationRegisters`] names inline constructor receiver words.
 //! - `AARCH64` / `X86_64` supply each native Graph instruction encoder.
 //!
 //! # Invariants
@@ -22,6 +23,16 @@ pub(crate) struct IntDivisionRegisters {
     pub(crate) remainder: u8,
 }
 
+/// The fixed words of an inline constructor receiver allocation: the target
+/// encoder proves new.target in `new_target`, leaves the receiver in
+/// `result` and writes every register in `clobbers`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ReceiverAllocationRegisters {
+    pub(crate) new_target: u8,
+    pub(crate) result: u8,
+    pub(crate) clobbers: &'static [u8],
+}
+
 /// Immutable backend register, call-ABI and arithmetic ownership.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct RegisterContract {
@@ -38,6 +49,7 @@ pub(crate) struct RegisterContract {
     pub(crate) variable_shift_count: Option<u8>,
     /// `None` means division has ordinary inputs, output and temporaries.
     pub(crate) integer_division: Option<IntDivisionRegisters>,
+    pub(crate) receiver_allocation: ReceiverAllocationRegisters,
 }
 
 impl RegisterContract {
@@ -89,6 +101,23 @@ impl RegisterContract {
                 "fixed arithmetic word must have an allocatable physical register"
             );
         }
+        let receiver = self.receiver_allocation;
+        for register in receiver
+            .clobbers
+            .iter()
+            .copied()
+            .chain([receiver.new_target, receiver.result])
+        {
+            assert!(
+                register < 32 && general & (1 << register) != 0,
+                "fixed receiver word must have an allocatable physical register"
+            );
+        }
+        assert!(
+            !receiver.clobbers.contains(&receiver.new_target)
+                && receiver.new_target != receiver.result,
+            "receiver allocation preserves its new.target input"
+        );
         if let Some(pair) = self.integer_division {
             assert_ne!(
                 pair.quotient, pair.remainder,
@@ -116,6 +145,11 @@ pub(crate) const AARCH64: RegisterContract = RegisterContract {
     call_result: 0,
     variable_shift_count: None,
     integer_division: None,
+    receiver_allocation: ReceiverAllocationRegisters {
+        new_target: 2,
+        result: 0,
+        clobbers: &[1, 4, 11, 12, 13, 14, 15],
+    },
 };
 
 #[cfg(any(test, target_arch = "x86_64"))]
@@ -133,6 +167,11 @@ pub(crate) const X86_64: RegisterContract = RegisterContract {
         quotient: 0,
         remainder: 2,
     }),
+    receiver_allocation: ReceiverAllocationRegisters {
+        new_target: 1,
+        result: 0,
+        clobbers: &[2, 7, 8, 9],
+    },
 };
 
 #[cfg(test)]

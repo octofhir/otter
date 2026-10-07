@@ -168,9 +168,9 @@ impl Interpreter {
             }),
         );
         push(
-            "string_constant_cells",
+            "literal_cells",
             count(|v| {
-                for value in self.string_constant_cells_for_trace() {
+                for value in self.literal_cells_for_trace() {
                     value.trace_value_slots(v);
                 }
             }),
@@ -179,14 +179,6 @@ impl Interpreter {
             "small_int_string_cache",
             count(|v| {
                 for value in self.small_int_strings_for_trace() {
-                    value.trace_value_slots(v);
-                }
-            }),
-        );
-        push(
-            "bigint_constant_cache",
-            count(|v| {
-                for value in self.bigint_constants_for_trace() {
                     value.trace_value_slots(v);
                 }
             }),

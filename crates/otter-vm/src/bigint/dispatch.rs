@@ -12,10 +12,9 @@
 //! - <https://tc39.es/ecma262/#sec-bigint.asuintn>
 //! - <https://tc39.es/ecma262/#sec-tobigint>
 
-use super::BigIntValue;
+use super::{BigIntValue, ops};
 use crate::{Value, VmError, oom_to_vm};
 use num_bigint::BigInt;
-use num_traits::Signed;
 
 /// Dispatch `BigInt(...)` ([`BigIntMethod::Construct`]) /
 /// `BigInt.<method>(...)`. Routes the typed [`BigIntMethod`]
@@ -30,45 +29,41 @@ pub fn call(
     args: &[Value],
 ) -> Result<Value, VmError> {
     use otter_bytecode::method_id::BigIntMethod as M;
-    match method {
+    let value = match method {
         // §21.2.1 BigInt(value) — coerce `value` to a BigInt.
-        M::Construct => {
-            let value = args.first().cloned().unwrap_or(Value::undefined());
-            let big = to_bigint(interp, &value)?;
-            let handle = BigIntValue::from_inner(interp.gc_heap_mut(), big).map_err(oom_to_vm)?;
-            Ok(Value::big_int(handle))
-        }
+        M::Construct => to_bigint(interp, args.first().copied().unwrap_or(Value::undefined()))?,
         // §21.2.2.1 BigInt.asIntN(bits, value).
-        M::AsIntN => {
+        M::AsIntN | M::AsUintN => {
             let bits = expect_bits(args.first(), interp)?;
-            let value = args.get(1).cloned().unwrap_or(Value::undefined());
-            let n = to_bigint_strict(interp, &value)?;
-            let clipped = as_int_n(bits, &n);
-            let handle =
-                BigIntValue::from_inner(interp.gc_heap_mut(), clipped).map_err(oom_to_vm)?;
-            Ok(Value::big_int(handle))
+            let value = args.get(1).copied().unwrap_or(Value::undefined());
+            let n = to_bigint_strict(interp, value)?;
+            let clip = if matches!(method, M::AsIntN) {
+                ops::as_int_n
+            } else {
+                ops::as_uint_n
+            };
+            clip(interp.gc_heap_mut(), bits, n).map_err(|error| op_error(interp, error))?
         }
-        // §21.2.2.2 BigInt.asUintN(bits, value).
-        M::AsUintN => {
-            let bits = expect_bits(args.first(), interp)?;
-            let value = args.get(1).cloned().unwrap_or(Value::undefined());
-            let n = to_bigint_strict(interp, &value)?;
-            let clipped = as_uint_n(bits, &n);
-            let handle =
-                BigIntValue::from_inner(interp.gc_heap_mut(), clipped).map_err(oom_to_vm)?;
-            Ok(Value::big_int(handle))
-        }
+    };
+    Ok(Value::big_int(value))
+}
+
+/// A BigInt operation failure as the VM error the spec throws.
+fn op_error(interp: &crate::Interpreter, error: ops::OpError) -> VmError {
+    match error {
+        ops::OpError::OutOfMemory(oom) => oom_to_vm(oom),
+        other => interp.err_range(other.to_string().into()),
     }
 }
 
 /// §7.1.13 ToBigInt — Number must be a safe integer; String parses
 /// as integer literal; Boolean → 0n / 1n; BigInt passes through.
-fn to_bigint(interp: &crate::Interpreter, value: &Value) -> Result<BigInt, VmError> {
+fn to_bigint(interp: &mut crate::Interpreter, value: Value) -> Result<BigIntValue, VmError> {
     if let Some(b) = value.as_big_int() {
-        return Ok(b.clone_inner(interp.gc_heap()));
+        return Ok(b);
     }
     if let Some(b) = value.as_boolean() {
-        return Ok(BigInt::from(if b { 1 } else { 0 }));
+        return BigIntValue::from_i32(interp.gc_heap_mut(), i32::from(b)).map_err(oom_to_vm);
     }
     // §21.2.1.1 step 3.a — `Number → NumberToBigInt`. The spec
     // throws **RangeError** on non-integer / non-finite values
@@ -79,10 +74,11 @@ fn to_bigint(interp: &crate::Interpreter, value: &Value) -> Result<BigInt, VmErr
             return Err(interp
                 .err_range(("The number is not a safe integer for BigInt".to_string()).into()));
         }
-        return Ok(exact_integer_to_bigint(f));
+        return ops::from_f64_integral(interp.gc_heap_mut(), f).map_err(oom_to_vm);
     }
     if let Some(s) = value.as_string(interp.gc_heap()) {
-        return string_to_bigint(interp, &s.to_lossy_string(interp.gc_heap()));
+        let parsed = string_to_bigint(interp, &s.to_lossy_string(interp.gc_heap()))?;
+        return BigIntValue::from_num(interp.gc_heap_mut(), &parsed).map_err(oom_to_vm);
     }
     // §7.1.13 step 7 — Symbol → TypeError.
     if value.is_symbol() {
@@ -106,47 +102,13 @@ fn to_bigint(interp: &crate::Interpreter, value: &Value) -> Result<BigInt, VmErr
     Err(interp.err_type(("Cannot convert value to a BigInt".to_string()).into()))
 }
 
-/// §21.2.1.1 NumberToBigInt for an integral, finite `f64`.
-///
-/// The IEEE-754 significand and exponent are read directly, so a value
-/// past the `i128` range (anything from `2^127` up to `Number.MAX_VALUE`)
-/// converts exactly instead of saturating.
-fn exact_integer_to_bigint(f: f64) -> BigInt {
-    if f == 0.0 {
-        return BigInt::from(0);
-    }
-    let bits = f.to_bits();
-    let raw_exponent = ((bits >> 52) & 0x7FF) as i32;
-    let fraction = bits & ((1u64 << 52) - 1);
-    // A subnormal is never a non-zero integer, so only the normal form
-    // needs the implicit leading bit.
-    let (significand, exponent) = if raw_exponent == 0 {
-        (fraction, -1074)
-    } else {
-        (fraction | (1u64 << 52), raw_exponent - 1075)
-    };
-    let mut magnitude = BigInt::from(significand);
-    if exponent > 0 {
-        magnitude <<= exponent as u32;
-    } else if exponent < 0 {
-        // The caller has already established `f.fract() == 0`, so every
-        // bit this drops is zero.
-        magnitude >>= exponent.unsigned_abs();
-    }
-    if f.is_sign_negative() {
-        -magnitude
-    } else {
-        magnitude
-    }
-}
-
 /// §7.1.13 ToBigInt — the strict conversion used by `BigInt.asIntN` /
 /// `asUintN`. Unlike the `BigInt()` constructor's `NumberToBigInt`
 /// (shared `to_bigint`), a Number operand is a `TypeError` here, not a
 /// silent integer conversion. The operand is already ToPrimitive'd by
 /// `coerce_bigint_call_args`, so a Number reaching this point came from
 /// a numeric primitive or a `valueOf` / `@@toPrimitive` result.
-fn to_bigint_strict(interp: &crate::Interpreter, value: &Value) -> Result<BigInt, VmError> {
+fn to_bigint_strict(interp: &mut crate::Interpreter, value: Value) -> Result<BigIntValue, VmError> {
     if value.is_number() {
         return Err(interp.err_type(("Cannot convert a Number to a BigInt".to_string()).into()));
     }
@@ -191,7 +153,7 @@ fn parse_radix_literal(input: &str) -> Option<BigInt> {
 /// then `ToIntegerOrInfinity`, rejecting Symbol / BigInt with
 /// **TypeError**, negatives and overflow with **RangeError**, and
 /// returning `0` for NaN / undefined per the spec.
-fn expect_bits(arg: Option<&Value>, interp: &crate::Interpreter) -> Result<u32, VmError> {
+fn expect_bits(arg: Option<&Value>, interp: &crate::Interpreter) -> Result<u64, VmError> {
     let Some(v) = arg else {
         return Ok(0);
     };
@@ -230,43 +192,5 @@ fn expect_bits(arg: Option<&Value>, interp: &crate::Interpreter) -> Result<u32, 
         return Err(interp
             .err_range(("Invalid bits parameter for BigInt.asIntN / asUintN".to_string()).into()));
     }
-    if trunc > u32::MAX as f64 {
-        // The spec allows up to 2^53-1, but the per-arm implementation
-        // can only address up to `u32::MAX` bits before overflow.
-        return Err(interp.err_range(("Bits parameter exceeds supported range".to_string()).into()));
-    }
-    Ok(trunc as u32)
-}
-
-/// §21.2.2.1 BigInt.asIntN — clip `value` to a signed N-bit
-/// integer. Result is in `[-2^(N-1), 2^(N-1) - 1]`.
-fn as_int_n(bits: u32, value: &BigInt) -> BigInt {
-    if bits == 0 {
-        return BigInt::from(0);
-    }
-    let modulus = BigInt::from(1u32) << bits;
-    let half = BigInt::from(1u32) << (bits - 1);
-    let mut wrapped = value.modpow(&BigInt::from(1u32), &modulus);
-    if wrapped.is_negative() {
-        wrapped += &modulus;
-    }
-    if wrapped >= half {
-        wrapped - modulus
-    } else {
-        wrapped
-    }
-}
-
-/// §21.2.2.2 BigInt.asUintN — clip `value` to an unsigned N-bit
-/// integer. Result is in `[0, 2^N - 1]`.
-fn as_uint_n(bits: u32, value: &BigInt) -> BigInt {
-    if bits == 0 {
-        return BigInt::from(0);
-    }
-    let modulus = BigInt::from(1u32) << bits;
-    let mut wrapped = value % &modulus;
-    if wrapped.is_negative() {
-        wrapped += &modulus;
-    }
-    wrapped
+    Ok(trunc as u64)
 }

@@ -89,8 +89,9 @@ pub enum MapKey {
     /// IEEE-754 with SameValueZero collapsing (`+0`/`-0` map to the
     /// same key; `NaN` matches itself).
     Number(f64),
-    /// BigInt — compared by exact value.
-    BigInt(crate::bigint::BigIntValue),
+    /// BigInts compare by numeric value; the second field is their value
+    /// hash.
+    BigInt(crate::bigint::BigIntValue, u64),
     /// Strings compare by code-unit content; the second field is their
     /// content hash.
     String(JsString, u32),
@@ -124,7 +125,7 @@ impl MapKey {
             let normalised = if f == 0.0 { 0.0 } else { f };
             MapKey::Number(normalised)
         } else if let Some(b) = value.as_big_int() {
-            MapKey::BigInt(b)
+            MapKey::BigInt(b, b.content_hash(heap))
         } else if let Some(s) = value.as_string(heap) {
             MapKey::String(s, s.peek_content_hash(heap))
         } else if let Some(s) = value.as_symbol(heap) {
@@ -155,7 +156,9 @@ impl MapKey {
                     a == b
                 }
             }
-            (MapKey::BigInt(a), MapKey::BigInt(b)) => a == b,
+            (MapKey::BigInt(a, a_hash), MapKey::BigInt(b, b_hash)) => {
+                a_hash == b_hash && a.numeric_eq(*b, heap)
+            }
             (MapKey::String(a, a_hash), MapKey::String(b, b_hash)) => {
                 a_hash == b_hash && a.equals(*b, heap)
             }
@@ -367,7 +370,7 @@ impl MapKey {
     fn record_into<T: ?Sized>(&self, heap: &mut otter_gc::GcHeap, parent: otter_gc::Gc<T>) {
         match self {
             Self::Undefined | Self::Null | Self::Boolean(_) | Self::Number(_) => {}
-            Self::BigInt(value) => heap.record_write(parent, &Value::big_int(*value)),
+            Self::BigInt(value, _) => heap.record_write(parent, &Value::big_int(*value)),
             Self::String(value, _) => heap.record_write(parent, &Value::string(*value)),
             Self::Symbol(value) => heap.record_write(parent, &Value::symbol(*value)),
             Self::ObjectValue(value) => heap.record_write(parent, value),
@@ -478,7 +481,11 @@ fn map_key_hash(key: &MapKey) -> Option<u64> {
             hash = fx_hash_word(hash, 4);
             hash = fx_hash_word(hash, u64::from(*string_hash));
         }
-        MapKey::BigInt(_) | MapKey::Symbol(_) | MapKey::ObjectValue(_) => return None,
+        MapKey::BigInt(_, value_hash) => {
+            hash = fx_hash_word(hash, 5);
+            hash = fx_hash_word(hash, *value_hash);
+        }
+        MapKey::Symbol(_) | MapKey::ObjectValue(_) => return None,
     }
     Some(avalanche_map_hash(hash.rotate_left(26)))
 }
@@ -1789,11 +1796,11 @@ impl crate::pelt::PeltField for MapKey {
             // A string key's body handle moves under a young-gen scavenge, so
             // its slot must be traced too (the equality path reads the body).
             MapKey::String(s, _) => s.trace_handle_slot(visitor),
+            MapKey::BigInt(b, _) => b.trace_handle_slot(visitor),
             MapKey::Undefined
             | MapKey::Null
             | MapKey::Boolean(_)
             | MapKey::Number(_)
-            | MapKey::BigInt(_)
             | MapKey::Symbol(_) => {}
         }
     }

@@ -859,12 +859,12 @@ impl<'a> Codegen<'a> {
                 let temps = [allocation.gp_temps[0], allocation.gp_temps[1]];
                 self.emit_global_binding(node, *byte_pc, destination, temps)?;
             }
-            Kind::LoadStringConstant(byte_pc) => {
+            Kind::LoadLiteral(byte_pc) => {
                 let destination = Self::gp(result.expect("a result"));
                 let byte_pc = *byte_pc;
                 let cell = self
                     .view_of(node)
-                    .string_constant_cells
+                    .literal_cells
                     .get(&byte_pc)
                     .ok_or(Unsupported::OperandShape("graph LoadString cell"))?
                     .cell_addr;
@@ -874,7 +874,7 @@ impl<'a> Codegen<'a> {
                     &mut self.relocations,
                     destination,
                     cell as u64,
-                    RelocationTarget::StringConstantCell {
+                    RelocationTarget::LiteralCell {
                         function_id,
                         byte_pc,
                     },
@@ -1631,6 +1631,7 @@ impl<'a> Codegen<'a> {
             Kind::AllocationGroup(index) => self.emit_allocation_group(node, *index)?,
             Kind::AllocationProjection(byte) => self.emit_allocation_projection(node, *byte),
             Kind::PrimitiveAdd => self.emit_primitive_add(node)?,
+            Kind::BigIntBinary(operator) => self.emit_bigint_binary(node, *operator)?,
             Kind::PrimitiveCompare(condition) => self.emit_primitive_compare(node, *condition)?,
             Kind::NewObject | Kind::NewArrayEmpty => {
                 let destination = Self::gp(result.expect("an allocation result"));

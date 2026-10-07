@@ -470,23 +470,23 @@ pub fn is_loosely_equal(x: &Value, y: &Value, heap: &otter_gc::GcHeap) -> bool {
     // collapses to `false`.
     if let (Some(big), Some(s)) = (x.as_big_int(), y.as_string(heap)) {
         return match string_to_big_int(&s.to_lossy_string(heap)) {
-            Some(parsed) => big.with_inner(heap, |b| b == &parsed),
+            Some(parsed) => big.to_num(heap) == parsed,
             None => false,
         };
     }
     if let (Some(s), Some(big)) = (x.as_string(heap), y.as_big_int()) {
         return match string_to_big_int(&s.to_lossy_string(heap)) {
-            Some(parsed) => big.with_inner(heap, |b| b == &parsed),
+            Some(parsed) => big.to_num(heap) == parsed,
             None => false,
         };
     }
 
     // Steps 13, 14: BigInt x Number.
     if let (Some(big), Some(num)) = (x.as_big_int(), y.as_number()) {
-        return big.with_inner(heap, |b| bigint_eq_number(b, num));
+        return bigint_ops::equals_f64(heap, big, num.as_f64());
     }
     if let (Some(num), Some(big)) = (x.as_number(), y.as_big_int()) {
-        return big.with_inner(heap, |b| bigint_eq_number(b, num));
+        return bigint_ops::equals_f64(heap, big, num.as_f64());
     }
 
     false
@@ -572,22 +572,6 @@ pub fn string_to_big_int(text: &str) -> Option<num_bigint::BigInt> {
     Some(if sign_negative { -parsed } else { parsed })
 }
 
-/// `bigint == number` — only true when `number` is finite and
-/// integer-valued and matches the bigint's exact decimal form.
-fn bigint_eq_number(big: &num_bigint::BigInt, num: NumberValue) -> bool {
-    let f = num.as_f64();
-    if !f.is_finite() {
-        return false;
-    }
-    if f.fract() != 0.0 {
-        return false;
-    }
-    matches!(
-        bigint_ops::compare_to_f64(big, f),
-        Some(std::cmp::Ordering::Equal)
-    )
-}
-
 /// ECMA-262 §7.2.14 `AbstractRelationalComparison` over operands
 /// that the caller has already coerced through
 /// `Op::ToPrimitive(number)`.
@@ -630,7 +614,7 @@ pub fn abstract_relational_comparison(
     // Step 2 / 3: BigInt x String.
     if let (Some(big), Some(s)) = (x.as_big_int(), y.as_string(heap)) {
         return match string_to_big_int(&s.to_lossy_string(heap)) {
-            Some(parsed) => match big.with_inner(heap, |b| bigint_ops::compare(b, &parsed)) {
+            Some(parsed) => match big.to_num(heap).cmp(&parsed) {
                 std::cmp::Ordering::Less => RelationalOutcome::LessThan,
                 _ => RelationalOutcome::NotLessThan,
             },
@@ -639,7 +623,7 @@ pub fn abstract_relational_comparison(
     }
     if let (Some(s), Some(big)) = (x.as_string(heap), y.as_big_int()) {
         return match string_to_big_int(&s.to_lossy_string(heap)) {
-            Some(parsed) => match big.with_inner(heap, |b| bigint_ops::compare(&parsed, b)) {
+            Some(parsed) => match parsed.cmp(&big.to_num(heap)) {
                 std::cmp::Ordering::Less => RelationalOutcome::LessThan,
                 _ => RelationalOutcome::NotLessThan,
             },
@@ -658,21 +642,19 @@ pub fn abstract_relational_comparison(
             }
             number::NumericOrdering::Unordered => RelationalOutcome::Undefined,
         },
-        (Some(NumericKind::Big(a)), Some(NumericKind::Big(b))) => {
-            match bigint_ops::compare(&a, &b) {
-                std::cmp::Ordering::Less => RelationalOutcome::LessThan,
-                _ => RelationalOutcome::NotLessThan,
-            }
-        }
+        (Some(NumericKind::Big(a)), Some(NumericKind::Big(b))) => match a.compare(b, heap) {
+            std::cmp::Ordering::Less => RelationalOutcome::LessThan,
+            _ => RelationalOutcome::NotLessThan,
+        },
         (Some(NumericKind::Big(a)), Some(NumericKind::Num(b))) => {
-            match bigint_ops::compare_to_f64(&a, b.as_f64()) {
+            match bigint_ops::compare_to_f64(heap, a, b.as_f64()) {
                 Some(std::cmp::Ordering::Less) => RelationalOutcome::LessThan,
                 Some(_) => RelationalOutcome::NotLessThan,
                 None => RelationalOutcome::Undefined,
             }
         }
         (Some(NumericKind::Num(a)), Some(NumericKind::Big(b))) => {
-            match bigint_ops::compare_to_f64(&b, a.as_f64()) {
+            match bigint_ops::compare_to_f64(heap, b, a.as_f64()) {
                 Some(std::cmp::Ordering::Less) => RelationalOutcome::NotLessThan,
                 Some(std::cmp::Ordering::Equal) => RelationalOutcome::NotLessThan,
                 Some(std::cmp::Ordering::Greater) => RelationalOutcome::LessThan,
@@ -691,10 +673,8 @@ pub enum NumericKind {
     /// Operand reduced to a Number (covers `Number`, `String`,
     /// `Boolean`, `null`, `undefined`).
     Num(NumberValue),
-    /// Operand reduced to an owned [`num_bigint::BigInt`]. The body
-    /// is cloned out of the GC heap once so downstream comparisons
-    /// / arithmetic do not have to re-borrow the heap.
-    Big(num_bigint::BigInt),
+    /// Operand that is a BigInt.
+    Big(crate::bigint::BigIntValue),
 }
 
 /// §7.1.4 ToNumeric over an already-primitive Value. Mirrors
@@ -709,7 +689,7 @@ pub fn to_numeric_kind(value: &Value, heap: &otter_gc::GcHeap) -> Option<Numeric
     if let Some(n) = value.as_number() {
         Some(NumericKind::Num(n))
     } else if let Some(b) = value.as_big_int() {
-        Some(NumericKind::Big(b.clone_inner(heap)))
+        Some(NumericKind::Big(b))
     } else if let Some(s) = value.as_string(heap) {
         Some(NumericKind::Num(number::to_number_from_js_string(s, heap)))
     } else if let Some(b) = value.as_boolean() {

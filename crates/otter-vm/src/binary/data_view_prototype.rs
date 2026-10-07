@@ -9,8 +9,6 @@
 //! - <https://tc39.es/ecma262/#sec-getviewvalue>
 //! - <https://tc39.es/ecma262/#sec-setviewvalue>
 
-use num_bigint::BigInt;
-
 use crate::Value;
 use crate::bigint::BigIntValue;
 use crate::number::NumberValue;
@@ -306,7 +304,7 @@ pub(crate) fn dv_get_bigint64(
         } else {
             i64::from_be_bytes(buf)
         };
-        let handle = BigIntValue::from_inner(heap, BigInt::from(v))?;
+        let handle = BigIntValue::from_i64(heap, v)?;
         Ok(Value::big_int(handle))
     })
 }
@@ -323,7 +321,7 @@ pub(crate) fn dv_get_biguint64(
         } else {
             u64::from_be_bytes(buf)
         };
-        let handle = BigIntValue::from_inner(heap, BigInt::from(v))?;
+        let handle = BigIntValue::from_u64(heap, v)?;
         Ok(Value::big_int(handle))
     })
 }
@@ -358,35 +356,11 @@ fn coerce_int(value: &Value, heap: &otter_gc::GcHeap) -> i64 {
 }
 
 fn coerce_bigint64(value: &Value, heap: &otter_gc::GcHeap) -> i64 {
-    let big = value
-        .as_big_int()
-        .map_or_else(|| BigInt::from(0), |b| b.clone_inner(heap));
-    use num_traits::Signed;
-    let modulus: BigInt = BigInt::from(1u64) << 64;
-    let mut wrapped: BigInt = &big % &modulus;
-    if wrapped.is_negative() {
-        wrapped += &modulus;
-    }
-    let half: BigInt = BigInt::from(1u64) << 63;
-    if wrapped >= half {
-        wrapped -= modulus;
-    }
-    use num_traits::ToPrimitive;
-    wrapped.to_i64().unwrap_or(0)
+    coerce_biguint64(value, heap) as i64
 }
 
 fn coerce_biguint64(value: &Value, heap: &otter_gc::GcHeap) -> u64 {
-    let big = value
-        .as_big_int()
-        .map_or_else(|| BigInt::from(0), |b| b.clone_inner(heap));
-    use num_traits::Signed;
-    let modulus: BigInt = BigInt::from(1u64) << 64;
-    let mut wrapped: BigInt = &big % &modulus;
-    if wrapped.is_negative() {
-        wrapped += &modulus;
-    }
-    use num_traits::ToPrimitive;
-    wrapped.to_u64().unwrap_or(0)
+    value.as_big_int().map_or(0, |b| b.to_u64_wrapping(heap))
 }
 
 pub(crate) fn dv_set_int8(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {

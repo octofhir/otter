@@ -21,13 +21,10 @@ impl Interpreter {
         for value in self.template_objects.values() {
             crate::code_liveness::visit_value(value, visitor);
         }
-        for value in self.string_constant_cells.values() {
+        for value in self.literal_cells.values() {
             crate::code_liveness::visit_value(value, visitor);
         }
         for value in self.small_int_string_cache.iter().flatten() {
-            crate::code_liveness::visit_value(value, visitor);
-        }
-        for value in self.bigint_constant_cache.values() {
             crate::code_liveness::visit_value(value, visitor);
         }
         self.handle_arena.visit_function_ids(visitor);

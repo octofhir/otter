@@ -159,9 +159,9 @@ pub(crate) enum Kind {
     LoadNewTarget,
     /// The callee (SELF) from the record.
     LoadClosure,
-    /// The primitive string constant of the `LoadString` at this byte PC,
-    /// read from its isolate-owned cell.
-    LoadStringConstant(u32),
+    /// The string or BigInt literal loaded at this byte PC, read from its
+    /// isolate-owned cell.
+    LoadLiteral(u32),
     /// Live global binding at this source body's byte PC. A pre-effect
     /// guard resumes the canonical binding operation at that exact site.
     LoadGlobalBinding(u32),
@@ -192,6 +192,8 @@ pub(crate) enum Kind {
 
     /// Number/String primitive addition with a collecting string miss.
     PrimitiveAdd,
+    /// A binary operator over two BigInts; any other operand exits.
+    BigIntBinary(otter_vm::bigint::ops::Operator),
     /// Primitive Number/String order, including unordered numeric operands.
     PrimitiveCompare(Condition),
 
@@ -568,7 +570,7 @@ impl Kind {
             | Self::InitialRegister(_)
             | Self::LoadNewTarget
             | Self::LoadClosure
-            | Self::LoadStringConstant(_)
+            | Self::LoadLiteral(_)
             | Self::LoadWindow(_)
             | Self::Phi
             | Self::AllocationProjection(_)
@@ -652,6 +654,7 @@ impl Kind {
             Self::PrimitiveCompare(_) => eager,
             Self::AllocationGroup(_)
             | Self::PrimitiveAdd
+            | Self::BigIntBinary(_)
             | Self::NativeNewContext(_)
             | Self::CopyContext
             | Self::NewClosure => Properties {
@@ -750,6 +753,13 @@ impl Kind {
                 fp_temps: 1,
                 fixed_gp_clobbers: SmallVec::new(),
             },
+            Self::BigIntBinary(_) => Constraints {
+                inputs: (0..input_count).map(|_| InputPolicy::Home).collect(),
+                result: ResultPolicy::Register,
+                gp_temps: 0,
+                fp_temps: 0,
+                fixed_gp_clobbers: SmallVec::new(),
+            },
             Self::PrimitiveCompare(_) => simple(2, ResultPolicy::Register),
             Self::AllocationProjection(_) => simple(1, ResultPolicy::Register),
             Self::AllocationGroup(_) | Self::NewObject | Self::NewArrayEmpty => Constraints {
@@ -781,7 +791,7 @@ impl Kind {
             | Self::LoadThis
             | Self::LoadNewTarget
             | Self::LoadClosure
-            | Self::LoadStringConstant(_)
+            | Self::LoadLiteral(_)
             | Self::LoadWindow(_) => simple(0, ResultPolicy::Register),
             // The right operand may be a constant, encoded in the
             // instruction when it fits.

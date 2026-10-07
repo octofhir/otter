@@ -612,6 +612,24 @@ fn build_once(
     })
 }
 
+/// The BigInt operator a binary opcode names.
+fn bigint_operator(op: Op) -> Option<otter_vm::bigint::ops::Operator> {
+    use otter_vm::bigint::ops::Operator;
+    Some(match op {
+        Op::Add => Operator::Add,
+        Op::Sub => Operator::Sub,
+        Op::Mul => Operator::Mul,
+        Op::Div => Operator::Div,
+        Op::Rem => Operator::Rem,
+        Op::BitwiseAnd => Operator::BitwiseAnd,
+        Op::BitwiseOr => Operator::BitwiseOr,
+        Op::BitwiseXor => Operator::BitwiseXor,
+        Op::Shl => Operator::Shl,
+        Op::Shr => Operator::Shr,
+        _ => return None,
+    })
+}
+
 /// Replace every phi that merges one value with that value.
 ///
 /// A phi whose inputs, apart from references to itself, are all the same
@@ -1767,17 +1785,10 @@ impl<'a> Builder<'a> {
                     };
                 self.write(instruction.writes[0], result);
             }
-            Op::LoadString
-                if self
-                    .view
-                    .string_constant_cells
-                    .contains_key(&instruction.byte_pc) =>
+            Op::LoadString | Op::LoadBigInt
+                if self.view.literal_cells.contains_key(&instruction.byte_pc) =>
             {
-                let value = self.add(
-                    Kind::LoadStringConstant(instruction.byte_pc),
-                    &[],
-                    Repr::Tagged,
-                );
+                let value = self.add(Kind::LoadLiteral(instruction.byte_pc), &[], Repr::Tagged);
                 self.write(instruction.writes[0], value);
             }
             Op::Instanceof => {
@@ -1999,6 +2010,15 @@ impl<'a> Builder<'a> {
             let a = self.tagged(lhs);
             let b = self.tagged(rhs);
             let result = self.add(Kind::PrimitiveAdd, &[a, b], Repr::Tagged);
+            self.write(instruction.writes[0], result);
+            return;
+        }
+        if feedback.is_bigint_only()
+            && let Some(operator) = bigint_operator(op)
+        {
+            let a = self.tagged(lhs);
+            let b = self.tagged(rhs);
+            let result = self.add(Kind::BigIntBinary(operator), &[a, b], Repr::Tagged);
             self.write(instruction.writes[0], result);
             return;
         }

@@ -227,7 +227,7 @@ fn bigint_proto_to_string(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Val
                 reason: "this is not a BigInt".to_string(),
             });
         };
-        let rendered = b.with_inner(scope.context().heap(), |bi| bi.to_str_radix(radix));
+        let rendered = b.to_string_radix(scope.context().heap(), radix);
         let rendered = scope
             .string(&rendered)
             .map_err(|_| oom("BigInt.prototype.toString"))?;

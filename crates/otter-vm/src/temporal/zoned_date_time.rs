@@ -9,8 +9,6 @@
 
 #![allow(missing_docs)]
 
-use num_traits::ToPrimitive;
-
 use crate::bigint::BigIntValue;
 use crate::js_surface::{Attr, MethodSpec};
 use crate::native_function::NativeCall;
@@ -31,7 +29,7 @@ pub fn construct(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Nativ
     require_construct(ctx, CLASS)?;
     let bi = crate::temporal::helpers::to_big_int_field(ctx, &arg_or_undef(args, 0), CLASS)?;
     let nanos = bi
-        .with_inner(ctx.heap(), |big| big.to_i128())
+        .to_i128(ctx.heap())
         .ok_or_else(|| NativeError::RangeError {
             name: CLASS,
             reason: "epochNanoseconds out of i128 range".to_string(),

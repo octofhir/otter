@@ -23,7 +23,7 @@ pub fn construct(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Nativ
     require_construct(ctx, CLASS)?;
     let raw = arg_or_undef(args, 0);
     let ns = if let Some(b) = raw.as_big_int() {
-        b.with_inner(ctx.heap(), |bi| bi.to_i128())
+        b.to_i128(ctx.heap())
     } else if let Some(s) = raw.as_string(ctx.heap()) {
         let text = s.to_lossy_string(ctx.heap());
         let parsed = crate::abstract_ops::string_to_big_int(&text).ok_or_else(|| {
@@ -102,8 +102,9 @@ fn from_epoch_nanoseconds(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Val
             reason: "fromEpochNanoseconds: argument must be a BigInt".to_string(),
         });
     };
-    let nanos =
-        i128::try_from(bv.clone_inner(ctx.heap())).map_err(|_| NativeError::RangeError {
+    let nanos = bv
+        .to_i128(ctx.heap())
+        .ok_or_else(|| NativeError::RangeError {
             name: CLASS,
             reason: "epoch nanoseconds out of range".to_string(),
         })?;

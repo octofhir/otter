@@ -398,7 +398,7 @@ pub(crate) fn to_big_int_or_throw(
                 interp.err_syntax((format!("Cannot convert {text:?} to a BigInt")).into())
             })
             .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
-        return BigIntValue::from_inner(&mut interp.gc_heap, parsed)
+        return BigIntValue::from_num(&mut interp.gc_heap, &parsed)
             .map_err(crate::oom_to_vm)
             .map_err(|error| CommittedValueError::JavaScript(error.into()));
     }

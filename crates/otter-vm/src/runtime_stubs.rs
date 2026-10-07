@@ -35,9 +35,9 @@ use crate::native_abi::{
     CodeRegistryView, NO_SAFEPOINT, NativeResultDomain, NativeResultPair, RuntimeStubAllocContext,
     RuntimeStubDescriptor, RuntimeStubId, STUB_ARRAY_CONSTRUCT_ALLOC, STUB_ARRAY_POP_LEAF,
     STUB_ARRAY_PUSH_LEAF, STUB_ARRAY_SHIFT_LEAF, STUB_ARRAY_UNSHIFT_ALLOC,
-    STUB_COLLECTION_MAP_DELETE_ALLOC, STUB_COLLECTION_MAP_GET_ALLOC, STUB_COLLECTION_MAP_GET_LEAF,
-    STUB_COLLECTION_MAP_HAS_ALLOC, STUB_COLLECTION_MAP_HAS_LEAF, STUB_COLLECTION_MAP_SET_ALLOC,
-    STUB_COLLECTION_MAP_SET_MUTATING, STUB_COLLECTION_SET_ADD_ALLOC,
+    STUB_BIGINT_BINARY_ALLOC, STUB_COLLECTION_MAP_DELETE_ALLOC, STUB_COLLECTION_MAP_GET_ALLOC,
+    STUB_COLLECTION_MAP_GET_LEAF, STUB_COLLECTION_MAP_HAS_ALLOC, STUB_COLLECTION_MAP_HAS_LEAF,
+    STUB_COLLECTION_MAP_SET_ALLOC, STUB_COLLECTION_MAP_SET_MUTATING, STUB_COLLECTION_SET_ADD_ALLOC,
     STUB_COLLECTION_SET_DELETE_ALLOC, STUB_COLLECTION_SET_HAS_ALLOC, STUB_COLLECTION_SET_HAS_LEAF,
     STUB_COPY_CONTEXT_ALLOC, STUB_CREATE_CONTEXT_ALLOC, STUB_JIT_MAKE_CLOSURE, STUB_JIT_MAKE_FN,
     STUB_MATH_ABS_LEAF, STUB_MATH_FLOOR_LEAF, STUB_MATH_MAX_LEAF, STUB_MATH_MIN_LEAF,
@@ -414,14 +414,16 @@ pub fn validate_alloc_safepoint_frame_roots(
 /// This type is the VM-native equivalent of the ad hoc native-call root scopes:
 /// it exposes each frame or spill slot named by a [`SafepointRecord`] to the
 /// moving collector, so a GC can both trace and rewrite those slots while an
-/// `Alloc` stub is executing.
+/// `Alloc` stub is executing. The record is resolved only when a collection
+/// actually visits the roots, as a stack walk would: a stub call that does not
+/// collect never looks its safepoint up.
 pub struct AllocSafepointFrameRoots<'a> {
     ctx: &'a RuntimeStubAllocContext,
-    safepoint: &'a SafepointRecord,
+    safepoint: SafepointId,
 }
 
 impl<'a> AllocSafepointFrameRoots<'a> {
-    /// Build a root publisher for a validated safepoint.
+    /// Build a root publisher for the packet's current safepoint.
     ///
     /// # Safety
     ///
@@ -429,22 +431,30 @@ impl<'a> AllocSafepointFrameRoots<'a> {
     /// or spill window named by the record for the entire root registration.
     pub unsafe fn new(
         ctx: &'a RuntimeStubAllocContext,
-        safepoint: &'a SafepointRecord,
+        safepoint: SafepointId,
     ) -> Result<Self, AllocSafepointRootError> {
+        if safepoint == NO_SAFEPOINT || safepoint != ctx.safepoint_id {
+            return Err(AllocSafepointRootError::NoSafepoint);
+        }
+        if !ctx.has_safepoint_records() {
+            return Err(AllocSafepointRootError::MissingSafepointRecords);
+        }
         // Each encoder publishes the exact window named by its record: frame
         // slots for baseline, initialized canonical spill homes for Graph. The
         // release path trusts that compiler contract. Diagnose a debug failure
         // with one validation walk and the actual published source/window shape.
         #[cfg(debug_assertions)]
         {
-            let validation = validate_alloc_safepoint_frame_roots(ctx, safepoint);
+            // SAFETY: forwarded from this constructor's caller.
+            let record = unsafe { alloc_safepoint_record(ctx, safepoint) };
+            let validation =
+                record.and_then(|record| validate_alloc_safepoint_frame_roots(ctx, record));
             // SAFETY: this constructor requires a live thread-published frame;
             // a null frame remains observable as None for failure diagnostics.
             let frame = unsafe { ctx.current_frame().as_ref() };
             debug_assert!(
                 validation.is_ok(),
-                "allocation safepoint roots: {validation:?}; safepoint={}; frame={:?}; inline_source={:?}; spill_present={}; spill_count={}",
-                safepoint.id,
+                "allocation safepoint roots: {validation:?}; safepoint={safepoint}; frame={:?}; spill_present={}; spill_count={}",
                 frame.map(|frame| (
                     frame.header.function_id,
                     frame.header.pc,
@@ -453,10 +463,6 @@ impl<'a> AllocSafepointFrameRoots<'a> {
                     frame.register_base() != 0,
                     frame.call_site,
                 )),
-                safepoint
-                    .inline_frames
-                    .last()
-                    .map(|source| (source.function_id, source.byte_pc,)),
                 !ctx.spill_slots.is_null(),
                 ctx.spill_slot_count,
             );
@@ -467,17 +473,21 @@ impl<'a> AllocSafepointFrameRoots<'a> {
     /// Safepoint id being published.
     #[must_use]
     pub fn safepoint_id(&self) -> SafepointId {
-        self.safepoint.id
+        self.safepoint
     }
 }
 
 impl otter_gc::ExtraRootSource for AllocSafepointFrameRoots<'_> {
     fn visit_extra_roots(&self, visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)) {
-        for slot in self.safepoint.spill_roots.iter() {
+        // SAFETY: the constructor's contract keeps the packet's frame and
+        // registry published while this source is registered.
+        let record = unsafe { alloc_safepoint_record(self.ctx, self.safepoint) }
+            .expect("a published allocation safepoint names its compiled record");
+        for slot in record.spill_roots.iter() {
             debug_assert!(slot < self.ctx.spill_slot_count);
-            // SAFETY: construction validated every rooted slot against the
-            // spill window, which callers keep alive and writable while this
-            // root source is registered. A moving collector both traces and
+            // SAFETY: the compiler names only initialized slots of the spill
+            // window, which callers keep alive and writable while this root
+            // source is registered. A moving collector both traces and
             // rewrites the pointer in place through the `&mut Value`.
             let value =
                 unsafe { &mut *(self.ctx.spill_slots.add(usize::from(slot)) as *mut Value) };
@@ -738,6 +748,14 @@ pub const ARRAY_CONSTRUCT_ALLOC: AllocValueStub = AllocValueStub {
 
 mod string;
 pub use string::{primitive_string_order, string_concat_alloc};
+mod bigint;
+pub use bigint::bigint_binary_alloc;
+
+/// ABI descriptor for the BigInt binary operators.
+pub const BIGINT_BINARY_ALLOC: AllocValueStub = AllocValueStub {
+    descriptor: STUB_BIGINT_BINARY_ALLOC,
+    entry: Some(bigint_binary_alloc),
+};
 mod allocation_group;
 pub use allocation_group::alloc_group_ensure;
 
@@ -945,6 +963,7 @@ pub const fn alloc_value_stub_by_id(id: RuntimeStubId) -> Option<AllocValueStub>
         id if id == STUB_CREATE_CONTEXT_ALLOC.id => Some(CREATE_CONTEXT_ALLOC),
         id if id == STUB_COPY_CONTEXT_ALLOC.id => Some(COPY_CONTEXT_ALLOC),
         id if id == STUB_ARRAY_UNSHIFT_ALLOC.id => Some(ARRAY_UNSHIFT_ALLOC),
+        id if id == STUB_BIGINT_BINARY_ALLOC.id => Some(BIGINT_BINARY_ALLOC),
         _ => None,
     }
 }
@@ -2651,9 +2670,7 @@ unsafe fn alloc_value_stub_call_roots<'a>(
     values: [Value; 3],
 ) -> Result<AllocValueStubCallRoots<'a>, AllocSafepointRootError> {
     // SAFETY: forwarded from this helper's caller.
-    let record = unsafe { alloc_safepoint_record(ctx, safepoint)? };
-    // SAFETY: forwarded from this helper's caller.
-    let frame_roots = unsafe { AllocSafepointFrameRoots::new(ctx, record)? };
+    let frame_roots = unsafe { AllocSafepointFrameRoots::new(ctx, safepoint)? };
     Ok(AllocValueStubCallRoots::new(frame_roots, values))
 }
 
@@ -2936,7 +2953,7 @@ mod tests {
         let ctx = test_alloc_context(std::ptr::null_mut(), &mut frame, &safepoints, 31)
             .with_spill_area(slots.as_mut_ptr(), slots.len() as u16);
         // SAFETY: `slots` and `safepoints` remain alive while roots are used.
-        let frame_roots = unsafe { AllocSafepointFrameRoots::new(&ctx, &safepoint) }.unwrap();
+        let frame_roots = unsafe { AllocSafepointFrameRoots::new(&ctx, safepoint.id) }.unwrap();
         let roots = AllocValueStubCallRoots::new(
             frame_roots,
             [arg_value, Value::undefined(), Value::undefined()],
@@ -3234,7 +3251,7 @@ mod tests {
         assert!(ctx.has_spill_slots());
 
         validate_alloc_safepoint_frame_roots(&ctx, &record).expect("spill root validates");
-        let roots = unsafe { AllocSafepointFrameRoots::new(&ctx, &record) }.expect("publisher");
+        let roots = unsafe { AllocSafepointFrameRoots::new(&ctx, record.id) }.expect("publisher");
         let mut visited = 0usize;
         roots.visit_extra_roots(&mut |_p| visited += 1);
         assert_eq!(visited, 1, "the spill-slot pointer is traced exactly once");

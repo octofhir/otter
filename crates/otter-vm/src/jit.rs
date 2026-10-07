@@ -697,10 +697,10 @@ pub struct JitCompileSnapshot {
     /// each non-moving cell; generated code reads its current value and takes
     /// the semantic stub only for a TDZ hole.
     pub global_lexical_loads: rustc_hash::FxHashMap<u32, JitGlobalLexicalLoad>,
-    /// Prepared address-stable, GC-traced primitive-string constant cells
-    /// keyed by `Op::LoadString` byte PC. Every site is a leaf load and remains
+    /// Prepared address-stable, GC-traced literal cells keyed by the byte PC
+    /// of a `LoadString` or `LoadBigInt`. Every site is a leaf load and remains
     /// valid for the lifetime of every code object carrying its relocation.
-    pub string_constant_cells: rustc_hash::FxHashMap<u32, JitStringConstantCell>,
+    pub literal_cells: rustc_hash::FxHashMap<u32, JitLiteralCell>,
     /// Guarded own-data reads from the global object record keyed by the
     /// `Op::LoadGlobalOrThrow` byte-PC. Generated code validates both the live
     /// global-declarative epoch and the global object's hidden class before
@@ -1448,21 +1448,18 @@ pub struct JitGlobalLexicalLoad {
     pub cell_offset: u32,
 }
 
-/// One primitive-string constant cell available to generated code.
+/// One string or BigInt literal cell available to generated code.
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub struct JitStringConstantCell {
+pub struct JitLiteralCell {
     /// Process-local address of the isolate-owned, GC-traced `Value` cell.
     /// The cell allocation is stable and outlives every code object in the
     /// isolate; artifacts retain only function/byte-PC identity.
     pub cell_addr: usize,
 }
 
-impl std::fmt::Debug for JitStringConstantCell {
+impl std::fmt::Debug for JitLiteralCell {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            formatter,
-            "JitStringConstantCell {{ cell_addr: <redacted> }}"
-        )
+        write!(formatter, "JitLiteralCell {{ cell_addr: <redacted> }}")
     }
 }
 
@@ -1930,7 +1927,7 @@ impl JitCompileSnapshot {
             native_call_layout: JitNativeCallLayout::default(),
             instructions,
             global_lexical_loads: rustc_hash::FxHashMap::default(),
-            string_constant_cells: rustc_hash::FxHashMap::default(),
+            literal_cells: rustc_hash::FxHashMap::default(),
             global_object_loads: rustc_hash::FxHashMap::default(),
             native_calls: rustc_hash::FxHashMap::default(),
             direct_callees: rustc_hash::FxHashMap::default(),

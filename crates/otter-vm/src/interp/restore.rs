@@ -126,10 +126,9 @@ impl Interpreter {
         let mut interp = Self {
             local_time_zone: crate::date::LocalTimeZone::default(),
             template_objects: rustc_hash::FxHashMap::default(),
-            string_constant_cells: rustc_hash::FxHashMap::default(),
+            literal_cells: rustc_hash::FxHashMap::default(),
             small_int_string_cache: vec![None; Self::SMALL_INT_STRING_CACHE as usize]
                 .into_boxed_slice(),
-            bigint_constant_cache: rustc_hash::FxHashMap::default(),
             pending_error_detail: std::cell::RefCell::new(None),
             handle_arena: crate::handles::HandleArena::new(),
             host_atoms: crate::HostAtomInterner::new(),

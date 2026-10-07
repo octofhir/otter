@@ -1065,7 +1065,7 @@ pub const STUB_JIT_PRIVATE_OP: RuntimeStubDescriptor = descriptor(
 );
 
 /// Completes static value loads (`MathLoad`, `SymbolLoad`, `TemporalLoad`,
-/// `LoadBigInt`, `GetStringIndex`) through the VM's load helpers.
+/// `GetStringIndex`) through the VM's load helpers.
 pub const STUB_JIT_VALUE_LOAD_OP: RuntimeStubDescriptor = descriptor(
     43,
     RuntimeStubClass::Reentrant,
@@ -1777,6 +1777,7 @@ pub const fn runtime_stub_name(id: super::RuntimeStubId) -> &'static str {
         96 => "jit_call_native",
         97 => "constructor_receiver_probe",
         98 => "constructor_receiver_commit",
+        99 => "bigint_binary_alloc",
         _ => "unknown_runtime_stub",
     }
 }
@@ -1863,6 +1864,19 @@ pub const STUB_CONSTRUCTOR_RECEIVER_COMMIT: RuntimeStubDescriptor = descriptor(
     RuntimeStubException::Never,
     RuntimeStubResultAbi::NativePair,
     NativeResultDomain::Committed,
+);
+
+/// Allocating BigInt binary operator over two BigInt operands and an
+/// operator code; every other input and every operator failure misses.
+pub const STUB_BIGINT_BINARY_ALLOC: RuntimeStubDescriptor = descriptor(
+    99,
+    RuntimeStubClass::Alloc,
+    RuntimeStubSignature::AllocValue3,
+    3,
+    RuntimeStubEffects::allocating(true, false),
+    RuntimeStubException::Status,
+    RuntimeStubResultAbi::NativePair,
+    NativeResultDomain::Probe,
 );
 
 /// Dense inventory of every current machine-callable runtime-stub contract.
@@ -1965,6 +1979,7 @@ pub const RUNTIME_STUB_DESCRIPTORS: &[RuntimeStubDescriptor] = &[
     STUB_JIT_CALL_NATIVE,
     STUB_CONSTRUCTOR_RECEIVER_PROBE,
     STUB_CONSTRUCTOR_RECEIVER_COMMIT,
+    STUB_BIGINT_BINARY_ALLOC,
 ];
 
 /// Validate a descriptor and one concrete call-site safepoint id.

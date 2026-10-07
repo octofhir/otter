@@ -14,7 +14,6 @@
 //! - `+` string-or-numeric dispatch.
 //! - Relational comparison dispatch.
 //! - Generic binary-operator completion for committed compiled sites.
-//! - BigInt adapter functions used by opcode arms.
 //!
 //! # Invariants
 //! - Inputs are already compiler-lowered through the required ToPrimitive
@@ -24,10 +23,8 @@
 //! - Generic `+` roots both operands and allocated string intermediates in a
 //!   handle scope before any moving-GC allocation.
 //! - Mixed Number/BigInt arithmetic is rejected with `TypeMismatch`.
-//! - BigInt ops here operate on owned [`num_bigint::BigInt`] values
-//!   (already cloned out of the GC body by
-//!   [`abstract_ops::to_numeric_kind`]); the result is folded back
-//!   into a fresh [`bigint::BigIntValue`] handle at the call site.
+//! - BigInt operators read their operand bodies in place and allocate only
+//!   their result ([`bigint::ops`]).
 //!
 //! # See also
 //! - [`crate::number`]
@@ -44,16 +41,7 @@ use crate::{
 };
 
 /// Signature of every BigInt binary op routed through this module.
-///
-/// Operates on borrowed [`num_bigint::BigInt`] payloads (extracted
-/// from the GC body by the caller via
-/// [`bigint::BigIntValue::clone_inner`] inside
-/// [`abstract_ops::to_numeric_kind`]). Returns an owned `BigInt`;
-/// the caller wraps it through [`bigint::BigIntValue::from_inner`].
-pub(crate) type BigIntBinop = fn(
-    &num_bigint::BigInt,
-    &num_bigint::BigInt,
-) -> Result<num_bigint::BigInt, bigint::ops::OpError>;
+pub(crate) type BigIntBinop = bigint::ops::Binary;
 
 /// Fully decoded numeric-family operation requested by native code.
 ///
@@ -227,7 +215,7 @@ impl Interpreter {
                 lhs,
                 rhs,
                 number::sub,
-                bigint_sub_op,
+                bigint::ops::sub,
                 feedback,
             ),
             NumericBinaryOp::Mul => self.run_numeric_regs(
@@ -238,7 +226,7 @@ impl Interpreter {
                 lhs,
                 rhs,
                 number::mul,
-                bigint_mul_op,
+                bigint::ops::mul,
                 feedback,
             ),
             NumericBinaryOp::Div => self.run_numeric_regs(
@@ -630,11 +618,10 @@ impl Interpreter {
                         Ok(Value::number(number::add(a, b)))
                     }
                     (abstract_ops::NumericKind::Big(a), abstract_ops::NumericKind::Big(b)) => {
-                        let sum = bigint::ops::add(&a, &b);
-                        let handle = bigint::BigIntValue::from_inner(&mut interp.gc_heap, sum)
-                            .map_err(oom_to_vm)
-                            .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
-                        Ok(Value::big_int(handle))
+                        bigint::ops::add(&mut interp.gc_heap, a, b, &mut bigint::gc_body::no_roots)
+                            .map(Value::big_int)
+                            .map_err(|err| bigint_to_vm_error(interp, err))
+                            .map_err(|error| CommittedValueError::JavaScript(error.into()))
                     }
                     // §6.1.6.2 Numeric Type Conversion forbids mixing
                     // Number and BigInt operands without an explicit coercion.
@@ -661,12 +648,24 @@ impl Interpreter {
         use crate::BinaryOperator as B;
         match operator {
             B::Add => self.add_value(stack, context, lhs, rhs),
-            B::Sub => {
-                numeric_binary_value(self, stack, context, lhs, rhs, number::sub, bigint_sub_op)
-            }
-            B::Mul => {
-                numeric_binary_value(self, stack, context, lhs, rhs, number::mul, bigint_mul_op)
-            }
+            B::Sub => numeric_binary_value(
+                self,
+                stack,
+                context,
+                lhs,
+                rhs,
+                number::sub,
+                bigint::ops::sub,
+            ),
+            B::Mul => numeric_binary_value(
+                self,
+                stack,
+                context,
+                lhs,
+                rhs,
+                number::mul,
+                bigint::ops::mul,
+            ),
             B::Div => numeric_binary_value(
                 self,
                 stack,
@@ -705,7 +704,7 @@ impl Interpreter {
                 lhs,
                 rhs,
                 number::bitwise_and,
-                bigint_and_op,
+                bigint::ops::bitwise_and,
             ),
             B::BitwiseOr => numeric_binary_value(
                 self,
@@ -714,7 +713,7 @@ impl Interpreter {
                 lhs,
                 rhs,
                 number::bitwise_or,
-                bigint_or_op,
+                bigint::ops::bitwise_or,
             ),
             B::BitwiseXor => numeric_binary_value(
                 self,
@@ -723,7 +722,7 @@ impl Interpreter {
                 lhs,
                 rhs,
                 number::bitwise_xor,
-                bigint_xor_op,
+                bigint::ops::bitwise_xor,
             ),
             B::Shl => numeric_binary_value(
                 self,
@@ -888,7 +887,7 @@ impl Interpreter {
                 lhs,
                 binary_rhs()?,
                 number::sub,
-                bigint_sub_op,
+                bigint::ops::sub,
             ),
             NumericRuntimeOp::Mul { .. } => numeric_binary_value(
                 self,
@@ -897,7 +896,7 @@ impl Interpreter {
                 lhs,
                 binary_rhs()?,
                 number::mul,
-                bigint_mul_op,
+                bigint::ops::mul,
             ),
             NumericRuntimeOp::Div { .. } => numeric_binary_value(
                 self,
@@ -933,7 +932,7 @@ impl Interpreter {
                 lhs,
                 binary_rhs()?,
                 number::bitwise_and,
-                bigint_and_op,
+                bigint::ops::bitwise_and,
             ),
             NumericRuntimeOp::BitwiseOr { .. } => numeric_binary_value(
                 self,
@@ -942,7 +941,7 @@ impl Interpreter {
                 lhs,
                 binary_rhs()?,
                 number::bitwise_or,
-                bigint_or_op,
+                bigint::ops::bitwise_or,
             ),
             NumericRuntimeOp::BitwiseXor { .. } => numeric_binary_value(
                 self,
@@ -951,7 +950,7 @@ impl Interpreter {
                 lhs,
                 binary_rhs()?,
                 number::bitwise_xor,
-                bigint_xor_op,
+                bigint::ops::bitwise_xor,
             ),
             NumericRuntimeOp::Shl { .. } => numeric_binary_value(
                 self,
@@ -1008,13 +1007,10 @@ impl Interpreter {
             abstract_ops::NumericKind::Num(number_value) => {
                 Ok(Value::number(number::neg(number_value)))
             }
-            abstract_ops::NumericKind::Big(big) => {
-                let negated = bigint::ops::neg(&big);
-                let handle = bigint::BigIntValue::from_inner(&mut self.gc_heap, negated)
-                    .map_err(oom_to_vm)
-                    .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
-                Ok(Value::big_int(handle))
-            }
+            abstract_ops::NumericKind::Big(big) => bigint::ops::neg(&mut self.gc_heap, big)
+                .map(Value::big_int)
+                .map_err(|err| bigint_to_vm_error(self, err))
+                .map_err(|error| CommittedValueError::JavaScript(error.into())),
         }
     }
 
@@ -1034,13 +1030,10 @@ impl Interpreter {
             abstract_ops::NumericKind::Num(number_value) => {
                 Ok(Value::number(number::bitwise_not(number_value)))
             }
-            abstract_ops::NumericKind::Big(big) => {
-                let inverted = bigint::ops::bitwise_not(&big);
-                let handle = bigint::BigIntValue::from_inner(&mut self.gc_heap, inverted)
-                    .map_err(oom_to_vm)
-                    .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
-                Ok(Value::big_int(handle))
-            }
+            abstract_ops::NumericKind::Big(big) => bigint::ops::bitwise_not(&mut self.gc_heap, big)
+                .map(Value::big_int)
+                .map_err(|err| bigint_to_vm_error(self, err))
+                .map_err(|error| CommittedValueError::JavaScript(error.into())),
         }
     }
 
@@ -1060,12 +1053,10 @@ impl Interpreter {
                 NumberValue::from_f64(number_value.as_f64() + f64::from(delta)),
             )),
             abstract_ops::NumericKind::Big(big) => {
-                let delta_big = num_bigint::BigInt::from(delta);
-                let sum = bigint::ops::add(&big, &delta_big);
-                let handle = bigint::BigIntValue::from_inner(&mut self.gc_heap, sum)
-                    .map_err(|_| VmError::TypeMismatch)
-                    .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
-                Ok(Value::big_int(handle))
+                bigint::ops::step(&mut self.gc_heap, big, delta > 0)
+                    .map(Value::big_int)
+                    .map_err(|err| bigint_to_vm_error(self, err))
+                    .map_err(|error| CommittedValueError::JavaScript(error.into()))
             }
         }
     }
@@ -1233,13 +1224,10 @@ fn numeric_binary_value(
             Ok(Value::number(op(a, b)))
         }
         (abstract_ops::NumericKind::Big(a), abstract_ops::NumericKind::Big(b)) => {
-            let folded = bigint_op(&a, &b)
+            bigint_op(interp.gc_heap_mut(), a, b, &mut bigint::gc_body::no_roots)
+                .map(Value::big_int)
                 .map_err(|err| bigint_to_vm_error(interp, err))
-                .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
-            let handle = bigint::BigIntValue::from_inner(interp.gc_heap_mut(), folded)
-                .map_err(oom_to_vm)
-                .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
-            Ok(Value::big_int(handle))
+                .map_err(|error| CommittedValueError::JavaScript(error.into()))
         }
         _ => Err(CommittedValueError::JavaScript(VmError::TypeMismatch)),
     }
@@ -1326,51 +1314,14 @@ fn commit_frame_result(frame: &mut Frame, dst: u16, result: Value) -> Result<(),
     Ok(())
 }
 
-pub(crate) fn bigint_sub_op(
-    a: &num_bigint::BigInt,
-    b: &num_bigint::BigInt,
-) -> Result<num_bigint::BigInt, bigint::ops::OpError> {
-    Ok(bigint::ops::sub(a, b))
-}
-
-pub(crate) fn bigint_mul_op(
-    a: &num_bigint::BigInt,
-    b: &num_bigint::BigInt,
-) -> Result<num_bigint::BigInt, bigint::ops::OpError> {
-    Ok(bigint::ops::mul(a, b))
-}
-
-pub(crate) fn bigint_and_op(
-    a: &num_bigint::BigInt,
-    b: &num_bigint::BigInt,
-) -> Result<num_bigint::BigInt, bigint::ops::OpError> {
-    Ok(bigint::ops::bitwise_and(a, b))
-}
-
-pub(crate) fn bigint_or_op(
-    a: &num_bigint::BigInt,
-    b: &num_bigint::BigInt,
-) -> Result<num_bigint::BigInt, bigint::ops::OpError> {
-    Ok(bigint::ops::bitwise_or(a, b))
-}
-
-pub(crate) fn bigint_xor_op(
-    a: &num_bigint::BigInt,
-    b: &num_bigint::BigInt,
-) -> Result<num_bigint::BigInt, bigint::ops::OpError> {
-    Ok(bigint::ops::bitwise_xor(a, b))
-}
-
 fn bigint_to_vm_error(interp: &Interpreter, err: bigint::ops::OpError) -> VmError {
     // §6.1.6.2.5 / .3 / .9 — BigInt division and remainder by zero,
     // a negative `**` exponent, and an unrepresentable shift all
     // raise RangeError, not TypeError.
-    let message = match err {
-        bigint::ops::OpError::DivisionByZero => "Division by zero",
-        bigint::ops::OpError::NegativeExponent => "Exponent must be non-negative",
-        bigint::ops::OpError::ShiftOutOfRange => "Maximum BigInt size exceeded",
-    };
-    interp.err_range((message.to_string()).into())
+    match err {
+        bigint::ops::OpError::OutOfMemory(oom) => oom_to_vm(oom),
+        other => interp.err_range(other.to_string().into()),
+    }
 }
 
 #[cfg(test)]

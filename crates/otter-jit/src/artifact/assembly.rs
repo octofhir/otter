@@ -474,11 +474,11 @@ fn symbolic_target(target: &RelocationTarget) -> String {
         } => {
             format!("globalLexicalCell(fid={function_id},bytePc={byte_pc})")
         }
-        RelocationTarget::StringConstantCell {
+        RelocationTarget::LiteralCell {
             function_id,
             byte_pc,
         } => {
-            format!("stringConstantCell(fid={function_id},bytePc={byte_pc})")
+            format!("literalCell(fid={function_id},bytePc={byte_pc})")
         }
         RelocationTarget::PropertyIcSlot {
             function_id,

@@ -50,7 +50,7 @@ const TARGET_GUARDED_HEAP_REFERENCE: u8 = 6;
 const TARGET_FUNCTION_ENTRY_CELL: u8 = 8;
 const TARGET_GLOBAL_LEXICAL_CELL: u8 = 10;
 const TARGET_DEOPT_RUNTIME_DATA: u8 = 11;
-const TARGET_STRING_CONSTANT_CELL: u8 = 12;
+const TARGET_LITERAL_CELL: u8 = 12;
 const TARGET_PROPERTY_ACTION_CACHE_TABLE: u8 = 13;
 const TARGET_CALLEE_IDENTITY_CELL: u8 = 16;
 const TARGET_ARITH_FEEDBACK_CELL: u8 = 17;
@@ -112,8 +112,9 @@ pub(crate) enum RelocationTarget {
         function_id: u32,
         byte_pc: u32,
     },
-    /// Address-stable GC-traced cell for one eagerly prepared string literal.
-    StringConstantCell {
+    /// Address-stable GC-traced cell for one eagerly prepared string or BigInt
+    /// literal.
+    LiteralCell {
         function_id: u32,
         byte_pc: u32,
     },
@@ -1218,11 +1219,11 @@ fn encode_target(target: &RelocationTarget, output: &mut Vec<u8>) -> Result<(), 
             put_u32(output, *function_id);
             put_u32(output, *byte_pc);
         }
-        RelocationTarget::StringConstantCell {
+        RelocationTarget::LiteralCell {
             function_id,
             byte_pc,
         } => {
-            output.push(TARGET_STRING_CONSTANT_CELL);
+            output.push(TARGET_LITERAL_CELL);
             put_u32(output, *function_id);
             put_u32(output, *byte_pc);
         }

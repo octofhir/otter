@@ -9,10 +9,33 @@ and inclusive samples (any frame, counted once per sample) by function name,
 for the `otter-isolate` thread unless THREAD names another. Prints the top
 rows of both tables. FOCUS=<substring> also aggregates the direct callers and
 callees of the outermost frame matching it. Traces and exports stay under
-<out-dir>.
+<out-dir>. Run otter with `--perf-basic-prof` to name generated code: the
+launch's `/tmp/perf-<pid>.map` is kept beside its export and resolves bare
+JIT addresses to `JS:<function> [<tier>]`.
 """
-import collections, os, pathlib, subprocess, sys
+import bisect, collections, glob, os, pathlib, shutil, subprocess, sys, time
 import xml.etree.ElementTree as ET
+
+
+def load_perf_map(path):
+    """Sorted (start, end, name) ranges of a perf map, or an empty list."""
+    ranges = []
+    if path.exists():
+        for line in path.read_text().splitlines():
+            start, size, name = line.split(" ", 2)
+            ranges.append((int(start, 16), int(start, 16) + int(size, 16), name))
+    ranges.sort()
+    return ranges
+
+
+def symbolize(name, ranges, starts):
+    if not ranges or not name.startswith("0x"):
+        return name
+    address = int(name, 16)
+    index = bisect.bisect_right(starts, address) - 1
+    if index >= 0 and address < ranges[index][1]:
+        return ranges[index][2]
+    return name
 
 out = pathlib.Path(sys.argv[1])
 runs = int(sys.argv[2])
@@ -30,14 +53,21 @@ total = 0
 for run in range(runs):
     trace = out / f"run{run}.trace"
     export = out / f"run{run}.xml"
+    perf_map = out / f"run{run}.perfmap"
     if not export.exists():
+        started = time.time()
         subprocess.run(["xcrun", "xctrace", "record", "--template", "Time Profiler",
                         "--output", str(trace), "--launch", "--", *command],
                        check=True, capture_output=True)
+        maps = [m for m in glob.glob("/tmp/perf-*.map") if os.path.getmtime(m) >= started]
+        if maps:
+            shutil.copy(max(maps, key=os.path.getmtime), perf_map)
         with export.open("w") as handle:
             subprocess.run(["xcrun", "xctrace", "export", "--input", str(trace), "--xpath",
                             '/trace-toc/run[@number="1"]/data/table[@schema="time-profile"]'],
                            check=True, stdout=handle, stderr=subprocess.DEVNULL)
+    ranges = load_perf_map(perf_map)
+    starts = [start for start, _, _ in ranges]
     root = ET.parse(export).getroot()
     by_id = {}
     for element in root.iter():
@@ -66,7 +96,8 @@ for run in range(runs):
         if backtrace is None:
             continue
         backtrace = resolve(backtrace)
-        names = [resolve(frame).get("name") or "?" for frame in backtrace.findall("frame")]
+        names = [symbolize(resolve(frame).get("name") or "?", ranges, starts)
+                 for frame in backtrace.findall("frame")]
         if not names:
             continue
         total += 1

@@ -49,6 +49,8 @@ pub struct JitDebugRequest {
     capture_events: bool,
     #[serde(default)]
     capture_artifacts: bool,
+    #[serde(default)]
+    perf_map: bool,
 }
 
 impl JitDebugRequest {
@@ -58,6 +60,7 @@ impl JitDebugRequest {
         Self {
             capture_events: false,
             capture_artifacts: false,
+            perf_map: false,
         }
     }
 
@@ -67,6 +70,7 @@ impl JitDebugRequest {
         Self {
             capture_events: true,
             capture_artifacts: false,
+            perf_map: false,
         }
     }
 
@@ -76,6 +80,7 @@ impl JitDebugRequest {
         Self {
             capture_events: false,
             capture_artifacts: true,
+            perf_map: false,
         }
     }
 
@@ -103,6 +108,20 @@ impl JitDebugRequest {
     #[must_use]
     pub const fn artifacts_enabled(self) -> bool {
         self.capture_artifacts
+    }
+
+    /// Enable or disable the perf map of installed code on this request.
+    #[must_use]
+    pub const fn with_perf_map(mut self, enabled: bool) -> Self {
+        self.perf_map = enabled;
+        self
+    }
+
+    /// Return whether installed code is written to the perf map
+    /// (`/tmp/perf-<pid>.map`, V8's `--perf-basic-prof`).
+    #[must_use]
+    pub const fn perf_map_enabled(self) -> bool {
+        self.perf_map
     }
 }
 
@@ -812,6 +831,8 @@ impl JitDebugReport {
 #[derive(Debug)]
 pub(crate) struct JitDebugState {
     request: JitDebugRequest,
+    /// The perf map, opened on the first installed code object.
+    perf_map: Option<std::fs::File>,
     events: Option<Vec<JitDebugEvent>>,
     dropped_events: u64,
     property_runtime: PropertyRuntimeIndices,
@@ -829,6 +850,7 @@ impl JitDebugState {
     pub(crate) fn new(request: JitDebugRequest) -> Self {
         Self {
             request,
+            perf_map: None,
             events: request.events_enabled().then(Vec::new),
             dropped_events: 0,
             property_runtime: PropertyRuntimeIndices::default(),
@@ -912,6 +934,29 @@ impl JitDebugState {
             let dropped_events = std::mem::take(&mut self.dropped_events);
             JitDebugReport::from_captured(std::mem::take(events), dropped_events)
         })
+    }
+}
+
+impl JitDebugState {
+    /// Append one installed code object to the perf map in the
+    /// `START SIZE name` form `perf` and V8's `--perf-basic-prof` share.
+    /// A map that cannot be written is skipped: it is a diagnostic.
+    pub(crate) fn record_perf_map(&mut self, address: u64, len: usize, name: &str) {
+        use std::io::Write;
+        if !self.request.perf_map_enabled() {
+            return;
+        }
+        if self.perf_map.is_none() {
+            let path = format!("/tmp/perf-{}.map", std::process::id());
+            self.perf_map = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+                .ok();
+        }
+        if let Some(map) = &mut self.perf_map {
+            let _ = writeln!(map, "{address:x} {len:x} {name}");
+        }
     }
 }
 
@@ -1009,7 +1054,13 @@ mod tests {
             JitDebugRequest {
                 capture_events: true,
                 capture_artifacts: true,
+                perf_map: false,
             }
+        );
+        assert!(
+            JitDebugRequest::disabled()
+                .with_perf_map(true)
+                .perf_map_enabled()
         );
     }
 

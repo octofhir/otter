@@ -185,6 +185,11 @@ struct Cli {
     #[arg(long = "expose-gc", alias = "expose_gc", global = true)]
     expose_gc: bool,
 
+    /// Write every installed compiled function to `/tmp/perf-<pid>.map` so
+    /// profilers can name generated code (Node's `--perf-basic-prof`).
+    #[arg(long = "perf-basic-prof", alias = "perf_basic_prof", global = true)]
+    perf_basic_prof: bool,
+
     /// Let a script require the engine's `internal/*` modules
     /// (Node's `--expose-internals`).
     #[arg(long = "expose-internals", alias = "expose_internals", global = true)]
@@ -951,6 +956,7 @@ async fn main() -> ExitCode {
     });
     execution.set_process_title(cli.title.clone());
     execution.set_expose_gc(cli.expose_gc);
+    execution.set_perf_map(cli.perf_basic_prof);
     execution.set_expose_internals(cli.expose_internals);
     execution.set_stack_size(cli.stack_size);
     // A node-style switch is accepted in both spellings; `process.execArgv`

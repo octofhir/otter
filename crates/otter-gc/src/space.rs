@@ -46,6 +46,10 @@ pub const MAX_NEW_SPACE_PAGES: usize = 64;
 pub struct NewSpace {
     from: Vec<Page>,
     to: Vec<Page>,
+    /// Cage offsets of the from-space bodies whose type has a reclamation
+    /// hook. A scavenge visits only these to reclaim the dead ones, never
+    /// the dead cells around them.
+    cleanup: Vec<u32>,
     /// Page index inside `from` currently being bump-allocated.
     active: usize,
     /// Maximum pages each semispace may grow to.
@@ -74,9 +78,28 @@ impl NewSpace {
         Ok(Self {
             from,
             to,
+            cleanup: Vec::new(),
             active: 0,
             max_pages,
         })
+    }
+
+    /// Track a fresh from-space body whose type has a reclamation hook.
+    #[inline]
+    pub fn track_cleanup(&mut self, offset: u32) {
+        self.cleanup.push(offset);
+    }
+
+    /// The tracked from-space bodies, leaving the list empty for a
+    /// scavenge to refill with its young survivors.
+    pub(crate) fn take_cleanup(&mut self) -> Vec<u32> {
+        std::mem::take(&mut self.cleanup)
+    }
+
+    /// Whether `offset` is tracked; only debug verification asks.
+    #[cfg(debug_assertions)]
+    pub(crate) fn tracks_cleanup(&self, offset: u32) -> bool {
+        self.cleanup.contains(&offset)
     }
 
     /// Bump-allocate `size_aligned` bytes in from-space. Returns

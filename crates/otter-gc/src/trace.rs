@@ -305,6 +305,8 @@ pub struct TraceTable {
     /// Sweep-time host-ref release hooks, `None` for every other tag.
     /// Fires before `finalize_table`.
     host_release_table: [Option<HostReleaseFn>; 256],
+    /// Whether a tag has any of the drop, finalize or host-release hooks.
+    cleanup_table: [bool; 256],
     sever_restored_table: [Option<SeverRestoredFn>; 256],
     /// Sweep-time finalizers for bodies that impl [`SafeFinalize`].
     /// `None` for every other tag. Fires *before* `drop_table`.
@@ -331,6 +333,7 @@ impl TraceTable {
             drop_table: [None; 256],
             finalize_table: [None; 256],
             host_release_table: [None; 256],
+            cleanup_table: [false; 256],
             sever_restored_table: [None; 256],
             name_table: [None; 256],
         }
@@ -417,7 +420,16 @@ impl TraceTable {
         // dead object on plain-old-data types.
         if std::mem::needs_drop::<T>() {
             self.drop_table[tag] = Some(drop_wrapper::<T>);
+            self.cleanup_table[tag] = true;
         }
+    }
+
+    /// Whether a dead body of `tag` has a reclamation hook — drop, finalize
+    /// or host release — so the young generation must track it.
+    #[inline]
+    #[must_use]
+    pub fn needs_cleanup(&self, tag: u8) -> bool {
+        self.cleanup_table[tag as usize]
     }
 
     /// Look up the trace function for a given type tag.
@@ -516,6 +528,7 @@ impl TraceTable {
             );
         }
         self.host_release_table[tag] = Some(release_wrapper::<T>);
+        self.cleanup_table[tag] = true;
     }
 
     /// Look up the restore-time sever function for a type tag. `None`
@@ -571,6 +584,7 @@ impl TraceTable {
             );
         }
         self.finalize_table[tag] = Some(finalize_wrapper::<T>);
+        self.cleanup_table[tag] = true;
     }
 
     /// Invoke the trace function for `header`, if registered.

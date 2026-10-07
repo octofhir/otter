@@ -860,8 +860,8 @@ pub(crate) fn from_elements_with_roots(
     values: impl IntoIterator<Item = Value>,
     external_visit: &mut RootSlotVisitor<'_>,
 ) -> Result<JsArray, otter_gc::OutOfMemory> {
-    let collected: Vec<Value> = values.into_iter().collect();
-    from_vec_with_roots(heap, collected, external_visit)
+    let mut collected: smallvec::SmallVec<[Value; 8]> = values.into_iter().collect();
+    from_values_with_roots(heap, &mut collected, external_visit)
 }
 
 /// Construct an array from an already materialized element vector through the
@@ -870,20 +870,19 @@ pub(crate) fn from_elements_with_roots(
 /// This is the array-literal fast boundary: bytecode/JIT callers have already
 /// copied source registers into owned storage, so taking the vector directly
 /// avoids a second transient argument container before the GC allocation.
-pub(crate) fn from_vec_with_roots(
+pub(crate) fn from_values_with_roots(
     heap: &mut GcHeap,
-    collected: Vec<Value>,
+    collected: &mut [Value],
     external_visit: &mut RootSlotVisitor<'_>,
 ) -> Result<JsArray, otter_gc::OutOfMemory> {
     let length = collected.len();
-    let mut collected = collected;
-    let slab = slab_from_values(heap, &mut collected, external_visit)?;
+    let slab = slab_from_values(heap, collected, external_visit)?;
     let mut body = ArrayBody {
         length,
         ..Default::default()
     };
     body.adopt_slab(slab, 0);
-    copy_values_into(&mut body, &collected);
+    copy_values_into(&mut body, collected);
     record_slab_contents(heap, slab, length);
     alloc_body_with_adopted_elements(heap, body, external_visit)
 }
@@ -2983,9 +2982,9 @@ mod tests {
     fn from_vec_with_roots_adopts_dense_elements() {
         let mut heap = fresh_heap();
         let mut external_visit = |_visitor: &mut dyn FnMut(*mut RawGc)| {};
-        let a = from_vec_with_roots(
+        let a = from_values_with_roots(
             &mut heap,
-            vec![
+            &mut vec![
                 Value::number_i32(0),
                 Value::number_i32(1),
                 Value::number_i32(2),

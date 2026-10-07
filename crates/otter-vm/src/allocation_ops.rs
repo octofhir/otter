@@ -298,7 +298,7 @@ impl Interpreter {
     where
         I: IntoIterator<Item = Value>,
     {
-        let elements: Vec<Value> = elements.into_iter().collect();
+        let mut elements: smallvec::SmallVec<[Value; 8]> = elements.into_iter().collect();
         let _runtime_roots_guard = self.scope_runtime_roots_guard();
         let prototype = self.current_array_prototype_override();
         let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
@@ -314,9 +314,12 @@ impl Interpreter {
                 }
             }
         };
-        let array =
-            crate::array::from_vec_with_roots(&mut self.gc_heap, elements, &mut external_visit)
-                .map_err(VmError::from)?;
+        let array = crate::array::from_values_with_roots(
+            &mut self.gc_heap,
+            &mut elements,
+            &mut external_visit,
+        )
+        .map_err(VmError::from)?;
         let array = self.register_array_prototype_override(array)?;
         Ok(array)
     }
@@ -336,7 +339,7 @@ impl Interpreter {
     where
         I: IntoIterator<Item = Value>,
     {
-        let elements: Vec<Value> = elements.into_iter().collect();
+        let mut elements: smallvec::SmallVec<[Value; 8]> = elements.into_iter().collect();
         let _runtime_roots_guard = self.scope_runtime_roots_guard();
         let prototype = self.current_array_prototype_override();
         let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
@@ -352,8 +355,11 @@ impl Interpreter {
                 }
             }
         };
-        let array =
-            crate::array::from_vec_with_roots(&mut self.gc_heap, elements, &mut external_visit)?;
+        let array = crate::array::from_values_with_roots(
+            &mut self.gc_heap,
+            &mut elements,
+            &mut external_visit,
+        )?;
         let array = self.register_array_prototype_override(array)?;
         Ok(array)
     }
@@ -747,7 +753,7 @@ impl Interpreter {
     where
         I: IntoIterator<Item = Value>,
     {
-        let elements: Vec<Value> = elements.into_iter().collect();
+        let mut elements: smallvec::SmallVec<[Value; 8]> = elements.into_iter().collect();
         let roots = self.collect_allocation_roots(stack);
         let prototype = self.current_array_prototype_override();
         let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
@@ -766,9 +772,12 @@ impl Interpreter {
                 }
             }
         };
-        let array =
-            crate::array::from_vec_with_roots(&mut self.gc_heap, elements, &mut external_visit)
-                .map_err(VmError::from)?;
+        let array = crate::array::from_values_with_roots(
+            &mut self.gc_heap,
+            &mut elements,
+            &mut external_visit,
+        )
+        .map_err(VmError::from)?;
         let array = self.register_array_prototype_override(array)?;
         Ok(array)
     }

@@ -122,8 +122,8 @@ impl LinkedBytecode {
         verified: VerifiedBytecodeModule,
         account: &ResourceAccount,
     ) -> Result<Arc<Self>, ResourceError> {
-        let bytes = (std::mem::size_of::<Self>() as u64)
-            .saturating_add(verified.module().retained_bytes());
+        let bytes =
+            (std::mem::size_of::<Self>() as u64).saturating_add(verified.module().retained_bytes());
         let lease = account.reserve_exact(ResourceClass::SourceModuleBytes, bytes)?;
         Ok(Arc::new(Self {
             verified,
@@ -769,7 +769,10 @@ impl CodeSpace {
     /// Visit every live chunk's admitted functions while the linked directory
     /// is held. The visitor must neither enter JavaScript nor mutate this code
     /// space.
-    pub(crate) fn visit_linked_functions(&self, mut visitor: impl FnMut(&otter_bytecode::Function)) {
+    pub(crate) fn visit_linked_functions(
+        &self,
+        mut visitor: impl FnMut(&otter_bytecode::Function),
+    ) {
         for chunk in self.chunks().iter() {
             let payload = chunk
                 .payload
@@ -925,8 +928,10 @@ impl CodeSpace {
 /// context (borrowed, the hot in-chunk path) or a context rebuilt from
 /// a foreign registry chunk (owned, a few `Arc` clones).
 #[derive(Debug)]
-pub(crate) enum ResolvedCtx<'a> {
+pub enum ResolvedCtx<'a> {
+    /// The admitting context itself, which owns the function.
     Ambient(&'a ExecutionContext),
+    /// A context rebuilt for the function's own chunk.
     Owned(ExecutionContext),
 }
 

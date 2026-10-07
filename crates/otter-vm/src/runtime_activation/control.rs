@@ -142,7 +142,7 @@ mod tests {
                 let mut runtime = RuntimeCall {
                     vm: NonNull::from(vm),
                     stack: NonNull::from(stack),
-                    context: context.clone(),
+                    context: crate::code_space::ResolvedCtx::Ambient(&context),
                     frame: NonNull::from(frame),
                     _exclusive: PhantomData,
                 };

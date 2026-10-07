@@ -40,7 +40,7 @@ pub use value_loads::ValueLoadRuntimeOp;
 use std::{marker::PhantomData, ptr::NonNull};
 
 use crate::{
-    ActivationStack, ActiveFrameMut, ActiveFrameRef, ExecutionContext, Interpreter, Value, VmError,
+    ActivationStack, ActiveFrameMut, ActiveFrameRef, Interpreter, Value, VmError,
     jit::VmRuntimeActivation, native_abi::Frame,
 };
 
@@ -54,7 +54,7 @@ use crate::{
 pub struct RuntimeCall<'a> {
     pub(super) vm: NonNull<Interpreter>,
     pub(super) stack: NonNull<ActivationStack>,
-    pub(super) context: ExecutionContext,
+    pub(super) context: crate::code_space::ResolvedCtx<'a>,
     pub(super) frame: NonNull<Frame>,
     _exclusive: PhantomData<&'a mut ()>,
 }
@@ -155,7 +155,7 @@ impl<'a> RuntimeCall<'a> {
             .map_err(|error| CommittedValueError::Fatal(error.into()))?;
         let vm = unsafe { &mut *self.vm.as_ptr() };
         let stack = unsafe { &mut *self.stack.as_ptr() };
-        let context = self.context.clone();
+        let context = (*self.context).clone();
         self.with_frame(|frame| {
             Ok(vm.jit_runtime_global_op(
                 &context,
@@ -186,7 +186,7 @@ impl<'a> RuntimeCall<'a> {
             .map_err(|error| CommittedValueError::Fatal(error.into()))?;
         let vm = unsafe { &mut *self.vm.as_ptr() };
         let stack = unsafe { &mut *self.stack.as_ptr() };
-        let context = self.context.clone();
+        let context = (*self.context).clone();
         self.with_frame(|frame| {
             Ok(vm.jit_runtime_delete_op(
                 &context,
@@ -227,6 +227,7 @@ impl<'a> RuntimeCall<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ExecutionContext;
     use crate::native_abi::{NativeFrameKind, VmFrameHeader};
     use otter_bytecode::{Function, Instruction, Op, Operand, SourceKind};
 

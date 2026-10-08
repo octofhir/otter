@@ -66,7 +66,7 @@ pub(crate) fn emit_inline_identity(
         ; b.eq =>guarded
         ; cbz x9, =>bail
     );
-    emit_cell_test(ops, 9, 10, CellTest::IsNotCell, bail);
+    emit_cell_test(ops, 9, CellTest::IsNotCell, bail);
     dynasm!(ops
         ; .arch aarch64
         // Heap-cell Values already carry the full pointer. No cage relocation

@@ -88,7 +88,7 @@ fn emit_cell_store(
     };
     let primitive = ops.new_dynamic_label();
     emit_load_reg(ops, 9, source)?;
-    emit_cell_test(ops, 9, 11, CellTest::IsNotCell, primitive);
+    emit_cell_test(ops, 9, CellTest::IsNotCell, primitive);
     store(ops);
     emit_write_barrier(ops, relocations, view, parent, 9);
     dynasm!(ops

@@ -236,7 +236,7 @@ fn emit_method(
     dynasm!(ops ; .arch aarch64 ; =>label);
     emit_load_handlers(ops, relocations, view, loaded, miss);
     dynasm!(ops ; .arch aarch64 ; =>loaded);
-    emit_cell_test(ops, 0, 16, CellTest::IsNotCell, miss);
+    emit_cell_test(ops, 0, CellTest::IsNotCell, miss);
     dynasm!(ops ; .arch aarch64
         ; cbz x0, =>miss
         ; ldrb w16, [x0]
@@ -298,7 +298,7 @@ fn emit_store(
         ; mov w16, w11
         ; =>barriers);
     super::ic_probe::emit_property_transition_shape_barrier(ops, relocations, view, 20);
-    emit_cell_test(ops, STORE_VALUE, 11, CellTest::IsNotCell, primitive);
+    emit_cell_test(ops, STORE_VALUE, CellTest::IsNotCell, primitive);
     super::values::emit_write_barrier(ops, relocations, view, STORE_RECEIVER, STORE_VALUE);
     dynasm!(ops ; .arch aarch64
         ; =>primitive

@@ -116,7 +116,7 @@ pub(super) fn emit_load_closure_context(
     let no_context = ops.new_dynamic_label();
     let done = ops.new_dynamic_label();
     dynasm!(ops ; .arch aarch64 ; ldr x9, [x21, NATIVE_FRAME_SELF_OFFSET]);
-    emit_cell_test(ops, 9, 10, CellTest::IsNotCell, no_context);
+    emit_cell_test(ops, 9, CellTest::IsNotCell, no_context);
     dynasm!(ops
         ; .arch aarch64
         ; ldrb w10, [x9]
@@ -202,7 +202,7 @@ fn emit_store_into_target(
         emit_load_u64(ops, 12, u64::from(offset));
         dynasm!(ops ; .arch aarch64 ; str x9, [x13, x12]);
     }
-    emit_cell_test(ops, 9, 11, CellTest::IsNotCell, done);
+    emit_cell_test(ops, 9, CellTest::IsNotCell, done);
     emit_write_barrier(ops, relocations, view, 13, 9);
     dynasm!(ops ; .arch aarch64 ; b =>done);
     Ok(())

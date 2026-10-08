@@ -67,7 +67,7 @@ pub(crate) fn emit_select_entry(
     let scan = ops.new_dynamic_label();
     let found = ops.new_dynamic_label();
     let keyed = ops.new_dynamic_label();
-    emit_cell_test(ops, receiver, 16, CellTest::IsNotCell, miss);
+    emit_cell_test(ops, receiver, CellTest::IsNotCell, miss);
     dynasm!(ops ; .arch aarch64
         ; cbz X(receiver), =>miss
         ; ldrb w16, [X(receiver)]

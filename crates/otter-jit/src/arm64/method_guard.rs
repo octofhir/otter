@@ -151,7 +151,7 @@ pub(crate) fn emit_method_guard_from_tagged_register(
         ; b.eq =>guarded
         ; cbz X(callable_register), =>bail
     );
-    emit_cell_test(ops, callable_register, 10, CellTest::IsNotCell, bail);
+    emit_cell_test(ops, callable_register, CellTest::IsNotCell, bail);
     dynasm!(ops
         ; .arch aarch64
         ; ldrb w11, [X(callable_register)]

@@ -29,7 +29,7 @@ pub(crate) fn emit_unbox_bigint64(ops: &mut Assembler, value: u8, scratch: u8, s
     let positive = ops.new_dynamic_label();
     let done = ops.new_dynamic_label();
     dynasm!(ops ; .arch aarch64 ; cbz X(value), =>slow);
-    emit_cell_test(ops, value, scratch, CellTest::IsNotCell, slow);
+    emit_cell_test(ops, value, CellTest::IsNotCell, slow);
     dynasm!(ops
         ; .arch aarch64
         ; ldrb W(scratch), [X(value)]

@@ -31,7 +31,7 @@ pub(super) fn emit_context_guard(
         emit_load_u64(ops, regs.size, VALUE_UNDEFINED);
         dynasm!(ops ; .arch aarch64 ; cmp X(regs.scratch), X(regs.size) ; b.eq =>ready);
     }
-    emit_cell_test(ops, regs.scratch, regs.size, CellTest::IsNotCell, slow);
+    emit_cell_test(ops, regs.scratch, CellTest::IsNotCell, slow);
     dynasm!(ops ; .arch aarch64 ; ldrb W(regs.size), [X(regs.scratch)] ; cmp WSP(regs.size), u32::from(view.context_layout.type_tag) ; b.ne =>slow ; =>ready);
 }
 

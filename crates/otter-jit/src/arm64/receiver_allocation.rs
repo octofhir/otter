@@ -76,7 +76,7 @@ pub(crate) fn emit_receiver_guards(
     );
     let closure = ops.new_dynamic_label();
     let prototype_ready = ops.new_dynamic_label();
-    emit_cell_test(ops, 2, 11, CellTest::IsNotCell, guard_miss);
+    emit_cell_test(ops, 2, CellTest::IsNotCell, guard_miss);
     emit_symbol(
         ops,
         relocations,
@@ -102,7 +102,7 @@ pub(crate) fn emit_receiver_guards(
     );
     let target_ready = ops.new_dynamic_label();
     dynasm!(ops ; .arch aarch64 ; cmp x14, x11 ; b.eq =>target_ready);
-    emit_cell_test(ops, 14, 11, CellTest::IsNotCell, guard_miss);
+    emit_cell_test(ops, 14, CellTest::IsNotCell, guard_miss);
     dynasm!(ops ; .arch aarch64
         ; ldrb w11, [x14] ; cmp w11, JS_CLOSURE_BODY_TYPE_TAG as u32 ; b.ne =>guard_miss
         ; ldr w11, [x14, view.closure_call_layout.function_id_byte]
@@ -134,7 +134,7 @@ pub(crate) fn emit_receiver_guards(
         ; add x17, x12, x17
         ; ldr x4, [x17, view.closure_call_layout.prototype_byte]
     );
-    emit_cell_test(ops, 4, 11, CellTest::IsNotCell, guard_miss);
+    emit_cell_test(ops, 4, CellTest::IsNotCell, guard_miss);
     dynasm!(ops ; .arch aarch64
         ; ldrb w14, [x4] ; cmp w14, OBJECT_BODY_TYPE_TAG ; b.ne =>guard_miss
         ; mov w4, w4

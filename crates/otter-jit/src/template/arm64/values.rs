@@ -165,22 +165,21 @@ pub(crate) enum CellTest {
 /// Branch to `target` when `X(value)`'s cell-ness matches `test`.
 ///
 /// A boxed `Value` is a heap cell exactly when it carries neither the number
-/// tag nor the immediate tag, so the whole test is one mask and one `tst`. The
-/// scratch register is explicit because callers hold live values in different
-/// places; the mask is materialized rather than written as a logical immediate
-/// because `dynasm` accepts one only against a literal register.
-pub(crate) fn emit_cell_test(
-    ops: &mut Assembler,
-    value: u8,
-    scratch: u8,
-    test: CellTest,
-    target: DynamicLabel,
-) {
-    emit_load_u64(ops, scratch, otter_vm::value::tag::NOT_CELL_MASK);
-    dynasm!(ops ; .arch aarch64 ; tst X(value), X(scratch));
+/// tag nor the immediate tag. The mask is a high run plus bit 1, so the test
+/// is one logical-immediate `tst` and one bit test, with no scratch register.
+pub(crate) fn emit_cell_test(ops: &mut Assembler, value: u8, test: CellTest, target: DynamicLabel) {
+    const _: () = assert!(otter_vm::value::tag::NOT_CELL_MASK == 0xfffe_0000_0000_0002);
     match test {
-        CellTest::IsCell => dynasm!(ops ; .arch aarch64 ; b.eq =>target),
-        CellTest::IsNotCell => dynasm!(ops ; .arch aarch64 ; b.ne =>target),
+        CellTest::IsCell => {
+            let not_cell = ops.new_dynamic_label();
+            dynasm!(ops ; .arch aarch64
+                ; tst X(value), #0xfffe_0000_0000_0000 ; b.ne =>not_cell
+                ; tbz X(value), #1, =>target
+                ; =>not_cell);
+        }
+        CellTest::IsNotCell => dynasm!(ops ; .arch aarch64
+            ; tst X(value), #0xfffe_0000_0000_0000 ; b.ne =>target
+            ; tbnz X(value), #1, =>target),
     }
 }
 
@@ -581,7 +580,7 @@ pub(crate) fn emit_html_dda_candidate_exit(
     exit: DynamicLabel,
 ) {
     let fall_through = ops.new_dynamic_label();
-    emit_cell_test(ops, value, scratch_a, CellTest::IsNotCell, fall_through);
+    emit_cell_test(ops, value, CellTest::IsNotCell, fall_through);
     // A cell value is its header's full address.
     dynasm!(ops ; .arch aarch64 ; ldrb W(scratch_b), [X(value)]);
     emit_load_u64(

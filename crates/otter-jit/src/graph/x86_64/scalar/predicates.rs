@@ -4,6 +4,7 @@
 //! - Numeric and identity strict equality, with content comparison in the VM.
 //! - Immediate/int32 truthiness and total leaf handling for other values.
 //! - Shared truthiness branches for Graph control.
+//! - `typeof` tests through the VM's total leaf probe.
 //!
 //! # Invariants
 //! - Inputs remain intact until the final tagged boolean is committed.
@@ -42,6 +43,11 @@ impl<'a> Codegen<'a> {
                 let dst = Self::gp(self.loc(node).result.unwrap());
                 let double = self.loc(node).fp_temps[0];
                 self.emit_strict_equal(node, a, b, double, dst, negate);
+            }
+            Kind::TestTypeOf { test } => {
+                let value = Self::gp(self.loc(node).inputs[0]);
+                let dst = Self::gp(self.loc(node).result.unwrap());
+                self.emit_test_typeof(node, value, dst, test);
             }
             _ => return Ok(false),
         }
@@ -187,6 +193,28 @@ impl<'a> Codegen<'a> {
     }
 
     #[allow(clippy::too_many_arguments)]
+    /// `Rq(dst)` = `typeof Rq(value)` compared with the encoded
+    /// `TypeOfTest`, as the leaf probe decides it. The probe reads the cell
+    /// and allocates nothing; its only miss is a null heap, which generated
+    /// code never passes.
+    fn emit_test_typeof(&mut self, node: NodeId, value: u8, dst: u8, test: i32) {
+        let live = self.loc(node).live_registers.clone();
+        let saved = self.emit_save_registers(&live);
+        dynasm!(self.ops ; .arch x64
+            ; mov rsi, Rq(value)
+            ; mov rdi, [r15 + crate::entry::THREAD_OFFSET as i32]
+            ; mov rdi, [rdi + crate::entry::VM_THREAD_GC_HEAP_OFFSET as i32]
+        );
+        self.load_immediate(2, u64::from(test as u32));
+        self.emit_scalar_vm_leaf(
+            abi::STUB_TYPEOF_TEST_LEAF,
+            otter_vm::runtime_stubs::TYPEOF_TEST_LEAF.entry_addr() as u64,
+        );
+        dynasm!(self.ops ; .arch x64 ; mov r10, rax);
+        self.emit_restore_registers(&live, saved);
+        dynasm!(self.ops ; .arch x64 ; mov Rq(dst), r10);
+    }
+
     fn defer_predicate_leaf(
         &mut self,
         node: NodeId,

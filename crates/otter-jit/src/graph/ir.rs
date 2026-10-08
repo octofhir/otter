@@ -286,6 +286,13 @@ pub(crate) enum Kind {
     ToBoolean,
     /// `!ToBoolean` producing a tagged boolean.
     LogicalNot,
+    /// `typeof input0 === kind` (or `!==`), the encoded
+    /// [`otter_bytecode::TypeOfTest`], producing a tagged boolean: decided
+    /// from the value bits and the cell's type tag, with a leaf probe for
+    /// the cells only the heap decides (V8's `TestTypeOf`).
+    TestTypeOf {
+        test: i32,
+    },
 
     // ---- Checks ----
     /// Eager deopt unless input0 is a Number.
@@ -566,6 +573,7 @@ impl Kind {
                 | Self::StrictEqual { .. }
                 | Self::ToBoolean
                 | Self::LogicalNot
+                | Self::TestTypeOf { .. }
         )
     }
 
@@ -617,6 +625,7 @@ impl Kind {
             | Self::StrictEqual { .. }
             | Self::ToBoolean
             | Self::LogicalNot
+            | Self::TestTypeOf { .. }
             | Self::LoadOwnField(_)
             | Self::LoadTaggedField(_)
             | Self::LoadContextParent
@@ -974,6 +983,13 @@ impl Kind {
                 result: ResultPolicy::Register,
                 gp_temps: 0,
                 fp_temps: 1,
+                fixed_gp_clobbers: SmallVec::new(),
+            },
+            Self::TestTypeOf { .. } => Constraints {
+                inputs: registers(1),
+                result: ResultPolicy::Register,
+                gp_temps: 1,
+                fp_temps: 0,
                 fixed_gp_clobbers: SmallVec::new(),
             },
             Self::Float64Mod => Constraints {

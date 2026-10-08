@@ -1,6 +1,6 @@
 // Property runtime handles must survive nested scopes and abrupt reentry.
 const prototype = { x: undefined };
-// Keep this handle-scope test on the runtime IC even after native tier-up.
+// The prototype also carries a symbol-keyed property.
 prototype[Symbol("runtime-only sidecar")] = true;
 function copyProperty(source, target) {
   target.x = source.x;

@@ -147,13 +147,28 @@ fn bank(
     base: u8,
     miss: DynamicLabel,
 ) {
+    dynasm!(ops ; .arch aarch64
+        ; and x16, X(holder), #0xffff_ffff_0000_0000
+        ; ldr w17, [X(holder), view.object_shape_byte] ; add x17, x16, x17);
+    bank_of_shape(ops, view, holder, 17, slot, base, miss);
+}
+
+/// [`bank`] of `holder` whose current shape's address is already in `shape`.
+fn bank_of_shape(
+    ops: &mut Assembler,
+    view: &JitCompileSnapshot,
+    holder: u8,
+    shape: u8,
+    slot: u8,
+    base: u8,
+    miss: DynamicLabel,
+) {
     let inline = ops.new_dynamic_label();
     let ready = ops.new_dynamic_label();
     dynasm!(ops ; .arch aarch64
-        ; and x16, X(holder), #0xffff_ffff_0000_0000
-        ; ldr w17, [X(holder), view.object_shape_byte] ; add x17, x16, x17
-        ; ldrb w17, [x17, view.shape_inline_capacity_byte]
+        ; ldrb w17, [X(shape), view.shape_inline_capacity_byte]
         ; cmp W(slot), w17 ; b.lo =>inline ; sub W(slot), W(slot), w17
+        ; and x16, X(holder), #0xffff_ffff_0000_0000
         ; ldr W(base), [X(holder), view.field_layout.slab_handle_byte] ; cbz W(base), =>miss
         ; add X(base), x16, X(base) ; ldr w16, [X(base), view.field_layout.slab_capacity_byte]
         ; cmp W(slot), w16 ; b.hs =>miss
@@ -194,7 +209,6 @@ pub(crate) fn emit_load(
         miss,
     );
     let own = ops.new_dynamic_label();
-    let held = ops.new_dynamic_label();
     let absent = ops.new_dynamic_label();
     let undefined = ops.new_dynamic_label();
     let done = ops.new_dynamic_label();
@@ -211,9 +225,7 @@ pub(crate) fn emit_load(
         ; ldr W(holder), [x16, view.shape_prototype_byte] ; cbz W(holder), =>miss
         ; add X(holder), x17, X(holder)
         ; ldrb w16, [X(holder)] ; cmp w16, #OBJECT_BODY_TYPE_TAG ; b.ne =>miss
-        ; b =>held
-        ; =>own ; mov X(holder), X(receiver)
-        ; =>held ; ldr W(base), [X(holder), view.object_shape_byte]
+        ; ldr W(base), [X(holder), view.object_shape_byte]
         ; ldr w16, [X(entry), cache.holder_shape_byte] ; cbz w16, =>miss
         ; cmp W(base), w16 ; b.ne =>miss
         ; and x17, X(holder), #0xffff_ffff_0000_0000
@@ -228,7 +240,14 @@ pub(crate) fn emit_load(
         ; ldr x16, [X(base), cache.shape_id_byte]
         ; ldr x17, [X(entry), cache.holder_shape_id_byte] ; cmp x16, x17 ; b.ne =>miss
         ; ldrh W(slot), [X(entry), cache.load_slot_byte]);
-    bank(ops, view, holder, slot, base, miss);
+    bank_of_shape(ops, view, holder, base, slot, base, miss);
+    dynasm!(ops ; .arch aarch64
+        ; ldr X(destination), [X(base), X(slot), lsl #otter_vm::object::FieldLocation::INDEX_SHIFT]
+        ; b =>done
+        // The matched key already proved the receiver's exact shape, whose
+        // address `key` left in the holder temporary.
+        ; =>own ; ldrh W(slot), [X(entry), cache.load_slot_byte]);
+    bank_of_shape(ops, view, receiver, holder, slot, base, miss);
     dynasm!(ops ; .arch aarch64
         ; ldr X(destination), [X(base), X(slot), lsl #otter_vm::object::FieldLocation::INDEX_SHIFT]
         ; b =>done
@@ -299,7 +318,7 @@ pub(crate) fn emit_store(
         ; ldr W(slot), [X(entry), cache.target_shape_byte]
         ; str W(slot), [X(receiver), view.object_shape_byte] ; b =>done
         ; =>own ; ldrh W(slot), [X(entry), cache.store_slot_byte]);
-    bank(ops, view, receiver, slot, base, miss);
+    bank_of_shape(ops, view, receiver, holder, slot, base, miss);
     dynasm!(ops ; .arch aarch64
         ; str X(value), [X(base), X(slot), lsl #otter_vm::object::FieldLocation::INDEX_SHIFT]
         ; mov W(slot), wzr ; =>done);

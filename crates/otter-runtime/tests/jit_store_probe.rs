@@ -57,7 +57,10 @@ fn property_handles_survive_nested_and_abrupt_reentry() {
             .expect("nested and abrupt property reentry");
         assert_eq!(result.completion_string(), "[16,12,7,66]", "{selection:?}");
         if selection != JitSelection::InterpreterOnly {
-            assert!(runtime.execution_stats().jit_runtime_property_stubs > 1000);
+            // Each of the 16 rounds reads an accessor and stores through one,
+            // which only the runtime IC completes.
+            let stubs = runtime.execution_stats().jit_runtime_property_stubs;
+            assert!(stubs >= 32, "{selection:?}: {stubs} runtime property stubs");
         }
     }
 }

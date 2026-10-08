@@ -300,7 +300,9 @@ pub(crate) enum Kind {
     /// Eager deopt unless input0 is an ordinary object with one of the
     /// shape handles (compressed offsets) and no object-local state
     /// overriding its slots; `writable` also requires that the object is
-    /// not a prototype (whose slot writes must invalidate dependents).
+    /// not a prototype (whose slot writes must invalidate dependents), which
+    /// its shapes already prove: they come from store handlers, which no
+    /// prototype shape receives, and a shape's state never changes.
     CheckShapes {
         shapes: SmallVec<[u32; 4]>,
         writable: bool,

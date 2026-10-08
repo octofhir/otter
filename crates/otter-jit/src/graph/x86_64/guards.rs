@@ -43,7 +43,11 @@ impl Codegen<'_> {
                 self.load_immediate(10, tag::NUMBER_TAG);
                 dynasm!(self.ops ; .arch x64 ; test Rq(input(0)), r10 ; jz =>exit);
             }
-            Kind::CheckShapes { shapes, writable } => {
+            // A writable site's shapes come from store handlers, which no
+            // prototype shape receives; a shape's state never changes, and
+            // this code keeps its shapes alive, so an exact match proves the
+            // receiver's role too.
+            Kind::CheckShapes { shapes, .. } => {
                 let exit = self.eager_exit(node, DeoptReason::WrongShape);
                 self.emit_object_receiver(input(0), exit);
                 let matched = self.ops.new_dynamic_label();
@@ -57,10 +61,6 @@ impl Codegen<'_> {
                     dynasm!(self.ops ; .arch x64 ; cmp r10d, shape as i32 ; je =>matched);
                 }
                 dynasm!(self.ops ; .arch x64 ; jmp =>exit ; =>matched);
-                if writable {
-                    self.emit_shape_state(input(0));
-                    dynasm!(self.ops ; .arch x64 ; test r10b, ShapeState::PROTOTYPE_MASK as i8 ; jnz =>exit);
-                }
             }
             Kind::CheckBounds => {
                 let exit = self.eager_exit(node, DeoptReason::OutOfBounds);

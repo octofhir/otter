@@ -155,6 +155,15 @@ enum HeapFact {
     Field(NodeId),
 }
 
+/// One bytecode loop of the compilation: its header block in the body
+/// it belongs to, the compiled function's own (`origin` 0) or an inlined
+/// one (the body's `Graph::inlined` origin).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct LoopKey {
+    origin: u16,
+    header: usize,
+}
+
 /// How a loop header treats the heap facts of its entry.
 #[derive(Debug, Clone, Default)]
 struct LoopPolicy {
@@ -430,15 +439,18 @@ struct Builder<'a> {
     /// Eager frame states already built, by PC.
     eager_states: FxHashMap<u32, FrameStateId>,
     /// How each loop header treats the heap facts of its entry.
-    policies: &'a FxHashMap<usize, LoopPolicy>,
+    policies: &'a FxHashMap<LoopKey, LoopPolicy>,
     /// Heap facts each loop header assumes for its whole body.
-    assumptions: FxHashMap<usize, Vec<(FactKey, HeapFact)>>,
+    assumptions: FxHashMap<LoopKey, Vec<(FactKey, HeapFact)>>,
     /// Loops whose body may write the heap through a call.
-    effectful: FxHashSet<usize>,
+    effectful: FxHashSet<LoopKey>,
     /// Per loop header, the assumed facts a back edge arrived without.
-    failed: FxHashMap<usize, FxHashSet<FactKey>>,
-    /// The loops each bytecode block lies in.
-    enclosing: Vec<SmallVec<[usize; 2]>>,
+    failed: FxHashMap<LoopKey, FxHashSet<FactKey>>,
+    /// The loops each bytecode block lies in: its own body's and, in an
+    /// inlined body, every loop around the call it runs for.
+    enclosing: Vec<SmallVec<[LoopKey; 2]>>,
+    /// Finished loops of the inlined bodies built so far.
+    inline_loop_headers: Vec<LoopHeader>,
     pc: u32,
     undefined: NodeId,
     /// The inlined call the body being visited runs for; `None` in the
@@ -471,8 +483,6 @@ struct InlineFrame {
     /// links to.
     caller: InlineCaller,
     depth: u8,
-    /// Loops of the compiled function around the outermost inlined call.
-    loops: SmallVec<[usize; 2]>,
     /// The caller's block the body's returns jump to.
     continuation: BlockId,
     /// Each return: its block, its value and the facts that hold there.
@@ -498,7 +508,7 @@ struct Scope<'a> {
     current_bytecode_block: usize,
     frame: Vec<NodeId>,
     eager_states: FxHashMap<u32, FrameStateId>,
-    enclosing: Vec<SmallVec<[usize; 2]>>,
+    enclosing: Vec<SmallVec<[LoopKey; 2]>>,
     pc: u32,
     inline: Option<Box<InlineFrame>>,
 }
@@ -515,7 +525,7 @@ pub(crate) fn build(
     baseline: &'_ super::BaselineSupport,
     osr_pc: Option<u32>,
 ) -> Result<Built, BuildError> {
-    let mut policies: FxHashMap<usize, LoopPolicy> = FxHashMap::default();
+    let mut policies: FxHashMap<LoopKey, LoopPolicy> = FxHashMap::default();
     loop {
         let BuildPass {
             built,
@@ -544,9 +554,9 @@ pub(crate) fn build(
 struct BuildPass {
     built: Built,
     /// Loops whose body calls out.
-    effectful: FxHashSet<usize>,
+    effectful: FxHashSet<LoopKey>,
     /// Per loop header, the assumed facts a back edge arrived without.
-    failed: FxHashMap<usize, FxHashSet<FactKey>>,
+    failed: FxHashMap<LoopKey, FxHashSet<FactKey>>,
 }
 
 fn build_once(
@@ -554,7 +564,7 @@ fn build_once(
     analysis: &Rc<Analysis>,
     baseline: &'_ super::BaselineSupport,
     osr_pc: Option<u32>,
-    policies: &FxHashMap<usize, LoopPolicy>,
+    policies: &FxHashMap<LoopKey, LoopPolicy>,
 ) -> Result<BuildPass, BuildError> {
     let code = view.code_block.as_ref();
     let register_count = code.register_count;
@@ -587,15 +597,8 @@ fn build_once(
         assumptions: FxHashMap::default(),
         effectful: FxHashSet::default(),
         failed: FxHashMap::default(),
-        enclosing: {
-            let mut enclosing = vec![SmallVec::new(); block_count];
-            for (&header, info) in &analysis.loops {
-                for &block in &info.body {
-                    enclosing[block].push(header);
-                }
-            }
-            enclosing
-        },
+        enclosing: loop_nesting(analysis, 0, &[]),
+        inline_loop_headers: Vec::new(),
         pc: 0,
         undefined,
         inline: None,
@@ -622,7 +625,9 @@ fn build_once(
     layout.extend(builder.build_body());
     builder.finish_loops();
     remove_trivial_phis(&mut builder.graph, &layout);
-    let loop_headers = builder.loop_headers();
+    let mut loop_headers = builder.loop_headers();
+    loop_headers.append(&mut builder.inline_loop_headers);
+    loop_headers.sort_by_key(|header| header.block);
     Ok(BuildPass {
         built: Built {
             graph: builder.graph,
@@ -634,6 +639,20 @@ fn build_once(
         effectful: builder.effectful,
         failed: builder.failed,
     })
+}
+
+/// The loops each bytecode block of a body lies in: the body's own loops,
+/// keyed by its `origin`, then `outer`, every loop around the call an
+/// inlined body runs for.
+fn loop_nesting(analysis: &Analysis, origin: u16, outer: &[LoopKey]) -> Vec<SmallVec<[LoopKey; 2]>> {
+    let mut enclosing: Vec<SmallVec<[LoopKey; 2]>> =
+        vec![outer.iter().copied().collect(); analysis.blocks.len()];
+    for (&header, info) in &analysis.loops {
+        for &block in &info.body {
+            enclosing[block].push(LoopKey { origin, header });
+        }
+    }
+    enclosing
 }
 
 /// The BigInt operator a binary opcode names.
@@ -930,14 +949,11 @@ impl<'a> Builder<'a> {
         self.inline_views.push(body.clone());
         let origin = self.graph.inlined.len() as u16;
         let continuation = self.graph.new_block();
-        let loops = match &self.inline {
-            Some(inline) => inline.loops.clone(),
-            None => self
-                .enclosing
-                .get(self.current_bytecode_block)
-                .cloned()
-                .unwrap_or_default(),
-        };
+        let loops = self
+            .enclosing
+            .get(self.current_bytecode_block)
+            .cloned()
+            .unwrap_or_default();
         let depth = self.inline.as_ref().map_or(0, |inline| inline.depth) + 1;
         let block_count = analysis.blocks.len();
         let mut block_map = vec![BlockId(u32::MAX); block_count];
@@ -950,6 +966,7 @@ impl<'a> Builder<'a> {
         for (slot, &argument) in frame.iter_mut().zip(arguments).take(params) {
             *slot = argument;
         }
+        let enclosing = loop_nesting(&analysis, origin, &loops);
         let mut scope = Scope {
             view: body,
             analysis: Rc::new(analysis),
@@ -962,7 +979,7 @@ impl<'a> Builder<'a> {
             current_bytecode_block: usize::MAX,
             frame,
             eager_states: FxHashMap::default(),
-            enclosing: vec![SmallVec::new(); block_count],
+            enclosing,
             pc: 0,
             inline: Some(Box::new(InlineFrame {
                 caller: InlineCaller {
@@ -973,7 +990,6 @@ impl<'a> Builder<'a> {
                     new_target,
                 },
                 depth,
-                loops,
                 continuation,
                 returns: Vec::new(),
                 receiver,
@@ -988,12 +1004,25 @@ impl<'a> Builder<'a> {
         // The caller's block jumps to the callee's first block.
         self.goto(0);
         let layout = self.build_body();
+        let inline_loop_headers = self.inline_loop_headers.len();
+        if !self.inline.as_ref().is_some_and(|inline| inline.abandoned) {
+            self.finish_loops();
+            let mut headers = self.loop_headers();
+            self.inline_loop_headers.append(&mut headers);
+        }
         self.swap_scope(&mut scope);
         self.graph.origin = caller_origin;
         self.graph.position = caller_position;
         let frame = scope.inline.take().expect("the callee's inline frame");
         if frame.abandoned {
             self.inlined_bytes -= bytes;
+            // Loops of the abandoned body, and of bodies spliced into it,
+            // go with it; their origins are reused.
+            self.inline_loop_headers.truncate(inline_loop_headers);
+            let kept = |key: &LoopKey| key.origin < origin;
+            self.assumptions.retain(|key, _| kept(key));
+            self.effectful.retain(kept);
+            self.failed.retain(|key, _| kept(key));
             self.graph.rollback(checkpoint);
             self.inline_views.truncate(views);
             // States built since the checkpoint are gone; their ids return.
@@ -1169,14 +1198,17 @@ impl<'a> Builder<'a> {
         }
         if is_loop {
             known.forget_storage();
-            match self.policies.get(&block) {
+            let key = self.loop_key(block);
+            match self.policies.get(&key) {
                 Some(policy) if policy.clobber => known.clobber_heap(),
                 Some(policy) => known.forget(&policy.dropped),
                 None => {}
             }
-            self.assumptions.insert(block, known.heap_facts());
+            self.assumptions.insert(key, known.heap_facts());
         }
+        // The OSR entry lies in the compiled function's own body.
         let encloses_osr = is_loop
+            && self.inline.is_none()
             && self.osr_header.is_some_and(|header| {
                 header != block && self.analysis.loops[&block].body.contains(&header)
             });
@@ -1269,10 +1301,11 @@ impl<'a> Builder<'a> {
         self.box_live_registers(&live);
         let target_block = self.block_map[target];
         if back_edge {
-            if let Some(assumed) = self.assumptions.get(&target) {
+            let key = self.loop_key(target);
+            if let Some(assumed) = self.assumptions.get(&key) {
                 let broken: Vec<FactKey> = self.known.broken(assumed).collect();
                 if !broken.is_empty() {
-                    self.failed.entry(target).or_default().extend(broken);
+                    self.failed.entry(key).or_default().extend(broken);
                 }
             }
             let phis = self.loop_phis[&target].clone();
@@ -1484,12 +1517,17 @@ impl<'a> Builder<'a> {
     /// the current block one that writes the heap.
     fn clobber_heap(&mut self) {
         self.known.clobber_heap();
-        let loops = match &self.inline {
-            Some(inline) => Some(&inline.loops),
-            None => self.enclosing.get(self.current_bytecode_block),
-        };
-        if let Some(loops) = loops {
+        if let Some(loops) = self.enclosing.get(self.current_bytecode_block) {
             self.effectful.extend(loops.iter().copied());
+        }
+    }
+
+    /// The key of the loop headed by bytecode block `header` of the body
+    /// being visited.
+    fn loop_key(&self, header: usize) -> LoopKey {
+        LoopKey {
+            origin: self.graph.origin,
+            header,
         }
     }
 

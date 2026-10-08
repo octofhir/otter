@@ -102,6 +102,9 @@ pub(crate) struct NodeInfo {
     pub(crate) heap_object: bool,
     /// The value is proved to be a Number.
     pub(crate) number: bool,
+    /// The value is proved to be an ordinary object cell by an earlier
+    /// shape check; what kind of cell a value is never changes.
+    pub(crate) ordinary_object: bool,
 }
 
 /// What is known about one object's layout along the current path, until a
@@ -232,6 +235,7 @@ impl Known {
             }
             info.heap_object &= theirs.heap_object;
             info.number &= theirs.number;
+            info.ordinary_object &= theirs.ordinary_object;
             *info != NodeInfo::default()
         });
         self.layouts.retain(|node, layout| {
@@ -2761,10 +2765,15 @@ impl<'a> Builder<'a> {
         {
             return;
         }
+        let object_proved = self
+            .known
+            .get(object)
+            .is_some_and(|info| info.ordinary_object);
         self.add(
             Kind::CheckShapes {
                 shapes: shapes.clone(),
                 writable,
+                object_proved,
             },
             &[object],
             Repr::None,
@@ -2772,7 +2781,9 @@ impl<'a> Builder<'a> {
         let layout = self.known.layout_entry(object);
         layout.shapes = Some(shapes.clone());
         layout.writable = writable;
-        self.known.entry(object).heap_object = true;
+        let info = self.known.entry(object);
+        info.heap_object = true;
+        info.ordinary_object = true;
     }
 
     // ------------------------------------------------------------------

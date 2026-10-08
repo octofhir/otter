@@ -362,12 +362,14 @@ pub(crate) fn parse_with_roots(
     external_visit: &mut RootSlotVisitor<'_>,
     object_proto: Option<Value>,
 ) -> Result<Value, ParseError> {
-    let mut prototype = object_proto.unwrap_or_else(Value::null);
+    // The collector rewrites the rooted slot through its address; readers
+    // share it as a `Cell` so no reference assumes it stays unchanged.
+    let prototype = std::cell::Cell::new(object_proto.unwrap_or_else(Value::null));
     let mut roots = otter_gc::RootScope::new(gc_heap);
     // SAFETY: the canonical prototype slot precedes the guard and remains
     // stationary through every string/container allocation and root lookup.
     unsafe {
-        roots.add_value(&mut prototype);
+        roots.add_value(&mut *prototype.as_ptr());
     }
     let bytes = text.as_bytes();
     let mut cursor = Cursor { bytes, pos: 0 };
@@ -421,7 +423,7 @@ fn read_value(
     cursor: &mut Cursor<'_>,
     gc_heap: &mut otter_gc::GcHeap,
     external_visit: &mut RootSlotVisitor<'_>,
-    object_proto: &Value,
+    object_proto: &std::cell::Cell<Value>,
 ) -> Result<Value, ParseError> {
     let mut stack: Vec<Builder> = Vec::with_capacity(8);
     let result = read_step(cursor, &mut stack, gc_heap, external_visit, object_proto)?;
@@ -448,7 +450,7 @@ fn read_step(
     stack: &mut Vec<Builder>,
     gc_heap: &mut otter_gc::GcHeap,
     external_visit: &mut RootSlotVisitor<'_>,
-    object_proto: &Value,
+    object_proto: &std::cell::Cell<Value>,
 ) -> Result<Value, ParseError> {
     cursor.skip_ws();
     let b = cursor
@@ -554,7 +556,7 @@ fn continue_container(
     just_read: Value,
     gc_heap: &mut otter_gc::GcHeap,
     external_visit: &mut RootSlotVisitor<'_>,
-    object_proto: &Value,
+    object_proto: &std::cell::Cell<Value>,
 ) -> Result<Value, ParseError> {
     let frame = stack.last_mut().expect("non-empty stack");
     match frame {
@@ -654,7 +656,7 @@ fn finish_builder(
     gc_heap: &mut otter_gc::GcHeap,
     pos: usize,
     external_visit: &mut RootSlotVisitor<'_>,
-    object_proto: &Value,
+    object_proto: &std::cell::Cell<Value>,
 ) -> Result<Value, ParseError> {
     match builder {
         Builder::Array {
@@ -697,7 +699,7 @@ fn finish_builder(
             // an own `"__proto__"` stays a data property.
             let root = crate::object::root_for_prototype(
                 gc_heap,
-                object_proto.as_object(),
+                object_proto.get().as_object(),
                 crate::object::ShapeState::ORDINARY,
                 &mut roots,
             )?;

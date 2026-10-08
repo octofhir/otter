@@ -123,7 +123,9 @@ fn interpreter_turn(ctx: *mut JitCtx, entering: bool) -> NativeResultPair {
         crate::prepared_call::ResumeInput::Normal
     };
     let frame = ctx.native_frame;
-    let floor = ActivationFloor::at_depth(unsafe { (*frame).depth } as usize - 1);
+    let floor = ActivationFloor::at_depth(
+        unsafe { crate::native_abi::Frame::logical_depth(frame) } as usize - 1,
+    );
     let completion = ctx.completion;
     let destination = ctx.completion_destination;
     let generation = ctx.completion_generation;

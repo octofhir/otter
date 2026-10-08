@@ -282,8 +282,8 @@ impl Interpreter {
 
     fn link_native_frame(&mut self, frame: &mut crate::native_abi::Frame) -> Result<(), VmError> {
         let caller = self.jit_innermost_native_frame();
-        // SAFETY: the innermost published record is live.
-        let caller_depth = unsafe { caller.as_ref() }.map_or(0, |caller| caller.depth);
+        // SAFETY: the innermost published record and its chain are live.
+        let caller_depth = unsafe { crate::native_abi::Frame::logical_depth(caller) };
         let depth = caller_depth.saturating_add(1);
         if depth > self.max_stack_depth {
             return Err(VmError::StackOverflow {
@@ -324,8 +324,7 @@ impl Interpreter {
         // SAFETY: as in `jit_push_native_frame`.
         unsafe { crate::ActiveFrameMut::from_ptr(frame) }.map_err(|_| VmError::InvalidOperand)?;
         let caller = self.jit_innermost_native_frame();
-        // SAFETY: the innermost published record is live.
-        frame.depth = unsafe { caller.as_ref() }.map_or(0, |caller| caller.depth);
+        frame.depth = 0;
         frame.caller = caller as u64;
         Ok(self.jit_context.replace(context))
     }
@@ -389,11 +388,17 @@ impl Interpreter {
     /// Derive the one suspended edge from the current synchronous owners.
     /// Active helpers have no child/request return anchor of their own.
     pub(crate) fn jit_frame_return_pc(&self, frame: &crate::native_abi::Frame) -> u64 {
+        // An interpreter-owned record has no generated return site.
+        if frame.code_object_id == 0 {
+            return 0;
+        }
         let address = std::ptr::from_ref(frame).addr() as u64;
         let mut anchor = 0;
         if let Some(context) = self.jit_context {
             let pending = unsafe { &(*context.as_ptr()).pending_call };
-            if pending.caller_return_pc != 0 && pending.caller == address {
+            if pending.caller_return_pc > crate::native_abi::NO_CALLER_RETURN_PC
+                && pending.caller == address
+            {
                 anchor = pending.caller_return_pc;
             }
         }
@@ -401,7 +406,9 @@ impl Interpreter {
             for child in self.jit_native_frames() {
                 let child = unsafe { &*child };
                 if child.caller == address {
-                    anchor = child.caller_return_pc;
+                    // SAFETY: published records stay anchored at their live
+                    // machine frames.
+                    anchor = unsafe { child.return_pc_into_caller() };
                     break;
                 }
             }

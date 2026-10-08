@@ -236,10 +236,18 @@ pub(crate) fn emit_tail_branch(
                 11,
                 RelocationTarget::FunctionEntryCell { function_id },
             );
+            // A handed-over caller anchor enters the callee as a staged
+            // request.
+            let direct = ops.new_dynamic_label();
             dynasm!(ops
                 ; .arch x64
                 ; mov r9, [r11]
-                ; jmp QWORD [r9]
+                ; mov rax, [r9]
+                ; cmp QWORD [rdi + (PENDING_CALL_OFFSET + abi::REQUEST_CALLER_RETURN_PC_OFFSET) as i32], 0
+                ; je =>direct
+                ; or r9, 1
+                ; =>direct
+                ; jmp rax
             );
         }
         CallTarget::Generic | CallTarget::Native => {

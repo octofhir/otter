@@ -299,9 +299,10 @@ pub struct Frame {
     /// Calling frame's record, or null for the outermost published frame.
     /// Linkage writes it before the frame becomes the innermost one.
     pub caller: u64,
-    /// Stack-register frames in the chain from this record outward, this one
-    /// included. The logical JavaScript depth of generated frames; linkage
-    /// computes it from the caller's value.
+    /// Logical JavaScript frames in the chain from this record outward, this
+    /// one included, or zero while not yet computed. Linkage writes zero; the
+    /// runtime derives and caches it on first use ([`Frame::logical_depth`]).
+    /// Call depth is bounded by the native stack limit alone.
     pub depth: u32,
     /// Root recipe of an active collecting C helper, or [`super::NO_SAFEPOINT`].
     /// Suspended JS calls resolve their actual child/request return address
@@ -330,10 +331,13 @@ pub struct Frame {
     /// or a parked-state field. Terminal ownership validates current-chain
     /// membership before dereferencing it, then proves the exact Super opcode.
     pub(crate) super_origin: u64,
-    /// Genuine machine return address in this frame's immediate physical caller.
-    /// The caller's exact code-object id owns its return-site table. Zero means
-    /// that caller is interpreter/host-owned. Initialized before publication;
-    /// tier changes preserve it, and parked invocations never retain it.
+    /// Return address into the immediate physical caller's code. Zero: the
+    /// caller called this record's generated entry directly, and the address
+    /// is the saved link register of this record's machine frame
+    /// ([`Frame::return_pc_into_caller`]). [`NO_CALLER_RETURN_PC`]: the caller
+    /// is interpreter/host-owned or a Rust helper. Anything else: the address
+    /// a trampoline-entered record copied from the pending request. Tier
+    /// changes preserve it, and parked invocations never retain it.
     pub caller_return_pc: u64,
 }
 
@@ -434,7 +438,7 @@ impl Frame {
             derived_this_context: crate::context::ContextHandle::null(),
             construct_receiver: Value::UNDEFINED,
             super_origin: 0,
-            caller_return_pc: 0,
+            caller_return_pc: NO_CALLER_RETURN_PC,
         }
     }
 
@@ -452,6 +456,70 @@ impl Frame {
     #[must_use]
     pub fn caller_frame(&self) -> *mut Frame {
         self.caller as *mut Frame
+    }
+
+    /// Logical JavaScript depth of `frame`, computed from the nearest caller
+    /// that already knows its own and cached in every record on the way.
+    /// Host frames keep their caller's depth.
+    ///
+    /// # Safety
+    /// `frame` and its whole caller chain must be live published records
+    /// exclusively owned by the stopped mutator.
+    #[must_use]
+    #[inline]
+    pub unsafe fn logical_depth(frame: *mut Frame) -> u32 {
+        if let Some(depth) = unsafe { frame.as_ref() }.map(|frame| frame.depth)
+            && depth != 0
+        {
+            return depth;
+        }
+        unsafe { Self::derive_logical_depth(frame) }
+    }
+
+    #[cold]
+    #[inline(never)]
+    unsafe fn derive_logical_depth(frame: *mut Frame) -> u32 {
+        let mut pending = smallvec::SmallVec::<[*mut Frame; 32]>::new();
+        let mut current = frame;
+        let mut depth = 0;
+        while !current.is_null() {
+            let known = unsafe { (*current).depth };
+            if known != 0 {
+                depth = known;
+                break;
+            }
+            pending.push(current);
+            current = unsafe { (*current).caller_frame() };
+        }
+        for record in pending.into_iter().rev() {
+            if unsafe { (*record).header.kind } != NativeFrameKind::Host {
+                depth += 1;
+            }
+            unsafe { (*record).depth = depth };
+        }
+        depth
+    }
+
+    /// Return address into the caller's code, or zero when the caller is not
+    /// suspended at a generated call site.
+    ///
+    /// # Safety
+    /// A record entered directly by generated code ([`Frame::caller_return_pc`]
+    /// zero) must still be anchored at its live machine frame.
+    #[must_use]
+    pub unsafe fn return_pc_into_caller(&self) -> u64 {
+        match self.caller_return_pc {
+            0 => {
+                let link =
+                    (std::ptr::from_ref(self) as usize + FRAME_RECORD_SLOT + 8) as *const u64;
+                // SAFETY: a directly entered generated record sits exactly
+                // `FRAME_RECORD_SLOT` bytes below its frame pointer, whose
+                // second word is the saved return address.
+                unsafe { link.read() }
+            }
+            NO_CALLER_RETURN_PC => 0,
+            pc => pc,
+        }
     }
 
     /// Exact running function object.
@@ -762,7 +830,25 @@ const _: [(); 108] = [(); std::mem::offset_of!(Frame, derived_this_context)];
 pub const NATIVE_FRAME_SUPER_ORIGIN_OFFSET: u32 = std::mem::offset_of!(Frame, super_origin) as u32;
 const _: [(); 120] = [(); std::mem::offset_of!(Frame, super_origin)];
 
-/// Genuine return address in the immediate physical caller.
+/// [`Frame::caller_return_pc`] of a record whose caller is not suspended at
+/// a generated call site.
+pub const NO_CALLER_RETURN_PC: u64 = 1;
+
+/// Record bytes reserved by a generated call entry: the record rounded up to
+/// the 16-byte stack alignment.
+pub const FRAME_RECORD_BYTES: usize = std::mem::size_of::<Frame>().next_multiple_of(16);
+
+/// Bytes between a directly entered generated record and its machine frame
+/// pointer, so `[record + FRAME_RECORD_SLOT + 8]` is its return address. On
+/// AArch64 the record sits immediately below the saved frame-pointer/link
+/// pair; on x86-64 below the fixed 48-byte save area under `rbp`.
+#[cfg(not(target_arch = "x86_64"))]
+pub const FRAME_RECORD_SLOT: usize = FRAME_RECORD_BYTES;
+/// See the AArch64 definition.
+#[cfg(target_arch = "x86_64")]
+pub const FRAME_RECORD_SLOT: usize = FRAME_RECORD_BYTES + 48;
+
+/// Return-address word of [`Frame`].
 pub const NATIVE_FRAME_CALLER_RETURN_PC_OFFSET: u32 =
     std::mem::offset_of!(Frame, caller_return_pc) as u32;
 const _: [(); 128] = [(); std::mem::offset_of!(Frame, caller_return_pc)];

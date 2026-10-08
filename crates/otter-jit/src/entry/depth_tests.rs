@@ -1,8 +1,9 @@
-//! Executable depth admission through both current compiled call protocols.
+//! Executable entry admission through both current compiled call protocols.
 //!
 //! # Contents
 //! - Known-cell and generic compiled entry over Template and Graph mappings.
-//! - Exact-limit acceptance, prepublication refusal and 32-bit depth carry.
+//! - Native-stack refusal before publication; derived logical depth and the
+//!   return address read back from the entered machine frame.
 //! - Typed body observations after the real native entry publishes its frame.
 //!
 //! # Invariants
@@ -42,6 +43,7 @@ struct Observation {
     body_frame: usize,
     body_caller: u64,
     body_return_pc: u64,
+    body_anchor: u64,
     body_pending_caller: u64,
     body_pending_return_pc: u64,
     body_depth: u32,
@@ -84,10 +86,11 @@ extern "C" fn body(ctx: *mut JitCtx, _opcode: u64, dst: u64, _arg1: u64, _arg2: 
         observation.body_calls += 1;
         observation.body_frame = std::ptr::from_ref(frame) as usize;
         observation.body_caller = frame.caller;
-        observation.body_return_pc = frame.caller_return_pc;
+        observation.body_return_pc = frame.return_pc_into_caller();
+        observation.body_anchor = frame.caller_return_pc;
         observation.body_pending_caller = (*ctx).pending_call.caller;
         observation.body_pending_return_pc = (*ctx).pending_call.caller_return_pc;
-        observation.body_depth = frame.depth;
+        observation.body_depth = abi::Frame::logical_depth(frame);
         observation.body_registers = frame.registers.iter().copied().collect();
         observation.body_actuals =
             std::slice::from_raw_parts(frame.actuals, frame.argument_count as usize).to_vec();
@@ -265,7 +268,6 @@ fn caller(
 #[derive(Clone, Copy, Debug)]
 struct Case {
     caller_depth: Option<u32>,
-    limit: u64,
     accepted: bool,
     no_native_room: bool,
     native_caller: bool,
@@ -356,7 +358,7 @@ fn run_case(
         thread: &mut thread,
         native_frame: frame,
         error: &mut error,
-        generated_depth_limit: case.limit,
+        generated_depth_limit: 8,
         global_this_offset: std::ptr::null(),
         native_stack_limit: if case.no_native_room { usize::MAX } else { 0 },
         generated_feedback_clean: 1,
@@ -442,13 +444,9 @@ fn run_case(
         );
         assert_eq!(observation.body_caller, frame as u64, "{label}");
         assert_eq!(
-            observation.body_return_pc,
-            if case.native_caller {
-                buffer.ptr(return_pc) as u64
-            } else {
-                0
-            },
-            "{label}: genuine machine CALL/BLR return, no interpreter anchor"
+            (observation.body_anchor, observation.body_return_pc),
+            (0, buffer.ptr(return_pc) as u64),
+            "{label}: the entered machine frame owns the genuine CALL/BLR return"
         );
         assert_eq!(
             (
@@ -477,13 +475,7 @@ fn run_case(
         );
     } else {
         assert_eq!(result, NativeResultPair::fatal_internal(), "{label}");
-        assert_eq!(
-            error,
-            Some(VmError::StackOverflow {
-                limit: case.limit.min(u64::from(u32::MAX)) as u32
-            }),
-            "{label}"
-        );
+        assert_eq!(error, Some(VmError::StackOverflow { limit: 8 }), "{label}");
         assert_eq!(
             observation.overflow_calls, 1,
             "{label}: production overflow once"
@@ -511,20 +503,14 @@ fn run_case(
 }
 
 #[test]
-fn known_and_generic_depth_refusal_precedes_publication_preparation_and_accounting() {
+fn known_and_generic_entries_publish_derived_depth_and_real_windows() {
     let table = transitions();
-    for semantics in [Semantics::Strict, Semantics::Sloppy, Semantics::Construct] {
+    for semantics in [Semantics::Strict] {
         let view = snapshot(semantics);
         for code in compile(&view, &table) {
             for generic in [false, true] {
                 for count in [0, 1, 3, 5] {
-                    for (caller_depth, limit) in [
-                        (None, 0),
-                        (Some(0), 0),
-                        (Some(7), 7),
-                        (Some(u32::MAX), u64::from(u32::MAX)),
-                        (Some(u32::MAX), u64::MAX),
-                    ] {
+                    for caller_depth in [None, Some(7)] {
                         run_case(
                             &view,
                             code.as_ref(),
@@ -534,48 +520,12 @@ fn known_and_generic_depth_refusal_precedes_publication_preparation_and_accounti
                             count,
                             Case {
                                 caller_depth,
-                                limit,
-                                accepted: false,
+                                accepted: true,
                                 no_native_room: false,
                                 native_caller: false,
                             },
                         );
                     }
-                }
-            }
-        }
-    }
-}
-
-#[test]
-fn exact_depth_limit_acceptance_publishes_checked_child_depth_and_real_windows() {
-    let table = transitions();
-    let view = snapshot(Semantics::Strict);
-    for code in compile(&view, &table) {
-        for generic in [false, true] {
-            for count in [0, 1, 3, 5] {
-                for (caller_depth, limit) in [
-                    (None, 1),
-                    (None, u64::MAX),
-                    (Some(0), 1),
-                    (Some(7), 8),
-                    (Some(u32::MAX - 1), u64::from(u32::MAX)),
-                ] {
-                    run_case(
-                        &view,
-                        code.as_ref(),
-                        &table,
-                        Semantics::Strict,
-                        generic,
-                        count,
-                        Case {
-                            caller_depth,
-                            limit,
-                            accepted: true,
-                            no_native_room: false,
-                            native_caller: false,
-                        },
-                    );
                 }
             }
         }
@@ -597,7 +547,6 @@ fn native_stack_refusal_keeps_the_same_unpublished_overflow_return() {
                 1,
                 Case {
                     caller_depth: Some(7),
-                    limit: 8,
                     accepted: false,
                     no_native_room: true,
                     native_caller: false,
@@ -623,7 +572,6 @@ fn published_known_and_generic_children_own_the_exact_emitted_hardware_return() 
                     count,
                     Case {
                         caller_depth: Some(7),
-                        limit: 8,
                         accepted: true,
                         no_native_room: false,
                         native_caller: true,

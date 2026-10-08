@@ -136,7 +136,9 @@ extern "C" fn recursive_entry(ctx: *mut JitCtx) -> NativeResultPair {
     unsafe {
         (*harness).active_rust += 1;
         (*harness).max_rust = (*harness).max_rust.max((*harness).active_rust);
-        (*harness).max_js = (*harness).max_js.max((*ctx.native_frame).depth);
+        (*harness).max_js = (*harness)
+            .max_js
+            .max(Frame::logical_depth(ctx.native_frame));
         (*harness).entries += 1;
     }
     let _guard = EntryGuard(harness);
@@ -240,16 +242,12 @@ fn continuation_calls_release_rust_entries_and_propagate_completions() {
 
 #[test]
 fn stack_limits_reject_before_publishing_a_child() {
-    for native_limit in [false, true] {
+    {
         let mut thread = VmThread::empty();
         let mut error = None;
         let mut ctx = context(&mut thread, &mut error);
         ctx.pending_call = request(arity_entry, &[], 0, 0);
-        if native_limit {
-            ctx.native_stack_limit = usize::MAX;
-        } else {
-            ctx.generated_depth_limit = 0;
-        }
+        ctx.native_stack_limit = usize::MAX;
         let result = unsafe { call_trampoline(&mut ctx) };
         assert_eq!(
             result.validate(NativeResultDomain::Execution),
@@ -299,7 +297,8 @@ fn moving_collection_rewrites_the_entire_native_call_chain() {
             Some(NativeResultStatus::Success)
         );
         assert!(result.payload_value().as_object().is_some());
-        assert_eq!(harness.max_js, 17);
+        // The outer interpreter record is the first logical activation.
+        assert_eq!(harness.max_js, 18);
         assert_eq!(harness.collections, 17);
         assert_eq!(harness.max_rust, 1);
         assert_eq!(ctx.native_frame, std::ptr::from_mut(&mut outer));
@@ -386,7 +385,9 @@ extern "C" fn tail_entry(ctx: *mut JitCtx) -> NativeResultPair {
     unsafe {
         (*harness).active_rust += 1;
         (*harness).max_rust = (*harness).max_rust.max((*harness).active_rust);
-        (*harness).max_js = (*harness).max_js.max((*ctx.native_frame).depth);
+        (*harness).max_js = (*harness)
+            .max_js
+            .max(Frame::logical_depth(ctx.native_frame));
         (*harness).entries += 1;
     }
     let _guard = EntryGuard(harness);
@@ -421,7 +422,6 @@ fn tail_replacement_keeps_one_physical_activation_and_rust_entry() {
     thread.runtime_context = std::ptr::from_mut(&mut harness) as u64;
     let mut error = None;
     let mut ctx = context(&mut thread, &mut error);
-    ctx.generated_depth_limit = 1;
     ctx.pending_call = request(tail_entry, &args, 2, 2);
     let result = unsafe { call_trampoline(&mut ctx) };
     assert_eq!(result, NativeResultPair::success(args[1]));
@@ -461,7 +461,7 @@ fn tier_guard(ctx: &JitCtx) -> (*mut TierHarness, TierGuard) {
 extern "C" fn selected_tier(ctx: *mut JitCtx) -> NativeResultPair {
     let ctx = unsafe { &mut *ctx };
     let (harness, _guard) = tier_guard(ctx);
-    assert_eq!(unsafe { (*ctx.native_frame).depth }, 1);
+    assert_eq!(unsafe { Frame::logical_depth(ctx.native_frame) }, 1);
     unsafe { (*harness).result }
 }
 extern "C" fn tier_dispatch(ctx: *mut JitCtx) -> NativeResultPair {
@@ -508,7 +508,6 @@ fn tier_transfer_retains_the_frame_and_releases_rust_before_every_entry() {
         thread.runtime_context = std::ptr::from_mut(&mut harness) as u64;
         let mut error = None;
         let mut ctx = context(&mut thread, &mut error);
-        ctx.generated_depth_limit = 1;
         ctx.pending_call = request(tier_dispatch, &[], 0, 0);
         assert_eq!(
             unsafe { call_trampoline(&mut ctx) },
@@ -660,7 +659,7 @@ extern "C" fn super_origin_transport_entry(ctx: *mut JitCtx) -> NativeResultPair
 }
 
 #[test]
-fn super_origin_moves_before_entry_and_is_cleared_on_both_admission_failures() {
+fn super_origin_moves_before_entry_and_is_cleared_on_stack_admission_failure() {
     let mut thread = VmThread::empty();
     let mut error = None;
     let mut ctx = context(&mut thread, &mut error);
@@ -691,9 +690,8 @@ fn super_origin_moves_before_entry_and_is_cleared_on_both_admission_failures() {
         assert_eq!(ctx.pending_call.super_origin, 0);
         assert!(error.is_none());
     }
-    for stack_failure in [false, true] {
-        ctx.generated_depth_limit = if stack_failure { 512 } else { 1 };
-        ctx.native_stack_limit = if stack_failure { usize::MAX } else { 0 };
+    {
+        ctx.native_stack_limit = usize::MAX;
         let mut incoming = request(super_origin_transport_entry, &[], 0, 0);
         incoming.header.flags =
             super::super::NativeFrameFlags::from_bits(super::super::NativeFrameFlags::CONSTRUCT);
@@ -758,7 +756,12 @@ fn rust_reentry_preserves_zero_and_explicit_suspended_caller_anchors() {
         let result = unsafe { call_trampoline(&mut ctx) };
         assert_eq!(result, NativeResultPair::success(Value::number_i32(731)));
         assert_eq!(observation.child_caller, parent_address);
-        assert_eq!(observation.child_anchor, anchor);
+        let expected = if anchor == 0 {
+            super::super::NO_CALLER_RETURN_PC
+        } else {
+            anchor
+        };
+        assert_eq!(observation.child_anchor, expected);
         assert_eq!(observation.pending_caller, 0);
         assert_eq!(observation.pending_anchor, 0);
         assert_eq!(ctx.native_frame, std::ptr::from_mut(&mut parent));

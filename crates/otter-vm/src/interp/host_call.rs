@@ -174,11 +174,13 @@ impl<'a> CallerContext<'a> {
                 child = caller;
                 continue;
             }
-            let function_id = if frame.code_object_id == 0 || callee.caller_return_pc == 0 {
+            // SAFETY: as above; the callee stays anchored at its machine frame.
+            let return_pc = unsafe { callee.return_pc_into_caller() };
+            let function_id = if frame.code_object_id == 0 || return_pc == 0 {
                 frame.header.function_id
             } else {
                 vm.jit_code_registry
-                    .return_pc_record(u64::from(frame.code_object_id), callee.caller_return_pc)
+                    .return_pc_record(u64::from(frame.code_object_id), return_pc)
                     .and_then(|record| record.inline_frames.last())
                     .map_or(frame.header.function_id, |inline| inline.function_id)
             };

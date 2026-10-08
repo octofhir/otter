@@ -485,7 +485,8 @@ impl Interpreter {
         let frame = &stack[top_idx];
         let tail_safe = !self.frame_has_suspension_owner(frame) && !frame.is_construct();
         let return_destination = frame.return_destination;
-        let return_anchor = (frame.caller, frame.caller_return_pc);
+        // SAFETY: the published record is anchored at its live machine frame.
+        let return_anchor = (frame.caller, unsafe { frame.return_pc_into_caller() });
         // A proxy's own steps throw in the realm of the code calling it: a
         // transfer that would leave a caller of another realm current keeps
         // this activation instead.

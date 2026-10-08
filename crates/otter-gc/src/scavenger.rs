@@ -134,6 +134,10 @@ struct ScavCtx {
     /// watermark — because promotion allocates through the old-space free
     /// list, which can place a survivor below any page's bump cursor.
     promoted_unscanned: Vec<u32>,
+    /// The cage base, read once for the pause instead of per slot.
+    cage: *mut u8,
+    /// Whether debug child-slot verification runs, read once for the pause.
+    verify: bool,
 }
 
 impl ScavCtx {
@@ -234,6 +238,8 @@ pub unsafe fn scavenge(
     // them, re-dirty survivors", but object-granular and find-cost-free.
     let snapshot_remembered: Vec<RawGc> = std::mem::take(remembered_parents);
     let mut ctx = ScavCtx {
+        cage: cage_base(),
+        verify: gc_verify_enabled(),
         // SAFETY: borrows are valid for the duration of this fn.
         new_space: unsafe { NonNull::new_unchecked(new_space as *mut _) },
         old_space: unsafe { NonNull::new_unchecked(old_space as *mut _) },
@@ -340,10 +346,10 @@ unsafe fn finalize_and_drop_dead_from_space(ctx: &mut ScavCtx) {
         let mut host_refs = ctx.host_refs;
         let tracked = ctx.new_space().take_cleanup();
         for offset in tracked {
-            let header = cage_base().add(offset as usize).cast::<GcHeader>();
+            let header = ctx.cage.add(offset as usize).cast::<GcHeader>();
             if (*header).is_forwarded() {
                 let target = GcHeader::read_forwarding_offset(header);
-                if (*cage_base().add(target as usize).cast::<GcHeader>()).is_young() {
+                if (*ctx.cage.add(target as usize).cast::<GcHeader>()).is_young() {
                     ctx.new_space().track_cleanup(target);
                 }
                 continue;
@@ -377,7 +383,7 @@ unsafe fn verify_cleanup_tracked(ctx: &mut ScavCtx) {
             page.for_each_object(|header, _| {
                 let tag = (*header).type_tag();
                 if !(*header).is_forwarded() && trace_table.needs_cleanup(tag) {
-                    let offset = (header as usize - cage_base() as usize) as u32;
+                    let offset = (header as usize - ctx.cage as usize) as u32;
                     debug_assert!(
                         new_space.tracks_cleanup(offset),
                         "young {:?} at {offset:#x} has a reclamation hook but is untracked",
@@ -480,8 +486,8 @@ unsafe fn process_slot(ctx: &mut ScavCtx, slot: *mut RawGc, parent_header: Optio
             return;
         }
         // SAFETY: raw is a valid in-cage offset by precondition.
-        let header_ptr = cage_base().add(raw as usize) as *mut GcHeader;
-        if gc_verify_enabled() {
+        let header_ptr = ctx.cage.add(raw as usize) as *mut GcHeader;
+        if ctx.verify {
             verify_child_slot(
                 ctx.trace_table.as_ref(),
                 slot,
@@ -509,7 +515,7 @@ unsafe fn process_slot(ctx: &mut ScavCtx, slot: *mut RawGc, parent_header: Optio
         // storage (Box/Vec/SmallVec) outside the cage, while re-tracing
         // the whole parent reaches every slot through the refreshed
         // slab base.
-        let child_header = cage_base().add(new_offset as usize) as *const GcHeader;
+        let child_header = ctx.cage.add(new_offset as usize) as *const GcHeader;
         remember_parent(ctx, parent_header, child_header);
     }
 }
@@ -546,7 +552,7 @@ unsafe fn remember_parent(
             // Parent is old/large and in-cage; old objects do not move on a
             // minor GC, so this offset stays valid until the next scavenge
             // drains it.
-            let offset = (parent_header as usize - cage_base() as usize) as u32;
+            let offset = (parent_header as usize - ctx.cage as usize) as u32;
             ctx.remembered().push(RawGc(offset));
         }
     }
@@ -566,7 +572,7 @@ unsafe fn process_weak_registry_slot(ctx: &mut ScavCtx, slot: *mut RawGc) {
         if raw == 0 {
             return;
         }
-        let header_ptr = cage_base().add(raw as usize) as *mut GcHeader;
+        let header_ptr = ctx.cage.add(raw as usize) as *mut GcHeader;
         if !(*header_ptr).is_young() {
             return;
         }
@@ -595,7 +601,7 @@ unsafe fn update_registry_slot_if_forwarded(ctx: &mut ScavCtx, slot: *mut RawGc)
         if raw == 0 {
             return false;
         }
-        let header_ptr = cage_base().add(raw as usize) as *mut GcHeader;
+        let header_ptr = ctx.cage.add(raw as usize) as *mut GcHeader;
         if !(*header_ptr).is_young() {
             return true;
         }
@@ -622,7 +628,7 @@ unsafe fn process_ephemeron_key_slot(ctx: &mut ScavCtx, slot: *mut RawGc) -> boo
         if raw == 0 {
             return false;
         }
-        let header_ptr = cage_base().add(raw as usize) as *mut GcHeader;
+        let header_ptr = ctx.cage.add(raw as usize) as *mut GcHeader;
         if !(*header_ptr).is_young() {
             return true;
         }
@@ -669,7 +675,7 @@ unsafe fn process_ephemeron_fixpoint(ctx: &mut ScavCtx, ephemeron_registry_slots
                 if raw == 0 {
                     continue;
                 }
-                let header_ptr = cage_base().add(raw as usize) as *mut GcHeader;
+                let header_ptr = ctx.cage.add(raw as usize) as *mut GcHeader;
                 trace_ephemeron_table(ctx, header_ptr);
             }
 
@@ -760,7 +766,7 @@ unsafe fn evacuate(ctx: &mut ScavCtx, header: *mut GcHeader) -> u32 {
         };
 
         // Copy header + payload to the new location.
-        let dest_ptr = cage_base().add(new_offset as usize);
+        let dest_ptr = ctx.cage.add(new_offset as usize);
         core::ptr::copy_nonoverlapping(header as *const u8, dest_ptr, size);
 
         // Promote / re-flag the destination header.
@@ -805,12 +811,12 @@ unsafe fn scan_remembered_parents(ctx: &mut ScavCtx, snapshot: &[RawGc]) {
         // re-dirty path during the trace below re-records (and re-sets the
         // bit on) any parent that still holds an old→young edge.
         for &parent in snapshot {
-            let header = cage_base().add(parent.0 as usize) as *mut GcHeader;
+            let header = ctx.cage.add(parent.0 as usize) as *mut GcHeader;
             (*header).clear_remembered();
         }
         for &parent in snapshot {
             ctx.stats.dirty_cards_scanned += 1; // remembered-set entries scanned
-            let header = cage_base().add(parent.0 as usize) as *mut GcHeader;
+            let header = ctx.cage.add(parent.0 as usize) as *mut GcHeader;
             // Skip swept corpses: a full-GC sweep drops dead old/large
             // objects in place (freeing their payload buffers, e.g. a string
             // `Vec<u16>`) but leaves the header walkable. Tracing such a
@@ -876,7 +882,7 @@ unsafe fn cheney_scan(ctx: &mut ScavCtx) {
             // within THIS scavenge.
             while let Some(offset) = ctx.promoted_unscanned.pop() {
                 progress = true;
-                let header_ptr = cage_base().add(offset as usize) as *mut GcHeader;
+                let header_ptr = ctx.cage.add(offset as usize) as *mut GcHeader;
                 let was_dirty = ctx.in_dirty_scan;
                 ctx.in_dirty_scan = true;
                 trace_one(ctx, header_ptr, TraceKind::Full);

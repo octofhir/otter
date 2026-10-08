@@ -1332,8 +1332,9 @@ pub fn equals_string_bodies(heap: &GcHeap, a: JsStringHandle, b: JsStringHandle)
     if a == b {
         return true;
     }
-    // Length and, when both are computed, hash reject first; a `Cons` /
-    // `Sliced` body falls through to the in-place or streaming compare.
+    // Length, recorded atoms and, when both are computed, hash decide first;
+    // a `Cons` / `Sliced` body falls through to the in-place or streaming
+    // compare.
     if let Some(answer) = heap.read_payload(a, |ba| {
         heap.read_payload(b, |bb| {
             if ba.len != bb.len {
@@ -1341,6 +1342,9 @@ pub fn equals_string_bodies(heap: &GcHeap, a: JsStringHandle, b: JsStringHandle)
             }
             if ba.len == 0 {
                 return Some(true);
+            }
+            if ba.atom != 0 && bb.atom != 0 {
+                return Some(ba.atom == bb.atom);
             }
             if ba.hash != 0 && bb.hash != 0 && ba.hash != bb.hash {
                 return Some(false);

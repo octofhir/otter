@@ -1526,6 +1526,14 @@ impl Interpreter {
             .string_constant_units(idx)
             .ok_or_else(|| VmError::InvalidOperand)?;
         let string = JsString::from_utf16_units(units, self.gc_heap_mut())?;
+        // A literal carries the atom linking resolved for its spelling, so
+        // keyed accesses and strict equality on it compare atoms.
+        if let Some(atom) = context.property_atom(idx).map(|key| key.atom().id())
+            && atom != crate::property_atom::AtomId::NONE
+        {
+            self.gc_heap
+                .with_payload(string.handle(), |body| body.set_cached_atom(atom));
+        }
         let value = Value::string(string);
         let replaced = self.literal_cells.insert(key, Box::new(value));
         debug_assert!(replaced.is_none(), "literals canonicalize once");

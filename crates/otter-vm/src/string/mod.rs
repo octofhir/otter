@@ -549,6 +549,16 @@ impl JsString {
         gc_body::ensure_utf16_cache(heap, source, &mut |_| {})
     }
 
+    /// The content as a Rust `String`, or `None` when it holds a lone
+    /// surrogate, which no `String` spells.
+    #[must_use]
+    pub fn to_well_formed_string(self, heap: &GcHeap) -> Option<String> {
+        if self.with_latin1(heap, |_| ()).is_some() {
+            return Some(self.to_lossy_string(heap));
+        }
+        String::from_utf16(&gc_body::to_utf16_vec(heap, self.handle)).ok()
+    }
+
     /// Render as a lossy Rust `String` for display / diagnostics.
     /// Lone surrogates round-trip via `String::from_utf16_lossy`.
     #[must_use]

@@ -641,6 +641,7 @@ fn render_deopt(runtime: &DeoptRuntime) -> String {
                 let (location_kind, location_value) = match location {
                     DeoptLocation::StackSlot(offset) => ("stackSlot", offset.to_string()),
                     DeoptLocation::Literal(raw) => ("literal", format!("0x{raw:016x}")),
+                    DeoptLocation::Register(index) => ("register", index.to_string()),
                     DeoptLocation::VirtualObject(_) => unreachable!(),
                 };
                 Slot {

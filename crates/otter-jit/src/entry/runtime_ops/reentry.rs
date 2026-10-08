@@ -1160,6 +1160,7 @@ mod tests {
                     std::ptr::from_ref(&runtime),
                     0,
                     window,
+                    0,
                 )
             };
             assert_eq!(
@@ -1242,6 +1243,7 @@ mod tests {
                         std::ptr::from_ref(&runtime),
                         homes.as_ptr() as u64,
                         window,
+                        0,
                     );
                     (result, *(window as *const Value))
                 };

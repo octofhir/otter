@@ -1188,11 +1188,12 @@ pub const STUB_JIT_FINISH_ERROR: RuntimeStubDescriptor = descriptor(
 
 /// Rebuild every interpreter frame a deopt exit owes, from deopt metadata.
 ///
-/// A generated exit site selects a code-owned recipe and materializes its
-/// canonical homes before calling this with the baked
-/// [`crate::deopt::DeoptRuntime`], the frame's stack pointer and its register
-/// window. Physical recipes read homes or constants; the entry accepts context,
-/// exit index, recipe address, canonical slot base and destination window.
+/// A generated exit site selects a code-owned recipe and calls this with the
+/// baked [`crate::deopt::DeoptRuntime`], the frame's canonical slot base, its
+/// register window and the register dump its shared handler saved (null when
+/// the recipe names no register). Physical recipes read homes, constants or
+/// dumped registers; the entry accepts context, exit index, recipe address,
+/// canonical slot base, destination window and register dump.
 /// The stub reconstitutes every slot of every owed frame from that recipe.
 ///
 /// An exit owing only the compiled function's own frame writes it into the

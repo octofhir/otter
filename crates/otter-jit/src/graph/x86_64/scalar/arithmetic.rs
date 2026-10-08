@@ -57,6 +57,10 @@ impl Codegen<'_> {
                 let minus_zero = self.eager_exit(node, DeoptReason::MinusZero);
                 emit_mul(&mut self.ops, a, b, dst, overflow, minus_zero);
             }
+            Kind::Int32MulExact => {
+                let (a, b, dst) = self.scalar_gp_binary(node);
+                dynasm!(self.ops ; .arch x64 ; mov r10d, Rd(a) ; imul r10d, Rd(b) ; mov Rd(dst), r10d);
+            }
             Kind::Int32Div | Kind::Int32Mod => {
                 let (a, b, dst) = self.scalar_gp_binary(node);
                 debug_assert!(![0, 2].contains(&a) && ![0, 2].contains(&b));

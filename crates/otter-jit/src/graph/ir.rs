@@ -209,13 +209,17 @@ pub(crate) enum Kind {
     /// Checked add; eager deopt on overflow.
     Int32Add,
     Int32Sub,
-    /// Two's-complement add whose every use applies `ToInt32` (or
-    /// `ToUint32`) to it and whose exact sum no frame state records: the
-    /// wrapped word is that conversion of the exact result.
+    /// Unchecked two's-complement add: the exact sum where the operands'
+    /// ranges prove it fits int32, otherwise the `ToInt32` of it that every
+    /// use applies (and no frame state records).
     Int32AddWrapping,
-    /// Two's-complement subtract under the same truncated-use contract.
+    /// Unchecked two's-complement subtract under the same contract.
     Int32SubWrapping,
+    /// Checked multiply; eager deopt on overflow and on a `-0` product.
     Int32Mul,
+    /// Unchecked multiply whose operands' ranges prove the product fits
+    /// int32 and is not `-0`.
+    Int32MulExact,
     /// Checked exact division; deopt on a remainder, zero divisor, overflow
     /// or negative zero.
     Int32Div,
@@ -588,6 +592,7 @@ impl Kind {
             | Self::AllocationProjection(_)
             | Self::Int32AddWrapping
             | Self::Int32SubWrapping
+            | Self::Int32MulExact
             | Self::Int32BitAnd
             | Self::Int32BitOr
             | Self::Int32BitXor
@@ -862,6 +867,7 @@ impl Kind {
                 fixed_gp_clobbers: SmallVec::new(),
             },
             Self::Int32Mul
+            | Self::Int32MulExact
             | Self::Float64Add
             | Self::Float64Sub
             | Self::Float64Mul

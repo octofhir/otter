@@ -47,7 +47,6 @@
 use otter_vm::{ExecutionContext, Interpreter, NativeCallInfo, NativeCtx, NativeError};
 use std::collections::BTreeMap;
 
-
 /// Lifecycle phases per ECMA-262 §16.2 Cyclic Module Records.
 ///
 /// The variants match the spec phases that have observable
@@ -166,9 +165,7 @@ impl RuntimeModuleRecords {
                                     // `default`.
                                     let env = if hosted.commonjs_value_install().is_some() {
                                         synthesize_commonjs_namespace(
-                                            &mut scope,
-                                            &init.url,
-                                            commonjs,
+                                            &mut scope, &init.url, commonjs,
                                         )?
                                     } else {
                                         let install = hosted
@@ -278,9 +275,10 @@ fn synthesize_commonjs_namespace<'scope>(
     specifier: &str,
     commonjs: &std::sync::Arc<crate::commonjs::CjsConfig>,
 ) -> Result<otter_vm::Local<'scope>, NativeError> {
-    let exports = crate::commonjs::cjs_load_builtin(scope, commonjs, specifier)?.ok_or_else(|| {
-        crate::runtime_type_error("import", format!("no builtin module named '{specifier}'"))
-    })?;
+    let exports =
+        crate::commonjs::cjs_load_builtin(scope, commonjs, specifier)?.ok_or_else(|| {
+            crate::runtime_type_error("import", format!("no builtin module named '{specifier}'"))
+        })?;
     let namespace = scope.bare_object()?;
     scope.set(namespace, "default", exports)?;
     for key in scope.enumerable_own_string_keys(exports)? {

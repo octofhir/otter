@@ -579,9 +579,8 @@ fn add_entries_from_iterable<'s>(
         .is_some_and(|adder| adder.is_static_fn(scope.context().heap(), kind.builtin_adder()));
     let iterable = scope.raw(iterable_h);
     let intrinsic = builtin_adder
-        && scope.with_turn_parts(|interp, stack| {
-            interp.intrinsic_iterable(&context, stack, iterable)
-        });
+        && scope
+            .with_turn_parts(|interp, stack| interp.intrinsic_iterable(&context, stack, iterable));
     if intrinsic {
         return add_entries_eager(scope, &context, target_h, iterable_h, kind, adder_h);
     }
@@ -929,7 +928,10 @@ fn map_proto_values(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, N
     make_map_iterator(ctx, m, MapIterKind::Values)
 }
 
-pub(crate) fn map_proto_entries(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+pub(crate) fn map_proto_entries(
+    ctx: &mut NativeCtx<'_>,
+    _args: &[Value],
+) -> Result<Value, NativeError> {
     let m = receiver_map(ctx, "Map.prototype.entries")?;
     make_map_iterator(ctx, m, MapIterKind::Entries)
 }
@@ -1147,7 +1149,10 @@ fn set_proto_keys(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, Nat
     set_proto_values(ctx, _args)
 }
 
-pub(crate) fn set_proto_values(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+pub(crate) fn set_proto_values(
+    ctx: &mut NativeCtx<'_>,
+    _args: &[Value],
+) -> Result<Value, NativeError> {
     let s = receiver_set(ctx, "Set.prototype.values")?;
     let set_value = Value::set(s);
     let iter = ctx

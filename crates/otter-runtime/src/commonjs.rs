@@ -301,14 +301,14 @@ fn resolve_module(
         .resolver
         .resolve_require(spec, referrer.file.as_deref(), &referrer.dir)
         .map_err(|_| {
-        // Node reports an unresolvable specifier as a plain `Error`
-        // carrying `MODULE_NOT_FOUND`; callers branch on the code.
-        NativeError::Coded {
-            kind: otter_vm::error_classes::ErrorKind::Error,
-            code: "MODULE_NOT_FOUND",
-            message: format!("Cannot find module '{spec}'"),
-        }
-    })?;
+            // Node reports an unresolvable specifier as a plain `Error`
+            // carrying `MODULE_NOT_FOUND`; callers branch on the code.
+            NativeError::Coded {
+                kind: otter_vm::error_classes::ErrorKind::Error,
+                code: "MODULE_NOT_FOUND",
+                message: format!("Cannot find module '{spec}'"),
+            }
+        })?;
     Ok(CjsResolution::file(path))
 }
 
@@ -351,8 +351,7 @@ fn make_require<'scope>(
     };
     let require = scope.native_closure("require", 1, &[cache], closure)?;
     scope.define(require, "cache", cache, Attr::data().to_flags())?;
-    let resolve =
-        make_require_resolve(scope, cfg_for_resolve, referrer_for_resolve, from_builtin)?;
+    let resolve = make_require_resolve(scope, cfg_for_resolve, referrer_for_resolve, from_builtin)?;
     scope.define(require, "resolve", resolve, Attr::data().to_flags())?;
     Ok(require)
 }

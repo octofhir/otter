@@ -61,5 +61,8 @@ out.join(" ; ");
         .expect("script")
         .completion_string()
         .to_string();
-    assert_eq!(out, r#"4 ; 6 ; [0,1,2] ; boom ; [1,null,3] ; [[1,{"a":1}],[2,2]] ; ab ; 3 ; 15 ; 789 ; 45 ; 0,1|1,2 ; 246 ; 299 ; n0n1n2n3 ; [0,"proto",2] ; 2 ; 3"#);
+    assert_eq!(
+        out,
+        r#"4 ; 6 ; [0,1,2] ; boom ; [1,null,3] ; [[1,{"a":1}],[2,2]] ; ab ; 3 ; 15 ; 789 ; 45 ; 0,1|1,2 ; 246 ; 299 ; n0n1n2n3 ; [0,"proto",2] ; 2 ; 3"#
+    );
 }

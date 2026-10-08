@@ -81,11 +81,8 @@ pub(crate) mod engine {
         start: usize,
         step_limit: u64,
     ) -> Execution<Vec<Match>> {
-        let mut matches = re.find_from_utf16_with_config(
-            text,
-            start,
-            otter_regex::ExecConfig { step_limit },
-        );
+        let mut matches =
+            re.find_from_utf16_with_config(text, start, otter_regex::ExecConfig { step_limit });
         let mut found = Vec::new();
         let result = loop {
             match matches.next() {
@@ -110,11 +107,8 @@ pub(crate) mod engine {
         start: usize,
         step_limit: u64,
     ) -> Execution<Option<Match>> {
-        let mut matches = re.find_from_utf16_with_config(
-            text,
-            start,
-            otter_regex::ExecConfig { step_limit },
-        );
+        let mut matches =
+            re.find_from_utf16_with_config(text, start, otter_regex::ExecConfig { step_limit });
         let result = matches.next().transpose();
         Execution {
             result,

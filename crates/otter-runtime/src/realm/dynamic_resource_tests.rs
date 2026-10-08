@@ -128,12 +128,7 @@ fn completed_dynamic_module_keeps_exact_source_refusal_in_default_and_additional
                     .interp
                     .with_host_realm(realm.realm, |interp| {
                         Ok(crate::evaluate_dynamic_linked_module_on(
-                            interp,
-                            records,
-                            config,
-                            commonjs,
-                            url,
-                            linked,
+                            interp, records, config, commonjs, url, linked,
                         ))
                     })
                     .expect("real traced realm extent")

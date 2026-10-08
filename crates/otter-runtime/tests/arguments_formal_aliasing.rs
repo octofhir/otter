@@ -44,7 +44,10 @@ out.join(",");
 "#;
     let mut rt = Runtime::builder().build().expect("runtime");
     let out = rt
-        .run_script(SourceInput::from_javascript(source), "<arguments-alias-test>")
+        .run_script(
+            SourceInput::from_javascript(source),
+            "<arguments-alias-test>",
+        )
         .expect("script")
         .completion_string()
         .to_string();

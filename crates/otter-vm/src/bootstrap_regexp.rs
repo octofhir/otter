@@ -320,9 +320,7 @@ pub(crate) fn prototype_is_builtin(
             .as_native_function()
             .is_some_and(|native| native.is_static_fn(heap, call))
     };
-    let data = |lookup: PropertyLookup, call: NativeFastFn| {
-        matches!(lookup, PropertyLookup::Data { value, .. } if is(&value, call))
-    };
+    let data = |lookup: PropertyLookup, call: NativeFastFn| matches!(lookup, PropertyLookup::Data { value, .. } if is(&value, call));
     let getter = |key: &str, call: NativeFastFn| {
         matches!(
             object::lookup_own(prototype, heap, key),
@@ -330,10 +328,16 @@ pub(crate) fn prototype_is_builtin(
         )
     };
     let method = |symbol: WellKnown, call: NativeFastFn| {
-        data(object::lookup_own_symbol(prototype, heap, symbols.get(symbol)), call)
+        data(
+            object::lookup_own_symbol(prototype, heap, symbols.get(symbol)),
+            call,
+        )
     };
     data(object::lookup_own(prototype, heap, "exec"), proto_exec)
-        && data(object::lookup_own(prototype, heap, "constructor"), regexp_ctor_call)
+        && data(
+            object::lookup_own(prototype, heap, "constructor"),
+            regexp_ctor_call,
+        )
         && getter("flags", accessor_flags)
         && getter("global", accessor_global)
         && getter("ignoreCase", accessor_ignore_case)
@@ -343,11 +347,26 @@ pub(crate) fn prototype_is_builtin(
         && getter("unicodeSets", accessor_unicode_sets)
         && getter("sticky", accessor_sticky)
         && getter("hasIndices", accessor_has_indices)
-        && method(WellKnown::Match, crate::regexp_prototype::native_regexp_symbol_match)
-        && method(WellKnown::Replace, crate::regexp_prototype::native_regexp_symbol_replace)
-        && method(WellKnown::Search, crate::regexp_prototype::native_regexp_symbol_search)
-        && method(WellKnown::Split, crate::regexp_prototype::native_regexp_symbol_split)
-        && method(WellKnown::MatchAll, crate::regexp_prototype::native_regexp_symbol_match_all)
+        && method(
+            WellKnown::Match,
+            crate::regexp_prototype::native_regexp_symbol_match,
+        )
+        && method(
+            WellKnown::Replace,
+            crate::regexp_prototype::native_regexp_symbol_replace,
+        )
+        && method(
+            WellKnown::Search,
+            crate::regexp_prototype::native_regexp_symbol_search,
+        )
+        && method(
+            WellKnown::Split,
+            crate::regexp_prototype::native_regexp_symbol_split,
+        )
+        && method(
+            WellKnown::MatchAll,
+            crate::regexp_prototype::native_regexp_symbol_match_all,
+        )
 }
 
 fn values_strict_equal(a: &Value, b: &Value) -> bool {

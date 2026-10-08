@@ -1144,10 +1144,10 @@ impl BaselinePlan {
                 | Op::HasNamedProperty
                 | Op::DeleteProperty
                 | Op::LoadSuperProperty => LoweredOperands::PropertyLoad(PropertyLoadOperands {
-                        dst: reg(operands, 0)?,
-                        object: reg(operands, 1)?,
-                        name: const_index(operands, 2)?,
-                    }),
+                    dst: reg(operands, 0)?,
+                    object: reg(operands, 1)?,
+                    name: const_index(operands, 2)?,
+                }),
                 Op::SetSuperProperty | Op::NewBuiltinError | Op::NewCollection => {
                     LoweredOperands::GlobalStore(GlobalStoreOperands {
                         value: reg(operands, 0)?,

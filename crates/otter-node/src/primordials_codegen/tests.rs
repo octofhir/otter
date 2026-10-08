@@ -515,7 +515,10 @@ fn current_dispatch_regenerates_and_rejects_private_token_or_helper_escape() {
             .split("const __otterPrimordialMissing")
             .next()
             .unwrap(),
-        BOOTSTRAP.split("function __otterPrimordialBuild").next().unwrap(),
+        BOOTSTRAP
+            .split("function __otterPrimordialBuild")
+            .next()
+            .unwrap(),
         "every byte before the AST-owned group is preserved"
     );
     assert!(output.ends_with(BOOTSTRAP.split("const primordials").last().unwrap()));

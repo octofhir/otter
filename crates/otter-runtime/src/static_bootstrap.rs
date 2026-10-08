@@ -61,12 +61,13 @@ pub(crate) fn prepare(
         return Ok((context, compiled.metadata));
     }
     // The build verified these exact bytes; they are part of the binary.
-    let mut verified = otter_bytecode::binary::decode_build_artifact(script.bytecode).map_err(|error| {
-        OtterError::Internal {
-            code: DiagnosticCode::GlobalClassBootstrap.as_str().to_owned(),
-            message: format!("invalid static extension bytecode: {error}"),
-        }
-    })?;
+    let mut verified =
+        otter_bytecode::binary::decode_build_artifact(script.bytecode).map_err(|error| {
+            OtterError::Internal {
+                code: DiagnosticCode::GlobalClassBootstrap.as_str().to_owned(),
+                message: format!("invalid static extension bytecode: {error}"),
+            }
+        })?;
     // Additional-realm installers retain their existing diagnostic URL. URL
     // metadata is outside the structural verifier proof.
     if verified.module().module != specifier {

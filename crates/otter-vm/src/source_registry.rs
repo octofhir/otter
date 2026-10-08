@@ -296,7 +296,11 @@ mod tests {
         let text = source("(function () { a;\nb;\n})");
         let src = ModuleSource::new(text, 15, ResourceAccount::default());
         assert_eq!(src.line_col(15), (1, 1));
-        assert_eq!(src.line_col(2), (1, 1), "a prologue offset clamps to line 1");
+        assert_eq!(
+            src.line_col(2),
+            (1, 1),
+            "a prologue offset clamps to line 1"
+        );
         assert_eq!(src.line_text(1), Some("a;"));
         assert_eq!(src.line_col(18), (2, 1));
     }
@@ -392,7 +396,10 @@ mod tests {
             .expect("first metadata");
         let before_index = current(&account);
         assert_eq!(a.get("same.js").unwrap().line_text(2), Some("source A"));
-        assert!(current(&account) > before_index, "the first query charges the index");
+        assert!(
+            current(&account) > before_index,
+            "the first query charges the index"
+        );
         let a_charge = current(&account);
         let snapshot = a.clone();
         assert_eq!(current(&account), a_charge, "clone shares one charge");

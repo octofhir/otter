@@ -1375,11 +1375,15 @@ impl<'a> Codegen<'a> {
                 self.load_immediate(16, NUMBER_TAG);
                 dynasm!(self.ops ; .arch aarch64 ; tst X(a), x16 ; b.eq =>exit);
             }
-            Kind::CheckShapes { shapes, writable } => {
+            // A writable site's shapes come from store handlers, which no
+            // prototype shape receives; a shape's state never changes, and
+            // this code keeps its shapes alive, so an exact match proves the
+            // receiver's role too.
+            Kind::CheckShapes { shapes, .. } => {
                 let a = Self::gp(input(0));
                 let exit = self.eager_exit(node, DeoptReason::WrongShape);
-                let (shapes, writable) = (shapes.clone(), *writable);
-                self.emit_check_shapes(a, &shapes, writable, exit);
+                let shapes = shapes.clone();
+                self.emit_check_shapes(a, &shapes, exit);
             }
             Kind::CheckBounds => {
                 let (index, length) = (Self::gp(input(0)), Self::gp(input(1)));
@@ -2074,7 +2078,6 @@ impl<'a> Codegen<'a> {
         &mut self,
         object: u8,
         shapes: &[u32],
-        writable: bool,
         exit: DynamicLabel,
     ) {
         let matched = self.ops.new_dynamic_label();
@@ -2094,12 +2097,6 @@ impl<'a> Codegen<'a> {
             dynasm!(self.ops ; .arch aarch64 ; b =>exit);
         }
         dynasm!(self.ops ; .arch aarch64 ; =>matched);
-        if writable {
-            self.emit_shape_state(object);
-            dynasm!(self.ops ; .arch aarch64
-                ; tst w16, u32::from(ShapeState::PROTOTYPE_MASK)
-                ; b.ne =>exit);
-        }
     }
 
     /// The generational barrier for storing `X(value)` into `X(object)`. The
@@ -2475,9 +2472,11 @@ impl<'a> Codegen<'a> {
     /// Prove a published ordinary object cell; exact static shape guards
     /// supply its lookup-state proof before any field/effect.
     fn emit_object_receiver(&mut self, receiver: u8, miss: DynamicLabel) {
-        self.load_immediate(16, NOT_CELL_MASK);
+        // The mask is a high run and bit 1: two encodable tests, no constant.
+        const _: () = assert!(NOT_CELL_MASK == 0xfffe_0000_0000_0002);
         dynasm!(self.ops ; .arch aarch64
-            ; tst X(receiver), x16 ; b.ne =>miss
+            ; tst X(receiver), #0xfffe_0000_0000_0000 ; b.ne =>miss
+            ; tbnz X(receiver), #1, =>miss
             ; cbz X(receiver), =>miss
             ; ldrb w16, [X(receiver)]
             ; cmp w16, crate::entry::OBJECT_BODY_TYPE_TAG ; b.ne =>miss);

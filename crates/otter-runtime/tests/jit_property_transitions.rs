@@ -44,7 +44,7 @@ function widen(rounds) {
   const keys = Object.keys(last).join(",");
   return acc + "|" + keys + "|" + last.f2 + "|" + last.f4 + "|" + last.f11;
 }
-widen(600);
+widen(2400);
 "#;
 
 fn run(selection: JitSelection) -> (String, u64, u64) {
@@ -85,13 +85,13 @@ fn slab_add_transitions_match_the_interpreter_on_every_tier() {
 #[test]
 fn slab_add_transitions_stay_in_generated_code() {
     let (_, _, runtime_stubs) = run(JitSelection::Template);
-    // Twelve stores per object over six hundred objects: a runtime call per
-    // store would be seven thousand. The slab grows twice per object
+    // Twelve stores per object over 2400 objects: a runtime call per store
+    // would be nearly thirty thousand. The slab grows twice per object
     // (inline cap 3 → 6 → 12), and the compiled loop only starts after the
     // OSR threshold, so the stub count is a small multiple of the object
     // count, never of the store count.
     assert!(
-        runtime_stubs < 600 * 4,
+        runtime_stubs < 2400 * 4,
         "runtime property stubs must not scale with every slab store: {runtime_stubs}"
     );
 }

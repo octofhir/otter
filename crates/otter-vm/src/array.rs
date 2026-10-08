@@ -1183,14 +1183,15 @@ pub(crate) fn plain_dense_element(
     })
 }
 
-/// Whether `idx` is one plain dense hole with no receiver-local exotic state.
+/// Whether `idx` names no own element of a plain dense array with no
+/// receiver-local exotic state: a hole, or an index past its dense elements.
 ///
 /// Prototype observability is deliberately not decided here: callers must
 /// separately prove that inherited indexed accessors cannot answer the hole.
 #[must_use]
-pub(crate) fn is_plain_dense_hole(arr: JsArray, heap: &otter_gc::GcHeap, idx: usize) -> bool {
+pub(crate) fn is_plain_dense_absent(arr: JsArray, heap: &otter_gc::GcHeap, idx: usize) -> bool {
     heap.read_payload(arr, |body| {
-        body.exotic.is_null() && body.dense_value(idx).is_some_and(Value::is_hole)
+        body.exotic.is_null() && body.dense_value(idx).is_none_or(Value::is_hole)
     })
 }
 

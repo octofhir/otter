@@ -77,20 +77,20 @@ impl Interpreter {
             });
         }
         // ActivationStack indexes JavaScript frames and skips physical Host
-        // records. Inspect only the actual innermost published frame; a Host
-        // error belongs to the creation realm that is still active here.
+        // records. Inspect only the actual innermost published frame: a native
+        // body's error belongs to its creation realm, which is active here; a
+        // proxy's own [[Call]]/[[Construct]] steps throw in the current
+        // execution context's realm, the code that called the proxy.
         // SAFETY: the current runtime extent retains its initialized published
         // chain; this immutable domain read cannot collect or reenter.
-        let physical_host = unsafe { self.jit_innermost_native_frame().as_ref() }
-            .is_some_and(|frame| frame.header.kind == crate::native_abi::NativeFrameKind::Host);
-        let error_realm_id = if physical_host {
-            self.active_realm_id
-        } else {
-            stack
-                .last()
-                .and_then(|frame| self.function_realm_ids.get(&frame.function_id))
-                .copied()
-                .unwrap_or(self.active_realm_id)
+        let host_kind = unsafe { self.jit_innermost_native_frame().as_ref() }
+            .filter(|frame| frame.header.kind == crate::native_abi::NativeFrameKind::Host)
+            .map(|frame| crate::native_abi::HostCallKind::from_code(frame.header.function_id));
+        let error_realm_id = match host_kind {
+            Some(Some(crate::native_abi::HostCallKind::Proxy)) | None => {
+                self.calling_realm(stack.last())
+            }
+            Some(_) => self.active_realm_id,
         };
         if error_realm_id != self.active_realm_id {
             return self.with_host_realm_id(error_realm_id, |interp| {

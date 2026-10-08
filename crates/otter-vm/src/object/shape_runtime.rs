@@ -64,7 +64,7 @@ use otter_gc::raw::{RawGc, SlotVisitor};
 
 use crate::inspect::{ShapeTransitionEvent, ShapeTransitionObserver};
 use crate::property_atom::{AtomId, NameInterner};
-use crate::string::{JsStringHandle, JsStringId, alloc_flat_string_body_with_roots};
+use crate::string::{JsStringHandle, alloc_flat_string_body_with_roots};
 
 use super::descriptor::PropertyFlags;
 use super::shape_body::{
@@ -134,7 +134,6 @@ impl WeakShapeTables {
 /// Mutable side tables for GC-managed hidden classes.
 pub(crate) struct ShapeRuntime {
     tables: RefCell<WeakShapeTables>,
-    next_string_id: u32,
     /// Names this shape layer has already seen, spelling → (string body, atom).
     /// The isolate interner is the identity authority; this map is the layer's
     /// own cache of it, so taking a known transition costs one hash of the
@@ -150,7 +149,6 @@ impl std::fmt::Debug for ShapeRuntime {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let tables = self.tables.borrow();
         f.debug_struct("ShapeRuntime")
-            .field("next_string_id", &self.next_string_id)
             .field("interned_keys", &self.interned_keys.len())
             .field("transitions", &tables.transitions.len())
             .field("offset_cache", &tables.offset_cache.len())
@@ -180,7 +178,6 @@ impl ShapeRuntime {
         super::shape_body::set_null_root(heap, root);
         Ok(Self {
             tables: RefCell::new(tables),
-            next_string_id: 1,
             interned_keys: FxHashMap::default(),
             names,
             observer: None,
@@ -326,7 +323,6 @@ impl ShapeRuntime {
     pub(crate) fn restored_shell(names: Arc<NameInterner>) -> Self {
         Self {
             tables: RefCell::new(WeakShapeTables::default()),
-            next_string_id: 0,
             interned_keys: FxHashMap::default(),
             names,
             observer: None,
@@ -408,14 +404,13 @@ impl ShapeRuntime {
             return Ok((existing.handle.get(), existing.atom));
         }
         let units: Vec<u16> = key.encode_utf16().collect();
-        let id = JsStringId::new(self.next_string_id);
         let mut visit_roots = |visitor: &mut dyn FnMut(*mut RawGc)| {
             self.trace_roots(visitor);
             external_visit(visitor);
         };
-        let handle = alloc_flat_string_body_with_roots(heap, id, &units, &mut visit_roots)?;
-        self.next_string_id = self.next_string_id.saturating_add(1);
+        let handle = alloc_flat_string_body_with_roots(heap, &units, &mut visit_roots)?;
         let atom = self.names.intern(key);
+        heap.with_payload(handle, |body| body.set_cached_atom(atom));
         self.interned_keys.insert(
             key.into(),
             ShapeKey {

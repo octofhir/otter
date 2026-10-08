@@ -116,6 +116,17 @@ impl NameInterner {
         AtomId(id)
     }
 
+    /// The spelling `atom` was minted for.
+    #[must_use]
+    pub(crate) fn spelling(&self, atom: AtomId) -> Option<Arc<str>> {
+        self.inner
+            .lock()
+            .expect("name interner")
+            .names
+            .get(atom.raw() as usize)
+            .cloned()
+    }
+
     /// `name`'s atom id when some shape, chunk or cache has interned it, or
     /// [`AtomId::NONE`] for a spelling never interned. Nothing is minted:
     /// every shape key is interned when its transition is built, so a

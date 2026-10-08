@@ -625,8 +625,18 @@ impl Interpreter {
         }
         property_key = self.coerce_property_key_value(stack, context, key_value)?;
 
+        let name: std::sync::Arc<str>;
         let key = if let Some(symbol) = property_key.as_symbol(&self.gc_heap) {
             VmPropertyKey::Symbol(symbol)
+        } else if let Some((atom, spelling)) = property_key
+            .as_string(&self.gc_heap)
+            .and_then(|key| self.interned_string_key(key))
+        {
+            name = spelling;
+            VmPropertyKey::Atom(crate::property_atom::AtomizedPropertyKey::new(
+                crate::property_atom::PropertyAtom::new(atom),
+                &name,
+            ))
         } else if let Some(string) = property_key.as_string(&self.gc_heap) {
             VmPropertyKey::OwnedString(string.to_lossy_string(&self.gc_heap))
         } else if let Some(number) = property_key.as_number() {

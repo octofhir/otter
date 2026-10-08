@@ -9,7 +9,6 @@
 //! [`JsStringHandle`] so the collector can trace them transitively.
 //!
 //! # Contents
-//! - [`JsStringId`] — stable intern-table identity for shape keys.
 //! - [`JsStringBody`] / [`JsStringBodyRepr`] — variant-enum body.
 //! - Stable representation tags and payload offsets consumed by generated
 //!   code for contiguous string operations.
@@ -95,25 +94,6 @@ pub enum StringConcatError {
     OutOfMemory(#[from] otter_gc::OutOfMemory),
 }
 
-/// Stable identity assigned by the VM-side string interner.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct JsStringId(u32);
-
-impl JsStringId {
-    /// Construct an interner-local string id.
-    #[must_use]
-    pub const fn new(raw: u32) -> Self {
-        Self(raw)
-    }
-
-    /// Raw numeric representation for diagnostics and compact side
-    /// tables.
-    #[must_use]
-    pub const fn get(self) -> u32 {
-        self.0
-    }
-}
-
 /// Internal representation of a [`JsStringBody`].
 #[derive(Debug)]
 #[repr(C, u8)]
@@ -178,9 +158,10 @@ const _: () = assert!(UTF16_CACHE_MIN_LEN as usize > INLINE_FLAT_CAP);
 #[derive(Debug)]
 #[repr(C)]
 pub struct JsStringBody {
-    /// Stable interner identity. Defaults to `JsStringId::new(0)` for
-    /// uninterned strings.
-    pub id: JsStringId,
+    /// The interned atom of this string's content plus one, recorded the
+    /// first time a property key or shape transition interned it; zero until
+    /// then. Content never changes, so a recorded atom stays exact.
+    atom: u32,
     /// Code-unit length (UTF-16). O(1) heap-free at the body level.
     pub len: u32,
     /// FNV-1a hash of the code units once [`string_hash`] computed it;
@@ -232,7 +213,7 @@ pub(crate) fn jit_layout() -> crate::jit::JitStringLayout {
             | (u64::from(crate::jit::JIT_GC_YOUNG_FLAG)
                 << (8 * otter_gc::header::HEADER_FLAGS_BYTE_OFFSET))
             | (u64::from(cell_bytes) << (8 * otter_gc::header::HEADER_SIZE_BYTES_OFFSET)),
-        id_byte: header + std::mem::offset_of!(JsStringBody, id) as u32,
+        atom_byte: header + std::mem::offset_of!(JsStringBody, atom) as u32,
         cache_byte: header + std::mem::offset_of!(JsStringBody, utf16_cache) as u32,
         cons_left_byte: repr + (std::ptr::from_ref(left) as usize - base) as u32,
         cons_right_byte: repr + (std::ptr::from_ref(right) as usize - base) as u32,
@@ -250,10 +231,17 @@ pub(crate) fn jit_layout() -> crate::jit::JitStringLayout {
 }
 
 impl JsStringBody {
-    /// Stable interner identity.
+    /// The interned atom of this string's content, when one was recorded.
     #[must_use]
-    pub const fn id(&self) -> JsStringId {
-        self.id
+    pub(crate) fn cached_atom(&self) -> Option<crate::property_atom::AtomId> {
+        self.atom
+            .checked_sub(1)
+            .map(crate::property_atom::AtomId::from_global)
+    }
+
+    /// Record the interned atom of this string's content.
+    pub(crate) fn set_cached_atom(&mut self, atom: crate::property_atom::AtomId) {
+        self.atom = atom.raw().wrapping_add(1);
     }
 
     /// String length in UTF-16 code units.
@@ -379,7 +367,6 @@ impl otter_gc::SafeTraceable for JsStringBody {
 /// Surfaces [`otter_gc::OutOfMemory`] verbatim.
 pub fn alloc_flat_string_body_with_roots(
     heap: &mut GcHeap,
-    id: JsStringId,
     units: &[u16],
     external_visit: &mut RootSlotVisitor<'_>,
 ) -> Result<JsStringHandle, otter_gc::OutOfMemory> {
@@ -390,7 +377,7 @@ pub fn alloc_flat_string_body_with_roots(
         inline[..units.len()].copy_from_slice(units);
         return heap.alloc_with_roots(
             JsStringBody {
-                id,
+                atom: 0,
                 len,
                 hash,
                 repr: JsStringBodyRepr::InlineFlat(inline),
@@ -403,7 +390,7 @@ pub fn alloc_flat_string_body_with_roots(
     // the GC allocation and need no separate cap reservation.
     let handle = heap.alloc_trailing_with_roots(
         JsStringBody {
-            id,
+            atom: 0,
             len,
             hash,
             repr: JsStringBodyRepr::SeqFlat,
@@ -425,7 +412,6 @@ pub fn alloc_flat_string_body_with_roots(
 /// Surfaces [`otter_gc::OutOfMemory`] verbatim.
 pub fn alloc_latin1_string_body_with_roots(
     heap: &mut GcHeap,
-    id: JsStringId,
     bytes: &[u8],
     external_visit: &mut RootSlotVisitor<'_>,
 ) -> Result<JsStringHandle, otter_gc::OutOfMemory> {
@@ -436,7 +422,7 @@ pub fn alloc_latin1_string_body_with_roots(
         inline[..bytes.len()].copy_from_slice(bytes);
         return heap.alloc_with_roots(
             JsStringBody {
-                id,
+                atom: 0,
                 len,
                 hash,
                 repr: JsStringBodyRepr::InlineLatin1(inline),
@@ -448,7 +434,7 @@ pub fn alloc_latin1_string_body_with_roots(
     // Same as the flat path: the bytes are inside the GC allocation.
     let handle = heap.alloc_trailing_with_roots(
         JsStringBody {
-            id,
+            atom: 0,
             len,
             hash,
             repr: JsStringBodyRepr::SeqLatin1,
@@ -539,19 +525,9 @@ pub fn concat_string_bodies(
                 for (dst, &unit) in bytes.iter_mut().zip(units[..n].iter()) {
                     *dst = unit as u8;
                 }
-                alloc_latin1_string_body_with_roots(
-                    heap,
-                    JsStringId::new(0),
-                    &bytes[..n],
-                    external_visit,
-                )?
+                alloc_latin1_string_body_with_roots(heap, &bytes[..n], external_visit)?
             } else {
-                alloc_flat_string_body_with_roots(
-                    heap,
-                    JsStringId::new(0),
-                    &units[..n],
-                    external_visit,
-                )?
+                alloc_flat_string_body_with_roots(heap, &units[..n], external_visit)?
             });
         }
     }
@@ -586,7 +562,7 @@ pub fn concat_string_bodies(
 
     Ok(heap.alloc_with_roots(
         JsStringBody {
-            id: JsStringId::new(0),
+            atom: 0,
             len: new_len,
             hash: 0,
             repr: JsStringBodyRepr::Cons {
@@ -616,7 +592,7 @@ pub fn slice_string_body(
     let start = start.min(total);
     let length = length.min(total.saturating_sub(start));
     if length == 0 {
-        return alloc_flat_string_body_with_roots(heap, JsStringId::new(0), &[], external_visit);
+        return alloc_flat_string_body_with_roots(heap, &[], external_visit);
     }
     // Inspect the source variant once; for Sliced / Cons we may
     // need to allocate, so we collect the inputs first and avoid
@@ -656,7 +632,7 @@ pub fn slice_string_body(
             // concatenated input string; materialising the full source for
             // each field turns that workload into quadratic heap pressure.
             let units = to_utf16_vec_slice(heap, string, start, length);
-            alloc_flat_string_body_with_roots(heap, JsStringId::new(0), &units, external_visit)
+            alloc_flat_string_body_with_roots(heap, &units, external_visit)
         }
     }
 }
@@ -688,7 +664,7 @@ fn slice_view(
     });
     heap.alloc_with_roots(
         JsStringBody {
-            id: JsStringId::new(0),
+            atom: 0,
             len: length,
             hash: 0,
             repr,
@@ -719,7 +695,7 @@ pub fn flatten_string_body(
         return Ok(string);
     }
     let units = to_utf16_vec(heap, string);
-    alloc_flat_string_body_with_roots(heap, JsStringId::new(0), &units, external_visit)
+    alloc_flat_string_body_with_roots(heap, &units, external_visit)
 }
 
 /// Flatten a cons rope / slice view **in place**: materialize its contents once
@@ -774,8 +750,7 @@ pub fn flatten_in_place(
             });
             return Ok(());
         }
-        let flat =
-            alloc_latin1_string_body_with_roots(heap, JsStringId::new(0), &bytes, &mut visit)?;
+        let flat = alloc_latin1_string_body_with_roots(heap, &bytes, &mut visit)?;
         heap.with_payload(rooted, |b| {
             b.repr = JsStringBodyRepr::Sliced {
                 parent: flat,
@@ -795,7 +770,7 @@ pub fn flatten_in_place(
         });
         return Ok(());
     }
-    let flat = alloc_flat_string_body_with_roots(heap, JsStringId::new(0), &units, &mut visit)?;
+    let flat = alloc_flat_string_body_with_roots(heap, &units, &mut visit)?;
     heap.with_payload(rooted, |b| {
         b.repr = JsStringBodyRepr::Sliced {
             parent: flat,
@@ -1091,7 +1066,7 @@ pub fn ensure_utf16_cache(
         visitor(p);
         external_visit(visitor);
     };
-    let widened = alloc_flat_string_body_with_roots(heap, JsStringId::new(0), &units, &mut visit)?;
+    let widened = alloc_flat_string_body_with_roots(heap, &units, &mut visit)?;
     heap.with_payload(rooted, |b| {
         b.utf16_cache = widened;
         true
@@ -1523,38 +1498,24 @@ mod tests {
     fn ordinary_string_representations_start_in_young_space() {
         let mut heap = GcHeap::new().expect("heap");
         let mut roots = empty_roots;
-        let inline =
-            alloc_flat_string_body_with_roots(&mut heap, JsStringId::new(0), &[0x1234], &mut roots)
-                .expect("inline flat");
+        let inline = alloc_flat_string_body_with_roots(&mut heap, &[0x1234], &mut roots)
+            .expect("inline flat");
         assert!(is_young(inline));
 
         let sequential_units = vec![0x1234; INLINE_FLAT_CAP + 1];
-        let sequential = alloc_flat_string_body_with_roots(
-            &mut heap,
-            JsStringId::new(0),
-            &sequential_units,
-            &mut roots,
-        )
-        .expect("sequential flat");
+        let sequential =
+            alloc_flat_string_body_with_roots(&mut heap, &sequential_units, &mut roots)
+                .expect("sequential flat");
         assert!(is_young(sequential));
 
-        let latin1 = alloc_latin1_string_body_with_roots(
-            &mut heap,
-            JsStringId::new(0),
-            b"latin1",
-            &mut roots,
-        )
-        .expect("inline latin1");
+        let latin1 = alloc_latin1_string_body_with_roots(&mut heap, b"latin1", &mut roots)
+            .expect("inline latin1");
         assert!(is_young(latin1));
 
         let sequential_bytes = vec![b'x'; INLINE_LATIN1_CAP + 1];
-        let sequential_latin1 = alloc_latin1_string_body_with_roots(
-            &mut heap,
-            JsStringId::new(0),
-            &sequential_bytes,
-            &mut roots,
-        )
-        .expect("sequential latin1");
+        let sequential_latin1 =
+            alloc_latin1_string_body_with_roots(&mut heap, &sequential_bytes, &mut roots)
+                .expect("sequential latin1");
         assert!(is_young(sequential_latin1));
     }
 
@@ -1588,46 +1549,22 @@ mod tests {
             }
         }
 
-        inline_wide =
-            alloc_flat_string_body_with_roots(&mut heap, JsStringId::new(0), &[0x1234], &mut roots)
-                .expect("inline wide");
+        inline_wide = alloc_flat_string_body_with_roots(&mut heap, &[0x1234], &mut roots)
+            .expect("inline wide");
         let wide_units = vec![0x2345; INLINE_FLAT_CAP + 1];
-        sequential_wide = alloc_flat_string_body_with_roots(
-            &mut heap,
-            JsStringId::new(0),
-            &wide_units,
-            &mut roots,
-        )
-        .expect("sequential wide");
-        inline_latin1 = alloc_latin1_string_body_with_roots(
-            &mut heap,
-            JsStringId::new(0),
-            b"latin1",
-            &mut roots,
-        )
-        .expect("inline latin1");
+        sequential_wide = alloc_flat_string_body_with_roots(&mut heap, &wide_units, &mut roots)
+            .expect("sequential wide");
+        inline_latin1 = alloc_latin1_string_body_with_roots(&mut heap, b"latin1", &mut roots)
+            .expect("inline latin1");
         let latin1_bytes = vec![b'x'; INLINE_LATIN1_CAP + 1];
-        sequential_latin1 = alloc_latin1_string_body_with_roots(
-            &mut heap,
-            JsStringId::new(0),
-            &latin1_bytes,
-            &mut roots,
-        )
-        .expect("sequential latin1");
-        cons_left = alloc_latin1_string_body_with_roots(
-            &mut heap,
-            JsStringId::new(0),
-            b"abcdefghijklmnop",
-            &mut roots,
-        )
-        .expect("cons left");
-        cons_right = alloc_latin1_string_body_with_roots(
-            &mut heap,
-            JsStringId::new(0),
-            b"qrstuvwxyz012345",
-            &mut roots,
-        )
-        .expect("cons right");
+        sequential_latin1 =
+            alloc_latin1_string_body_with_roots(&mut heap, &latin1_bytes, &mut roots)
+                .expect("sequential latin1");
+        cons_left = alloc_latin1_string_body_with_roots(&mut heap, b"abcdefghijklmnop", &mut roots)
+            .expect("cons left");
+        cons_right =
+            alloc_latin1_string_body_with_roots(&mut heap, b"qrstuvwxyz012345", &mut roots)
+                .expect("cons right");
         cons = concat_string_bodies(&mut heap, cons_left, cons_right, &mut roots).expect("cons");
         sliced =
             slice_string_body(&mut heap, sequential_latin1, 5, 10, &mut roots).expect("sliced");
@@ -1686,10 +1623,9 @@ mod tests {
     fn allocates_empty_flat_string() {
         let mut heap = GcHeap::new().expect("heap");
         let mut roots = empty_roots;
-        let s = alloc_flat_string_body_with_roots(&mut heap, JsStringId::new(1), &[], &mut roots)
-            .expect("flat");
+        let s = alloc_flat_string_body_with_roots(&mut heap, &[], &mut roots).expect("flat");
         heap.read_payload(s, |b| {
-            assert_eq!(b.id().get(), 1);
+            assert_eq!(b.cached_atom(), None);
             assert_eq!(b.len(), 0);
             assert!(b.is_empty());
             assert!(matches!(b.repr, JsStringBodyRepr::InlineFlat(_)));
@@ -1702,9 +1638,7 @@ mod tests {
         let mut heap = GcHeap::new().expect("heap");
         let mut roots = empty_roots;
         let units: Vec<u16> = (0..200).map(|i| (i % 0xd7ff) as u16).collect();
-        let s =
-            alloc_flat_string_body_with_roots(&mut heap, JsStringId::new(7), &units, &mut roots)
-                .expect("flat");
+        let s = alloc_flat_string_body_with_roots(&mut heap, &units, &mut roots).expect("flat");
         heap.read_payload(s, |b| {
             assert_eq!(b.len(), units.len() as u32);
             assert_eq!(b.hash, 0, "allocation never hashes");
@@ -1731,20 +1665,9 @@ mod tests {
         }
         let left_units: Vec<u16> = std::iter::repeat_n(b'a' as u16, 16).collect();
         let right_units: Vec<u16> = std::iter::repeat_n(b'b' as u16, 16).collect();
-        left = alloc_flat_string_body_with_roots(
-            &mut heap,
-            JsStringId::new(0),
-            &left_units,
-            &mut roots,
-        )
-        .expect("left");
-        right = alloc_flat_string_body_with_roots(
-            &mut heap,
-            JsStringId::new(0),
-            &right_units,
-            &mut roots,
-        )
-        .expect("right");
+        left = alloc_flat_string_body_with_roots(&mut heap, &left_units, &mut roots).expect("left");
+        right =
+            alloc_flat_string_body_with_roots(&mut heap, &right_units, &mut roots).expect("right");
         cons = concat_string_bodies(&mut heap, left, right, &mut roots).expect("cons");
         heap.read_payload(cons, |b| {
             assert_eq!(b.len(), 32);
@@ -1771,8 +1694,7 @@ mod tests {
             .iter()
             .map(|&b| b as u16)
             .collect();
-        flat = alloc_flat_string_body_with_roots(&mut heap, JsStringId::new(0), &units, &mut roots)
-            .expect("flat");
+        flat = alloc_flat_string_body_with_roots(&mut heap, &units, &mut roots).expect("flat");
         view = slice_string_body(&mut heap, flat, 6, 20, &mut roots).expect("slice");
         heap.read_payload(view, |b| {
             assert_eq!(b.len(), 20);
@@ -1785,13 +1707,8 @@ mod tests {
     fn latin1_body_round_trips() {
         let mut heap = GcHeap::new().expect("heap");
         let mut roots = empty_roots;
-        let s = alloc_latin1_string_body_with_roots(
-            &mut heap,
-            JsStringId::new(0),
-            b"hello",
-            &mut roots,
-        )
-        .expect("latin1");
+        let s =
+            alloc_latin1_string_body_with_roots(&mut heap, b"hello", &mut roots).expect("latin1");
         heap.read_payload(s, |b| {
             assert_eq!(b.len(), 5);
             assert!(matches!(b.repr, JsStringBodyRepr::InlineLatin1(_)));
@@ -1813,9 +1730,8 @@ mod tests {
             scope.add_raw_slot((&mut view as *mut JsStringHandle).cast::<RawGc>());
         }
         let bytes = b"0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
-        parent =
-            alloc_latin1_string_body_with_roots(&mut heap, JsStringId::new(0), bytes, &mut roots)
-                .expect("latin1 parent");
+        parent = alloc_latin1_string_body_with_roots(&mut heap, bytes, &mut roots)
+            .expect("latin1 parent");
         view = slice_string_body(&mut heap, parent, 10, 30, &mut roots).expect("slice");
         let expected = &bytes[10..40];
         heap.read_payload(view, |body| {
@@ -1854,7 +1770,6 @@ mod tests {
         }
         parent = alloc_latin1_string_body_with_roots(
             &mut heap,
-            JsStringId::new(0),
             b"0123456789abcdefghijklmnopqrstuvwxyz",
             &mut roots,
         )
@@ -1885,9 +1800,8 @@ mod tests {
             scope.add_raw_slot((&mut inner as *mut JsStringHandle).cast::<RawGc>());
         }
         let bytes = b"0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
-        parent =
-            alloc_latin1_string_body_with_roots(&mut heap, JsStringId::new(0), bytes, &mut roots)
-                .expect("latin1 parent");
+        parent = alloc_latin1_string_body_with_roots(&mut heap, bytes, &mut roots)
+            .expect("latin1 parent");
         outer = slice_string_body(&mut heap, parent, 10, 50, &mut roots).expect("outer");
         inner = slice_string_body(&mut heap, outer, 5, 30, &mut roots).expect("inner");
         heap.read_payload(inner, |body| {
@@ -1925,20 +1839,11 @@ mod tests {
             scope.add_raw_slot((&mut cons as *mut JsStringHandle).cast::<RawGc>());
             scope.add_raw_slot((&mut flat as *mut JsStringHandle).cast::<RawGc>());
         }
-        left = alloc_flat_string_body_with_roots(
-            &mut heap,
-            JsStringId::new(0),
-            &[b'a' as u16, b'b' as u16],
-            &mut roots,
-        )
-        .expect("left");
-        right = alloc_flat_string_body_with_roots(
-            &mut heap,
-            JsStringId::new(0),
-            &[b'c' as u16],
-            &mut roots,
-        )
-        .expect("right");
+        left =
+            alloc_flat_string_body_with_roots(&mut heap, &[b'a' as u16, b'b' as u16], &mut roots)
+                .expect("left");
+        right = alloc_flat_string_body_with_roots(&mut heap, &[b'c' as u16], &mut roots)
+            .expect("right");
         cons = concat_string_bodies(&mut heap, left, right, &mut roots).expect("cons");
         flat = flatten_string_body(&mut heap, cons, &mut roots).expect("flat");
         heap.read_payload(flat, |b| {
@@ -1961,27 +1866,9 @@ mod tests {
             scope.add_raw_slot((&mut b as *mut JsStringHandle).cast::<RawGc>());
             scope.add_raw_slot((&mut c as *mut JsStringHandle).cast::<RawGc>());
         }
-        a = alloc_flat_string_body_with_roots(
-            &mut heap,
-            JsStringId::new(0),
-            &[1, 2, 3],
-            &mut roots,
-        )
-        .expect("a");
-        b = alloc_flat_string_body_with_roots(
-            &mut heap,
-            JsStringId::new(0),
-            &[1, 2, 3],
-            &mut roots,
-        )
-        .expect("b");
-        c = alloc_flat_string_body_with_roots(
-            &mut heap,
-            JsStringId::new(0),
-            &[1, 2, 4],
-            &mut roots,
-        )
-        .expect("c");
+        a = alloc_flat_string_body_with_roots(&mut heap, &[1, 2, 3], &mut roots).expect("a");
+        b = alloc_flat_string_body_with_roots(&mut heap, &[1, 2, 3], &mut roots).expect("b");
+        c = alloc_flat_string_body_with_roots(&mut heap, &[1, 2, 4], &mut roots).expect("c");
         assert!(equals_string_bodies(&heap, a, a));
         assert!(equals_string_bodies(&heap, a, b));
         assert!(!equals_string_bodies(&heap, a, c));

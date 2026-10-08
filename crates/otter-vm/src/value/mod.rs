@@ -2307,7 +2307,7 @@ mod tests {
 
     #[test]
     fn string_gc_round_trip_via_real_heap() {
-        use crate::string::{JsStringId, alloc_flat_string_body_with_roots};
+        use crate::string::alloc_flat_string_body_with_roots;
         use otter_gc::GcHeap;
         use otter_gc::raw::RawGc;
 
@@ -2315,8 +2315,7 @@ mod tests {
         let mut roots = |_v: &mut dyn FnMut(*mut RawGc)| {};
         let units = [b'a' as u16, b'b' as u16, b'c' as u16];
         let body =
-            alloc_flat_string_body_with_roots(&mut heap, JsStringId::new(1), &units, &mut roots)
-                .expect("string");
+            alloc_flat_string_body_with_roots(&mut heap, &units, &mut roots).expect("string");
         let v = Value::string_gc(body);
         assert!(v.is_string());
         assert_eq!(v.kind(), ValueKind::PtrString);
@@ -2338,7 +2337,7 @@ mod tests {
         assert_eq!(Value::number_f64(f64::NAN).typeof_pure(), Some("number"));
         assert_eq!(Value::function_id(0).typeof_pure(), Some("function"));
 
-        use crate::string::{JsStringId, alloc_flat_string_body_with_roots};
+        use crate::string::alloc_flat_string_body_with_roots;
         use crate::symbol::{WellKnown, alloc_symbol};
         use crate::{Value as LegacyValue, alloc_closure};
         use otter_gc::GcHeap;
@@ -2348,13 +2347,8 @@ mod tests {
         let closure =
             alloc_closure(&mut heap, 1, LegacyValue::undefined(), None, None).expect("clo");
         assert_eq!(Value::closure(closure).typeof_pure(), Some("function"));
-        let body = alloc_flat_string_body_with_roots(
-            &mut heap,
-            JsStringId::new(1),
-            &[b'a' as u16],
-            &mut roots,
-        )
-        .expect("string");
+        let body = alloc_flat_string_body_with_roots(&mut heap, &[b'a' as u16], &mut roots)
+            .expect("string");
         assert_eq!(Value::string_gc(body).typeof_pure(), Some("string"));
         // Symbol / bigint need heap-side primitives to finish typeof.
         let sym = alloc_symbol(&mut heap, None, Some(WellKnown::Iterator), false).expect("sym");
@@ -2387,7 +2381,7 @@ mod tests {
         assert_eq!(Value::function_id(0).to_boolean_pure(), Some(true));
 
         use crate::object::alloc_fixture_object_with_roots as alloc_object_with_roots;
-        use crate::string::{JsStringId, alloc_flat_string_body_with_roots};
+        use crate::string::alloc_flat_string_body_with_roots;
         use crate::{Value as LegacyValue, alloc_closure};
         use otter_gc::GcHeap;
         use otter_gc::raw::RawGc;
@@ -2400,13 +2394,8 @@ mod tests {
         assert_eq!(Value::closure(closure).to_boolean_pure(), Some(true));
 
         // Strings need a length probe to finish ToBoolean.
-        let body = alloc_flat_string_body_with_roots(
-            &mut heap,
-            JsStringId::new(1),
-            &[b'a' as u16],
-            &mut roots,
-        )
-        .expect("string");
+        let body = alloc_flat_string_body_with_roots(&mut heap, &[b'a' as u16], &mut roots)
+            .expect("string");
         assert_eq!(Value::string_gc(body).to_boolean_pure(), None);
     }
 
@@ -2475,7 +2464,7 @@ mod tests {
 
         use crate::bigint::BigIntValue;
         use crate::object::alloc_fixture_object_with_roots as alloc_object_with_roots;
-        use crate::string::{JsStringId, alloc_flat_string_body_with_roots};
+        use crate::string::alloc_flat_string_body_with_roots;
         use crate::{Value as LegacyValue, alloc_closure};
         use num_bigint::BigInt;
         use otter_gc::GcHeap;
@@ -2485,13 +2474,8 @@ mod tests {
         let obj = alloc_object_with_roots(&mut heap, &mut roots).expect("obj");
         let closure =
             alloc_closure(&mut heap, 1, LegacyValue::undefined(), None, None).expect("clo");
-        let body = alloc_flat_string_body_with_roots(
-            &mut heap,
-            JsStringId::new(1),
-            &[b'a' as u16],
-            &mut roots,
-        )
-        .expect("string");
+        let body = alloc_flat_string_body_with_roots(&mut heap, &[b'a' as u16], &mut roots)
+            .expect("string");
         let big = BigIntValue::from_num(&mut heap, &BigInt::from(7))
             .map(BigIntValue::handle)
             .expect("big");

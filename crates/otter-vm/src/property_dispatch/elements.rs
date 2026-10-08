@@ -124,14 +124,24 @@ impl Interpreter {
             );
         }
         let value = if let Some(obj) = recv.as_object() {
-            let name;
+            let name: std::sync::Arc<str>;
             let key = if let Some(sym) = idx_value.as_symbol(&self.gc_heap) {
                 VmPropertyKey::Symbol(sym)
+            } else if let Some((atom, spelling)) = idx_value
+                .as_string(&self.gc_heap)
+                .and_then(|key| self.interned_string_key(key))
+            {
+                // An interned key spells its atom: no decoding, one lookup.
+                name = spelling;
+                VmPropertyKey::Atom(crate::property_atom::AtomizedPropertyKey::new(
+                    crate::property_atom::PropertyAtom::new(atom),
+                    &name,
+                ))
             } else {
                 name = if let Some(key) = idx_value.as_string(&self.gc_heap) {
-                    key.to_lossy_string(&self.gc_heap)
+                    key.to_lossy_string(&self.gc_heap).into()
                 } else if let Some(n) = idx_value.as_number() {
-                    n.to_display_string()
+                    n.to_display_string().into()
                 } else {
                     return Err(CommittedValueError::JavaScript(VmError::TypeMismatch));
                 };

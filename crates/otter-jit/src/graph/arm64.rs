@@ -1379,11 +1379,15 @@ impl<'a> Codegen<'a> {
             // prototype shape receives; a shape's state never changes, and
             // this code keeps its shapes alive, so an exact match proves the
             // receiver's role too.
-            Kind::CheckShapes { shapes, .. } => {
+            Kind::CheckShapes {
+                shapes,
+                object_proved,
+                ..
+            } => {
                 let a = Self::gp(input(0));
                 let exit = self.eager_exit(node, DeoptReason::WrongShape);
-                let shapes = shapes.clone();
-                self.emit_check_shapes(a, &shapes, exit);
+                let (shapes, object_proved) = (shapes.clone(), *object_proved);
+                self.emit_check_shapes(a, &shapes, object_proved, exit);
             }
             Kind::CheckBounds => {
                 let (index, length) = (Self::gp(input(0)), Self::gp(input(1)));
@@ -2078,10 +2082,13 @@ impl<'a> Codegen<'a> {
         &mut self,
         object: u8,
         shapes: &[u32],
+        object_proved: bool,
         exit: DynamicLabel,
     ) {
         let matched = self.ops.new_dynamic_label();
-        self.emit_object_receiver(object, exit);
+        if !object_proved {
+            self.emit_object_receiver(object, exit);
+        }
         let shape_byte = self.view.object_shape_byte;
         dynasm!(self.ops ; .arch aarch64 ; ldr w16, [X(object), shape_byte]);
         for (index, &shape) in shapes.iter().enumerate() {

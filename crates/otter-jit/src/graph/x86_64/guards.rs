@@ -47,9 +47,15 @@ impl Codegen<'_> {
             // prototype shape receives; a shape's state never changes, and
             // this code keeps its shapes alive, so an exact match proves the
             // receiver's role too.
-            Kind::CheckShapes { shapes, .. } => {
+            Kind::CheckShapes {
+                shapes,
+                object_proved,
+                ..
+            } => {
                 let exit = self.eager_exit(node, DeoptReason::WrongShape);
-                self.emit_object_receiver(input(0), exit);
+                if !object_proved {
+                    self.emit_object_receiver(input(0), exit);
+                }
                 let matched = self.ops.new_dynamic_label();
                 self.emit_body_load(
                     input(0),

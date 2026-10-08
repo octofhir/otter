@@ -18,7 +18,14 @@ parameters, and `A` earlier compiler invocations for this function and tier.
 The fixed compiler-work estimates are:
 
 - Template: `334 + 23*N + 4*R + 7*P` source-opcode work units.
-- Optimizing Graph: `750 + 88*N + 2*R + 4*P` source-opcode work units.
+- Optimizing Graph: `750 + 400*N + 2*R + 4*P` source-opcode work units.
+
+The Graph per-instruction term is V8's Maglev invocation budget
+(`invocation_count_for_maglev`: 400 executions of the function's bytecode), not
+a compile-cost conversion. Admitting a function earlier compiles paths that have
+not run yet; their insufficient-feedback deopts, retraining and recompiles cost
+more than the compile itself. On the fixed-work TypeScript compiler run the
+previous 88 per instruction cost 6% more instructions than 400.
 
 Predicted code bytes are `560 + 56*N + 16*R` for Template and
 `320 + 38*N + 16*R` for Graph. The memory charge is
@@ -52,11 +59,12 @@ source work. The static code estimate predicts compiler/memory work; it does not
 replace actual retained resource usage or create a second ledger.
 
 For the synthetic geometry `N=1, R=1, P=0, A=0`, required work is 573 Template
-attempts or 916 Graph attempts. These are geometry examples, not universal call
+attempts or 1228 Graph attempts. These are geometry examples, not universal call
 thresholds. Only instructions actually entered on a path accumulate work.
 
 `fit_cost_model.py` converts historical compiler-cost coefficients offline using
-12 ns per Template source opcode and 20 ns per Graph source opcode. Each
+12 ns per Template source opcode and 20 ns per Graph source opcode, then takes the
+Graph per-instruction term from the V8 budget above. Each
 coefficient is rounded upward: for example, `ceil(4000/12)=334` and
 `ceil(270/12)=23`. The historical 4 ns/byte memory charge converts to the exact
 divisors 3 and 5. The 12/20 denominators are conservative terms retained from the
@@ -71,7 +79,7 @@ and selects the retained capacity CDF. It performs no engine run, new benchmark,
 or leave-one-workload-out refit.
 
 For the direct anchor geometry `N=13, R=12, P=2, A=0`, it prints minimum required
-work of 1190 Template attempts and 2129 Graph attempts. This is a static compiler
+work of 1190 Template attempts and 6185 Graph attempts. This is a static compiler
 geometry estimate, conditional on sufficient `available_code_bytes`. The script
 also labels predicted code geometry as `estimated_code_bytes`; the old census
 contains no exact retained-lease headroom samples and reports that input as

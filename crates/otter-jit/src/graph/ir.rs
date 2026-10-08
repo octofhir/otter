@@ -218,8 +218,11 @@ pub(crate) enum Kind {
     /// Checked multiply; eager deopt on overflow and on a `-0` product.
     Int32Mul,
     /// Unchecked multiply whose operands' ranges prove the product fits
-    /// int32 and is not `-0`.
+    /// int32 and is not `-0`, or whose uses all identify `-0` with `0`.
     Int32MulExact,
+    /// Multiply that deopts on overflow only: every use identifies a `-0`
+    /// product with `0`.
+    Int32MulIdentifyZeros,
     /// Checked exact division; deopt on a remainder, zero divisor, overflow
     /// or negative zero.
     Int32Div,
@@ -634,6 +637,7 @@ impl Kind {
             Self::Int32Add
             | Self::Int32Sub
             | Self::Int32Mul
+            | Self::Int32MulIdentifyZeros
             | Self::Int32Div
             | Self::Int32Mod
             | Self::Int32Negate
@@ -868,6 +872,7 @@ impl Kind {
             },
             Self::Int32Mul
             | Self::Int32MulExact
+            | Self::Int32MulIdentifyZeros
             | Self::Float64Add
             | Self::Float64Sub
             | Self::Float64Mul

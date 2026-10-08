@@ -1,8 +1,11 @@
-//! Truncated-use selection of wrapping int32 additions.
+//! Truncated-use selection of wrapping int32 additions, and the int32 values
+//! whose uses cannot tell `-0` from `0`.
 //!
 //! # Contents
 //! - [`wrap_truncated_arithmetic`] — turn a checked `Int32Add`/`Int32Sub`
 //!   whose every use truncates its result into the two's-complement form.
+//! - [`zero_insensitive`] — the int32 values every use of which identifies
+//!   `-0` with `0` (TurboFan's `IdentifyZeros` truncation).
 //!
 //! # Invariants
 //! - Both operands are int32, so the exact sum or difference is an integer
@@ -17,6 +20,13 @@
 //!   interpreter with exact values, so a node any frame state captures keeps
 //!   its overflow check.
 //! - A selected node no longer deopts; it drops its eager frame state.
+//! - A use identifies zeros when it applies `ToInt32`/`ToUint32`, compares
+//!   int32 operands, or reads an element index, or when it is an int32
+//!   addition, subtraction, multiplication, negation or phi whose own uses
+//!   all identify zeros: such an operation maps operands that differ only in
+//!   the sign of a zero to results that differ only in the sign of a zero.
+//!   A frame state is not a use: the interpreter it resumes reads the value
+//!   only through the bytecode reads the graph's uses stand for.
 //!
 //! # See also
 //! - [`super::phi_repr`] — unboxes the phis these additions feed.
@@ -24,7 +34,7 @@
 
 use rustc_hash::FxHashSet;
 
-use super::ir::{BlockId, Graph, Kind, NodeId};
+use super::ir::{BlockId, BranchKind, Graph, Kind, NodeId, Repr};
 
 /// Whether `user` reads its input `index` through `ToInt32`/`ToUint32`.
 fn truncates(kind: &Kind, wrapping: bool) -> bool {
@@ -40,6 +50,81 @@ fn truncates(kind: &Kind, wrapping: bool) -> bool {
         Kind::Int32Add | Kind::Int32Sub => wrapping,
         _ => false,
     }
+}
+
+/// Whether `user`, reading `value` at input `index`, sees `-0` and `0` alike
+/// by itself (`Some(true)`), only when its own result does (`None`), or
+/// tells them apart (`Some(false)`).
+fn identifies_zeros(kind: &Kind, index: usize) -> Option<bool> {
+    match kind {
+        _ if truncates(kind, false) => Some(true),
+        Kind::Int32Compare(_)
+        | Kind::Branch {
+            kind: BranchKind::Int32(_),
+            ..
+        } => Some(true),
+        Kind::CheckBounds => Some(index == 0),
+        Kind::LoadElement(_)
+        | Kind::LoadHoleyFloat64Element(_)
+        | Kind::LoadElementUint32ToFloat64
+        | Kind::CheckElementPresent
+        | Kind::CheckHoleyElementPresent(_)
+        | Kind::StoreElement(_)
+        | Kind::ElementWriteBarrier => Some(index == 1),
+        Kind::Int32Add
+        | Kind::Int32Sub
+        | Kind::Int32AddWrapping
+        | Kind::Int32SubWrapping
+        | Kind::Int32Mul
+        | Kind::Int32MulExact
+        | Kind::Int32MulIdentifyZeros
+        | Kind::Int32Negate
+        | Kind::Phi => None,
+        _ => Some(false),
+    }
+}
+
+/// The int32 nodes whose every use identifies `-0` with `0`.
+pub(crate) fn zero_insensitive(graph: &Graph, layout: &[BlockId]) -> FxHashSet<NodeId> {
+    let mut insensitive: FxHashSet<NodeId> = FxHashSet::default();
+    let mut uses: Vec<(NodeId, NodeId, usize)> = Vec::new();
+    for &block in layout {
+        let data = graph.block(block);
+        for &node in data
+            .phis
+            .iter()
+            .chain(&data.body)
+            .chain(data.control.iter())
+        {
+            let node_data = graph.node(node);
+            if node_data.repr == Repr::Int32 {
+                insensitive.insert(node);
+            }
+            for (index, &input) in node_data.inputs.iter().enumerate() {
+                uses.push((input, node, index));
+            }
+        }
+    }
+    // Drop values with a use that may tell the zeros apart until the set is
+    // closed under its own transparent uses.
+    loop {
+        let mut dropped = false;
+        for &(value, user, index) in &uses {
+            if !insensitive.contains(&value) {
+                continue;
+            }
+            let identifies = identifies_zeros(&graph.node(user).kind, index)
+                .unwrap_or_else(|| insensitive.contains(&user));
+            if !identifies {
+                insensitive.remove(&value);
+                dropped = true;
+            }
+        }
+        if !dropped {
+            break;
+        }
+    }
+    insensitive
 }
 
 /// Select every checked int32 addition whose uses all truncate it.
@@ -99,5 +184,48 @@ pub(crate) fn wrap_truncated_arithmetic(graph: &mut Graph, layout: &[BlockId]) {
             _ => Kind::Int32SubWrapping,
         };
         data.eager = None;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn append(graph: &mut Graph, block: BlockId, kind: Kind, inputs: &[NodeId], repr: Repr) -> NodeId {
+        let node = graph.add_node(kind, inputs, repr);
+        graph.node_mut(node).block = Some(block);
+        graph.block_mut(block).body.push(node);
+        node
+    }
+
+    #[test]
+    fn a_product_identifies_zeros_only_through_zero_blind_uses() {
+        let mut graph = Graph::default();
+        let block = graph.new_block();
+        let a = append(&mut graph, block, Kind::InitialRegister(0), &[], Repr::Int32);
+        let b = append(&mut graph, block, Kind::InitialRegister(1), &[], Repr::Int32);
+        let mask = graph.constant(Kind::ConstInt32(0x3fff));
+        // Truncated through an addition: the sign of a zero product is lost.
+        let truncated = append(&mut graph, block, Kind::Int32Mul, &[a, b], Repr::Int32);
+        let sum = append(&mut graph, block, Kind::Int32Add, &[truncated, b], Repr::Int32);
+        let masked = append(&mut graph, block, Kind::Int32BitAnd, &[sum, mask], Repr::Int32);
+        // Boxed: `-0` is observable.
+        let boxed = append(&mut graph, block, Kind::Int32Mul, &[a, b], Repr::Int32);
+        let tagged = append(&mut graph, block, Kind::Int32ToTagged, &[boxed], Repr::Tagged);
+        // Added into a value that is boxed: the sum keeps the zero's sign.
+        let summed = append(&mut graph, block, Kind::Int32Mul, &[a, b], Repr::Int32);
+        let exact_sum = append(&mut graph, block, Kind::Int32Add, &[summed, b], Repr::Int32);
+        let exact = append(&mut graph, block, Kind::Int32ToTagged, &[exact_sum], Repr::Tagged);
+        let returned = graph.add_node(Kind::Return, &[tagged], Repr::None);
+        graph.node_mut(returned).block = Some(block);
+        graph.block_mut(block).control = Some(returned);
+        let _ = (masked, exact);
+
+        let insensitive = zero_insensitive(&graph, &[block]);
+        assert!(insensitive.contains(&truncated));
+        assert!(insensitive.contains(&sum));
+        assert!(!insensitive.contains(&boxed));
+        assert!(!insensitive.contains(&summed));
+        assert!(!insensitive.contains(&exact_sum));
     }
 }

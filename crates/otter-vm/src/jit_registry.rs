@@ -872,6 +872,21 @@ impl JitCodeRegistry {
         generations
     }
 
+    /// Calls of `function_id` its generated generations and its interpreter
+    /// route have counted, drained or not.
+    pub(crate) fn counted_entries(&self, function_id: u32) -> u64 {
+        let routed = self
+            .function_entry_cells
+            .get(&function_id)
+            .map_or(0, |function| function.interpreter_destination().generated_feedback().0);
+        self.entry_cells
+            .values()
+            .map(|entry| entry.cell.as_ref())
+            .filter(|cell| cell.native_frame_header.function_id == function_id)
+            .map(|cell| cell.generated_feedback().0)
+            .fold(routed, u64::saturating_add)
+    }
+
     /// Drain exact-generation generated-call deltas for cold tier-policy and
     /// budget reconciliation. Entry cells are retained tombstones, so feedback
     /// remains available after invalidation and executable retirement.

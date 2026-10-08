@@ -277,6 +277,14 @@ struct Allocator<'g> {
 
 const NO_POSITION: u32 = u32::MAX;
 
+/// Values that share one canonical home over the hull of their intervals.
+struct HomeBundle {
+    start: u32,
+    end: u32,
+    tagged: bool,
+    values: Vec<NodeId>,
+}
+
 /// Allocate `graph` in `layout` order.
 pub(crate) fn allocate(
     graph: &Graph,
@@ -1314,8 +1322,7 @@ impl<'g> Allocator<'g> {
     /// final walk can activate a home at any use without changing its
     /// location or the frame's tagged/untagged boundary.
     fn plan_homes(&self) -> Allocation {
-        let mut values: Vec<NodeId> = self.out.spill.keys().copied().collect();
-        values.sort_unstable_by_key(|&value| (self.pos(value), value));
+        let bundles = self.home_bundles();
         let mut out = Allocation {
             nodes: vec![NodeAllocation::default(); self.graph.nodes.len()],
             definition_spills: self.out.definition_spills.clone(),
@@ -1327,10 +1334,9 @@ impl<'g> Allocator<'g> {
             std::collections::BinaryHeap::new();
         let mut free_tagged = std::collections::BinaryHeap::new();
         let mut free_untagged = std::collections::BinaryHeap::new();
-        for value in values {
-            let start = self.pos(value);
-            let is_tagged = self.graph.node(value).repr == Repr::Tagged;
-            let (active, free, count) = if is_tagged {
+        for bundle in bundles {
+            let start = bundle.start;
+            let (active, free, count) = if bundle.tagged {
                 (&mut tagged, &mut free_tagged, &mut out.tagged_slots)
             } else {
                 (&mut untagged, &mut free_untagged, &mut out.untagged_slots)
@@ -1350,17 +1356,100 @@ impl<'g> Allocator<'g> {
                 },
                 |std::cmp::Reverse(slot)| slot,
             );
-            active.push(std::cmp::Reverse((self.last_use(value), slot)));
-            out.spill.insert(
-                value,
-                if is_tagged {
-                    Location::TaggedSlot(slot)
-                } else {
-                    Location::UntaggedSlot(slot)
-                },
-            );
+            active.push(std::cmp::Reverse((bundle.end, slot)));
+            let home = if bundle.tagged {
+                Location::TaggedSlot(slot)
+            } else {
+                Location::UntaggedSlot(slot)
+            };
+            for value in bundle.values {
+                out.spill.insert(value, home);
+            }
         }
         out
+    }
+
+    /// The values that share one home, in order of their first definition.
+    /// A phi joins every input of its representation whose live interval
+    /// overlaps no member's, as V8's register allocator bundles a phi with
+    /// its inputs before assigning spill slots: the edge into the phi then
+    /// moves nothing between homes. A bundle's slot is held over its whole
+    /// hull, which for a loop phi and its back-edge input is the loop.
+    fn home_bundles(&self) -> Vec<HomeBundle> {
+        let mut values: Vec<NodeId> = self.out.spill.keys().copied().collect();
+        values.sort_unstable_by_key(|&value| (self.pos(value), value));
+        let index: FxHashMap<NodeId, usize> = values
+            .iter()
+            .enumerate()
+            .map(|(index, &value)| (value, index))
+            .collect();
+        let tagged = |value: NodeId| self.graph.node(value).repr == Repr::Tagged;
+        let mut parent: Vec<usize> = (0..values.len()).collect();
+        let mut intervals: Vec<Vec<(u32, u32)>> = values
+            .iter()
+            .map(|&value| {
+                let start = self.pos(value);
+                vec![(start, self.last_use(value).max(start))]
+            })
+            .collect();
+        fn root(parent: &mut [usize], mut member: usize) -> usize {
+            while parent[member] != member {
+                parent[member] = parent[parent[member]];
+                member = parent[member];
+            }
+            member
+        }
+        fn overlap(left: &[(u32, u32)], right: &[(u32, u32)]) -> bool {
+            let (mut i, mut j) = (0, 0);
+            while i < left.len() && j < right.len() {
+                let ((a_start, a_end), (b_start, b_end)) = (left[i], right[j]);
+                if a_start <= b_end && b_start <= a_end {
+                    return true;
+                }
+                if a_end < b_end { i += 1 } else { j += 1 }
+            }
+            false
+        }
+        for (phi_index, &phi) in values.iter().enumerate() {
+            if self.graph.node(phi).kind != Kind::Phi {
+                continue;
+            }
+            for &input in &self.graph.node(phi).inputs {
+                let Some(&input_index) = index.get(&input) else {
+                    continue;
+                };
+                if tagged(input) != tagged(phi) {
+                    continue;
+                }
+                let (a, b) = (root(&mut parent, phi_index), root(&mut parent, input_index));
+                if a == b || overlap(&intervals[a], &intervals[b]) {
+                    continue;
+                }
+                let mut merged = std::mem::take(&mut intervals[b]);
+                merged.extend(std::mem::take(&mut intervals[a]));
+                merged.sort_unstable();
+                intervals[a] = merged;
+                parent[b] = a;
+            }
+        }
+        let mut bundles: FxHashMap<usize, HomeBundle> = FxHashMap::default();
+        for (member, &value) in values.iter().enumerate() {
+            let owner = root(&mut parent, member);
+            let span = &intervals[owner];
+            bundles
+                .entry(owner)
+                .or_insert_with(|| HomeBundle {
+                    start: span.first().map_or(0, |&(start, _)| start),
+                    end: span.iter().map(|&(_, end)| end).max().unwrap_or(0),
+                    tagged: tagged(value),
+                    values: Vec::new(),
+                })
+                .values
+                .push(value);
+        }
+        let mut bundles: Vec<HomeBundle> = bundles.into_values().collect();
+        bundles.sort_unstable_by_key(|bundle| (bundle.start, bundle.values[0]));
+        bundles
     }
 
     fn snapshot(&self) -> Vec<(NodeId, Location)> {

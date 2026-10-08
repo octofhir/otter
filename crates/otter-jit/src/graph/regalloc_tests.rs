@@ -1186,7 +1186,7 @@ fn boundary_roots_the_live_occupant_of_a_reused_slot() {
         Repr::Tagged,
     );
     let first_state = state(&mut graph, &[first]);
-    let first_check = collecting_reader(&mut graph, block, first_state);
+    collecting_reader(&mut graph, block, first_state);
     let second = append(
         &mut graph,
         block,
@@ -1316,7 +1316,7 @@ fn boundary_does_not_root_an_unproduced_collecting_result() {
         Repr::Tagged,
     );
     let first_state = state(&mut graph, &[first]);
-    let first_check = collecting_reader(&mut graph, block, first_state);
+    collecting_reader(&mut graph, block, first_state);
     let null = graph.constant(Kind::ConstTagged(otter_vm::value::tag::VALUE_NULL));
     let point = append(
         &mut graph,
@@ -1981,5 +1981,44 @@ fn empty_allocation_pressure_keeps_late_output_occupant_and_memory_homes() {
             .as_deref()
             .is_some_and(|rooted| rooted.contains(&object_home)),
         "array collection must root the previously allocated object even if memory-only"
+    );
+}
+
+#[test]
+fn a_loop_phi_shares_its_home_with_a_back_edge_input_it_never_overlaps() {
+    let mut graph = Graph::default();
+    let entry = graph.new_block();
+    let header = graph.new_block();
+    graph.block_mut(header).predecessors = vec![entry, header];
+    graph.block_mut(header).is_loop = true;
+    let initial = append(
+        &mut graph,
+        entry,
+        Kind::InitialRegister(0),
+        &[],
+        Repr::Tagged,
+    );
+    terminate(&mut graph, entry, Kind::Jump(header), &[]);
+    let phi = graph.add_node(Kind::Phi, &[initial, initial], Repr::Tagged);
+    graph.node_mut(phi).block = Some(header);
+    graph.block_mut(header).phis.push(phi);
+    let before = state(&mut graph, &[phi]);
+    collecting_reader(&mut graph, header, before);
+    let next = append(
+        &mut graph,
+        header,
+        Kind::InitialRegister(1),
+        &[],
+        Repr::Tagged,
+    );
+    graph.node_mut(phi).inputs[1] = next;
+    let after = state(&mut graph, &[next]);
+    collecting_reader(&mut graph, header, after);
+    terminate(&mut graph, header, Kind::JumpLoop(header), &[]);
+
+    let allocation = allocate(&graph, &[entry, header], AARCH64);
+    assert_eq!(
+        allocation.spill[&phi], allocation.spill[&next],
+        "the back edge moves nothing between homes"
     );
 }

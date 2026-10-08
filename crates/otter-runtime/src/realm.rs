@@ -428,6 +428,10 @@ impl crate::Runtime {
                             task_spawner.clone(),
                         )?;
                     }
+                    // The glue below already calls these natives (a namespace's
+                    // private natives sit on it until then): they must run in
+                    // this realm.
+                    interp.tag_active_realm_natives();
                     let mut context = RuntimeRealmContext::new(
                         interp,
                         &config.capabilities,
@@ -639,12 +643,7 @@ impl crate::Runtime {
             .interp
             .with_host_realm(realm.realm, |interp| {
                 Ok(execute_linked_module_in_active_realm(
-                    interp,
-                    records,
-                    &config,
-                    &commonjs,
-                    linked,
-                    started,
+                    interp, records, &config, &commonjs, linked, started,
                 ))
             })
             .map_err(map_realm_vm_error)??;

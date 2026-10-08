@@ -39,14 +39,15 @@ use crate::native_abi::{
     STUB_COLLECTION_MAP_GET_LEAF, STUB_COLLECTION_MAP_HAS_ALLOC, STUB_COLLECTION_MAP_HAS_LEAF,
     STUB_COLLECTION_MAP_SET_ALLOC, STUB_COLLECTION_MAP_SET_MUTATING, STUB_COLLECTION_SET_ADD_ALLOC,
     STUB_COLLECTION_SET_DELETE_ALLOC, STUB_COLLECTION_SET_HAS_ALLOC, STUB_COLLECTION_SET_HAS_LEAF,
-    STUB_COPY_CONTEXT_ALLOC, STUB_CREATE_CONTEXT_ALLOC, STUB_JIT_MAKE_CLOSURE, STUB_JIT_MAKE_FN,
-    STUB_MATH_ABS_LEAF, STUB_MATH_FLOOR_LEAF, STUB_MATH_MAX_LEAF, STUB_MATH_MIN_LEAF,
-    STUB_MATH_SQRT_LEAF, STUB_NUMBER_POW_F64_LEAF, STUB_NUMBER_REM_F64_LEAF, STUB_NUMBER_REM_LEAF,
-    STUB_NUMBER_TO_INT32_F64_LEAF, STUB_PARSE_INT_I32_LEAF, STUB_STRICT_EQ_LEAF,
-    STUB_STRING_CHAR_CODE_AT_LEAF, STUB_STRING_CODE_POINT_AT_LEAF, STUB_STRING_CONCAT_ALLOC,
-    STUB_STRING_ENDS_WITH_LEAF, STUB_STRING_INCLUDES_LEAF, STUB_STRING_INDEX_OF_LEAF,
-    STUB_STRING_STARTS_WITH_LEAF, STUB_TO_BOOLEAN_LEAF, STUB_TYPEOF_TEST_LEAF, SafepointId,
-    SafepointRecord, validate_stub_descriptor,
+    STUB_COPY_CONTEXT_ALLOC, STUB_CREATE_CONTEXT_ALLOC, STUB_INSTANCEOF_LEAF,
+    STUB_JIT_MAKE_CLOSURE, STUB_JIT_MAKE_FN, STUB_MATH_ABS_LEAF, STUB_MATH_FLOOR_LEAF,
+    STUB_MATH_MAX_LEAF, STUB_MATH_MIN_LEAF, STUB_MATH_SQRT_LEAF, STUB_NUMBER_POW_F64_LEAF,
+    STUB_NUMBER_REM_F64_LEAF, STUB_NUMBER_REM_LEAF, STUB_NUMBER_TO_INT32_F64_LEAF,
+    STUB_PARSE_INT_I32_LEAF, STUB_STRICT_EQ_LEAF, STUB_STRING_CHAR_CODE_AT_LEAF,
+    STUB_STRING_CODE_POINT_AT_LEAF, STUB_STRING_CONCAT_ALLOC, STUB_STRING_ENDS_WITH_LEAF,
+    STUB_STRING_INCLUDES_LEAF, STUB_STRING_INDEX_OF_LEAF, STUB_STRING_STARTS_WITH_LEAF,
+    STUB_TO_BOOLEAN_LEAF, STUB_TYPEOF_TEST_LEAF, SafepointId, SafepointRecord,
+    validate_stub_descriptor,
 };
 use crate::{Interpreter, Value, collections};
 use std::cell::UnsafeCell;
@@ -644,6 +645,12 @@ pub const STRICT_EQ_LEAF: LeafNoAllocStub2 = LeafNoAllocStub2 {
     entry: strict_eq_leaf,
 };
 
+/// Callable ABI entry for the native-target `instanceof` probe.
+pub const INSTANCEOF_LEAF: LeafNoAllocStub2 = LeafNoAllocStub2 {
+    descriptor: STUB_INSTANCEOF_LEAF,
+    entry: instanceof_leaf,
+};
+
 /// Callable ABI entry for the ToBoolean probe.
 pub const TO_BOOLEAN_LEAF: LeafNoAllocStub2 = LeafNoAllocStub2 {
     descriptor: STUB_TO_BOOLEAN_LEAF,
@@ -906,6 +913,7 @@ pub const fn leaf_no_alloc_stub2_by_id(id: RuntimeStubId) -> Option<LeafNoAllocS
         id if id == STUB_COLLECTION_MAP_HAS_LEAF.id => Some(COLLECTION_MAP_HAS_LEAF),
         id if id == STUB_COLLECTION_SET_HAS_LEAF.id => Some(COLLECTION_SET_HAS_LEAF),
         id if id == STUB_STRICT_EQ_LEAF.id => Some(STRICT_EQ_LEAF),
+        id if id == STUB_INSTANCEOF_LEAF.id => Some(INSTANCEOF_LEAF),
         id if id == STUB_TO_BOOLEAN_LEAF.id => Some(TO_BOOLEAN_LEAF),
         id if id == STUB_TYPEOF_TEST_LEAF.id => Some(TYPEOF_TEST_LEAF),
         id if id == STUB_NUMBER_REM_LEAF.id => Some(NUMBER_REM_LEAF),
@@ -1689,6 +1697,68 @@ pub extern "C" fn strict_eq_leaf(
     let rhs = Value::from_abi_bits(rhs_bits);
     let eq = crate::abstract_ops::is_strictly_equal(&lhs, &rhs, heap);
     NativeResultPair::success(Value::boolean(eq))
+}
+
+/// §13.10.2 InstanceofOperator for a native-function target without running
+/// JavaScript. Its `@@hasInstance` is `%Function.prototype%`'s, which is
+/// non-writable and non-configurable, when the target has no own
+/// `@@hasInstance` and no `[[Prototype]]` override; then a primitive
+/// is no instance, and an ordinary object is one when its chain of ordinary
+/// objects reaches the target's own data `prototype`, any object. A proxy or
+/// other exotic link before it, an accessor or a non-object `prototype`
+/// misses.
+#[must_use]
+pub extern "C" fn instanceof_leaf(
+    heap: *const otter_gc::GcHeap,
+    value_bits: u64,
+    target_bits: u64,
+) -> NativeResultPair {
+    let _guard = LeafNoAllocGuard::new(heap);
+    let Some(heap) = heap_ref(heap) else {
+        return NativeResultPair::miss();
+    };
+    let value = Value::from_abi_bits(value_bits);
+    let Some(native) = Value::from_abi_bits(target_bits).as_native_function() else {
+        return NativeResultPair::miss();
+    };
+    let bag = native.own_properties_bag(heap);
+    if native.has_prototype_override(heap)
+        || bag.is_null()
+        || crate::object::has_own_well_known_symbol(
+            bag,
+            heap,
+            crate::symbol::WellKnown::HasInstance,
+        )
+    {
+        return NativeResultPair::miss();
+    }
+    if !value.is_object_type() {
+        return NativeResultPair::success(Value::boolean(false));
+    }
+    let crate::object::PropertyLookup::Data {
+        value: prototype, ..
+    } = crate::object::lookup_own(bag, heap, "prototype")
+    else {
+        return NativeResultPair::miss();
+    };
+    // `Array.prototype` and its kin are exotic objects: the target's
+    // prototype is compared by identity, whatever object it is.
+    let (true, Some(mut current)) = (prototype.is_object_type(), value.as_object()) else {
+        return NativeResultPair::miss();
+    };
+    for _ in 0..crate::object::PROTO_CHAIN_HARD_CAP {
+        let Some(next) = crate::object::prototype_value(current, heap) else {
+            return NativeResultPair::success(Value::boolean(false));
+        };
+        if next == prototype {
+            return NativeResultPair::success(Value::boolean(true));
+        }
+        let Some(next) = next.as_object() else {
+            return NativeResultPair::miss();
+        };
+        current = next;
+    }
+    NativeResultPair::miss()
 }
 
 /// One numeric unary builtin, reached through the declared leaf ABI.

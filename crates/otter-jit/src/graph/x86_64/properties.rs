@@ -598,6 +598,37 @@ impl Codegen<'_> {
         dynasm!(self.ops ; .arch x64 ; jmp =>done ; =>no);
         self.load_immediate(destination, tag::VALUE_FALSE);
         dynasm!(self.ops ; .arch x64 ; jmp =>done ; =>miss);
+        // A native target (a builtin constructor) answers through the leaf
+        // probe without running JavaScript; any other case completes in the
+        // runtime. The probe keeps every live value and both operands.
+        let mut saved = self.loc(node).live_registers.clone();
+        for register in [value, target] {
+            if !saved
+                .iter()
+                .any(|(location, _)| *location == super::Location::Gp(register))
+            {
+                saved.push((super::Location::Gp(register), super::Repr::Tagged));
+            }
+        }
+        let runtime = self.ops.new_dynamic_label();
+        let bytes = self.emit_save_registers(&saved);
+        dynasm!(self.ops ; .arch x64
+            ; mov r10, Rq(value) ; mov r11, Rq(target)
+            ; mov rsi, r10 ; mov rdx, r11
+            ; mov rdi, [r15 + crate::entry::THREAD_OFFSET as i32]
+            ; mov rdi, [rdi + crate::entry::VM_THREAD_GC_HEAP_OFFSET as i32]
+        );
+        self.emit_scalar_vm_leaf(
+            abi::STUB_INSTANCEOF_LEAF,
+            otter_vm::runtime_stubs::INSTANCEOF_LEAF.entry_addr() as u64,
+        );
+        dynasm!(self.ops ; .arch x64 ; mov r10, rax ; mov r11, rdx);
+        self.emit_restore_registers(&saved, bytes);
+        dynasm!(self.ops ; .arch x64
+            ; test r11, r11 ; jnz =>runtime
+            ; mov Rq(destination), r10 ; jmp =>done
+            ; =>runtime
+        );
         self.emit_committed_call(
             node,
             abi::STUB_JIT_OBJECT_PROTOCOL_VALUE,

@@ -2748,6 +2748,42 @@ impl<'a> Codegen<'a> {
         dynasm!(self.ops ; .arch aarch64 ; b =>done ; =>no);
         self.load_immediate(destination, otter_vm::Value::boolean(false).to_bits());
         dynasm!(self.ops ; .arch aarch64 ; b =>done ; =>miss);
+        // A native target (a builtin constructor) answers through the leaf
+        // probe without running JavaScript; any other case completes in the
+        // runtime. The probe keeps every live value and both operands.
+        let mut saved = self.allocation.node(node).live_registers.clone();
+        for register in [value, target] {
+            if !saved.iter().any(|(location, _)| *location == Location::Gp(register)) {
+                saved.push((Location::Gp(register), Repr::Tagged));
+            }
+        }
+        let runtime = self.ops.new_dynamic_label();
+        let bytes = self.emit_save_registers(&saved);
+        dynasm!(self.ops
+            ; .arch aarch64
+            ; mov x16, X(value)
+            ; mov x17, X(target)
+            ; ldr x0, [x20, THREAD_OFFSET]
+            ; ldr x0, [x0, VM_THREAD_GC_HEAP_OFFSET]
+            ; mov x1, x16
+            ; mov x2, x17
+        );
+        emit_load_symbol_u64(
+            &mut self.ops,
+            &mut self.relocations,
+            16,
+            otter_vm::runtime_stubs::INSTANCEOF_LEAF.entry_addr() as u64,
+            RelocationTarget::runtime_stub(abi::STUB_INSTANCEOF_LEAF),
+        );
+        dynasm!(self.ops ; .arch aarch64 ; blr x16 ; mov x16, x0 ; mov x17, x1);
+        self.emit_restore_registers(&saved, bytes);
+        dynasm!(self.ops
+            ; .arch aarch64
+            ; cbnz x17, =>runtime
+            ; mov X(destination), x16
+            ; b =>done
+            ; =>runtime
+        );
         self.emit_committed_call(
             node,
             abi::STUB_JIT_OBJECT_PROTOCOL_VALUE,

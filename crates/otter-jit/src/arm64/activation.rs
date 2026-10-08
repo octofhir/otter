@@ -31,7 +31,8 @@ pub(crate) fn emit_object_receiver_test(ops: &mut Assembler, view: &JitCompileSn
 
 /// Branch to `object` when `X(value)` is an Object and to `primitive`
 /// otherwise. A function-id immediate is an object; every other non-cell and
-/// every primitive cell is not. Clobbers x9 and x10.
+/// every primitive cell is not. An ordinary object, the common receiver,
+/// takes the first cell-tag compare. Clobbers x9.
 pub(crate) fn emit_object_test(
     ops: &mut Assembler,
     view: &JitCompileSnapshot,
@@ -39,18 +40,23 @@ pub(crate) fn emit_object_test(
     object: DynamicLabel,
     primitive: DynamicLabel,
 ) {
-    let not_function_id = ops.new_dynamic_label();
-    dynasm!(ops ; .arch aarch64 ; and x9, X(value), 0xffff);
-    emit_load_u64(ops, 10, tag::FUNCTION_ID_TAG);
-    dynasm!(ops ; .arch aarch64 ; cmp x9, x10 ; b.ne =>not_function_id);
-    emit_load_u64(ops, 9, tag::NUMBER_TAG);
-    dynasm!(ops ; .arch aarch64 ; tst X(value), x9 ; b.eq =>object ; =>not_function_id);
-    emit_load_u64(ops, 9, tag::NOT_CELL_MASK);
-    dynasm!(ops ; .arch aarch64 ; tst X(value), x9 ; b.ne =>primitive ; ldrb w9, [X(value)]);
+    // A Number has a NUMBER_TAG bit; every other non-cell has OTHER_TAG.
+    const _: () = assert!(tag::NUMBER_TAG == u64::MAX << 49);
+    const _: () = assert!(tag::OTHER_TAG == 2);
+    let other = ops.new_dynamic_label();
+    dynasm!(ops ; .arch aarch64
+        ; lsr x9, X(value), #49 ; cbnz x9, =>primitive
+        ; tbnz X(value), #1, =>other
+        ; ldrb w9, [X(value)]
+        ; cmp w9, #crate::entry::OBJECT_BODY_TYPE_TAG ; b.eq =>object);
     for tag in view.primitive_cell_type_tags {
         dynasm!(ops ; .arch aarch64 ; cmp w9, u32::from(tag) ; b.eq =>primitive);
     }
-    dynasm!(ops ; .arch aarch64 ; b =>object);
+    dynasm!(ops ; .arch aarch64 ; b =>object
+        ; =>other
+        ; and x9, X(value), #0xffff
+        ; cmp x9, #tag::FUNCTION_ID_TAG as u32 ; b.eq =>object
+        ; b =>primitive);
 }
 
 /// An arrow closure's lexical `this` and `new.target` replace `x2`/`x3`.

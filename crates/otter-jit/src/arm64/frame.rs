@@ -253,11 +253,14 @@ pub(crate) fn emit_call_entry(
     let bytes = reservation(shape, spill);
     emit_save(ops);
     dynasm!(ops ; .arch aarch64 ; mov x20, x0);
-    emit_load_u64(ops, 9, u64::from(bytes));
+    if bytes < 4096 {
+        dynasm!(ops ; .arch aarch64 ; sub x9, sp, bytes);
+    } else {
+        emit_load_u64(ops, 9, u64::from(bytes));
+        dynasm!(ops ; .arch aarch64 ; mov x10, sp ; sub x9, x10, x9);
+    }
     dynasm!(ops
         ; .arch aarch64
-        ; mov x10, sp
-        ; sub x9, x10, x9
         ; ldr x11, [x20, NATIVE_STACK_LIMIT_OFFSET]
         ; cmp x9, x11
         ; b.lo =>overflow
@@ -427,8 +430,13 @@ pub(crate) fn emit_call_entry(
     }
     dynasm!(ops ; .arch aarch64 ; str x21, [x20, NATIVE_FRAME_OFFSET]);
     if let Some((cold, back)) = underarity {
-        emit_load_u64(ops, 9, u64::from(shape.param_count));
-        dynasm!(ops ; .arch aarch64 ; cmp w4, w9 ; b.lo =>cold ; =>back);
+        if shape.param_count < 4096 {
+            dynasm!(ops ; .arch aarch64 ; cmp w4, u32::from(shape.param_count));
+        } else {
+            emit_load_u64(ops, 9, u64::from(shape.param_count));
+            dynasm!(ops ; .arch aarch64 ; cmp w4, w9);
+        }
+        dynasm!(ops ; .arch aarch64 ; b.lo =>cold ; =>back);
     }
     if let Some((cold, _)) = construct {
         dynasm!(ops ; .arch aarch64 ; cmp x3, VALUE_UNDEFINED as u32 ; b.ne =>cold);

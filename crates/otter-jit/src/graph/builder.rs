@@ -193,6 +193,9 @@ pub(crate) struct Known {
     /// Elements read on this path: `(element base, index)` to the load and
     /// the value it read, until an element store or a call.
     elements_read: FxHashMap<(NodeId, NodeId), (Kind, NodeId)>,
+    /// The compiled function's receiver, already loaded on this path. The
+    /// activation's `this` binding never changes, so no write forgets it.
+    this: Option<NodeId>,
 }
 
 impl Known {
@@ -253,6 +256,9 @@ impl Known {
         self.bounds.retain(|pair| other.bounds.contains(pair));
         self.elements_read
             .retain(|key, read| other.elements_read.get(key) == Some(read));
+        if self.this != other.this {
+            self.this = None;
+        }
     }
 
     /// Forget every fact a heap write may invalidate.
@@ -1845,8 +1851,10 @@ impl<'a> Builder<'a> {
             Op::LoadThis if !self.view.derived_constructor => {
                 let value = match &self.inline {
                     Some(inline) => inline.caller.this,
+                    None if let Some(value) = self.known.this => value,
                     None => {
                         let value = self.add(Kind::LoadThis, &[], Repr::Tagged);
+                        self.known.this = Some(value);
                         // A real ordinary sloppy entry already performed
                         // OrdinaryCallBindThis. Use the CodeBlock's canonical
                         // immutable entry contract; strict/lexical bindings

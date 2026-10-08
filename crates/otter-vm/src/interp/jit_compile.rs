@@ -844,6 +844,8 @@ impl Interpreter {
         let Some(mut view) = context.jit_compile_snapshot(fid) else {
             return TemplateCompileOutcome::Deferred;
         };
+        // Realm guards compare the active realm with the function's own.
+        view.literal_allocations.realm_id = self.function_realm_id(fid);
         Self::bake_typed_array_layout(&mut view);
         Self::bake_string_layout(&mut view);
         if self.bake_literal_cells(&mut view, context, fid).is_none() {

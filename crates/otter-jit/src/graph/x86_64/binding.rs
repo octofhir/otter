@@ -3,6 +3,7 @@
 //! # Contents
 //! - Eligible lexical/object reads through the one shared binding emitter.
 //! - Pre-effect WrongShape recovery at the actual owning source instruction.
+//! - The source realm's global object behind the same realm guard.
 //!
 //! # Invariants
 //! - `view_of(node)` selects an inlined body's own FID, byte PC and proof.
@@ -44,5 +45,26 @@ impl Codegen<'_> {
             miss,
         )?;
         Ok(())
+    }
+
+    /// The source realm's global object, read through the active realm's
+    /// rooted compressed handle once the realm is proved active.
+    pub(super) fn emit_global_this(&mut self, node: NodeId) {
+        let destination = Self::gp(self.loc(node).result.expect("global object result"));
+        let source = self.view_of(node);
+        let miss = self.eager_exit(node, DeoptReason::WrongValue);
+        crate::x86_64::binding::emit_global_realm_guard(&mut self.ops, source, miss);
+        dynasm!(self.ops ; .arch x64
+            ; mov r10, [r15 + crate::entry::GLOBAL_THIS_OFFSET_PTR_OFFSET as i32]
+            ; mov Rd(destination), [r10]
+        );
+        crate::x86_64::values::emit_load_symbol_u64(
+            &mut self.ops,
+            &mut self.relocations,
+            11,
+            source.cage_base as u64,
+            RelocationTarget::GcCageBase,
+        );
+        dynasm!(self.ops ; .arch x64 ; add Rq(destination), r11);
     }
 }

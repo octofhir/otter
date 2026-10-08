@@ -861,6 +861,10 @@ impl<'a> Codegen<'a> {
                 let temps = [allocation.gp_temps[0], allocation.gp_temps[1]];
                 self.emit_global_binding(node, *byte_pc, destination, temps)?;
             }
+            Kind::LoadGlobalThis => {
+                let destination = Self::gp(result.expect("global object result"));
+                self.emit_global_this(node, destination);
+            }
             Kind::LoadLiteral(byte_pc) => {
                 let destination = Self::gp(result.expect("a result"));
                 let byte_pc = *byte_pc;

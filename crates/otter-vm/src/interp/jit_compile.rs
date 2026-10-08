@@ -2179,9 +2179,12 @@ impl Interpreter {
         // An inline body shares the physical caller's active-global cells.
         // Source identity alone does not make a foreign realm's globals active.
         // Refuse the optional splice before preparing any ambient proofs.
+        let small = context.exec_function(fid).is_some_and(|function| {
+            function.bytecode_byte_len() <= jit::JIT_SMALL_INLINE_BYTECODE_BYTES
+        });
         if self.jit_retraining_blocks(fid)
             || self.foreign_function_realm(fid).is_some()
-            || !budget.enter()
+            || !budget.enter(small)
         {
             return None;
         }
@@ -2595,7 +2598,11 @@ impl Interpreter {
                 // Only the optimizing tier splices a reduced `f.call` target.
                 let tier_splices =
                     !function_prototype_call || tier == jit_debug::JitDebugTier::Optimizing;
-                if inline_ineligible || target_count != 1 || !tier_splices {
+                if inline_ineligible
+                    || target_count != 1
+                    || !tier_splices
+                    || !callee.admits_graph_inlining()
+                {
                     continue;
                 }
                 let Some(body) = self.bake_inline_body(&callee_context, callee_fid, tier, budget)
@@ -2823,7 +2830,8 @@ impl Interpreter {
         // An optimizing caller may build the method in place of the call;
         // one that reads its actual arguments needs a frame of its own.
         let body = (tier == jit_debug::JitDebugTier::Optimizing
-            && !method.requires_argument_frame())
+            && !method.requires_argument_frame()
+            && method.admits_graph_inlining())
         .then(|| self.bake_inline_body(&method_context, target.method_fid, tier, budget))
         .flatten();
         Ok(jit::JitDirectMethod {

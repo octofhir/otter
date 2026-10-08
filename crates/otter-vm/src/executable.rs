@@ -836,6 +836,17 @@ impl CodeBlock {
         self.control_flow.loop_headers()
     }
 
+    /// Whether an optimizing caller may build this body in place of a call:
+    /// loop-free, without handlers and at most
+    /// [`crate::jit::JIT_MAX_INLINED_BYTECODE_BYTES`] long. Its callers
+    /// prepare inline snapshots only for such bodies.
+    #[must_use]
+    pub fn admits_graph_inlining(&self) -> bool {
+        self.bytecode_byte_len <= crate::jit::JIT_MAX_INLINED_BYTECODE_BYTES
+            && self.loop_headers().is_empty()
+            && self.control_flow().handlers().is_empty()
+    }
+
     /// Last logical backedge PC for a loop header.
     #[must_use]
     pub(crate) fn loop_latch(&self, header_pc: u32) -> Option<u32> {

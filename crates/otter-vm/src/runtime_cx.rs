@@ -2512,6 +2512,12 @@ impl<'scope, 'rt> NativeScope<'scope, 'rt> {
                 reason: "ArrayBuffer is already detached".to_string(),
             });
         }
+        if buffer.has_detach_key(self.ctx.heap()) {
+            return Err(NativeError::TypeError {
+                name: "NativeScope::detach_array_buffer",
+                reason: "ArrayBuffer cannot be detached".to_string(),
+            });
+        }
         self.ctx.interp_mut().detach_array_buffer(buffer);
         Ok(())
     }

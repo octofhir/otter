@@ -1522,6 +1522,12 @@ fn parse_worker_transfer_list(
                 format!("transferList[{idx}] is detached"),
             ));
         }
+        if buffer.has_detach_key(ctx.heap()) {
+            return Err(type_err(
+                "Worker.postMessage",
+                format!("transferList[{idx}] cannot be detached"),
+            ));
+        }
         if !out.set.insert(buffer) {
             return Err(type_err(
                 "Worker.postMessage",

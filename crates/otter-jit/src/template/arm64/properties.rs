@@ -91,7 +91,7 @@ fn emit_inline_own_field(
     let inline = ops.new_dynamic_label();
     let ready = ops.new_dynamic_label();
     let layout = view.field_layout;
-    emit_cell_test(ops, receiver, 11, CellTest::IsNotCell, miss);
+    emit_cell_test(ops, receiver, CellTest::IsNotCell, miss);
     dynasm!(ops ; .arch aarch64
         ; cbz X(receiver), =>miss
         ; ldrb w14, [X(receiver)]
@@ -306,7 +306,7 @@ pub(super) fn emit_store_property(
         ; ldr X(STORE_VALUE), [x19, src_off]
         ; str X(STORE_VALUE), [x16, x14, lsl #3]
     );
-    emit_cell_test(ops, STORE_VALUE, 11, CellTest::IsNotCell, primitive);
+    emit_cell_test(ops, STORE_VALUE, CellTest::IsNotCell, primitive);
     emit_write_barrier(ops, relocations, view, STORE_RECEIVER, STORE_VALUE);
     dynasm!(ops
         ; .arch aarch64

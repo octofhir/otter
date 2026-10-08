@@ -1607,7 +1607,8 @@ impl<'a> Codegen<'a> {
                     allocation.gp_temps[3],
                 ];
                 let (pc, atom) = (*pc, *atom);
-                let have_length = length.then(|| self.emit_exotic_length(node, receiver, destination));
+                let have_length =
+                    length.then(|| self.emit_exotic_length(node, receiver, destination));
                 self.emit_load_property_cached(node, pc, atom, receiver, temps, destination)?;
                 if let Some(have_length) = have_length {
                     dynasm!(self.ops ; .arch aarch64 ; =>have_length);
@@ -2816,12 +2817,12 @@ impl<'a> Codegen<'a> {
             );
             // Target: an ordinary closure whose own properties hold no
             // `@@hasInstance` override.
-            emit_cell_test(&mut self.ops, target, 16, CellTest::IsNotCell, miss);
+            emit_cell_test(&mut self.ops, target, CellTest::IsNotCell, miss);
             dynasm!(self.ops
                 ; .arch aarch64
                 ; cbz X(target), =>miss
-                ; mov w16, W(target)
-                ; add X(rare), X(cage), x16
+                // A cell value is its header's full address.
+                ; mov X(rare), X(target)
                 ; ldrb w16, [X(rare)]
                 ; cmp w16, u32::from(otter_vm::closure::JS_CLOSURE_BODY_TYPE_TAG)
                 ; b.ne =>miss
@@ -2846,24 +2847,21 @@ impl<'a> Codegen<'a> {
                 ; ldr X(prototype), [X(rare), layout.prototype_byte]
             );
             // The prototype must be an ordinary object; anything else throws.
-            emit_cell_test(&mut self.ops, prototype, 16, CellTest::IsNotCell, miss);
+            emit_cell_test(&mut self.ops, prototype, CellTest::IsNotCell, miss);
             dynasm!(self.ops
                 ; .arch aarch64
                 ; cbz X(prototype), =>miss
-                ; mov w16, W(prototype)
-                ; add X(prototype), X(cage), x16
                 ; ldrb w16, [X(prototype)]
                 ; cmp w16, crate::entry::OBJECT_BODY_TYPE_TAG
                 ; b.ne =>miss
             );
             // Value: a non-cell answers false, a primitive cell answers
             // false, an ordinary object is walked, any other cell misses.
-            emit_cell_test(&mut self.ops, value, 16, CellTest::IsNotCell, no);
+            emit_cell_test(&mut self.ops, value, CellTest::IsNotCell, no);
             dynasm!(self.ops
                 ; .arch aarch64
                 ; cbz X(value), =>miss
-                ; mov w16, W(value)
-                ; add X(cursor), X(cage), x16
+                ; mov X(cursor), X(value)
                 ; ldrb w16, [X(cursor)]
                 ; cmp w16, crate::entry::OBJECT_BODY_TYPE_TAG
                 ; b.eq =>walk
@@ -2913,7 +2911,10 @@ impl<'a> Codegen<'a> {
         // runtime. The probe keeps every live value and both operands.
         let mut saved = self.allocation.node(node).live_registers.clone();
         for register in [value, target] {
-            if !saved.iter().any(|(location, _)| *location == Location::Gp(register)) {
+            if !saved
+                .iter()
+                .any(|(location, _)| *location == Location::Gp(register))
+            {
                 saved.push((Location::Gp(register), Repr::Tagged));
             }
         }

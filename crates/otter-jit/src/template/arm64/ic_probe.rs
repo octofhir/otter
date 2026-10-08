@@ -139,7 +139,7 @@ pub(crate) fn emit_intrinsic_prototype_header(
         dynasm!(ops ; .arch aarch64 ; b =>miss);
         return;
     }
-    emit_cell_test(ops, 9, 11, CellTest::IsNotCell, miss);
+    emit_cell_test(ops, 9, CellTest::IsNotCell, miss);
     dynasm!(ops
         ; .arch aarch64
         ; cbz x9, =>miss
@@ -235,7 +235,7 @@ pub(crate) fn emit_exotic_length_fast(
     let string_len_byte = view.string_layout.string_len_byte;
     let try_string = ops.new_dynamic_label();
 
-    emit_cell_test(ops, 9, 11, CellTest::IsNotCell, not_length);
+    emit_cell_test(ops, 9, CellTest::IsNotCell, not_length);
     // A cell value is its header's full address.
     dynasm!(ops
         ; .arch aarch64
@@ -312,7 +312,7 @@ where
         return Err(Unsupported::OperandShape("dense element view base"));
     };
     load_receiver(ops, 9)?;
-    emit_cell_test(ops, 9, 11, CellTest::IsNotCell, miss);
+    emit_cell_test(ops, 9, CellTest::IsNotCell, miss);
     // A cell value is its header's full address.
     dynasm!(ops
         ; .arch aarch64
@@ -365,7 +365,7 @@ where
         return emit_dense_element_view(ops, access, load_receiver, miss);
     }
     load_receiver(ops, 9)?;
-    emit_cell_test(ops, 9, 11, CellTest::IsNotCell, miss);
+    emit_cell_test(ops, 9, CellTest::IsNotCell, miss);
     // A cell value is its header's full address.
     dynasm!(ops
         ; .arch aarch64
@@ -697,7 +697,7 @@ pub(crate) fn emit_element_write_guard(
     match element {
         JitElementRepr::Boxed => {
             // A heap cell would owe the generational barrier only the stub runs.
-            emit_cell_test(ops, 9, 11, CellTest::IsCell, miss);
+            emit_cell_test(ops, 9, CellTest::IsCell, miss);
         }
         JitElementRepr::Int8
         | JitElementRepr::Uint8
@@ -908,7 +908,7 @@ pub(crate) fn emit_native_leaf_guard(
     );
 
     let native_type_tag = u32::from(view.collection_layout.native_function_type_tag);
-    emit_cell_test(ops, callee_x, 12, CellTest::IsNotCell, bail);
+    emit_cell_test(ops, callee_x, CellTest::IsNotCell, bail);
     dynasm!(ops
         ; .arch aarch64
         ; cbz X(callee_x), =>bail
@@ -1331,8 +1331,7 @@ fn emit_receiver_type_guard_impl(
         emit_load_reg(ops, 9, receiver)?;
         9
     };
-    let tag_scratch = if tagged == 11 { 10 } else { 11 };
-    emit_cell_test(ops, tagged, tag_scratch, CellTest::IsNotCell, miss);
+    emit_cell_test(ops, tagged, CellTest::IsNotCell, miss);
     // A cell value is its header's full address.
     dynasm!(ops
         ; .arch aarch64

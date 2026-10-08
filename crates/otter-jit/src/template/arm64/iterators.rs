@@ -71,7 +71,7 @@ pub(super) fn emit_get_iterator(
     let done = ops.new_dynamic_label();
     if let Some(iteration) = &view.array_iteration {
         emit_load_reg(ops, 9, source)?;
-        emit_cell_test(ops, 9, 11, CellTest::IsNotCell, slow);
+        emit_cell_test(ops, 9, CellTest::IsNotCell, slow);
         dynasm!(ops
             ; .arch aarch64
             ; cbz x9, =>slow

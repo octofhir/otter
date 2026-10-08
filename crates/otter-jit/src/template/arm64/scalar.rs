@@ -70,7 +70,7 @@ fn emit_cell_header(
         ; .arch aarch64
         ; cbz x9, =>non_cell
     );
-    emit_cell_test(ops, 9, 11, CellTest::IsNotCell, non_cell);
+    emit_cell_test(ops, 9, CellTest::IsNotCell, non_cell);
     dynasm!(ops
         ; .arch aarch64
         ; mov x13, x9              // Value stores the full GcHeader pointer

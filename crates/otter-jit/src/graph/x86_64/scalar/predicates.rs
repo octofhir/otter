@@ -90,9 +90,19 @@ impl<'a> Codegen<'a> {
             ; test Rq(b), Rq(b) ; jz =>differ
             ; movzx r10d, BYTE [Rq(a)] ; movzx r11d, BYTE [Rq(b)]
             ; cmp r10d, r11d ; jne =>differ
-            ; cmp r10d, DWORD otter_vm::string::JS_STRING_BODY_TYPE_TAG as i32 ; je =>slow
             ; cmp r10d, DWORD otter_vm::bigint::BIG_INT_BODY_TYPE_TAG as i32 ; je =>slow
-            ; jmp =>differ
+            ; cmp r10d, DWORD otter_vm::string::JS_STRING_BODY_TYPE_TAG as i32 ; jne =>differ
+        );
+        // Strings of different lengths differ without reading their units,
+        // and two strings with recorded atoms are equal exactly when their
+        // atoms are.
+        let length = self.view.string_layout.string_len_byte as i32;
+        let atom = self.view.string_layout.atom_byte as i32;
+        dynasm!(self.ops ; .arch x64
+            ; mov r10d, DWORD [Rq(a) + length] ; cmp r10d, DWORD [Rq(b) + length] ; jne =>differ
+            ; mov r10d, DWORD [Rq(a) + atom] ; test r10d, r10d ; jz =>slow
+            ; mov r11d, DWORD [Rq(b) + atom] ; test r11d, r11d ; jz =>slow
+            ; cmp r10d, r11d ; je =>equal ; jmp =>differ
         );
         let (equal_value, differ_value) = if negate {
             (tag::VALUE_FALSE, tag::VALUE_TRUE)

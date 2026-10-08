@@ -1827,10 +1827,28 @@ impl<'a> Codegen<'a> {
             ; ldrb w17, [X(b)]
             ; cmp w16, w17
             ; b.ne =>differ
-            ; cmp w16, u32::from(otter_vm::string::JS_STRING_BODY_TYPE_TAG)
-            ; b.eq =>leaf
             ; cmp w16, u32::from(otter_vm::bigint::BIG_INT_BODY_TYPE_TAG)
             ; b.eq =>leaf
+            ; cmp w16, u32::from(otter_vm::string::JS_STRING_BODY_TYPE_TAG)
+            ; b.ne =>differ
+        );
+        // Strings of different lengths differ without reading their units,
+        // and two strings with recorded atoms are equal exactly when their
+        // atoms are.
+        let length = self.view.string_layout.string_len_byte;
+        let atom = self.view.string_layout.atom_byte;
+        dynasm!(self.ops
+            ; .arch aarch64
+            ; ldr w16, [X(a), length]
+            ; ldr w17, [X(b), length]
+            ; cmp w16, w17
+            ; b.ne =>differ
+            ; ldr w16, [X(a), atom]
+            ; ldr w17, [X(b), atom]
+            ; cbz w16, =>leaf
+            ; cbz w17, =>leaf
+            ; cmp w16, w17
+            ; b.eq =>equal
             ; =>differ
         );
         let (when_equal, when_differ) = if condition == Condition::Equal {

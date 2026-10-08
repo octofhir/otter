@@ -38,6 +38,10 @@ use crate::*;
 mod inline_snapshot_budget;
 use inline_snapshot_budget::InlineSnapshotBudget;
 
+/// Counted calls past which a hot loop's function is optimized for its entry
+/// before any of its loops is entered through OSR.
+const OSR_ENTRY_TIER_MIN_ENTRIES: u64 = 16;
+
 #[cfg(test)]
 #[path = "jit_compile_binding_tests.rs"]
 mod binding_tests;
@@ -692,6 +696,10 @@ impl Interpreter {
     /// decline waits for a new feedback epoch; pre-hook deferral and resource
     /// refusal leave OSR eligible when work or physical headroom permits it.
     ///
+    /// A function already entered [`OSR_ENTRY_TIER_MIN_ENTRIES`] times is
+    /// compiled for its entry first, and this activation stays below the
+    /// optimized tier.
+    ///
     /// Optimized code enters at most the one header it was compiled for. When
     /// the current code cannot enter `osr_pc`, this header's back-edge crossed
     /// its tier threshold while the function kept running below the optimized
@@ -718,6 +726,15 @@ impl Interpreter {
             if code.enters_optimized_osr_header(osr_pc) {
                 return Some(code.clone());
             }
+        } else if !self.jit_optimized_code.contains_key(&fid)
+            && self.jit_code_registry.counted_entries(fid) >= OSR_ENTRY_TIER_MIN_ENTRIES
+        {
+            // V8 optimizes a function that keeps being called for its entry
+            // and enters a loop through OSR only while one activation stays
+            // in it. This activation finishes below the optimized tier unless
+            // it funds this header's threshold again.
+            let _ = self.resolve_optimized_code_for_fid(context, fid);
+            return None;
         }
         // A declined compile is retried at a back-edge only when the feedback
         // epoch has advanced since the last failed attempt: on unchanged

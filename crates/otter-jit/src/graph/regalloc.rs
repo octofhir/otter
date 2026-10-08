@@ -213,6 +213,17 @@ impl Allocation {
     }
 }
 
+/// The registers of `mask`, lowest first.
+fn bits(mut mask: u32) -> impl Iterator<Item = u8> {
+    std::iter::from_fn(move || {
+        (mask != 0).then(|| {
+            let register = mask.trailing_zeros() as u8;
+            mask &= mask - 1;
+            register
+        })
+    })
+}
+
 /// Register file state of one class.
 #[derive(Debug, Clone)]
 struct RegisterFile {
@@ -235,18 +246,16 @@ impl RegisterFile {
 
     /// Free, unblocked allocatable registers, lowest first.
     fn free_unblocked(&self) -> impl Iterator<Item = u8> + use<> {
-        let mut free = self.allocatable & !self.occupied & !self.blocked;
-        std::iter::from_fn(move || {
-            (free != 0).then(|| {
-                let register = free.trailing_zeros() as u8;
-                free &= free - 1;
-                register
-            })
-        })
+        bits(self.allocatable & !self.occupied & !self.blocked)
     }
 
     fn holder(&self, register: u8) -> Option<NodeId> {
         self.values[register as usize]
+    }
+
+    /// Registers holding a value, lowest first, as of this call.
+    fn held(&self) -> impl Iterator<Item = u8> + use<> {
+        bits(self.occupied)
     }
 }
 
@@ -720,10 +729,7 @@ impl<'g> Allocator<'g> {
         let at = self.pos(self.current);
         let file = if float { &self.fp } else { &self.gp };
         let mut best: Option<(u8, u32)> = None;
-        for register in 0..32u8 {
-            if file.allocatable & (1 << register) == 0 || file.blocked & (1 << register) != 0 {
-                continue;
-            }
+        for register in bits(file.occupied & file.allocatable & !file.blocked) {
             let Some(value) = file.values[register as usize] else {
                 continue;
             };
@@ -821,7 +827,7 @@ impl<'g> Allocator<'g> {
     /// Release every register whose value has no use after `at`.
     fn release_dead(&mut self, at: u32) {
         for float in [false, true] {
-            for register in 0..32u8 {
+            for register in self.file(float).held() {
                 let Some(value) = self.file(float).holder(register) else {
                     continue;
                 };
@@ -875,9 +881,10 @@ impl<'g> Allocator<'g> {
     }
 
     fn restore_entry_state(&mut self, block: BlockId, start: u32) {
-        for register in 0..32u8 {
-            self.unbind(false, register);
-            self.unbind(true, register);
+        for float in [false, true] {
+            for register in self.file(float).held() {
+                self.unbind(float, register);
+            }
         }
         let Some(state) = self.entry_states[block.0 as usize].clone() else {
             return;
@@ -1090,7 +1097,7 @@ impl<'g> Allocator<'g> {
             // Live registers a slow path must preserve.
             let mut live = SmallVec::new();
             for float in [false, true] {
-                for register in 0..32u8 {
+                for register in self.file(float).held() {
                     // A slow path that may collect also keeps what this
                     // node's own exits read: a throw rebuilds the frame
                     // from those locations after the runtime returns.
@@ -1151,7 +1158,7 @@ impl<'g> Allocator<'g> {
     /// files.
     fn spill_all_live(&mut self, at: u32) {
         for float in [false, true] {
-            for register in 0..32u8 {
+            for register in self.file(float).held() {
                 let Some(value) = self.file(float).holder(register) else {
                     continue;
                 };
@@ -1228,7 +1235,7 @@ impl<'g> Allocator<'g> {
             .unwrap_or_default();
         let mut occupied = SmallVec::new();
         for (float, file) in [(false, &self.gp), (true, &self.fp)] {
-            for register in 0..32u8 {
+            for register in file.held() {
                 if let Some(value) = file.holder(register)
                     && (self.liveness.is_live_after(control, value)
                         || eager_values.contains(&value))
@@ -1498,7 +1505,7 @@ impl<'g> Allocator<'g> {
     fn snapshot(&self) -> Vec<(NodeId, Location)> {
         let mut state = Vec::new();
         for (float, file) in [(false, &self.gp), (true, &self.fp)] {
-            for register in 0..32u8 {
+            for register in file.held() {
                 if let Some(value) = file.holder(register) {
                     state.push((value, Self::register_location(float, register)));
                 }

@@ -3999,7 +3999,17 @@ impl<'a> Codegen<'a> {
 
     /// An exit recipe for `node`'s eager state that no branch leaves
     /// through: the frame is rebuilt and the code continues.
+    /// An exit a continuation materializes with `bl`, after the runtime ran:
+    /// its recipe reads homes and constants only.
     fn exit_index(&mut self, node: NodeId, reason: ExitReason, action: ExitAction) -> u32 {
+        debug_assert!(
+            self.allocation
+                .node(node)
+                .eager
+                .iter()
+                .all(|location| !matches!(location, Location::Gp(_) | Location::Fp(_))),
+            "a materialized exit reads homes and constants"
+        );
         let label = self.ops.new_dynamic_label();
         self.exits.push(ExitSite {
             label,
@@ -4512,6 +4522,7 @@ impl<'a> Codegen<'a> {
             ; .arch aarch64
             ; add x3, sp, #16
             ; mov x4, x19
+            ; mov x5, xzr
         );
         emit_load_symbol_u64(
             &mut self.ops,
@@ -4531,12 +4542,19 @@ impl<'a> Codegen<'a> {
         );
     }
 
-    /// The shared deopt handler rebuilds the interpreter frame from
-    /// canonical homes, then resumes its interpreter continuation. The exit
-    /// index is in `w17`; no register dump or secondary value home exists.
+    /// The shared deopt handler saves every allocatable register in the
+    /// register dump guard recipes name, rebuilds the interpreter frame from
+    /// that dump, canonical homes and literals, then resumes its interpreter
+    /// continuation. The exit index is in `w17`.
     fn emit_deopt_handler(&mut self) {
         let deopt = self.deopt;
-        dynasm!(self.ops ; .arch aarch64 ; =>deopt);
+        dynasm!(self.ops ; .arch aarch64 ; =>deopt ; sub sp, sp, DEOPT_DUMP_BYTES);
+        emit_register_dump(&mut self.ops, super::registers::AARCH64.general, 0);
+        emit_register_dump(
+            &mut self.ops,
+            super::registers::AARCH64.floating,
+            otter_vm::deopt::DEOPT_FLOAT_REGISTER_BASE,
+        );
         dynasm!(self.ops ; .arch aarch64 ; mov w1, w17);
         crate::arm64::frame::emit_publish_lazy_window(
             &mut self.ops,
@@ -4552,8 +4570,9 @@ impl<'a> Codegen<'a> {
         );
         dynasm!(self.ops
             ; .arch aarch64
-            ; mov x3, sp
+            ; add x3, sp, DEOPT_DUMP_BYTES
             ; mov x4, x19
+            ; mov x5, sp
         );
         emit_load_symbol_u64(
             &mut self.ops,
@@ -4569,11 +4588,38 @@ impl<'a> Codegen<'a> {
         dynasm!(self.ops
             ; .arch aarch64
             ; blr x16
+            ; add sp, sp, DEOPT_DUMP_BYTES
             ; cmp x1, NativeResultStatus::SideExit as u32
             ; b.eq =>side_exit
         );
         // An inline chain already completed, or the writeback failed.
         crate::arm64::frame::emit_epilogue(&mut self.ops, activation, spill);
+    }
+}
+
+/// Bytes of the register dump the shared deopt handler saves below the
+/// canonical homes.
+const DEOPT_DUMP_BYTES: u32 = (otter_vm::deopt::DEOPT_REGISTER_DUMP_WORDS * 8) as u32;
+
+/// Store `registers` at `[sp + 8 * (base + register)]`, pairing neighbours.
+/// `base` zero dumps general registers, otherwise floating-point ones.
+fn emit_register_dump(ops: &mut Assembler, registers: &[u8], base: u8) {
+    let mut index = 0;
+    while index < registers.len() {
+        let register = registers[index];
+        let offset = u32::from(base + register) * 8;
+        let paired = registers.get(index + 1) == Some(&(register + 1));
+        match (base, paired) {
+            (0, true) => {
+                dynasm!(ops ; .arch aarch64 ; stp X(register), X(register + 1), [sp, offset as i32])
+            }
+            (0, false) => dynasm!(ops ; .arch aarch64 ; str X(register), [sp, offset]),
+            (_, true) => {
+                dynasm!(ops ; .arch aarch64 ; stp D(register), D(register + 1), [sp, offset as i32])
+            }
+            (_, false) => dynasm!(ops ; .arch aarch64 ; str D(register), [sp, offset]),
+        }
+        index += if paired { 2 } else { 1 };
     }
 }
 

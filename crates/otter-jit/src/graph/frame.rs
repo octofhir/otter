@@ -7,7 +7,8 @@
 //!
 //! # Invariants
 //! - Only initialized tagged words are collector roots; unboxed homes follow.
-//! - Reconstruction reads canonical homes or constants, never machine registers.
+//! - Reconstruction reads canonical homes, constants, or the machine registers
+//!   the shared exit handler saves in its register dump.
 //! - A recipe lists only registers whose value is not the literal `undefined`;
 //!   every other register resumes `undefined`.
 //! - Byte offsets fit the signed VM recipe and the native frame's root indices.
@@ -157,8 +158,9 @@ fn deopt_slot(graph: &Graph, slots: SlotLayout, value: NodeId, location: Locatio
         _ => DeoptRepr::Tagged,
     };
     let location = match location {
-        Location::Gp(_) | Location::Fp(_) => {
-            unreachable!("deopt recipes read canonical homes or constants")
+        Location::Gp(register) => DeoptLocation::Register(register),
+        Location::Fp(register) => {
+            DeoptLocation::Register(otter_vm::deopt::DEOPT_FLOAT_REGISTER_BASE + register)
         }
         Location::TaggedSlot(_) | Location::UntaggedSlot(_) => {
             DeoptLocation::StackSlot(slots.offset(location) as i32)

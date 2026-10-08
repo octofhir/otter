@@ -2,11 +2,14 @@
 //!
 //! # Contents
 //! - Typed eager exits and local exception reconstruction targets.
-//! - One canonical-home writeback call for full inline frame recovery.
+//! - One writeback call for full inline frame recovery, over canonical homes
+//!   and the register dump the shared deopt handler saves.
 //! - Shared return, parked-error and committed-throw continuations.
 //!
 //! # Invariants
-//! - Recovery recipes read canonical homes or constants, never register dumps.
+//! - A guard's recovery recipe reads registers from the deopt handler's dump,
+//!   canonical homes or constants; a materialized throw continuation's reads
+//!   homes or constants only.
 //! - A thrown value is rooted before a collecting writeback can move it.
 //! - All C calls use the platform boundary; private materialization is aligned.
 //!
@@ -41,12 +44,21 @@ impl<'a> Codegen<'a> {
         });
         label
     }
+    /// An exit a continuation materializes with `call`, after the runtime
+    /// ran: its recipe reads homes and constants only.
     pub(super) fn exit_index(
         &mut self,
         node: NodeId,
         reason: abi::ExitReason,
         action: abi::ExitAction,
     ) -> u32 {
+        debug_assert!(
+            self.loc(node)
+                .eager
+                .iter()
+                .all(|location| !matches!(location, Location::Gp(_) | Location::Fp(_))),
+            "a materialized exit reads homes and constants"
+        );
         let label = self.ops.new_dynamic_label();
         self.exits.push(ExitSite {
             label,
@@ -174,13 +186,19 @@ impl<'a> Codegen<'a> {
     }
     /// `r11d` is the exact recipe index. SysV-shaped prepared arguments are
     /// normalized by the C owner, including Microsoft's hidden pair pointer.
-    pub(super) fn emit_writeback_call(&mut self, homes_delta: i32) {
+    /// With `dump`, the register dump starts at `rsp`.
+    pub(super) fn emit_writeback_call(&mut self, homes_delta: i32, dump: bool) {
         dynasm!(self.ops ; .arch x64 ; mov esi, r11d);
         crate::x86_64::frame::emit_publish_lazy_window(
             &mut self.ops,
             self.view.code_block.register_count,
         );
         dynasm!(self.ops ; .arch x64 ; mov rdi, r15 ; lea rcx, [rsp + homes_delta] ; mov r8, r13);
+        if dump {
+            dynasm!(self.ops ; .arch x64 ; mov r9, rsp);
+        } else {
+            dynasm!(self.ops ; .arch x64 ; xor r9d, r9d);
+        }
         emit_load_symbol_u64(
             &mut self.ops,
             &mut self.relocations,
@@ -198,7 +216,7 @@ impl<'a> Codegen<'a> {
         crate::x86_64::call_abi::emit_variadic_call(
             &mut self.ops,
             abi::STUB_JIT_DEOPT_WRITEBACK,
-            5,
+            6,
         );
     }
     pub(super) fn emit_materialize(&mut self) {
@@ -206,7 +224,7 @@ impl<'a> Codegen<'a> {
         let fatal = self.fatal;
         // Private call puts its return address below the canonical homes.
         dynasm!(self.ops ; .arch x64 ; =>materialize ; sub rsp, 8);
-        self.emit_writeback_call(16);
+        self.emit_writeback_call(16, false);
         dynasm!(self.ops ; .arch x64 ; add rsp, 8
             ; cmp edx, abi::NativeResultStatus::SideExit as i32 ; jne =>fatal ; ret
         );
@@ -214,9 +232,19 @@ impl<'a> Codegen<'a> {
     pub(super) fn emit_deopt_handler(&mut self) {
         let deopt = self.deopt;
         let side_exit = self.activation.side_exit;
-        dynasm!(self.ops ; .arch x64 ; =>deopt);
-        self.emit_writeback_call(0);
-        dynasm!(self.ops ; .arch x64 ; cmp edx, abi::NativeResultStatus::SideExit as i32 ; je =>side_exit);
+        // Every allocatable register goes to the dump guard recipes name.
+        dynasm!(self.ops ; .arch x64 ; =>deopt ; sub rsp, DEOPT_DUMP_BYTES);
+        for &register in super::super::registers::X86_64.general {
+            dynasm!(self.ops ; .arch x64 ; mov [rsp + i32::from(register) * 8], Rq(register));
+        }
+        let float_base = i32::from(otter_vm::deopt::DEOPT_FLOAT_REGISTER_BASE);
+        for &register in super::super::registers::X86_64.floating {
+            dynasm!(self.ops ; .arch x64
+                ; movsd QWORD [rsp + (float_base + i32::from(register)) * 8], Rx(register));
+        }
+        self.emit_writeback_call(DEOPT_DUMP_BYTES, true);
+        dynasm!(self.ops ; .arch x64 ; add rsp, DEOPT_DUMP_BYTES
+            ; cmp edx, abi::NativeResultStatus::SideExit as i32 ; je =>side_exit);
         crate::x86_64::frame::emit_epilogue(
             &mut self.ops,
             self.activation,
@@ -225,3 +253,7 @@ impl<'a> Codegen<'a> {
         );
     }
 }
+
+/// Bytes of the register dump the shared deopt handler saves below the
+/// canonical homes.
+const DEOPT_DUMP_BYTES: i32 = (otter_vm::deopt::DEOPT_REGISTER_DUMP_WORDS * 8) as i32;

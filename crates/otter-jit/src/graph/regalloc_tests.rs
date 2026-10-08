@@ -174,6 +174,19 @@ fn symbolic_block(
     }
 }
 
+/// A node that may collect and whose eager recipe reads `frame`, so the
+/// recipe's values keep canonical homes.
+fn collecting_reader(
+    graph: &mut Graph,
+    block: BlockId,
+    frame: super::super::ir::FrameStateId,
+) -> NodeId {
+    let null = graph.constant(Kind::ConstTagged(otter_vm::value::tag::VALUE_NULL));
+    let reader = append(graph, block, Kind::Instanceof, &[null, null], Repr::Tagged);
+    graph.node_mut(reader).eager = Some(frame);
+    reader
+}
+
 fn tagged(graph: &mut Graph, block: BlockId, value: NodeId) -> NodeId {
     let kind = if graph.node(value).repr.is_float() {
         Kind::Float64ToTagged
@@ -441,7 +454,7 @@ fn fixed_shift_counts_preserve_colliding_values_and_leave_immediates_unreserved(
 }
 
 #[test]
-fn division_clobbers_preserve_original_values_and_eager_lazy_home_recipes() {
+fn division_clobbers_preserve_original_values_for_eager_and_lazy_recipes() {
     for target in [AARCH64, X86_64] {
         for kind in [Kind::Int32Div, Kind::Int32Mod] {
             for mode in 0..3 {
@@ -549,11 +562,9 @@ fn division_clobbers_preserve_original_values_and_eager_lazy_home_recipes() {
                     );
                     assert!(assigned.gp_temps.is_empty());
                     assert!(
-                        assigned
-                            .eager_spills
-                            .iter()
-                            .all(|movement| movement.from != Location::Gp(pair.quotient)
-                                && movement.from != Location::Gp(pair.remainder)),
+                        assigned.eager.iter().all(|&location| location
+                            != Location::Gp(pair.quotient)
+                            && location != Location::Gp(pair.remainder)),
                         "even post-division exits must not read either overwritten implicit word"
                     );
                 } else {
@@ -570,22 +581,13 @@ fn division_clobbers_preserve_original_values_and_eager_lazy_home_recipes() {
                     // only after every guard; the symbolic recipe below
                     // checks preservation of the original eager values.
                 }
-                assert_eq!(
-                    assigned.eager,
-                    [tagged_word, left, untagged_word, left].map(|value| allocation.spill[&value])
-                );
                 assert!(
-                    assigned
-                        .eager_spills
-                        .windows(2)
-                        .any(|pair| pair[0] == pair[1])
-                        || assigned
-                            .eager_spills
-                            .iter()
-                            .enumerate()
-                            .any(|(index, movement)| assigned.eager_spills[index + 1..]
-                                .contains(movement)),
-                    "repeated frame bindings retain their identical source assignments"
+                    assigned.eager_spills.is_empty(),
+                    "a guard's exit reads its values where they are"
+                );
+                assert_eq!(
+                    assigned.eager[1], assigned.eager[3],
+                    "repeated frame bindings read one location"
                 );
                 let mut contents = FxHashMap::default();
                 symbolic_block(&graph, &allocation, target, block, &mut contents);
@@ -1184,8 +1186,7 @@ fn boundary_roots_the_live_occupant_of_a_reused_slot() {
         Repr::Tagged,
     );
     let first_state = state(&mut graph, &[first]);
-    let first_check = append(&mut graph, block, Kind::CheckNotHole, &[first], Repr::None);
-    graph.node_mut(first_check).eager = Some(first_state);
+    let first_check = collecting_reader(&mut graph, block, first_state);
     let second = append(
         &mut graph,
         block,
@@ -1315,8 +1316,7 @@ fn boundary_does_not_root_an_unproduced_collecting_result() {
         Repr::Tagged,
     );
     let first_state = state(&mut graph, &[first]);
-    let first_check = append(&mut graph, block, Kind::CheckNotHole, &[first], Repr::None);
-    graph.node_mut(first_check).eager = Some(first_state);
+    let first_check = collecting_reader(&mut graph, block, first_state);
     let null = graph.constant(Kind::ConstTagged(otter_vm::value::tag::VALUE_NULL));
     let point = append(
         &mut graph,
@@ -1326,8 +1326,7 @@ fn boundary_does_not_root_an_unproduced_collecting_result() {
         Repr::Tagged,
     );
     let result_state = state(&mut graph, &[point]);
-    let check = append(&mut graph, block, Kind::CheckNotHole, &[point], Repr::None);
-    graph.node_mut(check).eager = Some(result_state);
+    collecting_reader(&mut graph, block, result_state);
     terminate(&mut graph, block, Kind::Return, &[point]);
 
     let allocation = allocate(&graph, &[block], AARCH64);
@@ -1414,8 +1413,7 @@ fn non_overlapping_definitions_reuse_their_canonical_home() {
         Repr::Tagged,
     );
     let first_state = state(&mut graph, &[first]);
-    let first_check = append(&mut graph, block, Kind::CheckNotHole, &[first], Repr::None);
-    graph.node_mut(first_check).eager = Some(first_state);
+    let first_check = collecting_reader(&mut graph, block, first_state);
     let second = append(
         &mut graph,
         block,
@@ -1424,8 +1422,7 @@ fn non_overlapping_definitions_reuse_their_canonical_home() {
         Repr::Tagged,
     );
     let second_state = state(&mut graph, &[second]);
-    let check = append(&mut graph, block, Kind::CheckNotHole, &[second], Repr::None);
-    graph.node_mut(check).eager = Some(second_state);
+    collecting_reader(&mut graph, block, second_state);
     terminate(&mut graph, block, Kind::Return, &[second]);
     let allocation = allocate(&graph, &[block], AARCH64);
     assert_eq!(allocation.spill[&first], allocation.spill[&second]);
@@ -1440,7 +1437,7 @@ fn non_overlapping_definitions_reuse_their_canonical_home() {
                 .expect("initial value in a register"),
             to: allocation.spill[&first],
         }],
-        "an exit-only value populates its home on the cold guard exit",
+        "an exit-only value populates its home on the cold exit",
     );
 }
 
@@ -1479,8 +1476,8 @@ fn inner_loop_poll_does_not_save_a_value_read_only_on_another_path() {
     let poll = terminate(&mut graph, inner, Kind::JumpLoop(inner), &[]);
     graph.node_mut(poll).eager = Some(empty);
     let exit_state = state(&mut graph, &[value]);
-    let returned = terminate(&mut graph, outer_exit, Kind::Return, &[value]);
-    graph.node_mut(returned).eager = Some(exit_state);
+    collecting_reader(&mut graph, outer_exit, exit_state);
+    terminate(&mut graph, outer_exit, Kind::Return, &[value]);
     let allocation = allocate(&graph, &[entry, inner, outer_exit], AARCH64);
     assert!(matches!(allocation.spill[&value], Location::TaggedSlot(_)));
     assert!(allocation.node(poll).live_homes.is_empty());
@@ -1838,8 +1835,7 @@ fn cold_exit_roots_only_the_selected_finalized_recipe() {
         Repr::Tagged,
     );
     let before = state(&mut graph, &[argument, dead]);
-    let guard = append(&mut graph, block, Kind::CheckNotHole, &[dead], Repr::None);
-    graph.node_mut(guard).eager = Some(before);
+    collecting_reader(&mut graph, block, before);
     let callee = graph.add_node(
         Kind::ConstTagged(otter_vm::value::tag::VALUE_NULL),
         &[],

@@ -1,16 +1,16 @@
 //! Generated writeback entry and preparation for scalar and inline deopt.
 //!
 //! # Contents
-//! - Canonical-home/literal decoding and window writeback.
+//! - Canonical-home, literal and register-dump decoding and window writeback.
 //! - Owned inline descendant inputs and in-place catch reconstruction.
 //! - Architecture entries transfer to the common trampoline after Rust returns.
 //!
 //! # Invariants
-//! Code-owned recipes and canonical homes remain valid throughout preparation.
-//! The exit's recipe record is published before anything may collect, so the
-//! collector roots exactly the homes the exit wrote.
-//! Every physical recipe reads canonical homes or constants. No Rust
-//! preparation frame runs JavaScript. One-frame writeback returns its exact
+//! Code-owned recipes, canonical homes and the exit's register dump remain
+//! valid throughout preparation. The exit's recipe record is published before
+//! anything may collect, so the collector roots exactly the homes the recipe
+//! reads; every value is decoded before anything may collect, so a dumped
+//! register is never a root. No Rust preparation frame runs JavaScript. One-frame writeback returns its exact
 //! side exit; an inline exit resumes the restored physical frame and its
 //! descendants after every VM borrow ends. The call is never replayed.
 //!
@@ -27,8 +27,9 @@ use otter_vm::{
 
 /// Rebuild every interpreter frame a deopt exit owes, from deopt metadata.
 ///
-/// The generated exit site selects a code-owned recipe. Graph exits populate
-/// canonical stack homes before entering this helper.
+/// The generated exit site selects a code-owned recipe. Its values are in
+/// canonical stack homes, literals, or the machine registers the shared exit
+/// handler saved at `registers` (null when the recipe names none).
 /// This walks [`otter_vm::deopt::DeoptRuntime`] to reconstitute every owed frame.
 ///
 /// An exit that owes only the compiled function's own frame writes it back
@@ -51,6 +52,7 @@ extern "C" fn prepare_deopt_writeback(
     deopt_runtime: *const otter_vm::deopt::DeoptRuntime,
     frame_sp: u64,
     window: u64,
+    registers: u64,
 ) -> NativeResultPair {
     use otter_vm::deopt::{DeoptFrame, DeoptLocation, DeoptRuntime};
 
@@ -77,8 +79,8 @@ extern "C" fn prepare_deopt_writeback(
         return compiled_fatal(ctx, VmError::InvalidOperand);
     }
 
-    let slot_raw = |location: DeoptLocation| -> u64 {
-        match location {
+    let decode_physical = |slot: otter_vm::deopt::DeoptSlot| -> Result<otter_vm::Value, VmError> {
+        let raw = match slot.location {
             DeoptLocation::StackSlot(offset) => {
                 let address = frame_sp.wrapping_add(offset as i64 as u64);
                 // SAFETY: the verified deopt table bounds every stack-slot
@@ -86,13 +88,16 @@ extern "C" fn prepare_deopt_writeback(
                 unsafe { *(address as *const u64) }
             }
             DeoptLocation::Literal(raw) => raw,
-            DeoptLocation::VirtualObject(_) => {
-                unreachable!("virtual objects are decoded from FrameState recipes")
+            // SAFETY: the verified deopt table bounds every register index
+            // inside the dump the shared handler saved.
+            DeoptLocation::Register(index) if registers != 0 => unsafe {
+                *(registers as *const u64).add(usize::from(index))
+            },
+            DeoptLocation::Register(_) | DeoptLocation::VirtualObject(_) => {
+                return Err(VmError::InvalidOperand);
             }
-        }
-    };
-    let decode_physical = |slot: otter_vm::deopt::DeoptSlot| {
-        slot.reconstitute(slot_raw).ok_or(VmError::InvalidOperand)
+        };
+        Ok(slot.repr.reconstitute(raw))
     };
     let write_frame = |frame: &DeoptFrame, window: *mut otter_vm::Value| {
         // SAFETY: the window spans exactly the frame's declared registers and
@@ -255,6 +260,7 @@ pub(crate) unsafe extern "C" fn jit_deopt_writeback_entry(
     _runtime: *const otter_vm::deopt::DeoptRuntime,
     _frame_sp: u64,
     _window: u64,
+    _registers: u64,
 ) -> NativeResultPair {
     core::arch::naked_asm!(
         "stp x29, x30, [sp, #-32]!",
@@ -290,6 +296,7 @@ pub(crate) unsafe extern "C" fn jit_deopt_writeback_entry(
     _runtime: *const otter_vm::deopt::DeoptRuntime,
     _frame_sp: u64,
     _window: u64,
+    _registers: u64,
 ) -> NativeResultPair {
     core::arch::naked_asm!(
         "push rbp",
@@ -297,26 +304,28 @@ pub(crate) unsafe extern "C" fn jit_deopt_writeback_entry(
         "push rbx",
         ".if {windows}",
         "push r12",
-        "sub rsp, 48",
+        "sub rsp, 64",
         "mov r12, rcx",
         "mov rbx, rdx",
         "mov rax, [rbp + 48]",
         "mov [rsp + 32], rax",
         "mov rax, [rbp + 56]",
         "mov [rsp + 40], rax",
+        "mov rax, [rbp + 64]",
+        "mov [rsp + 48], rax",
         "call {prepare}",
         "cmp qword ptr [r12 + 8], {continue_status}",
         "jne 20f",
         "mov rcx, r12",
         "mov rdx, rbx",
-        "add rsp, 48",
+        "add rsp, 64",
         "pop r12",
         "pop rbx",
         "pop rbp",
         "jmp {trampoline}",
         "20:",
         "mov rax, r12",
-        "add rsp, 48",
+        "add rsp, 64",
         "pop r12",
         ".else",
         "sub rsp, 8",

@@ -24,7 +24,10 @@
 //!   reconstruction states, and that value's home is written there: stored at
 //!   its definition, or saved by the boundary's own slow path. A home never
 //!   written for its current value is never a root, so no home is cleared.
-//! - Eager and lazy deopt recipes read canonical homes or constants.
+//! - A guard's eager deopt recipe reads each value where it is when the guard
+//!   fails: a register (saved by the shared exit handler), its home, or a
+//!   constant. Recipes of calls and of nodes that may collect or throw read
+//!   canonical homes or constants: their runtime paths clobber registers.
 //!   An abandoned native body roots only the selected recipe's tagged homes
 //!   until writeback transfers recovery values to interpreter ownership.
 //! - A call spills every value live past it and leaves no value in a
@@ -83,7 +86,8 @@ pub(crate) struct NodeAllocation {
     pub(crate) eager: Vec<Location>,
     /// Locations of the lazy frame state's registers, in state order.
     pub(crate) lazy: Vec<Location>,
-    /// Cold parallel moves that materialize an eager exit's canonical homes.
+    /// Cold parallel moves that materialize the canonical homes an eager
+    /// exit of a collecting node reads; empty for a guard.
     pub(crate) eager_spills: Vec<Move>,
     /// Cold parallel moves that materialize a lazy exit's canonical homes.
     pub(crate) lazy_spills: Vec<Move>,
@@ -188,17 +192,19 @@ impl Allocation {
     /// Tagged homes a finalized cold reconstruction recipe reads, ascending.
     /// Native SSA execution is abandoned at this boundary, so its future
     /// reads keep no home alive. Recipes already contain every frame of an
-    /// inline chain, including the descendant entry bindings. The exit's cold
-    /// moves write every one of these homes before writeback can collect.
+    /// inline chain, including the descendant entry bindings. Each of these
+    /// homes is written before writeback can collect: at its value's
+    /// definition or by the exit's cold moves. Register values are decoded
+    /// before anything collects and root nothing.
     pub(crate) fn recipe_tagged_homes(locations: &[Location]) -> Vec<u32> {
         let mut homes: Vec<u32> = locations
             .iter()
             .filter_map(|&location| match location {
                 Location::TaggedSlot(slot) => Some(slot),
-                Location::UntaggedSlot(_) | Location::Constant(_) => None,
-                Location::Gp(_) | Location::Fp(_) => {
-                    unreachable!("a finalized reconstruction recipe reads homes or constants")
-                }
+                Location::UntaggedSlot(_)
+                | Location::Constant(_)
+                | Location::Gp(_)
+                | Location::Fp(_) => None,
             })
             .collect();
         homes.sort_unstable();
@@ -1076,12 +1082,12 @@ impl<'g> Allocator<'g> {
         }
         // Deopt locations.
         if let Some(state) = data.eager {
-            let (locations, spills) = self.deopt_locations(state);
+            let (locations, spills) = self.deopt_locations(state, Self::guard_only(&data.kind));
             self.out.nodes[node.0 as usize].eager = locations;
             self.out.nodes[node.0 as usize].eager_spills = spills;
         }
         if let Some(state) = data.lazy {
-            let (locations, spills) = self.deopt_locations(state);
+            let (locations, spills) = self.deopt_locations(state, false);
             self.out.nodes[node.0 as usize].lazy = locations;
             self.out.nodes[node.0 as usize].lazy_spills = spills;
         }
@@ -1129,7 +1135,7 @@ impl<'g> Allocator<'g> {
         let inputs = self.allocate_inputs(&data.inputs, &constraints);
         self.out.nodes[control.0 as usize].inputs = inputs;
         if let Some(state) = data.eager {
-            let (locations, spills) = self.deopt_locations(state);
+            let (locations, spills) = self.deopt_locations(state, Self::guard_only(&data.kind));
             self.out.nodes[control.0 as usize].eager = locations;
             self.out.nodes[control.0 as usize].eager_spills = spills;
         }
@@ -1263,11 +1269,27 @@ impl<'g> Allocator<'g> {
         }
     }
 
-    /// Keep recipes in canonical homes without moving exit-only stores
-    /// onto the hot path. A collecting completion has already saved the
-    /// same values; ordinary guard exits perform these moves before calling
-    /// the writeback entry.
-    fn deopt_locations(&mut self, state: super::ir::FrameStateId) -> (Vec<Location>, Vec<Move>) {
+    /// Whether a node's exits leave straight from its guards, with every
+    /// register intact: nothing on its paths calls into the runtime, as a
+    /// loop's interrupt poll does.
+    fn guard_only(kind: &Kind) -> bool {
+        let properties = kind.properties();
+        !properties.call
+            && !properties.may_collect
+            && !properties.can_throw
+            && !matches!(kind, Kind::JumpLoop(_))
+    }
+
+    /// A frame state's recipe. A guard's reads each value where it is: the
+    /// shared exit handler saves every register, so the exit itself is two
+    /// instructions and a value needs no home for it. Any other recipe reads
+    /// canonical homes, which a collecting completion has already saved and
+    /// the exit's cold moves write otherwise, never on the hot path.
+    fn deopt_locations(
+        &mut self,
+        state: super::ir::FrameStateId,
+        registers: bool,
+    ) -> (Vec<Location>, Vec<Move>) {
         let mut locations = Vec::new();
         let mut spills = Vec::new();
         for value in self.graph.state_values(state) {
@@ -1275,6 +1297,10 @@ impl<'g> Allocator<'g> {
                 .location_of(value)
                 .or(self.out.nodes[value.0 as usize].result)
                 .expect("a deopt value is live");
+            if registers {
+                locations.push(from);
+                continue;
+            }
             let to = self.canonical_location(value);
             locations.push(to);
             if from != to && !matches!(to, Location::Constant(_)) {

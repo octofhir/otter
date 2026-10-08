@@ -3,7 +3,8 @@
 //! # Contents
 //! - Emitter declines for tagged-root indices and signed deopt slot offsets.
 //! - Count overflow and a supported small frame's exact root descriptor.
-//! - Cold recipe stores and expiration, and rooted exception handoff.
+//! - Two-instruction guard exits over register recipes, and rooted
+//!   exception handoff.
 //!
 //! # Invariants
 //! Tests build a real bytecode graph and allocation, then vary only their
@@ -101,7 +102,7 @@ fn supported_small_frame_emits_only_the_initialized_tagged_region() {
 }
 
 #[test]
-fn cold_exit_materializes_its_home_and_roots_pure_throws_without_clearing_homes() {
+fn guard_exit_reads_registers_in_place_and_roots_pure_throws_in_the_scratch() {
     use super::super::ir::{FrameState, Repr};
 
     let mut view = JitCompileSnapshot::without_feedback(
@@ -158,21 +159,24 @@ fn cold_exit_materializes_its_home_and_roots_pure_throws_without_clearing_homes(
         super::super::registers::AARCH64,
     );
     let slots = SlotLayout::of(&allocation).expect("small frame geometry");
-    assert_eq!(allocation.tagged_slots, 2);
-    let forgotten_home = allocation.spill[&forgotten];
-    let kept_home = allocation.spill[&kept];
-    assert_ne!(forgotten_home, kept_home);
-    let cold_moves = &allocation.node(second).eager_spills;
     assert_eq!(
-        cold_moves.len(),
-        1,
-        "the kept home must actually be materialized on the cold exit"
+        allocation.tagged_slots, 0,
+        "guard recipes give no value a home"
     );
-    let Location::Gp(kept_register) = cold_moves[0].from else {
-        panic!("the fixture must have a register-only eager home");
+    assert!(allocation.node(second).eager_spills.is_empty());
+    let [Location::Gp(kept_register)] = allocation.node(second).eager[..] else {
+        panic!("the guard's recipe reads the kept value in its register");
     };
-    assert_eq!(cold_moves[0].to, kept_home);
-    assert!(!allocation.definition_spills.contains(&kept));
+    let frames = super::super::frame::deopt_frames(
+        &built.graph,
+        slots,
+        second_state,
+        &allocation.node(second).eager,
+    );
+    assert_eq!(
+        frames[0].slots[0].1.location,
+        otter_vm::deopt::DeoptLocation::Register(kept_register)
+    );
     let emission = emit(
         &view,
         &built,
@@ -199,24 +203,21 @@ fn cold_exit_materializes_its_home_and_roots_pure_throws_without_clearing_homes(
         .iter()
         .position(|exit| exit.node == second)
         .expect("second eager exit") as u32;
-    let cold_sequence = [
-        store(kept_register, kept_home),
-        0x52800000 | (exit_index << 5) | 17, // MOVZ W17, exit index.
-    ];
-    assert!(
-        words
-            .windows(cold_sequence.len())
-            .any(|sequence| sequence == cold_sequence),
-        "cold materialization must immediately precede exit selection"
+    let select = 0x52800000 | (exit_index << 5) | 17; // MOVZ W17, exit index.
+    let at = words
+        .iter()
+        .position(|&word| word == select)
+        .expect("the exit selects its recipe");
+    assert_eq!(
+        words[at + 1] & 0xfc00_0000,
+        0x1400_0000,
+        "the exit branches straight to the shared handler"
     );
-    // Each boundary's record roots exactly the homes it wrote, so no home
-    // is ever cleared to keep a stale value away from the collector.
-    for home in [forgotten_home, kept_home] {
-        assert!(
-            !words.contains(&store(31, home)),
-            "a tagged home is never cleared: {home:?}"
-        );
-    }
+    assert_ne!(
+        words[at - 1] & 0xffc0_0000,
+        0xf900_0000,
+        "a guard's exit stores nothing before selecting its recipe"
+    );
     let call_site = otter_vm::native_abi::NATIVE_FRAME_CALL_SITE_OFFSET;
     let throw_sequence = [
         store(0, slots.exception_scratch()),

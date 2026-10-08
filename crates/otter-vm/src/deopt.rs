@@ -47,8 +47,11 @@
 //!   preserves this, closure and new.target with register-slot location bounds.
 //! - Literal recipes are not physical locations and may be shared by any
 //!   number of slots. They let optimized code omit values needed only by deopt.
-//! - Physical recipes read canonical tagged or untagged homes. Eager/lazy
-//!   exit materialization precedes writeback; no register dump crosses this ABI.
+//! - Physical recipes read canonical tagged or untagged homes, literals, or
+//!   the machine registers the shared exit handler saved in its register dump
+//!   (V8's deoptimizer reads the registers its entry saved the same way).
+//!   Every value is decoded before writeback can collect, so a dumped tagged
+//!   value is never a root.
 //! - Virtual objects are part of the same authoritative frame state. Dense ids
 //!   and backward-only object references make materialization order explicit,
 //!   acyclic, and independent of target emission.
@@ -112,6 +115,15 @@ pub enum DeoptVerifyError {
         slot: usize,
         /// Misaligned frame-pointer-relative byte offset.
         offset: i32,
+    },
+    /// A register location names no word of the exit's register dump.
+    RegisterOutOfRange {
+        /// Frame state's exact byte-PC.
+        byte_pc: u32,
+        /// Interpreter slot containing the location.
+        slot: usize,
+        /// Invalid register-dump index.
+        register: u8,
     },
     /// An exit rebuilds no frames at all.
     EmptyFrameChain,
@@ -217,11 +229,21 @@ impl DeoptRepr {
     }
 }
 
+/// Words in the register dump a shared exit handler saves before writeback:
+/// general registers at their machine number, floating-point registers at
+/// [`DEOPT_FLOAT_REGISTER_BASE`] plus theirs.
+pub const DEOPT_REGISTER_DUMP_WORDS: usize = 64;
+
+/// Register-dump index of floating-point register zero.
+pub const DEOPT_FLOAT_REGISTER_BASE: u8 = 32;
+
 /// Where a value lives at a deopt point, relative to the optimized frame.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum DeoptLocation {
     /// A canonical home, by signed byte offset from the compiled slot base.
     StackSlot(i32),
+    /// A machine register, by its index in the exit's register dump.
+    Register(u8),
     /// A compile-time raw literal rematerialized only when this exit runs.
     /// [`DeoptSlot::repr`] defines how the bits become a tagged VM value.
     Literal(u64),
@@ -598,7 +620,18 @@ fn verify_slot(
                         offset,
                     });
                 }
-                DeoptLocation::StackSlot(_) | DeoptLocation::Literal(_) => {}
+                DeoptLocation::Register(register)
+                    if usize::from(register) >= DEOPT_REGISTER_DUMP_WORDS =>
+                {
+                    return Err(DeoptVerifyError::RegisterOutOfRange {
+                        byte_pc,
+                        slot: slot_index,
+                        register,
+                    });
+                }
+                DeoptLocation::StackSlot(_)
+                | DeoptLocation::Literal(_)
+                | DeoptLocation::Register(_) => {}
                 DeoptLocation::VirtualObject(_) => unreachable!(),
             }
             match slot.repr {
@@ -623,8 +656,8 @@ fn verify_slot(
 pub struct DeoptExitId(pub u32);
 
 /// One retained frame-state value: location kind and representation in
-/// `tag`, the stack offset, literal-pool index or virtual-object id in
-/// `payload`. A table keeps eight bytes per reconstructed value, as a V8
+/// `tag`, the stack offset, literal-pool index, virtual-object id or
+/// register-dump index in `payload`. A table keeps eight bytes per reconstructed value, as a V8
 /// translation array keeps a compact operand stream; recipes are unpacked
 /// only on the cold exit that uses them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -637,12 +670,14 @@ impl PackedDeoptSlot {
     const STACK: u32 = 0;
     const LITERAL: u32 = 1;
     const VIRTUAL: u32 = 2;
+    const REGISTER: u32 = 3;
 
     fn pack(slot: &DeoptSlot, literals: &mut LiteralPool) -> Self {
         let (kind, payload) = match slot.location {
             DeoptLocation::StackSlot(offset) => (Self::STACK, offset as u32),
             DeoptLocation::Literal(bits) => (Self::LITERAL, literals.intern(bits)),
             DeoptLocation::VirtualObject(VirtualObjectId(id)) => (Self::VIRTUAL, id),
+            DeoptLocation::Register(register) => (Self::REGISTER, u32::from(register)),
         };
         let repr = match slot.repr {
             DeoptRepr::Tagged => 0,
@@ -661,7 +696,8 @@ impl PackedDeoptSlot {
         let location = match self.tag & 3 {
             Self::STACK => DeoptLocation::StackSlot(self.payload as i32),
             Self::LITERAL => DeoptLocation::Literal(literals[self.payload as usize]),
-            _ => DeoptLocation::VirtualObject(VirtualObjectId(self.payload)),
+            Self::VIRTUAL => DeoptLocation::VirtualObject(VirtualObjectId(self.payload)),
+            _ => DeoptLocation::Register(self.payload as u8),
         };
         let repr = match self.tag >> 2 {
             0 => DeoptRepr::Tagged,
@@ -869,10 +905,12 @@ pub struct DeoptExitDescriptor {
 
 /// Deopt metadata a generated exit reads at run time.
 ///
-/// A generated exit site is two instructions: an exit index and a branch to
-/// one shared handler, which calls the writeback stub with this record's baked
-/// address after the exit has materialized its canonical homes. Interpreter-state
-/// reconstruction is therefore data walked by the stub, never per-exit code.
+/// A guard's generated exit site is two instructions: an exit index and a
+/// branch to one shared handler, which saves the machine registers in its
+/// register dump and calls the writeback stub with this record's baked
+/// address. A collecting site's exit first stores the values its recipe
+/// reads from canonical homes. Interpreter-state reconstruction is data
+/// walked by the stub, never per-exit code.
 /// The allocation's address is baked into the generated handler, so it must
 /// live exactly as long as the code — the same ownership contract as the
 /// property-IC cells.
@@ -1420,6 +1458,15 @@ mod tests {
             state_with(DeoptLocation::StackSlot(4)).verify(verify_limits()),
             Err(DeoptVerifyError::StackSlotMisaligned { .. })
         ));
+        let last = (DEOPT_REGISTER_DUMP_WORDS - 1) as u8;
+        assert_eq!(
+            state_with(DeoptLocation::Register(last)).verify(verify_limits()),
+            Ok(())
+        );
+        assert!(matches!(
+            state_with(DeoptLocation::Register(last + 1)).verify(verify_limits()),
+            Err(DeoptVerifyError::RegisterOutOfRange { .. })
+        ));
 
         let mut invalid_range = verify_limits();
         invalid_range.min_stack_slot_offset = 8;
@@ -1428,6 +1475,21 @@ mod tests {
             DeoptTable::default().verify(invalid_range),
             Err(DeoptVerifyError::InvalidStackSlotRange { min: 8, max: -8 })
         );
+    }
+
+    #[test]
+    fn register_recipes_survive_packing() {
+        let slots = vec![
+            DeoptSlot::physical(DeoptLocation::Register(7), DeoptRepr::Int32),
+            DeoptSlot::physical(
+                DeoptLocation::Register(DEOPT_FLOAT_REGISTER_BASE + 30),
+                DeoptRepr::Float64,
+            ),
+            DeoptSlot::physical(DeoptLocation::StackSlot(24), DeoptRepr::Tagged),
+        ];
+        let state = single_frame(3, slots.clone());
+        let table = DeoptTable::from_states(vec![state.clone()]);
+        assert_eq!(table.lookup(0), Some(state));
     }
 
     #[test]

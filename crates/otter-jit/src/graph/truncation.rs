@@ -21,10 +21,11 @@
 //!   its overflow check.
 //! - A selected node no longer deopts; it drops its eager frame state.
 //! - A use identifies zeros when it applies `ToInt32`/`ToUint32`, compares
-//!   int32 operands, or reads an element index, or when it is an int32
-//!   addition, subtraction, multiplication, negation or phi whose own uses
-//!   all identify zeros: such an operation maps operands that differ only in
-//!   the sign of a zero to results that differ only in the sign of a zero.
+//!   int32 operands, reads an element index, or adds the value to an operand
+//!   that is never `-0`, or when it is an int32 addition, subtraction,
+//!   multiplication, negation or phi whose own uses all identify zeros: such
+//!   an operation maps operands that differ only in the sign of a zero to
+//!   results that differ only in the sign of a zero.
 //!   A frame state is not a use: the interpreter it resumes reads the value
 //!   only through the bytecode reads the graph's uses stand for.
 //!
@@ -52,12 +53,33 @@ fn truncates(kind: &Kind, wrapping: bool) -> bool {
     }
 }
 
-/// Whether `user`, reading `value` at input `index`, sees `-0` and `0` alike
-/// by itself (`Some(true)`), only when its own result does (`None`), or
-/// tells them apart (`Some(false)`).
-fn identifies_zeros(kind: &Kind, index: usize) -> Option<bool> {
-    match kind {
-        _ if truncates(kind, false) => Some(true),
+/// Whether `node` is an int32 whose exact value is never `-0`: a constant or
+/// a bitwise result, or a sum or difference that cannot produce one
+/// (`x + y` is `-0` only when both are, `x - y` only when `x` is).
+fn never_minus_zero(graph: &Graph, node: NodeId, depth: u8) -> bool {
+    let data = graph.node(node);
+    match &data.kind {
+        Kind::ConstInt32(_) => true,
+        kind if truncates(kind, false) => true,
+        Kind::Int32Add | Kind::Int32AddWrapping if depth > 0 => {
+            never_minus_zero(graph, data.inputs[0], depth - 1)
+                || never_minus_zero(graph, data.inputs[1], depth - 1)
+        }
+        Kind::Int32Sub | Kind::Int32SubWrapping if depth > 0 => {
+            never_minus_zero(graph, data.inputs[0], depth - 1)
+        }
+        _ => false,
+    }
+}
+
+/// Whether `user`, reading its input `index`, sees `-0` and `0` alike by
+/// itself (`Some(true)`), only when its own result does (`None`), or tells
+/// them apart (`Some(false)`).
+fn identifies_zeros(graph: &Graph, user: NodeId, index: usize) -> Option<bool> {
+    let data = graph.node(user);
+    let other = |position: usize| never_minus_zero(graph, data.inputs[position], 4);
+    match &data.kind {
+        kind if truncates(kind, false) => Some(true),
         Kind::Int32Compare(_)
         | Kind::Branch {
             kind: BranchKind::Int32(_),
@@ -71,6 +93,10 @@ fn identifies_zeros(kind: &Kind, index: usize) -> Option<bool> {
         | Kind::CheckHoleyElementPresent(_)
         | Kind::StoreElement(_)
         | Kind::ElementWriteBarrier => Some(index == 1),
+        // `x + y` with `y` never `-0` is `y`'s value or `x + y` alike.
+        Kind::Int32Add | Kind::Int32AddWrapping if other(1 - index) => Some(true),
+        // `x - (-0)` and `x - 0` differ only for an `x` that is `-0`.
+        Kind::Int32Sub | Kind::Int32SubWrapping if index == 1 && other(0) => Some(true),
         Kind::Int32Add
         | Kind::Int32Sub
         | Kind::Int32AddWrapping
@@ -113,7 +139,7 @@ pub(crate) fn zero_insensitive(graph: &Graph, layout: &[BlockId]) -> FxHashSet<N
             if !insensitive.contains(&value) {
                 continue;
             }
-            let identifies = identifies_zeros(&graph.node(user).kind, index)
+            let identifies = identifies_zeros(graph, user, index)
                 .unwrap_or_else(|| insensitive.contains(&user));
             if !identifies {
                 insensitive.remove(&value);
@@ -221,7 +247,17 @@ mod tests {
         graph.block_mut(block).control = Some(returned);
         let _ = (masked, exact);
 
+        // Added to a shift result, which is never `-0`, then boxed: the sum
+        // is `-0` only when both operands are.
+        let carried = append(&mut graph, block, Kind::Int32Mul, &[a, b], Repr::Int32);
+        let shifted = append(&mut graph, block, Kind::Int32ShiftRight, &[a, mask], Repr::Int32);
+        let carry = append(&mut graph, block, Kind::Int32Add, &[shifted, carried], Repr::Int32);
+        let boxed_carry = append(&mut graph, block, Kind::Int32ToTagged, &[carry], Repr::Tagged);
+        let _ = boxed_carry;
+
         let insensitive = zero_insensitive(&graph, &[block]);
+        assert!(insensitive.contains(&carried));
+        assert!(!insensitive.contains(&carry));
         assert!(insensitive.contains(&truncated));
         assert!(insensitive.contains(&sum));
         assert!(!insensitive.contains(&boxed));

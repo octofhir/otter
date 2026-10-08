@@ -1908,6 +1908,16 @@ impl<'a> Builder<'a> {
                 let value = self.add(Kind::LoadLiteral(instruction.byte_pc), &[], Repr::Tagged);
                 self.write(instruction.writes[0], value);
             }
+            Op::TestTypeOf => {
+                let Some(test) = instruction.imm32(2) else {
+                    self.generic(instruction);
+                    return;
+                };
+                let value = self.read(instruction.reads[0]);
+                let value = self.tagged(value);
+                let result = self.add(Kind::TestTypeOf { test }, &[value], Repr::Tagged);
+                self.write(instruction.writes[0], result);
+            }
             Op::Instanceof => {
                 let value = self.read(instruction.reads[0]);
                 let value = self.tagged(value);

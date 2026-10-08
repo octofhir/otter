@@ -225,8 +225,7 @@ fn nested_native_regions_use_their_own_function_and_byte_pc() {
 #[test]
 fn generic_window_owner_survives_nested_splices_and_abandoned_inline_source() {
     use super::ir::Kind;
-    use Operand::{ConstIndex, Imm32, Register};
-    let typeof_number = otter_bytecode::TypeOfKind::Number as i32;
+    use Operand::{ConstIndex, Register};
     let mut leaf = snapshot(
         201,
         1,
@@ -261,10 +260,7 @@ fn generic_window_owner_survives_nested_splices_and_abandoned_inline_source() {
         2,
         vec![
             (Op::Neg, vec![Register(1), Register(0)]),
-            (
-                Op::TestTypeOf,
-                vec![Register(1), Register(1), Imm32(typeof_number)],
-            ),
+            (Op::TypeOf, vec![Register(1), Register(1)]),
             (Op::ReturnValue, vec![Register(1)]),
         ],
     );
@@ -274,10 +270,7 @@ fn generic_window_owner_survives_nested_splices_and_abandoned_inline_source() {
         4,
         7,
         vec![
-            (
-                Op::TestTypeOf,
-                vec![Register(4), Register(3), Imm32(typeof_number)],
-            ),
+            (Op::TypeOf, vec![Register(4), Register(3)]),
             (
                 Op::Call,
                 vec![

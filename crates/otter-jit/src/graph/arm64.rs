@@ -888,6 +888,11 @@ impl<'a> Codegen<'a> {
                 );
                 dynasm!(self.ops ; .arch aarch64 ; ldr X(destination), [X(destination)]);
             }
+            Kind::TestTypeOf { test } => {
+                let value = Self::gp(input(0));
+                let destination = Self::gp(result.expect("a result"));
+                self.emit_test_typeof(node, value, destination, allocation.gp_temps[0], *test)?;
+            }
             Kind::ToBoolean | Kind::LogicalNot => {
                 let value = Self::gp(input(0));
                 let destination = Self::gp(result.expect("a result"));
@@ -1906,6 +1911,73 @@ impl<'a> Codegen<'a> {
                     ; b =>differ
                 );
             }));
+    }
+
+    /// `X(destination)` = `typeof X(value)` compared with the encoded
+    /// [`otter_bytecode::TypeOfTest`]: classified inline from the value bits
+    /// and the cell's type tag; the cells only the heap decides ask the leaf
+    /// probe out of line. The kind code is built in `destination`, which the
+    /// classification writes only after its last read of `value`.
+    fn emit_test_typeof(
+        &mut self,
+        node: NodeId,
+        value: u8,
+        destination: u8,
+        scratch: u8,
+        test: i32,
+    ) -> Result<(), Unsupported> {
+        let decoded = otter_bytecode::TypeOfTest::decode(test)
+            .ok_or(Unsupported::OperandShape("graph TestTypeOf"))?;
+        let slow = self.ops.new_dynamic_label();
+        let done = self.ops.new_dynamic_label();
+        let view = self.view_of(node);
+        crate::template::arm64::values::emit_typeof_kind(
+            &mut self.ops,
+            view,
+            value,
+            destination,
+            scratch,
+            slow,
+        );
+        dynasm!(self.ops ; .arch aarch64 ; cmp WSP(destination), decoded.kind as u32);
+        let condition = if decoded.negate {
+            Condition::NotEqual
+        } else {
+            Condition::Equal
+        };
+        self.emit_cset_bool(destination, condition, false);
+        dynasm!(self.ops ; .arch aarch64 ; =>done);
+        let live = self.allocation.node(node).live_registers.clone();
+        self.deferred
+            .push(Box::new(move |codegen: &mut Codegen<'a>| {
+                dynasm!(codegen.ops ; .arch aarch64 ; =>slow);
+                let saved = codegen.emit_save_registers(&live);
+                // The probe reads the cell and allocates nothing; its only
+                // miss is a null heap, which generated code never passes.
+                dynasm!(codegen.ops
+                    ; .arch aarch64
+                    ; mov x16, X(value)
+                    ; ldr x0, [x20, THREAD_OFFSET]
+                    ; ldr x0, [x0, VM_THREAD_GC_HEAP_OFFSET]
+                    ; mov x1, x16
+                );
+                codegen.load_immediate(2, u64::from(test as u32));
+                emit_load_symbol_u64(
+                    &mut codegen.ops,
+                    &mut codegen.relocations,
+                    16,
+                    otter_vm::runtime_stubs::TYPEOF_TEST_LEAF.entry_addr() as u64,
+                    RelocationTarget::runtime_stub(abi::STUB_TYPEOF_TEST_LEAF),
+                );
+                dynasm!(codegen.ops ; .arch aarch64 ; blr x16 ; mov x16, x0);
+                codegen.emit_restore_registers(&live, saved);
+                dynasm!(codegen.ops
+                    ; .arch aarch64
+                    ; mov X(destination), x16
+                    ; b =>done
+                );
+            }));
+        Ok(())
     }
 
     /// `X(destination)` = the tagged boolean of the flags under `condition`.

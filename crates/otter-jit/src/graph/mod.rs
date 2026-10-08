@@ -137,7 +137,8 @@ pub(crate) fn compile(
         let phis = &built.graph.block(header.block).phis;
         header.phis.retain(|(_, phi)| phis.contains(phi));
     }
-    range::narrow_checked_arithmetic(&mut built.graph, &built.layout);
+    let zero_insensitive = truncation::zero_insensitive(&built.graph, &built.layout);
+    range::narrow_checked_arithmetic(&mut built.graph, &built.layout, &zero_insensitive);
     truncation::wrap_truncated_arithmetic(&mut built.graph, &built.layout);
     licm::hoist_invariants(&mut built.graph, &mut built.layout, &built.loop_headers);
     allocation_groups::fold(&mut built.graph, &built.layout, view, &built.inline_views);

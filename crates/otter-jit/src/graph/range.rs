@@ -15,8 +15,9 @@
 //!   entry inputs; a back edge that widens it moves the widened bound
 //!   straight to the int32 limit, so the analysis settles in a few passes.
 //! - A rewritten node computes the exact result its checked form would have
-//!   produced on every execution, so frame states may record it; it no
-//!   longer deopts and drops its eager state.
+//!   produced on every execution, up to the sign of a zero no use tells
+//!   apart, so frame states may record it; one that no longer deopts drops
+//!   its eager state.
 //!
 //! # See also
 //! - [`super::truncation`] — wraps the checked additions whose uses only
@@ -132,7 +133,7 @@ fn transfer(graph: &Graph, node: NodeId, ranges: &FxHashMap<NodeId, Range>) -> O
         }
         Kind::Int32Add => input(0).add(input(1)).clamped(),
         Kind::Int32Sub => input(0).sub(input(1)).clamped(),
-        Kind::Int32Mul => input(0).mul(input(1)).clamped(),
+        Kind::Int32Mul | Kind::Int32MulIdentifyZeros => input(0).mul(input(1)).clamped(),
         Kind::Int32AddWrapping => input(0).add(input(1)).wrapped(),
         Kind::Int32SubWrapping => input(0).sub(input(1)).wrapped(),
         Kind::Int32MulExact => input(0).mul(input(1)),
@@ -236,8 +237,13 @@ fn range_of(graph: &Graph, node: NodeId, ranges: &FxHashMap<NodeId, Range>) -> O
 }
 
 /// Compute the int32 ranges of the graph, then drop the overflow and
-/// minus-zero checks they prove impossible.
-pub(crate) fn narrow_checked_arithmetic(graph: &mut Graph, layout: &[BlockId]) {
+/// minus-zero checks they prove impossible. A multiplication in
+/// `zero_insensitive` needs no minus-zero check at all.
+pub(crate) fn narrow_checked_arithmetic(
+    graph: &mut Graph,
+    layout: &[BlockId],
+    zero_insensitive: &rustc_hash::FxHashSet<NodeId>,
+) {
     let mut ranges: FxHashMap<NodeId, Range> = FxHashMap::default();
     // Every pass visits the blocks in order, so a forward edge's value is
     // current and only back edges lag. A phi bound a back edge widens again
@@ -286,17 +292,24 @@ pub(crate) fn narrow_checked_arithmetic(graph: &mut Graph, layout: &[BlockId]) {
                     .unwrap_or(INT32)
             };
             let (a, b) = (operands(0), operands(1));
-            let exact = match data.kind {
+            let identifies_zeros = zero_insensitive.contains(&node);
+            let narrowed = match data.kind {
                 Kind::Int32Add if a.add(b).fits() => Kind::Int32AddWrapping,
                 Kind::Int32Sub if a.sub(b).fits() => Kind::Int32SubWrapping,
-                Kind::Int32Mul if a.mul(b).fits() && !a.product_may_be_minus_zero(b) => {
+                Kind::Int32Mul
+                    if a.mul(b).fits()
+                        && (identifies_zeros || !a.product_may_be_minus_zero(b)) =>
+                {
                     Kind::Int32MulExact
                 }
+                Kind::Int32Mul if identifies_zeros => Kind::Int32MulIdentifyZeros,
                 _ => continue,
             };
             let data = graph.node_mut(node);
-            data.kind = exact;
-            data.eager = None;
+            data.kind = narrowed;
+            if data.kind != Kind::Int32MulIdentifyZeros {
+                data.eager = None;
+            }
         }
     }
 }

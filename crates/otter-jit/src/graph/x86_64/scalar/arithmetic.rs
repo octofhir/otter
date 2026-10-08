@@ -61,6 +61,12 @@ impl Codegen<'_> {
                 let (a, b, dst) = self.scalar_gp_binary(node);
                 dynasm!(self.ops ; .arch x64 ; mov r10d, Rd(a) ; imul r10d, Rd(b) ; mov Rd(dst), r10d);
             }
+            Kind::Int32MulIdentifyZeros => {
+                let (a, b, dst) = self.scalar_gp_binary(node);
+                let overflow = self.eager_exit(node, DeoptReason::Overflow);
+                dynasm!(self.ops ; .arch x64
+                    ; mov r10d, Rd(a) ; imul r10d, Rd(b) ; jo =>overflow ; mov Rd(dst), r10d);
+            }
             Kind::Int32Div | Kind::Int32Mod => {
                 let (a, b, dst) = self.scalar_gp_binary(node);
                 debug_assert!(![0, 2].contains(&a) && ![0, 2].contains(&b));

@@ -9,6 +9,7 @@
 //!   into the graph.
 //! - [`feedback`] — the snapshot's per-site feedback as speculation.
 //! - [`phi_repr`] — unboxed int32 phis.
+//! - [`range`] — int32 ranges dropping overflow and `-0` checks.
 //! - [`truncation`] — wrapping int32 additions under truncating uses.
 //! - [`licm`] — loop-invariant checks and loads run once before their loop.
 //! - [`regalloc`] — live intervals, canonical homes and register assignment.
@@ -57,6 +58,7 @@ pub(crate) mod metadata;
 pub(crate) mod moves;
 mod native_leaf;
 pub(crate) mod phi_repr;
+mod range;
 pub(crate) mod regalloc;
 pub(crate) mod registers;
 pub(crate) mod truncation;
@@ -135,6 +137,7 @@ pub(crate) fn compile(
         let phis = &built.graph.block(header.block).phis;
         header.phis.retain(|(_, phi)| phis.contains(phi));
     }
+    range::narrow_checked_arithmetic(&mut built.graph, &built.layout);
     truncation::wrap_truncated_arithmetic(&mut built.graph, &built.layout);
     licm::hoist_invariants(&mut built.graph, &mut built.layout, &built.loop_headers);
     allocation_groups::fold(&mut built.graph, &built.layout, view, &built.inline_views);

@@ -987,6 +987,11 @@ impl<'a> Codegen<'a> {
                     ; mov W(destination), w16
                 );
             }
+            Kind::Int32MulExact => {
+                let (a, b) = (Self::gp(input(0)), Self::gp(input(1)));
+                let destination = Self::gp(result.expect("a result"));
+                dynasm!(self.ops ; .arch aarch64 ; mul W(destination), W(a), W(b));
+            }
             Kind::Int32Div => {
                 let (a, b) = (Self::gp(input(0)), Self::gp(input(1)));
                 let destination = Self::gp(result.expect("a result"));

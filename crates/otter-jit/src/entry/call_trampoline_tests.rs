@@ -80,7 +80,10 @@ fn transfer_entry(ctx: &mut JitCtx, entries: &mut Entries) -> NativeResultPair {
     }
     assert_eq!(entries.parent, ctx.native_frame.addr());
     assert_eq!(entries.register_base, frame.register_base());
-    assert_eq!(frame.depth, 1);
+    assert_eq!(
+        unsafe { otter_vm::native_abi::Frame::logical_depth(ctx.native_frame) },
+        1
+    );
     if entries.resumes != 0 {
         assert_eq!(
             ctx.completion,

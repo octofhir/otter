@@ -143,9 +143,8 @@ impl Interpreter {
         let mut frames = Vec::with_capacity(sites.len());
         for site in sites {
             let function_id = match *site {
-                FrameSite::Instruction { function_id, .. } | FrameSite::Inline { function_id, .. } => {
-                    function_id
-                }
+                FrameSite::Instruction { function_id, .. }
+                | FrameSite::Inline { function_id, .. } => function_id,
             };
             let Ok(owner) = ExecutionContext::for_function_in(&self.code_space, function_id) else {
                 continue;
@@ -208,10 +207,16 @@ impl Interpreter {
             // Inline parents recorded outermost first; the innermost one is
             // the most recent activation.
             if let Some(record) = call {
-                sites.extend(record.inline_frames.iter().rev().map(|frame| FrameSite::Inline {
-                    function_id: frame.function_id,
-                    byte_pc: frame.byte_pc,
-                }));
+                sites.extend(
+                    record
+                        .inline_frames
+                        .iter()
+                        .rev()
+                        .map(|frame| FrameSite::Inline {
+                            function_id: frame.function_id,
+                            byte_pc: frame.byte_pc,
+                        }),
+                );
             }
             sites.push(FrameSite::Instruction {
                 function_id: native.header.function_id,

@@ -322,6 +322,7 @@ pub(crate) fn emit(
         view,
         activation,
         shape,
+        spill.saved_pairs,
         call_entry_cold,
     );
     let call_entry = crate::arm64::frame::emit_call_entry(
@@ -4521,6 +4522,7 @@ impl<'a> Codegen<'a> {
         crate::arm64::frame::emit_publish_lazy_window(
             &mut self.ops,
             self.view.code_block.register_count,
+            self.spill.saved_pairs,
         );
         dynasm!(self.ops ; .arch aarch64 ; mov x0, x20);
         emit_load_symbol_u64(
@@ -4571,6 +4573,7 @@ impl<'a> Codegen<'a> {
         crate::arm64::frame::emit_publish_lazy_window(
             &mut self.ops,
             self.view.code_block.register_count,
+            self.spill.saved_pairs,
         );
         dynasm!(self.ops ; .arch aarch64 ; mov x0, x20);
         emit_load_symbol_u64(

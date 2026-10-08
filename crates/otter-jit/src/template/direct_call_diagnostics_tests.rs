@@ -288,7 +288,9 @@ fn tail_known_linkage_matches_diagnostic_and_call_artifacts() {
     assert_eq!(
         actual,
         vec![
-            &[0x4d, 0x8b, 0x0b, 0x41, 0xff, 0x21][..], // JMP [r9]
+            // MOV RAX, [r9]: the tail transfer reads the entry, then tags
+            // a handed-over caller anchor before jumping.
+            &[0x4d, 0x8b, 0x0b, 0x49, 0x8b, 0x01][..],
             &[0x4d, 0x8b, 0x0b, 0x41, 0xff, 0x11][..], // CALL [r9]
         ]
     );

@@ -25,17 +25,19 @@
 //! - `[x29 + 40]` holds the frame to publish on return: the caller of a
 //!   called record, or the published interpreter frame itself under a tier
 //!   entry. Bit 0 marks a record that owes constructor completion.
-//! - A call entry reserves the spill area, the window and the record below
-//!   `x29` (spill area lowest, at `sp`) and publishes the record after every
-//!   field and register is initialized. Nothing allocates or reenters
+//! - A call entry builds its record directly below `x29`, then the saved
+//!   callee-saved pairs, the window and the spill area (lowest, at `sp`), and
+//!   publishes the record after every field and register is initialized.
+//!   The record's return address is the link register saved at `[x29 + 8]`. Nothing allocates or reenters
 //!   before publication. A lazy-window entry publishes a record without a
 //!   window and points `x19` at its actual span when every formal is present.
 //!   Underarity initializes and publishes the reserved window before any
 //!   allocating helper; an exit that rebuilds an unpublished interpreter
 //!   frame also publishes the reserved window.
 //! - Only a baseline generation counts its entries toward promotion.
-//! - Depth carry and the configured JS depth limit reject entry before the
-//!   reservation, accounting, receiver preparation or frame publication.
+//! - The native stack limit alone bounds call depth; it rejects entry before
+//!   the reservation, accounting, receiver preparation or frame publication.
+//!   Records carry no depth: the runtime derives it on first use.
 //! - With a spill area, the record names the area's safepoint and its base
 //!   for the body's whole extent; a tier entry saves the interpreter
 //!   record's previous words in the area's top 16 bytes and every exit of a
@@ -75,8 +77,13 @@ use crate::{
 
 /// `[x29 + RETURN_FRAME]`: the frame published on return.
 const RETURN_FRAME: u32 = 40;
-/// Bytes of the record reserved below the saved registers.
-const RECORD_BYTES: u32 = std::mem::size_of::<abi::Frame>() as u32;
+/// Bytes of the record slot directly below `x29`. A call entry builds its
+/// record there, so a directly entered record's return address is
+/// `[record + RECORD_SLOT + 8]`; a tier entry leaves the slot unused so the
+/// callee-saved pairs share one location across both entries.
+const RECORD_SLOT: u32 = abi::FRAME_RECORD_BYTES as u32;
+const _: () =
+    assert!(abi::FRAME_RECORD_SLOT == abi::FRAME_RECORD_BYTES || cfg!(target_arch = "x86_64"));
 /// `call_site` and `machine_roots` of the record, as two words: the
 /// depth/call-site word at 80 and the roots word at 88.
 const DEPTH_CALL_SITE: u32 = abi::NATIVE_FRAME_DEPTH_OFFSET;
@@ -96,23 +103,22 @@ fn emit_zero_scratch(ops: &mut Assembler, spill: SpillArea) {
     }
 }
 
-/// Bytes the saved callee-saved pairs occupy just below `x29`.
+/// Bytes the saved callee-saved pairs occupy just below the record slot.
 fn saved_bytes(pairs: u8) -> u32 {
     16 * pairs.count_ones()
 }
 
 /// `(first register, x29-relative offset)` of each saved pair, the lowest
-/// pair highest.
+/// pair highest, below the record slot.
 fn saved_slots(pairs: u8) -> impl Iterator<Item = (u8, u32)> {
     (0..4u8)
         .filter(move |pair| pairs & (1 << pair) != 0)
         .enumerate()
-        .map(|(index, pair)| (22 + 2 * pair, 16 * (index as u32 + 1)))
+        .map(|(index, pair)| (22 + 2 * pair, RECORD_SLOT + 16 * (index as u32 + 1)))
 }
 
-/// Save the frame registers and establish `x29`, then the callee-saved
-/// pairs a Graph body allocates below it.
-fn emit_save(ops: &mut Assembler, pairs: u8) {
+/// Save the frame registers and establish `x29`.
+fn emit_save(ops: &mut Assembler) {
     dynasm!(ops
         ; .arch aarch64
         ; stp x29, x30, [sp, #-48]!
@@ -120,10 +126,11 @@ fn emit_save(ops: &mut Assembler, pairs: u8) {
         ; str x21, [sp, #32]
         ; mov x29, sp
     );
-    if pairs == 0 {
-        return;
-    }
-    dynasm!(ops ; .arch aarch64 ; sub sp, sp, saved_bytes(pairs));
+}
+
+/// Store the callee-saved pairs a Graph body allocates, once `sp` covers
+/// their slots.
+fn emit_store_saved(ops: &mut Assembler, pairs: u8) {
     for (first, offset) in saved_slots(pairs) {
         let offset = -(offset as i32);
         if first == 28 {
@@ -132,6 +139,15 @@ fn emit_save(ops: &mut Assembler, pairs: u8) {
             dynasm!(ops ; .arch aarch64 ; stp X(first), X(first + 1), [x29, offset]);
         }
     }
+}
+
+/// `x19` = the register window of a call-entry record: below the record
+/// slot and the saved pairs. Clobbers x16.
+fn emit_window_base(ops: &mut Assembler, register_count: u16, pairs: u8) {
+    let below =
+        RECORD_SLOT + saved_bytes(pairs) + (u32::from(register_count) * 8).next_multiple_of(16);
+    emit_load_u64(ops, 16, u64::from(below));
+    dynasm!(ops ; .arch aarch64 ; sub x19, x29, x16);
 }
 
 /// Reload the callee-saved pairs [`emit_save`] stored.
@@ -149,7 +165,7 @@ fn emit_restore_saved(ops: &mut Assembler, pairs: u8) {
 /// The entry over the published interpreter frame: its window and record
 /// become the body's, and the return publishes that frame again.
 pub(crate) fn emit_tier_prologue(ops: &mut Assembler, spill: SpillArea) {
-    emit_save(ops, spill.saved_pairs);
+    emit_save(ops);
     dynasm!(ops
         ; .arch aarch64
         ; mov x20, x0
@@ -157,20 +173,22 @@ pub(crate) fn emit_tier_prologue(ops: &mut Assembler, spill: SpillArea) {
         ; ldr x19, [x21, NATIVE_FRAME_REGISTER_BASE_OFFSET]
         ; str x21, [x29, RETURN_FRAME]
     );
+    // The interpreter already checked the stack for its own frame; the
+    // area is bounded by the same headroom the call entry checks.
+    let below = RECORD_SLOT + saved_bytes(spill.saved_pairs) + spill.bytes;
+    if below <= 4095 {
+        dynasm!(ops ; .arch aarch64 ; sub sp, sp, below);
+    } else {
+        emit_load_u64(ops, 16, u64::from(below));
+        dynasm!(ops ; .arch aarch64 ; sub sp, sp, x16);
+    }
+    emit_store_saved(ops, spill.saved_pairs);
     if spill.bytes == 0 {
         return;
     }
-    // The interpreter already checked the stack for its own frame; the
-    // area is bounded by the same headroom the call entry checks.
-    if spill.bytes <= 4095 {
-        dynasm!(ops ; .arch aarch64 ; sub sp, sp, spill.bytes);
-    } else {
-        emit_load_u64(ops, 16, u64::from(spill.bytes));
-        dynasm!(ops ; .arch aarch64 ; sub sp, sp, x16);
-    }
     emit_zero_scratch(ops, spill);
     emit_load_u64(ops, 17, u64::from(spill.safepoint));
-    let roots = -(saved_bytes(spill.saved_pairs) as i32);
+    let roots = -((RECORD_SLOT + saved_bytes(spill.saved_pairs)) as i32);
     dynasm!(ops
         ; .arch aarch64
         ; ldr x16, [x21, DEPTH_CALL_SITE]
@@ -190,7 +208,7 @@ fn emit_restore_tier_roots(ops: &mut Assembler, spill: SpillArea) {
         return;
     }
     let called = ops.new_dynamic_label();
-    let roots = -(saved_bytes(spill.saved_pairs) as i32);
+    let roots = -((RECORD_SLOT + saved_bytes(spill.saved_pairs)) as i32);
     dynasm!(ops
         ; .arch aarch64
         ; cmp x9, x21
@@ -203,10 +221,13 @@ fn emit_restore_tier_roots(ops: &mut Assembler, spill: SpillArea) {
     );
 }
 
-/// Bytes the call entry reserves below the saved registers: the register
-/// window, then the record.
+/// Bytes the call entry reserves below `x29`: the record slot, the saved
+/// pairs, the register window and the spill area.
 fn reservation(shape: EntryShape, spill: SpillArea) -> u32 {
-    (u32::from(shape.register_count) * 8 + RECORD_BYTES).next_multiple_of(16) + spill.bytes
+    RECORD_SLOT
+        + saved_bytes(spill.saved_pairs)
+        + (u32::from(shape.register_count) * 8).next_multiple_of(16)
+        + spill.bytes
 }
 
 /// Emit the call-ABI entry. It falls through into the body; its cold
@@ -230,22 +251,8 @@ pub(crate) fn emit_call_entry(
         underarity,
     } = cold;
     let bytes = reservation(shape, spill);
-    let window = u32::from(shape.register_count) * 8;
-    emit_save(ops, spill.saved_pairs);
+    emit_save(ops);
     dynasm!(ops ; .arch aarch64 ; mov x20, x0);
-    let depth_ready = ops.new_dynamic_label();
-    dynasm!(ops ; .arch aarch64
-        ; ldr x10, [x20, NATIVE_FRAME_OFFSET]
-        ; movz w11, 1
-        ; cbz x10, =>depth_ready
-        ; ldr w11, [x10, abi::NATIVE_FRAME_DEPTH_OFFSET]
-        ; adds w11, w11, 1
-        ; b.cs =>overflow
-        ; =>depth_ready
-        ; ldr x9, [x20, std::mem::offset_of!(abi::JitCtx, generated_depth_limit) as u32]
-        ; cmp x11, x9
-        ; b.hi =>overflow
-    );
     emit_load_u64(ops, 9, u64::from(bytes));
     dynasm!(ops
         ; .arch aarch64
@@ -270,45 +277,38 @@ pub(crate) fn emit_call_entry(
             ; =>probed
         );
     }
-    dynasm!(ops ; .arch aarch64 ; mov sp, x9);
+    dynasm!(ops ; .arch aarch64 ; mov sp, x9 ; sub x21, x29, RECORD_SLOT);
+    emit_store_saved(ops, spill.saved_pairs);
     emit_zero_scratch(ops, spill);
-    if shape.lazy_window {
-        // The record lies above the reserved window, which only an exit
-        // publishes; the body's x19 is set once the record is built.
-        emit_load_u64(ops, 21, u64::from(spill.bytes + window));
-        dynasm!(ops ; .arch aarch64 ; add x21, x9, x21);
-    } else {
+    if !shape.lazy_window {
+        // The lazy window, below the record and the pairs, is published only
+        // by an exit; the body's x19 is set once the record is built.
         if spill.bytes == 0 {
             dynasm!(ops ; .arch aarch64 ; mov x19, x9);
         } else {
             emit_load_u64(ops, 19, u64::from(spill.bytes));
             dynasm!(ops ; .arch aarch64 ; add x19, x9, x19);
         }
-        emit_load_u64(ops, 21, u64::from(window));
-        dynasm!(ops ; .arch aarch64 ; add x21, x19, x21);
     }
-    // Only the trampoline tags the aligned generation word. Direct entries
-    // read their genuine saved LR; staged entries consume the original caller
-    // anchor before any generation-cell dereference or frame publication.
+    // Only the trampoline tags the aligned generation word. A direct entry's
+    // return address is the link register saved at `[x29 + 8]`, read back
+    // through the record's anchor; a staged entry consumes the original
+    // caller anchor of the request before any generation-cell dereference
+    // or frame publication.
     let direct_origin = ops.new_dynamic_label();
     let origin_ready = ops.new_dynamic_label();
-    let no_native_caller = ops.new_dynamic_label();
     dynasm!(ops ; .arch aarch64
         ; tbz x8, 0, =>direct_origin
         ; and x8, x8, !(abi::CODE_ENTRY_STAGED_REQUEST_MASK as u64)
         ; ldr x16, [x20, crate::entry::PENDING_CALL_OFFSET + abi::REQUEST_CALLER_RETURN_PC_OFFSET]
+        ; cmp x16, 0
+        ; csinc x16, x16, xzr, ne
+        ; stp xzr, xzr, [x20, (crate::entry::PENDING_CALL_OFFSET + abi::REQUEST_CALLER_OFFSET) as i32]
         ; b =>origin_ready
         ; =>direct_origin
         ; mov x16, xzr
-        ; ldr x17, [x20, NATIVE_FRAME_OFFSET]
-        ; cbz x17, =>no_native_caller
-        ; ldr w17, [x17, abi::NATIVE_FRAME_CODE_OBJECT_ID_OFFSET]
-        ; cbz w17, =>no_native_caller
-        ; ldr x16, [x29, 8]
-        ; =>no_native_caller
         ; =>origin_ready
         ; str x16, [x21, abi::NATIVE_FRAME_CALLER_RETURN_PC_OFFSET]
-        ; stp xzr, xzr, [x20, (crate::entry::PENDING_CALL_OFFSET + abi::REQUEST_CALLER_OFFSET) as i32]
     );
     if let Some((check, back)) = break_even {
         // Entry diagnostics and canonical source-work admission for promotion.
@@ -353,16 +353,7 @@ pub(crate) fn emit_call_entry(
     if shape.derived {
         emit_load_u64(ops, 2, VALUE_HOLE);
     }
-    let have_depth = ops.new_dynamic_label();
-    dynasm!(ops
-        ; .arch aarch64
-        ; ldr x10, [x20, NATIVE_FRAME_OFFSET]
-        ; movz w11, 1
-        ; cbz x10, =>have_depth
-        ; ldr w11, [x10, abi::NATIVE_FRAME_DEPTH_OFFSET]
-        ; add w11, w11, 1
-        ; =>have_depth
-    );
+    dynasm!(ops ; .arch aarch64 ; ldr x10, [x20, NATIVE_FRAME_OFFSET]);
     // A derived constructor is entered only by `[[Construct]]` and always
     // owes constructor completion.
     if shape.derived {
@@ -401,16 +392,17 @@ pub(crate) fn emit_call_entry(
         ; add x15, x29, 48
         ; stp x15, x10, [x21, (abi::NATIVE_FRAME_ACTUALS_OFFSET) as i32]
     );
+    // The depth half stays zero: the runtime derives it on first use.
     if spill.bytes == 0 {
         dynasm!(ops
             ; .arch aarch64
-            ; orr x16, x11, 0xffff_ffff_0000_0000
+            ; orr x16, xzr, 0xffff_ffff_0000_0000
             ; stp x16, xzr, [x21, (abi::NATIVE_FRAME_DEPTH_OFFSET) as i32]
         );
     } else if spill.safepoint == abi::NO_SAFEPOINT {
         dynasm!(ops
             ; .arch aarch64
-            ; orr x16, x11, 0xffff_ffff_0000_0000
+            ; orr x16, xzr, 0xffff_ffff_0000_0000
             ; mov x17, sp
             ; stp x16, x17, [x21, (abi::NATIVE_FRAME_DEPTH_OFFSET) as i32]
         );
@@ -418,7 +410,6 @@ pub(crate) fn emit_call_entry(
         emit_load_u64(ops, 16, u64::from(spill.safepoint) << 32);
         dynasm!(ops
             ; .arch aarch64
-            ; orr x16, x16, x11
             ; mov x17, sp
             ; stp x16, x17, [x21, (abi::NATIVE_FRAME_DEPTH_OFFSET) as i32]
         );
@@ -458,16 +449,14 @@ pub(crate) fn emit_call_entry(
 /// unpublished: the slots reserved just below the record, all `undefined`,
 /// become the record's window in `x19`. A record with a window keeps it.
 /// Runs where no live value is in a register; clobbers `x16` and `x17`.
-pub(crate) fn emit_publish_lazy_window(ops: &mut Assembler, register_count: u16) {
+pub(crate) fn emit_publish_lazy_window(ops: &mut Assembler, register_count: u16, pairs: u8) {
     let published = ops.new_dynamic_label();
-    let window = u32::from(register_count) * 8;
     dynasm!(ops
         ; .arch aarch64
         ; ldr x16, [x21, NATIVE_FRAME_REGISTER_BASE_OFFSET]
         ; cbnz x16, =>published
     );
-    emit_load_u64(ops, 16, u64::from(window));
-    dynasm!(ops ; .arch aarch64 ; sub x19, x21, x16);
+    emit_window_base(ops, register_count, pairs);
     emit_load_u64(ops, 16, VALUE_UNDEFINED);
     for index in 0..u32::from(register_count) {
         let offset = index * 8;
@@ -620,12 +609,12 @@ pub(crate) fn emit_call_entry_cold(
     view: &JitCompileSnapshot,
     exits: ActivationExits,
     shape: EntryShape,
+    saved_pairs: u8,
     cold: CallEntryCold,
 ) {
     if let Some((missing, ready)) = cold.underarity {
         dynasm!(ops ; .arch aarch64 ; =>missing);
-        emit_load_u64(ops, 19, u64::from(shape.register_count) * 8);
-        dynasm!(ops ; .arch aarch64 ; sub x19, x21, x19);
+        emit_window_base(ops, shape.register_count, saved_pairs);
         emit_fill_underarity_window(ops, u32::from(shape.register_count));
         emit_load_u64(ops, 16, u64::from(shape.register_count));
         // Publish every initialized register before receiver conversion or
@@ -936,6 +925,16 @@ pub(crate) fn emit_tail_transfer(
         ; movz x3, VALUE_UNDEFINED as u32
         ; ldr x9, [x29, RETURN_FRAME]
         ; str x9, [x20, NATIVE_FRAME_OFFSET]
+    );
+    // A record the trampoline entered returns into the trampoline: its
+    // caller anchor travels to the callee through the request.
+    let direct = ops.new_dynamic_label();
+    dynasm!(ops
+        ; .arch aarch64
+        ; ldr x10, [x21, abi::NATIVE_FRAME_CALLER_RETURN_PC_OFFSET]
+        ; cbz x10, =>direct
+        ; stp x9, x10, [x20, (crate::entry::PENDING_CALL_OFFSET + abi::REQUEST_CALLER_OFFSET) as i32]
+        ; =>direct
         ; add x10, x29, 48
         ; ldr x21, [x29, #32]
         ; ldp x19, x20, [x29, #16]

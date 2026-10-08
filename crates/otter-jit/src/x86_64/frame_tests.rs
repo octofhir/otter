@@ -61,7 +61,8 @@ unsafe fn observe(ctx: *mut JitCtx) {
     observation.frame = ctx.native_frame as usize;
     observation.caller = frame.caller;
     observation.caller_return_pc = frame.caller_return_pc;
-    observation.depth = frame.depth;
+    // SAFETY: the published chain is live for this observation.
+    observation.depth = unsafe { abi::Frame::logical_depth(ctx.native_frame) };
     observation.call_site = frame.call_site;
     observation.machine_roots = frame.machine_roots;
     observation.register_count = frame.header.register_count;

@@ -264,6 +264,7 @@ fn compile_with_reach(
             view,
             activation_exits,
             shape,
+            0,
             cold,
         );
         crate::arm64::frame::emit_call_entry(

@@ -22,11 +22,14 @@
 //! - `[rbp - 40]` holds the frame to publish on return: the caller of a
 //!   called record, or the published interpreter frame itself under a tier
 //!   entry. Bit 0 marks a record that owes constructor completion.
-//! - A call entry reserves spills, window and record, then publishes only
-//!   initialized roots. Adequate actual-only entries leave the window absent;
+//! - A call entry builds its record directly below the fixed 48-byte save
+//!   area, then the window and the spill area (lowest, at `rsp`), and
+//!   publishes only initialized roots. The record's return address is the
+//!   one saved at `[rbp + 8]`. Adequate actual-only entries leave the window absent;
 //!   underarity initializes and publishes it before any collecting helper.
-//! - Depth carry and the configured JS depth limit reject entry before the
-//!   reservation, accounting, receiver preparation or frame publication.
+//! - The native stack limit alone bounds call depth; it rejects entry before
+//!   the reservation, accounting, receiver preparation or frame publication.
+//!   Records carry no depth: the runtime derives it on first use.
 //! - Spill roots are zeroed before publication. Tier exits restore both
 //!   previous interpreter root words from the area's top 16 bytes.
 //! - Graph alone saves `rbx` in the unused fixed slot at `[rbp - 48]`;
@@ -67,8 +70,12 @@ use crate::{
 
 /// `[rbp + RETURN_FRAME]`: the frame published on return.
 const RETURN_FRAME: i32 = -40;
-/// Bytes of the record reserved below the saved registers.
-const RECORD_BYTES: u32 = std::mem::size_of::<abi::Frame>() as u32;
+/// Bytes of the record slot directly below the fixed 48-byte save area. A
+/// call entry builds its record there, so a directly entered record's
+/// return address is `[record + 48 + RECORD_SLOT + 8]`.
+const RECORD_SLOT: i32 = abi::FRAME_RECORD_BYTES as i32;
+/// `rbp`-relative record address of a call entry.
+const RECORD: i32 = -48 - RECORD_SLOT;
 
 fn emit_save(ops: &mut Assembler, kind: abi::NativeFrameKind) {
     dynasm!(ops
@@ -234,22 +241,9 @@ pub(crate) fn emit_call_entry(
 ) -> AssemblyOffset {
     let start = ops.offset();
     let window = u32::from(shape.register_count) * 8;
-    let bytes = ((window + RECORD_BYTES).next_multiple_of(16) + spill.bytes) as i32;
+    let bytes = (RECORD_SLOT as u32 + window.next_multiple_of(16) + spill.bytes) as i32;
     emit_save(ops, shape.kind);
-    let depth_ready = ops.new_dynamic_label();
-    dynasm!(ops ; .arch x64
-        ; mov r15, rdi
-        ; mov r10, [r15 + NATIVE_FRAME_OFFSET as i32]
-        ; mov eax, 1
-        ; test r10, r10
-        ; jz =>depth_ready
-        ; mov eax, [r10 + abi::NATIVE_FRAME_DEPTH_OFFSET as i32]
-        ; add eax, 1
-        ; jc =>cold.overflow
-        ; =>depth_ready
-        ; cmp rax, [r15 + std::mem::offset_of!(abi::JitCtx, generated_depth_limit) as i32]
-        ; ja =>cold.overflow
-    );
+    dynasm!(ops ; .arch x64 ; mov r15, rdi);
     dynasm!(ops
         ; .arch x64
         ; lea r11, [rsp - bytes]
@@ -281,13 +275,11 @@ pub(crate) fn emit_call_entry(
     } else {
         dynasm!(ops ; .arch x64 ; lea r13, [rsp + spill.bytes as i32]);
     }
-    dynasm!(ops ; .arch x64 ; lea r14, [r13 + window as i32]);
-    // RAX still holds the depth checked before reservation. Publish it only
-    // into this private, unpublished record before accounting or receiver
-    // classification can use RAX. No helper or collection precedes the final
-    // initialized-frame publication below.
+    // The depth stays zero: the runtime derives it on first use. No helper
+    // or collection precedes the final initialized-frame publication below.
     dynasm!(ops ; .arch x64
-        ; mov [r14 + abi::NATIVE_FRAME_DEPTH_OFFSET as i32], eax
+        ; lea r14, [rbp + RECORD]
+        ; mov DWORD [r14 + abi::NATIVE_FRAME_DEPTH_OFFSET as i32], 0
         ; mov r10, [r15 + NATIVE_FRAME_OFFSET as i32]
         ; mov [r14 + abi::NATIVE_FRAME_CALLER_OFFSET as i32], r10
     );
@@ -297,30 +289,28 @@ pub(crate) fn emit_call_entry(
         dynasm!(ops ; .arch x64 ; mov [rbp + RETURN_FRAME], r10);
     }
     // The one origin bit belongs to the existing aligned generation input.
-    // Mask it before dereference; a staged target transfers the original JS
-    // return rather than the trampoline's own internal continuation.
+    // Mask it before dereference. A direct entry's return address is the one
+    // saved at `[rbp + 8]`, read back through the record's anchor; a staged
+    // target transfers the original JS return rather than the trampoline's
+    // own internal continuation.
     let direct_origin = ops.new_dynamic_label();
     let origin_ready = ops.new_dynamic_label();
-    let no_native_caller = ops.new_dynamic_label();
     dynasm!(ops ; .arch x64
         ; test r9b, abi::CODE_ENTRY_STAGED_REQUEST_MASK as i8
         ; jz =>direct_origin
         ; and r9, !(abi::CODE_ENTRY_STAGED_REQUEST_MASK as i32)
         ; mov r11, [r15 + (crate::entry::PENDING_CALL_OFFSET + abi::REQUEST_CALLER_RETURN_PC_OFFSET) as i32]
+        ; mov eax, abi::NO_CALLER_RETURN_PC as i32
+        ; test r11, r11
+        ; cmovz r11, rax
+        ; xor eax, eax
+        ; mov [r15 + (crate::entry::PENDING_CALL_OFFSET + abi::REQUEST_CALLER_OFFSET) as i32], rax
+        ; mov [r15 + (crate::entry::PENDING_CALL_OFFSET + abi::REQUEST_CALLER_RETURN_PC_OFFSET) as i32], rax
         ; jmp =>origin_ready
         ; =>direct_origin
         ; xor r11d, r11d
-        ; test r10, r10
-        ; jz =>no_native_caller
-        ; cmp DWORD [r10 + abi::NATIVE_FRAME_CODE_OBJECT_ID_OFFSET as i32], 0
-        ; je =>no_native_caller
-        ; mov r11, [rbp + 8]
-        ; =>no_native_caller
         ; =>origin_ready
         ; mov [r14 + abi::NATIVE_FRAME_CALLER_RETURN_PC_OFFSET as i32], r11
-        ; xor r11d, r11d
-        ; mov [r15 + (crate::entry::PENDING_CALL_OFFSET + abi::REQUEST_CALLER_OFFSET) as i32], r11
-        ; mov [r15 + (crate::entry::PENDING_CALL_OFFSET + abi::REQUEST_CALLER_RETURN_PC_OFFSET) as i32], r11
     );
     if let Some((check, back)) = cold.break_even {
         dynasm!(ops
@@ -467,7 +457,7 @@ pub(crate) fn emit_publish_lazy_window(ops: &mut Assembler, register_count: u16)
         ; .arch x64
         ; cmp QWORD [r14 + NATIVE_FRAME_REGISTER_BASE_OFFSET as i32], 0
         ; jne =>published
-        ; lea r13, [r14 - window]
+        ; lea r13, [r14 - ((window + 15) & !15)]
     );
     for index in 0..i32::from(register_count) {
         dynasm!(ops ; .arch x64 ; mov QWORD [r13 + index * 8], VALUE_UNDEFINED as i32);
@@ -507,7 +497,7 @@ pub(crate) fn emit_call_entry_cold(
         );
     }
     if let Some((underarity, back)) = cold.underarity {
-        let window = i32::from(shape.register_count) * 8;
+        let window = (i32::from(shape.register_count) * 8 + 15) & !15;
         dynasm!(ops ; .arch x64 ; =>underarity ; lea r13, [r14 - window]);
         emit_fill_window(ops, shape);
         emit_window_publication(ops, shape.register_count);
@@ -768,6 +758,18 @@ pub(crate) fn emit_tail_transfer(
         ; mov r8d, count as i32
         ; mov r11, [rbp + RETURN_FRAME]
         ; mov [r15 + NATIVE_FRAME_OFFSET as i32], r11
+    );
+    // A record the trampoline entered returns into the trampoline: its
+    // caller anchor travels to the callee through the request.
+    let direct = ops.new_dynamic_label();
+    dynasm!(ops
+        ; .arch x64
+        ; mov rax, [r14 + abi::NATIVE_FRAME_CALLER_RETURN_PC_OFFSET as i32]
+        ; test rax, rax
+        ; jz =>direct
+        ; mov [r15 + (crate::entry::PENDING_CALL_OFFSET + abi::REQUEST_CALLER_OFFSET) as i32], r11
+        ; mov [r15 + (crate::entry::PENDING_CALL_OFFSET + abi::REQUEST_CALLER_RETURN_PC_OFFSET) as i32], rax
+        ; =>direct
     );
     // The destination lies above the pushed span: copying from the top
     // down reads every word before a store can reach it.

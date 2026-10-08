@@ -1076,7 +1076,7 @@ them changes observable counters, not only speed.
 ### C6 landed: inline parents described by the call site
 Generated code no longer builds NativeFrames for spliced parents around a
 call. A generated call's safepoint record carries the recipe
-(`inline_frames_virtual`) and the call's PC in the code object's own
+(`inline_frames`) and the call's PC in the code object's own
 function (`call_pc`); stack snapshots read both from the physical caller's
 call site, the callee-deopt caller check validates the physical caller's
 recipe, and nothing is copied per call. Spliced bodies may therefore keep
@@ -1607,6 +1607,685 @@ commands, harnesses and output are in
 All seven fixed-work runs exited successfully. The initial sandboxed baseline
 could not read macOS resource counters; the table uses the successful run
 with access to those counters.
+
+## 19. Shared JavaScript stack and call trampolines
+
+Design recorded before implementation, 2026-09-30, on `main` after
+`ca942fa6`. The seven final measurements in section 18 are this item's
+before measurements; its preserved executable is the comparison baseline.
+
+### Reference mechanisms
+
+- V8's [ARM64 Call, Construct and interpreter-entry builtins](https://github.com/v8/v8/blob/main/src/builtins/arm64/builtins-arm64.cc)
+  dispatch on callable kind in generated code. Bound calls prepend arguments
+  and tail-dispatch to the target. Constructors select receiver creation or
+  an uninitialized derived receiver. Interpreter entry consumes the same
+  incoming JavaScript argument convention and constructs an interpreter
+  frame on the native stack. Runtime calls handle semantic work and errors;
+  they do not constitute the ordinary function-call dispatcher.
+- JSC's [CallFrame](https://github.com/WebKit/WebKit/blob/main/Source/JavaScriptCore/interpreter/CallFrame.h)
+  fixes caller/return address, code block, callee, argument count, receiver
+  and argument positions. Its [call thunks](https://github.com/WebKit/WebKit/blob/main/Source/JavaScriptCore/jit/ThunkGenerators.cpp)
+  select executable entries and transfer control directly. Native thunks
+  establish the host boundary and perform exception handling around the
+  native entry.
+- SpiderMonkey's [JS ABI design in JitFrames.h](https://github.com/mozilla-firefox/firefox/blob/main/js/src/jit/JitFrames.h)
+  explicitly covers Ion, Baseline, BaselineInterpreter and the C++ interpreter
+  stub with one function ABI. Arguments, callee identity, constructor state
+  and caller descriptors share a stack contract. Entry and exit frames mark
+  host transitions; frame pointers and descriptors support stack walking.
+
+### Existing Otter contract
+
+Ordinary interpreted calls push a 56-byte `Frame` into a vector and allocate
+registers in a separate segmented arena. Generated calls publish an 80-byte
+`NativeFrame` with a native-stack register window. `ActiveFrameStorage` and
+`RuntimeFrameIdentity` distinguish these physical forms. Compiled entry
+copies the common frame state into a Rust-local native record. Generic
+compiled calls enter boxed runtime operations, which can invoke
+`run_callable_sync_rooted` and nest a Rust dispatch loop. Generated callee
+deopt also materializes the other frame representation.
+
+A shared header does not remove those ownership and dispatch boundaries.
+This item replaces both physical activation forms and their call paths.
+
+### Chosen contract
+
+- One C-layout JavaScript frame owns the caller link, source position,
+  executable identity, SELF, receiver, new.target, argument window, register
+  window, lazy arguments identity and cold-record identity. Every active
+  interpreter, Template and Machine invocation uses that frame. Generated
+  linkage owns its native-stack extent. The materialized `Frame` carrier,
+  independent activation vector and register-arena ownership are removed.
+- One generated call/construct trampoline per architecture accepts the loaded
+  callee, receiver, new.target and complete actual arguments. It dispatches
+  closures, bound functions, class constructors and declared native entries
+  through fixed layouts. Callable kind and invocation mode are runtime
+  inputs, not feedback-specific alternative call implementations.
+- Bound arguments have collector-owned storage with a fixed machine layout.
+  The trampoline prepends them, preserves their order through nested binds,
+  applies bound receiver/new.target rules, and tail-dispatches the target.
+  Generated code never interprets Rust `SmallVec` or container internals.
+- Stable function entries always identify a valid execution destination:
+  interpreter, Template or Machine. Promotion changes the destination;
+  callers keep the same frame and argument contract. An unseen bytecode
+  callee needs no recursive Rust invocation merely because it has no JIT
+  generation yet.
+- The Rust interpreter runs the current activation until a call, completion,
+  exception or tier transfer needs the trampoline. It returns explicit
+  continuation state after releasing its Rust borrows. The trampoline owns
+  callee entry and caller resumption, so alternating interpreter/JIT calls
+  do not accumulate Rust dispatch loops. Pending object-protocol work keeps
+  its continuation in the existing cold semantic state.
+- Host natives retain the `NativeCtx`/handle-scope boundary. Their native
+  entry runs behind an explicit exit frame; a host callback enters JS through
+  the same trampoline. Declared fast ABI natives are selected directly from
+  their callable metadata. A real host callback may retain its host stack;
+  ordinary JavaScript call dispatch does not retain a Rust dispatcher.
+- GC and stack inspection walk the same published frame chain. Precise
+  Machine roots remain attached to their owning activation and safepoint.
+  Frame publication precedes allocating or reentrant work; no borrowed slot
+  slice survives it. Stack limits count the unified JavaScript chain once.
+- Return, throw, constructor completion, local catches and finally resume
+  through the common continuation contract. Exact deopt fills the existing
+  frame's canonical slots and transfers to interpreter entry. Inline recipes
+  reconstruct only missing logical activations in that same stack. The old
+  materialized/native conversion and generic-call replay paths are deleted.
+- Suspended generators and async functions retain owned parked state rather
+  than live stack pointers. Resumption creates an activation through the
+  same entry contract; suspension is not a second active-frame mechanism.
+
+Both emitters, bytecode dispatch, native entry, GC tracing, exceptions,
+arguments, deopt, stack inspection and artifact metadata change together.
+No compatibility carrier, alternate call mode, feature flag or environment
+switch preserves the former paths.
+
+### Entry and continuation ownership
+
+The VM owns `JitCtx` and the callable entry signature, so the interpreter
+can enter the same stack machinery without depending on the compiler crate.
+A fixed call request describes the selected entry, frame header, callee,
+receiver, new.target, formals and actuals. The native trampoline reserves and
+initializes the frame, register window and complete argument window before
+publishing the caller link. It retains no Rust activation between JS calls.
+An execution entry returns `Continue` in the execution result domain to
+consume the next call request; the trampoline invokes the child and resumes
+the parent entry with its completion. The existing two-word result carrier
+is retained, with domain validation separating this continuation from a
+committed exception transition. Request values are copied before any
+safepoint. A resumed entry must home its completion before allocating.
+Stack-limit checks precede reservation; ABI alignment and preserved
+registers are part of both architecture implementations.
+
+The activation view borrows the frame cell published by the execution context.
+Its indexing and iteration derive from caller links; it owns neither frames
+nor register storage. A prepared interpreted call owns only incoming values,
+optional register seeds for suspension/eval entry, and cold-record identity.
+The trampoline copies that packet into its native reservation before Rust
+entry consumes the packet owner. Return and exception cleanup keep the physical
+frame published until the trampoline releases its extent. The interpreter
+executes only its current frame: its unwind floor excludes the caller, and
+child completion is delivered before resuming that caller. Host callbacks may
+open another entry extent over the same chain. Suspensions copy values into
+owned snapshots and resume through the ordinary call packet.
+
+### Validation contract
+
+Regressions exercise mixed-tier recursion, unseen callees, nested bound calls
+and constructs, different actual/formal arities, lexical receiver/new.target,
+derived constructors, native callbacks, moving GC, local catches/finally,
+OSR and exact deopt. Structural tests check that generic generated calls
+reach the shared trampoline and that every tier publishes the one frame
+layout. Semantic comparisons and the full requested gates follow the
+coherent replacement; the seven fixed-work cases measure its result.
+
+### Interpreter and compiled entry control transfer
+
+An interpreter entry selects a live generation while its one native frame
+is published, then returns a tier-entry continuation to assembly. The
+trampoline invokes the selected entry after the Rust dispatcher has returned
+and passes its completion back to the interpreter entry on the same frame.
+Return, throw and exact side exit are interpreted only by the owning VM
+continuation; the assembly does not reconstruct or copy an activation.
+The tier-entry bit belongs to the request and is cleared from published frame
+flags. This uses the same continuation mailbox as child calls and retains
+one physical caller link, register window and actual-argument window.
+V8's interpreter entry and JSC's entry thunks likewise transfer through
+machine entry code rather than retaining the interpreter's C++ dispatch stack.
+The generation remains retained by the native activation retirement epoch.
+
+### OSR and cold resumption use the same continuation
+
+Sources inspected for OSR: V8
+[`OnStackReplacement` / `Generate_OSREntry`](https://github.com/v8/v8/blob/main/src/builtins/arm64/builtins-arm64.cc),
+JSC [`prepareOSREntry`](https://github.com/WebKit/WebKit/blob/main/Source/JavaScriptCore/dfg/DFGOSREntry.cpp),
+and SpiderMonkey
+[`BaselineScript::nativeCodeForOSREntry`](https://github.com/mozilla-firefox/firefox/blob/main/js/src/jit/BaselineJIT.cpp).
+V8 computes the target from the code entry and OSR offset; JSC validates live
+values and frame capacity before returning entry data; SpiderMonkey resolves
+a bytecode offset to the code object's native OSR address. Otter keeps exact
+PC and layout validation in the VM and transfers through its shared native
+continuation instead of executing through a code-object Rust method.
+
+Loop OSR selects an address from installed immutable code metadata and yields
+the same tier-entry request as ordinary entry. The published frame records
+its OSR origin for exit diagnostics and retry policy. No Rust method invokes
+the selected body; `JitFunctionCode` exposes addresses and metadata only.
+Compiled completion is delivered to the VM on that same frame, including
+OSR exits outside the initiating loop and exceptions.
+
+Cold deoptimization enters the common trampoline with a tier-entry request
+over the already-published activation. The trampoline keeps its frame and
+register window, drives interpreter and compiled continuations, and restores
+the enclosing frame cell on return. Only actual child calls reserve another
+extent. This removes the separate Rust resumption dispatch loop as well as
+the JIT-owned entry wrapper and its separate `JitExecOutcome` carrier.
+Measurement observes validated completion at the VM boundary rather than
+wrapping a Rust entry invocation. The completion mailbox identifies a tier
+transfer explicitly, so a cold inline deopt that already completed the frame
+returns its committed result without dispatching that frame again. V8's OSR builtin and JSC's OSR entry thunk
+likewise transfer to code using the existing activation and explicit entry
+metadata; code objects do not own an interpreter dispatch stack.
+
+The completion mailbox retains the entered generation's scalar identity.
+Assembly saves it before the tier transfer and delivers it with completion,
+so measurement still names the exact generation when cold deopt has already
+changed the frame back to interpreter state. This occupies the context's
+existing trailing alignment word; it retains no moving pointer or code lease.
+
+### Complete register extents at every entry
+
+All tiers publish the function's full canonical register extent at entry.
+Formal slots receive actual values or undefined; remaining slots are initialized
+before publication. Machine allocator homes and precise safepoint roots remain
+separate from this canonical extent. Neither an entry-cell flag nor an exit
+helper changes its visible length. The generation's parameter-prefix capability,
+caller skip-initialization branches and cold window-expansion helpers are
+deleted together. V8/JSC/SpiderMonkey likewise describe a frame through its
+function/code metadata and explicit roots, rather than changing its declared
+extent between entry and a runtime transition.
+
+Owned error stacks, native call-site capture and bounded CPU samples all use
+one visitor over the published physical chain and code-owned inline recipes.
+Each source function resolves through its owning code-space context. The
+activation-view-only diagnostic walker is deleted, so an optimized inline
+parent cannot disappear merely because inspection began in another script.
+
+### Actual arguments belong to every activation
+
+JSC's [`CallFrame`](https://github.com/WebKit/WebKit/blob/main/Source/JavaScriptCore/interpreter/CallFrame.h)
+stores the actual count and exposes argument slots independently of whether
+the body creates an arguments object. SpiderMonkey's
+[`JitFrames.h`](https://github.com/mozilla-firefox/firefox/blob/main/js/src/jit/JitFrames.h)
+frame-layout documentation likewise distinguishes actual count from formals;
+missing formals are undefined and extra actuals remain on the stack. V8's
+[`ARM64 builtins`](https://github.com/v8/v8/blob/main/src/builtins/arm64/builtins-arm64.cc)
+preserve actuals through construct entry and prepend bound arguments before
+tail dispatch. These are invocation data, rather than an optional layout
+chosen from the body's use of `arguments`.
+
+Otter's single contract therefore reserves every actual argument immediately
+after the complete canonical register extent, for interpreter, Template and
+Machine entries on both targets. The frame count is unconditional. Delete
+`INCOMING_ARGUMENTS`, the call plan's `needs_incoming_arguments`, optional-count
+decoding and parameter-only forwarding. All producers initialize the complete
+window before publication; rest, arguments materialization, suspension, GC and
+forwarding consume that same window. Compiler restrictions on splicing bodies
+that need arguments setup use the CodeBlock's semantic metadata, without
+reintroducing an optional physical frame layout. Spread linkage must account
+for its runtime count rather than publishing a frame with absent actuals.
+
+### Function linkage always has an execution destination
+
+V8's [`JSFunction` dispatch handle](https://github.com/v8/v8/blob/main/src/objects/js-function-inl.h)
+selects code through the isolate dispatch table and patches that entry on
+promotion. JSC's [`ExecutableBase::entrypointFor`](https://github.com/WebKit/WebKit/blob/main/Source/JavaScriptCore/runtime/ExecutableBase.h)
+selects a call or construct entry with its arity contract. SpiderMonkey's
+[`BaseScript::jitCodeRaw`](https://github.com/mozilla-firefox/firefox/blob/main/js/src/vm/JSScript.h)
+names compiled code, an interpreter entry or a lazy-link entry; its documented
+JIT-enabled contract keeps that destination non-null. The dispatch identity
+exists independently of an optimizing generation.
+
+Create Otter's permanent function cells when bytecode links, with immutable
+formal/register counts and callable semantics. An interpreter destination is
+present from first publication. Installing or invalidating a generation
+switches that destination; it never restores an unresolved call state. The
+VM owns both function and generation cells, including the interpreter entry,
+and generated callers retain only permanent function identities. Delete the
+zero-generation cold resolver, reverse-address scan and caller-specific
+rebuild paths when this contract is wired through both emitters.
+
+Generic generated dispatch reads a machine-visible directory of these cells
+by the global function ID. Its pointer/count header is address-stable; the
+pointer array may grow when linking, so generated code reloads it for each
+lookup and retains no array pointer across allocation or JavaScript reentry.
+Individual function cells remain pinned. This keeps code-space ownership and
+generation retirement explicit without exposing a Rust map to machine code.
+Snapshot restore creates a new directory and interpreter destinations.
+
+The interpreter destination is a generated entry trampoline for an already
+published canonical frame. It writes a tier-transfer request and tail-enters
+the shared stack trampoline, which executes the interpreter and any subsequent
+tier continuation over that same frame. Ordinary interpreter entry consumes
+owned pending inputs when present; a generated caller already supplies the
+complete initialized frame and needs no copied input packet or Rust call
+resolver. Both forms use the same current-activation dispatch. Interpreter
+entry has generation ID zero and never owns compiled safepoint metadata.
+Its fixed entry reservation comes from the trampoline's actual ABI prologue.
+
+Linking publishes every function cell, and compiled installation changes its
+destination in place. Invalidation chooses another installed tier or the
+owned interpreter entry. Cold-resolver stubs, their telemetry and recursive
+target-rebuild policy are deleted with this change. The private runtime-stub
+inventory is renumbered in place to retain its dense contract; artifacts name
+the interpreter destination explicitly.
+
+A body reading or forwarding its activation's actual arguments retains a
+physical argument frame. The immutable CodeBlock admission includes
+`CallForwardArguments` alongside an explicit arguments binding. Neither a
+spliced parent recipe nor its caller's window represents those actuals in the
+current IR. Such bodies therefore use their linked entry; this preserves the
+reference engines' per-activation actual-count/slot ownership without adding
+a materialization adapter to forwarding.
+
+Committed forwarding publishes current SSA register bindings and the formals
+context into the canonical frame before materializing an observable arguments
+object. The explicit operand packet already owns those current values. The
+frame is the collector-visible activation owner, so this publication ends
+before allocation; arguments-object construction then reads live bindings from
+the same frame. Intrinsic forwarding continues to consume the explicit packet.
+
+Generated-entry accounting includes each function's permanent interpreter
+cell. Reconciliation keys observations by the owned cell address, because
+interpreter destinations all carry generation ID zero. Interpreter entries
+already run function hotness and call-budget accounting inside the VM; their
+generated-entry deltas contribute dispatch diagnostics without charging those
+same calls twice. Compiled generation deltas continue to drive tier policy.
+Snapshot restoration walks its fresh CodeBlocks to republish interpreter cells.
+
+Logical completion belongs to the physical Frame until assembly releases it.
+A Rust-side completed-frame address can outlive that release and compare equal
+to a subsequent activation reusing the same stack storage. Completion therefore
+uses a frame-header state bit; every interpreter, Template and Machine entry
+initializes that header, so reused storage starts live. ActivationStack owns no
+completed-address field. Nested execution restores only its context pointer;
+completion-scope restoration touches only the currently published live frame.
+This follows the reference engines' physical stack ownership instead of retaining
+an address after the activation's extent ends.
+
+Caller linkage does not wait for a callee's compiled generation. The permanent
+interpreter destination makes the old pending-target sets, forced backedge
+relink and successful-baseline refresh unnecessary. Delete that complete
+caller-rebuild policy and its telemetry. Callee promotion still patches its
+own function cell; ordinary speculative exits still own their invalidation
+policy. A baseline poll may leave for optimizing OSR, but never because a
+callee acquired entry code. Generated-entry tier costing stays unchanged.
+
+Inline source frames also have one representation. V8's
+[optimized frame summaries](https://github.com/v8/v8/blob/main/src/execution/frames.cc),
+JSC's [StackVisitor code origins](https://github.com/WebKit/WebKit/blob/main/Source/JavaScriptCore/interpreter/StackVisitor.cpp)
+and SpiderMonkey's [inline-frame iteration](https://github.com/mozilla-firefox/firefox/blob/main/js/src/jit/JitFrames.h)
+recover logical inline activations from compiled metadata. An inlined body
+has no independent physical call. Otter currently reconstructs a `Vec<Frame>`
+for binding cold calls while property and generated calls retain virtual
+recipes. Replace that second active-frame publication mechanism: all inline
+parents remain code-owned safepoint recipes, and committed binding operations
+resolve their owning function/PC from those recipes. Their context/value inputs
+are already explicit SSA roots. Delete the recipe decoder, temporary physical
+frames, publication scopes and the physical/virtual metadata switch. Actual
+deoptimization still reconstructs missing interpreter activations through the
+common stack trampoline. Both emitters already publish the enclosing call PC;
+safepoints now describe the same logical origins for every cold inline call.
+
+### Contract verification
+
+The unconditional actual-window change passes the 11 native trampoline tests
+on each architecture and real Template/Machine entry checks on both. The new
+runtime regression inspects extra actuals in a callee with no arguments
+binding, after a nested call and numeric deopt; ARM64 and x86 match the Node
+oracle. ARM64 also passes this regression at GC stride 1 with verification.
+All 13 forwarding runtime tests pass. VM/JIT library and test targets pass
+clippy with warnings denied. Evidence is in
+`benchmarks/results/call-trampoline-actual-window-*.log`.
+
+The former bounded spread emitters could enter without retaining actuals.
+They now decline that incomplete layout. Generated spread coverage remains
+required when the shared call/construct linkage consumes the runtime argument
+count; the final item gate cannot pass with that linkage still missing.
+
+Focused checks on 2026-10-01 cover the native continuation core on ARM64 and
+x86 (11 tests each), complete Machine windows on both targets, optimizing OSR
+(3 runtime tests), inline property success/throw/exact deopt (2 runtime tests),
+bounded CPU samples and native stack diagnostics. The inline publication
+fixtures pass 4 tests, including moving roots and nested publication scopes.
+The OSR and inline runtime tests also pass with GC stride 1.
+
+The cross-script tests exposed two wrong assumptions: virtual inline stack
+recipes looked up functions only in the inspecting script, and deopt looked
+up resume PCs only in the current script. Both now resolve the owner by global
+function ID. Getter counts, throw identity, source stacks and arrow receiver
+state match their asserted semantics. The compiled completion mailbox also
+distinguishes an already-completed inline deopt from a frame needing dispatch.
+
+Six corpus cases passed 18/18 serial stride-1 runs against Node on frozen
+debug binary `f84ca12f7954ae0853d34adc5a6342462e65e41096b04bddca9ecfa4f6b0ae52`.
+That binary precedes the complete-window and unified-inspection changes;
+this is focused evidence, not the final item gate. Results are in
+`benchmarks/results/call-trampoline-osr-stress-one-verified/results.json`.
+The current VM/JIT library and test targets pass focused clippy with warnings
+denied and x86 compilation checks. Final release gates and fixed-work remain
+pending until generic generated call/construct linkage replaces the remaining
+Rust callee classification and manual generated frame setup.
+
+Permanent-entry checks cover 11 registry tests, including directory growth,
+promotion/invalidation and independent feedback from interpreter generation-zero
+cells. Two VM tests execute the generated interpreter destination over an
+already-published frame with no pending input and restore fresh interpreter
+cells from a snapshot. After deleting caller relink, 35 focused runtime cases
+pass: actual arguments, lifecycle, forwarding, inline properties and optimizing
+OSR. Evidence is in `call-trampoline-no-caller-relink-*.log` and
+`call-trampoline-permanent-entry-registry.log` under `benchmarks/results/`.
+
+After replacing temporary physical inline publication, 35 ARM64 runtime tests
+pass. On x86, all six inline binding/property tests pass. The new committed
+binding test proves Machine splicing and an inline safepoint recipe, then
+checks getter count, parent effects, throw identity and source stacks. It also
+passes with GC stress stride 1 and verification. The 11 native trampoline
+checks pass on both targets, and real Template/Machine entry tests pass on both.
+VM/JIT library and test targets pass clippy with warnings denied; both target
+compilation checks and formatting pass. Evidence is in
+`benchmarks/results/call-trampoline-inline-source-*.log`.
+
+### Native callable dispatch storage
+
+JSC's [native call trampoline](https://github.com/WebKit/WebKit/blob/main/Source/JavaScriptCore/jit/ThunkGenerators.cpp)
+loads the host entry from NativeExecutable after publishing the CallFrame.
+V8's [API callback builtin](https://github.com/v8/v8/blob/main/src/builtins/arm64/builtins-arm64.cc)
+keeps the callback address and actual arguments in its generated exit-frame
+contract. SpiderMonkey's [trampoline infrastructure](https://github.com/mozilla-firefox/firefox/blob/main/js/src/jit/Trampoline.cpp)
+likewise owns native entry/exit code independently of JavaScript callee bodies.
+These engine boundaries let generated linkage select an entry from callable
+metadata and retain precise roots while the host body runs.
+
+Otter's native body currently stores a Rust enum containing a function pointer,
+intrinsic or host-reference index. A generated classifier cannot consume that
+layout. Replace it with one 16-byte C header: external identity, entry kind,
+callable flags, length and an eight-byte payload. The kind selects a static
+function, captured static function, VM intrinsic, shared host reference or local
+host reference. Function-pointer payloads retain their typed Rust member; index
+payloads have fully initialized bytes. Constructor/extensibility and metadata
+flags belong to this header, with no second policy copy in the body. Captured
+values remain in the existing traced ValueSlab immediately after the header.
+
+Delete NativeCallSlot. Allocation, invocation, host-reference release, census,
+snapshot images and metadata mutation use the header in place. Replace the
+JIT snapshot's isolated native-ref offset with the complete callable layout;
+ARM64 and x86 identity guards consume that layout. This changes storage for the
+shared classifier and does not complete item 2 until the old generic dispatch
+and manual generated frame linkage are also deleted.
+
+### Generated deopt continuation ownership
+
+V8's [ARM64 deoptimization entry](https://github.com/v8/v8/blob/main/src/builtins/arm64/builtins-arm64.cc)
+calls its C++ reconstruction helpers, replaces the output frames in generated
+code, then branches to the saved continuation. JSC's
+[DFG OSR exit](https://github.com/WebKit/WebKit/blob/main/Source/JavaScriptCore/dfg/DFGOSRExit.cpp)
+restores baseline state and selects the continuation from the code origin.
+SpiderMonkey's [bailout helper](https://github.com/mozilla-firefox/firefox/blob/main/js/src/jit/Bailouts.cpp)
+produces BaselineBailoutInfo for its generated bailout tail. The reconstruction
+helper returns before JavaScript continuation execution; it does not recursively
+run the target tier from that helper.
+
+Otter's generated stack-call deopt currently passes eight words to a Rust
+stub, which recursively resumes the interpreter while retaining the Rust VM
+borrow. Replace that boundary with one generated deopt continuation entry on
+ARM64 and x86. Its only operand is the typed side exit. Caller/callee generation,
+logical inline source, constructor mode and resume PC come from the published
+physical chain and its code-owned recipes. The Rust preparation helper validates
+these facts, applies exit policy, rebuilds catches, changes the same frame to
+interpreter ownership and installs its continuation request. It returns before
+the assembly entry invokes the common trampoline on that frame. Success, pure
+throw and fatal completion return to the generated caller without replaying its
+call. Delete the eight-word stub and synchronous VM stack-call deopt method;
+all call, construct and forwarding emitters consume the new fixed contract.
+
+The same ownership rule applies to inline deopt. The current writeback helper
+reconstructs inline descendants and recursively dispatches them from Rust.
+Replace that synchronous execution with preparation of owned descendant inputs
+and catches, followed by a generated writeback entry which tail-transfers to
+the common trampoline only after the helper returns. The enclosing physical
+frame is restored in place; descendants become native activations when assembly
+consumes their requests. Delete the VM method that materializes and runs the
+inline chain from Rust. Single-frame writeback still reports its exact side exit
+so the entry owner can apply its generation policy once.
+
+Generated calls retain their suspended source PC in SafepointRecord.call_pc.
+The Frame.pc is the exact side-exit resume field and does not necessarily mirror
+a currently executing generated call. The shared source resolver must use the
+owned call PC and inline recipe while a call is published, and the canonical
+frame PC for boundaries with no call recipe. Both caller diagnostics and boxed
+semantic kernels consume that same resolver; no source IDs cross the deopt ABI.
+
+The generic generated callee-kind classifier, complete runtime spread linkage
+and replacement of the remaining manual generated call emitters are still
+required. Item 2 has no final release gate, fixed-work comparison or signed
+commit yet; these focused checks do not establish whole-item completion.
+
+### Generated callee classification and the one call linkage
+
+Design recorded 2026-10-01, before the classifier code. Sources read from the
+current trees and kept under `benchmarks/measurements/research-2026-10-01/`:
+
+- V8 [`builtins-arm64.cc`](https://github.com/v8/v8/blob/main/src/builtins/arm64/builtins-arm64.cc).
+  `GenerateCall` tests Smi, loads the map and dispatches on instance type:
+  callable JSFunction range → `CallFunction`, `JS_BOUND_FUNCTION_TYPE` →
+  `CallBoundFunction`, then the map's IsCallable bit, `JS_PROXY_TYPE` →
+  `CallProxy`, `JS_CLASS_CONSTRUCTOR_TYPE` → `ThrowConstructorNonCallableError`,
+  any other callable through the call-as-function delegate, and a runtime
+  `ThrowCalledNonCallable`. `CallFunction` converts the receiver only for
+  sloppy, non-native functions: `null`/`undefined` become the global proxy,
+  objects pass, primitives call the `ToObject` builtin inside an internal
+  frame. `Generate_PushBoundArguments` checks the real stack limit, claims
+  slots, keeps the receiver, inserts `[[BoundArguments]]` before the caller's
+  actuals and tail-calls `Call` on the target, so nested binds concatenate
+  inner prefixes first. `Generate_Construct` checks the map's IsConstructor
+  bit before dispatching functions, bound functions (patching `new.target`
+  to the bound target when it equals the bound function) and proxies.
+  `JSConstructStubGeneric` creates the implicit receiver for base kinds with
+  `FastNewObject`, passes `TheHole` for derived kinds, and after the call keeps
+  an object result, otherwise reloads the receiver and throws if it is still
+  the hole. Native API callbacks run behind an exit frame that owns the
+  argument pointer (`CallApiCallbackImpl`).
+- JSC [`ThunkGenerators.cpp`](https://github.com/WebKit/WebKit/blob/main/Source/JavaScriptCore/jit/ThunkGenerators.cpp).
+  `virtualThunkFor` checks cell and JSFunction type, loads the executable's
+  arity-checked entry for call or construct and jumps; host functions and
+  `InternalFunction` select a native trampoline, and anything else goes to
+  `operationVirtualCall`, which may run JavaScript and returns the target to
+  jump to. `nativeForGenerator` publishes the already-built `CallFrame` as
+  `topCallFrame`, calls the host function with that frame, so its arguments
+  are frame slots, and checks the VM exception after return.
+- SpiderMonkey [`BaselineCacheIRCompiler.cpp`](https://github.com/mozilla-firefox/firefox/blob/main/js/src/jit/BaselineCacheIRCompiler.cpp).
+  `pushBoundFunctionArguments` pushes the caller's actuals, then the bound
+  arguments, then bound `this` (or the bound target as `new.target`),
+  and pads underflow with `undefined`. `emitCallNativeShared` pushes `vp`
+  (callee/result, `this`, actuals), builds a native exit frame and calls
+  `JSNative(cx, argc, vp)`; failure branches to the exception tail.
+
+The common rule: callable kind is decided by generated code from object
+layout, one path per kind. Bound arguments become ordinary actuals before the
+target is entered. Receiver conversion, receiver allocation, proxy traps and
+host bodies are runtime work invoked by that generated path, with every input
+in a traced frame; none of them is a second call dispatcher.
+
+Otter currently classifies callees in Rust in `invoke`, `run_callable_sync`,
+`dispatch_construct_with_new_target` and their window-specialized copies,
+unwrapping bound functions through `SmallVec` concatenation. Generated code
+has two other paths: baked direct-call linkage that builds each callee frame
+inline per site (three emitter families, receiver allocation, forwarding and
+completion code), and boxed value stubs (`CALL_WITH_THIS_VALUE`,
+`CALL_METHOD_VALUE`, `CONSTRUCT_VALUE`, `CONSTRUCT`, the spread op) that
+enter Rust and nest another dispatcher. Natives called from the interpreter
+are invoked inline by Rust without a frame.
+
+Chosen contract:
+
+- `CallRequest.entry == 0` means *classify*. Producers supply only callee,
+  receiver, `new.target` (construct), the complete actual span, the
+  `CONSTRUCT`/`TAIL_CALL` request bits and the return destination. A non-zero
+  entry remains for VM-owned transfers (tier entry, deopt continuation,
+  parked resumption, script/module/eval entries).
+- The trampoline classifies before reserving any stack: function-id immediate
+  and closure → function path; `BoundFunctionBody` → accumulate its slab
+  length, replace the receiver with `bound_this` (call) or patch `new.target`
+  (construct) and continue with `target`, bounded by the depth limit;
+  `ClassConstructorBody` → its inner callable for construct, the
+  class-call error for call; every other cell → a host frame. No GC can occur
+  during classification, so the producer's span only has to stay valid until
+  the copy.
+- Function path: the permanent `FunctionEntryCell` found through the code
+  registry directory supplies formal/register counts and immutable call flags
+  (no-conversion, derived, constructible, suspendable). Call mode binds an
+  arrow's lexical `this`/`new.target` from the closure, keeps strict and
+  object receivers, maps `null`/`undefined` to the realm global for sloppy
+  functions and defers primitive conversion. Construct mode rejects
+  non-constructible kinds, passes the hole to derived constructors and defers
+  base receiver creation. Suspendable kinds always enter the interpreter
+  destination, which performs their promise/generator prologue on the
+  published frame. The current generation cell supplies entry, header and
+  code-object id; SELF is the exact closure (a class wrapper's inner callable).
+- Host frame: the same `Frame` layout with a fourth kind `Host`, an empty
+  register prefix of fixed small size for host-staged values, and the
+  complete actual window. `header.function_id` carries the host kind chosen
+  by the classifier (native body, proxy, object with an internal native
+  `[[Call]]`, not callable, class called without `new`, not a constructor).
+  The Rust host entry dispatches on that code only. Natives receive their
+  arguments as the frame's actual slice under `NativeCtx`, like JSC's host
+  calls. A host body that must call JavaScript next (`Function.prototype.call`
+  and `apply`, proxy traps or targets) stages the callee/receiver/actuals in
+  its own frame and returns a child request; it resumes from the frame's PC
+  state with the child's completion. Host frames are skipped by stack
+  diagnostics and activation indexing; collectors trace them like any frame.
+- Activation preparation: after the frame is published and before entry, one
+  Rust prepare hook runs only when needed — sloppy primitive `ToObject` and
+  base construct receiver creation, writing `frame.this` in place. Its inputs
+  are traced frame slots, it never executes the callee, and a throw releases
+  the frame before propagation.
+- Bound prefixes: total actual count is `Σ len(bound slabs) + argc`. The
+  caller's span is copied to the tail of the actual window, then each bound
+  slab is copied in front of the previously copied region walking from the
+  outer wrapper inward, producing `inner…outer, caller` order without
+  temporary storage. Formals are seeded from the combined window.
+- Constructor completion belongs to the trampoline for every tier: object
+  result → result; derived with `undefined` → frame `this`, or the
+  uninitialized-`this` error if it is still the hole; derived with another
+  primitive → `TypeError`; base → frame `this`. Interpreter completion already
+  produces an object or a throw, so the rule is idempotent.
+- Generated callers write the request into `JitCtx.pending_call` and call the
+  trampoline: fixed actuals from an outgoing area on the caller's stack,
+  spread actuals as the dense array's element pointer and length, forwarded
+  actuals from the caller frame's window. Callee identity guards remain only
+  where the optimizing tier speculates on the target. The trampoline returns
+  `Success`, `Throw` or `Fatal`; callee deopt has already resumed inside it.
+  Per-site manual frame construction, receiver allocation, forwarded-binding
+  copies, completion emitters and the boxed call/construct value stubs are
+  deleted together on ARM64 and x86, in both tiers.
+- The interpreter records call feedback from the callee value (as Ignition
+  does before calling the `Call` builtin) and returns every call as a
+  classify request. `run_callable_sync`/`run_construct_sync` enter the same
+  request through the host entry boundary. All Rust bound unwrap loops and
+  callee-kind matches are deleted; Rust retains only host-kind bodies.
+
+Base receiver creation stays a prepare-hook runtime call in this item. The
+generated initial-map receiver allocation belongs to in-object slack tracking
+(item 4), which replaces the constructor receiver caches that the deleted
+per-site emitters consumed.
+
+### Linked generation entries: callee-built frames for known targets
+
+Design recorded 2026-10-01 after measuring the classify-only linkage. With
+every generated call routed through the classifying trampoline, the fixed-work
+corpus regressed against the frozen item-1 binaries (retired instructions,
+same inputs): fib 3.02G → 5.57G, earley-boyer 100.2G → 139.7G, ts 154.5G →
+191.3G, crypto 13.2G → 15.0G; ast_ctor, mega_method and zlib held. A sampled
+fib run spends 66% of its time in the trampoline: about 250 instructions per
+call (classification, registry lookup, receiver binding, request reload,
+generic window loops, header copies, status dispatch), against ~224 for the
+whole call under the deleted per-site linkage and ~12 in Node. Sources read
+from the current trees and kept under
+`benchmarks/measurements/research-2026-10-02/`:
+
+- JSC [`JITCall.cpp`](https://github.com/WebKit/WebKit/blob/main/Source/JavaScriptCore/jit/JITCall.cpp),
+  [`CallLinkInfo.cpp`](https://github.com/WebKit/WebKit/blob/main/Source/JavaScriptCore/bytecode/CallLinkInfo.cpp),
+  [`CallFrame.h`](https://github.com/WebKit/WebKit/blob/main/Source/JavaScriptCore/interpreter/CallFrame.h),
+  [`JIT.cpp`](https://github.com/WebKit/WebKit/blob/main/Source/JavaScriptCore/jit/JIT.cpp).
+  `compileOpCall` documents the split: the caller initializes the callee
+  frame's `argumentCountIncludingThis`, `callee` and the argument slots; a JS
+  callee initializes `ReturnPC`/`CodeBlock` itself in its prologue. The call
+  IC (`emitFastPathImpl`) compares the callee with the linked
+  `m_callee` and calls `m_monomorphicCallDestination` directly; a miss
+  calls the LLInt default-call thunk, which links or goes virtual. The
+  linked destination is the callee code block's entry with or without arity
+  check (`addressForCall(ArityCheckMode)`); `privateCompile` emits the
+  prologue (frame pointer, stack-limit check, callee saves) and an
+  arity-check entry that calls `arityFixup` only when the actual count is
+  below `numParameters`. `CallFrameSlot` is one layout for LLInt, Baseline,
+  DFG and FTL frames.
+- V8 [`maglev-ir.cc`](https://github.com/v8/v8/blob/main/src/maglev/maglev-ir.cc)
+  `CallKnownJSFunction::GenerateCode`: push receiver and arguments, padding
+  missing formals with `undefined` up to the known parameter count, set the
+  argument count, target, new.target and context registers and call the
+  function's dispatch-table entry. The callee's prologue builds its frame;
+  only the interpreter entry trampoline fills a register file.
+- SpiderMonkey [`CodeGenerator.cpp`](https://github.com/mozilla-firefox/firefox/blob/main/js/src/jit/CodeGenerator.cpp)
+  `visitCallKnown`: arguments are already padded by Warp, the caller pushes
+  the callee token and a frame descriptor with the actual count and calls the
+  JIT entry; a class constructor called without `new` goes to the generic
+  invoke path; a constructing call replaces a primitive result with the
+  `CreateThis` object inline.
+
+Common rule: generic dispatch (classification, bound unwrapping, proxies,
+natives, arity adaptation) lives in one shared path, but a call whose target
+is known enters the callee's own code entry, and the callee's prologue — not
+a generic builder — completes the frame it already knows statically. One
+frame layout is shared by every tier; who writes which part is fixed.
+
+Chosen contract, replacing the generic frame build for known targets:
+
+- Every compiled generation (Template and Machine, ARM64 and x86) owns a
+  *linked entry*, emitted by one shared per-architecture emitter and
+  published in its `CodeEntryCell`. Inputs: context, callee (SELF), the
+  unbound receiver, `new.target`, the caller's actual span (pointer, count,
+  padded by the caller with `undefined` up to the callee's formal count) and
+  the request frame flags. It establishes exactly the trampoline's native
+  frame and saved registers, binds the receiver by the callee's static mode
+  (lexical from the closure, strict as given, sloppy `null`/`undefined` to
+  the realm global, primitives and base construct receivers through the same
+  prepare hook), counts the entry for tiering, checks depth and native stack,
+  writes the `Frame` header from immediates and the generation header,
+  copies the actual window, seeds formals with straight-line moves, fills the
+  remaining registers with paired `undefined` stores, publishes the frame
+  and continues in the trampoline's shared run tail.
+- The trampoline is split into three entry points over one native frame and
+  register contract: request classification, the generic frame builder for
+  classified requests, and the run tail (continuation loop, tier transfers,
+  side-exit deopt continuation, construct completion, unpublish, return).
+  The run tail exists once; linked entries and the classifier both end in it,
+  so completion, deopt and tier-up have one implementation.
+- A generated call site whose feedback names one bytecode target guards the
+  callee identity, pads its actual span and calls the target's permanent
+  `FunctionEntryCell`: current generation, then its linked entry. An identity
+  miss, a generation without a linked entry (the interpreter destination) or
+  any non-bytecode kind writes the classify request and calls the trampoline;
+  a call-target miss is not a deopt. Promotion republishes the cell, so
+  callers switch generations without recompiling.
+- Request round trips through `JitCtx.pending_call` remain only for the
+  classifier, staging entries and VM-owned transfers.
+
+This deletes the generic register-window and header code from the hot path
+for known targets while keeping classification, completion and deopt in one
+place. Machine-to-Machine frame building moves fully into the callee
+prologue later (one prologue instead of linked entry plus body prologue);
+that is a refinement of this contract, not a second mechanism.
 
 ## Checkpoint
 

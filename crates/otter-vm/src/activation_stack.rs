@@ -257,7 +257,7 @@ impl ActivationStack {
     fn frame_pointer(&self, index: usize) -> *mut Frame {
         let mut frame = self.top_pointer();
         while !frame.is_null() {
-            let depth = unsafe { (*frame).depth } as usize;
+            let depth = unsafe { Frame::logical_depth(frame) } as usize;
             if depth == index + 1 {
                 return frame;
             }
@@ -270,7 +270,12 @@ impl ActivationStack {
     }
     /// Total live logical depth in the published chain.
     pub fn len(&self) -> usize {
-        unsafe { self.top_pointer().as_ref() }.map_or(0, |f| f.depth as usize)
+        let top = self.top_pointer();
+        if top.is_null() {
+            return 0;
+        }
+        // SAFETY: the bound chain is live for this execution turn.
+        unsafe { Frame::logical_depth(top) as usize }
     }
     /// Whether this view has no live logical activation.
     pub fn is_empty(&self) -> bool {

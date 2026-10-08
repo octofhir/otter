@@ -153,7 +153,8 @@ impl JitCtx {
             super::NativeFrameFlags::from_bits(super::NativeFrameFlags::TAIL_CALL);
         let frame = unsafe { self.native_frame.as_ref() }.ok_or(VmError::InvalidOperand)?;
         self.pending_call.caller = frame.caller;
-        self.pending_call.caller_return_pc = frame.caller_return_pc;
+        // SAFETY: the published record is anchored at its live machine frame.
+        self.pending_call.caller_return_pc = unsafe { frame.return_pc_into_caller() };
         Ok(())
     }
 
@@ -191,8 +192,13 @@ impl JitCtx {
 
     /// Absolute index of the currently published activation.
     pub fn frame_index(&self) -> Result<usize, VmError> {
-        let frame = unsafe { self.native_frame.as_ref() }.ok_or(VmError::InvalidOperand)?;
-        usize::try_from(frame.depth)
+        // A pure-code fixture entry publishes no activation to index into.
+        if self.native_frame.is_null() || self.checked_activation().is_none() {
+            return Err(VmError::InvalidOperand);
+        }
+        // SAFETY: the published chain is live for this entry.
+        let depth = unsafe { Frame::logical_depth(self.native_frame) };
+        usize::try_from(depth)
             .ok()
             .and_then(|depth| depth.checked_sub(1))
             .ok_or(VmError::InvalidOperand)

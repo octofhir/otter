@@ -100,12 +100,21 @@ impl<'a> RuntimeCall<'a> {
         })
     }
 
-    /// Absolute index in the one physical activation chain.
+    /// Absolute index in the one physical activation chain. The bound frame
+    /// must be the published record at that index.
     fn frame_index(&self) -> Result<usize, VmError> {
-        usize::try_from(unsafe { self.frame.as_ref().depth })
-            .ok()
-            .and_then(|depth| depth.checked_sub(1))
-            .ok_or(VmError::InvalidOperand)
+        // SAFETY: construction validated the frame; its caller chain is live.
+        let index = usize::try_from(unsafe {
+            crate::native_abi::Frame::logical_depth(self.frame.as_ptr())
+        })
+        .ok()
+        .and_then(|depth| depth.checked_sub(1))
+        .ok_or(VmError::InvalidOperand)?;
+        let stack = unsafe { self.stack.as_ref() };
+        match stack.get(index) {
+            Some(published) if std::ptr::eq(published, self.frame.as_ptr()) => Ok(index),
+            _ => Err(VmError::InvalidOperand),
+        }
     }
 
     /// Read one checked register and end the frame borrow before returning.

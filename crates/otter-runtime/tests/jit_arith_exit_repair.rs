@@ -10,11 +10,16 @@
 //! - Every optimizing exit kind (entry, OSR, inlined deopt, generated
 //!   linkage) widens the exiting site's arithmetic feedback exactly once and
 //!   retires the generation; later calls run the widened code without exits.
+//!   A result the interpreter or baseline code already saw leave Int32 never
+//!   exits at all.
 //! - Results match the interpreter oracle exactly.
 
 use otter_runtime::{JitSelection, Runtime, RuntimeExecutionStats, SourceInput};
+use otter_vm::native_abi::{CodeLifetimeState, NativeFrameKind};
 
-fn run(source: &str, selection: JitSelection) -> (String, RuntimeExecutionStats) {
+/// The completion, the run's statistics, and how many functions' entries
+/// select an installed optimizing generation once it finishes.
+fn run(source: &str, selection: JitSelection) -> (String, RuntimeExecutionStats, usize) {
     let mut runtime = Runtime::builder()
         .jit_selection(selection)
         .build()
@@ -24,20 +29,26 @@ fn run(source: &str, selection: JitSelection) -> (String, RuntimeExecutionStats)
         .unwrap_or_else(|error| panic!("arithmetic repair fixture: {error:?}"))
         .completion_string()
         .to_owned();
-    (completion, runtime.execution_stats())
+    let optimized = runtime
+        .jit_code_generation_snapshot()
+        .into_iter()
+        .filter(|generation| {
+            generation.tier == NativeFrameKind::Optimizing
+                && generation.lifecycle == CodeLifetimeState::Installed
+                && generation.current_entry
+        })
+        .count();
+    (completion, runtime.execution_stats(), optimized)
 }
 
-fn assert_repaired_once(source: &str, expected: &str, min_entries: u64) {
-    let (oracle, _) = run(source, JitSelection::InterpreterOnly);
+fn assert_repaired_once(source: &str, expected: &str, optimized_functions: usize) {
+    let (oracle, _, _) = run(source, JitSelection::InterpreterOnly);
     assert_eq!(oracle, expected);
-    let (compiled, stats) = run(source, JitSelection::ProductionTiered);
+    let (compiled, stats, optimized) = run(source, JitSelection::ProductionTiered);
     assert_eq!(compiled, oracle);
     assert!(
-        stats.jit_optimized_entries
-            + stats.jit_optimized_osr_entries
-            + stats.jit_generated_optimizing_entries
-            >= min_entries,
-        "the fixture must keep entering optimized code: {stats:?}"
+        optimized >= optimized_functions,
+        "the fixture's functions must stay optimized: {optimized} current, {stats:?}"
     );
     assert!(
         stats.jit_optimized_deopts <= 4,
@@ -71,7 +82,7 @@ for (let call = 0; call < 400; call++) {
 }
 String(checksum);
 "#;
-    assert_repaired_once(ENTRY, "134400", 64);
+    assert_repaired_once(ENTRY, "134400", 3);
 }
 
 #[test]
@@ -99,5 +110,5 @@ fn arith_exit_repair_kernel_stays_optimized() {
     let source = format!(
         "{KERNEL}\nlet last = 0;\nfor (let call = 0; call < 20; call++) last = engineKernel();\nString(last);"
     );
-    assert_repaired_once(&source, "150000", 8);
+    assert_repaired_once(&source, "150000", 1);
 }

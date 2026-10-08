@@ -1096,7 +1096,15 @@ pub(crate) fn emit_operation<'a>(
             emit_int_bitwise(ops, dst, lhs, rhs, kind, numeric_slow_paths)?;
         }
         TemplateOp::UnsignedShiftRight { dst, lhs, rhs } => {
-            emit_unsigned_shift_right(ops, dst, lhs, rhs, numeric_slow_paths)?;
+            emit_unsigned_shift_right(
+                ops,
+                relocations,
+                dst,
+                lhs,
+                rhs,
+                arith::ArithSite::of(view, instr.pc),
+                numeric_slow_paths,
+            )?;
         }
         TemplateOp::Increment { dst, src, delta } => {
             emit_increment(

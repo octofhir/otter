@@ -6,6 +6,27 @@ usage: scripts/dev/sample_self.py <sample.txt> [top]
 import re
 import sys
 
+
+def readable(name):
+    """Crude Rust v0 demangling: the identifier path of an `_R` symbol."""
+    if not name.startswith('_R'):
+        return name
+    idents, i = [], 0
+    while i < len(name):
+        m = re.match(r'(\d+)_?', name[i:])
+        if not m:
+            i += 1
+            continue
+        n = int(m.group(1))
+        start = i + len(m.group(0))
+        ident = name[start:start + n]
+        if n and len(ident) == n and re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*', ident):
+            idents.append(ident)
+            i = start + n
+        else:
+            i += len(m.group(1))
+    return '::'.join(idents[-3:]) or name
+
 lines = open(sys.argv[1]).read().split('\n')
 top = int(sys.argv[2]) if len(sys.argv) > 2 else 30
 start = next(i for i, l in enumerate(lines) if l.startswith('Call graph:'))
@@ -17,7 +38,7 @@ for l in lines[start + 1:end]:
         continue
     name = re.sub(r'\s+\(in [^)]*\).*', '', m.group(3))
     name = re.sub(r'\s+\+ \d+.*', '', name)
-    entries.append((len(m.group(1)), int(m.group(2)), name))
+    entries.append((len(m.group(1)), int(m.group(2)), readable(name)))
 # Threads are the shallowest entries; keep the isolate thread.
 thread_depth = min(d for d, _, _ in entries)
 threads = [i for i, e in enumerate(entries) if e[0] == thread_depth]

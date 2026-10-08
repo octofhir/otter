@@ -5600,6 +5600,33 @@ fn object_prototype_of_shape(prototype: shape_body::ShapePrototype) -> ObjectPro
     }
 }
 
+/// Out-of-object properties past which a keyed store adds no further
+/// property to a fast object (V8's `kFastPropertiesSoftLimit`).
+const KEYED_FAST_PROPERTIES: usize = 12;
+
+/// Leave `obj` in dictionary mode before a keyed store adds a property to it
+/// once its out-of-object properties reach [`KEYED_FAST_PROPERTIES`], as
+/// V8's `Map::TooManyFastProperties` does for a keyed store origin: computed
+/// keys make hash tables, and every key appended to a transition chain makes
+/// each later lookup walk it. A prototype, a non-extensible or exotic object
+/// keeps its layout.
+pub(crate) fn normalize_before_keyed_addition(
+    obj: &mut JsObject,
+    heap: &mut GcHeap,
+) -> Result<(), otter_gc::OutOfMemory> {
+    let shape = shape(*obj, heap);
+    let state = shape_body::state_of(shape);
+    if state.is_dictionary() || !state.is_extensible() || state.is_prototype() || state.is_opaque()
+    {
+        return Ok(());
+    }
+    let count = shape_body::property_count_of(shape) as usize;
+    if count < shape_body::inline_capacity_of(shape) + KEYED_FAST_PROPERTIES {
+        return Ok(());
+    }
+    normalize_to_dictionary(obj, heap)
+}
+
 /// Move a keyed object's string-keyed properties into dictionary storage,
 /// keeping their order, values and attributes. A dictionary object is left
 /// as is.
@@ -6890,6 +6917,41 @@ mod tests {
         assert_eq!(keys.len(), MAX_FAST_PROPERTIES as usize + 1);
         assert_eq!(keys.first().map(String::as_str), Some("p0"));
         assert_eq!(keys.last().map(String::as_str), Some("overflow"));
+    }
+
+    #[test]
+    fn keyed_additions_past_the_soft_limit_normalize_only_ordinary_objects() {
+        let mut interp = crate::Interpreter::new().expect("fixture interpreter bootstrap");
+        let mut o = interp
+            .alloc_runtime_rooted_object_with_roots(&[], &[])
+            .expect("object");
+        let limit =
+            shape_body::inline_capacity_of(shape(o, interp.gc_heap())) + KEYED_FAST_PROPERTIES;
+        for i in 0..limit {
+            interp
+                .create_data_property(&mut o, &format!("k{i}"), Value::number_i32(i as i32))
+                .expect("fast property");
+            if i + 1 < limit {
+                normalize_before_keyed_addition(&mut o, interp.gc_heap_mut()).expect("check");
+                assert!(!is_dictionary(o, interp.gc_heap()), "below the limit at {i}");
+            }
+        }
+        normalize_before_keyed_addition(&mut o, interp.gc_heap_mut()).expect("normalize");
+        assert!(is_dictionary(o, interp.gc_heap()));
+        assert_eq!(get_own(o, interp.gc_heap(), "k0"), Some(Value::number_i32(0)));
+        let keys: Vec<String> = with_properties(o, interp.gc_heap(), |p| {
+            p.keys().map(str::to_string).collect()
+        });
+        assert_eq!(keys.len(), limit);
+        assert_eq!(keys.last().map(String::as_str), Some(format!("k{}", limit - 1).as_str()));
+
+        let mut prototype = interp
+            .realm_intrinsics
+            .object_prototype()
+            .expect("realm Object.prototype");
+        let was_dictionary = is_dictionary(prototype, interp.gc_heap());
+        normalize_before_keyed_addition(&mut prototype, interp.gc_heap_mut()).expect("check");
+        assert_eq!(is_dictionary(prototype, interp.gc_heap()), was_dictionary);
     }
 
     #[test]

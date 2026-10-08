@@ -172,7 +172,7 @@ impl ArrayBody {
     /// Debug verifier for the always-current element cache: the cached
     /// triple must agree with the slab the body holds, so any new mutation
     /// path that forgets to refresh fails deterministically.
-    #[cfg(debug_assertions)]
+    #[cfg(any(test, debug_assertions))]
     pub(crate) fn element_cache_is_current(&self) -> bool {
         let slab_len = elements::len_of(self.slab);
         self.elements_ptr.get() == elements::data_base(self.slab)

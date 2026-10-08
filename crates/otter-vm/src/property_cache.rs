@@ -628,7 +628,15 @@ impl crate::Interpreter {
         if closure.proto_override(&self.gc_heap).is_some() {
             return None;
         }
-        closure.own_props(&self.gc_heap)
+        // A closure without an own-property bag owns only its virtual
+        // `name`, `length` and `prototype`, which admission refuses: every
+        // other key starts at the `%Function.prototype%` an ordinary kind
+        // inherits from.
+        closure.own_props(&self.gc_heap).or_else(|| {
+            (closure.named_lookup(&self.gc_heap) == crate::closure::CLOSURE_LOOKUP_ORDINARY)
+                .then(|| self.function_prototype_object().ok())
+                .flatten()
+        })
     }
 
     /// The lookup start of a bag-backed exotic receiver: `Some(None)` while
@@ -732,9 +740,13 @@ impl crate::Interpreter {
             return Some(start);
         }
         let native = receiver.as_native_function().is_some();
+        let bagless = receiver
+            .as_closure(&self.gc_heap)
+            .is_some_and(|closure| closure.own_props(&self.gc_heap).is_none());
         let admitted = match name {
             "name" | "length" if native => false,
             "prototype" if !native => false,
+            "name" | "length" | "caller" | "arguments" if bagless => false,
             "name" | "length" | "caller" | "arguments" if !native => {
                 object::lookup_own_atom(start, &self.gc_heap, key)
                     .hit
@@ -744,6 +756,10 @@ impl crate::Interpreter {
         };
         if !admitted {
             return None;
+        }
+        if bagless {
+            // The lookup already starts at the inherited prototype.
+            return Some(start);
         }
         let prototype = self.get_prototype_for_op(&receiver).ok()?;
         let mirrored = match object::prototype_value(start, &self.gc_heap) {

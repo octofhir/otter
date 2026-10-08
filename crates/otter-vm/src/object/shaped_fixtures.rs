@@ -15,7 +15,7 @@
 use super::{JsObject, PropertyFlags, shape, shape_body};
 use crate::Value;
 use crate::property_atom::AtomizedPropertyKey;
-use crate::string::{JsStringId, alloc_flat_string_body_with_roots};
+use crate::string::alloc_flat_string_body_with_roots;
 use otter_gc::GcHeap;
 
 pub(crate) fn append_shaped_data_for_fixture(
@@ -37,13 +37,8 @@ pub(crate) fn append_shaped_data_for_fixture(
     let scope = unsafe { otter_gc::HandleScope::from_ptr(heap.handle_stack_ptr()) };
     let receiver = scope.local(object);
     let name: Vec<u16> = key.name().encode_utf16().collect();
-    let name = alloc_flat_string_body_with_roots(
-        heap,
-        JsStringId::new(key.atom().id().raw()),
-        &name,
-        &mut |_| {},
-    )
-    .expect("fixture shape key");
+    let name =
+        alloc_flat_string_body_with_roots(heap, &name, &mut |_| {}).expect("fixture shape key");
     let name = scope.local(name);
     let child = shape_body::alloc_child_shape_body_with_roots(
         heap,

@@ -32,8 +32,9 @@ pub struct JitStringLayout {
     pub cell_bytes: u32,
     /// Opaque fully sized young GC header word.
     pub header_word: u64,
-    /// Interner identity word; newly concatenated cells initialize it to zero.
-    pub id_byte: u32,
+    /// Recorded-atom word; newly concatenated cells initialize it to zero,
+    /// no atom recorded.
+    pub atom_byte: u32,
     /// Compressed optional UTF-16 cache; initialized to null.
     pub cache_byte: u32,
     /// Compressed Cons children, measured by the representation owner.
@@ -79,7 +80,7 @@ mod tests {
         assert_eq!((p.header_word >> 32) as u32, p.cell_bytes);
         assert_eq!(p.cell_bytes % otter_gc::page::CELL_SIZE as u32, 0);
         let mut ranges = [
-            (p.id_byte, 4),
+            (p.atom_byte, 4),
             (p.string_len_byte, 4),
             (p.string_repr_byte, 1),
             (p.cons_left_byte, 4),

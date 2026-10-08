@@ -110,6 +110,8 @@ mod descriptor_install;
 mod descriptor_mutation;
 mod field_location;
 mod ordinary_set;
+mod own_slot_cache;
+pub(crate) use own_slot_cache::OwnSlotCache;
 pub(crate) mod symbol_table;
 pub use field_location::{FieldLayout, FieldLocation};
 use symbol_table::{SymbolPropsBody, SymbolPropsHandle, body_of as symbol_props_body_of};
@@ -2316,6 +2318,18 @@ impl ObjectBody {
     /// [`PropertyLookup`] for the string-keyed slot at `i`.
     fn slot_lookup_at(&self, heap: &otter_gc::GcHeap, i: usize) -> PropertyLookup {
         let (flags, is_accessor) = self.slot_attrs(heap, i);
+        self.slot_lookup_with(heap, i, flags, is_accessor)
+    }
+
+    /// [`PropertyLookup`] for the string-keyed slot at `i` whose attributes
+    /// the caller already holds.
+    fn slot_lookup_with(
+        &self,
+        heap: &otter_gc::GcHeap,
+        i: usize,
+        flags: PropertyFlags,
+        is_accessor: bool,
+    ) -> PropertyLookup {
         if is_accessor {
             let (getter, setter) = read_accessor_cell(heap, self.data_value(heap, i));
             return PropertyLookup::Accessor {
@@ -3949,9 +3963,46 @@ pub(crate) fn lookup_own_atom(
     heap: &otter_gc::GcHeap,
     key: AtomizedPropertyKey<'_>,
 ) -> AtomPropertyLookup {
-    heap.read_payload(obj, |body| match body_offset_of_atom(heap, body, key) {
-        Some(offset) => {
-            let mut lookup = body.slot_lookup_at(heap, offset as usize);
+    lookup_own_atom_with(obj, heap, key, |shape, atom| {
+        shape_body::shape_slot_of_atom(heap, shape, atom)
+    })
+}
+
+/// [`lookup_own_atom`] resolving a shaped object's slot and attributes for
+/// an interned key through `slot_of`, which a caller may answer from a cache
+/// of earlier walks: a shape's slots never change.
+pub(crate) fn lookup_own_atom_with(
+    obj: JsObject,
+    heap: &otter_gc::GcHeap,
+    key: AtomizedPropertyKey<'_>,
+    slot_of: impl FnOnce(ShapeHandle, crate::property_atom::AtomId) -> Option<shape_body::ShapeSlot>,
+) -> AtomPropertyLookup {
+    heap.read_payload(obj, |body| {
+        let resolved = if body.is_dictionary() {
+            body.dictionary_index_get(key.name()).map(|offset| {
+                let (flags, is_accessor) = body.slot_attrs(heap, offset as usize);
+                (offset, flags, is_accessor)
+            })
+        } else if key.atom().id() == crate::property_atom::AtomId::NONE {
+            None
+        } else {
+            debug_assert_object_shape_handle(body.shape, "property offset lookup");
+            slot_of(body.shape, key.atom().id())
+                .map(|slot| (slot.offset, slot.flags, slot.is_accessor))
+        };
+        lookup_resolved_slot(heap, body, key, resolved)
+    })
+}
+
+fn lookup_resolved_slot(
+    heap: &otter_gc::GcHeap,
+    body: &ObjectBody,
+    key: AtomizedPropertyKey<'_>,
+    resolved: Option<(u32, PropertyFlags, bool)>,
+) -> AtomPropertyLookup {
+    match resolved {
+        Some((offset, flags, is_accessor)) => {
+            let mut lookup = body.slot_lookup_with(heap, offset as usize, flags, is_accessor);
             if let Some(cell) = mapped_argument_cell(body, key.name())
                 && let PropertyLookup::Data { value, .. } = &mut lookup
             {
@@ -3972,7 +4023,7 @@ pub(crate) fn lookup_own_atom(
             hit: None,
             lookup: PropertyLookup::Absent,
         },
-    })
+    }
 }
 
 /// Load a cached own data slot after validating shape and atom guards.

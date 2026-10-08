@@ -1129,6 +1129,9 @@ pub struct Interpreter {
         rustc_hash::FxHashMap<u32, Option<std::sync::Arc<dyn jit::JitFunctionCode>>>,
     /// Single-entry cache over [`Self::jit_optimized_code`] for hot leaf calls.
     jit_optimized_code_cache: Option<(u32, std::sync::Arc<dyn jit::JitFunctionCode>)>,
+    /// Own-slot lookups of shaped objects by shape and interned key, for the
+    /// generic property paths.
+    own_slot_cache: object::OwnSlotCache,
     /// Lifetime optimizing exit evidence keyed by the owning source function,
     /// PC and reason, including sites spliced into different native callers.
     /// The same record owns the requested policy, count and IC population.

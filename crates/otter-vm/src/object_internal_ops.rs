@@ -245,16 +245,56 @@ impl Interpreter {
         obj: JsObject,
         key: &VmPropertyKey,
     ) -> object::PropertyLookup {
+        let heap = &self.gc_heap;
+        let lookup = |key| {
+            object::lookup_own_atom_with(obj, heap, key, |shape, atom| {
+                self.own_slot_cache
+                    .slot(object::shape_body::id_of(shape), atom, || {
+                        object::shape_body::shape_slot_of_atom(heap, shape, atom)
+                    })
+            })
+            .lookup
+        };
         match key {
-            VmPropertyKey::Atom(key) => object::lookup_own_atom(obj, &self.gc_heap, *key).lookup,
-            VmPropertyKey::Symbol(sym) => object::lookup_own_symbol(obj, &self.gc_heap, *sym),
-            VmPropertyKey::String(name) => {
-                object::lookup_own_atom(obj, &self.gc_heap, self.atomized_key(name)).lookup
-            }
-            VmPropertyKey::OwnedString(name) => {
-                object::lookup_own_atom(obj, &self.gc_heap, self.atomized_key(name)).lookup
-            }
+            VmPropertyKey::Atom(key) => lookup(*key),
+            VmPropertyKey::Symbol(sym) => object::lookup_own_symbol(obj, heap, *sym),
+            VmPropertyKey::String(name) => lookup(self.atomized_key(name)),
+            VmPropertyKey::OwnedString(name) => lookup(self.atomized_key(name)),
         }
+    }
+
+    /// The interned atom of string `key`'s content, recorded on the string
+    /// the first time it is found, so later keyed accesses with the same
+    /// string decode nothing and skip the interner. A spelling nothing has
+    /// interned has no atom and is not recorded: it may be interned later.
+    pub(crate) fn string_key_atom(
+        &mut self,
+        key: crate::string::JsString,
+    ) -> Option<crate::property_atom::AtomId> {
+        let handle = key.handle();
+        if let Some(atom) = self
+            .gc_heap
+            .read_payload(handle, crate::string::JsStringBody::cached_atom)
+        {
+            return Some(atom);
+        }
+        let atom = self.names.lookup(&key.to_lossy_string(&self.gc_heap));
+        if atom == crate::property_atom::AtomId::NONE {
+            return None;
+        }
+        self.gc_heap
+            .with_payload(handle, |body| body.set_cached_atom(atom));
+        Some(atom)
+    }
+
+    /// [`Self::string_key_atom`] with the atom's spelling, which a key built
+    /// from it borrows instead of a decoded copy of the string.
+    pub(crate) fn interned_string_key(
+        &mut self,
+        key: crate::string::JsString,
+    ) -> Option<(crate::property_atom::AtomId, std::sync::Arc<str>)> {
+        let atom = self.string_key_atom(key)?;
+        Some((atom, self.names.spelling(atom)?))
     }
 
     /// A runtime spelling as an atomized key: shape walks compare its interned

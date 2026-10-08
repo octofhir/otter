@@ -59,7 +59,7 @@ pub mod statics;
 use otter_gc::{GcHeap, OutOfMemory};
 
 pub use gc_body::{
-    JS_STRING_BODY_TYPE_TAG, JsStringBody, JsStringBodyRepr, JsStringHandle, JsStringId,
+    JS_STRING_BODY_TYPE_TAG, JsStringBody, JsStringBodyRepr, JsStringHandle,
     MAX_ROPE_DEPTH as GC_MAX_ROPE_DEPTH, StringConcatError, alloc_flat_string_body_with_roots,
     alloc_latin1_string_body_with_roots, concat_string_bodies, eq_str, equals_string_bodies,
     flatten_string_body, hash_latin1, hash_utf16, peek_string_hash, slice_string_body, string_hash,
@@ -199,12 +199,7 @@ impl JsString {
         if let Some(bytes) = latin1_bytes_from_utf16(units) {
             return Self::from_latin1_with_roots(&bytes, heap, external_visit);
         }
-        let handle = gc_body::alloc_flat_string_body_with_roots(
-            heap,
-            JsStringId::new(0),
-            units,
-            external_visit,
-        )?;
+        let handle = gc_body::alloc_flat_string_body_with_roots(heap, units, external_visit)?;
         Ok(Self {
             handle,
             cached_len: units.len() as u32,
@@ -270,12 +265,7 @@ impl JsString {
         if let Some(shared) = Self::shared_unit_string(bytes.len(), first, heap) {
             return Ok(shared);
         }
-        let handle = gc_body::alloc_latin1_string_body_with_roots(
-            heap,
-            JsStringId::new(0),
-            bytes,
-            external_visit,
-        )?;
+        let handle = gc_body::alloc_latin1_string_body_with_roots(heap, bytes, external_visit)?;
         Ok(Self {
             handle,
             cached_len: bytes.len() as u32,

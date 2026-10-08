@@ -792,6 +792,41 @@ pub(crate) fn shape_slot_attrs(
     None
 }
 
+/// The slot a shape gives `atom`, with that slot's attributes: what
+/// [`shape_offset_of_atom`] then [`shape_slot_attrs`] answer, in one walk of
+/// the chain.
+#[must_use]
+pub(crate) fn shape_slot_of_atom(
+    heap: &GcHeap,
+    mut shape: ShapeHandle,
+    atom: AtomId,
+) -> Option<ShapeSlot> {
+    debug_assert_ne!(atom, AtomId::NONE, "the root atom names no property");
+    while !shape.is_null() {
+        let (parent, slot) = heap.read_payload(shape, |body| {
+            let slot = (body.transition_atom == atom).then(|| ShapeSlot {
+                offset: body.own_offset(),
+                flags: body.own_flags,
+                is_accessor: body.own_is_accessor,
+            });
+            (body.parent, slot)
+        });
+        if slot.is_some() {
+            return slot;
+        }
+        shape = parent;
+    }
+    None
+}
+
+/// One string-keyed slot of a shape: its offset and attributes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ShapeSlot {
+    pub(crate) offset: u32,
+    pub(crate) flags: PropertyFlags,
+    pub(crate) is_accessor: bool,
+}
+
 /// Validate a cached slot offset against a UTF-8 property key.
 #[must_use]
 pub(crate) fn shape_key_matches_str(
@@ -907,13 +942,12 @@ pub(crate) fn shape_enumerable_keys(heap: &GcHeap, mut shape: ShapeHandle) -> Ve
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::string::{JsStringId, alloc_flat_string_body_with_roots, to_utf16_vec};
+    use crate::string::{alloc_flat_string_body_with_roots, to_utf16_vec};
 
-    fn alloc_key(heap: &mut GcHeap, id: u32, key: &str) -> JsStringHandle {
+    fn alloc_key(heap: &mut GcHeap, key: &str) -> JsStringHandle {
         let mut roots = |_visitor: &mut dyn FnMut(*mut RawGc)| {};
         let units: Vec<u16> = key.encode_utf16().collect();
-        alloc_flat_string_body_with_roots(heap, JsStringId::new(id), &units, &mut roots)
-            .expect("key")
+        alloc_flat_string_body_with_roots(heap, &units, &mut roots).expect("key")
     }
 
     #[test]
@@ -966,8 +1000,8 @@ mod tests {
             &mut roots,
         )
         .expect("root");
-        x = alloc_key(&mut heap, 1, "x");
-        y = alloc_key(&mut heap, 2, "y");
+        x = alloc_key(&mut heap, "x");
+        y = alloc_key(&mut heap, "y");
 
         let flags = PropertyFlags::data_default();
         let atom_x = AtomId::from_global(1);

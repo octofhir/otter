@@ -33,7 +33,7 @@ use serde::Serialize;
 use crate::jit_debug::{JitDebugRequest, JitDebugTarget, JitDebugTier};
 
 /// Maximum successful compile bundles retained by one top-level capture.
-pub const JIT_ARTIFACT_BUNDLE_LIMIT: usize = 1_024;
+pub const JIT_ARTIFACT_BUNDLE_LIMIT: usize = 4_096;
 
 /// Maximum owned payload bytes retained by one top-level capture.
 pub const JIT_ARTIFACT_BYTE_LIMIT: usize = 2 * 1024 * 1024 * 1024;

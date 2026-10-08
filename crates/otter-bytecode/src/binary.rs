@@ -623,6 +623,7 @@ impl Writer {
             function.contains_direct_eval,
             function.primordial_iteration,
             function.ignores_this,
+            function.asm_module,
         ] {
             self.bool(flag);
         }
@@ -998,6 +999,7 @@ impl<'a> Reader<'a> {
         let contains_direct_eval = self.bool()?;
         let primordial_iteration = self.bool()?;
         let ignores_this = self.bool()?;
+        let asm_module = self.bool()?;
         let arguments_object_kind = match self.u8()? {
             0 => ArgumentsObjectKind::Unmapped,
             1 => ArgumentsObjectKind::Mapped,
@@ -1051,6 +1053,7 @@ impl<'a> Reader<'a> {
             contains_direct_eval,
             primordial_iteration,
             ignores_this,
+            asm_module,
             source_text_range,
             source_text_span,
             code,
@@ -1266,6 +1269,7 @@ mod tests {
                 contains_direct_eval: true,
                 primordial_iteration: false,
                 ignores_this: false,
+                asm_module: false,
                 source_text_range: Some((0, 18)),
                 source_text_span: Some((0, 18)),
                 code: code.finish(),

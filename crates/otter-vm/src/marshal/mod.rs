@@ -59,7 +59,7 @@ pub use completer::PromiseCompleter;
 pub use cx::MarshalCx;
 pub use error::{JsError, ValueIdent};
 pub use from_js::{
-    BufferSource, Callback, DOMString, FromJs, HostRef, JsValue, Sequence, USVString,
+    BufferSource, Callback, DOMString, FromJs, HostRef, JsValue, Sequence, USVString, to_int32,
 };
 pub use host_class::{
     HostAncestry, HostClassMeta, HostInstance, JsUnionProbe, class_instance, construct_instance,

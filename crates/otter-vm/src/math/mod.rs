@@ -164,9 +164,22 @@ pub fn call(
     Ok(call_numbers(method, &nums))
 }
 
+/// `Math.<method>` over already-coerced doubles: the arithmetic every
+/// `Math` call shares, for hosts (asm.js linking) whose operands are numbers.
+#[must_use]
+pub fn apply_f64(method: otter_bytecode::method_id::MathMethod, args: &[f64]) -> f64 {
+    let nums: smallvec::SmallVec<[NumberValue; 2]> =
+        args.iter().map(|&arg| NumberValue::Double(arg)).collect();
+    numbers(method, &nums).as_f64()
+}
+
 fn call_numbers(method: otter_bytecode::method_id::MathMethod, nums: &[NumberValue]) -> Value {
+    Value::number(numbers(method, nums))
+}
+
+fn numbers(method: otter_bytecode::method_id::MathMethod, nums: &[NumberValue]) -> NumberValue {
     use otter_bytecode::method_id::MathMethod as M;
-    let value = match method {
+    match method {
         M::Abs => impl_abs(nums),
         M::Acos => impl_acos(nums),
         M::Acosh => impl_acosh(nums),
@@ -202,8 +215,7 @@ fn call_numbers(method: otter_bytecode::method_id::MathMethod, nums: &[NumberVal
         M::Tan => impl_tan(nums),
         M::Tanh => impl_tanh(nums),
         M::Trunc => impl_trunc(nums),
-    };
-    Value::number(value)
+    }
 }
 
 fn native_call(

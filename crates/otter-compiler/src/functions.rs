@@ -219,8 +219,8 @@ pub(crate) fn compile_function_impl(
     // binding it can see, so every own binding becomes a slot.
     let unit = Rc::clone(&parent.capture);
     let facts = body.map(|b| unit.function(b));
-    let contains_direct_eval = facts.is_some_and(|facts| unit.contains_eval(facts))
-        || fields_contain_eval;
+    let contains_direct_eval =
+        facts.is_some_and(|facts| unit.contains_eval(facts)) || fields_contain_eval;
     // A sloppy direct eval in the function's OWN code creates `var`s in the
     // variable environment: that scope anchors the eval extension.
     let params_eval = has_param_expressions
@@ -306,9 +306,7 @@ pub(crate) fn compile_function_impl(
             child.captured_names.insert("arguments".to_string());
         }
         if contains_direct_eval {
-            child
-                .captured_names
-                .extend(unit.own_names(facts, true));
+            child.captured_names.extend(unit.own_names(facts, true));
             if is_arrow {
                 child.captured_names.remove("arguments");
                 if child.binds_arguments {
@@ -418,6 +416,11 @@ pub(crate) fn compile_function_impl(
         slot.is_arrow = is_arrow;
         slot.is_derived_constructor = hinted_derived_ctor;
         slot.needs_arguments = needs_arguments;
+        slot.asm_module = body.is_some_and(|body| {
+            body.directives
+                .iter()
+                .any(|directive| directive.directive.as_str() == "use asm")
+        });
         slot.uses_arguments_callee =
             body_needs_arguments_object && crate::hoist::body_uses_arguments_callee(params, body);
         slot.arguments_object_kind = if uses_mapped_arguments {

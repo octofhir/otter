@@ -75,6 +75,7 @@ fn test_function(
         contains_direct_eval: false,
         primordial_iteration: false,
         ignores_this: false,
+        asm_module: false,
         code: code.into(),
         spans: otter_bytecode::SpanTable::new(&spans),
         handlers: Vec::new(),
@@ -5422,6 +5423,7 @@ fn unwind_throw_pops_frames_until_handler_or_uncaught() {
         contains_direct_eval: false,
         primordial_iteration: false,
         ignores_this: false,
+        asm_module: false,
         code: vec![Instruction {
             pc: 0,
             op: Op::ReturnUndefined,
@@ -5503,6 +5505,7 @@ fn unwind_throw_lands_in_catch_handler() {
         contains_direct_eval: false,
         primordial_iteration: false,
         ignores_this: false,
+        asm_module: false,
         code: vec![Instruction {
             pc: 0,
             op: Op::ReturnUndefined,
@@ -6133,6 +6136,7 @@ fn arrow_closure_overrides_call_site_this() {
         contains_direct_eval: false,
         primordial_iteration: false,
         ignores_this: false,
+        asm_module: false,
         code: vec![Instruction {
             pc: 0,
             op: Op::ReturnUndefined,
@@ -6175,6 +6179,7 @@ fn arrow_closure_overrides_call_site_this() {
         contains_direct_eval: false,
         primordial_iteration: false,
         ignores_this: false,
+        asm_module: false,
         code: vec![
             Instruction {
                 pc: 0,

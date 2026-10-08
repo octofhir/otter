@@ -20,6 +20,12 @@ hmac = { version = "0.12", default-features = false }
 aes-gcm = { version = "0.10", default-features = false, features = ["aes", "alloc"] }
 pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"] }
 wasmtime = { version = "46", default-features = false, features = ["cranelift", "runtime", "gc", "gc-drc", "wat", "std"] }
+wasm-encoder = "0.253"
+oxc_allocator = { workspace = true }
+oxc_ast = { workspace = true }
+oxc_parser = { workspace = true }
+oxc_span = { workspace = true }
+oxc_syntax = { workspace = true }
 
 [build-dependencies]
 otter-compiler = { workspace = true }

@@ -75,6 +75,7 @@
 //! - <https://webassembly.github.io/exception-handling/js-api/>
 //! - `blob.rs` — the `#[js_class]` host-class exemplar this follows.
 
+pub(crate) mod asm;
 mod boundary;
 mod realm;
 mod references;

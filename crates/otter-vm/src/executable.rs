@@ -613,6 +613,7 @@ impl CodeBlock {
             register_count,
             is_strict: false,
             is_arrow: false,
+            asm_module: false,
             is_method: false,
             has_rest: false,
             is_async: false,
@@ -1123,6 +1124,9 @@ pub struct CodeBlock {
     pub is_strict: bool,
     /// `true` when this function is an arrow function.
     pub(crate) is_arrow: bool,
+    /// `true` when the body declares `"use asm"`: its first interpreted entry
+    /// offers it to the host asm.js linker.
+    pub(crate) asm_module: bool,
     /// `true` when this function is a MethodDefinition body (class
     /// or object-literal method / accessor) — never a constructor,
     /// carries no implicit `prototype` property.
@@ -1422,6 +1426,7 @@ impl CodeBlock {
             register_count,
             is_strict: function.is_strict,
             is_arrow: function.is_arrow,
+            asm_module: function.asm_module,
             is_method: function.is_method,
             has_rest: function.has_rest,
             is_derived_constructor: function.is_derived_constructor,

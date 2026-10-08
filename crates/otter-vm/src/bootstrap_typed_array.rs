@@ -594,7 +594,7 @@ fn tostring_tag_getter(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value
 
 macro_rules! ta_ctor {
     ($name:ident, $kind:expr) => {
-        fn $name(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+        pub(crate) fn $name(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
             ta_ctor_dispatch(ctx, args, $kind)
         }
     };

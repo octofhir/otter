@@ -36,6 +36,43 @@ pub(crate) enum DispatchOutcome {
     Fatal(VmError),
 }
 
+/// Realm global holding the host's asm.js linker. A realm without it runs
+/// every `"use asm"` body as ordinary JavaScript.
+const ASM_LINKER_GLOBAL: &str = "__otterAsmLink";
+
+/// Offer the `"use asm"` module the published `frame` runs to the realm's
+/// asm.js linker as `(sourceText, functionId, stdlib, foreign, heap)`:
+/// `Some` exports when it linked the module, `None` to run the body as
+/// ordinary JavaScript.
+fn link_asm_module(
+    vm: &mut Interpreter,
+    stack: &mut crate::activation_stack::ActivationStack,
+    context: &crate::ExecutionContext,
+    frame: *mut crate::native_abi::Frame,
+) -> Result<Option<Value>, VmError> {
+    let Some(linker) = crate::object::get(vm.global_this, &vm.gc_heap, ASM_LINKER_GLOBAL)
+        .filter(|linker| linker.is_callable())
+    else {
+        return Ok(None);
+    };
+    let function_id = unsafe { (*frame).header.function_id };
+    let Some(source) = context.function_source_text(function_id) else {
+        return Ok(None);
+    };
+    let source = crate::JsString::from_str(source, vm.gc_heap_mut()).map_err(crate::oom_to_vm)?;
+    let active =
+        unsafe { crate::ActiveFrameMut::from_ptr(frame) }.map_err(|_| VmError::InvalidOperand)?;
+    let mut args: smallvec::SmallVec<[Value; 8]> = smallvec::SmallVec::new();
+    args.push(Value::string(source));
+    args.push(Value::number_i32(function_id as i32));
+    for register in 0..3u16 {
+        args.push(active.read(register).unwrap_or(Value::undefined()));
+    }
+    let exports =
+        vm.run_callable_sync_rooted(stack, Some(context), &linker, Value::undefined(), args)?;
+    Ok((!exports.is_undefined()).then_some(exports))
+}
+
 pub(crate) extern "C" fn interpreter_entry(ctx: *mut JitCtx) -> NativeResultPair {
     interpreter_turn(ctx, true)
 }
@@ -215,6 +252,26 @@ fn interpreter_turn(ctx: *mut JitCtx, entering: bool) -> NativeResultPair {
     }
     if fresh_entry && !tier_completion && unsafe { (*frame).header.pc } == 0 {
         vm.begin_interpreted_retraining_activation(unsafe { &mut *frame });
+    }
+    // A `"use asm"` module offers itself to the host linker once per entry:
+    // linked exports replace the body's completion (V8 instantiates asm.js
+    // as WebAssembly the same way).
+    if fresh_entry
+        && !tier_completion
+        && resume_error.is_none()
+        && unsafe { (*frame).header.pc } == 0
+        && context
+            .exec_function(unsafe { (*frame).header.function_id })
+            .is_some_and(|function| function.asm_module)
+    {
+        match link_asm_module(vm, stack, context, frame) {
+            Ok(Some(exports)) => {
+                vm.frame_release_cold(unsafe { &mut *frame });
+                return NativeResultPair::success(exports);
+            }
+            Ok(None) => {}
+            Err(error) => resume_error = Some(error),
+        }
     }
     // A compiled body that side-exited at its entry resumes here at PC zero;
     // entering it again in the same turn would repeat that exit forever.

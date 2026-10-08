@@ -46,6 +46,9 @@ fn install(runtime: &mut RuntimeExtensionContext<'_>) -> Result<(), OtterError> 
         RuntimeNativeCall::Dynamic(fetch_call),
     )?;
     runtime.install_native_global("__otterStreamCodec", 3, stream_codec)?;
+    // The VM offers every `"use asm"` function to this hook before running
+    // its body.
+    runtime.install_native_global("__otterAsmLink", 5, crate::wasm::asm::link_native)?;
     install_navigator(runtime)?;
     install_self(runtime)?;
     install_promise_rejection_handling(runtime)?;

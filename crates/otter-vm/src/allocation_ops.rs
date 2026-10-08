@@ -426,6 +426,28 @@ impl Interpreter {
         Ok(self.stamp_native_creation_realm(value))
     }
 
+    /// Allocate a host-created native function whose body receives the traced
+    /// `captures`, while exposing runtime roots.
+    pub fn native_function_capturing_host_rooted(
+        &mut self,
+        name: &'static str,
+        length: u8,
+        call: NativeCall,
+        captures: smallvec::SmallVec<[Value; 4]>,
+    ) -> Result<Value, otter_gc::OutOfMemory> {
+        let _runtime_roots_guard = self.scope_runtime_roots_guard();
+        let mut external_visit = |_: &mut dyn FnMut(*mut RawGc)| {};
+        let value = Value::native_function(NativeFunction::from_call_capturing_with_roots(
+            &mut self.gc_heap,
+            name,
+            length,
+            call,
+            captures,
+            &mut external_visit,
+        )?);
+        Ok(self.stamp_native_creation_realm(value))
+    }
+
     /// Allocate a host-created native constructor while exposing runtime roots
     /// and caller-owned pending values.
     pub fn native_constructor_from_call_host_rooted(

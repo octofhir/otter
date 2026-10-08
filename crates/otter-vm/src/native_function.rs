@@ -726,6 +726,28 @@ impl NativeFunction {
         )
     }
 
+    /// Build a native function from an already-classified call target with
+    /// traced JS `captures`, exposing caller-owned roots across metadata
+    /// allocation.
+    pub fn from_call_capturing_with_roots(
+        heap: &mut otter_gc::GcHeap,
+        name: &'static str,
+        length: u8,
+        call: NativeCall,
+        captures: SmallVec<[Value; 4]>,
+        external_visit: &mut RootSlotVisitor<'_>,
+    ) -> Result<Self, otter_gc::OutOfMemory> {
+        Self::allocate_with_roots(
+            heap,
+            name,
+            length,
+            call.into(),
+            captures,
+            NativeFunctionMetadata::BUILTIN,
+            external_visit,
+        )
+    }
+
     /// Build a native constructor from an already-classified call target while
     /// exposing caller-owned roots across metadata allocation.
     pub fn from_constructor_call_with_roots(

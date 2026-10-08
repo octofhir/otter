@@ -187,6 +187,30 @@ impl<'rt, 'cx, 's> MarshalCx<'rt, 'cx, 's> {
         Ok(self.interp().scoped_value(scope, value))
     }
 
+    /// [`Self::native_call`] whose body receives `captures`, traced for the
+    /// callable's lifetime, as its third argument.
+    pub fn native_call_capturing(
+        &mut self,
+        name: &'static str,
+        length: u8,
+        call: crate::NativeCall,
+        captures: &[Local<'_>],
+    ) -> Result<Local<'s>, JsError> {
+        let scope = self.scope;
+        let captures: smallvec::SmallVec<[Value; 4]> = captures
+            .iter()
+            .map(|capture| self.ctx.cx.interp.escape_scoped(*capture))
+            .collect();
+        let value = match self
+            .interp()
+            .native_function_capturing_host_rooted(name, length, call, captures)
+        {
+            Ok(value) => value,
+            Err(error) => return Err(self.vm_err(VmError::from(error))),
+        };
+        Ok(self.interp().scoped_value(scope, value))
+    }
+
     /// Park a `BigInt` immediate built from a signed 64-bit integer. Unlike
     /// [`Self::number`], this preserves the full 64-bit range — the
     /// marshalling the WebAssembly spec mandates for `i64` values, which map to
@@ -325,6 +349,16 @@ impl<'rt, 'cx, 's> MarshalCx<'rt, 'cx, 's> {
         self.interp()
             .scoped_get(scope, obj, key)
             .map_err(|err| self.vm_err(err))
+    }
+
+    /// Side-effect-free `obj[key]` on an ordinary object (V8
+    /// `GetDataProperty`): the data value found along the prototype chain,
+    /// `undefined` for an accessor, `None` when absent or when `obj` is not
+    /// an ordinary object. Never runs JavaScript.
+    pub fn data_property(&mut self, obj: Local<'_>, key: &str) -> Option<Local<'s>> {
+        let object = self.ctx.cx.interp.escape_scoped(obj).as_object()?;
+        let value = crate::object::get(object, self.heap(), key)?;
+        Some(self.park(value))
     }
 
     /// Write `value` to property `key` on the object handle `obj`.

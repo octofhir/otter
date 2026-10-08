@@ -320,7 +320,7 @@ fn foreign_callable_binding_misses_keep_defining_realm_and_moving_actuals() {
             )
             .unwrap();
         exchange.recording.store(false, Ordering::Relaxed);
-        assert_eq!(result.completion_string(), EXPECTED);
+        assert_eq!(result.completion_string(), EXPECTED, "{selection:?}");
         assert!(runtime.execution_stats().gc_cycles > stats.gc_cycles);
         let records = exchange.observations.lock().unwrap();
         assert_eq!(

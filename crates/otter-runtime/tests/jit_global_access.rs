@@ -244,6 +244,10 @@ fn assert_strict_global_store_operations(bundle: &JitArtifactBundle) {
     }
 }
 
+/// `TST w16, #1`: the dictionary bit of the global's ShapeState.
+#[cfg(target_arch = "aarch64")]
+const DICTIONARY_STATE_TEST: u32 = 0x7200_021f;
+
 /// The dictionary discriminator is part of this exact emitted store guard.
 /// Combined with a zero-cold measured hit, it proves the actual global used
 /// dictionary storage and passed the emitter's nonprototype store admission.
@@ -255,16 +259,27 @@ fn assert_dictionary_store_guard(code: &[u8], start: usize, end: usize) {
             .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
             .collect::<Vec<_>>();
         assert!(
-            words.iter().any(|word| word & 0xfff8_001f == 0x3600_000b),
-            "own dictionary ShapeState test: TBZ w11, #0"
-        );
-        // TST w11, #0xf8: the five bits excluding an eligible ordinary global
-        // lookup (opaque facts plus provisional state) precede B.NE miss.
-        let reject_state = 0x7200_0000 | (29 << 16) | (4 << 10) | (11 << 5) | 31;
-        assert!(
             words.windows(2).any(|window| {
-                window[0] & !(1 << 21) == reject_state && window[1] & 0xff00_001f == 0x5400_0001
+                window[0] == DICTIONARY_STATE_TEST && window[1] & 0xff00_001f == 0x5400_0000
             }),
+            "own dictionary ShapeState test: TST w16, #1 ; B.EQ miss"
+        );
+        // MOV w17, #0xf8 then TST w16, w17: the five bits excluding an
+        // eligible ordinary global lookup (opaque facts plus provisional
+        // state) precede B.NE miss.
+        let reject_mask = words.iter().position(|word| {
+            word & 0x7fe0_001f == 0x5280_0011
+                && (word >> 5) & 0xffff
+                    == u32::from(
+                        otter_vm::object::ShapeState::OPAQUE_LOOKUP_MASK
+                            | otter_vm::object::ShapeState::PROVISIONAL_MASK,
+                    )
+        });
+        let reject_test = words
+            .windows(2)
+            .position(|window| window[0] == 0x6a11_021f && window[1] & 0xff00_001f == 0x5400_0001);
+        assert!(
+            matches!((reject_mask, reject_test), (Some(mask), Some(test)) if mask < test),
             "own dictionary proof rejects current opaque/provisional state"
         );
         assert!(
@@ -316,19 +331,19 @@ fn assert_ordinary_store_guard(code: &[u8], start: usize, end: usize) {
         let shape_load = words
             .iter()
             .position(|word| {
-                word & 0xffc0_03ff == 0xb940_01ae // LDR w14, [x13, #shape]
+                word & 0xffc0_001f == 0xb940_0010 // LDR w16, [header, #shape]
             })
             .expect("own ordinary header shape read");
         let identity = words
             .windows(2)
             .position(|window| {
-                window[0] == 0x6b0b_01df // CMP w14, w11 (expected compressed shape)
+                window[0] == 0x6b11_021f // CMP w16, w17 (expected compressed shape)
                 && window[1] & 0xff00_001f == 0x5400_0001 // B.NE miss
             })
             .expect("own exact shape comparison branches before the hit");
         assert!(shape_load < identity);
         assert!(
-            !words.iter().any(|word| word & 0xfff8_001f == 0x3600_000b),
+            !words.contains(&DICTIONARY_STATE_TEST),
             "the own operation uses exact ordinary identity, not dictionary layout"
         );
     }

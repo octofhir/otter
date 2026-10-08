@@ -650,6 +650,18 @@ impl Interpreter {
                 (format!("Cannot set property on {}", value_kind_name(&receiver))).into(),
             )));
         }
+        // A keyed store that adds a string-keyed property may first leave its
+        // receiver in dictionary mode.
+        if let Some(mut obj) = receiver.as_object()
+            && !matches!(key, VmPropertyKey::Symbol(_))
+            && matches!(
+                self.lookup_own_vm_property_key(obj, &key),
+                crate::object::PropertyLookup::Absent
+            )
+        {
+            crate::object::normalize_before_keyed_addition(&mut obj, &mut self.gc_heap)
+                .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+        }
         let wrapper_name = if receiver.is_boolean() {
             Some("Boolean")
         } else if receiver.is_number() {

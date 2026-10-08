@@ -165,6 +165,9 @@ pub(crate) enum Kind {
     /// Live global binding at this source body's byte PC. A pre-effect
     /// guard resumes the canonical binding operation at that exact site.
     LoadGlobalBinding(u32),
+    /// The global object of this source body's realm; eager deopt while
+    /// another realm is active.
+    LoadGlobalThis,
     /// Read a window-resident register.
     LoadWindow(u16),
     /// A merge of one value per predecessor.
@@ -655,6 +658,7 @@ impl Kind {
                 effectful: true,
                 ..Properties::default()
             },
+            Self::LoadGlobalThis => eager,
             Self::LoadGlobalBinding(_) => Properties {
                 eager_deopt: true,
                 effectful: true,
@@ -812,6 +816,7 @@ impl Kind {
             | Self::LoadNewTarget
             | Self::LoadClosure
             | Self::LoadLiteral(_)
+            | Self::LoadGlobalThis
             | Self::LoadWindow(_) => simple(0, ResultPolicy::Register),
             // The right operand may be a constant, encoded in the
             // instruction when it fits.

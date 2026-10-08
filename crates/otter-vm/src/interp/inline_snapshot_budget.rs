@@ -1,7 +1,8 @@
 //! Shared resource bound for owned plain and method inline snapshot trees.
 //!
 //! # Contents
-//! - Maximum nesting and a per-root preparation budget.
+//! - Maximum nesting, deeper for small bodies, and a per-root preparation
+//!   budget.
 //!
 //! # Invariants
 //! - Every candidate consumes the same budget before preparing its descendants.
@@ -25,8 +26,15 @@ impl InlineSnapshotBudget {
         }
     }
 
-    pub(super) fn enter(&mut self) -> bool {
-        if self.remaining == 0 || self.depth >= 3 {
+    /// Admit one body, `small` when its bytecode is at most
+    /// [`crate::jit::JIT_SMALL_INLINE_BYTECODE_BYTES`] long.
+    pub(super) fn enter(&mut self, small: bool) -> bool {
+        let depth = if small {
+            crate::jit::JIT_SMALL_INLINE_DEPTH
+        } else {
+            crate::jit::JIT_INLINE_DEPTH
+        };
+        if self.remaining == 0 || self.depth >= depth {
             return false;
         }
         self.remaining -= 1;
@@ -49,17 +57,22 @@ mod tests {
     #[test]
     fn snapshot_work_is_bounded_across_siblings_and_nesting() {
         let mut budget = InlineSnapshotBudget::new();
-        assert!(budget.enter());
-        assert!(budget.enter());
-        assert!(budget.enter());
-        assert!(!budget.enter());
-        budget.leave();
-        budget.leave();
-        budget.leave();
-        for _ in 0..61 {
-            assert!(budget.enter());
+        assert!(budget.enter(false));
+        assert!(budget.enter(false));
+        assert!(budget.enter(false));
+        assert!(!budget.enter(false));
+        // Small bodies nest deeper.
+        for _ in 3..8 {
+            assert!(budget.enter(true));
+        }
+        assert!(!budget.enter(true));
+        for _ in 0..8 {
             budget.leave();
         }
-        assert!(!budget.enter());
+        for _ in 0..56 {
+            assert!(budget.enter(false));
+            budget.leave();
+        }
+        assert!(!budget.enter(true));
     }
 }

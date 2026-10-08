@@ -406,6 +406,7 @@ impl<'a> Codegen<'a> {
                 dynasm!(self.ops ; .arch x64 ; mov Rq(dst), [r14 + offset as i32]);
             }
             Kind::LoadGlobalBinding(byte_pc) => self.emit_global_binding(node, *byte_pc)?,
+            Kind::LoadGlobalThis => self.emit_global_this(node),
             Kind::LoadLiteral(byte_pc) => {
                 let byte_pc = *byte_pc;
                 let source = self.view_of(node);

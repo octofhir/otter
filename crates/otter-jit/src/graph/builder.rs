@@ -437,12 +437,11 @@ struct Builder<'a> {
     inline_views: Vec<Arc<JitCompileSnapshot>>,
 }
 
-/// The longest body inlined at one call, in bytecode bytes.
-const MAX_INLINED_BYTECODE_SIZE: u32 = 460;
-/// The most bytecode bytes inlined into one compilation.
+/// The most bytecode bytes inlined into one compilation by bodies that are
+/// not small.
 const MAX_INLINED_BYTECODE_CUMULATIVE: u32 = 920;
-/// The deepest chain of inlined calls.
-const MAX_INLINE_DEPTH: u8 = 3;
+/// The most bytecode bytes inlined into one compilation by any bodies.
+const MAX_INLINED_BYTECODE_ABSOLUTE: u32 = 4600;
 
 /// How an inlined body binds `this`.
 #[derive(Clone, Copy)]
@@ -788,18 +787,24 @@ impl<'a> Builder<'a> {
 
     /// Whether `body` may be built in place of a call from the current
     /// body: a loop-free function without handlers, within the size, depth
-    /// and cumulative budgets, called from outside any exception region of
-    /// the compiled function.
+    /// and cumulative budgets (wider for a small body), called from outside
+    /// any exception region of the compiled function.
     fn inlinable(&self, body: &JitCompileSnapshot) -> bool {
         let code = body.code_block.as_ref();
         let bytes = code.bytecode_byte_len();
         let depth = self.inline.as_ref().map_or(0, |inline| inline.depth);
         let outer_pc = self.graph.outer_pc_at(self.graph.origin, self.pc);
-        depth < MAX_INLINE_DEPTH
-            && bytes <= MAX_INLINED_BYTECODE_SIZE
-            && self.inlined_bytes + bytes <= MAX_INLINED_BYTECODE_CUMULATIVE
-            && code.loop_headers().is_empty()
-            && code.control_flow().handlers().is_empty()
+        // A small body costs less inlined than its call does: like Maglev,
+        // it is inlined past the cumulative budget and deeper.
+        let within_budget = if bytes <= otter_vm::jit::JIT_SMALL_INLINE_BYTECODE_BYTES {
+            depth < otter_vm::jit::JIT_SMALL_INLINE_DEPTH
+                && self.inlined_bytes + bytes <= MAX_INLINED_BYTECODE_ABSOLUTE
+        } else {
+            depth < otter_vm::jit::JIT_INLINE_DEPTH
+                && self.inlined_bytes + bytes <= MAX_INLINED_BYTECODE_CUMULATIVE
+        };
+        within_budget
+            && code.admits_graph_inlining()
             && self.graph.inlined.len() < usize::from(u16::MAX)
             && self.root_handler_at(outer_pc).is_none()
     }
@@ -1681,6 +1686,13 @@ impl<'a> Builder<'a> {
                     &[],
                     Repr::Tagged,
                 );
+                self.write(instruction.writes[0], value);
+            }
+            Op::LoadGlobalThis
+                if self.view.cage_base != 0 && !self.exited_for(ExitReason::IdentityGuard) =>
+            {
+                let value = self.add(Kind::LoadGlobalThis, &[], Repr::Tagged);
+                self.known.entry(value).heap_object = true;
                 self.write(instruction.writes[0], value);
             }
             Op::LoadLocal | Op::StoreLocal => {

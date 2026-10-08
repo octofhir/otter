@@ -232,6 +232,18 @@ const _: () = {
     );
 };
 
+/// Inline nesting of one optimizing compilation: any body below this depth,
+/// and a small one down to [`JIT_SMALL_INLINE_DEPTH`] (Maglev's
+/// `max_maglev_inline_depth` and `max_maglev_hard_inline_depth`).
+pub const JIT_INLINE_DEPTH: u8 = 3;
+/// The deepest nesting a small body is inlined at.
+pub const JIT_SMALL_INLINE_DEPTH: u8 = 8;
+/// The longest body inlined at one call, in encoded bytecode bytes.
+pub const JIT_MAX_INLINED_BYTECODE_BYTES: u32 = 460;
+/// The longest small body in encoded bytecode bytes: a body of a few
+/// instructions, which costs less inlined than its call does.
+pub const JIT_SMALL_INLINE_BYTECODE_BYTES: u32 = 80;
+
 /// Bytes of the BigInt cell generated code carves: header, body and one
 /// digit, rounded to the cell size.
 pub const JIT_BIGINT64_CELL_BYTES: u32 = ((otter_gc::header::HEADER_SIZE

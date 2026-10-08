@@ -197,9 +197,11 @@ mod tests {
     #[test]
     fn ordinary_eligibility_preserves_intrinsic_collection_and_string_proofs() {
         let mut interpreter = Interpreter::new().expect("fixture interpreter bootstrap");
-        let names = std::sync::Arc::clone(&interpreter.names);
-        let key = |name: &'static str| {
-            AtomizedPropertyKey::new(PropertyAtom::new(names.intern(name)), name)
+        let key = |interpreter: &mut Interpreter, name: &'static str| {
+            AtomizedPropertyKey::new(
+                PropertyAtom::new(interpreter.shape_runtime.names_mut().intern(name)),
+                name,
+            )
         };
 
         for (name, type_tag, prototype) in [
@@ -221,7 +223,8 @@ mod tests {
                 prototype,
                 &interpreter.gc_heap
             ));
-            let programs = interpreter.jit_intrinsic_property_programs(key(name));
+            let key = key(&mut interpreter, name);
+            let programs = interpreter.jit_intrinsic_property_programs(key);
             assert_eq!(object::keyed_shape(prototype, &interpreter.gc_heap), shape);
             assert!(!object::state(prototype, &interpreter.gc_heap).is_provisional());
             assert!(
@@ -242,9 +245,8 @@ mod tests {
             string_prototype,
             &interpreter.gc_heap
         ));
-        let string_program = interpreter
-            .string_property_program(key("charCodeAt"))
-            .unwrap();
+        let char_code_at = key(&mut interpreter, "charCodeAt");
+        let string_program = interpreter.string_property_program(char_code_at).unwrap();
         assert!(matches!(
             string_program.ops.first(),
             Some(JitCacheIrOp::LoadIntrinsicPrototype { target, .. })
@@ -259,11 +261,14 @@ mod tests {
     #[test]
     fn collection_size_has_no_intrinsic_property_program() {
         let mut interpreter = Interpreter::new().expect("fixture interpreter bootstrap");
-        let names = std::sync::Arc::clone(&interpreter.names);
-        let key = |name: &'static str| {
-            AtomizedPropertyKey::new(PropertyAtom::new(names.intern(name)), name)
+        let key = |interpreter: &mut Interpreter, name: &'static str| {
+            AtomizedPropertyKey::new(
+                PropertyAtom::new(interpreter.shape_runtime.names_mut().intern(name)),
+                name,
+            )
         };
-        let programs = interpreter.jit_intrinsic_property_programs(key("get"));
+        let get = key(&mut interpreter, "get");
+        let programs = interpreter.jit_intrinsic_property_programs(get);
         assert!(
             !programs.is_empty(),
             "the initialized Map prototype must admit ordinary method slots"
@@ -305,10 +310,7 @@ mod tests {
                 (Some(_), object::PropertyLookup::Data { .. })
             ));
         }
-        assert!(
-            interpreter
-                .jit_intrinsic_property_programs(key("size"))
-                .is_empty()
-        );
+        let size = key(&mut interpreter, "size");
+        assert!(interpreter.jit_intrinsic_property_programs(size).is_empty());
     }
 }

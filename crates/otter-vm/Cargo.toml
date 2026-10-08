@@ -39,6 +39,7 @@ itoa = "1"
 serde_json = { workspace = true }
 smallvec = { workspace = true }
 indexmap = { workspace = true }
+hashbrown = { workspace = true }
 rustc-hash = { workspace = true }
 thiserror = { workspace = true }
 num-bigint = { workspace = true }

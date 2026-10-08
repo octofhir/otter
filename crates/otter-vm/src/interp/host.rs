@@ -629,7 +629,7 @@ impl Interpreter {
     /// through the interner re-mints identical atom ids.
     #[must_use]
     pub fn snapshot_atom_names(&self) -> Vec<Box<str>> {
-        self.names.snapshot_names()
+        self.shape_runtime.names().snapshot_names()
     }
 
     /// Global lexical bindings: name, cell, `is_const`. Unordered; the

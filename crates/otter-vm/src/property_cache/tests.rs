@@ -18,8 +18,11 @@ use super::*;
 use crate::property_atom::PropertyAtom;
 use crate::{Interpreter, Value};
 
-fn key<'a>(vm: &Interpreter, name: &'a str) -> AtomizedPropertyKey<'a> {
-    AtomizedPropertyKey::new(PropertyAtom::new(vm.names.intern(name)), name)
+fn key<'a>(vm: &mut Interpreter, name: &'a str) -> AtomizedPropertyKey<'a> {
+    AtomizedPropertyKey::new(
+        PropertyAtom::new(vm.shape_runtime.names_mut().intern(name)),
+        name,
+    )
 }
 
 #[test]

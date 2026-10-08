@@ -87,8 +87,7 @@ impl Interpreter {
         startup_timer.mark("vm_gc_heap");
         // First: every allocation after this creates objects on the heap's
         // `null`-prototype root, which the shape runtime installs.
-        let names = std::sync::Arc::new(crate::property_atom::NameInterner::default());
-        let shape_runtime = object::ShapeRuntime::new(&mut gc_heap, std::sync::Arc::clone(&names))?;
+        let shape_runtime = object::ShapeRuntime::new(&mut gc_heap)?;
         // Before any string: the empty and one-unit strings are shared.
         crate::JsString::install_unit_strings(&mut gc_heap)?;
         startup_timer.mark("vm_shape_runtime");
@@ -203,7 +202,6 @@ impl Interpreter {
             code_space: std::sync::Arc::new(code_space::CodeSpace::default()),
             code_eviction_high_water_bytes: Self::DEFAULT_CODE_EVICTION_HIGH_WATER_BYTES,
             code_eviction_stats: CodeEvictionStats::default(),
-            names,
             property_cache: crate::property_cache::PropertyActionCache::default(),
             realm_context: None,
             shape_runtime,

@@ -347,7 +347,7 @@ impl Interpreter {
         context: ExecutionContext,
         function_count: u32,
     ) -> Result<ExecutionContext, crate::BytecodeLinkError> {
-        context.resolve_atoms(&self.names);
+        context.resolve_atoms(self.shape_runtime.names_mut());
         for function in context.linked_functions() {
             self.jit_code_registry
                 .link_function(function, self.active_realm_id);
@@ -383,10 +383,11 @@ impl Interpreter {
         // The adopted chunks' property-name atoms were minted by whatever
         // interner linked them, which is not this isolate's. Re-resolve the
         // whole space so every atom id this run compares — against shape
-        // nodes, IC guards, transition records — comes from `self.names`.
+        // nodes, IC guards, transition records — comes from this isolate.
         if !std::sync::Arc::ptr_eq(&self.code_space, context.space()) {
             self.code_space = std::sync::Arc::clone(context.space());
-            self.code_space.resolve_atoms(&self.names);
+            self.code_space
+                .resolve_atoms(self.shape_runtime.names_mut());
             for function in context.linked_functions() {
                 let realm_id = self.function_realm_id(function.id);
                 self.jit_code_registry.link_function(function, realm_id);

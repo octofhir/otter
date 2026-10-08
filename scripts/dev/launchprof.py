@@ -15,7 +15,8 @@ launch's `/tmp/perf-<pid>.map` is kept beside its export and resolves bare
 JIT addresses to `JS:<function> [<tier> c<code-object>]`; OFFSETS=1 keeps the
 code offset (`+0x..`) to read against that run's `--jit-artifacts` listing.
 BOUNDARY=1 also counts, per sample, the native frame the innermost generated
-frame called: the runtime entries compiled code pays for.
+frame called: the runtime entries compiled code pays for. BOUNDARY=N keeps
+the N frames below that boundary, outermost first.
 """
 import bisect, collections, glob, os, pathlib, shutil, subprocess, sys, time
 import xml.etree.ElementTree as ET
@@ -50,7 +51,8 @@ top = int(os.environ.get("TOP", "40"))
 focus = os.environ.get("FOCUS")
 within = os.environ.get("WITHIN")
 offsets = os.environ.get("OFFSETS") == "1"
-boundary = collections.Counter() if os.environ.get("BOUNDARY") == "1" else None
+boundary_depth = int(os.environ.get("BOUNDARY", "0") or 0)
+boundary = collections.Counter() if boundary_depth else None
 callers = collections.Counter()
 callees = collections.Counter()
 out.mkdir(parents=True, exist_ok=True)
@@ -116,7 +118,13 @@ for run in range(runs):
             generated = [index for index, name in enumerate(names) if name.startswith("JS:")]
             if generated:
                 index = generated[0]
-                boundary[names[index - 1] if index > 0 else "<generated>"] += 1
+                if index == 0:
+                    boundary["<generated>"] += 1
+                else:
+                    # names[0] is the leaf: the frames just below the
+                    # innermost generated frame are the ones it called.
+                    called = names[max(index - boundary_depth, 0):index]
+                    boundary[" <- ".join(reversed(called))] += 1
         for name in set(names):
             inclusive[name] += 1
         if focus:

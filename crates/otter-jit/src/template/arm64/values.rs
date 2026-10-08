@@ -42,8 +42,54 @@ pub(super) fn emit_store_reg(ops: &mut Assembler, t: u8, idx: u16) -> Result<(),
     Ok(())
 }
 
-/// Materialize a 64-bit constant into x-register `t` via movz/movk.
+/// Materialize a 64-bit constant into x-register `t` in the fewest
+/// instructions, as V8's `MacroAssembler::Mov` does: one `movz` or `movn`
+/// when a single halfword differs from the rest, one `orr` of a logical
+/// immediate, otherwise `movz` or `movn` of the first halfword plus a `movk`
+/// for each other halfword that differs from that fill.
 pub(crate) fn emit_load_u64(ops: &mut Assembler, t: u8, v: u64) {
+    let halfword = |index: u32| ((v >> (16 * index)) & 0xFFFF) as u32;
+    let zeros = (0..4).filter(|&index| halfword(index) == 0).count();
+    let ones = (0..4).filter(|&index| halfword(index) == 0xFFFF).count();
+    if zeros < 3 && ones < 3 && dynasmrt::aarch64::encode_logical_immediate_64bit(v).is_some() {
+        dynasm!(ops ; .arch aarch64 ; orr XSP(t), xzr, v);
+        return;
+    }
+    // Fill with ones when more halfwords are all ones than all zeros.
+    let inverted = ones > zeros;
+    let fill = if inverted { 0xFFFF } else { 0 };
+    let mut first = true;
+    for index in 0..4 {
+        let part = halfword(index);
+        if part == fill && !(index == 3 && first) {
+            continue;
+        }
+        if first {
+            let value = if inverted { !part & 0xFFFF } else { part };
+            match (inverted, index) {
+                (false, 0) => dynasm!(ops ; .arch aarch64 ; movz X(t), value),
+                (false, 1) => dynasm!(ops ; .arch aarch64 ; movz X(t), value, lsl #16),
+                (false, 2) => dynasm!(ops ; .arch aarch64 ; movz X(t), value, lsl #32),
+                (false, _) => dynasm!(ops ; .arch aarch64 ; movz X(t), value, lsl #48),
+                (true, 0) => dynasm!(ops ; .arch aarch64 ; movn X(t), value),
+                (true, 1) => dynasm!(ops ; .arch aarch64 ; movn X(t), value, lsl #16),
+                (true, 2) => dynasm!(ops ; .arch aarch64 ; movn X(t), value, lsl #32),
+                (true, _) => dynasm!(ops ; .arch aarch64 ; movn X(t), value, lsl #48),
+            }
+            first = false;
+            continue;
+        }
+        match index {
+            1 => dynasm!(ops ; .arch aarch64 ; movk X(t), part, lsl #16),
+            2 => dynasm!(ops ; .arch aarch64 ; movk X(t), part, lsl #32),
+            _ => dynasm!(ops ; .arch aarch64 ; movk X(t), part, lsl #48),
+        }
+    }
+}
+
+/// The fixed `movz` + `movk` form of [`emit_load_u64`] whose instructions a
+/// relocation record names and a later rewrite patches.
+pub(crate) fn emit_load_u64_wide(ops: &mut Assembler, t: u8, v: u64) {
     dynasm!(ops ; .arch aarch64 ; movz X(t), (v & 0xFFFF) as u32);
     if (v >> 16) & 0xFFFF != 0 {
         dynasm!(ops ; .arch aarch64 ; movk X(t), ((v >> 16) & 0xFFFF) as u32, lsl #16);
@@ -56,8 +102,8 @@ pub(crate) fn emit_load_u64(ops: &mut Assembler, t: u8, v: u64) {
     }
 }
 
-/// Materialize one process-local symbolic value without changing the
-/// variable-width `movz`/`movk` sequence used by the normal code path.
+/// Materialize one process-local symbolic value in the fixed `movz`/`movk`
+/// form its relocation record names.
 pub(crate) fn emit_load_symbol_u64(
     ops: &mut Assembler,
     relocations: &mut RelocationCapture,
@@ -66,7 +112,7 @@ pub(crate) fn emit_load_symbol_u64(
     target: RelocationTarget,
 ) {
     let start = ops.offset().0;
-    emit_load_u64(ops, t, value);
+    emit_load_u64_wide(ops, t, value);
     relocations.record_mov_wide(start, ops.offset().0, t, target);
 }
 

@@ -2234,10 +2234,13 @@ impl<'a> Codegen<'a> {
             call_pc,
         };
         if cell != 0 {
-            let start = self.ops.offset().0;
-            self.load_immediate(16, cell);
-            self.relocations
-                .record_mov_wide(start, self.ops.offset().0, 16, cell_target.clone());
+            emit_load_symbol_u64(
+                &mut self.ops,
+                &mut self.relocations,
+                16,
+                cell,
+                cell_target.clone(),
+            );
             dynasm!(self.ops ; .arch aarch64 ; ldr x16, [x16] ; cmp X(value), x16 ; b.eq =>proved);
         }
         self.load_immediate(16, tag::box_function_id(function_id));
@@ -2262,10 +2265,7 @@ impl<'a> Codegen<'a> {
         dynasm!(self.ops ; .arch aarch64 ; cmp w16, w17 ; b.ne =>exit);
         if cell != 0 {
             // The proved value is the one the next check compares first.
-            let start = self.ops.offset().0;
-            self.load_immediate(16, cell);
-            self.relocations
-                .record_mov_wide(start, self.ops.offset().0, 16, cell_target);
+            emit_load_symbol_u64(&mut self.ops, &mut self.relocations, 16, cell, cell_target);
             dynasm!(self.ops ; .arch aarch64 ; str X(value), [x16]);
         }
         dynasm!(self.ops ; .arch aarch64 ; =>proved);

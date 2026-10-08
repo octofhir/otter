@@ -42,7 +42,7 @@ use crate::{
         REQUEST_RECEIVER_OFFSET, REQUEST_REGISTER_SEED_OFFSET, TransitionTable, Unsupported,
         VALUE_UNDEFINED,
     },
-    template::arm64::values::emit_load_u64,
+    template::arm64::values::{emit_load_u64, emit_load_u64_wide},
 };
 
 /// Prove a full tagged NativeFunction cell before reading its header.
@@ -304,7 +304,7 @@ pub(crate) fn emit_call(
             function_id,
         } => {
             let start = ops.offset().0;
-            emit_load_u64(ops, 8, entry_cell);
+            emit_load_u64_wide(ops, 8, entry_cell);
             relocations.record_mov_wide(
                 start,
                 ops.offset().0,
@@ -324,7 +324,7 @@ pub(crate) fn emit_call(
                 _ => abi::STUB_JIT_CALL_GENERIC,
             };
             let start = ops.offset().0;
-            emit_load_u64(ops, 16, table.entry(stub));
+            emit_load_u64_wide(ops, 16, table.entry(stub));
             relocations.record_mov_wide(
                 start,
                 ops.offset().0,
@@ -352,7 +352,7 @@ pub(crate) fn emit_tail_branch(
             function_id,
         } => {
             let start = ops.offset().0;
-            emit_load_u64(ops, 8, entry_cell);
+            emit_load_u64_wide(ops, 8, entry_cell);
             relocations.record_mov_wide(
                 start,
                 ops.offset().0,
@@ -379,7 +379,7 @@ pub(crate) fn emit_tail_branch(
                 _ => abi::STUB_JIT_CALL_GENERIC,
             };
             let start = ops.offset().0;
-            emit_load_u64(ops, 16, table.entry(stub));
+            emit_load_u64_wide(ops, 16, table.entry(stub));
             relocations.record_mov_wide(
                 start,
                 ops.offset().0,
@@ -425,7 +425,7 @@ pub(crate) fn emit_enter_staged(
         ; =>origin_ready
     );
     let start = ops.offset().0;
-    emit_load_u64(ops, 16, table.entry(abi::STUB_JIT_CALL));
+    emit_load_u64_wide(ops, 16, table.entry(abi::STUB_JIT_CALL));
     relocations.record_mov_wide(
         start,
         ops.offset().0,

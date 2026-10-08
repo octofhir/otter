@@ -2642,7 +2642,7 @@ impl<'a> Builder<'a> {
             &[object, value],
             Repr::None,
         );
-        self.add(Kind::WriteBarrier, &[object, value], Repr::None);
+        self.write_barrier(object, value);
         self.known.store_field(
             FieldKey {
                 object,
@@ -2675,7 +2675,7 @@ impl<'a> Builder<'a> {
                 &[object, value],
                 Repr::None,
             );
-            self.add(Kind::WriteBarrier, &[object, value], Repr::None);
+            self.write_barrier(object, value);
             // The receiver now has the shape each matching program leaves it
             // with; a published transition may leave any other node's shape
             // fact describing the old shape.
@@ -2753,10 +2753,24 @@ impl<'a> Builder<'a> {
             &[object, value],
             Repr::None,
         );
-        self.add(Kind::WriteBarrier, &[object, value], Repr::None);
+        self.write_barrier(object, value);
     }
 
     /// Prove `object` has one of `shapes`, unless already proved.
+    /// The generational barrier after storing `value` into `object`, unless
+    /// `value` can never be a cell, as V8 omits it for a Smi: an immediate
+    /// constant, a boxed number or a boolean result.
+    fn write_barrier(&mut self, object: NodeId, value: NodeId) {
+        let never_cell = match self.graph.node(value).kind {
+            Kind::ConstTagged(bits) => !tag::is_cell_bits(bits),
+            Kind::Int32ToTagged | Kind::Float64ToTagged => true,
+            ref kind => kind.produces_boolean(),
+        };
+        if !never_cell {
+            self.add(Kind::WriteBarrier, &[object, value], Repr::None);
+        }
+    }
+
     fn check_shapes(&mut self, object: NodeId, shapes: &SmallVec<[u32; 4]>, writable: bool) {
         if let Some(layout) = self.known.layout(object)
             && let Some(known) = layout.shapes.as_ref()
@@ -3724,7 +3738,7 @@ impl<'a> Builder<'a> {
             &[context, value],
             Repr::None,
         );
-        self.add(Kind::WriteBarrier, &[context, value], Repr::None);
+        self.write_barrier(context, value);
         self.known.store_field(
             FieldKey {
                 object: context,

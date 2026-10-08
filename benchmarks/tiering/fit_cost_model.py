@@ -84,6 +84,14 @@ for tier in ("template", "optimizing"):
     )
 coefficients["code_per_register_bytes"] = code_per_register_bytes
 
+# The optimizing tier's per-instruction work is V8's Maglev invocation budget
+# (`invocation_count_for_maglev`: 400 executions of the function's bytecode),
+# not a compile-cost conversion. An earlier admission compiles paths that have
+# not run yet; their insufficient-feedback deopts and recompiles cost more than
+# the compile the conversion amortizes.
+v8_maglev_invocation_budget = 400
+coefficients["optimizing_compile_per_instruction_work"] = v8_maglev_invocation_budget
+
 
 def estimated_code_bytes(tier: str, instructions: int, registers: int) -> int:
     """Predicted executable geometry, not measured retained resource usage."""

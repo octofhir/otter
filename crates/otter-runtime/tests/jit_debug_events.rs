@@ -28,7 +28,7 @@ use otter_runtime::{
 
 const HOT_LOOP: &str = r#"
 let total = 0;
-for (let i = 0; i < 96; i++) {
+for (let i = 0; i < 2000; i++) {
   total += i;
 }
 total;
@@ -45,7 +45,7 @@ function inner(limit) {
 
 function outer(limit) {
   let total = 0;
-  for (let i = 0; i < 96; i++) {
+  for (let i = 0; i < 600; i++) {
     total += inner(limit + i);
   }
   return total;
@@ -110,7 +110,7 @@ fn jit_debug_reports_are_default_off() {
         )
         .expect("hot loop");
 
-    assert_eq!(result.completion_string(), "4560");
+    assert_eq!(result.completion_string(), "1999000");
     assert!(result.jit_debug_report().is_none());
     assert!(result.jit_artifacts().is_none());
     assert!(runtime.take_jit_debug_report().is_none());
@@ -130,7 +130,7 @@ fn template_osr_emits_ordered_compile_events() {
         .jit_debug_report()
         .expect("enabled run owns a report");
 
-    assert_eq!(result.completion_string(), "4560");
+    assert_eq!(result.completion_string(), "1999000");
     assert_ordered_template_compile(report.events());
     let (bytecode_instruction_count, source_work, exit_count) = report
         .events()
@@ -212,7 +212,7 @@ fn extracted_int32_math_call_publishes_one_stable_optimizing_body() {
 (function () {
   const target = Math.abs;
   let sum = 0;
-  for (let i = 0; i < 128; i = i + 1) {
+  for (let i = 0; i < 5000; i = i + 1) {
     sum = sum + target(-1);
   }
   return sum;
@@ -226,7 +226,7 @@ fn extracted_int32_math_call_publishes_one_stable_optimizing_body() {
         .jit_debug_report()
         .expect("enabled run owns a report");
 
-    assert_eq!(result.completion_string(), "128");
+    assert_eq!(result.completion_string(), "5000");
     let optimizing_compiles = report
         .events()
         .iter()
@@ -306,7 +306,7 @@ function engineKernel(limit) {
   return total;
 }
 
-engineKernel(128);
+engineKernel(4000);
 "#,
             ),
             "jit-debug-numeric-method-argument.js",
@@ -316,7 +316,7 @@ engineKernel(128);
         .jit_debug_report()
         .expect("enabled run owns a report");
 
-    assert_eq!(result.completion_string(), "8640");
+    assert_eq!(result.completion_string(), "8014000");
     let engine_kernel = report
         .events()
         .iter()
@@ -384,7 +384,7 @@ function kernel(start, limit) {
   return total;
 }
 
-const hot = kernel(0, 128);
+const hot = kernel(0, 4000);
 
 // The method guard remains valid, but the inlined add overflows int32. The
 // side exit must reconstruct both frames at the exact callee PC.
@@ -424,7 +424,7 @@ try {
         .jit_debug_report()
         .expect("enabled run owns a report");
 
-    assert_eq!(result.completion_string(), "8640|4294967297|63|107");
+    assert_eq!(result.completion_string(), "8014000|4294967297|63|107");
     assert!(
         report.events().iter().any(|event| matches!(
             event,
@@ -515,7 +515,7 @@ async fn async_otter_success_carries_owned_report() {
         .jit_debug_report()
         .expect("async result carries the owned report");
 
-    assert_eq!(result.completion_string(), "4560");
+    assert_eq!(result.completion_string(), "1999000");
     assert_ordered_template_compile(report.events());
 }
 
@@ -535,7 +535,7 @@ setTimeout(() => {
     for (let i = 0; i < limit; i++) total += i;
     return total;
   }
-  globalThis.lateResult = lateHot(48);
+  globalThis.lateResult = lateHot(2000);
 }, 0);
 "#,
         )
@@ -596,7 +596,7 @@ setTimeout(() => {
     for (let i = 0; i < limit; i++) total += i;
     return total;
   }
-  globalThis.firstResult = firstLate(64);
+  globalThis.firstResult = firstLate(2000);
 }, 20);
 "#,
                 ),
@@ -615,7 +615,7 @@ function secondHot(limit) {
   for (let i = 0; i < limit; i++) total += i;
   return total;
 }
-secondHot(56);
+secondHot(2000);
 "#,
                 ),
                 "jit-debug-concurrent-second.js",

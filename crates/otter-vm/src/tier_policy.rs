@@ -109,7 +109,9 @@ impl TierWorkDecision {
 
 /// Fixed integer source-work costs, reproduced by the checked-in fit script.
 /// Conservative historical per-op calibration is converted once, rounding
-/// compiler costs upward. No duration or entry/loop model exists at runtime.
+/// compiler costs upward; the Graph per-instruction term is V8's Maglev
+/// invocation budget instead. No duration or entry/loop model exists at
+/// runtime.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct TierWorkModel;
 
@@ -127,7 +129,7 @@ impl TierWorkModel {
         let (base, instruction, register, parameter, code_base, code_instruction, memory_divisor) =
             match input.tier {
                 CostedTier::Template => (334u64, 23u64, 4u64, 7u64, 560u64, 56u64, 3u64),
-                CostedTier::Optimizing => (750u64, 88u64, 2u64, 4u64, 320u64, 38u64, 5u64),
+                CostedTier::Optimizing => (750u64, 400u64, 2u64, 4u64, 320u64, 38u64, 5u64),
             };
         let compile_work = base
             .saturating_add(instruction.saturating_mul(input.bytecode_instructions))

@@ -3522,11 +3522,14 @@ impl<'a> Codegen<'a> {
         let settled = young | self.view.gc_barrier.remembered_flag;
         let slow = self.ops.new_dynamic_label();
         let done = self.ops.new_dynamic_label();
-        self.load_immediate(16, NOT_CELL_MASK);
+        crate::template::arm64::values::emit_cell_test(
+            &mut self.ops,
+            value,
+            crate::template::arm64::values::CellTest::IsNotCell,
+            done,
+        );
         dynasm!(self.ops
             ; .arch aarch64
-            ; tst X(value), x16
-            ; b.ne =>done
             ; ldr x16, [x20, THREAD_OFFSET]
             ; ldr x16, [x16, VM_THREAD_MARKING_FLAG_CELL_OFFSET]
             ; ldrb w16, [x16]
@@ -3536,11 +3539,16 @@ impl<'a> Codegen<'a> {
             ; tst w16, w17
             ; b.ne =>done
             ; ldrb w16, [X(value), flags_byte]
-            ; movz w17, u32::from(young)
-            ; tst w16, w17
-            ; b.ne =>slow
-            ; =>done
         );
+        if young.is_power_of_two() {
+            dynasm!(self.ops ; .arch aarch64 ; tbnz w16, young.trailing_zeros(), =>slow);
+        } else {
+            dynasm!(self.ops ; .arch aarch64
+                ; movz w17, u32::from(young)
+                ; tst w16, w17
+                ; b.ne =>slow);
+        }
+        dynasm!(self.ops ; .arch aarch64 ; =>done);
         let live = self.allocation.node(node).live_registers.clone();
         self.deferred
             .push(Box::new(move |codegen: &mut Codegen<'a>| {

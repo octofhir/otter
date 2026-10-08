@@ -1977,11 +1977,12 @@ impl Interpreter {
                 },
             };
             let descriptor = object::PropertyDescriptor { kind, flags };
-            let ok = crate::object::define_own_property_in_place(
+            // The bag is the function's map: a new key extends its hidden
+            // class, so property ICs keep caching the function's loads.
+            let ok = this.define_own_property_partial(
                 &mut bag,
-                &mut this.gc_heap,
                 key,
-                descriptor,
+                object::PartialPropertyDescriptor::from_full(&descriptor),
             )?;
             if ok && let Some(metadata_key) = function_metadata::ordinary_function_metadata_key(key)
             {

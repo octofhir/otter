@@ -462,6 +462,12 @@ impl JsClosure {
 
     /// Record that this closure's function kind defaults its
     /// `[[Prototype]]` to `%Function.prototype%`. Set once at creation.
+    /// The named-lookup summary byte (`CLOSURE_LOOKUP_*` bits).
+    #[must_use]
+    pub(crate) fn named_lookup(self, heap: &GcHeap) -> u8 {
+        heap.read_payload(self.handle, JsClosureBody::named_lookup)
+    }
+
     pub(crate) fn mark_ordinary_lookup(self, heap: &mut GcHeap) {
         heap.with_payload(self.handle, |body| {
             body.set_named_lookup_bits(CLOSURE_LOOKUP_ORDINARY, true);

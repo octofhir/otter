@@ -913,13 +913,6 @@ pub struct Interpreter {
     /// Byte-driven high-water mark for eval and on-demand module payloads.
     code_eviction_high_water_bytes: u64,
     code_eviction_stats: CodeEvictionStats,
-    /// This isolate's property-name interner: the single authority for what
-    /// name a given [`property_atom::AtomId`] means. Chunk atom tables resolve
-    /// their string constants through it at link time, hidden-class transitions
-    /// intern runtime-built names through it, and every hot name comparison in
-    /// the object model is then a `u32` compare. Shared with `shape_runtime`,
-    /// which stores an atom on each shape node it creates.
-    names: std::sync::Arc<property_atom::NameInterner>,
     /// Shared `(receiver shape, property atom)` answers. A per-site inline
     /// cache stops answering once its site goes megamorphic; this table does
     /// not care which site asks, so a dispatch loop over sibling classes keeps

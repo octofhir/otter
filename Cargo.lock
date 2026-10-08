@@ -2947,6 +2947,7 @@ version = "0.1.0"
 dependencies = [
  "criterion",
  "fixed_decimal",
+ "hashbrown 0.17.1",
  "icu_collator",
  "icu_datetime",
  "icu_decimal",

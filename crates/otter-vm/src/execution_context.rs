@@ -158,7 +158,7 @@ impl ExecutionContext {
     /// A chunk is linked with no atom ids; the interpreter that links it (or
     /// adopts its code space) publishes the ids, so every id a running isolate
     /// sees comes from that isolate's interner.
-    pub(crate) fn resolve_atoms(&self, names: &crate::property_atom::NameInterner) {
+    pub(crate) fn resolve_atoms(&self, names: &mut crate::property_atom::NameInterner) {
         self.payload.atoms.resolve(names);
     }
 

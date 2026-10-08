@@ -87,7 +87,7 @@ impl Interpreter {
     ) -> Result<Self, otter_gc::ImageError> {
         // Admit code before touching heap pages or the process-wide shape floor.
         // No externally visible owner is published if any fresh table refuses.
-        let names = std::sync::Arc::new(crate::property_atom::NameInterner::default());
+        let mut names = crate::property_atom::NameInterner::default();
         for (expected, name) in snapshot.atom_names.iter().enumerate() {
             let minted = names.intern(name);
             debug_assert_eq!(
@@ -96,7 +96,7 @@ impl Interpreter {
                 "atom replay must re-mint identical ids"
             );
         }
-        let code_space = snapshot.code_space.restore(&names, account)?;
+        let code_space = snapshot.code_space.restore(&mut names, account)?;
         let mut gc_heap = otter_gc::GcHeap::with_max_heap_bytes(max_heap_bytes)?;
         gc_heap.set_external_bytes_account(account)?;
         object::register_gc_traceables(&mut gc_heap);
@@ -121,7 +121,7 @@ impl Interpreter {
         gc_heap.restore_external_refs(snapshot.external_ref_addrs.iter().copied());
 
         // Keyed side state uses the admitted directory's atom replay.
-        let shape_runtime = object::ShapeRuntime::restored_shell(std::sync::Arc::clone(&names));
+        let shape_runtime = object::ShapeRuntime::restored_shell(names);
 
         let mut interp = Self {
             local_time_zone: crate::date::LocalTimeZone::default(),
@@ -146,7 +146,6 @@ impl Interpreter {
             code_space,
             code_eviction_high_water_bytes: Self::DEFAULT_CODE_EVICTION_HIGH_WATER_BYTES,
             code_eviction_stats: crate::CodeEvictionStats::default(),
-            names,
             property_cache: crate::property_cache::PropertyActionCache::default(),
             realm_context: None,
             shape_runtime,

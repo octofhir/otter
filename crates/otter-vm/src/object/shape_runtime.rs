@@ -19,9 +19,9 @@
 //! - Side-table keys never contain `Gc` offsets; moving GC may rewrite handles,
 //!   so keys use stable [`super::ShapeId`] plus isolate-global
 //!   [`crate::property_atom::AtomId`] values.
-//! - A name's atom comes from the isolate's interner; this module's
-//!   `interned_keys` map only caches that answer next to the name's GC string
-//!   body, so a repeated transition never takes the interner lock.
+//! - This runtime owns the isolate's [`NameInterner`], the single authority
+//!   for a name's atom. `key_strings` holds, per atom the shape layer has
+//!   keyed, the GC string body shape nodes and key enumeration hold.
 //! - Hidden classes are collectable (V8 maps, JSC structures and SpiderMonkey
 //!   shapes all are): the id and transition tables hold shapes weakly, and a
 //!   shape lives while an object, a compiled code object or a strong cache
@@ -56,7 +56,6 @@
 
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::cell::{Cell, RefCell};
-use std::sync::Arc;
 
 use otter_gc::GcHeap;
 use otter_gc::heap::RootSlotVisitor;
@@ -95,15 +94,6 @@ struct TransitionKey {
     is_accessor: bool,
 }
 
-/// One property name as the shape layer needs it: the isolate-global atom that
-/// keys transitions and shape nodes, plus the GC string body shape nodes and
-/// key enumeration hold.
-#[derive(Debug)]
-struct ShapeKey {
-    handle: Cell<JsStringHandle>,
-    atom: AtomId,
-}
-
 /// The weakly held tables: every shape by id, the transition cache, and the
 /// flattened offset cache.
 #[derive(Default)]
@@ -134,14 +124,11 @@ impl WeakShapeTables {
 /// Mutable side tables for GC-managed hidden classes.
 pub(crate) struct ShapeRuntime {
     tables: RefCell<WeakShapeTables>,
-    /// Names this shape layer has already seen, spelling → (string body, atom).
-    /// The isolate interner is the identity authority; this map is the layer's
-    /// own cache of it, so taking a known transition costs one hash of the
-    /// spelling and never the interner lock.
-    interned_keys: FxHashMap<Box<str>, ShapeKey>,
-    /// This isolate's property-name interner, shared with the interpreter that
-    /// owns this runtime.
-    names: Arc<NameInterner>,
+    /// The GC string body of every name this shape layer has keyed a shape
+    /// node with, by its atom.
+    key_strings: FxHashMap<AtomId, Cell<JsStringHandle>>,
+    /// This isolate's property-name interner.
+    names: NameInterner,
     observer: Option<Box<dyn ShapeTransitionObserver>>,
 }
 
@@ -149,7 +136,7 @@ impl std::fmt::Debug for ShapeRuntime {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let tables = self.tables.borrow();
         f.debug_struct("ShapeRuntime")
-            .field("interned_keys", &self.interned_keys.len())
+            .field("key_strings", &self.key_strings.len())
             .field("transitions", &tables.transitions.len())
             .field("offset_cache", &tables.offset_cache.len())
             .field("observer_installed", &self.observer.is_some())
@@ -160,10 +147,7 @@ impl std::fmt::Debug for ShapeRuntime {
 impl ShapeRuntime {
     /// Create the `null`-prototype root in the heap's embedder root slot, with
     /// empty side tables.
-    pub(crate) fn new(
-        heap: &mut GcHeap,
-        names: Arc<NameInterner>,
-    ) -> Result<Self, otter_gc::OutOfMemory> {
+    pub(crate) fn new(heap: &mut GcHeap) -> Result<Self, otter_gc::OutOfMemory> {
         let mut roots = |_visitor: &mut dyn FnMut(*mut RawGc)| {};
         let root = alloc_root_shape_body_with_roots(
             heap,
@@ -178,8 +162,8 @@ impl ShapeRuntime {
         super::shape_body::set_null_root(heap, root);
         Ok(Self {
             tables: RefCell::new(tables),
-            interned_keys: FxHashMap::default(),
-            names,
+            key_strings: FxHashMap::default(),
+            names: NameInterner::default(),
             observer: None,
         })
     }
@@ -310,7 +294,7 @@ impl ShapeRuntime {
 
     /// Remove every side-table entry before heap teardown.
     pub(crate) fn clear(&mut self) {
-        self.interned_keys.clear();
+        self.key_strings.clear();
         *self.tables.borrow_mut() = WeakShapeTables::default();
     }
 
@@ -320,10 +304,10 @@ impl ShapeRuntime {
     /// re-populates `handles_by_id` from the restored heap, and the
     /// remaining tables are lookup caches that refill on use.
     #[must_use]
-    pub(crate) fn restored_shell(names: Arc<NameInterner>) -> Self {
+    pub(crate) fn restored_shell(names: NameInterner) -> Self {
         Self {
             tables: RefCell::new(WeakShapeTables::default()),
-            interned_keys: FxHashMap::default(),
+            key_strings: FxHashMap::default(),
             names,
             observer: None,
         }
@@ -337,8 +321,8 @@ impl ShapeRuntime {
     /// Yield the strong handles: the interned key strings and the pinned
     /// shapes. The id and transition tables are weak ([`Self::sweep_dead`]).
     pub(crate) fn trace_roots(&self, visitor: &mut SlotVisitor<'_>) {
-        for key in self.interned_keys.values() {
-            let p = key.handle.as_ptr() as *mut RawGc;
+        for handle in self.key_strings.values() {
+            let p = handle.as_ptr() as *mut RawGc;
             visitor(p);
         }
         for shape in self.tables.borrow().pinned.values() {
@@ -400,8 +384,9 @@ impl ShapeRuntime {
         key: &str,
         external_visit: &mut RootSlotVisitor<'_>,
     ) -> Result<(JsStringHandle, AtomId), otter_gc::OutOfMemory> {
-        if let Some(existing) = self.interned_keys.get(key) {
-            return Ok((existing.handle.get(), existing.atom));
+        let known = self.names.lookup(key);
+        if let Some(handle) = self.key_strings.get(&known) {
+            return Ok((handle.get(), known));
         }
         let units: Vec<u16> = key.encode_utf16().collect();
         let mut visit_roots = |visitor: &mut dyn FnMut(*mut RawGc)| {
@@ -411,13 +396,7 @@ impl ShapeRuntime {
         let handle = alloc_flat_string_body_with_roots(heap, &units, &mut visit_roots)?;
         let atom = self.names.intern(key);
         heap.with_payload(handle, |body| body.set_cached_atom(atom));
-        self.interned_keys.insert(
-            key.into(),
-            ShapeKey {
-                handle: Cell::new(handle),
-                atom,
-            },
-        );
+        self.key_strings.insert(atom, Cell::new(handle));
         Ok((handle, atom))
     }
 
@@ -440,7 +419,7 @@ impl ShapeRuntime {
         flags: PropertyFlags,
         is_accessor: bool,
     ) -> Option<ShapeHandle> {
-        let atom = self.interned_keys.get(key)?.atom;
+        let atom = self.names.lookup(key);
         let parent_id = heap.read_payload(parent, ShapeBody::id);
         let transition_key = TransitionKey {
             parent: parent_id,
@@ -543,7 +522,7 @@ impl ShapeRuntime {
         shape: ShapeHandle,
         key: &str,
     ) -> Option<u32> {
-        let atom = self.interned_keys.get(key)?.atom;
+        let atom = self.names.lookup(key);
         let shape_id = heap.read_payload(shape, ShapeBody::id);
         if let Some(cache) = self.tables.borrow().offset_cache.get(&shape_id) {
             return cache.get(&atom).copied();
@@ -565,7 +544,18 @@ impl ShapeRuntime {
     #[cfg(test)]
     #[must_use]
     pub(crate) fn interned_key_count(&self) -> usize {
-        self.interned_keys.len()
+        self.key_strings.len()
+    }
+
+    /// This isolate's property-name interner.
+    #[must_use]
+    pub(crate) fn names(&self) -> &NameInterner {
+        &self.names
+    }
+
+    /// This isolate's property-name interner, for minting atoms.
+    pub(crate) fn names_mut(&mut self) -> &mut NameInterner {
+        &mut self.names
     }
 }
 
@@ -576,7 +566,7 @@ mod tests {
     #[test]
     fn reuses_child_transition_and_interned_key() {
         let mut heap = GcHeap::new().expect("heap");
-        let mut runtime = ShapeRuntime::new(&mut heap, Arc::default()).expect("runtime");
+        let mut runtime = ShapeRuntime::new(&mut heap).expect("runtime");
         let mut roots = |_visitor: &mut dyn FnMut(*mut RawGc)| {};
 
         let flags = PropertyFlags::data_default();
@@ -596,7 +586,7 @@ mod tests {
     #[test]
     fn repeated_registration_pins_each_shape_once_and_reopens_after_a_turn() {
         let mut heap = GcHeap::new().expect("heap");
-        let mut runtime = ShapeRuntime::new(&mut heap, Arc::default()).expect("runtime");
+        let mut runtime = ShapeRuntime::new(&mut heap).expect("runtime");
         let root = super::super::shape_body::null_root(&heap);
         let dictionary = super::super::shape_body::dictionary_of(root);
         let mut roots = |_visitor: &mut dyn FnMut(*mut RawGc)| {};

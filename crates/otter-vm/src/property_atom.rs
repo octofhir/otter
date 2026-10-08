@@ -25,6 +25,9 @@
 //!   property name resolve to the same id, and different names never share one.
 //! - The interner is append-only and never evicts. Ids are permanent for the
 //!   isolate's life, which is what lets shapes and caches store bare ids.
+//! - The interner is keyed by a hash of UTF-16 code units, so a runtime
+//!   string's atom is found from its Latin-1 or wide units in place. Its one
+//!   owner is the isolate's shape runtime; no lock guards it.
 //! - Each interned spelling has one backing allocation shared by the name-to-id
 //!   map and the id-to-name table.
 //! - A chunk's atom table starts unresolved and is resolved by the interpreter
@@ -41,11 +44,10 @@
 //! - [`crate::execution_context`]
 //! - [`crate::property_dispatch`]
 
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Arc, Mutex};
 
 use otter_bytecode::Constant;
-use rustc_hash::FxHashMap;
 
 /// Isolate-global atom id for a string property key.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -81,50 +83,96 @@ impl AtomId {
 /// constants, and on a first-ever shape transition for a runtime-built name.
 /// Every hot comparison then reads a pre-resolved [`AtomId`].
 ///
-/// The lock exists because a [`crate::code_space::CodeSpace`] is `Sync` and
-/// several linkers may resolve chunks against one interner; it is never taken
-/// by property dispatch.
+/// Like V8's string table, the table is keyed by a hash of the UTF-16 code
+/// units, so a runtime string looks its atom up from its own Latin-1 or wide
+/// units with no decoded copy. The isolate's single mutator owns it through
+/// its shape runtime: no lock guards any read or mint.
 #[derive(Debug, Default)]
 pub(crate) struct NameInterner {
-    inner: Mutex<InternedNames>,
+    /// Atom ids by content hash; equality reads the id's spelling.
+    table: hashbrown::HashTable<u32>,
+    /// Id → spelling. Append-only: index equals the atom's id.
+    names: Vec<Arc<str>>,
+    /// Id → content hash, so growing the table rehashes no spelling.
+    hashes: Vec<u64>,
 }
 
-#[derive(Debug, Default)]
-struct InternedNames {
-    ids: FxHashMap<Arc<str>, u32>,
-    /// Id → name, for diagnostics. Append-only: index equals the atom's id.
-    names: Vec<Arc<str>>,
+/// One code-unit view of a candidate spelling.
+#[derive(Clone, Copy)]
+pub(crate) enum NameUnits<'a> {
+    Latin1(&'a [u8]),
+    Utf16(&'a [u16]),
+}
+
+const NAME_HASH_SEED: u64 = 0x9e37_79b9_7f4a_7c15;
+const NAME_HASH_MULTIPLIER: u64 = 0x51_7c_c1_b7_27_22_0a_95;
+
+/// Hash of a sequence of UTF-16 code units: equal for every representation
+/// of the same content.
+fn hash_units(units: impl Iterator<Item = u16>) -> u64 {
+    let mut hash = NAME_HASH_SEED;
+    for unit in units {
+        hash = (hash.rotate_left(5) ^ u64::from(unit)).wrapping_mul(NAME_HASH_MULTIPLIER);
+    }
+    hash
+}
+
+impl NameUnits<'_> {
+    fn hash(self) -> u64 {
+        match self {
+            Self::Latin1(bytes) => hash_units(bytes.iter().map(|&byte| u16::from(byte))),
+            Self::Utf16(units) => hash_units(units.iter().copied()),
+        }
+    }
+
+    /// `true` when `spelling` has exactly these code units. A lone surrogate
+    /// matches no spelling: a Rust string encodes none.
+    fn spells(self, spelling: &str) -> bool {
+        match self {
+            Self::Latin1(bytes) if spelling.is_ascii() => spelling.as_bytes() == bytes,
+            Self::Latin1(bytes) => spelling
+                .encode_utf16()
+                .eq(bytes.iter().map(|&byte| u16::from(byte))),
+            Self::Utf16(units) => spelling.encode_utf16().eq(units.iter().copied()),
+        }
+    }
 }
 
 impl NameInterner {
+    fn hash_str(name: &str) -> u64 {
+        if name.is_ascii() {
+            NameUnits::Latin1(name.as_bytes()).hash()
+        } else {
+            hash_units(name.encode_utf16())
+        }
+    }
+
     /// Return `name`'s isolate-global atom id, minting one on first sight.
     #[must_use]
-    pub(crate) fn intern(&self, name: &str) -> AtomId {
-        let mut inner = self.inner.lock().expect("name interner");
-        if let Some(id) = inner.ids.get(name) {
-            return AtomId(*id);
+    pub(crate) fn intern(&mut self, name: &str) -> AtomId {
+        let hash = Self::hash_str(name);
+        let names = &self.names;
+        if let Some(&id) = self.table.find(hash, |&id| *names[id as usize] == *name) {
+            return AtomId(id);
         }
-        let id = u32::try_from(inner.names.len()).expect("isolate exhausted the atom id range");
+        let id = u32::try_from(self.names.len()).expect("isolate exhausted the atom id range");
         assert_ne!(
             id,
             AtomId::UNRESOLVED,
             "isolate exhausted the atom id range"
         );
-        let spelling: Arc<str> = Arc::from(name);
-        inner.names.push(Arc::clone(&spelling));
-        inner.ids.insert(spelling, id);
+        self.names.push(Arc::from(name));
+        self.hashes.push(hash);
+        let hashes = &self.hashes;
+        self.table
+            .insert_unique(hash, id, |&id| hashes[id as usize]);
         AtomId(id)
     }
 
     /// The spelling `atom` was minted for.
     #[must_use]
-    pub(crate) fn spelling(&self, atom: AtomId) -> Option<Arc<str>> {
-        self.inner
-            .lock()
-            .expect("name interner")
-            .names
-            .get(atom.raw() as usize)
-            .cloned()
+    pub(crate) fn spelling(&self, atom: AtomId) -> Option<&Arc<str>> {
+        self.names.get(atom.raw() as usize)
     }
 
     /// `name`'s atom id when some shape, chunk or cache has interned it, or
@@ -134,12 +182,19 @@ impl NameInterner {
     /// by [`AtomId::NONE`] still finds dictionary-mode properties by spelling.
     #[must_use]
     pub(crate) fn lookup(&self, name: &str) -> AtomId {
-        self.inner
-            .lock()
-            .expect("name interner")
-            .ids
-            .get(name)
-            .map_or(AtomId::NONE, |id| AtomId(*id))
+        let names = &self.names;
+        self.table
+            .find(Self::hash_str(name), |&id| *names[id as usize] == *name)
+            .map_or(AtomId::NONE, |&id| AtomId(id))
+    }
+
+    /// [`Self::lookup`] of a string's code units, read in place.
+    #[must_use]
+    pub(crate) fn lookup_units(&self, units: NameUnits<'_>) -> AtomId {
+        let names = &self.names;
+        self.table
+            .find(units.hash(), |&id| units.spells(&names[id as usize]))
+            .map_or(AtomId::NONE, |&id| AtomId(id))
     }
 
     /// The whole table in id order, for the isolate snapshot: index
@@ -147,32 +202,17 @@ impl NameInterner {
     /// on a fresh isolate re-mints identical ids.
     #[must_use]
     pub(crate) fn snapshot_names(&self) -> Vec<Box<str>> {
-        self.inner
-            .lock()
-            .expect("name interner")
-            .names
+        self.names
             .iter()
             .map(|name| Box::<str>::from(name.as_ref()))
             .collect()
-    }
-
-    /// Spelling of an interned atom, for diagnostics. Copies out because the
-    /// storage is behind the interner's lock.
-    #[cfg(test)]
-    #[must_use]
-    pub(crate) fn name(&self, atom: AtomId) -> Option<Box<str>> {
-        let inner = self.inner.lock().expect("name interner");
-        inner
-            .names
-            .get(atom.raw() as usize)
-            .map(|name| Box::<str>::from(name.as_ref()))
     }
 
     /// Number of distinct property names this isolate has interned.
     #[cfg(test)]
     #[must_use]
     pub(crate) fn len(&self) -> usize {
-        self.inner.lock().expect("name interner").names.len()
+        self.names.len()
     }
 }
 
@@ -337,7 +377,7 @@ impl AtomTable {
     /// ids, and resolving against a different interner re-keys the whole table.
     /// That is what makes adopting a foreign code space sound — the adopting
     /// interpreter's ids are the only ones its shapes ever see.
-    pub(crate) fn resolve(&self, names: &NameInterner) {
+    pub(crate) fn resolve(&self, names: &mut NameInterner) {
         for slot in &self.slots {
             if let Some(text) = slot.text.as_deref() {
                 slot.id.store(names.intern(text).raw(), Ordering::Relaxed);
@@ -411,9 +451,9 @@ mod tests {
             },
         ];
 
-        let names = NameInterner::default();
+        let mut names = NameInterner::default();
         let table = atom_builder(&constants).freeze();
-        table.resolve(&names);
+        table.resolve(&mut names);
 
         assert_eq!(table.string_constant_str(0), None);
         assert_eq!(table.string_constant_str(1), Some("name"));
@@ -427,14 +467,14 @@ mod tests {
 
     #[test]
     fn one_name_has_one_id_across_chunks() {
-        let names = NameInterner::default();
+        let mut names = NameInterner::default();
         let first = atom_table(&[
             Constant::String { utf16: utf16("y") },
             Constant::String { utf16: utf16("x") },
         ]);
         let second = atom_table(&[Constant::String { utf16: utf16("x") }]);
-        first.resolve(&names);
-        second.resolve(&names);
+        first.resolve(&mut names);
+        second.resolve(&mut names);
 
         assert_eq!(
             first.property_atom(1).unwrap().atom().id(),
@@ -450,12 +490,12 @@ mod tests {
 
     #[test]
     fn duplicate_constants_share_one_atom() {
-        let names = NameInterner::default();
+        let mut names = NameInterner::default();
         let table = atom_table(&[
             Constant::String { utf16: utf16("x") },
             Constant::String { utf16: utf16("x") },
         ]);
-        table.resolve(&names);
+        table.resolve(&mut names);
 
         assert_eq!(
             table.property_atom(0).unwrap().atom().id(),
@@ -467,14 +507,14 @@ mod tests {
     #[test]
     fn resolution_rekeys_to_the_adopting_interner() {
         let table = atom_table(&[Constant::String { utf16: utf16("x") }]);
-        let first = NameInterner::default();
-        let second = NameInterner::default();
+        let mut first = NameInterner::default();
+        let mut second = NameInterner::default();
         // Give the second interner a different id for the same spelling.
         let _ = second.intern("unrelated");
 
-        table.resolve(&first);
+        table.resolve(&mut first);
         let before = table.property_atom(0).unwrap().atom().id();
-        table.resolve(&second);
+        table.resolve(&mut second);
         let after = table.property_atom(0).unwrap().atom().id();
 
         assert_eq!(before, first.intern("x"));
@@ -493,21 +533,42 @@ mod tests {
 
     #[test]
     fn interner_reverse_lookup_names_its_atoms() {
-        let names = NameInterner::default();
+        let mut names = NameInterner::default();
         let atom = names.intern("length");
-        assert_eq!(names.name(atom).as_deref(), Some("length"));
-        assert_eq!(names.name(AtomId::from_global(99)), None);
+        assert_eq!(names.spelling(atom).map(|name| &**name), Some("length"));
+        assert_eq!(names.spelling(AtomId::from_global(99)), None);
     }
 
     #[test]
-    fn interner_indexes_share_one_spelling_allocation() {
-        let names = NameInterner::default();
-        let atom = names.intern("length");
-        let inner = names.inner.lock().expect("name interner");
-        let indexed = &inner.names[atom.raw() as usize];
-        let (mapped, _) = inner.ids.get_key_value("length").expect("interned name");
-
-        assert!(Arc::ptr_eq(indexed, mapped));
-        assert_eq!(Arc::strong_count(indexed), 2);
+    fn code_unit_lookup_matches_every_representation() {
+        let mut names = NameInterner::default();
+        let ascii = names.intern("length");
+        let latin1 = names.intern("caf\u{e9}");
+        let wide = names.intern("\u{3b1}\u{1f600}");
+        assert_eq!(names.lookup_units(NameUnits::Latin1(b"length")), ascii);
+        assert_eq!(
+            names.lookup_units(NameUnits::Utf16(&utf16("length"))),
+            ascii
+        );
+        assert_eq!(names.lookup_units(NameUnits::Latin1(b"caf\xe9")), latin1);
+        assert_eq!(
+            names.lookup_units(NameUnits::Utf16(&utf16("caf\u{e9}"))),
+            latin1
+        );
+        assert_eq!(
+            names.lookup_units(NameUnits::Utf16(&utf16("\u{3b1}\u{1f600}"))),
+            wide
+        );
+        assert_eq!(names.lookup("\u{3b1}\u{1f600}"), wide);
+        assert_eq!(
+            names.lookup_units(NameUnits::Latin1(b"lengths")),
+            AtomId::NONE
+        );
+        // A lone surrogate spells nothing a Rust string can.
+        assert_eq!(
+            names.lookup_units(NameUnits::Utf16(&[0xd83d])),
+            AtomId::NONE
+        );
+        assert_eq!(names.len(), 3);
     }
 }

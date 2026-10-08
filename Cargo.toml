@@ -95,6 +95,7 @@ dotenvy     = "0.15"
 notify      = "8"
 notify-debouncer-full = "0.6"
 indexmap    = "2"
+hashbrown   = { version = "0.17", default-features = false }
 globset     = "0.4"
 sysinfo     = "0.39"
 yaxpeax-arch = { version = "0.3.2", default-features = false, features = ["std"] }

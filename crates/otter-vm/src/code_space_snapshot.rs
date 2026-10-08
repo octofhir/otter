@@ -85,7 +85,7 @@ impl CodeSpace {
 impl CodeSpaceSnapshot {
     pub(crate) fn restore(
         &self,
-        names: &crate::property_atom::NameInterner,
+        names: &mut crate::property_atom::NameInterner,
         account: &ResourceAccount,
     ) -> Result<Arc<CodeSpace>, ResourceError> {
         let space = Arc::new(CodeSpace::default());

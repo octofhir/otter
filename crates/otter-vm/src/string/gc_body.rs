@@ -964,6 +964,27 @@ pub fn with_latin1<R>(
     })
 }
 
+/// The atom interned for the string's content, looked up from its units in
+/// place. `None` when the content is a rope no read has flattened, whose
+/// units would first have to be materialised.
+#[must_use]
+pub(crate) fn lookup_atom_in_place(
+    heap: &GcHeap,
+    string: JsStringHandle,
+    names: &crate::property_atom::NameInterner,
+) -> Option<crate::property_atom::AtomId> {
+    use crate::property_atom::NameUnits;
+    let (target, start, len) = contiguous_view(heap, string)?;
+    heap.read_payload(target, |body| {
+        Some(
+            names.lookup_units(match flat_content_range(body, start, len)? {
+                FlatContent::Latin1(bytes) => NameUnits::Latin1(bytes),
+                FlatContent::Wide(units) => NameUnits::Utf16(units),
+            }),
+        )
+    })
+}
+
 /// Whether the string's code units can be borrowed through a direct body or a
 /// collapsed slice view, without materialising a rope.
 #[must_use]

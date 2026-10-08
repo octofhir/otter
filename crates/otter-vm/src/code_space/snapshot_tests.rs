@@ -77,7 +77,7 @@ fn captured_code_shares_compiler_but_not_donor_execution_and_restores_independen
     let context = donor
         .link_evictable_module(module(), SourceRegistry::default(), &donor_account)
         .unwrap();
-    donor.resolve_atoms(&NameInterner::default());
+    donor.resolve_atoms(&mut NameInterner::default());
     property_slot(&context).install(crate::property_ic::IcHandler::fixture_load(8));
     context.exec_function(0).unwrap().source_work().charge(37);
     let original = payload(&donor);
@@ -130,11 +130,13 @@ fn captured_code_shares_compiler_but_not_donor_execution_and_restores_independen
         "live snapshot keeps only donor immutable compiler allocation"
     );
 
-    let first_names = NameInterner::default();
-    let second_names = NameInterner::default();
+    let mut first_names = NameInterner::default();
+    let mut second_names = NameInterner::default();
     let _ = second_names.intern("unrelated preceding atom");
-    let first = snapshot.restore(&first_names, &first_account).unwrap();
-    let second = snapshot.restore(&second_names, &second_account).unwrap();
+    let first = snapshot.restore(&mut first_names, &first_account).unwrap();
+    let second = snapshot
+        .restore(&mut second_names, &second_account)
+        .unwrap();
     let a = payload(&first);
     let b = payload(&second);
     assert!(Arc::ptr_eq(&a.module, &b.module));
@@ -222,15 +224,15 @@ fn failed_capture_and_restore_admission_leave_original_tables_and_ids_unchanged(
 
     let probe_account = ResourceAccount::default();
     let probe = snapshot
-        .restore(&NameInterner::default(), &probe_account)
+        .restore(&mut NameInterner::default(), &probe_account)
         .unwrap();
     let restore_bytes = current(&probe_account);
     drop(probe);
     assert_eq!(current(&probe_account), 0);
     let refused_restore = limited(restore_bytes - 1);
-    let names = NameInterner::default();
+    let mut names = NameInterner::default();
     assert!(matches!(
-        snapshot.restore(&names, &refused_restore),
+        snapshot.restore(&mut names, &refused_restore),
         Err(ResourceError::Exhausted { .. })
     ));
     assert_eq!(
@@ -247,7 +249,7 @@ fn failed_capture_and_restore_admission_leave_original_tables_and_ids_unchanged(
         ),
         before
     );
-    let fresh = snapshot.restore(&names, &probe_account).unwrap();
+    let fresh = snapshot.restore(&mut names, &probe_account).unwrap();
     assert!(matches!(
         fresh.resolve_chunk(0),
         ChunkResolution::Live {

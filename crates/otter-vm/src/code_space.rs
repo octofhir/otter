@@ -736,7 +736,7 @@ impl CodeSpace {
     /// interner, and either would compare wrongly against shapes keyed by the
     /// adopting interpreter's atoms. Resolution is idempotent, so the walk is
     /// safe to repeat.
-    pub(crate) fn resolve_atoms(&self, names: &crate::property_atom::NameInterner) {
+    pub(crate) fn resolve_atoms(&self, names: &mut crate::property_atom::NameInterner) {
         for current in self.chunks().iter() {
             if let Some(payload) = current
                 .payload

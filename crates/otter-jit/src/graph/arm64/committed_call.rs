@@ -91,16 +91,13 @@ impl Codegen<'_> {
                     staged += 1;
                 }
                 CommittedArgument::Scalar(bits) => self.load_immediate(register, *bits),
-                CommittedArgument::Address(bits, target) => {
-                    let start = self.ops.offset().0;
-                    self.load_immediate(register, *bits);
-                    self.relocations.record_mov_wide(
-                        start,
-                        self.ops.offset().0,
-                        register,
-                        target.clone(),
-                    );
-                }
+                CommittedArgument::Address(bits, target) => emit_load_symbol_u64(
+                    &mut self.ops,
+                    &mut self.relocations,
+                    register,
+                    *bits,
+                    target.clone(),
+                ),
                 CommittedArgument::StackAddress(offset) => {
                     dynasm!(self.ops ; .arch aarch64 ; add XSP(register), sp, *offset);
                 }

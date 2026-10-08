@@ -30,7 +30,7 @@ use dynasmrt::{DynamicLabel, DynasmApi, DynasmLabelApi, aarch64::Assembler, dyna
 use otter_vm::{JitCompileSnapshot, closure::JS_CLOSURE_BODY_TYPE_TAG, value::tag as value_tag};
 
 use crate::arm64::allocation::emit_count_allocation;
-use crate::template::arm64::values::{CellTest, emit_cell_test};
+use crate::template::arm64::values::{CellTest, emit_cell_test, emit_load_u64, emit_load_u64_wide};
 use crate::{
     artifact::relocation::{RelocationCapture, RelocationTarget},
     entry::{
@@ -360,19 +360,6 @@ fn emit_increment_runtime_counter(ops: &mut Assembler, context_register: u8, off
     );
 }
 
-fn emit_load_u64(ops: &mut Assembler, register: u8, value: u64) {
-    dynasm!(ops ; .arch aarch64 ; movz X(register), (value & 0xffff) as u32);
-    if (value >> 16) & 0xffff != 0 {
-        dynasm!(ops ; .arch aarch64 ; movk X(register), ((value >> 16) & 0xffff) as u32, lsl #16);
-    }
-    if (value >> 32) & 0xffff != 0 {
-        dynasm!(ops ; .arch aarch64 ; movk X(register), ((value >> 32) & 0xffff) as u32, lsl #32);
-    }
-    if (value >> 48) & 0xffff != 0 {
-        dynasm!(ops ; .arch aarch64 ; movk X(register), ((value >> 48) & 0xffff) as u32, lsl #48);
-    }
-}
-
 fn emit_symbol(
     ops: &mut Assembler,
     relocations: &mut RelocationCapture,
@@ -381,7 +368,7 @@ fn emit_symbol(
     target: RelocationTarget,
 ) {
     let start = ops.offset().0;
-    emit_load_u64(ops, register, value);
+    emit_load_u64_wide(ops, register, value);
     relocations.record_mov_wide(start, ops.offset().0, register, target);
 }
 

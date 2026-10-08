@@ -12,7 +12,9 @@
 //!   closures of one function id still see their own contexts.
 
 use crate::artifact::relocation::RelocationCapture;
-use crate::template::arm64::values::{CellTest, emit_cell_test, emit_load_u64};
+use crate::template::arm64::values::{
+    CellTest, emit_cell_test, emit_load_symbol_u64, emit_load_u64,
+};
 use dynasmrt::{DynamicLabel, DynasmApi, DynasmLabelApi, aarch64::Assembler, dynasm};
 use otter_vm::{JitCompileSnapshot, closure::JS_CLOSURE_BODY_TYPE_TAG, value::tag as value_tag};
 
@@ -38,9 +40,7 @@ pub(crate) fn emit_cached_identity(
         call_pc,
     };
     let proven = ops.new_dynamic_label();
-    let start = ops.offset().0;
-    emit_load_u64(ops, 10, plan.callee_cell);
-    relocations.record_mov_wide(start, ops.offset().0, 10, cell.clone());
+    emit_load_symbol_u64(ops, relocations, 10, plan.callee_cell, cell.clone());
     dynasm!(ops
         ; .arch aarch64
         ; ldr x10, [x10]
@@ -48,9 +48,7 @@ pub(crate) fn emit_cached_identity(
         ; b.eq =>proven
     );
     emit_inline_identity(ops, view, plan.function_id, bail);
-    let start = ops.offset().0;
-    emit_load_u64(ops, 10, plan.callee_cell);
-    relocations.record_mov_wide(start, ops.offset().0, 10, cell);
+    emit_load_symbol_u64(ops, relocations, 10, plan.callee_cell, cell);
     dynasm!(ops ; .arch aarch64 ; str x9, [x10] ; =>proven);
 }
 

@@ -15,7 +15,7 @@
 //! - `super` owns LAB bump, publication and per-type accounting.
 
 use super::{emit_bump_probe, emit_publish};
-use crate::template::arm64::values::{emit_load_runtime_stub, emit_load_u64};
+use crate::template::arm64::values::{emit_load_runtime_stub, emit_load_symbol_u64, emit_load_u64};
 use crate::{
     allocation::LabRegisters,
     artifact::relocation::{RelocationCapture, RelocationTarget},
@@ -105,9 +105,13 @@ fn emit_fit(
         view.field_layout.inline_values_byte as usize
     );
     const _: () = assert!(otter_vm::jit::JIT_GC_HEADER_SIZE_BYTES_OFFSET == 4);
-    let start = ops.offset().0;
-    emit_load_u64(ops, 12, view.cage_base as u64);
-    relocations.record_mov_wide(start, ops.offset().0, 12, RelocationTarget::GcCageBase);
+    emit_load_symbol_u64(
+        ops,
+        relocations,
+        12,
+        view.cage_base as u64,
+        RelocationTarget::GcCageBase,
+    );
     dynasm!(ops ; .arch aarch64
         ; add x15, x12, x9 ; ldr w10, [x15, view.constructor_layout.root_byte]
         ; add x15, x12, x10 ; ldrb w14, [x15, view.shape_inline_capacity_byte]

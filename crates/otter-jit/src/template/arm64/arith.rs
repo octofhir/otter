@@ -121,12 +121,11 @@ pub(super) fn emit_record_arith(
     let Some(site) = site else {
         return;
     };
-    let start = ops.offset().0;
-    emit_load_u64(ops, 16, site.cell);
-    relocations.record_mov_wide(
-        start,
-        ops.offset().0,
+    super::values::emit_load_symbol_u64(
+        ops,
+        relocations,
         16,
+        site.cell,
         crate::artifact::relocation::RelocationTarget::ArithFeedbackCell {
             function_id: site.function_id,
             pc: site.pc,

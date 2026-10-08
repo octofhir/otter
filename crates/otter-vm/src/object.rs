@@ -4339,6 +4339,21 @@ pub fn lookup_own_symbol(obj: JsObject, heap: &otter_gc::GcHeap, key: JsSymbol) 
     })
 }
 
+/// Whether `obj` has an own property keyed by the well-known symbol `tag`,
+/// which every realm shares.
+#[must_use]
+pub(crate) fn has_own_well_known_symbol(
+    obj: JsObject,
+    heap: &otter_gc::GcHeap,
+    tag: crate::symbol::WellKnown,
+) -> bool {
+    heap.read_payload(obj, |body| {
+        body.symbol_props()
+            .iter()
+            .any(|(key, _)| key.well_known_tag() == Some(tag))
+    })
+}
+
 /// Return whether `obj` has an own symbol-keyed property.
 ///
 /// This is the symbol-keyed counterpart to [`lookup_own`]'s

@@ -1778,6 +1778,7 @@ pub const fn runtime_stub_name(id: super::RuntimeStubId) -> &'static str {
         97 => "constructor_receiver_probe",
         98 => "constructor_receiver_commit",
         99 => "bigint_binary_alloc",
+        100 => "instanceof_leaf",
         _ => "unknown_runtime_stub",
     }
 }
@@ -1875,6 +1876,22 @@ pub const STUB_BIGINT_BINARY_ALLOC: RuntimeStubDescriptor = descriptor(
     3,
     RuntimeStubEffects::allocating(true, false),
     RuntimeStubException::Status,
+    RuntimeStubResultAbi::NativePair,
+    NativeResultDomain::Probe,
+);
+
+/// Leaf §13.10.2 InstanceofOperator for a native-function target, over two
+/// raw operand words. Answers only what needs no JavaScript: a target whose
+/// `@@hasInstance` is `%Function.prototype%`'s immutable one and whose own
+/// `prototype` is an object, against a primitive or an ordinary object
+/// whose chain holds only ordinary objects. Everything else misses.
+pub const STUB_INSTANCEOF_LEAF: RuntimeStubDescriptor = descriptor(
+    100,
+    RuntimeStubClass::LeafNoAlloc,
+    RuntimeStubSignature::LeafValue2,
+    2,
+    RuntimeStubEffects::none(),
+    RuntimeStubException::Never,
     RuntimeStubResultAbi::NativePair,
     NativeResultDomain::Probe,
 );
@@ -1980,6 +1997,7 @@ pub const RUNTIME_STUB_DESCRIPTORS: &[RuntimeStubDescriptor] = &[
     STUB_CONSTRUCTOR_RECEIVER_PROBE,
     STUB_CONSTRUCTOR_RECEIVER_COMMIT,
     STUB_BIGINT_BINARY_ALLOC,
+    STUB_INSTANCEOF_LEAF,
 ];
 
 /// Validate a descriptor and one concrete call-site safepoint id.

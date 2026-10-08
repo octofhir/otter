@@ -59,14 +59,20 @@ impl Codegen<'_> {
                 [assigned.gp_temps[0], assigned.gp_temps[1]],
                 None,
             )?,
-            Kind::LoadPropertyCached { pc, atom } => self.emit_load_property_cached(
-                node,
-                pc,
-                atom,
-                input(0),
-                assigned.gp_temps[..4].try_into().unwrap(),
-                result(),
-            )?,
+            Kind::LoadPropertyCached { pc, atom, length } => {
+                let have_length = length.then(|| self.emit_exotic_length(node, input(0), result()));
+                self.emit_load_property_cached(
+                    node,
+                    pc,
+                    atom,
+                    input(0),
+                    assigned.gp_temps[..4].try_into().unwrap(),
+                    result(),
+                )?;
+                if let Some(have_length) = have_length {
+                    dynasm!(self.ops ; .arch x64 ; =>have_length);
+                }
+            }
             Kind::StorePropertyCached { pc, atom } => self.emit_store_property_cached(
                 node,
                 pc,
@@ -327,6 +333,43 @@ impl Codegen<'_> {
         }
         dynasm!(self.ops ; .arch x64 ; jmp =>exit ; =>done);
         Ok(())
+    }
+
+    /// An ordinary array's or a string's `length` as a tagged int32, then a
+    /// jump to the returned label, bound after the node; any other receiver,
+    /// or a length past int32, falls through to the property load emitted
+    /// after it.
+    fn emit_exotic_length(&mut self, node: NodeId, receiver: u8, destination: u8) -> DynamicLabel {
+        let view = self.view_of(node);
+        let array_tag = view.array_layout.type_tag as i8;
+        let array_length_byte = view.array_layout.length_byte as i32;
+        let string_tag = view.string_layout.string_type_tag as i8;
+        let string_length_byte = view.string_layout.string_len_byte as i32;
+        let (string, boxed, other, done) = (
+            self.ops.new_dynamic_label(),
+            self.ops.new_dynamic_label(),
+            self.ops.new_dynamic_label(),
+            self.ops.new_dynamic_label(),
+        );
+        self.emit_cell_guard(receiver, other);
+        dynasm!(self.ops
+            ; .arch x64
+            ; cmp BYTE [Rq(receiver)], array_tag
+            ; jne =>string
+            ; mov r10, QWORD [Rq(receiver) + array_length_byte]
+            ; jmp =>boxed
+            ; =>string
+            ; cmp BYTE [Rq(receiver)], string_tag
+            ; jne =>other
+            ; mov r10d, DWORD [Rq(receiver) + string_length_byte]
+            ; =>boxed
+            // A length past int32 is a Number the property load boxes.
+            ; cmp r10, i32::MAX
+            ; ja =>other
+        );
+        crate::x86_64::values::emit_box_int32(&mut self.ops, 10, destination, 11);
+        dynasm!(self.ops ; .arch x64 ; jmp =>done ; =>other);
+        done
     }
 
     fn emit_load_property_cached(

@@ -319,7 +319,13 @@ pub(crate) fn compile_optimized(
     );
     let node_count = built.graph.nodes.len() as u64;
     let diagnostics = if capture_events {
-        inline_diagnostics(view.code_block.id, &built)
+        let mut diagnostics = inline_diagnostics(view.code_block.id, &built).into_vec();
+        diagnostics.extend(static_native_diagnostics(
+            view,
+            &built,
+            emission.node_offsets.iter().map(|&(_, node)| node),
+        ));
+        diagnostics.into_boxed_slice()
     } else {
         Box::default()
     };
@@ -439,6 +445,34 @@ fn inline_diagnostics(
         });
     }
     diagnostics.into_boxed_slice()
+}
+
+/// Static native calls of the compiled body that the graph lowered to their
+/// guarded leaf, from the nodes actually emitted.
+fn static_native_diagnostics(
+    view: &JitCompileSnapshot,
+    built: &builder::Built,
+    emitted: impl Iterator<Item = ir::NodeId>,
+) -> Vec<otter_vm::JitCompilerDiagnostic> {
+    emitted
+        .filter_map(|node| {
+            let data = built.graph.node(node);
+            let ir::Kind::NativeLeaf(stub) = data.kind else {
+                return None;
+            };
+            (data.origin == 0).then(
+                || otter_vm::JitCompilerDiagnostic::StaticNativeCallLowered {
+                    instruction_pc: data.pc,
+                    byte_pc: view
+                        .instructions
+                        .get(data.pc as usize)
+                        .map_or(0, |instruction| instruction.byte_pc),
+                    target: otter_vm::native_abi::runtime_stub_name(stub),
+                    outcome: otter_vm::JitStaticNativeCallLoweringOutcome::Generated,
+                },
+            )
+        })
+        .collect()
 }
 
 #[cfg(test)]

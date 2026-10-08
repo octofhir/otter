@@ -346,10 +346,12 @@ pub(crate) enum Kind {
     /// `[[Get]]` of the named property at the load site `pc` from receiver
     /// input0: an own or prototype data slot proved by the load fact in the
     /// isolate's shared property action table for `atom`, else the committed
-    /// source operation in the runtime.
+    /// source operation in the runtime. A `length` site first reads an
+    /// ordinary array's or a string's length inline.
     LoadPropertyCached {
         pc: u32,
         atom: Option<u32>,
+        length: bool,
     },
     /// `[[Set]]` of input1 as the named property of receiver input0 at the
     /// store site `pc`: an existing writable own slot or an addition proved

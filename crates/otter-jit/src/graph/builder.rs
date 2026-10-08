@@ -644,7 +644,11 @@ fn build_once(
 /// The loops each bytecode block of a body lies in: the body's own loops,
 /// keyed by its `origin`, then `outer`, every loop around the call an
 /// inlined body runs for.
-fn loop_nesting(analysis: &Analysis, origin: u16, outer: &[LoopKey]) -> Vec<SmallVec<[LoopKey; 2]>> {
+fn loop_nesting(
+    analysis: &Analysis,
+    origin: u16,
+    outer: &[LoopKey],
+) -> Vec<SmallVec<[LoopKey; 2]>> {
     let mut enclosing: Vec<SmallVec<[LoopKey; 2]>> =
         vec![outer.iter().copied().collect(); analysis.blocks.len()];
     for (&header, info) in &analysis.loops {
@@ -2528,7 +2532,18 @@ impl<'a> Builder<'a> {
                 .get(&byte_pc)
                 .filter(|site| site.shared);
             if self.view.instructions[self.pc as usize].load_array_length {
-                return self.generic(instruction);
+                let object = self.read(instruction.reads[0]);
+                let object = self.tagged(object);
+                let value = self.add(
+                    Kind::LoadPropertyCached {
+                        pc: self.pc,
+                        atom: atom.map(|site| site.atom),
+                        length: true,
+                    },
+                    &[object],
+                    Repr::Tagged,
+                );
+                return self.write(instruction.writes[0], value);
             }
             if atom.is_none()
                 && !self.view.property_programs.contains_key(&byte_pc)
@@ -2577,7 +2592,11 @@ impl<'a> Builder<'a> {
             .filter(|site| site.shared)
             .map(|site| site.atom);
         self.add(
-            Kind::LoadPropertyCached { pc: self.pc, atom },
+            Kind::LoadPropertyCached {
+                pc: self.pc,
+                atom,
+                length: false,
+            },
             &[object],
             Repr::Tagged,
         )
@@ -2772,8 +2791,8 @@ impl<'a> Builder<'a> {
         if !self.view.instructions[self.pc as usize].call_attempted {
             return self.deopt(DeoptReason::InsufficientFeedback);
         }
-        // A native leaf target is entered by the baseline operation without
-        // a frame.
+        // A native leaf target runs on its operand words without a frame;
+        // one this site may not speculate on keeps the baseline operation.
         if !construct
             && self
                 .view
@@ -2781,7 +2800,27 @@ impl<'a> Builder<'a> {
                 .get(&instruction.byte_pc)
                 .is_some_and(|target| target.leaf().is_some())
         {
-            return self.generic(instruction);
+            let Some((target, declaration)) = self.admitted_native_leaf(instruction, argc) else {
+                return self.generic(instruction);
+            };
+            let callee = self.read(callee);
+            let callee = self.tagged(callee);
+            let arguments: SmallVec<[NodeId; 8]> = arguments
+                .iter()
+                .map(|&register| {
+                    let value = self.read(register);
+                    self.tagged(value)
+                })
+                .collect();
+            let undefined = self.undefined;
+            return self.emit_native_leaf_call(
+                instruction,
+                target,
+                declaration,
+                callee,
+                undefined,
+                &arguments,
+            );
         }
         // `[[Construct]]` enters a proven target directly only when it has
         // the internal method; classification throws otherwise.
@@ -3025,13 +3064,9 @@ impl<'a> Builder<'a> {
             .view
             .native_calls
             .get(&instruction.byte_pc)
-            .and_then(|target| target.leaf())
-            .copied();
-        let pure = leaf.and_then(|target| {
-            super::native_leaf::admit(self.view, target, arguments.len())
-                .map(|declaration| (target, declaration))
-        });
-        if leaf.is_some() && (pure.is_none() || self.exited_for(ExitReason::IdentityGuard)) {
+            .is_some_and(|target| target.leaf().is_some());
+        let pure = self.admitted_native_leaf(instruction, arguments.len());
+        if leaf && pure.is_none() {
             return self.generic(instruction);
         }
         let callee = self.read(callee);
@@ -3046,20 +3081,14 @@ impl<'a> Builder<'a> {
             })
             .collect();
         if let Some((target, declaration)) = pure {
-            self.add(
-                Kind::CheckNative(target.builtin_native_ref),
-                &[callee],
-                Repr::None,
+            return self.emit_native_leaf_call(
+                instruction,
+                target,
+                declaration,
+                callee,
+                this,
+                &arguments,
             );
-            let mut inputs: SmallVec<[NodeId; 2]> = SmallVec::new();
-            if declaration.this_operand {
-                inputs.push(this);
-            }
-            inputs.extend(arguments.iter().copied());
-            inputs.resize(2, self.undefined);
-            let node = self.add(Kind::NativeLeaf(target.leaf_stub_id), &inputs, Repr::Tagged);
-            self.write(instruction.writes[0], node);
-            return;
         }
         // A loaded `f.call` called with `f` as receiver calls `f`.
         if !self.exited_for(ExitReason::IdentityGuard)
@@ -3081,6 +3110,50 @@ impl<'a> Builder<'a> {
             .filter(|targets| targets.len() == 1)
             .map(|targets| targets[0].plan);
         self.emit_call_with_receiver(instruction, callee, this, &arguments, plan);
+    }
+
+    /// The passive exact-arity leaf a call site saw, when this site may still
+    /// speculate on its callee's identity.
+    fn admitted_native_leaf(
+        &self,
+        instruction: &Instruction,
+        argument_count: usize,
+    ) -> Option<(
+        otter_vm::jit::JitStaticNativeCall,
+        &'static otter_vm::jit_static_native::JitLeafBuiltin,
+    )> {
+        let target = *self.view.native_calls.get(&instruction.byte_pc)?.leaf()?;
+        if self.exited_for(ExitReason::IdentityGuard) {
+            return None;
+        }
+        super::native_leaf::admit(self.view, target, argument_count)
+            .map(|declaration| (target, declaration))
+    }
+
+    /// Call a proved static native through its leaf on the operand words,
+    /// without a frame: the callee is checked to be that native first.
+    fn emit_native_leaf_call(
+        &mut self,
+        instruction: &Instruction,
+        target: otter_vm::jit::JitStaticNativeCall,
+        declaration: &otter_vm::jit_static_native::JitLeafBuiltin,
+        callee: NodeId,
+        this: NodeId,
+        arguments: &[NodeId],
+    ) {
+        self.add(
+            Kind::CheckNative(target.builtin_native_ref),
+            &[callee],
+            Repr::None,
+        );
+        let mut inputs: SmallVec<[NodeId; 2]> = SmallVec::new();
+        if declaration.this_operand {
+            inputs.push(this);
+        }
+        inputs.extend(arguments.iter().copied());
+        inputs.resize(2, self.undefined);
+        let node = self.add(Kind::NativeLeaf(target.leaf_stub_id), &inputs, Repr::Tagged);
+        self.write(instruction.writes[0], node);
     }
 
     /// `dst = receiver.name(args...)`: `f.call` on a closure receiver, a
@@ -3325,8 +3398,11 @@ impl<'a> Builder<'a> {
     /// this path already did. A typed view is proved to keep a cached
     /// element base, which its storage then reads directly.
     fn elements_of(&mut self, receiver: NodeId, access: JitElementAccess) -> ElementStorage {
-        let proved =
-            self.known.layout(receiver).and_then(|layout| layout.elements) == Some(access);
+        let proved = self
+            .known
+            .layout(receiver)
+            .and_then(|layout| layout.elements)
+            == Some(access);
         if proved && let Some(&storage) = self.known.storage.get(&receiver) {
             return storage;
         }

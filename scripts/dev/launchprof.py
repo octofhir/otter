@@ -127,6 +127,27 @@ for run in range(runs):
                 callees[names[index - 1] if index > 0 else "<self>"] += 1
 
 print(f"samples on {thread_filter}: {total} over {runs} runs")
+
+
+def category(name):
+    """Coarse owner of a self sample."""
+    if name.startswith("JS:"):
+        return "jit:" + ("optimizing" if "[optimizing" in name else "template")
+    for marker, label in (("otter_gc", "gc"), ("regalloc", "jit-compiler"), ("otter_jit", "jit-compiler"),
+                          ("dispatch", "interpreter"), ("otter_compiler", "bytecode-compiler"),
+                          ("oxc", "bytecode-compiler"), ("malloc", "malloc"), ("free", "malloc"),
+                          ("otter_vm", "vm-runtime"), ("otter_runtime", "vm-runtime")):
+        if marker in name:
+            return label
+    return "other"
+
+
+categories = collections.Counter()
+for name, count in self_counts.items():
+    categories[category(name)] += count
+print("== categories")
+for name, count in categories.most_common():
+    print(f"{count:6d} {100 * count / max(total, 1):5.1f}%  {name}")
 print("== self")
 for name, count in self_counts.most_common(top):
     print(f"{count:6d}  {name[:150]}")

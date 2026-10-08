@@ -664,6 +664,7 @@ mod tests {
                     contains_direct_eval: false,
                     primordial_iteration: false,
                     ignores_this: false,
+                    asm_module: false,
                     code: vec![Instruction {
                         pc: 0,
                         op: otter_bytecode::Op::ReturnUndefined,

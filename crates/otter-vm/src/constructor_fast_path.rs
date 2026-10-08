@@ -311,6 +311,7 @@ mod tests {
                     contains_direct_eval: false,
                     primordial_iteration: false,
                     ignores_this: false,
+                    asm_module: false,
                     code: code.into(),
                     spans: otter_bytecode::SpanTable::default(),
                     handlers: Vec::new(),

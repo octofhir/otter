@@ -1291,7 +1291,12 @@ pub fn native_regexp_symbol_replace(
             let receiver = ctx.interp_mut().iteration_anchor(anchor_base + RECEIVER);
             let input = ctx.interp_mut().iteration_anchor(anchor_base + INPUT);
             let replacement = ctx.interp_mut().iteration_anchor(
-                anchor_base + if functional_replace { REPLACER } else { TEMPLATE },
+                anchor_base
+                    + if functional_replace {
+                        REPLACER
+                    } else {
+                        TEMPLATE
+                    },
             );
             return crate::regexp_fast::replace(
                 ctx,
@@ -2429,6 +2434,7 @@ mod tests {
                     contains_direct_eval: false,
                     primordial_iteration: false,
                     ignores_this: false,
+                    asm_module: false,
                     code: vec![Instruction {
                         pc: 0,
                         op: otter_bytecode::Op::ReturnUndefined,

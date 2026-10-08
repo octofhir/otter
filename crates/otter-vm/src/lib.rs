@@ -58,6 +58,7 @@ mod allocation_ops;
 mod argument_window;
 mod arguments_access;
 pub mod arguments_object;
+pub mod asm_stdlib;
 mod arithmetic_dispatch;
 pub mod array;
 mod array_ops;

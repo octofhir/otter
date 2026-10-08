@@ -2102,6 +2102,11 @@ pub struct Function {
     /// `false` is always sound.
     #[serde(default)]
     pub ignores_this: bool,
+    /// `true` when the body's directive prologue holds `"use asm"`: a call
+    /// first offers the function to the host's asm.js linker, which may
+    /// return the module's exports in place of running the body.
+    #[serde(default)]
+    pub asm_module: bool,
     /// Byte range into [`BytecodeModule::function_source`] for the
     /// function / class definition (§20.2.3.5 [[SourceText]]). Validated
     /// at compile time by slicing the source over `source_text_span` (or

@@ -1736,6 +1736,8 @@ impl InterruptHandle {
 /// Re-export of the VM's step-trace interfaces. Embedders that wire
 /// a [`TracerFactory`] through [`RuntimeBuilder`] / [`OtterBuilder`]
 /// build their tracers against these types.
+pub use otter_vm::asm_stdlib;
+pub use otter_vm::binary::byte_storage;
 pub use otter_vm::inspect;
 
 /// Factory for the per-instruction step tracer.
@@ -7286,14 +7288,8 @@ fn evaluate_and_settle_dynamic_linked_module_on(
     target_url: &str,
     linked: module_graph::LinkedProgram,
 ) -> Result<bool, OtterError> {
-    let outcome = evaluate_dynamic_linked_module_on(
-        interp,
-        records,
-        config,
-        commonjs,
-        target_url,
-        linked,
-    );
+    let outcome =
+        evaluate_dynamic_linked_module_on(interp, records, config, commonjs, target_url, linked);
     match outcome {
         Ok(DynamicModuleLoad::Loaded(namespace)) => {
             settle_dynamic_import_result_on(interp, token, Ok(namespace))

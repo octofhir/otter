@@ -77,6 +77,7 @@ impl CodeBlock {
             register_count: self.register_count,
             is_strict: self.is_strict,
             is_arrow: self.is_arrow,
+            asm_module: self.asm_module,
             is_method: self.is_method,
             has_rest: self.has_rest,
             is_async: self.is_async,

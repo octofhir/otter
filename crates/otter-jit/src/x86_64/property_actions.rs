@@ -171,7 +171,6 @@ pub(crate) fn emit_action_probe(
         PropertySourceAccess::Load => {
             let destination = destination.expect("property load destination");
             let own = ops.new_dynamic_label();
-            let holder_ready = ops.new_dynamic_label();
             let absent = ops.new_dynamic_label();
             let undefined = ops.new_dynamic_label();
             dynasm!(ops ; .arch x64
@@ -190,9 +189,6 @@ pub(crate) fn emit_action_probe(
                 ; test Rd(shape), Rd(shape) ; jz =>miss
                 ; add Rq(shape), r11
                 ; cmp BYTE [Rq(shape)], crate::entry::OBJECT_BODY_TYPE_TAG as i8 ; jne =>miss
-                ; jmp =>holder_ready
-                ; =>own ; mov Rq(shape), Rq(receiver)
-                ; =>holder_ready
                 ; mov r10d, [Rq(shape) + view.object_shape_byte as i32]
                 ; test r10d, r10d ; jz =>miss
                 ; cmp r10d, [Rq(entry) + cache.holder_shape_byte as i32] ; jne =>miss);
@@ -204,6 +200,14 @@ pub(crate) fn emit_action_probe(
                 ; cmp r10, [Rq(entry) + cache.holder_shape_id_byte as i32] ; jne =>miss
                 ; movzx Rd(identity), WORD [Rq(entry) + cache.load_slot_byte as i32]);
             emit_slot_storage(ops, view, shape, identity, base, miss);
+            dynasm!(ops ; .arch x64
+                ; mov Rq(destination), [Rq(base) + Rq(identity) * 8]
+                ; jmp =>done
+                // The matched key already proved the receiver's exact shape,
+                // whose address the key decode left in `shape`.
+                ; =>own
+                ; movzx Rd(identity), WORD [Rq(entry) + cache.load_slot_byte as i32]);
+            emit_slot_storage_of_shape(ops, view, receiver, shape, identity, base, miss);
             dynasm!(ops ; .arch x64
                 ; mov Rq(destination), [Rq(base) + Rq(identity) * 8]
                 ; jmp =>done
@@ -247,7 +251,7 @@ pub(crate) fn emit_action_probe(
                 ; jmp =>appended
                 ; =>own
                 ; movzx Rd(identity), WORD [Rq(entry) + cache.store_slot_byte as i32]);
-            emit_slot_storage(ops, view, receiver, identity, base, miss);
+            emit_slot_storage_of_shape(ops, view, receiver, shape, identity, base, miss);
             dynasm!(ops ; .arch x64
                 ; mov [Rq(base) + Rq(identity) * 8], Rq(value)
                 ; jmp =>done);
@@ -264,16 +268,34 @@ fn emit_slot_storage(
     base: u8,
     miss: DynamicLabel,
 ) {
-    let inline = ops.new_dynamic_label();
-    let ready = ops.new_dynamic_label();
     emit_load_u64(ops, 10, 0xffff_ffff_0000_0000);
     dynasm!(ops ; .arch x64
         ; and r10, Rq(holder)
-        ; mov r11d, [Rq(holder) + view.object_shape_byte as i32] ; add r11, r10
-        ; movzx r11d, BYTE [r11 + view.shape_inline_capacity_byte as i32]
+        ; mov r11d, [Rq(holder) + view.object_shape_byte as i32] ; add r11, r10);
+    emit_slot_storage_of_shape(ops, view, holder, 11, slot, base, miss);
+}
+
+/// [`emit_slot_storage`] of `holder` whose current shape's address is already
+/// in `shape`.
+fn emit_slot_storage_of_shape(
+    ops: &mut Assembler,
+    view: &JitCompileSnapshot,
+    holder: u8,
+    shape: u8,
+    slot: u8,
+    base: u8,
+    miss: DynamicLabel,
+) {
+    let inline = ops.new_dynamic_label();
+    let ready = ops.new_dynamic_label();
+    dynasm!(ops ; .arch x64
+        ; movzx r11d, BYTE [Rq(shape) + view.shape_inline_capacity_byte as i32]
         ; cmp Rd(slot), r11d ; jb =>inline ; sub Rd(slot), r11d
         ; mov Rd(base), [Rq(holder) + view.field_layout.slab_handle_byte as i32]
-        ; test Rd(base), Rd(base) ; jz =>miss ; add Rq(base), r10
+        ; test Rd(base), Rd(base) ; jz =>miss);
+    emit_load_u64(ops, 10, 0xffff_ffff_0000_0000);
+    dynasm!(ops ; .arch x64
+        ; and r10, Rq(holder) ; add Rq(base), r10
         ; cmp Rd(slot), [Rq(base) + view.field_layout.slab_capacity_byte as i32] ; jae =>miss
         ; add Rq(base), view.field_layout.slab_words_byte as i32 ; jmp =>ready
         ; =>inline ; lea Rq(base), [Rq(holder) + view.field_layout.inline_values_byte as i32]

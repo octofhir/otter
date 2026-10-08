@@ -874,9 +874,11 @@ pub(super) fn emit_int_bitwise(
 /// represented by the int32 tag.
 pub(super) fn emit_unsigned_shift_right(
     ops: &mut Assembler,
+    relocations: &mut RelocationCapture,
     dst: u16,
     lhs: u16,
     rhs: u16,
+    site: Option<ArithSite>,
     slow_paths: &mut Vec<NumericSlowPath>,
 ) -> Result<(), Unsupported> {
     let (slow, resume) = numeric_slow_path(ops, slow_paths, dst, lhs, u64::from(rhs), Op::Ushr);
@@ -884,11 +886,21 @@ pub(super) fn emit_unsigned_shift_right(
     emit_load_reg(ops, 10, rhs)?;
     emit_to_uint32_fast(ops, 9, 11, slow);
     emit_to_uint32_fast(ops, 10, 12, slow);
-    dynasm!(ops
-        ; .arch aarch64
-        ; lsr w13, w11, w12
-        ; ucvtf d0, w13
-    );
+    dynasm!(ops ; .arch aarch64 ; lsr w13, w11, w12);
+    // A result past int32 is a double the site's feedback must record, so
+    // optimized code computes this shift as one instead of exiting on it.
+    if site.is_some() {
+        let int32 = ops.new_dynamic_label();
+        dynasm!(ops ; .arch aarch64 ; tbz w13, #31, =>int32);
+        emit_record_arith(
+            ops,
+            relocations,
+            site,
+            otter_vm::jit_feedback::ARITH_FLOAT64,
+        );
+        dynasm!(ops ; .arch aarch64 ; =>int32);
+    }
+    dynasm!(ops ; .arch aarch64 ; ucvtf d0, w13);
     emit_box_double(ops, 0, 13);
     emit_store_reg(ops, 13, dst)?;
     dynasm!(ops ; .arch aarch64 ; =>resume);
@@ -975,6 +987,12 @@ pub(super) fn emit_negate(
     emit_box_int32(ops, 13, 12);
     emit_store_reg(ops, 13, dst)?;
     dynasm!(ops ; .arch aarch64 ; b =>done ; =>zero_case);
+    emit_record_arith(
+        ops,
+        relocations,
+        site,
+        otter_vm::jit_feedback::ARITH_FLOAT64,
+    );
     emit_load_u64(
         ops,
         13,
@@ -982,6 +1000,12 @@ pub(super) fn emit_negate(
     );
     emit_store_reg(ops, 13, dst)?;
     dynasm!(ops ; .arch aarch64 ; b =>done ; =>overflow_case);
+    emit_record_arith(
+        ops,
+        relocations,
+        site,
+        otter_vm::jit_feedback::ARITH_FLOAT64,
+    );
     emit_load_u64(
         ops,
         13,

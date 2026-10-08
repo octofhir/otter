@@ -191,6 +191,16 @@ impl NumericRuntimeOp {
     }
 }
 
+/// Fold a numeric result into its site's feedback with its operands, as
+/// V8's binary-operation feedback does: an int32 site is one whose results
+/// were int32 too, so an overflowing, fractional, unsigned or `-0` result
+/// speculates a double before any optimized code has to exit for it.
+fn record_arith_result(feedback: Option<InstructionFeedbackRecorder<'_>>, result: Value) {
+    if let Some(feedback) = feedback {
+        feedback.record_arith(result, result);
+    }
+}
+
 impl Interpreter {
     /// Execute one shared numeric-binary semantic operation from frame
     /// registers. The operation identity comes from the bytecode-owned scalar
@@ -369,14 +379,13 @@ impl Interpreter {
         // Number x Number is the dominant shape, needs no conversion, and
         // cannot re-enter JavaScript, so it never releases the frame borrow.
         if let (Some(a), Some(b)) = (lhs.as_number(), rhs.as_number()) {
-            return commit_frame_result(
-                unsafe { stack.top_unchecked_mut() },
-                dst,
-                Value::number(op(a, b)),
-            )
-            .map_err(CommittedValueError::Fatal);
+            let result = Value::number(op(a, b));
+            record_arith_result(feedback, result);
+            return commit_frame_result(unsafe { stack.top_unchecked_mut() }, dst, result)
+                .map_err(CommittedValueError::Fatal);
         }
         let result = numeric_binary_value(self, stack, context, lhs, rhs, op, bigint_op)?;
+        record_arith_result(feedback, result);
         commit_frame_result(&mut stack[top_idx], dst, result).map_err(CommittedValueError::Fatal)
     }
 
@@ -397,14 +406,13 @@ impl Interpreter {
             feedback.record_arith(lhs, rhs);
         }
         if let (Some(a), Some(b)) = (lhs.as_number(), rhs.as_number()) {
-            return commit_frame_result(
-                unsafe { stack.top_unchecked_mut() },
-                dst,
-                Value::number(number::add(a, b)),
-            )
-            .map_err(CommittedValueError::Fatal);
+            let result = Value::number(number::add(a, b));
+            record_arith_result(feedback, result);
+            return commit_frame_result(unsafe { stack.top_unchecked_mut() }, dst, result)
+                .map_err(CommittedValueError::Fatal);
         }
         let result = self.add_value(stack, context, lhs, rhs)?;
+        record_arith_result(feedback, result);
         commit_frame_result(&mut stack[top_idx], dst, result).map_err(CommittedValueError::Fatal)
     }
 
@@ -805,6 +813,7 @@ impl Interpreter {
             feedback.record_arith(lhs, rhs);
         }
         let result = ushr_value(self, stack, context, lhs, rhs)?;
+        record_arith_result(feedback, result);
         commit_frame_result(&mut stack[top_idx], dst, result).map_err(CommittedValueError::Fatal)
     }
 
@@ -824,6 +833,7 @@ impl Interpreter {
             feedback.record_arith(value, value);
         }
         let result = self.neg_value(stack, context, value)?;
+        record_arith_result(feedback, result);
         commit_frame_result(&mut stack[top_idx], dst, result).map_err(CommittedValueError::Fatal)
     }
 
@@ -862,6 +872,7 @@ impl Interpreter {
             feedback.record_arith(value, Value::number_i32(delta));
         }
         let result = self.increment_value(stack, context, value, delta)?;
+        record_arith_result(feedback, result);
         commit_frame_result(&mut stack[top_idx], dst, result).map_err(CommittedValueError::Fatal)
     }
 

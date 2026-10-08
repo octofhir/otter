@@ -18,7 +18,7 @@ use super::{canonical_numeric_index_string, typed_array_valid_index};
 use crate::activation_stack::ActivationStack;
 use crate::{
     ExecutionContext, Interpreter, NumberValue, Value, VmError, VmGetOutcome, VmPropertyKey,
-    abstract_ops, binary, read_register, rooting::RootScopeExt, symbol, write_register,
+    abstract_ops, binary, object, read_register, rooting::RootScopeExt, symbol, write_register,
 };
 
 impl Interpreter {
@@ -59,6 +59,48 @@ impl Interpreter {
             .map_err(|error| CommittedValueError::Fatal(error.into()))
     }
 
+    /// Ordinary `[[Get]]` of a string key answered from data properties
+    /// alone, as V8's megamorphic keyed load does for a name: shaped links
+    /// through the shared `(shape, atom)` table, dictionary links by their
+    /// own lookup. No rooting, coercion or decoded key. `None` when an
+    /// accessor, an exotic link or a never-interned key needs the full
+    /// `[[Get]]`.
+    fn ordinary_string_key_load(
+        &mut self,
+        obj: object::JsObject,
+        key: crate::string::JsString,
+    ) -> Option<Value> {
+        let atom = self.string_key_atom(key)?;
+        let name = self.shape_runtime.names().spelling(atom)?;
+        let key = crate::property_atom::AtomizedPropertyKey::new(
+            crate::property_atom::PropertyAtom::new(atom),
+            name,
+        );
+        let mut current = obj;
+        for _ in 0..object::PROTO_CHAIN_HARD_CAP {
+            if !object::is_dictionary(current, &self.gc_heap) {
+                return match self.resolve_property_load(current, key) {
+                    crate::property_cache::PropertyLoad::Data(resolved) => Some(resolved.value),
+                    crate::property_cache::PropertyLoad::Absent(_) => Some(Value::undefined()),
+                    crate::property_cache::PropertyLoad::Other => None,
+                };
+            }
+            if object::state(current, &self.gc_heap).is_opaque() {
+                return None;
+            }
+            match object::lookup_own_atom(current, &self.gc_heap, key).lookup {
+                object::PropertyLookup::Data { value, .. } => return Some(value),
+                object::PropertyLookup::Absent => {}
+                object::PropertyLookup::Accessor { .. } => return None,
+            }
+            match object::prototype_value(current, &self.gc_heap) {
+                None => return Some(Value::undefined()),
+                Some(prototype) => current = prototype.as_object()?,
+            }
+        }
+        None
+    }
+
     /// Complete computed element lookup against either physical activation.
     ///
     /// Coercion may allocate or invoke JavaScript, so the coerced key is first
@@ -73,18 +115,24 @@ impl Interpreter {
         mut idx_value_raw: Value,
     ) -> Result<Value, CommittedValueError> {
         // Generated dense loads enter this Rust completion only for a failed
-        // guard. The common miss is an in-bounds hole. When the one-shot
-        // indexed-accessor protector is still intact and the receiver has no
-        // exotic sidecar, the prototype chain cannot turn that hole into a
-        // getter result, so avoid `ToPropertyKey` and the full descriptor walk.
+        // guard. The common misses are a hole and an index past the end. When
+        // the one-shot indexed-accessor protector is still intact and the
+        // receiver has no exotic sidecar, the prototype chain cannot answer
+        // either, so avoid `ToPropertyKey` and the full descriptor walk.
         if !self.array_index_accessor_protector
             && let Some(arr) = recv.as_array()
             && let Some(index) = idx_value_raw
                 .as_i32()
                 .and_then(|index| usize::try_from(index).ok())
-            && crate::array::is_plain_dense_hole(arr, &self.gc_heap, index)
+            && crate::array::is_plain_dense_absent(arr, &self.gc_heap, index)
         {
             return Ok(Value::undefined());
+        }
+        if let Some(obj) = recv.as_object()
+            && let Some(key) = idx_value_raw.as_string(&self.gc_heap)
+            && let Some(value) = self.ordinary_string_key_load(obj, key)
+        {
+            return Ok(value);
         }
         let mut idx_value = Value::undefined();
         let mut result = Value::undefined();

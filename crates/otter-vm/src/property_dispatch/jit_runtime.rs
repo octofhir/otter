@@ -611,6 +611,38 @@ impl Interpreter {
                 return Ok(());
             }
         }
+        // A string key naming an existing own writable data slot of an
+        // ordinary non-prototype receiver, or an append the shared table
+        // recorded for its class, completes without rooting or `[[Set]]`
+        // resolution, as a megamorphic named store does.
+        if let Some(obj) = receiver.as_object()
+            && let Some(string) = key_value.as_string(&self.gc_heap)
+            && object::supports_fast_property_ic(obj, &self.gc_heap)
+            && !object::state(obj, &self.gc_heap).is_prototype()
+            && let Some(atom) = self.string_key_atom(string)
+            && let Some(name) = self.shape_runtime.names().spelling(atom)
+        {
+            let key = crate::property_atom::AtomizedPropertyKey::new(
+                crate::property_atom::PropertyAtom::new(atom),
+                name,
+            );
+            if self
+                .property_cache
+                .replay_store(obj, &mut self.gc_heap, key, &value)
+                .map_err(|error| CommittedValueError::JavaScript(error.into()))?
+                .is_some()
+            {
+                return Ok(());
+            }
+            if let crate::property_cache::PropertyLoad::Data(resolved) =
+                self.resolve_property_load(obj, key)
+                && resolved.hops == 0
+                && resolved.is_writable
+            {
+                object::store_proven_data_slot(obj, &mut self.gc_heap, resolved.hit.slot, value);
+                return Ok(());
+            }
+        }
         let mut property_key = Value::undefined();
         let strict = force_strict || context.function_is_strict(function_id);
 

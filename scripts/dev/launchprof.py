@@ -8,7 +8,8 @@ time-profile table and aggregates, over every run, self samples (leaf frame)
 and inclusive samples (any frame, counted once per sample) by function name,
 for the `otter-isolate` thread unless THREAD names another. Prints the top
 rows of both tables. FOCUS=<substring> also aggregates the direct callers and
-callees of the outermost frame matching it. Traces and exports stay under
+callees of the outermost frame matching it. WITHIN=<substring> keeps only
+the samples with a frame matching it, profiling that subtree alone. Traces and exports stay under
 <out-dir>. Run otter with `--perf-basic-prof` to name generated code: the
 launch's `/tmp/perf-<pid>.map` is kept beside its export and resolves bare
 JIT addresses to `JS:<function> [<tier> c<code-object>]`; OFFSETS=1 keeps the
@@ -47,6 +48,7 @@ command = sys.argv[sys.argv.index("--") + 1:]
 thread_filter = os.environ.get("THREAD", "otter-isolate")
 top = int(os.environ.get("TOP", "40"))
 focus = os.environ.get("FOCUS")
+within = os.environ.get("WITHIN")
 offsets = os.environ.get("OFFSETS") == "1"
 boundary = collections.Counter() if os.environ.get("BOUNDARY") == "1" else None
 callers = collections.Counter()
@@ -105,6 +107,8 @@ for run in range(runs):
         names = [symbolize(resolve(frame).get("name") or "?", ranges, starts)
                  for frame in backtrace.findall("frame")]
         if not names:
+            continue
+        if within and not any(within in name for name in names):
             continue
         total += 1
         self_counts[names[0]] += 1

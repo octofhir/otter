@@ -412,8 +412,8 @@ struct Builder<'a> {
     current_bytecode_block: usize,
     frame: Vec<NodeId>,
     known: Known,
-    /// The graph has an OSR entry block.
-    osr_entry: bool,
+    /// The bytecode loop header the OSR entry block feeds.
+    osr_header: Option<usize>,
     /// Eager frame states already built, by PC.
     eager_states: FxHashMap<u32, FrameStateId>,
     /// How each loop header treats the heap facts of its entry.
@@ -568,7 +568,7 @@ fn build_once(
         current_bytecode_block: 0,
         frame: vec![undefined; usize::from(register_count)],
         known: Known::default(),
-        osr_entry: osr_pc.is_some(),
+        osr_header: osr_pc.and_then(|pc| analysis.block_of.get(pc as usize).copied()),
         eager_states: FxHashMap::default(),
         policies,
         assumptions: FxHashMap::default(),
@@ -1163,6 +1163,10 @@ impl<'a> Builder<'a> {
             }
             self.assumptions.insert(block, known.heap_facts());
         }
+        let encloses_osr = is_loop
+            && self.osr_header.is_some_and(|header| {
+                header != block && self.analysis.loops[&block].body.contains(&header)
+            });
         let mut frame = incoming[0].frame.clone();
         let mut phis = Vec::new();
         for register in 0..self.register_count {
@@ -1172,11 +1176,13 @@ impl<'a> Builder<'a> {
                 continue;
             }
             let first = incoming[0].frame[index];
-            // An OSR entry reaches outer loop headers along their back edges
-            // only: there every live register is a merge, not just the ones
-            // the body assigns.
+            // An OSR entry inside a loop reaches its header along a back
+            // edge only: there every live register is a merge, not just the
+            // ones the body assigns. The OSR loop's own header merges the
+            // entry block as a forward edge, and any other loop sees the
+            // entry's values through its pre-header.
             let assigned = is_loop
-                && (self.osr_entry || self.analysis.loops[&block].assigned.contains(register));
+                && (encloses_osr || self.analysis.loops[&block].assigned.contains(register));
             let differs = incoming.iter().any(|edge| edge.frame[index] != first);
             if !assigned && !differs {
                 continue;

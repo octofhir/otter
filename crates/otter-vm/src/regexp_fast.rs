@@ -73,7 +73,9 @@ impl Interpreter {
         else {
             return false;
         };
-        let species = self.well_known_symbols.get(crate::symbol::WellKnown::Species);
+        let species = self
+            .well_known_symbols
+            .get(crate::symbol::WellKnown::Species);
         value
             .as_native_function()
             .and_then(|constructor| constructor.own_symbol_property_descriptor(heap, species))
@@ -115,8 +117,7 @@ impl Interpreter {
         let Some(prototype) = self.realm_intrinsics.regexp_prototype() else {
             return false;
         };
-        let Some(validity) =
-            object::prototype_validity::chain_validity(prototype, &self.gc_heap)
+        let Some(validity) = object::prototype_validity::chain_validity(prototype, &self.gc_heap)
         else {
             return false;
         };
@@ -292,9 +293,11 @@ pub(crate) fn split(
         if let Some(matched) = last_match {
             let subject = scope.raw(input);
             scope.with_turn_parts(|interp, _| {
-                interp
-                    .regexp_legacy
-                    .record_match(subject, matched.range.clone(), &matched.captures);
+                interp.regexp_legacy.record_match(
+                    subject,
+                    matched.range.clone(),
+                    &matched.captures,
+                );
             });
         }
         let array = scope.array(pieces.len())?;
@@ -372,7 +375,9 @@ pub(crate) fn replace(
                     .record_match(subject, last.range.clone(), &last.captures);
             });
         }
-        let named = matches.first().is_some_and(|m| m.named_groups().next().is_some());
+        let named = matches
+            .first()
+            .is_some_and(|m| m.named_groups().next().is_some());
         let mut out: Vec<u16> = Vec::with_capacity(units.len());
         let mut next = 0;
         for matched in &matches {
@@ -388,8 +393,7 @@ pub(crate) fn replace(
                     }
                 }
                 None => {
-                    let result =
-                        call_replacer(&mut scope, replacement, input, matched, named)?;
+                    let result = call_replacer(&mut scope, replacement, input, matched, named)?;
                     let result = scope.raw(result);
                     let result = crate::regexp_prototype::coerce_to_jsstring_runtime(
                         scope.context(),
@@ -472,7 +476,11 @@ fn expand_template(
     named: bool,
 ) -> bool {
     const DOLLAR: u16 = b'$' as u16;
-    let digit = |unit: u16| (b'0' as u16..=b'9' as u16).contains(&unit).then(|| usize::from(unit - b'0' as u16));
+    let digit = |unit: u16| {
+        (b'0' as u16..=b'9' as u16)
+            .contains(&unit)
+            .then(|| usize::from(unit - b'0' as u16))
+    };
     let groups = matched.captures.len();
     let tail = matched.range.end.min(subject.len());
     let mut i = 0;
@@ -528,7 +536,9 @@ fn expand_template(
                     continue;
                 };
                 let name = String::from_utf16_lossy(&template[i + 2..i + 2 + close]);
-                if let Some((_, Some(range))) = matched.named_groups().find(|(group, _)| *group == name) {
+                if let Some((_, Some(range))) =
+                    matched.named_groups().find(|(group, _)| *group == name)
+                {
                     out.extend_from_slice(&subject[range]);
                 }
                 i += close + 3;

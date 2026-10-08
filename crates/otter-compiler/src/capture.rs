@@ -195,7 +195,9 @@ impl CaptureFacts {
 
     /// Whether a function nested in the scope references `name`.
     pub(crate) fn inner_references(&self, scope: &ScopeFacts, name: &str) -> bool {
-        self.ids.get(name).is_some_and(|id| scope.inner.contains(id))
+        self.ids
+            .get(name)
+            .is_some_and(|id| scope.inner.contains(id))
     }
 
     /// Whether the scope's parameters or body name `name` at any depth,
@@ -236,7 +238,10 @@ impl CaptureFacts {
     }
 
     /// [`Self::nested_refs_in_statements`] for one expression.
-    pub(crate) fn nested_refs_in_expression(&self, expr: &Expression<'_>) -> (HashSet<String>, bool) {
+    pub(crate) fn nested_refs_in_expression(
+        &self,
+        expr: &Expression<'_>,
+    ) -> (HashSet<String>, bool) {
         let mut region = Region::new(self);
         region.visit_expression(expr);
         region.finish()
@@ -783,7 +788,6 @@ pub fn program_references_new_target(stmts: &[Statement<'_>]) -> bool {
     finder.found
 }
 
-
 /// `true` when a derived constructor's `this` must live in a
 /// `DerivedThis` context slot: an arrow nested in its parameters or body
 /// (through arrows only) reads `this`, calls `super(...)`, or reads a
@@ -853,7 +857,6 @@ impl<'a> Visit<'a> for DerivedThisFinder {
     }
 }
 
-
 /// `true` when `stmt` contains a function, arrow, class, or direct eval —
 /// any construct that can reach a `with` object after the statement's own
 /// straight-line code, so the object must live in a context slot.
@@ -886,7 +889,6 @@ pub fn statement_contains_closure_or_eval(stmt: &Statement<'_>) -> bool {
     finder.found
 }
 
-
 /// Whether `expr` contains a direct eval at any depth — used for
 /// class field initializers, which compile into the synthesized
 /// constructor's frame.
@@ -896,7 +898,6 @@ pub fn expression_contains_direct_eval(expr: &oxc_ast::ast::Expression<'_>) -> b
     finder.visit_expression(expr);
     finder.found
 }
-
 
 #[derive(Default)]
 struct DirectEvalFinder {
@@ -940,7 +941,6 @@ impl<'a> Visit<'a> for DirectEvalFinder {
         walk::walk_call_expression(self, it);
     }
 }
-
 
 /// `true` when the body of one function, including its arrow functions but
 /// not its other nested functions, reads a `.arguments` property.
@@ -1013,7 +1013,6 @@ impl<'a> Visit<'a> for DotArgumentsFinder {
     }
 }
 
-
 /// Whether `expr` names `name` anywhere, read or written, nested functions
 /// included.
 #[must_use]
@@ -1033,4 +1032,3 @@ pub fn expression_mentions_name(expr: &oxc_ast::ast::Expression<'_>, name: &str)
     finder.visit_expression(expr);
     finder.found
 }
-

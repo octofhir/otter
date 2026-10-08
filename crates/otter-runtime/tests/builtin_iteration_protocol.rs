@@ -10,10 +10,13 @@ use otter_runtime::{Runtime, SourceInput};
 
 fn run(source: &str) -> String {
     let mut rt = Runtime::builder().build().expect("runtime");
-    rt.run_script(SourceInput::from_javascript(source), "<iteration-protocol-test>")
-        .expect("script")
-        .completion_string()
-        .to_string()
+    rt.run_script(
+        SourceInput::from_javascript(source),
+        "<iteration-protocol-test>",
+    )
+    .expect("script")
+    .completion_string()
+    .to_string()
 }
 
 #[test]

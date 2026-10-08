@@ -1358,8 +1358,9 @@ pub(crate) fn compile_switch_statement(
     for case in &s.cases {
         hoist_lexical_names(&case.consequent, &mut case_lex);
     }
-    let (mut case_captured, nested_eval) =
-        cx.capture.nested_refs_in_statements(case_stmts.iter().copied());
+    let (mut case_captured, nested_eval) = cx
+        .capture
+        .nested_refs_in_statements(case_stmts.iter().copied());
     if nested_eval {
         case_captured.extend(case_lex.iter().map(|(name, _)| name.clone()));
     }

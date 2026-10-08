@@ -245,7 +245,10 @@ mod tests {
         }
         // A formal no alias can observe leaves plain reads elided.
         let plain = ops("plain");
-        assert!(plain.contains(&Op::LoadArgumentsElement), "plain: {plain:?}");
+        assert!(
+            plain.contains(&Op::LoadArgumentsElement),
+            "plain: {plain:?}"
+        );
         assert!(!plain.contains(&Op::CollectArguments), "plain: {plain:?}");
     }
 

@@ -420,8 +420,9 @@ fn restore_execution_failure(interp: &mut Interpreter, failure: crate::RunError)
         return VmError::InvalidOperand;
     }
     *interp.pending_error_detail.borrow_mut() = failure.detail;
-    interp.pending_throw_provenance = (!failure.frames.is_empty())
-        .then_some(crate::native_stack_snapshot::ThrowProvenance::Frames(failure.frames));
+    interp.pending_throw_provenance = (!failure.frames.is_empty()).then_some(
+        crate::native_stack_snapshot::ThrowProvenance::Frames(failure.frames),
+    );
     failure.error
 }
 

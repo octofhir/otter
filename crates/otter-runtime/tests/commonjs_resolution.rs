@@ -49,7 +49,11 @@ fn require_follows_node_commonjs_resolution() {
     write_fixture(root, "lib/app.config.js", "module.exports = 'config';");
     write_fixture(root, "lib/app.js", "module.exports = 'app';");
     write_fixture(root, "lib/index.js", "module.exports = 'lib-index';");
-    write_fixture(root, "lib/nested/index.js", "module.exports = require('..');");
+    write_fixture(
+        root,
+        "lib/nested/index.js",
+        "module.exports = require('..');",
+    );
     write_fixture(
         root,
         "node_modules/dual/package.json",
@@ -68,8 +72,16 @@ fn require_follows_node_commonjs_resolution() {
         "node_modules/dual/cjs.js",
         "module.exports = 'cjs+' + require('#internal');",
     );
-    write_fixture(root, "node_modules/dual/internal.js", "module.exports = 'internal';");
-    write_fixture(root, "node_modules/dual/feature-cjs.js", "module.exports = 'feature';");
+    write_fixture(
+        root,
+        "node_modules/dual/internal.js",
+        "module.exports = 'internal';",
+    );
+    write_fixture(
+        root,
+        "node_modules/dual/feature-cjs.js",
+        "module.exports = 'feature';",
+    );
     let entry = write_fixture(
         root,
         "entry.cjs",

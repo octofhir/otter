@@ -390,8 +390,7 @@ pub(crate) fn compile_block_statements(
 ) -> Result<Option<u16>, CompileError> {
     let mut block_lex: Vec<(String, bool)> = Vec::new();
     hoist_lexical_names(stmts, &mut block_lex);
-    let (mut block_captured, nested_eval) =
-        cx.capture.nested_refs_in_statements(stmts);
+    let (mut block_captured, nested_eval) = cx.capture.nested_refs_in_statements(stmts);
     if nested_eval {
         block_captured.extend(block_lex.iter().map(|(name, _)| name.clone()));
     }

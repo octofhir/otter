@@ -512,9 +512,7 @@ impl RuntimeCall<'_> {
     /// Whether the static handler table of the throwing function covers the
     /// published throw instruction.
     fn throw_lands_in_local_handler(&self) -> Result<bool, CommittedValueError> {
-        let (function_id, pc) = self
-            .semantic_source()
-            .map_err(CommittedValueError::Fatal)?;
+        let (function_id, pc) = self.semantic_source().map_err(CommittedValueError::Fatal)?;
         let owner = self
             .context
             .for_function(function_id)

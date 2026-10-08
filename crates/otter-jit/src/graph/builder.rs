@@ -87,8 +87,9 @@ mod binding_tests;
 
 const UNDEFINED: u64 = tag::VALUE_UNDEFINED;
 
-/// What is known about one value along the current path.
-#[derive(Debug, Clone, Default, PartialEq)]
+/// What is known about one value along the current path that no heap write
+/// changes.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub(crate) struct NodeInfo {
     /// The same value as an unboxed int32.
     pub(crate) int32: Option<NodeId>,
@@ -96,21 +97,24 @@ pub(crate) struct NodeInfo {
     pub(crate) float64: Option<NodeId>,
     /// The same value as a tagged word.
     pub(crate) tagged: Option<NodeId>,
-    /// Shapes the value is proved to have (an ordinary object with one of
-    /// them).
-    pub(crate) shapes: Option<SmallVec<[u32; 4]>>,
     /// The value is proved to be an ECMAScript Object receiver, so ordinary
     /// sloppy `this` binding returns this same value without allocation.
     pub(crate) heap_object: bool,
     /// The value is proved to be a Number.
     pub(crate) number: bool,
+}
+
+/// What is known about one object's layout along the current path, until a
+/// heap write may change it.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub(crate) struct LayoutInfo {
+    /// Shapes the value is proved to have (an ordinary object with one of
+    /// them).
+    pub(crate) shapes: Option<SmallVec<[u32; 4]>>,
     /// The shape proof also excludes prototype objects.
     pub(crate) writable: bool,
     /// The value is proved an indexed receiver of this element layout.
     pub(crate) elements: Option<JitElementAccess>,
-    /// The `Word` element count and element base of a proved indexed
-    /// receiver, already read on this path.
-    pub(crate) storage: Option<ElementStorage>,
 }
 
 /// The nodes that read a proved indexed receiver's storage.
@@ -164,6 +168,11 @@ struct LoopPolicy {
 #[derive(Debug, Clone, Default)]
 pub(crate) struct Known {
     info: FxHashMap<NodeId, NodeInfo>,
+    /// Layout proofs, which every heap write may clobber.
+    layouts: FxHashMap<NodeId, LayoutInfo>,
+    /// The `Word` element count and element base of a proved indexed
+    /// receiver, already read on this path; a collection may move them.
+    storage: FxHashMap<NodeId, ElementStorage>,
     /// Heap words whose current value is a node on this path.
     fields: FxHashMap<FieldKey, NodeId>,
     /// The parent of each context loaded on this path. Context chains never
@@ -186,6 +195,14 @@ impl Known {
         self.info.entry(node).or_default()
     }
 
+    fn layout(&self, node: NodeId) -> Option<&LayoutInfo> {
+        self.layouts.get(&node)
+    }
+
+    fn layout_entry(&mut self, node: NodeId) -> &mut LayoutInfo {
+        self.layouts.entry(node).or_default()
+    }
+
     /// Keep only facts `other` agrees on.
     fn intersect(&mut self, other: &Known) {
         self.info.retain(|node, info| {
@@ -201,20 +218,25 @@ impl Known {
             if info.tagged != theirs.tagged {
                 info.tagged = None;
             }
-            if info.shapes != theirs.shapes {
-                info.shapes = None;
-            }
-            if info.elements != theirs.elements {
-                info.elements = None;
-            }
-            if info.storage != theirs.storage {
-                info.storage = None;
-            }
-            info.writable &= theirs.writable;
             info.heap_object &= theirs.heap_object;
             info.number &= theirs.number;
             *info != NodeInfo::default()
         });
+        self.layouts.retain(|node, layout| {
+            let Some(theirs) = other.layouts.get(node) else {
+                return false;
+            };
+            if layout.shapes != theirs.shapes {
+                layout.shapes = None;
+            }
+            if layout.elements != theirs.elements {
+                layout.elements = None;
+            }
+            layout.writable &= theirs.writable;
+            *layout != LayoutInfo::default()
+        });
+        self.storage
+            .retain(|node, storage| other.storage.get(node) == Some(storage));
         self.fields
             .retain(|key, value| other.fields.get(key) == Some(value));
         self.parents
@@ -226,12 +248,8 @@ impl Known {
 
     /// Forget every fact a heap write may invalidate.
     fn clobber_heap(&mut self) {
-        for info in self.info.values_mut() {
-            info.shapes = None;
-            info.writable = false;
-            info.elements = None;
-            info.storage = None;
-        }
+        self.layouts.clear();
+        self.storage.clear();
         self.fields.clear();
         self.elements_read.clear();
     }
@@ -248,10 +266,11 @@ impl Known {
     /// Forget every node's shape proof: a published transition changes the
     /// shape of an object any node may name.
     fn forget_shapes(&mut self) {
-        for info in self.info.values_mut() {
-            info.shapes = None;
-            info.writable = false;
-        }
+        self.layouts.retain(|_, layout| {
+            layout.shapes = None;
+            layout.writable = false;
+            layout.elements.is_some()
+        });
     }
 
     /// Forget every known value at `offset`: a store through any node may
@@ -266,12 +285,8 @@ impl Known {
         for key in keys {
             match *key {
                 FactKey::Node(node) => {
-                    if let Some(info) = self.info.get_mut(&node) {
-                        info.shapes = None;
-                        info.writable = false;
-                        info.elements = None;
-                        info.storage = None;
-                    }
+                    self.layouts.remove(&node);
+                    self.storage.remove(&node);
                 }
                 FactKey::Field(field) => {
                     self.fields.remove(&field);
@@ -283,25 +298,23 @@ impl Known {
     /// Forget the storage words read on this path. A loop back edge polls
     /// for interrupts, and a collection there may move element storage.
     fn forget_storage(&mut self) {
-        for info in self.info.values_mut() {
-            info.storage = None;
-        }
+        self.storage.clear();
         self.elements_read.clear();
     }
 
     /// The heap facts on this path.
     fn heap_facts(&self) -> Vec<(FactKey, HeapFact)> {
         let mut facts: Vec<(FactKey, HeapFact)> = self
-            .info
+            .layouts
             .iter()
-            .filter(|(_, info)| info.shapes.is_some() || info.elements.is_some())
-            .map(|(&node, info)| {
+            .filter(|(_, layout)| layout.shapes.is_some() || layout.elements.is_some())
+            .map(|(&node, layout)| {
                 (
                     FactKey::Node(node),
                     HeapFact::Layout {
-                        shapes: info.shapes.clone(),
-                        writable: info.writable,
-                        elements: info.elements,
+                        shapes: layout.shapes.clone(),
+                        writable: layout.writable,
+                        elements: layout.elements,
                     },
                 )
             })
@@ -327,10 +340,10 @@ impl Known {
                         writable,
                         elements,
                     },
-                ) => !self.info.get(node).is_some_and(|info| {
-                    (shapes.is_none() || info.shapes == *shapes)
-                        && (!writable || info.writable)
-                        && (elements.is_none() || info.elements == *elements)
+                ) => !self.layouts.get(node).is_some_and(|layout| {
+                    (shapes.is_none() || layout.shapes == *shapes)
+                        && (!writable || layout.writable)
+                        && (elements.is_none() || layout.elements == *elements)
                 }),
                 (FactKey::Field(field), HeapFact::Field(value)) => {
                     self.fields.get(field) != Some(value)
@@ -896,10 +909,10 @@ impl<'a> Builder<'a> {
                     0 => allocation.prototype_root,
                     shape => shape,
                 };
-                let info = self.known.entry(receiver);
-                info.shapes = Some(smallvec::smallvec![shape]);
-                info.writable = true;
-                info.heap_object = true;
+                let layout = self.known.layout_entry(receiver);
+                layout.shapes = Some(smallvec::smallvec![shape]);
+                layout.writable = true;
+                self.known.entry(receiver).heap_object = true;
                 (receiver, closure, Some(receiver))
             }
         };
@@ -2500,12 +2513,12 @@ impl<'a> Builder<'a> {
             let value = self.add(Kind::LoadNamedProperty(byte_pc), &[object], Repr::Tagged);
             // Every program proved an ordinary receiver of one of its shapes.
             if let Some(shapes) = receiver_shapes {
-                let info = self.known.entry(object);
-                if info.shapes.is_none() {
-                    info.shapes = Some(shapes);
-                    info.writable = false;
+                let layout = self.known.layout_entry(object);
+                if layout.shapes.is_none() {
+                    layout.shapes = Some(shapes);
+                    layout.writable = false;
                 }
-                info.heap_object = true;
+                self.known.entry(object).heap_object = true;
             }
             return value;
         }
@@ -2526,8 +2539,8 @@ impl<'a> Builder<'a> {
         let receiver = self.read(instruction.reads[0]);
         let receivers = self
             .known
-            .get(receiver)
-            .and_then(|info| info.shapes.clone());
+            .layout(receiver)
+            .and_then(|layout| layout.shapes.clone());
         let Some(access) = (!self.exited_for(ExitReason::ShapeGuard))
             .then(|| {
                 super::feedback::own_data_store(
@@ -2560,9 +2573,9 @@ impl<'a> Builder<'a> {
             value,
         );
         // A slot write keeps the object's shape.
-        let info = self.known.entry(object);
-        info.shapes = Some(access.shapes.clone());
-        info.writable = true;
+        let layout = self.known.layout_entry(object);
+        layout.shapes = Some(access.shapes.clone());
+        layout.writable = true;
     }
 
     /// A named store that is not one existing own slot: a store through its
@@ -2628,10 +2641,10 @@ impl<'a> Builder<'a> {
                 };
                 self.known.fields.insert(key, value);
             }
-            let info = self.known.entry(object);
-            info.shapes = Some(shapes);
-            info.writable = true;
-            info.heap_object = true;
+            let layout = self.known.layout_entry(object);
+            layout.shapes = Some(shapes);
+            layout.writable = true;
+            self.known.entry(object).heap_object = true;
             return;
         }
         let atom = self
@@ -2666,10 +2679,10 @@ impl<'a> Builder<'a> {
 
     /// Prove `object` has one of `shapes`, unless already proved.
     fn check_shapes(&mut self, object: NodeId, shapes: &SmallVec<[u32; 4]>, writable: bool) {
-        if let Some(info) = self.known.get(object)
-            && let Some(known) = info.shapes.as_ref()
+        if let Some(layout) = self.known.layout(object)
+            && let Some(known) = layout.shapes.as_ref()
             && known.iter().all(|shape| shapes.contains(shape))
-            && (info.writable || !writable)
+            && (layout.writable || !writable)
         {
             return;
         }
@@ -2681,10 +2694,10 @@ impl<'a> Builder<'a> {
             &[object],
             Repr::None,
         );
-        let info = self.known.entry(object);
-        info.shapes = Some(shapes.clone());
-        info.writable = writable;
-        info.heap_object = true;
+        let layout = self.known.layout_entry(object);
+        layout.shapes = Some(shapes.clone());
+        layout.writable = writable;
+        self.known.entry(object).heap_object = true;
     }
 
     // ------------------------------------------------------------------
@@ -3264,9 +3277,9 @@ impl<'a> Builder<'a> {
     /// this path already did. A typed view is proved to keep a cached
     /// element base, which its storage then reads directly.
     fn elements_of(&mut self, receiver: NodeId, access: JitElementAccess) -> ElementStorage {
-        let info = self.known.get(receiver);
-        let proved = info.and_then(|info| info.elements) == Some(access);
-        if proved && let Some(storage) = info.and_then(|info| info.storage) {
+        let proved =
+            self.known.layout(receiver).and_then(|layout| layout.elements) == Some(access);
+        if proved && let Some(&storage) = self.known.storage.get(&receiver) {
             return storage;
         }
         let (base_byte, cached_base) = match access.base {
@@ -3305,10 +3318,9 @@ impl<'a> Builder<'a> {
             Repr::Word,
         );
         let storage = ElementStorage { length, base };
-        let info = self.known.entry(receiver);
-        info.elements = Some(access);
-        info.storage = Some(storage);
-        info.heap_object = true;
+        self.known.layout_entry(receiver).elements = Some(access);
+        self.known.storage.insert(receiver, storage);
+        self.known.entry(receiver).heap_object = true;
         storage
     }
 

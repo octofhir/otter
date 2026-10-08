@@ -24,6 +24,7 @@
 
 pub mod array_buffer;
 pub mod array_buffer_prototype;
+pub mod byte_storage;
 pub mod data_view;
 pub mod data_view_prototype;
 pub mod dispatch;

@@ -835,6 +835,13 @@ fn ab_transfer_inner(
                 reason: "buffer is detached".to_string(),
             });
         }
+        // §25.1.3.3 ArrayBufferCopyAndDetach step 7.
+        if buf.has_detach_key(scope.context().heap()) {
+            return Err(NativeError::TypeError {
+                name,
+                reason: "buffer cannot be detached".to_string(),
+            });
+        }
         let cur_len = buf.byte_length(scope.context().heap());
         let mut new_bytes = vec![0u8; new_len];
         let copy_len = new_len.min(cur_len);

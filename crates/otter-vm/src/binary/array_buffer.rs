@@ -74,14 +74,13 @@ pub struct LocalArrayBufferBodyGc {
     /// Raw bytes. Empty when detached.
     ///
     /// This Rust container is deliberately not part of any native
-    /// contract: `Vec`'s field order is unspecified, so compiled code
-    /// reads the cached [`Self::data`] / [`Self::byte_len`] pair
-    /// instead. Every path that can move or resize the allocation must
-    /// call [`Self::refresh_byte_cache`].
-    bytes: Vec<u8>,
+    /// contract: compiled code reads the cached [`Self::data`] /
+    /// [`Self::byte_len`] pair instead. Every path that can move or
+    /// resize the storage must call [`Self::refresh_byte_cache`].
+    bytes: super::byte_storage::ByteStorage,
     /// Always-current base of the byte storage, kept in a fixed body
-    /// field so compiled code can address bytes without knowing `Vec`
-    /// layout. The storage is a plain Rust allocation, so a moving
+    /// field so compiled code can address bytes without knowing the
+    /// container layout. The storage is off the GC heap, so a moving
     /// collection of the body leaves it valid; only growth, shrinkage,
     /// reallocation and detach change it. Null for empty or detached
     /// storage, which no access can reach because every access proves
@@ -92,6 +91,10 @@ pub struct LocalArrayBufferBodyGc {
     byte_len: std::cell::Cell<usize>,
     /// `true` after detach / transfer; once set, stays set per spec.
     pub detached: bool,
+    /// §25.1.3.5 `[[ArrayBufferDetachKey]]` is set: a host owns the storage
+    /// (an asm.js module's heap aliases it as WebAssembly memory), so every
+    /// DetachArrayBuffer throws a `TypeError` and the bytes never move.
+    pub detach_key: bool,
     /// `Some(n)` for a resizable buffer; `None` for a fixed-length
     /// buffer.
     pub max_byte_length: Option<usize>,
@@ -134,30 +137,41 @@ impl LocalArrayBufferBodyGc {
     /// that can move or resize the storage.
     #[inline]
     pub(crate) fn refresh_byte_cache(&self) {
-        self.data.set(if self.bytes.is_empty() {
+        let bytes = self.bytes.as_slice();
+        self.data.set(if bytes.is_empty() {
             std::ptr::null_mut()
         } else {
-            self.bytes.as_ptr().cast_mut()
+            bytes.as_ptr().cast_mut()
         });
-        self.byte_len.set(self.bytes.len());
+        self.byte_len.set(bytes.len());
     }
 
     /// Read-only view of the storage.
     #[inline]
     pub(crate) fn bytes(&self) -> &[u8] {
-        &self.bytes
+        self.bytes.as_slice()
     }
 
-    /// Mutable access to the storage that refreshes the cache afterwards,
-    /// so no caller can leave a stale base behind.
+    /// Mutable access to the bytes. Their length is fixed here; only
+    /// [`Self::resize_bytes`] and [`Self::clear_bytes`] change it.
     #[inline]
     pub(crate) fn with_bytes_mut<F, R>(&mut self, f: F) -> R
     where
-        F: FnOnce(&mut Vec<u8>) -> R,
+        F: FnOnce(&mut [u8]) -> R,
     {
-        let result = f(&mut self.bytes);
+        f(self.bytes.as_mut_slice())
+    }
+
+    /// Resize resizable storage, zero-filling growth, and refresh the cache.
+    pub(crate) fn resize_bytes(&mut self, new_len: usize) {
+        self.bytes.resize(new_len);
         self.refresh_byte_cache();
-        result
+    }
+
+    /// Release the storage (detach) and refresh the cache.
+    pub(crate) fn clear_bytes(&mut self) {
+        self.bytes.clear();
+        self.refresh_byte_cache();
     }
 
     /// Verifier for the always-current byte cache: the cached pair must
@@ -166,10 +180,11 @@ impl LocalArrayBufferBodyGc {
     /// Read paths assert it under `debug_assertions`.
     #[must_use]
     pub(crate) fn byte_cache_is_current(&self) -> bool {
-        if self.bytes.is_empty() {
+        let bytes = self.bytes.as_slice();
+        if bytes.is_empty() {
             return self.data.get().is_null() && self.byte_len.get() == 0;
         }
-        self.data.get() == self.bytes.as_ptr().cast_mut() && self.byte_len.get() == self.bytes.len()
+        self.data.get() == bytes.as_ptr().cast_mut() && self.byte_len.get() == bytes.len()
     }
 }
 
@@ -189,6 +204,19 @@ impl otter_gc::SafeTraceable for LocalArrayBufferBodyGc {
     }
 }
 
+/// The storage of a buffer keyed against detach (see
+/// [`JsArrayBuffer::key_against_detach`]).
+#[derive(Clone, Copy, Debug)]
+pub struct KeyedBytes {
+    /// Base of the bytes.
+    pub base: *mut u8,
+    /// Byte length.
+    pub len: usize,
+    /// The bytes sit at the start of a [`super::byte_storage::RESERVED_SPAN`]
+    /// reservation that reads as zero past them and faults past its guard.
+    pub reserved: bool,
+}
+
 /// 4-byte compressed GC handle to a [`LocalArrayBufferBodyGc`].
 /// `Copy`. Packs into [`crate::Value`] under `TAG_PTR_OBJECT`.
 pub type LocalArrayBufferHandle = otter_gc::Gc<LocalArrayBufferBodyGc>;
@@ -204,11 +232,21 @@ pub fn alloc_local_array_buffer(
     max_byte_length: Option<usize>,
     external: Option<otter_gc::ExternalMemory>,
 ) -> Result<LocalArrayBufferHandle, otter_gc::OutOfMemory> {
+    alloc_local_storage(heap, bytes.into(), max_byte_length, external)
+}
+
+fn alloc_local_storage(
+    heap: &mut otter_gc::GcHeap,
+    bytes: super::byte_storage::ByteStorage,
+    max_byte_length: Option<usize>,
+    external: Option<otter_gc::ExternalMemory>,
+) -> Result<LocalArrayBufferHandle, otter_gc::OutOfMemory> {
     let handle = heap.alloc_old(LocalArrayBufferBodyGc {
         bytes,
         data: std::cell::Cell::new(std::ptr::null_mut()),
         byte_len: std::cell::Cell::new(0),
         detached: false,
+        detach_key: false,
         max_byte_length,
         external,
         expando: None,
@@ -218,6 +256,15 @@ pub fn alloc_local_array_buffer(
     // and in any later collection — leaves the cached base valid.
     heap.with_payload(handle, |body| body.refresh_byte_cache());
     Ok(handle)
+}
+
+/// `false` when `bytes` exceed the heap's configured cap: no collection can
+/// ever make room, so §6.2.9.1 CreateByteDataBlock finds the block impossible
+/// to create and throws a `RangeError` — an allocation the cap *could* hold
+/// but cannot now remains an out-of-memory condition.
+fn fits_heap_cap(heap: &otter_gc::GcHeap, bytes: usize) -> bool {
+    let cap = heap.max_heap_bytes();
+    cap == 0 || (bytes as u64) <= cap
 }
 
 /// GC body for `SharedArrayBuffer` per ECMA-262 §25.2.
@@ -411,13 +458,22 @@ impl JsArrayBuffer {
         heap: &mut otter_gc::GcHeap,
         external_visit: &mut otter_gc::heap::RootSlotVisitor<'_>,
     ) -> Result<Option<Self>, otter_gc::OutOfMemory> {
-        let external = heap.reserve_external_with_roots(len as u64, external_visit)?;
-        let mut bytes: Vec<u8> = Vec::new();
-        if bytes.try_reserve_exact(len).is_err() {
+        if !fits_heap_cap(heap, len) {
             return Ok(None);
         }
-        bytes.resize(len, 0u8);
-        let handle = alloc_local_array_buffer(heap, bytes, None, Some(external))?;
+        let external = heap.reserve_external_with_roots(len as u64, external_visit)?;
+        let bytes = match super::byte_storage::ByteStorage::reserved_zeroed(len) {
+            Some(reserved) => reserved,
+            None => {
+                let mut bytes: Vec<u8> = Vec::new();
+                if bytes.try_reserve_exact(len).is_err() {
+                    return Ok(None);
+                }
+                bytes.resize(len, 0u8);
+                bytes.into()
+            }
+        };
+        let handle = alloc_local_storage(heap, bytes, None, Some(external))?;
         Ok(Some(Self::wrap_local(handle)))
     }
 
@@ -431,6 +487,9 @@ impl JsArrayBuffer {
         heap: &mut otter_gc::GcHeap,
         external_visit: &mut otter_gc::heap::RootSlotVisitor<'_>,
     ) -> Result<Option<Self>, otter_gc::OutOfMemory> {
+        if !fits_heap_cap(heap, max_byte_length) {
+            return Ok(None);
+        }
         let external = heap.reserve_external_with_roots(max_byte_length as u64, external_visit)?;
         let mut bytes: Vec<u8> = Vec::new();
         if bytes.try_reserve_exact(max_byte_length).is_err() {
@@ -461,6 +520,9 @@ impl JsArrayBuffer {
         heap: &mut otter_gc::GcHeap,
         external_visit: &mut otter_gc::heap::RootSlotVisitor<'_>,
     ) -> Result<Option<Self>, otter_gc::OutOfMemory> {
+        if !fits_heap_cap(heap, len) {
+            return Ok(None);
+        }
         let external = heap.reserve_shared_external_with_roots(len as u64, external_visit)?;
         let mut bytes: Vec<u8> = Vec::new();
         if bytes.try_reserve_exact(len).is_err() {
@@ -485,6 +547,9 @@ impl JsArrayBuffer {
         heap: &mut otter_gc::GcHeap,
         external_visit: &mut otter_gc::heap::RootSlotVisitor<'_>,
     ) -> Result<Option<Self>, otter_gc::OutOfMemory> {
+        if !fits_heap_cap(heap, max_byte_length) {
+            return Ok(None);
+        }
         let external =
             heap.reserve_shared_external_with_roots(max_byte_length as u64, external_visit)?;
         let mut bytes: Vec<u8> = Vec::new();
@@ -633,6 +698,48 @@ impl JsArrayBuffer {
         }
     }
 
+    /// `true` when §25.1.3.5 `[[ArrayBufferDetachKey]]` is set, so
+    /// DetachArrayBuffer must throw a `TypeError`. Shared buffers never
+    /// detach and carry no key.
+    #[must_use]
+    pub fn has_detach_key(self, heap: &otter_gc::GcHeap) -> bool {
+        match self.storage {
+            BufferStorage::Local(h) => heap.read_payload(h, |body| body.detach_key),
+            BufferStorage::Shared(_) => false,
+        }
+    }
+
+    /// `true` when a local buffer's bytes start a reservation (see
+    /// [`KeyedBytes::reserved`]).
+    #[must_use]
+    pub fn has_reserved_storage(self, heap: &otter_gc::GcHeap) -> bool {
+        match self.storage {
+            BufferStorage::Local(h) => heap.read_payload(h, |body| body.bytes.is_reserved()),
+            BufferStorage::Shared(_) => false,
+        }
+    }
+
+    /// Key a fixed-length local buffer against detach and return its stable
+    /// storage: it then never moves, resizes or empties for the buffer's
+    /// lifetime, so a host may alias it. `None` for shared, resizable,
+    /// detached or empty storage.
+    pub fn key_against_detach(self, heap: &mut otter_gc::GcHeap) -> Option<KeyedBytes> {
+        let BufferStorage::Local(h) = self.storage else {
+            return None;
+        };
+        heap.with_payload(h, |body| {
+            if body.detached || body.max_byte_length.is_some() || body.bytes().is_empty() {
+                return None;
+            }
+            body.detach_key = true;
+            Some(KeyedBytes {
+                base: body.data.get(),
+                len: body.byte_len.get(),
+                reserved: body.bytes.is_reserved(),
+            })
+        })
+    }
+
     /// Closure-style read over the byte buffer. Callers must check
     /// [`Self::is_detached`] first; a detached buffer yields an
     /// empty slice. The closure runs under the heap borrow — never
@@ -661,31 +768,32 @@ impl JsArrayBuffer {
     /// check [`Self::is_detached`] first.
     pub fn with_bytes_mut<F, R>(self, heap: &mut otter_gc::GcHeap, f: F) -> R
     where
-        F: FnOnce(&mut Vec<u8>) -> R,
+        F: FnOnce(&mut [u8]) -> R,
     {
         match self.storage {
             BufferStorage::Local(h) => heap.with_payload(h, |body| body.with_bytes_mut(f)),
             BufferStorage::Shared(h) => {
                 let arc = heap.read_payload(h, |body| body.inner.clone());
                 let mut guard = arc.bytes.lock().expect("SharedArrayBuffer mutex poisoned");
-                f(&mut guard)
+                f(&mut guard[..])
             }
         }
     }
 
     /// Detach the buffer. Idempotent; subsequent calls are no-ops.
     /// `SharedArrayBuffer` rejects detach per §25.2.4.1 step 2 —
-    /// the call is a no-op there. Callers go through
-    /// [`crate::Interpreter::detach_array_buffer`], which first invalidates
-    /// the isolate's detach protector.
+    /// the call is a no-op there, as it is for a keyed buffer whose callers
+    /// already threw (see [`Self::has_detach_key`]): its storage stays
+    /// aliased. Callers go through [`crate::Interpreter::detach_array_buffer`],
+    /// which first invalidates the isolate's detach protector.
     pub(crate) fn detach(self, heap: &mut otter_gc::GcHeap) {
         let BufferStorage::Local(h) = self.storage else {
             return;
         };
         heap.with_payload(h, |body| {
-            if !body.detached {
+            if !body.detached && !body.detach_key {
                 body.detached = true;
-                body.with_bytes_mut(Vec::clear);
+                body.clear_bytes();
                 let _ = body.external.take();
             }
         });
@@ -710,7 +818,7 @@ impl JsArrayBuffer {
             if new_len > max {
                 return false;
             }
-            body.with_bytes_mut(|bytes| bytes.resize(new_len, 0u8));
+            body.resize_bytes(new_len);
             true
         })
     }
@@ -887,22 +995,45 @@ mod tests {
         let buffer = JsArrayBuffer::new(&mut heap, 8).expect("buffer");
         assert_cache_current(buffer, &heap, "fresh");
 
-        // A push past capacity reallocates, which is exactly the case a raw
-        // `Vec`-first-word read would get wrong.
-        buffer.with_bytes_mut(&mut heap, |bytes| {
-            bytes.reserve_exact(0);
-            for value in 0..4096u32 {
-                bytes.push(value as u8);
-            }
-        });
-        assert_cache_current(buffer, &heap, "after reallocating push");
-
-        buffer.with_bytes_mut(&mut heap, |bytes| bytes.truncate(2));
-        assert_cache_current(buffer, &heap, "after truncate");
+        buffer.with_bytes_mut(&mut heap, |bytes| bytes.fill(7));
+        assert_cache_current(buffer, &heap, "after a write");
 
         buffer.detach(&mut heap);
         assert_cache_current(buffer, &heap, "after detach");
         assert!(buffer.is_detached(&heap), "detach must stick");
+    }
+
+    #[test]
+    fn large_heap_shaped_buffers_sit_in_a_reservation() {
+        let mut heap = otter_gc::GcHeap::new().expect("heap");
+        let mut closure = |_: &mut dyn FnMut(*mut otter_gc::compressed::RawGc)| {};
+        let visitor: &mut otter_gc::heap::RootSlotVisitor<'_> = &mut &mut closure;
+        let len = 1 << 24;
+        let buffer = JsArrayBuffer::try_new_with_roots(len, &mut heap, visitor)
+            .expect("reservation")
+            .expect("buffer");
+        assert_cache_current(buffer, &heap, "fresh reserved");
+        buffer.with_bytes_mut(&mut heap, |bytes| {
+            assert!(bytes.iter().all(|byte| *byte == 0));
+            bytes[len - 1] = 9;
+        });
+        let keyed = buffer.key_against_detach(&mut heap).expect("keyed");
+        assert_eq!(keyed.len, len);
+        if cfg!(all(unix, target_pointer_width = "64")) {
+            assert!(keyed.reserved);
+            // SAFETY: the reservation reads as zero past the buffer.
+            let past = unsafe { keyed.base.add(len + 4096).read() };
+            assert_eq!(past, 0);
+        }
+        buffer.detach(&mut heap);
+        assert!(!buffer.is_detached(&heap), "a keyed buffer never detaches");
+        assert_eq!(buffer.with_bytes(&heap, |bytes| bytes[len - 1]), 9);
+
+        let unkeyed = JsArrayBuffer::try_new_with_roots(len, &mut heap, visitor)
+            .expect("reservation")
+            .expect("buffer");
+        unkeyed.detach(&mut heap);
+        assert_cache_current(unkeyed, &heap, "after unmapping detach");
     }
 
     #[test]

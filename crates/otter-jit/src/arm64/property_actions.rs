@@ -102,23 +102,43 @@ fn key(
             dynasm!(ops ; .arch aarch64 ; mov W(base), W(atom) ; mul x17, X(base), x17);
         }
     }
-    dynasm!(ops ; .arch aarch64 ; eor X(entry), X(entry), x17 ; lsr X(entry), X(entry), #u32::from(cache.hash_shift));
-    emit_load_u64(ops, 17, u64::from(cache.set_mask));
-    dynasm!(ops ; .arch aarch64 ; and X(entry), X(entry), x17);
-    emit_load_u64(
-        ops,
-        17,
-        u64::from(cache.entry_bytes) * u64::from(cache.ways),
-    );
-    dynasm!(ops ; .arch aarch64 ; mul X(entry), X(entry), x17);
-    emit_load_symbol_u64(
-        ops,
-        relocations,
-        17,
-        cache.table_addr as u64,
-        RelocationTarget::PropertyActionCacheTable,
-    );
-    dynasm!(ops ; .arch aarch64 ; add X(entry), X(entry), x17);
+    dynasm!(ops ; .arch aarch64 ; eor X(entry), X(entry), x17);
+    let set_bits = (cache.set_mask + 1).trailing_zeros();
+    let stride = u64::from(cache.entry_bytes) * u64::from(cache.ways);
+    let fused = (cache.set_mask + 1).is_power_of_two()
+        && set_bits != 0
+        && u32::from(cache.hash_shift) + set_bits <= 64
+        && stride.is_power_of_two()
+        && stride.trailing_zeros() < 64;
+    if fused {
+        // Set index = hash bits [shift, shift + set_bits), scaled by the
+        // power-of-two set stride into the table.
+        dynasm!(ops ; .arch aarch64
+            ; ubfx X(entry), X(entry), u32::from(cache.hash_shift), set_bits);
+        emit_load_symbol_u64(
+            ops,
+            relocations,
+            17,
+            cache.table_addr as u64,
+            RelocationTarget::PropertyActionCacheTable,
+        );
+        dynasm!(ops ; .arch aarch64
+            ; add X(entry), x17, X(entry), lsl stride.trailing_zeros());
+    } else {
+        dynasm!(ops ; .arch aarch64 ; lsr X(entry), X(entry), #u32::from(cache.hash_shift));
+        emit_load_u64(ops, 17, u64::from(cache.set_mask));
+        dynasm!(ops ; .arch aarch64 ; and X(entry), X(entry), x17);
+        emit_load_u64(ops, 17, stride);
+        dynasm!(ops ; .arch aarch64 ; mul X(entry), X(entry), x17);
+        emit_load_symbol_u64(
+            ops,
+            relocations,
+            17,
+            cache.table_addr as u64,
+            RelocationTarget::PropertyActionCacheTable,
+        );
+        dynasm!(ops ; .arch aarch64 ; add X(entry), X(entry), x17);
+    }
     emit_load_u64(ops, base, u64::from(cache.ways));
     let way = ops.new_dynamic_label();
     let next = ops.new_dynamic_label();

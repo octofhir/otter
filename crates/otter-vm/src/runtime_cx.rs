@@ -2025,6 +2025,48 @@ impl<'scope, 'rt> NativeScope<'scope, 'rt> {
         result.map_err(|error| self.vm_error(error, "NativeScope::array"))
     }
 
+    /// `ArrayCreate`: an array of `len` holes holding `elements` at their
+    /// indices, whose prototype is `prototype` unless that is the realm's
+    /// `%Array.prototype%`. Every step re-reads the array from its handle, so
+    /// no allocation strands a stale array.
+    pub(crate) fn array_create(
+        &mut self,
+        len: usize,
+        elements: &[Local<'_>],
+        prototype: Option<Local<'_>>,
+    ) -> Result<Local<'scope>, NativeError> {
+        let interp = &mut *self.ctx.cx.interp;
+        let array = interp
+            .scoped_array(self.token, len.max(elements.len()))
+            .map_err(|error| native_function::vm_to_native_error(interp, error, "Array"))?;
+        for (index, element) in elements.iter().enumerate() {
+            interp
+                .scoped_set_index(self.token, array, index, *element)
+                .map_err(|error| native_function::vm_to_native_error(interp, error, "Array"))?;
+        }
+        if let Some(prototype) = prototype {
+            let prototype = interp.escape_scoped(prototype);
+            let default = !interp.active_realm_is_extra
+                && interp
+                    .realm_intrinsics
+                    .array_prototype()
+                    .is_some_and(|realm| Value::object(realm).to_bits() == prototype.to_bits());
+            if !default {
+                let target = interp
+                    .escape_scoped(array)
+                    .as_array()
+                    .expect("ArrayCreate made an array");
+                array::set_prototype_override(target, &mut interp.gc_heap, Some(prototype)).map_err(
+                    |_| NativeError::TypeError {
+                        name: "Array",
+                        reason: "out of memory while setting array prototype".to_owned(),
+                    },
+                )?;
+            }
+        }
+        Ok(array)
+    }
+
     /// Allocate an `ArrayBuffer` owning `bytes` and root it in this scope.
     pub fn array_buffer_from_bytes(
         &mut self,

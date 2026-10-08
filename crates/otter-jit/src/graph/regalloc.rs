@@ -217,6 +217,8 @@ impl Allocation {
 #[derive(Debug, Clone)]
 struct RegisterFile {
     values: [Option<NodeId>; 32],
+    /// Registers holding a value, as a mask of [`Self::values`].
+    occupied: u32,
     blocked: u32,
     allocatable: u32,
 }
@@ -225,16 +227,21 @@ impl RegisterFile {
     fn new(registers: &[u8]) -> Self {
         Self {
             values: [None; 32],
+            occupied: 0,
             blocked: 0,
             allocatable: registers.iter().fold(0, |mask, &r| mask | (1 << r)),
         }
     }
 
-    fn free_unblocked(&self) -> impl Iterator<Item = u8> + '_ {
-        (0..32u8).filter(move |&r| {
-            self.allocatable & (1 << r) != 0
-                && self.values[r as usize].is_none()
-                && self.blocked & (1 << r) == 0
+    /// Free, unblocked allocatable registers, lowest first.
+    fn free_unblocked(&self) -> impl Iterator<Item = u8> + use<> {
+        let mut free = self.allocatable & !self.occupied & !self.blocked;
+        std::iter::from_fn(move || {
+            (free != 0).then(|| {
+                let register = free.trailing_zeros() as u8;
+                free &= free - 1;
+                register
+            })
         })
     }
 
@@ -243,11 +250,24 @@ impl RegisterFile {
     }
 }
 
+/// One value's registers and its use positions.
+#[derive(Debug, Clone, Copy, Default)]
 struct ValueState {
     gp: u32,
     fp: u32,
-    /// Sorted use positions.
-    uses: Vec<u32>,
+    /// Its sorted, distinct use positions are `positions[first_use..][..use_count]`.
+    first_use: u32,
+    use_count: u32,
+    /// The last back edge of a loop the value is defined before and used
+    /// in, which keeps it live through every iteration; zero when none.
+    loop_end: u32,
+}
+
+impl ValueState {
+    /// Whether anything reads the value.
+    const fn is_used(self) -> bool {
+        self.use_count != 0
+    }
 }
 
 struct Allocator<'g> {
@@ -255,8 +275,11 @@ struct Allocator<'g> {
     graph: &'g Graph,
     layout: &'g [BlockId],
     position: Vec<u32>,
-    block_start: FxHashMap<BlockId, u32>,
-    values: FxHashMap<NodeId, ValueState>,
+    block_start: Vec<u32>,
+    /// Per node, indexed by its id.
+    values: Vec<ValueState>,
+    /// Every value's use positions, grouped by value.
+    positions: Vec<u32>,
     gp: RegisterFile,
     fp: RegisterFile,
     out: Allocation,
@@ -266,8 +289,9 @@ struct Allocator<'g> {
     /// Spilled values by the position of their last use, earliest first:
     /// each slot is released once, when the walk passes that use.
     expiries: std::collections::BinaryHeap<std::cmp::Reverse<(u32, u32)>>,
-    entry_states: FxHashMap<BlockId, Vec<(NodeId, Location)>>,
-    exit_states: FxHashMap<BlockId, Vec<(NodeId, Location)>>,
+    /// Per block, indexed by its id.
+    entry_states: Vec<Option<Vec<(NodeId, Location)>>>,
+    exit_states: Vec<Option<Vec<(NodeId, Location)>>>,
     current: NodeId,
     /// Control-flow liveness, including deopt frame-state uses.
     liveness: super::liveness::Liveness,
@@ -297,8 +321,9 @@ pub(crate) fn allocate(
         graph,
         layout,
         position: vec![NO_POSITION; graph.nodes.len()],
-        block_start: FxHashMap::default(),
-        values: FxHashMap::default(),
+        block_start: vec![NO_POSITION; graph.blocks.len()],
+        values: vec![ValueState::default(); graph.nodes.len()],
+        positions: Vec::new(),
         gp: RegisterFile::new(registers.general),
         fp: RegisterFile::new(registers.floating),
         out: Allocation {
@@ -308,8 +333,8 @@ pub(crate) fn allocate(
         free_tagged: Vec::new(),
         free_untagged: Vec::new(),
         expiries: std::collections::BinaryHeap::new(),
-        entry_states: FxHashMap::default(),
-        exit_states: FxHashMap::default(),
+        entry_states: vec![None; graph.blocks.len()],
+        exit_states: vec![None; graph.blocks.len()],
         current: NodeId(0),
         liveness: super::liveness::Liveness::compute(graph, layout),
         planned: false,
@@ -321,15 +346,15 @@ pub(crate) fn allocate(
     allocator.out = homes;
     allocator.gp = RegisterFile::new(registers.general);
     allocator.fp = RegisterFile::new(registers.floating);
-    for state in allocator.values.values_mut() {
+    for state in &mut allocator.values {
         state.gp = 0;
         state.fp = 0;
     }
     allocator.free_tagged.clear();
     allocator.free_untagged.clear();
     allocator.expiries.clear();
-    allocator.entry_states.clear();
-    allocator.exit_states.clear();
+    allocator.entry_states.fill(None);
+    allocator.exit_states.fill(None);
     allocator.planned = true;
     allocator.walk();
     allocator.plan_rooted_tagged_homes();
@@ -403,7 +428,7 @@ impl<'g> Allocator<'g> {
         let mut next = 1u32;
         for &block in self.layout {
             let data = self.graph.block(block);
-            self.block_start.insert(block, next);
+            self.block_start[block.0 as usize] = next;
             for &phi in &data.phis {
                 self.position[phi.0 as usize] = next;
             }
@@ -423,20 +448,9 @@ impl<'g> Allocator<'g> {
         self.position[node.0 as usize]
     }
 
-    fn add_use(&mut self, value: NodeId, at: u32) {
-        self.values
-            .entry(value)
-            .or_insert_with(|| ValueState {
-                gp: 0,
-                fp: 0,
-                uses: Vec::new(),
-            })
-            .uses
-            .push(at);
-    }
-
     fn collect_uses(&mut self) {
         let graph = self.graph;
+        let mut uses: Vec<(u32, u32)> = Vec::new();
         for &block in self.layout {
             let data = graph.block(block);
             for (index, &predecessor) in data.predecessors.iter().enumerate() {
@@ -446,7 +460,7 @@ impl<'g> Allocator<'g> {
                 let at = self.pos(control);
                 for &phi in &data.phis {
                     if let Some(&input) = graph.node(phi).inputs.get(index) {
-                        self.add_use(input, at);
+                        uses.push((input.0, at));
                     }
                 }
             }
@@ -454,16 +468,32 @@ impl<'g> Allocator<'g> {
                 let at = self.pos(node);
                 let data = graph.node(node);
                 for &input in &data.inputs {
-                    self.add_use(input, at);
+                    uses.push((input.0, at));
                 }
                 for state in data.eager.iter().chain(data.lazy.iter()) {
                     for value in graph.state_values(*state) {
                         if value != node {
-                            self.add_use(value, at);
+                            uses.push((value.0, at));
                         }
                     }
                 }
             }
+        }
+        // Group the positions by value in one flat array, each group sorted
+        // and distinct.
+        uses.sort_unstable();
+        uses.dedup();
+        self.positions = uses.iter().map(|&(_, at)| at).collect();
+        let mut index = 0;
+        while index < uses.len() {
+            let value = uses[index].0;
+            let first = index;
+            while index < uses.len() && uses[index].0 == value {
+                index += 1;
+            }
+            let state = &mut self.values[value as usize];
+            state.first_use = first as u32;
+            state.use_count = (index - first) as u32;
         }
         // A value used inside a loop but defined before it stays live until
         // every back edge of the loop.
@@ -473,7 +503,7 @@ impl<'g> Allocator<'g> {
             if !data.is_loop {
                 continue;
             }
-            let start = self.block_start[&block];
+            let start = self.block_start[block.0 as usize];
             let end = data
                 .predecessors
                 .iter()
@@ -485,30 +515,29 @@ impl<'g> Allocator<'g> {
                 loops.push((start, end));
             }
         }
-        for state in self.values.values_mut() {
-            state.uses.sort_unstable();
-            state.uses.dedup();
+        if loops.is_empty() {
+            return;
         }
-        let definitions: Vec<(NodeId, u32)> = self
-            .values
-            .keys()
-            .map(|&value| (value, self.pos(value)))
+        let used: Vec<u32> = (0..self.values.len() as u32)
+            .filter(|&value| self.values[value as usize].is_used())
             .collect();
-        // Uses stay sorted: an extension only ever appends a new last use.
+        // An extension may make a value used inside an enclosing loop.
         loop {
             let mut changed = false;
             for &(start, end) in &loops {
-                for &(value, defined) in &definitions {
-                    let defined_before = defined == NO_POSITION || defined < start;
-                    if !defined_before {
+                for &value in &used {
+                    let defined = self.position[value as usize];
+                    if defined != NO_POSITION && defined >= start {
                         continue;
                     }
-                    let state = self.values.get_mut(&value).expect("a used value");
-                    let first_inside = state.uses.partition_point(|&at| at < start);
-                    let used_inside = state.uses.get(first_inside).is_some_and(|&at| at <= end);
-                    let last = state.uses.last().copied().unwrap_or(0);
+                    let loop_end = self.values[value as usize].loop_end;
+                    let uses = self.uses_of(NodeId(value));
+                    let first_inside = uses.partition_point(|&at| at < start);
+                    let used_inside = uses.get(first_inside).is_some_and(|&at| at <= end)
+                        || (start..=end).contains(&loop_end);
+                    let last = uses.last().copied().unwrap_or(0).max(loop_end);
                     if used_inside && last < end {
-                        state.uses.push(end);
+                        self.values[value as usize].loop_end = end;
                         changed = true;
                     }
                 }
@@ -519,18 +548,29 @@ impl<'g> Allocator<'g> {
         }
     }
 
+    /// The sorted, distinct positions that read `value`.
+    fn uses_of(&self, value: NodeId) -> &[u32] {
+        let state = self.values[value.0 as usize];
+        &self.positions[state.first_use as usize..][..state.use_count as usize]
+    }
+
     fn last_use(&self, value: NodeId) -> u32 {
-        self.values
-            .get(&value)
-            .and_then(|state| state.uses.last().copied())
+        let state = self.values[value.0 as usize];
+        self.uses_of(value)
+            .last()
+            .copied()
             .unwrap_or(0)
+            .max(state.loop_end)
     }
 
     /// Next use of `value` strictly after `at`, if any.
     fn next_use_after(&self, value: NodeId, at: u32) -> Option<u32> {
-        let state = self.values.get(&value)?;
-        let index = state.uses.partition_point(|&use_at| use_at <= at);
-        state.uses.get(index).copied()
+        let uses = self.uses_of(value);
+        let index = uses.partition_point(|&use_at| use_at <= at);
+        uses.get(index).copied().or_else(|| {
+            let loop_end = self.values[value.0 as usize].loop_end;
+            (loop_end > at).then_some(loop_end)
+        })
     }
 
     fn is_live_after(&self, value: NodeId, at: u32) -> bool {
@@ -550,13 +590,12 @@ impl<'g> Allocator<'g> {
     }
 
     fn registers_of(&self, value: NodeId) -> u32 {
-        self.values.get(&value).map_or(0, |state| {
-            if self.graph.node(value).repr.is_float() {
-                state.fp
-            } else {
-                state.gp
-            }
-        })
+        let state = self.values[value.0 as usize];
+        if self.graph.node(value).repr.is_float() {
+            state.fp
+        } else {
+            state.gp
+        }
     }
 
     fn register_location(float: bool, register: u8) -> Location {
@@ -588,8 +627,11 @@ impl<'g> Allocator<'g> {
 
     fn bind(&mut self, value: NodeId, register: u8) {
         let float = self.is_float(value);
-        self.file(float).values[register as usize] = Some(value);
-        let state = self.values.get_mut(&value).expect("a tracked value");
+        let file = self.file(float);
+        file.values[register as usize] = Some(value);
+        file.occupied |= 1 << register;
+        let state = &mut self.values[value.0 as usize];
+        debug_assert!(state.is_used(), "a bound value is read");
         if float {
             state.fp |= 1 << register;
         } else {
@@ -598,15 +640,16 @@ impl<'g> Allocator<'g> {
     }
 
     fn unbind(&mut self, float: bool, register: u8) {
-        let Some(value) = self.file(float).values[register as usize].take() else {
+        let file = self.file(float);
+        let Some(value) = file.values[register as usize].take() else {
             return;
         };
-        if let Some(state) = self.values.get_mut(&value) {
-            if float {
-                state.fp &= !(1 << register);
-            } else {
-                state.gp &= !(1 << register);
-            }
+        file.occupied &= !(1 << register);
+        let state = &mut self.values[value.0 as usize];
+        if float {
+            state.fp &= !(1 << register);
+        } else {
+            state.gp &= !(1 << register);
         }
     }
 
@@ -810,7 +853,7 @@ impl<'g> Allocator<'g> {
         let graph = self.graph;
         for (layout_index, &block) in self.layout.iter().enumerate() {
             let data = graph.block(block);
-            let start = self.block_start[&block];
+            let start = self.block_start[block.0 as usize];
             if layout_index != 0 {
                 self.restore_entry_state(block, start);
             }
@@ -836,7 +879,7 @@ impl<'g> Allocator<'g> {
             self.unbind(false, register);
             self.unbind(true, register);
         }
-        let Some(state) = self.entry_states.get(&block).cloned() else {
+        let Some(state) = self.entry_states[block.0 as usize].clone() else {
             return;
         };
         for (value, location) in state {
@@ -852,7 +895,7 @@ impl<'g> Allocator<'g> {
 
     fn allocate_phi(&mut self, phi: NodeId, block: BlockId) {
         let float = self.is_float(phi);
-        if !self.values.contains_key(&phi) {
+        if !self.values[phi.0 as usize].is_used() {
             // A phi nothing reads.
             self.out.nodes[phi.0 as usize].skipped = true;
             return;
@@ -860,7 +903,7 @@ impl<'g> Allocator<'g> {
         let first = self.graph.block(block).predecessors.first().copied();
         let preferred = first.and_then(|predecessor| {
             let input = *self.graph.node(phi).inputs.first()?;
-            let exit = self.exit_states.get(&predecessor)?;
+            let exit = self.exit_states[predecessor.0 as usize].as_ref()?;
             exit.iter()
                 .find(|(value, _)| *value == input)
                 .and_then(|(_, location)| match *location {
@@ -993,7 +1036,7 @@ impl<'g> Allocator<'g> {
         if data.repr != Repr::None
             && !properties.effectful
             && !properties.eager_deopt
-            && !self.values.contains_key(&node)
+            && !self.values[node.0 as usize].is_used()
         {
             self.out.nodes[node.0 as usize].skipped = true;
             return;
@@ -1082,7 +1125,7 @@ impl<'g> Allocator<'g> {
                 }
                 ResultPolicy::Register | ResultPolicy::None => self.take_register(float),
             };
-            if self.values.contains_key(&node) {
+            if self.values[node.0 as usize].is_used() {
                 self.bind(node, register);
             }
             self.block_register(float, register);
@@ -1221,7 +1264,7 @@ impl<'g> Allocator<'g> {
         let snapshot = self.snapshot();
         self.release_dead(at);
         for target in targets {
-            let target_start = self.block_start[&target];
+            let target_start = self.block_start[target.0 as usize];
             let live: Vec<(NodeId, Location)> = snapshot
                 .iter()
                 .copied()
@@ -1233,7 +1276,7 @@ impl<'g> Allocator<'g> {
                 exit.push((input, location));
                 edge.phi_inputs.push((phi, location));
             }
-            if let Some(entry) = self.entry_states.get(&target) {
+            if let Some(entry) = &self.entry_states[target.0 as usize] {
                 // A later predecessor recreates the target's entry state. A
                 // value this path never defined cannot be read there.
                 for &(value, to) in entry {
@@ -1261,9 +1304,9 @@ impl<'g> Allocator<'g> {
                     }
                 }
             } else {
-                self.entry_states.insert(target, live);
+                self.entry_states[target.0 as usize] = Some(live);
             }
-            self.exit_states.insert(block, exit);
+            self.exit_states[block.0 as usize] = Some(exit);
             self.out.edges.insert((block, target), edge);
         }
     }

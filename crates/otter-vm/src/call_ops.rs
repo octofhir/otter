@@ -486,8 +486,16 @@ impl Interpreter {
         let tail_safe = !self.frame_has_suspension_owner(frame) && !frame.is_construct();
         let return_destination = frame.return_destination;
         let return_anchor = (frame.caller, frame.caller_return_pc);
+        // A proxy's own steps throw in the realm of the code calling it: a
+        // transfer that would leave a caller of another realm current keeps
+        // this activation instead.
+        let realm_kept = self.calling_realm(Some(frame))
+            == self.calling_realm(top_idx.checked_sub(1).map(|below| &stack[below]));
         self.do_call_inner(stack, ArgumentOperands::execution(function, instruction))?;
-        if tail_safe && let Some(request) = stack.staged_request_mut() {
+        if tail_safe
+            && let Some(request) = stack.staged_request_mut()
+            && (realm_kept || request.callee.as_proxy().is_none())
+        {
             request.return_destination = return_destination;
             request.caller = return_anchor.0;
             request.caller_return_pc = return_anchor.1;

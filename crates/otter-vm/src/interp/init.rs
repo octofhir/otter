@@ -1198,6 +1198,17 @@ impl Interpreter {
             .unwrap_or(0)
     }
 
+    /// The realm of the code a bytecode `frame` runs, the current execution
+    /// context's realm for what that code throws; the active realm without a
+    /// frame or for an unregistered function.
+    #[inline]
+    pub(crate) fn calling_realm(&self, frame: Option<&crate::Frame>) -> u32 {
+        frame
+            .and_then(|frame| self.function_realm_ids.get(&frame.function_id))
+            .copied()
+            .unwrap_or(self.active_realm_id)
+    }
+
     /// The realm a bytecode frame's globals resolve in, when it differs from
     /// the active realm. `None` on the overwhelmingly common same-realm path;
     /// an unregistered function belongs to the default realm.

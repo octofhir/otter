@@ -278,7 +278,8 @@ impl Interpreter {
         {
             return Some(atom);
         }
-        let atom = self.names.lookup(&key.to_lossy_string(&self.gc_heap));
+        // A lone surrogate spells no atom; a lossy spelling would alias U+FFFD.
+        let atom = self.names.lookup(&key.to_well_formed_string(&self.gc_heap)?);
         if atom == crate::property_atom::AtomId::NONE {
             return None;
         }

@@ -386,6 +386,14 @@ pub(crate) enum Kind {
     StoreKeyedCached {
         pc: u32,
     },
+    /// `[[Get]]` of key input1 of receiver input0 at the element load site
+    /// `pc`, as V8's generic keyed load: an in-bounds element of an Array's
+    /// dense storage of whatever kind it has, a name key through the
+    /// isolate's shared property table, else the committed source operation
+    /// in the runtime (holes, accessors, strings, typed arrays, proxies).
+    LoadKeyedCached {
+        pc: u32,
+    },
     /// Tagged word at `[input0 + offset]` (input0 a `Word` base or a tagged
     /// cell address).
     LoadTaggedField(i32),
@@ -738,6 +746,7 @@ impl Kind {
             Self::LoadPropertyCached { .. }
             | Self::StorePropertyCached { .. }
             | Self::StoreKeyedCached { .. }
+            | Self::LoadKeyedCached { .. }
             | Self::Instanceof
             | Self::LooseEqual { .. }
             | Self::NewObject
@@ -995,6 +1004,13 @@ impl Kind {
                 result: ResultPolicy::None,
                 gp_temps: 2,
                 fp_temps: 0,
+                fixed_gp_clobbers: SmallVec::new(),
+            },
+            Self::LoadKeyedCached { .. } => Constraints {
+                inputs: registers(2),
+                result: ResultPolicy::Register,
+                gp_temps: 2,
+                fp_temps: 1,
                 fixed_gp_clobbers: SmallVec::new(),
             },
             Self::Int32Div | Self::Int32Mod => {

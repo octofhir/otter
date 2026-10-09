@@ -45,8 +45,8 @@ pub(crate) fn frame_semantic_source(
     let function = owner
         .exec_function(source.function_id)
         .ok_or(VmError::InvalidOperand)?;
-    let pc = (0..function.code.len())
-        .find(|&pc| function.instruction_byte_pc(pc) == Some(source.byte_pc))
+    let pc = function
+        .instruction_at_byte_pc(source.byte_pc)
         .and_then(|pc| u32::try_from(pc).ok())
         .ok_or(VmError::InvalidOperand)?;
     Ok((source.function_id, pc))

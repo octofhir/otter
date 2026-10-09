@@ -28,6 +28,7 @@ impl Codegen<'_> {
         if self.emit_elements(node)?
             || self.emit_properties(node)?
             || self.emit_keyed_store(node)?
+            || self.emit_keyed_load(node)?
         {
             return Ok(true);
         }

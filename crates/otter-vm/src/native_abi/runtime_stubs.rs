@@ -1780,6 +1780,7 @@ pub const fn runtime_stub_name(id: super::RuntimeStubId) -> &'static str {
         98 => "constructor_receiver_commit",
         99 => "bigint_binary_alloc",
         100 => "instanceof_leaf",
+        101 => "string_key_atom_leaf",
         _ => "unknown_runtime_stub",
     }
 }
@@ -1897,6 +1898,21 @@ pub const STUB_INSTANCEOF_LEAF: RuntimeStubDescriptor = descriptor(
     NativeResultDomain::Probe,
 );
 
+/// Leaf `TryInternalizeString` for a keyed access: the interned atom of a
+/// flat string key's content, read through the isolate's name interner
+/// (the first word is the `VmThread`). Never allocates; a rope, a lone
+/// surrogate or content no property key ever named misses.
+pub const STUB_STRING_KEY_ATOM_LEAF: RuntimeStubDescriptor = descriptor(
+    101,
+    RuntimeStubClass::LeafNoAlloc,
+    RuntimeStubSignature::LeafValue2,
+    2,
+    RuntimeStubEffects::none(),
+    RuntimeStubException::Never,
+    RuntimeStubResultAbi::NativePair,
+    NativeResultDomain::Probe,
+);
+
 /// Dense inventory of every current machine-callable runtime-stub contract.
 pub const RUNTIME_STUB_DESCRIPTORS: &[RuntimeStubDescriptor] = &[
     STUB_JIT_BACKEDGE_POLL,
@@ -1999,6 +2015,7 @@ pub const RUNTIME_STUB_DESCRIPTORS: &[RuntimeStubDescriptor] = &[
     STUB_CONSTRUCTOR_RECEIVER_COMMIT,
     STUB_BIGINT_BINARY_ALLOC,
     STUB_INSTANCEOF_LEAF,
+    STUB_STRING_KEY_ATOM_LEAF,
 ];
 
 /// Validate a descriptor and one concrete call-site safepoint id.

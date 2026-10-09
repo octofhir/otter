@@ -17,8 +17,9 @@
 //! - Concat: the nursery string-concatenation fit every `Add` site shares
 //!   instead of inlining it.
 //! - Keyed load and store: V8's `KeyedLoadIC_Megamorphic` /
-//!   `KeyedStoreIC_Megamorphic` name case. A string key whose atom was
-//!   recorded probes the shared action table under that atom; any other
+//!   `KeyedStoreIC_Megamorphic` name case. A string key probes the shared
+//!   action table under its atom, recorded in the string or found by the
+//!   interning leaf (`TryInternalizeString`) and then recorded; any other
 //!   key, or a table miss, returns to the element site, which completes
 //!   through its committed element runtime (which records the table entry).
 //!
@@ -147,15 +148,23 @@ impl SharedPropertyProbes {
     }
 }
 
-/// Leave the recorded atom of the string `key` in `Rd(atom)`, or branch to
-/// `miss` for any other key or a string no property key has interned.
+/// Leave the atom of the string `key` in `Rd(atom)`, or branch to `miss`
+/// for any other key or a string no property key has interned. A string
+/// whose atom is not yet recorded asks the interning leaf (V8's
+/// `TryInternalizeString`) and records the answer in its atom word. The
+/// routine inputs, `rsi`, `rcx` and `rdx`, survive the leaf call; `aligned`
+/// says whether `rsp` is 16-byte aligned here.
 fn emit_key_atom(
     ops: &mut Assembler,
+    relocations: &mut RelocationCapture,
     view: &JitCompileSnapshot,
     key: u8,
     atom: u8,
+    aligned: bool,
     miss: DynamicLabel,
 ) {
+    let ready = ops.new_dynamic_label();
+    let atom_byte = view.string_layout.atom_byte as i32;
     emit_load_u64(ops, 11, otter_vm::value::tag::NOT_CELL_MASK);
     dynasm!(ops ; .arch x64
         ; test Rq(key), r11 ; jnz =>miss
@@ -163,12 +172,40 @@ fn emit_key_atom(
         ; movzx r11d, BYTE [Rq(key)]
         ; cmp r11d, i32::from(view.string_layout.string_type_tag) ; jne =>miss
         // The body records the atom plus one; zero is unrecorded.
-        ; mov Rd(atom), [Rq(key) + view.string_layout.atom_byte as i32]
-        ; sub Rd(atom), 1 ; jb =>miss);
+        ; mov Rd(atom), [Rq(key) + atom_byte]
+        ; sub Rd(atom), 1 ; jae =>ready
+        ; push rsi ; push rcx ; push rdx
+    );
+    if aligned {
+        dynasm!(ops ; .arch x64 ; sub rsp, 8);
+    }
+    dynasm!(ops ; .arch x64
+        ; mov rdx, Rq(key)
+        ; mov rsi, [r15 + crate::entry::THREAD_OFFSET as i32]
+        ; mov rdi, [rsi + crate::entry::VM_THREAD_GC_HEAP_OFFSET as i32]
+    );
+    emit_load_runtime_stub(
+        ops,
+        relocations,
+        otter_vm::runtime_stubs::STRING_KEY_ATOM_LEAF.entry_addr() as u64,
+        abi::STUB_STRING_KEY_ATOM_LEAF,
+    );
+    emit_runtime_call(ops, abi::STUB_STRING_KEY_ATOM_LEAF);
+    dynasm!(ops ; .arch x64 ; mov r10, rdx ; mov Rd(atom), eax);
+    if aligned {
+        dynasm!(ops ; .arch x64 ; add rsp, 8);
+    }
+    dynasm!(ops ; .arch x64
+        ; pop rdx ; pop rcx ; pop rsi
+        ; test r10, r10 ; jnz =>miss
+        ; lea r11d, [Rq(atom) + 1]
+        ; mov [Rq(key) + atom_byte], r11d
+        ; =>ready
+    );
 }
 
 /// `rdx == 0` with the value in `rax`, else `rdx == 1` and nothing observed.
-/// Leaf code: no call, no allocation.
+/// Nothing allocates; the only call is the interning leaf.
 fn emit_keyed_load(
     ops: &mut Assembler,
     relocations: &mut RelocationCapture,
@@ -178,7 +215,8 @@ fn emit_keyed_load(
     let loaded = ops.new_dynamic_label();
     let miss = ops.new_dynamic_label();
     dynasm!(ops ; .arch x64 ; =>label);
-    emit_key_atom(ops, view, KEYED_LOAD_KEY, 9, miss);
+    // Entered by `call`: `rsp` is eight bytes past alignment.
+    emit_key_atom(ops, relocations, view, KEYED_LOAD_KEY, 9, false, miss);
     emit_action_probe(
         ops,
         relocations,
@@ -216,7 +254,7 @@ fn emit_keyed_store(
     let miss = ops.new_dynamic_label();
     // Realign for the barrier calls.
     dynasm!(ops ; .arch x64 ; =>label ; sub rsp, 8);
-    emit_key_atom(ops, view, KEYED_STORE_KEY, 9, miss);
+    emit_key_atom(ops, relocations, view, KEYED_STORE_KEY, 9, true, miss);
     // The probe's identity temporary (`rdi`) carries an appended child.
     emit_action_probe(
         ops,

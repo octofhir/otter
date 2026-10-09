@@ -45,9 +45,9 @@ use crate::native_abi::{
     STUB_NUMBER_REM_F64_LEAF, STUB_NUMBER_REM_LEAF, STUB_NUMBER_TO_INT32_F64_LEAF,
     STUB_PARSE_INT_I32_LEAF, STUB_STRICT_EQ_LEAF, STUB_STRING_CHAR_CODE_AT_LEAF,
     STUB_STRING_CODE_POINT_AT_LEAF, STUB_STRING_CONCAT_ALLOC, STUB_STRING_ENDS_WITH_LEAF,
-    STUB_STRING_INCLUDES_LEAF, STUB_STRING_INDEX_OF_LEAF, STUB_STRING_STARTS_WITH_LEAF,
-    STUB_TO_BOOLEAN_LEAF, STUB_TYPEOF_TEST_LEAF, SafepointId, SafepointRecord,
-    validate_stub_descriptor,
+    STUB_STRING_INCLUDES_LEAF, STUB_STRING_INDEX_OF_LEAF, STUB_STRING_KEY_ATOM_LEAF,
+    STUB_STRING_STARTS_WITH_LEAF, STUB_TO_BOOLEAN_LEAF, STUB_TYPEOF_TEST_LEAF, SafepointId,
+    SafepointRecord, validate_stub_descriptor,
 };
 use crate::{Interpreter, Value, collections};
 use std::cell::UnsafeCell;
@@ -651,6 +651,12 @@ pub const INSTANCEOF_LEAF: LeafNoAllocStub2 = LeafNoAllocStub2 {
     entry: instanceof_leaf,
 };
 
+/// Callable ABI entry for the keyed-access string interning probe.
+pub const STRING_KEY_ATOM_LEAF: LeafNoAllocStub2 = LeafNoAllocStub2 {
+    descriptor: STUB_STRING_KEY_ATOM_LEAF,
+    entry: string_key_atom_leaf,
+};
+
 /// Callable ABI entry for the ToBoolean probe.
 pub const TO_BOOLEAN_LEAF: LeafNoAllocStub2 = LeafNoAllocStub2 {
     descriptor: STUB_TO_BOOLEAN_LEAF,
@@ -914,6 +920,7 @@ pub const fn leaf_no_alloc_stub2_by_id(id: RuntimeStubId) -> Option<LeafNoAllocS
         id if id == STUB_COLLECTION_SET_HAS_LEAF.id => Some(COLLECTION_SET_HAS_LEAF),
         id if id == STUB_STRICT_EQ_LEAF.id => Some(STRICT_EQ_LEAF),
         id if id == STUB_INSTANCEOF_LEAF.id => Some(INSTANCEOF_LEAF),
+        id if id == STUB_STRING_KEY_ATOM_LEAF.id => Some(STRING_KEY_ATOM_LEAF),
         id if id == STUB_TO_BOOLEAN_LEAF.id => Some(TO_BOOLEAN_LEAF),
         id if id == STUB_TYPEOF_TEST_LEAF.id => Some(TYPEOF_TEST_LEAF),
         id if id == STUB_NUMBER_REM_LEAF.id => Some(NUMBER_REM_LEAF),
@@ -1450,6 +1457,50 @@ pub extern "C" fn to_boolean_leaf(
     let value = Value::from_abi_bits(value_bits);
     let truthy = value.to_boolean(heap);
     NativeResultPair::success(Value::boolean(truthy))
+}
+
+/// V8's `TryInternalizeString` for a keyed access: the atom the isolate's
+/// name interner holds for the content of the flat string `key_bits`, as a
+/// raw atom id. The caller records it in the string's atom word. A rope (its
+/// units are not contiguous), a lone surrogate, content never interned, or a
+/// thread without a published runtime context misses; nothing allocates.
+#[must_use]
+pub extern "C" fn string_key_atom_leaf(
+    heap: *const otter_gc::GcHeap,
+    thread_bits: u64,
+    key_bits: u64,
+) -> NativeResultPair {
+    let _guard = LeafNoAllocGuard::new(heap);
+    let Some(heap) = heap_ref(heap) else {
+        return NativeResultPair::miss();
+    };
+    let thread = thread_bits as *const crate::native_abi::VmThread;
+    if thread.is_null() {
+        return NativeResultPair::miss();
+    }
+    // SAFETY: generated code passes its live `VmThread`, which outlives the
+    // compiled entry making this synchronous call.
+    let runtime_context = unsafe { (*thread).runtime_context };
+    if runtime_context == 0 {
+        return NativeResultPair::miss();
+    }
+    // SAFETY: `runtime_context` is published from a live VmRuntimeActivation
+    // whose interpreter is the mutator running this call; the reference is
+    // shared, read-only and not retained.
+    let vm = unsafe {
+        let activation = &*(runtime_context as *const crate::jit::VmRuntimeActivation);
+        &*activation.vm_ptr()
+    };
+    let Some(key) = Value::from_abi_bits(key_bits).as_string(heap) else {
+        return NativeResultPair::miss();
+    };
+    match crate::string::gc_body::lookup_atom_in_place(heap, key.handle(), vm.shape_runtime.names())
+    {
+        Some(atom) if atom != crate::property_atom::AtomId::NONE => {
+            NativeResultPair::success_bits(u64::from(atom.raw()))
+        }
+        _ => NativeResultPair::miss(),
+    }
 }
 
 /// `typeof value === kind` (or its negation) for an `Op::TestTypeOf`

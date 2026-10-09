@@ -32,7 +32,7 @@
 mod diagnostics;
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use serde::Serialize;
 
@@ -88,8 +88,19 @@ pub struct VmTypeMismatchAt {
 /// Cheap, cloneable, `Send + Sync`. The interpreter polls this flag
 /// before each instruction. An interrupt request converts into
 /// [`VmError::Interrupted`] at the next checkpoint.
+///
+/// The flag also owns the countdown compiled loops decrement at every
+/// back-edge (V8's interrupt budget with its stack-guard trip): tripping the
+/// flag zeroes the countdown, so compiled code tests one counter and still
+/// reaches its poll at the next back-edge.
 #[derive(Debug, Default, Clone)]
-pub struct InterruptFlag(Arc<AtomicBool>);
+pub struct InterruptFlag(Arc<InterruptState>);
+
+#[derive(Debug, Default)]
+struct InterruptState {
+    tripped: AtomicBool,
+    fuel: AtomicU64,
+}
 
 impl InterruptFlag {
     /// Construct a fresh, un-tripped flag.
@@ -98,30 +109,48 @@ impl InterruptFlag {
         Self::default()
     }
 
-    /// Trip the flag from any thread.
+    /// Trip the flag from any thread; compiled loops poll at their next
+    /// back-edge.
     pub fn interrupt(&self) {
-        self.0.store(true, Ordering::Release);
+        self.0.tripped.store(true, Ordering::Release);
+        self.0.fuel.store(0, Ordering::Release);
     }
 
     /// Check the flag without resetting it.
     #[must_use]
     pub fn is_set(&self) -> bool {
-        self.0.load(Ordering::Acquire)
+        self.0.tripped.load(Ordering::Acquire)
     }
 
-    /// Raw address of the backing `AtomicBool`, stable for this flag's life (the
-    /// `Arc` keeps it alive). Compiled code polls this byte inline at each
-    /// back-edge instead of re-entering the VM; a plain byte load is sufficient
-    /// for a cooperative poll (a set flag missed by a stale read is caught on the
-    /// next back-edge).
+    /// Raw address of the flag's byte, stable for this flag's life (the
+    /// `Arc` keeps it alive). Compiled code that has no back-edge to poll,
+    /// such as a tail-call admission, reads it inline; a plain byte load is
+    /// sufficient for a cooperative poll.
     #[must_use]
     pub fn as_ptr(&self) -> *const u8 {
-        self.0.as_ptr().cast::<u8>()
+        self.0.tripped.as_ptr().cast::<u8>()
+    }
+
+    /// Raw address of the back-edge countdown compiled code decrements
+    /// inline, stable for this flag's life; reaching zero or below re-enters
+    /// the back-edge poll.
+    #[must_use]
+    pub fn fuel_ptr(&self) -> *mut u64 {
+        self.0.fuel.as_ptr()
+    }
+
+    /// Re-arm the back-edge countdown. A trip racing the re-arm leaves it
+    /// at zero.
+    pub fn arm_fuel(&self, fuel: u64) {
+        self.0.fuel.store(fuel, Ordering::Relaxed);
+        if self.is_set() {
+            self.0.fuel.store(0, Ordering::Relaxed);
+        }
     }
 
     /// Reset the flag.
     pub fn reset(&self) {
-        self.0.store(false, Ordering::Release);
+        self.0.tripped.store(false, Ordering::Release);
     }
 }
 

@@ -103,7 +103,7 @@ use crate::entry::{
     CANONICAL_NAN_HI16, DOUBLE_OFFSET_HI16, NATIVE_FRAME_PC_OFFSET, NATIVE_FRAME_SELF_OFFSET,
     NATIVE_FRAME_THIS_OFFSET, NUMBER_TAG_HI16, THREAD_OFFSET, Unsupported, VALUE_FALSE, VALUE_HOLE,
     VALUE_NULL, VALUE_TRUE, VALUE_UNDEFINED, VM_THREAD_BACKEDGE_FUEL_CELL_OFFSET,
-    VM_THREAD_GC_HEAP_OFFSET, VM_THREAD_INTERRUPT_CELL_OFFSET, reg_offset,
+    VM_THREAD_GC_HEAP_OFFSET, reg_offset,
 };
 use otter_vm::native_abi as abi;
 
@@ -2359,10 +2359,8 @@ fn emit_backedge_poll(
     let cont = ops.new_dynamic_label();
     dynasm!(ops
         ; .arch aarch64
+        // An interrupt trip zeroes the countdown.
         ; ldr x17, [x20, THREAD_OFFSET]
-        ; ldr x9, [x17, VM_THREAD_INTERRUPT_CELL_OFFSET]
-        ; ldrb w9, [x9]
-        ; cbnz w9, =>slow
         ; ldr x9, [x17, VM_THREAD_BACKEDGE_FUEL_CELL_OFFSET]
         ; ldr x10, [x9]
         ; subs x10, x10, #1

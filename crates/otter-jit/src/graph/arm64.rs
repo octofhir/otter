@@ -63,7 +63,7 @@ use crate::Unsupported;
 use crate::artifact::relocation::{RelocationCapture, RelocationTarget};
 use crate::entry::{
     NATIVE_FRAME_SELF_OFFSET, NATIVE_FRAME_THIS_OFFSET, THREAD_OFFSET, VALUE_HOLE,
-    VM_THREAD_BACKEDGE_FUEL_CELL_OFFSET, VM_THREAD_GC_HEAP_OFFSET, VM_THREAD_INTERRUPT_CELL_OFFSET,
+    VM_THREAD_BACKEDGE_FUEL_CELL_OFFSET, VM_THREAD_GC_HEAP_OFFSET,
     VM_THREAD_MARKING_FLAG_CELL_OFFSET,
 };
 use crate::template::arm64::values::{emit_load_symbol_u64, emit_load_u64};
@@ -1295,20 +1295,44 @@ impl<'a> Codegen<'a> {
                 let destination = Self::gp(result.expect("a result"));
                 let exit = self.eager_exit(node, DeoptReason::LostPrecision);
                 let minus_zero = self.eager_exit(node, DeoptReason::MinusZero);
-                let done = self.ops.new_dynamic_label();
-                dynasm!(self.ops
-                    ; .arch aarch64
-                    ; fcvtzs w16, D(a)
-                    ; scvtf d31, w16
-                    ; fcmp D(a), d31
-                    ; b.ne =>exit
-                    ; cbnz w16, =>done
-                    ; fmov x17, D(a)
-                    ; cmp x17, #0
-                    ; b.lt =>minus_zero
-                    ; =>done
-                    ; mov W(destination), w16
-                );
+                if crate::arm64::has_javascript_conversion() {
+                    // FJCVTZS sets Z exactly for an int32 that is not -0:
+                    // one test on the hot path, the exit's reason out of line.
+                    let inexact = self.ops.new_dynamic_label();
+                    crate::arm64::emit_fjcvtzs(&mut self.ops, a, 16);
+                    dynasm!(self.ops
+                        ; .arch aarch64
+                        ; b.ne =>inexact
+                        ; mov W(destination), w16
+                    );
+                    self.deferred
+                        .push(Box::new(move |codegen: &mut Codegen<'a>| {
+                            dynasm!(codegen.ops
+                                ; .arch aarch64
+                                ; =>inexact
+                                ; fcvtzs w16, D(a)
+                                ; scvtf d31, w16
+                                ; fcmp D(a), d31
+                                ; b.ne =>exit
+                                ; b =>minus_zero
+                            );
+                        }));
+                } else {
+                    let done = self.ops.new_dynamic_label();
+                    dynasm!(self.ops
+                        ; .arch aarch64
+                        ; fcvtzs w16, D(a)
+                        ; scvtf d31, w16
+                        ; fcmp D(a), d31
+                        ; b.ne =>exit
+                        ; cbnz w16, =>done
+                        ; fmov x17, D(a)
+                        ; cmp x17, #0
+                        ; b.lt =>minus_zero
+                        ; =>done
+                        ; mov W(destination), w16
+                    );
+                }
             }
             Kind::CheckedTaggedToIndex => {
                 let a = Self::gp(input(0));
@@ -4456,10 +4480,8 @@ impl<'a> Codegen<'a> {
         let resume = self.ops.new_dynamic_label();
         dynasm!(self.ops
             ; .arch aarch64
+            // An interrupt trip zeroes the countdown.
             ; ldr x16, [x20, THREAD_OFFSET]
-            ; ldr x17, [x16, VM_THREAD_INTERRUPT_CELL_OFFSET]
-            ; ldrb w17, [x17]
-            ; cbnz w17, =>slow
             ; ldr x16, [x16, VM_THREAD_BACKEDGE_FUEL_CELL_OFFSET]
             ; ldr x17, [x16]
             ; subs x17, x17, #1

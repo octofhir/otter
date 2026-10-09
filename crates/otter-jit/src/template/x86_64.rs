@@ -1085,7 +1085,10 @@ fn emit_loose_compare(
     let not_equal = ops.new_dynamic_label();
     let numeric = ops.new_dynamic_label();
     let done = ops.new_dynamic_label();
-    dynasm!(ops ; .arch x64 ; cmp rax, r8 ; je =>equal);
+    // Identical words are equal, except a number's: NaN is not NaN.
+    dynasm!(ops ; .arch x64 ; cmp rax, r8 ; jne >distinct);
+    emit_load_u64(ops, 11, NUMBER_TAG);
+    dynasm!(ops ; .arch x64 ; test rax, r11 ; jnz =>numeric ; jmp =>equal ; distinct:);
     emit_load_u64(ops, 11, VALUE_NULL);
     dynasm!(ops ; .arch x64 ; cmp rax, r11 ; je >lhs_nullish);
     emit_load_u64(ops, 11, VALUE_UNDEFINED);

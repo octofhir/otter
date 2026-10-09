@@ -92,5 +92,5 @@ pub(crate) fn emit_bigint64(
         ; cmovs Rq(tmp), Rq(value)
         ; mov [Rq(regs.candidate) + JIT_BIGINT_DIGIT_BYTE as i32], Rq(tmp)
     );
-    emit_publish(ops, context, otter_vm::bigint::BIG_INT_BODY_TYPE_TAG, regs);
+    emit_publish(ops, regs);
 }

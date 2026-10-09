@@ -95,17 +95,8 @@ pub(crate) const GENERATED_FEEDBACK_CLEAN_OFFSET: u32 =
 pub(crate) const ALLOC_WINDOW_LAB_OFFSET: u32 = (std::mem::offset_of!(JitCtx, alloc_window)
     + std::mem::offset_of!(otter_vm::jit::JitMachineAllocationWindow, lab))
     as u32;
-pub(crate) const ALLOC_WINDOW_TYPE_STATS_OFFSET: u32 = (std::mem::offset_of!(JitCtx, alloc_window)
-    + std::mem::offset_of!(otter_vm::jit::JitMachineAllocationWindow, type_stats))
-    as u32;
 #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
 pub(crate) const RUNTIME_STATS_OFFSET: u32 = std::mem::offset_of!(JitCtx, runtime_stats) as u32;
-#[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
-pub(crate) const RECEIVER_ALLOC_ATTEMPTS_OFFSET: u32 =
-    std::mem::offset_of!(otter_vm::JitRuntimeStats, receiver_alloc_attempts) as u32;
-#[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
-pub(crate) const RECEIVER_ALLOC_GENERATED_OFFSET: u32 =
-    std::mem::offset_of!(otter_vm::JitRuntimeStats, receiver_alloc_generated) as u32;
 #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
 pub(crate) const RECEIVER_ALLOC_GUARD_MISSES_OFFSET: u32 =
     std::mem::offset_of!(otter_vm::JitRuntimeStats, receiver_alloc_guard_misses) as u32;

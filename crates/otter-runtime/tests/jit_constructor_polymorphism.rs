@@ -372,8 +372,10 @@ fn alternating_constructor_families_keep_one_body_native_without_recompilation()
             .unwrap();
         assert_eq!(probe.completion_string(), EXPECTED, "{selection:?}");
         let stats = runtime.execution_stats();
+        // The probe constructs 12000 receivers; a canonical construction
+        // fewer is a receiver the generated prefix carved.
         assert!(
-            stats.jit_receiver_alloc_generated > before.jit_receiver_alloc_generated,
+            stats.jit_receiver_alloc_canonical - before.jit_receiver_alloc_canonical < 12000,
             "actual current callee prefix must publish receiver LAB fits for alternating families"
         );
         let observed = counts.lock().unwrap();
@@ -422,8 +424,9 @@ fn alternating_constructor_families_keep_one_body_native_without_recompilation()
         assert_eq!(moved.completion_string(), "[5664,0,23]");
         let after_gc = runtime.execution_stats();
         assert_eq!(
-            after_gc.jit_receiver_alloc_generated, before_gc.jit_receiver_alloc_generated,
-            "disabled current LAB must miss before publication"
+            after_gc.jit_receiver_alloc_canonical - before_gc.jit_receiver_alloc_canonical,
+            96,
+            "disabled current LAB must miss before publication: all 96 constructs prepare canonically"
         );
         let recorded = observations.lock().unwrap();
         assert_eq!(
@@ -719,9 +722,12 @@ fn actual_owner_records_fit_split_classes_and_super_selected_before_argument_mut
                 expected,
                 "{selection:?}: {name}"
             );
+            // Each drive creates 128 base receivers; a canonical construction
+            // fewer is a receiver the generated prefix carved.
             assert!(
-                runtime.execution_stats().jit_receiver_alloc_generated
-                    > before.jit_receiver_alloc_generated,
+                runtime.execution_stats().jit_receiver_alloc_canonical
+                    - before.jit_receiver_alloc_canonical
+                    < 128,
                 "{selection:?}: {name} actual owner must admit generated receiver fits"
             );
             let observed = observations.lock().unwrap();
@@ -759,11 +765,12 @@ fn actual_owner_records_fit_split_classes_and_super_selected_before_argument_mut
             assert_eq!(after.generated_deopts, generation.generated_deopts);
             assert_eq!(after.active_count, 0);
         }
-        for (program, expected) in [
-            (OWNER_RECORD_WRONG_BASE, "[37,37,true,\"value,child\"]"),
+        for (program, expected, constructs) in [
+            (OWNER_RECORD_WRONG_BASE, "[37,37,true,\"value,child\"]", 2),
             (
                 OWNER_RECORD_INVALID_INSTANCE_CHAIN,
                 "[-1,77,77,1,true,\"received,child\"]",
+                1,
             ),
         ] {
             let before = runtime.execution_stats();
@@ -775,8 +782,9 @@ fn actual_owner_records_fit_split_classes_and_super_selected_before_argument_mut
                 .unwrap();
             assert_eq!(result.completion_string(), expected);
             assert_eq!(
-                runtime.execution_stats().jit_receiver_alloc_generated,
-                before.jit_receiver_alloc_generated,
+                runtime.execution_stats().jit_receiver_alloc_canonical
+                    - before.jit_receiver_alloc_canonical,
+                constructs,
                 "wrong current base or invalidated instance-chain proof must prepare canonically"
             );
         }

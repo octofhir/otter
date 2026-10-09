@@ -2,13 +2,14 @@
 //!
 //! # Contents
 //! - Flat width/hash, compressed Cons children, identities and pre-effect misses.
-//! - Two/eight-shell groups with one publication and exact per-type accounting.
+//! - Two/eight-shell groups with one publication covering every member's bytes.
 //! - Alternate declared GP banks and preserved live GP/FP canaries.
 //!
 //! # Invariants
 //! These bounded host cells never reach a collector. The actual production
 //! encoder executes with its native ABI, exact VM geometry and poisoned guards.
-//! Every initialized byte and all 256 statistics rows are checked. Runtime
+//! Every initialized byte and the exact buffer progress are checked: the heap
+//! derives generated-code allocation bytes from that progress alone. Runtime
 //! proofs separately own genuine moving cells and collecting group admission.
 //!
 //! # See also
@@ -22,7 +23,7 @@ use dynasmrt::aarch64::Assembler;
 #[cfg(target_arch = "x86_64")]
 use dynasmrt::x64::Assembler;
 use dynasmrt::{DynasmApi, DynasmLabelApi, dynasm};
-use otter_gc::{lab::LinearAllocationArea, stats::TypeStats};
+use otter_gc::lab::LinearAllocationArea;
 use otter_vm::{
     Value,
     jit::{JitEmptyArrayAllocationPlan, JitEmptyObjectAllocationPlan, JitStringLayout},
@@ -46,7 +47,6 @@ fn run(
     recipe: Recipe,
     values: [u64; 3],
     expected: Vec<u64>,
-    expected_counts: &[(u8, u64, usize)],
     regs: LabRegisters,
     fits: bool,
     allowed: bool,
@@ -62,7 +62,6 @@ fn run(
         top: start,
         limit: start + bytes - usize::from(!fits),
     };
-    let mut stats = [TypeStats::DEFAULT; 256];
     let mut thread = VmThread::empty();
     thread.active_realm_cell = std::ptr::addr_of!(actual_realm) as u64;
     let mut ctx = JitCtx {
@@ -73,10 +72,7 @@ fn run(
         global_this_offset: std::ptr::null(),
         native_stack_limit: 0,
         generated_feedback_clean: 1,
-        alloc_window: otter_vm::jit::JitMachineAllocationWindow {
-            lab: &mut lab,
-            type_stats: stats.as_mut_ptr(),
-        },
+        alloc_window: otter_vm::jit::JitMachineAllocationWindow { lab: &mut lab },
         runtime_stats: std::ptr::null_mut(),
         pending_call: CallRequest::EMPTY,
         completion: NativeResultPair::success(Value::UNDEFINED),
@@ -255,7 +251,7 @@ fn run(
     let call: extern "sysv64" fn(*mut JitCtx, *const u64, *mut u64) -> usize =
         unsafe { std::mem::transmute(code.entry_ptr()) };
     // SAFETY: the fixture preserves its private ABI and uses complete bounded
-    // host input/LAB/stat spans; no fabricated cell reaches the collector.
+    // host input/LAB spans; no fabricated cell reaches the collector.
     let result = call(&mut ctx, values.as_ptr(), canaries.as_mut_ptr());
     let accepted = allowed && (fits || identity.is_some());
     let allocates = accepted && identity.is_none();
@@ -301,27 +297,6 @@ fn run(
             words.iter().all(|word| *word == POISON),
             "{case_label} no partial initialization"
         );
-    }
-    for (index, row) in stats.iter().enumerate() {
-        let (count, owned_bytes) = if allocates {
-            expected_counts
-                .iter()
-                .find(|(tag, _, _)| usize::from(*tag) == index)
-                .map(|(_, count, bytes)| (*count, *bytes))
-                .unwrap_or((0, 0))
-        } else {
-            (0, 0)
-        };
-        assert_eq!(
-            row.alloc_count_total, count,
-            "{case_label} tag{index} count"
-        );
-        assert_eq!(
-            row.alloc_bytes_total, owned_bytes as u64,
-            "{case_label} tag{index} bytes"
-        );
-        assert_eq!(row.live_bytes, owned_bytes, "{case_label} tag{index} live");
-        assert_eq!(row.free_count_total, 0, "{case_label} tag{index} free");
     }
 }
 
@@ -443,7 +418,6 @@ fn strings_execute_exact_flat_cons_identity_and_pre_effect_refusal_payloads() {
                     Recipe::String(p),
                     values,
                     expected.clone(),
-                    &[(p.string_type_tag, 1, p.cell_bytes as usize)],
                     regs,
                     fits,
                     true,
@@ -464,7 +438,6 @@ fn strings_execute_exact_flat_cons_identity_and_pre_effect_refusal_payloads() {
                 Recipe::String(p),
                 values,
                 vec![0; p.cell_bytes as usize / 8],
-                &[],
                 regs,
                 false,
                 true,
@@ -478,7 +451,6 @@ fn strings_execute_exact_flat_cons_identity_and_pre_effect_refusal_payloads() {
             Recipe::String(p),
             values,
             vec![0; p.cell_bytes as usize / 8],
-            &[],
             regs,
             true,
             false,
@@ -491,7 +463,6 @@ fn strings_execute_exact_flat_cons_identity_and_pre_effect_refusal_payloads() {
             Recipe::String(p),
             [too_long.as_ptr() as u64, good.as_ptr() as u64, 0],
             vec![0; p.cell_bytes as usize / 8],
-            &[],
             regs,
             true,
             false,
@@ -505,7 +476,6 @@ fn strings_execute_exact_flat_cons_identity_and_pre_effect_refusal_payloads() {
             Recipe::String(p),
             [deep.as_ptr() as u64, good.as_ptr() as u64, 0],
             vec![0; p.cell_bytes as usize / 8],
-            &[],
             regs,
             true,
             false,
@@ -522,7 +492,6 @@ fn fixed_groups_initialize_every_cell_before_one_publication_and_account_once() 
             let array = EmptyLiteralLayout::Array(JitEmptyArrayAllocationPlan::default());
             let mut expected = Vec::new();
             let mut members = Vec::new();
-            let mut counts = Vec::<(u8, u64, usize)>::new();
             for index in 0..count {
                 let layout = if index % 2 == 0 { object } else { array };
                 members.push((expected.len() as u32 * 8, layout));
@@ -535,12 +504,6 @@ fn fixed_groups_initialize_every_cell_before_one_publication_and_account_once() 
                     }
                 }
                 expected.extend(cell);
-                if let Some(row) = counts.iter_mut().find(|r| r.0 == layout.header() as u8) {
-                    row.1 += 1;
-                    row.2 += layout.bytes() as usize;
-                } else {
-                    counts.push((layout.header() as u8, 1, layout.bytes() as usize));
-                }
             }
             for (fits, realm) in [(true, 0), (false, 0), (true, 1)] {
                 run(
@@ -550,7 +513,6 @@ fn fixed_groups_initialize_every_cell_before_one_publication_and_account_once() 
                     },
                     [0; 3],
                     expected.clone(),
-                    &counts,
                     regs,
                     fits,
                     realm == 0,
@@ -562,7 +524,6 @@ fn fixed_groups_initialize_every_cell_before_one_publication_and_account_once() 
                 Recipe::Group { realm: 1, members },
                 [0; 3],
                 expected,
-                &counts,
                 regs,
                 true,
                 false,

@@ -35,7 +35,7 @@ impl Codegen<'_> {
         let refill = self.ops.new_dynamic_label();
         let done = self.ops.new_dynamic_label();
         crate::arm64::emit_receiver_fit(&mut self.ops, view, plan, 20, refill);
-        crate::arm64::emit_receiver_bump(&mut self.ops, view, plan, 20);
+        crate::arm64::emit_receiver_bump(&mut self.ops);
         dynasm!(self.ops ; .arch aarch64 ; b =>done ; =>refill);
         let bytes = view
             .field_layout
@@ -56,7 +56,7 @@ impl Codegen<'_> {
             abi::ExitAction::Resume,
         );
         crate::arm64::emit_receiver_fit(&mut self.ops, view, plan, 20, miss);
-        crate::arm64::emit_receiver_bump(&mut self.ops, view, plan, 20);
+        crate::arm64::emit_receiver_bump(&mut self.ops);
         dynasm!(self.ops ; .arch aarch64 ; =>done);
         Ok(())
     }

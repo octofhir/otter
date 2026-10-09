@@ -47,6 +47,17 @@ pub(super) fn emit_store_reg(ops: &mut Assembler, t: u8, idx: u16) -> Result<(),
 /// when a single halfword differs from the rest, one `orr` of a logical
 /// immediate, otherwise `movz` or `movn` of the first halfword plus a `movk`
 /// for each other halfword that differs from that fill.
+/// Instructions [`emit_load_u64`] spends on `v`.
+pub(crate) fn load_u64_instructions(v: u64) -> usize {
+    let halfword = |index: u32| (v >> (16 * index)) & 0xFFFF;
+    let zeros = (0..4).filter(|&index| halfword(index) == 0).count();
+    let ones = (0..4).filter(|&index| halfword(index) == 0xFFFF).count();
+    if zeros < 3 && ones < 3 && dynasmrt::aarch64::encode_logical_immediate_64bit(v).is_some() {
+        return 1;
+    }
+    (4 - zeros.max(ones)).max(1)
+}
+
 pub(crate) fn emit_load_u64(ops: &mut Assembler, t: u8, v: u64) {
     let halfword = |index: u32| ((v >> (16 * index)) & 0xFFFF) as u32;
     let zeros = (0..4).filter(|&index| halfword(index) == 0).count();

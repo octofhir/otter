@@ -1,8 +1,6 @@
 //! Generated nursery allocation shared by the AArch64 tiers.
 //!
 //! # Contents
-//! - [`emit_count_allocation`]: the per-type statistics row update the Rust
-//!   allocator performs for every cell.
 //! - [`emit_create_context`]: `CreateContext` carved from a
 //!   [`otter_vm::jit::JitContextAllocationPlan`].
 //! - [`emit_copy_context`]: `CopyContext` carved from the live source cell.
@@ -34,73 +32,12 @@ use crate::allocation::{AllocationValue, LabRegisters};
 use dynasmrt::{DynamicLabel, DynasmApi, DynasmLabelApi, aarch64::Assembler, dynasm};
 use otter_vm::JitCompileSnapshot;
 use otter_vm::jit::{
-    JIT_CLOSURE_CELL_BYTES, JIT_TYPE_STATS_ALLOC_BYTES_OFFSET, JIT_TYPE_STATS_ALLOC_COUNT_OFFSET,
-    JIT_TYPE_STATS_LIVE_BYTES_OFFSET, JIT_TYPE_STATS_ROW_BYTES, JIT_YOUNG_CLOSURE_HEADER_WORD,
-    JIT_YOUNG_CONTEXT_HEADER_WORD, JitClosureAllocationPlan, JitContextAllocationPlan,
+    JIT_CLOSURE_CELL_BYTES, JIT_YOUNG_CLOSURE_HEADER_WORD, JIT_YOUNG_CONTEXT_HEADER_WORD,
+    JitClosureAllocationPlan, JitContextAllocationPlan,
 };
 
-use crate::entry::{
-    ALLOC_WINDOW_LAB_OFFSET, ALLOC_WINDOW_TYPE_STATS_OFFSET, LAB_LIMIT_OFFSET, LAB_TOP_OFFSET,
-    VALUE_UNDEFINED,
-};
+use crate::entry::{ALLOC_WINDOW_LAB_OFFSET, LAB_LIMIT_OFFSET, LAB_TOP_OFFSET, VALUE_UNDEFINED};
 use crate::template::arm64::values::{CellTest, emit_cell_test, emit_load_u64};
-
-/// Account one generated allocation of `X(size)` bytes against the
-/// statistics row of `type_tag`. Clobbers `X(base)` and `X(scratch)`.
-pub(crate) fn emit_count_allocation(
-    ops: &mut Assembler,
-    context_register: u8,
-    type_tag: u8,
-    size: u8,
-    base: u8,
-    scratch: u8,
-) {
-    let row = u32::from(type_tag) * JIT_TYPE_STATS_ROW_BYTES;
-    let live = row + JIT_TYPE_STATS_LIVE_BYTES_OFFSET;
-    let count = row + JIT_TYPE_STATS_ALLOC_COUNT_OFFSET;
-    let bytes = row + JIT_TYPE_STATS_ALLOC_BYTES_OFFSET;
-    dynasm!(ops
-        ; .arch aarch64
-        ; ldr X(base), [X(context_register), ALLOC_WINDOW_TYPE_STATS_OFFSET]
-        ; ldr X(scratch), [X(base), live]
-        ; add X(scratch), X(scratch), X(size)
-        ; str X(scratch), [X(base), live]
-        ; ldr X(scratch), [X(base), count]
-        ; add XSP(scratch), XSP(scratch), 1
-        ; str X(scratch), [X(base), count]
-        ; ldr X(scratch), [X(base), bytes]
-        ; add X(scratch), X(scratch), X(size)
-        ; str X(scratch), [X(base), bytes]
-    );
-}
-
-/// [`emit_count_allocation`] for a cell of a fixed `bytes` size.
-pub(crate) fn emit_count_allocation_bytes(
-    ops: &mut Assembler,
-    context_register: u8,
-    type_tag: u8,
-    bytes: u32,
-    base: u8,
-    scratch: u8,
-) {
-    let row = u32::from(type_tag) * JIT_TYPE_STATS_ROW_BYTES;
-    let live = row + JIT_TYPE_STATS_LIVE_BYTES_OFFSET;
-    let count = row + JIT_TYPE_STATS_ALLOC_COUNT_OFFSET;
-    let total = row + JIT_TYPE_STATS_ALLOC_BYTES_OFFSET;
-    dynasm!(ops
-        ; .arch aarch64
-        ; ldr X(base), [X(context_register), ALLOC_WINDOW_TYPE_STATS_OFFSET]
-        ; ldr X(scratch), [X(base), live]
-        ; add XSP(scratch), XSP(scratch), bytes
-        ; str X(scratch), [X(base), live]
-        ; ldr X(scratch), [X(base), count]
-        ; add XSP(scratch), XSP(scratch), 1
-        ; str X(scratch), [X(base), count]
-        ; ldr X(scratch), [X(base), total]
-        ; add XSP(scratch), XSP(scratch), bytes
-        ; str X(scratch), [X(base), total]
-    );
-}
 
 mod receiver_dynamic;
 pub(crate) use receiver_dynamic::emit_dynamic_construct_receiver;
@@ -145,17 +82,11 @@ fn emit_bump_probe(
     );
 }
 
-/// Publish the fully initialized cell and count it once; candidate survives.
-fn emit_publish(ops: &mut Assembler, context_register: u8, type_tag: u8, regs: LabRegisters) {
-    let LabRegisters {
-        buffer,
-        end,
-        scratch,
-        size,
-        ..
-    } = regs;
+/// Publish the fully initialized cell; candidate survives. The heap derives
+/// the allocated bytes from the buffer's progress.
+fn emit_publish(ops: &mut Assembler, regs: LabRegisters) {
+    let LabRegisters { buffer, end, .. } = regs;
     dynasm!(ops ; .arch aarch64 ; str X(end), [X(buffer), LAB_TOP_OFFSET]);
-    emit_count_allocation(ops, context_register, type_tag, size, buffer, scratch);
 }
 
 mod context;

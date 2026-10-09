@@ -239,7 +239,9 @@ impl RelocationForm {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct LiteralPool {
     enabled: bool,
-    entries: Vec<(u64, RelocationTarget, dynasmrt::DynamicLabel)>,
+    /// Pool words: a symbol's target, or `None` for a position-independent
+    /// constant that needs no relocation.
+    entries: Vec<(u64, Option<RelocationTarget>, dynasmrt::DynamicLabel)>,
     index: rustc_hash::FxHashMap<u64, usize>,
 }
 
@@ -296,14 +298,7 @@ impl RelocationCapture {
         if !self.pool.enabled {
             return false;
         }
-        let label = if let Some(&index) = self.pool.index.get(&value) {
-            self.pool.entries[index].2
-        } else {
-            let label = ops.new_dynamic_label();
-            self.pool.index.insert(value, self.pool.entries.len());
-            self.pool.entries.push((value, target.clone(), label));
-            label
-        };
+        let label = self.pool_label(ops, value, Some(target.clone()));
         let start = ops.offset().0;
         dynasm!(ops ; .arch aarch64 ; ldr X(register), =>label);
         if self.enabled {
@@ -316,6 +311,53 @@ impl RelocationCapture {
             });
         }
         true
+    }
+
+    /// Load the position-independent constant `value` into `X(register)`
+    /// with one `LDR (literal)` of its pool word, when the pool is enabled:
+    /// one instruction where a `MOVZ`/`MOVK` sequence takes two to four.
+    /// `false` leaves the load to the caller.
+    #[cfg(not(target_arch = "x86_64"))]
+    // dynasm 5 normalizes dynamic register operands through `Into<u8>`; the
+    // register ids here are already `u8`, so the macro-generated conversion is
+    // intentionally redundant.
+    #[allow(clippy::useless_conversion)]
+    pub(crate) fn emit_constant_load(
+        &mut self,
+        ops: &mut dynasmrt::aarch64::Assembler,
+        register: u8,
+        value: u64,
+    ) -> bool {
+        use dynasmrt::{DynasmApi, DynasmLabelApi, dynasm};
+        if !self.pool.enabled {
+            return false;
+        }
+        let label = self.pool_label(ops, value, None);
+        dynasm!(ops ; .arch aarch64 ; ldr X(register), =>label);
+        true
+    }
+
+    /// The pool word holding `value`, shared by every load of it. A symbol
+    /// names its word's target; a word first pooled as a plain constant takes
+    /// the target of a later symbol load of the same value.
+    #[cfg(not(target_arch = "x86_64"))]
+    fn pool_label(
+        &mut self,
+        ops: &mut dynasmrt::aarch64::Assembler,
+        value: u64,
+        target: Option<RelocationTarget>,
+    ) -> dynasmrt::DynamicLabel {
+        if let Some(&index) = self.pool.index.get(&value) {
+            let entry = &mut self.pool.entries[index];
+            if entry.1.is_none() {
+                entry.1 = target;
+            }
+            return entry.2;
+        }
+        let label = ops.new_dynamic_label();
+        self.pool.index.insert(value, self.pool.entries.len());
+        self.pool.entries.push((value, target, label));
+        label
     }
 
     /// Emit the pool every [`Self::emit_literal_load`] reads, after the code
@@ -334,7 +376,9 @@ impl RelocationCapture {
         for (value, target, label) in std::mem::take(&mut self.pool.entries) {
             let start = ops.offset().0;
             dynasm!(ops ; .arch aarch64 ; =>label ; .u64 value);
-            if self.enabled {
+            if self.enabled
+                && let Some(target) = target
+            {
                 self.records.push(RelocationRecord {
                     start,
                     end: start + 8,

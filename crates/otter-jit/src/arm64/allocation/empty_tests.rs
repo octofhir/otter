@@ -1,7 +1,7 @@
 //! Executable proof of the shared empty-literal fit and pre-effect miss.
 //!
 //! # Contents
-//! - Poisoned private LAB, exact initialization and per-type accounting.
+//! - Poisoned private LAB, exact initialization and exact cursor progress.
 //! - Several declared register recipes and realm/limit miss boundaries.
 //!
 //! # Invariants
@@ -11,7 +11,7 @@
 
 use super::*;
 use crate::CompiledCode;
-use otter_gc::{lab::LinearAllocationArea, stats::TypeStats};
+use otter_gc::lab::LinearAllocationArea;
 use otter_vm::jit::{JitEmptyArrayAllocationPlan, JitEmptyObjectAllocationPlan};
 use otter_vm::native_abi::{CallRequest, JitCtx, NativeResultPair, VmThread};
 
@@ -83,7 +83,6 @@ fn probe(
         top: start,
         limit: start + bytes as usize - usize::from(!fits),
     };
-    let mut stats = [TypeStats::DEFAULT; 256];
     let mut thread = VmThread::empty();
     thread.active_realm_cell = std::ptr::addr_of!(actual_realm) as u64;
     let mut ctx = JitCtx {
@@ -94,10 +93,7 @@ fn probe(
         global_this_offset: std::ptr::null(),
         native_stack_limit: 0,
         generated_feedback_clean: 1,
-        alloc_window: otter_vm::jit::JitMachineAllocationWindow {
-            lab: &mut lab,
-            type_stats: stats.as_mut_ptr(),
-        },
+        alloc_window: otter_vm::jit::JitMachineAllocationWindow { lab: &mut lab },
         runtime_stats: std::ptr::null_mut(),
         pending_call: CallRequest::EMPTY,
         completion: NativeResultPair::success(otter_vm::Value::UNDEFINED),
@@ -106,8 +102,8 @@ fn probe(
     };
     let code = executable(layout, expected_realm, regs);
     // SAFETY: the private machine ABI receives this complete JitCtx, preserves
-    // callee-saved x20/LR/SP, and touches only its initialized LAB/statistics and
-    // realm scalar. No VM entry or collector observes the private host storage.
+    // callee-saved x20/LR/SP, and touches only its initialized LAB and realm
+    // scalar. No VM entry or collector observes the private host storage.
     let call: extern "C" fn(*mut JitCtx) -> usize =
         unsafe { std::mem::transmute(code.entry_ptr()) };
     let result = call(&mut ctx);
@@ -135,16 +131,6 @@ fn probe(
             words.iter().all(|&word| word == POISON),
             "miss has no initialization effect"
         );
-    }
-    for (tag, row) in stats.iter().enumerate() {
-        let owns = accepted && tag == header as u8 as usize;
-        assert_eq!(row.live_bytes, if owns { bytes as usize } else { 0 });
-        assert_eq!(row.alloc_count_total, u64::from(owns));
-        assert_eq!(
-            row.alloc_bytes_total,
-            if owns { u64::from(bytes) } else { 0 }
-        );
-        assert_eq!(row.free_count_total, 0);
     }
 }
 

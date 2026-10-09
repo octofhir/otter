@@ -23,7 +23,6 @@
 use dynasmrt::{DynamicLabel, DynasmApi, DynasmLabelApi, dynasm};
 use otter_vm::{
     JitCacheIrOp as Op, jit::JitIntrinsicPrototype, native_abi as abi, object::ShapeState,
-    value::tag,
 };
 
 use super::Codegen;

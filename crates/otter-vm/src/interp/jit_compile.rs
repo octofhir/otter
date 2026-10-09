@@ -2992,10 +2992,14 @@ impl Interpreter {
             }
             _ => (0, 0),
         };
+        self.jit_compile_roots
+            .borrow_mut()
+            .push(crate::jit_roots::CompilationRoot::Family(layout));
         Some(jit::JitReceiverAllocationPlan {
             new_target_function_id,
             new_target_is_class,
             family_id,
+            family_cell: layout.offset(),
             receiver_shape,
             initial_field_count,
             inline_capacity: u8::try_from(inline_capacity).ok()?,

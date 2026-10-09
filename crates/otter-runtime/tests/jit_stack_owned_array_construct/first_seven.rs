@@ -9,7 +9,8 @@
 //! - Observers record scalar cell geometry only and retain no VM handle.
 //! - Ordinary source work admits every generation; no tier budget is forced.
 //! - Native execution requires exact call artifacts, complete trace exclusion,
-//!   real allocation-attempt counters and unchanged installed generations.
+//!   canonical-receiver and plan-miss counters and unchanged installed
+//!   generations.
 
 use super::*;
 use otter_runtime::{
@@ -225,28 +226,28 @@ fn retained_first_seven_cells_keep_geometry_while_current_native_calls_use_final
         after.jit_optimized_osr_entries,
         before.jit_optimized_osr_entries
     );
+    // The probe constructs two receivers, each through the caller's receiver
+    // plan. A fit carves the receiver and counts nothing. A disabled LAB
+    // misses the caller's plan, which passes no receiver; the callee's
+    // construct entry probes the family again, misses too, and the receiver
+    // is constructed canonically.
+    let canonical = after.jit_receiver_alloc_canonical - before.jit_receiver_alloc_canonical;
+    let space_misses =
+        after.jit_receiver_alloc_space_misses - before.jit_receiver_alloc_space_misses;
     assert_eq!(
-        after.jit_receiver_alloc_attempts - before.jit_receiver_alloc_attempts,
-        2
+        after.jit_receiver_alloc_guard_misses, before.jit_receiver_alloc_guard_misses,
+        "the finalized family and prototype guards hold for both calls"
     );
     if gc_stress_stride() == 0 {
         assert_eq!(
-            after.jit_receiver_alloc_generated - before.jit_receiver_alloc_generated,
-            2,
+            (canonical, space_misses),
+            (0, 0),
             "both current native calls carve the finalized family directly after full GC"
-        );
-        assert_eq!(
-            after.jit_receiver_alloc_guard_misses,
-            before.jit_receiver_alloc_guard_misses
         );
     } else {
         assert_eq!(
-            after.jit_receiver_alloc_generated,
-            before.jit_receiver_alloc_generated
-        );
-        assert_eq!(
-            after.jit_receiver_alloc_guard_misses - before.jit_receiver_alloc_guard_misses,
-            2,
+            (canonical, space_misses),
+            (2, 4),
             "stress disables LAB fits and canonical allocation preserves the finalized capacity"
         );
         assert!(after.gc_minor_cycles > before.gc_minor_cycles);

@@ -2,8 +2,10 @@
 //!
 //! Allocation totals, collection pauses, and root/remembered-set work make
 //! leaks and excessive collector work observable. Counters do not influence
-//! collection policy. The allocation fast path updates a handful of integers;
-//! collection counters are folded once per collection.
+//! collection policy. The runtime allocator updates a handful of integers per
+//! cell; generated code updates none, and its bytes are derived from the
+//! allocation buffers' progress. Collection counters are folded once per
+//! collection.
 //!
 //! # Contents
 //!
@@ -14,14 +16,14 @@
 //!
 //! # Invariants
 //!
-//! - `live_bytes` and `live_objects` reflect the live set as of
-//!   the most recent GC reconciliation; between collections
-//!   they grow with every alloc and only the mark-sweep /
-//!   scavenge passes correct them downward.
-//! - `alloc_count_total` is monotone — only allocs increment
-//!   it, never GC.
-//! - `free_count_total` is derived after each GC as
-//!   `alloc_count_total - live_object_count_per_tag`.
+//! - A row's `live_count` and `live_bytes` are exact after a full
+//!   collection; between collections they grow with every runtime
+//!   allocation of the type. Cells generated code carves join them at the
+//!   next full collection.
+//! - A row's `alloc_count_total` and `alloc_bytes_total` are monotone and
+//!   count runtime allocations of the type.
+//! - [`GcStats::alloc_bytes_total`] counts every allocated byte, generated
+//!   code's included.
 //!
 //! # See also
 //!
@@ -38,24 +40,23 @@ pub struct TypeStats {
     /// Bytes occupied by live objects of this type after the
     /// most recent GC reconciliation.
     pub live_bytes: usize,
-    /// Total allocations of this type since the heap was created
+    /// Live objects of this type after the most recent GC reconciliation.
+    pub live_count: u64,
+    /// Runtime allocations of this type since the heap was created
     /// (monotone — never decremented).
     pub alloc_count_total: u64,
-    /// Total bytes allocated for this type since the heap was
-    /// created (monotone — never decremented).
+    /// Bytes of this type the runtime allocated since the heap was created
+    /// (monotone — never decremented).
     pub alloc_bytes_total: u64,
-    /// Total objects of this type reclaimed since the heap was
-    /// created (derived after each GC).
-    pub free_count_total: u64,
 }
 
 impl TypeStats {
     /// Zeroed default value, usable in const contexts.
     pub const DEFAULT: Self = Self {
         live_bytes: 0,
+        live_count: 0,
         alloc_count_total: 0,
         alloc_bytes_total: 0,
-        free_count_total: 0,
     };
 }
 
@@ -140,7 +141,7 @@ impl std::fmt::Debug for GcStats {
         // readable.
         let mut by_type = Vec::new();
         for (tag, row) in self.by_type.iter().enumerate() {
-            if row.live_bytes != 0 || row.alloc_count_total != 0 || row.free_count_total != 0 {
+            if row.live_bytes != 0 || row.live_count != 0 || row.alloc_count_total != 0 {
                 by_type.push((tag, *row));
             }
         }

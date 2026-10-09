@@ -55,10 +55,5 @@ pub(crate) fn emit_closure(
     }
     emit_value(ops, regs.scratch, values[0]);
     dynasm!(ops ; .arch aarch64 ; str X(regs.scratch), [X(regs.candidate), layout.context_byte] ; str xzr, [X(regs.candidate), layout.rare_byte]);
-    emit_publish(
-        ops,
-        context,
-        otter_vm::closure::JS_CLOSURE_BODY_TYPE_TAG,
-        regs,
-    );
+    emit_publish(ops, regs);
 }

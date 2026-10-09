@@ -23,8 +23,7 @@ use crate::{
     allocation::LabRegisters,
     artifact::relocation::{RelocationCapture, RelocationTarget},
     entry::{
-        NATIVE_FRAME_THIS_OFFSET, OBJECT_BODY_TYPE_TAG, RECEIVER_ALLOC_ATTEMPTS_OFFSET,
-        RECEIVER_ALLOC_GENERATED_OFFSET, RECEIVER_ALLOC_GUARD_MISSES_OFFSET,
+        NATIVE_FRAME_THIS_OFFSET, RECEIVER_ALLOC_GUARD_MISSES_OFFSET,
         RECEIVER_ALLOC_SPACE_MISSES_OFFSET, RUNTIME_STATS_OFFSET, THREAD_OFFSET,
         TransitionTable, VALUE_UNDEFINED, VM_THREAD_GC_HEAP_OFFSET,
     },
@@ -58,7 +57,6 @@ pub(crate) fn emit_dynamic_construct_receiver(
     let space = ops.new_dynamic_label();
     let fatal = ops.new_dynamic_label();
     let refused = ops.new_dynamic_label();
-    count(ops, RECEIVER_ALLOC_ATTEMPTS_OFFSET);
     dynasm!(ops ; .arch x64
         ; mov rdi, [r15 + THREAD_OFFSET as i32] ; mov rdi, [rdi + VM_THREAD_GC_HEAP_OFFSET as i32]
         ; mov rsi, [r14 + abi::NATIVE_FRAME_NEW_TARGET_OFFSET as i32]
@@ -137,8 +135,7 @@ fn emit_fit(
     let fill = ops.new_dynamic_label();
     dynasm!(ops ; .arch x64 ; cmp r9, rdi ; je =>initialized
         ; =>fill ; mov [r9], r11 ; add r9, 8 ; cmp r9, rdi ; jne =>fill ; =>initialized);
-    emit_publish(ops, 15, OBJECT_BODY_TYPE_TAG as u8, LAB);
-    count(ops, RECEIVER_ALLOC_GENERATED_OFFSET);
+    emit_publish(ops, LAB);
     dynasm!(ops ; .arch x64
         ; mov [r14 + abi::NATIVE_FRAME_CONSTRUCT_LAYOUT_OFFSET as i32], r8d
         ; mov [r14 + abi::NATIVE_FRAME_CONSTRUCT_RECEIVER_OFFSET as i32], rax

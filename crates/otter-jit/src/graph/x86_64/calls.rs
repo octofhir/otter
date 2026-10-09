@@ -161,11 +161,7 @@ impl Codegen<'_> {
                     15,
                 );
                 dynasm!(self.ops ; .arch x64 ; test rdx, rdx ; jz =>missed);
-                crate::x86_64::allocation::emit_receiver_publication_effect(
-                    &mut self.ops,
-                    source,
-                    15,
-                );
+                crate::x86_64::allocation::emit_receiver_publication_effect(&mut self.ops, 15);
                 dynasm!(self.ops ; .arch x64 ; mov rdx, rax ; jmp =>allocated
                     ; =>missed ; mov edx, VALUE_UNDEFINED as i32 ; =>allocated);
                 true

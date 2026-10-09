@@ -68,8 +68,11 @@ JSON.stringify([settled, Object.getPrototypeOf(changed) !== original,
             .ok()
             .is_none_or(|s| s == "0")
         {
+            // The probe constructs 512 receivers in `drive` and four in `build`;
+            // at least 256 of them must be carved natively.
             assert!(
-                after.jit_receiver_alloc_generated - before.jit_receiver_alloc_generated >= 256,
+                after.jit_receiver_alloc_canonical - before.jit_receiver_alloc_canonical
+                    <= 516 - 256,
                 "{selection:?}: small siblings must allocate natively despite a large template maximum: {before:?} -> {after:?}"
             );
         }
@@ -86,10 +89,12 @@ JSON.stringify([settled, Object.getPrototypeOf(changed) !== original,
             .ok()
             .is_none_or(|s| s == "0")
         {
+            // One construct precedes the collection and `drive` constructs 512
+            // after it; at least 256 of them must be carved natively.
             assert!(
-                runtime.execution_stats().jit_receiver_alloc_generated
-                    - after.jit_receiver_alloc_generated
-                    >= 256,
+                runtime.execution_stats().jit_receiver_alloc_canonical
+                    - after.jit_receiver_alloc_canonical
+                    <= 513 - 256,
                 "{selection:?}: collection must permit a fresh weak observation and native allocation"
             );
         }

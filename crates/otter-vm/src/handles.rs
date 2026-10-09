@@ -983,13 +983,10 @@ impl Interpreter {
     ) -> Result<(), VmError> {
         let receiver = self.handle_arena.get(obj.index());
         let stored = self.handle_arena.get(value.index());
-        if let Some(mut object) = receiver.as_object() {
-            return if crate::object::ordinary_set_data_property(
-                &mut object,
-                &mut self.gc_heap,
-                key,
-                stored,
-            )? {
+        if let Some(object) = receiver.as_object() {
+            // A new property advances the hidden class like a JavaScript
+            // store, so host-built objects share shapes and inline caches.
+            return if self.ordinary_set_data_property(object, key, stored)? {
                 Ok(())
             } else {
                 Err(VmError::TypeMismatch)

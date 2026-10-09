@@ -116,6 +116,8 @@ fn codegen<'a>(
         materialize,
         sites: metadata::SitePlan::new(slots),
         return_sites: Vec::new(),
+        fused: Default::default(),
+        sink: None,
     }
 }
 

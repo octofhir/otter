@@ -188,19 +188,16 @@ pub struct HeapStats {
 ///
 /// This is not a general heap-mutation API. A consumer may carve only
 /// already-registered fixed-size bodies from [`Self::lab`] — bump `top` only
-/// when the whole cell fits below `limit` — and must update its type's row
-/// of [`Self::type_stats`] exactly once per cell. The buffer is empty
-/// whenever a collector handshake is required, so a miss is the only policy
-/// signal.
+/// when the whole cell fits below `limit`. A carve does no accounting: the
+/// heap derives the bytes generated code allocated from the buffer's
+/// progress (see [`GcHeap::gc_stats`]). The buffer is empty whenever a
+/// collector handshake is required, so a miss is the only policy signal.
 #[doc(hidden)]
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct MachineAllocationWindow {
     /// The heap's linear allocation buffer, or the permanently empty one.
     pub lab: *mut LinearAllocationArea,
-    /// Base of the per-type-tag statistics rows ([`crate::stats::TypeStats`],
-    /// indexed by type tag).
-    pub type_stats: *mut crate::stats::TypeStats,
 }
 
 /// Buffer a disabled window points at. Every bump misses, so generated code
@@ -208,13 +205,12 @@ pub struct MachineAllocationWindow {
 static EMPTY_LAB: LinearAllocationArea = LinearAllocationArea::EMPTY;
 
 impl MachineAllocationWindow {
-    /// A window that forces the caller through its rooted cold path. Its
-    /// buffer never admits a cell, so its statistics base is never written.
+    /// A window that forces the caller through its rooted cold path: its
+    /// buffer never admits a cell.
     #[must_use]
     pub const fn disabled() -> Self {
         Self {
             lab: std::ptr::addr_of!(EMPTY_LAB).cast_mut(),
-            type_stats: std::ptr::null_mut(),
         }
     }
 }
@@ -250,6 +246,13 @@ pub struct GcHeap {
     lab_start: usize,
     /// Page `allocated_bytes` at refill.
     lab_page_allocated: usize,
+    /// Bytes every retired buffer handed out, to the runtime allocator and
+    /// to generated code alike.
+    lab_consumed_bytes: u64,
+    /// Bytes the runtime allocator itself bumped from buffers. The rest of
+    /// [`Self::lab_consumed_bytes`] (plus the live buffer's progress) is what
+    /// generated code allocated.
+    runtime_lab_bytes: u64,
     /// Cap bytes charged for the whole buffer at refill; the unused tail is
     /// refunded at retire. `0` without a cap.
     lab_charged: u64,
@@ -501,6 +504,8 @@ impl GcHeap {
             lab_page: 0,
             lab_start: 0,
             lab_page_allocated: 0,
+            lab_consumed_bytes: 0,
+            runtime_lab_bytes: 0,
             lab_charged: 0,
             new_space,
             tenure_all: false,
@@ -1340,7 +1345,6 @@ impl GcHeap {
     pub fn machine_allocation_window(&mut self) -> MachineAllocationWindow {
         MachineAllocationWindow {
             lab: std::ptr::addr_of_mut!(self.lab),
-            type_stats: self.gc_stats.by_type.as_mut_ptr(),
         }
     }
 
@@ -1374,6 +1378,7 @@ impl GcHeap {
             return;
         }
         self.sync_lab();
+        self.lab_consumed_bytes += (self.lab.top - self.lab_start) as u64;
         if self.lab_charged != 0 {
             self.tracked_bytes = self
                 .tracked_bytes
@@ -1519,8 +1524,10 @@ impl GcHeap {
         if self.trace_table.needs_cleanup(T::TYPE_TAG) {
             self.new_space.track_cleanup(offset);
         }
+        self.runtime_lab_bytes += aligned as u64;
         let row = &mut self.gc_stats.by_type[T::TYPE_TAG as usize];
         row.live_bytes = row.live_bytes.wrapping_add(aligned);
+        row.live_count = row.live_count.wrapping_add(1);
         row.alloc_count_total = row.alloc_count_total.wrapping_add(1);
         row.alloc_bytes_total = row
             .alloc_bytes_total
@@ -1917,6 +1924,7 @@ impl GcHeap {
         // practice (≥ 1.8 × 10¹⁹ allocs).
         let row = &mut self.gc_stats.by_type[T::TYPE_TAG as usize];
         row.live_bytes = row.live_bytes.wrapping_add(aligned);
+        row.live_count = row.live_count.wrapping_add(1);
         row.alloc_count_total = row.alloc_count_total.wrapping_add(1);
         row.alloc_bytes_total = row
             .alloc_bytes_total
@@ -2114,6 +2122,7 @@ impl GcHeap {
         }
         let row = &mut self.gc_stats.by_type[T::TYPE_TAG as usize];
         row.live_bytes = row.live_bytes.wrapping_add(aligned);
+        row.live_count = row.live_count.wrapping_add(1);
         row.alloc_count_total = row.alloc_count_total.wrapping_add(1);
         row.alloc_bytes_total = row
             .alloc_bytes_total
@@ -3072,9 +3081,7 @@ impl GcHeap {
         for tag in 0..TYPE_TAG_COUNT {
             let row = &mut self.gc_stats.by_type[tag];
             row.live_bytes = per_tag_live_bytes[tag];
-            row.free_count_total = row
-                .alloc_count_total
-                .saturating_sub(per_tag_live_count[tag]);
+            row.live_count = per_tag_live_count[tag];
         }
     }
 
@@ -3089,28 +3096,37 @@ impl GcHeap {
         (self.gc_stats.minor_gc_cycles, self.gc_stats.gc_cycles)
     }
 
-    /// Per-heap GC counters (alloc / live / free, per-type
-    /// breakdown). The alloc fast path only updates the per-tag
-    /// rows; the aggregates `live_objects` / `live_bytes` are
-    /// derived from those rows here, so the returned snapshot
-    /// is always consistent.
+    /// Per-heap GC counters and the per-type breakdown. The runtime
+    /// allocator updates its type's row; the aggregates `live_objects` and
+    /// `live_bytes` are summed from the rows here. `alloc_bytes_total` adds
+    /// what generated code carved, derived from the allocation buffers'
+    /// progress rather than counted per cell (V8's inline allocation keeps
+    /// no per-object statistics either).
     pub fn gc_stats(&mut self) -> &GcStats {
         let mut live_objects = 0usize;
         let mut live_bytes = 0usize;
         let mut alloc_bytes_total = 0u64;
         for row in &self.gc_stats.by_type {
-            // Live count per tag = alloc_count_total -
-            // free_count_total; live_bytes is already maintained
-            // per-tag by alloc + reconcile.
-            let live_count = row.alloc_count_total.saturating_sub(row.free_count_total);
-            live_objects = live_objects.wrapping_add(live_count as usize);
+            live_objects = live_objects.wrapping_add(row.live_count as usize);
             live_bytes = live_bytes.wrapping_add(row.live_bytes);
             alloc_bytes_total = alloc_bytes_total.saturating_add(row.alloc_bytes_total);
         }
         self.gc_stats.live_objects = live_objects;
         self.gc_stats.live_bytes = live_bytes;
-        self.gc_stats.alloc_bytes_total = alloc_bytes_total;
+        self.gc_stats.alloc_bytes_total = alloc_bytes_total.saturating_add(self.generated_bytes());
         &self.gc_stats
+    }
+
+    /// Bytes generated code has carved from allocation buffers: everything
+    /// the buffers handed out, including the live one's progress, less what
+    /// the runtime allocator bumped from them.
+    fn generated_bytes(&self) -> u64 {
+        let live = if self.lab_page == 0 {
+            0
+        } else {
+            (self.lab.top - self.lab_start) as u64
+        };
+        (self.lab_consumed_bytes + live).saturating_sub(self.runtime_lab_bytes)
     }
 
     /// Single hot-path write barrier for a pointer-field store.

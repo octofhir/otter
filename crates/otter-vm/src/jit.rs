@@ -295,19 +295,6 @@ impl JitClosureAllocationPlan {
     }
 }
 
-/// Bytes of one per-type-tag allocation statistics row; generated
-/// allocators update the row at `tag * JIT_TYPE_STATS_ROW_BYTES`.
-pub const JIT_TYPE_STATS_ROW_BYTES: u32 = std::mem::size_of::<otter_gc::TypeStats>() as u32;
-/// Offset of a statistics row's live-byte counter.
-pub const JIT_TYPE_STATS_LIVE_BYTES_OFFSET: u32 =
-    std::mem::offset_of!(otter_gc::TypeStats, live_bytes) as u32;
-/// Offset of a statistics row's allocation counter.
-pub const JIT_TYPE_STATS_ALLOC_COUNT_OFFSET: u32 =
-    std::mem::offset_of!(otter_gc::TypeStats, alloc_count_total) as u32;
-/// Offset of a statistics row's allocated-byte counter.
-pub const JIT_TYPE_STATS_ALLOC_BYTES_OFFSET: u32 =
-    std::mem::offset_of!(otter_gc::TypeStats, alloc_bytes_total) as u32;
-
 /// Byte offset of the linear allocation buffer's `top` address, derived on
 /// the VM side so the backend does not depend directly on the collector.
 pub const JIT_LAB_TOP_OFFSET: u32 = otter_gc::LAB_TOP_OFFSET;
@@ -467,6 +454,11 @@ pub struct JitReceiverAllocationPlan {
     /// Nonzero monotonic identity of the exact actual constructor family.
     /// This scalar never retains a callable or a receiver by itself.
     pub family_id: u64,
+    /// Compressed handle of that family's cell. Generated code compares the
+    /// owner's family head with it directly: the compiled code roots the
+    /// cell, and old-space cells never move, so while the code lives the
+    /// handle names this family and no other.
+    pub family_cell: u32,
     /// Initial receiver hidden class naming its initial fields; generated
     /// code proves the prototype it fixes is the live prototype. `0` for a
     /// receiver with no initial fields: it uses the exact `prototype_root`.

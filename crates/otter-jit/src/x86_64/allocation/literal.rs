@@ -16,7 +16,7 @@
 //! - [`super`] owns the target LAB probe and allocation accounting.
 
 use super::empty::emit_source_realm_guard;
-use super::{emit_bump_probe, emit_count_allocation, emit_publish};
+use super::{emit_bump_probe, emit_publish};
 use crate::allocation::{AllocationValue, LabRegisters};
 use crate::artifact::relocation::{RelocationCapture, RelocationTarget};
 use crate::entry::{ALLOC_WINDOW_LAB_OFFSET, LAB_TOP_OFFSET, VALUE_HOLE, VALUE_UNDEFINED};
@@ -79,7 +79,7 @@ pub(crate) fn emit_object_literal(
         }
         dynasm!(ops ; .arch x64 ; mov [Rq(candidate) + byte as i32], r10);
     }
-    emit_publish(ops, context, plan.header_word as u8, regs);
+    emit_publish(ops, regs);
 }
 
 pub(crate) fn emit_array_literal(
@@ -239,21 +239,5 @@ fn emit_dense_array(
         ; mov [Rq(shell) + plan.shell_kind_byte as i32], r10b
         ; mov Rq(regs.buffer), [Rq(context) + ALLOC_WINDOW_LAB_OFFSET as i32]
         ; mov [Rq(regs.buffer) + LAB_TOP_OFFSET as i32], Rq(regs.end)
-    );
-    emit_load_u64(ops, regs.size, u64::from(plan.shell.cell_bytes));
-    emit_count_allocation(
-        ops,
-        context,
-        plan.shell.header_word as u8,
-        regs.size,
-        regs.buffer,
-    );
-    emit_load_u64(ops, regs.size, u64::from(plan.slab_bytes));
-    emit_count_allocation(
-        ops,
-        context,
-        plan.slab_header_word as u8,
-        regs.size,
-        regs.buffer,
     );
 }

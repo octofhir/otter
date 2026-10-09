@@ -6,8 +6,7 @@
 //!
 //! # See also
 //!
-//! - GC architecture plan §7 ("Leak diagnosis").
-//! - Task 74 — GC stats, heap snapshot, retained-size walker.
+//! - `otter_gc::stats` — what the rows count and when they reconcile.
 
 use otter_gc::trace::{SlotVisitor, Traceable};
 use otter_gc::{GcHeap, HandleScope};
@@ -53,6 +52,6 @@ fn live_count_returns_to_zero_after_full_gc() {
     assert_eq!(stats.gc_cycles, 1);
     let row = &stats.by_type[Cell::TYPE_TAG as usize];
     assert_eq!(row.live_bytes, 0);
+    assert_eq!(row.live_count, 0);
     assert_eq!(row.alloc_count_total, 100);
-    assert_eq!(row.free_count_total, 100);
 }

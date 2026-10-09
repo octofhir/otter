@@ -148,7 +148,7 @@ fn publish(ops: &mut Assembler, context: u8, p: JitStringLayout, r: LabRegisters
     emit_load_u64(ops, r.size, u64::from(p.cell_bytes));
     dynasm!(ops ; .arch aarch64 ; ldr X(r.buffer),[X(context),ALLOC_WINDOW_LAB_OFFSET]
         ; add XSP(r.end),XSP(r.candidate),p.cell_bytes);
-    emit_publish(ops, context, p.string_type_tag, r);
+    emit_publish(ops, r);
 }
 fn emit_flat(
     ops: &mut Assembler,

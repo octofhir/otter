@@ -141,7 +141,12 @@ struct Observation {
     minor: u64,
     slots: u64,
     updates: u64,
+    /// Closures the runtime allocator created; a generated carve adds none.
     closures: u64,
+    /// Closure bytes the runtime allocator created.
+    closure_bytes: u64,
+    /// Every allocated byte, generated carves included.
+    allocated_bytes: u64,
     typed_ok: u64,
 }
 
@@ -252,6 +257,10 @@ fn installer(
                                 closures: stats.by_type
                                     [otter_vm::closure::JS_CLOSURE_BODY_TYPE_TAG as usize]
                                     .alloc_count_total,
+                                closure_bytes: stats.by_type
+                                    [otter_vm::closure::JS_CLOSURE_BODY_TYPE_TAG as usize]
+                                    .alloc_bytes_total,
+                                allocated_bytes: stats.alloc_bytes_total,
                                 typed_ok,
                             })
                         })();
@@ -549,6 +558,7 @@ fn case(extra: bool) {
         "warm stress callback premises: {warm_observations:?}"
     );
     recording.store(true, Ordering::Relaxed);
+    let mut fitted_arrow_bytes = None;
     for cold in [false, true] {
         collecting.store(cold, Ordering::Relaxed);
         observations.lock().unwrap().clear();
@@ -596,12 +606,23 @@ fn case(extra: bool) {
                 && b.new_target_undefined,
             "lexical aliases/source: {observed:?}"
         );
-        assert_eq!(
-            b.closures,
-            a.closures + 1,
-            "one real arrow allocation inside the measured region"
-        );
+        let allocated = b.allocated_bytes - a.allocated_bytes;
         if cold {
+            assert_eq!(
+                b.closures,
+                a.closures + 1,
+                "the arrow takes the runtime allocator exactly once"
+            );
+            assert_eq!(
+                allocated,
+                b.closure_bytes - a.closure_bytes,
+                "one real arrow allocation inside the measured region"
+            );
+            assert_eq!(
+                Some(allocated),
+                fitted_arrow_bytes,
+                "the generated fit carved exactly one cell of the same arrow"
+            );
             assert_eq!(
                 b.typed_ok,
                 a.typed_ok + 1,
@@ -620,6 +641,16 @@ fn case(extra: bool) {
                 b.typed_ok, a.typed_ok,
                 "actual current generated LAB fit bypasses the runtime allocator"
             );
+            assert_eq!(
+                (b.closures, b.closure_bytes),
+                (a.closures, a.closure_bytes),
+                "generated code carves the arrow without the runtime allocator"
+            );
+            assert!(
+                allocated > 0,
+                "one real arrow carve inside the measured region"
+            );
+            fitted_arrow_bytes = Some(allocated);
             assert_eq!(a.minor, b.minor);
             assert_eq!(
                 (a.child, a.receiver, a.context, a.before),

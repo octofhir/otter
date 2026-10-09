@@ -1071,40 +1071,87 @@ fn emit_test_typeof(
     );
 }
 
+/// Emit abstract (in)equality: numbers and the null/undefined equivalence
+/// class inline; every coercing pair, and a nullish operand against a native
+/// function (the only `[[IsHTMLDDA]]` carrier), completes the whole opcode
+/// through the reentrant loose-equality transition, which writes `dst`.
+#[allow(clippy::too_many_arguments)]
 fn emit_loose_compare(
     ops: &mut Assembler,
+    relocations: &mut RelocationCapture,
+    transitions: &crate::entry::TransitionTable,
     dst: u16,
     lhs: u16,
     rhs: u16,
     negate: bool,
     bail: DynamicLabel,
+    threw: DynamicLabel,
+    fatal: DynamicLabel,
 ) {
+    const NULLISH_BIT: i32 = 0x8;
+    const _: () = assert!(VALUE_NULL | NULLISH_BIT as u64 == VALUE_UNDEFINED);
+    const _: () = assert!(VALUE_UNDEFINED | NULLISH_BIT as u64 == VALUE_UNDEFINED);
+    let native_tag = otter_vm::native_function::NATIVE_FUNCTION_BODY_TYPE_TAG as i8;
     emit_load_reg(ops, 0, lhs);
     emit_load_reg(ops, 8, rhs);
     let equal = ops.new_dynamic_label();
     let not_equal = ops.new_dynamic_label();
     let numeric = ops.new_dynamic_label();
+    let lhs_nullish = ops.new_dynamic_label();
+    let rhs_nullish = ops.new_dynamic_label();
+    let slow = ops.new_dynamic_label();
     let done = ops.new_dynamic_label();
     // Identical words are equal, except a number's: NaN is not NaN.
     dynasm!(ops ; .arch x64 ; cmp rax, r8 ; jne >distinct);
     emit_load_u64(ops, 11, NUMBER_TAG);
-    dynasm!(ops ; .arch x64 ; test rax, r11 ; jnz =>numeric ; jmp =>equal ; distinct:);
-    emit_load_u64(ops, 11, VALUE_NULL);
-    dynasm!(ops ; .arch x64 ; cmp rax, r11 ; je >lhs_nullish);
-    emit_load_u64(ops, 11, VALUE_UNDEFINED);
-    dynasm!(ops ; .arch x64 ; cmp rax, r11 ; je >lhs_nullish ; jmp =>numeric ; lhs_nullish:);
-    emit_load_u64(ops, 11, VALUE_NULL);
-    dynasm!(ops ; .arch x64 ; cmp r8, r11 ; je =>equal);
-    emit_load_u64(ops, 11, VALUE_UNDEFINED);
-    dynasm!(ops ; .arch x64 ; cmp r8, r11 ; je =>equal ; jmp =>not_equal ; =>numeric);
-    emit_number_to_double(ops, 0, 0, bail);
-    emit_number_to_double(ops, 8, 1, bail);
-    dynasm!(ops ; .arch x64 ; ucomisd xmm0, xmm1 ; jp =>not_equal ; je =>equal ; =>not_equal);
+    dynasm!(ops ; .arch x64
+        ; test rax, r11 ; jnz =>numeric ; jmp =>equal
+        ; distinct:
+        ; mov r10, rax ; or r10, NULLISH_BIT ; cmp r10, VALUE_UNDEFINED as i32 ; je =>lhs_nullish
+        ; mov r10, r8 ; or r10, NULLISH_BIT ; cmp r10, VALUE_UNDEFINED as i32 ; je =>rhs_nullish
+        ; =>numeric
+    );
+    emit_number_to_double(ops, 0, 0, slow);
+    emit_number_to_double(ops, 8, 1, slow);
+    dynasm!(ops ; .arch x64
+        ; ucomisd xmm0, xmm1 ; jp =>not_equal ; je =>equal ; jmp =>not_equal
+        ; =>lhs_nullish
+        ; mov r10, r8 ; or r10, NULLISH_BIT ; cmp r10, VALUE_UNDEFINED as i32 ; je =>equal
+        ; mov r10, r8 ; jmp >nullish_against
+        ; =>rhs_nullish
+        ; mov r10, rax
+        ; nullish_against:
+    );
+    emit_load_u64(ops, 11, NOT_CELL_MASK);
+    dynasm!(ops ; .arch x64
+        ; test r10, r11 ; jnz =>not_equal
+        ; test r10, r10 ; jz =>not_equal
+        ; cmp BYTE [r10], native_tag ; je =>slow
+        ; =>not_equal
+    );
     emit_load_u64(ops, 0, if negate { VALUE_TRUE } else { VALUE_FALSE });
-    dynasm!(ops ; .arch x64 ; jmp =>done ; =>equal);
+    dynasm!(ops ; .arch x64 ; jmp >store ; =>equal);
     emit_load_u64(ops, 0, if negate { VALUE_FALSE } else { VALUE_TRUE });
-    dynasm!(ops ; .arch x64 ; =>done);
+    dynasm!(ops ; .arch x64 ; store:);
     emit_store_reg(ops, 0, dst);
+    dynasm!(ops ; .arch x64
+        ; jmp =>done
+        ; =>slow
+        ; mov rdi, r15
+        ; mov esi, i32::from(dst)
+        ; mov edx, i32::from(lhs)
+        ; mov ecx, i32::from(rhs)
+        ; mov r8d, i32::from(negate)
+    );
+    emit_load_runtime_stub(
+        ops,
+        relocations,
+        transitions.variadic_entry(abi::STUB_JIT_LOOSE_EQ),
+        abi::STUB_JIT_LOOSE_EQ,
+    );
+    emit_variadic_call(ops, abi::STUB_JIT_LOOSE_EQ, 5);
+    emit_side_exit_status_result(ops, bail, threw, fatal);
+    dynasm!(ops ; .arch x64 ; =>done);
 }
 
 fn emit_bitwise(

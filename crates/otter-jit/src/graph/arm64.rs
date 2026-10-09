@@ -71,6 +71,7 @@ use crate::template::arm64::values::{emit_load_symbol_u64, emit_load_u64};
 mod allocation;
 mod binding;
 mod committed_call;
+mod keyed_store;
 mod native_leaf;
 mod own_fields;
 
@@ -1626,6 +1627,12 @@ impl<'a> Codegen<'a> {
                 ];
                 let (pc, atom) = (*pc, *atom);
                 self.emit_store_property_cached(node, pc, atom, [receiver, value], temps)?;
+            }
+            Kind::StoreKeyedCached { .. } => {
+                let (receiver, key, value) =
+                    (Self::gp(input(0)), Self::gp(input(1)), Self::gp(input(2)));
+                let temps = [allocation.gp_temps[0], allocation.gp_temps[1]];
+                self.emit_store_keyed_cached(node, [receiver, key, value], temps)?;
             }
             Kind::LoadContextParent => {
                 let context = Self::gp(input(0));

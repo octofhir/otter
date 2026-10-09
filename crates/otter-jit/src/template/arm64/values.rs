@@ -111,6 +111,9 @@ pub(crate) fn emit_load_symbol_u64(
     value: u64,
     target: RelocationTarget,
 ) {
+    if relocations.emit_literal_load(ops, t, value, target.clone()) {
+        return;
+    }
     let start = ops.offset().0;
     emit_load_u64_wide(ops, t, value);
     relocations.record_mov_wide(start, ops.offset().0, t, target);

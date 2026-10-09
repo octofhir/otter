@@ -53,6 +53,25 @@ pub(crate) fn emit_fjcvtzs(ops: &mut dynasmrt::aarch64::Assembler, source: u8, d
 }
 
 pub(crate) use method_guard::{MethodGuardSite, emit_method_guard};
+
+/// Largest bytecode body whose code loads symbols from a literal pool: its
+/// code, about twelve bytes per bytecode byte plus inlined bodies, stays
+/// well within the ±1 MiB reach of `LDR (literal)`.
+const LITERAL_POOL_MAX_BYTECODE_BYTES: u32 = 32 * 1024;
+
+/// Relocation capture for one code object of `view`, with the literal pool
+/// enabled when the body is small enough for the pool to stay in range.
+pub(crate) fn literal_pool_capture(
+    capture: bool,
+    view: &otter_vm::JitCompileSnapshot,
+) -> crate::artifact::relocation::RelocationCapture {
+    let relocations = crate::artifact::relocation::RelocationCapture::new(capture);
+    if view.code_block.bytecode_byte_len() <= LITERAL_POOL_MAX_BYTECODE_BYTES {
+        relocations.with_literal_pool()
+    } else {
+        relocations
+    }
+}
 pub(crate) use receiver_allocation::{
     emit_receiver_bump, emit_receiver_candidate_probe, emit_receiver_fit, emit_receiver_guards,
     emit_receiver_publication_effect,

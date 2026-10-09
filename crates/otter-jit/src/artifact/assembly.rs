@@ -444,6 +444,16 @@ fn collect_labels(
 }
 
 fn render_relocation(output: &mut String, relocation: &ValidatedRelocation) {
+    if relocation.form == super::relocation::RelocationForm::LiteralWord {
+        writeln!(
+            output,
+            "+0x{:08x}: literal {} ; encoded-bytes=8 redacted",
+            relocation.start_offset,
+            symbolic_target(&relocation.target)
+        )
+        .expect("writing to String cannot fail");
+        return;
+    }
     let register = register_name(relocation.register, relocation.width_bits == 64);
     let bytes = relocation.end_offset - relocation.start_offset;
     writeln!(

@@ -164,7 +164,7 @@ fn compile_with_reach(
     let mut return_sites = Vec::new();
     let mut call_source_exits = Vec::new();
     let mut code_map = artifact_request.as_ref().map(|_| CodeMapCapture::default());
-    let mut relocations = RelocationCapture::new(artifact_request.is_some());
+    let mut relocations = crate::arm64::literal_pool_capture(artifact_request.is_some(), view);
     let mut direct_call_events = capture_events.then(|| super::seed_direct_call_events(view));
     let poll_entry = transitions.entry(abi::STUB_JIT_BACKEDGE_POLL);
     let mut coercion_slow_paths = Vec::new();
@@ -704,6 +704,11 @@ fn compile_with_reach(
         ));
     }
 
+    if let Some((start, end)) = relocations.emit_literal_pool(&mut ops)
+        && let Some(code_map) = code_map.as_mut()
+    {
+        code_map.record(CodeRegion::structural("literalPool", start, end));
+    }
     let buf = crate::entry::finalize_assembler(ops)?;
     let tier_input = artifact_request.as_ref().map(|_| plan.render_artifact());
     let TemplatePlan {

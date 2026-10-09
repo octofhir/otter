@@ -297,8 +297,7 @@ pub(crate) fn narrow_checked_arithmetic(
                 Kind::Int32Add if a.add(b).fits() => Kind::Int32AddWrapping,
                 Kind::Int32Sub if a.sub(b).fits() => Kind::Int32SubWrapping,
                 Kind::Int32Mul
-                    if a.mul(b).fits()
-                        && (identifies_zeros || !a.product_may_be_minus_zero(b)) =>
+                    if a.mul(b).fits() && (identifies_zeros || !a.product_may_be_minus_zero(b)) =>
                 {
                     Kind::Int32MulExact
                 }

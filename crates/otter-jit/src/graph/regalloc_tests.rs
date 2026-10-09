@@ -562,9 +562,11 @@ fn division_clobbers_preserve_original_values_for_eager_and_lazy_recipes() {
                     );
                     assert!(assigned.gp_temps.is_empty());
                     assert!(
-                        assigned.eager.iter().all(|&location| location
-                            != Location::Gp(pair.quotient)
-                            && location != Location::Gp(pair.remainder)),
+                        assigned
+                            .eager
+                            .iter()
+                            .all(|&location| location != Location::Gp(pair.quotient)
+                                && location != Location::Gp(pair.remainder)),
                         "even post-division exits must not read either overwritten implicit word"
                     );
                 } else {

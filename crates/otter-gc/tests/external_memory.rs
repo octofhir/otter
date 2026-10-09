@@ -211,10 +211,10 @@ impl otter_gc::trace::Traceable for ExternalHolder {
 }
 
 const HOLDER_BYTES: u64 = 4 * 1024 * 1024;
-/// The major-GC budget floor: with no surviving pages or reservations the
-/// budget sits at this floor, so dead payloads can accumulate to it plus one
-/// in-flight holder before the growth-triggered collection reclaims them.
-const MAJOR_GC_FLOOR_BYTES: u64 = 16 * 1024 * 1024;
+/// The external allocation soft limit (V8's `kExternalAllocationSoftLimit`):
+/// with no surviving reservations, dead payloads can accumulate to it plus
+/// one in-flight holder before the triggered collection reclaims them.
+const EXTERNAL_SOFT_LIMIT_BYTES: u64 = 64 * 1024 * 1024;
 
 fn churn_dead_holders(heap: &mut otter_gc::GcHeap, count: usize) -> u64 {
     heap.register_traceable::<ExternalHolder>();
@@ -235,7 +235,7 @@ fn dead_external_payloads_trigger_major_gc_without_a_cap() {
     let churned = 128 * HOLDER_BYTES;
     let peak = churn_dead_holders(&mut heap, 128);
     assert!(
-        peak <= MAJOR_GC_FLOOR_BYTES + HOLDER_BYTES,
+        peak <= EXTERNAL_SOFT_LIMIT_BYTES + HOLDER_BYTES,
         "dead external bytes peaked at {peak} of {churned} churned"
     );
 }
@@ -245,11 +245,11 @@ fn dead_external_payloads_trigger_major_gc_below_the_cap() {
     let mut heap = otter_gc::GcHeap::with_max_heap_bytes(2 * 1024 * 1024 * 1024).expect("heap");
     let peak = churn_dead_holders(&mut heap, 128);
     assert!(
-        peak <= MAJOR_GC_FLOOR_BYTES + HOLDER_BYTES,
+        peak <= EXTERNAL_SOFT_LIMIT_BYTES + HOLDER_BYTES,
         "dead external bytes peaked at {peak} below a 2 GiB cap"
     );
     assert!(
-        heap.tracked_bytes() <= MAJOR_GC_FLOOR_BYTES + HOLDER_BYTES,
+        heap.tracked_bytes() <= EXTERNAL_SOFT_LIMIT_BYTES + HOLDER_BYTES,
         "tracked bytes must be reconciled after the growth-triggered major GC"
     );
 }
@@ -266,7 +266,7 @@ fn external_pressure_keeps_the_ledger_peak_bounded() {
         .get(otter_resource::ResourceClass::ExternalBytes)
         .peak();
     assert!(
-        peak <= MAJOR_GC_FLOOR_BYTES + HOLDER_BYTES,
+        peak <= EXTERNAL_SOFT_LIMIT_BYTES + HOLDER_BYTES,
         "ledger ExternalBytes peak {peak} must follow the major-GC budget"
     );
 }

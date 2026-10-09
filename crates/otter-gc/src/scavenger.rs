@@ -138,6 +138,10 @@ struct ScavCtx {
     cage: *mut u8,
     /// Whether debug child-slot verification runs, read once for the pause.
     verify: bool,
+    /// Whether the body being traced lives in old or large space, so a young
+    /// child it keeps must enter the remembered set. Classified once per
+    /// traced body rather than per slot.
+    parent_old: bool,
 }
 
 impl ScavCtx {
@@ -246,6 +250,7 @@ pub unsafe fn scavenge(
         trace_table: unsafe { NonNull::new_unchecked(trace_table as *const _ as *mut _) },
         stats: ScavengeStats::default(),
         in_dirty_scan: false,
+        parent_old: false,
         remembered: unsafe { NonNull::new_unchecked(remembered_parents as *mut _) },
         host_refs: unsafe { NonNull::new_unchecked(host_refs as *mut _) },
         promoted_unscanned: Vec::new(),
@@ -473,6 +478,10 @@ unsafe fn verify_child_slot(
     }
 }
 
+/// Visit one slot: the hot part, inlined into every trace visitor. A null,
+/// old or large target returns at once; only a from-space target leaves
+/// through the out-of-line evacuation.
+#[inline(always)]
 unsafe fn process_slot(ctx: &mut ScavCtx, slot: *mut RawGc, parent_header: Option<*mut GcHeader>) {
     // SAFETY: slot is dereferenceable per precondition.
     unsafe {
@@ -496,14 +505,38 @@ unsafe fn process_slot(ctx: &mut ScavCtx, slot: *mut RawGc, parent_header: Optio
                 parent_header,
             );
         }
-        if !(*header_ptr).is_young() {
-            return; // old / large objects do not move on scavenge.
+        // Classify the target by its page, as V8's `InFromPage` does: an old
+        // or large target is never touched, so its header stays out of the
+        // cache. Objects on new-space pages are exactly the young ones.
+        match Page::header_of(header_ptr as *const u8).space {
+            SpaceKind::Old | SpaceKind::Large => {}
+            SpaceKind::NewTo => {
+                // Already evacuated during this scavenge: still young.
+                if ctx.parent_old {
+                    remember_parent(ctx, parent_header);
+                }
+            }
+            SpaceKind::NewFrom => evacuate_slot(ctx, slot, header_ptr, parent_header),
         }
-        if Page::header_of(header_ptr as *const u8).space == SpaceKind::NewTo {
-            remember_parent(ctx, parent_header, header_ptr);
-            return; // already evacuated during this scavenge.
-        }
-        let new_offset = evacuate(ctx, header_ptr);
+    }
+}
+
+/// Evacuate a from-space target and rewrite its slot.
+///
+/// # Safety
+///
+/// `slot` holds `header`, a live from-space object, under the STW pause.
+#[inline(never)]
+unsafe fn evacuate_slot(
+    ctx: &mut ScavCtx,
+    slot: *mut RawGc,
+    header: *mut GcHeader,
+    parent_header: Option<*mut GcHeader>,
+) {
+    // SAFETY: per docstring.
+    unsafe {
+        debug_assert!((*header).is_young());
+        let new_offset = evacuate(ctx, header);
         (*slot).0 = new_offset;
         ctx.stats.slot_updates += 1;
         // Generational invariant: evacuation itself can mint an
@@ -515,8 +548,9 @@ unsafe fn process_slot(ctx: &mut ScavCtx, slot: *mut RawGc, parent_header: Optio
         // storage (Box/Vec/SmallVec) outside the cage, while re-tracing
         // the whole parent reaches every slot through the refreshed
         // slab base.
-        let child_header = ctx.cage.add(new_offset as usize) as *const GcHeader;
-        remember_parent(ctx, parent_header, child_header);
+        if ctx.parent_old && (*ctx.cage.add(new_offset as usize).cast::<GcHeader>()).is_young() {
+            remember_parent(ctx, parent_header);
+        }
     }
 }
 
@@ -525,29 +559,24 @@ unsafe fn process_slot(ctx: &mut ScavCtx, slot: *mut RawGc, parent_header: Optio
 /// it. Covers both slots rewritten by this trace and slots already
 /// rewritten to NewTo by an earlier root pass in the same scavenge.
 /// Deduped by `FLAG_REMEMBERED`: a parent is pushed at most once per
-/// scavenge.
+/// scavenge. Roots have no parent and record nothing.
 ///
 /// # Safety
 ///
-/// `parent_header`, when present, and `child_header` must be live heap
-/// object headers under the current STW scavenge.
-unsafe fn remember_parent(
-    ctx: &mut ScavCtx,
-    parent_header: Option<*mut GcHeader>,
-    child_header: *const GcHeader,
-) {
+/// `parent_header`, when present, must be a live old or large object
+/// header under the current STW scavenge.
+#[cold]
+unsafe fn remember_parent(ctx: &mut ScavCtx, parent_header: Option<*mut GcHeader>) {
     // SAFETY: preconditions are inherited from `process_slot`.
     unsafe {
-        if !(*child_header).is_young() {
-            return;
-        }
         let Some(parent_header) = parent_header else {
             return;
         };
-        let parent_page = Page::header_of_mut(parent_header as *const u8);
-        if matches!(parent_page.space, SpaceKind::Old | SpaceKind::Large)
-            && !(*parent_header).is_remembered()
-        {
+        debug_assert!(matches!(
+            Page::header_of(parent_header as *const u8).space,
+            SpaceKind::Old | SpaceKind::Large
+        ));
+        if !(*parent_header).is_remembered() {
             (*parent_header).set_remembered();
             // Parent is old/large and in-cage; old objects do not move on a
             // minor GC, so this offset stays valid until the next scavenge
@@ -701,6 +730,7 @@ unsafe fn trace_ephemeron_table(ctx: &mut ScavCtx, header: *mut GcHeader) {
     // SAFETY: per docstring.
     unsafe {
         let table_ptr = ctx.trace_table.as_ptr();
+        ctx.parent_old = is_old_body(header);
         let ctx_ptr = ctx as *mut ScavCtx;
         let mut visitor =
             move |key_slot: *mut RawGc,
@@ -919,6 +949,20 @@ unsafe fn scan_range_raw(ctx: &mut ScavCtx, base: *mut u8, from: usize, to: usiz
     }
 }
 
+/// Whether `header` lives on an old or large page.
+///
+/// # Safety
+///
+/// `header` is a live object header inside a heap page.
+#[inline]
+unsafe fn is_old_body(header: *const GcHeader) -> bool {
+    // SAFETY: per docstring, the page header precedes the object.
+    matches!(
+        unsafe { Page::header_of(header.cast::<u8>()) }.space,
+        SpaceKind::Old | SpaceKind::Large
+    )
+}
+
 /// Whether this body came from the old remembered set or the Cheney worklist.
 enum TraceKind {
     Full,
@@ -937,6 +981,7 @@ unsafe fn trace_one(ctx: &mut ScavCtx, header: *mut GcHeader, kind: TraceKind) {
     // the type tag.
     unsafe {
         let table_ptr = ctx.trace_table.as_ptr();
+        ctx.parent_old = is_old_body(header);
         let ctx_ptr = ctx as *mut ScavCtx;
         let mut visitor = move |slot: *mut RawGc| {
             process_slot(&mut *ctx_ptr, slot, Some(header));

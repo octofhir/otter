@@ -2656,8 +2656,27 @@ impl otter_gc::SafeTraceable for ObjectBody {
     fn trace_slots_safe(&mut self, v: &mut SlotVisitor<'_>) {
         self.trace_fixed_slots(v);
         // Fixed handles have been rewritten before capacity/count are read.
-        for i in 0..self.slot_count() {
-            unsafe { (*self.field_ptr(self.location_for_slot(i))).trace_value_slot_mut(v) };
+        // Live slots fill the in-object prefix first, then the slab suffix
+        // from its first word: two contiguous runs, as V8's body descriptors
+        // walk a JSObject's in-object range and its property array.
+        let count = self.slot_count();
+        if count == 0 {
+            return;
+        }
+        let inline = self.inline_capacity();
+        let values = self.inline_values_ptr();
+        for index in 0..count.min(inline) {
+            // SAFETY: `index` is below both the live count and the reserved
+            // in-object capacity.
+            unsafe { (*values.add(index)).trace_value_slot_mut(v) };
+        }
+        if count > inline {
+            // SAFETY: every live overflow slot has a reserved suffix slab.
+            let words = unsafe { (*self.slab_body_ptr()).words_ptr() };
+            for index in 0..count - inline {
+                // SAFETY: the suffix holds `count - inline` live words.
+                unsafe { (*words.add(index)).trace_value_slot_mut(v) };
+            }
         }
     }
 

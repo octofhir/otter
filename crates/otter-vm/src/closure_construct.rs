@@ -23,6 +23,9 @@
 //!   detaches every constructor family and clears `constructor_layouts`.
 //! - `prototype_ordinary` is set exactly while `prototype` holds an ordinary
 //!   object: generated `instanceof` reads it in place of the slot's type.
+//! - `instanceof_cached` is set by generated `instanceof` when a site's cell
+//!   caches the closure and never cleared: a later change to its `prototype`,
+//!   own properties or `[[Prototype]]` empties every such cell first.
 //! - `proto_override` is meaningful only while the owning closure's
 //!   [`crate::closure::CLOSURE_LOOKUP_PROTO_OVERRIDE`] bit is set; it is traced
 //!   either way.
@@ -53,6 +56,7 @@ pub struct ClosureRareBody {
     pub(crate) own_props: JsObject,
     pub(crate) prototype_writable: bool,
     pub(crate) prototype_ordinary: bool,
+    pub(crate) instanceof_cached: bool,
     pub(crate) constructor_layouts: crate::constructor_layout::ConstructorLayout,
     pub(crate) prototype: Value,
     pub(crate) proto_override: Value,
@@ -63,6 +67,9 @@ pub const CLOSURE_RARE_OWN_PROPS_OFFSET: usize = std::mem::offset_of!(ClosureRar
 /// Byte offset of the flag that the `prototype` slot holds an ordinary object.
 pub const CLOSURE_RARE_PROTOTYPE_ORDINARY_OFFSET: usize =
     std::mem::offset_of!(ClosureRareBody, prototype_ordinary);
+/// Byte offset of the flag that a generated `instanceof` cell cached the closure.
+pub const CLOSURE_RARE_INSTANCEOF_CACHED_OFFSET: usize =
+    std::mem::offset_of!(ClosureRareBody, instanceof_cached);
 /// Byte offset of the `prototype` slot (hole until allocated) in the payload.
 pub const CLOSURE_RARE_PROTOTYPE_OFFSET: usize = std::mem::offset_of!(ClosureRareBody, prototype);
 /// Byte offset of the traced constructor family head.
@@ -75,6 +82,7 @@ impl Default for ClosureRareBody {
             own_props: JsObject::null(),
             prototype_writable: true,
             prototype_ordinary: false,
+            instanceof_cached: false,
             constructor_layouts: crate::constructor_layout::ConstructorLayout::null(),
             prototype: Value::hole(),
             proto_override: Value::undefined(),

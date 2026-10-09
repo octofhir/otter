@@ -1162,6 +1162,10 @@ pub struct Interpreter {
     /// compile can start a nested one). A root until the code object that
     /// embeds them is registered and takes them over.
     jit_compile_roots: std::cell::RefCell<Vec<jit_roots::CompilationRoot>>,
+    /// Every `instanceof` cell a compilation baked, emptied together by
+    /// [`Self::retire_instanceof_proofs`]; compilations and installed code
+    /// own the cells.
+    jit_instanceof_cells: std::cell::RefCell<Vec<std::sync::Weak<jit_roots::InstanceofCell>>>,
     /// Nesting depth of [`Self::with_runtime_turn`]; shapes created during a
     /// turn stay pinned until the outermost one ends.
     runtime_turn_depth: u32,

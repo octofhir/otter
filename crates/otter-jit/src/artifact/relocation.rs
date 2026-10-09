@@ -57,6 +57,7 @@ const TARGET_PROPERTY_ACTION_CACHE_TABLE: u8 = 13;
 const TARGET_CALLEE_IDENTITY_CELL: u8 = 16;
 const TARGET_ARITH_FEEDBACK_CELL: u8 = 17;
 const TARGET_SOURCE_WORK_CELL: u8 = 18;
+const TARGET_INSTANCEOF_CELL: u8 = 19;
 const TARGET_PROTOTYPE_VALIDITY_CELL: u8 = 15;
 
 /// Whether a named-property probe serves a load or a store site.
@@ -143,6 +144,12 @@ pub(crate) enum RelocationTarget {
     CalleeIdentityCell {
         function_id: u32,
         call_pc: u32,
+    },
+    /// Code-owned cache of the last target and prototype one `instanceof`
+    /// site proved, named by the site's function and byte PC.
+    InstanceofCell {
+        function_id: u32,
+        byte_pc: u32,
     },
     /// Canonical non-GC opcode-work scalar retained by emitted Template code.
     SourceWorkCell {
@@ -1321,6 +1328,14 @@ fn encode_target(target: &RelocationTarget, output: &mut Vec<u8>) -> Result<(), 
             output.push(TARGET_CALLEE_IDENTITY_CELL);
             put_u32(output, *function_id);
             put_u32(output, *call_pc);
+        }
+        RelocationTarget::InstanceofCell {
+            function_id,
+            byte_pc,
+        } => {
+            output.push(TARGET_INSTANCEOF_CELL);
+            put_u32(output, *function_id);
+            put_u32(output, *byte_pc);
         }
         RelocationTarget::SourceWorkCell { function_id } => {
             output.push(TARGET_SOURCE_WORK_CELL);

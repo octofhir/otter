@@ -277,6 +277,7 @@ impl Interpreter {
             let owner_now = unsafe { std::ptr::read_volatile(&owner_value) }
                 .as_closure(&self.gc_heap)
                 .ok_or(VmError::TypeMismatch)?;
+            self.retire_instanceof_proofs_for(owner_now);
             owner_now.set_own_props(&mut self.gc_heap, bag);
             return Ok(bag);
         }

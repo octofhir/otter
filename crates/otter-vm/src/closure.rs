@@ -558,6 +558,13 @@ impl JsClosure {
         child.pelt_trace(&mut visit);
     }
 
+    /// Whether a generated `instanceof` site's cell ever cached this closure.
+    #[must_use]
+    pub(crate) fn instanceof_cached(self, heap: &GcHeap) -> bool {
+        self.with_rare(heap, |rare| rare.instanceof_cached)
+            .unwrap_or(false)
+    }
+
     /// Clear the `prototype` property's writable attribute in the rare record
     /// the caller already allocated.
     pub(crate) fn freeze_prototype(self, heap: &mut GcHeap) {

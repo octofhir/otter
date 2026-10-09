@@ -197,6 +197,7 @@ impl Interpreter {
             jit_runtime_stats: crate::JitRuntimeStats::default(),
             jit_code_registry: crate::jit_registry::JitCodeRegistry::new_boxed(),
             jit_compile_roots: std::cell::RefCell::default(),
+            jit_instanceof_cells: std::cell::RefCell::default(),
             runtime_turn_depth: 0,
             jit_generated_feedback_pending: false,
             jit_next_code_object_id: 1,

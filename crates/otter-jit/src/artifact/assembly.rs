@@ -499,6 +499,10 @@ fn symbolic_target(target: &RelocationTarget) -> String {
             function_id,
             call_pc,
         } => format!("calleeIdentityCell(function={function_id},callPc={call_pc})"),
+        RelocationTarget::InstanceofCell {
+            function_id,
+            byte_pc,
+        } => format!("instanceofCell(function={function_id},bytePc={byte_pc})"),
         RelocationTarget::ArithFeedbackCell { function_id, pc } => {
             format!("arithFeedbackCell(function={function_id},pc={pc})")
         }

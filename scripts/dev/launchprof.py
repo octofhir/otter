@@ -14,6 +14,9 @@ the samples with a frame matching it, profiling that subtree alone. Traces and e
 launch's `/tmp/perf-<pid>.map` is kept beside its export and resolves bare
 JIT addresses to `JS:<function> [<tier> c<code-object>]`; OFFSETS=1 keeps the
 code offset (`+0x..`) to read against that run's `--jit-artifacts` listing.
+ATTRIBUTE=<leaf>:<owner> counts the samples whose leaf frame contains <leaf>
+by the first frame up the stack that contains <owner> (e.g. `malloc:otter_jit`
+names the compiler code that allocates).
 BOUNDARY=1 also counts, per sample, the native frame the innermost generated
 frame called: the runtime entries compiled code pays for. BOUNDARY=N keeps
 the N frames below that boundary, outermost first; BOUNDARY_CALLER=1 prefixes
@@ -55,6 +58,8 @@ offsets = os.environ.get("OFFSETS") == "1"
 boundary_depth = int(os.environ.get("BOUNDARY", "0") or 0)
 boundary_caller = os.environ.get("BOUNDARY_CALLER") == "1"
 boundary = collections.Counter() if boundary_depth else None
+attribute = os.environ.get("ATTRIBUTE")
+attributed = collections.Counter()
 callers = collections.Counter()
 callees = collections.Counter()
 out.mkdir(parents=True, exist_ok=True)
@@ -116,6 +121,10 @@ for run in range(runs):
             continue
         total += 1
         self_counts[names[0]] += 1
+        if attribute:
+            leaf, owner = attribute.split(":", 1)
+            if leaf in names[0]:
+                attributed[next((name for name in names[1:] if owner in name), "<none>")] += 1
         if boundary is not None:
             generated = [index for index, name in enumerate(names) if name.startswith("JS:")]
             if generated:
@@ -203,3 +212,7 @@ if focus:
         print(f"== {title} of {focus}")
         for name, count in table.most_common(top):
             print(f"{count:6d}  {show(name)[:240]}")
+if attribute:
+    print(f"== {attribute.split(':', 1)[0]} attributed to the first {attribute.split(':', 1)[1]} frame")
+    for name, count in attributed.most_common(top):
+        print(f"{count:6}  {name}")

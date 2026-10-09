@@ -35,12 +35,14 @@ use crate::oom::OutOfMemory;
 use crate::page::{CELL_SIZE, PAGE_HEADER_SIZE, PAGE_PAYLOAD_SIZE, PAGE_SIZE};
 use crate::page::{LARGE_OBJECT_THRESHOLD, Page, SpaceKind, align_up};
 
-/// Young-gen pages per semispace by default. With 256 KiB pages
-/// this gives a 4 MiB nursery (matches NF1 budget).
+/// Young-gen pages per semispace at creation. With 256 KiB pages
+/// this gives a 4 MiB nursery.
 pub const DEFAULT_NEW_SPACE_PAGES: usize = 16;
 
-/// Cap on new-space pages — guard against runaway growth.
-pub const MAX_NEW_SPACE_PAGES: usize = 64;
+/// Most pages a semispace grows to: 32 MiB, V8's
+/// `kScavengerDefaultMaxCapacity`. A larger nursery gives short-lived
+/// objects more allocation to die in before a scavenge copies them.
+pub const MAX_NEW_SPACE_PAGES: usize = 128;
 
 /// Two-semispace young generation.
 pub struct NewSpace {
@@ -52,6 +54,10 @@ pub struct NewSpace {
     cleanup: Vec<u32>,
     /// Page index inside `from` currently being bump-allocated.
     active: usize,
+    /// Page index inside `to` the scavenger currently copies survivors into.
+    /// Pages before it are full for every request: each object is at most
+    /// half a page, so a page is left only once it is more than half full.
+    to_active: usize,
     /// Maximum pages each semispace may grow to.
     max_pages: usize,
 }
@@ -80,6 +86,7 @@ impl NewSpace {
             to,
             cleanup: Vec::new(),
             active: 0,
+            to_active: 0,
             max_pages,
         })
     }
@@ -166,10 +173,13 @@ impl NewSpace {
     /// Bump-allocate inside `to`-space — used by the scavenger
     /// while evacuating survivors.
     pub fn alloc_in_to(&mut self, size_aligned: usize) -> Option<u32> {
-        for page in &self.to {
+        // One moving to-space top, like V8's semispace allocation: never
+        // rescan the pages already filled.
+        while let Some(page) = self.to.get(self.to_active) {
             if let Some(offset) = page.bump_alloc(size_aligned) {
                 return Some(offset);
             }
+            self.to_active += 1;
         }
         // To-space ran out — would need to promote remainder to
         // old-gen. The scavenger handles that path; this fn
@@ -222,6 +232,7 @@ impl NewSpace {
             page.reset_bump();
         }
         self.active = 0;
+        self.to_active = 0;
     }
 }
 

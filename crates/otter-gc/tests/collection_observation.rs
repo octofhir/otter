@@ -78,10 +78,12 @@ fn natural_nursery_pressure_has_exact_provenance_and_cycle_coverage() {
 #[test]
 fn natural_major_pressure_includes_nested_minor_and_accounting_in_one_event() {
     let mut heap = heap();
+    heap.set_initial_old_generation_size(8 * 1024 * 1024);
     heap.start_gc_pause_capture(32).expect("capture");
     let before = heap.gc_stats().gc_cycles;
     // Each dead large cell consumes an actual old/large page. This crosses the
-    // production growth floor; there is no manual collection or stress tick.
+    // configured initial old-generation limit; there is no manual collection
+    // or stress tick.
     for i in 0..80u64 {
         heap.alloc_trailing_with_roots(OpaqueLeaf { payload: i }, 200 * 1024, &mut |_| {})
             .expect("dead large traffic");

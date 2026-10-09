@@ -199,6 +199,11 @@ pub(crate) struct Known {
     /// The compiled function's receiver, already loaded on this path. The
     /// activation's `this` binding never changes, so no write forgets it.
     this: Option<NodeId>,
+    /// Cells a buffer bump allocated on this path since its last safepoint:
+    /// the buffer serves only while no marking runs, so each is young and
+    /// unmarked, and a store into it owes no barrier (V8's
+    /// MemoryOptimizer). Any call, collection point or poll forgets them.
+    fresh: FxHashSet<NodeId>,
 }
 
 impl Known {
@@ -263,6 +268,7 @@ impl Known {
         if self.this != other.this {
             self.this = None;
         }
+        self.fresh.retain(|cell| other.fresh.contains(cell));
     }
 
     /// Forget every fact a heap write may invalidate.
@@ -271,6 +277,7 @@ impl Known {
         self.storage.clear();
         self.fields.clear();
         self.elements_read.clear();
+        self.fresh.clear();
     }
 
     /// The value a store just wrote to `key`. A store through another node
@@ -319,6 +326,7 @@ impl Known {
     fn forget_storage(&mut self) {
         self.storage.clear();
         self.elements_read.clear();
+        self.fresh.clear();
     }
 
     /// The heap facts on this path.
@@ -946,6 +954,9 @@ impl<'a> Builder<'a> {
                 layout.shapes = Some(smallvec::smallvec![shape]);
                 layout.writable = true;
                 self.known.entry(receiver).heap_object = true;
+                // A failed bump resumes the construct elsewhere: the node only
+                // ever yields a buffer cell.
+                self.known.fresh.insert(receiver);
                 (receiver, closure, Some(receiver))
             }
         };
@@ -2762,8 +2773,12 @@ impl<'a> Builder<'a> {
     /// Prove `object` has one of `shapes`, unless already proved.
     /// The generational barrier after storing `value` into `object`, unless
     /// `value` can never be a cell, as V8 omits it for a Smi: an immediate
-    /// constant, a boxed number or a boolean result.
+    /// constant, a boxed number or a boolean result; or unless `object` is a
+    /// cell this path just bumped.
     fn write_barrier(&mut self, object: NodeId, value: NodeId) {
+        if self.known.fresh.contains(&object) {
+            return;
+        }
         let never_cell = match self.graph.node(value).kind {
             Kind::ConstTagged(bits) => !tag::is_cell_bits(bits),
             Kind::Int32ToTagged | Kind::Float64ToTagged => true,

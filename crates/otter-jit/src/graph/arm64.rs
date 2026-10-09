@@ -498,8 +498,14 @@ impl<'a> Codegen<'a> {
     }
 
     /// Materialize `bits` into general register `register`.
+    /// `X(register)` = `bits`: one `MOVZ`/`MOVN`/`ORR` when that encodes
+    /// it, else one load of its literal-pool word.
     fn load_immediate(&mut self, register: u8, bits: u64) {
-        emit_load_u64(&mut self.ops, register, bits);
+        if crate::template::arm64::values::load_u64_instructions(bits) == 1
+            || !self.relocations.emit_constant_load(&mut self.ops, register, bits)
+        {
+            emit_load_u64(&mut self.ops, register, bits);
+        }
     }
 
     /// The int32 constant at `location`, if it is one.
@@ -3768,12 +3774,7 @@ impl<'a> Codegen<'a> {
                     20,
                 );
                 dynasm!(self.ops ; .arch aarch64 ; cbz x1, =>missed);
-                crate::arm64::emit_receiver_publication_effect(
-                    &mut self.ops,
-                    source_view,
-                    allocation,
-                    20,
-                );
+                crate::arm64::emit_receiver_publication_effect(&mut self.ops, 20);
                 dynasm!(self.ops ; .arch aarch64 ; b =>allocated ; =>missed);
                 self.load_immediate(0, VALUE_UNDEFINED);
                 dynasm!(self.ops

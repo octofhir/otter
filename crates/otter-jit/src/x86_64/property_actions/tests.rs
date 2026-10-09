@@ -60,7 +60,7 @@ fn snapshot() -> JitCompileSnapshot {
     view.shape_prototype_byte = 12;
     assert_ne!(view.object_shape_byte, 0, "object tag cannot alias shape");
     assert_ne!(view.shape_state_byte, view.shape_inline_capacity_byte);
-    assert!(view.shape_prototype_byte >= view.shape_inline_capacity_byte + 1);
+    assert!(view.shape_prototype_byte > view.shape_inline_capacity_byte);
     assert!(view.shape_prototype_byte + 4 <= SHAPE_ID_BYTE);
     view
 }

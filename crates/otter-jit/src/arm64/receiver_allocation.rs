@@ -32,13 +32,11 @@
 use dynasmrt::{DynamicLabel, DynasmApi, DynasmLabelApi, aarch64::Assembler, dynasm};
 use otter_vm::JitCompileSnapshot;
 
-use crate::arm64::allocation::emit_count_allocation_bytes;
 use crate::template::arm64::values::{CellTest, emit_cell_test, emit_load_u64};
 use crate::{
     artifact::relocation::RelocationCapture,
     entry::{
-        ALLOC_WINDOW_LAB_OFFSET, LAB_LIMIT_OFFSET, LAB_TOP_OFFSET, OBJECT_BODY_TYPE_TAG,
-        RECEIVER_ALLOC_ATTEMPTS_OFFSET, RECEIVER_ALLOC_GENERATED_OFFSET,
+        ALLOC_WINDOW_LAB_OFFSET, LAB_LIMIT_OFFSET, LAB_TOP_OFFSET,
         RECEIVER_ALLOC_GUARD_MISSES_OFFSET, RECEIVER_ALLOC_SPACE_MISSES_OFFSET,
         RUNTIME_STATS_OFFSET, VALUE_UNDEFINED,
     },
@@ -56,7 +54,6 @@ fn emit_receiver_candidate(
     ready: DynamicLabel,
 ) {
     crate::arm64::js_call::emit_clear_construct_ticket(ops, context_register);
-    emit_increment_runtime_counter(ops, context_register, RECEIVER_ALLOC_ATTEMPTS_OFFSET);
     emit_receiver_guards(ops, relocations, view, plan, guard_miss);
     emit_receiver_fit(ops, view, plan, context_register, space_miss);
     dynasm!(ops ; .arch aarch64 ; mov x0, x16 ; mov x1, x13 ; b =>ready);
@@ -103,15 +100,15 @@ pub(crate) fn emit_receiver_guards(
             ; ldr w17, [x17, closure.constructor_layouts_byte]
         );
     }
-    dynasm!(ops ; .arch aarch64
-        ; cbz w17, =>guard_miss ; add x17, x12, x17
-        ; ldr x11, [x17, view.constructor_layout.family_id_byte]
-    );
-    if plan.family_id <= 0xfff {
-        dynasm!(ops ; .arch aarch64 ; cmp x11, plan.family_id as u32);
+    // The head is the plan's exact family cell; an empty head (zero) never
+    // equals a cell handle.
+    let cell = plan.family_cell;
+    if cell < 1 << 24 {
+        dynasm!(ops ; .arch aarch64
+            ; sub w11, w17, cell >> 12, lsl 12 ; cmp w11, cell & 0xfff);
     } else {
-        emit_load_u64(ops, 14, plan.family_id);
-        dynasm!(ops ; .arch aarch64 ; cmp x11, x14);
+        emit_load_u64(ops, 14, u64::from(cell));
+        dynasm!(ops ; .arch aarch64 ; cmp w17, w14);
     }
     dynasm!(ops ; .arch aarch64 ; b.ne =>guard_miss);
     if let Some(validity) = plan.prototype_validity {
@@ -215,44 +212,10 @@ fn receiver_cell_bytes(
         .cell_bytes(usize::from(plan.inline_capacity)) as u32
 }
 
-/// Publish one completely initialized candidate fit, also in `x0`.
-///
-/// This operation cannot miss: the buffer bump was proven by
-/// `emit_receiver_candidate`, the heap charged the buffer to any cap when it
-/// was carved, and generated Machine code has no safepoint or reentry between
-/// candidate creation and this effect. Clobbers `x13`–`x15`.
-fn emit_receiver_publication(
-    ops: &mut Assembler,
-    view: &JitCompileSnapshot,
-    plan: otter_vm::jit::JitReceiverAllocationPlan,
-    context_register: u8,
-) {
-    dynasm!(ops ; .arch aarch64
-        ; str x0, [X(context_register), crate::entry::PENDING_CALL_OFFSET + otter_vm::native_abi::REQUEST_CONSTRUCT_RECEIVER_OFFSET]
-    );
-    emit_receiver_bump(ops, view, plan, context_register);
-    emit_increment_runtime_counter(ops, context_register, RECEIVER_ALLOC_GENERATED_OFFSET);
-}
-
-/// Publish the fit of `plan` — cell in `x16`, buffer in `x13`, end in `x15`
-/// — by bumping its buffer and accounting the cell; the receiver is returned
-/// in `x0`. Clobbers `x13`–`x15`.
-pub(crate) fn emit_receiver_bump(
-    ops: &mut Assembler,
-    view: &JitCompileSnapshot,
-    plan: otter_vm::jit::JitReceiverAllocationPlan,
-    context_register: u8,
-) {
-    dynasm!(ops ; .arch aarch64 ; str x15, [x13, LAB_TOP_OFFSET]);
-    emit_count_allocation_bytes(
-        ops,
-        context_register,
-        OBJECT_BODY_TYPE_TAG as u8,
-        receiver_cell_bytes(view, plan),
-        13,
-        14,
-    );
-    dynasm!(ops ; .arch aarch64 ; mov x0, x16);
+/// Publish a receiver fit — cell in `x16`, buffer in `x13`, end in `x15` —
+/// by bumping its buffer; the receiver is returned in `x0`.
+pub(crate) fn emit_receiver_bump(ops: &mut Assembler) {
+    dynasm!(ops ; .arch aarch64 ; str x15, [x13, LAB_TOP_OFFSET] ; mov x0, x16);
 }
 
 /// Complete the allocation half of an optimizing receiver probe.
@@ -293,14 +256,17 @@ pub(crate) fn emit_receiver_candidate_probe(
 }
 
 /// Commit one optimizing receiver candidate after the probe's hit edge
-/// dominates.
-pub(crate) fn emit_receiver_publication_effect(
-    ops: &mut Assembler,
-    view: &JitCompileSnapshot,
-    plan: otter_vm::jit::JitReceiverAllocationPlan,
-    context_register: u8,
-) {
-    emit_receiver_publication(ops, view, plan, context_register);
+/// dominates: publish the completely initialized fit, also in `x0`.
+///
+/// This operation cannot miss: the buffer bump was proven by
+/// `emit_receiver_candidate`, the heap charged the buffer to any cap when it
+/// was carved, and generated Machine code has no safepoint or reentry between
+/// candidate creation and this effect. Clobbers `x13`–`x15`.
+pub(crate) fn emit_receiver_publication_effect(ops: &mut Assembler, context_register: u8) {
+    dynasm!(ops ; .arch aarch64
+        ; str x0, [X(context_register), crate::entry::PENDING_CALL_OFFSET + otter_vm::native_abi::REQUEST_CONSTRUCT_RECEIVER_OFFSET]
+    );
+    emit_receiver_bump(ops);
 }
 
 fn emit_increment_runtime_counter(ops: &mut Assembler, context_register: u8, offset: u32) {

@@ -2,7 +2,7 @@
 //!
 //! # Contents
 //! - Exact empty/static shells, numeric/tagged slabs and multiword hole maps.
-//! - Source-realm and limit misses, complete type accounting and late results.
+//! - Source-realm and limit misses, exact cursor progress and late results.
 //!
 //! # Invariants
 //! - These poisoned host buffers never enter the GC cage or collector.
@@ -15,7 +15,7 @@ use crate::CompiledCode;
 use crate::allocation::{AllocationValue, EmptyLiteralLayout};
 use crate::artifact::relocation::RelocationCapture;
 use crate::entry::{VALUE_HOLE, VALUE_UNDEFINED};
-use otter_gc::{lab::LinearAllocationArea, stats::TypeStats};
+use otter_gc::lab::LinearAllocationArea;
 use otter_vm::jit::{
     JitArrayLiteralAllocationPlan, JitEmptyArrayAllocationPlan, JitEmptyObjectAllocationPlan,
     JitObjectLiteralAllocationPlan,
@@ -82,7 +82,6 @@ fn execute(
         top: start,
         limit: start + bytes as usize - usize::from(!fits),
     };
-    let mut stats = [TypeStats::DEFAULT; 256];
     let mut thread = VmThread::empty();
     thread.active_realm_cell = std::ptr::addr_of!(actual_realm) as u64;
     let mut ctx = JitCtx {
@@ -93,10 +92,7 @@ fn execute(
         global_this_offset: std::ptr::null(),
         native_stack_limit: 0,
         generated_feedback_clean: 1,
-        alloc_window: otter_vm::jit::JitMachineAllocationWindow {
-            lab: &mut lab,
-            type_stats: stats.as_mut_ptr(),
-        },
+        alloc_window: otter_vm::jit::JitMachineAllocationWindow { lab: &mut lab },
         runtime_stats: std::ptr::null_mut(),
         pending_call: CallRequest::EMPTY,
         completion: NativeResultPair::success(Value::UNDEFINED),
@@ -155,7 +151,7 @@ fn execute(
     );
     let code = CompiledCode::new(ops.finalize().unwrap(), entry);
     // SAFETY: the private System V function receives valid bounded host
-    // inputs/LAB/stats, preserves every nonvolatile GP and exact stack, and
+    // inputs and LAB, preserves every nonvolatile GP and exact stack, and
     // neither calls the VM nor exposes the fabricated host cells to GC.
     let call: extern "sysv64" fn(*mut JitCtx, *const u64) -> usize =
         unsafe { std::mem::transmute(code.entry_ptr()) };
@@ -258,36 +254,6 @@ fn execute(
             body, expected,
             "entire shell/slab payload, including padding"
         );
-    }
-    for (tag, row) in stats.iter().enumerate() {
-        let owned = if !accepted {
-            0
-        } else {
-            match layout {
-                Layout::Empty(EmptyLiteralLayout::Object(plan))
-                    if tag == plan.header_word as u8 as usize =>
-                {
-                    plan.cell_bytes
-                }
-                Layout::Empty(EmptyLiteralLayout::Array(plan))
-                    if tag == plan.header_word as u8 as usize =>
-                {
-                    plan.cell_bytes
-                }
-                Layout::Object(plan) if tag == plan.header_word as u8 as usize => plan.cell_bytes,
-                Layout::Array(_) if tag == dense.unwrap().shell.header_word as u8 as usize => {
-                    dense.unwrap().shell.cell_bytes
-                }
-                Layout::Array(_) if tag == dense.unwrap().slab_header_word as u8 as usize => {
-                    dense.unwrap().slab_bytes
-                }
-                _ => 0,
-            }
-        };
-        assert_eq!(row.live_bytes, owned as usize);
-        assert_eq!(row.alloc_count_total, u64::from(owned != 0));
-        assert_eq!(row.alloc_bytes_total, u64::from(owned));
-        assert_eq!(row.free_count_total, 0);
     }
 }
 

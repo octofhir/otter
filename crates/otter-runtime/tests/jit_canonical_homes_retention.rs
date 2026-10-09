@@ -90,7 +90,7 @@ fn live_types(gc: &otter_gc::GcStats) -> Vec<LiveType> {
         .filter(|(_, row)| row.live_bytes != 0)
         .map(|(type_tag, row)| LiveType {
             type_tag,
-            objects: row.alloc_count_total - row.free_count_total,
+            objects: row.live_count,
             bytes: row.live_bytes,
         })
         .collect()

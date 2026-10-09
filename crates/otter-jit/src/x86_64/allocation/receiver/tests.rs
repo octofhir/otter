@@ -4,7 +4,8 @@
 //! - Closure/class exact-family proofs and exact initialized shell bytes.
 //! - Boxed-function, missing-family, other-family, validity and LAB misses
 //!   before publication.
-//! - Exact allocation accounting and immutable family payload and preserved call operands/registers.
+//! - Exact LAB progress and miss counters, immutable family payload and
+//!   preserved call operands/registers.
 //!
 //! # Invariants
 //! - Fabricated host cells never enter the collector; these tests claim no GC.
@@ -15,7 +16,8 @@
 
 use super::*;
 use crate::CompiledCode;
-use otter_gc::{lab::LinearAllocationArea, stats::TypeStats};
+use crate::entry::OBJECT_BODY_TYPE_TAG;
+use otter_gc::lab::LinearAllocationArea;
 use otter_vm::{
     JitRuntimeStats, Value,
     jit::{
@@ -88,6 +90,12 @@ fn execute(case: Case) {
         new_target_function_id: FUNCTION,
         new_target_is_class: matches!(case, Case::Class | Case::NotClass),
         family_id: 0xfedc_ba98_7654_3210,
+        // A different family is a different cell than the owner's head.
+        family_cell: if matches!(case, Case::DifferentFamily) {
+            offset(family + 64)
+        } else {
+            offset(family)
+        },
         receiver_shape: if matches!(case, Case::EmptyShape) {
             0
         } else {
@@ -109,7 +117,7 @@ fn execute(case: Case) {
     store32(&mut memory, initial + 12, offset(prototype));
     store32(&mut memory, initial + 8, 2);
     memory[prototype / 8] = OBJECT_BODY_TYPE_TAG as u64;
-    memory[(family + 8) / 8] = plan.family_id - u64::from(matches!(case, Case::DifferentFamily));
+    memory[(family + 8) / 8] = plan.family_id;
     store32(&mut memory, family + 16, offset(root));
     let family_before = memory[family / 8..(family + 32) / 8].to_vec();
     let head = if matches!(case, Case::NoFamily) {
@@ -144,7 +152,6 @@ fn execute(case: Case) {
         top: start,
         limit: start + bytes - usize::from(matches!(case, Case::Space)),
     };
-    let mut stats = [TypeStats::DEFAULT; 256];
     let mut runtime = JitRuntimeStats::default();
     let mut thread = VmThread::empty();
     let mut ctx = JitCtx {
@@ -155,10 +162,7 @@ fn execute(case: Case) {
         global_this_offset: std::ptr::null(),
         native_stack_limit: 0,
         generated_feedback_clean: 1,
-        alloc_window: otter_vm::jit::JitMachineAllocationWindow {
-            lab: &mut lab,
-            type_stats: stats.as_mut_ptr(),
-        },
+        alloc_window: otter_vm::jit::JitMachineAllocationWindow { lab: &mut lab },
         runtime_stats: &mut runtime,
         pending_call: CallRequest::EMPTY,
         completion: NativeResultPair::success(Value::UNDEFINED),
@@ -187,7 +191,7 @@ fn execute(case: Case) {
         ; mov r10, [rdx + crate::entry::LAB_TOP_OFFSET as i32]
         ; mov [r14 + 16], r10
     );
-    emit_receiver_publication_effect(&mut ops, &view, 15);
+    emit_receiver_publication_effect(&mut ops, 15);
     dynasm!(ops ; .arch x64
         ; =>missed
         ; mov [r14 + 24], rsi ; mov [r14 + 32], rcx
@@ -200,7 +204,7 @@ fn execute(case: Case) {
     );
     let code = CompiledCode::new(ops.finalize().unwrap(), entry);
     // SAFETY: the private System V entry touches only these bounded host
-    // cells/LAB/stats/output, saves nonvolatiles and never calls or enters GC.
+    // cells/LAB/output, saves nonvolatiles and never calls or enters GC.
     let call: extern "sysv64" fn(*mut JitCtx, u64, *mut u64) =
         unsafe { std::mem::transmute(code.entry_ptr()) };
     call(&mut ctx, new_target, output.as_mut_ptr());
@@ -264,23 +268,17 @@ fn execute(case: Case) {
         family_before,
         "{case:?}: no probe/publication may mutate or retain a family receiver"
     );
-    assert_eq!(runtime.receiver_alloc_attempts, 1);
-    assert_eq!(runtime.receiver_alloc_generated, u64::from(accepted));
+    // A fit counts nothing: the buffer progress above is the heap's only
+    // record of it. Each miss counts exactly its own reason.
     assert_eq!(
-        runtime.receiver_alloc_space_misses,
-        u64::from(matches!(case, Case::Space))
+        runtime,
+        JitRuntimeStats {
+            receiver_alloc_space_misses: u64::from(matches!(case, Case::Space)),
+            receiver_alloc_guard_misses: u64::from(!accepted && !matches!(case, Case::Space)),
+            ..JitRuntimeStats::default()
+        },
+        "{case:?}: runtime counters"
     );
-    assert_eq!(
-        runtime.receiver_alloc_guard_misses,
-        u64::from(!accepted && !matches!(case, Case::Space))
-    );
-    for (tag, row) in stats.iter().enumerate() {
-        let owned = accepted && tag == OBJECT_BODY_TYPE_TAG as usize;
-        assert_eq!(row.live_bytes, if owned { bytes } else { 0 });
-        assert_eq!(row.alloc_count_total, u64::from(owned));
-        assert_eq!(row.alloc_bytes_total, if owned { bytes as u64 } else { 0 });
-        assert_eq!(row.free_count_total, 0);
-    }
 }
 
 #[test]

@@ -311,6 +311,13 @@ impl StepTracer for Tracer {
             .push((event.function_id, event.byte_pc, event.op));
     }
 }
+/// Bytes generated code carved: the heap folds buffer progress into the
+/// aggregate total, while the per-type rows count runtime allocations only.
+fn generated_bytes(stats: &otter_gc::GcStats) -> u64 {
+    let runtime: u64 = stats.by_type.iter().map(|row| row.alloc_bytes_total).sum();
+    stats.alloc_bytes_total - runtime
+}
+
 fn native_trace(
     vm: &mut Interpreter,
     source: &ExecutionContext,
@@ -609,8 +616,14 @@ fn run(optimizing: bool) {
         let after = vm.gc_stats_snapshot();
         assert_eq!(after.minor_gc_cycles, before.minor_gc_cycles);
         assert_eq!(
+            generated_bytes(&after) - generated_bytes(&before),
+            u64::from(layout.cell_bytes),
+            "the native fit carves exactly one string cell from the buffer"
+        );
+        assert_eq!(
             after.by_type[layout.string_type_tag as usize].alloc_count_total,
-            before.by_type[layout.string_type_tag as usize].alloc_count_total + 1
+            before.by_type[layout.string_type_tag as usize].alloc_count_total,
+            "the runtime allocator makes no string for a native fit"
         );
         assert_eq!(
             vm.jit_runtime_stats().alloc_value_stub_ok,

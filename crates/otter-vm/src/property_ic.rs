@@ -220,6 +220,21 @@ impl IcEntry {
         word == 0 || unsafe { PrototypeValidity::borrow_raw(word) }.is_valid()
     }
 
+    /// Whether the entry already holds exactly `handler` for its key: the
+    /// same field, kind, transition guard, slot, auxiliary shape and proof.
+    fn holds(&self, handler: &IcHandler) -> bool {
+        let validity = handler
+            .validity
+            .as_ref()
+            .map_or(0, |cell| Arc::as_ptr(cell) as u64);
+        self.field.load(Ordering::Relaxed) == handler.field.cache_key()
+            && self.kind() == handler.kind
+            && self.transition.load(Ordering::Relaxed) == handler.transition as u8
+            && self.slot() == handler.slot
+            && self.aux.load(Ordering::Relaxed) == handler.aux.offset()
+            && self.validity_word() == validity
+    }
+
     fn write(&self, handler: IcHandler) {
         let key = handler.key();
         let old = self.validity.swap(
@@ -836,6 +851,12 @@ impl PropertyIcSlot {
             "handler family matches the site"
         );
         if let Some(entry) = self.matching(handler.key()) {
+            // Re-learning the handler an entry already holds (a receiver
+            // that missed only because it reached the site before its shape
+            // settled) is no transition: the site's feedback did not change.
+            if entry.holds(&handler) {
+                return InstallOutcome::Unchanged;
+            }
             entry.write(handler);
             self.refresh_inline();
             self.installs.fetch_add(1, Ordering::Relaxed);

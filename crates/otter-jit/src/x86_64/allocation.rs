@@ -1,8 +1,6 @@
 //! Generated nursery allocation shared by the x86-64 tiers.
 //!
 //! # Contents
-//! - [`emit_count_allocation`]: the per-type statistics row update the Rust
-//!   allocator performs for every cell.
 //! - [`emit_create_context`]: `CreateContext` carved from a
 //!   [`otter_vm::jit::JitContextAllocationPlan`].
 //! - [`emit_copy_context`]: `CopyContext` carved from the live source cell.
@@ -38,39 +36,16 @@ use dynasmrt::{DynamicLabel, DynasmApi, DynasmLabelApi, dynasm, x64::Assembler};
 use otter_vm::JitCompileSnapshot;
 use otter_vm::jit::{
     JIT_CLOSURE_CELL_BYTES, JIT_CONTEXT_HAS_EXTENSION_BIT, JIT_INLINE_CONTEXT_MAX_WORDS,
-    JIT_TYPE_STATS_ALLOC_BYTES_OFFSET, JIT_TYPE_STATS_ALLOC_COUNT_OFFSET,
-    JIT_TYPE_STATS_LIVE_BYTES_OFFSET, JIT_TYPE_STATS_ROW_BYTES, JIT_YOUNG_CLOSURE_HEADER_WORD,
+    JIT_YOUNG_CLOSURE_HEADER_WORD,
     JIT_YOUNG_CONTEXT_HEADER_WORD, JitClosureAllocationPlan, JitContextAllocationPlan,
 };
 
 use crate::allocation::{AllocationValue, LabRegisters};
 
 use crate::entry::{
-    ALLOC_WINDOW_LAB_OFFSET, ALLOC_WINDOW_TYPE_STATS_OFFSET, LAB_LIMIT_OFFSET, LAB_TOP_OFFSET,
+    ALLOC_WINDOW_LAB_OFFSET, LAB_LIMIT_OFFSET, LAB_TOP_OFFSET,
     VALUE_UNDEFINED,
 };
-
-/// Account one generated allocation of `Rq(size)` bytes against the
-/// statistics row of `type_tag`. Clobbers `Rq(base)`.
-pub(crate) fn emit_count_allocation(
-    ops: &mut Assembler,
-    context: u8,
-    type_tag: u8,
-    size: u8,
-    base: u8,
-) {
-    let row = u32::from(type_tag) * JIT_TYPE_STATS_ROW_BYTES;
-    let live = (row + JIT_TYPE_STATS_LIVE_BYTES_OFFSET) as i32;
-    let count = (row + JIT_TYPE_STATS_ALLOC_COUNT_OFFSET) as i32;
-    let bytes = (row + JIT_TYPE_STATS_ALLOC_BYTES_OFFSET) as i32;
-    dynasm!(ops
-        ; .arch x64
-        ; mov Rq(base), [Rq(context) + ALLOC_WINDOW_TYPE_STATS_OFFSET as i32]
-        ; add [Rq(base) + live], Rq(size)
-        ; add QWORD [Rq(base) + count], 1
-        ; add [Rq(base) + bytes], Rq(size)
-    );
-}
 
 mod receiver_dynamic;
 pub(crate) use receiver_dynamic::emit_dynamic_construct_receiver;
@@ -117,10 +92,10 @@ fn emit_bump_probe(ops: &mut Assembler, context: u8, regs: LabRegisters, slow: D
     );
 }
 
-/// Publish the fully initialized cell and account it; candidate survives.
-fn emit_publish(ops: &mut Assembler, context: u8, type_tag: u8, regs: LabRegisters) {
+/// Publish the fully initialized cell; candidate survives. The heap derives
+/// the allocated bytes from the buffer's progress.
+fn emit_publish(ops: &mut Assembler, regs: LabRegisters) {
     dynasm!(ops ; .arch x64 ; mov [Rq(regs.buffer) + LAB_TOP_OFFSET as i32], Rq(regs.end));
-    emit_count_allocation(ops, context, type_tag, regs.size, regs.buffer);
 }
 
 mod context;

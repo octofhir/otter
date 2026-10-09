@@ -82,5 +82,5 @@ pub(crate) fn emit_bigint64(
         ; cneg X(tmp), X(value), mi
         ; str X(tmp), [X(regs.candidate), JIT_BIGINT_DIGIT_BYTE]
     );
-    emit_publish(ops, context, otter_vm::bigint::BIG_INT_BODY_TYPE_TAG, regs);
+    emit_publish(ops, regs);
 }

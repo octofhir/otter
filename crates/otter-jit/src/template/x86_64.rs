@@ -114,12 +114,15 @@ use crate::{
 };
 
 const NOT_CELL_MASK: u64 = otter_vm::value::tag::NOT_CELL_MASK;
-const _: () = assert!(
-    VALUE_TRUE <= i8::MAX as u64
-        && VALUE_FALSE <= i8::MAX as u64
-        && VALUE_NULL <= i8::MAX as u64
-        && VALUE_UNDEFINED <= i8::MAX as u64
-);
+// Every oddball fits a sign-extended 8-bit immediate.
+const _: () = {
+    let oddballs = [VALUE_TRUE, VALUE_FALSE, VALUE_NULL, VALUE_UNDEFINED];
+    let mut index = 0;
+    while index < oddballs.len() {
+        assert!(oddballs[index] <= i8::MAX as u64);
+        index += 1;
+    }
+};
 
 pub(super) fn compile(
     view: &JitCompileSnapshot,

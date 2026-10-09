@@ -266,20 +266,29 @@ fn own_generated_receiver_fits_and_collecting_array_construct_keep_exact_roots()
         &probe,
         CounterDelta::between(before, after),
     );
-    let attempts = after.jit_receiver_alloc_attempts - before.jit_receiver_alloc_attempts;
+    // The probe constructs two receivers, and each construct executes the
+    // caller's receiver plan. A fit carves the receiver and counts nothing.
+    // A disabled LAB misses the caller's plan, which passes no receiver; the
+    // callee's construct entry probes the family again, misses too, and
+    // prepares the receiver canonically.
+    let canonical = after.jit_receiver_alloc_canonical - before.jit_receiver_alloc_canonical;
+    let space_misses =
+        after.jit_receiver_alloc_space_misses - before.jit_receiver_alloc_space_misses;
     assert_eq!(
-        attempts, 2,
-        "both exact own construct edges execute the receiver plan"
+        after.jit_receiver_alloc_guard_misses, before.jit_receiver_alloc_guard_misses,
+        "the exact finalized family/prototype guards hold for both entries: {before:?} -> {after:?}"
     );
     if original_stride == 0 {
-        assert!(
-            after.jit_receiver_alloc_generated > before.jit_receiver_alloc_generated,
-            "an actual generated constructor must publish a receiver LAB fit: {before:?} -> {after:?}"
+        assert_eq!(
+            (canonical, space_misses),
+            (0, 0),
+            "both exact own construct edges must publish a receiver LAB fit: {before:?} -> {after:?}"
         );
     } else {
         assert_eq!(
-            after.jit_receiver_alloc_generated, before.jit_receiver_alloc_generated,
-            "external stress disables the LAB fit"
+            (canonical, space_misses),
+            (2, 4),
+            "external stress disables the LAB fit at both probes of each construct: {before:?} -> {after:?}"
         );
     }
     assert_eq!(
@@ -347,16 +356,13 @@ fn own_generated_receiver_fits_and_collecting_array_construct_keep_exact_roots()
         "the exact finalized family/prototype guards survive both collecting native entries: {before:?} -> {after:?}"
     );
     assert_eq!(
-        after.jit_receiver_alloc_generated, before.jit_receiver_alloc_generated,
+        after.jit_receiver_alloc_canonical - before.jit_receiver_alloc_canonical,
+        2,
         "both disabled-LAB misses create distinct ordinary receivers through the callee's emitted canonical preparation"
     );
     // Each construct probes twice: the caller's baked plan misses and passes
     // no receiver, then the callee's construct entry probes the family again
     // before its canonical preparation.
-    assert_eq!(
-        after.jit_receiver_alloc_attempts - before.jit_receiver_alloc_attempts,
-        4
-    );
     assert_eq!(
         after.jit_receiver_alloc_space_misses - before.jit_receiver_alloc_space_misses,
         4,

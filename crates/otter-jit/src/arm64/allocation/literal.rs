@@ -15,7 +15,7 @@
 //! `otter_vm::jit::JitLiteralAllocationPlans` owns geometry and source semantics.
 
 use super::empty::emit_source_realm_guard;
-use super::{emit_bump_probe, emit_count_allocation, emit_publish};
+use super::{emit_bump_probe, emit_publish};
 use crate::allocation::{AllocationValue, LabRegisters};
 use crate::artifact::relocation::{RelocationCapture, RelocationTarget};
 use crate::entry::{VALUE_HOLE, VALUE_UNDEFINED};
@@ -76,7 +76,7 @@ pub(crate) fn emit_object_literal(
         }
         dynasm!(ops ; .arch aarch64 ; str x16, [X(candidate), byte]);
     }
-    emit_publish(ops, context, plan.header_word as u8, regs);
+    emit_publish(ops, regs);
 }
 
 pub(crate) fn emit_array_literal(
@@ -236,24 +236,6 @@ fn emit_dense_array(
         ; strb w16, [X(shell), plan.shell_kind_byte]
         ; ldr X(regs.buffer), [X(context), crate::entry::ALLOC_WINDOW_LAB_OFFSET]
         ; str X(regs.end), [X(regs.buffer), crate::entry::LAB_TOP_OFFSET]
-    );
-    emit_load_u64(ops, regs.size, u64::from(plan.shell.cell_bytes));
-    emit_count_allocation(
-        ops,
-        context,
-        plan.shell.header_word as u8,
-        regs.size,
-        regs.buffer,
-        regs.scratch,
-    );
-    emit_load_u64(ops, regs.size, u64::from(plan.slab_bytes));
-    emit_count_allocation(
-        ops,
-        context,
-        plan.slab_header_word as u8,
-        regs.size,
-        regs.buffer,
-        regs.scratch,
     );
 }
 

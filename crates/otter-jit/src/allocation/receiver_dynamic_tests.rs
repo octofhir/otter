@@ -2,7 +2,8 @@
 //!
 //! # Contents
 //! - Actual VM snapshot geometry at zero, small and maximum final capacity.
-//! - Full initialized bytes, ticket stores, cursor and exact type accounting.
+//! - Full initialized bytes, ticket stores and the exact buffer cursor, the
+//!   only accounting generated code owns.
 //! - Call-prefix promotion/nonvolatile/FP preservation on both target encoders.
 //!
 //! # Invariants
@@ -13,7 +14,7 @@
 use super::*;
 use crate::CompiledCode;
 use otter_bytecode::{BytecodeModule, Function, FunctionCodeBuilder, Op, SourceKind};
-use otter_gc::{lab::LinearAllocationArea, stats::TypeStats};
+use otter_gc::lab::LinearAllocationArea;
 use otter_vm::{
     ExecutionContext, JitRuntimeStats, Value,
     native_abi::{CallRequest, Frame, JitCtx, NativeResultPair, VmFrameHeader, VmThread},
@@ -137,7 +138,6 @@ fn dynamic_receiver_writer_initializes_and_publishes_once_or_has_no_effect() {
                 top: start,
                 limit: start + bytes - usize::from(!fits),
             };
-            let mut stats = [TypeStats::DEFAULT; 256];
             let mut runtime = JitRuntimeStats::default();
             let mut thread = VmThread::empty();
             let mut frame = Frame::new(
@@ -165,10 +165,7 @@ fn dynamic_receiver_writer_initializes_and_publishes_once_or_has_no_effect() {
                 global_this_offset: std::ptr::null(),
                 native_stack_limit: 0,
                 generated_feedback_clean: 1,
-                alloc_window: otter_vm::jit::JitMachineAllocationWindow {
-                    lab: &mut lab,
-                    type_stats: stats.as_mut_ptr(),
-                },
+                alloc_window: otter_vm::jit::JitMachineAllocationWindow { lab: &mut lab },
                 runtime_stats: &mut runtime,
                 pending_call: CallRequest::EMPTY,
                 completion: NativeResultPair::success(Value::UNDEFINED),
@@ -188,7 +185,7 @@ fn dynamic_receiver_writer_initializes_and_publishes_once_or_has_no_effect() {
                 *mut u64,
             ) -> usize = unsafe { std::mem::transmute(code.entry_ptr()) };
             // SAFETY: wrapper preserves its host ABI; writer sees private initialized
-            // LAB, scalar metadata and statistic rows, and cannot call or collect.
+            // LAB and scalar metadata, and cannot call or collect.
             let result = call(&mut ctx, &mut frame, family, canaries.as_mut_ptr());
             assert_eq!(&canaries[..3], &[CANARY; 3]);
             assert_eq!(&canaries[4..7], &[0x5a5a_5a5a_5a5a_5a5a; 3]);
@@ -276,17 +273,14 @@ fn dynamic_receiver_writer_initializes_and_publishes_once_or_has_no_effect() {
                     0xa1b2_c3d4
                 );
             }
-            assert_eq!(runtime.receiver_alloc_generated, u64::from(fits));
-            assert_eq!(runtime.receiver_alloc_attempts, 0);
-            assert_eq!(runtime.receiver_alloc_guard_misses, 0);
-            assert_eq!(runtime.receiver_alloc_space_misses, 0);
-            for (tag, row) in stats.iter().enumerate() {
-                let owns = fits && tag == OBJECT_BODY_TYPE_TAG as usize;
-                assert_eq!(row.alloc_count_total, u64::from(owns));
-                assert_eq!(row.alloc_bytes_total, if owns { bytes as u64 } else { 0 });
-                assert_eq!(row.live_bytes, if owns { bytes } else { 0 });
-                assert_eq!(row.free_count_total, 0);
-            }
+            // The writer counts nothing on either path: its caller owns the
+            // guard/space miss counters, and buffer progress is the heap's
+            // only record of the published bytes.
+            assert_eq!(
+                runtime,
+                JitRuntimeStats::default(),
+                "capacity={capacity}, fit={fits} runtime counters"
+            );
         }
     }
 }

@@ -1,7 +1,8 @@
 //! Executable private-LAB proof of canonical-home literal initialization.
 //!
 //! # Contents
-//! - Numeric/holey/tagged two-cell arrays with exact initialization/accounting.
+//! - Numeric/holey/tagged two-cell arrays with exact initialization and one
+//!   cursor publication covering both cells.
 //! - Shaped objects, bounded bulk inputs and pre-effect realm/limit misses.
 //!
 //! # Invariants
@@ -11,7 +12,7 @@
 
 use super::*;
 use crate::CompiledCode;
-use otter_gc::{lab::LinearAllocationArea, stats::TypeStats};
+use otter_gc::lab::LinearAllocationArea;
 use otter_vm::jit::JitEmptyObjectAllocationPlan;
 use otter_vm::{
     Value,
@@ -48,7 +49,6 @@ fn execute(layout: Layout, values: &[u64], fits: bool, actual_realm: u32, regs: 
         top: start,
         limit: start + bytes as usize - usize::from(!fits),
     };
-    let mut stats = [TypeStats::DEFAULT; 256];
     let mut thread = VmThread::empty();
     thread.active_realm_cell = std::ptr::addr_of!(actual_realm) as u64;
     let mut ctx = JitCtx {
@@ -59,10 +59,7 @@ fn execute(layout: Layout, values: &[u64], fits: bool, actual_realm: u32, regs: 
         global_this_offset: std::ptr::null(),
         native_stack_limit: 0,
         generated_feedback_clean: 1,
-        alloc_window: otter_vm::jit::JitMachineAllocationWindow {
-            lab: &mut lab,
-            type_stats: stats.as_mut_ptr(),
-        },
+        alloc_window: otter_vm::jit::JitMachineAllocationWindow { lab: &mut lab },
         runtime_stats: std::ptr::null_mut(),
         pending_call: CallRequest::EMPTY,
         completion: NativeResultPair::success(Value::UNDEFINED),
@@ -107,7 +104,7 @@ fn execute(layout: Layout, values: &[u64], fits: bool, actual_realm: u32, regs: 
     }
     dynasm!(ops ; .arch aarch64 ; mov x0, X(regs.candidate) ; b =>done ; =>slow ; mov x0, xzr ; =>done ; add sp, sp, stack ; ldp x20, x30, [sp], #16 ; ret);
     let code = CompiledCode::new(ops.finalize().unwrap(), entry);
-    // SAFETY: this private ABI receives valid bounded host inputs/LAB/statistics,
+    // SAFETY: this private ABI receives valid bounded host inputs and LAB,
     // preserves x20/LR/SP, and neither calls the VM nor exposes host cells to GC.
     let call: extern "C" fn(*mut JitCtx, *const u64) -> usize =
         unsafe { std::mem::transmute(code.entry_ptr()) };
@@ -119,11 +116,6 @@ fn execute(layout: Layout, values: &[u64], fits: bool, actual_realm: u32, regs: 
     if !accepted {
         assert_eq!(lab.top, start);
         assert!(words.iter().all(|word| *word == POISON));
-        assert!(
-            stats
-                .iter()
-                .all(|row| row.alloc_count_total == 0 && row.live_bytes == 0)
-        );
         return;
     }
     assert_eq!(lab.top, start + bytes as usize);
@@ -196,21 +188,6 @@ fn execute(layout: Layout, values: &[u64], fits: bool, actual_realm: u32, regs: 
             }
             assert_eq!(body, expected);
         }
-    }
-    for (tag, row) in stats.iter().enumerate() {
-        let owned = match layout {
-            Layout::Object(p) if tag == p.header_word as u8 as usize => p.cell_bytes,
-            Layout::Array(_) if tag == dense.unwrap().shell.header_word as u8 as usize => {
-                dense.unwrap().shell.cell_bytes
-            }
-            Layout::Array(_) if tag == dense.unwrap().slab_header_word as u8 as usize => {
-                dense.unwrap().slab_bytes
-            }
-            _ => 0,
-        };
-        assert_eq!(row.live_bytes, owned as usize);
-        assert_eq!(row.alloc_count_total, u64::from(owned != 0));
-        assert_eq!(row.alloc_bytes_total, u64::from(owned));
     }
 }
 

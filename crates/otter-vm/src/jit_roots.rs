@@ -115,6 +115,8 @@ impl InstanceofCell {
 #[derive(Debug, Clone)]
 pub(crate) enum CompilationRoot {
     Shape(ShapeHandle),
+    /// A constructor family a receiver plan names by its cell handle.
+    Family(crate::constructor_layout::ConstructorLayout),
     Prototype(Arc<PrototypeValidity>),
     CalleeIdentity(Arc<CalleeIdentityCell>),
     Instanceof(Arc<InstanceofCell>),
@@ -124,6 +126,7 @@ impl CompilationRoot {
     pub(crate) fn key(&self) -> (u8, usize) {
         match self {
             Self::Shape(shape) => (0, shape.offset() as usize),
+            Self::Family(family) => (4, family.offset() as usize),
             Self::Prototype(cell) => (1, cell.address()),
             Self::CalleeIdentity(cell) => (2, cell.address() as usize),
             Self::Instanceof(cell) => (3, cell.address() as usize),
@@ -134,6 +137,8 @@ impl CompilationRoot {
         match self {
             // Shapes never move, so the tracer never rewrites this slot.
             Self::Shape(shape) => visitor(std::ptr::from_ref(shape).cast_mut().cast()),
+            // Family cells live in old space and never move either.
+            Self::Family(family) => visitor(std::ptr::from_ref(family).cast_mut().cast()),
             Self::Prototype(_) => {}
             Self::CalleeIdentity(cell) => cell.trace(visitor),
             Self::Instanceof(cell) => cell.trace(visitor),

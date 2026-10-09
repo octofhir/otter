@@ -639,26 +639,16 @@ pub struct JitRuntimeStats {
     pub alloc_value_stub_out_of_memory: u64,
     /// Executed `AllocValueStub` entries that returned another non-`Ok` status.
     pub alloc_value_stub_other: u64,
-    /// Generated receiver-allocation plans entered before any mutation.
-    pub receiver_alloc_attempts: u64,
-    /// Receivers carved and initialized entirely in generated code.
-    pub receiver_alloc_generated: u64,
     /// Plan identity/prototype guards that selected the rooted cold path.
     pub receiver_alloc_guard_misses: u64,
     /// Nursery-window capacity/state misses that selected the rooted cold path.
     pub receiver_alloc_space_misses: u64,
-    /// Rooted cold receiver-preparation calls from a generated allocation plan.
-    pub receiver_alloc_cold_transitions: u64,
-    /// Cold calls that crossed a minor or full collector cycle.
-    pub receiver_alloc_gc_transitions: u64,
-    /// Cold calls that refreshed the generated nursery page window.
-    pub receiver_alloc_refills: u64,
-    /// Cold receiver allocations that reported out-of-memory.
-    pub receiver_alloc_oom: u64,
+    /// Receivers the runtime's canonical construction created, in every
+    /// tier. A construct a generated receiver plan serves adds none: that
+    /// fast path counts nothing.
+    pub receiver_alloc_canonical: u64,
     /// Generated receiver allocation exits that deoptimized the construct.
     pub receiver_alloc_deopts: u64,
-    /// Generated receiver plans that entered a Rust allocation boundary.
-    pub receiver_alloc_rust_transitions: u64,
 }
 
 /// Per-isolate code-chunk reclamation telemetry.

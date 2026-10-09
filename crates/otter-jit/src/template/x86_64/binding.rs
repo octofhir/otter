@@ -354,8 +354,7 @@ mod tests {
                 + 8
         ]
         .into_boxed_slice();
-        let mut ctx = vec![0_u8; THREAD_OFFSET.max(GLOBAL_THIS_OFFSET_PTR_OFFSET) as usize + 8]
-            .into_boxed_slice();
+        let mut ctx = vec![0_u8; std::mem::size_of::<crate::entry::JitCtx>()].into_boxed_slice();
         let global = OBJECT;
         let mut epoch = 0_u64;
         write_u64(&mut ctx, THREAD_OFFSET as usize, thread.as_ptr() as u64);

@@ -54,10 +54,5 @@ pub(crate) fn emit_closure(
     }
     emit_value(ops, regs.scratch, values[0]);
     dynasm!(ops ; .arch x64 ; mov [Rq(regs.candidate) + layout.context_byte as i32], Rq(regs.scratch) ; mov QWORD [Rq(regs.candidate) + layout.rare_byte as i32], 0);
-    emit_publish(
-        ops,
-        context,
-        otter_vm::closure::JS_CLOSURE_BODY_TYPE_TAG,
-        regs,
-    );
+    emit_publish(ops, regs);
 }

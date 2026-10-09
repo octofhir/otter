@@ -47,8 +47,4 @@ pub(crate) fn emit_fixed_group(
     }
     dynasm!(ops ; .arch x64 ; sub Rq(r.candidate),cursor as i32
         ; mov [Rq(r.buffer)+LAB_TOP_OFFSET as i32],Rq(r.end));
-    for &(_, layout) in members {
-        emit_load_u64(ops, r.size, u64::from(layout.bytes()));
-        emit_count_allocation(ops, context, layout.header() as u8, r.size, r.buffer);
-    }
 }

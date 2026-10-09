@@ -165,6 +165,8 @@ fn fixture(kind: Kind) -> crate::CompiledCode {
         materialize,
         sites: crate::graph::metadata::SitePlan::new(slots),
         return_sites: Vec::new(),
+        fused: Default::default(),
+        sink: None,
     };
     // Four saved nonvolatile words plus 24 local bytes give 16-byte alignment.
     dynasm!(codegen.ops ; .arch x64

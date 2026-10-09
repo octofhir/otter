@@ -2,7 +2,8 @@
 //!
 //! # Contents
 //! - Prepared scope/arrow payloads and dynamic copies with alternate GP recipes.
-//! - Complete poisoned bytes/accounting, pre-effect misses and live canaries.
+//! - Complete poisoned bytes, LAB publication, pre-effect misses and live
+//!   canaries.
 //!
 //! # Invariants
 //! - Host cells never enter the moving heap; runtime tests own GC acceptance.
@@ -21,7 +22,7 @@ use dynasmrt::aarch64::Assembler;
 use dynasmrt::x64::Assembler;
 use dynasmrt::{DynasmApi, DynasmLabelApi, dynasm};
 use otter_bytecode::{BytecodeModule, Function, FunctionCodeBuilder, Op, SourceKind};
-use otter_gc::{lab::LinearAllocationArea, stats::TypeStats};
+use otter_gc::lab::LinearAllocationArea;
 use otter_vm::jit::{
     JIT_CLOSURE_CELL_BYTES, JIT_YOUNG_CLOSURE_HEADER_WORD, JIT_YOUNG_CONTEXT_HEADER_WORD,
     JitClosureAllocationPlan, JitContextAllocationPlan,
@@ -117,7 +118,6 @@ fn execute(view: &JitCompileSnapshot, case: Construction, regs: LabRegisters, fi
     let context_plan;
     let closure_plan;
     let values;
-    let tag;
     match case {
         Construction::Create { extension } => {
             let initial = vec![
@@ -150,7 +150,6 @@ fn execute(view: &JitCompileSnapshot, case: Construction, regs: LabRegisters, fi
                 Value::undefined().to_bits(),
                 Value::undefined().to_bits(),
             ];
-            tag = layout.type_tag;
         }
         Construction::Copy { extension, slots } => {
             source.resize(
@@ -169,7 +168,6 @@ fn execute(view: &JitCompileSnapshot, case: Construction, regs: LabRegisters, fi
                 Value::undefined().to_bits(),
             ];
             allowed = !extension && slots <= otter_vm::jit::JIT_INLINE_CONTEXT_MAX_WORDS;
-            tag = layout.type_tag;
         }
         Construction::Closure {
             arrow,
@@ -227,7 +225,6 @@ fn execute(view: &JitCompileSnapshot, case: Construction, regs: LabRegisters, fi
             context_plan = None;
             closure_plan = Some(plan);
             allowed = !invalid_context;
-            tag = otter_vm::closure::JS_CLOSURE_BODY_TYPE_TAG;
         }
     }
     let bytes = expected.len() * 8;
@@ -238,7 +235,6 @@ fn execute(view: &JitCompileSnapshot, case: Construction, regs: LabRegisters, fi
         top: start,
         limit: start + bytes - usize::from(!fits),
     };
-    let mut stats = [TypeStats::DEFAULT; 256];
     let mut thread = VmThread::empty();
     let mut ctx = JitCtx {
         thread: &mut thread,
@@ -248,10 +244,7 @@ fn execute(view: &JitCompileSnapshot, case: Construction, regs: LabRegisters, fi
         global_this_offset: std::ptr::null(),
         native_stack_limit: 0,
         generated_feedback_clean: 1,
-        alloc_window: otter_vm::jit::JitMachineAllocationWindow {
-            lab: &mut lab,
-            type_stats: stats.as_mut_ptr(),
-        },
+        alloc_window: otter_vm::jit::JitMachineAllocationWindow { lab: &mut lab },
         runtime_stats: std::ptr::null_mut(),
         pending_call: CallRequest::EMPTY,
         completion: NativeResultPair::success(Value::UNDEFINED),
@@ -385,7 +378,7 @@ fn execute(view: &JitCompileSnapshot, case: Construction, regs: LabRegisters, fi
     let call: extern "sysv64" fn(*mut JitCtx, *const u64, *mut u64) -> usize =
         unsafe { std::mem::transmute(code.entry_ptr()) };
     // SAFETY: the fixture preserves its private ABI and uses complete bounded
-    // host input/LAB/stat spans; no fabricated cell reaches the collector.
+    // host input/LAB spans; no fabricated cell reaches the collector.
     let result = call(&mut ctx, values.as_ptr(), canaries.as_mut_ptr());
     let accepted = fits && allowed;
     assert_eq!(
@@ -425,24 +418,6 @@ fn execute(view: &JitCompileSnapshot, case: Construction, regs: LabRegisters, fi
         assert!(
             words.iter().all(|word| *word == POISON),
             "{case_label} no partial initialization"
-        );
-    }
-    for (index, row) in stats.iter().enumerate() {
-        let owned = accepted && index == tag as usize;
-        assert_eq!(
-            row.alloc_count_total,
-            u64::from(owned),
-            "{case_label} tag {index} allocation count"
-        );
-        assert_eq!(
-            row.alloc_bytes_total,
-            if owned { bytes as u64 } else { 0 },
-            "{case_label} tag {index} allocated bytes"
-        );
-        assert_eq!(
-            row.live_bytes,
-            if owned { bytes } else { 0 },
-            "{case_label} tag {index} live bytes"
         );
     }
 }

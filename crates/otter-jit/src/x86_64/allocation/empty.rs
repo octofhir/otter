@@ -41,11 +41,10 @@ pub(crate) fn emit_empty_literal(
     }
     emit_source_realm_guard(ops, context, realm_id, regs.scratch, slow);
     let cell_bytes = layout.bytes();
-    let header_word = layout.header();
     emit_load_u64(ops, regs.size, u64::from(cell_bytes));
     emit_bump_probe(ops, context, regs, slow);
     emit_initialize_empty(ops, layout, regs);
-    emit_publish(ops, context, header_word as u8, regs);
+    emit_publish(ops, regs);
 }
 
 pub(super) fn emit_source_realm_guard(

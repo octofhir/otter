@@ -80,8 +80,7 @@ impl Fixture {
                 / 8
                 + 1
         ];
-        let context =
-            vec![0_u64; THREAD_OFFSET.max(GLOBAL_THIS_OFFSET_PTR_OFFSET) as usize / 8 + 1];
+        let context = vec![0_u64; std::mem::size_of::<crate::entry::JitCtx>().div_ceil(8)];
         let mut view = JitCompileSnapshot::without_feedback(
             FID,
             3,

@@ -60,7 +60,7 @@ pub(crate) fn emit_create_context(
         let byte = layout.slots_byte + 8 * index as u32;
         dynasm!(ops ; .arch aarch64 ; str X(regs.scratch), [X(regs.candidate), byte]);
     }
-    emit_publish(ops, context, layout.type_tag, regs);
+    emit_publish(ops, regs);
 }
 
 pub(crate) fn emit_copy_context(
@@ -107,5 +107,5 @@ pub(crate) fn emit_copy_context(
         ; ldr X(regs.buffer), [X(context), ALLOC_WINDOW_LAB_OFFSET]
         ; ldr W(regs.size), [X(regs.candidate), 4]
     );
-    emit_publish(ops, context, layout.type_tag, regs);
+    emit_publish(ops, regs);
 }

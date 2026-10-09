@@ -30,7 +30,6 @@ use super::{emit_bump_probe, emit_publish};
 use crate::allocation::LabRegisters;
 use crate::artifact::relocation::{RelocationCapture, RelocationTarget};
 use crate::entry::{
-    OBJECT_BODY_TYPE_TAG, RECEIVER_ALLOC_ATTEMPTS_OFFSET, RECEIVER_ALLOC_GENERATED_OFFSET,
     RECEIVER_ALLOC_GUARD_MISSES_OFFSET, RECEIVER_ALLOC_SPACE_MISSES_OFFSET, RUNTIME_STATS_OFFSET,
     VALUE_UNDEFINED,
 };
@@ -78,7 +77,6 @@ pub(crate) fn emit_receiver_candidate_probe(
     let miss = ops.new_dynamic_label();
     let ready = ops.new_dynamic_label();
     crate::x86_64::js_call::emit_clear_construct_ticket(ops, context);
-    increment_counter(ops, context, RECEIVER_ALLOC_ATTEMPTS_OFFSET);
     emit_receiver_guards(ops, relocations, view, plan, guard_miss);
     emit_receiver_fit(ops, view, plan, context, space_miss);
     dynasm!(ops ; .arch x64 ; mov rax, r9 ; jmp =>ready ; =>guard_miss);
@@ -136,16 +134,9 @@ pub(crate) fn emit_receiver_guards(
             ; mov r8d, [r8 + closure.constructor_layouts_byte as i32]
         );
     }
-    let family = view.constructor_layout.family_id_byte as i32;
-    dynasm!(ops ; .arch x64 ; test r8d, r8d ; jz =>guard_miss ; add r8, r11);
-    match i32::try_from(plan.family_id) {
-        Ok(id) => dynasm!(ops ; .arch x64 ; cmp QWORD [r8 + family], id),
-        Err(_) => {
-            emit_load_u64(ops, 10, plan.family_id);
-            dynasm!(ops ; .arch x64 ; cmp [r8 + family], r10);
-        }
-    }
-    dynasm!(ops ; .arch x64 ; jne =>guard_miss);
+    // The head is the plan's exact family cell; an empty head (zero) never
+    // equals a cell handle.
+    dynasm!(ops ; .arch x64 ; cmp r8d, plan.family_cell as i32 ; jne =>guard_miss);
     if let Some(validity) = plan.prototype_validity {
         emit_load_symbol_u64(
             ops,
@@ -212,23 +203,18 @@ pub(crate) fn emit_receiver_fit(
 /// candidate, LAB, end and size registers still hold the same recipe. No
 /// intervening operation may collect or clobber those values. RAX holds the
 /// receiver.
-pub(crate) fn emit_receiver_publication_effect(
-    ops: &mut Assembler,
-    _view: &JitCompileSnapshot,
-    context: u8,
-) {
+pub(crate) fn emit_receiver_publication_effect(ops: &mut Assembler, context: u8) {
     dynasm!(ops ; .arch x64
         ; mov [Rq(context) + (crate::entry::PENDING_CALL_OFFSET + otter_vm::native_abi::REQUEST_CONSTRUCT_RECEIVER_OFFSET) as i32], rax
     );
-    emit_receiver_bump(ops, context);
-    increment_counter(ops, context, RECEIVER_ALLOC_GENERATED_OFFSET);
+    emit_receiver_bump(ops);
 }
 
 /// Publish the dominated fit from [`emit_receiver_fit`], whose cell, LAB,
-/// end and size are still in R9, RDX, RDI and R8, and account the cell; the
-/// receiver is returned in RAX. Clobbers RDX and flags.
-pub(crate) fn emit_receiver_bump(ops: &mut Assembler, context: u8) {
-    emit_publish(ops, context, OBJECT_BODY_TYPE_TAG as u8, RECEIVER_LAB);
+/// end and size are still in R9, RDX, RDI and R8; the receiver is returned
+/// in RAX.
+pub(crate) fn emit_receiver_bump(ops: &mut Assembler) {
+    emit_publish(ops, RECEIVER_LAB);
     dynasm!(ops ; .arch x64 ; mov rax, r9);
 }
 

@@ -198,6 +198,10 @@ fn caller(
 }
 
 #[cfg(target_arch = "x86_64")]
+// dynasm 5 normalizes dynamic register operands through `Into<u8>`; the
+// register ids here are already `u8`, so the macro-generated conversion is
+// intentionally redundant.
+#[allow(clippy::useless_conversion)]
 fn caller(
     table: &TransitionTable,
     cell: &FunctionEntryCell,

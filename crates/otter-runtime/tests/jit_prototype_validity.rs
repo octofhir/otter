@@ -162,6 +162,7 @@ fn constructor_closures_allocate_on_their_live_prototype_roots() {
         .jit_selection(JitSelection::ProductionTiered)
         .build()
         .unwrap();
+    let before = runtime.execution_stats();
     let result = runtime
         .run_script(
             SourceInput::from_javascript(
@@ -196,12 +197,28 @@ constructMany()
         )
         .unwrap();
     assert_eq!(result.completion_string(), "2878800");
+    // `constructMany` runs twice and constructs 2400 receivers each time.
+    const CONSTRUCTS: u64 = 2 * 2400;
     let stats = runtime.execution_stats();
-    assert!(stats.jit_receiver_alloc_attempts > 0);
+    let canonical = stats.jit_receiver_alloc_canonical - before.jit_receiver_alloc_canonical;
+    let guard_misses =
+        stats.jit_receiver_alloc_guard_misses - before.jit_receiver_alloc_guard_misses;
+    let space_misses =
+        stats.jit_receiver_alloc_space_misses - before.jit_receiver_alloc_space_misses;
+    assert!(
+        canonical <= CONSTRUCTS,
+        "only the script's constructs create receivers: {before:?} -> {stats:?}"
+    );
+    // Every receiver a generated plan carves is one canonical construction fewer.
+    let generated = CONSTRUCTS - canonical;
+    assert!(
+        generated + guard_misses + space_misses > 0,
+        "the constructs must reach a generated receiver plan: {before:?} -> {stats:?}"
+    );
     if std::env::var_os("OTTER_GC_STRESS").is_none() {
         assert!(
-            stats.jit_receiver_alloc_generated > stats.jit_receiver_alloc_guard_misses,
-            "ordinary allocation must accept different live prototype roots: {stats:?}"
+            generated > guard_misses,
+            "ordinary allocation must accept different live prototype roots: {before:?} -> {stats:?}"
         );
     }
 }

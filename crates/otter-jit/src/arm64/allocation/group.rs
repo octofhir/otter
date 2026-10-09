@@ -45,15 +45,4 @@ pub(crate) fn emit_fixed_group(
     }
     dynasm!(ops ; .arch aarch64 ; sub XSP(r.candidate),XSP(r.candidate),cursor
         ; str X(r.end),[X(r.buffer),LAB_TOP_OFFSET]);
-    for &(_, layout) in members {
-        emit_load_u64(ops, r.size, u64::from(layout.bytes()));
-        emit_count_allocation(
-            ops,
-            context,
-            layout.header() as u8,
-            r.size,
-            r.buffer,
-            r.scratch,
-        );
-    }
 }

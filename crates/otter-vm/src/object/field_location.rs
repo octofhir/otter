@@ -223,10 +223,11 @@ impl FieldLayout {
             inline_capacity <= super::MAX_INLINE_CAPACITY,
             "object inline capacity exceeds maximum"
         );
-        assert_eq!(
-            object_cell_bytes,
-            self.cell_bytes(inline_capacity),
-            "shape capacity disagrees with cell footprint"
+        // A cell allocated while its constructor's lineage tracked slack
+        // keeps its wider footprint after the lineage shrinks.
+        assert!(
+            object_cell_bytes >= self.cell_bytes(inline_capacity),
+            "shape capacity exceeds cell footprint"
         );
         assert_eq!(self.inline_values_byte % FieldLocation::WORD_BYTES, 0);
         assert_eq!(self.slab_words_byte % FieldLocation::WORD_BYTES, 0);

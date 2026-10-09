@@ -103,6 +103,9 @@ struct WeakShapeTables {
     offset_cache: FxHashMap<ShapeId, FxHashMap<AtomId, u32>>,
     /// Rooted state variants are weak and keyed by stable source identity.
     state_variants: FxHashMap<(ShapeId, ShapeState), ShapeHandle>,
+    /// Transitions out of each provisional shape: the tree slack tracking
+    /// finishes in place (V8's transition-tree traversal).
+    provisional_children: FxHashMap<ShapeId, smallvec::SmallVec<[ShapeHandle; 2]>>,
     /// Distinct shapes pinned during the current outermost turn, in first-pin order.
     /// The stable id is only an index; the handle is the sole strong root slot.
     pinned: indexmap::IndexMap<
@@ -256,6 +259,63 @@ impl ShapeRuntime {
         Ok(root)
     }
 
+    /// Complete in-object slack tracking of the provisional lineage `root`
+    /// heads (V8's `CompleteInobjectSlackTracking`): every shape of its
+    /// transition tree shrinks in place to the fewest in-object slots that
+    /// still hold every field any of them places, and at least `required`;
+    /// the lineage becomes ordinary and gets a dictionary shape of that
+    /// capacity. One lineage serves the constructor's objects before and
+    /// after, so no site sees a second shape for the same layout.
+    pub(crate) fn finish_slack_tracking(
+        &self,
+        heap: &mut GcHeap,
+        root: ShapeHandle,
+        required: usize,
+        external_visit: &mut RootSlotVisitor<'_>,
+    ) -> Result<(), otter_gc::OutOfMemory> {
+        let mut nodes = vec![root];
+        {
+            let tables = self.tables.borrow();
+            let mut index = 0;
+            while index < nodes.len() {
+                let id = heap.read_payload(nodes[index], ShapeBody::id);
+                if let Some(children) = tables.provisional_children.get(&id) {
+                    nodes.extend(children.iter().copied());
+                }
+                index += 1;
+            }
+        }
+        let capacity = super::shape_body::inline_capacity_of(root);
+        let used = nodes
+            .iter()
+            .map(|&node| (super::shape_body::property_count_of(node) as usize).min(capacity))
+            .max()
+            .unwrap_or(0);
+        let finished = used.max(required).min(capacity);
+        // Old-space shapes never move; the visit keeps a node the weak
+        // transition table alone names alive across the allocation.
+        let mut visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
+            for node in &mut nodes {
+                visitor(std::ptr::from_mut(node).cast::<RawGc>());
+            }
+            self.trace_roots(visitor);
+            external_visit(visitor);
+        };
+        let dictionary = super::shape_body::alloc_dictionary_shape_body_with_roots(
+            heap, root, finished, &mut visit,
+        )?;
+        for &node in &nodes {
+            super::shape_body::finish_slack_tracking(heap, node, finished, dictionary);
+        }
+        let mut tables = self.tables.borrow_mut();
+        tables.pin(heap, dictionary);
+        for &node in &nodes {
+            let id = heap.read_payload(node, ShapeBody::id);
+            tables.provisional_children.remove(&id);
+        }
+        Ok(())
+    }
+
     /// Prepare a same-geometry immutable state variant without retaining a
     /// table or payload borrow across allocation. Runtime IC eligibility and
     /// native bakeability remain separate facts of the resulting shape.
@@ -347,6 +407,7 @@ impl ShapeRuntime {
             transitions,
             offset_cache,
             state_variants,
+            provisional_children,
             ..
         } = &mut *tables;
         handles_by_id.retain(|_, shape| {
@@ -364,6 +425,10 @@ impl ShapeRuntime {
         }
         transitions.retain(|_, child| !dead.contains(&child.offset()));
         offset_cache.retain(|id, _| handles_by_id.contains_key(id));
+        provisional_children.retain(|parent, children| {
+            children.retain(|child| !dead.contains(&child.offset()));
+            handles_by_id.contains_key(parent)
+        });
     }
 
     /// Resolve stable feedback identity back to the isolate-local GC handle.
@@ -488,6 +553,13 @@ impl ShapeRuntime {
         let mut tables = self.tables.borrow_mut();
         tables.handles_by_id.insert(child_id, child);
         tables.transitions.insert(transition_key, child);
+        if super::shape_body::state_of(child).is_provisional() {
+            tables
+                .provisional_children
+                .entry(parent_id)
+                .or_default()
+                .push(child);
+        }
         tables.pin(heap, child);
         drop(tables);
         self.notify_observer(heap, parent_id, child, key, false);

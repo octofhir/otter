@@ -22,6 +22,9 @@ const MODULE: &str = "jit-constructor-first-seven.js";
 const INITIAL: &str = r#"
 function layoutFactory() {
   return function LayoutCtor(value, observe) {
+    // Reading its actual arguments keeps the constructor out of its caller's
+    // body: the caller must enter its own generation with a fitted receiver.
+    if (arguments.length !== 2) throw "layout arity";
     this.value = value;
     this.next = value + 1;
     observe(this);

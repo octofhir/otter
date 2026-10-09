@@ -169,6 +169,9 @@ for (let warm = 0; warm < 5000; warm++) {
 // (one per 4,096 compiled back-edges); these warm loops span several polls.
 const ORDINARY_CONSTRUCTOR_SETUP: &str = r#"
 function OrdinaryArrayField() {
+  // Reading its actual arguments keeps the constructor out of its caller's
+  // body, so the probe enters its own generation.
+  if (arguments.length !== 0) throw "ordinary arity";
   this.elms = new Array();
 }
 
@@ -194,6 +197,9 @@ function lockOrdinaryReceiver(receiver) {
 }
 
 function NonExtensibleOrdinaryField(lock) {
+  // Reading its actual arguments keeps the constructor out of its caller's
+  // body, so the caller enters it through its entry cell.
+  if (arguments.length !== 1) throw "non-extensible arity";
   lock(this);
   this.x = 1;
 }
@@ -236,6 +242,9 @@ const NON_EXTENSIBLE_CONSTRUCTOR_PROBE: &str = r#"
 
 const WIDE_ORDINARY_CONSTRUCTOR_SETUP: &str = r#"
 function WideOrdinaryFields(value) {
+  // Reading its actual arguments keeps the constructor out of its caller's
+  // body, so the caller enters it through its entry cell.
+  if (arguments.length !== 1) throw "wide arity";
   const adjusted = value + 0;
   this.a = adjusted;
   this.b = adjusted + 1;
@@ -1120,7 +1129,8 @@ fn ordinary_constructor_array_and_field_transition_stay_generated() {
     );
     let delta = CounterDelta::between(before, runtime.execution_stats());
     assert_eq!(completion, "[0,0]");
-    assert_clean_generated_returns(delta, 2);
+    // The callee may run in either native tier; no call leaves native code.
+    assert_no_exits(delta);
     assert_eq!(delta.alloc_value_stub_ok, 2, "{delta:?}");
     assert_eq!(delta.property_store_misses, 0, "{delta:?}");
 }
@@ -1194,7 +1204,8 @@ fn wide_ordinary_constructor_transitions_preserve_the_reserved_slab() {
         completion,
         r#"[10,11,12,13,"a,b,c,d",20,21,22,23,"a,b,c,d"]"#
     );
-    assert_clean_generated_returns(delta, 2);
+    // The callee may run in either native tier; no call leaves native code.
+    assert_no_exits(delta);
     assert_eq!(delta.property_store_misses, 0, "{delta:?}");
 
     runtime

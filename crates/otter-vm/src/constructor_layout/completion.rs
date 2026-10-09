@@ -29,11 +29,10 @@ pub(crate) fn sample_terminal_receiver(
     if layout.is_null() {
         return false;
     }
-    let Some(receiver) = receiver.as_object() else {
+    if receiver.as_object().is_none() {
         return false;
-    };
-    let count = heap.read_payload(receiver, crate::object::ObjectBody::slot_count);
-    heap.with_payload(layout, |body| body.record_terminal(count))
+    }
+    heap.with_payload(layout, |body| body.record_terminal())
 }
 
 impl Interpreter {

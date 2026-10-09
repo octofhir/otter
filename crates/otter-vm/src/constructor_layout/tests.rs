@@ -1,7 +1,7 @@
 //! Physical first-seven cells and canonical completion ownership proofs.
 //!
 //! # Contents
-//! - Seven bounded samples, static minimum and future-only root publication.
+//! - Seven bounded samples, then in-place slack tracking of the one lineage.
 //! - Actual new.target identity and reentrant prototype-family replacement.
 //! - Super transfer retains the original receiver through object replacement.
 //!
@@ -53,7 +53,7 @@ fn ticket(layout: ConstructorLayout, receiver: Value) -> Frame {
 }
 
 #[test]
-fn seventh_terminal_sample_changes_only_future_physical_cells() {
+fn seventh_terminal_sample_shrinks_the_lineage_in_place() {
     let mut vm = Interpreter::new().expect("constructor fixture interpreter");
     vm.with_handle_scope(|vm, scope| {
         let prototype = vm.scoped_object(scope).unwrap();
@@ -61,12 +61,12 @@ fn seventh_terminal_sample_changes_only_future_physical_cells() {
         let layout = vm
             .constructor_layout_for_receiver(1, target, vm.escape_scoped(prototype), |_, _| 4)
             .unwrap();
-        let provisional = vm.gc_heap.read_payload(layout, ConstructorLayoutBody::root);
-        assert_eq!(object::shape_body::inline_capacity_of(provisional), 64);
-        assert!(object::shape_body::state_of(provisional).is_provisional());
+        let root = vm.gc_heap.read_payload(layout, ConstructorLayoutBody::root);
+        assert_eq!(object::shape_body::inline_capacity_of(root), 64);
+        assert!(object::shape_body::state_of(root).is_provisional());
         let mut retained = Vec::new();
         for (index, count) in [1, 2, 3, 4, 5, 6, 3].into_iter().enumerate() {
-            let value = receiver(vm, provisional, count);
+            let value = receiver(vm, root, count);
             retained.push(vm.scoped_value(scope, value));
             let mut frame = ticket(layout, value);
             vm.complete_constructor_layout(&mut frame);
@@ -80,17 +80,11 @@ fn seventh_terminal_sample_changes_only_future_physical_cells() {
             );
             assert!(frame.construct_layout.is_null());
             assert!(frame.construct_receiver.is_undefined());
-            assert_eq!(
-                vm.gc_heap.read_payload(layout, ConstructorLayoutBody::root),
-                provisional,
-                "completion cannot allocate, shrink or publish a final root"
+            assert!(
+                object::shape_body::state_of(root).is_provisional(),
+                "completion cannot allocate or shrink the lineage"
             );
         }
-        assert_eq!(
-            vm.gc_heap
-                .read_payload(layout, ConstructorLayoutBody::final_capacity),
-            6
-        );
         let again = vm
             .constructor_layout_for_receiver(1, target, vm.escape_scoped(prototype), |_, _| 4)
             .unwrap();
@@ -98,24 +92,30 @@ fn seventh_terminal_sample_changes_only_future_physical_cells() {
             again, layout,
             "finalization preserves exact family identity"
         );
-        let final_root = vm.gc_heap.read_payload(layout, ConstructorLayoutBody::root);
-        assert_ne!(final_root, provisional);
+        assert_eq!(
+            vm.gc_heap.read_payload(layout, ConstructorLayoutBody::root),
+            root,
+            "the family keeps its one lineage"
+        );
         assert!(
             vm.gc_heap
                 .read_payload(layout, ConstructorLayoutBody::finalized)
         );
-        assert_eq!(object::shape_body::inline_capacity_of(final_root), 6);
-        let future = receiver(vm, final_root, 4);
+        // The widest shape of the lineage's tree places six fields in-object.
+        assert_eq!(object::shape_body::inline_capacity_of(root), 6);
+        assert!(!object::shape_body::state_of(root).is_provisional());
+        let future = receiver(vm, root, 4);
         let future = vm.scoped_value(scope, future);
         for handle in retained {
             let object = vm.escape_scoped(handle).as_object().unwrap();
             let shape = object::shape(object, &vm.gc_heap);
-            assert_eq!(object::shape_body::inline_capacity_of(shape), 64);
-            assert!(object::shape_body::state_of(shape).is_provisional());
+            assert_eq!(object::shape_body::inline_capacity_of(shape), 6);
+            assert!(!object::shape_body::state_of(shape).is_provisional());
             // SAFETY: the handle scope retains this live receiver cell.
             assert_eq!(
                 unsafe { (*object.as_header_ptr()).size_bytes() } as usize,
-                otter_gc::header::HEADER_SIZE + std::mem::size_of::<object::ObjectBody>() + 64 * 8
+                otter_gc::header::HEADER_SIZE + std::mem::size_of::<object::ObjectBody>() + 64 * 8,
+                "a receiver allocated while tracking keeps its wider cell"
             );
         }
         let object = vm.escape_scoped(future).as_object().unwrap();
@@ -127,10 +127,9 @@ fn seventh_terminal_sample_changes_only_future_physical_cells() {
         let mut later = ticket(layout, vm.escape_scoped(future));
         vm.complete_constructor_layout(&mut later);
         assert_eq!(
-            vm.gc_heap
-                .read_payload(layout, ConstructorLayoutBody::final_capacity),
+            object::shape_body::inline_capacity_of(root),
             6,
-            "an eighth receiver never restarts or enlarges the finalized sampling contract"
+            "an eighth receiver never restarts or enlarges the finished lineage"
         );
     });
 }
@@ -258,12 +257,6 @@ fn super_ticket_samples_original_receiver_even_when_this_becomes_replacement() {
                 .read_payload(layout, ConstructorLayoutBody::samples_remaining),
             6
         );
-        assert_eq!(
-            vm.gc_heap
-                .read_payload(layout, ConstructorLayoutBody::final_capacity),
-            5,
-            "the allocated receiver, not replacement this, teaches physical usage"
-        );
     });
 }
 
@@ -334,11 +327,6 @@ fn abrupt_super_retry_and_second_success_sample_every_allocated_receiver_once() 
                 .read_payload(layout, ConstructorLayoutBody::samples_remaining),
             4
         );
-        assert_eq!(
-            vm.gc_heap
-                .read_payload(layout, ConstructorLayoutBody::final_capacity),
-            6
-        );
         assert!(outer.construct_layout.is_null());
         assert!(outer.construct_receiver.is_undefined());
     });
@@ -399,11 +387,6 @@ fn original_receiver_is_rewritten_through_published_frame_ticket() {
             vm.gc_heap
                 .read_payload(layout, ConstructorLayoutBody::samples_remaining),
             6
-        );
-        assert_eq!(
-            vm.gc_heap
-                .read_payload(layout, ConstructorLayoutBody::final_capacity),
-            3
         );
         assert!(frame.construct_layout.is_null());
         assert!(frame.construct_receiver.is_undefined());

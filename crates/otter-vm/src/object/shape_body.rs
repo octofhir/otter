@@ -1,6 +1,8 @@
 //! GC-managed hidden-class layout nodes.
 //!
-//! Shape nodes are immutable after allocation and record the transition from
+//! Shape nodes are immutable after allocation (except that finishing a
+//! constructor lineage's slack tracking shrinks its capacity and clears its
+//! provisional state once, in place) and record the transition from
 //! their parent — parent shape, added property key, property count, and the
 //! slot offset assigned to that key — together with what every object of the
 //! lineage shares: its `[[Prototype]]` (V8 `Map::prototype`, JSC
@@ -25,8 +27,10 @@
 //! - `parent == Gc::null()` and `transition_key == Gc::null()` only for a
 //!   root or a dictionary shape, the only nodes whose `transition_atom` is
 //!   [`AtomId::NONE`].
-//! - Every node shares its root's immutable inline capacity, prototype and
-//!   dictionary shape. Normal/dictionary roots partition capacity identities: a
+//! - Every node shares its root's inline capacity, prototype and dictionary
+//!   shape. Capacity changes only when slack tracking finishes a provisional
+//!   lineage: the whole transition tree shrinks together to a capacity every
+//!   node's fields fit, and objects allocated before keep wider cells. Normal/dictionary roots partition capacity identities: a
 //!   shape fixes its objects' `[[Prototype]]`, so a prototype change is a
 //!   change of shape. A dictionary shape describes no keys (a dictionary
 //!   object keeps them in its sidecar) and is its own dictionary shape.
@@ -111,7 +115,8 @@ pub struct ShapeBody {
     /// `true` when the slot added by this transition is an accessor rather
     /// than a data property. Meaningless for the root.
     own_is_accessor: bool,
-    /// Immutable number of persistent in-object words.
+    /// Number of persistent in-object words; fixed except when slack tracking
+    /// finishes a provisional lineage.
     inline_capacity: u8,
     /// Previous root for this prototype, capacity and state cache; roots only.
     previous_layout_root: ShapeHandle,
@@ -439,6 +444,74 @@ pub(crate) fn alloc_root_shape_body_with_roots(
     Ok(root)
 }
 
+/// Allocate a dictionary shape for `root`'s lineage at `inline_capacity`,
+/// with the root's current state. Slack tracking gives a finished lineage a
+/// fresh one: dictionary objects store values in their in-object slots, so
+/// objects already in dictionary mode keep the wider shape their cells match.
+pub(crate) fn alloc_dictionary_shape_body_with_roots(
+    heap: &mut GcHeap,
+    root: ShapeHandle,
+    inline_capacity: usize,
+    external_visit: &mut RootSlotVisitor<'_>,
+) -> Result<ShapeHandle, otter_gc::OutOfMemory> {
+    let (prototype, prototype_value, state) = heap.read_payload(root, |body| {
+        (body.prototype, body.prototype_value, body.state)
+    });
+    let prototype = if !prototype.is_null() {
+        ShapePrototype::Object(prototype)
+    } else if prototype_value.is_undefined() {
+        ShapePrototype::Null
+    } else {
+        ShapePrototype::Value(prototype_value)
+    };
+    // Old-space shapes never move: the visit only keeps the root alive.
+    let mut rooted = root;
+    let mut visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
+        visitor(std::ptr::from_mut(&mut rooted).cast::<RawGc>());
+        external_visit(visitor);
+    };
+    let dictionary = heap.alloc_old_with_roots(
+        ShapeBody::empty(
+            next_shape_id(),
+            prototype,
+            state.with_dictionary(true),
+            root,
+            inline_capacity,
+            ShapeHandle::null(),
+        ),
+        &mut visit,
+    )?;
+    let prototype = heap.read_payload(dictionary, ShapeBody::prototype);
+    remember_prototype(heap, dictionary, prototype);
+    Ok(dictionary)
+}
+
+/// Complete in-object slack tracking on one node of a provisional lineage
+/// (V8's `CompleteInobjectSlackTracking`): its in-object capacity shrinks to
+/// `inline_capacity`, which every node of the lineage's tree fits, it becomes
+/// ordinary, and its lineage's dictionary shape becomes `dictionary`. No
+/// existing field moves; later transitions place fields against the new
+/// capacity, and objects allocated before keep their wider cells.
+pub(crate) fn finish_slack_tracking(
+    heap: &mut GcHeap,
+    shape: ShapeHandle,
+    inline_capacity: usize,
+    dictionary: ShapeHandle,
+) {
+    heap.with_payload(shape, |body| {
+        debug_assert!(body.state.is_provisional() && !body.is_dictionary());
+        debug_assert!(body.property_count as usize <= inline_capacity);
+        debug_assert!(inline_capacity <= usize::from(body.inline_capacity));
+        body.inline_capacity = inline_capacity as u8;
+        if body.parent.is_null() {
+            body.own_field = super::FieldLocation::for_slot(0, inline_capacity);
+        }
+        body.state = body.state.with_provisional(false);
+        body.dictionary = dictionary;
+    });
+    heap.record_write(shape, &dictionary);
+}
+
 /// One heap root slot owns the complete null-prototype layout cache chain.
 const NULL_ROOT_SLOT: usize = 0;
 
@@ -481,7 +554,7 @@ pub(crate) fn set_null_root(heap: &GcHeap, root: ShapeHandle) {
     heap.set_embedder_root(NULL_ROOT_SLOT, root.raw());
 }
 
-/// Immutable inline capacity of this exact shape and its lineage.
+/// Inline capacity of this exact shape and its lineage.
 #[must_use]
 pub(crate) fn inline_capacity_of(shape: ShapeHandle) -> usize {
     body_of(shape).inline_capacity as usize

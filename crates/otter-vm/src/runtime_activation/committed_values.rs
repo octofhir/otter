@@ -317,10 +317,21 @@ impl Interpreter {
                 {
                     Value::boolean(self.proxy_private_find(&proxy, symbol).is_some())
                 } else {
+                    let name: std::sync::Arc<str>;
                     let key = if let Some(symbol) = result.as_symbol(&self.gc_heap) {
                         VmPropertyKey::Symbol(symbol)
                     } else if let Some(string) = result.as_string(&self.gc_heap) {
-                        VmPropertyKey::OwnedString(string.to_lossy_string(&self.gc_heap))
+                        // An interned key spells its atom: no decoding, and
+                        // shape walks compare ids.
+                        if let Some((atom, spelling)) = self.interned_string_key(string) {
+                            name = spelling;
+                            VmPropertyKey::Atom(crate::property_atom::AtomizedPropertyKey::new(
+                                crate::property_atom::PropertyAtom::new(atom),
+                                &name,
+                            ))
+                        } else {
+                            VmPropertyKey::OwnedString(string.to_lossy_string(&self.gc_heap))
+                        }
                     } else if let Some(number) = result.as_number() {
                         VmPropertyKey::OwnedString(number.to_display_string())
                     } else {

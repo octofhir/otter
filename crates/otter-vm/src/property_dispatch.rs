@@ -1190,18 +1190,13 @@ impl Interpreter {
                     .constructor_prototype_value(proto_name)
                     .map_err(|error| CommittedValueError::Fatal(error.into()))?,
             };
-            let Some(proto_obj) = proto.as_object() else {
+            // The prototype may be any object: an Array, a function or a
+            // proxy answers through its own `[[Get]]`.
+            if !proto.is_object_type() {
                 return Ok(Value::undefined());
-            };
+            }
             let key = VmPropertyKey::String(name);
-            match interp.ordinary_get_value(
-                stack,
-                Some(context),
-                Value::object(proto_obj),
-                *receiver,
-                &key,
-                0,
-            )? {
+            match interp.ordinary_get_value(stack, Some(context), proto, *receiver, &key, 0)? {
                 VmGetOutcome::Value(value) => Ok(value),
                 VmGetOutcome::InvokeGetter { getter } => interp
                     .run_callable_sync_rooted(

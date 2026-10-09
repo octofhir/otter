@@ -1,0 +1,10 @@
+const proto = [10, 20, 30];
+const a = [, , 3];
+Object.setPrototypeOf(a, proto);
+console.log(a[0], a[1], a[2], 0 in a, Object.getPrototypeOf(a) === proto);
+const b = [, , 3];
+b.__proto__ = { 0: "x", 1: "y" };
+console.log(b[0], b[1]);
+const c = new Array(3);
+Object.setPrototypeOf(c, proto);
+console.log(c[0], c[1]);

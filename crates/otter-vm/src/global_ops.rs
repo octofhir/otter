@@ -565,7 +565,8 @@ impl Interpreter {
         // a lexical. Sloppy-eval-introduced vars are *configurable*
         // and may be shadowed (tc39/ecma262#2205 removed
         // [[VarNames]]; configurability is the only gate).
-        if let Some(descriptor) = object::get_own_descriptor(self.global_this, &self.gc_heap, name)
+        let shadowed = object::get_own_descriptor(self.global_this, &self.gc_heap, name);
+        if let Some(descriptor) = &shadowed
             && !descriptor.flags.configurable()
         {
             return Err(
@@ -574,7 +575,12 @@ impl Interpreter {
         }
         let cell = crate::alloc_upvalue(&mut self.gc_heap, Value::hole())?;
         self.global_lexicals.insert(name.into(), (cell, is_const));
-        self.global_lexical_epoch = self.global_lexical_epoch.wrapping_add(1);
+        // Generated code reads a global-object property only while it is an
+        // own property: a lexical that shadows none invalidates no such read
+        // (V8 invalidates only the shadowed name's property cell).
+        if shadowed.is_some() {
+            self.global_lexical_epoch = self.global_lexical_epoch.wrapping_add(1);
+        }
         self.global_object_load_ic.clear();
         Ok(())
     }

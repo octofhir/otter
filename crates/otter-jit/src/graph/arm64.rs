@@ -4256,8 +4256,9 @@ impl<'a> Codegen<'a> {
     }
 
     /// `X(destination)` = the tagged boolean `ToBoolean(X(value))`, negated
-    /// for `!`: immediates and int32 inline, every other value through the
-    /// VM's leaf predicate with live registers saved.
+    /// for `!`: immediates, Numbers, strings and objects inline, native
+    /// functions, BigInts and other immediates through the VM's leaf
+    /// predicate with live registers saved.
     fn emit_to_boolean(&mut self, node: NodeId, value: u8, destination: u8, negate: bool) {
         let truthy = self.ops.new_dynamic_label();
         let falsy = self.ops.new_dynamic_label();
@@ -4284,8 +4285,8 @@ impl<'a> Codegen<'a> {
             ; b.eq =>falsy
             ; b =>truthy
             ; =>not_int
-            ; b =>slow
         );
+        self.emit_heap_truthiness(value, truthy, falsy, slow);
         let (when_truthy, when_falsy) = if negate {
             (VALUE_FALSE, VALUE_TRUE)
         } else {
@@ -4325,8 +4326,9 @@ impl<'a> Codegen<'a> {
             }));
     }
 
-    /// Branch on `ToBoolean(X(value))`: immediates and int32 inline, every
-    /// other value through the VM's leaf predicate with live registers saved.
+    /// Branch on `ToBoolean(X(value))`: immediates, Numbers, strings and
+    /// objects inline, native functions, BigInts and other immediates
+    /// through the VM's leaf predicate with live registers saved.
     fn emit_truthy_branch(
         &mut self,
         node: NodeId,
@@ -4358,8 +4360,8 @@ impl<'a> Codegen<'a> {
             ; b.eq =>false_target
             ; b =>if_true
             ; =>not_int
-            ; b =>slow
         );
+        self.emit_heap_truthiness(value, true_target, false_target, slow);
         let live = self.allocation.node(node).live_registers.clone();
         self.deferred
             .push(Box::new(move |codegen: &mut Codegen<'a>| {
@@ -4388,6 +4390,62 @@ impl<'a> Codegen<'a> {
                     ; b =>if_false
                 );
             }));
+    }
+
+    /// `ToBoolean` of a value below the int32 tag range that is not a
+    /// boolean, `null` or `undefined`: a double is falsy at ±0 and NaN, a
+    /// string at length zero, and every other cell is an object, truthy,
+    /// except a native function (the only possible `[[IsHTMLDDA]]`) and a
+    /// BigInt, which go to `slow` with the remaining immediates. Clobbers
+    /// `x16` and `x17`.
+    fn emit_heap_truthiness(
+        &mut self,
+        value: u8,
+        truthy: DynamicLabel,
+        falsy: DynamicLabel,
+        slow: DynamicLabel,
+    ) {
+        let cell = self.ops.new_dynamic_label();
+        let string_tag = u32::from(self.view.string_layout.string_type_tag);
+        let length = self.view.string_layout.string_len_byte;
+        self.load_immediate(16, NOT_CELL_MASK);
+        dynasm!(self.ops
+            ; .arch aarch64
+            ; tst X(value), x16
+            ; b.eq =>cell
+            // A boxed double carries number tag bits; other immediates do not.
+            ; lsr x16, X(value), #49
+            ; cbz x16, =>slow
+        );
+        self.load_immediate(16, DOUBLE_OFFSET);
+        dynasm!(self.ops
+            ; .arch aarch64
+            ; sub x16, X(value), x16
+            ; lsl x17, x16, #1
+            ; cbz x17, =>falsy
+        );
+        // NaN boxes as the one canonical pattern.
+        self.load_immediate(17, tag::CANONICAL_NAN);
+        dynasm!(self.ops
+            ; .arch aarch64
+            ; cmp x16, x17
+            ; b.eq =>falsy
+            ; b =>truthy
+            ; =>cell
+            ; cbz X(value), =>slow
+            ; ldrb w16, [X(value)]
+            ; cmp w16, string_tag
+            ; b.ne >object
+            ; ldr w16, [X(value), length]
+            ; cbz w16, =>falsy
+            ; b =>truthy
+            ; object:
+            ; cmp w16, u32::from(otter_vm::native_function::NATIVE_FUNCTION_BODY_TYPE_TAG)
+            ; b.eq =>slow
+            ; cmp w16, u32::from(otter_vm::bigint::BIG_INT_BODY_TYPE_TAG)
+            ; b.eq =>slow
+            ; b =>truthy
+        );
     }
 
     /// The interrupt and work-budget poll of a loop back edge, before the

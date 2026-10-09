@@ -4,7 +4,8 @@
 //! - Numeric and identity strict equality, with content comparison in the VM.
 //! - Loose equality: the pairs that convert nothing inline, every coercing
 //!   pair through the committed runtime operation.
-//! - Immediate/int32 truthiness and total leaf handling for other values.
+//! - Truthiness of immediates, Numbers, strings and objects inline, and total
+//!   leaf handling for native functions, BigInts and other immediates.
 //! - Shared truthiness branches for Graph control.
 //! - `typeof` tests through the VM's total leaf probe.
 //!
@@ -322,14 +323,17 @@ impl<'a> Codegen<'a> {
         if_false: DynamicLabel,
     ) {
         let slow = self.ops.new_dynamic_label();
+        let not_int = self.ops.new_dynamic_label();
         dynasm!(self.ops ; .arch x64
             ; cmp Rq(value), DWORD tag::VALUE_TRUE as i32 ; je =>if_true
             ; cmp Rq(value), DWORD tag::VALUE_FALSE as i32 ; je =>if_false
             ; cmp Rq(value), DWORD tag::VALUE_UNDEFINED as i32 ; je =>if_false
             ; cmp Rq(value), DWORD tag::VALUE_NULL as i32 ; je =>if_false
-            ; mov r10, Rq(value) ; sar r10, 49 ; cmp r10, -1 ; jne =>slow
+            ; mov r10, Rq(value) ; sar r10, 49 ; cmp r10, -1 ; jne =>not_int
             ; test Rd(value), Rd(value) ; jz =>if_false ; jmp =>if_true
+            ; =>not_int
         );
+        self.emit_heap_truthiness(value, if_true, if_false, slow);
         self.defer_predicate_leaf(
             node,
             value,
@@ -339,6 +343,51 @@ impl<'a> Codegen<'a> {
             if_false,
             abi::STUB_TO_BOOLEAN_LEAF,
             otter_vm::runtime_stubs::TO_BOOLEAN_LEAF.entry_addr() as u64,
+        );
+    }
+
+    /// `ToBoolean` of a value outside the int32 tag range that is not a
+    /// boolean, `null` or `undefined`: a double is falsy at ±0 and NaN, a
+    /// string at length zero, and every other cell is an object, truthy,
+    /// except a native function (the only possible `[[IsHTMLDDA]]`) and a
+    /// BigInt, which go to `slow` with the remaining immediates. `r10` holds
+    /// the value's top bits shifted down by 49. Clobbers `r10` and `r11`.
+    fn emit_heap_truthiness(
+        &mut self,
+        value: u8,
+        truthy: DynamicLabel,
+        falsy: DynamicLabel,
+        slow: DynamicLabel,
+    ) {
+        let cell = self.ops.new_dynamic_label();
+        let object = self.ops.new_dynamic_label();
+        let string_tag = self.view.string_layout.string_type_tag as i8;
+        let length = self.view.string_layout.string_len_byte as i32;
+        self.load_immediate(11, tag::NOT_CELL_MASK);
+        dynasm!(self.ops ; .arch x64
+            ; test Rq(value), r11 ; jz =>cell
+            // A boxed double carries number tag bits; other immediates do not.
+            ; test r10, r10 ; jz =>slow
+        );
+        self.load_immediate(11, tag::DOUBLE_ENCODE_OFFSET);
+        dynasm!(self.ops ; .arch x64
+            ; mov r10, Rq(value) ; sub r10, r11
+            ; mov r11, r10 ; shl r11, 1 ; jz =>falsy
+        );
+        // NaN boxes as the one canonical pattern.
+        self.load_immediate(11, tag::CANONICAL_NAN);
+        dynasm!(self.ops ; .arch x64
+            ; cmp r10, r11 ; je =>falsy ; jmp =>truthy
+            ; =>cell
+            ; test Rq(value), Rq(value) ; jz =>slow
+            ; cmp BYTE [Rq(value)], string_tag ; jne =>object
+            ; cmp DWORD [Rq(value) + length], 0 ; je =>falsy ; jmp =>truthy
+            ; =>object
+            ; cmp BYTE [Rq(value)], otter_vm::native_function::NATIVE_FUNCTION_BODY_TYPE_TAG as i8
+            ; je =>slow
+            ; cmp BYTE [Rq(value)], otter_vm::bigint::BIG_INT_BODY_TYPE_TAG as i8
+            ; je =>slow
+            ; jmp =>truthy
         );
     }
 

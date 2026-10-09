@@ -316,8 +316,21 @@ pub struct Frame {
     pub return_destination: u32,
     /// Frame-local semantic state. Zero denotes an unallocated cold record.
     pub cold: Option<ColdFrameIdx>,
+    /// Return address into the immediate physical caller's code. Zero: the
+    /// caller called this record's generated entry directly, and the address
+    /// is the saved link register of this record's machine frame
+    /// ([`Frame::return_pc_into_caller`]). [`NO_CALLER_RETURN_PC`]: the caller
+    /// is interpreter/host-owned or a Rust helper. Anything else: the address
+    /// a trampoline-entered record copied from the pending request. Tier
+    /// changes preserve it, and parked invocations never retain it.
+    pub caller_return_pc: u64,
     /// Exact allocating family, consumed before terminal construction unlink.
     /// Non-owning base/source metadata stays inside this traced GC layout.
+    ///
+    /// This and the three fields after it are the construction state: they
+    /// are initialized exactly when the header carries
+    /// [`NativeFrameFlags::CONSTRUCT`]. A generated entry entered through
+    /// `[[Call]]` never writes them, so nothing reads them without the flag.
     pub(crate) construct_layout: crate::constructor_layout::ConstructorLayout,
     /// Exact own DerivedThis context, published by this activation's CreateContext.
     /// This traced identity root contains no copied binding value. The descriptor's
@@ -331,14 +344,6 @@ pub struct Frame {
     /// or a parked-state field. Terminal ownership validates current-chain
     /// membership before dereferencing it, then proves the exact Super opcode.
     pub(crate) super_origin: u64,
-    /// Return address into the immediate physical caller's code. Zero: the
-    /// caller called this record's generated entry directly, and the address
-    /// is the saved link register of this record's machine frame
-    /// ([`Frame::return_pc_into_caller`]). [`NO_CALLER_RETURN_PC`]: the caller
-    /// is interpreter/host-owned or a Rust helper. Anything else: the address
-    /// a trampoline-entered record copied from the pending request. Tier
-    /// changes preserve it, and parked invocations never retain it.
-    pub caller_return_pc: u64,
 }
 
 impl Frame {
@@ -356,18 +361,23 @@ impl Frame {
                 std::ptr::addr_of_mut!((*frame).self_value),
                 std::ptr::addr_of_mut!((*frame).this_value),
                 std::ptr::addr_of_mut!((*frame).new_target_value),
-                std::ptr::addr_of_mut!((*frame).construct_receiver),
             ]
         } {
             unsafe { (&mut *slot).trace_value_slot_mut(visitor) };
         }
-        let binding = unsafe { std::ptr::addr_of_mut!((*frame).derived_this_context) };
-        if !unsafe { (*binding).is_null() } {
-            visitor(binding.cast::<RawGc>());
-        }
-        let layout = unsafe { std::ptr::addr_of_mut!((*frame).construct_layout) };
-        if !unsafe { (*layout).is_null() } {
-            visitor(layout.cast::<RawGc>());
+        // Construction state exists only on a constructing record.
+        if unsafe { (*frame).is_construct() } {
+            unsafe {
+                (*std::ptr::addr_of_mut!((*frame).construct_receiver)).trace_value_slot_mut(visitor)
+            };
+            let binding = unsafe { std::ptr::addr_of_mut!((*frame).derived_this_context) };
+            if !unsafe { (*binding).is_null() } {
+                visitor(binding.cast::<RawGc>());
+            }
+            let layout = unsafe { std::ptr::addr_of_mut!((*frame).construct_layout) };
+            if !unsafe { (*layout).is_null() } {
+                visitor(layout.cast::<RawGc>());
+            }
         }
         let arguments = unsafe { std::ptr::addr_of_mut!((*frame).arguments_object) };
         if !unsafe { (*arguments).is_null() } {
@@ -687,9 +697,14 @@ pub const NATIVE_FRAME_REGISTER_COUNT_OFFSET: u32 = (std::mem::offset_of!(Frame,
 pub const NATIVE_FRAME_REGISTER_BASE_OFFSET: u32 = std::mem::offset_of!(Frame, registers) as u32;
 /// Register capacity followed by alignment padding initialized to zero.
 pub const NATIVE_FRAME_REGISTER_EXTENT_OFFSET: u32 = NATIVE_FRAME_REGISTER_BASE_OFFSET + 8;
-/// Return destination followed by the nullable cold-state index.
+/// Return destination followed by the nullable cold-state index. The next
+/// word is [`Frame::caller_return_pc`], so linkage initializes both with one
+/// pair store.
 pub const NATIVE_FRAME_CONTINUATION_OFFSET: u32 =
     std::mem::offset_of!(Frame, return_destination) as u32;
+const _: () = assert!(
+    std::mem::offset_of!(Frame, caller_return_pc) == NATIVE_FRAME_CONTINUATION_OFFSET as usize + 8
+);
 /// Byte offset of [`Frame::this_value`].
 pub const NATIVE_FRAME_THIS_OFFSET: u32 = std::mem::offset_of!(Frame, this_value) as u32;
 /// Byte offset of [`Frame::new_target_value`].
@@ -722,12 +737,12 @@ pub const NATIVE_FRAME_CONSTRUCT_RECEIVER_OFFSET: u32 =
 /// Private compiled-engine offset of the own DerivedThis context identity root.
 pub const NATIVE_FRAME_DERIVED_THIS_CONTEXT_OFFSET: u32 =
     std::mem::offset_of!(Frame, derived_this_context) as u32;
-const _: [(); 108] = [(); std::mem::offset_of!(Frame, derived_this_context)];
+const _: [(); 116] = [(); std::mem::offset_of!(Frame, derived_this_context)];
 
 /// Private offset of the synchronous Super source; never a collector root.
 #[doc(hidden)]
 pub const NATIVE_FRAME_SUPER_ORIGIN_OFFSET: u32 = std::mem::offset_of!(Frame, super_origin) as u32;
-const _: [(); 120] = [(); std::mem::offset_of!(Frame, super_origin)];
+const _: [(); 128] = [(); std::mem::offset_of!(Frame, super_origin)];
 
 /// [`Frame::caller_return_pc`] of a record whose caller is not suspended at
 /// a generated call site.
@@ -750,7 +765,7 @@ pub const FRAME_RECORD_SLOT: usize = FRAME_RECORD_BYTES + 48;
 /// Return-address word of [`Frame`].
 pub const NATIVE_FRAME_CALLER_RETURN_PC_OFFSET: u32 =
     std::mem::offset_of!(Frame, caller_return_pc) as u32;
-const _: [(); 128] = [(); std::mem::offset_of!(Frame, caller_return_pc)];
+const _: [(); 104] = [(); std::mem::offset_of!(Frame, caller_return_pc)];
 
 #[cfg(test)]
 mod tests {

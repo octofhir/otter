@@ -74,6 +74,9 @@ pub(crate) struct ActivationExits {
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct CallEntryCold {
     pub(crate) overflow: DynamicLabel,
+    /// An entry the call trampoline staged takes its caller anchor from the
+    /// request.
+    pub(crate) staged: (DynamicLabel, DynamicLabel),
     pub(crate) break_even: Option<(DynamicLabel, DynamicLabel)>,
     pub(crate) promote: Option<(DynamicLabel, DynamicLabel)>,
     pub(crate) construct: Option<(DynamicLabel, DynamicLabel)>,
@@ -90,8 +93,10 @@ impl CallEntryCold {
         let construct = shape.base_constructor().then(&mut pair);
         let prepare = shape.sloppy_receiver().then(&mut pair);
         let underarity = (shape.lazy_window && shape.param_count != 0).then(&mut pair);
+        let staged = pair();
         Self {
             overflow: ops.new_dynamic_label(),
+            staged,
             break_even,
             promote,
             construct,

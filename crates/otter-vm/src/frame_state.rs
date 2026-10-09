@@ -327,9 +327,11 @@ impl ParkedFrameState {
             frame.arguments_object,
             frame.return_register(),
         );
-        parked.construct_layout = frame.construct_layout;
-        parked.derived_this_context = frame.derived_this_context;
-        parked.construct_receiver = frame.construct_receiver;
+        if frame.is_construct() {
+            parked.construct_layout = frame.construct_layout;
+            parked.derived_this_context = frame.derived_this_context;
+            parked.construct_receiver = frame.construct_receiver;
+        }
         parked
     }
 

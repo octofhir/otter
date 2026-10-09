@@ -244,6 +244,7 @@ pub(crate) fn emit_call_entry(
     let start = ops.offset();
     let CallEntryCold {
         overflow,
+        staged,
         break_even,
         promote,
         construct,
@@ -293,25 +294,18 @@ pub(crate) fn emit_call_entry(
             dynasm!(ops ; .arch aarch64 ; add x19, x9, x19);
         }
     }
-    // Only the trampoline tags the aligned generation word. A direct entry's
-    // return address is the link register saved at `[x29 + 8]`, read back
-    // through the record's anchor; a staged entry consumes the original
-    // caller anchor of the request before any generation-cell dereference
-    // or frame publication.
-    let direct_origin = ops.new_dynamic_label();
-    let origin_ready = ops.new_dynamic_label();
+    // The continuation word (ABI return, no cold state) and the caller
+    // return address share one pair store. A direct entry's return address
+    // is the link register saved at `[x29 + 8]`, read back through the
+    // record's anchor, so the word is zero. Only the trampoline tags the
+    // aligned generation word: a staged entry consumes the original caller
+    // anchor of the request before any generation-cell dereference or frame
+    // publication.
     dynasm!(ops ; .arch aarch64
-        ; tbz x8, 0, =>direct_origin
-        ; and x8, x8, !abi::CODE_ENTRY_STAGED_REQUEST_MASK
-        ; ldr x16, [x20, crate::entry::PENDING_CALL_OFFSET + abi::REQUEST_CALLER_RETURN_PC_OFFSET]
-        ; cmp x16, 0
-        ; csinc x16, x16, xzr, ne
-        ; stp xzr, xzr, [x20, (crate::entry::PENDING_CALL_OFFSET + abi::REQUEST_CALLER_OFFSET) as i32]
-        ; b =>origin_ready
-        ; =>direct_origin
-        ; mov x16, xzr
-        ; =>origin_ready
-        ; str x16, [x21, abi::NATIVE_FRAME_CALLER_RETURN_PC_OFFSET]
+        ; movn w16, 0
+        ; stp x16, xzr, [x21, (abi::NATIVE_FRAME_CONTINUATION_OFFSET) as i32]
+        ; tbnz x8, 0, =>staged.0
+        ; =>staged.1
     );
     if let Some((check, back)) = break_even {
         // Entry diagnostics and canonical source-work admission for promotion.
@@ -370,7 +364,12 @@ pub(crate) fn emit_call_entry(
         shape.register_count
     };
     emit_load_u64(ops, 13, u64::from(shape.function_id));
-    emit_load_u64(ops, 14, shape.header_word(window_slots));
+    // The register shape, tier, flags and generation are one constant of
+    // the code object.
+    let header = shape.header_word(window_slots);
+    if !relocations.emit_constant_load(ops, 14, header) {
+        emit_load_u64(ops, 14, header);
+    }
     dynasm!(ops ; .arch aarch64 ; stp x13, x14, [x21]);
     if shape.lazy_window {
         dynasm!(ops
@@ -389,7 +388,12 @@ pub(crate) fn emit_call_entry(
         ; stp x2, x3, [x21, (NATIVE_FRAME_THIS_OFFSET) as i32]
         ; stp x1, x4, [x21, (NATIVE_FRAME_SELF_OFFSET) as i32]
     );
-    emit_construct_request(ops);
+    // A derived constructor is entered only by `[[Construct]]`; a base
+    // constructor takes the request on its construct path, and any other
+    // body is never constructed.
+    if shape.derived {
+        emit_take_construct_request(ops);
+    }
     dynasm!(ops
         ; .arch aarch64
         ; add x15, x29, 48
@@ -417,11 +421,6 @@ pub(crate) fn emit_call_entry(
             ; stp x16, x17, [x21, (abi::NATIVE_FRAME_DEPTH_OFFSET) as i32]
         );
     }
-    dynasm!(ops
-        ; .arch aarch64
-        ; movn w16, 0
-        ; str x16, [x21, abi::NATIVE_FRAME_CONTINUATION_OFFSET]
-    );
     if shape.lazy_window {
         // The body reads its formals where the caller pushed them.
         dynasm!(ops ; .arch aarch64 ; add x19, x29, 48);
@@ -484,24 +483,22 @@ pub(crate) fn emit_publish_lazy_window(ops: &mut Assembler, register_count: u16,
     );
 }
 
-/// Move the pending construction request into the frame record.
+/// Move the pending construction request into the record's construction
+/// state and clear the request.
 ///
-/// Every consumer of the request (this prologue and the call trampoline)
-/// clears it, so outside a `[[Construct]]` it is already clear and an
-/// ordinary call (`new.target` undefined) only initializes its own record.
-/// Clobbers `x15`–`x17`.
-fn emit_construct_request(ops: &mut Assembler) {
+/// Runs only on a `[[Construct]]` entry, before anything can collect or read
+/// the state; an entry through `[[Call]]` leaves the state unwritten, and the
+/// record's `CONSTRUCT` flag tells readers which it is. Every consumer of the
+/// request (this entry and the call trampoline) clears it. Clobbers
+/// `x15`–`x17`.
+fn emit_take_construct_request(ops: &mut Assembler) {
     const _: () = assert!(
         abi::NATIVE_FRAME_CONSTRUCT_RECEIVER_OFFSET
             == abi::NATIVE_FRAME_CONSTRUCT_LAYOUT_OFFSET + 8
     );
-    let ordinary = ops.new_dynamic_label();
-    let recorded = ops.new_dynamic_label();
     dynasm!(ops
         ; .arch aarch64
         ; movz x15, VALUE_UNDEFINED as u32
-        ; cmp x3, x15
-        ; b.eq =>ordinary
         ; ldr w16, [x20, crate::entry::PENDING_CALL_OFFSET + abi::REQUEST_CONSTRUCT_LAYOUT_OFFSET]
         ; ldr x17, [x20, crate::entry::PENDING_CALL_OFFSET + abi::REQUEST_CONSTRUCT_RECEIVER_OFFSET]
         ; stp x16, x17, [x21, (abi::NATIVE_FRAME_CONSTRUCT_LAYOUT_OFFSET) as i32]
@@ -510,11 +507,6 @@ fn emit_construct_request(ops: &mut Assembler) {
         ; str xzr, [x20, crate::entry::PENDING_CALL_OFFSET + abi::REQUEST_SUPER_ORIGIN_OFFSET]
         ; str wzr, [x20, crate::entry::PENDING_CALL_OFFSET + abi::REQUEST_CONSTRUCT_LAYOUT_OFFSET]
         ; str x15, [x20, crate::entry::PENDING_CALL_OFFSET + abi::REQUEST_CONSTRUCT_RECEIVER_OFFSET]
-        ; b =>recorded
-        ; =>ordinary
-        ; stp xzr, x15, [x21, (abi::NATIVE_FRAME_CONSTRUCT_LAYOUT_OFFSET) as i32]
-        ; str xzr, [x21, abi::NATIVE_FRAME_SUPER_ORIGIN_OFFSET]
-        ; =>recorded
     );
 }
 
@@ -620,6 +612,18 @@ pub(crate) fn emit_call_entry_cold(
     saved_pairs: u8,
     cold: CallEntryCold,
 ) {
+    // A trampoline-staged entry: its caller anchor travels in the request.
+    let (staged, origin_ready) = cold.staged;
+    dynasm!(ops ; .arch aarch64
+        ; =>staged
+        ; and x8, x8, !abi::CODE_ENTRY_STAGED_REQUEST_MASK
+        ; ldr x16, [x20, crate::entry::PENDING_CALL_OFFSET + abi::REQUEST_CALLER_RETURN_PC_OFFSET]
+        ; cmp x16, 0
+        ; csinc x16, x16, xzr, ne
+        ; stp xzr, xzr, [x20, (crate::entry::PENDING_CALL_OFFSET + abi::REQUEST_CALLER_OFFSET) as i32]
+        ; str x16, [x21, abi::NATIVE_FRAME_CALLER_RETURN_PC_OFFSET]
+        ; b =>origin_ready
+    );
     if let Some((missing, ready)) = cold.underarity {
         dynasm!(ops ; .arch aarch64 ; =>missing);
         emit_window_base(ops, shape.register_count, saved_pairs);
@@ -651,9 +655,10 @@ pub(crate) fn emit_call_entry_cold(
     // conversion does not apply to the created receiver.
     if let Some((construct, constructed)) = cold.construct {
         let created = ops.new_dynamic_label();
+        dynasm!(ops ; .arch aarch64 ; =>construct);
+        emit_take_construct_request(ops);
         dynasm!(ops
             ; .arch aarch64
-            ; =>construct
             ; ldrb w9, [x21, crate::entry::NATIVE_FRAME_FLAGS_OFFSET]
             ; orr w9, w9, u32::from(abi::NativeFrameFlags::CONSTRUCT)
             ; strb w9, [x21, crate::entry::NATIVE_FRAME_FLAGS_OFFSET]

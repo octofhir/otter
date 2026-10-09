@@ -201,7 +201,18 @@ pub(crate) fn emit_operation(
             lhs,
             rhs,
             negate,
-        } => emit_loose_compare(ops, dst, lhs, rhs, negate, type_mismatch),
+        } => emit_loose_compare(
+            ops,
+            relocations,
+            transitions,
+            dst,
+            lhs,
+            rhs,
+            negate,
+            type_mismatch,
+            threw,
+            fatal,
+        ),
         TemplateOp::TestTypeOf { dst, src, test } => {
             emit_test_typeof(ops, relocations, dst, src, test, type_mismatch)
         }

@@ -74,6 +74,11 @@ use crate::{CompiledCode, Unsupported};
 /// Bounded inline prototype traversal before committed runtime completion.
 const INSTANCEOF_CHAIN_BOUND: u32 = 32;
 
+/// Graph nodes past which a body's code exceeds the ±32 KiB reach of the
+/// near form's `tbz`/`tbnz` exits even at about forty bytes a node.
+#[cfg(target_arch = "aarch64")]
+const FAR_BODY_NODES: usize = 800;
+
 /// Per-PC facts the builder takes from the baseline tier's plan.
 #[derive(Debug, Clone)]
 pub(crate) struct BaselineSupport {
@@ -169,9 +174,14 @@ pub(crate) fn compile(
             far,
         )
     };
+    // A body of this many nodes surely outgrows a `tbz`'s ±32 KiB at the
+    // fewest bytes a node takes, so it starts in the far form rather than
+    // emitting the near one only to have it refused.
     #[cfg(target_arch = "aarch64")]
-    let mut emission = match emit(false) {
-        Err(Unsupported::Backend(crate::BackendFailure::Relocation)) => emit(true),
+    let surely_far = built.graph.nodes.len() > FAR_BODY_NODES;
+    #[cfg(target_arch = "aarch64")]
+    let mut emission = match emit(surely_far) {
+        Err(Unsupported::Backend(crate::BackendFailure::Relocation)) if !surely_far => emit(true),
         result => result,
     }?;
     #[cfg(target_arch = "x86_64")]

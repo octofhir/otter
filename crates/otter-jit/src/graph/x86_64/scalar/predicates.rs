@@ -92,6 +92,7 @@ impl<'a> Codegen<'a> {
         let done = self.ops.new_dynamic_label();
         self.emit_equality_results(node, a, b, dst, negate, outcomes, done);
         dynasm!(self.ops ; .arch x64 ; =>done);
+        self.emit_sink_register(dst);
     }
 
     /// `Rq(dst)` = `Rq(a) == Rq(b)` (`!=` when `negate`) as a tagged
@@ -190,6 +191,7 @@ impl<'a> Codegen<'a> {
             Some(dst),
         )?;
         dynasm!(self.ops ; .arch x64 ; =>done);
+        self.emit_sink_register(dst);
         Ok(())
     }
 
@@ -267,10 +269,22 @@ impl<'a> Codegen<'a> {
         } else {
             (tag::VALUE_TRUE, tag::VALUE_FALSE)
         };
-        dynasm!(self.ops ; .arch x64 ; =>outcomes.equal);
-        self.load_immediate(dst, equal_value);
-        dynasm!(self.ops ; .arch x64 ; jmp =>done ; =>outcomes.differ);
-        self.load_immediate(dst, differ_value);
+        if let Some(sink) = self.sink {
+            // Fused into its branch: each outcome jumps to its successor.
+            let (on_equal, on_differ) = if negate {
+                (sink.if_false, sink.if_true)
+            } else {
+                (sink.if_true, sink.if_false)
+            };
+            dynasm!(self.ops ; .arch x64
+                ; =>outcomes.equal ; jmp =>on_equal
+                ; =>outcomes.differ ; jmp =>on_differ);
+        } else {
+            dynasm!(self.ops ; .arch x64 ; =>outcomes.equal);
+            self.load_immediate(dst, equal_value);
+            dynasm!(self.ops ; .arch x64 ; jmp =>done ; =>outcomes.differ);
+            self.load_immediate(dst, differ_value);
+        }
         self.defer_predicate_leaf(
             node,
             a,

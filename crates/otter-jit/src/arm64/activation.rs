@@ -63,10 +63,9 @@ pub(crate) fn emit_object_test(
 pub(crate) fn emit_lexical_this(ops: &mut Assembler, view: &JitCompileSnapshot) {
     let done = ops.new_dynamic_label();
     let layout = view.closure_call_layout;
-    emit_load_u64(ops, 9, tag::NOT_CELL_MASK);
     dynasm!(ops
         ; .arch aarch64
-        ; tst x1, x9
+        ; tst x1, #0xfffe_0000_0000_0007
         ; b.ne =>done
         ; ldr w9, [x1, layout.flags_byte]
     );

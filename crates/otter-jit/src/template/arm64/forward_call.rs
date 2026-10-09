@@ -64,10 +64,9 @@ pub(super) fn emit_forward_call(
         // The method is `%Function.prototype.apply%`, and no arguments
         // object stands for the activation's actuals.
         emit_load_reg(ops, 9, method)?;
-        emit_load_u64(ops, 16, otter_vm::value::tag::NOT_CELL_MASK);
         dynasm!(ops
             ; .arch aarch64
-            ; tst x9, x16
+            ; tst x9, #0xfffe_0000_0000_0007
             ; b.ne =>staged
             ; cbz x9, =>staged
             ; ldrb w16, [x9]

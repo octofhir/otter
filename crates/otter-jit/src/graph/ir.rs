@@ -626,6 +626,7 @@ impl Kind {
                 | Self::ToBoolean
                 | Self::LogicalNot
                 | Self::TestTypeOf { .. }
+                | Self::Instanceof
         )
     }
 

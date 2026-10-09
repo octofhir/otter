@@ -21,6 +21,54 @@ impl<'a> Codegen<'a> {
     pub(super) fn forwarded(&self, block: BlockId) -> BlockId {
         super::super::emission::forwarded(self.graph, self.allocation, block)
     }
+
+    /// The successor labels of the truthiness branch `control`, as its own
+    /// emission would name them.
+    pub(super) fn branch_sink(&self, control: NodeId) -> super::BooleanSink {
+        let Kind::Branch {
+            if_true, if_false, ..
+        } = self.graph.node(control).kind
+        else {
+            unreachable!("a fused producer answers a branch");
+        };
+        super::BooleanSink {
+            if_true: self.labels[&self.forwarded(if_true)],
+            if_false: self.labels[&self.forwarded(if_false)],
+        }
+    }
+
+    /// Bind a producer's two answers, `yes` and `no`: fused, each jumps to
+    /// its successor; otherwise each materializes its tagged boolean in
+    /// `Rq(destination)` and continues at `done`.
+    pub(super) fn emit_boolean_outcomes(
+        &mut self,
+        [yes, no]: [DynamicLabel; 2],
+        destination: u8,
+        done: DynamicLabel,
+    ) {
+        if let Some(sink) = self.sink {
+            dynasm!(self.ops ; .arch x64
+                ; =>yes ; jmp =>sink.if_true
+                ; =>no ; jmp =>sink.if_false);
+        } else {
+            dynasm!(self.ops ; .arch x64 ; =>yes);
+            self.load_immediate(destination, otter_vm::value::tag::VALUE_TRUE);
+            dynasm!(self.ops ; .arch x64 ; jmp =>done ; =>no);
+            self.load_immediate(destination, otter_vm::value::tag::VALUE_FALSE);
+            dynasm!(self.ops ; .arch x64 ; jmp =>done);
+        }
+    }
+
+    /// A fused producer's answer computed into `Rq(value)` as a tagged
+    /// boolean, delivered to its successors. Nothing when unfused.
+    pub(super) fn emit_sink_register(&mut self, value: u8) {
+        if let Some(sink) = self.sink {
+            dynasm!(self.ops ; .arch x64
+                ; cmp Rq(value), otter_vm::value::tag::VALUE_TRUE as i32
+                ; je =>sink.if_true
+                ; jmp =>sink.if_false);
+        }
+    }
     pub(super) fn emit_jump(&mut self, from: BlockId, to: BlockId, next: Option<BlockId>) {
         self.emit_parallel_moves(self.edge_moves(from, to));
         let to = self.forwarded(to);

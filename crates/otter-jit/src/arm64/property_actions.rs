@@ -76,9 +76,8 @@ fn key(
     store: bool,
     miss: DynamicLabel,
 ) {
-    emit_load_u64(ops, 16, otter_vm::value::tag::NOT_CELL_MASK);
     dynasm!(ops ; .arch aarch64
-        ; tst X(receiver), x16 ; b.ne =>miss ; cbz X(receiver), =>miss
+        ; tst X(receiver), #0xfffe_0000_0000_0007 ; b.ne =>miss ; cbz X(receiver), =>miss
         ; ldrb w16, [X(receiver)] ; cmp w16, #OBJECT_BODY_TYPE_TAG ; b.ne =>miss
         ; and x16, X(receiver), #0xffff_ffff_0000_0000
         ; ldr W(holder), [X(receiver), view.object_shape_byte] ; cbz W(holder), =>miss

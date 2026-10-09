@@ -48,10 +48,9 @@ impl Codegen<'_> {
         let holey = self.ops.new_dynamic_label();
         let store_double = self.ops.new_dynamic_label();
         let store_tagged = self.ops.new_dynamic_label();
-        self.load_immediate(16, super::NOT_CELL_MASK);
         dynasm!(self.ops
             ; .arch aarch64
-            ; tst X(receiver), x16
+            ; tst X(receiver), #0xfffe_0000_0000_0007
             ; b.ne =>other
             ; ldrb w17, [X(receiver)]
             ; cmp w17, u32::from(storage.type_tag)
@@ -136,10 +135,9 @@ impl Codegen<'_> {
             KEYED_STORE_KEY, KEYED_STORE_RECEIVER, KEYED_STORE_VALUE,
         };
         let string_tag = self.view.string_layout.string_type_tag;
-        self.load_immediate(16, super::NOT_CELL_MASK);
         dynasm!(self.ops
             ; .arch aarch64
-            ; tst X(key), x16
+            ; tst X(key), #0xfffe_0000_0000_0007
             ; b.ne =>missed
             ; ldrb w16, [X(key)]
             ; cmp w16, u32::from(string_tag)

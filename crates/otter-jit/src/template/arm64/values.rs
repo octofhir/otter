@@ -171,18 +171,15 @@ pub(crate) enum CellTest {
 /// tag nor the immediate tag. The mask is a high run plus bit 1, so the test
 /// is one logical-immediate `tst` and one bit test, with no scratch register.
 pub(crate) fn emit_cell_test(ops: &mut Assembler, value: u8, test: CellTest, target: DynamicLabel) {
+    // Every immediate sets bit 1 (the not-cell mask's low bit) and every
+    // cell is 8-aligned, so also testing bits 0 and 2 changes no answer and
+    // makes the mask one logical immediate.
     const _: () = assert!(otter_vm::value::tag::NOT_CELL_MASK == 0xfffe_0000_0000_0002);
     match test {
-        CellTest::IsCell => {
-            let not_cell = ops.new_dynamic_label();
-            dynasm!(ops ; .arch aarch64
-                ; tst X(value), #0xfffe_0000_0000_0000 ; b.ne =>not_cell
-                ; tbz X(value), #1, =>target
-                ; =>not_cell);
-        }
+        CellTest::IsCell => dynasm!(ops ; .arch aarch64
+            ; tst X(value), #0xfffe_0000_0000_0007 ; b.eq =>target),
         CellTest::IsNotCell => dynasm!(ops ; .arch aarch64
-            ; tst X(value), #0xfffe_0000_0000_0000 ; b.ne =>target
-            ; tbnz X(value), #1, =>target),
+            ; tst X(value), #0xfffe_0000_0000_0007 ; b.ne =>target),
     }
 }
 

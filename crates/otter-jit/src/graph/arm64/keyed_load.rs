@@ -19,7 +19,7 @@
 //! - [`super::keyed_store`] for the generic keyed store.
 //! - `otter_vm::jit::JitArrayStorage` for the storage this reads.
 
-use super::{Codegen, CommittedArgument, DynamicLabel, NOT_CELL_MASK, NodeId, VALUE_HOLE, abi};
+use super::{Codegen, CommittedArgument, DynamicLabel, NodeId, VALUE_HOLE, abi};
 use crate::Unsupported;
 use dynasmrt::{DynasmApi, DynasmLabelApi, dynasm};
 use otter_vm::jit::JitArrayStorage;
@@ -46,10 +46,9 @@ impl Codegen<'_> {
         let tagged = self.ops.new_dynamic_label();
         let holey = self.ops.new_dynamic_label();
         let boxed = self.ops.new_dynamic_label();
-        self.load_immediate(16, NOT_CELL_MASK);
         dynasm!(self.ops
             ; .arch aarch64
-            ; tst X(receiver), x16
+            ; tst X(receiver), #0xfffe_0000_0000_0007
             ; b.ne =>other
             ; ldrb w17, [X(receiver)]
             ; cmp w17, u32::from(storage.type_tag)
@@ -128,10 +127,9 @@ impl Codegen<'_> {
     ) {
         use crate::template::arm64::shared_property::{KEYED_LOAD_KEY, KEYED_LOAD_RECEIVER};
         let string_tag = self.view.string_layout.string_type_tag;
-        self.load_immediate(16, NOT_CELL_MASK);
         dynasm!(self.ops
             ; .arch aarch64
-            ; tst X(key), x16
+            ; tst X(key), #0xfffe_0000_0000_0007
             ; b.ne =>missed
             ; ldrb w16, [X(key)]
             ; cmp w16, u32::from(string_tag)

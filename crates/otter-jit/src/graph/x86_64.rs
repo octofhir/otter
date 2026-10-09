@@ -86,6 +86,20 @@ struct Codegen<'a> {
     /// Exact root records of the collecting boundaries emitted so far.
     sites: metadata::SitePlan,
     return_sites: Vec<abi::SafepointEntry>,
+    /// The truthiness branch each fused boolean producer answers into, by
+    /// producer (see [`super::emission::fused_branches`]).
+    fused: FxHashMap<NodeId, NodeId>,
+    /// The successors of the producer being emitted, while it is fused.
+    sink: Option<BooleanSink>,
+}
+
+/// Where a boolean producer fused with its block's branch delivers its
+/// answer: it jumps to the successor the answer selects instead of
+/// materializing `true` or `false` for the branch to test.
+#[derive(Clone, Copy)]
+struct BooleanSink {
+    if_true: DynamicLabel,
+    if_false: DynamicLabel,
 }
 
 /// Encode the production graph, with one entry and one recovery contract.
@@ -174,6 +188,8 @@ pub(crate) fn emit(
         materialize,
         sites: metadata::SitePlan::new(slots),
         return_sites: Vec::new(),
+        fused: super::emission::fused_branches(&built.graph, allocation),
+        sink: None,
     };
     let tier_entry = codegen.ops.offset().0;
     let body = codegen.ops.new_dynamic_label();
@@ -356,6 +372,7 @@ impl<'a> Codegen<'a> {
                     self.spill_definition(phi);
                 }
             }
+            let mut fused_control = None;
             for &node in &data.body {
                 if self.allocation.node(node).skipped {
                     continue;
@@ -364,11 +381,23 @@ impl<'a> Codegen<'a> {
                 for mov in self.allocation.node(node).moves.clone() {
                     self.emit_move(mov.from, mov.to);
                 }
+                if let Some(&control) = self.fused.get(&node) {
+                    self.sink = Some(self.branch_sink(control));
+                    let emitted = self.emit_node(node);
+                    self.sink = None;
+                    emitted?;
+                    fused_control = Some(control);
+                    continue;
+                }
                 self.emit_node(node)?;
                 self.spill_definition(node);
             }
             let control = data.control.expect("terminated block");
             self.node_offsets.push((self.ops.offset().0, control));
+            if fused_control == Some(control) {
+                // The producer already jumped to the branch's successors.
+                continue;
+            }
             for mov in self.allocation.node(control).moves.clone() {
                 self.emit_move(mov.from, mov.to);
             }

@@ -768,6 +768,13 @@ impl CodeBlock {
         self.byte_pcs.get(index).copied()
     }
 
+    /// The logical instruction index whose serialized byte PC is `byte_pc`.
+    /// Byte PCs ascend with the index.
+    #[must_use]
+    pub(crate) fn instruction_at_byte_pc(&self, byte_pc: u32) -> Option<usize> {
+        self.byte_pcs.binary_search(&byte_pc).ok()
+    }
+
     /// Operands in schema declaration order.
     #[cfg(test)]
     #[must_use]

@@ -42,6 +42,7 @@ mod elements;
 mod exits;
 mod guards;
 mod homes;
+mod keyed_load;
 mod keyed_store;
 mod memory;
 mod native_leaf;

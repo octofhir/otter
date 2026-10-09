@@ -15,7 +15,7 @@
 //! - [`super::Codegen`] owns canonical homes and collecting boundaries.
 
 use dynasmrt::{DynasmApi, DynasmLabelApi, dynasm};
-use otter_vm::{jit::JitGuardWidth, value::tag};
+use otter_vm::{jit::JitGuardWidth, native_abi as abi, value::tag};
 
 use super::Codegen;
 use crate::{
@@ -52,6 +52,39 @@ impl Codegen<'_> {
                 field,
                 true,
             ),
+            Kind::LoadArgumentCount => {
+                let destination = output();
+                dynasm!(self.ops ; .arch x64
+                    ; mov Rd(destination), [r14 + abi::NATIVE_FRAME_ARGUMENT_COUNT_OFFSET as i32]);
+            }
+            Kind::LoadActualArgument => {
+                let (index, destination) = (Self::gp(input(0)), output());
+                let exit = self.eager_exit(node, crate::graph::ir::DeoptReason::OutOfBounds);
+                // The actual window answers while no arguments object exists;
+                // the index compares unsigned, so a negative one is out of
+                // range too.
+                dynasm!(self.ops ; .arch x64
+                    ; cmp DWORD [r14 + abi::NATIVE_FRAME_ARGUMENTS_OBJECT_OFFSET as i32], 0
+                    ; jne =>exit
+                    ; cmp Rd(index), [r14 + abi::NATIVE_FRAME_ARGUMENT_COUNT_OFFSET as i32]
+                    ; jae =>exit
+                    ; mov r10, [r14 + abi::NATIVE_FRAME_ACTUALS_OFFSET as i32]
+                    ; mov r11d, Rd(index)
+                    ; mov Rq(destination), [r10 + r11 * 8]);
+            }
+            Kind::SelectArgument { count } => {
+                let (index, destination) = (Self::gp(input(0)), output());
+                let exit = self.eager_exit(node, crate::graph::ir::DeoptReason::OutOfBounds);
+                dynasm!(self.ops ; .arch x64
+                    ; cmp Rd(index), i32::from(count) ; jae =>exit
+                    ; mov r10, Rq(Self::gp(input(1))));
+                for argument in 1..count {
+                    let value = Self::gp(input(1 + usize::from(argument)));
+                    dynasm!(self.ops ; .arch x64
+                        ; cmp Rd(index), i32::from(argument) ; cmove r10, Rq(value));
+                }
+                dynasm!(self.ops ; .arch x64 ; mov Rq(destination), r10);
+            }
             Kind::LoadTaggedField(offset) => {
                 let (base, destination) = (Self::gp(input(0)), output());
                 dynasm!(self.ops ; .arch x64 ; mov Rq(destination), [Rq(base) + offset]);

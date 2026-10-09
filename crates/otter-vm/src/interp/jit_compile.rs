@@ -2556,10 +2556,12 @@ impl Interpreter {
                     continue;
                 };
                 let direct_ineligible = !callee.admits_generated_call(unresolved_call_kind);
-                // An `arguments` body reads the actual-argument window its
-                // generated caller publishes, so it still takes direct linkage;
-                // spliced into the caller it would have no window to read.
-                let inline_ineligible = direct_ineligible || callee.requires_argument_frame();
+                // A body that materializes or forwards `arguments`, or takes a
+                // rest list, reads the actual-argument window its generated
+                // caller publishes, so it keeps direct linkage; elided
+                // `arguments` reads are served from the call's values.
+                let inline_ineligible =
+                    direct_ineligible || !callee.splices_without_argument_frame();
                 if inline_ineligible {
                     self.record_jit_inline_candidate(
                         fid,

@@ -484,6 +484,19 @@ pub(crate) enum Kind {
     /// Eager deopt once the activation has materialized its arguments
     /// object: its actual arguments are then that object's elements.
     CheckArgumentsElided,
+    /// The physical activation's actual argument count, an int32: the
+    /// elided `arguments.length`.
+    LoadArgumentCount,
+    /// The physical activation's actual argument at int32 input0: the
+    /// elided `arguments[i]`. Eager deopt once an arguments object exists
+    /// or out of range, where the interpreter's ordinary `[[Get]]` applies.
+    LoadActualArgument,
+    /// The inlined body's actual argument at int32 input0 among the
+    /// `count` inputs after it: the elided `arguments[i]` of a spliced
+    /// call. Eager deopt out of range.
+    SelectArgument {
+        count: u8,
+    },
     /// Eager deopt unless input0 is the function `function_id`: its
     /// function-id immediate, or a closure of it that needs no runtime setup.
     /// `cell`, when not zero, holds the last value proved here, which a
@@ -636,6 +649,7 @@ impl Kind {
             | Self::InitialRegister(_)
             | Self::LoadNewTarget
             | Self::LoadClosure
+            | Self::LoadArgumentCount
             | Self::LoadLiteral(_)
             | Self::LoadWindow(_)
             | Self::Phi
@@ -701,6 +715,8 @@ impl Kind {
             | Self::CheckFunctionPrototypeCall(_)
             | Self::CheckNative(_)
             | Self::CheckArgumentsElided
+            | Self::LoadActualArgument
+            | Self::SelectArgument { .. }
             | Self::CheckFunction { .. }
             | Self::CheckCellValue(_)
             | Self::CheckNotHole
@@ -957,6 +973,11 @@ impl Kind {
             | Self::CheckNotHole
             | Self::CheckNative(_) => simple(1, ResultPolicy::None),
             Self::CheckArgumentsElided => simple(0, ResultPolicy::None),
+            Self::LoadArgumentCount => simple(0, ResultPolicy::Register),
+            Self::LoadActualArgument => simple(1, ResultPolicy::Register),
+            Self::SelectArgument { count } => {
+                simple(1 + usize::from(*count), ResultPolicy::Register)
+            }
             Self::LoadGuardedMethod { .. } => Constraints {
                 inputs: registers(1),
                 result: ResultPolicy::Register,
@@ -1238,7 +1259,8 @@ pub(crate) struct InlineCaller {
     /// The frame's `new.target`.
     pub(crate) new_target: NodeId,
     /// The call's actual arguments when legacy `fn.arguments` can read the
-    /// frame; the rebuilt activation's incoming arguments.
+    /// frame or its body reads `arguments`; the rebuilt activation's
+    /// incoming arguments.
     pub(crate) arguments: Option<SmallVec<[NodeId; 4]>>,
 }
 

@@ -1723,6 +1723,51 @@ impl<'a> Codegen<'a> {
                     ; cbnz w16, =>exit
                 );
             }
+            Kind::LoadArgumentCount => {
+                let destination = Self::gp(result.expect("a result"));
+                dynasm!(self.ops
+                    ; .arch aarch64
+                    ; ldr W(destination), [x21, abi::NATIVE_FRAME_ARGUMENT_COUNT_OFFSET]
+                );
+            }
+            Kind::LoadActualArgument => {
+                let index = Self::gp(input(0));
+                let destination = Self::gp(result.expect("a result"));
+                let exit = self.eager_exit(node, DeoptReason::OutOfBounds);
+                // The actual window answers while no arguments object
+                // exists; the index compares unsigned, so a negative one
+                // is out of range too.
+                dynasm!(self.ops
+                    ; .arch aarch64
+                    ; ldr w16, [x21, abi::NATIVE_FRAME_ARGUMENTS_OBJECT_OFFSET]
+                    ; cbnz w16, =>exit
+                    ; ldr w16, [x21, abi::NATIVE_FRAME_ARGUMENT_COUNT_OFFSET]
+                    ; cmp W(index), w16
+                    ; b.hs =>exit
+                    ; ldr x16, [x21, abi::NATIVE_FRAME_ACTUALS_OFFSET]
+                    ; ldr X(destination), [x16, W(index), uxtw #3]
+                );
+            }
+            Kind::SelectArgument { count } => {
+                let index = Self::gp(input(0));
+                let destination = Self::gp(result.expect("a result"));
+                let exit = self.eager_exit(node, DeoptReason::OutOfBounds);
+                dynasm!(self.ops
+                    ; .arch aarch64
+                    ; cmp WSP(index), u32::from(*count)
+                    ; b.hs =>exit
+                    ; mov x16, X(Self::gp(input(1)))
+                );
+                for argument in 1..*count {
+                    let value = Self::gp(input(1 + usize::from(argument)));
+                    dynasm!(self.ops
+                        ; .arch aarch64
+                        ; cmp WSP(index), u32::from(argument)
+                        ; csel x16, X(value), x16, eq
+                    );
+                }
+                dynasm!(self.ops ; .arch aarch64 ; mov X(destination), x16);
+            }
             Kind::CheckFunction { function_id, cell } => {
                 let value = Self::gp(input(0));
                 let (function_id, cell) = (*function_id, *cell);

@@ -100,7 +100,6 @@ use crate::{
         NATIVE_FRAME_PC_OFFSET, NATIVE_FRAME_SELF_OFFSET, NATIVE_FRAME_THIS_OFFSET,
         OBJECT_BODY_TYPE_TAG, THREAD_OFFSET, VALUE_FALSE, VALUE_HOLE, VALUE_NULL, VALUE_TRUE,
         VALUE_UNDEFINED, VM_THREAD_BACKEDGE_FUEL_CELL_OFFSET, VM_THREAD_GC_HEAP_OFFSET,
-        VM_THREAD_INTERRUPT_CELL_OFFSET,
     },
     frame::{ActivationExits, CallEntryCold, SpillArea},
     x86_64::{
@@ -583,10 +582,8 @@ fn emit_backedge_poll(
     let done = ops.new_dynamic_label();
     dynasm!(ops
         ; .arch x64
+        // An interrupt trip zeroes the countdown.
         ; mov r11, [r15 + THREAD_OFFSET as i32]
-        ; mov r10, [r11 + VM_THREAD_INTERRUPT_CELL_OFFSET as i32]
-        ; cmp BYTE [r10], 0
-        ; jne =>slow
         ; mov r10, [r11 + VM_THREAD_BACKEDGE_FUEL_CELL_OFFSET as i32]
         ; sub QWORD [r10], 1
         ; jg =>done

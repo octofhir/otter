@@ -885,14 +885,6 @@ pub struct Interpreter {
     /// Host shutdown holds a cloneable handle while this owner token ensures
     /// interpreter drop cannot leave a parked waiter in the process registry.
     atomics_wait_agent: atomics_wait::WaitAgent,
-    /// Countdown of remaining compiled back-edges before the next cooperative
-    /// budget checkpoint. Compiled code decrements this inline at every
-    /// back-edge and re-enters [`Self::jit_backedge_poll`] only when it reaches
-    /// zero (or the interrupt flag is set, polled inline every back-edge), which
-    /// batches the reduction accounting the checkpoint would otherwise record one
-    /// unit at a time per iteration. Reset to [`JIT_BACKEDGE_POLL_BATCH`] by the
-    /// checkpoint.
-    jit_backedge_fuel: u64,
     /// Back-edges the current fuel window started with, so a checkpoint
     /// charges exactly the back-edges it consumed even when the VM shortened
     /// the window to request an early poll.

@@ -138,9 +138,12 @@ impl Interpreter {
             array_index_accessor_protector: false,
             array_buffer_detach_protector: false,
             array_index_accessor_protector_epoch: 0,
-            interrupt: crate::InterruptFlag::new(),
+            interrupt: {
+                let interrupt = crate::InterruptFlag::new();
+                interrupt.arm_fuel(Self::JIT_BACKEDGE_POLL_BATCH);
+                interrupt
+            },
             atomics_wait_agent: crate::atomics_wait::WaitAgent::new(),
-            jit_backedge_fuel: Self::JIT_BACKEDGE_POLL_BATCH,
             jit_backedge_fuel_window: Self::JIT_BACKEDGE_POLL_BATCH,
             gc_heap,
             code_space,

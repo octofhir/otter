@@ -126,9 +126,8 @@ impl<'a> Codegen<'a> {
         let slow = self.ops.new_dynamic_label();
         let resume = self.ops.new_dynamic_label();
         dynasm!(self.ops ; .arch x64
+            // An interrupt trip zeroes the countdown.
             ; mov r10, [r15 + crate::entry::THREAD_OFFSET as i32]
-            ; mov r11, [r10 + crate::entry::VM_THREAD_INTERRUPT_CELL_OFFSET as i32]
-            ; cmp BYTE [r11], 0 ; jne =>slow
             ; mov r10, [r10 + crate::entry::VM_THREAD_BACKEDGE_FUEL_CELL_OFFSET as i32]
             ; sub QWORD [r10], 1 ; jle =>slow ; =>resume
         );

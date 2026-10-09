@@ -219,8 +219,8 @@ impl Interpreter {
     /// hot loop has OSR'd into native code.
     pub(crate) fn jit_backedge_poll(&mut self) -> Result<WorkBudgetCheckpoint, VmError> {
         self.record_jit_runtime_stub_class(native_abi::STUB_JIT_BACKEDGE_POLL.class);
-        // The interrupt flag is polled inline at every back-edge, so reaching
-        // this re-entry with the flag set means a cancellation is pending.
+        // Tripping the interrupt flag zeroes the back-edge countdown, so a
+        // pending cancellation reaches this re-entry at the next back-edge.
         if self.interrupt.is_set() {
             return Err(VmError::Interrupted);
         }
@@ -230,7 +230,7 @@ impl Interpreter {
         // run the (possibly early-returning) budget checkpoint.
         self.work_budget_stats
             .record_work(self.jit_backedge_fuel_window);
-        self.jit_backedge_fuel = Self::JIT_BACKEDGE_POLL_BATCH;
+        self.interrupt.arm_fuel(Self::JIT_BACKEDGE_POLL_BATCH);
         self.jit_backedge_fuel_window = Self::JIT_BACKEDGE_POLL_BATCH;
         let checkpoint = self.poll_work_budget_checkpoint()?;
         if checkpoint == WorkBudgetCheckpoint::Yield {
@@ -242,11 +242,11 @@ impl Interpreter {
     /// Address of the inline back-edge fuel counter, handed to compiled code so
     /// it can decrement the countdown without a VM re-entry.
     pub fn jit_backedge_fuel_ptr(&mut self) -> *mut u64 {
-        &mut self.jit_backedge_fuel
+        self.interrupt.fuel_ptr()
     }
 
-    /// Address of the cooperative interrupt flag's backing byte, polled inline at
-    /// each back-edge.
+    /// Address of the cooperative interrupt flag's backing byte, read inline
+    /// where compiled code has no back-edge countdown to poll.
     #[must_use]
     pub fn jit_interrupt_flag_ptr(&self) -> *const u8 {
         self.interrupt.as_ptr()

@@ -19,6 +19,11 @@
 //!   committed method resolution, which also records call feedback.
 //! - Concat: the nursery string-concatenation fit every `Add` site shares
 //!   instead of inlining it.
+//! - Keyed load and store: V8's `KeyedLoadIC_Megamorphic` /
+//!   `KeyedStoreIC_Megamorphic` name case. A string key whose atom was
+//!   recorded probes the shared action table under that atom; any other
+//!   key, or a table miss, returns to the element site, which completes
+//!   through its committed element runtime (which records the table entry).
 //!
 //! # Invariants
 //! - A site passes its receiver (and value) boxed from the rooted window plus
@@ -61,6 +66,16 @@ pub(crate) const STORE_RECEIVER: u8 = 12;
 pub(crate) const STORE_VALUE: u8 = 9;
 pub(crate) const STORE_SLOT: u8 = 10;
 
+/// Keyed load routine inputs: the load routine's receiver, and the key.
+pub(crate) const KEYED_LOAD_RECEIVER: u8 = LOAD_RECEIVER;
+pub(crate) const KEYED_LOAD_KEY: u8 = 10;
+
+/// Keyed store routine inputs: the store routine's receiver and value, and
+/// the key.
+pub(crate) const KEYED_STORE_RECEIVER: u8 = STORE_RECEIVER;
+pub(crate) const KEYED_STORE_VALUE: u8 = STORE_VALUE;
+pub(crate) const KEYED_STORE_KEY: u8 = 10;
+
 /// The shared routines one code object's sites requested.
 #[derive(Default)]
 pub(crate) struct SharedPropertyProbes {
@@ -68,6 +83,8 @@ pub(crate) struct SharedPropertyProbes {
     store: Option<DynamicLabel>,
     method: Option<DynamicLabel>,
     concat: Option<DynamicLabel>,
+    keyed_load: Option<DynamicLabel>,
+    keyed_store: Option<DynamicLabel>,
 }
 
 impl SharedPropertyProbes {
@@ -91,6 +108,16 @@ impl SharedPropertyProbes {
         *self.concat.get_or_insert_with(|| ops.new_dynamic_label())
     }
 
+    /// The name-keyed table probe serving element load or store sites.
+    pub(crate) fn keyed_label(&mut self, ops: &mut Assembler, store: bool) -> DynamicLabel {
+        let slot = if store {
+            &mut self.keyed_store
+        } else {
+            &mut self.keyed_load
+        };
+        *slot.get_or_insert_with(|| ops.new_dynamic_label())
+    }
+
     /// Emit every requested routine once, after the body.
     pub(crate) fn emit(
         self,
@@ -111,7 +138,119 @@ impl SharedPropertyProbes {
         if let Some(label) = self.concat {
             emit_concat(ops, view, label);
         }
+        if let Some(label) = self.keyed_load {
+            emit_keyed_load(ops, relocations, view, label);
+        }
+        if let Some(label) = self.keyed_store {
+            emit_keyed_store(ops, relocations, view, label);
+        }
     }
+}
+
+/// Leave the recorded atom of the string `key` in `W(atom)`, or branch to
+/// `miss` for any other key or a string no property key has interned.
+fn emit_key_atom(
+    ops: &mut Assembler,
+    view: &JitCompileSnapshot,
+    key: u8,
+    atom: u8,
+    miss: DynamicLabel,
+) {
+    emit_cell_test(ops, key, CellTest::IsNotCell, miss);
+    dynasm!(ops ; .arch aarch64
+        ; cbz X(key), =>miss
+        ; ldrb w16, [X(key)]
+        ; cmp w16, u32::from(view.string_layout.string_type_tag)
+        ; b.ne =>miss
+        // The body records the atom plus one; zero is unrecorded.
+        ; ldr W(atom), [X(key), view.string_layout.atom_byte]
+        ; cbz W(atom), =>miss
+        ; sub WSP(atom), WSP(atom), #1
+    );
+}
+
+/// `x1 == 0` with the value in `x0`, else `x1 == 1` and nothing observed.
+/// Leaf code: no call, no allocation, `x30` untouched.
+fn emit_keyed_load(
+    ops: &mut Assembler,
+    relocations: &mut RelocationCapture,
+    view: &JitCompileSnapshot,
+    label: DynamicLabel,
+) {
+    let miss = ops.new_dynamic_label();
+    dynasm!(ops ; .arch aarch64 ; =>label);
+    emit_key_atom(ops, view, KEYED_LOAD_KEY, 11, miss);
+    property_actions::emit_load(
+        ops,
+        relocations,
+        view,
+        AtomOperand::Register(11),
+        KEYED_LOAD_RECEIVER,
+        [13, 14, 15, 3],
+        0,
+        miss,
+    );
+    dynasm!(ops ; .arch aarch64
+        ; mov x1, xzr
+        ; ret
+        ; =>miss
+        ; movz x1, 1
+        ; ret
+    );
+}
+
+/// `x1 == 0` once the value is stored with its barriers, else `x1 == 1`
+/// and nothing written.
+fn emit_keyed_store(
+    ops: &mut Assembler,
+    relocations: &mut RelocationCapture,
+    view: &JitCompileSnapshot,
+    label: DynamicLabel,
+) {
+    let stored = ops.new_dynamic_label();
+    let miss = ops.new_dynamic_label();
+    dynasm!(ops ; .arch aarch64 ; =>label ; stp x29, x30, [sp, #-16]!);
+    emit_key_atom(ops, view, KEYED_STORE_KEY, 3, miss);
+    emit_table_store(ops, relocations, view, stored, miss);
+    dynasm!(ops ; .arch aarch64
+        ; =>miss
+        ; movz x1, 1
+        ; ldp x29, x30, [sp], #16
+        ; ret
+    );
+}
+
+/// The shared-table store under the atom in `w3`, then (also from `stored`,
+/// with the compressed child or zero in `w11`) both barriers and the
+/// success return. Expects the routine's saved `x29`/`x30` on the stack.
+fn emit_table_store(
+    ops: &mut Assembler,
+    relocations: &mut RelocationCapture,
+    view: &JitCompileSnapshot,
+    stored: DynamicLabel,
+    miss: DynamicLabel,
+) {
+    let primitive = ops.new_dynamic_label();
+    property_actions::emit_store(
+        ops,
+        relocations,
+        view,
+        AtomOperand::Register(3),
+        [STORE_RECEIVER, STORE_VALUE],
+        [15, 11, 13, 14],
+        miss,
+    );
+    // Both paths leave the compressed child (zero for an overwrite) in w11.
+    dynasm!(ops ; .arch aarch64 ; =>stored ; mov w16, w11);
+    super::ic_probe::emit_property_transition_shape_barrier(ops, relocations, view, 20);
+    emit_cell_test(ops, STORE_VALUE, CellTest::IsNotCell, primitive);
+    super::values::emit_write_barrier(ops, relocations, view, STORE_RECEIVER, STORE_VALUE);
+    dynasm!(ops ; .arch aarch64
+        ; =>primitive
+        ; mov x1, xzr
+        ; ldp x29, x30, [sp], #16
+        ; ret
+    );
 }
 
 /// Concat routine inputs: the two operands.
@@ -262,8 +401,6 @@ fn emit_store(
 ) {
     let megamorphic = ops.new_dynamic_label();
     let stored = ops.new_dynamic_label();
-    let barriers = ops.new_dynamic_label();
-    let primitive = ops.new_dynamic_label();
     let miss = ops.new_dynamic_label();
     // The committed barriers' slow paths call out, so the return address is
     // saved for the whole routine.
@@ -283,28 +420,8 @@ fn emit_store(
         ; =>megamorphic
         ; ldr w3, [X(STORE_SLOT), IC.atom_byte]
     );
-    property_actions::emit_store(
-        ops,
-        relocations,
-        view,
-        AtomOperand::Register(3),
-        [STORE_RECEIVER, STORE_VALUE],
-        [15, 11, 13, 14],
-        miss,
-    );
-    // Both paths leave the compressed child (zero for an overwrite) in w11.
+    emit_table_store(ops, relocations, view, stored, miss);
     dynasm!(ops ; .arch aarch64
-        ; =>stored
-        ; mov w16, w11
-        ; =>barriers);
-    super::ic_probe::emit_property_transition_shape_barrier(ops, relocations, view, 20);
-    emit_cell_test(ops, STORE_VALUE, CellTest::IsNotCell, primitive);
-    super::values::emit_write_barrier(ops, relocations, view, STORE_RECEIVER, STORE_VALUE);
-    dynasm!(ops ; .arch aarch64
-        ; =>primitive
-        ; mov x1, xzr
-        ; ldp x29, x30, [sp], #16
-        ; ret
         ; =>miss
         ; mov x0, x20
         ; mov x1, X(STORE_RECEIVER)

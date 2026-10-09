@@ -1844,12 +1844,19 @@ fn emit_load_element(
     ops: &mut Assembler,
     relocations: &mut RelocationCapture,
     transitions: &crate::entry::TransitionTable,
+    shared_property: &mut shared_property::SharedPropertyProbes,
     dst: u16,
     receiver: u16,
     index: u16,
     throw_value: DynamicLabel,
     fatal: DynamicLabel,
 ) {
+    // A name key: the receiver class's table entry, as a named load's.
+    use shared_property::{KEYED_LOAD_KEY, KEYED_LOAD_RECEIVER};
+    let routine = shared_property.keyed_label(ops, false);
+    emit_load_reg(ops, KEYED_LOAD_RECEIVER, receiver);
+    emit_load_reg(ops, KEYED_LOAD_KEY, index);
+    dynasm!(ops ; .arch x64 ; call =>routine ; test rdx, rdx ; jz >done);
     emit_load_reg(ops, 6, receiver);
     emit_load_reg(ops, 2, index);
     dynasm!(ops ; .arch x64 ; mov rdi, r15);
@@ -1876,12 +1883,20 @@ fn emit_store_element(
     ops: &mut Assembler,
     relocations: &mut RelocationCapture,
     transitions: &crate::entry::TransitionTable,
+    shared_property: &mut shared_property::SharedPropertyProbes,
     receiver: u16,
     index: u16,
     value: u16,
     throw_value: DynamicLabel,
     fatal: DynamicLabel,
 ) {
+    // A name key: the receiver class's table entry, as a named store's.
+    use shared_property::{KEYED_STORE_KEY, KEYED_STORE_RECEIVER, KEYED_STORE_VALUE};
+    let routine = shared_property.keyed_label(ops, true);
+    emit_load_reg(ops, KEYED_STORE_RECEIVER, receiver);
+    emit_load_reg(ops, KEYED_STORE_VALUE, value);
+    emit_load_reg(ops, KEYED_STORE_KEY, index);
+    dynasm!(ops ; .arch x64 ; call =>routine ; test rdx, rdx ; jz >done);
     emit_load_reg(ops, 6, receiver);
     emit_load_reg(ops, 2, index);
     emit_load_reg(ops, 1, value);

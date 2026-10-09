@@ -32,8 +32,9 @@
 //! - Exact finalized shapes prove ordinary lookup state. Dynamic shared-cache
 //!   guards read the sole current ShapeState byte and permit provisional
 //!   runtime feedback; stores reject prototype role before any effect.
-//! - Conditional branches to deopt exits and slow paths use the ±1 MiB
-//!   conditional form; nothing branches with `tbz`/`tbnz` to a far label.
+//! - A far body places an island of veneers, slow paths and exit stubs
+//!   after every 16 KiB segment, so a `tbz`/`tbnz` of a cell test reaches
+//!   the exit it names; `b.cond` and `cbz` reach ±1 MiB.
 //!
 //! # See also
 //! - [`super::regalloc`] — the locations consumed here.
@@ -144,9 +145,9 @@ struct Codegen<'a> {
     return_sites: Vec<abi::SafepointEntry>,
 }
 
-/// Body bytes between islands: a segment plus its island stays well inside
-/// the ±1 MiB a conditional branch reaches.
-const ISLAND_INTERVAL: usize = 256 * 1024;
+/// Body bytes between islands: a segment plus its island stays inside the
+/// ±32 KiB a `tbz`/`tbnz` reaches, which cell tests branch to exits with.
+const ISLAND_INTERVAL: usize = 16 * 1024;
 
 /// The right operand of an int32 operation.
 #[derive(Debug, Clone, Copy)]

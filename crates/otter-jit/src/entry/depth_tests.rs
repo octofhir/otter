@@ -117,14 +117,7 @@ fn transitions() -> TransitionTable {
     table
 }
 
-#[derive(Clone, Copy, Debug)]
-enum Semantics {
-    Strict,
-    Sloppy,
-    Construct,
-}
-
-fn snapshot(semantics: Semantics) -> JitCompileSnapshot {
+fn snapshot() -> JitCompileSnapshot {
     let mut snapshot = JitCompileSnapshot::without_feedback(
         1,
         3,
@@ -135,9 +128,10 @@ fn snapshot(semantics: Semantics) -> JitCompileSnapshot {
         ],
     );
     let function = std::sync::Arc::get_mut(&mut snapshot.code_block).unwrap();
-    function.is_strict = !matches!(semantics, Semantics::Sloppy);
-    // The feedback-free fixture retains an observable receiver. Only strict
-    // mode changes here; the typed body probe needs no rest-parameter metadata.
+    function.is_strict = true;
+    // The feedback-free fixture retains an observable receiver. A strict
+    // body binds it without the preparation stub this fixture refuses; the
+    // typed body probe needs no rest-parameter metadata.
     assert!(function.observes_this());
     snapshot
 }
@@ -159,7 +153,6 @@ fn caller(
     cell: &FunctionEntryCell,
     actuals: &[Value],
     generic: bool,
-    semantics: Semantics,
 ) -> (dynasmrt::ExecutableBuffer, AssemblyOffset) {
     use crate::arm64::js_call::{self, CallTarget};
     use crate::template::arm64::values::emit_load_u64;
@@ -179,11 +172,6 @@ fn caller(
     }
     emit_load_u64(&mut ops, 1, Value::function(1).to_bits());
     emit_load_u64(&mut ops, 2, Value::number_i32(3).to_bits());
-    let construct = matches!(semantics, Semantics::Construct);
-    if construct {
-        emit_load_u64(&mut ops, 2, Value::UNDEFINED.to_bits());
-        emit_load_u64(&mut ops, 3, Value::function(1).to_bits());
-    }
     let return_pc = js_call::emit_call(
         &mut ops,
         &mut relocations,
@@ -191,7 +179,7 @@ fn caller(
         20,
         1,
         Some(2),
-        construct.then_some(3),
+        None,
         Some(actuals.len() as u32),
         if generic {
             CallTarget::Generic
@@ -215,7 +203,6 @@ fn caller(
     cell: &FunctionEntryCell,
     actuals: &[Value],
     generic: bool,
-    semantics: Semantics,
 ) -> (dynasmrt::ExecutableBuffer, AssemblyOffset) {
     use crate::x86_64::js_call::{self, CallTarget};
     let mut ops = dynasmrt::x64::Assembler::new().unwrap();
@@ -236,20 +223,13 @@ fn caller(
         ; mov rsi, QWORD Value::function(1).to_bits() as i64
         ; mov rdx, QWORD Value::number_i32(3).to_bits() as i64
     );
-    let construct = matches!(semantics, Semantics::Construct);
-    if construct {
-        dynasm!(ops ; .arch x64
-            ; mov edx, Value::UNDEFINED.to_bits() as i32
-            ; mov rcx, QWORD Value::function(1).to_bits() as i64
-        );
-    }
     let return_pc = js_call::emit_call(
         &mut ops,
         &mut relocations,
         table,
         15,
         true,
-        construct,
+        false,
         actuals.len() as u32,
         if generic {
             CallTarget::Generic
@@ -277,7 +257,6 @@ fn run_case(
     view: &JitCompileSnapshot,
     code: &dyn JitFunctionCode,
     table: &TransitionTable,
-    semantics: Semantics,
     generic: bool,
     count: usize,
     case: Case,
@@ -317,7 +296,7 @@ fn run_case(
     let actuals: Vec<_> = (0..count)
         .map(|i| Value::number_i32(101 + i as i32))
         .collect();
-    let (buffer, return_pc) = caller(table, &function, &actuals, generic, semantics);
+    let (buffer, return_pc) = caller(table, &function, &actuals, generic);
     let mut observation = Observation::default();
     let mut thread = VmThread::empty();
     let interrupt = 0_u8;
@@ -384,7 +363,7 @@ fn run_case(
     // these initialized carriers and never enter the VM, collect or reenter.
     let result = unsafe { run(&mut ctx) };
     let label = format!(
-        "{:?} {semantics:?} generic={generic} argc={count} {case:?}",
+        "{:?} generic={generic} argc={count} {case:?}",
         code.native_frame_kind()
     );
     assert_eq!(
@@ -505,8 +484,8 @@ fn run_case(
 #[test]
 fn known_and_generic_entries_publish_derived_depth_and_real_windows() {
     let table = transitions();
-    for semantics in [Semantics::Strict] {
-        let view = snapshot(semantics);
+    {
+        let view = snapshot();
         for code in compile(&view, &table) {
             for generic in [false, true] {
                 for count in [0, 1, 3, 5] {
@@ -515,7 +494,6 @@ fn known_and_generic_entries_publish_derived_depth_and_real_windows() {
                             &view,
                             code.as_ref(),
                             &table,
-                            semantics,
                             generic,
                             count,
                             Case {
@@ -535,14 +513,13 @@ fn known_and_generic_entries_publish_derived_depth_and_real_windows() {
 #[test]
 fn native_stack_refusal_keeps_the_same_unpublished_overflow_return() {
     let table = transitions();
-    let view = snapshot(Semantics::Strict);
+    let view = snapshot();
     for code in compile(&view, &table) {
         for generic in [false, true] {
             run_case(
                 &view,
                 code.as_ref(),
                 &table,
-                Semantics::Strict,
                 generic,
                 1,
                 Case {
@@ -559,7 +536,7 @@ fn native_stack_refusal_keeps_the_same_unpublished_overflow_return() {
 #[test]
 fn published_known_and_generic_children_own_the_exact_emitted_hardware_return() {
     let table = transitions();
-    let view = snapshot(Semantics::Strict);
+    let view = snapshot();
     for code in compile(&view, &table) {
         for generic in [false, true] {
             for count in [0, 1, 3, 5] {
@@ -567,7 +544,6 @@ fn published_known_and_generic_children_own_the_exact_emitted_hardware_return() 
                     &view,
                     code.as_ref(),
                     &table,
-                    Semantics::Strict,
                     generic,
                     count,
                     Case {
@@ -585,7 +561,7 @@ fn published_known_and_generic_children_own_the_exact_emitted_hardware_return() 
 #[test]
 fn tier_entries_keep_the_existing_suspended_anchor_without_creating_a_js_return() {
     let table = transitions();
-    let view = snapshot(Semantics::Strict);
+    let view = snapshot();
     for code in compile(&view, &table) {
         let mut observation = Observation::default();
         let mut thread = VmThread::empty();

@@ -435,7 +435,10 @@ fn alternating_constructor_families_keep_one_body_native_without_recompilation()
             assert_eq!((pair[0].phase, pair[1].phase), (0, 1));
             assert!(pair[0].child.is_none());
             assert!(pair[1].child.is_some());
-            assert_eq!(pair[0].active_code, generation.code_object_id);
+            assert_eq!(
+                pair[0].active_code, generation.code_object_id,
+                "{selection:?}: the exact own native body is current before collection"
+            );
             assert_eq!(
                 pair[1].active_code, generation.code_object_id,
                 "the exact own native body is active through real collection"

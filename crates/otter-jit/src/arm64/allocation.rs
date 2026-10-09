@@ -74,6 +74,34 @@ pub(crate) fn emit_count_allocation(
     );
 }
 
+/// [`emit_count_allocation`] for a cell of a fixed `bytes` size.
+pub(crate) fn emit_count_allocation_bytes(
+    ops: &mut Assembler,
+    context_register: u8,
+    type_tag: u8,
+    bytes: u32,
+    base: u8,
+    scratch: u8,
+) {
+    let row = u32::from(type_tag) * JIT_TYPE_STATS_ROW_BYTES;
+    let live = row + JIT_TYPE_STATS_LIVE_BYTES_OFFSET;
+    let count = row + JIT_TYPE_STATS_ALLOC_COUNT_OFFSET;
+    let total = row + JIT_TYPE_STATS_ALLOC_BYTES_OFFSET;
+    dynasm!(ops
+        ; .arch aarch64
+        ; ldr X(base), [X(context_register), ALLOC_WINDOW_TYPE_STATS_OFFSET]
+        ; ldr X(scratch), [X(base), live]
+        ; add XSP(scratch), XSP(scratch), bytes
+        ; str X(scratch), [X(base), live]
+        ; ldr X(scratch), [X(base), count]
+        ; add XSP(scratch), XSP(scratch), 1
+        ; str X(scratch), [X(base), count]
+        ; ldr X(scratch), [X(base), total]
+        ; add XSP(scratch), XSP(scratch), bytes
+        ; str X(scratch), [X(base), total]
+    );
+}
+
 mod receiver_dynamic;
 pub(crate) use receiver_dynamic::emit_dynamic_construct_receiver;
 

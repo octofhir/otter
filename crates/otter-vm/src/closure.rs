@@ -528,13 +528,26 @@ impl JsClosure {
 
     /// Store the function's `prototype` value into the rare record the caller
     /// already allocated. The value may be younger than the record, so the
-    /// edge is barriered.
+    /// edge is barriered. A different value retires every constructor family
+    /// of this closure: each was selected for the replaced prototype (V8's
+    /// initial-map change), so the head never names a stale family.
     pub(crate) fn set_prototype_value(self, heap: &mut GcHeap, value: Value) {
         use crate::pelt::PeltField as _;
         let rare = self
             .rare(heap)
             .expect("a prototype value is stored into an allocated rare record");
-        heap.with_payload(rare, |rare| rare.prototype = value);
+        let (previous, head) =
+            heap.read_payload(rare, |rare| (rare.prototype, rare.constructor_layouts));
+        if previous != value && !head.is_null() {
+            crate::constructor_layout::detach_families(heap, head);
+            heap.with_payload(rare, |rare| {
+                rare.constructor_layouts = crate::constructor_layout::ConstructorLayout::null();
+            });
+        }
+        heap.with_payload(rare, |rare| {
+            rare.prototype = value;
+            rare.prototype_ordinary = value.as_object().is_some();
+        });
         let mut child = value;
         let mut visit = |slot: *mut RawGc| {
             // SAFETY: `pelt_trace` hands out pointers into the local copy of

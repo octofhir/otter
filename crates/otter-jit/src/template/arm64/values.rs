@@ -394,25 +394,6 @@ fn emit_to_int32_common(ops: &mut Assembler, src_x: u8, dst_w: u8, bail: Dynamic
     );
 }
 
-/// Load into `W(dst)` the compressed `[[Prototype]]` of the object whose
-/// decompressed `GcHeader` pointer is in `X(object)`: the prototype word of
-/// its shape, an ordinary object or null. `X(cage)` holds the cage base;
-/// `dst` may be `object`.
-pub(crate) fn emit_load_prototype(
-    ops: &mut Assembler,
-    view: &JitCompileSnapshot,
-    dst: u8,
-    object: u8,
-    cage: u8,
-) {
-    dynasm!(ops
-        ; .arch aarch64
-        ; ldr W(dst), [X(object), view.object_shape_byte]
-        ; add X(dst), X(cage), X(dst)
-        ; ldr W(dst), [X(dst), view.shape_prototype_byte]
-    );
-}
-
 /// Load the sole immutable state byte of the object's current shape.
 ///
 /// `header` is the full object header address. `state` and `cage` are distinct

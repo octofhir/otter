@@ -1,8 +1,9 @@
 //! Executable private-memory proofs of the production receiver encoder.
 //!
 //! # Contents
-//! - Closure/class live prototype proofs and exact initialized shell bytes.
-//! - Exact-family, unfinished-root, validity, shape and LAB misses before publication.
+//! - Closure/class exact-family proofs and exact initialized shell bytes.
+//! - Boxed-function, missing-family, other-family, validity and LAB misses
+//!   before publication.
 //! - Exact allocation accounting and immutable family payload and preserved call operands/registers.
 //!
 //! # Invariants
@@ -31,21 +32,12 @@ const CANARY: u64 = 0x1357_2468_ace0_bdf1;
 enum Case {
     Closure,
     EmptyShape,
-    ClassFunction,
-    ClassClosure,
-    ClassWrongFunction,
-    ClassNullPrototype,
-    GuardClass,
+    Class,
+    BoxedFunction,
+    NotClass,
     NoRare,
     NoFamily,
     DifferentFamily,
-    UnfinishedFamily,
-    WrongFunction,
-    ChangedFamilyRoot,
-    NullPrototype,
-    PrimitivePrototype,
-    RootPrototype,
-    InitialPrototype,
     InvalidValidity,
     Space,
 }
@@ -86,25 +78,15 @@ fn execute(case: Case) {
     };
     view.class_constructor_layout = JitClassConstructorLayout {
         type_tag: 0x44,
-        callable_byte: 8,
-        super_constructor_byte: 24,
-        prototype_byte: 16,
         constructor_layouts_byte: 32,
     };
     view.constructor_layout = JitConstructorLayout {
         family_id_byte: 8,
         root_byte: 16,
-        samples_remaining_byte: 20,
     };
     let plan = JitReceiverAllocationPlan {
         new_target_function_id: FUNCTION,
-        new_target_is_class: matches!(
-            case,
-            Case::ClassFunction
-                | Case::ClassClosure
-                | Case::ClassWrongFunction
-                | Case::ClassNullPrototype
-        ),
+        new_target_is_class: matches!(case, Case::Class | Case::NotClass),
         family_id: 0xfedc_ba98_7654_3210,
         receiver_shape: if matches!(case, Case::EmptyShape) {
             0
@@ -123,70 +105,21 @@ fn execute(case: Case) {
         }),
         prototype_root: offset(root),
     };
-    store32(
-        &mut memory,
-        root + 12,
-        if matches!(case, Case::RootPrototype) {
-            offset(prototype) + 8
-        } else {
-            offset(prototype)
-        },
-    );
-    store32(
-        &mut memory,
-        initial + 12,
-        if matches!(case, Case::InitialPrototype) {
-            offset(prototype) + 8
-        } else {
-            offset(prototype)
-        },
-    );
+    store32(&mut memory, root + 12, offset(prototype));
+    store32(&mut memory, initial + 12, offset(prototype));
     store32(&mut memory, initial + 8, 2);
     memory[prototype / 8] = OBJECT_BODY_TYPE_TAG as u64;
     memory[(family + 8) / 8] = plan.family_id - u64::from(matches!(case, Case::DifferentFamily));
-    store32(
-        &mut memory,
-        family + 16,
-        if matches!(case, Case::ChangedFamilyRoot) {
-            offset(initial)
-        } else {
-            offset(root)
-        },
-    );
-    store32(
-        &mut memory,
-        family + 20,
-        u32::from(matches!(case, Case::UnfinishedFamily)),
-    );
+    store32(&mut memory, family + 16, offset(root));
     let family_before = memory[family / 8..(family + 32) / 8].to_vec();
-    store32(
-        &mut memory,
-        rare + 8,
-        if matches!(case, Case::NoFamily) {
-            0
-        } else {
-            offset(family)
-        },
-    );
-    store32(
-        &mut memory,
-        class + 32,
-        if matches!(case, Case::NoFamily) {
-            0
-        } else {
-            offset(family)
-        },
-    );
-    memory[closure / 8] = JS_CLOSURE_BODY_TYPE_TAG as u64;
-    store32(
-        &mut memory,
-        closure + 8,
-        if matches!(case, Case::WrongFunction) {
-            FUNCTION - 1
-        } else {
-            FUNCTION
-        },
-    );
+    let head = if matches!(case, Case::NoFamily) {
+        0
+    } else {
+        offset(family)
+    };
+    store32(&mut memory, rare + 8, head);
+    store32(&mut memory, class + 32, head);
+    store32(&mut memory, closure + 8, FUNCTION);
     store32(
         &mut memory,
         closure + 12,
@@ -196,42 +129,13 @@ fn execute(case: Case) {
             offset(rare)
         },
     );
-    memory[(rare + 16) / 8] = match case {
-        Case::NullPrototype => 0,
-        Case::PrimitivePrototype => Value::number_i32(1).to_bits(),
-        _ => (base + prototype) as u64,
-    };
+    memory[(rare + 16) / 8] = (base + prototype) as u64;
     memory[class / 8] = u64::from(view.class_constructor_layout.type_tag);
-    memory[(class + 8) / 8] = if matches!(case, Case::ClassClosure | Case::ClassWrongFunction) {
-        (base + closure) as u64
-    } else {
-        otter_vm::value::tag::box_function_id(FUNCTION)
+    let new_target = match case {
+        Case::Class => (base + class) as u64,
+        Case::BoxedFunction => otter_vm::value::tag::box_function_id(FUNCTION),
+        _ => (base + closure) as u64,
     };
-    if matches!(case, Case::ClassWrongFunction) {
-        store32(&mut memory, closure + 8, FUNCTION - 1);
-    }
-    store32(
-        &mut memory,
-        class + 16,
-        if matches!(case, Case::ClassNullPrototype) {
-            0
-        } else {
-            offset(prototype)
-        },
-    );
-    let new_target = base
-        + if matches!(
-            case,
-            Case::ClassFunction
-                | Case::ClassClosure
-                | Case::ClassWrongFunction
-                | Case::ClassNullPrototype
-                | Case::GuardClass
-        ) {
-            class
-        } else {
-            closure
-        };
     let bytes = view
         .field_layout
         .cell_bytes(usize::from(plan.inline_capacity));
@@ -297,13 +201,10 @@ fn execute(case: Case) {
     let code = CompiledCode::new(ops.finalize().unwrap(), entry);
     // SAFETY: the private System V entry touches only these bounded host
     // cells/LAB/stats/output, saves nonvolatiles and never calls or enters GC.
-    let call: extern "sysv64" fn(*mut JitCtx, usize, *mut u64) =
+    let call: extern "sysv64" fn(*mut JitCtx, u64, *mut u64) =
         unsafe { std::mem::transmute(code.entry_ptr()) };
     call(&mut ctx, new_target, output.as_mut_ptr());
-    let accepted = matches!(
-        case,
-        Case::Closure | Case::EmptyShape | Case::ClassFunction | Case::ClassClosure
-    );
+    let accepted = matches!(case, Case::Closure | Case::EmptyShape | Case::Class);
     assert_eq!(
         output[0],
         if accepted {
@@ -315,7 +216,7 @@ fn execute(case: Case) {
     );
     assert_eq!(output[1] != 0, accepted, "{case:?}");
     assert_eq!(output[3], CANARY);
-    assert_eq!(output[4], new_target as u64);
+    assert_eq!(output[4], new_target);
     assert_eq!(output[5], CANARY);
     assert_eq!(output[6], CANARY);
     assert!(output[7..11].iter().all(|word| *word == CANARY));
@@ -383,13 +284,8 @@ fn execute(case: Case) {
 }
 
 #[test]
-fn native_receiver_live_proofs_initialize_then_publish_once() {
-    for case in [
-        Case::Closure,
-        Case::EmptyShape,
-        Case::ClassFunction,
-        Case::ClassClosure,
-    ] {
+fn native_receiver_family_proofs_initialize_then_publish_once() {
+    for case in [Case::Closure, Case::EmptyShape, Case::Class] {
         execute(case);
     }
 }
@@ -397,19 +293,11 @@ fn native_receiver_live_proofs_initialize_then_publish_once() {
 #[test]
 fn native_receiver_pre_effect_misses_preserve_call_operands_and_poison() {
     for case in [
-        Case::GuardClass,
-        Case::ClassWrongFunction,
-        Case::ClassNullPrototype,
+        Case::BoxedFunction,
+        Case::NotClass,
         Case::NoRare,
         Case::NoFamily,
         Case::DifferentFamily,
-        Case::UnfinishedFamily,
-        Case::WrongFunction,
-        Case::ChangedFamilyRoot,
-        Case::NullPrototype,
-        Case::PrimitivePrototype,
-        Case::RootPrototype,
-        Case::InitialPrototype,
         Case::InvalidValidity,
         Case::Space,
     ] {

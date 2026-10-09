@@ -2877,11 +2877,14 @@ impl Interpreter {
     ) -> Option<jit::JitReceiverAllocationPlan> {
         let (layout, new_target_function_id, new_target_is_class) =
             self.finalized_constructor_layout_for_id(family_id, base_function_id)?;
-        let root_handle = self.gc_heap.read_payload(
-            layout,
-            crate::constructor_layout::ConstructorLayoutBody::root,
-        );
-        if crate::object::shape_body::state_of(root_handle).is_provisional() {
+        let (root_handle, prototype) = self
+            .gc_heap
+            .read_payload(layout, |body| (body.root(), body.prototype()));
+        // Generated code proves only the family identity; the family fixes an
+        // ordinary prototype object, never an exotic one.
+        if crate::object::shape_body::state_of(root_handle).is_provisional()
+            || prototype.as_object().is_none()
+        {
             return None;
         }
         let root_id = crate::object::shape_body::id_of(root_handle);

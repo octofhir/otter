@@ -401,15 +401,11 @@ impl CodeBlock {
                     + crate::closure_construct::CLOSURE_RARE_PROTOTYPE_OFFSET as u32,
                 constructor_layouts_byte: gc_header_bytes
                     + crate::closure_construct::CLOSURE_RARE_CONSTRUCTOR_LAYOUTS_OFFSET as u32,
+                prototype_ordinary_byte: gc_header_bytes
+                    + crate::closure_construct::CLOSURE_RARE_PROTOTYPE_ORDINARY_OFFSET as u32,
             },
             class_constructor_layout: crate::jit::JitClassConstructorLayout {
                 type_tag: crate::class_constructor::CLASS_CONSTRUCTOR_BODY_TYPE_TAG,
-                callable_byte: gc_header_bytes
-                    + crate::class_constructor::CLASS_CONSTRUCTOR_BODY_CTOR_OFFSET as u32,
-                super_constructor_byte: gc_header_bytes
-                    + crate::class_constructor::CLASS_CONSTRUCTOR_BODY_CTOR_PROTO_OFFSET as u32,
-                prototype_byte: gc_header_bytes
-                    + crate::class_constructor::CLASS_CONSTRUCTOR_BODY_PROTOTYPE_OFFSET as u32,
                 constructor_layouts_byte: gc_header_bytes
                     + crate::class_constructor::CLASS_CONSTRUCTOR_BODY_LAYOUTS_OFFSET as u32,
             },
@@ -418,8 +414,6 @@ impl CodeBlock {
                     + crate::constructor_layout::CONSTRUCTOR_LAYOUT_FAMILY_ID_OFFSET as u32,
                 root_byte: gc_header_bytes
                     + crate::constructor_layout::CONSTRUCTOR_LAYOUT_ROOT_OFFSET as u32,
-                samples_remaining_byte: gc_header_bytes
-                    + crate::constructor_layout::CONSTRUCTOR_LAYOUT_SAMPLES_REMAINING_OFFSET as u32,
             },
             primitive_cell_type_tags: [
                 crate::string::JS_STRING_BODY_TYPE_TAG,
@@ -1766,6 +1760,8 @@ mod tests {
                     + crate::closure_construct::CLOSURE_RARE_PROTOTYPE_OFFSET as u32,
                 constructor_layouts_byte: gc_header_bytes
                     + crate::closure_construct::CLOSURE_RARE_CONSTRUCTOR_LAYOUTS_OFFSET as u32,
+                prototype_ordinary_byte: gc_header_bytes
+                    + crate::closure_construct::CLOSURE_RARE_PROTOTYPE_ORDINARY_OFFSET as u32,
             }
         );
     }

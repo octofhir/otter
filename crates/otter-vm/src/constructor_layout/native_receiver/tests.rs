@@ -107,6 +107,13 @@ fn pure_receiver_probe_uses_current_moving_aliases_and_revoked_real_proof() {
         .unwrap();
         let target = vm.scoped_value(scope, Value::closure(closure));
         miss(probe(vm, vm.escape_scoped(target), 9));
+        let mut target_value = vm.escape_scoped(target);
+        vm.ensure_closure_rare(None, &mut target_value, &[])
+            .unwrap();
+        let target_now = vm.escape_scoped(target).as_closure(&vm.gc_heap).unwrap();
+        let proto_now = vm.escape_scoped(prototype);
+        target_now.set_prototype_value(&mut vm.gc_heap, proto_now);
+        miss(probe(vm, vm.escape_scoped(target), 9));
         let provisional = vm
             .constructor_layout_for_receiver(
                 9,
@@ -115,9 +122,6 @@ fn pure_receiver_probe_uses_current_moving_aliases_and_revoked_real_proof() {
                 |_, _| 4,
             )
             .unwrap();
-        let target_now = vm.escape_scoped(target).as_closure(&vm.gc_heap).unwrap();
-        let proto_now = vm.escape_scoped(prototype);
-        target_now.set_prototype_value(&mut vm.gc_heap, proto_now);
         miss(probe(vm, vm.escape_scoped(target), 9));
         let layout = finalize(vm, vm.escape_scoped(target), vm.escape_scoped(prototype), 9);
         assert_eq!(layout, provisional);
@@ -133,15 +137,24 @@ fn pure_receiver_probe_uses_current_moving_aliases_and_revoked_real_proof() {
         assert_ne!(vm.escape_scoped(prototype), old_prototype);
         hit(probe(vm, vm.escape_scoped(target), 9), layout);
         // A different current own prototype cannot reuse the old family,
-        // even while its original instance-chain proof remains valid.
+        // even while its original instance-chain proof remains valid. The
+        // store retires every family of the owner, so restoring the old
+        // prototype selects a fresh family too.
         let replacement = vm.scoped_object(scope).unwrap();
         let target_now = vm.escape_scoped(target).as_closure(&vm.gc_heap).unwrap();
         let replacement_now = vm.escape_scoped(replacement);
         target_now.set_prototype_value(&mut vm.gc_heap, replacement_now);
         miss(probe(vm, vm.escape_scoped(target), 9));
+        assert!(
+            vm.gc_heap
+                .read_payload(layout, ConstructorLayoutBody::detached)
+        );
         let target_now = vm.escape_scoped(target).as_closure(&vm.gc_heap).unwrap();
         let prototype_now = vm.escape_scoped(prototype);
         target_now.set_prototype_value(&mut vm.gc_heap, prototype_now);
+        miss(probe(vm, vm.escape_scoped(target), 9));
+        let layout = finalize(vm, vm.escape_scoped(target), vm.escape_scoped(prototype), 9);
+        assert_ne!(layout, provisional);
         hit(probe(vm, vm.escape_scoped(target), 9), layout);
         let mut proto = vm.escape_scoped(prototype).as_object().unwrap();
         assert!(

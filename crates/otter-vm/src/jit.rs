@@ -390,6 +390,9 @@ pub struct JitClosureCallLayout {
     pub prototype_byte: u32,
     /// Traced compressed family-list head, from the decompressed rare record.
     pub constructor_layouts_byte: u32,
+    /// Byte flag, from the rare record: nonzero exactly while the
+    /// `prototype` slot holds an ordinary object.
+    pub prototype_ordinary_byte: u32,
 }
 
 /// Machine-readable class-constructor wrapper layout.
@@ -397,13 +400,6 @@ pub struct JitClosureCallLayout {
 pub struct JitClassConstructorLayout {
     /// GC body tag proving the wrapper family.
     pub type_tag: u8,
-    /// Byte offset from the decompressed body pointer to its underlying
-    /// callable value.
-    pub callable_byte: u32,
-    /// Byte offset from the wrapper body to its live superclass identity.
-    pub super_constructor_byte: u32,
-    /// Byte offset from the wrapper body to its live instance prototype.
-    pub prototype_byte: u32,
     /// Byte offset from the wrapper body to its traced exact-family head.
     pub constructor_layouts_byte: u32,
 }
@@ -416,8 +412,6 @@ pub struct JitConstructorLayout {
     pub family_id_byte: u32,
     /// Header-inclusive byte offset of the traced receiver root shape.
     pub root_byte: u32,
-    /// Header-inclusive byte offset of the remaining provisional samples.
-    pub samples_remaining_byte: u32,
 }
 
 /// Address-stable validity word for a complete ordinary prototype chain.
@@ -529,7 +523,7 @@ pub const JIT_TYPEOF_TAGS: JitTypeOfTags = JitTypeOfTags {
     ],
 };
 
-const _: [(); 48] = [(); std::mem::size_of::<JitClosureCallLayout>()];
+const _: [(); 52] = [(); std::mem::size_of::<JitClosureCallLayout>()];
 const _: [(); 4] = [(); std::mem::align_of::<JitClosureCallLayout>()];
 const _: [(); 0] = [(); std::mem::offset_of!(JitClosureCallLayout, function_id_byte)];
 const _: [(); 4] = [(); std::mem::offset_of!(JitClosureCallLayout, flags_byte)];
@@ -543,6 +537,7 @@ const _: [(); 32] = [(); std::mem::offset_of!(JitClosureCallLayout, rare_byte)];
 const _: [(); 36] = [(); std::mem::offset_of!(JitClosureCallLayout, own_props_byte)];
 const _: [(); 40] = [(); std::mem::offset_of!(JitClosureCallLayout, prototype_byte)];
 const _: [(); 44] = [(); std::mem::offset_of!(JitClosureCallLayout, constructor_layouts_byte)];
+const _: [(); 48] = [(); std::mem::offset_of!(JitClosureCallLayout, prototype_ordinary_byte)];
 
 /// Machine-readable [`crate::context::ContextBody`] layout.
 ///
@@ -2591,7 +2586,7 @@ mod layout_tests {
 
     #[test]
     fn closure_call_layout_has_stable_c_field_offsets() {
-        assert_eq!(std::mem::size_of::<JitClosureCallLayout>(), 48);
+        assert_eq!(std::mem::size_of::<JitClosureCallLayout>(), 52);
         assert_eq!(std::mem::align_of::<JitClosureCallLayout>(), 4);
         let fields = [
             std::mem::offset_of!(JitClosureCallLayout, function_id_byte),
@@ -2606,8 +2601,9 @@ mod layout_tests {
             std::mem::offset_of!(JitClosureCallLayout, own_props_byte),
             std::mem::offset_of!(JitClosureCallLayout, prototype_byte),
             std::mem::offset_of!(JitClosureCallLayout, constructor_layouts_byte),
+            std::mem::offset_of!(JitClosureCallLayout, prototype_ordinary_byte),
         ];
-        assert_eq!(fields, [0, 4, 8, 12, 16, 20, 24, 28, 32, 36, 40, 44]);
+        assert_eq!(fields, [0, 4, 8, 12, 16, 20, 24, 28, 32, 36, 40, 44, 48]);
     }
 
     #[test]

@@ -2069,8 +2069,8 @@ mod tests {
         assert!(vm.jit_retraining_blocks(0));
         assert!(vm.jit_retraining_blocks(99));
         assert!(
-            !vm.jit_retraining_blocks(100),
-            "already-invalid sibling does not charge a second outer retraining"
+            vm.jit_retraining_blocks(100),
+            "a sibling that spliced the body keeps its code until its own exit"
         );
     }
 
@@ -2240,7 +2240,7 @@ mod tests {
     }
 
     #[test]
-    fn stale_inline_generation_new_arithmetic_learning_retires_only_source_splices() {
+    fn stale_inline_generation_new_arithmetic_learning_retires_only_the_source() {
         let mut module = crate::test_support::minimal_bytecode_module("stale-inline-arithmetic.js");
         module.functions[0].param_count = 1;
         module.functions[0].locals = 2;
@@ -2298,7 +2298,10 @@ mod tests {
         vm.note_jit_optimized_bail_at(&context, 99, 11, exit, (0, 0), false);
         assert!(vm.jit_code_registry.is_current_generation(13));
         assert!(!vm.jit_code_registry.is_current_generation(12));
-        assert!(!vm.jit_code_registry.is_current_generation(14));
+        assert!(
+            vm.jit_code_registry.is_current_generation(14),
+            "a caller that spliced the narrow body leaves through its own guard"
+        );
         assert!(vm.jit_retraining_blocks(0));
         assert!(!vm.jit_retraining_blocks(99));
         assert_eq!(

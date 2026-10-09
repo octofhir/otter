@@ -12,6 +12,8 @@
 //! - [`range`] — int32 ranges dropping overflow and `-0` checks.
 //! - [`truncation`] — wrapping int32 additions under truncating uses.
 //! - [`licm`] — loop-invariant checks and loads run once before their loop.
+//! - `branch_fold` — truthiness branches test the value under `!` and
+//!   ToBoolean.
 //! - [`regalloc`] — live intervals, canonical homes and register assignment.
 //! - [`registers`] — backend-supplied physical ownership and fixed call words.
 //! - [`frame`] / [`emission`] — shared canonical geometry and finalized output.
@@ -44,6 +46,7 @@
 mod allocation_groups;
 #[cfg(target_arch = "aarch64")]
 pub(crate) mod arm64;
+mod branch_fold;
 pub(crate) mod builder;
 pub(crate) mod bytecode;
 pub(crate) mod call;
@@ -146,6 +149,7 @@ pub(crate) fn compile(
     range::narrow_checked_arithmetic(&mut built.graph, &built.layout, &zero_insensitive);
     truncation::wrap_truncated_arithmetic(&mut built.graph, &built.layout);
     licm::hoist_invariants(&mut built.graph, &mut built.layout, &built.loop_headers);
+    branch_fold::fold_branch_negations(&mut built.graph);
     allocation_groups::fold(&mut built.graph, &built.layout, view, &built.inline_views);
     #[cfg(target_arch = "aarch64")]
     let registers = registers::AARCH64;

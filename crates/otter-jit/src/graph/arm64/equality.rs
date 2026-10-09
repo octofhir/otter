@@ -26,8 +26,8 @@
 //! - [`super::super::ir::Kind::LooseEqual`] — the node.
 
 use super::{
-    Codegen, CommittedArgument, Condition, DOUBLE_OFFSET, DynamicLabel, NOT_CELL_MASK, NUMBER_TAG,
-    NodeId, RelocationTarget, THREAD_OFFSET, VALUE_FALSE, VALUE_NULL, VALUE_TRUE, VALUE_UNDEFINED,
+    Codegen, CommittedArgument, Condition, DOUBLE_OFFSET, DynamicLabel, NUMBER_TAG, NodeId,
+    RelocationTarget, THREAD_OFFSET, VALUE_FALSE, VALUE_NULL, VALUE_TRUE, VALUE_UNDEFINED,
     VM_THREAD_GC_HEAP_OFFSET, abi, emit_load_symbol_u64,
 };
 use crate::Unsupported;
@@ -84,12 +84,11 @@ impl Codegen<'_> {
             ; tst X(b), x16
             ; b.ne =>outcomes.differ
         );
-        self.load_immediate(16, NOT_CELL_MASK);
         dynasm!(self.ops
             ; .arch aarch64
-            ; tst X(a), x16
+            ; tst X(a), #0xfffe_0000_0000_0007
             ; b.eq =>cells
-            ; tst X(b), x16
+            ; tst X(b), #0xfffe_0000_0000_0007
             ; b.eq =>cells
             // Two immediates: identity.
             ; cmp X(a), X(b)
@@ -100,9 +99,9 @@ impl Codegen<'_> {
             ; b.eq =>outcomes.equal
             // A cell differs from an immediate, and two cells of different
             // types, or of a type compared by identity, differ.
-            ; tst X(a), x16
+            ; tst X(a), #0xfffe_0000_0000_0007
             ; b.ne =>outcomes.differ
-            ; tst X(b), x16
+            ; tst X(b), #0xfffe_0000_0000_0007
             ; b.ne =>outcomes.differ
             ; ldrb w16, [X(a)]
             ; ldrb w17, [X(b)]
@@ -112,6 +111,7 @@ impl Codegen<'_> {
         self.emit_same_type_cells([a, b], outcomes);
         self.emit_equality_results(node, [a, b], destination, condition, outcomes, done);
         dynasm!(self.ops ; .arch aarch64 ; =>done);
+        self.emit_sink_register(destination);
     }
 
     /// `X(destination)` = the tagged boolean of `X(a) == X(b)`, negated
@@ -161,12 +161,11 @@ impl Codegen<'_> {
         );
         // A boolean or function-id immediate converts or compares against
         // a converted cell: the runtime decides.
-        self.load_immediate(16, NOT_CELL_MASK);
         dynasm!(self.ops
             ; .arch aarch64
-            ; tst X(a), x16
+            ; tst X(a), #0xfffe_0000_0000_0007
             ; b.ne =>runtime
-            ; tst X(b), x16
+            ; tst X(b), #0xfffe_0000_0000_0007
             ; b.ne =>runtime
             ; ldrb w16, [X(a)]
             ; ldrb w17, [X(b)]
@@ -200,10 +199,9 @@ impl Codegen<'_> {
             ; mov x17, X(a)
             ; =>nullish_against
         );
-        self.load_immediate(16, NOT_CELL_MASK);
         dynasm!(self.ops
             ; .arch aarch64
-            ; tst x17, x16
+            ; tst x17, #0xfffe_0000_0000_0007
             ; b.ne =>outcomes.differ
             ; ldrb w16, [x17]
             ; cmp w16, native_tag
@@ -236,6 +234,7 @@ impl Codegen<'_> {
             Some(destination),
         )?;
         dynasm!(self.ops ; .arch aarch64 ; =>done);
+        self.emit_sink_register(destination);
         Ok(())
     }
 
@@ -321,7 +320,8 @@ impl Codegen<'_> {
 
     /// Bind `outcomes.differ` and `outcomes.equal` to the tagged results
     /// under `condition`: the first continues at `done`, the second falls
-    /// through. Defer the content leaf of `outcomes.leaf`.
+    /// through. A producer fused into its branch jumps from each to its
+    /// successor instead. Defer the content leaf of `outcomes.leaf`.
     fn emit_equality_results(
         &mut self,
         node: NodeId,
@@ -336,10 +336,26 @@ impl Codegen<'_> {
         } else {
             (VALUE_FALSE, VALUE_TRUE)
         };
-        dynasm!(self.ops ; .arch aarch64 ; =>outcomes.differ);
-        self.load_immediate(destination, when_differ);
-        dynasm!(self.ops ; .arch aarch64 ; b =>done ; =>outcomes.equal);
-        self.load_immediate(destination, when_equal);
+        if let Some(sink) = self.sink {
+            // Fused into its branch: each outcome jumps to its successor.
+            let (on_equal, on_differ) = if condition == Condition::Equal {
+                (sink.if_true, sink.if_false)
+            } else {
+                (sink.if_false, sink.if_true)
+            };
+            dynasm!(self.ops
+                ; .arch aarch64
+                ; =>outcomes.differ
+                ; b =>on_differ
+                ; =>outcomes.equal
+                ; b =>on_equal
+            );
+        } else {
+            dynasm!(self.ops ; .arch aarch64 ; =>outcomes.differ);
+            self.load_immediate(destination, when_differ);
+            dynasm!(self.ops ; .arch aarch64 ; b =>done ; =>outcomes.equal);
+            self.load_immediate(destination, when_equal);
+        }
         let live = self.allocation.node(node).live_registers.clone();
         self.deferred
             .push(Box::new(move |codegen: &mut Codegen<'_>| {

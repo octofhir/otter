@@ -79,6 +79,12 @@ mod own_fields;
 
 const NUMBER_TAG: u64 = tag::NUMBER_TAG;
 const NOT_CELL_MASK: u64 = tag::NOT_CELL_MASK;
+/// Every immediate sets bit 1 and every cell is 8-aligned, so a value is a
+/// cell exactly when none of these bits is set. Unlike [`NOT_CELL_MASK`],
+/// the high Number run and the low three bits form one logical immediate:
+/// `tst X(value), #0xfffe_0000_0000_0007` needs no constant register.
+const CELL_TEST_MASK: u64 = 0xfffe_0000_0000_0007;
+const _: () = assert!(CELL_TEST_MASK & NOT_CELL_MASK == NOT_CELL_MASK);
 const VALUE_TRUE: u64 = tag::VALUE_TRUE;
 const VALUE_FALSE: u64 = tag::VALUE_FALSE;
 const VALUE_UNDEFINED: u64 = tag::VALUE_UNDEFINED;
@@ -146,6 +152,20 @@ struct Codegen<'a> {
     /// Exact root records of the collecting boundaries emitted so far.
     sites: metadata::SitePlan,
     return_sites: Vec<abi::SafepointEntry>,
+    /// The truthiness branch each fused boolean producer answers into, by
+    /// producer (see [`super::emission::fused_branches`]).
+    fused: FxHashMap<NodeId, NodeId>,
+    /// The successors of the producer being emitted, while it is fused.
+    sink: Option<BooleanSink>,
+}
+
+/// Where a boolean producer fused with its block's branch delivers its
+/// answer: it jumps to the successor the answer selects instead of
+/// materializing `true` or `false` for the branch to test.
+#[derive(Clone, Copy)]
+struct BooleanSink {
+    if_true: DynamicLabel,
+    if_false: DynamicLabel,
 }
 
 /// Body bytes between islands: a segment plus its island stays inside the
@@ -293,7 +313,10 @@ pub(crate) fn emit(
         exits_flushed: 0,
         float_pool: FxHashMap::default(),
         veneers: Vec::new(),
+        fused: FxHashMap::default(),
+        sink: None,
     };
+    codegen.fused = super::emission::fused_branches(&built.graph, allocation);
     let tier_entry = codegen.ops.offset().0;
     let body = codegen.ops.new_dynamic_label();
     crate::arm64::frame::emit_tier_prologue(&mut codegen.ops, spill);
@@ -808,6 +831,7 @@ impl<'a> Codegen<'a> {
                     self.emit_move(result, slot);
                 }
             }
+            let mut fused_control = None;
             for &node in &data.body {
                 let allocation = self.allocation.node(node);
                 if allocation.skipped {
@@ -817,6 +841,14 @@ impl<'a> Codegen<'a> {
                 self.node_offsets.push((self.ops.offset().0, node));
                 for m in allocation.moves.clone() {
                     self.emit_move(m.from, m.to);
+                }
+                if let Some(&control) = self.fused.get(&node) {
+                    self.sink = Some(self.branch_sink(control));
+                    let emitted = self.emit_node(node);
+                    self.sink = None;
+                    emitted?;
+                    fused_control = Some(control);
+                    continue;
                 }
                 self.emit_node(node)?;
                 if let (Some(result), Some(&slot)) =
@@ -829,6 +861,10 @@ impl<'a> Codegen<'a> {
             }
             let control = data.control.expect("a terminated block");
             self.node_offsets.push((self.ops.offset().0, control));
+            if fused_control == Some(control) {
+                // The producer already jumped to the branch's successors.
+                continue;
+            }
             for m in self.allocation.node(control).moves.clone() {
                 self.emit_move(m.from, m.to);
             }
@@ -1393,6 +1429,7 @@ impl<'a> Codegen<'a> {
                 if oddball(data.inputs[0]) || oddball(data.inputs[1]) {
                     dynasm!(self.ops ; .arch aarch64 ; cmp X(a), X(b));
                     self.emit_cset_bool(destination, condition, false);
+                    self.emit_sink_register(destination);
                 } else {
                     let double = allocation.fp_temps[0];
                     self.emit_strict_equal(node, [a, b], double, destination, condition);
@@ -1444,10 +1481,9 @@ impl<'a> Codegen<'a> {
                 let exit = self.eager_exit(node, DeoptReason::WrongShape);
                 let (type_tag, guards, holes, cached_base) =
                     (*type_tag, *guards, *holes, *cached_base);
-                self.load_immediate(16, NOT_CELL_MASK);
                 dynasm!(self.ops
                     ; .arch aarch64
-                    ; tst X(receiver), x16
+                    ; tst X(receiver), #0xfffe_0000_0000_0007
                     ; b.ne =>exit
                     ; ldrb w17, [X(receiver)]
                     ; cmp w17, u32::from(type_tag)
@@ -2047,8 +2083,7 @@ impl<'a> Codegen<'a> {
         let shape_byte = self.view.object_shape_byte;
         dynasm!(self.ops ; .arch aarch64 ; ldr w16, [X(object), shape_byte]);
         for (index, &shape) in shapes.iter().enumerate() {
-            self.load_immediate(17, u64::from(shape));
-            dynasm!(self.ops ; .arch aarch64 ; cmp w16, w17);
+            self.emit_compare_w16(shape);
             if index + 1 == shapes.len() {
                 dynasm!(self.ops ; .arch aarch64 ; b.ne =>exit);
             } else {
@@ -2061,6 +2096,23 @@ impl<'a> Codegen<'a> {
         dynasm!(self.ops ; .arch aarch64 ; =>matched);
     }
 
+    /// Set the flags of `w16 - constant` without a constant register when the
+    /// constant has at most 24 significant bits: its high twelve subtract
+    /// shifted, its low twelve compare. Clobbers `w17`; keeps `w16`.
+    fn emit_compare_w16(&mut self, constant: u32) {
+        let (high, low) = (constant >> 12, constant & 0xfff);
+        if constant < 1 << 24 {
+            if high == 0 {
+                dynasm!(self.ops ; .arch aarch64 ; cmp w16, low);
+            } else {
+                dynasm!(self.ops ; .arch aarch64 ; sub w17, w16, high, lsl 12 ; cmp w17, low);
+            }
+        } else {
+            self.load_immediate(17, u64::from(constant));
+            dynasm!(self.ops ; .arch aarch64 ; cmp w16, w17);
+        }
+    }
+
     /// The generational barrier for storing `X(value)` into `X(object)`. The
     /// slow path preserves every live register itself.
     /// Branch to `miss` unless `X(value)` is a native function whose
@@ -2068,10 +2120,9 @@ impl<'a> Codegen<'a> {
     fn emit_native_identity(&mut self, value: u8, native_ref: u32, miss: DynamicLabel) {
         let native_type_tag = u32::from(self.view.collection_layout.native_function_type_tag);
         let identity_byte = self.view.native_call_layout.identity_byte;
-        self.load_immediate(16, NOT_CELL_MASK);
         dynasm!(self.ops
             ; .arch aarch64
-            ; tst X(value), x16
+            ; tst X(value), #0xfffe_0000_0000_0007
             ; b.ne =>miss
             ; cbz X(value), =>miss
             ; ldrb w16, [X(value)]
@@ -2108,10 +2159,9 @@ impl<'a> Codegen<'a> {
         };
         let target = lookup.receiver;
         let view = self.view;
-        self.load_immediate(16, NOT_CELL_MASK);
         dynasm!(self.ops
             ; .arch aarch64
-            ; tst X(value), x16
+            ; tst X(value), #0xfffe_0000_0000_0007
             ; b.ne =>exit
             ; cbz X(value), =>exit
             ; ldrb w16, [X(value)]
@@ -2207,10 +2257,9 @@ impl<'a> Codegen<'a> {
         }
         self.load_immediate(16, tag::box_function_id(function_id));
         dynasm!(self.ops ; .arch aarch64 ; cmp X(value), x16 ; b.eq =>proved);
-        self.load_immediate(16, NOT_CELL_MASK);
         dynasm!(self.ops
             ; .arch aarch64
-            ; tst X(value), x16
+            ; tst X(value), #0xfffe_0000_0000_0007
             ; b.ne =>exit
             ; cbz X(value), =>exit
             ; ldrb w16, [X(value)]
@@ -2434,11 +2483,9 @@ impl<'a> Codegen<'a> {
     /// Prove a published ordinary object cell; exact static shape guards
     /// supply its lookup-state proof before any field/effect.
     fn emit_object_receiver(&mut self, receiver: u8, miss: DynamicLabel) {
-        // The mask is a high run and bit 1: two encodable tests, no constant.
-        const _: () = assert!(NOT_CELL_MASK == 0xfffe_0000_0000_0002);
+        const _: () = assert!(CELL_TEST_MASK == 0xfffe_0000_0000_0007);
         dynasm!(self.ops ; .arch aarch64
-            ; tst X(receiver), #0xfffe_0000_0000_0000 ; b.ne =>miss
-            ; tbnz X(receiver), #1, =>miss
+            ; tst X(receiver), #0xfffe_0000_0000_0007 ; b.ne =>miss
             ; cbz X(receiver), =>miss
             ; ldrb w16, [X(receiver)]
             ; cmp w16, crate::entry::OBJECT_BODY_TYPE_TAG ; b.ne =>miss);
@@ -2497,10 +2544,9 @@ impl<'a> Codegen<'a> {
             self.ops.new_dynamic_label(),
             self.ops.new_dynamic_label(),
         );
-        self.load_immediate(16, NOT_CELL_MASK);
         dynasm!(self.ops
             ; .arch aarch64
-            ; tst X(receiver), x16
+            ; tst X(receiver), #0xfffe_0000_0000_0007
             ; b.ne =>other
             ; cbz X(receiver), =>other
             ; ldrb w17, [X(receiver)]
@@ -2896,11 +2942,8 @@ impl<'a> Codegen<'a> {
             }
             dynasm!(self.ops ; .arch aarch64 ; b =>miss);
         }
-        dynasm!(self.ops ; .arch aarch64 ; =>yes);
-        self.load_immediate(destination, otter_vm::Value::boolean(true).to_bits());
-        dynasm!(self.ops ; .arch aarch64 ; b =>done ; =>no);
-        self.load_immediate(destination, otter_vm::Value::boolean(false).to_bits());
-        dynasm!(self.ops ; .arch aarch64 ; b =>done ; =>miss);
+        self.emit_boolean_outcomes([yes, no], destination, done);
+        dynasm!(self.ops ; .arch aarch64 ; =>miss);
         // A native target (a builtin constructor) answers through the leaf
         // probe without running JavaScript; any other case completes in the
         // runtime. The probe keeps every live value and both operands.
@@ -2950,6 +2993,7 @@ impl<'a> Codegen<'a> {
             Some(destination),
         )?;
         dynasm!(self.ops ; .arch aarch64 ; =>done);
+        self.emit_sink_register(destination);
         Ok(())
     }
 
@@ -3093,10 +3137,9 @@ impl<'a> Codegen<'a> {
                 let object = |operand: u8| if operand == 0 { receiver } else { holder };
                 match *op {
                     Op::LoadIntrinsicPrototype { target, .. } => {
-                        self.load_immediate(16, NOT_CELL_MASK);
                         dynasm!(self.ops
                             ; .arch aarch64
-                            ; tst X(receiver), x16
+                            ; tst X(receiver), #0xfffe_0000_0000_0007
                             ; b.ne =>next
                             ; cbz X(receiver), =>next
                             ; ldrb w16, [X(receiver)]
@@ -3163,10 +3206,9 @@ impl<'a> Codegen<'a> {
                     } => {
                         let header = object(operand);
                         if operand == 0 {
-                            self.load_immediate(16, NOT_CELL_MASK);
                             dynasm!(self.ops
                                 ; .arch aarch64
-                                ; tst X(header), x16
+                                ; tst X(header), #0xfffe_0000_0000_0007
                                 ; b.ne =>next
                                 ; ldrb w16, [X(header)]
                                 ; cmp w16, crate::entry::OBJECT_BODY_TYPE_TAG
@@ -3466,10 +3508,9 @@ impl<'a> Codegen<'a> {
         let young = self.view.gc_barrier.young_flag;
         let slow = self.ops.new_dynamic_label();
         let done = self.ops.new_dynamic_label();
-        self.load_immediate(16, NOT_CELL_MASK);
         dynasm!(self.ops
             ; .arch aarch64
-            ; tst X(value), x16
+            ; tst X(value), #0xfffe_0000_0000_0007
             ; b.ne =>done
             ; ldr x16, [x20, THREAD_OFFSET]
             ; ldr x16, [x16, VM_THREAD_MARKING_FLAG_CELL_OFFSET]
@@ -4197,6 +4238,68 @@ impl<'a> Codegen<'a> {
         super::emission::forwarded(self.graph, self.allocation, block)
     }
 
+    /// The successor labels of the truthiness branch `control`, as its own
+    /// emission would name them.
+    fn branch_sink(&self, control: NodeId) -> BooleanSink {
+        let Kind::Branch {
+            if_true, if_false, ..
+        } = self.graph.node(control).kind
+        else {
+            unreachable!("a fused producer answers a branch");
+        };
+        let (if_true, if_false) = if self.far {
+            (if_true, if_false)
+        } else {
+            (self.forwarded(if_true), self.forwarded(if_false))
+        };
+        BooleanSink {
+            if_true: self.labels[&if_true],
+            if_false: self.labels[&if_false],
+        }
+    }
+
+    /// Bind a producer's two answers, `yes` and `no`: fused, each jumps to
+    /// its successor; otherwise each materializes its tagged boolean in
+    /// `X(destination)` and continues at `done`.
+    fn emit_boolean_outcomes(
+        &mut self,
+        [yes, no]: [DynamicLabel; 2],
+        destination: u8,
+        done: DynamicLabel,
+    ) {
+        if let Some(sink) = self.sink {
+            dynasm!(self.ops
+                ; .arch aarch64
+                ; =>yes
+                ; b =>sink.if_true
+                ; =>no
+                ; b =>sink.if_false
+            );
+        } else {
+            dynasm!(self.ops ; .arch aarch64 ; =>yes);
+            self.load_immediate(destination, VALUE_TRUE);
+            dynasm!(self.ops ; .arch aarch64 ; b =>done ; =>no);
+            self.load_immediate(destination, VALUE_FALSE);
+            dynasm!(self.ops ; .arch aarch64 ; b =>done);
+        }
+    }
+
+    /// A fused producer's answer computed into `X(value)` as a tagged
+    /// boolean, delivered to its successors. Nothing when unfused.
+    fn emit_sink_register(&mut self, value: u8) {
+        if let Some(sink) = self.sink {
+            let falsy = self.ops.new_dynamic_label();
+            dynasm!(self.ops
+                ; .arch aarch64
+                ; cmp XSP(value), VALUE_TRUE as u32
+                ; b.ne =>falsy
+                ; b =>sink.if_true
+                ; =>falsy
+                ; b =>sink.if_false
+            );
+        }
+    }
+
     fn emit_control(
         &mut self,
         block: BlockId,
@@ -4477,10 +4580,9 @@ impl<'a> Codegen<'a> {
         let cell = self.ops.new_dynamic_label();
         let string_tag = u32::from(self.view.string_layout.string_type_tag);
         let length = self.view.string_layout.string_len_byte;
-        self.load_immediate(16, NOT_CELL_MASK);
         dynasm!(self.ops
             ; .arch aarch64
-            ; tst X(value), x16
+            ; tst X(value), #0xfffe_0000_0000_0007
             ; b.eq =>cell
             // A boxed double carries number tag bits; other immediates do not.
             ; lsr x16, X(value), #49

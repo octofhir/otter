@@ -49,8 +49,7 @@ pub(crate) fn emit_concat(
     let empty_b = ops.new_dynamic_label();
     for input in inputs {
         emit_value(ops, r.buffer, input);
-        emit_load_u64(ops, 17, otter_vm::value::tag::NOT_CELL_MASK);
-        dynasm!(ops ; .arch aarch64 ; tst X(r.buffer),x17 ; b.ne =>slow
+        dynasm!(ops ; .arch aarch64 ; tst X(r.buffer), #0xfffe_0000_0000_0007 ; b.ne =>slow
             ; cbz X(r.buffer),=>slow ; ldrb w17,[X(r.buffer)]
             ; cmp WSP(17),p.string_type_tag as u32 ; b.ne =>slow);
     }

@@ -53,9 +53,8 @@ pub(crate) fn emit_native_kind_guard(ops: &mut Assembler, value: u8, miss: Dynam
         value != 16 && value != 17,
         "native callee cannot alias guard scratch"
     );
-    emit_load_u64(ops, 16, otter_vm::value::tag::NOT_CELL_MASK);
     dynasm!(ops ; .arch aarch64
-        ; tst X(value), x16 ; b.ne =>miss ; cbz X(value), =>miss
+        ; tst X(value), #0xfffe_0000_0000_0007 ; b.ne =>miss ; cbz X(value), =>miss
         ; ldrb w16, [X(value)]
         ; cmp w16, u32::from(otter_vm::native_function::NATIVE_FUNCTION_BODY_TYPE_TAG)
         ; b.ne =>miss

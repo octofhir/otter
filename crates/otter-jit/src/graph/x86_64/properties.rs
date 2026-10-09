@@ -684,11 +684,8 @@ impl Codegen<'_> {
                 ; cmp BYTE [Rq(cursor)], crate::entry::OBJECT_BODY_TYPE_TAG as i8 ; jne =>miss
                 ; dec Rd(budget) ; jnz =>step ; jmp =>miss);
         }
-        dynasm!(self.ops ; .arch x64 ; =>yes);
-        self.load_immediate(destination, tag::VALUE_TRUE);
-        dynasm!(self.ops ; .arch x64 ; jmp =>done ; =>no);
-        self.load_immediate(destination, tag::VALUE_FALSE);
-        dynasm!(self.ops ; .arch x64 ; jmp =>done ; =>miss);
+        self.emit_boolean_outcomes([yes, no], destination, done);
+        dynasm!(self.ops ; .arch x64 ; =>miss);
         // A native target (a builtin constructor) answers through the leaf
         // probe without running JavaScript; any other case completes in the
         // runtime. The probe keeps every live value and both operands.
@@ -730,6 +727,7 @@ impl Codegen<'_> {
             Some(destination),
         )?;
         dynasm!(self.ops ; .arch x64 ; =>done);
+        self.emit_sink_register(destination);
         Ok(())
     }
 }

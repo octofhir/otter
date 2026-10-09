@@ -618,7 +618,6 @@ impl Interpreter {
     }
 
     /// Frozen code directory with empty feedback for an isolate snapshot.
-    #[must_use]
     pub(crate) fn snapshot_code_space(
         &self,
     ) -> Result<crate::code_space::snapshot::CodeSpaceSnapshot, otter_resource::ResourceError> {

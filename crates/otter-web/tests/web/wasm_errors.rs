@@ -112,7 +112,7 @@ fn runtime(records: Arc<Mutex<Records>>) -> Runtime {
                                     .offset();
                                 let stats = ctx.interp_mut().gc_stats_snapshot();
                                 ctx.interp_mut().force_gc().map_err(|error| {
-                                    JsError::from_vm(ctx.interp_mut(), error)
+                                    JsError::from_vm(ctx.interp_mut(), error.into())
                                         .into_native("wasmMove")
                                 })?;
                                 let after = ctx
@@ -252,10 +252,7 @@ fn wasm_export_and_start_keep_typed_fatal_control_and_actual_oom() {
                 "wasm-fatal.js",
             );
             if code == 4 {
-                assert_eq!(
-                    result.expect("typed exit completion").exit_code_override(),
-                    Some(27)
-                );
+                assert_eq!(result.expect("typed exit completion").exit_code(), 27);
             } else {
                 let error = result.expect_err("fatal host cause must leave actual Wasmtime call");
                 match code {

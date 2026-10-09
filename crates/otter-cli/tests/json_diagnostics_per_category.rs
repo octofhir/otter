@@ -4,11 +4,15 @@
 //! is invoked with `--json`, stdout/stderr is
 //! parsed via `serde_json`, and we assert the typed wire shape:
 //!
-//! - error envelope deserializes into a known
+//! - the error envelope's `kind` tag names the expected
 //!   [`otter_runtime::OtterError`] variant,
 //! - the embedded diagnostic (when present) carries a
 //!   [`otter_runtime::DiagnosticCode`] from the closed set
 //!   matching the expected category.
+//!
+//! `OtterError` is serialize-only: its frames may retain admitted source
+//! handles, so decoding belongs to the source-accounting boundary. The test
+//! reads the wire format through a local mirror of the fields it checks.
 //!
 //! Errors print to stderr, not stdout — `--json` is the
 //! machine-readable channel even for failures, so the CLI flushes
@@ -16,12 +20,26 @@
 
 use std::process::Command;
 
-use otter_runtime::{DiagnosticCategory, DiagnosticCode, OtterError};
+use otter_runtime::{DiagnosticCategory, DiagnosticCode};
 use serde::Deserialize;
 
 #[derive(Debug, Deserialize)]
 struct Envelope {
-    error: OtterError,
+    error: WireError,
+}
+
+/// Wire mirror of the [`otter_runtime::OtterError`] variants these fixtures
+/// produce, keyed by the same `kind` tag.
+#[derive(Debug, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum WireError {
+    Compile { diagnostics: Vec<WireDiagnostic> },
+    Runtime { diagnostic: WireDiagnostic },
+}
+
+#[derive(Debug, Deserialize)]
+struct WireDiagnostic {
+    code: String,
 }
 
 fn run_with_json(source: &str, file_name: &str) -> (i32, Envelope) {
@@ -48,7 +66,7 @@ fn run_with_json(source: &str, file_name: &str) -> (i32, Envelope) {
 
 fn assert_compile_category(env: Envelope, expected: DiagnosticCategory) {
     let diagnostics = match env.error {
-        OtterError::Compile { diagnostics } => diagnostics,
+        WireError::Compile { diagnostics } => diagnostics,
         other => panic!("expected Compile error, got {other:?}"),
     };
     let first = diagnostics.first().expect("at least one diagnostic");
@@ -95,7 +113,7 @@ fn runtime_category_json_envelope() {
     let (status, env) = run_with_json("throw new Error(\"boom\");\n", "entry.ts");
     assert_ne!(status, 0);
     let diagnostic = match env.error {
-        OtterError::Runtime { diagnostic } => *diagnostic,
+        WireError::Runtime { diagnostic } => diagnostic,
         other => panic!("expected Runtime error, got {other:?}"),
     };
     let code = DiagnosticCode::parse(&diagnostic.code)

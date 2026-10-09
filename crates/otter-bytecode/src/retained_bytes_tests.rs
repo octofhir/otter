@@ -42,7 +42,7 @@ fn retained_module_counts_spare_rows_nested_strings_and_exception_capacity() {
     scope.slots.try_reserve_exact(4).unwrap();
     let mut name = String::new();
     name.try_reserve_exact(83).unwrap();
-    name.push_str("x");
+    name.push('x');
     let name_capacity = name.capacity();
     scope.slots.push(SlotDescriptor {
         name,

@@ -594,7 +594,7 @@ fn bit_length(magnitude: &[u64]) -> u64 {
 
 /// Keep the low `bits` of `out`, which is exactly `bits.div_ceil(64)` long.
 fn mask_top(out: &mut [u64], bits: u64) {
-    if bits % 64 != 0
+    if !bits.is_multiple_of(64)
         && let Some(top) = out.last_mut()
     {
         *top &= (1u64 << (bits % 64)) - 1;

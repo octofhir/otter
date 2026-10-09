@@ -53,10 +53,10 @@ impl Interpreter {
         ) {
             return false;
         }
-        let changed = code_block
+        
+        code_block
             .feedback_recorder_at(instruction_pc as usize)
-            .is_some_and(|feedback| feedback.record_element_family(observed));
-        changed
+            .is_some_and(|feedback| feedback.record_element_family(observed))
     }
 }
 

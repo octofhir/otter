@@ -23,7 +23,7 @@ fn bench_dispatch(c: &mut Criterion) {
         op: Op::Return,
         operands: vec![Operand::Register(0)],
     });
-    let spans: Vec<SpanEntry> = code
+    let spans: otter_bytecode::SpanTable = code
         .iter()
         .map(|i| SpanEntry {
             pc: i.pc,
@@ -50,7 +50,7 @@ fn bench_dispatch(c: &mut Criterion) {
     let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
     let context = otter_vm::ExecutionContext::from_module(
         module,
-        crate::source_registry::SourceRegistry::default(),
+        otter_vm::source_registry::SourceRegistry::default(),
     )
     .expect("valid bytecode fixture");
     c.bench_function("dispatch_10k_nop", |b| {

@@ -53,8 +53,8 @@ impl Interpreter {
                 crate::property_ic::PropertyIcKind::Load,
             )
             .is_some_and(|slot| slot.record_attempt());
-        let changed = call_changed || property_changed;
-        changed
+        
+        call_changed || property_changed
     }
 
     /// Publish one isolate-owned method-target population transition.

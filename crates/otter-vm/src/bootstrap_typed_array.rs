@@ -185,8 +185,8 @@ pub fn install_typed_array_well_knowns_post_bootstrap(
             })
             .and_then(|proto| proto.as_object())
             .and_then(|proto| object::get(proto, heap, "toString"));
-        if let Some(fun) = array_to_string {
-            if !object::define_own_property(
+        if let Some(fun) = array_to_string
+            && !object::define_own_property(
                 abstract_proto,
                 heap,
                 "toString",
@@ -194,7 +194,6 @@ pub fn install_typed_array_well_knowns_post_bootstrap(
             )? {
                 return Err(JsSurfaceError::DefinePropertyFailed("[[BuiltinProperty]]"));
             };
-        }
         let abstract_proto_root = Value::object(abstract_proto);
         let getter = crate::bootstrap::native_static_with_value_roots(
             heap,

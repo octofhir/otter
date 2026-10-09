@@ -80,7 +80,7 @@ impl Interpreter {
                 stack,
                 context
                     .ok_or(VmError::InvalidOperand)
-                    .map_err(|error| CommittedValueError::Fatal(error.into()))?,
+                    .map_err(CommittedValueError::Fatal)?,
                 &base,
                 true,
             )?;
@@ -115,7 +115,7 @@ impl Interpreter {
             }
             if let Some(value) = self
                 .string_object_exotic_get(obj, key)
-                .map_err(|error| CommittedValueError::JavaScript(error.into()))?
+                .map_err(CommittedValueError::JavaScript)?
             {
                 return Ok(VmGetOutcome::Value(value));
             }
@@ -146,7 +146,7 @@ impl Interpreter {
         if base.as_proxy().is_some() {
             let key_value = self
                 .vm_property_key_to_value(key)
-                .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                .map_err(CommittedValueError::JavaScript)?;
             let key_handle = self.scoped_value(scope, key_value);
             let proxy = self
                 .escape_scoped(base_handle)
@@ -164,7 +164,7 @@ impl Interpreter {
                         .as_proxy()
                         .ok_or(CommittedValueError::Fatal(VmError::InvalidOperand))?;
                     self.validate_proxy_get_invariants(&proxy.target(&self.gc_heap), key, &value)
-                        .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                        .map_err(CommittedValueError::JavaScript)?;
                     Ok(VmGetOutcome::Value(value))
                 }
                 crate::object_internal_ops::ProxyTrap::NoTrap {
@@ -199,7 +199,7 @@ impl Interpreter {
                     } else {
                         let proto = self
                             .array_get_prototype_value(arr)
-                            .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                            .map_err(CommittedValueError::JavaScript)?;
                         if proto.is_object_type() {
                             return self.continue_ordinary_get_value_scoped(
                                 stack,
@@ -246,7 +246,7 @@ impl Interpreter {
                             // just %Array.prototype%.
                             let proto = self
                                 .array_get_prototype_value(arr)
-                                .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                                .map_err(CommittedValueError::JavaScript)?;
                             if proto.is_object_type() {
                                 return self.continue_ordinary_get_value_scoped(
                                     stack,
@@ -272,7 +272,7 @@ impl Interpreter {
         if let Some(function_id) = fid {
             let owner_context = self
                 .function_context(context, function_id)
-                .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                .map_err(CommittedValueError::Fatal)?;
             let context = &owner_context;
             let owner = base.as_closure(&self.gc_heap);
             // A user-mutated [[Prototype]] (`fn.__proto__ = obj` /
@@ -325,7 +325,7 @@ impl Interpreter {
                         function_id,
                         key_name,
                     )
-                    .map_err(|error| CommittedValueError::JavaScript(error.into()))?
+                    .map_err(CommittedValueError::JavaScript)?
                     .map(descriptor_to_lookup)
                 }
             };
@@ -397,7 +397,7 @@ impl Interpreter {
             };
             if let Some(outcome) = self
                 .callable_realm_prototype_accessor_outcome(&value, key)
-                .map_err(|error| CommittedValueError::Fatal(error.into()))?
+                .map_err(CommittedValueError::Fatal)?
             {
                 return Ok(outcome);
             }
@@ -502,7 +502,7 @@ impl Interpreter {
             };
             if let Some(outcome) = self
                 .callable_realm_prototype_accessor_outcome(&value, key)
-                .map_err(|error| CommittedValueError::Fatal(error.into()))?
+                .map_err(CommittedValueError::Fatal)?
             {
                 return Ok(outcome);
             }
@@ -561,7 +561,7 @@ impl Interpreter {
             };
             if let Some(outcome) = self
                 .callable_realm_prototype_accessor_outcome(&value, key)
-                .map_err(|error| CommittedValueError::Fatal(error.into()))?
+                .map_err(CommittedValueError::Fatal)?
             {
                 return Ok(outcome);
             }
@@ -609,7 +609,7 @@ impl Interpreter {
             };
             if let Some(outcome) = self
                 .callable_realm_prototype_accessor_outcome(&value, key)
-                .map_err(|error| CommittedValueError::Fatal(error.into()))?
+                .map_err(CommittedValueError::Fatal)?
             {
                 return Ok(outcome);
             }
@@ -670,7 +670,7 @@ impl Interpreter {
                     Some(p) => p,
                     None => self
                         .constructor_prototype_value("RegExp")
-                        .map_err(|error| CommittedValueError::Fatal(error.into()))?,
+                        .map_err(CommittedValueError::Fatal)?,
                 };
                 if proto.is_nullish() {
                     return Ok(VmGetOutcome::Value(Value::undefined()));
@@ -781,7 +781,7 @@ impl Interpreter {
                 // returns the per-instance override or the intrinsic.
                 let proto = self
                     .get_prototype_for_op(&base)
-                    .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                    .map_err(CommittedValueError::JavaScript)?;
                 if proto.is_nullish() {
                     return Ok(VmGetOutcome::Value(Value::undefined()));
                 }
@@ -846,7 +846,7 @@ impl Interpreter {
                         "WeakSet"
                     };
                     self.constructor_prototype_value(proto_name)
-                        .map_err(|error| CommittedValueError::Fatal(error.into()))?
+                        .map_err(CommittedValueError::Fatal)?
                 }
             };
             if proto.is_nullish() {
@@ -895,7 +895,7 @@ impl Interpreter {
                 Some(over) => over,
                 None => self
                     .constructor_prototype_value("Promise")
-                    .map_err(|error| CommittedValueError::Fatal(error.into()))?,
+                    .map_err(CommittedValueError::Fatal)?,
             };
             if proto.is_nullish() {
                 return Ok(VmGetOutcome::Value(Value::undefined()));
@@ -914,7 +914,7 @@ impl Interpreter {
         if base.is_big_int() {
             let proto = self
                 .constructor_prototype_value("BigInt")
-                .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                .map_err(CommittedValueError::Fatal)?;
             if proto.is_nullish() {
                 return Ok(VmGetOutcome::Value(Value::undefined()));
             }
@@ -939,7 +939,7 @@ impl Interpreter {
             };
             let proto = self
                 .constructor_prototype_value(proto_name)
-                .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                .map_err(CommittedValueError::Fatal)?;
             if proto.is_nullish() {
                 return Ok(VmGetOutcome::Value(Value::undefined()));
             }
@@ -973,7 +973,7 @@ impl Interpreter {
             }
             let proto = self
                 .constructor_prototype_value("String")
-                .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                .map_err(CommittedValueError::Fatal)?;
             if proto.is_nullish() {
                 return Ok(VmGetOutcome::Value(Value::undefined()));
             }
@@ -996,7 +996,7 @@ impl Interpreter {
             };
             let proto = self
                 .constructor_prototype_value(proto_name)
-                .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                .map_err(CommittedValueError::Fatal)?;
             if proto.is_nullish() {
                 return Ok(VmGetOutcome::Value(Value::undefined()));
             }
@@ -1043,7 +1043,7 @@ impl Interpreter {
             }
             let proto = self
                 .get_prototype_for_op(&base)
-                .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                .map_err(CommittedValueError::JavaScript)?;
             if proto.is_nullish() {
                 return Ok(VmGetOutcome::Value(Value::undefined()));
             }
@@ -1092,7 +1092,7 @@ impl Interpreter {
             }
             let proto = self
                 .get_prototype_for_op(&base)
-                .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                .map_err(CommittedValueError::JavaScript)?;
             if proto.is_nullish() {
                 return Ok(VmGetOutcome::Value(Value::undefined()));
             }
@@ -1150,7 +1150,7 @@ impl Interpreter {
             }
             let proto = self
                 .get_prototype_for_op(&base)
-                .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                .map_err(CommittedValueError::JavaScript)?;
             if proto.is_nullish() {
                 return Ok(VmGetOutcome::Value(Value::undefined()));
             }
@@ -1176,7 +1176,7 @@ impl Interpreter {
                     return Ok(VmGetOutcome::Value(
                         t.get(&mut self.gc_heap, idx)
                             .map_err(crate::oom_to_vm)
-                            .map_err(|error| CommittedValueError::JavaScript(error.into()))?,
+                            .map_err(CommittedValueError::JavaScript)?,
                     ));
                 }
                 if let Some(bag) = t.expando(&self.gc_heap)
@@ -1194,7 +1194,7 @@ impl Interpreter {
             let this_value = Value::typed_array(t);
             let proto = self
                 .get_prototype_for_op(&this_value)
-                .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                .map_err(CommittedValueError::JavaScript)?;
             if proto.is_nullish() {
                 return Ok(VmGetOutcome::Value(Value::undefined()));
             }
@@ -1244,7 +1244,7 @@ impl Interpreter {
             // on `Temporal.<X>.prototype`.
             let proto = self
                 .get_prototype_for_op(&base)
-                .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                .map_err(CommittedValueError::JavaScript)?;
             if proto.is_nullish() {
                 return Ok(VmGetOutcome::Value(Value::undefined()));
             }
@@ -1292,7 +1292,7 @@ impl Interpreter {
             // prototype overrides selected by `new.target`.
             let proto = self
                 .get_prototype_for_op(&base)
-                .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                .map_err(CommittedValueError::JavaScript)?;
             if proto.is_nullish() {
                 return Ok(VmGetOutcome::Value(Value::undefined()));
             }
@@ -1397,7 +1397,7 @@ impl Interpreter {
                 stack,
                 context
                     .ok_or(VmError::InvalidOperand)
-                    .map_err(|error| CommittedValueError::Fatal(error.into()))?,
+                    .map_err(CommittedValueError::Fatal)?,
                 &base,
                 true,
             )?;
@@ -1428,7 +1428,7 @@ impl Interpreter {
             // getOwnPropertyDescriptor agree on one funnel.
             if self
                 .string_object_exotic_descriptor(obj, key)
-                .map_err(|error| CommittedValueError::JavaScript(error.into()))?
+                .map_err(CommittedValueError::JavaScript)?
                 .is_some()
             {
                 return Ok(true);
@@ -1449,7 +1449,7 @@ impl Interpreter {
         if base.as_proxy().is_some() {
             let key_value = self
                 .vm_property_key_to_value(key)
-                .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                .map_err(CommittedValueError::JavaScript)?;
             let proxy = self
                 .escape_scoped(base_handle)
                 .as_proxy()
@@ -1520,7 +1520,7 @@ impl Interpreter {
                     let base_value = Value::array(arr);
                     let proto = self
                         .get_prototype_for_op(&base_value)
-                        .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                        .map_err(CommittedValueError::JavaScript)?;
                     if proto.is_null() || proto.is_undefined() {
                         return Ok(false);
                     }
@@ -1557,7 +1557,7 @@ impl Interpreter {
                     let base_value = Value::array(arr);
                     let proto = self
                         .get_prototype_for_op(&base_value)
-                        .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                        .map_err(CommittedValueError::JavaScript)?;
                     if proto.is_null() || proto.is_undefined() {
                         return Ok(false);
                     }
@@ -1579,20 +1579,20 @@ impl Interpreter {
         {
             let owner_context = self
                 .function_context(context, function_id)
-                .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                .map_err(CommittedValueError::Fatal)?;
             let context = Some(&owner_context);
             let owner = base.as_closure(&self.gc_heap);
             if let Some(name) = key.string_name()
                 && self
                     .ordinary_function_own_property_descriptor(context, owner, function_id, name)
-                    .map_err(|error| CommittedValueError::JavaScript(error.into()))?
+                    .map_err(CommittedValueError::JavaScript)?
                     .is_some()
             {
                 return Ok(true);
             }
             let proto = self
                 .get_prototype_for_op(&base)
-                .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                .map_err(CommittedValueError::JavaScript)?;
             return if proto.is_null() || proto.is_undefined() {
                 Ok(false)
             } else {
@@ -1628,7 +1628,7 @@ impl Interpreter {
             }
             let proto = self
                 .get_prototype_for_op(&base)
-                .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                .map_err(CommittedValueError::JavaScript)?;
             return if proto.is_null() || proto.is_undefined() {
                 Ok(false)
             } else {
@@ -1662,7 +1662,7 @@ impl Interpreter {
             }
             let proto = self
                 .get_prototype_for_op(&base)
-                .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                .map_err(CommittedValueError::JavaScript)?;
             return if proto.is_null() || proto.is_undefined() {
                 Ok(false)
             } else {
@@ -1704,7 +1704,7 @@ impl Interpreter {
             }
             let proto = self
                 .get_prototype_for_op(&base)
-                .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                .map_err(CommittedValueError::JavaScript)?;
             return if proto.is_null() || proto.is_undefined() {
                 Ok(false)
             } else {
@@ -1753,7 +1753,7 @@ impl Interpreter {
             }
             let proto = self
                 .get_prototype_for_op(&base)
-                .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                .map_err(CommittedValueError::JavaScript)?;
             if crate::reflect::is_type_object_value(&proto) {
                 return self.continue_ordinary_has_property_value_scoped(
                     stack,
@@ -1982,7 +1982,7 @@ impl Interpreter {
                         &[&target_clone],
                         &[args],
                     )
-                    .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                    .map_err(CommittedValueError::JavaScript)?;
                 Ok(Some(Value::array(array)))
             }
             M::GetOwnPropertySymbols => {
@@ -2014,7 +2014,7 @@ impl Interpreter {
                         &[&target_clone],
                         &[args],
                     )
-                    .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                    .map_err(CommittedValueError::JavaScript)?;
                 Ok(Some(Value::array(array)))
             }
             _ => Ok(None),

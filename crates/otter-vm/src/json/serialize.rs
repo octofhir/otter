@@ -143,7 +143,7 @@ impl Interpreter {
                     state.replacer_root = Some(self.json_root_push(replacer));
                 } else if self
                     .json_is_array(&replacer)
-                    .map_err(|error| CommittedValueError::JavaScript(error.into()))?
+                    .map_err(CommittedValueError::JavaScript)?
                 {
                     state.property_list =
                         Some(self.json_build_property_list(stack, context, &replacer)?);
@@ -157,7 +157,7 @@ impl Interpreter {
             let rooted_value = self.json_root_get(value_root);
             let wrapper = self
                 .json_make_wrapper(rooted_value)
-                .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                .map_err(CommittedValueError::JavaScript)?;
 
             let mut buffer = String::with_capacity(self.json_stringify_capacity_hint);
             let wrote = self.serialize_json_property_into(
@@ -205,7 +205,7 @@ impl Interpreter {
         let result = (|| {
             let root = self
                 .json_make_wrapper(self.json_root_get(base_root))
-                .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                .map_err(CommittedValueError::JavaScript)?;
             self.internalize_json_property(
                 stack,
                 context,
@@ -247,7 +247,7 @@ impl Interpreter {
             if self.json_root_get(value_root).is_object_type() {
                 if self
                     .json_is_array(&self.json_root_get(value_root))
-                    .map_err(|error| CommittedValueError::JavaScript(error.into()))?
+                    .map_err(CommittedValueError::JavaScript)?
                 {
                     let len = self.json_length(stack, context, &self.json_root_get(value_root))?;
                     for index in 0..len {
@@ -291,11 +291,11 @@ impl Interpreter {
             // dangle an earlier one before the call assembles them.
             let name_arg = self
                 .json_key_value(name)
-                .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                .map_err(CommittedValueError::JavaScript)?;
             let name_root = self.json_root_push(name_arg);
             let context_obj = self
                 .json_make_reviver_context(self.json_root_get(value_root), source)
-                .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                .map_err(CommittedValueError::JavaScript)?;
             let context_root = self.json_root_push(context_obj);
             let args: SmallVec<[Value; 8]> = smallvec![
                 self.json_root_get(name_root),
@@ -510,7 +510,7 @@ impl Interpreter {
                 let to_json_root = self.json_root_push(to_json);
                 let key_arg = self
                     .json_key_value(key)
-                    .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                    .map_err(CommittedValueError::JavaScript)?;
                 let args: SmallVec<[Value; 8]> = smallvec![key_arg];
                 let receiver = self.json_root_get(value_root);
                 let to_json = self.json_root_get(to_json_root);
@@ -526,7 +526,7 @@ impl Interpreter {
         if let Some(replacer_root) = state.replacer_root {
             let key_arg = self
                 .json_key_value(key)
-                .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                .map_err(CommittedValueError::JavaScript)?;
             let args: SmallVec<[Value; 8]> = smallvec![key_arg, self.json_root_get(value_root)];
             let holder = self.json_root_get(holder_root);
             let replacer = self.json_root_get(replacer_root);
@@ -609,7 +609,7 @@ impl Interpreter {
         if value.is_object_type() && !value.is_callable() {
             if self
                 .json_is_array(&value)
-                .map_err(|error| CommittedValueError::JavaScript(error.into()))?
+                .map_err(CommittedValueError::JavaScript)?
             {
                 self.serialize_json_array_into(stack, context, state, value, out)?;
             } else {
@@ -631,7 +631,7 @@ impl Interpreter {
         out: &mut String,
     ) -> Result<(), CommittedValueError> {
         self.json_enter(state, &value)
-            .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+            .map_err(CommittedValueError::JavaScript)?;
         // Park the container: `json_enumerable_string_keys` mints a
         // `JsString` per key and each property may recurse, so a
         // scavenge can move `value` mid-loop. Re-read from the slot.
@@ -760,7 +760,7 @@ impl Interpreter {
         out: &mut String,
     ) -> Result<(), CommittedValueError> {
         self.json_enter(state, &value)
-            .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+            .map_err(CommittedValueError::JavaScript)?;
         // Park the container so per-index recursion (which allocates
         // index-key strings and may scavenge) can't strand a stale copy.
         let value_root = self.json_root_push(value);

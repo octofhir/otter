@@ -76,7 +76,7 @@ pub(super) fn assert_sites(bundle: &JitArtifactBundle) -> Value {
         assert_eq!(owners.len(), 1, "actual call has one emitted region");
         #[cfg(target_arch = "aarch64")]
         {
-            assert!(offset >= 4 && offset % 4 == 0);
+            assert!(offset >= 4 && offset.is_multiple_of(4));
             let word = u32::from_le_bytes(code[offset - 4..offset].try_into().unwrap());
             assert!(
                 word & 0xffff_fc1f == 0xd63f_0000 || word & 0xfc00_0000 == 0x9400_0000,
@@ -209,7 +209,7 @@ pub(super) fn assert_plain_hot_source_unstamped(code: &[u8], start: usize, end: 
     ];
     #[cfg(target_arch = "aarch64")]
     {
-        assert!(start % 4 == 0 && end % 4 == 0);
+        assert!(start.is_multiple_of(4) && end.is_multiple_of(4));
         for word in code[start..end].chunks_exact(4) {
             let word = u32::from_le_bytes(word.try_into().unwrap());
             // STR Wt,[x21,#imm12*4] is the actual shared caller-stamp form.

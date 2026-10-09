@@ -47,7 +47,7 @@ impl Interpreter {
                         stack,
                         context
                             .ok_or(VmError::InvalidOperand)
-                            .map_err(|error| CommittedValueError::Fatal(error.into()))?,
+                            .map_err(CommittedValueError::Fatal)?,
                         &current,
                         true,
                     )?;
@@ -80,7 +80,7 @@ impl Interpreter {
         if let Some(proxy) = target.as_proxy() {
             let key_value = self
                 .vm_property_key_to_value(key)
-                .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                .map_err(CommittedValueError::JavaScript)?;
             let trap_args: SmallVec<[Value; 8]> =
                 smallvec::smallvec![proxy.target(&self.gc_heap), key_value];
             return match self.invoke_proxy_trap(
@@ -103,7 +103,7 @@ impl Interpreter {
                         target_desc.as_ref(),
                         None,
                     )
-                    .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                    .map_err(CommittedValueError::JavaScript)?;
                     Ok(None)
                 }
                 crate::object_internal_ops::ProxyTrap::Trapped(v)
@@ -126,7 +126,7 @@ impl Interpreter {
                         target_desc.as_ref(),
                         Some(&desc),
                     )
-                    .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                    .map_err(CommittedValueError::JavaScript)?;
                     Ok(Some(desc))
                 }
                 crate::object_internal_ops::ProxyTrap::Trapped(_) => {
@@ -152,7 +152,7 @@ impl Interpreter {
         if let Some(obj) = target.as_object() {
             if let Some(desc) = self
                 .string_object_exotic_descriptor(obj, key)
-                .map_err(|error| CommittedValueError::JavaScript(error.into()))?
+                .map_err(CommittedValueError::JavaScript)?
             {
                 return Ok(Some(desc));
             }
@@ -166,7 +166,7 @@ impl Interpreter {
         }
         if let Some(value) = target.as_string(&self.gc_heap) {
             return string::exotic::descriptor_for_key(value, key, &mut self.gc_heap)
-                .map_err(|error| CommittedValueError::JavaScript(error.into()));
+                .map_err(CommittedValueError::JavaScript);
         }
         if let Some(arr) = target.as_array() {
             // §10.4.2 — own symbol-keyed properties live in a
@@ -255,7 +255,7 @@ impl Interpreter {
                                     t.get(&mut self.gc_heap, idx)
                                         .map_err(crate::oom_to_vm)
                                         .map_err(|error| {
-                                            CommittedValueError::JavaScript(error.into())
+                                            CommittedValueError::JavaScript(error)
                                         })?,
                                     true,
                                     true,
@@ -367,7 +367,7 @@ impl Interpreter {
         if let Some(function_id) = function_id {
             let owner_context = self
                 .function_context(context, function_id)
-                .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                .map_err(CommittedValueError::Fatal)?;
             let context = &owner_context;
             let owner = target.as_closure(&self.gc_heap);
             if let VmPropertyKey::Symbol(sym) = key {
@@ -402,12 +402,12 @@ impl Interpreter {
                             function_id,
                             key,
                         )
-                        .map_err(|error| CommittedValueError::JavaScript(error.into()))
+                        .map_err(CommittedValueError::JavaScript)
                 });
             }
             return self
                 .ordinary_function_own_property_descriptor(Some(context), owner, function_id, key)
-                .map_err(|error| CommittedValueError::JavaScript(error.into()));
+                .map_err(CommittedValueError::JavaScript);
         }
         if let Some(bound) = target.as_bound_function() {
             let Some(key) = key.string_name() else {
@@ -426,7 +426,7 @@ impl Interpreter {
                 key,
             )
             .map_err(VmError::from)
-            .map_err(|error| CommittedValueError::JavaScript(error.into()));
+            .map_err(CommittedValueError::JavaScript);
         }
         if let Some(native) = target.as_native_function() {
             return Ok(if let VmPropertyKey::Symbol(sym) = key {
@@ -472,12 +472,12 @@ impl Interpreter {
                 let owner = ctor.as_closure(&self.gc_heap);
                 return self
                     .ordinary_function_own_property_descriptor(context, owner, function_id, key)
-                    .map_err(|error| CommittedValueError::JavaScript(error.into()));
+                    .map_err(CommittedValueError::JavaScript);
             }
             if let Some(native) = ctor.as_native_function() {
-                return Ok(native
+                return native
                     .own_property_descriptor(&mut self.gc_heap, key)
-                    .map_err(|error| CommittedValueError::JavaScript(error.into()))?);
+                    .map_err(|error| CommittedValueError::JavaScript(error.into()));
             }
             if let Some(bound) = ctor.as_bound_function() {
                 return function_metadata::bound_own_property_descriptor(
@@ -486,7 +486,7 @@ impl Interpreter {
                     key,
                 )
                 .map_err(VmError::from)
-                .map_err(|error| CommittedValueError::JavaScript(error.into()));
+                .map_err(CommittedValueError::JavaScript);
             }
         }
         Ok(None)
@@ -566,7 +566,7 @@ impl Interpreter {
         if value.is_object_type() {
             return self
                 .get_prototype_for_op(&value)
-                .map_err(|error| CommittedValueError::JavaScript(error.into()));
+                .map_err(CommittedValueError::JavaScript);
         }
         // §B.2.2.1.1 step 1 — ToObject(this value): a primitive
         // receiver reports its wrapper's [[Prototype]] without
@@ -574,7 +574,7 @@ impl Interpreter {
         if !value.is_nullish() {
             return self
                 .get_prototype_for_op(&value)
-                .map_err(|error| CommittedValueError::JavaScript(error.into()));
+                .map_err(CommittedValueError::JavaScript);
         }
         Err(CommittedValueError::JavaScript(VmError::TypeMismatch))
     }

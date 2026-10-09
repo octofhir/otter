@@ -120,7 +120,7 @@ impl Interpreter {
                 if let Some(ErrorDetail::Syscall(payload)) = &detail {
                     node_code = Some(payload.code);
                     dynamic_message = payload.message.clone();
-                    syscall_detail = Some(payload.clone());
+                    syscall_detail = Some(payload.as_ref().clone());
                     (error_classes::ErrorKind::Error, dynamic_message.as_str())
                 } else if let Some(ErrorDetail::Coded(payload)) = &detail {
                     node_code = Some(payload.code);

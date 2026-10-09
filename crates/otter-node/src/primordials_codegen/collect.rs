@@ -346,24 +346,24 @@ impl<'a> Visit<'a> for Uses<'_> {
 
     fn visit_variable_declarator(&mut self, declaration: &VariableDeclarator<'a>) {
         self.record_imports(declaration);
-        if let Some(span) = declaration.init.as_ref().and_then(is_primordial) {
-            if let BindingPattern::ObjectPattern(pattern) = &declaration.id {
-                self.allow(span);
-                if let Some(rest) = &pattern.rest {
+        if let Some(span) = declaration.init.as_ref().and_then(is_primordial)
+            && let BindingPattern::ObjectPattern(pattern) = &declaration.id
+        {
+            self.allow(span);
+            if let Some(rest) = &pattern.rest {
+                self.fail(
+                    rest.span,
+                    "primordial object-rest is an unproved escaping use",
+                );
+            }
+            for property in &pattern.properties {
+                if let Some(name) = literal_key(&property.key, property.computed) {
+                    self.note(&name, property.key.span(), "destructure");
+                } else {
                     self.fail(
-                        rest.span,
-                        "primordial object-rest is an unproved escaping use",
+                        property.key.span(),
+                        "unproved computed primordial destructuring key",
                     );
-                }
-                for property in &pattern.properties {
-                    if let Some(name) = literal_key(&property.key, property.computed) {
-                        self.note(&name, property.key.span(), "destructure");
-                    } else {
-                        self.fail(
-                            property.key.span(),
-                            "unproved computed primordial destructuring key",
-                        );
-                    }
                 }
             }
         }
@@ -396,8 +396,8 @@ impl<'a> Visit<'a> for Uses<'_> {
                         end: site.end,
                         kind: "typed-array-tag",
                     });
-                    for name in self.typed_arrays.to_vec() {
-                        self.note(&name, member.span, "typed-array-tag-domain");
+                    for name in self.typed_arrays {
+                        self.note(name, member.span, "typed-array-tag-domain");
                     }
                 }
                 _ => self.fail(
@@ -442,10 +442,10 @@ impl<'a> Visit<'a> for Uses<'_> {
     }
 
     fn visit_simple_assignment_target(&mut self, target: &SimpleAssignmentTarget<'a>) {
-        if let SimpleAssignmentTarget::AssignmentTargetIdentifier(identifier) = target {
-            if DYNAMIC_BINDINGS.contains(&identifier.name.as_str()) {
-                self.helper_writes.push(identifier.span);
-            }
+        if let SimpleAssignmentTarget::AssignmentTargetIdentifier(identifier) = target
+            && DYNAMIC_BINDINGS.contains(&identifier.name.as_str())
+        {
+            self.helper_writes.push(identifier.span);
         }
         walk::walk_simple_assignment_target(self, target);
     }
@@ -476,24 +476,23 @@ impl<'a> Visit<'a> for Uses<'_> {
             && self.function_depth == 2
             && self.function.as_deref() == Some("formatRaw")
             && self.typed_guard
+            && let Statement::BlockStatement(block) = &statement.consequent
         {
-            if let Statement::BlockStatement(block) = &statement.consequent {
-                match reconstruction(block) {
-                    Ok(Some(branch)) => {
-                        for child in &block.body {
-                            self.dynamic_proved = child.span() == branch;
-                            self.visit_statement(child);
-                        }
-                        self.typed_guard = previous;
-                        self.dynamic_proved = proved;
-                        if let Some(alternate) = &statement.alternate {
-                            self.visit_statement(alternate);
-                        }
-                        return;
+            match reconstruction(block) {
+                Ok(Some(branch)) => {
+                    for child in &block.body {
+                        self.dynamic_proved = child.span() == branch;
+                        self.visit_statement(child);
                     }
-                    Ok(None) => {}
-                    Err(error) => self.errors.push(error),
+                    self.typed_guard = previous;
+                    self.dynamic_proved = proved;
+                    if let Some(alternate) = &statement.alternate {
+                        self.visit_statement(alternate);
+                    }
+                    return;
                 }
+                Ok(None) => {}
+                Err(error) => self.errors.push(error),
             }
         }
         self.visit_statement(&statement.consequent);

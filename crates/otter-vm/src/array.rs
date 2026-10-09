@@ -2987,14 +2987,12 @@ mod tests {
         let mut external_visit = |_visitor: &mut dyn FnMut(*mut RawGc)| {};
         let a = from_values_with_roots(
             &mut heap,
-            &mut vec![
-                Value::number_i32(0),
+            &mut [Value::number_i32(0),
                 Value::number_i32(1),
                 Value::number_i32(2),
                 Value::number_i32(3),
                 Value::number_i32(4),
-                Value::number_i32(5),
-            ],
+                Value::number_i32(5)],
             &mut external_visit,
         )
         .unwrap();

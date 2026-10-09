@@ -86,7 +86,7 @@ fn runtime(capture: Arc<Capture>) -> Runtime {
                         let _value = scope.string(&"x".repeat(16 * 1024 * 1024))?;
                         Ok(otter_runtime::Value::undefined())
                     })
-                    .map_err(|error| {
+                    .inspect_err(|error| {
                         if let NativeError::ExecutionFailure(otter_vm::RunError {
                             error:
                                 otter_vm::VmError::OutOfMemory {
@@ -94,7 +94,7 @@ fn runtime(capture: Arc<Capture>) -> Runtime {
                                     heap_limit_bytes,
                                 },
                             ..
-                        }) = &error
+                        }) = error
                         {
                             *allocation_capture
                                 .allocation_failure
@@ -102,7 +102,6 @@ fn runtime(capture: Arc<Capture>) -> Runtime {
                                 .unwrap_or_else(|poisoned| poisoned.into_inner()) =
                                 Some((*requested_bytes, *heap_limit_bytes));
                         }
-                        error
                     })
                 })),
             )?;

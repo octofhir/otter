@@ -40,11 +40,11 @@ impl RuntimeCall<'_> {
         let function = context
             .exec_function(self.function_id())
             .ok_or(crate::VmError::InvalidOperand)
-            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+            .map_err(CommittedValueError::Fatal)?;
         let instruction = function
             .instr_at_index(self.pc() as usize)
             .ok_or(crate::VmError::InvalidOperand)
-            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+            .map_err(CommittedValueError::Fatal)?;
         let bindings = function
             .forwarded_argument_bindings()
             .filter(|(_, storage)| {

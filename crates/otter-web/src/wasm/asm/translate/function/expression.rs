@@ -388,10 +388,10 @@ impl<'m, 'a> FunctionTranslator<'m, 'a> {
                 {
                     let ty = self.expression(&inner.argument)?;
                     if ty.is_a(AsmType::DOUBLE) {
-                        self.to_int32();
+                        self.int32_conversion();
                     } else if ty.is_a(AsmType::FLOATQ) {
                         self.emit(Instruction::F64PromoteF32);
-                        self.to_int32();
+                        self.int32_conversion();
                     } else {
                         return fail("expected double or float?");
                     }
@@ -410,7 +410,7 @@ impl<'m, 'a> FunctionTranslator<'m, 'a> {
     }
 
     /// `~~` of the double on the stack: JavaScript `ToInt32`.
-    pub(super) fn to_int32(&mut self) {
+    pub(super) fn int32_conversion(&mut self) {
         let value = self.temp(ValType::F64);
         self.emit(Instruction::LocalTee(value));
         self.emit(Instruction::F64Abs);

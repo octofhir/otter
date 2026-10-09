@@ -611,7 +611,7 @@ impl Interpreter {
             };
         }
         self.prevent_extensions_non_proxy(value)
-            .map_err(|error| CommittedValueError::JavaScript(error.into()))
+            .map_err(CommittedValueError::JavaScript)
     }
 
     /// The `[[PreventExtensions]]` family dispatch for every receiver kind
@@ -782,7 +782,7 @@ impl Interpreter {
             let desc = native
                 .own_property_descriptor(&mut self.gc_heap, "prototype")
                 .map_err(VmError::from)
-                .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                .map_err(CommittedValueError::JavaScript)?;
             let value = match desc {
                 Some(object::PropertyDescriptor {
                     kind: object::DescriptorKind::Data { value },
@@ -889,12 +889,12 @@ impl Interpreter {
     ) -> Result<VmPropertyKey<'static>, CommittedValueError> {
         if abstract_ops::is_primitive(&value) {
             return primitive_to_property_key(value, &self.gc_heap)
-                .map_err(|error| CommittedValueError::JavaScript(error.into()));
+                .map_err(CommittedValueError::JavaScript);
         }
         let primitive =
             self.to_primitive_sync(stack, context, value, abstract_ops::ToPrimitiveHint::String)?;
         primitive_to_property_key(primitive, &self.gc_heap)
-            .map_err(|error| CommittedValueError::JavaScript(error.into()))
+            .map_err(CommittedValueError::JavaScript)
     }
 
     /// §7.1.1 `ToPrimitive(value, hint)` — synchronous variant. See
@@ -941,7 +941,7 @@ impl Interpreter {
                     let proxy = target
                         .as_proxy()
                         .ok_or(VmError::InvalidOperand)
-                        .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                        .map_err(CommittedValueError::Fatal)?;
                     let trap_args: SmallVec<[Value; 8]> =
                         smallvec::smallvec![proxy.target(&interp.gc_heap)];
                     let trap_result = match interp.invoke_proxy_trap(
@@ -958,13 +958,13 @@ impl Interpreter {
                         .escape_scoped(proxy_root)
                         .as_proxy()
                         .ok_or(VmError::InvalidOperand)
-                        .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                        .map_err(CommittedValueError::Fatal)?;
                     let names = match trap_result {
                         Some(v) if v.as_array().is_some() => {
                             let arr = v
                                 .as_array()
                                 .ok_or(VmError::InvalidOperand)
-                                .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                                .map_err(CommittedValueError::Fatal)?;
                             crate::array::with_elements(arr, &interp.gc_heap, |elements| {
                                 elements
                                     .iter()
@@ -1139,7 +1139,7 @@ impl Interpreter {
                             function_id,
                             &key,
                         )
-                        .map_err(|error| CommittedValueError::JavaScript(error.into()))?
+                        .map_err(CommittedValueError::JavaScript)?
                         && desc.enumerable()
                     {
                         out.push(key);
@@ -1192,7 +1192,7 @@ impl Interpreter {
         if let Some(class) = target.as_class_constructor() {
             let keys = self
                 .class_constructor_own_property_keys(Some(context), class)
-                .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                .map_err(CommittedValueError::JavaScript)?;
             let mut out = Vec::with_capacity(keys.len());
             for key in keys {
                 if let Some(descriptor) = self.ordinary_get_own_property_descriptor_value(

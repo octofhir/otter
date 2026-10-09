@@ -154,7 +154,10 @@ impl Interpreter {
 
     /// Raise a failed system call, carrying the properties Node stamps on it.
     pub(crate) fn err_syscall(&self, payload: run_control::VmSyscallError) -> VmError {
-        self.raise(run_control::ErrorDetail::Syscall(payload), VmError::Coded)
+        self.raise(
+            run_control::ErrorDetail::Syscall(Box::new(payload)),
+            VmError::Coded,
+        )
     }
 
     /// Clone the in-flight error's dynamic detail, set by the `err_*` helpers.

@@ -56,7 +56,7 @@ impl Interpreter {
         let function = context
             .exec_function(function_id)
             .ok_or(VmError::InvalidOperand)
-            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+            .map_err(CommittedValueError::Fatal)?;
         self.record_call_attempt_feedback(function, call_pc);
         self.record_jit_runtime_stub_class(crate::native_abi::RuntimeStubClass::Reentrant);
         let receiver_anchor = self.push_iteration_anchor(receiver) - 1;
@@ -140,7 +140,7 @@ impl Interpreter {
                 let method_key = context
                     .property_atom_for_function(function_id, name_index)
                     .ok_or(VmError::InvalidOperand)
-                    .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                    .map_err(CommittedValueError::Fatal)?;
                 receiver = interp.iteration_anchor(receiver_anchor);
                 method = interp
                     .get_method_value_for_call(context, stack, receiver, method_key)?

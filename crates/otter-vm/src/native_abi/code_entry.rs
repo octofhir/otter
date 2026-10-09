@@ -363,6 +363,13 @@ const _: [(); 36] = [(); std::mem::offset_of!(CodeEntryCell, native_frame_code_o
 const _: [(); 56] = [(); std::mem::offset_of!(CodeEntryCell, generated_entries)];
 const _: [(); 64] = [(); std::mem::offset_of!(CodeEntryCell, generated_deopts)];
 
+/// Bit zero of the private JS generation input identifies a trampoline-staged
+/// request. The code cell itself remains the sole aligned generation owner;
+/// entries clear this bit before any generation-cell dereference and consume
+/// the request's genuine caller return address before publishing their frame.
+pub const CODE_ENTRY_STAGED_REQUEST_MASK: u64 = 1;
+const _: () = assert!(std::mem::align_of::<CodeEntryCell>() > 1);
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -414,10 +421,3 @@ mod tests {
         assert_eq!(std::mem::offset_of!(CodeEntryCell, native_frame_header), 24);
     }
 }
-
-/// Bit zero of the private JS generation input identifies a trampoline-staged
-/// request. The code cell itself remains the sole aligned generation owner;
-/// entries clear this bit before any generation-cell dereference and consume
-/// the request's genuine caller return address before publishing their frame.
-pub const CODE_ENTRY_STAGED_REQUEST_MASK: u64 = 1;
-const _: () = assert!(std::mem::align_of::<CodeEntryCell>() > 1);

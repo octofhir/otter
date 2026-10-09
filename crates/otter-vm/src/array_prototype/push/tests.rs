@@ -227,7 +227,7 @@ fn moving_push_case(
             );
             assert!(after.minor_root_slots_scanned > before.minor_root_slots_scanned);
             assert!(
-                after.minor_slot_updates >= before.minor_slot_updates + CHILDREN as u64 + 1,
+                after.minor_slot_updates > before.minor_slot_updates + CHILDREN as u64,
                 "receiver and every pending child root must be rewritten"
             );
             *ctx.this_value()

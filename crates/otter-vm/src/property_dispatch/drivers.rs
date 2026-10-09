@@ -68,21 +68,21 @@ impl Interpreter {
         let name = atomized_key.name();
         let top_idx = stack.len() - 1;
         let receiver = *read_register(&stack[top_idx], obj_reg)
-            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+            .map_err(CommittedValueError::Fatal)?;
         if let Some(value) = self.lookup_start_load(slot, receiver, atomized_key) {
             Self::finish_property_fast_path_value(&mut stack[top_idx], dst, value)
-                .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                .map_err(CommittedValueError::Fatal)?;
             return Ok(true);
         }
         // Preparing a function's bag can scavenge; re-read the rooted register.
         let receiver = *read_register(&stack[top_idx], obj_reg)
-            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+            .map_err(CommittedValueError::Fatal)?;
         if let Some(obj) = receiver.as_object() {
             // The site's handlers: one shape compare selects the entry.
             if let Some(value) = slot.probe_load(obj, &self.gc_heap) {
                 slot.record_hit();
                 Self::finish_property_fast_path_value(&mut stack[top_idx], dst, value)
-                    .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                    .map_err(CommittedValueError::Fatal)?;
                 return Ok(true);
             }
             slot.record_miss();
@@ -90,7 +90,7 @@ impl Interpreter {
             // it from its rooted register before the handler install and the
             // slow-path get both read its shape.
             let mut obj = read_register(&stack[top_idx], obj_reg)
-                .map_err(|error| CommittedValueError::Fatal(error.into()))?
+                .map_err(CommittedValueError::Fatal)?
                 .as_object()
                 .unwrap_or(obj);
             // Prepare bootstrap namespaces before the first optimizing/OSR
@@ -116,13 +116,13 @@ impl Interpreter {
             };
             if let Some(value) = value {
                 Self::finish_property_fast_path_value(&mut stack[top_idx], dst, value)
-                    .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                    .map_err(CommittedValueError::Fatal)?;
                 return Ok(true);
             }
             let key = VmPropertyKey::atom(atomized_key);
             stack[top_idx]
                 .advance_pc()
-                .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                .map_err(CommittedValueError::Fatal)?;
             match self.ordinary_get_value(
                 stack,
                 Some(context),
@@ -132,17 +132,17 @@ impl Interpreter {
                 0,
             )? {
                 VmGetOutcome::Value(value) => write_register(&mut stack[top_idx], dst, value)
-                    .map_err(|error| CommittedValueError::Fatal(error.into()))?,
+                    .map_err(CommittedValueError::Fatal)?,
                 VmGetOutcome::InvokeGetter { getter } => {
                     if abstract_ops::is_callable(&getter) {
                         let args: SmallVec<[Value; 8]> = SmallVec::new();
                         let receiver = *read_register(&stack[top_idx], obj_reg)
                             .map_err(CommittedValueError::Fatal)?;
                         self.invoke(stack, context, &getter, receiver, args, dst)
-                            .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                            .map_err(CommittedValueError::JavaScript)?;
                     } else {
                         write_register(&mut stack[top_idx], dst, Value::undefined())
-                            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                            .map_err(CommittedValueError::Fatal)?;
                     }
                 }
             }
@@ -162,18 +162,18 @@ impl Interpreter {
             let key = VmPropertyKey::atom(atomized_key);
             stack[top_idx]
                 .advance_pc()
-                .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                .map_err(CommittedValueError::Fatal)?;
             match self.ordinary_get_value(stack, Some(context), receiver, receiver, &key, 0)? {
                 VmGetOutcome::Value(value) => write_register(&mut stack[top_idx], dst, value)
-                    .map_err(|error| CommittedValueError::Fatal(error.into()))?,
+                    .map_err(CommittedValueError::Fatal)?,
                 VmGetOutcome::InvokeGetter { getter } => {
                     if abstract_ops::is_callable(&getter) {
                         let args: SmallVec<[Value; 8]> = SmallVec::new();
                         self.invoke(stack, context, &getter, receiver, args, dst)
-                            .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                            .map_err(CommittedValueError::JavaScript)?;
                     } else {
                         write_register(&mut stack[top_idx], dst, Value::undefined())
-                            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                            .map_err(CommittedValueError::Fatal)?;
                     }
                 }
             }
@@ -187,28 +187,28 @@ impl Interpreter {
         {
             let boxed = self
                 .box_sloppy_this_primitive_stack_rooted(stack, receiver, &[])
-                .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                .map_err(CommittedValueError::JavaScript)?;
             // Boxing can move a string, symbol or BigInt receiver. Its source
             // register is the existing root; the copied value is no longer live.
             let receiver = *read_register(&stack[top_idx], obj_reg)
-                .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                .map_err(CommittedValueError::Fatal)?;
             let key = VmPropertyKey::atom(atomized_key);
             stack[top_idx]
                 .advance_pc()
-                .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                .map_err(CommittedValueError::Fatal)?;
             match self.ordinary_get_value(stack, Some(context), boxed, receiver, &key, 0)? {
                 VmGetOutcome::Value(value) => write_register(&mut stack[top_idx], dst, value)
-                    .map_err(|error| CommittedValueError::Fatal(error.into()))?,
+                    .map_err(CommittedValueError::Fatal)?,
                 VmGetOutcome::InvokeGetter { getter } => {
                     if abstract_ops::is_callable(&getter) {
                         let args: SmallVec<[Value; 8]> = SmallVec::new();
                         let receiver = *read_register(&stack[top_idx], obj_reg)
-                            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                            .map_err(CommittedValueError::Fatal)?;
                         self.invoke(stack, context, &getter, receiver, args, dst)
-                            .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                            .map_err(CommittedValueError::JavaScript)?;
                     } else {
                         write_register(&mut stack[top_idx], dst, Value::undefined())
-                            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                            .map_err(CommittedValueError::Fatal)?;
                     }
                 }
             }
@@ -225,15 +225,15 @@ impl Interpreter {
                 }) => {
                     stack[top_idx]
                         .advance_pc()
-                        .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                        .map_err(CommittedValueError::Fatal)?;
                     match getter {
                         Some(callee) if abstract_ops::is_callable(&callee) => {
                             let args: SmallVec<[Value; 8]> = SmallVec::new();
                             self.invoke(stack, context, &callee, receiver, args, dst)
-                                .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                                .map_err(CommittedValueError::JavaScript)?;
                         }
                         _ => write_register(&mut stack[top_idx], dst, Value::undefined())
-                            .map_err(|error| CommittedValueError::Fatal(error.into()))?,
+                            .map_err(CommittedValueError::Fatal)?,
                     }
                     return Ok(true);
                 }
@@ -245,13 +245,13 @@ impl Interpreter {
                     if is_restricted_function_property(name)
                         && let Some(value) = self
                             .legacy_restricted_property(stack, context, receiver, name)
-                            .map_err(|error| CommittedValueError::JavaScript(error.into()))?
+                            .map_err(CommittedValueError::JavaScript)?
                     {
                         write_register(&mut stack[top_idx], dst, value)
-                            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                            .map_err(CommittedValueError::Fatal)?;
                         stack[top_idx]
                             .advance_pc()
-                            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                            .map_err(CommittedValueError::Fatal)?;
                         return Ok(true);
                     }
                     if let Some(object::PropertyDescriptor {
@@ -259,36 +259,36 @@ impl Interpreter {
                         ..
                     }) = object::get_own_descriptor(
                         self.function_prototype_object()
-                            .map_err(|error| CommittedValueError::JavaScript(error.into()))?,
+                            .map_err(CommittedValueError::JavaScript)?,
                         &self.gc_heap,
                         name,
                     ) {
                         stack[top_idx]
                             .advance_pc()
-                            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                            .map_err(CommittedValueError::Fatal)?;
                         match getter {
                             Some(callee) if abstract_ops::is_callable(&callee) => {
                                 let args: SmallVec<[Value; 8]> = SmallVec::new();
                                 self.invoke(stack, context, &callee, receiver, args, dst)
                                     .map_err(|error| {
-                                        CommittedValueError::JavaScript(error.into())
+                                        CommittedValueError::JavaScript(error)
                                     })?;
                             }
                             _ => write_register(&mut stack[top_idx], dst, Value::undefined())
-                                .map_err(|error| CommittedValueError::Fatal(error.into()))?,
+                                .map_err(CommittedValueError::Fatal)?,
                         }
                         return Ok(true);
                     }
                     if is_restricted_function_property(name) {
                         stack[top_idx]
                             .advance_pc()
-                            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                            .map_err(CommittedValueError::Fatal)?;
                         let callee = self
                             .restricted_throw_type_error()
-                            .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                            .map_err(CommittedValueError::JavaScript)?;
                         let args: SmallVec<[Value; 8]> = SmallVec::new();
                         self.invoke(stack, context, &callee, receiver, args, dst)
-                            .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                            .map_err(CommittedValueError::JavaScript)?;
                         return Ok(true);
                     }
                 }
@@ -353,32 +353,32 @@ impl Interpreter {
                 if is_restricted_function_property(name)
                     && let Some(value) = self
                         .legacy_restricted_property(stack, context, receiver, name)
-                        .map_err(|error| CommittedValueError::JavaScript(error.into()))?
+                        .map_err(CommittedValueError::JavaScript)?
                 {
                     write_register(&mut stack[top_idx], dst, value)
-                        .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                        .map_err(CommittedValueError::Fatal)?;
                     stack[top_idx]
                         .advance_pc()
-                        .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                        .map_err(CommittedValueError::Fatal)?;
                     return Ok(true);
                 }
                 let proto = self
                     .function_prototype_object()
-                    .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                    .map_err(CommittedValueError::JavaScript)?;
                 if let object::PropertyLookup::Accessor { getter, .. } =
                     object::lookup(proto, &self.gc_heap, name)
                 {
                     stack[top_idx]
                         .advance_pc()
-                        .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                        .map_err(CommittedValueError::Fatal)?;
                     match getter {
                         Some(callee) if abstract_ops::is_callable(&callee) => {
                             let args: SmallVec<[Value; 8]> = SmallVec::new();
                             self.invoke(stack, context, &callee, receiver, args, dst)
-                                .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                                .map_err(CommittedValueError::JavaScript)?;
                         }
                         _ => write_register(&mut stack[top_idx], dst, Value::undefined())
-                            .map_err(|error| CommittedValueError::Fatal(error.into()))?,
+                            .map_err(CommittedValueError::Fatal)?,
                     }
                     return Ok(true);
                 }
@@ -407,17 +407,17 @@ impl Interpreter {
             object::PropertyLookup::Accessor { getter, .. } => {
                 stack[top_idx]
                     .advance_pc()
-                    .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                    .map_err(CommittedValueError::Fatal)?;
                 match getter {
                     Some(callee) if abstract_ops::is_callable(&callee) => {
                         let args: SmallVec<[Value; 8]> = SmallVec::new();
                         self.invoke(stack, context, &callee, receiver, args, dst)
-                            .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                            .map_err(CommittedValueError::JavaScript)?;
                     }
                     _ => {
                         // §10.1.8.1 step 4.b — undefined.
                         write_register(&mut stack[top_idx], dst, Value::undefined())
-                            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                            .map_err(CommittedValueError::Fatal)?;
                     }
                 }
                 Ok(true)
@@ -436,16 +436,16 @@ impl Interpreter {
         operands: impl crate::executable::OperandSource,
     ) -> Result<bool, CommittedValueError> {
         let dst = register_operand(operands.first())
-            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+            .map_err(CommittedValueError::Fatal)?;
         let obj_reg = register_operand(operands.get(1))
-            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+            .map_err(CommittedValueError::Fatal)?;
         let key_reg = register_operand(operands.get(2))
-            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+            .map_err(CommittedValueError::Fatal)?;
         let top_idx = stack.len() - 1;
         let receiver = *read_register(&stack[top_idx], obj_reg)
-            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+            .map_err(CommittedValueError::Fatal)?;
         let key_value_raw = *read_register(&stack[top_idx], key_reg)
-            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+            .map_err(CommittedValueError::Fatal)?;
         // An own dense element of a plain array is the whole `[[Get]]` answer
         // and is the dominant computed-index shape. Everything below first
         // spells the index as a fresh heap string through `ToPropertyKey`,
@@ -459,10 +459,10 @@ impl Interpreter {
         {
             let frame = &mut stack[top_idx];
             write_register(frame, dst, value)
-                .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                .map_err(CommittedValueError::Fatal)?;
             frame
                 .advance_pc()
-                .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                .map_err(CommittedValueError::Fatal)?;
             return Ok(true);
         }
         // Key coercion, accessors and descriptor reads below may collect:
@@ -494,7 +494,7 @@ impl Interpreter {
         }
         let key_value = self.coerce_property_key_value(stack, context, key_value_raw)?;
         write_register(&mut stack[top_idx], key_reg, key_value)
-            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+            .map_err(CommittedValueError::Fatal)?;
         let receiver = self.escape_scoped(receiver_root);
         let key = if let Some(s) = key_value.as_string(&self.gc_heap) {
             VmPropertyKey::OwnedString(s.to_key_spelling(&self.gc_heap))
@@ -515,10 +515,10 @@ impl Interpreter {
         if prototype_routed {
             stack[top_idx]
                 .advance_pc()
-                .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                .map_err(CommittedValueError::Fatal)?;
             match self.ordinary_get_value(stack, Some(context), receiver, receiver, &key, 0)? {
                 VmGetOutcome::Value(value) => write_register(&mut stack[top_idx], dst, value)
-                    .map_err(|error| CommittedValueError::Fatal(error.into()))?,
+                    .map_err(CommittedValueError::Fatal)?,
                 VmGetOutcome::InvokeGetter { getter } => {
                     if abstract_ops::is_callable(&getter) {
                         let args: SmallVec<[Value; 8]> = SmallVec::new();
@@ -530,10 +530,10 @@ impl Interpreter {
                             args,
                             dst,
                         )
-                        .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                        .map_err(CommittedValueError::JavaScript)?;
                     } else {
                         write_register(&mut stack[top_idx], dst, Value::undefined())
-                            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                            .map_err(CommittedValueError::Fatal)?;
                     }
                 }
             }
@@ -551,7 +551,7 @@ impl Interpreter {
                 }) => {
                     stack[top_idx]
                         .advance_pc()
-                        .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                        .map_err(CommittedValueError::Fatal)?;
                     match getter {
                         Some(callee) if abstract_ops::is_callable(&callee) => {
                             let args: SmallVec<[Value; 8]> = SmallVec::new();
@@ -563,10 +563,10 @@ impl Interpreter {
                                 args,
                                 dst,
                             )
-                            .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                            .map_err(CommittedValueError::JavaScript)?;
                         }
                         _ => write_register(&mut stack[top_idx], dst, Value::undefined())
-                            .map_err(|error| CommittedValueError::Fatal(error.into()))?,
+                            .map_err(CommittedValueError::Fatal)?,
                     }
                     return Ok(true);
                 }
@@ -583,13 +583,13 @@ impl Interpreter {
                                 self.escape_scoped(receiver_root),
                                 key,
                             )
-                            .map_err(|error| CommittedValueError::JavaScript(error.into()))?
+                            .map_err(CommittedValueError::JavaScript)?
                     {
                         write_register(&mut stack[top_idx], dst, value)
-                            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                            .map_err(CommittedValueError::Fatal)?;
                         stack[top_idx]
                             .advance_pc()
-                            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                            .map_err(CommittedValueError::Fatal)?;
                         return Ok(true);
                     }
                     if let Some(object::PropertyDescriptor {
@@ -597,13 +597,13 @@ impl Interpreter {
                         ..
                     }) = object::get_own_descriptor(
                         self.function_prototype_object()
-                            .map_err(|error| CommittedValueError::JavaScript(error.into()))?,
+                            .map_err(CommittedValueError::JavaScript)?,
                         &self.gc_heap,
                         key,
                     ) {
                         stack[top_idx]
                             .advance_pc()
-                            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                            .map_err(CommittedValueError::Fatal)?;
                         match getter {
                             Some(callee) if abstract_ops::is_callable(&callee) => {
                                 let args: SmallVec<[Value; 8]> = SmallVec::new();
@@ -615,20 +615,20 @@ impl Interpreter {
                                     args,
                                     dst,
                                 )
-                                .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                                .map_err(CommittedValueError::JavaScript)?;
                             }
                             _ => write_register(&mut stack[top_idx], dst, Value::undefined())
-                                .map_err(|error| CommittedValueError::Fatal(error.into()))?,
+                                .map_err(CommittedValueError::Fatal)?,
                         }
                         return Ok(true);
                     }
                     if is_restricted_function_property(key) {
                         stack[top_idx]
                             .advance_pc()
-                            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                            .map_err(CommittedValueError::Fatal)?;
                         let callee = self
                             .restricted_throw_type_error()
-                            .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                            .map_err(CommittedValueError::JavaScript)?;
                         let args: SmallVec<[Value; 8]> = SmallVec::new();
                         self.invoke(
                             stack,
@@ -638,7 +638,7 @@ impl Interpreter {
                             args,
                             dst,
                         )
-                        .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                        .map_err(CommittedValueError::JavaScript)?;
                         return Ok(true);
                     }
                 }
@@ -652,13 +652,13 @@ impl Interpreter {
             if key.string_name().is_some_and(|key| key == "prototype") {
                 stack[top_idx]
                     .advance_pc()
-                    .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                    .map_err(CommittedValueError::Fatal)?;
                 write_register(
                     &mut stack[top_idx],
                     dst,
                     Value::object(class.prototype(&self.gc_heap)),
                 )
-                .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                .map_err(CommittedValueError::Fatal)?;
                 return Ok(true);
             }
             class.statics(&self.gc_heap)
@@ -688,15 +688,15 @@ impl Interpreter {
             object::PropertyLookup::Data { value, .. } => {
                 stack[top_idx]
                     .advance_pc()
-                    .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                    .map_err(CommittedValueError::Fatal)?;
                 write_register(&mut stack[top_idx], dst, value)
-                    .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                    .map_err(CommittedValueError::Fatal)?;
                 Ok(true)
             }
             object::PropertyLookup::Accessor { getter, .. } => {
                 stack[top_idx]
                     .advance_pc()
-                    .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                    .map_err(CommittedValueError::Fatal)?;
                 match getter {
                     Some(callee) if abstract_ops::is_callable(&callee) => {
                         let args: SmallVec<[Value; 8]> = SmallVec::new();
@@ -708,11 +708,11 @@ impl Interpreter {
                             args,
                             dst,
                         )
-                        .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                        .map_err(CommittedValueError::JavaScript)?;
                     }
                     _ => {
                         write_register(&mut stack[top_idx], dst, Value::undefined())
-                            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                            .map_err(CommittedValueError::Fatal)?;
                     }
                 }
                 Ok(true)
@@ -824,7 +824,7 @@ impl Interpreter {
     ) -> Result<bool, CommittedValueError> {
         let Some(base_object) = self
             .object_for_primitive_property_base_stack_rooted(stack, &receiver)
-            .map_err(|error| CommittedValueError::JavaScript(error.into()))?
+            .map_err(CommittedValueError::JavaScript)?
         else {
             return Ok(false);
         };
@@ -857,19 +857,19 @@ impl Interpreter {
                                     strict,
                                     format!("Cannot assign to read-only property '{name}'"),
                                 )
-                                .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                                .map_err(CommittedValueError::JavaScript)?;
                             } else {
                                 let name = key.string_name().unwrap_or("symbol");
                                 self.failed_set_result(
                                     strict,
                                     format!("Cannot assign to property '{name}' on primitive"),
                                 )
-                                .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                                .map_err(CommittedValueError::JavaScript)?;
                             }
                             let top_idx = stack.len() - 1;
                             stack[top_idx]
                                 .advance_pc()
-                                .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                                .map_err(CommittedValueError::Fatal)?;
                             return Ok(true);
                         }
                         object::PropertyLookup::Accessor { setter, .. } => {
@@ -878,23 +878,23 @@ impl Interpreter {
                                     strict,
                                     "Cannot assign to accessor property without a setter",
                                 )
-                                .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                                .map_err(CommittedValueError::JavaScript)?;
                                 let top_idx = stack.len() - 1;
                                 let pc = stack[top_idx].pc;
                                 stack[top_idx].pc = pc
                                     .checked_add(1)
                                     .ok_or(VmError::InvalidOperand)
-                                    .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                                    .map_err(CommittedValueError::Fatal)?;
                                 return Ok(true);
                             };
                             let top_idx = stack.len() - 1;
                             stack[top_idx]
                                 .advance_pc()
-                                .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                                .map_err(CommittedValueError::Fatal)?;
                             let mut args: SmallVec<[Value; 8]> = SmallVec::new();
                             args.push(value);
                             self.invoke(stack, context, &setter, receiver, args, scratch_reg)
-                                .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                                .map_err(CommittedValueError::JavaScript)?;
                             return Ok(true);
                         }
                         object::PropertyLookup::Absent => {
@@ -906,7 +906,7 @@ impl Interpreter {
                 {
                     let key_value = self
                         .vm_property_key_to_value(&key)
-                        .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                        .map_err(CommittedValueError::JavaScript)?;
                     let trap_args: SmallVec<[Value; 8]> = smallvec::smallvec![
                         proxy.target(&self.gc_heap),
                         key_value,
@@ -916,7 +916,7 @@ impl Interpreter {
                     let top_idx = stack.len() - 1;
                     stack[top_idx]
                         .advance_pc()
-                        .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                        .map_err(CommittedValueError::Fatal)?;
                     match self.invoke_proxy_trap(stack, Some(context), &proxy, "set", trap_args)? {
                         crate::object_internal_ops::ProxyTrap::Trapped(_) => {}
                         crate::object_internal_ops::ProxyTrap::NoTrap {
@@ -942,7 +942,7 @@ impl Interpreter {
                                             )
                                             .map_err(
                                                 |error| {
-                                                    CommittedValueError::JavaScript(error.into())
+                                                    CommittedValueError::JavaScript(error)
                                                 },
                                             )?;
                                         }
@@ -953,7 +953,7 @@ impl Interpreter {
                                             )
                                             .map_err(
                                                 |error| {
-                                                    CommittedValueError::JavaScript(error.into())
+                                                    CommittedValueError::JavaScript(error)
                                                 },
                                             )?;
                                         }
@@ -972,7 +972,7 @@ impl Interpreter {
                                                     "Cannot assign to symbol property",
                                                 )
                                                 .map_err(|error| {
-                                                    CommittedValueError::JavaScript(error.into())
+                                                    CommittedValueError::JavaScript(error)
                                                 })?;
                                             }
                                         }
@@ -997,7 +997,7 @@ impl Interpreter {
                                             )
                                             .map_err(
                                                 |error| {
-                                                    CommittedValueError::JavaScript(error.into())
+                                                    CommittedValueError::JavaScript(error)
                                                 },
                                             )?;
                                         }
@@ -1008,7 +1008,7 @@ impl Interpreter {
                                             )
                                             .map_err(
                                                 |error| {
-                                                    CommittedValueError::JavaScript(error.into())
+                                                    CommittedValueError::JavaScript(error)
                                                 },
                                             )?;
                                         }
@@ -1027,7 +1027,7 @@ impl Interpreter {
                                                     format!("Cannot assign to property '{key}'"),
                                                 )
                                                 .map_err(|error| {
-                                                    CommittedValueError::JavaScript(error.into())
+                                                    CommittedValueError::JavaScript(error)
                                                 })?;
                                             }
                                         }
@@ -1049,10 +1049,10 @@ impl Interpreter {
             strict,
             format!("Cannot assign to property '{name}' on primitive"),
         )
-        .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+        .map_err(CommittedValueError::JavaScript)?;
         stack[top_idx]
             .advance_pc()
-            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+            .map_err(CommittedValueError::Fatal)?;
         Ok(true)
     }
 
@@ -1078,17 +1078,17 @@ impl Interpreter {
         force_strict: bool,
     ) -> Result<bool, CommittedValueError> {
         let obj_reg = register_operand(operands.first())
-            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+            .map_err(CommittedValueError::Fatal)?;
         let name_idx = const_operand(operands.get(1))
-            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+            .map_err(CommittedValueError::Fatal)?;
         let src_reg = register_operand(operands.get(2))
-            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+            .map_err(CommittedValueError::Fatal)?;
         let scratch_reg = register_operand(operands.get(3))
-            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+            .map_err(CommittedValueError::Fatal)?;
         let atomized_key = context
             .property_atom(name_idx)
             .ok_or(VmError::InvalidOperand)
-            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+            .map_err(CommittedValueError::Fatal)?;
         let name = atomized_key.name();
         let top_idx = stack.len() - 1;
         let property_slot = context
@@ -1098,12 +1098,12 @@ impl Interpreter {
                 PropertyIcKind::Store,
             )
             .ok_or(VmError::InvalidOperand)
-            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+            .map_err(CommittedValueError::Fatal)?;
         property_slot.record_attempt();
         let receiver = *read_register(&stack[top_idx], obj_reg)
-            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+            .map_err(CommittedValueError::Fatal)?;
         let value = *read_register(&stack[top_idx], src_reg)
-            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+            .map_err(CommittedValueError::Fatal)?;
         // §15.7.1 — Op::StorePropertyStrict forces strict PutValue
         // failure semantics for class parts lowered into sloppy frames.
         let strict = force_strict || Self::current_frame_is_strict(stack, context);
@@ -1116,7 +1116,7 @@ impl Interpreter {
             {
                 property_slot.record_hit();
                 Self::advance_property_fast_path(&mut stack[top_idx])
-                    .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                    .map_err(CommittedValueError::JavaScript)?;
                 return Ok(true);
             }
             property_slot.record_miss();
@@ -1140,7 +1140,7 @@ impl Interpreter {
             ];
             stack[top_idx]
                 .advance_pc()
-                .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                .map_err(CommittedValueError::Fatal)?;
             match self.invoke_proxy_trap(stack, Some(context), &proxy, "set", trap_args)? {
                 crate::object_internal_ops::ProxyTrap::Trapped(result) => {
                     let ok = result.to_boolean(&self.gc_heap);
@@ -1149,7 +1149,7 @@ impl Interpreter {
                             strict,
                             format!("Cannot assign to property '{name}'"),
                         )
-                        .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                        .map_err(CommittedValueError::JavaScript)?;
                         return Ok(true);
                     }
                     // §10.5.9 step 13–14 invariants — when trap reports
@@ -1214,7 +1214,7 @@ impl Interpreter {
                             strict,
                             format!("Cannot assign to property '{name}'"),
                         )
-                        .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                        .map_err(CommittedValueError::JavaScript)?;
                     }
                 }
             }
@@ -1231,17 +1231,17 @@ impl Interpreter {
                 }) => {
                     let setter = setter
                         .ok_or(VmError::TypeMismatch)
-                        .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                        .map_err(CommittedValueError::JavaScript)?;
                     if !abstract_ops::is_callable(&setter) {
                         return Err(CommittedValueError::JavaScript(VmError::TypeMismatch));
                     }
                     stack[top_idx]
                         .advance_pc()
-                        .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                        .map_err(CommittedValueError::Fatal)?;
                     let mut args: SmallVec<[Value; 8]> = SmallVec::new();
                     args.push(value);
                     self.invoke(stack, context, &setter, receiver, args, scratch_reg)
-                        .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                        .map_err(CommittedValueError::JavaScript)?;
                     return Ok(true);
                 }
                 Some(_) => return Ok(false),
@@ -1251,36 +1251,36 @@ impl Interpreter {
                         ..
                     }) = object::get_own_descriptor(
                         self.function_prototype_object()
-                            .map_err(|error| CommittedValueError::JavaScript(error.into()))?,
+                            .map_err(CommittedValueError::JavaScript)?,
                         &self.gc_heap,
                         name,
                     ) {
                         let setter = setter
                             .ok_or(VmError::TypeMismatch)
-                            .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                            .map_err(CommittedValueError::JavaScript)?;
                         if !abstract_ops::is_callable(&setter) {
                             return Err(CommittedValueError::JavaScript(VmError::TypeMismatch));
                         }
                         stack[top_idx]
                             .advance_pc()
-                            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                            .map_err(CommittedValueError::Fatal)?;
                         let mut args: SmallVec<[Value; 8]> = SmallVec::new();
                         args.push(value);
                         self.invoke(stack, context, &setter, receiver, args, scratch_reg)
-                            .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                            .map_err(CommittedValueError::JavaScript)?;
                         return Ok(true);
                     }
                     if is_restricted_function_property(name) {
                         stack[top_idx]
                             .advance_pc()
-                            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                            .map_err(CommittedValueError::Fatal)?;
                         let callee = self
                             .restricted_throw_type_error()
-                            .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                            .map_err(CommittedValueError::JavaScript)?;
                         let mut args: SmallVec<[Value; 8]> = SmallVec::new();
                         args.push(value);
                         self.invoke(stack, context, &callee, receiver, args, scratch_reg)
-                            .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                            .map_err(CommittedValueError::JavaScript)?;
                         return Ok(true);
                     }
                 }
@@ -1335,14 +1335,14 @@ impl Interpreter {
             if !own_present && is_restricted_function_property(name) {
                 stack[top_idx]
                     .advance_pc()
-                    .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                    .map_err(CommittedValueError::Fatal)?;
                 let callee = self
                     .restricted_throw_type_error()
-                    .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                    .map_err(CommittedValueError::JavaScript)?;
                 let mut args: SmallVec<[Value; 8]> = SmallVec::new();
                 args.push(value);
                 self.invoke(stack, context, &callee, receiver, args, scratch_reg)
-                    .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                    .map_err(CommittedValueError::JavaScript)?;
                 return Ok(true);
             }
         }
@@ -1366,7 +1366,7 @@ impl Interpreter {
         } else if let Some(c) = receiver.as_class_constructor() {
             if self
                 .class_store_hits_readonly_intrinsic(context, c, name)
-                .map_err(|error| CommittedValueError::JavaScript(error.into()))?
+                .map_err(CommittedValueError::JavaScript)?
             {
                 return self
                     .finish_failed_set(
@@ -1375,7 +1375,7 @@ impl Interpreter {
                         force_strict,
                         format!("Cannot assign to read-only property '{name}' of class"),
                     )
-                    .map_err(|error| CommittedValueError::JavaScript(error.into()));
+                    .map_err(CommittedValueError::JavaScript);
             }
             c.statics(&self.gc_heap)
         } else if let Some(fid) = receiver.as_function().or_else(|| {
@@ -1387,7 +1387,7 @@ impl Interpreter {
             if function_metadata::ordinary_function_metadata_key(name).is_some() {
                 match self
                     .ordinary_function_own_property_descriptor(Some(context), owner, fid, name)
-                    .map_err(|error| CommittedValueError::JavaScript(error.into()))?
+                    .map_err(CommittedValueError::JavaScript)?
                 {
                     Some(desc) if !desc.writable() => {
                         return self
@@ -1397,7 +1397,7 @@ impl Interpreter {
                                 force_strict,
                                 format!("Cannot assign to read-only property '{name}' of function"),
                             )
-                            .map_err(|error| CommittedValueError::JavaScript(error.into()));
+                            .map_err(CommittedValueError::JavaScript);
                     }
                     // The virtual `name`/`length` was deleted: defer to the
                     // slow store funnel, which resolves the write along the
@@ -1425,7 +1425,7 @@ impl Interpreter {
                 Some(bag) => bag,
                 None => self
                     .function_user_bag_with_stack_roots(stack, owner, fid, &[&receiver, &value])
-                    .map_err(|error| CommittedValueError::JavaScript(error.into()))?,
+                    .map_err(CommittedValueError::JavaScript)?,
             }
         } else {
             return Ok(false);
@@ -1435,7 +1435,7 @@ impl Interpreter {
         // resolve (throwing under strict PutValue).
         if let Some(desc) = self
             .string_object_exotic_descriptor(obj, &VmPropertyKey::String(name))
-            .map_err(|error| CommittedValueError::JavaScript(error.into()))?
+            .map_err(CommittedValueError::JavaScript)?
             && !desc.writable()
         {
             return self
@@ -1445,7 +1445,7 @@ impl Interpreter {
                     force_strict,
                     format!("Cannot assign to read-only property '{name}' of string"),
                 )
-                .map_err(|error| CommittedValueError::JavaScript(error.into()));
+                .map_err(CommittedValueError::JavaScript);
         }
         let outcome = crate::object::resolve_set_atomized(obj, &self.gc_heap, atomized_key);
         match outcome {
@@ -1469,11 +1469,11 @@ impl Interpreter {
                             force_strict,
                             format!("Cannot assign to property '{name}'"),
                         )
-                        .map_err(|error| CommittedValueError::JavaScript(error.into()));
+                        .map_err(CommittedValueError::JavaScript);
                 }
                 stack[top_idx]
                     .advance_pc()
-                    .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                    .map_err(CommittedValueError::Fatal)?;
                 Ok(true)
             }
             object::SetOutcome::AssignData => {
@@ -1488,7 +1488,7 @@ impl Interpreter {
                         atomized_key,
                         &value,
                     )
-                    .map_err(|error| CommittedValueError::JavaScript(error.into()))?
+                    .map_err(CommittedValueError::JavaScript)?
                 } else {
                     None
                 };
@@ -1501,7 +1501,7 @@ impl Interpreter {
                     // bags are derived from the receiver and keep their handle.
                     let store_obj = if receiver.is_object() {
                         read_register(&stack[top_idx], obj_reg)
-                            .map_err(|error| CommittedValueError::Fatal(error.into()))?
+                            .map_err(CommittedValueError::Fatal)?
                             .as_object()
                             .unwrap_or(obj)
                     } else {
@@ -1509,7 +1509,7 @@ impl Interpreter {
                     };
                     if !self
                         .ordinary_set_data_property(store_obj, name, value)
-                        .map_err(|error| CommittedValueError::JavaScript(error.into()))?
+                        .map_err(CommittedValueError::JavaScript)?
                     {
                         return self
                             .finish_failed_set(
@@ -1518,7 +1518,7 @@ impl Interpreter {
                                 force_strict,
                                 format!("Cannot assign to property '{name}'"),
                             )
-                            .map_err(|error| CommittedValueError::JavaScript(error.into()));
+                            .map_err(CommittedValueError::JavaScript);
                     }
                 }
                 if receiver.is_object() {
@@ -1526,12 +1526,12 @@ impl Interpreter {
                     // relocating the receiver object; re-read the live handle
                     // from its rooted register before the IC probe touches it.
                     let Some(obj) = read_register(&stack[top_idx], obj_reg)
-                        .map_err(|error| CommittedValueError::Fatal(error.into()))?
+                        .map_err(CommittedValueError::Fatal)?
                         .as_object()
                     else {
                         stack[top_idx]
                             .advance_pc()
-                            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                            .map_err(CommittedValueError::Fatal)?;
                         return Ok(true);
                     };
                     if !property_slot.is_megamorphic()
@@ -1555,7 +1555,7 @@ impl Interpreter {
                 }
                 stack[top_idx]
                     .advance_pc()
-                    .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                    .map_err(CommittedValueError::Fatal)?;
                 Ok(true)
             }
             object::SetOutcome::InvokeSetter { setter } => {
@@ -1569,15 +1569,15 @@ impl Interpreter {
                             force_strict,
                             format!("Cannot assign to accessor property '{name}' without a setter"),
                         )
-                        .map_err(|error| CommittedValueError::JavaScript(error.into()));
+                        .map_err(CommittedValueError::JavaScript);
                 }
                 stack[top_idx]
                     .advance_pc()
-                    .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                    .map_err(CommittedValueError::Fatal)?;
                 let mut args: SmallVec<[Value; 8]> = SmallVec::new();
                 args.push(value);
                 self.invoke(stack, context, &setter, receiver, args, scratch_reg)
-                    .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                    .map_err(CommittedValueError::JavaScript)?;
                 Ok(true)
             }
             object::SetOutcome::Reject { .. } => self
@@ -1587,7 +1587,7 @@ impl Interpreter {
                     force_strict,
                     format!("Cannot assign to property '{name}'"),
                 )
-                .map_err(|error| CommittedValueError::JavaScript(error.into())),
+                .map_err(CommittedValueError::JavaScript),
         }
     }
 
@@ -1600,24 +1600,24 @@ impl Interpreter {
         operands: impl crate::executable::OperandSource,
     ) -> Result<bool, CommittedValueError> {
         let dst = register_operand(operands.first())
-            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+            .map_err(CommittedValueError::Fatal)?;
         let obj_reg = register_operand(operands.get(1))
-            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+            .map_err(CommittedValueError::Fatal)?;
         let name_idx = const_operand(operands.get(2))
-            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+            .map_err(CommittedValueError::Fatal)?;
         let atomized_key = context
             .property_atom(name_idx)
             .ok_or(VmError::InvalidOperand)
-            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+            .map_err(CommittedValueError::Fatal)?;
         let top_idx = stack.len() - 1;
         let receiver = *read_register(&stack[top_idx], obj_reg)
-            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+            .map_err(CommittedValueError::Fatal)?;
         let Some(proxy) = receiver.as_proxy() else {
             return Ok(false);
         };
         stack[top_idx]
             .advance_pc()
-            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+            .map_err(CommittedValueError::Fatal)?;
         let removed = self.ordinary_delete_value(
             stack,
             context,
@@ -1634,7 +1634,7 @@ impl Interpreter {
             ));
         }
         write_register(&mut stack[top_idx], dst, Value::boolean(removed))
-            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+            .map_err(CommittedValueError::Fatal)?;
         Ok(true)
     }
 
@@ -1647,24 +1647,24 @@ impl Interpreter {
         operands: impl crate::executable::OperandSource,
     ) -> Result<bool, CommittedValueError> {
         let dst = register_operand(operands.first())
-            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+            .map_err(CommittedValueError::Fatal)?;
         let obj_reg = register_operand(operands.get(1))
-            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+            .map_err(CommittedValueError::Fatal)?;
         let idx_reg = register_operand(operands.get(2))
-            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+            .map_err(CommittedValueError::Fatal)?;
         let top_idx = stack.len() - 1;
         let receiver = *read_register(&stack[top_idx], obj_reg)
-            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+            .map_err(CommittedValueError::Fatal)?;
         if !receiver.is_proxy() {
             return Ok(false);
         }
         let idx = *read_register(&stack[top_idx], idx_reg)
-            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+            .map_err(CommittedValueError::Fatal)?;
         let key = Self::coerce_vm_property_key(Some(&idx), &self.gc_heap)
-            .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+            .map_err(CommittedValueError::JavaScript)?;
         stack[top_idx]
             .advance_pc()
-            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+            .map_err(CommittedValueError::Fatal)?;
         let removed = self.ordinary_delete_value(stack, context, receiver, &key, 0)?;
         let strict = context.function_is_strict(stack[top_idx].function_id);
         if !removed && strict {
@@ -1673,7 +1673,7 @@ impl Interpreter {
             ));
         }
         write_register(&mut stack[top_idx], dst, Value::boolean(removed))
-            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+            .map_err(CommittedValueError::Fatal)?;
         Ok(true)
     }
 }

@@ -65,10 +65,7 @@ pub(super) fn validate(
             && scope == SCOPE
             && clock == CLOCK
             && *warmup_count == manifest.sampling.warmup_count
-            && *sample_count == manifest.sampling.sample_count =>
-        {
-            ()
-        }
+            && *sample_count == manifest.sampling.sample_count => {}
         _ => return Err(reject("missing or foreign Ready record")),
     }
     match records.last() {
@@ -78,10 +75,7 @@ pub(super) fn validate(
             sample_count,
         }) if *anchor == manifest.anchor
             && *warmup_count == manifest.sampling.warmup_count
-            && *sample_count == manifest.sampling.sample_count =>
-        {
-            ()
-        }
+            && *sample_count == manifest.sampling.sample_count => {}
         _ => return Err(reject("missing or foreign Complete record")),
     }
     let mut result = ValidatedWarmRun {

@@ -760,7 +760,8 @@ pub const ARRAY_CONSTRUCT_ALLOC: AllocValueStub = AllocValueStub {
 };
 
 mod string;
-pub use string::{primitive_string_order, string_concat_alloc};
+pub(crate) use string::primitive_string_order;
+pub use string::string_concat_alloc;
 mod bigint;
 pub use bigint::bigint_binary_alloc;
 
@@ -1341,11 +1342,10 @@ fn create_context_alloc_inner(
             if owns_this.is_some() {
                 // SAFETY: the typed call root provider keeps this current frame
                 // published. Allocation finished; this store cannot GC/reenter.
-                if let Some(frame) = unsafe { ctx.current_frame().as_mut() } {
-                    if let Some(handle) = value.as_context() {
+                if let Some(frame) = unsafe { ctx.current_frame().as_mut() }
+                    && let Some(handle) = value.as_context() {
                         frame.publish_derived_this_context(function_id, handle);
                     }
-                }
             }
             NativeResultPair::success(value)
         }

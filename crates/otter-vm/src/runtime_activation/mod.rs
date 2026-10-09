@@ -161,7 +161,7 @@ impl<'a> RuntimeCall<'a> {
     ) -> Result<(), CommittedValueError> {
         let frame_index = self
             .frame_index()
-            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+            .map_err(CommittedValueError::Fatal)?;
         let vm = unsafe { &mut *self.vm.as_ptr() };
         let stack = unsafe { &mut *self.stack.as_ptr() };
         let context = (*self.context).clone();
@@ -192,7 +192,7 @@ impl<'a> RuntimeCall<'a> {
     ) -> Result<(), CommittedValueError> {
         let frame_index = self
             .frame_index()
-            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+            .map_err(CommittedValueError::Fatal)?;
         let vm = unsafe { &mut *self.vm.as_ptr() };
         let stack = unsafe { &mut *self.stack.as_ptr() };
         let context = (*self.context).clone();

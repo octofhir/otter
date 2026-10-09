@@ -1539,7 +1539,7 @@ impl ErrorStackBody {
         // SAFETY: the arena follows the records.
         unsafe {
             self.records_ptr()
-                .add(self.frame_count as usize)
+                .add(self.frame_count)
                 .cast::<u8>()
         }
     }
@@ -1548,8 +1548,8 @@ impl ErrorStackBody {
         // SAFETY: written from `&str` at capture; inside `byte_len`.
         unsafe {
             std::str::from_utf8_unchecked(std::slice::from_raw_parts(
-                self.bytes_ptr().add(offset as usize).cast_const(),
-                len as usize,
+                self.bytes_ptr().add(offset).cast_const(),
+                len,
             ))
         }
     }

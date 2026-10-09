@@ -510,9 +510,7 @@ impl Interpreter {
                         }),
                     }
                 });
-                if let Err(error) = outcome {
-                    return Err(error);
-                }
+                outcome?;
             }
             if !self.microtasks.has_any_pending() {
                 return Ok(());

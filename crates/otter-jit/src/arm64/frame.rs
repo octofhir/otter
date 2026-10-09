@@ -302,7 +302,7 @@ pub(crate) fn emit_call_entry(
     let origin_ready = ops.new_dynamic_label();
     dynasm!(ops ; .arch aarch64
         ; tbz x8, 0, =>direct_origin
-        ; and x8, x8, !(abi::CODE_ENTRY_STAGED_REQUEST_MASK as u64)
+        ; and x8, x8, !abi::CODE_ENTRY_STAGED_REQUEST_MASK
         ; ldr x16, [x20, crate::entry::PENDING_CALL_OFFSET + abi::REQUEST_CALLER_RETURN_PC_OFFSET]
         ; cmp x16, 0
         ; csinc x16, x16, xzr, ne

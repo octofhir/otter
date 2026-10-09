@@ -191,8 +191,7 @@ pub fn install_collection_well_knowns_post_bootstrap(
         // is preserved.
         if let (Some(method_name), Some(_)) = (alias_method, alias_kind)
             && let Some(method_value) = object::get(prototype, heap, method_name)
-        {
-            if !object::define_own_symbol_property_partial(
+            && !object::define_own_symbol_property_partial(
                 &mut prototype,
                 heap,
                 iterator_sym,
@@ -206,7 +205,6 @@ pub fn install_collection_well_knowns_post_bootstrap(
             )? {
                 return Err(JsSurfaceError::DefinePropertyFailed("[[SymbolProperty]]"));
             };
-        }
         // §24.2.3.6 — `Set.prototype.keys` is the same function
         // object as `Set.prototype.values`. The individual `method`
         // builder allocates a fresh NativeFunction per name; overwrite
@@ -214,8 +212,7 @@ pub fn install_collection_well_knowns_post_bootstrap(
         // === Set.prototype.values`.
         if matches!(alias_kind, Some(CollectionKind::Set))
             && let Some(values_value) = object::get(prototype, heap, "values")
-        {
-            if !object::define_own_property_partial(
+            && !object::define_own_property_partial(
                 &mut prototype,
                 heap,
                 "keys",
@@ -229,7 +226,6 @@ pub fn install_collection_well_knowns_post_bootstrap(
             )? {
                 return Err(JsSurfaceError::DefinePropertyFailed("[[BuiltinProperty]]"));
             };
-        }
     }
     Ok(())
 }
@@ -710,8 +706,8 @@ fn build_adder_args<'s>(
     let key = match read_indexed_property(scope, context, next_h, "0") {
         Ok(v) => v,
         Err(err) => {
-            if let Some(iterator_h) = iterator_for_close {
-                if matches!(&err, CommittedValueError::JavaScript(_)) {
+            if let Some(iterator_h) = iterator_for_close
+                && matches!(&err, CommittedValueError::JavaScript(_)) {
                     iterator_close::preserving_completion(
                         scope,
                         Some(context),
@@ -719,7 +715,6 @@ fn build_adder_args<'s>(
                         ctor_name,
                     )?;
                 }
-            }
             return Err(err.into_native(scope.context().interp_mut(), ctor_name));
         }
     };
@@ -729,8 +724,8 @@ fn build_adder_args<'s>(
     let value = match read_indexed_property(scope, context, next_h, "1") {
         Ok(v) => v,
         Err(err) => {
-            if let Some(iterator_h) = iterator_for_close {
-                if matches!(&err, CommittedValueError::JavaScript(_)) {
+            if let Some(iterator_h) = iterator_for_close
+                && matches!(&err, CommittedValueError::JavaScript(_)) {
                     iterator_close::preserving_completion(
                         scope,
                         Some(context),
@@ -738,7 +733,6 @@ fn build_adder_args<'s>(
                         ctor_name,
                     )?;
                 }
-            }
             return Err(err.into_native(scope.context().interp_mut(), ctor_name));
         }
     };

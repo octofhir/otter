@@ -92,14 +92,14 @@ mod tests {
                 code: "ERR_PREVIOUS",
                 message: "previous coded error".into(),
             }),
-            ErrorDetail::Syscall(VmSyscallError {
+            ErrorDetail::Syscall(Box::new(VmSyscallError {
                 code: "ENOENT",
                 message: "previous syscall".into(),
                 syscall: "open",
                 path: None,
                 dest: None,
                 errno: -2,
-            }),
+            })),
         ]
     }
 

@@ -52,10 +52,10 @@ impl Interpreter {
                 let atom = context
                     .property_atom_for_function(stack[frame_index].function_id, arg2 as u32)
                     .ok_or(VmError::InvalidOperand)
-                    .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                    .map_err(CommittedValueError::Fatal)?;
                 let name = atom.name();
                 let home = *read_register(&stack[frame_index], arg1 as u16)
-                    .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                    .map_err(CommittedValueError::Fatal)?;
                 self.run_load_super_property(
                     context,
                     stack,
@@ -68,9 +68,9 @@ impl Interpreter {
             value if value == Op::LoadSuperElement as u8 => {
                 let dst = arg0 as u16;
                 let home = *read_register(&stack[frame_index], arg1 as u16)
-                    .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                    .map_err(CommittedValueError::Fatal)?;
                 let key_raw = *read_register(&stack[frame_index], arg2 as u16)
-                    .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                    .map_err(CommittedValueError::Fatal)?;
                 self.run_load_super_property(
                     context,
                     stack,
@@ -84,12 +84,12 @@ impl Interpreter {
                 let atom = context
                     .property_atom_for_function(stack[frame_index].function_id, arg1 as u32)
                     .ok_or(VmError::InvalidOperand)
-                    .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                    .map_err(CommittedValueError::Fatal)?;
                 let name = atom.name();
                 let home = *read_register(&stack[frame_index], arg0 as u16)
-                    .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                    .map_err(CommittedValueError::Fatal)?;
                 let value = *read_register(&stack[frame_index], arg2 as u16)
-                    .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                    .map_err(CommittedValueError::Fatal)?;
                 self.run_store_super_property(
                     context,
                     stack,
@@ -102,11 +102,11 @@ impl Interpreter {
             }
             value if value == Op::SetSuperElement as u8 => {
                 let home = *read_register(&stack[frame_index], arg0 as u16)
-                    .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                    .map_err(CommittedValueError::Fatal)?;
                 let key_raw = *read_register(&stack[frame_index], arg1 as u16)
-                    .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                    .map_err(CommittedValueError::Fatal)?;
                 let value = *read_register(&stack[frame_index], arg2 as u16)
-                    .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                    .map_err(CommittedValueError::Fatal)?;
                 self.run_store_super_property(
                     context,
                     stack,

@@ -50,7 +50,7 @@ impl ByteStorage {
     /// is a large asm.js heap length and the platform maps reservations,
     /// otherwise `None` so the caller allocates on the heap.
     pub(crate) fn reserved_zeroed(len: usize) -> Option<Self> {
-        if !(len >= 1 << 24 && len % (1 << 24) == 0 && len <= 1 << 31) {
+        if !(len >= 1 << 24 && len.is_multiple_of(1 << 24) && len <= 1 << 31) {
             return None;
         }
         Reservation::map(len).map(Self::Reserved)

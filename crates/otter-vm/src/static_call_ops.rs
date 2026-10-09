@@ -203,16 +203,16 @@ impl Interpreter {
         let (dst, target) = {
             let frame = &stack[top_idx];
             let dst = register_operand(operands.first())
-                .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                .map_err(CommittedValueError::Fatal)?;
             let src = register_operand(operands.get(1))
-                .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                .map_err(CommittedValueError::Fatal)?;
             let target = *read_register(frame, src)
-                .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                .map_err(CommittedValueError::Fatal)?;
             (dst, target)
         };
         if let Some(keys) = self
             .for_in_cached_keys(target)
-            .map_err(|error| CommittedValueError::JavaScript(error.into()))?
+            .map_err(CommittedValueError::JavaScript)?
         {
             return finish_static_call(&mut stack[top_idx], dst, keys)
                 .map_err(CommittedValueError::Fatal);
@@ -220,7 +220,7 @@ impl Interpreter {
         let keys = self.enumerable_for_in_string_keys_for_value(stack, context, target)?;
         let names = self
             .scoped_key_strings(&keys)
-            .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+            .map_err(CommittedValueError::JavaScript)?;
         finish_static_call(&mut stack[top_idx], dst, names).map_err(CommittedValueError::Fatal)
     }
 
@@ -240,18 +240,18 @@ impl Interpreter {
         let (target, src, excluded_value) = {
             let frame = &stack[top_idx];
             let target_reg = register_operand(operands.first())
-                .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                .map_err(CommittedValueError::Fatal)?;
             let src_reg = register_operand(operands.get(1))
-                .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                .map_err(CommittedValueError::Fatal)?;
             let excluded_reg = register_operand(operands.get(2))
-                .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                .map_err(CommittedValueError::Fatal)?;
             (
                 *read_register(frame, target_reg)
-                    .map_err(|error| CommittedValueError::Fatal(error.into()))?,
+                    .map_err(CommittedValueError::Fatal)?,
                 *read_register(frame, src_reg)
-                    .map_err(|error| CommittedValueError::Fatal(error.into()))?,
+                    .map_err(CommittedValueError::Fatal)?,
                 *read_register(frame, excluded_reg)
-                    .map_err(|error| CommittedValueError::Fatal(error.into()))?,
+                    .map_err(CommittedValueError::Fatal)?,
             )
         };
         let excluded: Vec<Value> = match excluded_value.as_array() {
@@ -268,7 +268,7 @@ impl Interpreter {
         let frame = &mut stack[top_idx];
         frame
             .advance_pc()
-            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+            .map_err(CommittedValueError::Fatal)?;
         Ok(())
     }
 
@@ -288,9 +288,9 @@ impl Interpreter {
     ) -> Result<(), CommittedValueError> {
         let top_idx = stack.len() - 1;
         let target_reg = register_operand(operands.first())
-            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+            .map_err(CommittedValueError::Fatal)?;
         let src_reg = register_operand(operands.get(1))
-            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+            .map_err(CommittedValueError::Fatal)?;
         self.run_star_reexport_regs(context, stack, top_idx, target_reg, src_reg)
     }
 
@@ -303,18 +303,18 @@ impl Interpreter {
         src_reg: u16,
     ) -> Result<(), CommittedValueError> {
         let target = *read_register(&stack[frame_index], target_reg)
-            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+            .map_err(CommittedValueError::Fatal)?;
         if target.is_object() {
             let existing: std::collections::HashSet<String> = self
                 .enumerable_own_string_keys_for_value(stack, context, target, 0)?
                 .into_iter()
                 .collect();
             let src = *read_register(&stack[frame_index], src_reg)
-                .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                .map_err(CommittedValueError::Fatal)?;
             if !src.is_object() {
                 stack[frame_index]
                     .advance_pc()
-                    .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                    .map_err(CommittedValueError::Fatal)?;
                 return Ok(());
             }
             let names = self.enumerable_own_string_keys_for_value(stack, context, src, 0)?;
@@ -323,25 +323,25 @@ impl Interpreter {
                     continue;
                 }
                 let mut target_obj = read_register(&stack[frame_index], target_reg)
-                    .map_err(|error| CommittedValueError::Fatal(error.into()))?
+                    .map_err(CommittedValueError::Fatal)?
                     .as_object()
                     .ok_or(VmError::TypeMismatch)
-                    .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                    .map_err(CommittedValueError::JavaScript)?;
                 let src_obj = read_register(&stack[frame_index], src_reg)
-                    .map_err(|error| CommittedValueError::Fatal(error.into()))?
+                    .map_err(CommittedValueError::Fatal)?
                     .as_object()
                     .ok_or(VmError::TypeMismatch)
-                    .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                    .map_err(CommittedValueError::JavaScript)?;
                 if let Some(value) = crate::object::get(src_obj, &self.gc_heap, &name) {
                     self.create_data_property(&mut target_obj, &name, value)
-                        .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                        .map_err(CommittedValueError::JavaScript)?;
                 }
             }
         }
         let frame = &mut stack[frame_index];
         frame
             .advance_pc()
-            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+            .map_err(CommittedValueError::Fatal)?;
         Ok(())
     }
 
@@ -356,16 +356,16 @@ impl Interpreter {
         operands: impl crate::executable::OperandSource,
     ) -> Result<(), CommittedValueError> {
         let target_reg = register_operand(operands.first())
-            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+            .map_err(CommittedValueError::Fatal)?;
         let key_reg = register_operand(operands.get(1))
-            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+            .map_err(CommittedValueError::Fatal)?;
         let descriptor_reg = register_operand(operands.get(2))
-            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+            .map_err(CommittedValueError::Fatal)?;
         let top_idx = stack
             .len()
             .checked_sub(1)
             .ok_or(VmError::InvalidOperand)
-            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+            .map_err(CommittedValueError::Fatal)?;
         self.run_define_own_property_regs(
             context,
             stack,
@@ -388,17 +388,17 @@ impl Interpreter {
         let frame = stack
             .get(frame_index)
             .ok_or(VmError::InvalidOperand)
-            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+            .map_err(CommittedValueError::Fatal)?;
         let target = *read_register(frame, target_reg)
-            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+            .map_err(CommittedValueError::Fatal)?;
         let key_value = *read_register(frame, key_reg)
-            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+            .map_err(CommittedValueError::Fatal)?;
         let desc_value = *read_register(frame, descriptor_reg)
-            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+            .map_err(CommittedValueError::Fatal)?;
         self.define_own_property_values(stack, context, target, key_value, desc_value)?;
         stack[frame_index]
             .advance_pc()
-            .map_err(|error| CommittedValueError::Fatal(error.into()))
+            .map_err(CommittedValueError::Fatal)
     }
 
     /// `Op::DefineMember` — a data property (§10.2.8 DefineMethodProperty,
@@ -418,15 +418,15 @@ impl Interpreter {
         let frame = stack
             .get(frame_index)
             .ok_or(VmError::InvalidOperand)
-            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+            .map_err(CommittedValueError::Fatal)?;
         let target = *read_register(frame, target_reg)
-            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+            .map_err(CommittedValueError::Fatal)?;
         let key_value = *read_register(frame, key_reg)
-            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+            .map_err(CommittedValueError::Fatal)?;
         let value = *read_register(frame, value_reg)
-            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+            .map_err(CommittedValueError::Fatal)?;
         if !target.is_object_type() {
-            return Err(CommittedValueError::Fatal(VmError::InvalidOperand.into()));
+            return Err(CommittedValueError::Fatal(VmError::InvalidOperand));
         }
         self.with_handle_scope(|interp, scope| {
             let target = interp.scoped_value(scope, target);
@@ -456,7 +456,7 @@ impl Interpreter {
         })?;
         stack[frame_index]
             .advance_pc()
-            .map_err(|error| CommittedValueError::Fatal(error.into()))
+            .map_err(CommittedValueError::Fatal)
     }
 
     /// Apply a property descriptor through the canonical activation.
@@ -529,7 +529,7 @@ impl Interpreter {
                         .escape_scoped(symbol)
                         .as_symbol(&interp.gc_heap)
                         .ok_or(VmError::InvalidOperand)
-                        .map_err(|error| CommittedValueError::Fatal(error.into()))?,
+                        .map_err(CommittedValueError::Fatal)?,
                 ),
             };
             let target = interp.escape_scoped(target);
@@ -579,7 +579,7 @@ impl Interpreter {
         }
         let mut obj = self
             .alloc_stack_rooted_object_with_value_roots(stack, &[&proto], args)
-            .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+            .map_err(CommittedValueError::JavaScript)?;
         let proto_value = if proto.is_null() { None } else { Some(proto) };
         if !object::set_prototype_value(&mut obj, &mut self.gc_heap, proto_value)
             .map_err(|error| CommittedValueError::JavaScript(error.into()))?
@@ -846,7 +846,7 @@ impl Interpreter {
             } else {
                 interp
                     .box_sloppy_this_primitive_stack_rooted(stack, target_input, &[args])
-                    .map_err(|error| CommittedValueError::JavaScript(error.into()))?
+                    .map_err(CommittedValueError::JavaScript)?
             };
             // Copying a source can allocate or reenter JavaScript. Keep the
             // target in one canonical handle for the whole operation and
@@ -924,7 +924,7 @@ impl Interpreter {
                 let target = args.first().cloned().unwrap_or(Value::undefined());
                 let keys = self.enumerable_for_in_string_keys_for_value(stack, context, target)?;
                 Ok(Some(self.scoped_key_strings(&keys).map_err(|error| {
-                    CommittedValueError::JavaScript(error.into())
+                    CommittedValueError::JavaScript(error)
                 })?))
             }
             M::Keys => {
@@ -962,7 +962,7 @@ impl Interpreter {
                     _ => return Err(CommittedValueError::JavaScript(VmError::TypeMismatch)),
                 };
                 Ok(Some(self.scoped_key_strings(&owned).map_err(|error| {
-                    CommittedValueError::JavaScript(error.into())
+                    CommittedValueError::JavaScript(error)
                 })?))
             }
             M::Values => {
@@ -990,7 +990,7 @@ impl Interpreter {
                         let units = s.to_utf16_vec(&self.gc_heap);
                         return Ok(Some(
                             self.scoped_code_unit_strings(&units)
-                                .map_err(|error| CommittedValueError::JavaScript(error.into()))?,
+                                .map_err(CommittedValueError::JavaScript)?,
                         ));
                     }
                     Some(target) if enumerable_own_names_uses_internal_methods(target) => {
@@ -1008,7 +1008,7 @@ impl Interpreter {
                         &[],
                         &[args],
                     )
-                    .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                    .map_err(CommittedValueError::JavaScript)?;
                 Ok(Some(Value::array(array)))
             }
             M::Entries => {
@@ -1087,7 +1087,7 @@ impl Interpreter {
                                 &[],
                                 &[args],
                             )
-                            .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                            .map_err(CommittedValueError::JavaScript)?;
                         // Park the freshly built pair so later pair allocations
                         // never strand it.
                         pair_handles.push(interp.scoped_value(scope, Value::array(pair)));
@@ -1127,7 +1127,7 @@ impl Interpreter {
                     // §20.1.2.7 step 2 — OrdinaryObjectCreate(%Object.prototype%).
                     let result = interp
                         .scoped_object(scope)
-                        .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                        .map_err(CommittedValueError::JavaScript)?;
                     let (iterator, next_method) = interp.get_iterator_sync(
                         stack,
                         context,
@@ -1248,7 +1248,7 @@ impl Interpreter {
             }
             M::GetOwnPropertyDescriptor => {
                 let key = Self::coerce_vm_property_key(args.get(1), &self.gc_heap)
-                    .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                    .map_err(CommittedValueError::JavaScript)?;
                 let Some(target) = args.first() else {
                     return Err(CommittedValueError::JavaScript(
                         self.err_type(
@@ -1328,7 +1328,7 @@ impl Interpreter {
                                         t.get(&mut self.gc_heap, idx)
                                             .map_err(crate::oom_to_vm)
                                             .map_err(|error| {
-                                                CommittedValueError::JavaScript(error.into())
+                                                CommittedValueError::JavaScript(error)
                                             })?,
                                         true,
                                         true,
@@ -1384,7 +1384,7 @@ impl Interpreter {
                     Some(desc) => self.with_handle_scope(|interp, scope| {
                         let result = interp
                             .scoped_descriptor_object(scope, &desc)
-                            .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                            .map_err(CommittedValueError::JavaScript)?;
                         Ok(Some(interp.escape_scoped(result)))
                     }),
                     None => Ok(Some(Value::undefined())),
@@ -1433,7 +1433,7 @@ impl Interpreter {
                     let target_h = interp.scoped_value(scope, target);
                     let result = interp
                         .scoped_object(scope)
-                        .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                        .map_err(CommittedValueError::JavaScript)?;
 
                     if target.is_boolean()
                         || target.is_number()
@@ -1450,7 +1450,7 @@ impl Interpreter {
                                 interp.gc_heap_mut(),
                             )
                             .map_err(|_| VmError::TypeMismatch)
-                            .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                            .map_err(CommittedValueError::JavaScript)?;
                             let desc = crate::object::PropertyDescriptor::data(
                                 Value::string(unit),
                                 false,
@@ -1459,10 +1459,10 @@ impl Interpreter {
                             );
                             let desc_h = interp
                                 .scoped_descriptor_object(scope, &desc)
-                                .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                                .map_err(CommittedValueError::JavaScript)?;
                             interp
                                 .scoped_set(scope, result, &i.to_string(), desc_h)
-                                .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                                .map_err(CommittedValueError::JavaScript)?;
                         }
                         let length_desc = crate::object::PropertyDescriptor::data(
                             Value::number_f64(units.len() as f64),
@@ -1472,10 +1472,10 @@ impl Interpreter {
                         );
                         let length_h = interp
                             .scoped_descriptor_object(scope, &length_desc)
-                            .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                            .map_err(CommittedValueError::JavaScript)?;
                         interp
                             .scoped_set(scope, result, "length", length_h)
-                            .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                            .map_err(CommittedValueError::JavaScript)?;
                     } else if own_property_descriptors_uses_internal_methods(&target) {
                         // §20.1.2.10.1 step 3 — drive the spec ladder via
                         // `own_property_keys_value`, then read each descriptor
@@ -1512,7 +1512,7 @@ impl Interpreter {
                             };
                             let desc_h = interp
                                 .scoped_descriptor_object(scope, &desc)
-                                .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                                .map_err(CommittedValueError::JavaScript)?;
                             // Resolve the key spelling through the arena again:
                             // the descriptor allocation may have relocated it.
                             let key = interp.escape_scoped(key_h);
@@ -1521,13 +1521,13 @@ impl Interpreter {
                                 interp
                                     .scoped_set(scope, result, &key_string, desc_h)
                                     .map_err(|error| {
-                                        CommittedValueError::JavaScript(error.into())
+                                        CommittedValueError::JavaScript(error)
                                     })?;
                             } else if let Some(sym) = key.as_symbol(&interp.gc_heap) {
                                 interp
                                     .scoped_set_symbol(scope, result, sym, desc_h)
                                     .map_err(|error| {
-                                        CommittedValueError::JavaScript(error.into())
+                                        CommittedValueError::JavaScript(error)
                                     })?;
                             }
                         }
@@ -1576,7 +1576,7 @@ impl Interpreter {
                     return Err(CommittedValueError::JavaScript(VmError::TypeMismatch));
                 };
                 Ok(Some(self.scoped_key_strings(&owned).map_err(|error| {
-                    CommittedValueError::JavaScript(error.into())
+                    CommittedValueError::JavaScript(error)
                 })?))
             }
             M::GetOwnPropertySymbols => {
@@ -1634,7 +1634,7 @@ impl Interpreter {
                         &[&target_root],
                         &[args],
                     )
-                    .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                    .map_err(CommittedValueError::JavaScript)?;
                 Ok(Some(Value::array(array)))
             }
             // §20.1.2.7 `Object.groupBy(items, callbackfn)` — groups
@@ -1674,7 +1674,7 @@ impl Interpreter {
             let next_method = interp.scoped_value(scope, next_method);
             let result = interp
                 .scoped_object_bare(scope)
-                .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                .map_err(CommittedValueError::JavaScript)?;
             let mut index = 0_u64;
 
             loop {
@@ -1910,7 +1910,7 @@ fn own_enumerable_keys_for_define(
             for key_handle in key_handles {
                 let key = interp.escape_scoped(key_handle);
                 let vm_key = value_to_static_property_key(interp, &key, interp.gc_heap())
-                    .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                    .map_err(CommittedValueError::JavaScript)?;
                 out.push((vm_key, true));
             }
             Ok(out)
@@ -2280,7 +2280,7 @@ fn assign_set_string(
     if let Some(obj) = target_object {
         if let Some(desc) = interp
             .string_object_exotic_descriptor(obj, &VmPropertyKey::String(key))
-            .map_err(|error| CommittedValueError::JavaScript(error.into()))?
+            .map_err(CommittedValueError::JavaScript)?
             && !desc.writable()
         {
             return Err(CommittedValueError::JavaScript(interp.err_type(

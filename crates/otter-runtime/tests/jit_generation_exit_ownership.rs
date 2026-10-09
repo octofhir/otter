@@ -115,9 +115,7 @@ impl CaptureCompiler {
             .snapshot
             .instructions
             .iter()
-            .enumerate()
-            .filter(|(pc, _)| source.op_at(*pc) == Some(Op::LoadProperty))
-            .next_back()
+            .enumerate().rfind(|(pc, _)| source.op_at(*pc) == Some(Op::LoadProperty))
             .expect("reader ends by loading the receiver's x property");
         let mut observed = self.observed.lock().unwrap();
         if let Some(previous) = &observed.source {

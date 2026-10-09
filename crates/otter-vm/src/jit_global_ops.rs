@@ -52,7 +52,7 @@ impl Interpreter {
         match opcode {
             value if value == Op::LoadGlobalThis as u8 => {
                 self.run_load_global_this_reg(&mut stack[frame_index], arg0 as u16)
-                    .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                    .map_err(CommittedValueError::JavaScript)?;
             }
             value if value == Op::LoadGlobalOrUndefined as u8 => {
                 self.run_load_global_or_undefined_reg(
@@ -90,7 +90,7 @@ impl Interpreter {
                     arg1 as u32,
                     arg2 != 0,
                 )
-                .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                .map_err(CommittedValueError::JavaScript)?;
             }
             value if value == Op::DeclareGlobalLex as u8 => {
                 self.run_declare_global_lex_reg(
@@ -99,7 +99,7 @@ impl Interpreter {
                     arg1 as u32,
                     arg2 != 0,
                 )
-                .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                .map_err(CommittedValueError::JavaScript)?;
             }
             value if value == Op::ValidateGlobalDecl as u8 => {
                 self.run_validate_global_decl_reg(
@@ -108,7 +108,7 @@ impl Interpreter {
                     arg1 as u32,
                     arg2 as u32 as i32,
                 )
-                .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                .map_err(CommittedValueError::JavaScript)?;
             }
             value if value == Op::DefineGlobalVar as u8 => {
                 self.run_define_global_var_reg(
@@ -127,7 +127,7 @@ impl Interpreter {
                     arg0 as u16,
                     arg2 != 0,
                 )
-                .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                .map_err(CommittedValueError::JavaScript)?;
             }
             value if value == Op::InitGlobalLex as u8 => {
                 self.run_init_global_lex_reg(
@@ -136,7 +136,7 @@ impl Interpreter {
                     arg0 as u16,
                     arg1 as u32,
                 )
-                .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                .map_err(CommittedValueError::JavaScript)?;
             }
             value if value == Op::GlobalBindingExists as u8 => {
                 self.run_global_binding_exists_reg(

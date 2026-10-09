@@ -125,7 +125,7 @@ impl Interpreter {
                     lane(arg0, 3),
                     Some(arg1 as u16),
                 )
-                .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                .map_err(CommittedValueError::JavaScript)?;
             }
             value if value == Op::NewFunction as u8 => {
                 let argc = lane(arg0, 1) as usize;
@@ -145,7 +145,7 @@ impl Interpreter {
                     arg0 as u16,
                     arg1 as u32,
                 )
-                .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                .map_err(CommittedValueError::JavaScript)?;
             }
             value if value == Op::GetTemplateObject as u8 => {
                 self.run_get_template_object_reg(
@@ -155,11 +155,11 @@ impl Interpreter {
                     arg0 as u16,
                     arg1 as u32,
                 )
-                .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                .map_err(CommittedValueError::JavaScript)?;
             }
             value if value == Op::IsEvalIntrinsic as u8 => {
                 self.run_is_eval_intrinsic_reg(stack, frame_index, lane(arg0, 0), lane(arg0, 1))
-                    .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                    .map_err(CommittedValueError::JavaScript)?;
             }
             value if value == Op::DefineMember as u8 => {
                 let definition = otter_bytecode::MemberDefinition::from_imm32(arg1 as u32 as i32)

@@ -65,7 +65,7 @@ impl Interpreter {
             let next_method = self.json_root_get(next_root);
             let wrapper = self
                 .alloc_runtime_rooted_object_with_roots(&[&sync_iterator, &next_method], &[])
-                .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                .map_err(CommittedValueError::JavaScript)?;
             let wrapper_root = self.json_root_push(Value::object(wrapper));
             for (name, call, caches_next) in [
                 ("next", step_next as StepFn, true),
@@ -76,12 +76,12 @@ impl Interpreter {
                 let cached = caches_next.then(|| self.json_root_get(next_root));
                 let method = self
                     .async_from_sync_step(name, call, sync_iterator, cached)
-                    .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                    .map_err(CommittedValueError::JavaScript)?;
                 let Some(mut wrapper) = self.json_root_get(wrapper_root).as_object() else {
                     return Err(CommittedValueError::Fatal(VmError::InvalidOperand));
                 };
                 self.create_data_property(&mut wrapper, name, method)
-                    .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                    .map_err(CommittedValueError::JavaScript)?;
             }
             Ok(self.json_root_get(wrapper_root))
         })();
@@ -233,7 +233,7 @@ impl Interpreter {
                     },
                 )
                 .map_err(VmError::from)
-                .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                .map_err(CommittedValueError::JavaScript)?;
             let on_fulfilled = self.stamp_native_creation_realm(on_fulfilled);
             let fulfilled_root = self.json_root_push(on_fulfilled);
 
@@ -281,7 +281,7 @@ impl Interpreter {
                         },
                     )
                     .map_err(VmError::from)
-                    .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                    .map_err(CommittedValueError::JavaScript)?;
                 let on_rejected = self.stamp_native_creation_realm(on_rejected);
                 Some(self.json_root_push(on_rejected))
             } else {
@@ -297,7 +297,7 @@ impl Interpreter {
                 .json_root_get(base)
                 .as_promise()
                 .ok_or(VmError::InvalidOperand)
-                .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                .map_err(CommittedValueError::Fatal)?;
             let on_fulfilled = self.json_root_get(fulfilled_root);
             let on_rejected = rejected_root.map(|root| self.json_root_get(root));
             let outcome = self
@@ -308,7 +308,7 @@ impl Interpreter {
                     capability,
                     context.cloned(),
                 )
-                .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                .map_err(CommittedValueError::JavaScript)?;
             if let Some(job) = outcome.immediate_job {
                 self.microtasks.enqueue(job);
             }

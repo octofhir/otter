@@ -110,7 +110,7 @@ fn named_property_loop(iterations: i32) -> ExecutionContext {
             module_inits: Vec::new(),
             function_source: None,
         },
-        crate::source_registry::SourceRegistry::default(),
+        otter_vm::source_registry::SourceRegistry::default(),
     )
     .expect("valid bytecode fixture")
 }
@@ -201,7 +201,7 @@ fn computed_string_property_loop(iterations: i32) -> ExecutionContext {
             module_inits: Vec::new(),
             function_source: None,
         },
-        crate::source_registry::SourceRegistry::default(),
+        otter_vm::source_registry::SourceRegistry::default(),
     )
     .expect("valid bytecode fixture")
 }
@@ -279,7 +279,7 @@ fn own_named_load_loop(iterations: i32) -> ExecutionContext {
             module_inits: Vec::new(),
             function_source: None,
         },
-        crate::source_registry::SourceRegistry::default(),
+        otter_vm::source_registry::SourceRegistry::default(),
     )
     .expect("valid bytecode fixture")
 }
@@ -358,7 +358,7 @@ fn own_named_store_loop(iterations: i32) -> ExecutionContext {
             module_inits: Vec::new(),
             function_source: None,
         },
-        crate::source_registry::SourceRegistry::default(),
+        otter_vm::source_registry::SourceRegistry::default(),
     )
     .expect("valid bytecode fixture")
 }
@@ -442,7 +442,7 @@ fn prototype_named_load_loop(iterations: i32) -> ExecutionContext {
             module_inits: Vec::new(),
             function_source: None,
         },
-        crate::source_registry::SourceRegistry::default(),
+        otter_vm::source_registry::SourceRegistry::default(),
     )
     .expect("valid bytecode fixture")
 }
@@ -520,7 +520,7 @@ fn named_delete_own_data_loop(iterations: i32) -> ExecutionContext {
             module_inits: Vec::new(),
             function_source: None,
         },
-        crate::source_registry::SourceRegistry::default(),
+        otter_vm::source_registry::SourceRegistry::default(),
     )
     .expect("valid bytecode fixture")
 }
@@ -587,7 +587,7 @@ fn named_delete_missing_loop(iterations: i32) -> ExecutionContext {
             module_inits: Vec::new(),
             function_source: None,
         },
-        crate::source_registry::SourceRegistry::default(),
+        otter_vm::source_registry::SourceRegistry::default(),
     )
     .expect("valid bytecode fixture")
 }
@@ -671,7 +671,7 @@ fn named_delete_inherited_present_loop(iterations: i32) -> ExecutionContext {
             module_inits: Vec::new(),
             function_source: None,
         },
-        crate::source_registry::SourceRegistry::default(),
+        otter_vm::source_registry::SourceRegistry::default(),
     )
     .expect("valid bytecode fixture")
 }

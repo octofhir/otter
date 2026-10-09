@@ -446,7 +446,7 @@ fn clones_share_aggregate_usage() {
 fn exact_many_charges_and_releases_every_class_together() {
     let account = ResourceAccount::default();
     let lease = account
-        .reserve_exact_many(&[
+        .reserve_exact_many([
             (ResourceClass::Workers, 2),
             (ResourceClass::WorkerStackBytes, 32),
             (ResourceClass::QueuedMessages, 0),
@@ -470,7 +470,7 @@ fn exact_many_charges_and_releases_every_class_together() {
     assert_eq!(snapshot.get(ResourceClass::WorkerStackBytes).current(), 0);
 
     let empty = account
-        .reserve_exact_many(&[(ResourceClass::Workers, 0)])
+        .reserve_exact_many([(ResourceClass::Workers, 0)])
         .unwrap();
     assert!(empty.is_empty());
     assert_eq!(empty.amount(ResourceClass::Workers), 0);
@@ -481,7 +481,7 @@ fn exact_many_charges_and_releases_every_class_together() {
 fn exact_many_take_transfers_one_class_without_mutating_the_ledger() {
     let account = ResourceAccount::default();
     let mut set = account
-        .reserve_exact_many(&[
+        .reserve_exact_many([
             (ResourceClass::QueuedTasks, 1),
             (ResourceClass::HostOperations, 1),
         ])
@@ -522,7 +522,7 @@ fn exact_many_second_class_failure_changes_no_current_or_peak() {
         .unwrap();
 
     let error = account
-        .reserve_exact_many(&[
+        .reserve_exact_many([
             (ResourceClass::Workers, 3),
             (ResourceClass::WorkerStackBytes, 9),
         ])
@@ -554,7 +554,7 @@ fn exact_many_second_class_failure_changes_no_current_or_peak() {
 fn exact_many_aggregates_duplicates_and_rejects_aggregate_overflow() {
     let account = ResourceAccount::default();
     let lease = account
-        .reserve_exact_many(&[
+        .reserve_exact_many([
             (ResourceClass::QueuedMessages, 2),
             (ResourceClass::QueuedMessages, 3),
             (ResourceClass::QueuedMessages, 0),
@@ -571,7 +571,7 @@ fn exact_many_aggregates_duplicates_and_rejects_aggregate_overflow() {
     drop(lease);
 
     let error = account
-        .reserve_exact_many(&[
+        .reserve_exact_many([
             (ResourceClass::QueuedMessages, u64::MAX),
             (ResourceClass::QueuedMessages, 1),
         ])
@@ -638,7 +638,7 @@ fn concurrent_mixed_reservations_never_publish_partial_state() {
             start.wait();
             for _ in 0..ITERATIONS {
                 let lease = account
-                    .reserve_exact_many(&[
+                    .reserve_exact_many([
                         (ResourceClass::QueuedMessages, 1),
                         (ResourceClass::QueuedMessageBytes, BYTES_PER_MESSAGE),
                     ])
@@ -814,7 +814,7 @@ fn exact_many_recovers_a_poisoned_mutex_and_releases_as_one_set() {
     );
 
     let lease = account
-        .reserve_exact_many(&[
+        .reserve_exact_many([
             (ResourceClass::QueuedMessages, 2),
             (ResourceClass::QueuedMessageBytes, 32),
         ])
@@ -857,7 +857,8 @@ fn shared_utf8_slices_retain_one_full_charge_and_view_identity() {
     assert!(line.slice(1..2).is_none());
     assert!(line.slice(3..6).is_none());
     assert!(line.slice(0..8).is_none());
-    assert!(line.slice(5..2).is_none());
+    // An inverted range is refused instead of reading as an empty slice.
+    assert!(line.slice(std::ops::Range { start: 5, end: 2 }).is_none());
     let separate_account = ResourceAccount::default();
     let equal = SharedSource::admit(&separate_account, "𝄞".to_owned()).unwrap();
     assert_eq!(scalar, equal);

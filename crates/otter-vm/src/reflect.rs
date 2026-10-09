@@ -99,10 +99,10 @@ pub fn call(
             // the heap — re-read the target from the rooted argument
             // slot afterwards so the local copy is never stale.
             expect_object_value(args.first())
-                .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                .map_err(CommittedValueError::JavaScript)?;
             let key = coerce_property_key(interp, stack, context, args.get(1))?;
             let target = expect_object_value(args.first())
-                .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                .map_err(CommittedValueError::JavaScript)?;
             let attributes = args.get(2).cloned().unwrap_or(Value::undefined());
             let descriptor =
                 interp.evaluate_to_property_descriptor(stack, Some(context), &attributes)?;
@@ -117,10 +117,10 @@ pub fn call(
             // the heap — re-read the target from the rooted argument
             // slot afterwards so the local copy is never stale.
             expect_object_value(args.first())
-                .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                .map_err(CommittedValueError::JavaScript)?;
             let key = coerce_property_key(interp, stack, context, args.get(1))?;
             let target = expect_object_value(args.first())
-                .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                .map_err(CommittedValueError::JavaScript)?;
             let removed = interp.ordinary_delete_value(stack, context, target, &key, 0)?;
             Ok(Value::boolean(removed))
         }
@@ -132,10 +132,10 @@ pub fn call(
             // the heap — re-read the target from the rooted argument
             // slot afterwards so the local copy is never stale.
             expect_object_value(args.first())
-                .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                .map_err(CommittedValueError::JavaScript)?;
             let key = coerce_property_key(interp, stack, context, args.get(1))?;
             let target = expect_object_value(args.first())
-                .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                .map_err(CommittedValueError::JavaScript)?;
             let receiver = args.get(2).cloned().unwrap_or(target);
             match interp.ordinary_get_value(stack, Some(context), target, receiver, &key, 0)? {
                 VmGetOutcome::Value(v) => Ok(v),
@@ -155,10 +155,10 @@ pub fn call(
             // the heap — re-read the target from the rooted argument
             // slot afterwards so the local copy is never stale.
             expect_object_value(args.first())
-                .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                .map_err(CommittedValueError::JavaScript)?;
             let key = coerce_property_key(interp, stack, context, args.get(1))?;
             let target = expect_object_value(args.first())
-                .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                .map_err(CommittedValueError::JavaScript)?;
             match interp.ordinary_get_own_property_descriptor_value(
                 stack,
                 Some(context),
@@ -170,7 +170,7 @@ pub fn call(
                 Some(desc) => interp.with_handle_scope(|interp, scope| {
                     let result = interp
                         .scoped_descriptor_object(scope, &desc)
-                        .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                        .map_err(CommittedValueError::JavaScript)?;
                     Ok(interp.escape_scoped(result))
                 }),
             }
@@ -179,7 +179,7 @@ pub fn call(
         // <https://tc39.es/ecma262/#sec-reflect.getprototypeof>
         M::GetPrototypeOf => {
             let target = expect_object_value(args.first())
-                .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                .map_err(CommittedValueError::JavaScript)?;
             interp.ordinary_get_prototype_value(stack, context, target, 0)
         }
         // §28.1.9 Reflect.has(target, propertyKey)
@@ -190,10 +190,10 @@ pub fn call(
             // the heap — re-read the target from the rooted argument
             // slot afterwards so the local copy is never stale.
             expect_object_value(args.first())
-                .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                .map_err(CommittedValueError::JavaScript)?;
             let key = coerce_property_key(interp, stack, context, args.get(1))?;
             let target = expect_object_value(args.first())
-                .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                .map_err(CommittedValueError::JavaScript)?;
             let present =
                 interp.ordinary_has_property_value(stack, Some(context), target, &key, 0)?;
             Ok(Value::boolean(present))
@@ -202,7 +202,7 @@ pub fn call(
         // <https://tc39.es/ecma262/#sec-reflect.isextensible>
         M::IsExtensible => {
             let target = expect_object_value(args.first())
-                .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                .map_err(CommittedValueError::JavaScript)?;
             let ext = interp.is_extensible_value(stack, Some(context), &target)?;
             Ok(Value::boolean(ext))
         }
@@ -210,7 +210,7 @@ pub fn call(
         // <https://tc39.es/ecma262/#sec-reflect.ownkeys>
         M::OwnKeys => {
             let target = expect_object_value(args.first())
-                .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                .map_err(CommittedValueError::JavaScript)?;
             let keys = interp.own_property_keys_value(stack, context, &target)?;
             Ok(Value::array(
                 interp
@@ -220,14 +220,14 @@ pub fn call(
                         &[&target],
                         &[args],
                     )
-                    .map_err(|error| CommittedValueError::JavaScript(error.into()))?,
+                    .map_err(CommittedValueError::JavaScript)?,
             ))
         }
         // §28.1.12 Reflect.preventExtensions(target)
         // <https://tc39.es/ecma262/#sec-reflect.preventextensions>
         M::PreventExtensions => {
             let target = expect_object_value(args.first())
-                .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                .map_err(CommittedValueError::JavaScript)?;
             let ok = interp.prevent_extensions_value(stack, context, &target)?;
             Ok(Value::boolean(ok))
         }
@@ -239,10 +239,10 @@ pub fn call(
             // the heap — re-read the target from the rooted argument
             // slot afterwards so the local copy is never stale.
             expect_object_value(args.first())
-                .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                .map_err(CommittedValueError::JavaScript)?;
             let key = coerce_property_key(interp, stack, context, args.get(1))?;
             let target = expect_object_value(args.first())
-                .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                .map_err(CommittedValueError::JavaScript)?;
             let value = args.get(2).cloned().unwrap_or(Value::undefined());
             let receiver = args.get(3).cloned().unwrap_or(target);
             // §10.1.9 OrdinarySet with receiver semantics for ordinary
@@ -305,7 +305,7 @@ pub fn call(
                         if !target_has_own
                             && let Some(proxy_proto) = interp
                                 .first_proxy_in_prototype_chain(target)
-                                .map_err(|error| CommittedValueError::JavaScript(error.into()))?
+                                .map_err(CommittedValueError::JavaScript)?
                         {
                             let ok = interp.ordinary_set_data_value(
                                 stack,
@@ -335,7 +335,7 @@ pub fn call(
         // <https://tc39.es/ecma262/#sec-reflect.setprototypeof>
         M::SetPrototypeOf => {
             let target = expect_object_value(args.first())
-                .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                .map_err(CommittedValueError::JavaScript)?;
             // §28.1.14 step 2 — a missing `proto` is `undefined`, which is
             // neither an Object nor null, so it is a TypeError just like an
             // explicit non-object/non-null argument.

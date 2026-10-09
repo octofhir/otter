@@ -83,7 +83,7 @@ impl Interpreter {
         if !value.is_object_type() {
             let boxed = self
                 .box_sloppy_this_primitive_runtime_rooted(value, &[])
-                .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                .map_err(CommittedValueError::JavaScript)?;
             // This driver owns the receiver slot; replace its primitive with
             // ToObject's result immediately, before another allocation.
             self.set_scoped(receiver, boxed);
@@ -103,7 +103,7 @@ impl Interpreter {
                     let value = self.escape_scoped(argument);
                     crate::array::push_with_roots(array, self.gc_heap_mut(), value, &mut |_| {})
                         .map_err(VmError::from)
-                        .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                        .map_err(CommittedValueError::JavaScript)?;
                 }
                 return Ok(Value::number_f64(end as f64));
             }

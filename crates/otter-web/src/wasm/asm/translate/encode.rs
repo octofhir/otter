@@ -196,7 +196,7 @@ impl<'a> ModuleTranslator<'a> {
 /// The asm.js heap as wasm memory: the exact byte length, in 64 KiB pages
 /// when it divides evenly and in one-byte pages otherwise.
 fn heap_memory_type(len: u32) -> MemoryType {
-    let (pages, page_size_log2) = if len % 65536 == 0 {
+    let (pages, page_size_log2) = if len.is_multiple_of(65536) {
         (u64::from(len / 65536), None)
     } else {
         (u64::from(len), Some(0))

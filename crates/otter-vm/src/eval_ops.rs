@@ -247,7 +247,7 @@ impl Interpreter {
         operands: impl crate::executable::OperandSource,
     ) -> Result<(), CommittedValueError> {
         let dst = register_operand(operands.first())
-            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+            .map_err(CommittedValueError::Fatal)?;
         let argc = match operands.get(1) {
             Some(Operand::ConstIndex(n)) => n as usize,
             _ => return Err(CommittedValueError::Fatal(VmError::InvalidOperand)),
@@ -260,24 +260,24 @@ impl Interpreter {
         let mut parts: Vec<String> = Vec::with_capacity(argc);
         for i in 0..argc {
             let r = register_operand(operands.get(2 + i))
-                .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                .map_err(CommittedValueError::Fatal)?;
             let top_idx = stack.len() - 1;
             let value = *read_register(&stack[top_idx], r)
-                .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                .map_err(CommittedValueError::Fatal)?;
             parts.push(self.function_constructor_arg_to_string(stack, context, &value)?);
         }
         let result = self
             .build_function_constructor_from_parts(stack, parts)
-            .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+            .map_err(CommittedValueError::JavaScript)?;
         let frame = stack
             .last_mut()
             .ok_or(VmError::InvalidOperand)
-            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+            .map_err(CommittedValueError::Fatal)?;
         write_register(frame, dst, result)
-            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+            .map_err(CommittedValueError::Fatal)?;
         frame
             .advance_pc()
-            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+            .map_err(CommittedValueError::Fatal)?;
         Ok(())
     }
 
@@ -428,7 +428,7 @@ impl Interpreter {
             }
             interp
                 .build_dynamic_function_from_parts(stack, parts, kind)
-                .map_err(|error| CommittedValueError::JavaScript(error.into()))
+                .map_err(CommittedValueError::JavaScript)
         })
     }
 

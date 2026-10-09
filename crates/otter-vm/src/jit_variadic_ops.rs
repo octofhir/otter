@@ -62,7 +62,7 @@ impl Interpreter {
             }
             value if value == Op::QueueMicrotask as u8 => {
                 self.run_queue_microtask_operands(context, &mut stack[frame_index], &ops[..])
-                    .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                    .map_err(CommittedValueError::JavaScript)?;
             }
             _ => return Err(CommittedValueError::Fatal(VmError::InvalidOperand)),
         }

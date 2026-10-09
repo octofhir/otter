@@ -36,9 +36,9 @@ impl Interpreter {
         key_reg: u16,
     ) -> Result<(), CommittedValueError> {
         let receiver = *read_register(&stack[top_idx], obj_reg)
-            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+            .map_err(CommittedValueError::Fatal)?;
         let key = *read_register(&stack[top_idx], key_reg)
-            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+            .map_err(CommittedValueError::Fatal)?;
         let Some(sym) = key.as_symbol(&self.gc_heap) else {
             return Err(CommittedValueError::JavaScript(
                 self.err_type(
@@ -62,7 +62,7 @@ impl Interpreter {
                 object::DescriptorKind::Accessor { getter, .. } => match getter {
                     Some(getter) => {
                         let receiver = *read_register(&stack[top_idx], obj_reg)
-                            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                            .map_err(CommittedValueError::Fatal)?;
                         self.run_callable_sync_rooted(
                             stack,
                             Some(context),
@@ -82,10 +82,10 @@ impl Interpreter {
         };
         let frame = &mut stack[top_idx];
         write_register(frame, dst, result)
-            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+            .map_err(CommittedValueError::Fatal)?;
         frame
             .advance_pc()
-            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+            .map_err(CommittedValueError::Fatal)?;
         Ok(())
     }
 
@@ -100,9 +100,9 @@ impl Interpreter {
         value_reg: u16,
     ) -> Result<(), CommittedValueError> {
         let receiver = *read_register(&stack[top_idx], obj_reg)
-            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+            .map_err(CommittedValueError::Fatal)?;
         let key = *read_register(&stack[top_idx], key_reg)
-            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+            .map_err(CommittedValueError::Fatal)?;
         let Some(sym) = key.as_symbol(&self.gc_heap) else {
             return Err(CommittedValueError::JavaScript(
                 self.err_type(
@@ -127,9 +127,9 @@ impl Interpreter {
                 object::DescriptorKind::Accessor { setter, .. } => match setter {
                     Some(setter) => {
                         let receiver = *read_register(&stack[top_idx], obj_reg)
-                            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                            .map_err(CommittedValueError::Fatal)?;
                         let value = *read_register(&stack[top_idx], value_reg)
-                            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                            .map_err(CommittedValueError::Fatal)?;
                         let argv: SmallVec<[Value; 8]> = smallvec::smallvec![value];
                         self.run_callable_sync_rooted(
                             stack,
@@ -148,14 +148,14 @@ impl Interpreter {
                 },
                 object::DescriptorKind::Data { .. } => {
                     let receiver = *read_register(&stack[top_idx], obj_reg)
-                        .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                        .map_err(CommittedValueError::Fatal)?;
                     if holder != receiver || !desc.flags.writable() {
                         return Err(CommittedValueError::JavaScript(
                             self.err_type(("Private method is not writable".to_string()).into()),
                         ));
                     }
                     let value = *read_register(&stack[top_idx], value_reg)
-                        .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                        .map_err(CommittedValueError::Fatal)?;
                     let descriptor = object::PartialPropertyDescriptor {
                         value: Some(value),
                         ..Default::default()
@@ -167,7 +167,7 @@ impl Interpreter {
         }
         stack[top_idx]
             .advance_pc()
-            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+            .map_err(CommittedValueError::Fatal)?;
         Ok(())
     }
 
@@ -181,9 +181,9 @@ impl Interpreter {
         brand_reg: u16,
     ) -> Result<(), CommittedValueError> {
         let receiver = *read_register(&stack[top_idx], obj_reg)
-            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+            .map_err(CommittedValueError::Fatal)?;
         let brand = *read_register(&stack[top_idx], brand_reg)
-            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+            .map_err(CommittedValueError::Fatal)?;
         let Some(sym) = brand.as_symbol(&self.gc_heap) else {
             return Err(CommittedValueError::JavaScript(
                 self.err_type(
@@ -217,7 +217,7 @@ impl Interpreter {
         }
         stack[top_idx]
             .advance_pc()
-            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+            .map_err(CommittedValueError::Fatal)?;
         Ok(())
     }
 

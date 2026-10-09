@@ -192,11 +192,11 @@ impl Interpreter {
             };
             let key_value = self
                 .vm_property_key_to_value(key)
-                .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                .map_err(CommittedValueError::JavaScript)?;
             let key_root = self.scoped_value(&scope, key_value);
             let descriptor_object = self
                 .partial_descriptor_to_object(&current_descriptor(self), &[])
-                .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                .map_err(CommittedValueError::JavaScript)?;
             let trap_args: SmallVec<[Value; 8]> = smallvec::smallvec![
                 self.escape_scoped(target_root),
                 self.escape_scoped(key_root),
@@ -206,7 +206,7 @@ impl Interpreter {
                 .escape_scoped(proxy_root)
                 .as_proxy()
                 .ok_or(VmError::InvalidOperand)
-                .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                .map_err(CommittedValueError::Fatal)?;
             return match self.invoke_proxy_trap(
                 stack,
                 Some(context),
@@ -348,7 +348,7 @@ impl Interpreter {
             } else {
                 if let Some(current) = self
                     .string_object_exotic_descriptor(obj, key)
-                    .map_err(|error| CommittedValueError::JavaScript(error.into()))?
+                    .map_err(CommittedValueError::JavaScript)?
                 {
                     return Ok(is_compatible_partial_descriptor(
                         &current,
@@ -360,7 +360,7 @@ impl Interpreter {
                     .string_name()
                     .expect("non-symbol key has string spelling");
                 self.define_own_property_partial(&mut obj, k, descriptor)
-                    .map_err(|error| CommittedValueError::JavaScript(error.into()))?
+                    .map_err(CommittedValueError::JavaScript)?
             });
         }
         if let Some(native) = target.as_native_function() {
@@ -440,7 +440,7 @@ impl Interpreter {
                     .string_name()
                     .expect("non-symbol key has string spelling");
                 self.define_own_property_partial(&mut statics, k, descriptor)
-                    .map_err(|error| CommittedValueError::JavaScript(error.into()))?
+                    .map_err(CommittedValueError::JavaScript)?
             });
         }
         let fid = target.as_function().or_else(|| {
@@ -453,15 +453,15 @@ impl Interpreter {
                 let owner = target.as_closure(&self.gc_heap);
                 let (mut bag, descriptor) = self.with_descriptor_anchored(descriptor, |this| {
                     this.function_user_bag(stack, owner, function_id, &[])
-                        .map_err(|error| CommittedValueError::JavaScript(error.into()))
+                        .map_err(CommittedValueError::JavaScript)
                 })?;
-                return Ok(object::define_own_symbol_property_partial(
+                return object::define_own_symbol_property_partial(
                     &mut bag,
                     &mut self.gc_heap,
                     *sym,
                     descriptor,
                 )
-                .map_err(|error| CommittedValueError::JavaScript(error.into()))?);
+                .map_err(|error| CommittedValueError::JavaScript(error.into()));
             }
             let Some(k) = key.string_name() else {
                 return Ok(false);
@@ -505,7 +505,7 @@ impl Interpreter {
                                 function_id,
                                 k,
                             )
-                            .map_err(|error| CommittedValueError::JavaScript(error.into()))
+                            .map_err(CommittedValueError::JavaScript)
                     })?;
                 let completed = match current {
                     Some(current) => descriptor.complete_against_current(&current),
@@ -521,7 +521,7 @@ impl Interpreter {
                         None,
                         completed,
                     )
-                    .map_err(|error| CommittedValueError::JavaScript(error.into()))
+                    .map_err(CommittedValueError::JavaScript)
             });
         }
         if let Some(regexp) = target.as_regexp() {
@@ -547,7 +547,7 @@ impl Interpreter {
             }
             let (mut bag, descriptor) = self.with_descriptor_anchored(descriptor, |this| {
                 crate::property_dispatch::regexp_ensure_expando_pub(&mut this.gc_heap, &regexp)
-                    .map_err(|error| CommittedValueError::JavaScript(error.into()))
+                    .map_err(CommittedValueError::JavaScript)
             })?;
             return Ok(if let VmPropertyKey::Symbol(sym) = key {
                 object::define_own_symbol_property_partial(
@@ -562,7 +562,7 @@ impl Interpreter {
                     .string_name()
                     .expect("non-symbol key has string spelling");
                 self.define_own_property_partial(&mut bag, k, descriptor)
-                    .map_err(|error| CommittedValueError::JavaScript(error.into()))?
+                    .map_err(CommittedValueError::JavaScript)?
             });
         }
         if target.is_map()
@@ -573,7 +573,7 @@ impl Interpreter {
         {
             let (mut bag, descriptor) = self.with_descriptor_anchored(descriptor, |this| {
                 this.collection_ensure_expando(target)
-                    .map_err(|error| CommittedValueError::JavaScript(error.into()))
+                    .map_err(CommittedValueError::JavaScript)
             })?;
             return Ok(if let VmPropertyKey::Symbol(sym) = key {
                 object::define_own_symbol_property_partial(
@@ -588,7 +588,7 @@ impl Interpreter {
                     .string_name()
                     .expect("non-symbol key has string spelling");
                 self.define_own_property_partial(&mut bag, k, descriptor)
-                    .map_err(|error| CommittedValueError::JavaScript(error.into()))?
+                    .map_err(CommittedValueError::JavaScript)?
             });
         }
         if let Some(promise) = target.as_promise() {
@@ -597,7 +597,7 @@ impl Interpreter {
             // resolve path observes) live on a lazily-allocated expando.
             let (mut bag, descriptor) = self.with_descriptor_anchored(descriptor, |this| {
                 crate::property_dispatch::promise_ensure_expando_pub(&mut this.gc_heap, &promise)
-                    .map_err(|error| CommittedValueError::JavaScript(error.into()))
+                    .map_err(CommittedValueError::JavaScript)
             })?;
             return Ok(if let VmPropertyKey::Symbol(sym) = key {
                 object::define_own_symbol_property_partial(
@@ -612,7 +612,7 @@ impl Interpreter {
                     .string_name()
                     .expect("non-symbol key has string spelling");
                 self.define_own_property_partial(&mut bag, k, descriptor)
-                    .map_err(|error| CommittedValueError::JavaScript(error.into()))?
+                    .map_err(CommittedValueError::JavaScript)?
             });
         }
         if let Some(dv) = target.as_data_view() {
@@ -620,7 +620,7 @@ impl Interpreter {
             // `Object.defineProperty(dv, …)` installs onto the expando.
             let (mut bag, descriptor) = self.with_descriptor_anchored(descriptor, |this| {
                 crate::property_dispatch::data_view_ensure_expando_pub(&mut this.gc_heap, &dv)
-                    .map_err(|error| CommittedValueError::JavaScript(error.into()))
+                    .map_err(CommittedValueError::JavaScript)
             })?;
             return Ok(if let VmPropertyKey::Symbol(sym) = key {
                 object::define_own_symbol_property_partial(
@@ -635,7 +635,7 @@ impl Interpreter {
                     .string_name()
                     .expect("non-symbol key has string spelling");
                 self.define_own_property_partial(&mut bag, k, descriptor)
-                    .map_err(|error| CommittedValueError::JavaScript(error.into()))?
+                    .map_err(CommittedValueError::JavaScript)?
             });
         }
         if let Some(t) = target.as_temporal(&self.gc_heap) {
@@ -645,7 +645,7 @@ impl Interpreter {
             // the lazy expando bag.
             let (mut bag, descriptor) = self.with_descriptor_anchored(descriptor, |this| {
                 crate::property_dispatch::temporal_ensure_expando_pub(&mut this.gc_heap, &t)
-                    .map_err(|error| CommittedValueError::JavaScript(error.into()))
+                    .map_err(CommittedValueError::JavaScript)
             })?;
             return Ok(if let VmPropertyKey::Symbol(sym) = key {
                 object::define_own_symbol_property_partial(
@@ -660,13 +660,13 @@ impl Interpreter {
                     .string_name()
                     .expect("non-symbol key has string spelling");
                 self.define_own_property_partial(&mut bag, k, descriptor)
-                    .map_err(|error| CommittedValueError::JavaScript(error.into()))?
+                    .map_err(CommittedValueError::JavaScript)?
             });
         }
         if target.is_intl() || target.is_iterator() {
             let (bag, descriptor) = self.with_descriptor_anchored(descriptor, |this| {
                 this.ensure_non_gc_exotic_user_props(target)
-                    .map_err(|error| CommittedValueError::JavaScript(error.into()))
+                    .map_err(CommittedValueError::JavaScript)
             })?;
             let Some(mut bag) = bag else {
                 return Ok(false);
@@ -684,7 +684,7 @@ impl Interpreter {
                     .string_name()
                     .expect("non-symbol key has string spelling");
                 self.define_own_property_partial(&mut bag, k, descriptor)
-                    .map_err(|error| CommittedValueError::JavaScript(error.into()))?
+                    .map_err(CommittedValueError::JavaScript)?
             });
         }
         if let Some(arr) = target.as_array() {
@@ -696,7 +696,7 @@ impl Interpreter {
                     descriptor,
                 )
                 .map_err(VmError::from)
-                .map_err(|error| CommittedValueError::JavaScript(error.into()));
+                .map_err(CommittedValueError::JavaScript);
             }
             let Some(k) = key.string_name() else {
                 return Ok(false);
@@ -748,7 +748,7 @@ impl Interpreter {
                 let arr = array_value
                     .as_array()
                     .ok_or(VmError::TypeMismatch)
-                    .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                    .map_err(CommittedValueError::JavaScript)?;
                 // OrdinaryDefineOwnProperty validation against length's fixed
                 // shape — a non-configurable, non-enumerable data property.
                 if descriptor.is_accessor()
@@ -780,7 +780,7 @@ impl Interpreter {
                     }
                     array::set_length_checked(arr, &mut self.gc_heap, new_len)
                         .map_err(|_| VmError::TypeMismatch)
-                        .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                        .map_err(CommittedValueError::JavaScript)?;
                     if want_writable_false {
                         array::set_length_writable(arr, &mut self.gc_heap, false);
                     }
@@ -792,7 +792,7 @@ impl Interpreter {
                 }
                 let delete_ok = array::set_length_checked(arr, &mut self.gc_heap, new_len)
                     .map_err(|_| VmError::TypeMismatch)
-                    .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                    .map_err(CommittedValueError::JavaScript)?;
                 if want_writable_false {
                     array::set_length_writable(arr, &mut self.gc_heap, false);
                 }
@@ -801,11 +801,11 @@ impl Interpreter {
             if let Some(idx) = object::array_index_property_name(k) {
                 return self
                     .define_array_index_property(arr, k, idx as usize, descriptor)
-                    .map_err(|error| CommittedValueError::JavaScript(error.into()));
+                    .map_err(CommittedValueError::JavaScript);
             }
             return self
                 .define_array_named_property(arr, k, descriptor)
-                .map_err(|error| CommittedValueError::JavaScript(error.into()));
+                .map_err(CommittedValueError::JavaScript);
         }
         if let Some(t) = target.as_typed_array(&self.gc_heap) {
             // §10.4.5.3 Integer-Indexed exotic [[DefineOwnProperty]].
@@ -815,15 +815,15 @@ impl Interpreter {
             if let VmPropertyKey::Symbol(sym) = key {
                 let (mut bag, descriptor) = self.with_descriptor_anchored(descriptor, |this| {
                     crate::property_dispatch::typed_array_ensure_expando_pub(&mut this.gc_heap, &t)
-                        .map_err(|error| CommittedValueError::JavaScript(error.into()))
+                        .map_err(CommittedValueError::JavaScript)
                 })?;
-                return Ok(object::define_own_symbol_property_partial(
+                return object::define_own_symbol_property_partial(
                     &mut bag,
                     &mut self.gc_heap,
                     *sym,
                     descriptor,
                 )
-                .map_err(|error| CommittedValueError::JavaScript(error.into()))?);
+                .map_err(|error| CommittedValueError::JavaScript(error.into()));
             }
             let Some(name) = key.string_name() else {
                 return Ok(false);
@@ -854,11 +854,11 @@ impl Interpreter {
             }
             let (mut bag, descriptor) = self.with_descriptor_anchored(descriptor, |this| {
                 crate::property_dispatch::typed_array_ensure_expando_pub(&mut this.gc_heap, &t)
-                    .map_err(|error| CommittedValueError::JavaScript(error.into()))
+                    .map_err(CommittedValueError::JavaScript)
             })?;
             return self
                 .define_own_property_partial(&mut bag, name, descriptor)
-                .map_err(|error| CommittedValueError::JavaScript(error.into()));
+                .map_err(CommittedValueError::JavaScript);
         }
         // ArrayBuffer / SharedArrayBuffer and DataView are ordinary
         // objects (no exotic [[DefineOwnProperty]]); own properties live
@@ -866,7 +866,7 @@ impl Interpreter {
         if let Some(b) = target.as_array_buffer() {
             let (mut bag, descriptor) = self.with_descriptor_anchored(descriptor, |this| {
                 crate::property_dispatch::array_buffer_ensure_expando_pub(&mut this.gc_heap, &b)
-                    .map_err(|error| CommittedValueError::JavaScript(error.into()))
+                    .map_err(CommittedValueError::JavaScript)
             })?;
             return match key {
                 VmPropertyKey::Symbol(sym) => Ok(object::define_own_symbol_property_partial(
@@ -879,7 +879,7 @@ impl Interpreter {
                 _ => match key.string_name() {
                     Some(name) => self
                         .define_own_property_partial(&mut bag, name, descriptor)
-                        .map_err(|error| CommittedValueError::JavaScript(error.into())),
+                        .map_err(CommittedValueError::JavaScript),
                     None => Ok(false),
                 },
             };
@@ -887,7 +887,7 @@ impl Interpreter {
         if let Some(dv) = target.as_data_view() {
             let (mut bag, descriptor) = self.with_descriptor_anchored(descriptor, |this| {
                 crate::property_dispatch::data_view_ensure_expando_pub(&mut this.gc_heap, &dv)
-                    .map_err(|error| CommittedValueError::JavaScript(error.into()))
+                    .map_err(CommittedValueError::JavaScript)
             })?;
             return match key {
                 VmPropertyKey::Symbol(sym) => Ok(object::define_own_symbol_property_partial(
@@ -900,7 +900,7 @@ impl Interpreter {
                 _ => match key.string_name() {
                     Some(name) => self
                         .define_own_property_partial(&mut bag, name, descriptor)
-                        .map_err(|error| CommittedValueError::JavaScript(error.into())),
+                        .map_err(CommittedValueError::JavaScript),
                     None => Ok(false),
                 },
             };
@@ -942,7 +942,7 @@ impl Interpreter {
                 for key_handle in keys {
                     let key_value = interp.escape_scoped(key_handle);
                     let key = property_key_value_to_vm_key(interp, &key_value, &interp.gc_heap)
-                        .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                        .map_err(CommittedValueError::JavaScript)?;
                     let descriptor = match level {
                         ObjectIntegrityLevel::Sealed => object::PartialPropertyDescriptor {
                             configurable: Some(false),
@@ -1022,7 +1022,7 @@ impl Interpreter {
             for key_handle in keys {
                 let key_value = interp.escape_scoped(key_handle);
                 let key = property_key_value_to_vm_key(interp, &key_value, &interp.gc_heap)
-                    .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                    .map_err(CommittedValueError::JavaScript)?;
                 let live = interp.escape_scoped(target_handle);
                 let desc = interp.ordinary_get_own_property_descriptor_value(
                     stack,

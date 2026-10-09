@@ -190,9 +190,7 @@ fn actual_only_known_and_generic_entries_initialize_missing_formals() {
                 resolve_return_pc: 0,
             };
             for argc in 0..=5 {
-                let actuals: Vec<_> = (0..argc)
-                    .map(|i| Value::number_i32(100 + i as i32))
-                    .collect();
+                let actuals: Vec<_> = (0..argc).map(|i| Value::number_i32(100 + i)).collect();
                 for generic in [false, true] {
                     let buffer = caller(&transitions, &function, &actuals, generic);
                     let interrupt = 0_u8;

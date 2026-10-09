@@ -435,10 +435,9 @@ impl StepTracer for Tracer {
             .register_window
             .get(3)
             .map_or(Value::undefined().to_bits(), |v| v.to_bits());
-        let aliases = event.register_window.get(0) == event.register_window.get(1);
+        let aliases = event.register_window.first() == event.register_window.get(1);
         let child = event
-            .register_window
-            .get(0)
+            .register_window.first()
             .map_or(Value::undefined().to_bits(), |v| v.to_bits());
         self.ticks.lock().unwrap().push(Tick {
             pc: event.byte_pc,

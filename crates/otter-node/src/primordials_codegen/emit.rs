@@ -231,41 +231,41 @@ fn edits(program: &Program<'_>) -> Result<Span> {
     let mut helpers = std::collections::BTreeSet::new();
     let mut missing = false;
     for statement in &program.body {
-        if let Statement::FunctionDeclaration(function) = statement {
-            if let Some(identifier) = &function.id {
-                if identifier.name == BUILD {
-                    build_count += 1;
-                    spans.push(function.span);
-                } else if HELPERS.contains(&identifier.name.as_str()) {
-                    if !helpers.insert(identifier.name.as_str()) {
-                        return Err(reject(
-                            "bootstrap",
-                            function.span,
-                            "duplicate current dispatch helper",
-                        ));
-                    }
-                    spans.push(function.span);
+        if let Statement::FunctionDeclaration(function) = statement
+            && let Some(identifier) = &function.id
+        {
+            if identifier.name == BUILD {
+                build_count += 1;
+                spans.push(function.span);
+            } else if HELPERS.contains(&identifier.name.as_str()) {
+                if !helpers.insert(identifier.name.as_str()) {
+                    return Err(reject(
+                        "bootstrap",
+                        function.span,
+                        "duplicate current dispatch helper",
+                    ));
                 }
+                spans.push(function.span);
             }
         }
         if let Statement::VariableDeclaration(declaration) = statement {
             for variable in &declaration.declarations {
-                if let BindingPattern::BindingIdentifier(identifier) = &variable.id {
-                    if identifier.name == MISSING {
-                        if missing
-                            || declaration.kind != VariableDeclarationKind::Const
-                            || declaration.declarations.len() != 1
-                            || !matches!(&variable.init, Some(Expression::ObjectExpression(object)) if object.properties.is_empty())
-                        {
-                            return Err(reject(
-                                "bootstrap",
-                                declaration.span,
-                                "private missing token must be one const empty object literal",
-                            ));
-                        }
-                        missing = true;
-                        spans.push(declaration.span);
+                if let BindingPattern::BindingIdentifier(identifier) = &variable.id
+                    && identifier.name == MISSING
+                {
+                    if missing
+                        || declaration.kind != VariableDeclarationKind::Const
+                        || declaration.declarations.len() != 1
+                        || !matches!(&variable.init, Some(Expression::ObjectExpression(object)) if object.properties.is_empty())
+                    {
+                        return Err(reject(
+                            "bootstrap",
+                            declaration.span,
+                            "private missing token must be one const empty object literal",
+                        ));
                     }
+                    missing = true;
+                    spans.push(declaration.span);
                 }
             }
         }

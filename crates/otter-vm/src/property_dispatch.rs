@@ -102,7 +102,10 @@ impl Interpreter {
         value: &Value,
     ) -> Result<Option<object::StorePropertyTransition>, VmError> {
         let parent = object::keyed_shape(obj, &self.gc_heap);
-        if parent.is_null() || self.shape_offset_of(parent, key.name()).is_some() {
+        if parent.is_null()
+            || (key.atom().id() != crate::property_atom::AtomId::NONE
+                && self.shape_slot_of_atom(parent, key.atom().id()).is_some())
+        {
             return Ok(None);
         }
         // Normalize to dictionary storage past the fast-property cap:

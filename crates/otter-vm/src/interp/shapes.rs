@@ -122,13 +122,10 @@ impl Interpreter {
     }
 
     pub(crate) fn should_add_property(&mut self, obj: object::JsObject, key: &str) -> bool {
+        // A shaped object's own string keys are exactly its shape's.
         let shape = object::shape(obj, &self.gc_heap);
         !object::shape_body::is_dictionary_of(shape)
             && object::is_extensible(obj, &self.gc_heap)
-            && matches!(
-                object::lookup_own(obj, &self.gc_heap, key),
-                object::PropertyLookup::Absent
-            )
             && self.shape_offset_of(shape, key).is_none()
     }
 
@@ -497,9 +494,29 @@ impl Interpreter {
         })
     }
 
-    /// Look up a property slot in a GC-managed hidden-class shape.
+    /// Look up a property slot in a GC-managed hidden-class shape. A spelling
+    /// nothing has interned names no shape key.
     #[must_use]
-    pub(crate) fn shape_offset_of(&mut self, shape: object::ShapeHandle, key: &str) -> Option<u32> {
-        self.shape_runtime.offset_of(&self.gc_heap, shape, key)
+    pub(crate) fn shape_offset_of(&self, shape: object::ShapeHandle, key: &str) -> Option<u32> {
+        let atom = self.shape_runtime.names().lookup(key);
+        if atom == crate::property_atom::AtomId::NONE {
+            return None;
+        }
+        self.shape_slot_of_atom(shape, atom).map(|slot| slot.offset)
+    }
+
+    /// The slot `shape` gives `atom`, through the isolate's lookup cache
+    /// (V8's `DescriptorLookupCache`) before the transition-chain walk.
+    #[must_use]
+    pub(crate) fn shape_slot_of_atom(
+        &self,
+        shape: object::ShapeHandle,
+        atom: crate::property_atom::AtomId,
+    ) -> Option<object::shape_body::ShapeSlot> {
+        let heap = &self.gc_heap;
+        self.own_slot_cache
+            .slot(object::shape_body::id_of(shape), atom, || {
+                object::shape_body::shape_slot_of_atom(heap, shape, atom)
+            })
     }
 }

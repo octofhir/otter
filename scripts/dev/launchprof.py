@@ -155,24 +155,51 @@ def category(name):
     return "other"
 
 
+def demangler(names):
+    """Display names: Rust symbols demangled by `c++filt` (which reads the
+    v0 scheme), hash suffixes dropped; other names unchanged."""
+    mangled = sorted({part for name in names for part in name.split(" <- ")
+                      for part in part.split(" -> ") if part.startswith("_R")})
+    table = {}
+    if mangled:
+        try:
+            out = subprocess.run(["c++filt"], input="\n".join(mangled), capture_output=True,
+                                 text=True, check=True).stdout.splitlines()
+            table = dict(zip(mangled, out))
+        except (OSError, subprocess.CalledProcessError):
+            pass
+
+    def show(name):
+        def one(part):
+            text = table.get(part, part)
+            # Drop crate disambiguators and closure suffixes.
+            return text.replace("::{closure#0}", "{c}")
+        return " -> ".join(" <- ".join(one(p) for p in side.split(" <- "))
+                           for side in name.split(" -> "))
+    return show
+
+
 categories = collections.Counter()
 for name, count in self_counts.items():
     categories[category(name)] += count
 print("== categories")
 for name, count in categories.most_common():
     print(f"{count:6d} {100 * count / max(total, 1):5.1f}%  {name}")
+shown = list(self_counts) + list(inclusive) + (list(boundary) if boundary is not None else []) \
+    + (list(callers) + list(callees) if focus else [])
+show = demangler(shown)
 print("== self")
 for name, count in self_counts.most_common(top):
-    print(f"{count:6d}  {name[:150]}")
+    print(f"{count:6d}  {show(name)[:240]}")
 print("== inclusive")
 for name, count in inclusive.most_common(top):
-    print(f"{count:6d}  {name[:150]}")
+    print(f"{count:6d}  {show(name)[:240]}")
 if boundary is not None:
     print("== runtime entries called by generated code")
     for name, count in boundary.most_common(top):
-        print(f"{count:6d}  {name[:150]}")
+        print(f"{count:6d}  {show(name)[:240]}")
 if focus:
     for title, table in (("callers", callers), ("callees", callees)):
         print(f"== {title} of {focus}")
         for name, count in table.most_common(top):
-            print(f"{count:6d}  {name[:150]}")
+            print(f"{count:6d}  {show(name)[:240]}")

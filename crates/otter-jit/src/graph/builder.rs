@@ -2361,6 +2361,12 @@ impl<'a> Builder<'a> {
                 let b = self.tagged(rhs);
                 let value = self.add(Kind::PrimitiveCompare(condition), &[a, b], Repr::Tagged);
                 self.write(instruction.writes[0], value);
+            } else if matches!(instruction.op, Op::LooseEqual | Op::LooseNotEqual) {
+                let a = self.tagged(lhs);
+                let b = self.tagged(rhs);
+                let negate = instruction.op == Op::LooseNotEqual;
+                let value = self.add(Kind::LooseEqual { negate }, &[a, b], Repr::Tagged);
+                self.write(instruction.writes[0], value);
             } else {
                 self.generic(instruction);
             }

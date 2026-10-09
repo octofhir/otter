@@ -286,6 +286,13 @@ pub(crate) enum Kind {
     StrictEqual {
         negate: bool,
     },
+    /// `input0 == input1` (or `!=` when `negate`) on any two tagged values,
+    /// producing a tagged boolean: identity, two Numbers, `null`/`undefined`
+    /// and two cells that convert nothing inline, every coercing pair in
+    /// the runtime, which may run JavaScript.
+    LooseEqual {
+        negate: bool,
+    },
     /// `ToBoolean` producing a tagged boolean.
     ToBoolean,
     /// `!ToBoolean` producing a tagged boolean.
@@ -594,6 +601,7 @@ impl Kind {
                 | Self::PrimitiveCompare(_)
                 | Self::Float64Compare(_)
                 | Self::StrictEqual { .. }
+                | Self::LooseEqual { .. }
                 | Self::ToBoolean
                 | Self::LogicalNot
                 | Self::TestTypeOf { .. }
@@ -731,6 +739,7 @@ impl Kind {
             | Self::StorePropertyCached { .. }
             | Self::StoreKeyedCached { .. }
             | Self::Instanceof
+            | Self::LooseEqual { .. }
             | Self::NewObject
             | Self::NewArrayEmpty
             | Self::NewObjectLiteral
@@ -1013,7 +1022,7 @@ impl Kind {
                     }
                 }
             }
-            Self::StrictEqual { .. } => Constraints {
+            Self::StrictEqual { .. } | Self::LooseEqual { .. } => Constraints {
                 inputs: registers(2),
                 result: ResultPolicy::Register,
                 gp_temps: 0,

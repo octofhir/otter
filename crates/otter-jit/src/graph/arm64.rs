@@ -71,6 +71,7 @@ use crate::template::arm64::values::{emit_load_symbol_u64, emit_load_u64};
 mod allocation;
 mod binding;
 mod committed_call;
+mod equality;
 mod keyed_store;
 mod native_leaf;
 mod own_fields;
@@ -1372,6 +1373,12 @@ impl<'a> Codegen<'a> {
                     self.emit_strict_equal(node, [a, b], double, destination, condition);
                 }
             }
+            Kind::LooseEqual { negate } => {
+                let (a, b) = (Self::gp(input(0)), Self::gp(input(1)));
+                let destination = Self::gp(result.expect("a result"));
+                let double = allocation.fp_temps[0];
+                self.emit_loose_equal(node, [a, b], double, destination, *negate)?;
+            }
             Kind::CheckNumber => {
                 let a = Self::gp(input(0));
                 let exit = self.eager_exit(node, DeoptReason::WrongType);
@@ -1794,163 +1801,6 @@ impl<'a> Codegen<'a> {
             }
         }
         Ok(())
-    }
-
-    /// `X(destination)` = the tagged boolean of `X(a) === X(b)` under
-    /// `condition` (`Equal` for `===`, `NotEqual` for `!==`). Numbers compare
-    /// by value, identical words are equal, two cells of one string or BigInt
-    /// type compare by content through the leaf probe, and anything else
-    /// differs. Reads both inputs before it writes the result.
-    fn emit_strict_equal(
-        &mut self,
-        node: NodeId,
-        [a, b]: [u8; 2],
-        double: u8,
-        destination: u8,
-        condition: Condition,
-    ) {
-        let lhs_non_number = self.ops.new_dynamic_label();
-        let a_int = self.ops.new_dynamic_label();
-        let a_done = self.ops.new_dynamic_label();
-        let b_int = self.ops.new_dynamic_label();
-        let b_done = self.ops.new_dynamic_label();
-        let cells = self.ops.new_dynamic_label();
-        let leaf = self.ops.new_dynamic_label();
-        let equal = self.ops.new_dynamic_label();
-        let differ = self.ops.new_dynamic_label();
-        let done = self.ops.new_dynamic_label();
-        self.load_immediate(16, NUMBER_TAG);
-        dynasm!(self.ops
-            ; .arch aarch64
-            ; tst X(a), x16
-            ; b.eq =>lhs_non_number
-            ; tst X(b), x16
-            ; b.eq =>differ
-            // Two Numbers: compare their values; NaN is unordered.
-            ; cmp X(a), x16
-            ; b.hs =>a_int
-        );
-        self.load_immediate(17, DOUBLE_OFFSET);
-        dynasm!(self.ops
-            ; .arch aarch64
-            ; sub x17, X(a), x17
-            ; fmov d31, x17
-            ; b =>a_done
-            ; =>a_int
-            ; scvtf d31, W(a)
-            ; =>a_done
-            ; cmp X(b), x16
-            ; b.hs =>b_int
-        );
-        self.load_immediate(17, DOUBLE_OFFSET);
-        dynasm!(self.ops
-            ; .arch aarch64
-            ; sub x17, X(b), x17
-            ; fmov D(double), x17
-            ; b =>b_done
-            ; =>b_int
-            ; scvtf D(double), W(b)
-            ; =>b_done
-            ; fcmp d31, D(double)
-        );
-        self.emit_cset_bool(destination, condition, true);
-        dynasm!(self.ops
-            ; .arch aarch64
-            ; b =>done
-            ; =>lhs_non_number
-            ; tst X(b), x16
-            ; b.ne =>differ
-        );
-        self.load_immediate(16, NOT_CELL_MASK);
-        dynasm!(self.ops
-            ; .arch aarch64
-            ; tst X(a), x16
-            ; b.eq =>cells
-            ; tst X(b), x16
-            ; b.eq =>cells
-            // Two immediates: identity.
-            ; cmp X(a), X(b)
-            ; b.eq =>equal
-            ; b =>differ
-            ; =>cells
-            ; cmp X(a), X(b)
-            ; b.eq =>equal
-            // A cell differs from an immediate, and two cells of different
-            // types, or of a type compared by identity, differ.
-            ; tst X(a), x16
-            ; b.ne =>differ
-            ; tst X(b), x16
-            ; b.ne =>differ
-            ; ldrb w16, [X(a)]
-            ; ldrb w17, [X(b)]
-            ; cmp w16, w17
-            ; b.ne =>differ
-            ; cmp w16, u32::from(otter_vm::bigint::BIG_INT_BODY_TYPE_TAG)
-            ; b.eq =>leaf
-            ; cmp w16, u32::from(otter_vm::string::JS_STRING_BODY_TYPE_TAG)
-            ; b.ne =>differ
-        );
-        // Strings of different lengths differ without reading their units,
-        // and two strings with recorded atoms are equal exactly when their
-        // atoms are.
-        let length = self.view.string_layout.string_len_byte;
-        let atom = self.view.string_layout.atom_byte;
-        dynasm!(self.ops
-            ; .arch aarch64
-            ; ldr w16, [X(a), length]
-            ; ldr w17, [X(b), length]
-            ; cmp w16, w17
-            ; b.ne =>differ
-            ; ldr w16, [X(a), atom]
-            ; ldr w17, [X(b), atom]
-            ; cbz w16, =>leaf
-            ; cbz w17, =>leaf
-            ; cmp w16, w17
-            ; b.eq =>equal
-            ; =>differ
-        );
-        let (when_equal, when_differ) = if condition == Condition::Equal {
-            (VALUE_TRUE, VALUE_FALSE)
-        } else {
-            (VALUE_FALSE, VALUE_TRUE)
-        };
-        self.load_immediate(destination, when_differ);
-        dynasm!(self.ops ; .arch aarch64 ; b =>done ; =>equal);
-        self.load_immediate(destination, when_equal);
-        dynasm!(self.ops ; .arch aarch64 ; =>done);
-        let live = self.allocation.node(node).live_registers.clone();
-        self.deferred
-            .push(Box::new(move |codegen: &mut Codegen<'a>| {
-                dynasm!(codegen.ops ; .arch aarch64 ; =>leaf);
-                let saved = codegen.emit_save_registers(&live);
-                // The probe reads two string or BigInt bodies and allocates
-                // nothing; its only miss is a null heap, which generated
-                // code never passes.
-                dynasm!(codegen.ops
-                    ; .arch aarch64
-                    ; mov x16, X(a)
-                    ; mov x17, X(b)
-                    ; ldr x0, [x20, THREAD_OFFSET]
-                    ; ldr x0, [x0, VM_THREAD_GC_HEAP_OFFSET]
-                    ; mov x1, x16
-                    ; mov x2, x17
-                );
-                emit_load_symbol_u64(
-                    &mut codegen.ops,
-                    &mut codegen.relocations,
-                    16,
-                    otter_vm::runtime_stubs::STRICT_EQ_LEAF.entry_addr() as u64,
-                    RelocationTarget::runtime_stub(abi::STUB_STRICT_EQ_LEAF),
-                );
-                dynasm!(codegen.ops ; .arch aarch64 ; blr x16 ; mov x16, x0);
-                codegen.emit_restore_registers(&live, saved);
-                dynasm!(codegen.ops
-                    ; .arch aarch64
-                    ; cmp x16, VALUE_TRUE as u32
-                    ; b.eq =>equal
-                    ; b =>differ
-                );
-            }));
     }
 
     /// `X(destination)` = `typeof X(value)` compared with the encoded

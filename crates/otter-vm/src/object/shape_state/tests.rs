@@ -306,8 +306,8 @@ fn collecting_prototype_change_roots_receiver_prototype_keys_and_both_banks() {
             );
             let source_proto_state = shape_body::state_of(source_proto_shape);
             assert!(
-                source_proto_state.is_dictionary(),
-                "marker insertion owns dictionary storage"
+                !source_proto_state.is_dictionary(),
+                "marker insertion takes the transition the other children share"
             );
             assert!(!source_proto_state.is_prototype());
             let offsets = [owner, prototype, first, last]

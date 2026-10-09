@@ -3,11 +3,12 @@
 //! # Invariants
 //!
 //! - Direct and spread calls keep the newly-created generator rooted while its
-//!   prologue and observable `fn.prototype` lookup allocate.
+//!   prologue allocates and its `fn.prototype` (a writable, non-configurable
+//!   data property, §27.3.4) is resolved.
 //! - Native synchronous re-entry (`Array.from` driving `@@iterator`) uses the
 //!   same rooted generator ownership.
-//! - A throwing prototype getter releases its temporary root and leaves the
-//!   next generator call reusable.
+//! - Redefining a generator's `prototype` as an accessor is a TypeError and
+//!   leaves the next generator call reusable.
 
 use otter_runtime::{Runtime, SourceInput};
 
@@ -26,26 +27,17 @@ fn generator_calls_keep_owner_rooted_through_prototype_lookup() {
 
                 const directProto = {};
                 function* direct(value) { yield value; }
-                Object.defineProperty(direct, "prototype", {
-                    configurable: true,
-                    get() { return allocateAndReturn(directProto); }
-                });
+                direct.prototype = allocateAndReturn(directProto);
                 const directGen = direct(11);
 
                 const spreadProto = {};
                 function* spread(value) { yield value; }
-                Object.defineProperty(spread, "prototype", {
-                    configurable: true,
-                    get() { return allocateAndReturn(spreadProto); }
-                });
+                spread.prototype = allocateAndReturn(spreadProto);
                 const spreadGen = spread(...[13]);
 
                 const asyncProto = {};
                 async function* asyncDirect(value) { yield value; }
-                Object.defineProperty(asyncDirect, "prototype", {
-                    configurable: true,
-                    get() { return allocateAndReturn(asyncProto); }
-                });
+                asyncDirect.prototype = allocateAndReturn(asyncProto);
                 const asyncGen = asyncDirect(15);
 
                 const iterable = {
@@ -53,17 +45,17 @@ fn generator_calls_keep_owner_rooted_through_prototype_lookup() {
                 };
                 const from = Array.from(iterable);
 
-                const marker = {};
                 function* fails() { yield 19; }
-                Object.defineProperty(fails, "prototype", {
-                    configurable: true,
-                    get() {
-                        allocateAndReturn({});
-                        throw marker;
-                    }
-                });
                 let caughtSame = false;
-                try { fails(); } catch (error) { caughtSame = error === marker; }
+                try {
+                    Object.defineProperty(fails, "prototype", {
+                        configurable: true,
+                        get() { return allocateAndReturn({}); }
+                    });
+                } catch (error) {
+                    caughtSame = error instanceof TypeError;
+                }
+                fails();
 
                 const after = direct(23);
                 [

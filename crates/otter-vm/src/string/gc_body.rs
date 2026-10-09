@@ -450,6 +450,47 @@ pub fn alloc_latin1_string_body_with_roots(
     Ok(handle)
 }
 
+/// Allocate a Latin-1 string body directly in old space through the heap's
+/// diagnostic allocator, which neither collects nor charges the heap cap:
+/// the message of an out-of-memory error is built while the nursery and
+/// the cap are exhausted, beside its [`crate::object::alloc_diagnostic_object`]
+/// instance.
+///
+/// # Errors
+/// Surfaces [`otter_gc::OutOfMemory`] when old space has no room either.
+pub(crate) fn alloc_latin1_string_body_diagnostic(
+    heap: &mut GcHeap,
+    bytes: &[u8],
+) -> Result<JsStringHandle, otter_gc::OutOfMemory> {
+    let len = bytes.len() as u32;
+    if bytes.len() <= INLINE_LATIN1_CAP {
+        let mut inline = [0u8; INLINE_LATIN1_CAP];
+        inline[..bytes.len()].copy_from_slice(bytes);
+        return heap.alloc_old_diagnostic(JsStringBody {
+            atom: 0,
+            len,
+            hash: 0,
+            repr: JsStringBodyRepr::InlineLatin1(inline),
+            utf16_cache: JsStringHandle::null(),
+        });
+    }
+    let handle = heap.alloc_old_diagnostic_trailing(
+        JsStringBody {
+            atom: 0,
+            len,
+            hash: 0,
+            repr: JsStringBodyRepr::SeqLatin1,
+            utf16_cache: JsStringHandle::null(),
+        },
+        JsStringBody::trailing_bytes(true, bytes.len()),
+    )?;
+    heap.with_payload(handle, |body| {
+        body.init_seq_latin1(bytes);
+        true
+    });
+    Ok(handle)
+}
+
 /// Concatenate two GC string bodies into a `Cons` rope node.
 ///
 /// Cheap: bounded by the depth-bound check plus one allocation. If

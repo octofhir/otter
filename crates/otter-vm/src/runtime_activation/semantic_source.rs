@@ -27,11 +27,12 @@ pub(crate) fn frame_semantic_source(
     context: &ExecutionContext,
     frame: &Frame,
 ) -> Result<(u32, u32), VmError> {
-    let Some(record) = vm.jit_frame_safepoint(frame)? else {
+    let anchor = vm.jit_frame_return_pc(frame);
+    let Some(record) = vm.jit_anchored_safepoint(frame, anchor)? else {
         return Ok((frame.header.function_id, frame.header.pc));
     };
     if record.inline_frames.is_empty() {
-        let pc = vm.jit_frame_source_pc(frame, Some(record));
+        let pc = vm.jit_frame_source_pc(frame, anchor, Some(record));
         return Ok((frame.header.function_id, pc));
     }
     if record.call_pc == NO_CALL_PC {

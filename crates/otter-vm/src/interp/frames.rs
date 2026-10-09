@@ -263,6 +263,21 @@ impl Interpreter {
         })
     }
 
+    /// [`Self::jit_native_frames`], each paired with its published child: the
+    /// record visited just before it, whose caller link names it (null for
+    /// the innermost record).
+    pub(crate) fn jit_native_frames_with_children(
+        &self,
+    ) -> impl Iterator<Item = (*mut crate::native_abi::Frame, *mut crate::native_abi::Frame)> + '_
+    {
+        let mut child = std::ptr::null_mut();
+        self.jit_native_frames().map(move |frame| {
+            let pair = (frame, child);
+            child = frame;
+            pair
+        })
+    }
+
     /// Link `frame` as the innermost published native frame.
     ///
     /// # Safety
@@ -351,11 +366,12 @@ impl Interpreter {
     /// (including Host frames) carry their suspended caller's genuine return.
     /// The one pending request covers the interval before child publication.
     /// A nonzero anchor which does not resolve is an error, never a PC fallback.
-    pub(crate) fn jit_frame_safepoint(
+    /// `anchor` is the frame's [`Self::jit_frame_return_pc`].
+    pub(crate) fn jit_anchored_safepoint(
         &self,
         frame: &crate::native_abi::Frame,
+        anchor: u64,
     ) -> Result<Option<&crate::native_abi::SafepointRecord>, VmError> {
-        let anchor = self.jit_frame_return_pc(frame);
         let code_id = u64::from(frame.code_object_id);
         if anchor != 0 {
             if self.jit_code_registry.generation_function_id(code_id)
@@ -393,41 +409,56 @@ impl Interpreter {
             return 0;
         }
         let address = std::ptr::from_ref(frame).addr() as u64;
-        let mut anchor = 0;
+        // The innermost record has no child; any other has exactly one.
+        let child = if self.jit_innermost_native_frame().addr() as u64 == address {
+            std::ptr::null_mut()
+        } else {
+            self.jit_native_frames()
+                .find(|&child| unsafe { (*child).caller } == address)
+                .unwrap_or(std::ptr::null_mut())
+        };
+        self.jit_child_return_pc(frame, child)
+    }
+
+    /// [`Self::jit_frame_return_pc`] of `frame` whose published child (null
+    /// when it has none) is already known, as a walk outward knows it.
+    pub(crate) fn jit_child_return_pc(
+        &self,
+        frame: &crate::native_abi::Frame,
+        child: *const crate::native_abi::Frame,
+    ) -> u64 {
+        if frame.code_object_id == 0 {
+            return 0;
+        }
+        let address = std::ptr::from_ref(frame).addr() as u64;
         if let Some(context) = self.jit_context {
             let pending = unsafe { &(*context.as_ptr()).pending_call };
             if pending.caller_return_pc > crate::native_abi::NO_CALLER_RETURN_PC
                 && pending.caller == address
             {
-                anchor = pending.caller_return_pc;
+                return pending.caller_return_pc;
             }
         }
-        if anchor == 0 {
-            for child in self.jit_native_frames() {
-                let child = unsafe { &*child };
-                if child.caller == address {
-                    // SAFETY: published records stay anchored at their live
-                    // machine frames.
-                    anchor = unsafe { child.return_pc_into_caller() };
-                    break;
-                }
-            }
-        }
-        anchor
+        // SAFETY: a published child stays anchored at its live machine frame.
+        let Some(child) = (unsafe { child.as_ref() }) else {
+            return 0;
+        };
+        debug_assert_eq!(child.caller, address, "child must link to its caller");
+        unsafe { child.return_pc_into_caller() }
     }
 
     /// An active Template helper publishes its current header PC, even if an
     /// earlier cold JS stage left a source-bearing window record in call_site.
     /// Graph helpers publish their own exact source/inline map. Suspended calls
-    /// always use the actual return association; they never use the header PC.
+    /// always use the actual return association (`anchor`, from
+    /// [`Self::jit_frame_return_pc`]); they never use the header PC.
     pub(crate) fn jit_frame_source_pc(
         &self,
         frame: &crate::native_abi::Frame,
+        anchor: u64,
         record: Option<&crate::native_abi::SafepointRecord>,
     ) -> u32 {
-        if self.jit_frame_return_pc(frame) != 0
-            || frame.header.kind == native_abi::NativeFrameKind::Optimizing
-        {
+        if anchor != 0 || frame.header.kind == native_abi::NativeFrameKind::Optimizing {
             if let Some(pc) = record
                 .map(|record| record.call_pc)
                 .filter(|pc| *pc != native_abi::NO_CALL_PC)
@@ -456,14 +487,15 @@ impl Interpreter {
                 unsafe { pending.trace_return_roots(visitor) };
             }
         }
-        for native in self.jit_native_frames() {
+        for (native, child) in self.jit_native_frames_with_children() {
             let frame = unsafe { crate::ActiveFrameRef::from_ptr(native) }
                 .expect("published native frame must remain valid");
             frame.trace_stack_register_slots(visitor);
             frame.trace_non_register_slots(visitor);
             let physical = unsafe { &*native };
+            let anchor = self.jit_child_return_pc(physical, child);
             let Some(safepoint) = self
-                .jit_frame_safepoint(physical)
+                .jit_anchored_safepoint(physical, anchor)
                 .expect("published native root anchor must resolve exactly")
             else {
                 continue;

@@ -356,6 +356,8 @@ pub(crate) const ARRAY_BODY_DENSE_OWN_GUARD_OFFSET: usize =
     std::mem::offset_of!(ArrayBody, dense_own_guard);
 
 pub(crate) const ARRAY_BODY_SLAB_OFFSET: usize = std::mem::offset_of!(ArrayBody, slab);
+/// Byte offset of the compressed exotic-sidecar handle.
+pub(crate) const ARRAY_BODY_EXOTIC_OFFSET: usize = std::mem::offset_of!(ArrayBody, exotic);
 pub(crate) const ARRAY_BODY_DENSE_CAP_OFFSET: usize = std::mem::offset_of!(ArrayBody, dense_cap);
 
 /// Native guard literal for terminal tagged dense storage.

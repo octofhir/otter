@@ -25,7 +25,10 @@ use crate::{
 
 impl Codegen<'_> {
     pub(super) fn emit_memory(&mut self, node: NodeId) -> Result<bool, Unsupported> {
-        if self.emit_elements(node)? || self.emit_properties(node)? {
+        if self.emit_elements(node)?
+            || self.emit_properties(node)?
+            || self.emit_keyed_store(node)?
+        {
             return Ok(true);
         }
         let allocation = self.allocation.node(node).clone();

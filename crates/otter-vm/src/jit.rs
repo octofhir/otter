@@ -1678,6 +1678,56 @@ impl JitElementRepr {
     }
 }
 
+/// An ordinary Array's dense storage as a generic keyed store reads it,
+/// whatever storage kind the array currently has (V8's
+/// `KeyedStoreGenericAssembler` over fast elements kinds). Offsets count
+/// from the Array's `GcHeader`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct JitArrayStorage {
+    /// The Array cell tag.
+    pub type_tag: u8,
+    /// Byte that reads zero while present dense slots have default own data
+    /// semantics.
+    pub own_guard_byte: u32,
+    /// Compressed exotic-sidecar handle: zero while the array has neither a
+    /// custom prototype nor exotic own state, so that, while the realm's
+    /// array-index accessor protector also holds, a store into a hole is an
+    /// ordinary own addition.
+    pub exotic_byte: u32,
+    /// `u32` live dense length.
+    pub length_byte: u32,
+    /// Element base pointer.
+    pub base_byte: u32,
+    /// Kind byte of tagged storage, whose holes are the hole sentinel.
+    pub tagged_kind: u8,
+    /// Numeric storage: the cached kind byte, its kinds and hole bitmap.
+    pub numeric: JitHoleBitmap,
+}
+
+impl JitArrayStorage {
+    /// The VM's current Array layout.
+    #[must_use]
+    pub const fn current() -> Self {
+        let header = std::mem::size_of::<otter_gc::GcHeader>() as u32;
+        Self {
+            type_tag: crate::array::ARRAY_BODY_TYPE_TAG,
+            own_guard_byte: header + crate::array::ARRAY_BODY_DENSE_OWN_GUARD_OFFSET as u32,
+            exotic_byte: header + crate::array::ARRAY_BODY_EXOTIC_OFFSET as u32,
+            length_byte: header + crate::array::ARRAY_BODY_DENSE_LEN_OFFSET as u32,
+            base_byte: header + crate::array::ARRAY_BODY_ELEMENTS_PTR_OFFSET as u32,
+            tagged_kind: crate::array::DENSE_ELEMENT_KIND_TAGGED as u8,
+            numeric: JitHoleBitmap {
+                capacity_byte: crate::array::elements::CAPACITY_FROM_DATA_BYTE,
+                hole_count_byte: crate::array::elements::HOLE_COUNT_FROM_DATA_BYTE,
+                storage_kind_byte: crate::array::elements::KIND_FROM_DATA_BYTE,
+                kind_byte: header + crate::array::ARRAY_BODY_DENSE_KIND_OFFSET as u32,
+                packed_kind: crate::array::DENSE_ELEMENT_KIND_PACKED_DOUBLE as u8,
+                holey_kind: crate::array::DENSE_ELEMENT_KIND_HOLEY_DOUBLE as u8,
+            },
+        }
+    }
+}
+
 /// One receiver family's indexed-element storage, as the guard program reads it.
 ///
 /// Every element-bearing body answers the same questions — which cell tag it
@@ -1717,6 +1767,12 @@ pub struct JitHoleBitmap {
     /// Signed byte offset, from the element base, of the storage's `u32`
     /// element capacity.
     pub capacity_byte: i32,
+    /// Signed byte offset, from the element base, of the storage's `u32`
+    /// count of set bits. Clearing the last one makes the storage packed.
+    pub hole_count_byte: i32,
+    /// Signed byte offset, from the element base, of the storage's own kind
+    /// byte, which a packed transition rewrites with the receiver's.
+    pub storage_kind_byte: i32,
     /// Byte offset, from the receiver's `GcHeader`, of its one-byte storage
     /// kind.
     pub kind_byte: u32,

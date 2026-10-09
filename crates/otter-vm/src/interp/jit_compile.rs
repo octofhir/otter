@@ -1552,12 +1552,7 @@ impl Interpreter {
                 )),
                 None,
             ],
-            holes: Some(jit::JitHoleBitmap {
-                capacity_byte: crate::array::elements::CAPACITY_FROM_DATA_BYTE,
-                kind_byte: header + crate::array::ARRAY_BODY_DENSE_KIND_OFFSET as u32,
-                packed_kind: crate::array::DENSE_ELEMENT_KIND_PACKED_DOUBLE as u8,
-                holey_kind: crate::array::DENSE_ELEMENT_KIND_HOLEY_DOUBLE as u8,
-            }),
+            holes: Some(jit::JitArrayStorage::current().numeric),
             ..Self::dense_element_access(
                 jit::JitElementRepr::Float64,
                 crate::array::DENSE_ELEMENT_KIND_HOLEY_DOUBLE,

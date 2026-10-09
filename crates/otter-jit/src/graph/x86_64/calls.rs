@@ -57,20 +57,19 @@ impl Codegen<'_> {
         span_bytes: u32,
     ) -> Result<(), Unsupported> {
         assert!(arguments.len() <= 3);
-        assert!(
-            arguments
-                .iter()
-                .filter(|arg| matches!(arg, CommittedArgument::Value(_)))
-                .count()
-                <= 2
-        );
         self.save_live_homes(node);
         self.stamp_node_safepoint(node)?;
         self.stamp_pc(node);
+        // Values may sit in any argument register: stage the first two in the
+        // scratch pair and a third on the stack before any is overwritten.
         let mut staged = 0;
         for argument in arguments {
             if let CommittedArgument::Value(value) = *argument {
-                dynasm!(self.ops ; .arch x64 ; mov Rq(10 + staged), Rq(value));
+                if staged < 2 {
+                    dynasm!(self.ops ; .arch x64 ; mov Rq(10 + staged), Rq(value));
+                } else {
+                    dynasm!(self.ops ; .arch x64 ; push Rq(value));
+                }
                 staged += 1;
             }
         }
@@ -80,7 +79,11 @@ impl Codegen<'_> {
             let register = [6, 2, 1][index];
             match argument {
                 CommittedArgument::Value(_) => {
-                    dynasm!(self.ops ; .arch x64 ; mov Rq(register), Rq(10 + staged));
+                    if staged < 2 {
+                        dynasm!(self.ops ; .arch x64 ; mov Rq(register), Rq(10 + staged));
+                    } else {
+                        dynasm!(self.ops ; .arch x64 ; pop Rq(register));
+                    }
                     staged += 1;
                 }
                 CommittedArgument::Scalar(bits) => self.load_immediate(register, *bits),

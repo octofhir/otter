@@ -107,6 +107,13 @@ pub(crate) const SLAB_DIRTY_START_BYTE: usize = std::mem::offset_of!(ElementSlab
 pub(crate) const CAPACITY_FROM_DATA_BYTE: i32 = std::mem::offset_of!(ElementSlabBody, capacity)
     as i32
     - std::mem::size_of::<ElementSlabBody>() as i32;
+/// Signed byte offset of a slab's `u32` hole count from its element base.
+pub(crate) const HOLE_COUNT_FROM_DATA_BYTE: i32 = std::mem::offset_of!(ElementSlabBody, hole_count)
+    as i32
+    - std::mem::size_of::<ElementSlabBody>() as i32;
+/// Signed byte offset of a slab's kind byte from its element base.
+pub(crate) const KIND_FROM_DATA_BYTE: i32 = std::mem::offset_of!(ElementSlabBody, kind) as i32
+    - std::mem::size_of::<ElementSlabBody>() as i32;
 const _: () = assert!(std::mem::align_of::<ElementSlabBody>() == 8);
 
 impl ElementSlabBody {

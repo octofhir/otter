@@ -3611,7 +3611,7 @@ impl<'a> Builder<'a> {
         let access = match self.element_access(instruction) {
             Ok(access) => access,
             Err(true) => return self.deopt(DeoptReason::InsufficientFeedback),
-            Err(false) => return self.generic(instruction),
+            Err(false) => return self.keyed_store(instruction),
         };
         let value = self.read(instruction.reads[2]);
         let element = access.element;
@@ -3673,6 +3673,38 @@ impl<'a> Builder<'a> {
                 Repr::None,
             );
         }
+    }
+
+    /// An element store that sees Array storage of several kinds, or whose
+    /// speculation left for a bound, a hole or another layout: V8's generic
+    /// keyed store, without a deopt. A typed-array site keeps its baseline
+    /// operation.
+    fn keyed_store(&mut self, instruction: &Instruction) {
+        let typed = matches!(
+            self.view.element_accesses.get(&instruction.byte_pc),
+            Some(access) if access.type_tag != otter_vm::array::ARRAY_BODY_TYPE_TAG
+        );
+        // The runtime completion reads the physical frame's function, which
+        // an inlined body is not.
+        if self.inline.is_some()
+            || instruction.op != Op::StoreElement
+            || self.view.cage_base == 0
+            || typed
+        {
+            return self.generic(instruction);
+        }
+        let receiver = self.read(instruction.reads[0]);
+        let receiver = self.tagged(receiver);
+        let key = self.read(instruction.reads[1]);
+        let key = self.tagged(key);
+        let value = self.read(instruction.reads[2]);
+        let value = self.tagged(value);
+        self.add(
+            Kind::StoreKeyedCached { pc: self.pc },
+            &[receiver, key, value],
+            Repr::None,
+        );
+        self.known.elements_read.clear();
     }
 
     /// Whether `value` is, or is speculated by this site's value feedback to

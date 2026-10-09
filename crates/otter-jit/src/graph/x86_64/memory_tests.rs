@@ -413,6 +413,8 @@ fn graph_numeric_holes_use_the_indexed_bitmap_word() {
         &mut allocation,
         Kind::CheckHoleyElementPresent(JitHoleBitmap {
             capacity_byte: -8,
+            hole_count_byte: -4,
+            storage_kind_byte: -12,
             kind_byte: 0,
             packed_kind: 0,
             holey_kind: 1,

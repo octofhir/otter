@@ -58,13 +58,6 @@ impl Codegen<'_> {
         span_bytes: u32,
     ) -> Result<(), crate::Unsupported> {
         assert!(arguments.len() <= 3, "bounded committed ABI arguments");
-        assert!(
-            arguments
-                .iter()
-                .filter(|arg| matches!(arg, CommittedArgument::Value(_)))
-                .count()
-                <= 2
-        );
         let live = self.allocation.node(node).live_homes.clone();
         for &(location, home) in &live {
             if !matches!(home, Location::Constant(_)) {
@@ -74,10 +67,16 @@ impl Codegen<'_> {
         self.stamp_node_safepoint(node)?;
         self.load_word32(16, self.graph.outer_pc(node));
         dynasm!(self.ops ; .arch aarch64 ; str w16, [x21, crate::entry::NATIVE_FRAME_PC_OFFSET]);
+        // Values may sit in any argument register: stage the first two in the
+        // scratch pair and a third on the stack before any is overwritten.
         let mut staged = 0u8;
         for argument in arguments {
             if let CommittedArgument::Value(value) = *argument {
-                dynasm!(self.ops ; .arch aarch64 ; mov X(16 + staged), X(value));
+                if staged < 2 {
+                    dynasm!(self.ops ; .arch aarch64 ; mov X(16 + staged), X(value));
+                } else {
+                    dynasm!(self.ops ; .arch aarch64 ; str X(value), [sp, #-16]!);
+                }
                 staged += 1;
             }
         }
@@ -87,7 +86,11 @@ impl Codegen<'_> {
             let register = 1 + index as u8;
             match argument {
                 CommittedArgument::Value(_) => {
-                    dynasm!(self.ops ; .arch aarch64 ; mov X(register), X(16 + staged));
+                    if staged < 2 {
+                        dynasm!(self.ops ; .arch aarch64 ; mov X(register), X(16 + staged));
+                    } else {
+                        dynasm!(self.ops ; .arch aarch64 ; ldr X(register), [sp], #16);
+                    }
                     staged += 1;
                 }
                 CommittedArgument::Scalar(bits) => self.load_immediate(register, *bits),

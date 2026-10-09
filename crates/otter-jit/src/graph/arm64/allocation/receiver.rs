@@ -1,7 +1,7 @@
 //! Inline constructor receivers over the shared nursery buffer.
 //!
 //! # Contents
-//! - Live family/prototype proof of the new.target, then one LAB fit.
+//! - Exact family identity proof of the new.target, then one LAB fit.
 //! - A collecting buffer refill and one retried fit on a space miss.
 //!
 //! # Invariants
@@ -35,7 +35,7 @@ impl Codegen<'_> {
         let refill = self.ops.new_dynamic_label();
         let done = self.ops.new_dynamic_label();
         crate::arm64::emit_receiver_fit(&mut self.ops, view, plan, 20, refill);
-        crate::arm64::emit_receiver_bump(&mut self.ops, 20);
+        crate::arm64::emit_receiver_bump(&mut self.ops, view, plan, 20);
         dynasm!(self.ops ; .arch aarch64 ; b =>done ; =>refill);
         let bytes = view
             .field_layout
@@ -56,7 +56,7 @@ impl Codegen<'_> {
             abi::ExitAction::Resume,
         );
         crate::arm64::emit_receiver_fit(&mut self.ops, view, plan, 20, miss);
-        crate::arm64::emit_receiver_bump(&mut self.ops, 20);
+        crate::arm64::emit_receiver_bump(&mut self.ops, view, plan, 20);
         dynasm!(self.ops ; .arch aarch64 ; =>done);
         Ok(())
     }

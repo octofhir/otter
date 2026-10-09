@@ -114,8 +114,6 @@ pub(crate) const CONSTRUCTOR_LAYOUT_FAMILY_ID_OFFSET: usize =
     std::mem::offset_of!(ConstructorLayoutBody, family_id);
 pub(crate) const CONSTRUCTOR_LAYOUT_ROOT_OFFSET: usize =
     std::mem::offset_of!(ConstructorLayoutBody, root);
-pub(crate) const CONSTRUCTOR_LAYOUT_SAMPLES_REMAINING_OFFSET: usize =
-    std::mem::offset_of!(ConstructorLayoutBody, samples_remaining);
 
 impl ConstructorLayoutBody {
     #[allow(clippy::too_many_arguments)]
@@ -154,6 +152,9 @@ impl ConstructorLayoutBody {
     }
     pub(crate) fn root(&self) -> ShapeHandle {
         self.root
+    }
+    pub(crate) fn prototype(&self) -> Value {
+        self.prototype
     }
     pub(crate) fn base_function_id(&self) -> u32 {
         self.base_function_id
@@ -281,6 +282,21 @@ impl ConstructorFamilies {
         }
         families.next_id.set(next);
         families
+    }
+}
+
+/// Detach every family of one owner's list starting at `head`, after its
+/// prototype changed: none may seed a generated plan again, and the caller
+/// clears the head so no generated family hit survives the change. In-flight
+/// canonical tickets keep their detached family alive. Old layout cells and
+/// no allocation: the walk cannot collect.
+pub(crate) fn detach_families(heap: &mut GcHeap, head: ConstructorLayout) {
+    let mut current = head;
+    while !current.is_null() {
+        current = heap.with_payload(current, |body| {
+            body.detached = true;
+            body.next
+        });
     }
 }
 

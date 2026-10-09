@@ -19,7 +19,10 @@
 //!   allocated, then its value. It never lives in the bag, so assigning
 //!   `F.prototype` gives the closure no own-property bag. The property is
 //!   non-enumerable and non-configurable; `prototype_writable` is its only
-//!   attribute that can change (true → false).
+//!   attribute that can change (true → false). Storing a different value
+//!   detaches every constructor family and clears `constructor_layouts`.
+//! - `prototype_ordinary` is set exactly while `prototype` holds an ordinary
+//!   object: generated `instanceof` reads it in place of the slot's type.
 //! - `proto_override` is meaningful only while the owning closure's
 //!   [`crate::closure::CLOSURE_LOOKUP_PROTO_OVERRIDE`] bit is set; it is traced
 //!   either way.
@@ -49,6 +52,7 @@ pub type ClosureRareHandle = otter_gc::Gc<ClosureRareBody>;
 pub struct ClosureRareBody {
     pub(crate) own_props: JsObject,
     pub(crate) prototype_writable: bool,
+    pub(crate) prototype_ordinary: bool,
     pub(crate) constructor_layouts: crate::constructor_layout::ConstructorLayout,
     pub(crate) prototype: Value,
     pub(crate) proto_override: Value,
@@ -56,6 +60,9 @@ pub struct ClosureRareBody {
 
 /// Byte offset of the own-property bag handle in the payload.
 pub const CLOSURE_RARE_OWN_PROPS_OFFSET: usize = std::mem::offset_of!(ClosureRareBody, own_props);
+/// Byte offset of the flag that the `prototype` slot holds an ordinary object.
+pub const CLOSURE_RARE_PROTOTYPE_ORDINARY_OFFSET: usize =
+    std::mem::offset_of!(ClosureRareBody, prototype_ordinary);
 /// Byte offset of the `prototype` slot (hole until allocated) in the payload.
 pub const CLOSURE_RARE_PROTOTYPE_OFFSET: usize = std::mem::offset_of!(ClosureRareBody, prototype);
 /// Byte offset of the traced constructor family head.
@@ -67,6 +74,7 @@ impl Default for ClosureRareBody {
         Self {
             own_props: JsObject::null(),
             prototype_writable: true,
+            prototype_ordinary: false,
             constructor_layouts: crate::constructor_layout::ConstructorLayout::null(),
             prototype: Value::hole(),
             proto_override: Value::undefined(),

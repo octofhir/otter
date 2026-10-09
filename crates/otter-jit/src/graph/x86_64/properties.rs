@@ -611,14 +611,13 @@ impl Codegen<'_> {
                 ; cmp r10d, otter_vm::closure::CLOSURE_LOOKUP_ORDINARY as i32 ; jne =>miss
                 ; mov Rd(rare), [Rq(rare) + layout.rare_byte as i32] ; test Rd(rare), Rd(rare) ; jz =>miss
                 ; add Rq(rare), Rq(cage)
+                // Any `prototype` but an ordinary object completes in the runtime.
+                ; cmp BYTE [Rq(rare) + layout.prototype_ordinary_byte as i32], 0 ; je =>miss
                 ; mov r10d, [Rq(rare) + layout.own_props_byte as i32] ; test r10d, r10d ; jz =>symbols_absent
                 ; add r10, Rq(cage) ; mov r10d, [r10 + view.object_exotic_handle_byte as i32]
                 ; test r10d, r10d ; jz =>symbols_absent ; add r10, Rq(cage)
                 ; cmp DWORD [r10 + otter_vm::object::EXOTIC_SLOTS_SYMBOL_PROPS_BYTE as i32], 0 ; jne =>miss
                 ; =>symbols_absent ; mov Rq(prototype), [Rq(rare) + layout.prototype_byte as i32]);
-            self.emit_cell_guard(prototype, miss);
-            dynasm!(self.ops ; .arch x64 ; mov Rd(prototype), Rd(prototype) ; add Rq(prototype), Rq(cage)
-                ; cmp BYTE [Rq(prototype)], crate::entry::OBJECT_BODY_TYPE_TAG as i8 ; jne =>miss);
             self.emit_cell_guard(value, no);
             dynasm!(self.ops ; .arch x64 ; mov Rd(cursor), Rd(value) ; add Rq(cursor), Rq(cage)
                 ; movzx r10d, BYTE [Rq(cursor)] ; cmp r10d, crate::entry::OBJECT_BODY_TYPE_TAG as i32 ; je =>walk);

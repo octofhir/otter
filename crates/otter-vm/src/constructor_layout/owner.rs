@@ -9,7 +9,11 @@
 //! Base function identity partitions one actual new.target's family list.
 //! Prototype replacement creates a new monotonic family identity and detaches
 //! the old family from the owner; in-flight canonical tickets keep that old
-//! family alive. Closures of the same template and class wrappers never share
+//! family alive. A closure's `prototype` store detaches its whole list and
+//! clears the head (`JsClosure::set_prototype_value`), and a class's
+//! `prototype` never changes, so a non-null head always holds the owner's
+//! current prototype: generated code proves the receiver's prototype by the
+//! head family's identity alone. Closures of the same template and class wrappers never share
 //! layout state. Each moving source operand lives in a branded handle across
 //! allocations. Generated hit uses only the head family; selecting an existing
 //! family moves it to the head without allocation or effects.

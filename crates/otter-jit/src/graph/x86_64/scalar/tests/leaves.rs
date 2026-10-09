@@ -163,7 +163,7 @@ fn fixture(kind: Kind) -> crate::CompiledCode {
         committed_throw,
         propagate,
         materialize,
-        sites: crate::graph::metadata::SitePlan::new(slots.spill_tagged),
+        sites: crate::graph::metadata::SitePlan::new(slots),
         return_sites: Vec::new(),
     };
     // Four saved nonvolatile words plus 24 local bytes give 16-byte alignment.

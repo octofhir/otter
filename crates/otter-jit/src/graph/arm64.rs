@@ -281,7 +281,7 @@ pub(crate) fn emit(
         no_direct_call_events: None,
         no_code_map: None,
         spliced_functions: std::collections::BTreeSet::new(),
-        sites: metadata::SitePlan::new(slots.spill_tagged),
+        sites: metadata::SitePlan::new(slots),
         return_sites: Vec::new(),
         node_offsets: Vec::new(),
         threw,

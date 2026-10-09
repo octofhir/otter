@@ -197,9 +197,12 @@ pub struct SafepointRecord {
     /// Native spill slots holding live tagged values, beyond the canonical
     /// register window the collector always traces.
     pub spill_roots: SpillRoots,
-    /// Logical inline descendants, with values indexed into the precise spill map.
-    /// The owning code generation and this record's id select the recipe.
-    pub inline_frames: Box<[crate::deopt::DeoptFrame<Option<u16>>]>,
+    /// Logical inline descendants, outermost first: each one's function and
+    /// byte PC and, at a generated JavaScript call, its activation's binding
+    /// and actual arguments as slots of this frame's homes or constants (V8's
+    /// FrameInspector over the call's frame state). The owning code
+    /// generation and this record's id select the recipe.
+    pub inline_frames: Box<[crate::deopt::DeoptFrame]>,
     /// Canonical PC, in the code object's own function, of the generated
     /// JavaScript call this safepoint belongs to, or [`NO_CALL_PC`]. Stack
     /// walks read a calling frame's position here instead of a per-call PC
@@ -273,6 +276,13 @@ mod tests {
         assert!(SpillRoots::from_slots([]).is_empty());
     }
 
+    fn home(offset: i32) -> crate::deopt::DeoptSlot {
+        crate::deopt::DeoptSlot::physical(
+            crate::deopt::DeoptLocation::StackSlot(offset),
+            crate::deopt::DeoptRepr::Tagged,
+        )
+    }
+
     #[test]
     fn retained_bytes_include_spill_bitmap_and_nested_inline_slots_once() {
         let record = SafepointRecord {
@@ -280,8 +290,8 @@ mod tests {
             frame_state: NO_FRAME_STATE,
             spill_roots: SpillRoots::from_slots([0, 1, 70]),
             inline_frames: Box::new([
-                crate::deopt::DeoptFrame::with_window(7, 11, None, [Some(0), None, Some(1)]),
-                crate::deopt::DeoptFrame::with_window(8, 12, None, [Some(1)]),
+                crate::deopt::DeoptFrame::with_window(7, 11, None, [home(0), home(8), home(16)]),
+                crate::deopt::DeoptFrame::with_window(8, 12, None, [home(8)]),
             ]),
             call_pc: NO_CALL_PC,
         };
@@ -290,8 +300,7 @@ mod tests {
             .iter()
             .map(|frame| std::mem::size_of_val(frame.slots.as_ref()))
             .sum();
-        let expected =
-            2 * 8 + 2 * std::mem::size_of::<crate::deopt::DeoptFrame<Option<u16>>>() + inline_slots;
+        let expected = 2 * 8 + 2 * std::mem::size_of::<crate::deopt::DeoptFrame>() + inline_slots;
         assert_eq!(record.retained_bytes(), expected as u64);
         let mut record = record;
         record.inline_frames = Box::default();

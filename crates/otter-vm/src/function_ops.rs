@@ -2547,7 +2547,7 @@ impl Interpreter {
             return Ok(None);
         }
         match name {
-            "caller" => Ok(Some(self.legacy_caller_value(context, stack, receiver))),
+            "caller" => Ok(Some(self.legacy_caller_value(context, receiver))),
             "arguments" => self
                 .legacy_arguments_value(stack, context, receiver)
                 .map(Some),
@@ -2578,38 +2578,35 @@ impl Interpreter {
     /// module frames are looked through (legacy `caller` sees past
     /// eval boundaries); strict, generator, and async callers are
     /// censored to `null`; no live activation yields `null`.
-    fn legacy_caller_value(
-        &self,
-        context: &ExecutionContext,
-        stack: &ActivationStack,
-        callee: Value,
-    ) -> Value {
+    fn legacy_caller_value(&self, context: &ExecutionContext, callee: Value) -> Value {
         let mut found = false;
-        for frame in stack.iter().rev() {
+        // Activations a compiled frame runs inlined are activations too.
+        for activation in self.logical_activations() {
             if !found {
-                found = frame.self_value == callee;
+                found = activation.callee == callee;
                 continue;
             }
-            let Ok(owner) = context.for_function(frame.function_id) else {
+            let function_id = activation.function_id;
+            let Ok(owner) = context.for_function(function_id) else {
                 continue;
             };
-            let Some(function) = owner.exec_function(frame.function_id) else {
+            let Some(function) = owner.exec_function(function_id) else {
                 continue;
             };
             let is_main = owner
-                .function(frame.function_id)
+                .function(function_id)
                 .is_none_or(|f| f.name == "<main>");
             if function.is_module || is_main {
                 continue;
             }
-            if owner.function_is_strict(frame.function_id)
+            if owner.function_is_strict(function_id)
                 || owner
-                    .function(frame.function_id)
+                    .function(function_id)
                     .is_none_or(|f| f.is_generator || f.is_async)
             {
                 return Value::null();
             }
-            return frame.self_value;
+            return activation.callee;
         }
         Value::null()
     }
@@ -2626,10 +2623,18 @@ impl Interpreter {
         callee: Value,
     ) -> Result<Value, VmError> {
         let mut args: Option<Vec<Value>> = None;
-        for frame in stack.iter().rev() {
-            if frame.self_value != callee {
+        // An activation a compiled frame runs inlined reads its actuals from
+        // that frame's record; a physical one from its own frame.
+        for activation in self.logical_activations() {
+            if activation.callee != callee {
                 continue;
             }
+            if activation.inlined {
+                args = activation.inlined_arguments;
+                break;
+            }
+            // SAFETY: the published record stays live while it is linked.
+            let frame = unsafe { &*activation.frame };
             let view = crate::ActiveFrameRef::from_frame(frame);
             let count = view.incoming_argument_count();
             args = Some(

@@ -497,7 +497,7 @@ impl Interpreter {
             .map_err(|error| CommittedValueError::Fatal(error.into()))?;
         let receiver = self.escape_scoped(receiver_root);
         let key = if let Some(s) = key_value.as_string(&self.gc_heap) {
-            VmPropertyKey::OwnedString(s.to_lossy_string(&self.gc_heap))
+            VmPropertyKey::OwnedString(s.to_key_spelling(&self.gc_heap))
         } else if let Some(n) = key_value.as_number() {
             VmPropertyKey::OwnedString(n.to_display_string())
         } else if let Some(sym) = key_value.as_symbol(&self.gc_heap) {
@@ -1129,7 +1129,7 @@ impl Interpreter {
                     ("Cannot perform 'set' on a proxy that has been revoked".to_string()).into(),
                 )));
             }
-            let key_str = JsString::from_str(name, self.gc_heap_mut())
+            let key_str = JsString::from_key_spelling(name, self.gc_heap_mut())
                 .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
             let key_vm = VmPropertyKey::atom(atomized_key);
             let trap_args: SmallVec<[Value; 8]> = smallvec::smallvec![

@@ -75,7 +75,7 @@ fn primitive_to_property_key(
         return Ok(VmPropertyKey::Symbol(sym));
     }
     if let Some(s) = value.as_string(heap) {
-        return Ok(VmPropertyKey::OwnedString(s.to_lossy_string(heap)));
+        return Ok(VmPropertyKey::OwnedString(s.to_key_spelling(heap)));
     }
     if let Some(n) = value.as_number() {
         return Ok(VmPropertyKey::OwnedString(n.to_display_string()));
@@ -101,7 +101,7 @@ fn property_key_value_to_vm_key(
     heap: &otter_gc::GcHeap,
 ) -> Result<VmPropertyKey<'static>, VmError> {
     if let Some(s) = value.as_string(heap) {
-        return Ok(VmPropertyKey::OwnedString(s.to_lossy_string(heap)));
+        return Ok(VmPropertyKey::OwnedString(s.to_key_spelling(heap)));
     }
     if let Some(sym) = value.as_symbol(heap) {
         return Ok(VmPropertyKey::Symbol(sym));
@@ -232,7 +232,10 @@ impl Interpreter {
         key: &VmPropertyKey,
     ) -> Result<Value, VmError> {
         if let Some(key) = key.string_name() {
-            Ok(Value::string(JsString::from_str(key, &mut self.gc_heap)?))
+            Ok(Value::string(JsString::from_key_spelling(
+                key,
+                &mut self.gc_heap,
+            )?))
         } else if let VmPropertyKey::Symbol(sym) = key {
             Ok(Value::symbol(*sym))
         } else {
@@ -282,9 +285,8 @@ impl Interpreter {
         let atom = match crate::string::gc_body::lookup_atom_in_place(&self.gc_heap, handle, names)
         {
             Some(atom) => atom,
-            // A rope's units are materialised. A lone surrogate spells no
-            // atom; a lossy spelling would alias U+FFFD.
-            None => names.lookup(&key.to_well_formed_string(&self.gc_heap)?),
+            // A rope's units are materialised into its key spelling.
+            None => names.lookup(&key.to_key_spelling(&self.gc_heap)),
         };
         if atom == crate::property_atom::AtomId::NONE {
             return None;
@@ -967,7 +969,7 @@ impl Interpreter {
                                 elements
                                     .iter()
                                     .filter_map(|key| key.as_string(&interp.gc_heap))
-                                    .map(|name| name.to_lossy_string(&interp.gc_heap))
+                                    .map(|name| name.to_key_spelling(&interp.gc_heap))
                                     .collect::<Vec<_>>()
                             })
                         }
@@ -1048,7 +1050,7 @@ impl Interpreter {
                     .own_property_keys_value(stack, context, &current)?
                     .iter()
                     .filter_map(|key| key.as_string(&interp.gc_heap))
-                    .map(|name| name.to_lossy_string(&interp.gc_heap))
+                    .map(|name| name.to_key_spelling(&interp.gc_heap))
                     .collect::<Vec<_>>();
                 let mut out = Vec::new();
                 for key in names {
@@ -1169,7 +1171,7 @@ impl Interpreter {
                 let Some(name) = key_value.as_string(&self.gc_heap) else {
                     continue;
                 };
-                let key = name.to_lossy_string(&self.gc_heap);
+                let key = name.to_key_spelling(&self.gc_heap);
                 if let Some(desc) = self.ordinary_get_own_property_descriptor_value(
                     stack,
                     Some(context),
@@ -1270,7 +1272,7 @@ impl Interpreter {
                     let Some(name) = key.as_string(&interp.gc_heap) else {
                         continue;
                     };
-                    let name = name.to_lossy_string(&interp.gc_heap);
+                    let name = name.to_key_spelling(&interp.gc_heap);
                     if !visited.insert(name.clone()) {
                         continue;
                     }
@@ -1403,7 +1405,7 @@ fn optional_value_eq_pair(a: &Option<Value>, b: &Option<Value>, heap: &otter_gc:
 /// Symbols). Used by §10.5.11 Proxy `ownKeys` invariant validation.
 fn same_property_key(a: &Value, b: &Value, heap: &otter_gc::GcHeap) -> bool {
     if let (Some(x), Some(y)) = (a.as_string(heap), b.as_string(heap)) {
-        return x.to_lossy_string(heap) == y.to_lossy_string(heap);
+        return x.to_key_spelling(heap) == y.to_key_spelling(heap);
     }
     if let (Some(x), Some(y)) = (a.as_symbol(heap), b.as_symbol(heap)) {
         return x.ptr_eq(y);
@@ -1420,7 +1422,7 @@ fn property_key_from_value(
     heap: &otter_gc::GcHeap,
 ) -> Result<VmPropertyKey<'static>, VmError> {
     if let Some(s) = value.as_string(heap) {
-        return Ok(VmPropertyKey::OwnedString(s.to_lossy_string(heap)));
+        return Ok(VmPropertyKey::OwnedString(s.to_key_spelling(heap)));
     }
     if let Some(sym) = value.as_symbol(heap) {
         return Ok(VmPropertyKey::Symbol(sym));

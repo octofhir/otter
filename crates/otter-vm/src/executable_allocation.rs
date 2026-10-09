@@ -94,12 +94,13 @@ pub(crate) fn try_scopes(
     Ok(scopes.into_boxed_slice())
 }
 
+/// UTF-8 bytes of the property-key spelling of `source`.
 pub(crate) fn utf16_bytes(source: &[u16]) -> u64 {
-    char::decode_utf16(source.iter().copied())
-        .map(|value| value.unwrap_or(char::REPLACEMENT_CHARACTER).len_utf8() as u64)
-        .fold(0u64, u64::saturating_add)
+    crate::wtf16_escape::encoded_len(source) as u64
 }
 
+/// The property-key spelling of `source` (see [`crate::wtf16_escape`]),
+/// allocated against `lease`.
 pub(crate) fn try_utf16(
     source: &[u16],
     lease: &mut ResourceLease,
@@ -119,9 +120,7 @@ pub(crate) fn try_utf16(
     if extra != 0 {
         lease.resize(lease.amount().saturating_add(extra))?;
     }
-    for value in char::decode_utf16(source.iter().copied()) {
-        buffer.push(value.unwrap_or(char::REPLACEMENT_CHARACTER));
-    }
+    buffer.extend(crate::wtf16_escape::escaped_chars(source));
     Ok(buffer)
 }
 

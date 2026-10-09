@@ -80,7 +80,7 @@ impl Interpreter {
             _ => {
                 if value
                     .as_string(&self.gc_heap)
-                    .is_some_and(|s| s.to_lossy_string(&self.gc_heap) == "prototype")
+                    .is_some_and(|s| s.eq_str("prototype", &self.gc_heap))
                 {
                     return Err(self.err_type(
                         ("Classes may not have a static property named 'prototype'".to_string())
@@ -91,6 +91,28 @@ impl Interpreter {
         }
         stack[top_idx].advance_pc()?;
         Ok(())
+    }
+
+    /// §10.2.10 SetFunctionName steps 2-5 — the name `key` gives a function,
+    /// after `prefix`, as a key spelling: a lone surrogate of the key or of
+    /// a symbol's description stays exact through the join (see
+    /// [`crate::wtf16_escape`]).
+    pub(crate) fn function_name_spelling(&self, key: crate::Value, prefix: &str) -> String {
+        let name = if let Some(symbol) = key.as_symbol(&self.gc_heap) {
+            match symbol.description() {
+                Some(description) => format!("[{}]", description.to_key_spelling(&self.gc_heap)),
+                None => String::new(),
+            }
+        } else if let Some(string) = key.as_string(&self.gc_heap) {
+            string.to_key_spelling(&self.gc_heap)
+        } else {
+            key.display_string(&self.gc_heap)
+        };
+        if prefix.is_empty() {
+            name
+        } else {
+            format!("{prefix} {name}")
+        }
     }
 
     /// §10.2.10 SetFunctionName — name an anonymous function from a run-time key.
@@ -109,17 +131,7 @@ impl Interpreter {
             .property_atom_for_function(stack[top_idx].function_id, prefix_idx)
             .map(|atom| atom.name().to_string())
             .unwrap_or_default();
-        let mut name = if let Some(sym) = key_value.as_symbol(&self.gc_heap) {
-            match sym.description() {
-                Some(desc) => format!("[{}]", desc.to_lossy_string(&self.gc_heap)),
-                None => String::new(),
-            }
-        } else {
-            key_value.display_string(&self.gc_heap)
-        };
-        if !prefix.is_empty() {
-            name = format!("{prefix} {name}");
-        }
+        let name = self.function_name_spelling(key_value, &prefix);
         let callee = match callee.as_class_constructor() {
             Some(c) => c.ctor(&self.gc_heap),
             None => callee,
@@ -131,7 +143,7 @@ impl Interpreter {
         }) {
             self.with_handle_scope(|interp, scope| {
                 let callee = interp.scoped_value(scope, callee);
-                let name = interp.scoped_string(scope, &name)?;
+                let name = interp.scoped_key_string(scope, &name)?;
                 let callee = interp.escape_scoped(callee);
                 let owner = callee.as_closure(&interp.gc_heap);
                 let descriptor = object::PropertyDescriptor {

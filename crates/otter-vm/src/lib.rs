@@ -246,6 +246,7 @@ pub mod value;
 pub mod value_slab;
 pub mod weak_refs;
 pub mod work_budget;
+mod wtf16_escape;
 
 #[cfg(test)]
 mod gc_invariants;

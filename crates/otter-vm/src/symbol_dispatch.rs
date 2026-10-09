@@ -187,14 +187,14 @@ fn symbol_key_for(interp: &mut Interpreter, args: &[Value]) -> Result<Value, Sym
         })?;
     match interp.symbol_registry().key_for(sym) {
         Some(key) => {
-            let s = JsString::from_str(&key, interp.gc_heap_mut())?;
+            let s = JsString::from_key_spelling(&key, interp.gc_heap_mut())?;
             Ok(Value::string(s))
         }
         None => Ok(Value::undefined()),
     }
 }
 
-/// Coerce the first argument of a registry call to a Rust string.
+/// Coerce the first argument of a registry call to its key spelling.
 /// Spec invokes ToString; foundation accepts strings and
 /// non-`Symbol` primitives directly.
 fn key_argument(
@@ -209,7 +209,7 @@ fn key_argument(
         return Ok("undefined".to_string());
     }
     if let Some(s) = first.as_string(heap) {
-        return Ok(s.to_lossy_string(heap));
+        return Ok(s.to_key_spelling(heap));
     }
     if first.is_symbol() {
         return Err(SymbolError::BadArgument {

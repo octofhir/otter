@@ -285,7 +285,7 @@ pub(crate) fn property_key_from_arg(
         return Ok("undefined".to_string());
     };
     if let Some(s) = v.as_string(heap) {
-        Ok(s.to_lossy_string(heap))
+        Ok(s.to_key_spelling(heap))
     } else if let Some(n) = v.as_number() {
         Ok(n.to_display_string())
     } else if let Some(b) = v.as_boolean() {

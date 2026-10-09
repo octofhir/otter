@@ -289,7 +289,7 @@ fn emit_value(
     } else if value.is_big_int() {
         return Err(JsonError::BigInt);
     } else if let Some(s) = value.as_string(gc_heap) {
-        write_string_literal(out, &s.to_lossy_string(gc_heap));
+        write_string_literal(out, &s.to_key_spelling(gc_heap));
     } else if let Some(arr) = value.as_array() {
         // Lazy stringify memcpy fast-path: capture text from JSON.parse.
         if !options.pretty()
@@ -389,16 +389,23 @@ fn write_number(out: &mut String, n: NumberValue) {
     out.push_str(&n.to_display_string());
 }
 
-/// Hand-rolled JSON string encoder. Bulk-skips clean ASCII spans
-/// via [`super::scan::find_first_escape`] (8 bytes/iteration) and
-/// only enters the per-byte escape switch for `"`, `\\`, or
-/// control characters. Non-ASCII (≥ 0x80) bytes are forwarded
-/// verbatim — UTF-8 lead and continuation bytes are clean from
-/// the JSON-string viewpoint.
+/// Hand-rolled JSON string encoder over a key spelling (see
+/// [`crate::wtf16_escape`]). A spelling that escapes a lone surrogate
+/// quotes over its code units, so the surrogate prints as `\uXXXX`.
+/// Any other spelling bulk-skips clean ASCII spans via
+/// [`super::scan::find_first_escape`] (8 bytes/iteration) and only
+/// enters the per-byte escape switch for `"`, `\\`, or control
+/// characters. Non-ASCII (≥ 0x80) bytes are forwarded verbatim — UTF-8
+/// lead and continuation bytes are clean from the JSON-string viewpoint.
 ///
 /// Spec: <https://tc39.es/ecma262/#sec-quotejsonstring> §25.5.2.2
 fn write_string_literal(out: &mut String, s: &str) {
     use std::fmt::Write as _;
+    if crate::wtf16_escape::is_escaped(s) {
+        let units: Vec<u16> = crate::wtf16_escape::units(s).collect();
+        super::serialize::quote_units_into(&units, out);
+        return;
+    }
     out.push('"');
     let bytes = s.as_bytes();
     let mut i = 0;

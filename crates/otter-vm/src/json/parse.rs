@@ -279,8 +279,9 @@ impl SourceScanner<'_> {
     }
 }
 
-/// Minimal JSON string unescape for object-key matching. Covers the
-/// standard short escapes plus BMP `\uXXXX`; surrogate pairs combine.
+/// Minimal JSON string unescape for object-key matching, as a key
+/// spelling. Covers the standard short escapes plus BMP `\uXXXX`;
+/// surrogate pairs combine and a lone surrogate stays exact.
 fn decode_json_string(raw: &str) -> String {
     if !raw.contains('\\') {
         return raw.to_string();
@@ -338,7 +339,7 @@ fn decode_json_string(raw: &str) -> String {
             }
         }
     }
-    String::from_utf16_lossy(&out)
+    crate::wtf16_escape::encode(&out)
 }
 
 /// Strict `JSON.parse` over `text`, with no caller-owned GC roots.
@@ -814,7 +815,7 @@ fn read_object_key(
     // Escape / control / unterminated: defer to the full string reader,
     // which decodes escapes (and reports the precise error) identically.
     let s = read_string(cursor, heap, stack, external_visit)?;
-    Ok(s.to_lossy_string(heap))
+    Ok(s.to_key_spelling(heap))
 }
 
 /// Strict number parser. Accepts the JSON subset of JS numeric

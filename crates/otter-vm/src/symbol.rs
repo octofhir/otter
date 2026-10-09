@@ -616,7 +616,8 @@ impl SymbolRegistry {
 
     /// Spec §20.4.2.4 `Symbol.for(key)`: return the registered symbol
     /// for `key`, or create + register a new one with description
-    /// equal to `key`. The freshly allocated symbol's body lives on
+    /// equal to `key`. `key` is a property-key spelling, so a lone
+    /// surrogate in it is escaped rather than replaced. The freshly allocated symbol's body lives on
     /// the GC heap; root tracing visits registry entries so the body
     /// stays live as long as the registry retains it.
     ///
@@ -631,7 +632,7 @@ impl SymbolRegistry {
         if let Some(sym) = self.lookup(key) {
             return Ok(sym);
         }
-        let desc = JsString::from_str(key, gc_heap)?;
+        let desc = JsString::from_key_spelling(key, gc_heap)?;
         let sym = JsSymbol::registered(gc_heap, desc)?;
         self.entries.borrow_mut().push((key.to_string(), sym));
         Ok(sym)

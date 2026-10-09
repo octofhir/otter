@@ -173,6 +173,8 @@ pub(crate) fn compile_object_literal(
                     // §7.1.19 ToPropertyKey owns the formatting and the
                     // engine keeps ONE Number-to-String implementation.
                     crate::synthetic::numeric_literal_to_property_key(lit.value)
+                } else if crate::synthetic::is_lone_surrogate_key(&p.key) {
+                    None
                 } else {
                     Some(match &p.key {
                         oxc_ast::ast::PropertyKey::StaticIdentifier(id) => {
@@ -293,9 +295,10 @@ pub(crate) fn compile_object_literal(
                     );
                     continue;
                 }
-                // A numeric literal key with no settled integer spelling
-                // has `static_key_str == None`: it lowers like a computed
-                // key so the runtime's ToPropertyKey formats the number.
+                // A numeric literal key with no settled integer spelling,
+                // or a string literal holding a lone surrogate, has
+                // `static_key_str == None`: it lowers like a computed key so
+                // the runtime formats the number or decodes the literal.
                 if p.computed || static_key_str.is_none() {
                     let key_reg =
                         match &p.key {
@@ -549,13 +552,14 @@ fn compile_static_object_literal(
         }
         let key = match &p.key {
             oxc_ast::ast::PropertyKey::StaticIdentifier(id) => id.name.as_str(),
-            oxc_ast::ast::PropertyKey::StringLiteral(lit) => lit.value.as_str(),
+            oxc_ast::ast::PropertyKey::StringLiteral(lit) if !lit.lone_surrogates => {
+                lit.value.as_str()
+            }
+            // Lone surrogates travel through the lossy oxc spelling; keep
+            // them on the general path, which decodes them.
             _ => return Ok(None),
         };
-        // Lone surrogates travel through the lossy oxc spelling; keep them
-        // on the general path, which decodes them.
         if key == "__proto__"
-            || key.contains('\u{FFFD}')
             || key
                 .parse::<u32>()
                 .is_ok_and(|index| index != u32::MAX && index.to_string() == key)

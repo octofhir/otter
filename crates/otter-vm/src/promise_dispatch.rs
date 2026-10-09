@@ -2140,7 +2140,7 @@ fn vm_property_key_from_value(
     heap: &otter_gc::GcHeap,
 ) -> Option<crate::VmPropertyKey<'static>> {
     if let Some(s) = key.as_string(heap) {
-        return Some(crate::VmPropertyKey::OwnedString(s.to_lossy_string(heap)));
+        return Some(crate::VmPropertyKey::OwnedString(s.to_key_spelling(heap)));
     }
     if let Some(sym) = key.as_symbol(heap) {
         return Some(crate::VmPropertyKey::Symbol(sym));
@@ -2322,7 +2322,7 @@ fn create_keyed_result(
             let heap = interp.gc_heap_mut();
             let desc = crate::object::PropertyDescriptor::data(value, true, true, true);
             let ok = if let Some(s) = key.as_string(heap) {
-                let key = s.to_lossy_string(heap);
+                let key = s.to_key_spelling(heap);
                 crate::object::define_own_property(raw, heap, &key, desc)?
             } else if let Some(sym) = key.as_symbol(heap) {
                 crate::object::define_own_symbol_property(raw, heap, sym, desc)?

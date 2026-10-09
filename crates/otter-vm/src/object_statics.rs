@@ -2590,7 +2590,7 @@ fn expect_property_key(
         return Ok(PropertyKey::String("undefined".to_string()));
     };
     if let Some(s) = v.as_string(heap) {
-        Ok(PropertyKey::String(s.to_lossy_string(heap)))
+        Ok(PropertyKey::String(s.to_key_spelling(heap)))
     } else if let Some(n) = v.as_number() {
         Ok(PropertyKey::String(n.to_display_string()))
     } else if let Some(b) = v.as_boolean() {
@@ -2663,7 +2663,7 @@ fn has_own_property(
 /// - <https://tc39.es/ecma262/#sec-topropertykey>
 fn property_key_from_value(value: &Value, heap: &otter_gc::GcHeap) -> Result<String, VmError> {
     if let Some(s) = value.as_string(heap) {
-        Ok(s.to_lossy_string(heap))
+        Ok(s.to_key_spelling(heap))
     } else if let Some(n) = value.as_number() {
         Ok(n.to_display_string())
     } else if let Some(b) = value.as_boolean() {

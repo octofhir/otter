@@ -242,6 +242,22 @@ impl JsString {
         Self::from_utf16_units_with_roots(&units, heap, external_visit)
     }
 
+    /// The string a property-key spelling stands for: the exact code units,
+    /// unpaired surrogates included (see [`crate::wtf16_escape`]).
+    ///
+    /// # Errors
+    /// See [`Self::from_utf16_units`].
+    pub(crate) fn from_key_spelling(
+        spelling: &str,
+        heap: &mut GcHeap,
+    ) -> Result<Self, OutOfMemory> {
+        if !crate::wtf16_escape::is_escaped(spelling) {
+            return Self::from_str(spelling, heap);
+        }
+        let units: Vec<u16> = crate::wtf16_escape::units(spelling).collect();
+        Self::from_utf16_units(&units, heap)
+    }
+
     /// Construct from a Latin-1 / ASCII byte slice. Each byte
     /// zero-extends to a `u16` on read.
     ///
@@ -549,14 +565,24 @@ impl JsString {
         gc_body::ensure_utf16_cache(heap, source, &mut |_| {})
     }
 
-    /// The content as a Rust `String`, or `None` when it holds a lone
-    /// surrogate, which no `String` spells.
+    /// The content as a property-key spelling: every code unit kept, an
+    /// unpaired surrogate escaped rather than replaced (see
+    /// [`crate::wtf16_escape`]). Distinct strings spell distinct keys, and
+    /// [`Self::from_key_spelling`] restores the string.
     #[must_use]
-    pub fn to_well_formed_string(self, heap: &GcHeap) -> Option<String> {
-        if self.with_latin1(heap, |_| ()).is_some() {
-            return Some(self.to_lossy_string(heap));
+    pub(crate) fn to_key_spelling(self, heap: &GcHeap) -> String {
+        // Latin-1 holds neither a surrogate nor the escape marker.
+        if let Some(s) = self.with_latin1(heap, |bytes| {
+            if bytes.is_ascii() {
+                // SAFETY: ASCII bytes are valid UTF-8.
+                unsafe { String::from_utf8_unchecked(bytes.to_vec()) }
+            } else {
+                bytes.iter().map(|&b| b as char).collect()
+            }
+        }) {
+            return s;
         }
-        String::from_utf16(&gc_body::to_utf16_vec(heap, self.handle)).ok()
+        self.with_utf16(heap, crate::wtf16_escape::encode)
     }
 
     /// Render as a lossy Rust `String` for display / diagnostics.

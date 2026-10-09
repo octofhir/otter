@@ -672,6 +672,17 @@ impl Interpreter {
         Ok(self.scoped_value(scope, Value::string(string)))
     }
 
+    /// Allocate the string a property-key spelling stands for (see
+    /// [`crate::wtf16_escape`]) and root it in `scope`.
+    pub(crate) fn scoped_key_string<'s>(
+        &mut self,
+        scope: &'s HandleScope,
+        spelling: &str,
+    ) -> Result<Local<'s>, VmError> {
+        let string = JsString::from_key_spelling(spelling, &mut self.gc_heap)?;
+        Ok(self.scoped_value(scope, Value::string(string)))
+    }
+
     /// Build a rooted substring view over a rooted JavaScript string.
     pub(crate) fn scoped_string_slice<'s>(
         &mut self,
@@ -690,7 +701,8 @@ impl Interpreter {
         Ok(self.scoped_value(scope, Value::string(string)))
     }
 
-    /// Build interned `JsString` values for `keys`, rooting each in a handle
+    /// Build the `JsString` values the key spellings `keys` stand for (see
+    /// [`crate::wtf16_escape`]), rooting each in a handle
     /// scope so an earlier key is never stranded by a later string allocation,
     /// and return them as plain `Value`s for immediate hand-off to an array
     /// allocator.
@@ -716,7 +728,7 @@ impl Interpreter {
         self.with_handle_scope(|interp, scope| {
             let parked = interp.scoped_value(scope, Value::array(array));
             for (index, key) in keys.iter().enumerate() {
-                let string = JsString::from_str(key, &mut interp.gc_heap)?;
+                let string = JsString::from_key_spelling(key, &mut interp.gc_heap)?;
                 // The allocation above may have moved the array; the parked
                 // handle reads back the live one. The slot already exists,
                 // so the write cannot allocate and the fresh string needs no

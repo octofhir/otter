@@ -178,7 +178,7 @@ impl RuntimeCall<'_> {
                     }
                 } else if value
                     .as_string(&vm.gc_heap)
-                    .is_some_and(|string| string.to_lossy_string(&vm.gc_heap) == "prototype")
+                    .is_some_and(|string| string.eq_str("prototype", &vm.gc_heap))
                 {
                     return Err(vm.err_type(
                         "Classes may not have a static property named 'prototype'"
@@ -200,19 +200,7 @@ impl RuntimeCall<'_> {
                     .property_atom_for_function(self.function_id(), prefix_index)
                     .map(|atom| atom.name().to_string())
                     .unwrap_or_default();
-                let mut name = if let Some(symbol) = key_value.as_symbol(&vm.gc_heap) {
-                    match symbol.description() {
-                        Some(description) => {
-                            format!("[{}]", description.to_lossy_string(&vm.gc_heap))
-                        }
-                        None => String::new(),
-                    }
-                } else {
-                    key_value.display_string(&vm.gc_heap)
-                };
-                if !prefix.is_empty() {
-                    name = format!("{prefix} {name}");
-                }
+                let name = vm.function_name_spelling(key_value, &prefix);
                 let callee = match callee.as_class_constructor() {
                     Some(class) => class.ctor(&vm.gc_heap),
                     None => callee,
@@ -224,7 +212,7 @@ impl RuntimeCall<'_> {
                 }) {
                     vm.with_handle_scope(|vm, scope| {
                         let callee = vm.scoped_value(scope, callee);
-                        let name = vm.scoped_string(scope, &name)?;
+                        let name = vm.scoped_key_string(scope, &name)?;
                         let callee = vm.escape_scoped(callee);
                         let owner = callee.as_closure(&vm.gc_heap);
                         let descriptor = object::PropertyDescriptor {

@@ -288,29 +288,20 @@ pub(crate) fn emit_call_entry(
     } else {
         dynasm!(ops ; .arch x64 ; mov [rbp + RETURN_FRAME], r10);
     }
-    // The one origin bit belongs to the existing aligned generation input.
-    // Mask it before dereference. A direct entry's return address is the one
-    // saved at `[rbp + 8]`, read back through the record's anchor; a staged
-    // target transfers the original JS return rather than the trampoline's
-    // own internal continuation.
-    let direct_origin = ops.new_dynamic_label();
-    let origin_ready = ops.new_dynamic_label();
+    // The continuation word (ABI return, no cold state), then the caller
+    // return address. A direct entry's return address is the one saved at
+    // `[rbp + 8]`, read back through the record's anchor, so the word is
+    // zero. The one origin bit belongs to the existing aligned generation
+    // input: a staged target transfers the original JS return rather than
+    // the trampoline's own internal continuation, and masks the bit before
+    // any dereference.
     dynasm!(ops ; .arch x64
+        ; mov r11d, -1
+        ; mov [r14 + abi::NATIVE_FRAME_CONTINUATION_OFFSET as i32], r11
+        ; mov QWORD [r14 + abi::NATIVE_FRAME_CALLER_RETURN_PC_OFFSET as i32], 0
         ; test r9b, abi::CODE_ENTRY_STAGED_REQUEST_MASK as i8
-        ; jz =>direct_origin
-        ; and r9, !(abi::CODE_ENTRY_STAGED_REQUEST_MASK as i32)
-        ; mov r11, [r15 + (crate::entry::PENDING_CALL_OFFSET + abi::REQUEST_CALLER_RETURN_PC_OFFSET) as i32]
-        ; mov eax, abi::NO_CALLER_RETURN_PC as i32
-        ; test r11, r11
-        ; cmovz r11, rax
-        ; xor eax, eax
-        ; mov [r15 + (crate::entry::PENDING_CALL_OFFSET + abi::REQUEST_CALLER_OFFSET) as i32], rax
-        ; mov [r15 + (crate::entry::PENDING_CALL_OFFSET + abi::REQUEST_CALLER_RETURN_PC_OFFSET) as i32], rax
-        ; jmp =>origin_ready
-        ; =>direct_origin
-        ; xor r11d, r11d
-        ; =>origin_ready
-        ; mov [r14 + abi::NATIVE_FRAME_CALLER_RETURN_PC_OFFSET as i32], r11
+        ; jnz =>cold.staged.0
+        ; =>cold.staged.1
     );
     if let Some((check, back)) = cold.break_even {
         dynasm!(ops
@@ -380,30 +371,12 @@ pub(crate) fn emit_call_entry(
             ; mov QWORD [r14 + NATIVE_FRAME_REGISTER_BASE_OFFSET as i32 + 8], i32::from(shape.register_count)
         );
     }
-    // Every request consumer clears the construction fields, so an ordinary
-    // call (`new.target` undefined) only initializes its own record.
-    let ordinary = ops.new_dynamic_label();
-    let recorded = ops.new_dynamic_label();
-    dynasm!(ops
-        ; .arch x64
-        ; cmp rcx, VALUE_UNDEFINED as i32
-        ; je =>ordinary
-        ; mov r11d, [r15 + (crate::entry::PENDING_CALL_OFFSET + abi::REQUEST_CONSTRUCT_LAYOUT_OFFSET) as i32]
-        ; mov [r14 + abi::NATIVE_FRAME_CONSTRUCT_LAYOUT_OFFSET as i32], r11
-        ; mov r11, [r15 + (crate::entry::PENDING_CALL_OFFSET + abi::REQUEST_CONSTRUCT_RECEIVER_OFFSET) as i32]
-        ; mov [r14 + abi::NATIVE_FRAME_CONSTRUCT_RECEIVER_OFFSET as i32], r11
-        ; mov r11, [r15 + (crate::entry::PENDING_CALL_OFFSET + abi::REQUEST_SUPER_ORIGIN_OFFSET) as i32]
-        ; mov [r14 + abi::NATIVE_FRAME_SUPER_ORIGIN_OFFSET as i32], r11
-        ; mov QWORD [r15 + (crate::entry::PENDING_CALL_OFFSET + abi::REQUEST_SUPER_ORIGIN_OFFSET) as i32], 0
-        ; mov QWORD [r15 + (crate::entry::PENDING_CALL_OFFSET + abi::REQUEST_CONSTRUCT_LAYOUT_OFFSET) as i32], 0
-        ; mov QWORD [r15 + (crate::entry::PENDING_CALL_OFFSET + abi::REQUEST_CONSTRUCT_RECEIVER_OFFSET) as i32], VALUE_UNDEFINED as i32
-        ; jmp =>recorded
-        ; =>ordinary
-        ; mov QWORD [r14 + abi::NATIVE_FRAME_CONSTRUCT_LAYOUT_OFFSET as i32], 0
-        ; mov QWORD [r14 + abi::NATIVE_FRAME_CONSTRUCT_RECEIVER_OFFSET as i32], VALUE_UNDEFINED as i32
-        ; mov QWORD [r14 + abi::NATIVE_FRAME_SUPER_ORIGIN_OFFSET as i32], 0
-        ; =>recorded
-    );
+    // A derived constructor is entered only by `[[Construct]]`; a base
+    // constructor takes the request on its construct path, and any other
+    // body is never constructed.
+    if shape.derived {
+        emit_take_construct_request(ops);
+    }
     dynasm!(ops
         ; .arch x64
         ; mov [r14 + NATIVE_FRAME_THIS_OFFSET as i32], rdx
@@ -419,11 +392,6 @@ pub(crate) fn emit_call_entry(
     } else {
         dynasm!(ops ; .arch x64 ; mov [r14 + abi::NATIVE_FRAME_MACHINE_ROOTS_OFFSET as i32], rsp);
     }
-    dynasm!(ops
-        ; .arch x64
-        ; mov DWORD [r14 + abi::NATIVE_FRAME_CONTINUATION_OFFSET as i32], -1
-        ; mov DWORD [r14 + abi::NATIVE_FRAME_CONTINUATION_OFFSET as i32 + 4], 0
-    );
     if shape.lazy_window {
         dynasm!(ops ; .arch x64 ; lea r13, [rbp + 16]);
     } else {
@@ -446,6 +414,28 @@ pub(crate) fn emit_call_entry(
         dynasm!(ops ; .arch x64 ; test r12, r12 ; jnz =>promote ; =>back);
     }
     start
+}
+
+/// Move the pending construction request into the record's construction
+/// state and clear the request.
+///
+/// Runs only on a `[[Construct]]` entry, before anything can collect or read
+/// the state; an entry through `[[Call]]` leaves the state unwritten, and the
+/// record's `CONSTRUCT` flag tells readers which it is. Every consumer of the
+/// request (this entry and the call trampoline) clears it. Clobbers `r11`.
+fn emit_take_construct_request(ops: &mut Assembler) {
+    dynasm!(ops
+        ; .arch x64
+        ; mov r11d, [r15 + (crate::entry::PENDING_CALL_OFFSET + abi::REQUEST_CONSTRUCT_LAYOUT_OFFSET) as i32]
+        ; mov [r14 + abi::NATIVE_FRAME_CONSTRUCT_LAYOUT_OFFSET as i32], r11
+        ; mov r11, [r15 + (crate::entry::PENDING_CALL_OFFSET + abi::REQUEST_CONSTRUCT_RECEIVER_OFFSET) as i32]
+        ; mov [r14 + abi::NATIVE_FRAME_CONSTRUCT_RECEIVER_OFFSET as i32], r11
+        ; mov r11, [r15 + (crate::entry::PENDING_CALL_OFFSET + abi::REQUEST_SUPER_ORIGIN_OFFSET) as i32]
+        ; mov [r14 + abi::NATIVE_FRAME_SUPER_ORIGIN_OFFSET as i32], r11
+        ; mov QWORD [r15 + (crate::entry::PENDING_CALL_OFFSET + abi::REQUEST_SUPER_ORIGIN_OFFSET) as i32], 0
+        ; mov QWORD [r15 + (crate::entry::PENDING_CALL_OFFSET + abi::REQUEST_CONSTRUCT_LAYOUT_OFFSET) as i32], 0
+        ; mov QWORD [r15 + (crate::entry::PENDING_CALL_OFFSET + abi::REQUEST_CONSTRUCT_RECEIVER_OFFSET) as i32], VALUE_UNDEFINED as i32
+    );
 }
 
 /// Publish initialized reserved registers when an exit needs an interpreter window.
@@ -485,6 +475,21 @@ pub(crate) fn emit_call_entry_cold(
     exits: ActivationExits,
     cold: CallEntryCold,
 ) {
+    // A trampoline-staged entry: its caller anchor travels in the request.
+    let (staged, origin_ready) = cold.staged;
+    dynasm!(ops ; .arch x64
+        ; =>staged
+        ; and r9, !(abi::CODE_ENTRY_STAGED_REQUEST_MASK as i32)
+        ; mov r11, [r15 + (crate::entry::PENDING_CALL_OFFSET + abi::REQUEST_CALLER_RETURN_PC_OFFSET) as i32]
+        ; mov eax, abi::NO_CALLER_RETURN_PC as i32
+        ; test r11, r11
+        ; cmovz r11, rax
+        ; xor eax, eax
+        ; mov [r15 + (crate::entry::PENDING_CALL_OFFSET + abi::REQUEST_CALLER_OFFSET) as i32], rax
+        ; mov [r15 + (crate::entry::PENDING_CALL_OFFSET + abi::REQUEST_CALLER_RETURN_PC_OFFSET) as i32], rax
+        ; mov [r14 + abi::NATIVE_FRAME_CALLER_RETURN_PC_OFFSET as i32], r11
+        ; jmp =>origin_ready
+    );
     // Promotion is requested only while this generation may still tier up.
     if let Some((check, back)) = cold.break_even {
         dynasm!(ops
@@ -507,9 +512,10 @@ pub(crate) fn emit_call_entry_cold(
     // create the receiver unless the caller allocated it. Receiver
     // conversion does not apply to the created receiver.
     if let Some((construct, constructed)) = cold.construct {
+        dynasm!(ops ; .arch x64 ; =>construct);
+        emit_take_construct_request(ops);
         dynasm!(ops
             ; .arch x64
-            ; =>construct
             ; or BYTE [r14 + crate::entry::NATIVE_FRAME_FLAGS_OFFSET as i32], abi::NativeFrameFlags::CONSTRUCT as i8
             ; or QWORD [rbp + RETURN_FRAME], 1
             ; cmp rdx, VALUE_UNDEFINED as i32

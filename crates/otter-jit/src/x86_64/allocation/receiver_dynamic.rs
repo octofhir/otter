@@ -23,9 +23,10 @@ use crate::{
     allocation::LabRegisters,
     artifact::relocation::{RelocationCapture, RelocationTarget},
     entry::{
-        NATIVE_FRAME_THIS_OFFSET, OBJECT_BODY_TYPE_TAG, RECEIVER_ALLOC_GENERATED_OFFSET,
-        RUNTIME_STATS_OFFSET, THREAD_OFFSET, TransitionTable, VALUE_UNDEFINED,
-        VM_THREAD_GC_HEAP_OFFSET,
+        NATIVE_FRAME_THIS_OFFSET, OBJECT_BODY_TYPE_TAG, RECEIVER_ALLOC_ATTEMPTS_OFFSET,
+        RECEIVER_ALLOC_GENERATED_OFFSET, RECEIVER_ALLOC_GUARD_MISSES_OFFSET,
+        RECEIVER_ALLOC_SPACE_MISSES_OFFSET, RUNTIME_STATS_OFFSET, THREAD_OFFSET,
+        TransitionTable, VALUE_UNDEFINED, VM_THREAD_GC_HEAP_OFFSET,
     },
 };
 use dynasmrt::{DynamicLabel, DynasmApi, DynasmLabelApi, dynasm, x64::Assembler};
@@ -56,6 +57,8 @@ pub(crate) fn emit_dynamic_construct_receiver(
     let hit = ops.new_dynamic_label();
     let space = ops.new_dynamic_label();
     let fatal = ops.new_dynamic_label();
+    let refused = ops.new_dynamic_label();
+    count(ops, RECEIVER_ALLOC_ATTEMPTS_OFFSET);
     dynasm!(ops ; .arch x64
         ; mov rdi, [r15 + THREAD_OFFSET as i32] ; mov rdi, [rdi + VM_THREAD_GC_HEAP_OFFSET as i32]
         ; mov rsi, [r14 + abi::NATIVE_FRAME_NEW_TARGET_OFFSET as i32]
@@ -70,7 +73,7 @@ pub(crate) fn emit_dynamic_construct_receiver(
     emit_runtime_call(ops, abi::STUB_CONSTRUCTOR_RECEIVER_PROBE);
     dynasm!(ops ; .arch x64 ; test rdx, rdx ; jz =>hit
         ; cmp rdx, abi::NativeResultStatus::SideExit as i32 ; jne =>fatal
-        ; test rax, rax ; jnz =>fatal ; jmp =>canonical ; =>hit);
+        ; test rax, rax ; jnz =>fatal ; jmp =>refused ; =>hit);
     emit_load_u64(ops, 11, !u64::from(u32::MAX));
     dynasm!(ops ; .arch x64 ; mov r10, rax ; and r10, r11);
     emit_load_u64(ops, 11, otter_vm::value::tag::NUMBER_TAG);
@@ -88,7 +91,10 @@ pub(crate) fn emit_dynamic_construct_receiver(
     dynasm!(ops ; .arch x64 ; test rdx, rdx ; jz =>complete
         ; cmp rdx, abi::NativeResultStatus::Fatal as i32 ; jne =>fatal
         ; cmp rax, VALUE_UNDEFINED as i32 ; jne =>fatal ; jmp =>complete);
-    dynasm!(ops ; .arch x64 ; =>space);
+    dynasm!(ops ; .arch x64 ; =>refused);
+    count(ops, RECEIVER_ALLOC_GUARD_MISSES_OFFSET);
+    dynasm!(ops ; .arch x64 ; jmp =>canonical ; =>space);
+    count(ops, RECEIVER_ALLOC_SPACE_MISSES_OFFSET);
     dynasm!(ops ; .arch x64 ; jmp =>canonical ; =>fatal
         ; mov eax, VALUE_UNDEFINED as i32 ; mov edx, abi::NativeResultStatus::Fatal as i32
         ; jmp =>complete);

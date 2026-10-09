@@ -350,14 +350,17 @@ fn own_generated_receiver_fits_and_collecting_array_construct_keep_exact_roots()
         after.jit_receiver_alloc_generated, before.jit_receiver_alloc_generated,
         "both disabled-LAB misses create distinct ordinary receivers through the callee's emitted canonical preparation"
     );
+    // Each construct probes twice: the caller's baked plan misses and passes
+    // no receiver, then the callee's construct entry probes the family again
+    // before its canonical preparation.
     assert_eq!(
         after.jit_receiver_alloc_attempts - before.jit_receiver_alloc_attempts,
-        2
+        4
     );
     assert_eq!(
         after.jit_receiver_alloc_space_misses - before.jit_receiver_alloc_space_misses,
-        2,
-        "both actual retired-LAB probes reach rooted canonical preparation; the second follows ArrayConstruct movement: {before:?} -> {after:?}"
+        4,
+        "every retired-LAB probe reaches rooted canonical preparation; the second construct follows ArrayConstruct movement: {before:?} -> {after:?}"
     );
     drop(observations);
     trace.lock().unwrap().recording = false;

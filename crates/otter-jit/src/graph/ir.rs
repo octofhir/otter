@@ -197,6 +197,10 @@ pub(crate) enum Kind {
     /// the live family and prototype are proved. A failed proof, or a
     /// buffer the collector cannot refill, resumes the construct.
     NewReceiver(otter_vm::jit::JitReceiverAllocationPlan),
+    /// `ArrayCreate(input0)` for the original `%Array%` constructor called
+    /// with at most one argument: an array of that exact nonnegative int32
+    /// length, all holes. Any other length resumes the operation.
+    NewArrayWithLength,
 
     /// Number/String primitive addition with a collecting string miss.
     PrimitiveAdd,
@@ -464,6 +468,9 @@ pub(crate) enum Kind {
         function_id: u32,
         cell: u64,
     },
+    /// Eager deopt unless input0 is the value the identity cell at this
+    /// address holds; the collector keeps the cell's value current.
+    CheckCellValue(u64),
     /// Eager deopt when input0 is the hole of a binding still in its
     /// temporal dead zone.
     CheckNotHole,
@@ -670,6 +677,7 @@ impl Kind {
             | Self::CheckNative(_)
             | Self::CheckArgumentsElided
             | Self::CheckFunction { .. }
+            | Self::CheckCellValue(_)
             | Self::CheckNotHole
             | Self::LoadGuardedMethod { .. }
             | Self::LoadNamedProperty(_)
@@ -696,6 +704,7 @@ impl Kind {
             | Self::NativeNewContext(_)
             | Self::CopyContext
             | Self::NewClosure
+            | Self::NewArrayWithLength
             | Self::NewReceiver(_) => Properties {
                 eager_deopt: true,
                 writes: true,
@@ -812,6 +821,7 @@ impl Kind {
             | Self::NewArrayLiteral
             | Self::NativeNewContext(_)
             | Self::CopyContext
+            | Self::NewArrayWithLength
             | Self::NewClosure => Constraints {
                 inputs: (0..input_count).map(|_| InputPolicy::Home).collect(),
                 result: ResultPolicy::Register,
@@ -914,9 +924,10 @@ impl Kind {
                 fp_temps: 0,
                 fixed_gp_clobbers: SmallVec::new(),
             },
-            Self::CheckFunction { .. } | Self::CheckNotHole | Self::CheckNative(_) => {
-                simple(1, ResultPolicy::None)
-            }
+            Self::CheckFunction { .. }
+            | Self::CheckCellValue(_)
+            | Self::CheckNotHole
+            | Self::CheckNative(_) => simple(1, ResultPolicy::None),
             Self::CheckArgumentsElided => simple(0, ResultPolicy::None),
             Self::LoadGuardedMethod { .. } => Constraints {
                 inputs: registers(1),

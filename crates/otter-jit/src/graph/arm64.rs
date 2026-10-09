@@ -1695,7 +1695,25 @@ impl<'a> Codegen<'a> {
                 self.emit_literal_allocation(node, destination)?;
             }
             Kind::NewReceiver(plan) => self.emit_new_receiver(node, *plan)?,
-            Kind::NativeNewContext(_) | Kind::CopyContext | Kind::NewClosure => {
+            Kind::CheckCellValue(cell) => {
+                let value = Self::gp(input(0));
+                let exit = self.eager_exit(node, DeoptReason::WrongValue);
+                let target = RelocationTarget::CalleeIdentityCell {
+                    function_id: self.view_of(node).code_block.id,
+                    call_pc: self.graph.node(node).pc,
+                };
+                emit_load_symbol_u64(&mut self.ops, &mut self.relocations, 16, *cell, target);
+                dynasm!(self.ops
+                    ; .arch aarch64
+                    ; ldr x16, [x16]
+                    ; cmp X(value), x16
+                    ; b.ne =>exit
+                );
+            }
+            Kind::NativeNewContext(_)
+            | Kind::CopyContext
+            | Kind::NewClosure
+            | Kind::NewArrayWithLength => {
                 let destination = Self::gp(result.expect("lexical allocation result"));
                 self.emit_lexical_allocation(node, destination)?;
             }

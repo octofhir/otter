@@ -437,7 +437,10 @@ impl<'a> Codegen<'a> {
             Kind::NewObject | Kind::NewArrayEmpty => self.emit_empty_allocation(node)?,
             Kind::NewObjectLiteral | Kind::NewArrayLiteral => self.emit_literal_allocation(node)?,
             Kind::NewReceiver(plan) => self.emit_new_receiver(node, *plan)?,
-            Kind::NativeNewContext(_) | Kind::CopyContext | Kind::NewClosure => {
+            Kind::NativeNewContext(_)
+            | Kind::CopyContext
+            | Kind::NewClosure
+            | Kind::NewArrayWithLength => {
                 let dst = Self::gp(self.loc(node).result.expect("lexical allocation result"));
                 self.emit_lexical_allocation(node, dst)?;
             }

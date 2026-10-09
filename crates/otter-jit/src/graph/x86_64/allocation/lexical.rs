@@ -149,6 +149,10 @@ impl Codegen<'_> {
                 };
                 (stub, values)
             }
+            Kind::NewArrayWithLength => (
+                abi::STUB_ARRAY_CONSTRUCT_ALLOC,
+                [inputs[0], undefined, undefined],
+            ),
             _ => unreachable!("lexical allocation kind"),
         };
         dynasm!(self.ops ; .arch x64 ; =>slow);

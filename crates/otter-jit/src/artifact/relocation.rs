@@ -213,9 +213,11 @@ struct RelocationRecord {
     form: RelocationForm,
 }
 
-/// How a relocation site encodes its address.
+/// How a relocation site encodes its address. Only AArch64 code has a
+/// literal pool.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(target_arch = "x86_64", allow(dead_code))]
 pub(super) enum RelocationForm {
     /// `MOVZ`/`MOVK` instructions, or x86-64 `mov r64, imm64`.
     Immediate,

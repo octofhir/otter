@@ -16,7 +16,8 @@ JIT addresses to `JS:<function> [<tier> c<code-object>]`; OFFSETS=1 keeps the
 code offset (`+0x..`) to read against that run's `--jit-artifacts` listing.
 BOUNDARY=1 also counts, per sample, the native frame the innermost generated
 frame called: the runtime entries compiled code pays for. BOUNDARY=N keeps
-the N frames below that boundary, outermost first.
+the N frames below that boundary, outermost first; BOUNDARY_CALLER=1 prefixes
+each with the generated frame that called it.
 """
 import bisect, collections, glob, os, pathlib, shutil, subprocess, sys, time
 import xml.etree.ElementTree as ET
@@ -52,6 +53,7 @@ focus = os.environ.get("FOCUS")
 within = os.environ.get("WITHIN")
 offsets = os.environ.get("OFFSETS") == "1"
 boundary_depth = int(os.environ.get("BOUNDARY", "0") or 0)
+boundary_caller = os.environ.get("BOUNDARY_CALLER") == "1"
 boundary = collections.Counter() if boundary_depth else None
 callers = collections.Counter()
 callees = collections.Counter()
@@ -124,7 +126,10 @@ for run in range(runs):
                     # names[0] is the leaf: the frames just below the
                     # innermost generated frame are the ones it called.
                     called = names[max(index - boundary_depth, 0):index]
-                    boundary[" <- ".join(reversed(called))] += 1
+                    key = " <- ".join(reversed(called))
+                    if boundary_caller:
+                        key = f"{names[index]} -> {key}"
+                    boundary[key] += 1
         for name in set(names):
             inclusive[name] += 1
         if focus:

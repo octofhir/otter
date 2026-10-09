@@ -104,10 +104,33 @@ impl Interpreter {
 
     /// Stable feedback selected without allocation or user code.
     pub(crate) fn native_call_target(&self, callee: crate::Value) -> Option<OrdinaryCallTarget> {
+        self.native_construct_target(callee)
+            .filter(|target| *target == OrdinaryCallTarget::ArrayConstructor)
+            .or_else(|| {
+                callee.as_native_function().map(|native| {
+                    crate::jit_static_native::jit_static_call_target(native, &self.gc_heap)
+                        .map(|entry| OrdinaryCallTarget::StaticNative(entry.leaf_stub_id))
+                        .unwrap_or(OrdinaryCallTarget::Native)
+                })
+            })
+    }
+
+    /// Stable `new` feedback for a native callee: the realm's original
+    /// `%Array%`, or any other native by kind.
+    pub(crate) fn native_construct_target(
+        &self,
+        callee: crate::Value,
+    ) -> Option<OrdinaryCallTarget> {
         callee.as_native_function().map(|native| {
-            crate::jit_static_native::jit_static_call_target(native, &self.gc_heap)
-                .map(|entry| OrdinaryCallTarget::StaticNative(entry.leaf_stub_id))
-                .unwrap_or(OrdinaryCallTarget::Native)
+            if self
+                .realm_intrinsics
+                .array_constructor()
+                .is_some_and(|array| array.raw() == native.raw())
+            {
+                OrdinaryCallTarget::ArrayConstructor
+            } else {
+                OrdinaryCallTarget::Native
+            }
         })
     }
 

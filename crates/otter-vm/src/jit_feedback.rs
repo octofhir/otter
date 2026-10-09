@@ -128,6 +128,8 @@ pub(crate) enum OrdinaryCallTarget {
     /// Any NativeFunction reached through its live Host native kernel.
     /// Kind-only feedback carries no callback identity or moving handle.
     Native,
+    /// The current realm's original `%Array%` constructor.
+    ArrayConstructor,
 }
 
 /// One observed call target and its saturating execution count.
@@ -167,6 +169,7 @@ const CALL_TARGET_BYTECODE: u8 = 0;
 const CALL_TARGET_STATIC_NATIVE: u8 = 1;
 const CALL_TARGET_FUNCTION_PROTOTYPE_CALL: u8 = 2;
 const CALL_TARGET_NATIVE: u8 = 3;
+const CALL_TARGET_ARRAY_CONSTRUCTOR: u8 = 4;
 
 const fn call_target_kind(target: OrdinaryCallTarget) -> u8 {
     match target {
@@ -174,6 +177,7 @@ const fn call_target_kind(target: OrdinaryCallTarget) -> u8 {
         OrdinaryCallTarget::StaticNative(_) => CALL_TARGET_STATIC_NATIVE,
         OrdinaryCallTarget::FunctionPrototypeCall(_) => CALL_TARGET_FUNCTION_PROTOTYPE_CALL,
         OrdinaryCallTarget::Native => CALL_TARGET_NATIVE,
+        OrdinaryCallTarget::ArrayConstructor => CALL_TARGET_ARRAY_CONSTRUCTOR,
     }
 }
 
@@ -182,7 +186,7 @@ const fn call_target_payload(target: OrdinaryCallTarget) -> u32 {
         OrdinaryCallTarget::Bytecode(fid) => fid,
         OrdinaryCallTarget::StaticNative(stub_id) => stub_id,
         OrdinaryCallTarget::FunctionPrototypeCall(fid) => fid,
-        OrdinaryCallTarget::Native => 0,
+        OrdinaryCallTarget::Native | OrdinaryCallTarget::ArrayConstructor => 0,
     }
 }
 
@@ -209,6 +213,7 @@ fn unpack_call_target(packed: u64, kind: u8) -> CallTargetCount {
             );
             OrdinaryCallTarget::Native
         }
+        CALL_TARGET_ARRAY_CONSTRUCTOR => OrdinaryCallTarget::ArrayConstructor,
         _ => unreachable!("invalid atomic call target kind"),
     };
     CallTargetCount {

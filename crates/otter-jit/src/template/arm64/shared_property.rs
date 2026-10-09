@@ -20,8 +20,9 @@
 //! - Concat: the nursery string-concatenation fit every `Add` site shares
 //!   instead of inlining it.
 //! - Keyed load and store: V8's `KeyedLoadIC_Megamorphic` /
-//!   `KeyedStoreIC_Megamorphic` name case. A string key whose atom was
-//!   recorded probes the shared action table under that atom; any other
+//!   `KeyedStoreIC_Megamorphic` name case. A string key probes the shared
+//!   action table under its atom, recorded in the string or found by the
+//!   interning leaf (`TryInternalizeString`) and then recorded; any other
 //!   key, or a table miss, returns to the element site, which completes
 //!   through its committed element runtime (which records the table entry).
 //!
@@ -147,15 +148,23 @@ impl SharedPropertyProbes {
     }
 }
 
-/// Leave the recorded atom of the string `key` in `W(atom)`, or branch to
-/// `miss` for any other key or a string no property key has interned.
+/// Leave the atom of the string `key` in `W(atom)`, or branch to `miss` for
+/// any other key or a string no property key has interned. A string whose
+/// atom is not yet recorded asks the interning leaf (V8's
+/// `TryInternalizeString`) and records the answer in its atom word, so the
+/// same string probes directly next time. The routine inputs, `x9`, `x10`
+/// and `x12`, survive the leaf call.
 fn emit_key_atom(
     ops: &mut Assembler,
+    relocations: &mut RelocationCapture,
     view: &JitCompileSnapshot,
     key: u8,
     atom: u8,
     miss: DynamicLabel,
 ) {
+    let unrecorded = ops.new_dynamic_label();
+    let ready = ops.new_dynamic_label();
+    let atom_byte = view.string_layout.atom_byte;
     emit_cell_test(ops, key, CellTest::IsNotCell, miss);
     dynasm!(ops ; .arch aarch64
         ; cbz X(key), =>miss
@@ -163,14 +172,38 @@ fn emit_key_atom(
         ; cmp w16, u32::from(view.string_layout.string_type_tag)
         ; b.ne =>miss
         // The body records the atom plus one; zero is unrecorded.
-        ; ldr W(atom), [X(key), view.string_layout.atom_byte]
-        ; cbz W(atom), =>miss
+        ; ldr W(atom), [X(key), atom_byte]
+        ; cbz W(atom), =>unrecorded
         ; sub WSP(atom), WSP(atom), #1
+        ; b =>ready
+        ; =>unrecorded
+        ; stp x30, x9, [sp, #-32]!
+        ; stp x10, x12, [sp, #16]
+        ; ldr x1, [x20, crate::entry::THREAD_OFFSET]
+        ; ldr x0, [x1, crate::entry::VM_THREAD_GC_HEAP_OFFSET]
+        ; mov x2, X(key)
+    );
+    emit_load_runtime_stub(
+        ops,
+        relocations,
+        16,
+        otter_vm::runtime_stubs::STRING_KEY_ATOM_LEAF.entry_addr() as u64,
+        abi::STUB_STRING_KEY_ATOM_LEAF,
+    );
+    dynasm!(ops ; .arch aarch64
+        ; blr x16
+        ; ldp x10, x12, [sp, #16]
+        ; ldp x30, x9, [sp], #32
+        ; cbnz x1, =>miss
+        ; mov W(atom), w0
+        ; add w16, w0, #1
+        ; str w16, [X(key), atom_byte]
+        ; =>ready
     );
 }
 
 /// `x1 == 0` with the value in `x0`, else `x1 == 1` and nothing observed.
-/// Leaf code: no call, no allocation, `x30` untouched.
+/// Nothing allocates; the only call is the interning leaf.
 fn emit_keyed_load(
     ops: &mut Assembler,
     relocations: &mut RelocationCapture,
@@ -179,7 +212,7 @@ fn emit_keyed_load(
 ) {
     let miss = ops.new_dynamic_label();
     dynasm!(ops ; .arch aarch64 ; =>label);
-    emit_key_atom(ops, view, KEYED_LOAD_KEY, 11, miss);
+    emit_key_atom(ops, relocations, view, KEYED_LOAD_KEY, 11, miss);
     property_actions::emit_load(
         ops,
         relocations,
@@ -210,7 +243,7 @@ fn emit_keyed_store(
     let stored = ops.new_dynamic_label();
     let miss = ops.new_dynamic_label();
     dynasm!(ops ; .arch aarch64 ; =>label ; stp x29, x30, [sp, #-16]!);
-    emit_key_atom(ops, view, KEYED_STORE_KEY, 3, miss);
+    emit_key_atom(ops, relocations, view, KEYED_STORE_KEY, 3, miss);
     emit_table_store(ops, relocations, view, stored, miss);
     dynasm!(ops ; .arch aarch64
         ; =>miss

@@ -1177,6 +1177,16 @@ for (let warm = 0; warm < 5000; warm++) {
     let mut harness = fresh();
     assert_eq!(
         harness.probe(
+            "let unrelatedLexical = 31; readEpochBinding() + unrelatedLexical;",
+            "34",
+            &["readEpochBinding"]
+        ),
+        0,
+        "a lexical that shadows no global property keeps the read native"
+    );
+    let mut harness = fresh();
+    assert_eq!(
+        harness.probe(
             "globalThis.bindingAddedAfterCompile = 1; readDictionaryBinding();",
             "5",
             &["readDictionaryBinding"]

@@ -139,8 +139,8 @@ pub(crate) fn zero_insensitive(graph: &Graph, layout: &[BlockId]) -> FxHashSet<N
             if !insensitive.contains(&value) {
                 continue;
             }
-            let identifies = identifies_zeros(graph, user, index)
-                .unwrap_or_else(|| insensitive.contains(&user));
+            let identifies =
+                identifies_zeros(graph, user, index).unwrap_or_else(|| insensitive.contains(&user));
             if !identifies {
                 insensitive.remove(&value);
                 dropped = true;
@@ -217,7 +217,13 @@ pub(crate) fn wrap_truncated_arithmetic(graph: &mut Graph, layout: &[BlockId]) {
 mod tests {
     use super::*;
 
-    fn append(graph: &mut Graph, block: BlockId, kind: Kind, inputs: &[NodeId], repr: Repr) -> NodeId {
+    fn append(
+        graph: &mut Graph,
+        block: BlockId,
+        kind: Kind,
+        inputs: &[NodeId],
+        repr: Repr,
+    ) -> NodeId {
         let node = graph.add_node(kind, inputs, repr);
         graph.node_mut(node).block = Some(block);
         graph.block_mut(block).body.push(node);
@@ -228,20 +234,56 @@ mod tests {
     fn a_product_identifies_zeros_only_through_zero_blind_uses() {
         let mut graph = Graph::default();
         let block = graph.new_block();
-        let a = append(&mut graph, block, Kind::InitialRegister(0), &[], Repr::Int32);
-        let b = append(&mut graph, block, Kind::InitialRegister(1), &[], Repr::Int32);
+        let a = append(
+            &mut graph,
+            block,
+            Kind::InitialRegister(0),
+            &[],
+            Repr::Int32,
+        );
+        let b = append(
+            &mut graph,
+            block,
+            Kind::InitialRegister(1),
+            &[],
+            Repr::Int32,
+        );
         let mask = graph.constant(Kind::ConstInt32(0x3fff));
         // Truncated through an addition: the sign of a zero product is lost.
         let truncated = append(&mut graph, block, Kind::Int32Mul, &[a, b], Repr::Int32);
-        let sum = append(&mut graph, block, Kind::Int32Add, &[truncated, b], Repr::Int32);
-        let masked = append(&mut graph, block, Kind::Int32BitAnd, &[sum, mask], Repr::Int32);
+        let sum = append(
+            &mut graph,
+            block,
+            Kind::Int32Add,
+            &[truncated, b],
+            Repr::Int32,
+        );
+        let masked = append(
+            &mut graph,
+            block,
+            Kind::Int32BitAnd,
+            &[sum, mask],
+            Repr::Int32,
+        );
         // Boxed: `-0` is observable.
         let boxed = append(&mut graph, block, Kind::Int32Mul, &[a, b], Repr::Int32);
-        let tagged = append(&mut graph, block, Kind::Int32ToTagged, &[boxed], Repr::Tagged);
+        let tagged = append(
+            &mut graph,
+            block,
+            Kind::Int32ToTagged,
+            &[boxed],
+            Repr::Tagged,
+        );
         // Added into a value that is boxed: the sum keeps the zero's sign.
         let summed = append(&mut graph, block, Kind::Int32Mul, &[a, b], Repr::Int32);
         let exact_sum = append(&mut graph, block, Kind::Int32Add, &[summed, b], Repr::Int32);
-        let exact = append(&mut graph, block, Kind::Int32ToTagged, &[exact_sum], Repr::Tagged);
+        let exact = append(
+            &mut graph,
+            block,
+            Kind::Int32ToTagged,
+            &[exact_sum],
+            Repr::Tagged,
+        );
         let returned = graph.add_node(Kind::Return, &[tagged], Repr::None);
         graph.node_mut(returned).block = Some(block);
         graph.block_mut(block).control = Some(returned);
@@ -250,9 +292,27 @@ mod tests {
         // Added to a shift result, which is never `-0`, then boxed: the sum
         // is `-0` only when both operands are.
         let carried = append(&mut graph, block, Kind::Int32Mul, &[a, b], Repr::Int32);
-        let shifted = append(&mut graph, block, Kind::Int32ShiftRight, &[a, mask], Repr::Int32);
-        let carry = append(&mut graph, block, Kind::Int32Add, &[shifted, carried], Repr::Int32);
-        let boxed_carry = append(&mut graph, block, Kind::Int32ToTagged, &[carry], Repr::Tagged);
+        let shifted = append(
+            &mut graph,
+            block,
+            Kind::Int32ShiftRight,
+            &[a, mask],
+            Repr::Int32,
+        );
+        let carry = append(
+            &mut graph,
+            block,
+            Kind::Int32Add,
+            &[shifted, carried],
+            Repr::Int32,
+        );
+        let boxed_carry = append(
+            &mut graph,
+            block,
+            Kind::Int32ToTagged,
+            &[carry],
+            Repr::Tagged,
+        );
         let _ = boxed_carry;
 
         let insensitive = zero_insensitive(&graph, &[block]);

@@ -330,7 +330,7 @@ impl Interpreter {
                                 &name,
                             ))
                         } else {
-                            VmPropertyKey::OwnedString(string.to_lossy_string(&self.gc_heap))
+                            VmPropertyKey::OwnedString(string.to_key_spelling(&self.gc_heap))
                         }
                     } else if let Some(number) = result.as_number() {
                         VmPropertyKey::OwnedString(number.to_display_string())

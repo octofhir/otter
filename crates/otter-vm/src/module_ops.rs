@@ -1427,7 +1427,7 @@ impl Interpreter {
                         // Symbol keys are filtered by EnumerableOwnProperties.
                         continue;
                     };
-                    let key = key_string.to_lossy_string(&interp.gc_heap);
+                    let key = key_string.to_key_spelling(&interp.gc_heap);
                     let with_now = interp.escape_scoped(with_handle);
                     let descriptor = interp.get_own_property_descriptor_for_value(
                         stack,

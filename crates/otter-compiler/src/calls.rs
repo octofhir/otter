@@ -704,6 +704,7 @@ pub(crate) fn compile_method_call(
     if let Expression::ComputedMemberExpression(member) = callee {
         let receiver_reg = compile_expr(cx, &member.object, span)?;
         if let Expression::StringLiteral(lit) = unwrap_ts_expr(&member.expression)
+            && !lit.lone_surrogates
             && call_arguments_are_effect_free(cx, &call.arguments)
         {
             let name_idx = cx.intern_string_constant(lit.value.as_str());

@@ -65,12 +65,12 @@ fn symbol_ctor_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Na
                         name: "Symbol",
                         reason: "missing execution context".to_string(),
                     })?;
-            let result = ctx
-                .with_turn_parts(|interp, stack| interp.coerce_to_string(stack, &context, other));
-            let coerced = result.map_err(|error| error.into_native(ctx.interp_mut(), "Symbol"))?;
-            let rendered = crate::string::JsString::from_str(&coerced, ctx.heap_mut())
-                .map_err(NativeError::from)?;
-            Some(rendered)
+            // ToString keeps the description's code units, lone surrogates
+            // included.
+            let result = ctx.with_turn_parts(|interp, stack| {
+                crate::coerce::to_js_string_or_throw(interp, stack, &context, other)
+            });
+            Some(result.map_err(|error| error.into_native(ctx.interp_mut(), "Symbol"))?)
         }
     };
     let sym = crate::symbol::JsSymbol::new(ctx.interp_mut().gc_heap_mut(), description)
@@ -94,8 +94,12 @@ fn symbol_for_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Nat
                         name: "Symbol.for",
                         reason: "missing execution context".to_string(),
                     })?;
-            let result = ctx
-                .with_turn_parts(|interp, stack| interp.coerce_to_string(stack, &context, other));
+            // The registry keys on the string's key spelling, so distinct
+            // strings never share a symbol.
+            let result = ctx.with_turn_parts(|interp, stack| {
+                crate::coerce::to_js_string_or_throw(interp, stack, &context, other)
+                    .map(|key| key.to_key_spelling(interp.gc_heap()))
+            });
             result.map_err(|error| error.into_native(ctx.interp_mut(), "Symbol.for"))?
         }
     };
@@ -118,12 +122,13 @@ fn symbol_key_for_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value,
     let key = ctx.interp_mut().symbol_registry().key_for(sym);
     match key {
         Some(key) => {
-            let value = crate::string::JsString::from_str(&key, ctx.heap_mut()).map_err(|_| {
-                NativeError::TypeError {
-                    name: "Symbol.keyFor",
-                    reason: "out of memory".to_string(),
-                }
-            })?;
+            let value =
+                crate::string::JsString::from_key_spelling(&key, ctx.heap_mut()).map_err(|_| {
+                    NativeError::TypeError {
+                        name: "Symbol.keyFor",
+                        reason: "out of memory".to_string(),
+                    }
+                })?;
             Ok(Value::string(value))
         }
         None => Ok(Value::undefined()),

@@ -287,7 +287,10 @@ impl Interpreter {
             return Ok(VmPropertyKey::Symbol(sym));
         }
         Ok(VmPropertyKey::OwnedString(
-            primitive.display_string(&self.gc_heap),
+            match primitive.as_string(&self.gc_heap) {
+                Some(string) => string.to_key_spelling(&self.gc_heap),
+                None => primitive.display_string(&self.gc_heap),
+            },
         ))
     }
 
@@ -349,7 +352,7 @@ impl Interpreter {
                 .collect();
             let mut fresh: Vec<Local> = Vec::new();
             for name in names {
-                fresh.push(interp.scoped_string(scope, name)?);
+                fresh.push(interp.scoped_key_string(scope, name)?);
             }
             // Every allocation above is a collection point; read the
             // (now collector-updated) arena slots back into the caller's

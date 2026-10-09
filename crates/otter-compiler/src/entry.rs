@@ -1046,7 +1046,6 @@ pub(crate) fn compile_program_parts(
         functions,
         constants,
         template_sites,
-        next_private_namespace: _,
         ..
     } = Rc::try_unwrap(module)
         .expect("module builder should be uniquely owned at finalize")
@@ -1672,7 +1671,6 @@ pub fn compile_module_program(
         functions,
         constants,
         template_sites,
-        next_private_namespace: _,
         ..
     } = Rc::try_unwrap(module)
         .expect("module builder should be uniquely owned at finalize")

@@ -187,7 +187,7 @@ impl Interpreter {
                 ))
             } else {
                 name = if let Some(key) = idx_value.as_string(&self.gc_heap) {
-                    key.to_lossy_string(&self.gc_heap).into()
+                    key.to_key_spelling(&self.gc_heap).into()
                 } else if let Some(n) = idx_value.as_number() {
                     n.to_display_string().into()
                 } else {
@@ -256,7 +256,7 @@ impl Interpreter {
                 }
             } else if let Some(key) = idx_value.as_string(&self.gc_heap) {
                 // Computed string-key access on Array exotic.
-                let name = key.to_lossy_string(&self.gc_heap);
+                let name = key.to_key_spelling(&self.gc_heap);
                 if name == "length" {
                     Value::number(NumberValue::from_f64(
                         crate::array::len(arr, &self.gc_heap) as f64
@@ -347,7 +347,7 @@ impl Interpreter {
             // function's prototype chain.
             let key = if let Some(key) = idx_value.as_string(&self.gc_heap) {
                 Some(VmPropertyKey::OwnedString(
-                    key.to_lossy_string(&self.gc_heap),
+                    key.to_key_spelling(&self.gc_heap),
                 ))
             } else {
                 idx_value
@@ -373,7 +373,7 @@ impl Interpreter {
             // the old own-descriptor read made Object['toString']
             // undefined while Object.toString resolved.
             if let Some(key) = idx_value.as_string(&self.gc_heap) {
-                let key = key.to_lossy_string(&self.gc_heap);
+                let key = key.to_key_spelling(&self.gc_heap);
                 let key = VmPropertyKey::OwnedString(key);
                 match self.ordinary_get_value(stack, Some(context), recv, recv, &key, 0)? {
                     crate::VmGetOutcome::Value(v) => v,
@@ -400,7 +400,7 @@ impl Interpreter {
             // Same ladder for bound functions — own descriptor first,
             // then %Function.prototype% via the shared resolver.
             if let Some(key) = idx_value.as_string(&self.gc_heap) {
-                let key = key.to_lossy_string(&self.gc_heap);
+                let key = key.to_key_spelling(&self.gc_heap);
                 let key = VmPropertyKey::OwnedString(key);
                 match self.ordinary_get_value(stack, Some(context), recv, recv, &key, 0)? {
                     crate::VmGetOutcome::Value(v) => v,
@@ -425,7 +425,7 @@ impl Interpreter {
             }
         } else if let Some(t) = recv.as_typed_array(&self.gc_heap) {
             if let Some(key) = idx_value.as_string(&self.gc_heap) {
-                let name = key.to_lossy_string(&self.gc_heap);
+                let name = key.to_key_spelling(&self.gc_heap);
                 if let Some(n) = canonical_numeric_index_string(&name) {
                     match typed_array_valid_index(&t, &self.gc_heap, n) {
                         Some(idx) => t
@@ -499,7 +499,7 @@ impl Interpreter {
             // §10.4.3 String exotic [[GetOwnProperty]] — UTF-16 code
             // unit indexed access then String.prototype fallback.
             if let Some(key) = idx_value.as_string(&self.gc_heap) {
-                let name = key.to_lossy_string(&self.gc_heap);
+                let name = key.to_key_spelling(&self.gc_heap);
                 self.load_string_primitive_property(stack, context, &recv, s, &name)?
             } else if let Some(n) = idx_value.as_number() {
                 // §10.4.3.5 — every numeric index, in- or out-of-bounds,
@@ -535,7 +535,7 @@ impl Interpreter {
                 // override (cross-realm literals), and the observable
                 // `%RegExp.prototype%` accessors — identical to the
                 // static-key path.
-                let name = key.to_lossy_string(&self.gc_heap);
+                let name = key.to_key_spelling(&self.gc_heap);
                 let key = VmPropertyKey::OwnedString(name);
                 match self.ordinary_get_value(stack, Some(context), recv, recv, &key, 0)? {
                     crate::VmGetOutcome::Value(v) => v,
@@ -573,7 +573,7 @@ impl Interpreter {
             let key = if let Some(sym) = idx_value.as_symbol(&self.gc_heap) {
                 VmPropertyKey::Symbol(sym)
             } else if let Some(s) = idx_value.as_string(&self.gc_heap) {
-                VmPropertyKey::OwnedString(s.to_lossy_string(&self.gc_heap))
+                VmPropertyKey::OwnedString(s.to_key_spelling(&self.gc_heap))
             } else if let Some(n) = idx_value.as_number() {
                 VmPropertyKey::OwnedString(n.to_display_string())
             } else {
@@ -602,7 +602,7 @@ impl Interpreter {
             let key = if let Some(sym) = idx_value.as_symbol(&self.gc_heap) {
                 VmPropertyKey::Symbol(sym)
             } else if let Some(k) = idx_value.as_string(&self.gc_heap) {
-                VmPropertyKey::OwnedString(k.to_lossy_string(&self.gc_heap))
+                VmPropertyKey::OwnedString(k.to_key_spelling(&self.gc_heap))
             } else if let Some(n) = idx_value.as_number() {
                 VmPropertyKey::OwnedString(n.to_display_string())
             } else {

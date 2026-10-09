@@ -255,7 +255,7 @@ fn emit_instance_field_inits_inner(
         let pspan = (p.span.start, p.span.end);
         // §15.7.10 / §13.15.2 NamedEvaluation — a static-key field's
         // anonymous initializer takes the field name.
-        let static_key_name = if p.computed {
+        let static_key_name = if p.computed || crate::synthetic::is_lone_surrogate_key(&p.key) {
             None
         } else {
             match &p.key {
@@ -290,13 +290,24 @@ fn emit_instance_field_inits_inner(
         };
         let this_reg = cx.alloc_scratch();
         cx.emit_load_this(this_reg, pspan);
-        if p.computed {
+        let runtime_key = if p.computed {
             // §15.7.10 — computed-key field. The key was evaluated
             // exactly once at class-definition time (§15.7.14) into
             // a synthetic captured binding; resolve it here instead
             // of re-evaluating the expression per instance.
             let binding = crate::class::field_key_binding_name(idx);
-            let key_reg = load_synthetic_capture(cx, &binding, pspan)?;
+            Some(load_synthetic_capture(cx, &binding, pspan)?)
+        } else if let oxc_ast::ast::PropertyKey::StringLiteral(lit) = &p.key
+            && lit.lone_surrogates
+        {
+            // Only the literal spells a lone surrogate's code units.
+            Some(crate::expr::literal::compile_string_literal(
+                cx, lit, pspan,
+            )?)
+        } else {
+            None
+        };
+        if let Some(key_reg) = runtime_key {
             // §15.7.10 step 4 — `[key] = AnonymousFunctionDefinition`
             // names the function from the (already canonical) key.
             if p.value

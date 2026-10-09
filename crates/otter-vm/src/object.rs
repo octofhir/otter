@@ -4307,8 +4307,8 @@ pub fn has_in_proto_chain(obj: JsObject, heap: &otter_gc::GcHeap, target: JsObje
 /// sites that already hold the WTF-16 form.
 #[must_use]
 pub fn get_jsstring(obj: JsObject, heap: &otter_gc::GcHeap, key: JsString) -> Option<Value> {
-    let utf8 = key.to_lossy_string(heap);
-    get(obj, heap, &utf8)
+    let spelling = key.to_key_spelling(heap);
+    get(obj, heap, &spelling)
 }
 
 /// Look up an **own** symbol-keyed property.
@@ -6400,7 +6400,7 @@ fn ordinary_string_key_entries(heap: &otter_gc::GcHeap, body: &ObjectBody) -> Ve
             .into_iter()
             .map(|(key, offset)| {
                 (
-                    String::from_utf16_lossy(&to_utf16_vec(heap, key)),
+                    JsString::from_handle(key, heap).to_key_spelling(heap),
                     offset as usize,
                 )
             })
@@ -6533,7 +6533,7 @@ pub(crate) fn shape_ordered_slot_attrs(
             let (flags, is_accessor) = shape_body::shape_slot_attrs(heap, shape, offset)
                 .unwrap_or((PropertyFlags::data_default(), false));
             (
-                String::from_utf16_lossy(&to_utf16_vec(heap, key)),
+                JsString::from_handle(key, heap).to_key_spelling(heap),
                 flags,
                 is_accessor,
             )
@@ -6545,7 +6545,7 @@ fn string_keys_in_shape_order(heap: &otter_gc::GcHeap, body: &ObjectBody) -> Vec
     if !body.is_dictionary() {
         return shape_body::shape_keys_ordered(heap, body.shape)
             .into_iter()
-            .map(|(key, _)| String::from_utf16_lossy(&to_utf16_vec(heap, key)))
+            .map(|(key, _)| JsString::from_handle(key, heap).to_key_spelling(heap))
             .collect();
     }
     body.dict_keys().map_or_else(Vec::new, |table| {

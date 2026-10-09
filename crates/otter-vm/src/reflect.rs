@@ -415,7 +415,7 @@ fn coerce_property_key(
     };
     if let Some(s) = v.as_string(interp.gc_heap()) {
         return Ok(VmPropertyKey::OwnedString(
-            s.to_lossy_string(interp.gc_heap()),
+            s.to_key_spelling(interp.gc_heap()),
         ));
     }
     if let Some(n) = v.as_number() {

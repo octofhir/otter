@@ -436,7 +436,8 @@ impl ShapeRuntime {
         heap.read_payload(shape, ShapeBody::id)
     }
 
-    /// Intern a property key as a GC-managed string body plus its global atom.
+    /// Intern a property-key spelling as a GC-managed string body holding
+    /// the code units it stands for, plus its global atom.
     pub(crate) fn intern_key_with_roots(
         &mut self,
         heap: &mut GcHeap,
@@ -447,7 +448,7 @@ impl ShapeRuntime {
         if let Some(handle) = self.key_strings.get(&known) {
             return Ok((handle.get(), known));
         }
-        let units: Vec<u16> = key.encode_utf16().collect();
+        let units: Vec<u16> = crate::wtf16_escape::units(key).collect();
         let mut visit_roots = |visitor: &mut dyn FnMut(*mut RawGc)| {
             self.trace_roots(visitor);
             external_visit(visitor);

@@ -1261,7 +1261,8 @@ pub(crate) fn assign_object_pattern(
                 // FIRST, then §13.15.5.6 step 1 evaluates the target
                 // Reference (member bases, a derived-constructor `this`),
                 // and only then does GetV read the source property.
-                let computed_key = if p.computed {
+                let computed_key = if p.computed || crate::synthetic::is_lone_surrogate_key(&p.name)
+                {
                     Some(match &p.name {
                         PropertyKey::StaticIdentifier(id) => {
                             let r = cx.alloc_scratch();

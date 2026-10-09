@@ -1156,6 +1156,9 @@ impl<'rt> NativeCtx<'rt> {
 
     /// Return enumerable own string keys through the target's JavaScript
     /// internal methods, including Proxy `ownKeys` and descriptor traps.
+    /// Each key is its property-key spelling: a key holding an unpaired
+    /// surrogate carries it escaped, and passes back to a property access
+    /// as is.
     pub fn enumerable_own_string_keys(
         &mut self,
         target: Value,
@@ -3374,7 +3377,8 @@ impl<'scope, 'rt> NativeScope<'scope, 'rt> {
         self.raw(value).display_string(self.ctx.heap())
     }
 
-    /// Return enumerable own string keys through JavaScript internal methods.
+    /// Return enumerable own string keys through JavaScript internal methods,
+    /// as property-key spellings (see the context-level method).
     pub fn enumerable_own_string_keys(
         &mut self,
         value: Local<'_>,

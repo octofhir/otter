@@ -782,12 +782,13 @@ pub fn flatten_in_place(
     Ok(())
 }
 
-/// Compare a JS string against a UTF-8 `&str` for code-unit equality
-/// **without allocating** for the common single-segment case.
+/// Compare a JS string against a property-key spelling (see
+/// [`crate::wtf16_escape`]) for code-unit equality **without allocating**
+/// for the common single-segment case.
 ///
 /// Property keys are overwhelmingly short, interned, single-segment
 /// `Latin1` or `Flat` bodies, so the hot path (shape-key validation in
-/// the property IC) compares in place against `key.encode_utf16()`.
+/// the property IC) compares in place against the spelling's code units.
 /// Only the rare `Cons` / `Sliced` rope shapes fall back to the
 /// allocating [`to_utf16_vec`] materialiser.
 #[must_use]
@@ -818,7 +819,7 @@ pub fn eq_str(heap: &GcHeap, string: JsStringHandle, key: &str) -> bool {
             }
         }
         JsStringBodyRepr::InlineLatin1(bytes) => {
-            let mut units = key.encode_utf16();
+            let mut units = crate::wtf16_escape::units(key);
             for &byte in &bytes[..b.len as usize] {
                 match units.next() {
                     Some(u) if u == u16::from(byte) => {}
@@ -835,7 +836,7 @@ pub fn eq_str(heap: &GcHeap, string: JsStringHandle, key: &str) -> bool {
             let bytes = b.seq_latin1_bytes();
             // Latin-1 byte values are Unicode scalar values 0..=255,
             // so each zero-extends straight to a UTF-16 code unit.
-            let mut units = key.encode_utf16();
+            let mut units = crate::wtf16_escape::units(key);
             for &byte in bytes {
                 match units.next() {
                     Some(u) if u == u16::from(byte) => {}
@@ -849,7 +850,7 @@ pub fn eq_str(heap: &GcHeap, string: JsStringHandle, key: &str) -> bool {
             }
         }
         JsStringBodyRepr::InlineFlat(code_units) => {
-            let mut units = key.encode_utf16();
+            let mut units = crate::wtf16_escape::units(key);
             for &unit in &code_units[..b.len as usize] {
                 match units.next() {
                     Some(u) if u == unit => {}
@@ -864,7 +865,7 @@ pub fn eq_str(heap: &GcHeap, string: JsStringHandle, key: &str) -> bool {
         }
         JsStringBodyRepr::SeqFlat => {
             let code_units = b.seq_flat_units();
-            let mut units = key.encode_utf16();
+            let mut units = crate::wtf16_escape::units(key);
             for &unit in code_units {
                 match units.next() {
                     Some(u) if u == unit => {}
@@ -887,16 +888,19 @@ pub fn eq_str(heap: &GcHeap, string: JsStringHandle, key: &str) -> bool {
         Fast::Rope => match contiguous_view(heap, string) {
             Some((target, start, len)) => {
                 heap.read_payload(target, |b| match flat_content_range(b, start, len) {
-                    Some(FlatContent::Latin1(bytes)) => {
-                        bytes.iter().map(|&x| u16::from(x)).eq(key.encode_utf16())
+                    Some(FlatContent::Latin1(bytes)) => bytes
+                        .iter()
+                        .map(|&x| u16::from(x))
+                        .eq(crate::wtf16_escape::units(key)),
+                    Some(FlatContent::Wide(units)) => {
+                        units.iter().copied().eq(crate::wtf16_escape::units(key))
                     }
-                    Some(FlatContent::Wide(units)) => units.iter().copied().eq(key.encode_utf16()),
                     None => unreachable!("resolved view stores its units contiguously"),
                 })
             }
             None => to_utf16_vec(heap, string)
                 .into_iter()
-                .eq(key.encode_utf16()),
+                .eq(crate::wtf16_escape::units(key)),
         },
     }
 }

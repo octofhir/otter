@@ -303,6 +303,7 @@ fn compile_binary_to(
     // ToPropertyKey is itself, so only the object operand is evaluated.
     if op == Op::HasProperty
         && let Expression::StringLiteral(name) = &b.left
+        && !name.lone_surrogates
         && is_named_key(name.value.as_str())
     {
         let object = compile_expr(cx, &b.right, span)?;

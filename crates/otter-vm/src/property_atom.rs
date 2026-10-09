@@ -125,25 +125,27 @@ impl NameUnits<'_> {
         }
     }
 
-    /// `true` when `spelling` has exactly these code units. A lone surrogate
-    /// matches no spelling: a Rust string encodes none.
+    /// `true` when `spelling` stands for exactly these code units: an
+    /// unpaired surrogate matches its escape (see [`crate::wtf16_escape`]).
     fn spells(self, spelling: &str) -> bool {
         match self {
             Self::Latin1(bytes) if spelling.is_ascii() => spelling.as_bytes() == bytes,
-            Self::Latin1(bytes) => spelling
-                .encode_utf16()
-                .eq(bytes.iter().map(|&byte| u16::from(byte))),
-            Self::Utf16(units) => spelling.encode_utf16().eq(units.iter().copied()),
+            Self::Latin1(bytes) => {
+                crate::wtf16_escape::units(spelling).eq(bytes.iter().map(|&byte| u16::from(byte)))
+            }
+            Self::Utf16(units) => crate::wtf16_escape::units(spelling).eq(units.iter().copied()),
         }
     }
 }
 
 impl NameInterner {
+    /// Hash of the code units spelling `name` stands for, so a string's
+    /// own units find an escaped spelling.
     fn hash_str(name: &str) -> u64 {
         if name.is_ascii() {
             NameUnits::Latin1(name.as_bytes()).hash()
         } else {
-            hash_units(name.encode_utf16())
+            hash_units(crate::wtf16_escape::units(name))
         }
     }
 

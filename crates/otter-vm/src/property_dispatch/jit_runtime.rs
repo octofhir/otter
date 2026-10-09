@@ -703,7 +703,7 @@ impl Interpreter {
                 &name,
             ))
         } else if let Some(string) = property_key.as_string(&self.gc_heap) {
-            VmPropertyKey::OwnedString(string.to_lossy_string(&self.gc_heap))
+            VmPropertyKey::OwnedString(string.to_key_spelling(&self.gc_heap))
         } else if let Some(number) = property_key.as_number() {
             VmPropertyKey::OwnedString(number.to_display_string())
         } else {

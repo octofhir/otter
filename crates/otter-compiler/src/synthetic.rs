@@ -2,6 +2,7 @@
 //!
 //! # Contents
 //! - UTF-16 string decoding
+//! - lone-surrogate key detection
 //! - numeric literal property-key formatting
 //!
 //! # Invariants
@@ -55,6 +56,14 @@ pub(crate) fn decode_lone_surrogate_string(value: &str) -> Vec<u16> {
         }
     }
     out
+}
+
+/// Whether `key` is a string literal holding an unpaired surrogate. Its
+/// oxc text is a lossy stand-in, not its code units, so no static name
+/// spells it: such a key lowers like a computed key, whose literal decodes
+/// to the exact code units.
+pub(crate) fn is_lone_surrogate_key(key: &oxc_ast::ast::PropertyKey<'_>) -> bool {
+    matches!(key, oxc_ast::ast::PropertyKey::StringLiteral(lit) if lit.lone_surrogates)
 }
 
 /// The settled property-key spelling of a `NumericLiteral` per

@@ -193,17 +193,17 @@ impl Interpreter {
         match key {
             VmPropertyKey::Symbol(sym) => Ok(Value::symbol(sym)),
             VmPropertyKey::Atom(atom) => {
-                let s = JsString::from_str(atom.name(), self.gc_heap_mut())
+                let s = JsString::from_key_spelling(atom.name(), self.gc_heap_mut())
                     .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
                 Ok(Value::string(s))
             }
             VmPropertyKey::String(s) => {
-                let s = JsString::from_str(s, self.gc_heap_mut())
+                let s = JsString::from_key_spelling(s, self.gc_heap_mut())
                     .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
                 Ok(Value::string(s))
             }
             VmPropertyKey::OwnedString(s) => {
-                let s = JsString::from_str(&s, self.gc_heap_mut())
+                let s = JsString::from_key_spelling(&s, self.gc_heap_mut())
                     .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
                 Ok(Value::string(s))
             }
@@ -489,7 +489,7 @@ impl Interpreter {
                 other => {
                     let name = other.string_name().map(str::to_string).unwrap_or_default();
                     Value::string(
-                        crate::JsString::from_str(&name, &mut self.gc_heap)
+                        crate::JsString::from_key_spelling(&name, &mut self.gc_heap)
                             .map_err(|error| CommittedValueError::JavaScript(error.into()))?,
                     )
                 }
@@ -508,7 +508,7 @@ impl Interpreter {
             if let Some(sym) = idx.as_symbol(&self.gc_heap) {
                 crate::object::delete_symbol(obj, &mut self.gc_heap, sym)
             } else if let Some(s) = idx.as_string(&self.gc_heap) {
-                let name = s.to_lossy_string(&self.gc_heap);
+                let name = s.to_key_spelling(&self.gc_heap);
                 match namespace_env {
                     Some(env) => crate::object::get(env, &self.gc_heap, &name).is_none(),
                     None => crate::object::delete(&mut { obj }, &mut self.gc_heap, &name)
@@ -540,7 +540,7 @@ impl Interpreter {
                     ),
                 }
             } else if let Some(s) = idx.as_string(&self.gc_heap) {
-                let name = s.to_lossy_string(&self.gc_heap);
+                let name = s.to_key_spelling(&self.gc_heap);
                 crate::array::delete_named_property(arr, &mut self.gc_heap, &name)
             } else if let Some(sym) = idx.as_symbol(&self.gc_heap) {
                 crate::array::delete_symbol_property(arr, &mut self.gc_heap, sym)
@@ -553,7 +553,7 @@ impl Interpreter {
                 crate::object::delete_symbol(statics, &mut self.gc_heap, sym)
             } else if let Some(name) = idx
                 .as_string(&self.gc_heap)
-                .map(|s| s.to_lossy_string(&self.gc_heap))
+                .map(|s| s.to_key_spelling(&self.gc_heap))
                 .or_else(|| idx.as_number().map(|n| n.to_display_string()))
             {
                 if crate::object::get_own_descriptor(statics, &self.gc_heap, &name).is_some() {
@@ -608,7 +608,7 @@ impl Interpreter {
                 deleted
             } else {
                 let name = match (idx.as_string(&self.gc_heap), idx.as_number()) {
-                    (Some(s), _) => s.to_lossy_string(&self.gc_heap),
+                    (Some(s), _) => s.to_key_spelling(&self.gc_heap),
                     (None, Some(n)) => match n.as_smi() {
                         Some(v) if v >= 0 => v.to_string(),
                         _ => n.to_display_string(),
@@ -625,7 +625,7 @@ impl Interpreter {
             if let Some(sym) = idx.as_symbol(&self.gc_heap) {
                 native.delete_own_symbol_property(&mut self.gc_heap, sym)
             } else if let Some(s) = idx.as_string(&self.gc_heap) {
-                let name = s.to_lossy_string(&self.gc_heap);
+                let name = s.to_key_spelling(&self.gc_heap);
                 native
                     .delete_own_property(&mut self.gc_heap, &name)
                     .map_err(|error| CommittedValueError::JavaScript(error.into()))?
@@ -634,7 +634,7 @@ impl Interpreter {
             }
         } else if let Some(bound) = receiver.as_bound_function() {
             let name = match (idx.as_string(&self.gc_heap), idx.as_number()) {
-                (Some(s), _) => Some(s.to_lossy_string(&self.gc_heap)),
+                (Some(s), _) => Some(s.to_key_spelling(&self.gc_heap)),
                 (None, Some(n)) => Some(match n.as_smi() {
                     Some(v) if v >= 0 => v.to_string(),
                     _ => n.to_display_string(),
@@ -657,7 +657,7 @@ impl Interpreter {
             }
         } else if let Some(t) = receiver.as_typed_array(&self.gc_heap) {
             if let Some(s) = idx.as_string(&self.gc_heap) {
-                let name = s.to_lossy_string(&self.gc_heap);
+                let name = s.to_key_spelling(&self.gc_heap);
                 match canonical_numeric_index_string(&name) {
                     Some(n) => typed_array_valid_index(&t, &self.gc_heap, n).is_none(),
                     None => {
@@ -699,7 +699,7 @@ impl Interpreter {
                     true
                 }
             } else if let Some(s) = idx.as_string(&self.gc_heap) {
-                let name = s.to_lossy_string(&self.gc_heap);
+                let name = s.to_key_spelling(&self.gc_heap);
                 if name == "lastIndex" {
                     false
                 } else if let Some(bag) = r.expando(&self.gc_heap) {
@@ -722,7 +722,7 @@ impl Interpreter {
                     None => true,
                 }
             } else if let Some(s) = idx.as_string(&self.gc_heap) {
-                let name = s.to_lossy_string(&self.gc_heap);
+                let name = s.to_key_spelling(&self.gc_heap);
                 match dv.expando(&self.gc_heap) {
                     Some(bag) => crate::object::delete(&mut { bag }, &mut self.gc_heap, &name)
                         .map_err(|error| CommittedValueError::JavaScript(error.into()))?,
@@ -792,7 +792,7 @@ impl Interpreter {
                     if let Some(sym) = coerced.as_symbol(&interp.gc_heap) {
                         VmPropertyKey::Symbol(sym)
                     } else if let Some(s) = coerced.as_string(&interp.gc_heap) {
-                        VmPropertyKey::OwnedString(s.to_lossy_string(&interp.gc_heap))
+                        VmPropertyKey::OwnedString(s.to_key_spelling(&interp.gc_heap))
                     } else if let Some(n) = coerced.as_number() {
                         VmPropertyKey::OwnedString(n.to_display_string())
                     } else {
@@ -921,7 +921,7 @@ impl Interpreter {
                         .map_err(|error| CommittedValueError::Fatal(error.into()))?;
                     return Ok(());
                 } else if let Some(s) = coerced.as_string(&self.gc_heap) {
-                    s.to_lossy_string(&self.gc_heap)
+                    s.to_key_spelling(&self.gc_heap)
                 } else if let Some(n) = coerced.as_number() {
                     n.to_display_string()
                 } else {

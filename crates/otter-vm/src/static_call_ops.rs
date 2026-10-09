@@ -863,14 +863,13 @@ impl Interpreter {
                     // as own indexed properties plus a `length`. The
                     // latter is read-only on the wrapper, so we copy
                     // only the indexed slots.
-                    let lossy = s.to_lossy_string(&interp.gc_heap);
-                    for (idx, ch) in lossy.chars().enumerate() {
-                        let mut buf = [0u16; 2];
-                        let units = ch.encode_utf16(&mut buf);
-                        let unit_string =
-                            crate::string::JsString::from_utf16_units(units, interp.gc_heap_mut())
-                                .map_err(|_| VmError::TypeMismatch)
-                                .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                    let units = s.with_utf16(&interp.gc_heap, <[u16]>::to_vec);
+                    for (idx, unit) in units.into_iter().enumerate() {
+                        let unit_string = crate::string::JsString::from_utf16_units(
+                            &[unit],
+                            interp.gc_heap_mut(),
+                        )
+                        .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
                         let target_value = interp.escape_scoped(target);
                         assign_set_string(
                             interp,
@@ -1074,8 +1073,8 @@ impl Interpreter {
                     let mut pair_handles: Vec<Local> = Vec::with_capacity(raw.len());
                     for ((key, _), value_h) in raw.iter().zip(value_handles) {
                         let key_h = interp
-                            .scoped_string(scope, key)
-                            .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                            .scoped_key_string(scope, key)
+                            .map_err(CommittedValueError::JavaScript)?;
                         // Resolve both handles through the arena immediately
                         // before the pair allocation, which traces its pending
                         // element vector.
@@ -1493,7 +1492,7 @@ impl Interpreter {
                             let key = interp.escape_scoped(key_h);
                             let vm_key = if let Some(s) = key.as_string(&interp.gc_heap) {
                                 crate::VmPropertyKey::OwnedString(
-                                    s.to_lossy_string(&interp.gc_heap),
+                                    s.to_key_spelling(&interp.gc_heap),
                                 )
                             } else if let Some(sym) = key.as_symbol(&interp.gc_heap) {
                                 crate::VmPropertyKey::Symbol(sym)
@@ -1518,7 +1517,7 @@ impl Interpreter {
                             // the descriptor allocation may have relocated it.
                             let key = interp.escape_scoped(key_h);
                             if let Some(s) = key.as_string(&interp.gc_heap) {
-                                let key_string = s.to_lossy_string(&interp.gc_heap);
+                                let key_string = s.to_key_spelling(&interp.gc_heap);
                                 interp
                                     .scoped_set(scope, result, &key_string, desc_h)
                                     .map_err(|error| {
@@ -1570,7 +1569,7 @@ impl Interpreter {
                         .into_iter()
                         .filter_map(|key| {
                             key.as_string(&self.gc_heap)
-                                .map(|s| s.to_lossy_string(&self.gc_heap))
+                                .map(|s| s.to_key_spelling(&self.gc_heap))
                         })
                         .collect()
                 } else {
@@ -1949,7 +1948,7 @@ fn value_to_static_property_key(
     heap: &otter_gc::GcHeap,
 ) -> Result<VmPropertyKey<'static>, VmError> {
     if let Some(s) = value.as_string(heap) {
-        return Ok(VmPropertyKey::OwnedString(s.to_lossy_string(heap)));
+        return Ok(VmPropertyKey::OwnedString(s.to_key_spelling(heap)));
     }
     if let Some(sym) = value.as_symbol(heap) {
         return Ok(VmPropertyKey::Symbol(sym));
@@ -2050,7 +2049,7 @@ pub(crate) fn enumerable_own_string_entries(
             let Some(name) = key_value.as_string(interp.gc_heap()) else {
                 continue;
             };
-            let key_name = name.to_lossy_string(interp.gc_heap());
+            let key_name = name.to_key_spelling(interp.gc_heap());
             let key = VmPropertyKey::OwnedString(key_name.clone());
             let live = interp.escape_scoped(target);
             let desc = interp.ordinary_get_own_property_descriptor_value(
@@ -2139,7 +2138,7 @@ fn assign_copy_source_keys(
         for index in 0..key_count {
             let key_value = interp.json_root_get(keys_base + index);
             let key = if let Some(s) = key_value.as_string(interp.gc_heap()) {
-                VmPropertyKey::OwnedString(s.to_lossy_string(interp.gc_heap()))
+                VmPropertyKey::OwnedString(s.to_key_spelling(interp.gc_heap()))
             } else if key_value.as_symbol(interp.gc_heap()).is_some() {
                 VmPropertyKey::Symbol(
                     interp
@@ -2170,7 +2169,7 @@ fn assign_copy_source_keys(
                     return false;
                 };
                 if let Some(a) = candidate.as_string(interp.gc_heap()) {
-                    return a.to_lossy_string(interp.gc_heap()) == key_name;
+                    return a.to_key_spelling(interp.gc_heap()) == key_name;
                 }
                 if let Some(number) = candidate.as_number() {
                     return number.to_display_string() == key_name;

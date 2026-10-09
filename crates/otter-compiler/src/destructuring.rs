@@ -327,9 +327,11 @@ pub(crate) fn destructure_object_inner(
         } else {
             None
         };
-        if prop.computed {
+        if prop.computed || crate::synthetic::is_lone_surrogate_key(&prop.key) {
             // §13.15.5 — computed key evaluated at destructuring
-            // time, then `obj[key]` via `Op::LoadElement`.
+            // time, then `obj[key]` via `Op::LoadElement`. A string key
+            // holding a lone surrogate takes this path too: only its
+            // literal spells its code units.
             let key_reg = match &prop.key {
                 oxc_ast::ast::PropertyKey::StaticIdentifier(id) => {
                     let r = parent.alloc_scratch();

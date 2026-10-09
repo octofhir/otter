@@ -954,7 +954,7 @@ impl Interpreter {
                     let key = self.json_root_get(key_root);
                     let s = key
                         .as_string(self.gc_heap())
-                        .map(|js| js.to_lossy_string(self.gc_heap()))
+                        .map(|js| js.to_key_spelling(self.gc_heap()))
                         .unwrap_or_else(|| key.display_string(self.gc_heap()));
                     out.push(s);
                 }
@@ -1010,7 +1010,7 @@ impl Interpreter {
         item: &Value,
     ) -> Result<Option<String>, CommittedValueError> {
         if let Some(s) = item.as_string(self.gc_heap()) {
-            return Ok(Some(s.to_lossy_string(self.gc_heap())));
+            return Ok(Some(s.to_key_spelling(self.gc_heap())));
         }
         if let Some(n) = item.as_number() {
             return Ok(Some(render_number_key(n)));
@@ -1092,7 +1092,7 @@ impl Interpreter {
 
     /// Build the `key` argument passed to `toJSON` / the replacer.
     fn json_key_value(&mut self, key: &str) -> Result<Value, VmError> {
-        let s = JsString::from_str(key, self.gc_heap_mut())?;
+        let s = JsString::from_key_spelling(key, self.gc_heap_mut())?;
         Ok(Value::string(s))
     }
 }
@@ -1113,13 +1113,19 @@ fn quote_json_string_into(s: JsString, heap: &otter_gc::GcHeap, out: &mut String
     quote_units_into(&units, out);
 }
 
-/// QuoteJSONString for a Rust `&str` member name (object keys are
-/// always well-formed UTF-8, so the bytes can be escaped in place: only
-/// ASCII `"`, `\\`, and control bytes need escaping, and every multi-byte
-/// UTF-8 sequence — being `>= 0x80` and never JSON-special — is copied
-/// verbatim, producing the same output as the UTF-16 path with no Vec.
+/// QuoteJSONString for a property-key spelling. A spelling that escapes a
+/// lone surrogate quotes over its code units; any other spelling is
+/// well-formed UTF-8 whose bytes escape in place: only ASCII `"`, `\\`,
+/// and control bytes need escaping, and every multi-byte UTF-8 sequence —
+/// being `>= 0x80` and never JSON-special — is copied verbatim, producing
+/// the same output as the UTF-16 path with no Vec.
 fn quote_json_string_str_into(s: &str, out: &mut String) {
     use std::fmt::Write as _;
+    if crate::wtf16_escape::is_escaped(s) {
+        let units: Vec<u16> = crate::wtf16_escape::units(s).collect();
+        quote_units_into(&units, out);
+        return;
+    }
     let bytes = s.as_bytes();
     out.reserve(bytes.len() + 2);
     out.push('"');
@@ -1200,7 +1206,7 @@ fn quote_latin1_into(bytes: &[u8], out: &mut String) {
     out.push('"');
 }
 
-fn quote_units_into(units: &[u16], out: &mut String) {
+pub(super) fn quote_units_into(units: &[u16], out: &mut String) {
     use std::fmt::Write as _;
     out.reserve(units.len() + 2);
     out.push('"');

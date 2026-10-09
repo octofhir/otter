@@ -1403,7 +1403,7 @@ impl Interpreter {
             return Ok(VmPropertyKey::String("undefined"));
         };
         if let Some(s) = value.as_string(heap) {
-            return Ok(VmPropertyKey::OwnedString(s.to_lossy_string(heap)));
+            return Ok(VmPropertyKey::OwnedString(s.to_key_spelling(heap)));
         }
         if let Some(n) = value.as_number() {
             return Ok(VmPropertyKey::OwnedString(n.to_display_string()));
@@ -2168,7 +2168,7 @@ impl Interpreter {
                             .own_property_keys_value(stack, context, &target)?
                             .iter()
                             .filter_map(|key| key.as_string(&interp.gc_heap))
-                            .map(|name| name.to_lossy_string(&interp.gc_heap))
+                            .map(|name| name.to_key_spelling(&interp.gc_heap))
                             .collect::<Vec<_>>();
                         let mut enumerable = Vec::with_capacity(names.len());
                         for name in names {

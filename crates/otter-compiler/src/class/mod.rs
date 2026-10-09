@@ -631,7 +631,10 @@ fn compile_class_strict(
         // Compute the static name (when known) for diagnostics +
         // the method's `.name` intrinsic.
         let is_private = matches!(m.key, oxc_ast::ast::PropertyKey::PrivateIdentifier(_));
-        let static_name: Option<String> = if !m.computed && !is_private {
+        // A string key holding a lone surrogate resolves like a computed
+        // key: only its literal spells its code units.
+        let runtime_key = m.computed || crate::synthetic::is_lone_surrogate_key(&m.key);
+        let static_name: Option<String> = if !runtime_key && !is_private {
             match &m.key {
                 oxc_ast::ast::PropertyKey::StaticIdentifier(id) => {
                     Some(id.name.as_str().to_string())
@@ -699,7 +702,7 @@ fn compile_class_strict(
             // Resolve the property key into a register (literal vs
             // computed expression — both paths are observed by the
             // §13.2.5 ComputedPropertyName / IdentifierName rules).
-            let key_reg = match (&m.key, &static_name, m.computed) {
+            let key_reg = match (&m.key, &static_name, runtime_key) {
                 (oxc_ast::ast::PropertyKey::PrivateIdentifier(pid), _, false) => {
                     load_private_key(cx, pid.name.as_str(), method_span)?
                 }
@@ -783,7 +786,7 @@ fn compile_class_strict(
             );
             continue;
         }
-        let key_reg = match (&m.key, &static_name, m.computed) {
+        let key_reg = match (&m.key, &static_name, runtime_key) {
             (oxc_ast::ast::PropertyKey::PrivateIdentifier(pid), _, false) => {
                 load_private_key(cx, pid.name.as_str(), method_span)?
             }
@@ -829,7 +832,7 @@ fn compile_class_strict(
         };
         // §10.2.10 SetFunctionName — a computed key resolves the
         // method's `.name` at run time (symbols render `[desc]`).
-        if m.computed {
+        if runtime_key {
             let empty_idx = cx.intern_string_constant("");
             cx.emit(
                 Op::SetFunctionName,
@@ -919,6 +922,11 @@ fn compile_class_strict(
                         oxc_ast::ast::PropertyKey::PrivateIdentifier(pid) => {
                             inferred_name = Some(format!("#{}", pid.name.as_str()));
                             load_private_key(cx, pid.name.as_str(), pspan)?
+                        }
+                        // Only the literal spells a lone surrogate's code
+                        // units; the key stays unnamed at compile time.
+                        oxc_ast::ast::PropertyKey::StringLiteral(lit) if lit.lone_surrogates => {
+                            crate::expr::literal::compile_string_literal(cx, lit, pspan)?
                         }
                         _ => {
                             let key_str = match &p.key {

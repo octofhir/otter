@@ -519,8 +519,13 @@ impl<'a, 'b> ProgramParts<'a, 'b> {
 /// `[[SourceText]]` ranges and whether each body ignores its `this`.
 fn finish_bytecode(module: &mut BytecodeModule, source: &str) {
     attach_source_text(module, source);
-    for function in &mut module.functions {
-        function.ignores_this = !function.body_observes_this();
+    let observed: Vec<bool> = module
+        .functions
+        .iter()
+        .map(|function| function.body_observes_this(&module.constants, &module.functions, 0))
+        .collect();
+    for (function, observed) in module.functions.iter_mut().zip(observed) {
+        function.ignores_this = !observed;
     }
 }
 

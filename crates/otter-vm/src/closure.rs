@@ -518,6 +518,29 @@ impl JsClosure {
         });
     }
 
+    /// Release an own-property bag a delete left empty and extensible, so
+    /// the closure reads as one that never had own properties again (V8
+    /// rolls a delete of the last-added property back to the parent map).
+    /// Generated code proving the ordinary lookup then stays valid.
+    pub(crate) fn release_empty_own_props(self, heap: &mut GcHeap) {
+        let Some(bag) = self.own_props(heap) else {
+            return;
+        };
+        let empty = crate::object::with_properties(bag, heap, |properties| {
+            properties.keys().next().is_none() && properties.symbol_keys().next().is_none()
+        });
+        if !empty || !crate::object::is_extensible(bag, heap) {
+            return;
+        }
+        let Some(rare) = self.rare(heap) else {
+            return;
+        };
+        heap.with_payload(rare, |rare| rare.own_props = JsObject::null());
+        heap.with_payload(self.handle, |body| {
+            body.set_named_lookup_bits(CLOSURE_LOOKUP_OWN_PROPS, false);
+        });
+    }
+
     /// The function's `prototype` slot: its value (the hole until the default
     /// object is allocated) and whether it is writable. `None` without a
     /// rare record: unallocated and writable.

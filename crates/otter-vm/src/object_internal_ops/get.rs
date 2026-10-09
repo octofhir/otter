@@ -510,11 +510,26 @@ impl Interpreter {
         }
         if let Some(bound) = base.as_bound_function() {
             let value = match key {
-                VmPropertyKey::Symbol(sym) => self
-                    .function_prototype_object()
-                    .ok()
-                    .and_then(|p| object::get_symbol(p, &self.gc_heap, *sym))
-                    .unwrap_or(Value::undefined()),
+                VmPropertyKey::Symbol(sym) => match object::get_own_symbol_descriptor(
+                    crate::function_metadata::bound_own_properties(&bound, &self.gc_heap),
+                    &self.gc_heap,
+                    *sym,
+                ) {
+                    Some(descriptor) => match descriptor.kind {
+                        object::DescriptorKind::Data { value } => value,
+                        object::DescriptorKind::Accessor { getter, .. } => {
+                            return Ok(match getter {
+                                Some(getter) => VmGetOutcome::InvokeGetter { getter },
+                                None => VmGetOutcome::Value(Value::undefined()),
+                            });
+                        }
+                    },
+                    None => self
+                        .function_prototype_object()
+                        .ok()
+                        .and_then(|p| object::get_symbol(p, &self.gc_heap, *sym))
+                        .unwrap_or(Value::undefined()),
+                },
                 _ => {
                     let key = key
                         .string_name()
@@ -1633,6 +1648,15 @@ impl Interpreter {
                 && function_metadata::bound_own_property_descriptor(&bound, &mut self.gc_heap, name)
                     .map_err(|error| CommittedValueError::JavaScript(error.into()))?
                     .is_some()
+            {
+                return Ok(true);
+            }
+            if let VmPropertyKey::Symbol(sym) = key
+                && object::has_own_symbol(
+                    function_metadata::bound_own_properties(&bound, &self.gc_heap),
+                    &self.gc_heap,
+                    *sym,
+                )
             {
                 return Ok(true);
             }

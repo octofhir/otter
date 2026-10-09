@@ -190,7 +190,7 @@ impl Interpreter {
     /// source positions or allocations beyond the returned vector.
     pub(crate) fn capture_active_sites(&self, limit: usize) -> Vec<FrameSite> {
         let mut sites = Vec::new();
-        for address in self.jit_native_frames() {
+        for (address, child) in self.jit_native_frames_with_children() {
             if sites.len() >= limit {
                 break;
             }
@@ -201,8 +201,9 @@ impl Interpreter {
             if native.header.kind == crate::native_abi::NativeFrameKind::Host {
                 continue;
             }
+            let anchor = self.jit_child_return_pc(native, child);
             let call = self
-                .jit_frame_safepoint(native)
+                .jit_anchored_safepoint(native, anchor)
                 .expect("published source anchor must resolve exactly");
             // Inline parents recorded outermost first; the innermost one is
             // the most recent activation.
@@ -220,7 +221,7 @@ impl Interpreter {
             }
             sites.push(FrameSite::Instruction {
                 function_id: native.header.function_id,
-                pc: self.jit_frame_source_pc(native, call),
+                pc: self.jit_frame_source_pc(native, anchor, call),
             });
         }
         sites

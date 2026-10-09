@@ -206,7 +206,13 @@ fn pending_and_published_host_edges_trace_real_moving_homes_without_pc_stamps() 
         ctx.pending_call.initial_registers = initial.as_mut_ptr();
         ctx.pending_call.initial_register_count = 1;
         let previous = vm.jit_context.replace(std::ptr::NonNull::from(&mut ctx));
-        assert_eq!(vm.jit_frame_safepoint(&parent).unwrap().unwrap().call_pc, 7);
+        assert_eq!(
+            vm.jit_anchored_safepoint(&parent, vm.jit_frame_return_pc(&parent))
+                .unwrap()
+                .unwrap()
+                .call_pc,
+            7
+        );
         vm.force_gc().unwrap();
         assert_ne!(home[0].to_bits(), before, "actual nursery evacuation");
         for rooted in [
@@ -239,7 +245,13 @@ fn pending_and_published_host_edges_trace_real_moving_homes_without_pc_stamps() 
         child.caller_return_pc = pc;
         ctx.native_frame = &mut child;
         assert_eq!(ctx.native_frame, std::ptr::from_mut(&mut child));
-        assert_eq!(vm.jit_frame_safepoint(&parent).unwrap().unwrap().call_pc, 7);
+        assert_eq!(
+            vm.jit_anchored_safepoint(&parent, vm.jit_frame_return_pc(&parent))
+                .unwrap()
+                .unwrap()
+                .call_pc,
+            7
+        );
         let young = vm.alloc_host_object_with_roots(&[], &[]).unwrap();
         home[0] = Value::object(young);
         let before = home[0].to_bits();
@@ -249,7 +261,7 @@ fn pending_and_published_host_edges_trace_real_moving_homes_without_pc_stamps() 
         assert_eq!(child.caller_return_pc, pc + 1);
         assert!(
             matches!(
-                vm.jit_frame_safepoint(&parent),
+                vm.jit_anchored_safepoint(&parent, vm.jit_frame_return_pc(&parent)),
                 Err(crate::VmError::InvalidOperand)
             ),
             "non-site cannot use poisoned PC/call-site fallback"
@@ -262,7 +274,9 @@ fn pending_and_published_host_edges_trace_real_moving_homes_without_pc_stamps() 
         parent.call_site = 17;
         parent.header.kind = NativeFrameKind::Baseline;
         parent.header.pc = 13;
-        let record = vm.jit_frame_safepoint(&parent).unwrap();
+        let record = vm
+            .jit_anchored_safepoint(&parent, vm.jit_frame_return_pc(&parent))
+            .unwrap();
         assert_eq!(
             record.unwrap().call_pc,
             7,
@@ -274,13 +288,13 @@ fn pending_and_published_host_edges_trace_real_moving_homes_without_pc_stamps() 
             "no suspended edge after return"
         );
         assert_eq!(
-            vm.jit_frame_source_pc(&parent, record),
+            vm.jit_frame_source_pc(&parent, vm.jit_frame_return_pc(&parent), record),
             13,
             "current active Template helper source"
         );
         parent.header.kind = NativeFrameKind::Optimizing;
         assert_eq!(
-            vm.jit_frame_source_pc(&parent, record),
+            vm.jit_frame_source_pc(&parent, vm.jit_frame_return_pc(&parent), record),
             7,
             "Graph helper retains its explicit source-bearing map"
         );

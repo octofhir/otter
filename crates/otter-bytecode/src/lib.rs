@@ -2714,16 +2714,35 @@ impl BytecodeModule {
 }
 
 impl Function {
-    /// Whether the body can read its `this` binding: `LoadThis`, a nested
-    /// function or class creation that may capture it, or a direct eval.
+    /// Whether the body can read its `this` binding: `LoadThis`, a direct
+    /// eval, or the creation of an arrow function, which snapshots it. Every
+    /// other function binds its own `this`. `constants` and `functions` are
+    /// the owning module's, whose first function has id `function_base`; a
+    /// creation they do not resolve counts as an arrow.
     #[must_use]
-    pub fn body_observes_this(&self) -> bool {
+    pub fn body_observes_this(
+        &self,
+        constants: &[Constant],
+        functions: &[Function],
+        function_base: u32,
+    ) -> bool {
+        let creates_arrow = |instruction: &wordcode::Instruction| {
+            let Some(Operand::ConstIndex(constant)) = self.code.operand(instruction, 1) else {
+                return true;
+            };
+            let Some(Constant::FunctionId { index }) = constants.get(constant as usize) else {
+                return true;
+            };
+            index
+                .checked_sub(function_base)
+                .and_then(|local| functions.get(local as usize))
+                .is_none_or(|function| function.is_arrow)
+        };
         self.contains_direct_eval
-            || self.code.iter().any(|instruction| {
-                matches!(
-                    instruction.op,
-                    Op::LoadThis | Op::MakeFunction | Op::MakeClosure
-                )
+            || self.code.iter().any(|instruction| match instruction.op {
+                Op::LoadThis => true,
+                Op::MakeFunction | Op::MakeClosure => creates_arrow(instruction),
+                _ => false,
             })
     }
 

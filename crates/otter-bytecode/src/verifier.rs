@@ -1230,7 +1230,9 @@ fn verify_function(
     function_end: u32,
 ) -> Result<VerifiedFunction, BytecodeVerifyError> {
     let register_count = u32::from(register_window(function, function_index)?);
-    if function.ignores_this && function.body_observes_this() {
+    if function.ignores_this
+        && function.body_observes_this(&module.constants, &module.functions, function_base)
+    {
         return Err(BytecodeVerifyError::ObservedIgnoredThis { function_index });
     }
     let layout = layout_wordcode_function(&function.code).map_err(|error| {
@@ -1861,6 +1863,31 @@ mod tests {
             verify_module(&module),
             Err(BytecodeVerifyError::ObservedIgnoredThis { function_index: 0 })
         );
+
+        // Creating a function observes `this` only when an arrow snapshots it.
+        for arrow in [false, true] {
+            let mut code = FunctionCodeBuilder::new();
+            code.push(
+                Op::MakeFunction,
+                &[Operand::Register(0), Operand::ConstIndex(0)],
+            );
+            code.push(Op::ReturnUndefined, &[]);
+            let mut module = module_with(code.finish());
+            module.functions.push(Function {
+                id: 1,
+                name: "child".to_string(),
+                is_arrow: arrow,
+                code: returning_module().functions.remove(0).code,
+                ..Function::default()
+            });
+            module.constants.push(Constant::FunctionId { index: 1 });
+            module.functions[0].ignores_this = true;
+            assert_eq!(
+                verify_module(&module).is_ok(),
+                !arrow,
+                "arrow creation observes `this`: {arrow}"
+            );
+        }
     }
 
     #[test]

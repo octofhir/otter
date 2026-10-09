@@ -388,29 +388,44 @@ fn assert_group(
     let frames = state["frames"].as_array().unwrap();
     assert_eq!(frames.len(), 1);
     assert_eq!(frames[0]["functionId"], bundle.manifest().function_id());
+    // Slots are sparse `[register, slot]` pairs.
     let slots = frames[0]["slots"].as_array().unwrap();
+    let slot = |register: usize| {
+        slots
+            .iter()
+            .find(|pair| pair[0] == register)
+            .map(|pair| &pair[1])
+            .expect("frame-state slot for the register")
+    };
     for register in [0usize, 1] {
-        assert_eq!(slots[register]["representation"], "tagged");
-        assert_eq!(slots[register]["locationKind"], "stackSlot");
+        assert_eq!(slot(register)["representation"], "tagged");
+        assert_eq!(slot(register)["locationKind"], "stackSlot");
     }
+    // The exit's homes are rooted by the collecting boundary the group's
+    // ensure edge records: some boundary record lists both of them.
+    let homes: Vec<usize> = [0usize, 1]
+        .into_iter()
+        .map(|register| {
+            slot(register)["locationValue"]
+                .as_str()
+                .unwrap()
+                .parse::<usize>()
+                .unwrap()
+        })
+        .collect();
+    assert!(homes.iter().all(|home| home.is_multiple_of(8)));
     let points = json(bundle, JitArtifactFileName::Safepoints);
-    let roots = points["records"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|p| p["id"] == u32::MAX - 1)
-        .unwrap();
-    let roots = roots["taggedLocations"].as_array().unwrap();
-    for register in [0usize, 1] {
-        let home = slots[register]["locationValue"]
-            .as_str()
-            .unwrap()
-            .parse::<usize>()
-            .unwrap();
-        assert!(home.is_multiple_of(8) && home / 8 < roots.len());
-        assert_eq!(roots[home / 8]["kind"], "spillSlot");
-        assert_eq!(roots[home / 8]["index"], home / 8);
-    }
+    assert!(
+        points["records"].as_array().unwrap().iter().any(|record| {
+            let roots = record["taggedLocations"].as_array().unwrap();
+            homes.iter().all(|home| {
+                roots
+                    .iter()
+                    .any(|root| root["kind"] == "spillSlot" && root["index"] == home / 8)
+            })
+        }),
+        "a collecting boundary roots both exit homes {homes:?}: {points}"
+    );
 }
 
 #[derive(Debug)]
@@ -437,7 +452,8 @@ impl StepTracer for Tracer {
             .map_or(Value::undefined().to_bits(), |v| v.to_bits());
         let aliases = event.register_window.first() == event.register_window.get(1);
         let child = event
-            .register_window.first()
+            .register_window
+            .first()
             .map_or(Value::undefined().to_bits(), |v| v.to_bits());
         self.ticks.lock().unwrap().push(Tick {
             pc: event.byte_pc,

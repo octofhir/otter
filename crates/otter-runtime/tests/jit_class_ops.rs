@@ -36,7 +36,7 @@ function classes(rounds) {
   return acc;
 }
 
-classes(180);
+classes(20000);
 "#;
 
 fn run(selection: JitSelection) -> (String, u64) {

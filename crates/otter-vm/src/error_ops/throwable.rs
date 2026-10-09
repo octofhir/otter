@@ -281,7 +281,18 @@ impl Interpreter {
         obj = self.with_handle_scope(|interp, scope| {
             let obj_h = interp.scoped_value(scope, Value::object(obj));
             if is_oom {
-                let message_h = interp.scoped_string(scope, message)?;
+                // An exhausted heap may refuse the ordinary (collecting)
+                // allocation; the message then joins its diagnostic instance
+                // in old space.
+                debug_assert!(message.is_ascii());
+                let text = match crate::JsString::from_str(message, &mut interp.gc_heap) {
+                    Ok(text) => text,
+                    Err(_) => crate::JsString::from_latin1_diagnostic(
+                        message.as_bytes(),
+                        &mut interp.gc_heap,
+                    )?,
+                };
+                let message_h = interp.scoped_value(scope, Value::string(text));
                 interp.scoped_define_data(
                     scope,
                     obj_h,

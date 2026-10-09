@@ -268,6 +268,23 @@ impl JsString {
         Self::from_latin1_with_roots(bytes, heap, &mut roots)
     }
 
+    /// Construct a Latin-1 string in old space without collecting or
+    /// charging the heap cap (see
+    /// [`gc_body::alloc_latin1_string_body_diagnostic`]).
+    ///
+    /// # Errors
+    /// Surfaces [`OutOfMemory`] when old space has no room.
+    pub(crate) fn from_latin1_diagnostic(
+        bytes: &[u8],
+        heap: &mut GcHeap,
+    ) -> Result<Self, OutOfMemory> {
+        let handle = gc_body::alloc_latin1_string_body_diagnostic(heap, bytes)?;
+        Ok(Self {
+            handle,
+            cached_len: bytes.len() as u32,
+        })
+    }
+
     /// Construct from a Latin-1 / ASCII byte slice while exposing caller roots.
     ///
     /// # Errors

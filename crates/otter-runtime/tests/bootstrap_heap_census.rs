@@ -104,17 +104,21 @@ fn full_surface_bootstrap_census() {
         natives.static_count,
         natives.dynamic_count + natives.local_dynamic_count,
     );
+    // A VM intrinsic carries the index of its identity address, the word
+    // generated code compares; it has no static entry to resolve.
     assert_eq!(
-        natives.native_ref_count, natives.static_count,
-        "every static body carries an external-reference index",
+        natives.native_ref_count,
+        natives.static_count + natives.vm_intrinsic_count,
+        "every static and VM-intrinsic body carries an external-reference index",
     );
     assert_eq!(
         natives.resolved_native_ref_count, natives.static_count,
         "every index must resolve back to the entry address its storage holds",
     );
     assert_eq!(
-        natives.external_ref_table_len, natives.distinct_static_fns,
-        "the table holds exactly the distinct static entries, interned once each",
+        natives.external_ref_table_len,
+        natives.distinct_static_fns + natives.vm_intrinsic_count,
+        "the table holds exactly the distinct static entries and intrinsic identities, interned once each",
     );
 }
 
@@ -148,6 +152,18 @@ fn external_ref_indices_are_stable_across_runtimes() {
 /// property a snapshot writer rests on: the dump set is old space.
 #[test]
 fn a_built_runtime_leaves_nothing_in_the_nursery() {
+    // A runtime runs its surface bootstrap on the stack of the thread that
+    // builds it; give the five live runtimes an isolate-sized stack rather
+    // than the test harness's default one.
+    std::thread::Builder::new()
+        .stack_size(64 * 1024 * 1024)
+        .spawn(built_runtimes_leave_nothing_in_the_nursery)
+        .expect("census thread")
+        .join()
+        .expect("census");
+}
+
+fn built_runtimes_leave_nothing_in_the_nursery() {
     let surfaces: [(&str, Runtime); 5] = [
         ("base", base_runtime()),
         (

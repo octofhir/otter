@@ -158,14 +158,21 @@ fn same_receiver_shape_heals_in_place() {
     let obj = object::alloc_object_old_for_fixture(&mut heap).unwrap();
     shaped_data_fixture(obj, &mut heap, "x", Value::boolean(true));
     let slot = PropertyIcSlot::new(PropertyIcKind::Load);
-    for _ in 0..8 {
+    assert_eq!(
+        slot.install(own_load_handler(obj, &heap, "x")),
+        InstallOutcome::Installed
+    );
+    // Reinstalling the handler the entry already holds changes nothing, so
+    // the slot's feedback epoch stays put.
+    for _ in 0..7 {
         assert_eq!(
             slot.install(own_load_handler(obj, &heap, "x")),
-            InstallOutcome::Installed
+            InstallOutcome::Unchanged
         );
     }
     assert_eq!(slot.entry_count(), 1);
     assert!(!slot.is_megamorphic());
+    assert_eq!(slot.stats().load_installs, 1);
 }
 
 #[test]

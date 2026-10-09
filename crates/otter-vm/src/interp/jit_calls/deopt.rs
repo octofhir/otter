@@ -177,12 +177,18 @@ impl Interpreter {
                 call.header.flags = call.header.flags.with(NativeFrameFlags::ADVANCE_ON_RESUME);
             }
             let window = deopt.dense(Value::undefined());
-            call.arguments.extend(
-                window
-                    .iter()
-                    .copied()
-                    .take(usize::from(function.param_count)),
-            );
+            // The recorded actuals are the activation's incoming arguments;
+            // a body whose arguments nothing reads rebuilds them from its
+            // parameter registers.
+            match &deopt.arguments {
+                Some(arguments) => call.arguments.extend(arguments.iter().copied()),
+                None => call.arguments.extend(
+                    window
+                        .iter()
+                        .copied()
+                        .take(usize::from(function.param_count)),
+                ),
+            }
             call.initial_registers.extend_from_slice(&window);
             call.set_new_target(entry.new_target);
             if !entry.new_target.is_undefined() {

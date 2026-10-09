@@ -1002,6 +1002,9 @@ impl<'a> Builder<'a> {
                     this,
                     closure,
                     new_target,
+                    arguments: code
+                        .exposes_legacy_arguments()
+                        .then(|| arguments.iter().copied().collect()),
                 },
                 depth,
                 continuation,
@@ -1618,7 +1621,7 @@ impl<'a> Builder<'a> {
             function_id: self.function_id,
             register_count: self.register_count,
             registers,
-            caller: self.inline.as_ref().map(|inline| inline.caller),
+            caller: self.inline.as_ref().map(|inline| inline.caller.clone()),
         })
     }
 

@@ -188,6 +188,7 @@ impl SitePlan {
                     entry: None,
                     register_count: 0,
                     slots: Box::new([]),
+                    arguments: None,
                 });
                 byte_pc = body.call_byte_pc;
                 origin = body.parent;

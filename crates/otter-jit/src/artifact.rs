@@ -710,6 +710,10 @@ fn render_deopt(runtime: &DeoptRuntime) -> String {
                         .iter()
                         .map(|(register, slot)| (*register, render_slot(slot)))
                         .collect(),
+                    arguments: frame
+                        .arguments
+                        .as_ref()
+                        .map(|arguments| arguments.iter().map(render_slot).collect()),
                 })
                 .collect(),
             virtual_objects: state

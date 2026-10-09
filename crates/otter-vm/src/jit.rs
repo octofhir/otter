@@ -393,7 +393,15 @@ pub struct JitClosureCallLayout {
     /// Byte flag, from the rare record: nonzero exactly while the
     /// `prototype` slot holds an ordinary object.
     pub prototype_ordinary_byte: u32,
+    /// Byte flag, from the rare record, generated `instanceof` sets when it
+    /// caches the closure in a site's cell.
+    pub instanceof_cached_byte: u32,
 }
+
+/// Byte offset of the cached target in a generated `instanceof` site's cell.
+pub const JIT_INSTANCEOF_CELL_TARGET_OFFSET: u32 = 0;
+/// Byte offset of the cached prototype in a generated `instanceof` site's cell.
+pub const JIT_INSTANCEOF_CELL_PROTOTYPE_OFFSET: u32 = 8;
 
 /// Machine-readable class-constructor wrapper layout.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -523,7 +531,7 @@ pub const JIT_TYPEOF_TAGS: JitTypeOfTags = JitTypeOfTags {
     ],
 };
 
-const _: [(); 52] = [(); std::mem::size_of::<JitClosureCallLayout>()];
+const _: [(); 56] = [(); std::mem::size_of::<JitClosureCallLayout>()];
 const _: [(); 4] = [(); std::mem::align_of::<JitClosureCallLayout>()];
 const _: [(); 0] = [(); std::mem::offset_of!(JitClosureCallLayout, function_id_byte)];
 const _: [(); 4] = [(); std::mem::offset_of!(JitClosureCallLayout, flags_byte)];
@@ -538,6 +546,7 @@ const _: [(); 36] = [(); std::mem::offset_of!(JitClosureCallLayout, own_props_by
 const _: [(); 40] = [(); std::mem::offset_of!(JitClosureCallLayout, prototype_byte)];
 const _: [(); 44] = [(); std::mem::offset_of!(JitClosureCallLayout, constructor_layouts_byte)];
 const _: [(); 48] = [(); std::mem::offset_of!(JitClosureCallLayout, prototype_ordinary_byte)];
+const _: [(); 52] = [(); std::mem::offset_of!(JitClosureCallLayout, instanceof_cached_byte)];
 
 /// Machine-readable [`crate::context::ContextBody`] layout.
 ///
@@ -795,6 +804,9 @@ pub struct JitCompileSnapshot {
     /// `%Function.prototype.call%`. Generated code proves the intrinsic and
     /// calls the function it ran directly, with the first argument as `this`.
     pub function_prototype_calls: rustc_hash::FxHashMap<u32, JitFunctionPrototypeCallSite>,
+    /// Address of each `instanceof` site's cell, keyed by byte PC: the last
+    /// target the site proved and the prototype it searches for.
+    pub instanceof_cells: rustc_hash::FxHashMap<u32, u64>,
     /// External-reference index of `%Function.prototype.apply%` for a body
     /// that forwards its arguments (`Op::CallForwardArguments`): generated
     /// code proves a forwarding site's method is the intrinsic before it
@@ -1974,6 +1986,7 @@ impl JitCompileSnapshot {
             inline_poly_methods: rustc_hash::FxHashMap::default(),
             guarded_method_calls: rustc_hash::FxHashMap::default(),
             function_prototype_calls: rustc_hash::FxHashMap::default(),
+            instanceof_cells: rustc_hash::FxHashMap::default(),
             forward_apply_native_ref: None,
             property_programs: rustc_hash::FxHashMap::default(),
             property_action_cache: None,
@@ -2586,7 +2599,7 @@ mod layout_tests {
 
     #[test]
     fn closure_call_layout_has_stable_c_field_offsets() {
-        assert_eq!(std::mem::size_of::<JitClosureCallLayout>(), 52);
+        assert_eq!(std::mem::size_of::<JitClosureCallLayout>(), 56);
         assert_eq!(std::mem::align_of::<JitClosureCallLayout>(), 4);
         let fields = [
             std::mem::offset_of!(JitClosureCallLayout, function_id_byte),
@@ -2602,8 +2615,12 @@ mod layout_tests {
             std::mem::offset_of!(JitClosureCallLayout, prototype_byte),
             std::mem::offset_of!(JitClosureCallLayout, constructor_layouts_byte),
             std::mem::offset_of!(JitClosureCallLayout, prototype_ordinary_byte),
+            std::mem::offset_of!(JitClosureCallLayout, instanceof_cached_byte),
         ];
-        assert_eq!(fields, [0, 4, 8, 12, 16, 20, 24, 28, 32, 36, 40, 44, 48]);
+        assert_eq!(
+            fields,
+            [0, 4, 8, 12, 16, 20, 24, 28, 32, 36, 40, 44, 48, 52]
+        );
     }
 
     #[test]

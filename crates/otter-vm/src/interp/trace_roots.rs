@@ -170,6 +170,7 @@ impl Interpreter {
         // definition: the override belongs in that instance's body, not
         // in a table keyed by the shared bytecode template id.
         if let Some(closure) = value.as_closure(&self.gc_heap) {
+            self.retire_instanceof_proofs_for(closure);
             match proto {
                 Some(proto) => {
                     // The override lives in the closure's rare record; its

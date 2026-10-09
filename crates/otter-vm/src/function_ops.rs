@@ -1564,6 +1564,7 @@ impl Interpreter {
                     .escape_scoped(owner)
                     .as_closure(&interp.gc_heap)
                     .ok_or(VmError::TypeMismatch)?;
+                interp.retire_instanceof_proofs_for(closure);
                 closure.set_own_props(&mut interp.gc_heap, bag);
                 return Ok(bag);
             }

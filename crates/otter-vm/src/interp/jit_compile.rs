@@ -577,6 +577,7 @@ impl Interpreter {
             jit_debug::JitDebugTier::Optimizing,
         );
         self.bake_guarded_method_calls(&mut snapshot);
+        self.bake_instanceof_cells(&mut snapshot);
         self.bake_forward_apply(&mut snapshot);
         self.bake_element_accesses(&mut snapshot);
         Self::bake_context_allocations(&mut snapshot);
@@ -1043,6 +1044,54 @@ impl Interpreter {
             .borrow_mut()
             .push(crate::jit_roots::CompilationRoot::CalleeIdentity(cell));
         address
+    }
+
+    /// A fresh `instanceof` cell for one generated site, retained by the
+    /// compilation and registered for [`Self::retire_instanceof_proofs_for`].
+    pub(crate) fn bake_instanceof_cell(&self) -> u64 {
+        let cell = std::sync::Arc::new(crate::jit_roots::InstanceofCell::new());
+        let address = cell.address();
+        {
+            let mut cells = self.jit_instanceof_cells.borrow_mut();
+            if cells.len().is_power_of_two() {
+                cells.retain(|cell| cell.strong_count() != 0);
+            }
+            cells.push(std::sync::Arc::downgrade(&cell));
+        }
+        self.jit_compile_roots
+            .borrow_mut()
+            .push(crate::jit_roots::CompilationRoot::Instanceof(cell));
+        address
+    }
+
+    /// Bake one `instanceof` cell for every `instanceof` site of `view`.
+    fn bake_instanceof_cells(&self, view: &mut jit::JitCompileSnapshot) {
+        let sites: Vec<u32> = view
+            .instructions
+            .iter()
+            .filter(|instruction| instruction.op(&view.code_block) == Op::Instanceof)
+            .map(|instruction| instruction.byte_pc)
+            .collect();
+        for byte_pc in sites {
+            view.instanceof_cells
+                .insert(byte_pc, self.bake_instanceof_cell());
+        }
+    }
+
+    /// Empty every generated `instanceof` cell before `closure` changes its
+    /// `prototype`, own properties or `[[Prototype]]`, when a cell ever
+    /// cached it: no site may answer from a pair the change invalidates.
+    pub(crate) fn retire_instanceof_proofs_for(&self, closure: crate::closure::JsClosure) {
+        if !closure.instanceof_cached(&self.gc_heap) {
+            return;
+        }
+        self.jit_instanceof_cells.borrow_mut().retain(|cell| {
+            let Some(cell) = cell.upgrade() else {
+                return false;
+            };
+            cell.clear();
+            true
+        });
     }
 
     /// Retain a valid chain proof for the generation being compiled.
@@ -2222,6 +2271,7 @@ impl Interpreter {
             self.bake_property_cache_ir(&mut body, context);
             self.bake_call_site_plans(&mut body, context, fid, tier, budget);
             self.bake_guarded_method_calls(&mut body);
+            self.bake_instanceof_cells(&mut body);
             self.bake_forward_apply(&mut body);
             self.bake_element_accesses(&mut body);
             Self::bake_context_allocations(&mut body);

@@ -403,6 +403,8 @@ impl CodeBlock {
                     + crate::closure_construct::CLOSURE_RARE_CONSTRUCTOR_LAYOUTS_OFFSET as u32,
                 prototype_ordinary_byte: gc_header_bytes
                     + crate::closure_construct::CLOSURE_RARE_PROTOTYPE_ORDINARY_OFFSET as u32,
+                instanceof_cached_byte: gc_header_bytes
+                    + crate::closure_construct::CLOSURE_RARE_INSTANCEOF_CACHED_OFFSET as u32,
             },
             class_constructor_layout: crate::jit::JitClassConstructorLayout {
                 type_tag: crate::class_constructor::CLASS_CONSTRUCTOR_BODY_TYPE_TAG,
@@ -527,6 +529,7 @@ impl CodeBlock {
             inline_poly_methods: rustc_hash::FxHashMap::default(),
             guarded_method_calls: rustc_hash::FxHashMap::default(),
             function_prototype_calls: rustc_hash::FxHashMap::default(),
+            instanceof_cells: rustc_hash::FxHashMap::default(),
             forward_apply_native_ref: None,
             property_programs: rustc_hash::FxHashMap::default(),
             property_action_cache: None,
@@ -1776,6 +1779,8 @@ mod tests {
                     + crate::closure_construct::CLOSURE_RARE_CONSTRUCTOR_LAYOUTS_OFFSET as u32,
                 prototype_ordinary_byte: gc_header_bytes
                     + crate::closure_construct::CLOSURE_RARE_PROTOTYPE_ORDINARY_OFFSET as u32,
+                instanceof_cached_byte: gc_header_bytes
+                    + crate::closure_construct::CLOSURE_RARE_INSTANCEOF_CACHED_OFFSET as u32,
             }
         );
     }

@@ -583,15 +583,32 @@ impl Codegen<'_> {
         [cage, rare, prototype, cursor, budget]: [u8; 5],
         destination: u8,
     ) -> Result<(), Unsupported> {
-        let view = self.view;
+        let view = self.view_of(node);
         let layout = view.closure_call_layout;
         let miss = self.ops.new_dynamic_label();
         let yes = self.ops.new_dynamic_label();
         let no = self.ops.new_dynamic_label();
         let done = self.ops.new_dynamic_label();
         let symbols_absent = self.ops.new_dynamic_label();
+        let proved = self.ops.new_dynamic_label();
+        let validate = self.ops.new_dynamic_label();
         let walk = self.ops.new_dynamic_label();
         let step = self.ops.new_dynamic_label();
+        let pc = self.graph.node(node).pc;
+        let cell = view.instructions.get(pc as usize).and_then(|instruction| {
+            let byte_pc = instruction.byte_pc;
+            view.instanceof_cells.get(&byte_pc).map(|&address| {
+                (
+                    address,
+                    RelocationTarget::InstanceofCell {
+                        function_id: view.code_block.id,
+                        byte_pc,
+                    },
+                )
+            })
+        });
+        let target_byte = otter_vm::jit::JIT_INSTANCEOF_CELL_TARGET_OFFSET as i32;
+        let prototype_byte = otter_vm::jit::JIT_INSTANCEOF_CELL_PROTOTYPE_OFFSET as i32;
         if view.cage_base == 0 || layout.prototype_byte == 0 {
             dynasm!(self.ops ; .arch x64 ; jmp =>miss);
         } else {
@@ -602,6 +619,20 @@ impl Codegen<'_> {
                 view.cage_base as u64,
                 RelocationTarget::GcCageBase,
             );
+            if let Some((address, relocation)) = cell.clone() {
+                // The target this site last proved, and its prototype.
+                emit_load_symbol_u64(
+                    &mut self.ops,
+                    &mut self.relocations,
+                    10,
+                    address,
+                    relocation,
+                );
+                dynasm!(self.ops ; .arch x64
+                    ; cmp Rq(target), [r10 + target_byte] ; jne =>validate
+                    ; mov Rq(prototype), [r10 + prototype_byte] ; jmp =>proved
+                    ; =>validate);
+            }
             self.emit_cell_guard(target, miss);
             dynasm!(self.ops ; .arch x64
                 ; mov Rd(rare), Rd(target) ; add Rq(rare), Rq(cage)
@@ -613,11 +644,29 @@ impl Codegen<'_> {
                 ; add Rq(rare), Rq(cage)
                 // Any `prototype` but an ordinary object completes in the runtime.
                 ; cmp BYTE [Rq(rare) + layout.prototype_ordinary_byte as i32], 0 ; je =>miss
+                ; mov Rq(prototype), [Rq(rare) + layout.prototype_byte as i32]
                 ; mov r10d, [Rq(rare) + layout.own_props_byte as i32] ; test r10d, r10d ; jz =>symbols_absent
                 ; add r10, Rq(cage) ; mov r10d, [r10 + view.object_exotic_handle_byte as i32]
-                ; test r10d, r10d ; jz =>symbols_absent ; add r10, Rq(cage)
+                ; test r10d, r10d ; jz =>proved ; add r10, Rq(cage)
                 ; cmp DWORD [r10 + otter_vm::object::EXOTIC_SLOTS_SYMBOL_PROPS_BYTE as i32], 0 ; jne =>miss
-                ; =>symbols_absent ; mov Rq(prototype), [Rq(rare) + layout.prototype_byte as i32]);
+                ; jmp =>proved
+                ; =>symbols_absent);
+            if let Some((address, relocation)) = cell {
+                // A closure without own properties is cached; the flag asks
+                // the VM to empty the cell before the closure changes.
+                emit_load_symbol_u64(
+                    &mut self.ops,
+                    &mut self.relocations,
+                    10,
+                    address,
+                    relocation,
+                );
+                dynasm!(self.ops ; .arch x64
+                    ; mov [r10 + target_byte], Rq(target)
+                    ; mov [r10 + prototype_byte], Rq(prototype)
+                    ; mov BYTE [Rq(rare) + layout.instanceof_cached_byte as i32], 1);
+            }
+            dynasm!(self.ops ; .arch x64 ; =>proved);
             self.emit_cell_guard(value, no);
             dynasm!(self.ops ; .arch x64 ; mov Rd(cursor), Rd(value) ; add Rq(cursor), Rq(cage)
                 ; movzx r10d, BYTE [Rq(cursor)] ; cmp r10d, crate::entry::OBJECT_BODY_TYPE_TAG as i32 ; je =>walk);

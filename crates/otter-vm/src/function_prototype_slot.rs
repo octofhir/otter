@@ -72,10 +72,11 @@ impl Interpreter {
                 let mut closure_value = Value::closure(closure);
                 interp.ensure_closure_rare(stack, &mut closure_value, &[])?;
                 let value = interp.escape_scoped(value);
-                closure_value
+                let closure = closure_value
                     .as_closure(&interp.gc_heap)
-                    .ok_or(VmError::TypeMismatch)?
-                    .set_prototype_value(&mut interp.gc_heap, value);
+                    .ok_or(VmError::TypeMismatch)?;
+                interp.retire_instanceof_proofs_for(closure);
+                closure.set_prototype_value(&mut interp.gc_heap, value);
                 Ok::<(), VmError>(())
             })?,
             None => {

@@ -2785,9 +2785,11 @@ impl<'a> Codegen<'a> {
     /// an ordinary closure without symbol-keyed own properties uses the
     /// default `@@hasInstance`, OrdinaryHasInstance: its `prototype` (an
     /// ordinary object, as its rare record's flag states) is searched on the
-    /// value's prototype chain, a primitive answers false. Every other case,
-    /// an opaque chain link and a chain longer than the walk bound complete
-    /// in the runtime.
+    /// value's prototype chain, a primitive answers false. The site's cell
+    /// caches the last target proved without any own property, with its
+    /// prototype, so the same target skips the proof: the VM empties the
+    /// cell before such a closure changes. Every other case, an opaque chain
+    /// link and a chain longer than the walk bound complete in the runtime.
     fn emit_instanceof(
         &mut self,
         node: NodeId,
@@ -2796,7 +2798,7 @@ impl<'a> Codegen<'a> {
         destination: u8,
     ) -> Result<(), Unsupported> {
         use crate::template::arm64::values::{CellTest, emit_cell_test};
-        let view = self.view;
+        let view = self.view_of(node);
         let layout = view.closure_call_layout;
         let yes = self.ops.new_dynamic_label();
         let no = self.ops.new_dynamic_label();
@@ -2804,10 +2806,51 @@ impl<'a> Codegen<'a> {
         let done = self.ops.new_dynamic_label();
         let step = self.ops.new_dynamic_label();
         let not_object = self.ops.new_dynamic_label();
+        let proved = self.ops.new_dynamic_label();
+        let validate = self.ops.new_dynamic_label();
         let symbols_absent = self.ops.new_dynamic_label();
+        let pc = self.graph.node(node).pc;
+        let byte_pc = view
+            .instructions
+            .get(pc as usize)
+            .map(|instruction| instruction.byte_pc);
+        let cell = byte_pc.and_then(|byte_pc| {
+            view.instanceof_cells.get(&byte_pc).map(|&address| {
+                (
+                    address,
+                    RelocationTarget::InstanceofCell {
+                        function_id: view.code_block.id,
+                        byte_pc,
+                    },
+                )
+            })
+        });
+        const _: () = assert!(
+            otter_vm::jit::JIT_INSTANCEOF_CELL_PROTOTYPE_OFFSET
+                == otter_vm::jit::JIT_INSTANCEOF_CELL_TARGET_OFFSET + 8
+        );
         if view.cage_base == 0 || layout.prototype_byte == 0 {
             dynasm!(self.ops ; .arch aarch64 ; b =>miss);
         } else {
+            if let Some((address, relocation)) = cell.clone() {
+                // The target this site last proved, and its prototype.
+                emit_load_symbol_u64(
+                    &mut self.ops,
+                    &mut self.relocations,
+                    16,
+                    address,
+                    relocation,
+                );
+                dynasm!(self.ops
+                    ; .arch aarch64
+                    ; ldp x17, X(prototype), [x16, otter_vm::jit::JIT_INSTANCEOF_CELL_TARGET_OFFSET as i32]
+                    ; cmp X(target), x17
+                    ; b.ne =>validate
+                    ; and XSP(cage), X(target), #0xffff_ffff_0000_0000
+                    ; b =>proved
+                    ; =>validate
+                );
+            }
             let named_lookup = otter_vm::closure::CLOSURE_NAMED_LOOKUP_BYTE;
             // Target: an ordinary closure whose own properties hold no
             // `@@hasInstance` override. A cell value is its header's full
@@ -2832,17 +2875,36 @@ impl<'a> Codegen<'a> {
                 ; add X(rare), X(cage), X(rare)
                 ; ldrb w16, [X(rare), layout.prototype_ordinary_byte]
                 ; cbz w16, =>miss
+                ; ldr X(prototype), [X(rare), layout.prototype_byte]
                 ; ldr w16, [X(rare), layout.own_props_byte]
                 ; cbz w16, =>symbols_absent
                 ; add x16, X(cage), x16
                 ; ldr w16, [x16, view.object_exotic_handle_byte]
-                ; cbz w16, =>symbols_absent
+                ; cbz w16, =>proved
                 ; add x16, X(cage), x16
                 ; ldr w16, [x16, otter_vm::object::EXOTIC_SLOTS_SYMBOL_PROPS_BYTE]
                 ; cbnz w16, =>miss
+                ; b =>proved
                 ; =>symbols_absent
-                ; ldr X(prototype), [X(rare), layout.prototype_byte]
             );
+            if let Some((address, relocation)) = cell {
+                // A closure without own properties is cached; the flag asks
+                // the VM to empty the cell before the closure changes.
+                emit_load_symbol_u64(
+                    &mut self.ops,
+                    &mut self.relocations,
+                    16,
+                    address,
+                    relocation,
+                );
+                dynasm!(self.ops
+                    ; .arch aarch64
+                    ; stp X(target), X(prototype), [x16, otter_vm::jit::JIT_INSTANCEOF_CELL_TARGET_OFFSET as i32]
+                    ; mov w16, #1
+                    ; strb w16, [X(rare), layout.instanceof_cached_byte]
+                );
+            }
+            dynasm!(self.ops ; .arch aarch64 ; =>proved);
             // Value: a non-cell answers false, a primitive cell answers
             // false, an ordinary object is walked, any other cell misses.
             emit_cell_test(&mut self.ops, value, CellTest::IsNotCell, no);

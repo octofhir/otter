@@ -640,14 +640,20 @@ impl Interpreter {
         }
         if let Some(bound) = target.as_bound_function() {
             let names = function_metadata::bound_own_property_keys(&bound, &self.gc_heap);
-            let mut keys: Vec<Value> = Vec::with_capacity(names.len());
+            // Symbols are not moved by collection; they follow the strings.
+            let mut symbols = object::own_symbol_key_values(
+                crate::function_metadata::bound_own_properties(&bound, &self.gc_heap),
+                &self.gc_heap,
+            );
+            let mut keys: Vec<Value> = Vec::with_capacity(names.len() + symbols.len());
             self.push_own_key_strings(
                 &mut keys,
                 &mut target,
-                &mut [],
+                &mut symbols,
                 names.iter().map(String::as_str),
             )
             .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+            keys.extend(symbols);
             return Ok(keys);
         }
         if let Some(class) = target.as_class_constructor() {

@@ -150,9 +150,14 @@ impl Interpreter {
                 self.ordinary_function_delete_own_property(owner, function_id, key, has_prototype)
                     .map_err(|error| CommittedValueError::JavaScript(error.into()))?
             } else if let VmPropertyKey::Symbol(sym) = key {
-                self.callable_bag_read(owner, function_id)
+                let deleted = self
+                    .callable_bag_read(owner, function_id)
                     .map(|bag| object::delete_symbol(bag, &mut self.gc_heap, *sym))
-                    .unwrap_or(true)
+                    .unwrap_or(true);
+                if deleted && let Some(owner) = owner {
+                    owner.release_empty_own_props(&mut self.gc_heap);
+                }
+                deleted
             } else {
                 true
             });
@@ -174,7 +179,14 @@ impl Interpreter {
                     function_metadata::bound_delete_own_property(&bound, &mut self.gc_heap, key)
                         .map_err(|error| CommittedValueError::JavaScript(error.into()))?
                 }
-                None => true,
+                None => match key {
+                    VmPropertyKey::Symbol(sym) => {
+                        let bag =
+                            crate::function_metadata::bound_own_properties(&bound, &self.gc_heap);
+                        object::delete_symbol(bag, &mut self.gc_heap, *sym)
+                    }
+                    _ => true,
+                },
             });
         }
         if target.is_regexp() {

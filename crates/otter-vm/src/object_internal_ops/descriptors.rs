@@ -411,7 +411,14 @@ impl Interpreter {
         }
         if let Some(bound) = target.as_bound_function() {
             let Some(key) = key.string_name() else {
-                return Ok(None);
+                return Ok(match key {
+                    VmPropertyKey::Symbol(sym) => object::get_own_symbol_descriptor(
+                        crate::function_metadata::bound_own_properties(&bound, &self.gc_heap),
+                        &self.gc_heap,
+                        *sym,
+                    ),
+                    _ => None,
+                });
             };
             return function_metadata::bound_own_property_descriptor(
                 &bound,

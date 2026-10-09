@@ -2018,11 +2018,15 @@ impl Interpreter {
         // after the allocating dictionary owner returns.
         unsafe { roots.add_value(&mut owner_value) };
         let Some(metadata_key) = function_metadata::ordinary_function_metadata_key(key) else {
-            return match self.callable_bag_read(owner_value.as_closure(&self.gc_heap), function_id)
-            {
-                Some(mut bag) => crate::object::delete(&mut bag, &mut self.gc_heap, key),
-                None => Ok(true),
+            let owner = owner_value.as_closure(&self.gc_heap);
+            let deleted = match self.callable_bag_read(owner, function_id) {
+                Some(mut bag) => crate::object::delete(&mut bag, &mut self.gc_heap, key)?,
+                None => true,
             };
+            if deleted && let Some(owner) = owner {
+                owner.release_empty_own_props(&mut self.gc_heap);
+            }
+            return Ok(deleted);
         };
         if let Some(mut bag) =
             self.callable_bag_read(owner_value.as_closure(&self.gc_heap), function_id)
@@ -2285,7 +2289,23 @@ impl Interpreter {
                                 completed,
                             )
                             .map_err(|error| CommittedValueError::JavaScript(error.into()))?,
-                        (None, VmPropertyKey::Symbol(_)) => false,
+                        (None, VmPropertyKey::Symbol(sym)) => {
+                            let target = this.iteration_anchor(target_slot);
+                            let Some(bound) = target.as_bound_function() else {
+                                return Ok(None);
+                            };
+                            let mut bag = crate::function_metadata::bound_own_properties(
+                                &bound,
+                                &this.gc_heap,
+                            );
+                            crate::object::define_own_symbol_property_partial(
+                                &mut bag,
+                                &mut this.gc_heap,
+                                *sym,
+                                descriptor,
+                            )
+                            .map_err(|error| CommittedValueError::JavaScript(error.into()))?
+                        }
                         (None, _) => {
                             let target = this.iteration_anchor(target_slot);
                             let Some(bound) = target.as_bound_function() else {
@@ -2338,7 +2358,16 @@ impl Interpreter {
                         }
                         desc
                     }
-                    (None, VmPropertyKey::Symbol(_)) => None,
+                    (None, VmPropertyKey::Symbol(sym)) => {
+                        let Some(bound) = target.as_bound_function() else {
+                            return Ok(None);
+                        };
+                        crate::object::get_own_symbol_descriptor(
+                            crate::function_metadata::bound_own_properties(&bound, &self.gc_heap),
+                            &self.gc_heap,
+                            *sym,
+                        )
+                    }
                     (None, _) => {
                         let Some(bound) = target.as_bound_function() else {
                             return Ok(None);
@@ -2390,7 +2419,16 @@ impl Interpreter {
                                 },
                             )
                     }
-                    (None, VmPropertyKey::Symbol(_)) => false,
+                    (None, VmPropertyKey::Symbol(sym)) => {
+                        let Some(bound) = target.as_bound_function() else {
+                            return Ok(None);
+                        };
+                        crate::object::has_own_symbol(
+                            crate::function_metadata::bound_own_properties(&bound, &self.gc_heap),
+                            &self.gc_heap,
+                            *sym,
+                        )
+                    }
                     (None, _) => {
                         let Some(bound) = target.as_bound_function() else {
                             return Ok(None);

@@ -119,6 +119,18 @@ impl Interpreter {
             (Some(innermost), Some(&pc)) => (innermost.function_id, pc),
             _ => (outermost.function_id, exit.logical_pc()),
         };
+        // The physical generation was entered and exits here, whichever of
+        // its spliced bodies took the exit.
+        let callee_code_object_id = u64::from(native.code_object_id);
+        let callee_resume_pc = exit.logical_pc();
+        self.record_jit_debug_event(|| crate::JitDebugEvent::EnteredGenerationDeopt {
+            callee_function_id: outermost.function_id,
+            callee_code_object_id,
+            callee_tier: crate::jit_debug::JitDebugTier::Optimizing,
+            callee_resume_pc,
+            exit_reason: exit.reason(),
+            exit_action: exit.action(),
+        });
         self.note_jit_optimized_bail_at(
             context,
             outermost.function_id,

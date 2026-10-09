@@ -377,9 +377,21 @@ impl Interpreter {
                     .map_err(|error| CommittedValueError::JavaScript(error.into()))?
             });
         }
-        if target.as_bound_function().is_some() {
+        if let Some(bound) = target.as_bound_function() {
             let Some(k) = key.string_name() else {
-                return Ok(false);
+                let VmPropertyKey::Symbol(sym) = key else {
+                    return Ok(false);
+                };
+                // Symbol-keyed own properties are ordinary entries of the
+                // bound function's own-property bag.
+                let mut bag = crate::function_metadata::bound_own_properties(&bound, &self.gc_heap);
+                return object::define_own_symbol_property_partial(
+                    &mut bag,
+                    &mut self.gc_heap,
+                    *sym,
+                    descriptor,
+                )
+                .map_err(|error| CommittedValueError::JavaScript(error.into()));
             };
             // Reading a builtin `name` materializes a string, so the target
             // and the descriptor's values are rooted across it.

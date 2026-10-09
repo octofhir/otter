@@ -475,10 +475,14 @@ impl Interpreter {
     ) -> Result<(), CommittedValueError> {
         let mut idx = *read_register(&stack[top_idx], idx_reg)
             .map_err(|error| CommittedValueError::Fatal(error.into()))?;
-        if !crate::abstract_ops::is_primitive(&idx) {
+        if idx.as_symbol(&self.gc_heap).is_none()
+            && idx.as_string(&self.gc_heap).is_none()
+            && idx.as_number().is_none()
+        {
             // §13.5.1.2 — ToPropertyKey runs the key's coercion (a
-            // user `toString`) before the [[Delete]]; the receiver is
-            // re-read from its traced register afterwards.
+            // user `toString`) before the [[Delete]], and names a
+            // boolean, null, undefined or BigInt key by its string; the
+            // receiver is re-read from its traced register afterwards.
             let key = self.to_property_key_sync(stack, context, idx)?;
             idx = match key {
                 crate::VmPropertyKey::Symbol(sym) => Value::symbol(sym),
@@ -592,14 +596,30 @@ impl Interpreter {
                 .as_closure(&self.gc_heap)
                 .map(|c| c.cached_function_id)
         }) {
-            if let Some(s) = idx.as_string(&self.gc_heap) {
-                let name = s.to_lossy_string(&self.gc_heap);
-                let owner = receiver.as_closure(&self.gc_heap);
+            let owner = receiver.as_closure(&self.gc_heap);
+            if let Some(sym) = idx.as_symbol(&self.gc_heap) {
+                let deleted = self
+                    .callable_bag_read(owner, function_id)
+                    .map(|bag| crate::object::delete_symbol(bag, &mut self.gc_heap, sym))
+                    .unwrap_or(true);
+                if deleted && let Some(owner) = owner {
+                    owner.release_empty_own_props(&mut self.gc_heap);
+                }
+                deleted
+            } else {
+                let name = match (idx.as_string(&self.gc_heap), idx.as_number()) {
+                    (Some(s), _) => s.to_lossy_string(&self.gc_heap),
+                    (None, Some(n)) => match n.as_smi() {
+                        Some(v) if v >= 0 => v.to_string(),
+                        _ => n.to_display_string(),
+                    },
+                    (None, None) => {
+                        return Err(CommittedValueError::JavaScript(VmError::TypeMismatch));
+                    }
+                };
                 let has_prototype = context.function_has_prototype_property(function_id);
                 self.ordinary_function_delete_own_property(owner, function_id, &name, has_prototype)
                     .map_err(|error| CommittedValueError::JavaScript(error.into()))?
-            } else {
-                return Err(CommittedValueError::JavaScript(VmError::TypeMismatch));
             }
         } else if let Some(native) = receiver.as_native_function() {
             if let Some(sym) = idx.as_symbol(&self.gc_heap) {
@@ -613,12 +633,27 @@ impl Interpreter {
                 return Err(CommittedValueError::JavaScript(VmError::TypeMismatch));
             }
         } else if let Some(bound) = receiver.as_bound_function() {
-            if let Some(s) = idx.as_string(&self.gc_heap) {
-                let name = s.to_lossy_string(&self.gc_heap);
-                function_metadata::bound_delete_own_property(&bound, &mut self.gc_heap, &name)
-                    .map_err(|error| CommittedValueError::JavaScript(error.into()))?
-            } else {
-                return Err(CommittedValueError::JavaScript(VmError::TypeMismatch));
+            let name = match (idx.as_string(&self.gc_heap), idx.as_number()) {
+                (Some(s), _) => Some(s.to_lossy_string(&self.gc_heap)),
+                (None, Some(n)) => Some(match n.as_smi() {
+                    Some(v) if v >= 0 => v.to_string(),
+                    _ => n.to_display_string(),
+                }),
+                (None, None) => None,
+            };
+            match name {
+                Some(name) => {
+                    function_metadata::bound_delete_own_property(&bound, &mut self.gc_heap, &name)
+                        .map_err(|error| CommittedValueError::JavaScript(error.into()))?
+                }
+                None => match idx.as_symbol(&self.gc_heap) {
+                    Some(sym) => {
+                        let bag =
+                            crate::function_metadata::bound_own_properties(&bound, &self.gc_heap);
+                        crate::object::delete_symbol(bag, &mut self.gc_heap, sym)
+                    }
+                    None => true,
+                },
             }
         } else if let Some(t) = receiver.as_typed_array(&self.gc_heap) {
             if let Some(s) = idx.as_string(&self.gc_heap) {

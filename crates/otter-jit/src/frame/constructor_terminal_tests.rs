@@ -103,7 +103,7 @@ fn execute(pair: NativeResultPair) {
         "parked pair is 16-byte aligned"
     );
     assert_eq!(
-        context.generated_feedback_clean, context.pending_call.entry as u64,
+        context.generated_feedback_clean, context.pending_call.entry,
         "exact caller SP restore"
     );
 }
@@ -154,7 +154,7 @@ fn execute(pair: NativeResultPair) {
         "parked pair is 16-byte aligned"
     );
     assert_eq!(
-        context.generated_feedback_clean, context.pending_call.entry as u64,
+        context.generated_feedback_clean, context.pending_call.entry,
         "exact caller SP restore"
     );
 }

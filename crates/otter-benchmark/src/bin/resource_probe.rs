@@ -446,5 +446,5 @@ fn main() -> ProbeResult<()> {
 }
 
 #[cfg(test)]
-#[path = "resource_probe_tests.rs"]
+#[path = "resource_probe/tests.rs"]
 mod tests;

@@ -117,6 +117,42 @@ impl RunnerProvenance {
     }
 }
 
+/// Capture only active GC execution controls without exposing their raw values.
+#[must_use]
+pub fn engine_environment() -> BTreeMap<String, String> {
+    ["OTTER_GC_STRESS", "OTTER_GC_VERIFY"]
+        .into_iter()
+        .filter_map(|key| {
+            std::env::var_os(key).map(|value| {
+                (
+                    key.to_owned(),
+                    format!("{:x}", Sha256::digest(value.as_encoded_bytes())),
+                )
+            })
+        })
+        .collect()
+}
+
+#[cfg(test)]
+pub(crate) fn synthetic() -> RunnerProvenance {
+    RunnerProvenance {
+        executable_sha256: "0".repeat(64),
+        target: "synthetic-test-target".to_owned(),
+        debug_assertions: true,
+        semantic_config: RunConfig {
+            timeout_ms: 5000,
+            max_heap_bytes: 1024,
+            jit_tier: "interpreter".to_owned(),
+            snapshot_isolates: false,
+            skip_features: vec![],
+            skip_flags: vec![],
+            ignored_tests: vec![],
+            known_panics: vec![],
+            engine_environment: BTreeMap::new(),
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -158,41 +194,5 @@ mod tests {
             .engine_environment
             .insert("OTTER_GC_STRESS".to_owned(), "0".repeat(64));
         assert!(identity.validate().is_ok());
-    }
-}
-
-/// Capture only active GC execution controls without exposing their raw values.
-#[must_use]
-pub fn engine_environment() -> BTreeMap<String, String> {
-    ["OTTER_GC_STRESS", "OTTER_GC_VERIFY"]
-        .into_iter()
-        .filter_map(|key| {
-            std::env::var_os(key).map(|value| {
-                (
-                    key.to_owned(),
-                    format!("{:x}", Sha256::digest(value.as_encoded_bytes())),
-                )
-            })
-        })
-        .collect()
-}
-
-#[cfg(test)]
-pub(crate) fn synthetic() -> RunnerProvenance {
-    RunnerProvenance {
-        executable_sha256: "0".repeat(64),
-        target: "synthetic-test-target".to_owned(),
-        debug_assertions: true,
-        semantic_config: RunConfig {
-            timeout_ms: 5000,
-            max_heap_bytes: 1024,
-            jit_tier: "interpreter".to_owned(),
-            snapshot_isolates: false,
-            skip_features: vec![],
-            skip_flags: vec![],
-            ignored_tests: vec![],
-            known_panics: vec![],
-            engine_environment: BTreeMap::new(),
-        },
     }
 }

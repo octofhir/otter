@@ -255,13 +255,12 @@ pub fn construct_instance<'s, T: HostAncestry>(
     if let Some(proto) = proto {
         let raw_proto = cx.escape(proto);
         let raw_instance = cx.escape(handle);
-        if let Some(object) = raw_instance.as_object() {
-            if !object::set_prototype_value(&mut { object }, cx.heap_mut(), Some(raw_proto))
+        if let Some(object) = raw_instance.as_object()
+            && !object::set_prototype_value(&mut { object }, cx.heap_mut(), Some(raw_proto))
                 .map_err(|error| JsError::from_native(crate::NativeError::from(error)))?
             {
                 return Err(JsError::Type("host instance prototype rejected".into()));
             }
-        }
     }
     Ok(handle)
 }
@@ -358,13 +357,12 @@ pub fn class_instance<'s, T: HostAncestry>(
     if let Some(proto) = proto {
         let raw_proto = cx.escape(proto);
         let raw_instance = cx.escape(handle);
-        if let Some(object) = raw_instance.as_object() {
-            if !object::set_prototype_value(&mut { object }, cx.heap_mut(), Some(raw_proto))
+        if let Some(object) = raw_instance.as_object()
+            && !object::set_prototype_value(&mut { object }, cx.heap_mut(), Some(raw_proto))
                 .map_err(|error| JsError::from_native(crate::NativeError::from(error)))?
             {
                 return Err(JsError::Type("host instance prototype rejected".into()));
             }
-        }
     }
     Ok(handle)
 }

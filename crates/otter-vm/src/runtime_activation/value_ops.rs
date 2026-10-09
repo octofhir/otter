@@ -136,23 +136,23 @@ impl RuntimeCall<'_> {
         let (receiver, args) = values
             .split_first()
             .ok_or(VmError::InvalidOperand)
-            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+            .map_err(CommittedValueError::Fatal)?;
         let (function_id, call_pc) = self
             .semantic_source()
-            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+            .map_err(CommittedValueError::Fatal)?;
         let context = self
             .context
             .for_function(function_id)
             .map_err(|_| VmError::InvalidOperand)
-            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+            .map_err(CommittedValueError::Fatal)?;
         let function = context
             .exec_function(function_id)
             .ok_or(VmError::InvalidOperand)
-            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+            .map_err(CommittedValueError::Fatal)?;
         let instruction = function
             .instr_at_index(call_pc as usize)
             .ok_or(VmError::InvalidOperand)
-            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+            .map_err(CommittedValueError::Fatal)?;
         if instruction.instruction_pc != call_pc
             || function.op(instruction) != otter_bytecode::Op::CallMethodValue
         {
@@ -161,12 +161,12 @@ impl RuntimeCall<'_> {
         let name_index = function
             .const_index(instruction, 2)
             .ok_or(VmError::InvalidOperand)
-            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+            .map_err(CommittedValueError::Fatal)?;
         let argument_count = function
             .const_index(instruction, 3)
             .and_then(|count| usize::try_from(count).ok())
             .ok_or(VmError::InvalidOperand)
-            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+            .map_err(CommittedValueError::Fatal)?;
         if args.len() != argument_count {
             return Err(CommittedValueError::Fatal(VmError::InvalidOperand));
         }
@@ -200,20 +200,20 @@ impl RuntimeCall<'_> {
         };
         let (function_id, call_pc) = self
             .semantic_source()
-            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+            .map_err(CommittedValueError::Fatal)?;
         let context = self
             .context
             .for_function(function_id)
             .map_err(|_| VmError::InvalidOperand)
-            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+            .map_err(CommittedValueError::Fatal)?;
         let function = context
             .exec_function(function_id)
             .ok_or(VmError::InvalidOperand)
-            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+            .map_err(CommittedValueError::Fatal)?;
         let instruction = function
             .instr_at_index(call_pc as usize)
             .ok_or(VmError::InvalidOperand)
-            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+            .map_err(CommittedValueError::Fatal)?;
         if instruction.instruction_pc != call_pc
             || function.op(instruction) != otter_bytecode::Op::CallMethodValue
         {
@@ -222,12 +222,12 @@ impl RuntimeCall<'_> {
         let name_index = function
             .const_index(instruction, 2)
             .ok_or(VmError::InvalidOperand)
-            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+            .map_err(CommittedValueError::Fatal)?;
         let argument_count = function
             .const_index(instruction, 3)
             .and_then(|count| usize::try_from(count).ok())
             .ok_or(VmError::InvalidOperand)
-            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+            .map_err(CommittedValueError::Fatal)?;
         let vm = unsafe { &mut *self.vm.as_ptr() };
         let stack = unsafe { &mut *self.stack.as_ptr() };
         vm.jit_runtime_resolve_method(
@@ -355,10 +355,10 @@ impl RuntimeCall<'_> {
             .context
             .string_constant_str_for_function(self.function_id(), hint_index)
             .ok_or(VmError::InvalidOperand)
-            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+            .map_err(CommittedValueError::Fatal)?;
         let hint = UnaryPrimitiveHint::from_token(token)
             .ok_or(VmError::InvalidOperand)
-            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+            .map_err(CommittedValueError::Fatal)?;
         self.coerce_unary(dst, src, UnaryCoercionOp::ToPrimitive { hint })
     }
 
@@ -557,7 +557,7 @@ impl RuntimeCall<'_> {
         let context = ambient
             .for_function(function_id)
             .map_err(|_| VmError::InvalidOperand)
-            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+            .map_err(CommittedValueError::Fatal)?;
         vm.jit_runtime_load_property_value(stack, &context, function_id, instruction_pc, receiver)
     }
 
@@ -577,7 +577,7 @@ impl RuntimeCall<'_> {
         let context = ambient
             .for_function(function_id)
             .map_err(|_| VmError::InvalidOperand)
-            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+            .map_err(CommittedValueError::Fatal)?;
         // Every tier enters the same committed store and publishes the same
         // eligible action facts for subsequent live shared-table probes.
         vm.jit_runtime_store_property_value(

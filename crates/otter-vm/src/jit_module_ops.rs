@@ -46,7 +46,7 @@ impl Interpreter {
                     arg0 as u16,
                     arg1 as u32,
                 )
-                .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                .map_err(CommittedValueError::JavaScript)?;
             }
             value if value == Op::ImportNamespaceDeferred as u8 => {
                 self.run_import_namespace_deferred_reg(
@@ -56,7 +56,7 @@ impl Interpreter {
                     arg0 as u16,
                     arg1 as u32,
                 )
-                .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                .map_err(CommittedValueError::JavaScript)?;
             }
             value if value == Op::ModuleNamespaceObject as u8 => {
                 self.run_module_namespace_object_reg(
@@ -66,7 +66,7 @@ impl Interpreter {
                     arg0 as u16,
                     arg1 as u32,
                 )
-                .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                .map_err(CommittedValueError::JavaScript)?;
             }
             value if value == Op::LoadImportBinding as u8 => {
                 self.run_load_import_binding_reg(
@@ -77,14 +77,14 @@ impl Interpreter {
                     arg1 as u32,
                     arg2 as u32,
                 )
-                .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                .map_err(CommittedValueError::JavaScript)?;
             }
             value if value == Op::StarReexport as u8 => {
                 self.run_star_reexport_regs(context, stack, frame_index, arg0 as u16, arg1 as u16)?;
             }
             value if value == Op::MarkModuleEvaluated as u8 => {
                 self.run_mark_module_evaluated_const(context, stack, frame_index, arg0 as u32)
-                    .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                    .map_err(CommittedValueError::JavaScript)?;
             }
             value if value == Op::ImportMetaResolve as u8 => {
                 self.run_import_meta_resolve_regs(
@@ -94,7 +94,7 @@ impl Interpreter {
                     arg0 as u16,
                     arg1 as u16,
                 )
-                .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                .map_err(CommittedValueError::JavaScript)?;
             }
             _ => return Err(CommittedValueError::Fatal(VmError::InvalidOperand)),
         }

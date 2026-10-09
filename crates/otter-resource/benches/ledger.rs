@@ -55,7 +55,7 @@ fn bench_single_thread(c: &mut Criterion) {
     ];
     group.bench_function("reserve_exact_many_2_release", |b| {
         b.iter(|| {
-            let set = account.reserve_exact_many(&message).expect("many");
+            let set = account.reserve_exact_many(message).expect("many");
             std::hint::black_box(set.amount(ResourceClass::QueuedMessages));
             drop(set);
         });
@@ -64,8 +64,8 @@ fn bench_single_thread(c: &mut Criterion) {
     let family = unlimited();
     group.bench_function("worker_message_two_accounts", |b| {
         b.iter(|| {
-            let main = account.reserve_exact_many(&message).expect("main");
-            let fam = family.reserve_exact_many(&message).expect("family");
+            let main = account.reserve_exact_many(message).expect("main");
+            let fam = family.reserve_exact_many(message).expect("family");
             std::hint::black_box((main.is_empty(), fam.is_empty()));
             drop(fam);
             drop(main);

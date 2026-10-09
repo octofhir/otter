@@ -98,40 +98,37 @@ impl Runtime {
                 commonjs::cjs_instantiate_file(ctx, &cfg, &abs, &source.text).map(|_| ())
             },
         );
-        match load {
-            Err(error) => {
-                if let Some(code) = error.exit_code() {
-                    let result = ExecutionResult::from_exit_code(code, start.elapsed());
-                    return Ok(self.attach_execution_stats(result));
-                }
-                let error = match error {
-                    otter_vm::NativeError::SyntaxError { reason, .. } => {
-                        // The wrapper compiler owns this diagnostic. It is not
-                        // a fabricated throw or an internal loader failure.
-                        return Err(OtterError::Internal {
-                            code: DiagnosticCode::SyntaxError.as_str().to_owned(),
-                            message: reason,
-                        });
-                    }
-                    error => error,
-                };
-                let failure = otter_vm::NativeCtx::with_host_context(
-                    &mut self.interp,
-                    otter_vm::NativeCallInfo::default_call(),
-                    None,
-                    |ctx| ctx.take_native_error(error),
-                );
-                if checkpoint::stops(&failure.error) {
-                    return Err(map_vm_error(failure));
-                }
-                if !self.dispatch_uncaught_exception(None)? {
-                    return Err(enrich_runtime_diagnostic_with_cause(
-                        &mut self.interp,
-                        map_vm_error(failure),
-                    ));
-                }
+        if let Err(error) = load {
+            if let Some(code) = error.exit_code() {
+                let result = ExecutionResult::from_exit_code(code, start.elapsed());
+                return Ok(self.attach_execution_stats(result));
             }
-            Ok(()) => {}
+            let error = match error {
+                otter_vm::NativeError::SyntaxError { reason, .. } => {
+                    // The wrapper compiler owns this diagnostic. It is not
+                    // a fabricated throw or an internal loader failure.
+                    return Err(OtterError::Internal {
+                        code: DiagnosticCode::SyntaxError.as_str().to_owned(),
+                        message: reason,
+                    });
+                }
+                error => error,
+            };
+            let failure = otter_vm::NativeCtx::with_host_context(
+                &mut self.interp,
+                otter_vm::NativeCallInfo::default_call(),
+                None,
+                |ctx| ctx.take_native_error(error),
+            );
+            if checkpoint::stops(&failure.error) {
+                return Err(map_vm_error(failure));
+            }
+            if !self.dispatch_uncaught_exception(None)? {
+                return Err(enrich_runtime_diagnostic_with_cause(
+                    &mut self.interp,
+                    map_vm_error(failure),
+                ));
+            }
         }
         if let Err(error) = self.drain_microtasks_dispatching_uncaught() {
             if let otter_vm::VmError::Exit { code } = error.error {

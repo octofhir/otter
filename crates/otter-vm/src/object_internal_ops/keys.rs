@@ -78,7 +78,7 @@ impl Interpreter {
                 }
                 let hint_handle = interp
                     .scoped_string(scope, hint.as_token())
-                    .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                    .map_err(CommittedValueError::JavaScript)?;
                 let args: SmallVec<[Value; 8]> =
                     smallvec::smallvec![interp.escape_scoped(hint_handle)];
                 let result = interp
@@ -409,13 +409,13 @@ impl Interpreter {
                 &mut [],
                 names.iter().map(String::as_str),
             )
-            .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+            .map_err(CommittedValueError::JavaScript)?;
             // Re-read the receiver: the key allocations above may have moved
             // it; `target` is rewritten in place by the rooted visitor.
             let obj = target
                 .as_object()
                 .ok_or(VmError::InvalidOperand)
-                .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                .map_err(CommittedValueError::Fatal)?;
             let symbols: Vec<Value> = object::with_properties(obj, &self.gc_heap, |p| {
                 p.symbol_keys()
                     .filter(|k| !k.is_private_name())
@@ -478,13 +478,13 @@ impl Interpreter {
                     &mut [],
                     names.iter().map(String::as_str),
                 )
-                .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                .map_err(CommittedValueError::JavaScript)?;
             }
             // Re-read the receiver after the index-key allocations above.
             let t = target
                 .as_typed_array(&self.gc_heap)
                 .ok_or(VmError::InvalidOperand)
-                .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                .map_err(CommittedValueError::Fatal)?;
             if let Some(bag) = t.expando(&self.gc_heap) {
                 let (strings, mut symbols): (Vec<String>, Vec<Value>) =
                     object::with_properties(bag, &self.gc_heap, |p| {
@@ -502,7 +502,7 @@ impl Interpreter {
                     &mut symbols,
                     strings.iter().map(String::as_str),
                 )
-                .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                .map_err(CommittedValueError::JavaScript)?;
                 keys.extend(symbols);
             }
             return Ok(keys);
@@ -523,7 +523,7 @@ impl Interpreter {
                 for idx in 0..value.len() {
                     let key = idx.to_string();
                     self.push_own_key_string(&mut keys, &mut target, &mut [], &key)
-                        .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                        .map_err(CommittedValueError::JavaScript)?;
                 }
             }
             let is_string_exotic = string_data.is_some();
@@ -531,7 +531,7 @@ impl Interpreter {
             let obj = target
                 .as_object()
                 .ok_or(VmError::InvalidOperand)
-                .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                .map_err(CommittedValueError::Fatal)?;
             let (ordinary_strings, mut symbols): (Vec<String>, Vec<Value>) =
                 object::with_properties(obj, &self.gc_heap, |p| {
                     (
@@ -569,7 +569,7 @@ impl Interpreter {
                         .chain(std::iter::once("length"))
                         .chain(non_index_strings.iter().map(String::as_str)),
                 )
-                .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                .map_err(CommittedValueError::JavaScript)?;
             } else {
                 self.push_own_key_strings(
                     &mut keys,
@@ -577,7 +577,7 @@ impl Interpreter {
                     &mut symbols,
                     ordinary_strings.iter().map(String::as_str),
                 )
-                .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                .map_err(CommittedValueError::JavaScript)?;
             }
             keys.extend(symbols);
             return Ok(keys);
@@ -597,7 +597,7 @@ impl Interpreter {
                     .chain(std::iter::once("length"))
                     .chain(string_keys.iter().map(String::as_str)),
             )
-            .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+            .map_err(CommittedValueError::JavaScript)?;
             // §10.4.2 — own symbol-keyed properties follow the
             // string keys per §7.3.22 OrdinaryOwnPropertyKeys
             // ordering. Re-read the receiver after the key
@@ -605,7 +605,7 @@ impl Interpreter {
             let arr = target
                 .as_array()
                 .ok_or(VmError::InvalidOperand)
-                .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                .map_err(CommittedValueError::Fatal)?;
             for sym in array::own_symbol_keys(arr, &self.gc_heap) {
                 keys.push(Value::symbol(sym));
             }
@@ -626,7 +626,7 @@ impl Interpreter {
                 &mut [],
                 names.iter().map(String::as_str),
             )
-            .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+            .map_err(CommittedValueError::JavaScript)?;
             return Ok(keys);
         }
         if let Some(native) = target.as_native_function() {
@@ -638,7 +638,7 @@ impl Interpreter {
                 &mut [],
                 names.iter().map(String::as_str),
             )
-            .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+            .map_err(CommittedValueError::JavaScript)?;
             return Ok(keys);
         }
         if let Some(bound) = target.as_bound_function() {
@@ -655,14 +655,14 @@ impl Interpreter {
                 &mut symbols,
                 names.iter().map(String::as_str),
             )
-            .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+            .map_err(CommittedValueError::JavaScript)?;
             keys.extend(symbols);
             return Ok(keys);
         }
         if let Some(class) = target.as_class_constructor() {
             let names = self
                 .class_constructor_own_property_keys(Some(context), class)
-                .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                .map_err(CommittedValueError::JavaScript)?;
             let mut keys: Vec<Value> = Vec::with_capacity(names.len());
             self.push_own_key_strings(
                 &mut keys,
@@ -670,7 +670,7 @@ impl Interpreter {
                 &mut [],
                 names.iter().map(String::as_str),
             )
-            .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+            .map_err(CommittedValueError::JavaScript)?;
             // §10.1.11 — symbol keys follow the string keys. A class
             // constructor's own symbol-keyed properties (e.g. a static
             // `[sym]() {}` method) live on its statics object. Re-read
@@ -678,7 +678,7 @@ impl Interpreter {
             let class = target
                 .as_class_constructor()
                 .ok_or(VmError::InvalidOperand)
-                .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                .map_err(CommittedValueError::Fatal)?;
             let statics = class.statics(&self.gc_heap);
             let symbols: Vec<Value> = object::with_properties(statics, &self.gc_heap, |p| {
                 p.symbol_keys()
@@ -692,12 +692,12 @@ impl Interpreter {
         if target.as_regexp().is_some() {
             let mut keys = Vec::new();
             self.push_own_key_string(&mut keys, &mut target, &mut [], "lastIndex")
-                .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                .map_err(CommittedValueError::JavaScript)?;
             // Re-read the receiver after the key allocation above.
             let regexp = target
                 .as_regexp()
                 .ok_or(VmError::InvalidOperand)
-                .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                .map_err(CommittedValueError::Fatal)?;
             if let Some(expando) = regexp.expando(&self.gc_heap) {
                 let (strings, mut symbols): (Vec<String>, Vec<Value>) =
                     object::with_properties(expando, &self.gc_heap, |p| {
@@ -711,7 +711,7 @@ impl Interpreter {
                     });
                 for key in strings {
                     self.push_own_key_string(&mut keys, &mut target, &mut symbols, &key)
-                        .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                        .map_err(CommittedValueError::JavaScript)?;
                 }
                 keys.extend(symbols);
             }
@@ -734,7 +734,7 @@ impl Interpreter {
                     });
                 for key in strings {
                     self.push_own_key_string(&mut keys, &mut target, &mut symbols, &key)
-                        .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                        .map_err(CommittedValueError::JavaScript)?;
                 }
                 keys.extend(symbols);
             }
@@ -757,7 +757,7 @@ impl Interpreter {
                     });
                 for key in strings {
                     self.push_own_key_string(&mut keys, &mut target, &mut symbols, &key)
-                        .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                        .map_err(CommittedValueError::JavaScript)?;
                 }
                 keys.extend(symbols);
             }
@@ -780,7 +780,7 @@ impl Interpreter {
                     });
                 for key in strings {
                     self.push_own_key_string(&mut keys, &mut target, &mut symbols, &key)
-                        .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                        .map_err(CommittedValueError::JavaScript)?;
                 }
                 keys.extend(symbols);
             }
@@ -804,7 +804,7 @@ impl Interpreter {
                     });
                 for key in strings {
                     self.push_own_key_string(&mut keys, &mut target, &mut symbols, &key)
-                        .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                        .map_err(CommittedValueError::JavaScript)?;
                 }
                 keys.extend(symbols);
             }
@@ -849,7 +849,7 @@ impl Interpreter {
             }
         };
         let len = to_length(&len_value, &self.gc_heap)
-            .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+            .map_err(CommittedValueError::JavaScript)?;
         let mut out: Vec<Local<'s>> = Vec::with_capacity(len);
         for i in 0..len {
             let key = VmPropertyKey::OwnedString(i.to_string());
@@ -960,7 +960,7 @@ impl Interpreter {
                 .escape_scoped(proxy)
                 .as_proxy()
                 .ok_or(VmError::InvalidOperand)
-                .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                .map_err(CommittedValueError::Fatal)?;
             let target = proxy.target(&self.gc_heap);
             self.scoped_value(scope, target)
         };
@@ -976,7 +976,7 @@ impl Interpreter {
         let mut target_nonconfigurable: Vec<Local<'s>> = Vec::new();
         for key in target_keys {
             let vm_key = property_key_from_value(&self.escape_scoped(key), &self.gc_heap)
-                .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                .map_err(CommittedValueError::JavaScript)?;
             let target_value = self.escape_scoped(target);
             let desc = self.ordinary_get_own_property_descriptor_value(
                 stack,
@@ -1195,12 +1195,12 @@ impl Interpreter {
             let mut obj = obj;
             return self
                 .set_ordinary_prototype(&mut obj, proto_opt)
-                .map_err(|error| CommittedValueError::JavaScript(error.into()));
+                .map_err(CommittedValueError::JavaScript);
         }
         if let Some(arr) = target.as_array() {
             let current_proto = self
                 .get_prototype_for_op(target)
-                .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                .map_err(CommittedValueError::JavaScript)?;
             if abstract_ops::same_value(proto, &current_proto, &self.gc_heap) {
                 return Ok(true);
             }
@@ -1233,7 +1233,7 @@ impl Interpreter {
         if let Some(function_id) = fid {
             let current = self
                 .get_prototype_for_op(target)
-                .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                .map_err(CommittedValueError::JavaScript)?;
             if abstract_ops::same_value(proto, &current, &self.gc_heap) {
                 return Ok(true);
             }
@@ -1251,7 +1251,7 @@ impl Interpreter {
         if let Some(bound) = target.as_bound_function() {
             let current = self
                 .get_prototype_for_op(target)
-                .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                .map_err(CommittedValueError::JavaScript)?;
             if abstract_ops::same_value(proto, &current, &self.gc_heap) {
                 return Ok(true);
             }
@@ -1272,7 +1272,7 @@ impl Interpreter {
         // chain that would run back into the target refuses.
         let current = self
             .get_prototype_for_op(target)
-            .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+            .map_err(CommittedValueError::JavaScript)?;
         if abstract_ops::same_value(proto, &current, &self.gc_heap) {
             return Ok(true);
         }

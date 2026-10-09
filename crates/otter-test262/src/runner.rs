@@ -25,8 +25,8 @@
 //!
 //! # See also
 //! - [`crate::results`] and [`crate::report`].
-//! Spec: <https://tc39.es/ecma262/>
-//! Spec: <https://github.com/tc39/test262/blob/main/INTERPRETING.md>
+//! - Spec: <https://tc39.es/ecma262/>
+//! - Spec: <https://github.com/tc39/test262/blob/main/INTERPRETING.md>
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;

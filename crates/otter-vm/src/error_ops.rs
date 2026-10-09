@@ -59,14 +59,14 @@ impl Interpreter {
     ) -> Result<(), CommittedValueError> {
         let frame = &stack[top_idx];
         let value = *read_register(frame, msg_reg)
-            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+            .map_err(CommittedValueError::Fatal)?;
         let value = self.new_error_value(context, stack, ErrorKind::Error, value)?;
         let frame = &mut stack[top_idx];
         write_register(frame, dst, value)
-            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+            .map_err(CommittedValueError::Fatal)?;
         frame
             .advance_pc()
-            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+            .map_err(CommittedValueError::Fatal)?;
         Ok(())
     }
 
@@ -85,20 +85,20 @@ impl Interpreter {
         let kind_name = context
             .string_constant_str_for_function(stack[top_idx].function_id, kind_idx)
             .ok_or(VmError::InvalidOperand)
-            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+            .map_err(CommittedValueError::Fatal)?;
         let kind = ErrorKind::from_class_name(kind_name)
             .ok_or(VmError::InvalidOperand)
-            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+            .map_err(CommittedValueError::Fatal)?;
         let frame = &stack[top_idx];
         let value = *read_register(frame, msg_reg)
-            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+            .map_err(CommittedValueError::Fatal)?;
         let value = self.new_error_value(context, stack, kind, value)?;
         let frame = &mut stack[top_idx];
         write_register(frame, dst, value)
-            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+            .map_err(CommittedValueError::Fatal)?;
         frame
             .advance_pc()
-            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+            .map_err(CommittedValueError::Fatal)?;
         Ok(())
     }
 
@@ -119,9 +119,9 @@ impl Interpreter {
         let owned_message = self.coerce_error_message(stack, context, &message)?;
         let mut obj = self
             .make_error_instance_with_stack_roots(stack, kind, owned_message, &message)
-            .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+            .map_err(CommittedValueError::JavaScript)?;
         self.capture_error_stack_frames(context, &mut obj)
-            .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+            .map_err(CommittedValueError::JavaScript)?;
         Ok(Value::object(obj))
     }
 

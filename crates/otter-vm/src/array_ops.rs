@@ -56,11 +56,11 @@ impl Interpreter {
         let result = match op {
             Op::ArrayConstruct => self
                 .array_construct_stack_rooted(stack, &args)
-                .map_err(|error| CommittedValueError::JavaScript(error.into()))?,
+                .map_err(CommittedValueError::JavaScript)?,
             Op::ArrayFrom => self.array_from_sync(stack, context, Value::undefined(), &args)?,
             Op::ArrayOf => self
                 .array_of_stack_rooted(stack, &args)
-                .map_err(|error| CommittedValueError::JavaScript(error.into()))?,
+                .map_err(CommittedValueError::JavaScript)?,
             _ => return Err(CommittedValueError::Fatal(VmError::InvalidOperand)),
         };
 
@@ -197,19 +197,19 @@ impl Interpreter {
                 let len = crate::array::len(arr, &interp.gc_heap);
                 let result = interp
                     .scoped_array(scope, len)
-                    .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                    .map_err(CommittedValueError::JavaScript)?;
                 let value_handle = interp.scoped_value(scope, Value::undefined());
                 for index in 0..len {
                     let items = interp.escape_scoped(items_handle);
                     let arr = items
                         .as_array()
                         .ok_or(VmError::InvalidOperand)
-                        .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                        .map_err(CommittedValueError::Fatal)?;
                     let value = crate::array::get(arr, &interp.gc_heap, index);
                     interp.set_scoped(value_handle, value);
                     interp
                         .scoped_set_index(scope, result, index, value_handle)
-                        .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                        .map_err(CommittedValueError::JavaScript)?;
                 }
                 return Ok(interp.escape_scoped(result));
             }
@@ -232,7 +232,7 @@ impl Interpreter {
                         let arr = items
                             .as_array()
                             .ok_or(VmError::InvalidOperand)
-                            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                            .map_err(CommittedValueError::Fatal)?;
                         let value = crate::array::get(arr, &interp.gc_heap, index);
                         let target = interp.iteration_anchor(target_anchor);
                         interp.create_data_property_or_throw(
@@ -444,7 +444,7 @@ impl Interpreter {
                 }
             };
             let len = to_length(&length_value, &interp.gc_heap)
-                .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                .map_err(CommittedValueError::JavaScript)?;
             let constructor = interp.escape_scoped(constructor_handle);
             let target =
                 interp.array_from_make_target(stack, context, use_ctor, &constructor, Some(len))?;
@@ -555,7 +555,7 @@ impl Interpreter {
             }
             Ok(Value::array(
                 self.alloc_runtime_rooted_array_from_values(Vec::new(), &[], &[])
-                    .map_err(|error| CommittedValueError::JavaScript(error.into()))?,
+                    .map_err(CommittedValueError::JavaScript)?,
             ))
         }
     }

@@ -257,7 +257,7 @@ impl BigIntValue {
     pub fn content_hash(self, heap: &otter_gc::GcHeap) -> u64 {
         self.read(heap, |negative, magnitude| {
             magnitude.iter().fold(u64::from(negative), |hash, &digit| {
-                (hash.rotate_left(5) ^ digit).wrapping_mul(0x51_7cc1_b727_220a_95)
+                (hash.rotate_left(5) ^ digit).wrapping_mul(0x517c_c1b7_2722_0a95)
             })
         })
     }

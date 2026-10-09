@@ -391,11 +391,11 @@ impl Interpreter {
             .construct_prototype_for_callee(stack, context, &new_target)?
             .unwrap_or(
                 self.constructor_prototype_value("Object")
-                    .map_err(|error| CommittedValueError::Fatal(error.into()))?,
+                    .map_err(CommittedValueError::Fatal)?,
             );
         roots.scratch_0.set(proto);
         self.allocate_bytecode_constructor_receiver(context, function_id, &roots)
-            .map_err(|error| CommittedValueError::JavaScript(error.into()))
+            .map_err(CommittedValueError::JavaScript)
     }
 
     /// Prepare the source-proven base-to-derived class shape chain without

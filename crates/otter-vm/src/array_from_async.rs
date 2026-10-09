@@ -91,26 +91,26 @@ impl Interpreter {
         let result = (|| -> Result<Value, CommittedValueError> {
             let state_obj = self
                 .alloc_runtime_rooted_object_with_roots(&[], &[])
-                .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                .map_err(CommittedValueError::JavaScript)?;
             let st = self.push_iteration_anchor(Value::object(state_obj)) - 1;
             let resolve = self.iteration_anchor(resolve_slot);
             self.state_set(self.iteration_anchor(st), slot::RESOLVE, resolve)
-                .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                .map_err(CommittedValueError::JavaScript)?;
             let reject = self.iteration_anchor(reject_slot);
             self.state_set(self.iteration_anchor(st), slot::REJECT, reject)
-                .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                .map_err(CommittedValueError::JavaScript)?;
             let mapfn = self.iteration_anchor(mapfn_slot);
             self.state_set(self.iteration_anchor(st), slot::MAPFN, mapfn)
-                .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                .map_err(CommittedValueError::JavaScript)?;
             let this_arg = self.iteration_anchor(this_arg_slot);
             self.state_set(self.iteration_anchor(st), slot::THIS_ARG, this_arg)
-                .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                .map_err(CommittedValueError::JavaScript)?;
             self.state_set(
                 self.iteration_anchor(st),
                 slot::INDEX,
                 Value::number_f64(0.0),
             )
-            .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+            .map_err(CommittedValueError::JavaScript)?;
 
             match self.collect_begin(stack, context, st, this_value_slot, items_slot, mapfn_slot) {
                 Ok(()) => {}
@@ -251,7 +251,7 @@ impl Interpreter {
                         .map_err(CommittedValueError::completed_call)?
                     } else {
                         self.collect_new_array(0)
-                            .map_err(|error| CommittedValueError::JavaScript(error.into()))?
+                            .map_err(CommittedValueError::JavaScript)?
                     };
                     let iterator = self.iteration_anchor(iterator_slot);
                     let next = self.iteration_anchor(next_slot);
@@ -260,7 +260,7 @@ impl Interpreter {
                         array,
                         &[(slot::ITERATOR, iterator), (slot::NEXT, next)],
                     )
-                    .map_err(|error| CommittedValueError::JavaScript(error.into()))
+                    .map_err(CommittedValueError::JavaScript)
                 })();
                 self.pop_iteration_anchors_to(iterator_slot);
                 result?;
@@ -272,7 +272,7 @@ impl Interpreter {
                     items
                 } else {
                     self.box_sloppy_this_primitive_runtime_rooted(items, &[])
-                        .map_err(|error| CommittedValueError::JavaScript(error.into()))?
+                        .map_err(CommittedValueError::JavaScript)?
                 };
                 let array_like_slot = self.push_iteration_anchor(array_like) - 1;
                 let result = (|| -> Result<(), CommittedValueError> {
@@ -303,7 +303,7 @@ impl Interpreter {
                             return Err(self.collect_range_error(stack, "Invalid array length"));
                         }
                         self.collect_new_array(len as usize)
-                            .map_err(|error| CommittedValueError::JavaScript(error.into()))?
+                            .map_err(CommittedValueError::JavaScript)?
                     };
                     let array_like = self.iteration_anchor(array_like_slot);
                     self.collect_publish_array_state(
@@ -314,7 +314,7 @@ impl Interpreter {
                             (slot::LENGTH, Value::number_f64(len)),
                         ],
                     )
-                    .map_err(|error| CommittedValueError::JavaScript(error.into()))
+                    .map_err(CommittedValueError::JavaScript)
                 })();
                 self.pop_iteration_anchors_to(array_like_slot);
                 result?;
@@ -403,7 +403,7 @@ impl Interpreter {
             let inner = inner_value
                 .as_promise()
                 .ok_or(VmError::InvalidOperand)
-                .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                .map_err(CommittedValueError::Fatal)?;
             let on_fulfilled = self.iteration_anchor(fulfilled_slot);
             let on_rejected = self.iteration_anchor(rejected_slot);
             let outcome = self
@@ -414,7 +414,7 @@ impl Interpreter {
                     capability,
                     Some(context.clone()),
                 )
-                .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                .map_err(CommittedValueError::JavaScript)?;
             if let Some(job) = outcome.immediate_job {
                 self.microtasks.enqueue(job);
             }
@@ -458,7 +458,7 @@ impl Interpreter {
             },
         )
         .map_err(VmError::from)
-        .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+        .map_err(CommittedValueError::JavaScript)?;
         Ok(self.stamp_native_creation_realm(value))
     }
 
@@ -558,7 +558,7 @@ impl Interpreter {
             slot::INDEX,
             Value::number_f64(index + 1.0),
         )
-        .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+        .map_err(CommittedValueError::JavaScript)?;
         self.collect_pump(stack, context, st)
     }
 
@@ -652,7 +652,7 @@ impl Interpreter {
                     slot::ITERATOR,
                     Value::undefined(),
                 )
-                .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                .map_err(CommittedValueError::JavaScript)?;
             let current = interp.escape_scoped(iterator);
             let close = match interp.collect_get(stack, context, current, "return") {
                 Ok(method) if interp.is_callable_runtime(&method) => {

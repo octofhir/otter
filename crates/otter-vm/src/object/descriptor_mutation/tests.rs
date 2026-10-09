@@ -32,7 +32,7 @@ fn dictionary_fixture(capacity: usize) -> (GcHeap, JsObject, usize) {
         &mut |_| {},
     )
     .expect("capacity root");
-    shape_body::set_null_root(&mut heap, root);
+    shape_body::set_null_root(&heap, root);
     let mut object = alloc_object_body_old(&mut heap, empty_object_body(root)).expect("old owner");
     let count = capacity + 2;
     for index in 0..count {

@@ -38,6 +38,10 @@ enum Recipe {
         members: Vec<(u32, EmptyLiteralLayout)>,
     },
 }
+// dynasm 5 normalizes dynamic register operands through `Into<u8>`; the
+// register ids here are already `u8`, so the macro-generated conversion is
+// intentionally redundant.
+#[allow(clippy::useless_conversion)]
 fn run(
     recipe: Recipe,
     values: [u64; 3],
@@ -496,7 +500,7 @@ fn strings_execute_exact_flat_cons_identity_and_pre_effect_refusal_payloads() {
         );
         let mut deep = good.clone();
         bytes_mut(&mut deep)[p.string_repr_byte as usize] = p.cons_tag;
-        bytes_mut(&mut deep)[p.cons_depth_byte as usize] = p.max_rope_depth as u8;
+        bytes_mut(&mut deep)[p.cons_depth_byte as usize] = p.max_rope_depth;
         run(
             Recipe::String(p),
             [deep.as_ptr() as u64, good.as_ptr() as u64, 0],

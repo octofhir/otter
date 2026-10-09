@@ -18,6 +18,9 @@
 use super::*;
 use otter_vm::PersistentRootId;
 
+// This fixture consumes the complete table validator; Known-call helpers
+// in the shared proof module are used by the direct-call fixtures instead.
+#[allow(dead_code)]
 #[path = "../support/return_sites.rs"]
 mod return_sites;
 

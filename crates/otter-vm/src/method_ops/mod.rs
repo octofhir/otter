@@ -610,7 +610,7 @@ impl Interpreter {
         if let Some(result) =
             self.try_collection_method_call_ic(method_site, recv_value, arg_values.as_slice())
         {
-            let value = result.map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+            let value = result.map_err(CommittedValueError::JavaScript)?;
             stack[top_idx]
                 .advance_pc()
                 .map_err(CommittedValueError::Fatal)?;
@@ -649,7 +649,7 @@ impl Interpreter {
             name,
             arg_values.as_slice(),
         ) {
-            let value = result.map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+            let value = result.map_err(CommittedValueError::JavaScript)?;
             stack[top_idx]
                 .advance_pc()
                 .map_err(CommittedValueError::Fatal)?;
@@ -794,7 +794,7 @@ impl Interpreter {
                         .map_err(CommittedValueError::Fatal)?;
                 self.record_method_native_call(operands, method, recv_value);
                 self.invoke(stack, context, &method, recv_value, arg_values, dst)
-                    .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                    .map_err(CommittedValueError::JavaScript)?;
                 return Ok(());
             }
         }
@@ -822,7 +822,7 @@ impl Interpreter {
             && recv_value.is_string()
             && let Some(result) = self
                 .try_fast_primitive_string_char_code_at(recv_value, arg_values.as_slice())
-                .map_err(|error| CommittedValueError::JavaScript(error.into()))?
+                .map_err(CommittedValueError::JavaScript)?
         {
             stack[top_idx]
                 .advance_pc()
@@ -835,7 +835,7 @@ impl Interpreter {
             && recv_value.is_number()
             && let Some(result) = self
                 .try_fast_primitive_number_to_string(recv_value, arg_values.as_slice())
-                .map_err(|error| CommittedValueError::JavaScript(error.into()))?
+                .map_err(CommittedValueError::JavaScript)?
         {
             stack[top_idx]
                 .advance_pc()
@@ -906,7 +906,7 @@ impl Interpreter {
                             recv_value,
                             SmallVec::new(),
                         )
-                        .map_err(|error| CommittedValueError::JavaScript(error.into()))?,
+                        .map_err(CommittedValueError::JavaScript)?,
                 };
                 if self.is_callable_runtime(&method) {
                     stack[top_idx]
@@ -1095,7 +1095,7 @@ impl Interpreter {
                     .and_then(|obj| crate::object::string_data(obj, &self.gc_heap))
                     .map(Value::string)
                     .ok_or(VmError::InvalidOperand)
-                    .map_err(|error| CommittedValueError::Fatal(error.into()))?
+                    .map_err(CommittedValueError::Fatal)?
             };
             if let (Some(search), Some(slot)) = (coerced_search, coerced_args.first_mut()) {
                 *slot = search;
@@ -1247,7 +1247,7 @@ impl Interpreter {
             && function_prototype_intrinsic_name(name)
             && self
                 .callable_has_own_function_method_shadow(context, recv_value, name)
-                .map_err(|error| CommittedValueError::JavaScript(error.into()))?
+                .map_err(CommittedValueError::JavaScript)?
         {
             let method = self
                 .get_method_value_for_call(context, stack, recv_value, method_key)?
@@ -1812,7 +1812,7 @@ impl Interpreter {
         value_bits: u64,
     ) -> Result<(), CommittedValueError> {
         let recv = *read_register(&stack[frame_index], recv_reg)
-            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+            .map_err(CommittedValueError::Fatal)?;
         let value = Value::from_bits(value_bits);
         let result = self.dispatch_array_builtin_rooted(
             stack,
@@ -1822,7 +1822,7 @@ impl Interpreter {
             &[value],
         )?;
         write_register(&mut stack[frame_index], dst, result)
-            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+            .map_err(CommittedValueError::Fatal)?;
         Ok(())
     }
 
@@ -2311,12 +2311,12 @@ impl Interpreter {
             let recv = receiver
                 .as_string(&interp.gc_heap)
                 .ok_or(VmError::TypeMismatch)
-                .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                .map_err(CommittedValueError::JavaScript)?;
             let needle = args
                 .first()
                 .and_then(|v| v.as_string(&interp.gc_heap))
                 .ok_or(VmError::TypeMismatch)
-                .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                .map_err(CommittedValueError::JavaScript)?;
             let callback = args.get(1).copied().unwrap_or_else(Value::undefined);
             let recv_units = recv.to_utf16_vec(&interp.gc_heap);
             let needle_units = needle.to_utf16_vec(&interp.gc_heap);
@@ -2356,7 +2356,7 @@ impl Interpreter {
                         let display = raw.display_string(&interp.gc_heap);
                         JsString::from_str(&display, &mut interp.gc_heap)
                             .map_err(crate::oom_to_vm)
-                            .map_err(|error| CommittedValueError::JavaScript(error.into()))?
+                            .map_err(CommittedValueError::JavaScript)?
                             .to_utf16_vec(&interp.gc_heap)
                     };
                     out.extend_from_slice(&replacement);
@@ -2367,7 +2367,7 @@ impl Interpreter {
                 return Ok(Value::string(
                     JsString::from_utf16_units(&out, &mut interp.gc_heap)
                         .map_err(crate::oom_to_vm)
-                        .map_err(|error| CommittedValueError::JavaScript(error.into()))?,
+                        .map_err(CommittedValueError::JavaScript)?,
                 ));
             }
             if recv_units.len() < needle_len {
@@ -2400,7 +2400,7 @@ impl Interpreter {
                         let display = raw.display_string(&interp.gc_heap);
                         JsString::from_str(&display, &mut interp.gc_heap)
                             .map_err(crate::oom_to_vm)
-                            .map_err(|error| CommittedValueError::JavaScript(error.into()))?
+                            .map_err(CommittedValueError::JavaScript)?
                             .to_utf16_vec(&interp.gc_heap)
                     };
                     out.extend_from_slice(&replacement);
@@ -2417,7 +2417,7 @@ impl Interpreter {
             Ok(Value::string(
                 JsString::from_utf16_units(&out, &mut interp.gc_heap)
                     .map_err(crate::oom_to_vm)
-                    .map_err(|error| CommittedValueError::JavaScript(error.into()))?,
+                    .map_err(CommittedValueError::JavaScript)?,
             ))
         })
     }
@@ -2492,7 +2492,7 @@ impl Interpreter {
         let len = t.length(&self.gc_heap);
         let this_arg = args.get(1).cloned().unwrap_or(Value::undefined());
         let callee = require_callable(args.first())
-            .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+            .map_err(CommittedValueError::JavaScript)?;
 
         // Every value reused after a callback lives in the collector-traced
         // iteration-anchor range. Callback execution may move the receiver,
@@ -2519,10 +2519,10 @@ impl Interpreter {
                         let t = ta_value
                             .as_typed_array(&interp.gc_heap)
                             .ok_or(VmError::InvalidOperand)
-                            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                            .map_err(CommittedValueError::Fatal)?;
                         let value = interp
                             .ta_live_element(&t, i)
-                            .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                            .map_err(CommittedValueError::JavaScript)?;
                         interp.set_iteration_anchor(anchor_base + ELEMENT, value);
                         interp.run_typed_array_callback(
                             stack,
@@ -2547,7 +2547,7 @@ impl Interpreter {
                         .iteration_anchor(anchor_base + RECEIVER)
                         .as_typed_array(&interp.gc_heap)
                         .ok_or(VmError::InvalidOperand)
-                        .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                        .map_err(CommittedValueError::Fatal)?;
                     let a = interp.typed_array_species_create(stack, context, &t, len)?;
                     let a_value = Value::typed_array(a);
                     let target_kind = a.kind();
@@ -2557,10 +2557,10 @@ impl Interpreter {
                         let t = ta_value
                             .as_typed_array(&interp.gc_heap)
                             .ok_or(VmError::InvalidOperand)
-                            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                            .map_err(CommittedValueError::Fatal)?;
                         let value = interp
                             .ta_live_element(&t, i)
-                            .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                            .map_err(CommittedValueError::JavaScript)?;
                         interp.set_iteration_anchor(anchor_base + ELEMENT, value);
                         let mapped = interp.run_typed_array_callback(
                             stack,
@@ -2580,13 +2580,13 @@ impl Interpreter {
                             target_kind,
                             &mapped,
                         )
-                        .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                        .map_err(CommittedValueError::JavaScript)?;
                         interp.set_iteration_anchor(anchor_base + CARRIED, coerced);
                         let output = interp
                             .iteration_anchor(output_anchor)
                             .as_typed_array(&interp.gc_heap)
                             .ok_or(VmError::InvalidOperand)
-                            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                            .map_err(CommittedValueError::Fatal)?;
                         let coerced = interp.iteration_anchor(anchor_base + CARRIED);
                         output.set(&mut interp.gc_heap, i, &coerced);
                     }
@@ -2605,10 +2605,10 @@ impl Interpreter {
                         let t = ta_value
                             .as_typed_array(&interp.gc_heap)
                             .ok_or(VmError::InvalidOperand)
-                            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                            .map_err(CommittedValueError::Fatal)?;
                         let value = interp
                             .ta_live_element(&t, i)
-                            .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                            .map_err(CommittedValueError::JavaScript)?;
                         interp.set_iteration_anchor(anchor_base + ELEMENT, value);
                         let selected = interp.run_typed_array_callback(
                             stack,
@@ -2632,7 +2632,7 @@ impl Interpreter {
                         .iteration_anchor(anchor_base + RECEIVER)
                         .as_typed_array(&interp.gc_heap)
                         .ok_or(VmError::InvalidOperand)
-                        .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                        .map_err(CommittedValueError::Fatal)?;
                     let a = interp.typed_array_species_create(stack, context, &t, kept_len)?;
                     let target_kind = a.kind();
                     let output_anchor = interp.push_iteration_anchor(Value::typed_array(a)) - 1;
@@ -2643,13 +2643,13 @@ impl Interpreter {
                             target_kind,
                             &kept,
                         )
-                        .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                        .map_err(CommittedValueError::JavaScript)?;
                         interp.set_iteration_anchor(anchor_base + CARRIED, coerced);
                         let output = interp
                             .iteration_anchor(output_anchor)
                             .as_typed_array(&interp.gc_heap)
                             .ok_or(VmError::InvalidOperand)
-                            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                            .map_err(CommittedValueError::Fatal)?;
                         let coerced = interp.iteration_anchor(anchor_base + CARRIED);
                         output.set(&mut interp.gc_heap, i, &coerced);
                     }
@@ -2662,10 +2662,10 @@ impl Interpreter {
                         let t = ta_value
                             .as_typed_array(&interp.gc_heap)
                             .ok_or(VmError::InvalidOperand)
-                            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                            .map_err(CommittedValueError::Fatal)?;
                         let value = interp
                             .ta_live_element(&t, i)
-                            .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                            .map_err(CommittedValueError::JavaScript)?;
                         interp.set_iteration_anchor(anchor_base + ELEMENT, value);
                         let hit = interp.run_typed_array_callback(
                             stack,
@@ -2692,10 +2692,10 @@ impl Interpreter {
                         let t = ta_value
                             .as_typed_array(&interp.gc_heap)
                             .ok_or(VmError::InvalidOperand)
-                            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                            .map_err(CommittedValueError::Fatal)?;
                         let value = interp
                             .ta_live_element(&t, i)
-                            .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                            .map_err(CommittedValueError::JavaScript)?;
                         interp.set_iteration_anchor(anchor_base + ELEMENT, value);
                         let hit = interp.run_typed_array_callback(
                             stack,
@@ -2722,10 +2722,10 @@ impl Interpreter {
                         let t = ta_value
                             .as_typed_array(&interp.gc_heap)
                             .ok_or(VmError::InvalidOperand)
-                            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                            .map_err(CommittedValueError::Fatal)?;
                         let value = interp
                             .ta_live_element(&t, i)
-                            .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                            .map_err(CommittedValueError::JavaScript)?;
                         interp.set_iteration_anchor(anchor_base + ELEMENT, value);
                         let hit = interp.run_typed_array_callback(
                             stack,
@@ -2752,10 +2752,10 @@ impl Interpreter {
                         let t = ta_value
                             .as_typed_array(&interp.gc_heap)
                             .ok_or(VmError::InvalidOperand)
-                            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                            .map_err(CommittedValueError::Fatal)?;
                         let value = interp
                             .ta_live_element(&t, i)
-                            .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                            .map_err(CommittedValueError::JavaScript)?;
                         interp.set_iteration_anchor(anchor_base + ELEMENT, value);
                         let hit = interp.run_typed_array_callback(
                             stack,
@@ -2782,10 +2782,10 @@ impl Interpreter {
                         let t = ta_value
                             .as_typed_array(&interp.gc_heap)
                             .ok_or(VmError::InvalidOperand)
-                            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                            .map_err(CommittedValueError::Fatal)?;
                         let value = interp
                             .ta_live_element(&t, i)
-                            .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                            .map_err(CommittedValueError::JavaScript)?;
                         interp.set_iteration_anchor(anchor_base + ELEMENT, value);
                         let hit = interp.run_typed_array_callback(
                             stack,
@@ -2812,10 +2812,10 @@ impl Interpreter {
                         let t = ta_value
                             .as_typed_array(&interp.gc_heap)
                             .ok_or(VmError::InvalidOperand)
-                            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                            .map_err(CommittedValueError::Fatal)?;
                         let value = interp
                             .ta_live_element(&t, i)
-                            .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                            .map_err(CommittedValueError::JavaScript)?;
                         interp.set_iteration_anchor(anchor_base + ELEMENT, value);
                         let hit = interp.run_typed_array_callback(
                             stack,
@@ -2850,10 +2850,10 @@ impl Interpreter {
                             .iteration_anchor(anchor_base + RECEIVER)
                             .as_typed_array(&interp.gc_heap)
                             .ok_or(VmError::InvalidOperand)
-                            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                            .map_err(CommittedValueError::Fatal)?;
                         let seed_value = interp
                             .ta_live_element(&t, seed)
-                            .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                            .map_err(CommittedValueError::JavaScript)?;
                         interp.set_iteration_anchor(anchor_base + CARRIED, seed_value);
                         seed as i64 + step
                     };
@@ -2863,10 +2863,10 @@ impl Interpreter {
                         let t = ta_value
                             .as_typed_array(&interp.gc_heap)
                             .ok_or(VmError::InvalidOperand)
-                            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                            .map_err(CommittedValueError::Fatal)?;
                         let value = interp
                             .ta_live_element(&t, i as usize)
-                            .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                            .map_err(CommittedValueError::JavaScript)?;
                         interp.set_iteration_anchor(anchor_base + ELEMENT, value);
                         let next_acc = interp.run_typed_array_callback(
                             stack,
@@ -2937,7 +2937,7 @@ impl Interpreter {
             let exemplar = exemplar_value
                 .as_typed_array(&interp.gc_heap)
                 .ok_or(VmError::InvalidOperand)
-                .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                .map_err(CommittedValueError::Fatal)?;
             let default_name = exemplar.kind().name();
             let Some(default_ctor) =
                 crate::object::get(interp.global_this, &interp.gc_heap, default_name)
@@ -3029,7 +3029,7 @@ impl Interpreter {
                 .escape_scoped(source_handle)
                 .as_typed_array(&interp.gc_heap)
                 .ok_or(VmError::InvalidOperand)
-                .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                .map_err(CommittedValueError::Fatal)?;
             // §23.2.3.27 step 4 — `[[ArrayLength]]` is `0` for a detached
             // buffer; `subarray` does not itself throw on detachment.
             let src_len = source.length(&interp.gc_heap) as i64;
@@ -3056,7 +3056,7 @@ impl Interpreter {
                 .escape_scoped(source_handle)
                 .as_typed_array(&interp.gc_heap)
                 .ok_or(VmError::InvalidOperand)
-                .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                .map_err(CommittedValueError::Fatal)?;
             let buffer = source.buffer(&interp.gc_heap);
             let bpe = source.kind().bytes_per_element();
             // §23.2.3.30 step 13 — [[ByteOffset]] is the construction-time
@@ -3108,7 +3108,7 @@ impl Interpreter {
                 .escape_scoped(source_handle)
                 .as_typed_array(&interp.gc_heap)
                 .ok_or(VmError::InvalidOperand)
-                .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                .map_err(CommittedValueError::Fatal)?;
             if source.is_out_of_bounds(&interp.gc_heap) {
                 return Err(CommittedValueError::JavaScript(interp.err_type(
                     ("Cannot slice a detached or out-of-bounds TypedArray".to_string()).into(),
@@ -3138,7 +3138,7 @@ impl Interpreter {
                 .escape_scoped(source_handle)
                 .as_typed_array(&interp.gc_heap)
                 .ok_or(VmError::InvalidOperand)
-                .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                .map_err(CommittedValueError::Fatal)?;
             let a = interp.typed_array_species_create(stack, context, &source, count)?;
             let result_handle = interp.scoped_value(scope, Value::typed_array(a));
             if count > 0 {
@@ -3151,7 +3151,7 @@ impl Interpreter {
                     .escape_scoped(source_handle)
                     .as_typed_array(&interp.gc_heap)
                     .ok_or(VmError::InvalidOperand)
-                    .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                    .map_err(CommittedValueError::Fatal)?;
                 if source.is_out_of_bounds(&interp.gc_heap) {
                     return Err(CommittedValueError::JavaScript(interp.err_type(
                         ("TypedArray buffer was detached or resized out of bounds during slice"
@@ -3166,13 +3166,13 @@ impl Interpreter {
                     .escape_scoped(result_handle)
                     .as_typed_array(&interp.gc_heap)
                     .ok_or(VmError::InvalidOperand)
-                    .map_err(|error| CommittedValueError::Fatal(error.into()))?
+                    .map_err(CommittedValueError::Fatal)?
                     .kind();
                 let source_kind = interp
                     .escape_scoped(source_handle)
                     .as_typed_array(&interp.gc_heap)
                     .ok_or(VmError::InvalidOperand)
-                    .map_err(|error| CommittedValueError::Fatal(error.into()))?
+                    .map_err(CommittedValueError::Fatal)?
                     .kind();
                 if source_kind == target_kind {
                     // §23.2.3.27 step 15.e — a same-type transfer copies
@@ -3183,12 +3183,12 @@ impl Interpreter {
                         .escape_scoped(source_handle)
                         .as_typed_array(&interp.gc_heap)
                         .ok_or(VmError::InvalidOperand)
-                        .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                        .map_err(CommittedValueError::Fatal)?;
                     let target = interp
                         .escape_scoped(result_handle)
                         .as_typed_array(&interp.gc_heap)
                         .ok_or(VmError::InvalidOperand)
-                        .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                        .map_err(CommittedValueError::Fatal)?;
                     let bpe = source_kind.bytes_per_element();
                     let src_start = source.byte_offset(&interp.gc_heap) + base * bpe;
                     let dst_start = target.byte_offset(&interp.gc_heap);
@@ -3232,11 +3232,11 @@ impl Interpreter {
                         .escape_scoped(source_handle)
                         .as_typed_array(&interp.gc_heap)
                         .ok_or(VmError::InvalidOperand)
-                        .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                        .map_err(CommittedValueError::Fatal)?;
                     let value = source
                         .get(&mut interp.gc_heap, base + n)
                         .map_err(crate::oom_to_vm)
-                        .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                        .map_err(CommittedValueError::JavaScript)?;
                     interp.set_scoped(element_handle, value);
                     let value = interp.escape_scoped(element_handle);
                     let coerced = crate::binary::dispatch::coerce_element_for_store(
@@ -3244,13 +3244,13 @@ impl Interpreter {
                         target_kind,
                         &value,
                     )
-                    .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                    .map_err(CommittedValueError::JavaScript)?;
                     interp.set_scoped(element_handle, coerced);
                     let target = interp
                         .escape_scoped(result_handle)
                         .as_typed_array(&interp.gc_heap)
                         .ok_or(VmError::InvalidOperand)
-                        .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                        .map_err(CommittedValueError::Fatal)?;
                     let coerced = interp.escape_scoped(element_handle);
                     target.set(&mut interp.gc_heap, n, &coerced);
                 }
@@ -3300,9 +3300,9 @@ impl Interpreter {
                 let forwarded: SmallVec<[Value; 8]> = iter.collect();
                 stack[top_idx]
                     .advance_pc()
-                    .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                    .map_err(CommittedValueError::Fatal)?;
                 self.invoke(stack, context, callee, this_value, forwarded, dst)
-                    .map_err(|error| CommittedValueError::JavaScript(error.into()))
+                    .map_err(CommittedValueError::JavaScript)
             }
             "apply" => {
                 let mut iter = args.into_iter();
@@ -3316,9 +3316,9 @@ impl Interpreter {
                 };
                 stack[top_idx]
                     .advance_pc()
-                    .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                    .map_err(CommittedValueError::Fatal)?;
                 self.invoke(stack, context, callee, this_value, forwarded, dst)
-                    .map_err(|error| CommittedValueError::JavaScript(error.into()))
+                    .map_err(CommittedValueError::JavaScript)
             }
             "bind" => {
                 let mut iter = args.into_iter();
@@ -3328,7 +3328,7 @@ impl Interpreter {
                 let pc = stack[top_idx].pc;
                 match self
                     .callable_bind_metadata_get(context, &target, "length")
-                    .map_err(|error| CommittedValueError::JavaScript(error.into()))?
+                    .map_err(CommittedValueError::JavaScript)?
                 {
                     BindMetadataGet::Value(target_length) => self
                         .continue_bind_function_after_length(
@@ -3352,7 +3352,7 @@ impl Interpreter {
                             target_length: None,
                         });
                         self.invoke(stack, context, &getter, target, SmallVec::new(), dst)
-                            .map_err(|error| CommittedValueError::JavaScript(error.into()))
+                            .map_err(CommittedValueError::JavaScript)
                     }
                 }
             }
@@ -3382,13 +3382,13 @@ impl Interpreter {
                 };
                 let s = JsString::from_str(&display, &mut self.gc_heap)
                     .map_err(|_| VmError::TypeMismatch)
-                    .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                    .map_err(CommittedValueError::JavaScript)?;
                 let frame = &mut stack[top_idx];
                 write_register(frame, dst, Value::string(s))
-                    .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                    .map_err(CommittedValueError::Fatal)?;
                 frame
                     .advance_pc()
-                    .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                    .map_err(CommittedValueError::Fatal)?;
                 Ok(())
             }
             _ => Err(CommittedValueError::JavaScript(

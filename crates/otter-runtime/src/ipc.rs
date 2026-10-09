@@ -256,11 +256,11 @@ impl IpcPayloadBudget {
         ];
         let family = self
             .family
-            .reserve_exact_many(&requests)
+            .reserve_exact_many(requests)
             .map_err(|_| IpcPayloadError::FamilyBudget)?;
         let runtime = self
             .runtime
-            .reserve_exact_many(&requests)
+            .reserve_exact_many(requests)
             .map_err(|_| IpcPayloadError::RuntimeBudget)?;
         Ok(IpcPayloadLeases {
             _family: family,

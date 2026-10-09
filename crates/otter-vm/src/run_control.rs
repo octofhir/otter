@@ -182,8 +182,9 @@ pub enum ErrorDetail {
     Json(VmJsonError),
     /// Node-style coded failure payload.
     Coded(VmCodedError),
-    /// Failed system call payload.
-    Syscall(VmSyscallError),
+    /// Failed system call payload. Boxed because it is the largest and rarest
+    /// detail, and an inline payload would size every [`RunError`].
+    Syscall(Box<VmSyscallError>),
     /// Exact resource-admission failure for [`VmError::ResourceLimit`].
     Resource(otter_resource::ResourceError),
 }

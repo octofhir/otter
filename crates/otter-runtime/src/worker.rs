@@ -716,13 +716,13 @@ fn admit_worker_message(
     }
     let family_leases = family
         .account
-        .reserve_exact_many(&[
+        .reserve_exact_many([
             (ResourceClass::QueuedMessages, 1),
             (ResourceClass::QueuedMessageBytes, bytes),
         ])
         .map_err(|err| type_err(api, format!("worker message queue limit: {err}")))?;
     let main_leases = account
-        .reserve_exact_many(&[
+        .reserve_exact_many([
             (ResourceClass::QueuedTasks, 1),
             (ResourceClass::QueuedMessages, 1),
             (ResourceClass::QueuedMessageBytes, bytes),

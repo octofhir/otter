@@ -54,7 +54,6 @@ impl Interpreter {
     /// Construct a fresh interpreter with its own interrupt flag,
     /// a no-cap string heap, the default stack-depth limit, and a
     /// fresh GC heap.
-    #[must_use]
     pub fn new() -> Result<Self, crate::js_surface::JsSurfaceError> {
         Self::with_string_heap_cap(0)
     }
@@ -71,7 +70,6 @@ impl Interpreter {
     /// Construct an interpreter with a string heap cap (`0` =
     /// unlimited). The same cap is honoured by the interpreter's
     /// GC heap.
-    #[must_use]
     pub fn with_string_heap_cap(cap_bytes: u64) -> Result<Self, crate::js_surface::JsSurfaceError> {
         let startup_timer = StartupPhaseTimer::from_env();
         let mut gc_heap = otter_gc::GcHeap::with_max_heap_bytes(cap_bytes)?;

@@ -696,14 +696,13 @@ impl crate::Interpreter {
                 promise.prototype_override(heap),
                 Intrinsic::PromisePrototype,
             )
-        } else if let Some(regexp) = receiver.as_regexp() {
+        } else {
+            let regexp = receiver.as_regexp()?;
             (
                 regexp.expando(heap),
                 regexp.prototype_override(heap),
                 Intrinsic::RegExpPrototype,
             )
-        } else {
-            return None;
         };
         if expando.is_some() {
             return Some(None);

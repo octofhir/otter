@@ -365,8 +365,8 @@ impl Interpreter {
         // marked disabled by `prepare_osr`, so it should not keep counting) and
         // attempt OSR.
         self.jit_runtime_stats.osr_attempts = self.jit_runtime_stats.osr_attempts.saturating_add(1);
-        let outcome = self.prepare_osr(stack, context, top_idx, optimizing_enabled);
-        outcome
+        
+        self.prepare_osr(stack, context, top_idx, optimizing_enabled)
     }
 
     /// Whether a baseline exit is a back-edge poll handing its loop to the

@@ -68,7 +68,7 @@ impl Interpreter {
         if let Some(proxy) = target.as_proxy() {
             let key_value = self
                 .vm_property_key_to_value(key)
-                .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                .map_err(CommittedValueError::JavaScript)?;
             let trap_args: SmallVec<[Value; 8]> =
                 smallvec::smallvec![proxy.target(&self.gc_heap), key_value];
             return match self.invoke_proxy_trap(
@@ -115,7 +115,7 @@ impl Interpreter {
         if let Some(obj) = target.as_object() {
             if let Some(desc) = self
                 .string_object_exotic_descriptor(obj, key)
-                .map_err(|error| CommittedValueError::JavaScript(error.into()))?
+                .map_err(CommittedValueError::JavaScript)?
                 && !desc.configurable()
             {
                 return Ok(false);
@@ -338,7 +338,7 @@ impl Interpreter {
                     return this.ordinary_set_on_receiver(stack, context, key, value, &receiver);
                 }
                 let mut bag = crate::property_dispatch::typed_array_ensure_expando(this, &t)
-                    .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                    .map_err(CommittedValueError::JavaScript)?;
                 // OrdinarySet on the expando: an own non-writable
                 // data property rejects, an own accessor invokes
                 // its setter (receiver = the typed array), and a
@@ -368,7 +368,7 @@ impl Interpreter {
                             value,
                         )
                         .map_err(VmError::from)
-                        .map_err(|error| CommittedValueError::JavaScript(error.into()))
+                        .map_err(CommittedValueError::JavaScript)
                     }
                     object::PropertyLookup::Accessor { setter, .. } => {
                         let Some(setter) = setter else {
@@ -396,7 +396,7 @@ impl Interpreter {
                         let target = this.iteration_anchor(target_slot);
                         let parent = this
                             .get_prototype_for_op(&target)
-                            .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                            .map_err(CommittedValueError::JavaScript)?;
                         let value = this.iteration_anchor(value_slot);
                         let receiver = this.iteration_anchor(receiver_slot);
                         if parent.is_null() || parent.is_undefined() {
@@ -437,7 +437,7 @@ impl Interpreter {
                 // ToPropertyKey materialization allocates for named keys. Park
                 // every operand before it so the trap receives relocated
                 // target/value/receiver handles rather than pre-move copies.
-                let key_value = interp.vm_property_key_to_value(key).map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                let key_value = interp.vm_property_key_to_value(key).map_err(CommittedValueError::JavaScript)?;
                 let key_root = interp.scoped_value(scope, key_value);
                 let proxy = interp
                     .escape_scoped(proxy_root)
@@ -573,7 +573,7 @@ impl Interpreter {
             }
             let parent = self
                 .get_prototype_for_op(&target_value)
-                .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                .map_err(CommittedValueError::JavaScript)?;
             if parent.is_null() || parent.is_undefined() {
                 return self.ordinary_set_on_receiver(stack, context, key, value, &receiver);
             }
@@ -604,7 +604,7 @@ impl Interpreter {
             }
             if let Some(desc) = self
                 .string_object_exotic_descriptor(obj, key)
-                .map_err(|error| CommittedValueError::JavaScript(error.into()))?
+                .map_err(CommittedValueError::JavaScript)?
                 && !desc.writable()
             {
                 return Ok(false);
@@ -662,7 +662,7 @@ impl Interpreter {
                                 .expect("non-symbol key has string spelling"),
                             value,
                         )
-                        .map_err(|error| CommittedValueError::JavaScript(error.into()))?
+                        .map_err(CommittedValueError::JavaScript)?
                     })
                 }
             };
@@ -721,7 +721,7 @@ impl Interpreter {
                                     .expect("non-symbol key has string spelling"),
                                 value,
                             )
-                            .map_err(|error| CommittedValueError::JavaScript(error.into()))?
+                            .map_err(CommittedValueError::JavaScript)?
                         });
                     }
                     object::PropertyLookup::Accessor { setter, .. } => {
@@ -751,7 +751,7 @@ impl Interpreter {
             }
             let parent = self
                 .get_prototype_for_op(&target)
-                .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                .map_err(CommittedValueError::JavaScript)?;
             if parent.is_null() || parent.is_undefined() {
                 return self.ordinary_set_on_receiver(stack, context, key, value, &receiver);
             }
@@ -783,7 +783,7 @@ impl Interpreter {
                     let target = interp.scoped_value(scope, target);
                     let value = interp.scoped_value(scope, value);
                     let receiver = interp.scoped_value(scope, receiver);
-                    let bag = interp.collection_ensure_expando(&interp.escape_scoped(target)).map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                    let bag = interp.collection_ensure_expando(&interp.escape_scoped(target)).map_err(CommittedValueError::JavaScript)?;
                     Ok((
                         bag,
                         interp.escape_scoped(target),
@@ -841,7 +841,7 @@ impl Interpreter {
                                 .expect("non-symbol key has string spelling"),
                             value,
                         )
-                        .map_err(|error| CommittedValueError::JavaScript(error.into()))?
+                        .map_err(CommittedValueError::JavaScript)?
                     });
                 }
                 object::PropertyLookup::Accessor { setter, .. } => {
@@ -869,7 +869,7 @@ impl Interpreter {
                 object::PropertyLookup::Absent => {
                     let parent = self
                         .get_prototype_for_op(&target)
-                        .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                        .map_err(CommittedValueError::JavaScript)?;
                     if parent.is_null() || parent.is_undefined() {
                         return self
                             .ordinary_set_on_receiver(stack, context, key, value, &receiver);
@@ -894,7 +894,7 @@ impl Interpreter {
             // (so `dt.year = x`, a getter-only accessor, rejects).
             let mut bag =
                 crate::property_dispatch::temporal_ensure_expando_pub(&mut self.gc_heap, &t)
-                    .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                    .map_err(CommittedValueError::JavaScript)?;
             let same_receiver = receiver
                 .as_temporal(&self.gc_heap)
                 .is_some_and(|r| r.ptr_eq(t));
@@ -947,7 +947,7 @@ impl Interpreter {
                 object::PropertyLookup::Absent => {
                     let parent = self
                         .get_prototype_for_op(&target)
-                        .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                        .map_err(CommittedValueError::JavaScript)?;
                     if parent.is_null() || parent.is_undefined() {
                         return self
                             .ordinary_set_on_receiver(stack, context, key, value, &receiver);
@@ -970,7 +970,7 @@ impl Interpreter {
             // prototype walk stays ordinary (§10.1.9).
             let Some(mut bag) = self
                 .ensure_non_gc_exotic_user_props(&target)
-                .map_err(|error| CommittedValueError::JavaScript(error.into()))?
+                .map_err(CommittedValueError::JavaScript)?
             else {
                 return Ok(false);
             };
@@ -1027,7 +1027,7 @@ impl Interpreter {
                 object::PropertyLookup::Absent => {
                     let parent = self
                         .get_prototype_for_op(&target)
-                        .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                        .map_err(CommittedValueError::JavaScript)?;
                     if parent.is_null() || parent.is_undefined() {
                         return self
                             .ordinary_set_on_receiver(stack, context, key, value, &receiver);
@@ -1051,7 +1051,7 @@ impl Interpreter {
             // side-table bag and the prototype walk remains ordinary.
             let Some(mut bag) = self
                 .ensure_non_gc_exotic_user_props(&target)
-                .map_err(|error| CommittedValueError::JavaScript(error.into()))?
+                .map_err(CommittedValueError::JavaScript)?
             else {
                 return Ok(false);
             };
@@ -1109,7 +1109,7 @@ impl Interpreter {
                 object::PropertyLookup::Absent => {
                     let parent = self
                         .get_prototype_for_op(&target)
-                        .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                        .map_err(CommittedValueError::JavaScript)?;
                     if parent.is_null() || parent.is_undefined() {
                         return self
                             .ordinary_set_on_receiver(stack, context, key, value, &receiver);
@@ -1173,7 +1173,7 @@ impl Interpreter {
                 None => {
                     let parent = self
                         .get_prototype_for_op(&target)
-                        .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                        .map_err(CommittedValueError::JavaScript)?;
                     if parent.is_null() || parent.is_undefined() {
                         return self
                             .ordinary_set_on_receiver(stack, context, key, value, &receiver);
@@ -1220,7 +1220,7 @@ impl Interpreter {
                         function_id,
                         name,
                     )
-                    .map_err(|error| CommittedValueError::JavaScript(error.into()))?
+                    .map_err(CommittedValueError::JavaScript)?
                 }
             };
             return match own {
@@ -1250,7 +1250,7 @@ impl Interpreter {
                 None => {
                     let parent = self
                         .get_prototype_for_op(&target)
-                        .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                        .map_err(CommittedValueError::JavaScript)?;
                     if parent.is_null() || parent.is_undefined() {
                         return self
                             .ordinary_set_on_receiver(stack, context, key, value, &receiver);
@@ -1336,7 +1336,7 @@ impl Interpreter {
                 }
                 let parent = interp
                     .get_prototype_for_op(&interp.escape_scoped(target))
-                    .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                    .map_err(CommittedValueError::JavaScript)?;
                 if parent.is_null() || parent.is_undefined() {
                     return interp.ordinary_set_on_receiver(
                         stack,

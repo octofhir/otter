@@ -351,7 +351,7 @@ impl Interpreter {
                     self.ordinary_get_prototype_value(stack, context, value0, 0)?
                 } else {
                     self.get_prototype_for_op(&value0)
-                        .map_err(|error| CommittedValueError::JavaScript(error.into()))?
+                        .map_err(CommittedValueError::JavaScript)?
                 }
             }
             ObjectProtocolValueOp::SetPrototype => {
@@ -449,7 +449,7 @@ impl Interpreter {
                     return Err(CommittedValueError::JavaScript(VmError::TypeMismatch));
                 }
                 self.box_sloppy_this_primitive_runtime_rooted(value0, &[])
-                    .map_err(|error| CommittedValueError::JavaScript(error.into()))?
+                    .map_err(CommittedValueError::JavaScript)?
             }
             ScalarValueOp::ToPropertyKey => {
                 self.coerce_property_key_value(stack, context, value0)?
@@ -465,7 +465,7 @@ impl Interpreter {
             }
             ScalarValueOp::IsArray => {
                 let mut is_array = abstract_ops::is_array(&self.gc_heap, &value0)
-                    .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                    .map_err(CommittedValueError::JavaScript)?;
                 if !is_array
                     && let Some(object) = value0.as_object()
                     && self
@@ -481,7 +481,7 @@ impl Interpreter {
                 let array = value0
                     .as_array()
                     .ok_or(VmError::TypeMismatch)
-                    .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                    .map_err(CommittedValueError::JavaScript)?;
                 Value::number(NumberValue::from_f64(
                     crate::array::len(array, &self.gc_heap) as f64,
                 ))
@@ -490,7 +490,7 @@ impl Interpreter {
                 let string = value0
                     .as_string(&self.gc_heap)
                     .ok_or(VmError::TypeMismatch)
-                    .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                    .map_err(CommittedValueError::JavaScript)?;
                 Value::number_u32(string.len())
             }
         };

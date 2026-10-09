@@ -15,6 +15,10 @@ use dynasmrt::{DynasmApi, DynasmLabelApi, dynasm};
 use otter_vm::value::tag;
 
 #[cfg(target_arch = "aarch64")]
+// dynasm 5 normalizes dynamic register operands through `Into<u8>`; the
+// register ids here are already `u8`, so the macro-generated conversion is
+// intentionally redundant.
+#[allow(clippy::useless_conversion)]
 fn classifier(value: u8) -> crate::CompiledCode {
     let mut ops = dynasmrt::aarch64::Assembler::new().unwrap();
     let entry = ops.offset();

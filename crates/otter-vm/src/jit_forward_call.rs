@@ -36,7 +36,7 @@ impl Interpreter {
         let function = context
             .exec_function(function_id)
             .ok_or(VmError::InvalidOperand)
-            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+            .map_err(CommittedValueError::Fatal)?;
         self.record_call_attempt_feedback(function, call_pc);
         self.record_jit_runtime_stub_class(crate::native_abi::RuntimeStubClass::Reentrant);
         let intrinsic = crate::method_ops::is_function_prototype_intrinsic_value(
@@ -60,13 +60,13 @@ impl Interpreter {
                     let count = self
                         .elided_forward_argument_count(source)
                         .ok_or(VmError::InvalidOperand)
-                        .map_err(|error| CommittedValueError::Fatal(error.into()))?
+                        .map_err(CommittedValueError::Fatal)?
                         as usize;
                     let mut arguments = SmallVec::<[Value; 8]>::with_capacity(count);
                     for index in 0..count {
                         let value = source
                             .incoming_argument(index)
-                            .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                            .map_err(CommittedValueError::JavaScript)?;
                         arguments.push(value);
                     }
                     let register_words = function
@@ -92,10 +92,10 @@ impl Interpreter {
                                     .iteration_anchor(context_word)
                                     .as_context()
                                     .ok_or(VmError::InvalidOperand)
-                                    .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                                    .map_err(CommittedValueError::Fatal)?;
                                 crate::context::read_slot(&self.gc_heap, context, slot)
                                     .ok_or(VmError::InvalidOperand)
-                                    .map_err(|error| CommittedValueError::Fatal(error.into()))?
+                                    .map_err(CommittedValueError::Fatal)?
                             }
                         };
                         if let Some(slot) = arguments.get_mut(usize::from(index)) {
@@ -117,7 +117,7 @@ impl Interpreter {
                             && frame.registers.as_ptr() == source.register_base_ptr()
                     })
                     .ok_or(VmError::InvalidOperand)
-                    .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                    .map_err(CommittedValueError::Fatal)?;
                 // Publish current SSA aliases before observable arguments creation.
                 // Every write ends before allocation; the canonical window roots
                 // the live context and register bindings through moving collection.
@@ -128,7 +128,7 @@ impl Interpreter {
                             .registers
                             .get_mut(usize::from(reg))
                             .ok_or(VmError::InvalidOperand)
-                            .map_err(|error| CommittedValueError::Fatal(error.into()))? =
+                            .map_err(CommittedValueError::Fatal)? =
                             self.iteration_anchor(word);
                         word += 1;
                     }
@@ -138,12 +138,12 @@ impl Interpreter {
                         .registers
                         .get_mut(usize::from(register))
                         .ok_or(VmError::InvalidOperand)
-                        .map_err(|error| CommittedValueError::Fatal(error.into()))? =
+                        .map_err(CommittedValueError::Fatal)? =
                         self.iteration_anchor(word);
                 }
                 let object = self
                     .materialize_frame_arguments_object(context, stack, index)
-                    .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                    .map_err(CommittedValueError::JavaScript)?;
                 (
                     self.iteration_anchor(base),
                     self.iteration_anchor(base + 1),

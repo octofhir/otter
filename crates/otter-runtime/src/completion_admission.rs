@@ -114,7 +114,7 @@ impl CompletionAdmissionPool {
         let origin_permit = self.acquire_origin(origin)?;
         let mut leases = self
             .resources
-            .reserve_exact_many(&[(ResourceClass::QueuedTasks, 1), (origin_class, 1)])?;
+            .reserve_exact_many([(ResourceClass::QueuedTasks, 1), (origin_class, 1)])?;
         let queued_task = leases
             .take(ResourceClass::QueuedTasks)
             .expect("non-zero queued-task admission owns a lease");

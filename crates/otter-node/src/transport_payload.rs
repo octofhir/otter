@@ -60,11 +60,11 @@ impl TransportPayloadBudget {
         ];
         let binding = self
             .binding
-            .reserve_exact_many(&requests)
+            .reserve_exact_many(requests)
             .map_err(TransportPayloadError::BindingBudget)?;
         let runtime = self
             .runtime
-            .reserve_exact_many(&requests)
+            .reserve_exact_many(requests)
             .map_err(TransportPayloadError::RuntimeBudget)?;
 
         let mut owned = Vec::new();

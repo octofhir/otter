@@ -115,7 +115,7 @@ impl Interpreter {
             // continues at the next instruction.
             stack[top_idx]
                 .advance_pc()
-                .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                .map_err(CommittedValueError::Fatal)?;
             // The continuation belongs to the context that awaited, so capture it
             // before the frame parks.
             let async_context = vm.scoped_value(scope, vm.async_context());
@@ -189,7 +189,7 @@ impl Interpreter {
             let top_idx = stack.len() - 1;
             stack[top_idx]
                 .advance_pc()
-                .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                .map_err(CommittedValueError::Fatal)?;
             // The continuation belongs to the context that awaited, so capture it
             // before the frame parks.
             let async_context = vm.scoped_value(scope, vm.async_context());
@@ -240,7 +240,7 @@ impl Interpreter {
                 .escape_scoped(owner_root)
                 .as_generator()
                 .ok_or(VmError::InvalidOperand)
-                .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                .map_err(CommittedValueError::Fatal)?;
             let async_context = vm.escape_scoped(async_context);
             let outcome = promise.perform_async_resume_then(
                 &mut vm.gc_heap,
@@ -259,7 +259,7 @@ impl Interpreter {
             vm.escape_scoped(owner_root)
                 .as_generator()
                 .ok_or(VmError::InvalidOperand)
-                .map_err(|error| CommittedValueError::Fatal(error.into()))?
+                .map_err(CommittedValueError::Fatal)?
                 .set_async_state(
                     &mut vm.gc_heap,
                     crate::generator::AsyncGeneratorState::Awaiting,

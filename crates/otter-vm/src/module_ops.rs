@@ -1286,7 +1286,7 @@ impl Interpreter {
                             val,
                             crate::object::PropertyFlags::new(true, true, false),
                         )
-                        .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                        .map_err(CommittedValueError::JavaScript)?;
                 }
                 let namespace_obj = interp
                     .escape_scoped(namespace)
@@ -1487,13 +1487,13 @@ impl Interpreter {
         operands: impl crate::executable::OperandSource,
     ) -> Result<(), CommittedValueError> {
         let dst = register_operand(operands.first())
-            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+            .map_err(CommittedValueError::Fatal)?;
         let spec_reg = register_operand(operands.get(1))
-            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+            .map_err(CommittedValueError::Fatal)?;
         let options_reg = register_operand(operands.get(2))
-            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+            .map_err(CommittedValueError::Fatal)?;
         let spec_value = *read_register(&stack[top_idx], spec_reg)
-            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+            .map_err(CommittedValueError::Fatal)?;
         // §13.3.10 step 1 / GetActiveScriptOrModule — eval-compiled chunks
         // carry no module URL of their own, so walk the live activations
         // down to the nearest frame whose owning chunk supplies one.
@@ -1523,7 +1523,7 @@ impl Interpreter {
                 // Re-read the options register after specifier coercion: the
                 // coercion can collect, and registers are the traced home.
                 let options_value = *read_register(&stack[top_idx], options_reg)
-                    .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                    .map_err(CommittedValueError::Fatal)?;
                 let attr_type =
                     match self.evaluate_import_call_options(stack, context, &options_value)? {
                         Ok(attr_type) => attr_type,
@@ -1535,10 +1535,10 @@ impl Interpreter {
                             .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
                             let frame = &mut stack[top_idx];
                             write_register(frame, dst, Value::promise(promise))
-                                .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                                .map_err(CommittedValueError::Fatal)?;
                             frame
                                 .advance_pc()
-                                .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                                .map_err(CommittedValueError::Fatal)?;
                             return Ok(());
                         }
                     };
@@ -1567,13 +1567,13 @@ impl Interpreter {
                             referrer.clone(),
                             specifier.clone(),
                         )
-                        .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                        .map_err(CommittedValueError::JavaScript)?;
                         let frame = &mut stack[top_idx];
                         write_register(frame, dst, Value::promise(pending))
-                            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                            .map_err(CommittedValueError::Fatal)?;
                         frame
                             .advance_pc()
-                            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                            .map_err(CommittedValueError::Fatal)?;
                         return Ok(());
                     }
                     match self
@@ -1597,7 +1597,7 @@ impl Interpreter {
                                 gate,
                                 std::sync::Arc::from(target.as_str()),
                             )
-                            .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                            .map_err(CommittedValueError::JavaScript)?;
                             pending
                         }
                         Ok(None) => {
@@ -1608,7 +1608,7 @@ impl Interpreter {
                                         format!("import \"{specifier}\"").into(),
                                     )
                                 })
-                                .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                                .map_err(CommittedValueError::JavaScript)?;
                             let namespace_value = Value::object(ns);
                             promise_dispatch::PromiseBuilder::with_context(Some(
                                 import_context.clone(),
@@ -1698,10 +1698,10 @@ impl Interpreter {
             }
         };
         write_register(&mut stack[top_idx], dst, Value::promise(promise))
-            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+            .map_err(CommittedValueError::Fatal)?;
         stack[top_idx]
             .advance_pc()
-            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+            .map_err(CommittedValueError::Fatal)?;
         Ok(())
     }
 }

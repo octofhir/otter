@@ -128,7 +128,7 @@ pub(crate) fn to_string_or_throw(
         interp.evaluate_to_primitive(stack, context, input, ToPrimitiveHint::String)?
     };
     primitive_to_string_lossy(interp, &primitive)
-        .map_err(|error| CommittedValueError::JavaScript(error.into()))
+        .map_err(CommittedValueError::JavaScript)
 }
 
 /// §7.1.17 `ToString` restricted to primitive operands — the re-entry-free
@@ -193,7 +193,7 @@ pub(crate) fn to_js_string_units(
         return Ok(s.with_utf16(&interp.gc_heap, <[u16]>::to_vec));
     }
     let rendered = primitive_to_string_lossy(interp, &primitive)
-        .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+        .map_err(CommittedValueError::JavaScript)?;
     Ok(rendered.encode_utf16().collect())
 }
 
@@ -252,7 +252,7 @@ pub(crate) fn to_number_or_throw(
         interp.evaluate_to_primitive(stack, context, input, ToPrimitiveHint::Number)?
     };
     primitive_to_number(interp, &primitive)
-        .map_err(|error| CommittedValueError::JavaScript(error.into()))
+        .map_err(CommittedValueError::JavaScript)
 }
 
 /// §7.1.3 `ToNumeric(value)`: a Number or BigInt value. Objects flow
@@ -276,7 +276,7 @@ pub(crate) fn to_numeric_or_throw(
     }
     primitive_to_number(interp, &primitive)
         .map(Value::number)
-        .map_err(|error| CommittedValueError::JavaScript(error.into()))
+        .map_err(CommittedValueError::JavaScript)
 }
 
 /// §7.1.4 `ToNumber` restricted to primitive operands — the
@@ -389,7 +389,7 @@ pub(crate) fn to_big_int_or_throw(
     if let Some(b) = primitive.as_boolean() {
         return BigIntValue::from_i32(&mut interp.gc_heap, if b { 1 } else { 0 })
             .map_err(crate::oom_to_vm)
-            .map_err(|error| CommittedValueError::JavaScript(error.into()));
+            .map_err(CommittedValueError::JavaScript);
     }
     if let Some(s) = primitive.as_string(&interp.gc_heap) {
         let text = s.to_lossy_string(&interp.gc_heap);
@@ -397,10 +397,10 @@ pub(crate) fn to_big_int_or_throw(
             .ok_or_else(|| {
                 interp.err_syntax((format!("Cannot convert {text:?} to a BigInt")).into())
             })
-            .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+            .map_err(CommittedValueError::JavaScript)?;
         return BigIntValue::from_num(&mut interp.gc_heap, &parsed)
             .map_err(crate::oom_to_vm)
-            .map_err(|error| CommittedValueError::JavaScript(error.into()));
+            .map_err(CommittedValueError::JavaScript);
     }
     if primitive.is_number() {
         return Err(CommittedValueError::JavaScript(interp.err_type(

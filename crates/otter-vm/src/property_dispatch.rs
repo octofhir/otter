@@ -88,7 +88,7 @@ impl Interpreter {
                     strict,
                     format!("Cannot assign to accessor property '{key}' without a setter"),
                 )
-                .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                .map_err(CommittedValueError::JavaScript)?;
             }
         }
         Ok(true)
@@ -474,7 +474,7 @@ impl Interpreter {
         strict: bool,
     ) -> Result<(), CommittedValueError> {
         let mut idx = *read_register(&stack[top_idx], idx_reg)
-            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+            .map_err(CommittedValueError::Fatal)?;
         if idx.as_symbol(&self.gc_heap).is_none()
             && idx.as_string(&self.gc_heap).is_none()
             && idx.as_number().is_none()
@@ -496,7 +496,7 @@ impl Interpreter {
             };
         }
         let receiver = *read_register(&stack[top_idx], obj_reg)
-            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+            .map_err(CommittedValueError::Fatal)?;
         let frame = &mut stack[top_idx];
         let removed = if let Some(obj) = receiver.as_object() {
             // §10.4.6.10 [[Delete]] — a Module Namespace Exotic Object
@@ -742,10 +742,10 @@ impl Interpreter {
             ));
         }
         write_register(frame, dst, Value::boolean(removed))
-            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+            .map_err(CommittedValueError::Fatal)?;
         frame
             .advance_pc()
-            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+            .map_err(CommittedValueError::Fatal)?;
         Ok(())
     }
 
@@ -777,7 +777,7 @@ impl Interpreter {
             }
             let base = interp
                 .get_prototype_for_op(&home)
-                .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                .map_err(CommittedValueError::JavaScript)?;
             if base.is_null() || base.is_undefined() {
                 return Err(CommittedValueError::JavaScript(interp.err_type(
                     ("cannot read property of null or undefined super reference".to_string()).into(),
@@ -814,10 +814,10 @@ impl Interpreter {
                         .map_err(CommittedValueError::completed_call)?,
                 };
             write_register(&mut stack[top_idx], dst, value)
-                .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                .map_err(CommittedValueError::Fatal)?;
             stack[top_idx]
                 .advance_pc()
-                .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                .map_err(CommittedValueError::Fatal)?;
             Ok(())
 
         })
@@ -886,7 +886,7 @@ impl Interpreter {
                                 strict,
                                 "Cannot assign to read-only symbol property".to_string(),
                             )
-                            .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                            .map_err(CommittedValueError::JavaScript)?;
                         }
                         object::SetOutcome::AssignData
                         | object::SetOutcome::ExoticParent { .. } => {
@@ -912,13 +912,13 @@ impl Interpreter {
                                     strict,
                                     "Cannot assign to read-only symbol property".to_string(),
                                 )
-                                .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                                .map_err(CommittedValueError::JavaScript)?;
                             }
                         }
                     }
                     stack[top_idx]
                         .advance_pc()
-                        .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                        .map_err(CommittedValueError::Fatal)?;
                     return Ok(());
                 } else if let Some(s) = coerced.as_string(&self.gc_heap) {
                     s.to_key_spelling(&self.gc_heap)
@@ -952,7 +952,7 @@ impl Interpreter {
                     strict,
                     format!("Cannot assign to read-only property '{key}'"),
                 )
-                .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                .map_err(CommittedValueError::JavaScript)?;
             }
             object::SetOutcome::ExoticParent { parent } => {
                 if !self.ordinary_set_data_value(
@@ -965,7 +965,7 @@ impl Interpreter {
                     1,
                 )? {
                     self.failed_set_result(strict, format!("Cannot assign to property '{key}'"))
-                        .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                        .map_err(CommittedValueError::JavaScript)?;
                 }
             }
             object::SetOutcome::AssignData => {
@@ -995,13 +995,13 @@ impl Interpreter {
                     }
                     if !self
                         .ordinary_set_data_property(this_obj, &key, value)
-                        .map_err(|error| CommittedValueError::JavaScript(error.into()))?
+                        .map_err(CommittedValueError::JavaScript)?
                     {
                         self.failed_set_result(
                             strict,
                             format!("Cannot assign to read-only property '{key}'"),
                         )
-                        .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                        .map_err(CommittedValueError::JavaScript)?;
                     }
                 } else if let Some(c) = actual_this.as_class_constructor() {
                     // Static elements run with `this` = the class
@@ -1010,13 +1010,13 @@ impl Interpreter {
                     let statics = c.statics(&self.gc_heap);
                     if !self
                         .ordinary_set_data_property(statics, &key, value)
-                        .map_err(|error| CommittedValueError::JavaScript(error.into()))?
+                        .map_err(CommittedValueError::JavaScript)?
                     {
                         self.failed_set_result(
                             strict,
                             format!("Cannot assign to read-only property '{key}'"),
                         )
-                        .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                        .map_err(CommittedValueError::JavaScript)?;
                     }
                 } else {
                     return Err(CommittedValueError::JavaScript(VmError::TypeMismatch));
@@ -1025,7 +1025,7 @@ impl Interpreter {
         }
         stack[top_idx]
             .advance_pc()
-            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+            .map_err(CommittedValueError::Fatal)?;
         Ok(())
     }
 
@@ -1069,7 +1069,7 @@ impl Interpreter {
             object::SetOutcome::AssignData => {
                 if self
                     .ordinary_set_data_property(obj, key, value)
-                    .map_err(|error| CommittedValueError::JavaScript(error.into()))?
+                    .map_err(CommittedValueError::JavaScript)?
                 {
                     Ok(())
                 } else {
@@ -1079,7 +1079,7 @@ impl Interpreter {
                         format!("Cannot assign to read-only property '{key}'"),
                     );
                     self.failed_set_result(strict, message)
-                        .map_err(|error| CommittedValueError::JavaScript(error.into()))
+                        .map_err(CommittedValueError::JavaScript)
                 }
             }
             object::SetOutcome::InvokeSetter { setter } => {
@@ -1102,7 +1102,7 @@ impl Interpreter {
                     format!("Cannot assign to property '{key}'"),
                 );
                 self.failed_set_result(strict, message)
-                    .map_err(|error| CommittedValueError::JavaScript(error.into()))
+                    .map_err(CommittedValueError::JavaScript)
             }
             object::SetOutcome::ExoticParent { parent } => {
                 if !self.ordinary_set_data_value(
@@ -1115,7 +1115,7 @@ impl Interpreter {
                     1,
                 )? {
                     self.failed_set_result(strict, format!("Cannot assign to property '{key}'"))
-                        .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                        .map_err(CommittedValueError::JavaScript)?;
                 }
                 Ok(())
             }
@@ -1145,7 +1145,7 @@ impl Interpreter {
                 .map_err(|error| CommittedValueError::JavaScript(error.into()))?
                 {
                     self.failed_set_result(strict, "Cannot assign to symbol property")
-                        .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                        .map_err(CommittedValueError::JavaScript)?;
                 }
                 Ok(())
             }
@@ -1164,7 +1164,7 @@ impl Interpreter {
             }
             object::SetOutcome::Reject { .. } => self
                 .failed_set_result(strict, "Cannot assign to symbol property")
-                .map_err(|error| CommittedValueError::JavaScript(error.into())),
+                .map_err(CommittedValueError::JavaScript),
             object::SetOutcome::ExoticParent { parent } => {
                 if !self.ordinary_set_data_value(
                     stack,
@@ -1176,7 +1176,7 @@ impl Interpreter {
                     1,
                 )? {
                     self.failed_set_result(strict, "Cannot assign to symbol property")
-                        .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                        .map_err(CommittedValueError::JavaScript)?;
                 }
                 Ok(())
             }
@@ -1223,7 +1223,7 @@ impl Interpreter {
                 Some(proto) => proto,
                 None => interp
                     .constructor_prototype_value(proto_name)
-                    .map_err(|error| CommittedValueError::Fatal(error.into()))?,
+                    .map_err(CommittedValueError::Fatal)?,
             };
             // The prototype may be any object: an Array, a function or a
             // proxy answers through its own `[[Get]]`.

@@ -933,7 +933,6 @@ impl FeedbackVector {
     }
 
     /// Allocate dense cells plus bytecode-kind-selected out-of-line payloads.
-    #[must_use]
     pub(crate) fn for_instruction_ops<I>(
         ops: I,
         lease: &mut otter_resource::ResourceLease,

@@ -281,6 +281,10 @@ impl RelocationCapture {
     /// word, when the pool is enabled; `false` leaves the load to the
     /// caller.
     #[cfg(not(target_arch = "x86_64"))]
+    // dynasm 5 normalizes dynamic register operands through `Into<u8>`; the
+    // register ids here are already `u8`, so the macro-generated conversion is
+    // intentionally redundant.
+    #[allow(clippy::useless_conversion)]
     pub(crate) fn emit_literal_load(
         &mut self,
         ops: &mut dynasmrt::aarch64::Assembler,

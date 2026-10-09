@@ -148,7 +148,7 @@ impl Interpreter {
             let owner = context
                 .for_function(function_id)
                 .map_err(|_| VmError::InvalidOperand)
-                .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                .map_err(CommittedValueError::Fatal)?;
             let closure = self
                 .iteration_anchor(callee_anchor)
                 .as_closure(&self.gc_heap);
@@ -158,7 +158,7 @@ impl Interpreter {
                 .iteration_anchor(generator_anchor)
                 .as_generator()
                 .ok_or(VmError::InvalidOperand)
-                .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                .map_err(CommittedValueError::Fatal)?;
             generator.set_prototype_override(
                 &mut self.gc_heap,
                 proto.as_object().is_some().then_some(proto),
@@ -458,14 +458,13 @@ impl Interpreter {
         anchor: u64,
         record: Option<&crate::native_abi::SafepointRecord>,
     ) -> u32 {
-        if anchor != 0 || frame.header.kind == native_abi::NativeFrameKind::Optimizing {
-            if let Some(pc) = record
+        if (anchor != 0 || frame.header.kind == native_abi::NativeFrameKind::Optimizing)
+            && let Some(pc) = record
                 .map(|record| record.call_pc)
                 .filter(|pc| *pc != native_abi::NO_CALL_PC)
             {
                 return pc;
             }
-        }
         frame.header.pc
     }
 

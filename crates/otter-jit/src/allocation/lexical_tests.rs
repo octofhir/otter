@@ -96,6 +96,10 @@ fn fixture_view() -> JitCompileSnapshot {
     view
 }
 
+// dynasm 5 normalizes dynamic register operands through `Into<u8>`; the
+// register ids here are already `u8`, so the macro-generated conversion is
+// intentionally redundant.
+#[allow(clippy::useless_conversion)]
 fn execute(view: &JitCompileSnapshot, case: Construction, regs: LabRegisters, fits: bool) {
     let case_label = format!("{case:?}, {regs:?}, fit={fits}");
     let layout = view.context_layout;

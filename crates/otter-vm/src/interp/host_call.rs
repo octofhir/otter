@@ -354,7 +354,7 @@ pub(crate) extern "C" fn host_call_entry(ctx: *mut JitCtx) -> NativeResultPair {
     with_turn(ctx, |turn, ctx| {
         let kind = HostCallKind::from_code(turn.frame().header.function_id)
             .ok_or(VmError::InvalidOperand)
-            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+            .map_err(CommittedValueError::Fatal)?;
         match kind {
             HostCallKind::Native => {
                 let native = turn
@@ -362,7 +362,7 @@ pub(crate) extern "C" fn host_call_entry(ctx: *mut JitCtx) -> NativeResultPair {
                     .self_value
                     .as_native_function()
                     .ok_or(VmError::InvalidOperand)
-                    .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                    .map_err(CommittedValueError::Fatal)?;
                 if turn.is_construct() {
                     native_construct(turn, ctx, native)
                 } else {
@@ -432,7 +432,7 @@ fn native_call(
         let context = caller
             .get(turn.vm)
             .ok_or(VmError::InvalidOperand)
-            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+            .map_err(CommittedValueError::Fatal)?;
         let (vm, stack) = (&mut *turn.vm, &mut *turn.stack);
         let invoke = |vm: &mut Interpreter| {
             let result = vm.run_vm_intrinsic_sync_rooted(stack, context, intrinsic, receiver, args);
@@ -450,7 +450,7 @@ fn native_call(
     }
     turn.vm
         .record_runtime_native_call()
-        .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+        .map_err(CommittedValueError::Fatal)?;
     let realm_global = turn.vm.native_target_realm_global(&native);
     let receiver = turn.frame().this_value;
     let args = turn.frame_actuals();
@@ -502,7 +502,7 @@ fn native_construct_with(
     let context = turn
         .context
         .ok_or(VmError::InvalidOperand)
-        .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+        .map_err(CommittedValueError::Fatal)?;
     turn.vm
         .record_runtime_construct_call()
         .map_err(CommittedValueError::Fatal)?;
@@ -533,18 +533,18 @@ fn native_construct_with(
         None if date_default => turn
             .vm
             .constructor_prototype_value("Date")
-            .map_err(|error| CommittedValueError::Fatal(error.into()))?,
+            .map_err(CommittedValueError::Fatal)?,
         None => turn
             .vm
             .constructor_prototype_value("Object")
-            .map_err(|error| CommittedValueError::Fatal(error.into()))?,
+            .map_err(CommittedValueError::Fatal)?,
     };
     // The frame's receiver slot roots the prototype across the allocation.
     turn.frame_mut().this_value = proto;
     let mut receiver = turn
         .vm
         .alloc_stack_rooted_object_with_extra_roots(turn.stack, &[])
-        .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+        .map_err(CommittedValueError::JavaScript)?;
     let proto = turn.frame().this_value;
     if !crate::object::set_prototype_value(&mut receiver, &mut turn.vm.gc_heap, Some(proto))
         .map_err(|error| CommittedValueError::JavaScript(error.into()))?
@@ -565,7 +565,7 @@ fn native_construct_with(
             })
         })
         .ok_or(VmError::InvalidOperand)
-        .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+        .map_err(CommittedValueError::Fatal)?;
     let args = turn.actuals();
     invoke_native_construct(
         turn,
@@ -677,13 +677,13 @@ fn proxy_entry(turn: &mut HostTurn<'_>, ctx: &mut JitCtx) -> Result<HostStep, Co
         .self_value
         .as_proxy()
         .ok_or(VmError::InvalidOperand)
-        .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+        .map_err(CommittedValueError::Fatal)?;
     let admitted = if construct {
         crate::abstract_ops::is_constructor(
             &turn.frame().self_value,
             context
                 .ok_or(VmError::InvalidOperand)
-                .map_err(|error| CommittedValueError::Fatal(error.into()))?,
+                .map_err(CommittedValueError::Fatal)?,
             &turn.vm.gc_heap,
         )
     } else {
@@ -766,7 +766,7 @@ fn proxy_entry(turn: &mut HostTurn<'_>, ctx: &mut JitCtx) -> Result<HostStep, Co
     let argv = turn
         .vm
         .alloc_stack_rooted_array_from_values(turn.stack, args.iter().copied(), &[], &args)
-        .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+        .map_err(CommittedValueError::JavaScript)?;
     let trap = turn.frame().this_value;
     let receiver = turn.register(TRAP_ARGUMENTS_REGISTER + 1);
     turn.frame_mut().this_value = receiver;
@@ -811,11 +811,11 @@ pub extern "C" fn prepare_activation(ctx: *mut JitCtx) -> NativeResultPair {
         let owner = turn
             .vm
             .function_context(turn.context, function_id)
-            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+            .map_err(CommittedValueError::Fatal)?;
         if turn.is_construct() {
             turn.vm
                 .record_runtime_construct_call()
-                .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                .map_err(CommittedValueError::Fatal)?;
             let callee = turn.frame().self_value;
             let new_target = turn.frame().new_target_value;
             let receiver = turn.vm.jit_prepare_base_construct_receiver(
@@ -833,12 +833,12 @@ pub extern "C" fn prepare_activation(ctx: *mut JitCtx) -> NativeResultPair {
         let function = owner
             .exec_function(function_id)
             .ok_or(VmError::InvalidOperand)
-            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+            .map_err(CommittedValueError::Fatal)?;
         let receiver = turn.frame().this_value;
         let receiver = turn
             .vm
             .this_for_bytecode_call_stack_rooted(function, turn.stack, receiver, &[])
-            .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+            .map_err(CommittedValueError::JavaScript)?;
         turn.frame_mut().this_value = receiver;
         Ok(HostStep::Complete(NativeResultPair::success(
             Value::UNDEFINED,

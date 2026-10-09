@@ -156,8 +156,8 @@ impl Interpreter {
             .and_then(|value| value.as_number())
             .map(|number| number.as_f64())
             .unwrap_or(0.0);
-        if new_len > current {
-            if !object::ordinary_set_data_property(
+        if new_len > current
+            && !object::ordinary_set_data_property(
                 &mut obj,
                 &mut self.gc_heap,
                 "length",
@@ -165,7 +165,6 @@ impl Interpreter {
             )? {
                 return Err(VmError::TypeMismatch);
             }
-        }
         Ok(())
     }
 

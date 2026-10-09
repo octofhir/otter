@@ -57,9 +57,9 @@ impl Interpreter {
                 let key = context
                     .property_atom_for_function(stack[frame_index].function_id, name_idx)
                     .ok_or(VmError::InvalidOperand)
-                    .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                    .map_err(CommittedValueError::Fatal)?;
                 let receiver = *read_register(&stack[frame_index], obj_reg)
-                    .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                    .map_err(CommittedValueError::Fatal)?;
                 if receiver.as_object().is_some_and(|o| {
                     crate::object::deferred_namespace_target(o, &self.gc_heap).is_some()
                 }) {
@@ -84,19 +84,19 @@ impl Interpreter {
                         key,
                         strict,
                     )
-                    .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                    .map_err(CommittedValueError::JavaScript)?;
                 }
             }
             value if value == Op::DeleteElement as u8 => {
                 let obj_reg = arg1 as u16;
                 let idx_reg = arg2 as u16;
                 let receiver = *read_register(&stack[frame_index], obj_reg)
-                    .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                    .map_err(CommittedValueError::Fatal)?;
                 if receiver.as_object().is_some_and(|o| {
                     crate::object::deferred_namespace_target(o, &self.gc_heap).is_some()
                 }) {
                     let key_val = *read_register(&stack[frame_index], idx_reg)
-                        .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                        .map_err(CommittedValueError::Fatal)?;
                     let symbol_like = key_val.as_symbol(&self.gc_heap).is_some()
                         || key_val
                             .as_string(&self.gc_heap)

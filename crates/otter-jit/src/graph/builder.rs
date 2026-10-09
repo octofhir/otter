@@ -1406,10 +1406,9 @@ impl<'a> Builder<'a> {
             false
         } else if let Some(boolean) = constant.as_boolean() {
             boolean
-        } else if let Some(number) = constant.as_f64() {
-            number != 0.0 && !number.is_nan()
         } else {
-            return None;
+            let number = constant.as_f64()?;
+            number != 0.0 && !number.is_nan()
         };
         match op {
             Op::JumpIfTrue => Some(truthy),

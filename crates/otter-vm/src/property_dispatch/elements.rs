@@ -48,15 +48,15 @@ impl Interpreter {
         idx_reg: u16,
     ) -> Result<(), CommittedValueError> {
         let receiver = *read_register(&stack[top_idx], recv_reg)
-            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+            .map_err(CommittedValueError::Fatal)?;
         let key = *read_register(&stack[top_idx], idx_reg)
-            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+            .map_err(CommittedValueError::Fatal)?;
         let value = self.load_element_values(stack, context, receiver, key)?;
         write_register(&mut stack[top_idx], dst, value)
-            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+            .map_err(CommittedValueError::Fatal)?;
         stack[top_idx]
             .advance_pc()
-            .map_err(|error| CommittedValueError::Fatal(error.into()))
+            .map_err(CommittedValueError::Fatal)
     }
 
     /// Ordinary `[[Get]]` of a string key answered from data properties
@@ -244,7 +244,7 @@ impl Interpreter {
                         None => {
                             let proto = self
                                 .constructor_prototype_value("Array")
-                                .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                                .map_err(CommittedValueError::Fatal)?;
                             if let Some(p) = proto.as_object() {
                                 crate::object::get_symbol(p, &self.gc_heap, sym)
                                     .unwrap_or(Value::undefined())
@@ -431,7 +431,7 @@ impl Interpreter {
                         Some(idx) => t
                             .get(&mut self.gc_heap, idx)
                             .map_err(crate::oom_to_vm)
-                            .map_err(|error| CommittedValueError::JavaScript(error.into()))?,
+                            .map_err(CommittedValueError::JavaScript)?,
                         None => Value::undefined(),
                     }
                 } else {
@@ -478,7 +478,7 @@ impl Interpreter {
                         None => t
                             .get(&mut self.gc_heap, idx)
                             .map_err(crate::oom_to_vm)
-                            .map_err(|error| CommittedValueError::JavaScript(error.into()))?,
+                            .map_err(CommittedValueError::JavaScript)?,
                     },
                     None => Value::undefined(),
                 }
@@ -512,7 +512,7 @@ impl Interpreter {
                 let key = VmPropertyKey::Symbol(sym);
                 let proto = self
                     .constructor_prototype_value("String")
-                    .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                    .map_err(CommittedValueError::Fatal)?;
                 if proto.is_nullish() {
                     Value::undefined()
                 } else {
@@ -581,7 +581,7 @@ impl Interpreter {
             };
             let proto = self
                 .constructor_prototype_value(ctor_name)
-                .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                .map_err(CommittedValueError::Fatal)?;
             if proto.is_nullish() {
                 Value::undefined()
             } else {
@@ -644,6 +644,6 @@ impl Interpreter {
             )?)
         };
         binary::dispatch::coerce_element_for_store(&mut self.gc_heap, kind, &converted)
-            .map_err(|error| CommittedValueError::JavaScript(error.into()))
+            .map_err(CommittedValueError::JavaScript)
     }
 }

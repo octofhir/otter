@@ -712,6 +712,46 @@ pub const NATIVE_FRAME_ARGUMENTS_OBJECT_OFFSET: u32 =
     std::mem::offset_of!(Frame, arguments_object) as u32;
 const _: [(); 60] = [(); std::mem::offset_of!(Frame, arguments_object)];
 
+/// Byte offset of the sole traced construction layout ticket.
+pub const NATIVE_FRAME_CONSTRUCT_LAYOUT_OFFSET: u32 =
+    std::mem::offset_of!(Frame, construct_layout) as u32;
+/// Byte offset of the original allocated construction receiver root.
+pub const NATIVE_FRAME_CONSTRUCT_RECEIVER_OFFSET: u32 =
+    std::mem::offset_of!(Frame, construct_receiver) as u32;
+
+/// Private compiled-engine offset of the own DerivedThis context identity root.
+pub const NATIVE_FRAME_DERIVED_THIS_CONTEXT_OFFSET: u32 =
+    std::mem::offset_of!(Frame, derived_this_context) as u32;
+const _: [(); 108] = [(); std::mem::offset_of!(Frame, derived_this_context)];
+
+/// Private offset of the synchronous Super source; never a collector root.
+#[doc(hidden)]
+pub const NATIVE_FRAME_SUPER_ORIGIN_OFFSET: u32 = std::mem::offset_of!(Frame, super_origin) as u32;
+const _: [(); 120] = [(); std::mem::offset_of!(Frame, super_origin)];
+
+/// [`Frame::caller_return_pc`] of a record whose caller is not suspended at
+/// a generated call site.
+pub const NO_CALLER_RETURN_PC: u64 = 1;
+
+/// Record bytes reserved by a generated call entry: the record rounded up to
+/// the 16-byte stack alignment.
+pub const FRAME_RECORD_BYTES: usize = std::mem::size_of::<Frame>().next_multiple_of(16);
+
+/// Bytes between a directly entered generated record and its machine frame
+/// pointer, so `[record + FRAME_RECORD_SLOT + 8]` is its return address. On
+/// AArch64 the record sits immediately below the saved frame-pointer/link
+/// pair; on x86-64 below the fixed 48-byte save area under `rbp`.
+#[cfg(not(target_arch = "x86_64"))]
+pub const FRAME_RECORD_SLOT: usize = FRAME_RECORD_BYTES;
+/// See the AArch64 definition.
+#[cfg(target_arch = "x86_64")]
+pub const FRAME_RECORD_SLOT: usize = FRAME_RECORD_BYTES + 48;
+
+/// Return-address word of [`Frame`].
+pub const NATIVE_FRAME_CALLER_RETURN_PC_OFFSET: u32 =
+    std::mem::offset_of!(Frame, caller_return_pc) as u32;
+const _: [(); 128] = [(); std::mem::offset_of!(Frame, caller_return_pc)];
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -812,43 +852,3 @@ mod tests {
         assert_eq!(NATIVE_FRAME_MACHINE_ROOTS_OFFSET, 88);
     }
 }
-
-/// Byte offset of the sole traced construction layout ticket.
-pub const NATIVE_FRAME_CONSTRUCT_LAYOUT_OFFSET: u32 =
-    std::mem::offset_of!(Frame, construct_layout) as u32;
-/// Byte offset of the original allocated construction receiver root.
-pub const NATIVE_FRAME_CONSTRUCT_RECEIVER_OFFSET: u32 =
-    std::mem::offset_of!(Frame, construct_receiver) as u32;
-
-/// Private compiled-engine offset of the own DerivedThis context identity root.
-pub const NATIVE_FRAME_DERIVED_THIS_CONTEXT_OFFSET: u32 =
-    std::mem::offset_of!(Frame, derived_this_context) as u32;
-const _: [(); 108] = [(); std::mem::offset_of!(Frame, derived_this_context)];
-
-/// Private offset of the synchronous Super source; never a collector root.
-#[doc(hidden)]
-pub const NATIVE_FRAME_SUPER_ORIGIN_OFFSET: u32 = std::mem::offset_of!(Frame, super_origin) as u32;
-const _: [(); 120] = [(); std::mem::offset_of!(Frame, super_origin)];
-
-/// [`Frame::caller_return_pc`] of a record whose caller is not suspended at
-/// a generated call site.
-pub const NO_CALLER_RETURN_PC: u64 = 1;
-
-/// Record bytes reserved by a generated call entry: the record rounded up to
-/// the 16-byte stack alignment.
-pub const FRAME_RECORD_BYTES: usize = std::mem::size_of::<Frame>().next_multiple_of(16);
-
-/// Bytes between a directly entered generated record and its machine frame
-/// pointer, so `[record + FRAME_RECORD_SLOT + 8]` is its return address. On
-/// AArch64 the record sits immediately below the saved frame-pointer/link
-/// pair; on x86-64 below the fixed 48-byte save area under `rbp`.
-#[cfg(not(target_arch = "x86_64"))]
-pub const FRAME_RECORD_SLOT: usize = FRAME_RECORD_BYTES;
-/// See the AArch64 definition.
-#[cfg(target_arch = "x86_64")]
-pub const FRAME_RECORD_SLOT: usize = FRAME_RECORD_BYTES + 48;
-
-/// Return-address word of [`Frame`].
-pub const NATIVE_FRAME_CALLER_RETURN_PC_OFFSET: u32 =
-    std::mem::offset_of!(Frame, caller_return_pc) as u32;
-const _: [(); 128] = [(); std::mem::offset_of!(Frame, caller_return_pc)];

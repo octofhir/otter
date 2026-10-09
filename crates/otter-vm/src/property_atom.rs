@@ -289,7 +289,6 @@ pub(crate) struct AtomTableBuilder {
 
 impl AtomTableBuilder {
     /// Build atom metadata from a bytecode constant pool.
-    #[must_use]
     pub(crate) fn from_constants(
         constants: &[Constant],
         lease: &mut otter_resource::ResourceLease,
@@ -339,7 +338,6 @@ pub(crate) struct AtomTable {
 
 impl AtomTable {
     /// Build and freeze an unresolved atom table from a bytecode constant pool.
-    #[must_use]
     pub(crate) fn from_constants(
         constants: &[Constant],
         lease: &mut otter_resource::ResourceLease,

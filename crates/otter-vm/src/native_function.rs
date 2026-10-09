@@ -1855,14 +1855,17 @@ pub fn vm_to_native_error(
             message: message(),
         },
         crate::VmError::Coded => match detail {
-            Some(ErrorDetail::Syscall(payload)) => NativeError::Syscall {
-                code: payload.code,
-                message: payload.message,
-                syscall: payload.syscall,
-                path: payload.path,
-                dest: payload.dest,
-                errno: payload.errno,
-            },
+            Some(ErrorDetail::Syscall(payload)) => {
+                let payload = *payload;
+                NativeError::Syscall {
+                    code: payload.code,
+                    message: payload.message,
+                    syscall: payload.syscall,
+                    path: payload.path,
+                    dest: payload.dest,
+                    errno: payload.errno,
+                }
+            }
             Some(ErrorDetail::Coded(payload)) => NativeError::Coded {
                 kind: payload.kind,
                 code: payload.code,

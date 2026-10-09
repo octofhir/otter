@@ -32,9 +32,7 @@ use crate::{
 fn current_family(heap: &otter_gc::GcHeap, target: Value) -> Option<(ConstructorLayout, Value)> {
     if let Some(closure) = target.as_closure(heap) {
         let (prototype, _) = closure.prototype_slot(heap)?;
-        if prototype.as_object().is_none() {
-            return None;
-        }
+        prototype.as_object()?;
         return Some((closure.constructor_layouts(heap), prototype));
     }
     let class = target.as_class_constructor()?;

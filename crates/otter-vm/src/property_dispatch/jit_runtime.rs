@@ -298,7 +298,7 @@ impl Interpreter {
                 .escape_scoped(receiver_root)
                 .as_object()
                 .ok_or(VmError::InvalidOperand)
-                .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                .map_err(CommittedValueError::Fatal)?;
             if let Some((handler, hit)) = crate::property_ic::IcHandler::store_existing_hit(
                 current_obj,
                 &self.gc_heap,
@@ -323,7 +323,7 @@ impl Interpreter {
                     atomized_key,
                     &value,
                 )
-                .map_err(|error| CommittedValueError::JavaScript(error.into()))?
+                .map_err(CommittedValueError::JavaScript)?
             {
                 if let Some(handler) =
                     crate::property_ic::IcHandler::store_transition(from_shape, &transition)
@@ -340,18 +340,18 @@ impl Interpreter {
                 .escape_scoped(receiver_root)
                 .as_object()
                 .ok_or(VmError::InvalidOperand)
-                .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                .map_err(CommittedValueError::Fatal)?;
             path = Path::UncachedData;
             let value = self.escape_scoped(value_root);
             if !self
                 .ordinary_set_data_property(current_obj, atomized_key.name(), value)
-                .map_err(|error| CommittedValueError::JavaScript(error.into()))?
+                .map_err(CommittedValueError::JavaScript)?
             {
                 self.failed_set_result(
                     strict,
                     format!("Cannot assign to property '{}'", atomized_key.name()),
                 )
-                .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                .map_err(CommittedValueError::JavaScript)?;
             } else if slot.is_megamorphic() {
                 // The committed store may have allocated a slab or published a
                 // child shape. Re-read the rooted receiver, then make that
@@ -361,7 +361,7 @@ impl Interpreter {
                     .escape_scoped(receiver_root)
                     .as_object()
                     .ok_or(VmError::InvalidOperand)
-                    .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                    .map_err(CommittedValueError::Fatal)?;
                 let _ = self.resolve_property_data_slot(current_obj, atomized_key);
             }
             Ok(())
@@ -443,13 +443,13 @@ impl Interpreter {
         let frame = stack
             .get(top_idx)
             .ok_or(VmError::InvalidOperand)
-            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+            .map_err(CommittedValueError::Fatal)?;
         let target = *read_register(frame, obj_reg)
-            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+            .map_err(CommittedValueError::Fatal)?;
         let key_value = *read_register(frame, key_reg)
-            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+            .map_err(CommittedValueError::Fatal)?;
         let value = *read_register(frame, value_reg)
-            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+            .map_err(CommittedValueError::Fatal)?;
         self.define_data_property_values(stack, context, target, key_value, value)
     }
 
@@ -515,7 +515,7 @@ impl Interpreter {
                             .expect("non-symbol key has string spelling");
                         interp
                             .create_data_property(&mut obj, name, value)
-                            .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                            .map_err(CommittedValueError::JavaScript)?;
                     }
                 }
             } else {
@@ -668,7 +668,7 @@ impl Interpreter {
                 }
                 let transition = self
                     .capture_store_property_transition_with_stack_roots(stack, obj, key, &value)
-                    .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                    .map_err(CommittedValueError::JavaScript)?;
                 drop(roots);
                 if let Some(transition) = transition {
                     self.property_cache.record_store(transition);
@@ -743,7 +743,7 @@ impl Interpreter {
         let accepted = if let Some(wrapper_name) = wrapper_name {
             let parent = self
                 .primitive_wrapper_prototype(wrapper_name)
-                .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                .map_err(CommittedValueError::JavaScript)?;
             self.ordinary_set_data_value(
                 stack,
                 context,
@@ -759,7 +759,7 @@ impl Interpreter {
         if !accepted {
             let name = key.string_name().unwrap_or("symbol");
             self.failed_set_result(strict, format!("Cannot assign to property '{name}'"))
-                .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                .map_err(CommittedValueError::JavaScript)?;
         }
         drop(roots);
         Ok(())

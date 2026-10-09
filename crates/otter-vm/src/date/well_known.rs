@@ -60,8 +60,8 @@ pub fn install_date_well_knowns_post_bootstrap(
         return Ok(());
     };
 
-    if let Some(to_utc_string) = object::get(prototype, heap, "toUTCString") {
-        if !object::define_own_property_partial(
+    if let Some(to_utc_string) = object::get(prototype, heap, "toUTCString")
+        && !object::define_own_property_partial(
             &mut prototype,
             heap,
             "toGMTString",
@@ -75,7 +75,6 @@ pub fn install_date_well_knowns_post_bootstrap(
         )? {
             return Err(JsSurfaceError::DefinePropertyFailed("[[BuiltinProperty]]"));
         };
-    }
 
     let global_root = Value::object(global);
     let date_ctor_root = date_ctor_value;

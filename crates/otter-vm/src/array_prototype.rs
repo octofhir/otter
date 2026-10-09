@@ -992,7 +992,7 @@ pub(crate) fn length_of_array_like(
         len_val
     };
     crate::to_length(&len_val, interp.gc_heap())
-        .map_err(|error| CommittedValueError::JavaScript(error.into()))
+        .map_err(CommittedValueError::JavaScript)
 }
 
 /// §23.1.3.17 / §23.1.3.22 live search for `indexOf` and `lastIndexOf`.
@@ -1229,7 +1229,7 @@ impl Interpreter {
             receiver
         } else {
             self.box_sloppy_this_primitive_runtime_rooted(receiver, roots)
-                .map_err(|error| CommittedValueError::JavaScript(error.into()))?
+                .map_err(CommittedValueError::JavaScript)?
         };
         if name == "includes" {
             let found = array_includes(self, stack, context, o, search, from_arg)?;
@@ -1332,13 +1332,13 @@ impl Interpreter {
             }
             T::Keys => self
                 .array_iterator_method(context, receiver, "keys", roots)
-                .map_err(|error| CommittedValueError::JavaScript(error.into())),
+                .map_err(CommittedValueError::JavaScript),
             T::Values => self
                 .array_iterator_method(context, receiver, "values", roots)
-                .map_err(|error| CommittedValueError::JavaScript(error.into())),
+                .map_err(CommittedValueError::JavaScript),
             T::Entries => self
                 .array_iterator_method(context, receiver, "entries", roots)
-                .map_err(|error| CommittedValueError::JavaScript(error.into())),
+                .map_err(CommittedValueError::JavaScript),
         }
     }
 
@@ -1355,7 +1355,7 @@ impl Interpreter {
             receiver
         } else {
             self.box_sloppy_this_primitive_runtime_rooted(receiver, roots)
-                .map_err(|error| CommittedValueError::JavaScript(error.into()))?
+                .map_err(CommittedValueError::JavaScript)?
         };
         let len = length_of_array_like(self, stack, context, &o)?;
         let n = self.coerce_to_number(stack, context, &index)?.as_f64();
@@ -1389,7 +1389,7 @@ impl Interpreter {
             receiver
         } else {
             self.box_sloppy_this_primitive_runtime_rooted(receiver, roots)
-                .map_err(|error| CommittedValueError::JavaScript(error.into()))?
+                .map_err(CommittedValueError::JavaScript)?
         };
         let len = length_of_array_like(self, stack, context, &o)?;
         if len < 2 {
@@ -1445,7 +1445,7 @@ impl Interpreter {
             receiver
         } else {
             self.box_sloppy_this_primitive_runtime_rooted(receiver, roots)
-                .map_err(|error| CommittedValueError::JavaScript(error.into()))?
+                .map_err(CommittedValueError::JavaScript)?
         };
         let len = length_of_array_like(self, stack, context, &o)?;
         let start = self.array_relative_index(stack, context, args.get(1), 0.0, len)?;
@@ -1455,7 +1455,7 @@ impl Interpreter {
             && crate::array::can_fast_fill_dense_range(arr, self.gc_heap(), start, bounded_end)
             && !self
                 .array_prototype_chain_has_indexed_property(start, bounded_end)
-                .map_err(|error| CommittedValueError::JavaScript(error.into()))?
+                .map_err(CommittedValueError::JavaScript)?
         {
             let receiver_root = o;
             let value_root = value;
@@ -1477,7 +1477,7 @@ impl Interpreter {
                 &mut external_visit,
             )
             .map_err(|_| self.err_range(("Invalid array length".to_string()).into()))
-            .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+            .map_err(CommittedValueError::JavaScript)?;
             return Ok(o);
         }
         for k in start..bounded_end {
@@ -1694,7 +1694,7 @@ impl Interpreter {
                     if depth > 0
                         && this
                             .is_array_spec(&element)
-                            .map_err(|error| CommittedValueError::JavaScript(error.into()))?
+                            .map_err(CommittedValueError::JavaScript)?
                     {
                         let element = this.iteration_anchor(element_slot);
                         let element_len = length_of_array_like(this, stack, context, &element)?
@@ -1833,7 +1833,7 @@ impl Interpreter {
             receiver
         } else {
             self.box_sloppy_this_primitive_runtime_rooted(receiver, roots)
-                .map_err(|error| CommittedValueError::JavaScript(error.into()))?
+                .map_err(CommittedValueError::JavaScript)?
         };
         // `undefined` and an absent separator both select ",".
         let mut separator_value = separator_arg.unwrap_or(Value::undefined());
@@ -1970,7 +1970,7 @@ impl Interpreter {
             receiver
         } else {
             self.box_sloppy_this_primitive_runtime_rooted(receiver, roots)
-                .map_err(|error| CommittedValueError::JavaScript(error.into()))?
+                .map_err(CommittedValueError::JavaScript)?
         };
         let func = self.get_property_value_for_call(stack, context, o, "join")?;
         if self.is_callable_runtime(&func) {
@@ -2061,7 +2061,7 @@ impl Interpreter {
                         interp.escape_scoped(receiver_root),
                         roots,
                     )
-                    .map_err(|error| CommittedValueError::JavaScript(error.into()))?
+                    .map_err(CommittedValueError::JavaScript)?
             };
             let array_root = interp.scoped_value(scope, o);
             // step 2 — len = ? LengthOfArrayLike(array).
@@ -2187,7 +2187,7 @@ impl Interpreter {
                 // revoked proxy) rather than only matching a bare Array.
                 interp
                     .is_array_spec(&interp.escape_scoped(receiver_root))
-                    .map_err(|error| CommittedValueError::JavaScript(error.into()))
+                    .map_err(CommittedValueError::JavaScript)
             } else {
                 Ok(spread.to_boolean(interp.gc_heap()))
             }
@@ -2527,7 +2527,7 @@ impl Interpreter {
             Ok(receiver)
         } else {
             self.box_sloppy_this_primitive_runtime_rooted(receiver, roots)
-                .map_err(|error| CommittedValueError::JavaScript(error.into()))
+                .map_err(CommittedValueError::JavaScript)
         };
         let o = match o {
             Ok(o) => o,
@@ -2668,7 +2668,7 @@ impl Interpreter {
         {
             let proto = self
                 .constructor_prototype_value("Array")
-                .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                .map_err(CommittedValueError::Fatal)?;
             if let Some(proto) = proto.as_object() {
                 match crate::object::resolve_set(proto, self.gc_heap(), key) {
                     crate::object::SetOutcome::InvokeSetter { setter } => {
@@ -2834,7 +2834,7 @@ impl Interpreter {
             // setter or non-writable shadow before installing a new slot.
             let proto = self
                 .constructor_prototype_value("Array")
-                .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                .map_err(CommittedValueError::Fatal)?;
             if let Some(proto_obj) = proto.as_object() {
                 match crate::object::resolve_set(proto_obj, self.gc_heap(), key) {
                     crate::object::SetOutcome::InvokeSetter { setter } => {
@@ -2863,11 +2863,11 @@ impl Interpreter {
         match idx {
             Some(i) => crate::array::define_index_value(arr, self.gc_heap_mut(), i, value)
                 .map_err(crate::oom_to_vm)
-                .map_err(|error| CommittedValueError::JavaScript(error.into()))?,
+                .map_err(CommittedValueError::JavaScript)?,
             None => {
                 crate::array::set_named_property(arr, self.gc_heap_mut(), key, value)
                     .map_err(crate::oom_to_vm)
-                    .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                    .map_err(CommittedValueError::JavaScript)?;
             }
         }
         Ok(true)
@@ -2885,7 +2885,7 @@ impl Interpreter {
             receiver
         } else {
             self.box_sloppy_this_primitive_runtime_rooted(receiver, roots)
-                .map_err(|error| CommittedValueError::JavaScript(error.into()))?
+                .map_err(CommittedValueError::JavaScript)?
         };
         // Dense fast path (symmetric with `array_push`): a plain extensible
         // array with a writable `length` and no accessor/attribute override on
@@ -2939,7 +2939,7 @@ impl Interpreter {
             receiver
         } else {
             self.box_sloppy_this_primitive_runtime_rooted(receiver, roots)
-                .map_err(|error| CommittedValueError::JavaScript(error.into()))?
+                .map_err(CommittedValueError::JavaScript)?
         };
         // Dense fast path (symmetric with `array_pop`): a fully dense array with
         // a writable `length` and no accessor/attribute override slides the
@@ -3000,7 +3000,7 @@ impl Interpreter {
             receiver
         } else {
             self.box_sloppy_this_primitive_runtime_rooted(receiver, roots)
-                .map_err(|error| CommittedValueError::JavaScript(error.into()))?
+                .map_err(CommittedValueError::JavaScript)?
         };
         // Dense fast path (symmetric with `array_push`): inserting at the head
         // of a fully dense array slides the element buffer up directly. Like
@@ -3040,7 +3040,7 @@ impl Interpreter {
                         &mut visit,
                     )
                     .map_err(VmError::from)
-                    .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                    .map_err(CommittedValueError::JavaScript)?;
                 }
                 return Ok(Value::number(NumberValue::from_f64(new_len as f64)));
             }
@@ -3065,7 +3065,7 @@ impl Interpreter {
         } else {
             let mut candidates = self
                 .unshift_sparse_candidates(o, len, arg_count)
-                .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                .map_err(CommittedValueError::JavaScript)?;
             while let Some(k) = candidates.pop_last() {
                 self.unshift_move_index(stack, context, o, k, arg_count)?;
             }
@@ -3152,7 +3152,7 @@ impl Interpreter {
             receiver
         } else {
             self.box_sloppy_this_primitive_runtime_rooted(receiver, roots)
-                .map_err(|error| CommittedValueError::JavaScript(error.into()))?
+                .map_err(CommittedValueError::JavaScript)?
         };
         let len = length_of_array_like(self, stack, context, &o)?;
         let to = self.array_relative_index(stack, context, args.first(), 0.0, len)?;
@@ -3178,7 +3178,7 @@ impl Interpreter {
         } else {
             let mut offsets = self
                 .copy_within_sparse_offsets(o, len, from, to, count)
-                .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                .map_err(CommittedValueError::JavaScript)?;
             if backwards {
                 while let Some(offset) = offsets.pop_last() {
                     self.copy_within_move_index(stack, context, o, from + offset, to + offset)?;
@@ -3225,7 +3225,7 @@ impl Interpreter {
         if o.is_array() {
             let proto = self
                 .get_prototype_for_op(&o)
-                .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                .map_err(CommittedValueError::JavaScript)?;
             if !proto.is_nullish() {
                 return self.ordinary_has_property_value(
                     stack,
@@ -3267,7 +3267,7 @@ impl Interpreter {
             }
             let proto = self
                 .get_prototype_for_op(&o)
-                .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                .map_err(CommittedValueError::JavaScript)?;
             if !proto.is_nullish()
                 && self.ordinary_has_property_value(
                     stack,
@@ -3332,7 +3332,7 @@ impl Interpreter {
             receiver
         } else {
             self.box_sloppy_this_primitive_runtime_rooted(receiver, roots)
-                .map_err(|error| CommittedValueError::JavaScript(error.into()))?
+                .map_err(CommittedValueError::JavaScript)?
         };
         // Length/index coercion, species construction, and every copy
         // iteration can allocate and move the receiver and the result
@@ -3359,7 +3359,7 @@ impl Interpreter {
                 let o_now = interp.escape_scoped(o_handle);
                 for n in interp
                     .slice_sparse_offsets(o_now, len, start, count)
-                    .map_err(|error| CommittedValueError::JavaScript(error.into()))?
+                    .map_err(CommittedValueError::JavaScript)?
                 {
                     let o_now = interp.escape_scoped(o_handle);
                     let a_now = interp.escape_scoped(a_handle);
@@ -3427,15 +3427,15 @@ impl Interpreter {
 
             if !interp
                 .array_species_is_array(context, interp.escape_scoped(original_root))
-                .map_err(|error| CommittedValueError::JavaScript(error.into()))?
+                .map_err(CommittedValueError::JavaScript)?
             {
                 return interp
                     .array_create_with_length(interp.escape_scoped(original_root), length, &[])
-                    .map_err(|error| CommittedValueError::JavaScript(error.into()));
+                    .map_err(CommittedValueError::JavaScript);
             }
             let default_ctor = crate::object::get(interp.global_this, &interp.gc_heap, "Array")
                 .ok_or_else(|| interp.err_type(("%Array% intrinsic is missing".to_string()).into()))
-                .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                .map_err(CommittedValueError::JavaScript)?;
             let default_ctor_root = interp.scoped_value(scope, default_ctor);
             // §7.3.22 steps 5-6 — C = Get(original, "constructor"); when C
             // IS another realm's %Array% constructor it counts as the
@@ -3457,7 +3457,7 @@ impl Interpreter {
             {
                 return interp
                     .array_create_with_length(interp.escape_scoped(original_root), length, &[])
-                    .map_err(|error| CommittedValueError::JavaScript(error.into()));
+                    .map_err(CommittedValueError::JavaScript);
             }
             let constructor = if c.is_undefined() {
                 interp.escape_scoped(default_ctor_root)
@@ -3506,7 +3506,7 @@ impl Interpreter {
             ) {
                 return interp
                     .array_create_with_length(interp.escape_scoped(original_root), length, &[])
-                    .map_err(|error| CommittedValueError::JavaScript(error.into()));
+                    .map_err(CommittedValueError::JavaScript);
             }
             let argv: SmallVec<[Value; 8]> =
                 smallvec::smallvec![Value::number(NumberValue::from_f64(length as f64))];
@@ -3598,7 +3598,7 @@ impl Interpreter {
         {
             crate::array::define_index_value(arr, self.gc_heap_mut(), idx, value)
                 .map_err(VmError::from)
-                .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                .map_err(CommittedValueError::JavaScript)?;
             return Ok(());
         }
         let key = format_index_key(idx as f64);
@@ -3763,7 +3763,7 @@ impl Interpreter {
                 let current_receiver = interp.escape_scoped(receiver);
                 let offsets = interp
                     .splice_sparse_offsets(current_receiver, len, actual_start, actual_delete_count)
-                    .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                    .map_err(CommittedValueError::JavaScript)?;
                 for n in offsets {
                     let current_receiver = interp.escape_scoped(receiver);
                     let current_removed = interp.escape_scoped(removed);
@@ -3904,7 +3904,7 @@ impl Interpreter {
                     actual_delete_count,
                     insert_count,
                 )
-                .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                .map_err(CommittedValueError::JavaScript)?;
             for k in candidates {
                 let o_now = interp.escape_scoped(o_handle);
                 interp.splice_move_or_delete(
@@ -3918,7 +3918,7 @@ impl Interpreter {
             let o_now = interp.escape_scoped(o_handle);
             let own_indices = interp
                 .splice_own_indices(o_now, len)
-                .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                .map_err(CommittedValueError::JavaScript)?;
             for k in own_indices.range((len - shift)..len) {
                 let key = format_index_key(*k as f64);
                 let o_now = interp.escape_scoped(o_handle);
@@ -3966,7 +3966,7 @@ impl Interpreter {
                     actual_delete_count,
                     insert_count,
                 )
-                .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                .map_err(CommittedValueError::JavaScript)?;
             for k in candidates.into_iter().rev() {
                 let o_now = interp.escape_scoped(o_handle);
                 interp.splice_move_or_delete(
@@ -4095,18 +4095,18 @@ impl Interpreter {
             receiver
         } else {
             self.box_sloppy_this_primitive_runtime_rooted(receiver, roots)
-                .map_err(|error| CommittedValueError::JavaScript(error.into()))?
+                .map_err(CommittedValueError::JavaScript)?
         };
         let len = length_of_array_like(self, stack, context, &o)?;
         self.ensure_change_by_copy_len(len)
-            .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+            .map_err(CommittedValueError::JavaScript)?;
         let mut out = Vec::with_capacity(len);
         for k in 0..len {
             let from = format_index_key((len - k - 1) as f64);
             out.push(self.array_method_get_property(stack, context, o, &from)?);
         }
         self.array_create_from_dense_values(out)
-            .map_err(|error| CommittedValueError::JavaScript(error.into()))
+            .map_err(CommittedValueError::JavaScript)
     }
 
     /// §23.1.3.40 live `Array.prototype.toSpliced`.
@@ -4122,7 +4122,7 @@ impl Interpreter {
             receiver
         } else {
             self.box_sloppy_this_primitive_runtime_rooted(receiver, roots)
-                .map_err(|error| CommittedValueError::JavaScript(error.into()))?
+                .map_err(CommittedValueError::JavaScript)?
         };
         let len = length_of_array_like(self, stack, context, &o)?;
         let actual_start = self.array_relative_index(stack, context, args.first(), 0.0, len)?;
@@ -4141,14 +4141,14 @@ impl Interpreter {
             .checked_sub(skip_count)
             .and_then(|n| n.checked_add(insert_count))
             .ok_or_else(|| self.err_type(("Invalid array length".to_string()).into()))
-            .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+            .map_err(CommittedValueError::JavaScript)?;
         if new_len > MAX_SAFE_ARRAY_LENGTH {
             return Err(CommittedValueError::JavaScript(
                 self.err_type(("Invalid array length".to_string()).into()),
             ));
         }
         self.ensure_change_by_copy_len(new_len)
-            .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+            .map_err(CommittedValueError::JavaScript)?;
 
         let mut out = Vec::with_capacity(new_len);
         for k in 0..actual_start {
@@ -4169,7 +4169,7 @@ impl Interpreter {
             )?);
         }
         self.array_create_from_dense_values(out)
-            .map_err(|error| CommittedValueError::JavaScript(error.into()))
+            .map_err(CommittedValueError::JavaScript)
     }
 
     /// §23.1.3.41 live `Array.prototype.toSorted`.
@@ -4192,7 +4192,7 @@ impl Interpreter {
             Ok(receiver)
         } else {
             self.box_sloppy_this_primitive_runtime_rooted(receiver, roots)
-                .map_err(|error| CommittedValueError::JavaScript(error.into()))
+                .map_err(CommittedValueError::JavaScript)
         };
         let o = match o {
             Ok(o) => o,
@@ -4206,7 +4206,7 @@ impl Interpreter {
             let o = self.iteration_anchor(o_anchor);
             let len = length_of_array_like(self, stack, context, &o)?;
             self.ensure_change_by_copy_len(len)
-                .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                .map_err(CommittedValueError::JavaScript)?;
             // `toSorted` reads every index (holes become undefined). Keep
             // each result directly traced and sort stable anchor indices.
             let mut items = Vec::with_capacity(len);
@@ -4227,7 +4227,7 @@ impl Interpreter {
                 .map(|anchor| self.iteration_anchor(anchor))
                 .collect();
             self.array_create_from_dense_values(values)
-                .map_err(|error| CommittedValueError::JavaScript(error.into()))
+                .map_err(CommittedValueError::JavaScript)
         })();
         self.pop_iteration_anchors_to(anchor_base);
         result
@@ -4247,11 +4247,11 @@ impl Interpreter {
             receiver
         } else {
             self.box_sloppy_this_primitive_runtime_rooted(receiver, roots)
-                .map_err(|error| CommittedValueError::JavaScript(error.into()))?
+                .map_err(CommittedValueError::JavaScript)?
         };
         let len = length_of_array_like(self, stack, context, &o)?;
         self.ensure_change_by_copy_len(len)
-            .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+            .map_err(CommittedValueError::JavaScript)?;
         let actual = self.array_relative_index_strict(stack, context, &index, len)?;
         let mut out = Vec::with_capacity(len);
         for k in 0..len {
@@ -4267,7 +4267,7 @@ impl Interpreter {
             }
         }
         self.array_create_from_dense_values(out)
-            .map_err(|error| CommittedValueError::JavaScript(error.into()))
+            .map_err(CommittedValueError::JavaScript)
     }
 
     fn ensure_change_by_copy_len(&self, len: usize) -> Result<(), VmError> {

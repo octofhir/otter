@@ -99,10 +99,10 @@ impl Interpreter {
         let value = self.load_global_or_throw_value(stack, context, function_id, name_idx)?;
         let frame = &mut stack[top_idx];
         write_register(frame, dst, value)
-            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+            .map_err(CommittedValueError::Fatal)?;
         frame
             .advance_pc()
-            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+            .map_err(CommittedValueError::Fatal)?;
         Ok(())
     }
 
@@ -140,7 +140,7 @@ impl Interpreter {
             let name = context
                 .string_constant_str_for_function(function_id, name_idx)
                 .ok_or(VmError::InvalidOperand)
-                .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                .map_err(CommittedValueError::Fatal)?;
             return Err(CommittedValueError::JavaScript(self.err_this_uninit(
                 (format!("Cannot access '{name}' before initialization")).into(),
             )));
@@ -164,7 +164,7 @@ impl Interpreter {
         let name = context
             .string_constant_str_for_function(function_id, name_idx)
             .ok_or(VmError::InvalidOperand)
-            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+            .map_err(CommittedValueError::Fatal)?;
         self.load_global_binding_name(
             Some(context),
             stack,
@@ -186,10 +186,10 @@ impl Interpreter {
         let value = self.load_global_or_undefined_value(context, stack, function_id, name_idx)?;
         let frame = &mut stack[top_idx];
         write_register(frame, dst, value)
-            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+            .map_err(CommittedValueError::Fatal)?;
         frame
             .advance_pc()
-            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+            .map_err(CommittedValueError::Fatal)?;
         Ok(())
     }
 
@@ -217,7 +217,7 @@ impl Interpreter {
         let name = context
             .string_constant_str_for_function(function_id, name_idx)
             .ok_or(VmError::InvalidOperand)
-            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+            .map_err(CommittedValueError::Fatal)?;
         self.load_global_binding_name(Some(context), stack, name, GlobalBindingRead::Typeof, None)
     }
 
@@ -235,7 +235,7 @@ impl Interpreter {
     ) -> Result<Value, CommittedValueError> {
         if let Some(value) = self
             .read_global_lexical(name)
-            .map_err(|error| CommittedValueError::JavaScript(error.into()))?
+            .map_err(CommittedValueError::JavaScript)?
         {
             if let Some(site) = cache_site
                 && let Some((cell, _)) = self.global_lexicals.get(name).copied()
@@ -330,11 +330,11 @@ impl Interpreter {
         let frame = &stack[frame_index];
         let function_id = frame.function_id;
         let value = *crate::read_register(frame, value_reg)
-            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+            .map_err(CommittedValueError::Fatal)?;
         self.define_global_var_value(context, stack, function_id, name_idx, value)?;
         stack[frame_index]
             .advance_pc()
-            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+            .map_err(CommittedValueError::Fatal)?;
         Ok(())
     }
 
@@ -349,7 +349,7 @@ impl Interpreter {
         let name = context
             .string_constant_str_for_function(function_id, name_idx)
             .ok_or(VmError::InvalidOperand)
-            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+            .map_err(CommittedValueError::Fatal)?;
         // §9.1.1.4.18 SetMutableBinding shape — an existing own
         // property keeps its attributes (enumerability,
         // configurability) and only receives the new value; a
@@ -715,10 +715,10 @@ impl Interpreter {
         let exists = self.global_binding_exists_value(stack, context, function_id, name_idx)?;
         let frame = &mut stack[top_idx];
         crate::write_register(frame, dst, exists)
-            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+            .map_err(CommittedValueError::Fatal)?;
         frame
             .advance_pc()
-            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+            .map_err(CommittedValueError::Fatal)?;
         Ok(())
     }
 
@@ -739,7 +739,7 @@ impl Interpreter {
         let name = context
             .string_constant_str_for_function(function_id, name_idx)
             .ok_or(VmError::InvalidOperand)
-            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+            .map_err(CommittedValueError::Fatal)?;
         if self.global_lexicals.contains_key(name)
             || object::get_own_descriptor(self.global_this, &self.gc_heap, name).is_some()
         {
@@ -769,14 +769,14 @@ impl Interpreter {
     ) -> Result<(), CommittedValueError> {
         let frame = &stack[top_idx];
         let existed = crate::read_register(frame, exists_reg)
-            .map_err(|error| CommittedValueError::Fatal(error.into()))?
+            .map_err(CommittedValueError::Fatal)?
             .as_boolean()
             .unwrap_or(false);
         if !existed {
             let name = context
                 .string_constant_str(name_idx)
                 .ok_or(VmError::InvalidOperand)
-                .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                .map_err(CommittedValueError::Fatal)?;
             return Err(CommittedValueError::JavaScript(
                 self.err_undefined_ident((name.to_string()).into()),
             ));
@@ -811,7 +811,7 @@ impl Interpreter {
             let name = context
                 .string_constant_str_for_function(function_id, name_idx)
                 .ok_or(VmError::InvalidOperand)
-                .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                .map_err(CommittedValueError::Fatal)?;
             return Err(CommittedValueError::JavaScript(
                 self.err_undefined_ident((name.to_string()).into()),
             ));
@@ -829,12 +829,12 @@ impl Interpreter {
         strict: bool,
     ) -> Result<(), CommittedValueError> {
         let value = *crate::read_register(&stack[top_idx], value_reg)
-            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+            .map_err(CommittedValueError::Fatal)?;
         let function_id = stack[top_idx].function_id;
         self.store_global_binding_value(context, stack, function_id, value, name_idx, strict)?;
         stack[top_idx]
             .advance_pc()
-            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+            .map_err(CommittedValueError::Fatal)?;
         Ok(())
     }
 
@@ -864,7 +864,7 @@ impl Interpreter {
         let name = context
             .string_constant_str_for_function(function_id, name_idx)
             .ok_or(VmError::InvalidOperand)
-            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+            .map_err(CommittedValueError::Fatal)?;
         if let Some(&(cell, is_const)) = self.global_lexicals.get(name) {
             if is_const {
                 return Err(CommittedValueError::JavaScript(self.err_type(

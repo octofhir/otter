@@ -104,7 +104,7 @@ struct Activation {
 }
 impl Activation {
     fn new() -> Self {
-        let context_bytes = THREAD_OFFSET.max(GLOBAL_THIS_OFFSET_PTR_OFFSET) as usize + 8;
+        let context_bytes = std::mem::size_of::<crate::entry::JitCtx>();
         let thread_bytes = VM_THREAD_GLOBAL_LEXICAL_EPOCH_CELL_OFFSET
             .max(VM_THREAD_ACTIVE_REALM_CELL_OFFSET) as usize
             + 8;

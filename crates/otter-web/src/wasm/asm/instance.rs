@@ -386,7 +386,7 @@ fn instantiate(
             .memory_may_move(false)
             .guard_before_linear_memory(false)
             .memory_init_cow(false)
-            .wasm_custom_page_sizes(len % 65536 != 0)
+            .wasm_custom_page_sizes(!len.is_multiple_of(65536))
             .with_host_memory(Arc::new(creator));
     }
     let engine = Engine::new(&config).ok()?;

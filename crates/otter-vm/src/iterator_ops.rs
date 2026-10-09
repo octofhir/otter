@@ -183,16 +183,16 @@ impl Interpreter {
     ) -> Result<(), CommittedValueError> {
         self.with_handle_scope(|interp, scope| {
             let value = *read_register(&stack[top_idx], src)
-                .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                .map_err(CommittedValueError::Fatal)?;
             let value_root = interp.scoped_value(scope, value);
             if let Some(handle) = value.as_generator()
                 && handle.is_async(&interp.gc_heap)
             {
                 write_register(&mut stack[top_idx], dst, value)
-                    .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                    .map_err(CommittedValueError::Fatal)?;
                 stack[top_idx]
                     .advance_pc()
-                    .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                    .map_err(CommittedValueError::Fatal)?;
                 return Ok(());
             }
 
@@ -246,10 +246,10 @@ impl Interpreter {
                         return Err(CommittedValueError::JavaScript(VmError::TypeMismatch));
                     }
                     write_register(&mut stack[top_idx], dst, produced)
-                        .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                        .map_err(CommittedValueError::Fatal)?;
                     stack[top_idx]
                         .advance_pc()
-                        .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                        .map_err(CommittedValueError::Fatal)?;
                     return Ok(());
                 }
             }
@@ -265,10 +265,10 @@ impl Interpreter {
             )?;
             let wrapped = interp.create_async_from_sync_iterator(stack, context, iterator)?;
             write_register(&mut stack[top_idx], dst, wrapped)
-                .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                .map_err(CommittedValueError::Fatal)?;
             stack[top_idx]
                 .advance_pc()
-                .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                .map_err(CommittedValueError::Fatal)?;
             Ok(())
         })
     }
@@ -362,7 +362,7 @@ impl Interpreter {
                         &[&produced],
                         &[],
                     )
-                    .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                    .map_err(CommittedValueError::JavaScript)?;
                 return Ok(Value::iterator(iter));
             }
             let produced = interp.escape_scoped(produced_root);
@@ -419,7 +419,7 @@ impl Interpreter {
                     &[&interp.escape_scoped(produced_root)],
                     &[],
                 )
-                .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                .map_err(CommittedValueError::JavaScript)?;
             Ok(Value::iterator(iter))
         })
     }
@@ -444,20 +444,20 @@ impl Interpreter {
         self.with_handle_scope(|interp, scope| {
             if interp
                 .open_fast_array_record(context, stack, top_idx, dst, src)
-                .map_err(|error| CommittedValueError::JavaScript(error.into()))?
+                .map_err(CommittedValueError::JavaScript)?
             {
                 return Ok(());
             }
             let value = *read_register(&stack[top_idx], src)
-                .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                .map_err(CommittedValueError::Fatal)?;
             let value_root = interp.scoped_value(scope, value);
             let primordial = interp.frame_iterates_primordially(context, stack, top_idx);
             if let Some(record) = interp
                 .unobservable_iterator_record(stack, value, primordial)
-                .map_err(|error| CommittedValueError::JavaScript(error.into()))?
+                .map_err(CommittedValueError::JavaScript)?
             {
                 Self::write_iterator_record(&mut stack[top_idx], dst, record)
-                    .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                    .map_err(CommittedValueError::Fatal)?;
                 return Ok(());
             }
             // §7.4.3 GetIterator step 1 — GetMethod(obj, @@iterator) runs the
@@ -476,7 +476,7 @@ impl Interpreter {
             let wrapped =
                 interp.wrap_iterator_method_result(context, stack, produced, primordial)?;
             Self::write_iterator_record(&mut stack[top_idx], dst, wrapped)
-                .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                .map_err(CommittedValueError::Fatal)?;
             Ok(())
         })
     }
@@ -709,7 +709,7 @@ impl Interpreter {
             if matches!(kind, ArrayIterKind::Entry) {
                 let pair = interp
                     .alloc_runtime_rooted_array_from_values([index_value, value], &[&value], &[])
-                    .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                    .map_err(CommittedValueError::JavaScript)?;
                 return Ok((Value::array(pair), false));
             }
             Ok((value, false))
@@ -3005,14 +3005,14 @@ impl Interpreter {
         iterable_reg: u16,
     ) -> Result<(), CommittedValueError> {
         let iterable = *read_register(&stack[frame_index], iterable_reg)
-            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+            .map_err(CommittedValueError::Fatal)?;
         let operands = |stack: &ActivationStack| -> Result<(Value, Value), CommittedValueError> {
             let frame = &stack[frame_index];
             Ok((
                 *read_register(frame, array_reg)
-                    .map_err(|error| CommittedValueError::Fatal(error.into()))?,
+                    .map_err(CommittedValueError::Fatal)?,
                 *read_register(frame, iterable_reg)
-                    .map_err(|error| CommittedValueError::Fatal(error.into()))?,
+                    .map_err(CommittedValueError::Fatal)?,
             ))
         };
         // A proven plain dense array copies straight across. Proving may
@@ -3037,7 +3037,7 @@ impl Interpreter {
         let (_, iterable) = operands(stack)?;
         let values = self.iterator_to_list_sync(context, stack, &iterable)?;
         let array = read_register(&stack[frame_index], array_reg)
-            .map_err(|error| CommittedValueError::Fatal(error.into()))?
+            .map_err(CommittedValueError::Fatal)?
             .as_array()
             .ok_or(CommittedValueError::Fatal(VmError::InvalidOperand))?;
         let roots = self.collect_allocation_roots(stack);
@@ -3418,7 +3418,7 @@ impl Interpreter {
                 .escape_scoped(inner_root)
                 .as_promise()
                 .ok_or(VmError::InvalidOperand)
-                .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                .map_err(CommittedValueError::Fatal)?;
             let on_fulfilled = vm.escape_scoped(fulfilled_root);
             let on_rejected = vm.escape_scoped(rejected_root);
             let outcome = vm
@@ -3429,7 +3429,7 @@ impl Interpreter {
                     capability,
                     Some(context.clone()),
                 )
-                .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                .map_err(CommittedValueError::JavaScript)?;
             if let Some(job) = outcome.immediate_job {
                 vm.microtasks.enqueue(job);
             }
@@ -3473,7 +3473,7 @@ impl Interpreter {
                             Ok(Value::undefined()),
                             true,
                         )
-                        .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                        .map_err(CommittedValueError::JavaScript)?;
                         continue;
                     }
                     self.resume_generator(
@@ -3491,7 +3491,7 @@ impl Interpreter {
                         handle.mark_done(&mut self.gc_heap);
                         handle.set_async_state(&mut self.gc_heap, AsyncGeneratorState::Completed);
                         self.async_generator_complete_step(context, handle, Err(reason), true)
-                            .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                            .map_err(CommittedValueError::JavaScript)?;
                         continue;
                     }
                     self.resume_generator(
@@ -3670,7 +3670,7 @@ impl Interpreter {
                     capability,
                     context.cloned(),
                 )
-                .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                .map_err(CommittedValueError::JavaScript)?;
             if let Some(job) = outcome.immediate_job {
                 vm.microtasks.enqueue(job);
             }
@@ -3702,7 +3702,7 @@ impl Interpreter {
         handle.mark_done(&mut self.gc_heap);
         handle.set_async_state(&mut self.gc_heap, AsyncGeneratorState::Completed);
         self.async_generator_complete_step(context, handle, completion, true)
-            .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+            .map_err(CommittedValueError::JavaScript)?;
         self.async_generator_resume_next(stack, context, handle)
     }
 
@@ -3921,7 +3921,7 @@ impl Interpreter {
                 // and every request behind it as done.
                 if handle.is_async(&self.gc_heap) {
                     self.async_generator_complete_step(Some(context), handle, Ok(*arg), true)
-                        .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                        .map_err(CommittedValueError::JavaScript)?;
                     self.async_generator_drain_done(stack, Some(context), handle)?;
                     return Ok(Value::undefined());
                 }
@@ -3998,7 +3998,7 @@ impl Interpreter {
                 handle.mark_done(&mut self.gc_heap);
                 if is_async {
                     self.async_generator_complete_step(Some(context), handle, Ok(value), true)
-                        .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                        .map_err(CommittedValueError::JavaScript)?;
                     self.async_generator_drain_done(stack, Some(context), handle)?;
                     return Ok(Value::undefined());
                 }
@@ -4022,7 +4022,7 @@ impl Interpreter {
                             Err(reason),
                             true,
                         )
-                        .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                        .map_err(CommittedValueError::JavaScript)?;
                         self.async_generator_drain_done(stack, Some(context), handle)?;
                         return Ok(Value::undefined());
                     }
@@ -4057,9 +4057,9 @@ impl Interpreter {
     ) -> Result<(), CommittedValueError> {
         self.with_handle_scope(|interp, scope| {
             let dst = register_operand(operands.first())
-                .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                .map_err(CommittedValueError::Fatal)?;
             let src = register_operand(operands.get(1))
-                .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                .map_err(CommittedValueError::Fatal)?;
             let top_idx = stack.len() - 1;
             let pc = stack[top_idx].pc;
 
@@ -4071,7 +4071,7 @@ impl Interpreter {
                 .cloned();
             if let Some(_state) = resume {
                 let produced = *read_register(&stack[top_idx], dst)
-                    .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                    .map_err(CommittedValueError::Fatal)?;
                 // §7.4.3 step 2 — `[@@iterator]()` must return an
                 // Object; GetIteratorDirect then reads `next` once. Both
                 // are owned by the shared wrap helper. A failure here must
@@ -4089,13 +4089,13 @@ impl Interpreter {
                     }
                 };
                 Self::write_iterator_record(&mut stack[top_idx], dst, produced_value)
-                    .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                    .map_err(CommittedValueError::Fatal)?;
                 if let Some(cold) = interp.frame_cold_mut(&mut stack[top_idx]) {
                     cold.pending_get_iterator = None;
                 }
                 stack[top_idx]
                     .advance_pc()
-                    .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                    .map_err(CommittedValueError::Fatal)?;
                 return Ok(());
             }
 
@@ -4103,26 +4103,26 @@ impl Interpreter {
             // Array record, or a built-in iterator value.
             if interp
                 .open_fast_array_record(context, stack, top_idx, dst, src)
-                .map_err(|error| CommittedValueError::JavaScript(error.into()))?
+                .map_err(CommittedValueError::JavaScript)?
             {
                 stack[top_idx]
                     .advance_pc()
-                    .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                    .map_err(CommittedValueError::Fatal)?;
                 return Ok(());
             }
             let value = *read_register(&stack[top_idx], src)
-                .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                .map_err(CommittedValueError::Fatal)?;
             let value_root = interp.scoped_value(scope, value);
             let primordial = interp.frame_iterates_primordially(context, stack, top_idx);
             if let Some(record) = interp
                 .unobservable_iterator_record(stack, value, primordial)
-                .map_err(|error| CommittedValueError::JavaScript(error.into()))?
+                .map_err(CommittedValueError::JavaScript)?
             {
                 Self::write_iterator_record(&mut stack[top_idx], dst, record)
-                    .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                    .map_err(CommittedValueError::Fatal)?;
                 stack[top_idx]
                     .advance_pc()
-                    .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                    .map_err(CommittedValueError::Fatal)?;
                 return Ok(());
             }
             // 3. Call `@@iterator` in a pushed frame; pc stays on
@@ -4142,7 +4142,7 @@ impl Interpreter {
                     SmallVec::new(),
                     dst,
                 )
-                .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                .map_err(CommittedValueError::JavaScript)?;
             Ok(())
         })
     }

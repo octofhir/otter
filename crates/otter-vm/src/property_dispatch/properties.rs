@@ -38,14 +38,14 @@ impl Interpreter {
     ) -> Result<(), CommittedValueError> {
         let name = key.name();
         let receiver = *read_register(&stack[top_idx], obj_reg)
-            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+            .map_err(CommittedValueError::Fatal)?;
         let value = self.load_property_value(context, stack, receiver, name)?;
         let frame = &mut stack[top_idx];
         write_register(frame, dst, value)
-            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+            .map_err(CommittedValueError::Fatal)?;
         frame
             .advance_pc()
-            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+            .map_err(CommittedValueError::Fatal)?;
         Ok(())
     }
 
@@ -66,7 +66,7 @@ impl Interpreter {
         slot: Option<crate::feedback::PropertyFeedbackSlot<'_>>,
     ) -> Result<(), CommittedValueError> {
         let receiver = *read_register(&stack[frame_index], obj_reg)
-            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+            .map_err(CommittedValueError::Fatal)?;
         if !receiver.is_object_type() {
             return Err(CommittedValueError::JavaScript(
                 crate::VmError::TypeMismatch,
@@ -102,10 +102,10 @@ impl Interpreter {
         };
         let frame = &mut stack[frame_index];
         write_register(frame, dst, Value::boolean(found))
-            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+            .map_err(CommittedValueError::Fatal)?;
         frame
             .advance_pc()
-            .map_err(|error| CommittedValueError::Fatal(error.into()))
+            .map_err(CommittedValueError::Fatal)
     }
 
     /// Full string-keyed `[[Get]]` over any receiver value: the complete
@@ -184,7 +184,7 @@ impl Interpreter {
                         // statics-object walk cannot see.
                         let parent = interp
                             .get_prototype_for_op(&receiver)
-                            .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                            .map_err(CommittedValueError::JavaScript)?;
                         if parent.is_null() || parent.is_undefined() {
                             Value::undefined()
                         } else {
@@ -228,7 +228,7 @@ impl Interpreter {
                             )
                             .with_owner_deleted(owner_deleted);
                             function_metadata::callable_intrinsic_property(&mut ctx, &ctor, name)
-                                .map_err(|error| CommittedValueError::JavaScript(error.into()))?
+                                .map_err(CommittedValueError::JavaScript)?
                         } else {
                             Value::undefined()
                         }
@@ -574,7 +574,7 @@ impl Interpreter {
                         Some(idx) => t
                             .get(&mut interp.gc_heap, idx)
                             .map_err(crate::oom_to_vm)
-                            .map_err(|error| CommittedValueError::JavaScript(error.into()))?,
+                            .map_err(CommittedValueError::JavaScript)?,
                         None => Value::undefined(),
                     }
                 } else if let Some(bag) = t.expando(&interp.gc_heap)
@@ -605,7 +605,7 @@ impl Interpreter {
                         // against the real chain.
                         let proto = interp
                             .get_prototype_for_op(&receiver)
-                            .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                            .map_err(CommittedValueError::JavaScript)?;
                         match proto.as_object() {
                             Some(proto_obj) => {
                                 let key = VmPropertyKey::String(name);
@@ -737,7 +737,7 @@ impl Interpreter {
         let accepted = if let Some(wrapper_name) = wrapper_name {
             let parent = self
                 .primitive_wrapper_prototype(wrapper_name)
-                .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                .map_err(CommittedValueError::JavaScript)?;
             self.ordinary_set_data_value(
                 stack,
                 context,
@@ -752,7 +752,7 @@ impl Interpreter {
         };
         if !accepted {
             self.failed_set_result(strict, format!("Cannot assign to property '{name}'"))
-                .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                .map_err(CommittedValueError::JavaScript)?;
         }
         Ok(())
     }
@@ -776,7 +776,7 @@ impl Interpreter {
         let key = VmPropertyKey::String(name);
         let mut current = self
             .get_prototype_for_op(&receiver)
-            .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+            .map_err(CommittedValueError::JavaScript)?;
         let mut hops = 0usize;
         while hops < object::PROTO_CHAIN_HARD_CAP {
             if current.is_null() || current.is_undefined() {
@@ -808,7 +808,7 @@ impl Interpreter {
                 None => {
                     current = self
                         .get_prototype_for_op(&current)
-                        .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                        .map_err(CommittedValueError::JavaScript)?;
                     hops += 1;
                 }
             }
@@ -829,29 +829,29 @@ impl Interpreter {
         let name = key.name();
         let frame = &stack[top_idx];
         let value =
-            *read_register(frame, src).map_err(|error| CommittedValueError::Fatal(error.into()))?;
+            *read_register(frame, src).map_err(CommittedValueError::Fatal)?;
         // §15.7.1 — Op::StorePropertyStrict: class heritage / computed
         // keys are strict code even inside a sloppy function's frame.
         let strict = force_strict || context.function_is_strict(frame.function_id);
         let receiver = *read_register(frame, obj_reg)
-            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+            .map_err(CommittedValueError::Fatal)?;
         if let Some(o) = receiver.as_object()
             && object::deferred_namespace_target(o, &self.gc_heap).is_some()
         {
             self.ensure_deferred_namespace_ready(stack, context, &receiver, true)?;
             if !self
                 .ordinary_set_data_property(o, name, value)
-                .map_err(|error| CommittedValueError::JavaScript(error.into()))?
+                .map_err(CommittedValueError::JavaScript)?
             {
                 self.failed_set_result(
                     strict,
                     format!("Cannot assign to read-only property '{name}'"),
                 )
-                .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                .map_err(CommittedValueError::JavaScript)?;
             }
             stack[top_idx]
                 .advance_pc()
-                .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                .map_err(CommittedValueError::Fatal)?;
             return Ok(());
         }
         let target = if let Some(o) = receiver.as_object() {
@@ -859,16 +859,16 @@ impl Interpreter {
         } else if let Some(c) = receiver.as_class_constructor() {
             if self
                 .class_store_hits_readonly_intrinsic(context, c, name)
-                .map_err(|error| CommittedValueError::JavaScript(error.into()))?
+                .map_err(CommittedValueError::JavaScript)?
             {
                 self.failed_set_result(
                     strict,
                     format!("Cannot assign to read-only property '{name}' of class"),
                 )
-                .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                .map_err(CommittedValueError::JavaScript)?;
                 stack[top_idx]
                     .advance_pc()
-                    .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                    .map_err(CommittedValueError::Fatal)?;
                 return Ok(());
             }
             Some(c.statics(&self.gc_heap))
@@ -895,7 +895,7 @@ impl Interpreter {
                     // rejects the write rather than installing an own slot.
                     let proto = self
                         .get_prototype_for_op(&receiver)
-                        .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                        .map_err(CommittedValueError::JavaScript)?;
                     if let Some(proto_obj) = proto.as_object() {
                         match object::resolve_set(proto_obj, &self.gc_heap, name) {
                             object::SetOutcome::InvokeSetter { setter } => {
@@ -911,7 +911,7 @@ impl Interpreter {
                                 .map_err(CommittedValueError::completed_call)?;
                                 stack[top_idx]
                                     .advance_pc()
-                                    .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                                    .map_err(CommittedValueError::Fatal)?;
                                 return Ok(());
                             }
                             object::SetOutcome::Reject { .. } => {
@@ -919,10 +919,10 @@ impl Interpreter {
                                     strict,
                                     format!("Cannot assign to read-only property '{name}'"),
                                 )
-                                .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                                .map_err(CommittedValueError::JavaScript)?;
                                 stack[top_idx]
                                     .advance_pc()
-                                    .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                                    .map_err(CommittedValueError::Fatal)?;
                                 return Ok(());
                             }
                             object::SetOutcome::AssignData => {}
@@ -937,33 +937,33 @@ impl Interpreter {
                             strict,
                             format!("Cannot add property '{name}' to non-extensible RegExp"),
                         )
-                        .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                        .map_err(CommittedValueError::JavaScript)?;
                         None
                     } else {
                         let bag = regexp_ensure_expando(self, &r, &receiver)
-                            .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                            .map_err(CommittedValueError::JavaScript)?;
                         // The expando ensure allocates; the stored value is
                         // re-read from its traced register slot.
                         let value = *read_register(&stack[top_idx], src)
-                            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                            .map_err(CommittedValueError::Fatal)?;
                         self.ordinary_set_data_property(bag, name, value)
-                            .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                            .map_err(CommittedValueError::JavaScript)?;
                         None
                     }
                 } else {
                     let bag = regexp_ensure_expando(self, &r, &receiver)
-                        .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                        .map_err(CommittedValueError::JavaScript)?;
                     let value = *read_register(&stack[top_idx], src)
-                        .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                        .map_err(CommittedValueError::Fatal)?;
                     if !self
                         .ordinary_set_data_property(bag, name, value)
-                        .map_err(|error| CommittedValueError::JavaScript(error.into()))?
+                        .map_err(CommittedValueError::JavaScript)?
                     {
                         self.failed_set_result(
                             strict,
                             format!("Cannot assign to property '{name}'"),
                         )
-                        .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                        .map_err(CommittedValueError::JavaScript)?;
                     }
                     None
                 }
@@ -991,11 +991,11 @@ impl Interpreter {
                         strict,
                         "Cannot assign to read only property 'length' of array".to_string(),
                     )
-                    .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                    .map_err(CommittedValueError::JavaScript)?;
                 }
                 stack[top_idx]
                     .advance_pc()
-                    .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                    .map_err(CommittedValueError::Fatal)?;
                 return Ok(());
             }
             if !self.store_array_accessor_property(stack, context, a, name, &value, strict)? {
@@ -1004,7 +1004,7 @@ impl Interpreter {
                 if !has_own_named {
                     let proto = self
                         .constructor_prototype_value("Array")
-                        .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                        .map_err(CommittedValueError::Fatal)?;
                     if let Some(proto) = proto.as_object() {
                         match crate::object::resolve_set(proto, &self.gc_heap, name) {
                             object::SetOutcome::InvokeSetter { setter } => {
@@ -1020,7 +1020,7 @@ impl Interpreter {
                                 .map_err(CommittedValueError::completed_call)?;
                                 stack[top_idx]
                                     .advance_pc()
-                                    .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                                    .map_err(CommittedValueError::Fatal)?;
                                 return Ok(());
                             }
                             object::SetOutcome::Reject { .. } => {
@@ -1028,10 +1028,10 @@ impl Interpreter {
                                     strict,
                                     format!("Cannot assign to property '{name}'"),
                                 )
-                                .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                                .map_err(CommittedValueError::JavaScript)?;
                                 stack[top_idx]
                                     .advance_pc()
-                                    .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                                    .map_err(CommittedValueError::Fatal)?;
                                 return Ok(());
                             }
                             object::SetOutcome::AssignData => {}
@@ -1044,7 +1044,7 @@ impl Interpreter {
                     .map_err(|error| CommittedValueError::JavaScript(error.into()))?
                 {
                     self.failed_set_result(strict, format!("Cannot assign to property '{name}'"))
-                        .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                        .map_err(CommittedValueError::JavaScript)?;
                 }
             }
             None
@@ -1074,7 +1074,7 @@ impl Interpreter {
                 )?;
                 if !ok {
                     self.failed_set_result(strict, format!("Cannot assign to property '{name}'"))
-                        .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                        .map_err(CommittedValueError::JavaScript)?;
                 }
             }
             None
@@ -1088,7 +1088,7 @@ impl Interpreter {
                 .ordinary_function_has_own_string_property_for_extensibility(
                     context, owner, fid, name,
                 )
-                .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                .map_err(CommittedValueError::JavaScript)?;
 
             // §10.2.5 — the implicit `prototype` is an own data property from
             // creation; an assignment writes its slot, never the bag.
@@ -1097,32 +1097,32 @@ impl Interpreter {
             {
                 if writable {
                     let value = *read_register(&stack[top_idx], src)
-                        .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                        .map_err(CommittedValueError::Fatal)?;
                     self.store_function_prototype(Some(stack), owner, fid, value)
-                        .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                        .map_err(CommittedValueError::JavaScript)?;
                 } else {
                     self.failed_set_result(
                         strict,
                         "Cannot assign to read-only property 'prototype' of function".to_string(),
                     )
-                    .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                    .map_err(CommittedValueError::JavaScript)?;
                 }
                 stack[top_idx]
                     .advance_pc()
-                    .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                    .map_err(CommittedValueError::Fatal)?;
                 return Ok(());
             }
             if matches!(name, "name" | "length") {
                 let own = self
                     .ordinary_function_own_property_descriptor(Some(context), owner, fid, name)
-                    .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                    .map_err(CommittedValueError::JavaScript)?;
                 match own {
                     Some(desc) if !desc.writable() => {
                         self.failed_set_result(
                             strict,
                             format!("Cannot assign to read-only property '{name}' of function"),
                         )
-                        .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                        .map_err(CommittedValueError::JavaScript)?;
                         None
                     }
                     Some(_) => {
@@ -1130,7 +1130,7 @@ impl Interpreter {
                         // defineProperty): overwrite in place.
                         let bag = self
                             .function_user_bag_for_register(stack, top_idx, obj_reg, src, fid)
-                            .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                            .map_err(CommittedValueError::JavaScript)?;
                         Some(bag)
                     }
                     None => match self
@@ -1141,7 +1141,7 @@ impl Interpreter {
                                 strict,
                                 format!("Cannot assign to read-only property '{name}' of function"),
                             )
-                            .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                            .map_err(CommittedValueError::JavaScript)?;
                             None
                         }
                         MetadataProtoSet::InvokeSetter(setter) => {
@@ -1158,7 +1158,7 @@ impl Interpreter {
                         MetadataProtoSet::Create => {
                             let bag = self
                                 .function_user_bag_for_register(stack, top_idx, obj_reg, src, fid)
-                                .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                                .map_err(CommittedValueError::JavaScript)?;
                             if let Some(metadata_key) =
                                 function_metadata::ordinary_function_metadata_key(name)
                             {
@@ -1173,7 +1173,7 @@ impl Interpreter {
                     strict,
                     format!("Cannot add property '{name}' to non-extensible function"),
                 )
-                .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                .map_err(CommittedValueError::JavaScript)?;
                 None
             } else if !has_own {
                 // §10.1.9 OrdinarySet — an inherited accessor (e.g. the
@@ -1186,7 +1186,7 @@ impl Interpreter {
                             strict,
                             format!("Cannot assign to read-only property '{name}' of function"),
                         )
-                        .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                        .map_err(CommittedValueError::JavaScript)?;
                         None
                     }
                     MetadataProtoSet::InvokeSetter(setter) => {
@@ -1203,14 +1203,14 @@ impl Interpreter {
                     MetadataProtoSet::Create => {
                         let bag = self
                             .function_user_bag_for_register(stack, top_idx, obj_reg, src, fid)
-                            .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                            .map_err(CommittedValueError::JavaScript)?;
                         Some(bag)
                     }
                 }
             } else {
                 let bag = self
                     .function_user_bag_for_register(stack, top_idx, obj_reg, src, fid)
-                    .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                    .map_err(CommittedValueError::JavaScript)?;
                 Some(bag)
             }
         } else if let Some(native) = receiver.as_native_function() {
@@ -1246,7 +1246,7 @@ impl Interpreter {
                                     native.name_string(&self.gc_heap)
                                 ),
                             )
-                            .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                            .map_err(CommittedValueError::JavaScript)?;
                         }
                     }
                     None
@@ -1259,7 +1259,7 @@ impl Interpreter {
                             native.name_string(&self.gc_heap)
                         ),
                     )
-                    .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                    .map_err(CommittedValueError::JavaScript)?;
                     None
                 }
                 // No own slot for `name`/`length` means it was deleted; the
@@ -1276,7 +1276,7 @@ impl Interpreter {
                                     native.name_string(&self.gc_heap)
                                 ),
                             )
-                            .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                            .map_err(CommittedValueError::JavaScript)?;
                         }
                         MetadataProtoSet::InvokeSetter(setter) => {
                             self.run_callable_sync_rooted(
@@ -1301,7 +1301,7 @@ impl Interpreter {
                                         native.name_string(&self.gc_heap)
                                     ),
                                 )
-                                .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                                .map_err(CommittedValueError::JavaScript)?;
                             }
                         }
                     }
@@ -1322,7 +1322,7 @@ impl Interpreter {
                                 native.name_string(&self.gc_heap)
                             ),
                         )
-                        .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                        .map_err(CommittedValueError::JavaScript)?;
                     }
                     None
                 }
@@ -1337,7 +1337,7 @@ impl Interpreter {
                         strict,
                         format!("Cannot assign to read-only property '{name}' of bound function"),
                     )
-                    .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                    .map_err(CommittedValueError::JavaScript)?;
                     None
                 }
                 // Deleted `name`/`length`: resolve along [[Prototype]]
@@ -1352,7 +1352,7 @@ impl Interpreter {
                                     "Cannot assign to read-only property '{name}' of bound function"
                                 ),
                             )
-                            .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                            .map_err(CommittedValueError::JavaScript)?;
                         }
                         MetadataProtoSet::InvokeSetter(setter) => {
                             self.run_callable_sync_rooted(
@@ -1378,7 +1378,7 @@ impl Interpreter {
                                     strict,
                                     format!("Cannot define property '{name}' on bound function"),
                                 )
-                                .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                                .map_err(CommittedValueError::JavaScript)?;
                             }
                         }
                     }
@@ -1398,7 +1398,7 @@ impl Interpreter {
                             strict,
                             format!("Cannot define property '{name}' on bound function"),
                         )
-                        .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                        .map_err(CommittedValueError::JavaScript)?;
                     }
                     None
                 }
@@ -1434,7 +1434,7 @@ impl Interpreter {
                     strict,
                     format!("Cannot assign to read-only property '{name}'"),
                 )
-                .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                .map_err(CommittedValueError::JavaScript)?;
             }
             None
         } else if receiver.is_temporal() {
@@ -1449,7 +1449,7 @@ impl Interpreter {
                     strict,
                     format!("Cannot assign to read-only property '{name}'"),
                 )
-                .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                .map_err(CommittedValueError::JavaScript)?;
             }
             None
         } else if receiver.is_map()
@@ -1470,7 +1470,7 @@ impl Interpreter {
                     strict,
                     format!("Cannot assign to read-only property '{name}'"),
                 )
-                .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                .map_err(CommittedValueError::JavaScript)?;
             }
             None
         } else if receiver.is_intl() || receiver.is_iterator() {
@@ -1487,7 +1487,7 @@ impl Interpreter {
                     strict,
                     format!("Cannot assign to read-only property '{name}'"),
                 )
-                .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                .map_err(CommittedValueError::JavaScript)?;
             }
             None
         } else if receiver.is_undefined() || receiver.is_null() || receiver.is_hole() {
@@ -1513,7 +1513,7 @@ impl Interpreter {
                     value_kind_name(&receiver)
                 ),
             )
-            .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+            .map_err(CommittedValueError::JavaScript)?;
             None
         } else {
             // §10.1.9.2 OrdinarySetWithOwnDescriptor — for
@@ -1529,16 +1529,16 @@ impl Interpreter {
                     value_kind_name(&receiver)
                 ),
             )
-            .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+            .map_err(CommittedValueError::JavaScript)?;
             None
         };
         if let Some(target) = target {
             // Branches above may have allocated (lazy expando bags); the
             // stored value is re-read from its traced register slot.
             let value = *read_register(&stack[top_idx], src)
-                .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                .map_err(CommittedValueError::Fatal)?;
             let receiver = *read_register(&stack[top_idx], obj_reg)
-                .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                .map_err(CommittedValueError::Fatal)?;
             let vm_key = VmPropertyKey::OwnedString(name.to_owned());
             if !self.ordinary_set_data_value(
                 stack,
@@ -1550,12 +1550,12 @@ impl Interpreter {
                 0,
             )? {
                 self.failed_set_result(strict, format!("Cannot assign to property '{name}'"))
-                    .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                    .map_err(CommittedValueError::JavaScript)?;
             }
         }
         stack[top_idx]
             .advance_pc()
-            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+            .map_err(CommittedValueError::Fatal)?;
         Ok(())
     }
 }

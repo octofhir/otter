@@ -120,14 +120,14 @@ impl Interpreter {
         src: u16,
     ) -> Result<(), CommittedValueError> {
         let input = *read_register(&stack[frame_index], src)
-            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+            .map_err(CommittedValueError::Fatal)?;
         let value = self.coerce_to_number(stack, context, &input)?;
         let frame = &mut stack[frame_index];
         write_register(frame, dst, Value::number(value))
-            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+            .map_err(CommittedValueError::Fatal)?;
         frame
             .advance_pc()
-            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+            .map_err(CommittedValueError::Fatal)?;
         Ok(())
     }
 
@@ -168,18 +168,18 @@ impl Interpreter {
         operands: impl crate::executable::OperandSource,
     ) -> Result<bool, CommittedValueError> {
         let dst = register_operand(operands.first())
-            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+            .map_err(CommittedValueError::Fatal)?;
         let src = register_operand(operands.get(1))
-            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+            .map_err(CommittedValueError::Fatal)?;
         let hint_idx = const_operand(operands.get(2))
-            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+            .map_err(CommittedValueError::Fatal)?;
         let hint_token = context
             .string_constant_str(hint_idx)
             .ok_or(VmError::InvalidOperand)
-            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+            .map_err(CommittedValueError::Fatal)?;
         let hint = abstract_ops::ToPrimitiveHint::from_token(hint_token)
             .ok_or(VmError::InvalidOperand)
-            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+            .map_err(CommittedValueError::Fatal)?;
 
         let top_idx = stack.len() - 1;
         let pc = stack[top_idx].pc;
@@ -194,14 +194,14 @@ impl Interpreter {
             .cloned();
         if let Some(state) = resume {
             let produced = *read_register(&stack[top_idx], dst)
-                .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                .map_err(CommittedValueError::Fatal)?;
             if abstract_ops::is_primitive(&produced) {
                 if let Some(cold) = self.frame_cold_mut(&mut stack[top_idx]) {
                     cold.pending_to_primitive = None;
                 }
                 stack[top_idx]
                     .advance_pc()
-                    .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                    .map_err(CommittedValueError::Fatal)?;
                 return Ok(false);
             }
             if state.stage == ToPrimitiveStage::SymbolResult {
@@ -225,13 +225,13 @@ impl Interpreter {
 
         // 2. Fresh entry — primitive fast path.
         let recv = *read_register(&stack[top_idx], src)
-            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+            .map_err(CommittedValueError::Fatal)?;
         if abstract_ops::is_primitive(&recv) {
             write_register(&mut stack[top_idx], dst, recv)
-                .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                .map_err(CommittedValueError::Fatal)?;
             stack[top_idx]
                 .advance_pc()
-                .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                .map_err(CommittedValueError::Fatal)?;
             return Ok(false);
         }
 
@@ -602,7 +602,7 @@ impl Interpreter {
                                         args,
                                     )
                                     .map_err(|error| {
-                                        CommittedValueError::JavaScript(error.into())
+                                        CommittedValueError::JavaScript(error)
                                     });
                             }
                             Some(_) => {
@@ -641,7 +641,7 @@ impl Interpreter {
                                     interp.escape_scoped(receiver_root),
                                     args,
                                 )
-                                .map_err(|error| CommittedValueError::JavaScript(error.into()));
+                                .map_err(CommittedValueError::JavaScript);
                         }
                         // Fallback: when the prototype chain has no
                         // own / inherited callable for `method`, fall
@@ -663,7 +663,7 @@ impl Interpreter {
                                 &mut interp.gc_heap,
                                 fn_proto,
                             )
-                            .map_err(|error| CommittedValueError::JavaScript(error.into()))?
+                            .map_err(CommittedValueError::JavaScript)?
                                 && abstract_ops::is_primitive(&v)
                             {
                                 let top_idx = stack.len() - 1;
@@ -671,10 +671,10 @@ impl Interpreter {
                                     cold.pending_to_primitive = None;
                                 }
                                 write_register(&mut stack[top_idx], dst, v)
-                                    .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                                    .map_err(CommittedValueError::Fatal)?;
                                 stack[top_idx]
                                     .advance_pc()
-                                    .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                                    .map_err(CommittedValueError::Fatal)?;
                                 return Ok(false);
                             }
                         }
@@ -710,7 +710,7 @@ impl Interpreter {
                                     interp.escape_scoped(receiver_root),
                                     args,
                                 )
-                                .map_err(|error| CommittedValueError::JavaScript(error.into()));
+                                .map_err(CommittedValueError::JavaScript);
                         }
                         // Same prototype-intercept fallback as
                         // OrdinaryFirst above — runs the second method
@@ -729,7 +729,7 @@ impl Interpreter {
                                 &mut interp.gc_heap,
                                 fn_proto,
                             )
-                            .map_err(|error| CommittedValueError::JavaScript(error.into()))?
+                            .map_err(CommittedValueError::JavaScript)?
                                 && abstract_ops::is_primitive(&v)
                             {
                                 let top_idx = stack.len() - 1;
@@ -737,10 +737,10 @@ impl Interpreter {
                                     cold.pending_to_primitive = None;
                                 }
                                 write_register(&mut stack[top_idx], dst, v)
-                                    .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                                    .map_err(CommittedValueError::Fatal)?;
                                 stack[top_idx]
                                     .advance_pc()
-                                    .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                                    .map_err(CommittedValueError::Fatal)?;
                                 return Ok(false);
                             }
                         }

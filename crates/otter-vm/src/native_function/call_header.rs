@@ -141,8 +141,7 @@ impl NativeCallHeader {
     }
 
     pub(super) fn set_prototype_overridden(&mut self, overridden: bool) {
-        self.flags = self.flags & !Self::PROTOTYPE_OVERRIDE
-            | u8::from(overridden) * Self::PROTOTYPE_OVERRIDE;
+        self.flags = self.flags & !Self::PROTOTYPE_OVERRIDE | (u8::from(overridden) * Self::PROTOTYPE_OVERRIDE);
     }
 
     pub(super) fn host_ref(self) -> Option<u32> {

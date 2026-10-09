@@ -67,7 +67,7 @@ impl Interpreter {
     ) -> Result<Value, CommittedValueError> {
         if let Some(value) = self
             .unmaterialized_argument_read(&ActiveFrameRef::from_frame(&stack[index]), key)
-            .map_err(|error| CommittedValueError::JavaScript(error.into()))?
+            .map_err(CommittedValueError::JavaScript)?
         {
             return Ok(value);
         }
@@ -79,7 +79,7 @@ impl Interpreter {
         }
         let object = self
             .materialize_frame_arguments_object(context, stack, index)
-            .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+            .map_err(CommittedValueError::JavaScript)?;
         self.materialized_argument_read(context, stack, object, key.map(|_| rooted_key))
     }
 
@@ -92,7 +92,7 @@ impl Interpreter {
     ) -> Result<Value, CommittedValueError> {
         if let Some(value) = self
             .unmaterialized_argument_read(&frame.as_ref(), key)
-            .map_err(|error| CommittedValueError::JavaScript(error.into()))?
+            .map_err(CommittedValueError::JavaScript)?
         {
             return Ok(value);
         }
@@ -104,7 +104,7 @@ impl Interpreter {
         }
         let object = self
             .jit_materialize_arguments(context, stack, frame)
-            .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+            .map_err(CommittedValueError::JavaScript)?;
         self.materialized_argument_read(context, stack, object, key.map(|_| rooted_key))
     }
 }

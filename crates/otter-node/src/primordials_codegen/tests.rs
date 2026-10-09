@@ -292,54 +292,52 @@ struct Shape {
 
 impl<'a> Visit<'a> for Shape {
     fn visit_if_statement(&mut self, statement: &oxc_ast::ast::IfStatement<'a>) {
-        if let Expression::BinaryExpression(expression) = &statement.test {
-            if let Expression::Identifier(identifier) = &expression.right {
-                if ["explicit", "symbolWells", "constructors", "namespaces"]
-                    .contains(&identifier.name.as_str())
-                {
-                    self.guard_authorities.push(identifier.name.to_string());
-                }
-            }
+        if let Expression::BinaryExpression(expression) = &statement.test
+            && let Expression::Identifier(identifier) = &expression.right
+            && ["explicit", "symbolWells", "constructors", "namespaces"]
+                .contains(&identifier.name.as_str())
+        {
+            self.guard_authorities.push(identifier.name.to_string());
         }
         walk::walk_if_statement(self, statement);
     }
 
     fn visit_call_expression(&mut self, call: &oxc_ast::ast::CallExpression<'a>) {
-        if let Expression::Identifier(id) = &call.callee {
-            if matches!(
+        if let Expression::Identifier(id) = &call.callee
+            && matches!(
                 id.name.as_str(),
                 "__otterPrimordialStatic" | "__otterPrimordialStaticApply"
-            ) {
-                assert_eq!(
-                    call.arguments.len(),
-                    3,
-                    "one holder and two fixed key operands"
-                );
-                let Argument::ComputedMemberExpression(holder) = &call.arguments[0] else {
-                    panic!("static holder is an explicit captured-table member")
-                };
-                let Expression::Identifier(authority) = &holder.object else {
-                    panic!("captured holder authority")
-                };
-                let Expression::StringLiteral(base) = &holder.expression else {
-                    panic!("fixed holder key")
-                };
-                let Argument::StringLiteral(key0) = &call.arguments[1] else {
-                    panic!("fixed first member key")
-                };
-                let key1 = match &call.arguments[2] {
-                    Argument::StringLiteral(key) => Some(key.value.to_string()),
-                    Argument::NullLiteral(_) => None,
-                    _ => panic!("fixed fallback key or literal null"),
-                };
-                self.static_calls.push((
-                    id.name.to_string(),
-                    authority.name.to_string(),
-                    base.value.to_string(),
-                    key0.value.to_string(),
-                    key1,
-                ));
-            }
+            )
+        {
+            assert_eq!(
+                call.arguments.len(),
+                3,
+                "one holder and two fixed key operands"
+            );
+            let Argument::ComputedMemberExpression(holder) = &call.arguments[0] else {
+                panic!("static holder is an explicit captured-table member")
+            };
+            let Expression::Identifier(authority) = &holder.object else {
+                panic!("captured holder authority")
+            };
+            let Expression::StringLiteral(base) = &holder.expression else {
+                panic!("fixed holder key")
+            };
+            let Argument::StringLiteral(key0) = &call.arguments[1] else {
+                panic!("fixed first member key")
+            };
+            let key1 = match &call.arguments[2] {
+                Argument::StringLiteral(key) => Some(key.value.to_string()),
+                Argument::NullLiteral(_) => None,
+                _ => panic!("fixed fallback key or literal null"),
+            };
+            self.static_calls.push((
+                id.name.to_string(),
+                authority.name.to_string(),
+                base.value.to_string(),
+                key0.value.to_string(),
+                key1,
+            ));
         }
         if matches!(&call.callee, Expression::Identifier(id) if id.name == "ReflectApply") {
             self.apply_arities.insert(call.arguments.len());

@@ -109,7 +109,7 @@ fn concat(
 
 /// Return exact primitive ordering without managed allocation or user coercion.
 #[must_use]
-pub extern "C" fn primitive_string_order(
+pub(crate) extern "C" fn primitive_string_order(
     heap: *const otter_gc::GcHeap,
     lhs: u64,
     rhs: u64,

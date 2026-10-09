@@ -528,9 +528,7 @@ fn split_group_cell_initializers(code: &[u8], region: &Json, object_bytes: u32) 
     let (first, candidate) = headers[0];
     let second = headers[1].0;
     assert!(
-        words[first + 1..second]
-            .iter()
-            .any(|&word| word == 0x9100_0000 | (object_bytes << 10) | (candidate << 5) | candidate),
+        words[first + 1..second].contains(&(0x9100_0000 | (object_bytes << 10) | (candidate << 5) | candidate)),
         "the array candidate advances by the exact first physical cell before its header"
     );
     let mut first_region = region.clone();
@@ -663,11 +661,9 @@ fn assert_empty_native_bytes(
                 .collect()
         };
         assert!(
-            offsets.iter().all(|&byte| words.iter().any(|&word| word
-                == 0xf900_0000
+            offsets.iter().all(|&byte| words.contains(&(0xf900_0000
                     | ((byte / 8) << 10)
-                    | (candidate << 5)
-                    | if index == 0 { 16 } else { 31 })),
+                    | (candidate << 5) | if index == 0 { 16 } else { 31 }))),
             "every VM-owned initial Value/payload word is emitted into the fit candidate"
         );
     }

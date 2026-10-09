@@ -545,7 +545,7 @@ impl Interpreter {
     ) -> Result<(), CommittedValueError> {
         let mode = LookupGlobalMode::from_imm32(mode)
             .ok_or(VmError::InvalidOperand)
-            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+            .map_err(CommittedValueError::Fatal)?;
         let name = Self::lookup_name(context, function_id, name_idx)
             .map_err(CommittedValueError::Fatal)?;
         if let Some(extension) = context::probe_extensions(
@@ -633,7 +633,7 @@ impl Interpreter {
     ) -> Result<(), CommittedValueError> {
         let mode = StoreRefMode::from_imm32(mode)
             .ok_or(VmError::InvalidOperand)
-            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+            .map_err(CommittedValueError::Fatal)?;
         let name = Self::lookup_name(context, function_id, name_idx)
             .map_err(CommittedValueError::Fatal)?;
         if let Some(extension) = reference.as_eval_extension() {
@@ -653,10 +653,10 @@ impl Interpreter {
             let slot = mode
                 .slot
                 .ok_or(VmError::InvalidOperand)
-                .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                .map_err(CommittedValueError::Fatal)?;
             return self
                 .store_slot_with_fallback(context, target, slot, mode.fallback, value, name)
-                .map_err(|error| CommittedValueError::JavaScript(error.into()));
+                .map_err(CommittedValueError::JavaScript);
         }
         if reference.is_undefined() {
             return self.store_global_binding_value(

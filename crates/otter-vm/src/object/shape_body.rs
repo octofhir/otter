@@ -914,22 +914,6 @@ pub(crate) fn shape_key_matches_str(
     !actual.is_null() && eq_str(heap, actual, key)
 }
 
-/// Return transition atoms with their slot offsets, root-first.
-#[must_use]
-pub(crate) fn shape_atoms_ordered(heap: &GcHeap, mut shape: ShapeHandle) -> Vec<(AtomId, u32)> {
-    let mut atoms = Vec::new();
-    while !shape.is_null() {
-        let (parent, transition_atom, own_offset) = heap.read_payload(shape, |body| {
-            (body.parent(), body.transition_atom(), body.own_offset())
-        });
-        if transition_atom != AtomId::NONE {
-            atoms.push((transition_atom, own_offset));
-        }
-        shape = parent;
-    }
-    atoms
-}
-
 /// Return transition keys in ordinary insertion order with their slot offsets.
 #[must_use]
 pub(crate) fn shape_keys_ordered(

@@ -5614,17 +5614,23 @@ pub(crate) fn normalize_before_keyed_addition(
     obj: &mut JsObject,
     heap: &mut GcHeap,
 ) -> Result<(), otter_gc::OutOfMemory> {
-    let shape = shape(*obj, heap);
-    let state = shape_body::state_of(shape);
-    if state.is_dictionary() || !state.is_extensible() || state.is_prototype() || state.is_opaque()
-    {
-        return Ok(());
-    }
-    let count = shape_body::property_count_of(shape) as usize;
-    if count < shape_body::inline_capacity_of(shape) + KEYED_FAST_PROPERTIES {
+    if !keyed_addition_normalizes(*obj, heap) {
         return Ok(());
     }
     normalize_to_dictionary(obj, heap)
+}
+
+/// Whether a keyed store adding a property to `obj` first leaves it in
+/// dictionary mode ([`normalize_before_keyed_addition`]).
+pub(crate) fn keyed_addition_normalizes(obj: JsObject, heap: &GcHeap) -> bool {
+    let shape = shape(obj, heap);
+    let state = shape_body::state_of(shape);
+    if state.is_dictionary() || !state.is_extensible() || state.is_prototype() || state.is_opaque()
+    {
+        return false;
+    }
+    let count = shape_body::property_count_of(shape) as usize;
+    count >= shape_body::inline_capacity_of(shape) + KEYED_FAST_PROPERTIES
 }
 
 /// Move a keyed object's string-keyed properties into dictionary storage,

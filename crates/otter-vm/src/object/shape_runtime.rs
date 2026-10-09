@@ -68,7 +68,6 @@ use crate::string::{JsStringHandle, alloc_flat_string_body_with_roots};
 use super::descriptor::PropertyFlags;
 use super::shape_body::{
     ShapeBody, ShapeHandle, alloc_child_shape_body_with_roots, alloc_root_shape_body_with_roots,
-    shape_atoms_ordered,
 };
 use super::{ShapeId, ShapeState};
 
@@ -94,13 +93,11 @@ struct TransitionKey {
     is_accessor: bool,
 }
 
-/// The weakly held tables: every shape by id, the transition cache, and the
-/// flattened offset cache.
+/// The weakly held tables: every shape by id and the transition cache.
 #[derive(Default)]
 struct WeakShapeTables {
     handles_by_id: FxHashMap<ShapeId, ShapeHandle>,
     transitions: FxHashMap<TransitionKey, ShapeHandle>,
-    offset_cache: FxHashMap<ShapeId, FxHashMap<AtomId, u32>>,
     /// Rooted state variants are weak and keyed by stable source identity.
     state_variants: FxHashMap<(ShapeId, ShapeState), ShapeHandle>,
     /// Transitions out of each provisional shape: the tree slack tracking
@@ -141,7 +138,6 @@ impl std::fmt::Debug for ShapeRuntime {
         f.debug_struct("ShapeRuntime")
             .field("key_strings", &self.key_strings.len())
             .field("transitions", &tables.transitions.len())
-            .field("offset_cache", &tables.offset_cache.len())
             .field("observer_installed", &self.observer.is_some())
             .finish()
     }
@@ -405,7 +401,6 @@ impl ShapeRuntime {
         let WeakShapeTables {
             handles_by_id,
             transitions,
-            offset_cache,
             state_variants,
             provisional_children,
             ..
@@ -424,7 +419,6 @@ impl ShapeRuntime {
             return;
         }
         transitions.retain(|_, child| !dead.contains(&child.offset()));
-        offset_cache.retain(|id, _| handles_by_id.contains_key(id));
         provisional_children.retain(|parent, children| {
             children.retain(|child| !dead.contains(&child.offset()));
             handles_by_id.contains_key(parent)
@@ -586,32 +580,6 @@ impl ShapeRuntime {
         });
     }
 
-    /// Lookup `key` in a shape, using the flattened cache when available.
-    #[must_use]
-    pub(crate) fn offset_of(
-        &mut self,
-        heap: &GcHeap,
-        shape: ShapeHandle,
-        key: &str,
-    ) -> Option<u32> {
-        let atom = self.names.lookup(key);
-        let shape_id = heap.read_payload(shape, ShapeBody::id);
-        if let Some(cache) = self.tables.borrow().offset_cache.get(&shape_id) {
-            return cache.get(&atom).copied();
-        }
-
-        let mut cache = FxHashMap::default();
-        for (atom, offset) in shape_atoms_ordered(heap, shape) {
-            cache.insert(atom, offset);
-        }
-        let result = cache.get(&atom).copied();
-        self.tables
-            .borrow_mut()
-            .offset_cache
-            .insert(shape_id, cache);
-        result
-    }
-
     /// Number of interned shape property names.
     #[cfg(test)]
     #[must_use]
@@ -652,7 +620,12 @@ mod tests {
 
         assert_eq!(first, second);
         assert_eq!(runtime.interned_key_count(), 1);
-        assert_eq!(runtime.offset_of(&heap, first, "x"), Some(0));
+        let atom = runtime.names().lookup("x");
+        assert_eq!(
+            super::super::shape_body::shape_slot_of_atom(&heap, first, atom)
+                .map(|slot| slot.offset),
+            Some(0)
+        );
     }
 
     #[test]

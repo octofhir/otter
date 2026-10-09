@@ -642,6 +642,39 @@ impl Interpreter {
                 object::store_proven_data_slot(obj, &mut self.gc_heap, resolved.hit.slot, value);
                 return Ok(());
             }
+            // V8's generic keyed store adds a key its receiver's chain lets it
+            // add by the receiver class's transition, shared with every site
+            // as a named add is, unless the keyed soft limit first leaves the
+            // receiver a dictionary.
+            if !object::keyed_addition_normalizes(obj, &self.gc_heap)
+                && matches!(
+                    object::resolve_set_atomized(obj, &self.gc_heap, key),
+                    object::SetOutcome::AssignData
+                )
+            {
+                let name = name.clone();
+                let key = crate::property_atom::AtomizedPropertyKey::new(
+                    crate::property_atom::PropertyAtom::new(atom),
+                    &name,
+                );
+                // Interning the child shape may collect; a refused add leaves
+                // the full path below with current receiver and key words.
+                let mut roots = otter_gc::RootScope::new(&mut self.gc_heap);
+                // SAFETY: both locals stay declared and unmoved while the
+                // scope is live; it is dropped before either is read again.
+                unsafe {
+                    roots.add_value(&mut receiver);
+                    roots.add_value(&mut key_value);
+                }
+                let transition = self
+                    .capture_store_property_transition_with_stack_roots(stack, obj, key, &value)
+                    .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                drop(roots);
+                if let Some(transition) = transition {
+                    self.property_cache.record_store(transition);
+                    return Ok(());
+                }
+            }
         }
         let mut property_key = Value::undefined();
         let strict = force_strict || context.function_is_strict(function_id);

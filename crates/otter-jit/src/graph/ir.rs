@@ -1160,6 +1160,9 @@ impl FrameState {
             f(&mut caller.this);
             f(&mut caller.closure);
             f(&mut caller.new_target);
+            for argument in caller.arguments.iter_mut().flatten() {
+                f(argument);
+            }
         }
         for (_, value) in &mut self.registers {
             f(value);
@@ -1168,7 +1171,7 @@ impl FrameState {
 }
 
 /// The call an inlined frame runs for.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub(crate) struct InlineCaller {
     /// The calling frame's state. It resumes after the call and stands on
     /// the call until this frame returns.
@@ -1181,6 +1184,9 @@ pub(crate) struct InlineCaller {
     pub(crate) closure: NodeId,
     /// The frame's `new.target`.
     pub(crate) new_target: NodeId,
+    /// The call's actual arguments when legacy `fn.arguments` can read the
+    /// frame; the rebuilt activation's incoming arguments.
+    pub(crate) arguments: Option<SmallVec<[NodeId; 4]>>,
 }
 
 /// A point graph construction can return to; see [`Graph::checkpoint`].
@@ -1277,7 +1283,11 @@ impl Graph {
         let mut cursor = Some(id);
         while let Some(state) = cursor {
             chain.push(state);
-            cursor = self.frame_state(state).caller.map(|caller| caller.state);
+            cursor = self
+                .frame_state(state)
+                .caller
+                .as_ref()
+                .map(|caller| caller.state);
         }
         chain.reverse();
         chain
@@ -1285,13 +1295,15 @@ impl Graph {
 
     /// Every value the frame states of `id`'s chain read, outermost frame
     /// first: an inlined frame's entry bindings (`this`, closure,
-    /// `new.target`), then each frame's live registers.
+    /// `new.target`, recorded actual arguments), then each frame's live
+    /// registers.
     pub(crate) fn state_values(&self, id: FrameStateId) -> SmallVec<[NodeId; 16]> {
         let mut values = SmallVec::new();
         for state in self.state_chain(id) {
             let data = self.frame_state(state);
-            if let Some(caller) = data.caller {
+            if let Some(caller) = &data.caller {
                 values.extend([caller.this, caller.closure, caller.new_target]);
+                values.extend(caller.arguments.iter().flatten().copied());
             }
             values.extend(data.registers.iter().map(|&(_, value)| value));
         }

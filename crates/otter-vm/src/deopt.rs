@@ -368,6 +368,11 @@ pub struct DeoptFrame<Slot = DeoptSlot> {
     pub register_count: u16,
     /// The registers this state reconstructs, strictly ascending by index.
     pub slots: Box<[(u16, Slot)]>,
+    /// An inlined frame's actual arguments, in order, when legacy
+    /// `fn.arguments` can read its activation: the rebuilt frame's incoming
+    /// arguments (V8's inlined-arguments translation). `None` rebuilds the
+    /// incoming arguments from the parameter registers.
+    pub arguments: Option<Box<[Slot]>>,
 }
 
 impl<Slot> DeoptFrame<Slot> {
@@ -395,6 +400,7 @@ impl<Slot> DeoptFrame<Slot> {
             entry,
             register_count: u16::try_from(slots.len()).expect("a window fits the register space"),
             slots,
+            arguments: None,
         }
     }
 }
@@ -472,7 +478,9 @@ impl FrameState {
             return Err(DeoptVerifyError::EmptyFrameChain);
         }
         for (index, frame) in self.frames.iter().enumerate() {
-            if frame.entry.is_some() != (index != 0) {
+            if frame.entry.is_some() != (index != 0)
+                || (frame.entry.is_none() && frame.arguments.is_some())
+            {
                 return Err(DeoptVerifyError::InvalidFrameEntry { frame_index: index });
             }
             if let Some(entry) = &frame.entry
@@ -569,7 +577,13 @@ impl DeoptFrame {
             .flat_map(|entry| [&entry.this, &entry.closure, &entry.new_target])
             .enumerate()
             .map(|(index, slot)| (usize::from(self.register_count) + index, slot));
-        for (slot_index, slot) in register_slots.chain(entry_slots) {
+        let argument_slots = self
+            .arguments
+            .iter()
+            .flat_map(|arguments| arguments.iter())
+            .enumerate()
+            .map(|(index, slot)| (usize::from(self.register_count) + 3 + index, slot));
+        for (slot_index, slot) in register_slots.chain(entry_slots).chain(argument_slots) {
             verify_slot(slot, limits, self.byte_pc, slot_index, virtual_object_count)?;
         }
         Ok(())
@@ -748,6 +762,10 @@ impl<A> FrameState<A> {
                         .iter()
                         .map(|(register, slot)| (*register, f(slot)))
                         .collect(),
+                    arguments: frame
+                        .arguments
+                        .as_ref()
+                        .map(|arguments| arguments.iter().map(&mut f).collect()),
                 })
                 .collect(),
             virtual_objects: self

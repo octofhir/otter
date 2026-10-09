@@ -233,7 +233,7 @@ fn nested_global_reads_keep_their_source_proofs_and_before_load_exit_chain() {
             );
             let mut chain = state;
             let mut depth = 0;
-            while let Some(frame) = chain.caller {
+            while let Some(frame) = &chain.caller {
                 chain = built.graph.frame_state(frame.state);
                 depth += 1;
             }

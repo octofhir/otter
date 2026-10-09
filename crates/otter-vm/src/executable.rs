@@ -841,6 +841,20 @@ impl CodeBlock {
             && self.control_flow().handlers().is_empty()
     }
 
+    /// Whether legacy `fn.arguments` reads an activation of this body: an
+    /// ordinary sloppy function (not arrow, method, generator or async), as
+    /// `Interpreter::legacy_function_metadata_eligible` admits. An inlined
+    /// frame of such a body records its actual arguments for deopt.
+    #[must_use]
+    pub fn exposes_legacy_arguments(&self) -> bool {
+        !self.is_strict
+            && !self.is_arrow
+            && !self.is_method
+            && !self.is_generator
+            && !self.is_async
+            && !self.is_async_generator
+    }
+
     /// Last logical backedge PC for a loop header.
     #[must_use]
     pub(crate) fn loop_latch(&self, header_pc: u32) -> Option<u32> {

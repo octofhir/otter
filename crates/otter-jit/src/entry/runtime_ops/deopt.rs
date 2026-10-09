@@ -210,6 +210,16 @@ extern "C" fn prepare_deopt_writeback(
                     .iter()
                     .map(|&(register, slot)| Ok((register, decode(slot)?)))
                     .collect::<Result<_, VmError>>()?,
+                arguments: frame
+                    .arguments
+                    .as_ref()
+                    .map(|arguments| {
+                        arguments
+                            .iter()
+                            .map(|&slot| decode(slot))
+                            .collect::<Result<_, VmError>>()
+                    })
+                    .transpose()?,
             })
         })
         .collect::<Result<Vec<_>, VmError>>()

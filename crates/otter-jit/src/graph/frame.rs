@@ -117,12 +117,17 @@ pub(crate) fn deopt_frames(
         .into_iter()
         .map(|state| {
             let data = graph.frame_state(state);
-            let entry = data.caller.map(|caller| DeoptFrameEntry {
+            let entry = data.caller.as_ref().map(|caller| DeoptFrameEntry {
                 return_register: caller.return_register,
                 this: slot(caller.this),
                 closure: slot(caller.closure),
                 new_target: slot(caller.new_target),
             });
+            let arguments = data
+                .caller
+                .as_ref()
+                .and_then(|caller| caller.arguments.as_ref())
+                .map(|arguments| arguments.iter().map(|&value| slot(value)).collect());
             // Each value consumes its location in state order; a later write
             // to a register replaces an earlier one, and a literal `undefined`
             // is the window's resumption default, which the recipe omits.
@@ -141,6 +146,7 @@ pub(crate) fn deopt_frames(
                     .into_iter()
                     .filter(|(_, slot)| *slot != undefined)
                     .collect(),
+                arguments,
             }
         })
         .collect();

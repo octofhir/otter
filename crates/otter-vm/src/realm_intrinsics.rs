@@ -263,6 +263,7 @@ impl Intrinsic {
 pub(crate) struct RealmIntrinsics {
     slots: [JsObject; Intrinsic::COUNT],
     array_values: crate::native_function::NativeFunction,
+    array_constructor: crate::native_function::NativeFunction,
     /// Whether this realm's `%RegExp.prototype%` is built-in, while proven.
     pub(crate) regexp_protocol: Option<crate::regexp_fast::RegExpProtocolProof>,
     /// Which iteration reads have built-in answers in this realm, while proven.
@@ -277,6 +278,7 @@ impl Default for RealmIntrinsics {
         Self {
             slots: [JsObject::null(); Intrinsic::COUNT],
             array_values: crate::native_function::NativeFunction::from_gc(otter_gc::Gc::null()),
+            array_constructor: crate::native_function::NativeFunction::from_gc(otter_gc::Gc::null()),
             regexp_protocol: None,
             iteration: crate::iteration_protocol::IterationProofs::default(),
             iterator_result: None,
@@ -319,6 +321,11 @@ impl RealmIntrinsics {
             .then(|| crate::Value::native_function(self.array_values))
     }
 
+    /// Original `%Array%` constructor, independent of the mutable global.
+    pub(crate) fn array_constructor(&self) -> Option<crate::native_function::NativeFunction> {
+        (!self.array_constructor.raw().is_null()).then_some(self.array_constructor)
+    }
+
     /// Read one slot, mapping the null handle to `None`.
     #[must_use]
     pub(crate) fn get(&self, slot: Intrinsic) -> Option<JsObject> {
@@ -341,6 +348,11 @@ impl RealmIntrinsics {
             .unwrap_or_else(|| {
                 crate::native_function::NativeFunction::from_gc(otter_gc::Gc::null())
             });
+        self.array_constructor = object::get(global, heap, "Array")
+            .and_then(|value| value.as_native_function())
+            .unwrap_or_else(|| {
+                crate::native_function::NativeFunction::from_gc(otter_gc::Gc::null())
+            });
     }
 
     /// Visit every slot address, filled or not.
@@ -355,6 +367,7 @@ impl RealmIntrinsics {
             visitor(p);
         }
         self.array_values.trace_gc_roots(visitor);
+        self.array_constructor.trace_gc_roots(visitor);
     }
 
     /// Trace cached prototype handles as root slots.
@@ -367,12 +380,17 @@ impl RealmIntrinsics {
         if !self.array_values.raw().is_null() {
             self.array_values.trace_gc_roots(visitor);
         }
+        if !self.array_constructor.raw().is_null() {
+            self.array_constructor.trace_gc_roots(visitor);
+        }
     }
 
     /// All slots empty?
     #[cfg(test)]
     pub(crate) fn is_empty(&self) -> bool {
-        self.slots.iter().all(|handle| handle.is_null()) && self.array_values.raw().is_null()
+        self.slots.iter().all(|handle| handle.is_null())
+            && self.array_values.raw().is_null()
+            && self.array_constructor.raw().is_null()
     }
 }
 

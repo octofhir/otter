@@ -2827,6 +2827,28 @@ impl<'a> Builder<'a> {
         if !self.view.instructions[self.pc as usize].call_attempted {
             return self.deopt(DeoptReason::InsufficientFeedback);
         }
+        // `new <%Array%>(length)` (V8's ReduceArrayConstructor): the realm's
+        // original constructor, proved by identity, creates its array
+        // without a frame of its own.
+        if construct
+            && argc <= 1
+            && let Some(&cell) = self.view.array_constructor_sites.get(&instruction.byte_pc)
+            && !self.exited_for(ExitReason::IdentityGuard)
+        {
+            let callee = self.read(callee);
+            let callee = self.tagged(callee);
+            self.add(Kind::CheckCellValue(cell), &[callee], Repr::None);
+            let length = match arguments.first() {
+                Some(&register) => {
+                    let value = self.read(register);
+                    self.tagged(value)
+                }
+                None => self.constant_tagged(otter_vm::Value::number_i32(0).to_bits()),
+            };
+            let array = self.add(Kind::NewArrayWithLength, &[length], Repr::Tagged);
+            self.write(instruction.writes[0], array);
+            return;
+        }
         // A native leaf target runs on its operand words without a frame;
         // one this site may not speculate on keeps the baseline operation.
         if !construct

@@ -530,6 +530,7 @@ impl CodeBlock {
             guarded_method_calls: rustc_hash::FxHashMap::default(),
             function_prototype_calls: rustc_hash::FxHashMap::default(),
             instanceof_cells: rustc_hash::FxHashMap::default(),
+            array_constructor_sites: rustc_hash::FxHashMap::default(),
             forward_apply_native_ref: None,
             property_programs: rustc_hash::FxHashMap::default(),
             property_action_cache: None,

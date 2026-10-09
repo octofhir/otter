@@ -43,6 +43,11 @@ impl CalleeIdentityCell {
         Self(AtomicU64::new(Self::EMPTY))
     }
 
+    /// A cell already holding `value`, which generated code only compares.
+    pub(crate) fn holding(value: crate::Value) -> Self {
+        Self(AtomicU64::new(value.to_bits()))
+    }
+
     /// Address generated code reads and writes.
     pub(crate) fn address(&self) -> u64 {
         self.0.as_ptr() as u64

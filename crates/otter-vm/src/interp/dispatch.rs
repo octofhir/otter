@@ -639,11 +639,7 @@ impl Interpreter {
                                 .and_then(|register| {
                                     stack[top_idx].registers.get(register as usize).copied()
                                 })
-                                .and_then(|callee| {
-                                    callee
-                                        .as_native_function()
-                                        .map(|_| crate::feedback::OrdinaryCallTarget::Native)
-                                })
+                                .and_then(|callee| self.native_construct_target(callee))
                         })
                         .flatten();
                     if jit_installed {

@@ -1046,6 +1046,17 @@ impl Interpreter {
         address
     }
 
+    /// An identity cell that holds `value` for generated code to compare,
+    /// retained by the compilation and rewritten by the collector.
+    pub(crate) fn bake_held_identity_cell(&self, value: Value) -> u64 {
+        let cell = std::sync::Arc::new(crate::jit_roots::CalleeIdentityCell::holding(value));
+        let address = cell.address();
+        self.jit_compile_roots
+            .borrow_mut()
+            .push(crate::jit_roots::CompilationRoot::CalleeIdentity(cell));
+        address
+    }
+
     /// A fresh `instanceof` cell for one generated site, retained by the
     /// compilation and registered for [`Self::retire_instanceof_proofs_for`].
     pub(crate) fn bake_instanceof_cell(&self) -> u64 {
@@ -2457,6 +2468,18 @@ impl Interpreter {
                     feedback::OrdinaryCallTarget::Native => {
                         view.native_calls
                             .insert(call_byte_pc, jit::JitNativeCall::Native);
+                        continue;
+                    }
+                    feedback::OrdinaryCallTarget::ArrayConstructor => {
+                        view.native_calls
+                            .insert(call_byte_pc, jit::JitNativeCall::Native);
+                        if op == Op::New
+                            && let Some(array) = self.realm_intrinsics.array_constructor()
+                        {
+                            let address =
+                                self.bake_held_identity_cell(Value::native_function(array));
+                            view.array_constructor_sites.insert(call_byte_pc, address);
+                        }
                         continue;
                     }
                     feedback::OrdinaryCallTarget::Bytecode(callee_fid)

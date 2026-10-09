@@ -130,6 +130,15 @@ impl Codegen<'_> {
                     exit,
                 );
             }
+            Kind::CheckCellValue(cell) => {
+                let exit = self.eager_exit(node, DeoptReason::WrongValue);
+                let target = RelocationTarget::CalleeIdentityCell {
+                    function_id: self.view_of(node).code_block.id,
+                    call_pc: self.graph.node(node).pc,
+                };
+                emit_load_symbol_u64(&mut self.ops, &mut self.relocations, 11, cell, target);
+                dynasm!(self.ops ; .arch x64 ; cmp Rq(input(0)), [r11] ; jne =>exit);
+            }
             Kind::CheckNotHole => {
                 let exit = self.eager_exit(node, DeoptReason::WrongValue);
                 self.load_immediate(10, tag::VALUE_HOLE);

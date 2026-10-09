@@ -804,6 +804,9 @@ pub struct JitCompileSnapshot {
     /// `%Function.prototype.call%`. Generated code proves the intrinsic and
     /// calls the function it ran directly, with the first argument as `this`.
     pub function_prototype_calls: rustc_hash::FxHashMap<u32, JitFunctionPrototypeCallSite>,
+    /// `new` sites whose callee was the realm's original `%Array%`, keyed by
+    /// byte PC: the address of an identity cell holding that constructor.
+    pub array_constructor_sites: rustc_hash::FxHashMap<u32, u64>,
     /// Address of each `instanceof` site's cell, keyed by byte PC: the last
     /// target the site proved and the prototype it searches for.
     pub instanceof_cells: rustc_hash::FxHashMap<u32, u64>,
@@ -1987,6 +1990,7 @@ impl JitCompileSnapshot {
             guarded_method_calls: rustc_hash::FxHashMap::default(),
             function_prototype_calls: rustc_hash::FxHashMap::default(),
             instanceof_cells: rustc_hash::FxHashMap::default(),
+            array_constructor_sites: rustc_hash::FxHashMap::default(),
             forward_apply_native_ref: None,
             property_programs: rustc_hash::FxHashMap::default(),
             property_action_cache: None,

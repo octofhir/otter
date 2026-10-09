@@ -253,7 +253,7 @@ pub(crate) fn emit(
     .with_lazy_window(lazy_window);
     let mut codegen = Codegen {
         ops,
-        relocations: RelocationCapture::new(capture_relocations),
+        relocations: crate::arm64::literal_pool_capture(capture_relocations, view),
         view,
         inline_views: &built.inline_views,
         graph: &built.graph,
@@ -368,6 +368,7 @@ pub(crate) fn emit(
         view,
     );
     codegen.emit_float_pool();
+    codegen.relocations.emit_literal_pool(&mut codegen.ops);
     codegen
         .return_sites
         .sort_by_key(|site| site.native_return_offset);

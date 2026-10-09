@@ -741,8 +741,19 @@ mod tests {
         assert_eq!(osr[0]["logicalPc"].as_u64(), Some(0));
         let osr_start = osr[0]["startOffset"].as_u64().unwrap();
         let total = code.code_len() as u64;
-        assert!(body_start <= body_end && body_end <= osr_start && osr_start <= total);
-        assert_eq!(osr[0]["endOffset"].as_u64(), Some(total));
+        // The literal pool, when any load uses it, follows every instruction.
+        let instructions_end = map["regions"]
+            .as_array()
+            .expect("native regions are an array")
+            .iter()
+            .find(|region| region["kind"] == "literalPool")
+            .map_or(total, |region| {
+                assert_eq!(region["endOffset"].as_u64(), Some(total));
+                region["startOffset"].as_u64().unwrap()
+            });
+        assert!(body_start <= body_end && body_end <= osr_start && osr_start <= instructions_end);
+        assert!(osr[0]["endOffset"].as_u64().unwrap() <= instructions_end);
+        assert!(instructions_end - osr[0]["endOffset"].as_u64().unwrap() < 8);
         let call_entry = code
             .call_entry_addr()
             .expect("the JavaScript call entry is retained")

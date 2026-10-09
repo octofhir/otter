@@ -182,8 +182,10 @@ fn assert_generated(
         .unwrap()
         .iter()
         .filter(|relocation| {
+            // A literal-pool word is the address the load site reads.
             relocation["target"]["kind"] == "functionEntryCell"
                 && relocation["target"]["functionId"] == target.plan.function_id
+                && relocation["form"] != "literalWord"
         })
         .collect();
     assert_eq!(links.len(), 1, "each target has one actual Known edge");

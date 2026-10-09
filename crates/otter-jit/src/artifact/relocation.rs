@@ -11,7 +11,12 @@
 //! # Invariants
 //! - Relocation ranges use exact `code.bin` byte offsets and contain one
 //!   the target's fixed address-materialization form: AArch64 `MOVZ`/`MOVK`
-//!   sequences or one x86-64 `mov r64, imm64`.
+//!   sequences, an 8-byte AArch64 literal-pool word that one PC-relative
+//!   `LDR (literal)` reads (V8's arm64 constant pool), or one x86-64
+//!   `mov r64, imm64`.
+//! - A literal pool follows every instruction of its code object, which the
+//!   tier keeps within the `LDR (literal)` range; each distinct address has
+//!   one word.
 //! - Captured targets contain semantic identities only. Raw target addresses
 //!   never enter this module's state or either rendered artifact.
 //! - Exact relocation JSON may name an isolate-local target code generation.
@@ -44,6 +49,8 @@ const ITEM_RELOCATION: u8 = 1;
 const ITEM_DIRECT_BRANCH: u8 = 2;
 #[cfg(not(target_arch = "x86_64"))]
 const ITEM_DATA_WORD: u8 = 4;
+#[cfg(not(target_arch = "x86_64"))]
+const ITEM_LITERAL_WORD: u8 = 5;
 
 const TARGET_RUNTIME_STUB: u8 = 1;
 const TARGET_GC_CAGE_BASE: u8 = 2;
@@ -203,25 +210,136 @@ struct RelocationRecord {
     end: usize,
     register: u8,
     target: RelocationTarget,
+    form: RelocationForm,
 }
 
-/// Optional emission-side typed relocation storage.
+/// How a relocation site encodes its address.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) enum RelocationForm {
+    /// `MOVZ`/`MOVK` instructions, or x86-64 `mov r64, imm64`.
+    Immediate,
+    /// One AArch64 `LDR (literal)` reading the target's pool word.
+    LiteralLoad,
+    /// The 8-byte pool word holding the target's address.
+    LiteralWord,
+}
+
+impl RelocationForm {
+    fn is_immediate(&self) -> bool {
+        *self == Self::Immediate
+    }
+}
+
+/// The pending AArch64 literal pool of one code object: each distinct
+/// symbolic address once, with the label its loads address.
+#[cfg(not(target_arch = "x86_64"))]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct LiteralPool {
+    enabled: bool,
+    entries: Vec<(u64, RelocationTarget, dynasmrt::DynamicLabel)>,
+    index: rustc_hash::FxHashMap<u64, usize>,
+}
+
+/// Optional emission-side typed relocation storage, and the literal pool
+/// address loads may use.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct RelocationCapture {
     enabled: bool,
     records: Vec<RelocationRecord>,
     /// Byte ranges of in-code data (literal pools), never instructions.
     data: Vec<(usize, usize)>,
+    #[cfg(not(target_arch = "x86_64"))]
+    pool: LiteralPool,
 }
 
 impl RelocationCapture {
     /// Creates capture storage without allocating a record buffer.
-    pub(crate) const fn new(enabled: bool) -> Self {
+    pub(crate) fn new(enabled: bool) -> Self {
         Self {
             enabled,
             records: Vec::new(),
             data: Vec::new(),
+            #[cfg(not(target_arch = "x86_64"))]
+            pool: LiteralPool::default(),
         }
+    }
+
+    /// Load every symbolic address through one PC-relative `LDR (literal)`
+    /// of a pool word: the caller emits [`Self::emit_literal_pool`] after
+    /// its last instruction and keeps the code within the instruction's
+    /// ±1 MiB range.
+    #[cfg(not(target_arch = "x86_64"))]
+    pub(crate) fn with_literal_pool(mut self) -> Self {
+        self.pool.enabled = true;
+        self
+    }
+
+    /// Load `value` into `X(register)` with one `LDR (literal)` of its pool
+    /// word, when the pool is enabled; `false` leaves the load to the
+    /// caller.
+    #[cfg(not(target_arch = "x86_64"))]
+    pub(crate) fn emit_literal_load(
+        &mut self,
+        ops: &mut dynasmrt::aarch64::Assembler,
+        register: u8,
+        value: u64,
+        target: RelocationTarget,
+    ) -> bool {
+        use dynasmrt::{DynasmApi, DynasmLabelApi, dynasm};
+        if !self.pool.enabled {
+            return false;
+        }
+        let label = if let Some(&index) = self.pool.index.get(&value) {
+            self.pool.entries[index].2
+        } else {
+            let label = ops.new_dynamic_label();
+            self.pool.index.insert(value, self.pool.entries.len());
+            self.pool.entries.push((value, target.clone(), label));
+            label
+        };
+        let start = ops.offset().0;
+        dynasm!(ops ; .arch aarch64 ; ldr X(register), =>label);
+        if self.enabled {
+            self.records.push(RelocationRecord {
+                start,
+                end: start + 4,
+                register,
+                target,
+                form: RelocationForm::LiteralLoad,
+            });
+        }
+        true
+    }
+
+    /// Emit the pool every [`Self::emit_literal_load`] reads, after the code
+    /// object's last instruction; the pool's byte range, if any.
+    #[cfg(not(target_arch = "x86_64"))]
+    pub(crate) fn emit_literal_pool(
+        &mut self,
+        ops: &mut dynasmrt::aarch64::Assembler,
+    ) -> Option<(usize, usize)> {
+        use dynasmrt::{DynasmApi, DynasmLabelApi, dynasm};
+        if self.pool.entries.is_empty() {
+            return None;
+        }
+        let pool_start = ops.offset().0;
+        dynasm!(ops ; .arch aarch64 ; .align 8);
+        for (value, target, label) in std::mem::take(&mut self.pool.entries) {
+            let start = ops.offset().0;
+            dynasm!(ops ; .arch aarch64 ; =>label ; .u64 value);
+            if self.enabled {
+                self.records.push(RelocationRecord {
+                    start,
+                    end: start + 8,
+                    register: 0,
+                    target,
+                    form: RelocationForm::LiteralWord,
+                });
+            }
+        }
+        self.pool.index.clear();
+        Some((pool_start, ops.offset().0))
     }
 
     /// Records one in-code data range (a literal pool) that `ldr (literal)`
@@ -253,6 +371,7 @@ impl RelocationCapture {
             end,
             register,
             target,
+            form: RelocationForm::Immediate,
         });
     }
 
@@ -273,6 +392,7 @@ impl RelocationCapture {
             end,
             register,
             target,
+            form: RelocationForm::Immediate,
         });
     }
 
@@ -361,6 +481,7 @@ fn render_x86_64(
             width_bits: 64,
             chunks: Vec::new(),
             target: record.target,
+            form: RelocationForm::Immediate,
         });
     }
     let json = render_json(&validated);
@@ -690,6 +811,8 @@ pub(super) struct ValidatedRelocation {
     pub(super) width_bits: u8,
     chunks: Vec<MovWideChunk>,
     pub(super) target: RelocationTarget,
+    #[serde(skip_serializing_if = "RelocationForm::is_immediate")]
+    pub(super) form: RelocationForm,
 }
 
 impl ValidatedRelocation {
@@ -770,7 +893,37 @@ fn validate_relocations(
 
     records
         .into_iter()
-        .map(|record| validate_mov_wide(record, code))
+        .map(|record| match record.form {
+            RelocationForm::Immediate => validate_mov_wide(record, code),
+            RelocationForm::LiteralLoad => {
+                let instruction = read_instruction(code, record.start);
+                if instruction & 0xff00_0000 != 0x5800_0000
+                    || (instruction & 0x1f) as u8 != record.register
+                {
+                    return Err(RelocationError::ExpectedMovz {
+                        offset: record.start,
+                    });
+                }
+                Ok(ValidatedRelocation {
+                    start_offset: record.start as u64,
+                    end_offset: record.end as u64,
+                    register: record.register,
+                    width_bits: 64,
+                    chunks: Vec::new(),
+                    target: record.target,
+                    form: record.form,
+                })
+            }
+            RelocationForm::LiteralWord => Ok(ValidatedRelocation {
+                start_offset: record.start as u64,
+                end_offset: record.end as u64,
+                register: record.register,
+                width_bits: 64,
+                chunks: Vec::new(),
+                target: record.target,
+                form: record.form,
+            }),
+        })
         .collect()
 }
 
@@ -798,7 +951,21 @@ fn validate_record_bounds(
         });
     }
     let instruction_count = (record.end - record.start) / 4;
-    if !(1..=4).contains(&instruction_count) {
+    if record.form == RelocationForm::LiteralLoad {
+        if instruction_count != 1 {
+            return Err(RelocationError::MovWideInstructionCount {
+                start: record.start,
+                count: instruction_count,
+            });
+        }
+    } else if record.form == RelocationForm::LiteralWord {
+        if instruction_count != 2 || !record.start.is_multiple_of(8) {
+            return Err(RelocationError::RangeNotInstructionAligned {
+                start: record.start,
+                end: record.end,
+            });
+        }
+    } else if !(1..=4).contains(&instruction_count) {
         return Err(RelocationError::MovWideInstructionCount {
             start: record.start,
             count: instruction_count,
@@ -901,6 +1068,7 @@ fn validate_mov_wide(
         width_bits,
         chunks,
         target: record.target,
+        form: RelocationForm::Immediate,
     })
 }
 
@@ -996,9 +1164,13 @@ fn render_normalized(
         match item {
             LogicalItem::Relocation { index } => {
                 let relocation = &relocations[*index];
-                output.push(ITEM_RELOCATION);
-                output.push(relocation.register);
-                output.push(relocation.width_bits);
+                if relocation.form == RelocationForm::LiteralWord {
+                    output.push(ITEM_LITERAL_WORD);
+                } else {
+                    output.push(ITEM_RELOCATION);
+                    output.push(relocation.register);
+                    output.push(relocation.width_bits);
+                }
                 encode_target(&relocation.target, &mut output)?;
             }
             LogicalItem::DataWord { offset } => {

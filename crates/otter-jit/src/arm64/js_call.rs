@@ -42,7 +42,7 @@ use crate::{
         REQUEST_RECEIVER_OFFSET, REQUEST_REGISTER_SEED_OFFSET, TransitionTable, Unsupported,
         VALUE_UNDEFINED,
     },
-    template::arm64::values::{emit_load_u64, emit_load_u64_wide},
+    template::arm64::values::{emit_load_symbol_u64, emit_load_u64},
 };
 
 /// Prove a full tagged NativeFunction cell before reading its header.
@@ -303,12 +303,11 @@ pub(crate) fn emit_call(
             entry_cell,
             function_id,
         } => {
-            let start = ops.offset().0;
-            emit_load_u64_wide(ops, 8, entry_cell);
-            relocations.record_mov_wide(
-                start,
-                ops.offset().0,
+            emit_load_symbol_u64(
+                ops,
+                relocations,
                 8,
+                entry_cell,
                 RelocationTarget::FunctionEntryCell { function_id },
             );
             dynasm!(ops
@@ -323,12 +322,11 @@ pub(crate) fn emit_call(
                 CallTarget::Native => abi::STUB_JIT_CALL_NATIVE,
                 _ => abi::STUB_JIT_CALL_GENERIC,
             };
-            let start = ops.offset().0;
-            emit_load_u64_wide(ops, 16, table.entry(stub));
-            relocations.record_mov_wide(
-                start,
-                ops.offset().0,
+            emit_load_symbol_u64(
+                ops,
+                relocations,
                 16,
+                table.entry(stub),
                 RelocationTarget::runtime_stub(stub),
             );
             dynasm!(ops ; .arch aarch64 ; blr x16);
@@ -351,12 +349,11 @@ pub(crate) fn emit_tail_branch(
             entry_cell,
             function_id,
         } => {
-            let start = ops.offset().0;
-            emit_load_u64_wide(ops, 8, entry_cell);
-            relocations.record_mov_wide(
-                start,
-                ops.offset().0,
+            emit_load_symbol_u64(
+                ops,
+                relocations,
                 8,
+                entry_cell,
                 RelocationTarget::FunctionEntryCell { function_id },
             );
             // A handed-over caller anchor enters the callee as a staged
@@ -378,12 +375,11 @@ pub(crate) fn emit_tail_branch(
                 CallTarget::Native => abi::STUB_JIT_CALL_NATIVE,
                 _ => abi::STUB_JIT_CALL_GENERIC,
             };
-            let start = ops.offset().0;
-            emit_load_u64_wide(ops, 16, table.entry(stub));
-            relocations.record_mov_wide(
-                start,
-                ops.offset().0,
+            emit_load_symbol_u64(
+                ops,
+                relocations,
                 16,
+                table.entry(stub),
                 RelocationTarget::runtime_stub(stub),
             );
             dynasm!(ops ; .arch aarch64 ; br x16);
@@ -424,12 +420,11 @@ pub(crate) fn emit_enter_staged(
         ; str xzr, [x16, abi::REQUEST_CALLER_RETURN_PC_OFFSET]
         ; =>origin_ready
     );
-    let start = ops.offset().0;
-    emit_load_u64_wide(ops, 16, table.entry(abi::STUB_JIT_CALL));
-    relocations.record_mov_wide(
-        start,
-        ops.offset().0,
+    emit_load_symbol_u64(
+        ops,
+        relocations,
         16,
+        table.entry(abi::STUB_JIT_CALL),
         RelocationTarget::runtime_stub(abi::STUB_JIT_CALL),
     );
     dynasm!(ops ; .arch aarch64 ; blr x16 ; =>return_to_caller);

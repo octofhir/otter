@@ -1,7 +1,9 @@
 //! Interpreted execution evidence required before replacing deoptimized code.
 //!
 //! # Contents
-//! - Optimized-code retirement and entry routing for one retraining function.
+//! - Optimized-code retirement and entry routing for one retraining function;
+//!   callers that spliced its body keep their code until their own guards
+//!   fail.
 //! - Fresh-activation and complete-loop evidence carried by cold frame records.
 //!
 //! # Invariants
@@ -29,12 +31,13 @@ impl Interpreter {
         {
             self.optimizing_tier_policy.bind_source(function);
         }
-        // Only optimized code embeds the failed speculation: drop it and the
-        // optimized callers that spliced it. The baseline generation stays
-        // installed while the stable cell routes entries to the interpreter.
-        let mut affected = self
-            .jit_code_registry
-            .invalidate_optimizing_for_retraining(fid);
+        // Only optimized code embeds the failed speculation: drop this
+        // function's own. Like V8, a caller that spliced the body keeps its
+        // code and leaves through its own copy of the guard if that guard
+        // ever fails there, recompiling from the feedback this retraining
+        // collects. The baseline generation stays installed while the
+        // stable cell routes entries to the interpreter.
+        let mut affected = self.jit_code_registry.invalidate_own_optimizing(fid);
         self.jit_runtime_stats.caller_invalidations = self
             .jit_runtime_stats
             .caller_invalidations

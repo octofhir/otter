@@ -674,23 +674,18 @@ impl JitCodeRegistry {
         self.invalidate_code_objects(seeds)
     }
 
-    /// Unlink the optimizing generations compiled from `function_id` and every
-    /// optimizing caller that spliced it, for a deopt's retraining. Baseline
-    /// generations, including baseline callers' guarded leaf splices, stay.
-    pub(crate) fn invalidate_optimizing_for_retraining(&mut self, function_id: u32) -> Vec<u32> {
+    /// Unlink the optimizing generations compiled from `function_id` alone,
+    /// for a deopt's retraining. Baseline generations and optimizing callers
+    /// that spliced the body stay installed.
+    pub(crate) fn invalidate_own_optimizing(&mut self, function_id: u32) -> Vec<u32> {
         let seeds = self
             .codes
             .iter()
             .filter_map(|(&code_object_id, registered)| {
                 (registered.state == CodeLifetimeState::Installed
                     && registered.code.native_frame_kind() == NativeFrameKind::Optimizing
-                    && (registered.code.metadata().code_block_id == function_id
-                        || registered
-                            .code
-                            .spliced_functions()
-                            .binary_search(&function_id)
-                            .is_ok()))
-                .then_some(code_object_id)
+                    && registered.code.metadata().code_block_id == function_id)
+                    .then_some(code_object_id)
             })
             .collect::<Vec<_>>();
         self.invalidate_code_objects(seeds)
@@ -878,7 +873,9 @@ impl JitCodeRegistry {
         let routed = self
             .function_entry_cells
             .get(&function_id)
-            .map_or(0, |function| function.interpreter_destination().generated_feedback().0);
+            .map_or(0, |function| {
+                function.interpreter_destination().generated_feedback().0
+            });
         self.entry_cells
             .values()
             .map(|entry| entry.cell.as_ref())

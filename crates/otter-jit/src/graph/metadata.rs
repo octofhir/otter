@@ -29,10 +29,11 @@
 use std::sync::Arc;
 
 use otter_vm::JitCompileSnapshot;
-use otter_vm::deopt::DeoptFrame;
+use otter_vm::deopt::{DeoptFrame, DeoptLocation};
 use otter_vm::native_abi::{self as abi, SafepointRecord, SpillRoots};
 use rustc_hash::FxHashMap;
 
+use super::frame::SlotLayout;
 use super::ir::{Graph, Kind, NodeId};
 use super::regalloc::Allocation;
 use crate::template::TemplatePlan;
@@ -92,14 +93,16 @@ pub(crate) struct SitePlan {
     records: Vec<SafepointRecord>,
     ids: FxHashMap<SiteKey, abi::SafepointId>,
     scratch: u32,
+    slots: SlotLayout,
 }
 
 impl SitePlan {
-    pub(crate) fn new(scratch: u32) -> Self {
+    pub(crate) fn new(slots: SlotLayout) -> Self {
         Self {
-            records: vec![entry_safepoint(scratch)],
+            records: vec![entry_safepoint(slots.spill_tagged)],
             ids: FxHashMap::default(),
-            scratch,
+            scratch: slots.spill_tagged,
+            slots,
         }
     }
 
@@ -125,7 +128,7 @@ impl SitePlan {
         &mut self,
         key: SiteKey,
         call_pc: u32,
-        inline_frames: impl FnOnce() -> Box<[DeoptFrame<Option<u16>>]>,
+        inline_frames: impl FnOnce() -> Box<[DeoptFrame]>,
     ) -> abi::SafepointId {
         if let Some(&id) = self.ids.get(&key) {
             return id;
@@ -173,22 +176,43 @@ impl SitePlan {
         let rooted = self.rooted(allocation, node)?;
         let data = graph.node(node);
         let key = (Some((data.origin, data.pc)), rooted);
+        let slots = self.slots;
         Ok(self.intern(key, graph.outer_pc(node), || {
+            // A suspended JS call holds every value of its lazy state in a
+            // home or as a constant: each inlined activation's binding and
+            // actual arguments read from there (V8's FrameInspector).
+            let described: Vec<DeoptFrame> = data
+                .lazy
+                .filter(|_| data.origin != 0)
+                .map(|state| {
+                    super::frame::deopt_frames(graph, slots, state, &allocation.node(node).lazy)
+                        .into_vec()
+                })
+                .unwrap_or_default();
             let mut frames = Vec::new();
             let mut origin = data.origin;
+            let mut depth = described.len();
             let mut byte_pc = source_view(view, inline_views, graph, node)
                 .instructions
                 .get(data.pc as usize)
                 .map_or(0, |instruction| instruction.byte_pc);
             while origin != 0 {
                 let body = graph.inlined[usize::from(origin) - 1];
+                depth = depth.saturating_sub(1);
+                let activation = described
+                    .get(depth)
+                    .filter(|frame| frame.function_id == body.function_id);
                 frames.push(DeoptFrame {
                     function_id: body.function_id,
                     byte_pc,
-                    entry: None,
+                    entry: activation
+                        .and_then(|frame| frame.entry)
+                        .filter(|entry| readable(&entry.closure)),
                     register_count: 0,
                     slots: Box::new([]),
-                    arguments: None,
+                    arguments: activation
+                        .and_then(|frame| frame.arguments.clone())
+                        .filter(|arguments| arguments.iter().all(readable)),
                 });
                 byte_pc = body.call_byte_pc;
                 origin = body.parent;
@@ -197,6 +221,15 @@ impl SitePlan {
             frames.into_boxed_slice()
         }))
     }
+}
+
+/// Whether a suspended frame can read `slot` back: a home or a constant,
+/// never a register the call clobbered or a scalar-replaced object.
+fn readable(slot: &otter_vm::deopt::DeoptSlot) -> bool {
+    matches!(
+        slot.location,
+        DeoptLocation::StackSlot(_) | DeoptLocation::Literal(_)
+    )
 }
 
 /// The record of one deopt recipe: the recipe's tagged homes, which every

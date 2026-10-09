@@ -114,7 +114,7 @@ fn codegen<'a>(
         committed_throw,
         propagate,
         materialize,
-        sites: metadata::SitePlan::new(slots.spill_tagged),
+        sites: metadata::SitePlan::new(slots),
         return_sites: Vec::new(),
     }
 }

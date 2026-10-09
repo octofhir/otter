@@ -172,7 +172,7 @@ pub(crate) fn emit(
         committed_throw,
         propagate,
         materialize,
-        sites: metadata::SitePlan::new(slots.spill_tagged),
+        sites: metadata::SitePlan::new(slots),
         return_sites: Vec::new(),
     };
     let tier_entry = codegen.ops.offset().0;

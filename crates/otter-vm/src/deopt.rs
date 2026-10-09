@@ -196,7 +196,8 @@ impl std::error::Error for DeoptVerifyError {}
 /// general register, a double in an FP register); the deopt record names the
 /// representation so the exit re-tags it into the boxed `Value` the
 /// interpreter frame expects.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 pub enum DeoptRepr {
     /// Already a full 8-byte tagged `Value`; the raw bits are the value.
     Tagged,
@@ -238,7 +239,8 @@ pub const DEOPT_REGISTER_DUMP_WORDS: usize = 64;
 pub const DEOPT_FLOAT_REGISTER_BASE: u8 = 32;
 
 /// Where a value lives at a deopt point, relative to the optimized frame.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 pub enum DeoptLocation {
     /// A canonical home, by signed byte offset from the compiled slot base.
     StackSlot(i32),
@@ -291,7 +293,8 @@ pub enum VirtualMaterializationValue {
 /// A [`DeoptLocation::VirtualObject`] names a recipe in the same
 /// [`FrameState`]; no separate materialization table or emitter-owned state
 /// exists.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct DeoptSlot {
     /// Where the value lives or which virtual recipe materializes it.
     pub location: DeoptLocation,

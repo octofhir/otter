@@ -17,6 +17,7 @@ mod jit_call;
 mod jit_compile;
 mod jit_intrinsic_properties;
 mod jit_retraining;
+mod logical_frames;
 mod modules;
 mod protos;
 mod prototype_shapes;

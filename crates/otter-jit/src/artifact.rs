@@ -571,7 +571,7 @@ fn render_safepoints(records: &[SafepointRecord], return_sites: &[SafepointEntry
         id: u32,
         frame_state: u32,
         tagged_locations: Vec<Location>,
-        inline_frames: &'a [otter_vm::deopt::DeoptFrame<Option<u16>>],
+        inline_frames: &'a [otter_vm::deopt::DeoptFrame],
         call_pc: Option<u32>,
     }
 

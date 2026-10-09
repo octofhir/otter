@@ -485,6 +485,9 @@ struct Builder<'a> {
 const MAX_INLINED_BYTECODE_CUMULATIVE: u32 = 920;
 /// The most bytecode bytes inlined into one compilation by any bodies.
 const MAX_INLINED_BYTECODE_ABSOLUTE: u32 = 4600;
+/// The most actual arguments a spliced body's elided `arguments[i]` selects
+/// among; a call with more keeps the body out of line.
+const MAX_SELECTED_ARGUMENTS: usize = 8;
 
 /// How an inlined body binds `this`.
 #[derive(Clone, Copy)]
@@ -1013,8 +1016,7 @@ impl<'a> Builder<'a> {
                     this,
                     closure,
                     new_target,
-                    arguments: code
-                        .exposes_legacy_arguments()
+                    arguments: (code.exposes_legacy_arguments() || code.needs_arguments())
                         .then(|| arguments.iter().copied().collect()),
                 },
                 depth,
@@ -1995,6 +1997,8 @@ impl<'a> Builder<'a> {
                 self.write(instruction.writes[0], result);
             }
             Op::LoadElement => self.visit_load_element(instruction),
+            Op::LoadArgumentsLength => self.visit_arguments_length(instruction),
+            Op::LoadArgumentsElement => self.visit_arguments_element(instruction),
             Op::StoreElement | Op::StoreElementStrict => self.visit_store_element(instruction),
             Op::LoadContextSlot => self.visit_load_context_slot(instruction, false),
             Op::LoadContextSlotChecked if !self.exited_for(ExitReason::IdentityGuard) => {
@@ -3716,6 +3720,73 @@ impl<'a> Builder<'a> {
             Repr::None,
         );
         self.known.elements_read.clear();
+    }
+
+    /// The elided `arguments.length`: a spliced call's actual count, or the
+    /// physical activation's.
+    fn visit_arguments_length(&mut self, instruction: &Instruction) {
+        let count = match self.inline.as_ref().map(|inline| {
+            inline
+                .caller
+                .arguments
+                .as_ref()
+                .map(|arguments| arguments.len())
+        }) {
+            None => self.add(Kind::LoadArgumentCount, &[], Repr::Int32),
+            Some(Some(count)) => match i32::try_from(count) {
+                Ok(count) => self.constant_int32(count),
+                Err(_) => return self.generic(instruction),
+            },
+            Some(None) => return self.generic(instruction),
+        };
+        self.write(instruction.writes[0], count);
+    }
+
+    /// The elided `arguments[i]` for an int32 `i` naming an actual
+    /// argument: one of a spliced call's argument values, or the physical
+    /// activation's actual. Any other key, or an index past the actuals,
+    /// leaves for the interpreter, whose ordinary `[[Get]]` materializes the
+    /// object; a site that left once keeps the baseline operation.
+    fn visit_arguments_element(&mut self, instruction: &Instruction) {
+        if self.exited_before() {
+            return self.generic(instruction);
+        }
+        let arguments = match self.inline.as_ref() {
+            None => None,
+            Some(inline) => match inline.caller.arguments.clone() {
+                Some(arguments)
+                    if !arguments.is_empty() && arguments.len() <= MAX_SELECTED_ARGUMENTS =>
+                {
+                    Some(arguments)
+                }
+                _ => return self.generic(instruction),
+            },
+        };
+        let key = self.read(instruction.reads[0]);
+        let index = self.int32(key);
+        let value = match arguments {
+            None => self.add(Kind::LoadActualArgument, &[index], Repr::Tagged),
+            Some(arguments) => {
+                if let Kind::ConstInt32(constant) = self.graph.node(index).kind {
+                    match usize::try_from(constant)
+                        .ok()
+                        .and_then(|constant| arguments.get(constant))
+                    {
+                        Some(&argument) => self.tagged(argument),
+                        None => return self.generic(instruction),
+                    }
+                } else {
+                    let mut inputs: SmallVec<[NodeId; 4]> = smallvec::smallvec![index];
+                    for &argument in &arguments {
+                        let argument = self.tagged(argument);
+                        inputs.push(argument);
+                    }
+                    let count = arguments.len() as u8;
+                    self.add(Kind::SelectArgument { count }, &inputs, Repr::Tagged)
+                }
+            }
+        };
+        self.write(instruction.writes[0], value);
     }
 
     /// An element load that sees Array storage of several kinds or a name

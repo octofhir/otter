@@ -50,11 +50,10 @@ impl Route {
         }
     }
 
+    /// Every route's lineage tree holds the base's four fields and the
+    /// derived constructor's eight, whichever terminal sampled the receiver.
     fn final_capacity(self) -> usize {
-        match self {
-            Self::TransparentProxy | Self::Bound => 12,
-            Self::UserTrap => 4,
-        }
+        12
     }
 }
 
@@ -272,7 +271,7 @@ JSON.stringify([forwardBaseCalls, forwardTrapCalls,
                 expected.extend_from_within(..);
                 assert_eq!(
                     sizes, expected,
-                    "{selection:?}, {route:?}, lexical={lexical}: transparent Super samples all12 fields at the outer terminal; user-trap ordinary construction samples4 locally; first7 cells never shrink"
+                    "{selection:?}, {route:?}, lexical={lexical}: the finished lineage holds every field its transition tree places; first7 cells never shrink"
                 );
             }
         }

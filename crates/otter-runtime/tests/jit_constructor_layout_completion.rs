@@ -3,7 +3,8 @@
 //! # Contents
 //! - Native/Proxy first super followed by a rejected bytecode second super.
 //! - Successful transparent Proxy/Bound Super and observable-trap ownership.
-//! - Escaped rejected receivers grow after child terminal sampling.
+//! - Escaped rejected receivers grow after child terminal sampling; the
+//!   finished lineage holds that growth.
 //! - First-seven retained cells and the future finalized cell survive full GC.
 //!
 //! # Invariants
@@ -141,12 +142,15 @@ JSON.stringify([mixedOuterReceivers.length, escapedRejectedReceivers.length,
                     .expect("owned observation premises");
                 let prefix = otter_gc::header::HEADER_SIZE
                     + std::mem::size_of::<otter_vm::object::ObjectBody>();
+                // Slack tracking finishes the lineage over its whole
+                // transition tree: the escaped receivers' later eight fields
+                // are in-object for future cells; the first seven keep 64.
                 let mut expected = vec![prefix + 64 * 8; 7];
-                expected.push(prefix + 8);
+                expected.push(prefix + 9 * 8);
                 expected.extend_from_within(..);
                 assert_eq!(
                     sizes, expected,
-                    "{selection:?}, proxy={proxy}, lexical={lexical_label}: rejected child samples at one-field terminal; later escaped growth cannot enlarge finalized future cells or shrink first seven"
+                    "{selection:?}, proxy={proxy}, lexical={lexical_label}: the finished lineage holds every field its transition tree places; first seven keep their cells"
                 );
             }
         }

@@ -281,11 +281,7 @@ mod tests {
                     .unwrap(),
                 &proof
             ));
-            assert_eq!(
-                vm.gc_heap
-                    .read_payload(layout, |body| body.prepared_capacity(provisional, Value::object(proto))),
-                None
-            );
+            assert_eq!(root, provisional, "slack tracking keeps the family's one lineage");
             assert_eq!(
                 vm.gc_heap.read_payload(layout, |body| body.prepared_capacity(root, Value::NULL)),
                 None,

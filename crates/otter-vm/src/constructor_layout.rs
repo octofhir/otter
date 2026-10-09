@@ -1,4 +1,4 @@
-//! Constructor-owned seven-completion receiver layouts.
+//! Constructor-owned receiver layouts with in-object slack tracking.
 //!
 //! # Contents
 //! - [`ConstructorLayoutBody`] owns one exact base/new.target/prototype family.
@@ -8,20 +8,24 @@
 //!
 //! # Invariants
 //! - A family starts with 64 persistent in-object words on a provisional shape
-//!   lineage. Its shapes are ordinary immutable layouts for every guard; no
-//!   allocation plan ever allocates from a provisional root.
-//! - Exactly seven terminal outer constructions sample their allocated receiver,
-//!   including abrupt completion and explicit replacement-object returns. An
-//!   ordinary call or a derived construction with no receiver supplies no sample.
+//!   lineage (V8's in-object slack tracking). Its shapes are ordinary layouts
+//!   for every guard; no allocation plan ever allocates from a provisional
+//!   root.
+//! - Exactly seven terminal outer constructions are counted, including abrupt
+//!   completion and explicit replacement-object returns. An ordinary call or a
+//!   derived construction with no receiver supplies no sample.
 //! - The family retains shapes/prototype and a non-owning base-id key, never an instance. Only
 //!   the canonical active construct packet/frame owns the allocated receiver.
 //! - Successful field preparation belongs to the exact family root. Its
-//!   existing prototype proof invalidates on mutation; root publication clears
-//!   the result. No per-root side map retains dead families or code.
-//! - Completion records scalar slack only. A later rooted preparation may
-//!   replace the active root with a newly allocated final lineage; metadata OOM
-//!   leaves the provisional root usable and cannot change a completed result.
-//! - First-seven cells and every old shape retain their immutable capacity.
+//!   existing prototype proof invalidates on mutation; finishing the lineage
+//!   clears the result. No per-root side map retains dead families or code.
+//! - After the seventh sample a rooted preparation finishes slack tracking in
+//!   place: the family keeps its root, and every shape of the root's
+//!   transition tree shrinks to the fewest in-object slots that hold every
+//!   field any of them places (and the static required count), so one lineage
+//!   serves receivers allocated before and after. No existing field moves;
+//!   first-seven cells keep their wider footprint. Metadata OOM leaves the
+//!   provisional lineage usable.
 //! - Layout cells live in old space. Their monotonic identity is the generated
 //!   guard; no reclaimable or moving GC address is baked as family identity.
 //! - Family identities are isolate-local and never reused. The weak index
@@ -47,10 +51,7 @@ pub use completion::constructor_terminal;
 #[cfg(test)]
 mod tests;
 
-use crate::{
-    Value,
-    object::{ShapeHandle, ShapeState},
-};
+use crate::{Value, object::ShapeHandle};
 use otter_gc::raw::SlotVisitor;
 use otter_gc::{Gc, GcHeap};
 use rustc_hash::FxHashMap;
@@ -101,8 +102,6 @@ pub(crate) struct ConstructorLayoutBody {
     detached: bool,
     /// Seven initially; zero permanently after the final terminal sample.
     samples_remaining: u8,
-    /// Minimum unused words among the first seven allocated receivers.
-    minimum_unused: u8,
     /// Source-proven static slots required by the whole base/derived family.
     required_slots: u8,
     /// Successful preparation of this exact finalized root. No receiver or
@@ -142,7 +141,6 @@ impl ConstructorLayoutBody {
             owner,
             detached: false,
             samples_remaining: CONSTRUCTOR_LAYOUT_SAMPLES,
-            minimum_unused: CONSTRUCTOR_PROVISIONAL_CAPACITY,
             required_slots: required_slots.min(usize::from(CONSTRUCTOR_PROVISIONAL_CAPACITY)) as u8,
             preparation: None,
         }
@@ -172,21 +170,12 @@ impl ConstructorLayoutBody {
         self.samples_remaining() == 0
             && !crate::object::shape_body::state_of(self.root).is_provisional()
     }
-    pub(super) fn final_capacity(&self) -> usize {
-        usize::from(
-            (CONSTRUCTOR_PROVISIONAL_CAPACITY - self.minimum_unused).max(self.required_slots),
-        )
-    }
     /// Nonallocating, bounded, one-shot completion state change. Tickets own
     /// at-most-once delivery; samples after the seventh never change layout.
-    pub(super) fn record_terminal(&mut self, own_slots: usize) -> bool {
+    pub(super) fn record_terminal(&mut self) -> bool {
         if self.samples_remaining == 0 {
             return false;
         }
-        let used = own_slots.min(usize::from(CONSTRUCTOR_PROVISIONAL_CAPACITY)) as u8;
-        self.minimum_unused = self
-            .minimum_unused
-            .min(CONSTRUCTOR_PROVISIONAL_CAPACITY - used);
         self.samples_remaining -= 1;
         self.samples_remaining == 0
     }
@@ -300,7 +289,9 @@ pub(crate) fn detach_families(heap: &mut GcHeap, head: ConstructorLayout) {
     }
 }
 
-/// Best-effort deferred finalization. `layout` is reachable from a rooted
+/// Best-effort deferred finalization: complete in-object slack tracking on
+/// the family's own lineage once its seven samples are in (V8's
+/// `CompleteInobjectSlackTracking`). `layout` is reachable from a rooted
 /// actual constructor or canonical construction packet throughout this call.
 /// Returning false is metadata refusal, not a JavaScript error.
 pub(crate) fn try_finalize_root(
@@ -309,33 +300,20 @@ pub(crate) fn try_finalize_root(
     shapes: &crate::object::ShapeRuntime,
     roots: &mut otter_gc::heap::RootSlotVisitor<'_>,
 ) -> bool {
-    let Some((prototype, capacity)) = heap.read_payload(layout, |body| {
+    let Some((root, required)) = heap.read_payload(layout, |body| {
         (body.samples_remaining == 0 && !body.finalized())
-            .then(|| (body.prototype, body.final_capacity()))
+            .then(|| (body.root, usize::from(body.required_slots)))
     }) else {
         return false;
     };
-    let prototype = match prototype.as_object() {
-        Some(object) => crate::object::shape_body::ShapePrototype::Object(object),
-        None if prototype.is_null() => crate::object::shape_body::ShapePrototype::Null,
-        None => crate::object::shape_body::ShapePrototype::Value(prototype),
-    };
-    let Ok(root) = shapes.new_root(
-        heap,
-        prototype,
-        capacity,
-        ShapeHandle::null(),
-        ShapeState::ORDINARY,
-        roots,
-    ) else {
+    // The root stays the family's root: its lineage shrinks in place, so the
+    // first seven receivers and every later one share their shapes.
+    if shapes
+        .finish_slack_tracking(heap, root, required, roots)
+        .is_err()
+    {
         return false;
-    };
-    // No receiver/old shape is rewritten. The fresh final root deliberately
-    // has no previous-layout link to the first-seven provisional lineage.
-    heap.with_payload(layout, |body| {
-        body.preparation = None;
-        body.root = root;
-    });
-    heap.record_write(layout, &root);
+    }
+    heap.with_payload(layout, |body| body.preparation = None);
     true
 }

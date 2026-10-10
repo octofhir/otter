@@ -26,7 +26,7 @@
 
 use core::ops::Range;
 
-use crate::cursor::Input;
+use crate::cursor::{Input, Unit};
 use crate::error::{ExecError, RegexError};
 use crate::exec::ExecConfig;
 use crate::exec::backtrack;
@@ -90,6 +90,28 @@ impl Regex {
         start: usize,
         config: ExecConfig,
     ) -> Matches<'r, 't> {
+        self.find_units(text, start, config)
+    }
+
+    /// Search a one-byte subject — every code unit below `0x100`, one byte
+    /// each — exactly as [`Regex::find_utf16`] searches its UTF-16 form, with
+    /// the same code-unit offsets, without widening it.
+    #[must_use]
+    pub fn find_latin1<'r, 't>(
+        &'r self,
+        text: &'t [u8],
+        start: usize,
+        config: ExecConfig,
+    ) -> Matches<'r, 't, u8> {
+        self.find_units(text, start, config)
+    }
+
+    fn find_units<'r, 't, U: Unit>(
+        &'r self,
+        text: &'t [U],
+        start: usize,
+        config: ExecConfig,
+    ) -> Matches<'r, 't, U> {
         Matches {
             regex: self,
             text,
@@ -133,21 +155,23 @@ enum Scan<'p> {
     Unfiltered,
     /// Only offset 0 can match.
     Anchored,
-    /// Candidates are the occurrences of a required literal prefix.
-    Literal(&'p crate::program::LiteralPrefix),
+    /// Candidates are the starts within a required literal's offset window
+    /// of one of its occurrences.
+    Literal(&'p crate::program::RequiredLiteral),
     /// Candidates are the positions whose code point can begin a match.
     FirstSet(&'p crate::program::Prefilter),
 }
 
-/// Iterator over successive matches of a [`Regex`] in a UTF-16 subject.
+/// Iterator over successive matches of a [`Regex`] in a subject of UTF-16
+/// units or Latin-1 bytes.
 ///
 /// Mirrors the host's existing consumption: it collects `Result<Match,
 /// ExecError>` and stops on the first error. The host preserves that error as
 /// resource exhaustion rather than converting it into a semantic no-match.
 #[derive(Debug)]
-pub struct Matches<'r, 't> {
+pub struct Matches<'r, 't, U: Unit = u16> {
     regex: &'r Regex,
-    text: &'t [u16],
+    text: &'t [U],
     next_start: usize,
     config: ExecConfig,
     done: bool,
@@ -155,7 +179,7 @@ pub struct Matches<'r, 't> {
     scratch: backtrack::Scratch,
 }
 
-impl Matches<'_, '_> {
+impl<U: Unit> Matches<'_, '_, U> {
     /// Number of backtrack points explored by this search so far.
     #[must_use]
     pub fn steps_executed(&self) -> u64 {
@@ -163,7 +187,7 @@ impl Matches<'_, '_> {
     }
 }
 
-impl Iterator for Matches<'_, '_> {
+impl<U: Unit> Iterator for Matches<'_, '_, U> {
     type Item = Result<Match, ExecError>;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -178,7 +202,7 @@ impl Iterator for Matches<'_, '_> {
         // every candidate position.
         let scan = if program.start_anchored {
             Scan::Anchored
-        } else if let Some(lit) = &program.literal_prefix {
+        } else if let Some(lit) = &program.required_literal {
             Scan::Literal(lit)
         } else if let Some(pf) = &program.prefilter {
             Scan::FirstSet(pf)
@@ -198,24 +222,43 @@ impl Iterator for Matches<'_, '_> {
                         return None;
                     }
                 }
-                // Jump straight to the next position whose units match the
-                // literal every match must begin with.
-                Scan::Literal(lit) => match lit.find(self.text, pos) {
-                    Some(at) => pos = at,
-                    // No further occurrence, so no further match. Step past the
-                    // end so the terminator below fires.
-                    None => pos = self.text.len() + 1,
-                },
+                // A match starting at `pos` or later holds the literal at
+                // `pos + min_offset` or later, so the first such occurrence `at`
+                // rules out every start before `at - max_offset`: a match there
+                // would need an earlier occurrence. Jump to that start.
+                Scan::Literal(lit) => {
+                    match lit.find(self.text, pos.saturating_add(lit.min_offset)) {
+                        Some(at) => {
+                            let earliest = at - lit.max_offset.min(at);
+                            if earliest > pos {
+                                pos = earliest;
+                                // The leftmost search never starts between the
+                                // halves of a surrogate pair; the pair's lead is
+                                // the position it would try instead.
+                                if unicode
+                                    && (0xDC00..=0xDFFF).contains(&self.text[pos].widen())
+                                    && (0xD800..=0xDBFF).contains(&self.text[pos - 1].widen())
+                                {
+                                    pos -= 1;
+                                }
+                            }
+                        }
+                        // No further occurrence, so no further match. Step past
+                        // the end so the terminator below fires.
+                        None => pos = self.text.len() + 1,
+                    }
+                }
                 // First-set prefilter: skip positions that cannot start a match.
                 Scan::FirstSet(pf) => {
                     if let Some(unit) = pf.single() {
                         // Single-literal fast path: a vectorizable equality scan for
-                        // the one code unit that can begin a match.
-                        match self
-                            .text
-                            .get(pos..)
-                            .and_then(|t| t.iter().position(|&u| u == unit))
-                        {
+                        // the one code unit that can begin a match. A unit too
+                        // wide for the subject never occurs in it.
+                        match U::narrow(unit).and_then(|unit| {
+                            self.text
+                                .get(pos..)
+                                .and_then(|t| t.iter().position(|&u| u == unit))
+                        }) {
                             Some(off) => pos += off,
                             // No further occurrence: a single-literal prefilter means
                             // every match must consume that unit, so no match remains.
@@ -235,7 +278,7 @@ impl Iterator for Matches<'_, '_> {
                     } else {
                         // Non-Unicode: a code unit is a code point, so the scan is a
                         // tight single-step loop with no surrogate decode.
-                        while pos < self.text.len() && !pf.cp_may_start(u32::from(self.text[pos])) {
+                        while pos < self.text.len() && !pf.cp_may_start(self.text[pos].into()) {
                             pos += 1;
                         }
                     }
@@ -261,8 +304,8 @@ impl Iterator for Matches<'_, '_> {
                     self.done = true;
                     return Some(Err(e));
                 }
-                Ok(Some(caps)) => {
-                    let mat = build_match(&self.regex.program, &caps);
+                Ok(true) => {
+                    let mat = build_match(&self.regex.program, self.scratch.captures());
                     let end = mat.range.end;
                     self.next_start = if end > pos {
                         end
@@ -271,7 +314,7 @@ impl Iterator for Matches<'_, '_> {
                     };
                     return Some(Ok(mat));
                 }
-                Ok(None) => {
+                Ok(false) => {
                     // When the unique leading consumer is a possessive `min >= 1`
                     // repeat, every prefilter-positive position in the current run
                     // fails identically, so skip the whole run in one step rather
@@ -287,7 +330,7 @@ impl Iterator for Matches<'_, '_> {
                                 e = advance_scan(self.text, e, unicode);
                             }
                         } else {
-                            while e < self.text.len() && pf.cp_may_start(u32::from(self.text[e])) {
+                            while e < self.text.len() && pf.cp_may_start(self.text[e].into()) {
                                 e += 1;
                             }
                         }
@@ -303,29 +346,27 @@ impl Iterator for Matches<'_, '_> {
 
 /// Decode the code point at `pos` (which must be `< text.len()`), returning it
 /// and its code-unit width. Surrogate pairs combine only in unicode mode.
-fn decode_at(text: &[u16], pos: usize, unicode: bool) -> (u32, usize) {
-    let hi = text[pos];
+fn decode_at<U: Unit>(text: &[U], pos: usize, unicode: bool) -> (u32, usize) {
+    let hi: u32 = text[pos].into();
     if unicode
         && (0xD800..=0xDBFF).contains(&hi)
         && let Some(&lo) = text.get(pos + 1)
+        && let lo = Into::<u32>::into(lo)
         && (0xDC00..=0xDFFF).contains(&lo)
     {
-        return (
-            0x10000 + ((u32::from(hi) - 0xD800) << 10) + (u32::from(lo) - 0xDC00),
-            2,
-        );
+        return (0x10000 + ((hi - 0xD800) << 10) + (lo - 0xDC00), 2);
     }
-    (u32::from(hi), 1)
+    (hi, 1)
 }
 
 /// Advance a scan position by one code point (two units over a surrogate pair in
 /// unicode mode) so the leftmost search makes progress.
-fn advance_scan(text: &[u16], pos: usize, unicode: bool) -> usize {
+fn advance_scan<U: Unit>(text: &[U], pos: usize, unicode: bool) -> usize {
     if unicode
         && let Some(&hi) = text.get(pos)
-        && (0xD800..=0xDBFF).contains(&hi)
+        && (0xD800..=0xDBFF).contains(&hi.widen())
         && let Some(&lo) = text.get(pos + 1)
-        && (0xDC00..=0xDFFF).contains(&lo)
+        && (0xDC00..=0xDFFF).contains(&lo.widen())
     {
         return pos + 2;
     }

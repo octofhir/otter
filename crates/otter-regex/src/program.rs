@@ -11,13 +11,13 @@
 //!   engine-relevant flag bits, and the scan strategy chosen for the pattern.
 //! - [`Insn`] — a single matcher instruction.
 //! - [`Prefilter`] — the set of code points that can begin a match.
-//! - [`LiteralPrefix`] — the literal run every match must begin with, when the
-//!   pattern has one.
+//! - [`RequiredLiteral`] — a literal run every match must contain at a bounded
+//!   distance from its start, when the pattern has one.
 //!
 //! # Invariants
 //! - Operands that reference other instructions are indices into the same
 //!   [`Program::insns`] vector.
-//! - Every scan aid ([`Program::prefilter`], [`Program::literal_prefix`],
+//! - Every scan aid ([`Program::prefilter`], [`Program::required_literal`],
 //!   [`Program::start_anchored`]) is a *necessary* condition on a match's start
 //!   position, never a sufficient one: skipping a position it rejects can never
 //!   discard a match, and every position it accepts is still run through the
@@ -195,12 +195,13 @@ pub(crate) struct Program {
     /// exactly the maximal span of [`Prefilter`] members, so the skip reuses the
     /// prefilter membership test.
     pub(crate) lead_possessive_run: bool,
-    /// The literal code units every match must begin with, when there are at
-    /// least two of them. Strictly stronger than [`Self::prefilter`] (which
-    /// characterizes only the first code point), so the leftmost search prefers
-    /// it: a whole literal run is confirmed by the scan before the matcher is
-    /// entered at all.
-    pub(crate) literal_prefix: Option<LiteralPrefix>,
+    /// A literal run of at least two code units every match must contain, a
+    /// bounded number of units after its start. The leftmost search prefers it
+    /// over [`Self::prefilter`] (which characterizes only the first code
+    /// point): a subject without the literal is rejected by one scan, and only
+    /// starts within the literal's offset window of an occurrence are ever run
+    /// through the matcher.
+    pub(crate) required_literal: Option<RequiredLiteral>,
     /// `true` when every path from entry asserts start-of-input (`^` outside
     /// multiline) before consuming anything. Such a pattern can only match at
     /// offset `0`, so the leftmost search tries that one position and stops
@@ -330,8 +331,9 @@ impl Prefilter {
     }
 }
 
-/// A literal code-unit sequence every match must begin with, plus the offset of
-/// its rarest unit.
+/// A literal code-unit sequence every match must contain, the window of
+/// distances from the match start at which it can sit, and the offset of its
+/// rarest unit.
 ///
 /// The scan searches for that one unit rather than the first, then confirms the
 /// whole literal. Searching a single unit keeps the inner loop a plain equality
@@ -339,23 +341,34 @@ impl Prefilter {
 /// the candidate rate low: in ordinary text the leading unit of a word is a
 /// common letter, so a first-unit scan stops constantly, whereas the `q` of
 /// `unquestionable` almost never fires.
+///
+/// A literal the pattern begins with has a window of `0..=0`. One behind a
+/// bounded-width head — `(^|[^\\])"Date(` — sits `min_offset..=max_offset`
+/// units in, so an occurrence at `q` admits only the starts
+/// `q - max_offset ..= q - min_offset`.
 #[derive(Debug, Clone)]
-pub(crate) struct LiteralPrefix {
+pub(crate) struct RequiredLiteral {
     /// The required units, in subject order.
     units: Box<[u16]>,
     /// Index into `units` of the unit the scan searches for.
     rare: usize,
+    /// Fewest code units any match consumes before the literal begins.
+    pub(crate) min_offset: usize,
+    /// Most code units any match consumes before the literal begins.
+    pub(crate) max_offset: usize,
 }
 
-impl LiteralPrefix {
-    /// Longest literal this scan will hold. A longer required prefix is
+impl RequiredLiteral {
+    /// Longest literal this scan will hold. A longer required run is
     /// truncated, which only weakens the filter, never its soundness.
     const MAX_UNITS: usize = 4096;
 
-    /// Build the scan for a required literal of two or more units.
-    pub(crate) fn new(mut units: Vec<u16>) -> Self {
+    /// Build the scan for a required literal of two or more units that every
+    /// match holds between `min_offset` and `max_offset` units after its start.
+    pub(crate) fn new(mut units: Vec<u16>, min_offset: usize, max_offset: usize) -> Self {
         units.truncate(Self::MAX_UNITS);
         debug_assert!(units.len() >= 2);
+        debug_assert!(min_offset <= max_offset);
         let rare = units
             .iter()
             .enumerate()
@@ -364,15 +377,23 @@ impl LiteralPrefix {
         Self {
             units: units.into_boxed_slice(),
             rare,
+            min_offset,
+            max_offset,
         }
+    }
+
+    /// The literal's code units.
+    pub(crate) fn units(&self) -> &[u16] {
+        &self.units
     }
 
     /// The first offset at or after `from` where the literal occurs, or `None`
     /// when the subject holds no further occurrence.
     #[must_use]
-    pub(crate) fn find(&self, text: &[u16], from: usize) -> Option<usize> {
+    pub(crate) fn find<U: crate::cursor::Unit>(&self, text: &[U], from: usize) -> Option<usize> {
         let n = self.units.len();
-        let target = self.units[self.rare];
+        // A unit too wide for the subject means the literal never occurs.
+        let target = U::narrow(self.units[self.rare])?;
         let mut i = from;
         loop {
             if i + n > text.len() {
@@ -385,7 +406,7 @@ impl LiteralPrefix {
             if start + n > text.len() {
                 return None;
             }
-            if text[start..start + n] == *self.units {
+            if U::eq_units(&text[start..start + n], &self.units) {
                 return Some(start);
             }
             i = start + 1;
@@ -479,19 +500,28 @@ impl Program {
 
     /// A one-line summary of how the leftmost search skips positions.
     fn scan_strategy(&self) -> String {
-        match (&self.prefilter, self.lead_possessive_run) {
-            (None, _) => "unfiltered".to_string(),
-            (Some(pf), run) => {
-                let base = match pf.single() {
-                    Some(u) => format!("literal U+{u:04X}"),
+        let base = if self.start_anchored {
+            "anchored".to_string()
+        } else if let Some(lit) = &self.required_literal {
+            format!(
+                "literal {:?} at {}..={}",
+                String::from_utf16_lossy(lit.units()),
+                lit.min_offset,
+                lit.max_offset
+            )
+        } else {
+            match &self.prefilter {
+                None => "unfiltered".to_string(),
+                Some(pf) => match pf.single() {
+                    Some(u) => format!("unit U+{u:04X}"),
                     None => "first-set".to_string(),
-                };
-                if run {
-                    format!("{base} + possessive-run skip")
-                } else {
-                    base
-                }
+                },
             }
+        };
+        if self.lead_possessive_run && self.prefilter.is_some() {
+            format!("{base} + possessive-run skip")
+        } else {
+            base
         }
     }
 }

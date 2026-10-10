@@ -114,13 +114,15 @@ pub(crate) fn lower(parsed: Parsed, flags: Flags) -> Program {
     mark_possessive(&mut e.insns, &e.classes, flags.is_unicode_mode());
     let lead_possessive_run = lead_possessive_run(&e.insns);
     let start_anchored = start_anchored(&e.insns);
-    let literal_prefix = (!start_anchored)
-        .then(|| compute_literal_prefix(&e.insns))
+    let unicode = flags.is_unicode_mode();
+    let required_literal = (!start_anchored)
+        .then(|| compute_required_literal(&e.insns, &e.classes, unicode))
         .flatten()
-        .map(crate::program::LiteralPrefix::new);
+        .map(|(units, min_offset, max_offset)| {
+            crate::program::RequiredLiteral::new(units, min_offset, max_offset)
+        });
 
     let loop_marks = e.next_mark - mark_base;
-    let unicode = flags.is_unicode_mode();
     let prefilter =
         compute_first_set(&e.insns, &e.classes, flags.ignore_case, unicode).map(|(set, canon)| {
             if canon {
@@ -144,7 +146,7 @@ pub(crate) fn lower(parsed: Parsed, flags: Flags) -> Program {
         prefilter,
         lead_possessive_run,
         start_anchored,
-        literal_prefix,
+        required_literal,
     }
 }
 
@@ -156,8 +158,173 @@ const LITERAL_WALK_BUDGET: u32 = 512;
 /// descending.
 const LITERAL_MAX_DEPTH: u32 = 24;
 
+/// The literal run every match must contain and the window of distances from
+/// the match start it sits at — see [`Program::required_literal`].
+///
+/// Two analyses offer one: the literal every match begins with (window `0..=0`)
+/// and the longest literal instruction every match passes through a bounded
+/// distance in. The longer run filters better, so it wins; the prefix wins a
+/// tie, since its window admits a single start per occurrence.
+fn compute_required_literal(
+    insns: &[Insn],
+    classes: &[ClassSet],
+    unicode: bool,
+) -> Option<(Vec<u16>, usize, usize)> {
+    let prefix = compute_literal_prefix(insns);
+    let inner = inner_literal(insns, classes, unicode);
+    match (prefix, inner) {
+        (Some(prefix), Some(inner)) if inner.0.len() > prefix.len() => Some(inner),
+        (Some(prefix), _) => Some((prefix, 0, 0)),
+        (None, inner) => inner,
+    }
+}
+
+/// Largest program the offset analysis models; a larger one keeps only its
+/// literal prefix.
+const OFFSET_ANALYSIS_LIMIT: usize = 4096;
+
+/// Widest distance from the match start the offset analysis tracks; anything
+/// farther counts as unbounded.
+const MAX_LITERAL_OFFSET: usize = 1024;
+
+/// How many times an instruction's offset window may change before it is
+/// treated as unbounded — a window still changing sits on a consuming loop.
+const OFFSET_WIDENING_ROUNDS: u8 = 4;
+
+/// The longest `CharSeq` every match passes through, with the fewest and most
+/// code units any match consumes before reaching it.
+///
+/// A forward pass over the main region (lookaround bodies are entered only
+/// through their assertion and consume nothing on the outer path) gives every
+/// instruction the window of distances from the match start it can be reached
+/// at; a loop or an unbounded atom on the way makes the window unbounded. A
+/// candidate is required when `Match` is unreachable once it is removed.
+fn inner_literal(
+    insns: &[Insn],
+    classes: &[ClassSet],
+    unicode: bool,
+) -> Option<(Vec<u16>, usize, usize)> {
+    let n = insns.len();
+    if n == 0 || n > OFFSET_ANALYSIS_LIMIT {
+        return None;
+    }
+    // `(fewest, most)` units consumed before an instruction runs; `None` as
+    // the most means unbounded.
+    let mut window: Vec<Option<(usize, Option<usize>)>> = vec![None; n];
+    let mut changes = vec![0u8; n];
+    window[0] = Some((0, Some(0)));
+    let mut work = vec![0usize];
+    while let Some(pc) = work.pop() {
+        let Some((lo, hi)) = window[pc] else {
+            continue;
+        };
+        let (width_lo, width_hi) = insn_width(&insns[pc], classes, unicode);
+        let out_lo = lo.saturating_add(width_lo);
+        let out_hi = hi
+            .zip(width_hi)
+            .map(|(a, b)| a.saturating_add(b))
+            .filter(|&most| most <= MAX_LITERAL_OFFSET);
+        for next in main_successors(insns, pc).into_iter().flatten() {
+            if next >= n {
+                continue;
+            }
+            let mut merged = match window[next] {
+                None => (out_lo, out_hi),
+                Some((l, h)) => (l.min(out_lo), h.zip(out_hi).map(|(a, b)| a.max(b))),
+            };
+            if window[next] == Some(merged) {
+                continue;
+            }
+            changes[next] = changes[next].saturating_add(1);
+            if changes[next] > OFFSET_WIDENING_ROUNDS {
+                merged.1 = None;
+            }
+            window[next] = Some(merged);
+            work.push(next);
+        }
+    }
+    let mut candidates: Vec<(usize, usize, usize)> = (0..n)
+        .filter_map(|pc| match (&insns[pc], window[pc]) {
+            (Insn::CharSeq(_), Some((lo, Some(hi)))) => Some((pc, lo, hi)),
+            _ => None,
+        })
+        .collect();
+    // Longest run first; among equals, the narrowest window, then the
+    // nearest one.
+    candidates.sort_by_key(|&(pc, lo, hi)| {
+        let len = match &insns[pc] {
+            Insn::CharSeq(seq) => seq.len(),
+            _ => 0,
+        };
+        (core::cmp::Reverse(len), hi - lo, hi)
+    });
+    candidates
+        .into_iter()
+        .find(|&(pc, _, _)| !match_reachable_without(insns, pc))
+        .and_then(|(pc, lo, hi)| match &insns[pc] {
+            Insn::CharSeq(seq) => Some((seq.to_vec(), lo, hi)),
+            _ => None,
+        })
+}
+
+/// The instructions control can reach next from `pc` on the outer path.
+fn main_successors(insns: &[Insn], pc: usize) -> [Option<usize>; 2] {
+    match &insns[pc] {
+        Insn::Match | Insn::LookMatch | Insn::Fail => [None, None],
+        Insn::Jump(t) => [Some(*t), None],
+        Insn::Split(a, b) => [Some(*a), Some(*b)],
+        _ => [Some(pc + 1), None],
+    }
+}
+
+/// Whether some path from entry reaches `Match` without running `skip`.
+fn match_reachable_without(insns: &[Insn], skip: usize) -> bool {
+    let mut visited = vec![false; insns.len()];
+    let mut work = vec![0usize];
+    while let Some(pc) = work.pop() {
+        if pc >= insns.len() || pc == skip || visited[pc] {
+            continue;
+        }
+        visited[pc] = true;
+        if matches!(insns[pc], Insn::Match) {
+            return true;
+        }
+        work.extend(main_successors(insns, pc).into_iter().flatten());
+    }
+    false
+}
+
+/// The fewest and most code units one instruction consumes; `None` as the most
+/// means unbounded. A code point is one unit outside `u`/`v` and one or two
+/// within it.
+fn insn_width(insn: &Insn, classes: &[ClassSet], unicode: bool) -> (usize, Option<usize>) {
+    let code_point = (1, Some(if unicode { 2 } else { 1 }));
+    match insn {
+        Insn::Char { cp, .. } if *cp > 0xFFFF => (2, Some(2)),
+        Insn::Char { .. } | Insn::AnyChar { .. } => code_point,
+        Insn::CharSeq(seq) => (seq.len(), Some(seq.len())),
+        Insn::Class { class, .. } if classes[*class as usize].strings.is_empty() => code_point,
+        // A class with string alternatives can consume a whole sequence.
+        Insn::Class { .. } | Insn::BackRef { .. } => (0, None),
+        Insn::Repeat { min, .. } => (*min as usize, None),
+        Insn::Match
+        | Insn::LookMatch
+        | Insn::Fail
+        | Insn::Jump(_)
+        | Insn::Split(..)
+        | Insn::Save(_)
+        | Insn::ClearCapture(_)
+        | Insn::SetMark(_)
+        | Insn::CheckProgress(_)
+        | Insn::AssertStart { .. }
+        | Insn::AssertEnd { .. }
+        | Insn::WordBoundary { .. }
+        | Insn::Look { .. } => (0, Some(0)),
+    }
+}
+
 /// The literal code units every match must begin with, when there are at least
-/// two — see [`Program::literal_prefix`].
+/// two.
 ///
 /// Walks the paths leaving entry and returns their longest common literal
 /// prefix, so an alternation of literals that share a head (`ab|ac`) still

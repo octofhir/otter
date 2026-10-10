@@ -42,6 +42,7 @@ mod program;
 mod unicode;
 
 pub use api::{Match, Matches, NamedGroups, Regex};
+pub use cursor::Unit;
 pub use error::{ExecError, RegexError};
 pub use exec::ExecConfig;
 pub use flags::Flags;

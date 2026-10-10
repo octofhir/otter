@@ -55,8 +55,8 @@
 //! - The shared store's `Mutex` is non-reentrant: an export call holds the
 //!   guard, so a JS import that re-enters and calls another export cannot
 //!   re-lock it — that surfaces as a `RuntimeError` rather than a deadlock.
-//!   wasmtime's exclusive `&mut Store` borrow forbids two overlapping calls;
-//!   V8/Deno allow nested calls, we surface a catchable error.
+//!   wasmtime's exclusive `&mut Store` borrow forbids two overlapping calls,
+//!   so a nested call surfaces as a catchable error.
 //! - `Memory.buffer` snapshots the linear memory into a fresh `ArrayBuffer`;
 //!   the VM has no `ArrayBuffer` backed by foreign memory.
 //! - `i64` values marshal to JS `BigInt` (spec-faithful), not `Number`.

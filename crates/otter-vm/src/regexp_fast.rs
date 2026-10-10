@@ -1,4 +1,4 @@
-//! The unmodified-RegExp protocol — V8's `IsFastRegExp`.
+//! The unmodified-RegExp protocol.
 //!
 //! RegExp built-ins observe their receiver through `exec`, the flag getters,
 //! `constructor`, `@@species` and `lastIndex`. While a receiver and its

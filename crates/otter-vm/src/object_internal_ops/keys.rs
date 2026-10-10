@@ -899,10 +899,9 @@ impl Interpreter {
         trap_keys: &[Local<'s>],
     ) -> Result<Vec<Value>, CommittedValueError> {
         // Step 9 — reject duplicates. String keys hash into a set
-        // (the spec requires linear behaviour here — see V8's
-        // ownKeys-linear regression); symbol keys are compared
-        // pairwise, which stays cheap because real handler results
-        // carry at most a handful of symbols.
+        // (the spec requires linear behaviour here); symbol keys are
+        // compared pairwise, which stays cheap because real handler
+        // results carry at most a handful of symbols.
         let trap_strs: Vec<Option<String>> = trap_keys
             .iter()
             .map(|key| {

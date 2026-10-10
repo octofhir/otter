@@ -2,9 +2,9 @@
 //!
 //! # Contents
 //! - [`narrow_checked_arithmetic`] — a forward range analysis of the int32
-//!   nodes (the integer subset of TurboFan's typer) and the rewrite of
-//!   checked additions, subtractions and multiplications that cannot
-//!   overflow, or produce `-0`, into their unchecked forms.
+//!   nodes and the rewrite of checked additions, subtractions and
+//!   multiplications that cannot overflow, or produce `-0`, into their
+//!   unchecked forms.
 //!
 //! # Invariants
 //! - A node's range bounds every value it produces on any execution that

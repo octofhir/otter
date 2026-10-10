@@ -566,8 +566,8 @@ impl<'m, 'a> FunctionTranslator<'m, 'a> {
                 _ => None,
             }
         };
-        // V8 takes a small leading literal as an integer factor only below
-        // 2^20; a larger one is an ordinary operand.
+        // A small leading literal is an integer factor only below 2^20; a
+        // larger one is an ordinary operand.
         if let Some(Ok(factor)) = small(left) {
             self.emit(Instruction::I32Const(factor));
             self.expect(right, AsmType::INT)?;
@@ -882,7 +882,7 @@ impl<'m, 'a> FunctionTranslator<'m, 'a> {
         use StdlibFunction as F;
         let (args, _) = self.arguments(call)?;
         let requested = coercion.result();
-        // V8 tries the context's result first, then float, floatish, double,
+        // Try the context's result first, then float, floatish, double,
         // signed and unsigned, against the member's overloads.
         let candidates = [
             requested,

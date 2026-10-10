@@ -1,11 +1,11 @@
-//! Per-site named-property inline caches: V8's feedback slot and handlers.
+//! Per-site named-property inline caches: a feedback slot and handlers.
 //!
 //! Each `LoadProperty`, `StoreProperty` and the method lookup of
 //! `CallMethodValue` owns one [`PropertyIcSlot`] in its CodeBlock's feedback
 //! vector. The slot is mutable data that the VM and generated code both read:
 //! the receiver's shape selects an [`IcEntry`] whose handler says how to finish
-//! the access. Misses update the slot through V8's state machine
-//! (`IC::SetCache`); generated code never changes when the feedback does.
+//! the access. Misses update the slot through the IC state machine;
+//! generated code never changes when the feedback does.
 //!
 //! # Contents
 //! - [`PropertyIcSlot`] — the native slot: an inline own-field pair for the
@@ -24,11 +24,10 @@
 //! - A receiver whose named lookup starts at another object is keyed by that
 //!   lookup-start object's shape with the low bit set (shape handles are
 //!   8-aligned, so the key never equals an ordinary receiver's shape), and
-//!   its handlers act on the lookup-start object (V8's
-//!   `lookup_start_object`): a function's property bag, which carries the
-//!   function's own `[[Prototype]]`, for every key the function does not
-//!   synthesize; an ordinary dense array's prototype, for every named key
-//!   but `length`.
+//!   its handlers act on the lookup-start object: a function's property bag,
+//!   which carries the function's own `[[Prototype]]`, for every key the
+//!   function does not synthesize; an ordinary dense array's prototype, for
+//!   every named key but `length`.
 //! - A matched receiver shape fixes the object's lookup state, own keys,
 //!   attributes, prototype and storage banks. Prototype-field and
 //!   nonexistent handlers additionally require their chain proof; a
@@ -99,8 +98,8 @@ pub(crate) enum PropertyIcKind {
     Store,
 }
 
-/// What a matched entry does: V8's `LoadHandler::Kind` / `StoreHandler::Kind`
-/// subset for Otter's ordinary objects.
+/// What a matched entry does: the load and store handler kinds for Otter's
+/// ordinary objects.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum IcHandlerKind {
@@ -564,7 +563,7 @@ pub struct PropertyIcLayout {
     pub entry_validity_byte: u32,
 }
 
-/// One named-property site: V8's `(feedback, extra)` slot pair with the
+/// One named-property site: a `(feedback, extra)` slot pair with the
 /// polymorphic array inline.
 #[derive(Debug)]
 #[repr(C)]
@@ -836,7 +835,7 @@ impl PropertyIcSlot {
         }
     }
 
-    /// Install `handler`: V8 `IC::SetCache` for a non-global named IC.
+    /// Install `handler` into a non-global named IC.
     ///
     /// An entry for the same receiver shape is replaced (healing a handler
     /// whose proof died); entries with dead proofs are dropped; a new shape is

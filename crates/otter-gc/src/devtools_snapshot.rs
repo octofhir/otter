@@ -1,9 +1,7 @@
 //! Streaming Chrome DevTools `.heapsnapshot` writer.
 //!
 //! The output is accepted by Chrome DevTools' "Memory" panel. The format is
-//! documented at <https://developer.chrome.com/docs/devtools/memory-problems/heap-snapshots>;
-//! the on-the-wire schema lives in V8's
-//! `src/profiler/heap-snapshot-generator.cc`.
+//! documented at <https://developer.chrome.com/docs/devtools/memory-problems/heap-snapshots>.
 //!
 //! # Contents
 //! - [`write_heap_snapshot`] — walk the heap and stream one complete JSON

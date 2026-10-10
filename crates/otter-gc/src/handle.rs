@@ -5,7 +5,7 @@
 //! Phase-1 GC is moving (the scavenger relocates young objects).
 //! Native code that holds a `Gc<T>` across a safepoint must root
 //! it through a handle so the GC can rewrite the slot when the
-//! object moves. V8 / Oilpan use the same pattern.
+//! object moves.
 //!
 //! # Contents
 //!
@@ -233,9 +233,8 @@ impl Drop for HandleScope<'_> {
 ///
 /// The escape slot is reserved before the nested scope starts, so
 /// dropping the nested scope truncates only its temporaries and keeps
-/// the escaped handle live in the parent scope. This mirrors the V8
-/// `EscapableHandleScope` shape without exposing raw handle-table
-/// entries to native authors.
+/// the escaped handle live in the parent scope. Raw handle-table
+/// entries are never exposed to native authors.
 ///
 /// # Example
 ///
@@ -372,8 +371,7 @@ pub(crate) struct GlobalHandle<T: ?Sized> {
     idx: u32,
     /// Owning heap's global handle table is reached through a
     /// raw pointer set when the handle is created. The handle
-    /// is sound only while the heap lives — same contract V8
-    /// imposes on `v8::Persistent`.
+    /// is sound only while the heap lives.
     table: *const GlobalHandleTable,
     _t: PhantomData<*const T>,
 }
@@ -381,8 +379,8 @@ pub(crate) struct GlobalHandle<T: ?Sized> {
 impl<T: ?Sized> GlobalHandle<T> {
     /// Read the current `Gc<T>` value.
     pub fn get(&self) -> Gc<T> {
-        // SAFETY: caller holds the heap alive (V8 Persistent
-        // contract) and the index is in-range by construction.
+        // SAFETY: caller holds the heap alive and the index is
+        // in-range by construction.
         unsafe {
             let table = &*self.table;
             Gc::from_offset(table.read(self.idx).0)

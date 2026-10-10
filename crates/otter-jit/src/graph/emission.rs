@@ -88,7 +88,7 @@ pub(crate) fn forwarded(graph: &Graph, allocation: &Allocation, mut block: Block
 }
 
 /// Boolean producers that answer straight into their block's truthiness
-/// branch (Maglev's fused compare-and-branch), mapped to that branch: the
+/// branch (a fused compare-and-branch), mapped to that branch: the
 /// last emitted node of the block, read by that branch alone — no other
 /// node, phi or frame state — with no moves at the branch and no definition
 /// spill, of a kind both encoders emit jumping to successors.

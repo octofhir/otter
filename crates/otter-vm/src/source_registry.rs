@@ -40,8 +40,8 @@ pub struct ModuleSource {
     prologue: u32,
     /// Ledger the line index is charged to when it is built.
     account: ResourceAccount,
-    /// Built by the first position query, like V8's `Script::line_ends`:
-    /// most loaded sources never report a position.
+    /// Built by the first position query: most loaded sources never report
+    /// a position.
     lines: OnceLock<LineIndex>,
 }
 

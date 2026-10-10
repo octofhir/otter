@@ -5,14 +5,14 @@
 //! - [`wrap_truncated_arithmetic`] — turn a checked `Int32Add`/`Int32Sub`
 //!   whose every use truncates its result into the two's-complement form.
 //! - [`zero_insensitive`] — the int32 values every use of which identifies
-//!   `-0` with `0` (TurboFan's `IdentifyZeros` truncation).
+//!   `-0` with `0`.
 //!
 //! # Invariants
 //! - Both operands are int32, so the exact sum or difference is an integer
 //!   below 2^33 in magnitude and is exact as a double. `ToInt32` and
 //!   `ToUint32` are additive modulo 2^32, so the wrapped word is what every
 //!   truncating use computes from the exact result, also through a chain of
-//!   wrapping additions (TurboFan's word32 truncation of `NumberAdd`).
+//!   wrapping additions.
 //! - A use truncates when it is a bitwise or shift operand, or a wrapping
 //!   addition itself selected by this pass. Comparisons, phis, boxes,
 //!   conversions, element indices and stores observe the exact value.

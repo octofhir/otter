@@ -440,7 +440,7 @@ impl Interpreter {
         };
         // §13.5.1.2 step 5.c — when the result of `[[Delete]]` is
         // `false` in strict mode, throw a TypeError. The receiver renders in
-        // V8's `#<Tag>` shape (`@@toStringTag` first, constructor name after),
+        // the `#<Tag>` shape (`@@toStringTag` first, constructor name after),
         // which the Node harness matches against.
         if !removed && strict {
             let receiver_tag = receiver
@@ -1039,7 +1039,7 @@ impl Interpreter {
     /// non-extensible.
     /// Pick the right TypeError text for a rejected `[[Set]]`: adding a
     /// brand-new property to a non-extensible (sealed / frozen) object is
-    /// V8's "Cannot add property X, object is not extensible", distinct
+    /// "Cannot add property X, object is not extensible", distinct
     /// from the `fallback` used when an existing property is unwritable
     /// or accessor-only.
     fn extensibility_aware_set_message(

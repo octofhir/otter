@@ -131,7 +131,7 @@ impl Interpreter {
         let value = *read_register(&stack[top_idx], src_reg)?;
         if let Some(s) = value.as_string(&self.gc_heap) {
             let source = s.to_lossy_string(&self.gc_heap);
-            if is_v8_native_eval_hint(&source) {
+            if is_native_syntax_hint(&source) {
                 let frame = stack.last_mut().ok_or(VmError::InvalidOperand)?;
                 write_register(frame, dst, Value::undefined())?;
                 frame.advance_pc()?;
@@ -328,7 +328,7 @@ impl Interpreter {
             return Ok(*value);
         };
         let source = s.with_utf16(&self.gc_heap, crate::eval_source::encode);
-        if is_v8_native_eval_hint(&source) {
+        if is_native_syntax_hint(&source) {
             return Ok(Value::undefined());
         }
         let module = self.compile_escaped_source(&source, options)?;
@@ -708,7 +708,7 @@ pub enum CommonJsBody<'a> {
     Embedded(&'static EmbeddedCommonJs),
 }
 
-fn is_v8_native_eval_hint(source: &str) -> bool {
+fn is_native_syntax_hint(source: &str) -> bool {
     let trimmed = source.trim();
     (trimmed.starts_with("%PrepareFunctionForOptimization(")
         || trimmed.starts_with("%OptimizeFunctionOnNextCall("))

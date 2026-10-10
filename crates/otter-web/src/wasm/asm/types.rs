@@ -1,4 +1,4 @@
-//! The asm.js value-type lattice (asm.js §2.1, with the V8 errata).
+//! The asm.js value-type lattice (asm.js §2.1, with errata).
 //!
 //! Every value type is a bitset that carries its own bit plus the bits of
 //! all its supertypes, so `a.is_a(b)` — "`a` is a subtype of `b`" — is one
@@ -11,7 +11,7 @@
 //! - [`Signature`] — the function type of an asm.js function or table.
 //!
 //! # Invariants
-//! - The bit layout mirrors V8's `asm-types.h`: `FixNum ⊂ Signed ⊂ Int ⊂
+//! - The bit layout encodes the subtype relation: `FixNum ⊂ Signed ⊂ Int ⊂
 //!   Intish`, `FixNum ⊂ Unsigned ⊂ Int`, `Float ⊂ FloatQ ⊂ Floatish`,
 //!   `Double ⊂ DoubleQ`, `Signed, Double ⊂ Extern`.
 //! - A [`Signature`] holds only the parameter types `Int`, `Double` and
@@ -150,7 +150,7 @@ pub(super) struct Signature {
 
 impl Signature {
     /// `true` when a call with argument types `args` expecting `result`
-    /// may invoke a function of this type (V8 `CanBeInvokedWith`).
+    /// may invoke a function of this type.
     pub(super) fn accepts(&self, result: AsmType, args: &[AsmType]) -> bool {
         self.result == result
             && self.params.len() == args.len()

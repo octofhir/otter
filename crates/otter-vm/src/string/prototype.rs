@@ -474,8 +474,8 @@ fn impl_char_code_at(
     if pos < 0 || pos >= len {
         return Ok(Value::number(NumberValue::Double(f64::NAN)));
     }
-    // Indexing a rope descends it per call; flatten it once, as V8's
-    // `String::Flatten` does, so a scan over a concatenated string is linear.
+    // Indexing a rope descends it per call; flatten it once, so a scan over a
+    // concatenated string is linear.
     // Flattening allocates, so the receiver is re-read from its rooted slot.
     recv.flatten_in_place(ctx.heap_mut())?;
     let recv = receiver_string(ctx, receiver)?;

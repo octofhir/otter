@@ -16,8 +16,6 @@
 //!
 //! # See also
 //! - `super::OldSpace` owns pages and consumes ranges through a linear area.
-//! - V8 `src/heap/free-list.cc`: `FreeListManyCached::Allocate` and
-//!   `FreeListCategory::PickNodeFromList` use category skipping and head probes.
 
 use crate::header::{GcHeader, HEADER_SIZE};
 use crate::page::{CELL_SIZE, PAGE_PAYLOAD_SIZE};

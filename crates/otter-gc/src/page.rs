@@ -2,8 +2,7 @@
 //!
 //! Pages are carved from the [`crate::compressed::Cage`]. Every GC
 //! object lives inside a page; an object pointer's page can be
-//! recovered in O(1) with the bitmask `addr & !(PAGE_SIZE - 1)`,
-//! the same trick V8 / JSC use.
+//! recovered in O(1) with the bitmask `addr & !(PAGE_SIZE - 1)`.
 //!
 //! # Layout
 //!
@@ -49,14 +48,14 @@
 //! # See also
 //!
 //! - [`crate::compressed`] — cage backing the page.
-//! - GC architecture plan §2.3, §6 (V8 page shape).
+//! - GC architecture plan §2.3, §6 (page shape).
 
 use crate::OBJECT_ALIGNMENT;
 use crate::compressed::{Cage, CagePage, cage_base};
 use crate::header::GcHeader;
 
-/// 256 KiB page size — V8 ARM64 alignment, balances metadata
-/// overhead against per-page granularity.
+/// 256 KiB page size — balances metadata overhead against per-page
+/// granularity.
 pub const PAGE_SIZE: usize = 256 * 1024;
 
 /// Card size: 512 B per card. Card-table bitmap covers
@@ -158,10 +157,9 @@ pub struct PageHeader {
     /// by [`Page::cage_offset`] without touching the cage mutex.
     pub cage_offset: u32,
     /// Consecutive cage pages this region owns. `1` for an ordinary page;
-    /// a large-object region spans as many as its single body needs, the
-    /// way V8's `LargePage` is a variable-sized chunk rather than a fixed
-    /// page. Bump allocation and the object walk both bound themselves by
-    /// `span_pages * PAGE_SIZE`.
+    /// a large-object region spans as many as its single body needs, a
+    /// variable-sized chunk rather than a fixed page. Bump allocation and the
+    /// object walk both bound themselves by `span_pages * PAGE_SIZE`.
     pub span_pages: u32,
     /// Card-table bitmap — 1 bit per [`CARD_SIZE`]-byte card. Bit
     /// set ⇒ card may contain old→young pointers (generational

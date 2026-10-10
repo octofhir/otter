@@ -1139,7 +1139,7 @@ fn define_accessor_helper(
     let Some(mut target) = this_value.as_object() else {
         // §7.1.18 ToObject — primitives wrap. The accessor lands on
         // the transient wrapper which is discarded once the call
-        // returns, mirroring V8/JSC.
+        // returns.
         return Ok(Value::undefined());
     };
     let ok = match key {
@@ -2441,8 +2441,7 @@ fn call(
 /// Implement §6.2.5.5 ToPropertyDescriptor against `desc_obj`.
 ///
 /// Returns a [`PartialPropertyDescriptor`] that tracks which fields
-/// were present on the source object, matching the V8 / JSC /
-/// SpiderMonkey descriptor-coercion shape so
+/// were present on the source object, so
 /// `ValidateAndApplyPropertyDescriptor` can distinguish "absent" from
 /// "present with `false`".
 ///

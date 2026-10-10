@@ -48,8 +48,8 @@ pub const HEADER_SIZE_BYTES_OFFSET: usize = 4;
 
 /// Byte offset of the two body-owned header bytes. The collector never
 /// reads or writes them after allocation zeroes them; the body type gives
-/// them meaning (JSC keeps per-cell type flags in its cell header the same
-/// way). They travel with the cell because evacuation copies whole cells.
+/// them meaning. They travel with the cell because evacuation copies whole
+/// cells.
 pub const HEADER_BODY_BYTES_OFFSET: usize = 2;
 
 /// The young-generation flag bit within the [`GcHeader`] flag byte

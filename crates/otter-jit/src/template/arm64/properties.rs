@@ -1,11 +1,10 @@
 //! AArch64 named-property IC sites for the template compiler.
 //!
 //! # Contents
-//! - The inline own-field path (JSC's baseline DataIC fast path): the
-//!   receiver shape against the slot's own-field pair, then the field read
-//!   or write. Every other receiver calls the code object's shared IC routine
-//!   ([`super::shared_property`]), V8's `LoadIC` / `StoreIC` over the same
-//!   slot, which ends in the committed runtime miss.
+//! - The inline own-field path: the receiver shape against the slot's
+//!   own-field pair, then the field read or write. Every other receiver
+//!   calls the code object's shared IC routine ([`super::shared_property`])
+//!   over the same slot, which ends in the committed runtime miss.
 //! - Exotic length reads, static intrinsic-prototype reads on non-ordinary
 //!   receivers (primitive strings, functions, collections), and the value
 //!   barrier after an inline store.

@@ -9,8 +9,7 @@
 //! slot addresses outside the heap.
 //!
 //! So the overflow slab is a GC body with its words in trailing storage
-//! in the same cell — the shape V8 and JSC use for a property backing
-//! store, for the same reason.
+//! in the same cell.
 //!
 //! # Contents
 //!

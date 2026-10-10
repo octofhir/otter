@@ -39,9 +39,9 @@ use crate::page::{LARGE_OBJECT_THRESHOLD, Page, SpaceKind, align_up};
 /// this gives a 4 MiB nursery.
 pub const DEFAULT_NEW_SPACE_PAGES: usize = 16;
 
-/// Most pages a semispace grows to: 32 MiB, V8's
-/// `kScavengerDefaultMaxCapacity`. A larger nursery gives short-lived
-/// objects more allocation to die in before a scavenge copies them.
+/// Most pages a semispace grows to: 32 MiB. A larger nursery gives
+/// short-lived objects more allocation to die in before a scavenge copies
+/// them.
 pub const MAX_NEW_SPACE_PAGES: usize = 128;
 
 /// Two-semispace young generation.
@@ -173,8 +173,7 @@ impl NewSpace {
     /// Bump-allocate inside `to`-space — used by the scavenger
     /// while evacuating survivors.
     pub fn alloc_in_to(&mut self, size_aligned: usize) -> Option<u32> {
-        // One moving to-space top, like V8's semispace allocation: never
-        // rescan the pages already filled.
+        // One moving to-space top: never rescan the pages already filled.
         while let Some(page) = self.to.get(self.to_active) {
             if let Some(offset) = page.bump_alloc(size_aligned) {
                 return Some(offset);
@@ -562,9 +561,9 @@ impl LargeObjectSpace {
         debug_assert!(size_aligned > LARGE_OBJECT_THRESHOLD);
         // The region is sized to the body, not the other way round: a
         // string or backing store larger than one page spans as many as it
-        // needs, the way V8's `LargePage` is a variable-sized chunk. A
-        // fixed one-page region would make any body over ~128 KiB
-        // unallocatable, which for string storage means unrepresentable.
+        // needs, as one variable-sized chunk. A fixed one-page region would
+        // make any body over ~128 KiB unallocatable, which for string
+        // storage means unrepresentable.
         let span = size_aligned
             .saturating_add(PAGE_HEADER_SIZE)
             .div_ceil(PAGE_SIZE);

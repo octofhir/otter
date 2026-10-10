@@ -1307,7 +1307,7 @@ impl Interpreter {
                 hops + 1,
             );
         }
-        // V8-compatible diagnostic: name the base kind and the key being
+        // Diagnostic: name the base kind and the key being
         // read ("Cannot read properties of undefined (reading 'foo')").
         Err(CommittedValueError::JavaScript(
             self.nullish_read_error(&base, key.string_name()),

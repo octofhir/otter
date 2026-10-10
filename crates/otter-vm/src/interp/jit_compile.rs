@@ -730,8 +730,8 @@ impl Interpreter {
         } else if !self.jit_optimized_code.contains_key(&fid)
             && self.jit_code_registry.counted_entries(fid) >= OSR_ENTRY_TIER_MIN_ENTRIES
         {
-            // V8 optimizes a function that keeps being called for its entry
-            // and enters a loop through OSR only while one activation stays
+            // A function that keeps being called is optimized for its entry;
+            // a loop is entered through OSR only while one activation stays
             // in it. This activation finishes below the optimized tier unless
             // it funds this header's threshold again.
             let _ = self.resolve_optimized_code_for_fid(context, fid);
@@ -1751,12 +1751,12 @@ impl Interpreter {
     /// prototype hop rather than a second description of the same access. An
     /// entry that may collect reserves its safepoint here, at the site that
     /// will publish it.
-    /// Proof for an `f.call(...)` site (V8's `ReduceFunctionPrototypeCall`)
-    /// whose feedback recorded the function `%Function.prototype.call%` ran.
-    /// A method call named `call` proves its lookup through the closure
-    /// property program while the intrinsic still occupies the slot; an
-    /// explicit-receiver call proves only its loaded callee. Generated code
-    /// re-proves the intrinsic's identity before calling the function.
+    /// Proof for an `f.call(...)` site whose feedback recorded the function
+    /// `%Function.prototype.call%` ran. A method call named `call` proves its
+    /// lookup through the closure property program while the intrinsic still
+    /// occupies the slot; an explicit-receiver call proves only its loaded
+    /// callee. Generated code re-proves the intrinsic's identity before
+    /// calling the function.
     fn function_prototype_call_proof(
         &mut self,
         view: &jit::JitCompileSnapshot,

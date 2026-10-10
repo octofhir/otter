@@ -90,9 +90,8 @@ pub struct VmTypeMismatchAt {
 /// [`VmError::Interrupted`] at the next checkpoint.
 ///
 /// The flag also owns the countdown compiled loops decrement at every
-/// back-edge (V8's interrupt budget with its stack-guard trip): tripping the
-/// flag zeroes the countdown, so compiled code tests one counter and still
-/// reaches its poll at the next back-edge.
+/// back-edge: tripping the flag zeroes the countdown, so compiled code tests
+/// one counter and still reaches its poll at the next back-edge.
 #[derive(Debug, Default, Clone)]
 pub struct InterruptFlag(Arc<InterruptState>);
 

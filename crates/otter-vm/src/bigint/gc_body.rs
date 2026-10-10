@@ -1,6 +1,6 @@
 //! GC-managed body for [`crate::Value::BigInt`].
 //!
-//! V8's `BigInt` layout: a sign, a digit count, and the magnitude's
+//! The layout is a sign, a digit count, and the magnitude's
 //! little-endian `u64` digits stored inline after the body. A body owns no
 //! memory outside the heap, so it is born young, dies in a scavenge, and
 //! moves with the collector like a string.

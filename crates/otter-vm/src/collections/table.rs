@@ -8,9 +8,8 @@
 //!
 //! Both now live in one GC body — a bucket array followed by the entry
 //! array, in the same cell, with collision chains threaded through the
-//! entries themselves. That is V8's `OrderedHashTable`, and it is the
-//! same shape for the same reason: one object, no side allocation, and
-//! insertion order falls out of the entry array being append-only.
+//! entries themselves: one object, no side allocation, and insertion
+//! order falls out of the entry array being append-only.
 //!
 //! # Contents
 //!

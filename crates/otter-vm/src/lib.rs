@@ -693,11 +693,11 @@ pub struct JitCollectionMethodIcStats {
 /// isolate-owned distribution never retains a movable GC handle. Absence from
 /// the directory = unobserved.
 /// Maximum number of distinct `(receiver shape, method)` targets one
-/// polymorphic method-call site keeps for inline guard-chain baking. Mirrors
-/// the V8/JSC polymorphic IC width: enough to cover real OO dispatch (a family
-/// of sibling classes sharing a method name through one call site) while
-/// bounding both the emitted guard-chain length and the number of
-/// reoptimization evictions a single site can trigger as its target set grows.
+/// polymorphic method-call site keeps for inline guard-chain baking: enough
+/// to cover real OO dispatch (a family of sibling classes sharing a method
+/// name through one call site) while bounding both the emitted guard-chain
+/// length and the number of reoptimization evictions a single site can
+/// trigger as its target set grows.
 ///
 /// A site with more shapes than this bakes none and side-exits at the method
 /// call, which is far costlier than a few extra shape-guard compares. This
@@ -810,13 +810,13 @@ pub struct Interpreter {
     /// site. Values are traced from [`RuntimeState::trace_roots`] so moving
     /// collection rewrites them in place without invalidating relocations.
     literal_cells: rustc_hash::FxHashMap<(usize, u32), Box<Value>>,
-    /// Decimal strings for small non-negative integers, served on demand
-    /// (JSC `SmallStrings` / V8 number-string-cache idea, adapted). Integer →
-    /// string is one of the most repeated allocations in real code (`"" + n`,
-    /// `(n).toString()`, integer keys); caching `0..SMALL_INT_STRING_CACHE`
-    /// returns one immutable shared handle instead of allocating a fresh string
-    /// body every conversion. Lazily filled; entries are traced from
-    /// [`RuntimeState::trace_roots`] so a moving collection rewrites them.
+    /// Decimal strings for small non-negative integers, served on demand.
+    /// Integer → string is one of the most repeated allocations in real code
+    /// (`"" + n`, `(n).toString()`, integer keys); caching
+    /// `0..SMALL_INT_STRING_CACHE` returns one immutable shared handle instead
+    /// of allocating a fresh string body every conversion. Lazily filled;
+    /// entries are traced from [`RuntimeState::trace_roots`] so a moving
+    /// collection rewrites them.
     small_int_string_cache: Box<[Option<Value>]>,
     /// Prepared bytecode callback metadata for native loops that repeatedly
     /// call the same JS function. Entries are a strict stack: acquisition
@@ -866,10 +866,9 @@ pub struct Interpreter {
     /// Monotonic version of `array_index_accessor_protector`. Advances exactly
     /// once, on the latch's sole `false -> true` transition.
     array_index_accessor_protector_epoch: u64,
-    /// `true` once any `ArrayBuffer` has been detached or transferred (V8's
-    /// ArrayBufferDetachingProtector). While it stays `false`, a fixed-length
-    /// typed array's cached element base is live, so generated element
-    /// access needs no per-buffer detach proof.
+    /// `true` once any `ArrayBuffer` has been detached or transferred. While
+    /// it stays `false`, a fixed-length typed array's cached element base is
+    /// live, so generated element access needs no per-buffer detach proof.
     array_buffer_detach_protector: bool,
     interrupt: InterruptFlag,
     /// Non-reused ECMA agent identity for `Atomics.wait` lifecycle control.
@@ -1333,8 +1332,8 @@ pub struct Interpreter {
     /// Traced as a GC root once created.
     intl_fallback_symbol: Option<crate::symbol::JsSymbol>,
     /// The eight `typeof` result strings, created on first use and shared
-    /// by every `typeof` so the operator never allocates (V8 keeps them as
-    /// read-only roots). Traced as GC roots once created.
+    /// by every `typeof` so the operator never allocates. Traced as GC roots
+    /// once created.
     typeof_strings: [Option<crate::JsString>; 8],
     /// Embedder-overridable sink behind the `console` namespace.
     /// Defaults to `println!` / `eprintln!` via

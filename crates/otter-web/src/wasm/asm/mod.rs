@@ -1,4 +1,4 @@
-//! asm.js modules run as WebAssembly (V8 `src/asmjs`).
+//! asm.js modules run as WebAssembly.
 //!
 //! A function whose directive prologue holds `"use asm"` is offered, on its
 //! first interpreted entry, to the realm's `__otterAsmLink` global: the

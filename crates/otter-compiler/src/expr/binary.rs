@@ -297,7 +297,7 @@ fn compile_binary_to(
         // <https://tc39.es/ecma262/#sec-relational-operators-runtime-semantics-evaluation>
         BinaryOperator::In => Op::HasProperty,
     };
-    // `"name" in object` with a literal, non-index name is V8's KeyedHasIC
+    // `"name" in object` with a literal, non-index name is a presence test
     // on a constant key: a named site whose load inline cache answers
     // presence by the receiver's shape. The literal has no effect and its
     // ToPropertyKey is itself, so only the object operand is evaluated.
@@ -326,8 +326,8 @@ fn compile_binary_to(
     }
     // `typeof x === "kind"` (and `!==`, `==`, `!=`, either side) against one
     // of the eight `typeof` spellings is a type test, not a string compare:
-    // no result string is produced (V8's `TestTypeOf`). The literal side has
-    // no effect, so evaluating only the `typeof` operand keeps the order.
+    // no result string is produced. The literal side has no effect, so
+    // evaluating only the `typeof` operand keeps the order.
     if matches!(
         op,
         Op::Equal | Op::NotEqual | Op::LooseEqual | Op::LooseNotEqual

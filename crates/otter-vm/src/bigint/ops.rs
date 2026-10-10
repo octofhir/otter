@@ -2,9 +2,8 @@
 //!
 //! Each operator reads its operands' signs and lengths, sizes the result,
 //! allocates it once (operands rooted across the allocation), and runs a
-//! [`super::digits`] kernel straight into it — V8's `MutableBigInt`
-//! discipline. An operator whose result equals an operand returns that
-//! operand: published BigInts are immutable.
+//! [`super::digits`] kernel straight into it. An operator whose result
+//! equals an operand returns that operand: published BigInts are immutable.
 //!
 //! # Contents
 //! - Arithmetic: [`add`], [`sub`], [`mul`], [`div`], [`rem`], [`pow`],
@@ -17,9 +16,9 @@
 //!
 //! # Invariants
 //! - Results never exceed [`MAX_BITS`]; a larger one is
-//!   [`OpError::TooBig`] (V8 `kMaxLengthBits`).
+//!   [`OpError::TooBig`].
 //! - Two's-complement bitwise semantics map onto magnitude kernels through
-//!   `-x == !(x - 1)` for negative operands, as in V8 `bitwise.cc`.
+//!   `-x == !(x - 1)` for negative operands.
 //!
 //! # Spec references
 //! - ECMA-262 §6.1.6.2 — BigInt operations.

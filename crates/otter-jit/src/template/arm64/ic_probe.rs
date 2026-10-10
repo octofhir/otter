@@ -398,9 +398,8 @@ where
             cached_data_byte,
         } => {
             // A fixed view's cached base stands for every buffer proof below
-            // while no buffer has ever been detached (V8's
-            // ArrayBufferDetachingProtector): its storage cannot move, grow or
-            // shrink, and its extent was validated at construction.
+            // while no buffer has ever been detached: its storage cannot move,
+            // grow or shrink, and its extent was validated at construction.
             let slow = ops.new_dynamic_label();
             let ready = ops.new_dynamic_label();
             dynasm!(ops

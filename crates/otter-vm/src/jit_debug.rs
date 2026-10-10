@@ -118,7 +118,7 @@ impl JitDebugRequest {
     }
 
     /// Return whether installed code is written to the perf map
-    /// (`/tmp/perf-<pid>.map`, V8's `--perf-basic-prof`).
+    /// (`/tmp/perf-<pid>.map`).
     #[must_use]
     pub const fn perf_map_enabled(self) -> bool {
         self.perf_map
@@ -939,7 +939,7 @@ impl JitDebugState {
 
 impl JitDebugState {
     /// Append one installed code object to the perf map in the
-    /// `START SIZE name` form `perf` and V8's `--perf-basic-prof` share.
+    /// `START SIZE name` form `perf` reads.
     /// A map that cannot be written is skipped: it is a diagnostic.
     pub(crate) fn record_perf_map(&mut self, address: u64, len: usize, name: &str) {
         use std::io::Write;

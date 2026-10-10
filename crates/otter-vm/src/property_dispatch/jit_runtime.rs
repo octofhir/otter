@@ -642,7 +642,7 @@ impl Interpreter {
                 object::store_proven_data_slot(obj, &mut self.gc_heap, resolved.hit.slot, value);
                 return Ok(());
             }
-            // V8's generic keyed store adds a key its receiver's chain lets it
+            // The generic keyed store adds a key its receiver's chain lets it
             // add by the receiver class's transition, shared with every site
             // as a named add is, unless the keyed soft limit first leaves the
             // receiver a dictionary.

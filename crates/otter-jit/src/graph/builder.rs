@@ -201,8 +201,8 @@ pub(crate) struct Known {
     this: Option<NodeId>,
     /// Cells a buffer bump allocated on this path since its last safepoint:
     /// the buffer serves only while no marking runs, so each is young and
-    /// unmarked, and a store into it owes no barrier (V8's
-    /// MemoryOptimizer). Any call, collection point or poll forgets them.
+    /// unmarked, and a store into it owes no barrier. Any call, collection
+    /// point or poll forgets them.
     fresh: FxHashSet<NodeId>,
 }
 
@@ -851,8 +851,8 @@ impl<'a> Builder<'a> {
         let bytes = code.bytecode_byte_len();
         let depth = self.inline.as_ref().map_or(0, |inline| inline.depth);
         let outer_pc = self.graph.outer_pc_at(self.graph.origin, self.pc);
-        // A small body costs less inlined than its call does: like Maglev,
-        // it is inlined past the cumulative budget and deeper.
+        // A small body costs less inlined than its call does, so it is
+        // inlined past the cumulative budget and deeper.
         let within_budget = if bytes <= otter_vm::jit::JIT_SMALL_INLINE_BYTECODE_BYTES {
             depth < otter_vm::jit::JIT_SMALL_INLINE_DEPTH
                 && self.inlined_bytes + bytes <= MAX_INLINED_BYTECODE_ABSOLUTE
@@ -2513,8 +2513,7 @@ impl<'a> Builder<'a> {
         let taken = self.analysis.block_of[target as usize];
         let fallthrough = self.analysis.block_of[self.pc as usize + 1];
         // A condition known while building selects its edge now; the other
-        // successor gets no incoming edge from here (Maglev folds a
-        // constant `JumpIf*` the same way).
+        // successor gets no incoming edge from here.
         if let Some(jumps) = self.constant_condition(instruction.op, value) {
             self.goto(if jumps { taken } else { fallthrough });
             return;
@@ -2803,9 +2802,8 @@ impl<'a> Builder<'a> {
 
     /// Prove `object` has one of `shapes`, unless already proved.
     /// The generational barrier after storing `value` into `object`, unless
-    /// `value` can never be a cell, as V8 omits it for a Smi: an immediate
-    /// constant, a boxed number or a boolean result; or unless `object` is a
-    /// cell this path just bumped.
+    /// `value` can never be a cell: an immediate constant, a boxed number or
+    /// a boolean result; or unless `object` is a cell this path just bumped.
     fn write_barrier(&mut self, object: NodeId, value: NodeId) {
         if self.known.fresh.contains(&object) {
             return;
@@ -2892,9 +2890,8 @@ impl<'a> Builder<'a> {
         if !self.view.instructions[self.pc as usize].call_attempted {
             return self.deopt(DeoptReason::InsufficientFeedback);
         }
-        // `new <%Array%>(length)` (V8's ReduceArrayConstructor): the realm's
-        // original constructor, proved by identity, creates its array
-        // without a frame of its own.
+        // `new <%Array%>(length)`: the realm's original constructor, proved
+        // by identity, creates its array without a frame of its own.
         if construct
             && argc <= 1
             && let Some(&cell) = self.view.array_constructor_sites.get(&instruction.byte_pc)
@@ -3750,7 +3747,7 @@ impl<'a> Builder<'a> {
     }
 
     /// An element store that sees Array storage of several kinds, or whose
-    /// speculation left for a bound, a hole or another layout: V8's generic
+    /// speculation left for a bound, a hole or another layout: the generic
     /// keyed store, without a deopt. A typed-array site keeps its baseline
     /// operation.
     fn keyed_store(&mut self, instruction: &Instruction) {
@@ -3840,7 +3837,7 @@ impl<'a> Builder<'a> {
 
     /// An element load that sees Array storage of several kinds or a name
     /// key, or whose speculation left for a bound, a hole or another layout:
-    /// V8's generic keyed load, without a deopt.
+    /// the generic keyed load, without a deopt.
     fn keyed_load(&mut self, instruction: &Instruction) {
         if !self.keyed_generic_site(instruction) {
             return self.generic(instruction);

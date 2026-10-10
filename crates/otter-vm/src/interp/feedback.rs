@@ -417,8 +417,7 @@ impl Interpreter {
 
     /// Mark one `Op::CallMethodValue` site megamorphic after a receiver or
     /// callee that no generated guard can describe, so later calls skip the
-    /// per-call feedback capture, as a V8 IC goes megamorphic once it fails
-    /// to cache.
+    /// per-call feedback capture.
     pub(crate) fn saturate_method_site_feedback(&mut self, site: usize) {
         self.method_feedback.saturate_method_targets(site);
     }

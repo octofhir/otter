@@ -191,10 +191,10 @@ impl NumericRuntimeOp {
     }
 }
 
-/// Fold a numeric result into its site's feedback with its operands, as
-/// V8's binary-operation feedback does: an int32 site is one whose results
-/// were int32 too, so an overflowing, fractional, unsigned or `-0` result
-/// speculates a double before any optimized code has to exit for it.
+/// Fold a numeric result into its site's feedback with its operands: an
+/// int32 site is one whose results were int32 too, so an overflowing,
+/// fractional, unsigned or `-0` result speculates a double before any
+/// optimized code has to exit for it.
 fn record_arith_result(feedback: Option<InstructionFeedbackRecorder<'_>>, result: Value) {
     if let Some(feedback) = feedback {
         feedback.record_arith(result, result);

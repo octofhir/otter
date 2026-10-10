@@ -6,7 +6,7 @@
 //!   the string/BigInt content leaf out of line.
 //! - [`Codegen::emit_loose_equal`] — §7.2.15 IsLooselyEqual: every case
 //!   that coerces nothing inline, every coercing case (and `[[IsHTMLDDA]]`)
-//!   in the runtime, as V8's `Equal` builtin splits them.
+//!   in the runtime.
 //!
 //! # Invariants
 //! - Both operands are read before the result is written; the result may

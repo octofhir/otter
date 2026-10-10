@@ -225,8 +225,7 @@ impl Interpreter {
     /// The cached method of a shaped receiver whose resolution `site`
     /// already records, or `None` when the call would change its feedback.
     /// A recorded call skips the layout capture (chain migration, lookup and
-    /// shape registration), as a V8 IC hit leaves its feedback slot
-    /// untouched. Runs no user code and never allocates.
+    /// shape registration). Runs no user code and never allocates.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn recorded_method_call(
         &mut self,

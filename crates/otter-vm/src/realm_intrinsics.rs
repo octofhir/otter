@@ -269,7 +269,7 @@ pub(crate) struct RealmIntrinsics {
     /// Which iteration reads have built-in answers in this realm, while proven.
     pub(crate) iteration: crate::iteration_protocol::IterationProofs,
     /// CreateIteratorResultObject's hidden class: `%Object.prototype%`, then
-    /// `value`, then `done` (V8's iterator result map).
+    /// `value`, then `done`.
     pub(crate) iterator_result: Option<crate::ObjectLayout>,
 }
 

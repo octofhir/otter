@@ -8,7 +8,7 @@
 //!
 //! # Invariants
 //! - A family starts with 64 persistent in-object words on a provisional shape
-//!   lineage (V8's in-object slack tracking). Its shapes are ordinary layouts
+//!   lineage (in-object slack tracking). Its shapes are ordinary layouts
 //!   for every guard; no allocation plan ever allocates from a provisional
 //!   root.
 //! - Exactly seven terminal outer constructions are counted, including abrupt
@@ -290,10 +290,10 @@ pub(crate) fn detach_families(heap: &mut GcHeap, head: ConstructorLayout) {
 }
 
 /// Best-effort deferred finalization: complete in-object slack tracking on
-/// the family's own lineage once its seven samples are in (V8's
-/// `CompleteInobjectSlackTracking`). `layout` is reachable from a rooted
-/// actual constructor or canonical construction packet throughout this call.
-/// Returning false is metadata refusal, not a JavaScript error.
+/// the family's own lineage once its seven samples are in. `layout` is
+/// reachable from a rooted actual constructor or canonical construction
+/// packet throughout this call. Returning false is metadata refusal, not a
+/// JavaScript error.
 pub(crate) fn try_finalize_root(
     layout: ConstructorLayout,
     heap: &mut GcHeap,

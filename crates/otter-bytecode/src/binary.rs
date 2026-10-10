@@ -3,10 +3,9 @@
 //! A cache only pays if reading an entry costs much less than producing it,
 //! and a general-purpose serializer does not clear that bar here: it walks the
 //! module as a graph of values, allocating as it goes, which lands in the same
-//! order of magnitude as simply compiling the source again. The engines that
-//! ship code caches do not do that — V8 writes a flat blob it can fix up in a
-//! near-linear pass, and JSC's bytecode cache is a flat buffer of records read
-//! back by offset.
+//! order of magnitude as simply compiling the source again. A code cache that
+//! pays for itself is a flat blob fixed up in a near-linear pass, or a flat
+//! buffer of records read back by offset.
 //!
 //! This is that shape. Every sequence is length-prefixed and decoding is a
 //! straight walk over the bytes into pre-sized vectors — no visitor

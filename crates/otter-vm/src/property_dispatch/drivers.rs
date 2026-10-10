@@ -239,7 +239,7 @@ impl Interpreter {
                 }
                 Some(_) => return Ok(false),
                 None => {
-                    // SpiderMonkey-legacy magic `caller` / `arguments`
+                    // Legacy magic `caller` / `arguments`
                     // on a sloppy ordinary function resolves BEFORE the
                     // %Function.prototype% poison accessors.
                     if is_restricted_function_property(name)
@@ -347,7 +347,7 @@ impl Interpreter {
                 false
             };
             if !own_present {
-                // SpiderMonkey-legacy magic `caller` / `arguments` on
+                // Legacy magic `caller` / `arguments` on
                 // a sloppy ordinary function resolves BEFORE the
                 // %Function.prototype% poison accessors.
                 if is_restricted_function_property(name)
@@ -572,7 +572,7 @@ impl Interpreter {
                 }
                 Some(_) => return Ok(false),
                 None => {
-                    // SpiderMonkey-legacy magic `caller` / `arguments`
+                    // Legacy magic `caller` / `arguments`
                     // on a sloppy ordinary function resolves BEFORE the
                     // %Function.prototype% poison accessors.
                     if is_restricted_function_property(key)

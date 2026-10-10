@@ -1,6 +1,6 @@
 //! Phi representation selection: a phi whose every input is an int32 value
 //! becomes an unboxed int32 phi, and one whose every input is a number an
-//! unboxed float64 phi (Maglev's phi untagging).
+//! unboxed float64 phi (phi untagging).
 //!
 //! # Contents
 //! - [`untag_phis`] — retype qualifying phis, drop the checks that unboxed

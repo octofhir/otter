@@ -5,8 +5,7 @@
 //! young-gen scavenger (Cheney BFS), tri-color mark-sweep old-gen,
 //! generational + Dijkstra-insertion write barriers, type-tag
 //! function-pointer trace dispatch, RAII handle scopes, Chrome
-//! DevTools `.heapsnapshot` export. V8 Orinoco / JSC Riptide
-//! shaped, 2026.
+//! DevTools `.heapsnapshot` export.
 //!
 //! # Contents
 //!

@@ -4,8 +4,7 @@
 //! internal slot per §21.4.5. The slot is stored on
 //! [`crate::object::ObjectBody::date_data`] — same shape as
 //! [[BooleanData]] / [[NumberData]] / [[StringData]] — so Date
-//! reuses the standard property machinery (V8 `JSDate` and JSC
-//! `DateInstance` follow the same model).
+//! reuses the standard property machinery.
 //!
 //! UTC operations use self-contained proleptic Gregorian arithmetic in
 //! [`broken_down`] / [`make_date`]. Local operations use the same

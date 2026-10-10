@@ -83,7 +83,7 @@ impl<'a> ModuleTranslator<'a> {
                         ConstExpr::f64_const((-value).into()),
                         mutable,
                     )),
-                    // V8 reads `-0` as a float.
+                    // `-0` reads as a float.
                     Literal::Unsigned(0) => Ok(self.global(
                         AsmType::FLOAT,
                         ValType::F32,

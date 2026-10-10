@@ -66,8 +66,7 @@ otter_macros::holt! {
 
 /// Hard cap on nesting depth. Both stringify and parse abort with
 /// `JsonError::TooDeep` once exceeded — keeps adversarial input
-/// from blowing the host stack and matches V8's `JSON.stringify`
-/// behaviour for very deep objects.
+/// from blowing the host stack.
 pub const MAX_NESTING_DEPTH: usize = 1024;
 
 /// Failure modes for [`call`].

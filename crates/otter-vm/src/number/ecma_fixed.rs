@@ -343,7 +343,7 @@ fn format_fixed(n: &BigUint, fraction_digits: u32, negative: bool) -> String {
     let mut out = String::with_capacity(total + 4);
     // §21.1.3.3 step 9: always prepend `-` if `x < 0`, even when
     // the rounded magnitude is zero (so `(-0.5).toFixed(0)` is
-    // `"-0"`, matching V8/Node.js).
+    // `"-0"`, matching Node.js).
     let _ = n.is_zero();
     if negative {
         out.push('-');

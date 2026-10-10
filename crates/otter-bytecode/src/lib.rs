@@ -432,7 +432,7 @@ pub enum Op {
     /// `Register(dst), Register(src)`. Writes the iterator record into the
     /// register pair at `dst`. An ordinary Array whose iteration is not
     /// observable keeps the array in `dst` and an int32 cursor in `dst + 1`,
-    /// with no iterator object (JSC's fast-array iteration mode). Any other
+    /// with no iterator object (fast-array iteration mode). Any other
     /// source keeps an internal iterator value in `dst` (`String` walks code
     /// units, user objects route through `[@@iterator]`) and `undefined` in
     /// `dst + 1`.
@@ -950,7 +950,7 @@ pub enum Op {
     /// `Register(dst), Register(src), Imm32(test)`, where `test` is a
     /// [`TypeOfTest`] encoding. The compiler fuses `typeof x ===`/`!==`/
     /// `==`/`!=` against one of the eight `typeof` result spellings into
-    /// this test, so no result string is produced (V8's `TestTypeOf`).
+    /// this test, so no result string is produced.
     TestTypeOf,
     /// `r<dst> = delete r<obj>[r<idx>]` (boolean result). Operands:
     /// `dst, obj, idx`. Indexed counterpart of
@@ -1149,9 +1149,8 @@ pub enum Op {
     /// `r<dst> = name in r<object>` for a constant, non-index property name:
     /// §13.10.1 with `HasProperty(object, name)`, a TypeError when `object`
     /// is not an Object. The site owns a load inline cache, whose handler
-    /// for the receiver's shape answers presence without reading the value
-    /// (V8's `KeyedHasIC` on a constant key). Operands:
-    /// `Register(dst), Register(object), ConstIndex(name)`.
+    /// for the receiver's shape answers presence without reading the value.
+    /// Operands: `Register(dst), Register(object), ConstIndex(name)`.
     ///
     /// # See also
     /// - <https://tc39.es/ecma262/#sec-relational-operators-runtime-semantics-evaluation>

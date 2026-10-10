@@ -256,8 +256,7 @@ fn interpreter_turn(ctx: *mut JitCtx, entering: bool) -> NativeResultPair {
         vm.begin_interpreted_retraining_activation(unsafe { &mut *frame });
     }
     // A `"use asm"` module offers itself to the host linker once per entry:
-    // linked exports replace the body's completion (V8 instantiates asm.js
-    // as WebAssembly the same way).
+    // linked exports replace the body's completion.
     if fresh_entry
         && !tier_completion
         && resume_error.is_none()

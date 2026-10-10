@@ -30,9 +30,9 @@
 //!   materialization retains the existing traced source and write barrier.
 //! - Concatenation preserves the exact `u32` UTF-16 length contract. A wider
 //!   sum returns [`StringConcatError::StringTooLong`] before allocation.
-//! - The empty string and every one-unit Latin-1 string exist once per heap
-//!   (V8's single-character string table): once [`JsString::install_unit_strings`]
-//!   has run, constructors return those shared bodies instead of allocating.
+//! - The empty string and every one-unit Latin-1 string exist once per heap:
+//!   once [`JsString::install_unit_strings`] has run, constructors return
+//!   those shared bodies instead of allocating.
 //!
 //! # See also
 //! - <https://tc39.es/ecma262/#sec-ecmascript-language-types-string-type>

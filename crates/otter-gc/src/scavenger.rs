@@ -32,7 +32,7 @@
 //! # Promotion
 //!
 //! An object is copied to to-space on its first survival and promoted to
-//! old space on its second (V8's semispace age mark). The to-space pages
+//! old space on its second (the semispace age mark). The to-space pages
 //! that received survivors become the next from-space and the mutator keeps
 //! bump-allocating above their `age_mark`, so a fresh object never inherits
 //! its page's age. Children of remembered old parents are promoted at once.
@@ -330,8 +330,7 @@ pub unsafe fn scavenge(
 /// evacuated, and keep tracking the ones that stayed young.
 ///
 /// Only bodies whose type has a hook are tracked, at allocation; the dead
-/// cells around them are never visited (V8 keeps the same side lists for
-/// young array buffers and external strings). A copying collector transfers
+/// cells around them are never visited. A copying collector transfers
 /// ownership of a survivor's payload with the byte copy in [`evacuate`]; only
 /// an unforwarded source remains a valid Rust value. Its finalizer follows
 /// the same ordering as old-space sweep, then its `Drop` implementation
@@ -505,9 +504,9 @@ unsafe fn process_slot(ctx: &mut ScavCtx, slot: *mut RawGc, parent_header: Optio
                 parent_header,
             );
         }
-        // Classify the target by its page, as V8's `InFromPage` does: an old
-        // or large target is never touched, so its header stays out of the
-        // cache. Objects on new-space pages are exactly the young ones.
+        // Classify the target by its page: an old or large target is never
+        // touched, so its header stays out of the cache. Objects on
+        // new-space pages are exactly the young ones.
         match Page::header_of(header_ptr as *const u8).space {
             SpaceKind::Old | SpaceKind::Large => {}
             SpaceKind::NewTo => {
@@ -693,7 +692,8 @@ unsafe fn process_ephemeron_fixpoint(ctx: &mut ScavCtx, ephemeron_registry_slots
             // forwarding target — that made the loop believe it progressed
             // every pass and re-run a full to-space re-scan (fresh cheney
             // cursors each call) millions of times: one first scavenge ran
-            // for minutes on v8-v7 raytrace with ZERO ephemeron tables.
+            // for minutes on the raytrace benchmark with ZERO ephemeron
+            // tables.
             let before = (ctx.stats.copied_bytes, ctx.stats.promoted_bytes);
 
             for &slot in ephemeron_registry_slots {
@@ -766,8 +766,8 @@ unsafe fn evacuate(ctx: &mut ScavCtx, header: *mut GcHeader) -> u32 {
         // immediately: leaving it young re-remembers the parent, and the
         // parent is then re-traced in full on EVERY scavenge until the
         // child ages out — for a large promoted graph that made each
-        // scavenge O(old heap) and the run quadratic (v8-v7 earley-boyer
-        // spent 20+ minutes inside the scavenger). An object an old
+        // scavenge O(old heap) and the run quadratic (the earley-boyer
+        // benchmark spent 20+ minutes inside the scavenger). An object an old
         // object points at is long-lived with overwhelming likelihood
         // anyway, so this is the standard generational answer.
         let promote = ctx.in_dirty_scan || {

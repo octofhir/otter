@@ -1,8 +1,7 @@
 //! Property, element, binding, and collection VM slow paths.
 //!
 //! # Contents
-//! - Named-property IC misses (V8 `LoadIC_Miss` / `StoreIC_Miss`) and
-//!   committed cold handlers.
+//! - Named-property IC misses and committed cold handlers.
 //! - Effect-once boxed-span method-call completion.
 //! - Element/global/object runtime operations.
 //!
@@ -43,8 +42,8 @@ fn property_ic_site(slot: u64) -> Result<(u32, u32), CommittedValueError> {
     Ok(unsafe { otter_vm::jit::property_ic_site(slot) })
 }
 
-/// Complete the source-owned `LoadProperty` from one boxed receiver: V8's
-/// `LoadIC_Miss`.
+/// Complete the source-owned `LoadProperty` from one boxed receiver: the
+/// load IC miss.
 ///
 /// The site's IC slot supplies function/logical-PC identity; the VM validates
 /// the opcode, derives its property name, completes the load and updates the
@@ -66,7 +65,7 @@ pub(crate) extern "C" fn jit_load_property_stub(
 }
 
 /// Complete the exact published `StoreProperty` from boxed receiver/value
-/// operands: V8's `StoreIC_Miss`.
+/// operands: the store IC miss.
 ///
 /// A successful return means the full store committed once; a setter/proxy
 /// exception is returned as a pure exception value without replay.

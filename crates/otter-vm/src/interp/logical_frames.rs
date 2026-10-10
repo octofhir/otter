@@ -1,6 +1,6 @@
 //! The published JavaScript activations as the language sees them: each
-//! physical frame, preceded by the activations it runs inlined (V8's
-//! `FrameInspector` over an optimized frame's frame state).
+//! physical frame, preceded by the activations it runs inlined (read from
+//! an optimized frame's frame state).
 //!
 //! # Contents
 //! - [`LogicalActivation`] — one activation's function, callee and, for an

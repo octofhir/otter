@@ -21,8 +21,7 @@
 //!   data-pointer (`identity_addr`), so we never round-trip
 //!   through string keys.
 //! - Number formatting mirrors `Number.prototype.toString` (which
-//!   we already ship), so the output is byte-identical to V8 for
-//!   the foundation subset.
+//!   we already ship).
 
 use crate::Value;
 use crate::array::JsArray;

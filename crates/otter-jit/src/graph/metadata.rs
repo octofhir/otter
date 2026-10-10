@@ -180,7 +180,7 @@ impl SitePlan {
         Ok(self.intern(key, graph.outer_pc(node), || {
             // A suspended JS call holds every value of its lazy state in a
             // home or as a constant: each inlined activation's binding and
-            // actual arguments read from there (V8's FrameInspector).
+            // actual arguments read from there.
             let described: Vec<DeoptFrame> = data
                 .lazy
                 .filter(|_| data.origin != 0)

@@ -6,8 +6,8 @@
 //!   slot, or a constant rematerialized at the use.
 //! - [`allocate`] — assigns inputs, results, temporaries, edge moves and a
 //!   provisional home per spilled value in one walk, then colors the homes by
-//!   their live intervals and renames them, as V8's allocators assign spill
-//!   slots after register allocation.
+//!   their live intervals and renames them, assigning spill slots after
+//!   register allocation.
 //! - [`Allocation`] — the per-node and per-edge result consumed by code
 //!   generation.
 //!
@@ -374,8 +374,7 @@ struct Allocator<'g> {
     /// Control-flow liveness, including deopt frame-state uses.
     liveness: super::liveness::Liveness,
     /// Values a loop's back edge feeds into a header phi, with that phi: the
-    /// value prefers the phi's register, so the edge needs no move (V8's
-    /// register hints for phi inputs).
+    /// value prefers the phi's register, so the edge needs no move.
     phi_hints: FxHashMap<NodeId, NodeId>,
 }
 
@@ -1520,10 +1519,10 @@ impl<'g> Allocator<'g> {
 
     /// The values that share one home, in order of their first definition.
     /// A phi joins every input of its representation whose live interval
-    /// overlaps no member's, as V8's register allocator bundles a phi with
-    /// its inputs before assigning spill slots: the edge into the phi then
-    /// moves nothing between homes. A bundle's slot is held over its whole
-    /// hull, which for a loop phi and its back-edge input is the loop.
+    /// overlaps no member's, bundling the phi with its inputs before spill
+    /// slots are assigned: the edge into the phi then moves nothing between
+    /// homes. A bundle's slot is held over its whole hull, which for a loop
+    /// phi and its back-edge input is the loop.
     fn home_bundles(&self) -> Vec<HomeBundle> {
         let mut values: Vec<NodeId> = self.out.spill.iter().map(|(value, _)| value).collect();
         values.sort_unstable_by_key(|&value| (self.pos(value), value));

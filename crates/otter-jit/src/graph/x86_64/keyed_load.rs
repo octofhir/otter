@@ -1,5 +1,5 @@
-//! x86-64 generic element loads: V8's `KeyedLoadIC_Megamorphic` for a site
-//! the optimizer does not specialize.
+//! x86-64 generic element loads for a site the optimizer does not
+//! specialize.
 //!
 //! # Contents
 //! - [`Codegen::emit_keyed_load`] reads an Array's dense storage of any kind

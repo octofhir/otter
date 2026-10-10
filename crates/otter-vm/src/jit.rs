@@ -233,8 +233,7 @@ const _: () = {
 };
 
 /// Inline nesting of one optimizing compilation: any body below this depth,
-/// and a small one down to [`JIT_SMALL_INLINE_DEPTH`] (Maglev's
-/// `max_maglev_inline_depth` and `max_maglev_hard_inline_depth`).
+/// and a small one down to [`JIT_SMALL_INLINE_DEPTH`].
 pub const JIT_INLINE_DEPTH: u8 = 3;
 /// The deepest nesting a small body is inlined at.
 pub const JIT_SMALL_INLINE_DEPTH: u8 = 8;
@@ -652,8 +651,8 @@ pub struct JitCompileSnapshot {
     pub feedback_exits: std::collections::BTreeSet<u32>,
     /// Widest value each parameter was seen to hold when an optimized entry's
     /// parameter guards failed, indexed by parameter; empty when none did.
-    /// Entry representations are capped by it, as JSC's argument value
-    /// profiles widen from the exit's own values.
+    /// Entry representations are capped by it, so they widen from the exit's
+    /// own values.
     pub parameter_widening: Box<[JitParameterWidening]>,
     /// How the indexed-element program addresses each site's receiver, keyed by
     /// the site's byte-PC. Generated code reads only this; the family's body
@@ -1675,9 +1674,8 @@ impl JitElementRepr {
 }
 
 /// An ordinary Array's dense storage as a generic keyed store reads it,
-/// whatever storage kind the array currently has (V8's
-/// `KeyedStoreGenericAssembler` over fast elements kinds). Offsets count
-/// from the Array's `GcHeader`.
+/// whatever storage kind the array currently has. Offsets count from the
+/// Array's `GcHeader`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct JitArrayStorage {
     /// The Array cell tag.

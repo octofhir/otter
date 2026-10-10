@@ -2630,7 +2630,7 @@ impl<'a> Codegen<'a> {
         let slow = self.ops.new_dynamic_label();
         let done = self.ops.new_dynamic_label();
         let table = self.ops.new_dynamic_label();
-        // V8's generic LoadIC: the site's own handlers first, then the
+        // The generic load: the site's own handlers first, then the
         // isolate's shared table, then the committed miss.
         if let Some((slot, function_id, byte_pc)) = self.property_ic_slot(node, pc) {
             let view = metadata::source_view(self.view, self.inline_views, self.graph, node);
@@ -2698,7 +2698,7 @@ impl<'a> Codegen<'a> {
         let done = self.ops.new_dynamic_label();
         let table = self.ops.new_dynamic_label();
         let stored = self.ops.new_dynamic_label();
-        // V8's generic StoreIC: the site's own handlers, then the shared
+        // The generic store: the site's own handlers, then the shared
         // table; both leave the compressed child (zero for an overwrite).
         let slot = self.property_ic_slot(node, pc);
         if let Some((slot, function_id, byte_pc)) = slot {

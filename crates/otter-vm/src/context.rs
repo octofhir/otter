@@ -22,11 +22,11 @@
 //!
 //! # Invariants
 //! - `parent` holds a context value or `undefined`; the extension word, which
-//!   only a scope whose descriptor has `has_extension` (V8's `extension`
-//!   slot, present only for sloppy-eval scopes) carries, holds an
-//!   `EvalExtensionBody` value or `undefined`. Both are full 8-byte `Value`
-//!   words, so generated code dereferences them with one load and no
-//!   cage-base arithmetic. Slot offsets never depend on the extension.
+//!   only a scope whose descriptor has `has_extension` (present only for
+//!   sloppy-eval scopes) carries, holds an `EvalExtensionBody` value or
+//!   `undefined`. Both are full 8-byte `Value` words, so generated code
+//!   dereferences them with one load and no cage-base arithmetic. Slot
+//!   offsets never depend on the extension.
 //! - The body and its whole slot array are initialized before the cell can be
 //!   observed by any collection: allocation goes through
 //!   [`otter_gc::GcHeap::alloc_trailing_with_roots_initialized`], whose

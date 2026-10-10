@@ -15,7 +15,7 @@
 //! - Retraining requires one complete fresh interpreted activation or loop
 //!   iteration of its exact generation. Re-optimization then waits for a full
 //!   stable work window after the deopt's feedback change, earned in any
-//!   tier, as V8 and JSC re-warm a deoptimized function in baseline code.
+//!   tier.
 //! - Code objects retain the same scalar allocation through active retirement.
 //!
 //! # See also
@@ -109,9 +109,8 @@ impl TierWorkDecision {
 
 /// Fixed integer source-work costs, reproduced by the checked-in fit script.
 /// Conservative historical per-op calibration is converted once, rounding
-/// compiler costs upward; the Graph per-instruction term is V8's Maglev
-/// invocation budget instead. No duration or entry/loop model exists at
-/// runtime.
+/// compiler costs upward; the Graph per-instruction term is an invocation
+/// budget instead. No duration or entry/loop model exists at runtime.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct TierWorkModel;
 

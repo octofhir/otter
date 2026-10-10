@@ -2005,7 +2005,7 @@ pub(super) fn emit_method_call(
         dynasm!(ops ; .arch aarch64 ; b =>done ; =>next_target);
     }
     // Every other receiver runs the site's load IC (its handlers, then the
-    // isolate's shared action table as V8's megamorphic stub cache); a
+    // isolate's shared action table as a megamorphic stub cache); a
     // callable hit is called generically. A miss resolves through the
     // committed method resolution, which also records the site's call
     // feedback and updates the slot.

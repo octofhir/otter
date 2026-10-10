@@ -71,8 +71,7 @@ pub(crate) enum StorePropertyTransitionKind {
         validity: Arc<PrototypeValidity>,
     },
     /// A link of the ordinary prototype chain had writable data of this name;
-    /// the appended own property shadows it (V8 stores through a writable
-    /// inherited field the same way, under one chain validity cell).
+    /// the appended own property shadows it.
     PrototypeWritableData {
         /// Shared proof includes descriptor and value mutations.
         validity: Arc<PrototypeValidity>,

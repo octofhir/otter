@@ -678,7 +678,7 @@ impl Interpreter {
     /// Stamp the natives a host installed into the active additional realm
     /// after it was built (extension classes and namespaces) with that realm,
     /// as [`Self::tag_realm_native_graph`] stamps the builtins: a native runs
-    /// under its creation realm (V8's function context), never under the
+    /// under its creation realm, never under the
     /// default realm a missing stamp selects. A no-op in the default realm,
     /// whose natives are unstamped by design.
     #[doc(hidden)]
@@ -921,7 +921,7 @@ impl Interpreter {
         // `non_gc_exotic_prototype_overrides` grew a GC-traced map by one
         // entry per iterator ever created: entries never die (the key is a
         // reusable header address), every scavenge re-traced the whole map,
-        // and v8-v7 raytrace degraded ~200x.
+        // and the raytrace benchmark degraded ~200x.
         if !self.active_realm_is_extra {
             return;
         }

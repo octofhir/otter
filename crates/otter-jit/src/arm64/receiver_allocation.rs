@@ -11,9 +11,9 @@
 //!   plan names only a finalized family, whose root never changes again, and
 //!   a family belongs to exactly one constructor object.
 //! - A closure's `prototype` store clears its family head and a class's
-//!   `prototype` never changes (V8's initial-map dependency): the identity
-//!   proves the live prototype the receiver's shape fixes, so no prototype
-//!   slot is read. Every uncertain case reaches rooted canonical preparation.
+//!   `prototype` never changes: the identity proves the live prototype the
+//!   receiver's shape fixes, so no prototype slot is read. Every uncertain
+//!   case reaches rooted canonical preparation.
 //! - The receiver's shape fixes its prototype and immutable inline capacity.
 //!   An empty receiver uses the exact baked capacity root, never a prototype
 //!   cache-chain head.

@@ -177,7 +177,7 @@ JSON.stringify([plain(), compound(), logical()]);
         // §13.15.2: the assignment target is resolved before its right-hand
         // side runs, so each write lands on the captured outer binding while
         // the `return` afterwards resolves the `var` the eval just declared
-        // (still `undefined`). V8 resolves the target late and answers
+        // (still `undefined`). Resolving the target late would answer
         // `[[5,3],[4,3],[5,0]]`; test262 `language/expressions/assignment`
         // agrees with the resolve-once answer.
         "[[null,5],[null,4],[null,5]]",

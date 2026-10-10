@@ -1,16 +1,15 @@
-//! Per-code-object named-property IC routines for baseline sites: V8's
-//! `LoadIC` / `StoreIC` builtins over the site's native feedback slot.
+//! Per-code-object named-property IC routines for baseline sites, over the
+//! site's native feedback slot.
 //!
 //! # Contents
 //! - [`SharedPropertyProbes`] names one load, one store and one method
 //!   routine, requested by sites and emitted once after the body.
 //! - Load: the receiver shape selects an entry of the site's
-//!   [`otter_vm::jit::PropertyIcLayout`] slot (V8 `TryMonomorphicCase` /
-//!   `HandlePolymorphicCase`), whose handler is dispatched in machine code:
-//!   own field, prototype field under its chain proof, nonexistent key.
-//!   A megamorphic slot probes the isolate's shared action table
-//!   (`TryProbeStubCache`). Anything else is the committed runtime miss,
-//!   which also updates the slot.
+//!   [`otter_vm::jit::PropertyIcLayout`] slot, whose handler is dispatched in
+//!   machine code: own field, prototype field under its chain proof,
+//!   nonexistent key. A megamorphic slot probes the isolate's shared action
+//!   table. Anything else is the committed runtime miss, which also updates
+//!   the slot.
 //! - Store: the same selection for own-field stores and add-transitions
 //!   (field write, shape publication, both barriers), then the shared table,
 //!   then the committed miss.
@@ -19,15 +18,14 @@
 //!   committed method resolution, which also records call feedback.
 //! - Concat: the nursery string-concatenation fit every `Add` site shares
 //!   instead of inlining it.
-//! - Keyed load and store: V8's `KeyedLoadIC_Megamorphic` /
-//!   `KeyedStoreIC_Megamorphic` name case. A string key probes the shared
-//!   action table under its atom, recorded in the string or found by the
-//!   interning leaf (`TryInternalizeString`) and then recorded. A load the
-//!   table misses on a dictionary-mode receiver, which the table never
-//!   holds, runs the generic own-data walk leaf (`GenericPropertyLoad`); any
-//!   other key, a shaped receiver's or a store's table miss, or a walk the
-//!   leaf cannot finish returns to the element site, which completes through
-//!   its committed element runtime (which records the table entry).
+//! - Keyed load and store, name case: a string key probes the shared action
+//!   table under its atom, recorded in the string or found by the interning
+//!   leaf and then recorded. A load the table misses on a dictionary-mode
+//!   receiver, which the table never holds, runs the generic own-data walk
+//!   leaf; any other key, a shaped receiver's or a store's table miss, or a
+//!   walk the leaf cannot finish returns to the element site, which
+//!   completes through its committed element runtime (which records the
+//!   table entry).
 //!
 //! # Invariants
 //! - A site passes its receiver (and value) boxed from the rooted window plus
@@ -153,10 +151,9 @@ impl SharedPropertyProbes {
 
 /// Leave the atom of the string `key` in `W(atom)`, or branch to `miss` for
 /// any other key or a string no property key has interned. A string whose
-/// atom is not yet recorded asks the interning leaf (V8's
-/// `TryInternalizeString`) and records the answer in its atom word, so the
-/// same string probes directly next time. The routine inputs, `x9`, `x10`
-/// and `x12`, survive the leaf call.
+/// atom is not yet recorded asks the interning leaf and records the answer
+/// in its atom word, so the same string probes directly next time. The
+/// routine inputs, `x9`, `x10` and `x12`, survive the leaf call.
 fn emit_key_atom(
     ops: &mut Assembler,
     relocations: &mut RelocationCapture,
@@ -232,9 +229,8 @@ fn emit_keyed_load(
     dynasm!(ops ; .arch aarch64
         ; mov x1, xzr
         ; ret
-        // A name the table does not hold: the generic own-data walk
-        // (`KeyedLoadIC_Megamorphic` falling back to `GenericPropertyLoad`),
-        // whose pair is the routine's result.
+        // A name the table does not hold: the generic own-data walk, whose
+        // pair is the routine's result.
         ; =>generic
         ; str x30, [sp, #-16]!
         ; mov x1, X(KEYED_LOAD_RECEIVER)

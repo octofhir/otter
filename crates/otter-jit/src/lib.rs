@@ -321,7 +321,7 @@ mod toolchain_tests {
 
     #[test]
     fn emits_and_runs_tagged_fib() {
-        // Tagged fib over the JSC value encoding: an int32 carries NUMBER_TAG
+        // Tagged fib over the boxed value encoding: an int32 carries NUMBER_TAG
         // (0xfffe in the top 16 bits) with the payload in the low 32. int32
         // guard + checked arith + rebox; self-recursive.
         let code = assemble(|ops| {

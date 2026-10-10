@@ -505,7 +505,7 @@ impl Interpreter {
     }
 
     /// The slot `shape` gives `atom`, through the isolate's lookup cache
-    /// (V8's `DescriptorLookupCache`) before the transition-chain walk.
+    /// before the transition-chain walk.
     #[must_use]
     pub(crate) fn shape_slot_of_atom(
         &self,

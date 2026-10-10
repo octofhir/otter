@@ -2277,18 +2277,49 @@ impl Interpreter {
                             )
                             .map_err(|error| CommittedValueError::JavaScript(error.into()))?
                         }
-                        (Some(function_id), _) => this
-                            .ordinary_function_define_own_property(
+                        (Some(function_id), _) => {
+                            let name = key
+                                .string_name()
+                                .expect("non-symbol key has string spelling");
+                            // §10.1.6.3 ValidateAndApplyPropertyDescriptor:
+                            // fields the descriptor omits keep the current
+                            // property's. Reading the current descriptor can
+                            // materialize virtual metadata, which allocates,
+                            // so the descriptor is coerced again from its
+                            // anchored object afterwards.
+                            let current = this
+                                .ordinary_function_own_property_descriptor(
+                                    context,
+                                    owner,
+                                    function_id,
+                                    name,
+                                )
+                                .map_err(CommittedValueError::JavaScript)?;
+                            let desc_obj = this
+                                .iteration_anchor(desc_slot)
+                                .as_object()
+                                .ok_or(VmError::TypeMismatch)
+                                .map_err(CommittedValueError::JavaScript)?;
+                            let descriptor =
+                                object_statics::coerce_to_descriptor(&desc_obj, &this.gc_heap)
+                                    .map_err(CommittedValueError::JavaScript)?;
+                            let completed = match current {
+                                Some(current) => descriptor.complete_against_current(&current),
+                                None => descriptor.complete_for_new_property(),
+                            };
+                            let owner =
+                                this.iteration_anchor(target_slot).as_closure(&this.gc_heap);
+                            this.ordinary_function_define_own_property(
                                 stack,
                                 context,
                                 owner,
                                 function_id,
-                                key.string_name()
-                                    .expect("non-symbol key has string spelling"),
+                                name,
                                 Some(desc_obj),
                                 completed,
                             )
-                            .map_err(CommittedValueError::JavaScript)?,
+                            .map_err(CommittedValueError::JavaScript)?
+                        }
                         (None, VmPropertyKey::Symbol(sym)) => {
                             let target = this.iteration_anchor(target_slot);
                             let Some(bound) = target.as_bound_function() else {

@@ -29,7 +29,12 @@ use crate::property_atom::{AtomId, AtomizedPropertyKey};
 
 pub(crate) mod jit;
 
-const SETS: usize = 512;
+/// Sets of the shared table. It serves every keyed and megamorphic named
+/// site of the isolate under `(shape, atom)` keys — V8 splits that load into
+/// per-site ICs first and a 2048 + 512 entry stub cache after — so it is
+/// sized for a large program's live (shape, name) working set: 8K entries,
+/// within 1 MiB with their proof owners.
+const SETS: usize = 2048;
 const WAYS: usize = 4;
 const HASH_SHAPE_MULTIPLIER: u64 = 0x9E37_79B9_7F4A_7C15;
 const HASH_ATOM_MULTIPLIER: u64 = 0xC2B2_AE3D_27D4_EB4F;

@@ -1,7 +1,7 @@
 //! x86-64 Graph named properties, shared caches and ordinary prototype walks.
 //!
 //! # Contents
-//! - Current CacheIR load/store programs and guarded method holders.
+//! - Selected source CacheIR load programs, stores and guarded method holders.
 //! - One authoritative property-action table with live logical-slot banks.
 //! - Source-owned committed property calls and default instanceof walks.
 //!
@@ -12,6 +12,8 @@
 //! - Cold operations run once with canonical roots, never by replaying a hit.
 //! - Mutable fields are read live; shape and chain identities authorize layout.
 //! - Receiver SSA values survive holder traversal and all scratch work.
+//! - Named loads omit only a receiver shape guard matching their live exact
+//!   proof. Holder, prototype-validity and dictionary guards remain intact.
 //! - Addresses carry exact symbolic relocations; hashes and slots retain width.
 //! - Static programs prove eligible exact shapes or their admitted intrinsic
 //!   dictionary contract. Shared probes use current ShapeState, including
@@ -44,9 +46,9 @@ impl Codegen<'_> {
         let input = |i| Self::gp(assigned.inputs[i]);
         let result = || Self::gp(assigned.result.expect("property result"));
         match self.graph.node(node).kind.clone() {
-            Kind::LoadNamedProperty(pc) => self.emit_named_program(
+            Kind::LoadNamedProperty { byte_pc, .. } => self.emit_named_program(
                 node,
-                pc,
+                byte_pc,
                 input(0),
                 None,
                 [assigned.gp_temps[0], assigned.gp_temps[1]],
@@ -213,6 +215,18 @@ impl Codegen<'_> {
             .get(&pc)
             .ok_or(Unsupported::OperandShape("x86 graph named programs"))?
             .clone();
+        let (selected, receiver_shape) = match self.graph.node(node).kind.clone() {
+            Kind::LoadNamedProperty {
+                programs,
+                receiver_shape,
+                ..
+            } => (programs, receiver_shape),
+            Kind::StoreNamedProperty(_) => (
+                (0..programs.len()).map(|index| index as u32).collect(),
+                None,
+            ),
+            _ => return Err(Unsupported::OperandShape("x86 graph named program plan")),
+        };
         let exit = self.eager_exit(node, DeoptReason::WrongShape);
         let done = self.ops.new_dynamic_label();
         let view = self.view;
@@ -224,7 +238,10 @@ impl Codegen<'_> {
             self.emit_shape_state(receiver);
             dynasm!(self.ops ; .arch x64 ; test r10b, ShapeState::PROTOTYPE_MASK as i8 ; jnz =>exit);
         }
-        for program in programs.iter() {
+        for index in selected {
+            let program = programs
+                .get(index as usize)
+                .ok_or(Unsupported::OperandShape("x86 graph named program index"))?;
             let next = self.ops.new_dynamic_label();
             let object = |operand| if operand == 0 { receiver } else { holder };
             let mut committed = false;
@@ -260,6 +277,9 @@ impl Codegen<'_> {
                         object: operand,
                         shape,
                     } => {
+                        if operand == 0 && receiver_shape == Some(shape) {
+                            continue;
+                        }
                         let header = object(operand);
                         if operand == 0 {
                             self.emit_cell_guard(header, next);

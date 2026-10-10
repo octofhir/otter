@@ -44,6 +44,9 @@
 //!   binding operation, including the full chain of inlined frames.
 //! - Own fields carry their immutable bank and index in one access node; no
 //!   movable suffix address escapes into SSA or crosses a collecting boundary.
+//! - Named loads select feedback programs by current or revalidated receiver
+//!   shapes. Their indices belong to the innermost source snapshot; only an
+//!   exact singleton proof removes the selected program's receiver guard.
 //!
 //! # See also
 //! - [`super::bytecode`] — blocks, loops and liveness.
@@ -2601,16 +2604,19 @@ impl<'a> Builder<'a> {
             return;
         }
         let byte_pc = instruction.byte_pc;
+        let object = self.read(instruction.reads[0]);
+        let object = self.tagged(object);
+        let receivers = (!self.exited_for(ExitReason::ShapeGuard))
+            .then(|| self.known_shapes(object))
+            .flatten();
         // A site that already left on a receiver its shapes did not describe
         // is compiled to the lookup that serves every receiver.
         let Some(access) = (!self.exited_for(ExitReason::ShapeGuard))
-            .then(|| super::feedback::own_data_load(self.view, byte_pc))
+            .then(|| super::feedback::own_data_load(self.view, byte_pc, receivers.as_deref()))
             .flatten()
         else {
             return self.visit_named_load(instruction);
         };
-        let object = self.read(instruction.reads[0]);
-        let object = self.tagged(object);
         self.check_shapes(object, &access.shapes, false);
         let key = FieldKey {
             object,
@@ -2647,8 +2653,13 @@ impl<'a> Builder<'a> {
     /// baseline operation.
     fn visit_named_load(&mut self, instruction: &Instruction) {
         let byte_pc = instruction.byte_pc;
+        let object = self.read(instruction.reads[0]);
+        let object = self.tagged(object);
+        let receivers = (!self.exited_for(ExitReason::ShapeGuard))
+            .then(|| self.known_shapes(object))
+            .flatten();
         let programs = (!self.exited_for(ExitReason::ShapeGuard))
-            .then(|| super::feedback::named_load_programs(self.view, byte_pc))
+            .then(|| super::feedback::named_load_programs(self.view, byte_pc, receivers.as_deref()))
             .flatten()
             .is_some();
         if !programs {
@@ -2658,8 +2669,6 @@ impl<'a> Builder<'a> {
                 .get(&byte_pc)
                 .filter(|site| site.shared);
             if self.view.instructions[self.pc as usize].load_array_length {
-                let object = self.read(instruction.reads[0]);
-                let object = self.tagged(object);
                 let value = self.add(
                     Kind::LoadPropertyCached {
                         pc: self.pc,
@@ -2678,8 +2687,6 @@ impl<'a> Builder<'a> {
                 return self.deopt(DeoptReason::InsufficientFeedback);
             }
         }
-        let object = self.read(instruction.reads[0]);
-        let object = self.tagged(object);
         let value = self.named_lookup(byte_pc, object);
         self.write(instruction.writes[0], value);
     }
@@ -2689,25 +2696,38 @@ impl<'a> Builder<'a> {
     /// receivers no program describes, a probe of the shared property action table
     /// that completes in the runtime on a miss.
     fn named_lookup(&mut self, byte_pc: u32, object: NodeId) -> NodeId {
+        let receivers = (!self.exited_for(ExitReason::ShapeGuard))
+            .then(|| self.known_shapes(object))
+            .flatten();
         if !self.exited_for(ExitReason::ShapeGuard)
-            && let Some(programs) = super::feedback::named_load_programs(self.view, byte_pc)
+            && let Some(programs) =
+                super::feedback::named_load_programs(self.view, byte_pc, receivers.as_deref())
         {
-            let receiver_shapes: Option<SmallVec<[u32; 4]>> = programs
-                .iter()
-                .map(|program| match program.ops.first() {
-                    Some(otter_vm::JitCacheIrOp::GuardShape { object: 0, shape }) => Some(*shape),
-                    _ => None,
-                })
-                .collect();
-            let value = self.add(Kind::LoadNamedProperty(byte_pc), &[object], Repr::Tagged);
+            let receiver_shape = match (
+                programs.programs.as_slice(),
+                receivers.as_deref(),
+                programs.receiver_shapes.as_deref(),
+            ) {
+                ([_], Some([known]), Some([selected])) if known == selected => Some(*known),
+                _ => None,
+            };
+            let value = self.add(
+                Kind::LoadNamedProperty {
+                    byte_pc,
+                    programs: programs.programs,
+                    receiver_shape,
+                },
+                &[object],
+                Repr::Tagged,
+            );
             // Every program proved an ordinary receiver of one of its shapes.
-            if let Some(shapes) = receiver_shapes {
+            if let Some(shapes) = programs.receiver_shapes {
                 let layout = self.known.layout_entry(object);
                 if layout.shapes.is_none() {
                     layout.shapes = Some(shapes);
                     layout.writable = false;
                 }
-                self.known.entry(object).heap_object = true;
+                self.prove_ordinary_object(object);
             }
             return value;
         }

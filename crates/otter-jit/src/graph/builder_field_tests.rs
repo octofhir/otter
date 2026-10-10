@@ -1,9 +1,11 @@
-//! Own-field specialization retains banks without movable address nodes.
+//! Shape-selected property programs and persistent field banks.
 //!
 //! # Contents
 //! - Loads and stores specialize exact CacheIR field locations in both banks.
 //! - Store barriers retain the rooted receiver and value rather than slab bases.
 //! - Inline appends stay native; suffix appends use the collecting cached store.
+//! - Known ordinary receivers select load programs across body splices.
+//! - Uncovered known shapes keep guards and exact eager source chains.
 //!
 //! # Invariants
 //! Fake shape offsets are compile-time geometry only; no fake object executes.
@@ -12,12 +14,18 @@
 //! # See also
 //! - [`super::build`] and `otter_vm::object::FieldLocation`.
 
-use std::rc::Rc;
+use std::{rc::Rc, sync::Arc};
 
-use otter_bytecode::{Op, Operand};
+use otter_bytecode::{
+    BytecodeModule, Constant, Function, FunctionCodeBuilder, Op, Operand, SourceKind,
+};
 use otter_vm::{
-    JitCompileSnapshot,
-    jit::{JitCacheIrOp, JitCacheIrProgram, JitTestInstruction},
+    ExecutionContext, JitCompileSnapshot, JitInlineCallee,
+    jit::{
+        JitCacheIrOp, JitCacheIrProgram, JitDirectCallPlan, JitDirectCallThisMode, JitDirectCallee,
+        JitPrototypeValidity, JitTestInstruction,
+    },
+    native_abi::NativeFrameKind,
     object::FieldLocation,
 };
 
@@ -303,5 +311,305 @@ fn overflow_append_preserves_the_strict_store_boundary() {
             Kind::StoreNamedProperty(_) | Kind::StorePropertyCached { .. } | Kind::Deopt(_)
         )),
         "the ordinary cached-store contract cannot replace an explicit strict store"
+    );
+}
+
+fn load_program(shape: u32, field: FieldLocation, inherited: bool) -> JitCacheIrProgram {
+    let mut ops = vec![JitCacheIrOp::GuardShape { object: 0, shape }];
+    let object = if inherited {
+        ops.extend([
+            JitCacheIrOp::GuardPrototypeValidity {
+                validity: JitPrototypeValidity {
+                    address: 8,
+                    identity: u64::from(shape),
+                },
+            },
+            JitCacheIrOp::LoadPrototypeHolder {
+                root: shape + 8,
+                result: 1,
+            },
+            JitCacheIrOp::GuardShape {
+                object: 1,
+                shape: shape + 16,
+            },
+        ]);
+        1
+    } else {
+        0
+    };
+    ops.extend([
+        JitCacheIrOp::GuardAtomSlot {
+            object,
+            atom: 1,
+            field,
+            writable: false,
+        },
+        JitCacheIrOp::LoadField { object, field },
+    ]);
+    JitCacheIrProgram {
+        ops: ops.into_boxed_slice(),
+    }
+}
+
+fn load_instruction(pc: u32, destination: u16) -> JitTestInstruction {
+    JitTestInstruction::new(
+        Op::LoadProperty,
+        pc,
+        pc * 4,
+        vec![
+            Operand::Register(destination),
+            Operand::Register(0),
+            Operand::ConstIndex(0),
+        ],
+    )
+}
+
+fn load_graph(view: &JitCompileSnapshot) -> super::Built {
+    let analysis = Rc::new(Analysis::build(view).unwrap());
+    build(
+        view,
+        &analysis,
+        &BaselineSupport {
+            supported: vec![true; view.instructions.len()],
+        },
+        None,
+    )
+    .unwrap()
+}
+
+#[test]
+fn prior_receiver_proofs_select_own_banks_and_preserve_uncovered_shape_checks() {
+    for covered in [false, true] {
+        let mut view = JitCompileSnapshot::without_feedback(
+            90,
+            1,
+            3,
+            vec![
+                load_instruction(0, 1),
+                load_instruction(1, 2),
+                JitTestInstruction::new(Op::ReturnValue, 2, 8, vec![Operand::Register(2)]),
+            ],
+        );
+        let mut anchors = vec![load_program(128, FieldLocation::inline(0), false)];
+        if !covered {
+            anchors.push(load_program(256, FieldLocation::inline(0), false));
+        }
+        view.property_programs
+            .insert(view.instructions[0].byte_pc, anchors);
+        view.property_programs.insert(
+            view.instructions[1].byte_pc,
+            if covered {
+                vec![
+                    load_program(256, FieldLocation::overflow(0), false),
+                    load_program(128, FieldLocation::inline(1), false),
+                ]
+            } else {
+                vec![load_program(128, FieldLocation::inline(1), false)]
+            },
+        );
+        let built = load_graph(&view);
+        assert!(
+            built
+                .graph
+                .nodes
+                .iter()
+                .any(|node| node.kind == Kind::LoadOwnField(FieldLocation::inline(1)))
+        );
+        let checks: Vec<_> = built
+            .graph
+            .nodes
+            .iter()
+            .filter(|node| matches!(node.kind, Kind::CheckShapes { .. }))
+            .collect();
+        assert_eq!(checks.len(), if covered { 1 } else { 2 });
+        if !covered {
+            assert!(matches!(
+                &checks[1].kind,
+                Kind::CheckShapes { shapes, object_proved: true, .. }
+                    if shapes.as_slice() == [128]
+            ));
+        }
+    }
+}
+
+#[test]
+fn selected_named_programs_remove_only_exact_receiver_guards() {
+    for covered in [false, true] {
+        let mut view = JitCompileSnapshot::without_feedback(
+            90,
+            1,
+            3,
+            vec![
+                load_instruction(0, 1),
+                load_instruction(1, 2),
+                JitTestInstruction::new(Op::ReturnValue, 2, 8, vec![Operand::Register(2)]),
+            ],
+        );
+        let mut anchors = vec![load_program(128, FieldLocation::inline(0), true)];
+        if !covered {
+            anchors.push(load_program(256, FieldLocation::inline(0), true));
+        }
+        view.property_programs
+            .insert(view.instructions[0].byte_pc, anchors);
+        let pc = view.instructions[1].byte_pc;
+        view.property_programs.insert(
+            pc,
+            vec![
+                load_program(384, FieldLocation::overflow(0), true),
+                load_program(128, FieldLocation::inline(1), true),
+            ],
+        );
+        let built = load_graph(&view);
+        let access = built
+            .graph
+            .nodes
+            .iter()
+            .find(|node| matches!(node.kind, Kind::LoadNamedProperty { byte_pc, .. } if byte_pc == pc))
+            .unwrap();
+        assert_eq!(
+            access.kind,
+            Kind::LoadNamedProperty {
+                byte_pc: pc,
+                programs: smallvec::smallvec![1],
+                receiver_shape: covered.then_some(128),
+            }
+        );
+        let frame = built.graph.frame_state(access.eager.unwrap());
+        assert_eq!((frame.function_id, frame.pc, frame.byte_pc), (90, 1, pc));
+    }
+}
+
+#[test]
+fn inlined_named_selection_uses_its_source_bank_and_full_eager_chain() {
+    let mut bytes = FunctionCodeBuilder::new();
+    bytes.push(
+        Op::LoadProperty,
+        &[
+            Operand::Register(1),
+            Operand::Register(0),
+            Operand::ConstIndex(0),
+        ],
+    );
+    bytes.push(Op::ReturnValue, &[Operand::Register(1)]);
+    let mut entry = FunctionCodeBuilder::new();
+    entry.push(Op::ReturnUndefined, &[]);
+    let context = ExecutionContext::from_module(
+        BytecodeModule {
+            module: "named-load-source-geometry".into(),
+            source_kind: SourceKind::JavaScript,
+            functions: vec![
+                Function {
+                    id: 0,
+                    code: entry.finish(),
+                    ..Function::default()
+                },
+                Function {
+                    id: 1,
+                    name: "readValue".into(),
+                    param_count: 1,
+                    locals: 2,
+                    is_strict: true,
+                    ignores_this: true,
+                    code: bytes.finish(),
+                    ..Function::default()
+                },
+            ],
+            constants: vec![Constant::String {
+                utf16: "value".encode_utf16().collect(),
+            }],
+            function_source: None,
+            template_sites: vec![],
+            module_resolutions: vec![],
+            module_inits: vec![],
+        },
+        Default::default(),
+    )
+    .expect("verified inline property source");
+    let mut body = context.jit_compile_snapshot(1).unwrap();
+    assert!(!body.code_block.observes_this());
+    let body_pc = body.instructions[0].byte_pc;
+    body.property_programs.insert(
+        body_pc,
+        vec![
+            load_program(256, FieldLocation::overflow(0), true),
+            load_program(128, FieldLocation::inline(1), true),
+        ],
+    );
+    let mut caller = JitCompileSnapshot::without_feedback(
+        90,
+        2,
+        4,
+        vec![
+            load_instruction(0, 2),
+            JitTestInstruction::new(
+                Op::Call,
+                1,
+                4,
+                vec![
+                    Operand::Register(3),
+                    Operand::Register(1),
+                    Operand::ConstIndex(1),
+                    Operand::Register(0),
+                ],
+            ),
+            JitTestInstruction::new(Op::ReturnValue, 2, 8, vec![Operand::Register(3)]),
+        ],
+    );
+    assert_eq!(caller.instructions[0].byte_pc, body_pc);
+    caller.property_programs.insert(
+        body_pc,
+        vec![load_program(128, FieldLocation::inline(0), true)],
+    );
+    let call_pc = caller.instructions[1].byte_pc;
+    caller.instructions[1].call_attempted = true;
+    caller.direct_callees.insert(
+        call_pc,
+        vec![JitDirectCallee {
+            plan: JitDirectCallPlan {
+                function_id: body.code_block.id,
+                code_object_id: 1,
+                entry_cell: 0,
+                tier: NativeFrameKind::Baseline,
+                this_mode: JitDirectCallThisMode::StrictOrLexical,
+                is_derived_constructor: false,
+                call_flags: body.code_block.call_flags(),
+                callee_cell: 0,
+            },
+            receiver_allocation: None,
+        }],
+    );
+    caller.inline_callees.insert(
+        call_pc,
+        JitInlineCallee {
+            body: Arc::new(body),
+        },
+    );
+    let built = load_graph(&caller);
+    assert_eq!(built.graph.inlined.len(), 1);
+    let access = built
+        .graph
+        .nodes
+        .iter()
+        .find(|node| node.origin == 1 && matches!(node.kind, Kind::LoadNamedProperty { .. }))
+        .unwrap();
+    assert_eq!(
+        access.kind,
+        Kind::LoadNamedProperty {
+            byte_pc: body_pc,
+            programs: smallvec::smallvec![1],
+            receiver_shape: Some(128),
+        }
+    );
+    let frame = built.graph.frame_state(access.eager.unwrap());
+    assert_eq!(
+        (frame.function_id, frame.pc, frame.byte_pc),
+        (1, 0, body_pc)
+    );
+    let outer = built
+        .graph
+        .frame_state(frame.caller.as_ref().unwrap().state);
+    assert_eq!(
+        (outer.function_id, outer.pc, outer.byte_pc),
+        (90, 2, caller.instructions[2].byte_pc)
     );
 }

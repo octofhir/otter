@@ -1179,6 +1179,10 @@ pub struct JitMethodGuard {
     /// of `method_fid` when this guard was baked, so while the proof holds
     /// the method read here is a closure of that function.
     pub slot_proven: bool,
+    /// The holder slot holds an accessor's cell rather than the method
+    /// itself: the method is the cell's getter or setter, at this byte offset
+    /// from the cell value.
+    pub accessor_byte: Option<u32>,
 }
 
 /// A method the baseline may splice into a caller's `Op::CallMethodValue` site.

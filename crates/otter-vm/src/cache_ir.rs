@@ -10,12 +10,16 @@
 //! - [`ResolvedDataSlot`] / [`resolve_atom_data_slot`] — where a named data
 //!   property lives and what it holds.
 //! - [`resolve_absent_atom`] — a key no link of an ordinary chain owns.
+//! - [`ResolvedAccessorSlot`] / [`resolve_atom_inherited_accessor`] — an
+//!   accessor a prototype owns, and the getter and setter its cell holds.
 //!
 //! # Invariants
 //!
 //! - Resolution neither allocates nor runs JavaScript.
-//! - Accessors, proxies, opaque lookup state and dictionary holders are not
-//!   resolved; their callers complete the ordinary `[[Get]]`/`[[Set]]`.
+//! - Proxies, opaque lookup state and dictionary holders are not resolved;
+//!   their callers complete the ordinary `[[Get]]`/`[[Set]]`. Accessors are
+//!   resolved only by [`resolve_atom_inherited_accessor`], for a caller that
+//!   invokes the getter or setter itself.
 //! - An inherited or absent answer carries the chain proof of its first
 //!   prototype. Any mutation of a link (including adding the key) invalidates
 //!   it, and an invalid proof is never revived.
@@ -95,6 +99,70 @@ pub(crate) fn resolve_atom_data_slot(
                     holder_root,
                     holder_root_id: heap
                         .read_payload(holder_root, object::shape_body::ShapeBody::id),
+                });
+            }
+            (_, object::PropertyLookup::Absent) => proto = object::prototype(proto, heap)?,
+            _ => return None,
+        }
+    }
+    None
+}
+
+/// An accessor a prototype of the receiver owns, under the receiver's chain
+/// proof.
+#[derive(Debug, Clone)]
+pub(crate) struct ResolvedAccessorSlot {
+    pub(crate) validity: Arc<PrototypeValidity>,
+    pub(crate) holder_root: object::ShapeHandle,
+    pub(crate) holder_root_id: ShapeId,
+    /// The holder's own-slot hit, guarded by its shape. The slot holds the
+    /// accessor's cell.
+    pub(crate) hit: AtomOwnPropertyHit,
+    /// `[[Get]]`, when the accessor has one.
+    pub(crate) getter: Option<Value>,
+    /// `[[Set]]`, when the accessor has one.
+    pub(crate) setter: Option<Value>,
+}
+
+/// Resolve an accessor that a prototype of an ordinary receiver owns, with
+/// the chain proof of the receiver's first prototype. Any write to a link of
+/// the chain — replacing the accessor's cell included — invalidates the
+/// proof. Own accessors, data properties, absent keys and opaque lookup state
+/// return `None`.
+#[must_use]
+pub(crate) fn resolve_atom_inherited_accessor(
+    obj: JsObject,
+    heap: &otter_gc::GcHeap,
+    key: AtomizedPropertyKey<'_>,
+) -> Option<ResolvedAccessorSlot> {
+    if !object::supports_fast_property_ic(obj, heap) || object::state(obj, heap).is_opaque() {
+        return None;
+    }
+    if !matches!(
+        object::lookup_own_atom(obj, heap, key).lookup,
+        object::PropertyLookup::Absent
+    ) {
+        return None;
+    }
+    let first = object::prototype(obj, heap)?;
+    let validity = chain_validity(first, heap)?;
+    let mut proto = first;
+    for _ in 0..object::PROTO_CHAIN_HARD_CAP {
+        if !object::supports_fast_property_ic(proto, heap) {
+            return None;
+        }
+        let inherited = object::lookup_own_atom(proto, heap, key);
+        match (inherited.hit, inherited.lookup) {
+            (Some(hit), object::PropertyLookup::Accessor { getter, setter, .. }) => {
+                let holder_root = object::cached_instance_root(proto, heap)?;
+                return Some(ResolvedAccessorSlot {
+                    validity,
+                    holder_root,
+                    holder_root_id: heap
+                        .read_payload(holder_root, object::shape_body::ShapeBody::id),
+                    hit,
+                    getter,
+                    setter,
                 });
             }
             (_, object::PropertyLookup::Absent) => proto = object::prototype(proto, heap)?,

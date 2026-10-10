@@ -148,6 +148,15 @@ impl Interpreter {
             crate::property_cache::PropertyLoad::Absent(_) => return Ok(Value::undefined()),
             crate::property_cache::PropertyLoad::Other => {}
         }
+        // An inherited getter is what an optimizing caller can call directly.
+        self.note_accessor_target(
+            context,
+            function_id,
+            instruction_pc,
+            obj,
+            atomized_key,
+            false,
+        );
         // No data slot (accessor, opaque lookup, absent): complete the load in
         // place through the full cascade.
         let result = self.load_property_value(context, stack, receiver, atomized_key.name())?;
@@ -275,10 +284,20 @@ impl Interpreter {
             // new shape program can be installed. Inherited setters, non-writable data,
             // proxies/exotic parents, and non-extensible receivers retain the full
             // value-level implementation (and strict-mode throwing behavior).
-            if !matches!(
-                object::resolve_set_atomized(obj, &self.gc_heap, atomized_key),
-                object::SetOutcome::AssignData
-            ) {
+            let outcome = object::resolve_set_atomized(obj, &self.gc_heap, atomized_key);
+            if !matches!(outcome, object::SetOutcome::AssignData) {
+                // An inherited setter is what an optimizing caller can call
+                // directly.
+                if matches!(outcome, object::SetOutcome::InvokeSetter { .. }) {
+                    self.note_accessor_target(
+                        context,
+                        function_id,
+                        instruction_pc,
+                        obj,
+                        atomized_key,
+                        true,
+                    );
+                }
                 path = Path::SetSemantics;
                 self.store_property_value(
                     context,
@@ -444,12 +463,9 @@ impl Interpreter {
             .get(top_idx)
             .ok_or(VmError::InvalidOperand)
             .map_err(CommittedValueError::Fatal)?;
-        let target = *read_register(frame, obj_reg)
-            .map_err(CommittedValueError::Fatal)?;
-        let key_value = *read_register(frame, key_reg)
-            .map_err(CommittedValueError::Fatal)?;
-        let value = *read_register(frame, value_reg)
-            .map_err(CommittedValueError::Fatal)?;
+        let target = *read_register(frame, obj_reg).map_err(CommittedValueError::Fatal)?;
+        let key_value = *read_register(frame, key_reg).map_err(CommittedValueError::Fatal)?;
+        let value = *read_register(frame, value_reg).map_err(CommittedValueError::Fatal)?;
         self.define_data_property_values(stack, context, target, key_value, value)
     }
 

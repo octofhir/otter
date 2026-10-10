@@ -465,6 +465,14 @@ pub struct AccessorCellBody {
     pub setter: Value,
 }
 
+/// Byte offset of [`AccessorCellBody::getter`] from an accessor cell value,
+/// which is its header's address.
+pub const ACCESSOR_CELL_GETTER_BYTE: u32 =
+    (otter_gc::header::HEADER_SIZE + std::mem::offset_of!(AccessorCellBody, getter)) as u32;
+/// Byte offset of [`AccessorCellBody::setter`] from an accessor cell value.
+pub const ACCESSOR_CELL_SETTER_BYTE: u32 =
+    (otter_gc::header::HEADER_SIZE + std::mem::offset_of!(AccessorCellBody, setter)) as u32;
+
 impl AccessorCellBody {
     pub(crate) fn visit_function_ids(&self, visitor: &mut dyn FnMut(u32)) {
         crate::code_liveness::visit_value(&self.getter, visitor);

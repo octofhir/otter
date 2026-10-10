@@ -115,6 +115,11 @@ impl Codegen<'_> {
                     guard.method_field,
                     false,
                 );
+                // An accessor's slot holds its cell; the method is the cell's
+                // getter or setter. A cell value is its header's full address.
+                if let Some(byte) = guard.accessor_byte {
+                    dynasm!(self.ops ; .arch x64 ; mov Rq(result()), [Rq(result()) + byte as i32]);
+                }
             }
             Kind::Instanceof => self.emit_instanceof(
                 node,

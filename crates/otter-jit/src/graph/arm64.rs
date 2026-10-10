@@ -2386,6 +2386,11 @@ impl<'a> Codegen<'a> {
             self.load_immediate(17, u64::from(value_byte));
             dynasm!(self.ops ; .arch aarch64 ; ldr X(destination), [x16, x17]);
         }
+        // An accessor's slot holds its cell; the method is the cell's getter
+        // or setter. A cell value is its header's full address.
+        if let Some(byte) = guard.accessor_byte {
+            dynasm!(self.ops ; .arch aarch64 ; ldr X(destination), [X(destination), byte]);
+        }
         Ok(())
     }
 

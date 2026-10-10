@@ -2731,15 +2731,33 @@ impl Interpreter {
         // list of candidate targets — one for `Mono`, up to
         // `MAX_POLY_METHOD_TARGETS` (most-frequent first) for `Poly`.
         // `Megamorphic` sites are skipped and side-exit before method lookup.
+        //
+        // A named load or store site's targets are the getters or setters its
+        // receivers reached through an inherited accessor: the same guard, with
+        // the holder slot holding the accessor's cell. Only the optimizing tier
+        // calls them; nothing inlines them.
         struct PolySnapshot {
             instruction_pc: u32,
             call_byte_pc: u32,
             targets: SmallVec<[PolyMethodTarget; MAX_POLY_METHOD_TARGETS]>,
+            accessor_byte: Option<u32>,
         }
         let method_sites: Vec<PolySnapshot> =
             view.instructions
                 .iter()
                 .filter_map(|instr| {
+                    let accessor_byte = match instr.op(&view.code_block) {
+                        Op::CallMethodValue => None,
+                        Op::LoadProperty if tier == jit_debug::JitDebugTier::Optimizing => {
+                            Some(crate::object::ACCESSOR_CELL_GETTER_BYTE)
+                        }
+                        Op::StoreProperty | Op::StorePropertyStrict
+                            if tier == jit_debug::JitDebugTier::Optimizing =>
+                        {
+                            Some(crate::object::ACCESSOR_CELL_SETTER_BYTE)
+                        }
+                        _ => return None,
+                    };
                     let site = instr.property_ic_site(&view.code_block)?;
                     let state = self.method_target_feedback(site)?;
                     match state {
@@ -2762,6 +2780,7 @@ impl Interpreter {
                                 instruction_pc: instr.instruction_pc(&view.code_block),
                                 call_byte_pc: instr.byte_pc,
                                 targets,
+                                accessor_byte,
                             })
                         }
                         MethodCallFeedback::Poly(observed) => {
@@ -2773,6 +2792,7 @@ impl Interpreter {
                                 instruction_pc: instr.instruction_pc(&view.code_block),
                                 call_byte_pc: instr.byte_pc,
                                 targets,
+                                accessor_byte,
                             })
                         }
                         // Native leaf sites are baked by their own pass: they
@@ -2795,7 +2815,12 @@ impl Interpreter {
                     tier,
                     budget,
                 ) {
-                    Ok(method) => {
+                    Ok(mut method) => {
+                        if snap.accessor_byte.is_some() {
+                            method.guard.accessor_byte = snap.accessor_byte;
+                            method.guard.slot_proven = false;
+                            method.body = None;
+                        }
                         let plan = method.callee.plan;
                         direct_methods.push(method);
                         (
@@ -2837,6 +2862,9 @@ impl Interpreter {
             if !direct_methods.is_empty() {
                 view.direct_methods
                     .insert(snap.call_byte_pc, direct_methods);
+            }
+            if snap.accessor_byte.is_some() {
+                continue;
             }
             let mut baked: Vec<jit::JitInlineMethod> = Vec::new();
             for target in &snap.targets {
@@ -2895,6 +2923,7 @@ impl Interpreter {
             holder_root,
             method_field: target.method_field,
             slot_proven: self.method_slot_proven(target),
+            accessor_byte: None,
         })
     }
 

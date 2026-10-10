@@ -1,9 +1,9 @@
 //! asm.js validation and translation to WebAssembly.
 //!
-//! A port of V8's `AsmJsParser` (`src/asmjs/asm-parser.cc`) that walks the
-//! oxc AST of a `"use asm"` function instead of re-scanning tokens. Every
-//! construct is type-checked against the asm.js lattice as it is emitted, so
-//! a module either translates completely or is rejected and runs as ordinary
+//! An asm.js validator and translator that walks the oxc AST of a
+//! `"use asm"` function instead of re-scanning tokens. Every construct is
+//! type-checked against the asm.js lattice as it is emitted, so a module
+//! either translates completely or is rejected and runs as ordinary
 //! JavaScript. Translation happens at link time, against the actual heap
 //! length, so heap bounds are immediates.
 //!
@@ -20,9 +20,9 @@
 //!
 //! # Invariants
 //! - Every accepted program computes exactly what its JavaScript evaluation
-//!   computes. Where V8 is laxer than that (an out-of-bounds `intish` load in
-//!   an addition, `HEAPF32[i] = d` yielding the rounded value), validation is
-//!   strict or emission follows JavaScript.
+//!   computes. Where a laxer translation would diverge from that (an
+//!   out-of-bounds `intish` load in an addition, `HEAPF32[i] = d` yielding the
+//!   rounded value), validation is strict or emission follows JavaScript.
 //! - Heap loads out of bounds yield `0` (integer views) or `NaN` (float
 //!   views) and stores out of bounds are dropped, as typed-array accesses do;
 //!   the module never traps on memory.

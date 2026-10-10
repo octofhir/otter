@@ -57,8 +57,7 @@
 //!   including ones without safepoints or exits. A deopt unlinks the source
 //!   function's optimizing generations and every optimizing caller that
 //!   spliced it; its baseline generation stays installed, and its stable cell
-//!   selects the interpreter until retraining completes (V8 keeps baseline
-//!   code across a deopt the same way).
+//!   selects the interpreter until retraining completes.
 //! - Invalidating a generation unlinks its entry cell before executable
 //!   retirement. The cell address remains valid and is never reused.
 //!

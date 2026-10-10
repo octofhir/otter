@@ -357,7 +357,7 @@ pub type JsClosureHandle = otter_gc::Gc<JsClosureBody>;
 /// a 4-byte cached `function_id` so the call path can dispatch
 /// without a heap touch. Identity (`===`) is handle-offset equality.
 ///
-/// Matches V8 / JSC `JSFunction` cell-with-cached-code-entry layout.
+/// Cell-with-cached-code-entry layout.
 /// Packs into [`crate::Value`] under `TAG_PTR_FUNCTION`.
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
 pub struct JsClosure {
@@ -519,8 +519,7 @@ impl JsClosure {
     }
 
     /// Release an own-property bag a delete left empty and extensible, so
-    /// the closure reads as one that never had own properties again (V8
-    /// rolls a delete of the last-added property back to the parent map).
+    /// the closure reads as one that never had own properties again.
     /// Generated code proving the ordinary lookup then stays valid.
     pub(crate) fn release_empty_own_props(self, heap: &mut GcHeap) {
         let Some(bag) = self.own_props(heap) else {
@@ -552,8 +551,8 @@ impl JsClosure {
     /// Store the function's `prototype` value into the rare record the caller
     /// already allocated. The value may be younger than the record, so the
     /// edge is barriered. A different value retires every constructor family
-    /// of this closure: each was selected for the replaced prototype (V8's
-    /// initial-map change), so the head never names a stale family.
+    /// of this closure: each was selected for the replaced prototype, so the
+    /// head never names a stale family.
     pub(crate) fn set_prototype_value(self, heap: &mut GcHeap, value: Value) {
         use crate::pelt::PeltField as _;
         let rare = self

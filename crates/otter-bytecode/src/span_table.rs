@@ -1,7 +1,6 @@
 //! A function's source spans as one compact, delta-encoded byte table.
 //!
-//! V8 keeps source positions the same way (`SourcePositionTable`): the
-//! entries are written once, read by iteration when a position is actually
+//! The entries are written once, read by iteration when a position is actually
 //! asked for, and never expanded into a record per instruction. Most compiled
 //! functions never report a position, so neither the cache decoder nor a
 //! linked module pays for them.

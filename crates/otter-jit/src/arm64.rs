@@ -37,7 +37,7 @@ mod receiver_allocation;
 
 /// Whether this CPU implements the ARMv8.3 JavaScript conversion
 /// (`FJCVTZS`), which computes ECMAScript ToInt32 of a double in one
-/// instruction. V8 selects the same instruction under `JSCVT`.
+/// instruction.
 pub(crate) fn has_javascript_conversion() -> bool {
     std::arch::is_aarch64_feature_detected!("jsconv")
 }

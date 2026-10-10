@@ -4,10 +4,9 @@
 //! like a large asm.js heap (a multiple of 16 MiB, at most 2 GiB) is mapped
 //! at the start of a 4 GiB virtual reservation instead: the bytes past the
 //! buffer read as zero and an inaccessible guard follows. That is the layout
-//! under which every 32-bit WebAssembly access needs no bounds check (V8
-//! reserves wasm memory the same way), so a linked asm.js module aliases the
-//! buffer as its memory, and a read past the end yields the `0` a typed-array
-//! miss coerces to.
+//! under which every 32-bit WebAssembly access needs no bounds check, so a
+//! linked asm.js module aliases the buffer as its memory, and a read past the
+//! end yields the `0` a typed-array miss coerces to.
 //!
 //! # Contents
 //! - [`ByteStorage`] — the heap or reserved bytes of one buffer.

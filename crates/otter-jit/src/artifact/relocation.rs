@@ -12,8 +12,7 @@
 //! - Relocation ranges use exact `code.bin` byte offsets and contain one
 //!   the target's fixed address-materialization form: AArch64 `MOVZ`/`MOVK`
 //!   sequences, an 8-byte AArch64 literal-pool word that one PC-relative
-//!   `LDR (literal)` reads (V8's arm64 constant pool), or one x86-64
-//!   `mov r64, imm64`.
+//!   `LDR (literal)` reads, or one x86-64 `mov r64, imm64`.
 //! - A literal pool follows every instruction of its code object, which the
 //!   tier keeps within the `LDR (literal)` range; each distinct address has
 //!   one word.

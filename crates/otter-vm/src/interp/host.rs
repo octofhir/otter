@@ -391,8 +391,8 @@ impl Interpreter {
     #[must_use]
     pub fn jit_sync_reentry_limit(&self) -> u32 {
         // With the thread's stack floor known, every re-entry's trampoline
-        // checks the real stack pointer against it, as V8's stack guard does;
-        // no re-entry count is needed.
+        // checks the real stack pointer against it; no re-entry count is
+        // needed.
         if self.native_stack_floor.is_some_and(|floor| floor != 0) {
             u32::MAX
         } else {
@@ -470,10 +470,9 @@ impl Interpreter {
     }
 
     /// Read the live `Error.stackTraceLimit` and translate it to a frame
-    /// cap, matching V8's coercion: a finite `>= 1` number caps the
-    /// count, `+Infinity` keeps every frame, a missing property falls
-    /// back to the default 10, and anything else (`<= 0`, `NaN`, a
-    /// non-number) disables capture.
+    /// cap: a finite `>= 1` number caps the count, `+Infinity` keeps
+    /// every frame, a missing property falls back to the default 10, and
+    /// anything else (`<= 0`, `NaN`, a non-number) disables capture.
     pub(crate) fn current_stack_trace_limit(&self) -> usize {
         let ctor = self
             .error_classes

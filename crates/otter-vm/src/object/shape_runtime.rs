@@ -22,21 +22,21 @@
 //! - This runtime owns the isolate's [`NameInterner`], the single authority
 //!   for a name's atom. `key_strings` holds, per atom the shape layer has
 //!   keyed, the GC string body shape nodes and key enumeration hold.
-//! - Hidden classes are collectable (V8 maps, JSC structures and SpiderMonkey
-//!   shapes all are): the id and transition tables hold shapes weakly, and a
-//!   shape lives while an object, a compiled code object or a strong cache
-//!   names it. [`Self::sweep_dead`] forgets every shape the marking left
-//!   unreached before the sweep frees it, so no table ever hands out a dead
-//!   cell; ids are never reused, so an id that outlives its shape only misses.
+//! - Hidden classes are collectable: the id and transition tables hold
+//!   shapes weakly, and a shape lives while an object, a compiled code object
+//!   or a strong cache names it. [`Self::sweep_dead`] forgets every shape the
+//!   marking left unreached before the sweep frees it, so no table ever hands
+//!   out a dead cell; ids are never reused, so an id that outlives its shape
+//!   only misses.
 //! - Shapes live in non-moving old space: a weak entry never needs rewriting.
 //! - The id table never names a dictionary shape: all dictionary objects of a
 //!   lineage share one whatever their keys, so a guard baked from an id must
 //!   never resolve to it.
-//! - Every lineage starts at a prototype's root (V8's per-prototype initial
-//!   maps): the heap's embedder root slot keeps the `null`-prototype root
-//!   (`super::shape_body::null_root_head`), an ordinary prototype
-//!   keeps its instances' root on itself, and a non-ordinary prototype's root
-//!   lives as long as the objects built from it.
+//! - Every lineage starts at a prototype's root: the heap's embedder root
+//!   slot keeps the `null`-prototype root
+//!   (`super::shape_body::null_root_head`), an ordinary prototype keeps its
+//!   instances' root on itself, and a non-ordinary prototype's root lives as
+//!   long as the objects built from it.
 //! - No table borrow is held across an allocation — the collection it may
 //!   run prunes the tables through `&self`.
 //! - A shape created during a runtime turn is pinned (strong) until the
@@ -101,7 +101,7 @@ struct WeakShapeTables {
     /// Rooted state variants are weak and keyed by stable source identity.
     state_variants: FxHashMap<(ShapeId, ShapeState), ShapeHandle>,
     /// Transitions out of each provisional shape: the tree slack tracking
-    /// finishes in place (V8's transition-tree traversal).
+    /// finishes in place.
     provisional_children: FxHashMap<ShapeId, smallvec::SmallVec<[ShapeHandle; 2]>>,
     /// Distinct shapes pinned during the current outermost turn, in first-pin order.
     /// The stable id is only an index; the handle is the sole strong root slot.
@@ -256,12 +256,12 @@ impl ShapeRuntime {
     }
 
     /// Complete in-object slack tracking of the provisional lineage `root`
-    /// heads (V8's `CompleteInobjectSlackTracking`): every shape of its
-    /// transition tree shrinks in place to the fewest in-object slots that
-    /// still hold every field any of them places, and at least `required`;
-    /// the lineage becomes ordinary and gets a dictionary shape of that
-    /// capacity. One lineage serves the constructor's objects before and
-    /// after, so no site sees a second shape for the same layout.
+    /// heads: every shape of its transition tree shrinks in place to the
+    /// fewest in-object slots that still hold every field any of them
+    /// places, and at least `required`; the lineage becomes ordinary and gets
+    /// a dictionary shape of that capacity. One lineage serves the
+    /// constructor's objects before and after, so no site sees a second shape
+    /// for the same layout.
     pub(crate) fn finish_slack_tracking(
         &self,
         heap: &mut GcHeap,

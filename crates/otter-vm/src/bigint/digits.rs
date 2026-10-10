@@ -1,9 +1,8 @@
 //! Magnitude kernels over little-endian `u64` digit spans.
 //!
-//! The V8 `src/bigint` model: an operation sizes its result, allocates it
-//! once, and a kernel writes the digits straight into it. Kernels read
-//! borrowed spans and write a caller-provided output span, so they never
-//! allocate a result of their own.
+//! An operation sizes its result, allocates it once, and a kernel writes the
+//! digits straight into it. Kernels read borrowed spans and write a
+//! caller-provided output span, so they never allocate a result of their own.
 //!
 //! # Contents
 //! - [`significant_len`], [`compare`] over normalized spans.
@@ -33,7 +32,7 @@ use num_bigint::BigUint;
 use smallvec::SmallVec;
 
 /// Digit count at which both factors take `num_bigint`'s sub-quadratic
-/// multiplication instead of the schoolbook loop (V8 `kKaratsubaThreshold`).
+/// multiplication instead of the schoolbook loop.
 pub(crate) const KARATSUBA_THRESHOLD: usize = 34;
 
 /// Scratch digits a kernel keeps on the stack before spilling to the heap.
@@ -108,7 +107,7 @@ pub(crate) fn mul(a: &[u64], b: &[u64], out: &mut [u64]) {
 }
 
 /// `(hi:lo) / d` and its remainder, for `hi < d` with `d`'s top bit set:
-/// Hacker's Delight `divlu` (V8 `digit_div`), two native divisions.
+/// Hacker's Delight `divlu`, two native divisions.
 #[inline]
 fn div_wide(hi: u64, lo: u64, d: u64) -> (u64, u64) {
     debug_assert!(hi < d && d >> 63 == 1);

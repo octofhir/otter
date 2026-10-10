@@ -60,11 +60,10 @@ impl Interpreter {
     }
 
     /// Ordinary `[[Get]]` of a string key answered from data properties
-    /// alone, as V8's megamorphic keyed load does for a name: shaped links
-    /// through the shared `(shape, atom)` table, dictionary links by their
-    /// own lookup. No rooting, coercion or decoded key. `None` when an
-    /// accessor, an exotic link or a never-interned key needs the full
-    /// `[[Get]]`.
+    /// alone: shaped links through the shared `(shape, atom)` table,
+    /// dictionary links by their own lookup. No rooting, coercion or decoded
+    /// key. `None` when an accessor, an exotic link or a never-interned key
+    /// needs the full `[[Get]]`.
     fn ordinary_string_key_load(
         &mut self,
         obj: object::JsObject,

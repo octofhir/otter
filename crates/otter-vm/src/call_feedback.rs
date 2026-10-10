@@ -62,8 +62,7 @@ impl Interpreter {
     /// Repeat hits are deliberately ignored. A new shape/target advances the
     /// caller's shared feedback epoch, so the next optimizing compilation
     /// replans the chain. Installed optimized code keeps its own guards until
-    /// one fails, as V8 keeps optimized code until a check deoptimizes it;
-    /// discarding it on every new target only churned code memory.
+    /// one fails; discarding it on every new target only churned code memory.
     pub(crate) fn commit_method_call_feedback_transition(
         &mut self,
         code_block: &CodeBlock,

@@ -383,7 +383,7 @@ impl Codegen<'_> {
         let slow = self.ops.new_dynamic_label();
         let done = self.ops.new_dynamic_label();
         let table = self.ops.new_dynamic_label();
-        // V8's generic LoadIC: the site's own handlers first, then the
+        // The generic load: the site's own handlers first, then the
         // isolate's shared table, then the committed miss.
         if let Some((slot, function_id, byte_pc)) = self.property_ic_slot(node, pc) {
             let view = self.view_of(node);
@@ -451,7 +451,7 @@ impl Codegen<'_> {
         let appended = self.ops.new_dynamic_label();
         let table = self.ops.new_dynamic_label();
         let slot_stored = self.ops.new_dynamic_label();
-        // V8's generic StoreIC: the site's own handlers, then the shared
+        // The generic store: the site's own handlers, then the shared
         // table; an append leaves its compressed child in `temps[1]`.
         let slot = self.property_ic_slot(node, pc);
         if let Some((slot, function_id, byte_pc)) = slot {

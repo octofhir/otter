@@ -2,8 +2,8 @@
 //!
 //! # Contents
 //! - [`bigint_binary_alloc`]: one allocating Probe over two BigInt operands
-//!   and an [`crate::bigint::ops::Operator`] code (V8's `BigIntAdd` and
-//!   friends: the kernel runs straight into the result, no runtime frame).
+//!   and an [`crate::bigint::ops::Operator`] code (the kernel runs straight
+//!   into the result, no runtime frame).
 //!
 //! # Invariants
 //! - A non-BigInt operand and an operator failure (`RangeError`) are

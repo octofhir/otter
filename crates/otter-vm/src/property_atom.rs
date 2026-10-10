@@ -1,11 +1,9 @@
 //! Isolate-global property-name atoms for executable VM code.
 //!
 //! A property name has exactly one identity per isolate: the index it was
-//! assigned by that isolate's [`NameInterner`]. Every real engine does this
-//! (V8 internalized strings, SpiderMonkey atoms, JSC `UniquedStringImpl`)
-//! because it turns every name comparison on a hot path — shape-chain walks,
-//! IC guards, transition replay — into a `u32` compare instead of a string
-//! content compare.
+//! assigned by that isolate's [`NameInterner`]. That turns every name
+//! comparison on a hot path — shape-chain walks, IC guards, transition
+//! replay — into a `u32` compare instead of a string content compare.
 //!
 //! The bytecode constant pool remains the public/debug source of truth. Each
 //! linked chunk carries an [`AtomTable`] that maps its string constant indexes
@@ -83,10 +81,10 @@ impl AtomId {
 /// constants, and on a first-ever shape transition for a runtime-built name.
 /// Every hot comparison then reads a pre-resolved [`AtomId`].
 ///
-/// Like V8's string table, the table is keyed by a hash of the UTF-16 code
-/// units, so a runtime string looks its atom up from its own Latin-1 or wide
-/// units with no decoded copy. The isolate's single mutator owns it through
-/// its shape runtime: no lock guards any read or mint.
+/// The table is keyed by a hash of the UTF-16 code units, so a runtime
+/// string looks its atom up from its own Latin-1 or wide units with no
+/// decoded copy. The isolate's single mutator owns it through its shape
+/// runtime: no lock guards any read or mint.
 #[derive(Debug, Default)]
 pub(crate) struct NameInterner {
     /// Atom ids by content hash; equality reads the id's spelling.

@@ -1,4 +1,4 @@
-//! Linking a translated asm.js module (V8 `AsmJs::InstantiateAsmWasm`).
+//! Linking a translated asm.js module.
 //!
 //! The linker checks the standard library and the heap, compiles the
 //! translation with Wasmtime, aliases the heap `ArrayBuffer`'s bytes as the
@@ -21,7 +21,7 @@
 //!   heap length, so wasm never addresses past the buffer.
 //! - One store per linked module. The store is locked by the outermost call;
 //!   a call made while an import runs JavaScript re-enters through the
-//!   import's `Caller` instead (V8 allows asm.js callbacks into the module).
+//!   import's `Caller` instead (asm.js callbacks into the module are allowed).
 //! - Foreign callables are export captures, read through the active call's
 //!   bridge; nothing about them is held outside the GC.
 //!
@@ -150,8 +150,8 @@ pub(super) fn link<'s>(
     }
 }
 
-/// V8 `IsValidAsmjsMemorySize`: a fixed-length, unshared, attached buffer
-/// of 2^12..2^24 bytes in powers of two, or a multiple of 2^24 up to 2^31.
+/// A valid asm.js heap: a fixed-length, unshared, attached buffer of
+/// 2^12..2^24 bytes in powers of two, or a multiple of 2^24 up to 2^31.
 fn valid_heap(cx: &mut MarshalCx<'_, '_, '_>, heap: JsValue<'_>) -> Option<Heap> {
     let buffer = cx.escape(heap).as_array_buffer()?;
     let store = cx.heap();
@@ -170,8 +170,8 @@ fn valid_heap(cx: &mut MarshalCx<'_, '_, '_>, heap: JsValue<'_>) -> Option<Heap>
     })
 }
 
-/// V8 `AreStdlibMembersValid`: each captured member, read without running
-/// JavaScript, is still the engine's own builtin or constant.
+/// `true` when each captured member, read without running JavaScript, is
+/// still the engine's own builtin or constant.
 fn stdlib_is_valid(
     cx: &mut MarshalCx<'_, '_, '_>,
     stdlib: JsValue<'_>,

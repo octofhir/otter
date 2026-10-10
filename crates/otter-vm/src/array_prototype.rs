@@ -60,10 +60,9 @@ use crate::{
 /// snapshot. Spec ToLength clamps to 2^53-1; test262 patterns
 /// (`{length: 2**32 - 1}`, `new Array(2**32)`) deliberately
 /// exercise pathological lengths to stress generic-array methods.
-/// V8 / JSC handle this by visiting only **present** indexed own
-/// properties (see HasProperty short-circuit in §22.1.3 generic
-/// algorithms); we follow the same strategy and never materialise
-/// the absent slots, so the cap only matters when a caller passes
+/// These methods visit only **present** indexed own properties (see
+/// HasProperty short-circuit in §22.1.3 generic algorithms) and never
+/// materialise the absent slots, so the cap only matters when a caller passes
 /// in a genuinely-large-but-dense object — at that point an OOM
 /// `RangeError` from the allocator is the spec-compliant outcome
 /// and we never reach a 4 GB pre-allocated `Vec`.
@@ -105,9 +104,8 @@ fn numeric_sub_sort_order(x: Value, y: Value) -> Option<std::cmp::Ordering> {
 }
 
 /// Order of the decimal renderings of two int32 values — `ToString` then
-/// code-unit comparison (§7.2.13 IsLessThan on strings) without allocating,
-/// as V8's `SortCompareDefault` does for two Smis. Decimal digits and `-` are
-/// ASCII, so byte order equals code-unit order.
+/// code-unit comparison (§7.2.13 IsLessThan on strings) without allocating.
+/// Decimal digits and `-` are ASCII, so byte order equals code-unit order.
 fn int32_lexicographic_order(x: i32, y: i32) -> std::cmp::Ordering {
     if x == y {
         return std::cmp::Ordering::Equal;

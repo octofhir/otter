@@ -356,8 +356,8 @@ mod tests {
     }
 
     #[test]
-    fn point_one_in_radix_2_matches_v8() {
-        // (0.1).toString(2) per V8 / SpiderMonkey reference.
+    fn point_one_in_radix_2_matches_the_reference_digits() {
+        // Reference expansion of (0.1).toString(2).
         assert_eq!(
             fmt(0.1, 2),
             "0.0001100110011001100110011001100110011001100110011001101"
@@ -366,12 +366,11 @@ mod tests {
 
     #[test]
     fn point_one_in_radix_3() {
-        // Confirmed against V8: (0.1).toString(3) emits a long
-        // ternary expansion. Round-trip-correct, no V8 reference
-        // string asserted here — algorithm correctness is verified
-        // via the parse-roundtrip in `dense_round_trip` for radix
-        // 10 (which we already trust) and via the radix-2 V8 match
-        // above.
+        // (0.1).toString(3) emits a long ternary expansion.
+        // Round-trip-correct, no reference string asserted here —
+        // algorithm correctness is verified via the parse-roundtrip in
+        // `dense_round_trip` for radix 10 (which we already trust) and
+        // via the radix-2 reference match above.
         let s = fmt(0.1, 3);
         assert!(s.starts_with("0."));
         assert!(s.len() > 3);

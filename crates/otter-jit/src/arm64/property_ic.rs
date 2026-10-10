@@ -2,10 +2,9 @@
 //! Template IC routines and Graph generic property nodes.
 //!
 //! # Contents
-//! - [`emit_select_entry`] — V8 `TryMonomorphicCase` / `HandlePolymorphicCase`:
-//!   the receiver's map selects its slot entry — an ordinary object's shape,
-//!   or a closure's or native function's property-bag shape keyed with the
-//!   lookup-start bit.
+//! - [`emit_select_entry`] — the receiver's map selects its slot entry: an
+//!   ordinary object's shape, or a closure's or native function's
+//!   property-bag shape keyed with the lookup-start bit.
 //! - [`emit_slot_load`] — own field, prototype field under its chain proof,
 //!   nonexistent key.
 //! - [`emit_slot_store`] — own-field store and add-transition (write, shape

@@ -1467,7 +1467,7 @@ pub extern "C" fn to_boolean_leaf(
     NativeResultPair::success(Value::boolean(truthy))
 }
 
-/// V8's `TryInternalizeString` for a keyed access: the atom the isolate's
+/// String internalization lookup for a keyed access: the atom the isolate's
 /// name interner holds for the content of the flat string `key_bits`, as a
 /// raw atom id. The caller records it in the string's atom word. A rope (its
 /// units are not contiguous), a lone surrogate, content never interned, or a
@@ -1511,7 +1511,7 @@ pub extern "C" fn string_key_atom_leaf(
     }
 }
 
-/// V8's `GenericPropertyLoad` dictionary case for a keyed load whose name
+/// The generic property load's dictionary case for a keyed load whose name
 /// key missed the shared property table: the data property of the
 /// dictionary-mode object `receiver_bits` or its prototype chain for the
 /// string `key_bits`, by the atom the key recorded and its ASCII spelling.

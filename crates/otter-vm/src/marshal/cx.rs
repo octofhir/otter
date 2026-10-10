@@ -351,10 +351,10 @@ impl<'rt, 'cx, 's> MarshalCx<'rt, 'cx, 's> {
             .map_err(|err| self.vm_err(err))
     }
 
-    /// Side-effect-free `obj[key]` on an ordinary object (V8
-    /// `GetDataProperty`): the data value found along the prototype chain,
-    /// `undefined` for an accessor, `None` when absent or when `obj` is not
-    /// an ordinary object. Never runs JavaScript.
+    /// Side-effect-free `obj[key]` on an ordinary object: the data value
+    /// found along the prototype chain, `undefined` for an accessor, `None`
+    /// when absent or when `obj` is not an ordinary object. Never runs
+    /// JavaScript.
     pub fn data_property(&mut self, obj: Local<'_>, key: &str) -> Option<Local<'s>> {
         let object = self.ctx.cx.interp.escape_scoped(obj).as_object()?;
         let value = crate::object::get(object, self.heap(), key)?;

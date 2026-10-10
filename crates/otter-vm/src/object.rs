@@ -61,10 +61,10 @@
 //! - Runtime transaction rollback may force-remove only the own data slot that
 //!   still holds its expected published value; it never invokes an accessor or
 //!   removes a replacement installed by re-entrant code.
-//! - Every object has a shape, and the shape fixes its `[[Prototype]]`
-//!   (V8 maps, JSC structures): a keyed shape of its prototype's lineage, or
-//!   that lineage's dictionary shape in dictionary mode. A prototype change is
-//!   a shape change; nothing else stores the prototype.
+//! - Every object has a shape, and the shape fixes its `[[Prototype]]`: a
+//!   keyed shape of its prototype's lineage, or that lineage's dictionary
+//!   shape in dictionary mode. A prototype change is a shape change; nothing
+//!   else stores the prototype.
 //! - A shape fixes inline capacity as well as prototype. Overflow slabs hold
 //!   only the suffix; inline prefix words never migrate. Capacity roots are
 //!   cached per prototype, capacity and complete immutable state.
@@ -763,13 +763,12 @@ pub const OBJECT_BODY_TYPE_TAG: u8 = 0x11;
 /// The fixed body is 16 bytes — shape, slab and sidecar handles plus padding —
 /// and is followed in the same cell by [`Self::inline_capacity`] in-object
 /// value slots, sized per allocation site (object literals by their property
-/// count, constructor receivers by the learned field count): the JSC
-/// `JSFinalObject` / V8 in-object layout. The shape owns immutable capacity;
-/// immutable semantic state lives in its hidden class; GC body-owned bytes are zero
-/// ([`otter_gc::header::HEADER_BODY_BYTES_OFFSET`]). The live slot count is the shape's property
-/// count, or the sidecar's dictionary slot count for a dictionary-mode
-/// object, so appending to a shaped object stores a slot and a shape and
-/// nothing else.
+/// count, constructor receivers by the learned field count). The shape owns
+/// immutable capacity; immutable semantic state lives in its hidden class; GC
+/// body-owned bytes are zero ([`otter_gc::header::HEADER_BODY_BYTES_OFFSET`]).
+/// The live slot count is the shape's property count, or the sidecar's
+/// dictionary slot count for a dictionary-mode object, so appending to a
+/// shaped object stores a slot and a shape and nothing else.
 /// String-keyed slot `i` stays inline when `i < shape.inline_capacity`.
 /// Otherwise it occupies suffix word `i - shape.inline_capacity`. Slab growth
 /// never moves or copies the inline prefix.
@@ -984,9 +983,9 @@ impl ExoticSlot {
 pub struct ExoticSlots {
     /// Mutation subscriptions and the current proof of this prototype chain.
     prototype_watchpoints: prototype_validity::PrototypeWatchpoints,
-    /// Root shape of the objects whose `[[Prototype]]` is this object (V8's
-    /// `PrototypeInfo::ObjectCreateMap`), created on first use. The root holds
-    /// this object as its prototype, so the pair lives and dies together.
+    /// Root shape of the objects whose `[[Prototype]]` is this object,
+    /// created on first use. The root holds this object as its prototype, so
+    /// the pair lives and dies together.
     instance_root: ShapeHandle,
     /// Insertion-ordered dictionary keys with their content-hash index,
     /// in a [`DictKeysBody`] of their own — null until the object leaves
@@ -2658,8 +2657,7 @@ impl otter_gc::SafeTraceable for ObjectBody {
         self.trace_fixed_slots(v);
         // Fixed handles have been rewritten before capacity/count are read.
         // Live slots fill the in-object prefix first, then the slab suffix
-        // from its first word: two contiguous runs, as V8's body descriptors
-        // walk a JSObject's in-object range and its property array.
+        // from its first word: two contiguous runs.
         let count = self.slot_count();
         if count == 0 {
             return;
@@ -3812,15 +3810,13 @@ pub(crate) fn shape_property_count(shape: ShapeHandle, heap: &otter_gc::GcHeap) 
 /// transition-shape storage when a property arrives through a keyed or
 /// generic store, before it normalizes to dictionary mode. Objects filled
 /// with computed keys are dictionaries in all but name; bounding their
-/// transition chains keeps lookup and bulk addition O(1). V8's
-/// `JSObject::kMaxFastProperties`.
+/// transition chains keeps lookup and bulk addition O(1).
 pub(crate) const MAX_FAST_PROPERTIES: u32 = 128;
 
 /// Maximum number of own properties a *named* store (`o.x = v`) keeps in
 /// fast storage. Named stores describe an object's fixed layout, as a
 /// constructor building a large state object does, so they stay on shapes
-/// (and shape ICs) until V8's descriptor-array limit,
-/// `kMaxNumberOfDescriptors`.
+/// (and shape ICs) up to this limit.
 pub(crate) const MAX_NAMED_FAST_PROPERTIES: u32 = 1020;
 
 /// Append a dictionary key. The caller pushes the matching slot
@@ -3990,7 +3986,7 @@ pub(crate) fn lookup_own_atom(
 }
 
 /// Ordinary `[[Get]]` of an interned key that own data answers along the
-/// prototype chain (V8's `GenericPropertyLoad`): the first data property's
+/// prototype chain: the first data property's
 /// value, or `undefined` past a `null` prototype. `None` for an accessor, an
 /// opaque lookup or a non-object prototype, which the full get owns. Reads
 /// only; never allocates.
@@ -5651,15 +5647,14 @@ fn object_prototype_of_shape(prototype: shape_body::ShapePrototype) -> ObjectPro
 }
 
 /// Out-of-object properties past which a keyed store adds no further
-/// property to a fast object (V8's `kFastPropertiesSoftLimit`).
+/// property to a fast object.
 const KEYED_FAST_PROPERTIES: usize = 12;
 
 /// Leave `obj` in dictionary mode before a keyed store adds a property to it
-/// once its out-of-object properties reach [`KEYED_FAST_PROPERTIES`], as
-/// V8's `Map::TooManyFastProperties` does for a keyed store origin: computed
-/// keys make hash tables, and every key appended to a transition chain makes
-/// each later lookup walk it. A prototype, a non-extensible or exotic object
-/// keeps its layout.
+/// once its out-of-object properties reach [`KEYED_FAST_PROPERTIES`]:
+/// computed keys make hash tables, and every key appended to a transition
+/// chain makes each later lookup walk it. A prototype, a non-extensible or
+/// exotic object keeps its layout.
 pub(crate) fn normalize_before_keyed_addition(
     obj: &mut JsObject,
     heap: &mut GcHeap,

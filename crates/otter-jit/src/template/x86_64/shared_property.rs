@@ -1,30 +1,28 @@
-//! Per-code-object named-property IC routines for x86-64 baseline sites:
-//! V8's `LoadIC` / `StoreIC` builtins over the site's native feedback slot.
+//! Per-code-object named-property IC routines for x86-64 baseline sites,
+//! over the site's native feedback slot.
 //!
 //! # Contents
 //! - [`SharedPropertyProbes`] names one load, one store and one method
 //!   routine, requested by sites and emitted once after the body.
-//! - Load: the receiver shape selects an entry of the site's slot
-//!   (V8 `TryMonomorphicCase` / `HandlePolymorphicCase`) whose handler runs in
-//!   machine code: own field, prototype field under its chain proof,
-//!   nonexistent key. A megamorphic slot probes the isolate's shared action
-//!   table. Anything else is the committed runtime miss, which also updates
-//!   the slot.
+//! - Load: the receiver shape selects an entry of the site's slot whose
+//!   handler runs in machine code: own field, prototype field under its chain
+//!   proof, nonexistent key. A megamorphic slot probes the isolate's shared
+//!   action table. Anything else is the committed runtime miss, which also
+//!   updates the slot.
 //! - Store: own-field stores and add-transitions (field write, shape
 //!   publication, both barriers), then the shared table, then the miss.
 //! - Method: the load selection without a miss call; it returns only a
 //!   callable hit.
 //! - Concat: the nursery string-concatenation fit every `Add` site shares
 //!   instead of inlining it.
-//! - Keyed load and store: V8's `KeyedLoadIC_Megamorphic` /
-//!   `KeyedStoreIC_Megamorphic` name case. A string key probes the shared
-//!   action table under its atom, recorded in the string or found by the
-//!   interning leaf (`TryInternalizeString`) and then recorded. A load the
-//!   table misses on a dictionary-mode receiver, which the table never
-//!   holds, runs the generic own-data walk leaf (`GenericPropertyLoad`); any
-//!   other key, a shaped receiver's or a store's table miss, or a walk the
-//!   leaf cannot finish returns to the element site, which completes through
-//!   its committed element runtime (which records the table entry).
+//! - Keyed load and store, name case: a string key probes the shared action
+//!   table under its atom, recorded in the string or found by the interning
+//!   leaf and then recorded. A load the table misses on a dictionary-mode
+//!   receiver, which the table never holds, runs the generic own-data walk
+//!   leaf; any other key, a shaped receiver's or a store's table miss, or a
+//!   walk the leaf cannot finish returns to the element site, which
+//!   completes through its committed element runtime (which records the
+//!   table entry).
 //!
 //! # Invariants
 //! - Inputs arrive in the System V argument registers the miss passes on:
@@ -153,10 +151,10 @@ impl SharedPropertyProbes {
 
 /// Leave the atom of the string `key` in `Rd(atom)`, or branch to `miss`
 /// for any other key or a string no property key has interned. A string
-/// whose atom is not yet recorded asks the interning leaf (V8's
-/// `TryInternalizeString`) and records the answer in its atom word. The
-/// routine inputs, `rsi`, `rcx` and `rdx`, survive the leaf call; `aligned`
-/// says whether `rsp` is 16-byte aligned here.
+/// whose atom is not yet recorded asks the interning leaf and records the
+/// answer in its atom word. The routine inputs, `rsi`, `rcx` and `rdx`,
+/// survive the leaf call; `aligned` says whether `rsp` is 16-byte aligned
+/// here.
 fn emit_key_atom(
     ops: &mut Assembler,
     relocations: &mut RelocationCapture,
@@ -238,8 +236,8 @@ fn emit_keyed_load(
         loaded,
         loaded,
     );
-    // `KeyedLoadIC_Megamorphic` falling back to `GenericPropertyLoad`: the
-    // leaf's pair is the routine's result. The receiver is already `rsi`.
+    // The generic own-data walk: the leaf's pair is the routine's result.
+    // The receiver is already `rsi`.
     const _: () = assert!(KEYED_LOAD_RECEIVER == 6);
     dynasm!(ops ; .arch x64
         ; =>loaded

@@ -99,7 +99,7 @@ impl Codegen<'_> {
         Ok(())
     }
     /// A BigInt binary operator. Operands that fit `i64` take the inline
-    /// BigInt64 path (V8's), whose result is carved in the buffer; every other
+    /// BigInt64 path, whose result is carved in the buffer; every other
     /// case, and any overflow, reaches the allocating Probe, which exits to
     /// the source instruction for a non-BigInt operand or a throwing operator.
     /// Division and remainder keep the Probe: `idiv` owns `rax`/`rdx`.

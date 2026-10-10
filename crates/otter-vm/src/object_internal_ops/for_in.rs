@@ -1,4 +1,4 @@
-//! `for-in` key snapshots read from hidden classes (V8's enum cache).
+//! `for-in` key snapshots read from hidden classes' enum caches.
 //!
 //! # Contents
 //! - [`Interpreter::for_in_cached_keys`]: the keys array `ForInKeys` hands
@@ -31,9 +31,8 @@ use crate::{Interpreter, JsString, Value, VmError};
 impl Interpreter {
     /// The keys `for (k in target)` visits when no prototype contributes an
     /// enumerable string key: a shaped receiver's from its shape's enum
-    /// cache, a dictionary receiver's read from its own storage (V8's
-    /// dictionary-mode `KeyAccumulator`). `None` when the receiver or a
-    /// prototype needs the general enumeration.
+    /// cache, a dictionary receiver's read from its own storage. `None` when
+    /// the receiver or a prototype needs the general enumeration.
     pub(crate) fn for_in_cached_keys(&mut self, target: Value) -> Result<Option<Value>, VmError> {
         let Some(receiver) = target.as_object() else {
             return Ok(None);

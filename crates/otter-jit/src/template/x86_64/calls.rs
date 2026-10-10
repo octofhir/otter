@@ -510,7 +510,7 @@ pub(super) fn emit_method_call(
     }
     let resolved = ops.new_dynamic_label();
     // Every other receiver runs the site's load IC (its handlers, then the
-    // isolate's shared action table as V8's megamorphic stub cache); a
+    // isolate's shared action table as a megamorphic stub cache); a
     // closure or native hit is called generically. A miss resolves through
     // the committed method resolution, which also records call feedback and
     // updates the slot.

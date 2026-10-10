@@ -1,4 +1,4 @@
-//! The key table a shape lineage shares (V8's `DescriptorArray`).
+//! The key table a shape lineage shares.
 //!
 //! A hidden class's keys are its transition chain: slot `i` is the key the
 //! `i`-th transition added. Walking that chain costs one dependent heap read
@@ -8,11 +8,11 @@
 //! attributes, and an atom index finds an entry in one probe. A shape with
 //! `n` keys reads entries `0..n` only.
 //!
-//! As V8 shares a descriptor array along a transition chain, a child shares
-//! its parent's table when the parent's keys are exactly the table's: it
-//! appends its key in place, and the parent, which reads a shorter prefix,
-//! does not see it. A second child of the same parent, or a full table,
-//! copies the prefix into a new, larger table.
+//! Along a transition chain, a child shares its parent's table when the
+//! parent's keys are exactly the table's: it appends its key in place, and
+//! the parent, which reads a shorter prefix, does not see it. A second child
+//! of the same parent, or a full table, copies the prefix into a new, larger
+//! table.
 //!
 //! # Contents
 //! - [`ShapeKeysBody`] — the table: length and capacity, then the entries and

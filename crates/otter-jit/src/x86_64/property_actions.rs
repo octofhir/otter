@@ -113,9 +113,8 @@ pub(crate) fn emit_action_probe(
     );
     // The table records loads only for shaped receivers with ordinary
     // lookup: a dictionary or opaque receiver's shape id keys no load entry,
-    // so a load probe needs no state test (V8 probes its stub cache by map
-    // alone). A store also refuses a prototype receiver, whose stores reach
-    // the prototype-validity owner.
+    // so a load probe needs no state test. A store also refuses a prototype
+    // receiver, whose stores reach the prototype-validity owner.
     if store {
         let excluded = ShapeState::DICTIONARY_MASK
             | ShapeState::OPAQUE_LOOKUP_MASK

@@ -9,11 +9,10 @@
 //!   [`Interpreter::freeze_function_prototype`] — the slot's only mutations.
 //!
 //! # Invariants
-//! - Like V8's `JSFunction::prototype_or_initial_map`, the property lives in
-//!   the closure's rare record (a bare function value's in a side table),
-//!   never in the own-property bag: assigning `F.prototype` gives a closure
-//!   no bag, so its named lookups stay ordinary and generated `F.call`,
-//!   construct and `instanceof` proofs read one slot.
+//! - The property lives in the closure's rare record (a bare function
+//!   value's in a side table), never in the own-property bag: assigning
+//!   `F.prototype` gives a closure no bag, so its named lookups stay ordinary
+//!   and generated `F.call`, construct and `instanceof` proofs read one slot.
 //! - The property exists from creation for every kind
 //!   [`crate::ExecutionContext::function_has_prototype_property`] admits:
 //!   `{writable: true, enumerable: false, configurable: false}`. The value is

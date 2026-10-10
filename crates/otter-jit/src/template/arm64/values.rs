@@ -43,10 +43,10 @@ pub(super) fn emit_store_reg(ops: &mut Assembler, t: u8, idx: u16) -> Result<(),
 }
 
 /// Materialize a 64-bit constant into x-register `t` in the fewest
-/// instructions, as V8's `MacroAssembler::Mov` does: one `movz` or `movn`
-/// when a single halfword differs from the rest, one `orr` of a logical
-/// immediate, otherwise `movz` or `movn` of the first halfword plus a `movk`
-/// for each other halfword that differs from that fill.
+/// instructions: one `movz` or `movn` when a single halfword differs from
+/// the rest, one `orr` of a logical immediate, otherwise `movz` or `movn` of
+/// the first halfword plus a `movk` for each other halfword that differs
+/// from that fill.
 /// Instructions [`emit_load_u64`] spends on `v`.
 pub(crate) fn load_u64_instructions(v: u64) -> usize {
     let halfword = |index: u32| (v >> (16 * index)) & 0xFFFF;
@@ -466,8 +466,8 @@ pub(crate) fn emit_field_base(
 /// `slow` for the cells only the heap can decide: a plain object whose
 /// sidecar may carry a native `[[Call]]`, a native function that may be
 /// `[[IsHTMLDDA]]`, a proxy, or an internal body. Numbers, immediates and
-/// every other cell resolve from the value bits and the GC type tag (V8's
-/// `TestTypeOf` lowering). Clobbers `W(scratch)`.
+/// every other cell resolve from the value bits and the GC type tag.
+/// Clobbers `W(scratch)`.
 pub(crate) fn emit_typeof_kind(
     ops: &mut Assembler,
     view: &JitCompileSnapshot,

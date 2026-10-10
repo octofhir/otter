@@ -1,4 +1,4 @@
-//! The unmodified iteration protocol — V8's iterator protectors.
+//! The unmodified iteration protocol — iterator protectors.
 //!
 //! GetIterator reads `@@iterator` from the iterable and `next` from the
 //! iterator it returns; IteratorClose reads `return`. While a realm's

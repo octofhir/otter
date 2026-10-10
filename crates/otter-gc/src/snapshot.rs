@@ -31,12 +31,12 @@
 //! `self_size` over objects only reachable from `R`. With one
 //! root, this collapses to the total reachable byte count;
 //! shared subgraphs between two roots are exclusive to neither
-//! (matches V8 DevTools terminology).
+//! (matches Chrome DevTools terminology).
 //!
 //! # See also
 //!
 //! - GC architecture plan §7 ("Leak diagnosis"), §1.2 NF6.
-//! - V8 DevTools "retained size" definition:
+//! - Chrome DevTools "retained size" definition:
 //!   <https://developer.chrome.com/docs/devtools/memory-problems/heap-snapshots#retained_size>
 //! - Task 74 — GC stats, heap snapshot, retained-size walker.
 

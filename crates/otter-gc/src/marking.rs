@@ -29,9 +29,6 @@
 //! # See also
 //!
 //! - GC architecture plan §2.3 (MarkingState row), §5 (barriers).
-//! - V8 incremental marker, [V8 blog 2018-04 Concurrent
-//!   marking](https://v8.dev/blog/concurrent-marking) (read-only
-//!   inspiration; we are STW in Phase 1).
 
 use std::collections::VecDeque;
 

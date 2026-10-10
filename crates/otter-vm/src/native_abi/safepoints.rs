@@ -102,7 +102,7 @@ impl CodeRegistryView {
 }
 
 /// Live tagged native spill slots at one safepoint: a bitmap over the code
-/// object's spill area, as V8's safepoint table records tagged stack slots.
+/// object's spill area.
 ///
 /// A raw machine register is never a root at a collecting boundary (the
 /// register map saves it to its spill home first), so a slot index is the
@@ -199,9 +199,8 @@ pub struct SafepointRecord {
     pub spill_roots: SpillRoots,
     /// Logical inline descendants, outermost first: each one's function and
     /// byte PC and, at a generated JavaScript call, its activation's binding
-    /// and actual arguments as slots of this frame's homes or constants (V8's
-    /// FrameInspector over the call's frame state). The owning code
-    /// generation and this record's id select the recipe.
+    /// and actual arguments as slots of this frame's homes or constants. The
+    /// owning code generation and this record's id select the recipe.
     pub inline_frames: Box<[crate::deopt::DeoptFrame]>,
     /// Canonical PC, in the code object's own function, of the generated
     /// JavaScript call this safepoint belongs to, or [`NO_CALL_PC`]. Stack

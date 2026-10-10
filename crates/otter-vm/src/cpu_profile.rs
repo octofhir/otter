@@ -34,7 +34,7 @@ const CPU_PROFILE_SAMPLE_LIMIT: u64 = 65_536;
 const CPU_PROFILE_RETAINED_BYTE_LIMIT: usize = 64 * 1024 * 1024;
 /// Maximum logical bytes retained by one sample.
 const CPU_PROFILE_SAMPLE_BYTE_LIMIT: usize = 1024 * 1024;
-/// Maximum JavaScript frames owned by one sample, matching V8's stack bound.
+/// Maximum JavaScript frames owned by one sample.
 const CPU_PROFILE_MAX_FRAMES: usize = 255;
 /// Conservative outer-vector and allocator overhead charged to every sample.
 const CPU_PROFILE_SAMPLE_OVERHEAD_BYTES: usize = 128;

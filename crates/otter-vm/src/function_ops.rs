@@ -2558,7 +2558,7 @@ impl Interpreter {
         self.function_property_get_with_receiver(stack, context, owner, function_id, None, name)
     }
 
-    /// SpiderMonkey-legacy magic `fn.caller` / `fn.arguments` read.
+    /// Legacy magic `fn.caller` / `fn.arguments` read.
     /// `Some(value)` for an eligible sloppy ordinary function
     /// receiver (a live stack walk / arguments snapshot); `None`
     /// falls through to the poisoned %Function.prototype% accessors.
@@ -2593,7 +2593,7 @@ impl Interpreter {
         }
     }
 
-    /// SpiderMonkey-legacy `fn.caller` / `fn.arguments` eligibility:
+    /// Legacy `fn.caller` / `fn.arguments` eligibility:
     /// only sloppy ordinary functions (not arrows, methods,
     /// generators, async functions) get the magic values; every other
     /// shape falls through to the poisoned %ThrowTypeError%
@@ -2610,7 +2610,7 @@ impl Interpreter {
                 .is_some_and(|f| !f.is_generator && !f.is_async && !f.is_method)
     }
 
-    /// SpiderMonkey-legacy `fn.caller`: the function value of the
+    /// Legacy `fn.caller`: the function value of the
     /// nearest frame below `callee`'s innermost activation whose
     /// function is ordinary script code. `<main>` / eval-chunk /
     /// module frames are looked through (legacy `caller` sees past
@@ -2649,7 +2649,7 @@ impl Interpreter {
         Value::null()
     }
 
-    /// SpiderMonkey-legacy `fn.arguments`: a fresh snapshot object of
+    /// Legacy `fn.arguments`: a fresh snapshot object of
     /// the innermost live activation's arguments (`null` when the
     /// function is not executing). Exact when the frame captured its
     /// incoming argv (`needs_arguments` bodies); otherwise

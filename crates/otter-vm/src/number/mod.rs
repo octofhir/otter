@@ -148,7 +148,7 @@ impl NumberValue {
     /// powers `Number.prototype.toString` (`crate::number::ecma`).
     /// Special values (`NaN`, `±Infinity`, `±0`) and the
     /// fixed/exponential boundaries (`-6 < n ≤ 0`, `1 ≤ n ≤ 21`,
-    /// scientific otherwise) all match V8 / Test262 expectations.
+    /// scientific otherwise) all match Test262 expectations.
     #[must_use]
     pub fn to_display_string(self) -> String {
         let mut buf = [0u8; super::number::ecma::ECMA_BUF_LEN];

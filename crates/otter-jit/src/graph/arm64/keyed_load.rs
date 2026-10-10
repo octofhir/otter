@@ -1,5 +1,4 @@
-//! Generic element loads: V8's `KeyedLoadIC_Megamorphic` for a site the
-//! optimizer does not specialize.
+//! Generic element loads for a site the optimizer does not specialize.
 //!
 //! # Contents
 //! - [`Codegen::emit_load_keyed_cached`] reads an Array's dense storage of

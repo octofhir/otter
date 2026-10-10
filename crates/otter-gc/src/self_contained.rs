@@ -11,7 +11,7 @@
 //! collector does not own — the `Vec`, `Box`, or hash table a restore
 //! cannot reproduce.
 //!
-//! This is the property V8's serializer enforces when it refuses to write
+//! This is the property a heap serializer enforces when it refuses to write
 //! an object holding a raw external pointer, arrived at from the other
 //! direction: rather than enumerate the fields that are allowed, ask the
 //! tracer where the references are.

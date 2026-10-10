@@ -234,9 +234,8 @@ fn reservation(shape: EntryShape, spill: SpillArea) -> u32 {
 /// continuations, named by `cold`, are emitted by [`emit_call_entry_cold`]
 /// just before it. Returns the entry and the receiver-ready entry: a sloppy
 /// body tests its receiver first, before saving anything, and a caller that
-/// proved the receiver an Object enters past that test (V8 converts the
-/// receiver at the call site for the same reason). Any other body has one
-/// entry.
+/// proved the receiver an Object enters past that test. Any other body has
+/// one entry.
 pub(crate) fn emit_call_entry(
     ops: &mut Assembler,
     relocations: &mut RelocationCapture,

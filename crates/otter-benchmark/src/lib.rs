@@ -39,7 +39,7 @@ pub const ENGINE_COMPILE_FEEDBACK_SEED_CALLS: u32 = 8;
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct BenchmarkIdentity {
-    /// Suite owning the workload, for example `engine` or `v8-v7`.
+    /// Suite owning the workload, for example `engine`.
     pub suite: String,
     /// Stable workload name within the suite.
     pub name: String,

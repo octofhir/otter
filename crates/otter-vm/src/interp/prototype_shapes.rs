@@ -7,9 +7,9 @@
 //!   OrdinarySetPrototypeOf for ordinary objects.
 //!
 //! # Invariants
-//! - A shape fixes its objects' `[[Prototype]]` (V8 maps, JSC structures,
-//!   SpiderMonkey shapes all do), so creating an object picks its prototype's
-//!   root and changing a prototype changes the shape; nothing else stores it.
+//! - A shape fixes its objects' `[[Prototype]]`, so creating an object picks
+//!   its prototype's root and changing a prototype changes the shape; nothing
+//!   else stores it.
 //! - Each ordinary prototype caches a traced chain of capacity/state roots on itself;
 //!   each root owns its dictionary companion. `null` uses the heap root chain,
 //!   and a non-ordinary prototype gets a fresh root that lives as long as the

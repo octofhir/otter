@@ -1,9 +1,9 @@
 //! The standard-library builtins an asm.js module may import, by identity.
 //!
-//! asm.js linking (V8 `AreStdlibMembersValid`) accepts a `stdlib` member only
-//! when it is the engine's own builtin, never a lookalike: a `Math` function
-//! or typed-array constructor is recognized by the static native entry every
-//! realm's copy shares, so a replaced global cannot pass.
+//! asm.js linking accepts a `stdlib` member only when it is the engine's own
+//! builtin, never a lookalike: a `Math` function or typed-array constructor
+//! is recognized by the static native entry every realm's copy shares, so a
+//! replaced global cannot pass.
 //!
 //! # Contents
 //! - [`StdlibFunction`] — the importable functions.

@@ -10,11 +10,10 @@
 //! chunk stays resolvable after it escapes to a frame executing a
 //! different chunk.
 //!
-//! This is the ownership shape production engines use: a JSC
-//! `JSFunction` resolves through its own `Executable` rather than an
-//! ambient per-script table, so code born in `eval` outlives the eval
-//! turn. Otter keeps ids dense and chunk-relative instead of holding a
-//! per-value code pointer, which leaves [`crate::Frame`],
+//! In this ownership shape a function resolves through its own executable
+//! code rather than an ambient per-script table, so code born in `eval`
+//! outlives the eval turn. Otter keeps ids dense and chunk-relative instead
+//! of holding a per-value code pointer, which leaves [`crate::Frame`],
 //! [`crate::closure::JsClosure`], and [`crate::Value`] layouts
 //! untouched. A foreign id is first resolved to its owning
 //! [`crate::ExecutionContext`]; table access is always chunk-local.

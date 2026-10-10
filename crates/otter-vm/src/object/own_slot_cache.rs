@@ -1,5 +1,4 @@
-//! Isolate cache of shaped objects' own-slot lookups (V8's
-//! `DescriptorLookupCache`).
+//! Isolate cache of shaped objects' own-slot lookups.
 //!
 //! # Contents
 //! - [`OwnSlotCache`] — a direct-mapped table from a shape id and an

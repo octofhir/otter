@@ -191,7 +191,7 @@ pub(crate) fn descriptor_value(desc: &crate::object::PropertyDescriptor) -> Valu
 }
 
 impl Interpreter {
-    /// V8's TypeError for reading a property of `null` / `undefined`:
+    /// The TypeError for reading a property of `null` / `undefined`:
     /// `Cannot read properties of null (reading 'x')`, naming the key when it
     /// is known without running user code.
     pub(crate) fn nullish_read_error(&self, base: &Value, key: Option<&str>) -> VmError {

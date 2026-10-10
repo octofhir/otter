@@ -7,8 +7,8 @@
 //! slot addresses outside the heap.
 //!
 //! So the values live in a GC body with the payload in trailing storage
-//! in the same cell — V8's `FixedArray`, reached from the owner by
-//! handle. Owners include arrays, native captures and bound-call prefixes.
+//! in the same cell, reached from the owner by handle. Owners include
+//! arrays, native captures and bound-call prefixes.
 //!
 //! # Contents
 //!

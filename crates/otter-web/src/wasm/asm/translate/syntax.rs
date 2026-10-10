@@ -232,7 +232,7 @@ pub(super) fn comparison(
     Ok(table[row].clone())
 }
 
-/// V8's stdlib overload sets (with the errata for `min`/`max`/`abs`/`ceil`).
+/// The stdlib overload sets (with the errata for `min`/`max`/`abs`/`ceil`).
 pub(super) fn stdlib_overload(function: StdlibFunction, result: AsmType, args: &[AsmType]) -> bool {
     use StdlibFunction as F;
     let unary =

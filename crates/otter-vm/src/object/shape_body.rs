@@ -5,11 +5,9 @@
 //! provisional state once, in place) and record the transition from
 //! their parent — parent shape, added property key, property count, and the
 //! slot offset assigned to that key — together with what every object of the
-//! lineage shares: its `[[Prototype]]` (V8 `Map::prototype`, JSC
-//! `Structure::m_prototype`, SpiderMonkey `BaseShape::proto`) and its
-//! dictionary shape. Transition tables and flattened lookup caches live
-//! outside this GC body so mutation never requires `Cell`/`RefCell` inside
-//! traced payloads.
+//! lineage shares: its `[[Prototype]]` and its dictionary shape. Transition
+//! tables and flattened lookup caches live outside this GC body so mutation
+//! never requires `Cell`/`RefCell` inside traced payloads.
 //!
 //! # Contents
 //! - [`ShapeBody`] — immutable hidden-class layout node.
@@ -135,7 +133,7 @@ pub struct ShapeBody {
     /// The lineage's dictionary shape; in the dictionary shape itself, which
     /// is its own, the lineage's root.
     dictionary: ShapeHandle,
-    /// The keys `for-in` visits on this shape's objects (V8's enum cache):
+    /// The keys `for-in` visits on this shape's objects (the enum cache):
     /// an array of the enumerable string keys in own-key order, filled on
     /// first need and never changed; `undefined` until then.
     enum_cache: crate::Value,
@@ -502,12 +500,12 @@ pub(crate) fn alloc_dictionary_shape_body_with_roots(
     Ok(dictionary)
 }
 
-/// Complete in-object slack tracking on one node of a provisional lineage
-/// (V8's `CompleteInobjectSlackTracking`): its in-object capacity shrinks to
-/// `inline_capacity`, which every node of the lineage's tree fits, it becomes
-/// ordinary, and its lineage's dictionary shape becomes `dictionary`. No
-/// existing field moves; later transitions place fields against the new
-/// capacity, and objects allocated before keep their wider cells.
+/// Complete in-object slack tracking on one node of a provisional lineage:
+/// its in-object capacity shrinks to `inline_capacity`, which every node of
+/// the lineage's tree fits, it becomes ordinary, and its lineage's
+/// dictionary shape becomes `dictionary`. No existing field moves; later
+/// transitions place fields against the new capacity, and objects allocated
+/// before keep their wider cells.
 pub(crate) fn finish_slack_tracking(
     heap: &mut GcHeap,
     shape: ShapeHandle,

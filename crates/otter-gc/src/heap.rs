@@ -115,28 +115,27 @@ pub fn empty() -> EmptyRoots {
 /// Number of [`GcHeap::embedder_root`] slots.
 pub const EMBEDDER_ROOT_SLOTS: usize = 2;
 
-/// Old-generation allocation limit before the first mark-compact: V8's
-/// `Heap::DefaultInitialOldGenerationSize`, 256 MiB times its
-/// `HeapLimitMultiplier` (system pointer size / 4 = 2 on 64-bit targets).
-/// The heap grows freely up to it; collections before then would re-mark a
-/// young, mostly-live old generation for little reclamation.
+/// Old-generation allocation limit before the first mark-compact: 256 MiB
+/// times the heap-limit multiplier (system pointer size / 4 = 2 on 64-bit
+/// targets). The heap grows freely up to it; collections before then would
+/// re-mark a young, mostly-live old generation for little reclamation.
 const INITIAL_OLD_GENERATION_SIZE: u64 = 512 * 1024 * 1024;
 /// Lower bound of every recomputed old-generation limit.
 const MIN_OLD_GENERATION_SIZE: u64 = 16 * 1024 * 1024;
-/// V8 `heap-controller.h`: the growing-factor bounds and the mutator
-/// utilization the limit targets (at most 3% of mutator time in mark-compact).
+/// The growing-factor bounds and the mutator utilization the limit targets
+/// (at most 3% of mutator time in mark-compact).
 const MIN_GROWING_FACTOR: f64 = 1.1;
 const MAX_GROWING_FACTOR: f64 = 4.0;
 const TARGET_MUTATOR_UTILIZATION: f64 = 0.97;
-/// V8 `kMinimumAllocationLimitGrowingStep`: a limit always leaves this much
-/// old-generation room above the surviving set.
+/// A limit always leaves this much old-generation room above the surviving
+/// set.
 const MINIMUM_ALLOCATION_LIMIT_GROWING_STEP: u64 = 8 * 1024 * 1024;
 /// External (backing-store) bytes that may accumulate above the surviving
-/// reservations before they force a mark-compact: V8's
-/// `kExternalAllocationSoftLimit`. Objects owning them are small cells with
-/// drop glue, so page occupancy barely moves while their payloads can pin
-/// gigabytes of native memory; the separate limit reclaims dead payloads
-/// without letting a large live external set license proportional garbage.
+/// reservations before they force a mark-compact. Objects owning them are
+/// small cells with drop glue, so page occupancy barely moves while their
+/// payloads can pin gigabytes of native memory; the separate limit reclaims
+/// dead payloads without letting a large live external set license
+/// proportional garbage.
 const EXTERNAL_ALLOCATION_SOFT_LIMIT: u64 = 64 * 1024 * 1024;
 /// Near-cage hard ceiling on the old-generation limit (numerator/256
 /// of the cage). A cap-less heap always attempts a full GC before cage
@@ -151,12 +150,12 @@ fn cage_hardcap_bytes() -> u64 {
     (cage_size() as u64) / 256 * MAJOR_GC_CAGE_SOFTCAP_NUM
 }
 
-/// V8 `MemoryController::DynamicGrowingFactor`: the old-generation growing
-/// factor that keeps mark-compact at `1 - TARGET_MUTATOR_UTILIZATION` of the
-/// time if collection and allocation keep their measured speeds (bytes per
-/// millisecond). `F = R(1 - MU) / (R(1 - MU) - MU)` with `R = gc / mutator`,
-/// bounded to `[MIN_GROWING_FACTOR, MAX_GROWING_FACTOR]`; without both
-/// speeds the factor is the maximum.
+/// The old-generation growing factor that keeps mark-compact at
+/// `1 - TARGET_MUTATOR_UTILIZATION` of the time if collection and allocation
+/// keep their measured speeds (bytes per millisecond).
+/// `F = R(1 - MU) / (R(1 - MU) - MU)` with `R = gc / mutator`, bounded to
+/// `[MIN_GROWING_FACTOR, MAX_GROWING_FACTOR]`; without both speeds the factor
+/// is the maximum.
 fn dynamic_growing_factor(gc_speed: f64, mutator_speed: f64) -> f64 {
     if !(gc_speed > 0.0 && mutator_speed > 0.0) {
         return MAX_GROWING_FACTOR;
@@ -317,8 +316,8 @@ pub struct GcHeap {
     handle_stack: Box<HandleStack>,
     global_handles: Box<GlobalHandleTable>,
     /// Strong handles the embedder keeps at fixed indices for code that holds
-    /// only the heap (V8's roots table). Traced as roots and rewritten in
-    /// place when their targets move.
+    /// only the heap. Traced as roots and rewritten in place when their
+    /// targets move.
     embedder_roots: [Cell<RawGc>; EMBEDDER_ROOT_SLOTS],
     /// LIFO stack of runtime-owned root sources. A stack — not a
     /// single slot — because VM scopes nest (native call → re-entrant
@@ -346,9 +345,8 @@ pub struct GcHeap {
     /// state changes; shrinks follow every release path, including drained
     /// shared-token releases. `None` until the runtime installs its account.
     external_ledger: Option<otter_resource::ResourceLease>,
-    /// Old-generation allocation limit over old/large page bytes (V8's
-    /// `old_generation_allocation_limit`). It starts at
-    /// [`INITIAL_OLD_GENERATION_SIZE`] and every mark-compact recomputes it
+    /// Old-generation allocation limit over old/large page bytes. It starts
+    /// at [`INITIAL_OLD_GENERATION_SIZE`] and every mark-compact recomputes it
     /// from the surviving pages and the measured collection and allocation
     /// speeds ([`dynamic_growing_factor`]). Without it a cap-less heap never
     /// runs a full GC, so old space — fed by scavenge promotion and the
@@ -2437,7 +2435,7 @@ impl GcHeap {
     }
 
     /// Recompute the old-generation and external limits after a
-    /// mark-compact (V8 `HeapLimits::UpdateAllocationLimits`).
+    /// mark-compact.
     ///
     /// The collection speed is the old generation it processed per
     /// millisecond of this pause; the mutator speed is the old generation
@@ -2537,8 +2535,7 @@ impl GcHeap {
     }
 
     /// Set the old-generation allocation limit that holds until the first
-    /// mark-compact (V8's `ResourceConstraints` initial old-generation size).
-    /// Embedders with small heaps lower it from
+    /// mark-compact. Embedders with small heaps lower it from
     /// [`INITIAL_OLD_GENERATION_SIZE`]; it has no effect once a mark-compact
     /// has recomputed the limits.
     pub fn set_initial_old_generation_size(&mut self, bytes: u64) {
@@ -3155,8 +3152,7 @@ impl GcHeap {
     /// allocator updates its type's row; the aggregates `live_objects` and
     /// `live_bytes` are summed from the rows here. `alloc_bytes_total` adds
     /// what generated code carved, derived from the allocation buffers'
-    /// progress rather than counted per cell (V8's inline allocation keeps
-    /// no per-object statistics either).
+    /// progress rather than counted per cell.
     pub fn gc_stats(&mut self) -> &GcStats {
         let mut live_objects = 0usize;
         let mut live_bytes = 0usize;

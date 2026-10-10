@@ -300,7 +300,7 @@ pub(crate) enum Kind {
     /// `typeof input0 === kind` (or `!==`), the encoded
     /// [`otter_bytecode::TypeOfTest`], producing a tagged boolean: decided
     /// from the value bits and the cell's type tag, with a leaf probe for
-    /// the cells only the heap decides (V8's `TestTypeOf`).
+    /// the cells only the heap decides.
     TestTypeOf {
         test: i32,
     },
@@ -378,7 +378,7 @@ pub(crate) enum Kind {
         atom: Option<u32>,
     },
     /// `[[Set]]` of input2 at key input1 of receiver input0 at the element
-    /// store site `pc`, as V8's generic keyed store: an in-bounds store into
+    /// store site `pc` as a generic keyed store: an in-bounds store into
     /// an Array's dense storage of whatever kind it has, a hole included
     /// while no indexed accessor exists and the array has no exotic state;
     /// a name key through the isolate's shared property table; else the
@@ -387,7 +387,7 @@ pub(crate) enum Kind {
         pc: u32,
     },
     /// `[[Get]]` of key input1 of receiver input0 at the element load site
-    /// `pc`, as V8's generic keyed load: an in-bounds element of an Array's
+    /// `pc` as a generic keyed load: an in-bounds element of an Array's
     /// dense storage of whatever kind it has, a name key through the
     /// isolate's shared property table, else the committed source operation
     /// in the runtime (holes, accessors, strings, typed arrays, proxies).

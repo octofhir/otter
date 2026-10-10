@@ -3,7 +3,7 @@
 //! `Op::GetIterator` writes an iterator record into two consecutive
 //! registers: the iterator, then its cursor. GetIterator over an ordinary
 //! Array whose iteration nothing can observe keeps the array itself and an
-//! int32 cursor, with no iterator object (JSC's fast-array iteration mode):
+//! int32 cursor, with no iterator object:
 //! `%ArrayIteratorPrototype%.next` reads the array's length and the element at
 //! the cursor on every step, so the record needs no other state. Every other
 //! iterable keeps an iterator value and an `undefined` cursor.

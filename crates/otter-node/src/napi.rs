@@ -3,7 +3,7 @@
 //! A native addon is a dynamic library whose symbol-based initializer or
 //! constructor-based `napi_module_register` callback calls the `napi_*` C
 //! symbols exported by the Otter executable. This module supplies that
-//! VM-neutral ABI directly; it does not embed Node or V8 and does not route
+//! VM-neutral ABI directly; it does not embed Node and does not route
 //! through `napi-rs` (which is an addon-side binding).
 //!
 //! # Contents

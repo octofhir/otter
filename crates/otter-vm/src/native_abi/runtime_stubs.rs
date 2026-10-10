@@ -602,8 +602,7 @@ pub const STUB_JIT_DEFINE_OWN_PROPERTY: RuntimeStubDescriptor = descriptor(
     RuntimeStubResultAbi::StatusWord,
     NativeResultDomain::None,
 );
-/// Named-property read over one boxed receiver and the site's native IC slot
-/// (V8 `LoadIC_Miss`).
+/// Named-property read over one boxed receiver and the site's native IC slot.
 ///
 /// Accessors, proxies, and exotic receivers may re-enter JavaScript. The site
 /// identity bound in the slot selects `LoadProperty`; success returns its value
@@ -620,7 +619,7 @@ pub const STUB_JIT_LOAD_PROPERTY: RuntimeStubDescriptor = descriptor(
     NativeResultDomain::Committed,
 );
 /// Named-property write over boxed receiver/value operands and the site's
-/// native IC slot (V8 `StoreIC_Miss`).
+/// native IC slot.
 ///
 /// Shape transitions may allocate and setters or proxy traps may re-enter
 /// JavaScript. Entry commits the complete store exactly once or returns one
@@ -1915,11 +1914,9 @@ pub const STUB_STRING_KEY_ATOM_LEAF: RuntimeStubDescriptor = descriptor(
 );
 
 /// Leaf keyed `[[Get]]` of an interned string key on a dictionary-mode
-/// object that own data answers along its prototype chain (V8's
-/// `GenericPropertyLoad` behind `KeyedLoadIC_Megamorphic`): `(heap,
-/// receiver, key)`, the key carrying its recorded atom. Never allocates; a
-/// shaped receiver, an accessor, an opaque object or an unrecorded key
-/// misses.
+/// object that own data answers along its prototype chain: `(heap, receiver,
+/// key)`, the key carrying its recorded atom. Never allocates; a shaped
+/// receiver, an accessor, an opaque object or an unrecorded key misses.
 pub const STUB_KEYED_NAMED_LOAD_LEAF: RuntimeStubDescriptor = descriptor(
     102,
     RuntimeStubClass::LeafNoAlloc,

@@ -1,6 +1,6 @@
 //! asm.js function bodies (§6.4–6.5): parameter annotations, locals and
 //! statements, emitted as buffered wasm with blocks for every loop, label
-//! and switch (V8's block stack).
+//! and switch (a block stack).
 //!
 //! # Invariants
 //! - `break` targets the innermost loop or switch block, or the labeled
@@ -38,7 +38,7 @@ struct LocalInfo {
     index: u32,
 }
 
-/// How the context of a call coerces its result (V8 `call_coercion_`).
+/// How the context of a call coerces its result.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Coercion {
     None,

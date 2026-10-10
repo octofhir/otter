@@ -32,11 +32,11 @@ impl Interpreter {
             self.optimizing_tier_policy.bind_source(function);
         }
         // Only optimized code embeds the failed speculation: drop this
-        // function's own. Like V8, a caller that spliced the body keeps its
-        // code and leaves through its own copy of the guard if that guard
-        // ever fails there, recompiling from the feedback this retraining
-        // collects. The baseline generation stays installed while the
-        // stable cell routes entries to the interpreter.
+        // function's own. A caller that spliced the body keeps its code and
+        // leaves through its own copy of the guard if that guard ever fails
+        // there, recompiling from the feedback this retraining collects. The
+        // baseline generation stays installed while the stable cell routes
+        // entries to the interpreter.
         let mut affected = self.jit_code_registry.invalidate_own_optimizing(fid);
         self.jit_runtime_stats.caller_invalidations = self
             .jit_runtime_stats

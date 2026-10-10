@@ -149,8 +149,7 @@ pub(super) fn compile(
 
 /// Emit one Template body. `far_branches` lowers every conditional branch to
 /// a bytecode label as an inverted local branch around an unconditional `b`
-/// (±128 MiB), the veneer V8's arm64 assembler places for out-of-range
-/// branches.
+/// (±128 MiB), a veneer for out-of-range branches.
 fn compile_with_reach(
     view: &JitCompileSnapshot,
     code_object_id: u64,

@@ -5,8 +5,7 @@
 //! already applies ToBoolean. Rewriting the branch to read `x` leaves the
 //! conversion without the branch as a user, and the allocator drops a pure
 //! node no one reads, so `if (!(a instanceof B))` tests the instanceof answer
-//! directly instead of materializing and negating it first (Maglev's
-//! `BranchIfToBooleanTrue` over a `LogicalNot` input).
+//! directly instead of materializing and negating it first.
 //!
 //! # Contents
 //! - [`fold_branch_negations`] — the rewrite over every block's branch.

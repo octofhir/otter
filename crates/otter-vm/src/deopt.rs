@@ -48,8 +48,7 @@
 //! - Literal recipes are not physical locations and may be shared by any
 //!   number of slots. They let optimized code omit values needed only by deopt.
 //! - Physical recipes read canonical tagged or untagged homes, literals, or
-//!   the machine registers the shared exit handler saved in its register dump
-//!   (V8's deoptimizer reads the registers its entry saved the same way).
+//!   the machine registers the shared exit handler saved in its register dump.
 //!   Every value is decoded before writeback can collect, so a dumped tagged
 //!   value is never a root.
 //! - Virtual objects are part of the same authoritative frame state. Dense ids
@@ -373,8 +372,8 @@ pub struct DeoptFrame<Slot = DeoptSlot> {
     pub slots: Box<[(u16, Slot)]>,
     /// An inlined frame's actual arguments, in order, when legacy
     /// `fn.arguments` can read its activation: the rebuilt frame's incoming
-    /// arguments (V8's inlined-arguments translation). `None` rebuilds the
-    /// incoming arguments from the parameter registers.
+    /// arguments. `None` rebuilds the incoming arguments from the parameter
+    /// registers.
     pub arguments: Option<Box<[Slot]>>,
 }
 
@@ -674,9 +673,9 @@ pub struct DeoptExitId(pub u32);
 
 /// One retained frame-state value: location kind and representation in
 /// `tag`, the stack offset, literal-pool index, virtual-object id or
-/// register-dump index in `payload`. A table keeps eight bytes per reconstructed value, as a V8
-/// translation array keeps a compact operand stream; recipes are unpacked
-/// only on the cold exit that uses them.
+/// register-dump index in `payload`. A table keeps eight bytes per
+/// reconstructed value, a compact operand stream; recipes are unpacked only
+/// on the cold exit that uses them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct PackedDeoptSlot {
     tag: u32,

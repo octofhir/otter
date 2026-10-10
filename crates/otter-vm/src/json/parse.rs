@@ -19,8 +19,7 @@
 //!   `+`, leading zeros, NaN / Infinity / undefined / hex literals
 //!   — all rejected.
 //! - Numeric overflow falls back to `f64::INFINITY` per IEEE-754
-//!   round-toward-infinity (matches V8's strtod path for huge
-//!   inputs).
+//!   round-toward-infinity.
 
 use std::sync::Arc;
 

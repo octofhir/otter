@@ -30,10 +30,9 @@ use crate::property_atom::{AtomId, AtomizedPropertyKey};
 pub(crate) mod jit;
 
 /// Sets of the shared table. It serves every keyed and megamorphic named
-/// site of the isolate under `(shape, atom)` keys — V8 splits that load into
-/// per-site ICs first and a 2048 + 512 entry stub cache after — so it is
-/// sized for a large program's live (shape, name) working set: 8K entries,
-/// within 1 MiB with their proof owners.
+/// site of the isolate under `(shape, atom)` keys, so it is sized for a large
+/// program's live (shape, name) working set: 8K entries, within 1 MiB with
+/// their proof owners.
 const SETS: usize = 2048;
 const WAYS: usize = 4;
 const HASH_SHAPE_MULTIPLIER: u64 = 0x9E37_79B9_7F4A_7C15;
@@ -54,7 +53,7 @@ pub enum PropertyLoadAction {
     InheritedData = 3,
     /// The key is absent from the receiver and its whole chain: `undefined`
     /// under the chain proof (none when the receiver's shape fixes a `null`
-    /// prototype). V8's stub cache holds `LoadNonExistent` handlers alike.
+    /// prototype).
     NonExistent = 4,
 }
 
@@ -555,9 +554,9 @@ impl crate::Interpreter {
     }
 
     /// Complete a named load on a receiver whose lookup starts at another
-    /// object (V8's `lookup_start_object`) through the site's handlers,
-    /// installing one on a miss. That object's shape, keyed with the
-    /// lookup-start bit, fixes the receiver's whole ordinary lookup:
+    /// object through the site's handlers, installing one on a miss. That
+    /// object's shape, keyed with the lookup-start bit, fixes the receiver's
+    /// whole ordinary lookup:
     /// - an ordinary dense array owns no named property but `length`, so
     ///   every other non-index name starts at `%Array.prototype%`;
     /// - a Map, Set, WeakMap, WeakSet, DataView, ArrayBuffer, TypedArray,
@@ -782,9 +781,9 @@ impl crate::Interpreter {
         Some(start)
     }
 
-    /// V8 `LoadIC::UpdateCaches` for an ordinary receiver that missed its
-    /// site: install the handler of the resolved data slot, or of a key the
-    /// receiver and its whole chain lack. Neither allocates nor runs code.
+    /// Cache update for an ordinary receiver that missed its site: install
+    /// the handler of the resolved data slot, or of a key the receiver and
+    /// its whole chain lack. Neither allocates nor runs code.
     pub(crate) fn update_load_ic(
         &self,
         slot: crate::feedback::PropertyFeedbackSlot<'_>,

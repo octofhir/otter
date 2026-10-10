@@ -8,7 +8,7 @@
 //! # Contents
 //! - [`BigIntValue`] — `Copy` 4-byte handle wrapping [`BigIntHandle`]
 //!   (`Gc<BigIntBody>`). Reads route through `&GcHeap`.
-//! - [`gc_body`] — the V8-layout body: sign, length, inline digits.
+//! - [`gc_body`] — the GC body: sign, length, inline digits.
 //! - [`digits`] — magnitude kernels writing into preallocated results.
 //! - [`ops`] — the operators: each sizes, allocates and fills its result.
 //! - [`dispatch`] — `BigInt(...)`, `BigInt.asIntN`, `BigInt.asUintN`.

@@ -1,6 +1,6 @@
 //! ECMA-262 §6.2.5 Property Descriptor types.
 //!
-//! Two-tier descriptor representation mirrors V8 / JSC / SpiderMonkey:
+//! Two-tier descriptor representation:
 //!
 //! - [`PropertyFlags`] — packed `(writable, enumerable, configurable)`
 //!   bitfield used in every stored slot.
@@ -254,12 +254,7 @@ impl PropertyDescriptor {
 ///
 /// Every field is optional and tracks **field presence** so the spec
 /// algorithms can distinguish "absent" from "present with value
-/// `false`". This is the same slot layout V8 / JSC / SpiderMonkey use
-/// for the user-facing descriptor type:
-///
-/// - V8 `PropertyDescriptor` (`property-descriptor.h`)
-/// - JSC `PropertyDescriptor` (`PropertyDescriptor.h`)
-/// - SpiderMonkey `Rooted<PropertyDescriptor>` (`PropertyDescriptor.h`)
+/// `false`".
 ///
 /// Once a partial descriptor reaches storage (the JsObject property
 /// slot table), it is completed into a [`PropertyDescriptor`] with

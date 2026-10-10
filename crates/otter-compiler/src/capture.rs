@@ -945,11 +945,11 @@ impl<'a> Visit<'a> for DirectEvalFinder {
 /// `true` when the body of one function, including its arrow functions but
 /// not its other nested functions, reads a `.arguments` property.
 ///
-/// Like SpiderMonkey, only such a function captures its actual arguments at
-/// call time: `fn.arguments` is almost always read inside `fn` itself. Any
-/// other running activation answers the accessor from its live parameter
-/// registers, so an unrelated `node.arguments` elsewhere in the unit does
-/// not pessimize every function.
+/// Only such a function captures its actual arguments at call time:
+/// `fn.arguments` is almost always read inside `fn` itself. Any other running
+/// activation answers the accessor from its live parameter registers, so an
+/// unrelated `node.arguments` elsewhere in the unit does not pessimize every
+/// function.
 #[must_use]
 pub fn function_body_reads_dot_arguments(
     params: &oxc_ast::ast::FormalParameters<'_>,

@@ -4,7 +4,7 @@
 //!
 //! # Contents
 //! - [`ClosureRareBody`] — GC body a closure points at once it needs any of
-//!   this state (JSC's `FunctionRareData`, V8's `FunctionRareData`).
+//!   this state.
 //! - [`alloc_closure_rare_with_roots`] — allocator.
 //!
 //! # Invariants
@@ -14,13 +14,13 @@
 //!   It owns an ordinary internal property table, never a JS exotic receiver.
 //!   Dictionary migration may retain an empty metadata sidecar; that does not
 //!   invalidate a matching shape with no overridden slot attributes.
-//! - `prototype` holds the function's `prototype` property (V8's
-//!   `prototype_or_initial_map`): the hole until the default object is
-//!   allocated, then its value. It never lives in the bag, so assigning
-//!   `F.prototype` gives the closure no own-property bag. The property is
-//!   non-enumerable and non-configurable; `prototype_writable` is its only
-//!   attribute that can change (true → false). Storing a different value
-//!   detaches every constructor family and clears `constructor_layouts`.
+//! - `prototype` holds the function's `prototype` property: the hole until
+//!   the default object is allocated, then its value. It never lives in the
+//!   bag, so assigning `F.prototype` gives the closure no own-property bag.
+//!   The property is non-enumerable and non-configurable;
+//!   `prototype_writable` is its only attribute that can change (true →
+//!   false). Storing a different value detaches every constructor family and
+//!   clears `constructor_layouts`.
 //! - `prototype_ordinary` is set exactly while `prototype` holds an ordinary
 //!   object: generated `instanceof` reads it in place of the slot's type.
 //! - `instanceof_cached` is set by generated `instanceof` when a site's cell

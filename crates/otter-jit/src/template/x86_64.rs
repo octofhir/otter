@@ -1550,10 +1550,10 @@ fn emit_slot_address(
     Ok(())
 }
 
-/// Inline own-field selection (JSC's baseline DataIC fast path): an ordinary
-/// receiver whose shape equals the slot's own-field pair leaves the field's
-/// bank base in `r8` and bank-relative index in `rax`; anything else jumps
-/// to `miss`. Clobbers `r8`, `r10`, `r11`, `rax`.
+/// Inline own-field selection: an ordinary receiver whose shape equals the
+/// slot's own-field pair leaves the field's bank base in `r8` and
+/// bank-relative index in `rax`; anything else jumps to `miss`. Clobbers
+/// `r8`, `r10`, `r11`, `rax`.
 fn emit_inline_own_field(
     ops: &mut Assembler,
     view: &JitCompileSnapshot,

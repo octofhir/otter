@@ -140,7 +140,7 @@ pub struct TemporalBody {
     /// (8 bytes) past the cell start, so an inline 16-aligned field
     /// would land on an 8-aligned address and trip the misaligned-read
     /// check. The `Box` moves the over-aligned record to a side
-    /// allocation, matching the V8-style rule that managed cells never
+    /// allocation, following the rule that managed cells never
     /// embed data needing more than pointer alignment.
     #[pelt(skip)]
     pub payload: Box<TemporalPayload>,

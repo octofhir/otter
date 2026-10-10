@@ -32,9 +32,6 @@
 //!
 //! # See also
 //!
-//! - V8 `LinearAllocationArea` (`src/heap/linear-allocation-area.h`) and
-//!   the new-space allocation top/limit external references compiled code
-//!   bumps inline; JSC `FreeList` bump intervals follow the same shape.
 //! - [`crate::heap::GcHeap`] — refill, retire and publication.
 
 /// Nursery bump window `[top, limit)` in absolute addresses.

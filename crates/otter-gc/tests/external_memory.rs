@@ -211,9 +211,9 @@ impl otter_gc::trace::Traceable for ExternalHolder {
 }
 
 const HOLDER_BYTES: u64 = 4 * 1024 * 1024;
-/// The external allocation soft limit (V8's `kExternalAllocationSoftLimit`):
-/// with no surviving reservations, dead payloads can accumulate to it plus
-/// one in-flight holder before the triggered collection reclaims them.
+/// The external allocation soft limit: with no surviving reservations, dead
+/// payloads can accumulate to it plus one in-flight holder before the
+/// triggered collection reclaims them.
 const EXTERNAL_SOFT_LIMIT_BYTES: u64 = 64 * 1024 * 1024;
 
 fn churn_dead_holders(heap: &mut otter_gc::GcHeap, count: usize) -> u64 {

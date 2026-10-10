@@ -4,8 +4,7 @@
 //! virtual cage. All GC pointers are 32-bit offsets relative to the
 //! cage base, decompressed to a real `*mut u8` via
 //! `cage_base + offset`. This halves heap-pointer footprint vs. raw
-//! 64-bit pointers and matches V8's sandbox shape (V8 blog,
-//! 2020-03 "Pointer Compression in V8").
+//! 64-bit pointers.
 //!
 //! # Contents
 //!
@@ -34,7 +33,6 @@
 //!
 //! - GC architecture plan §1.2 NF9 (pointer-compression invariants),
 //!   §2.3 ("Pointer compression — add in Phase 1").
-//! - V8 pointer compression: <https://v8.dev/blog/pointer-compression>.
 
 use std::alloc::{Layout, alloc, dealloc};
 use std::marker::PhantomData;
@@ -46,12 +44,12 @@ use crate::page::PAGE_SIZE;
 /// Default cage size when [`init_cage_with_size`] has not been
 /// called: 256 MiB on 64-bit hosts.
 ///
-/// Production embedders that want the full V8-shaped 4 GiB cage
+/// Production embedders that want the full 4 GiB cage
 /// must call `init_cage_with_size(4 * 1024 * 1024 * 1024)` before
 /// the first [`crate::heap::GcHeap::new`].
 pub const DEFAULT_CAGE_SIZE_BYTES: usize = 2 * 1024 * 1024 * 1024;
 
-/// Maximum cage size — V8's compressed-pointer cap. `Gc<T>` is a
+/// Maximum cage size — the compressed-pointer cap. `Gc<T>` is a
 /// `u32`, so the cage cannot exceed `u32::MAX + 1` bytes.
 pub const MAX_CAGE_SIZE_BYTES: usize = 1usize << 32;
 
@@ -599,9 +597,8 @@ impl Cage {
     /// from the cage's never-used tail rather than from the free list: the
     /// list holds pages in release order, so satisfying a run from it would
     /// mean searching for a gap, and the whole point of a bump cursor is
-    /// that fresh space is already contiguous. This is the shape V8's
-    /// `MemoryAllocator` uses — a reservation with a bump cursor for new
-    /// chunks and a free list for recycled ones.
+    /// that fresh space is already contiguous. The cage is a reservation
+    /// with a bump cursor for new chunks and a free list for recycled ones.
     ///
     /// Returns `None` when the tail cannot cover the run; a single-page
     /// caller still recycles through the free list.

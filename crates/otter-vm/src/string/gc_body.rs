@@ -30,8 +30,8 @@
 //!   of the code units for every representation, so equal content always has
 //!   equal hashes. Allocation, slicing, concatenation and flattening never
 //!   hash; rope equality and ordering stream the immutable code units.
-//! - A slice short enough for an inline body is copied into one (V8's
-//!   `SlicedString::kMinLength` rule): same cell size, no parent retention.
+//! - A slice short enough for an inline body is copied into one: same cell
+//!   size, no parent retention.
 //! - Cons depth never exceeds [`MAX_ROPE_DEPTH`]; concatenations
 //!   that would exceed it flatten the deeper child eagerly.
 //! - Slicing a flat body is O(1) for either storage width. Slicing a `Cons`
@@ -743,14 +743,14 @@ pub fn flatten_string_body(
 /// and rewrite the body's `repr` to a flat body (Latin-1 when every unit fits in
 /// a byte, else WTF-16). A no-op for already-flat bodies.
 ///
-/// This is the rope-flattening that production engines (V8, JSC) perform on
-/// first content access: a string built incrementally (`s += chunk`) is a rope,
-/// and every scan over it (`indexOf`, `includes`, `split`, …) would otherwise
-/// re-walk and re-materialize the whole rope. Flattening the shared body once
-/// makes every later access — and every later call on the same handle — hit the
-/// O(1) flat / Latin-1 fast paths with no allocation. The body keeps its `id`,
-/// `len`, and `hash` (content is unchanged), so every existing handle and
-/// interner entry stays valid; the old child handles simply become unreachable.
+/// Ropes are flattened on first content access: a string built incrementally
+/// (`s += chunk`) is a rope, and every scan over it (`indexOf`, `includes`,
+/// `split`, …) would otherwise re-walk and re-materialize the whole rope.
+/// Flattening the shared body once makes every later access — and every later
+/// call on the same handle — hit the O(1) flat / Latin-1 fast paths with no
+/// allocation. The body keeps its `id`, `len`, and `hash` (content is
+/// unchanged), so every existing handle and interner entry stays valid; the
+/// old child handles simply become unreachable.
 pub fn flatten_in_place(
     heap: &mut GcHeap,
     string: JsStringHandle,

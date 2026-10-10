@@ -1,5 +1,5 @@
-//! Generated BigInt arithmetic over one-digit operands (V8's BigInt64
-//! fast path).
+//! Generated BigInt arithmetic over one-digit operands (the BigInt64 fast
+//! path).
 //!
 //! # Contents
 //! - [`emit_unbox_bigint64`]: a BigInt whose value fits `i64` read into a

@@ -576,8 +576,7 @@ impl Interpreter {
         let cell = crate::alloc_upvalue(&mut self.gc_heap, Value::hole())?;
         self.global_lexicals.insert(name.into(), (cell, is_const));
         // Generated code reads a global-object property only while it is an
-        // own property: a lexical that shadows none invalidates no such read
-        // (V8 invalidates only the shadowed name's property cell).
+        // own property: a lexical that shadows none invalidates no such read.
         if shadowed.is_some() {
             self.global_lexical_epoch = self.global_lexical_epoch.wrapping_add(1);
         }

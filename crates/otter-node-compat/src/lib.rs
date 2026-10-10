@@ -425,10 +425,10 @@ fn ensure_node_tests_present(workspace_root: &Path) -> Result<()> {
     )
 }
 
-/// The subset of a test's `// Flags:` line the engine understands. V8-specific
-/// flags are skipped (the harness's own flag re-exec stays disabled), but the
-/// Node-level switches Otter implements are honored, so tests that assert on
-/// them run the way `node` runs them.
+/// The subset of a test's `// Flags:` line the engine understands.
+/// Engine-specific flags are skipped (the harness's own flag re-exec stays
+/// disabled), but the Node-level switches Otter implements are honored, so
+/// tests that assert on them run the way `node` runs them.
 fn supported_test_flags(file_path: &Path) -> Vec<String> {
     const SUPPORTED_PREFIXES: &[&str] = &[
         "--title=",
@@ -618,9 +618,9 @@ fn run_one_test(
                 .arg("--allow-all")
                 .args(supported_test_flags(file_path))
                 .arg(file_path)
-                // The harness's `common` re-execs the test with V8-specific
-                // `// Flags:`. Otter is a different engine, so disable that
-                // flag-reexec path.
+                // The harness's `common` re-execs the test with
+                // engine-specific `// Flags:`. Otter is a different engine,
+                // so disable that flag-reexec path.
                 .env("NODE_SKIP_FLAG_CHECK", "1")
                 // `common/tmpdir.js` names its scratch directory
                 // `.tmp.${TEST_SERIAL_ID}`, so a unique id per test is what

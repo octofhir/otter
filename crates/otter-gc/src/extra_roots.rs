@@ -39,10 +39,9 @@ pub trait ExtraRootSource {
     fn prepare_collection(&self, _heap: &GcHeap) {}
 
     /// Drop owner-held references to cells a full collection's marking left
-    /// unreached, before the sweep frees them (V8's weak-object processing,
-    /// SpiderMonkey's weak-table sweep). Mark bits are final: the ephemeron
-    /// fixpoint has run. The hook must not allocate, mark, reenter JavaScript
-    /// or retain the heap reference; it may only forget entries.
+    /// unreached, before the sweep frees them. Mark bits are final: the
+    /// ephemeron fixpoint has run. The hook must not allocate, mark, reenter
+    /// JavaScript or retain the heap reference; it may only forget entries.
     fn sweep_weak(&self, _heap: &GcHeap) {}
 
     /// Visit every mutable raw root slot owned by this source.

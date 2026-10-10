@@ -4,6 +4,8 @@
 //! - Nested arithmetic splices with different local instruction geometries.
 //! - Exact region ownership and disabled-capture compilation parity.
 //! - Generic-owning callee abandonment with accepted nested specialized bodies.
+//! - An abandoned callee drops the loop headers of a looping body spliced
+//!   into it.
 //!
 //! # Invariants
 //! Expected source positions come from the accepted graph origins and each
@@ -414,4 +416,68 @@ fn generic_window_owner_survives_nested_splices_and_abandoned_inline_source() {
             "inlined Generic has no baseline register window"
         ))
     ));
+}
+
+#[test]
+fn an_abandoned_callee_drops_the_loops_of_bodies_spliced_into_it() {
+    use Operand::{ConstIndex, Imm32, Register};
+    // `looping(n)` sums 0..n: a loop the middle body splices before its
+    // TypeOf, which needs a baseline activation, abandons the middle body.
+    let mut looping = snapshot(
+        301,
+        1,
+        4,
+        vec![
+            (Op::LoadInt32, vec![Register(1), Imm32(0)]),
+            (Op::LoadInt32, vec![Register(2), Imm32(0)]),
+            (Op::LessThan, vec![Register(3), Register(2), Register(0)]),
+            (Op::JumpIfFalse, vec![Imm32(3), Register(3)]),
+            (Op::Add, vec![Register(1), Register(1), Register(2)]),
+            (Op::AddImm, vec![Register(2), Register(2), Imm32(1)]),
+            (Op::Jump, vec![Imm32(-5)]),
+            (Op::ReturnValue, vec![Register(1)]),
+        ],
+    );
+    for pc in [2, 4, 5] {
+        looping.seed_arith_feedback_for_test(pc, ArithFeedback::from_bits(ARITH_INT32));
+    }
+    let mut middle = snapshot(
+        302,
+        1,
+        3,
+        vec![
+            (
+                Op::Call,
+                vec![Register(1), Register(0), ConstIndex(1), Register(0)],
+            ),
+            (Op::TypeOf, vec![Register(2), Register(1)]),
+            (Op::ReturnValue, vec![Register(2)]),
+        ],
+    );
+    offer(&mut middle, Arc::new(looping));
+    let mut root = snapshot(
+        300,
+        2,
+        3,
+        vec![
+            (
+                Op::Call,
+                vec![Register(2), Register(0), ConstIndex(1), Register(1)],
+            ),
+            (Op::ReturnValue, vec![Register(2)]),
+        ],
+    );
+    offer(&mut root, Arc::new(middle));
+    let transitions = crate::entry::TransitionTable::resolve();
+    let compiled = super::compile(&root, 7102, &transitions, None, false).unwrap();
+    let graph = &compiled.built.graph;
+    assert!(graph.inlined.is_empty(), "the middle body was abandoned");
+    assert!(
+        compiled
+            .built
+            .loop_headers
+            .iter()
+            .all(|header| (header.block.0 as usize) < graph.blocks.len()),
+        "no loop header names a rolled-back block"
+    );
 }

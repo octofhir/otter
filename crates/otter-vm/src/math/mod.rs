@@ -173,6 +173,16 @@ pub fn apply_f64(method: otter_bytecode::method_id::MathMethod, args: &[f64]) ->
     numbers(method, &nums).as_f64()
 }
 
+/// `Math.<method>` over already-coerced numbers, as the native computes it:
+/// the arithmetic the generated leaf entries share with the call path.
+#[must_use]
+pub(crate) fn apply_numbers(
+    method: otter_bytecode::method_id::MathMethod,
+    nums: &[NumberValue],
+) -> NumberValue {
+    numbers(method, nums)
+}
+
 fn call_numbers(method: otter_bytecode::method_id::MathMethod, nums: &[NumberValue]) -> Value {
     Value::number(numbers(method, nums))
 }

@@ -149,6 +149,10 @@ pub struct CodeEntryCell {
     /// retires its own frame. The interpreter destination's entry classifies
     /// the call through the trampoline, which builds the interpreter frame.
     pub entry_addr: AtomicU64,
+    /// Entry for a caller that proved the receiver an Object: a sloppy body
+    /// starts here past its receiver test. Equal to [`Self::entry_addr`] for
+    /// every other body and destination; zero after unlinking.
+    pub receiver_entry_addr: AtomicU64,
     /// Immutable isolate-local code-object identity.
     pub code_object_id: u64,
     /// Static properties of this compiled generation.
@@ -188,10 +192,10 @@ pub struct CodeEntryCell {
 
 impl CodeEntryCell {
     fn interpreter(function_id: u32, register_count: u16) -> Self {
+        let generic = super::call_trampoline::call_generic_entry as *const () as u64;
         Self {
-            entry_addr: AtomicU64::new(
-                super::call_trampoline::call_generic_entry as *const () as u64,
-            ),
+            entry_addr: AtomicU64::new(generic),
+            receiver_entry_addr: AtomicU64::new(generic),
             code_object_id: 0,
             flags: 0,
             active_count: AtomicU32::new(0),
@@ -208,6 +212,7 @@ impl CodeEntryCell {
     #[must_use]
     pub fn new(
         entry_addr: usize,
+        receiver_entry_addr: usize,
         code_object_id: u64,
         function_id: u32,
         register_count: u16,
@@ -215,6 +220,7 @@ impl CodeEntryCell {
         generated_tiering_work_target: Option<u64>,
     ) -> Self {
         debug_assert_ne!(entry_addr, 0);
+        debug_assert_ne!(receiver_entry_addr, 0);
         debug_assert_ne!(code_object_id, 0);
         let kind = if flags & CODE_ENTRY_OPTIMIZING_TIER != 0 {
             NativeFrameKind::Optimizing
@@ -228,6 +234,7 @@ impl CodeEntryCell {
         let frame_flags = NativeFrameFlags::from_bits(frame_flag_bits);
         Self {
             entry_addr: AtomicU64::new(entry_addr as u64),
+            receiver_entry_addr: AtomicU64::new(receiver_entry_addr as u64),
             code_object_id,
             flags,
             active_count: AtomicU32::new(0),
@@ -285,6 +292,7 @@ impl CodeEntryCell {
 
     /// Permanently reject new entries and return the previously linked address.
     pub fn unlink(&self) -> Option<usize> {
+        self.receiver_entry_addr.store(0, Ordering::Release);
         let previous = self.entry_addr.swap(0, Ordering::AcqRel);
         (previous != 0).then_some(previous as usize)
     }
@@ -340,7 +348,7 @@ impl Drop for CodeEntryLease<'_> {
     }
 }
 
-const _: [(); 96] = [(); std::mem::size_of::<FunctionEntryCell>()];
+const _: [(); 104] = [(); std::mem::size_of::<FunctionEntryCell>()];
 const _: [(); 8] = [(); std::mem::align_of::<FunctionEntryCell>()];
 const _: [(); 0] = [(); std::mem::offset_of!(FunctionEntryCell, generation_cell)];
 const _: [(); 8] = [(); std::mem::offset_of!(FunctionEntryCell, function_id)];
@@ -350,24 +358,30 @@ const _: [(); 16] = [(); FUNCTION_ENTRY_CALL_FLAGS_OFFSET];
 const _: [(); 20] = [(); FUNCTION_ENTRY_REALM_OFFSET];
 const _: [(); 24] = [(); FUNCTION_ENTRY_INTERPRETER_OFFSET];
 
-const _: [(); 72] = [(); std::mem::size_of::<CodeEntryCell>()];
-const _: [(); 40] = [(); std::mem::offset_of!(CodeEntryCell, generated_tiering_work_target)];
-const _: [(); 48] = [(); std::mem::offset_of!(CodeEntryCell, generated_tiering_enabled)];
+const _: [(); 80] = [(); std::mem::size_of::<CodeEntryCell>()];
+const _: [(); 48] = [(); std::mem::offset_of!(CodeEntryCell, generated_tiering_work_target)];
+const _: [(); 56] = [(); std::mem::offset_of!(CodeEntryCell, generated_tiering_enabled)];
 const _: [(); 8] = [(); std::mem::align_of::<CodeEntryCell>()];
 const _: [(); 0] = [(); std::mem::offset_of!(CodeEntryCell, entry_addr)];
-const _: [(); 8] = [(); std::mem::offset_of!(CodeEntryCell, code_object_id)];
-const _: [(); 16] = [(); std::mem::offset_of!(CodeEntryCell, flags)];
-const _: [(); 20] = [(); std::mem::offset_of!(CodeEntryCell, active_count)];
-const _: [(); 24] = [(); std::mem::offset_of!(CodeEntryCell, native_frame_header)];
-const _: [(); 36] = [(); std::mem::offset_of!(CodeEntryCell, native_frame_code_object_id)];
-const _: [(); 56] = [(); std::mem::offset_of!(CodeEntryCell, generated_entries)];
-const _: [(); 64] = [(); std::mem::offset_of!(CodeEntryCell, generated_deopts)];
+const _: [(); 8] = [(); std::mem::offset_of!(CodeEntryCell, receiver_entry_addr)];
+const _: [(); 16] = [(); std::mem::offset_of!(CodeEntryCell, code_object_id)];
+const _: [(); 24] = [(); std::mem::offset_of!(CodeEntryCell, flags)];
+const _: [(); 28] = [(); std::mem::offset_of!(CodeEntryCell, active_count)];
+const _: [(); 32] = [(); std::mem::offset_of!(CodeEntryCell, native_frame_header)];
+const _: [(); 44] = [(); std::mem::offset_of!(CodeEntryCell, native_frame_code_object_id)];
+const _: [(); 64] = [(); std::mem::offset_of!(CodeEntryCell, generated_entries)];
+const _: [(); 72] = [(); std::mem::offset_of!(CodeEntryCell, generated_deopts)];
 
 /// Bit zero of the private JS generation input identifies a trampoline-staged
 /// request. The code cell itself remains the sole aligned generation owner;
 /// entries clear this bit before any generation-cell dereference and consume
 /// the request's genuine caller return address before publishing their frame.
 pub const CODE_ENTRY_STAGED_REQUEST_MASK: u64 = 1;
+
+/// Byte offset of [`CodeEntryCell::receiver_entry_addr`], loaded by a
+/// generated call whose receiver is proved an Object.
+pub const CODE_ENTRY_RECEIVER_ENTRY_OFFSET: usize =
+    std::mem::offset_of!(CodeEntryCell, receiver_entry_addr);
 const _: () = assert!(std::mem::align_of::<CodeEntryCell>() > 1);
 
 #[cfg(test)]
@@ -375,7 +389,15 @@ mod tests {
     use super::*;
 
     fn cell() -> CodeEntryCell {
-        CodeEntryCell::new(0x1234, 7, 9, 12, CODE_ENTRY_HAS_SAFEPOINTS, Some(321))
+        CodeEntryCell::new(
+            0x1234,
+            0x1234,
+            7,
+            9,
+            12,
+            CODE_ENTRY_HAS_SAFEPOINTS,
+            Some(321),
+        )
     }
 
     #[test]
@@ -416,8 +438,8 @@ mod tests {
     #[test]
     fn generation_cell_keeps_one_function_identity_in_a_compact_layout() {
         let cell = cell();
-        assert_eq!(std::mem::size_of::<CodeEntryCell>(), 72);
+        assert_eq!(std::mem::size_of::<CodeEntryCell>(), 80);
         assert_eq!(cell.native_frame_header.function_id, 9);
-        assert_eq!(std::mem::offset_of!(CodeEntryCell, native_frame_header), 24);
+        assert_eq!(std::mem::offset_of!(CodeEntryCell, native_frame_header), 32);
     }
 }

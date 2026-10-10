@@ -2798,6 +2798,27 @@ impl<'a> Builder<'a> {
         }
     }
 
+    /// `object` passed a guard on one ordinary object shape; what kind of
+    /// cell a value is never changes.
+    fn prove_ordinary_object(&mut self, object: NodeId) {
+        let info = self.known.entry(object);
+        info.heap_object = true;
+        info.ordinary_object = true;
+    }
+
+    /// `receiver` passed a method guard on its exact `shape`, which holds
+    /// until a heap write may change it.
+    fn prove_receiver_shape(&mut self, receiver: NodeId, shape: u32) {
+        let layout = self.known.layout_entry(receiver);
+        match layout.shapes.as_ref() {
+            None => layout.writable = false,
+            Some(shapes) if shapes.contains(&shape) => {}
+            Some(_) => return self.prove_ordinary_object(receiver),
+        }
+        layout.shapes = Some(smallvec::smallvec![shape]);
+        self.prove_ordinary_object(receiver);
+    }
+
     fn check_shapes(&mut self, object: NodeId, shapes: &SmallVec<[u32; 4]>, writable: bool) {
         if let Some(layout) = self.known.layout(object)
             && let Some(known) = layout.shapes.as_ref()
@@ -2822,9 +2843,7 @@ impl<'a> Builder<'a> {
         let layout = self.known.layout_entry(object);
         layout.shapes = Some(shapes.clone());
         layout.writable = writable;
-        let info = self.known.entry(object);
-        info.heap_object = true;
-        info.ordinary_object = true;
+        self.prove_ordinary_object(object);
     }
 
     // ------------------------------------------------------------------
@@ -2974,6 +2993,7 @@ impl<'a> Builder<'a> {
                 plan: crate::call_linkage::CallPlan::for_site(self.view, instruction.byte_pc, plan),
                 construct,
                 receiver: false,
+                receiver_object: false,
                 allocation,
             },
             &inputs,
@@ -3020,12 +3040,18 @@ impl<'a> Builder<'a> {
         inputs.push(callee);
         inputs.push(receiver);
         inputs.extend(arguments.iter().copied());
+        // A sloppy callee converts a receiver that is not an Object; one
+        // proved here enters past that test.
+        let receiver_object = plan.is_some_and(|plan| {
+            plan.this_mode == otter_vm::jit::JitDirectCallThisMode::SloppyGlobal
+        }) && self.is_object(receiver) == Some(true);
         let node = self.add(
             Kind::CallJs {
                 pc: self.pc,
                 plan: crate::call_linkage::CallPlan::for_site(self.view, instruction.byte_pc, plan),
                 construct: false,
                 receiver: true,
+                receiver_object,
                 allocation: None,
             },
             &inputs,
@@ -3321,10 +3347,11 @@ impl<'a> Builder<'a> {
                 Repr::Tagged,
             );
             let view: &'a JitCompileSnapshot = self.view;
-            let body = view
-                .direct_methods
-                .get(&byte_pc)
-                .and_then(|methods| methods[0].body.as_ref());
+            let method = view.direct_methods.get(&byte_pc).map(|methods| &methods[0]);
+            if let Some(method) = method {
+                self.prove_receiver_shape(receiver, method.guard.recv_shape);
+            }
+            let body = method.and_then(|method| method.body.as_ref());
             // The guard proved an object receiver, which a non-arrow method
             // binds as `this`.
             if let Some(body) = body
@@ -3405,6 +3432,7 @@ impl<'a> Builder<'a> {
                 &[receiver],
                 Repr::Tagged,
             );
+            self.prove_receiver_shape(receiver, method.guard.recv_shape);
             let plan = method.callee.plan;
             let inlined = method.body.as_ref().is_some_and(|body| {
                 (!body.code_block.observes_this() || !body.code_block.is_arrow())

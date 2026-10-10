@@ -407,6 +407,7 @@ pub(crate) fn compile_optimized(
         code: OptimizedCode::new(
             code,
             emission.call_entry,
+            emission.receiver_entry,
             deopt,
             safepoints.into_boxed_slice(),
             emission.return_sites.into_boxed_slice(),

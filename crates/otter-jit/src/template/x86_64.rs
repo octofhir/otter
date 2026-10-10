@@ -179,7 +179,7 @@ pub(super) fn compile(
     dynasm!(ops ; .arch x64 ; jmp =>body);
     let call_entry = (!plan.osr_only).then(|| {
         let cold = CallEntryCold::new(&mut ops, shape);
-        let start = frame::emit_call_entry(
+        let entries = frame::emit_call_entry(
             &mut ops,
             &mut relocations,
             view,
@@ -187,11 +187,11 @@ pub(super) fn compile(
             SpillArea::NONE,
             cold,
         );
-        (start, cold)
+        (entries, cold)
     });
     dynasm!(ops ; .arch x64 ; =>body);
     if let Some(code_map) = code_map.as_mut()
-        && let Some((offset, _)) = call_entry.as_ref()
+        && let Some(((offset, _), _)) = call_entry.as_ref()
     {
         code_map.record_call_entry(offset.0);
     }
@@ -467,7 +467,10 @@ pub(super) fn compile(
         safepoint_records.into_boxed_slice(),
         return_sites.into_boxed_slice(),
         osr_entries,
-        call_entry.map(|(offset, _)| offset.0),
+        call_entry.map(|((offset, _), _)| offset.0),
+        call_entry
+            .filter(|((offset, receiver), _)| receiver != offset)
+            .map(|((_, receiver), _)| receiver.0),
         osr_only,
     );
     Ok(NativeCompileOutput {

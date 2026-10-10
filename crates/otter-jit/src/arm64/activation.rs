@@ -1,9 +1,9 @@
 //! Activation pieces shared by every AArch64 tier's call entry.
 //!
 //! # Contents
-//! - [`emit_object_receiver_test`] — the receiver a sloppy body binds as is.
 //! - [`emit_lexical_this`] — an arrow closure's `this` and `new.target`.
-//! - [`emit_object_test`] — the Object test of constructor completion.
+//! - [`emit_object_test`] — the Object test of constructor completion and
+//!   of a sloppy body's receiver.
 //!
 //! # Invariants
 //! - Call ABI registers: `x0` context, `x1` callee, `x2` receiver, `x3`
@@ -19,15 +19,6 @@ use otter_vm::{JitCompileSnapshot, value::tag};
 use crate::template::arm64::values::emit_load_u64;
 
 pub(crate) use crate::call_linkage::EntryShape;
-
-/// `x5 = 1` unless the receiver `x2` is an object, which binds as is.
-pub(crate) fn emit_object_receiver_test(ops: &mut Assembler, view: &JitCompileSnapshot) {
-    let bound = ops.new_dynamic_label();
-    let convert = ops.new_dynamic_label();
-    dynasm!(ops ; .arch aarch64 ; mov x5, xzr);
-    emit_object_test(ops, view, 2, bound, convert);
-    dynasm!(ops ; .arch aarch64 ; =>convert ; movz x5, 1 ; =>bound);
-}
 
 /// Branch to `object` when `X(value)` is an Object and to `primitive`
 /// otherwise. A function-id immediate is an object; every other non-cell and

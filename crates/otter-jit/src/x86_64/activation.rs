@@ -1,7 +1,6 @@
 //! Activation pieces shared by every x86-64 tier's call entry.
 //!
 //! # Contents
-//! - [`emit_object_receiver_test`] — the receiver a sloppy body binds as is.
 //! - [`emit_lexical_this`] — an arrow closure's `this` and `new.target`.
 //! - [`emit_object_test`] — the Object test of constructor completion.
 //!
@@ -22,15 +21,6 @@
 
 use dynasmrt::{DynamicLabel, DynasmApi, DynasmLabelApi, dynasm, x64::Assembler};
 use otter_vm::{JitCompileSnapshot, value::tag};
-
-/// `r9 = 1` unless the receiver `rdx` is an object, which binds as is.
-pub(crate) fn emit_object_receiver_test(ops: &mut Assembler, view: &JitCompileSnapshot) {
-    let bound = ops.new_dynamic_label();
-    let convert = ops.new_dynamic_label();
-    dynasm!(ops ; .arch x64 ; xor r9d, r9d);
-    emit_object_test(ops, view, 2, bound, convert);
-    dynasm!(ops ; .arch x64 ; =>convert ; mov r9d, 1 ; =>bound);
-}
 
 /// Jump to `object` when `Rq(value)` is an Object and to `primitive`
 /// otherwise. A function-id immediate is an object; every other non-cell and

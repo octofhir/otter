@@ -180,6 +180,7 @@ fn emit_target_call(
         CallTarget::Known {
             entry_cell,
             function_id,
+            receiver_ready,
         } => {
             let start = ops.offset().0;
             dynasm!(ops ; .arch x64 ; mov r11, QWORD entry_cell as i64);
@@ -189,11 +190,17 @@ fn emit_target_call(
                 11,
                 RelocationTarget::FunctionEntryCell { function_id },
             );
-            dynasm!(ops
-                ; .arch x64
-                ; mov r9, [r11]
-                ; call QWORD [r9]
-            );
+            dynasm!(ops ; .arch x64 ; mov r9, [r11]);
+            // A receiver proved an Object enters past a sloppy callee's
+            // receiver test.
+            if receiver_ready {
+                dynasm!(ops
+                    ; .arch x64
+                    ; call QWORD [r9 + abi::CODE_ENTRY_RECEIVER_ENTRY_OFFSET as i32]
+                );
+            } else {
+                dynasm!(ops ; .arch x64 ; call QWORD [r9]);
+            }
         }
         CallTarget::Generic | CallTarget::Native => {
             let stub = match target {
@@ -227,6 +234,7 @@ pub(crate) fn emit_tail_branch(
         CallTarget::Known {
             entry_cell,
             function_id,
+            ..
         } => {
             let start = ops.offset().0;
             dynasm!(ops ; .arch x64 ; mov r11, QWORD entry_cell as i64);

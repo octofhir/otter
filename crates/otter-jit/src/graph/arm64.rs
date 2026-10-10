@@ -352,15 +352,15 @@ pub(crate) fn emit(
         spill.saved_pairs,
         call_entry_cold,
     );
-    let call_entry = crate::arm64::frame::emit_call_entry(
+    let (call_entry, receiver_entry) = crate::arm64::frame::emit_call_entry(
         &mut codegen.ops,
         &mut codegen.relocations,
         view,
         shape,
         spill,
         call_entry_cold,
-    )
-    .0;
+    );
+    let (call_entry, receiver_entry) = (call_entry.0, receiver_entry.0);
     dynasm!(codegen.ops ; .arch aarch64 ; =>body);
     codegen.emit_body()?;
     let body_end = codegen.ops.offset().0;
@@ -414,6 +414,7 @@ pub(crate) fn emit(
         buffer,
         tier_entry,
         call_entry,
+        receiver_entry: (receiver_entry != call_entry).then_some(receiver_entry),
         exits,
         relocations,
         node_offsets,
@@ -1760,11 +1761,26 @@ impl<'a> Codegen<'a> {
                 plan,
                 construct,
                 receiver,
+                receiver_object,
                 allocation,
             } => {
-                let (pc, plan, construct, receiver, allocation) =
-                    (*pc, *plan, *construct, *receiver, *allocation);
-                self.emit_call_js(node, pc, plan, construct, receiver, allocation)?;
+                let (pc, plan, construct, receiver, receiver_object, allocation) = (
+                    *pc,
+                    *plan,
+                    *construct,
+                    *receiver,
+                    *receiver_object,
+                    *allocation,
+                );
+                self.emit_call_js(
+                    node,
+                    pc,
+                    plan,
+                    construct,
+                    receiver,
+                    receiver_object,
+                    allocation,
+                )?;
             }
             Kind::CallForward { plan, bindings, .. } => {
                 let (plan, bindings) = (*plan, bindings.clone());
@@ -3748,6 +3764,7 @@ impl<'a> Codegen<'a> {
     /// the proof refuses takes the generic entry with the same span. A callee
     /// that retired itself for a tail call it staged returns `Continue`, and
     /// the staged call is entered in its place.
+    #[allow(clippy::too_many_arguments)]
     fn emit_call_js(
         &mut self,
         node: NodeId,
@@ -3755,6 +3772,7 @@ impl<'a> Codegen<'a> {
         plan: crate::call_linkage::CallPlan,
         construct: bool,
         receiver: bool,
+        receiver_object: bool,
         allocation: Option<otter_vm::jit::JitReceiverAllocationPlan>,
     ) -> Result<(), Unsupported> {
         // `new.target` is the callee itself, already in `x1`; an explicit
@@ -3820,6 +3838,7 @@ impl<'a> Codegen<'a> {
                 CallTarget::Known {
                     entry_cell: plan.entry_cell,
                     function_id: plan.function_id,
+                    receiver_ready: receiver_object,
                 },
             );
             self.record_js_return(node, return_pc)?;
@@ -3918,6 +3937,7 @@ impl<'a> Codegen<'a> {
                 CallTarget::Known {
                     entry_cell: plan.entry_cell,
                     function_id: plan.function_id,
+                    receiver_ready: false,
                 },
             );
             self.record_js_return(node, return_pc)?;

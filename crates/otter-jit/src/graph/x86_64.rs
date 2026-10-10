@@ -218,15 +218,15 @@ pub(crate) fn emit(
         activation,
         cold,
     );
-    let call_entry = crate::x86_64::frame::emit_call_entry(
+    let (call_entry, receiver_entry) = crate::x86_64::frame::emit_call_entry(
         &mut codegen.ops,
         &mut codegen.relocations,
         view,
         shape,
         spill,
         cold,
-    )
-    .0;
+    );
+    let (call_entry, receiver_entry) = (call_entry.0, receiver_entry.0);
     dynasm!(codegen.ops ; .arch x64 ; =>body);
     codegen.emit_body()?;
     let body_end = codegen.ops.offset().0;
@@ -265,6 +265,7 @@ pub(crate) fn emit(
         buffer: crate::entry::finalize_assembler(ops)?,
         tier_entry,
         call_entry,
+        receiver_entry: (receiver_entry != call_entry).then_some(receiver_entry),
         exits,
         relocations,
         node_offsets,
@@ -480,9 +481,18 @@ impl<'a> Codegen<'a> {
                 plan,
                 construct,
                 receiver,
+                receiver_object,
                 allocation,
             } => {
-                self.emit_call_js(node, *pc, *plan, *construct, *receiver, *allocation)?;
+                self.emit_call_js(
+                    node,
+                    *pc,
+                    *plan,
+                    *construct,
+                    *receiver,
+                    *receiver_object,
+                    *allocation,
+                )?;
             }
             Kind::CallForward { pc, plan, bindings } => {
                 self.emit_call_forward(node, *pc, *plan, bindings)?

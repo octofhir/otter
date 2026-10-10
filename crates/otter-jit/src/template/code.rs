@@ -52,6 +52,9 @@ pub struct TemplateCode {
     /// Offset of the JavaScript call ABI entry, which builds this function's
     /// own frame; absent for a body entered only over an interpreter frame.
     call_entry: Option<usize>,
+    /// Offset of the entry for a caller that proved the receiver an Object,
+    /// when it differs from the call entry.
+    receiver_entry: Option<usize>,
     /// `true` when unsupported opcodes were lowered to exact side exits;
     /// entry selection skips such code and only loop OSR uses it.
     osr_only: bool,
@@ -71,6 +74,7 @@ impl TemplateCode {
         return_sites: Box<[SafepointEntry]>,
         osr_entries: std::collections::BTreeMap<u32, usize>,
         call_entry: Option<usize>,
+        receiver_entry: Option<usize>,
         osr_only: bool,
     ) -> Self {
         let metadata = CodeObjectMetadata {
@@ -97,6 +101,7 @@ impl TemplateCode {
                 .collect::<Vec<_>>()
                 .into_boxed_slice(),
             call_entry,
+            receiver_entry,
             osr_only,
         }
     }
@@ -195,6 +200,13 @@ impl JitFunctionCode for TemplateCode {
             .map(|offset| unsafe { self.code.ptr_at(offset) as usize })
     }
 
+    fn receiver_entry_addr(&self) -> Option<usize> {
+        // SAFETY: the assembler recorded this entry in the live mapping.
+        self.receiver_entry
+            .or(self.call_entry)
+            .map(|offset| unsafe { self.code.ptr_at(offset) as usize })
+    }
+
     fn dependencies(&self) -> &[CodeDependency] {
         &self.dependencies
     }
@@ -281,6 +293,7 @@ mod tests {
             Box::new([SafepointRecord::window(1, NO_FRAME_STATE)]),
             Box::new([]),
             [(2, 0), (7, 0)].into_iter().collect(),
+            None,
             None,
             false,
         );

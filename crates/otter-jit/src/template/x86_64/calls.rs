@@ -256,6 +256,7 @@ pub(super) fn emit_call(
                 CallTarget::Known {
                     entry_cell: plan.entry_cell,
                     function_id: plan.function_id,
+                    receiver_ready: false,
                 },
             )
         })
@@ -341,6 +342,7 @@ pub(super) fn emit_tail_call(
                 CallTarget::Known {
                     entry_cell: plan.entry_cell,
                     function_id: plan.function_id,
+                    receiver_ready: false,
                 },
             )
         })
@@ -476,6 +478,7 @@ pub(super) fn emit_method_call(
                 CallTarget::Known {
                     entry_cell: plan.entry_cell,
                     function_id: plan.function_id,
+                    receiver_ready: false,
                 },
                 dst,
                 throw_value,

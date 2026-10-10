@@ -1338,6 +1338,7 @@ impl Interpreter {
         context: &ExecutionContext,
     ) {
         view.property_action_cache = Some(self.property_cache.jit_layout());
+        view.backedge_fuel_cell = self.interrupt.fuel_ptr() as usize;
         let sites: Vec<_> = view
             .instructions
             .iter()

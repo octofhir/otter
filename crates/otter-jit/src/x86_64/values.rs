@@ -72,6 +72,31 @@ pub(crate) fn emit_load_u64(ops: &mut Assembler, register: u8, value: u64) {
     }
 }
 
+/// Put the address of the isolate's back-edge fuel countdown in `register`:
+/// the baked cell's address, or the thread record's pointer when the
+/// snapshot carries none. Clobbers only `register`.
+pub(crate) fn emit_load_backedge_fuel_cell(
+    ops: &mut Assembler,
+    relocations: &mut RelocationCapture,
+    register: u8,
+    cell: usize,
+) {
+    if cell != 0 {
+        emit_load_symbol_u64(
+            ops,
+            relocations,
+            register,
+            cell as u64,
+            RelocationTarget::BackedgeFuelCell,
+        );
+    } else {
+        dynasm!(ops ; .arch x64
+            ; mov Rq(register), [r15 + crate::entry::THREAD_OFFSET as i32]
+            ; mov Rq(register), [Rq(register) + crate::entry::VM_THREAD_BACKEDGE_FUEL_CELL_OFFSET as i32]
+        );
+    }
+}
+
 pub(crate) fn emit_load_symbol_u64(
     ops: &mut Assembler,
     relocations: &mut RelocationCapture,

@@ -605,6 +605,10 @@ pub struct JitCompileSnapshot {
     /// to a compressed `Gc` offset to decompress an object pointer without a
     /// runtime load. `0` when no inline access is baked.
     pub cage_base: usize,
+    /// Address of the isolate's back-edge fuel countdown, stable for the
+    /// isolate's life: a loop poll decrements it in place instead of reaching
+    /// it through the thread record. `0` when not baked.
+    pub backedge_fuel_cell: usize,
     /// Static heap-layout offsets for inline typed-array element access. Baked
     /// once at compile time from `otter-vm`'s `#[repr(C)]` body layouts so the
     /// emitter stays layout-agnostic.
@@ -2001,6 +2005,7 @@ impl JitCompileSnapshot {
             derived_constructor: false,
             literal_allocations: JitLiteralAllocationPlans::default(),
             cage_base: 0,
+            backedge_fuel_cell: 0,
             array_layout: JitArrayLayout::default(),
             element_accesses: rustc_hash::FxHashMap::default(),
             array_iteration: None,

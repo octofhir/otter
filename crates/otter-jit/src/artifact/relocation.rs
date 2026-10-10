@@ -65,6 +65,7 @@ const TARGET_CALLEE_IDENTITY_CELL: u8 = 16;
 const TARGET_ARITH_FEEDBACK_CELL: u8 = 17;
 const TARGET_SOURCE_WORK_CELL: u8 = 18;
 const TARGET_INSTANCEOF_CELL: u8 = 19;
+const TARGET_BACKEDGE_FUEL_CELL: u8 = 20;
 const TARGET_PROTOTYPE_VALIDITY_CELL: u8 = 15;
 
 /// Whether a named-property probe serves a load or a store site.
@@ -168,6 +169,8 @@ pub(crate) enum RelocationTarget {
         function_id: u32,
         pc: u32,
     },
+    /// The isolate's back-edge fuel countdown, decremented by every loop poll.
+    BackedgeFuelCell,
 }
 
 impl RelocationTarget {
@@ -1568,6 +1571,7 @@ fn encode_target(target: &RelocationTarget, output: &mut Vec<u8>) -> Result<(), 
             put_u32(output, *function_id);
             put_u32(output, *pc);
         }
+        RelocationTarget::BackedgeFuelCell => output.push(TARGET_BACKEDGE_FUEL_CELL),
     }
     Ok(())
 }

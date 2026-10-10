@@ -303,7 +303,14 @@ fn a_collecting_branch_invalidates_the_base_at_the_join() {
 }
 
 #[test]
-fn loop_and_osr_headers_reload_bases_that_licm_cannot_hoist() {
+fn loop_bases_move_to_the_preheader_across_the_no_alloc_poll() {
+    // A loop that calls nothing collects nowhere: its back edge's poll is a
+    // no-allocation leaf, so even a raw base into a movable slab may live
+    // across it.
+    assert_eq!(
+        otter_vm::native_abi::STUB_JIT_BACKEDGE_POLL.class,
+        otter_vm::native_abi::RuntimeStubClass::LeafNoAlloc
+    );
     for element in [JitElementRepr::Boxed, JitElementRepr::Float64] {
         for osr_pc in [None, Some(1)] {
             let mut view = snapshot(
@@ -345,22 +352,11 @@ fn loop_and_osr_headers_reload_bases_that_licm_cannot_hoist() {
             assert_eq!(built.graph.node(header_base).block, Some(header));
             licm::hoist_invariants(&mut built.graph, &mut built.layout, &built.loop_headers);
             assert_eq!(bases(&built), old_bases);
-            assert_eq!(
+            assert_ne!(
                 built.graph.node(header_base).block,
                 Some(header),
-                "LICM keeps the loop-header base load inside the loop"
+                "LICM moves the loop-header base load into the pre-header"
             );
-            let polls: Vec<_> = built
-                .graph
-                .nodes
-                .iter()
-                .enumerate()
-                .filter_map(|(index, node)| {
-                    matches!(node.kind, Kind::JumpLoop(_)).then_some(NodeId(index as u32))
-                })
-                .collect();
-            assert_eq!(polls.len(), 1);
-            assert_no_base_crosses(&built, polls[0]);
         }
     }
 }

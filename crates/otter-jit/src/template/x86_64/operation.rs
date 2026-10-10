@@ -92,6 +92,7 @@ pub(crate) fn emit_operation(
                 emit_backedge_poll(
                     ops,
                     relocations,
+                    view.backedge_fuel_cell,
                     transitions.entry(abi::STUB_JIT_BACKEDGE_POLL),
                     target,
                     backedge_relink,
@@ -118,6 +119,7 @@ pub(crate) fn emit_operation(
                 emit_backedge_poll(
                     ops,
                     relocations,
+                    view.backedge_fuel_cell,
                     transitions.entry(abi::STUB_JIT_BACKEDGE_POLL),
                     target,
                     backedge_relink,
@@ -144,6 +146,7 @@ pub(crate) fn emit_operation(
                 emit_backedge_poll(
                     ops,
                     relocations,
+                    view.backedge_fuel_cell,
                     transitions.entry(abi::STUB_JIT_BACKEDGE_POLL),
                     target,
                     backedge_relink,

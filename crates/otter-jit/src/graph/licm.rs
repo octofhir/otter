@@ -13,9 +13,10 @@
 //!   transition a layout or grow storage, they leave instead. A shape check
 //!   also needs a loop that changes no shape; a context slot load needs a
 //!   loop that stores to no slot at its offset; a global binding read needs
-//!   a loop that stores no object property. Only an off-heap element base
-//!   moves: a raw base into a movable slab must not live across the
-//!   back edge's poll. Context parents never change.
+//!   a loop that stores no object property. An element base moves too, a
+//!   raw base into a movable slab included: nothing in the loop collects,
+//!   and the back edge's poll is a no-allocation leaf
+//!   (`STUB_JIT_BACKEDGE_POLL`). Context parents never change.
 //! - A moved node reads only values defined before the loop, values moved
 //!   before it, or a header phi the loop never changes, which it reads as
 //!   the value entering the loop.
@@ -170,8 +171,10 @@ fn hoist_loop(
                 Kind::CheckElements { .. } | Kind::LoadContextParent => true,
                 Kind::CheckShapes { .. } => !clobbers.shapes,
                 Kind::LoadElementsLength { .. } => !clobbers.lengths,
-                // A movable slab base must not live across the loop's poll.
-                Kind::LoadElementsBase { off_heap, .. } => *off_heap && !clobbers.lengths,
+                // The loop runs nothing that collects: its back edge's poll
+                // is a no-allocation leaf, so even a base into a movable slab
+                // stays valid across it.
+                Kind::LoadElementsBase { .. } => !clobbers.lengths,
                 Kind::LoadGlobalBinding(_) => !clobbers.properties,
                 Kind::LoadTaggedField(offset) => {
                     data.inputs

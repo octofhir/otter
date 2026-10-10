@@ -366,6 +366,7 @@ impl CodeBlock {
             // Baked by `Interpreter::compile_jit_function`, which holds the
             // cage base and the live property-IC tables.
             cage_base: 0,
+            backedge_fuel_cell: 0,
             // Baked alongside `cage_base` by `compile_jit_function`; the
             // all-zero default is never read because the emitter gates inline
             // element access on `cage_base != 0`.

@@ -54,6 +54,33 @@ pub(crate) fn emit_fjcvtzs(ops: &mut dynasmrt::aarch64::Assembler, source: u8, d
 
 pub(crate) use method_guard::{MethodGuardSite, emit_method_guard};
 
+/// Put the address of the isolate's back-edge fuel countdown in `register`:
+/// one literal load of the baked cell, or the thread record's pointer when
+/// the snapshot carries none. Clobbers only `register`.
+pub(crate) fn emit_load_backedge_fuel_cell(
+    ops: &mut dynasmrt::aarch64::Assembler,
+    relocations: &mut crate::artifact::relocation::RelocationCapture,
+    register: u8,
+    cell: usize,
+) {
+    use dynasmrt::{DynasmApi, dynasm};
+    if cell != 0 {
+        crate::template::arm64::values::emit_load_symbol_u64(
+            ops,
+            relocations,
+            register,
+            cell as u64,
+            crate::artifact::relocation::RelocationTarget::BackedgeFuelCell,
+        );
+    } else {
+        dynasm!(ops
+            ; .arch aarch64
+            ; ldr X(register), [x20, crate::entry::THREAD_OFFSET]
+            ; ldr X(register), [X(register), crate::entry::VM_THREAD_BACKEDGE_FUEL_CELL_OFFSET]
+        );
+    }
+}
+
 /// Largest bytecode body whose code loads symbols from a literal pool: its
 /// code, about twelve bytes per bytecode byte plus inlined bodies, stays
 /// well within the ±1 MiB reach of `LDR (literal)`.

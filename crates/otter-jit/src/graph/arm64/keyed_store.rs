@@ -1,10 +1,10 @@
-//! Generic element stores: V8's `KeyedStoreIC_Megamorphic` for a site the
-//! optimizer does not specialize.
+//! Generic element stores for a site the optimizer does not specialize.
 //!
 //! # Contents
 //! - [`Codegen::emit_store_keyed_cached`] stores into an Array's dense
-//!   storage of any kind inline, a name key through the code object's keyed
-//!   table routine, and every other store in the runtime.
+//!   storage of any kind inline, appends at its length through the VM's
+//!   push leaf, a name key through the code object's keyed table routine,
+//!   and every other store in the runtime.
 //!
 //! # Invariants
 //! - Every guard precedes the one store; a failed guard has written nothing
@@ -15,6 +15,9 @@
 //! - A store into numeric storage fills its hole as the VM does: the bit is
 //!   cleared and counted, and the last one makes the storage packed. A
 //!   tagged cell value takes the element write barrier.
+//! - An append is an ordinary own addition under the same permit as a
+//!   hole store; the push leaf completes it only within the storage's
+//!   capacity and its own dense-range guards, so it never allocates.
 //! - The keyed table routine neither allocates nor collects; the runtime
 //!   operation grows storage and records the site's feedback.
 //!
@@ -22,7 +25,10 @@
 //! - [`super::Codegen::emit_store_element`] for the speculative store.
 //! - `otter_vm::jit::JitArrayStorage` for the storage this reads.
 
-use super::{Codegen, CommittedArgument, DynamicLabel, NodeId, THREAD_OFFSET, VALUE_HOLE, abi};
+use super::{
+    Codegen, CommittedArgument, DynamicLabel, NodeId, RelocationTarget, THREAD_OFFSET, VALUE_HOLE,
+    VM_THREAD_GC_HEAP_OFFSET, abi, emit_load_symbol_u64,
+};
 use crate::Unsupported;
 use crate::entry::VM_THREAD_ARRAY_INDEX_PROTECTOR_CELL_OFFSET;
 use dynasmrt::{DynasmApi, DynasmLabelApi, dynasm};
@@ -48,6 +54,7 @@ impl Codegen<'_> {
         let holey = self.ops.new_dynamic_label();
         let store_double = self.ops.new_dynamic_label();
         let store_tagged = self.ops.new_dynamic_label();
+        let in_bounds = self.ops.new_dynamic_label();
         dynasm!(self.ops
             ; .arch aarch64
             ; tst X(receiver), #0xfffe_0000_0000_0007
@@ -64,7 +71,15 @@ impl Codegen<'_> {
             ; tbnz W(key), 31, =>runtime
             ; ldr W(length), [X(receiver), storage.length_byte]
             ; cmp W(length), W(key)
-            ; b.ls =>runtime
+            ; b.hi =>in_bounds
+            ; b.ne =>runtime
+        );
+        // A key at the length appends.
+        self.emit_hole_store_permit(storage, receiver, runtime);
+        self.emit_array_push_leaf(node, [receiver, key, value], runtime, done);
+        dynasm!(self.ops
+            ; .arch aarch64
+            ; =>in_bounds
             ; ldr X(base), [X(receiver), storage.base_byte]
             ; ldrb w17, [X(receiver), numeric.kind_byte]
             ; cmp w17, u32::from(storage.tagged_kind)
@@ -163,6 +178,54 @@ impl Codegen<'_> {
             ; bl =>routine
             ; mov x17, x1
         );
+        self.emit_restore_registers(&live, saved);
+        dynasm!(self.ops
+            ; .arch aarch64
+            ; ldr X(receiver), [sp]
+            ; ldr X(key), [sp, #8]
+            ; ldr X(value), [sp, #16]
+            ; add sp, sp, PARKED_BYTES
+            ; cbz x17, =>stored
+            ; b =>missed
+        );
+    }
+
+    /// Append `X(value)` to the Array in `X(receiver)` through the VM's push
+    /// leaf: to `stored` when it appended, else to `missed` with every
+    /// register as it was. The leaf refuses a full storage or a range its
+    /// own guards do not admit, and never allocates.
+    fn emit_array_push_leaf(
+        &mut self,
+        node: NodeId,
+        [receiver, key, value]: [u8; 3],
+        missed: DynamicLabel,
+        stored: DynamicLabel,
+    ) {
+        let leaf = otter_vm::runtime_stubs::ARRAY_PUSH_LEAF;
+        let live = self.allocation.node(node).live_registers.clone();
+        dynasm!(self.ops
+            ; .arch aarch64
+            ; sub sp, sp, PARKED_BYTES
+            ; str X(receiver), [sp]
+            ; str X(key), [sp, #8]
+            ; str X(value), [sp, #16]
+        );
+        let saved = self.emit_save_registers(&live);
+        dynasm!(self.ops
+            ; .arch aarch64
+            ; ldr x1, [sp, saved]
+            ; ldr x2, [sp, saved + 16]
+            ; ldr x0, [x20, THREAD_OFFSET]
+            ; ldr x0, [x0, VM_THREAD_GC_HEAP_OFFSET]
+        );
+        emit_load_symbol_u64(
+            &mut self.ops,
+            &mut self.relocations,
+            16,
+            leaf.entry_addr() as u64,
+            RelocationTarget::runtime_stub(leaf.descriptor),
+        );
+        dynasm!(self.ops ; .arch aarch64 ; blr x16 ; mov x17, x1);
         self.emit_restore_registers(&live, saved);
         dynasm!(self.ops
             ; .arch aarch64

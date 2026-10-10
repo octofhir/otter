@@ -1017,6 +1017,24 @@ impl CodeUnits<'_> {
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
+
+    /// The code unit at `index`, widened to UTF-16.
+    #[must_use]
+    pub fn get(&self, index: usize) -> Option<u16> {
+        match self {
+            Self::Latin1(bytes) => bytes.get(index).map(|&byte| u16::from(byte)),
+            Self::Utf16(units) => units.get(index).copied(),
+        }
+    }
+
+    /// The units in `range`, at the same width.
+    #[must_use]
+    pub fn slice(&self, range: std::ops::Range<usize>) -> Self {
+        match self {
+            Self::Latin1(bytes) => CodeUnits::Latin1(&bytes[range]),
+            Self::Utf16(units) => CodeUnits::Utf16(&units[range]),
+        }
+    }
 }
 
 /// Run `f` over the string's code units at their stored width.

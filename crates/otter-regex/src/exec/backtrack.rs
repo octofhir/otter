@@ -28,12 +28,12 @@
 //! # See also
 //! - <https://tc39.es/ecma262/#sec-pattern-matching>
 
-use smallvec::{SmallVec, smallvec};
+use smallvec::SmallVec;
 
 use super::ExecConfig;
 use crate::casefold::{ascii_other_case, canonicalize, fold_unicode};
 use crate::classes::ClassSet;
-use crate::cursor::Input;
+use crate::cursor::{Input, Unit};
 use crate::error::ExecError;
 use crate::program::{Insn, Program, RepeatAtom};
 
@@ -54,14 +54,16 @@ type UndoEntry = (usize, Option<usize>);
 
 /// Reusable per-attempt buffers.
 ///
-/// The backtrack stack and undo log are the same shape for every match attempt,
-/// so a global search (`/g`) that probes many start offsets keeps one of each
-/// and clears them per attempt instead of allocating fresh `Vec`s each time.
-/// Nested lookaround evaluation still uses its own transient buffers.
+/// The backtrack stack, undo log and capture slots are the same shape for
+/// every match attempt, so a search that probes many start offsets keeps one
+/// of each and resets them per attempt instead of allocating fresh buffers at
+/// every offset. Nested lookaround evaluation still uses its own transient
+/// buffers.
 #[derive(Debug, Default)]
 pub(crate) struct Scratch {
     stack: Vec<Frame>,
     log: Vec<UndoEntry>,
+    caps: Caps,
 }
 
 impl Scratch {
@@ -69,42 +71,42 @@ impl Scratch {
     pub(crate) fn new() -> Self {
         Self::default()
     }
+
+    /// The capture slots of the last successful [`attempt`].
+    pub(crate) fn captures(&self) -> &[Option<usize>] {
+        &self.caps
+    }
 }
 
 /// Try to match `program` against `input` beginning exactly at code-unit offset
-/// `at`. Returns the filled capture slots on success. `scratch` is reused across
-/// successive attempts on the same subject to avoid a per-attempt allocation.
-pub(crate) fn attempt(
+/// `at`. On success the filled capture slots are [`Scratch::captures`].
+/// `scratch` is reused across successive attempts on the same subject to avoid
+/// a per-attempt allocation.
+pub(crate) fn attempt<U: Unit>(
     program: &Program,
-    input: &Input<'_>,
+    input: &Input<'_, U>,
     at: usize,
     config: ExecConfig,
     scratch: &mut Scratch,
-) -> (Result<Option<Caps>, ExecError>, u64) {
+) -> (Result<bool, ExecError>, u64) {
     let mut m = Matcher {
         program,
         input,
         steps: 0,
         step_limit: config.step_limit,
     };
-    let mut caps: Caps = smallvec![None; program.slot_count()];
+    let Scratch { stack, log, caps } = scratch;
+    caps.clear();
+    caps.resize(program.slot_count(), None);
     // Seed the overall-match start; the lowering no longer emits a `Save(0)`.
     caps[0] = Some(at);
-    let mut stack = core::mem::take(&mut scratch.stack);
-    let mut log = core::mem::take(&mut scratch.log);
-    let result = m.run(0, at, false, caps, &mut stack, &mut log);
-    let steps = m.steps;
-    scratch.stack = stack;
-    scratch.log = log;
-    (
-        result.map(|matched| matched.map(|(_, captures)| captures)),
-        steps,
-    )
+    let result = m.run(0, at, false, caps, stack, log);
+    (result.map(|matched| matched.is_some()), m.steps)
 }
 
-struct Matcher<'p, 't> {
+struct Matcher<'p, 't, U: Unit> {
     program: &'p Program,
-    input: &'p Input<'t>,
+    input: &'p Input<'t, U>,
     steps: u64,
     step_limit: u64,
 }
@@ -136,7 +138,7 @@ enum Resume {
     RepeatLazy { high: usize },
 }
 
-impl Matcher<'_, '_> {
+impl<U: Unit> Matcher<'_, '_, U> {
     /// Run from `entry` at `start`. `backward` runs the region with direction
     /// -1: every consuming instruction matches the input before the current
     /// position and moves it left.
@@ -145,10 +147,10 @@ impl Matcher<'_, '_> {
         entry: usize,
         start: usize,
         backward: bool,
-        mut caps: Caps,
+        caps: &mut Caps,
         stack: &mut Vec<Frame>,
         log: &mut Vec<UndoEntry>,
-    ) -> Result<Option<(usize, Caps)>, ExecError> {
+    ) -> Result<Option<usize>, ExecError> {
         stack.clear();
         log.clear();
         stack.push(Frame {
@@ -238,7 +240,7 @@ impl Matcher<'_, '_> {
                         } else {
                             (pos, pos + seq.len())
                         };
-                        if hi <= units.len() && seq_eq(&units[lo..hi], seq) {
+                        if hi <= units.len() && U::eq_units(&units[lo..hi], seq) {
                             pc += 1;
                             pos = if backward { lo } else { hi };
                         } else {
@@ -314,14 +316,13 @@ impl Matcher<'_, '_> {
                         match atom {
                             RepeatAtom::Char { cp, ignore_case } => {
                                 let (cp, ic) = (*cp, *ignore_case);
-                                while more(end) && self.char_eq(cp, u32::from(unit_at(end)), ic) {
+                                while more(end) && self.char_eq(cp, unit_at(end).into(), ic) {
                                     end = advance(end);
                                 }
                             }
                             RepeatAtom::Any { dot_all } => {
                                 let da = *dot_all;
-                                while more(end)
-                                    && (da || !is_line_terminator(u32::from(unit_at(end))))
+                                while more(end) && (da || !is_line_terminator(unit_at(end).into()))
                                 {
                                     end = advance(end);
                                 }
@@ -335,12 +336,7 @@ impl Matcher<'_, '_> {
                                 let neg = *negate;
                                 if *ignore_case {
                                     while more(end)
-                                        && self.class_member(
-                                            set,
-                                            neg,
-                                            u32::from(unit_at(end)),
-                                            true,
-                                        )
+                                        && self.class_member(set, neg, unit_at(end).into(), true)
                                     {
                                         end = advance(end);
                                     }
@@ -354,13 +350,13 @@ impl Matcher<'_, '_> {
                                     let lo = set.ascii_lo as u64;
                                     let hi = (set.ascii_lo >> 64) as u64;
                                     while more(end) {
-                                        let u = unit_at(end);
+                                        let u: u32 = unit_at(end).into();
                                         let in_set = if u < 64 {
                                             (lo >> u) & 1 != 0
                                         } else if u < 128 {
                                             (hi >> (u - 64)) & 1 != 0
                                         } else {
-                                            set.code_points.contains(u32::from(u))
+                                            set.code_points.contains(u)
                                         };
                                         if in_set == neg {
                                             break;
@@ -491,7 +487,7 @@ impl Matcher<'_, '_> {
                     Insn::BackRef {
                         indices,
                         ignore_case,
-                    } => match self.match_backref(indices, pos, &caps, *ignore_case, backward) {
+                    } => match self.match_backref(indices, pos, caps, *ignore_case, backward) {
                         Some(next) => {
                             pc += 1;
                             pos = next;
@@ -504,7 +500,7 @@ impl Matcher<'_, '_> {
                         entry,
                     } => {
                         let (negate, behind, look_entry) = (*negate, *behind, *entry);
-                        match self.eval_look(negate, behind, look_entry, pos, &caps)? {
+                        match self.eval_look(negate, behind, look_entry, pos, caps)? {
                             Some(updated) => {
                                 // Apply the lookaround's capture writes, logging
                                 // each overwrite so a later backtrack restores it.
@@ -523,7 +519,7 @@ impl Matcher<'_, '_> {
             };
 
             if let Some(pos) = accepted {
-                return Ok(Some((pos, caps)));
+                return Ok(Some(pos));
             }
         }
         Ok(None)
@@ -546,16 +542,17 @@ impl Matcher<'_, '_> {
         // Both directions start at the assertion point; a lookbehind body was
         // lowered to run backwards from there, so neither needs a search over
         // candidate start offsets.
+        let mut look_caps = caps.clone();
         let found = self
             .run(
                 entry,
                 pos,
                 behind,
-                caps.clone(),
+                &mut look_caps,
                 &mut look_stack,
                 &mut look_log,
             )?
-            .map(|(_, c)| c);
+            .map(|_| look_caps);
 
         Ok(match (negate, found) {
             (false, Some(updated)) => Some(updated),
@@ -567,7 +564,7 @@ impl Matcher<'_, '_> {
 
     // --- Input helpers -------------------------------------------------------
 
-    fn units(&self) -> &[u16] {
+    fn units(&self) -> &[U] {
         self.input.units()
     }
 
@@ -665,16 +662,17 @@ impl Matcher<'_, '_> {
     /// Decode the code point at `pos`, returning it and its code-unit width.
     fn decode(&self, pos: usize) -> Option<(u32, usize)> {
         let units = self.units();
-        let hi = *units.get(pos)?;
+        let hi: u32 = (*units.get(pos)?).into();
         if self.input.is_code_point_mode()
             && (0xD800..=0xDBFF).contains(&hi)
             && let Some(&lo) = units.get(pos + 1)
+            && let lo = Into::<u32>::into(lo)
             && (0xDC00..=0xDFFF).contains(&lo)
         {
-            let cp = 0x10000 + ((u32::from(hi) - 0xD800) << 10) + (u32::from(lo) - 0xDC00);
+            let cp = 0x10000 + ((hi - 0xD800) << 10) + (lo - 0xDC00);
             return Some((cp, 2));
         }
-        Some((u32::from(hi), 1))
+        Some((hi, 1))
     }
 
     /// The code point ending just before `pos` (for boundary / multiline tests).
@@ -683,17 +681,17 @@ impl Matcher<'_, '_> {
             return None;
         }
         let units = self.units();
-        let lo = units[pos - 1];
+        let lo: u32 = units[pos - 1].into();
         if self.input.is_code_point_mode()
             && (0xDC00..=0xDFFF).contains(&lo)
             && pos >= 2
-            && (0xD800..=0xDBFF).contains(&units[pos - 2])
+            && let hi = Into::<u32>::into(units[pos - 2])
+            && (0xD800..=0xDBFF).contains(&hi)
         {
-            let hi = units[pos - 2];
-            let cp = 0x10000 + ((u32::from(hi) - 0xD800) << 10) + (u32::from(lo) - 0xDC00);
+            let cp = 0x10000 + ((hi - 0xD800) << 10) + (lo - 0xDC00);
             return Some(cp);
         }
-        Some(u32::from(lo))
+        Some(lo)
     }
 
     /// Case-fold canonical form for the current flags.
@@ -803,7 +801,7 @@ impl Matcher<'_, '_> {
                 // A pair straddling the capture's end reads as its lone
                 // lead — the capture ends inside the pair.
                 let (ca, wa) = if i + wa > end {
-                    (u32::from(units[i]), 1)
+                    (units[i].into(), 1)
                 } else {
                     (ca, wa)
                 };
@@ -818,32 +816,14 @@ impl Matcher<'_, '_> {
             return Some(j);
         }
         for k in 0..len {
-            let a = u32::from(units[start + k]);
-            let b = u32::from(units[at + k]);
+            let a: u32 = units[start + k].into();
+            let b: u32 = units[at + k].into();
             let eq = a == b || (ignore_case && self.canon(a) == self.canon(b));
             if !eq {
                 return None;
             }
         }
         Some(if backward { at } else { at + len })
-    }
-}
-
-/// Compare a subject window against a fused literal run of the same length.
-///
-/// Short runs — nearly all of them — compare unit by unit so the check stays
-/// inline instead of paying a call into the slice comparison; longer runs are
-/// worth that call.
-#[inline]
-fn seq_eq(window: &[u16], seq: &[u16]) -> bool {
-    debug_assert_eq!(window.len(), seq.len());
-    match seq.len() {
-        2 => window[0] == seq[0] && window[1] == seq[1],
-        3 => window[0] == seq[0] && window[1] == seq[1] && window[2] == seq[2],
-        4 => {
-            window[0] == seq[0] && window[1] == seq[1] && window[2] == seq[2] && window[3] == seq[3]
-        }
-        _ => window == seq,
     }
 }
 

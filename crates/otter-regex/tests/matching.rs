@@ -590,6 +590,45 @@ fn literal_prefix_scan_finds_every_match() {
     assert_eq!(all_matches("\u{1F600}x", "u", "y\u{1F600}x"), vec![(1, 4)]);
 }
 
+/// A literal behind a bounded-width head admits only the starts within its
+/// offset window of an occurrence, so every match those starts produce must
+/// still be found, leftmost first.
+#[test]
+fn required_literal_window_finds_every_match() {
+    let date = r#"(^|[^\\])"\\\/Date\((-?[0-9]+)\)\\\/""#;
+    let quote = r#""\/Date(12)\/""#;
+    let scan = Regex::compile_str(date, Flags::default())
+        .expect("compile")
+        .describe();
+    assert!(scan.contains("at 0..=1"), "{scan}");
+    // The `^` arm puts the literal at offset 0; the class arm at offset 1.
+    assert_eq!(all_matches(date, "", quote), vec![(0, 14)]);
+    let after_space = format!(" {quote}");
+    assert_eq!(all_matches(date, "", &after_space), vec![(0, 15)]);
+    // An escaped quote rejects the class arm, and `^` holds only at 0.
+    let escaped = format!("x\\{quote}");
+    assert_eq!(all_matches(date, "", &escaped), Vec::new());
+    let both = format!("{quote}, {quote}");
+    assert_eq!(all_matches(date, "", &both), vec![(0, 14), (15, 30)]);
+    // A subject without the literal has no match at all.
+    assert_eq!(all_matches(date, "", &"x".repeat(4096)), Vec::new());
+    // The window spans optional and fixed-width atoms in front of the literal.
+    assert_eq!(
+        all_matches("a?b?xyz", "", "abxyz bxyz xyz"),
+        vec![(0, 5), (6, 10), (11, 14)]
+    );
+    assert_eq!(
+        all_matches("[0-9]{2}:xyz", "", "1:xyz 12:xyz"),
+        vec![(6, 12)]
+    );
+    // A loop in front leaves the window unbounded, which must not lose a match.
+    assert_eq!(all_matches("a+xyz", "", "aaaaxyz"), vec![(0, 7)]);
+    // Under `u` a window that would land between the halves of a pair starts
+    // at the pair's lead instead.
+    assert_eq!(all_matches(".?ab", "u", "\u{1F600}xab"), vec![(2, 5)]);
+    assert_eq!(all_matches(".?ab", "u", "\u{1F600}ab"), vec![(0, 4)]);
+}
+
 /// A fused repeat under `u`/`v` counts *code points*: give-back must step whole
 /// surrogate pairs, and `min` must be a repetition count, not a unit count.
 #[test]
@@ -643,4 +682,59 @@ fn unmatchable_alternatives_are_dropped() {
     assert_eq!(all_matches("[^]", "", "a"), vec![(0, 1)]);
     // A negative lookahead over an unmatchable body always succeeds.
     assert_eq!(all_matches("(?![])a", "", "a"), vec![(0, 1)]);
+}
+
+/// A one-byte subject is searched in place and must find exactly what the same
+/// subject finds as UTF-16: every scan strategy, flag and atom family, plus
+/// pattern units no one-byte subject can hold.
+#[test]
+fn latin1_subjects_match_like_their_utf16_form() {
+    let patterns = [
+        ("quick", ""),
+        ("qu[a-z]+k", ""),
+        ("QUICK", "i"),
+        ("(^|[^\\\\])\"x\\(", ""),
+        ("\\bfox\\b", ""),
+        ("o\\w*", "g"),
+        ("(\\w)\\1", ""),
+        ("(?<=a)b", ""),
+        ("(?<!a)b+", ""),
+        ("^b", "m"),
+        ("x$", "m"),
+        ("caf\u{e9}", ""),
+        ("CAF\u{c9}", "i"),
+        ("\u{100}", ""),
+        ("a\u{100}|ab", ""),
+        ("[\u{e0}-\u{ff}]+", ""),
+        ("[^ ]+", "u"),
+        (".+?o", "s"),
+        ("\\s*$", "g"),
+        ("(a|b)*c", ""),
+    ];
+    let subjects = [
+        "the quick brown fox jumps over the lazy dog",
+        "aab bab abb\nbx\nx caf\u{e9} CAF\u{c9} \u{e0}\u{ff}",
+        "\\\"x( \"x( z\"x(",
+        "",
+        "ab",
+    ];
+    for (pattern, flags) in patterns {
+        let re = Regex::compile_str(pattern, Flags::from_str_lossy(flags)).expect("compile");
+        for subject in subjects {
+            let wide: Vec<u16> = subject.encode_utf16().collect();
+            let narrow: Vec<u8> = wide.iter().map(|&u| u8::try_from(u).expect("one-byte")).collect();
+            let collect = |found: Vec<Result<otter_regex::Match, otter_regex::ExecError>>| {
+                found
+                    .into_iter()
+                    .map(|m| {
+                        let m = m.expect("match");
+                        (m.range, m.captures)
+                    })
+                    .collect::<Vec<_>>()
+            };
+            let wide_found = collect(re.find_utf16(&wide, 0, ExecConfig::default()).collect());
+            let narrow_found = collect(re.find_latin1(&narrow, 0, ExecConfig::default()).collect());
+            assert_eq!(narrow_found, wide_found, "/{pattern}/{flags} on {subject:?}");
+        }
+    }
 }

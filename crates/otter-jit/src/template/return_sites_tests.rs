@@ -176,15 +176,18 @@ fn captured_callable_entry_matches_retained_emission_for_template_and_graph() {
         assert_eq!(bytes.len(), code.code_len());
         assert!(offset < bytes.len() as u64);
         assert_ne!(map["entryOffset"].as_u64(), Some(offset));
+        // A sloppy body tests its receiver first: the frame save follows the
+        // receiver entry's clear of the conversion flag.
+        let receiver = (code.receiver_entry_addr().unwrap() as u64)
+            .checked_sub(code.native_code_address().unwrap())
+            .unwrap();
         #[cfg(target_arch = "aarch64")]
-        assert_eq!(
-            &bytes[offset as usize..offset as usize + 4],
-            &0xa9bd_7bfdu32.to_le_bytes()
-        );
+        let save = if receiver == offset { offset } else { receiver + 4 } as usize;
         #[cfg(target_arch = "x86_64")]
-        assert_eq!(
-            &bytes[offset as usize..offset as usize + 4],
-            &[0x55, 0x48, 0x89, 0xe5]
-        );
+        let save = if receiver == offset { offset } else { receiver + 2 } as usize;
+        #[cfg(target_arch = "aarch64")]
+        assert_eq!(&bytes[save..save + 4], &0xa9bd_7bfdu32.to_le_bytes());
+        #[cfg(target_arch = "x86_64")]
+        assert_eq!(&bytes[save..save + 4], &[0x55, 0x48, 0x89, 0xe5]);
     }
 }

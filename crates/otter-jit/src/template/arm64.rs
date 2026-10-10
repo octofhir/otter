@@ -278,7 +278,7 @@ fn compile_with_reach(
     });
     dynasm!(ops ; .arch aarch64 ; =>body);
     if let Some(code_map) = code_map.as_mut() {
-        if let Some(offset) = call_entry {
+        if let Some((offset, _)) = call_entry {
             code_map.record_call_entry(offset.0);
         }
         code_map.record(CodeRegion::structural(
@@ -751,7 +751,10 @@ fn compile_with_reach(
         safepoint_records.into_boxed_slice(),
         return_sites.into_boxed_slice(),
         osr_entries,
-        call_entry.map(|offset| offset.0),
+        call_entry.map(|(offset, _)| offset.0),
+        call_entry
+            .filter(|(offset, receiver)| receiver != offset)
+            .map(|(_, receiver)| receiver.0),
         osr_only,
     );
     Ok(NativeCompileOutput {

@@ -78,6 +78,7 @@ fn caller(
             CallTarget::Known {
                 entry_cell: std::ptr::from_ref(cell) as u64,
                 function_id: 1,
+                receiver_ready: false,
             }
         },
     );
@@ -132,6 +133,7 @@ fn caller(
             CallTarget::Known {
                 entry_cell: std::ptr::from_ref(cell) as u64,
                 function_id: 1,
+                receiver_ready: false,
             }
         },
     );
@@ -177,6 +179,7 @@ fn actual_only_known_and_generic_entries_initialize_missing_formals() {
         for (code, flags) in &codes {
             let generation = CodeEntryCell::new(
                 code.call_entry_addr().unwrap(),
+                code.receiver_entry_addr().unwrap(),
                 code.metadata().id,
                 1,
                 3,

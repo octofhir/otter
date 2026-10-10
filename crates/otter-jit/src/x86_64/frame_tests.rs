@@ -235,6 +235,7 @@ fn caller(
         CallTarget::Known {
             entry_cell: std::ptr::from_ref(cell) as u64,
             function_id: 1,
+            receiver_ready: false,
         },
     );
     js_call::emit_pop_arguments(&mut ops, bytes);
@@ -367,7 +368,8 @@ fn lazy_called_entries_publish_only_initialized_roots_and_preserve_rbx() {
         let mut relocations = RelocationCapture::default();
         let exits = exits(&mut ops);
         let cold = CallEntryCold::new(&mut ops, shape);
-        let start = emit_call_entry(&mut ops, &mut relocations, &view, shape, SPILL, cold);
+        let (start, receiver_entry) =
+            emit_call_entry(&mut ops, &mut relocations, &view, shape, SPILL, cold);
         dynasm!(ops ; .arch x64 ; mov rbx, QWORD 0x2288);
         if deopt {
             let exit = abi::SideExit::new(
@@ -402,6 +404,7 @@ fn lazy_called_entries_publish_only_initialized_roots_and_preserve_rbx() {
         let mapping = ops.finalize().unwrap();
         let code = CodeEntryCell::new(
             mapping.ptr(start) as usize,
+            mapping.ptr(receiver_entry) as usize,
             11,
             1,
             4,
@@ -483,7 +486,8 @@ fn overflow_never_publishes_reserved_record_or_spill_roots() {
     let mut relocations = RelocationCapture::default();
     let exits = exits(&mut ops);
     let cold = CallEntryCold::new(&mut ops, shape);
-    let start = emit_call_entry(&mut ops, &mut relocations, &view, shape, SPILL, cold);
+    let (start, receiver_entry) =
+        emit_call_entry(&mut ops, &mut relocations, &view, shape, SPILL, cold);
     dynasm!(ops ; .arch x64 ; mov eax, VALUE_UNDEFINED as i32 ; xor edx, edx);
     emit_epilogue(&mut ops, exits, shape.kind, SPILL);
     emit_exits(
@@ -505,7 +509,15 @@ fn overflow_never_publishes_reserved_record_or_spill_roots() {
         cold,
     );
     let mapping = ops.finalize().unwrap();
-    let code = CodeEntryCell::new(mapping.ptr(start) as usize, 11, 1, 4, 0, None);
+    let code = CodeEntryCell::new(
+        mapping.ptr(start) as usize,
+        mapping.ptr(receiver_entry) as usize,
+        11,
+        1,
+        4,
+        0,
+        None,
+    );
     let function = FunctionEntryCell::new(1, 3, 4, view.code_block.call_flags(), 0);
     function.publish(std::ptr::from_ref(&code) as u64);
     let caller = caller(&transitions, &function, &[]);
@@ -567,7 +579,15 @@ fn physical_tail_replacement_restores_graph_rbx_and_reuses_the_actual_span() {
         ; ret
     );
     let target = target.finalize().unwrap();
-    let target_code = CodeEntryCell::new(target.ptr(AssemblyOffset(0)) as usize, 12, 2, 1, 0, None);
+    let target_code = CodeEntryCell::new(
+        target.ptr(AssemblyOffset(0)) as usize,
+        target.ptr(AssemblyOffset(0)) as usize,
+        12,
+        2,
+        1,
+        0,
+        None,
+    );
     let target_function = FunctionEntryCell::new(2, 1, 1, view.code_block.call_flags(), 0);
     target_function.publish(std::ptr::from_ref(&target_code) as u64);
 
@@ -576,7 +596,8 @@ fn physical_tail_replacement_restores_graph_rbx_and_reuses_the_actual_span() {
     let exits = exits(&mut ops);
     let cold = CallEntryCold::new(&mut ops, shape);
     let ordinary = ops.new_dynamic_label();
-    let start = emit_call_entry(&mut ops, &mut relocations, &view, shape, SPILL, cold);
+    let (start, receiver_entry) =
+        emit_call_entry(&mut ops, &mut relocations, &view, shape, SPILL, cold);
     emit_tail_admission(&mut ops, exits.side_exit, ordinary);
     emit_tail_span_check(&mut ops, 2, exits.side_exit);
     dynasm!(ops ; .arch x64 ; mov rbx, QWORD 0x2299);
@@ -599,6 +620,7 @@ fn physical_tail_replacement_restores_graph_rbx_and_reuses_the_actual_span() {
         CallTarget::Known {
             entry_cell: std::ptr::from_ref(target_function.as_ref()) as u64,
             function_id: 2,
+            receiver_ready: false,
         },
         shape.kind,
     );
@@ -629,6 +651,7 @@ fn physical_tail_replacement_restores_graph_rbx_and_reuses_the_actual_span() {
     let mapping = ops.finalize().unwrap();
     let code = CodeEntryCell::new(
         mapping.ptr(start) as usize,
+        mapping.ptr(receiver_entry) as usize,
         11,
         1,
         4,

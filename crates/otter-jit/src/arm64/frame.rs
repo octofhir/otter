@@ -64,7 +64,7 @@ use crate::entry::TransitionTable;
 use crate::frame::{ActivationExits, CallEntryCold, SpillArea};
 use crate::template::arm64::values::{emit_load_runtime_stub, emit_load_u64};
 use crate::{
-    arm64::activation::{emit_lexical_this, emit_object_receiver_test, emit_object_test},
+    arm64::activation::{emit_lexical_this, emit_object_test},
     artifact::relocation::RelocationCapture,
     entry::{
         CODE_ENTRY_GENERATED_ENTRIES_OFFSET, CODE_ENTRY_TIERING_ENABLED_OFFSET,
@@ -232,7 +232,11 @@ fn reservation(shape: EntryShape, spill: SpillArea) -> u32 {
 
 /// Emit the call-ABI entry. It falls through into the body; its cold
 /// continuations, named by `cold`, are emitted by [`emit_call_entry_cold`]
-/// just before it.
+/// just before it. Returns the entry and the receiver-ready entry: a sloppy
+/// body tests its receiver first, before saving anything, and a caller that
+/// proved the receiver an Object enters past that test (V8 converts the
+/// receiver at the call site for the same reason). Any other body has one
+/// entry.
 pub(crate) fn emit_call_entry(
     ops: &mut Assembler,
     relocations: &mut RelocationCapture,
@@ -240,8 +244,22 @@ pub(crate) fn emit_call_entry(
     shape: EntryShape,
     spill: SpillArea,
     cold: CallEntryCold,
-) -> AssemblyOffset {
+) -> (AssemblyOffset, AssemblyOffset) {
     let start = ops.offset();
+    let receiver_entry = if shape.sloppy_receiver() {
+        // `x5` carries the receiver-preparation decision to the end of the
+        // entry; the test clobbers only `x9`.
+        let object = ops.new_dynamic_label();
+        let convert = ops.new_dynamic_label();
+        let tested = ops.new_dynamic_label();
+        emit_object_test(ops, view, 2, object, convert);
+        dynasm!(ops ; .arch aarch64 ; =>convert ; movz x5, 1 ; b =>tested ; =>object);
+        let receiver_entry = ops.offset();
+        dynasm!(ops ; .arch aarch64 ; mov x5, xzr ; =>tested);
+        receiver_entry
+    } else {
+        start
+    };
     let CallEntryCold {
         overflow,
         staged,
@@ -340,9 +358,6 @@ pub(crate) fn emit_call_entry(
             ; b.hs =>check
             ; =>back
         );
-    }
-    if shape.sloppy_receiver() {
-        emit_object_receiver_test(ops, view);
     }
     if shape.lexical_this {
         emit_lexical_this(ops, view);
@@ -449,7 +464,7 @@ pub(crate) fn emit_call_entry(
     if let Some((promote, promoted)) = promote {
         dynasm!(ops ; .arch aarch64 ; cbnz x6, =>promote ; =>promoted);
     }
-    start
+    (start, receiver_entry)
 }
 
 /// Publish the register window of a record whose entry left it

@@ -301,6 +301,7 @@ pub(crate) fn emit_call(
         CallTarget::Known {
             entry_cell,
             function_id,
+            receiver_ready,
         } => {
             emit_load_symbol_u64(
                 ops,
@@ -309,10 +310,15 @@ pub(crate) fn emit_call(
                 entry_cell,
                 RelocationTarget::FunctionEntryCell { function_id },
             );
+            let entry = if receiver_ready {
+                abi::CODE_ENTRY_RECEIVER_ENTRY_OFFSET as u32
+            } else {
+                0
+            };
             dynasm!(ops
                 ; .arch aarch64
                 ; ldr x8, [x8]
-                ; ldr x16, [x8]
+                ; ldr x16, [x8, entry]
                 ; blr x16
             );
         }
@@ -347,6 +353,7 @@ pub(crate) fn emit_tail_branch(
         CallTarget::Known {
             entry_cell,
             function_id,
+            ..
         } => {
             emit_load_symbol_u64(
                 ops,

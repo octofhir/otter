@@ -456,6 +456,9 @@ pub(crate) enum Kind {
         construct: bool,
         /// Input1 is the receiver; otherwise the receiver is `undefined`.
         receiver: bool,
+        /// The receiver is proved an Object: the callee is entered past a
+        /// sloppy body's receiver test.
+        receiver_object: bool,
         /// For a construct of a proven base constructor: how the receiver
         /// is allocated before the constructor is entered, so its prologue
         /// does not prepare one in the runtime.

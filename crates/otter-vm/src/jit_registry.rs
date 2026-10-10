@@ -322,8 +322,13 @@ impl JitCodeRegistry {
         let call_entry = code
             .call_entry_addr()
             .unwrap_or(crate::native_abi::call_generic_entry as *const () as usize);
+        let receiver_entry = code
+            .call_entry_addr()
+            .and_then(|_| code.receiver_entry_addr())
+            .unwrap_or(call_entry);
         let entry_cell = Box::new(CodeEntryCell::new(
             call_entry,
+            receiver_entry,
             code_object_id,
             metadata.code_block_id,
             register_count,

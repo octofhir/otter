@@ -221,6 +221,7 @@ fn physical_assignment_uses_each_backends_register_pool_and_fixed_call_words() {
             Kind::CallJs {
                 pc: 0,
                 receiver: true,
+                receiver_object: false,
                 plan: crate::call_linkage::CallPlan::Generic,
                 construct: false,
                 allocation: None,
@@ -1274,6 +1275,7 @@ fn call_roots_current_inputs_and_lazy_only_state() {
             plan: crate::call_linkage::CallPlan::Generic,
             construct: false,
             receiver: false,
+            receiver_object: false,
             allocation: None,
         },
         &[callee, argument],
@@ -1852,6 +1854,7 @@ fn cold_exit_roots_only_the_selected_finalized_recipe() {
             plan: crate::call_linkage::CallPlan::Generic,
             construct: false,
             receiver: false,
+            receiver_object: false,
             allocation: None,
         },
         &[callee, argument],

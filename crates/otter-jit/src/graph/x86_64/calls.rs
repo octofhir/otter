@@ -124,6 +124,7 @@ impl Codegen<'_> {
         plan: crate::call_linkage::CallPlan,
         construct: bool,
         receiver: bool,
+        receiver_object: bool,
         allocation: Option<otter_vm::jit::JitReceiverAllocationPlan>,
     ) -> Result<(), Unsupported> {
         self.node_safepoint(node)?;
@@ -179,6 +180,7 @@ impl Codegen<'_> {
                 CallTarget::Known {
                     entry_cell: plan.entry_cell,
                     function_id: plan.function_id,
+                    receiver_ready: receiver_object,
                 },
             );
             self.record_js_return(node, return_pc)?;
@@ -263,6 +265,7 @@ impl Codegen<'_> {
                 CallTarget::Known {
                     entry_cell: plan.entry_cell,
                     function_id: plan.function_id,
+                    receiver_ready: false,
                 },
             );
             self.record_js_return(node, return_pc)?;

@@ -54,6 +54,9 @@ pub(crate) enum CallTarget {
         entry_cell: u64,
         /// The target's function id, the cell's relocation identity.
         function_id: u32,
+        /// The receiver is proved an Object: enter past a sloppy body's
+        /// receiver test (`CodeEntryCell::receiver_entry_addr`).
+        receiver_ready: bool,
     },
     /// A proved NativeFunction, using the canonical Host native kernel.
     Native,

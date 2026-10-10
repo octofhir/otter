@@ -37,6 +37,8 @@ pub(crate) struct Emission {
     pub(crate) buffer: dynasmrt::ExecutableBuffer,
     pub(crate) tier_entry: usize,
     pub(crate) call_entry: usize,
+    /// The receiver-ready call entry, when it differs from `call_entry`.
+    pub(crate) receiver_entry: Option<usize>,
     pub(crate) exits: Vec<ExitSite>,
     pub(crate) relocations: RelocationCapture,
     pub(crate) node_offsets: Vec<(usize, NodeId)>,

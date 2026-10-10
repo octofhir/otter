@@ -71,6 +71,9 @@ pub struct OptimizedCode {
     /// Offset of the JavaScript call ABI entry, which builds this
     /// function's own frame.
     call_entry: usize,
+    /// Offset of the entry for a caller that proved the receiver an Object,
+    /// when it differs from the call entry.
+    receiver_entry: Option<usize>,
     /// Deopt metadata whose address is baked into the shared exit handler; the
     /// allocation must live exactly as long as the code.
     deopt: Box<otter_vm::deopt::DeoptRuntime>,
@@ -98,6 +101,7 @@ impl OptimizedCode {
     pub(crate) fn new(
         code: CompiledCode,
         call_entry: usize,
+        receiver_entry: Option<usize>,
         deopt: Box<otter_vm::deopt::DeoptRuntime>,
         safepoint_records: Box<[SafepointRecord]>,
         return_sites: Box<[otter_vm::native_abi::SafepointEntry]>,
@@ -120,6 +124,7 @@ impl OptimizedCode {
         Self {
             code,
             call_entry,
+            receiver_entry,
             deopt,
             safepoint_records,
             return_sites,
@@ -202,6 +207,12 @@ impl JitFunctionCode for OptimizedCode {
     fn call_entry_addr(&self) -> Option<usize> {
         // SAFETY: the assembler recorded this entry in the live mapping.
         Some(unsafe { self.code.ptr_at(self.call_entry) as usize })
+    }
+
+    fn receiver_entry_addr(&self) -> Option<usize> {
+        let offset = self.receiver_entry.unwrap_or(self.call_entry);
+        // SAFETY: the assembler recorded this entry in the live mapping.
+        Some(unsafe { self.code.ptr_at(offset) as usize })
     }
 
     fn dependencies(&self) -> &[CodeDependency] {
@@ -291,6 +302,7 @@ mod tests {
         let compiled = OptimizedCode::new(
             code,
             0,
+            None,
             Box::default(),
             Box::new([roots]),
             Box::new([]),

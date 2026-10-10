@@ -63,7 +63,7 @@ use crate::{
     },
     frame::{ActivationExits, CallEntryCold, SpillArea},
     x86_64::{
-        activation::{emit_lexical_this, emit_object_receiver_test, emit_object_test},
+        activation::{emit_lexical_this, emit_object_test},
         values::{emit_load_runtime_stub, emit_load_symbol_u64},
     },
 };
@@ -238,10 +238,25 @@ pub(crate) fn emit_call_entry(
     shape: EntryShape,
     spill: SpillArea,
     cold: CallEntryCold,
-) -> AssemblyOffset {
+) -> (AssemblyOffset, AssemblyOffset) {
     let start = ops.offset();
     let window = u32::from(shape.register_count) * 8;
     let bytes = (RECORD_SLOT as u32 + window.next_multiple_of(16) + spill.bytes) as i32;
+    // A sloppy body binds an Object receiver as is and converts any other
+    // one (`eax = 1`) once the activation is published. A caller that proved
+    // an Object receiver enters past the test.
+    let receiver_entry = if shape.sloppy_receiver() {
+        let object = ops.new_dynamic_label();
+        let convert = ops.new_dynamic_label();
+        let tested = ops.new_dynamic_label();
+        emit_object_test(ops, view, 2, object, convert);
+        dynasm!(ops ; .arch x64 ; =>convert ; mov eax, 1 ; jmp =>tested ; =>object);
+        let receiver_entry = ops.offset();
+        dynasm!(ops ; .arch x64 ; xor eax, eax ; =>tested);
+        receiver_entry
+    } else {
+        start
+    };
     emit_save(ops, shape.kind);
     dynasm!(ops ; .arch x64 ; mov r15, rdi);
     dynasm!(ops
@@ -307,9 +322,7 @@ pub(crate) fn emit_call_entry(
         dynasm!(ops
             ; .arch x64
             ; xor r12d, r12d
-            ; mov rax, [r9 + CODE_ENTRY_GENERATED_ENTRIES_OFFSET as i32]
-            ; inc rax
-            ; mov [r9 + CODE_ENTRY_GENERATED_ENTRIES_OFFSET as i32], rax
+            ; inc QWORD [r9 + CODE_ENTRY_GENERATED_ENTRIES_OFFSET as i32]
             ; mov QWORD [r15 + GENERATED_FEEDBACK_CLEAN_OFFSET as i32], 0
         );
         emit_load_symbol_u64(
@@ -326,19 +339,16 @@ pub(crate) fn emit_call_entry(
         let work = i32::try_from(crate::frame::entry_work(view)).unwrap_or(i32::MAX);
         let charged = ops.new_dynamic_label();
         dynasm!(ops ; .arch x64
-            ; mov rax, [r10]
-            ; add rax, work
+            ; mov r11, [r10]
+            ; add r11, work
             ; jnc =>charged
-            ; mov rax, -1
+            ; mov r11, -1
             ; =>charged
-            ; mov [r10], rax
-            ; cmp rax, [r9 + CODE_ENTRY_TIERING_WORK_TARGET_OFFSET as i32]
+            ; mov [r10], r11
+            ; cmp r11, [r9 + CODE_ENTRY_TIERING_WORK_TARGET_OFFSET as i32]
             ; jae =>check
             ; =>back
         );
-    }
-    if shape.sloppy_receiver() {
-        emit_object_receiver_test(ops, view);
     }
     if shape.lexical_this {
         emit_lexical_this(ops, view);
@@ -405,7 +415,7 @@ pub(crate) fn emit_call_entry(
         dynasm!(ops ; .arch x64 ; cmp rcx, VALUE_UNDEFINED as i32 ; jne =>construct);
     }
     if let Some((prepare, back)) = cold.prepare {
-        dynasm!(ops ; .arch x64 ; test r9, r9 ; jnz =>prepare ; =>back);
+        dynasm!(ops ; .arch x64 ; test eax, eax ; jnz =>prepare ; =>back);
     }
     if let Some((_, back)) = cold.construct {
         dynasm!(ops ; .arch x64 ; =>back);
@@ -413,7 +423,7 @@ pub(crate) fn emit_call_entry(
     if let Some((promote, back)) = cold.promote {
         dynasm!(ops ; .arch x64 ; test r12, r12 ; jnz =>promote ; =>back);
     }
-    start
+    (start, receiver_entry)
 }
 
 /// Move the pending construction request into the record's construction
@@ -481,12 +491,12 @@ pub(crate) fn emit_call_entry_cold(
         ; =>staged
         ; and r9, !(abi::CODE_ENTRY_STAGED_REQUEST_MASK as i32)
         ; mov r11, [r15 + (crate::entry::PENDING_CALL_OFFSET + abi::REQUEST_CALLER_RETURN_PC_OFFSET) as i32]
-        ; mov eax, abi::NO_CALLER_RETURN_PC as i32
+        ; mov r10d, abi::NO_CALLER_RETURN_PC as i32
         ; test r11, r11
-        ; cmovz r11, rax
-        ; xor eax, eax
-        ; mov [r15 + (crate::entry::PENDING_CALL_OFFSET + abi::REQUEST_CALLER_OFFSET) as i32], rax
-        ; mov [r15 + (crate::entry::PENDING_CALL_OFFSET + abi::REQUEST_CALLER_RETURN_PC_OFFSET) as i32], rax
+        ; cmovz r11, r10
+        ; xor r10d, r10d
+        ; mov [r15 + (crate::entry::PENDING_CALL_OFFSET + abi::REQUEST_CALLER_OFFSET) as i32], r10
+        ; mov [r15 + (crate::entry::PENDING_CALL_OFFSET + abi::REQUEST_CALLER_RETURN_PC_OFFSET) as i32], r10
         ; mov [r14 + abi::NATIVE_FRAME_CALLER_RETURN_PC_OFFSET as i32], r11
         ; jmp =>origin_ready
     );

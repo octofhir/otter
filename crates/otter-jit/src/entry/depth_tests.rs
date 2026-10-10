@@ -187,6 +187,7 @@ fn caller(
             CallTarget::Known {
                 entry_cell: std::ptr::from_ref(cell) as u64,
                 function_id: 1,
+                receiver_ready: false,
             }
         },
     );
@@ -241,6 +242,7 @@ fn caller(
             CallTarget::Known {
                 entry_cell: std::ptr::from_ref(cell) as u64,
                 function_id: 1,
+                receiver_ready: false,
             }
         },
     );
@@ -277,6 +279,7 @@ fn run_case(
     };
     let generation = CodeEntryCell::new(
         code.call_entry_addr().unwrap(),
+        code.receiver_entry_addr().unwrap(),
         code.metadata().id,
         1,
         REGISTER_COUNT,

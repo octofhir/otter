@@ -1260,6 +1260,7 @@ pub(super) fn emit_tail_call(
             CallTarget::Known {
                 entry_cell: plan.entry_cell,
                 function_id: plan.function_id,
+                receiver_ready: false,
             },
             outgrown,
             saved_pairs,
@@ -1518,6 +1519,7 @@ pub(super) fn emit_trampoline_call(
                 CallTarget::Known {
                     entry_cell: plan.entry_cell,
                     function_id: plan.function_id,
+                    receiver_ready: false,
                 },
             )
         })

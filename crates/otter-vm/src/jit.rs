@@ -2381,6 +2381,13 @@ pub trait JitFunctionCode: std::fmt::Debug + Send + Sync {
         None
     }
 
+    /// Call entry for a caller that proved the receiver an Object; see
+    /// [`crate::native_abi::CodeEntryCell::receiver_entry_addr`]. A body
+    /// without a receiver test enters at its call entry.
+    fn receiver_entry_addr(&self) -> Option<usize> {
+        self.call_entry_addr()
+    }
+
     /// Immutable isolate-state dependencies declared by this code object.
     ///
     /// Implementations that record dependencies own the backing slice for the

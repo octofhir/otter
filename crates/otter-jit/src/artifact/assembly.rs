@@ -520,6 +520,7 @@ fn symbolic_target(target: &RelocationTarget) -> String {
             format!("sourceWorkCell(function={function_id})")
         }
         RelocationTarget::BackedgeFuelCell => "backedgeFuelCell".to_string(),
+        RelocationTarget::ShapeStableByte { shape } => format!("shapeStableByte(shape={shape})"),
     }
 }
 

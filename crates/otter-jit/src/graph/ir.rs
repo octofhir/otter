@@ -120,6 +120,8 @@ pub(crate) enum DeoptReason {
     /// The operation has no optimized form and resumes in the interpreter
     /// (suspension, irreducible entry).
     Unsupported,
+    /// An object left a shape a fact relied on no object leaving.
+    StabilityChanged,
 }
 
 /// One branch condition of a [`Kind::Branch`].
@@ -555,6 +557,10 @@ pub(crate) enum Kind {
     Return,
     /// Unconditional eager deopt.
     Deopt(DeoptReason),
+    /// Re-prove an earlier shape fact after an operation that may have run
+    /// code: every one of these shapes still has each object it ever had,
+    /// read from the shapes' stable bytes; eager deopt otherwise.
+    CheckStableShapes(SmallVec<[u32; 4]>),
 }
 
 /// What a node may do.
@@ -808,7 +814,7 @@ impl Kind {
                 effectful: true,
                 ..Properties::default()
             },
-            Self::Deopt(_) => Properties {
+            Self::Deopt(_) | Self::CheckStableShapes(_) => Properties {
                 eager_deopt: true,
                 effectful: true,
                 ..Properties::default()
@@ -1158,7 +1164,9 @@ impl Kind {
                 fp_temps: 0,
                 fixed_gp_clobbers: SmallVec::new(),
             },
-            Self::Jump(_) | Self::JumpLoop(_) | Self::Deopt(_) => simple(0, ResultPolicy::None),
+            Self::Jump(_) | Self::JumpLoop(_) | Self::Deopt(_) | Self::CheckStableShapes(_) => {
+                simple(0, ResultPolicy::None)
+            }
             Self::Branch {
                 kind: BranchKind::Int32(_),
                 ..

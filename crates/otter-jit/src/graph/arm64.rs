@@ -32,6 +32,8 @@
 //! - Exact finalized shapes prove ordinary lookup state. Dynamic shared-cache
 //!   guards read the sole current ShapeState byte and permit provisional
 //!   runtime feedback; stores reject prototype role before any effect.
+//! - Shape transitions clear the source shape's stability byte before
+//!   publishing the child shape; allocation stores establish the initial shape.
 //! - A far body places an island of veneers, slow paths and exit stubs
 //!   after every 16 KiB segment, so a `tbz`/`tbnz` of a cell test reaches
 //!   the exit it names; `b.cond` and `cbz` reach ±1 MiB.
@@ -907,6 +909,23 @@ impl<'a> Codegen<'a> {
                 let destination = Self::gp(result.expect("a result"));
                 let offset = u32::from(*register) * 8;
                 dynasm!(self.ops ; .arch aarch64 ; ldr X(destination), [x19, offset]);
+            }
+            Kind::CheckStableShapes(shapes) => {
+                let shapes = shapes.clone();
+                let exit = self.eager_exit(node, DeoptReason::StabilityChanged);
+                let view = self.view;
+                for shape in shapes {
+                    emit_load_symbol_u64(
+                        &mut self.ops,
+                        &mut self.relocations,
+                        16,
+                        view.cage_base as u64
+                            + u64::from(shape)
+                            + u64::from(view.shape_stable_byte),
+                        RelocationTarget::ShapeStableByte { shape },
+                    );
+                    dynasm!(self.ops ; .arch aarch64 ; ldrb w16, [x16] ; cbz w16, =>exit);
+                }
             }
             Kind::LoadThis => {
                 let destination = Self::gp(result.expect("a result"));
@@ -2512,6 +2531,13 @@ impl<'a> Codegen<'a> {
                         stored_byte = Some(value_byte);
                     }
                     Op::PublishShape { shape, .. } => {
+                        dynasm!(self.ops
+                            ; .arch aarch64
+                            ; and x17, X(receiver), #0xffff_ffff_0000_0000
+                            ; ldr w16, [X(receiver), view.object_shape_byte]
+                            ; add x16, x17, x16
+                            ; strb wzr, [x16, view.shape_stable_byte]
+                        );
                         self.load_immediate(16, u64::from(shape));
                         dynasm!(self.ops
                             ; .arch aarch64

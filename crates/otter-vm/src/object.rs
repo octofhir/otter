@@ -813,6 +813,15 @@ pub struct ObjectBody {
 }
 
 impl ObjectBody {
+    /// Move this object to `shape`; the shape it leaves is stable no more.
+    #[inline]
+    pub(crate) fn adopt_shape(&mut self, shape: ShapeHandle) {
+        if self.shape != shape {
+            shape_body::note_left(self.shape);
+            self.shape = shape;
+        }
+    }
+
     /// Retire dependent proofs before changing a watched prototype.
     #[inline]
     fn invalidate_prototype_proofs(&self) {
@@ -2009,7 +2018,7 @@ impl ObjectBody {
         let dictionary = shape_body::dictionary_of(self.shape);
         if self.exotic.is_null() {
             debug_assert_eq!(count, 0, "a dictionary object with slots owns a sidecar");
-            self.shape = dictionary;
+            self.adopt_shape(dictionary);
             return;
         }
         let exotic = self.exotic_mut();
@@ -2018,7 +2027,7 @@ impl ObjectBody {
         if advance_layout {
             exotic.dictionary_layout = exotic.dictionary_layout.saturating_add(1);
         }
-        self.shape = dictionary;
+        self.adopt_shape(dictionary);
     }
 
     /// Advance a dictionary-mode object's slot-layout epoch, saturating at
@@ -2264,7 +2273,7 @@ impl ObjectBody {
                 self.set_data_value(i, value);
                 debug_assert_object_shape_handle(shape, "slot attribute shape install");
                 debug_assert_object_shape_handle(shape, "shape-slot store");
-                self.shape = shape;
+                self.adopt_shape(shape);
                 assert!(
                     !self.is_dictionary(),
                     "attribute shape owns all descriptors"
@@ -3280,7 +3289,7 @@ pub(crate) fn install_fresh_shape_with_slots(
             shape_body::inline_capacity_of(shape),
             "shape transition changed object footprint"
         );
-        body.shape = shape;
+        body.adopt_shape(shape);
     });
     for &value in &stored {
         record_slot_write(heap, obj, value);
@@ -5446,7 +5455,7 @@ pub(crate) fn install_prototype_shape(
             shape_body::inline_capacity_of(shape),
             "shape transition changed object footprint"
         );
-        body.shape = shape;
+        body.adopt_shape(shape);
         if dictionary {
             body.enter_dictionary_mode_as(next_shape_id(), true);
         }
@@ -5764,7 +5773,7 @@ pub fn delete(
             unsafe {
                 *body.field_ptr(body.location_for_slot(offset as usize)) = Value::undefined();
             }
-            body.shape = parent;
+            body.adopt_shape(parent);
             remove_mapped_argument(body, key);
             body.debug_verify_field_layout();
         });
@@ -6263,7 +6272,7 @@ pub(crate) fn seal_with_shape(obj: JsObject, heap: &mut otter_gc::GcHeap, new_sh
         );
         if body.shape != new_shape {
             body.invalidate_prototype_proofs();
-            body.shape = new_shape;
+            body.adopt_shape(new_shape);
         }
     });
     heap.record_write(obj, &new_shape);
@@ -6305,7 +6314,7 @@ pub(crate) fn freeze_with_shape(
         );
         if body.shape != new_shape {
             body.invalidate_prototype_proofs();
-            body.shape = new_shape;
+            body.adopt_shape(new_shape);
         }
     });
     heap.record_write(obj, &new_shape);
@@ -6567,7 +6576,7 @@ pub(crate) fn adopt_fast_shape(obj: JsObject, heap: &mut otter_gc::GcHeap, shape
             shape_body::inline_capacity_of(shape),
             "shape transition changed object footprint"
         );
-        body.shape = shape;
+        body.adopt_shape(shape);
         if let Some(exotic) = exotic_body_of(body.exotic.get()).map(|e|
             // SAFETY: a non-null handle names a live sidecar payload.
             unsafe { &mut *e })

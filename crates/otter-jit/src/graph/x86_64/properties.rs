@@ -7,6 +7,8 @@
 //!
 //! # Invariants
 //! - Every store guard completes before the first slot or shape write.
+//! - Shape transitions clear the source shape's stability byte before
+//!   publishing the child shape.
 //! - Cold operations run once with canonical roots, never by replaying a hit.
 //! - Mutable fields are read live; shape and chain identities authorize layout.
 //! - Receiver SSA values survive holder traversal and all scratch work.
@@ -329,7 +331,13 @@ impl Codegen<'_> {
                         committed = true;
                     }
                     Op::PublishShape { shape, .. } if value.is_some() => {
-                        dynasm!(self.ops ; .arch x64 ; mov DWORD [Rq(receiver) + view.object_shape_byte as i32], shape as i32);
+                        self.load_immediate(11, 0xffff_ffff_0000_0000);
+                        dynasm!(self.ops ; .arch x64
+                            ; and r11, Rq(receiver)
+                            ; mov r10d, [Rq(receiver) + view.object_shape_byte as i32]
+                            ; add r10, r11
+                            ; mov BYTE [r10 + view.shape_stable_byte as i32], 0
+                            ; mov DWORD [Rq(receiver) + view.object_shape_byte as i32], shape as i32);
                         self.emit_shape_child_barrier(node, receiver, shape, scratch);
                     }
                     _ => {

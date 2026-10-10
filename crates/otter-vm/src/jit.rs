@@ -711,6 +711,14 @@ pub struct JitCompileSnapshot {
     /// or non-ordinary prototype. Prototype-chain guards read the receiver's
     /// shape, then this word, without runtime resolution.
     pub shape_prototype_byte: u32,
+    /// Header-inclusive offset of a shape's stable byte: one while no object
+    /// has ever left the shape (see `crate::object::shape_body`).
+    pub shape_stable_byte: u32,
+    /// Compressed handles of baked shapes no object had left when the
+    /// generation compiled. A value proven to have one of them before an
+    /// operation that may run code is re-proven afterwards by reading the
+    /// shapes' stable bytes instead of the value.
+    pub stable_shapes: rustc_hash::FxHashSet<u32>,
     /// Header-inclusive offset of the sole immutable [`crate::object::ShapeState`]
     /// byte on a decompressed shape. Exact eligible baked shape identity fixes
     /// these facts; only dynamic/shared and dictionary probes read them live.
@@ -2066,6 +2074,8 @@ impl JitCompileSnapshot {
             object_exotic_handle_byte: 0,
             gc_barrier: JitGcBarrierLayout::default(),
             shape_prototype_byte: 0,
+            shape_stable_byte: 0,
+            stable_shapes: rustc_hash::FxHashSet::default(),
             shape_state_byte: 0,
             shape_inline_capacity_byte: 0,
             closure_call_layout: JitClosureCallLayout::default(),

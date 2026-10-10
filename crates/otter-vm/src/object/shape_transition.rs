@@ -195,7 +195,7 @@ pub(crate) fn capture_store_property_transition_with_shape(
             return None;
         }
         body.invalidate_prototype_proofs();
-        body.shape = next_shape;
+        body.adopt_shape(next_shape);
         body.push_slot(index, SlotMeta::data_default(), stored);
         Some(StorePropertyTransition {
             from_shape_id,
@@ -333,7 +333,7 @@ pub(crate) fn replay_store_property_transition(
         } else {
             debug_assert_eq!(to_shape_id, Some(target_shape_id));
             body.invalidate_prototype_proofs();
-            body.shape = to_shape;
+            body.adopt_shape(to_shape);
         }
         body.push_slot(offset, SlotMeta::data_default(), stored);
     });

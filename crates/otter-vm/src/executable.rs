@@ -407,6 +407,9 @@ impl CodeBlock {
             },
             shape_prototype_byte: otter_gc::header::HEADER_SIZE as u32
                 + crate::object::SHAPE_BODY_PROTOTYPE_OFFSET as u32,
+            shape_stable_byte: otter_gc::header::HEADER_SIZE as u32
+                + crate::object::shape_body::SHAPE_BODY_STABLE_OFFSET as u32,
+            stable_shapes: rustc_hash::FxHashSet::default(),
             shape_inline_capacity_byte: otter_gc::header::HEADER_SIZE as u32
                 + crate::object::SHAPE_BODY_INLINE_CAPACITY_OFFSET as u32,
             shape_state_byte: otter_gc::header::HEADER_SIZE as u32

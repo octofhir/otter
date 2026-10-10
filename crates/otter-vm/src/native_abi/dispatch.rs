@@ -57,6 +57,8 @@ pub enum ExitReason {
     /// Generated code reached a site that had no feedback when it was
     /// compiled. The exit collects feedback; it is not a failed speculation.
     InsufficientFeedback = 12,
+    /// An object left a shape the generation relied on no object leaving.
+    StabilityChanged = 13,
 }
 
 impl ExitReason {
@@ -74,6 +76,7 @@ impl ExitReason {
             10 => Some(Self::UnsupportedOperation),
             11 => Some(Self::RuntimeTransition),
             12 => Some(Self::InsufficientFeedback),
+            13 => Some(Self::StabilityChanged),
             _ => None,
         }
     }

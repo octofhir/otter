@@ -13,6 +13,7 @@
 //! transition. Load and store facts share a key, never a holder or slot. The
 //! store writes its full value and optional child shape after every guard,
 //! then leaves the compressed child (zero for overwrite) in the slot temporary.
+//! An append clears the source shape's stability byte before publishing its child.
 //! The tier runs its existing child/value barriers without a replay edge.
 //!
 //! # See also
@@ -348,13 +349,14 @@ pub(crate) fn emit_store(
         ; =>chain ; ldrb w16, [X(holder), view.shape_state_byte]
         ; tst w16, #u32::from(ShapeState::EXTENSIBLE_MASK) ; b.eq =>miss
         ; and x17, X(receiver), #0xffff_ffff_0000_0000
-        ; ldr W(holder), [X(entry), cache.target_shape_byte] ; add X(holder), x17, X(holder)
-        ; ldr x16, [X(holder), cache.shape_id_byte]
+        ; ldr w16, [X(entry), cache.target_shape_byte] ; add x16, x17, x16
+        ; ldr x16, [x16, cache.shape_id_byte]
         ; ldr x17, [X(entry), cache.target_shape_id_byte] ; cmp x16, x17 ; b.ne =>miss
         ; ldrh W(slot), [X(entry), cache.store_slot_byte]);
     bank(ops, view, receiver, slot, base, miss);
     dynasm!(ops ; .arch aarch64
         ; str X(value), [X(base), X(slot), lsl #otter_vm::object::FieldLocation::INDEX_SHIFT]
+        ; strb wzr, [X(holder), view.shape_stable_byte]
         ; ldr W(slot), [X(entry), cache.target_shape_byte]
         ; str W(slot), [X(receiver), view.object_shape_byte] ; b =>done
         ; =>own ; ldrh W(slot), [X(entry), cache.store_slot_byte]);

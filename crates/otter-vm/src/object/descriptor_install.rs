@@ -202,7 +202,7 @@ pub(super) fn define_string_with_shape(
                 "shape transition changed object footprint"
             );
             body.invalidate_prototype_proofs();
-            body.shape = next_shape;
+            body.adopt_shape(next_shape);
             body.push_slot(index, meta, stored);
         }
     });

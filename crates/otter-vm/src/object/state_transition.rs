@@ -123,7 +123,7 @@ pub(super) fn install_state_shape(object: JsObject, heap: &mut GcHeap, shape: Sh
         );
         if body.shape != shape {
             body.invalidate_prototype_proofs();
-            body.shape = shape;
+            body.adopt_shape(shape);
         }
     });
     heap.record_write(object, &shape);

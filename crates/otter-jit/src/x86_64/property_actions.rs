@@ -11,7 +11,8 @@
 //! - The VM owns the table, action discriminants, immutable shapes and retained
 //!   validity words. Native probes neither allocate nor clone a proof.
 //! - Every store check finishes before the first write. Append commits slot
-//!   then child shape; callers perform the existing child/value edge barriers.
+//!   then clears the source shape's stability byte and publishes the child
+//!   shape; callers perform the existing child/value edge barriers.
 //! - Slots and the suffix handle are reread from current geometry. No storage
 //!   pointer or table proof survives a call, collection or committed miss.
 //! - Unknown, unresolvable and runtime-only actions take the one cold source
@@ -256,6 +257,7 @@ pub(crate) fn emit_action_probe(
             emit_slot_storage(ops, view, receiver, identity, base, miss);
             dynasm!(ops ; .arch x64
                 ; mov [Rq(base) + Rq(identity) * 8], Rq(value)
+                ; mov BYTE [Rq(shape) + view.shape_stable_byte as i32], 0
                 ; mov Rd(identity), [Rq(entry) + cache.target_shape_byte as i32]
                 ; mov [Rq(receiver) + view.object_shape_byte as i32], Rd(identity)
                 ; jmp =>appended

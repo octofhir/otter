@@ -4,6 +4,7 @@
 //! - One exact key carries inherited reads and receiver append actions.
 //! - Full input/canary preservation and untouched pre-effect refusals.
 //! - Live inline/slab bounds and independent own writable authorization.
+//! - Source-shape stability invalidation with independent holder/child bytes.
 //!
 //! # Invariants
 //! The aligned host arena models the scalar native DTO; it never enters GC.
@@ -11,6 +12,9 @@
 //! model explicitly assigns nonoverlapping object/shape offsets; its shape-ID
 //! offset is fixture-only. VM/runtime tests own actual
 //! table publication, descriptor semantics, weak clearing and moving roots.
+//!
+//! # See also
+//! - [`super::emit_store`] owns the emitted append and overwrite effects.
 
 use super::*;
 use crate::CompiledCode;
@@ -60,6 +64,7 @@ fn snapshot() -> JitCompileSnapshot {
         view.object_exotic_handle_byte = 16;
         view.shape_state_byte = 8;
         view.shape_inline_capacity_byte = 9;
+        view.shape_stable_byte = 10;
         view.shape_prototype_byte = 16;
         // The real layout: shape, slab handle, exotic handle, then inline words.
         assert!(view.field_layout.slab_handle_byte >= view.object_shape_byte + 4);
@@ -101,6 +106,15 @@ fn offset(arena: &[u64], byte: usize) -> u32 {
 fn address(arena: &[u64], byte: usize) -> u64 {
     (arena.as_ptr() as usize + byte) as u64
 }
+fn assert_stability(arena: &[u64], view: &JitCompileSnapshot, source: u8) {
+    for (shape, expected) in [(RECEIVER_SHAPE, source), (HOLDER_SHAPE, 1), (CHILD, 1)] {
+        assert_eq!(
+            get::<u8>(arena, shape + view.shape_stable_byte as usize),
+            expected,
+            "shape at {shape}"
+        );
+    }
+}
 fn put_offset(arena: &mut [u64], field: usize, target: usize) {
     let compressed = offset(arena, target);
     put(arena, field, compressed);
@@ -122,6 +136,7 @@ fn prepare(arena: &mut [u64], view: &mut JitCompileSnapshot, proof: &AtomicU32) 
     for (shape, id) in [(RECEIVER_SHAPE, 7u64), (HOLDER_SHAPE, 8), (CHILD, 9)] {
         put(arena, shape + SHAPE_ID_BYTE as usize, id);
         put(arena, shape + view.shape_inline_capacity_byte as usize, 2u8);
+        put(arena, shape + view.shape_stable_byte as usize, 1u8);
         put(
             arena,
             shape + view.shape_state_byte as usize,
@@ -320,6 +335,7 @@ fn emitted_actions_keep_inherited_reads_append_slots_and_pre_effect_misses_indep
         get::<u32>(&arena, RECEIVER + view.object_shape_byte as usize),
         offset(&arena, CHILD)
     );
+    assert_stability(&arena, &view, 0);
 
     for failure in 0..9 {
         prepare(&mut arena, &mut view, &proof);
@@ -362,6 +378,7 @@ fn emitted_actions_keep_inherited_reads_append_slots_and_pre_effect_misses_indep
             "failure {failure}"
         );
         assert_eq!(arena, before, "pre-effect failure {failure}");
+        assert_stability(&arena, &view, 1);
         proof.store(1, std::sync::atomic::Ordering::Relaxed);
     }
     prepare(&mut arena, &mut view, &proof);
@@ -395,6 +412,7 @@ fn emitted_actions_keep_inherited_reads_append_slots_and_pre_effect_misses_indep
         get::<u32>(&arena, RECEIVER + view.object_shape_byte as usize),
         shape_before
     );
+    assert_stability(&arena, &view, 1);
     put(
         &mut arena,
         SLAB + view.field_layout.slab_capacity_byte as usize,
@@ -403,4 +421,5 @@ fn emitted_actions_keep_inherited_reads_append_slots_and_pre_effect_misses_indep
     let before = arena.clone();
     assert_eq!(run(&code, &mut arena, Value::number_i32(999)), POISON);
     assert_eq!(arena, before);
+    assert_stability(&arena, &view, 1);
 }

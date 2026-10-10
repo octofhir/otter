@@ -612,6 +612,8 @@ pub struct JitCompileSnapshot {
     /// once at compile time from `otter-vm`'s `#[repr(C)]` body layouts so the
     /// emitter stays layout-agnostic.
     pub array_layout: JitArrayLayout,
+    /// Static offsets for a generated `.length` read on a typed view.
+    pub typed_array_length: JitTypedArrayLengthLayout,
     /// Complete CodeBlock-owned CacheIR programs, copied at the compilation
     /// boundary and keyed by source byte PC. Every installed program must be
     /// representable or the site is absent and uses its committed cold edge.
@@ -1559,6 +1561,25 @@ pub struct JitDirectMethod {
     pub body: Option<Arc<JitCompileSnapshot>>,
 }
 
+/// Offsets a generated `.length` read on a typed view uses. The read is the
+/// view's own cached element count, which is exact while the view has no
+/// named own property (the only state a `length` read consults besides the
+/// count), its storage is a fixed-length local buffer (non-null cached element
+/// base: neither length-tracking nor shrinkable) and no buffer was ever
+/// detached (the isolate's detach protector). Zero offsets mean no layout was
+/// baked.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct JitTypedArrayLengthLayout {
+    /// `GcHeader::type_tag` of a typed view body.
+    pub type_tag: u8,
+    /// 4-byte expando handle, zero while the view owns no named property.
+    pub expando_byte: u32,
+    /// Cached element base, non-null only over a fixed-length local buffer.
+    pub data_byte: u32,
+    /// `u64` element count.
+    pub length_byte: u32,
+}
+
 /// Current static offsets needed by native Array guards.
 ///
 /// Dense element storage remains behind runtime stubs because Rust container
@@ -2023,6 +2044,7 @@ impl JitCompileSnapshot {
             cage_base: 0,
             backedge_fuel_cell: 0,
             array_layout: JitArrayLayout::default(),
+            typed_array_length: JitTypedArrayLengthLayout::default(),
             element_accesses: rustc_hash::FxHashMap::default(),
             array_iteration: None,
             unseen_element_sites: rustc_hash::FxHashSet::default(),

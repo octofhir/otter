@@ -7,8 +7,9 @@
 //!   intrinsic-prototype primitives of static intrinsic-prototype reads.
 //! - [`emit_property_transition_shape_barrier`] — the child-shape edge barrier
 //!   after an add-transition commit.
-//! - [`emit_exotic_length_fast`] — the `.length` reads no IC handler
-//!   describes.
+//! - [`emit_exotic_length_fast`] / [`emit_typed_view_length`] — the `.length`
+//!   reads no IC handler describes: arrays, strings and plain typed views.
+//! - [`emit_closure_prototype_load`] — a closure's own `prototype` slot.
 //! - [`emit_element_address`] / [`emit_element_read`] / [`emit_element_write`]
 //!   — the indexed element access program.
 //! - [`emit_native_leaf_guard`] / [`emit_native_leaf_call`] — prove a static
@@ -234,6 +235,7 @@ pub(crate) fn emit_exotic_length_fast(
     let string_tag = u32::from(view.string_layout.string_type_tag);
     let string_len_byte = view.string_layout.string_len_byte;
     let try_string = ops.new_dynamic_label();
+    let try_typed = ops.new_dynamic_label();
 
     emit_cell_test(ops, 9, CellTest::IsNotCell, not_length);
     // A cell value is its header's full address.
@@ -258,7 +260,7 @@ pub(crate) fn emit_exotic_length_fast(
         ; b =>have_length
         ; =>try_string
         ; cmp w14, string_tag
-        ; b.ne =>not_length
+        ; b.ne =>try_typed
         ; ldr w9, [x13, string_len_byte]
     );
     // Ropes carry a u32 length and can exceed the tagged int32 range without
@@ -271,7 +273,50 @@ pub(crate) fn emit_exotic_length_fast(
         ; b.hi =>not_length
     );
     emit_box_int32(ops, 9, 12);
+    dynasm!(ops ; .arch aarch64 ; b =>have_length ; =>try_typed);
+    let typed_tag = u32::from(view.typed_array_length.type_tag);
+    if typed_tag == 0 {
+        dynasm!(ops ; .arch aarch64 ; b =>not_length);
+        return;
+    }
+    dynasm!(ops ; .arch aarch64 ; cmp w14, typed_tag ; b.ne =>not_length);
+    emit_typed_view_length(ops, view, 13, 9, not_length);
+    emit_load_u64(ops, 12, i32::MAX as u64);
+    dynasm!(ops
+        ; .arch aarch64
+        ; cmp x9, x12
+        ; b.hi =>not_length
+    );
+    emit_box_int32(ops, 9, 12);
     dynasm!(ops ; .arch aarch64 ; b =>have_length);
+}
+
+/// With `X(receiver)` a typed view cell, load its element count into
+/// `X(out)` when that count is its `length`: the view owns no named property,
+/// its storage is a fixed-length local buffer and no buffer was ever
+/// detached (see [`otter_vm::JitTypedArrayLengthLayout`]). Otherwise branch to
+/// `miss`. Reads the native context from `x20`; clobbers `x16`.
+pub(crate) fn emit_typed_view_length(
+    ops: &mut Assembler,
+    view: &JitCompileSnapshot,
+    receiver: u8,
+    out: u8,
+    miss: DynamicLabel,
+) {
+    let layout = view.typed_array_length;
+    dynasm!(ops
+        ; .arch aarch64
+        ; ldr w16, [X(receiver), layout.expando_byte]
+        ; cbnz w16, =>miss
+        ; ldr x16, [X(receiver), layout.data_byte]
+        ; cbz x16, =>miss
+        ; ldr x16, [x20, THREAD_OFFSET]
+        ; ldr x16, [x16, VM_THREAD_ARRAY_BUFFER_DETACH_PROTECTOR_CELL_OFFSET]
+        ; cbz x16, =>miss
+        ; ldrb w16, [x16]
+        ; cbnz w16, =>miss
+        ; ldr X(out), [X(receiver), layout.length_byte]
+    );
 }
 
 /// Whether a family is baked for the indexed-element program.

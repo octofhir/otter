@@ -1328,6 +1328,15 @@ impl Interpreter {
             type_tag: crate::array::ARRAY_BODY_TYPE_TAG,
             length_byte: header + crate::array::ARRAY_BODY_LENGTH_OFFSET as u32,
         };
+        {
+            use crate::binary::typed_array as typed;
+            view.typed_array_length = jit::JitTypedArrayLengthLayout {
+                type_tag: typed::TYPED_ARRAY_BODY_TYPE_TAG,
+                expando_byte: header + typed::TYPED_ARRAY_BODY_EXPANDO_OFFSET as u32,
+                data_byte: header + typed::TYPED_ARRAY_BODY_DATA_OFFSET as u32,
+                length_byte: header + typed::TYPED_ARRAY_BODY_LENGTH_OFFSET as u32,
+            };
+        }
         view.cage_base = otter_gc::cage_base() as usize;
     }
 

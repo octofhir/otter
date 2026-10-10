@@ -345,17 +345,19 @@ impl Codegen<'_> {
         Ok(())
     }
 
-    /// An ordinary array's or a string's `length` as a tagged int32, then a
-    /// jump to the returned label, bound after the node; any other receiver,
-    /// or a length past int32, falls through to the property load emitted
-    /// after it.
+    /// An ordinary array's, a string's or a plain typed view's `length` as a
+    /// tagged int32, then a jump to the returned label, bound after the node;
+    /// any other receiver, or a length past int32, falls through to the
+    /// property load emitted after it.
     fn emit_exotic_length(&mut self, node: NodeId, receiver: u8, destination: u8) -> DynamicLabel {
         let view = self.view_of(node);
         let array_tag = view.array_layout.type_tag as i8;
         let array_length_byte = view.array_layout.length_byte as i32;
         let string_tag = view.string_layout.string_type_tag as i8;
         let string_length_byte = view.string_layout.string_len_byte as i32;
-        let (string, boxed, other, done) = (
+        let typed = view.typed_array_length;
+        let (string, typed_view, boxed, other, done) = (
+            self.ops.new_dynamic_label(),
             self.ops.new_dynamic_label(),
             self.ops.new_dynamic_label(),
             self.ops.new_dynamic_label(),
@@ -370,8 +372,34 @@ impl Codegen<'_> {
             ; jmp =>boxed
             ; =>string
             ; cmp BYTE [Rq(receiver)], string_tag
-            ; jne =>other
+            ; jne =>typed_view
             ; mov r10d, DWORD [Rq(receiver) + string_length_byte]
+            ; jmp =>boxed
+            ; =>typed_view
+        );
+        if typed.type_tag == 0 {
+            dynasm!(self.ops ; .arch x64 ; jmp =>other);
+        } else {
+            // A typed view's count is its `length` while it owns no named
+            // property, its storage is a fixed-length local buffer and no
+            // buffer was ever detached.
+            dynasm!(self.ops
+                ; .arch x64
+                ; cmp BYTE [Rq(receiver)], typed.type_tag as i8
+                ; jne =>other
+                ; cmp DWORD [Rq(receiver) + typed.expando_byte as i32], 0
+                ; jne =>other
+                ; cmp QWORD [Rq(receiver) + typed.data_byte as i32], 0
+                ; je =>other
+                ; mov r10, [r15 + crate::entry::THREAD_OFFSET as i32]
+                ; mov r10, [r10 + crate::entry::VM_THREAD_ARRAY_BUFFER_DETACH_PROTECTOR_CELL_OFFSET as i32]
+                ; test r10, r10 ; jz =>other
+                ; cmp BYTE [r10], 0 ; jne =>other
+                ; mov r10, QWORD [Rq(receiver) + typed.length_byte as i32]
+            );
+        }
+        dynasm!(self.ops
+            ; .arch x64
             ; =>boxed
             // A length past int32 is a Number the property load boxes.
             ; cmp r10, i32::MAX

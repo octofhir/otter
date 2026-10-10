@@ -2577,17 +2577,19 @@ impl<'a> Codegen<'a> {
 
     /// A named load probes the one live action table, then completes its
     /// actual source once through the committed runtime owner on a miss.
-    /// An ordinary array's or a string's `length` as a tagged int32, then a
-    /// jump to the returned label, bound after the node; any other receiver,
-    /// or a length past int32, falls through to the property load emitted
-    /// after it.
+    /// An ordinary array's, a string's or a plain typed view's `length` as a
+    /// tagged int32, then a jump to the returned label, bound after the node;
+    /// any other receiver, or a length past int32, falls through to the
+    /// property load emitted after it.
     fn emit_exotic_length(&mut self, node: NodeId, receiver: u8, destination: u8) -> DynamicLabel {
         let view = metadata::source_view(self.view, self.inline_views, self.graph, node);
         let array_tag = u32::from(view.array_layout.type_tag);
         let array_length_byte = view.array_layout.length_byte;
         let string_tag = u32::from(view.string_layout.string_type_tag);
         let string_length_byte = view.string_layout.string_len_byte;
-        let (string, boxed, other) = (
+        let typed_tag = u32::from(view.typed_array_length.type_tag);
+        let (string, typed, boxed, other) = (
+            self.ops.new_dynamic_label(),
             self.ops.new_dynamic_label(),
             self.ops.new_dynamic_label(),
             self.ops.new_dynamic_label(),
@@ -2604,10 +2606,24 @@ impl<'a> Codegen<'a> {
             ; b =>boxed
             ; =>string
             ; cmp w17, string_tag
-            ; b.ne =>other
+            ; b.ne =>typed
             ; ldr w16, [X(receiver), string_length_byte]
-            ; =>boxed
+            ; b =>boxed
+            ; =>typed
         );
+        if typed_tag == 0 {
+            dynasm!(self.ops ; .arch aarch64 ; b =>other);
+        } else {
+            dynasm!(self.ops ; .arch aarch64 ; cmp w17, typed_tag ; b.ne =>other);
+            crate::template::arm64::ic_probe::emit_typed_view_length(
+                &mut self.ops,
+                view,
+                receiver,
+                16,
+                other,
+            );
+        }
+        dynasm!(self.ops ; .arch aarch64 ; =>boxed);
         // A length past int32 is a Number the property load boxes.
         self.load_immediate(17, i32::MAX as u64);
         let done = self.ops.new_dynamic_label();

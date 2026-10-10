@@ -285,13 +285,16 @@ fn emitted_actions_keep_inherited_reads_append_slots_and_pre_effect_misses_indep
         Value::number_i32(11).to_bits()
     );
     assert_eq!(arena, before_own);
-    // The same inherited action must decline a holder that is no longer ordinary.
+    // The same inherited action must decline a holder that is no longer
+    // ordinary: becoming a dictionary installs another shape (a shape's
+    // state never changes), which the recorded holder shape no longer names.
     prepare(&mut arena, &mut view, &proof);
     put(
         &mut arena,
-        HOLDER_SHAPE + view.shape_state_byte as usize,
+        CHILD + view.shape_state_byte as usize,
         ShapeState::DICTIONARY_MASK,
     );
+    put_offset(&mut arena, HOLDER + view.object_shape_byte as usize, CHILD);
     let held = executable(&view, false, false);
     let before_held = arena.clone();
     assert_eq!(run(&held, &mut arena, Value::UNDEFINED), POISON);

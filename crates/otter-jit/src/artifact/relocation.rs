@@ -392,7 +392,11 @@ impl RelocationCapture {
             }
         }
         self.pool.index.clear();
-        Some((pool_start, ops.offset().0))
+        // The pool is data: validation must not decode its words, which may
+        // hold any constant, as instructions.
+        let end = ops.offset().0;
+        self.record_data(pool_start, end);
+        Some((pool_start, end))
     }
 
     /// Records one in-code data range (a literal pool) that `ldr (literal)`
@@ -2254,6 +2258,21 @@ mod tests {
         let tail = &rendered.normalized_code[14..];
         assert_eq!(tail[..6], [ITEM_DIRECT_BRANCH, 8, 1, 1, 0, 2]);
         assert!(tail.ends_with(&[ITEM_DATA_WORD, 0, 0, 0, 0x14, ITEM_DATA_WORD, 0, 0, 0, 0]));
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn an_emitted_literal_pool_is_data_whatever_its_constants_decode_as() {
+        use dynasmrt::dynasm;
+        let mut capture = RelocationCapture::new(true).with_literal_pool();
+        let mut ops = dynasmrt::aarch64::Assembler::new().unwrap();
+        // The low word of this constant encodes `b` far outside the code.
+        let constant = 0x1234_5678_17ff_0000;
+        assert!(capture.emit_constant_load(&mut ops, 17, constant));
+        dynasm!(ops ; .arch aarch64 ; ret);
+        capture.emit_literal_pool(&mut ops);
+        let code = ops.finalize().unwrap();
+        capture.render(&code).expect("pool words are data");
     }
 
     #[cfg(target_arch = "aarch64")]

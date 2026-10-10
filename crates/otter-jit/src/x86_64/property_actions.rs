@@ -99,9 +99,6 @@ pub(crate) fn emit_action_probe(
         return;
     };
     let store = matches!(access, PropertySourceAccess::Store);
-    let excluded = ShapeState::DICTIONARY_MASK
-        | ShapeState::OPAQUE_LOOKUP_MASK
-        | if store { ShapeState::PROTOTYPE_MASK } else { 0 };
     emit_load_u64(ops, 10, tag::NOT_CELL_MASK);
     dynasm!(ops ; .arch x64
         ; test Rq(receiver), r10 ; jnz =>miss
@@ -113,7 +110,20 @@ pub(crate) fn emit_action_probe(
         ; mov Rd(shape), [Rq(receiver) + view.object_shape_byte as i32]
         ; test Rd(shape), Rd(shape) ; jz =>miss
         ; add Rq(shape), r10
-        ; test BYTE [Rq(shape) + view.shape_state_byte as i32], excluded as i8 ; jnz =>miss
+    );
+    // The table records loads only for shaped receivers with ordinary
+    // lookup: a dictionary or opaque receiver's shape id keys no load entry,
+    // so a load probe needs no state test (V8 probes its stub cache by map
+    // alone). A store also refuses a prototype receiver, whose stores reach
+    // the prototype-validity owner.
+    if store {
+        let excluded = ShapeState::DICTIONARY_MASK
+            | ShapeState::OPAQUE_LOOKUP_MASK
+            | ShapeState::PROTOTYPE_MASK;
+        dynasm!(ops ; .arch x64
+            ; test BYTE [Rq(shape) + view.shape_state_byte as i32], excluded as i8 ; jnz =>miss);
+    }
+    dynasm!(ops ; .arch x64
         ; mov Rq(identity), [Rq(shape) + cache.shape_id_byte as i32]);
 
     emit_load_u64(ops, 11, cache.hash_shape_multiplier);
@@ -195,7 +205,8 @@ pub(crate) fn emit_action_probe(
             emit_load_u64(ops, 11, 0xffff_ffff_0000_0000);
             dynasm!(ops ; .arch x64
                 ; and r11, Rq(shape) ; add r10, r11
-                ; test BYTE [r10 + view.shape_state_byte as i32], (ShapeState::DICTIONARY_MASK | ShapeState::OPAQUE_LOOKUP_MASK) as i8 ; jnz =>miss
+                // The recorded holder was shaped with ordinary lookup, so its
+                // never reused shape id proves its state as well as its layout.
                 ; mov r10, [r10 + cache.shape_id_byte as i32]
                 ; cmp r10, [Rq(entry) + cache.holder_shape_id_byte as i32] ; jne =>miss
                 ; movzx Rd(identity), WORD [Rq(entry) + cache.load_slot_byte as i32]);

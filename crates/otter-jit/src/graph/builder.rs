@@ -1174,6 +1174,7 @@ impl<'a> Builder<'a> {
     fn start_entry(&mut self, entry: BlockId) {
         self.current = Some(entry);
         let params = self.view.code_block.param_count.min(self.register_count);
+        self.frame = vec![self.undefined; usize::from(self.register_count)];
         for register in 0..self.register_count {
             self.frame[usize::from(register)] = if register < params {
                 self.add(Kind::InitialRegister(register), &[], Repr::Tagged)
@@ -1196,6 +1197,7 @@ impl<'a> Builder<'a> {
             .analysis
             .live_at(self.analysis.blocks[header].start)
             .clone();
+        self.frame = vec![self.undefined; usize::from(self.register_count)];
         for register in 0..self.register_count {
             self.frame[usize::from(register)] = if live.contains(register) {
                 self.add(Kind::InitialRegister(register), &[], Repr::Tagged)
@@ -1208,7 +1210,7 @@ impl<'a> Builder<'a> {
 
     /// Begin bytecode block `block`; `false` when nothing reaches it.
     fn start_block(&mut self, block: usize) -> bool {
-        let incoming = std::mem::take(&mut self.incoming[block]);
+        let mut incoming = std::mem::take(&mut self.incoming[block]);
         if incoming.is_empty() {
             return false;
         }
@@ -1222,20 +1224,6 @@ impl<'a> Builder<'a> {
             incoming.iter().map(|edge| edge.block).collect();
         self.graph.block_mut(graph_block).is_loop = is_loop;
 
-        let mut known = incoming[0].known.clone();
-        for edge in &incoming[1..] {
-            known.intersect(&edge.known);
-        }
-        if is_loop {
-            known.forget_storage();
-            let key = self.loop_key(block);
-            match self.policies.get(&key) {
-                Some(policy) if policy.clobber => known.clobber_heap(),
-                Some(policy) => known.forget(&policy.dropped),
-                None => {}
-            }
-            self.assumptions.insert(key, known.heap_facts());
-        }
         // The OSR entry lies in the compiled function's own body.
         let encloses_osr = is_loop
             && self.inline.is_none()
@@ -1276,6 +1264,22 @@ impl<'a> Builder<'a> {
         }
         if is_loop {
             self.loop_phis.insert(block, phis);
+        }
+        // Phis read each edge's own facts above; the merge takes the first
+        // edge's and keeps what every other agrees on.
+        let mut known = std::mem::take(&mut incoming[0].known);
+        for edge in &incoming[1..] {
+            known.intersect(&edge.known);
+        }
+        if is_loop {
+            known.forget_storage();
+            let key = self.loop_key(block);
+            match self.policies.get(&key) {
+                Some(policy) if policy.clobber => known.clobber_heap(),
+                Some(policy) => known.forget(&policy.dropped),
+                None => {}
+            }
+            self.assumptions.insert(key, known.heap_facts());
         }
         self.frame = frame;
         self.known = known;
@@ -1355,10 +1359,12 @@ impl<'a> Builder<'a> {
             self.graph.node_mut(jump).eager = Some(state);
             return;
         }
+        // The block ends here: its state moves onto the edge, and the next
+        // block or the inline caller installs its own.
         self.incoming[target].push(Incoming {
             block: current,
-            frame: self.frame.clone(),
-            known: self.known.clone(),
+            frame: std::mem::take(&mut self.frame),
+            known: std::mem::take(&mut self.known),
         });
         self.terminate(Kind::Jump(target_block), &[]);
     }
@@ -1381,9 +1387,25 @@ impl<'a> Builder<'a> {
         );
         // Each edge continues from its own split block with the branch's
         // facts: a box one edge materializes does not exist on the other.
-        let known = self.known.clone();
-        for (split, target) in [(true_block, if_true), (false_block, if_false)] {
-            self.known = known.clone();
+        let mut state = Some((
+            std::mem::take(&mut self.frame),
+            std::mem::take(&mut self.known),
+        ));
+        for (edge, (split, target)) in [(true_block, if_true), (false_block, if_false)]
+            .into_iter()
+            .enumerate()
+        {
+            let (frame, known) = if edge == 1 {
+                state
+                    .take()
+                    .expect("the second edge takes the branch state")
+            } else {
+                state
+                    .clone()
+                    .expect("the first edge copies the branch state")
+            };
+            self.frame = frame;
+            self.known = known;
             self.current = Some(split);
             self.graph.block_mut(split).predecessors.push(current);
             self.goto(target);

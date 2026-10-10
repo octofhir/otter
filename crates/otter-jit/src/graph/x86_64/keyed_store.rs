@@ -1,10 +1,11 @@
-//! x86-64 generic element stores: V8's `KeyedStoreIC_Megamorphic` for a
-//! site the optimizer does not specialize.
+//! x86-64 generic element stores for a site the optimizer does not
+//! specialize.
 //!
 //! # Contents
 //! - [`Codegen::emit_keyed_store`] stores into an Array's dense storage of
-//!   any kind inline, a name key through the code object's keyed table
-//!   routine, and every other store in the runtime.
+//!   any kind inline, appends at its length through the VM's push leaf, a
+//!   name key through the code object's keyed table routine, and every
+//!   other store in the runtime.
 //!
 //! # Invariants
 //! - Every guard precedes the one store; a failed guard has written nothing
@@ -14,6 +15,9 @@
 //! - A store into numeric storage fills its hole as the VM does: the bit is
 //!   cleared and counted, and the last one makes the storage packed. A
 //!   tagged cell value takes the element write barrier.
+//! - An append is an ordinary own addition under the same permit as a
+//!   hole store; the push leaf completes it only within the storage's
+//!   capacity and its own dense-range guards, so it never allocates.
 //! - The keyed table routine neither allocates nor collects; the runtime
 //!   operation grows storage and records the site's feedback.
 //!
@@ -53,6 +57,7 @@ impl Codegen<'_> {
         let holey = self.ops.new_dynamic_label();
         let store_double = self.ops.new_dynamic_label();
         let store_tagged = self.ops.new_dynamic_label();
+        let in_bounds = self.ops.new_dynamic_label();
         self.load_immediate(10, tag::NOT_CELL_MASK);
         dynasm!(self.ops ; .arch x64
             ; test Rq(receiver), r10 ; jnz =>other
@@ -62,7 +67,13 @@ impl Codegen<'_> {
             ; mov r10, Rq(key) ; sar r10, 49 ; cmp r10, -1 ; jne =>runtime
             ; test Rd(key), Rd(key) ; js =>runtime
             ; mov Rd(length), [Rq(receiver) + storage.length_byte as i32]
-            ; cmp Rd(length), Rd(key) ; jbe =>runtime
+            ; cmp Rd(length), Rd(key) ; ja =>in_bounds ; jne =>runtime
+        );
+        // A key at the length appends.
+        self.emit_hole_store_permit(storage, receiver, runtime);
+        self.emit_array_push_leaf(node, [receiver, key, value], runtime, done);
+        dynasm!(self.ops ; .arch x64
+            ; =>in_bounds
             ; mov Rq(base), [Rq(receiver) + storage.base_byte as i32]
             ; movzx r10d, BYTE [Rq(receiver) + numeric.kind_byte as i32]
             ; cmp r10d, i32::from(storage.tagged_kind) ; je =>tagged
@@ -147,6 +158,48 @@ impl Codegen<'_> {
             ; call =>routine
             ; mov r11, rdx
         );
+        self.emit_restore_registers(&live, saved as u32);
+        dynasm!(self.ops ; .arch x64
+            ; mov Rq(receiver), [rsp] ; mov Rq(key), [rsp + 8] ; mov Rq(value), [rsp + 16]
+            ; add rsp, PARKED_BYTES as i32
+            ; test r11, r11 ; jz =>stored ; jmp =>missed
+        );
+        self.sp_delta -= PARKED_BYTES;
+    }
+
+    /// Append `Rq(value)` to the Array in `Rq(receiver)` through the VM's
+    /// push leaf: to `stored` when it appended, else to `missed` with every
+    /// register as it was. The leaf refuses a full storage or a range its
+    /// own guards do not admit, and never allocates.
+    fn emit_array_push_leaf(
+        &mut self,
+        node: NodeId,
+        [receiver, key, value]: [u8; 3],
+        missed: DynamicLabel,
+        stored: DynamicLabel,
+    ) {
+        let leaf = otter_vm::runtime_stubs::ARRAY_PUSH_LEAF;
+        let live = self.allocation.node(node).live_registers.clone();
+        dynasm!(self.ops ; .arch x64
+            ; sub rsp, PARKED_BYTES as i32
+            ; mov [rsp], Rq(receiver) ; mov [rsp + 8], Rq(key) ; mov [rsp + 16], Rq(value)
+        );
+        self.sp_delta += PARKED_BYTES;
+        let saved = self.emit_save_registers(&live) as i32;
+        dynasm!(self.ops ; .arch x64
+            ; mov rsi, [rsp + saved]
+            ; mov rdx, [rsp + saved + 16]
+            ; mov rdi, [r15 + crate::entry::THREAD_OFFSET as i32]
+            ; mov rdi, [rdi + crate::entry::VM_THREAD_GC_HEAP_OFFSET as i32]
+        );
+        crate::x86_64::values::emit_load_runtime_stub(
+            &mut self.ops,
+            &mut self.relocations,
+            leaf.entry_addr() as u64,
+            leaf.descriptor,
+        );
+        crate::x86_64::call_abi::emit_runtime_call(&mut self.ops, leaf.descriptor);
+        dynasm!(self.ops ; .arch x64 ; mov r11, rdx);
         self.emit_restore_registers(&live, saved as u32);
         dynasm!(self.ops ; .arch x64
             ; mov Rq(receiver), [rsp] ; mov Rq(key), [rsp + 8] ; mov Rq(value), [rsp + 16]

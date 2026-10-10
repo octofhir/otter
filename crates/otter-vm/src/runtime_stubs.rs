@@ -41,7 +41,10 @@ use crate::native_abi::{
     STUB_COLLECTION_SET_DELETE_ALLOC, STUB_COLLECTION_SET_HAS_ALLOC, STUB_COLLECTION_SET_HAS_LEAF,
     STUB_COPY_CONTEXT_ALLOC, STUB_CREATE_CONTEXT_ALLOC, STUB_INSTANCEOF_LEAF,
     STUB_JIT_MAKE_CLOSURE, STUB_JIT_MAKE_FN, STUB_KEYED_NAMED_LOAD_LEAF, STUB_MATH_ABS_LEAF,
-    STUB_MATH_FLOOR_LEAF, STUB_MATH_MAX_LEAF, STUB_MATH_MIN_LEAF, STUB_MATH_SQRT_LEAF,
+    STUB_MATH_ATAN_LEAF, STUB_MATH_ATAN2_LEAF, STUB_MATH_CEIL_LEAF, STUB_MATH_COS_LEAF,
+    STUB_MATH_EXP_LEAF, STUB_MATH_FLOOR_LEAF, STUB_MATH_LOG_LEAF, STUB_MATH_MAX_LEAF,
+    STUB_MATH_MIN_LEAF, STUB_MATH_POW_LEAF, STUB_MATH_ROUND_LEAF, STUB_MATH_SIN_LEAF,
+    STUB_MATH_SQRT_LEAF, STUB_MATH_TAN_LEAF, STUB_MATH_TRUNC_LEAF,
     STUB_NUMBER_POW_F64_LEAF, STUB_NUMBER_REM_F64_LEAF, STUB_NUMBER_REM_LEAF,
     STUB_NUMBER_TO_INT32_F64_LEAF, STUB_PARSE_INT_I32_LEAF, STUB_STRICT_EQ_LEAF,
     STUB_STRING_CHAR_CODE_AT_LEAF, STUB_STRING_CODE_POINT_AT_LEAF, STUB_STRING_CONCAT_ALLOC,
@@ -597,6 +600,72 @@ pub const MATH_MIN_LEAF: LeafNoAllocStub2 = LeafNoAllocStub2 {
     entry: math_min_leaf,
 };
 
+/// Callable ABI entry for `Math.sin`.
+pub const MATH_SIN_LEAF: LeafNoAllocStub2 = LeafNoAllocStub2 {
+    descriptor: STUB_MATH_SIN_LEAF,
+    entry: math_sin_leaf,
+};
+
+/// Callable ABI entry for `Math.cos`.
+pub const MATH_COS_LEAF: LeafNoAllocStub2 = LeafNoAllocStub2 {
+    descriptor: STUB_MATH_COS_LEAF,
+    entry: math_cos_leaf,
+};
+
+/// Callable ABI entry for `Math.tan`.
+pub const MATH_TAN_LEAF: LeafNoAllocStub2 = LeafNoAllocStub2 {
+    descriptor: STUB_MATH_TAN_LEAF,
+    entry: math_tan_leaf,
+};
+
+/// Callable ABI entry for `Math.atan`.
+pub const MATH_ATAN_LEAF: LeafNoAllocStub2 = LeafNoAllocStub2 {
+    descriptor: STUB_MATH_ATAN_LEAF,
+    entry: math_atan_leaf,
+};
+
+/// Callable ABI entry for `Math.exp`.
+pub const MATH_EXP_LEAF: LeafNoAllocStub2 = LeafNoAllocStub2 {
+    descriptor: STUB_MATH_EXP_LEAF,
+    entry: math_exp_leaf,
+};
+
+/// Callable ABI entry for `Math.log`.
+pub const MATH_LOG_LEAF: LeafNoAllocStub2 = LeafNoAllocStub2 {
+    descriptor: STUB_MATH_LOG_LEAF,
+    entry: math_log_leaf,
+};
+
+/// Callable ABI entry for `Math.ceil`.
+pub const MATH_CEIL_LEAF: LeafNoAllocStub2 = LeafNoAllocStub2 {
+    descriptor: STUB_MATH_CEIL_LEAF,
+    entry: math_ceil_leaf,
+};
+
+/// Callable ABI entry for `Math.round`.
+pub const MATH_ROUND_LEAF: LeafNoAllocStub2 = LeafNoAllocStub2 {
+    descriptor: STUB_MATH_ROUND_LEAF,
+    entry: math_round_leaf,
+};
+
+/// Callable ABI entry for `Math.trunc`.
+pub const MATH_TRUNC_LEAF: LeafNoAllocStub2 = LeafNoAllocStub2 {
+    descriptor: STUB_MATH_TRUNC_LEAF,
+    entry: math_trunc_leaf,
+};
+
+/// Callable ABI entry for `Math.atan2`.
+pub const MATH_ATAN2_LEAF: LeafNoAllocStub2 = LeafNoAllocStub2 {
+    descriptor: STUB_MATH_ATAN2_LEAF,
+    entry: math_atan2_leaf,
+};
+
+/// Callable ABI entry for `Math.pow`.
+pub const MATH_POW_LEAF: LeafNoAllocStub2 = LeafNoAllocStub2 {
+    descriptor: STUB_MATH_POW_LEAF,
+    entry: math_pow_leaf,
+};
+
 /// Callable ABI entry for exact-one-argument `parseInt(Int32)`.
 pub const PARSE_INT_I32_LEAF: LeafNoAllocStub2 = LeafNoAllocStub2 {
     descriptor: STUB_PARSE_INT_I32_LEAF,
@@ -928,6 +997,17 @@ pub const fn leaf_no_alloc_stub2_by_id(id: RuntimeStubId) -> Option<LeafNoAllocS
         id if id == STUB_MATH_SQRT_LEAF.id => Some(MATH_SQRT_LEAF),
         id if id == STUB_MATH_MAX_LEAF.id => Some(MATH_MAX_LEAF),
         id if id == STUB_MATH_MIN_LEAF.id => Some(MATH_MIN_LEAF),
+        id if id == STUB_MATH_SIN_LEAF.id => Some(MATH_SIN_LEAF),
+        id if id == STUB_MATH_COS_LEAF.id => Some(MATH_COS_LEAF),
+        id if id == STUB_MATH_TAN_LEAF.id => Some(MATH_TAN_LEAF),
+        id if id == STUB_MATH_ATAN_LEAF.id => Some(MATH_ATAN_LEAF),
+        id if id == STUB_MATH_EXP_LEAF.id => Some(MATH_EXP_LEAF),
+        id if id == STUB_MATH_LOG_LEAF.id => Some(MATH_LOG_LEAF),
+        id if id == STUB_MATH_CEIL_LEAF.id => Some(MATH_CEIL_LEAF),
+        id if id == STUB_MATH_ROUND_LEAF.id => Some(MATH_ROUND_LEAF),
+        id if id == STUB_MATH_TRUNC_LEAF.id => Some(MATH_TRUNC_LEAF),
+        id if id == STUB_MATH_ATAN2_LEAF.id => Some(MATH_ATAN2_LEAF),
+        id if id == STUB_MATH_POW_LEAF.id => Some(MATH_POW_LEAF),
         id if id == STUB_PARSE_INT_I32_LEAF.id => Some(PARSE_INT_I32_LEAF),
         id if id == STUB_COLLECTION_MAP_HAS_LEAF.id => Some(COLLECTION_MAP_HAS_LEAF),
         id if id == STUB_COLLECTION_SET_HAS_LEAF.id => Some(COLLECTION_SET_HAS_LEAF),
@@ -1977,6 +2057,133 @@ pub extern "C" fn math_min_leaf(
 ) -> NativeResultPair {
     let _guard = LeafNoAllocGuard::new(heap);
     math_binary_leaf(lhs_bits, rhs_bits, js_math_min)
+}
+
+/// One `Math` method over number arguments, reached through the declared
+/// leaf ABI: the same arithmetic the native runs. A non-number argument
+/// misses, because its coercion can observe user code.
+fn math_method_leaf(
+    method: otter_bytecode::method_id::MathMethod,
+    words: &[u64],
+) -> NativeResultPair {
+    let mut numbers = smallvec::SmallVec::<[crate::number::NumberValue; 2]>::new();
+    for &bits in words {
+        let Some(number) = Value::from_abi_bits(bits).as_number() else {
+            return NativeResultPair::miss();
+        };
+        numbers.push(number);
+    }
+    NativeResultPair::success(Value::number(crate::math::apply_numbers(method, &numbers)))
+}
+
+/// Leaf ABI entry for `Math.sin`.
+pub extern "C" fn math_sin_leaf(
+    heap: *const otter_gc::GcHeap,
+    arg_bits: u64,
+    _unused: u64,
+) -> NativeResultPair {
+    let _guard = LeafNoAllocGuard::new(heap);
+    math_method_leaf(otter_bytecode::method_id::MathMethod::Sin, &[arg_bits])
+}
+
+/// Leaf ABI entry for `Math.cos`.
+pub extern "C" fn math_cos_leaf(
+    heap: *const otter_gc::GcHeap,
+    arg_bits: u64,
+    _unused: u64,
+) -> NativeResultPair {
+    let _guard = LeafNoAllocGuard::new(heap);
+    math_method_leaf(otter_bytecode::method_id::MathMethod::Cos, &[arg_bits])
+}
+
+/// Leaf ABI entry for `Math.tan`.
+pub extern "C" fn math_tan_leaf(
+    heap: *const otter_gc::GcHeap,
+    arg_bits: u64,
+    _unused: u64,
+) -> NativeResultPair {
+    let _guard = LeafNoAllocGuard::new(heap);
+    math_method_leaf(otter_bytecode::method_id::MathMethod::Tan, &[arg_bits])
+}
+
+/// Leaf ABI entry for `Math.atan`.
+pub extern "C" fn math_atan_leaf(
+    heap: *const otter_gc::GcHeap,
+    arg_bits: u64,
+    _unused: u64,
+) -> NativeResultPair {
+    let _guard = LeafNoAllocGuard::new(heap);
+    math_method_leaf(otter_bytecode::method_id::MathMethod::Atan, &[arg_bits])
+}
+
+/// Leaf ABI entry for `Math.exp`.
+pub extern "C" fn math_exp_leaf(
+    heap: *const otter_gc::GcHeap,
+    arg_bits: u64,
+    _unused: u64,
+) -> NativeResultPair {
+    let _guard = LeafNoAllocGuard::new(heap);
+    math_method_leaf(otter_bytecode::method_id::MathMethod::Exp, &[arg_bits])
+}
+
+/// Leaf ABI entry for `Math.log`.
+pub extern "C" fn math_log_leaf(
+    heap: *const otter_gc::GcHeap,
+    arg_bits: u64,
+    _unused: u64,
+) -> NativeResultPair {
+    let _guard = LeafNoAllocGuard::new(heap);
+    math_method_leaf(otter_bytecode::method_id::MathMethod::Log, &[arg_bits])
+}
+
+/// Leaf ABI entry for `Math.ceil`.
+pub extern "C" fn math_ceil_leaf(
+    heap: *const otter_gc::GcHeap,
+    arg_bits: u64,
+    _unused: u64,
+) -> NativeResultPair {
+    let _guard = LeafNoAllocGuard::new(heap);
+    math_method_leaf(otter_bytecode::method_id::MathMethod::Ceil, &[arg_bits])
+}
+
+/// Leaf ABI entry for `Math.round`.
+pub extern "C" fn math_round_leaf(
+    heap: *const otter_gc::GcHeap,
+    arg_bits: u64,
+    _unused: u64,
+) -> NativeResultPair {
+    let _guard = LeafNoAllocGuard::new(heap);
+    math_method_leaf(otter_bytecode::method_id::MathMethod::Round, &[arg_bits])
+}
+
+/// Leaf ABI entry for `Math.trunc`.
+pub extern "C" fn math_trunc_leaf(
+    heap: *const otter_gc::GcHeap,
+    arg_bits: u64,
+    _unused: u64,
+) -> NativeResultPair {
+    let _guard = LeafNoAllocGuard::new(heap);
+    math_method_leaf(otter_bytecode::method_id::MathMethod::Trunc, &[arg_bits])
+}
+
+/// Leaf ABI entry for two-argument `Math.atan2`.
+pub extern "C" fn math_atan2_leaf(
+    heap: *const otter_gc::GcHeap,
+    lhs_bits: u64,
+    rhs_bits: u64,
+) -> NativeResultPair {
+    let _guard = LeafNoAllocGuard::new(heap);
+    math_method_leaf(otter_bytecode::method_id::MathMethod::Atan2, &[lhs_bits, rhs_bits])
+}
+
+/// Leaf ABI entry for two-argument `Math.pow`.
+pub extern "C" fn math_pow_leaf(
+    heap: *const otter_gc::GcHeap,
+    lhs_bits: u64,
+    rhs_bits: u64,
+) -> NativeResultPair {
+    let _guard = LeafNoAllocGuard::new(heap);
+    math_method_leaf(otter_bytecode::method_id::MathMethod::Pow, &[lhs_bits, rhs_bits])
 }
 
 /// Leaf ABI entry for exact-one-argument `parseInt(Int32)`.

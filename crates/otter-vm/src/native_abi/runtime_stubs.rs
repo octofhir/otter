@@ -1467,6 +1467,138 @@ pub const STUB_MATH_MIN_LEAF: RuntimeStubDescriptor = descriptor(
     NativeResultDomain::Probe,
 );
 
+/// Leaf `Math.sin`.
+pub const STUB_MATH_SIN_LEAF: RuntimeStubDescriptor = descriptor(
+    104,
+    RuntimeStubClass::LeafNoAlloc,
+    RuntimeStubSignature::LeafValue2,
+    2,
+    RuntimeStubEffects::none(),
+    RuntimeStubException::Never,
+    RuntimeStubResultAbi::NativePair,
+    NativeResultDomain::Probe,
+);
+
+/// Leaf `Math.cos`.
+pub const STUB_MATH_COS_LEAF: RuntimeStubDescriptor = descriptor(
+    105,
+    RuntimeStubClass::LeafNoAlloc,
+    RuntimeStubSignature::LeafValue2,
+    2,
+    RuntimeStubEffects::none(),
+    RuntimeStubException::Never,
+    RuntimeStubResultAbi::NativePair,
+    NativeResultDomain::Probe,
+);
+
+/// Leaf `Math.tan`.
+pub const STUB_MATH_TAN_LEAF: RuntimeStubDescriptor = descriptor(
+    106,
+    RuntimeStubClass::LeafNoAlloc,
+    RuntimeStubSignature::LeafValue2,
+    2,
+    RuntimeStubEffects::none(),
+    RuntimeStubException::Never,
+    RuntimeStubResultAbi::NativePair,
+    NativeResultDomain::Probe,
+);
+
+/// Leaf `Math.atan`.
+pub const STUB_MATH_ATAN_LEAF: RuntimeStubDescriptor = descriptor(
+    107,
+    RuntimeStubClass::LeafNoAlloc,
+    RuntimeStubSignature::LeafValue2,
+    2,
+    RuntimeStubEffects::none(),
+    RuntimeStubException::Never,
+    RuntimeStubResultAbi::NativePair,
+    NativeResultDomain::Probe,
+);
+
+/// Leaf `Math.exp`.
+pub const STUB_MATH_EXP_LEAF: RuntimeStubDescriptor = descriptor(
+    108,
+    RuntimeStubClass::LeafNoAlloc,
+    RuntimeStubSignature::LeafValue2,
+    2,
+    RuntimeStubEffects::none(),
+    RuntimeStubException::Never,
+    RuntimeStubResultAbi::NativePair,
+    NativeResultDomain::Probe,
+);
+
+/// Leaf `Math.log`.
+pub const STUB_MATH_LOG_LEAF: RuntimeStubDescriptor = descriptor(
+    109,
+    RuntimeStubClass::LeafNoAlloc,
+    RuntimeStubSignature::LeafValue2,
+    2,
+    RuntimeStubEffects::none(),
+    RuntimeStubException::Never,
+    RuntimeStubResultAbi::NativePair,
+    NativeResultDomain::Probe,
+);
+
+/// Leaf `Math.ceil`.
+pub const STUB_MATH_CEIL_LEAF: RuntimeStubDescriptor = descriptor(
+    110,
+    RuntimeStubClass::LeafNoAlloc,
+    RuntimeStubSignature::LeafValue2,
+    2,
+    RuntimeStubEffects::none(),
+    RuntimeStubException::Never,
+    RuntimeStubResultAbi::NativePair,
+    NativeResultDomain::Probe,
+);
+
+/// Leaf `Math.round`.
+pub const STUB_MATH_ROUND_LEAF: RuntimeStubDescriptor = descriptor(
+    111,
+    RuntimeStubClass::LeafNoAlloc,
+    RuntimeStubSignature::LeafValue2,
+    2,
+    RuntimeStubEffects::none(),
+    RuntimeStubException::Never,
+    RuntimeStubResultAbi::NativePair,
+    NativeResultDomain::Probe,
+);
+
+/// Leaf `Math.trunc`.
+pub const STUB_MATH_TRUNC_LEAF: RuntimeStubDescriptor = descriptor(
+    112,
+    RuntimeStubClass::LeafNoAlloc,
+    RuntimeStubSignature::LeafValue2,
+    2,
+    RuntimeStubEffects::none(),
+    RuntimeStubException::Never,
+    RuntimeStubResultAbi::NativePair,
+    NativeResultDomain::Probe,
+);
+
+/// Leaf `Math.atan2` over exactly two arguments.
+pub const STUB_MATH_ATAN2_LEAF: RuntimeStubDescriptor = descriptor(
+    113,
+    RuntimeStubClass::LeafNoAlloc,
+    RuntimeStubSignature::LeafValue2,
+    2,
+    RuntimeStubEffects::none(),
+    RuntimeStubException::Never,
+    RuntimeStubResultAbi::NativePair,
+    NativeResultDomain::Probe,
+);
+
+/// Leaf `Math.pow` over exactly two arguments.
+pub const STUB_MATH_POW_LEAF: RuntimeStubDescriptor = descriptor(
+    114,
+    RuntimeStubClass::LeafNoAlloc,
+    RuntimeStubSignature::LeafValue2,
+    2,
+    RuntimeStubEffects::none(),
+    RuntimeStubException::Never,
+    RuntimeStubResultAbi::NativePair,
+    NativeResultDomain::Probe,
+);
+
 /// Leaf `parseInt(value)` for one exact int32-tagged argument.
 ///
 /// Other argument representations and all non-one-argument JavaScript call
@@ -1782,6 +1914,17 @@ pub const fn runtime_stub_name(id: super::RuntimeStubId) -> &'static str {
         101 => "string_key_atom_leaf",
         102 => "keyed_named_load_leaf",
         103 => "array_push_alloc",
+        104 => "math_sin_leaf",
+        105 => "math_cos_leaf",
+        106 => "math_tan_leaf",
+        107 => "math_atan_leaf",
+        108 => "math_exp_leaf",
+        109 => "math_log_leaf",
+        110 => "math_ceil_leaf",
+        111 => "math_round_leaf",
+        112 => "math_trunc_leaf",
+        113 => "math_atan2_leaf",
+        114 => "math_pow_leaf",
         _ => "unknown_runtime_stub",
     }
 }
@@ -2048,6 +2191,17 @@ pub const RUNTIME_STUB_DESCRIPTORS: &[RuntimeStubDescriptor] = &[
     STUB_STRING_KEY_ATOM_LEAF,
     STUB_KEYED_NAMED_LOAD_LEAF,
     STUB_ARRAY_PUSH_ALLOC,
+    STUB_MATH_SIN_LEAF,
+    STUB_MATH_COS_LEAF,
+    STUB_MATH_TAN_LEAF,
+    STUB_MATH_ATAN_LEAF,
+    STUB_MATH_EXP_LEAF,
+    STUB_MATH_LOG_LEAF,
+    STUB_MATH_CEIL_LEAF,
+    STUB_MATH_ROUND_LEAF,
+    STUB_MATH_TRUNC_LEAF,
+    STUB_MATH_ATAN2_LEAF,
+    STUB_MATH_POW_LEAF,
 ];
 
 /// Validate a descriptor and one concrete call-site safepoint id.

@@ -797,7 +797,7 @@ unsafe fn evacuate(ctx: &mut ScavCtx, header: *mut GcHeader) -> u32 {
 
         // Copy header + payload to the new location.
         let dest_ptr = ctx.cage.add(new_offset as usize);
-        core::ptr::copy_nonoverlapping(header as *const u8, dest_ptr, size);
+        copy_cell(header as *const u8, dest_ptr, aligned);
 
         // Promote / re-flag the destination header.
         let dest_header = dest_ptr as *mut GcHeader;
@@ -813,6 +813,51 @@ unsafe fn evacuate(ctx: &mut ScavCtx, header: *mut GcHeader) -> u32 {
         GcHeader::write_forwarding_offset(header, new_offset);
 
         new_offset
+    }
+}
+
+/// Copy one whole cell, `bytes` a multiple of the cell size.
+///
+/// Most surviving cells are a few words long, and a call into the general
+/// copy routine costs more than moving them: each small size is a fixed-size
+/// copy the compiler emits as plain loads and stores. Copying the aligned
+/// extent reads only the cell's own padding past its size.
+///
+/// # Safety
+///
+/// `src` and `dst` are cell-aligned, non-overlapping and valid for `bytes`.
+#[inline(always)]
+unsafe fn copy_cell(src: *const u8, dst: *mut u8, bytes: usize) {
+    const WORD: usize = 8;
+    const _: () = assert!(CELL_SIZE.is_multiple_of(WORD));
+    #[inline(always)]
+    unsafe fn words<const N: usize>(src: *const u8, dst: *mut u8) {
+        // SAFETY: forwarded from `copy_cell`.
+        unsafe {
+            core::ptr::copy_nonoverlapping(src.cast::<[u64; N]>(), dst.cast::<[u64; N]>(), 1);
+        }
+    }
+    // SAFETY: forwarded from the caller; every arm copies exactly `bytes`.
+    unsafe {
+        match bytes / WORD {
+            1 => words::<1>(src, dst),
+            2 => words::<2>(src, dst),
+            3 => words::<3>(src, dst),
+            4 => words::<4>(src, dst),
+            5 => words::<5>(src, dst),
+            6 => words::<6>(src, dst),
+            7 => words::<7>(src, dst),
+            8 => words::<8>(src, dst),
+            9 => words::<9>(src, dst),
+            10 => words::<10>(src, dst),
+            11 => words::<11>(src, dst),
+            12 => words::<12>(src, dst),
+            13 => words::<13>(src, dst),
+            14 => words::<14>(src, dst),
+            15 => words::<15>(src, dst),
+            16 => words::<16>(src, dst),
+            _ => core::ptr::copy_nonoverlapping(src, dst, bytes),
+        }
     }
 }
 

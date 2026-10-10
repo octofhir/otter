@@ -334,22 +334,22 @@ fn allocating_shared_replay_preserves_cap_cause_and_does_not_commit_or_hold_proo
 }
 
 #[test]
-fn fixed_entry_and_proof_owners_stay_within_the_replaced_cache_budget() {
+fn fixed_entry_and_proof_owners_stay_within_the_table_budget() {
     let entries = SETS * WAYS;
     let bytes = entries
         * (std::mem::size_of::<Cell<PropertyActionEntry>>()
             + std::mem::size_of::<RefCell<ActionOwners>>())
         + std::mem::size_of::<PropertyActionCache>();
-    // Frozen replaced-owner geometry: lookup 1024*(64+16), transition
-    // 2048*(56+32), four boxed-slice owner fields. Arc allocations and allocator
-    // overhead are separate retained-memory terms, not part of this receipt.
-    let replaced_bytes = 1024 * (64 + 16) + 2048 * (56 + 32) + 4 * std::mem::size_of::<Box<[u8]>>();
+    // One isolate's fixed table: entries and their proof owners. Arc
+    // allocations and allocator overhead are separate retained-memory terms,
+    // not part of this receipt.
+    let budget = 1024 * 1024;
     assert!(
-        bytes <= replaced_bytes,
-        "new fixed owner {bytes} exceeds replaced {replaced_bytes}"
+        bytes <= budget,
+        "fixed table {bytes} exceeds its {budget}-byte budget"
     );
     eprintln!(
-        "shared-action fixed payload+owners={bytes}, replaced={replaced_bytes}, proof-owner-stride={}, max-Arc-retention-slots={}",
+        "shared-action fixed payload+owners={bytes}, budget={budget}, proof-owner-stride={}, max-Arc-retention-slots={}",
         std::mem::size_of::<RefCell<ActionOwners>>(),
         2 * entries
     );

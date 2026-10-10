@@ -93,6 +93,7 @@ fn method(index: u32, count: u32) -> JitDirectMethod {
             prototype_validity: None,
             holder_root: 0,
             method_field: otter_vm::object::FieldLocation::inline(0),
+            slot_proven: false,
         },
         callee: target(fid, 91 + u64::from(index), NativeFrameKind::Baseline),
         body: None,

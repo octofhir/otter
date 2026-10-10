@@ -1174,6 +1174,11 @@ pub struct JitMethodGuard {
     pub holder_root: u32,
     /// Shape-owned method bank and relative index in the holder.
     pub method_field: crate::object::FieldLocation,
+    /// The prototype proof also fixes the holder slot's value: every write
+    /// to a watched prototype retires the proof, and the slot held a closure
+    /// of `method_fid` when this guard was baked, so while the proof holds
+    /// the method read here is a closure of that function.
+    pub slot_proven: bool,
 }
 
 /// A method the baseline may splice into a caller's `Op::CallMethodValue` site.

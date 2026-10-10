@@ -4246,6 +4246,20 @@ pub(crate) fn load_proven_data_slot(obj: JsObject, heap: &GcHeap, slot: u16) -> 
     heap.read_payload(obj, |body| body.slot_word(usize::from(slot)))
 }
 
+/// The value of the live own slot `obj`'s current layout stores at `field`,
+/// or `None` when no slot of that layout sits there.
+pub(crate) fn load_slot_at_field(
+    obj: JsObject,
+    heap: &GcHeap,
+    field: FieldLocation,
+) -> Option<Value> {
+    heap.read_payload(obj, |body| {
+        (0..body.slot_count())
+            .find(|&index| body.location_for_slot(index) == field)
+            .map(|index| body.slot_word(index))
+    })
+}
+
 /// Write a writable own data slot whose receiver shape an IC handler already
 /// matched. The shape fixes the slot's attributes and storage bank, so the
 /// write needs no descriptor or key check; the generational barrier runs.

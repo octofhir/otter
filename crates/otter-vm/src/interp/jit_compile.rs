@@ -2894,7 +2894,35 @@ impl Interpreter {
             prototype_validity,
             holder_root,
             method_field: target.method_field,
+            slot_proven: self.method_slot_proven(target),
         })
+    }
+
+    /// Whether `target`'s prototype proof fixes its holder slot: the proof
+    /// still holds, and the slot it names holds a closure of the target's
+    /// function now. Every write to a watched prototype retires the proof, so
+    /// the slot cannot change while generated code finds it valid.
+    fn method_slot_proven(&self, target: &PolyMethodTarget) -> bool {
+        let Some(cell) = &target.prototype.validity else {
+            return false;
+        };
+        if !cell.is_valid() {
+            return false;
+        }
+        let Some(root) = self
+            .shape_runtime
+            .handle_for_id(target.prototype.holder_root)
+        else {
+            return false;
+        };
+        let crate::object::shape_body::ShapePrototype::Object(holder) =
+            crate::object::shape_body::prototype_of(root)
+        else {
+            return false;
+        };
+        crate::object::load_slot_at_field(holder, &self.gc_heap, target.method_field)
+            .and_then(|value| value.as_closure(&self.gc_heap))
+            .is_some_and(|closure| closure.function_id() == target.method_fid)
     }
 
     /// Bake one compiler-generated method call independently of leaf inlining.

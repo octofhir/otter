@@ -907,6 +907,28 @@ impl<'a> Builder<'a> {
         self.inline_frame(instruction, body, plan, closure, this, arguments)
     }
 
+    /// Whether `closure` is a guarded method read whose target's prototype
+    /// proof fixes the holder slot to a closure of `function_id` (see
+    /// [`otter_vm::jit::JitMethodGuard::slot_proven`]): the read's own guard
+    /// already proved what a function check would.
+    fn proven_method_of(&self, closure: NodeId, function_id: u32) -> bool {
+        let Kind::LoadGuardedMethod {
+            byte_pc, target, ..
+        } = self.graph.node(closure).kind
+        else {
+            return false;
+        };
+        self.view
+            .direct_methods
+            .get(&byte_pc)
+            .and_then(|methods| methods.get(usize::from(target)))
+            .is_some_and(|method| {
+                method.guard.slot_proven
+                    && method.guard.prototype_validity.is_some()
+                    && method.guard.method_fid == function_id
+            })
+    }
+
     /// The shared body of [`Self::inline_call`] and
     /// [`Self::inline_construct`].
     fn inline_frame(
@@ -934,15 +956,19 @@ impl<'a> Builder<'a> {
         let frame_states = self.graph.frame_states.len();
         let views = self.inline_views.len();
         let known = self.known.clone();
-        // The callee runs only as the function the body is.
-        self.add(
-            Kind::CheckFunction {
-                function_id: code.id,
-                cell,
-            },
-            &[closure],
-            Repr::None,
-        );
+        // The callee runs only as the function the body is. A method read
+        // from a slot its prototype proof fixes is already a closure of that
+        // function.
+        if !self.proven_method_of(closure, code.id) {
+            self.add(
+                Kind::CheckFunction {
+                    function_id: code.id,
+                    cell,
+                },
+                &[closure],
+                Repr::None,
+            );
+        }
         // A construct's receiver exists before its body runs; a failed proof
         // or refill resumes the whole construct.
         let (this, new_target, receiver) = match this {

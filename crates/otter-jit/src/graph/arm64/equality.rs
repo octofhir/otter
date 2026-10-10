@@ -6,7 +6,8 @@
 //!   the string/BigInt content leaf out of line.
 //! - [`Codegen::emit_loose_equal`] — §7.2.15 IsLooselyEqual: every case
 //!   that coerces nothing inline, every coercing case (and `[[IsHTMLDDA]]`)
-//!   in the runtime.
+//!   in the runtime; against a `null`/`undefined` constant, only the
+//!   nullish test and the native-function check.
 //!
 //! # Invariants
 //! - Both operands are read before the result is written; the result may
@@ -131,6 +132,9 @@ impl Codegen<'_> {
         } else {
             Condition::Equal
         };
+        if let Some(other) = self.nullish_constant_operand(node, [a, b]) {
+            return self.emit_loose_equal_nullish(node, [a, b], other, destination, condition);
+        }
         let a_number = self.ops.new_dynamic_label();
         let b_number = self.ops.new_dynamic_label();
         let a_nullish = self.ops.new_dynamic_label();
@@ -225,6 +229,68 @@ impl Codegen<'_> {
         );
         self.emit_number_pair_equal([a, b], double, destination, condition);
         dynasm!(self.ops ; .arch aarch64 ; b =>done);
+        self.emit_equality_results(node, [a, b], destination, condition, outcomes, done);
+        dynasm!(self.ops ; .arch aarch64 ; b =>done ; =>runtime);
+        self.emit_committed_call(
+            node,
+            abi::STUB_JIT_OBJECT_PROTOCOL_VALUE,
+            &[CommittedArgument::Value(a), CommittedArgument::Value(b)],
+            Some(destination),
+        )?;
+        dynasm!(self.ops ; .arch aarch64 ; =>done);
+        self.emit_sink_register(destination);
+        Ok(())
+    }
+
+    /// The register of the operand compared against a `null` or `undefined`
+    /// constant, when one of the two is that constant.
+    fn nullish_constant_operand(&self, node: NodeId, [a, b]: [u8; 2]) -> Option<u8> {
+        let nullish = |input: NodeId| {
+            matches!(
+                self.graph.node(input).kind,
+                super::super::ir::Kind::ConstTagged(bits)
+                    if bits == VALUE_NULL || bits == VALUE_UNDEFINED
+            )
+        };
+        let inputs = &self.graph.node(node).inputs;
+        if nullish(inputs[1]) {
+            Some(a)
+        } else if nullish(inputs[0]) {
+            Some(b)
+        } else {
+            None
+        }
+    }
+
+    /// `X(other) == null` (or `undefined`, which `==` cannot tell apart):
+    /// true for both, false for every other immediate and for every cell
+    /// but a native function, which may be `[[IsHTMLDDA]]` and asks the
+    /// runtime.
+    fn emit_loose_equal_nullish(
+        &mut self,
+        node: NodeId,
+        [a, b]: [u8; 2],
+        other: u8,
+        destination: u8,
+        condition: Condition,
+    ) -> Result<(), Unsupported> {
+        let runtime = self.ops.new_dynamic_label();
+        let done = self.ops.new_dynamic_label();
+        let outcomes = self.equality_outcomes();
+        let native_tag = u32::from(otter_vm::native_function::NATIVE_FUNCTION_BODY_TYPE_TAG);
+        dynasm!(self.ops
+            ; .arch aarch64
+            ; orr x17, X(other), NULLISH_BIT
+            ; cmp x17, NULLISH
+            ; b.eq =>outcomes.equal
+            ; tst X(other), #0xfffe_0000_0000_0007
+            ; b.ne =>outcomes.differ
+            ; cbz X(other), =>outcomes.differ
+            ; ldrb w16, [X(other)]
+            ; cmp w16, native_tag
+            ; b.eq =>runtime
+            ; b =>outcomes.differ
+        );
         self.emit_equality_results(node, [a, b], destination, condition, outcomes, done);
         dynasm!(self.ops ; .arch aarch64 ; b =>done ; =>runtime);
         self.emit_committed_call(

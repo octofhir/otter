@@ -113,6 +113,49 @@ impl<'a> Codegen<'a> {
         const NULLISH: i32 = tag::VALUE_UNDEFINED as i32;
         const _: () = assert!(tag::VALUE_NULL | NULLISH_BIT as u64 == tag::VALUE_UNDEFINED);
         const _: () = assert!(tag::VALUE_UNDEFINED | NULLISH_BIT as u64 == tag::VALUE_UNDEFINED);
+        let nullish = |input: NodeId| {
+            matches!(
+                self.graph.node(input).kind,
+                Kind::ConstTagged(bits) if bits == tag::VALUE_NULL || bits == tag::VALUE_UNDEFINED
+            )
+        };
+        let inputs = &self.graph.node(node).inputs;
+        let other = if nullish(inputs[1]) {
+            Some(a)
+        } else if nullish(inputs[0]) {
+            Some(b)
+        } else {
+            None
+        };
+        if let Some(other) = other {
+            // `==` against `null`/`undefined`: both of those, and only an
+            // `[[IsHTMLDDA]]` native function among cells.
+            let runtime = self.ops.new_dynamic_label();
+            let done = self.ops.new_dynamic_label();
+            let outcomes = self.equality_outcomes();
+            let native_tag = i32::from(otter_vm::native_function::NATIVE_FUNCTION_BODY_TYPE_TAG);
+            dynasm!(self.ops ; .arch x64
+                ; mov r11, Rq(other) ; or r11, NULLISH_BIT ; cmp r11, NULLISH ; je =>outcomes.equal
+            );
+            self.load_immediate(10, tag::NOT_CELL_MASK);
+            dynasm!(self.ops ; .arch x64
+                ; test Rq(other), r10 ; jnz =>outcomes.differ
+                ; test Rq(other), Rq(other) ; jz =>outcomes.differ
+                ; cmp BYTE [Rq(other)], native_tag as i8 ; je =>runtime
+                ; jmp =>outcomes.differ
+            );
+            self.emit_equality_results(node, a, b, dst, negate, outcomes, done);
+            dynasm!(self.ops ; .arch x64 ; jmp =>done ; =>runtime);
+            self.emit_committed_call(
+                node,
+                abi::STUB_JIT_OBJECT_PROTOCOL_VALUE,
+                &[CommittedArgument::Value(a), CommittedArgument::Value(b)],
+                Some(dst),
+            )?;
+            dynasm!(self.ops ; .arch x64 ; =>done);
+            self.emit_sink_register(dst);
+            return Ok(());
+        }
         let a_number = self.ops.new_dynamic_label();
         let b_number = self.ops.new_dynamic_label();
         let both_numbers = self.ops.new_dynamic_label();

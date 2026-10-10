@@ -1266,10 +1266,19 @@ impl<'a> Builder<'a> {
             self.loop_phis.insert(block, phis);
         }
         // Phis read each edge's own facts above; the merge takes the first
-        // edge's and keeps what every other agrees on.
-        let mut known = std::mem::take(&mut incoming[0].known);
-        for edge in &incoming[1..] {
-            known.intersect(&edge.known);
+        // edge's and keeps what every other agrees on. A loop that encloses
+        // the OSR entry is also entered along its back edge from that entry,
+        // where no value of the forward path exists: its header keeps no
+        // fact, as the OSR entry block itself starts with none.
+        let mut known = if encloses_osr {
+            Known::default()
+        } else {
+            std::mem::take(&mut incoming[0].known)
+        };
+        if !encloses_osr {
+            for edge in &incoming[1..] {
+                known.intersect(&edge.known);
+            }
         }
         if is_loop {
             known.forget_storage();

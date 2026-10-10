@@ -547,7 +547,7 @@ fn native_set_prototype_of(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Va
     Ok(target)
 }
 
-fn native_prototype_to_string(
+pub(crate) fn native_prototype_to_string(
     ctx: &mut NativeCtx<'_>,
     _args: &[Value],
 ) -> Result<Value, NativeError> {
@@ -578,7 +578,7 @@ fn native_prototype_to_string(
     ))
 }
 
-fn native_prototype_value_of(
+pub(crate) fn native_prototype_value_of(
     ctx: &mut NativeCtx<'_>,
     _args: &[Value],
 ) -> Result<Value, NativeError> {

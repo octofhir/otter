@@ -41,6 +41,12 @@ impl Interpreter {
         if abstract_ops::is_primitive(input) {
             return Ok(*input);
         }
+        if let Some(converted) = self
+            .unobservable_to_primitive(*input)
+            .map_err(CommittedValueError::JavaScript)?
+        {
+            return Ok(converted);
+        }
         self.with_handle_scope(|interp, scope| {
             let input_handle = interp.scoped_value(scope, *input);
             // Step 1.a — try `@@toPrimitive` via OrdinaryGet on the

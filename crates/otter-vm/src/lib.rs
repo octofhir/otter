@@ -158,6 +158,7 @@ mod array_from_async;
 mod async_from_sync_iterator;
 mod forward_arguments;
 pub(crate) mod iteration_protocol;
+mod conversion_protocol;
 mod jit_call_admission;
 mod jit_forward_call;
 mod jit_global_ops;

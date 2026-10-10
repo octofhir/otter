@@ -1,8 +1,9 @@
 //! GC-managed hidden-class layout nodes.
 //!
-//! Shape nodes are immutable after allocation (except that finishing a
+//! Shape layouts are immutable after allocation (except that finishing a
 //! constructor lineage's slack tracking shrinks its capacity and clears its
-//! provisional state once, in place) and record the transition from
+//! provisional state once, in place). A monotone stability byte records
+//! whether an object has left the shape. Each node records the transition from
 //! their parent — parent shape, added property key, property count, and the
 //! slot offset assigned to that key — together with what every object of the
 //! lineage shares: its `[[Prototype]]` and its dictionary shape. Transition
@@ -23,6 +24,7 @@
 //!   lineage's flat key table ([`super::shape_keys`]) once a shape has
 //!   [`super::shape_keys::SHAPE_KEYS_MIN`] keys, the parent chain below.
 //! - [`shape_keys_ordered`] — parent-chain reader.
+//! - [`note_left`] / [`is_stable`] — monotone membership-stability tracking.
 //!
 //! # Invariants
 //! - `parent == Gc::null()` and `transition_key == Gc::null()` only for a
@@ -40,15 +42,18 @@
 //! - A non-root `own_field` has the parent's `property_count` as its logical slot.
 //! - `property_count` is the number of string-keyed own slots represented by
 //!   the full parent chain.
-//! - Shape bodies have no interior mutability; all transition/cache mutation
-//!   belongs to interpreter-owned side tables. A shape names its key table at
+//! - Every change of an existing object's shape clears its former shape's
+//!   stability byte before publication. The byte never returns to one;
+//!   generated code can revalidate a prior membership proof from that byte.
+//! - Transition/cache mutation belongs to interpreter-owned side tables.
+//!   A shape names its key table at
 //!   allocation and never changes it; the table grows in place only past
 //!   every naming shape's key count (see [`super::shape_keys`]).
 //! - New null-prototype capacity/state roots prepend to one immutable chain.
 //!   Ordinary allocation always selects its initial ordinary root, so prototype,
 //!   non-extensible or provisional state never leaks from a cache head.
-//! - The C layout exposes only the immutable identity word to generated
-//!   shared-cache probes; shapes live in non-moving old space, so a handle
+//! - The C layout exposes layout fields and the stability byte to generated
+//!   probes; shapes live in non-moving old space, so a handle
 //!   never relocates. Shapes are collectable (see
 //!   [`super::shape_runtime`]); an id is never reused, a handle may be once
 //!   its shape is collected.
@@ -57,6 +62,8 @@
 //! - <https://tc39.es/ecma262/#sec-ordinary-object-internal-methods-and-internal-slots>
 //! - <https://tc39.es/ecma262/#sec-ordinary-object-internal-methods-and-internal-slots-ownpropertykeys>
 //! - Architecture plan §4.1 (hidden classes).
+
+use std::sync::atomic::{AtomicU8, Ordering};
 
 use otter_gc::GcHeap;
 use otter_gc::heap::RootSlotVisitor;
@@ -91,7 +98,7 @@ pub(crate) enum ShapePrototype {
 }
 
 /// Immutable hidden-class layout node.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 #[repr(C)]
 pub struct ShapeBody {
     /// VM-local identity used by property inline-cache guards.
@@ -142,7 +149,16 @@ pub struct ShapeBody {
     /// [`super::shape_keys::SHAPE_KEYS_MIN`] keys, where lookups walk the
     /// chain.
     keys: super::shape_keys::ShapeKeysHandle,
+    /// One while no object has ever left this shape; zero forever after.
+    /// An object proven to have a still-stable shape before an operation
+    /// that may run code still has it afterwards, which generated code
+    /// confirms by reading this byte instead of the object.
+    stable: AtomicU8,
 }
+
+/// Byte generated code reads to confirm a shape still has every object it
+/// had (see [`ShapeBody`]'s `stable`).
+pub(crate) const SHAPE_BODY_STABLE_OFFSET: usize = std::mem::offset_of!(ShapeBody, stable);
 
 /// Identity word read by generated probes of the shared property lookup table.
 pub(crate) const SHAPE_BODY_ID_OFFSET: usize = std::mem::offset_of!(ShapeBody, id);
@@ -195,6 +211,7 @@ impl ShapeBody {
             dictionary,
             enum_cache: crate::Value::undefined(),
             keys: super::shape_keys::ShapeKeysHandle::null(),
+            stable: AtomicU8::new(1),
         }
     }
 
@@ -247,6 +264,7 @@ impl ShapeBody {
             dictionary: parent.dictionary,
             enum_cache: crate::Value::undefined(),
             keys,
+            stable: AtomicU8::new(1),
         }
     }
 
@@ -578,6 +596,18 @@ pub(crate) fn inline_capacity_of(shape: ShapeHandle) -> usize {
 #[must_use]
 pub(crate) fn state_of(shape: ShapeHandle) -> ShapeState {
     body_of(shape).state()
+}
+
+/// An object is leaving `shape` for another: `shape` is stable no more.
+pub(crate) fn note_left(shape: ShapeHandle) {
+    if !shape.is_null() {
+        body_of(shape).stable.store(0, Ordering::Relaxed);
+    }
+}
+
+/// Whether no object has ever left `shape`.
+pub(crate) fn is_stable(shape: ShapeHandle) -> bool {
+    !shape.is_null() && body_of(shape).stable.load(Ordering::Relaxed) != 0
 }
 
 /// Find the exact prototype/capacity/state root in an immutable root chain.

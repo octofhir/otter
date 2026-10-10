@@ -4,6 +4,7 @@
 //! - Full-width keys, four-way collisions and independent load/store slots.
 //! - Live capacities zero/four/sixty-four and replacement suffix handles.
 //! - Guard refusal atomicity and preservation of all unassigned registers.
+//! - Source-shape stability invalidation with independent holder/child bytes.
 //!
 //! # Invariants
 //! - Owned aligned fixture words model the VM DTO's physical offsets; no raw
@@ -57,6 +58,7 @@ fn snapshot() -> JitCompileSnapshot {
     view.object_shape_byte = 8;
     view.shape_state_byte = 8;
     view.shape_inline_capacity_byte = 9;
+    view.shape_stable_byte = 10;
     view.shape_prototype_byte = 12;
     assert_ne!(view.object_shape_byte, 0, "object tag cannot alias shape");
     assert_ne!(view.shape_state_byte, view.shape_inline_capacity_byte);
@@ -148,6 +150,7 @@ impl Fixture {
                 shape + fixture.view.shape_inline_capacity_byte as usize,
                 capacity,
             );
+            fixture.cell_u8(shape + fixture.view.shape_stable_byte as usize, 1);
             fixture.cell_u32(shape + fixture.view.shape_prototype_byte as usize, 0);
         }
         fixture.cell_u32(
@@ -171,6 +174,16 @@ impl Fixture {
 
     fn address(&self, byte: usize) -> u64 {
         self.cells.as_ptr() as u64 + byte as u64
+    }
+    fn assert_stability(&self, source: u8) {
+        for (shape, expected) in [(SHAPE, source), (HOLDER_SHAPE, 1), (TARGET, 1)] {
+            let byte = shape + self.view.shape_stable_byte as usize;
+            assert_eq!(
+                (self.cells[byte / 8] >> ((byte % 8) * 8)) as u8,
+                expected,
+                "shape at {shape}"
+            );
+        }
     }
     fn bank_byte(&self, object: usize, slab: usize, slot: u16) -> usize {
         if slot < u16::from(self.capacity) {
@@ -378,15 +391,18 @@ fn one_key_keeps_independent_inherited_load_and_append_slots() {
         let (outcome, regs) = f.run(PropertySourceAccess::Store, f.atom, stored);
         assert_eq!(outcome, 2);
         assert_eq!(regs[6], u64::from(f.address(TARGET) as u32));
+        f.assert_stability(0);
         let mut expected = before;
         expected[store_byte / 8] = stored;
         let shape_byte = f.view.object_shape_byte as usize;
         let shift = (shape_byte % 8) * 8;
         expected[shape_byte / 8] = (expected[shape_byte / 8] & !(0xffff_ffff_u64 << shift))
             | (u64::from(f.address(TARGET) as u32) << shift);
+        let stable_byte = SHAPE + f.view.shape_stable_byte as usize;
+        expected[stable_byte / 8] &= !(0xff_u64 << ((stable_byte % 8) * 8));
         assert_eq!(
             f.cells, expected,
-            "only receiver append slot and shape are written"
+            "only receiver append slot, shape and source stability are written"
         );
         assert_eq!(
             f.cells[load_byte / 8],
@@ -414,6 +430,7 @@ fn own_data_reads_readonly_and_current_suffix_while_store_requires_its_action() 
             f.cells, before,
             "read-only load never implies writable store"
         );
+        f.assert_stability(1);
         f.cell_u32(
             f.view.field_layout.slab_handle_byte as usize,
             f.address(REPLACEMENT_SLAB) as u32,
@@ -447,6 +464,7 @@ fn own_data_reads_readonly_and_current_suffix_while_store_requires_its_action() 
             f.cells, expected,
             "existing overwrite selects the current prefix or suffix"
         );
+        f.assert_stability(1);
     }
 }
 
@@ -502,6 +520,7 @@ fn every_miss_finishes_before_any_slot_or_shape_effect() {
             f.cells, before,
             "refusal {refusal} must not publish any effect"
         );
+        f.assert_stability(1);
     }
     for refusal in 0..6 {
         let mut f = Fixture::new(4);
@@ -525,6 +544,7 @@ fn every_miss_finishes_before_any_slot_or_shape_effect() {
             "load refusal {refusal}"
         );
         assert_eq!(f.cells, before);
+        f.assert_stability(1);
     }
     let mut f = Fixture::new(4);
     f.append(5, false);
@@ -538,4 +558,5 @@ fn every_miss_finishes_before_any_slot_or_shape_effect() {
         2,
         "dynamic provisional ordinary feedback remains eligible"
     );
+    f.assert_stability(0);
 }

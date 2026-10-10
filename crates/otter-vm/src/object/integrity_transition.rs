@@ -67,7 +67,7 @@ pub(super) fn apply(
         }
         if body.shape != shape.get() {
             body.invalidate_prototype_proofs();
-            body.shape = shape.get();
+            body.adopt_shape(shape.get());
         }
     });
     let sidecar = heap.read_payload(*object, |body| body.exotic.get());

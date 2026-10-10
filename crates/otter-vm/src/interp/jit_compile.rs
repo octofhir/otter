@@ -583,6 +583,19 @@ impl Interpreter {
         Self::bake_context_allocations(&mut snapshot);
         Self::bake_closure_allocations(&mut snapshot, context);
         self.bake_optimized_exit_profile(&mut snapshot, fid);
+        // Every shape baked so far that no object has left yet: a value
+        // proven to have one survives calls on a read of its stable byte.
+        snapshot.stable_shapes = self.jit_compile_roots.borrow()[roots_start..]
+            .iter()
+            .filter_map(|root| match root {
+                crate::jit_roots::CompilationRoot::Shape(shape)
+                    if crate::object::shape_body::is_stable(*shape) =>
+                {
+                    Some(shape.offset())
+                }
+                _ => None,
+            })
+            .collect();
         let target = osr_pc.map_or(jit_debug::JitDebugTarget::Entry, |pc| {
             jit_debug::JitDebugTarget::Osr { pc }
         });
@@ -2351,6 +2364,7 @@ impl Interpreter {
                         reason,
                         native_abi::ExitReason::InsufficientFeedback
                             | native_abi::ExitReason::RuntimeTransition
+                            | native_abi::ExitReason::StabilityChanged
                     ))
                 .then_some((pc, reason))
             })

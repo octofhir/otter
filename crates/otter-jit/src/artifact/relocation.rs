@@ -65,6 +65,7 @@ const TARGET_ARITH_FEEDBACK_CELL: u8 = 17;
 const TARGET_SOURCE_WORK_CELL: u8 = 18;
 const TARGET_INSTANCEOF_CELL: u8 = 19;
 const TARGET_BACKEDGE_FUEL_CELL: u8 = 20;
+const TARGET_SHAPE_STABLE_BYTE: u8 = 21;
 const TARGET_PROTOTYPE_VALIDITY_CELL: u8 = 15;
 
 /// Whether a named-property probe serves a load or a store site.
@@ -170,6 +171,10 @@ pub(crate) enum RelocationTarget {
     },
     /// The isolate's back-edge fuel countdown, decremented by every loop poll.
     BackedgeFuelCell,
+    /// The stable byte of a baked shape, named by its compressed handle.
+    ShapeStableByte {
+        shape: u32,
+    },
 }
 
 impl RelocationTarget {
@@ -1575,6 +1580,10 @@ fn encode_target(target: &RelocationTarget, output: &mut Vec<u8>) -> Result<(), 
             put_u32(output, *pc);
         }
         RelocationTarget::BackedgeFuelCell => output.push(TARGET_BACKEDGE_FUEL_CELL),
+        RelocationTarget::ShapeStableByte { shape } => {
+            output.push(TARGET_SHAPE_STABLE_BYTE);
+            put_u32(output, *shape);
+        }
     }
     Ok(())
 }

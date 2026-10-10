@@ -194,5 +194,6 @@ pub(crate) fn exit_reason(reason: DeoptReason) -> (ExitReason, ExitAction) {
             (ExitReason::InsufficientFeedback, ExitAction::Recompile)
         }
         DeoptReason::Unsupported => (ExitReason::UnsupportedOperation, ExitAction::Resume),
+        DeoptReason::StabilityChanged => (ExitReason::StabilityChanged, ExitAction::Recompile),
     }
 }

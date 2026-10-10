@@ -23,7 +23,8 @@
 //! - Frame states carry exactly the registers live before (eager) or after
 //!   (lazy) the instruction; dead registers resume as `undefined`.
 //! - A fact in [`Known`] never outlives the path it was proved on: joins keep
-//!   only facts every predecessor agrees on, calls drop every heap fact, and
+//!   only facts every predecessor agrees on, calls drop heap facts except
+//!   shape memberships revalidated by monotone stability bytes, and
 //!   a store forgets every known value at its offset. A loop header keeps the
 //!   heap facts of its entry only when every back edge arrives with them;
 //!   otherwise the graph is rebuilt with the facts a back edge lost forgotten
@@ -204,6 +205,14 @@ pub(crate) struct Known {
     /// unmarked, and a store into it owes no barrier. Any call, collection
     /// point or poll forgets them.
     fresh: FxHashSet<NodeId>,
+    /// Shape proofs an operation that may run code has since overtaken, of
+    /// nodes whose every proved shape was stable when the generation
+    /// compiled: still true for as long as those shapes stay stable, which
+    /// a use confirms from the shapes before relying on them.
+    stale_shapes: FxHashMap<NodeId, SmallVec<[u32; 4]>>,
+    /// Shapes whose stable byte this path already read since its last such
+    /// operation.
+    stable_checked: FxHashSet<u32>,
 }
 
 impl Known {
@@ -269,10 +278,29 @@ impl Known {
             self.this = None;
         }
         self.fresh.retain(|cell| other.fresh.contains(cell));
+        self.stale_shapes
+            .retain(|node, shapes| other.stale_shapes.get(node) == Some(shapes));
+        self.stable_checked
+            .retain(|shape| other.stable_checked.contains(shape));
     }
 
-    /// Forget every fact a heap write may invalidate.
-    fn clobber_heap(&mut self) {
+    /// Keep each layout proof whose shapes were all stable at compile time
+    /// as a stale proof before an operation forgets it.
+    fn keep_stable_shapes(&mut self, stable: &FxHashSet<u32>) {
+        for (&node, layout) in &self.layouts {
+            if let Some(shapes) = &layout.shapes
+                && shapes.iter().all(|shape| stable.contains(shape))
+            {
+                self.stale_shapes.insert(node, shapes.clone());
+            }
+        }
+        self.stable_checked.clear();
+    }
+
+    /// Forget every fact a heap write may invalidate; proofs of stable
+    /// shapes stay as stale proofs.
+    fn clobber_heap(&mut self, stable: &FxHashSet<u32>) {
+        self.keep_stable_shapes(stable);
         self.layouts.clear();
         self.storage.clear();
         self.fields.clear();
@@ -290,8 +318,9 @@ impl Known {
     }
 
     /// Forget every node's shape proof: a published transition changes the
-    /// shape of an object any node may name.
-    fn forget_shapes(&mut self) {
+    /// shape of an object any node may name, but never a stable one's.
+    fn forget_shapes(&mut self, stable: &FxHashSet<u32>) {
+        self.keep_stable_shapes(stable);
         self.layouts.retain(|_, layout| {
             layout.shapes = None;
             layout.writable = false;
@@ -1312,7 +1341,7 @@ impl<'a> Builder<'a> {
             known.forget_storage();
             let key = self.loop_key(block);
             match self.policies.get(&key) {
-                Some(policy) if policy.clobber => known.clobber_heap(),
+                Some(policy) if policy.clobber => known.clobber_heap(&self.root.stable_shapes),
                 Some(policy) => known.forget(&policy.dropped),
                 None => {}
             }
@@ -1604,7 +1633,8 @@ impl<'a> Builder<'a> {
     /// Forget heap facts after a call, which also makes every loop around
     /// the current block one that writes the heap.
     fn clobber_heap(&mut self) {
-        self.known.clobber_heap();
+        let root = self.root;
+        self.known.clobber_heap(&root.stable_shapes);
         if let Some(loops) = self.enclosing.get(self.current_bytecode_block) {
             self.effectful.extend(loops.iter().copied());
         }
@@ -2703,10 +2733,7 @@ impl<'a> Builder<'a> {
             return;
         }
         let receiver = self.read(instruction.reads[0]);
-        let receivers = self
-            .known
-            .layout(receiver)
-            .and_then(|layout| layout.shapes.clone());
+        let receivers = self.known_shapes(receiver);
         let Some(access) = (!self.exited_for(ExitReason::ShapeGuard))
             .then(|| {
                 super::feedback::own_data_store(
@@ -2794,7 +2821,8 @@ impl<'a> Builder<'a> {
                 }
             }
             if transition {
-                self.known.forget_shapes();
+                let root = self.root;
+                self.known.forget_shapes(&root.stable_shapes);
             }
             for &offset in &offsets {
                 self.known.forget_field_offset(true, offset);
@@ -2882,11 +2910,42 @@ impl<'a> Builder<'a> {
         self.prove_ordinary_object(receiver);
     }
 
+    /// The shapes `object` is proved to have on this path: a current proof,
+    /// or a stale proof of stable shapes, re-proved here by reading the
+    /// shapes' stable bytes (each once per overtaking operation).
+    fn known_shapes(&mut self, object: NodeId) -> Option<SmallVec<[u32; 4]>> {
+        if let Some(shapes) = self
+            .known
+            .layout(object)
+            .and_then(|layout| layout.shapes.clone())
+        {
+            return Some(shapes);
+        }
+        let shapes = self.known.stale_shapes.get(&object)?.clone();
+        let unchecked: SmallVec<[u32; 4]> = shapes
+            .iter()
+            .copied()
+            .filter(|shape| !self.known.stable_checked.contains(shape))
+            .collect();
+        if !unchecked.is_empty() {
+            self.add(Kind::CheckStableShapes(unchecked.clone()), &[], Repr::None);
+            self.known.stable_checked.extend(unchecked);
+        }
+        self.known.stale_shapes.remove(&object);
+        let layout = self.known.layout_entry(object);
+        layout.shapes = Some(shapes.clone());
+        layout.writable = false;
+        Some(shapes)
+    }
+
     fn check_shapes(&mut self, object: NodeId, shapes: &SmallVec<[u32; 4]>, writable: bool) {
-        if let Some(layout) = self.known.layout(object)
-            && let Some(known) = layout.shapes.as_ref()
+        if let Some(known) = self.known_shapes(object)
             && known.iter().all(|shape| shapes.contains(shape))
-            && (layout.writable || !writable)
+            && (!writable
+                || self
+                    .known
+                    .layout(object)
+                    .is_some_and(|layout| layout.writable))
         {
             return;
         }
@@ -3472,17 +3531,23 @@ impl<'a> Builder<'a> {
             return self.emit_function_prototype_call(instruction, receiver, &arguments, plan);
         }
         if let Some(plan) = method {
+            let view: &'a JitCompileSnapshot = self.view;
+            let method = view.direct_methods.get(&byte_pc).map(|methods| &methods[0]);
+            // A receiver this path already proved to have the guard's shape
+            // needs no second proof.
+            let receiver_proved = method.is_some_and(|method| {
+                self.known_shapes(receiver)
+                    .is_some_and(|shapes| shapes.as_slice() == [method.guard.recv_shape])
+            });
             let callee = self.add(
                 Kind::LoadGuardedMethod {
                     byte_pc,
                     target: 0,
-                    receiver_proved: false,
+                    receiver_proved,
                 },
                 &[receiver],
                 Repr::Tagged,
             );
-            let view: &'a JitCompileSnapshot = self.view;
-            let method = view.direct_methods.get(&byte_pc).map(|methods| &methods[0]);
             if let Some(method) = method {
                 self.prove_receiver_shape(receiver, method.guard.recv_shape);
             }

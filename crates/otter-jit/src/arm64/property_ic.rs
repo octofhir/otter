@@ -17,6 +17,8 @@
 //!   allocates nothing. A megamorphic slot branches to its own label so the
 //!   caller can probe the isolate's shared action table.
 //! - Feedback is read from the slot at run time; nothing is baked.
+//! - An append clears the source shape's stability byte before publishing
+//!   its child; overwrite stores preserve the shape's stability.
 //!
 //! # See also
 //! - `otter_vm::property_ic` owns the slot layout and handler kinds.
@@ -318,6 +320,10 @@ pub(crate) fn emit_slot_store(
         ; add x16, XSP(receiver), #layout.inline_values_byte
         ; str X(value), [x16, X(index), lsl #3]
         ; =>publish
+        ; and x17, X(receiver), #0xffff_ffff_0000_0000
+        ; ldr w16, [X(receiver), view.object_shape_byte]
+        ; add x16, x17, x16
+        ; strb wzr, [x16, view.shape_stable_byte]
         ; str W(child), [X(receiver), view.object_shape_byte]
         ; b =>stored
         ; =>own

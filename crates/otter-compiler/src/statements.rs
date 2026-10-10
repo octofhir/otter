@@ -57,12 +57,13 @@ pub(crate) fn compile_tail_return(
             }
         }
         Expression::ConditionalExpression(c) => {
-            let test = compile_expr(cx, &c.test, span)?;
-            let to_else = cx.emit_branch_placeholder(Op::JumpIfFalse, Some(test), span);
+            let to_else = crate::expr::compile_condition(cx, &c.test, false, span)?;
             // The consequent path always ends in a return, so control
             // never falls through into the alternate.
             compile_tail_return(cx, &c.consequent, span)?;
-            cx.patch_branch_to_here(to_else);
+            for branch in to_else {
+                cx.patch_branch_to_here(branch);
+            }
             compile_tail_return(cx, &c.alternate, span)
         }
         Expression::LogicalExpression(l) => {
@@ -489,9 +490,8 @@ fn compile_statement_body(
             // value, or `undefined` when no branch runs (false test
             // with no `else`).
             let completion_reg = cx.alloc_completion_reg(span);
-            let cond_reg = compile_expr(cx, &s.test, span)?;
-            // JUMP_IF_FALSE → after consequent
-            let jmp_if_false = cx.emit_branch_placeholder(Op::JumpIfFalse, Some(cond_reg), span);
+            // A false test jumps past the consequent.
+            let to_alternate = crate::expr::compile_condition(cx, &s.test, false, span)?;
             if let Some(cons_reg) = compile_if_branch_statement(cx, &s.consequent)? {
                 cx.store_completion(completion_reg, cons_reg, span);
             }
@@ -499,13 +499,17 @@ fn compile_statement_body(
                 // After consequent, unconditional JUMP past the
                 // alternate.
                 let jmp_end = cx.emit_branch_placeholder(Op::Jump, None, span);
-                cx.patch_branch_to_here(jmp_if_false);
+                for branch in to_alternate {
+                    cx.patch_branch_to_here(branch);
+                }
                 if let Some(alt_reg) = compile_if_branch_statement(cx, alt)? {
                     cx.store_completion(completion_reg, alt_reg, span);
                 }
                 cx.patch_branch_to_here(jmp_end);
             } else {
-                cx.patch_branch_to_here(jmp_if_false);
+                for branch in to_alternate {
+                    cx.patch_branch_to_here(branch);
+                }
             }
             Ok(completion_reg)
         }
@@ -518,15 +522,16 @@ fn compile_statement_body(
             let completion_reg = cx.alloc_completion_reg(span);
             let loop_top = cx.next_pc();
             cx.push_loop_frame(LoopFrame::iteration());
-            let cond_reg = compile_expr(cx, &s.test, span)?;
-            let exit_jmp = cx.emit_branch_placeholder(Op::JumpIfFalse, Some(cond_reg), span);
+            let exits = crate::expr::compile_condition(cx, &s.test, false, span)?;
             if let Some(body_reg) = compile_statement(cx, &s.body)? {
                 cx.store_completion(completion_reg, body_reg, span);
             }
             // Back-edge jump to loop top.
             let back_jmp = cx.emit_branch_placeholder(Op::Jump, None, span);
             cx.patch_branch(back_jmp, loop_top);
-            cx.patch_branch_to_here(exit_jmp);
+            for exit in exits {
+                cx.patch_branch_to_here(exit);
+            }
             let frame = cx.loops.pop().expect("loop frame disappeared");
             for pc in frame.continue_patches {
                 cx.patch_branch(pc, loop_top);
@@ -547,9 +552,9 @@ fn compile_statement_body(
                 cx.store_completion(completion_reg, body_reg, span);
             }
             let continue_target = cx.next_pc();
-            let cond_reg = compile_expr(cx, &s.test, span)?;
-            let back_jmp = cx.emit_branch_placeholder(Op::JumpIfTrue, Some(cond_reg), span);
-            cx.patch_branch(back_jmp, body_top);
+            for back_jmp in crate::expr::compile_condition(cx, &s.test, true, span)? {
+                cx.patch_branch(back_jmp, body_top);
+            }
             let frame = cx.loops.pop().expect("loop frame disappeared");
             for pc in frame.continue_patches {
                 cx.patch_branch(pc, continue_target);
@@ -605,11 +610,9 @@ fn compile_statement_body(
             cx.push_loop_frame(LoopFrame::iteration());
             let test_top = cx.next_pc();
             // Test.
-            let exit_patch = if let Some(test) = &s.test {
-                let cond_reg = compile_expr(cx, test, span)?;
-                Some(cx.emit_branch_placeholder(Op::JumpIfFalse, Some(cond_reg), span))
-            } else {
-                None
+            let exit_patches = match &s.test {
+                Some(test) => crate::expr::compile_condition(cx, test, false, span)?,
+                None => Vec::new(),
             };
             // Body.
             if let Some(body_reg) = compile_statement(cx, &s.body)? {
@@ -627,8 +630,8 @@ fn compile_statement_body(
             }
             let back_jmp = cx.emit_branch_placeholder(Op::Jump, None, span);
             cx.patch_branch(back_jmp, test_top);
-            if let Some(p) = exit_patch {
-                cx.patch_branch_to_here(p);
+            for exit in exit_patches {
+                cx.patch_branch_to_here(exit);
             }
             let frame = cx.loops.pop().expect("loop frame disappeared");
             for pc in frame.continue_patches {

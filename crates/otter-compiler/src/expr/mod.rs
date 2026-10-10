@@ -3,6 +3,7 @@
 //! # Contents
 //! - [`compile_expr`] — main expression dispatch.
 //! - [`compile_effect`] — lowering of an expression whose value is unused.
+//! - [`compile_condition`] — lowering of an expression only branched on.
 //! - [`compile_expr_into_with_inferred_name`] — destination-aware declaration
 //!   initializer lowering.
 //! - [`compile_expr_as_property_key`] — property-key coercion for patterns.
@@ -21,6 +22,10 @@
 //! - Expression lowering writes its result to the requested destination register.
 //! - Destination-aware lowering preserves operand snapshots; it changes only
 //!   the final result location.
+//! - A condition reads its expression only through ToBoolean, which runs no
+//!   code, so `&&`, `||` and `!` there lower to jumps without materializing
+//!   their values; every operand is still evaluated in source order exactly
+//!   when the short-circuit rules say.
 //!
 //! # See also
 //! - `statements`, `calls`, and `class`
@@ -37,6 +42,59 @@ pub(crate) mod object_array;
 mod unary;
 
 use crate::*;
+
+/// Lower `expr` as a branch condition: every returned branch is taken when
+/// `ToBoolean(expr)` is `jump_if`, and control falls through otherwise.
+/// The caller patches the branches to their common target.
+pub(crate) fn compile_condition(
+    cx: &mut Compiler,
+    expr: &Expression<'_>,
+    jump_if: bool,
+    enclosing_span: (u32, u32),
+) -> Result<Vec<u32>, CompileError> {
+    match unwrap_ts_expr(expr) {
+        Expression::ParenthesizedExpression(p) => {
+            compile_condition(cx, &p.expression, jump_if, (p.span.start, p.span.end))
+        }
+        Expression::UnaryExpression(u) if u.operator == UnaryOperator::LogicalNot => {
+            compile_condition(cx, &u.argument, !jump_if, (u.span.start, u.span.end))
+        }
+        Expression::SequenceExpression(s) => {
+            let span = (s.span.start, s.span.end);
+            let Some((last, effects)) = s.expressions.split_last() else {
+                return Ok(Vec::new());
+            };
+            for expr in effects {
+                compile_effect(cx, expr, span)?;
+            }
+            compile_condition(cx, last, jump_if, span)
+        }
+        Expression::LogicalExpression(l) if l.operator != LogicalOperator::Coalesce => {
+            let span = (l.span.start, l.span.end);
+            // The operator's short-circuit outcome: `&&` stops on a falsy
+            // left operand, `||` on a truthy one, and either way the whole
+            // expression takes the left operand's truthiness.
+            let short_circuit = l.operator == LogicalOperator::Or;
+            if short_circuit == jump_if {
+                let mut jumps = compile_condition(cx, &l.left, jump_if, span)?;
+                jumps.extend(compile_condition(cx, &l.right, jump_if, span)?);
+                Ok(jumps)
+            } else {
+                let skip = compile_condition(cx, &l.left, short_circuit, span)?;
+                let jumps = compile_condition(cx, &l.right, jump_if, span)?;
+                for branch in skip {
+                    cx.patch_branch_to_here(branch);
+                }
+                Ok(jumps)
+            }
+        }
+        expr => {
+            let value = compile_expr(cx, expr, enclosing_span)?;
+            let op = if jump_if { Op::JumpIfTrue } else { Op::JumpIfFalse };
+            Ok(vec![cx.emit_branch_placeholder(op, Some(value), enclosing_span)])
+        }
+    }
+}
 
 /// Evaluate `expr` for its effects alone: nothing reads its value.
 pub(crate) fn compile_effect(
@@ -474,12 +532,13 @@ fn compile_conditional_into(
     destination: u16,
 ) -> Result<u16, CompileError> {
     let span = (conditional.span.start, conditional.span.end);
-    let condition = compile_expr(cx, &conditional.test, span)?;
-    let to_alternate = cx.emit_branch_placeholder(Op::JumpIfFalse, Some(condition), span);
+    let to_alternate = compile_condition(cx, &conditional.test, false, span)?;
     let consequent = compile_expr(cx, &conditional.consequent, span)?;
     move_result_into(cx, consequent, destination, span);
     let to_end = cx.emit_branch_placeholder(Op::Jump, None, span);
-    cx.patch_branch_to_here(to_alternate);
+    for branch in to_alternate {
+        cx.patch_branch_to_here(branch);
+    }
     let alternate = compile_expr(cx, &conditional.alternate, span)?;
     move_result_into(cx, alternate, destination, span);
     cx.patch_branch_to_here(to_end);

@@ -14,6 +14,8 @@
 //! - [`licm`] — loop-invariant checks and loads run once before their loop.
 //! - `branch_fold` — truthiness branches test the value under `!` and
 //!   ToBoolean.
+//! - `branch_thread` — branches on a merged boolean take the merged edges
+//!   directly.
 //! - [`regalloc`] — live intervals, canonical homes and register assignment.
 //! - [`registers`] — backend-supplied physical ownership and fixed call words.
 //! - [`frame`] / [`emission`] — shared canonical geometry and finalized output.
@@ -47,6 +49,7 @@ mod allocation_groups;
 #[cfg(target_arch = "aarch64")]
 pub(crate) mod arm64;
 mod branch_fold;
+mod branch_thread;
 pub(crate) mod builder;
 pub(crate) mod bytecode;
 pub(crate) mod call;
@@ -150,6 +153,7 @@ pub(crate) fn compile(
     truncation::wrap_truncated_arithmetic(&mut built.graph, &built.layout);
     licm::hoist_invariants(&mut built.graph, &mut built.layout, &built.loop_headers);
     branch_fold::fold_branch_negations(&mut built.graph);
+    branch_thread::thread_boolean_phis(&mut built.graph, &mut built.layout);
     allocation_groups::fold(&mut built.graph, &built.layout, view, &built.inline_views);
     #[cfg(target_arch = "aarch64")]
     let registers = registers::AARCH64;

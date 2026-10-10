@@ -47,6 +47,30 @@ fn native_type_error(name: &'static str, reason: impl Into<String>) -> NativeErr
 /// own properties — and, when the receiver has the `d` flag, an
 /// `indices` companion array (§22.2.7.7
 /// [`MakeMatchIndicesIndexPairArray`](https://tc39.es/ecma262/#sec-makematchindicesindexpairarray)).
+/// `? Set(R, "lastIndex", value, true)` inside RegExpBuiltinExec. A
+/// RegExp's own writable `lastIndex` takes the value directly; a read-only
+/// one goes through the full set, which throws.
+fn set_exec_last_index(
+    scope: &mut NativeScope<'_, '_>,
+    receiver: Local<'_>,
+    value: Value,
+) -> Result<(), NativeError> {
+    let receiver_value = scope.raw(receiver);
+    if let Some(re) = receiver_value.as_regexp()
+        && re.last_index_writable(scope.context().heap())
+    {
+        re.set_last_index_value(scope.context().heap_mut(), value);
+        return Ok(());
+    }
+    set_property_runtime(
+        scope.context(),
+        &receiver_value,
+        "lastIndex",
+        value,
+        REGEXP_EXEC_NAME,
+    )
+}
+
 pub(crate) fn exec_once_native(
     receiver: &Value,
     text: JsString,
@@ -66,13 +90,18 @@ pub(crate) fn exec_once_native(
             // §22.2.7.2 step 3 — the observable lastIndex read and coercion
             // may run arbitrary JS. Receiver, subject, and the returned value
             // all live in the handle arena before either step starts.
+            // A RegExp owns `lastIndex` as a non-configurable data property,
+            // so reading it runs no code; only its coercion may.
             let receiver_value = scope.raw(receiver);
-            let last_index = get_property_runtime(
-                scope.context(),
-                &receiver_value,
-                "lastIndex",
-                REGEXP_EXEC_NAME,
-            )?;
+            let last_index = match receiver_value.as_regexp() {
+                Some(re) => re.last_index_value(scope.context().heap()),
+                None => get_property_runtime(
+                    scope.context(),
+                    &receiver_value,
+                    "lastIndex",
+                    REGEXP_EXEC_NAME,
+                )?,
+            };
             let last_index = scope.value(last_index);
             let last_index_value = scope.raw(last_index);
             let mut start =
@@ -89,14 +118,7 @@ pub(crate) fn exec_once_native(
             if !flags.global && !flags.sticky {
                 start = 0;
             } else if start > len {
-                let receiver_value = scope.raw(receiver);
-                set_property_runtime(
-                    scope.context(),
-                    &receiver_value,
-                    "lastIndex",
-                    Value::number_i32(0),
-                    REGEXP_EXEC_NAME,
-                )?;
+                set_exec_last_index(&mut scope, receiver, Value::number_i32(0))?;
                 return Ok(scope.null());
             }
 
@@ -130,38 +152,17 @@ pub(crate) fn exec_once_native(
                 Some(matched) => matched,
                 None => {
                     if flags.global || flags.sticky {
-                        let receiver_value = scope.raw(receiver);
-                        set_property_runtime(
-                            scope.context(),
-                            &receiver_value,
-                            "lastIndex",
-                            Value::number_i32(0),
-                            REGEXP_EXEC_NAME,
-                        )?;
+                        set_exec_last_index(&mut scope, receiver, Value::number_i32(0))?;
                     }
                     return Ok(scope.null());
                 }
             };
             if flags.sticky && matched.range.start != start {
-                let receiver_value = scope.raw(receiver);
-                set_property_runtime(
-                    scope.context(),
-                    &receiver_value,
-                    "lastIndex",
-                    Value::number_i32(0),
-                    REGEXP_EXEC_NAME,
-                )?;
+                set_exec_last_index(&mut scope, receiver, Value::number_i32(0))?;
                 return Ok(scope.null());
             }
             if flags.global || flags.sticky {
-                let receiver_value = scope.raw(receiver);
-                set_property_runtime(
-                    scope.context(),
-                    &receiver_value,
-                    "lastIndex",
-                    Value::number_f64(matched.range.end as f64),
-                    REGEXP_EXEC_NAME,
-                )?;
+                set_exec_last_index(&mut scope, receiver, Value::number_f64(matched.range.end as f64))?;
             }
 
             // §B.2.4 — a legacy-enabled instance publishes the match into
@@ -1237,8 +1238,19 @@ pub fn native_regexp_symbol_replace(
     ctx: &mut NativeCtx<'_>,
     args: &[Value],
 ) -> Result<Value, crate::NativeError> {
-    let name = "RegExp.prototype[@@replace]";
     let receiver = *ctx.this_value();
+    regexp_symbol_replace(ctx, receiver, args)
+}
+
+/// `RegExp.prototype[@@replace]` with `receiver` as its `this`: the body
+/// the native runs, and what `String.prototype.replace` calls directly once
+/// it has proven the receiver's `@@replace` is this built-in.
+pub(crate) fn regexp_symbol_replace(
+    ctx: &mut NativeCtx<'_>,
+    receiver: Value,
+    args: &[Value],
+) -> Result<Value, crate::NativeError> {
+    let name = "RegExp.prototype[@@replace]";
     if !receiver.is_object_type() {
         return Err(crate::NativeError::TypeError {
             name,

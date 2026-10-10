@@ -1920,6 +1920,22 @@ fn string_replace_spec(
                     }
                 }
             }
+            // A pristine RegExp's `@@replace` is the built-in, and reading
+            // it runs no code: call its body without the lookup and the call.
+            let search_value = scope.raw(search);
+            if search_value.as_regexp().is_some()
+                && scope.context().interp_mut().is_pristine_regexp(search_value)
+            {
+                let call_args = [scope.raw(this), scope.raw(replace_value)];
+                let search_value = scope.raw(search);
+                let result = crate::regexp_prototype::regexp_symbol_replace(
+                    scope.context(),
+                    search_value,
+                    &call_args,
+                )?;
+                let result = scope.value(result);
+                return Ok(scope.finish(result));
+            }
             let search_value = scope.raw(search);
             if let Some(method_value) =
                 get_symbol_method(scope.context(), search_value, WellKnown::Replace, name)?

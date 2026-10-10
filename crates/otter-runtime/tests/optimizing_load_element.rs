@@ -28,7 +28,7 @@ use otter_bytecode::{
 };
 use otter_jit::OtterJitCompiler;
 use otter_runtime::{JitSelection, Runtime, SourceInput};
-use otter_vm::{ExecutionContext, Interpreter, JitRuntimeStats, PersistentRootId, Value};
+use otter_vm::{ExecutionContext, Interpreter, PersistentRootId, Value};
 use smallvec::{SmallVec, smallvec};
 
 fn fixture_module() -> BytecodeModule {
@@ -253,7 +253,20 @@ fn call(
     )
 }
 
-fn run(selection: JitSelection) -> (Value, Value, Value, Value, String, JitRuntimeStats) {
+/// Whether `fid`'s function entry cell currently selects an optimizing
+/// generation: calls from host and generated code alike enter it directly.
+fn runs_optimized(interp: &Interpreter, fid: u32) -> bool {
+    interp
+        .jit_code_generation_snapshot()
+        .iter()
+        .any(|generation| {
+            generation.function_id == fid
+                && generation.current_entry
+                && generation.tier == otter_vm::native_abi::NativeFrameKind::Optimizing
+        })
+}
+
+fn run(selection: JitSelection) -> (Value, Value, Value, Value, String, Vec<u32>) {
     let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
     if !matches!(selection, JitSelection::InterpreterOnly) {
         interp.set_jit_compiler(Some(Arc::new(OtterJitCompiler::production_tiered())));
@@ -368,6 +381,11 @@ fn run(selection: JitSelection) -> (Value, Value, Value, Value, String, JitRunti
         ]
     })
     .expect("optimized many-array sum");
+    // The null load below throws out of the load's optimized code, which
+    // then deopts; record which generations ran before it.
+    let optimized = (1..=4)
+        .filter(|&fid| runs_optimized(&interp, fid))
+        .collect();
     let thrown = format!(
         "{:?}",
         call(&mut interp, &context, 1, |_| smallvec![
@@ -376,21 +394,14 @@ fn run(selection: JitSelection) -> (Value, Value, Value, Value, String, JitRunti
         ],)
         .expect_err("null element load must throw")
     );
-    (
-        loaded,
-        summed,
-        float_summed,
-        many_summed,
-        thrown,
-        interp.jit_runtime_stats(),
-    )
+    (loaded, summed, float_summed, many_summed, thrown, optimized)
 }
 
 #[test]
 fn optimized_element_values_and_throw_match_interpreter() {
     let (oracle_load, oracle_sum, oracle_float, oracle_many, oracle_throw, _) =
         run(JitSelection::InterpreterOnly);
-    let (tiered_load, tiered_sum, tiered_float, tiered_many, tiered_throw, stats) =
+    let (tiered_load, tiered_sum, tiered_float, tiered_many, tiered_throw, optimized) =
         run(JitSelection::ProductionTiered);
 
     assert_eq!(oracle_load.to_bits(), Value::number_i32(4).to_bits());
@@ -409,9 +420,10 @@ fn optimized_element_values_and_throw_match_interpreter() {
         tiered_throw.contains("Uncaught") || tiered_throw.contains("TypeError"),
         "optimized null load must throw through the parked exception channel: {tiered_throw}"
     );
-    assert!(
-        stats.optimized_entries >= 5,
-        "load, integer loop, float loop, many-array loop, and throwing load must enter optimized code: {stats:?}"
+    assert_eq!(
+        optimized,
+        [1, 2, 3, 4],
+        "load, integer loop, float loop and many-array loop run optimized code"
     );
 }
 
@@ -451,10 +463,9 @@ fn float_array_loop_enters_optimized_code() {
             Value::number_f64(12.75).to_bits()
         );
     }
-    let stats = interp.jit_runtime_stats();
     assert!(
-        stats.optimized_entries > 0,
-        "float array loop must enter optimized code: {stats:?}"
+        runs_optimized(&interp, 3),
+        "float array loop runs optimized code"
     );
 }
 
@@ -490,10 +501,9 @@ fn several_live_arrays_enter_optimized_code() {
             Value::number_i32(140).to_bits()
         );
     }
-    let stats = interp.jit_runtime_stats();
     assert!(
-        stats.optimized_entries > 0,
-        "many-array loop must enter optimized code: {stats:?}"
+        runs_optimized(&interp, 4),
+        "many-array loop runs optimized code"
     );
 }
 

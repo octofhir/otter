@@ -10,6 +10,8 @@
 //!   processes.
 //! - Accessor misses may mutate an otherwise cacheable property without making
 //!   the versioned loop observe stale state.
+//! - The structured events it reads are emitted by the AArch64 encoder.
+#![cfg(target_arch = "aarch64")]
 
 use std::process::{Command, Output};
 
@@ -87,7 +89,6 @@ fn assert_success(output: &Output) {
     );
 }
 
-#[cfg(target_arch = "aarch64")]
 #[test]
 fn property_loop_versioning_matches_the_interpreter_oracle() {
     let tmp = tempfile::tempdir().expect("tempdir");

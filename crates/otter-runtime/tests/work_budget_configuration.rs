@@ -114,14 +114,22 @@ fn regexp_backtracking_is_charged_to_the_shared_work_ledger() {
 }
 
 #[test]
-fn regexp_default_limit_surfaces_the_runtime_resource_error() {
-    let mut rt = Runtime::builder().build().expect("runtime");
+fn regexp_work_budget_surfaces_the_runtime_resource_error() {
+    // A search runs to its answer unless a configured work budget ends it.
+    let mut rt = Runtime::builder()
+        .work_budget(WorkBudget {
+            on_exceeded: WorkBudgetExceededAction::Reject,
+            max_work_units_per_turn: Some(2_000_000),
+            ..WorkBudget::default()
+        })
+        .build()
+        .expect("runtime");
     let error = rt
         .run_script(
             SourceInput::from_javascript(r#"/(a|aa)+b/.test("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");"#),
-            "<regexp-default-budget>",
+            "<regexp-configured-budget>",
         )
-        .expect_err("catastrophic backtracking must exhaust the finite default");
+        .expect_err("catastrophic backtracking must exhaust the configured budget");
 
     match error {
         OtterError::Runtime { diagnostic } => assert_eq!(diagnostic.code, "BUDGET_EXCEEDED"),
@@ -228,7 +236,7 @@ fn regexp_and_gc_charge_the_same_work_counter() {
                 r#"
                     const matched = /(a+)+$/.test("aaaaaaaaaaaaaaaa!");
                     const keep = [];
-                    for (let i = 0; i < 150_000; i += 1) {
+                    for (let i = 0; i < 600_000; i += 1) {
                         keep[i % 1024] = { i, text: "allocation-" + i };
                     }
                     matched;

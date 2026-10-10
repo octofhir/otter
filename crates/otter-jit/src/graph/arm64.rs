@@ -8,6 +8,7 @@
 //! - Sequential gap moves and target encoding of the shared parallel edge/exit
 //!   assignments in [`super::moves`].
 //! - Source-owned global binding reads with eager guards shared with Template.
+//! - Named loads through selected source-program indices and live shape proofs.
 //! - Node emitters for frame, arithmetic, conversion, check, memory, generic
 //!   and control nodes.
 //!
@@ -34,6 +35,8 @@
 //!   runtime feedback; stores reject prototype role before any effect.
 //! - Shape transitions clear the source shape's stability byte before
 //!   publishing the child shape; allocation stores establish the initial shape.
+//! - Named loads omit only a receiver shape guard matching their live exact
+//!   proof. Holder, prototype-validity and dictionary guards remain intact.
 //! - A far body places an island of veneers, slow paths and exit stubs
 //!   after every 16 KiB segment, so a `tbz`/`tbnz` of a cell test reaches
 //!   the exit it names; `b.cond` and `cbz` reach ±1 MiB.
@@ -1696,18 +1699,11 @@ impl<'a> Codegen<'a> {
                 self.load_immediate(destination, VALUE_UNDEFINED);
                 dynasm!(self.ops ; .arch aarch64 ; =>done);
             }
-            Kind::LoadNamedProperty(byte_pc) => {
+            Kind::LoadNamedProperty { .. } => {
                 let receiver = Self::gp(input(0));
                 let destination = Self::gp(result.expect("a result"));
                 let [holder, scratch] = [allocation.gp_temps[0], allocation.gp_temps[1]];
-                let byte_pc = *byte_pc;
-                self.emit_load_named_property(
-                    node,
-                    byte_pc,
-                    receiver,
-                    [holder, scratch],
-                    destination,
-                )?;
+                self.emit_load_named_property(node, receiver, [holder, scratch], destination)?;
             }
             Kind::StoreNamedProperty(byte_pc) => {
                 let (receiver, value) = (Self::gp(input(0)), Self::gp(input(1)));
@@ -3205,19 +3201,25 @@ impl<'a> Codegen<'a> {
             }));
     }
 
-    /// The named load at `byte_pc` through its feedback programs: each
-    /// proves the receiver in `X(receiver)` and reads one data slot of it or
-    /// of its holder; the first program that matches delivers the value to
-    /// `X(destination)`, and none matching leaves through the eager deopt.
+    /// Read through the node's selected source programs. A matching live
+    /// receiver proof removes its guard; all holder and chain guards remain.
+    /// The first matching program supplies the result, else the load deopts.
     fn emit_load_named_property(
         &mut self,
         node: NodeId,
-        byte_pc: u32,
         receiver: u8,
         [holder, scratch]: [u8; 2],
         destination: u8,
     ) -> Result<(), Unsupported> {
         use otter_vm::JitCacheIrOp as Op;
+        let Kind::LoadNamedProperty {
+            byte_pc,
+            programs: selected,
+            receiver_shape,
+        } = self.graph.node(node).kind.clone()
+        else {
+            return Err(Unsupported::OperandShape("graph named load plan"));
+        };
         let programs = self
             .view_of(node)
             .property_programs
@@ -3226,7 +3228,10 @@ impl<'a> Codegen<'a> {
             .clone();
         let exit = self.eager_exit(node, DeoptReason::WrongShape);
         let done = self.ops.new_dynamic_label();
-        for program in programs.iter() {
+        for index in selected {
+            let program = programs
+                .get(index as usize)
+                .ok_or(Unsupported::OperandShape("graph named load program index"))?;
             let next = self.ops.new_dynamic_label();
             for op in program.ops.iter() {
                 let object = |operand: u8| if operand == 0 { receiver } else { holder };
@@ -3299,6 +3304,9 @@ impl<'a> Codegen<'a> {
                         object: operand,
                         shape,
                     } => {
+                        if operand == 0 && receiver_shape == Some(shape) {
+                            continue;
+                        }
                         let header = object(operand);
                         if operand == 0 {
                             dynasm!(self.ops

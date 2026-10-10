@@ -14,6 +14,7 @@
 //!   deopt eagerly or lazily, throw, read or write the heap).
 //! - [`Constraints`] / [`Kind::constraints`] — where the register allocator
 //!   must put inputs, the result, and how many temporaries a node needs.
+//! - Named-load plans retain ordered indices into their source body's programs.
 //!
 //! # Invariants
 //! - Constants live outside blocks and are materialized at each use; every
@@ -29,6 +30,8 @@
 //!   allocator spills every live value before it.
 //! - A frame state of an inlined body links to its caller's state after the
 //!   call; the values of the whole chain stay live wherever it is read.
+//! - A named load's receiver shape is a live exact proof. Only a matching
+//!   receiver shape guard may be omitted; holder and chain proofs stay live.
 //!
 //! # See also
 //! - [`super::builder`] — builds the graph from bytecode and feedback.
@@ -350,11 +353,16 @@ pub(crate) enum Kind {
     LoadOwnField(otter_vm::object::FieldLocation),
     /// Store input1 into input0's shape-owned field; a separate node owns its barrier.
     StoreOwnField(otter_vm::object::FieldLocation),
-    /// The named property of receiver input0 the load site at this byte PC
-    /// reads through its feedback programs: one of their receivers, then one
-    /// data slot of the receiver or of its guarded holder. Eager deopt when no
-    /// program matches.
-    LoadNamedProperty(u32),
+    /// Read a named property of input0 through the selected feedback programs
+    /// at `byte_pc`. Indices refer to the original source programs in their
+    /// order. A live exact `receiver_shape` proves only a matching receiver
+    /// shape guard; holder and chain guards remain. Eager deopt when no
+    /// selected program matches.
+    LoadNamedProperty {
+        byte_pc: u32,
+        programs: SmallVec<[u32; 4]>,
+        receiver_shape: Option<u32>,
+    },
     /// Store input1 into the named property of receiver input0 through the
     /// feedback programs of the store site at this byte PC: an existing
     /// writable slot, or an appended slot with the child shape published and
@@ -731,7 +739,7 @@ impl Kind {
             | Self::CheckCellValue(_)
             | Self::CheckNotHole
             | Self::LoadGuardedMethod { .. }
-            | Self::LoadNamedProperty(_)
+            | Self::LoadNamedProperty { .. }
             | Self::CheckElements { .. }
             | Self::CheckElementPresent
             | Self::CheckHoleyElementPresent(_)
@@ -995,7 +1003,7 @@ impl Kind {
                 fp_temps: 0,
                 fixed_gp_clobbers: SmallVec::new(),
             },
-            Self::LoadNamedProperty(_) => Constraints {
+            Self::LoadNamedProperty { .. } => Constraints {
                 inputs: registers(1),
                 result: ResultPolicy::Register,
                 gp_temps: 2,

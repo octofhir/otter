@@ -1291,6 +1291,22 @@ pub(crate) struct InlinedBody {
     pub(crate) call_byte_pc: u32,
 }
 
+/// Every frame state's [`Graph::state_values`], in state order.
+#[derive(Debug, Default)]
+pub(crate) struct StateValues {
+    /// Start of each state's values; one more entry closes the last.
+    starts: Vec<u32>,
+    values: Vec<NodeId>,
+}
+
+impl StateValues {
+    /// The values `state`'s chain reads, outermost frame first.
+    pub(crate) fn of(&self, state: FrameStateId) -> &[NodeId] {
+        let index = state.0 as usize;
+        &self.values[self.starts[index] as usize..self.starts[index + 1] as usize]
+    }
+}
+
 /// The whole graph of one compilation.
 #[derive(Debug, Default)]
 pub(crate) struct Graph {
@@ -1387,6 +1403,19 @@ impl Graph {
             values.extend(data.registers.iter().map(|&(_, value)| value));
         }
         values
+    }
+
+    /// [`Self::state_values`] of every frame state, flattened once the graph
+    /// is final.
+    pub(crate) fn all_state_values(&self) -> StateValues {
+        let mut starts = Vec::with_capacity(self.frame_states.len() + 1);
+        let mut values = Vec::new();
+        for state in 0..self.frame_states.len() {
+            starts.push(values.len() as u32);
+            values.extend(self.state_values(FrameStateId(state as u32)));
+        }
+        starts.push(values.len() as u32);
+        StateValues { starts, values }
     }
 
     /// The instruction of the compiled function itself that `node` runs

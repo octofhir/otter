@@ -1526,7 +1526,7 @@ fn collecting_slow_path_rematerializes_live_constants() {
             .iter()
             .any(|&(_, home)| home == Location::Constant(constant))
     );
-    assert!(!allocation.spill.contains_key(&constant));
+    assert!(allocation.spill.get(&constant).is_none());
 }
 
 #[test]

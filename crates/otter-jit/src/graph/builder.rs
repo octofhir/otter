@@ -1031,10 +1031,12 @@ impl<'a> Builder<'a> {
         self.graph.origin = origin;
         self.graph.position = 0;
         self.inlined_bytes += bytes;
+        // Loop headers recorded from here on belong to this body or to bodies
+        // spliced into it; an abandoned body drops all of them.
+        let inline_loop_headers = self.inline_loop_headers.len();
         // The caller's block jumps to the callee's first block.
         self.goto(0);
         let layout = self.build_body();
-        let inline_loop_headers = self.inline_loop_headers.len();
         if !self.inline.as_ref().is_some_and(|inline| inline.abandoned) {
             self.finish_loops();
             let mut headers = self.loop_headers();

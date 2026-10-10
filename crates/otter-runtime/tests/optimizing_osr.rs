@@ -7,6 +7,9 @@
 //!   reconstructed interpreter frame.
 //! - A once-called loop reading one invariant property, whose access the
 //!   optimizing tier moves into a pre-header the OSR entry never reaches.
+//! - A once-called method whose OSR entry lies in an inner loop: the
+//!   enclosing loop runs again along its back edge, where the receiver and
+//!   the field it read before that loop were never computed.
 //!
 //! # Invariants
 //! - Tiered and interpreter-only runs execute identical source.
@@ -78,6 +81,25 @@ const HOISTED_INVARIANT_READ_SETUP: &str = r#"
 "#;
 
 const HOISTED_INVARIANT_READ_PROBE: &str = "String(onceInvariantRead(osrHolder, 4096));";
+
+const ENCLOSING_LOOP_SETUP: &str = r#"
+    function OsrWorld() { this.gravity = { x: 1 }; this.rounds = 4; }
+    const osrWorld = new OsrWorld();
+
+    OsrWorld.prototype.step = function onceEnclosingLoop(limit) {
+      const first = this.gravity.x;
+      let total = 0;
+      for (let round = 0; round < this.rounds; round = round + 1) {
+        for (let index = 0; index < limit; index = index + 1) {
+          total = total + (index & 1);
+        }
+        total = total + this.gravity.x + first;
+      }
+      return total;
+    };
+"#;
+
+const ENCLOSING_LOOP_PROBE: &str = "String(osrWorld.step(40000));";
 
 struct Observation {
     completion: String,
@@ -285,6 +307,26 @@ fn osr_entry_performs_the_pre_header_access_a_hoisted_loop_reads() {
     assert_eq!(oracle.completion, "28672");
     let bundle = assert_own_osr(&tiered, "onceInvariantRead");
     assert_no_loop_exit(&tiered, bundle);
+}
+
+#[test]
+fn a_loop_enclosing_the_osr_entry_keeps_no_fact_of_the_forward_path() {
+    let oracle = run(
+        ENCLOSING_LOOP_SETUP,
+        ENCLOSING_LOOP_PROBE,
+        JitSelection::InterpreterOnly,
+        "optimizing-osr-enclosing-oracle.js",
+    );
+    let tiered = run(
+        ENCLOSING_LOOP_SETUP,
+        ENCLOSING_LOOP_PROBE,
+        JitSelection::ProductionTiered,
+        "optimizing-osr-enclosing-tiered.js",
+    );
+
+    assert_eq!(tiered.completion, oracle.completion);
+    assert_eq!(oracle.completion, "80008");
+    assert_own_osr(&tiered, "onceEnclosingLoop");
 }
 
 #[test]

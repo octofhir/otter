@@ -65,12 +65,12 @@ use super::values::{
 };
 use crate::artifact::relocation::{GuardedHeapComponent, RelocationCapture, RelocationTarget};
 use crate::entry::{
-    ALLOC_CTX_SAFEPOINT_ID_OFFSET, ALLOC_CTX_SPILL_SLOT_COUNT_OFFSET, ALLOC_CTX_SPILL_SLOTS_OFFSET,
-    ALLOC_CTX_STACK_SIZE, ALLOC_CTX_THREAD_OFFSET, DOUBLE_OFFSET_HI16, NUMBER_TAG_HI16,
-    OBJECT_BODY_TYPE_TAG, THREAD_OFFSET, Unsupported, VALUE_HOLE, VALUE_UNDEFINED,
-    VM_THREAD_ACTIVE_REALM_CELL_OFFSET, VM_THREAD_ARRAY_BUFFER_DETACH_PROTECTOR_CELL_OFFSET,
+    ALLOC_CTX_STACK_SIZE, DOUBLE_OFFSET_HI16, NUMBER_TAG_HI16, OBJECT_BODY_TYPE_TAG, THREAD_OFFSET,
+    Unsupported, VALUE_HOLE, VALUE_UNDEFINED, VM_THREAD_ACTIVE_REALM_CELL_OFFSET,
+    VM_THREAD_ARRAY_BUFFER_DETACH_PROTECTOR_CELL_OFFSET,
     VM_THREAD_ARRAY_INDEX_PROTECTOR_CELL_OFFSET, VM_THREAD_GC_HEAP_OFFSET,
 };
+use crate::template::operation::{AllocPacket, AllocRoots};
 
 /// Compare the immutable hidden-class token. It fixes descriptor attributes,
 /// lookup state, prototype role and bank geometry together.
@@ -880,7 +880,7 @@ where
         ops,
         relocations,
         stub_id,
-        NO_SAFEPOINT,
+        AllocRoots::Window.packet(NO_SAFEPOINT),
         declaration.argument_count,
         context_x,
         load_argument,
@@ -936,12 +936,14 @@ pub(crate) fn emit_native_leaf_guard(
 /// across a miss and `load_value` may freely use `x10`–`x15`. `value_count` is
 /// how many of the family's operand words the site fills; the rest are
 /// `undefined`. The boxed result is left in `x0`; a miss branches to `bail`.
-/// The caller supplies its native context register as `context_x`.
+/// The caller supplies its native context register as `context_x`, and the
+/// packet an allocating entry publishes as `packet` — a leaf entry's names no
+/// record.
 pub(crate) fn emit_native_entry_call<F>(
     ops: &mut Assembler,
     relocations: &mut RelocationCapture,
     stub_id: RuntimeStubId,
-    safepoint_id: SafepointId,
+    packet: AllocPacket,
     value_count: u8,
     context_x: u8,
     mut load_value: F,
@@ -950,7 +952,7 @@ pub(crate) fn emit_native_entry_call<F>(
 where
     F: FnMut(&mut Assembler, u8, u8) -> Result<(), Unsupported>,
 {
-    if safepoint_id == NO_SAFEPOINT {
+    if packet.safepoint == NO_SAFEPOINT {
         // Both leaf families take the heap and their operand words directly;
         // they differ only in how many words they read, so the width is the
         // whole distinction.
@@ -992,26 +994,20 @@ where
     }
 
     let Some((entry_addr, descriptor)) = alloc_value_stub_by_id(stub_id)
-        .filter(|stub| stub.is_valid_for_safepoint(safepoint_id))
+        .filter(|stub| stub.is_valid_for_safepoint(packet.safepoint))
         .and_then(|stub| Some((stub.entry_addr()?, stub.descriptor)))
     else {
         return Err(Unsupported::OperandShape("native allocating entry"));
     };
     // The context lives in the caller's own stack, so the entry's rooting
     // packet is torn down by the same `add sp` that unwinds it, on both the
-    // taken and the missed path.
-    dynasm!(ops
-        ; .arch aarch64
-        ; sub sp, sp, ALLOC_CTX_STACK_SIZE
-        ; ldr x9, [X(context_x), THREAD_OFFSET]
-        ; str x9, [sp, ALLOC_CTX_THREAD_OFFSET]
-        ; movz w9, safepoint_id
-        ; str w9, [sp, ALLOC_CTX_SAFEPOINT_ID_OFFSET]
-        ; strh wzr, [sp, ALLOC_CTX_SPILL_SLOT_COUNT_OFFSET]
-        ; str xzr, [sp, ALLOC_CTX_SPILL_SLOTS_OFFSET]
-        ; mov x0, sp
+    // taken and the missed path. The packet's thread comes from the native
+    // context, so the context register must be the one the packet reads.
+    debug_assert_eq!(
+        context_x, 20,
+        "allocation packets read the context from x20"
     );
-    emit_load_u64(ops, 1, u64::from(safepoint_id));
+    super::transitions::emit_alloc_packet(ops, packet);
     emit_entry_values(ops, 2, 4, value_count, &mut load_value)?;
     emit_load_symbol_u64(
         ops,
@@ -1071,8 +1067,10 @@ pub(crate) fn native_leaf_call_name(stub_id: RuntimeStubId) -> &'static str {
 ///
 /// `load_argument(ops, index, register)` materializes one JavaScript argument
 /// and runs only after every guard. An exotic receiver is passed to the entry
-/// ahead of those arguments, because the operation is on that body. The boxed
-/// result is left in `x0`; every miss branches to `miss`.
+/// ahead of those arguments, because the operation is on that body. A call
+/// with a grow entry retries a declined operation there. An allocating entry
+/// publishes its packet through `roots`. The boxed result is left in `x0`;
+/// every miss branches to `miss`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn emit_guarded_method_call<F>(
     ops: &mut Assembler,
@@ -1081,6 +1079,7 @@ pub(crate) fn emit_guarded_method_call<F>(
     call: &JitGuardedMethodCall,
     receiver: u16,
     byte_pc: u32,
+    roots: AllocRoots,
     mut load_argument: F,
     miss: DynamicLabel,
 ) -> Result<(), Unsupported>
@@ -1100,21 +1099,55 @@ where
     // own arguments shift one place along.
     let receiver_word = u8::from(receiver_is_operand);
     let value_count = receiver_word + call.argument_count;
+    let mut operand = |ops: &mut Assembler, index: u8, register: u8| {
+        if receiver_is_operand && index == 0 {
+            return emit_load_reg(ops, register, receiver);
+        }
+        load_argument(ops, index - receiver_word, register)
+    };
+    let Some((grow_id, grow_safepoint)) = call
+        .grow
+        .filter(|&(stub_id, safepoint_id)| native_entry_call_is_supported(stub_id, safepoint_id))
+    else {
+        return emit_native_entry_call(
+            ops,
+            relocations,
+            call.entry_stub_id,
+            roots.packet(call.safepoint_id),
+            value_count,
+            20,
+            &mut operand,
+            miss,
+        );
+    };
+    // The declared entry refuses without effects when the storage it writes
+    // is full; the grow entry takes the same operands, reloaded after the
+    // first call clobbered them, and completes the operation by allocating.
+    let declined = ops.new_dynamic_label();
+    let done = ops.new_dynamic_label();
     emit_native_entry_call(
         ops,
         relocations,
         call.entry_stub_id,
-        call.safepoint_id,
+        roots.packet(call.safepoint_id),
         value_count,
         20,
-        |ops, index, register| {
-            if receiver_is_operand && index == 0 {
-                return emit_load_reg(ops, register, receiver);
-            }
-            load_argument(ops, index - receiver_word, register)
-        },
+        &mut operand,
+        declined,
+    )?;
+    dynasm!(ops ; .arch aarch64 ; b =>done ; =>declined);
+    emit_native_entry_call(
+        ops,
+        relocations,
+        grow_id,
+        roots.packet(grow_safepoint),
+        value_count,
+        20,
+        &mut operand,
         miss,
-    )
+    )?;
+    dynasm!(ops ; .arch aarch64 ; =>done);
+    Ok(())
 }
 
 /// Miss unless the isolate's active realm is `realm`, the realm whose

@@ -929,7 +929,7 @@ pub(super) fn emit_call_with_receiver(
             ops,
             relocations,
             target.leaf_stub_id,
-            abi::NO_SAFEPOINT,
+            crate::template::operation::AllocRoots::Window.packet(abi::NO_SAFEPOINT),
             this_word + declaration.argument_count,
             20,
             |ops, index, register| {
@@ -1806,6 +1806,7 @@ pub(super) fn emit_method_call(
     byte_pc: u32,
     arg0: Option<u16>,
     arg1: Option<u16>,
+    alloc_roots: crate::template::operation::AllocRoots,
     bail: DynamicLabel,
     threw: DynamicLabel,
     throw_value: DynamicLabel,
@@ -1831,6 +1832,7 @@ pub(super) fn emit_method_call(
             call,
             receiver,
             byte_pc,
+            alloc_roots,
             |ops, index, register| {
                 let source = method_arguments
                     .get(usize::from(index))

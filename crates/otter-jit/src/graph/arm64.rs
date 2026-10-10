@@ -63,8 +63,7 @@ use crate::Unsupported;
 use crate::artifact::relocation::{RelocationCapture, RelocationTarget};
 use crate::entry::{
     NATIVE_FRAME_SELF_OFFSET, NATIVE_FRAME_THIS_OFFSET, THREAD_OFFSET, VALUE_HOLE,
-    VM_THREAD_GC_HEAP_OFFSET,
-    VM_THREAD_MARKING_FLAG_CELL_OFFSET,
+    VM_THREAD_GC_HEAP_OFFSET, VM_THREAD_MARKING_FLAG_CELL_OFFSET,
 };
 use crate::template::arm64::values::{emit_load_symbol_u64, emit_load_u64};
 
@@ -503,7 +502,9 @@ impl<'a> Codegen<'a> {
     /// it, else one load of its literal-pool word.
     fn load_immediate(&mut self, register: u8, bits: u64) {
         if crate::template::arm64::values::load_u64_instructions(bits) == 1
-            || !self.relocations.emit_constant_load(&mut self.ops, register, bits)
+            || !self
+                .relocations
+                .emit_constant_load(&mut self.ops, register, bits)
         {
             emit_load_u64(&mut self.ops, register, bits);
         }
@@ -1364,7 +1365,11 @@ impl<'a> Codegen<'a> {
                     let inexact = self.ops.new_dynamic_label();
                     // The inexact path recomputes from the input alone.
                     let direct = !self.exit_reads_gp(node, destination);
-                    crate::arm64::emit_fjcvtzs(&mut self.ops, a, if direct { destination } else { 16 });
+                    crate::arm64::emit_fjcvtzs(
+                        &mut self.ops,
+                        a,
+                        if direct { destination } else { 16 },
+                    );
                     dynasm!(self.ops ; .arch aarch64 ; b.ne =>inexact);
                     if !direct {
                         dynasm!(self.ops ; .arch aarch64 ; mov W(destination), w16);
@@ -4172,10 +4177,19 @@ impl<'a> Codegen<'a> {
         let labels = std::collections::BTreeMap::new();
         let mut numeric_slow_paths = Vec::new();
         let mut coercion_slow_paths = Vec::new();
+        // Values live across the operation sit in this body's tagged homes,
+        // not in the register window, so an allocating stub call inside it
+        // publishes the boundary's record over the homes — the record the
+        // frame is stamped with — rather than the operation's window record.
+        let alloc_roots = crate::template::operation::AllocRoots::Optimized {
+            safepoint: self.helper_safepoint(node)?,
+            tagged_slots: u16::try_from(self.slots.tagged)
+                .map_err(|_| Unsupported::OperandShape("graph tagged home count"))?,
+        };
         for position in positions {
             let operation = self.plan.instructions[position].op;
+            self.stamp_node_safepoint(node)?;
             if !crate::template::operation_is_js_call(operation) {
-                self.stamp_node_safepoint(node)?;
                 self.load_word32(16, self.graph.outer_pc(node));
                 dynasm!(self.ops ; .arch aarch64 ; str w16,[x21,crate::entry::NATIVE_FRAME_PC_OFFSET]);
             }
@@ -4186,6 +4200,7 @@ impl<'a> Codegen<'a> {
                     relocations: &mut self.relocations,
                     return_sites: &mut self.return_sites,
                     call_safepoint,
+                    alloc_roots,
                     transitions: self.transitions,
                     view: self.view,
                     plan: self.plan,

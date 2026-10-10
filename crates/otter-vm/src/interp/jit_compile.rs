@@ -1825,14 +1825,14 @@ impl Interpreter {
             // An exotic receiver — a collection body, a dense array or a
             // primitive — reaches its builtin through a pinned realm prototype
             // rather than a shape, so its feedback names the call directly.
-            if let Some(call) = site
+            if let Some(mut call) = site
                 .and_then(|site| self.jit_collection_method_call(site, alloc_safepoint_id))
                 .or_else(|| {
                     site.and_then(|site| self.jit_array_method_call(site, alloc_safepoint_id))
                 })
                 .or_else(|| self.jit_primitive_method_call(method_hint))
             {
-                if reserve_guarded_entry_safepoint(view, &call) {
+                if reserve_guarded_entry_safepoint(view, &mut call) {
                     view.guarded_method_calls.insert(byte_pc, call);
                 }
                 continue;
@@ -1891,6 +1891,7 @@ impl Interpreter {
                     entry_stub_id: stub_id,
                     safepoint_id: native_abi::NO_SAFEPOINT,
                     argument_count: declaration.argument_count,
+                    grow: None,
                 },
             );
         }
@@ -3095,13 +3096,29 @@ impl Interpreter {
 /// The family the entry id resolves in is the whole decision: a leaf or
 /// mutating-leaf entry cannot collect and publishes nothing, while an
 /// allocating one must name a precise map covering the caller's full register
-/// window before generated code may call it.
+/// window before generated code may call it. A grow entry without callable
+/// code is dropped, leaving the declared entry's misses on the ordinary call.
 fn reserve_guarded_entry_safepoint(
     view: &mut jit::JitCompileSnapshot,
-    call: &jit::JitGuardedMethodCall,
+    call: &mut jit::JitGuardedMethodCall,
 ) -> bool {
-    let stub_id = call.entry_stub_id;
-    if call.safepoint_id == native_abi::NO_SAFEPOINT {
+    if !reserve_entry_safepoint(view, call.entry_stub_id, call.safepoint_id) {
+        return false;
+    }
+    if let Some((stub_id, safepoint_id)) = call.grow
+        && !reserve_entry_safepoint(view, stub_id, safepoint_id)
+    {
+        call.grow = None;
+    }
+    true
+}
+
+fn reserve_entry_safepoint(
+    view: &mut jit::JitCompileSnapshot,
+    stub_id: native_abi::RuntimeStubId,
+    safepoint_id: native_abi::SafepointId,
+) -> bool {
+    if safepoint_id == native_abi::NO_SAFEPOINT {
         return crate::runtime_stubs::leaf_no_alloc_stub2_by_id(stub_id)
             .is_some_and(crate::runtime_stubs::LeafNoAllocStub2::is_valid)
             || crate::runtime_stubs::mutating_leaf_stub2_by_id(stub_id)
@@ -3110,13 +3127,13 @@ fn reserve_guarded_entry_safepoint(
                 .is_some_and(crate::runtime_stubs::MutatingLeafStub3::is_valid);
     }
     if !crate::runtime_stubs::alloc_value_stub_by_id(stub_id)
-        .is_some_and(|stub| stub.is_valid_for_safepoint(call.safepoint_id) && stub.has_entry())
+        .is_some_and(|stub| stub.is_valid_for_safepoint(safepoint_id) && stub.has_entry())
     {
         return false;
     }
     view.safepoints.insert(
-        call.safepoint_id,
-        native_abi::SafepointRecord::window(call.safepoint_id, native_abi::NO_FRAME_STATE),
+        safepoint_id,
+        native_abi::SafepointRecord::window(safepoint_id, native_abi::NO_FRAME_STATE),
     );
     true
 }

@@ -247,6 +247,7 @@ pub(super) fn compile(
                 relocations: &mut relocations,
                 return_sites: &mut return_sites,
                 call_safepoint: call_safepoints.get(&instruction.pc).copied().unwrap_or(0),
+                alloc_roots: crate::template::operation::AllocRoots::Window,
                 transitions,
                 view,
                 plan: &plan,
@@ -730,6 +731,35 @@ fn emit_binary_arith(
     emit_store_reg(ops, 0, dst);
 }
 
+/// Reserve an allocating stub's rooting packet on the machine stack and fill
+/// it for `packet`: the thread, the record the stub resolves its roots
+/// through and, inside an optimized body, the frame's machine-root window.
+/// Leaves the packet address in `rdi` and the record id in `esi`; the caller's
+/// `add rsp, ALLOC_CTX_STACK_SIZE` tears it down. Clobbers `r11`.
+pub(crate) fn emit_alloc_packet(
+    ops: &mut Assembler,
+    packet: crate::template::operation::AllocPacket,
+) {
+    dynasm!(ops
+        ; .arch x64
+        ; sub rsp, ALLOC_CTX_STACK_SIZE as i32
+        ; mov r11, [r15 + THREAD_OFFSET as i32]
+        ; mov [rsp + ALLOC_CTX_THREAD_OFFSET as i32], r11
+        ; mov DWORD [rsp + ALLOC_CTX_SAFEPOINT_ID_OFFSET as i32], packet.safepoint as i32
+        ; mov WORD [rsp + ALLOC_CTX_SPILL_SLOT_COUNT_OFFSET as i32], packet.tagged_slots as i16
+    );
+    if packet.tagged_slots == 0 {
+        dynasm!(ops ; .arch x64 ; mov QWORD [rsp + ALLOC_CTX_SPILL_SLOTS_OFFSET as i32], 0);
+    } else {
+        dynasm!(ops
+            ; .arch x64
+            ; mov r11, [r14 + abi::NATIVE_FRAME_MACHINE_ROOTS_OFFSET as i32]
+            ; mov [rsp + ALLOC_CTX_SPILL_SLOTS_OFFSET as i32], r11
+        );
+    }
+    dynasm!(ops ; .arch x64 ; mov rdi, rsp ; mov esi, packet.safepoint as i32);
+}
+
 #[allow(clippy::too_many_arguments)]
 fn emit_add_generic(
     ops: &mut Assembler,
@@ -739,7 +769,7 @@ fn emit_add_generic(
     dst: u16,
     lhs: u16,
     rhs: u16,
-    concat_safepoint: otter_vm::native_abi::SafepointId,
+    concat: crate::template::operation::AllocPacket,
     threw: DynamicLabel,
     fatal: DynamicLabel,
 ) -> Result<(), Unsupported> {
@@ -770,17 +800,7 @@ fn emit_add_generic(
     if let Some(stub_addr) =
         alloc_value_stub_by_id(abi::STUB_STRING_CONCAT_ALLOC.id).and_then(|stub| stub.entry_addr())
     {
-        dynasm!(ops
-            ; .arch x64
-            ; sub rsp, ALLOC_CTX_STACK_SIZE as i32
-            ; mov r11, [r15 + THREAD_OFFSET as i32]
-            ; mov [rsp + ALLOC_CTX_THREAD_OFFSET as i32], r11
-            ; mov DWORD [rsp + ALLOC_CTX_SAFEPOINT_ID_OFFSET as i32], concat_safepoint as i32
-            ; mov QWORD [rsp + ALLOC_CTX_SPILL_SLOTS_OFFSET as i32], 0
-            ; mov WORD [rsp + ALLOC_CTX_SPILL_SLOT_COUNT_OFFSET as i32], 0
-            ; mov rdi, rsp
-            ; mov esi, concat_safepoint as i32
-        );
+        emit_alloc_packet(ops, concat);
         emit_load_reg(ops, 2, lhs);
         emit_load_reg(ops, 1, rhs);
         emit_load_u64(ops, 8, VALUE_UNDEFINED);
@@ -1445,7 +1465,7 @@ fn emit_array_construct_alloc_call(
     relocations: &mut RelocationCapture,
     dst: u16,
     length: Option<u16>,
-    safepoint: abi::SafepointId,
+    packet: crate::template::operation::AllocPacket,
     miss: DynamicLabel,
 ) -> Result<(), Unsupported> {
     let descriptor = abi::STUB_ARRAY_CONSTRUCT_ALLOC;
@@ -1454,17 +1474,7 @@ fn emit_array_construct_alloc_call(
         .ok_or(Unsupported::OperandShape(
             "ArrayConstruct allocating stub entry",
         ))?;
-    dynasm!(ops
-        ; .arch x64
-        ; sub rsp, ALLOC_CTX_STACK_SIZE as i32
-        ; mov r11, [r15 + THREAD_OFFSET as i32]
-        ; mov [rsp + ALLOC_CTX_THREAD_OFFSET as i32], r11
-        ; mov DWORD [rsp + ALLOC_CTX_SAFEPOINT_ID_OFFSET as i32], safepoint as i32
-        ; mov QWORD [rsp + ALLOC_CTX_SPILL_SLOTS_OFFSET as i32], 0
-        ; mov WORD [rsp + ALLOC_CTX_SPILL_SLOT_COUNT_OFFSET as i32], 0
-        ; mov rdi, rsp
-        ; mov esi, safepoint as i32
-    );
+    emit_alloc_packet(ops, packet);
     if let Some(length) = length {
         emit_load_reg(ops, 2, length);
     } else {

@@ -348,7 +348,7 @@ pub(super) fn emit_fused_numeric_chain(
 
 /// Emit `+` with the full ECMAScript semantics: the inline numeric paths of
 /// [`emit_binary_arith`], then a shared native string LAB fit, then the allocating runtime call
-/// rooted at `concat_safepoint`, then the interpreter-completing delegate for
+/// publishing the `concat` packet, then the interpreter-completing delegate for
 /// every remaining coercive case. Non-number operands never side-exit — `+`
 /// stays resident in compiled code.
 #[allow(clippy::too_many_arguments)]
@@ -360,7 +360,7 @@ pub(super) fn emit_add_generic(
     dst: u16,
     lhs: u16,
     rhs: u16,
-    concat_safepoint: otter_vm::native_abi::SafepointId,
+    concat: crate::template::operation::AllocPacket,
     site: Option<ArithSite>,
     threw: DynamicLabel,
     fatal: DynamicLabel,
@@ -404,16 +404,7 @@ pub(super) fn emit_add_generic(
     let collecting = ops.new_dynamic_label();
     super::primitive_strings::emit_concat_fit(ops, shared, dst, lhs, rhs, collecting, done)?;
     dynasm!(ops ; .arch aarch64 ; =>collecting);
-    emit_string_concat_alloc_call(
-        ops,
-        relocations,
-        dst,
-        lhs,
-        rhs,
-        concat_safepoint,
-        delegate_path,
-        done,
-    )?;
+    emit_string_concat_alloc_call(ops, relocations, dst, lhs, rhs, concat, delegate_path, done)?;
     dynasm!(ops ; .arch aarch64 ; =>delegate_path);
     emit_add_delegate(ops, relocations, table, dst, lhs, rhs, threw, fatal);
     dynasm!(ops ; .arch aarch64 ; =>done);

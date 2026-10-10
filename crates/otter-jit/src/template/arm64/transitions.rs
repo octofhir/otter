@@ -440,9 +440,45 @@ pub(super) fn emit_add_delegate(
     );
 }
 
+/// Reserve an allocating stub's rooting packet on the machine stack and fill
+/// it for `packet`: the thread, the record the stub resolves its roots
+/// through and, inside an optimized body, the frame's machine-root window.
+/// Leaves the packet address in `x0` and the record id in `x1`; the caller's
+/// `add sp, sp, ALLOC_CTX_STACK_SIZE` tears it down. Clobbers `x9` and `x10`.
+pub(crate) fn emit_alloc_packet(
+    ops: &mut Assembler,
+    packet: crate::template::operation::AllocPacket,
+) {
+    dynasm!(ops
+        ; .arch aarch64
+        ; sub sp, sp, ALLOC_CTX_STACK_SIZE
+        ; ldr x9, [x20, THREAD_OFFSET]
+        ; str x9, [sp, ALLOC_CTX_THREAD_OFFSET]
+    );
+    emit_load_u64(ops, 9, u64::from(packet.safepoint));
+    dynasm!(ops ; .arch aarch64 ; str w9, [sp, ALLOC_CTX_SAFEPOINT_ID_OFFSET]);
+    if packet.tagged_slots == 0 {
+        dynasm!(ops
+            ; .arch aarch64
+            ; strh wzr, [sp, ALLOC_CTX_SPILL_SLOT_COUNT_OFFSET]
+            ; str xzr, [sp, ALLOC_CTX_SPILL_SLOTS_OFFSET]
+        );
+    } else {
+        emit_load_u64(ops, 9, u64::from(packet.tagged_slots));
+        dynasm!(ops
+            ; .arch aarch64
+            ; strh w9, [sp, ALLOC_CTX_SPILL_SLOT_COUNT_OFFSET]
+            ; ldr x10, [x21, abi::NATIVE_FRAME_MACHINE_ROOTS_OFFSET]
+            ; str x10, [sp, ALLOC_CTX_SPILL_SLOTS_OFFSET]
+        );
+    }
+    dynasm!(ops ; .arch aarch64 ; mov x0, sp);
+    emit_load_u64(ops, 1, u64::from(packet.safepoint));
+}
+
 /// Allocating string-concat call through the isolate-resolved `AllocValue3`
-/// entry: build the frozen call packet on the machine stack, name the
-/// concrete `safepoint`, call, and on `Ok` store the result. Any non-`Ok`
+/// entry: build the frozen call packet on the machine stack, publish
+/// `packet`'s roots, call, and on `Ok` store the result. Any non-`Ok`
 /// status branches to `miss` (the interpreter-completing delegate path).
 pub(super) fn emit_string_concat_alloc_call(
     ops: &mut Assembler,
@@ -450,7 +486,7 @@ pub(super) fn emit_string_concat_alloc_call(
     dst: u16,
     lhs: u16,
     rhs: u16,
-    safepoint: otter_vm::native_abi::SafepointId,
+    packet: crate::template::operation::AllocPacket,
     miss: DynamicLabel,
     done: DynamicLabel,
 ) -> Result<(), Unsupported> {
@@ -459,18 +495,7 @@ pub(super) fn emit_string_concat_alloc_call(
     else {
         return Ok(());
     };
-    dynasm!(ops
-        ; .arch aarch64
-        ; sub sp, sp, ALLOC_CTX_STACK_SIZE
-        ; ldr x9, [x20, THREAD_OFFSET]
-        ; str x9, [sp, ALLOC_CTX_THREAD_OFFSET]
-        ; movz w9, safepoint
-        ; str w9, [sp, ALLOC_CTX_SAFEPOINT_ID_OFFSET]
-        ; strh wzr, [sp, ALLOC_CTX_SPILL_SLOT_COUNT_OFFSET]
-        ; str xzr, [sp, ALLOC_CTX_SPILL_SLOTS_OFFSET]
-        ; mov x0, sp
-    );
-    emit_load_u64(ops, 1, u64::from(safepoint));
+    emit_alloc_packet(ops, packet);
     emit_load_reg(ops, 2, lhs)?;
     emit_load_reg(ops, 3, rhs)?;
     emit_load_u64(ops, 4, VALUE_UNDEFINED);
@@ -503,7 +528,7 @@ pub(super) fn emit_array_construct_alloc_call(
     relocations: &mut RelocationCapture,
     dst: u16,
     length: Option<u16>,
-    safepoint: otter_vm::native_abi::SafepointId,
+    packet: crate::template::operation::AllocPacket,
     bail: DynamicLabel,
 ) -> Result<(), Unsupported> {
     let descriptor = abi::STUB_ARRAY_CONSTRUCT_ALLOC;
@@ -512,18 +537,7 @@ pub(super) fn emit_array_construct_alloc_call(
         .ok_or(Unsupported::OperandShape(
             "ArrayConstruct allocating stub entry",
         ))?;
-    dynasm!(ops
-        ; .arch aarch64
-        ; sub sp, sp, ALLOC_CTX_STACK_SIZE
-        ; ldr x9, [x20, THREAD_OFFSET]
-        ; str x9, [sp, ALLOC_CTX_THREAD_OFFSET]
-        ; movz w9, safepoint
-        ; str w9, [sp, ALLOC_CTX_SAFEPOINT_ID_OFFSET]
-        ; strh wzr, [sp, ALLOC_CTX_SPILL_SLOT_COUNT_OFFSET]
-        ; str xzr, [sp, ALLOC_CTX_SPILL_SLOTS_OFFSET]
-        ; mov x0, sp
-    );
-    emit_load_u64(ops, 1, u64::from(safepoint));
+    emit_alloc_packet(ops, packet);
     if let Some(length) = length {
         emit_load_reg(ops, 2, length)?;
     } else {

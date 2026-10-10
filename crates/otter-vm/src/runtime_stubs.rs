@@ -34,7 +34,7 @@
 use crate::native_abi::{
     CodeRegistryView, NO_SAFEPOINT, NativeResultDomain, NativeResultPair, RuntimeStubAllocContext,
     RuntimeStubDescriptor, RuntimeStubId, STUB_ARRAY_CONSTRUCT_ALLOC, STUB_ARRAY_POP_LEAF,
-    STUB_ARRAY_PUSH_LEAF, STUB_ARRAY_SHIFT_LEAF, STUB_ARRAY_UNSHIFT_ALLOC,
+    STUB_ARRAY_PUSH_ALLOC, STUB_ARRAY_PUSH_LEAF, STUB_ARRAY_SHIFT_LEAF, STUB_ARRAY_UNSHIFT_ALLOC,
     STUB_BIGINT_BINARY_ALLOC, STUB_COLLECTION_MAP_DELETE_ALLOC, STUB_COLLECTION_MAP_GET_ALLOC,
     STUB_COLLECTION_MAP_GET_LEAF, STUB_COLLECTION_MAP_HAS_ALLOC, STUB_COLLECTION_MAP_HAS_LEAF,
     STUB_COLLECTION_MAP_SET_ALLOC, STUB_COLLECTION_MAP_SET_MUTATING, STUB_COLLECTION_SET_ADD_ALLOC,
@@ -834,6 +834,12 @@ pub const ARRAY_SHIFT_LEAF: MutatingLeafStub2 = MutatingLeafStub2 {
     entry: array_shift_leaf,
 };
 
+/// ABI descriptor for `Array.prototype.push` growing a dense array.
+pub const ARRAY_PUSH_ALLOC: AllocValueStub = AllocValueStub {
+    descriptor: STUB_ARRAY_PUSH_ALLOC,
+    entry: Some(array_push_alloc),
+};
+
 /// ABI descriptor for `Array.prototype.unshift` over a dense array.
 pub const ARRAY_UNSHIFT_ALLOC: AllocValueStub = AllocValueStub {
     descriptor: STUB_ARRAY_UNSHIFT_ALLOC,
@@ -986,6 +992,7 @@ pub const fn alloc_value_stub_by_id(id: RuntimeStubId) -> Option<AllocValueStub>
         id if id == STUB_CREATE_CONTEXT_ALLOC.id => Some(CREATE_CONTEXT_ALLOC),
         id if id == STUB_COPY_CONTEXT_ALLOC.id => Some(COPY_CONTEXT_ALLOC),
         id if id == STUB_ARRAY_UNSHIFT_ALLOC.id => Some(ARRAY_UNSHIFT_ALLOC),
+        id if id == STUB_ARRAY_PUSH_ALLOC.id => Some(ARRAY_PUSH_ALLOC),
         id if id == STUB_BIGINT_BINARY_ALLOC.id => Some(BIGINT_BINARY_ALLOC),
         _ => None,
     }
@@ -2756,6 +2763,78 @@ fn array_unshift_alloc_inner(
         value.trace_value_slots(visitor);
     };
     match crate::array::dense_unshift_with_roots(arr, &mut interp.gc_heap, value, &mut visit) {
+        Ok(new_len) => {
+            NativeResultPair::success(Value::number(crate::NumberValue::from_f64(new_len as f64)))
+        }
+        Err(_) => NativeResultPair::out_of_memory(),
+    }
+}
+
+/// Allocating `Array.prototype.push` over a dense array: the push the leaf
+/// refused because the dense storage was full, growing it.
+#[must_use]
+pub extern "C" fn array_push_alloc(
+    ctx: *mut RuntimeStubAllocContext,
+    safepoint: SafepointId,
+    recv_bits: u64,
+    value_bits: u64,
+    unused_bits: u64,
+) -> NativeResultPair {
+    record_alloc_value_stub_result(
+        ctx,
+        array_push_alloc_inner(ctx, safepoint, recv_bits, value_bits, unused_bits),
+    )
+}
+
+fn array_push_alloc_inner(
+    ctx: *mut RuntimeStubAllocContext,
+    safepoint: SafepointId,
+    recv_bits: u64,
+    value_bits: u64,
+    unused_bits: u64,
+) -> NativeResultPair {
+    let Some(ctx) = alloc_context_mut(ctx) else {
+        return NativeResultPair::miss();
+    };
+    let Some(interp) = alloc_interpreter_mut(ctx) else {
+        return NativeResultPair::miss();
+    };
+    // The new trailing index is an ordinary addition only while no indexed
+    // accessor exists in the realm.
+    if interp.array_index_accessor_protector {
+        return NativeResultPair::miss();
+    }
+    // SAFETY: `ctx` is the current allocating-stub call packet. Its safepoint
+    // table and frame-slot window must remain live for this call.
+    let Ok(roots) = (unsafe {
+        alloc_value_stub_call_roots(
+            ctx,
+            safepoint,
+            [
+                Value::from_abi_bits(recv_bits),
+                Value::from_abi_bits(value_bits),
+                Value::from_abi_bits(unused_bits),
+            ],
+        )
+    }) else {
+        return NativeResultPair::miss();
+    };
+    let _roots_guard = interp
+        .gc_heap
+        .register_extra_roots(otter_gc::ExtraRoots::new(&roots));
+    let Some(arr) = roots.value(0).as_array() else {
+        return NativeResultPair::miss();
+    };
+    let len = crate::array::len(arr, &interp.gc_heap);
+    if !dense_range_is_fast(arr, &interp.gc_heap, len, len + 1) {
+        return NativeResultPair::miss();
+    }
+    let value = roots.value(1);
+    let mut visit = |visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
+        roots.value(0).trace_value_slots(visitor);
+        value.trace_value_slots(visitor);
+    };
+    match crate::array::push_with_roots(arr, &mut interp.gc_heap, value, &mut visit) {
         Ok(new_len) => {
             NativeResultPair::success(Value::number(crate::NumberValue::from_f64(new_len as f64)))
         }

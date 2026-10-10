@@ -102,8 +102,7 @@ use crate::artifact::{
 use crate::entry::{
     CANONICAL_NAN_HI16, DOUBLE_OFFSET_HI16, NATIVE_FRAME_PC_OFFSET, NATIVE_FRAME_SELF_OFFSET,
     NATIVE_FRAME_THIS_OFFSET, NUMBER_TAG_HI16, THREAD_OFFSET, Unsupported, VALUE_FALSE, VALUE_HOLE,
-    VALUE_NULL, VALUE_TRUE, VALUE_UNDEFINED,
-    VM_THREAD_GC_HEAP_OFFSET, reg_offset,
+    VALUE_NULL, VALUE_TRUE, VALUE_UNDEFINED, VM_THREAD_GC_HEAP_OFFSET, reg_offset,
 };
 use otter_vm::native_abi as abi;
 
@@ -406,6 +405,7 @@ fn compile_with_reach(
                 relocations: &mut relocations,
                 return_sites: &mut return_sites,
                 call_safepoint: call_safepoints.get(&instr.pc).copied().unwrap_or(0),
+                alloc_roots: crate::template::operation::AllocRoots::Window,
                 transitions,
                 view,
                 plan: &plan,
@@ -845,6 +845,9 @@ pub(crate) struct OperationContext<'c, 'a> {
     pub(crate) relocations: &'c mut RelocationCapture,
     pub(crate) return_sites: &'c mut Vec<abi::SafepointEntry>,
     pub(crate) call_safepoint: abi::SafepointId,
+    /// Record and spill window an allocating stub call in the operation
+    /// publishes.
+    pub(crate) alloc_roots: crate::template::operation::AllocRoots,
     pub(crate) transitions: &'a crate::entry::TransitionTable,
     pub(crate) view: &'a JitCompileSnapshot,
     pub(crate) plan: &'c TemplatePlan,
@@ -878,6 +881,7 @@ pub(crate) fn emit_operation<'a>(
         relocations,
         return_sites,
         call_safepoint,
+        alloc_roots,
         transitions,
         view,
         plan,
@@ -1161,7 +1165,7 @@ pub(crate) fn emit_operation<'a>(
                 dst,
                 lhs,
                 rhs,
-                concat_safepoint,
+                alloc_roots.packet(concat_safepoint),
                 arith::ArithSite::of(view, instr.pc),
                 threw,
                 fatal,
@@ -1214,7 +1218,7 @@ pub(crate) fn emit_operation<'a>(
                 instr.byte_pc,
                 dst,
                 context::ContextAllocation::Create { parent, scope },
-                safepoint,
+                alloc_roots.packet(safepoint),
                 allocation_miss_exit,
                 fatal,
             )?;
@@ -1232,7 +1236,7 @@ pub(crate) fn emit_operation<'a>(
                 instr.byte_pc,
                 dst,
                 context::ContextAllocation::Copy { source: src },
-                safepoint,
+                alloc_roots.packet(safepoint),
                 allocation_miss_exit,
                 fatal,
             )?;
@@ -1261,7 +1265,7 @@ pub(crate) fn emit_operation<'a>(
                 instr.byte_pc,
                 dst,
                 context::ContextAllocation::Function,
-                safepoint,
+                alloc_roots.packet(safepoint),
                 allocation_miss_exit,
                 fatal,
             )?;
@@ -1281,7 +1285,7 @@ pub(crate) fn emit_operation<'a>(
                 context::ContextAllocation::Closure {
                     context: closure_context,
                 },
-                safepoint,
+                alloc_roots.packet(safepoint),
                 allocation_miss_exit,
                 fatal,
             )?;
@@ -1647,6 +1651,7 @@ pub(crate) fn emit_operation<'a>(
                 byte_pc,
                 arg0,
                 arg1,
+                alloc_roots,
                 identity_guard_exit,
                 threw,
                 committed_throw,
@@ -1931,7 +1936,7 @@ pub(crate) fn emit_operation<'a>(
                 relocations,
                 dst,
                 length,
-                safepoint,
+                alloc_roots.packet(safepoint),
                 allocation_miss_exit,
             )?;
         }

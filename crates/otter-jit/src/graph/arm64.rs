@@ -3312,6 +3312,16 @@ impl<'a> Codegen<'a> {
                         }
                         dynasm!(self.ops ; .arch aarch64 ; b =>done);
                     }
+                    Op::LoadClosurePrototype { object: 0 } => {
+                        crate::template::arm64::ic_probe::emit_closure_prototype_load(
+                            &mut self.ops,
+                            self.view,
+                            receiver,
+                            destination,
+                            next,
+                        );
+                        dynasm!(self.ops ; .arch aarch64 ; b =>done);
+                    }
                     _ => return Err(Unsupported::OperandShape("graph named load operation")),
                 }
             }

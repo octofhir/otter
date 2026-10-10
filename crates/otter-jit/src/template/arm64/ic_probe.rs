@@ -1150,6 +1150,45 @@ where
     Ok(())
 }
 
+/// Read a closure's own `prototype` from its rare record's slot into
+/// `X(destination)` (see [`otter_vm::JitCacheIrOp::LoadClosurePrototype`]).
+/// Misses on a non-closure, a closure without a rare record, and the hole the
+/// runtime replaces with the default object; `X(receiver)` survives a miss.
+/// Clobbers `x16` and `x17`.
+pub(crate) fn emit_closure_prototype_load(
+    ops: &mut Assembler,
+    view: &JitCompileSnapshot,
+    receiver: u8,
+    destination: u8,
+    miss: DynamicLabel,
+) {
+    let layout = view.closure_call_layout;
+    if view.cage_base == 0 || layout.rare_byte == 0 || layout.prototype_byte == 0 {
+        dynasm!(ops ; .arch aarch64 ; b =>miss);
+        return;
+    }
+    emit_cell_test(ops, receiver, CellTest::IsNotCell, miss);
+    dynasm!(ops
+        ; .arch aarch64
+        ; cbz X(receiver), =>miss
+        ; ldrb w16, [X(receiver)]
+        ; cmp w16, u32::from(otter_vm::closure::JS_CLOSURE_BODY_TYPE_TAG)
+        ; b.ne =>miss
+        ; ldr w16, [X(receiver), layout.rare_byte]
+        ; cbz w16, =>miss
+        ; and x17, X(receiver), #0xffff_ffff_0000_0000
+        ; add x16, x17, x16
+        ; ldr x17, [x16, layout.prototype_byte]
+    );
+    emit_load_u64(ops, 16, VALUE_HOLE);
+    dynasm!(ops
+        ; .arch aarch64
+        ; cmp x17, x16
+        ; b.eq =>miss
+        ; mov X(destination), x17
+    );
+}
+
 /// Miss unless the isolate's active realm is `realm`, the realm whose
 /// intrinsic prototype a proof baked. `context` holds the tier's native
 /// context pointer. Clobbers `x12` and `x14`.

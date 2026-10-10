@@ -116,8 +116,9 @@ fn emit_inline_own_field(
 
 /// Static intrinsic-prototype reads: a receiver of an intrinsic body type
 /// (primitive string, closure, collection) reading a data slot of its pinned
-/// realm prototype. These programs describe realm intrinsics, not site
-/// feedback; a miss falls through to the site's IC.
+/// realm prototype, or a closure's own `prototype` slot. These programs
+/// describe realm intrinsics, not site feedback; a miss falls through to the
+/// site's IC.
 fn emit_intrinsic_loads(
     ops: &mut Assembler,
     relocations: &mut RelocationCapture,
@@ -132,6 +133,16 @@ fn emit_intrinsic_loads(
         return;
     };
     for program in programs {
+        if let [Op::LoadClosurePrototype { object: 0 }] = *program.ops {
+            let next = ops.new_dynamic_label();
+            dynasm!(ops ; .arch aarch64 ; ldr x9, [x19, obj_off]);
+            ic_probe::emit_closure_prototype_load(ops, view, 9, 9, next);
+            dynasm!(ops ; .arch aarch64
+                ; str x9, [x19, dst_off]
+                ; b =>done
+                ; =>next);
+            continue;
+        }
         let Some((
             Op::LoadIntrinsicPrototype {
                 object: 0,

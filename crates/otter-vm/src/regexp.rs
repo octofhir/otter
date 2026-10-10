@@ -74,15 +74,28 @@ pub(crate) mod engine {
     }
 
     /// Collect every successful match from `start` with exact work accounting,
-    /// exploring at most `step_limit` backtrack points.
+    /// exploring at most `step_limit` backtrack points. The subject is
+    /// searched at its stored width.
     pub(crate) fn find(
         re: &Regex,
-        text: &[u16],
+        text: crate::string::CodeUnits<'_>,
         start: usize,
         step_limit: u64,
     ) -> Execution<Vec<Match>> {
-        let mut matches =
-            re.find_from_utf16_with_config(text, start, otter_regex::ExecConfig { step_limit });
+        let config = otter_regex::ExecConfig { step_limit };
+        match text {
+            crate::string::CodeUnits::Latin1(bytes) => {
+                collect_all(re.find_latin1(bytes, start, config))
+            }
+            crate::string::CodeUnits::Utf16(units) => {
+                collect_all(re.find_utf16(units, start, config))
+            }
+        }
+    }
+
+    fn collect_all<U: otter_regex::Unit>(
+        mut matches: otter_regex::Matches<'_, '_, U>,
+    ) -> Execution<Vec<Match>> {
         let mut found = Vec::new();
         let result = loop {
             match matches.next() {
@@ -103,12 +116,24 @@ pub(crate) mod engine {
     /// resource error for the VM boundary to surface.
     pub(crate) fn find_one(
         re: &Regex,
-        text: &[u16],
+        text: crate::string::CodeUnits<'_>,
         start: usize,
         step_limit: u64,
     ) -> Execution<Option<Match>> {
-        let mut matches =
-            re.find_from_utf16_with_config(text, start, otter_regex::ExecConfig { step_limit });
+        let config = otter_regex::ExecConfig { step_limit };
+        match text {
+            crate::string::CodeUnits::Latin1(bytes) => {
+                first_match(re.find_latin1(bytes, start, config))
+            }
+            crate::string::CodeUnits::Utf16(units) => {
+                first_match(re.find_utf16(units, start, config))
+            }
+        }
+    }
+
+    fn first_match<U: otter_regex::Unit>(
+        mut matches: otter_regex::Matches<'_, '_, U>,
+    ) -> Execution<Option<Match>> {
         let result = matches.next().transpose();
         Execution {
             result,
@@ -126,21 +151,23 @@ pub(crate) mod engine {
 /// `new RegExp(samePattern)`) is the common case; recompiling a large
 /// pattern (e.g. the multi-kilobyte Unicode-property classes test262's
 /// `nativeFunctionMatcher` rebuilds on every call) dominated runtime. A
-/// cache hit clones the lowered program (a `memcpy`) instead of
-/// re-parsing and re-lowering.
+/// cache hit shares the compiled pattern instead of re-parsing and
+/// re-lowering it.
 ///
 /// # Invariants
-/// - A compiled [`engine::Regex`] is a pure function of `(pattern,
-///   engine-relevant flags)` and carries no isolate-specific or GC
-///   state, so caching and cloning it is always sound.
+/// - A [`RegExpPattern`] is a pure function of `(pattern, engine-relevant
+///   flags)` and carries no isolate-specific or GC state, so sharing it
+///   between RegExp objects is always sound.
 /// - Bounded: once [`Self::CAP`] distinct programs are cached the table
 ///   is cleared wholesale, so a generator of unique patterns cannot grow
 ///   it without bound while the hot-loop fast path stays intact.
 #[derive(Debug, Default)]
 pub(crate) struct RegexCompileCache {
     /// Keyed by the five engine-relevant flag bits, then pattern code units.
-    by_flags:
-        std::collections::HashMap<CompileKey, std::collections::HashMap<Vec<u16>, engine::Regex>>,
+    by_flags: rustc_hash::FxHashMap<
+        CompileKey,
+        rustc_hash::FxHashMap<Box<[u16]>, std::sync::Arc<RegExpPattern>>,
+    >,
 }
 
 /// Engine-relevant flag bits that select a distinct compiled program.
@@ -162,14 +189,14 @@ impl RegexCompileCache {
         dot_all: bool,
         unicode: bool,
         unicode_sets: bool,
-    ) -> Result<engine::Regex, String> {
+    ) -> Result<std::sync::Arc<RegExpPattern>, String> {
         let key: CompileKey = (ignore_case, multiline, dot_all, unicode, unicode_sets);
         if let Some(hit) = self
             .by_flags
             .get(&key)
             .and_then(|by_source| by_source.get(pattern_utf16))
         {
-            return Ok(hit.clone());
+            return Ok(std::sync::Arc::clone(hit));
         }
         let regex = engine::compile(
             pattern_utf16,
@@ -179,6 +206,7 @@ impl RegexCompileCache {
             unicode,
             unicode_sets,
         )?;
+        let pattern = std::sync::Arc::new(RegExpPattern::new(regex, pattern_utf16));
         let total: usize = self
             .by_flags
             .values()
@@ -190,8 +218,35 @@ impl RegexCompileCache {
         self.by_flags
             .entry(key)
             .or_default()
-            .insert(pattern_utf16.to_vec(), regex.clone());
-        Ok(regex)
+            .insert(pattern_utf16.into(), std::sync::Arc::clone(&pattern));
+        Ok(pattern)
+    }
+}
+
+/// A compiled program with the pattern text it came from.
+///
+/// One instance is shared by every RegExp object a literal evaluation or a
+/// repeated pattern produces: the compiled program and the text are pure
+/// functions of the pattern and its engine-relevant flags, so a fresh RegExp
+/// takes a reference instead of copying either.
+#[derive(Debug)]
+pub struct RegExpPattern {
+    /// Compiled matcher.
+    pub regex: Regex,
+    /// Pattern source code-units (the body between the slashes).
+    pub pattern_utf16: Box<[u16]>,
+    /// Pattern source as a Rust string (lossy WTF-16 → UTF-8), read by the
+    /// `.source` getter.
+    pub source: Box<str>,
+}
+
+impl RegExpPattern {
+    fn new(regex: Regex, pattern_utf16: &[u16]) -> Self {
+        Self {
+            regex,
+            pattern_utf16: pattern_utf16.into(),
+            source: String::from_utf16_lossy(pattern_utf16).into_boxed_str(),
+        }
     }
 }
 
@@ -355,15 +410,12 @@ impl RegExpFlags {
 #[derive(Debug, otter_macros::Pelt)]
 #[pelt(tag = REGEXP_BODY_TYPE_TAG)]
 pub struct JsRegExpBody {
-    /// Compiled matcher. Always present after construction — errors surface
-    /// during [`compile`] before the body is built.
+    /// Compiled matcher and pattern text, shared with every other RegExp of
+    /// the same pattern and engine-relevant flags. Always present after
+    /// construction — errors surface during [`compile`] before the body is
+    /// built.
     #[pelt(skip)]
-    pub regex: Regex,
-    /// Pattern source code-units (the body between the slashes).
-    pub pattern_utf16: Vec<u16>,
-    /// Pattern source as a Rust string (lossy WTF-16 → UTF-8). Used
-    /// by the `.source` JS getter.
-    pub source: String,
+    pub pattern: std::sync::Arc<RegExpPattern>,
     /// Parsed flag bits.
     #[pelt(skip)]
     pub flags: RegExpFlags,
@@ -407,11 +459,11 @@ impl JsRegExpBody {
 
     /// Sever foreign ownership after a snapshot restore.
     ///
-    /// A restored body's `regex`, `pattern_utf16` and `source` alias the
-    /// capture isolate's malloc storage byte-for-byte. Each owning field
-    /// is overwritten via `ptr::write` with a freshly built value —
-    /// recompiling the pattern from the opaque snapshot's side record — so the
-    /// alias is never dropped and both isolates own their storage.
+    /// A restored body's shared `pattern` aliases the capture isolate's
+    /// malloc storage byte-for-byte. It is overwritten via `ptr::write` with
+    /// a freshly built one — recompiling the pattern from the opaque
+    /// snapshot's side record — so the alias is never dropped and both
+    /// isolates own their storage.
     pub(crate) fn rebuild_after_restore(&mut self, pattern_utf16: &[u16], source: &str) {
         let regex = engine::compile(
             pattern_utf16,
@@ -426,10 +478,13 @@ impl JsRegExpBody {
         // point — the old values remain the source isolate's property. The
         // pattern text comes from the snapshot's owned side record, never from
         // the copied page field.
+        let pattern = RegExpPattern {
+            regex,
+            pattern_utf16: pattern_utf16.into(),
+            source: source.into(),
+        };
         unsafe {
-            std::ptr::write(&mut self.regex, regex);
-            std::ptr::write(&mut self.pattern_utf16, pattern_utf16.to_vec());
-            std::ptr::write(&mut self.source, source.to_owned());
+            std::ptr::write(&mut self.pattern, std::sync::Arc::new(pattern));
         }
     }
 }
@@ -449,11 +504,10 @@ impl JsRegExp {
         flag_str: &str,
     ) -> Result<Self, RegExpError> {
         let flags = RegExpFlags::parse(flag_str)?;
-        // `.source` keeps a lossy UTF-8 reading for display; the engine
-        // compiles from the raw code units so lone surrogates survive.
-        let source = String::from_utf16_lossy(pattern_utf16);
         // `g`, `y`, and `d` are spec-level state above the matcher and are not
-        // part of the compiled pattern.
+        // part of the compiled pattern. `.source` keeps a lossy UTF-8 reading
+        // for display; the engine compiles from the raw code units so lone
+        // surrogates survive.
         let regex = engine::compile(
             pattern_utf16,
             flags.ignore_case,
@@ -465,9 +519,7 @@ impl JsRegExp {
         .map_err(|message| RegExpError::InvalidPattern { message })?;
         Ok(Self {
             inner: heap.alloc_old(JsRegExpBody {
-                regex,
-                pattern_utf16: pattern_utf16.to_vec(),
-                source,
+                pattern: std::sync::Arc::new(RegExpPattern::new(regex, pattern_utf16)),
                 flags,
                 last_index: RefCell::new(Value::number_i32(0)),
                 last_index_writable: true,
@@ -490,8 +542,7 @@ impl JsRegExp {
         flag_str: &str,
     ) -> Result<Self, RegExpError> {
         let flags = RegExpFlags::parse(flag_str)?;
-        let source = String::from_utf16_lossy(pattern_utf16);
-        let regex = cache
+        let pattern = cache
             .get_or_compile(
                 pattern_utf16,
                 flags.ignore_case,
@@ -503,9 +554,7 @@ impl JsRegExp {
             .map_err(|message| RegExpError::InvalidPattern { message })?;
         Ok(Self {
             inner: heap.alloc_old(JsRegExpBody {
-                regex,
-                pattern_utf16: pattern_utf16.to_vec(),
-                source,
+                pattern,
                 flags,
                 last_index: RefCell::new(Value::number_i32(0)),
                 last_index_writable: true,
@@ -529,7 +578,6 @@ impl JsRegExp {
         flag_str: &str,
     ) -> Result<(), RegExpError> {
         let flags = RegExpFlags::parse(flag_str)?;
-        let source = String::from_utf16_lossy(pattern_utf16);
         let regex = engine::compile(
             pattern_utf16,
             flags.ignore_case,
@@ -539,11 +587,9 @@ impl JsRegExp {
             flags.unicode_sets,
         )
         .map_err(|message| RegExpError::InvalidPattern { message })?;
-        let pattern_units = pattern_utf16.to_vec();
+        let pattern = std::sync::Arc::new(RegExpPattern::new(regex, pattern_utf16));
         heap.with_payload(self.inner, |body| {
-            body.regex = regex;
-            body.pattern_utf16 = pattern_units;
-            body.source = source;
+            body.pattern = pattern;
             body.flags = flags;
             *body.last_index.borrow_mut() = Value::number(NumberValue::from_i32(0));
             body.prototype_override = None;
@@ -567,36 +613,37 @@ impl JsRegExp {
         Self { inner }
     }
 
-    /// Find only the **first** match from a UTF-16 offset, without collecting
-    /// the rest. `RegExp.prototype.exec`/`test` returns a single match and
-    /// advances `lastIndex`, so a `/g` loop calls this once per match; using the
-    /// collecting [`Self::find_from_utf16`] there is quadratic (each call would
-    /// re-find every remaining match and discard all but the first). Step-limit
-    /// aborts remain explicit so the runtime can surface one resource error.
-    pub(crate) fn find_one_from_utf16(
+    /// Find only the **first** match from a code-unit offset, without
+    /// collecting the rest. `RegExp.prototype.exec`/`test` returns a single
+    /// match and advances `lastIndex`, so a `/g` loop calls this once per
+    /// match; using the collecting [`Self::find_all`] there is quadratic (each
+    /// call would re-find every remaining match and discard all but the
+    /// first). Step-limit aborts remain explicit so the runtime can surface one
+    /// resource error.
+    pub(crate) fn find_one(
         &self,
         heap: &otter_gc::GcHeap,
-        text_units: &[u16],
+        text_units: crate::string::CodeUnits<'_>,
         start: usize,
         step_limit: u64,
     ) -> engine::Execution<Option<engine::Match>> {
         heap.read_payload(self.inner, |body| {
-            engine::find_one(&body.regex, text_units, start, step_limit)
+            engine::find_one(&body.pattern.regex, text_units, start, step_limit)
         })
     }
 
-    /// Run the compiled engine from a UTF-16 offset and collect owned matches,
-    /// exploring at most `step_limit` backtrack points; the returned work count
-    /// is charged at the runtime boundary.
-    pub(crate) fn find_from_utf16(
+    /// Run the compiled engine from a code-unit offset and collect owned
+    /// matches, exploring at most `step_limit` backtrack points; the returned
+    /// work count is charged at the runtime boundary.
+    pub(crate) fn find_all(
         &self,
         heap: &otter_gc::GcHeap,
-        text_units: &[u16],
+        text_units: crate::string::CodeUnits<'_>,
         start: usize,
         step_limit: u64,
     ) -> engine::Execution<Vec<engine::Match>> {
         heap.read_payload(self.inner, |body| {
-            engine::find(&body.regex, text_units, start, step_limit)
+            engine::find(&body.pattern.regex, text_units, start, step_limit)
         })
     }
 
@@ -677,13 +724,13 @@ impl JsRegExp {
     /// [`Self::pattern_utf16`].
     #[must_use]
     pub fn source(&self, heap: &otter_gc::GcHeap) -> String {
-        heap.read_payload(self.inner, |body| body.source.clone())
+        heap.read_payload(self.inner, |body| body.pattern.source.to_string())
     }
 
     /// Original WTF-16 pattern body.
     #[must_use]
     pub fn pattern_utf16(&self, heap: &otter_gc::GcHeap) -> Vec<u16> {
-        heap.read_payload(self.inner, |body| body.pattern_utf16.clone())
+        heap.read_payload(self.inner, |body| body.pattern.pattern_utf16.to_vec())
     }
 
     /// Read `lastIndex`.
@@ -830,7 +877,7 @@ mod tests {
         assert!(r.flags(&heap).ignore_case);
         let utf16: Vec<u16> = "abbbcXabbbbc".encode_utf16().collect();
         let m = r
-            .find_from_utf16(&heap, &utf16, 0, u64::MAX)
+            .find_all(&heap, crate::string::CodeUnits::Utf16(&utf16), 0, u64::MAX)
             .result
             .expect("within matcher budget")
             .into_iter()

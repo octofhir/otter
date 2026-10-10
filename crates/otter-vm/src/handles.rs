@@ -830,6 +830,30 @@ impl Interpreter {
         Ok(handle)
     }
 
+    /// Allocate an array holding `elements` at their indices — length, dense
+    /// storage and contents in one allocation sequence — and park it in the
+    /// current scope.
+    pub(crate) fn scoped_array_from<'s>(
+        &mut self,
+        scope: &'s HandleScope,
+        elements: &[Local<'_>],
+    ) -> Result<Local<'s>, VmError> {
+        let _runtime_roots_guard = self.scope_runtime_roots_guard();
+        let mut values: smallvec::SmallVec<[Value; 8]> = elements
+            .iter()
+            .map(|element| self.handle_arena.get(element.index()))
+            .collect();
+        let mut external_visit = |_visitor: &mut dyn FnMut(*mut RawGc)| {};
+        let array = crate::array::from_values_with_roots(
+            &mut self.gc_heap,
+            &mut values,
+            &mut external_visit,
+        )
+        .map_err(VmError::from)?;
+        let array = self.register_array_prototype_override(array)?;
+        Ok(self.scoped_value(scope, Value::array(array)))
+    }
+
     /// Allocate a Set collection and park it in the current scope.
     pub(crate) fn scoped_collection_set<'s>(
         &mut self,

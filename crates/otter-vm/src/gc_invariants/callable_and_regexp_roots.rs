@@ -141,7 +141,12 @@ fn regexp_body_survives_force_gc_when_rooted() {
     };
     let haystack: Vec<u16> = "abbbc".encode_utf16().collect();
     let m = re
-        .find_from_utf16(interp.gc_heap(), &haystack, 0, u64::MAX)
+        .find_all(
+            interp.gc_heap(),
+            crate::string::CodeUnits::Utf16(&haystack),
+            0,
+            u64::MAX,
+        )
         .result
         .expect("within matcher budget")
         .into_iter()

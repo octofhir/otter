@@ -100,8 +100,19 @@ pub(crate) fn exec_once_native(
                 return Ok(scope.null());
             }
 
-            // Matching itself is non-allocating. Resolve both raw handles from
-            // their Locals immediately before the shared heap borrow.
+            let input_value = scope.raw(input);
+            let text = input_value
+                .as_string(scope.context().heap())
+                .ok_or_else(|| native_type_error(REGEXP_EXEC_NAME, "input is not a string"))?;
+            // A `/g` loop re-enters here once per match against the same
+            // subject. Flatten a rope once now, while the heap is available
+            // mutably, so every match reads the units in place at their
+            // stored width. A failure here only costs speed, so it is not
+            // surfaced.
+            let _ = text.flatten_in_place(scope.context().heap_mut());
+            // Matching itself is non-allocating. Flattening may have moved
+            // either body, so resolve both raw handles from their Locals
+            // immediately before the shared heap borrow.
             let receiver_value = scope.raw(receiver);
             let re = receiver_value
                 .as_regexp()
@@ -110,22 +121,10 @@ pub(crate) fn exec_once_native(
             let text = input_value
                 .as_string(scope.context().heap())
                 .ok_or_else(|| native_type_error(REGEXP_EXEC_NAME, "input is not a string"))?;
-            // A `/g` loop re-enters here once per match against the same
-            // subject. Widen it once now, while the heap is available
-            // mutably; the match below then reads the units in place. A
-            // failure here only costs speed, so it is not surfaced.
-            let _ = text.ensure_utf16_cache(scope.context().heap_mut());
-            // Filling the cache allocates, so re-resolve the subject through
-            // its root rather than reusing a possibly forwarded handle.
-            let input_value = scope.raw(input);
-            let text = input_value
-                .as_string(scope.context().heap())
-                .ok_or_else(|| native_type_error(REGEXP_EXEC_NAME, "input is not a string"))?;
             let step_limit = scope.context().regex_step_limit();
             let heap = scope.context().heap();
-            let execution = text.with_utf16(heap, |units| {
-                re.find_one_from_utf16(heap, units, start, step_limit)
-            });
+            let execution =
+                text.with_code_units(heap, |units| re.find_one(heap, units, start, step_limit));
             let matched = crate::regexp::finish_execution(scope.context(), execution)?;
             let matched = match matched {
                 Some(matched) => matched,
@@ -224,16 +223,18 @@ fn build_match_result_native<'scope>(
     has_indices: bool,
     scope: &mut NativeScope<'scope, '_>,
 ) -> Result<Local<'scope>, NativeError> {
-    let result = scope.array(1 + m.captures.len())?;
-    let full = slice_subject_string(scope, input, m.range.clone())?;
-    scope.set_index(result, 0, full)?;
-    for (index, capture) in m.captures.iter().enumerate() {
-        let value = match capture {
+    // Every element is produced before the array exists, so the array is
+    // allocated once at its final length with its contents in place.
+    let mut elements: smallvec::SmallVec<[Local<'_>; 8]> =
+        smallvec::SmallVec::with_capacity(1 + m.captures.len());
+    elements.push(slice_subject_string(scope, input, m.range.clone())?);
+    for capture in &m.captures {
+        elements.push(match capture {
             Some(range) => slice_subject_string(scope, input, range.clone())?,
             None => scope.undefined(),
-        };
-        scope.set_index(result, index + 1, value)?;
+        });
     }
+    let result = scope.array_from(&elements)?;
 
     let mut named = m.named_groups();
     let groups = if let Some((name, range)) = named.next() {
@@ -356,7 +357,7 @@ fn pair_array_native<'scope>(
 /// 5. Otherwise return `? RegExpExec(rx, S)`.
 ///
 /// The foundation drives the engine directly via
-/// [`JsRegExp::find_from_utf16`] so the spec-mandated `lastIndex`
+/// [`JsRegExp::find_all`] so the spec-mandated `lastIndex`
 /// updates and `AdvanceStringIndex` semantics fire correctly for
 /// both global and non-global receivers. Unicode awareness is keyed
 /// off the `u` and `v` flags per §22.2.5.2 step 18.
@@ -455,8 +456,12 @@ pub fn native_regexp_symbol_match(
                     )
                 {
                     let step_limit = scope.context().regex_step_limit();
-                    let execution =
-                        re.find_from_utf16(scope.context().heap(), &input_units, 0, step_limit);
+                    let execution = re.find_all(
+                        scope.context().heap(),
+                        crate::string::CodeUnits::Utf16(&input_units),
+                        0,
+                        step_limit,
+                    );
                     let found = crate::regexp::finish_execution(scope.context(), execution)?;
                     if found.is_empty() {
                         return Ok(Value::null());
@@ -1265,8 +1270,6 @@ pub fn native_regexp_symbol_replace(
         let s = coerce_to_jsstring_runtime(ctx, &string_arg, name)?;
         ctx.interp_mut()
             .set_iteration_anchor(anchor_base + INPUT, Value::string(s));
-        let s_units = s.to_utf16_vec(ctx.heap());
-        let length_s = s_units.len();
 
         // Step 4 — functionalReplace = IsCallable(replaceValue).
         let replacer = ctx.interp_mut().iteration_anchor(anchor_base + REPLACER);
@@ -1306,6 +1309,16 @@ pub fn native_regexp_symbol_replace(
                 functional_replace,
             );
         }
+
+        // S's code units, read through its anchor: a string's content never
+        // changes, so reading them here equals reading them at step 3.
+        let s_units = ctx
+            .interp_mut()
+            .iteration_anchor(anchor_base + INPUT)
+            .as_string(ctx.heap())
+            .ok_or_else(|| native_type_error(name, "input root is not a string"))?
+            .to_utf16_vec(ctx.heap());
+        let length_s = s_units.len();
 
         // Step 6 — flags = ? ToString(? Get(rx, "flags")).
         let receiver = ctx.interp_mut().iteration_anchor(anchor_base + RECEIVER);

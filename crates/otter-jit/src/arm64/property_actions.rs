@@ -32,6 +32,21 @@ use otter_vm::{
     object::ShapeState,
 };
 
+/// `X(register)` = `value`: one move when that encodes it, else one load of
+/// its literal-pool word where the code object has a pool.
+fn load_constant(
+    ops: &mut Assembler,
+    relocations: &mut RelocationCapture,
+    register: u8,
+    value: u64,
+) {
+    if crate::template::arm64::values::load_u64_instructions(value) == 1
+        || !relocations.emit_constant_load(ops, register, value)
+    {
+        emit_load_u64(ops, register, value);
+    }
+}
+
 /// The probed property key: a compile-time atom, or one held in a register by
 /// a shared per-code-object probe that serves many sites.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -81,23 +96,32 @@ fn key(
         ; ldrb w16, [X(receiver)] ; cmp w16, #OBJECT_BODY_TYPE_TAG ; b.ne =>miss
         ; and x16, X(receiver), #0xffff_ffff_0000_0000
         ; ldr W(holder), [X(receiver), view.object_shape_byte] ; cbz W(holder), =>miss
-        ; add X(holder), x16, X(holder) ; ldrb w17, [X(holder), view.shape_state_byte]);
-    let mask = ShapeState::DICTIONARY_MASK
-        | ShapeState::OPAQUE_LOOKUP_MASK
-        | if store { ShapeState::PROTOTYPE_MASK } else { 0 };
-    emit_load_u64(ops, 16, u64::from(mask));
-    dynasm!(ops ; .arch aarch64 ; tst w17, w16 ; b.ne =>miss
-        ; ldr X(slot), [X(holder), cache.shape_id_byte]);
-    emit_load_u64(ops, 17, cache.hash_shape_multiplier);
+        ; add X(holder), x16, X(holder));
+    // The table records loads only for shaped receivers with ordinary
+    // lookup: a dictionary or opaque receiver's shape id keys no load entry,
+    // so a load probe needs no state test (V8 probes its stub cache by map
+    // alone). A store also refuses a prototype receiver, whose stores reach
+    // the prototype-validity owner.
+    if store {
+        let mask = ShapeState::DICTIONARY_MASK
+            | ShapeState::OPAQUE_LOOKUP_MASK
+            | ShapeState::PROTOTYPE_MASK;
+        dynasm!(ops ; .arch aarch64 ; ldrb w17, [X(holder), view.shape_state_byte]);
+        emit_load_u64(ops, 16, u64::from(mask));
+        dynasm!(ops ; .arch aarch64 ; tst w17, w16 ; b.ne =>miss);
+    }
+    dynasm!(ops ; .arch aarch64 ; ldr X(slot), [X(holder), cache.shape_id_byte]);
+    load_constant(ops, relocations, 17, cache.hash_shape_multiplier);
     dynasm!(ops ; .arch aarch64 ; mul X(entry), X(slot), x17);
     match atom {
-        AtomOperand::Immediate(atom) => emit_load_u64(
+        AtomOperand::Immediate(atom) => load_constant(
             ops,
+            relocations,
             17,
             u64::from(atom).wrapping_mul(cache.hash_atom_multiplier),
         ),
         AtomOperand::Register(atom) => {
-            emit_load_u64(ops, 17, cache.hash_atom_multiplier);
+            load_constant(ops, relocations, 17, cache.hash_atom_multiplier);
             dynasm!(ops ; .arch aarch64 ; mov W(base), W(atom) ; mul x17, X(base), x17);
         }
     }
@@ -146,6 +170,9 @@ fn key(
         ; ldr x16, [X(entry), cache.receiver_shape_id_byte] ; cmp x16, X(slot) ; b.ne =>next
         ; ldr w16, [X(entry), cache.atom_byte]);
     match atom {
+        AtomOperand::Immediate(atom) if atom < 1 << 12 => {
+            dynasm!(ops ; .arch aarch64 ; cmp w16, atom);
+        }
         AtomOperand::Immediate(atom) => {
             emit_load_u64(ops, 17, u64::from(atom));
             dynasm!(ops ; .arch aarch64 ; cmp w16, w17);
@@ -249,13 +276,8 @@ pub(crate) fn emit_load(
         ; cmp W(base), w16 ; b.ne =>miss
         ; and x17, X(holder), #0xffff_ffff_0000_0000
         ; add X(base), x17, X(base)
-        ; ldrb w16, [X(base), view.shape_state_byte]);
-    emit_load_u64(
-        ops,
-        17,
-        u64::from(ShapeState::DICTIONARY_MASK | ShapeState::OPAQUE_LOOKUP_MASK),
-    );
-    dynasm!(ops ; .arch aarch64 ; tst w16, w17 ; b.ne =>miss
+        // The recorded holder was shaped with ordinary lookup, so its never
+        // reused shape id proves the holder's state as well as its layout.
         ; ldr x16, [X(base), cache.shape_id_byte]
         ; ldr x17, [X(entry), cache.holder_shape_id_byte] ; cmp x16, x17 ; b.ne =>miss
         ; ldrh W(slot), [X(entry), cache.load_slot_byte]);

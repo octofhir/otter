@@ -20,6 +20,15 @@
 //! - JSON outputs (`--json`, `--dump-bytecode=json`, error payloads)
 //!   match the documented CLI and bytecode-dump wire formats.
 
+/// The process allocator. The engine's Rust-side allocation is dominated by
+/// many small, short-lived buffers (compiler IR and allocation tables,
+/// property-cache and runtime scratch); mimalloc's thread-local free lists
+/// serve them in a fraction of the system allocator's work. C libraries keep
+/// the system allocator: nothing allocated here is freed by them, or the
+/// other way round.
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::io::{self, Write};

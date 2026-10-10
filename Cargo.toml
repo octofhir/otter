@@ -88,6 +88,7 @@ tokio               = { version = "1", features = ["rt-multi-thread", "sync", "t
 
 # Collections / utilities.
 smallvec    = "1"
+mimalloc    = { version = "0.1.52", default-features = false }
 blake3      = "1"
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 dirs        = "6"

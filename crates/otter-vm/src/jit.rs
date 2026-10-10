@@ -1044,6 +1044,14 @@ pub struct JitGuardedMethodCall {
     pub safepoint_id: crate::native_abi::SafepointId,
     /// Exact JavaScript argument count the entry implements.
     pub argument_count: u8,
+    /// An allocating entry with the same operands, and the safepoint it
+    /// publishes, that completes the call when the declared entry misses for
+    /// storage it would have to grow; `None` when a miss takes the ordinary
+    /// call.
+    pub grow: Option<(
+        crate::native_abi::RuntimeStubId,
+        crate::native_abi::SafepointId,
+    )>,
 }
 
 /// Widest representation a parameter held at a failed optimized entry.

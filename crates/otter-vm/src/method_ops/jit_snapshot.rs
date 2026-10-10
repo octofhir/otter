@@ -63,8 +63,8 @@ impl Interpreter {
         alloc_safepoint_id: crate::native_abi::SafepointId,
     ) -> Option<JitGuardedMethodCall> {
         use crate::native_abi::{
-            NO_SAFEPOINT, STUB_ARRAY_POP_LEAF, STUB_ARRAY_PUSH_LEAF, STUB_ARRAY_SHIFT_LEAF,
-            STUB_ARRAY_UNSHIFT_ALLOC,
+            NO_SAFEPOINT, STUB_ARRAY_POP_LEAF, STUB_ARRAY_PUSH_ALLOC, STUB_ARRAY_PUSH_LEAF,
+            STUB_ARRAY_SHIFT_LEAF, STUB_ARRAY_UNSHIFT_ALLOC,
         };
 
         let ic = match self.method_feedback.method_ic(site)? {
@@ -72,6 +72,9 @@ impl Interpreter {
             MethodCallIc::Collection(_) | MethodCallIc::Ordinary(_) => return None,
         };
         use crate::array_prototype::ArrayMethodTag as Tag;
+        // A push the leaf refuses for a full buffer grows it through the
+        // allocating entry instead of leaving the site.
+        let grow = (ic.tag == Tag::Push).then_some((STUB_ARRAY_PUSH_ALLOC.id, alloc_safepoint_id));
         let (stub_id, safepoint_id, argument_count) = match ic.tag {
             Tag::Pop => (STUB_ARRAY_POP_LEAF.id, NO_SAFEPOINT, 0),
             Tag::Shift => (STUB_ARRAY_SHIFT_LEAF.id, NO_SAFEPOINT, 0),
@@ -104,6 +107,7 @@ impl Interpreter {
             entry_stub_id: stub_id,
             safepoint_id,
             argument_count,
+            grow,
         })
     }
 
@@ -166,6 +170,7 @@ impl Interpreter {
             entry_stub_id: stub_id,
             safepoint_id: NO_SAFEPOINT,
             argument_count: 1,
+            grow: None,
         })
     }
 
@@ -247,6 +252,7 @@ impl Interpreter {
             entry_stub_id: stub_id,
             safepoint_id,
             argument_count: ic.op.argument_count(),
+            grow: None,
         })
     }
 }

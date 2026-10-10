@@ -1781,6 +1781,7 @@ pub const fn runtime_stub_name(id: super::RuntimeStubId) -> &'static str {
         100 => "instanceof_leaf",
         101 => "string_key_atom_leaf",
         102 => "keyed_named_load_leaf",
+        103 => "array_push_alloc",
         _ => "unknown_runtime_stub",
     }
 }
@@ -1928,6 +1929,20 @@ pub const STUB_KEYED_NAMED_LOAD_LEAF: RuntimeStubDescriptor = descriptor(
     NativeResultDomain::Probe,
 );
 
+/// Allocating dense-array `Array.prototype.push`: the entry a guarded push
+/// site calls when the in-place leaf found the dense storage full, so the
+/// growth publishes a precise safepoint.
+pub const STUB_ARRAY_PUSH_ALLOC: RuntimeStubDescriptor = descriptor(
+    103,
+    RuntimeStubClass::Alloc,
+    RuntimeStubSignature::AllocValue3,
+    3,
+    RuntimeStubEffects::allocating(false, true),
+    RuntimeStubException::Never,
+    RuntimeStubResultAbi::NativePair,
+    NativeResultDomain::Probe,
+);
+
 /// Dense inventory of every current machine-callable runtime-stub contract.
 pub const RUNTIME_STUB_DESCRIPTORS: &[RuntimeStubDescriptor] = &[
     STUB_JIT_BACKEDGE_POLL,
@@ -2032,6 +2047,7 @@ pub const RUNTIME_STUB_DESCRIPTORS: &[RuntimeStubDescriptor] = &[
     STUB_INSTANCEOF_LEAF,
     STUB_STRING_KEY_ATOM_LEAF,
     STUB_KEYED_NAMED_LOAD_LEAF,
+    STUB_ARRAY_PUSH_ALLOC,
 ];
 
 /// Validate a descriptor and one concrete call-site safepoint id.

@@ -382,10 +382,19 @@ impl Codegen<'_> {
         };
         let positions = self.plan_index.get(&pc).cloned().unwrap_or_default();
         let labels = std::collections::BTreeMap::new();
+        // Values live across the operation sit in this body's tagged homes,
+        // not in the register window, so an allocating stub call inside it
+        // publishes the boundary's record over the homes — the record the
+        // frame is stamped with — rather than the operation's window record.
+        let alloc_roots = crate::template::operation::AllocRoots::Optimized {
+            safepoint: self.helper_safepoint(node)?,
+            tagged_slots: u16::try_from(self.slots.tagged)
+                .map_err(|_| Unsupported::OperandShape("graph tagged home count"))?,
+        };
         for position in positions {
             let operation = self.plan.instructions[position].op;
+            self.stamp_node_safepoint(node)?;
             if !crate::template::operation_is_js_call(operation) {
-                self.stamp_node_safepoint(node)?;
                 self.stamp_pc(node);
             }
 
@@ -395,6 +404,7 @@ impl Codegen<'_> {
                     relocations: &mut self.relocations,
                     return_sites: &mut self.return_sites,
                     call_safepoint,
+                    alloc_roots,
                     transitions: self.transitions,
                     view: source,
                     plan: self.plan,

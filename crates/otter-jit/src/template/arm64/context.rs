@@ -42,9 +42,7 @@ use super::values::{
 };
 use crate::artifact::relocation::RelocationCapture;
 use crate::entry::{
-    ALLOC_CTX_SAFEPOINT_ID_OFFSET, ALLOC_CTX_SPILL_SLOT_COUNT_OFFSET, ALLOC_CTX_SPILL_SLOTS_OFFSET,
-    ALLOC_CTX_STACK_SIZE, ALLOC_CTX_THREAD_OFFSET, NATIVE_FRAME_SELF_OFFSET, THREAD_OFFSET,
-    Unsupported, VALUE_HOLE, VALUE_UNDEFINED,
+    ALLOC_CTX_STACK_SIZE, NATIVE_FRAME_SELF_OFFSET, Unsupported, VALUE_HOLE, VALUE_UNDEFINED,
 };
 
 /// Largest scaled unsigned 64-bit `ldr`/`str` displacement.
@@ -273,7 +271,7 @@ pub(super) fn emit_context_allocation(
     byte_pc: u32,
     dst: u16,
     allocation: ContextAllocation,
-    safepoint: abi::SafepointId,
+    packet: crate::template::operation::AllocPacket,
     miss: DynamicLabel,
     fatal: DynamicLabel,
 ) -> Result<(), Unsupported> {
@@ -363,13 +361,8 @@ pub(super) fn emit_context_allocation(
     emit_store_reg(ops, regs.candidate, dst)?;
     dynasm!(ops ; .arch aarch64 ; b =>done ; =>slow);
     emit_load_u64(ops, 9, u64::from(pc));
-    dynasm!(ops ; .arch aarch64 ; str w9, [x21, crate::entry::NATIVE_FRAME_PC_OFFSET]
-        ; sub sp, sp, ALLOC_CTX_STACK_SIZE ; ldr x9, [x20, THREAD_OFFSET]
-        ; str x9, [sp, ALLOC_CTX_THREAD_OFFSET]
-    );
-    emit_load_u64(ops, 1, u64::from(safepoint));
-    dynasm!(ops ; .arch aarch64 ; str w1, [sp, ALLOC_CTX_SAFEPOINT_ID_OFFSET]
-        ; strh wzr, [sp, ALLOC_CTX_SPILL_SLOT_COUNT_OFFSET] ; str xzr, [sp, ALLOC_CTX_SPILL_SLOTS_OFFSET] ; mov x0, sp);
+    dynasm!(ops ; .arch aarch64 ; str w9, [x21, crate::entry::NATIVE_FRAME_PC_OFFSET]);
+    super::transitions::emit_alloc_packet(ops, packet);
     match allocation {
         ContextAllocation::Create { parent, scope } => {
             let function_id = i32::try_from(view.code_block.id)

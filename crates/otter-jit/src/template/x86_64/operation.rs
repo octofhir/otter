@@ -26,6 +26,9 @@ pub(crate) struct OperationContext<'c, 'a> {
     pub(crate) relocations: &'c mut RelocationCapture,
     pub(crate) return_sites: &'c mut Vec<abi::SafepointEntry>,
     pub(crate) call_safepoint: abi::SafepointId,
+    /// Record and spill window an allocating stub call in the operation
+    /// publishes.
+    pub(crate) alloc_roots: crate::template::operation::AllocRoots,
     pub(crate) transitions: &'a crate::entry::TransitionTable,
     pub(crate) view: &'a JitCompileSnapshot,
     pub(crate) plan: &'c TemplatePlan,
@@ -47,6 +50,7 @@ pub(crate) fn emit_operation(
         relocations,
         return_sites,
         call_safepoint,
+        alloc_roots,
         transitions,
         view,
         plan,
@@ -189,7 +193,7 @@ pub(crate) fn emit_operation(
             dst,
             lhs,
             rhs,
-            concat_safepoint,
+            alloc_roots.packet(concat_safepoint),
             threw,
             fatal,
         )?,
@@ -294,7 +298,7 @@ pub(crate) fn emit_operation(
             instruction.byte_pc,
             dst,
             context::ContextAllocation::Create { parent, scope },
-            safepoint,
+            alloc_roots.packet(safepoint),
             allocation_miss,
             fatal,
         )?,
@@ -310,7 +314,7 @@ pub(crate) fn emit_operation(
             instruction.byte_pc,
             dst,
             context::ContextAllocation::Copy { source: src },
-            safepoint,
+            alloc_roots.packet(safepoint),
             allocation_miss,
             fatal,
         )?,
@@ -337,7 +341,7 @@ pub(crate) fn emit_operation(
                 instruction.byte_pc,
                 dst,
                 context::ContextAllocation::Function,
-                safepoint,
+                alloc_roots.packet(safepoint),
                 allocation_miss,
                 fatal,
             )?;
@@ -688,7 +692,7 @@ pub(crate) fn emit_operation(
             relocations,
             dst,
             length,
-            safepoint,
+            alloc_roots.packet(safepoint),
             allocation_miss,
         )?,
         TemplateOp::ClassValueOp {
@@ -724,7 +728,7 @@ pub(crate) fn emit_operation(
                 context::ContextAllocation::Closure {
                     context: closure_context,
                 },
-                safepoint,
+                alloc_roots.packet(safepoint),
                 allocation_miss,
                 fatal,
             )?;

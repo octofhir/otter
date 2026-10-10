@@ -220,7 +220,7 @@ pub(super) fn emit_context_allocation(
     byte_pc: u32,
     dst: u16,
     allocation: ContextAllocation,
-    safepoint: abi::SafepointId,
+    packet: crate::template::operation::AllocPacket,
     miss: DynamicLabel,
     fatal: DynamicLabel,
 ) -> Result<(), Unsupported> {
@@ -309,13 +309,8 @@ pub(super) fn emit_context_allocation(
     }
     emit_store_reg(ops, regs.candidate, dst);
     dynasm!(ops ; .arch x64 ; jmp =>done ; =>slow);
-    dynasm!(ops ; .arch x64 ; mov DWORD [r14 + crate::entry::NATIVE_FRAME_PC_OFFSET as i32], pc as i32
-        ; sub rsp, ALLOC_CTX_STACK_SIZE as i32 ; mov r11, [r15 + THREAD_OFFSET as i32]
-        ; mov [rsp + ALLOC_CTX_THREAD_OFFSET as i32], r11
-        ; mov DWORD [rsp + ALLOC_CTX_SAFEPOINT_ID_OFFSET as i32], safepoint as i32
-        ; mov QWORD [rsp + ALLOC_CTX_SPILL_SLOTS_OFFSET as i32], 0
-        ; mov WORD [rsp + ALLOC_CTX_SPILL_SLOT_COUNT_OFFSET as i32], 0
-        ; mov rdi, rsp ; mov esi, safepoint as i32);
+    dynasm!(ops ; .arch x64 ; mov DWORD [r14 + crate::entry::NATIVE_FRAME_PC_OFFSET as i32], pc as i32);
+    super::emit_alloc_packet(ops, packet);
     match allocation {
         ContextAllocation::Create { parent, scope } => {
             let function_id = i32::try_from(view.code_block.id)

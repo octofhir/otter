@@ -101,6 +101,7 @@ fn narrowed_operations_emit_no_reference_to_an_omitted_cold_exit() {
                 relocations: &mut relocations,
                 return_sites: &mut return_sites,
                 call_safepoint: 0,
+                alloc_roots: crate::template::operation::AllocRoots::Window,
                 transitions: &transitions,
                 view: &view,
                 plan: &plan,

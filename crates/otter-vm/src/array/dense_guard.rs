@@ -2,11 +2,16 @@
 //!
 //! # Contents
 //! - The cached body byte consumed by both native element backends.
-//! - Prototype-only sidecar admission and conservative exotic rejection.
+//! - Sidecar admission for state that leaves indexed slots ordinary, and
+//!   conservative rejection of everything that reaches them.
 //!
 //! # Invariants
 //! - A zero byte proves default own data semantics only for a present slot.
 //!   It never permits a hole to bypass a prototype lookup.
+//! - Named state — string-keyed data properties, their creation order,
+//!   symbol-keyed properties, and accessors or descriptor flags on non-index
+//!   keys — never aliases an index, so it leaves the byte zero. A RegExp match
+//!   result (`index`, `input`, `groups`) keeps native element access.
 //! - Mutable sidecar exposure invalidates the byte before a write; completed
 //!   mutations and traced relocation recompute it from the current sidecar.
 //! - Holey numeric access still requires no sidecar, because its hole result
@@ -20,23 +25,35 @@ use super::{ArrayBody, ArrayExoticSlots, DenseElementKind, JsArray};
 use crate::jit::JitElementFamily;
 
 impl ArrayExoticSlots {
-    fn prototype_only(&self) -> bool {
+    /// Whether every present dense slot still has default own data
+    /// semantics: no sparse or JSON-source state, extensible, and no accessor
+    /// or descriptor on an index key.
+    fn leaves_dense_slots_ordinary(&self) -> bool {
+        let index_key = |key: &String| crate::object::array_index_property_name(key).is_some();
         self.sparse_elements.is_none()
-            && self.named_properties.is_none()
-            && self.named_key_order.is_none()
-            && self.accessors.is_none()
-            && self.property_flags.is_none()
-            && self.symbol_properties.is_null()
             && self.source_bytes.is_none()
             && self.extensible.0
+            && self
+                .accessors
+                .as_ref()
+                .is_none_or(|accessors| !accessors.keys().any(index_key))
+            && self
+                .property_flags
+                .as_ref()
+                .is_none_or(|flags| !flags.keys().any(index_key))
         // `prototype_override` cannot affect a proved present own element.
+        // Named data, key order and symbol properties never alias an index.
         // `dirty` is bookkeeping, not a property or descriptor.
     }
 }
 
 impl ArrayBody {
     pub(super) fn current_dense_own_guard(&self) -> u8 {
-        u8::from(!self.exotic().is_none_or(ArrayExoticSlots::prototype_only))
+        u8::from(
+            !self
+                .exotic()
+                .is_none_or(ArrayExoticSlots::leaves_dense_slots_ordinary),
+        )
     }
 
     pub(crate) fn refresh_dense_own_guard(&self) {

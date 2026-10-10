@@ -2567,6 +2567,9 @@ impl<'a> Builder<'a> {
     // ------------------------------------------------------------------
 
     fn visit_load_property(&mut self, instruction: &Instruction) {
+        if self.try_accessor_call(instruction, None) {
+            return;
+        }
         let byte_pc = instruction.byte_pc;
         // A site that already left on a receiver its shapes did not describe
         // is compiled to the lookup that serves every receiver.
@@ -2696,6 +2699,9 @@ impl<'a> Builder<'a> {
     }
 
     fn visit_store_property(&mut self, instruction: &Instruction) {
+        if self.try_accessor_call(instruction, Some(instruction.reads[1])) {
+            return;
+        }
         let receiver = self.read(instruction.reads[0]);
         let receivers = self
             .known
@@ -3092,6 +3098,28 @@ impl<'a> Builder<'a> {
         {
             return;
         }
+        self.emit_receiver_call(
+            instruction,
+            callee,
+            receiver,
+            arguments,
+            plan,
+            Some(instruction.writes[0]),
+        );
+    }
+
+    /// The out-of-line call of `callee` with `receiver` bound as `this`; its
+    /// result goes to `destination`, or nowhere for an instruction that
+    /// writes no register.
+    fn emit_receiver_call(
+        &mut self,
+        instruction: &Instruction,
+        callee: NodeId,
+        receiver: NodeId,
+        arguments: &[NodeId],
+        plan: Option<otter_vm::jit::JitDirectCallPlan>,
+        destination: Option<u16>,
+    ) {
         let mut inputs: SmallVec<[NodeId; 4]> = SmallVec::new();
         inputs.push(callee);
         inputs.push(receiver);
@@ -3113,10 +3141,61 @@ impl<'a> Builder<'a> {
             &inputs,
             Repr::Tagged,
         );
-        let destination = instruction.writes[0];
-        let lazy = self.lazy_state(Some((destination, node)));
+        let lazy = self.lazy_state(destination.map(|destination| (destination, node)));
         self.graph.node_mut(node).lazy = Some(lazy);
-        self.write(destination, node);
+        if let Some(destination) = destination {
+            self.write(destination, node);
+        }
+    }
+
+    /// A named load or store whose receivers reached one getter or setter
+    /// through an inherited accessor: the method-target guard (receiver
+    /// shape, prototype proof), the getter or setter read from the
+    /// accessor's cell, and a direct call of it with the receiver bound as
+    /// `this` — the stored value as its argument for a store. `false` when
+    /// the site has no such target, its guard already failed here, or it saw
+    /// several.
+    fn try_accessor_call(&mut self, instruction: &Instruction, value: Option<u16>) -> bool {
+        let byte_pc = instruction.byte_pc;
+        if self.exited_for(ExitReason::ShapeGuard) || self.exited_for(ExitReason::IdentityGuard) {
+            return false;
+        }
+        let view: &'a JitCompileSnapshot = self.view;
+        let Some([method]) = view.direct_methods.get(&byte_pc).map(Vec::as_slice) else {
+            return false;
+        };
+        if method.guard.accessor_byte.is_none() {
+            return false;
+        }
+        let receiver = self.read(instruction.reads[0]);
+        let receiver = self.tagged(receiver);
+        let arguments: SmallVec<[NodeId; 1]> = value
+            .map(|register| {
+                let value = self.read(register);
+                self.tagged(value)
+            })
+            .into_iter()
+            .collect();
+        let callee = self.add(
+            Kind::LoadGuardedMethod {
+                byte_pc,
+                target: 0,
+                receiver_proved: false,
+            },
+            &[receiver],
+            Repr::Tagged,
+        );
+        self.prove_receiver_shape(receiver, method.guard.recv_shape);
+        let destination = instruction.writes.first().copied();
+        self.emit_receiver_call(
+            instruction,
+            callee,
+            receiver,
+            &arguments,
+            Some(method.callee.plan),
+            destination,
+        );
+        true
     }
 
     /// `dst = callee.apply(this, arguments)` over the activation's own

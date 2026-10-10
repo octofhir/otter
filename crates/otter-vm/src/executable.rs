@@ -78,7 +78,9 @@ pub(crate) struct ExecutableModule {
     _table_lease: ResourceLease,
 }
 
-/// Directory entry naming a globally dense method-call site.
+/// Directory entry naming a globally dense site whose call-target distribution
+/// the isolate keeps: a method call, or a named load or store whose receivers
+/// reach an accessor.
 #[derive(Debug, Clone)]
 pub(crate) struct FeedbackSlotAddress;
 
@@ -223,7 +225,16 @@ impl ExecutableModule {
                 if !has_property_ic_site(instruction.op) {
                     continue;
                 }
-                if instruction.op == Op::CallMethodValue {
+                // A named load or store records the getters or setters its
+                // receivers reach through an inherited accessor, the way a
+                // method call records its methods.
+                if matches!(
+                    instruction.op,
+                    Op::CallMethodValue
+                        | Op::LoadProperty
+                        | Op::StoreProperty
+                        | Op::StorePropertyStrict
+                ) {
                     slots.push((site, FeedbackSlotAddress));
                 }
                 site += 1;

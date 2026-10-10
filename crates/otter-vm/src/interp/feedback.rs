@@ -3,7 +3,10 @@
 //! # Contents
 //! - Dense global method-site directory installation.
 //! - Executable builtin-method IC banks.
-//! - Single-writer bounded method-target distributions.
+//! - Single-writer bounded method-target distributions. A named load or store
+//!   site's distribution names the getters or setters its receivers reached
+//!   through an inherited accessor; a site id belongs to one instruction, so
+//!   the two uses never share an entry.
 //! - Range purge for tombstoned code chunks.
 //!
 //! # Invariants
@@ -150,6 +153,32 @@ impl MethodFeedbackDirectory {
     fn method_targets(&self, site: usize) -> Option<MethodCallFeedback> {
         self.address(site)?.is_method().then_some(())?;
         self.method_targets.get(site)?.clone()
+    }
+
+    /// Whether the site's bounded distribution already names `recv_shape`
+    /// under a still-valid lookup proof, whatever function it resolved to,
+    /// counting the hit.
+    pub(crate) fn records_receiver(
+        &mut self,
+        site: usize,
+        recv_shape: crate::object::ShapeId,
+    ) -> bool {
+        let live = |proof: &crate::MethodLookupProof| {
+            proof.validity.as_ref().is_none_or(|cell| cell.is_valid())
+        };
+        match self.method_targets.get_mut(site) {
+            Some(Some(MethodCallFeedback::Mono {
+                recv_shape: seen,
+                prototype,
+                ..
+            })) => *seen == recv_shape && live(prototype),
+            Some(Some(MethodCallFeedback::Poly(targets))) => targets
+                .iter_mut()
+                .find(|seen| seen.recv_shape == recv_shape && live(&seen.prototype))
+                .map(|seen| seen.hits = seen.hits.saturating_add(1))
+                .is_some(),
+            _ => false,
+        }
     }
 
     /// Whether the site's bounded distribution already names `recv_shape`
@@ -442,6 +471,74 @@ impl Interpreter {
     ) -> bool {
         self.method_feedback
             .record_method_target(site, method_fid, method_site)
+    }
+
+    /// Record the getter (or, for a store, the setter) the named access at
+    /// `pc` of `function_id` reached on `receiver` through an accessor its
+    /// prototype chain owns, under the receiver's chain proof. Any other
+    /// resolution — an own accessor, a missing or non-closure function, an
+    /// unprovable chain — saturates the site, since no guard could name it.
+    pub(crate) fn note_accessor_target(
+        &mut self,
+        context: &ExecutionContext,
+        function_id: u32,
+        pc: u32,
+        receiver: crate::object::JsObject,
+        key: crate::property_atom::AtomizedPropertyKey<'_>,
+        setter: bool,
+    ) {
+        let Some(site) = context.property_ic_site(function_id, pc) else {
+            return;
+        };
+        self.ensure_method_feedback_context(context);
+        if self.method_target_feedback_saturated(site) {
+            return;
+        }
+        let shape = crate::object::keyed_shape(receiver, &self.gc_heap);
+        // A receiver class the site already recorded under a live proof needs
+        // no second resolution.
+        if !shape.is_null()
+            && self
+                .method_feedback
+                .records_receiver(site, crate::object::shape_id(receiver, &self.gc_heap))
+        {
+            return;
+        }
+        let resolved = (!shape.is_null())
+            .then(|| crate::cache_ir::resolve_atom_inherited_accessor(receiver, &self.gc_heap, key))
+            .flatten();
+        let Some(resolved) = resolved else {
+            self.saturate_method_site_feedback(site);
+            return;
+        };
+        let function = if setter {
+            resolved.setter
+        } else {
+            resolved.getter
+        };
+        let Some(function_id) = function
+            .and_then(|function| function.as_closure(&self.gc_heap))
+            .map(crate::closure::JsClosure::function_id)
+        else {
+            self.saturate_method_site_feedback(site);
+            return;
+        };
+        let recv_shape = crate::object::shape_id(receiver, &self.gc_heap);
+        self.shape_runtime.register_shape(&self.gc_heap, shape);
+        self.shape_runtime
+            .register_shape(&self.gc_heap, resolved.holder_root);
+        let method_site = MethodSite {
+            recv_shape,
+            prototype: crate::MethodLookupProof {
+                validity: Some(resolved.validity),
+                holder_root: resolved.holder_root_id,
+            },
+            method_field: crate::object::field_location(
+                resolved.hit.shape,
+                u32::from(resolved.hit.slot),
+            ),
+        };
+        self.record_method_target_feedback(site, function_id, method_site);
     }
 }
 

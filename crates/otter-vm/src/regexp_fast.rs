@@ -34,6 +34,7 @@ use std::sync::Arc;
 use crate::object::prototype_validity::PrototypeValidity;
 use crate::object::{self, ShapeState};
 use crate::runtime_cx::{NativeCtx, NativeScope};
+use crate::string::CodeUnits;
 use crate::{Interpreter, Local, NativeError, Value};
 
 /// Per-realm proof about `%RegExp.prototype%`, valid while its cell is.
@@ -391,18 +392,26 @@ pub(crate) fn replace(
         if matches.is_empty() {
             return Ok(scope.finish(input));
         }
+        // S and the template are copied out at their stored widths: a
+        // replacer may collect, and the result is built at the narrowest
+        // width its pieces allow.
         let subject = scope.raw(input);
         let heap = scope.context().heap();
-        let units = subject
-            .as_string(heap)
-            .expect("replace subject is a string")
-            .to_utf16_vec(heap);
+        let units = OwnedUnits::of(
+            subject
+                .as_string(heap)
+                .expect("replace subject is a string"),
+            heap,
+        );
         let template = (!functional).then(|| {
-            scope
-                .raw(replacement)
-                .as_string(scope.context().heap())
-                .expect("replace template is a string")
-                .to_utf16_vec(scope.context().heap())
+            let template = scope.raw(replacement);
+            let heap = scope.context().heap();
+            OwnedUnits::of(
+                template
+                    .as_string(heap)
+                    .expect("replace template is a string"),
+                heap,
+            )
         });
         if let Some(last) = matches.last() {
             let subject = scope.raw(input);
@@ -415,14 +424,18 @@ pub(crate) fn replace(
         let named = matches
             .first()
             .is_some_and(|m| m.named_groups().next().is_some());
-        let mut out: Vec<u16> = Vec::with_capacity(units.len());
+        let subject = units.view();
+        let mut out = UnitSink::with_capacity(subject.len());
         let mut next = 0;
         for matched in &matches {
             let position = matched.range.start;
-            let mut replaced = Vec::new();
+            if position >= next {
+                out.extend(subject.slice(next..position));
+            }
+            let start = out.len();
             match &template {
                 Some(template) => {
-                    if !expand_template(&mut replaced, template, &units, matched, named) {
+                    if !expand_template(&mut out, template.view(), subject, matched, named) {
                         return Err(NativeError::RangeError {
                             name: NAME,
                             reason: "Invalid string length".to_string(),
@@ -437,13 +450,14 @@ pub(crate) fn replace(
                         &result,
                         NAME,
                     )?;
-                    replaced = result.to_utf16_vec(scope.context().heap());
+                    result.with_code_units(scope.context().heap(), |units| out.extend(units));
                 }
             }
             if position >= next {
-                out.extend_from_slice(&units[next..position]);
-                out.extend_from_slice(&replaced);
                 next = matched.range.end;
+            } else {
+                // A match inside an earlier replaced span contributes nothing.
+                out.truncate(start);
             }
             if out.len() > MAX_STRING_UNITS {
                 return Err(NativeError::RangeError {
@@ -452,17 +466,108 @@ pub(crate) fn replace(
                 });
             }
         }
-        out.extend_from_slice(&units[next.min(units.len())..]);
+        out.extend(subject.slice(next.min(subject.len())..subject.len()));
         if out.len() > MAX_STRING_UNITS {
             return Err(NativeError::RangeError {
                 name: NAME,
                 reason: "Invalid string length".to_string(),
             });
         }
-        let result = crate::string::JsString::from_utf16_units(&out, scope.context().heap_mut())?;
+        let result = out.finish(scope.context().heap_mut())?;
         let result = scope.value(Value::string(result));
         Ok(scope.finish(result))
     })
+}
+
+/// A string's code units copied out at the width it stores them in.
+enum OwnedUnits {
+    Latin1(Vec<u8>),
+    Utf16(Vec<u16>),
+}
+
+impl OwnedUnits {
+    fn of(string: crate::string::JsString, heap: &otter_gc::GcHeap) -> Self {
+        string.with_code_units(heap, |units| match units {
+            CodeUnits::Latin1(bytes) => Self::Latin1(bytes.to_vec()),
+            CodeUnits::Utf16(units) => Self::Utf16(units.to_vec()),
+        })
+    }
+
+    fn view(&self) -> CodeUnits<'_> {
+        match self {
+            Self::Latin1(bytes) => CodeUnits::Latin1(bytes),
+            Self::Utf16(units) => CodeUnits::Utf16(units),
+        }
+    }
+}
+
+/// A result string assembled one byte per unit until a unit past Latin-1
+/// arrives, then widened once.
+enum UnitSink {
+    Latin1(Vec<u8>),
+    Utf16(Vec<u16>),
+}
+
+impl UnitSink {
+    fn with_capacity(capacity: usize) -> Self {
+        Self::Latin1(Vec::with_capacity(capacity))
+    }
+
+    fn len(&self) -> usize {
+        match self {
+            Self::Latin1(bytes) => bytes.len(),
+            Self::Utf16(units) => units.len(),
+        }
+    }
+
+    fn truncate(&mut self, len: usize) {
+        match self {
+            Self::Latin1(bytes) => bytes.truncate(len),
+            Self::Utf16(units) => units.truncate(len),
+        }
+    }
+
+    fn widen(&mut self) -> &mut Vec<u16> {
+        if let Self::Latin1(bytes) = self {
+            let mut units = Vec::with_capacity(bytes.capacity().max(bytes.len() * 2));
+            units.extend(bytes.iter().map(|&byte| u16::from(byte)));
+            *self = Self::Utf16(units);
+        }
+        match self {
+            Self::Utf16(units) => units,
+            Self::Latin1(_) => unreachable!("widened above"),
+        }
+    }
+
+    fn push(&mut self, unit: u16) {
+        match self {
+            Self::Latin1(bytes) if unit <= 0xff => bytes.push(unit as u8),
+            _ => self.widen().push(unit),
+        }
+    }
+
+    fn extend(&mut self, units: CodeUnits<'_>) {
+        match (&mut *self, units) {
+            (Self::Latin1(bytes), CodeUnits::Latin1(more)) => bytes.extend_from_slice(more),
+            (Self::Utf16(units), CodeUnits::Latin1(more)) => {
+                units.extend(more.iter().map(|&byte| u16::from(byte)));
+            }
+            (Self::Latin1(bytes), CodeUnits::Utf16(more)) if more.iter().all(|&u| u <= 0xff) => {
+                bytes.extend(more.iter().map(|&unit| unit as u8));
+            }
+            (_, CodeUnits::Utf16(more)) => self.widen().extend_from_slice(more),
+        }
+    }
+
+    fn finish(
+        self,
+        heap: &mut otter_gc::GcHeap,
+    ) -> Result<crate::string::JsString, otter_gc::OutOfMemory> {
+        match self {
+            Self::Latin1(bytes) => crate::string::JsString::from_latin1(&bytes, heap),
+            Self::Utf16(units) => crate::string::JsString::from_utf16_units(&units, heap),
+        }
+    }
 }
 
 /// Longest string `@@replace` builds before reporting a RangeError.
@@ -506,9 +611,9 @@ fn call_replacer<'scope>(
 /// §22.2.6.11.1 `GetSubstitution` over code-unit ranges of `subject`;
 /// `false` once the expansion passes the longest string a result can be.
 fn expand_template(
-    out: &mut Vec<u16>,
-    template: &[u16],
-    subject: &[u16],
+    out: &mut UnitSink,
+    template: CodeUnits<'_>,
+    subject: CodeUnits<'_>,
     matched: &crate::regexp::engine::Match,
     named: bool,
 ) -> bool {
@@ -521,12 +626,11 @@ fn expand_template(
     let groups = matched.captures.len();
     let tail = matched.range.end.min(subject.len());
     let mut i = 0;
-    while i < template.len() {
+    while let Some(unit) = template.get(i) {
         if out.len() > MAX_STRING_UNITS {
             return false;
         }
-        let unit = template[i];
-        let Some(&next) = template.get(i + 1).filter(|_| unit == DOLLAR) else {
+        let Some(next) = template.get(i + 1).filter(|_| unit == DOLLAR) else {
             out.push(unit);
             i += 1;
             continue;
@@ -537,20 +641,20 @@ fn expand_template(
                 i += 2;
             }
             0x26 => {
-                out.extend_from_slice(&subject[matched.range.clone()]);
+                out.extend(subject.slice(matched.range.clone()));
                 i += 2;
             }
             0x60 => {
-                out.extend_from_slice(&subject[..matched.range.start]);
+                out.extend(subject.slice(0..matched.range.start));
                 i += 2;
             }
             0x27 => {
-                out.extend_from_slice(&subject[tail..]);
+                out.extend(subject.slice(tail..subject.len()));
                 i += 2;
             }
             _ if digit(next).is_some() => {
                 let first = digit(next).expect("digit");
-                let second = template.get(i + 2).copied().and_then(digit);
+                let second = template.get(i + 2).and_then(digit);
                 let group = |index: usize| (index > 0 && index <= groups).then_some(index);
                 let (index, consumed) = match second.map(|second| first * 10 + second) {
                     Some(two) if group(two).is_some() => (Some(two), 3),
@@ -559,26 +663,30 @@ fn expand_template(
                 match index {
                     Some(index) => {
                         if let Some(range) = &matched.captures[index - 1] {
-                            out.extend_from_slice(&subject[range.clone()]);
+                            out.extend(subject.slice(range.clone()));
                         }
                     }
-                    None => out.extend_from_slice(&template[i..i + consumed]),
+                    None => out.extend(template.slice(i..i + consumed)),
                 }
                 i += consumed;
             }
             0x3c if named => {
-                let Some(close) = template[i + 2..].iter().position(|&u| u == b'>' as u16) else {
+                let close = (i + 2..template.len()).find(|&j| template.get(j) == Some(b'>' as u16));
+                let Some(close) = close else {
                     out.push(DOLLAR);
                     i += 1;
                     continue;
                 };
-                let name = String::from_utf16_lossy(&template[i + 2..i + 2 + close]);
+                let name: String =
+                    char::decode_utf16((i + 2..close).filter_map(|j| template.get(j)))
+                        .map(|c| c.unwrap_or(char::REPLACEMENT_CHARACTER))
+                        .collect();
                 if let Some((_, Some(range))) =
                     matched.named_groups().find(|(group, _)| *group == name)
                 {
-                    out.extend_from_slice(&subject[range]);
+                    out.extend(subject.slice(range));
                 }
-                i += close + 3;
+                i = close + 1;
             }
             _ => {
                 out.push(DOLLAR);

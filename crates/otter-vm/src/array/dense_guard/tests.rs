@@ -3,10 +3,12 @@
 //! # Contents
 //! - Default and source-realm boxed/numeric slabs under every stress stride.
 //! - Descriptor, accessor, sparse, and JSON-source rejection and removal.
+//! - Named sidecar state admitted beside indexed state rejected.
 //! - Collecting inherited hole getters and restored indexed writability.
 //!
 //! # Invariants
-//! - A prototype-only sidecar admits present own slots, never inherited holes.
+//! - A sidecar holding only a prototype or named state admits present own
+//!   slots, never inherited holes.
 //! - Tests keep moving values in production handle scopes and reread them there.
 //! - Snapshot restoration rebuilds flags before publishing native eligibility.
 //!
@@ -349,6 +351,105 @@ fn descriptor_accessor_sparse_and_source_mutations_refresh_dense_eligibility() {
     .expect("descriptor mutation fixture");
 }
 
+/// Named state — match-result fields, a named accessor, a descriptor on a
+/// non-index key — keeps native element access; the same state on an index key
+/// withdraws it.
+#[test]
+fn named_sidecar_state_keeps_dense_eligibility() {
+    let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
+    interp.gc_heap_mut().set_gc_stress(0, false);
+    let context = context(&mut interp);
+    NativeCtx::with_host_context(
+        &mut interp,
+        NativeCallInfo::default_call(),
+        Some(&context),
+        |ctx| {
+            ctx.scope(|mut scope| {
+                let array = scope.array(0)?;
+                let value = scope.boolean(true);
+                scope.set_index(array, 0, value)?;
+                scope.set_index(array, 1, value)?;
+                scope.with_turn_parts(|interp, stack| {
+                    let receiver = interp.escape_scoped(array);
+                    crate::array::set_match_result_props(
+                        receiver.as_array().unwrap(),
+                        interp.gc_heap_mut(),
+                        Value::number_i32(0),
+                        Value::undefined(),
+                        Value::undefined(),
+                    )
+                    .unwrap();
+                    assert_family(
+                        interp,
+                        interp.escape_scoped(array),
+                        JitElementFamily::DenseTagged,
+                    );
+                    let receiver = interp.escape_scoped(array);
+                    assert!(
+                        interp
+                            .define_own_property_value(
+                                stack,
+                                &context,
+                                &receiver,
+                                &crate::VmPropertyKey::String("named"),
+                                PartialPropertyDescriptor {
+                                    get: Some(Value::undefined()),
+                                    set: Some(Value::undefined()),
+                                    enumerable: Some(true),
+                                    configurable: Some(true),
+                                    ..Default::default()
+                                }
+                            )
+                            .unwrap()
+                    );
+                    let receiver = interp.escape_scoped(array);
+                    assert!(
+                        interp
+                            .define_own_property_value(
+                                stack,
+                                &context,
+                                &receiver,
+                                &crate::VmPropertyKey::String("index"),
+                                PartialPropertyDescriptor {
+                                    writable: Some(false),
+                                    ..Default::default()
+                                }
+                            )
+                            .unwrap()
+                    );
+                    assert_family(
+                        interp,
+                        interp.escape_scoped(array),
+                        JitElementFamily::DenseTagged,
+                    );
+                    let receiver = interp.escape_scoped(array);
+                    assert!(
+                        interp
+                            .define_own_property_value(
+                                stack,
+                                &context,
+                                &receiver,
+                                &crate::VmPropertyKey::String("1"),
+                                PartialPropertyDescriptor {
+                                    writable: Some(false),
+                                    ..Default::default()
+                                }
+                            )
+                            .unwrap()
+                    );
+                    assert_family(
+                        interp,
+                        interp.escape_scoped(array),
+                        JitElementFamily::Generic,
+                    );
+                });
+                Ok::<_, NativeError>(())
+            })
+        },
+    )
+    .expect("named sidecar fixture");
+}
+
 fn collecting_hole_getter(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
     ctx.scope(|mut scope| {
         let receiver = scope.this();
@@ -462,7 +563,9 @@ fn default_and_custom_prototype_holes_commit_collecting_getter_exactly_once() {
                             assert!(after.minor_slot_updates > before.minor_slot_updates);
                             let receiver = interp.escape_scoped(array);
                             assert_ne!(receiver.as_array().unwrap().offset(), old_offset);
-                            assert_family(interp, receiver, JitElementFamily::Generic);
+                            // The getter's named writes leave indexed slots
+                            // ordinary, so native element access survives.
+                            assert_family(interp, receiver, JitElementFamily::DenseTagged);
                             let array = receiver.as_array().unwrap();
                             assert_eq!(
                                 crate::array::get_named_property(

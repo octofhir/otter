@@ -392,14 +392,15 @@ impl IcHandler {
         })
     }
 
-    /// This load handler, serving a receiver whose lookup-start object has the
+    /// This handler, serving a receiver whose lookup-start object has the
     /// handler's receiver shape: a function's property bag or an ordinary
-    /// dense array's prototype.
+    /// dense array's prototype for a load, a function's bag for an own-field
+    /// store.
     #[must_use]
     pub(crate) fn for_lookup_start(mut self) -> Self {
         debug_assert!(
-            !self.kind.is_store(),
-            "lookup-start receivers take loads only"
+            self.kind != IcHandlerKind::StoreTransition,
+            "lookup-start receivers never append"
         );
         self.lookup_start = true;
         self
@@ -752,6 +753,28 @@ impl PropertyIcSlot {
             return None;
         }
         self.probe_load_from(start, shape.offset() | LOOKUP_START_KEY_BIT, heap)
+    }
+
+    /// Run the own-field store handler of a function receiver whose property
+    /// bag is `bag`. `false` on a miss.
+    #[must_use]
+    pub(crate) fn probe_lookup_start_store(
+        &self,
+        bag: JsObject,
+        heap: &mut otter_gc::GcHeap,
+        value: Value,
+    ) -> bool {
+        let shape = object::keyed_shape(bag, heap);
+        if shape.is_null() {
+            return false;
+        }
+        match self.matching(shape.offset() | LOOKUP_START_KEY_BIT) {
+            Some(entry) if entry.kind() == IcHandlerKind::StoreField => {
+                object::store_proven_data_slot(bag, heap, entry.slot(), value);
+                true
+            }
+            _ => false,
+        }
     }
 
     /// Run the load handler keyed `key` with `obj` as lookup-start object.

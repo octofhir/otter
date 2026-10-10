@@ -1120,6 +1120,10 @@ impl Interpreter {
                 return Ok(true);
             }
             property_slot.record_miss();
+        } else if self.lookup_start_store(property_slot, receiver, atomized_key, value) {
+            Self::advance_property_fast_path(&mut stack[top_idx])
+                .map_err(CommittedValueError::JavaScript)?;
+            return Ok(true);
         }
         // §28.2.4.5 / §10.5.9 Proxy.[[Set]] — invoke the `set` trap
         // when present; otherwise delegate to the target.

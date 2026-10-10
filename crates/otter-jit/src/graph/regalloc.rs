@@ -1,11 +1,13 @@
 //! Register allocation over live intervals with canonical, representation-
-//! specific spill homes planned before the final allocation walk.
+//! specific spill homes colored after the allocation walk.
 //!
 //! # Contents
 //! - [`Location`] — a general register, a floating-point register, a frame
 //!   slot, or a constant rematerialized at the use.
-//! - [`allocate`] — discovers spill requirements, colors their live
-//!   intervals, then assigns inputs, results, temporaries and edge moves.
+//! - [`allocate`] — assigns inputs, results, temporaries, edge moves and a
+//!   provisional home per spilled value in one walk, then colors the homes by
+//!   their live intervals and renames them, as V8's allocators assign spill
+//!   slots after register allocation.
 //! - [`Allocation`] — the per-node and per-edge result consumed by code
 //!   generation.
 //!
@@ -36,8 +38,11 @@
 //!   until after the node's result is assigned: a result never overwrites
 //!   the only location an exit still reads.
 //! - Fixed arithmetic clobbers are evicted into canonical definition homes
-//!   before inputs are assigned in both allocation walks. Inputs and
-//!   temporaries avoid those registers; a fixed result writes them late.
+//!   before inputs are assigned. Inputs and temporaries avoid those
+//!   registers; a fixed result writes them late.
+//! - Register decisions never depend on which slot a home gets: the walk
+//!   names each home after its value, and coloring only renames homes and
+//!   drops the moves that renaming makes empty.
 //! - A fixed count operand that remains a constant reserves no register.
 //! - A block's entry register state is the state of its first predecessor in
 //!   emission order, restricted to values live at the block; every other
@@ -123,14 +128,82 @@ pub(crate) struct EdgeMoves {
 pub(crate) struct Allocation {
     pub(crate) nodes: Vec<NodeAllocation>,
     /// Spill slot of each value that has one.
-    pub(crate) spill: FxHashMap<NodeId, Location>,
+    pub(crate) spill: Homes,
     /// Values whose homes must already be valid when a register is evicted.
     /// Other homes are materialized by the collecting slow path or exit.
-    pub(crate) definition_spills: FxHashSet<NodeId>,
+    pub(crate) definition_spills: NodeSet,
     /// Moves per `(predecessor, successor)` edge.
     pub(crate) edges: FxHashMap<(BlockId, BlockId), EdgeMoves>,
     pub(crate) tagged_slots: u32,
     pub(crate) untagged_slots: u32,
+}
+
+/// Colored homes and the slot counts of each region.
+#[derive(Debug, Default)]
+struct PlannedHomes {
+    homes: Homes,
+    tagged_slots: u32,
+    untagged_slots: u32,
+}
+
+/// Spill homes by value, dense over node ids: the walk reads a home for
+/// every frame-state value of every node.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct Homes {
+    homes: Vec<Option<Location>>,
+    /// The values with a home, in the order they got it.
+    values: Vec<NodeId>,
+}
+
+impl Homes {
+    pub(crate) fn get(&self, value: &NodeId) -> Option<&Location> {
+        self.homes.get(value.0 as usize)?.as_ref()
+    }
+
+    fn insert(&mut self, value: NodeId, home: Location) {
+        let index = value.0 as usize;
+        if index >= self.homes.len() {
+            self.homes.resize(index + 1, None);
+        }
+        if self.homes[index].replace(home).is_none() {
+            self.values.push(value);
+        }
+    }
+
+    /// Every value with a home and the home, in the order they got it.
+    pub(crate) fn iter(&self) -> impl Iterator<Item = (NodeId, Location)> + '_ {
+        self.values.iter().map(|&value| (value, self[&value]))
+    }
+}
+
+impl std::ops::Index<&NodeId> for Homes {
+    type Output = Location;
+
+    fn index(&self, value: &NodeId) -> &Location {
+        self.get(value).expect("a value with a home")
+    }
+}
+
+/// A set of values, dense over node ids.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct NodeSet {
+    words: Vec<u64>,
+}
+
+impl NodeSet {
+    pub(crate) fn contains(&self, value: &NodeId) -> bool {
+        self.words
+            .get(value.0 as usize / 64)
+            .is_some_and(|word| word & (1 << (value.0 % 64)) != 0)
+    }
+
+    fn insert(&mut self, value: NodeId) {
+        let word = value.0 as usize / 64;
+        if word >= self.words.len() {
+            self.words.resize(word + 1, 0);
+        }
+        self.words[word] |= 1 << (value.0 % 64);
+    }
 }
 
 impl Allocation {
@@ -282,6 +355,8 @@ impl ValueState {
 struct Allocator<'g> {
     registers: RegisterContract,
     graph: &'g Graph,
+    /// Every frame state's values, flattened once.
+    states: &'g super::ir::StateValues,
     layout: &'g [BlockId],
     position: Vec<u32>,
     block_start: Vec<u32>,
@@ -292,20 +367,12 @@ struct Allocator<'g> {
     gp: RegisterFile,
     fp: RegisterFile,
     out: Allocation,
-    /// Released slots with the position their last value died at.
-    free_tagged: Vec<(u32, u32)>,
-    free_untagged: Vec<(u32, u32)>,
-    /// Spilled values by the position of their last use, earliest first:
-    /// each slot is released once, when the walk passes that use.
-    expiries: std::collections::BinaryHeap<std::cmp::Reverse<(u32, u32)>>,
     /// Per block, indexed by its id.
     entry_states: Vec<Option<Vec<(NodeId, Location)>>>,
     exit_states: Vec<Option<Vec<(NodeId, Location)>>>,
     current: NodeId,
     /// Control-flow liveness, including deopt frame-state uses.
     liveness: super::liveness::Liveness,
-    /// Final homes are immutable during the second allocation walk.
-    planned: bool,
     /// Values a loop's back edge feeds into a header phi, with that phi: the
     /// value prefers the phi's register, so the edge needs no move (V8's
     /// register hints for phi inputs).
@@ -329,7 +396,9 @@ pub(crate) fn allocate(
     registers: RegisterContract,
 ) -> Allocation {
     registers.validate();
+    let states = graph.all_state_values();
     let mut allocator = Allocator {
+        states: &states,
         registers,
         graph,
         layout,
@@ -343,34 +412,17 @@ pub(crate) fn allocate(
             nodes: vec![NodeAllocation::default(); graph.nodes.len()],
             ..Allocation::default()
         },
-        free_tagged: Vec::new(),
-        free_untagged: Vec::new(),
-        expiries: std::collections::BinaryHeap::new(),
         entry_states: vec![None; graph.blocks.len()],
         exit_states: vec![None; graph.blocks.len()],
         current: NodeId(0),
-        liveness: super::liveness::Liveness::compute(graph, layout),
-        planned: false,
+        liveness: super::liveness::Liveness::compute_with(graph, layout, &states),
         phi_hints: FxHashMap::default(),
     };
     allocator.number();
     allocator.collect_uses();
     allocator.walk();
     let homes = allocator.plan_homes();
-    allocator.out = homes;
-    allocator.gp = RegisterFile::new(registers.general);
-    allocator.fp = RegisterFile::new(registers.floating);
-    for state in &mut allocator.values {
-        state.gp = 0;
-        state.fp = 0;
-    }
-    allocator.free_tagged.clear();
-    allocator.free_untagged.clear();
-    allocator.expiries.clear();
-    allocator.entry_states.fill(None);
-    allocator.exit_states.fill(None);
-    allocator.planned = true;
-    allocator.walk();
+    allocator.place_homes(homes);
     allocator.plan_rooted_tagged_homes();
     allocator.out
 }
@@ -404,7 +456,7 @@ impl<'g> Allocator<'g> {
                         data.eager
                             .iter()
                             .chain(data.lazy.iter())
-                            .flat_map(|&state| self.graph.state_values(state)),
+                            .flat_map(|&state| self.states.of(state).iter().copied()),
                     )
                     .collect();
                 let mut rooted: Vec<u32> = self.out.nodes[node.0 as usize]
@@ -415,7 +467,7 @@ impl<'g> Allocator<'g> {
                         _ => None,
                     })
                     .collect();
-                for (&value, &home) in &self.out.spill {
+                for (value, home) in self.out.spill.iter() {
                     // The result's home may still contain an earlier colored
                     // occupant. Its value does not exist before the call.
                     if value == node || !self.out.definition_spills.contains(&value) {
@@ -492,7 +544,7 @@ impl<'g> Allocator<'g> {
                     uses.push((input.0, at));
                 }
                 for state in data.eager.iter().chain(data.lazy.iter()) {
-                    for value in graph.state_values(*state) {
+                    for &value in self.states.of(*state) {
                         if value != node {
                             uses.push((value.0, at));
                         }
@@ -501,21 +553,42 @@ impl<'g> Allocator<'g> {
             }
         }
         // Group the positions by value in one flat array, each group sorted
-        // and distinct.
-        uses.sort_unstable();
-        uses.dedup();
-        self.positions = uses.iter().map(|&(_, at)| at).collect();
-        let mut index = 0;
-        while index < uses.len() {
-            let value = uses[index].0;
-            let first = index;
-            while index < uses.len() && uses[index].0 == value {
-                index += 1;
-            }
-            let state = &mut self.values[value as usize];
-            state.first_use = first as u32;
-            state.use_count = (index - first) as u32;
+        // and distinct. Uses arrive in layout order but for phi inputs, read
+        // at a predecessor's end, so a counting placement keeps each group
+        // nearly sorted and only an out-of-order group is sorted.
+        let mut starts = vec![0u32; self.values.len() + 1];
+        for &(value, _) in &uses {
+            starts[value as usize + 1] += 1;
         }
+        for index in 1..starts.len() {
+            starts[index] += starts[index - 1];
+        }
+        let mut grouped = vec![0u32; uses.len()];
+        let mut fill = starts.clone();
+        for &(value, at) in &uses {
+            grouped[fill[value as usize] as usize] = at;
+            fill[value as usize] += 1;
+        }
+        let mut positions = Vec::with_capacity(uses.len());
+        for value in 0..self.values.len() {
+            let group = &mut grouped[starts[value] as usize..starts[value + 1] as usize];
+            if group.is_empty() {
+                continue;
+            }
+            if !group.is_sorted() {
+                group.sort_unstable();
+            }
+            let first = positions.len();
+            for &at in group.iter() {
+                if positions.len() == first || positions.last() != Some(&at) {
+                    positions.push(at);
+                }
+            }
+            let state = &mut self.values[value];
+            state.first_use = first as u32;
+            state.use_count = (positions.len() - first) as u32;
+        }
+        self.positions = positions;
         // A value used inside a loop but defined before it stays live until
         // every back edge of the loop.
         let mut loops = Vec::new();
@@ -594,8 +667,10 @@ impl<'g> Allocator<'g> {
         })
     }
 
+    /// Whether `value` is read after `at`: some next use exists exactly
+    /// when its last use, loop extension included, lies past `at`.
     fn is_live_after(&self, value: NodeId, at: u32) -> bool {
-        self.next_use_after(value, at).is_some()
+        self.last_use(value) > at
     }
 
     // ------------------------------------------------------------------
@@ -683,36 +758,14 @@ impl<'g> Allocator<'g> {
         if let Some(&slot) = self.out.spill.get(&value) {
             return slot;
         }
-        assert!(
-            !self.planned,
-            "every spill home is planned before final allocation"
-        );
-        // The slot is written at the definition, so a released slot is
-        // reusable only when its last value died before this one exists.
-        let defined = match self.pos(value) {
-            NO_POSITION => 0,
-            at => at,
-        };
-        let take = |free: &mut Vec<(u32, u32)>| {
-            let index = free.iter().position(|&(_, died)| died < defined)?;
-            Some(free.swap_remove(index).0)
-        };
+        // A provisional home named by the value itself; homes are colored
+        // once the walk has discovered them all (see `place_homes`).
         let slot = if self.graph.node(value).repr == Repr::Tagged {
-            let index = take(&mut self.free_tagged).unwrap_or_else(|| {
-                self.out.tagged_slots += 1;
-                self.out.tagged_slots - 1
-            });
-            Location::TaggedSlot(index)
+            Location::TaggedSlot(value.0)
         } else {
-            let index = take(&mut self.free_untagged).unwrap_or_else(|| {
-                self.out.untagged_slots += 1;
-                self.out.untagged_slots - 1
-            });
-            Location::UntaggedSlot(index)
+            Location::UntaggedSlot(value.0)
         };
         self.out.spill.insert(value, slot);
-        self.expiries
-            .push(std::cmp::Reverse((self.last_use(value), value.0)));
         slot
     }
 
@@ -861,19 +914,6 @@ impl<'g> Allocator<'g> {
                 if !self.is_live_after(value, at) {
                     self.unbind(float, register);
                 }
-            }
-        }
-        while let Some(&std::cmp::Reverse((last, value))) = self.expiries.peek() {
-            if last > at {
-                break;
-            }
-            self.expiries.pop();
-            let slot = self.out.spill[&NodeId(value)];
-            // A slot lives as long as its value, then is recycled.
-            match slot {
-                Location::TaggedSlot(index) => self.free_tagged.push((index, at)),
-                Location::UntaggedSlot(index) => self.free_untagged.push((index, at)),
-                _ => {}
             }
         }
     }
@@ -1099,11 +1139,7 @@ impl<'g> Allocator<'g> {
         self.out.nodes[node.0 as usize].fp_temps = fp_temps;
         // Inputs whose last use is this node die before the result unless an
         // eager deopt of this node still reads them.
-        let eager_values: SmallVec<[NodeId; 8]> = data
-            .eager
-            .iter()
-            .flat_map(|&state| graph.state_values(state))
-            .collect();
+        let eager_values: &[NodeId] = data.eager.map_or(&[], |state| self.states.of(state));
         for &input in &data.inputs {
             if !self.is_live_after(input, at) && !eager_values.contains(&input) {
                 let float = self.is_float(input);
@@ -1204,7 +1240,7 @@ impl<'g> Allocator<'g> {
             .eager
             .iter()
             .chain(current.lazy.iter())
-            .flat_map(|&state| self.graph.state_values(state))
+            .flat_map(|&state| self.states.of(state).iter().copied())
             .collect();
         for value in state_values {
             if value != self.current && !self.graph.node(value).kind.is_constant() {
@@ -1258,10 +1294,7 @@ impl<'g> Allocator<'g> {
             }
         }
         // A poll preserves its exit state as well as values read by the edge.
-        let eager_values = data
-            .eager
-            .map(|state| graph.state_values(state))
-            .unwrap_or_default();
+        let eager_values: &[NodeId] = data.eager.map_or(&[], |state| self.states.of(state));
         let mut occupied = SmallVec::new();
         for (float, file) in [(false, &self.gp), (true, &self.fp)] {
             for register in file.held() {
@@ -1379,7 +1412,7 @@ impl<'g> Allocator<'g> {
     ) -> (Vec<Location>, Vec<Move>) {
         let mut locations = Vec::new();
         let mut spills = Vec::new();
-        for value in self.graph.state_values(state) {
+        for &value in self.states.of(state) {
             let from = self
                 .location_of(value)
                 .or(self.out.nodes[value.0 as usize].result)
@@ -1397,16 +1430,12 @@ impl<'g> Allocator<'g> {
         (locations, spills)
     }
 
-    /// Color the discovered homes by their complete live intervals. The
-    /// final walk can activate a home at any use without changing its
-    /// location or the frame's tagged/untagged boundary.
-    fn plan_homes(&self) -> Allocation {
+    /// Color the discovered homes by their complete live intervals: a home
+    /// holds its value over every use, so any use may read or write it, and
+    /// tagged and untagged homes keep separate regions.
+    fn plan_homes(&self) -> PlannedHomes {
         let bundles = self.home_bundles();
-        let mut out = Allocation {
-            nodes: vec![NodeAllocation::default(); self.graph.nodes.len()],
-            definition_spills: self.out.definition_spills.clone(),
-            ..Allocation::default()
-        };
+        let mut out = PlannedHomes::default();
         let mut tagged: std::collections::BinaryHeap<std::cmp::Reverse<(u32, u32)>> =
             std::collections::BinaryHeap::new();
         let mut untagged: std::collections::BinaryHeap<std::cmp::Reverse<(u32, u32)>> =
@@ -1442,10 +1471,51 @@ impl<'g> Allocator<'g> {
                 Location::UntaggedSlot(slot)
             };
             for value in bundle.values {
-                out.spill.insert(value, home);
+                out.homes.insert(value, home);
             }
         }
         out
+    }
+
+    /// Replace every provisional home the walk named with its colored slot
+    /// and drop the moves that renaming makes empty: a phi and an input
+    /// bundled into one home move nothing between them.
+    fn place_homes(&mut self, planned: PlannedHomes) {
+        let place = |location: &mut Location| {
+            if let Location::TaggedSlot(value) | Location::UntaggedSlot(value) = *location {
+                *location = planned.homes[&NodeId(value)];
+            }
+        };
+        let place_moves = |moves: &mut Vec<Move>| {
+            for each in moves.iter_mut() {
+                place(&mut each.from);
+                place(&mut each.to);
+            }
+            moves.retain(|each| each.from != each.to);
+        };
+        for node in &mut self.out.nodes {
+            place_moves(&mut node.moves);
+            node.inputs.iter_mut().for_each(place);
+            if let Some(result) = &mut node.result {
+                place(result);
+            }
+            node.eager.iter_mut().for_each(place);
+            node.lazy.iter_mut().for_each(place);
+            place_moves(&mut node.eager_spills);
+            place_moves(&mut node.lazy_spills);
+            for (_, home) in &mut node.live_homes {
+                place(home);
+            }
+        }
+        for edge in self.out.edges.values_mut() {
+            place_moves(&mut edge.moves);
+            for (_, location) in &mut edge.phi_inputs {
+                place(location);
+            }
+        }
+        self.out.spill = planned.homes;
+        self.out.tagged_slots = planned.tagged_slots;
+        self.out.untagged_slots = planned.untagged_slots;
     }
 
     /// The values that share one home, in order of their first definition.
@@ -1455,7 +1525,7 @@ impl<'g> Allocator<'g> {
     /// moves nothing between homes. A bundle's slot is held over its whole
     /// hull, which for a loop phi and its back-edge input is the loop.
     fn home_bundles(&self) -> Vec<HomeBundle> {
-        let mut values: Vec<NodeId> = self.out.spill.keys().copied().collect();
+        let mut values: Vec<NodeId> = self.out.spill.iter().map(|(value, _)| value).collect();
         values.sort_unstable_by_key(|&value| (self.pos(value), value));
         let index: FxHashMap<NodeId, usize> = values
             .iter()

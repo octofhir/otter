@@ -519,6 +519,7 @@ fn symbolic_target(target: &RelocationTarget) -> String {
         RelocationTarget::SourceWorkCell { function_id } => {
             format!("sourceWorkCell(function={function_id})")
         }
+        RelocationTarget::BackedgeFuelCell => "backedgeFuelCell".to_string(),
     }
 }
 

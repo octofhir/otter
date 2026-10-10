@@ -99,7 +99,7 @@ use crate::{
         ALLOC_CTX_SPILL_SLOTS_OFFSET, ALLOC_CTX_STACK_SIZE, ALLOC_CTX_THREAD_OFFSET,
         NATIVE_FRAME_PC_OFFSET, NATIVE_FRAME_SELF_OFFSET, NATIVE_FRAME_THIS_OFFSET,
         OBJECT_BODY_TYPE_TAG, THREAD_OFFSET, VALUE_FALSE, VALUE_HOLE, VALUE_NULL, VALUE_TRUE,
-        VALUE_UNDEFINED, VM_THREAD_BACKEDGE_FUEL_CELL_OFFSET, VM_THREAD_GC_HEAP_OFFSET,
+        VALUE_UNDEFINED, VM_THREAD_GC_HEAP_OFFSET,
     },
     frame::{ActivationExits, CallEntryCold, SpillArea},
     x86_64::{
@@ -575,6 +575,7 @@ fn emit_side_exit(
 fn emit_backedge_poll(
     ops: &mut Assembler,
     relocations: &mut RelocationCapture,
+    fuel_cell: usize,
     poll_entry: u64,
     target: u32,
     relink: DynamicLabel,
@@ -583,11 +584,10 @@ fn emit_backedge_poll(
 ) {
     let slow = ops.new_dynamic_label();
     let done = ops.new_dynamic_label();
+    crate::x86_64::values::emit_load_backedge_fuel_cell(ops, relocations, 10, fuel_cell);
     dynasm!(ops
         ; .arch x64
         // An interrupt trip zeroes the countdown.
-        ; mov r11, [r15 + THREAD_OFFSET as i32]
-        ; mov r10, [r11 + VM_THREAD_BACKEDGE_FUEL_CELL_OFFSET as i32]
         ; sub QWORD [r10], 1
         ; jg =>done
         ; =>slow

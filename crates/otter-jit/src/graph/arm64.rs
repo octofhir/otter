@@ -63,7 +63,7 @@ use crate::Unsupported;
 use crate::artifact::relocation::{RelocationCapture, RelocationTarget};
 use crate::entry::{
     NATIVE_FRAME_SELF_OFFSET, NATIVE_FRAME_THIS_OFFSET, THREAD_OFFSET, VALUE_HOLE,
-    VM_THREAD_BACKEDGE_FUEL_CELL_OFFSET, VM_THREAD_GC_HEAP_OFFSET,
+    VM_THREAD_GC_HEAP_OFFSET,
     VM_THREAD_MARKING_FLAG_CELL_OFFSET,
 };
 use crate::template::arm64::values::{emit_load_symbol_u64, emit_load_u64};
@@ -699,6 +699,20 @@ impl<'a> Codegen<'a> {
     // ------------------------------------------------------------------
 
     /// A label that leaves through `node`'s eager deopt.
+    /// Whether `node`'s eager exits read general register `register`: a
+    /// frame-state location or the source of a cold home materialization.
+    /// The allocator gives a result the register of a dying input only when
+    /// no exit reads that input, so such a result can be written before the
+    /// node's checks.
+    fn exit_reads_gp(&self, node: NodeId, register: u8) -> bool {
+        let allocation = self.allocation.node(node);
+        allocation.eager.contains(&Location::Gp(register))
+            || allocation
+                .eager_spills
+                .iter()
+                .any(|movement| movement.from == Location::Gp(register))
+    }
+
     fn eager_exit(&mut self, node: NodeId, reason: DeoptReason) -> DynamicLabel {
         let (reason, action) = exit_reason(reason);
         self.typed_exit(node, reason, action)
@@ -987,10 +1001,9 @@ impl<'a> Codegen<'a> {
                 let operand = self.int32_operand(input(1));
                 let destination = Self::gp(result.expect("a result"));
                 let exit = self.eager_exit(node, DeoptReason::Overflow);
-                // The exit reads the inputs: the result goes straight to its
-                // register only when that is neither of them.
-                let direct = destination != a
-                    && !matches!(operand, Int32Operand::Register(b) if b == destination);
+                // The result goes straight to its register unless the exit
+                // still reads that register.
+                let direct = !self.exit_reads_gp(node, destination);
                 let target = if direct { destination } else { 16 };
                 let add = data.kind == Kind::Int32Add;
                 match operand {
@@ -1049,13 +1062,20 @@ impl<'a> Codegen<'a> {
                 let (a, b) = (Self::gp(input(0)), Self::gp(input(1)));
                 let destination = Self::gp(result.expect("a result"));
                 let overflow = self.eager_exit(node, DeoptReason::Overflow);
+                let target = if self.exit_reads_gp(node, destination) {
+                    16
+                } else {
+                    destination
+                };
                 dynasm!(self.ops
                     ; .arch aarch64
-                    ; smull x16, W(a), W(b)
-                    ; cmp x16, w16, sxtw
+                    ; smull X(target), W(a), W(b)
+                    ; cmp XSP(target), W(target), sxtw
                     ; b.ne =>overflow
-                    ; mov W(destination), w16
                 );
+                if target != destination {
+                    dynasm!(self.ops ; .arch aarch64 ; mov W(destination), w16);
+                }
             }
             Kind::Int32Div => {
                 let (a, b) = (Self::gp(input(0)), Self::gp(input(1)));
@@ -1341,12 +1361,13 @@ impl<'a> Codegen<'a> {
                     // FJCVTZS sets Z exactly for an int32 that is not -0:
                     // one test on the hot path, the exit's reason out of line.
                     let inexact = self.ops.new_dynamic_label();
-                    crate::arm64::emit_fjcvtzs(&mut self.ops, a, 16);
-                    dynasm!(self.ops
-                        ; .arch aarch64
-                        ; b.ne =>inexact
-                        ; mov W(destination), w16
-                    );
+                    // The inexact path recomputes from the input alone.
+                    let direct = !self.exit_reads_gp(node, destination);
+                    crate::arm64::emit_fjcvtzs(&mut self.ops, a, if direct { destination } else { 16 });
+                    dynasm!(self.ops ; .arch aarch64 ; b.ne =>inexact);
+                    if !direct {
+                        dynasm!(self.ops ; .arch aarch64 ; mov W(destination), w16);
+                    }
                     self.deferred
                         .push(Box::new(move |codegen: &mut Codegen<'a>| {
                             dynasm!(codegen.ops
@@ -4626,11 +4647,15 @@ impl<'a> Codegen<'a> {
     fn emit_backedge_poll(&mut self, control: NodeId) -> Result<(), Unsupported> {
         let slow = self.ops.new_dynamic_label();
         let resume = self.ops.new_dynamic_label();
+        crate::arm64::emit_load_backedge_fuel_cell(
+            &mut self.ops,
+            &mut self.relocations,
+            16,
+            self.view.backedge_fuel_cell,
+        );
         dynasm!(self.ops
             ; .arch aarch64
             // An interrupt trip zeroes the countdown.
-            ; ldr x16, [x20, THREAD_OFFSET]
-            ; ldr x16, [x16, VM_THREAD_BACKEDGE_FUEL_CELL_OFFSET]
             ; ldr x17, [x16]
             ; subs x17, x17, #1
             ; str x17, [x16]

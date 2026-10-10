@@ -306,6 +306,10 @@ struct Allocator<'g> {
     liveness: super::liveness::Liveness,
     /// Final homes are immutable during the second allocation walk.
     planned: bool,
+    /// Values a loop's back edge feeds into a header phi, with that phi: the
+    /// value prefers the phi's register, so the edge needs no move (V8's
+    /// register hints for phi inputs).
+    phi_hints: FxHashMap<NodeId, NodeId>,
 }
 
 const NO_POSITION: u32 = u32::MAX;
@@ -347,6 +351,7 @@ pub(crate) fn allocate(
         current: NodeId(0),
         liveness: super::liveness::Liveness::compute(graph, layout),
         planned: false,
+        phi_hints: FxHashMap::default(),
     };
     allocator.number();
     allocator.collect_uses();
@@ -440,6 +445,13 @@ impl<'g> Allocator<'g> {
             self.block_start[block.0 as usize] = next;
             for &phi in &data.phis {
                 self.position[phi.0 as usize] = next;
+                // A loop header's last predecessor is its back edge.
+                if data.is_loop
+                    && let Some(&input) = self.graph.node(phi).inputs.last()
+                    && input != phi
+                {
+                    self.phi_hints.entry(input).or_insert(phi);
+                }
             }
             next += 1;
             for &node in &data.body {
@@ -722,6 +734,21 @@ impl<'g> Allocator<'g> {
     }
 
     /// A free unblocked register, evicting the value used furthest away.
+    /// The register of the loop phi `value` feeds on its back edge, when
+    /// that register is free here: the phi's own value is dead, so the
+    /// edge carries `value` in place.
+    fn phi_hint(&self, value: NodeId, float: bool) -> Option<u8> {
+        let phi = *self.phi_hints.get(&value)?;
+        let register = match self.out.nodes[phi.0 as usize].result? {
+            Location::Gp(register) if !float => register,
+            Location::Fp(register) if float => register,
+            _ => return None,
+        };
+        let file = if float { &self.fp } else { &self.gp };
+        (file.allocatable & !file.occupied & !file.blocked & (1 << register) != 0)
+            .then_some(register)
+    }
+
     fn take_register(&mut self, float: bool) -> u8 {
         if let Some(register) = self.file(float).free_unblocked().next() {
             return register;
@@ -1130,7 +1157,9 @@ impl<'g> Allocator<'g> {
                     self.evict(false, register);
                     register
                 }
-                ResultPolicy::Register | ResultPolicy::None => self.take_register(float),
+                ResultPolicy::Register | ResultPolicy::None => self
+                    .phi_hint(node, float)
+                    .unwrap_or_else(|| self.take_register(float)),
             };
             if self.values[node.0 as usize].is_used() {
                 self.bind(node, register);

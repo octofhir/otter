@@ -102,7 +102,7 @@ use crate::artifact::{
 use crate::entry::{
     CANONICAL_NAN_HI16, DOUBLE_OFFSET_HI16, NATIVE_FRAME_PC_OFFSET, NATIVE_FRAME_SELF_OFFSET,
     NATIVE_FRAME_THIS_OFFSET, NUMBER_TAG_HI16, THREAD_OFFSET, Unsupported, VALUE_FALSE, VALUE_HOLE,
-    VALUE_NULL, VALUE_TRUE, VALUE_UNDEFINED, VM_THREAD_BACKEDGE_FUEL_CELL_OFFSET,
+    VALUE_NULL, VALUE_TRUE, VALUE_UNDEFINED,
     VM_THREAD_GC_HEAP_OFFSET, reg_offset,
 };
 use otter_vm::native_abi as abi;
@@ -929,6 +929,7 @@ pub(crate) fn emit_operation<'a>(
                 emit_backedge_poll(
                     ops,
                     relocations,
+                    view.backedge_fuel_cell,
                     poll_entry,
                     target,
                     backedge_relink_exit,
@@ -962,6 +963,7 @@ pub(crate) fn emit_operation<'a>(
                 emit_backedge_poll(
                     ops,
                     relocations,
+                    view.backedge_fuel_cell,
                     poll_entry,
                     target,
                     backedge_relink_exit,
@@ -1004,6 +1006,7 @@ pub(crate) fn emit_operation<'a>(
                 emit_backedge_poll(
                     ops,
                     relocations,
+                    view.backedge_fuel_cell,
                     poll_entry,
                     target,
                     backedge_relink_exit,
@@ -2349,6 +2352,7 @@ fn emit_truthiness_bool(
 fn emit_backedge_poll(
     ops: &mut Assembler,
     relocations: &mut RelocationCapture,
+    fuel_cell: usize,
     poll_entry: u64,
     target: u32,
     relink: DynamicLabel,
@@ -2357,11 +2361,10 @@ fn emit_backedge_poll(
 ) {
     let slow = ops.new_dynamic_label();
     let cont = ops.new_dynamic_label();
+    crate::arm64::emit_load_backedge_fuel_cell(ops, relocations, 9, fuel_cell);
     dynasm!(ops
         ; .arch aarch64
         // An interrupt trip zeroes the countdown.
-        ; ldr x17, [x20, THREAD_OFFSET]
-        ; ldr x9, [x17, VM_THREAD_BACKEDGE_FUEL_CELL_OFFSET]
         ; ldr x10, [x9]
         ; subs x10, x10, #1
         ; str x10, [x9]

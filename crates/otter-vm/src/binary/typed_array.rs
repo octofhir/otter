@@ -468,8 +468,10 @@ pub struct TypedArrayBodyGc {
     pub byte_offset: usize,
     /// Element count at construction time.
     pub length: usize,
-    /// Lazy expando bag for non-canonical-numeric own properties.
-    pub expando: Option<crate::object::JsObject>,
+    /// Lazy expando bag for non-canonical-numeric own properties; the null
+    /// handle until the first one is created, so generated code proves its
+    /// absence by reading one zero word.
+    pub expando: crate::object::JsObject,
     /// §10.1.2 [[SetPrototypeOf]] override — `None` means the
     /// per-kind `%TypedArray%.prototype` chain applies.
     pub custom_proto: Option<crate::Value>,
@@ -513,6 +515,10 @@ pub const TYPED_ARRAY_BODY_BYTE_OFFSET_OFFSET: usize =
 /// Byte offset of [`TypedArrayBodyGc::length`] (element count) from the
 /// body start. The JIT bounds-checks the index against this.
 pub const TYPED_ARRAY_BODY_LENGTH_OFFSET: usize = std::mem::offset_of!(TypedArrayBodyGc, length);
+/// Byte offset of [`TypedArrayBodyGc::expando`] from the body start: a
+/// 4-byte compressed handle that reads zero exactly while the view owns no
+/// named property.
+pub const TYPED_ARRAY_BODY_EXPANDO_OFFSET: usize = std::mem::offset_of!(TypedArrayBodyGc, expando);
 /// Byte offset of [`TypedArrayBodyGc::length_tracking`] from the body
 /// start. The JIT bails inline access when this flag is set (the cached
 /// `length` is then stale and the live byte length must be recomputed).
@@ -526,10 +532,8 @@ impl otter_gc::SafeTraceable for TypedArrayBodyGc {
         // Forward to the buffer's GC handle so the backing ArrayBuffer
         // body survives the cycle.
         self.buffer.trace_value_slots(visitor);
-        if let Some(expando) = &mut self.expando
-            && !expando.is_null()
-        {
-            let p = expando as *mut crate::object::JsObject as *mut otter_gc::raw::RawGc;
+        if !self.expando.is_null() {
+            let p = &mut self.expando as *mut crate::object::JsObject as *mut otter_gc::raw::RawGc;
             visitor(p);
         }
         if let Some(proto) = &self.custom_proto {
@@ -574,7 +578,7 @@ pub fn alloc_typed_array(
         byte_offset,
         length,
         length_tracking: false,
-        expando: None,
+        expando: crate::object::JsObject::null(),
         custom_proto: None,
         data: std::cell::Cell::new(data),
     })
@@ -643,7 +647,9 @@ impl JsTypedArray {
     /// Read the lazy expando bag, if one has been created.
     #[must_use]
     pub fn expando(self, heap: &otter_gc::GcHeap) -> Option<crate::object::JsObject> {
-        heap.read_payload(self.handle, |body| body.expando)
+        heap.read_payload(self.handle, |body| {
+            (!body.expando.is_null()).then_some(body.expando)
+        })
     }
 
     /// §10.1.2 — custom [[Prototype]] override, if one was set.
@@ -661,7 +667,7 @@ impl JsTypedArray {
     /// Install / replace the lazy expando bag.
     pub fn set_expando(self, heap: &mut otter_gc::GcHeap, expando: crate::object::JsObject) {
         let barrier = crate::Value::object(expando);
-        heap.with_payload(self.handle, |body| body.expando = Some(expando));
+        heap.with_payload(self.handle, |body| body.expando = expando);
         heap.record_write(self.handle, &barrier);
     }
 

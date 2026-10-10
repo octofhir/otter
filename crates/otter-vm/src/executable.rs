@@ -371,6 +371,7 @@ impl CodeBlock {
             // all-zero default is never read because the emitter gates inline
             // element access on `cage_base != 0`.
             array_layout: crate::jit::JitArrayLayout::default(),
+            typed_array_length: crate::jit::JitTypedArrayLengthLayout::default(),
             element_accesses: rustc_hash::FxHashMap::default(),
             array_iteration: None,
             unseen_element_sites: rustc_hash::FxHashSet::default(),

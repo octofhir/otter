@@ -19,9 +19,12 @@
 //! - Keyed load and store: V8's `KeyedLoadIC_Megamorphic` /
 //!   `KeyedStoreIC_Megamorphic` name case. A string key probes the shared
 //!   action table under its atom, recorded in the string or found by the
-//!   interning leaf (`TryInternalizeString`) and then recorded; any other
-//!   key, or a table miss, returns to the element site, which completes
-//!   through its committed element runtime (which records the table entry).
+//!   interning leaf (`TryInternalizeString`) and then recorded. A load the
+//!   table misses on a dictionary-mode receiver, which the table never
+//!   holds, runs the generic own-data walk leaf (`GenericPropertyLoad`); any
+//!   other key, a shaped receiver's or a store's table miss, or a walk the
+//!   leaf cannot finish returns to the element site, which completes through
+//!   its committed element runtime (which records the table entry).
 //!
 //! # Invariants
 //! - Inputs arrive in the System V argument registers the miss passes on:
@@ -204,8 +207,10 @@ fn emit_key_atom(
     );
 }
 
-/// `rdx == 0` with the value in `rax`, else `rdx == 1` and nothing observed.
-/// Nothing allocates; the only call is the interning leaf.
+/// `rdx == 0` with the value in `rax`, else `rdx != 0` and nothing observed.
+/// Nothing allocates; the only calls are the interning leaf and, for a
+/// dictionary-mode receiver the table does not hold, the generic own-data
+/// walk.
 fn emit_keyed_load(
     ops: &mut Assembler,
     relocations: &mut RelocationCapture,
@@ -214,6 +219,7 @@ fn emit_keyed_load(
 ) {
     let loaded = ops.new_dynamic_label();
     let miss = ops.new_dynamic_label();
+    let generic = ops.new_dynamic_label();
     dynasm!(ops ; .arch x64 ; =>label);
     // Entered by `call`: `rsp` is eight bytes past alignment.
     emit_key_atom(ops, relocations, view, KEYED_LOAD_KEY, 9, false, miss);
@@ -228,13 +234,32 @@ fn emit_keyed_load(
         None,
         [1, 7, 8, 0],
         Some(0),
-        miss,
+        generic,
         loaded,
         loaded,
     );
+    // `KeyedLoadIC_Megamorphic` falling back to `GenericPropertyLoad`: the
+    // leaf's pair is the routine's result. The receiver is already `rsi`.
+    const _: () = assert!(KEYED_LOAD_RECEIVER == 6);
     dynasm!(ops ; .arch x64
         ; =>loaded
         ; xor edx, edx
+        ; ret
+        ; =>generic
+        ; mov rdx, Rq(KEYED_LOAD_KEY)
+        ; mov rdi, [r15 + crate::entry::THREAD_OFFSET as i32]
+        ; mov rdi, [rdi + crate::entry::VM_THREAD_GC_HEAP_OFFSET as i32]
+        ; sub rsp, 8
+    );
+    emit_load_runtime_stub(
+        ops,
+        relocations,
+        otter_vm::runtime_stubs::KEYED_NAMED_LOAD_LEAF.entry_addr() as u64,
+        abi::STUB_KEYED_NAMED_LOAD_LEAF,
+    );
+    emit_runtime_call(ops, abi::STUB_KEYED_NAMED_LOAD_LEAF);
+    dynasm!(ops ; .arch x64
+        ; add rsp, 8
         ; ret
         ; =>miss
         ; mov edx, 1

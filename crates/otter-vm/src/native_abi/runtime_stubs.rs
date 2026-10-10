@@ -1781,6 +1781,7 @@ pub const fn runtime_stub_name(id: super::RuntimeStubId) -> &'static str {
         99 => "bigint_binary_alloc",
         100 => "instanceof_leaf",
         101 => "string_key_atom_leaf",
+        102 => "keyed_named_load_leaf",
         _ => "unknown_runtime_stub",
     }
 }
@@ -1913,6 +1914,23 @@ pub const STUB_STRING_KEY_ATOM_LEAF: RuntimeStubDescriptor = descriptor(
     NativeResultDomain::Probe,
 );
 
+/// Leaf keyed `[[Get]]` of an interned string key on a dictionary-mode
+/// object that own data answers along its prototype chain (V8's
+/// `GenericPropertyLoad` behind `KeyedLoadIC_Megamorphic`): `(heap,
+/// receiver, key)`, the key carrying its recorded atom. Never allocates; a
+/// shaped receiver, an accessor, an opaque object or an unrecorded key
+/// misses.
+pub const STUB_KEYED_NAMED_LOAD_LEAF: RuntimeStubDescriptor = descriptor(
+    102,
+    RuntimeStubClass::LeafNoAlloc,
+    RuntimeStubSignature::LeafValue2,
+    2,
+    RuntimeStubEffects::none(),
+    RuntimeStubException::Never,
+    RuntimeStubResultAbi::NativePair,
+    NativeResultDomain::Probe,
+);
+
 /// Dense inventory of every current machine-callable runtime-stub contract.
 pub const RUNTIME_STUB_DESCRIPTORS: &[RuntimeStubDescriptor] = &[
     STUB_JIT_BACKEDGE_POLL,
@@ -2016,6 +2034,7 @@ pub const RUNTIME_STUB_DESCRIPTORS: &[RuntimeStubDescriptor] = &[
     STUB_BIGINT_BINARY_ALLOC,
     STUB_INSTANCEOF_LEAF,
     STUB_STRING_KEY_ATOM_LEAF,
+    STUB_KEYED_NAMED_LOAD_LEAF,
 ];
 
 /// Validate a descriptor and one concrete call-site safepoint id.

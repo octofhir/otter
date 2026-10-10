@@ -1030,6 +1030,21 @@ pub(crate) fn lookup_atom_in_place(
     })
 }
 
+/// The interner's hash of the string's code units
+/// ([`crate::property_atom::spelling_hash`] of its spelling), read in place.
+/// `None` for a rope no read has flattened.
+#[must_use]
+pub(crate) fn spelling_hash_in_place(heap: &GcHeap, string: JsStringHandle) -> Option<u64> {
+    use crate::property_atom::NameUnits;
+    let (target, start, len) = contiguous_view(heap, string)?;
+    heap.read_payload(target, |body| {
+        Some(match flat_content_range(body, start, len)? {
+            FlatContent::Latin1(bytes) => NameUnits::Latin1(bytes).hash(),
+            FlatContent::Wide(units) => NameUnits::Utf16(units).hash(),
+        })
+    })
+}
+
 /// Whether the string's code units can be borrowed through a direct body or a
 /// collapsed slice view, without materialising a rope.
 #[must_use]

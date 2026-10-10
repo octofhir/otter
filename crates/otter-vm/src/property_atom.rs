@@ -117,8 +117,15 @@ fn hash_units(units: impl Iterator<Item = u16>) -> u64 {
     hash
 }
 
+/// The interner's hash of the code units `name` stands for: what a string of
+/// that content hashes to through [`NameUnits`].
+#[must_use]
+pub(crate) fn spelling_hash(name: &str) -> u64 {
+    NameInterner::hash_str(name)
+}
+
 impl NameUnits<'_> {
-    fn hash(self) -> u64 {
+    pub(crate) fn hash(self) -> u64 {
         match self {
             Self::Latin1(bytes) => hash_units(bytes.iter().map(|&byte| u16::from(byte))),
             Self::Utf16(units) => hash_units(units.iter().copied()),

@@ -112,6 +112,7 @@ WeakMap w.c function
 WeakRef w.c function
 WeakSet w.c function
 Worker w.c function
+__otterTimerSetRef w.c function
 clearImmediate w.c function
 clearInterval w.c function
 clearTimeout w.c function

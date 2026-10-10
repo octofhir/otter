@@ -223,6 +223,17 @@ impl Codegen<'_> {
             let mut committed = false;
             for op in program.ops.iter() {
                 match *op {
+                    Op::LoadClosurePrototype { object: 0 } if value.is_none() => {
+                        crate::template::x86_64::emit_closure_prototype_load(
+                            &mut self.ops,
+                            view,
+                            receiver,
+                            destination.expect("named load result"),
+                            next,
+                        );
+                        dynasm!(self.ops ; .arch x64 ; jmp =>done);
+                        committed = true;
+                    }
                     Op::LoadIntrinsicPrototype { target, .. } if value.is_none() => self
                         .emit_intrinsic_prototype(
                             target,

@@ -6,6 +6,7 @@
 //!   dictionary-layout guard, for every name a primitive string cannot own.
 //! - Ordinary closure proofs (no bag, no prototype override, plain kind, the
 //!   compiling realm active) composed with `%Function.prototype%` slot guards.
+//! - A closure's own `prototype`, read from its rare record's slot.
 //!
 //! # Invariants
 //! - Only own data slots of pinned realm prototypes are captured.
@@ -54,6 +55,12 @@ impl Interpreter {
         .collect::<Vec<_>>();
         programs.extend(self.string_property_program(key));
         programs.extend(self.closure_property_program(key));
+        if key.name() == "prototype" {
+            // `F.prototype` — read directly from the closure's slot.
+            programs.push(JitCacheIrProgram {
+                ops: Box::new([JitCacheIrOp::LoadClosurePrototype { object: 0 }]),
+            });
+        }
         programs
     }
 

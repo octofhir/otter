@@ -159,7 +159,8 @@ pub(crate) fn own_data_store(
 /// The load programs of the site at `byte_pc`, when every one proves its
 /// receiver and reads one data slot through operations generated code runs:
 /// the receiver (operand 0) or its holder (operand 1) — a guarded prototype
-/// holder or a pinned intrinsic prototype — ending in one field read.
+/// holder or a pinned intrinsic prototype — ending in one field read, or a
+/// closure's own `prototype` slot.
 pub(crate) fn named_load_programs(
     view: &JitCompileSnapshot,
     byte_pc: u32,
@@ -169,6 +170,10 @@ pub(crate) fn named_load_programs(
         return None;
     }
     for program in programs {
+        // A closure's own `prototype` slot read stands alone.
+        if let [JitCacheIrOp::LoadClosurePrototype { object: 0 }] = *program.ops {
+            continue;
+        }
         let mut holder = false;
         let (last, guards) = program.ops.split_last()?;
         let JitCacheIrOp::LoadField { object, .. } = *last else {

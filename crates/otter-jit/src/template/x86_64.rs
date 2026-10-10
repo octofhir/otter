@@ -1641,11 +1641,45 @@ fn emit_store_property(
     Ok(())
 }
 
+/// Read a closure's own `prototype` from its rare record's slot into
+/// `Rq(destination)` (see [`otter_vm::JitCacheIrOp::LoadClosurePrototype`]).
+/// Misses on a non-closure, a closure without a rare record, and the hole the
+/// runtime replaces with the default object; `Rq(receiver)` survives a miss.
+/// Clobbers `r10` and `r11`.
+pub(crate) fn emit_closure_prototype_load(
+    ops: &mut Assembler,
+    view: &JitCompileSnapshot,
+    receiver: u8,
+    destination: u8,
+    miss: DynamicLabel,
+) {
+    let layout = view.closure_call_layout;
+    if view.cage_base == 0 || layout.rare_byte == 0 || layout.prototype_byte == 0 {
+        dynasm!(ops ; .arch x64 ; jmp =>miss);
+        return;
+    }
+    emit_load_u64(ops, 11, otter_vm::value::tag::NOT_CELL_MASK | 0x5);
+    dynasm!(ops ; .arch x64
+        ; test Rq(receiver), r11 ; jnz =>miss
+        ; test Rq(receiver), Rq(receiver) ; jz =>miss
+        ; cmp BYTE [Rq(receiver)], otter_vm::closure::JS_CLOSURE_BODY_TYPE_TAG as i8 ; jne =>miss
+        ; mov r10d, [Rq(receiver) + layout.rare_byte as i32]
+        ; test r10d, r10d ; jz =>miss);
+    emit_load_u64(ops, 11, 0xffff_ffff_0000_0000);
+    dynasm!(ops ; .arch x64
+        ; and r11, Rq(receiver) ; add r10, r11
+        ; mov r10, [r10 + layout.prototype_byte as i32]);
+    emit_load_u64(ops, 11, VALUE_HOLE);
+    dynasm!(ops ; .arch x64
+        ; cmp r10, r11 ; je =>miss
+        ; mov Rq(destination), r10);
+}
+
 /// Static intrinsic-prototype reads: a receiver of an intrinsic body type
 /// (primitive string, closure, collection) reading a data slot of its pinned
-/// realm prototype. These programs describe realm intrinsics, not site
-/// feedback; a miss falls through to the site's IC. A hit leaves the value in
-/// `rax` and jumps to `done`.
+/// realm prototype, or a closure's own `prototype` slot. These programs
+/// describe realm intrinsics, not site feedback; a miss falls through to the
+/// site's IC. A hit leaves the value in `rax` and jumps to `done`.
 fn emit_intrinsic_loads(
     ops: &mut Assembler,
     relocations: &mut RelocationCapture,
@@ -1659,6 +1693,13 @@ fn emit_intrinsic_loads(
         return;
     };
     for program in programs {
+        if let [Op::LoadClosurePrototype { object: 0 }] = *program.ops {
+            let next = ops.new_dynamic_label();
+            emit_load_reg(ops, 0, object);
+            emit_closure_prototype_load(ops, view, 0, 0, next);
+            dynasm!(ops ; .arch x64 ; jmp =>done ; =>next);
+            continue;
+        }
         let Some((
             Op::LoadIntrinsicPrototype {
                 object: 0,

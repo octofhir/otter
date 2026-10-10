@@ -1323,6 +1323,16 @@ pub enum JitCacheIrOp {
         /// Existing receiver/type/latch proof shared with native methods.
         target: JitIntrinsicPrototype,
     },
+    /// Read a closure's own `prototype` from its rare record's slot. A
+    /// non-hole slot is the property's value for every closure: only a kind
+    /// that owns `prototype` writes the slot, and such a kind keeps the
+    /// property nowhere else. A non-closure, a closure without a rare record,
+    /// or the hole (no default object allocated yet) misses. Terminal: the
+    /// slot value is the load's result.
+    LoadClosurePrototype {
+        /// CacheIR receiver operand to read.
+        object: u8,
+    },
     /// Prove that an object's direct prototype is null.
     GuardPrototypeNull {
         /// CacheIR object operand whose prototype link is guarded.

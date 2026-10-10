@@ -123,6 +123,7 @@ mod persistent_fields_tests;
 pub(crate) mod prototype_validity;
 pub(crate) mod shape_body;
 mod shape_cache;
+pub(crate) mod shape_keys;
 #[cfg(test)]
 mod shape_lookup_tests;
 mod shape_runtime;
@@ -2962,6 +2963,7 @@ pub fn register_gc_traceables(heap: &mut otter_gc::GcHeap) {
         AccessorCellBody,
         ObjectBody,
         shape_body::ShapeBody,
+        shape_keys::ShapeKeysBody,
         slot_slab::SlotSlabBody,
     }
 }
@@ -3985,6 +3987,35 @@ pub(crate) fn lookup_own_atom(
     lookup_own_atom_with(obj, heap, key, |shape, atom| {
         shape_body::shape_slot_of_atom(heap, shape, atom)
     })
+}
+
+/// Ordinary `[[Get]]` of an interned key that own data answers along the
+/// prototype chain (V8's `GenericPropertyLoad`): the first data property's
+/// value, or `undefined` past a `null` prototype. `None` for an accessor, an
+/// opaque lookup or a non-object prototype, which the full get owns. Reads
+/// only; never allocates.
+#[must_use]
+pub(crate) fn get_data_atom(
+    obj: JsObject,
+    heap: &otter_gc::GcHeap,
+    key: AtomizedPropertyKey<'_>,
+) -> Option<Value> {
+    let mut current = obj;
+    for _ in 0..PROTO_CHAIN_HARD_CAP {
+        if state(current, heap).is_opaque() {
+            return None;
+        }
+        match lookup_own_atom(current, heap, key).lookup {
+            PropertyLookup::Data { value, .. } => return Some(value),
+            PropertyLookup::Absent => {}
+            PropertyLookup::Accessor { .. } => return None,
+        }
+        match prototype_value(current, heap) {
+            None => return Some(Value::undefined()),
+            Some(prototype) => current = prototype.as_object()?,
+        }
+    }
+    None
 }
 
 /// [`lookup_own_atom`] resolving a shaped object's slot and attributes for

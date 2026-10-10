@@ -20,8 +20,11 @@
 //! - [`null_root`] selects the initial ordinary allocation root.
 //! - [`null_root_head`] / [`set_null_root`] own the cached capacity/state root
 //!   chain in one heap embedder slot, independent of allocation semantics.
-//! - [`shape_offset_of_atom`] / [`shape_offset_of_str`] / [`shape_keys_ordered`]
-//!   — parent-chain readers.
+//! - [`shape_offset_of_atom`] / [`shape_offset_of_str`] / [`shape_slot_of_atom`]
+//!   / [`shape_key_at_offset`] / [`shape_slot_attrs`] — slot lookups: the
+//!   lineage's flat key table ([`super::shape_keys`]) once a shape has
+//!   [`super::shape_keys::SHAPE_KEYS_MIN`] keys, the parent chain below.
+//! - [`shape_keys_ordered`] — parent-chain reader.
 //!
 //! # Invariants
 //! - `parent == Gc::null()` and `transition_key == Gc::null()` only for a
@@ -40,7 +43,9 @@
 //! - `property_count` is the number of string-keyed own slots represented by
 //!   the full parent chain.
 //! - Shape bodies have no interior mutability; all transition/cache mutation
-//!   belongs to interpreter-owned side tables.
+//!   belongs to interpreter-owned side tables. A shape names its key table at
+//!   allocation and never changes it; the table grows in place only past
+//!   every naming shape's key count (see [`super::shape_keys`]).
 //! - New null-prototype capacity/state roots prepend to one immutable chain.
 //!   Ordinary allocation always selects its initial ordinary root, so prototype,
 //!   non-extensible or provisional state never leaks from a cache head.
@@ -134,6 +139,11 @@ pub struct ShapeBody {
     /// an array of the enumerable string keys in own-key order, filled on
     /// first need and never changed; `undefined` until then.
     enum_cache: crate::Value,
+    /// The lineage's flat key table this shape reads its first
+    /// `property_count` entries of; null below
+    /// [`super::shape_keys::SHAPE_KEYS_MIN`] keys, where lookups walk the
+    /// chain.
+    keys: super::shape_keys::ShapeKeysHandle,
 }
 
 /// Identity word read by generated probes of the shared property lookup table.
@@ -186,6 +196,7 @@ impl ShapeBody {
             prototype_value,
             dictionary,
             enum_cache: crate::Value::undefined(),
+            keys: super::shape_keys::ShapeKeysHandle::null(),
         }
     }
 
@@ -197,6 +208,7 @@ impl ShapeBody {
         atom: AtomId,
         own_flags: PropertyFlags,
         own_is_accessor: bool,
+        keys: super::shape_keys::ShapeKeysHandle,
     ) -> Self {
         debug_assert!(
             parent_handle.offset().is_multiple_of(8),
@@ -236,6 +248,7 @@ impl ShapeBody {
             prototype_value: parent.prototype_value,
             dictionary: parent.dictionary,
             enum_cache: crate::Value::undefined(),
+            keys,
         }
     }
 
@@ -383,6 +396,9 @@ impl otter_gc::SafeTraceable for ShapeBody {
             visitor(p);
         }
         self.enum_cache.pelt_trace(visitor);
+        if !self.keys.is_null() {
+            visitor((&mut self.keys as *mut super::shape_keys::ShapeKeysHandle).cast::<RawGc>());
+        }
     }
 }
 
@@ -630,8 +646,26 @@ pub(crate) fn alloc_child_shape_body_with_roots(
     own_is_accessor: bool,
     external_visit: &mut RootSlotVisitor<'_>,
 ) -> Result<ShapeHandle, otter_gc::OutOfMemory> {
+    let mut key = key;
+    let keys = child_keys(
+        heap,
+        parent,
+        &mut key,
+        atom,
+        own_flags,
+        own_is_accessor,
+        external_visit,
+    )?;
     let body = heap.read_payload(parent, |parent_body| {
-        ShapeBody::child(parent, parent_body, key, atom, own_flags, own_is_accessor)
+        ShapeBody::child(
+            parent,
+            parent_body,
+            key,
+            atom,
+            own_flags,
+            own_is_accessor,
+            keys,
+        )
     });
     let child = heap.alloc_old_with_roots(body, external_visit)?;
     // The pending body was collector-rewritten during allocation. A local
@@ -639,6 +673,90 @@ pub(crate) fn alloc_child_shape_body_with_roots(
     let prototype = heap.read_payload(child, ShapeBody::prototype);
     remember_prototype(heap, child, prototype);
     Ok(child)
+}
+
+/// The key table a child of `parent` adding `key` names (see
+/// [`super::shape_keys::keys_for_child`]). `key` is rewritten in place when
+/// a new table's allocation collects. A key or chain spelling that is not
+/// read in place builds no table: its hash would be unknown.
+fn child_keys(
+    heap: &mut GcHeap,
+    parent: ShapeHandle,
+    key: &mut JsStringHandle,
+    atom: AtomId,
+    flags: PropertyFlags,
+    is_accessor: bool,
+    external_visit: &mut RootSlotVisitor<'_>,
+) -> Result<super::shape_keys::ShapeKeysHandle, otter_gc::OutOfMemory> {
+    use super::shape_keys::{KeyEntry, SHAPE_KEYS_MIN, ShapeKeysHandle, keys_for_child};
+    let (parent_keys, parent_count) =
+        heap.read_payload(parent, |body| (body.keys, body.property_count));
+    if parent_count + 1 < SHAPE_KEYS_MIN {
+        return Ok(ShapeKeysHandle::null());
+    }
+    let Some(hash) = crate::string::gc_body::spelling_hash_in_place(heap, *key) else {
+        return Ok(ShapeKeysHandle::null());
+    };
+    let Some(prefix) = chain_key_entries(heap, parent, parent_keys, parent_count) else {
+        return Ok(ShapeKeysHandle::null());
+    };
+    let entry = KeyEntry {
+        key: *key,
+        atom,
+        hash: hash as u32,
+        flags,
+        is_accessor,
+    };
+    let key_slot = key as *mut JsStringHandle;
+    let mut visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
+        external_visit(visitor);
+        // SAFETY: the caller's key outlives the allocation.
+        if unsafe { !(*key_slot).is_null() } {
+            visitor(key_slot.cast::<RawGc>());
+        }
+    };
+    keys_for_child(
+        heap,
+        parent_keys,
+        parent_count,
+        |_| prefix,
+        entry,
+        &mut visit,
+    )
+}
+
+/// The keys of `shape`'s `count` slots in slot order: the first entries of
+/// its table, or its chain walked. `None` when a chain key's spelling is not
+/// read in place.
+fn chain_key_entries(
+    heap: &GcHeap,
+    mut shape: ShapeHandle,
+    keys: super::shape_keys::ShapeKeysHandle,
+    count: u32,
+) -> Option<Vec<super::shape_keys::KeyEntry>> {
+    if !keys.is_null() {
+        return Some(heap.read_payload(keys, |table| {
+            (0..count).map(|slot| table.entry(slot)).collect()
+        }));
+    }
+    let mut entries = Vec::with_capacity(count as usize);
+    while !shape.is_null() {
+        let body = body_of(shape);
+        if !body.is_root() {
+            entries.push(super::shape_keys::KeyEntry {
+                key: body.transition_key,
+                atom: body.transition_atom,
+                hash: crate::string::gc_body::spelling_hash_in_place(heap, body.transition_key)?
+                    as u32,
+                flags: body.own_flags,
+                is_accessor: body.own_is_accessor,
+            });
+        }
+        shape = body.parent;
+    }
+    entries.reverse();
+    debug_assert_eq!(entries.len(), count as usize);
+    Some(entries)
 }
 
 /// Walk `shape`'s parent chain and return the slot for `key`.
@@ -693,6 +811,9 @@ pub(crate) fn shape_offset_of_atom(
     atom: AtomId,
 ) -> Option<u32> {
     debug_assert_ne!(atom, AtomId::NONE, "the root atom names no property");
+    if let Some((keys, count)) = keys_of(shape) {
+        return heap.read_payload(keys, |table| table.slot_of_atom(atom, count));
+    }
     while !shape.is_null() {
         let (parent, transition_atom, own_offset) = heap.read_payload(shape, |body| {
             (body.parent(), body.transition_atom(), body.own_offset())
@@ -706,6 +827,10 @@ pub(crate) fn shape_offset_of_atom(
 }
 
 pub(crate) fn shape_offset_of_str(heap: &GcHeap, mut shape: ShapeHandle, key: &str) -> Option<u32> {
+    if let Some((keys, count)) = keys_of(shape) {
+        let hash = crate::property_atom::spelling_hash(key) as u32;
+        return heap.read_payload(keys, |table| table.slot_of_str(heap, key, hash, count));
+    }
     while !shape.is_null() {
         let (parent, transition_key, own_offset) = heap.read_payload(shape, |body| {
             (body.parent(), body.transition_key(), body.own_offset())
@@ -816,6 +941,9 @@ pub(crate) fn shape_key_at_offset(
     mut shape: ShapeHandle,
     offset: u32,
 ) -> Option<JsStringHandle> {
+    if let Some((keys, count)) = keys_of(shape) {
+        return (offset < count).then(|| heap.read_payload(keys, |table| table.entry(offset).key));
+    }
     while !shape.is_null() {
         let (parent, transition_key, own_offset, is_root) = heap.read_payload(shape, |body| {
             (
@@ -846,6 +974,14 @@ pub(crate) fn shape_slot_attrs(
     mut shape: ShapeHandle,
     offset: u32,
 ) -> Option<(PropertyFlags, bool)> {
+    if let Some((keys, count)) = keys_of(shape) {
+        return (offset < count).then(|| {
+            heap.read_payload(keys, |table| {
+                let entry = table.entry(offset);
+                (entry.flags, entry.is_accessor)
+            })
+        });
+    }
     while !shape.is_null() {
         let (parent, own_offset, own_flags, own_is_accessor, is_root) =
             heap.read_payload(shape, |body| {
@@ -875,6 +1011,17 @@ pub(crate) fn shape_slot_of_atom(
     atom: AtomId,
 ) -> Option<ShapeSlot> {
     debug_assert_ne!(atom, AtomId::NONE, "the root atom names no property");
+    if let Some((keys, count)) = keys_of(shape) {
+        return heap.read_payload(keys, |table| {
+            let offset = table.slot_of_atom(atom, count)?;
+            let entry = table.entry(offset);
+            Some(ShapeSlot {
+                offset,
+                flags: entry.flags,
+                is_accessor: entry.is_accessor,
+            })
+        });
+    }
     while !shape.is_null() {
         let (parent, slot) = heap.read_payload(shape, |body| {
             let slot = (body.transition_atom == atom).then(|| ShapeSlot {
@@ -937,6 +1084,16 @@ pub(crate) fn shape_keys_ordered(
     }
     reversed.reverse();
     reversed
+}
+
+/// A live, non-null `shape`'s key table and key count, or `None` when its
+/// lookups walk the chain.
+fn keys_of(shape: ShapeHandle) -> Option<(super::shape_keys::ShapeKeysHandle, u32)> {
+    if shape.is_null() {
+        return None;
+    }
+    let body = body_of(shape);
+    (!body.keys.is_null()).then_some((body.keys, body.property_count))
 }
 
 /// A live, non-null `shape`'s cached `for-in` keys, or `undefined`.

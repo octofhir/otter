@@ -40,14 +40,14 @@ use crate::native_abi::{
     STUB_COLLECTION_MAP_SET_ALLOC, STUB_COLLECTION_MAP_SET_MUTATING, STUB_COLLECTION_SET_ADD_ALLOC,
     STUB_COLLECTION_SET_DELETE_ALLOC, STUB_COLLECTION_SET_HAS_ALLOC, STUB_COLLECTION_SET_HAS_LEAF,
     STUB_COPY_CONTEXT_ALLOC, STUB_CREATE_CONTEXT_ALLOC, STUB_INSTANCEOF_LEAF,
-    STUB_JIT_MAKE_CLOSURE, STUB_JIT_MAKE_FN, STUB_MATH_ABS_LEAF, STUB_MATH_FLOOR_LEAF,
-    STUB_MATH_MAX_LEAF, STUB_MATH_MIN_LEAF, STUB_MATH_SQRT_LEAF, STUB_NUMBER_POW_F64_LEAF,
-    STUB_NUMBER_REM_F64_LEAF, STUB_NUMBER_REM_LEAF, STUB_NUMBER_TO_INT32_F64_LEAF,
-    STUB_PARSE_INT_I32_LEAF, STUB_STRICT_EQ_LEAF, STUB_STRING_CHAR_CODE_AT_LEAF,
-    STUB_STRING_CODE_POINT_AT_LEAF, STUB_STRING_CONCAT_ALLOC, STUB_STRING_ENDS_WITH_LEAF,
-    STUB_STRING_INCLUDES_LEAF, STUB_STRING_INDEX_OF_LEAF, STUB_STRING_KEY_ATOM_LEAF,
-    STUB_STRING_STARTS_WITH_LEAF, STUB_TO_BOOLEAN_LEAF, STUB_TYPEOF_TEST_LEAF, SafepointId,
-    SafepointRecord, validate_stub_descriptor,
+    STUB_JIT_MAKE_CLOSURE, STUB_JIT_MAKE_FN, STUB_KEYED_NAMED_LOAD_LEAF, STUB_MATH_ABS_LEAF,
+    STUB_MATH_FLOOR_LEAF, STUB_MATH_MAX_LEAF, STUB_MATH_MIN_LEAF, STUB_MATH_SQRT_LEAF,
+    STUB_NUMBER_POW_F64_LEAF, STUB_NUMBER_REM_F64_LEAF, STUB_NUMBER_REM_LEAF,
+    STUB_NUMBER_TO_INT32_F64_LEAF, STUB_PARSE_INT_I32_LEAF, STUB_STRICT_EQ_LEAF,
+    STUB_STRING_CHAR_CODE_AT_LEAF, STUB_STRING_CODE_POINT_AT_LEAF, STUB_STRING_CONCAT_ALLOC,
+    STUB_STRING_ENDS_WITH_LEAF, STUB_STRING_INCLUDES_LEAF, STUB_STRING_INDEX_OF_LEAF,
+    STUB_STRING_KEY_ATOM_LEAF, STUB_STRING_STARTS_WITH_LEAF, STUB_TO_BOOLEAN_LEAF,
+    STUB_TYPEOF_TEST_LEAF, SafepointId, SafepointRecord, validate_stub_descriptor,
 };
 use crate::{Interpreter, Value, collections};
 use std::cell::UnsafeCell;
@@ -657,6 +657,12 @@ pub const STRING_KEY_ATOM_LEAF: LeafNoAllocStub2 = LeafNoAllocStub2 {
     entry: string_key_atom_leaf,
 };
 
+/// Callable ABI entry for the keyed named-property load probe.
+pub const KEYED_NAMED_LOAD_LEAF: LeafNoAllocStub2 = LeafNoAllocStub2 {
+    descriptor: STUB_KEYED_NAMED_LOAD_LEAF,
+    entry: keyed_named_load_leaf,
+};
+
 /// Callable ABI entry for the ToBoolean probe.
 pub const TO_BOOLEAN_LEAF: LeafNoAllocStub2 = LeafNoAllocStub2 {
     descriptor: STUB_TO_BOOLEAN_LEAF,
@@ -922,6 +928,7 @@ pub const fn leaf_no_alloc_stub2_by_id(id: RuntimeStubId) -> Option<LeafNoAllocS
         id if id == STUB_STRICT_EQ_LEAF.id => Some(STRICT_EQ_LEAF),
         id if id == STUB_INSTANCEOF_LEAF.id => Some(INSTANCEOF_LEAF),
         id if id == STUB_STRING_KEY_ATOM_LEAF.id => Some(STRING_KEY_ATOM_LEAF),
+        id if id == STUB_KEYED_NAMED_LOAD_LEAF.id => Some(KEYED_NAMED_LOAD_LEAF),
         id if id == STUB_TO_BOOLEAN_LEAF.id => Some(TO_BOOLEAN_LEAF),
         id if id == STUB_TYPEOF_TEST_LEAF.id => Some(TYPEOF_TEST_LEAF),
         id if id == STUB_NUMBER_REM_LEAF.id => Some(NUMBER_REM_LEAF),
@@ -1343,9 +1350,10 @@ fn create_context_alloc_inner(
                 // SAFETY: the typed call root provider keeps this current frame
                 // published. Allocation finished; this store cannot GC/reenter.
                 if let Some(frame) = unsafe { ctx.current_frame().as_mut() }
-                    && let Some(handle) = value.as_context() {
-                        frame.publish_derived_this_context(function_id, handle);
-                    }
+                    && let Some(handle) = value.as_context()
+                {
+                    frame.publish_derived_this_context(function_id, handle);
+                }
             }
             NativeResultPair::success(value)
         }
@@ -1501,6 +1509,54 @@ pub extern "C" fn string_key_atom_leaf(
         }
         _ => NativeResultPair::miss(),
     }
+}
+
+/// V8's `GenericPropertyLoad` dictionary case for a keyed load whose name
+/// key missed the shared property table: the data property of the
+/// dictionary-mode object `receiver_bits` or its prototype chain for the
+/// string `key_bits`, by the atom the key recorded and its ASCII spelling.
+/// The table never holds a dictionary-mode receiver, so the runtime's miss
+/// could record nothing either; a shaped receiver misses here and completes
+/// through that runtime, which fills the table. An unrecorded or non-ASCII
+/// key, an accessor, an opaque object or a non-object prototype misses;
+/// nothing allocates.
+#[must_use]
+pub extern "C" fn keyed_named_load_leaf(
+    heap: *const otter_gc::GcHeap,
+    receiver_bits: u64,
+    key_bits: u64,
+) -> NativeResultPair {
+    let _guard = LeafNoAllocGuard::new(heap);
+    let Some(heap) = heap_ref(heap) else {
+        return NativeResultPair::miss();
+    };
+    let (Some(object), Some(key)) = (
+        Value::from_abi_bits(receiver_bits).as_object(),
+        Value::from_abi_bits(key_bits).as_string(heap),
+    ) else {
+        return NativeResultPair::miss();
+    };
+    if !crate::object::is_dictionary(object, heap) {
+        return NativeResultPair::miss();
+    }
+    let Some(atom) = heap.read_payload(key.handle(), crate::string::JsStringBody::cached_atom)
+    else {
+        return NativeResultPair::miss();
+    };
+    crate::string::gc_body::with_latin1(heap, key.handle(), |bytes| {
+        if !bytes.is_ascii() {
+            return None;
+        }
+        // SAFETY: ASCII bytes are valid UTF-8.
+        let name = unsafe { std::str::from_utf8_unchecked(bytes) };
+        let key = crate::property_atom::AtomizedPropertyKey::new(
+            crate::property_atom::PropertyAtom::new(atom),
+            name,
+        );
+        crate::object::get_data_atom(object, heap, key)
+    })
+    .flatten()
+    .map_or_else(NativeResultPair::miss, NativeResultPair::success)
 }
 
 /// `typeof value === kind` (or its negation) for an `Op::TestTypeOf`

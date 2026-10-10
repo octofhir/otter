@@ -22,9 +22,12 @@
 //! - Keyed load and store: V8's `KeyedLoadIC_Megamorphic` /
 //!   `KeyedStoreIC_Megamorphic` name case. A string key probes the shared
 //!   action table under its atom, recorded in the string or found by the
-//!   interning leaf (`TryInternalizeString`) and then recorded; any other
-//!   key, or a table miss, returns to the element site, which completes
-//!   through its committed element runtime (which records the table entry).
+//!   interning leaf (`TryInternalizeString`) and then recorded. A load the
+//!   table misses on a dictionary-mode receiver, which the table never
+//!   holds, runs the generic own-data walk leaf (`GenericPropertyLoad`); any
+//!   other key, a shaped receiver's or a store's table miss, or a walk the
+//!   leaf cannot finish returns to the element site, which completes through
+//!   its committed element runtime (which records the table entry).
 //!
 //! # Invariants
 //! - A site passes its receiver (and value) boxed from the rooted window plus
@@ -202,8 +205,10 @@ fn emit_key_atom(
     );
 }
 
-/// `x1 == 0` with the value in `x0`, else `x1 == 1` and nothing observed.
-/// Nothing allocates; the only call is the interning leaf.
+/// `x1 == 0` with the value in `x0`, else `x1 != 0` and nothing observed.
+/// Nothing allocates; the only calls are the interning leaf and, for a
+/// dictionary-mode receiver the table does not hold, the generic own-data
+/// walk.
 fn emit_keyed_load(
     ops: &mut Assembler,
     relocations: &mut RelocationCapture,
@@ -211,6 +216,7 @@ fn emit_keyed_load(
     label: DynamicLabel,
 ) {
     let miss = ops.new_dynamic_label();
+    let generic = ops.new_dynamic_label();
     dynasm!(ops ; .arch aarch64 ; =>label);
     emit_key_atom(ops, relocations, view, KEYED_LOAD_KEY, 11, miss);
     property_actions::emit_load(
@@ -221,10 +227,31 @@ fn emit_keyed_load(
         KEYED_LOAD_RECEIVER,
         [13, 14, 15, 3],
         0,
-        miss,
+        generic,
     );
     dynasm!(ops ; .arch aarch64
         ; mov x1, xzr
+        ; ret
+        // A name the table does not hold: the generic own-data walk
+        // (`KeyedLoadIC_Megamorphic` falling back to `GenericPropertyLoad`),
+        // whose pair is the routine's result.
+        ; =>generic
+        ; str x30, [sp, #-16]!
+        ; mov x1, X(KEYED_LOAD_RECEIVER)
+        ; mov x2, X(KEYED_LOAD_KEY)
+        ; ldr x0, [x20, crate::entry::THREAD_OFFSET]
+        ; ldr x0, [x0, crate::entry::VM_THREAD_GC_HEAP_OFFSET]
+    );
+    emit_load_runtime_stub(
+        ops,
+        relocations,
+        16,
+        otter_vm::runtime_stubs::KEYED_NAMED_LOAD_LEAF.entry_addr() as u64,
+        abi::STUB_KEYED_NAMED_LOAD_LEAF,
+    );
+    dynasm!(ops ; .arch aarch64
+        ; blr x16
+        ; ldr x30, [sp], #16
         ; ret
         ; =>miss
         ; movz x1, 1

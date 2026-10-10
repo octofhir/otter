@@ -160,10 +160,21 @@ pub(crate) fn exec_without_result(
         regexp.set_last_index(heap, 0);
         return Ok(false);
     }
+    // Flatten a rope once so this and every later match of a `/g` loop read
+    // the subject in place at its stored width; a failure only costs speed.
+    let _ = text.flatten_in_place(scope.context().heap_mut());
+    let regexp = scope
+        .raw(receiver)
+        .as_regexp()
+        .expect("pristine receiver stays a RegExp");
+    let text = scope
+        .raw(input)
+        .as_string(scope.context().heap())
+        .expect("subject root stays a string");
     let step_limit = scope.context().regex_step_limit();
     let heap = scope.context().heap();
-    let execution = text.with_utf16(heap, |units| {
-        regexp.find_one_from_utf16(heap, units, start, step_limit)
+    let execution = text.with_code_units(heap, |units| {
+        regexp.find_one(heap, units, start, step_limit)
     });
     let matched = crate::regexp::finish_execution(scope.context(), execution)?;
     // Charging the work cannot run JavaScript but re-reads the roots anyway.
@@ -236,7 +247,12 @@ pub(crate) fn split(
             let step_limit = scope.context().regex_step_limit();
             let regexp = scope.raw(receiver).as_regexp().expect("pristine RegExp");
             let heap = scope.context().heap();
-            let execution = regexp.find_one_from_utf16(heap, &units, at, step_limit);
+            let execution = regexp.find_one(
+                heap,
+                crate::string::CodeUnits::Utf16(&units),
+                at,
+                step_limit,
+            );
             crate::regexp::finish_execution(scope.context(), execution)
         };
         if limit > 0 && size == 0 {
@@ -340,10 +356,43 @@ pub(crate) fn replace(
         let receiver = scope.value(receiver);
         let input = scope.value(input);
         let replacement = scope.value(replacement);
+        // Flatten a rope once so the search reads the subject in place at its
+        // stored width; a failure only costs speed.
+        let _ = scope
+            .raw(input)
+            .as_string(scope.context().heap())
+            .expect("replace subject is a string")
+            .flatten_in_place(scope.context().heap_mut());
         let regexp = scope.raw(receiver).as_regexp().expect("pristine RegExp");
+        let subject = scope
+            .raw(input)
+            .as_string(scope.context().heap())
+            .expect("replace subject is a string");
+        let flags = regexp.flags(scope.context().heap());
+        let step_limit = scope.context().regex_step_limit();
+        let heap = scope.context().heap();
+        if flags.global {
+            regexp.set_last_index(heap, 0);
+        }
+        let execution = subject.with_code_units(heap, |units| {
+            if flags.global {
+                regexp.find_all(heap, units, 0, step_limit)
+            } else {
+                let execution = regexp.find_one(heap, units, 0, step_limit);
+                crate::regexp::engine::Execution {
+                    result: execution.result.map(|found| found.into_iter().collect()),
+                    steps: execution.steps,
+                }
+            }
+        });
+        let matches = crate::regexp::finish_execution(scope.context(), execution)?;
+        // Without a match the result is S itself: strings are values, so
+        // returning the subject is indistinguishable from rebuilding it.
+        if matches.is_empty() {
+            return Ok(scope.finish(input));
+        }
         let subject = scope.raw(input);
         let heap = scope.context().heap();
-        let flags = regexp.flags(heap);
         let units = subject
             .as_string(heap)
             .expect("replace subject is a string")
@@ -355,18 +404,6 @@ pub(crate) fn replace(
                 .expect("replace template is a string")
                 .to_utf16_vec(scope.context().heap())
         });
-        let step_limit = scope.context().regex_step_limit();
-        let heap = scope.context().heap();
-        let matches = if flags.global {
-            regexp.set_last_index(heap, 0);
-            let execution = regexp.find_from_utf16(heap, &units, 0, step_limit);
-            crate::regexp::finish_execution(scope.context(), execution)?
-        } else {
-            let execution = regexp.find_one_from_utf16(heap, &units, 0, step_limit);
-            crate::regexp::finish_execution(scope.context(), execution)?
-                .into_iter()
-                .collect()
-        };
         if let Some(last) = matches.last() {
             let subject = scope.raw(input);
             scope.with_turn_parts(|interp, _| {

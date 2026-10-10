@@ -177,7 +177,10 @@ impl crate::Interpreter {
         let mut regexp_payloads: Vec<(Vec<u16>, String)> = Vec::new();
         self.gc_heap()
             .for_each_live_payload::<crate::regexp::JsRegExpBody, _>(|_space, body| {
-                regexp_payloads.push((body.pattern_utf16.clone(), body.source.clone()));
+                regexp_payloads.push((
+                    body.pattern.pattern_utf16.to_vec(),
+                    body.pattern.source.to_string(),
+                ));
             });
         let mut array_sidecar_with_content = false;
         let mut array_sidecar_flags: Vec<Vec<(String, bool, bool, bool)>> = Vec::new();

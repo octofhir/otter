@@ -993,6 +993,59 @@ pub fn with_utf16<R>(heap: &GcHeap, string: JsStringHandle, f: impl FnOnce(&[u16
     f(&units)
 }
 
+/// A string's code units borrowed at the width they are stored in.
+#[derive(Debug, Clone, Copy)]
+pub enum CodeUnits<'a> {
+    /// One byte per code unit; every unit is below `0x100`.
+    Latin1(&'a [u8]),
+    /// UTF-16 code units.
+    Utf16(&'a [u16]),
+}
+
+impl CodeUnits<'_> {
+    /// Number of code units.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        match self {
+            Self::Latin1(bytes) => bytes.len(),
+            Self::Utf16(units) => units.len(),
+        }
+    }
+
+    /// Whether there are no code units.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+/// Run `f` over the string's code units at their stored width.
+///
+/// A contiguous body — flat, a collapsed slice, or one with a filled widened
+/// cache — is borrowed in place, so a one-byte string is never widened; any
+/// other body is materialised as UTF-16 first. `f` must not allocate on the
+/// heap while holding the borrow.
+pub fn with_code_units<R>(
+    heap: &GcHeap,
+    string: JsStringHandle,
+    f: impl FnOnce(CodeUnits<'_>) -> R,
+) -> R {
+    let mut f = Some(f);
+    if let Some((target, start, len)) = contiguous_view(heap, string)
+        && let Some(result) = heap.read_payload(target, |b| {
+            let units = match flat_content_range(b, start, len)? {
+                FlatContent::Latin1(bytes) => CodeUnits::Latin1(bytes),
+                FlatContent::Wide(units) => CodeUnits::Utf16(units),
+            };
+            Some((f.take().expect("unused reader"))(units))
+        })
+    {
+        return result;
+    }
+    let units = materialize_utf16_vec(heap, string);
+    (f.take().expect("unused reader"))(CodeUnits::Utf16(&units))
+}
+
 /// Run `f` over a contiguous Latin-1 view, following one collapsed slice hop.
 ///
 /// Direct and sliced Latin-1 bodies therefore share the same allocation-free

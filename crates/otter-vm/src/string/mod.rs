@@ -59,7 +59,7 @@ pub mod statics;
 use otter_gc::{GcHeap, OutOfMemory};
 
 pub use gc_body::{
-    JS_STRING_BODY_TYPE_TAG, JsStringBody, JsStringBodyRepr, JsStringHandle,
+    CodeUnits, JS_STRING_BODY_TYPE_TAG, JsStringBody, JsStringBodyRepr, JsStringHandle,
     MAX_ROPE_DEPTH as GC_MAX_ROPE_DEPTH, StringConcatError, alloc_flat_string_body_with_roots,
     alloc_latin1_string_body_with_roots, concat_string_bodies, eq_str, equals_string_bodies,
     flatten_string_body, hash_latin1, hash_utf16, peek_string_hash, slice_string_body, string_hash,
@@ -559,6 +559,18 @@ impl JsString {
     /// holding the borrow.
     pub fn with_utf16<R>(self, heap: &GcHeap, f: impl FnOnce(&[u16]) -> R) -> R {
         gc_body::with_utf16(heap, self.handle, f)
+    }
+
+    /// Run `f` over the string's code units at their stored width (see
+    /// [`gc_body::with_code_units`]): a one-byte string is read as bytes
+    /// rather than widened. `f` must not allocate on the heap while holding
+    /// the borrow.
+    pub fn with_code_units<R>(
+        self,
+        heap: &GcHeap,
+        f: impl FnOnce(gc_body::CodeUnits<'_>) -> R,
+    ) -> R {
+        gc_body::with_code_units(heap, self.handle, f)
     }
 
     /// Fill this string's widened cache so later [`Self::with_utf16`] reads

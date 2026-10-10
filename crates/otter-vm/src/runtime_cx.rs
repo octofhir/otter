@@ -2028,6 +2028,15 @@ impl<'scope, 'rt> NativeScope<'scope, 'rt> {
         result.map_err(|error| self.vm_error(error, "NativeScope::array"))
     }
 
+    /// Allocate an array holding `elements` at their indices.
+    pub(crate) fn array_from(
+        &mut self,
+        elements: &[Local<'_>],
+    ) -> Result<Local<'scope>, NativeError> {
+        let result = self.ctx.cx.interp.scoped_array_from(self.token, elements);
+        result.map_err(|error| self.vm_error(error, "NativeScope::array_from"))
+    }
+
     /// `ArrayCreate`: an array of `len` holes holding `elements` at their
     /// indices, whose prototype is `prototype` unless that is the realm's
     /// `%Array.prototype%`. Every step re-reads the array from its handle, so
@@ -2059,12 +2068,11 @@ impl<'scope, 'rt> NativeScope<'scope, 'rt> {
                     .escape_scoped(array)
                     .as_array()
                     .expect("ArrayCreate made an array");
-                array::set_prototype_override(target, &mut interp.gc_heap, Some(prototype)).map_err(
-                    |_| NativeError::TypeError {
+                array::set_prototype_override(target, &mut interp.gc_heap, Some(prototype))
+                    .map_err(|_| NativeError::TypeError {
                         name: "Array",
                         reason: "out of memory while setting array prototype".to_owned(),
-                    },
-                )?;
+                    })?;
             }
         }
         Ok(array)

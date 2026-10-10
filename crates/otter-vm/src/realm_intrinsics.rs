@@ -268,6 +268,9 @@ pub(crate) struct RealmIntrinsics {
     pub(crate) regexp_protocol: Option<crate::regexp_fast::RegExpProtocolProof>,
     /// Which iteration reads have built-in answers in this realm, while proven.
     pub(crate) iteration: crate::iteration_protocol::IterationProofs,
+    /// Whether this realm's `%Object.prototype%` answers the conversion reads
+    /// with its built-ins, while proven.
+    pub(crate) object_conversion: Option<crate::conversion_protocol::ObjectConversionProof>,
     /// CreateIteratorResultObject's hidden class: `%Object.prototype%`, then
     /// `value`, then `done`.
     pub(crate) iterator_result: Option<crate::ObjectLayout>,
@@ -281,6 +284,7 @@ impl Default for RealmIntrinsics {
             array_constructor: crate::native_function::NativeFunction::from_gc(otter_gc::Gc::null()),
             regexp_protocol: None,
             iteration: crate::iteration_protocol::IterationProofs::default(),
+            object_conversion: None,
             iterator_result: None,
         }
     }

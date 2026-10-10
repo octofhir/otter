@@ -235,6 +235,18 @@ impl Interpreter {
             return Ok(false);
         }
 
+        if let Some(converted) = self
+            .unobservable_to_primitive(recv)
+            .map_err(CommittedValueError::JavaScript)?
+        {
+            write_register(&mut stack[top_idx], dst, converted)
+                .map_err(CommittedValueError::Fatal)?;
+            stack[top_idx]
+                .advance_pc()
+                .map_err(CommittedValueError::Fatal)?;
+            return Ok(false);
+        }
+
         // 3. Object operand — start the ladder at SymbolToPrim.
         self.drive_to_primitive_stage(
             stack,

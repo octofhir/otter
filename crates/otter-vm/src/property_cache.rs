@@ -608,6 +608,75 @@ impl crate::Interpreter {
         Some(value)
     }
 
+    /// `[[Set]]` of `key` on a closure or native function whose property bag
+    /// owns it as writable data: the store lands in the bag, as the site's
+    /// lookup-start store handler directs or, on a miss, as one installed
+    /// after resolving the bag's own slot. `false` leaves the full `[[Set]]`
+    /// to the caller. Neither allocates nor runs code.
+    ///
+    /// A key the function may synthesize ahead of its bag never qualifies
+    /// (`name` and `length`, and a closure's `prototype`, `caller` and
+    /// `arguments`). An own writable data property ends OrdinarySet at
+    /// the bag whatever the function's prototype, so the bag need not mirror
+    /// it, and a native's bag that a load has not yet prepared simply misses.
+    pub(crate) fn lookup_start_store(
+        &mut self,
+        slot: crate::feedback::PropertyFeedbackSlot<'_>,
+        receiver: crate::Value,
+        key: AtomizedPropertyKey<'_>,
+        value: crate::Value,
+    ) -> bool {
+        let Some(bag) = self.function_bag(receiver) else {
+            return false;
+        };
+        if slot
+            .native()
+            .probe_lookup_start_store(bag, &mut self.gc_heap, value)
+        {
+            slot.record_hit();
+            return true;
+        }
+        slot.record_miss();
+        let heap = &self.gc_heap;
+        let native = receiver.as_native_function().is_some();
+        let synthesized = match key.name() {
+            "name" | "length" => true,
+            "prototype" | "caller" | "arguments" => !native,
+            _ => false,
+        };
+        if synthesized {
+            return false;
+        }
+        let Some((handler, hit)) = crate::property_ic::IcHandler::store_existing_hit(bag, heap, key)
+        else {
+            return false;
+        };
+        object::store_proven_data_slot(bag, &mut self.gc_heap, hit.slot, value);
+        if !slot.is_megamorphic() {
+            slot.install(handler.for_lookup_start());
+        }
+        true
+    }
+
+    /// The property bag a closure or native function keeps its own named
+    /// properties in, when present and in the default realm with no
+    /// `[[Prototype]]` override.
+    fn function_bag(&self, receiver: crate::Value) -> Option<JsObject> {
+        if self.active_realm_id != 0 {
+            return None;
+        }
+        if let Some(native) = receiver.as_native_function() {
+            return (!native.has_prototype_override(&self.gc_heap))
+                .then(|| native.own_properties_bag(&self.gc_heap))
+                .filter(|bag| !bag.is_null());
+        }
+        let closure = receiver.as_closure(&self.gc_heap)?;
+        if closure.proto_override(&self.gc_heap).is_some() {
+            return None;
+        }
+        closure.own_props(&self.gc_heap)
+    }
+
     /// The object a named lookup on `receiver` starts at, whatever the key,
     /// or `None` when the receiver's own lookup is not a bag or array.
     fn lookup_start_object(&self, receiver: crate::Value) -> Option<JsObject> {

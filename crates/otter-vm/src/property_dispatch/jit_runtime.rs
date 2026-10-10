@@ -225,6 +225,10 @@ impl Interpreter {
             let receiver_root = self.scoped_value(&scope, receiver);
             let value_root = self.scoped_value(&scope, value);
             let Some(obj) = receiver.as_object() else {
+                if self.lookup_start_store(slot, receiver, atomized_key, value) {
+                    path = Path::Cached;
+                    return Ok(());
+                }
                 path = Path::NonObject;
                 self.store_property_value(
                     context,

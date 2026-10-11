@@ -97,6 +97,7 @@ pub(crate) fn emit_select_entry(
     let scan = ops.new_dynamic_label();
     let found = ops.new_dynamic_label();
     let keyed = ops.new_dynamic_label();
+    let projected = ops.new_dynamic_label();
     emit_load_u64(ops, 10, otter_vm::value::tag::NOT_CELL_MASK);
     dynasm!(ops ; .arch x64
         ; test Rq(receiver), r10 ; jnz =>miss
@@ -106,69 +107,12 @@ pub(crate) fn emit_select_entry(
         None => dynasm!(ops ; .arch x64
             ; jne =>miss
             ; mov r11d, [Rq(receiver) + view.object_shape_byte as i32]),
-        Some(start) => {
-            let function = ops.new_dynamic_label();
-            let array = ops.new_dynamic_label();
-            let native = ops.new_dynamic_label();
-            let bag = ops.new_dynamic_label();
-            let layout = view.closure_call_layout;
-            let native_layout = view.native_call_layout;
-            let qualifying = i32::from(
-                otter_vm::closure::CLOSURE_LOOKUP_OWN_PROPS
-                    | otter_vm::closure::CLOSURE_LOOKUP_PROTO_OVERRIDE,
-            );
-            dynasm!(ops ; .arch x64
-                ; jne =>function
-                ; mov r11d, [Rq(receiver) + view.object_shape_byte as i32]
-                ; mov Rq(start), Rq(receiver)
-                ; jmp =>keyed
-                ; =>function
-                ; cmp BYTE [Rq(receiver)], view.array_layout.type_tag as i8
-                ; je =>array
-                ; cmp BYTE [Rq(receiver)], otter_vm::native_function::NATIVE_FUNCTION_BODY_TYPE_TAG as i8
-                ; je =>native
-                ; cmp BYTE [Rq(receiver)], otter_vm::closure::JS_CLOSURE_BODY_TYPE_TAG as i8
-                ; jne =>miss
-                ; movzx r10d, BYTE [Rq(receiver) + otter_vm::closure::CLOSURE_NAMED_LOOKUP_BYTE as i32]
-                ; and r10d, qualifying
-                ; cmp r10d, i32::from(otter_vm::closure::CLOSURE_LOOKUP_OWN_PROPS)
-                ; jne =>miss
-                ; mov r10d, [Rq(receiver) + layout.rare_byte as i32]
-                ; test r10d, r10d ; jz =>miss);
-            emit_load_u64(ops, 11, CAGE_MASK);
-            dynasm!(ops ; .arch x64
-                ; and r11, Rq(receiver) ; add r10, r11
-                ; mov Rd(start), [r10 + layout.own_props_byte as i32]
-                ; jmp =>bag
-                ; =>native
-                ; test BYTE [Rq(receiver) + native_layout.flags_byte as i32],
-                    native_layout.prototype_override_flag as i8
-                ; jnz =>miss
-                ; mov Rd(start), [Rq(receiver) + native_layout.own_props_byte as i32]
-                // The bag of either function kind: present, in the default
-                // realm, keyed by its shape.
-                ; =>bag
-                ; test Rd(start), Rd(start) ; jz =>miss
-                ; mov r10, [r15 + THREAD_OFFSET as i32]
-                ; mov r10, [r10 + VM_THREAD_ACTIVE_REALM_CELL_OFFSET as i32]
-                ; test r10, r10 ; jz =>miss
-                ; cmp DWORD [r10], 0 ; jne =>miss);
-            emit_load_u64(ops, 11, CAGE_MASK);
-            dynasm!(ops ; .arch x64
-                ; and r11, Rq(receiver)
-                ; add Rq(start), r11
-                ; mov r11d, [Rq(start) + view.object_shape_byte as i32]
-                ; or r11d, Projection::LookupStart as i32
-                ; jmp =>keyed
-                ; =>array
-                ; mov Rd(start), [Rq(receiver) + view.array_layout.expando_byte as i32]
-                ; test Rd(start), Rd(start) ; jz =>miss);
-            emit_load_u64(ops, 11, CAGE_MASK);
-            dynasm!(ops ; .arch x64
-                ; and r11, Rq(receiver) ; add Rq(start), r11
-                ; mov r11d, [Rq(start) + view.object_shape_byte as i32]
-                ; or r11d, Projection::ArrayExpando as i32);
-        }
+        // An ordinary object is its own storage and falls through to the scan;
+        // every projected receiver kind selects out of line.
+        Some(start) => dynasm!(ops ; .arch x64
+            ; jne =>projected
+            ; mov r11d, [Rq(receiver) + view.object_shape_byte as i32]
+            ; mov Rq(start), Rq(receiver)),
     }
     dynasm!(ops ; .arch x64
         ; =>keyed
@@ -180,8 +124,67 @@ pub(crate) fn emit_select_entry(
         ; cmp r11d, [Rq(entry) + IC.entry_shape_byte as i32] ; je =>found
         ; dec Rd(scratch) ; jz =>miss
         ; add Rq(entry), IC.entry_bytes as i32 ; jmp =>scan
-        ; =>found
     );
+    if let Some(start) = start {
+        let array = ops.new_dynamic_label();
+        let native = ops.new_dynamic_label();
+        let bag = ops.new_dynamic_label();
+        let layout = view.closure_call_layout;
+        let native_layout = view.native_call_layout;
+        let qualifying = i32::from(
+            otter_vm::closure::CLOSURE_LOOKUP_OWN_PROPS
+                | otter_vm::closure::CLOSURE_LOOKUP_PROTO_OVERRIDE,
+        );
+        dynasm!(ops ; .arch x64
+            ; =>projected
+            ; cmp BYTE [Rq(receiver)], view.array_layout.type_tag as i8
+            ; je =>array
+            ; cmp BYTE [Rq(receiver)], otter_vm::native_function::NATIVE_FUNCTION_BODY_TYPE_TAG as i8
+            ; je =>native
+            ; cmp BYTE [Rq(receiver)], otter_vm::closure::JS_CLOSURE_BODY_TYPE_TAG as i8
+            ; jne =>miss
+            ; movzx r10d, BYTE [Rq(receiver) + otter_vm::closure::CLOSURE_NAMED_LOOKUP_BYTE as i32]
+            ; and r10d, qualifying
+            ; cmp r10d, i32::from(otter_vm::closure::CLOSURE_LOOKUP_OWN_PROPS)
+            ; jne =>miss
+            ; mov r10d, [Rq(receiver) + layout.rare_byte as i32]
+            ; test r10d, r10d ; jz =>miss);
+        emit_load_u64(ops, 11, CAGE_MASK);
+        dynasm!(ops ; .arch x64
+            ; and r11, Rq(receiver) ; add r10, r11
+            ; mov Rd(start), [r10 + layout.own_props_byte as i32]
+            ; jmp =>bag
+            ; =>native
+            ; test BYTE [Rq(receiver) + native_layout.flags_byte as i32],
+                native_layout.prototype_override_flag as i8
+            ; jnz =>miss
+            ; mov Rd(start), [Rq(receiver) + native_layout.own_props_byte as i32]
+            // The bag of either function kind: present, in the default
+            // realm, keyed by its shape.
+            ; =>bag
+            ; test Rd(start), Rd(start) ; jz =>miss
+            ; mov r10, [r15 + THREAD_OFFSET as i32]
+            ; mov r10, [r10 + VM_THREAD_ACTIVE_REALM_CELL_OFFSET as i32]
+            ; test r10, r10 ; jz =>miss
+            ; cmp DWORD [r10], 0 ; jne =>miss);
+        emit_load_u64(ops, 11, CAGE_MASK);
+        dynasm!(ops ; .arch x64
+            ; and r11, Rq(receiver)
+            ; add Rq(start), r11
+            ; mov r11d, [Rq(start) + view.object_shape_byte as i32]
+            ; or r11d, Projection::LookupStart as i32
+            ; jmp =>keyed
+            ; =>array
+            ; mov Rd(start), [Rq(receiver) + view.array_layout.expando_byte as i32]
+            ; test Rd(start), Rd(start) ; jz =>miss);
+        emit_load_u64(ops, 11, CAGE_MASK);
+        dynasm!(ops ; .arch x64
+            ; and r11, Rq(receiver) ; add Rq(start), r11
+            ; mov r11d, [Rq(start) + view.object_shape_byte as i32]
+            ; or r11d, Projection::ArrayExpando as i32
+            ; jmp =>keyed);
+    }
+    dynasm!(ops ; .arch x64 ; =>found);
 }
 
 /// Jump to `miss` unless the entry at `Rq(entry)` carries no proof (when

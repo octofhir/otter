@@ -77,6 +77,7 @@ use crate::entry::{
     NATIVE_FRAME_SELF_OFFSET, NATIVE_FRAME_THIS_OFFSET, THREAD_OFFSET, VALUE_HOLE,
     VM_THREAD_GC_HEAP_OFFSET, VM_THREAD_MARKING_FLAG_CELL_OFFSET,
 };
+use crate::field_store::FieldStoreOwner;
 use crate::template::arm64::values::{emit_load_symbol_u64, emit_load_u64};
 
 mod allocation;
@@ -1683,24 +1684,26 @@ impl<'a> Codegen<'a> {
                 );
                 if !owners.is_empty() {
                     let owner = allocation.gp_temps[0];
-                    let first_owner = owners[0].owner_shape;
-                    if first_owner != 0 && owners.iter().all(|arm| arm.owner_shape == first_owner) {
-                        self.load_immediate(owner, u64::from(first_owner));
+                    let first = &owners[0].1;
+                    if first.observes() && owners.iter().all(|(_, arm)| arm == first) {
+                        self.load_immediate(owner, u64::from(first.owner_shape));
                         crate::arm64::field_type::emit_observe_known(
                             &mut self.ops,
                             &mut self.relocations,
                             self.view,
                             owner,
                             value,
-                            (&owners[0].stored_shapes, owners[0].nullish_mask),
+                            first,
                         );
                     } else {
                         let done = self.ops.new_dynamic_label();
                         dynasm!(self.ops ; .arch aarch64
                             ; ldr w16, [X(object), self.view.object_shape_byte]);
-                        for authority in owners.iter().filter(|arm| arm.owner_shape != 0) {
+                        for (receiver_shape, authority) in
+                            owners.iter().filter(|(_, arm)| arm.observes())
+                        {
                             let next = self.ops.new_dynamic_label();
-                            self.load_immediate(owner, u64::from(authority.receiver_shape));
+                            self.load_immediate(owner, u64::from(*receiver_shape));
                             dynasm!(self.ops ; .arch aarch64
                                 ; cmp w16, W(owner) ; b.ne =>next);
                             self.load_immediate(owner, u64::from(authority.owner_shape));
@@ -1710,7 +1713,7 @@ impl<'a> Codegen<'a> {
                                 self.view,
                                 owner,
                                 value,
-                                (&authority.stored_shapes, authority.nullish_mask),
+                                authority,
                             );
                             dynasm!(self.ops ; .arch aarch64 ; b =>done ; =>next);
                         }
@@ -1775,13 +1778,14 @@ impl<'a> Codegen<'a> {
                 let [holder, scratch] = [allocation.gp_temps[0], allocation.gp_temps[1]];
                 self.emit_load_named_property(node, receiver, [holder, scratch], destination)?;
             }
-            Kind::StoreNamedProperty(byte_pc) => {
+            Kind::StoreNamedProperty { byte_pc, owners } => {
                 let (receiver, value) = (Self::gp(input(0)), Self::gp(input(1)));
                 let [holder, scratch] = [allocation.gp_temps[0], allocation.gp_temps[1]];
-                let byte_pc = *byte_pc;
+                let (byte_pc, owners) = (*byte_pc, owners.clone());
                 self.emit_store_named_property(
                     node,
                     byte_pc,
+                    &owners,
                     [receiver, value],
                     [holder, scratch],
                 )?;
@@ -1803,7 +1807,7 @@ impl<'a> Codegen<'a> {
                     dynasm!(self.ops ; .arch aarch64 ; =>have_length);
                 }
             }
-            Kind::StorePropertyCached { pc, atom } => {
+            Kind::StorePropertyCached { pc, atom, barrier } => {
                 let (receiver, value) = (Self::gp(input(0)), Self::gp(input(1)));
                 let temps = [
                     allocation.gp_temps[0],
@@ -1811,8 +1815,8 @@ impl<'a> Codegen<'a> {
                     allocation.gp_temps[2],
                     allocation.gp_temps[3],
                 ];
-                let (pc, atom) = (*pc, *atom);
-                self.emit_store_property_cached(node, pc, atom, [receiver, value], temps)?;
+                let (pc, atom, barrier) = (*pc, *atom, *barrier);
+                self.emit_store_property_cached(node, pc, atom, barrier, [receiver, value], temps)?;
             }
             Kind::StoreKeyedCached { .. } => {
                 let (receiver, key, value) =
@@ -1951,7 +1955,7 @@ impl<'a> Codegen<'a> {
                 let destination = Self::gp(result.expect("an allocation result"));
                 self.emit_empty_allocation(node, destination)?;
             }
-            Kind::NewObjectLiteral | Kind::NewArrayLiteral => {
+            Kind::NewObjectLiteral { .. } | Kind::NewArrayLiteral => {
                 let destination = Self::gp(result.expect("an allocation result"));
                 self.emit_literal_allocation(node, destination)?;
             }
@@ -2489,6 +2493,7 @@ impl<'a> Codegen<'a> {
         &mut self,
         node: NodeId,
         byte_pc: u32,
+        owners: &[FieldStoreOwner],
         [receiver, value]: [u8; 2],
         [holder, scratch]: [u8; 2],
     ) -> Result<(), Unsupported> {
@@ -2510,7 +2515,10 @@ impl<'a> Codegen<'a> {
         dynasm!(self.ops ; .arch aarch64
             ; tst w16, u32::from(ShapeState::PROTOTYPE_MASK)
             ; b.ne =>exit);
-        for program in programs.iter() {
+        if owners.len() != programs.len() {
+            return Err(Unsupported::OperandShape("graph named store owner records"));
+        }
+        for (program, authority) in programs.iter().zip(owners) {
             let expando = matches!(
                 program.ops.first(),
                 Some(Op::LoadArrayExpando {
@@ -2519,25 +2527,7 @@ impl<'a> Codegen<'a> {
                     ..
                 })
             );
-            let receiver_shape = program.ops.iter().rev().find_map(|op| match *op {
-                Op::PublishShape { shape, .. } | Op::GuardShape { shape, .. } => Some(shape),
-                _ => None,
-            });
-            let field = program.ops.iter().find_map(|op| match *op {
-                Op::StoreField { field, .. } => Some(field),
-                _ => None,
-            });
-            let authority = receiver_shape
-                .zip(field)
-                .and_then(|key| self.view_of(node).field_types.get(&key))
-                .ok_or(Unsupported::OperandShape(
-                    "graph named store field authority",
-                ))?;
-            let mut owner = if authority.guard.expected == otter_vm::object::field_type::TOP {
-                0
-            } else {
-                authority.guard.owner_shape
-            };
+            let mut owner = authority.owner_shape;
             let next = self.ops.new_dynamic_label();
             let mut stored_byte = None;
             for op in program.ops.iter() {
@@ -2651,7 +2641,7 @@ impl<'a> Codegen<'a> {
                                 view,
                                 holder,
                                 value,
-                                (&authority.stored_shapes, authority.nullish_mask),
+                                authority,
                             );
                             owner = 0;
                         }
@@ -2673,7 +2663,7 @@ impl<'a> Codegen<'a> {
                     view,
                     holder,
                     value,
-                    (&authority.stored_shapes, authority.nullish_mask),
+                    authority,
                 );
             }
             dynasm!(self.ops ; .arch aarch64 ; b =>done ; =>next);
@@ -2860,13 +2850,15 @@ impl<'a> Codegen<'a> {
 
     /// Store actions are independent of the read fact under the shared key.
     /// The probe commits only after all guards. Its hit returns the actual
-    /// storage object for the value barrier, while append children remain
-    /// owned by the original ordinary receiver.
+    /// storage object for the value barrier, which a `barrier`-free store
+    /// does not owe, while append children remain owned by the original
+    /// ordinary receiver.
     fn emit_store_property_cached(
         &mut self,
         node: NodeId,
         pc: u32,
         atom: Option<u32>,
+        barrier: bool,
         [receiver, value]: [u8; 2],
         temps @ [holder, child_shape, entry, index]: [u8; 4],
     ) -> Result<(), Unsupported> {
@@ -2917,16 +2909,22 @@ impl<'a> Codegen<'a> {
         } else {
             dynasm!(self.ops ; .arch aarch64 ; b =>slow);
         }
-        if atom.is_some() {
+        if atom.is_some() && barrier {
             dynasm!(self.ops ; .arch aarch64 ; mov X(holder), X(receiver));
         }
         if atom.is_some() || slot.is_some() {
-            let overwritten = self.ops.new_dynamic_label();
+            // A store that owes no value barrier completes at `done`.
+            let overwritten = if barrier {
+                self.ops.new_dynamic_label()
+            } else {
+                done
+            };
             dynasm!(self.ops ; .arch aarch64 ; =>stored ; cbz W(child_shape), =>overwritten);
             self.emit_dynamic_shape_child_barrier(node, receiver, child_shape, entry);
-            dynasm!(self.ops ; .arch aarch64 ; mov X(holder), X(receiver));
-            dynasm!(self.ops ; .arch aarch64 ; =>overwritten);
-            self.emit_write_barrier(node, holder, value);
+            if barrier {
+                dynasm!(self.ops ; .arch aarch64 ; mov X(holder), X(receiver) ; =>overwritten);
+                self.emit_write_barrier(node, holder, value);
+            }
             dynasm!(self.ops ; .arch aarch64 ; b =>done);
         }
         dynasm!(self.ops ; .arch aarch64 ; =>slow);

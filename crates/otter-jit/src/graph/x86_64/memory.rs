@@ -59,23 +59,25 @@ impl Codegen<'_> {
                 );
                 if !owners.is_empty() {
                     let owner = allocation.gp_temps[0];
-                    let first_owner = owners[0].owner_shape;
-                    if first_owner != 0 && owners.iter().all(|arm| arm.owner_shape == first_owner) {
-                        self.load_immediate(owner, u64::from(first_owner));
+                    let first = &owners[0].1;
+                    if first.observes() && owners.iter().all(|(_, arm)| arm == first) {
+                        self.load_immediate(owner, u64::from(first.owner_shape));
                         crate::x86_64::field_type::emit_observe_known(
                             &mut self.ops,
                             &mut self.relocations,
                             self.view,
                             owner,
                             value,
-                            (&owners[0].stored_shapes, owners[0].nullish_mask),
+                            first,
                         );
                     } else {
                         let done = self.ops.new_dynamic_label();
-                        for authority in owners.iter().filter(|arm| arm.owner_shape != 0) {
+                        for (receiver_shape, authority) in
+                            owners.iter().filter(|(_, arm)| arm.observes())
+                        {
                             let next = self.ops.new_dynamic_label();
                             dynasm!(self.ops ; .arch x64
-                                ; cmp DWORD [Rq(object) + self.view.object_shape_byte as i32], authority.receiver_shape as i32
+                                ; cmp DWORD [Rq(object) + self.view.object_shape_byte as i32], *receiver_shape as i32
                                 ; jne =>next);
                             self.load_immediate(owner, u64::from(authority.owner_shape));
                             crate::x86_64::field_type::emit_observe_known(
@@ -84,7 +86,7 @@ impl Codegen<'_> {
                                 self.view,
                                 owner,
                                 value,
-                                (&authority.stored_shapes, authority.nullish_mask),
+                                authority,
                             );
                             dynasm!(self.ops ; .arch x64 ; jmp =>done ; =>next);
                         }

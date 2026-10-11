@@ -501,7 +501,9 @@ impl<'a> Codegen<'a> {
             Kind::BigIntBinary(operator) => self.emit_bigint_binary(node, *operator)?,
             Kind::PrimitiveCompare(condition) => self.emit_primitive_compare(node, *condition)?,
             Kind::NewObject | Kind::NewArrayEmpty => self.emit_empty_allocation(node)?,
-            Kind::NewObjectLiteral | Kind::NewArrayLiteral => self.emit_literal_allocation(node)?,
+            Kind::NewObjectLiteral { .. } | Kind::NewArrayLiteral => {
+                self.emit_literal_allocation(node)?
+            }
             Kind::NewReceiver(plan) => self.emit_new_receiver(node, *plan)?,
             Kind::NativeNewContext(_)
             | Kind::CopyContext

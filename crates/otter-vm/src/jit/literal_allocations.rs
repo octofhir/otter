@@ -9,9 +9,8 @@
 //! session and installed generation. The source realm is the owning function's
 //! realm. An array without a sidecar may be carved only in the default realm.
 //! Object lookup/extensibility facts live on the rooted immutable shape.
-//! Defining field owners are retained by that shape's ancestry. Zero owners
-//! denote absorbing Top summaries; all other live fields are observed before
-//! the initialized cell is published.
+//! Geometry names no field owner: the source body's field-record bank holds
+//! every initialized field's defining owner and captured membership.
 //! Empty array payload fields all have zero representations; Rust field order
 //! and padding are never serialized across this boundary.
 //!
@@ -53,8 +52,6 @@ pub struct JitObjectLiteralAllocationPlan {
     pub inline_capacity: u32,
     /// Number of initialized properties in source order.
     pub value_count: u32,
-    /// Defining shape offsets in source order; zero denotes absorbing Top.
-    pub field_owners: smallvec::SmallVec<[u32; 4]>,
     /// VM-owned inline addressing geometry.
     pub fields: crate::object::FieldLayout,
 }
@@ -74,12 +71,6 @@ impl JitObjectLiteralAllocationPlan {
         }
         let fields = crate::object::FieldLayout::current();
         let cell_bytes = u32::try_from(fields.cell_bytes(capacity)).ok()?;
-        let field_owners = (0..count)
-            .map(|index| {
-                crate::object::field_type::observer_owner(shape, u32::try_from(index).ok()?)
-                    .map(|owner| owner.offset())
-            })
-            .collect::<Option<smallvec::SmallVec<[u32; 4]>>>()?;
         Some(Self {
             shape: shape.offset(),
             shape_byte: u32::try_from(
@@ -90,7 +81,6 @@ impl JitObjectLiteralAllocationPlan {
             header_word: ordinary_object_header_word(cell_bytes),
             inline_capacity: u32::try_from(capacity).ok()?,
             value_count: u32::try_from(count).ok()?,
-            field_owners,
             fields,
         })
     }

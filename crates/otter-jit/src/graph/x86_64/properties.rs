@@ -71,7 +71,7 @@ impl Codegen<'_> {
                 [assigned.gp_temps[0], assigned.gp_temps[1]],
                 Some(result()),
             )?,
-            Kind::StoreNamedProperty(pc) => self.emit_named_program(
+            Kind::StoreNamedProperty { byte_pc: pc, .. } => self.emit_named_program(
                 node,
                 pc,
                 input(0),
@@ -93,10 +93,11 @@ impl Codegen<'_> {
                     dynasm!(self.ops ; .arch x64 ; =>have_length);
                 }
             }
-            Kind::StorePropertyCached { pc, atom } => self.emit_store_property_cached(
+            Kind::StorePropertyCached { pc, atom, barrier } => self.emit_store_property_cached(
                 node,
                 pc,
                 atom,
+                barrier,
                 [input(0), input(1)],
                 assigned.gp_temps[..4].try_into().unwrap(),
             )?,
@@ -232,15 +233,16 @@ impl Codegen<'_> {
             .get(&pc)
             .ok_or(Unsupported::OperandShape("x86 graph named programs"))?
             .clone();
-        let (selected, receiver_shape) = match self.graph.node(node).kind.clone() {
+        let (selected, receiver_shape, owners) = match self.graph.node(node).kind.clone() {
             Kind::LoadNamedProperty {
                 programs,
                 receiver_shape,
                 ..
-            } => (programs, receiver_shape),
-            Kind::StoreNamedProperty(_) => (
+            } => (programs, receiver_shape, smallvec::SmallVec::new()),
+            Kind::StoreNamedProperty { owners, .. } if owners.len() == programs.len() => (
                 (0..programs.len()).map(|index| index as u32).collect(),
                 None,
+                owners,
             ),
             _ => return Err(Unsupported::OperandShape("x86 graph named program plan")),
         };
@@ -267,33 +269,8 @@ impl Codegen<'_> {
                     ..
                 })
             );
-            let (mut owner, known) = if value.is_some() {
-                let receiver_shape = program.ops.iter().rev().find_map(|op| match *op {
-                    Op::PublishShape { shape, .. } | Op::GuardShape { shape, .. } => Some(shape),
-                    _ => None,
-                });
-                let field = program.ops.iter().find_map(|op| match *op {
-                    Op::StoreField { field, .. } => Some(field),
-                    _ => None,
-                });
-                let authority = receiver_shape
-                    .zip(field)
-                    .and_then(|key| self.view_of(node).field_types.get(&key))
-                    .ok_or(Unsupported::OperandShape(
-                        "x86 graph named store field authority",
-                    ))?;
-                let owner = if authority.guard.expected == otter_vm::object::field_type::TOP {
-                    0
-                } else {
-                    authority.guard.owner_shape
-                };
-                (
-                    owner,
-                    (authority.stored_shapes.as_slice(), authority.nullish_mask),
-                )
-            } else {
-                (0, (&[][..], 0))
-            };
+            let known = owners.get(index as usize);
+            let mut owner = known.map_or(0, |record| record.owner_shape);
             let next = self.ops.new_dynamic_label();
             let object = |operand| {
                 if operand == 0 || (expando && value.is_some()) {
@@ -426,7 +403,7 @@ impl Codegen<'_> {
                             ; add r10, r11
                             ; mov BYTE [r10 + view.shape_stable_byte as i32], 0
                             ; mov DWORD [Rq(receiver) + view.object_shape_byte as i32], shape as i32);
-                        if owner != 0 {
+                        if let Some(record) = known.filter(|_| owner != 0) {
                             self.load_immediate(holder, u64::from(owner));
                             crate::x86_64::field_type::emit_observe_known(
                                 &mut self.ops,
@@ -434,7 +411,7 @@ impl Codegen<'_> {
                                 view,
                                 holder,
                                 value.expect("named store value"),
-                                known,
+                                record,
                             );
                             owner = 0;
                         }
@@ -452,7 +429,7 @@ impl Codegen<'_> {
                     "x86 graph named program without access",
                 ));
             }
-            if owner != 0 {
+            if let Some(record) = known.filter(|_| owner != 0) {
                 self.load_immediate(holder, u64::from(owner));
                 crate::x86_64::field_type::emit_observe_known(
                     &mut self.ops,
@@ -460,7 +437,7 @@ impl Codegen<'_> {
                     view,
                     holder,
                     value.expect("named store value"),
-                    known,
+                    record,
                 );
             }
             dynasm!(self.ops ; .arch x64 ; jmp =>done ; =>next);
@@ -606,6 +583,7 @@ impl Codegen<'_> {
         node: NodeId,
         pc: u32,
         atom: Option<u32>,
+        barrier: bool,
         [receiver, value]: [u8; 2],
         temps: [u8; 4],
     ) -> Result<(), Unsupported> {
@@ -660,14 +638,25 @@ impl Codegen<'_> {
             table_stored,
             appended,
         );
-        let value_stored = self.ops.new_dynamic_label();
+        // A store that owes no value barrier completes at `done`.
+        let value_stored = if barrier {
+            self.ops.new_dynamic_label()
+        } else {
+            done
+        };
+        dynasm!(self.ops ; .arch x64 ; =>table_stored);
+        if barrier {
+            dynasm!(self.ops ; .arch x64 ; mov Rq(temps[0]), Rq(receiver));
+        }
         dynasm!(self.ops ; .arch x64
-            ; =>table_stored ; mov Rq(temps[0]), Rq(receiver) ; jmp =>value_stored
+            ; jmp =>value_stored
             ; =>slot_stored ; test Rd(temps[1]), Rd(temps[1]) ; jz =>value_stored
             ; =>appended);
         self.emit_dynamic_shape_child_barrier(node, receiver, temps[1], temps[2]);
-        dynasm!(self.ops ; .arch x64 ; mov Rq(temps[0]), Rq(receiver) ; =>value_stored);
-        self.emit_write_barrier(node, temps[0], value);
+        if barrier {
+            dynasm!(self.ops ; .arch x64 ; mov Rq(temps[0]), Rq(receiver) ; =>value_stored);
+            self.emit_write_barrier(node, temps[0], value);
+        }
         dynasm!(self.ops ; .arch x64 ; jmp =>done ; =>slow);
         self.emit_property_runtime(
             node,

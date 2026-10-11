@@ -109,7 +109,7 @@ fn clobbers(graph: &Graph, body: &FxHashSet<BlockId>) -> Option<Clobbers> {
                 return None;
             }
             match kind {
-                Kind::StoreNamedProperty(_)
+                Kind::StoreNamedProperty { .. }
                 | Kind::StorePropertyCached { .. }
                 | Kind::StoreKeyedCached { .. } => {
                     clobbers.shapes = true;

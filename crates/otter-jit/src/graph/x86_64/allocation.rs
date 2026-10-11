@@ -7,8 +7,8 @@
 //! # Invariants
 //! - The candidate never aliases the result; its previous occupant reaches
 //!   canonical homes before a collecting miss assigns the result.
-//! - Plans, realms and captured field membership come from the node's actual
-//!   outer or inlined source.
+//! - Plans and realms come from the node's actual outer or inlined source;
+//!   each field's observation record comes from the node itself.
 //! - Fit initialization precedes publication and cannot collect.
 //! - Misses use the same canonical VM allocator and root contract as ARM.
 //!
@@ -99,8 +99,8 @@ impl Codegen<'_> {
         let slow = self.ops.new_dynamic_label();
         let done = self.ops.new_dynamic_label();
         let stub = match kind {
-            Kind::NewObjectLiteral => {
-                if let Some(plan) = object {
+            Kind::NewObjectLiteral { fields } => {
+                if let Some((plan, fields)) = object.zip(fields) {
                     emit_object_literal(
                         &mut self.ops,
                         &mut self.relocations,
@@ -108,6 +108,7 @@ impl Codegen<'_> {
                         15,
                         realm,
                         &plan,
+                        &fields,
                         &inputs,
                         regs,
                         slow,

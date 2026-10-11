@@ -699,18 +699,22 @@ fn polymorphic_own_stores_select_each_defining_owner() {
     assert_eq!(
         owners.as_slice(),
         &[
-            crate::graph::ir::FieldStoreOwner {
-                receiver_shape: 128,
-                owner_shape: 384,
-                stored_shapes: smallvec::smallvec![640],
-                nullish_mask: 1,
-            },
-            crate::graph::ir::FieldStoreOwner {
-                receiver_shape: 256,
-                owner_shape: 512,
-                stored_shapes: smallvec::smallvec![768],
-                nullish_mask: 2,
-            },
+            (
+                128,
+                crate::graph::ir::FieldStoreOwner {
+                    owner_shape: 384,
+                    stored_shapes: smallvec::smallvec![640],
+                    nullish_mask: 1,
+                },
+            ),
+            (
+                256,
+                crate::graph::ir::FieldStoreOwner {
+                    owner_shape: 512,
+                    stored_shapes: smallvec::smallvec![768],
+                    nullish_mask: 2,
+                },
+            ),
         ]
     );
 }
@@ -784,18 +788,22 @@ fn partially_elided_stores_retain_every_admitted_receiver_arm() {
             assert_eq!(
                 owners.as_slice(),
                 &[
-                    crate::graph::ir::FieldStoreOwner {
-                        receiver_shape: 128,
-                        owner_shape: 0,
-                        stored_shapes: smallvec::SmallVec::new(),
-                        nullish_mask: 2,
-                    },
-                    crate::graph::ir::FieldStoreOwner {
-                        receiver_shape: 256,
-                        owner_shape: 512,
-                        stored_shapes: smallvec::SmallVec::new(),
-                        nullish_mask: 0,
-                    },
+                    (
+                        128,
+                        crate::graph::ir::FieldStoreOwner {
+                            owner_shape: 0,
+                            stored_shapes: smallvec::SmallVec::new(),
+                            nullish_mask: 2,
+                        },
+                    ),
+                    (
+                        256,
+                        crate::graph::ir::FieldStoreOwner {
+                            owner_shape: 512,
+                            stored_shapes: smallvec::SmallVec::new(),
+                            nullish_mask: 0,
+                        },
+                    ),
                 ]
             );
         } else {
@@ -889,4 +897,275 @@ fn loop_headers_recheck_target_bytes_checked_on_the_forward_path() {
         built.graph.frame_state(checks[1].eager.unwrap()).byte_pc,
         24
     );
+}
+
+/// One canonical non-Top record of defining owner 384 whose captured word
+/// holds `nullish` and whose resolvable historical targets are `stored`.
+fn store_record(stored: &[u32], nullish: u64) -> JitFieldType {
+    JitFieldType {
+        guard: JitFieldTypeGuard {
+            owner_shape: 384,
+            expected: field_type::merge(field_type::shape_id_sample(7), nullish),
+        },
+        shapes: smallvec::SmallVec::new(),
+        stored_shapes: stored.iter().copied().collect(),
+        nullish_mask: nullish as u8,
+    }
+}
+
+/// Retained field-summary and stability checks of a built graph.
+fn retained_checks(built: &super::super::Built) -> usize {
+    built
+        .graph
+        .nodes
+        .iter()
+        .filter(|node| {
+            node.block.is_some()
+                && matches!(
+                    node.kind,
+                    Kind::CheckFieldTypes(_) | Kind::CheckStableShapes(_)
+                )
+        })
+        .count()
+}
+
+/// The selected owner of one native store `r<receiver>.f = r<value>` through
+/// `program`, after optional value proofs: an own load of `r1` guarded by
+/// `value_shape`, or `null` written to `r1`.
+fn named_store_owner(
+    program: JitCacheIrProgram,
+    record_shape: u32,
+    record: JitFieldType,
+    value_shape: Option<u32>,
+    null_value: bool,
+    receiver_register: u16,
+    value_register: u16,
+) -> (crate::graph::ir::FieldStoreOwner, usize) {
+    let mut ops = Vec::new();
+    if let Some(shape) = value_shape {
+        ops.push((shape, field_load(3, 1)));
+    }
+    if null_value {
+        ops.push((0, (Op::LoadNull, vec![Operand::Register(1)])));
+    }
+    let store_pc = ops.len() as u32;
+    let mut view = JitCompileSnapshot::without_feedback(
+        90,
+        2,
+        5,
+        ops.iter()
+            .map(|(_, op)| op.clone())
+            .chain([
+                (
+                    Op::StoreProperty,
+                    vec![
+                        Operand::Register(receiver_register),
+                        Operand::ConstIndex(0),
+                        Operand::Register(value_register),
+                        Operand::Register(2),
+                    ],
+                ),
+                (Op::ReturnUndefined, vec![]),
+            ])
+            .enumerate()
+            .map(|(pc, (op, operands))| {
+                JitTestInstruction::new(op, pc as u32, pc as u32 * 4, operands)
+            })
+            .collect(),
+    );
+    for (pc, (shape, (op, _))) in ops.iter().enumerate() {
+        if *op == Op::LoadProperty {
+            view.property_programs.insert(
+                pc as u32 * 4,
+                vec![load_program(*shape, FieldLocation::inline(0), false)],
+            );
+        }
+    }
+    view.seed_property_attempted_for_test(store_pc);
+    view.property_programs.insert(store_pc * 4, vec![program]);
+    let (record_stored, record_nullish) = (record.stored_shapes.clone(), record.nullish_mask);
+    view.field_types
+        .insert((record_shape, FieldLocation::inline(3)), record);
+    let built = load_graph(&view);
+    // An overwrite is an own store; an append stays a named program.
+    let owner = built
+        .graph
+        .nodes
+        .iter()
+        .find_map(|node| match &node.kind {
+            Kind::StoreNamedProperty { owners, .. } => {
+                assert_eq!(owners.len(), 1);
+                Some(owners[0].clone())
+            }
+            Kind::StoreOwnField { owners, .. } => Some(match owners.as_slice() {
+                [] => crate::graph::ir::FieldStoreOwner {
+                    owner_shape: 0,
+                    stored_shapes: record_stored.clone(),
+                    nullish_mask: record_nullish,
+                },
+                [(_, owner)] => owner.clone(),
+                _ => panic!("one admitted receiver"),
+            }),
+            _ => None,
+        })
+        .expect("native store");
+    (owner, retained_checks(&built))
+}
+
+fn overwrite_program(shape: u32, field: FieldLocation) -> JitCacheIrProgram {
+    JitCacheIrProgram {
+        ops: vec![
+            JitCacheIrOp::GuardShape { object: 0, shape },
+            JitCacheIrOp::GuardAtomSlot {
+                object: 0,
+                atom: 1,
+                field,
+                writable: true,
+            },
+            JitCacheIrOp::StoreField { object: 0, field },
+        ]
+        .into_boxed_slice(),
+    }
+}
+
+#[test]
+fn named_appends_judge_the_value_after_publishing_the_destination_shape() {
+    let field = FieldLocation::inline(3);
+    let append = || transition_program(128, field);
+    // `S = 128` publishes `T = 136`; authority is always the destination's.
+    let cases: [(&[u32], Option<u32>, u16, bool); 7] = [
+        // The receiver stored into itself is exactly `T` afterwards.
+        (&[136], None, 0, false),
+        (&[128], None, 0, true),
+        // A value proved to have another shape is not the receiver.
+        (&[256], Some(256), 1, false),
+        // A value of shape `S` may be the receiver and may now be `T`.
+        (&[128], Some(128), 1, true),
+        (&[128, 136], Some(128), 1, false),
+        // No proof: observe unless the word is Top.
+        (&[128, 256], None, 1, true),
+        (&[136, 256], None, 1, true),
+    ];
+    for (stored, value_shape, value_register, observes) in cases {
+        let (owner, checks) = named_store_owner(
+            append(),
+            136,
+            store_record(stored, 0),
+            value_shape,
+            false,
+            0,
+            value_register,
+        );
+        assert_eq!(owner.observes(), observes, "{stored:?} {value_shape:?}");
+        assert_eq!(owner.stored_shapes.as_slice(), stored);
+        assert_eq!(checks, 0, "selection adds no field or stability check");
+    }
+    let mut top = store_record(&[], 0);
+    top.guard.expected = field_type::TOP;
+    let (owner, _) = named_store_owner(append(), 136, top, None, false, 0, 1);
+    assert!(!owner.observes());
+}
+
+#[test]
+fn own_overwrites_keep_the_value_bound_and_nullish_constants() {
+    let field = FieldLocation::inline(3);
+    for (stored, nullish, value_shape, null_value, observes) in [
+        (&[256][..], 0, Some(256), false, false),
+        (&[256][..], 0, Some(128), false, true),
+        (&[][..], field_type::NULL, None, true, false),
+        (&[][..], field_type::UNDEFINED, None, true, true),
+        (&[256][..], field_type::NULL, None, false, true),
+    ] {
+        let (owner, checks) = named_store_owner(
+            overwrite_program(128, field),
+            128,
+            store_record(stored, nullish),
+            value_shape,
+            null_value,
+            0,
+            1,
+        );
+        assert_eq!(
+            owner.observes(),
+            observes,
+            "{stored:?} {nullish} {value_shape:?}"
+        );
+        assert_eq!(checks, 0);
+    }
+}
+
+#[test]
+fn literal_fields_select_records_before_the_collecting_birth() {
+    let shape = 4096;
+    let fields = otter_vm::object::FieldLayout::current();
+    let mut view = JitCompileSnapshot::without_feedback(
+        90,
+        2,
+        6,
+        [
+            field_load(3, 1),
+            (Op::LoadNull, vec![Operand::Register(4)]),
+            (
+                Op::NewObjectLiteral,
+                vec![
+                    Operand::Register(5),
+                    Operand::ConstIndex(3),
+                    Operand::ConstIndex(0),
+                    Operand::Register(1),
+                    Operand::Register(4),
+                    Operand::Register(0),
+                ],
+            ),
+            (Op::ReturnValue, vec![Operand::Register(5)]),
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(pc, (op, operands))| JitTestInstruction::new(op, pc as u32, pc as u32 * 4, operands))
+        .collect(),
+    );
+    view.property_programs
+        .insert(0, vec![load_program(256, FieldLocation::inline(0), false)]);
+    let plan = otter_vm::jit::JitObjectLiteralAllocationPlan {
+        shape,
+        shape_byte: 8,
+        cell_bytes: fields.cell_bytes(4) as u32,
+        header_word: 0,
+        inline_capacity: 4,
+        value_count: 3,
+        fields,
+    };
+    let records = [
+        store_record(&[256], 0),
+        store_record(&[], field_type::NULL),
+        store_record(&[256], 0),
+    ];
+    for (index, record) in records.iter().enumerate() {
+        view.field_types
+            .insert((shape, FieldLocation::inline(index as u32)), record.clone());
+    }
+    let literal = |view: &JitCompileSnapshot| {
+        load_graph(view)
+            .graph
+            .nodes
+            .iter()
+            .find_map(|node| match &node.kind {
+                Kind::NewObjectLiteral { fields } => Some(fields.clone()),
+                _ => None,
+            })
+            .expect("object literal")
+    };
+    // No geometry: the committed birth alone.
+    assert_eq!(literal(&view), None);
+    view.literal_allocations.objects.insert(2, plan);
+    let selected = literal(&view).expect("native literal plan");
+    let observes: Vec<_> = selected.iter().map(|owner| owner.observes()).collect();
+    assert_eq!(observes, [false, false, true]);
+    assert!(
+        selected
+            .iter()
+            .all(|owner| owner.owner_shape == 384 || !owner.observes())
+    );
+    // A field without authority keeps only the committed birth.
+    view.field_types.remove(&(shape, FieldLocation::inline(2)));
+    assert_eq!(literal(&view), None);
 }

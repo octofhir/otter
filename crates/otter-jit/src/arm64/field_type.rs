@@ -7,7 +7,9 @@
 //!
 //! # Invariants
 //! - The caller has completed every store guard and supplies the defining owner.
-//! - Zero owners denote absorbing Top summaries. The owner temporary is consumed.
+//! - A store whose selected record has owner zero emits no observation at all;
+//!   the dynamic probe's zero owner still denotes an absorbing Top summary.
+//!   The owner temporary is consumed.
 //! - Captured targets are rooted ordinary shapes whose identities already
 //!   belong to the monotone owner word. They need not remain stable: the probe
 //!   compares the RHS's current shape and never infers a loaded value's shape.
@@ -31,19 +33,23 @@ use crate::artifact::relocation::{RelocationCapture, RelocationTarget};
 use crate::entry::{
     OBJECT_BODY_TYPE_TAG, THREAD_OFFSET, VALUE_NULL, VALUE_UNDEFINED, VM_THREAD_GC_HEAP_OFFSET,
 };
+use crate::field_store::FieldStoreOwner;
 use crate::template::arm64::values::{emit_load_symbol_u64, emit_load_u64};
 
+/// Observe a store through `record`'s nonzero defining owner, already
+/// materialized in `X(owner)`: captured membership first, then the live word.
 pub(crate) fn emit_observe_known(
     ops: &mut Assembler,
     relocations: &mut RelocationCapture,
     view: &JitCompileSnapshot,
     owner: u8,
     value: u8,
-    known: (&[u32], u8),
+    record: &FieldStoreOwner,
 ) {
     debug_assert!(owner != value && !matches!(owner, 16 | 17 | 19 | 20 | 21 | 29 | 30 | 31));
     debug_assert!(!matches!(value, 16 | 17));
-    let (stored_shapes, nullish_mask) = known;
+    debug_assert!(record.observes());
+    let (stored_shapes, nullish_mask) = (record.stored_shapes.as_slice(), record.nullish_mask);
     debug_assert!(stored_shapes.len() <= 2 && stored_shapes.iter().all(|shape| *shape != 0));
     let nullish_mask = u64::from(nullish_mask);
     debug_assert!(nullish_mask & !(NULL | UNDEFINED) == 0);

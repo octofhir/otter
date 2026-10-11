@@ -96,6 +96,14 @@ fn execute(layout: &Layout, values: &[u64], fits: bool, actual_realm: u32, regs:
             20,
             0,
             plan,
+            &vec![
+                crate::field_store::FieldStoreOwner {
+                    owner_shape: 0,
+                    stored_shapes: smallvec::SmallVec::new(),
+                    nullish_mask: 0,
+                };
+                inputs.len()
+            ],
             &inputs,
             regs,
             slow,
@@ -226,7 +234,6 @@ fn literal_native_fit_miss_bulk_homes_and_numeric_holes_initialize_exactly() {
             | ((fields.cell_bytes(64) as u64) << 32),
         inline_capacity: 64,
         value_count: 64,
-        field_owners: (0..64).map(|_| 0).collect(),
         fields,
     };
     let object_values = (0..64)
@@ -285,5 +292,74 @@ fn literal_native_fit_miss_bulk_homes_and_numeric_holes_initialize_exactly() {
             execute(&layout, values, false, 0, regs);
             execute(&layout, values, true, 1, regs);
         }
+    }
+}
+
+/// Selected records alone decide observation: an all-zero literal emits
+/// neither the observer leaf nor the LAB buffer reload an observing one needs.
+#[test]
+fn zero_records_emit_no_observation_and_keep_the_buffer_live() {
+    let fields = otter_vm::object::FieldLayout::current();
+    let plan = JitObjectLiteralAllocationPlan {
+        shape: 4096,
+        shape_byte: 8,
+        cell_bytes: fields.cell_bytes(4) as u32,
+        header_word: JitEmptyObjectAllocationPlan::new(4096).header_word,
+        inline_capacity: 4,
+        value_count: 2,
+        fields,
+    };
+    let regs = LabRegisters {
+        buffer: 1,
+        candidate: 2,
+        end: 3,
+        scratch: 4,
+        size: 17,
+    };
+    let reload = {
+        let mut ops = Assembler::new().unwrap();
+        dynasm!(ops ; .arch aarch64 ; ldr X(regs.buffer), [x20, crate::entry::ALLOC_WINDOW_LAB_OFFSET]);
+        ops.finalize().unwrap().to_vec()
+    };
+    let view = otter_vm::JitCompileSnapshot::without_feedback(0, 0, 0, vec![]);
+    for observed in [false, true] {
+        let records: Vec<_> = (0..2)
+            .map(|index| crate::field_store::FieldStoreOwner {
+                owner_shape: if observed && index == 1 { 8192 } else { 0 },
+                stored_shapes: smallvec::smallvec![4096],
+                nullish_mask: 0,
+            })
+            .collect();
+        let mut ops = Assembler::new().unwrap();
+        let slow = ops.new_dynamic_label();
+        let mut relocations = RelocationCapture::new(true);
+        emit_object_literal(
+            &mut ops,
+            &mut relocations,
+            &view,
+            20,
+            0,
+            &plan,
+            &records,
+            &[
+                AllocationValue::Constant(VALUE_UNDEFINED),
+                AllocationValue::StackByte(0),
+            ],
+            regs,
+            slow,
+        );
+        dynasm!(ops ; .arch aarch64 ; =>slow ; ret);
+        let code = ops.finalize().unwrap();
+        let reloads = code
+            .chunks_exact(4)
+            .filter(|word| *word == reload.as_slice())
+            .count();
+        assert_eq!(
+            reloads,
+            1 + usize::from(observed),
+            "probe, then publication"
+        );
+        let json = relocations.render(&code).unwrap().json;
+        assert_eq!(json.contains("field_type_observe"), observed);
     }
 }

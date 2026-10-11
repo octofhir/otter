@@ -209,6 +209,7 @@ fn shaped_births_observe_inline_suffix_and_live_undefined() {
                 &mut heap,
                 layout.get(),
                 &mut values,
+                otter_gc::SitePlacement::Young(0),
                 &mut |_| {},
             )
             .expect("complete shaped birth"),

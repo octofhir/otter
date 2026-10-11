@@ -537,12 +537,14 @@ pub(crate) fn alloc_element_slab(
     heap: &mut otter_gc::GcHeap,
     capacity: usize,
     kind: DenseElementKind,
+    placement: otter_gc::SitePlacement,
     external_visit: &mut RootSlotVisitor<'_>,
 ) -> Result<ElementSlabHandle, otter_gc::OutOfMemory> {
     debug_assert!(capacity != 0);
-    let slab = heap.alloc_trailing_with_roots_initialized(
+    let slab = heap.alloc_trailing_at_site_with_roots_initialized(
         ElementSlabBody::new(capacity, kind),
         ElementSlabBody::trailing_bytes(capacity, kind),
+        placement,
         external_visit,
         |body| {
             if kind.is_numeric() {
@@ -573,6 +575,7 @@ mod tests {
             interp.gc_heap_mut(),
             4,
             DenseElementKind::HoleyDouble,
+            otter_gc::SitePlacement::Young(0),
             &mut |_| {},
         )
         .expect("slab");
@@ -606,6 +609,7 @@ mod tests {
             interp.gc_heap_mut(),
             2,
             DenseElementKind::HoleyDouble,
+            otter_gc::SitePlacement::Young(0),
             &mut |_| {},
         )
         .expect("slab");

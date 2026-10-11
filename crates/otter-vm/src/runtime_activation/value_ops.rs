@@ -351,9 +351,18 @@ impl RuntimeCall<'_> {
     pub fn new_array_value(&mut self, elements: &[Value]) -> Result<Value, VmError> {
         // SAFETY: the branded runtime call exclusively owns VM access and its
         // published native roots remain active through the shared allocator.
-        let (function_id, _) = self.semantic_source()?;
+        let (function_id, pc) = self.semantic_source()?;
+        let owner = self
+            .context
+            .for_function(function_id)
+            .map_err(|_| VmError::InvalidOperand)?;
         let vm = unsafe { &mut *self.vm.as_ptr() };
-        vm.allocate_array_literal_value(function_id, elements.iter().copied())
+        let placement = vm.literal_site_placement(
+            owner
+                .exec_function(function_id)
+                .and_then(|function| function.allocation_site_at(pc as usize)),
+        );
+        vm.allocate_array_literal_value(function_id, elements.iter().copied(), placement)
     }
 
     /// Read one compiler-proven activation-local arguments property.
@@ -411,7 +420,12 @@ impl RuntimeCall<'_> {
         };
         // SAFETY: as `new_array_value`.
         let vm = unsafe { &mut *self.vm.as_ptr() };
-        vm.allocate_static_object_literal(&owner, function_id, first_key, values)
+        let placement = vm.literal_site_placement(
+            owner
+                .exec_function(function_id)
+                .and_then(|function| function.allocation_site_at(pc as usize)),
+        );
+        vm.allocate_static_object_literal(&owner, function_id, first_key, values, placement)
     }
 
     /// Allocate an ordinary object without an interpreter destination.
@@ -1165,7 +1179,11 @@ mod tests {
         let context = element_context();
         let mut vm = Interpreter::new().expect("fixture interpreter bootstrap");
         let scalar_object = vm
-            .allocate_array_literal_value(0, [Value::number_i32(99)])
+            .allocate_array_literal_value(
+                0,
+                [Value::number_i32(99)],
+                otter_gc::SitePlacement::Young(0),
+            )
             .expect("scalar array field");
         let mut stack = crate::test_support::FrameChainFixture::new();
         let mut activation = VmRuntimeActivation::new(&mut vm, &mut stack, Some(&context));

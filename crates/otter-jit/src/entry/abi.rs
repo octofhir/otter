@@ -95,6 +95,9 @@ pub(crate) const GENERATED_FEEDBACK_CLEAN_OFFSET: u32 =
 pub(crate) const ALLOC_WINDOW_LAB_OFFSET: u32 = (std::mem::offset_of!(JitCtx, alloc_window)
     + std::mem::offset_of!(otter_vm::jit::JitMachineAllocationWindow, lab))
     as u32;
+pub(crate) const ALLOC_WINDOW_OLD_LAB_OFFSET: u32 = (std::mem::offset_of!(JitCtx, alloc_window)
+    + std::mem::offset_of!(otter_vm::jit::JitMachineAllocationWindow, old_lab))
+    as u32;
 #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
 pub(crate) const RUNTIME_STATS_OFFSET: u32 = std::mem::offset_of!(JitCtx, runtime_stats) as u32;
 #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]

@@ -244,7 +244,10 @@ fn execute(view: &JitCompileSnapshot, case: Construction, regs: LabRegisters, fi
         global_this_offset: std::ptr::null(),
         native_stack_limit: 0,
         generated_feedback_clean: 1,
-        alloc_window: otter_vm::jit::JitMachineAllocationWindow { lab: &mut lab },
+        alloc_window: otter_vm::jit::JitMachineAllocationWindow {
+            lab: &mut lab,
+            ..otter_vm::jit::JitMachineAllocationWindow::disabled()
+        },
         runtime_stats: std::ptr::null_mut(),
         pending_call: CallRequest::EMPTY,
         completion: NativeResultPair::success(Value::UNDEFINED),

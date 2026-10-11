@@ -1625,6 +1625,11 @@ fn nonempty_probe(extra_realm: bool) {
     assert!(!report.truncated());
     for event in report.events() {
         if let Some((pc, reason, _action)) = own_optimized_exit(event, function_id) {
+            // A tracked literal site that decides its placement leaves once
+            // to recompile; it is not a failed speculation.
+            if reason == ExitReason::AllocationSiteDecided {
+                continue;
+            }
             assert!(
                 pc > last_loop_pc,
                 "own literal Graph leaves before collecting phase: {event:?}"

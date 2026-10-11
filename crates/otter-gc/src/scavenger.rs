@@ -29,6 +29,12 @@
 //!    mutator allocates above their age marks. Prior from-space becomes
 //!    the new to-space, whose evacuated/dead input storage is recycled.
 //!
+//! # Allocation-site feedback
+//!
+//! Evacuating a cell tagged with an allocation site counts it as found for
+//! that site and clears the copy's tag, so a cell is counted once in its life.
+//! The heap digests the counts into pretenuring decisions after the flip.
+//!
 //! # Promotion
 //!
 //! An object is copied to to-space on its first survival and promoted to
@@ -129,6 +135,8 @@ struct ScavCtx {
     /// The heap's host-ref table, for sweep-time release of dead young
     /// bodies that name owned host payloads.
     host_refs: NonNull<crate::host_refs::HostRefTable>,
+    /// The isolate's allocation sites; each evacuated tagged cell is found once.
+    sites: NonNull<crate::pretenuring::AllocationSites>,
     /// Cage offsets of objects promoted to old-space this scavenge and not
     /// yet Cheney-scanned. An explicit worklist — not a bump-cursor
     /// watermark — because promotion allocates through the old-space free
@@ -195,6 +203,7 @@ pub unsafe fn scavenge(
     weak_registry_slots: &[*mut RawGc],
     remembered_parents: &mut Vec<RawGc>,
     host_refs: &mut crate::host_refs::HostRefTable,
+    sites: &mut crate::pretenuring::AllocationSites,
 ) -> Result<ScavengeStats, OutOfMemory> {
     // Reserve every page promotion/fallback can need before forwarding the
     // first object. After a forwarding write, cage exhaustion cannot be
@@ -253,6 +262,7 @@ pub unsafe fn scavenge(
         parent_old: false,
         remembered: unsafe { NonNull::new_unchecked(remembered_parents as *mut _) },
         host_refs: unsafe { NonNull::new_unchecked(host_refs as *mut _) },
+        sites: unsafe { NonNull::new_unchecked(sites as *mut _) },
         promoted_unscanned: Vec::new(),
     };
 
@@ -799,8 +809,14 @@ unsafe fn evacuate(ctx: &mut ScavCtx, header: *mut GcHeader) -> u32 {
         let dest_ptr = ctx.cage.add(new_offset as usize);
         copy_cell(header as *const u8, dest_ptr, aligned);
 
-        // Promote / re-flag the destination header.
+        // Promote / re-flag the destination header. A site-tagged cell is
+        // found once: its copy drops the tag.
         let dest_header = dest_ptr as *mut GcHeader;
+        let site = (*header).allocation_site();
+        if site != 0 {
+            ctx.sites.as_mut().record_found(site);
+            GcHeader::set_allocation_site(dest_header, 0);
+        }
         if promoted {
             (*dest_header).promote_to_old();
             ctx.stats.promoted_bytes += aligned;
@@ -1153,6 +1169,7 @@ mod tests {
                 &[],
                 &mut remembered,
                 &mut crate::host_refs::HostRefTable::default(),
+                &mut crate::pretenuring::AllocationSites::default(),
             )
         }
         .expect("promotion preflight");

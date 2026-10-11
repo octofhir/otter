@@ -1238,6 +1238,10 @@ impl Interpreter {
                     view.literal_allocations.object = plan;
                 }
                 Op::NewObjectLiteral => {
+                    let site = self.jit_allocation_site(view.code_block.allocation_site_at(pc));
+                    view.literal_allocations
+                        .sites
+                        .insert(u32::try_from(pc).ok()?, site);
                     let count = instruction.const_index(&view.code_block, 1)? as usize;
                     let first_key = instruction.const_index(&view.code_block, 2)?;
                     let plan = self
@@ -1262,6 +1266,12 @@ impl Interpreter {
                 }
                 Op::NewArray => {
                     let count = instruction.const_index(&view.code_block, 1)? as usize;
+                    if count != 0 {
+                        let site = self.jit_allocation_site(view.code_block.allocation_site_at(pc));
+                        view.literal_allocations
+                            .sites
+                            .insert(u32::try_from(pc).ok()?, site);
+                    }
                     if let Some(plan) = jit::JitArrayLiteralAllocationPlan::new(count) {
                         view.literal_allocations
                             .arrays
@@ -2387,6 +2397,7 @@ impl Interpreter {
                             | native_abi::ExitReason::RuntimeTransition
                             | native_abi::ExitReason::StabilityChanged
                             | native_abi::ExitReason::FieldTypeChanged
+                            | native_abi::ExitReason::AllocationSiteDecided
                     ))
                 .then_some((pc, reason))
             })

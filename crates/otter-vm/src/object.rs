@@ -782,8 +782,9 @@ pub const OBJECT_BODY_TYPE_TAG: u8 = 0x11;
 /// and is followed in the same cell by [`Self::inline_capacity`] in-object
 /// value slots, sized per allocation site (object literals by their property
 /// count, constructor receivers by the learned field count). The shape owns
-/// immutable capacity; immutable semantic state lives in its hidden class; GC
-/// body-owned bytes are zero ([`otter_gc::header::HEADER_BODY_BYTES_OFFSET`]).
+/// immutable capacity; immutable semantic state lives in its hidden class; the
+/// header bytes at [`otter_gc::header::HEADER_BODY_BYTES_OFFSET`] belong to
+/// the collector's allocation-site tag.
 /// The live slot count is the shape's property count, or the sidecar's
 /// dictionary slot count for a dictionary-mode object, so appending to a
 /// shaped object stores a slot and a shape and nothing else.
@@ -899,13 +900,10 @@ impl ObjectBody {
         shape_body::inline_capacity_of(self.shape)
     }
 
-    /// Write the header bytes of a freshly allocated cell, before any
-    /// collection can observe it.
+    /// Check a freshly allocated cell's field layout at its final address,
+    /// before any collection can observe it.
     #[inline]
-    fn init_cell_bytes(&mut self) {
-        // SAFETY: called by the allocation initializer on the body's final
-        // address.
-        unsafe { otter_gc::GcHeader::set_body_bytes(self.cell_header(), [0, 0]) };
+    fn init_cell(&mut self) {
         self.debug_verify_field_layout();
     }
 
@@ -3065,7 +3063,7 @@ fn alloc_object_body_with_roots(
     let extra = pending.trailing_bytes();
     let PendingObject { body } = pending;
     heap.alloc_trailing_with_roots_initialized(body, extra, external_visit, |body| {
-        body.init_cell_bytes();
+        body.init_cell();
         for index in 0..body.inline_capacity() {
             unsafe {
                 *FieldLocation::inline(index as u32).word_ptr(body.inline_values_ptr()) =
@@ -3085,7 +3083,7 @@ fn alloc_object_body_old(
     let PendingObject { body } = pending;
     let mut no_roots = |_visitor: &mut dyn FnMut(*mut RawGc)| {};
     heap.alloc_variable_with_roots_initialized(body, extra, &mut no_roots, |body| {
-        body.init_cell_bytes();
+        body.init_cell();
         for index in 0..body.inline_capacity() {
             unsafe {
                 *FieldLocation::inline(index as u32).word_ptr(body.inline_values_ptr()) =
@@ -3192,7 +3190,13 @@ pub(crate) fn alloc_object_with_shape_roots(
     external_visit: &mut RootSlotVisitor<'_>,
 ) -> Result<JsObject, otter_gc::OutOfMemory> {
     let mut values = vec![Value::undefined(); shape_property_count(shape, heap) as usize];
-    alloc_object_with_shape_and_values_roots(heap, shape, &mut values, external_visit)
+    alloc_object_with_shape_and_values_roots(
+        heap,
+        shape,
+        &mut values,
+        otter_gc::SitePlacement::Young(0),
+        external_visit,
+    )
 }
 
 /// Allocate a fresh shaped object whose complete data-slot prefix is installed
@@ -3207,6 +3211,7 @@ pub(crate) fn alloc_object_with_shape_and_values_roots(
     heap: &mut GcHeap,
     mut shape: ShapeHandle,
     values: &mut [Value],
+    placement: otter_gc::SitePlacement,
     external_visit: &mut RootSlotVisitor<'_>,
 ) -> Result<JsObject, otter_gc::OutOfMemory> {
     debug_assert_eq!(
@@ -3251,12 +3256,13 @@ pub(crate) fn alloc_object_with_shape_and_values_roots(
             unsafe { (*values_base.add(index)).trace_value_slot_mut(visitor) };
         }
     };
-    heap.alloc_trailing_with_roots_initialized(
+    heap.alloc_trailing_at_site_with_roots_initialized(
         body,
         FieldLocation::words_bytes(capacity),
+        placement,
         &mut visit,
         |body| {
-            body.init_cell_bytes();
+            body.init_cell();
             for index in 0..capacity {
                 let value = if index < prefix {
                     unsafe { *values_base.add(index) }
@@ -3352,7 +3358,7 @@ pub(crate) fn try_alloc_object_with_shape_no_collect(
     let extra = pending.trailing_bytes();
     let PendingObject { body } = pending;
     heap.try_alloc_trailing_no_collect_or_return(body, extra, |body| {
-        body.init_cell_bytes();
+        body.init_cell();
         for index in 0..body.inline_capacity() {
             unsafe {
                 *FieldLocation::inline(index as u32).word_ptr(body.inline_values_ptr()) =
@@ -3388,7 +3394,7 @@ pub(crate) fn alloc_diagnostic_object(
     let object = heap.alloc_old_diagnostic_trailing(body, extra)?;
     // No safepoint separates the allocation from this write.
     heap.with_payload(object, |body| {
-        body.init_cell_bytes();
+        body.init_cell();
         for index in 0..body.inline_capacity() {
             unsafe {
                 *FieldLocation::inline(index as u32).word_ptr(body.inline_values_ptr()) =

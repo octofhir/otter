@@ -53,10 +53,22 @@ pub(crate) use empty::emit_empty_literal;
 mod literal;
 pub(crate) use literal::{emit_array_literal, emit_object_literal};
 
-/// Probe one bounded aligned cell; miss precedes every write.
+/// Probe one bounded aligned cell in the nursery buffer; miss precedes
+/// every write.
 fn emit_bump_probe(
     ops: &mut Assembler,
     context_register: u8,
+    regs: LabRegisters,
+    slow: DynamicLabel,
+) {
+    emit_bump_probe_in(ops, context_register, ALLOC_WINDOW_LAB_OFFSET, regs, slow);
+}
+
+/// [`emit_bump_probe`] in the buffer the window holds at `lab_offset`.
+fn emit_bump_probe_in(
+    ops: &mut Assembler,
+    context_register: u8,
+    lab_offset: u32,
     regs: LabRegisters,
     slow: DynamicLabel,
 ) {
@@ -73,7 +85,7 @@ fn emit_bump_probe(
     }));
     dynasm!(ops
         ; .arch aarch64
-        ; ldr X(buffer), [X(context_register), ALLOC_WINDOW_LAB_OFFSET]
+        ; ldr X(buffer), [X(context_register), lab_offset]
         ; ldr X(candidate), [X(buffer), LAB_TOP_OFFSET]
         ; ldr X(scratch), [X(buffer), LAB_LIMIT_OFFSET]
         ; add X(end), X(candidate), X(size)

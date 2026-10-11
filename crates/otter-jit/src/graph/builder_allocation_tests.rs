@@ -222,3 +222,60 @@ fn inlined_literal_allocations_keep_callee_geometry_and_semantic_realm() {
 
 #[path = "allocation_group_tests.rs"]
 mod allocation_group_tests;
+
+#[test]
+fn tenured_object_literals_barrier_each_possible_cell_input() {
+    for mode in [
+        otter_vm::jit::JitSiteMode::Young,
+        otter_vm::jit::JitSiteMode::Track,
+        otter_vm::jit::JitSiteMode::Old,
+    ] {
+        let mut view = snapshot(
+            90,
+            1,
+            4,
+            vec![
+                (Op::LoadInt32, vec![Operand::Register(1), Operand::Imm32(7)]),
+                (
+                    Op::NewObjectLiteral,
+                    vec![
+                        Operand::Register(2),
+                        Operand::ConstIndex(2),
+                        Operand::ConstIndex(0),
+                        Operand::Register(0),
+                        Operand::Register(1),
+                    ],
+                ),
+                (Op::ReturnValue, vec![Operand::Register(2)]),
+            ],
+        );
+        view.literal_allocations.sites.insert(
+            1,
+            otter_vm::jit::JitAllocationSite {
+                id: 3,
+                record: 64,
+                mode,
+            },
+        );
+        let built = graph(&view);
+        let literal = built
+            .graph
+            .nodes
+            .iter()
+            .position(|node| matches!(node.kind, Kind::NewObjectLiteral { .. }))
+            .expect("object literal");
+        let barriers: Vec<_> = built
+            .graph
+            .nodes
+            .iter()
+            .filter(|node| node.kind == Kind::WriteBarrier)
+            .collect();
+        if mode == otter_vm::jit::JitSiteMode::Old {
+            // The parameter may be a young cell; the int never is.
+            assert_eq!(barriers.len(), 1);
+            assert_eq!(barriers[0].inputs[0].0 as usize, literal);
+        } else {
+            assert!(barriers.is_empty(), "{mode:?} cells are born young");
+        }
+    }
+}

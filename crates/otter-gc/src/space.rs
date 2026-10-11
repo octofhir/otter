@@ -91,6 +91,12 @@ impl NewSpace {
         })
     }
 
+    /// Whether each semispace already holds its largest page count.
+    #[must_use]
+    pub fn at_maximum(&self) -> bool {
+        self.from.len() >= self.max_pages
+    }
+
     /// Track a fresh from-space body whose type has a reclamation hook.
     #[inline]
     pub fn track_cleanup(&mut self, offset: u32) {

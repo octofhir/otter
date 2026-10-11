@@ -87,6 +87,7 @@ pub mod marking;
 pub mod observation;
 pub mod oom;
 pub mod page;
+pub mod pretenuring;
 pub mod root_scope;
 #[doc(hidden)]
 pub mod scavenger;
@@ -109,7 +110,8 @@ pub use frame_roots::{FrameRootProviders, FrameRoots, FrameRootsGuard, RawFrameR
 pub use handle::{EscapableHandleScope, HandleScope, HandleStack, Local};
 pub use header::{GcHeader, MarkColor};
 pub use heap::{
-    AlwaysAllocateScope, EmptyRoots, GcHeap, HeapStats, MachineAllocationWindow, PostMarkProcessor,
+    AlwaysAllocateScope, EmptyRoots, GcHeap, HeapStats, MachineAllocationWindow, OLD_LAB_BYTES,
+    PostMarkProcessor, SitePlacement,
 };
 pub use heap_image::{HeapImage, ImageError, Relocation};
 pub use lab::{LAB_LIMIT_OFFSET, LAB_TOP_OFFSET, LinearAllocationArea};

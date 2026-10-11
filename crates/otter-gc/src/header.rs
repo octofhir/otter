@@ -3,7 +3,8 @@
 //! Every GC-managed allocation in the cage starts with a
 //! [`GcHeader`]. The header is 8 bytes — a u8 type tag, an atomic
 //! u8 flag byte (mark color, young flag, forwarded flag, pinned
-//! flag, swept flag, remembered flag), 2 reserved bytes, and a u32
+//! flag, swept flag, remembered flag), a young cell's u16 allocation
+//! site, and a u32
 //! size — chosen to fit in a single cache-line fetch alongside the
 //! object's first field.
 //!
@@ -46,10 +47,10 @@ pub const HEADER_FLAGS_BYTE_OFFSET: usize = 1;
 /// read by generated code that publishes a cell it sized itself.
 pub const HEADER_SIZE_BYTES_OFFSET: usize = 4;
 
-/// Byte offset of the two body-owned header bytes. The collector never
-/// reads or writes them after allocation zeroes them; the body type gives
-/// them meaning. They travel with the cell because evacuation copies whole
-/// cells.
+/// Byte offset of the two header bytes after the flags. A young cell
+/// carries its allocation site id there (little-endian, zero for none); its
+/// first evacuation counts and clears it, so an old cell holds zero. No body
+/// type stores data in them.
 pub const HEADER_BODY_BYTES_OFFSET: usize = 2;
 
 /// The young-generation flag bit within the [`GcHeader`] flag byte
@@ -185,6 +186,23 @@ impl GcHeader {
         }
     }
 
+    /// Build a fresh young-generation header tagged with an allocation site.
+    #[inline]
+    pub const fn new_young_at_site(type_tag: u8, size_bytes: u32, site: u16) -> Self {
+        Self {
+            type_tag,
+            flags: AtomicU8::new(FLAG_YOUNG),
+            body_bytes: site.to_le_bytes(),
+            size_bytes,
+        }
+    }
+
+    /// Allocation site a young cell was tagged with; zero for none.
+    #[inline]
+    pub const fn allocation_site(&self) -> u16 {
+        u16::from_le_bytes(self.body_bytes)
+    }
+
     /// Build a fresh young-generation header marked black, used by
     /// the black-allocation path while a marking cycle is in
     /// progress (a freshly published object is never traced this cycle).
@@ -204,22 +222,16 @@ impl GcHeader {
         self.type_tag
     }
 
-    /// The two body-owned header bytes ([`HEADER_BODY_BYTES_OFFSET`]).
-    #[inline]
-    pub const fn body_bytes(&self) -> [u8; 2] {
-        self.body_bytes
-    }
-
-    /// Replace the two body-owned header bytes.
+    /// Tag a young cell with its allocation site; zero clears the tag.
     ///
     /// # Safety
-    /// `this` must address the header of a live cell owned by the caller's
-    /// body type; no other agent writes these bytes.
+    /// `this` must address the header of a live cell the collector owns at
+    /// this point: a fresh allocation before publication, or an evacuated copy.
     #[inline]
-    pub unsafe fn set_body_bytes(this: *mut Self, bytes: [u8; 2]) {
+    pub(crate) unsafe fn set_allocation_site(this: *mut Self, site: u16) {
         // SAFETY: caller contract; the field is a plain byte pair distinct
         // from the atomic flag byte.
-        unsafe { std::ptr::addr_of_mut!((*this).body_bytes).write(bytes) };
+        unsafe { std::ptr::addr_of_mut!((*this).body_bytes).write(site.to_le_bytes()) };
     }
 
     /// Returns the total allocation size (header + payload).

@@ -646,6 +646,7 @@ impl Interpreter {
             &mut self.gc_heap,
             shape,
             &mut slots,
+            otter_gc::SitePlacement::Young(0),
             &mut roots,
         )
         .map_err(VmError::from)?;
@@ -681,6 +682,7 @@ impl Interpreter {
             &mut self.gc_heap,
             shape,
             &mut stored,
+            otter_gc::SitePlacement::Young(0),
             &mut roots,
         )
         .map_err(VmError::from)?;
@@ -930,6 +932,7 @@ impl Interpreter {
         let array = crate::array::from_values_with_roots(
             &mut self.gc_heap,
             &mut values,
+            otter_gc::SitePlacement::Young(0),
             &mut external_visit,
         )
         .map_err(VmError::from)?;

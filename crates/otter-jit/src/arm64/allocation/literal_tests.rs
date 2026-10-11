@@ -13,7 +13,7 @@
 use super::*;
 use crate::CompiledCode;
 use otter_gc::lab::LinearAllocationArea;
-use otter_vm::jit::JitEmptyObjectAllocationPlan;
+use otter_vm::jit::{JitAllocationSite, JitEmptyObjectAllocationPlan, JitSiteMode};
 use otter_vm::{
     Value,
     native_abi::{CallRequest, JitCtx, NativeResultPair, VmThread},
@@ -27,7 +27,14 @@ enum Layout {
     Array(JitArrayLiteralAllocationPlan),
 }
 
-fn execute(layout: &Layout, values: &[u64], fits: bool, actual_realm: u32, regs: LabRegisters) {
+fn execute(
+    layout: &Layout,
+    site: JitAllocationSite,
+    values: &[u64],
+    fits: bool,
+    actual_realm: u32,
+    regs: LabRegisters,
+) {
     let numeric = values
         .iter()
         .all(|bits| *bits == VALUE_HOLE || *bits & tag::NUMBER_TAG != 0);
@@ -49,6 +56,8 @@ fn execute(layout: &Layout, values: &[u64], fits: bool, actual_realm: u32, regs:
         top: start,
         limit: start + bytes as usize - usize::from(!fits),
     };
+    // Both windows name one host buffer, so either placement carves it.
+    let lab_ptr: *mut LinearAllocationArea = &mut lab;
     let mut thread = VmThread::empty();
     thread.active_realm_cell = std::ptr::addr_of!(actual_realm) as u64;
     let mut ctx = JitCtx {
@@ -59,7 +68,10 @@ fn execute(layout: &Layout, values: &[u64], fits: bool, actual_realm: u32, regs:
         global_this_offset: std::ptr::null(),
         native_stack_limit: 0,
         generated_feedback_clean: 1,
-        alloc_window: otter_vm::jit::JitMachineAllocationWindow { lab: &mut lab },
+        alloc_window: otter_vm::jit::JitMachineAllocationWindow {
+            lab: lab_ptr,
+            old_lab: lab_ptr,
+        },
         runtime_stats: std::ptr::null_mut(),
         pending_call: CallRequest::EMPTY,
         completion: NativeResultPair::success(Value::UNDEFINED),
@@ -96,6 +108,7 @@ fn execute(layout: &Layout, values: &[u64], fits: bool, actual_realm: u32, regs:
             20,
             0,
             plan,
+            site,
             &vec![
                 crate::field_store::FieldStoreOwner {
                     owner_shape: 0,
@@ -115,6 +128,7 @@ fn execute(layout: &Layout, values: &[u64], fits: bool, actual_realm: u32, regs:
             0,
             start as u64 - 4096,
             *plan,
+            site,
             &inputs,
             regs,
             slow,
@@ -127,7 +141,10 @@ fn execute(layout: &Layout, values: &[u64], fits: bool, actual_realm: u32, regs:
     let call: extern "C" fn(*mut JitCtx, *const u64) -> usize =
         unsafe { std::mem::transmute(code.entry_ptr()) };
     let result = call(&mut ctx, values.as_ptr());
-    let accepted = fits && actual_realm == 0;
+    // A tenured array is carved only numeric.
+    let accepted = fits
+        && actual_realm == 0
+        && !(site.mode == JitSiteMode::Old && matches!(layout, Layout::Array(_)) && !numeric);
     assert_eq!(result, if accepted { start } else { 0 });
     assert_eq!(words[0], POISON);
     assert_eq!(*words.last().unwrap(), POISON);
@@ -155,7 +172,7 @@ fn execute(layout: &Layout, values: &[u64], fits: bool, actual_realm: u32, regs:
     match layout {
         Layout::Object(plan) => {
             let mut expected = vec![0; body.len()];
-            expected[0] = plan.header_word;
+            expected[0] = site.header_word(plan.header_word);
             expected[plan.shape_byte as usize / 8] = u64::from(plan.shape);
             for index in 0..plan.inline_capacity {
                 let byte = plan
@@ -180,8 +197,12 @@ fn execute(layout: &Layout, values: &[u64], fits: bool, actual_realm: u32, regs:
                 2
             };
             let mut expected = vec![0; body.len()];
-            expected[0] = p.shell.header_word;
-            expected[slab] = p.slab_header_word;
+            expected[0] = site.header_word(p.shell.header_word);
+            expected[slab] = if site.mode == JitSiteMode::Old {
+                site.header_word(p.slab_header_word)
+            } else {
+                p.slab_header_word
+            };
             let put32 = |words: &mut [u64], byte: u32, value: u32| {
                 words[byte as usize / 8] |= u64::from(value) << (byte % 8 * 8);
             };
@@ -288,9 +309,16 @@ fn literal_native_fit_miss_bulk_homes_and_numeric_holes_initialize_exactly() {
                 tagged.as_slice(),
             ),
         ] {
-            execute(&layout, values, true, 0, regs);
-            execute(&layout, values, false, 0, regs);
-            execute(&layout, values, true, 1, regs);
+            for mode in [JitSiteMode::Young, JitSiteMode::Track, JitSiteMode::Old] {
+                let site = JitAllocationSite {
+                    id: 0x2a5,
+                    record: 0,
+                    mode,
+                };
+                execute(&layout, site, values, true, 0, regs);
+                execute(&layout, site, values, false, 0, regs);
+                execute(&layout, site, values, true, 1, regs);
+            }
         }
     }
 }
@@ -340,6 +368,7 @@ fn zero_records_emit_no_observation_and_keep_the_buffer_live() {
             20,
             0,
             &plan,
+            JitAllocationSite::default(),
             &records,
             &[
                 AllocationValue::Constant(VALUE_UNDEFINED),

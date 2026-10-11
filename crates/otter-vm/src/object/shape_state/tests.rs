@@ -170,7 +170,7 @@ fn state_preparation_moves_keys_and_distinct_bank_children_without_changing_sour
                 assert_eq!(body.inline_capacity(), capacity);
                 // SAFETY: the handle is live in the production scope, and no
                 // allocation occurs while the resident header is inspected.
-                assert_eq!(unsafe { (*current.as_header_ptr()).body_bytes() }, [0, 0]);
+                assert_eq!(unsafe { (*current.as_header_ptr()).allocation_site() }, 0);
             });
         });
     }

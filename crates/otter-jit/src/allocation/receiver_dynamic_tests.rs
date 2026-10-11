@@ -165,7 +165,10 @@ fn dynamic_receiver_writer_initializes_and_publishes_once_or_has_no_effect() {
                 global_this_offset: std::ptr::null(),
                 native_stack_limit: 0,
                 generated_feedback_clean: 1,
-                alloc_window: otter_vm::jit::JitMachineAllocationWindow { lab: &mut lab },
+                alloc_window: otter_vm::jit::JitMachineAllocationWindow {
+                    lab: &mut lab,
+                    ..otter_vm::jit::JitMachineAllocationWindow::disabled()
+                },
                 runtime_stats: &mut runtime,
                 pending_call: CallRequest::EMPTY,
                 completion: NativeResultPair::success(Value::UNDEFINED),

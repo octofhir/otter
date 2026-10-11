@@ -136,6 +136,8 @@ pub(crate) enum DeoptReason {
     StabilityChanged,
     /// A shaped field's monotone value bound has widened.
     FieldTypeChanged,
+    /// A tracked literal allocation site has decided its placement.
+    AllocationSiteDecided,
 }
 
 /// One branch condition of a [`Kind::Branch`].

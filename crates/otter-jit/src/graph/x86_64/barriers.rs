@@ -19,7 +19,8 @@ use dynasmrt::{DynasmApi, DynasmLabelApi, dynasm};
 use otter_vm::{native_abi as abi, value::tag};
 
 use super::Codegen;
-use crate::graph::ir::NodeId;
+use crate::graph::ir::{NodeId, Repr};
+use crate::graph::regalloc::Location;
 
 impl Codegen<'_> {
     pub(super) fn emit_write_barrier(&mut self, node: NodeId, parent: u8, value: u8) {
@@ -90,25 +91,55 @@ impl Codegen<'_> {
         self.emit_cell_edge_barrier(node, receiver, child);
     }
 
+    /// The barrier after storing `value` at `index` of the tagged slab whose
+    /// element base is `base`: a non-cell or an old cell needs nothing; a
+    /// young cell widens the slab's dirty interval, which is the whole
+    /// barrier for a young or already remembered slab. A cell while marking,
+    /// or a young cell in an old slab not yet remembered, reaches the slab
+    /// barrier, which also preserves the registers in `keep`.
     pub(super) fn emit_element_write_barrier(
         &mut self,
         node: NodeId,
         base: u8,
         index: u8,
         value: u8,
+        keep: &[u8],
     ) {
         let slow = self.ops.new_dynamic_label();
         let done = self.ops.new_dynamic_label();
         let layout = self.view.gc_barrier;
+        let settled = layout.young_flag | layout.remembered_flag;
+        let storage = otter_vm::jit::JitArrayStorage::current();
+        let slab_flags = storage.slab_header_from_base + layout.header_flags_byte as i32;
+        let (dirty_start, dirty_end) = (
+            storage.slab_dirty_start_from_base,
+            storage.slab_dirty_end_from_base,
+        );
         self.load_immediate(10, tag::NOT_CELL_MASK);
         dynasm!(self.ops ; .arch x64
             ; test Rq(value), r10 ; jnz =>done ; test Rq(value), Rq(value) ; jz =>done
             ; mov r10, [r15 + crate::entry::THREAD_OFFSET as i32]
             ; mov r10, [r10 + crate::entry::VM_THREAD_MARKING_FLAG_CELL_OFFSET as i32]
             ; cmp BYTE [r10], 0 ; jne =>slow
-            ; test BYTE [Rq(value) + layout.header_flags_byte as i32], layout.young_flag as i8 ; jnz =>slow
+            ; test BYTE [Rq(value) + layout.header_flags_byte as i32], layout.young_flag as i8 ; jz =>done
+            // The slot joins the interval the slab's next scavenge re-traces;
+            // an empty interval is `[u32::MAX, 0)`.
+            ; mov r10d, [Rq(base) + dirty_start] ; cmp r10d, Rd(index)
+            ; cmova r10d, Rd(index) ; mov [Rq(base) + dirty_start], r10d
+            ; lea r11d, [Rq(index) + 1]
+            ; mov r10d, [Rq(base) + dirty_end] ; cmp r10d, r11d
+            ; cmovb r10d, r11d ; mov [Rq(base) + dirty_end], r10d
+            ; test BYTE [Rq(base) + slab_flags], settled as i8 ; jz =>slow
             ; =>done);
-        let live = self.allocation.node(node).live_registers.clone();
+        let mut live = self.allocation.node(node).live_registers.clone();
+        for &register in keep {
+            if !live
+                .iter()
+                .any(|&(location, _)| location == Location::Gp(register))
+            {
+                live.push((Location::Gp(register), Repr::Word));
+            }
+        }
         self.deferred.push(Box::new(move |codegen| {
             dynasm!(codegen.ops ; .arch x64 ; =>slow);
             let saved = codegen.emit_save_registers(&live);

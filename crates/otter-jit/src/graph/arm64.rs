@@ -65,7 +65,7 @@ use rustc_hash::FxHashMap;
 
 use super::INSTANCEOF_CHAIN_BOUND;
 use super::builder::Built;
-use super::call::CommittedArgument;
+use super::call::{CommittedArgument, IntrinsicMethod};
 use super::emission::{Emission, ExitSite};
 use super::frame::{SlotLayout, exit_reason};
 use super::ir::{BlockId, BranchKind, Condition, DeoptReason, Graph, Kind, NodeId, Repr};
@@ -81,6 +81,7 @@ use crate::field_store::FieldStoreOwner;
 use crate::template::arm64::values::{emit_load_symbol_u64, emit_load_u64};
 
 mod allocation;
+mod array_method;
 mod binding;
 mod committed_call;
 mod equality;
@@ -1844,7 +1845,7 @@ impl<'a> Codegen<'a> {
             Kind::ElementWriteBarrier => {
                 let (base, index, value) =
                     (Self::gp(input(0)), Self::gp(input(1)), Self::gp(input(2)));
-                self.emit_element_write_barrier(node, base, index, value);
+                self.emit_element_write_barrier(node, base, index, value, &[]);
             }
             Kind::Generic { pc, registers } => {
                 let (pc, registers) = (*pc, registers.clone());
@@ -1981,6 +1982,26 @@ impl<'a> Codegen<'a> {
             | Kind::NewArrayWithLength => {
                 let destination = Self::gp(result.expect("lexical allocation result"));
                 self.emit_lexical_allocation(node, destination)?;
+            }
+            Kind::ArrayPush(byte_pc) => {
+                let (receiver, value) = (Self::gp(input(0)), Self::gp(input(1)));
+                let destination = Self::gp(result.expect("a result"));
+                let temps = [
+                    allocation.gp_temps[0],
+                    allocation.gp_temps[1],
+                    allocation.gp_temps[2],
+                ];
+                self.emit_array_push(node, *byte_pc, [receiver, value], temps, destination)?;
+            }
+            Kind::ArrayPop(byte_pc) => {
+                let receiver = Self::gp(input(0));
+                let destination = Self::gp(result.expect("a result"));
+                let temps = [
+                    allocation.gp_temps[0],
+                    allocation.gp_temps[1],
+                    allocation.gp_temps[2],
+                ];
+                self.emit_array_pop(node, *byte_pc, receiver, temps, destination)?;
             }
             Kind::Instanceof => {
                 let (value, target) = (Self::gp(input(0)), Self::gp(input(1)));
@@ -2294,33 +2315,58 @@ impl<'a> Codegen<'a> {
             self.emit_native_identity(value, native_ref, exit);
             return Ok(());
         };
-        let target = lookup.receiver;
+        self.emit_intrinsic_method_identity(
+            IntrinsicMethod {
+                receiver: lookup.receiver,
+                holder_shape: lookup.holder_shape,
+                field: lookup.call_field,
+                native_ref,
+            },
+            (byte_pc, abi::STUB_JIT_RESOLVE_METHOD.id),
+            value,
+            temp,
+            exit,
+        );
+        Ok(())
+    }
+
+    /// Branch to `miss` unless `X(value)` is `method`'s receiver and reads
+    /// its builtin from the pinned prototype, whose reference the site
+    /// `(byte_pc, stub id)` names. Clobbers `X(temp)`, `x16` and `x17`.
+    fn emit_intrinsic_method_identity(
+        &mut self,
+        method: IntrinsicMethod,
+        (byte_pc, stub_id): (u32, u32),
+        value: u8,
+        temp: u8,
+        miss: DynamicLabel,
+    ) {
+        let target = method.receiver;
         let view = self.view;
         dynasm!(self.ops
             ; .arch aarch64
             ; tst X(value), #0xfffe_0000_0000_0007
-            ; b.ne =>exit
-            ; cbz X(value), =>exit
+            ; b.ne =>miss
+            ; cbz X(value), =>miss
             ; ldrb w16, [X(value)]
             ; cmp w16, u32::from(target.type_tag)
-            ; b.ne =>exit
+            ; b.ne =>miss
         );
         if let Some(guard) = target.guard {
-            self.emit_body_guard(value, guard, exit);
+            self.emit_body_guard(value, guard, miss);
         }
         if let Some(realm) = target.active_realm {
             dynasm!(self.ops
                 ; .arch aarch64
                 ; ldr x16, [x20, THREAD_OFFSET]
                 ; ldr x16, [x16, crate::entry::VM_THREAD_ACTIVE_REALM_CELL_OFFSET]
-                ; cbz x16, =>exit
+                ; cbz x16, =>miss
                 ; ldr w16, [x16]
             );
             self.load_immediate(17, u64::from(realm));
-            dynasm!(self.ops ; .arch aarch64 ; cmp w16, w17 ; b.ne =>exit);
+            dynasm!(self.ops ; .arch aarch64 ; cmp w16, w17 ; b.ne =>miss);
         }
-        // `%Function.prototype%`, its shape, and the native in its `call`
-        // slot.
+        // The pinned prototype, its shape, and the native in the slot.
         emit_load_symbol_u64(
             &mut self.ops,
             &mut self.relocations,
@@ -2329,7 +2375,7 @@ impl<'a> Codegen<'a> {
             RelocationTarget::GuardedHeapReference {
                 component: crate::artifact::relocation::GuardedHeapComponent::Prototype,
                 byte_pc,
-                runtime_stub_id: abi::STUB_JIT_RESOLVE_METHOD.id,
+                runtime_stub_id: stub_id,
             },
         );
         dynasm!(self.ops
@@ -2338,18 +2384,17 @@ impl<'a> Codegen<'a> {
             ; add X(temp), X(temp), x16
             ; ldr w16, [X(temp), view.object_shape_byte]
         );
-        self.load_immediate(17, u64::from(lookup.holder_shape));
-        dynasm!(self.ops ; .arch aarch64 ; cmp w16, w17 ; b.ne =>exit);
-        self.emit_field_storage(temp, 16, lookup.call_field);
-        let byte = lookup.call_field.byte_offset();
+        self.load_immediate(17, u64::from(method.holder_shape));
+        dynasm!(self.ops ; .arch aarch64 ; cmp w16, w17 ; b.ne =>miss);
+        self.emit_field_storage(temp, 16, method.field);
+        let byte = method.field.byte_offset();
         if byte <= 32760 {
             dynasm!(self.ops ; .arch aarch64 ; ldr X(temp), [x16, byte]);
         } else {
             self.load_immediate(17, u64::from(byte));
             dynasm!(self.ops ; .arch aarch64 ; ldr X(temp), [x16, x17]);
         }
-        self.emit_native_identity(temp, native_ref, exit);
-        Ok(())
+        self.emit_native_identity(temp, method.native_ref, miss);
     }
 
     /// The method of the guarded method call at `byte_pc` into
@@ -3760,12 +3805,29 @@ impl<'a> Codegen<'a> {
         Ok(())
     }
 
-    /// The barrier after a tagged element store: a non-cell needs nothing;
-    /// a cell while marking, or a young cell, reaches the slab barrier, which
-    /// marks the slot dirty and remembers the slab.
-    fn emit_element_write_barrier(&mut self, node: NodeId, base: u8, index: u8, value: u8) {
+    /// The barrier after storing `X(value)` at `W(index)` of the tagged slab
+    /// whose element base is `X(base)`: a non-cell or an old cell needs
+    /// nothing; a young cell widens the slab's dirty interval, which is the
+    /// whole barrier for a young or already remembered slab. A cell while
+    /// marking, or a young cell in an old slab not yet remembered, reaches
+    /// the slab barrier, which also preserves the registers in `keep`.
+    fn emit_element_write_barrier(
+        &mut self,
+        node: NodeId,
+        base: u8,
+        index: u8,
+        value: u8,
+        keep: &[u8],
+    ) {
+        let storage = otter_vm::jit::JitArrayStorage::current();
         let flags_byte = self.view.gc_barrier.header_flags_byte;
         let young = self.view.gc_barrier.young_flag;
+        let settled = young | self.view.gc_barrier.remembered_flag;
+        let slab_flags = storage.slab_header_from_base + flags_byte as i32;
+        let (dirty_start, dirty_end) = (
+            storage.slab_dirty_start_from_base,
+            storage.slab_dirty_end_from_base,
+        );
         let slow = self.ops.new_dynamic_label();
         let done = self.ops.new_dynamic_label();
         dynasm!(self.ops
@@ -3779,10 +3841,33 @@ impl<'a> Codegen<'a> {
             ; ldrb w16, [X(value), flags_byte]
             ; movz w17, u32::from(young)
             ; tst w16, w17
-            ; b.ne =>slow
+            ; b.eq =>done
+            // The slot joins the interval the slab's next scavenge re-traces;
+            // an empty interval is `[u32::MAX, 0)`.
+            ; ldur w16, [X(base), dirty_start]
+            ; cmp w16, W(index)
+            ; csel w16, w16, W(index), ls
+            ; stur w16, [X(base), dirty_start]
+            ; ldur w16, [X(base), dirty_end]
+            ; add w17, WSP(index), #1
+            ; cmp w16, w17
+            ; csel w16, w16, w17, hs
+            ; stur w16, [X(base), dirty_end]
+            ; ldurb w16, [X(base), slab_flags]
+            ; movz w17, u32::from(settled)
+            ; tst w16, w17
+            ; b.eq =>slow
             ; =>done
         );
-        let live = self.allocation.node(node).live_registers.clone();
+        let mut live = self.allocation.node(node).live_registers.clone();
+        for &register in keep {
+            if !live
+                .iter()
+                .any(|&(location, _)| location == Location::Gp(register))
+            {
+                live.push((Location::Gp(register), Repr::Word));
+            }
+        }
         self.deferred
             .push(Box::new(move |codegen: &mut Codegen<'a>| {
                 dynasm!(codegen.ops ; .arch aarch64 ; =>slow);

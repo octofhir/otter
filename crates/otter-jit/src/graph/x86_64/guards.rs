@@ -2,7 +2,8 @@
 //!
 //! # Contents
 //! - Shape, body, bounds, hole and detach-protector checks.
-//! - Native/function identity and Function.prototype.call proofs.
+//! - Native/function identity, intrinsic-prototype method and
+//!   Function.prototype.call proofs.
 //! - Shared ordinary-receiver and exact body-word checks.
 //!
 //! # Invariants
@@ -30,7 +31,10 @@ use crate::x86_64::values::emit_load_symbol_u64;
 use crate::{
     Unsupported,
     artifact::relocation::RelocationTarget,
-    graph::ir::{DeoptReason, Kind, NodeId},
+    graph::{
+        call::IntrinsicMethod,
+        ir::{DeoptReason, Kind, NodeId},
+    },
 };
 
 impl Codegen<'_> {
@@ -273,29 +277,47 @@ impl Codegen<'_> {
             .proof;
         let miss = self.eager_exit(node, DeoptReason::WrongValue);
         if let Some(lookup) = proof.lookup {
-            self.emit_intrinsic_prototype(
-                lookup.receiver,
-                byte_pc,
+            self.emit_intrinsic_method_identity(
+                IntrinsicMethod {
+                    receiver: lookup.receiver,
+                    holder_shape: lookup.holder_shape,
+                    field: lookup.call_field,
+                    native_ref: proof.call_native_ref,
+                },
+                (byte_pc, abi::STUB_JIT_RESOLVE_METHOD.id),
                 value,
                 holder,
                 miss,
-                abi::STUB_JIT_RESOLVE_METHOD.id,
             );
-            let view = self.view;
-            dynasm!(self.ops ; .arch x64
-                ; cmp DWORD [Rq(holder) + view.object_shape_byte as i32], lookup.holder_shape as i32 ; jne =>miss);
-            crate::x86_64::fields::emit_own_field(
-                &mut self.ops,
-                view.field_layout,
-                holder,
-                holder,
-                lookup.call_field,
-                false,
-            );
-            self.emit_native_identity(holder, proof.call_native_ref, miss);
         } else {
             self.emit_native_identity(value, proof.call_native_ref, miss);
         }
         Ok(())
+    }
+
+    /// Branch to `miss` unless `value` is `method`'s receiver and reads its
+    /// builtin from the pinned prototype, whose reference the site
+    /// `(byte_pc, stub id)` names. Clobbers `holder`, `r10` and `r11`.
+    pub(super) fn emit_intrinsic_method_identity(
+        &mut self,
+        method: IntrinsicMethod,
+        (byte_pc, stub_id): (u32, u32),
+        value: u8,
+        holder: u8,
+        miss: DynamicLabel,
+    ) {
+        self.emit_intrinsic_prototype(method.receiver, byte_pc, value, holder, miss, stub_id);
+        let view = self.view;
+        dynasm!(self.ops ; .arch x64
+            ; cmp DWORD [Rq(holder) + view.object_shape_byte as i32], method.holder_shape as i32 ; jne =>miss);
+        crate::x86_64::fields::emit_own_field(
+            &mut self.ops,
+            view.field_layout,
+            holder,
+            holder,
+            method.field,
+            false,
+        );
+        self.emit_native_identity(holder, method.native_ref, miss);
     }
 }

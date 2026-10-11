@@ -38,6 +38,7 @@ use crate::artifact::relocation::{RelocationCapture, RelocationTarget};
 use crate::x86_64::values::{emit_load_symbol_u64, emit_load_u64};
 
 mod allocation;
+mod array_method;
 mod barriers;
 mod binding;
 mod calls;

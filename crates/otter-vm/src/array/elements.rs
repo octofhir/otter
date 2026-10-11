@@ -111,6 +111,22 @@ pub(crate) const CAPACITY_FROM_DATA_BYTE: i32 = std::mem::offset_of!(ElementSlab
 pub(crate) const HOLE_COUNT_FROM_DATA_BYTE: i32 = std::mem::offset_of!(ElementSlabBody, hole_count)
     as i32
     - std::mem::size_of::<ElementSlabBody>() as i32;
+/// Signed byte offset of a slab's `u32` live length from its element base.
+pub(crate) const LENGTH_FROM_DATA_BYTE: i32 = std::mem::offset_of!(ElementSlabBody, len) as i32
+    - std::mem::size_of::<ElementSlabBody>() as i32;
+/// Signed byte offset of a slab's `u32` dirty interval start from its
+/// element base.
+pub(crate) const DIRTY_START_FROM_DATA_BYTE: i32 =
+    std::mem::offset_of!(ElementSlabBody, dirty_start) as i32
+        - std::mem::size_of::<ElementSlabBody>() as i32;
+/// Signed byte offset of a slab's `u32` exclusive dirty interval end from its
+/// element base.
+pub(crate) const DIRTY_END_FROM_DATA_BYTE: i32 = std::mem::offset_of!(ElementSlabBody, dirty_end)
+    as i32
+    - std::mem::size_of::<ElementSlabBody>() as i32;
+/// Signed byte offset of a slab's `GcHeader` from its element base.
+pub(crate) const HEADER_FROM_DATA_BYTE: i32 =
+    -((std::mem::size_of::<ElementSlabBody>() + std::mem::size_of::<otter_gc::GcHeader>()) as i32);
 /// Signed byte offset of a slab's kind byte from its element base.
 pub(crate) const KIND_FROM_DATA_BYTE: i32 = std::mem::offset_of!(ElementSlabBody, kind) as i32
     - std::mem::size_of::<ElementSlabBody>() as i32;

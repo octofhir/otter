@@ -104,7 +104,7 @@ impl Codegen<'_> {
             ; =>store_tagged
             ; mov r10d, Rd(key) ; mov [Rq(base) + r10 * 8], Rq(value)
         );
-        self.emit_element_write_barrier(node, base, key, value);
+        self.emit_element_write_barrier(node, base, key, value, &[]);
         dynasm!(self.ops ; .arch x64 ; jmp =>done ; =>other);
         self.emit_keyed_table_store(node, [receiver, key, value], runtime, done);
         dynasm!(self.ops ; .arch x64 ; =>runtime);

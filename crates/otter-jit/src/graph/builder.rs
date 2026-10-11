@@ -106,6 +106,9 @@ use field_type::FieldValueBound;
 #[path = "builder_intrinsic_calls.rs"]
 mod intrinsic_calls;
 
+#[path = "builder_array_methods.rs"]
+mod array_methods;
+
 const UNDEFINED: u64 = tag::VALUE_UNDEFINED;
 
 /// What is known about one value along the current path that no heap write
@@ -3700,6 +3703,9 @@ impl<'a> Builder<'a> {
         };
         if !self.view.instructions[self.pc as usize].call_attempted {
             return self.deopt(DeoptReason::InsufficientFeedback);
+        }
+        if self.emit_array_method(instruction, receiver, &arguments) {
+            return;
         }
         let byte_pc = instruction.byte_pc;
         let fold = (!self.exited_for(ExitReason::IdentityGuard))

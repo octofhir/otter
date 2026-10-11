@@ -573,6 +573,19 @@ pub(crate) enum Kind {
     /// `input0 instanceof input1`: the prototype chain walk of the default
     /// `@@hasInstance` inline, every other case in the runtime.
     Instanceof,
+    /// `input0.push(input1)` at the guarded method call at this byte PC,
+    /// whose callee is `%Array.prototype.push%`: an append into spare tagged
+    /// capacity of an Array whose dense prefix is its whole length inline,
+    /// every other Array state through the builtin in the runtime. Eager
+    /// deopt unless the receiver is an Array that reads the builtin from its
+    /// pinned prototype and no indexed accessor exists in the realm.
+    ArrayPush(u32),
+    /// `input0.pop()` at the guarded method call at this byte PC, whose
+    /// callee is `%Array.prototype.pop%`: removal of a present tagged last
+    /// element inline, every other Array state through the builtin in the
+    /// runtime. Eager deopt unless the receiver is an Array that reads the
+    /// builtin from its pinned prototype.
+    ArrayPop(u32),
     /// The method the guarded method call at this byte PC reads from
     /// receiver input0: its proved shape, prototype chain and holder slot.
     /// Eager deopt when the receiver does not match.
@@ -836,6 +849,8 @@ impl Kind {
             | Self::StoreKeyedCached { .. }
             | Self::LoadKeyedCached { .. }
             | Self::Instanceof
+            | Self::ArrayPush(_)
+            | Self::ArrayPop(_)
             | Self::LooseEqual { .. }
             | Self::NewObject
             | Self::NewArrayEmpty
@@ -1076,6 +1091,13 @@ impl Kind {
                 inputs: registers(2),
                 result: ResultPolicy::Register,
                 gp_temps: 5,
+                fp_temps: 0,
+                fixed_gp_clobbers: SmallVec::new(),
+            },
+            Self::ArrayPush(_) | Self::ArrayPop(_) => Constraints {
+                inputs: registers(input_count),
+                result: ResultPolicy::Register,
+                gp_temps: 3,
                 fp_temps: 0,
                 fixed_gp_clobbers: SmallVec::new(),
             },

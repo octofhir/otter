@@ -453,12 +453,12 @@ mod tests {
     }
 
     #[test]
-    fn wrong_committed_site_is_fatal_before_semantic_entry() {
+    fn explicit_object_operation_is_authoritative_without_source_opcode_lookup() {
         let mut vm = Interpreter::new().expect("fixture interpreter bootstrap");
         let before = vm.jit_runtime_stats();
         let mut stack = crate::test_support::FrameChainFixture::new();
         let context = ExecutionContext::from_module(
-            crate::test_support::minimal_bytecode_module("runtime-call-wrong-site-test.js"),
+            crate::test_support::minimal_bytecode_module("runtime-call-explicit-operation-test.js"),
             crate::source_registry::SourceRegistry::default(),
         )
         .expect("valid bytecode fixture");
@@ -480,11 +480,25 @@ mod tests {
         let mut call =
             unsafe { RuntimeCall::bind(NonNull::from(&mut activation), NonNull::from(&mut frame)) }
                 .expect("runtime call");
-        assert!(matches!(
-            call.object_protocol_values(Value::undefined(), Value::undefined()),
-            Err(CommittedValueError::Fatal(VmError::InvalidOperand))
-        ));
-        assert_eq!(vm.jit_runtime_stats(), before);
+        for (operation, expected) in [
+            (ObjectProtocolValueOp::LooseEqual, true),
+            (ObjectProtocolValueOp::LooseNotEqual, false),
+        ] {
+            let result = call
+                .object_protocol_values(operation, Value::undefined(), Value::undefined())
+                .expect("explicit operation completes at an unrelated published PC");
+            assert_eq!(result, Value::boolean(expected));
+            assert_eq!(call.pc(), 37);
+        }
+        let after = vm.jit_runtime_stats();
+        assert_eq!(
+            after.runtime_stub_transitions,
+            before.runtime_stub_transitions + 2
+        );
+        assert_eq!(
+            after.reentrant_stub_transitions,
+            before.reentrant_stub_transitions + 2
+        );
         assert!(vm.pending_uncaught_throw.is_none());
         assert!(vm.pending_throw_provenance.is_none());
         assert!(vm.error_detail().is_none());

@@ -14,6 +14,8 @@
 //! - Static stores use their source snapshot's captured membership only for
 //!   the defining owner selected by the destination shape and logical field.
 //! - Cold operations run once with canonical roots, never by replaying a hit.
+//! - Instanceof passes its operation explicitly while source records retain
+//!   root and reconstruction ownership.
 //! - Mutable fields are read live; shape and chain identities authorize layout.
 //! - Receiver SSA values survive holder traversal and all scratch work.
 //! - Named loads omit only a receiver shape guard matching their live exact
@@ -30,7 +32,8 @@
 
 use dynasmrt::{DynamicLabel, DynasmApi, DynasmLabelApi, dynasm};
 use otter_vm::{
-    JitCacheIrOp as Op, jit::JitIntrinsicPrototype, native_abi as abi, object::ShapeState,
+    JitCacheIrOp as Op, ObjectProtocolValueOp, jit::JitIntrinsicPrototype, native_abi as abi,
+    object::ShapeState,
 };
 
 use super::Codegen;
@@ -851,6 +854,7 @@ impl Codegen<'_> {
             &[
                 CommittedArgument::Value(value),
                 CommittedArgument::Value(target),
+                CommittedArgument::Scalar(ObjectProtocolValueOp::Instanceof.encode_abi()),
             ],
             Some(destination),
         )?;

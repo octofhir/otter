@@ -991,15 +991,15 @@ pub const STUB_JIT_BIND_FUNCTION: RuntimeStubDescriptor = descriptor(
     NativeResultDomain::None,
 );
 
-/// Complete the exact published object property-protocol operation from two
-/// boxed values. Function/PC identity selects `instanceof`, `in`,
-/// `[[GetPrototypeOf]]`, or `[[SetPrototypeOf]]`; Proxy traps and
-/// `@@hasInstance` commit exactly once.
+/// Complete the explicit object operation from two boxed values and its
+/// checked scalar operation word. Published source/root records retain GC
+/// and reconstruction ownership; Proxy traps, coercions and `@@hasInstance`
+/// commit exactly once.
 pub const STUB_JIT_OBJECT_PROTOCOL_VALUE: RuntimeStubDescriptor = descriptor(
     38,
     RuntimeStubClass::Reentrant,
-    RuntimeStubSignature::CommittedValue2,
-    2,
+    RuntimeStubSignature::ContextWords,
+    3,
     RuntimeStubEffects::reentrant(true),
     RuntimeStubException::Status,
     RuntimeStubResultAbi::NativePair,
@@ -2581,7 +2581,7 @@ mod tests {
     }
 
     #[test]
-    fn committed_value_families_share_one_fixed_physical_abi() {
+    fn committed_value_families_retain_precise_operation_contracts() {
         assert_eq!(
             runtime_stub_name(STUB_JIT_OBJECT_PROTOCOL_VALUE.id),
             "jit_object_protocol_value"
@@ -2591,9 +2591,20 @@ mod tests {
             "jit_scalar_value"
         );
 
-        for descriptor in [STUB_JIT_OBJECT_PROTOCOL_VALUE, STUB_JIT_SCALAR_VALUE] {
-            assert_eq!(descriptor.signature, RuntimeStubSignature::CommittedValue2);
-            assert_eq!(descriptor.argument_count, 2);
+        for (descriptor, signature, arguments) in [
+            (
+                STUB_JIT_OBJECT_PROTOCOL_VALUE,
+                RuntimeStubSignature::ContextWords,
+                3,
+            ),
+            (
+                STUB_JIT_SCALAR_VALUE,
+                RuntimeStubSignature::CommittedValue2,
+                2,
+            ),
+        ] {
+            assert_eq!(descriptor.signature, signature);
+            assert_eq!(descriptor.argument_count, arguments);
             assert_eq!(descriptor.class, RuntimeStubClass::Reentrant);
             assert_eq!(descriptor.safepoint, RuntimeStubSafepoint::Required);
             assert_eq!(descriptor.exception, RuntimeStubException::Status);

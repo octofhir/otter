@@ -14,11 +14,14 @@
 //! - Inputs remain intact until the final tagged boolean is committed.
 //! - Slow leaves see a live heap and preserve every control-flow-live register.
 //! - Numeric equality distinguishes NaN from identical words and equates ±0.
+//! - Coercive equality passes its operation explicitly; source records own
+//!   roots and reconstruction independently of the semantic operand.
 //!
 //! # See also
 //! - `otter_vm::runtime_stubs` owns total value semantics and leaf signatures.
 
 use super::*;
+use otter_vm::ObjectProtocolValueOp;
 
 impl<'a> Codegen<'a> {
     pub(super) fn emit_predicate(&mut self, node: NodeId) -> Result<bool, Unsupported> {
@@ -104,7 +107,7 @@ impl<'a> Codegen<'a> {
     /// boolean: identity, two Numbers, `null`/`undefined` and two cells that
     /// convert nothing inline; every coercing pair, and `null`/`undefined`
     /// against a native function (the only possible `[[IsHTMLDDA]]`), in the
-    /// runtime, which completes the published `==`/`!=` itself.
+    /// runtime, which completes the explicit `==`/`!=` operation itself.
     fn emit_loose_equal(
         &mut self,
         node: NodeId,
@@ -118,6 +121,11 @@ impl<'a> Codegen<'a> {
         const NULLISH: i32 = tag::VALUE_UNDEFINED as i32;
         const _: () = assert!(tag::VALUE_NULL | NULLISH_BIT as u64 == tag::VALUE_UNDEFINED);
         const _: () = assert!(tag::VALUE_UNDEFINED | NULLISH_BIT as u64 == tag::VALUE_UNDEFINED);
+        let operation = if negate {
+            ObjectProtocolValueOp::LooseNotEqual
+        } else {
+            ObjectProtocolValueOp::LooseEqual
+        };
         let nullish = |input: NodeId| {
             matches!(
                 self.graph.node(input).kind,
@@ -154,7 +162,11 @@ impl<'a> Codegen<'a> {
             self.emit_committed_call(
                 node,
                 abi::STUB_JIT_OBJECT_PROTOCOL_VALUE,
-                &[CommittedArgument::Value(a), CommittedArgument::Value(b)],
+                &[
+                    CommittedArgument::Value(a),
+                    CommittedArgument::Value(b),
+                    CommittedArgument::Scalar(operation.encode_abi()),
+                ],
                 Some(dst),
             )?;
             dynasm!(self.ops ; .arch x64 ; =>done);
@@ -235,7 +247,11 @@ impl<'a> Codegen<'a> {
         self.emit_committed_call(
             node,
             abi::STUB_JIT_OBJECT_PROTOCOL_VALUE,
-            &[CommittedArgument::Value(a), CommittedArgument::Value(b)],
+            &[
+                CommittedArgument::Value(a),
+                CommittedArgument::Value(b),
+                CommittedArgument::Scalar(operation.encode_abi()),
+            ],
             Some(dst),
         )?;
         dynasm!(self.ops ; .arch x64 ; =>done);

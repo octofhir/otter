@@ -1,12 +1,13 @@
 //! Committed object property-protocol value emission.
 //!
 //! # Contents
-//! - Fixed boxed-value calls to the VM-owned property-protocol kernels.
+//! - Boxed-value calls with explicit VM-owned property-protocol operations.
 //! - Normal-result commit and rooted JavaScript-throw routing.
 //!
 //! # Invariants
-//! - The published function/PC selects semantics; no opcode, destination,
-//!   register index, or materialized-frame identity crosses the ABI.
+//! - The producer supplies the semantic operation; published source/root
+//!   records own GC, throw routing and reconstruction. No bytecode opcode,
+//!   destination or register index crosses the ABI.
 //! - Once semantic entry begins, the VM returns `Ok(value)` or
 //!   `Throw(exception)`. Pre-entry `Fatal` bypasses local JS handlers and
 //!   propagates the parked structural error. Proxy traps and `@@hasInstance`
@@ -27,7 +28,7 @@ pub(super) fn emit_object_protocol_value(
     ops: &mut Assembler,
     relocations: &mut RelocationCapture,
     transitions: &crate::entry::TransitionTable,
-    _operation: abi::ObjectProtocolValueOp,
+    operation: abi::ObjectProtocolValueOp,
     result: Option<u16>,
     value0: u16,
     value1: Option<u16>,
@@ -41,6 +42,7 @@ pub(super) fn emit_object_protocol_value(
     } else {
         emit_load_u64(ops, 2, VALUE_UNDEFINED);
     }
+    emit_load_u64(ops, 3, operation.encode_abi());
     emit_load_runtime_stub(
         ops,
         relocations,

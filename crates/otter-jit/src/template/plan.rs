@@ -19,6 +19,8 @@
 //!   places its cooperative poll identically.
 //! - Immediate operands carry final boxed `Value` bit patterns; backends
 //!   materialize them without consulting the constant pool.
+//! - Object-protocol operations carry a VM-owned semantic word across the
+//!   committed ABI. Their source/root records serve GC and reconstruction.
 //! - Binding and global-declaration families are selected only by the opcode
 //!   schema. Their runtime operations carry boxed SSA values; immutable site
 //!   metadata is never copied into a raw dispatcher payload. Checked
@@ -463,9 +465,9 @@ pub(crate) enum TemplateOp {
     /// the VM's full observable `@@asyncIterator` transition.
     GetAsyncIterator { dst: u16, src: u16 },
     /// Complete one object-protocol operation through the fixed boxed-value
-    /// committed boundary. `operation` is compile-time-only; the VM decodes
-    /// the authoritative operation from the published function/PC. `result`
-    /// is absent for `SetPrototype`.
+    /// committed boundary. `operation` crosses the ABI as its semantic word;
+    /// published source/root records serve GC and reconstruction. `result` is
+    /// absent for `SetPrototype`.
     ObjectProtocolValue {
         operation: ObjectProtocolValueOp,
         result: Option<u16>,

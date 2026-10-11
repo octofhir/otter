@@ -1,0 +1,1946 @@
+{
+  "status": "passed",
+  "parent": "742c603b0bf7e2ff573e6495fb8c595dc6634575",
+  "commands": [
+    {
+      "name": "vm-lib",
+      "command": [
+        "cargo",
+        "test",
+        "-p",
+        "otter-vm",
+        "--lib",
+        "--release"
+      ],
+      "exit_code": 0,
+      "elapsed_seconds": 362.21479392051697
+    },
+    {
+      "name": "build-x86",
+      "command": [
+        "cargo",
+        "build",
+        "--release",
+        "-p",
+        "otter-cli",
+        "-p",
+        "otter-difftest",
+        "--target",
+        "x86_64-apple-darwin"
+      ],
+      "exit_code": 0,
+      "elapsed_seconds": 559.5391280651093
+    },
+    {
+      "name": "jit-lib",
+      "command": [
+        "cargo",
+        "test",
+        "-p",
+        "otter-jit",
+        "--lib",
+        "--release"
+      ],
+      "exit_code": 0,
+      "elapsed_seconds": 70.99886703491211
+    },
+    {
+      "name": "runtime-object-protocol",
+      "command": [
+        "cargo",
+        "test",
+        "-p",
+        "otter-runtime",
+        "--test",
+        "jit_object_protocol",
+        "--release"
+      ],
+      "exit_code": 0,
+      "elapsed_seconds": 292.2603373527527
+    },
+    {
+      "name": "clippy-host",
+      "command": [
+        "cargo",
+        "clippy",
+        "-p",
+        "otter-vm",
+        "-p",
+        "otter-jit",
+        "-p",
+        "otter-runtime",
+        "-p",
+        "otter-cli",
+        "-p",
+        "otter-difftest",
+        "--all-targets",
+        "--",
+        "-D",
+        "warnings"
+      ],
+      "exit_code": 0,
+      "elapsed_seconds": 25.64298701286316
+    },
+    {
+      "name": "jit-lib-x86",
+      "command": [
+        "cargo",
+        "test",
+        "-p",
+        "otter-jit",
+        "--lib",
+        "--release",
+        "--target",
+        "x86_64-apple-darwin"
+      ],
+      "exit_code": 0,
+      "elapsed_seconds": 155.7694809436798
+    },
+    {
+      "name": "clippy-x86",
+      "command": [
+        "cargo",
+        "clippy",
+        "-p",
+        "otter-vm",
+        "-p",
+        "otter-jit",
+        "-p",
+        "otter-runtime",
+        "-p",
+        "otter-cli",
+        "-p",
+        "otter-difftest",
+        "--all-targets",
+        "--target",
+        "x86_64-apple-darwin",
+        "--",
+        "-D",
+        "warnings"
+      ],
+      "exit_code": 0,
+      "elapsed_seconds": 125.96890711784363
+    },
+    {
+      "name": "difftest-x86",
+      "command": [
+        "target/x86_64-apple-darwin/release/otter-difftest",
+        "--otter",
+        "target/x86_64-apple-darwin/release/otter",
+        "--timeout-ms",
+        "120000"
+      ],
+      "exit_code": 0,
+      "elapsed_seconds": 380.38227796554565
+    },
+    {
+      "name": "difftest-host",
+      "command": [
+        "target/release/otter-difftest",
+        "--otter",
+        "target/release/otter",
+        "--timeout-ms",
+        "120000"
+      ],
+      "exit_code": 0,
+      "elapsed_seconds": 263.40684700012207
+    }
+  ],
+  "test262": {
+    "full_report": "benchmarks/results/t262/full-2026-10-11d.json",
+    "previous_report": "benchmarks/results/t262/full-2026-10-11c.md",
+    "full_totals": {
+      "total": 53575,
+      "passed": 52459,
+      "failed": 12,
+      "skipped": 1100,
+      "crashed": 0,
+      "timed_out": 4,
+      "oom": 0
+    },
+    "identical_failure_set": true,
+    "failure_paths": [
+      "intl402/DateTimeFormat/prototype/formatRange/en-US.js",
+      "intl402/DateTimeFormat/prototype/formatRangeToParts/chinese-calendar-dates.js",
+      "intl402/DateTimeFormat/prototype/formatRangeToParts/dangi-calendar-dates.js",
+      "intl402/DateTimeFormat/prototype/formatRangeToParts/en-US.js",
+      "intl402/DateTimeFormat/prototype/formatToParts/chinese-calendar-dates.js",
+      "intl402/DateTimeFormat/prototype/formatToParts/compare-to-temporal-lunisolar.js",
+      "intl402/DateTimeFormat/prototype/formatToParts/compare-to-temporal.js",
+      "intl402/DateTimeFormat/prototype/formatToParts/dangi-calendar-dates.js",
+      "intl402/DateTimeFormat/prototype/formatToParts/era.js",
+      "staging/sm/String/internalUsage.js",
+      "staging/sm/lexical-environment/block-scoped-functions-annex-b-arguments.js",
+      "staging/sm/regress/regress-602621.js"
+    ],
+    "timeout_rechecks_passed": 4,
+    "effective_totals": {
+      "total": 53575,
+      "passed": 52463,
+      "failed": 12,
+      "skipped": 1100,
+      "crashed": 0,
+      "timed_out": 0,
+      "oom": 0
+    },
+    "runner_sha256": "6acf90b79193b4d7b49c0ed7894951b6463f7c0ba979668ccb074ccd544c1d56",
+    "step": {
+      "exit_code": 0,
+      "timeout_ms": 7200000,
+      "elapsed_seconds": 725.1514749526978,
+      "command": [
+        "bash",
+        "scripts/test262-safe.sh",
+        "--output",
+        "benchmarks/results/t262/full-2026-10-11d.json"
+      ]
+    },
+    "timeout_rechecks": [
+      {
+        "path": "staging/sm/Date/dst-offset-caching-1-of-8.js",
+        "command": [
+          "target/release/otter-test262",
+          "run",
+          "--filter",
+          "staging/sm/Date/dst-offset-caching-1-of-8.js",
+          "--timeout",
+          "30000",
+          "--jobs",
+          "1",
+          "--max-heap-bytes",
+          "536870912",
+          "--output",
+          "benchmarks/results/object-protocol-operation/dst-offset-caching-1-of-8.json"
+        ],
+        "exit_code": 0,
+        "elapsed_seconds": 8.560043096542358,
+        "totals": {
+          "total": 1,
+          "passed": 1,
+          "failed": 0,
+          "skipped": 0,
+          "crashed": 0,
+          "timed_out": 0,
+          "oom": 0
+        }
+      },
+      {
+        "path": "staging/sm/Date/dst-offset-caching-3-of-8.js",
+        "command": [
+          "target/release/otter-test262",
+          "run",
+          "--filter",
+          "staging/sm/Date/dst-offset-caching-3-of-8.js",
+          "--timeout",
+          "30000",
+          "--jobs",
+          "1",
+          "--max-heap-bytes",
+          "536870912",
+          "--output",
+          "benchmarks/results/object-protocol-operation/dst-offset-caching-3-of-8.json"
+        ],
+        "exit_code": 0,
+        "elapsed_seconds": 6.46021580696106,
+        "totals": {
+          "total": 1,
+          "passed": 1,
+          "failed": 0,
+          "skipped": 0,
+          "crashed": 0,
+          "timed_out": 0,
+          "oom": 0
+        }
+      },
+      {
+        "path": "staging/sm/Date/dst-offset-caching-5-of-8.js",
+        "command": [
+          "target/release/otter-test262",
+          "run",
+          "--filter",
+          "staging/sm/Date/dst-offset-caching-5-of-8.js",
+          "--timeout",
+          "30000",
+          "--jobs",
+          "1",
+          "--max-heap-bytes",
+          "536870912",
+          "--output",
+          "benchmarks/results/object-protocol-operation/dst-offset-caching-5-of-8.json"
+        ],
+        "exit_code": 0,
+        "elapsed_seconds": 5.0883471965789795,
+        "totals": {
+          "total": 1,
+          "passed": 1,
+          "failed": 0,
+          "skipped": 0,
+          "crashed": 0,
+          "timed_out": 0,
+          "oom": 0
+        }
+      },
+      {
+        "path": "staging/sm/Date/dst-offset-caching-7-of-8.js",
+        "command": [
+          "target/release/otter-test262",
+          "run",
+          "--filter",
+          "staging/sm/Date/dst-offset-caching-7-of-8.js",
+          "--timeout",
+          "30000",
+          "--jobs",
+          "1",
+          "--max-heap-bytes",
+          "536870912",
+          "--output",
+          "benchmarks/results/object-protocol-operation/dst-offset-caching-7-of-8.json"
+        ],
+        "exit_code": 0,
+        "elapsed_seconds": 5.2036309242248535,
+        "totals": {
+          "total": 1,
+          "passed": 1,
+          "failed": 0,
+          "skipped": 0,
+          "crashed": 0,
+          "timed_out": 0,
+          "oom": 0
+        }
+      }
+    ]
+  },
+  "units": {
+    "vm-lib": {
+      "passed": 1224,
+      "failed": 0
+    },
+    "jit-lib": {
+      "passed": 250,
+      "failed": 0
+    },
+    "jit-lib-x86": {
+      "passed": 272,
+      "failed": 0
+    },
+    "runtime-object-protocol": {
+      "passed": 3,
+      "failed": 0
+    }
+  },
+  "difftest": {
+    "host": {
+      "seed": 340717225298,
+      "passed": 140,
+      "failed": 0
+    },
+    "x86": {
+      "seed": 340717225298,
+      "passed": 140,
+      "failed": 0
+    }
+  },
+  "gc_stress": [
+    {
+      "benchmark": "richards",
+      "stride": 256,
+      "cases": {
+        "normal": {
+          "exit_code": 0,
+          "elapsed_seconds": 1.8162128925323486,
+          "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "stress": {
+          "exit_code": 0,
+          "elapsed_seconds": 1.568145990371704,
+          "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        }
+      },
+      "stdout_equal": true
+    },
+    {
+      "benchmark": "deltablue",
+      "stride": 256,
+      "cases": {
+        "normal": {
+          "exit_code": 0,
+          "elapsed_seconds": 2.466217041015625,
+          "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "stress": {
+          "exit_code": 0,
+          "elapsed_seconds": 7.455767869949341,
+          "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        }
+      },
+      "stdout_equal": true
+    },
+    {
+      "benchmark": "crypto",
+      "stride": 256,
+      "cases": {
+        "normal": {
+          "exit_code": 0,
+          "elapsed_seconds": 0.3226501941680908,
+          "stdout_sha256": "9f98c7df675c3271e22de845dee97e4be3c15c21947ef644adf39c05853b8756"
+        },
+        "stress": {
+          "exit_code": 0,
+          "elapsed_seconds": 0.31363701820373535,
+          "stdout_sha256": "9f98c7df675c3271e22de845dee97e4be3c15c21947ef644adf39c05853b8756"
+        }
+      },
+      "stdout_equal": true
+    },
+    {
+      "benchmark": "raytrace",
+      "stride": 256,
+      "cases": {
+        "normal": {
+          "exit_code": 0,
+          "elapsed_seconds": 2.671535015106201,
+          "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "stress": {
+          "exit_code": 0,
+          "elapsed_seconds": 16.443604946136475,
+          "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        }
+      },
+      "stdout_equal": true
+    },
+    {
+      "benchmark": "earley-boyer",
+      "stride": 256,
+      "cases": {
+        "normal": {
+          "exit_code": 0,
+          "elapsed_seconds": 1.7705731391906738,
+          "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "stress": {
+          "exit_code": 0,
+          "elapsed_seconds": 46.71613693237305,
+          "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        }
+      },
+      "stdout_equal": true
+    },
+    {
+      "benchmark": "regexp",
+      "stride": 256,
+      "cases": {
+        "normal": {
+          "exit_code": 0,
+          "elapsed_seconds": 4.335180997848511,
+          "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "stress": {
+          "exit_code": 0,
+          "elapsed_seconds": 8.27953815460205,
+          "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        }
+      },
+      "stdout_equal": true
+    },
+    {
+      "benchmark": "splay",
+      "stride": 256,
+      "cases": {
+        "normal": {
+          "exit_code": 0,
+          "elapsed_seconds": 1.2240960597991943,
+          "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "stress": {
+          "exit_code": 0,
+          "elapsed_seconds": 6.254104137420654,
+          "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        }
+      },
+      "stdout_equal": true
+    },
+    {
+      "benchmark": "navier-stokes",
+      "stride": 256,
+      "cases": {
+        "normal": {
+          "exit_code": 0,
+          "elapsed_seconds": 0.9816539287567139,
+          "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "stress": {
+          "exit_code": 0,
+          "elapsed_seconds": 0.9548399448394775,
+          "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        }
+      },
+      "stdout_equal": true
+    },
+    {
+      "benchmark": "box2d",
+      "stride": 256,
+      "cases": {
+        "normal": {
+          "exit_code": 0,
+          "elapsed_seconds": 0.9663600921630859,
+          "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "stress": {
+          "exit_code": 0,
+          "elapsed_seconds": 1.7204737663269043,
+          "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        }
+      },
+      "stdout_equal": true
+    },
+    {
+      "benchmark": "gbemu",
+      "stride": 256,
+      "cases": {
+        "normal": {
+          "exit_code": 0,
+          "elapsed_seconds": 1.790463924407959,
+          "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "stress": {
+          "exit_code": 0,
+          "elapsed_seconds": 1.8312098979949951,
+          "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        }
+      },
+      "stdout_equal": true
+    },
+    {
+      "benchmark": "mandreel",
+      "stride": 256,
+      "cases": {
+        "normal": {
+          "exit_code": 0,
+          "elapsed_seconds": 1.301159143447876,
+          "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "stress": {
+          "exit_code": 0,
+          "elapsed_seconds": 1.3096168041229248,
+          "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        }
+      },
+      "stdout_equal": true
+    },
+    {
+      "benchmark": "zlib",
+      "stride": 256,
+      "cases": {
+        "normal": {
+          "exit_code": 0,
+          "elapsed_seconds": 2.033102035522461,
+          "stdout_sha256": "6ce676148eb0ea63eb473ac8dcf56ecf0e4597a8d4d3c360aab3f6da1fed2354"
+        },
+        "stress": {
+          "exit_code": 0,
+          "elapsed_seconds": 2.0142197608947754,
+          "stdout_sha256": "6ce676148eb0ea63eb473ac8dcf56ecf0e4597a8d4d3c360aab3f6da1fed2354"
+        }
+      },
+      "stdout_equal": true
+    },
+    {
+      "benchmark": "ts",
+      "stride": 256,
+      "cases": {
+        "normal": {
+          "exit_code": 0,
+          "elapsed_seconds": 4.256971836090088,
+          "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "stress": {
+          "exit_code": 0,
+          "elapsed_seconds": 29.059612274169922,
+          "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        }
+      },
+      "stdout_equal": true
+    }
+  ],
+  "corpus_oracles": {
+    "node": {
+      "command": [
+        "node",
+        "crates/otter-difftest/corpus/object_protocol_operation.js"
+      ],
+      "exit_code": 0,
+      "stdout_sha256": "b0a978ccb12ebe2c2510bc0372968e692068d7db96c35c3fb275f4c5b857d8ca",
+      "stderr_bytes": 0
+    },
+    "interpreter": {
+      "command": [
+        "target/release/otter",
+        "--interpreter",
+        "crates/otter-difftest/corpus/object_protocol_operation.js"
+      ],
+      "exit_code": 0,
+      "stdout_sha256": "b0a978ccb12ebe2c2510bc0372968e692068d7db96c35c3fb275f4c5b857d8ca",
+      "stderr_bytes": 0
+    },
+    "native": {
+      "command": [
+        "target/release/otter",
+        "crates/otter-difftest/corpus/object_protocol_operation.js"
+      ],
+      "exit_code": 0,
+      "stdout_sha256": "b0a978ccb12ebe2c2510bc0372968e692068d7db96c35c3fb275f4c5b857d8ca",
+      "stderr_bytes": 0
+    },
+    "template": {
+      "command": [
+        "target/release/otter",
+        "--jitless",
+        "crates/otter-difftest/corpus/object_protocol_operation.js"
+      ],
+      "exit_code": 0,
+      "stdout_sha256": "b0a978ccb12ebe2c2510bc0372968e692068d7db96c35c3fb275f4c5b857d8ca",
+      "stderr_bytes": 0
+    },
+    "stress": {
+      "command": [
+        "target/release/otter",
+        "crates/otter-difftest/corpus/object_protocol_operation.js"
+      ],
+      "exit_code": 0,
+      "stdout_sha256": "b0a978ccb12ebe2c2510bc0372968e692068d7db96c35c3fb275f4c5b857d8ca",
+      "stderr_bytes": 0
+    },
+    "stdout_equal": true
+  },
+  "performance": {
+    "measurements": {
+      "richards": {
+        "otter": 28496624586,
+        "node": 11559753905,
+        "ratio": 2.4651584125570536,
+        "delta_percent": -0.03208952213398231
+      },
+      "deltablue": {
+        "otter": 39901878177,
+        "node": 5590907366,
+        "ratio": 7.136923501837179,
+        "delta_percent": -0.011453449586795728
+      },
+      "crypto": {
+        "otter": 4681628059,
+        "node": 2918126968,
+        "ratio": 1.604326374533543,
+        "delta_percent": 0.12354571814441329
+      },
+      "raytrace": {
+        "otter": 34660442373,
+        "node": 8371358844,
+        "ratio": 4.140360366685531,
+        "delta_percent": 0.03691849992193408
+      },
+      "earley-boyer": {
+        "otter": 29671774935,
+        "node": 18688380783,
+        "ratio": 1.5877124551096,
+        "delta_percent": -0.05471310986588929
+      },
+      "regexp": {
+        "otter": 51082054695,
+        "node": 7302024402,
+        "ratio": 6.995601751345667,
+        "delta_percent": 0.07592997293119907
+      },
+      "splay": {
+        "otter": 12210740424,
+        "node": 4396614120,
+        "ratio": 2.7773054652337787,
+        "delta_percent": 0.18022584234493877
+      },
+      "navier-stokes": {
+        "otter": 8888568153,
+        "node": 8095275899,
+        "ratio": 1.097994467872058,
+        "delta_percent": 0.03745875243734709
+      },
+      "box2d": {
+        "otter": 13553365200,
+        "node": 5062573423,
+        "ratio": 2.6771691129308093,
+        "delta_percent": -4.495984795070074
+      },
+      "gbemu": {
+        "otter": 26327493690,
+        "node": 8221150072,
+        "ratio": 3.2024100593501488,
+        "delta_percent": 0.027920967158823196
+      },
+      "mandreel": {
+        "otter": 19198318231,
+        "node": 13823039865,
+        "ratio": 1.388863695576125,
+        "delta_percent": 0.0553250026982921
+      },
+      "zlib": {
+        "otter": 24507415353,
+        "node": 24749906421,
+        "ratio": 0.9902023440462688,
+        "delta_percent": 0.02411381052782602
+      },
+      "ts": {
+        "otter": 37618302425,
+        "node": 20854641072,
+        "ratio": 1.8038336068755143,
+        "delta_percent": -0.49514613059210566
+      }
+    },
+    "baseline": "benchmarks/results/call-frame-contract/performance.json",
+    "baseline_geomean": 2.4011131757370605,
+    "geomean": 2.392569906614916,
+    "geomean_delta_percent": -0.35580451635821575,
+    "regressions_percent": {
+      "crypto": 0.12354571814441329,
+      "raytrace": 0.03691849992193408,
+      "regexp": 0.07592997293119907,
+      "splay": 0.18022584234493877,
+      "navier-stokes": 0.03745875243734709,
+      "gbemu": 0.027920967158823196,
+      "mandreel": 0.0553250026982921,
+      "zlib": 0.02411381052782602
+    },
+    "under_load_measurement_preserved": "performance-under-load.json",
+    "idle_repeats": [
+      {
+        "repeat": 1,
+        "benchmark": "regexp",
+        "instructions": 51159083853
+      },
+      {
+        "repeat": 1,
+        "benchmark": "splay",
+        "instructions": 12205891826
+      },
+      {
+        "repeat": 2,
+        "benchmark": "regexp",
+        "instructions": 51062504230
+      },
+      {
+        "repeat": 2,
+        "benchmark": "splay",
+        "instructions": 12210219126
+      }
+    ]
+  },
+  "profile": {
+    "excludedProfiles": [
+      "after-runtime-profile",
+      "after-profile"
+    ],
+    "measure": "one leaf/self count per sample; native extent below innermost generated frame",
+    "physicalOwnerProof": {
+      "afterStubRange": [
+        "0x1007f6578",
+        "0x1007f672c"
+      ],
+      "beforeMethodRange": [
+        "0x100da2768",
+        "0x100da2924"
+      ],
+      "addressNormalization": "frame.addr - binary.load-addr + 0x100000000; exact half-open range"
+    },
+    "profiles": [
+      {
+        "profile": "before-runtime-profile",
+        "runs": 3,
+        "selfSamples": 3018,
+        "selfSamplesPerRun": {
+          "0": 1002,
+          "1": 1007,
+          "2": 1009
+        },
+        "samplesWithGeneratedFrame": 2873,
+        "globalLookupSubtreeSelfSamples": 104,
+        "objectProtocolBoundarySamples": 205,
+        "objectProtocolNamedStubSamples": 200,
+        "operationLookupSubtreeSelfSamples": 104,
+        "ownerProofSamples": {
+          "named-stub": 200,
+          "exact-before-method-PC": 5
+        },
+        "physicalOwnerExamples": [
+          {
+            "run": 0,
+            "generatedCaller": "JS:<anonymous> [optimizing c366]",
+            "nativeExtent": [
+              {
+                "symbol": "<otter_vm::runtime_activation::RuntimeCall>::object_protocol_values",
+                "runtimeAddress": "0x1034c2911",
+                "linkedAddress": "0x100da2911"
+              }
+            ]
+          },
+          {
+            "run": 0,
+            "generatedCaller": "JS:<anonymous> [optimizing c369]",
+            "nativeExtent": [
+              {
+                "symbol": "<otter_vm::runtime_activation::RuntimeCall>::object_protocol_values",
+                "runtimeAddress": "0x1034c2915",
+                "linkedAddress": "0x100da2915"
+              }
+            ]
+          },
+          {
+            "run": 1,
+            "generatedCaller": "JS:<anonymous> [optimizing c369]",
+            "nativeExtent": [
+              {
+                "symbol": "<otter_vm::runtime_activation::RuntimeCall>::object_protocol_values",
+                "runtimeAddress": "0x104ec2915",
+                "linkedAddress": "0x100da2915"
+              }
+            ]
+          },
+          {
+            "run": 1,
+            "generatedCaller": "JS:<anonymous> [optimizing c408]",
+            "nativeExtent": [
+              {
+                "symbol": "<otter_vm::runtime_activation::RuntimeCall>::object_protocol_values",
+                "runtimeAddress": "0x104ec2915",
+                "linkedAddress": "0x100da2915"
+              }
+            ]
+          },
+          {
+            "run": 2,
+            "generatedCaller": "JS:<anonymous> [optimizing c366]",
+            "nativeExtent": [
+              {
+                "symbol": "<otter_vm::runtime_activation::RuntimeCall>::object_protocol_values",
+                "runtimeAddress": "0x10330a919",
+                "linkedAddress": "0x100da2919"
+              }
+            ]
+          }
+        ],
+        "operationLookupLeafRows": [
+          {
+            "symbol": "<otter_vm::runtime_activation::RuntimeCall>::published_opcode",
+            "samples": 32
+          },
+          {
+            "symbol": "<[otter_vm::native_abi::safepoints::SafepointRecord]>::binary_search_by::<<[otter_vm::native_abi::safepoints::SafepointRecord]>::binary_search_by_key<u32, <otter_jit::optimizing::OptimizedCode as otter_vm::jit::JitFunctionCode>::safepoint_record::{closure#0}>::{closure#0}>",
+            "samples": 16
+          },
+          {
+            "symbol": "otter_vm::runtime_activation::semantic_source::frame_semantic_source",
+            "samples": 13
+          },
+          {
+            "symbol": "<otter_vm::executable::ExecutableModule>::function_slot",
+            "samples": 10
+          },
+          {
+            "symbol": "<otter_vm::Interpreter>::jit_anchored_safepoint",
+            "samples": 7
+          },
+          {
+            "symbol": "core::core_arch::arm_shared::neon::generated::vreinterpret_u64_u8",
+            "samples": 6
+          },
+          {
+            "symbol": "<otter_jit::optimizing::OptimizedCode as otter_vm::jit::JitFunctionCode>::safepoint_record",
+            "samples": 4
+          },
+          {
+            "symbol": "<otter_vm::jit_registry::JitCodeRegistry>::generation_function_id::{closure#0}",
+            "samples": 3
+          },
+          {
+            "symbol": "<otter_jit::optimizing::OptimizedCode as otter_vm::jit::JitFunctionCode>::metadata",
+            "samples": 3
+          },
+          {
+            "symbol": "core::hint::select_unpredictable::<usize>",
+            "samples": 3
+          },
+          {
+            "symbol": "<hashbrown::raw::RawTable<(u64, otter_vm::jit_registry::RegisteredCode)>>::find::<hashbrown::map::equivalent_key<u64, u64, otter_vm::jit_registry::RegisteredCode>::{closure#0}>::{closure#0}",
+            "samples": 3
+          },
+          {
+            "symbol": "<otter_vm::jit_registry::JitCodeRegistry>::safepoint_record::{closure#0}",
+            "samples": 2
+          },
+          {
+            "symbol": "<core::option::Option<&otter_vm::native_abi::safepoints::SafepointRecord>>::ok_or::<otter_vm::run_control::VmError>",
+            "samples": 1
+          },
+          {
+            "symbol": "core::ptr::drop_glue::<core::option::Option<otter_vm::execution_context::ExecutionContext>>",
+            "samples": 1
+          }
+        ],
+        "operationLookupFullPaths": [
+          {
+            "path": "otter_jit::entry::runtime_ops::reentry::jit_object_protocol_value_stub::{closure#0} <- <otter_vm::runtime_activation::RuntimeCall>::object_protocol_values <- <otter_vm::runtime_activation::RuntimeCall>::published_opcode",
+            "samples": 29
+          },
+          {
+            "path": "otter_jit::entry::runtime_ops::reentry::jit_object_protocol_value_stub::{closure#0} <- <otter_vm::runtime_activation::RuntimeCall>::object_protocol_values <- <otter_vm::runtime_activation::RuntimeCall>::published_opcode <- otter_vm::runtime_activation::semantic_source::frame_semantic_source <- <otter_vm::jit_registry::JitCodeRegistry>::safepoint_record::{closure#0} <- <[otter_vm::native_abi::safepoints::SafepointRecord]>::binary_search_by::<<[otter_vm::native_abi::safepoints::SafepointRecord]>::binary_search_by_key<u32, <otter_jit::optimizing::OptimizedCode as otter_vm::jit::JitFunctionCode>::safepoint_record::{closure#0}>::{closure#0}>",
+            "samples": 16
+          },
+          {
+            "path": "otter_jit::entry::runtime_ops::reentry::jit_object_protocol_value_stub::{closure#0} <- <otter_vm::runtime_activation::RuntimeCall>::object_protocol_values <- <otter_vm::runtime_activation::RuntimeCall>::published_opcode <- otter_vm::runtime_activation::semantic_source::frame_semantic_source",
+            "samples": 13
+          },
+          {
+            "path": "otter_jit::entry::runtime_ops::reentry::jit_object_protocol_value_stub::{closure#0} <- <otter_vm::runtime_activation::RuntimeCall>::object_protocol_values <- <otter_vm::runtime_activation::RuntimeCall>::published_opcode <- <otter_vm::executable::ExecutableModule>::function_slot",
+            "samples": 10
+          },
+          {
+            "path": "otter_jit::entry::runtime_ops::reentry::jit_object_protocol_value_stub::{closure#0} <- <otter_vm::runtime_activation::RuntimeCall>::object_protocol_values <- <otter_vm::runtime_activation::RuntimeCall>::published_opcode <- otter_vm::runtime_activation::semantic_source::frame_semantic_source <- core::core_arch::arm_shared::neon::generated::vreinterpret_u64_u8",
+            "samples": 6
+          },
+          {
+            "path": "otter_jit::entry::runtime_ops::reentry::jit_object_protocol_value_stub::{closure#0} <- <otter_vm::runtime_activation::RuntimeCall>::object_protocol_values <- <otter_vm::runtime_activation::RuntimeCall>::published_opcode <- otter_vm::runtime_activation::semantic_source::frame_semantic_source <- <otter_vm::jit_registry::JitCodeRegistry>::safepoint_record::{closure#0} <- <otter_jit::optimizing::OptimizedCode as otter_vm::jit::JitFunctionCode>::safepoint_record",
+            "samples": 4
+          },
+          {
+            "path": "otter_jit::entry::runtime_ops::reentry::jit_object_protocol_value_stub::{closure#0} <- <otter_vm::runtime_activation::RuntimeCall>::object_protocol_values <- <otter_vm::runtime_activation::RuntimeCall>::published_opcode <- <otter_vm::Interpreter>::jit_anchored_safepoint",
+            "samples": 4
+          },
+          {
+            "path": "otter_jit::entry::runtime_ops::reentry::jit_object_protocol_value_stub::{closure#0} <- <otter_vm::runtime_activation::RuntimeCall>::object_protocol_values <- <otter_vm::runtime_activation::RuntimeCall>::published_opcode <- otter_vm::runtime_activation::semantic_source::frame_semantic_source <- <otter_vm::jit_registry::JitCodeRegistry>::generation_function_id::{closure#0}",
+            "samples": 3
+          },
+          {
+            "path": "otter_jit::entry::runtime_ops::reentry::jit_object_protocol_value_stub::{closure#0} <- <otter_vm::runtime_activation::RuntimeCall>::object_protocol_values <- <otter_vm::runtime_activation::RuntimeCall>::published_opcode <- otter_vm::runtime_activation::semantic_source::frame_semantic_source <- <otter_vm::jit_registry::JitCodeRegistry>::generation_function_id::{closure#0} <- <otter_jit::optimizing::OptimizedCode as otter_vm::jit::JitFunctionCode>::metadata",
+            "samples": 3
+          },
+          {
+            "path": "otter_jit::entry::runtime_ops::reentry::jit_object_protocol_value_stub::{closure#0} <- <otter_vm::runtime_activation::RuntimeCall>::object_protocol_values <- <otter_vm::runtime_activation::RuntimeCall>::published_opcode <- otter_vm::runtime_activation::semantic_source::frame_semantic_source <- <otter_vm::Interpreter>::jit_anchored_safepoint",
+            "samples": 3
+          },
+          {
+            "path": "otter_jit::entry::runtime_ops::reentry::jit_object_protocol_value_stub::{closure#0} <- <otter_vm::runtime_activation::RuntimeCall>::published_opcode",
+            "samples": 3
+          },
+          {
+            "path": "otter_jit::entry::runtime_ops::reentry::jit_object_protocol_value_stub::{closure#0} <- <otter_vm::runtime_activation::RuntimeCall>::object_protocol_values <- <otter_vm::runtime_activation::RuntimeCall>::published_opcode <- otter_vm::runtime_activation::semantic_source::frame_semantic_source <- <otter_vm::jit_registry::JitCodeRegistry>::safepoint_record::{closure#0} <- core::hint::select_unpredictable::<usize>",
+            "samples": 3
+          },
+          {
+            "path": "otter_jit::entry::runtime_ops::reentry::jit_object_protocol_value_stub::{closure#0} <- <otter_vm::runtime_activation::RuntimeCall>::object_protocol_values <- <otter_vm::runtime_activation::RuntimeCall>::published_opcode <- otter_vm::runtime_activation::semantic_source::frame_semantic_source <- <hashbrown::raw::RawTable<(u64, otter_vm::jit_registry::RegisteredCode)>>::find::<hashbrown::map::equivalent_key<u64, u64, otter_vm::jit_registry::RegisteredCode>::{closure#0}>::{closure#0}",
+            "samples": 3
+          },
+          {
+            "path": "otter_jit::entry::runtime_ops::reentry::jit_object_protocol_value_stub::{closure#0} <- <otter_vm::runtime_activation::RuntimeCall>::object_protocol_values <- <otter_vm::runtime_activation::RuntimeCall>::published_opcode <- otter_vm::runtime_activation::semantic_source::frame_semantic_source <- <otter_vm::jit_registry::JitCodeRegistry>::safepoint_record::{closure#0}",
+            "samples": 2
+          },
+          {
+            "path": "otter_jit::entry::runtime_ops::reentry::jit_object_protocol_value_stub::{closure#0} <- <otter_vm::runtime_activation::RuntimeCall>::object_protocol_values <- <otter_vm::runtime_activation::RuntimeCall>::published_opcode <- otter_vm::runtime_activation::semantic_source::frame_semantic_source <- <core::option::Option<&otter_vm::native_abi::safepoints::SafepointRecord>>::ok_or::<otter_vm::run_control::VmError>",
+            "samples": 1
+          },
+          {
+            "path": "otter_jit::entry::runtime_ops::reentry::jit_object_protocol_value_stub::{closure#0} <- <otter_vm::runtime_activation::RuntimeCall>::object_protocol_values <- <otter_vm::runtime_activation::RuntimeCall>::published_opcode <- core::ptr::drop_glue::<core::option::Option<otter_vm::execution_context::ExecutionContext>>",
+            "samples": 1
+          }
+        ],
+        "objectBoundaryDepth5Rows": [
+          {
+            "path": "otter_jit::entry::runtime_ops::reentry::jit_object_protocol_value_stub::{closure#0} <- <otter_vm::Interpreter>::object_protocol_value",
+            "samples": 34
+          },
+          {
+            "path": "otter_jit::entry::runtime_ops::reentry::jit_object_protocol_value_stub::{closure#0} <- <otter_vm::runtime_activation::RuntimeCall>::object_protocol_values <- <otter_vm::runtime_activation::RuntimeCall>::published_opcode",
+            "samples": 29
+          },
+          {
+            "path": "otter_jit::entry::runtime_ops::reentry::jit_object_protocol_value_stub::{closure#0} <- <otter_vm::runtime_activation::RuntimeCall>::object_protocol_values <- <otter_vm::runtime_activation::RuntimeCall>::published_opcode <- otter_vm::runtime_activation::semantic_source::frame_semantic_source <- <otter_vm::jit_registry::JitCodeRegistry>::safepoint_record::{closure#0}",
+            "samples": 25
+          },
+          {
+            "path": "otter_jit::entry::runtime_ops::reentry::jit_object_protocol_value_stub::{closure#0} <- <otter_vm::runtime_activation::RuntimeCall>::object_protocol_values <- <otter_vm::runtime_activation::RuntimeCall>::published_opcode <- otter_vm::runtime_activation::semantic_source::frame_semantic_source",
+            "samples": 13
+          },
+          {
+            "path": "otter_jit::entry::runtime_ops::reentry::jit_object_protocol_value_stub::{closure#0} <- <otter_vm::runtime_activation::RuntimeCall>::object_protocol_values <- <otter_vm::runtime_activation::RuntimeCall>::published_opcode <- <otter_vm::executable::ExecutableModule>::function_slot",
+            "samples": 10
+          },
+          {
+            "path": "otter_jit::entry::runtime_ops::reentry::jit_object_protocol_value_stub::{closure#0} <- <otter_vm::Interpreter>::object_protocol_value <- <otter_vm::Interpreter>::loose_equal_with_context",
+            "samples": 9
+          },
+          {
+            "path": "otter_jit::entry::runtime_ops::reentry::jit_object_protocol_value_stub::{closure#0} <- <otter_vm::runtime_activation::RuntimeCall>::object_protocol_values <- <otter_vm::executable::ExecutableModule>::function_slot",
+            "samples": 8
+          },
+          {
+            "path": "otter_jit::entry::runtime_ops::reentry::jit_object_protocol_value_stub::{closure#0} <- <otter_vm::runtime_activation::RuntimeCall>::object_protocol_values <- <otter_vm::runtime_activation::RuntimeCall>::published_opcode <- otter_vm::runtime_activation::semantic_source::frame_semantic_source <- core::core_arch::arm_shared::neon::generated::vreinterpret_u64_u8",
+            "samples": 6
+          },
+          {
+            "path": "otter_jit::entry::runtime_ops::reentry::jit_object_protocol_value_stub::{closure#0} <- <otter_vm::runtime_activation::RuntimeCall>::object_protocol_values <- <otter_vm::runtime_activation::RuntimeCall>::published_opcode <- otter_vm::runtime_activation::semantic_source::frame_semantic_source <- <otter_vm::jit_registry::JitCodeRegistry>::generation_function_id::{closure#0}",
+            "samples": 6
+          },
+          {
+            "path": "otter_jit::entry::runtime_ops::reentry::jit_object_protocol_value_stub::{closure#0} <- <otter_vm::runtime_activation::committed_values::ObjectProtocolValueOp>::from_opcode",
+            "samples": 5
+          },
+          {
+            "path": "<otter_vm::runtime_activation::RuntimeCall>::object_protocol_values",
+            "samples": 5
+          },
+          {
+            "path": "otter_jit::entry::runtime_ops::reentry::jit_object_protocol_value_stub::{closure#0} <- <otter_vm::runtime_activation::RuntimeCall>::object_protocol_values",
+            "samples": 5
+          },
+          {
+            "path": "otter_jit::entry::runtime_ops::reentry::jit_object_protocol_value_stub::{closure#0} <- <otter_vm::Interpreter>::object_protocol_value <- <otter_vm::Interpreter>::loose_equal_with_context <- otter_vm::abstract_ops::is_loosely_equal",
+            "samples": 4
+          },
+          {
+            "path": "otter_jit::entry::runtime_ops::reentry::jit_object_protocol_value_stub::{closure#0} <- <otter_vm::code_space::ResolvedCtx as core::ops::deref::Deref>::deref",
+            "samples": 4
+          },
+          {
+            "path": "otter_jit::entry::runtime_ops::reentry::jit_object_protocol_value_stub::{closure#0} <- <otter_vm::runtime_activation::RuntimeCall>::object_protocol_values <- <otter_vm::runtime_activation::RuntimeCall>::published_opcode <- <otter_vm::Interpreter>::jit_anchored_safepoint",
+            "samples": 4
+          },
+          {
+            "path": "otter_jit::entry::runtime_ops::reentry::jit_object_protocol_value_stub::{closure#0} <- <otter_vm::Interpreter>::object_protocol_value <- <otter_vm::Interpreter>::loose_equal_with_context <- otter_vm::value::tag::is_cell_bits",
+            "samples": 3
+          },
+          {
+            "path": "<core::result::Result<otter_vm::runtime_activation::RuntimeCall, otter_vm::runtime_activation::committed_values::CommittedValueError>>::and_then::<otter_vm::value::Value, otter_jit::entry::runtime_ops::reentry::jit_object_protocol_value_stub::{closure#0}>",
+            "samples": 3
+          },
+          {
+            "path": "otter_jit::entry::runtime_ops::reentry::jit_object_protocol_value_stub::{closure#0} <- <otter_vm::runtime_activation::RuntimeCall>::object_protocol_values <- <otter_vm::runtime_activation::RuntimeCall>::published_opcode <- otter_vm::runtime_activation::semantic_source::frame_semantic_source <- <otter_vm::Interpreter>::jit_anchored_safepoint",
+            "samples": 3
+          },
+          {
+            "path": "otter_jit::entry::runtime_ops::reentry::jit_object_protocol_value_stub::{closure#0} <- <otter_vm::Interpreter>::loose_equal_with_context",
+            "samples": 3
+          },
+          {
+            "path": "otter_jit::entry::runtime_ops::reentry::jit_object_protocol_value_stub::{closure#0} <- <otter_vm::runtime_activation::RuntimeCall>::published_opcode",
+            "samples": 3
+          },
+          {
+            "path": "otter_jit::entry::runtime_ops::reentry::jit_object_protocol_value_stub::{closure#0} <- <otter_vm::Interpreter>::object_protocol_value <- otter_vm::abstract_ops::is_loosely_equal",
+            "samples": 3
+          },
+          {
+            "path": "otter_jit::entry::runtime_ops::reentry::jit_object_protocol_value_stub::{closure#0} <- <otter_vm::runtime_activation::RuntimeCall>::object_protocol_values <- <otter_vm::runtime_activation::RuntimeCall>::published_opcode <- otter_vm::runtime_activation::semantic_source::frame_semantic_source <- <hashbrown::raw::RawTable<(u64, otter_vm::jit_registry::RegisteredCode)>>::find::<hashbrown::map::equivalent_key<u64, u64, otter_vm::jit_registry::RegisteredCode>::{closure#0}>::{closure#0}",
+            "samples": 3
+          },
+          {
+            "path": "otter_jit::entry::runtime_ops::reentry::jit_object_protocol_value_stub",
+            "samples": 3
+          },
+          {
+            "path": "otter_jit::entry::runtime_ops::reentry::jit_object_protocol_value_stub::{closure#0} <- <otter_vm::Interpreter>::object_protocol_value <- <otter_vm::Interpreter>::loose_equal_with_context <- <otter_vm::value::Value>::is_boolean",
+            "samples": 2
+          },
+          {
+            "path": "otter_jit::entry::runtime_ops::reentry::jit_object_protocol_value_stub <- otter_jit::entry::runtime_ops::reentry::committed_value_result",
+            "samples": 2
+          },
+          {
+            "path": "otter_jit::entry::runtime_ops::reentry::jit_object_protocol_value_stub::{closure#0} <- <otter_vm::runtime_activation::RuntimeCall>::object_protocol_values <- otter_vm::runtime_activation::semantic_source::frame_semantic_source",
+            "samples": 2
+          },
+          {
+            "path": "otter_jit::entry::runtime_ops::reentry::jit_object_protocol_value_stub::{closure#0} <- <otter_vm::Interpreter>::object_protocol_value <- <otter_vm::Interpreter>::loose_equal_with_context <- <otter_vm::value::Value>::as_number",
+            "samples": 1
+          },
+          {
+            "path": "otter_jit::entry::runtime_ops::reentry::jit_object_protocol_value_stub::{closure#0} <- <otter_vm::Interpreter>::object_protocol_value <- <otter_vm::Interpreter>::instanceof_operator <- <otter_vm::Interpreter>::instanceof_target_prototype_scoped",
+            "samples": 1
+          },
+          {
+            "path": "otter_jit::entry::runtime_ops::reentry::jit_object_protocol_value_stub::{closure#0} <- <otter_vm::Interpreter>::record_jit_runtime_stub_class",
+            "samples": 1
+          },
+          {
+            "path": "otter_jit::entry::runtime_ops::reentry::jit_object_protocol_value_stub::{closure#0} <- <otter_vm::Interpreter>::object_protocol_value <- <otter_vm::Interpreter>::loose_equal_with_context <- otter_vm::abstract_ops::same_value_non_numeric_or_strict_numeric",
+            "samples": 1
+          },
+          {
+            "path": "otter_jit::entry::runtime_ops::reentry::jit_object_protocol_value_stub::{closure#0} <- <otter_vm::runtime_activation::RuntimeCall>::object_protocol_values <- <otter_vm::runtime_activation::RuntimeCall>::published_opcode <- otter_vm::runtime_activation::semantic_source::frame_semantic_source <- <core::option::Option<&otter_vm::native_abi::safepoints::SafepointRecord>>::ok_or::<otter_vm::run_control::VmError>",
+            "samples": 1
+          },
+          {
+            "path": "otter_jit::entry::runtime_ops::reentry::jit_object_protocol_value_stub::{closure#0} <- <core::result::Result<otter_bytecode::Op, otter_vm::run_control::VmError>>::and_then::<otter_vm::runtime_activation::committed_values::ObjectProtocolValueOp, <otter_vm::runtime_activation::committed_values::ObjectProtocolValueOp>::from_opcode>",
+            "samples": 1
+          },
+          {
+            "path": "otter_jit::entry::runtime_ops::reentry::jit_object_protocol_value_stub::{closure#0} <- <otter_vm::runtime_activation::RuntimeCall>::object_protocol_values <- <otter_vm::runtime_activation::RuntimeCall>::published_opcode <- core::ptr::drop_glue::<core::option::Option<otter_vm::execution_context::ExecutionContext>>",
+            "samples": 1
+          },
+          {
+            "path": "otter_jit::entry::runtime_ops::reentry::jit_object_protocol_value_stub::{closure#0} <- <otter_vm::Interpreter>::object_protocol_value <- <otter_vm::Interpreter>::instanceof_operator <- otter_vm::value::tag::is_cell_bits",
+            "samples": 1
+          }
+        ],
+        "objectBoundaryLeafRows": [
+          {
+            "symbol": "<otter_vm::Interpreter>::object_protocol_value",
+            "samples": 34
+          },
+          {
+            "symbol": "<otter_vm::runtime_activation::RuntimeCall>::published_opcode",
+            "samples": 32
+          },
+          {
+            "symbol": "<otter_vm::executable::ExecutableModule>::function_slot",
+            "samples": 18
+          },
+          {
+            "symbol": "<[otter_vm::native_abi::safepoints::SafepointRecord]>::binary_search_by::<<[otter_vm::native_abi::safepoints::SafepointRecord]>::binary_search_by_key<u32, <otter_jit::optimizing::OptimizedCode as otter_vm::jit::JitFunctionCode>::safepoint_record::{closure#0}>::{closure#0}>",
+            "samples": 16
+          },
+          {
+            "symbol": "otter_vm::runtime_activation::semantic_source::frame_semantic_source",
+            "samples": 15
+          },
+          {
+            "symbol": "<otter_vm::Interpreter>::loose_equal_with_context",
+            "samples": 12
+          },
+          {
+            "symbol": "<otter_vm::runtime_activation::RuntimeCall>::object_protocol_values",
+            "samples": 10
+          },
+          {
+            "symbol": "otter_vm::abstract_ops::is_loosely_equal",
+            "samples": 7
+          },
+          {
+            "symbol": "<otter_vm::Interpreter>::jit_anchored_safepoint",
+            "samples": 7
+          },
+          {
+            "symbol": "core::core_arch::arm_shared::neon::generated::vreinterpret_u64_u8",
+            "samples": 6
+          },
+          {
+            "symbol": "<otter_vm::runtime_activation::committed_values::ObjectProtocolValueOp>::from_opcode",
+            "samples": 5
+          },
+          {
+            "symbol": "otter_vm::value::tag::is_cell_bits",
+            "samples": 4
+          },
+          {
+            "symbol": "<otter_jit::optimizing::OptimizedCode as otter_vm::jit::JitFunctionCode>::safepoint_record",
+            "samples": 4
+          },
+          {
+            "symbol": "<otter_vm::code_space::ResolvedCtx as core::ops::deref::Deref>::deref",
+            "samples": 4
+          },
+          {
+            "symbol": "<core::result::Result<otter_vm::runtime_activation::RuntimeCall, otter_vm::runtime_activation::committed_values::CommittedValueError>>::and_then::<otter_vm::value::Value, otter_jit::entry::runtime_ops::reentry::jit_object_protocol_value_stub::{closure#0}>",
+            "samples": 3
+          },
+          {
+            "symbol": "<otter_vm::jit_registry::JitCodeRegistry>::generation_function_id::{closure#0}",
+            "samples": 3
+          },
+          {
+            "symbol": "<otter_jit::optimizing::OptimizedCode as otter_vm::jit::JitFunctionCode>::metadata",
+            "samples": 3
+          },
+          {
+            "symbol": "core::hint::select_unpredictable::<usize>",
+            "samples": 3
+          },
+          {
+            "symbol": "<hashbrown::raw::RawTable<(u64, otter_vm::jit_registry::RegisteredCode)>>::find::<hashbrown::map::equivalent_key<u64, u64, otter_vm::jit_registry::RegisteredCode>::{closure#0}>::{closure#0}",
+            "samples": 3
+          },
+          {
+            "symbol": "otter_jit::entry::runtime_ops::reentry::jit_object_protocol_value_stub",
+            "samples": 3
+          },
+          {
+            "symbol": "<otter_vm::value::Value>::is_boolean",
+            "samples": 2
+          },
+          {
+            "symbol": "otter_jit::entry::runtime_ops::reentry::committed_value_result",
+            "samples": 2
+          },
+          {
+            "symbol": "<otter_vm::jit_registry::JitCodeRegistry>::safepoint_record::{closure#0}",
+            "samples": 2
+          },
+          {
+            "symbol": "<otter_vm::value::Value>::as_number",
+            "samples": 1
+          },
+          {
+            "symbol": "<otter_vm::Interpreter>::instanceof_target_prototype_scoped",
+            "samples": 1
+          },
+          {
+            "symbol": "<otter_vm::Interpreter>::record_jit_runtime_stub_class",
+            "samples": 1
+          },
+          {
+            "symbol": "otter_vm::abstract_ops::same_value_non_numeric_or_strict_numeric",
+            "samples": 1
+          },
+          {
+            "symbol": "<core::option::Option<&otter_vm::native_abi::safepoints::SafepointRecord>>::ok_or::<otter_vm::run_control::VmError>",
+            "samples": 1
+          },
+          {
+            "symbol": "<core::result::Result<otter_bytecode::Op, otter_vm::run_control::VmError>>::and_then::<otter_vm::runtime_activation::committed_values::ObjectProtocolValueOp, <otter_vm::runtime_activation::committed_values::ObjectProtocolValueOp>::from_opcode>",
+            "samples": 1
+          },
+          {
+            "symbol": "core::ptr::drop_glue::<core::option::Option<otter_vm::execution_context::ExecutionContext>>",
+            "samples": 1
+          }
+        ],
+        "objectBoundaryFullPaths": [
+          {
+            "path": "otter_jit::entry::runtime_ops::reentry::jit_object_protocol_value_stub::{closure#0} <- <otter_vm::Interpreter>::object_protocol_value",
+            "samples": 34
+          },
+          {
+            "path": "otter_jit::entry::runtime_ops::reentry::jit_object_protocol_value_stub::{closure#0} <- <otter_vm::runtime_activation::RuntimeCall>::object_protocol_values <- <otter_vm::runtime_activation::RuntimeCall>::published_opcode",
+            "samples": 29
+          },
+          {
+            "path": "otter_jit::entry::runtime_ops::reentry::jit_object_protocol_value_stub::{closure#0} <- <otter_vm::runtime_activation::RuntimeCall>::object_protocol_values <- <otter_vm::runtime_activation::RuntimeCall>::published_opcode <- otter_vm::runtime_activation::semantic_source::frame_semantic_source <- <otter_vm::jit_registry::JitCodeRegistry>::safepoint_record::{closure#0} <- <[otter_vm::native_abi::safepoints::SafepointRecord]>::binary_search_by::<<[otter_vm::native_abi::safepoints::SafepointRecord]>::binary_search_by_key<u32, <otter_jit::optimizing::OptimizedCode as otter_vm::jit::JitFunctionCode>::safepoint_record::{closure#0}>::{closure#0}>",
+            "samples": 16
+          },
+          {
+            "path": "otter_jit::entry::runtime_ops::reentry::jit_object_protocol_value_stub::{closure#0} <- <otter_vm::runtime_activation::RuntimeCall>::object_protocol_values <- <otter_vm::runtime_activation::RuntimeCall>::published_opcode <- otter_vm::runtime_activation::semantic_source::frame_semantic_source",
+            "samples": 13
+          },
+          {
+            "path": "otter_jit::entry::runtime_ops::reentry::jit_object_protocol_value_stub::{closure#0} <- <otter_vm::runtime_activation::RuntimeCall>::object_protocol_values <- <otter_vm::runtime_activation::RuntimeCall>::published_opcode <- <otter_vm::executable::ExecutableModule>::function_slot",
+            "samples": 10
+          },
+          {
+            "path": "otter_jit::entry::runtime_ops::reentry::jit_object_protocol_value_stub::{closure#0} <- <otter_vm::Interpreter>::object_protocol_value <- <otter_vm::Interpreter>::loose_equal_with_context",
+            "samples": 9
+          },
+          {
+            "path": "otter_jit::entry::runtime_ops::reentry::jit_object_protocol_value_stub::{closure#0} <- <otter_vm::runtime_activation::RuntimeCall>::object_protocol_values <- <otter_vm::executable::ExecutableModule>::function_slot",
+            "samples": 8
+          },
+          {
+            "path": "otter_jit::entry::runtime_ops::reentry::jit_object_protocol_value_stub::{closure#0} <- <otter_vm::runtime_activation::RuntimeCall>::object_protocol_values <- <otter_vm::runtime_activation::RuntimeCall>::published_opcode <- otter_vm::runtime_activation::semantic_source::frame_semantic_source <- core::core_arch::arm_shared::neon::generated::vreinterpret_u64_u8",
+            "samples": 6
+          },
+          {
+            "path": "otter_jit::entry::runtime_ops::reentry::jit_object_protocol_value_stub::{closure#0} <- <otter_vm::runtime_activation::committed_values::ObjectProtocolValueOp>::from_opcode",
+            "samples": 5
+          },
+          {
+            "path": "<otter_vm::runtime_activation::RuntimeCall>::object_protocol_values",
+            "samples": 5
+          },
+          {
+            "path": "otter_jit::entry::runtime_ops::reentry::jit_object_protocol_value_stub::{closure#0} <- <otter_vm::runtime_activation::RuntimeCall>::object_protocol_values",
+            "samples": 5
+          },
+          {
+            "path": "otter_jit::entry::runtime_ops::reentry::jit_object_protocol_value_stub::{closure#0} <- <otter_vm::Interpreter>::object_protocol_value <- <otter_vm::Interpreter>::loose_equal_with_context <- otter_vm::abstract_ops::is_loosely_equal",
+            "samples": 4
+          },
+          {
+            "path": "otter_jit::entry::runtime_ops::reentry::jit_object_protocol_value_stub::{closure#0} <- <otter_vm::runtime_activation::RuntimeCall>::object_protocol_values <- <otter_vm::runtime_activation::RuntimeCall>::published_opcode <- otter_vm::runtime_activation::semantic_source::frame_semantic_source <- <otter_vm::jit_registry::JitCodeRegistry>::safepoint_record::{closure#0} <- <otter_jit::optimizing::OptimizedCode as otter_vm::jit::JitFunctionCode>::safepoint_record",
+            "samples": 4
+          },
+          {
+            "path": "otter_jit::entry::runtime_ops::reentry::jit_object_protocol_value_stub::{closure#0} <- <otter_vm::code_space::ResolvedCtx as core::ops::deref::Deref>::deref",
+            "samples": 4
+          },
+          {
+            "path": "otter_jit::entry::runtime_ops::reentry::jit_object_protocol_value_stub::{closure#0} <- <otter_vm::runtime_activation::RuntimeCall>::object_protocol_values <- <otter_vm::runtime_activation::RuntimeCall>::published_opcode <- <otter_vm::Interpreter>::jit_anchored_safepoint",
+            "samples": 4
+          },
+          {
+            "path": "otter_jit::entry::runtime_ops::reentry::jit_object_protocol_value_stub::{closure#0} <- <otter_vm::Interpreter>::object_protocol_value <- <otter_vm::Interpreter>::loose_equal_with_context <- otter_vm::value::tag::is_cell_bits",
+            "samples": 3
+          },
+          {
+            "path": "<core::result::Result<otter_vm::runtime_activation::RuntimeCall, otter_vm::runtime_activation::committed_values::CommittedValueError>>::and_then::<otter_vm::value::Value, otter_jit::entry::runtime_ops::reentry::jit_object_protocol_value_stub::{closure#0}>",
+            "samples": 3
+          },
+          {
+            "path": "otter_jit::entry::runtime_ops::reentry::jit_object_protocol_value_stub::{closure#0} <- <otter_vm::runtime_activation::RuntimeCall>::object_protocol_values <- <otter_vm::runtime_activation::RuntimeCall>::published_opcode <- otter_vm::runtime_activation::semantic_source::frame_semantic_source <- <otter_vm::jit_registry::JitCodeRegistry>::generation_function_id::{closure#0}",
+            "samples": 3
+          },
+          {
+            "path": "otter_jit::entry::runtime_ops::reentry::jit_object_protocol_value_stub::{closure#0} <- <otter_vm::runtime_activation::RuntimeCall>::object_protocol_values <- <otter_vm::runtime_activation::RuntimeCall>::published_opcode <- otter_vm::runtime_activation::semantic_source::frame_semantic_source <- <otter_vm::jit_registry::JitCodeRegistry>::generation_function_id::{closure#0} <- <otter_jit::optimizing::OptimizedCode as otter_vm::jit::JitFunctionCode>::metadata",
+            "samples": 3
+          },
+          {
+            "path": "otter_jit::entry::runtime_ops::reentry::jit_object_protocol_value_stub::{closure#0} <- <otter_vm::runtime_activation::RuntimeCall>::object_protocol_values <- <otter_vm::runtime_activation::RuntimeCall>::published_opcode <- otter_vm::runtime_activation::semantic_source::frame_semantic_source <- <otter_vm::Interpreter>::jit_anchored_safepoint",
+            "samples": 3
+          },
+          {
+            "path": "otter_jit::entry::runtime_ops::reentry::jit_object_protocol_value_stub::{closure#0} <- <otter_vm::Interpreter>::loose_equal_with_context",
+            "samples": 3
+          },
+          {
+            "path": "otter_jit::entry::runtime_ops::reentry::jit_object_protocol_value_stub::{closure#0} <- <otter_vm::runtime_activation::RuntimeCall>::published_opcode",
+            "samples": 3
+          },
+          {
+            "path": "otter_jit::entry::runtime_ops::reentry::jit_object_protocol_value_stub::{closure#0} <- <otter_vm::runtime_activation::RuntimeCall>::object_protocol_values <- <otter_vm::runtime_activation::RuntimeCall>::published_opcode <- otter_vm::runtime_activation::semantic_source::frame_semantic_source <- <otter_vm::jit_registry::JitCodeRegistry>::safepoint_record::{closure#0} <- core::hint::select_unpredictable::<usize>",
+            "samples": 3
+          },
+          {
+            "path": "otter_jit::entry::runtime_ops::reentry::jit_object_protocol_value_stub::{closure#0} <- <otter_vm::Interpreter>::object_protocol_value <- otter_vm::abstract_ops::is_loosely_equal",
+            "samples": 3
+          },
+          {
+            "path": "otter_jit::entry::runtime_ops::reentry::jit_object_protocol_value_stub::{closure#0} <- <otter_vm::runtime_activation::RuntimeCall>::object_protocol_values <- <otter_vm::runtime_activation::RuntimeCall>::published_opcode <- otter_vm::runtime_activation::semantic_source::frame_semantic_source <- <hashbrown::raw::RawTable<(u64, otter_vm::jit_registry::RegisteredCode)>>::find::<hashbrown::map::equivalent_key<u64, u64, otter_vm::jit_registry::RegisteredCode>::{closure#0}>::{closure#0}",
+            "samples": 3
+          },
+          {
+            "path": "otter_jit::entry::runtime_ops::reentry::jit_object_protocol_value_stub",
+            "samples": 3
+          },
+          {
+            "path": "otter_jit::entry::runtime_ops::reentry::jit_object_protocol_value_stub::{closure#0} <- <otter_vm::Interpreter>::object_protocol_value <- <otter_vm::Interpreter>::loose_equal_with_context <- <otter_vm::value::Value>::is_boolean",
+            "samples": 2
+          },
+          {
+            "path": "otter_jit::entry::runtime_ops::reentry::jit_object_protocol_value_stub <- otter_jit::entry::runtime_ops::reentry::committed_value_result",
+            "samples": 2
+          },
+          {
+            "path": "otter_jit::entry::runtime_ops::reentry::jit_object_protocol_value_stub::{closure#0} <- <otter_vm::runtime_activation::RuntimeCall>::object_protocol_values <- otter_vm::runtime_activation::semantic_source::frame_semantic_source",
+            "samples": 2
+          },
+          {
+            "path": "otter_jit::entry::runtime_ops::reentry::jit_object_protocol_value_stub::{closure#0} <- <otter_vm::runtime_activation::RuntimeCall>::object_protocol_values <- <otter_vm::runtime_activation::RuntimeCall>::published_opcode <- otter_vm::runtime_activation::semantic_source::frame_semantic_source <- <otter_vm::jit_registry::JitCodeRegistry>::safepoint_record::{closure#0}",
+            "samples": 2
+          },
+          {
+            "path": "otter_jit::entry::runtime_ops::reentry::jit_object_protocol_value_stub::{closure#0} <- <otter_vm::Interpreter>::object_protocol_value <- <otter_vm::Interpreter>::loose_equal_with_context <- <otter_vm::value::Value>::as_number",
+            "samples": 1
+          },
+          {
+            "path": "otter_jit::entry::runtime_ops::reentry::jit_object_protocol_value_stub::{closure#0} <- <otter_vm::Interpreter>::object_protocol_value <- <otter_vm::Interpreter>::instanceof_operator <- <otter_vm::Interpreter>::instanceof_target_prototype_scoped",
+            "samples": 1
+          },
+          {
+            "path": "otter_jit::entry::runtime_ops::reentry::jit_object_protocol_value_stub::{closure#0} <- <otter_vm::Interpreter>::record_jit_runtime_stub_class",
+            "samples": 1
+          },
+          {
+            "path": "otter_jit::entry::runtime_ops::reentry::jit_object_protocol_value_stub::{closure#0} <- <otter_vm::Interpreter>::object_protocol_value <- <otter_vm::Interpreter>::loose_equal_with_context <- otter_vm::abstract_ops::same_value_non_numeric_or_strict_numeric",
+            "samples": 1
+          },
+          {
+            "path": "otter_jit::entry::runtime_ops::reentry::jit_object_protocol_value_stub::{closure#0} <- <otter_vm::runtime_activation::RuntimeCall>::object_protocol_values <- <otter_vm::runtime_activation::RuntimeCall>::published_opcode <- otter_vm::runtime_activation::semantic_source::frame_semantic_source <- <core::option::Option<&otter_vm::native_abi::safepoints::SafepointRecord>>::ok_or::<otter_vm::run_control::VmError>",
+            "samples": 1
+          },
+          {
+            "path": "otter_jit::entry::runtime_ops::reentry::jit_object_protocol_value_stub::{closure#0} <- <core::result::Result<otter_bytecode::Op, otter_vm::run_control::VmError>>::and_then::<otter_vm::runtime_activation::committed_values::ObjectProtocolValueOp, <otter_vm::runtime_activation::committed_values::ObjectProtocolValueOp>::from_opcode>",
+            "samples": 1
+          },
+          {
+            "path": "otter_jit::entry::runtime_ops::reentry::jit_object_protocol_value_stub::{closure#0} <- <otter_vm::runtime_activation::RuntimeCall>::object_protocol_values <- <otter_vm::runtime_activation::RuntimeCall>::published_opcode <- core::ptr::drop_glue::<core::option::Option<otter_vm::execution_context::ExecutionContext>>",
+            "samples": 1
+          },
+          {
+            "path": "otter_jit::entry::runtime_ops::reentry::jit_object_protocol_value_stub::{closure#0} <- <otter_vm::Interpreter>::object_protocol_value <- <otter_vm::Interpreter>::instanceof_operator <- otter_vm::value::tag::is_cell_bits",
+            "samples": 1
+          }
+        ],
+        "retainedScalarLookupFullPaths": [],
+        "independentLookupFullPaths": [],
+        "independentSourceLookupFullPaths": [
+          {
+            "path": "otter_vm::interp::host_call::prepare_activation::{closure#0} <- <otter_vm::Interpreter>::publish_constructor_receiver_ticket <- <otter_vm::Interpreter>::record_prepared_construct_family <- otter_vm::runtime_activation::semantic_source::frame_semantic_source",
+            "samples": 2
+          },
+          {
+            "path": "otter_vm::constructor_layout::native_receiver::constructor_receiver_commit::{closure#0} <- <otter_vm::Interpreter>::record_prepared_construct_family <- otter_vm::runtime_activation::semantic_source::frame_semantic_source <- <otter_vm::Interpreter>::jit_anchored_safepoint",
+            "samples": 2
+          },
+          {
+            "path": "otter_jit::entry::runtime_ops::vm_ops::jit_load_element_stub::{closure#0} <- <otter_vm::executable::ExecutableModule>::function <- <otter_vm::executable::ExecutableModule>::function_slot",
+            "samples": 1
+          },
+          {
+            "path": "otter_native_invoke <- otter_native_invoke <- otter_native_invoke <- otter_native_invoke <- otter_vm::interp::call_dispatch::interpreter_entry <- otter_vm::interp::call_dispatch::interpreter_turn <- <otter_vm::executable::ExecutableModule>::function <- <otter_vm::executable::ExecutableModule>::function_slot <- otter_bytecode::verifier::verify_function <- <core::option::Option<otter_bytecode::opcode_schema::OperandKind> as core::ops::try_trait::Try>::branch",
+            "samples": 1
+          },
+          {
+            "path": "otter_jit::entry::runtime_ops::vm_ops::jit_store_property_stub::{closure#0} <- <otter_vm::runtime_activation::RuntimeCall>::store_property_value <- <otter_vm::Interpreter>::complete_named_store::<false> <- <otter_vm::executable::ExecutableModule>::function <- <otter_vm::executable::ExecutableModule>::function_slot",
+            "samples": 1
+          }
+        ],
+        "unattributedKernelFullPaths": [
+          {
+            "path": "<otter_vm::Interpreter>::object_protocol_value",
+            "samples": 3
+          }
+        ],
+        "scalarBoundarySamples": 0,
+        "scalarOperationLookupSubtreeSelfSamples": 0
+      },
+      {
+        "profile": "after-runtime-profile-sequential",
+        "runs": 3,
+        "selfSamples": 2983,
+        "selfSamplesPerRun": {
+          "0": 1029,
+          "1": 972,
+          "2": 982
+        },
+        "samplesWithGeneratedFrame": 2832,
+        "objectProtocolBoundarySamples": 109,
+        "objectProtocolNamedStubSamples": 8,
+        "ownerProofSamples": {
+          "exact-current-stub-PC": 101,
+          "named-stub": 8
+        },
+        "physicalOwnerExamples": [
+          {
+            "run": 0,
+            "generatedCaller": "JS:<anonymous> [template c43]",
+            "nativeExtent": [
+              {
+                "symbol": "<otter_vm::Interpreter>::function_prototype_slot",
+                "runtimeAddress": "0x105531209",
+                "linkedAddress": "0x100ccd209"
+              },
+              {
+                "symbol": "<otter_vm::Interpreter>::function_property_get_with_receiver",
+                "runtimeAddress": "0x1054eddb8",
+                "linkedAddress": "0x100c89db8"
+              },
+              {
+                "symbol": "<otter_vm::Interpreter>::instanceof_target_prototype_scoped",
+                "runtimeAddress": "0x1054e6844",
+                "linkedAddress": "0x100c82844"
+              },
+              {
+                "symbol": "<otter_vm::Interpreter>::instanceof_operator",
+                "runtimeAddress": "0x1054e4e2c",
+                "linkedAddress": "0x100c80e2c"
+              },
+              {
+                "symbol": "<otter_vm::Interpreter>::object_protocol_value",
+                "runtimeAddress": "0x1055fb1ac",
+                "linkedAddress": "0x100d971ac"
+              },
+              {
+                "symbol": "<otter_vm::runtime_activation::RuntimeCall>::object_protocol_values",
+                "runtimeAddress": "0x10505a64c",
+                "linkedAddress": "0x1007f664c"
+              }
+            ]
+          },
+          {
+            "run": 0,
+            "generatedCaller": "JS:<anonymous> [optimizing c369]",
+            "nativeExtent": [
+              {
+                "symbol": "<otter_vm::Interpreter>::object_protocol_value",
+                "runtimeAddress": "0x1055fb095",
+                "linkedAddress": "0x100d97095"
+              },
+              {
+                "symbol": "<otter_vm::runtime_activation::RuntimeCall>::object_protocol_values",
+                "runtimeAddress": "0x10505a64c",
+                "linkedAddress": "0x1007f664c"
+              }
+            ]
+          },
+          {
+            "run": 0,
+            "generatedCaller": "JS:<anonymous> [optimizing c369]",
+            "nativeExtent": [
+              {
+                "symbol": "<otter_vm::Interpreter>::loose_equal_with_context",
+                "runtimeAddress": "0x1056395e5",
+                "linkedAddress": "0x100dd55e5"
+              },
+              {
+                "symbol": "<otter_vm::Interpreter>::object_protocol_value",
+                "runtimeAddress": "0x1055fb190",
+                "linkedAddress": "0x100d97190"
+              },
+              {
+                "symbol": "<otter_vm::runtime_activation::RuntimeCall>::object_protocol_values",
+                "runtimeAddress": "0x10505a64c",
+                "linkedAddress": "0x1007f664c"
+              }
+            ]
+          },
+          {
+            "run": 0,
+            "generatedCaller": "JS:<anonymous> [optimizing c369]",
+            "nativeExtent": [
+              {
+                "symbol": "<otter_vm::Interpreter>::object_protocol_value",
+                "runtimeAddress": "0x1055fbb7d",
+                "linkedAddress": "0x100d97b7d"
+              },
+              {
+                "symbol": "<otter_vm::runtime_activation::RuntimeCall>::object_protocol_values",
+                "runtimeAddress": "0x10505a64c",
+                "linkedAddress": "0x1007f664c"
+              }
+            ]
+          },
+          {
+            "run": 0,
+            "generatedCaller": "JS:<anonymous> [optimizing c408]",
+            "nativeExtent": [
+              {
+                "symbol": "<otter_vm::Interpreter>::loose_equal_with_context",
+                "runtimeAddress": "0x1056394d9",
+                "linkedAddress": "0x100dd54d9"
+              },
+              {
+                "symbol": "<otter_vm::Interpreter>::object_protocol_value",
+                "runtimeAddress": "0x1055fb190",
+                "linkedAddress": "0x100d97190"
+              },
+              {
+                "symbol": "<otter_vm::runtime_activation::RuntimeCall>::object_protocol_values",
+                "runtimeAddress": "0x10505a64c",
+                "linkedAddress": "0x1007f664c"
+              }
+            ]
+          },
+          {
+            "run": 0,
+            "generatedCaller": "JS:<anonymous> [optimizing c307]",
+            "nativeExtent": [
+              {
+                "symbol": "<otter_vm::value::Value>::as_number",
+                "runtimeAddress": "0x105667931",
+                "linkedAddress": "0x100e03931"
+              },
+              {
+                "symbol": "<otter_vm::Interpreter>::loose_equal_with_context",
+                "runtimeAddress": "0x105639658",
+                "linkedAddress": "0x100dd5658"
+              },
+              {
+                "symbol": "<otter_vm::Interpreter>::object_protocol_value",
+                "runtimeAddress": "0x1055fb190",
+                "linkedAddress": "0x100d97190"
+              },
+              {
+                "symbol": "<otter_vm::runtime_activation::RuntimeCall>::object_protocol_values",
+                "runtimeAddress": "0x10505a64c",
+                "linkedAddress": "0x1007f664c"
+              }
+            ]
+          }
+        ],
+        "operationLookupLeafRows": [],
+        "operationLookupFullPaths": [],
+        "objectBoundaryDepth5Rows": [
+          {
+            "path": "<otter_vm::runtime_activation::RuntimeCall>::object_protocol_values <- <otter_vm::Interpreter>::object_protocol_value",
+            "samples": 26
+          },
+          {
+            "path": "<otter_vm::runtime_activation::RuntimeCall>::object_protocol_values <- <otter_vm::Interpreter>::object_protocol_value <- <otter_vm::Interpreter>::loose_equal_with_context",
+            "samples": 17
+          },
+          {
+            "path": "<otter_vm::runtime_activation::RuntimeCall>::object_protocol_values <- <otter_vm::Interpreter>::object_protocol_value <- <otter_vm::Interpreter>::loose_equal_with_context <- otter_vm::abstract_ops::is_loosely_equal",
+            "samples": 13
+          },
+          {
+            "path": "<otter_vm::runtime_activation::RuntimeCall>::object_protocol_values <- <otter_vm::Interpreter>::object_protocol_value <- <otter_vm::Interpreter>::loose_equal_with_context <- <otter_vm::value::Value>::as_number",
+            "samples": 6
+          },
+          {
+            "path": "<otter_vm::runtime_activation::RuntimeCall>::object_protocol_values",
+            "samples": 6
+          },
+          {
+            "path": "<otter_vm::runtime_activation::RuntimeCall>::object_protocol_values <- <otter_vm::Interpreter>::object_protocol_value <- otter_vm::abstract_ops::is_loosely_equal",
+            "samples": 6
+          },
+          {
+            "path": "otter_jit::entry::runtime_ops::reentry::jit_object_protocol_value_stub",
+            "samples": 6
+          },
+          {
+            "path": "<otter_vm::native_abi::call_thread::JitCtx>::runtime_call <- otter_vm::active_frame::checked_window::<otter_vm::value::Value>",
+            "samples": 4
+          },
+          {
+            "path": "<otter_vm::runtime_activation::RuntimeCall>::object_protocol_values <- <otter_vm::Interpreter>::object_protocol_value <- <otter_vm::Interpreter>::loose_equal_with_context <- otter_vm::value::tag::is_cell_bits",
+            "samples": 3
+          },
+          {
+            "path": "<otter_vm::runtime_activation::RuntimeCall>::object_protocol_values <- <otter_vm::Interpreter>::object_protocol_value <- <otter_vm::Interpreter>::loose_equal_with_context <- otter_vm::abstract_ops::same_value_non_numeric_or_strict_numeric",
+            "samples": 2
+          },
+          {
+            "path": "<otter_vm::runtime_activation::RuntimeCall>::object_protocol_values <- <otter_vm::Interpreter>::loose_equal_with_context",
+            "samples": 2
+          },
+          {
+            "path": "<otter_vm::native_abi::call_thread::JitCtx>::runtime_call <- <otter_vm::runtime_activation::RuntimeCall>::bind",
+            "samples": 2
+          },
+          {
+            "path": "<core::result::Result<otter_vm::runtime_activation::RuntimeCall, otter_vm::run_control::VmError>>::map_err::<otter_vm::runtime_activation::committed_values::CommittedValueError, otter_vm::runtime_activation::committed_values::CommittedValueError::Fatal>",
+            "samples": 2
+          },
+          {
+            "path": "<otter_vm::runtime_activation::RuntimeCall>::object_protocol_values <- <otter_vm::Interpreter>::object_protocol_value <- <otter_vm::Interpreter>::instanceof_operator <- <otter_vm::Interpreter>::instanceof_target_prototype_scoped <- <otter_vm::Interpreter>::function_property_get_with_receiver",
+            "samples": 1
+          },
+          {
+            "path": "otter_jit::entry::runtime_ops::reentry::jit_object_protocol_value_stub::{closure#0}",
+            "samples": 1
+          },
+          {
+            "path": "<otter_vm::runtime_activation::RuntimeCall>::object_protocol_values <- <otter_vm::Interpreter>::object_protocol_value <- <otter_vm::Interpreter>::instanceof_operator <- <alloc::vec::Vec<core::option::Option<*const dyn otter_gc::frame_roots::FrameRoots>>>::truncate",
+            "samples": 1
+          },
+          {
+            "path": "otter_jit::entry::runtime_ops::reentry::jit_object_protocol_value_stub <- otter_jit::entry::runtime_ops::reentry::committed_value_result",
+            "samples": 1
+          },
+          {
+            "path": "<otter_vm::runtime_activation::RuntimeCall>::object_protocol_values <- <otter_vm::Interpreter>::object_protocol_value <- <otter_vm::Interpreter>::instanceof_operator <- <otter_vm::Interpreter>::ordinary_get_value::{closure#0} <- <otter_vm::Interpreter>::callable_bag_read",
+            "samples": 1
+          },
+          {
+            "path": "<otter_vm::runtime_activation::RuntimeCall>::object_protocol_values <- <otter_vm::Interpreter>::object_protocol_value <- <otter_vm::Interpreter>::loose_equal_with_context <- <otter_vm::value::Value>::is_boolean",
+            "samples": 1
+          },
+          {
+            "path": "<otter_vm::native_abi::call_thread::JitCtx>::runtime_call <- <alloc::vec::Vec<otter_bytecode::Function>>::len",
+            "samples": 1
+          },
+          {
+            "path": "<otter_vm::native_abi::call_thread::JitCtx>::runtime_call <- <otter_vm::native_abi::frame::Frame>::incoming_argument_count",
+            "samples": 1
+          },
+          {
+            "path": "<otter_vm::native_abi::call_thread::JitCtx>::runtime_call",
+            "samples": 1
+          },
+          {
+            "path": "<otter_vm::runtime_activation::RuntimeCall>::object_protocol_values <- <otter_vm::Interpreter>::object_protocol_value <- <otter_vm::Interpreter>::instanceof_operator <- <otter_vm::Interpreter>::value_has_proxy_aware_prototype::{closure#0}",
+            "samples": 1
+          },
+          {
+            "path": "<otter_vm::native_abi::call_thread::JitCtx>::runtime_call <- <otter_vm::execution_context::ExecutionContext>::covers_function",
+            "samples": 1
+          },
+          {
+            "path": "<otter_vm::code_space::ResolvedCtx as core::ops::deref::Deref>::deref",
+            "samples": 1
+          },
+          {
+            "path": "<otter_vm::native_abi::call_thread::JitCtx>::runtime_call <- <otter_vm::execution_context::ExecutionContext>::for_function",
+            "samples": 1
+          },
+          {
+            "path": "<otter_vm::runtime_activation::RuntimeCall>::object_protocol_values <- <otter_vm::Interpreter>::object_protocol_value <- <otter_vm::Interpreter>::instanceof_operator <- <otter_vm::Interpreter>::value_has_proxy_aware_prototype::{closure#0} <- <otter_gc::header::GcHeader>::type_tag",
+            "samples": 1
+          }
+        ],
+        "objectBoundaryLeafRows": [
+          {
+            "symbol": "<otter_vm::Interpreter>::object_protocol_value",
+            "samples": 26
+          },
+          {
+            "symbol": "<otter_vm::Interpreter>::loose_equal_with_context",
+            "samples": 19
+          },
+          {
+            "symbol": "otter_vm::abstract_ops::is_loosely_equal",
+            "samples": 19
+          },
+          {
+            "symbol": "<otter_vm::value::Value>::as_number",
+            "samples": 6
+          },
+          {
+            "symbol": "<otter_vm::runtime_activation::RuntimeCall>::object_protocol_values",
+            "samples": 6
+          },
+          {
+            "symbol": "otter_jit::entry::runtime_ops::reentry::jit_object_protocol_value_stub",
+            "samples": 6
+          },
+          {
+            "symbol": "otter_vm::active_frame::checked_window::<otter_vm::value::Value>",
+            "samples": 4
+          },
+          {
+            "symbol": "otter_vm::value::tag::is_cell_bits",
+            "samples": 3
+          },
+          {
+            "symbol": "otter_vm::abstract_ops::same_value_non_numeric_or_strict_numeric",
+            "samples": 2
+          },
+          {
+            "symbol": "<otter_vm::runtime_activation::RuntimeCall>::bind",
+            "samples": 2
+          },
+          {
+            "symbol": "<core::result::Result<otter_vm::runtime_activation::RuntimeCall, otter_vm::run_control::VmError>>::map_err::<otter_vm::runtime_activation::committed_values::CommittedValueError, otter_vm::runtime_activation::committed_values::CommittedValueError::Fatal>",
+            "samples": 2
+          },
+          {
+            "symbol": "<otter_vm::Interpreter>::function_prototype_slot",
+            "samples": 1
+          },
+          {
+            "symbol": "otter_jit::entry::runtime_ops::reentry::jit_object_protocol_value_stub::{closure#0}",
+            "samples": 1
+          },
+          {
+            "symbol": "<alloc::vec::Vec<core::option::Option<*const dyn otter_gc::frame_roots::FrameRoots>>>::truncate",
+            "samples": 1
+          },
+          {
+            "symbol": "otter_jit::entry::runtime_ops::reentry::committed_value_result",
+            "samples": 1
+          },
+          {
+            "symbol": "<otter_vm::Interpreter>::callable_bag_read",
+            "samples": 1
+          },
+          {
+            "symbol": "<otter_vm::value::Value>::is_boolean",
+            "samples": 1
+          },
+          {
+            "symbol": "<alloc::vec::Vec<otter_bytecode::Function>>::len",
+            "samples": 1
+          },
+          {
+            "symbol": "<otter_vm::native_abi::frame::Frame>::incoming_argument_count",
+            "samples": 1
+          },
+          {
+            "symbol": "<otter_vm::native_abi::call_thread::JitCtx>::runtime_call",
+            "samples": 1
+          },
+          {
+            "symbol": "<otter_vm::Interpreter>::value_has_proxy_aware_prototype::{closure#0}",
+            "samples": 1
+          },
+          {
+            "symbol": "<otter_vm::execution_context::ExecutionContext>::covers_function",
+            "samples": 1
+          },
+          {
+            "symbol": "<otter_vm::code_space::ResolvedCtx as core::ops::deref::Deref>::deref",
+            "samples": 1
+          },
+          {
+            "symbol": "<otter_vm::execution_context::ExecutionContext>::for_function",
+            "samples": 1
+          },
+          {
+            "symbol": "<otter_gc::header::GcHeader>::type_tag",
+            "samples": 1
+          }
+        ],
+        "objectBoundaryFullPaths": [
+          {
+            "path": "<otter_vm::runtime_activation::RuntimeCall>::object_protocol_values <- <otter_vm::Interpreter>::object_protocol_value",
+            "samples": 26
+          },
+          {
+            "path": "<otter_vm::runtime_activation::RuntimeCall>::object_protocol_values <- <otter_vm::Interpreter>::object_protocol_value <- <otter_vm::Interpreter>::loose_equal_with_context",
+            "samples": 17
+          },
+          {
+            "path": "<otter_vm::runtime_activation::RuntimeCall>::object_protocol_values <- <otter_vm::Interpreter>::object_protocol_value <- <otter_vm::Interpreter>::loose_equal_with_context <- otter_vm::abstract_ops::is_loosely_equal",
+            "samples": 13
+          },
+          {
+            "path": "<otter_vm::runtime_activation::RuntimeCall>::object_protocol_values <- <otter_vm::Interpreter>::object_protocol_value <- <otter_vm::Interpreter>::loose_equal_with_context <- <otter_vm::value::Value>::as_number",
+            "samples": 6
+          },
+          {
+            "path": "<otter_vm::runtime_activation::RuntimeCall>::object_protocol_values",
+            "samples": 6
+          },
+          {
+            "path": "<otter_vm::runtime_activation::RuntimeCall>::object_protocol_values <- <otter_vm::Interpreter>::object_protocol_value <- otter_vm::abstract_ops::is_loosely_equal",
+            "samples": 6
+          },
+          {
+            "path": "otter_jit::entry::runtime_ops::reentry::jit_object_protocol_value_stub",
+            "samples": 6
+          },
+          {
+            "path": "<otter_vm::native_abi::call_thread::JitCtx>::runtime_call <- otter_vm::active_frame::checked_window::<otter_vm::value::Value>",
+            "samples": 4
+          },
+          {
+            "path": "<otter_vm::runtime_activation::RuntimeCall>::object_protocol_values <- <otter_vm::Interpreter>::object_protocol_value <- <otter_vm::Interpreter>::loose_equal_with_context <- otter_vm::value::tag::is_cell_bits",
+            "samples": 3
+          },
+          {
+            "path": "<otter_vm::runtime_activation::RuntimeCall>::object_protocol_values <- <otter_vm::Interpreter>::object_protocol_value <- <otter_vm::Interpreter>::loose_equal_with_context <- otter_vm::abstract_ops::same_value_non_numeric_or_strict_numeric",
+            "samples": 2
+          },
+          {
+            "path": "<otter_vm::runtime_activation::RuntimeCall>::object_protocol_values <- <otter_vm::Interpreter>::loose_equal_with_context",
+            "samples": 2
+          },
+          {
+            "path": "<otter_vm::native_abi::call_thread::JitCtx>::runtime_call <- <otter_vm::runtime_activation::RuntimeCall>::bind",
+            "samples": 2
+          },
+          {
+            "path": "<core::result::Result<otter_vm::runtime_activation::RuntimeCall, otter_vm::run_control::VmError>>::map_err::<otter_vm::runtime_activation::committed_values::CommittedValueError, otter_vm::runtime_activation::committed_values::CommittedValueError::Fatal>",
+            "samples": 2
+          },
+          {
+            "path": "<otter_vm::runtime_activation::RuntimeCall>::object_protocol_values <- <otter_vm::Interpreter>::object_protocol_value <- <otter_vm::Interpreter>::instanceof_operator <- <otter_vm::Interpreter>::instanceof_target_prototype_scoped <- <otter_vm::Interpreter>::function_property_get_with_receiver <- <otter_vm::Interpreter>::function_prototype_slot",
+            "samples": 1
+          },
+          {
+            "path": "otter_jit::entry::runtime_ops::reentry::jit_object_protocol_value_stub::{closure#0}",
+            "samples": 1
+          },
+          {
+            "path": "<otter_vm::runtime_activation::RuntimeCall>::object_protocol_values <- <otter_vm::Interpreter>::object_protocol_value <- <otter_vm::Interpreter>::instanceof_operator <- <alloc::vec::Vec<core::option::Option<*const dyn otter_gc::frame_roots::FrameRoots>>>::truncate",
+            "samples": 1
+          },
+          {
+            "path": "otter_jit::entry::runtime_ops::reentry::jit_object_protocol_value_stub <- otter_jit::entry::runtime_ops::reentry::committed_value_result",
+            "samples": 1
+          },
+          {
+            "path": "<otter_vm::runtime_activation::RuntimeCall>::object_protocol_values <- <otter_vm::Interpreter>::object_protocol_value <- <otter_vm::Interpreter>::instanceof_operator <- <otter_vm::Interpreter>::ordinary_get_value::{closure#0} <- <otter_vm::Interpreter>::callable_bag_read",
+            "samples": 1
+          },
+          {
+            "path": "<otter_vm::runtime_activation::RuntimeCall>::object_protocol_values <- <otter_vm::Interpreter>::object_protocol_value <- <otter_vm::Interpreter>::loose_equal_with_context <- <otter_vm::value::Value>::is_boolean",
+            "samples": 1
+          },
+          {
+            "path": "<otter_vm::native_abi::call_thread::JitCtx>::runtime_call <- <alloc::vec::Vec<otter_bytecode::Function>>::len",
+            "samples": 1
+          },
+          {
+            "path": "<otter_vm::native_abi::call_thread::JitCtx>::runtime_call <- <otter_vm::native_abi::frame::Frame>::incoming_argument_count",
+            "samples": 1
+          },
+          {
+            "path": "<otter_vm::native_abi::call_thread::JitCtx>::runtime_call",
+            "samples": 1
+          },
+          {
+            "path": "<otter_vm::runtime_activation::RuntimeCall>::object_protocol_values <- <otter_vm::Interpreter>::object_protocol_value <- <otter_vm::Interpreter>::instanceof_operator <- <otter_vm::Interpreter>::value_has_proxy_aware_prototype::{closure#0}",
+            "samples": 1
+          },
+          {
+            "path": "<otter_vm::native_abi::call_thread::JitCtx>::runtime_call <- <otter_vm::execution_context::ExecutionContext>::covers_function",
+            "samples": 1
+          },
+          {
+            "path": "<otter_vm::code_space::ResolvedCtx as core::ops::deref::Deref>::deref",
+            "samples": 1
+          },
+          {
+            "path": "<otter_vm::native_abi::call_thread::JitCtx>::runtime_call <- <otter_vm::execution_context::ExecutionContext>::for_function",
+            "samples": 1
+          },
+          {
+            "path": "<otter_vm::runtime_activation::RuntimeCall>::object_protocol_values <- <otter_vm::Interpreter>::object_protocol_value <- <otter_vm::Interpreter>::instanceof_operator <- <otter_vm::Interpreter>::value_has_proxy_aware_prototype::{closure#0} <- <otter_gc::header::GcHeader>::type_tag",
+            "samples": 1
+          }
+        ],
+        "retainedScalarLookupFullPaths": [],
+        "independentLookupFullPaths": [],
+        "independentSourceLookupFullPaths": [
+          {
+            "path": "otter_vm::constructor_layout::native_receiver::constructor_receiver_commit::{closure#0} <- <otter_vm::Interpreter>::record_prepared_construct_family <- otter_vm::runtime_activation::semantic_source::frame_semantic_source <- <otter_vm::Interpreter>::jit_anchored_safepoint <- otter_vm::native_abi::return_pc::return_pc_record <- <[otter_vm::native_abi::safepoints::SafepointRecord]>::binary_search_by::<<[otter_vm::native_abi::safepoints::SafepointRecord]>::binary_search_by_key<u32, <otter_jit::template::code::TemplateCode as otter_vm::jit::JitFunctionCode>::safepoint_record::{closure#0}>::{closure#0}>",
+            "samples": 1
+          },
+          {
+            "path": "otter_vm::constructor_layout::native_receiver::constructor_receiver_commit::{closure#0} <- <otter_vm::Interpreter>::record_prepared_construct_family <- otter_vm::runtime_activation::semantic_source::frame_semantic_source <- <otter_vm::Interpreter>::jit_anchored_safepoint <- <core::option::Option<u64> as core::ops::try_trait::Try>::branch",
+            "samples": 1
+          },
+          {
+            "path": "otter_native_invoke <- otter_native_invoke <- otter_native_invoke <- otter_vm::interp::call_dispatch::interpreter_entry <- otter_vm::interp::call_dispatch::interpreter_turn <- <otter_vm::executable::ExecutableModule>::function <- <otter_vm::executable::ExecutableModule>::function_slot <- otter_bytecode::encoding::layout_wordcode_function <- otter_bytecode::encoding::verify_reachable_end::<[usize; 1]>",
+            "samples": 1
+          },
+          {
+            "path": "otter_native_invoke <- otter_native_invoke <- otter_native_invoke <- otter_vm::interp::call_dispatch::interpreter_entry <- otter_vm::interp::call_dispatch::interpreter_turn <- <otter_vm::executable::ExecutableModule>::function <- <otter_vm::executable::ExecutableModule>::function_slot <- otter_bytecode::encoding::layout_wordcode_function <- <mimalloc::MiMalloc as core::alloc::global::GlobalAlloc>::alloc <- mi_theap_malloc_zero_aligned_at_overalloc <- _mi_malloc_generic",
+            "samples": 1
+          },
+          {
+            "path": "otter_jit::entry::runtime_ops::reentry::complete_numeric_op <- <otter_vm::runtime_activation::RuntimeCall>::numeric <- <otter_vm::Interpreter>::jit_runtime_numeric_op <- <otter_vm::executable::ExecutableModule>::function <- <otter_vm::executable::ExecutableModule>::function_slot",
+            "samples": 1
+          }
+        ],
+        "unattributedKernelFullPaths": [
+          {
+            "path": "<otter_vm::Interpreter>::object_protocol_value",
+            "samples": 3
+          },
+          {
+            "path": "otter_native_invoke <- otter_vm::interp::call_dispatch::interpreter_entry <- <otter_vm::Interpreter>::dispatch_loop_inner <- <otter_vm::Interpreter>::dispatch_ticks <- <otter_vm::Interpreter>::object_protocol_value <- <otter_vm::Interpreter>::instanceof_operator <- <otter_vm::Interpreter>::instanceof_target_prototype_scoped <- <otter_vm::Interpreter>::function_property_get_with_receiver <- <otter_vm::Interpreter>::function_prototype_value <- <otter_vm::execution_context::ExecutionContext>::function_has_prototype_property::{closure#0}",
+            "samples": 1
+          }
+        ],
+        "operationLookupSubtreeSelfSamples": 0,
+        "globalLookupSubtreeSelfSamples": 0,
+        "scalarBoundarySamples": 0,
+        "scalarOperationLookupSubtreeSelfSamples": 0
+      }
+    ]
+  },
+  "source_fingerprints": {
+    "crates/otter-difftest/corpus/object_protocol_operation.js": "cecf221f74cd90f7d077137a9f503b0e3dedd5f9976ea1928d9aa5d699a71c1a",
+    "crates/otter-jit/src/entry.rs": "c32a2a1b3f44e84225d0fbc8b9cada3b54a502a01d77186d7109f930f21fb112",
+    "crates/otter-jit/src/entry/runtime_ops/reentry.rs": "b94146aad9160012c4985ad6b566a89e851b80706979cf0cec92cfefca306e67",
+    "crates/otter-jit/src/graph/arm64.rs": "d517fcc0ec38f10ed6d60928dc7a3eec1d4dcd80740b77ce117cdfc3f20e7885",
+    "crates/otter-jit/src/graph/arm64/equality.rs": "40c6c54335f05a18204f9edbcb5c03e864898bdce378e9acbee6d104f5ca49bf",
+    "crates/otter-jit/src/graph/source_map_tests.rs": "cf7c1233d64e13e6a6172f932f5d90c6b56533ac8aa4762f27dd774866be6ddd",
+    "crates/otter-jit/src/graph/x86_64/properties.rs": "017a2dfabcbfb3c7f04aa2fb7584948c098f4e7b84379cab15ab3595c1621c57",
+    "crates/otter-jit/src/graph/x86_64/scalar/predicates.rs": "e06054949a9ebede32336b270272936804819518504a5d3135a7fd4bff69762c",
+    "crates/otter-jit/src/template/arm64/protocol.rs": "2faed142084faeefb8ecef156dc389cc63a57034c0fa73bfe7bb701b1799e2b1",
+    "crates/otter-jit/src/template/plan.rs": "57482a1cdebd278e6d46f20222667c40699c59b02bbc6ba01ea0658d069b7855",
+    "crates/otter-jit/src/template/x86_64.rs": "ab9ccbda63f8b03df4d67fc01306a4b1cac1d984551761af07217bbde736fc3c",
+    "crates/otter-jit/src/template/x86_64/operation.rs": "6611dcd9cac2e54caab47098d32e039c7eefd16d97752b452184a8f931def99f",
+    "crates/otter-jit/src/template/x86_64/protocol.rs": "e27b0cc3d813381c8aea8ced4a1e55ba4b090c78181d59b1b0ce121a31aee2a4",
+    "crates/otter-vm/src/native_abi/runtime_stubs.rs": "9dced0d3d6ffbfeb5713c332ef67c4a375fd947c21fc161f6e4b25af7b456c95",
+    "crates/otter-vm/src/runtime_activation/committed_values.rs": "f74d7c47845ffe444278a3ac14e5c4b7219ed2923df463b69939127e9507b1ab",
+    "crates/otter-vm/src/runtime_activation/mod.rs": "6cf3d00b2494adc0558ead8cff138609293bdeeecd3aeafbb1d95a9b1d01c621",
+    "docs/site/src/content/docs/engine/jit-debugging.md": "f2d1d91744a1f94b5b8ec28aa9c357657094e2c9c39fd8dc43fe43674b990a07"
+  },
+  "binary_fingerprints": {
+    "target/release/otter": "9b9f54616e092214218a0005d84357f7393b58e497b116d7fc025bdb9298dc08",
+    "target/release/otter-difftest": "ca552e3c7159789c77753277a7e0d1407960d044c474bea8e45bd135c0ed8b7b",
+    "target/release/otter-test262": "6acf90b79193b4d7b49c0ed7894951b6463f7c0ba979668ccb074ccd544c1d56",
+    "target/x86_64-apple-darwin/release/otter": "a47babfa987168c28168b7f395398061ff85bab8fb5425f07317d351fffb2aca",
+    "target/x86_64-apple-darwin/release/otter-difftest": "76f449933803519813dabffcb0a7b001798c9eb37b095532fac4d1d641ee7d5f"
+  },
+  "fixture_repair": "Initial host and x86 emitted fixture selected Int32Compare from empty feedback. Test-only ARITH_OTHER seed fixes object-protocol admission; production binary unchanged. Initial logs preserved.",
+  "user_untracked_hot_asm_sha256": "18701d47faf9bf38a9cd385b8152429d4c2e53387c37466a3015c2f3b3b1c90d"
+}

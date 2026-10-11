@@ -304,6 +304,12 @@ fn allocating_shared_replay_preserves_cap_cause_and_does_not_commit_or_hold_proo
         assert!(transition.to_shape.get().is_null());
         let source = transition.from_shape_id;
         vm.property_cache.record_store(transition);
+        let (_, entry) = vm.property_cache.entry_for(
+            vm.escape_scoped(second).as_object().unwrap(), &vm.gc_heap, key,
+        ).expect("published VM dictionary append");
+        assert_eq!(entry.store_action, PropertyStoreAction::AddOwn);
+        assert!(entry.target_shape.is_null());
+        assert!(entry.store_owner.is_null());
         let mut settled = false;
         vm.shape_runtime.unpin_turn_shapes();
         for round in 0..8 {

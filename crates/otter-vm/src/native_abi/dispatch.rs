@@ -59,6 +59,8 @@ pub enum ExitReason {
     InsufficientFeedback = 12,
     /// An object left a shape the generation relied on no object leaving.
     StabilityChanged = 13,
+    /// A defining field's observed value bound widened after compilation.
+    FieldTypeChanged = 14,
 }
 
 impl ExitReason {
@@ -77,6 +79,7 @@ impl ExitReason {
             11 => Some(Self::RuntimeTransition),
             12 => Some(Self::InsufficientFeedback),
             13 => Some(Self::StabilityChanged),
+            14 => Some(Self::FieldTypeChanged),
             _ => None,
         }
     }

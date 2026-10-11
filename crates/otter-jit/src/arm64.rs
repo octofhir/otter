@@ -27,6 +27,7 @@
 pub(crate) mod activation;
 pub(crate) mod allocation;
 pub(crate) mod binding;
+pub(crate) mod field_type;
 pub(crate) mod frame;
 pub(crate) mod inline_guard;
 pub(crate) mod js_call;

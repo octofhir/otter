@@ -151,7 +151,10 @@ fn graph_own_fields_keep_both_banks_and_allocatable_registers() {
             let store = node(
                 &mut graph,
                 &mut allocation,
-                Kind::StoreOwnField(field),
+                Kind::StoreOwnField {
+                    field,
+                    owners: smallvec::SmallVec::new(),
+                },
                 &[Location::Gp(7), Location::Gp(6)],
                 None,
             );

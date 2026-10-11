@@ -12,7 +12,9 @@
 //!   validity words. Native probes neither allocate nor clone a proof.
 //! - Every store check finishes before the first write. Append commits slot
 //!   then clears the source shape's stability byte and publishes the child
-//!   shape; callers perform the existing child/value edge barriers.
+//!   shape; callers perform the existing child/value edge barriers. Defining
+//!   field summaries are observed after publication, with a noncollecting leaf
+//!   used only on an inline membership miss.
 //! - Slots and the suffix handle are reread from current geometry. No storage
 //!   pointer or table proof survives a call, collection or committed miss.
 //! - Unknown, unresolvable and runtime-only actions take the one cold source
@@ -260,12 +262,19 @@ pub(crate) fn emit_action_probe(
                 ; mov BYTE [Rq(shape) + view.shape_stable_byte as i32], 0
                 ; mov Rd(identity), [Rq(entry) + cache.target_shape_byte as i32]
                 ; mov [Rq(receiver) + view.object_shape_byte as i32], Rd(identity)
-                ; jmp =>appended
+                ; mov Rd(entry), [Rq(entry) + cache.store_owner_byte as i32]
+            );
+            super::field_type::emit_observe(ops, relocations, view, entry, value);
+            dynasm!(ops ; .arch x64 ; jmp =>appended
                 ; =>own
                 ; movzx Rd(identity), WORD [Rq(entry) + cache.store_slot_byte as i32]);
             emit_slot_storage_of_shape(ops, view, receiver, shape, identity, base, miss);
             dynasm!(ops ; .arch x64
                 ; mov [Rq(base) + Rq(identity) * 8], Rq(value)
+                ; mov Rd(entry), [Rq(entry) + cache.store_owner_byte as i32]
+            );
+            super::field_type::emit_observe(ops, relocations, view, entry, value);
+            dynasm!(ops ; .arch x64
                 ; jmp =>done);
         }
     }

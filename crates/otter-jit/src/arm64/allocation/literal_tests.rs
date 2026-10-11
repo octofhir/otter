@@ -21,13 +21,13 @@ use otter_vm::{
 
 const POISON: u64 = 0xcafe_1357_2468_abcd;
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 enum Layout {
     Object(JitObjectLiteralAllocationPlan),
     Array(JitArrayLiteralAllocationPlan),
 }
 
-fn execute(layout: Layout, values: &[u64], fits: bool, actual_realm: u32, regs: LabRegisters) {
+fn execute(layout: &Layout, values: &[u64], fits: bool, actual_realm: u32, regs: LabRegisters) {
     let numeric = values
         .iter()
         .all(|bits| *bits == VALUE_HOLE || *bits & tag::NUMBER_TAG != 0);
@@ -89,14 +89,24 @@ fn execute(layout: Layout, values: &[u64], fits: bool, actual_realm: u32, regs: 
         .collect::<Vec<_>>();
     let mut relocations = RelocationCapture::default();
     match layout {
-        Layout::Object(plan) => emit_object_literal(&mut ops, 20, 0, plan, &inputs, regs, slow),
+        Layout::Object(plan) => emit_object_literal(
+            &mut ops,
+            &mut relocations,
+            &otter_vm::JitCompileSnapshot::without_feedback(0, 0, 0, vec![]),
+            20,
+            0,
+            plan,
+            &inputs,
+            regs,
+            slow,
+        ),
         Layout::Array(plan) => emit_array_literal(
             &mut ops,
             &mut relocations,
             20,
             0,
             start as u64 - 4096,
-            plan,
+            *plan,
             &inputs,
             regs,
             slow,
@@ -202,6 +212,7 @@ fn literal_native_fit_miss_bulk_homes_and_numeric_holes_initialize_exactly() {
             | ((fields.cell_bytes(64) as u64) << 32),
         inline_capacity: 64,
         value_count: 64,
+        field_owners: (0..64).map(|_| 0).collect(),
         fields,
     };
     let object_values = (0..64)
@@ -242,7 +253,7 @@ fn literal_native_fit_miss_bulk_homes_and_numeric_holes_initialize_exactly() {
         },
     ] {
         for (layout, values) in [
-            (Layout::Object(object), object_values.as_slice()),
+            (Layout::Object(object.clone()), object_values.as_slice()),
             (
                 Layout::Array(JitArrayLiteralAllocationPlan::new(numeric.len()).unwrap()),
                 numeric.as_slice(),
@@ -256,9 +267,9 @@ fn literal_native_fit_miss_bulk_homes_and_numeric_holes_initialize_exactly() {
                 tagged.as_slice(),
             ),
         ] {
-            execute(layout, values, true, 0, regs);
-            execute(layout, values, false, 0, regs);
-            execute(layout, values, true, 1, regs);
+            execute(&layout, values, true, 0, regs);
+            execute(&layout, values, false, 0, regs);
+            execute(&layout, values, true, 1, regs);
         }
     }
 }

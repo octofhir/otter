@@ -521,6 +521,9 @@ fn symbolic_target(target: &RelocationTarget) -> String {
         }
         RelocationTarget::BackedgeFuelCell => "backedgeFuelCell".to_string(),
         RelocationTarget::ShapeStableByte { shape } => format!("shapeStableByte(shape={shape})"),
+        RelocationTarget::FieldTypeWord { owner_shape } => {
+            format!("fieldTypeWord(ownerShape={owner_shape})")
+        }
     }
 }
 

@@ -9,8 +9,8 @@
 //! # Invariants
 //! Four caller-declared GP temporaries and reserved x16/x17 are the only
 //! scratch. Inputs remain unchanged through every pre-effect miss. Neither
-//! probe allocates, collects or calls; no interior address escapes to a cold
-//! transition. Load and store facts share a key, never a holder or slot. The
+//! probe allocates or collects; field-summary membership misses use a
+//! noncollecting metadata leaf. No storage address escapes to a cold transition. Load and store facts share a key, never a holder or slot. The
 //! store writes its full value and optional child shape after every guard,
 //! then leaves the compressed child (zero for overwrite) in the slot temporary.
 //! An append clears the source shape's stability byte before publishing its child.
@@ -358,11 +358,19 @@ pub(crate) fn emit_store(
         ; str X(value), [X(base), X(slot), lsl #otter_vm::object::FieldLocation::INDEX_SHIFT]
         ; strb wzr, [X(holder), view.shape_stable_byte]
         ; ldr W(slot), [X(entry), cache.target_shape_byte]
-        ; str W(slot), [X(receiver), view.object_shape_byte] ; b =>done
+        ; str W(slot), [X(receiver), view.object_shape_byte]
+        ; ldr W(entry), [X(entry), cache.store_owner_byte]
+    );
+    super::field_type::emit_observe(ops, relocations, view, entry, value);
+    dynasm!(ops ; .arch aarch64 ; b =>done
         ; =>own ; ldrh W(slot), [X(entry), cache.store_slot_byte]);
     bank_of_shape(ops, view, receiver, holder, slot, base, miss);
     dynasm!(ops ; .arch aarch64
         ; str X(value), [X(base), X(slot), lsl #otter_vm::object::FieldLocation::INDEX_SHIFT]
+        ; ldr W(entry), [X(entry), cache.store_owner_byte]
+    );
+    super::field_type::emit_observe(ops, relocations, view, entry, value);
+    dynasm!(ops ; .arch aarch64
         ; mov W(slot), wzr ; =>done);
 }
 

@@ -1925,6 +1925,7 @@ pub const fn runtime_stub_name(id: super::RuntimeStubId) -> &'static str {
         112 => "math_trunc_leaf",
         113 => "math_atan2_leaf",
         114 => "math_pow_leaf",
+        115 => "field_type_observe",
         _ => "unknown_runtime_stub",
     }
 }
@@ -2086,6 +2087,20 @@ pub const STUB_ARRAY_PUSH_ALLOC: RuntimeStubDescriptor = descriptor(
     NativeResultDomain::Probe,
 );
 
+/// Widen one defining shape's field-value word: `(heap_mut, owner_offset,
+/// boxed_rhs)`. The owner is a rooted, non-moving defining shape. Only scalar
+/// metadata is changed, so no traced pointer store or barrier is required.
+pub const STUB_FIELD_TYPE_OBSERVE: RuntimeStubDescriptor = descriptor(
+    115,
+    RuntimeStubClass::LeafNoAlloc,
+    RuntimeStubSignature::MutatingLeafValue2,
+    2,
+    RuntimeStubEffects::leaf(false, true),
+    RuntimeStubException::Never,
+    RuntimeStubResultAbi::NativePair,
+    NativeResultDomain::Probe,
+);
+
 /// Dense inventory of every current machine-callable runtime-stub contract.
 pub const RUNTIME_STUB_DESCRIPTORS: &[RuntimeStubDescriptor] = &[
     STUB_JIT_BACKEDGE_POLL,
@@ -2202,6 +2217,7 @@ pub const RUNTIME_STUB_DESCRIPTORS: &[RuntimeStubDescriptor] = &[
     STUB_MATH_TRUNC_LEAF,
     STUB_MATH_ATAN2_LEAF,
     STUB_MATH_POW_LEAF,
+    STUB_FIELD_TYPE_OBSERVE,
 ];
 
 /// Validate a descriptor and one concrete call-site safepoint id.

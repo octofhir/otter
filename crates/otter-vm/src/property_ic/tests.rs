@@ -301,8 +301,12 @@ fn direct_prototype_store_transition_rejects_dictionary_prototype() {
         &Value::boolean(false),
     )
     .expect("store transition");
+    assert!(transition.to_shape.get().is_null(), "VM dictionary replay");
+    let handler = IcHandler::store_transition(from_shape, &transition).expect("transition");
+    assert!(handler.owner.is_null());
+    assert_eq!(handler.field, object::FieldLocation::from_cache_key(0));
     let slot = PropertyIcSlot::new(PropertyIcKind::Store);
-    slot.install(IcHandler::store_transition(from_shape, &transition).expect("transition"));
+    slot.install(handler);
     let mut second = object::alloc_object_old_for_fixture(&mut heap).unwrap();
     let _second_root = fixture_roots.local(second);
     assert!(
@@ -322,6 +326,52 @@ fn direct_prototype_store_transition_rejects_dictionary_prototype() {
             .expect("store allocation")
     );
     assert_eq!(object::get_own(second, &heap, "x"), None);
+}
+
+#[test]
+fn dictionary_store_replay_assigns_distinct_structural_ids() {
+    let mut heap = fresh_heap();
+    // SAFETY: the stationary heap owns this scope and all fixture roots.
+    let roots = unsafe { otter_gc::HandleScope::from_ptr(heap.handle_stack_ptr()) };
+    let mut ids = Vec::new();
+    for name in ["x", "y"] {
+        let sample = object::alloc_object_old_for_fixture(&mut heap).unwrap();
+        let _sample_root = roots.local(sample);
+        let source = object::keyed_shape(sample, &heap);
+        let transition = object::capture_store_property_transition(
+            sample,
+            &mut heap,
+            key(name),
+            &Value::boolean(true),
+        )
+        .expect("captured dictionary append");
+        assert!(transition.to_shape.get().is_null());
+        let slot = PropertyIcSlot::new(PropertyIcKind::Store);
+        slot.install(IcHandler::store_transition(source, &transition).expect("dictionary handler"));
+        let receiver = object::alloc_object_old_for_fixture(&mut heap).unwrap();
+        let _receiver_root = roots.local(receiver);
+        assert_eq!(object::keyed_shape(receiver, &heap), source);
+        assert!(
+            slot.probe_store(receiver, &mut heap, key(name), &Value::boolean(false))
+                .expect("dictionary replay")
+        );
+        assert!(object::is_dictionary(receiver, &heap));
+        assert_eq!(
+            object::get_own(receiver, &heap, name),
+            Some(Value::boolean(false))
+        );
+        let id = object::shape_id(receiver, &heap);
+        assert_ne!(id, object::ShapeId::UNASSIGNED);
+        assert_ne!(
+            id,
+            object::shape_body::id_of(object::shape(receiver, &heap))
+        );
+        ids.push(id);
+    }
+    assert_ne!(
+        ids[0], ids[1],
+        "different keys have distinct structural ids"
+    );
 }
 
 #[test]

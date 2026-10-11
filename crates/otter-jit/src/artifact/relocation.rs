@@ -66,6 +66,7 @@ const TARGET_SOURCE_WORK_CELL: u8 = 18;
 const TARGET_INSTANCEOF_CELL: u8 = 19;
 const TARGET_BACKEDGE_FUEL_CELL: u8 = 20;
 const TARGET_SHAPE_STABLE_BYTE: u8 = 21;
+const TARGET_FIELD_TYPE_WORD: u8 = 22;
 const TARGET_PROTOTYPE_VALIDITY_CELL: u8 = 15;
 
 /// Whether a named-property probe serves a load or a store site.
@@ -174,6 +175,10 @@ pub(crate) enum RelocationTarget {
     /// The stable byte of a baked shape, named by its compressed handle.
     ShapeStableByte {
         shape: u32,
+    },
+    /// The monotone value-bound word of a rooted defining shape.
+    FieldTypeWord {
+        owner_shape: u32,
     },
 }
 
@@ -1583,6 +1588,10 @@ fn encode_target(target: &RelocationTarget, output: &mut Vec<u8>) -> Result<(), 
         RelocationTarget::ShapeStableByte { shape } => {
             output.push(TARGET_SHAPE_STABLE_BYTE);
             put_u32(output, *shape);
+        }
+        RelocationTarget::FieldTypeWord { owner_shape } => {
+            output.push(TARGET_FIELD_TYPE_WORD);
+            put_u32(output, *owner_shape);
         }
     }
     Ok(())

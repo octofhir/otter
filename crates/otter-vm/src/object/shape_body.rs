@@ -3,7 +3,8 @@
 //! Shape layouts are immutable after allocation (except that finishing a
 //! constructor lineage's slack tracking shrinks its capacity and clears its
 //! provisional state once, in place). A monotone stability byte records
-//! whether an object has left the shape. Each node records the transition from
+//! whether an object has left the shape, and an atomic field summary records
+//! the values stored in its own data slot. Each node records the transition from
 //! their parent — parent shape, added property key, property count, and the
 //! slot offset assigned to that key — together with what every object of the
 //! lineage shares: its `[[Prototype]]` and its dictionary shape. Transition
@@ -25,6 +26,7 @@
 //!   [`super::shape_keys::SHAPE_KEYS_MIN`] keys, the parent chain below.
 //! - [`shape_keys_ordered`] — parent-chain reader.
 //! - [`note_left`] / [`is_stable`] — monotone membership-stability tracking.
+//! - `field_owner` / `field_type_snapshot` — defining-slot summary ownership.
 //!
 //! # Invariants
 //! - `parent == Gc::null()` and `transition_key == Gc::null()` only for a
@@ -45,6 +47,8 @@
 //! - Every change of an existing object's shape clears its former shape's
 //!   stability byte before publication. The byte never returns to one;
 //!   generated code can revalidate a prior membership proof from that byte.
+//! - Append descendants share each ancestor's data-field summary. Its scalar
+//!   shape identities are historical and require stable targets for a proof.
 //! - Transition/cache mutation belongs to interpreter-owned side tables.
 //!   A shape names its key table at
 //!   allocation and never changes it; the table grows in place only past
@@ -52,7 +56,7 @@
 //! - New null-prototype capacity/state roots prepend to one immutable chain.
 //!   Ordinary allocation always selects its initial ordinary root, so prototype,
 //!   non-extensible or provisional state never leaks from a cache head.
-//! - The C layout exposes layout fields and the stability byte to generated
+//! - The C layout exposes layout fields and monotone scalar summaries to generated
 //!   probes; shapes live in non-moving old space, so a handle
 //!   never relocates. Shapes are collectable (see
 //!   [`super::shape_runtime`]); an id is never reused, a handle may be once
@@ -63,7 +67,7 @@
 //! - <https://tc39.es/ecma262/#sec-ordinary-object-internal-methods-and-internal-slots-ownpropertykeys>
 //! - Architecture plan §4.1 (hidden classes).
 
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 
 use otter_gc::GcHeap;
 use otter_gc::heap::RootSlotVisitor;
@@ -103,6 +107,8 @@ pub(crate) enum ShapePrototype {
 pub struct ShapeBody {
     /// VM-local identity used by property inline-cache guards.
     id: ShapeId,
+    /// Values stored in this node's data field, shared by its descendants.
+    field_type: AtomicU64,
     /// Parent shape, or `Gc::null()` for root.
     parent: ShapeHandle,
     /// Key added by this transition, or `Gc::null()` for root.
@@ -160,6 +166,9 @@ pub struct ShapeBody {
 /// had (see [`ShapeBody`]'s `stable`).
 pub(crate) const SHAPE_BODY_STABLE_OFFSET: usize = std::mem::offset_of!(ShapeBody, stable);
 
+/// Atomic summary word for the data field introduced by this shape.
+pub(crate) const SHAPE_BODY_FIELD_TYPE_OFFSET: usize = std::mem::offset_of!(ShapeBody, field_type);
+
 /// Identity word read by generated probes of the shared property lookup table.
 pub(crate) const SHAPE_BODY_ID_OFFSET: usize = std::mem::offset_of!(ShapeBody, id);
 
@@ -196,6 +205,7 @@ impl ShapeBody {
         };
         Self {
             id,
+            field_type: AtomicU64::new(0),
             parent: ShapeHandle::null(),
             transition_key: JsStringHandle::null(),
             transition_atom: AtomId::NONE,
@@ -246,6 +256,7 @@ impl ShapeBody {
         );
         Self {
             id: next_shape_id(),
+            field_type: AtomicU64::new(0),
             parent: parent_handle,
             transition_key: key,
             transition_atom: atom,
@@ -596,6 +607,43 @@ pub(crate) fn inline_capacity_of(shape: ShapeHandle) -> usize {
 #[must_use]
 pub(crate) fn state_of(shape: ShapeHandle) -> ShapeState {
     body_of(shape).state()
+}
+
+/// Parent of a live shape, retained by this node's strong GC edge.
+pub(crate) fn parent_of(shape: ShapeHandle) -> ShapeHandle {
+    body_of(shape).parent
+}
+
+pub(super) fn field_owner(mut shape: ShapeHandle, logical_slot: u32) -> Option<ShapeHandle> {
+    if shape.is_null() {
+        return None;
+    }
+    let first = body_of(shape);
+    if first.is_dictionary() || logical_slot >= first.property_count {
+        return None;
+    }
+    loop {
+        let body = body_of(shape);
+        if body.own_offset() == logical_slot {
+            return (!body.own_is_accessor).then_some(shape);
+        }
+        shape = body.parent;
+        if shape.is_null() {
+            return None;
+        }
+    }
+}
+
+pub(super) fn field_type_snapshot(shape: ShapeHandle) -> u64 {
+    let body = body_of(shape);
+    debug_assert!(!body.is_root() && !body.own_is_accessor && !body.is_dictionary());
+    body.field_type.load(Ordering::Relaxed)
+}
+
+pub(super) fn set_field_type_snapshot(shape: ShapeHandle, value: u64) {
+    let body = body_of(shape);
+    debug_assert!(!body.is_root() && !body.own_is_accessor && !body.is_dictionary());
+    body.field_type.store(value, Ordering::Relaxed);
 }
 
 /// An object is leaving `shape` for another: `shape` is stable no more.

@@ -23,6 +23,8 @@
 //!   transitions, including receiver storage and write-barrier proofs, plus
 //!   guarded lookup through pinned intrinsic prototypes. PIC misses share the
 //!   VM property-action table with Graph before one committed runtime miss.
+//!   Defining field summaries widen through a noncollecting metadata leaf only
+//!   when an inline membership probe misses.
 //! - Structured try/catch/finally operations through the VM-owned exception
 //!   transition protocol.
 //! - Cooperative interrupt/work-budget polling on every generated backedge.
@@ -1630,6 +1632,8 @@ fn emit_store_property(
     emit_inline_own_field(ops, view, STORE_RECEIVER, STORE_SLOT, shared);
     emit_load_reg(ops, STORE_VALUE, value);
     dynasm!(ops ; .arch x64 ; mov [r8 + rax * 8], Rq(STORE_VALUE));
+    dynasm!(ops ; .arch x64 ; mov Rd(STORE_SLOT), [Rq(STORE_SLOT) + otter_vm::jit::PROPERTY_IC_LAYOUT.inline_owner_byte as i32]);
+    crate::x86_64::field_type::emit_observe(ops, relocations, view, STORE_SLOT, STORE_VALUE);
     emit_template_value_barrier(ops, relocations, view, STORE_RECEIVER, STORE_VALUE);
     dynasm!(ops ; .arch x64 ; jmp =>done ; =>shared);
     let routine = shared_property.label(ops, true);

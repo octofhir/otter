@@ -8,6 +8,8 @@
 //! # Invariants
 //! - Only results, declared temporaries and reserved r10/r11 are overwritten.
 //! - Own-field banks resolve inside their access; no suffix address escapes.
+//! - Own stores select their receiver's defining field owner after the write;
+//!   membership misses use a noncollecting leaf preserving live registers.
 //! - Every frame word uses the root Codegen's canonical home geometry.
 //!
 //! # See also
@@ -44,14 +46,52 @@ impl Codegen<'_> {
                 field,
                 false,
             ),
-            Kind::StoreOwnField(field) => crate::x86_64::fields::emit_own_field(
-                &mut self.ops,
-                self.view.field_layout,
-                Self::gp(input(0)),
-                Self::gp(input(1)),
-                field,
-                true,
-            ),
+            Kind::StoreOwnField { field, owners } => {
+                let object = Self::gp(input(0));
+                let value = Self::gp(input(1));
+                crate::x86_64::fields::emit_own_field(
+                    &mut self.ops,
+                    self.view.field_layout,
+                    object,
+                    value,
+                    field,
+                    true,
+                );
+                if !owners.is_empty() {
+                    let owner = allocation.gp_temps[0];
+                    let first_owner = owners[0].owner_shape;
+                    if first_owner != 0 && owners.iter().all(|arm| arm.owner_shape == first_owner) {
+                        self.load_immediate(owner, u64::from(first_owner));
+                        crate::x86_64::field_type::emit_observe_known(
+                            &mut self.ops,
+                            &mut self.relocations,
+                            self.view,
+                            owner,
+                            value,
+                            (&owners[0].stored_shapes, owners[0].nullish_mask),
+                        );
+                    } else {
+                        let done = self.ops.new_dynamic_label();
+                        for authority in owners.iter().filter(|arm| arm.owner_shape != 0) {
+                            let next = self.ops.new_dynamic_label();
+                            dynasm!(self.ops ; .arch x64
+                                ; cmp DWORD [Rq(object) + self.view.object_shape_byte as i32], authority.receiver_shape as i32
+                                ; jne =>next);
+                            self.load_immediate(owner, u64::from(authority.owner_shape));
+                            crate::x86_64::field_type::emit_observe_known(
+                                &mut self.ops,
+                                &mut self.relocations,
+                                self.view,
+                                owner,
+                                value,
+                                (&authority.stored_shapes, authority.nullish_mask),
+                            );
+                            dynasm!(self.ops ; .arch x64 ; jmp =>done ; =>next);
+                        }
+                        dynasm!(self.ops ; .arch x64 ; =>done);
+                    }
+                }
+            }
             Kind::LoadArgumentCount => {
                 let destination = output();
                 dynasm!(self.ops ; .arch x64

@@ -82,11 +82,11 @@ impl Fixture {
     fn new(capacity: u8) -> Self {
         let atom = if capacity == 4 { 0 } else { ATOM };
         let cells = vec![CANARY; 1024];
-        let table = vec![0_u64; 512 * 4 * 8];
+        let table = vec![0_u64; 512 * 4 * 9];
         let validity = Box::new(1);
         let cache = JitPropertyActionCache {
             table_addr: table.as_ptr() as usize,
-            entry_bytes: 64,
+            entry_bytes: 72,
             set_mask: 511,
             ways: 4,
             receiver_shape_id_byte: 0,
@@ -99,10 +99,11 @@ impl Fixture {
             holder_shape_byte: 20,
             holder_root_byte: 24,
             target_shape_byte: 28,
-            holder_shape_id_byte: 32,
-            target_shape_id_byte: 40,
-            load_validity_byte: 48,
-            store_validity_byte: 56,
+            store_owner_byte: 32,
+            holder_shape_id_byte: 40,
+            target_shape_id_byte: 48,
+            load_validity_byte: 56,
+            store_validity_byte: 64,
             shape_id_byte: SHAPE_ID_BYTE,
             hash_shape_multiplier: 0x9e37_79b9_7f4a_7c15,
             hash_atom_multiplier: 0xc2b2_ae3d_27d4_eb4f,
@@ -117,15 +118,15 @@ impl Fixture {
             validity,
             view: snapshot(),
             cache,
-            entry: (set * 4 + 3) * 64,
+            entry: (set * 4 + 3) * 72,
             capacity,
             atom,
         };
-        let start = set * 4 * 64;
+        let start = set * 4 * 72;
         for way in 0..3 {
             // Identical low 32 shape bits must not select these collisions.
-            fixture.table_u64(start + way * 64, RECEIVER_ID ^ (1_u64 << 41));
-            fixture.table_u32(start + way * 64 + 8, atom);
+            fixture.table_u64(start + way * 72, RECEIVER_ID ^ (1_u64 << 41));
+            fixture.table_u32(start + way * 72 + 8, atom);
         }
         fixture.table_u64(fixture.entry, RECEIVER_ID);
         fixture.table_u32(fixture.entry + 8, atom);
@@ -257,7 +258,7 @@ impl Fixture {
         );
         self.table_u16(self.entry + 14, slot);
         self.table_u32(self.entry + 20, self.address(SHAPE) as u32);
-        self.table_u64(self.entry + 32, RECEIVER_ID);
+        self.table_u64(self.entry + 40, RECEIVER_ID);
     }
     fn inherited_load_and_append(&mut self, load_slot: u16, store_slot: u16) {
         self.table_u8(
@@ -268,8 +269,8 @@ impl Fixture {
         self.table_u8(self.entry + 18, 1);
         self.table_u32(self.entry + 20, self.address(HOLDER_SHAPE) as u32);
         self.table_u32(self.entry + 24, self.address(ROOT) as u32);
-        self.table_u64(self.entry + 32, HOLDER_ID);
-        self.table_u64(self.entry + 48, self.validity.as_ref() as *const u32 as u64);
+        self.table_u64(self.entry + 40, HOLDER_ID);
+        self.table_u64(self.entry + 56, self.validity.as_ref() as *const u32 as u64);
         self.cell_u32(
             SHAPE + self.view.shape_prototype_byte as usize,
             self.address(HOLDER) as u32,
@@ -287,9 +288,9 @@ impl Fixture {
         );
         self.table_u16(self.entry + 16, slot);
         self.table_u32(self.entry + 28, self.address(TARGET) as u32);
-        self.table_u64(self.entry + 40, TARGET_ID);
+        self.table_u64(self.entry + 48, TARGET_ID);
         self.table_u64(
-            self.entry + 56,
+            self.entry + 64,
             if chain {
                 self.validity.as_ref() as *const u32 as u64
             } else {

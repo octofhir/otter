@@ -12,6 +12,8 @@
 //!   owned tree, including bounded recursive bodies. Template construction
 //!   keeps generated call linkage.
 //! - Cross-script recompilation resolves the defining code owner before baking.
+//! - Own-field bounds resolve monotone identities to separately rooted targets
+//!   for each source body, including spliced bodies.
 //!
 //! # Invariants
 //! Baked pointers (shape ids, global cells, prototype slots) must only
@@ -31,12 +33,20 @@
 //! is baked for guards; only receiver allocation plans refuse a provisional
 //! root. A refusal drops that specialized operation or call plan while
 //! Generic semantics and runtime IC training remain available.
+//!
+//! # See also
+//! - [`crate::jit::JitCompileSnapshot`] owns the native compile input.
+//! - `field_types` resolves defining words and retained ordinary targets.
+//! - [`crate::jit_roots`] owns compile-session and generation lifetimes.
 #![allow(unused_imports)]
 use crate::*;
 
 #[path = "inline_snapshot_budget.rs"]
 mod inline_snapshot_budget;
 use inline_snapshot_budget::InlineSnapshotBudget;
+
+#[path = "jit_field_types.rs"]
+mod field_types;
 
 /// Counted calls past which a hot loop's function is optimized for its entry
 /// before any of its loops is entered through OSR.
@@ -583,6 +593,7 @@ impl Interpreter {
         Self::bake_context_allocations(&mut snapshot);
         Self::bake_closure_allocations(&mut snapshot, context);
         self.bake_optimized_exit_profile(&mut snapshot, fid);
+        self.bake_field_type_tree(&mut snapshot);
         // Every shape baked so far that no object has left yet: a value
         // proven to have one survives calls on a read of its stable byte.
         snapshot.stable_shapes = self.jit_compile_roots.borrow()[roots_start..]
@@ -874,6 +885,7 @@ impl Interpreter {
         self.bake_element_accesses(&mut view);
         Self::bake_context_allocations(&mut view);
         Self::bake_closure_allocations(&mut view, context);
+        self.bake_field_type_tree(&mut view);
         let target = osr_pc.map_or(jit_debug::JitDebugTarget::Entry, |pc| {
             jit_debug::JitDebugTarget::Osr { pc }
         });
@@ -2365,6 +2377,7 @@ impl Interpreter {
                         native_abi::ExitReason::InsufficientFeedback
                             | native_abi::ExitReason::RuntimeTransition
                             | native_abi::ExitReason::StabilityChanged
+                            | native_abi::ExitReason::FieldTypeChanged
                     ))
                 .then_some((pc, reason))
             })
@@ -3067,6 +3080,13 @@ impl Interpreter {
                     init.fields.len(),
                     "source initial fields and final shape diverged"
                 );
+                // Generated receivers expose these live fields as undefined
+                // before the constructor writes them. Seed the monotone bound
+                // while preparing the plan, before any native receiver exists.
+                for slot in 0..init.fields.len() {
+                    let owner = crate::object::field_type::owner(shape, slot as u32)?;
+                    crate::object::field_type::observe_owner(owner, Value::undefined());
+                }
                 (
                     self.bake_shape(shape)?,
                     u8::try_from(init.fields.len()).ok()?,

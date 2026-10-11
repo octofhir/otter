@@ -9,6 +9,10 @@
 //! - Every store guard completes before the first slot or shape write.
 //! - Shape transitions clear the source shape's stability byte before
 //!   publishing the child shape.
+//! - Defining field owners observe the complete store and child publication;
+//!   membership misses use a noncollecting leaf with live-register preservation.
+//! - Static stores use their source snapshot's captured membership only for
+//!   the defining owner selected by the destination shape and logical field.
 //! - Cold operations run once with canonical roots, never by replaying a hit.
 //! - Mutable fields are read live; shape and chain identities authorize layout.
 //! - Receiver SSA values survive holder traversal and all scratch work.
@@ -242,6 +246,35 @@ impl Codegen<'_> {
             let program = programs
                 .get(index as usize)
                 .ok_or(Unsupported::OperandShape("x86 graph named program index"))?;
+            let (mut owner, known) = if value.is_some() {
+                let receiver_shape = program.ops.iter().rev().find_map(|op| match *op {
+                    Op::PublishShape { shape, .. } | Op::GuardShape { object: 0, shape } => {
+                        Some(shape)
+                    }
+                    _ => None,
+                });
+                let field = program.ops.iter().find_map(|op| match *op {
+                    Op::StoreField { field, .. } => Some(field),
+                    _ => None,
+                });
+                let authority = receiver_shape
+                    .zip(field)
+                    .and_then(|key| self.view_of(node).field_types.get(&key))
+                    .ok_or(Unsupported::OperandShape(
+                        "x86 graph named store field authority",
+                    ))?;
+                let owner = if authority.guard.expected == otter_vm::object::field_type::TOP {
+                    0
+                } else {
+                    authority.guard.owner_shape
+                };
+                (
+                    owner,
+                    (authority.stored_shapes.as_slice(), authority.nullish_mask),
+                )
+            } else {
+                (0, (&[][..], 0))
+            };
             let next = self.ops.new_dynamic_label();
             let object = |operand| if operand == 0 { receiver } else { holder };
             let mut committed = false;
@@ -358,6 +391,18 @@ impl Codegen<'_> {
                             ; add r10, r11
                             ; mov BYTE [r10 + view.shape_stable_byte as i32], 0
                             ; mov DWORD [Rq(receiver) + view.object_shape_byte as i32], shape as i32);
+                        if owner != 0 {
+                            self.load_immediate(holder, u64::from(owner));
+                            crate::x86_64::field_type::emit_observe_known(
+                                &mut self.ops,
+                                &mut self.relocations,
+                                view,
+                                holder,
+                                value.expect("named store value"),
+                                known,
+                            );
+                            owner = 0;
+                        }
                         self.emit_shape_child_barrier(node, receiver, shape, scratch);
                     }
                     _ => {
@@ -371,6 +416,17 @@ impl Codegen<'_> {
                 return Err(Unsupported::OperandShape(
                     "x86 graph named program without access",
                 ));
+            }
+            if owner != 0 {
+                self.load_immediate(holder, u64::from(owner));
+                crate::x86_64::field_type::emit_observe_known(
+                    &mut self.ops,
+                    &mut self.relocations,
+                    view,
+                    holder,
+                    value.expect("named store value"),
+                    known,
+                );
             }
             dynasm!(self.ops ; .arch x64 ; jmp =>done ; =>next);
         }
@@ -540,6 +596,7 @@ impl Codegen<'_> {
             );
             crate::x86_64::property_ic::emit_slot_store(
                 &mut self.ops,
+                &mut self.relocations,
                 view,
                 receiver,
                 value,

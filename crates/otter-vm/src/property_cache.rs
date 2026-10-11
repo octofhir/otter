@@ -14,6 +14,11 @@
 //! before reuse. A runtime allocating replay releases all proof borrows and
 //! rereads the canonical child word after GC. Every miss precedes effects and
 //! enters the source operation once.
+//! Store owners are retained by their receiver or append child. Weak cleanup
+//! clears a whole row before a dead receiver or defining owner can be reused.
+//! A shaped store uses zero owner only for an absorbing Top summary. An append
+//! with a null child has zero owner for VM dictionary replay; generated probes
+//! reject null children before effects and never use that replay marker.
 //!
 //! # See also
 //! - `crate::object::shape_transition` owns the one add-property replay kernel.
@@ -84,6 +89,8 @@ struct PropertyActionEntry {
     holder_shape: object::ShapeHandle,
     holder_root: object::ShapeHandle,
     target_shape: object::ShapeHandle,
+    store_owner: object::ShapeHandle,
+    store_receiver: object::ShapeHandle,
     holder_shape_id: ShapeId,
     target_shape_id: ShapeId,
     load_validity: usize,
@@ -103,6 +110,8 @@ impl PropertyActionEntry {
         holder_shape: object::ShapeHandle::null(),
         holder_root: object::ShapeHandle::null(),
         target_shape: object::ShapeHandle::null(),
+        store_owner: object::ShapeHandle::null(),
+        store_receiver: object::ShapeHandle::null(),
         holder_shape_id: ShapeId::UNASSIGNED,
         target_shape_id: ShapeId::UNASSIGNED,
         load_validity: 0,
@@ -344,11 +353,25 @@ impl PropertyActionCache {
             entry.holder_shape_id = resolved.hit.shape_id;
             entry.holder_root = resolved.holder_root;
             if resolved.hops == 0 && resolved.is_writable {
+                let Some(owner) = object::field_type::observer_owner(
+                    resolved.hit.shape,
+                    u32::from(resolved.hit.slot),
+                ) else {
+                    entry.store_action = PropertyStoreAction::Unknown;
+                    entry.store_owner = object::ShapeHandle::null();
+                    entry.store_receiver = object::ShapeHandle::null();
+                    self.owners[index].borrow_mut().store = None;
+                    self.owners[index].borrow_mut().load = validity;
+                    self.entries[index].set(entry);
+                    return;
+                };
                 entry.store_action = PropertyStoreAction::OwnWritable;
                 entry.store_slot = resolved.hit.slot;
                 entry.target_shape = object::ShapeHandle::null();
                 entry.target_shape_id = ShapeId::UNASSIGNED;
                 entry.store_validity = 0;
+                entry.store_owner = owner;
+                entry.store_receiver = resolved.hit.shape;
                 self.owners[index].borrow_mut().store = None;
             }
         } else if nonexistent {
@@ -367,6 +390,9 @@ impl PropertyActionCache {
         if hit.atom_id == AtomId::NONE {
             return;
         }
+        let Some(owner) = object::field_type::observer_owner(hit.shape, u32::from(hit.slot)) else {
+            return;
+        };
         let index = self.record_way(hit.shape_id, hit.atom_id);
         self.owners[index].replace(ActionOwners::default());
         self.entries[index].set(PropertyActionEntry {
@@ -379,6 +405,8 @@ impl PropertyActionCache {
             load_writable: true,
             holder_shape: hit.shape,
             holder_shape_id: hit.shape_id,
+            store_owner: owner,
+            store_receiver: hit.shape,
             ..PropertyActionEntry::EMPTY
         });
     }
@@ -388,12 +416,25 @@ impl PropertyActionCache {
         if transition.atom_id == AtomId::NONE {
             return;
         }
+        let owner = if transition.to_shape.get().is_null() {
+            object::ShapeHandle::null()
+        } else {
+            let Some(owner) = object::field_type::observer_owner(
+                transition.to_shape.get(),
+                u32::from(transition.slot),
+            ) else {
+                return;
+            };
+            owner
+        };
         let index = self.record_way(transition.from_shape_id, transition.atom_id);
         let mut entry = self.entries[index].get();
         entry.store_action = PropertyStoreAction::AddOwn;
         entry.store_slot = transition.slot;
         entry.target_shape = transition.to_shape.get();
         entry.target_shape_id = transition.to_shape_id;
+        entry.store_owner = owner;
+        entry.store_receiver = object::ShapeHandle::null();
         entry.store_validity = match &transition.kind {
             object::StorePropertyTransitionKind::OwnAdd => 0,
             object::StorePropertyTransitionKind::PrototypeChainMissing { validity }
@@ -469,6 +510,11 @@ impl PropertyActionCache {
         let dead = |shape: object::ShapeHandle| !shape.is_null() && !heap.is_marked(shape.raw());
         for (index, way) in self.entries.iter().enumerate() {
             let mut entry = way.get();
+            if dead(entry.store_receiver) || dead(entry.store_owner) {
+                way.set(PropertyActionEntry::EMPTY);
+                self.owners[index].replace(ActionOwners::default());
+                continue;
+            }
             if dead(entry.holder_shape) || dead(entry.holder_root) {
                 entry.clear_load();
                 if entry.store_action == PropertyStoreAction::Unknown {
@@ -647,7 +693,8 @@ impl crate::Interpreter {
         if synthesized {
             return false;
         }
-        let Some((handler, hit)) = crate::property_ic::IcHandler::store_existing_hit(bag, heap, key)
+        let Some((handler, hit)) =
+            crate::property_ic::IcHandler::store_existing_hit(bag, heap, key)
         else {
             return false;
         };

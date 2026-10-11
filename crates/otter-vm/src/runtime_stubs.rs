@@ -13,6 +13,7 @@
 //! - Unboxed binary64 math and scalar-conversion leaves for typed numeric
 //!   machine code.
 //! - Allocating collection, string-concat, and length-array entries.
+//! - Non-allocating defining-field observation shared by generated stores.
 //! - JIT transition-binding validation against the static descriptor inventory.
 //!
 //! # Invariants
@@ -44,13 +45,13 @@ use crate::native_abi::{
     STUB_MATH_ATAN_LEAF, STUB_MATH_ATAN2_LEAF, STUB_MATH_CEIL_LEAF, STUB_MATH_COS_LEAF,
     STUB_MATH_EXP_LEAF, STUB_MATH_FLOOR_LEAF, STUB_MATH_LOG_LEAF, STUB_MATH_MAX_LEAF,
     STUB_MATH_MIN_LEAF, STUB_MATH_POW_LEAF, STUB_MATH_ROUND_LEAF, STUB_MATH_SIN_LEAF,
-    STUB_MATH_SQRT_LEAF, STUB_MATH_TAN_LEAF, STUB_MATH_TRUNC_LEAF,
-    STUB_NUMBER_POW_F64_LEAF, STUB_NUMBER_REM_F64_LEAF, STUB_NUMBER_REM_LEAF,
-    STUB_NUMBER_TO_INT32_F64_LEAF, STUB_PARSE_INT_I32_LEAF, STUB_STRICT_EQ_LEAF,
-    STUB_STRING_CHAR_CODE_AT_LEAF, STUB_STRING_CODE_POINT_AT_LEAF, STUB_STRING_CONCAT_ALLOC,
-    STUB_STRING_ENDS_WITH_LEAF, STUB_STRING_INCLUDES_LEAF, STUB_STRING_INDEX_OF_LEAF,
-    STUB_STRING_KEY_ATOM_LEAF, STUB_STRING_STARTS_WITH_LEAF, STUB_TO_BOOLEAN_LEAF,
-    STUB_TYPEOF_TEST_LEAF, SafepointId, SafepointRecord, validate_stub_descriptor,
+    STUB_MATH_SQRT_LEAF, STUB_MATH_TAN_LEAF, STUB_MATH_TRUNC_LEAF, STUB_NUMBER_POW_F64_LEAF,
+    STUB_NUMBER_REM_F64_LEAF, STUB_NUMBER_REM_LEAF, STUB_NUMBER_TO_INT32_F64_LEAF,
+    STUB_PARSE_INT_I32_LEAF, STUB_STRICT_EQ_LEAF, STUB_STRING_CHAR_CODE_AT_LEAF,
+    STUB_STRING_CODE_POINT_AT_LEAF, STUB_STRING_CONCAT_ALLOC, STUB_STRING_ENDS_WITH_LEAF,
+    STUB_STRING_INCLUDES_LEAF, STUB_STRING_INDEX_OF_LEAF, STUB_STRING_KEY_ATOM_LEAF,
+    STUB_STRING_STARTS_WITH_LEAF, STUB_TO_BOOLEAN_LEAF, STUB_TYPEOF_TEST_LEAF, SafepointId,
+    SafepointRecord, validate_stub_descriptor,
 };
 use crate::{Interpreter, Value, collections};
 use std::cell::UnsafeCell;
@@ -558,6 +559,12 @@ pub const WRITE_BARRIER_MUTATING: MutatingLeafStub2 = MutatingLeafStub2 {
     entry: write_barrier_mutating,
 };
 
+/// Callable metadata observer for a shape-owned ordinary data field.
+pub const FIELD_TYPE_OBSERVE: MutatingLeafStub2 = MutatingLeafStub2 {
+    descriptor: crate::native_abi::STUB_FIELD_TYPE_OBSERVE,
+    entry: crate::object::field_type::observe_native,
+};
+
 /// Callable ABI entry for the generated tagged element-store barrier.
 pub const ELEMENT_WRITE_BARRIER_MUTATING: MutatingLeafStub3 = MutatingLeafStub3 {
     descriptor: crate::native_abi::STUB_ELEMENT_WRITE_BARRIER,
@@ -971,6 +978,7 @@ pub const fn mutating_leaf_stub2_by_id(id: RuntimeStubId) -> Option<MutatingLeaf
         id if id == STUB_ARRAY_PUSH_LEAF.id => Some(ARRAY_PUSH_LEAF),
         id if id == STUB_ARRAY_SHIFT_LEAF.id => Some(ARRAY_SHIFT_LEAF),
         id if id == crate::native_abi::STUB_WRITE_BARRIER.id => Some(WRITE_BARRIER_MUTATING),
+        id if id == crate::native_abi::STUB_FIELD_TYPE_OBSERVE.id => Some(FIELD_TYPE_OBSERVE),
         _ => None,
     }
 }
@@ -2173,7 +2181,10 @@ pub extern "C" fn math_atan2_leaf(
     rhs_bits: u64,
 ) -> NativeResultPair {
     let _guard = LeafNoAllocGuard::new(heap);
-    math_method_leaf(otter_bytecode::method_id::MathMethod::Atan2, &[lhs_bits, rhs_bits])
+    math_method_leaf(
+        otter_bytecode::method_id::MathMethod::Atan2,
+        &[lhs_bits, rhs_bits],
+    )
 }
 
 /// Leaf ABI entry for two-argument `Math.pow`.
@@ -2183,7 +2194,10 @@ pub extern "C" fn math_pow_leaf(
     rhs_bits: u64,
 ) -> NativeResultPair {
     let _guard = LeafNoAllocGuard::new(heap);
-    math_method_leaf(otter_bytecode::method_id::MathMethod::Pow, &[lhs_bits, rhs_bits])
+    math_method_leaf(
+        otter_bytecode::method_id::MathMethod::Pow,
+        &[lhs_bits, rhs_bits],
+    )
 }
 
 /// Leaf ABI entry for exact-one-argument `parseInt(Int32)`.

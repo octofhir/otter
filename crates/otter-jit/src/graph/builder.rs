@@ -47,6 +47,12 @@
 //! - Named loads select feedback programs by current or revalidated receiver
 //!   shapes. Their indices belong to the innermost source snapshot; only an
 //!   exact singleton proof removes the selected program's receiver guard.
+//! - Shape-owned field bounds belong to loaded SSA values. Their nullish
+//!   arms require edge refinement or an eager check, and their ordinary
+//!   targets require live stability checks before layout-dependent uses.
+//!   Calls forget owner-word checks while retaining the loaded value bounds.
+//!   Owner guards keep their original load's eager frame and remain only
+//!   when a consumer relies on the bound, including through a non-loop phi.
 //!
 //! # See also
 //! - [`super::bytecode`] — blocks, loops and liveness.
@@ -88,6 +94,10 @@ mod receiver_inline_tests;
 #[cfg(test)]
 #[path = "builder_binding_tests.rs"]
 mod binding_tests;
+
+#[path = "builder_field_type.rs"]
+mod field_type;
+use field_type::FieldValueBound;
 
 const UNDEFINED: u64 = tag::VALUE_UNDEFINED;
 
@@ -216,6 +226,10 @@ pub(crate) struct Known {
     /// Shapes whose stable byte this path already read since its last such
     /// operation.
     stable_checked: FxHashSet<u32>,
+    /// Nullable value bounds; their target layouts require stability checks.
+    field_values: FxHashMap<NodeId, FieldValueBound>,
+    /// Defining field guards available since the last possible widening.
+    checked_field_types: FxHashMap<u32, (u64, NodeId)>,
 }
 
 impl Known {
@@ -285,6 +299,19 @@ impl Known {
             .retain(|node, shapes| other.stale_shapes.get(node) == Some(shapes));
         self.stable_checked
             .retain(|shape| other.stable_checked.contains(shape));
+        self.field_values.retain(|node, bound| {
+            let Some(union) = other
+                .field_values
+                .get(node)
+                .and_then(|other| bound.union(other))
+            else {
+                return false;
+            };
+            *bound = union;
+            true
+        });
+        self.checked_field_types
+            .retain(|owner, expected| other.checked_field_types.get(owner) == Some(expected));
     }
 
     /// Keep each layout proof whose shapes were all stable at compile time
@@ -309,6 +336,7 @@ impl Known {
         self.fields.clear();
         self.elements_read.clear();
         self.fresh.clear();
+        self.checked_field_types.clear();
     }
 
     /// The value a store just wrote to `key`. A store through another node
@@ -510,6 +538,10 @@ struct Builder<'a> {
     inlined_bytes: u32,
     /// The snapshot of each inlined body, by origin minus one.
     inline_views: Vec<Arc<JitCompileSnapshot>>,
+    /// Owner guards required by a consumed value bound.
+    required_field_guards: FxHashSet<NodeId>,
+    /// Nullish comparisons whose ordinary arms depend on owner guards.
+    field_nullish_candidates: FxHashMap<NodeId, SmallVec<[NodeId; 4]>>,
 }
 
 /// The most bytecode bytes inlined into one compilation by bodies that are
@@ -657,6 +689,8 @@ fn build_once(
         inline: None,
         inlined_bytes: 0,
         inline_views: Vec::new(),
+        required_field_guards: FxHashSet::default(),
+        field_nullish_candidates: FxHashMap::default(),
     };
     let entry = builder.graph.new_block();
     builder.start_entry(entry);
@@ -677,6 +711,7 @@ fn build_once(
     }
     layout.extend(builder.build_body());
     builder.finish_loops();
+    builder.prune_field_guards();
     remove_trivial_phis(&mut builder.graph, &layout);
     let mut loop_headers = builder.loop_headers();
     loop_headers.append(&mut builder.inline_loop_headers);
@@ -988,6 +1023,8 @@ impl<'a> Builder<'a> {
         let frame_states = self.graph.frame_states.len();
         let views = self.inline_views.len();
         let known = self.known.clone();
+        let required_field_guards = self.required_field_guards.clone();
+        let field_nullish_candidates = self.field_nullish_candidates.clone();
         // The callee runs only as the function the body is. A method read
         // from a slot its prototype proof fixes is already a closure of that
         // function.
@@ -1119,6 +1156,8 @@ impl<'a> Builder<'a> {
             self.eager_states
                 .retain(|_, state| (state.0 as usize) < frame_states);
             self.known = known;
+            self.required_field_guards = required_field_guards;
+            self.field_nullish_candidates = field_nullish_candidates;
             self.current = Some(block);
             return false;
         }
@@ -1138,6 +1177,11 @@ impl<'a> Builder<'a> {
             known.intersect(edge);
         }
         self.current = Some(continuation);
+        let bound = field_type::merged_bound(
+            &self.graph,
+            &self.root.stable_shapes,
+            returns.iter().map(|(_, value, known)| (*value, known)),
+        );
         let value = if returns.len() == 1 {
             returns[0].1
         } else {
@@ -1151,6 +1195,9 @@ impl<'a> Builder<'a> {
             phi
         };
         self.known = known;
+        if let Some(bound) = bound {
+            self.known.field_values.insert(value, bound);
+        }
         self.write(destination, value);
         true
     }
@@ -1292,6 +1339,7 @@ impl<'a> Builder<'a> {
             });
         let mut frame = incoming[0].frame.clone();
         let mut phis = Vec::new();
+        let mut field_phis = Vec::new();
         for register in 0..self.register_count {
             let index = usize::from(register);
             if !live.contains(register) {
@@ -1318,6 +1366,15 @@ impl<'a> Builder<'a> {
             self.graph.node_mut(phi).block = Some(graph_block);
             self.graph.block_mut(graph_block).phis.push(phi);
             frame[index] = phi;
+            if !is_loop
+                && let Some(bound) = field_type::merged_bound(
+                    &self.graph,
+                    &self.root.stable_shapes,
+                    incoming.iter().map(|edge| (edge.frame[index], &edge.known)),
+                )
+            {
+                field_phis.push((phi, bound));
+            }
             if is_loop {
                 phis.push((register, phi));
             }
@@ -1342,6 +1399,8 @@ impl<'a> Builder<'a> {
         }
         if is_loop {
             known.forget_storage();
+            known.checked_field_types.clear();
+            known.stable_checked.clear();
             let key = self.loop_key(block);
             match self.policies.get(&key) {
                 Some(policy) if policy.clobber => known.clobber_heap(&self.root.stable_shapes),
@@ -1352,6 +1411,7 @@ impl<'a> Builder<'a> {
         }
         self.frame = frame;
         self.known = known;
+        self.known.field_values.extend(field_phis);
         true
     }
 
@@ -1477,6 +1537,7 @@ impl<'a> Builder<'a> {
             self.known = known;
             self.current = Some(split);
             self.graph.block_mut(split).predecessors.push(current);
+            self.refine_field_branch(kind, inputs, edge == 0);
             self.goto(target);
         }
         self.current = None;
@@ -2435,6 +2496,40 @@ impl<'a> Builder<'a> {
             Some(value) => self.constant_int32(value),
             None => self.read(instruction.reads[1]),
         };
+        if matches!(instruction.op, Op::LooseEqual | Op::LooseNotEqual) {
+            let nullish = |value| {
+                matches!(self.graph.node(value).kind, Kind::ConstTagged(bits)
+                    if bits == tag::VALUE_NULL || bits == tag::VALUE_UNDEFINED)
+            };
+            let other = if nullish(lhs) {
+                Some(rhs)
+            } else if nullish(rhs) {
+                Some(lhs)
+            } else {
+                None
+            };
+            if let Some(other) = other {
+                let other = self.tagged(other);
+                let value = self.field_nullish_equal(other, instruction.op == Op::LooseNotEqual);
+                self.write(instruction.writes[0], value);
+                return;
+            }
+        }
+        let strict = matches!(
+            instruction.op,
+            Op::Equal | Op::NotEqual | Op::EqualImm | Op::NotEqualImm
+        );
+        // An explicit non-Number constant rules out numeric speculation,
+        // including at sites whose feedback is still empty.
+        if strict
+            && [lhs, rhs].iter().any(|&value| {
+                matches!(self.graph.node(value).kind, Kind::ConstTagged(bits)
+                    if !tag::is_number_bits(bits))
+            })
+        {
+            self.visit_strict_equal(instruction, lhs, rhs, condition);
+            return;
+        }
         // Operands already held as int32 compare as int32 whatever the site
         // saw elsewhere: no conversion, no speculation.
         let held_int32 = [lhs, rhs]
@@ -2444,10 +2539,6 @@ impl<'a> Builder<'a> {
         // Loose equality of two Numbers is their strict equality.
         let proved_numbers = self.is_number(lhs) && self.is_number(rhs);
         let numeric = feedback.is_numeric_only() || int32 || proved_numbers;
-        let strict = matches!(
-            instruction.op,
-            Op::Equal | Op::NotEqual | Op::EqualImm | Op::NotEqualImm
-        );
         if !numeric {
             if strict {
                 self.visit_strict_equal(instruction, lhs, rhs, condition);
@@ -2627,7 +2718,11 @@ impl<'a> Builder<'a> {
             self.write(instruction.writes[0], value);
             return;
         }
+        let bound = self.field_load_bound(&access.shapes, access.field);
         let value = self.add(Kind::LoadOwnField(access.field), &[object], Repr::Tagged);
+        if let Some(bound) = bound {
+            self.known.field_values.insert(value, bound);
+        }
         self.known.fields.insert(key, value);
         self.write(instruction.writes[0], value);
     }
@@ -2771,8 +2866,14 @@ impl<'a> Builder<'a> {
         let value = self.read(instruction.reads[1]);
         let value = self.tagged(value);
         self.check_shapes(object, &access.shapes, true);
+        let Some(owners) = self.field_store_owners(&access.shapes, access.field, value) else {
+            return self.visit_named_store(instruction);
+        };
         self.add(
-            Kind::StoreOwnField(access.field),
+            Kind::StoreOwnField {
+                field: access.field,
+                owners,
+            },
             &[object, value],
             Repr::None,
         );
@@ -2795,6 +2896,7 @@ impl<'a> Builder<'a> {
     /// feedback programs, a deopt for a site that never ran, or the baseline
     /// operation.
     fn visit_named_store(&mut self, instruction: &Instruction) {
+        self.known.checked_field_types.clear();
         let byte_pc = instruction.byte_pc;
         if !self.exited_for(ExitReason::ShapeGuard)
             && let Some(programs) = super::feedback::named_store_programs(self.view, byte_pc)
@@ -2941,7 +3043,9 @@ impl<'a> Builder<'a> {
         {
             return Some(shapes);
         }
-        let shapes = self.known.stale_shapes.get(&object)?.clone();
+        let Some(shapes) = self.known.stale_shapes.get(&object).cloned() else {
+            return self.field_result_shapes(object);
+        };
         let unchecked: SmallVec<[u32; 4]> = shapes
             .iter()
             .copied()
@@ -3683,6 +3787,11 @@ impl<'a> Builder<'a> {
             known.intersect(edge);
         }
         self.current = Some(join);
+        let bound = field_type::merged_bound(
+            &self.graph,
+            &self.root.stable_shapes,
+            arms.iter().map(|(_, value, known)| (*value, known)),
+        );
         let inputs: SmallVec<[NodeId; 4]> = arms
             .iter_mut()
             .map(|(block, value, edge)| self.tagged_at_end(*block, *value, edge))
@@ -3691,6 +3800,9 @@ impl<'a> Builder<'a> {
         self.graph.node_mut(phi).block = Some(join);
         self.graph.block_mut(join).phis.push(phi);
         self.known = known;
+        if let Some(bound) = bound {
+            self.known.field_values.insert(phi, bound);
+        }
         self.write(destination, phi);
     }
 

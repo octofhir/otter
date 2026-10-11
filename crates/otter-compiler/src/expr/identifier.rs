@@ -22,7 +22,8 @@ pub(crate) fn compile_identifier(
     let span = (id.span.start, id.span.end);
     // Immutable global value properties may fold only after proving that no
     // lexical, imported, eval-extension, or `with` binding intercepts the name.
-    let immutable_global = cx.active_with_envs.is_empty()
+    let immutable_global = matches!(id.name.as_str(), "NaN" | "Infinity")
+        && cx.active_with_envs.is_empty()
         && matches!(
             cx.resolve_ref(id.name.as_str()),
             crate::compiler::NameRef::Global(None)
@@ -58,6 +59,10 @@ pub(crate) fn compile_identifier(
     }
     compile_identifier_without_with(cx, id.name.as_str(), span)
 }
+
+#[cfg(test)]
+#[path = "identifier_tests.rs"]
+mod tests;
 
 fn compile_identifier_with_envs(
     cx: &mut Compiler,

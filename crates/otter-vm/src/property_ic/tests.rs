@@ -713,3 +713,101 @@ fn full_collection_forgets_entries_naming_dead_shapes() {
         super::EMPTY_SHAPE
     );
 }
+
+#[test]
+fn storage_projection_codec_and_own_array_domain_are_disjoint() {
+    use super::PropertyStorageProjection as Projection;
+    for projection in [
+        Projection::Receiver,
+        Projection::LookupStart,
+        Projection::ArrayExpando,
+    ] {
+        assert_eq!(
+            Projection::decode_key(projection.encode_key(128)),
+            Some((projection, 128))
+        );
+    }
+    for invalid in [0, 1, 2, 3, 4, 127, 131, super::EMPTY_SHAPE] {
+        assert_eq!(Projection::decode_key(invalid), None);
+    }
+    let mut heap = fresh_heap();
+    let bag = object::alloc_object_old_for_fixture(&mut heap).unwrap();
+    shaped_data_fixture(bag, &mut heap, "x", Value::number_i32(9));
+    let slot = PropertyIcSlot::new(PropertyIcKind::Load);
+    slot.install(
+        own_load_handler(bag, &heap, "x")
+            .projected(Projection::ArrayExpando)
+            .unwrap(),
+    );
+    assert_eq!(
+        slot.probe_load(bag, &heap),
+        None,
+        "storage key cannot masquerade as ordinary receiver feedback"
+    );
+    assert_eq!(
+        slot.probe_projected_load(bag, Projection::LookupStart, &heap),
+        None
+    );
+    assert_eq!(
+        slot.probe_projected_load(bag, Projection::ArrayExpando, &heap),
+        Some(Value::number_i32(9))
+    );
+    assert!(
+        slot.mono_own_field().is_none(),
+        "bag shape is not an Array receiver shape"
+    );
+    let crate::inspect::IcSiteState::Polymorphic { entries } = slot.snapshot_state() else {
+        panic!("installed projected entry");
+    };
+    assert_eq!(entries[0].storage_projection, Projection::ArrayExpando);
+    assert_eq!(
+        entries[0].storage_shape_id,
+        object::shape_body::id_of(object::shape(bag, &heap)).raw()
+    );
+    let programs = slot
+        .jit_programs(atom_of("x"), |shape| Some(shape.offset()), |_| None)
+        .unwrap();
+    assert!(matches!(
+        programs[0].ops.first(),
+        Some(JitCacheIrOp::LoadArrayExpando {
+            object: 0,
+            result: 1,
+            ..
+        })
+    ));
+    assert!(matches!(
+        programs[0].ops.last(),
+        Some(JitCacheIrOp::LoadField { object: 1, .. })
+    ));
+    assert!(
+        IcHandler::load_nonexistent(object::shape(bag, &heap), None)
+            .unwrap()
+            .projected(Projection::ArrayExpando)
+            .is_none(),
+        "null bag prototype is not Array absence"
+    );
+}
+
+#[test]
+fn projected_array_overwrite_uses_bag_field_authority() {
+    use super::PropertyStorageProjection as Projection;
+    let mut heap = fresh_heap();
+    let bag = object::alloc_object_old_for_fixture(&mut heap).unwrap();
+    shaped_data_fixture(bag, &mut heap, "x", Value::null());
+    let slot = PropertyIcSlot::new(PropertyIcKind::Store);
+    let handler = IcHandler::store_existing(bag, &heap, key("x"))
+        .unwrap()
+        .projected(Projection::ArrayExpando)
+        .unwrap();
+    slot.install(handler);
+    assert!(!slot.probe_projected_store(bag, Projection::Receiver, &mut heap, Value::TRUE));
+    assert!(slot.probe_projected_store(bag, Projection::ArrayExpando, &mut heap, Value::TRUE));
+    assert_eq!(object::load_proven_data_slot(bag, &heap, 0), Value::TRUE);
+    let programs = slot
+        .jit_programs(atom_of("x"), |shape| Some(shape.offset()), |_| None)
+        .unwrap();
+    assert!(matches!(
+        programs[0].ops.last(),
+        Some(JitCacheIrOp::StoreField { object: 1, .. })
+    ));
+}

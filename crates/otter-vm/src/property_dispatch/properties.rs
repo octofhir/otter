@@ -11,6 +11,8 @@
 //!   that can run user code does so before any cache is consulted.
 //! - Branded Array prototypes enter canonical Set before ordinary field
 //!   caches, preserving length/index checks and foreign receiver behavior.
+//! - Array bodies use their shaped expando only as own storage; live prototype
+//!   lookup and accessor calls keep the original Array receiver.
 //!
 //! # See also
 //! - `crate::object_internal_ops` owns committed object internal methods.
@@ -130,6 +132,7 @@ impl Interpreter {
                 ));
             }
             let value = if receiver.as_object().is_some()
+                || receiver.is_array()
                 || super::get_walks_prototype_chain(receiver)
             {
                 let key = VmPropertyKey::String(name);
@@ -279,66 +282,6 @@ impl Interpreter {
                 }
             } else if let Some(s) = receiver.as_string(&interp.gc_heap) {
                 interp.load_string_primitive_property(stack, context, &receiver, s, name)?
-            } else if receiver.is_array() {
-                let v = &receiver;
-                let a = v.as_array().unwrap();
-                let direct = if let Some((getter, _setter)) =
-                    crate::array::get_accessor(a, &interp.gc_heap, name)
-                {
-                    match getter {
-                        Some(getter) if abstract_ops::is_callable(&getter) => {
-                            let args: SmallVec<[Value; 8]> = SmallVec::new();
-                            Some(
-                                interp
-                                    .run_callable_sync_rooted(
-                                        stack,
-                                        Some(context),
-                                        &getter,
-                                        interp.escape_scoped(receiver_root),
-                                        args,
-                                    )
-                                    .map_err(CommittedValueError::completed_call)?,
-                            )
-                        }
-                        _ => Some(Value::undefined()),
-                    }
-                } else {
-                    crate::array::get_named_property(a, &interp.gc_heap, name)
-                };
-                match direct {
-                    Some(value) => value,
-                    // §10.4.2.4 — walk the array's *actual* [[Prototype]]: a
-                    // `class X extends Array` instance carries a per-instance
-                    // override (`X.prototype`), so inherited subclass
-                    // accessors / data properties resolve, not only
-                    // %Array.prototype%.
-                    None => match crate::array::prototype_override(a, &interp.gc_heap) {
-                        Some(proto) if proto.is_object_type() => {
-                            match interp.ordinary_get_value(
-                                stack,
-                                Some(context),
-                                proto,
-                                *v,
-                                &crate::VmPropertyKey::String(name),
-                                0,
-                            )? {
-                                VmGetOutcome::Value(val) => val,
-                                VmGetOutcome::InvokeGetter { getter } => interp
-                                    .run_callable_sync_rooted(
-                                        stack,
-                                        Some(context),
-                                        &getter,
-                                        interp.escape_scoped(receiver_root),
-                                        SmallVec::new(),
-                                    )
-                                    .map_err(CommittedValueError::completed_call)?,
-                            }
-                        }
-                        Some(_) => Value::undefined(),
-                        None => interp
-                            .load_from_constructor_prototype(stack, context, "Array", v, name)?,
-                    },
-                }
             } else if let Some(fid) = receiver.as_function().or_else(|| {
                 receiver
                     .as_closure(&interp.gc_heap)
@@ -833,9 +776,10 @@ impl Interpreter {
         // keys are strict code even inside a sloppy function's frame.
         let strict = force_strict || context.function_is_strict(frame.function_id);
         let receiver = *read_register(frame, obj_reg).map_err(CommittedValueError::Fatal)?;
-        if receiver
-            .as_object()
-            .is_some_and(|object| self.is_array_prototype_object(object))
+        if receiver.is_array()
+            || receiver
+                .as_object()
+                .is_some_and(|object| self.is_array_prototype_object(object))
         {
             self.store_property_value(context, stack, receiver, name, value, strict)?;
             stack[top_idx]
@@ -976,86 +920,6 @@ impl Interpreter {
                     None
                 }
             }
-        } else if let Some(a) = receiver.as_array() {
-            // §10.4.2.4 ArraySetLength — `arr.length = v` is a
-            // [[DefineOwnProperty]] of "length", so ToUint32(v) must
-            // equal ToNumber(v) (else RangeError) and the value's
-            // `valueOf` runs. Route it through the shared define path
-            // rather than the lenient named-property store.
-            if name == "length" {
-                let descriptor = object::PartialPropertyDescriptor {
-                    value: Some(value),
-                    ..Default::default()
-                };
-                let ok = self.define_own_property_value(
-                    stack,
-                    context,
-                    &receiver,
-                    &crate::VmPropertyKey::String("length"),
-                    descriptor,
-                )?;
-                if !ok {
-                    self.failed_set_result(
-                        strict,
-                        "Cannot assign to read only property 'length' of array".to_string(),
-                    )
-                    .map_err(CommittedValueError::JavaScript)?;
-                }
-                stack[top_idx]
-                    .advance_pc()
-                    .map_err(CommittedValueError::Fatal)?;
-                return Ok(());
-            }
-            if !self.store_array_accessor_property(stack, context, a, name, &value, strict)? {
-                let has_own_named =
-                    crate::array::get_named_property(a, &self.gc_heap, name).is_some();
-                if !has_own_named {
-                    let proto = self
-                        .constructor_prototype_value("Array")
-                        .map_err(CommittedValueError::Fatal)?;
-                    if let Some(proto) = proto.as_object() {
-                        match crate::object::resolve_set(proto, &self.gc_heap, name) {
-                            object::SetOutcome::InvokeSetter { setter } => {
-                                let mut args: SmallVec<[Value; 8]> = SmallVec::new();
-                                args.push(value);
-                                self.run_callable_sync_rooted(
-                                    stack,
-                                    Some(context),
-                                    &setter,
-                                    Value::array(a),
-                                    args,
-                                )
-                                .map_err(CommittedValueError::completed_call)?;
-                                stack[top_idx]
-                                    .advance_pc()
-                                    .map_err(CommittedValueError::Fatal)?;
-                                return Ok(());
-                            }
-                            object::SetOutcome::Reject { .. } => {
-                                self.failed_set_result(
-                                    strict,
-                                    format!("Cannot assign to property '{name}'"),
-                                )
-                                .map_err(CommittedValueError::JavaScript)?;
-                                stack[top_idx]
-                                    .advance_pc()
-                                    .map_err(CommittedValueError::Fatal)?;
-                                return Ok(());
-                            }
-                            object::SetOutcome::AssignData => {}
-                            // %Array.prototype% chains stay ordinary.
-                            object::SetOutcome::ExoticParent { .. } => {}
-                        }
-                    }
-                }
-                if !crate::array::set_named_property(a, &mut self.gc_heap, name, value)
-                    .map_err(|error| CommittedValueError::JavaScript(error.into()))?
-                {
-                    self.failed_set_result(strict, format!("Cannot assign to property '{name}'"))
-                        .map_err(CommittedValueError::JavaScript)?;
-                }
-            }
-            None
         } else if let Some(t) = receiver.as_typed_array(&self.gc_heap) {
             if let Some(n) = canonical_numeric_index_string(name) {
                 // §10.4.5.16 step 2 — convert the value (firing its

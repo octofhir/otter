@@ -3,7 +3,6 @@
 //! # Contents
 //! - `ToPrimitive` / `ToPropertyDescriptor` / `ToPropertyKey` evaluation.
 //! - `[[OwnPropertyKeys]]` and its proxy invariant checks.
-//! - `[[SetPrototypeOf]]` in its proxy-aware form.
 //!
 //! # Invariants
 //! - Coercion may call user code, so every entry here re-reads its receiver
@@ -11,6 +10,12 @@
 //! - ToPropertyDescriptor forwards an actual optional source through the sole
 //!   Get/Has owners. Native callbacks require no fabricated dispatch context;
 //!   bytecode callbacks resolve their own admitted FunctionID.
+//! - Array keys consist of sorted present indices, length, then the shaped
+//!   expando's string and symbol birth order; the expando is never the receiver.
+//!
+//! # See also
+//! - [crate::array]: indexed storage and expando attachment.
+//! - [crate::object]: ordinary descriptors and property ordering.
 
 use super::*;
 use crate::activation_stack::ActivationStack;
@@ -589,14 +594,30 @@ impl Interpreter {
             return Ok(keys);
         }
         if let Some(arr) = target.as_array() {
-            let (indices, string_keys) = array::own_index_and_string_keys(arr, &self.gc_heap);
-            let mut keys: Vec<Value> = Vec::with_capacity(indices.len() + string_keys.len() + 2);
-            let indices: Vec<String> = indices.into_iter().map(|idx| idx.to_string()).collect();
-            // §10.4.2 Array exotic objects always expose `length`.
+            let indices = array::own_indices(arr, &self.gc_heap);
+            let (string_keys, mut symbols): (Vec<String>, Vec<Value>) =
+                array::expando_object(arr, &self.gc_heap).map_or_else(
+                    || (Vec::new(), Vec::new()),
+                    |bag| {
+                        object::with_properties(bag, &self.gc_heap, |properties| {
+                            (
+                                properties.keys().map(str::to_string).collect(),
+                                properties
+                                    .symbol_keys()
+                                    .filter(|key| !key.is_private_name())
+                                    .map(Value::symbol)
+                                    .collect(),
+                            )
+                        })
+                    },
+                );
+            let mut keys: Vec<Value> =
+                Vec::with_capacity(indices.len() + string_keys.len() + symbols.len() + 1);
+            let indices: Vec<String> = indices.into_iter().map(|index| index.to_string()).collect();
             self.push_own_key_strings(
                 &mut keys,
                 &mut target,
-                &mut [],
+                &mut symbols,
                 indices
                     .iter()
                     .map(String::as_str)
@@ -604,17 +625,7 @@ impl Interpreter {
                     .chain(string_keys.iter().map(String::as_str)),
             )
             .map_err(CommittedValueError::JavaScript)?;
-            // §10.4.2 — own symbol-keyed properties follow the
-            // string keys per §7.3.22 OrdinaryOwnPropertyKeys
-            // ordering. Re-read the receiver after the key
-            // allocations above.
-            let arr = target
-                .as_array()
-                .ok_or(VmError::InvalidOperand)
-                .map_err(CommittedValueError::Fatal)?;
-            for sym in array::own_symbol_keys(arr, &self.gc_heap) {
-                keys.push(Value::symbol(sym));
-            }
+            keys.extend(symbols);
             return Ok(keys);
         }
         let fid = target.as_function().or_else(|| {
@@ -854,8 +865,7 @@ impl Interpreter {
                     .map_err(CommittedValueError::completed_call)?
             }
         };
-        let len = to_length(&len_value, &self.gc_heap)
-            .map_err(CommittedValueError::JavaScript)?;
+        let len = to_length(&len_value, &self.gc_heap).map_err(CommittedValueError::JavaScript)?;
         let mut out: Vec<Local<'s>> = Vec::with_capacity(len);
         for i in 0..len {
             let key = VmPropertyKey::OwnedString(i.to_string());
@@ -1066,244 +1076,5 @@ impl Interpreter {
             )));
         }
         Ok(trap_result)
-    }
-
-    /// §10.5.2 / §10.1.2 — value-level `[[SetPrototypeOf]]`.
-    /// Proxies dispatch through `setPrototypeOf` trap and enforce the
-    /// §10.5.7 invariant for non-extensible targets.
-    pub(crate) fn set_prototype_value_proxy_aware(
-        &mut self,
-        stack: &mut ActivationStack,
-        context: &ExecutionContext,
-        target: &Value,
-        proto: &Value,
-    ) -> Result<bool, CommittedValueError> {
-        // Deferred namespaces have an immutable null [[Prototype]]
-        // (§28.3 [[SetPrototypeOf]] = SetImmutablePrototype): succeed
-        // only when the requested prototype is also null.
-        if let Some(obj) = target.as_object()
-            && (object::deferred_namespace_target(obj, &self.gc_heap).is_some()
-                || object::module_namespace_env(obj, &self.gc_heap).is_some())
-        {
-            return Ok(proto.is_null());
-        }
-        if let Some(proxy) = target.as_proxy() {
-            if proxy.is_revoked(&self.gc_heap) {
-                return Err(CommittedValueError::JavaScript(
-                    self.err_type(
-                        ("Cannot perform 'setPrototypeOf' on a proxy that has been revoked"
-                            .to_string())
-                        .into(),
-                    ),
-                ));
-            }
-            let trap_args: SmallVec<[Value; 8]> =
-                smallvec::smallvec![proxy.target(&self.gc_heap), *proto];
-            return match self.invoke_proxy_trap(
-                stack,
-                Some(context),
-                &proxy,
-                "setPrototypeOf",
-                trap_args,
-            )? {
-                crate::object_internal_ops::ProxyTrap::Trapped(result) => {
-                    let ok = result.to_boolean(&self.gc_heap);
-                    if !ok {
-                        return Ok(false);
-                    }
-                    let target_value = proxy.target(&self.gc_heap);
-                    let target_extensible =
-                        self.is_extensible_value(stack, Some(context), &target_value)?;
-                    if !target_extensible {
-                        let target_proto =
-                            self.ordinary_get_prototype_value(stack, context, target_value, 0)?;
-                        if !abstract_ops::same_value(proto, &target_proto, &self.gc_heap) {
-                            return Err(CommittedValueError::JavaScript(self.err_type((
-                                    "Proxy setPrototypeOf invariant violated: target is non-extensible and prototypes differ"
-                                        .to_string()).into())));
-                        }
-                    }
-                    Ok(true)
-                }
-                crate::object_internal_ops::ProxyTrap::NoTrap {
-                    target: fallthrough_target,
-                } => {
-                    self.set_prototype_value_proxy_aware(stack, context, &fallthrough_target, proto)
-                }
-            };
-        }
-        // Class constructor [[SetPrototypeOf]] — record the identity
-        // in the ctor_proto slot and mirror the walk-able chain on
-        // the statics object (a class parent maps to its statics so
-        // inherited statics keep resolving).
-        if let Some(c) = target.as_class_constructor() {
-            c.set_ctor_proto(&mut self.gc_heap, *proto);
-            let statics_chain = if let Some(pc) = proto.as_class_constructor() {
-                Value::object(pc.statics(&self.gc_heap))
-            } else {
-                *proto
-            };
-            let statics = Value::object(c.statics(&self.gc_heap));
-            return self.set_prototype_value_proxy_aware(stack, context, &statics, &statics_chain);
-        }
-        if let Some(obj) = target.as_object() {
-            // §10.1.2 OrdinarySetPrototypeOf full algorithm.
-            let current_proto =
-                object::prototype_value(obj, &self.gc_heap).unwrap_or(Value::null());
-            // §20.1.3 — %Object.prototype% is an
-            // immutable-prototype exotic object. It reports
-            // success only when the requested prototype is
-            // SameValue with its current [[Prototype]].
-            if self.object_prototype_object_opt() == Some(obj) {
-                return Ok(abstract_ops::same_value(
-                    proto,
-                    &current_proto,
-                    &self.gc_heap,
-                ));
-            }
-            if abstract_ops::same_value(proto, &current_proto, &self.gc_heap) {
-                return Ok(true);
-            }
-            if !object::is_extensible(obj, &self.gc_heap) {
-                return Ok(false);
-            }
-            // Step 8 cycle check — walk the candidate chain looking
-            // for O itself. Only ordinary-object hops; the spec
-            // stops when an exotic [[GetPrototypeOf]] is hit.
-            let mut p = *proto;
-            let hard_cap = object::PROTO_CHAIN_HARD_CAP;
-            let mut hops = 0;
-            loop {
-                if p.is_null() {
-                    break;
-                }
-                if let Some(candidate) = p.as_object() {
-                    if abstract_ops::same_value(
-                        &Value::object(candidate),
-                        &Value::object(obj),
-                        &self.gc_heap,
-                    ) {
-                        return Ok(false);
-                    }
-                    if hops >= hard_cap {
-                        break;
-                    }
-                    hops += 1;
-                    p = object::prototype_value(candidate, &self.gc_heap).unwrap_or(Value::null());
-                } else {
-                    // Non-ordinary prototype links short-circuit per
-                    // §10.1.2 step 8.c.i.
-                    break;
-                }
-            }
-            let proto_opt = if proto.is_null() { None } else { Some(*proto) };
-            let mut obj = obj;
-            return self
-                .set_ordinary_prototype(&mut obj, proto_opt)
-                .map_err(CommittedValueError::JavaScript);
-        }
-        if let Some(arr) = target.as_array() {
-            let current_proto = self
-                .get_prototype_for_op(target)
-                .map_err(CommittedValueError::JavaScript)?;
-            if abstract_ops::same_value(proto, &current_proto, &self.gc_heap) {
-                return Ok(true);
-            }
-            if !array::is_extensible(arr, &self.gc_heap) {
-                return Ok(false);
-            }
-            if abstract_ops::same_value(proto, target, &self.gc_heap) {
-                return Ok(false);
-            }
-            let proto_opt = if proto.is_null() {
-                None
-            } else if proto.is_object_type() || proto.is_proxy() {
-                Some(*proto)
-            } else {
-                return Ok(false);
-            };
-            array::set_prototype_override(arr, &mut self.gc_heap, proto_opt)
-                .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
-            return Ok(true);
-        }
-        // §10.1.2 OrdinarySetPrototypeOf for interned functions and
-        // closures — the override rides the closure instance's body, or
-        // the interned-template side table for a bare function value
-        // (a stored `null` means an explicit null [[Prototype]],
-        // distinct from "no override").
-        let owner = target.as_closure(&self.gc_heap);
-        let fid = target
-            .as_function()
-            .or_else(|| owner.map(|c| c.cached_function_id));
-        if let Some(function_id) = fid {
-            let current = self
-                .get_prototype_for_op(target)
-                .map_err(CommittedValueError::JavaScript)?;
-            if abstract_ops::same_value(proto, &current, &self.gc_heap) {
-                return Ok(true);
-            }
-            if !self.ordinary_function_is_extensible(owner, function_id) {
-                return Ok(false);
-            }
-            if abstract_ops::same_value(proto, target, &self.gc_heap) {
-                return Ok(false);
-            }
-            self.set_function_prototype_override(target, Some(*proto));
-            return Ok(true);
-        }
-        // §10.4.1 bound function exotic objects use OrdinarySetPrototypeOf;
-        // the override rides a body slot every prototype walk consults.
-        if let Some(bound) = target.as_bound_function() {
-            let current = self
-                .get_prototype_for_op(target)
-                .map_err(CommittedValueError::JavaScript)?;
-            if abstract_ops::same_value(proto, &current, &self.gc_heap) {
-                return Ok(true);
-            }
-            if !self.is_extensible_non_proxy(target)
-                || abstract_ops::same_value(proto, target, &self.gc_heap)
-            {
-                return Ok(false);
-            }
-            bound.set_prototype_override(&mut self.gc_heap, *proto);
-            return Ok(true);
-        }
-        // §10.1.2 OrdinarySetPrototypeOf for the remaining exotics —
-        // TypedArray / ArrayBuffer / DataView / Map / Set / WeakMap /
-        // WeakSet / RegExp / Promise / generator / iterator / Intl.
-        // Their [[Prototype]] rides a body slot rather than an
-        // `ObjectBody`, but the algorithm is the ordinary one: the
-        // no-op case succeeds, a non-extensible object refuses, and a
-        // chain that would run back into the target refuses.
-        let current = self
-            .get_prototype_for_op(target)
-            .map_err(CommittedValueError::JavaScript)?;
-        if abstract_ops::same_value(proto, &current, &self.gc_heap) {
-            return Ok(true);
-        }
-        if !self.is_extensible_value(stack, Some(context), target)? {
-            return Ok(false);
-        }
-        let mut p = *proto;
-        let mut hops = 0;
-        loop {
-            if p.is_null() {
-                break;
-            }
-            if abstract_ops::same_value(&p, target, &self.gc_heap) {
-                return Ok(false);
-            }
-            let Some(candidate) = p.as_object() else {
-                // Non-ordinary prototype links short-circuit per
-                // §10.1.2 step 8.c.i.
-                break;
-            };
-            if hops >= object::PROTO_CHAIN_HARD_CAP {
-                break;
-            }
-            hops += 1;
-            p = object::prototype_value(candidate, &self.gc_heap).unwrap_or(Value::null());
-        }
-        Ok(self.set_exotic_prototype_override(target, *proto))
     }
 }

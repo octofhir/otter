@@ -21,13 +21,14 @@
 //!   transition target died before those cells can be reused, so a handle
 //!   compare is an exact layout proof. Only fast ordinary shapes are
 //!   installed; dictionary and opaque objects never match an entry.
-//! - A receiver whose named lookup starts at another object is keyed by that
-//!   lookup-start object's shape with the low bit set (shape handles are
-//!   8-aligned, so the key never equals an ordinary receiver's shape), and
-//!   its handlers act on the lookup-start object: a function's property bag,
-//!   which carries the function's own `[[Prototype]]`, for every key the
-//!   function does not synthesize; an ordinary dense array's prototype, for
-//!   every named key but `length`.
+//! - One checked [`PropertyStorageProjection`] occupies the low two bits of
+//!   an 8-aligned storage shape key. Empty keys are rejected before decoding;
+//!   the reserved projection and unaligned or null shapes cannot be installed.
+//!   Receiver handlers operate on the source object. Lookup-start handlers
+//!   operate on a function bag or a proved clean exotic prototype. Array-expando
+//!   handlers reload the array's live own storage and admit only own data loads
+//!   and overwrites: its null prototype never proves absence, inheritance or an
+//!   append on the original array. The projection never replaces the JS receiver.
 //! - A matched receiver shape fixes the object's lookup state, own keys,
 //!   attributes, prototype and storage banks. Prototype-field and
 //!   nonexistent handlers additionally require their chain proof; a
@@ -156,9 +157,45 @@ pub enum TransitionGuard {
 /// separate emptiness test.
 pub const EMPTY_SHAPE: u32 = u32::MAX;
 
-/// Key bit of a receiver whose named lookup starts at another object: that
-/// lookup-start object's shape handle with the low bit set.
-pub const LOOKUP_START_KEY_BIT: u32 = 1;
+/// Storage selected before a property handler runs. The source receiver remains
+/// unchanged; projected objects own only the storage operation.
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum PropertyStorageProjection {
+    /// The source receiver owns the shape and storage operation.
+    #[default]
+    Receiver = 0,
+    /// A separately proved lookup-start object owns the operation.
+    LookupStart = 1,
+    /// The array's live expando owns an existing non-index data slot.
+    ArrayExpando = 2,
+}
+
+impl PropertyStorageProjection {
+    /// Bits reserved in an aligned shape key for its storage projection.
+    pub const KEY_MASK: u32 = 3;
+
+    /// Encode one nonzero aligned shape with this projection.
+    pub fn encode_key(self, shape: u32) -> u32 {
+        debug_assert!(shape != 0 && shape.is_multiple_of(8));
+        shape | self as u32
+    }
+
+    /// Decode the current key format, rejecting emptiness and reserved codes.
+    pub fn decode_key(key: u32) -> Option<(Self, u32)> {
+        if key == EMPTY_SHAPE {
+            return None;
+        }
+        let projection = match key & Self::KEY_MASK {
+            0 => Self::Receiver,
+            1 => Self::LookupStart,
+            2 => Self::ArrayExpando,
+            _ => return None,
+        };
+        let shape = key & !Self::KEY_MASK;
+        (shape != 0 && shape.is_multiple_of(8)).then_some((projection, shape))
+    }
+}
 
 const STATE_COUNT_MASK: u32 = 0xff;
 const STATE_ATTEMPTED: u32 = 1 << 8;
@@ -262,15 +299,18 @@ impl IcEntry {
         self.shape.store(key, Ordering::Relaxed);
     }
 
-    /// Shape handle the entry's key names, with the function bit cleared.
+    /// The aligned shape named by this validated live entry.
     fn shape_handle(&self) -> ShapeHandle {
-        // SAFETY: entry keys hold shape handles (plus the function bit)
-        // published by `write`; the weak pass clears dead ones.
-        unsafe { ShapeHandle::from_offset(self.shape() & !LOOKUP_START_KEY_BIT) }
+        let (_, shape) = PropertyStorageProjection::decode_key(self.shape())
+            .expect("live property entry has a valid shape projection");
+        // SAFETY: writes encode rooted shape handles; the weak pass clears dead entries.
+        unsafe { ShapeHandle::from_offset(shape) }
     }
 
-    fn lookup_start(&self) -> bool {
-        self.shape() != EMPTY_SHAPE && self.shape() & LOOKUP_START_KEY_BIT != 0
+    fn projection(&self) -> PropertyStorageProjection {
+        PropertyStorageProjection::decode_key(self.shape())
+            .expect("live property entry has a valid storage projection")
+            .0
     }
 
     /// Move `other`'s contents (including its proof count) into `self`.
@@ -326,7 +366,7 @@ impl IcEntry {
 #[derive(Debug, Clone)]
 pub(crate) struct IcHandler {
     receiver_shape: ShapeHandle,
-    lookup_start: bool,
+    projection: PropertyStorageProjection,
     kind: IcHandlerKind,
     field: FieldLocation,
     slot: u16,
@@ -362,7 +402,7 @@ impl IcHandler {
             }
             return Some(Self {
                 receiver_shape,
-                lookup_start: false,
+                projection: PropertyStorageProjection::Receiver,
                 kind: IcHandlerKind::OwnField,
                 field,
                 slot: resolved.hit.slot,
@@ -377,7 +417,7 @@ impl IcHandler {
         }
         Some(Self {
             receiver_shape,
-            lookup_start: false,
+            projection: PropertyStorageProjection::Receiver,
             kind: IcHandlerKind::PrototypeField,
             field,
             slot: resolved.hit.slot,
@@ -396,7 +436,7 @@ impl IcHandler {
     ) -> Option<Self> {
         Self::eligible_receiver(receiver_shape).then(|| Self {
             receiver_shape,
-            lookup_start: false,
+            projection: PropertyStorageProjection::Receiver,
             kind: IcHandlerKind::NonExistent,
             field: FieldLocation::from_cache_key(0),
             slot: 0,
@@ -407,27 +447,25 @@ impl IcHandler {
         })
     }
 
-    /// This handler, serving a receiver whose lookup-start object has the
-    /// handler's receiver shape: a function's property bag or an ordinary
-    /// dense array's prototype for a load, a function's bag for an own-field
-    /// store.
+    /// Select the object's role without granting array-chain absence or append.
     #[must_use]
-    pub(crate) fn for_lookup_start(mut self) -> Self {
-        debug_assert!(
-            self.kind != IcHandlerKind::StoreTransition,
-            "lookup-start receivers never append"
-        );
-        self.lookup_start = true;
-        self
+    pub(crate) fn projected(mut self, projection: PropertyStorageProjection) -> Option<Self> {
+        if (projection == PropertyStorageProjection::LookupStart
+            && self.kind == IcHandlerKind::StoreTransition)
+            || (projection == PropertyStorageProjection::ArrayExpando
+                && !matches!(
+                    self.kind,
+                    IcHandlerKind::OwnField | IcHandlerKind::StoreField
+                ))
+        {
+            return None;
+        }
+        self.projection = projection;
+        Some(self)
     }
 
     fn key(&self) -> u32 {
-        self.receiver_shape.offset()
-            | if self.lookup_start {
-                LOOKUP_START_KEY_BIT
-            } else {
-                0
-            }
+        self.projection.encode_key(self.receiver_shape.offset())
     }
 
     /// The store handler for the receiver's existing writable own data slot.
@@ -466,7 +504,7 @@ impl IcHandler {
         Some((
             Self {
                 receiver_shape,
-                lookup_start: false,
+                projection: PropertyStorageProjection::Receiver,
                 kind: IcHandlerKind::StoreField,
                 field: object::field_location(receiver_shape, u32::from(hit.slot)),
                 slot: hit.slot,
@@ -511,7 +549,7 @@ impl IcHandler {
         };
         Some(Self {
             receiver_shape: from_shape,
-            lookup_start: false,
+            projection: PropertyStorageProjection::Receiver,
             kind: IcHandlerKind::StoreTransition,
             field,
             slot: transition.slot,
@@ -531,7 +569,7 @@ impl IcHandler {
         Self {
             // SAFETY: the fixture handle is never dereferenced.
             receiver_shape: unsafe { ShapeHandle::from_offset(shape_offset) },
-            lookup_start: false,
+            projection: PropertyStorageProjection::Receiver,
             kind: IcHandlerKind::OwnField,
             field: FieldLocation::inline(0),
             slot: 0,
@@ -724,10 +762,9 @@ impl PropertyIcSlot {
             PropertyIcKind::Load => IcHandlerKind::OwnField,
             PropertyIcKind::Store => IcHandlerKind::StoreField,
         };
-        let entry = self
-            .live()
-            .iter()
-            .find(|entry| entry.kind() == own && !entry.lookup_start());
+        let entry = self.live().iter().find(|entry| {
+            entry.kind() == own && entry.projection() == PropertyStorageProjection::Receiver
+        });
         match entry {
             Some(entry) => {
                 self.inline_field
@@ -776,24 +813,26 @@ impl PropertyIcSlot {
     /// Run the load handler of a receiver whose named lookup starts at
     /// `start`. `None` on a miss.
     #[must_use]
-    pub(crate) fn probe_lookup_start_load(
+    pub(crate) fn probe_projected_load(
         &self,
         start: JsObject,
+        projection: PropertyStorageProjection,
         heap: &otter_gc::GcHeap,
     ) -> Option<Value> {
         let shape = object::keyed_shape(start, heap);
         if shape.is_null() {
             return None;
         }
-        self.probe_load_from(start, shape.offset() | LOOKUP_START_KEY_BIT, heap)
+        self.probe_load_from(start, projection.encode_key(shape.offset()), heap)
     }
 
-    /// Run the own-field store handler of a function receiver whose property
-    /// bag is `bag`. `false` on a miss.
+    /// Run the own-field store handler for the selected `bag` and projection.
+    /// `false` on a miss; the original receiver never becomes this bag.
     #[must_use]
-    pub(crate) fn probe_lookup_start_store(
+    pub(crate) fn probe_projected_store(
         &self,
         bag: JsObject,
+        projection: PropertyStorageProjection,
         heap: &mut otter_gc::GcHeap,
         value: Value,
     ) -> bool {
@@ -801,7 +840,7 @@ impl PropertyIcSlot {
         if shape.is_null() {
             return false;
         }
-        match self.matching(shape.offset() | LOOKUP_START_KEY_BIT) {
+        match self.matching(projection.encode_key(shape.offset())) {
             Some(entry) if entry.kind() == IcHandlerKind::StoreField => {
                 object::store_proven_data_slot(bag, heap, entry.slot(), value);
                 true
@@ -813,6 +852,11 @@ impl PropertyIcSlot {
     /// Run the load handler keyed `key` with `obj` as lookup-start object.
     fn probe_load_from(&self, obj: JsObject, key: u32, heap: &otter_gc::GcHeap) -> Option<Value> {
         let entry = self.matching(key)?;
+        if entry.projection() == PropertyStorageProjection::ArrayExpando
+            && entry.kind() != IcHandlerKind::OwnField
+        {
+            return None;
+        }
         match entry.kind() {
             IcHandlerKind::OwnField => Some(object::load_proven_data_slot(obj, heap, entry.slot())),
             IcHandlerKind::PrototypeField => {
@@ -965,7 +1009,8 @@ impl PropertyIcSlot {
             heap.is_marked(unsafe { ShapeHandle::from_offset(handle) }.raw())
         };
         self.retain(|entry| {
-            live(entry.shape() & !LOOKUP_START_KEY_BIT)
+            PropertyStorageProjection::decode_key(entry.shape())
+                .is_some_and(|(_, shape)| live(shape))
                 && (entry.aux.load(Ordering::Relaxed) == 0
                     || live(entry.aux.load(Ordering::Relaxed)))
                 && (entry.owner.load(Ordering::Relaxed) == 0
@@ -973,13 +1018,14 @@ impl PropertyIcSlot {
         });
     }
 
-    /// The first live own-field load entry: `(receiver shape, logical slot)`.
+    /// The first live unprojected own-field load: `(receiver shape, logical slot)`.
     #[must_use]
     pub(crate) fn mono_own_field(&self) -> Option<(ShapeHandle, u16)> {
         let [entry] = self.live() else {
             return None;
         };
-        (entry.kind() == IcHandlerKind::OwnField && !entry.lookup_start())
+        (entry.kind() == IcHandlerKind::OwnField
+            && entry.projection() == PropertyStorageProjection::Receiver)
             .then(|| (entry.shape_handle(), entry.slot()))
     }
 
@@ -1059,7 +1105,8 @@ impl PropertyIcSlot {
                 let transition = entry.kind() == IcHandlerKind::StoreTransition;
                 IcEntrySnapshot {
                     variant,
-                    receiver_shape_id: object::shape_body::id_of(receiver).raw(),
+                    storage_projection: entry.projection(),
+                    storage_shape_id: object::shape_body::id_of(receiver).raw(),
                     key: None,
                     slot: (!transition && entry.kind() != IcHandlerKind::NonExistent)
                         .then(|| entry.slot()),
@@ -1092,7 +1139,7 @@ impl PropertyIcSlot {
         for entry in self.live() {
             // Lookup-start receivers have no CacheIR lowering in the optimizing
             // tier; they reach its generic node like unseen shapes.
-            if entry.lookup_start() {
+            if entry.projection() == PropertyStorageProjection::LookupStart {
                 continue;
             }
             let receiver = entry.shape_handle();
@@ -1111,7 +1158,7 @@ impl PropertyIcSlot {
                 }
             };
             let field = entry.field();
-            let ops: Vec<JitCacheIrOp> = match entry.kind() {
+            let mut ops: Vec<JitCacheIrOp> = match entry.kind() {
                 IcHandlerKind::OwnField => vec![
                     JitCacheIrOp::GuardShape { object: 0, shape },
                     JitCacheIrOp::GuardAtomSlot {
@@ -1170,6 +1217,31 @@ impl PropertyIcSlot {
                 }
                 IcHandlerKind::NonExistent | IcHandlerKind::Empty => continue,
             };
+            if entry.projection() == PropertyStorageProjection::ArrayExpando {
+                if !matches!(
+                    entry.kind(),
+                    IcHandlerKind::OwnField | IcHandlerKind::StoreField
+                ) {
+                    continue;
+                }
+                for op in &mut ops {
+                    match op {
+                        JitCacheIrOp::GuardShape { object, .. }
+                        | JitCacheIrOp::GuardAtomSlot { object, .. }
+                        | JitCacheIrOp::LoadField { object, .. }
+                        | JitCacheIrOp::StoreField { object, .. } => *object = 1,
+                        _ => unreachable!("array expando admits existing own slots only"),
+                    }
+                }
+                ops.insert(
+                    0,
+                    JitCacheIrOp::LoadArrayExpando {
+                        object: 0,
+                        result: 1,
+                        layout: crate::jit::JitArrayLayout::current(),
+                    },
+                );
+            }
             programs.push(crate::jit::JitCacheIrProgram {
                 ops: ops.into_boxed_slice(),
             });

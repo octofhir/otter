@@ -3,15 +3,15 @@
 //!
 //! # Contents
 //! - [`OwnDataLoad`] / [`own_data_load`] — a named load whose selected
-//!   receiver shapes keep the property as an own data slot at one location.
+//!   selected storage shapes keep one own data slot at the same location.
 //! - [`own_data_store`] — the same for a store into an existing writable
 //!   slot.
 //! - [`NamedLoadPrograms`] / [`named_load_programs`] — source-owned indices
 //!   of load programs compatible with the receiver's known ordinary shapes.
 //!   Each reads the receiver, a guarded holder, a pinned intrinsic prototype,
-//!   or a closure's own `prototype` slot.
+//!   a live Array expando, or a closure's own `prototype` slot.
 //! - [`named_store_programs`] — any store whose every program writes an
-//!   existing writable slot of an ordinary receiver or appends one through
+//!   existing writable slot of ordinary storage or appends one through
 //!   a guarded shape transition into its persistent inline capacity.
 //!
 //! # Invariants
@@ -23,18 +23,23 @@
 //! - Program indices retain their order in the exact source snapshot.
 //! - Single-slot specializations agree on the entire shape-owned FieldLocation:
 //!   both storage bank and relative word index, not only the byte displacement.
+//! - Array-expando shapes describe storage, never the source receiver. Known
+//!   ordinary receiver shapes cannot select them, and they grant no inherited,
+//!   absent-key or append proof on the original array.
 //!
 //! # See also
 //! - `otter_vm::jit::JitCacheIrProgram` — the program format read here.
 //! - [`super::builder`] — the consumer.
 
 use otter_vm::JitCompileSnapshot;
-use otter_vm::jit::JitCacheIrOp;
+use otter_vm::jit::{JitCacheIrOp, PropertyStorageProjection};
 use smallvec::SmallVec;
 
 /// A named load from one own data slot of up to four receiver shapes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct OwnDataLoad {
+    /// Storage shape belongs to this projection, never the source receiver by accident.
+    pub(crate) projection: PropertyStorageProjection,
     /// Compressed shape handles.
     pub(crate) shapes: SmallVec<[u32; 4]>,
     /// Immutable storage bank and bank-relative word index.
@@ -77,6 +82,15 @@ fn load_program_indices(
                     // ordinary object cells established by shape proofs.
                     continue;
                 }
+                Some(JitCacheIrOp::LoadArrayExpando {
+                    object: 0,
+                    result: 1,
+                    ..
+                }) => {
+                    // Known ordinary receiver shapes exclude actual Array cells,
+                    // but never compare those shapes to the bag's shape token.
+                    continue;
+                }
                 Some(JitCacheIrOp::LoadClosurePrototype { object: 0 })
                     if program.ops.len() == 1 =>
                 {
@@ -93,6 +107,25 @@ fn load_program_indices(
     (!selected.is_empty()).then_some(selected)
 }
 
+/// Storage and ordinary own-slot suffix of a complete field program.
+fn own_storage_program(
+    program: &otter_vm::JitCacheIrProgram,
+) -> (PropertyStorageProjection, u8, &[JitCacheIrOp]) {
+    if let Some((
+        JitCacheIrOp::LoadArrayExpando {
+            object: 0,
+            result: 1,
+            ..
+        },
+        rest,
+    )) = program.ops.split_first()
+    {
+        (PropertyStorageProjection::ArrayExpando, 1, rest)
+    } else {
+        (PropertyStorageProjection::Receiver, 0, &program.ops)
+    }
+}
+
 /// The own-data load the site at `byte_pc` observed, if every selected
 /// program reads one own slot and all agree on its complete location.
 pub(crate) fn own_data_load(
@@ -104,25 +137,38 @@ pub(crate) fn own_data_load(
     let selected = load_program_indices(programs, receivers)?;
     let mut shapes = SmallVec::new();
     let mut location = None;
+    let mut projection = None;
     for index in selected {
         let program = &programs[index as usize];
+        let (storage, operand, ops) = own_storage_program(program);
+        if projection.is_some_and(|known| known != storage) {
+            return None;
+        }
+        projection = Some(storage);
         let [
-            JitCacheIrOp::GuardShape { object: 0, shape },
+            JitCacheIrOp::GuardShape {
+                object: shape_operand,
+                shape,
+            },
             JitCacheIrOp::GuardAtomSlot {
-                object: 0,
+                object: slot_operand,
                 field,
                 writable: false,
                 ..
             },
             JitCacheIrOp::LoadField {
-                object: 0,
+                object: load_operand,
                 field: load_byte,
             },
-        ] = &*program.ops
+        ] = ops
         else {
             return None;
         };
-        if field != load_byte {
+        if *shape_operand != operand
+            || *slot_operand != operand
+            || *load_operand != operand
+            || field != load_byte
+        {
             return None;
         }
         i32::try_from(field.byte_offset()).ok()?;
@@ -133,6 +179,7 @@ pub(crate) fn own_data_load(
         shapes.push(*shape);
     }
     Some(OwnDataLoad {
+        projection: projection?,
         shapes,
         field: location?,
     })
@@ -177,6 +224,7 @@ pub(crate) fn own_data_store(
     }
     let mut shapes = SmallVec::new();
     let mut location = None;
+    let mut projection = None;
     for program in programs {
         if let (Some(receivers), Some(JitCacheIrOp::GuardShape { object: 0, shape })) =
             (receivers, program.ops.first())
@@ -184,23 +232,35 @@ pub(crate) fn own_data_store(
         {
             continue;
         }
+        let (storage, operand, ops) = own_storage_program(program);
+        if projection.is_some_and(|known| known != storage) {
+            return None;
+        }
+        projection = Some(storage);
         let [
-            JitCacheIrOp::GuardShape { object: 0, shape },
+            JitCacheIrOp::GuardShape {
+                object: shape_operand,
+                shape,
+            },
             JitCacheIrOp::GuardAtomSlot {
-                object: 0,
+                object: slot_operand,
                 field,
                 writable: true,
                 ..
             },
             JitCacheIrOp::StoreField {
-                object: 0,
+                object: store_operand,
                 field: store_byte,
             },
-        ] = &*program.ops
+        ] = ops
         else {
             return None;
         };
-        if field != store_byte {
+        if *shape_operand != operand
+            || *slot_operand != operand
+            || *store_operand != operand
+            || field != store_byte
+        {
             return None;
         }
         i32::try_from(field.byte_offset()).ok()?;
@@ -211,6 +271,7 @@ pub(crate) fn own_data_store(
         shapes.push(*shape);
     }
     Some(OwnDataLoad {
+        projection: projection?,
         shapes,
         field: location?,
     })
@@ -246,6 +307,11 @@ pub(crate) fn named_load_programs(
                     result: 1,
                     target,
                 } if index == 0 && target.is_generated_receiver() => holder = true,
+                JitCacheIrOp::LoadArrayExpando {
+                    object: 0,
+                    result: 1,
+                    ..
+                } if index == 0 => holder = true,
                 JitCacheIrOp::LoadPrototypeHolder { result: 1, .. } => holder = true,
                 JitCacheIrOp::GuardPrototypeValidity { .. } => {}
                 JitCacheIrOp::GuardShape { object, .. }
@@ -265,7 +331,9 @@ pub(crate) fn named_load_programs(
         // An ordinary receiver must be proved before its field is read.
         let intrinsic = matches!(
             program.ops.first(),
-            Some(JitCacheIrOp::LoadIntrinsicPrototype { .. })
+            Some(
+                JitCacheIrOp::LoadIntrinsicPrototype { .. } | JitCacheIrOp::LoadArrayExpando { .. }
+            )
         );
         if !intrinsic
             && !matches!(
@@ -303,15 +371,21 @@ pub(crate) fn named_load_programs(
 pub(crate) fn named_store_programs(
     view: &JitCompileSnapshot,
     byte_pc: u32,
-) -> Option<&[otter_vm::JitCacheIrProgram]> {
+) -> Option<(PropertyStorageProjection, &[otter_vm::JitCacheIrProgram])> {
     let programs = view.property_programs.get(&byte_pc)?;
     if programs.is_empty() || programs.len() > 4 {
         return None;
     }
+    let mut projection = None;
     for program in programs {
+        let (storage, operand, ops) = own_storage_program(program);
+        if projection.is_some_and(|known| known != storage) {
+            return None;
+        }
+        projection = Some(storage);
         if !matches!(
-            program.ops.first(),
-            Some(JitCacheIrOp::GuardShape { object: 0, .. })
+            ops.first(),
+            Some(JitCacheIrOp::GuardShape { object, .. }) if *object == operand
         ) {
             return None;
         }
@@ -320,7 +394,7 @@ pub(crate) fn named_store_programs(
         let mut published = false;
         let mut receiver_shape = None;
         let mut stored_field = None;
-        for op in program.ops.iter() {
+        for op in ops {
             if published {
                 return None;
             }
@@ -328,26 +402,28 @@ pub(crate) fn named_store_programs(
                 JitCacheIrOp::LoadPrototypeHolder { result: 1, .. } if !stored => holder = true,
                 JitCacheIrOp::GuardPrototypeValidity { .. } if !stored => {}
                 JitCacheIrOp::GuardShape { object, shape }
-                    if !stored && (object == 0 || (object == 1 && holder)) =>
+                    if !stored
+                        && (object == operand || (operand == 0 && object == 1 && holder)) =>
                 {
-                    if object == 0 {
+                    if object == operand {
                         receiver_shape = Some(shape);
                     }
                 }
                 JitCacheIrOp::GuardPrototypeNull { object }
-                    if !stored && (object == 0 || (object == 1 && holder)) => {}
+                    if !stored
+                        && (object == operand || (operand == 0 && object == 1 && holder)) => {}
                 JitCacheIrOp::GuardAtomSlot {
-                    object: 0,
+                    object,
                     writable: true,
                     ..
-                } if !stored => {}
+                } if !stored && object == operand => {}
                 JitCacheIrOp::GuardExtensible { object: 0, field }
-                    if !stored && field.is_inline() => {}
-                JitCacheIrOp::StoreField { object: 0, field } if !stored => {
+                    if !stored && operand == 0 && field.is_inline() => {}
+                JitCacheIrOp::StoreField { object, field } if !stored && object == operand => {
                     stored = true;
                     stored_field = Some(field);
                 }
-                JitCacheIrOp::PublishShape { object: 0, shape } if stored => {
+                JitCacheIrOp::PublishShape { object: 0, shape } if stored && operand == 0 => {
                     published = true;
                     receiver_shape = Some(shape);
                 }
@@ -359,7 +435,7 @@ pub(crate) fn named_store_programs(
         }
         view.field_types.get(&(receiver_shape?, stored_field?))?;
     }
-    Some(programs)
+    Some((projection?, programs))
 }
 
 #[cfg(test)]
@@ -381,6 +457,47 @@ mod tests {
             ]
             .into_boxed_slice(),
         }
+    }
+
+    #[test]
+    fn expando_shapes_are_storage_proofs_and_never_receiver_selection() {
+        let mut view = JitCompileSnapshot::without_feedback(1, 0, 1, Vec::new());
+        let field = FieldLocation::inline(0);
+        view.array_layout = otter_vm::jit::JitArrayLayout::current();
+        view.property_programs.insert(
+            0,
+            vec![otter_vm::JitCacheIrProgram {
+                ops: Box::new([
+                    JitCacheIrOp::LoadArrayExpando {
+                        object: 0,
+                        result: 1,
+                        layout: view.array_layout,
+                    },
+                    JitCacheIrOp::GuardShape {
+                        object: 1,
+                        shape: 128,
+                    },
+                    JitCacheIrOp::GuardAtomSlot {
+                        object: 1,
+                        atom: 1,
+                        field,
+                        writable: false,
+                    },
+                    JitCacheIrOp::LoadField { object: 1, field },
+                ]),
+            }],
+        );
+        let access = own_data_load(&view, 0, None).unwrap();
+        assert_eq!(access.projection, PropertyStorageProjection::ArrayExpando);
+        assert_eq!(access.shapes.as_slice(), &[128]);
+        assert!(
+            own_data_load(&view, 0, Some(&[128])).is_none(),
+            "ordinary receiver shape never means Array bag identity"
+        );
+        assert_eq!(
+            named_load_programs(&view, 0, None).unwrap().receiver_shapes,
+            None
+        );
     }
 
     fn string_program() -> otter_vm::JitCacheIrProgram {
@@ -462,6 +579,7 @@ mod tests {
         assert_eq!(
             own_data_load(&view, 0, Some(&[16])).unwrap(),
             OwnDataLoad {
+                projection: PropertyStorageProjection::Receiver,
                 shapes: smallvec::smallvec![16],
                 field: FieldLocation::overflow(0),
             }

@@ -1,4 +1,4 @@
-//! One managed insertion-ordered symbol descriptor table for objects and arrays.
+//! Managed insertion-ordered symbol descriptor storage for ordinary objects.
 //!
 //! # Contents
 //! - The existing SymbolPropsBody records, trace and function-liveness owner.
@@ -6,7 +6,7 @@
 //! - Descriptor reads/publication, deletion, ordering and integrity attributes.
 //!
 //! # Invariants
-//! - Object and Array sidecars use this one physical table/type/tag/layout.
+//! - Ordinary objects and Array expando objects use one table/type/tag/layout.
 //! - Keys and every descriptor reference are traced in the actual managed slots.
 //! - Capacity growth roots the old table until its current records are copied.
 //! - No payload borrow encloses allocation; writes require prepared capacity.
@@ -14,9 +14,9 @@
 //!
 //! # See also
 //! - `super::descriptor_install` owns object descriptor publication.
-//! - `crate::array::symbol_properties` owns array descriptor validation.
+//! - `crate::object_internal_ops::array_define` owns Array descriptor validation.
 
-use super::{PropertyDescriptor, PropertyFlags, SlotData, SlotKind};
+use super::{PropertyDescriptor, SlotData, SlotKind};
 use crate::symbol::JsSymbol;
 use otter_gc::{
     GcHeap,
@@ -27,7 +27,7 @@ use otter_gc::{
 /// Reserved [`otter_gc::Traceable::TYPE_TAG`] for [`SymbolPropsBody`].
 pub(crate) const SYMBOL_PROPS_BODY_TYPE_TAG: u8 = 0x3b;
 
-/// Handle to the shared object/array symbol descriptor table.
+/// Handle to the ordinary-object symbol descriptor table.
 pub(crate) type SymbolPropsHandle = otter_gc::Gc<SymbolPropsBody>;
 
 /// One symbol-keyed own property.
@@ -188,13 +188,6 @@ pub(crate) fn body_of(handle: SymbolPropsHandle) -> Option<*mut SymbolPropsBody>
 }
 
 impl SymbolPropsBody {
-    /// Current descriptors in their original creation order.
-    pub(crate) fn descriptors(&self) -> impl Iterator<Item = (JsSymbol, PropertyDescriptor)> + '_ {
-        self.entries()
-            .iter()
-            .map(|(key, slot)| (*key, slot.to_descriptor()))
-    }
-
     pub(crate) fn descriptor(&self, key: JsSymbol) -> Option<PropertyDescriptor> {
         self.entries()
             .iter()
@@ -215,48 +208,6 @@ impl SymbolPropsBody {
             self.push((key, slot));
         }
     }
-
-    pub(crate) fn remove_key(&mut self, key: JsSymbol) -> bool {
-        let Some(index) = self
-            .entries()
-            .iter()
-            .position(|(symbol, _)| symbol.ptr_eq(key))
-        else {
-            return false;
-        };
-        self.remove(index);
-        true
-    }
-
-    pub(crate) fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
-
-    pub(crate) fn set_integrity_level(&mut self, frozen: bool) {
-        for (key, slot) in self.entries_mut() {
-            if !key.is_private_name() {
-                slot.flags = PropertyFlags::new(
-                    !frozen && slot.flags.writable(),
-                    slot.flags.enumerable(),
-                    false,
-                );
-            }
-        }
-    }
-
-    pub(crate) fn test_integrity_level(&self, frozen: bool) -> bool {
-        self.entries()
-            .iter()
-            .filter(|(key, _)| !key.is_private_name())
-            .all(|(_, slot)| !slot.flags.configurable() && (!frozen || !slot.flags.writable()))
-    }
-}
-
-pub(crate) fn len_of(handle: SymbolPropsHandle) -> usize {
-    body_of(handle).map_or(0, |body| {
-        // SAFETY: this typed handle names the live table owned by a sidecar.
-        unsafe { (*body).len() }
-    })
 }
 
 /// Prepare one append slot, preserving the old table on actual allocator failure.
@@ -325,3 +276,6 @@ where
 {
     heap.record_write(table, value);
 }
+
+#[cfg(test)]
+mod array_expando_tests;

@@ -53,6 +53,16 @@ impl Codegen<'_> {
         let input = |i| Self::gp(assigned.inputs[i]);
         let result = || Self::gp(assigned.result.expect("property result"));
         match self.graph.node(node).kind.clone() {
+            Kind::LoadArrayExpando(layout) => {
+                let exit = self.eager_exit(node, DeoptReason::WrongShape);
+                crate::x86_64::property_ic::emit_array_expando(
+                    &mut self.ops,
+                    layout,
+                    input(0),
+                    result(),
+                    exit,
+                );
+            }
             Kind::LoadNamedProperty { byte_pc, .. } => self.emit_named_program(
                 node,
                 byte_pc,
@@ -249,11 +259,17 @@ impl Codegen<'_> {
             let program = programs
                 .get(index as usize)
                 .ok_or(Unsupported::OperandShape("x86 graph named program index"))?;
+            let expando = matches!(
+                program.ops.first(),
+                Some(Op::LoadArrayExpando {
+                    object: 0,
+                    result: 1,
+                    ..
+                })
+            );
             let (mut owner, known) = if value.is_some() {
                 let receiver_shape = program.ops.iter().rev().find_map(|op| match *op {
-                    Op::PublishShape { shape, .. } | Op::GuardShape { object: 0, shape } => {
-                        Some(shape)
-                    }
+                    Op::PublishShape { shape, .. } | Op::GuardShape { shape, .. } => Some(shape),
                     _ => None,
                 });
                 let field = program.ops.iter().find_map(|op| match *op {
@@ -279,10 +295,26 @@ impl Codegen<'_> {
                 (0, (&[][..], 0))
             };
             let next = self.ops.new_dynamic_label();
-            let object = |operand| if operand == 0 { receiver } else { holder };
+            let object = |operand| {
+                if operand == 0 || (expando && value.is_some()) {
+                    receiver
+                } else {
+                    holder
+                }
+            };
             let mut committed = false;
             for op in program.ops.iter() {
                 match *op {
+                    Op::LoadArrayExpando { layout, .. } if value.is_none() => {
+                        crate::x86_64::property_ic::emit_array_expando(
+                            &mut self.ops,
+                            layout,
+                            receiver,
+                            holder,
+                            next,
+                        );
+                    }
+                    Op::LoadArrayExpando { .. } if expando && value.is_some() => {}
                     Op::LoadClosurePrototype { object: 0 } if value.is_none() => {
                         crate::template::x86_64::emit_closure_prototype_load(
                             &mut self.ops,
@@ -582,6 +614,7 @@ impl Codegen<'_> {
         let appended = self.ops.new_dynamic_label();
         let table = self.ops.new_dynamic_label();
         let slot_stored = self.ops.new_dynamic_label();
+        let table_stored = self.ops.new_dynamic_label();
         // The generic store: the site's own handlers, then the shared
         // table; an append leaves its compressed child in `temps[1]`.
         let slot = self.property_ic_slot(node, pc);
@@ -624,18 +657,17 @@ impl Codegen<'_> {
             temps,
             None,
             slow,
-            done,
+            table_stored,
             appended,
         );
-        if slot.is_some() {
-            dynasm!(self.ops ; .arch x64
-                ; jmp =>slow
-                ; =>slot_stored
-                ; test Rd(temps[1]), Rd(temps[1])
-                ; jz =>done);
-        }
-        dynasm!(self.ops ; .arch x64 ; =>appended);
-        self.emit_dynamic_shape_child_barrier(node, receiver, temps[1], temps[0]);
+        let value_stored = self.ops.new_dynamic_label();
+        dynasm!(self.ops ; .arch x64
+            ; =>table_stored ; mov Rq(temps[0]), Rq(receiver) ; jmp =>value_stored
+            ; =>slot_stored ; test Rd(temps[1]), Rd(temps[1]) ; jz =>value_stored
+            ; =>appended);
+        self.emit_dynamic_shape_child_barrier(node, receiver, temps[1], temps[2]);
+        dynasm!(self.ops ; .arch x64 ; mov Rq(temps[0]), Rq(receiver) ; =>value_stored);
+        self.emit_write_barrier(node, temps[0], value);
         dynasm!(self.ops ; .arch x64 ; jmp =>done ; =>slow);
         self.emit_property_runtime(
             node,
@@ -645,8 +677,7 @@ impl Codegen<'_> {
             None,
         )?;
         dynasm!(self.ops ; .arch x64 ; =>done);
-        // The existing StorePropertyCached value-barrier node follows both
-        // native actions. Child publication uses its existing NoAlloc owner.
+        // Each hit barriers its actual storage owner; the committed miss owns its edges.
         Ok(())
     }
 

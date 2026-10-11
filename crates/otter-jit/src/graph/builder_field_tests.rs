@@ -274,13 +274,14 @@ fn overflow_appends_keep_a_collecting_completion_inside_the_graph() {
                 .any(|node| matches!(node.kind, Kind::StoreNamedProperty(_) | Kind::Deopt(_))),
             "an allocation-required append completes without an eager shape miss"
         );
-        let barrier = built
-            .graph
-            .nodes
-            .iter()
-            .find(|node| node.kind == Kind::WriteBarrier)
-            .unwrap();
-        assert_eq!(barrier.inputs, store.inputs);
+        assert!(
+            !built
+                .graph
+                .nodes
+                .iter()
+                .any(|node| node.kind == Kind::WriteBarrier),
+            "the cached store owns its hit's dynamic storage barrier; the source receiver is not necessarily its parent"
+        );
     }
 }
 
@@ -658,4 +659,137 @@ fn inlined_named_selection_uses_its_source_bank_and_full_eager_chain() {
         (outer.function_id, outer.pc, outer.byte_pc),
         (90, 2, caller.instructions[2].byte_pc)
     );
+}
+
+#[test]
+fn array_expando_fields_use_tagged_storage_while_eager_state_keeps_array() {
+    for store in [false, true] {
+        for field in [FieldLocation::inline(0), FieldLocation::overflow(3)] {
+            let operands = if store {
+                vec![
+                    Operand::Register(0),
+                    Operand::ConstIndex(0),
+                    Operand::Register(1),
+                    Operand::Register(2),
+                ]
+            } else {
+                vec![
+                    Operand::Register(2),
+                    Operand::Register(0),
+                    Operand::ConstIndex(0),
+                ]
+            };
+            let mut view = JitCompileSnapshot::without_feedback(
+                90,
+                2,
+                3,
+                vec![
+                    JitTestInstruction::new(
+                        if store {
+                            Op::StoreProperty
+                        } else {
+                            Op::LoadProperty
+                        },
+                        0,
+                        0,
+                        operands,
+                    ),
+                    JitTestInstruction::new(Op::ReturnValue, 1, 4, vec![Operand::Register(2)]),
+                ],
+            );
+            view.array_layout = otter_vm::jit::JitArrayLayout::current();
+            view.property_programs.insert(
+                0,
+                vec![JitCacheIrProgram {
+                    ops: vec![
+                        JitCacheIrOp::LoadArrayExpando {
+                            object: 0,
+                            result: 1,
+                            layout: view.array_layout,
+                        },
+                        JitCacheIrOp::GuardShape {
+                            object: 1,
+                            shape: 128,
+                        },
+                        JitCacheIrOp::GuardAtomSlot {
+                            object: 1,
+                            atom: 1,
+                            field,
+                            writable: store,
+                        },
+                        if store {
+                            JitCacheIrOp::StoreField { object: 1, field }
+                        } else {
+                            JitCacheIrOp::LoadField { object: 1, field }
+                        },
+                    ]
+                    .into_boxed_slice(),
+                }],
+            );
+            view.field_types.insert(
+                (128, field),
+                JitFieldType {
+                    guard: JitFieldTypeGuard {
+                        owner_shape: 128,
+                        expected: field_type::TOP,
+                    },
+                    shapes: smallvec::SmallVec::new(),
+                    stored_shapes: smallvec::SmallVec::new(),
+                    nullish_mask: 0,
+                },
+            );
+            let built = load_graph(&view);
+            let (bag_id, bag) = built
+                .graph
+                .nodes
+                .iter()
+                .enumerate()
+                .find(|(_, node)| matches!(node.kind, Kind::LoadArrayExpando(_)))
+                .unwrap();
+            let bag_id = super::NodeId(bag_id as u32);
+            assert_eq!(bag.repr, Repr::Tagged);
+            let frame = built.graph.frame_state(bag.eager.unwrap());
+            assert_eq!((frame.function_id, frame.pc), (90, 0));
+            assert_eq!(
+                frame
+                    .registers
+                    .iter()
+                    .find(|(register, _)| *register == 0)
+                    .unwrap()
+                    .1,
+                bag.inputs[0]
+            );
+            let access = built
+                .graph
+                .nodes
+                .iter()
+                .find(|node| {
+                    matches!(
+                        node.kind,
+                        Kind::StoreOwnField { .. } | Kind::LoadOwnField(_)
+                    )
+                })
+                .unwrap();
+            assert_eq!(access.inputs[0], bag_id);
+            assert_ne!(access.inputs[0], bag.inputs[0]);
+            if store {
+                let barrier = built
+                    .graph
+                    .nodes
+                    .iter()
+                    .find(|node| node.kind == Kind::WriteBarrier)
+                    .unwrap();
+                assert_eq!(
+                    barrier.inputs, access.inputs,
+                    "old bag owns the RHS edge, not the array shell"
+                );
+            }
+            assert!(!built.graph.nodes.iter().any(|node| matches!(
+                node.kind,
+                Kind::Generic { .. }
+                    | Kind::LoadPropertyCached { .. }
+                    | Kind::StorePropertyCached { .. }
+            )));
+        }
+    }
 }

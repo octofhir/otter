@@ -22,6 +22,7 @@
 //! - `inspection` — nonallocating scalar reads through current scoped values.
 //! - `scoped_completion` — rooted async/throw handoff and fresh error extents.
 //! - Exact Array metadata includes lifetime-branded canonical prototypes.
+//! - Fixed null-prototype RegExp records use the isolate's retained layout slots.
 //!
 //! # Invariants
 //!
@@ -44,6 +45,8 @@
 //!   branded prototype use ordinary `Get`, including rooted accessor entry.
 //! - Branded Array prototype writes enter canonical source-owned Set/Define;
 //!   heap-only construction does not bypass length and index semantics.
+//! - Fixed RegExp layout tokens name shapes in the one strong layout cache;
+//!   a cache hit discovers neither names nor an ambient realm prototype.
 //!
 //! # See also
 //!
@@ -2786,9 +2789,9 @@ impl<'scope, 'rt> NativeScope<'scope, 'rt> {
 
     /// The hidden class an object gets from these property names, in order.
     ///
-    /// Keep the answer: the walk is paid once per distinct key list per
-    /// isolate, and [`Self::object_with_layout`] then builds each object with
-    /// one shape instead of a transition per property.
+    /// The isolate strongly retains the returned layout across turns and GC,
+    /// including when no instance exists yet. [`Self::object_with_layout`]
+    /// builds each object with one shape instead of a transition per property.
     ///
     /// # Errors
     /// Propagates an allocation failure from extending the shape chain.
@@ -2822,6 +2825,29 @@ impl<'scope, 'rt> NativeScope<'scope, 'rt> {
     ) -> Result<crate::ObjectLayout, NativeError> {
         let result = self.ctx.cx.interp.object_layout_for_atoms(tag, keys);
         result.map_err(|error| self.vm_error(error, "NativeScope::object_layout_for_atoms"))
+    }
+
+    /// Read a fixed null-prototype RegExp layout from the isolate's strong cache.
+    pub(crate) fn regexp_record_layout(
+        &mut self,
+        kind: crate::object_layout_cache::RegExpRecordLayout,
+    ) -> Result<crate::ObjectLayout, NativeError> {
+        let result = self.ctx.cx.interp.regexp_record_layout(kind);
+        result.map_err(|error| self.vm_error(error, "NativeScope::regexp_record_layout"))
+    }
+
+    /// Attach a completely initialized rooted ordinary null-prototype property bag.
+    pub(crate) fn attach_array_expando(
+        &mut self,
+        array: Local<'_>,
+        expando: Local<'_>,
+    ) -> Result<(), NativeError> {
+        let result = self
+            .ctx
+            .cx
+            .interp
+            .attach_array_expando(self.token, array, expando);
+        result.map_err(|error| self.vm_error(error, "NativeScope::attach_array_expando"))
     }
 
     /// Build an object that already has `layout`'s properties, every one of
@@ -3140,7 +3166,8 @@ impl<'scope, 'rt> NativeScope<'scope, 'rt> {
             .map_err(NativeError::from)
     }
 
-    /// Define a symbol-keyed data property with explicit descriptor flags.
+    /// Define a symbol-keyed data property on an ordinary object or actual Array.
+    /// Array named storage uses the canonical ordinary bag descriptor owner.
     pub fn define_symbol(
         &mut self,
         object: Local<'_>,

@@ -6,6 +6,7 @@
 //! - Typed Graph regions, direct cold span entries and canonical home proof.
 //! - Boxed/numeric element bases reloaded after collecting literal/instanceof nodes.
 //! - Canonical callable proofs, source-realm prototypes and late identity misses.
+//! - Array expando field owners, retained roots and original accessor receivers.
 //! - Optional raw probe artifacts preserved before assertions for gate diagnosis.
 //!
 //! # Invariants
@@ -32,6 +33,9 @@
 
 #[path = "jit_empty_allocations/intrinsic.rs"]
 mod intrinsic;
+
+#[path = "jit_empty_allocations/array_expando.rs"]
+mod array_expando;
 
 #[cfg(target_arch = "x86_64")]
 #[path = "support/native_code.rs"]

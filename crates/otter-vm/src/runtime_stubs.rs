@@ -27,6 +27,8 @@
 //!   their own barriers; scalar constructor feedback reuses admitted cells.
 //! - `Alloc` stubs must publish their current safepoint roots before any
 //!   allocation and must not hold untracked raw `Value` bits across GC.
+//! - Once the callable is proven, dense Array method bodies check indexed
+//!   state only; named expando storage cannot alter those indexed effects.
 //!
 //! # See also
 //! - [`crate::native_abi`]
@@ -2820,13 +2822,15 @@ fn array_construct_alloc_inner(
 /// remaining spec preconditions — a writable `length`, extensibility, an
 /// accessor or attribute override in range, or the dense-size cap — so the
 /// stub re-checks them and misses instead of falling back internally.
+/// The callable has already been resolved: named expando storage does not
+/// participate in these indexed effects.
 fn dense_range_is_fast(
     arr: crate::array::JsArray,
     heap: &otter_gc::GcHeap,
     start: usize,
     end: usize,
 ) -> bool {
-    crate::array::is_ordinary_dense(arr, heap)
+    crate::array::is_ordinary_indexed(arr, heap)
         && crate::array::length_writable(arr, heap)
         && crate::array::can_fast_fill_dense_range(arr, heap, start, end)
 }

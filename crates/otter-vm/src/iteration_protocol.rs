@@ -290,7 +290,9 @@ impl Interpreter {
             let symbol = self.well_known_symbols.get(WellKnown::Iterator);
             (
                 Iterable::Array,
-                crate::array::get_symbol_descriptor(array, heap, symbol).is_some(),
+                crate::array::expando_object(array, heap)
+                    .and_then(|bag| object::get_own_symbol_descriptor(bag, heap, symbol))
+                    .is_some(),
                 crate::array::prototype_override(array, heap),
                 self.realm_intrinsics.array_prototype(),
             )

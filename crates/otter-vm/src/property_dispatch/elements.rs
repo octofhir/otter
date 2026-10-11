@@ -10,6 +10,12 @@
 //!   eligibility agrees with its current exotic state.
 //! - A dense hole bypasses prototype lookup only while the one-shot indexed
 //!   accessor protector remains intact.
+//! - Expando storage never replaces the original Array receiver during
+//!   prototype lookup or accessor invocation.
+//!
+//! # See also
+//! - [crate::object_internal_ops]: canonical value-level internal methods.
+//! - [crate::array]: indexed storage and shaped expando attachment.
 
 use crate::native_abi::CommittedValueError;
 use smallvec::SmallVec;
@@ -17,8 +23,8 @@ use smallvec::SmallVec;
 use super::{canonical_numeric_index_string, typed_array_valid_index};
 use crate::activation_stack::ActivationStack;
 use crate::{
-    ExecutionContext, Interpreter, NumberValue, Value, VmError, VmGetOutcome, VmPropertyKey,
-    abstract_ops, binary, object, read_register, rooting::RootScopeExt, symbol, write_register,
+    ExecutionContext, Interpreter, Value, VmError, VmGetOutcome, VmPropertyKey, binary, object,
+    read_register, rooting::RootScopeExt, write_register,
 };
 
 impl Interpreter {
@@ -47,13 +53,11 @@ impl Interpreter {
         recv_reg: u16,
         idx_reg: u16,
     ) -> Result<(), CommittedValueError> {
-        let receiver = *read_register(&stack[top_idx], recv_reg)
-            .map_err(CommittedValueError::Fatal)?;
-        let key = *read_register(&stack[top_idx], idx_reg)
-            .map_err(CommittedValueError::Fatal)?;
+        let receiver =
+            *read_register(&stack[top_idx], recv_reg).map_err(CommittedValueError::Fatal)?;
+        let key = *read_register(&stack[top_idx], idx_reg).map_err(CommittedValueError::Fatal)?;
         let value = self.load_element_values(stack, context, receiver, key)?;
-        write_register(&mut stack[top_idx], dst, value)
-            .map_err(CommittedValueError::Fatal)?;
+        write_register(&mut stack[top_idx], dst, value).map_err(CommittedValueError::Fatal)?;
         stack[top_idx]
             .advance_pc()
             .map_err(CommittedValueError::Fatal)
@@ -209,136 +213,35 @@ impl Interpreter {
                     .map_err(CommittedValueError::completed_call)?,
             }
         } else if let Some(arr) = recv.as_array() {
-            if let Some(sym) = idx_value.as_symbol(&self.gc_heap) {
-                if sym
-                    .well_known_tag()
-                    .is_some_and(|t| t == symbol::WellKnown::Iterator)
-                {
-                    if let Some(v) = crate::array::get_symbol_property(arr, &self.gc_heap, sym) {
-                        v
-                    } else {
-                        let key = VmPropertyKey::Symbol(sym);
-                        match self.ordinary_get_value(stack, Some(context), recv, recv, &key, 0)? {
-                            crate::VmGetOutcome::Value(v) => v,
-                            crate::VmGetOutcome::InvokeGetter { getter } => {
-                                let args: smallvec::SmallVec<[Value; 8]> =
-                                    smallvec::SmallVec::new();
-                                self.run_callable_sync_rooted(
-                                    stack,
-                                    Some(context),
-                                    &getter,
-                                    recv,
-                                    args,
-                                )
-                                .map_err(CommittedValueError::completed_call)?
-                            }
-                        }
-                    }
-                } else {
-                    // §22.1 Array exotic — symbol-keyed access reads
-                    // array's own symbol table first; on miss walks
-                    // `Array.prototype`.
-                    match crate::array::get_symbol_property(arr, &self.gc_heap, sym) {
-                        Some(v) => v,
-                        None => {
-                            let proto = self
-                                .constructor_prototype_value("Array")
-                                .map_err(CommittedValueError::Fatal)?;
-                            if let Some(p) = proto.as_object() {
-                                crate::object::get_symbol(p, &self.gc_heap, sym)
-                                    .unwrap_or(Value::undefined())
-                            } else {
-                                Value::undefined()
-                            }
-                        }
-                    }
-                }
-            } else if let Some(key) = idx_value.as_string(&self.gc_heap) {
-                // Computed string-key access on Array exotic.
-                let name = key.to_key_spelling(&self.gc_heap);
-                if name == "length" {
-                    Value::number(NumberValue::from_f64(
-                        crate::array::len(arr, &self.gc_heap) as f64
-                    ))
-                } else if let Some((getter, _setter)) =
-                    crate::array::get_accessor(arr, &self.gc_heap, &name)
-                {
-                    match getter {
-                        Some(getter) if abstract_ops::is_callable(&getter) => {
-                            let args: SmallVec<[Value; 8]> = SmallVec::new();
-                            self.run_callable_sync_rooted(stack, Some(context), &getter, recv, args)
-                                .map_err(CommittedValueError::completed_call)?
-                        }
-                        _ => Value::undefined(),
-                    }
-                } else if let Some(idx) = crate::object::array_index_property_name(&name) {
-                    // §10.4.2.4 [[Get]] — an absent integer index is not a
-                    // dead end; OrdinaryGet walks the Array.prototype chain
-                    // (e.g. `Array.prototype[0]` inherited by a hole slot).
-                    if crate::array::has_own_element(arr, &self.gc_heap, idx as usize) {
-                        crate::array::get(arr, &self.gc_heap, idx as usize)
-                    } else {
-                        self.load_from_constructor_prototype(stack, context, "Array", &recv, &name)?
-                    }
-                } else {
-                    match crate::array::get_named_property(arr, &self.gc_heap, &name) {
-                        Some(v) => v,
-                        None => self.load_from_constructor_prototype(
-                            stack, context, "Array", &recv, &name,
-                        )?,
-                    }
-                }
-            } else if let Some(n) = idx_value.as_number() {
-                match crate::array::index_from_number(n) {
-                    Some(idx)
-                        if !crate::array::has_accessors(arr, &self.gc_heap)
-                            && crate::array::has_own_element(arr, &self.gc_heap, idx) =>
-                    {
-                        // Dense own element, no index accessors: read directly,
-                        // skipping the per-element `idx.to_string()` + accessor
-                        // lookup (the hot array element-load path).
-                        crate::array::get(arr, &self.gc_heap, idx)
-                    }
-                    Some(idx) => {
-                        let key = idx.to_string();
-                        if let Some((getter, _setter)) =
-                            crate::array::get_accessor(arr, &self.gc_heap, &key)
-                        {
-                            match getter {
-                                Some(getter) if abstract_ops::is_callable(&getter) => {
-                                    let args: smallvec::SmallVec<[Value; 8]> =
-                                        smallvec::SmallVec::new();
-                                    self.run_callable_sync_rooted(
-                                        stack,
-                                        Some(context),
-                                        &getter,
-                                        Value::array(arr),
-                                        args,
-                                    )
-                                    .map_err(CommittedValueError::completed_call)?
-                                }
-                                _ => Value::undefined(),
-                            }
-                        } else if crate::array::has_own_element(arr, &self.gc_heap, idx) {
-                            crate::array::get(arr, &self.gc_heap, idx)
-                        } else {
-                            // §10.4.2.4 — an absent index falls to Array.prototype.
-                            self.load_from_constructor_prototype(
-                                stack,
-                                context,
-                                "Array",
-                                &recv,
-                                &idx.to_string(),
-                            )?
-                        }
-                    }
-                    None => {
-                        crate::array::get_named_property(arr, &self.gc_heap, &n.to_display_string())
-                            .unwrap_or(Value::undefined())
-                    }
-                }
+            if let Some(index) = idx_value
+                .as_number()
+                .and_then(crate::array::index_from_number)
+                && !crate::array::has_index_accessors(arr, &self.gc_heap)
+                && crate::array::has_own_element(arr, &self.gc_heap, index)
+            {
+                crate::array::get(arr, &self.gc_heap, index)
             } else {
-                return Err(CommittedValueError::JavaScript(VmError::TypeMismatch));
+                let key = if let Some(symbol) = idx_value.as_symbol(&self.gc_heap) {
+                    VmPropertyKey::Symbol(symbol)
+                } else if let Some(key) = idx_value.as_string(&self.gc_heap) {
+                    VmPropertyKey::OwnedString(key.to_key_spelling(&self.gc_heap))
+                } else if let Some(number) = idx_value.as_number() {
+                    VmPropertyKey::OwnedString(number.to_display_string())
+                } else {
+                    return Err(CommittedValueError::JavaScript(VmError::TypeMismatch));
+                };
+                match self.ordinary_get_value(stack, Some(context), recv, recv, &key, 0)? {
+                    VmGetOutcome::Value(value) => value,
+                    VmGetOutcome::InvokeGetter { getter } => self
+                        .run_callable_sync_rooted(
+                            stack,
+                            Some(context),
+                            &getter,
+                            recv,
+                            SmallVec::new(),
+                        )
+                        .map_err(CommittedValueError::completed_call)?,
+                }
             }
         } else if recv.as_function().is_some() || recv.as_closure(&self.gc_heap).is_some() {
             // Computed keys walk the ordinary [[Get]] ladder like dotted

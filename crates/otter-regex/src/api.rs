@@ -18,6 +18,8 @@
 //!   [`Match::range`].
 //! - [`Match::named_groups`] yields source order, deduplicating duplicate names
 //!   (ES2025) and preferring the alternative that matched.
+//! - [`Match::named_group_index`] owns named-capture selection; equal capture
+//!   ranges do not make distinct capture groups interchangeable.
 //! - A successful scan always advances `next_start` past the current match, so
 //!   the iterator terminates even on zero-width matches.
 //!
@@ -407,7 +409,7 @@ pub struct Match {
     /// Capture-group names in source order, parallel to a notional `group N`;
     /// the empty string marks an unnamed group. Shared with the compiled
     /// program (`Arc`), so producing a match clones a pointer, not the names.
-    /// Used by [`Match::named_groups`] and [`Match::named_group`].
+    /// Used by [`Match::named_groups`] and [`Match::named_group_index`].
     pub(crate) group_names: std::sync::Arc<[String]>,
 }
 
@@ -422,26 +424,32 @@ impl Match {
         }
     }
 
+    /// Select a named capture's 1-based group index, preferring a matched
+    /// alternative when a name appears more than once. If every alternative
+    /// is unmatched, return the first declared group with that name.
+    #[must_use]
+    pub fn named_group_index(&self, name: &str) -> Option<usize> {
+        if name.is_empty() {
+            return None;
+        }
+        let mut first = None;
+        for (idx, gname) in self.group_names.iter().enumerate() {
+            if gname == name {
+                if self.captures.get(idx).is_some_and(Option::is_some) {
+                    return Some(idx + 1);
+                }
+                first.get_or_insert(idx + 1);
+            }
+        }
+        first
+    }
+
     /// Access a named group's range, deduplicating duplicate names and
     /// preferring the alternative that matched.
     #[must_use]
     pub fn named_group(&self, name: &str) -> Option<Range<usize>> {
-        if name.is_empty() {
-            return None;
-        }
-        let mut best: Option<Range<usize>> = None;
-        for (idx, gname) in self.group_names.iter().enumerate() {
-            if gname == name {
-                let cap = self.captures.get(idx).and_then(Clone::clone);
-                if cap.is_some() {
-                    return cap;
-                }
-                if best.is_none() {
-                    best = cap;
-                }
-            }
-        }
-        best
+        self.named_group_index(name)
+            .and_then(|index| self.group(index))
     }
 
     /// Iterate the named groups in deterministic source order, each name once.
@@ -517,7 +525,30 @@ mod tests {
     #[test]
     fn duplicate_named_group_prefers_match() {
         let m = mk(0..1, vec![None, Some(0..1)], &["dup", "dup"]);
+        assert_eq!(m.named_group_index("dup"), Some(2));
         assert_eq!(m.named_group("dup"), Some(0..1));
+    }
+
+    #[test]
+    fn unmatched_named_group_retains_its_declared_index() {
+        let m = mk(0..0, vec![None, None, None], &["dup", "other", "dup"]);
+        assert_eq!(m.named_group_index("dup"), Some(1));
+        assert_eq!(m.named_group_index("other"), Some(2));
+        assert_eq!(m.named_group_index("missing"), None);
+        assert_eq!(m.named_group_index(""), None);
+        assert_eq!(m.named_group("dup"), None);
+        assert_eq!(
+            m.named_groups().collect::<Vec<_>>(),
+            vec![("dup", None), ("other", None)]
+        );
+    }
+
+    #[test]
+    fn equal_ranges_preserve_distinct_capture_indices() {
+        let m = mk(0..1, vec![Some(0..1), Some(0..1)], &["outer", "inner"]);
+        assert_eq!(m.named_group_index("outer"), Some(1));
+        assert_eq!(m.named_group_index("inner"), Some(2));
+        assert_eq!(m.named_group("outer"), m.named_group("inner"));
     }
 
     #[test]

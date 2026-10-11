@@ -2277,27 +2277,27 @@ fn call_method_array_own_non_callable_shadows_builtin() {
         function_source: None,
     };
     let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
-    let array =
-        crate::array::from_elements_old_for_fixture(interp.gc_heap_mut(), [Value::number_i32(1)])
+    let non_callable = interp.with_handle_scope(|interp, scope| {
+        let value = interp.scoped_value(scope, Value::number_i32(1));
+        let array = interp
+            .scoped_array_from(scope, &[value])
             .expect("array allocation");
-    crate::array::set_named_property(array, interp.gc_heap_mut(), "map", Value::number_i32(1))
-        .expect("array expando property");
-
-    let context = interp
-        .link_module(
-            module.clone(),
-            crate::source_registry::SourceRegistry::default(),
-        )
-        .expect("valid bytecode fixture");
-    let mut stack: crate::test_support::FrameChainFixture =
-        crate::test_support::FrameChainFixture::new();
-    let mut frame = interp
-        .test_frame_for_function(&module.functions[0])
-        .unwrap();
-    frame.registers[0] = Value::array(array);
-    stack.push(frame);
-
-    let err = {
+        interp
+            .scoped_set(scope, array, "map", value)
+            .expect("array expando property");
+        let context = interp
+            .link_module(
+                module.clone(),
+                crate::source_registry::SourceRegistry::default(),
+            )
+            .expect("valid bytecode fixture");
+        let mut stack: crate::test_support::FrameChainFixture =
+            crate::test_support::FrameChainFixture::new();
+        let mut frame = interp
+            .test_frame_for_function(&module.functions[0])
+            .unwrap();
+        frame.registers[0] = interp.escape_scoped(array);
+        stack.push(frame);
         let staged = interp.do_call_method_value(
             &mut stack,
             &context,
@@ -2308,14 +2308,14 @@ fn call_method_array_own_non_callable_shadows_builtin() {
                 Operand::ConstIndex(0),
             ],
         );
-        complete_staged(&mut interp, &mut stack, &context, staged)
-    }
-    .expect_err("non-callable own array method should shadow builtin");
-
-    assert!(matches!(
-        err,
-        crate::CommittedValueError::JavaScript(VmError::NotCallable)
-    ));
+        let err = complete_staged(interp, &mut stack, &context, staged)
+            .expect_err("non-callable own array method should shadow builtin");
+        matches!(
+            err,
+            crate::CommittedValueError::JavaScript(VmError::NotCallable)
+        )
+    });
+    assert!(non_callable);
 }
 
 #[test]

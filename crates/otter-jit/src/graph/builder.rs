@@ -2714,6 +2714,7 @@ impl<'a> Builder<'a> {
         else {
             return self.visit_named_load(instruction);
         };
+        let object = self.property_storage(object, access.projection);
         self.check_shapes(object, &access.shapes, false);
         let key = FieldKey {
             object,
@@ -2871,10 +2872,11 @@ impl<'a> Builder<'a> {
         let object = self.tagged(object);
         let value = self.read(instruction.reads[1]);
         let value = self.tagged(value);
-        self.check_shapes(object, &access.shapes, true);
         let Some(owners) = self.field_store_owners(&access.shapes, access.field, value) else {
             return self.visit_named_store(instruction);
         };
+        let object = self.property_storage(object, access.projection);
+        self.check_shapes(object, &access.shapes, true);
         self.add(
             Kind::StoreOwnField {
                 field: access.field,
@@ -2905,11 +2907,13 @@ impl<'a> Builder<'a> {
         self.known.checked_field_types.clear();
         let byte_pc = instruction.byte_pc;
         if !self.exited_for(ExitReason::ShapeGuard)
-            && let Some(programs) = super::feedback::named_store_programs(self.view, byte_pc)
+            && let Some((projection, programs)) =
+                super::feedback::named_store_programs(self.view, byte_pc)
         {
             use otter_vm::JitCacheIrOp as Op;
             let object = self.read(instruction.reads[0]);
             let object = self.tagged(object);
+            let object = self.property_storage(object, projection);
             let value = self.read(instruction.reads[1]);
             let value = self.tagged(value);
             self.add(
@@ -2929,9 +2933,19 @@ impl<'a> Builder<'a> {
                 for op in program.ops.iter() {
                     match *op {
                         Op::GuardShape {
-                            object: 0,
+                            object: operand,
                             shape: guarded,
-                        } => shape = Some(guarded),
+                        } if operand
+                            == if projection
+                                == otter_vm::jit::PropertyStorageProjection::ArrayExpando
+                            {
+                                1
+                            } else {
+                                0
+                            } =>
+                        {
+                            shape = Some(guarded)
+                        }
                         Op::PublishShape { shape: child, .. } => {
                             shape = Some(child);
                             transition = true;
@@ -2996,7 +3010,29 @@ impl<'a> Builder<'a> {
             &[object, value],
             Repr::None,
         );
-        self.write_barrier(object, value);
+    }
+
+    /// Materialize a tagged storage owner while source state retains its receiver.
+    fn property_storage(
+        &mut self,
+        receiver: NodeId,
+        projection: otter_vm::jit::PropertyStorageProjection,
+    ) -> NodeId {
+        match projection {
+            otter_vm::jit::PropertyStorageProjection::Receiver => receiver,
+            otter_vm::jit::PropertyStorageProjection::ArrayExpando => {
+                let bag = self.add(
+                    Kind::LoadArrayExpando(self.view.array_layout),
+                    &[receiver],
+                    Repr::Tagged,
+                );
+                self.known.entry(bag).heap_object = true;
+                bag
+            }
+            otter_vm::jit::PropertyStorageProjection::LookupStart => {
+                unreachable!("ordinary field programs do not infer lookup-start storage")
+            }
+        }
     }
 
     /// Prove `object` has one of `shapes`, unless already proved.

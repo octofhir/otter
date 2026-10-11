@@ -383,6 +383,8 @@ pub(crate) enum Kind {
     // ---- Memory ----
     /// Read input0's shape-owned field without exposing a movable storage address.
     LoadOwnField(otter_vm::object::FieldLocation),
+    /// Tagged live named storage of actual Array input0; miss before effects.
+    LoadArrayExpando(otter_vm::jit::JitArrayLayout),
     /// Store input1 into input0's shape-owned field; a separate node owns its barrier.
     StoreOwnField {
         field: otter_vm::object::FieldLocation,
@@ -418,6 +420,7 @@ pub(crate) enum Kind {
     /// store site `pc`: an existing writable own slot or an addition proved
     /// by the independent store fact in the shared property action table for
     /// `atom`; else the committed source operation in the runtime.
+    /// The source receiver remains input0; each hit barriers its selected storage.
     StorePropertyCached {
         pc: u32,
         atom: Option<u32>,
@@ -788,6 +791,11 @@ impl Kind {
                 effectful: true,
                 ..Properties::default()
             },
+            Self::LoadArrayExpando(_) => Properties {
+                eager_deopt: true,
+                effectful: true,
+                ..Properties::default()
+            },
             Self::LoadGlobalThis => eager,
             Self::LoadGlobalBinding(_) => Properties {
                 eager_deopt: true,
@@ -1041,6 +1049,7 @@ impl Kind {
                 fp_temps: 0,
                 fixed_gp_clobbers: SmallVec::new(),
             },
+            Self::LoadArrayExpando(_) => simple(1, ResultPolicy::Register),
             Self::LoadNamedProperty { .. } => Constraints {
                 inputs: registers(1),
                 result: ResultPolicy::Register,

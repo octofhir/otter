@@ -14,6 +14,8 @@
 //!   the opcode's observable work.
 //! - The in-place step writes nothing until its last guard passes, so every
 //!   miss reaches the helper with the record untouched.
+//! - An inherited Array iterator opens only after its canonical aligned
+//!   rare/expando word reads zero; the original Array remains the record value.
 //!
 //! # See also
 //! - `otter_vm::Interpreter::jit_runtime_iterator_op`
@@ -23,7 +25,9 @@ use otter_bytecode::Op;
 use otter_vm::JitCompileSnapshot;
 use otter_vm::native_abi as abi;
 
-use super::ic_probe::{element_access_for, emit_element_address, emit_element_read};
+use super::ic_probe::{
+    element_access_for, emit_body_guard, emit_element_address, emit_element_read,
+};
 use super::values::{
     CellTest, emit_cell_test, emit_load_reg, emit_load_runtime_stub, emit_load_u64,
     emit_prototype_validity_guard, emit_store_reg,
@@ -78,9 +82,8 @@ pub(super) fn emit_get_iterator(
             ; ldrb w11, [x9]
             ; cmp w11, u32::from(iteration.array_type_tag)
             ; b.ne =>slow
-            ; ldr w11, [x9, iteration.array_exotic_byte]
-            ; cbnz w11, =>slow
         );
+        emit_body_guard(ops, 9, iteration.receiver_guard, slow);
         emit_iteration_realm_guard(ops, iteration, slow);
         emit_prototype_validity_guard(ops, relocations, iteration.iterable, 11, slow);
         emit_prototype_validity_guard(ops, relocations, iteration.iterator, 11, slow);

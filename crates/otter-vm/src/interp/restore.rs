@@ -345,7 +345,7 @@ impl Interpreter {
             });
             assert_eq!(
                 array_sidecars.len(),
-                snapshot.array_sidecar_flags.len(),
+                snapshot.array_indexed_records.len(),
                 "array-sidecar record count must match the restored bodies"
             );
             // SAFETY: single mutator, no allocation between collect and
@@ -358,9 +358,9 @@ impl Interpreter {
                 }
                 for (body, records) in array_sidecars
                     .into_iter()
-                    .zip(&snapshot.array_sidecar_flags)
+                    .zip(&snapshot.array_indexed_records)
                 {
-                    (*body).restore_property_flags(records);
+                    (*body).restore_indexed_snapshot(records);
                 }
             }
             heap.for_each_live_payload::<crate::array::ArrayBody, _>(|_space, body| {

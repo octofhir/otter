@@ -11,13 +11,17 @@
 //! - The value-level `[[Set]]` funnel shared by interpreter and JIT property
 //!   stores, including ordinary and exotic receiver phases.
 //! - Shared Array length policy for physical arrays and canonical prototypes.
+//! - Array indexed semantics and ordinary shaped named/Symbol storage.
 //! - String exotic property reads/descriptors.
 //! - Proxy invariant validation helpers.
+//! - Scoped prototype mutation and one ordinary cycle-check boundary.
 //! - Realm constructor prototype lookup.
 //! - Protector/shape epoch publication at the existing mutation funnels.
 //!
 //! # Invariants
-//! - Proxy traps are invoked through the normal callable path.
+//! - Proxy traps are invoked through the normal callable path. Captured targets
+//!   stay rooted through reentry and revocation; invariant checks use the
+//!   canonical internal method or its already evaluated result.
 //! - Get, traps, coercions and their internal-method parents carry the existing
 //!   `CommittedValueError` through recursive operations. Completed child calls
 //!   retain terminal disposition; fresh local semantic/allocation failures keep
@@ -25,6 +29,8 @@
 //! - `ordinary_set_data_value` is total for object-like values: specialised
 //!   exotics run first and the generic internal-method fallback owns the rest.
 //! - String exotic keys only synthesize `length` and index descriptors.
+//! - Array expandos own property storage only. The Array owns extensibility,
+//!   prototypes and the original receiver at every internal-method boundary.
 //! - Constructor prototype lookup preserves existing global-object semantics.
 //! - The array-index accessor protector epoch advances only on the existing
 //!   latch's `false -> true` transition.
@@ -58,6 +64,7 @@ mod for_in;
 mod get;
 pub(crate) use get::byte_view_expando;
 mod keys;
+mod prototype_set;
 mod set_delete;
 
 #[derive(Clone, Copy)]
@@ -109,22 +116,6 @@ fn property_key_value_to_vm_key(
         return Ok(VmPropertyKey::Symbol(sym));
     }
     Err(interp.err_type(("property key must be a string or symbol".to_string()).into()))
-}
-
-fn normalize_accessor_slot(value: Option<Value>) -> Option<Value> {
-    value.filter(|value| !value.is_undefined())
-}
-
-fn same_optional_value(
-    left: &Option<Value>,
-    right: &Option<Value>,
-    heap: &otter_gc::GcHeap,
-) -> bool {
-    match (left, right) {
-        (None, None) => true,
-        (Some(left), Some(right)) => abstract_ops::same_value(left, right, heap),
-        _ => false,
-    }
 }
 
 fn descriptor_to_lookup(desc: object::PropertyDescriptor) -> object::PropertyLookup {
@@ -359,21 +350,15 @@ impl Interpreter {
         string::exotic::descriptor_for_key(value, key, &mut self.gc_heap)
     }
 
-    fn target_is_non_extensible_object(&self, target: &Value) -> bool {
-        target
-            .as_object()
-            .is_some_and(|obj| !object::is_extensible(obj, &self.gc_heap))
-    }
-
     pub(crate) fn validate_proxy_get_own_property_descriptor(
         &self,
-        target: &Value,
+        extensible_target: bool,
         target_desc: Option<&object::PropertyDescriptor>,
         trap_desc: Option<&object::PropertyDescriptor>,
     ) -> Result<(), VmError> {
         match (target_desc, trap_desc) {
             (Some(target_desc), None) => {
-                if !target_desc.configurable() || self.target_is_non_extensible_object(target) {
+                if !target_desc.configurable() || !extensible_target {
                     return Err(self.err_type(
                         ("Proxy getOwnPropertyDescriptor trap cannot hide target property"
                             .to_string())
@@ -382,7 +367,7 @@ impl Interpreter {
                 }
             }
             (None, Some(trap_desc)) => {
-                if self.target_is_non_extensible_object(target) || !trap_desc.configurable() {
+                if !extensible_target || !trap_desc.configurable() {
                     return Err(self.err_type(
                         ("Proxy getOwnPropertyDescriptor trap reported incompatible property"
                             .to_string())
@@ -432,56 +417,19 @@ impl Interpreter {
         Ok(())
     }
 
-    fn proxy_get_own_target_descriptor(
-        &self,
-        target: &Value,
-        key: &VmPropertyKey,
-    ) -> Option<object::PropertyDescriptor> {
-        // A class constructor's `prototype` is a non-writable
-        // non-configurable own data property — the one function-shaped
-        // descriptor the §10.5.8 get-trap invariant can trip over.
-        if let Some(class) = target.as_class_constructor() {
-            if key.string_name() == Some("prototype") {
-                if let Some(desc) = object::get_own_descriptor(
-                    class.statics(&self.gc_heap),
-                    &self.gc_heap,
-                    "prototype",
-                ) {
-                    return Some(desc);
-                }
-                return Some(object::PropertyDescriptor::data(
-                    Value::object(class.prototype(&self.gc_heap)),
-                    false,
-                    false,
-                    false,
-                ));
-            }
-            return None;
-        }
-        let obj = target.as_object()?;
-        if let Some(key) = key.string_name() {
-            object::get_own_descriptor(obj, &self.gc_heap, key)
-        } else if let VmPropertyKey::Symbol(sym) = key {
-            object::get_own_symbol_descriptor(obj, &self.gc_heap, *sym)
-        } else {
-            None
-        }
-    }
-
     pub(crate) fn validate_proxy_get_invariants(
         &self,
-        target: &Value,
-        key: &VmPropertyKey,
+        descriptor: Option<&object::PropertyDescriptor>,
         trap_result: &Value,
     ) -> Result<(), VmError> {
-        let Some(desc) = self.proxy_get_own_target_descriptor(target, key) else {
+        let Some(desc) = descriptor else {
             return Ok(());
         };
-        match desc.kind {
+        match &desc.kind {
             object::DescriptorKind::Data { value }
                 if !desc.configurable()
                     && !desc.writable()
-                    && !abstract_ops::same_value(trap_result, &value, &self.gc_heap) =>
+                    && !abstract_ops::same_value(trap_result, value, &self.gc_heap) =>
             {
                 return Err(self.err_type(( "Proxy get trap returned incompatible value for non-writable non-configurable property".to_string()).into()));
             }
@@ -584,33 +532,43 @@ impl Interpreter {
                     ),
                 ));
             }
-            let trap_args: SmallVec<[Value; 8]> = smallvec::smallvec![proxy.target(&self.gc_heap)];
-            return match self.invoke_proxy_trap(
-                stack,
-                Some(context),
-                &proxy,
-                "preventExtensions",
-                trap_args,
-            )? {
-                crate::object_internal_ops::ProxyTrap::Trapped(result) => {
-                    let ok = result.to_boolean(&self.gc_heap);
-                    if ok
-                        && self.is_extensible_value(
-                            stack,
-                            Some(context),
-                            &proxy.target(&self.gc_heap),
-                        )?
-                    {
-                        return Err(CommittedValueError::JavaScript(self.err_type((
+            return self.with_handle_scope(|interp, scope| {
+                let proxy_handle = interp.scoped_value(scope, Value::proxy(proxy));
+                let target_handle = interp.scoped_value(scope, proxy.target(&interp.gc_heap));
+                let proxy = interp
+                    .escape_scoped(proxy_handle)
+                    .as_proxy()
+                    .ok_or(CommittedValueError::Fatal(VmError::InvalidOperand))?;
+                let trap_args: SmallVec<[Value; 8]> =
+                    smallvec::smallvec![interp.escape_scoped(target_handle)];
+                match interp.invoke_proxy_trap(
+                    stack,
+                    Some(context),
+                    &proxy,
+                    "preventExtensions",
+                    trap_args,
+                )? {
+                    crate::object_internal_ops::ProxyTrap::Trapped(result) => {
+                        let ok = result.to_boolean(&interp.gc_heap);
+                        if ok
+                            && interp.is_extensible_value(
+                                stack,
+                                Some(context),
+                                &interp.escape_scoped(target_handle),
+                            )?
+                        {
+                            return Err(CommittedValueError::JavaScript(interp.err_type(
                                 "Proxy preventExtensions trap succeeded but target is still extensible"
-                                    .to_string()).into())));
+                                    .into(),
+                            )));
+                        }
+                        Ok(ok)
                     }
-                    Ok(ok)
+                    crate::object_internal_ops::ProxyTrap::NoTrap {
+                        target: fallthrough_target,
+                    } => interp.prevent_extensions_value(stack, context, &fallthrough_target),
                 }
-                crate::object_internal_ops::ProxyTrap::NoTrap {
-                    target: fallthrough_target,
-                } => self.prevent_extensions_value(stack, context, &fallthrough_target),
-            };
+            });
         }
         self.prevent_extensions_non_proxy(value)
             .map_err(CommittedValueError::JavaScript)
@@ -650,7 +608,7 @@ impl Interpreter {
             return Ok(true);
         }
         if let Some(arr) = value.as_array() {
-            array::prevent_extensions(arr, &mut self.gc_heap);
+            array::prevent_extensions(arr, &mut self.gc_heap)?;
             return Ok(true);
         }
         if let Some(native) = value.as_native_function() {

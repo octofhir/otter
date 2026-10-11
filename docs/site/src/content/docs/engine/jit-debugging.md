@@ -130,6 +130,22 @@ throwing property operations therefore remain ordinary runtime probes after
 warming instead of repeatedly leaving for `InsufficientFeedback`. The IC
 inspector exposes the latter state as `Uncacheable` until a program attaches.
 
+An Array keeps its non-index string and symbol descriptors in an ordinary
+shaped expando object. `LoadArrayExpando` projects that live storage before its
+shape, descriptor and capacity guards. Own loads and overwrites use the bag's
+field summaries and write barrier; source records and reconstruction retain the
+original Array receiver. A failed proof enters the existing committed property
+operation once. A missing bag does not prove absence on the Array's prototype
+chain or authorize adding a property to a non-extensible Array.
+
+Present own dense elements retain their indexed guards. Inherited native
+method and iterator proofs use one `JitBodyGuard` over the aligned 64-bit
+rare/expando pair: both compressed handles must be zero before using a
+canonical prototype, unless a complete per-key proof already establishes the
+lookup. The word contains exactly the two handles, with no padding or adjacent
+slab state. Match result `index`, `input`, `groups` and
+`indices` fields use this same shaped property path.
+
 `propertyStoreRuntime` aggregates generated named-store runtime entries by
 `functionId`, logical `instructionPc`, selected `path`, `failed`, and
 `nativeWay`. `propertyName` is the owned executable spelling; `count` is the

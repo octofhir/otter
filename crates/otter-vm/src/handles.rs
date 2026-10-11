@@ -47,6 +47,9 @@
 //!   provider is not accepted as a substitute. The arena is then traced by any
 //!   collection the box drives, while the dispatch hot path pays nothing
 //!   because its matching source is already present.
+//! - Ordinary and null-prototype layouts share one strong root-keyed cache;
+//!   a returned token survives turns and GC even before its first instance.
+//!   Fixed RegExp layouts use that cache's typed slots, independent of realms.
 //! - Bulk layout construction allocates the final shape's immutable inline
 //!   capacity and publishes all its initial slots in the same allocation.
 //!
@@ -64,8 +67,8 @@ use crate::{Interpreter, JsString, Value, VmError};
 /// The hidden class for a fixed list of own data properties, in order.
 ///
 /// Held as a shape id rather than a handle so it stays valid across
-/// collections: the shape runtime interns its nodes and traces them, and an id
-/// resolves to the current handle each time it is used. Build one with
+/// collections: the isolate's root-keyed layout cache strongly retains the final
+/// shape, and an id resolves to the current handle each time it is used. Build one with
 /// [`crate::NativeScope::object_layout`] and keep it for as long as objects of
 /// that shape keep coming.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -445,26 +448,13 @@ impl Interpreter {
         Some(self.gc_heap.register_extra_roots(extra))
     }
 
-    /// The hidden class an object gets from appending `keys` in order to the
-    /// empty shape.
-    ///
-    /// The walk is paid once per distinct key list per isolate — every
-    /// transition after the first resolves from the transition cache — so a
-    /// caller that builds many objects of one shape should keep the answer.
+    /// Resolve and strongly retain the complete layout for ordered string keys.
     pub(crate) fn object_layout(&mut self, keys: &[&str]) -> Result<ObjectLayout, VmError> {
-        let prototype = self.object_prototype_object_opt();
-        let mut shape = self.object_root(
-            prototype,
-            crate::object::inline_capacity_for(keys.len()),
-            crate::object::ShapeState::ORDINARY,
-        )?;
-        for key in keys {
-            shape = self.layout_shape_child(shape, key)?;
-        }
-        Ok(ObjectLayout {
-            shape: self.shape_runtime.id_for_handle(&self.gc_heap, shape),
-            len: keys.len() as u32,
-        })
+        let tag = self.host_atom("[[HostObjectLayout]]");
+        let atoms: smallvec::SmallVec<[crate::HostAtom; 8]> =
+            keys.iter().map(|key| self.host_atom(key)).collect();
+        let refs: smallvec::SmallVec<[&crate::HostAtom; 8]> = atoms.iter().collect();
+        self.object_layout_for_atoms(&tag, &refs)
     }
 
     /// Intern a host property name in this interpreter's stable host table.
@@ -473,19 +463,57 @@ impl Interpreter {
         self.host_atoms.intern(name)
     }
 
-    /// Resolve the complete hidden class for an atomized record signature.
-    ///
-    /// The first occurrence builds the ordinary shape chain. Later occurrences
-    /// compare only the tag and ordered property atom ids and return the final
-    /// layout directly.
+    /// Resolve an ordinary record layout under the current Object prototype.
     pub(crate) fn object_layout_for_atoms(
         &mut self,
         tag: &crate::HostAtom,
         keys: &[&crate::HostAtom],
     ) -> Result<ObjectLayout, VmError> {
-        // A layout's shape fixes the realm's `%Object.prototype%`, so the
-        // realm's root partitions the cache.
-        let prototype = self.object_prototype_object_opt();
+        self.record_layout_for_atoms(self.object_prototype_object_opt(), tag, keys)
+    }
+
+    /// Resolve a null-prototype record layout in the same strong root-keyed cache.
+    pub(crate) fn null_object_layout_for_atoms(
+        &mut self,
+        tag: &crate::HostAtom,
+        keys: &[&crate::HostAtom],
+    ) -> Result<ObjectLayout, VmError> {
+        self.record_layout_for_atoms(None, tag, keys)
+    }
+
+    /// Read or prepare a fixed null-prototype RegExp record's retained final shape.
+    pub(crate) fn regexp_record_layout(
+        &mut self,
+        kind: crate::object_layout_cache::RegExpRecordLayout,
+    ) -> Result<ObjectLayout, VmError> {
+        if let Some(layout) = self.object_layout_cache.regexp(kind) {
+            return Ok(layout);
+        }
+        let _runtime_roots = self.scope_runtime_roots_guard();
+        let keys = kind.keys();
+        let mut shape = self.object_root(
+            None,
+            crate::object::inline_capacity_for(keys.len()),
+            crate::object::ShapeState::ORDINARY,
+        )?;
+        for key in keys {
+            shape = self.layout_shape_child(shape, key)?;
+        }
+        let layout = ObjectLayout {
+            shape: self.shape_runtime.id_for_handle(&self.gc_heap, shape),
+            len: keys.len() as u32,
+        };
+        self.object_layout_cache.insert_regexp(kind, layout);
+        Ok(layout)
+    }
+
+    fn record_layout_for_atoms(
+        &mut self,
+        prototype: Option<crate::object::JsObject>,
+        tag: &crate::HostAtom,
+        keys: &[&crate::HostAtom],
+    ) -> Result<ObjectLayout, VmError> {
+        let _runtime_roots = self.scope_runtime_roots_guard();
         let root = self.object_root(
             prototype,
             crate::object::inline_capacity_for(keys.len()),
@@ -495,12 +523,67 @@ impl Interpreter {
         if let Some(layout) = self.object_layout_cache.get(root_id, tag, keys) {
             return Ok(layout);
         }
-
-        let spellings: smallvec::SmallVec<[&str; 8]> =
-            keys.iter().map(|key| key.as_str()).collect();
-        let layout = self.object_layout(&spellings)?;
+        let mut shape = root;
+        for key in keys {
+            shape = self.layout_shape_child(shape, key.as_str())?;
+        }
+        let layout = ObjectLayout {
+            shape: self.shape_runtime.id_for_handle(&self.gc_heap, shape),
+            len: keys.len() as u32,
+        };
         self.object_layout_cache.insert(root_id, tag, keys, layout);
         Ok(layout)
+    }
+
+    /// Return the array's current ordinary property bag, allocating it once.
+    pub(crate) fn ensure_array_expando<'s>(
+        &mut self,
+        scope: &'s HandleScope,
+        array: Local<'_>,
+    ) -> Result<Local<'s>, VmError> {
+        let _runtime_roots = self.scope_runtime_roots_guard();
+        let arr = self
+            .handle_arena
+            .get(array.index())
+            .as_array()
+            .ok_or(VmError::TypeMismatch)?;
+        if let Some(bag) = crate::array::expando_object(arr, &self.gc_heap) {
+            return Ok(self.scoped_value(scope, Value::object(bag)));
+        }
+        let tag = self.host_atom("[[ArrayExpando]]");
+        let layout = self.null_object_layout_for_atoms(&tag, &[])?;
+        let bag = self.scoped_object_of_layout(scope, layout)?;
+        self.attach_array_expando(scope, array, bag)?;
+        Ok(bag)
+    }
+
+    /// Publish one rooted null-prototype ordinary bag and its generational edge.
+    pub(crate) fn attach_array_expando(
+        &mut self,
+        _scope: &HandleScope,
+        array: Local<'_>,
+        expando: Local<'_>,
+    ) -> Result<(), VmError> {
+        let arr = self
+            .handle_arena
+            .get(array.index())
+            .as_array()
+            .ok_or(VmError::TypeMismatch)?;
+        let bag = self
+            .handle_arena
+            .get(expando.index())
+            .as_object()
+            .ok_or(VmError::TypeMismatch)?;
+        if crate::array::expando_object(arr, &self.gc_heap).is_some()
+            || crate::object::prototype_value(bag, &self.gc_heap).is_some()
+            || crate::object::state(bag, &self.gc_heap).is_opaque()
+            || crate::object::state(bag, &self.gc_heap).is_prototype()
+        {
+            return Err(VmError::TypeMismatch);
+        }
+        self.gc_heap.with_payload(arr, |body| body.expando = bag);
+        self.gc_heap.record_write(arr, &bag);
+        Ok(())
     }
 
     /// One transition of [`Self::object_layout`], cached where possible.
@@ -1017,15 +1100,30 @@ impl Interpreter {
             };
         }
         if let Some(array) = receiver.as_array() {
-            // Indexed writes and ArraySetLength have their own scoped owners.
-            if key == "length" || crate::object::array_index_property_name(key).is_some() {
+            let property = crate::VmPropertyKey::String(key);
+            if crate::array::classify_property_key(&property)
+                != crate::array::ArrayPropertyKey::Expando
+            {
                 return Err(VmError::TypeMismatch);
             }
-            return if crate::array::set_named_property(array, &mut self.gc_heap, key, stored)? {
-                Ok(())
-            } else {
-                Err(VmError::TypeMismatch)
-            };
+            let current = self.array_own_property_descriptor(array, &property);
+            if current.as_ref().is_some_and(|desc| !desc.writable())
+                || current.is_none() && !crate::array::is_extensible(array, &self.gc_heap)
+            {
+                return Err(VmError::TypeMismatch);
+            }
+            let bag = self.ensure_array_expando(_scope, obj)?;
+            let object = self
+                .handle_arena
+                .get(bag.index())
+                .as_object()
+                .ok_or(VmError::TypeMismatch)?;
+            let stored = self.handle_arena.get(value.index());
+            let accepted = self.ordinary_set_data_property(object, key, stored)?;
+            if accepted {
+                return Ok(());
+            }
+            return Err(VmError::TypeMismatch);
         }
         Err(VmError::TypeMismatch)
     }
@@ -1066,17 +1164,37 @@ impl Interpreter {
                 Err(VmError::TypeMismatch)
             };
         }
-        if let Some(mut array) = receiver.as_array() {
-            return if crate::array::ordinary_set_symbol_data_property(
-                &mut array,
+        if let Some(array) = receiver.as_array() {
+            let symbol = self.scoped_value(_scope, Value::symbol(key));
+            let current =
+                self.array_own_property_descriptor(array, &crate::VmPropertyKey::Symbol(key));
+            if current.as_ref().is_some_and(|desc| !desc.writable())
+                || current.is_none() && !crate::array::is_extensible(array, &self.gc_heap)
+            {
+                return Err(VmError::TypeMismatch);
+            }
+            let bag = self.ensure_array_expando(_scope, obj)?;
+            let mut object = self
+                .handle_arena
+                .get(bag.index())
+                .as_object()
+                .ok_or(VmError::TypeMismatch)?;
+            let key = self
+                .handle_arena
+                .get(symbol.index())
+                .as_symbol(&self.gc_heap)
+                .ok_or(VmError::TypeMismatch)?;
+            let stored = self.handle_arena.get(value.index());
+            let accepted = crate::object::ordinary_set_symbol_data_property(
+                &mut object,
                 &mut self.gc_heap,
                 key,
                 stored,
-            )? {
-                Ok(())
-            } else {
-                Err(VmError::TypeMismatch)
-            };
+            )?;
+            if accepted {
+                return Ok(());
+            }
+            return Err(VmError::TypeMismatch);
         }
         Err(VmError::TypeMismatch)
     }
@@ -1113,6 +1231,29 @@ impl Interpreter {
         value: Local<'_>,
         flags: crate::object::PropertyFlags,
     ) -> Result<(), VmError> {
+        let receiver = self.handle_arena.get(obj.index());
+        if let Some(array) = receiver.as_array() {
+            let symbol = self
+                .handle_arena
+                .get(key.index())
+                .as_symbol(&self.gc_heap)
+                .ok_or(VmError::TypeMismatch)?;
+            let descriptor = crate::object::PropertyDescriptor::data(
+                self.handle_arena.get(value.index()),
+                flags.writable(),
+                flags.enumerable(),
+                flags.configurable(),
+            );
+            return if self.define_array_expando_property(
+                array,
+                &crate::VmPropertyKey::Symbol(symbol),
+                crate::object::PartialPropertyDescriptor::from_full(&descriptor),
+            )? {
+                Ok(())
+            } else {
+                Err(VmError::TypeMismatch)
+            };
+        }
         let object = self
             .handle_arena
             .get(obj.index())
@@ -1228,6 +1369,29 @@ impl Interpreter {
         flags: crate::object::PropertyFlags,
     ) -> Result<(), VmError> {
         let receiver = self.handle_arena.get(obj.index());
+        if let Some(array) = receiver.as_array() {
+            let property = crate::VmPropertyKey::String(key);
+            if crate::array::classify_property_key(&property)
+                != crate::array::ArrayPropertyKey::Expando
+            {
+                return Err(VmError::TypeMismatch);
+            }
+            let descriptor = crate::object::PropertyDescriptor::data(
+                self.handle_arena.get(value.index()),
+                flags.writable(),
+                flags.enumerable(),
+                flags.configurable(),
+            );
+            return if self.define_array_expando_property(
+                array,
+                &property,
+                crate::object::PartialPropertyDescriptor::from_full(&descriptor),
+            )? {
+                Ok(())
+            } else {
+                Err(VmError::TypeMismatch)
+            };
+        }
         if let Some(native) = receiver.as_native_function() {
             let stored = self.handle_arena.get(value.index());
             let descriptor = crate::object::PropertyDescriptor {
@@ -1275,9 +1439,6 @@ impl Interpreter {
         flags: crate::object::PropertyFlags,
     ) -> Result<(), VmError> {
         let receiver = self.handle_arena.get(obj.index());
-        let Some(object) = receiver.as_object() else {
-            return Err(VmError::TypeMismatch);
-        };
         let getter = self.handle_arena.get(getter.index());
         let setter = self.handle_arena.get(setter.index());
         let descriptor = crate::object::PropertyDescriptor {
@@ -1287,6 +1448,24 @@ impl Interpreter {
             },
             flags,
         };
+        if let Some(array) = receiver.as_array() {
+            let property = crate::VmPropertyKey::String(key);
+            if crate::array::classify_property_key(&property)
+                != crate::array::ArrayPropertyKey::Expando
+            {
+                return Err(VmError::TypeMismatch);
+            }
+            return if self.define_array_expando_property(
+                array,
+                &property,
+                crate::object::PartialPropertyDescriptor::from_full(&descriptor),
+            )? {
+                Ok(())
+            } else {
+                Err(VmError::TypeMismatch)
+            };
+        }
+        let object = receiver.as_object().ok_or(VmError::TypeMismatch)?;
         if crate::object::define_own_property(object, &mut self.gc_heap, key, descriptor)? {
             Ok(())
         } else {

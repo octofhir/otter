@@ -599,12 +599,12 @@ impl crate::Interpreter {
         }
     }
 
-    /// Complete a named load on a receiver whose lookup starts at another
-    /// object through the site's handlers, installing one on a miss. That
-    /// object's shape, keyed with the lookup-start bit, fixes the receiver's
-    /// whole ordinary lookup:
-    /// - an ordinary dense array owns no named property but `length`, so
-    ///   every other non-index name starts at `%Array.prototype%`;
+    /// Complete a named load through one source-preserving storage projection.
+    /// An array's live expando admits only existing own data fields; its shape
+    /// does not authorize inherited or missing keys on the original array.
+    /// Clean lookup-start shapes fix the receiver's whole ordinary lookup:
+    /// - an array without rare state or an expando starts non-index names other
+    ///   than `length` at the retained default `%Array.prototype%`;
     /// - a Map, Set, WeakMap, WeakSet, DataView, ArrayBuffer, TypedArray,
     ///   Promise or RegExp keeps user-defined own properties in a lazy
     ///   expando bag; without one it owns no named key but the ones its kind
@@ -620,21 +620,40 @@ impl crate::Interpreter {
     /// gives it the function's prototype and a hidden class, which allocates:
     /// a caller that continues after `None` re-reads its receiver from a
     /// root.
-    pub(crate) fn lookup_start_load(
+    pub(crate) fn projected_load(
         &mut self,
         slot: crate::feedback::PropertyFeedbackSlot<'_>,
         receiver: crate::Value,
         key: AtomizedPropertyKey<'_>,
     ) -> Option<crate::Value> {
-        let start = self.lookup_start_object(receiver)?;
-        if let Some(value) = slot.native().probe_lookup_start_load(start, &self.gc_heap) {
+        use crate::property_ic::PropertyStorageProjection as Projection;
+        let (start, projection) = if let Some(array) = receiver.as_array()
+            && let Some(bag) = crate::array::expando_object(array, &self.gc_heap)
+        {
+            (bag, Projection::ArrayExpando)
+        } else {
+            (self.lookup_start_object(receiver)?, Projection::LookupStart)
+        };
+        if let Some(value) = slot
+            .native()
+            .probe_projected_load(start, projection, &self.gc_heap)
+        {
             slot.record_hit();
             return Some(value);
         }
         slot.record_miss();
-        let start = self.admit_lookup_start(receiver, start, key)?;
+        let start = if projection == Projection::ArrayExpando {
+            start
+        } else {
+            self.admit_lookup_start(receiver, start, key)?
+        };
         let load = self.resolve_property_load(start, key);
         let shape = object::keyed_shape(start, &self.gc_heap);
+        if projection == Projection::ArrayExpando
+            && !matches!(&load, PropertyLoad::Data(resolved) if resolved.hops == 0)
+        {
+            return None;
+        }
         let (handler, value) = match load {
             PropertyLoad::Data(resolved) => (
                 crate::property_ic::IcHandler::load_resolved(shape, &resolved),
@@ -648,15 +667,16 @@ impl crate::Interpreter {
         };
         if !slot.is_megamorphic()
             && let Some(handler) = handler
+            && let Some(handler) = handler.projected(projection)
         {
-            slot.install(handler.for_lookup_start());
+            slot.install(handler);
         }
         Some(value)
     }
 
-    /// `[[Set]]` of `key` on a closure or native function whose property bag
-    /// owns it as writable data: the store lands in the bag, as the site's
-    /// lookup-start store handler directs or, on a miss, as one installed
+    /// `[[Set]]` of `key` on an array, closure or native function whose property
+    /// bag owns it as writable data: the store lands in the bag, as the site's
+    /// projected store handler directs or, on a miss, as one installed
     /// after resolving the bag's own slot. `false` leaves the full `[[Set]]`
     /// to the caller. Neither allocates nor runs code.
     ///
@@ -665,19 +685,28 @@ impl crate::Interpreter {
     /// `arguments`). An own writable data property ends OrdinarySet at
     /// the bag whatever the function's prototype, so the bag need not mirror
     /// it, and a native's bag that a load has not yet prepared simply misses.
-    pub(crate) fn lookup_start_store(
+    pub(crate) fn projected_store(
         &mut self,
         slot: crate::feedback::PropertyFeedbackSlot<'_>,
         receiver: crate::Value,
         key: AtomizedPropertyKey<'_>,
         value: crate::Value,
     ) -> bool {
-        let Some(bag) = self.function_bag(receiver) else {
-            return false;
+        use crate::property_ic::PropertyStorageProjection as Projection;
+        let (bag, projection) = if let Some(array) = receiver.as_array() {
+            let Some(bag) = crate::array::expando_object(array, &self.gc_heap) else {
+                return false;
+            };
+            (bag, Projection::ArrayExpando)
+        } else {
+            let Some(bag) = self.function_bag(receiver) else {
+                return false;
+            };
+            (bag, Projection::LookupStart)
         };
         if slot
             .native()
-            .probe_lookup_start_store(bag, &mut self.gc_heap, value)
+            .probe_projected_store(bag, projection, &mut self.gc_heap, value)
         {
             slot.record_hit();
             return true;
@@ -690,7 +719,7 @@ impl crate::Interpreter {
             "prototype" | "caller" | "arguments" => !native,
             _ => false,
         };
-        if synthesized {
+        if projection == Projection::LookupStart && synthesized {
             return false;
         }
         let Some((handler, hit)) =
@@ -699,8 +728,10 @@ impl crate::Interpreter {
             return false;
         };
         object::store_proven_data_slot(bag, &mut self.gc_heap, hit.slot, value);
-        if !slot.is_megamorphic() {
-            slot.install(handler.for_lookup_start());
+        if !slot.is_megamorphic()
+            && let Some(handler) = handler.projected(projection)
+        {
+            slot.install(handler);
         }
         true
     }

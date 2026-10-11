@@ -232,6 +232,7 @@ pub mod snapshot;
 pub mod source_registry;
 mod static_call_ops;
 mod static_load_ops;
+mod template_objects;
 pub mod string;
 pub mod swar;
 pub mod symbol;
@@ -1581,87 +1582,7 @@ impl Interpreter {
         self.handle_arena.truncate(idx);
     }
 
-    /// §13.2.8.4 GetTemplateObject steps 7-15 — build the frozen
-    /// template-strings array with its frozen, non-enumerable `.raw`
-    /// companion.
-    pub(crate) fn build_template_object(
-        &mut self,
-        context: &ExecutionContext,
-        stack: &ActivationStack,
-        function_id: u32,
-        site_idx: u32,
-    ) -> Result<Value, VmError> {
-        let site = context
-            .template_site_for_function(function_id, site_idx)
-            .ok_or_else(|| VmError::InvalidOperand)?
-            .clone();
-        let mut cooked: Vec<Value> = Vec::with_capacity(site.cooked.len());
-        for entry in &site.cooked {
-            match entry {
-                Some(text) => {
-                    let s = JsString::from_str(text, &mut self.gc_heap)?;
-                    cooked.push(Value::string(s));
-                }
-                None => cooked.push(Value::undefined()),
-            }
-        }
-        let mut raw: Vec<Value> = Vec::with_capacity(site.raw.len());
-        for text in &site.raw {
-            let s = JsString::from_str(text, &mut self.gc_heap)?;
-            raw.push(Value::string(s));
-        }
-        let roots = self.collect_allocation_roots(stack);
-        let raw_value;
-        {
-            let mut visit = |visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
-                for &slot in &roots {
-                    visitor(slot);
-                }
-                for v in cooked.iter().chain(raw.iter()) {
-                    v.trace_value_slots(visitor);
-                }
-            };
-            let raw_arr = crate::array::from_elements_with_roots(
-                &mut self.gc_heap,
-                raw.iter().copied(),
-                &mut visit,
-            )
-            .map_err(crate::oom_to_vm)?;
-            raw_value = Value::array(raw_arr);
-        }
-        let strings_arr;
-        {
-            let mut visit = |visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
-                for &slot in &roots {
-                    visitor(slot);
-                }
-                for v in cooked.iter().chain(std::iter::once(&raw_value)) {
-                    v.trace_value_slots(visitor);
-                }
-            };
-            strings_arr = crate::array::from_elements_with_roots(
-                &mut self.gc_heap,
-                cooked.iter().copied(),
-                &mut visit,
-            )
-            .map_err(crate::oom_to_vm)?;
-        }
-        crate::array::set_named_property(strings_arr, &mut self.gc_heap, "raw", raw_value)
-            .map_err(|_| VmError::TypeMismatch)?;
-        // §13.2.8.4 steps 10-14 — `.raw` is non-enumerable and both
-        // arrays are frozen.
-        crate::array::set_named_property_flags(
-            strings_arr,
-            &mut self.gc_heap,
-            "raw",
-            object::PropertyFlags::new(false, false, false),
-        );
-        if let Some(raw_arr) = raw_value.as_array() {
-            crate::array::set_integrity_level(raw_arr, &mut self.gc_heap, true);
-        }
-        crate::array::set_integrity_level(strings_arr, &mut self.gc_heap, true);
-        Ok(Value::array(strings_arr))
-    }
+
 }
 
 impl otter_gc::ExtraRootSource for Interpreter {

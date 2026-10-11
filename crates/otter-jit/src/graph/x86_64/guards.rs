@@ -203,8 +203,12 @@ impl Codegen<'_> {
         miss: DynamicLabel,
     ) {
         self.emit_body_load(receiver, 10, guard.byte, guard.width);
-        self.load_immediate(11, u64::from(guard.expect));
-        dynasm!(self.ops ; .arch x64 ; cmp r10, r11 ; jne =>miss);
+        if guard.expect == 0 {
+            dynasm!(self.ops ; .arch x64 ; test r10, r10 ; jne =>miss);
+        } else {
+            self.load_immediate(11, u64::from(guard.expect));
+            dynasm!(self.ops ; .arch x64 ; cmp r10, r11 ; jne =>miss);
+        }
     }
 
     pub(super) fn emit_native_identity(&mut self, value: u8, identity: u32, miss: DynamicLabel) {

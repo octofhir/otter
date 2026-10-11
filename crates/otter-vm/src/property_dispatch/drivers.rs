@@ -72,7 +72,7 @@ impl Interpreter {
         let top_idx = stack.len() - 1;
         let receiver =
             *read_register(&stack[top_idx], obj_reg).map_err(CommittedValueError::Fatal)?;
-        if let Some(value) = self.lookup_start_load(slot, receiver, atomized_key) {
+        if let Some(value) = self.projected_load(slot, receiver, atomized_key) {
             Self::finish_property_fast_path_value(&mut stack[top_idx], dst, value)
                 .map_err(CommittedValueError::Fatal)?;
             return Ok(true);
@@ -1104,7 +1104,7 @@ impl Interpreter {
                 return Ok(true);
             }
             property_slot.record_miss();
-        } else if self.lookup_start_store(property_slot, receiver, atomized_key, value) {
+        } else if self.projected_store(property_slot, receiver, atomized_key, value) {
             Self::advance_property_fast_path(&mut stack[top_idx])
                 .map_err(CommittedValueError::JavaScript)?;
             return Ok(true);

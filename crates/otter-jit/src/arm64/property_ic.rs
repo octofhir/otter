@@ -2,13 +2,13 @@
 //! Template IC routines and Graph generic property nodes.
 //!
 //! # Contents
-//! - [`emit_select_entry`] — the receiver's map selects its slot entry: an
-//!   ordinary object's shape, or a closure's or native function's
-//!   property-bag shape keyed with the lookup-start bit.
+//! - [`emit_select_entry`] — the source receiver selects a current storage
+//!   shape through the shared checked projection key.
 //! - [`emit_slot_load`] — own field, prototype field under its chain proof,
 //!   nonexistent key.
 //! - [`emit_slot_store`] — own-field store and add-transition (write, shape
-//!   publication), leaving the published child shape for the caller's barrier.
+//!   publication), returning the actual storage parent and optional child
+//!   shape for the caller's barriers.
 //!
 //! # Invariants
 //! - Callers name every register; the emitters additionally clobber only
@@ -29,8 +29,8 @@
 use dynasmrt::{DynamicLabel, DynasmApi, DynasmLabelApi, aarch64::Assembler, dynasm};
 use otter_vm::JitCompileSnapshot;
 use otter_vm::jit::{
-    PROPERTY_IC_LAYOUT as IC, PROPERTY_IC_LOOKUP_START_KEY_BIT as LOOKUP_START_KEY_BIT,
-    PropertyIcHandlerKind as Kind,
+    PROPERTY_IC_LAYOUT as IC, PropertyIcHandlerKind as Kind,
+    PropertyStorageProjection as Projection,
 };
 
 use crate::entry::{
@@ -45,14 +45,35 @@ fn distinct(registers: &[u8]) -> bool {
         .all(|(i, r)| *r < 31 && !matches!(*r, 16 | 17) && !registers[..i].contains(r))
 }
 
+/// Read a tagged live named-storage object without changing the source receiver.
+/// The nullable compressed edge is reloaded on every access; no payload pointer
+/// is retained across a helper or collection.
+pub(crate) fn emit_array_expando(
+    ops: &mut Assembler,
+    layout: otter_vm::jit::JitArrayLayout,
+    receiver: u8,
+    destination: u8,
+    miss: DynamicLabel,
+) {
+    emit_cell_test(ops, receiver, CellTest::IsNotCell, miss);
+    dynasm!(ops ; .arch aarch64
+        ; cbz X(receiver), =>miss
+        ; ldrb w16, [X(receiver)]
+        ; cmp w16, u32::from(layout.type_tag) ; b.ne =>miss
+        ; and x17, X(receiver), #0xffff_ffff_0000_0000
+        ; ldr W(destination), [X(receiver), layout.expando_byte]
+        ; cbz W(destination), =>miss
+        ; add X(destination), x17, X(destination));
+}
+
 /// Select the entry of the receiver's map in the slot at `X(slot)`:
 /// `X(entry)` addresses it on fall-through. An ordinary object's map is its
-/// shape. With `start` given, a closure or native function receiver whose
-/// property bag carries its own `[[Prototype]]` (bag present, no override,
-/// default realm active) selects by its bag's shape keyed with the
-/// lookup-start bit, and `X(start)`
-/// becomes the lookup-start object (the receiver itself for an ordinary
-/// object). A megamorphic slot branches to `megamorphic`, anything else to
+/// shape. With `start` given, an Array selects the live expando's shape with
+/// `ArrayExpando`, and a closure or native function whose bag carries its own
+/// `[[Prototype]]` (bag present, no override, default realm active) selects
+/// that shape with `LookupStart`. `X(start)` receives the storage object,
+/// including the receiver itself for an ordinary object. A megamorphic slot
+/// branches to `megamorphic`, anything else to
 /// `miss`. Clobbers `X(entry)`, `X(scratch)`, `x16`, `x17`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn emit_select_entry(
@@ -83,6 +104,7 @@ pub(crate) fn emit_select_entry(
         ),
         Some(start) => {
             let function = ops.new_dynamic_label();
+            let array = ops.new_dynamic_label();
             let native = ops.new_dynamic_label();
             let bag = ops.new_dynamic_label();
             let layout = view.closure_call_layout;
@@ -97,6 +119,8 @@ pub(crate) fn emit_select_entry(
                 ; mov X(start), X(receiver)
                 ; b =>keyed
                 ; =>function
+                ; cmp w16, u32::from(view.array_layout.type_tag)
+                ; b.eq =>array
                 ; cmp w16, u32::from(otter_vm::native_function::NATIVE_FUNCTION_BODY_TYPE_TAG)
                 ; b.eq =>native
                 ; cmp w16, u32::from(otter_vm::closure::JS_CLOSURE_BODY_TYPE_TAG)
@@ -128,7 +152,15 @@ pub(crate) fn emit_select_entry(
                 ; and x17, X(receiver), #0xffff_ffff_0000_0000
                 ; add X(start), x17, X(start)
                 ; ldr w17, [X(start), view.object_shape_byte]
-                ; orr w17, w17, #LOOKUP_START_KEY_BIT
+                ; orr w17, w17, #Projection::LookupStart as u32
+                ; b =>keyed
+                ; =>array
+                ; ldr W(start), [X(receiver), view.array_layout.expando_byte]
+                ; cbz W(start), =>miss
+                ; and x17, X(receiver), #0xffff_ffff_0000_0000
+                ; add X(start), x17, X(start)
+                ; ldr w17, [X(start), view.object_shape_byte]
+                ; orr w17, w17, #Projection::ArrayExpando as u32
             );
         }
     }
@@ -263,7 +295,8 @@ pub(crate) fn emit_slot_load(
 /// Complete a store of `X(value)` through the slot at `X(slot)`: on a hit
 /// the field is written, an append has published its target shape, and
 /// control jumps to `stored` with `W(child)` holding the compressed child
-/// shape (zero for an overwrite). The caller owns both barriers.
+/// shape (zero for an overwrite), and `slot` naming the actual storage owner.
+/// Misses preserve the source receiver and slot; the caller owns both barriers.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn emit_slot_store(
     ops: &mut Assembler,
@@ -288,7 +321,7 @@ pub(crate) fn emit_slot_store(
         receiver,
         slot,
         [entry, index],
-        None,
+        Some(child),
         megamorphic,
         miss,
     );
@@ -297,6 +330,9 @@ pub(crate) fn emit_slot_store(
         ; cmp w16, Kind::StoreField as u32
         ; b.eq =>own
         ; cmp w16, Kind::StoreTransition as u32
+        ; b.ne =>miss
+        ; ldr w16, [X(entry), IC.entry_shape_byte]
+        ; tst w16, #Projection::KEY_MASK
         ; b.ne =>miss
     );
     // Append: the chain proof (absent for a `null` prototype, which the
@@ -332,18 +368,24 @@ pub(crate) fn emit_slot_store(
     );
     super::field_type::emit_observe(ops, relocations, view, entry, value);
     dynasm!(ops ; .arch aarch64
+        ; mov X(slot), X(receiver)
         ; b =>stored
         ; =>own
         ; ldr W(index), [X(entry), IC.entry_field_byte]
     );
-    emit_field_bank(ops, view, receiver, index, miss);
+    emit_field_bank(ops, view, child, index, miss);
     dynasm!(ops ; .arch aarch64
         ; str X(value), [x16, X(index), lsl #3]
         ; ldr W(entry), [X(entry), IC.entry_owner_byte]
     );
     super::field_type::emit_observe(ops, relocations, view, entry, value);
     dynasm!(ops ; .arch aarch64
+        ; mov X(slot), X(child)
         ; mov W(child), wzr
         ; b =>stored
     );
 }
+
+#[cfg(test)]
+#[path = "property_ic_tests.rs"]
+mod tests;

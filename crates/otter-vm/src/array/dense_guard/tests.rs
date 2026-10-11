@@ -3,11 +3,11 @@
 //! # Contents
 //! - Default and source-realm boxed/numeric slabs under every stress stride.
 //! - Descriptor, accessor, sparse, and JSON-source rejection and removal.
-//! - Named sidecar state admitted beside indexed state rejected.
+//! - Managed named state admitted beside indexed state rejected.
 //! - Collecting inherited hole getters and restored indexed writability.
 //!
 //! # Invariants
-//! - A sidecar holding only a prototype or named state admits present own
+//! - A prototype-only sidecar and an ordinary expando admit present own
 //!   slots, never inherited holes.
 //! - Tests keep moving values in production handle scopes and reread them there.
 //! - Snapshot restoration rebuilds flags before publishing native eligibility.
@@ -241,11 +241,11 @@ fn descriptor_accessor_sparse_and_source_mutations_refresh_dense_eligibility() {
                     let receiver = value.as_array().unwrap();
                     assert_family(interp, value, JitElementFamily::Generic);
                     assert!(
-                        !crate::array::get_property_flags(receiver, interp.gc_heap(), "0")
+                        !crate::array::get_index_flags(receiver, interp.gc_heap(), 0)
                             .unwrap()
                             .writable()
                     );
-                    crate::array::clear_property_flags(receiver, interp.gc_heap_mut(), "0");
+                    crate::array::clear_index_flags(receiver, interp.gc_heap_mut(), 0);
                     assert_family(interp, value, JitElementFamily::DenseTagged);
                     assert!(
                         interp
@@ -321,7 +321,8 @@ fn descriptor_accessor_sparse_and_source_mutations_refresh_dense_eligibility() {
                     crate::array::prevent_extensions(
                         value.as_array().unwrap(),
                         interp.gc_heap_mut(),
-                    );
+                    )
+                    .unwrap();
                     assert_family(
                         interp,
                         interp.escape_scoped(array),
@@ -351,11 +352,11 @@ fn descriptor_accessor_sparse_and_source_mutations_refresh_dense_eligibility() {
     .expect("descriptor mutation fixture");
 }
 
-/// Named state — match-result fields, a named accessor, a descriptor on a
+/// Managed named state — match-result fields, a named accessor, a descriptor on a
 /// non-index key — keeps native element access; the same state on an index key
 /// withdraws it.
 #[test]
-fn named_sidecar_state_keeps_dense_eligibility() {
+fn shaped_expando_keeps_dense_eligibility() {
     let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
     interp.gc_heap_mut().set_gc_stress(0, false);
     let context = context(&mut interp);
@@ -369,16 +370,12 @@ fn named_sidecar_state_keeps_dense_eligibility() {
                 let value = scope.boolean(true);
                 scope.set_index(array, 0, value)?;
                 scope.set_index(array, 1, value)?;
+                let index = scope.number(0.0);
+                let undefined = scope.undefined();
+                scope.set(array, "index", index)?;
+                scope.set(array, "input", undefined)?;
+                scope.set(array, "groups", undefined)?;
                 scope.with_turn_parts(|interp, stack| {
-                    let receiver = interp.escape_scoped(array);
-                    crate::array::set_match_result_props(
-                        receiver.as_array().unwrap(),
-                        interp.gc_heap_mut(),
-                        Value::number_i32(0),
-                        Value::undefined(),
-                        Value::undefined(),
-                    )
-                    .unwrap();
                     assert_family(
                         interp,
                         interp.escape_scoped(array),
@@ -568,16 +565,16 @@ fn default_and_custom_prototype_holes_commit_collecting_getter_exactly_once() {
                             assert_family(interp, receiver, JitElementFamily::DenseTagged);
                             let array = receiver.as_array().unwrap();
                             assert_eq!(
-                                crate::array::get_named_property(
-                                    array,
+                                crate::object::get(
+                                    crate::array::expando_object(array, interp.gc_heap()).unwrap(),
                                     interp.gc_heap(),
                                     "getterCalls"
                                 ),
                                 Some(Value::number_i32(1))
                             );
                             assert_eq!(
-                                crate::array::get_named_property(
-                                    array,
+                                crate::object::get(
+                                    crate::array::expando_object(array, interp.gc_heap()).unwrap(),
                                     interp.gc_heap(),
                                     "getterResult"
                                 ),
@@ -648,10 +645,10 @@ fn restored_indexed_readonly_flags_refresh_guard_after_metadata_rebuild() {
         .expect("indexed flag metadata is capturable");
     assert!(
         snapshot
-            .array_sidecar_flags
+            .array_indexed_records
             .iter()
-            .flatten()
-            .any(|(key, writable, _, _)| key == "0" && !writable)
+            .flat_map(|record| &record.property_flags)
+            .any(|(key, flags)| *key == 0 && !flags.writable())
     );
     let mut restored =
         Interpreter::from_isolate_snapshot(&snapshot, &otter_resource::ResourceAccount::default())
@@ -673,10 +670,10 @@ fn restored_indexed_readonly_flags_refresh_guard_after_metadata_rebuild() {
                     1
                 );
                 assert!(
-                    !crate::array::get_property_flags(
+                    !crate::array::get_index_flags(
                         receiver.as_array().unwrap(),
                         interp.gc_heap(),
-                        "0"
+                        0
                     )
                     .unwrap()
                     .writable()

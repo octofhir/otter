@@ -1,7 +1,7 @@
 //! `[[DefineOwnProperty]]` and integrity levels.
 //!
 //! # Contents
-//! - The value-level define entry and its array-exotic index and named forms.
+//! - The value-level define entry, indexed Array policy and ordinary expandos.
 //! - `SetIntegrityLevel` / `TestIntegrityLevel`.
 //! - Descriptor round-tripping to and from ordinary objects.
 //!
@@ -12,7 +12,7 @@
 //!   rooted across trap argument construction, reentry, and invariant checks.
 //!
 //! # See also
-//! - `super::array_define` owns the shared Array length policy.
+//! - `super::array_define` owns Array descriptors, length and expando policy.
 //! - `super::set_delete` owns assignment and receiver definition.
 
 use super::*;
@@ -706,30 +706,17 @@ impl Interpreter {
             });
         }
         if let Some(arr) = target.as_array() {
-            if let VmPropertyKey::Symbol(sym) = key {
-                return array::define_symbol_property_partial(
-                    &mut { arr },
-                    &mut self.gc_heap,
-                    *sym,
-                    descriptor,
-                )
-                .map_err(VmError::from)
-                .map_err(CommittedValueError::JavaScript);
-            }
-            let Some(k) = key.string_name() else {
-                return Ok(false);
+            return match array::classify_property_key(key) {
+                array::ArrayPropertyKey::Length => {
+                    self.define_array_length_value(stack, context, *target, descriptor)
+                }
+                array::ArrayPropertyKey::Index(index) => self
+                    .define_array_index_property(arr, index, descriptor)
+                    .map_err(CommittedValueError::JavaScript),
+                array::ArrayPropertyKey::Expando => self
+                    .define_array_expando_property(arr, key, descriptor)
+                    .map_err(CommittedValueError::JavaScript),
             };
-            if k == "length" {
-                return self.define_array_length_value(stack, context, *target, descriptor);
-            }
-            if let Some(idx) = object::array_index_property_name(k) {
-                return self
-                    .define_array_index_property(arr, k, idx as usize, descriptor)
-                    .map_err(CommittedValueError::JavaScript);
-            }
-            return self
-                .define_array_named_property(arr, k, descriptor)
-                .map_err(CommittedValueError::JavaScript);
         }
         if let Some(t) = target.as_typed_array(&self.gc_heap) {
             // §10.4.5.3 Integer-Indexed exotic [[DefineOwnProperty]].
@@ -972,323 +959,40 @@ impl Interpreter {
         })
     }
 
-    pub(crate) fn define_array_named_property(
-        &mut self,
-        arr: array::JsArray,
-        key: &str,
-        descriptor: object::PartialPropertyDescriptor,
-    ) -> Result<bool, VmError> {
-        let current = if let Some((getter, setter)) = array::get_accessor(arr, &self.gc_heap, key) {
-            let flags = array::get_property_flags(arr, &self.gc_heap, key)
-                .unwrap_or_else(|| object::PropertyFlags::new(false, true, true));
-            Some(object::PropertyDescriptor {
-                kind: object::DescriptorKind::Accessor { getter, setter },
-                flags,
-            })
-        } else if let Some(value) = array::get_named_property(arr, &self.gc_heap, key) {
-            let flags = array::get_property_flags(arr, &self.gc_heap, key)
-                .unwrap_or_else(object::PropertyFlags::data_default);
-            Some(object::PropertyDescriptor {
-                kind: object::DescriptorKind::Data { value },
-                flags,
-            })
-        } else {
-            None
-        };
-
-        if current.is_none() {
-            if !array::is_extensible(arr, &self.gc_heap) {
-                return Ok(false);
-            }
-            self.store_array_named_descriptor(arr, key, descriptor.complete_for_new_property())?;
-            return Ok(true);
-        }
-
-        let current = current.expect("current descriptor is present");
-        if !current.configurable() {
-            if matches!(descriptor.configurable, Some(true)) {
-                return Ok(false);
-            }
-            if let Some(enumerable) = descriptor.enumerable
-                && enumerable != current.enumerable()
-            {
-                return Ok(false);
-            }
-        }
-
-        if descriptor.is_generic() {
-            let updated = match current.kind.clone() {
-                object::DescriptorKind::Data { value } => object::PropertyDescriptor::data(
-                    value,
-                    current.writable(),
-                    descriptor.enumerable.unwrap_or(current.enumerable()),
-                    descriptor.configurable.unwrap_or(current.configurable()),
-                ),
-                object::DescriptorKind::Accessor { getter, setter } => {
-                    object::PropertyDescriptor::accessor(
-                        getter,
-                        setter,
-                        descriptor.enumerable.unwrap_or(current.enumerable()),
-                        descriptor.configurable.unwrap_or(current.configurable()),
-                    )
-                }
-            };
-            self.store_array_named_descriptor(arr, key, updated)?;
-            return Ok(true);
-        }
-
-        if current.is_data() != descriptor.is_data() {
-            if !current.configurable() {
-                return Ok(false);
-            }
-            let updated = if descriptor.is_data() {
-                object::PropertyDescriptor::data(
-                    descriptor.value.unwrap_or(Value::undefined()),
-                    descriptor.writable.unwrap_or(false),
-                    descriptor.enumerable.unwrap_or(current.enumerable()),
-                    descriptor.configurable.unwrap_or(current.configurable()),
-                )
-            } else {
-                object::PropertyDescriptor::accessor(
-                    if descriptor.get.is_some() {
-                        normalize_accessor_slot(descriptor.get)
-                    } else {
-                        None
-                    },
-                    if descriptor.set.is_some() {
-                        normalize_accessor_slot(descriptor.set)
-                    } else {
-                        None
-                    },
-                    descriptor.enumerable.unwrap_or(current.enumerable()),
-                    descriptor.configurable.unwrap_or(current.configurable()),
-                )
-            };
-            self.store_array_named_descriptor(arr, key, updated)?;
-            return Ok(true);
-        }
-
-        match current.kind.clone() {
-            object::DescriptorKind::Data {
-                value: current_value,
-            } => {
-                if !current.configurable() && !current.writable() {
-                    if matches!(descriptor.writable, Some(true)) {
-                        return Ok(false);
-                    }
-                    if let Some(value) = &descriptor.value
-                        && !abstract_ops::same_value(value, &current_value, &self.gc_heap)
-                    {
-                        return Ok(false);
-                    }
-                }
-                let updated = object::PropertyDescriptor::data(
-                    descriptor.value.unwrap_or(current_value),
-                    descriptor.writable.unwrap_or(current.writable()),
-                    descriptor.enumerable.unwrap_or(current.enumerable()),
-                    descriptor.configurable.unwrap_or(current.configurable()),
-                );
-                self.store_array_named_descriptor(arr, key, updated)?;
-                Ok(true)
-            }
-            object::DescriptorKind::Accessor {
-                getter: current_getter,
-                setter: current_setter,
-            } => {
-                let getter = normalize_accessor_slot(descriptor.get);
-                let setter = normalize_accessor_slot(descriptor.set);
-                if !current.configurable()
-                    && ((descriptor.get.is_some()
-                        && !same_optional_value(&getter, &current_getter, &self.gc_heap))
-                        || (descriptor.set.is_some()
-                            && !same_optional_value(&setter, &current_setter, &self.gc_heap)))
-                {
-                    return Ok(false);
-                }
-                let updated = object::PropertyDescriptor::accessor(
-                    if descriptor.get.is_some() {
-                        getter
-                    } else {
-                        current_getter
-                    },
-                    if descriptor.set.is_some() {
-                        setter
-                    } else {
-                        current_setter
-                    },
-                    descriptor.enumerable.unwrap_or(current.enumerable()),
-                    descriptor.configurable.unwrap_or(current.configurable()),
-                );
-                self.store_array_named_descriptor(arr, key, updated)?;
-                Ok(true)
-            }
-        }
-    }
-
     pub(crate) fn define_array_index_property(
         &mut self,
         arr: array::JsArray,
-        key: &str,
-        idx: usize,
+        idx: u32,
         descriptor: object::PartialPropertyDescriptor,
     ) -> Result<bool, VmError> {
-        let current = if let Some((getter, setter)) = array::get_accessor(arr, &self.gc_heap, key) {
-            let flags = array::get_property_flags(arr, &self.gc_heap, key)
-                .unwrap_or_else(|| object::PropertyFlags::new(false, true, true));
-            Some(object::PropertyDescriptor {
-                kind: object::DescriptorKind::Accessor { getter, setter },
-                flags,
-            })
-        } else if array::has_own_element(arr, &self.gc_heap, idx) {
-            let flags = array::get_property_flags(arr, &self.gc_heap, key)
-                .unwrap_or_else(object::PropertyFlags::data_default);
-            Some(object::PropertyDescriptor {
-                kind: object::DescriptorKind::Data {
-                    value: array::get(arr, &self.gc_heap, idx),
-                },
-                flags,
-            })
-        } else {
-            None
-        };
+        let current = self.array_own_index_descriptor(arr, idx);
 
         let old_len = array::len(arr, &self.gc_heap);
         if current.is_none() {
             if !array::is_extensible(arr, &self.gc_heap)
-                || (idx >= old_len && !array::length_writable(arr, &self.gc_heap))
+                || (idx as usize >= old_len && !array::length_writable(arr, &self.gc_heap))
             {
                 return Ok(false);
             }
             let completed = descriptor.complete_for_new_property();
             // §10.4.2.1 step 3 — the element is defined first; `length`
             // follows from the array the definition left current.
-            let arr = self.store_array_index_descriptor(arr, key, idx, completed)?;
-            if idx >= old_len {
-                array::set_length(arr, &mut self.gc_heap, idx + 1)
+            let arr = self.store_array_index_descriptor(arr, idx, completed)?;
+            if idx as usize >= old_len {
+                array::set_length(arr, &mut self.gc_heap, idx as usize + 1)
                     .map_err(|_| VmError::TypeMismatch)?;
             }
             return Ok(true);
         }
 
         let current = current.expect("current descriptor is present");
-        if !current.configurable() {
-            if matches!(descriptor.configurable, Some(true)) {
-                return Ok(false);
-            }
-            if let Some(enumerable) = descriptor.enumerable
-                && enumerable != current.enumerable()
-            {
-                return Ok(false);
-            }
-        }
-
-        if descriptor.is_generic() {
-            let updated = match current.kind.clone() {
-                object::DescriptorKind::Data { value } => object::PropertyDescriptor::data(
-                    value,
-                    current.writable(),
-                    descriptor.enumerable.unwrap_or(current.enumerable()),
-                    descriptor.configurable.unwrap_or(current.configurable()),
-                ),
-                object::DescriptorKind::Accessor { getter, setter } => {
-                    object::PropertyDescriptor::accessor(
-                        getter,
-                        setter,
-                        descriptor.enumerable.unwrap_or(current.enumerable()),
-                        descriptor.configurable.unwrap_or(current.configurable()),
-                    )
-                }
-            };
-            self.store_array_index_descriptor(arr, key, idx, updated)?;
-            return Ok(true);
-        }
-
-        if current.is_data() != descriptor.is_data() {
-            if !current.configurable() {
-                return Ok(false);
-            }
-            let updated = if descriptor.is_data() {
-                object::PropertyDescriptor::data(
-                    descriptor.value.unwrap_or(Value::undefined()),
-                    descriptor.writable.unwrap_or(false),
-                    descriptor.enumerable.unwrap_or(current.enumerable()),
-                    descriptor.configurable.unwrap_or(current.configurable()),
-                )
-            } else {
-                object::PropertyDescriptor::accessor(
-                    if descriptor.get.is_some() {
-                        normalize_accessor_slot(descriptor.get)
-                    } else {
-                        None
-                    },
-                    if descriptor.set.is_some() {
-                        normalize_accessor_slot(descriptor.set)
-                    } else {
-                        None
-                    },
-                    descriptor.enumerable.unwrap_or(current.enumerable()),
-                    descriptor.configurable.unwrap_or(current.configurable()),
-                )
-            };
-            self.store_array_index_descriptor(arr, key, idx, updated)?;
-            return Ok(true);
-        }
-
-        match current.kind.clone() {
-            object::DescriptorKind::Data {
-                value: current_value,
-            } => {
-                if !current.configurable() && !current.writable() {
-                    if matches!(descriptor.writable, Some(true)) {
-                        return Ok(false);
-                    }
-                    if let Some(value) = &descriptor.value
-                        && !abstract_ops::same_value(value, &current_value, &self.gc_heap)
-                    {
-                        return Ok(false);
-                    }
-                }
-                let updated = object::PropertyDescriptor::data(
-                    descriptor.value.unwrap_or(current_value),
-                    descriptor.writable.unwrap_or(current.writable()),
-                    descriptor.enumerable.unwrap_or(current.enumerable()),
-                    descriptor.configurable.unwrap_or(current.configurable()),
-                );
-                self.store_array_index_descriptor(arr, key, idx, updated)?;
-                Ok(true)
-            }
-            object::DescriptorKind::Accessor {
-                getter: current_getter,
-                setter: current_setter,
-            } => {
-                let getter = normalize_accessor_slot(descriptor.get);
-                let setter = normalize_accessor_slot(descriptor.set);
-                if !current.configurable()
-                    && ((descriptor.get.is_some()
-                        && !same_optional_value(&getter, &current_getter, &self.gc_heap))
-                        || (descriptor.set.is_some()
-                            && !same_optional_value(&setter, &current_setter, &self.gc_heap)))
-                {
-                    return Ok(false);
-                }
-                let updated = object::PropertyDescriptor::accessor(
-                    if descriptor.get.is_some() {
-                        getter
-                    } else {
-                        current_getter
-                    },
-                    if descriptor.set.is_some() {
-                        setter
-                    } else {
-                        current_setter
-                    },
-                    descriptor.enumerable.unwrap_or(current.enumerable()),
-                    descriptor.configurable.unwrap_or(current.configurable()),
-                );
-                self.store_array_index_descriptor(arr, key, idx, updated)?;
-                Ok(true)
-            }
-        }
+        let Some(updated) =
+            object::validate_descriptor_partial(&current, &descriptor, &self.gc_heap)
+        else {
+            return Ok(false);
+        };
+        self.store_array_index_descriptor(arr, idx, updated)?;
+        Ok(true)
     }
 
     /// Install a validated descriptor for array index `idx` and return the
@@ -1297,57 +1001,60 @@ impl Interpreter {
     pub(crate) fn store_array_index_descriptor(
         &mut self,
         arr: array::JsArray,
-        key: &str,
-        idx: usize,
+        idx: u32,
         descriptor: object::PropertyDescriptor,
     ) -> Result<array::JsArray, VmError> {
         self.with_handle_scope(|interp, scope| {
             let root = interp.scoped_value(scope, Value::array(arr));
+            let (first, second) = match &descriptor.kind {
+                object::DescriptorKind::Data { value } => {
+                    (Some(interp.scoped_value(scope, *value)), None)
+                }
+                object::DescriptorKind::Accessor { getter, setter } => (
+                    getter.map(|value| interp.scoped_value(scope, value)),
+                    setter.map(|value| interp.scoped_value(scope, value)),
+                ),
+            };
             let current = |interp: &Interpreter| {
                 interp
                     .escape_scoped(root)
                     .as_array()
                     .ok_or(VmError::InvalidOperand)
             };
-            match descriptor.kind.clone() {
-                object::DescriptorKind::Data { value } => {
-                    array::delete_accessor(current(interp)?, &mut interp.gc_heap, key);
-                    array::define_index_value(current(interp)?, &mut interp.gc_heap, idx, value)
-                        .map_err(|_| VmError::TypeMismatch)?;
+            match descriptor.kind {
+                object::DescriptorKind::Data { .. } => {
+                    let value = interp.escape_scoped(first.expect("data descriptor value"));
+                    array::delete_index_accessor(current(interp)?, &mut interp.gc_heap, idx);
+                    array::define_index_value(
+                        current(interp)?,
+                        &mut interp.gc_heap,
+                        idx as usize,
+                        value,
+                    )
+                    .map_err(|_| VmError::TypeMismatch)?;
                     // An absent entry reads back as a default data element, so
                     // the common `CreateDataProperty` keeps the array free of a
                     // sidecar and on the dense paths generated code proves.
                     if descriptor.flags == object::PropertyFlags::data_default() {
-                        array::clear_property_flags(current(interp)?, &mut interp.gc_heap, key);
+                        array::clear_index_flags(current(interp)?, &mut interp.gc_heap, idx);
                         return current(interp);
                     }
                 }
-                object::DescriptorKind::Accessor { getter, setter } => {
-                    array::set_accessor(current(interp)?, &mut interp.gc_heap, key, getter, setter);
+                object::DescriptorKind::Accessor { .. } => {
+                    let getter = first.map(|value| interp.escape_scoped(value));
+                    let setter = second.map(|value| interp.escape_scoped(value));
+                    array::set_index_accessor(
+                        current(interp)?,
+                        &mut interp.gc_heap,
+                        idx,
+                        getter,
+                        setter,
+                    )?;
                 }
             }
-            array::set_property_flags(current(interp)?, &mut interp.gc_heap, key, descriptor.flags);
+            array::set_index_flags(current(interp)?, &mut interp.gc_heap, idx, descriptor.flags)?;
             current(interp)
         })
-    }
-
-    pub(crate) fn store_array_named_descriptor(
-        &mut self,
-        arr: array::JsArray,
-        key: &str,
-        descriptor: object::PropertyDescriptor,
-    ) -> Result<(), VmError> {
-        match descriptor.kind.clone() {
-            object::DescriptorKind::Data { value } => {
-                array::delete_accessor(arr, &mut self.gc_heap, key);
-                array::define_named_data_property(arr, &mut self.gc_heap, key, value);
-            }
-            object::DescriptorKind::Accessor { getter, setter } => {
-                array::set_accessor(arr, &mut self.gc_heap, key, getter, setter);
-            }
-        }
-        array::set_property_flags(arr, &mut self.gc_heap, key, descriptor.flags);
-        Ok(())
     }
 
     /// §6.2.5.4 FromPropertyDescriptor for a

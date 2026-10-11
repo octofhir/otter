@@ -8,8 +8,9 @@
 //! # Invariants
 //! - Only ordinary own data fields receive result bounds; inherited and
 //!   accessor results keep their existing load proofs.
-//! - Each original source view owns its receiver/location records. An append
-//!   store names the destination shape's defining field, not its old receiver.
+//! - Each source view owns its storage-shape/location records. An Array bag
+//!   supplies the field shape while the source operation retains the Array.
+//!   An append names the destination shape's defining field, not its old receiver.
 //! - Defining shapes and every admitted target enter the same compile roots
 //!   retained when the native generation is installed.
 //! - Missing, unconstrained or unstable historical targets grant no load shape
@@ -57,8 +58,22 @@ impl Interpreter {
         let mut locations = BTreeSet::new();
         for programs in view.property_programs.values() {
             for program in programs {
-                let Some(JitCacheIrOp::GuardShape { object: 0, shape }) = program.ops.first()
-                else {
+                let operand = if matches!(
+                    program.ops.first(),
+                    Some(JitCacheIrOp::LoadArrayExpando {
+                        object: 0,
+                        result: 1,
+                        ..
+                    })
+                ) {
+                    1
+                } else {
+                    0
+                };
+                let Some(shape) = program.ops.iter().find_map(|op| match *op {
+                    JitCacheIrOp::GuardShape { object, shape } if object == operand => Some(shape),
+                    _ => None,
+                }) else {
                     continue;
                 };
                 let destination = program.ops.iter().find_map(|op| match op {
@@ -67,11 +82,11 @@ impl Interpreter {
                 });
                 for op in &program.ops {
                     match op {
-                        JitCacheIrOp::LoadField { object: 0, field } => {
-                            locations.insert((*shape, *field));
+                        JitCacheIrOp::LoadField { object, field } if *object == operand => {
+                            locations.insert((shape, *field));
                         }
-                        JitCacheIrOp::StoreField { object: 0, field } => {
-                            locations.insert((destination.unwrap_or(*shape), *field));
+                        JitCacheIrOp::StoreField { object, field } if *object == operand => {
+                            locations.insert((destination.unwrap_or(shape), *field));
                         }
                         _ => {}
                     }

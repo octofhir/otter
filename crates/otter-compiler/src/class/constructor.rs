@@ -408,7 +408,7 @@ fn emit_field_add_type_error(cx: &mut Compiler, span: (u32, u32)) {
     let error_reg = cx.alloc_scratch();
     let kind_idx = cx.intern_string_constant("TypeError");
     cx.emit(
-        Op::NewBuiltinError,
+        Op::NewError,
         [
             Operand::Register(error_reg),
             Operand::ConstIndex(kind_idx),

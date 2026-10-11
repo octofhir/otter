@@ -4,7 +4,7 @@
 //! - Shared register helpers for template objects, private names, and the
 //!   direct-eval identity probe.
 //! - Packed compiled dispatch for class creation, method definition, dynamic
-//!   functions, direct eval, and full `ToNumber` coercion.
+//!   direct eval, and full `ToNumber` coercion.
 //!
 //! # Invariants
 //! - Interpreter and JIT dispatch call the same VM helpers; no JavaScript
@@ -21,7 +21,6 @@
 
 use crate::native_abi::CommittedValueError;
 use otter_bytecode::{Op, Operand};
-use smallvec::SmallVec;
 
 use crate::{
     ExecutionContext, Interpreter, JsString, Value, VmError, activation_stack::ActivationStack,
@@ -126,16 +125,6 @@ impl Interpreter {
                     Some(arg1 as u16),
                 )
                 .map_err(CommittedValueError::JavaScript)?;
-            }
-            value if value == Op::NewFunction as u8 => {
-                let argc = lane(arg0, 1) as usize;
-                let mut operands: SmallVec<[Operand; 6]> = SmallVec::with_capacity(argc + 2);
-                operands.push(Operand::Register(lane(arg0, 0)));
-                operands.push(Operand::ConstIndex(argc as u32));
-                for index in 0..argc {
-                    operands.push(Operand::Register(lane(arg1, index)));
-                }
-                self.run_new_function_operands(context, stack, operands.as_slice())?;
             }
             value if value == Op::NewPrivateName as u8 => {
                 self.run_new_private_name_reg(

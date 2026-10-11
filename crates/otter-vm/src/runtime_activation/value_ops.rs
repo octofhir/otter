@@ -137,9 +137,7 @@ impl RuntimeCall<'_> {
             .split_first()
             .ok_or(VmError::InvalidOperand)
             .map_err(CommittedValueError::Fatal)?;
-        let (function_id, call_pc) = self
-            .semantic_source()
-            .map_err(CommittedValueError::Fatal)?;
+        let (function_id, call_pc) = self.semantic_source().map_err(CommittedValueError::Fatal)?;
         let context = self
             .context
             .for_function(function_id)
@@ -198,9 +196,7 @@ impl RuntimeCall<'_> {
         let [receiver] = values else {
             return Err(CommittedValueError::Fatal(VmError::InvalidOperand));
         };
-        let (function_id, call_pc) = self
-            .semantic_source()
-            .map_err(CommittedValueError::Fatal)?;
+        let (function_id, call_pc) = self.semantic_source().map_err(CommittedValueError::Fatal)?;
         let context = self
             .context
             .for_function(function_id)
@@ -239,17 +235,6 @@ impl RuntimeCall<'_> {
             name_index,
             argument_count,
         )
-    }
-
-    /// Load one realm builtin error constructor.
-    pub fn load_builtin_error(&mut self, dst: u16, kind_index: u32) -> Result<(), VmError> {
-        let vm = unsafe { &mut *self.vm.as_ptr() };
-        let context = &self.context;
-        let frame = self.frame.as_ptr();
-        // SAFETY: RuntimeCall exclusively owns this validated descriptor.
-        let mut frame = unsafe { crate::ActiveFrameMut::from_ptr(frame) }
-            .map_err(|_| VmError::InvalidOperand)?;
-        vm.jit_runtime_load_builtin_error(context, &mut frame, dst, kind_index)
     }
 
     /// Define one object-literal data property through the current activation.

@@ -4089,7 +4089,7 @@ fn new_collection_map_uses_root_aware_allocation_with_frame_roots() {
 
 #[test]
 fn bytecode_new_error_uses_young_allocation_with_frame_roots() {
-    let module = module_with(
+    let mut module = module_with(
         vec![
             Instruction {
                 pc: 0,
@@ -4099,7 +4099,11 @@ fn bytecode_new_error_uses_young_allocation_with_frame_roots() {
             Instruction {
                 pc: 1,
                 op: Op::NewError,
-                operands: vec![Operand::Register(0), Operand::Register(1)],
+                operands: vec![
+                    Operand::Register(0),
+                    Operand::ConstIndex(0),
+                    Operand::Register(1),
+                ],
             },
             Instruction {
                 pc: 2,
@@ -4109,6 +4113,9 @@ fn bytecode_new_error_uses_young_allocation_with_frame_roots() {
         ],
         2,
     );
+    module.constants.push(Constant::String {
+        utf16: "Error".encode_utf16().collect(),
+    });
     let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
     let before = interp.gc_heap_mut().stats().new_allocated_bytes;
     let context = interp

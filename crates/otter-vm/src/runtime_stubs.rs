@@ -2769,7 +2769,22 @@ fn array_construct_alloc_inner(
     let Some(ctx) = alloc_context_mut(ctx) else {
         return NativeResultPair::miss();
     };
+    let Some(context) = alloc_execution_context(ctx) else {
+        return NativeResultPair::miss();
+    };
     let Some(interp) = alloc_interpreter_mut(ctx) else {
+        return NativeResultPair::miss();
+    };
+    let frame = ctx.current_frame();
+    if frame.is_null() {
+        return NativeResultPair::miss();
+    }
+    // SAFETY: the packet's current frame stays published for this synchronous call.
+    let Ok((function_id, _)) = crate::runtime_activation::semantic_source::frame_semantic_source(
+        interp,
+        context,
+        unsafe { &*frame },
+    ) else {
         return NativeResultPair::miss();
     };
     // SAFETY: `ctx` is the current allocating-stub call packet. Its safepoint
@@ -2790,9 +2805,10 @@ fn array_construct_alloc_inner(
     let _call_roots_guard = interp
         .gc_heap
         .register_extra_roots(otter_gc::ExtraRoots::new(&roots));
-    match interp.array_construct_length_runtime_rooted(length) {
+    match interp.array_construct_length_runtime_rooted(function_id, length) {
         Ok(array) => NativeResultPair::success(array),
-        Err(_) => NativeResultPair::out_of_memory(),
+        Err(crate::VmError::OutOfMemory { .. }) => NativeResultPair::out_of_memory(),
+        Err(_) => NativeResultPair::miss(),
     }
 }
 
@@ -3627,7 +3643,18 @@ mod tests {
             Value::undefined().to_abi_bits(),
             Value::undefined().to_abi_bits(),
         ];
+        let source = crate::ExecutionContext::from_module(
+            crate::test_support::minimal_bytecode_module("array-length-probe.js"),
+            crate::source_registry::SourceRegistry::default(),
+        )
+        .expect("source context");
         let mut ctx = test_alloc_context(&mut interp, &mut slots, &safepoints, 25);
+        // SAFETY: the packet's leaked activation is private to this fixture;
+        // its source context stays live throughout both synchronous probes.
+        unsafe {
+            let activation = (*ctx.thread).runtime_context as *mut crate::jit::VmRuntimeActivation;
+            (*activation).context = &source;
+        }
 
         let pair = ARRAY_CONSTRUCT_ALLOC
             .invoke_raw(&mut ctx, 25, slots[0], slots[1], slots[2])
@@ -3648,6 +3675,60 @@ mod tests {
         assert_eq!(crate::array::len(array, interp.gc_heap()), 8);
         assert!(!crate::array::has_own_element(array, interp.gc_heap(), 0));
         assert!(!crate::array::has_own_element(array, interp.gc_heap(), 7));
+    }
+
+    #[test]
+    fn array_length_probe_uses_source_realm_and_restores_caller_at_all_stress_strides() {
+        for stride in 1..=16 {
+            let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
+            let realm = interp.create_host_realm().expect("source realm");
+            interp.function_realm_ids.insert(0, realm.0);
+            let source = crate::ExecutionContext::from_module(
+                crate::test_support::minimal_bytecode_module("source-array-length-probe.js"),
+                crate::source_registry::SourceRegistry::default(),
+            )
+            .expect("source context");
+            let records = [SafepointRecord::window(25, NO_FRAME_STATE)];
+            let mut slots = [
+                n(8).to_abi_bits(),
+                Value::undefined().to_abi_bits(),
+                Value::undefined().to_abi_bits(),
+            ];
+            let mut packet = test_alloc_context(&mut interp, &mut slots, &records, 25);
+            // SAFETY: the fixture activation is private; source outlives the probe.
+            unsafe {
+                let activation =
+                    (*packet.thread).runtime_context as *mut crate::jit::VmRuntimeActivation;
+                (*activation).context = &source;
+            }
+            interp.gc_heap.set_gc_stress(stride, false);
+            let result = ARRAY_CONSTRUCT_ALLOC
+                .invoke_raw(&mut packet, 25, slots[0], slots[1], slots[2])
+                .expect("typed probe");
+            assert_eq!(
+                probe_status(result),
+                NativeResultStatus::Success,
+                "stride {stride}"
+            );
+            assert_eq!(interp.active_realm_id, 0, "restore the actual caller realm");
+            interp
+                .with_handle_scope(|vm, scope| {
+                    let result = vm.scoped_value(scope, probe_value(result).unwrap());
+                    vm.gc_heap.set_gc_stress(0, false);
+                    vm.with_host_realm(realm, |vm| {
+                        let array = vm.handle_arena.get(result.index()).as_array().unwrap();
+                        assert_eq!(crate::array::len(array, &vm.gc_heap), 8);
+                        assert_eq!(
+                            crate::array::prototype_override(array, &vm.gc_heap),
+                            vm.realm_intrinsics.array_prototype().map(Value::object),
+                            "length result belongs to the published source realm at stride {stride}"
+                        );
+                        Ok(())
+                    })
+                })
+                .expect("source array observation");
+            interp.jit_pop_native_frame();
+        }
     }
 
     #[test]
@@ -3685,7 +3766,18 @@ mod tests {
             Value::undefined().to_abi_bits(),
             Value::undefined().to_abi_bits(),
         ];
+        let source = crate::ExecutionContext::from_module(
+            crate::test_support::minimal_bytecode_module("array-length-probe.js"),
+            crate::source_registry::SourceRegistry::default(),
+        )
+        .expect("source context");
         let mut ctx = test_alloc_context(&mut interp, &mut slots, &safepoints, 27);
+        // SAFETY: the packet's leaked activation is private to this fixture;
+        // its source context stays live throughout both synchronous probes.
+        unsafe {
+            let activation = (*ctx.thread).runtime_context as *mut crate::jit::VmRuntimeActivation;
+            (*activation).context = &source;
+        }
 
         let pair = ARRAY_CONSTRUCT_ALLOC
             .invoke_raw(&mut ctx, 27, slots[0], slots[1], slots[2])

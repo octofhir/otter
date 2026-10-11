@@ -290,10 +290,6 @@ pub(crate) fn runtime_stub_bindings() -> Vec<otter_vm::JitRuntimeStubBinding> {
             jit_define_data_property_stub as *const () as usize,
         ),
         binding(
-            abi::STUB_JIT_LOAD_BUILTIN_ERROR,
-            jit_load_builtin_error_stub as *const () as usize,
-        ),
-        binding(
             abi::STUB_JIT_NEW_OBJECT,
             jit_new_object_stub as *const () as usize,
         ),
@@ -390,10 +386,6 @@ pub(crate) fn runtime_stub_bindings() -> Vec<otter_vm::JitRuntimeStubBinding> {
         binding(
             abi::STUB_JIT_CLASS_OP,
             jit_class_op_stub as *const () as usize,
-        ),
-        binding(
-            abi::STUB_JIT_VARIADIC_OP,
-            jit_variadic_op_stub as *const () as usize,
         ),
         binding(
             abi::STUB_JIT_STATIC_CALL_OP,
@@ -520,49 +512,33 @@ mod tests {
     }
 
     #[test]
-    fn lowering_plan_assigns_typed_array_construct_safepoints() {
+    fn lowering_plan_retains_one_source_record_for_ordinary_intrinsic_calls() {
         let v = view(&[
             (
-                Op::ArrayConstruct,
-                vec![Operand::Register(0), Operand::ConstIndex(0)],
-            ),
-            (
-                Op::ArrayConstruct,
+                Op::Call,
                 vec![
+                    Operand::Register(0),
                     Operand::Register(1),
                     Operand::ConstIndex(1),
                     Operand::Register(2),
                 ],
             ),
             (
-                Op::ArrayConstruct,
+                Op::New,
                 vec![
                     Operand::Register(3),
-                    Operand::ConstIndex(2),
                     Operand::Register(4),
-                    Operand::Register(5),
+                    Operand::ConstIndex(0),
                 ],
             ),
             (Op::ReturnUndefined, vec![]),
         ]);
         let plan = BaselinePlan::build(&v).expect("plan");
-        assert_eq!(plan.array_construct_alloc_safepoints.len(), 2);
-        assert!(
-            plan.array_construct_alloc_safepoints
-                .contains_key(&plan.instructions[0].byte_pc)
-        );
-        assert!(
-            plan.array_construct_alloc_safepoints
-                .contains_key(&plan.instructions[1].byte_pc)
-        );
-        assert!(
-            !plan
-                .array_construct_alloc_safepoints
-                .contains_key(&plan.instructions[2].byte_pc)
-        );
-        for id in plan.array_construct_alloc_safepoints.values() {
-            assert!(plan.safepoint_records.iter().any(|record| record.id == *id));
-        }
+        assert_eq!(plan.safepoint_records.len(), v.safepoints.len());
+        assert!(plan.add_alloc_safepoints.is_empty());
+        assert!(plan.lexical_alloc_safepoints.is_empty());
+        assert_eq!(plan.instructions[0].call_operands().unwrap().callee, 1);
+        assert_eq!(plan.instructions[1].call_operands().unwrap().callee, 4);
     }
 
     #[test]

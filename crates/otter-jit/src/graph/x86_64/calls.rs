@@ -359,6 +359,11 @@ impl Codegen<'_> {
                 abi::ExitReason::TypeMismatch,
                 abi::ExitAction::Recompile,
             ),
+            identity_guard_exit: self.typed_exit(
+                node,
+                abi::ExitReason::IdentityGuard,
+                abi::ExitAction::Recompile,
+            ),
             allocation_miss_exit: self.typed_exit(
                 node,
                 abi::ExitReason::AllocationMiss,

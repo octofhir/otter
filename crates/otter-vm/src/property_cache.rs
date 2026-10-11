@@ -729,7 +729,7 @@ impl crate::Interpreter {
     fn lookup_start_object(&self, receiver: crate::Value) -> Option<JsObject> {
         if let Some(array) = receiver.as_array() {
             return if crate::array::is_ordinary_dense(array, &self.gc_heap) {
-                self.realm_intrinsics.array_prototype()
+                self.default_array_prototype()
             } else {
                 None
             };

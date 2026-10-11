@@ -87,7 +87,7 @@ fn narrowed_operations_emit_no_reference_to_an_omitted_cold_exit() {
     }
     for op in cases {
         let mut ops = Assembler::new().unwrap();
-        let exits = std::array::from_fn::<_, 9, _>(|_| ops.new_dynamic_label());
+        let exits = std::array::from_fn::<_, 10, _>(|_| ops.new_dynamic_label());
         let destination = ops.new_dynamic_label();
         let labels = BTreeMap::from([(0, destination)]);
         let mut relocations = crate::artifact::relocation::RelocationCapture::default();
@@ -108,6 +108,7 @@ fn narrowed_operations_emit_no_reference_to_an_omitted_cold_exit() {
                 labels: &labels,
                 exits: OperationExits {
                     type_mismatch_exit: exits[0],
+                    identity_guard_exit: exits[9],
                     unsupported_exit: exits[1],
                     runtime_transition_exit: exits[2],
                     allocation_miss_exit: exits[3],

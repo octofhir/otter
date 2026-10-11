@@ -18,8 +18,8 @@
 //!   including receivers and getters whose result cannot enter the call cache.
 //! - The typed `Op::Call` / `Op::New` payload owns the bounded target
 //!   population; no interpreter-side `(function_id, pc)` map mirrors it.
-//! - Bytecode, exact leaf and general native-kind observations share one coherent
-//!   target population and one transition epoch. A native kind stores no handle.
+//! - Bytecode, canonical intrinsic, exact leaf and general native observations
+//!   share one target population and transition epoch. Kinds store no handles.
 //! - The first attempt and first resolved target are independent material
 //!   facts. Each advances the feedback epoch once; repeated attempts and hits
 //!   do not. No transition discards installed code: compiled bodies keep
@@ -53,7 +53,7 @@ impl Interpreter {
                 crate::property_ic::PropertyIcKind::Load,
             )
             .is_some_and(|slot| slot.record_attempt());
-        
+
         call_changed || property_changed
     }
 
@@ -101,35 +101,37 @@ impl Interpreter {
             .map(OrdinaryCallTarget::FunctionPrototypeCall)
     }
 
-    /// Stable feedback selected without allocation or user code.
+    /// Stable feedback selected from the actual callable without allocation.
     pub(crate) fn native_call_target(&self, callee: crate::Value) -> Option<OrdinaryCallTarget> {
-        self.native_construct_target(callee)
-            .filter(|target| *target == OrdinaryCallTarget::ArrayConstructor)
-            .or_else(|| {
-                callee.as_native_function().map(|native| {
-                    crate::jit_static_native::jit_static_call_target(native, &self.gc_heap)
-                        .map(|entry| OrdinaryCallTarget::StaticNative(entry.leaf_stub_id))
-                        .unwrap_or(OrdinaryCallTarget::Native)
-                })
+        callee.as_native_function().map(|native| {
+            self.canonical_intrinsic_target(native).unwrap_or_else(|| {
+                crate::jit_static_native::jit_static_call_target(native, &self.gc_heap)
+                    .map(|entry| OrdinaryCallTarget::StaticNative(entry.leaf_stub_id))
+                    .unwrap_or(OrdinaryCallTarget::Native)
             })
+        })
     }
 
-    /// Stable `new` feedback for a native callee: the realm's original
-    /// `%Array%`, or any other native by kind.
+    /// Stable `new` feedback for the actual native callable.
     pub(crate) fn native_construct_target(
         &self,
         callee: crate::Value,
     ) -> Option<OrdinaryCallTarget> {
         callee.as_native_function().map(|native| {
-            if self
-                .realm_intrinsics
-                .array_constructor()
-                .is_some_and(|array| array.raw() == native.raw())
-            {
-                OrdinaryCallTarget::ArrayConstructor
-            } else {
-                OrdinaryCallTarget::Native
-            }
+            self.canonical_intrinsic_target(native)
+                .unwrap_or(OrdinaryCallTarget::Native)
+        })
+    }
+
+    fn canonical_intrinsic_target(
+        &self,
+        native: crate::native_function::NativeFunction,
+    ) -> Option<OrdinaryCallTarget> {
+        crate::IntrinsicCallKind::ALL.into_iter().find_map(|kind| {
+            self.realm_intrinsics
+                .callable(kind)
+                .filter(|canonical| canonical.raw() == native.raw())
+                .map(|_| OrdinaryCallTarget::Intrinsic(kind))
         })
     }
 

@@ -97,22 +97,6 @@ pub(super) extern "C" fn jit_define_data_property_stub(
     park_result(ctx, result)
 }
 
-pub(super) extern "C" fn jit_load_builtin_error_stub(
-    ctx: *mut JitCtx,
-    dst: u64,
-    kind_index: u64,
-) -> u64 {
-    // SAFETY: the live `JitCtx` reentry contract.
-    let ctx = unsafe { &mut *ctx };
-    let result = (|| {
-        ctx.runtime_call()
-            .map_err(CommittedValueError::Fatal)?
-            .load_builtin_error(dst as u16, kind_index as u32)
-            .map_err(CommittedValueError::JavaScript)
-    })();
-    park_result(ctx, result)
-}
-
 pub(super) extern "C" fn jit_define_own_property_stub(
     ctx: *mut JitCtx,
     target: u64,

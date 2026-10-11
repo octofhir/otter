@@ -2,8 +2,7 @@
 //!
 //! # Contents
 //! - Prepared address-stable string-cell leaf loads.
-//! - Native guarded fast paths for string length, array length, and
-//!   `Array.isArray`.
+//! - Native guarded fast paths for string and array length.
 //! - Fixed boxed-value fallback to the VM-owned typed scalar boundary.
 //! - Normal-result commit and rooted JavaScript-throw routing.
 //!
@@ -28,7 +27,7 @@ use super::values::{
     emit_load_symbol_u64, emit_load_u64, emit_store_reg,
 };
 use crate::artifact::relocation::{RelocationCapture, RelocationTarget};
-use crate::entry::{Unsupported, VALUE_FALSE, VALUE_TRUE, VALUE_UNDEFINED};
+use crate::entry::{Unsupported, VALUE_UNDEFINED};
 
 /// Load one eagerly prepared string or BigInt literal through its traced cell.
 pub(super) fn emit_literal(
@@ -138,32 +137,6 @@ fn emit_array_length_fast(
     Ok(())
 }
 
-fn emit_is_array_fast(
-    ops: &mut Assembler,
-    view: &JitCompileSnapshot,
-    dst: u16,
-    src: u16,
-    slow: DynamicLabel,
-    done: DynamicLabel,
-) -> Result<(), Unsupported> {
-    let primitive = ops.new_dynamic_label();
-    emit_cell_header(ops, src, primitive)?;
-    let array_tag = u32::from(view.array_layout.type_tag);
-    dynasm!(ops
-        ; .arch aarch64
-        ; ldrb w14, [x13]
-        ; cmp w14, array_tag
-        ; b.ne =>slow
-    );
-    emit_load_u64(ops, 9, VALUE_TRUE);
-    emit_store_reg(ops, 9, dst)?;
-    dynasm!(ops ; .arch aarch64 ; b =>done ; =>primitive);
-    emit_load_u64(ops, 9, VALUE_FALSE);
-    emit_store_reg(ops, 9, dst)?;
-    dynasm!(ops ; .arch aarch64 ; b =>done);
-    Ok(())
-}
-
 #[allow(clippy::too_many_arguments)]
 pub(super) fn emit_scalar_value(
     ops: &mut Assembler,
@@ -197,9 +170,6 @@ pub(super) fn emit_scalar_value(
             }
             (abi::ScalarValueOp::ArrayLength, Some(src)) => {
                 emit_array_length_fast(ops, view, result, src, slow, done)?;
-            }
-            (abi::ScalarValueOp::IsArray, Some(src)) => {
-                emit_is_array_fast(ops, view, result, src, slow, done)?;
             }
             _ => {}
         }

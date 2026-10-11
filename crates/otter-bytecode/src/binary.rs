@@ -574,10 +574,8 @@ impl Writer {
                 break;
             }
             let (op, operand_count, inline, overflow_offset) = instruction.raw_parts();
-            // The wire byte, not the Rust discriminant: the two orders differ,
-            // and reading one as the other lands on a different opcode whose
-            // operands then decode against the wrong schema row.
-            self.u8(op_to_byte(op).unwrap_or(u8::MAX));
+            // The opcode discriminant is also its canonical wire identity.
+            self.u8(op_to_byte(op));
             self.u8(operand_count);
             // Inline operands write only their own words; every other record
             // writes its full raw form.

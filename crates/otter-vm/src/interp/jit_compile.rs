@@ -16,9 +16,9 @@
 //!   for each source body, including spliced bodies.
 //!
 //! # Invariants
-//! Baked pointers (shape ids, global cells, prototype slots) must only
-//! reference permanent or non-moving allocations; anything movable goes
-//! through a runtime stub instead.
+//! Baked addresses name permanent or non-moving allocations. Moving values
+//! are read through address-stable traced cells or a rooted runtime boundary;
+//! their handles are never encoded as executable constants.
 //! Compile requests use the function's defining context, even when a later
 //! script triggered invalidation or reentry. Global proofs and body splices
 //! require the linked source realm to be active; foreign calls retain their
@@ -1207,7 +1207,21 @@ impl Interpreter {
         view.literal_allocations.group_allowed = self.gc_heap.machine_allocation_allowed();
         for (pc, instruction) in view.instructions.iter().enumerate() {
             match instruction.op(&view.code_block) {
-                Op::NewObject => {
+                op if op == Op::NewObject
+                    || (matches!(op, Op::Call | Op::New)
+                        && instruction.const_index(&view.code_block, 2) == Some(0)
+                        && matches!(
+                            view.code_block.call_distribution_at(pc),
+                            Some(feedback::CallSiteDistribution::Mono(
+                                feedback::CallTargetCount {
+                                    target: feedback::OrdinaryCallTarget::Intrinsic(
+                                        jit::IntrinsicCallKind::Object
+                                    ),
+                                    ..
+                                }
+                            ))
+                        )) =>
+                {
                     let plan = self
                         .with_host_realm_id(realm_id, |vm| {
                             let prototype = vm.object_prototype_object_opt();
@@ -2503,16 +2517,22 @@ impl Interpreter {
                             .insert(call_byte_pc, jit::JitNativeCall::Native);
                         continue;
                     }
-                    feedback::OrdinaryCallTarget::ArrayConstructor => {
-                        view.native_calls
-                            .insert(call_byte_pc, jit::JitNativeCall::Native);
-                        if op == Op::New
-                            && let Some(array) = self.realm_intrinsics.array_constructor()
+                    feedback::OrdinaryCallTarget::Intrinsic(kind) => {
+                        let native = if matches!(op, Op::Call | Op::New)
+                            && self.foreign_function_realm(fid).is_none()
+                            && let Some(callable) = self.realm_intrinsics.callable(kind)
                         {
-                            let address =
-                                self.bake_held_identity_cell(Value::native_function(array));
-                            view.array_constructor_sites.insert(call_byte_pc, address);
-                        }
+                            let identity_cell =
+                                self.bake_held_identity_cell(Value::native_function(callable));
+                            jit::JitNativeCall::Intrinsic(jit::JitIntrinsicCallProof {
+                                kind,
+                                identity_cell,
+                                realm_id: self.function_realm_id(fid),
+                            })
+                        } else {
+                            jit::JitNativeCall::Native
+                        };
+                        view.native_calls.insert(call_byte_pc, native);
                         continue;
                     }
                     feedback::OrdinaryCallTarget::Bytecode(callee_fid)

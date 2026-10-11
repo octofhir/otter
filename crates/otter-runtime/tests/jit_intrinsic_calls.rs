@@ -5,11 +5,12 @@
 //!   from loop OSR.
 //!
 //! # Invariants
-//! - The intrinsic-call opcodes complete in machine code through the shared
-//!   reentrant transitions; every result matches the interpreter oracle.
+//! - The compiler resolves actual callable values before their arguments.
+//! - Native calls preserve ordinary completion and source/root ownership after
+//!   loop OSR; every result matches the interpreter oracle.
 //!
 //! # See also
-//! - `otter_vm::Interpreter::jit_runtime_variadic_op`
+//! - `otter_vm::JitNativeCall` owns the source call's selected native entry.
 
 use otter_runtime::{JitSelection, Runtime, SourceInput};
 

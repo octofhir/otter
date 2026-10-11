@@ -275,8 +275,6 @@ pub enum ScalarValueOp {
     LoadNewTarget,
     /// ECMAScript `SameValue`.
     SameValue,
-    /// ECMAScript `IsArray`.
-    IsArray,
     /// Read one dense array's length.
     ArrayLength,
     /// Read one string's UTF-16 code-unit length.
@@ -287,14 +285,10 @@ pub enum ScalarValueOp {
     LoadArgumentsElement,
     /// Capture an explicit throw origin before native frames unwind.
     PrepareThrow,
-    /// Intrinsic Error allocation with observable message coercion.
+    /// Intrinsic error allocation selected by the published kind constant.
     NewError,
-    /// Intrinsic native-error allocation selected by the published constant.
-    NewBuiltinError,
     /// Bind the completed `super()` result as derived-constructor `this`.
     BindThisValue,
-    /// Materialize the site's fresh RegExp literal.
-    LoadRegExp,
 }
 
 impl ScalarValueOp {
@@ -305,16 +299,13 @@ impl ScalarValueOp {
             Op::TypeOf => Ok(Self::TypeOf),
             Op::LoadNewTarget => Ok(Self::LoadNewTarget),
             Op::SameValue => Ok(Self::SameValue),
-            Op::IsArray => Ok(Self::IsArray),
             Op::ArrayLength => Ok(Self::ArrayLength),
             Op::LoadLength => Ok(Self::LoadLength),
             Op::LoadArgumentsLength => Ok(Self::LoadArgumentsLength),
             Op::LoadArgumentsElement => Ok(Self::LoadArgumentsElement),
             Op::Throw => Ok(Self::PrepareThrow),
             Op::NewError => Ok(Self::NewError),
-            Op::NewBuiltinError => Ok(Self::NewBuiltinError),
             Op::BindThisValue => Ok(Self::BindThisValue),
-            Op::LoadRegExp => Ok(Self::LoadRegExp),
             _ => Err(VmError::InvalidOperand),
         }
     }
@@ -488,9 +479,7 @@ impl Interpreter {
             | ScalarValueOp::LoadArgumentsLength
             | ScalarValueOp::LoadArgumentsElement
             | ScalarValueOp::NewError
-            | ScalarValueOp::NewBuiltinError
-            | ScalarValueOp::PrepareThrow
-            | ScalarValueOp::LoadRegExp => {
+            | ScalarValueOp::PrepareThrow => {
                 // This operation consumes activation metadata and is completed
                 // by `RuntimeCall::scalar_values`.
                 return Err(CommittedValueError::Fatal(VmError::InvalidOperand));
@@ -513,20 +502,6 @@ impl Interpreter {
             ScalarValueOp::LoadNewTarget => new_target,
             ScalarValueOp::SameValue => {
                 Value::boolean(abstract_ops::same_value(&value0, &value1, &self.gc_heap))
-            }
-            ScalarValueOp::IsArray => {
-                let mut is_array = abstract_ops::is_array(&self.gc_heap, &value0)
-                    .map_err(CommittedValueError::JavaScript)?;
-                if !is_array
-                    && let Some(object) = value0.as_object()
-                    && self
-                        .current_array_prototype_override()
-                        .and_then(Value::as_object)
-                        == Some(object)
-                {
-                    is_array = true;
-                }
-                Value::boolean(is_array)
             }
             ScalarValueOp::ArrayLength => {
                 let array = value0
@@ -606,21 +581,6 @@ impl RuntimeCall<'_> {
             self.bind_derived_this_value(value0)?;
             return Ok(value0);
         }
-        if operation == ScalarValueOp::LoadRegExp {
-            let index = self
-                .published_const_index(1)
-                .map_err(CommittedValueError::Fatal)?;
-            let function_id = self.function_id();
-            let resolved = self
-                .context
-                .for_function(function_id)
-                .map_err(|_| CommittedValueError::Fatal(VmError::InvalidOperand))?;
-            let vm = unsafe { &mut *self.vm.as_ptr() };
-            vm.record_jit_runtime_stub_class(crate::native_abi::RuntimeStubClass::Alloc);
-            return vm
-                .load_regexp_literal_value(&resolved, function_id, index)
-                .map_err(CommittedValueError::JavaScript);
-        }
         if operation == ScalarValueOp::PrepareThrow {
             // A handler of the throwing function that covers this instruction
             // absorbs the throw inside this activation, which acknowledges the
@@ -633,25 +593,28 @@ impl RuntimeCall<'_> {
             }
             return Ok(value0);
         }
-        if matches!(
-            operation,
-            ScalarValueOp::NewError | ScalarValueOp::NewBuiltinError
-        ) {
-            let context = &self.context;
-            let kind = if operation == ScalarValueOp::NewError {
-                crate::ErrorKind::Error
-            } else {
-                let constant = self
-                    .published_const_index(1)
-                    .map_err(CommittedValueError::Fatal)?;
-                context
-                    .string_constant_str_for_function(self.function_id(), constant)
-                    .and_then(crate::ErrorKind::from_class_name)
-                    .ok_or(CommittedValueError::Fatal(VmError::InvalidOperand))?
-            };
+        if operation == ScalarValueOp::NewError {
+            let (function_id, _) = self.semantic_source().map_err(CommittedValueError::Fatal)?;
+            let context = self
+                .context
+                .for_function(function_id)
+                .map_err(|_| CommittedValueError::Fatal(VmError::InvalidOperand))?;
+            let constant = self
+                .published_const_index(1)
+                .map_err(CommittedValueError::Fatal)?;
+            let kind = context
+                .string_constant_str_for_function(function_id, constant)
+                .and_then(crate::ErrorKind::from_class_name)
+                .ok_or(CommittedValueError::Fatal(VmError::InvalidOperand))?;
             let vm = unsafe { &mut *self.vm.as_ptr() };
             vm.record_jit_runtime_stub_class(crate::native_abi::RuntimeStubClass::Reentrant);
-            return vm.new_error_value(context, unsafe { &mut *self.stack.as_ptr() }, kind, value0);
+            return vm.new_error_value(
+                &context,
+                unsafe { &mut *self.stack.as_ptr() },
+                function_id,
+                kind,
+                value0,
+            );
         }
         let new_target = if operation == ScalarValueOp::LoadNewTarget {
             self.with_frame(|frame| Ok(frame.new_target_value()))

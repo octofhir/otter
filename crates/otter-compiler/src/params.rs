@@ -140,7 +140,7 @@ fn apply_default_syntax_error_into(
     let error_reg = parent.alloc_scratch();
     let kind = parent.intern_string_constant("SyntaxError");
     parent.emit(
-        Op::NewBuiltinError,
+        Op::NewError,
         [
             Operand::Register(error_reg),
             Operand::ConstIndex(kind),

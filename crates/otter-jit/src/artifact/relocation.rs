@@ -148,8 +148,9 @@ pub(crate) enum RelocationTarget {
     FunctionEntryCell {
         function_id: u32,
     },
-    /// Code-owned cache of the last callee one call site proved to be its
-    /// baked target, named by that target and the site's canonical PC.
+    /// Code-owned traced callable word used by an identity proof. It either
+    /// holds the exact target or caches a previously proven target; collection
+    /// updates its live value. The source function and canonical call PC name it.
     CalleeIdentityCell {
         function_id: u32,
         call_pc: u32,
@@ -1958,10 +1959,12 @@ mod tests {
 
     #[test]
     fn runtime_stub_target_uses_stable_abi_names() {
+        // IDs follow the descriptor inventory; names and signatures retain
+        // independent expectations for the artifact's semantic output.
         assert_eq!(
             RelocationTarget::runtime_stub(otter_vm::native_abi::STUB_JIT_BACKEDGE_POLL),
             RelocationTarget::RuntimeStub {
-                id: 1,
+                id: otter_vm::native_abi::STUB_JIT_BACKEDGE_POLL.id,
                 name: "jit_backedge_poll",
                 signature: "poll1",
             }
@@ -1969,7 +1972,7 @@ mod tests {
         assert_eq!(
             RelocationTarget::runtime_stub(otter_vm::native_abi::STUB_COLLECTION_MAP_GET_LEAF),
             RelocationTarget::RuntimeStub {
-                id: 2,
+                id: otter_vm::native_abi::STUB_COLLECTION_MAP_GET_LEAF.id,
                 name: "collection_map_get_leaf",
                 signature: "leafValue2",
             }
@@ -1977,7 +1980,7 @@ mod tests {
         assert_eq!(
             RelocationTarget::runtime_stub(otter_vm::native_abi::STUB_JIT_LOAD_PROPERTY),
             RelocationTarget::RuntimeStub {
-                id: 17,
+                id: otter_vm::native_abi::STUB_JIT_LOAD_PROPERTY.id,
                 name: "jit_load_property_value",
                 signature: "reentrantNamedLoad",
             }
@@ -1985,7 +1988,7 @@ mod tests {
         assert_eq!(
             RelocationTarget::runtime_stub(otter_vm::native_abi::STUB_JIT_STORE_PROPERTY),
             RelocationTarget::RuntimeStub {
-                id: 18,
+                id: otter_vm::native_abi::STUB_JIT_STORE_PROPERTY.id,
                 name: "jit_store_property_value",
                 signature: "reentrantNamedStore",
             }
@@ -1993,7 +1996,7 @@ mod tests {
         assert_eq!(
             RelocationTarget::runtime_stub(otter_vm::native_abi::STUB_JIT_CALL_GENERIC),
             RelocationTarget::RuntimeStub {
-                id: 89,
+                id: otter_vm::native_abi::STUB_JIT_CALL_GENERIC.id,
                 name: "jit_call_generic",
                 signature: "jsCall",
             }
@@ -2001,7 +2004,7 @@ mod tests {
         assert_eq!(
             RelocationTarget::runtime_stub(otter_vm::native_abi::STUB_CREATE_CONTEXT_ALLOC),
             RelocationTarget::RuntimeStub {
-                id: 25,
+                id: otter_vm::native_abi::STUB_CREATE_CONTEXT_ALLOC.id,
                 name: "create_context_alloc",
                 signature: "allocValue3",
             }
@@ -2009,7 +2012,7 @@ mod tests {
         assert_eq!(
             RelocationTarget::runtime_stub(otter_vm::native_abi::STUB_COPY_CONTEXT_ALLOC),
             RelocationTarget::RuntimeStub {
-                id: 27,
+                id: otter_vm::native_abi::STUB_COPY_CONTEXT_ALLOC.id,
                 name: "copy_context_alloc",
                 signature: "allocValue3",
             }

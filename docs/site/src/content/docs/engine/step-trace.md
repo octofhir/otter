@@ -145,8 +145,8 @@ The trace format is wedged to the bytecode wire format by the
 schema tests in `crates/otter-vm/src/inspect.rs`:
 
 - `every_table_op_has_unique_mnemonic` walks
-  [`otter_bytecode::encoding::OP_BYTE_TABLE`][op-byte-table] —
-  the authoritative dense byte table — and verifies every opcode
+  [`otter_bytecode::opcode_schema::OPCODE_SCHEMA`][opcode-schema] —
+  the current operand schema, whose byte tags derive from `Op` — and verifies every opcode
   produces a non-empty unique mnemonic.
 - `op_table_matches_reference_list` cross-checks that the inspect
   module's reference list stays aligned with the wire-format
@@ -156,6 +156,6 @@ schema tests in `crates/otter-vm/src/inspect.rs`:
   change.
 
 [op-mnemonic]: https://docs.rs/otter-bytecode/latest/otter_bytecode/enum.Op.html#method.mnemonic
-[op-byte-table]: https://docs.rs/otter-bytecode/latest/otter_bytecode/encoding/constant.OP_BYTE_TABLE.html
+[opcode-schema]: https://docs.rs/otter-bytecode/latest/otter_bytecode/opcode_schema/constant.OPCODE_SCHEMA.html
 [step-tracer]: https://docs.rs/otter-vm/latest/otter_vm/inspect/trait.StepTracer.html
 [writer-tracer]: https://docs.rs/otter-vm/latest/otter_vm/inspect/struct.WriterTracer.html

@@ -37,8 +37,8 @@
 //!   records.
 //! - Mnemonics are `SCREAMING_SNAKE_CASE` and match the strings the
 //!   disassembler emits.
-//! - Opcode byte assignments have one source in [`opcode_schema`]; encoding
-//!   retains a generated compatibility view of the unchanged wire format.
+//! - [`Op`] discriminants own opcode bytes; [`opcode_schema`] rows, encoded
+//!   wordcode and compiled call operands use the same current identity.
 //! - Bindings live in registers or in context slots. A context slot is named
 //!   by a register holding a context plus a [`ContextCoord`] hop count and
 //!   slot; no instruction reads a register it does not name as an operand.
@@ -78,7 +78,7 @@ pub use wordcode::{
 
 use serde::{Deserialize, Serialize};
 
-/// The canonical engine opcode set.
+/// The canonical engine opcode set; each discriminant is its current wire tag.
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -118,16 +118,6 @@ pub enum Op {
     /// load time; subsequent loads of the same constant share the
     /// compiled engine via the constant pool slot.
     LoadRegExp,
-    /// Enqueue a microtask: `queueMicrotask(callee, args...)`.
-    /// Operands: `callee_reg, argc, args...`. There is no
-    /// destination register — the global returns `undefined`
-    /// synchronously and the caller writes that itself with
-    /// [`Op::LoadUndefined`] when needed.
-    ///
-    /// The runtime stores `(callee, this=undefined, args)` on the
-    /// per-interpreter microtask queue and drains it after the
-    /// currently-running script completes (success or error).
-    QueueMicrotask,
     /// `r<dst> = new Promise(executor)`. Operands: `dst,
     /// executor_reg, scratch_dst`.
     ///
@@ -416,13 +406,10 @@ pub enum Op {
     /// bottom of the call stack surfaces through the public API as
     /// `OtterError::Runtime` with `code = "UNCAUGHT"`.
     Throw,
-    /// `r<dst> = new Error(r<msg>)`. Operands:
-    /// `Register(dst), Register(msg)`. Materialises a foundation
-    /// `Error` object with `name = "Error"` and `message = msg`,
-    /// where `msg` is coerced to its display string when not
-    /// already a `String`. Used by both `new Error(x)` and
-    /// `Error(x)` lowering — the foundation makes no observable
-    /// distinction yet (subclassing arrives with task 26).
+    /// Create the intrinsic error selected by a kind string constant. Operands:
+    /// `Register(dst), ConstIndex(kind), Register(message)`. Implicit language
+    /// failures use the source realm's canonical prototype and message coercion,
+    /// independently of mutable global constructor bindings.
     NewError,
     /// Park a generator after call-time parameter/body-instantiation
     /// prologue. No operands.
@@ -566,12 +553,6 @@ pub enum Op {
     /// constructor callable, instance-side prototype object, and
     /// static-side object into a single first-class value.
     MakeClass,
-    /// Read a constant or other read-only property off the
-    /// `Math` namespace. Operands:
-    /// `Register(dst), ConstIndex(name)`. Used by the compiler
-    /// when it sees `Math.PI` / `Math.E` / `Math.<known>` outside
-    /// a call expression.
-    MathLoad,
     /// `r<dst> = trailing-args-as-array`. Operand: `Register(dst)`.
     /// Reads the call's overflow argument list (the values past
     /// the declared `param_count`) that the dispatcher stashed on
@@ -714,38 +695,24 @@ pub enum Op {
     /// step 6.a `SameValue(func, %eval%)`.
     IsEvalIntrinsic,
 
-    /// `r<dst> = new Function(arg0, arg1, …, body)`. Operands:
-    /// `Register(dst), ConstIndex(argc), Register(arg0), …`.
-    ///
-    /// Variadic. The runtime stringifies each argument; the leading
-    /// `argc - 1` strings become the function's parameter list and
-    /// the trailing string becomes the body. The result is a
-    /// callable closure-less `Value::Function` (no captures from
-    /// the caller's lexical environment, per §20.2.1.1).
-    ///
-    /// # See also
-    /// - <https://tc39.es/ecma262/#sec-function-p1-p2-pn-body>
-    NewFunction,
-
     /// `r<dst> = globalThis`. Operand: `Register(dst)`. Returns the
-    /// per-Interpreter shared `globalThis` JsObject. The foundation
-    /// surface is intentionally minimal (the global functions are
-    /// reached through dedicated opcodes; the value is mostly used
-    /// for identity comparisons + `globalThis.foo = x` patterns).
+    /// active realm's `globalThis` object, which participates in ordinary
+    /// identity and property operations.
+    /// Global function calls resolve their callable before evaluating arguments.
     ///
     /// # See also
     /// - <https://tc39.es/ecma262/#sec-globalthis>
     LoadGlobalThis,
 
-    /// `r<dst> = globalThis[const<name>]` with §10.2.4.1
-    /// ResolveBinding semantics: throw `ReferenceError` when the
-    /// global has no own property under that name. Operands:
+    /// `r<dst> = GetValue(ResolveBinding(const<name>))`.
+    /// Throw `ReferenceError` when the
+    /// global binding is unresolvable. Operands:
     /// `Register(dst), ConstIndex(name)`.
     ///
     /// The compiler emits this for free-identifier reads that did
-    /// not resolve to a local / context slot / module import / known
-    /// intrinsic. Strict-mode behaviour (every test262 test runs
-    /// strict) is the only mode the foundation supports.
+    /// not resolve to a local, context slot or module import. Unresolvable
+    /// reads throw in both strict and sloppy code. Intrinsic specialization
+    /// follows the resulting callable identity at its ordinary call site.
     ///
     /// # See also
     /// - <https://tc39.es/ecma262/#sec-resolvebinding>
@@ -754,14 +721,13 @@ pub enum Op {
 
     /// `r<dst> = arguments` — materialise the current frame's
     /// incoming argument list as an arguments object. Operand:
-    /// `Register(dst)`. The dispatcher populates `frame.incoming_args`
-    /// at call entry only when the callee was compiled with
-    /// `needs_arguments = true`, so this opcode is only emitted
-    /// inside such functions. The function metadata decides whether
+    /// `Register(dst)`. The call boundary retains the activation's actual
+    /// arguments. The compiler emits this operation when the implicit object
+    /// must materialize (`needs_arguments = true`). Function metadata decides whether
     /// the object is strict/unmapped or sloppy/simple mapped.
     ///
     /// Spec: <https://tc39.es/ecma262/#sec-arguments-exotic-objects>
-    /// (strict functions, non-simple parameter lists, and arrows use
+    /// (strict functions and non-simple parameter lists use
     /// the unmapped variant; sloppy simple-parameter functions may
     /// expose mapped indexed properties).
     /// Operands: `Register(dst), Register(ctx)`. `ctx` is the register the
@@ -989,16 +955,6 @@ pub enum Op {
     /// - <https://tc39.es/ecma262/#sec-samevalue>
     /// - <https://tc39.es/ecma262/#sec-object.is>
     SameValue,
-    /// `r<dst> = Array.isArray(r<src>)`. Operands:
-    /// `Register(dst), Register(src)`. Dispatches to ECMA-262
-    /// §7.2.2 `IsArray`. Today the runtime checks the `Value::Array`
-    /// tag directly; once Proxy lands the dispatcher walks the
-    /// proxy-target chain.
-    ///
-    /// # See also
-    /// - <https://tc39.es/ecma262/#sec-isarray>
-    /// - <https://tc39.es/ecma262/#sec-array.isarray>
-    IsArray,
     /// `r<dst> = (r<x> == r<y>)`. Operands:
     /// `Register(dst), Register(x), Register(y)`. Implements
     /// ECMA-262 §7.2.13 `IsLooselyEqual` over operands the
@@ -1015,36 +971,6 @@ pub enum Op {
     /// # See also
     /// - <https://tc39.es/ecma262/#sec-islooselyequal>
     LooseNotEqual,
-    /// `r<dst> = new <Kind>(r<msg>)`. Operands:
-    /// `Register(dst), ConstIndex(kind_const), Register(msg)`.
-    ///
-    /// `kind_const` references a [`Constant::String`] whose value
-    /// is the canonical class name (`"Error"` /
-    /// `"TypeError"` / `"RangeError"` / `"SyntaxError"` /
-    /// `"ReferenceError"` / `"URIError"` / `"EvalError"`). The
-    /// runtime allocates a fresh `JsObject`, links its
-    /// `[[Prototype]]` to the kind's prototype from the
-    /// interpreter's [`ErrorClassRegistry`], and stamps an own
-    /// `message` property when `msg` is not `undefined`.
-    ///
-    /// # See also
-    /// - <https://tc39.es/ecma262/#sec-error-objects>
-    /// - <https://tc39.es/ecma262/#sec-native-error-types-used-in-this-standard>
-    NewBuiltinError,
-    /// `r<dst> = <Kind>` (the constructor object for one of the
-    /// seven canonical error classes). Operands:
-    /// `Register(dst), ConstIndex(kind_const)`.
-    ///
-    /// Used by the compiler when a source identifier names one of
-    /// the canonical classes (e.g. `e instanceof TypeError`). The
-    /// runtime fetches the constructor object from the
-    /// interpreter's [`ErrorClassRegistry`]; the constructor
-    /// carries a `prototype` own property so `Op::Instanceof`
-    /// resolves correctly.
-    ///
-    /// # See also
-    /// - <https://tc39.es/ecma262/#sec-error-objects>
-    LoadBuiltinError,
     /// `r<dst> = String(args...)` / `String.<name>(args...)`.
     /// Operands: `Register(dst), ConstIndex(name), ConstIndex(argc),
     /// Register(arg0), …`.
@@ -1063,32 +989,6 @@ pub enum Op {
     /// # See also
     /// - <https://tc39.es/ecma262/#sec-bigint-constructor>
     BigIntCall,
-
-    /// `r<dst> = Array(args...)` / `r<dst> = new Array(args...)`.
-    /// Operands: `Register(dst), ConstIndex(argc), Register(arg0), …`.
-    ///
-    /// §23.1.1.1 — single-numeric argument reserves a sparse array
-    /// of that length; everything else collects values verbatim.
-    ///
-    /// # See also
-    /// - <https://tc39.es/ecma262/#sec-array>
-    ArrayConstruct,
-    /// `r<dst> = Array.from(args...)`. Operands:
-    /// `Register(dst), ConstIndex(argc), Register(arg0), …`.
-    ///
-    /// §23.1.2.1 Array.from. Variadic.
-    ///
-    /// # See also
-    /// - <https://tc39.es/ecma262/#sec-array.from>
-    ArrayFrom,
-    /// `r<dst> = Array.of(args...)`. Operands:
-    /// `Register(dst), ConstIndex(argc), Register(arg0), …`.
-    ///
-    /// §23.1.2.3 Array.of. Variadic.
-    ///
-    /// # See also
-    /// - <https://tc39.es/ecma262/#sec-array.of>
-    ArrayOf,
     /// `r<dst> = enumerable-string-keys(r<obj>)` — internal `for-in`
     /// snapshot. Operands: `Register(dst), Register(obj)`.
     ///
@@ -1549,7 +1449,6 @@ impl Op {
             Op::LoadInt32 => "LOAD_INT32",
             Op::LoadBigInt => "LOAD_BIGINT",
             Op::LoadRegExp => "LOAD_REGEXP",
-            Op::QueueMicrotask => "QUEUE_MICROTASK",
             Op::PromiseNew => "PROMISE_NEW",
             Op::PromiseCall => "PROMISE_CALL",
             Op::LoadTrue => "LOAD_TRUE",
@@ -1588,7 +1487,6 @@ impl Op {
             Op::StoreGlobalChecked => "STORE_GLOBAL_CHECKED",
             Op::MakeClass => "MAKE_CLASS",
             Op::CollectRest => "COLLECT_REST",
-            Op::MathLoad => "MATH_LOAD",
             Op::Add => "ADD",
             Op::Sub => "SUB",
             Op::Mul => "MUL",
@@ -1667,20 +1565,14 @@ impl Op {
             Op::NewFinalizationRegistry => "NEW_FINALIZATION_REGISTRY",
             Op::TemporalLoad => "TEMPORAL_LOAD",
             Op::SameValue => "SAME_VALUE",
-            Op::IsArray => "IS_ARRAY",
             Op::ToPrimitive => "TO_PRIMITIVE",
             Op::LooseEqual => "LOOSE_EQ",
             Op::LooseNotEqual => "LOOSE_NEQ",
-            Op::NewBuiltinError => "NEW_BUILTIN_ERROR",
-            Op::LoadBuiltinError => "LOAD_BUILTIN_ERROR",
             Op::ForInKeys => "FOR_IN_KEYS",
             Op::CopyDataProperties => "COPY_DATA_PROPERTIES",
             Op::DefineOwnProperty => "DEFINE_OWN_PROPERTY",
             Op::DefineMember => "DEFINE_MEMBER",
             Op::HasNamedProperty => "HAS_NAMED_PROPERTY",
-            Op::ArrayConstruct => "ARRAY_CONSTRUCT",
-            Op::ArrayFrom => "ARRAY_FROM",
-            Op::ArrayOf => "ARRAY_OF",
             Op::BigIntCall => "BIGINT_CALL",
             Op::HasProperty => "HAS_PROPERTY",
             Op::ImportNamespaceDynamic => "IMPORT_NAMESPACE_DYNAMIC",
@@ -1725,7 +1617,6 @@ impl Op {
             Op::LoadArgumentsElement => "LOAD_ARGUMENTS_ELEMENT",
             Op::Eval => "EVAL",
             Op::IsEvalIntrinsic => "IS_EVAL_INTRINSIC",
-            Op::NewFunction => "NEW_FUNCTION",
             Op::ArrayBufferCall => "ARRAY_BUFFER_CALL",
             Op::DataViewCall => "DATA_VIEW_CALL",
             Op::Yield => "YIELD",
@@ -1788,13 +1679,11 @@ impl Op {
             | Op::LoadBigInt
             | Op::LoadRegExp
             | Op::MakeFunction
-            | Op::MathLoad
             | Op::ImportNamespace
             | Op::ImportNamespaceDeferred
             | Op::ModuleNamespaceObject
             | Op::SymbolLoad
             | Op::TemporalLoad
-            | Op::LoadBuiltinError
             | Op::LoadGlobalOrThrow
             | Op::LoadGlobalOrUndefined
             | Op::NewPrivateName => pos == 1,
@@ -1831,7 +1720,7 @@ impl Op {
             // [dst, url_const, name_const]
             Op::LoadImportBinding => pos == 1 || pos == 2,
             // [reg, kind_const, reg]
-            Op::NewCollection | Op::NewBuiltinError => pos == 1,
+            Op::NewCollection | Op::NewError => pos == 1,
             Op::SetFunctionName => pos == 2,
             // [reg, name_const, src_reg, scratch_dst]
             Op::StoreProperty | Op::StorePropertyStrict => pos == 1,

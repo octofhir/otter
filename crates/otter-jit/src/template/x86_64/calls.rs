@@ -265,7 +265,7 @@ pub(super) fn emit_call(
             matches!(
                 view.native_calls
                     .get(&view.instructions[call_pc as usize].byte_pc),
-                Some(otter_vm::JitNativeCall::Native)
+                Some(otter_vm::JitNativeCall::Native | otter_vm::JitNativeCall::Intrinsic(_))
             )
             .then_some((None, CallTarget::Native)),
         )
@@ -351,7 +351,7 @@ pub(super) fn emit_tail_call(
             matches!(
                 view.native_calls
                     .get(&view.instructions[call_pc as usize].byte_pc),
-                Some(otter_vm::JitNativeCall::Native)
+                Some(otter_vm::JitNativeCall::Native | otter_vm::JitNativeCall::Intrinsic(_))
             )
             .then_some((None, CallTarget::Native)),
         )

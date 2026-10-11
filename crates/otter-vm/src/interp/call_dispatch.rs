@@ -14,6 +14,8 @@
 //! A completed Fatal pair propagates without another Error allocation. Raw
 //! prepublication StackOverflow is normalized once by the published interpreter
 //! caller, because admission failed before the child had an execution extent.
+//! Restored parents retain their call PC and resume flag until their queued
+//! child completes; an entry's placeholder completion cannot advance them.
 //!
 //! # See also
 //! - [`super::dispatch`] for bytecode execution.
@@ -175,7 +177,8 @@ fn interpreter_turn(ctx: *mut JitCtx, entering: bool) -> NativeResultPair {
     // A call this activation staged has completed. The activation stands
     // at the staging instruction; a call instruction moves past it on a
     // normal completion. Only a frame waiting on its call carries the bit.
-    let advance_on_resume = !tier_completion && {
+    let awaiting_child = stack.has_prepared_call();
+    let advance_on_resume = !awaiting_child && !tier_completion && {
         let header = unsafe { &mut (*frame).header };
         let staged_past = header
             .flags
@@ -185,7 +188,11 @@ fn interpreter_turn(ctx: *mut JitCtx, entering: bool) -> NativeResultPair {
             .without(crate::native_abi::NativeFrameFlags::ADVANCE_ON_RESUME);
         staged_past
     };
-    let resume_error = if tier_completion {
+    let resume_error = if awaiting_child {
+        // Inline reconstruction queues the child before entering its waiting
+        // parent. This entry's initial completion carries no child result.
+        None
+    } else if tier_completion {
         match vm.complete_compiled_entry(stack, context, floor, completion) {
             Ok(Some(value)) => return NativeResultPair::success(value),
             Ok(None) => None,
@@ -385,3 +392,7 @@ impl Interpreter {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "call_dispatch_tests.rs"]
+mod tests;

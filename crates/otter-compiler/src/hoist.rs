@@ -13,6 +13,8 @@
 //!   its descriptor kind when `CreateContext` allocates the scope.
 //! - Declarations land in the innermost scope, which is the scope being
 //!   instantiated.
+//! - Cross-clause switch bindings use hole-bearing context slots; private
+//!   clause bindings retain register storage when nothing else observes them.
 //!
 //! # See also
 //! - `entry` and `statements`
@@ -349,19 +351,26 @@ pub(crate) fn lexical_kind(is_const: bool) -> otter_bytecode::SlotKind {
 /// to the block binding instead of an outer same-named one. Only a
 /// same-scope binding suppresses the declaration. A captured name takes a
 /// slot of the block's context, which every entry into the block creates
-/// afresh — the per-entry binding a loop body's closures need.
+/// afresh. A checked name takes the same storage so branch entry cannot turn
+/// an uninitialized lexical binding into an ordinary register value.
 pub(crate) fn pre_declare_block_lexical_bindings(
     cx: &mut Compiler,
     names: &[(String, bool)],
     captured_names: &std::collections::HashSet<String>,
+    checked_names: &std::collections::HashSet<String>,
     span: (u32, u32),
 ) -> Result<(), CompileError> {
     for (name, is_const) in names {
         if cx.lookup_in_current_scope(name).is_some() {
             continue;
         }
-        let captured = captured_names.contains(name) || cx.captured_names.contains(name.as_str());
-        cx.declare_binding_with_capture(name, lexical_kind(*is_const), span, captured)?;
+        if checked_names.contains(name) {
+            cx.declare_forced_slot(name, lexical_kind(*is_const), span)?;
+        } else {
+            let captured =
+                captured_names.contains(name) || cx.captured_names.contains(name.as_str());
+            cx.declare_binding_with_capture(name, lexical_kind(*is_const), span, captured)?;
+        }
     }
     Ok(())
 }
@@ -394,7 +403,7 @@ pub(crate) fn compile_block_statements(
     if nested_eval {
         block_captured.extend(block_lex.iter().map(|(name, _)| name.clone()));
     }
-    pre_declare_block_lexical_bindings(cx, &block_lex, &block_captured, span)?;
+    pre_declare_block_lexical_bindings(cx, &block_lex, &block_captured, &HashSet::new(), span)?;
     let saved_hoisted = cx.hoisted_function_names.clone();
     let result = (|| {
         hoist_function_declarations(cx, stmts)?;

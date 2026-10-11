@@ -18,6 +18,7 @@
 //! - Strict functions and modules still reject `with`.
 //! - A direct eval inside a `with` body sees the object through its caller
 //!   chain's `With` scope and rebuilds the same probe order.
+//! - Callable objects participate in @@unscopables; null and primitives do not.
 //!
 //! # See also
 //! - `expr::identifier` for identifier reads.
@@ -218,7 +219,28 @@ pub(crate) fn emit_with_binding_probe(
             ],
             span,
         );
+        let object_unscopables = cx.emit_branch_placeholder(Op::JumpIfTrue, Some(is_object), span);
+        let function_type = cx.alloc_scratch();
+        let function_idx = cx.intern_string_constant("function");
+        cx.emit(
+            Op::LoadString,
+            [
+                Operand::Register(function_type),
+                Operand::ConstIndex(function_idx),
+            ],
+            span,
+        );
+        cx.emit(
+            Op::Equal,
+            [
+                Operand::Register(is_object),
+                Operand::Register(unscopables_type),
+                Operand::Register(function_type),
+            ],
+            span,
+        );
         let bind_env = cx.emit_branch_placeholder(Op::JumpIfFalse, Some(is_object), span);
+        cx.patch_branch_to_here(object_unscopables);
         let blocked = cx.alloc_scratch();
         cx.emit_load_property(blocked, unscopables, name, span);
         let next_env_for_blocked = cx.emit_branch_placeholder(Op::JumpIfTrue, Some(blocked), span);

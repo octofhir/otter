@@ -62,6 +62,7 @@ mod exceptions;
 mod forward_call;
 mod functions;
 pub(crate) mod ic_probe;
+mod intrinsic_calls;
 mod iterators;
 mod module_op;
 mod primitive_strings;
@@ -78,7 +79,6 @@ mod transitions;
 mod value_load;
 mod value_packet;
 pub(crate) mod values;
-mod variadic;
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -1342,17 +1342,6 @@ pub(crate) fn emit_operation<'a>(
                 fatal,
             )?;
         }
-        TemplateOp::LoadBuiltinError { dst, constant } => {
-            transitions::emit_load_builtin_error(
-                ops,
-                relocations,
-                transitions,
-                dst,
-                constant,
-                threw,
-                fatal,
-            );
-        }
         TemplateOp::NewObject { dst } => {
             transitions::emit_new_object(
                 ops,
@@ -1926,38 +1915,16 @@ pub(crate) fn emit_operation<'a>(
                 fatal,
             );
         }
-        TemplateOp::ArrayConstruct {
-            dst,
-            length,
-            safepoint,
-        } => {
-            transitions::emit_array_construct_alloc_call(
-                ops,
-                relocations,
-                dst,
-                length,
-                alloc_roots.packet(safepoint),
-                allocation_miss_exit,
-            )?;
-        }
-        TemplateOp::VariadicOp {
-            opcode,
-            prefix,
-            argc,
-            packed_args,
-        } => {
-            variadic::emit_variadic_op(
+        TemplateOp::IntrinsicCall { .. } => {
+            intrinsic_calls::emit_intrinsic_call(
                 ops,
                 relocations,
                 transitions,
-                opcode,
-                prefix,
-                argc,
-                packed_args,
-                bail,
-                threw,
-                fatal,
-            );
+                view,
+                instr,
+                alloc_roots.packet(call_safepoint),
+                exits,
+            )?;
         }
         TemplateOp::StaticCallOp {
             opcode,

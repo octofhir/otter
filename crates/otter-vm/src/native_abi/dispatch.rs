@@ -48,7 +48,7 @@ pub enum ExitReason {
     BoundsGuard = 7,
     /// Interrupt or work-budget polling requested interpreter control.
     Interrupt = 8,
-    /// A pre-effect generated allocation probe missed.
+    /// A pre-effect generated value allocation probe missed.
     AllocationMiss = 9,
     /// The baseline tier reached an operation it deliberately did not emit.
     UnsupportedOperation = 10,
@@ -61,6 +61,8 @@ pub enum ExitReason {
     StabilityChanged = 13,
     /// A defining field's observed value bound widened after compilation.
     FieldTypeChanged = 14,
+    /// A pre-effect constructor receiver allocation probe missed.
+    ReceiverAllocationMiss = 15,
 }
 
 impl ExitReason {
@@ -80,6 +82,7 @@ impl ExitReason {
             12 => Some(Self::InsufficientFeedback),
             13 => Some(Self::StabilityChanged),
             14 => Some(Self::FieldTypeChanged),
+            15 => Some(Self::ReceiverAllocationMiss),
             _ => None,
         }
     }
@@ -493,6 +496,10 @@ mod tests {
             ExitReason::AllocationMiss,
             ExitReason::UnsupportedOperation,
             ExitReason::RuntimeTransition,
+            ExitReason::InsufficientFeedback,
+            ExitReason::StabilityChanged,
+            ExitReason::FieldTypeChanged,
+            ExitReason::ReceiverAllocationMiss,
         ];
         let actions = [
             ExitAction::Resume,
@@ -503,8 +510,18 @@ mod tests {
             for action in actions {
                 let exit = SideExit::new(u32::MAX, reason, action);
                 assert_eq!(SideExit::from_bits(exit.to_bits()), Some(exit));
+                let pair = NativeResultPair::side_exit(exit);
+                assert_eq!(
+                    pair.validate(NativeResultDomain::Compiled),
+                    Some(NativeResultStatus::SideExit)
+                );
+                assert_eq!(pair.side_exit_payload(), Some(exit));
             }
         }
+        assert_eq!(
+            serde_json::to_string(&ExitReason::ReceiverAllocationMiss).unwrap(),
+            "\"receiverAllocationMiss\""
+        );
 
         assert_eq!(SideExit::from_bits(1), None, "reason zero is invalid");
         assert_eq!(

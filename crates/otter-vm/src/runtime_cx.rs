@@ -21,6 +21,7 @@
 //! - Scoped named global reads with lexical, TDZ and observable `Get` semantics.
 //! - `inspection` — nonallocating scalar reads through current scoped values.
 //! - `scoped_completion` — rooted async/throw handoff and fresh error extents.
+//! - Exact Array metadata includes lifetime-branded canonical prototypes.
 //!
 //! # Invariants
 //!
@@ -39,6 +40,10 @@
 //!   [`Local`] before any later allocation can expose a stale raw value.
 //! - Scoped promise settlement records rejection tracking and enqueues every
 //!   reaction before returning to the runtime drain boundary.
+//! - Exact Array length reads inspect only own metadata; indexed reads of a
+//!   branded prototype use ordinary `Get`, including rooted accessor entry.
+//! - Branded Array prototype writes enter canonical source-owned Set/Define;
+//!   heap-only construction does not bypass length and index semantics.
 //!
 //! # See also
 //!
@@ -1053,16 +1058,16 @@ impl<'rt> NativeCtx<'rt> {
 
     /// Apply ECMAScript `IsArray`, including recursive Proxy handling.
     pub fn is_array(&mut self, value: Value) -> Result<bool, NativeError> {
-        crate::abstract_ops::is_array(self.heap(), &value)
+        self.cx
+            .interp
+            .is_array(&value)
             .map_err(|error| native_function::vm_to_native_error(self.cx.interp, error, "IsArray"))
     }
 
-    /// Return the logical length of an Array exotic value.
+    /// Return the logical length of an exact Array or branded Array prototype.
     #[must_use]
     pub fn array_length(&self, value: Value) -> Option<usize> {
-        value
-            .as_array()
-            .map(|array| crate::array::len(array, self.heap()))
+        self.cx.interp.exact_array_length(value)
     }
 
     /// Test whether `value` is an instance of `constructor` using the VM's
@@ -2894,8 +2899,9 @@ impl<'scope, 'rt> NativeScope<'scope, 'rt> {
 
     /// Store a string-keyed property through the rooted object path.
     ///
-    /// Plain objects and arrays keep the direct scoped store and a native
-    /// function its own property bag. Every other receiver kind (RegExp,
+    /// Ordinary objects and Array bodies keep the direct scoped store and a
+    /// native function its own property bag. A branded Array prototype and
+    /// every other receiver kind (RegExp,
     /// functions, collections, Proxies, ...) performs the canonical
     /// `Set(receiver, key, value, true)` under the active execution context.
     pub fn set(
@@ -2905,6 +2911,12 @@ impl<'scope, 'rt> NativeScope<'scope, 'rt> {
         value: Local<'_>,
     ) -> Result<(), NativeError> {
         let receiver = self.raw(object);
+        if receiver
+            .as_object()
+            .is_some_and(|object| self.ctx.cx.interp.is_array_prototype_object(object))
+        {
+            return self.ctx.set_value_property(receiver, key, self.raw(value));
+        }
         if receiver.as_object().is_none()
             && receiver.as_array().is_none()
             && receiver.as_native_function().is_none()
@@ -2942,6 +2954,13 @@ impl<'scope, 'rt> NativeScope<'scope, 'rt> {
         atom: &crate::HostAtom,
         value: Local<'_>,
     ) -> Result<(), NativeError> {
+        if self
+            .raw(object)
+            .as_object()
+            .is_some_and(|object| self.ctx.cx.interp.is_array_prototype_object(object))
+        {
+            return self.set(object, atom.as_str(), value);
+        }
         let result = self
             .ctx
             .cx
@@ -2985,9 +3004,10 @@ impl<'scope, 'rt> NativeScope<'scope, 'rt> {
     /// Define an accessor property with explicit descriptor flags. Pass the
     /// scope's `undefined` for an absent getter or setter.
     ///
-    /// An ordinary object takes the heap-only scoped define. Every other
-    /// receiver kind (arrays, functions, class constructors, Proxies, typed
-    /// arrays) runs the canonical `[[DefineOwnProperty]]` under the active
+    /// An ordinary object takes the heap-only scoped define. Branded Array
+    /// prototypes and every other receiver kind (arrays, functions, class
+    /// constructors, Proxies, typed arrays) run canonical
+    /// `[[DefineOwnProperty]]` under the active
     /// execution context, which roots the target and descriptor itself.
     pub fn define_accessor(
         &mut self,
@@ -2997,9 +3017,18 @@ impl<'scope, 'rt> NativeScope<'scope, 'rt> {
         setter: Local<'_>,
         flags: crate::object::PropertyFlags,
     ) -> Result<(), NativeError> {
-        if self.raw(object).as_object().is_none()
-            && let Some(context) = self.ctx.context_ref().cloned()
+        let canonical_array = self
+            .raw(object)
+            .as_object()
+            .is_some_and(|object| self.ctx.cx.interp.is_array_prototype_object(object));
+        if canonical_array
+            || (self.raw(object).as_object().is_none() && self.ctx.context_ref().is_some())
         {
+            let context = self
+                .ctx
+                .context_ref()
+                .cloned()
+                .ok_or(NativeError::InvalidOperand)?;
             let target = self.raw(object);
             let descriptor = object::PartialPropertyDescriptor {
                 get: Some(self.raw(getter)),
@@ -3034,6 +3063,8 @@ impl<'scope, 'rt> NativeScope<'scope, 'rt> {
     }
 
     /// Define a data property with explicit descriptor flags.
+    /// Branded Array prototypes use canonical Array definition semantics under
+    /// the active source context, including observable length conversion.
     pub fn define(
         &mut self,
         object: Local<'_>,
@@ -3041,6 +3072,41 @@ impl<'scope, 'rt> NativeScope<'scope, 'rt> {
         value: Local<'_>,
         flags: object::PropertyFlags,
     ) -> Result<(), NativeError> {
+        if self
+            .raw(object)
+            .as_object()
+            .is_some_and(|object| self.ctx.cx.interp.is_array_prototype_object(object))
+        {
+            let context = self
+                .ctx
+                .context_ref()
+                .cloned()
+                .ok_or(NativeError::InvalidOperand)?;
+            let target = self.raw(object);
+            let descriptor = object::PartialPropertyDescriptor {
+                value: Some(self.raw(value)),
+                writable: Some(flags.writable()),
+                enumerable: Some(flags.enumerable()),
+                configurable: Some(flags.configurable()),
+                ..Default::default()
+            };
+            let defined = self.with_turn_parts(|interp, stack| {
+                interp
+                    .define_own_property_value(
+                        stack,
+                        &context,
+                        &target,
+                        &crate::VmPropertyKey::String(key),
+                        descriptor,
+                    )
+                    .map_err(|error| error.into_native(interp, "NativeScope::define"))
+            })?;
+            return if defined {
+                Ok(())
+            } else {
+                Err(self.vm_error(VmError::TypeMismatch, "NativeScope::define"))
+            };
+        }
         let result = self
             .ctx
             .cx
@@ -3119,8 +3185,13 @@ impl<'scope, 'rt> NativeScope<'scope, 'rt> {
     }
 
     /// Read an array index, rooting `undefined` for a hole or out-of-range
-    /// index.
+    /// index. Canonical prototypes use ordinary `Get` for their descriptors.
     pub fn index(&mut self, array: Local<'_>, index: usize) -> Result<Local<'scope>, NativeError> {
+        if self.raw(array).as_array().is_none() && self.is_exact_array(array) {
+            // The canonical prototype uses ordinary indexed descriptors;
+            // `get` owns accessor invocation, original this, and moving roots.
+            return self.get(array, &index.to_string());
+        }
         let result = self
             .ctx
             .cx
@@ -3136,6 +3207,13 @@ impl<'scope, 'rt> NativeScope<'scope, 'rt> {
         index: usize,
         value: Local<'_>,
     ) -> Result<(), NativeError> {
+        if self
+            .raw(array)
+            .as_object()
+            .is_some_and(|object| self.ctx.cx.interp.is_array_prototype_object(object))
+        {
+            return self.set(array, &index.to_string(), value);
+        }
         let result = self
             .ctx
             .cx
@@ -3452,10 +3530,18 @@ impl<'scope, 'rt> NativeScope<'scope, 'rt> {
     }
 
     /// Whether a local is an exact Array exotic rather than a Proxy whose
-    /// target happens to be an Array.
+    /// target happens to be an Array. Canonical branded Array prototypes pass
+    /// this test for their full object lifetime.
     #[must_use]
     pub fn is_exact_array(&self, value: Local<'_>) -> bool {
-        self.raw(value).as_array().is_some()
+        let value = self.raw(value);
+        !value.is_proxy()
+            && self
+                .ctx
+                .cx
+                .interp
+                .is_array(&value)
+                .expect("non-Proxy IsArray does not throw")
     }
 
     /// Whether a local is an exact ordinary-object representation.

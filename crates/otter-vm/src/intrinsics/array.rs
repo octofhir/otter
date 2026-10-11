@@ -1,12 +1,21 @@
 //! `%Array%` constructor installer.
 //!
 //! Routes through `couch!`. Static methods come from
-//! `ARRAY_STATIC_METHODS` (also consumed by the `Op::CallMethod`
-//! native dispatch fast path), prototype methods from
+//! `ARRAY_STATIC_METHODS`, prototype methods from
 //! `ARRAY_PROTOTYPE_METHODS`. The constructor body handles the
 //! §23.1.1.1 "single numeric arg = pre-sized sparse array" / "n+
 //! args = collected values" split internally, plus the
 //! `new.target` prototype of a subclass.
+//!
+//! # Contents
+//! - Canonical constructor, static and prototype surface installation.
+//! - Array prototype birth metadata and its length descriptor.
+//! - Rooted constructor arguments and `new.target` prototype lookup.
+//!
+//! # Invariants
+//! - Only this canonical prototype birth assigns the enduring Array brand.
+//! - Constructor values and prototypes stay rooted across allocation and calls.
+//! - Mutable global names never select intrinsic execution semantics.
 //!
 //! # See also
 //! - <https://tc39.es/ecma262/#sec-array-constructor>
@@ -40,11 +49,12 @@ fn install_array_prototype_length(
     let object::DescriptorKind::Data { value } = descriptor.kind else {
         return Err(JsSurfaceError::DefinePropertyFailed("prototype"));
     };
-    let Some(prototype) = value.as_object() else {
+    let Some(mut prototype) = value.as_object() else {
         return Ok(());
     };
+    object::mark_array_prototype(&mut prototype, heap)?;
     let desc = PropertyDescriptor::data(Value::number_i32(0), true, false, false);
-    if !object::define_own_property(prototype, heap, "length", desc)? {
+    if !object::define_own_property_in_place(&mut prototype, heap, "length", desc)? {
         return Err(JsSurfaceError::DefinePropertyFailed("length"));
     }
     Ok(())

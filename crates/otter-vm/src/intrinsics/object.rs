@@ -1,19 +1,15 @@
-//! `%Object%` constructor installer.
+//! Canonical Object constructor, primitive wrappers and prototype installation.
 //!
-//! Routes through `couch!`. Static reflection helpers come from
-//! `OBJECT_SPEC.methods` (also consumed by the `Op::CallMethod`
-//! native dispatch fast path) via `static_method_specs`; prototype
-//! methods come from `OBJECT_PROTOTYPE_METHODS` via the prototype
-//! `method_specs` field. The §B.2.2.1 `__proto__` accessor pair is
-//! pinned via `post_install` (`couch!` accessor rows take static
-//! get/set fn paths, but the __proto__ getter / setter need their
-//! roots wired through `native_static_with_value_roots` to keep the
-//! prototype alive across allocator GCs — same shape as RegExp's
-//! legacy static accessors).
+//! # Contents
+//! - Static constructor and prototype specifications through `couch!`.
+//! - Object call/construct semantics and rooted primitive wrapper allocation.
+//! - Rooted installation of the `__proto__` getter/setter pair.
 //!
 //! # Invariants
 //! - The constructor, global, prototype, getter, and setter occupy canonical
 //!   root-scope slots until the `__proto__` accessor cell is installed.
+//! - Primitive boxing and active-constructor identity use traced realm
+//!   intrinsics, independently of mutable global constructor bindings.
 //!
 //! # See also
 //! - <https://tc39.es/ecma262/#sec-object-constructor>
@@ -144,55 +140,78 @@ fn object_ctor_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Na
     // The wrapped heap primitive is re-read from the rooted value after the
     // wrapper allocation, which can move it.
     if let Some(b) = v.as_boolean() {
-        return wrap_primitive(ctx, "Boolean", v, |obj, heap, _| {
-            crate::object::set_boolean_data(obj, heap, b)
-        });
+        return wrap_primitive(
+            ctx,
+            crate::realm_intrinsics::Intrinsic::BooleanPrototype,
+            v,
+            |obj, heap, _| crate::object::set_boolean_data(obj, heap, b),
+        );
     }
     if let Some(n) = v.as_number() {
-        return wrap_primitive(ctx, "Number", v, |obj, heap, _| {
-            crate::object::set_number_data(obj, heap, n)
-        });
+        return wrap_primitive(
+            ctx,
+            crate::realm_intrinsics::Intrinsic::NumberPrototype,
+            v,
+            |obj, heap, _| crate::object::set_number_data(obj, heap, n),
+        );
     }
     if v.as_string(ctx.heap()).is_some() {
-        return wrap_primitive(ctx, "String", v, |obj, heap, value| {
-            let s = value.as_string(heap).expect("rooted string primitive");
-            crate::object::set_string_data(obj, heap, s)
-        });
+        return wrap_primitive(
+            ctx,
+            crate::realm_intrinsics::Intrinsic::StringPrototype,
+            v,
+            |obj, heap, value| {
+                let s = value.as_string(heap).expect("rooted string primitive");
+                crate::object::set_string_data(obj, heap, s)
+            },
+        );
     }
     if v.as_symbol(ctx.heap()).is_some() {
-        return wrap_primitive(ctx, "Symbol", v, |obj, heap, value| {
-            let sym = value.as_symbol(heap).expect("rooted symbol primitive");
-            crate::object::set_symbol_data(obj, heap, sym)
-        });
+        return wrap_primitive(
+            ctx,
+            crate::realm_intrinsics::Intrinsic::SymbolPrototype,
+            v,
+            |obj, heap, value| {
+                let sym = value.as_symbol(heap).expect("rooted symbol primitive");
+                crate::object::set_symbol_data(obj, heap, sym)
+            },
+        );
     }
     if v.as_big_int().is_some() {
-        return wrap_primitive(ctx, "BigInt", v, |obj, heap, value| {
-            let bigint = value.as_big_int().expect("rooted bigint primitive");
-            crate::object::set_bigint_data(obj, heap, bigint)
-        });
+        return wrap_primitive(
+            ctx,
+            crate::realm_intrinsics::Intrinsic::BigIntPrototype,
+            v,
+            |obj, heap, value| {
+                let bigint = value.as_big_int().expect("rooted bigint primitive");
+                crate::object::set_bigint_data(obj, heap, bigint)
+            },
+        );
     }
     Ok(v)
 }
 
 /// `true` when this constructor call's `new.target` is the active
 /// `Object` function itself (per §20.1.1.1 step 1's "active function
-/// object" check). The comparison goes through `globalThis.Object`,
-/// which is the same `NativeFunction` value `couch!` installed at
-/// bootstrap.
+/// object" check). The active realm retains the canonical callable,
+/// independently of the mutable global Object binding.
 fn new_target_is_self(ctx: &mut NativeCtx<'_>) -> bool {
     let Some(new_target) = ctx.new_target().copied() else {
         return false;
     };
     let interp = ctx.interp_mut();
-    let Some(self_ctor) = crate::object::get(interp.global_this, &interp.gc_heap, "Object") else {
+    let Some(self_ctor) = interp
+        .realm_intrinsics
+        .callable(crate::IntrinsicCallKind::Object)
+    else {
         return false;
     };
-    new_target == self_ctor
+    new_target == Value::native_function(self_ctor)
 }
 
 fn wrap_primitive<F>(
     ctx: &mut NativeCtx<'_>,
-    wrapper_name: &'static str,
+    wrapper_name: crate::realm_intrinsics::Intrinsic,
     value: Value,
     apply_data_slot: F,
 ) -> Result<Value, NativeError>

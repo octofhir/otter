@@ -424,55 +424,6 @@ pub(crate) extern "C" fn jit_module_op_stub(
     )
 }
 
-/// Complete one variadic construction opcode (`ArrayConstruct`, `ArrayFrom`,
-/// `ArrayOf`, `QueueMicrotask`). Returns committed `Success`, pre-effect
-/// `SideExit`, parked `Throw`, or completed `Fatal`.
-pub(crate) extern "C" fn jit_variadic_op_stub(
-    ctx: *mut JitCtx,
-    opcode: u64,
-    prefix: u64,
-    count: u64,
-    packed_args: u64,
-) -> u64 {
-    // SAFETY: the live `JitCtx` reentry contract.
-    let ctx = unsafe { &mut *ctx };
-    let frame_index = match ctx.frame_index() {
-        Ok(index) => index,
-        Err(_) => return NativeResultStatus::SideExit as u64,
-    };
-    let Some(activation) = ctx.checked_activation() else {
-        return NativeResultStatus::SideExit as u64;
-    };
-    let vm = unsafe { &mut *activation.vm_ptr() };
-    let stack = unsafe { &mut *activation.stack_ptr() };
-    // SAFETY: the published frame and activation context are live.
-    let Some(owner) = (unsafe { activation.owner_context((*ctx.native_frame).header.function_id) })
-    else {
-        park_jit_error(ctx, VmError::InvalidOperand);
-        return NativeResultStatus::Throw as u64;
-    };
-    let context = &owner;
-    match vm.jit_runtime_variadic_op(
-        context,
-        stack,
-        frame_index,
-        opcode as u8,
-        prefix,
-        count,
-        packed_args,
-    ) {
-        Ok(()) => NativeResultStatus::Success as u64,
-        Err(CommittedValueError::JavaScript(error)) => {
-            park_jit_error(ctx, error);
-            NativeResultStatus::Throw as u64
-        }
-        Err(CommittedValueError::Fatal(error)) => {
-            park_jit_error(ctx, error);
-            NativeResultStatus::Fatal as u64
-        }
-    }
-}
-
 /// Complete one decoded class-construction operation through the canonical
 /// stack-owned runtime boundary. An absent activation is the only pre-effect
 /// side exit; a started operation either commits once or throws.
@@ -612,10 +563,6 @@ pub(crate) extern "C" fn jit_value_load_op_stub(
     // SAFETY: the live `JitCtx` reentry contract.
     let ctx = unsafe { &mut *ctx };
     let operation = match opcode as u8 {
-        value if value == otter_bytecode::Op::MathLoad as u8 => ValueLoadRuntimeOp::Math {
-            dst: arg0 as u16,
-            name_index: arg1 as u32,
-        },
         value if value == otter_bytecode::Op::SymbolLoad as u8 => ValueLoadRuntimeOp::Symbol {
             dst: arg0 as u16,
             name_index: arg1 as u32,

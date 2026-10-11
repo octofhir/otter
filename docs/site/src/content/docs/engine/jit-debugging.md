@@ -58,6 +58,18 @@ reuse the already published interpreter record and restore its previous root
 words on exit. Both native encoders consume the same admission proof; the
 platform C boundary remains separate from private JavaScript calls.
 
+Ordinary `Call` and `New` instructions resolve the callable and evaluate every
+argument before an intrinsic proof can replace the operation. The proof retains
+the source realm and an address-stable, collector-traced callable identity cell.
+Both generated tiers guard the loaded callable against that live cell before
+allocating an empty Array/Object, constructing a one-length Array, or performing
+an admitted scalar conversion. A guard miss resumes the original call with its
+evaluated callable and arguments; preceding effects are preserved. Empty
+allocation fits use the existing LAB path, while collecting misses publish the
+same source and root records as other allocation operations. Artifacts expose
+the identity-cell relocation and eager reconstruction state. Inlining consumes
+these same operations and proofs under its ordinary bytecode budget.
+
 Own-field Graph operations carry a `FieldLocation` with its storage bank and
 relative index. `LoadOwnField` and `StoreOwnField` keep address resolution inside
 the emitted access: inline fields use a direct receiver-relative instruction;

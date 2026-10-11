@@ -25,6 +25,8 @@ mod deopt;
 mod exceptions;
 mod forward_arguments;
 mod iterators;
+#[cfg(test)]
+mod new_error_tests;
 pub(crate) mod semantic_source;
 mod value_loads;
 mod value_ops;
@@ -159,9 +161,7 @@ impl<'a> RuntimeCall<'a> {
         arg1: u64,
         arg2: u64,
     ) -> Result<(), CommittedValueError> {
-        let frame_index = self
-            .frame_index()
-            .map_err(CommittedValueError::Fatal)?;
+        let frame_index = self.frame_index().map_err(CommittedValueError::Fatal)?;
         let vm = unsafe { &mut *self.vm.as_ptr() };
         let stack = unsafe { &mut *self.stack.as_ptr() };
         let context = (*self.context).clone();
@@ -190,9 +190,7 @@ impl<'a> RuntimeCall<'a> {
         arg1: u64,
         arg2: u64,
     ) -> Result<(), CommittedValueError> {
-        let frame_index = self
-            .frame_index()
-            .map_err(CommittedValueError::Fatal)?;
+        let frame_index = self.frame_index().map_err(CommittedValueError::Fatal)?;
         let vm = unsafe { &mut *self.vm.as_ptr() };
         let stack = unsafe { &mut *self.stack.as_ptr() };
         let context = (*self.context).clone();

@@ -407,7 +407,7 @@ pub(crate) const fn opcode_work_units(op: Op) -> u8 {
         | Op::DeleteProperty
         | Op::GetIterator
         | Op::IteratorNext => 4,
-        Op::Eval | Op::NewFunction => 16,
+        Op::Eval => 16,
         _ => 1,
     }
 }
@@ -457,8 +457,9 @@ mod tests {
 
     #[test]
     fn every_opcode_has_a_nonzero_static_work_charge() {
-        for (op, _) in otter_bytecode::encoding::OP_BYTE_TABLE {
-            assert_ne!(opcode_work_units(*op), 0, "missing work charge for {op:?}");
+        for schema in otter_bytecode::opcode_schema::OPCODE_SCHEMA {
+            let op = schema.op;
+            assert_ne!(opcode_work_units(op), 0, "missing work charge for {op:?}");
         }
     }
 

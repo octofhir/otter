@@ -499,14 +499,6 @@ impl Compiler {
         self.resolve_name(name)
             .map(|resolved| self.location_rank(resolved.location))
     }
-
-    /// `true` when `name` has no static binding and no eval extension or
-    /// `with` object can intercept it, so it reads the global object.
-    pub(crate) fn resolves_to_plain_global(&self, name: &str) -> bool {
-        self.active_with_envs.is_empty()
-            && self.resolve_name(name).is_none()
-            && self.global_lookup().is_none()
-    }
 }
 
 /// Module-scope slot holding the module environment object.

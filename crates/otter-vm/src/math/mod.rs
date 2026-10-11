@@ -4,12 +4,10 @@
 //! builder bootstrap flow, and every call on it — `Math.abs(x)` written
 //! directly, `m.abs(x)` through a variable, or `let abs = Math.abs; abs(-1)` —
 //! is an ordinary call whose site caches the receiver shape, the method slot
-//! and the declared leaf entry. `Op::MathLoad` remains as the compiler's
-//! constant read.
+//! and the declared leaf entry. Constants use ordinary property lookup.
 //!
 //! # Contents
 //! - [`MATH_SPEC`] — static namespace spec used by bootstrap.
-//! - [`load_constant`] — used by `Op::MathLoad`.
 //! - [`call`] — typed numeric dispatch shared by the native wrappers.
 //! - `coercion` — rooted argument conversion across user-defined coercion.
 //! - [`MathError`] — failure modes the dispatcher converts to
@@ -33,9 +31,7 @@ mod coercion;
 
 use coercion::{coerce_all, coerce_math_args};
 
-/// Foundation `Math` constants per ECMA-262 §21.3.1. Each constant
-/// is a static `f64` so the compiler can fold them at intern time
-/// when it wants to skip the runtime hop.
+/// `Math` constants installed by the namespace spec per ECMA-262 §21.3.1.
 ///
 /// # See also
 /// - <https://tc39.es/ecma262/#sec-value-properties-of-the-math-object>
@@ -132,28 +128,7 @@ pub enum MathError {
     },
 }
 
-/// Read a constant or other read-only Math property by name.
-/// Returns `None` for unknown names so the dispatcher can surface
-/// a uniform `UnknownMember` diagnostic.
-#[must_use]
-pub fn load_constant(name: &str) -> Option<Value> {
-    let v = match name {
-        "PI" => PI,
-        "E" => E,
-        "LN2" => LN2,
-        "LN10" => LN10,
-        "LOG2E" => LOG2E,
-        "LOG10E" => LOG10E,
-        "SQRT1_2" => SQRT1_2,
-        "SQRT2" => SQRT2,
-        _ => return None,
-    };
-    Some(Value::number(NumberValue::from_f64(v)))
-}
-
-/// Dispatch a `Math.<method>(args...)` call. Routes via the
-/// typed method id emitted by the compiler — direct match, no
-/// table scan or string compare.
+/// Dispatch the resolved Math native entry by its typed method id.
 pub fn call(
     method: otter_bytecode::method_id::MathMethod,
     args: &[Value],
@@ -807,13 +782,6 @@ mod tests {
 
     fn n(v: i32) -> Value {
         Value::number(NumberValue::Smi(v))
-    }
-
-    #[test]
-    fn constants_resolve() {
-        let pi = load_constant("PI").unwrap();
-        assert!((pi.as_number().unwrap().as_f64() - PI).abs() < 1e-12);
-        assert!(load_constant("nope").is_none());
     }
 
     #[test]

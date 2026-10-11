@@ -280,6 +280,13 @@ impl Interpreter {
     fn plain_iterable(&self, value: Value) -> Option<Iterable> {
         let heap = &self.gc_heap;
         let (kind, own, link, intrinsic) = if let Some(array) = value.as_array() {
+            // Bare arrays belong to the default realm. A foreign caller must
+            // enter the resolved iterator callable's realm through its normal
+            // boundary before creating an iterator or evaluating its protocol.
+            if self.active_realm_id != 0 && crate::array::prototype_override(array, heap).is_none()
+            {
+                return None;
+            }
             let symbol = self.well_known_symbols.get(WellKnown::Iterator);
             (
                 Iterable::Array,
@@ -323,6 +330,10 @@ impl Interpreter {
     /// is proven absent. Generated code tests the cells in place of the
     /// proofs. May allocate the chains' prototype roles once.
     pub(crate) fn array_iteration_cells(&mut self) -> Option<ArrayIterationCells> {
+        // Generated dense-array iteration proves a bare default-realm receiver.
+        if self.active_realm_id != 0 {
+            return None;
+        }
         if !self.iterable_proven(Iterable::Array) {
             return None;
         }

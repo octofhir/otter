@@ -1,17 +1,18 @@
 //! Native JIT tiers for the Otter VM.
 //!
 //! The baseline compiler is a template macro-assembler that
-//! lowers Otter register bytecode directly to native machine code with no
-//! register allocation or deopt. The optimizing tier is the graph tier: an
+//! lowers Otter register bytecode directly to native machine code with fixed
+//! register windows and canonical miss exits. The optimizing tier is the graph tier: an
 //! SSA graph built straight from bytecode and feedback, with calls inlined,
-//! live-interval allocation with planned canonical homes, and AArch64 code
+//! live-interval allocation with planned canonical homes, and AArch64/x86_64 code
 //! generation. The
 //! dynasm-backed [`CompiledCode`] remains the sole W^X executable-memory owner.
 //!
 //! # Contents
 //! - [`CompiledCode`] — a finalized, owned block of W^X executable machine code
 //!   plus its entry offset. The foundational output type every compile produces.
-//! - `graph` — the optimizing compiler (AArch64).
+//! - `graph` — the optimizing compiler (AArch64/x86_64).
+//! - `intrinsic_calls` — shared admission for identity-proven ordinary calls.
 //! - [`optimizing`] — finalized optimizing code objects with function and
 //!   loop-header OSR entries.
 //! - Default-off owned artifact sidecars containing tier input, exact code,
@@ -54,6 +55,7 @@ mod entry;
 mod frame;
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 mod graph;
+mod intrinsic_calls;
 mod measurement;
 pub mod optimizing;
 mod return_sites;

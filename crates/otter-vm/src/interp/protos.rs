@@ -9,6 +9,8 @@
 //! - Moving primitive payloads are re-read from a handle after every wrapper
 //!   allocation; raw string, symbol, and bigint handles never cross a GC point.
 //! - Sloppy receiver boxing preserves the caller's stack/runtime root domain.
+//! - Wrapper prototypes come from traced realm intrinsics; mutable global
+//!   constructor bindings do not participate in primitive boxing.
 //! - Nullish sloppy receivers use their function's actual linked global; a
 //!   disposed source realm fails admission without an ambient substitution.
 //!
@@ -630,27 +632,12 @@ impl Interpreter {
 
 impl Interpreter {
     pub(crate) fn primitive_wrapper_prototype(
-        &mut self,
-        constructor_name: &str,
+        &self,
+        intrinsic: crate::realm_intrinsics::Intrinsic,
     ) -> Result<JsObject, VmError> {
-        let constructor = object::get(self.global_this, &self.gc_heap, constructor_name)
-            .ok_or_else(|| VmError::InvalidOperand)?;
-        let prototype = if let Some(ctor) = constructor.as_object() {
-            object::get(ctor, &self.gc_heap, "prototype")
-        } else if let Some(native) = constructor.as_native_function() {
-            let desc = native
-                .own_property_descriptor(&mut self.gc_heap, "prototype")
-                .map_err(|_| VmError::InvalidOperand)?;
-            desc.and_then(|d| match d.kind {
-                object::DescriptorKind::Data { value } => Some(value),
-                _ => None,
-            })
-        } else {
-            None
-        };
-        prototype
-            .and_then(|v| v.as_object())
-            .ok_or_else(|| VmError::InvalidOperand)
+        self.realm_intrinsics
+            .get(intrinsic)
+            .ok_or(VmError::InvalidOperand)
     }
 
     pub(crate) fn box_sloppy_this_primitive_runtime_rooted(
@@ -659,13 +646,16 @@ impl Interpreter {
         slice_roots: &[&[Value]],
     ) -> Result<Value, VmError> {
         let object = if let Some(value) = this_value.as_boolean() {
-            let proto = self.primitive_wrapper_prototype("Boolean")?;
+            let proto = self.primitive_wrapper_prototype(
+                crate::realm_intrinsics::Intrinsic::BooleanPrototype,
+            )?;
             let mut obj =
                 self.alloc_runtime_rooted_object_with_proto(proto, &[&this_value], slice_roots)?;
             object::set_boolean_data(&mut obj, &mut self.gc_heap, value)?;
             obj
         } else if let Some(value) = this_value.as_number() {
-            let proto = self.primitive_wrapper_prototype("Number")?;
+            let proto = self
+                .primitive_wrapper_prototype(crate::realm_intrinsics::Intrinsic::NumberPrototype)?;
             let mut obj =
                 self.alloc_runtime_rooted_object_with_proto(proto, &[&this_value], slice_roots)?;
             object::set_number_data(&mut obj, &mut self.gc_heap, value)?;
@@ -673,7 +663,9 @@ impl Interpreter {
         } else if this_value.as_string(&self.gc_heap).is_some() {
             self.with_handle_scope(|interp, scope| -> Result<JsObject, VmError> {
                 let rooted = interp.scoped_value(scope, this_value);
-                let proto = interp.primitive_wrapper_prototype("String")?;
+                let proto = interp.primitive_wrapper_prototype(
+                    crate::realm_intrinsics::Intrinsic::StringPrototype,
+                )?;
                 let mut obj =
                     interp.alloc_runtime_rooted_object_with_proto(proto, &[], slice_roots)?;
                 let value = interp
@@ -686,7 +678,9 @@ impl Interpreter {
         } else if this_value.as_symbol(&self.gc_heap).is_some() {
             self.with_handle_scope(|interp, scope| -> Result<JsObject, VmError> {
                 let rooted = interp.scoped_value(scope, this_value);
-                let proto = interp.primitive_wrapper_prototype("Symbol")?;
+                let proto = interp.primitive_wrapper_prototype(
+                    crate::realm_intrinsics::Intrinsic::SymbolPrototype,
+                )?;
                 let mut obj =
                     interp.alloc_runtime_rooted_object_with_proto(proto, &[], slice_roots)?;
                 let value = interp
@@ -699,7 +693,9 @@ impl Interpreter {
         } else if this_value.as_big_int().is_some() {
             self.with_handle_scope(|interp, scope| -> Result<JsObject, VmError> {
                 let rooted = interp.scoped_value(scope, this_value);
-                let proto = interp.primitive_wrapper_prototype("BigInt")?;
+                let proto = interp.primitive_wrapper_prototype(
+                    crate::realm_intrinsics::Intrinsic::BigIntPrototype,
+                )?;
                 let mut obj =
                     interp.alloc_runtime_rooted_object_with_proto(proto, &[], slice_roots)?;
                 let value = interp
@@ -722,7 +718,9 @@ impl Interpreter {
         slice_roots: &[&[Value]],
     ) -> Result<Value, VmError> {
         let object = if let Some(value) = this_value.as_boolean() {
-            let proto = self.primitive_wrapper_prototype("Boolean")?;
+            let proto = self.primitive_wrapper_prototype(
+                crate::realm_intrinsics::Intrinsic::BooleanPrototype,
+            )?;
             let mut obj = self.alloc_stack_rooted_object_with_proto(
                 stack,
                 proto,
@@ -732,7 +730,8 @@ impl Interpreter {
             object::set_boolean_data(&mut obj, &mut self.gc_heap, value)?;
             obj
         } else if let Some(value) = this_value.as_number() {
-            let proto = self.primitive_wrapper_prototype("Number")?;
+            let proto = self
+                .primitive_wrapper_prototype(crate::realm_intrinsics::Intrinsic::NumberPrototype)?;
             let mut obj = self.alloc_stack_rooted_object_with_proto(
                 stack,
                 proto,
@@ -744,7 +743,9 @@ impl Interpreter {
         } else if this_value.as_string(&self.gc_heap).is_some() {
             self.with_handle_scope(|interp, scope| -> Result<JsObject, VmError> {
                 let rooted = interp.scoped_value(scope, this_value);
-                let proto = interp.primitive_wrapper_prototype("String")?;
+                let proto = interp.primitive_wrapper_prototype(
+                    crate::realm_intrinsics::Intrinsic::StringPrototype,
+                )?;
                 let mut obj =
                     interp.alloc_stack_rooted_object_with_proto(stack, proto, &[], slice_roots)?;
                 let value = interp
@@ -757,7 +758,9 @@ impl Interpreter {
         } else if this_value.as_symbol(&self.gc_heap).is_some() {
             self.with_handle_scope(|interp, scope| -> Result<JsObject, VmError> {
                 let rooted = interp.scoped_value(scope, this_value);
-                let proto = interp.primitive_wrapper_prototype("Symbol")?;
+                let proto = interp.primitive_wrapper_prototype(
+                    crate::realm_intrinsics::Intrinsic::SymbolPrototype,
+                )?;
                 let mut obj =
                     interp.alloc_stack_rooted_object_with_proto(stack, proto, &[], slice_roots)?;
                 let value = interp
@@ -770,7 +773,9 @@ impl Interpreter {
         } else if this_value.as_big_int().is_some() {
             self.with_handle_scope(|interp, scope| -> Result<JsObject, VmError> {
                 let rooted = interp.scoped_value(scope, this_value);
-                let proto = interp.primitive_wrapper_prototype("BigInt")?;
+                let proto = interp.primitive_wrapper_prototype(
+                    crate::realm_intrinsics::Intrinsic::BigIntPrototype,
+                )?;
                 let mut obj =
                     interp.alloc_stack_rooted_object_with_proto(stack, proto, &[], slice_roots)?;
                 let value = interp
@@ -792,17 +797,21 @@ impl Interpreter {
         value: &Value,
     ) -> Result<Option<JsObject>, VmError> {
         let object = if let Some(v) = value.as_boolean() {
-            let proto = self.primitive_wrapper_prototype("Boolean")?;
+            let proto = self.primitive_wrapper_prototype(
+                crate::realm_intrinsics::Intrinsic::BooleanPrototype,
+            )?;
             let mut obj = self.alloc_stack_rooted_object_with_proto(stack, proto, &[value], &[])?;
             object::set_boolean_data(&mut obj, &mut self.gc_heap, v)?;
             obj
         } else if let Some(v) = value.as_number() {
-            let proto = self.primitive_wrapper_prototype("Number")?;
+            let proto = self
+                .primitive_wrapper_prototype(crate::realm_intrinsics::Intrinsic::NumberPrototype)?;
             let mut obj = self.alloc_stack_rooted_object_with_proto(stack, proto, &[value], &[])?;
             object::set_number_data(&mut obj, &mut self.gc_heap, v)?;
             obj
         } else if value.as_string(&self.gc_heap).is_some() {
-            let proto = self.primitive_wrapper_prototype("String")?;
+            let proto = self
+                .primitive_wrapper_prototype(crate::realm_intrinsics::Intrinsic::StringPrototype)?;
             let mut obj = self.alloc_stack_rooted_object_with_proto(stack, proto, &[value], &[])?;
             // `value` rode the allocation as a root; read the moved string
             // from it.
@@ -812,10 +821,12 @@ impl Interpreter {
             object::set_string_data(&mut obj, &mut self.gc_heap, v)?;
             obj
         } else if value.is_symbol() {
-            let proto = self.primitive_wrapper_prototype("Symbol")?;
+            let proto = self
+                .primitive_wrapper_prototype(crate::realm_intrinsics::Intrinsic::SymbolPrototype)?;
             self.alloc_stack_rooted_object_with_proto(stack, proto, &[value], &[])?
         } else if value.is_big_int() {
-            let proto = self.primitive_wrapper_prototype("BigInt")?;
+            let proto = self
+                .primitive_wrapper_prototype(crate::realm_intrinsics::Intrinsic::BigIntPrototype)?;
             self.alloc_stack_rooted_object_with_proto(stack, proto, &[value], &[])?
         } else {
             return Ok(None);

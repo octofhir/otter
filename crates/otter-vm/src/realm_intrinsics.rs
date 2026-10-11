@@ -1,9 +1,10 @@
 //! Typed per-realm intrinsic slots.
 //!
 //! The original `%Array.prototype.values%` callable is also retained for
-//! arguments creation, which must never consult a mutable prototype property.
+//! arguments creation. The original Array, Boolean, Number, and Object callables
+//! are retained for exact resolved-call feedback and generation-owned proofs.
 //!
-//! Boa-style typed registry: every well-known **prototype** that the
+//! Every well-known prototype that the
 //! dispatch path looks up by name gets a dedicated slot. Bootstrap
 //! runs once and caches the resolved handles; runtime lookups read
 //! the slot directly instead of doing two `object::get()` calls
@@ -15,6 +16,7 @@
 //!   plus a named accessor for each. Native-function-shaped constructors
 //!   that are not on hot object-dispatch paths still resolve through
 //!   `NativeFunction::own_property_descriptor`.
+//! - Actual default-array prototype lookup through the retained realm owner.
 //!
 //! # Invariants
 //! - Slots are populated by reading the `globalThis` graph **after**
@@ -29,6 +31,17 @@
 //!   to the original string-lookup helper.
 //! - Slots are traced as runtime roots so moving GC rewrites the cached
 //!   handles in place.
+//! - Canonical callable roots are populated once; mutable global and prototype
+//!   properties never change their authority. Feedback stores only their kind.
+//! - An array without an explicit prototype override belongs to the default
+//!   realm, including while its owner is parked during a foreign-realm call.
+//! - Canonical Array prototype classification reads an enduring object brand,
+//!   so an escaped prototype keeps its Array identity after realm disposal.
+//!
+//! # See also
+//! - `crate::jit::IntrinsicCallKind` owns the resolved-call kind contract.
+//! - `crate::call_feedback` records actual callable identities.
+//! - `crate::object_internal_ops` observes actual array prototypes.
 
 use crate::gc_trace::{GcRootVisitor, GcTrace};
 use crate::object::{self, JsObject};
@@ -264,6 +277,9 @@ pub(crate) struct RealmIntrinsics {
     slots: [JsObject; Intrinsic::COUNT],
     array_values: crate::native_function::NativeFunction,
     array_constructor: crate::native_function::NativeFunction,
+    boolean_constructor: crate::native_function::NativeFunction,
+    number_constructor: crate::native_function::NativeFunction,
+    object_constructor: crate::native_function::NativeFunction,
     /// Whether this realm's `%RegExp.prototype%` is built-in, while proven.
     pub(crate) regexp_protocol: Option<crate::regexp_fast::RegExpProtocolProof>,
     /// Which iteration reads have built-in answers in this realm, while proven.
@@ -282,6 +298,15 @@ impl Default for RealmIntrinsics {
             slots: [JsObject::null(); Intrinsic::COUNT],
             array_values: crate::native_function::NativeFunction::from_gc(otter_gc::Gc::null()),
             array_constructor: crate::native_function::NativeFunction::from_gc(otter_gc::Gc::null()),
+            boolean_constructor: crate::native_function::NativeFunction::from_gc(
+                otter_gc::Gc::null(),
+            ),
+            number_constructor: crate::native_function::NativeFunction::from_gc(
+                otter_gc::Gc::null(),
+            ),
+            object_constructor: crate::native_function::NativeFunction::from_gc(
+                otter_gc::Gc::null(),
+            ),
             regexp_protocol: None,
             iteration: crate::iteration_protocol::IterationProofs::default(),
             object_conversion: None,
@@ -325,9 +350,25 @@ impl RealmIntrinsics {
             .then(|| crate::Value::native_function(self.array_values))
     }
 
-    /// Original `%Array%` constructor, independent of the mutable global.
-    pub(crate) fn array_constructor(&self) -> Option<crate::native_function::NativeFunction> {
-        (!self.array_constructor.raw().is_null()).then_some(self.array_constructor)
+    fn callable_slot(
+        &self,
+        kind: crate::IntrinsicCallKind,
+    ) -> &crate::native_function::NativeFunction {
+        match kind {
+            crate::IntrinsicCallKind::Array => &self.array_constructor,
+            crate::IntrinsicCallKind::Boolean => &self.boolean_constructor,
+            crate::IntrinsicCallKind::Number => &self.number_constructor,
+            crate::IntrinsicCallKind::Object => &self.object_constructor,
+        }
+    }
+
+    /// Original canonical callable, independent of mutable global properties.
+    pub(crate) fn callable(
+        &self,
+        kind: crate::IntrinsicCallKind,
+    ) -> Option<crate::native_function::NativeFunction> {
+        let callable = *self.callable_slot(kind);
+        (!callable.raw().is_null()).then_some(callable)
     }
 
     /// Read one slot, mapping the null handle to `None`.
@@ -352,11 +393,17 @@ impl RealmIntrinsics {
             .unwrap_or_else(|| {
                 crate::native_function::NativeFunction::from_gc(otter_gc::Gc::null())
             });
-        self.array_constructor = object::get(global, heap, "Array")
-            .and_then(|value| value.as_native_function())
-            .unwrap_or_else(|| {
-                crate::native_function::NativeFunction::from_gc(otter_gc::Gc::null())
-            });
+        let callable = |heap: &mut otter_gc::GcHeap, name| {
+            object::get(global, heap, name)
+                .and_then(|value| value.as_native_function())
+                .unwrap_or_else(|| {
+                    crate::native_function::NativeFunction::from_gc(otter_gc::Gc::null())
+                })
+        };
+        self.array_constructor = callable(heap, "Array");
+        self.boolean_constructor = callable(heap, "Boolean");
+        self.number_constructor = callable(heap, "Number");
+        self.object_constructor = callable(heap, "Object");
     }
 
     /// Visit every slot address, filled or not.
@@ -372,6 +419,9 @@ impl RealmIntrinsics {
         }
         self.array_values.trace_gc_roots(visitor);
         self.array_constructor.trace_gc_roots(visitor);
+        self.boolean_constructor.trace_gc_roots(visitor);
+        self.number_constructor.trace_gc_roots(visitor);
+        self.object_constructor.trace_gc_roots(visitor);
     }
 
     /// Trace cached prototype handles as root slots.
@@ -384,8 +434,11 @@ impl RealmIntrinsics {
         if !self.array_values.raw().is_null() {
             self.array_values.trace_gc_roots(visitor);
         }
-        if !self.array_constructor.raw().is_null() {
-            self.array_constructor.trace_gc_roots(visitor);
+        for kind in crate::IntrinsicCallKind::ALL {
+            let slot = self.callable_slot(kind);
+            if !slot.raw().is_null() {
+                slot.trace_gc_roots(visitor);
+            }
         }
     }
 
@@ -394,7 +447,42 @@ impl RealmIntrinsics {
     pub(crate) fn is_empty(&self) -> bool {
         self.slots.iter().all(|handle| handle.is_null())
             && self.array_values.raw().is_null()
-            && self.array_constructor.raw().is_null()
+            && crate::IntrinsicCallKind::ALL
+                .into_iter()
+                .all(|kind| self.callable(kind).is_none())
+    }
+}
+
+impl crate::Interpreter {
+    /// Default-realm roots remain owned by the active or parked realm state.
+    fn default_realm_intrinsics(&self) -> Option<&RealmIntrinsics> {
+        if self.active_realm_id == 0 {
+            Some(&self.realm_intrinsics)
+        } else {
+            self.extra_realms
+                .iter()
+                .find(|realm| realm.id == 0)
+                .map(|realm| &realm.realm_intrinsics)
+        }
+    }
+
+    /// A bare Array has the default realm's prototype, regardless of the caller.
+    pub(crate) fn default_array_prototype(&self) -> Option<JsObject> {
+        self.default_realm_intrinsics()?.array_prototype()
+    }
+
+    /// Actual Array prototype, including an explicit null or subclass override.
+    pub(crate) fn array_prototype_value(&self, array: crate::array::JsArray) -> crate::Value {
+        crate::array::prototype_override(array, &self.gc_heap).unwrap_or_else(|| {
+            self.default_array_prototype()
+                .map(crate::Value::object)
+                .unwrap_or_else(crate::Value::null)
+        })
+    }
+
+    /// `%Array.prototype%` retains Array identity for the object's lifetime.
+    pub(crate) fn is_array_prototype_object(&self, object: JsObject) -> bool {
+        object::is_array_prototype(object, &self.gc_heap)
     }
 }
 
@@ -443,7 +531,7 @@ mod tests {
         empty.visit_slots(&mut |_| visited += 1);
         assert_eq!(
             visited,
-            Intrinsic::COUNT + 2,
+            Intrinsic::COUNT + 5,
             "a fixed-shape walk must not depend on which slots are filled"
         );
         let mut traced = 0usize;
@@ -525,6 +613,73 @@ mod tests {
             Some(object_slot),
             "new objects must receive the forwarded cached Object.prototype"
         );
+    }
+
+    #[test]
+    fn canonical_callable_roots_are_actual_slots_rewritten_by_moving_collection() {
+        fn native(
+            _ctx: &mut crate::NativeCtx<'_>,
+            _args: &[crate::Value],
+        ) -> Result<crate::Value, crate::NativeError> {
+            Ok(crate::Value::undefined())
+        }
+        let mut vm = Interpreter::new().expect("fixture interpreter bootstrap");
+        vm.gc_heap.set_gc_stress(0, false);
+        vm.with_runtime_roots(|vm| {
+            for (kind, name) in crate::IntrinsicCallKind::ALL.into_iter().zip([
+                "array-root",
+                "boolean-root",
+                "number-root",
+                "object-root",
+            ]) {
+                let callable = crate::native_function::NativeFunction::new_static(
+                    &mut vm.gc_heap,
+                    name,
+                    0,
+                    native,
+                )?;
+                match kind {
+                    crate::IntrinsicCallKind::Array => {
+                        vm.realm_intrinsics.array_constructor = callable
+                    }
+                    crate::IntrinsicCallKind::Boolean => {
+                        vm.realm_intrinsics.boolean_constructor = callable
+                    }
+                    crate::IntrinsicCallKind::Number => {
+                        vm.realm_intrinsics.number_constructor = callable
+                    }
+                    crate::IntrinsicCallKind::Object => {
+                        vm.realm_intrinsics.object_constructor = callable
+                    }
+                }
+            }
+            Ok::<_, crate::VmError>(())
+        })
+        .expect("young canonical root fixtures");
+        let old = crate::IntrinsicCallKind::ALL
+            .map(|kind| vm.realm_intrinsics.callable(kind).unwrap().raw());
+        let mut addresses = Vec::new();
+        vm.realm_intrinsics
+            .trace_roots(&mut |slot| addresses.push(slot));
+        for kind in crate::IntrinsicCallKind::ALL {
+            assert!(addresses.contains(
+                &(vm.realm_intrinsics.callable_slot(kind) as *const _ as *mut otter_gc::raw::RawGc)
+            ));
+        }
+        collect_minor_with_runtime_roots(&mut vm);
+        for (kind, before) in crate::IntrinsicCallKind::ALL.into_iter().zip(old) {
+            let callable = vm.realm_intrinsics.callable(kind).unwrap();
+            assert_ne!(callable.raw(), before, "root {kind:?} really moved");
+            let value = crate::Value::native_function(callable);
+            assert_eq!(
+                vm.native_call_target(value),
+                Some(crate::feedback::OrdinaryCallTarget::Intrinsic(kind))
+            );
+            assert_eq!(
+                vm.native_construct_target(value),
+                Some(crate::feedback::OrdinaryCallTarget::Intrinsic(kind))
+            );
+        }
     }
 
     #[test]

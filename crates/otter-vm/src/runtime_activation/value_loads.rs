@@ -15,20 +15,13 @@
 //! - [`crate::static_load_ops`]
 //! - [`crate::constant_ops`]
 
-use crate::{JsString, Value, VmError, math, symbol_dispatch, symbol_to_vm_error};
+use crate::{JsString, Value, VmError, symbol_dispatch, symbol_to_vm_error};
 
 use super::RuntimeCall;
 
 /// Decoded static value-load operation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ValueLoadRuntimeOp {
-    /// Load one `Math` namespace constant.
-    Math {
-        /// Destination register.
-        dst: u16,
-        /// Context string-constant index naming the property.
-        name_index: u32,
-    },
     /// Load one `Symbol` namespace static value.
     Symbol {
         /// Destination register.
@@ -65,14 +58,6 @@ impl RuntimeCall<'_> {
         // entered it under a sibling chunk's activation.
         let context = &self.context;
         let (dst, value) = match operation {
-            ValueLoadRuntimeOp::Math { dst, name_index } => {
-                let name = context
-                    .string_constant_str(name_index)
-                    .ok_or(VmError::InvalidOperand)?;
-                let value = math::load_constant(name)
-                    .ok_or_else(|| vm.err_unknown_intrinsic(format!("Math.{name}").into()))?;
-                (dst, value)
-            }
             ValueLoadRuntimeOp::Symbol { dst, name_index } => {
                 let name = context
                     .string_constant_str(name_index)

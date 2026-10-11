@@ -1269,7 +1269,7 @@ pub(super) fn emit_tail_call(
     }
     if matches!(
         view.native_calls.get(&byte_pc),
-        Some(otter_vm::JitNativeCall::Native)
+        Some(otter_vm::JitNativeCall::Native | otter_vm::JitNativeCall::Intrinsic(_))
     ) {
         let generic = ops.new_dynamic_label();
         emit_load_reg(ops, 9, callee)?;
@@ -1510,7 +1510,7 @@ pub(super) fn emit_trampoline_call(
     });
     let native = matches!(
         view.native_calls.get(&byte_pc),
-        Some(otter_vm::JitNativeCall::Native)
+        Some(otter_vm::JitNativeCall::Native | otter_vm::JitNativeCall::Intrinsic(_))
     );
     for (plan, target) in known
         .map(|plan| {

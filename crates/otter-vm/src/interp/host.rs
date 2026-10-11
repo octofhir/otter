@@ -423,11 +423,8 @@ impl Interpreter {
         }
     }
 
-    /// Install the parse + compile callback used by `Op::Eval` and
-    /// `Op::NewFunction`. The runtime layer hooks the otter-compiler
-    /// in here at construction time. Pass `None` (the default) to
-    /// disable dynamic code; both opcodes will raise SyntaxError
-    /// when invoked without a hook.
+    /// Install the parse + compile callback used by eval and native dynamic
+    /// Function constructors. Without a hook dynamic code raises SyntaxError.
     pub fn set_eval_hook(&mut self, hook: Option<EvalHook>) {
         self.eval_hook = hook;
     }

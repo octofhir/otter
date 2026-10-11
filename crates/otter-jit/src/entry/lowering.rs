@@ -717,12 +717,8 @@ pub(crate) struct BaselinePlan {
     register_operands: Box<[u16]>,
     pub(crate) safepoint_records: Vec<SafepointRecord>,
     pub(crate) add_alloc_safepoints: BTreeMap<u32, SafepointId>,
-    /// Allocating safepoints owned by the typed zero/one-argument
-    /// `ArrayConstruct` path. The byte PC is the stable join key consumed by
-    /// both template planning and artifact capture.
-    pub(crate) array_construct_alloc_safepoints: BTreeMap<u32, SafepointId>,
     /// Allocating safepoints owned by context and closure construction, keyed
-    /// by byte PC like [`Self::array_construct_alloc_safepoints`].
+    /// by the stable source byte PC.
     pub(crate) lexical_alloc_safepoints: BTreeMap<u32, SafepointId>,
 }
 
@@ -826,10 +822,8 @@ impl BaselinePlan {
                 | Op::LoadString
                 | Op::LoadRegExp
                 | Op::LoadBigInt
-                | Op::MathLoad
                 | Op::SymbolLoad
                 | Op::TemporalLoad
-                | Op::LoadBuiltinError
                 | Op::GetTemplateObject
                 | Op::NewPrivateName
                 | Op::ImportNamespace
@@ -883,12 +877,10 @@ impl BaselinePlan {
                 | Op::ToObject
                 | Op::ToPropertyKey
                 | Op::TypeOf
-                | Op::IsArray
                 | Op::ArrayLength
                 | Op::LoadArgumentsElement
                 | Op::LoadLength
                 | Op::PrivateBrandCheck
-                | Op::NewError
                 | Op::ArrayPush
                 | Op::SpreadAppend
                 | Op::ForInKeys
@@ -1038,12 +1030,7 @@ impl BaselinePlan {
                         arguments,
                     })
                 }
-                Op::NewArray
-                | Op::ArrayConstruct
-                | Op::ArrayFrom
-                | Op::ArrayOf
-                | Op::NewFunction
-                | Op::QueueMicrotask => {
+                Op::NewArray => {
                     let count = const_index(operands, 1)? as usize;
                     let elements = append_register_tail(
                         &mut register_operands,
@@ -1148,7 +1135,7 @@ impl BaselinePlan {
                     object: reg(operands, 1)?,
                     name: const_index(operands, 2)?,
                 }),
-                Op::SetSuperProperty | Op::NewBuiltinError | Op::NewCollection => {
+                Op::SetSuperProperty | Op::NewError | Op::NewCollection => {
                     LoweredOperands::GlobalStore(GlobalStoreOperands {
                         value: reg(operands, 0)?,
                         name: const_index(operands, 1)?,
@@ -1241,18 +1228,12 @@ impl BaselinePlan {
             .map_or(1, |id| id.saturating_add(1))
             .max(1);
         let mut add_alloc_safepoints = BTreeMap::new();
-        let mut array_construct_alloc_safepoints = BTreeMap::new();
         let mut lexical_alloc_safepoints = BTreeMap::new();
         for lowered in &instructions {
             let allocating_site = match lowered.op {
                 Op::Add | Op::AddImm => Some(&mut add_alloc_safepoints),
                 Op::CreateContext | Op::CopyContext | Op::MakeFunction | Op::MakeClosure => {
                     Some(&mut lexical_alloc_safepoints)
-                }
-                Op::ArrayConstruct => {
-                    let operands = lowered.new_array_operands()?;
-                    let arguments = self::slice_range(&register_operands, operands.elements)?;
-                    (arguments.len() <= 1).then_some(&mut array_construct_alloc_safepoints)
                 }
                 _ => None,
             };
@@ -1269,7 +1250,6 @@ impl BaselinePlan {
             register_operands: register_operands.into_boxed_slice(),
             safepoint_records,
             add_alloc_safepoints,
-            array_construct_alloc_safepoints,
             lexical_alloc_safepoints,
         })
     }

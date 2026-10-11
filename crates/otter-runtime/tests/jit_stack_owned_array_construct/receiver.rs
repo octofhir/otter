@@ -3,15 +3,17 @@
 //! # Contents
 //! - Real closure receiver LAB hits and canonical misses in the same native edge.
 //! - Exact current Graph artifacts, complete interpreter traces and lease release.
-//! - Late stress activation around the production ArrayConstruct allocation.
+//! - Late stress activation around the production Array construction allocation.
 //!
 //! # Invariants
 //! - Native observation retains only offsets; it never roots or keeps raw cells.
 //! - A late allocation moves the exact receiver while its child aliases remain
 //!   live in native argument, field and canonical frame homes.
-//! - The collecting allocation is the tested generated callee's ArrayConstruct;
+//! - The collecting allocation is the tested generated callee's Array construction;
 //!   no separate force-GC operation substitutes for it.
 //! - A private host-buffer unit fit cannot satisfy the runtime LAB-hit assertion.
+//! - Cold argument forwarding keeps the callee's actual frame without an
+//!   arguments-object allocation that could promote the receiver before phase 0.
 //!
 //! # See also
 //! - The parent fixture owns exact generation and private entry-cell proofs.
@@ -39,11 +41,13 @@ JSON.stringify([receiverOne.child === receiverProbeChild, receiverOne.marker, re
 const SETUP: &str = r#"
 function receiverFactory() {
   return function ReceiverWithArray(child, observe) {
+    "use strict";
     this.child = child;
     this.marker = child.marker;
     observe(this, child, 0);
     this.array = new Array(1);
     observe(this, child, 1);
+    if (this.array.length < 0) return ReceiverWithArray.apply(this, arguments);
   };
 }
 const ReceiverCtor = receiverFactory();
@@ -103,7 +107,7 @@ fn assert_native_probe(
     assert_eq!(delta.optimized_osr_entries, 0);
     assert_eq!(
         delta.alloc_value_stub_ok, 2,
-        "one ArrayConstruct per native callee"
+        "one Array construction per native callee"
     );
     assert_eq!(delta.alloc_value_stub_miss, 0);
     assert_eq!(delta.alloc_value_stub_out_of_memory, 0);
@@ -231,6 +235,51 @@ fn own_generated_receiver_fits_and_collecting_array_construct_keep_exact_roots()
         "the exact own construct edge must own a baked receiver allocation plan: {ir}"
     );
     let callee = current_graph_entry(&artifacts, &generations[1]);
+    assert_argument_frame_opcode(callee, "CallForwardArguments");
+    let bytecode = std::str::from_utf8(
+        callee
+            .file(JitArtifactFileName::Bytecode)
+            .unwrap()
+            .contents(),
+    )
+    .unwrap();
+    assert!(
+        !bytecode
+            .lines()
+            .any(|line| line.split_whitespace().nth(2) == Some("CollectArguments")),
+        "the exact callee has no prologue arguments allocation before phase 0: {bytecode}"
+    );
+    let operations: Vec<_> = bytecode
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace();
+            fields.next()?.parse::<u32>().ok()?;
+            fields.next()?;
+            fields.next()
+        })
+        .collect();
+    let observation_calls: Vec<_> = operations
+        .iter()
+        .enumerate()
+        .filter_map(|(pc, op)| (*op == "Call").then_some(pc))
+        .collect();
+    assert_eq!(
+        observation_calls.len(),
+        2,
+        "both observation calls: {bytecode}"
+    );
+    let array = operations.iter().position(|op| *op == "New").unwrap();
+    let forward = operations
+        .iter()
+        .position(|op| *op == "CallForwardArguments")
+        .unwrap();
+    assert!(
+        observation_calls[0] < array
+            && array < observation_calls[1]
+            && observation_calls[1] < forward,
+        "the tested Array allocation precedes phase 1 and the cold ordinary forward: {bytecode}"
+    );
+    assert_array_allocation_nodes(callee, 0, 1);
     let relocations = artifact_json(callee, JitArtifactFileName::Relocations);
     assert!(
         relocations["relocations"]
@@ -308,7 +357,7 @@ fn own_generated_receiver_fits_and_collecting_array_construct_keep_exact_roots()
     // Configure stress before the measured callee is entered. Stress disables
     // generated LAB fits while the GC-owned constructor family stays live.
     // Both entries use rooted canonical receiver preparation; the real callee
-    // ArrayConstruct must move that receiver, preserving its family ticket
+    // Array construction must move that receiver, preserving its family ticket
     // and live child aliases through the same published native frame.
     run(
         &mut runtime,
@@ -343,7 +392,7 @@ fn own_generated_receiver_fits_and_collecting_array_construct_keep_exact_roots()
         assert_eq!(pair[1].phase, 1);
         assert_ne!(
             pair[0].receiver, pair[1].receiver,
-            "the exact callee ArrayConstruct must move its live receiver: {pair:?}"
+            "the exact callee Array construction must move its live receiver: {pair:?}"
         );
         assert_ne!(pair[0].receiver, pair[0].child);
         assert_ne!(pair[1].receiver, pair[1].child);
@@ -366,7 +415,7 @@ fn own_generated_receiver_fits_and_collecting_array_construct_keep_exact_roots()
     assert_eq!(
         after.jit_receiver_alloc_space_misses - before.jit_receiver_alloc_space_misses,
         4,
-        "every retired-LAB probe reaches rooted canonical preparation; the second construct follows ArrayConstruct movement: {before:?} -> {after:?}"
+        "every retired-LAB probe reaches rooted canonical preparation; the second construct follows Array construction movement: {before:?} -> {after:?}"
     );
     drop(observations);
     trace.lock().unwrap().recording = false;

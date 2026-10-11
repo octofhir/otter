@@ -1381,15 +1381,11 @@ impl Interpreter {
         Ok(self.scoped_value(scope, value))
     }
 
-    /// Read the current logical length of the array behind `arr`, resolving
-    /// the handle through the arena at call time.
+    /// Read the current logical length of an exact Array or branded Array
+    /// prototype, resolving the handle through the arena at call time.
     pub(crate) fn scoped_array_length(&self, arr: Local<'_>) -> Result<usize, VmError> {
-        let array = self
-            .handle_arena
-            .get(arr.index())
-            .as_array()
-            .ok_or(VmError::TypeMismatch)?;
-        Ok(crate::array::len(array, &self.gc_heap))
+        self.exact_array_length(self.handle_arena.get(arr.index()))
+            .ok_or(VmError::TypeMismatch)
     }
 
     /// Read the current raw `Value` behind a scope handle for immediate

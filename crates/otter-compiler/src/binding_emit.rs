@@ -15,7 +15,8 @@
 //!
 //! # Invariants
 //! - A statically uninitialized own binding reads or writes as `TdzError`;
-//!   an outer slot whose kind can hold the hole uses the checked form.
+//!   an outer slot or switch slot whose kind can hold the hole uses the
+//!   checked form even after a textual initializer.
 //! - Immutable bindings reject assignment after the right-hand side ran,
 //!   with a TDZ check first when the slot can still hold the hole.
 //! - Only a store to a locally exported module-scope binding mirrors onto
@@ -173,6 +174,12 @@ impl Compiler {
         {
             return None;
         }
+        let ScopeLocation::Frame { scope, .. } = resolved.location else {
+            return None;
+        };
+        if self.own_access_needs_check(&resolved.info, scope) {
+            return None;
+        }
         match resolved.info.storage {
             crate::scope::BindingStorage::Register { reg } => Some(reg),
             crate::scope::BindingStorage::Slot { .. } => None,
@@ -283,21 +290,31 @@ impl Compiler {
         }
         match fallback {
             BindingStoreFallback::ImmutableThrow => {
-                if let Access::Outer { depth, slot } = resolved.access
-                    && info.kind.initial_hole()
-                {
-                    let probe = self.alloc_scratch();
-                    self.emit_ctx(
-                        Op::LoadContextSlotChecked,
-                        vec![
-                            Operand::Register(probe),
-                            Operand::Register(0),
-                            Operand::Imm32(Self::coord(depth, slot)),
-                        ],
-                        1,
-                        CtxReg::Closure,
-                        span,
-                    );
+                match resolved.access {
+                    Access::Own => {
+                        let ScopeLocation::Frame { scope, .. } = resolved.location else {
+                            unreachable!("an own binding belongs to the current frame")
+                        };
+                        if self.own_access_needs_check(&info, scope) {
+                            let probe = self.alloc_scratch();
+                            self.emit_load_storage_checked(probe, info.storage, span);
+                        }
+                    }
+                    Access::Outer { depth, slot } if info.kind.initial_hole() => {
+                        let probe = self.alloc_scratch();
+                        self.emit_ctx(
+                            Op::LoadContextSlotChecked,
+                            vec![
+                                Operand::Register(probe),
+                                Operand::Register(0),
+                                Operand::Imm32(Self::coord(depth, slot)),
+                            ],
+                            1,
+                            CtxReg::Closure,
+                            span,
+                        );
+                    }
+                    Access::Outer { .. } => {}
                 }
                 crate::assignment::emit_assignment_type_error(
                     self,

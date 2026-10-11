@@ -113,6 +113,9 @@ pub use literal_allocations::{
 mod string_layout;
 pub use string_layout::JitStringLayout;
 
+mod intrinsic_calls;
+pub use intrinsic_calls::{IntrinsicCallKind, JitIntrinsicCallProof, JitNativeCall};
+
 mod native_callable;
 pub use native_callable::JitNativeCallLayout;
 
@@ -821,9 +824,6 @@ pub struct JitCompileSnapshot {
     /// `%Function.prototype.call%`. Generated code proves the intrinsic and
     /// calls the function it ran directly, with the first argument as `this`.
     pub function_prototype_calls: rustc_hash::FxHashMap<u32, JitFunctionPrototypeCallSite>,
-    /// `new` sites whose callee was the realm's original `%Array%`, keyed by
-    /// byte PC: the address of an identity cell holding that constructor.
-    pub array_constructor_sites: rustc_hash::FxHashMap<u32, u64>,
     /// Address of each `instanceof` site's cell, keyed by byte PC: the last
     /// target the site proved and the prototype it searches for.
     pub instanceof_cells: rustc_hash::FxHashMap<u32, u64>,
@@ -982,7 +982,7 @@ impl JitIntrinsicPrototype {
     /// body owns only `length` and its indices, so every other name resolves on
     /// `%String.prototype%`. An array body without an exotic sidecar likewise
     /// owns only `length` and its elements, and its `[[Prototype]]` is still the
-    /// realm `%Array.prototype%`. A closure whose named-lookup byte reads
+    /// default realm's retained `%Array.prototype%`. A closure whose named-lookup byte reads
     /// exactly ordinary has no own bag and no prototype override, and its
     /// kind resolves every non-virtual name on the active realm's
     /// `%Function.prototype%`, so its proof also pins that realm. The proof establishes only the receiver; the
@@ -1431,30 +1431,6 @@ pub struct JitStaticNativeCall {
     /// whose count differs is not lowered, so variadic and defaulted forms keep
     /// the ordinary path instead of being truncated to this entry's arity.
     pub argument_count: u8,
-}
-
-/// Selected native entry for one source call site.
-///
-/// A leaf is an exact bootstrap identity and its declared NoAlloc operation.
-/// `Native` proves only the live cell kind: its current callback, policy,
-/// captures and realm are selected by the canonical Host native kernel.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum JitNativeCall {
-    /// An exact audited leaf declaration.
-    Leaf(JitStaticNativeCall),
-    /// Any NativeFunction, entered through the private Native kind convention.
-    Native,
-}
-
-impl JitNativeCall {
-    /// Exact leaf payload, when this plan permits the declared leaf ABI.
-    #[must_use]
-    pub const fn leaf(&self) -> Option<&JitStaticNativeCall> {
-        match self {
-            Self::Leaf(leaf) => Some(leaf),
-            Self::Native => None,
-        }
-    }
 }
 
 /// VM-resolved direct-call target for one eligible compiled callee.
@@ -2115,7 +2091,6 @@ impl JitCompileSnapshot {
             guarded_method_calls: rustc_hash::FxHashMap::default(),
             function_prototype_calls: rustc_hash::FxHashMap::default(),
             instanceof_cells: rustc_hash::FxHashMap::default(),
-            array_constructor_sites: rustc_hash::FxHashMap::default(),
             forward_apply_native_ref: None,
             property_programs: rustc_hash::FxHashMap::default(),
             property_action_cache: None,

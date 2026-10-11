@@ -44,6 +44,9 @@
 //!   binding operation, including the full chain of inlined frames.
 //! - Own fields carry their immutable bank and index in one access node; no
 //!   movable suffix address escapes into SSA or crosses a collecting boundary.
+//! - Intrinsic call operations follow a traced proof of the evaluated callee
+//!   in the current source realm; guards reconstruct the original call and
+//!   evaluated actuals before any specialized effect.
 //! - Named loads select feedback programs by current or revalidated receiver
 //!   shapes. Their indices belong to the innermost source snapshot; only an
 //!   exact singleton proof removes the selected program's receiver guard.
@@ -98,6 +101,9 @@ mod binding_tests;
 #[path = "builder_field_type.rs"]
 mod field_type;
 use field_type::FieldValueBound;
+
+#[path = "builder_intrinsic_calls.rs"]
+mod intrinsic_calls;
 
 const UNDEFINED: u64 = tag::VALUE_UNDEFINED;
 
@@ -3116,25 +3122,7 @@ impl<'a> Builder<'a> {
         if !self.view.instructions[self.pc as usize].call_attempted {
             return self.deopt(DeoptReason::InsufficientFeedback);
         }
-        // `new <%Array%>(length)`: the realm's original constructor, proved
-        // by identity, creates its array without a frame of its own.
-        if construct
-            && argc <= 1
-            && let Some(&cell) = self.view.array_constructor_sites.get(&instruction.byte_pc)
-            && !self.exited_for(ExitReason::IdentityGuard)
-        {
-            let callee = self.read(callee);
-            let callee = self.tagged(callee);
-            self.add(Kind::CheckCellValue(cell), &[callee], Repr::None);
-            let length = match arguments.first() {
-                Some(&register) => {
-                    let value = self.read(register);
-                    self.tagged(value)
-                }
-                None => self.constant_tagged(otter_vm::Value::number_i32(0).to_bits()),
-            };
-            let array = self.add(Kind::NewArrayWithLength, &[length], Repr::Tagged);
-            self.write(instruction.writes[0], array);
+        if self.emit_intrinsic_call(instruction, callee, &arguments, construct) {
             return;
         }
         // A native leaf target runs on its operand words without a frame;

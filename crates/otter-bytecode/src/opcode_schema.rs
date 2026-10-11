@@ -2,8 +2,6 @@
 //!
 //! # Contents
 //! - [`OPCODE_SCHEMA`] is the dense, generated metadata table.
-//! - [`OP_BYTE_TABLE`] is the compatibility view consumed by the current wire
-//!   encoder and decoder.
 //! - [`opcode_schema`] provides an exhaustive `Op` lookup.
 //! - [`encode_operand_word`], [`decode_operand_word`], and
 //!   [`operand_kind_at`] define schema-typed CodeBlock word operands.
@@ -14,8 +12,8 @@
 //!   accesses that may throw or consult eval extensions.
 //!
 //! # Invariants
-//! - One macro invocation owns opcode identity and byte assignment; generated
-//!   compatibility views cannot drift from it.
+//! - [`Op`]'s discriminant owns the current opcode byte. Schema rows are placed
+//!   at that exact index; the wire codec and compiled calls share its identity.
 //! - The serialized compiler/debug format remains self-describing while active
 //!   CodeBlocks store untagged operand words whose kinds come only from this
 //!   schema. Fixed and variadic families have exact operand/register roles.
@@ -30,7 +28,7 @@
 //!   memory operations with no binding row and no exception edge.
 //!
 //! # See also
-//! - [`crate::encoding`] for the unchanged executable byte format.
+//! - [`crate::encoding`] for the current executable byte format.
 //! - [`crate::opcode_audit`] for the machine-readable schema projection.
 //! - [`crate::ScopeDescriptor`] for the scopes a [`ContextCoord`] addresses.
 
@@ -1202,7 +1200,7 @@ impl OpcodeEffects {
 pub struct OpcodeSchema {
     /// Opcode identity.
     pub op: Op,
-    /// Stable current wire byte.
+    /// Current wire byte, equal to the opcode discriminant.
     pub byte: u8,
     /// Executable operand encoding format.
     pub operand_format: OperandFormat,
@@ -1252,222 +1250,210 @@ impl OpcodeSchema {
 }
 
 macro_rules! opcode_schema {
-    ($(($op:path, $byte:expr)),+ $(,)?) => {
-        /// Dense declarative schema in wire-byte order.
-        pub const OPCODE_SCHEMA: &[OpcodeSchema] = &[
-            $(OpcodeSchema::new($op, $byte)),+
-        ];
-
-        /// Compatibility view for the current encoder/decoder.
-        pub const OP_BYTE_TABLE: &[(Op, u8)] = &[
-            $(($op, $byte)),+
-        ];
+    ($($op:path),+ $(,)?) => {
+        /// Dense declarative schema indexed by the canonical `Op` discriminant.
+        pub const OPCODE_SCHEMA: &[OpcodeSchema] = &{
+            let mut rows = [OpcodeSchema::new(Op::Nop, 0); [$($op),+].len()];
+            $(rows[$op as usize] = OpcodeSchema::new($op, $op as u8);)+
+            rows
+        };
 
         const fn schema_index(op: Op) -> usize {
             match op {
-                $($op => $byte as usize),+
+                $($op => $op as usize),+
             }
         }
     };
 }
 
 opcode_schema! {
-    (Op::Nop, 0x00),
-    (Op::LoadUndefined, 0x01),
-    (Op::LoadHole, 0x02),
-    (Op::Return, 0x03),
-    (Op::LoadString, 0x04),
-    (Op::LoadNumber, 0x05),
-    (Op::LoadInt32, 0x06),
-    (Op::LoadBigInt, 0x07),
-    (Op::LoadRegExp, 0x08),
-    (Op::QueueMicrotask, 0x09),
-    (Op::PromiseNew, 0x0A),
-    (Op::PromiseCall, 0x0B),
-    (Op::LoadTrue, 0x0C),
-    (Op::LoadFalse, 0x0D),
-    (Op::LoadLength, 0x0E),
-    (Op::GetStringIndex, 0x0F),
-    (Op::CallMethodValue, 0x10),
-    (Op::Add, 0x11),
-    (Op::Sub, 0x12),
-    (Op::Mul, 0x13),
-    (Op::Div, 0x14),
-    (Op::Rem, 0x15),
-    (Op::Neg, 0x16),
-    (Op::Pow, 0x17),
-    (Op::BitwiseAnd, 0x18),
-    (Op::BitwiseOr, 0x19),
-    (Op::BitwiseXor, 0x1A),
-    (Op::BitwiseNot, 0x1B),
-    (Op::Shl, 0x1C),
-    (Op::Shr, 0x1D),
-    (Op::Ushr, 0x1E),
-    (Op::ToNumber, 0x1F),
-    (Op::Equal, 0x20),
-    (Op::NotEqual, 0x21),
-    (Op::LessThan, 0x22),
-    (Op::LessEq, 0x23),
-    (Op::GreaterThan, 0x24),
-    (Op::GreaterEq, 0x25),
-    (Op::LoadNull, 0x26),
-    (Op::LogicalNot, 0x27),
-    (Op::ToBoolean, 0x28),
-    (Op::Jump, 0x29),
-    (Op::JumpIfTrue, 0x2A),
-    (Op::JumpIfFalse, 0x2B),
-    (Op::JumpIfNullish, 0x2C),
-    (Op::LoadLocal, 0x2D),
-    (Op::StoreLocal, 0x2E),
-    (Op::TdzError, 0x2F),
-    (Op::MakeFunction, 0x30),
-    (Op::MakeClosure, 0x31),
-    (Op::LoadContextSlot, 0x32),
-    (Op::StoreContextSlot, 0x33),
-    (Op::Call, 0x34),
-    (Op::CallWithThis, 0x35),
-    (Op::BindFunction, 0x36),
-    (Op::LoadThis, 0x37),
-    (Op::LoadNewTarget, 0x38),
-    (Op::Throw, 0x39),
-    (Op::NewError, 0x3A),
-    (Op::GetIterator, 0x3B),
-    (Op::IteratorNext, 0x3C),
-    (Op::ArrayPush, 0x3D),
-    (Op::CallSpread, 0x3E),
-    (Op::New, 0x3F),
-    (Op::NewSpread, 0x40),
-    (Op::SuperConstructSpread, 0x41),
-    (Op::MakeClass, 0x42),
-    (Op::MathLoad, 0x43),
-    (Op::CollectRest, 0x44),
-    (Op::ReturnValue, 0x45),
-    (Op::ReturnUndefined, 0x46),
-    (Op::NewObject, 0x47),
-    (Op::LoadProperty, 0x48),
-    (Op::StoreProperty, 0x49),
-    (Op::DeleteProperty, 0x4A),
-    (Op::GetPrototype, 0x4B),
-    (Op::SetPrototype, 0x4C),
-    (Op::NewArray, 0x4D),
-    (Op::LoadElement, 0x4E),
-    (Op::StoreElement, 0x4F),
-    (Op::ArrayLength, 0x50),
-    (Op::HasProperty, 0x51),
-    (Op::Instanceof, 0x52),
-    (Op::Eval, 0x53),
-    (Op::NewFunction, 0x54),
-    (Op::LoadGlobalThis, 0x55),
-    (Op::LoadGlobalOrThrow, 0x56),
-    (Op::CollectArguments, 0x57),
-    (Op::LoadGlobalOrUndefined, 0x58),
-    (Op::DefineGlobalVar, 0x59),
-    (Op::ImportMetaResolve, 0x5A),
-    (Op::ImportNamespaceDynamic, 0x5B),
-    (Op::ImportNamespace, 0x5C),
-    (Op::PromiseFulfilledOf, 0x5D),
-    (Op::TemporalLoad, 0x5E),
-    (Op::NewCollection, 0x5F),
-    (Op::NewWeakRef, 0x60),
-    (Op::NewFinalizationRegistry, 0x61),
-    (Op::SymbolLoad, 0x62),
-    (Op::TypeOf, 0x63),
-    (Op::DeleteElement, 0x64),
-    (Op::Await, 0x65),
-    (Op::SameValue, 0x66),
-    (Op::IsArray, 0x67),
-    (Op::LooseEqual, 0x68),
-    (Op::LooseNotEqual, 0x69),
-    (Op::NewBuiltinError, 0x6A),
-    (Op::LoadBuiltinError, 0x6B),
-    (Op::BigIntCall, 0x6C),
-    (Op::ArrayConstruct, 0x6D),
-    (Op::ArrayFrom, 0x6E),
-    (Op::ArrayOf, 0x6F),
-    (Op::ArrayBufferCall, 0x70),
-    (Op::DataViewCall, 0x71),
-    (Op::Yield, 0x72),
-    (Op::SharedArrayBufferCall, 0x73),
-    (Op::ToPrimitive, 0x74),
-    (Op::ForInKeys, 0x75),
-    (Op::CopyDataProperties, 0x76),
-    (Op::DefineOwnProperty, 0x77),
-    (Op::IteratorClose, 0x78),
-    (Op::IteratorCloseThrow, 0x79),
-    (Op::GeneratorStart, 0x7A),
-    (Op::GetAsyncIterator, 0x7B),
-    (Op::BindThisValue, 0x7C),
-    (Op::LoadSuperProperty, 0x7D),
-    (Op::LoadSuperElement, 0x7E),
-    (Op::SetSuperProperty, 0x7F),
-    (Op::SetSuperElement, 0x80),
-    (Op::CreateContext, 0x81),
-    (Op::ImportNamespaceDeferred, 0x82),
-    (Op::EvaluateModule, 0x83),
-    (Op::MarkModuleEvaluated, 0x84),
-    (Op::StarReexport, 0x85),
-    (Op::ModuleNamespaceObject, 0x86),
-    (Op::LoadImportBinding, 0x87),
-    (Op::StoreContextSlotChecked, 0x88),
-    (Op::DeclareGlobalVar, 0x89),
-    (Op::LoadLookupGlobal, 0x8A),
-    (Op::StoreLookupGlobal, 0x8B),
-    (Op::TypeofLookupGlobal, 0x8C),
-    (Op::DefineGlobalFunction, 0x8D),
-    (Op::DeclareGlobalLex, 0x8E),
-    (Op::StoreGlobalBinding, 0x8F),
-    (Op::InitGlobalLex, 0x90),
-    (Op::ValidateGlobalDecl, 0x91),
-    (Op::ToObject, 0x92),
-    (Op::ToNumeric, 0x93),
-    (Op::PrivateGet, 0x94),
-    (Op::PrivateSet, 0x95),
-    (Op::YieldDelegate, 0x96),
-    (Op::DefineDataProperty, 0x97),
-    (Op::SetFunctionName, 0x98),
-    (Op::ClassCheck, 0x99),
-    (Op::ToPropertyKey, 0x9A),
-    (Op::Increment, 0x9B),
-    (Op::PrivateBrandCheck, 0x9C),
-    (Op::LoadLookupSlot, 0x9D),
-    (Op::GetTemplateObject, 0x9E),
-    (Op::DeleteLookupGlobal, 0x9F),
-    (Op::NewPrivateName, 0xA0),
-    (Op::TailCall, 0xA1),
-    (Op::IsEvalIntrinsic, 0xA2),
-    (Op::GlobalBindingExists, 0xA3),
-    (Op::StoreGlobalChecked, 0xA4),
-    (Op::AddImm, 0xA5),
-    (Op::SubImm, 0xA6),
-    (Op::BitwiseAndImm, 0xA7),
-    (Op::LessThanImm, 0xA8),
-    (Op::EqualImm, 0xA9),
-    (Op::NotEqualImm, 0xAA),
-    (Op::SuperConstruct, 0xAB),
-    (Op::StoreLookupSlot, 0xAC),
-    (Op::DeleteLookupSlot, 0xAD),
-    (Op::AsyncIteratorReturn, 0xAE),
-    (Op::CheckIteratorResult, 0xAF),
-    (Op::ResolveLookupRef, 0xB0),
-    (Op::LoadContextSlotChecked, 0xB1),
-    (Op::StoreRef, 0xB2),
-    (Op::DeclareEvalVar, 0xB3),
-    (Op::StorePropertyStrict, 0xB4),
-    (Op::StoreElementStrict, 0xB5),
-    (Op::CallForwardArguments, 0xB6),
-    (Op::NewObjectLiteral, 0xB7),
-    (Op::LoadArgumentsLength, 0xB8),
-    (Op::LoadArgumentsElement, 0xB9),
-    (Op::LoadClosureContext, 0xBA),
-    (Op::LoadSelf, 0xBB),
-    (Op::CopyContext, 0xBC),
-    (Op::BindThisContextSlot, 0xBD),
-    (Op::ReturnDerived, 0xBE),
-    (Op::StoreVarScope, 0xBF),
-    (Op::TestTypeOf, 0xC0),
-    (Op::SpreadAppend, 0xC1),
-    (Op::DefineMember, 0xC2),
-    (Op::HasNamedProperty, 0xC3),
+    Op::Nop,
+    Op::LoadUndefined,
+    Op::LoadHole,
+    Op::Return,
+    Op::LoadString,
+    Op::LoadNumber,
+    Op::LoadInt32,
+    Op::LoadBigInt,
+    Op::LoadRegExp,
+    Op::PromiseNew,
+    Op::PromiseCall,
+    Op::LoadTrue,
+    Op::LoadFalse,
+    Op::LoadLength,
+    Op::GetStringIndex,
+    Op::CallMethodValue,
+    Op::Add,
+    Op::Sub,
+    Op::Mul,
+    Op::Div,
+    Op::Rem,
+    Op::Neg,
+    Op::Pow,
+    Op::BitwiseAnd,
+    Op::BitwiseOr,
+    Op::BitwiseXor,
+    Op::BitwiseNot,
+    Op::Shl,
+    Op::Shr,
+    Op::Ushr,
+    Op::ToNumber,
+    Op::Equal,
+    Op::NotEqual,
+    Op::LessThan,
+    Op::LessEq,
+    Op::GreaterThan,
+    Op::GreaterEq,
+    Op::LoadNull,
+    Op::LogicalNot,
+    Op::ToBoolean,
+    Op::Jump,
+    Op::JumpIfTrue,
+    Op::JumpIfFalse,
+    Op::JumpIfNullish,
+    Op::LoadLocal,
+    Op::StoreLocal,
+    Op::TdzError,
+    Op::MakeFunction,
+    Op::MakeClosure,
+    Op::LoadContextSlot,
+    Op::StoreContextSlot,
+    Op::Call,
+    Op::CallWithThis,
+    Op::BindFunction,
+    Op::LoadThis,
+    Op::LoadNewTarget,
+    Op::Throw,
+    Op::NewError,
+    Op::GetIterator,
+    Op::IteratorNext,
+    Op::ArrayPush,
+    Op::CallSpread,
+    Op::New,
+    Op::NewSpread,
+    Op::SuperConstructSpread,
+    Op::MakeClass,
+    Op::CollectRest,
+    Op::ReturnValue,
+    Op::ReturnUndefined,
+    Op::NewObject,
+    Op::LoadProperty,
+    Op::StoreProperty,
+    Op::DeleteProperty,
+    Op::GetPrototype,
+    Op::SetPrototype,
+    Op::NewArray,
+    Op::LoadElement,
+    Op::StoreElement,
+    Op::ArrayLength,
+    Op::HasProperty,
+    Op::Instanceof,
+    Op::Eval,
+    Op::LoadGlobalThis,
+    Op::LoadGlobalOrThrow,
+    Op::CollectArguments,
+    Op::LoadGlobalOrUndefined,
+    Op::DefineGlobalVar,
+    Op::ImportMetaResolve,
+    Op::ImportNamespaceDynamic,
+    Op::ImportNamespace,
+    Op::PromiseFulfilledOf,
+    Op::TemporalLoad,
+    Op::NewCollection,
+    Op::NewWeakRef,
+    Op::NewFinalizationRegistry,
+    Op::SymbolLoad,
+    Op::TypeOf,
+    Op::DeleteElement,
+    Op::Await,
+    Op::SameValue,
+    Op::LooseEqual,
+    Op::LooseNotEqual,
+    Op::BigIntCall,
+    Op::ArrayBufferCall,
+    Op::DataViewCall,
+    Op::Yield,
+    Op::SharedArrayBufferCall,
+    Op::ToPrimitive,
+    Op::ForInKeys,
+    Op::CopyDataProperties,
+    Op::DefineOwnProperty,
+    Op::IteratorClose,
+    Op::IteratorCloseThrow,
+    Op::GeneratorStart,
+    Op::GetAsyncIterator,
+    Op::BindThisValue,
+    Op::LoadSuperProperty,
+    Op::LoadSuperElement,
+    Op::SetSuperProperty,
+    Op::SetSuperElement,
+    Op::CreateContext,
+    Op::ImportNamespaceDeferred,
+    Op::EvaluateModule,
+    Op::MarkModuleEvaluated,
+    Op::StarReexport,
+    Op::ModuleNamespaceObject,
+    Op::LoadImportBinding,
+    Op::StoreContextSlotChecked,
+    Op::DeclareGlobalVar,
+    Op::LoadLookupGlobal,
+    Op::StoreLookupGlobal,
+    Op::TypeofLookupGlobal,
+    Op::DefineGlobalFunction,
+    Op::DeclareGlobalLex,
+    Op::StoreGlobalBinding,
+    Op::InitGlobalLex,
+    Op::ValidateGlobalDecl,
+    Op::ToObject,
+    Op::ToNumeric,
+    Op::PrivateGet,
+    Op::PrivateSet,
+    Op::YieldDelegate,
+    Op::DefineDataProperty,
+    Op::SetFunctionName,
+    Op::ClassCheck,
+    Op::ToPropertyKey,
+    Op::Increment,
+    Op::PrivateBrandCheck,
+    Op::LoadLookupSlot,
+    Op::GetTemplateObject,
+    Op::DeleteLookupGlobal,
+    Op::NewPrivateName,
+    Op::TailCall,
+    Op::IsEvalIntrinsic,
+    Op::GlobalBindingExists,
+    Op::StoreGlobalChecked,
+    Op::AddImm,
+    Op::SubImm,
+    Op::BitwiseAndImm,
+    Op::LessThanImm,
+    Op::EqualImm,
+    Op::NotEqualImm,
+    Op::SuperConstruct,
+    Op::StoreLookupSlot,
+    Op::DeleteLookupSlot,
+    Op::AsyncIteratorReturn,
+    Op::CheckIteratorResult,
+    Op::ResolveLookupRef,
+    Op::LoadContextSlotChecked,
+    Op::StoreRef,
+    Op::DeclareEvalVar,
+    Op::StorePropertyStrict,
+    Op::StoreElementStrict,
+    Op::CallForwardArguments,
+    Op::NewObjectLiteral,
+    Op::LoadArgumentsLength,
+    Op::LoadArgumentsElement,
+    Op::LoadClosureContext,
+    Op::LoadSelf,
+    Op::CopyContext,
+    Op::BindThisContextSlot,
+    Op::ReturnDerived,
+    Op::StoreVarScope,
+    Op::TestTypeOf,
+    Op::SpreadAppend,
+    Op::DefineMember,
+    Op::HasNamedProperty,
 }
 
 /// Return the authoritative schema row for `op`.
@@ -1711,13 +1697,11 @@ const fn operand_shape(op: Op) -> OperandShape {
             count_operand_index: 3,
             tail: R,
         },
-        Op::NewArray | Op::ArrayConstruct | Op::ArrayFrom | Op::ArrayOf | Op::NewFunction => {
-            OperandShape::Variadic {
-                prefix: COUNTED_VALUES_PREFIX,
-                count_operand_index: 1,
-                tail: R,
-            }
-        }
+        Op::NewArray => OperandShape::Variadic {
+            prefix: COUNTED_VALUES_PREFIX,
+            count_operand_index: 1,
+            tail: R,
+        },
         Op::NewObjectLiteral => OperandShape::Variadic {
             prefix: OBJECT_LITERAL_PREFIX,
             count_operand_index: 1,
@@ -1767,11 +1751,6 @@ const fn operand_shape(op: Op) -> OperandShape {
         Op::StoreRef => OperandShape::Fixed(STORE_REF),
         Op::DeclareEvalVar => OperandShape::Fixed(DECLARE_EVAL_VAR),
         Op::StoreVarScope => OperandShape::Fixed(STORE_VAR_SCOPE),
-        Op::QueueMicrotask => OperandShape::Variadic {
-            prefix: &[R, CONST],
-            count_operand_index: 1,
-            tail: R,
-        },
         Op::PromiseNew => OperandShape::Fixed(WRITE_READ_WRITE),
         Op::PromiseCall
         | Op::BigIntCall
@@ -1782,7 +1761,7 @@ const fn operand_shape(op: Op) -> OperandShape {
             count_operand_index: 2,
             tail: R,
         },
-        Op::LoadLength | Op::TypeOf | Op::Await | Op::IsArray | Op::IsEvalIntrinsic => {
+        Op::LoadLength | Op::TypeOf | Op::Await | Op::IsEvalIntrinsic => {
             OperandShape::Fixed(WRITE_READ)
         }
         Op::GetStringIndex | Op::SameValue | Op::LooseEqual | Op::LooseNotEqual => {
@@ -1790,7 +1769,6 @@ const fn operand_shape(op: Op) -> OperandShape {
         }
         Op::TdzError => OperandShape::Fixed(&[IMM]),
         Op::MakeFunction
-        | Op::MathLoad
         | Op::LoadGlobalOrThrow
         | Op::LoadGlobalOrUndefined
         | Op::ImportNamespace
@@ -1798,14 +1776,12 @@ const fn operand_shape(op: Op) -> OperandShape {
         | Op::ModuleNamespaceObject
         | Op::TemporalLoad
         | Op::SymbolLoad
-        | Op::LoadBuiltinError
         | Op::GetTemplateObject
         | Op::NewPrivateName
         | Op::EvaluateModule => OperandShape::Fixed(WRITE_CONST),
         Op::MakeClosure => OperandShape::Fixed(MAKE_CLOSURE),
         Op::GeneratorStart => OperandShape::Fixed(EMPTY),
-        Op::NewError
-        | Op::ImportMetaResolve
+        Op::ImportMetaResolve
         | Op::PromiseFulfilledOf
         | Op::NewWeakRef
         | Op::NewFinalizationRegistry => OperandShape::Fixed(WRITE_READ),
@@ -1820,7 +1796,7 @@ const fn operand_shape(op: Op) -> OperandShape {
         Op::Increment | Op::TestTypeOf => OperandShape::Fixed(WRITE_READ_IMM),
         Op::Eval => OperandShape::Fixed(EVAL),
         Op::DefineGlobalVar => OperandShape::Fixed(CONST_READ),
-        Op::NewCollection | Op::NewBuiltinError => OperandShape::Fixed(&[W, CONST, R]),
+        Op::NewCollection | Op::NewError => OperandShape::Fixed(&[W, CONST, R]),
         Op::ToPrimitive => OperandShape::Fixed(WRITE_READ_CONST),
         Op::DefineOwnProperty | Op::PrivateSet | Op::DefineDataProperty => {
             OperandShape::Fixed(&[R, R, R])
@@ -2236,14 +2212,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn schema_is_dense_unique_and_matches_compatibility_table() {
-        assert_eq!(OPCODE_SCHEMA.len(), OP_BYTE_TABLE.len());
+    fn schema_is_dense_unique_and_matches_opcode_discriminants() {
         let mut ops = HashSet::new();
         let mut bytes = HashSet::new();
-        for (index, (schema, compatibility)) in OPCODE_SCHEMA.iter().zip(OP_BYTE_TABLE).enumerate()
-        {
-            assert_eq!(schema.op, compatibility.0);
-            assert_eq!(schema.byte, compatibility.1);
+        for (index, schema) in OPCODE_SCHEMA.iter().enumerate() {
+            assert_eq!(schema.byte, schema.op as u8);
             assert_eq!(schema.byte as usize, index);
             assert!(
                 ops.insert(schema.op),
@@ -2396,12 +2369,10 @@ mod tests {
 
     fn assert_row(
         op: Op,
-        byte: u8,
         operands: &[(OperandKind, RegisterAccess, Option<ImmediateDomain>)],
         binding: Option<BindingSemantics>,
     ) {
         let schema = opcode_schema(op);
-        assert_eq!(schema.byte, byte, "{op:?} byte");
         let shape = schema.operand_shape.fixed().expect("fixed shape");
         assert_eq!(shape.len(), operands.len(), "{op:?} arity");
         for (index, (spec, (kind, access, domain))) in shape.iter().zip(operands).enumerate() {
@@ -2428,20 +2399,18 @@ mod tests {
         let k = (K, N, None);
         let coord = (I, N, Some(ImmediateDomain::ContextCoord));
 
-        assert_row(Op::LoadClosureContext, 0xBA, &[w], None);
-        assert_row(Op::LoadSelf, 0xBB, &[w], None);
+        assert_row(Op::LoadClosureContext, &[w], None);
+        assert_row(Op::LoadSelf, &[w], None);
         assert_row(
             Op::CreateContext,
-            0x81,
             &[w, r, (I, N, Some(ImmediateDomain::ScopeIndex))],
             None,
         );
-        assert_row(Op::CopyContext, 0xBC, &[w, r], None);
-        assert_row(Op::LoadContextSlot, 0x32, &[w, r, coord], None);
-        assert_row(Op::StoreContextSlot, 0x33, &[r, r, coord], None);
+        assert_row(Op::CopyContext, &[w, r], None);
+        assert_row(Op::LoadContextSlot, &[w, r, coord], None);
+        assert_row(Op::StoreContextSlot, &[r, r, coord], None);
         assert_row(
             Op::LoadContextSlotChecked,
-            0xB1,
             &[w, r, coord],
             Some(BindingSemantics::Read(BindingRead::ContextSlot {
                 destination: 0,
@@ -2451,7 +2420,6 @@ mod tests {
         );
         assert_row(
             Op::StoreContextSlotChecked,
-            0x88,
             &[r, r, coord],
             Some(BindingSemantics::Write(BindingWrite::ContextSlot {
                 value: 0,
@@ -2461,7 +2429,6 @@ mod tests {
         );
         assert_row(
             Op::BindThisContextSlot,
-            0xBD,
             &[r, r, coord],
             Some(BindingSemantics::Write(BindingWrite::BindThis {
                 value: 0,
@@ -2469,10 +2436,10 @@ mod tests {
                 coord: 2,
             })),
         );
-        assert_row(Op::ReturnDerived, 0xBE, &[r, r, coord], None);
-        assert_row(Op::MakeClosure, 0x31, &[w, k, r], None);
-        assert_row(Op::Eval, 0x53, &[w, r, r, (I, N, None)], None);
-        assert_row(Op::CallForwardArguments, 0xB6, &[w, r, r, r, r], None);
+        assert_row(Op::ReturnDerived, &[r, r, coord], None);
+        assert_row(Op::MakeClosure, &[w, k, r], None);
+        assert_row(Op::Eval, &[w, r, r, (I, N, None)], None);
+        assert_row(Op::CallForwardArguments, &[w, r, r, r, r], None);
     }
 
     #[test]
@@ -2487,7 +2454,6 @@ mod tests {
 
         assert_row(
             Op::LoadLookupSlot,
-            0x9D,
             &[w, r, k, coord],
             Some(BindingSemantics::Read(BindingRead::LookupSlot {
                 destination: 0,
@@ -2498,7 +2464,6 @@ mod tests {
         );
         assert_row(
             Op::StoreLookupSlot,
-            0xAC,
             &[r, r, k, coord, (I, N, Some(ImmediateDomain::StoreFallback))],
             Some(BindingSemantics::Write(BindingWrite::LookupSlot {
                 value: 0,
@@ -2510,7 +2475,6 @@ mod tests {
         );
         assert_row(
             Op::DeleteLookupSlot,
-            0xAD,
             &[w, r, k, depth],
             Some(BindingSemantics::Delete(BindingDelete::LookupSlot {
                 destination: 0,
@@ -2519,13 +2483,12 @@ mod tests {
                 depth: 3,
             })),
         );
-        for (op, byte, missing) in [
-            (Op::LoadLookupGlobal, 0x8A, BindingMissing::Throw),
-            (Op::TypeofLookupGlobal, 0x8C, BindingMissing::Undefined),
+        for (op, missing) in [
+            (Op::LoadLookupGlobal, BindingMissing::Throw),
+            (Op::TypeofLookupGlobal, BindingMissing::Undefined),
         ] {
             assert_row(
                 op,
-                byte,
                 &[w, r, k, depth],
                 Some(BindingSemantics::Read(BindingRead::LookupGlobal {
                     destination: 0,
@@ -2538,7 +2501,6 @@ mod tests {
         }
         assert_row(
             Op::StoreLookupGlobal,
-            0x8B,
             &[r, r, k, (I, N, Some(ImmediateDomain::LookupGlobalMode))],
             Some(BindingSemantics::Write(BindingWrite::LookupGlobal {
                 value: 0,
@@ -2549,7 +2511,6 @@ mod tests {
         );
         assert_row(
             Op::DeleteLookupGlobal,
-            0x9F,
             &[w, r, k, depth],
             Some(BindingSemantics::Delete(BindingDelete::LookupGlobal {
                 destination: 0,
@@ -2560,7 +2521,6 @@ mod tests {
         );
         assert_row(
             Op::ResolveLookupRef,
-            0xB0,
             &[w, r, k, (I, N, Some(ImmediateDomain::LookupRefTarget))],
             Some(BindingSemantics::Read(BindingRead::ResolveRef {
                 destination: 0,
@@ -2571,7 +2531,6 @@ mod tests {
         );
         assert_row(
             Op::StoreRef,
-            0xB2,
             &[r, r, k, (I, N, Some(ImmediateDomain::StoreRefMode))],
             Some(BindingSemantics::Write(BindingWrite::StoreRef {
                 value: 0,
@@ -2582,7 +2541,6 @@ mod tests {
         );
         assert_row(
             Op::DeclareEvalVar,
-            0xB3,
             &[r, k, depth],
             Some(BindingSemantics::Write(BindingWrite::DeclareEvalVar {
                 context: 0,
@@ -2592,7 +2550,6 @@ mod tests {
         );
         assert_row(
             Op::StoreVarScope,
-            0xBF,
             &[r, r, k, depth],
             Some(BindingSemantics::Write(BindingWrite::VarScope {
                 value: 0,

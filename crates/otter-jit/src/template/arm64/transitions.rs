@@ -112,28 +112,6 @@ pub(super) fn emit_load_regexp(
     );
 }
 
-pub(super) fn emit_load_builtin_error(
-    ops: &mut Assembler,
-    relocations: &mut RelocationCapture,
-    table: &TransitionTable,
-    dst: u16,
-    constant: u32,
-    threw: DynamicLabel,
-    fatal: DynamicLabel,
-) {
-    emit_ctx_arg(ops);
-    dynasm!(ops ; .arch aarch64 ; movz x1, dst as u32);
-    emit_load_u64(ops, 2, u64::from(constant));
-    emit_transition_call(
-        ops,
-        relocations,
-        table.variadic_entry(abi::STUB_JIT_LOAD_BUILTIN_ERROR),
-        abi::STUB_JIT_LOAD_BUILTIN_ERROR,
-        threw,
-        fatal,
-    );
-}
-
 pub(super) fn emit_new_object(
     ops: &mut Assembler,
     relocations: &mut RelocationCapture,
@@ -518,16 +496,16 @@ pub(super) fn emit_string_concat_alloc_call(
     Ok(())
 }
 
-/// Allocate `Array()` or `Array(Int32)` through the shared `AllocValue3`
+/// Allocate a proven `Array(Int32)` through the shared `AllocValue3`
 /// boundary. The VM stub rejects a non-Int32 or negative length before any
 /// allocation; every non-success status therefore exits at the original
-/// `ArrayConstruct` and lets the canonical interpreter own wide/non-number
+/// call or construction and lets the canonical interpreter own wide/non-number
 /// semantics, `RangeError`, and OOM reporting.
-pub(super) fn emit_array_construct_alloc_call(
+pub(super) fn emit_array_length_alloc_call(
     ops: &mut Assembler,
     relocations: &mut RelocationCapture,
     dst: u16,
-    length: Option<u16>,
+    length: u16,
     packet: crate::template::operation::AllocPacket,
     bail: DynamicLabel,
 ) -> Result<(), Unsupported> {
@@ -535,14 +513,10 @@ pub(super) fn emit_array_construct_alloc_call(
     let stub_addr = alloc_value_stub_by_id(descriptor.id)
         .and_then(|stub| stub.entry_addr())
         .ok_or(Unsupported::OperandShape(
-            "ArrayConstruct allocating stub entry",
+            "array length allocating stub entry",
         ))?;
     emit_alloc_packet(ops, packet);
-    if let Some(length) = length {
-        emit_load_reg(ops, 2, length)?;
-    } else {
-        emit_load_u64(ops, 2, otter_vm::Value::number_i32(0).to_bits());
-    }
+    emit_load_reg(ops, 2, length)?;
     emit_load_u64(ops, 3, VALUE_UNDEFINED);
     emit_load_u64(ops, 4, VALUE_UNDEFINED);
     emit_load_runtime_stub(ops, relocations, 16, stub_addr as u64, descriptor);

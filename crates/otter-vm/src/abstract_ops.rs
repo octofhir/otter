@@ -1,14 +1,7 @@
 //! ECMA-262 §7.2 type-check abstract operations as canonical helpers.
 //!
-//! Single source of truth for the small set of equality / shape
-//! predicates the runtime needs everywhere — collection key matching,
-//! call dispatch, `Object.is`, `Array.isArray`, `Reflect.construct`,
-//! `Reflect.apply`, the upcoming Proxy / Reflect surface (task 81).
-//!
-//! Implementations are spec-faithful: every helper tracks the same
-//! steps the specification text carries so future audits can map
-//! line-for-line. Performance work belongs in a later track — these
-//! helpers are intentionally simple `match` arms over [`Value`].
+//! Shared equality and runtime type predicates used by collection keys,
+//! callable dispatch, object protocols and canonical native entry points.
 //!
 //! # Contents
 //! - [`same_value`] — §7.2.11 `SameValue`. Backs `Object.is`.
@@ -16,9 +9,8 @@
 //!   `Set` keying, `Array.prototype.includes`, `String.prototype.includes`.
 //! - [`same_value_non_numeric`] — §7.2.13. Shared tail of the two
 //!   operations above.
-//! - [`is_array`] — §7.2.2 `IsArray`. Today checks the `Value::Array`
-//!   tag directly; once Proxy lands the implementation walks the
-//!   proxy-target chain.
+//! - [`crate::Interpreter::is_array`] — §7.2.2 `IsArray` resolves one Proxy
+//!   target chain and recognises lifetime-branded canonical array prototypes.
 //! - [`is_callable`] — §7.2.3 `IsCallable`. Recognises every
 //!   call-site shape the dispatcher accepts.
 //! - [`is_constructor`] — §7.2.4 `IsConstructor`. Subset of
@@ -26,6 +18,8 @@
 //!   `false`.
 //!
 //! # Invariants
+//! - IsArray performs no allocation or JavaScript entry while walking its
+//!   target chain; canonical prototype identity belongs to the object itself.
 //! - Number equality follows IEEE-754 semantics with the spec's
 //!   `+0` / `-0` / `NaN` overrides explicitly applied. `NumberValue`
 //!   never normalises `-0.0` into `Smi(0)`, so the helpers can
@@ -232,38 +226,44 @@ fn same_value_zero_numeric(a: NumberValue, b: NumberValue) -> bool {
 /// (or cyclic) chain blowing the native stack.
 const IS_ARRAY_MAX_PROXY_DEPTH: u32 = 1_000;
 
-/// §7.2.2 `IsArray(argument)`.
-///
-/// # Algorithm
-/// 1. An Array exotic object is an array.
-/// 2. A Proxy is an array iff its target is — recurse through
-///    `[[ProxyTarget]]`. A revoked Proxy (`[[ProxyHandler]]` is null)
-///    throws a `TypeError`.
-/// 3. Anything else is not an array.
-///
-/// # See also
-/// - <https://tc39.es/ecma262/#sec-isarray>
-pub fn is_array(heap: &otter_gc::GcHeap, value: &Value) -> Result<bool, crate::VmError> {
-    let mut current = *value;
-    let mut depth = 0u32;
-    loop {
-        if current.is_array() {
-            return Ok(true);
+impl crate::Interpreter {
+    /// §7.2.2 `IsArray(argument)`.
+    ///
+    /// # Algorithm
+    /// 1. An Array body or lifetime-branded canonical Array prototype is an array.
+    /// 2. A Proxy is an array iff its target is — recurse through
+    ///    `[[ProxyTarget]]`. A revoked Proxy (`[[ProxyHandler]]` is null)
+    ///    throws a `TypeError`.
+    /// 3. Anything else is not an array.
+    ///
+    /// # See also
+    /// - <https://tc39.es/ecma262/#sec-isarray>
+    pub(crate) fn is_array(&self, value: &Value) -> Result<bool, crate::VmError> {
+        let mut current = *value;
+        let mut depth = 0u32;
+        loop {
+            if current.is_array()
+                || current
+                    .as_object()
+                    .is_some_and(|object| self.is_array_prototype_object(object))
+            {
+                return Ok(true);
+            }
+            let Some(proxy) = current.as_proxy() else {
+                return Ok(false);
+            };
+            if depth >= IS_ARRAY_MAX_PROXY_DEPTH {
+                return Err(crate::VmError::StackOverflow {
+                    limit: IS_ARRAY_MAX_PROXY_DEPTH,
+                });
+            }
+            // §7.2.2 step 3.a — a revoked Proxy throws.
+            if proxy.is_revoked(&self.gc_heap) {
+                return Err(crate::VmError::TypeError);
+            }
+            current = proxy.target(&self.gc_heap);
+            depth += 1;
         }
-        let Some(proxy) = current.as_proxy() else {
-            return Ok(false);
-        };
-        if depth >= IS_ARRAY_MAX_PROXY_DEPTH {
-            return Err(crate::VmError::StackOverflow {
-                limit: IS_ARRAY_MAX_PROXY_DEPTH,
-            });
-        }
-        // §7.2.2 step 3.a — a revoked Proxy throws.
-        if proxy.is_revoked(heap) {
-            return Err(crate::VmError::TypeError);
-        }
-        current = proxy.target(heap);
-        depth += 1;
     }
 }
 
@@ -791,13 +791,35 @@ mod tests {
     }
 
     #[test]
-    fn is_array_recognises_array_only() {
-        let mut heap = otter_gc::GcHeap::new().expect("gc heap");
-        let arr = Value::array(crate::array::alloc_array_old_for_fixture(&mut heap).unwrap());
-        let obj = Value::object(crate::object::alloc_object_old_for_fixture(&mut heap).unwrap());
-        assert!(is_array(&heap, &arr).unwrap());
-        assert!(!is_array(&heap, &obj).unwrap());
-        assert!(!is_array(&heap, &Value::undefined()).unwrap());
+    fn is_array_recognises_array_and_branded_array_prototypes() {
+        let mut vm = crate::Interpreter::new().expect("fixture interpreter bootstrap");
+        vm.gc_heap.set_gc_stress(0, false);
+        let arr = Value::array(crate::array::alloc_array_old_for_fixture(&mut vm.gc_heap).unwrap());
+        let obj =
+            Value::object(crate::object::alloc_object_old_for_fixture(&mut vm.gc_heap).unwrap());
+        assert!(vm.is_array(&arr).unwrap());
+        assert!(!vm.is_array(&obj).unwrap());
+        assert!(!vm.is_array(&Value::undefined()).unwrap());
+        assert!(
+            vm.is_array(&Value::object(vm.default_array_prototype().unwrap()))
+                .unwrap()
+        );
+        vm.with_handle_scope(|vm, scope| {
+            let prototype =
+                vm.scoped_value(scope, Value::object(vm.default_array_prototype().unwrap()));
+            let handler = vm.scoped_object(scope).unwrap();
+            let proxy = vm.scoped_proxy(scope, prototype, handler).unwrap();
+            let outer = vm.scoped_proxy(scope, proxy, handler).unwrap();
+            assert!(vm.is_array(&vm.escape_scoped(outer)).unwrap());
+            vm.escape_scoped(proxy)
+                .as_proxy()
+                .unwrap()
+                .revoke(&mut vm.gc_heap);
+            assert!(matches!(
+                vm.is_array(&vm.escape_scoped(outer)),
+                Err(crate::VmError::TypeError)
+            ));
+        });
     }
 
     #[test]

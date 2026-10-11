@@ -28,8 +28,9 @@
 //! - Recording happens only while a JIT hook is installed; interpreter-only
 //!   execution never touches these cells.
 //! - The vector's feedback epoch advances once per material state transition,
-//!   never for an already-recorded observation. Every ordinary-call target
-//!   population transition invalidates stale compiled caller plans. Constructor
+//!   never for an already-recorded observation. Ordinary-call target population
+//!   changes advance that epoch; installed code retains its live identity guards
+//!   until the tier owner retires its generation. Constructor
 //!   families generalize once from unseen to monomorphic to terminal unprepared;
 //!   alternating actual constructors cannot keep advancing that epoch.
 //! - The isolate's VM thread is the sole property-IC writer and hot-path
@@ -128,8 +129,8 @@ pub(crate) enum OrdinaryCallTarget {
     /// Any NativeFunction reached through its live Host native kernel.
     /// Kind-only feedback carries no callback identity or moving handle.
     Native,
-    /// The current realm's original `%Array%` constructor.
-    ArrayConstructor,
+    /// One canonical callable in the current source realm, without a GC handle.
+    Intrinsic(crate::IntrinsicCallKind),
 }
 
 /// One observed call target and its saturating execution count.
@@ -169,7 +170,7 @@ const CALL_TARGET_BYTECODE: u8 = 0;
 const CALL_TARGET_STATIC_NATIVE: u8 = 1;
 const CALL_TARGET_FUNCTION_PROTOTYPE_CALL: u8 = 2;
 const CALL_TARGET_NATIVE: u8 = 3;
-const CALL_TARGET_ARRAY_CONSTRUCTOR: u8 = 4;
+const CALL_TARGET_INTRINSIC: u8 = 4;
 
 const fn call_target_kind(target: OrdinaryCallTarget) -> u8 {
     match target {
@@ -177,7 +178,7 @@ const fn call_target_kind(target: OrdinaryCallTarget) -> u8 {
         OrdinaryCallTarget::StaticNative(_) => CALL_TARGET_STATIC_NATIVE,
         OrdinaryCallTarget::FunctionPrototypeCall(_) => CALL_TARGET_FUNCTION_PROTOTYPE_CALL,
         OrdinaryCallTarget::Native => CALL_TARGET_NATIVE,
-        OrdinaryCallTarget::ArrayConstructor => CALL_TARGET_ARRAY_CONSTRUCTOR,
+        OrdinaryCallTarget::Intrinsic(_) => CALL_TARGET_INTRINSIC,
     }
 }
 
@@ -186,7 +187,8 @@ const fn call_target_payload(target: OrdinaryCallTarget) -> u32 {
         OrdinaryCallTarget::Bytecode(fid) => fid,
         OrdinaryCallTarget::StaticNative(stub_id) => stub_id,
         OrdinaryCallTarget::FunctionPrototypeCall(fid) => fid,
-        OrdinaryCallTarget::Native | OrdinaryCallTarget::ArrayConstructor => 0,
+        OrdinaryCallTarget::Native => 0,
+        OrdinaryCallTarget::Intrinsic(kind) => kind.feedback_payload(),
     }
 }
 
@@ -213,7 +215,10 @@ fn unpack_call_target(packed: u64, kind: u8) -> CallTargetCount {
             );
             OrdinaryCallTarget::Native
         }
-        CALL_TARGET_ARRAY_CONSTRUCTOR => OrdinaryCallTarget::ArrayConstructor,
+        CALL_TARGET_INTRINSIC => OrdinaryCallTarget::Intrinsic(
+            crate::IntrinsicCallKind::from_feedback_payload(payload)
+                .expect("atomic call feedback has a valid intrinsic kind"),
+        ),
         _ => unreachable!("invalid atomic call target kind"),
     };
     CallTargetCount {
@@ -1480,6 +1485,41 @@ mod tests {
                 }))
             ));
         }
+    }
+
+    #[test]
+    fn intrinsic_targets_keep_distinct_kinds_counts_and_epoch_without_handles() {
+        let vector = feedback_for([Op::Call, Op::New]);
+        for index in 0..2 {
+            for (ordinal, kind) in crate::IntrinsicCallKind::ALL.into_iter().enumerate() {
+                let target = OrdinaryCallTarget::Intrinsic(kind);
+                assert_eq!(
+                    vector.record_call(index, target),
+                    if ordinal == 0 {
+                        CallTargetTransition::BecameMonomorphic
+                    } else {
+                        CallTargetTransition::BecamePolymorphic
+                    }
+                );
+                assert_eq!(
+                    vector.record_call(index, target),
+                    CallTargetTransition::Unchanged
+                );
+            }
+            let Some(CallSiteDistribution::Poly(targets)) =
+                vector.call_slot(index).and_then(|slot| slot.distribution())
+            else {
+                panic!("four canonical kinds remain a typed target population");
+            };
+            assert_eq!(targets.len(), 4);
+            for kind in crate::IntrinsicCallKind::ALL {
+                assert!(targets.contains(&CallTargetCount {
+                    target: OrdinaryCallTarget::Intrinsic(kind),
+                    hits: 2,
+                }));
+            }
+        }
+        assert_eq!(vector.epoch(), 8);
     }
 
     #[test]

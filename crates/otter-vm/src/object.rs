@@ -43,6 +43,7 @@
 //!   serialisation and `Object.keys` enumeration.
 //! - [`HostDataTracer`] / [`HostCodeLivenessTracer`] — safe paired visitors for
 //!   host payloads that retain JavaScript values.
+//! - `intrinsic_brand` — enduring canonical Array prototype classification.
 //!
 //! # Invariants
 //! - Insertion order is encoded by the GC shape chain, or by
@@ -84,6 +85,8 @@
 //!   generational and incremental marker observe the new pointer.
 //! - Traced host payloads enumerate the same strong slots for moving-GC
 //!   tracing and the allocation-free dynamic-code liveness census.
+//! - A canonical Array prototype carries its intrinsic brand in its existing
+//!   exotic metadata; that identity outlives the realm which created it.
 //!
 //! # See also
 //! - <https://tc39.es/ecma262/#sec-property-attributes>
@@ -122,6 +125,8 @@ pub(crate) mod symbol_table;
 pub use field_location::{FieldLayout, FieldLocation};
 use symbol_table::{SymbolPropsBody, SymbolPropsHandle, body_of as symbol_props_body_of};
 mod integrity_transition;
+mod intrinsic_brand;
+pub(crate) use intrinsic_brand::{is_array_prototype, mark_array_prototype};
 mod key_order;
 mod lookup;
 #[cfg(test)]
@@ -1051,6 +1056,9 @@ pub struct ExoticSlots {
     bigint_data: Option<BigIntValue>,
     /// `[[IsRawJSON]]` marker (`JSON.rawJSON`, ECMA-262 §25.5.3).
     is_raw_json: bool,
+    /// Canonical `%Array.prototype%` intrinsic identity, assigned only at
+    /// bootstrap birth and retained through realm disposal and heap restore.
+    array_prototype_brand: bool,
     /// `[[DateValue]]` for Date instances (UTC epoch ms, or NaN). §21.4.5.
     date_data: Option<f64>,
     /// `[[ErrorData]]` presence marker (§20.5).
@@ -1091,7 +1099,8 @@ pub struct ExoticSlots {
 impl otter_gc::trace::SeverRestoredPayload for ExoticSlots {
     /// Sever foreign ownership on a snapshot restore. Host payloads and
     /// prototype watchpoints belong to the capture isolate. Restored chains
-    /// establish fresh cells and subscriptions on their first lookup.
+    /// establish fresh cells and subscriptions on their first lookup; scalar
+    /// intrinsic brands remain owned by the restored object.
     fn sever_restored_payload(&mut self) {
         // SAFETY: overwriting without dropping (or reading) severs the
         // alias; the capture isolate remains the owner.

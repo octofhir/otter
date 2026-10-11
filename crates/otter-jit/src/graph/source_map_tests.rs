@@ -8,6 +8,8 @@
 //!   into it.
 //! - Rewritten object-protocol nodes carry their operation independently of
 //!   the retained inline source and root recipe.
+//! - Receiver refill/retry exits remain distinct from intrinsic Array value
+//!   misses even when both operations have an ordinary `New` source.
 //!
 //! # Invariants
 //! Expected source positions come from the accepted graph origins and each
@@ -84,6 +86,135 @@ fn offer_at(caller: &mut JitCompileSnapshot, pc: usize, body: Arc<JitCompileSnap
     caller
         .inline_callees
         .insert(byte_pc, JitInlineCallee { body });
+}
+
+#[test]
+fn emitted_receiver_refill_and_retry_misses_keep_their_semantic_owner() {
+    use Operand::{ConstIndex as C, Register as R};
+    use otter_vm::native_abi::{ExitAction, ExitReason, FUNCTION_CALL_CONSTRUCTIBLE};
+    let constructor = Arc::new(snapshot(
+        801,
+        0,
+        1,
+        vec![(Op::LoadThis, vec![R(0)]), (Op::ReturnValue, vec![R(0)])],
+    ));
+    let mut receiver = snapshot(
+        800,
+        1,
+        2,
+        vec![
+            (Op::New, vec![R(1), R(0), C(0)]),
+            (Op::ReturnValue, vec![R(1)]),
+        ],
+    );
+    receiver.instructions[0].call_attempted = true;
+    receiver.literal_allocations.group_allowed = true;
+    receiver.direct_constructs.insert(
+        0,
+        JitDirectCallee {
+            plan: JitDirectCallPlan {
+                function_id: 801,
+                code_object_id: 1,
+                entry_cell: 0,
+                tier: NativeFrameKind::Baseline,
+                this_mode: JitDirectCallThisMode::StrictOrLexical,
+                is_derived_constructor: false,
+                call_flags: FUNCTION_CALL_CONSTRUCTIBLE,
+                callee_cell: 0,
+            },
+            receiver_allocation: Some(otter_vm::jit::JitReceiverAllocationPlan {
+                new_target_function_id: 801,
+                new_target_is_class: false,
+                family_id: 1,
+                family_cell: 432,
+                receiver_shape: 0,
+                initial_field_count: 0,
+                inline_capacity: 0,
+                prototype_validity: None,
+                prototype_root: 864,
+            }),
+        },
+    );
+    receiver
+        .inline_callees
+        .insert(0, JitInlineCallee { body: constructor });
+    let transitions = crate::entry::TransitionTable::resolve();
+    let compiled = super::compile(&receiver, 8001, &transitions, None, false).unwrap();
+    assert_eq!(compiled.built.inline_views.len(), 1);
+    assert!(
+        compiled
+            .built
+            .graph
+            .nodes
+            .iter()
+            .any(|node| matches!(node.kind, super::ir::Kind::NewReceiver(_)))
+    );
+    let exits: Vec<_> = compiled
+        .deopt
+        .exits
+        .iter()
+        .filter(|exit| exit.reason == ExitReason::ReceiverAllocationMiss)
+        .collect();
+    assert_eq!(
+        exits.len(),
+        1,
+        "the refill Probe and retry fit share their exact receiver exit"
+    );
+    for exit in exits {
+        assert_eq!(exit.action, ExitAction::Resume);
+        assert_eq!(exit.resume_pcs.as_ref(), &[0]);
+    }
+    assert!(
+        compiled
+            .deopt
+            .exits
+            .iter()
+            .all(|exit| exit.reason != ExitReason::AllocationMiss)
+    );
+
+    let mut array = snapshot(
+        802,
+        2,
+        3,
+        vec![
+            (Op::New, vec![R(2), R(0), C(1), R(1)]),
+            (Op::ReturnValue, vec![R(2)]),
+        ],
+    );
+    array.instructions[0].call_attempted = true;
+    array.native_calls.insert(
+        0,
+        otter_vm::JitNativeCall::Intrinsic(otter_vm::JitIntrinsicCallProof {
+            kind: otter_vm::IntrinsicCallKind::Array,
+            identity_cell: 32,
+            realm_id: array.literal_allocations.realm_id,
+        }),
+    );
+    let compiled = super::compile(&array, 8002, &transitions, None, false).unwrap();
+    assert!(
+        compiled
+            .built
+            .graph
+            .nodes
+            .iter()
+            .any(|node| node.kind == super::ir::Kind::NewArrayWithLength)
+    );
+    assert!(
+        compiled
+            .deopt
+            .exits
+            .iter()
+            .all(|exit| exit.reason != ExitReason::ReceiverAllocationMiss)
+    );
+    let exits: Vec<_> = compiled
+        .deopt
+        .exits
+        .iter()
+        .filter(|exit| exit.reason == ExitReason::AllocationMiss)
+        .collect();
+    assert_eq!(exits.len(), 1);
+    assert_eq!(exits[0].action, ExitAction::Resume);
+    assert_eq!(exits[0].resume_pcs.as_ref(), &[0]);
 }
 
 #[test]

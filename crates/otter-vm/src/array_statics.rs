@@ -1,13 +1,8 @@
 //! `Array.<static>` dispatchers and JS-visible static method specs.
 //!
-//! Each Array static surface has its own typed entry point —
-//! The active `Array(...)`, `Array.from`, and `Array.of` opcode
-//! paths live in [`crate::array_ops`] because they can expose the VM
-//! frame stack to root-aware allocation. This module owns the
-//! JS-visible static method specs installed on the constructor so
-//! reflective access (`Array.of.length`, `Array.of.call(C, ...)`,
-//! `Array.from.bind(...)`, `Array.fromAsync.name`) resolves to a real
-//! callable.
+//! Each static method resolves through its actual callable and receives the
+//! original receiver. Rooted constructor, iterator, property, and callback
+//! semantics live in `crate::array_ops`.
 //!
 //! # Contents
 //! - [`ARRAY_STATIC_METHODS`] — methods installed on the `Array`
@@ -16,9 +11,6 @@
 //!   owns the promise chain the collection runs on.
 //!
 //! # Invariants
-//! - The compiler's [`otter_bytecode::Op::ArrayOf`] /
-//!   [`otter_bytecode::Op::ArrayFrom`] fast paths still bypass the
-//!   NativeFunction dispatcher for direct `Array.<x>(...)` callsites.
 //! - The NativeFunction path observes the spec `this` value, so
 //!   `Array.of.call(C, ...)` runs `Construct(C, «len»)` per
 //!   §23.1.2.3 step 4 when `C` is a constructor.
@@ -64,19 +56,10 @@ pub static ARRAY_STATIC_METHODS: &[MethodSpec] = &[
 
 fn native_is_array(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let value = args.first().copied().unwrap_or_else(Value::undefined);
-    // §7.2.2 IsArray — shared with the `Op::IsArray` fast path so the
-    // direct call and `Array.isArray.call(...)` agree (Proxy recursion,
-    // revoked-Proxy TypeError).
-    let is_array_result = crate::abstract_ops::is_array(ctx.heap(), &value);
-    let mut result = is_array_result.map_err(|err| {
+    // §7.2.2 IsArray includes Proxy recursion and revoked-Proxy TypeError.
+    let result = ctx.cx.interp.is_array(&value).map_err(|err| {
         crate::native_function::vm_to_native_error(ctx.cx.interp, err, "Array.isArray")
     })?;
-    if !result
-        && let Some(obj) = value.as_object()
-        && let Some(array_prototype) = ctx.cx.interp.realm_intrinsics.array_prototype()
-    {
-        result = obj == array_prototype;
-    }
     Ok(Value::boolean(result))
 }
 

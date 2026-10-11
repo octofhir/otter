@@ -1,18 +1,11 @@
-//! Array static opcode helpers.
-//!
-//! Array constructor/static bytecodes are variadic, so their argument registers
-//! still live in the executable side-operand slice. This module keeps their
-//! decode and call glue out of the main interpreter loop.
+//! Rooted Array static semantics and guarded length allocation.
 //!
 //! # Contents
-//! - `Array(...)` / `new Array(...)` construction.
 //! - Shared rooted initialization for canonical and typed-JIT length arrays.
 //! - `Array.from(...)` and `Array.of(...)` static calls.
 //!
 //! # Invariants
-//! - The current frame PC is advanced before running `Array.from` so any
-//!   synchronous iterator/property callbacks observe the post-call PC.
-//! - Arguments are read from executable operands, not cloned bytecode DTOs.
+//! - Guarded length-array allocation belongs to the published source realm.
 //! - Length-array shell and hole growth always retain both caller roots and
 //!   the fresh array owner across every possible moving collection.
 //! - `Array.from` roots its copied arguments for the complete observable
@@ -25,121 +18,36 @@
 //! - [`crate::array_statics`]
 //! - [`crate::executable`]
 
-use crate::activation_stack::ActivationStack;
 use crate::runtime_activation::CommittedValueError;
-use otter_bytecode::{Op, Operand};
 use smallvec::SmallVec;
 
 use crate::{
-    ExecutionContext, Frame, Interpreter, Value, VmError, VmGetOutcome, VmPropertyKey, array,
-    operand_decode::register_operand, read_register, symbol, to_length, write_register,
+    ExecutionContext, Interpreter, Value, VmError, VmGetOutcome, VmPropertyKey, array, symbol,
+    to_length,
 };
 
 const MAX_DENSE_ARRAY_CONSTRUCT_HOLES: u32 = 1_048_576;
 
 impl Interpreter {
-    pub(crate) fn run_array_static_operands(
-        &mut self,
-        op: Op,
-        context: &ExecutionContext,
-        stack: &mut ActivationStack,
-        operands: impl crate::executable::OperandSource,
-    ) -> Result<(), CommittedValueError> {
-        let dst = register_operand(operands.first()).map_err(CommittedValueError::Fatal)?;
-        let top_idx = stack.len() - 1;
-        let args =
-            collect_array_args(&stack[top_idx], operands).map_err(CommittedValueError::Fatal)?;
-
-        stack[top_idx]
-            .advance_pc()
-            .map_err(CommittedValueError::Fatal)?;
-        let result = match op {
-            Op::ArrayConstruct => self
-                .array_construct_stack_rooted(stack, &args)
-                .map_err(CommittedValueError::JavaScript)?,
-            Op::ArrayFrom => self.array_from_sync(stack, context, Value::undefined(), &args)?,
-            Op::ArrayOf => self
-                .array_of_stack_rooted(stack, &args)
-                .map_err(CommittedValueError::JavaScript)?,
-            _ => return Err(CommittedValueError::Fatal(VmError::InvalidOperand)),
-        };
-
-        let frame = stack
-            .last_mut()
-            .ok_or(CommittedValueError::Fatal(VmError::InvalidOperand))?;
-        write_register(frame, dst, result).map_err(CommittedValueError::Fatal)
-    }
-
-    /// §23.1.1.1 `Array(...values)`.
-    fn array_construct_stack_rooted(
-        &mut self,
-        stack: &ActivationStack,
-        args: &[Value],
-    ) -> Result<Value, VmError> {
-        if args.len() == 1
-            && let Some(n) = args[0].as_number()
-        {
-            let raw = n.as_f64();
-            let len = raw as u32;
-            // §23.1.1.1 step 8.b — a single Number argument whose
-            // ToUint32 round-trip differs from the value is not a valid
-            // array length and raises a RangeError (not a TypeError).
-            if !raw.is_finite() || raw < 0.0 || raw != f64::from(len) {
-                return Err(self.err_range(("Invalid array length".to_string()).into()));
-            }
-            let arr = self.alloc_stack_rooted_array(stack, &[], &[args])?;
-            if len == 0 {
-                return Ok(Value::array(arr));
-            }
-            let roots = self.collect_allocation_roots(stack);
-            let mut external_visit = |visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
-                for &slot in &roots {
-                    visitor(slot);
-                }
-                for value in args {
-                    value.trace_value_slots(visitor);
-                }
-            };
-            let arr = initialize_array_length_with_roots(
-                arr,
-                &mut self.gc_heap,
-                len,
-                &mut external_visit,
-            )?;
-            return Ok(Value::array(arr));
-        }
-        self.array_of_stack_rooted(stack, args)
-    }
-
-    /// Allocate the guarded typed-JIT `Array(length)` result through the full
-    /// runtime root provider rather than a materialized interpreter frame.
+    /// Allocate a guarded length array in the source function's realm.
     pub(crate) fn array_construct_length_runtime_rooted(
         &mut self,
+        function_id: u32,
         len: u32,
-    ) -> Result<Value, otter_gc::OutOfMemory> {
-        let _runtime_roots_guard = self.scope_runtime_roots_guard();
-        let mut external_visit = |_visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {};
-        let arr = array::alloc_array_with_roots(&mut self.gc_heap, &mut external_visit)?;
-        let arr = self.register_array_prototype_override(arr)?;
-        let arr =
-            initialize_array_length_with_roots(arr, &mut self.gc_heap, len, &mut external_visit)?;
-        Ok(Value::array(arr))
-    }
-
-    /// §23.1.2.3 `Array.of(...items)`.
-    fn array_of_stack_rooted(
-        &mut self,
-        stack: &ActivationStack,
-        args: &[Value],
     ) -> Result<Value, VmError> {
-        Ok(Value::array(
-            self.alloc_stack_rooted_array_from_values_with_root_slices(
-                stack,
-                args.iter().cloned(),
-                &[],
-                &[args],
-            )?,
-        ))
+        let allocate = |vm: &mut Self| {
+            let _runtime_roots_guard = vm.scope_runtime_roots_guard();
+            let mut external_visit = |_visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {};
+            let arr = array::alloc_array_with_roots(&mut vm.gc_heap, &mut external_visit)?;
+            let arr = vm.register_array_prototype_override(arr)?;
+            let arr =
+                initialize_array_length_with_roots(arr, &mut vm.gc_heap, len, &mut external_visit)?;
+            Ok(Value::array(arr))
+        };
+        match self.foreign_function_realm(function_id) {
+            Some(realm) => self.with_host_realm_id(realm, allocate),
+            None => allocate(self),
+        }
     }
 
     /// §23.1.2.1 `Array.from(items, mapFn?, thisArg?)`.
@@ -566,10 +474,6 @@ impl Interpreter {
     /// `CreateDataPropertyOrThrow` and the length written through the
     /// observable `Set(A, "length", len, true)`.
     ///
-    /// The `Op::ArrayOf` fast path keeps building a plain Array for
-    /// direct `Array.of(...)` callsites; this is the reflective
-    /// (`Array.of.call(C, …)`) entry that must observe `C`.
-    ///
     /// # See also
     /// - <https://tc39.es/ecma262/#sec-array.of>
     pub(crate) fn array_of_sync(
@@ -645,27 +549,11 @@ fn initialize_array_length_with_roots(
     Ok(arr)
 }
 
-fn collect_array_args(
-    frame: &Frame,
-    operands: impl crate::executable::OperandSource,
-) -> Result<SmallVec<[Value; 4]>, VmError> {
-    let argc = match operands.get(1) {
-        Some(Operand::ConstIndex(n)) => n as usize,
-        _ => return Err(VmError::InvalidOperand),
-    };
-    let mut args: SmallVec<[Value; 4]> = SmallVec::with_capacity(argc);
-    for i in 0..argc {
-        let r = register_operand(operands.get(2 + i))?;
-        args.push(*read_register(frame, r)?);
-    }
-    Ok(args)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use otter_bytecode::{
-        BytecodeModule, Function, Instruction, SourceKind as BcSourceKind, SpanEntry,
+        BytecodeModule, Function, Instruction, Op, SourceKind as BcSourceKind, SpanEntry,
     };
 
     fn empty_context() -> ExecutionContext {
@@ -831,7 +719,12 @@ mod tests {
         let before = interp.gc_heap().stats().new_allocated_bytes;
 
         let result = interp
-            .array_of_stack_rooted(&stack, &[Value::number_i32(1), Value::number_i32(2)])
+            .array_of_sync(
+                &mut stack,
+                &empty_context(),
+                Value::undefined(),
+                &[Value::number_i32(1), Value::number_i32(2)],
+            )
             .expect("Array.of");
 
         let after = interp.gc_heap().stats().new_allocated_bytes;
@@ -860,7 +753,7 @@ mod tests {
         let before_reserved = interp.gc_heap().stats().allocated_bytes;
 
         let result = interp
-            .array_construct_stack_rooted(&stack, &[Value::number_i32(8)])
+            .array_construct_length_runtime_rooted(0, 8)
             .expect("Array constructor");
 
         let after_alloc = interp.gc_heap().stats().new_allocated_bytes;
@@ -895,7 +788,7 @@ mod tests {
         let before_reserved = interp.gc_heap().stats().allocated_bytes;
 
         let result = interp
-            .array_construct_stack_rooted(&stack, &[Value::number_i32(20_000)])
+            .array_construct_length_runtime_rooted(0, 20_000)
             .expect("Array constructor");
 
         let after_reserved = interp.gc_heap().stats().allocated_bytes;

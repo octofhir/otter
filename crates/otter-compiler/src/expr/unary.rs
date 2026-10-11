@@ -6,10 +6,12 @@
 //!   [`UpdateUse`] says whether the value is read.
 //!
 //! # Invariants
-//! - The numeric operators run their own ToPrimitive / ToNumeric ladder, so
+//! - Unary numeric operators run their own ToPrimitive / ToNumeric ladder, so
 //!   no separate coercion instruction precedes them.
-//! - An update emits `ToNumeric` only when it is postfix and its value is
+//! - A mutable update emits `ToNumeric` only when it is postfix and its value is
 //!   read; a mutable own register binding is rewritten in place.
+//! - Immutable updates read through the same TDZ owner as ordinary names and
+//!   compute one numeric delta before their immutable PutValue outcome.
 //!
 //! # See also
 //! - [`super`] — expression dispatch and shared helpers.
@@ -296,7 +298,6 @@ pub(crate) fn typeof_operand(
         let reference = cx.resolve_ref(name);
         if matches!(reference, crate::compiler::NameRef::Global(_))
             && find_module_import_binding(cx, name).is_none()
-            && !is_builtin_error_class_name(name)
             && name != "NaN"
             && name != "Infinity"
             && name != "undefined"
@@ -351,7 +352,7 @@ fn emit_delete_super_reference_error(cx: &mut Compiler, span: (u32, u32)) -> u16
     let error_reg = cx.alloc_scratch();
     let kind = cx.intern_string_constant("ReferenceError");
     cx.emit(
-        Op::NewBuiltinError,
+        Op::NewError,
         [
             Operand::Register(error_reg),
             Operand::ConstIndex(kind),
@@ -428,27 +429,20 @@ pub(crate) fn compile_update(
     let target = match &u.argument {
         SimpleAssignmentTarget::AssignmentTargetIdentifier(id) => {
             let name = id.name.as_str().to_string();
-            if let Some(info) = cx
-                .lookup_binding(&name)
-                .filter(|info| info.is_const || info.fn_self_name)
+            let reference = cx.resolve_ref(&name);
+            if cx.active_with_envs.is_empty()
+                && let Some(info) = cx
+                    .lookup_binding(&name)
+                    .filter(|info| info.is_const || info.fn_self_name)
                 && matches!(
-                    cx.resolve_ref(&name),
+                    &reference,
                     crate::compiler::NameRef::Binding(resolved) if resolved.lookup.is_none()
                 )
             {
-                if info.initialized {
-                    cx.emit_load_storage(old, info.storage, span);
-                } else {
-                    cx.emit(
-                        Op::TdzError,
-                        [Operand::Imm32(info.storage.diagnostic_index())],
-                        span,
-                    );
-                }
+                cx.emit_name_load(old, &name, &reference, false, span);
                 let throws = info.is_const || cx.is_strict;
                 return finish_immutable_update(cx, &name, old, u, span, throws);
             }
-            let reference = cx.resolve_ref(&name);
             if cx.active_with_envs.is_empty()
                 && let Some(reg) = cx.plain_register_binding(&reference)
             {
@@ -772,9 +766,11 @@ fn update_register_binding(
     }
 }
 
-/// §13.4.2-5 — update on a `const` binding: the old value still loads
-/// and coerces through ToNumeric (firing user `valueOf` /
-/// `[Symbol.toPrimitive]`), then PutValue throws TypeError at runtime.
+/// §13.4.2-5 — immutable update performs ToNumeric before PutValue.
+/// A rejecting binding throws; a sloppy function-self binding ignores the
+/// store but still returns the new numeric value for prefix and old for postfix.
+/// Every form computes the delta before PutValue: BigInt arithmetic can allocate
+/// and fail even when the assignment ignores the store or discards the result.
 fn finish_immutable_update(
     cx: &mut Compiler,
     name: &str,
@@ -783,11 +779,24 @@ fn finish_immutable_update(
     span: (u32, u32),
     throws: bool,
 ) -> Result<u16, CompileError> {
-    let _ = u;
     let cur = cx.alloc_scratch();
     cx.emit(
         Op::ToNumeric,
         [Operand::Register(cur), Operand::Register(old)],
+        span,
+    );
+    let next = cx.alloc_scratch();
+    let delta = match u.operator {
+        UpdateOperator::Increment => 1,
+        UpdateOperator::Decrement => -1,
+    };
+    cx.emit(
+        Op::Increment,
+        [
+            Operand::Register(next),
+            Operand::Register(cur),
+            Operand::Imm32(delta),
+        ],
         span,
     );
     if throws {
@@ -796,6 +805,8 @@ fn finish_immutable_update(
             &format!("Assignment to constant variable '{name}'."),
             span,
         ))
+    } else if u.prefix {
+        Ok(next)
     } else {
         Ok(cur)
     }

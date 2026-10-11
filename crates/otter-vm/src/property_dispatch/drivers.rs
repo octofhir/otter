@@ -16,6 +16,9 @@
 //!   or lookup can collect, before the original receiver reaches a getter.
 //! - Named-property attempts are recorded before receiver classification, so
 //!   unsupported or throwing operations remain distinct from cold branches.
+//! - Branded Array prototypes complete through canonical Set before cache
+//!   probes or ordinary descriptor publication; Array length coercion owns
+//!   its effect and the driver advances the source PC exactly once.
 //!
 //! # See also
 //! - `property_ic` for guarded store completion and allocation-failure handling.
@@ -67,16 +70,16 @@ impl Interpreter {
         slot.record_attempt();
         let name = atomized_key.name();
         let top_idx = stack.len() - 1;
-        let receiver = *read_register(&stack[top_idx], obj_reg)
-            .map_err(CommittedValueError::Fatal)?;
+        let receiver =
+            *read_register(&stack[top_idx], obj_reg).map_err(CommittedValueError::Fatal)?;
         if let Some(value) = self.lookup_start_load(slot, receiver, atomized_key) {
             Self::finish_property_fast_path_value(&mut stack[top_idx], dst, value)
                 .map_err(CommittedValueError::Fatal)?;
             return Ok(true);
         }
         // Preparing a function's bag can scavenge; re-read the rooted register.
-        let receiver = *read_register(&stack[top_idx], obj_reg)
-            .map_err(CommittedValueError::Fatal)?;
+        let receiver =
+            *read_register(&stack[top_idx], obj_reg).map_err(CommittedValueError::Fatal)?;
         if let Some(obj) = receiver.as_object() {
             // The site's handlers: one shape compare selects the entry.
             if let Some(value) = slot.probe_load(obj, &self.gc_heap) {
@@ -190,8 +193,8 @@ impl Interpreter {
                 .map_err(CommittedValueError::JavaScript)?;
             // Boxing can move a string, symbol or BigInt receiver. Its source
             // register is the existing root; the copied value is no longer live.
-            let receiver = *read_register(&stack[top_idx], obj_reg)
-                .map_err(CommittedValueError::Fatal)?;
+            let receiver =
+                *read_register(&stack[top_idx], obj_reg).map_err(CommittedValueError::Fatal)?;
             let key = VmPropertyKey::atom(atomized_key);
             stack[top_idx]
                 .advance_pc()
@@ -270,9 +273,7 @@ impl Interpreter {
                             Some(callee) if abstract_ops::is_callable(&callee) => {
                                 let args: SmallVec<[Value; 8]> = SmallVec::new();
                                 self.invoke(stack, context, &callee, receiver, args, dst)
-                                    .map_err(|error| {
-                                        CommittedValueError::JavaScript(error)
-                                    })?;
+                                    .map_err(CommittedValueError::JavaScript)?;
                             }
                             _ => write_register(&mut stack[top_idx], dst, Value::undefined())
                                 .map_err(CommittedValueError::Fatal)?,
@@ -435,17 +436,14 @@ impl Interpreter {
         context: &ExecutionContext,
         operands: impl crate::executable::OperandSource,
     ) -> Result<bool, CommittedValueError> {
-        let dst = register_operand(operands.first())
-            .map_err(CommittedValueError::Fatal)?;
-        let obj_reg = register_operand(operands.get(1))
-            .map_err(CommittedValueError::Fatal)?;
-        let key_reg = register_operand(operands.get(2))
-            .map_err(CommittedValueError::Fatal)?;
+        let dst = register_operand(operands.first()).map_err(CommittedValueError::Fatal)?;
+        let obj_reg = register_operand(operands.get(1)).map_err(CommittedValueError::Fatal)?;
+        let key_reg = register_operand(operands.get(2)).map_err(CommittedValueError::Fatal)?;
         let top_idx = stack.len() - 1;
-        let receiver = *read_register(&stack[top_idx], obj_reg)
-            .map_err(CommittedValueError::Fatal)?;
-        let key_value_raw = *read_register(&stack[top_idx], key_reg)
-            .map_err(CommittedValueError::Fatal)?;
+        let receiver =
+            *read_register(&stack[top_idx], obj_reg).map_err(CommittedValueError::Fatal)?;
+        let key_value_raw =
+            *read_register(&stack[top_idx], key_reg).map_err(CommittedValueError::Fatal)?;
         // An own dense element of a plain array is the whole `[[Get]]` answer
         // and is the dominant computed-index shape. Everything below first
         // spells the index as a fresh heap string through `ToPropertyKey`,
@@ -458,11 +456,8 @@ impl Interpreter {
             && let Some(value) = crate::array::plain_dense_element(arr, &self.gc_heap, index)
         {
             let frame = &mut stack[top_idx];
-            write_register(frame, dst, value)
-                .map_err(CommittedValueError::Fatal)?;
-            frame
-                .advance_pc()
-                .map_err(CommittedValueError::Fatal)?;
+            write_register(frame, dst, value).map_err(CommittedValueError::Fatal)?;
+            frame.advance_pc().map_err(CommittedValueError::Fatal)?;
             return Ok(true);
         }
         // Key coercion, accessors and descriptor reads below may collect:
@@ -940,22 +935,14 @@ impl Interpreter {
                                                 args,
                                                 scratch_reg,
                                             )
-                                            .map_err(
-                                                |error| {
-                                                    CommittedValueError::JavaScript(error)
-                                                },
-                                            )?;
+                                            .map_err(CommittedValueError::JavaScript)?;
                                         }
                                         object::SetOutcome::Reject { .. } => {
                                             self.failed_set_result(
                                                 strict,
                                                 "Cannot assign to symbol property",
                                             )
-                                            .map_err(
-                                                |error| {
-                                                    CommittedValueError::JavaScript(error)
-                                                },
-                                            )?;
+                                            .map_err(CommittedValueError::JavaScript)?;
                                         }
                                         object::SetOutcome::ExoticParent { parent } => {
                                             if !self.ordinary_set_data_value(
@@ -995,22 +982,14 @@ impl Interpreter {
                                                 args,
                                                 scratch_reg,
                                             )
-                                            .map_err(
-                                                |error| {
-                                                    CommittedValueError::JavaScript(error)
-                                                },
-                                            )?;
+                                            .map_err(CommittedValueError::JavaScript)?;
                                         }
                                         object::SetOutcome::Reject { .. } => {
                                             self.failed_set_result(
                                                 strict,
                                                 format!("Cannot assign to property '{key}'"),
                                             )
-                                            .map_err(
-                                                |error| {
-                                                    CommittedValueError::JavaScript(error)
-                                                },
-                                            )?;
+                                            .map_err(CommittedValueError::JavaScript)?;
                                         }
                                         object::SetOutcome::ExoticParent { parent } => {
                                             if !self.ordinary_set_data_value(
@@ -1077,14 +1056,10 @@ impl Interpreter {
         operands: impl crate::executable::OperandSource,
         force_strict: bool,
     ) -> Result<bool, CommittedValueError> {
-        let obj_reg = register_operand(operands.first())
-            .map_err(CommittedValueError::Fatal)?;
-        let name_idx = const_operand(operands.get(1))
-            .map_err(CommittedValueError::Fatal)?;
-        let src_reg = register_operand(operands.get(2))
-            .map_err(CommittedValueError::Fatal)?;
-        let scratch_reg = register_operand(operands.get(3))
-            .map_err(CommittedValueError::Fatal)?;
+        let obj_reg = register_operand(operands.first()).map_err(CommittedValueError::Fatal)?;
+        let name_idx = const_operand(operands.get(1)).map_err(CommittedValueError::Fatal)?;
+        let src_reg = register_operand(operands.get(2)).map_err(CommittedValueError::Fatal)?;
+        let scratch_reg = register_operand(operands.get(3)).map_err(CommittedValueError::Fatal)?;
         let atomized_key = context
             .property_atom(name_idx)
             .ok_or(VmError::InvalidOperand)
@@ -1100,13 +1075,22 @@ impl Interpreter {
             .ok_or(VmError::InvalidOperand)
             .map_err(CommittedValueError::Fatal)?;
         property_slot.record_attempt();
-        let receiver = *read_register(&stack[top_idx], obj_reg)
-            .map_err(CommittedValueError::Fatal)?;
-        let value = *read_register(&stack[top_idx], src_reg)
-            .map_err(CommittedValueError::Fatal)?;
+        let receiver =
+            *read_register(&stack[top_idx], obj_reg).map_err(CommittedValueError::Fatal)?;
+        let value = *read_register(&stack[top_idx], src_reg).map_err(CommittedValueError::Fatal)?;
         // §15.7.1 — Op::StorePropertyStrict forces strict PutValue
         // failure semantics for class parts lowered into sloppy frames.
         let strict = force_strict || Self::current_frame_is_strict(stack, context);
+        if receiver
+            .as_object()
+            .is_some_and(|object| self.is_array_prototype_object(object))
+        {
+            self.store_property_value(context, stack, receiver, name, value, strict)?;
+            stack[top_idx]
+                .advance_pc()
+                .map_err(CommittedValueError::Fatal)?;
+            return Ok(true);
+        }
         if let Some(obj) = receiver.as_object()
             && object::supports_fast_property_ic(obj, &self.gc_heap)
         {
@@ -1603,19 +1587,16 @@ impl Interpreter {
         context: &ExecutionContext,
         operands: impl crate::executable::OperandSource,
     ) -> Result<bool, CommittedValueError> {
-        let dst = register_operand(operands.first())
-            .map_err(CommittedValueError::Fatal)?;
-        let obj_reg = register_operand(operands.get(1))
-            .map_err(CommittedValueError::Fatal)?;
-        let name_idx = const_operand(operands.get(2))
-            .map_err(CommittedValueError::Fatal)?;
+        let dst = register_operand(operands.first()).map_err(CommittedValueError::Fatal)?;
+        let obj_reg = register_operand(operands.get(1)).map_err(CommittedValueError::Fatal)?;
+        let name_idx = const_operand(operands.get(2)).map_err(CommittedValueError::Fatal)?;
         let atomized_key = context
             .property_atom(name_idx)
             .ok_or(VmError::InvalidOperand)
             .map_err(CommittedValueError::Fatal)?;
         let top_idx = stack.len() - 1;
-        let receiver = *read_register(&stack[top_idx], obj_reg)
-            .map_err(CommittedValueError::Fatal)?;
+        let receiver =
+            *read_register(&stack[top_idx], obj_reg).map_err(CommittedValueError::Fatal)?;
         let Some(proxy) = receiver.as_proxy() else {
             return Ok(false);
         };
@@ -1650,20 +1631,16 @@ impl Interpreter {
         context: &ExecutionContext,
         operands: impl crate::executable::OperandSource,
     ) -> Result<bool, CommittedValueError> {
-        let dst = register_operand(operands.first())
-            .map_err(CommittedValueError::Fatal)?;
-        let obj_reg = register_operand(operands.get(1))
-            .map_err(CommittedValueError::Fatal)?;
-        let idx_reg = register_operand(operands.get(2))
-            .map_err(CommittedValueError::Fatal)?;
+        let dst = register_operand(operands.first()).map_err(CommittedValueError::Fatal)?;
+        let obj_reg = register_operand(operands.get(1)).map_err(CommittedValueError::Fatal)?;
+        let idx_reg = register_operand(operands.get(2)).map_err(CommittedValueError::Fatal)?;
         let top_idx = stack.len() - 1;
-        let receiver = *read_register(&stack[top_idx], obj_reg)
-            .map_err(CommittedValueError::Fatal)?;
+        let receiver =
+            *read_register(&stack[top_idx], obj_reg).map_err(CommittedValueError::Fatal)?;
         if !receiver.is_proxy() {
             return Ok(false);
         }
-        let idx = *read_register(&stack[top_idx], idx_reg)
-            .map_err(CommittedValueError::Fatal)?;
+        let idx = *read_register(&stack[top_idx], idx_reg).map_err(CommittedValueError::Fatal)?;
         let key = Self::coerce_vm_property_key(Some(&idx), &self.gc_heap)
             .map_err(CommittedValueError::JavaScript)?;
         stack[top_idx]

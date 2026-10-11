@@ -1,8 +1,6 @@
 //! Promise opcode helpers.
 //!
-//! Promise and microtask opcode helpers.
-//!
-//! Fixed-width promise helpers and variadic promise/microtask call glue stay
+//! Fixed-width promise helpers and variadic promise call glue stay
 //! out of the main dispatch loop while preserving the compact executable
 //! operand path.
 //!
@@ -10,7 +8,6 @@
 //! - Wrap a value in an already-fulfilled promise.
 //! - Construct a promise with an executor.
 //! - Dispatch promise static methods.
-//! - Enqueue `queueMicrotask` callbacks.
 //!
 //! # Invariants
 //! - The produced promise carries the current execution context for reaction
@@ -28,8 +25,7 @@ use otter_bytecode::Operand;
 use smallvec::SmallVec;
 
 use crate::{
-    CommittedValueError, ExecutionContext, Frame, Interpreter, Microtask, Value, VmError,
-    microtask,
+    CommittedValueError, ExecutionContext, Frame, Interpreter, Value, VmError,
     operand_decode::{const_operand, register_operand},
     promise_dispatch, read_register, write_register,
 };
@@ -48,34 +44,6 @@ impl Interpreter {
             .fulfilled_stack_rooted(self, stack, value, &[], &[])?;
         write_register(&mut stack[top_idx], dst, Value::promise(promise))?;
         stack[top_idx].advance_pc()?;
-        Ok(())
-    }
-
-    pub(crate) fn run_queue_microtask_operands(
-        &mut self,
-        context: &ExecutionContext,
-        frame: &mut Frame,
-        operands: impl crate::executable::OperandSource,
-    ) -> Result<(), VmError> {
-        let callee_reg = register_operand(operands.first())?;
-        let callee = *read_register(frame, callee_reg)?;
-        if !self.is_callable_runtime(&callee) {
-            return Err(VmError::NotCallable);
-        }
-        let args = collect_variadic_args(frame, operands, 1, 2)?;
-        let realm_id = self.reaction_realm(Some(callee), self.active_realm_id)?;
-        let source = self.callable_context(Some(context), callee)?;
-        frame.advance_pc()?;
-        self.microtasks.enqueue(Microtask {
-            callee,
-            this_value: Value::undefined(),
-            args,
-            context: source,
-            realm_id,
-            result_capability: None,
-            kind: microtask::MicrotaskKind::Call,
-            async_context: self.async_context(),
-        });
         Ok(())
     }
 

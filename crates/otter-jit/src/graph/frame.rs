@@ -4,6 +4,7 @@
 //! - [`SlotLayout`] places tagged homes, exception scratch and untagged homes.
 //! - [`deopt_frames`] maps complete inline states to the VM's recovery frames.
 //! - [`exit_reason`] selects the shared semantic exit and recovery action.
+//! - [`allocation_exit_reason`] distinguishes receiver and value probe misses.
 //!
 //! # Invariants
 //! - Only initialized tagged words are collector roots; unboxed homes follow.
@@ -68,6 +69,15 @@ pub(crate) fn can_defer_frame(
                         )
                 })
         })
+}
+
+/// Classify an emitted pre-effect probe by its operation, independently of the
+/// source opcode: an ordinary `New` can allocate either a receiver or an Array.
+pub(crate) fn allocation_exit_reason(kind: &Kind) -> ExitReason {
+    match kind {
+        Kind::NewReceiver(_) => ExitReason::ReceiverAllocationMiss,
+        _ => ExitReason::AllocationMiss,
+    }
 }
 
 /// Frame-slot geometry shared by ordinary call and OSR entry.

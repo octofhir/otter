@@ -6,6 +6,7 @@
 //! - Inline appends stay native; suffix appends use the collecting cached store.
 //! - Known ordinary receivers select load programs across body splices.
 //! - Uncovered known shapes keep guards and exact eager source chains.
+//! - Field summaries retain nullable distinctions and recheck metadata after effects.
 //!
 //! # Invariants
 //! Fake shape offsets are compile-time geometry only; no fake object executes.
@@ -23,14 +24,51 @@ use otter_vm::{
     ExecutionContext, JitCompileSnapshot, JitInlineCallee,
     jit::{
         JitCacheIrOp, JitCacheIrProgram, JitDirectCallPlan, JitDirectCallThisMode, JitDirectCallee,
-        JitPrototypeValidity, JitTestInstruction,
+        JitFieldType, JitFieldTypeGuard, JitPrototypeValidity, JitTestInstruction,
     },
     native_abi::NativeFrameKind,
-    object::FieldLocation,
+    object::{FieldLocation, field_type},
 };
 
 use super::{Kind, Repr, build};
 use crate::graph::{BaselineSupport, bytecode::Analysis};
+
+#[path = "builder_field_type_tests.rs"]
+mod field_type_tests;
+
+fn seed_top_fields(view: &mut JitCompileSnapshot) {
+    for programs in view.property_programs.values() {
+        for program in programs {
+            let Some(JitCacheIrOp::GuardShape { object: 0, shape }) = program.ops.first() else {
+                continue;
+            };
+            let shape = program
+                .ops
+                .iter()
+                .find_map(|op| match op {
+                    JitCacheIrOp::PublishShape { object: 0, shape } => Some(*shape),
+                    _ => None,
+                })
+                .unwrap_or(*shape);
+            for op in &program.ops {
+                if let JitCacheIrOp::StoreField { object: 0, field } = op {
+                    view.field_types.insert(
+                        (shape, *field),
+                        JitFieldType {
+                            guard: JitFieldTypeGuard {
+                                owner_shape: shape,
+                                expected: field_type::TOP,
+                            },
+                            shapes: smallvec::SmallVec::new(),
+                            stored_shapes: smallvec::SmallVec::new(),
+                            nullish_mask: 0,
+                        },
+                    );
+                }
+            }
+        }
+    }
+}
 
 #[test]
 fn own_fields_keep_the_bank_in_a_single_access_and_barrier_the_receiver() {
@@ -93,6 +131,7 @@ fn own_fields_keep_the_bank_in_a_single_access_and_barrier_the_receiver() {
                     .into_boxed_slice(),
                 }],
             );
+            seed_top_fields(&mut view);
             let analysis = Rc::new(Analysis::build(&view).unwrap());
             let built = build(
                 &view,
@@ -107,14 +146,22 @@ fn own_fields_keep_the_bank_in_a_single_access_and_barrier_the_receiver() {
                 .graph
                 .nodes
                 .iter()
-                .filter(|node| matches!(node.kind, Kind::LoadOwnField(_) | Kind::StoreOwnField(_)))
+                .filter(|node| {
+                    matches!(
+                        node.kind,
+                        Kind::LoadOwnField(_) | Kind::StoreOwnField { .. }
+                    )
+                })
                 .collect();
             assert_eq!(accesses.len(), 1);
             let access = accesses[0];
             assert_eq!(
                 access.kind,
                 if store {
-                    Kind::StoreOwnField(field)
+                    Kind::StoreOwnField {
+                        field,
+                        owners: smallvec::SmallVec::new(),
+                    }
                 } else {
                     Kind::LoadOwnField(field)
                 }
@@ -175,6 +222,7 @@ fn store_graph(op: Op, programs: Vec<JitCacheIrProgram>) -> super::Built {
     );
     view.seed_property_attempted_for_test(0);
     view.property_programs.insert(0, programs);
+    seed_top_fields(&mut view);
     let analysis = Rc::new(Analysis::build(&view).unwrap());
     build(
         &view,
@@ -275,13 +323,11 @@ fn inline_appends_and_existing_suffix_overwrites_still_specialize() {
                 .into_boxed_slice(),
             }],
         );
-        assert!(
-            built
-                .graph
-                .nodes
-                .iter()
-                .any(|node| node.kind == Kind::StoreOwnField(field))
-        );
+        assert!(built.graph.nodes.iter().any(|node| node.kind
+            == Kind::StoreOwnField {
+                field,
+                owners: smallvec::SmallVec::new()
+            }));
         assert!(
             !built.graph.nodes.iter().any(|node| matches!(
                 node.kind,

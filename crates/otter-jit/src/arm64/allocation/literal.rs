@@ -10,6 +10,10 @@
 //! are initialized before the single cursor publication. Fits cannot collect;
 //! fresh young cells need no initializing write barrier. Only the four declared
 //! GP temporaries, x16/x17 and reserved d31 are clobbered.
+//! Live shaped fields update their defining summaries through a noncollecting
+//! leaf on an inline membership miss, before the cell becomes visible.
+//! Captured membership comes from the literal's source snapshot and is used
+//! only when its defining owner matches the plan's retained owner.
 //!
 //! # See also
 //! `otter_vm::jit::JitLiteralAllocationPlans` owns geometry and source semantics.
@@ -18,7 +22,7 @@ use super::empty::emit_source_realm_guard;
 use super::{emit_bump_probe, emit_publish};
 use crate::allocation::{AllocationValue, LabRegisters};
 use crate::artifact::relocation::{RelocationCapture, RelocationTarget};
-use crate::entry::{VALUE_HOLE, VALUE_UNDEFINED};
+use crate::entry::{ALLOC_WINDOW_LAB_OFFSET, VALUE_HOLE, VALUE_UNDEFINED};
 use crate::template::arm64::values::{emit_load_symbol_u64, emit_load_u64};
 use dynasmrt::{DynamicLabel, DynasmApi, DynasmLabelApi, aarch64::Assembler, dynasm};
 use otter_vm::jit::{
@@ -44,14 +48,17 @@ fn emit_load_input(ops: &mut Assembler, input: AllocationValue) {
 
 pub(crate) fn emit_object_literal(
     ops: &mut Assembler,
+    relocations: &mut RelocationCapture,
+    view: &otter_vm::JitCompileSnapshot,
     context: u8,
     realm: u32,
-    plan: JitObjectLiteralAllocationPlan,
+    plan: &JitObjectLiteralAllocationPlan,
     inputs: &[AllocationValue],
     regs: LabRegisters,
     slow: DynamicLabel,
 ) {
     assert_eq!(inputs.len(), plan.value_count as usize);
+    assert_eq!(inputs.len(), plan.field_owners.len());
     emit_source_realm_guard(ops, context, realm, regs.scratch, slow);
     emit_load_u64(ops, regs.size, u64::from(plan.cell_bytes));
     emit_bump_probe(ops, context, regs, slow);
@@ -75,6 +82,36 @@ pub(crate) fn emit_object_literal(
             None => emit_load_u64(ops, 16, VALUE_UNDEFINED),
         }
         dynasm!(ops ; .arch aarch64 ; str x16, [X(candidate), byte]);
+    }
+    let mut observed = false;
+    for (index, (input, owner)) in inputs.iter().zip(&plan.field_owners).enumerate() {
+        if *owner == 0 {
+            continue;
+        }
+        emit_load_input(ops, *input);
+        dynasm!(ops ; .arch aarch64 ; mov X(regs.buffer), x16);
+        emit_load_u64(ops, regs.scratch, u64::from(*owner));
+        let known = view
+            .field_types
+            .get(&(
+                plan.shape,
+                otter_vm::object::FieldLocation::inline(index as u32),
+            ))
+            .filter(|record| record.guard.owner_shape == *owner)
+            .map(|record| (record.stored_shapes.as_slice(), record.nullish_mask))
+            .unwrap_or((&[], 0));
+        crate::arm64::field_type::emit_observe_known(
+            ops,
+            relocations,
+            view,
+            regs.scratch,
+            regs.buffer,
+            known,
+        );
+        observed = true;
+    }
+    if observed {
+        dynasm!(ops ; .arch aarch64 ; ldr X(regs.buffer), [X(context), ALLOC_WINDOW_LAB_OFFSET]);
     }
     emit_publish(ops, regs);
 }

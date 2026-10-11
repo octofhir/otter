@@ -163,9 +163,9 @@ fn prepare(arena: &mut [u64], view: &mut JitCompileSnapshot, proof: &AtomicU32) 
     // in one component; only the third full key matches.
     put(arena, 0, 7u64);
     put(arena, 8, 123u32);
-    put(arena, 64, 123u64);
-    put(arena, 72, 0u32);
-    let row = 128;
+    put(arena, 72, 123u64);
+    put(arena, 80, 0u32);
+    let row = 144;
     put(arena, row, 7u64);
     put(arena, row + 8, 0u32);
     put(arena, row + 12, PropertyLoadAction::InheritedData as u8);
@@ -176,13 +176,15 @@ fn prepare(arena: &mut [u64], view: &mut JitCompileSnapshot, proof: &AtomicU32) 
     put_offset(arena, row + 20, HOLDER_SHAPE);
     put_offset(arena, row + 24, ROOT);
     put_offset(arena, row + 28, CHILD);
-    put(arena, row + 32, 8u64);
-    put(arena, row + 40, 9u64);
-    put(arena, row + 48, proof as *const AtomicU32 as usize);
+    put(arena, row + 32, 0u32);
+    put(arena, row + 36, 0u32);
+    put(arena, row + 40, 8u64);
+    put(arena, row + 48, 9u64);
     put(arena, row + 56, proof as *const AtomicU32 as usize);
+    put(arena, row + 64, proof as *const AtomicU32 as usize);
     view.property_action_cache = Some(JitPropertyActionCache {
         table_addr: arena.as_ptr() as usize,
-        entry_bytes: 64,
+        entry_bytes: 72,
         set_mask: 0,
         ways: 4,
         receiver_shape_id_byte: 0,
@@ -195,10 +197,11 @@ fn prepare(arena: &mut [u64], view: &mut JitCompileSnapshot, proof: &AtomicU32) 
         holder_shape_byte: 20,
         holder_root_byte: 24,
         target_shape_byte: 28,
-        holder_shape_id_byte: 32,
-        target_shape_id_byte: 40,
-        load_validity_byte: 48,
-        store_validity_byte: 56,
+        store_owner_byte: 32,
+        holder_shape_id_byte: 40,
+        target_shape_id_byte: 48,
+        load_validity_byte: 56,
+        store_validity_byte: 64,
         shape_id_byte: SHAPE_ID_BYTE,
         hash_shape_multiplier: 0x9e37_79b9_7f4a_7c15,
         hash_atom_multiplier: 0xc2b2_ae3d_27d4_eb4f,
@@ -288,11 +291,11 @@ fn emitted_actions_keep_inherited_reads_append_slots_and_pre_effect_misses_indep
         );
         assert_eq!(arena, before);
     }
-    put(&mut arena, 140, PropertyLoadAction::OwnData as u8);
-    put(&mut arena, 141, PropertyStoreAction::Unknown as u8);
-    put(&mut arena, 146, false);
-    put_offset(&mut arena, 148, RECEIVER_SHAPE);
-    put(&mut arena, 160, 7u64);
+    put(&mut arena, 156, PropertyLoadAction::OwnData as u8);
+    put(&mut arena, 157, PropertyStoreAction::Unknown as u8);
+    put(&mut arena, 162, false);
+    put_offset(&mut arena, 164, RECEIVER_SHAPE);
+    put(&mut arena, 184, 7u64);
     let own = executable(&view, false, true);
     let before_own = arena.clone();
     assert_eq!(
@@ -340,9 +343,9 @@ fn emitted_actions_keep_inherited_reads_append_slots_and_pre_effect_misses_indep
     for failure in 0..9 {
         prepare(&mut arena, &mut view, &proof);
         match failure {
-            0 => put(&mut arena, 136, 10u32), // full key mismatch
-            1 => put(&mut arena, 141, PropertyStoreAction::Unknown as u8),
-            2 => put(&mut arena, 156, 0u32), // runtime-only transition
+            0 => put(&mut arena, 152, 10u32), // full key mismatch
+            1 => put(&mut arena, 157, PropertyStoreAction::Unknown as u8),
+            2 => put(&mut arena, 172, 0u32), // runtime-only transition
             3 => proof.store(0, std::sync::atomic::Ordering::Relaxed),
             4 => put(
                 &mut arena,
@@ -356,7 +359,7 @@ fn emitted_actions_keep_inherited_reads_append_slots_and_pre_effect_misses_indep
             ),
             6 => put(&mut arena, CHILD + SHAPE_ID_BYTE as usize, 123u64),
             7 => {
-                put(&mut arena, 144, 2u16);
+                put(&mut arena, 160, 2u16);
                 put(
                     &mut arena,
                     RECEIVER + view.field_layout.slab_handle_byte as usize,
@@ -382,9 +385,9 @@ fn emitted_actions_keep_inherited_reads_append_slots_and_pre_effect_misses_indep
         proof.store(1, std::sync::atomic::Ordering::Relaxed);
     }
     prepare(&mut arena, &mut view, &proof);
-    put(&mut arena, 140, PropertyLoadAction::Unknown as u8);
-    put(&mut arena, 141, PropertyStoreAction::OwnWritable as u8);
-    put(&mut arena, 144, 2u16);
+    put(&mut arena, 156, PropertyLoadAction::Unknown as u8);
+    put(&mut arena, 157, PropertyStoreAction::OwnWritable as u8);
+    put(&mut arena, 160, 2u16);
     put(
         &mut arena,
         RECEIVER_SHAPE + view.shape_state_byte as usize,

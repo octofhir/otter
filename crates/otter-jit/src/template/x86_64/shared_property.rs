@@ -483,6 +483,7 @@ fn emit_store(
         ; mov [rsp], Rq(STORE_SLOT));
     property_ic::emit_slot_store(
         ops,
+        relocations,
         view,
         STORE_RECEIVER,
         STORE_VALUE,

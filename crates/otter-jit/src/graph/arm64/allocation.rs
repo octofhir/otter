@@ -8,6 +8,7 @@
 //! The candidate never aliases the result; the result's previous occupant stays
 //! intact until cold canonical saves. The own source realm guards the fit, and
 //! the existing VM allocator selects that same source realm on a miss.
+//! Literal plans and captured field membership come from that same source.
 //!
 //! # See also
 //! `crate::arm64::allocation` owns the one LAB probe/init/publish implementation.
@@ -27,7 +28,7 @@ impl Codegen<'_> {
         let source = self.view_of(node);
         let realm = source.literal_allocations.realm_id;
         let cage_base = source.cage_base as u64;
-        let object = source.literal_allocations.objects.get(&data.pc).copied();
+        let object = source.literal_allocations.objects.get(&data.pc).cloned();
         let array = source.literal_allocations.arrays.get(&data.pc).copied();
         let kind = data.kind.clone();
         let allocation = self.allocation.node(node);
@@ -62,7 +63,17 @@ impl Codegen<'_> {
         let stub = match kind {
             Kind::NewObjectLiteral => {
                 if let Some(plan) = object {
-                    emit_object_literal(&mut self.ops, 20, realm, plan, &inputs, regs, slow);
+                    emit_object_literal(
+                        &mut self.ops,
+                        &mut self.relocations,
+                        source,
+                        20,
+                        realm,
+                        &plan,
+                        &inputs,
+                        regs,
+                        slow,
+                    );
                     dynasm!(self.ops ; .arch aarch64 ; mov X(destination), X(regs.candidate) ; b =>done);
                 }
                 abi::STUB_JIT_NEW_OBJECT_LITERAL

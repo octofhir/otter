@@ -116,7 +116,7 @@ fn clobbers(graph: &Graph, body: &FxHashSet<BlockId>) -> Option<Clobbers> {
                     clobbers.lengths = true;
                     clobbers.properties = true;
                 }
-                Kind::StoreOwnField(_) => clobbers.properties = true,
+                Kind::StoreOwnField { .. } => clobbers.properties = true,
                 Kind::StoreTaggedField(offset) => {
                     clobbers.slot_offsets.insert(*offset);
                 }

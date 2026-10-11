@@ -12,9 +12,9 @@
 //! # Invariants
 //! - Feedback is read from the site's native slot at run time, never baked:
 //!   generated code is unchanged when the slot's entries change.
-//! - The inline path neither allocates nor calls, so it carries no safepoint;
-//!   the receiver pointer is recomputed from the rooted frame slot on every
-//!   access and never survives one.
+//! - The inline path cannot collect or reenter and carries no safepoint. A
+//!   field-summary membership miss uses a noncollecting metadata leaf. The
+//!   receiver pointer is recomputed from the rooted frame slot on every access.
 //! - The slot base derives from the fresh header (in-object slots) or the
 //!   out-of-line slab handle — never a cached body pointer that the moving
 //!   collector could dangle.
@@ -315,7 +315,9 @@ pub(super) fn emit_store_property(
         ; .arch aarch64
         ; ldr X(STORE_VALUE), [x19, src_off]
         ; str X(STORE_VALUE), [x16, x14, lsl #3]
+        ; ldr W(STORE_SLOT), [X(STORE_SLOT), IC.inline_owner_byte]
     );
+    crate::arm64::field_type::emit_observe(ops, relocations, view, STORE_SLOT, STORE_VALUE);
     emit_cell_test(ops, STORE_VALUE, CellTest::IsNotCell, primitive);
     emit_write_barrier(ops, relocations, view, STORE_RECEIVER, STORE_VALUE);
     dynasm!(ops

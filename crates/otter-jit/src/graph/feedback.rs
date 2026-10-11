@@ -318,6 +318,8 @@ pub(crate) fn named_store_programs(
         let mut holder = false;
         let mut stored = false;
         let mut published = false;
+        let mut receiver_shape = None;
+        let mut stored_field = None;
         for op in program.ops.iter() {
             if published {
                 return None;
@@ -325,8 +327,13 @@ pub(crate) fn named_store_programs(
             match *op {
                 JitCacheIrOp::LoadPrototypeHolder { result: 1, .. } if !stored => holder = true,
                 JitCacheIrOp::GuardPrototypeValidity { .. } if !stored => {}
-                JitCacheIrOp::GuardShape { object, .. }
-                    if !stored && (object == 0 || (object == 1 && holder)) => {}
+                JitCacheIrOp::GuardShape { object, shape }
+                    if !stored && (object == 0 || (object == 1 && holder)) =>
+                {
+                    if object == 0 {
+                        receiver_shape = Some(shape);
+                    }
+                }
                 JitCacheIrOp::GuardPrototypeNull { object }
                     if !stored && (object == 0 || (object == 1 && holder)) => {}
                 JitCacheIrOp::GuardAtomSlot {
@@ -336,14 +343,21 @@ pub(crate) fn named_store_programs(
                 } if !stored => {}
                 JitCacheIrOp::GuardExtensible { object: 0, field }
                     if !stored && field.is_inline() => {}
-                JitCacheIrOp::StoreField { object: 0, .. } if !stored => stored = true,
-                JitCacheIrOp::PublishShape { object: 0, .. } if stored => published = true,
+                JitCacheIrOp::StoreField { object: 0, field } if !stored => {
+                    stored = true;
+                    stored_field = Some(field);
+                }
+                JitCacheIrOp::PublishShape { object: 0, shape } if stored => {
+                    published = true;
+                    receiver_shape = Some(shape);
+                }
                 _ => return None,
             }
         }
         if !stored {
             return None;
         }
+        view.field_types.get(&(receiver_shape?, stored_field?))?;
     }
     Some(programs)
 }

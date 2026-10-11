@@ -37,6 +37,7 @@
 //! - `ordinary_set` and `descriptor_install` — assignment gates and the sole
 //!   rooted descriptor publication owner.
 //! - `symbol_table` — one managed ordered descriptor table for objects/arrays.
+//! - [`field_type`] — shape-owned nullish and exact-shape field summaries.
 //! - [`JsObject`] / [`ObjectBody`] / [`Properties`] — the public object handle,
 //!   the GC-allocated storage, and the read-only view used by JSON
 //!   serialisation and `Object.keys` enumeration.
@@ -68,8 +69,12 @@
 //! - A shape fixes inline capacity as well as prototype. Overflow slabs hold
 //!   only the suffix; inline prefix words never migrate. Capacity roots are
 //!   cached per prototype, capacity and complete immutable state.
-//! - GC shape bodies are immutable after allocation; transition tables and
-//!   offset maps live in interpreter-owned side caches.
+//! - GC shape layouts are immutable except for constructor slack completion;
+//!   scalar stability and field summaries widen monotonically. Transition
+//!   tables and offset maps live in interpreter-owned side caches.
+//! - Every live shaped data field contributes to its defining shape's summary
+//!   at birth, store and adoption into an independent lineage. Collector
+//!   handle rewrites do not change these scalar summaries.
 //! - Dictionary string-slot redefinitions and bulk integrity changes retire
 //!   the structural identity and any changed watched-slot layout proof before
 //!   publishing descriptors. A bulk change retires each proof domain once.
@@ -109,6 +114,7 @@ pub(crate) use descriptor_core::validate_descriptor_partial;
 mod descriptor_install;
 mod descriptor_mutation;
 mod field_location;
+pub mod field_type;
 mod ordinary_set;
 mod own_slot_cache;
 pub(crate) use own_slot_cache::OwnSlotCache;
@@ -691,8 +697,7 @@ impl ShapeId {
         self.0
     }
 
-    /// Rebuild a stable VM-local identity in tests.
-    #[cfg(test)]
+    /// Rebuild an identity captured in scalar metadata.
     #[must_use]
     pub(crate) const fn from_raw(raw: u64) -> Self {
         Self(raw)
@@ -817,9 +822,19 @@ impl ObjectBody {
     #[inline]
     pub(crate) fn adopt_shape(&mut self, shape: ShapeHandle) {
         if self.shape != shape {
+            let live = self.slot_count();
+            let shared = shape_body::parent_of(shape) == self.shape
+                || shape_body::parent_of(self.shape) == shape;
             shape_body::note_left(self.shape);
             self.shape = shape;
+            if !shared {
+                self.seed_field_types(live.min(self.slot_count()));
+            }
         }
+    }
+
+    fn seed_field_types(&self, count: usize) {
+        field_type::seed(self.shape, count, |slot| self.slot_word(slot as usize));
     }
 
     /// Retire dependent proofs before changing a watched prototype.
@@ -1554,11 +1569,7 @@ impl ErrorStackBody {
 
     fn bytes_ptr(&self) -> *mut u8 {
         // SAFETY: the arena follows the records.
-        unsafe {
-            self.records_ptr()
-                .add(self.frame_count)
-                .cast::<u8>()
-        }
+        unsafe { self.records_ptr().add(self.frame_count).cast::<u8>() }
     }
 
     fn str_at(&self, offset: usize, len: usize) -> &str {
@@ -2009,10 +2020,16 @@ impl ObjectBody {
         self.enter_dictionary_mode_as(next_shape_id(), advance_layout);
     }
 
-    /// [`Self::enter_dictionary_mode`] under a structural id the caller
-    /// chose (a captured transition replays its id), advancing the
-    /// slot-layout epoch when `advance_layout`.
+    /// [`Self::enter_dictionary_mode`] under an assigned caller-provided
+    /// structural id, or a fresh id when the caller passes `UNASSIGNED`.
+    /// Captured transitions replay their assigned id; `advance_layout`
+    /// advances the slot-layout epoch.
     pub(super) fn enter_dictionary_mode_as(&mut self, id: ShapeId, advance_layout: bool) {
+        let id = if id == ShapeId::UNASSIGNED {
+            next_shape_id()
+        } else {
+            id
+        };
         self.invalidate_prototype_proofs();
         let count = self.slot_count();
         let dictionary = shape_body::dictionary_of(self.shape);
@@ -2182,13 +2199,14 @@ impl ObjectBody {
         debug_assert!(i < self.slot_count(), "slab write out of range");
         // SAFETY: same in-range word as `slot_word`.
         unsafe { *self.field_ptr(self.location_for_slot(i)) = value };
+        field_type::observe_slot(self.shape, i, value);
     }
 
     /// Write slot word `index` of an append into the active buffer. The
     /// caller reserved the room through [`reserve_slot_capacity`], which
     /// grows only the suffix when the shape-owned capacity is exhausted.
-    /// A shaped object's count follows from the shape its caller installs
-    /// (before or after this write, with no safepoint between); a
+    /// A shaped object's count follows from the shape its caller installed
+    /// before this write, with no safepoint between; a
     /// dictionary object's count advances here.
     #[inline]
     fn push_slab_word(&mut self, index: usize, value: Value) {
@@ -2203,13 +2221,14 @@ impl ObjectBody {
         // SAFETY: the append index is inside the reserved capacity of the
         // active buffer.
         unsafe { *self.field_ptr(self.location_for_slot(index)) = value };
+        field_type::observe_slot(self.shape, index, value);
         if self.is_dictionary() {
             debug_assert_eq!(self.slot_count(), index, "dictionary append desynced");
             self.set_dictionary_slot_count(index + 1);
         } else {
             let count = self.slot_count();
             debug_assert!(
-                count == index || count == index + 1,
+                count == index + 1,
                 "shaped append at {index} under a shape of {count} slots"
             );
         }
@@ -3044,6 +3063,7 @@ fn alloc_object_body_with_roots(
                     Value::undefined()
             };
         }
+        body.seed_field_types(body.slot_count());
     })
 }
 
@@ -3063,6 +3083,7 @@ fn alloc_object_body_old(
                     Value::undefined()
             };
         }
+        body.seed_field_types(body.slot_count());
     })
 }
 
@@ -3237,6 +3258,7 @@ pub(crate) fn alloc_object_with_shape_and_values_roots(
                     *FieldLocation::inline(index as u32).word_ptr(body.inline_values_ptr()) = value
                 };
             }
+            body.seed_field_types(values_len);
         },
     )
 }
@@ -3290,6 +3312,7 @@ pub(crate) fn install_fresh_shape_with_slots(
             "shape transition changed object footprint"
         );
         body.adopt_shape(shape);
+        body.seed_field_types(stored.len());
     });
     for &value in &stored {
         record_slot_write(heap, obj, value);
@@ -3327,6 +3350,7 @@ pub(crate) fn try_alloc_object_with_shape_no_collect(
                     Value::undefined()
             };
         }
+        body.seed_field_types(body.slot_count());
     })
     .ok()
 }
@@ -3362,6 +3386,7 @@ pub(crate) fn alloc_diagnostic_object(
                     Value::undefined()
             };
         }
+        body.seed_field_types(body.slot_count());
     });
     Ok(object)
 }
@@ -7015,17 +7040,26 @@ mod tests {
                 .expect("fast property");
             if i + 1 < limit {
                 normalize_before_keyed_addition(&mut o, interp.gc_heap_mut()).expect("check");
-                assert!(!is_dictionary(o, interp.gc_heap()), "below the limit at {i}");
+                assert!(
+                    !is_dictionary(o, interp.gc_heap()),
+                    "below the limit at {i}"
+                );
             }
         }
         normalize_before_keyed_addition(&mut o, interp.gc_heap_mut()).expect("normalize");
         assert!(is_dictionary(o, interp.gc_heap()));
-        assert_eq!(get_own(o, interp.gc_heap(), "k0"), Some(Value::number_i32(0)));
+        assert_eq!(
+            get_own(o, interp.gc_heap(), "k0"),
+            Some(Value::number_i32(0))
+        );
         let keys: Vec<String> = with_properties(o, interp.gc_heap(), |p| {
             p.keys().map(str::to_string).collect()
         });
         assert_eq!(keys.len(), limit);
-        assert_eq!(keys.last().map(String::as_str), Some(format!("k{}", limit - 1).as_str()));
+        assert_eq!(
+            keys.last().map(String::as_str),
+            Some(format!("k{}", limit - 1).as_str())
+        );
 
         let mut prototype = interp
             .realm_intrinsics

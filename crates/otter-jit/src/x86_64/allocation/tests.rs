@@ -29,7 +29,7 @@ use otter_vm::{
 const POISON: u64 = 0xcafe_1357_2468_abcd;
 const OLD_RESULT: usize = 0x1357;
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 enum Layout {
     Empty(EmptyLiteralLayout),
     Object(JitObjectLiteralAllocationPlan),
@@ -41,7 +41,7 @@ fn put32(words: &mut [u64], byte: u32, value: u32) {
 }
 
 fn execute(
-    layout: Layout,
+    layout: &Layout,
     values: &[u64],
     fits: bool,
     expected_realm: u32,
@@ -128,17 +128,25 @@ fn execute(
         .collect::<Vec<_>>();
     let mut relocations = RelocationCapture::default();
     match layout {
-        Layout::Empty(plan) => emit_empty_literal(&mut ops, 15, expected_realm, plan, regs, slow),
-        Layout::Object(plan) => {
-            emit_object_literal(&mut ops, 15, expected_realm, plan, &inputs, regs, slow)
-        }
+        Layout::Empty(plan) => emit_empty_literal(&mut ops, 15, expected_realm, *plan, regs, slow),
+        Layout::Object(plan) => emit_object_literal(
+            &mut ops,
+            &mut relocations,
+            &otter_vm::JitCompileSnapshot::without_feedback(0, 0, 0, vec![]),
+            15,
+            expected_realm,
+            plan,
+            &inputs,
+            regs,
+            slow,
+        ),
         Layout::Array(plan) => emit_array_literal(
             &mut ops,
             &mut relocations,
             15,
             expected_realm,
             start as u64 - 4096,
-            plan,
+            *plan,
             &inputs,
             regs,
             slow,
@@ -285,7 +293,7 @@ fn native_empty_fit_and_pre_effect_realm_limit_misses_keep_late_result() {
         )),
     ];
     for regs in RECIPES {
-        for layout in layouts {
+        for layout in &layouts {
             execute(layout, &[], true, 0, 0, regs);
             execute(layout, &[], false, 0, 0, regs);
             execute(layout, &[], true, 0, 1, regs);
@@ -305,6 +313,7 @@ fn native_literal_bulk_homes_and_numeric_holes_initialize_and_count_exact_cells(
             | ((fields.cell_bytes(64) as u64) << 32),
         inline_capacity: 64,
         value_count: 63,
+        field_owners: (0..63).map(|_| 0).collect(),
         fields,
     };
     let object_values = (0..63)
@@ -330,7 +339,7 @@ fn native_literal_bulk_homes_and_numeric_holes_initialize_and_count_exact_cells(
     ];
     for regs in RECIPES {
         for (layout, values) in [
-            (Layout::Object(object), object_values.as_slice()),
+            (Layout::Object(object.clone()), object_values.as_slice()),
             (
                 Layout::Array(JitArrayLiteralAllocationPlan::new(numeric.len()).unwrap()),
                 numeric.as_slice(),
@@ -344,10 +353,10 @@ fn native_literal_bulk_homes_and_numeric_holes_initialize_and_count_exact_cells(
                 tagged.as_slice(),
             ),
         ] {
-            execute(layout, values, true, 0, 0, regs);
-            execute(layout, values, false, 0, 0, regs);
-            execute(layout, values, true, 0, 1, regs);
-            execute(layout, values, true, 1, 1, regs);
+            execute(&layout, values, true, 0, 0, regs);
+            execute(&layout, values, false, 0, 0, regs);
+            execute(&layout, values, true, 0, 1, regs);
+            execute(&layout, values, true, 1, 1, regs);
         }
     }
 }

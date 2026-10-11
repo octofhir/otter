@@ -23,6 +23,8 @@
 //!   generations and retained entry-cell tombstones.
 //! - Collector-owned receiver-allocation windows and immutable constructor
 //!   allocation plans used by generated fixed, spread, and superclass linkage.
+//! - Shape-owned field-value bounds with defining-cell authority and rooted
+//!   ordinary target identities.
 //! - [`VmRuntimeActivation`] owns the dynamic VM bridge, including the single
 //!   post-entry feedback/result transaction after generated execution.
 //!
@@ -113,6 +115,9 @@ pub use string_layout::JitStringLayout;
 
 mod native_callable;
 pub use native_callable::JitNativeCallLayout;
+
+mod field_types;
+pub use field_types::{JitFieldType, JitFieldTypeGuard};
 
 /// Opaque collector-owned nursery window carried by the compiled-entry ABI.
 pub type JitMachineAllocationWindow = otter_gc::MachineAllocationWindow;
@@ -714,6 +719,13 @@ pub struct JitCompileSnapshot {
     /// Header-inclusive offset of a shape's stable byte: one while no object
     /// has ever left the shape (see `crate::object::shape_body`).
     pub shape_stable_byte: u32,
+    /// Header-inclusive offset of a shape's monotone field-value word.
+    pub shape_field_type_byte: u32,
+    /// Header-inclusive offset of the immutable u64 shape identity.
+    pub shape_id_byte: u32,
+    /// Defining-cell words and result bounds for ordinary own data locations.
+    /// Keys retain this source body's receiver shape and complete storage bank.
+    pub field_types: rustc_hash::FxHashMap<(u32, crate::object::FieldLocation), JitFieldType>,
     /// Compressed handles of baked shapes no object had left when the
     /// generation compiled. A value proven to have one of them before an
     /// operation that may run code is re-proven afterwards by reading the
@@ -2075,6 +2087,9 @@ impl JitCompileSnapshot {
             gc_barrier: JitGcBarrierLayout::default(),
             shape_prototype_byte: 0,
             shape_stable_byte: 0,
+            shape_field_type_byte: 0,
+            shape_id_byte: 0,
+            field_types: rustc_hash::FxHashMap::default(),
             stable_shapes: rustc_hash::FxHashSet::default(),
             shape_state_byte: 0,
             shape_inline_capacity_byte: 0,

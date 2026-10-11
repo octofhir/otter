@@ -9,6 +9,8 @@
 //!   assignments in [`super::moves`].
 //! - Source-owned global binding reads with eager guards shared with Template.
 //! - Named loads through selected source-program indices and live shape proofs.
+//! - Defining field-summary observation after own stores and shape publication.
+//! - Non-converting nullish comparisons preserve shape and field facts.
 //! - Node emitters for frame, arithmetic, conversion, check, memory, generic
 //!   and control nodes.
 //!
@@ -26,6 +28,10 @@
 //! - Actual collecting calls expire tagged homes no live value or frame
 //!   state can read, after live-register saves. The full tagged root region
 //!   remains fixed; NoAlloc polls and leaf paths do not expire homes.
+//! - Field-summary membership misses preserve live registers through a
+//!   noncollecting leaf after the store and any child-shape publication.
+//! - Static stores use their source snapshot's captured membership only for
+//!   the defining owner selected by the destination shape and logical field.
 //! - Cold exits materialize their selected canonical recipe, expire homes
 //!   outside it, then pass its index to writeback. Throw routing expires all
 //!   allocator homes after catch writeback; the rooted window and reserved
@@ -76,9 +82,11 @@ mod allocation;
 mod binding;
 mod committed_call;
 mod equality;
+mod field_types;
 mod keyed_load;
 mod keyed_store;
 mod native_leaf;
+mod nullish;
 mod own_fields;
 
 const NUMBER_TAG: u64 = tag::NUMBER_TAG;
@@ -930,6 +938,13 @@ impl<'a> Codegen<'a> {
                     dynasm!(self.ops ; .arch aarch64 ; ldrb w16, [x16] ; cbz w16, =>exit);
                 }
             }
+            Kind::CheckFieldTypes(guards) => {
+                let guards = guards.clone();
+                self.emit_field_type_guards(node, &guards);
+            }
+            Kind::CheckNotNullish { mask } => {
+                self.emit_not_nullish(node, *mask);
+            }
             Kind::LoadThis => {
                 let destination = Self::gp(result.expect("a result"));
                 dynasm!(self.ops ; .arch aarch64 ; ldr X(destination), [x21, NATIVE_FRAME_THIS_OFFSET]);
@@ -1496,6 +1511,10 @@ impl<'a> Codegen<'a> {
                 let double = allocation.fp_temps[0];
                 self.emit_loose_equal(node, [a, b], double, destination, *negate)?;
             }
+            Kind::NullishEqual {
+                negate,
+                object_or_nullish,
+            } => self.emit_nullish_equal(node, *negate, *object_or_nullish),
             Kind::CheckNumber => {
                 let a = Self::gp(input(0));
                 let exit = self.eager_exit(node, DeoptReason::WrongType);
@@ -1647,7 +1666,8 @@ impl<'a> Codegen<'a> {
                     false,
                 );
             }
-            Kind::StoreOwnField(field) => {
+            Kind::StoreOwnField { field, owners } => {
+                let owners = owners.clone();
                 let (object, value) = (Self::gp(input(0)), Self::gp(input(1)));
                 own_fields::emit(
                     &mut self.ops,
@@ -1657,6 +1677,42 @@ impl<'a> Codegen<'a> {
                     *field,
                     true,
                 );
+                if !owners.is_empty() {
+                    let owner = allocation.gp_temps[0];
+                    let first_owner = owners[0].owner_shape;
+                    if first_owner != 0 && owners.iter().all(|arm| arm.owner_shape == first_owner) {
+                        self.load_immediate(owner, u64::from(first_owner));
+                        crate::arm64::field_type::emit_observe_known(
+                            &mut self.ops,
+                            &mut self.relocations,
+                            self.view,
+                            owner,
+                            value,
+                            (&owners[0].stored_shapes, owners[0].nullish_mask),
+                        );
+                    } else {
+                        let done = self.ops.new_dynamic_label();
+                        dynasm!(self.ops ; .arch aarch64
+                            ; ldr w16, [X(object), self.view.object_shape_byte]);
+                        for authority in owners.iter().filter(|arm| arm.owner_shape != 0) {
+                            let next = self.ops.new_dynamic_label();
+                            self.load_immediate(owner, u64::from(authority.receiver_shape));
+                            dynasm!(self.ops ; .arch aarch64
+                                ; cmp w16, W(owner) ; b.ne =>next);
+                            self.load_immediate(owner, u64::from(authority.owner_shape));
+                            crate::arm64::field_type::emit_observe_known(
+                                &mut self.ops,
+                                &mut self.relocations,
+                                self.view,
+                                owner,
+                                value,
+                                (&authority.stored_shapes, authority.nullish_mask),
+                            );
+                            dynasm!(self.ops ; .arch aarch64 ; b =>done ; =>next);
+                        }
+                        dynasm!(self.ops ; .arch aarch64 ; =>done);
+                    }
+                }
             }
             Kind::LoadTaggedField(offset) => {
                 let base = Self::gp(input(0));
@@ -2441,6 +2497,25 @@ impl<'a> Codegen<'a> {
             ; tst w16, u32::from(ShapeState::PROTOTYPE_MASK)
             ; b.ne =>exit);
         for program in programs.iter() {
+            let receiver_shape = program.ops.iter().rev().find_map(|op| match *op {
+                Op::PublishShape { shape, .. } | Op::GuardShape { object: 0, shape } => Some(shape),
+                _ => None,
+            });
+            let field = program.ops.iter().find_map(|op| match *op {
+                Op::StoreField { field, .. } => Some(field),
+                _ => None,
+            });
+            let authority = receiver_shape
+                .zip(field)
+                .and_then(|key| self.view_of(node).field_types.get(&key))
+                .ok_or(Unsupported::OperandShape(
+                    "graph named store field authority",
+                ))?;
+            let mut owner = if authority.guard.expected == otter_vm::object::field_type::TOP {
+                0
+            } else {
+                authority.guard.owner_shape
+            };
             let next = self.ops.new_dynamic_label();
             let mut stored_byte = None;
             for op in program.ops.iter() {
@@ -2539,6 +2614,18 @@ impl<'a> Codegen<'a> {
                             ; .arch aarch64
                             ; str w16, [X(receiver), view.object_shape_byte]
                         );
+                        if owner != 0 {
+                            self.load_immediate(holder, u64::from(owner));
+                            crate::arm64::field_type::emit_observe_known(
+                                &mut self.ops,
+                                &mut self.relocations,
+                                view,
+                                holder,
+                                value,
+                                (&authority.stored_shapes, authority.nullish_mask),
+                            );
+                            owner = 0;
+                        }
                         self.emit_shape_child_barrier(node, receiver, shape, scratch);
                     }
                     _ => return Err(Unsupported::OperandShape("graph named store operation")),
@@ -2548,6 +2635,17 @@ impl<'a> Codegen<'a> {
                 return Err(Unsupported::OperandShape(
                     "graph named store without a store",
                 ));
+            }
+            if owner != 0 {
+                self.load_immediate(holder, u64::from(owner));
+                crate::arm64::field_type::emit_observe_known(
+                    &mut self.ops,
+                    &mut self.relocations,
+                    view,
+                    holder,
+                    value,
+                    (&authority.stored_shapes, authority.nullish_mask),
+                );
             }
             dynasm!(self.ops ; .arch aarch64 ; b =>done ; =>next);
         }
@@ -2763,6 +2861,7 @@ impl<'a> Codegen<'a> {
             );
             crate::arm64::property_ic::emit_slot_store(
                 &mut self.ops,
+                &mut self.relocations,
                 view,
                 receiver,
                 value,

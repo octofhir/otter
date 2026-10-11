@@ -45,6 +45,9 @@ pub struct JitPropertyActionCache {
     pub load_slot_byte: u32,
     /// Logical u16 own-overwrite or append slot.
     pub store_slot_byte: u32,
+    /// Compressed defining store owner: zero for shaped Top or a VM-only
+    /// dictionary append whose null target generated probes reject.
+    pub store_owner_byte: u32,
     /// Recorded load descriptor writability, independent of store authorization.
     pub load_writable_byte: u32,
     /// Weak compressed holder shape offset.
@@ -84,6 +87,7 @@ impl PropertyActionCache {
             store_action_byte: offset_of!(PropertyActionEntry, store_action) as u32,
             load_slot_byte: offset_of!(PropertyActionEntry, load_slot) as u32,
             store_slot_byte: offset_of!(PropertyActionEntry, store_slot) as u32,
+            store_owner_byte: offset_of!(PropertyActionEntry, store_owner) as u32,
             load_writable_byte: offset_of!(PropertyActionEntry, load_writable) as u32,
             holder_shape_byte: offset_of!(PropertyActionEntry, holder_shape) as u32,
             holder_root_byte: offset_of!(PropertyActionEntry, holder_root) as u32,
@@ -103,7 +107,7 @@ impl PropertyActionCache {
 
 const _: () = {
     assert!(SETS.is_power_of_two());
-    assert!(size_of::<PropertyActionEntry>() == 64);
+    assert!(size_of::<PropertyActionEntry>() == 72);
     assert!(std::mem::align_of::<PropertyActionEntry>() == 8);
     assert!(size_of::<std::cell::Cell<PropertyActionEntry>>() == size_of::<PropertyActionEntry>());
     assert!(offset_of!(PropertyActionEntry, receiver_shape_id) == 0);
@@ -117,9 +121,11 @@ const _: () = {
     assert!(offset_of!(PropertyActionEntry, holder_shape) == 20);
     assert!(offset_of!(PropertyActionEntry, holder_root) == 24);
     assert!(offset_of!(PropertyActionEntry, target_shape) == 28);
-    assert!(offset_of!(PropertyActionEntry, holder_shape_id) == 32);
-    assert!(offset_of!(PropertyActionEntry, target_shape_id) == 40);
-    assert!(offset_of!(PropertyActionEntry, load_validity) == 48);
-    assert!(offset_of!(PropertyActionEntry, store_validity) == 56);
+    assert!(offset_of!(PropertyActionEntry, store_owner) == 32);
+    assert!(offset_of!(PropertyActionEntry, store_receiver) == 36);
+    assert!(offset_of!(PropertyActionEntry, holder_shape_id) == 40);
+    assert!(offset_of!(PropertyActionEntry, target_shape_id) == 48);
+    assert!(offset_of!(PropertyActionEntry, load_validity) == 56);
+    assert!(offset_of!(PropertyActionEntry, store_validity) == 64);
     assert!(size_of::<crate::object::ShapeHandle>() == size_of::<otter_gc::raw::RawGc>());
 };

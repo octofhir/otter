@@ -463,6 +463,7 @@ fn emit_store(
     dynasm!(ops ; .arch aarch64 ; =>label ; stp x29, x30, [sp, #-16]!);
     property_ic::emit_slot_store(
         ops,
+        relocations,
         view,
         STORE_RECEIVER,
         STORE_VALUE,

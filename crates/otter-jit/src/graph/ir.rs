@@ -15,10 +15,13 @@
 //! - [`Constraints`] / [`Kind::constraints`] — where the register allocator
 //!   must put inputs, the result, and how many temporaries a node needs.
 //! - Named-load plans retain ordered indices into their source body's programs.
+//! - Field-summary checks authorize nullable value bounds; own stores select
+//!   their defining field cell by the receiver's admitted shape.
 //!
 //! # Invariants
 //! - Constants live outside blocks and are materialized at each use; every
-//!   other value node is placed in exactly one block.
+//!   other retained node is placed in exactly one block. Removed checks have
+//!   no block or eager state and are absent from every block's body.
 //! - Every block ends in exactly one control node; phis precede the body.
 //! - A phi has one input per predecessor, in predecessor order. A loop
 //!   header's last predecessor is its back edge.
@@ -32,17 +35,31 @@
 //!   call; the values of the whole chain stay live wherever it is read.
 //! - A named load's receiver shape is a live exact proof. Only a matching
 //!   receiver shape guard may be omitted; holder and chain proofs stay live.
+//! - A field-summary check reads metadata, never a field's current value.
+//!   Its exact ordinary targets still need shape stability confirmation.
 //!
 //! # See also
 //! - [`super::builder`] — builds the graph from bytecode and feedback.
 //! - [`super::regalloc`] — assigns locations from [`Constraints`].
 
-use otter_vm::jit::{JitBodyGuard, JitElementRepr, JitGuardWidth, JitHoleBitmap};
+use otter_vm::jit::{
+    JitBodyGuard, JitElementRepr, JitFieldTypeGuard, JitGuardWidth, JitHoleBitmap,
+};
 use smallvec::SmallVec;
 
 /// Dense node index.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct NodeId(pub(crate) u32);
+
+/// The defining field cell selected by an admitted store receiver shape.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct FieldStoreOwner {
+    pub(crate) receiver_shape: u32,
+    pub(crate) owner_shape: u32,
+    /// Rooted historical targets whose current membership needs no widening.
+    pub(crate) stored_shapes: SmallVec<[u32; 2]>,
+    pub(crate) nullish_mask: u8,
+}
 
 /// Dense block index; block order is emission order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -125,6 +142,8 @@ pub(crate) enum DeoptReason {
     Unsupported,
     /// An object left a shape a fact relied on no object leaving.
     StabilityChanged,
+    /// A shaped field's monotone value bound has widened.
+    FieldTypeChanged,
 }
 
 /// One branch condition of a [`Kind::Branch`].
@@ -298,6 +317,13 @@ pub(crate) enum Kind {
     LooseEqual {
         negate: bool,
     },
+    /// Loose equality against null or undefined, including native HTML-DDA
+    /// cells, without conversion, allocation or JavaScript execution.
+    NullishEqual {
+        negate: bool,
+        /// Ordinary cells and nullish values exclude native HTML-DDA identity.
+        object_or_nullish: bool,
+    },
     /// `ToBoolean` producing a tagged boolean.
     ToBoolean,
     /// `!ToBoolean` producing a tagged boolean.
@@ -313,6 +339,12 @@ pub(crate) enum Kind {
     // ---- Checks ----
     /// Eager deopt unless input0 is a Number.
     CheckNumber,
+    /// Eager deopt if input0 is one of the nullish categories in `mask`.
+    CheckNotNullish {
+        mask: u8,
+    },
+    /// Eager deopt unless every shape-owned field summary matches its snapshot.
+    CheckFieldTypes(SmallVec<[JitFieldTypeGuard; 4]>),
     /// Eager deopt unless input0 is an ordinary object with one of the
     /// shape handles (compressed offsets) and no object-local state
     /// overriding its slots; `writable` also requires that the object is
@@ -352,7 +384,10 @@ pub(crate) enum Kind {
     /// Read input0's shape-owned field without exposing a movable storage address.
     LoadOwnField(otter_vm::object::FieldLocation),
     /// Store input1 into input0's shape-owned field; a separate node owns its barrier.
-    StoreOwnField(otter_vm::object::FieldLocation),
+    StoreOwnField {
+        field: otter_vm::object::FieldLocation,
+        owners: SmallVec<[FieldStoreOwner; 4]>,
+    },
     /// Read a named property of input0 through the selected feedback programs
     /// at `byte_pc`. Indices refer to the original source programs in their
     /// order. A live exact `receiver_shape` proves only a matching receiver
@@ -640,6 +675,7 @@ impl Kind {
                 | Self::Float64Compare(_)
                 | Self::StrictEqual { .. }
                 | Self::LooseEqual { .. }
+                | Self::NullishEqual { .. }
                 | Self::ToBoolean
                 | Self::LogicalNot
                 | Self::TestTypeOf { .. }
@@ -694,6 +730,7 @@ impl Kind {
             | Self::Int32ToFloat64
             | Self::TruncateFloat64ToInt32
             | Self::StrictEqual { .. }
+            | Self::NullishEqual { .. }
             | Self::ToBoolean
             | Self::LogicalNot
             | Self::TestTypeOf { .. }
@@ -728,6 +765,7 @@ impl Kind {
             | Self::CheckedTaggedToIndex
             | Self::CheckedFloat64ToIndex
             | Self::CheckNumber
+            | Self::CheckNotNullish { .. }
             | Self::CheckShapes { .. }
             | Self::CheckBounds
             | Self::CheckFunctionPrototypeCall(_)
@@ -794,7 +832,7 @@ impl Kind {
                 may_collect: true,
                 ..Properties::default()
             },
-            Self::StoreOwnField(_)
+            Self::StoreOwnField { .. }
             | Self::StoreTaggedField(_)
             | Self::StoreElement(_)
             | Self::WriteBarrier
@@ -822,7 +860,7 @@ impl Kind {
                 effectful: true,
                 ..Properties::default()
             },
-            Self::Deopt(_) | Self::CheckStableShapes(_) => Properties {
+            Self::Deopt(_) | Self::CheckStableShapes(_) | Self::CheckFieldTypes(_) => Properties {
                 eager_deopt: true,
                 effectful: true,
                 ..Properties::default()
@@ -1084,6 +1122,7 @@ impl Kind {
                 fp_temps: 1,
                 fixed_gp_clobbers: SmallVec::new(),
             },
+            Self::NullishEqual { .. } => simple(1, ResultPolicy::Register),
             Self::TestTypeOf { .. } => Constraints {
                 inputs: registers(1),
                 result: ResultPolicy::Register,
@@ -1126,8 +1165,13 @@ impl Kind {
             }
             Self::ToBoolean | Self::LogicalNot => simple(1, ResultPolicy::Register),
             Self::CheckNumber => simple(1, ResultPolicy::None),
+            Self::CheckNotNullish { .. } => simple(1, ResultPolicy::None),
             Self::CheckShapes { .. } | Self::CheckElements { .. } => simple(1, ResultPolicy::None),
-            Self::StoreOwnField(_) | Self::StoreTaggedField(_) => simple(2, ResultPolicy::None),
+            Self::StoreOwnField { owners, .. } => Constraints {
+                gp_temps: u8::from(!owners.is_empty()),
+                ..simple(2, ResultPolicy::None)
+            },
+            Self::StoreTaggedField(_) => simple(2, ResultPolicy::None),
             Self::WriteBarrier => simple(2, ResultPolicy::None),
             Self::NativeLeaf(_) => Constraints {
                 inputs: (0..input_count).map(|_| InputPolicy::Home).collect(),
@@ -1172,9 +1216,11 @@ impl Kind {
                 fp_temps: 0,
                 fixed_gp_clobbers: SmallVec::new(),
             },
-            Self::Jump(_) | Self::JumpLoop(_) | Self::Deopt(_) | Self::CheckStableShapes(_) => {
-                simple(0, ResultPolicy::None)
-            }
+            Self::Jump(_)
+            | Self::JumpLoop(_)
+            | Self::Deopt(_)
+            | Self::CheckStableShapes(_)
+            | Self::CheckFieldTypes(_) => simple(0, ResultPolicy::None),
             Self::Branch {
                 kind: BranchKind::Int32(_),
                 ..

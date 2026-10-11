@@ -3,6 +3,7 @@
 //! # Contents
 //! - Canonical homes, parallel moves and ordinary/OSR entry publication.
 //! - Target instruction modules for control, scalars, memory and calls.
+//! - Source-owned field bounds and non-converting nullish comparisons.
 //! - Finalized bytes and metadata through the one Graph emission owner.
 //!
 //! # Invariants
@@ -40,12 +41,14 @@ mod calls;
 mod control;
 mod elements;
 mod exits;
+mod field_types;
 mod guards;
 mod homes;
 mod keyed_load;
 mod keyed_store;
 mod memory;
 mod native_leaf;
+mod nullish;
 mod properties;
 mod scalar;
 
@@ -435,11 +438,20 @@ impl<'a> Codegen<'a> {
                         &mut self.ops,
                         &mut self.relocations,
                         10,
-                        view.cage_base as u64 + u64::from(shape) + u64::from(view.shape_stable_byte),
+                        view.cage_base as u64
+                            + u64::from(shape)
+                            + u64::from(view.shape_stable_byte),
                         RelocationTarget::ShapeStableByte { shape },
                     );
                     dynasm!(self.ops ; .arch x64 ; cmp BYTE [r10], 0 ; je =>exit);
                 }
+            }
+            Kind::CheckFieldTypes(guards) => {
+                let guards = guards.clone();
+                self.emit_field_type_guards(node, &guards);
+            }
+            Kind::CheckNotNullish { mask } => {
+                self.emit_not_nullish(node, *mask);
             }
             Kind::LoadThis | Kind::LoadClosure | Kind::LoadNewTarget => {
                 let dst = Self::gp(self.loc(node).result.expect("result"));

@@ -7,7 +7,8 @@
 //! # Invariants
 //! - The candidate never aliases the result; its previous occupant reaches
 //!   canonical homes before a collecting miss assigns the result.
-//! - Plans and realms come from the node's actual outer or inlined source.
+//! - Plans, realms and captured field membership come from the node's actual
+//!   outer or inlined source.
 //! - Fit initialization precedes publication and cannot collect.
 //! - Misses use the same canonical VM allocator and root contract as ARM.
 //!
@@ -67,7 +68,7 @@ impl Codegen<'_> {
         let source = self.view_of(node);
         let realm = source.literal_allocations.realm_id;
         let cage_base = source.cage_base as u64;
-        let object = source.literal_allocations.objects.get(&data.pc).copied();
+        let object = source.literal_allocations.objects.get(&data.pc).cloned();
         let array = source.literal_allocations.arrays.get(&data.pc).copied();
         let kind = data.kind.clone();
         let allocation = self.loc(node);
@@ -100,7 +101,17 @@ impl Codegen<'_> {
         let stub = match kind {
             Kind::NewObjectLiteral => {
                 if let Some(plan) = object {
-                    emit_object_literal(&mut self.ops, 15, realm, plan, &inputs, regs, slow);
+                    emit_object_literal(
+                        &mut self.ops,
+                        &mut self.relocations,
+                        source,
+                        15,
+                        realm,
+                        &plan,
+                        &inputs,
+                        regs,
+                        slow,
+                    );
                     dynasm!(self.ops ; .arch x64 ; mov Rq(destination), Rq(regs.candidate) ; jmp =>done);
                 }
                 abi::STUB_JIT_NEW_OBJECT_LITERAL

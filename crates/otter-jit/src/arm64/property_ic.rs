@@ -19,6 +19,8 @@
 //! - Feedback is read from the slot at run time; nothing is baked.
 //! - An append clears the source shape's stability byte before publishing
 //!   its child; overwrite stores preserve the shape's stability.
+//! - Stores observe their defining field owner after complete publication.
+//!   Membership misses call a noncollecting leaf that preserves live registers.
 //!
 //! # See also
 //! - `otter_vm::property_ic` owns the slot layout and handler kinds.
@@ -265,6 +267,7 @@ pub(crate) fn emit_slot_load(
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn emit_slot_store(
     ops: &mut Assembler,
+    relocations: &mut crate::artifact::relocation::RelocationCapture,
     view: &JitCompileSnapshot,
     receiver: u8,
     value: u8,
@@ -325,6 +328,10 @@ pub(crate) fn emit_slot_store(
         ; add x16, x17, x16
         ; strb wzr, [x16, view.shape_stable_byte]
         ; str W(child), [X(receiver), view.object_shape_byte]
+        ; ldr W(entry), [X(entry), IC.entry_owner_byte]
+    );
+    super::field_type::emit_observe(ops, relocations, view, entry, value);
+    dynasm!(ops ; .arch aarch64
         ; b =>stored
         ; =>own
         ; ldr W(index), [X(entry), IC.entry_field_byte]
@@ -332,6 +339,10 @@ pub(crate) fn emit_slot_store(
     emit_field_bank(ops, view, receiver, index, miss);
     dynasm!(ops ; .arch aarch64
         ; str X(value), [x16, X(index), lsl #3]
+        ; ldr W(entry), [X(entry), IC.entry_owner_byte]
+    );
+    super::field_type::emit_observe(ops, relocations, view, entry, value);
+    dynasm!(ops ; .arch aarch64
         ; mov W(child), wzr
         ; b =>stored
     );

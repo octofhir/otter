@@ -35,6 +35,10 @@
 //!   shape fixes). An invalid proof only misses.
 //! - Store handlers are never installed for prototype-role receivers: their
 //!   mutations must reach the invalidation boundary.
+//! - Shaped store owner words name the defining ancestor of the live logical
+//!   slot. Zero skips observation only for an absorbing Top summary. An append
+//!   with a null target has zero owner and flat field zero for VM dictionary
+//!   replay; generated probes reject that target before any effect.
 //! - One VM thread writes a slot; generated code reads it on that thread.
 //! - Megamorphic is terminal; its receivers use the isolate's shared action
 //!   table, which every resolution already records.
@@ -170,6 +174,7 @@ pub struct IcEntry {
     transition: AtomicU8,
     slot: AtomicU16,
     aux: AtomicU32,
+    owner: AtomicU32,
     validity: AtomicU64,
 }
 
@@ -182,6 +187,7 @@ impl IcEntry {
             transition: AtomicU8::new(0),
             slot: AtomicU16::new(0),
             aux: AtomicU32::new(0),
+            owner: AtomicU32::new(0),
             validity: AtomicU64::new(0),
         }
     }
@@ -231,6 +237,7 @@ impl IcEntry {
             && self.transition.load(Ordering::Relaxed) == handler.transition as u8
             && self.slot() == handler.slot
             && self.aux.load(Ordering::Relaxed) == handler.aux.offset()
+            && self.owner.load(Ordering::Relaxed) == handler.owner.offset()
             && self.validity_word() == validity
     }
 
@@ -251,6 +258,7 @@ impl IcEntry {
             .store(handler.transition as u8, Ordering::Relaxed);
         self.slot.store(handler.slot, Ordering::Relaxed);
         self.aux.store(handler.aux.offset(), Ordering::Relaxed);
+        self.owner.store(handler.owner.offset(), Ordering::Relaxed);
         self.shape.store(key, Ordering::Relaxed);
     }
 
@@ -278,6 +286,8 @@ impl IcEntry {
         self.slot.store(other.slot(), Ordering::Relaxed);
         self.aux
             .store(other.aux.load(Ordering::Relaxed), Ordering::Relaxed);
+        self.owner
+            .store(other.owner.load(Ordering::Relaxed), Ordering::Relaxed);
         self.validity
             .store(other.validity.swap(0, Ordering::Relaxed), Ordering::Relaxed);
         other.reset();
@@ -300,6 +310,7 @@ impl IcEntry {
         self.transition.store(0, Ordering::Relaxed);
         self.slot.store(0, Ordering::Relaxed);
         self.aux.store(0, Ordering::Relaxed);
+        self.owner.store(0, Ordering::Relaxed);
     }
 
     fn transition_guard(&self) -> TransitionGuard {
@@ -320,6 +331,7 @@ pub(crate) struct IcHandler {
     field: FieldLocation,
     slot: u16,
     aux: ShapeHandle,
+    owner: ShapeHandle,
     validity: Option<Arc<PrototypeValidity>>,
     transition: TransitionGuard,
 }
@@ -355,6 +367,7 @@ impl IcHandler {
                 field,
                 slot: resolved.hit.slot,
                 aux: ShapeHandle::null(),
+                owner: ShapeHandle::null(),
                 validity: None,
                 transition: TransitionGuard::OwnAdd,
             });
@@ -369,6 +382,7 @@ impl IcHandler {
             field,
             slot: resolved.hit.slot,
             aux: resolved.holder_root,
+            owner: ShapeHandle::null(),
             validity: Some(resolved.validity.clone()?),
             transition: TransitionGuard::OwnAdd,
         })
@@ -387,6 +401,7 @@ impl IcHandler {
             field: FieldLocation::from_cache_key(0),
             slot: 0,
             aux: ShapeHandle::null(),
+            owner: ShapeHandle::null(),
             validity,
             transition: TransitionGuard::OwnAdd,
         })
@@ -444,21 +459,24 @@ impl IcHandler {
         else {
             return None;
         };
-        (flags.writable() && hit.shape == receiver_shape).then(|| {
-            (
-                Self {
-                    receiver_shape,
-                    lookup_start: false,
-                    kind: IcHandlerKind::StoreField,
-                    field: object::field_location(receiver_shape, u32::from(hit.slot)),
-                    slot: hit.slot,
-                    aux: ShapeHandle::null(),
-                    validity: None,
-                    transition: TransitionGuard::OwnAdd,
-                },
-                hit,
-            )
-        })
+        if !flags.writable() || hit.shape != receiver_shape {
+            return None;
+        }
+        let owner = object::field_type::observer_owner(receiver_shape, u32::from(hit.slot))?;
+        Some((
+            Self {
+                receiver_shape,
+                lookup_start: false,
+                kind: IcHandlerKind::StoreField,
+                field: object::field_location(receiver_shape, u32::from(hit.slot)),
+                slot: hit.slot,
+                aux: ShapeHandle::null(),
+                owner,
+                validity: None,
+                transition: TransitionGuard::OwnAdd,
+            },
+            hit,
+        ))
     }
 
     /// The store handler replaying a captured append from `from_shape`.
@@ -474,6 +492,14 @@ impl IcHandler {
             return None;
         }
         let to_shape = transition.to_shape.get();
+        let (owner, field) = if to_shape.is_null() {
+            (ShapeHandle::null(), FieldLocation::from_cache_key(0))
+        } else {
+            (
+                object::field_type::observer_owner(to_shape, u32::from(transition.slot))?,
+                object::field_location(to_shape, u32::from(transition.slot)),
+            )
+        };
         let (guard, validity) = match &transition.kind {
             StorePropertyTransitionKind::OwnAdd => (TransitionGuard::OwnAdd, None),
             StorePropertyTransitionKind::PrototypeChainMissing { validity } => {
@@ -483,13 +509,6 @@ impl IcHandler {
                 (TransitionGuard::PrototypeWritable, Some(validity.clone()))
             }
         };
-        // A dictionary target has no layout to publish; its location is the
-        // flat slot, consumed only by the VM's replay.
-        let field = if to_shape.is_null() {
-            FieldLocation::from_cache_key(0)
-        } else {
-            object::field_location(to_shape, u32::from(transition.slot))
-        };
         Some(Self {
             receiver_shape: from_shape,
             lookup_start: false,
@@ -497,6 +516,7 @@ impl IcHandler {
             field,
             slot: transition.slot,
             aux: to_shape,
+            owner,
             validity,
             transition: guard,
         })
@@ -516,6 +536,7 @@ impl IcHandler {
             field: FieldLocation::inline(0),
             slot: 0,
             aux: ShapeHandle::null(),
+            owner: ShapeHandle::null(),
             validity: None,
             transition: TransitionGuard::OwnAdd,
         }
@@ -540,6 +561,8 @@ pub struct PropertyIcLayout {
     pub inline_shape_byte: u32,
     /// `u32` [`FieldLocation`] key of that entry.
     pub inline_field_byte: u32,
+    /// `u32` defining store owner, or zero for an absorbing Top summary.
+    pub inline_owner_byte: u32,
     /// `u32` state: entry count in the low byte, then flags.
     pub state_byte: u32,
     /// Bit set in `state` once the slot is megamorphic.
@@ -560,6 +583,9 @@ pub struct PropertyIcLayout {
     pub entry_kind_byte: u32,
     /// Entry `u32` auxiliary shape.
     pub entry_aux_byte: u32,
+    /// Entry `u32` defining store owner: zero for shaped Top or a VM-only
+    /// dictionary append with a null auxiliary target.
+    pub entry_owner_byte: u32,
     /// Entry `u64` validity word address.
     pub entry_validity_byte: u32,
 }
@@ -571,6 +597,7 @@ pub struct PropertyIcLayout {
 pub struct PropertyIcSlot {
     inline_shape: AtomicU32,
     inline_field: AtomicU32,
+    inline_owner: AtomicU32,
     state: AtomicU32,
     atom: AtomicU32,
     function_id: AtomicU32,
@@ -588,6 +615,7 @@ impl PropertyIcSlot {
     pub const LAYOUT: PropertyIcLayout = PropertyIcLayout {
         inline_shape_byte: std::mem::offset_of!(Self, inline_shape) as u32,
         inline_field_byte: std::mem::offset_of!(Self, inline_field) as u32,
+        inline_owner_byte: std::mem::offset_of!(Self, inline_owner) as u32,
         state_byte: std::mem::offset_of!(Self, state) as u32,
         megamorphic_bit: STATE_MEGAMORPHIC,
         count_mask: STATE_COUNT_MASK,
@@ -598,6 +626,7 @@ impl PropertyIcSlot {
         entry_field_byte: std::mem::offset_of!(IcEntry, field) as u32,
         entry_kind_byte: std::mem::offset_of!(IcEntry, kind) as u32,
         entry_aux_byte: std::mem::offset_of!(IcEntry, aux) as u32,
+        entry_owner_byte: std::mem::offset_of!(IcEntry, owner) as u32,
         entry_validity_byte: std::mem::offset_of!(IcEntry, validity) as u32,
     };
 
@@ -607,6 +636,7 @@ impl PropertyIcSlot {
         Self {
             inline_shape: AtomicU32::new(EMPTY_SHAPE),
             inline_field: AtomicU32::new(0),
+            inline_owner: AtomicU32::new(0),
             state: AtomicU32::new(0),
             atom: AtomicU32::new(0),
             function_id: AtomicU32::new(0),
@@ -702,11 +732,14 @@ impl PropertyIcSlot {
             Some(entry) => {
                 self.inline_field
                     .store(entry.field.load(Ordering::Relaxed), Ordering::Relaxed);
+                self.inline_owner
+                    .store(entry.owner.load(Ordering::Relaxed), Ordering::Relaxed);
                 self.inline_shape.store(entry.shape(), Ordering::Relaxed);
             }
             None => {
                 self.inline_shape.store(EMPTY_SHAPE, Ordering::Relaxed);
                 self.inline_field.store(0, Ordering::Relaxed);
+                self.inline_owner.store(0, Ordering::Relaxed);
             }
         }
     }
@@ -935,6 +968,8 @@ impl PropertyIcSlot {
             live(entry.shape() & !LOOKUP_START_KEY_BIT)
                 && (entry.aux.load(Ordering::Relaxed) == 0
                     || live(entry.aux.load(Ordering::Relaxed)))
+                && (entry.owner.load(Ordering::Relaxed) == 0
+                    || live(entry.owner.load(Ordering::Relaxed)))
         });
     }
 
@@ -1152,7 +1187,7 @@ impl Drop for PropertyIcSlot {
 }
 
 const _: () = {
-    assert!(std::mem::size_of::<IcEntry>() == 24);
+    assert!(std::mem::size_of::<IcEntry>() == 32);
     assert!(std::mem::offset_of!(PropertyIcSlot, inline_shape) == 0);
     assert!(std::mem::offset_of!(PropertyIcSlot, inline_field) == 4);
 };

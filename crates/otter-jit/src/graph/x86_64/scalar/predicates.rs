@@ -4,6 +4,7 @@
 //! - Numeric and identity strict equality, with content comparison in the VM.
 //! - Loose equality: the pairs that convert nothing inline, every coercing
 //!   pair through the committed runtime operation.
+//! - Unary nullish equality preserves heap facts through a total native leaf.
 //! - Truthiness of immediates, Numbers, strings and objects inline, and total
 //!   leaf handling for native functions, BigInts and other immediates.
 //! - Shared truthiness branches for Graph control.
@@ -54,6 +55,10 @@ impl<'a> Codegen<'a> {
                 let double = self.loc(node).fp_temps[0];
                 self.emit_loose_equal(node, a, b, double, dst, negate)?;
             }
+            Kind::NullishEqual {
+                negate,
+                object_or_nullish,
+            } => self.emit_nullish_equal(node, negate, object_or_nullish),
             Kind::TestTypeOf { test } => {
                 let value = Self::gp(self.loc(node).inputs[0]);
                 let dst = Self::gp(self.loc(node).result.unwrap());

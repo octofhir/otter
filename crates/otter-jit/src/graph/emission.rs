@@ -143,7 +143,10 @@ pub(crate) fn fused_branches(
             && !allocation.definition_spills.contains(&producer)
             && matches!(
                 graph.node(producer).kind,
-                Kind::Instanceof | Kind::StrictEqual { .. } | Kind::LooseEqual { .. }
+                Kind::Instanceof
+                    | Kind::StrictEqual { .. }
+                    | Kind::LooseEqual { .. }
+                    | Kind::NullishEqual { .. }
             )
         {
             fused.insert(producer, control);

@@ -7,6 +7,8 @@
 //!   including error allocation, throw origins and derived-`this` binding.
 //! - Generic binary arithmetic and relational operators for compiled sites
 //!   whose feedback is not numeric ([`BinaryOperator`]).
+//! - The complete `Array.prototype.push`/`pop` builtins for a compiled method
+//!   site whose inline append or removal does not cover the receiver.
 //! - Rooted value kernels shared by interpreter and compiled callers.
 //! - [`ObjectProtocolValueOp`] owns the checked compiled operation word.
 //! - [`RuntimeCall`] typed object operations and source-decoded scalar sites.
@@ -138,6 +140,12 @@ pub enum ObjectProtocolValueOp {
     /// numeric, including every observable `ToPrimitive` / `ToNumeric`
     /// coercion and `+` string concatenation.
     Binary(BinaryOperator),
+    /// `Array.prototype.push` of the second value onto the first, at a site
+    /// whose generated code proved the builtin is the callee.
+    ArrayPush,
+    /// `Array.prototype.pop` of the first value, at a site whose generated
+    /// code proved the builtin is the callee.
+    ArrayPop,
 }
 
 /// The generic binary operator a committed site completes.
@@ -230,6 +238,8 @@ impl ObjectProtocolValueOp {
             Self::Binary(BinaryOperator::Shl) => 19,
             Self::Binary(BinaryOperator::Shr) => 20,
             Self::Binary(BinaryOperator::Ushr) => 21,
+            Self::ArrayPush => 22,
+            Self::ArrayPop => 23,
         }
     }
 
@@ -259,6 +269,8 @@ impl ObjectProtocolValueOp {
             19 => Self::Binary(BinaryOperator::Shl),
             20 => Self::Binary(BinaryOperator::Shr),
             21 => Self::Binary(BinaryOperator::Ushr),
+            22 => Self::ArrayPush,
+            23 => Self::ArrayPop,
             _ => return Err(VmError::InvalidOperand),
         })
     }
@@ -350,6 +362,10 @@ impl Interpreter {
                 Value::boolean(!self.loose_equal_with_context(stack, context, &value0, &value1)?)
             }
             ObjectProtocolValueOp::Binary(_) => unreachable!("binary operators return above"),
+            ObjectProtocolValueOp::ArrayPush => {
+                self.array_push(stack, context, value0, &[value1], &[])?
+            }
+            ObjectProtocolValueOp::ArrayPop => self.array_pop(stack, context, value0, &[])?,
             ObjectProtocolValueOp::HasProperty => {
                 if !value1.is_object_type() {
                     return Err(CommittedValueError::JavaScript(VmError::TypeMismatch));
@@ -732,6 +748,8 @@ mod tests {
             O::Binary(B::Shl),
             O::Binary(B::Shr),
             O::Binary(B::Ushr),
+            O::ArrayPush,
+            O::ArrayPop,
         ];
         let mut words = std::collections::BTreeSet::new();
         for operation in operations {
@@ -745,8 +763,8 @@ mod tests {
                 ));
             }
         }
-        assert_eq!(words.len(), 22);
-        for word in [22, 255, u64::MAX] {
+        assert_eq!(words.len(), 24);
+        for word in [24, 255, u64::MAX] {
             assert!(matches!(O::decode_abi(word), Err(VmError::InvalidOperand)));
         }
     }

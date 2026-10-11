@@ -30,6 +30,7 @@ impl Codegen<'_> {
         if self.emit_elements(node)?
             || self.emit_properties(node)?
             || self.emit_keyed_store(node)?
+            || self.emit_array_method(node)?
             || self.emit_keyed_load(node)?
         {
             return Ok(true);
@@ -179,6 +180,7 @@ impl Codegen<'_> {
                 Self::gp(input(0)),
                 Self::gp(input(1)),
                 Self::gp(input(2)),
+                &[],
             ),
             _ => return Ok(false),
         }

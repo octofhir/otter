@@ -1763,6 +1763,21 @@ pub struct JitArrayStorage {
     pub exotic_byte: u32,
     /// `u32` live dense length.
     pub length_byte: u32,
+    /// `u32` dense capacity of the current slab.
+    pub capacity_byte: u32,
+    /// `u64` logical `length` property.
+    pub logical_length_byte: u32,
+    /// Signed offset of the slab's own `u32` live length from the element base.
+    pub slab_length_from_base: i32,
+    /// Signed offset of the slab's `u32` dirty interval start from the element
+    /// base: the interval holds the slots a remembered slab's next scavenge
+    /// re-traces.
+    pub slab_dirty_start_from_base: i32,
+    /// Signed offset of the slab's `u32` exclusive dirty interval end from the
+    /// element base.
+    pub slab_dirty_end_from_base: i32,
+    /// Signed offset of the slab's `GcHeader` from the element base.
+    pub slab_header_from_base: i32,
     /// Element base pointer.
     pub base_byte: u32,
     /// Kind byte of tagged storage, whose holes are the hole sentinel.
@@ -1781,6 +1796,12 @@ impl JitArrayStorage {
             own_guard_byte: header + crate::array::ARRAY_BODY_DENSE_OWN_GUARD_OFFSET as u32,
             exotic_byte: header + crate::array::ARRAY_BODY_EXOTIC_OFFSET as u32,
             length_byte: header + crate::array::ARRAY_BODY_DENSE_LEN_OFFSET as u32,
+            capacity_byte: header + crate::array::ARRAY_BODY_DENSE_CAP_OFFSET as u32,
+            logical_length_byte: header + crate::array::ARRAY_BODY_LENGTH_OFFSET as u32,
+            slab_length_from_base: crate::array::elements::LENGTH_FROM_DATA_BYTE,
+            slab_dirty_start_from_base: crate::array::elements::DIRTY_START_FROM_DATA_BYTE,
+            slab_dirty_end_from_base: crate::array::elements::DIRTY_END_FROM_DATA_BYTE,
+            slab_header_from_base: crate::array::elements::HEADER_FROM_DATA_BYTE,
             base_byte: header + crate::array::ARRAY_BODY_ELEMENTS_PTR_OFFSET as u32,
             tagged_kind: crate::array::DENSE_ELEMENT_KIND_TAGGED as u8,
             numeric: JitHoleBitmap {

@@ -1976,8 +1976,22 @@ impl<'a> Builder<'a> {
                 } else {
                     Kind::NewArrayLiteral
                 };
+                let tenured = self
+                    .view
+                    .literal_allocations
+                    .sites
+                    .get(&self.pc)
+                    .is_some_and(|site| site.mode == otter_vm::jit::JitSiteMode::Old);
+                let object = matches!(kind, Kind::NewObjectLiteral { .. });
                 let value = self.add(kind, &inputs, Repr::Tagged);
                 self.known.entry(value).heap_object = true;
+                if tenured && object {
+                    // A tenured object is born old: each young input it holds
+                    // is an edge the next scavenge finds only if remembered.
+                    for &input in &inputs {
+                        self.write_barrier(value, input);
+                    }
+                }
                 self.write(instruction.writes[0], value);
             }
             Op::CreateContext => {

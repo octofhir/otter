@@ -10,14 +10,19 @@
 //! the existing VM allocator selects that same source realm on a miss.
 //! Literal geometry comes from that same source; each field's observation
 //! record comes from the node, selected before any collecting clobber.
+//! The allocation site's compiled placement selects the buffer and header; a
+//! tracking site leaves before effects once decided and counts each birth.
 //!
 //! # See also
 //! `crate::arm64::allocation` owns the one LAB probe/init/publish implementation.
 
-use super::{Codegen, CommittedArgument, Kind, Location, NodeId, abi};
+use super::{Codegen, CommittedArgument, DeoptReason, Kind, Location, NodeId, abi};
 use crate::allocation::{AllocationValue, EmptyLiteralLayout, LabRegisters};
 use crate::arm64::allocation::{emit_array_literal, emit_empty_literal, emit_object_literal};
 use dynasmrt::{DynasmApi, DynasmLabelApi, dynasm};
+use otter_vm::jit::{
+    JIT_SITE_CREATED_OFFSET, JIT_SITE_DECIDED_BIT, JIT_SITE_DECISION_OFFSET, JitSiteMode,
+};
 
 impl Codegen<'_> {
     pub(super) fn emit_literal_allocation(
@@ -31,6 +36,12 @@ impl Codegen<'_> {
         let cage_base = source.cage_base as u64;
         let object = source.literal_allocations.objects.get(&data.pc).cloned();
         let array = source.literal_allocations.arrays.get(&data.pc).copied();
+        let site = source
+            .literal_allocations
+            .sites
+            .get(&data.pc)
+            .copied()
+            .unwrap_or_default();
         let kind = data.kind.clone();
         let allocation = self.allocation.node(node);
         let values = allocation.inputs.clone();
@@ -61,6 +72,20 @@ impl Codegen<'_> {
         debug_assert!(!allocation.gp_temps.contains(&destination));
         let slow = self.ops.new_dynamic_label();
         let done = self.ops.new_dynamic_label();
+        let fitted = self.ops.new_dynamic_label();
+        let fits = match &kind {
+            Kind::NewObjectLiteral { fields } => object.is_some() && fields.is_some(),
+            Kind::NewArrayLiteral => array.is_some(),
+            _ => unreachable!("literal allocation kind"),
+        };
+        if fits && site.mode == JitSiteMode::Track {
+            // A decided site leaves before any effect and recompiles.
+            let exit = self.eager_exit(node, DeoptReason::AllocationSiteDecided);
+            self.load_immediate(16, site.record);
+            dynasm!(self.ops ; .arch aarch64
+                ; ldrb w17, [x16, JIT_SITE_DECISION_OFFSET]
+                ; tbnz w17, JIT_SITE_DECIDED_BIT.trailing_zeros(), =>exit);
+        }
         let stub = match kind {
             Kind::NewObjectLiteral { fields } => {
                 if let Some((plan, fields)) = object.zip(fields) {
@@ -71,12 +96,13 @@ impl Codegen<'_> {
                         20,
                         realm,
                         &plan,
+                        site,
                         &fields,
                         &inputs,
                         regs,
                         slow,
                     );
-                    dynasm!(self.ops ; .arch aarch64 ; mov X(destination), X(regs.candidate) ; b =>done);
+                    dynasm!(self.ops ; .arch aarch64 ; b =>fitted);
                 }
                 abi::STUB_JIT_NEW_OBJECT_LITERAL
             }
@@ -89,16 +115,29 @@ impl Codegen<'_> {
                         realm,
                         cage_base,
                         plan,
+                        site,
                         &inputs,
                         regs,
                         slow,
                     );
-                    dynasm!(self.ops ; .arch aarch64 ; mov X(destination), X(regs.candidate) ; b =>done);
+                    dynasm!(self.ops ; .arch aarch64 ; b =>fitted);
                 }
                 abi::STUB_JIT_NEW_ARRAY
             }
             _ => unreachable!("literal allocation kind"),
         };
+        if fits {
+            dynasm!(self.ops ; .arch aarch64 ; =>fitted);
+            if site.mode == JitSiteMode::Track {
+                // The tagged birth counts toward the site's survival ratio.
+                self.load_immediate(16, site.record);
+                dynasm!(self.ops ; .arch aarch64
+                    ; ldr w17, [x16, JIT_SITE_CREATED_OFFSET]
+                    ; add w17, w17, #1
+                    ; str w17, [x16, JIT_SITE_CREATED_OFFSET]);
+            }
+            dynasm!(self.ops ; .arch aarch64 ; mov X(destination), X(regs.candidate) ; b =>done);
+        }
         dynasm!(self.ops ; .arch aarch64 ; =>slow);
         self.emit_committed_span_call(node, stub, &values, destination)?;
         dynasm!(self.ops ; .arch aarch64 ; =>done);

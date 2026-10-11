@@ -240,6 +240,6 @@ pub type JitEntry = extern "C" fn(*mut JitCtx) -> NativeResultPair;
 // The canonical 128-byte request includes the original receiver, lexical
 // context identity and synchronous Super origin. No parallel compact request
 // is used by generated tiers or the trampoline.
-const _: [(); 224] = [(); std::mem::size_of::<JitCtx>()];
+const _: [(); 232] = [(); std::mem::size_of::<JitCtx>()];
 
-const _: [(); 220] = [(); std::mem::offset_of!(JitCtx, completion_generation)];
+const _: [(); 228] = [(); std::mem::offset_of!(JitCtx, completion_generation)];

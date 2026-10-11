@@ -5160,12 +5160,15 @@ fn bytecode_array_push_uses_root_aware_growth_with_frame_roots() {
         .with_handle_scope(|interp, scope| {
             let child = interp.scoped_object(scope)?;
             let value = interp.escape_scoped(child);
-            let value = interp.allocate_array_in_active_realm([
-                value,
-                Value::number_i32(2),
-                Value::number_i32(3),
-                Value::number_i32(4),
-            ])?;
+            let value = interp.allocate_array_in_active_realm(
+                [
+                    value,
+                    Value::number_i32(2),
+                    Value::number_i32(3),
+                    Value::number_i32(4),
+                ],
+                otter_gc::SitePlacement::Young(0),
+            )?;
             let array = interp.scoped_value(scope, value);
             let sentinel = interp.scoped_object(scope)?;
             frame.registers[0] = interp.escape_scoped(array);
@@ -5273,12 +5276,15 @@ fn bytecode_store_element_uses_root_aware_growth_with_frame_roots() {
         .with_handle_scope(|interp, scope| {
             let child = interp.scoped_object(scope)?;
             let value = interp.escape_scoped(child);
-            let value = interp.allocate_array_in_active_realm([
-                value,
-                Value::number_i32(2),
-                Value::number_i32(3),
-                Value::number_i32(4),
-            ])?;
+            let value = interp.allocate_array_in_active_realm(
+                [
+                    value,
+                    Value::number_i32(2),
+                    Value::number_i32(3),
+                    Value::number_i32(4),
+                ],
+                otter_gc::SitePlacement::Young(0),
+            )?;
             let array = interp.scoped_value(scope, value);
             let sentinel = interp.scoped_object(scope)?;
             frame.registers[0] = interp.escape_scoped(array);

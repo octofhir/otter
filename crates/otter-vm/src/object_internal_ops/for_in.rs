@@ -100,7 +100,12 @@ impl Interpreter {
             .into_iter()
             .map(|key| Value::string(JsString::from_handle(key, &self.gc_heap)))
             .collect();
-        let keys = array::from_values_with_roots(&mut self.gc_heap, &mut keys, &mut |_| {})?;
+        let keys = array::from_values_with_roots(
+            &mut self.gc_heap,
+            &mut keys,
+            otter_gc::SitePlacement::Young(0),
+            &mut |_| {},
+        )?;
         shape_body::set_enum_cache(&mut self.gc_heap, shape, Value::array(keys));
         Ok(keys)
     }

@@ -17,8 +17,8 @@ use crate::artifact::relocation::RelocationCapture;
 use crate::entry::{VALUE_HOLE, VALUE_UNDEFINED};
 use otter_gc::lab::LinearAllocationArea;
 use otter_vm::jit::{
-    JitArrayLiteralAllocationPlan, JitEmptyArrayAllocationPlan, JitEmptyObjectAllocationPlan,
-    JitObjectLiteralAllocationPlan,
+    JitAllocationSite, JitArrayLiteralAllocationPlan, JitEmptyArrayAllocationPlan,
+    JitEmptyObjectAllocationPlan, JitObjectLiteralAllocationPlan, JitSiteMode,
 };
 use otter_vm::{
     Value,
@@ -42,6 +42,7 @@ fn put32(words: &mut [u64], byte: u32, value: u32) {
 
 fn execute(
     layout: &Layout,
+    site: JitAllocationSite,
     values: &[u64],
     fits: bool,
     expected_realm: u32,
@@ -82,6 +83,8 @@ fn execute(
         top: start,
         limit: start + bytes as usize - usize::from(!fits),
     };
+    // Both windows name one host buffer, so either placement carves it.
+    let lab_ptr: *mut LinearAllocationArea = &mut lab;
     let mut thread = VmThread::empty();
     thread.active_realm_cell = std::ptr::addr_of!(actual_realm) as u64;
     let mut ctx = JitCtx {
@@ -92,7 +95,10 @@ fn execute(
         global_this_offset: std::ptr::null(),
         native_stack_limit: 0,
         generated_feedback_clean: 1,
-        alloc_window: otter_vm::jit::JitMachineAllocationWindow { lab: &mut lab },
+        alloc_window: otter_vm::jit::JitMachineAllocationWindow {
+            lab: lab_ptr,
+            old_lab: lab_ptr,
+        },
         runtime_stats: std::ptr::null_mut(),
         pending_call: CallRequest::EMPTY,
         completion: NativeResultPair::success(Value::UNDEFINED),
@@ -136,6 +142,7 @@ fn execute(
             15,
             expected_realm,
             plan,
+            site,
             &vec![
                 crate::field_store::FieldStoreOwner {
                     owner_shape: 0,
@@ -155,6 +162,7 @@ fn execute(
             expected_realm,
             start as u64 - 4096,
             *plan,
+            site,
             &inputs,
             regs,
             slow,
@@ -176,7 +184,11 @@ fn execute(
         layout,
         Layout::Array(_) | Layout::Empty(EmptyLiteralLayout::Array(_))
     );
-    let accepted = fits && actual_realm == expected_realm && (!array || expected_realm == 0);
+    // A tenured array is carved only numeric.
+    let accepted = fits
+        && actual_realm == expected_realm
+        && (!array || expected_realm == 0)
+        && !(site.mode == JitSiteMode::Old && matches!(layout, Layout::Array(_)) && !numeric);
     assert_eq!(result, if accepted { start } else { OLD_RESULT });
     assert_eq!(words[0], POISON);
     assert_eq!(*words.last().unwrap(), POISON);
@@ -216,7 +228,7 @@ fn execute(
                 expected[0] = plan.header_word;
             }
             Layout::Object(plan) => {
-                expected[0] = plan.header_word;
+                expected[0] = site.header_word(plan.header_word);
                 put32(&mut expected, plan.shape_byte, plan.shape);
                 for index in 0..plan.inline_capacity {
                     let byte = plan
@@ -239,8 +251,12 @@ fn execute(
                 } else {
                     2
                 };
-                expected[0] = plan.shell.header_word;
-                expected[slab] = plan.slab_header_word;
+                expected[0] = site.header_word(plan.shell.header_word);
+                expected[slab] = if site.mode == JitSiteMode::Old {
+                    site.header_word(plan.slab_header_word)
+                } else {
+                    plan.slab_header_word
+                };
                 put32(
                     &mut expected,
                     plan.shell_slab_byte,
@@ -316,10 +332,11 @@ fn native_empty_fit_and_pre_effect_realm_limit_misses_keep_late_result() {
     ];
     for regs in RECIPES {
         for layout in &layouts {
-            execute(layout, &[], true, 0, 0, regs);
-            execute(layout, &[], false, 0, 0, regs);
-            execute(layout, &[], true, 0, 1, regs);
-            execute(layout, &[], true, 1, 1, regs);
+            let site = JitAllocationSite::default();
+            execute(layout, site, &[], true, 0, 0, regs);
+            execute(layout, site, &[], false, 0, 0, regs);
+            execute(layout, site, &[], true, 0, 1, regs);
+            execute(layout, site, &[], true, 1, 1, regs);
         }
     }
 }
@@ -374,10 +391,17 @@ fn native_literal_bulk_homes_and_numeric_holes_initialize_and_count_exact_cells(
                 tagged.as_slice(),
             ),
         ] {
-            execute(&layout, values, true, 0, 0, regs);
-            execute(&layout, values, false, 0, 0, regs);
-            execute(&layout, values, true, 0, 1, regs);
-            execute(&layout, values, true, 1, 1, regs);
+            for mode in [JitSiteMode::Young, JitSiteMode::Track, JitSiteMode::Old] {
+                let site = JitAllocationSite {
+                    id: 0x2a5,
+                    record: 0,
+                    mode,
+                };
+                execute(&layout, site, values, true, 0, 0, regs);
+                execute(&layout, site, values, false, 0, 0, regs);
+                execute(&layout, site, values, true, 0, 1, regs);
+                execute(&layout, site, values, true, 1, 1, regs);
+            }
         }
     }
 }
@@ -428,6 +452,7 @@ fn zero_records_emit_no_observation_and_keep_the_buffer_live() {
             15,
             0,
             &plan,
+            JitAllocationSite::default(),
             &records,
             &[
                 AllocationValue::Constant(VALUE_UNDEFINED),

@@ -36,16 +36,13 @@ use dynasmrt::{DynamicLabel, DynasmApi, DynasmLabelApi, dynasm, x64::Assembler};
 use otter_vm::JitCompileSnapshot;
 use otter_vm::jit::{
     JIT_CLOSURE_CELL_BYTES, JIT_CONTEXT_HAS_EXTENSION_BIT, JIT_INLINE_CONTEXT_MAX_WORDS,
-    JIT_YOUNG_CLOSURE_HEADER_WORD,
-    JIT_YOUNG_CONTEXT_HEADER_WORD, JitClosureAllocationPlan, JitContextAllocationPlan,
+    JIT_YOUNG_CLOSURE_HEADER_WORD, JIT_YOUNG_CONTEXT_HEADER_WORD, JitClosureAllocationPlan,
+    JitContextAllocationPlan,
 };
 
 use crate::allocation::{AllocationValue, LabRegisters};
 
-use crate::entry::{
-    ALLOC_WINDOW_LAB_OFFSET, LAB_LIMIT_OFFSET, LAB_TOP_OFFSET,
-    VALUE_UNDEFINED,
-};
+use crate::entry::{ALLOC_WINDOW_LAB_OFFSET, LAB_LIMIT_OFFSET, LAB_TOP_OFFSET, VALUE_UNDEFINED};
 
 mod receiver_dynamic;
 pub(crate) use receiver_dynamic::emit_dynamic_construct_receiver;
@@ -70,8 +67,20 @@ pub(crate) use receiver::{
 #[path = "allocation/tests.rs"]
 mod tests;
 
-/// Probe a declared bounded cell. The limit miss precedes every heap write.
+/// Probe a declared bounded cell in the nursery buffer. The limit miss
+/// precedes every heap write.
 fn emit_bump_probe(ops: &mut Assembler, context: u8, regs: LabRegisters, slow: DynamicLabel) {
+    emit_bump_probe_in(ops, context, ALLOC_WINDOW_LAB_OFFSET, regs, slow);
+}
+
+/// [`emit_bump_probe`] in the buffer the window holds at `lab_offset`.
+fn emit_bump_probe_in(
+    ops: &mut Assembler,
+    context: u8,
+    lab_offset: u32,
+    regs: LabRegisters,
+    slow: DynamicLabel,
+) {
     let LabRegisters {
         buffer,
         candidate,
@@ -84,7 +93,7 @@ fn emit_bump_probe(ops: &mut Assembler, context: u8, regs: LabRegisters, slow: D
         !registers[..index].contains(register) && *register != context
     }));
     dynasm!(ops ; .arch x64
-        ; mov Rq(buffer), [Rq(context) + ALLOC_WINDOW_LAB_OFFSET as i32]
+        ; mov Rq(buffer), [Rq(context) + lab_offset as i32]
         ; mov Rq(candidate), [Rq(buffer) + LAB_TOP_OFFSET as i32]
         ; lea Rq(end), [Rq(candidate) + Rq(size)]
         ; cmp Rq(end), [Rq(buffer) + LAB_LIMIT_OFFSET as i32]

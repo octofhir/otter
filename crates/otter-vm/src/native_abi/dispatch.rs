@@ -63,6 +63,10 @@ pub enum ExitReason {
     FieldTypeChanged = 14,
     /// A pre-effect constructor receiver allocation probe missed.
     ReceiverAllocationMiss = 15,
+    /// A literal allocation site the generation tracked has decided its
+    /// placement. The exit recompiles with the decision; it is not a failed
+    /// speculation.
+    AllocationSiteDecided = 16,
 }
 
 impl ExitReason {
@@ -83,6 +87,7 @@ impl ExitReason {
             13 => Some(Self::StabilityChanged),
             14 => Some(Self::FieldTypeChanged),
             15 => Some(Self::ReceiverAllocationMiss),
+            16 => Some(Self::AllocationSiteDecided),
             _ => None,
         }
     }
@@ -500,6 +505,7 @@ mod tests {
             ExitReason::StabilityChanged,
             ExitReason::FieldTypeChanged,
             ExitReason::ReceiverAllocationMiss,
+            ExitReason::AllocationSiteDecided,
         ];
         let actions = [
             ExitAction::Resume,

@@ -2002,12 +2002,20 @@ impl Interpreter {
                 }
                 Op::NewArray => {
                     let operands = function.operand_view(instr);
-                    self.run_new_array_operands(&mut *stack, top_idx, operands)?;
+                    let placement = self.literal_site_placement(function.allocation_site_at(idx));
+                    self.run_new_array_operands(&mut *stack, top_idx, placement, operands)?;
                     continue;
                 }
                 Op::NewObjectLiteral => {
                     let operands = function.operand_view(instr);
-                    self.run_new_object_literal_operands(&mut *stack, top_idx, context, operands)?;
+                    let placement = self.literal_site_placement(function.allocation_site_at(idx));
+                    self.run_new_object_literal_operands(
+                        &mut *stack,
+                        top_idx,
+                        context,
+                        placement,
+                        operands,
+                    )?;
                     continue;
                 }
                 Op::LoadRegExp => {

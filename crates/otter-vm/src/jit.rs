@@ -105,9 +105,10 @@ pub struct JitPropertyAccess {
 
 mod literal_allocations;
 pub use literal_allocations::{
+    JIT_SITE_CREATED_OFFSET, JIT_SITE_DECIDED_BIT, JIT_SITE_DECISION_OFFSET, JitAllocationSite,
     JitArrayLiteralAllocationPlan, JitDenseArrayAllocationPlan, JitEmptyArrayAllocationPlan,
     JitEmptyObjectAllocationPlan, JitLiteralAllocationPlans, JitObjectLiteralAllocationPlan,
-    ordinary_object_header_word,
+    JitSiteMode, ordinary_object_header_word,
 };
 
 mod string_layout;

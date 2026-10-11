@@ -298,6 +298,27 @@ impl Interpreter {
     where
         I: IntoIterator<Item = Value>,
     {
+        self.alloc_runtime_rooted_array_at_site(
+            elements,
+            otter_gc::SitePlacement::Young(0),
+            value_roots,
+            slice_roots,
+        )
+    }
+
+    /// [`Self::alloc_runtime_rooted_array_from_values`] for one array-literal
+    /// allocation site: the shell carries the site, and a tenured site's
+    /// slab and shell are both born old.
+    pub(crate) fn alloc_runtime_rooted_array_at_site<I>(
+        &mut self,
+        elements: I,
+        placement: otter_gc::SitePlacement,
+        value_roots: &[&Value],
+        slice_roots: &[&[Value]],
+    ) -> Result<crate::array::JsArray, VmError>
+    where
+        I: IntoIterator<Item = Value>,
+    {
         let mut elements: smallvec::SmallVec<[Value; 8]> = elements.into_iter().collect();
         let _runtime_roots_guard = self.scope_runtime_roots_guard();
         let prototype = self.current_array_prototype_override();
@@ -317,6 +338,7 @@ impl Interpreter {
         let array = crate::array::from_values_with_roots(
             &mut self.gc_heap,
             &mut elements,
+            placement,
             &mut external_visit,
         )
         .map_err(VmError::from)?;
@@ -358,6 +380,7 @@ impl Interpreter {
         let array = crate::array::from_values_with_roots(
             &mut self.gc_heap,
             &mut elements,
+            otter_gc::SitePlacement::Young(0),
             &mut external_visit,
         )?;
         let array = self.register_array_prototype_override(array)?;
@@ -773,6 +796,7 @@ impl Interpreter {
         let array = crate::array::from_values_with_roots(
             &mut self.gc_heap,
             &mut elements,
+            otter_gc::SitePlacement::Young(0),
             &mut external_visit,
         )
         .map_err(VmError::from)?;
@@ -836,6 +860,7 @@ impl Interpreter {
         stack: &mut ActivationStack,
         top_idx: usize,
         context: &ExecutionContext,
+        placement: otter_gc::SitePlacement,
         operands: impl crate::executable::OperandSource,
     ) -> Result<(), VmError> {
         let dst = register_operand(operands.first())?;
@@ -852,8 +877,13 @@ impl Interpreter {
                 )?);
             }
         }
-        let value =
-            self.allocate_static_object_literal(context, function_id, first_key, &values)?;
+        let value = self.allocate_static_object_literal(
+            context,
+            function_id,
+            first_key,
+            &values,
+            placement,
+        )?;
         let frame = &mut stack[top_idx];
         write_register(frame, dst, value)?;
         frame.advance_pc()?;
@@ -895,6 +925,7 @@ impl Interpreter {
         &mut self,
         layout: crate::handles::ObjectLayout,
         values: &mut [Value],
+        placement: otter_gc::SitePlacement,
     ) -> Result<Value, VmError> {
         if values.len() != layout.len() {
             return Err(VmError::InvalidOperand);
@@ -911,6 +942,7 @@ impl Interpreter {
             &mut self.gc_heap,
             shape,
             values,
+            placement,
             &mut roots,
         )
         .map_err(VmError::from)?;
@@ -921,6 +953,7 @@ impl Interpreter {
         &mut self,
         stack: &mut ActivationStack,
         top_idx: usize,
+        placement: otter_gc::SitePlacement,
         operands: impl crate::executable::OperandSource,
     ) -> Result<(), VmError> {
         let dst = register_operand(operands.first())?;
@@ -929,7 +962,7 @@ impl Interpreter {
         for i in 0..count {
             source_regs.push(register_operand(operands.get(2 + i))?);
         }
-        self.run_new_array_regs(stack, top_idx, dst, &source_regs)
+        self.run_new_array_regs(stack, top_idx, dst, &source_regs, placement)
     }
 
     pub(crate) fn run_new_array_regs(
@@ -938,6 +971,7 @@ impl Interpreter {
         top_idx: usize,
         dst: u16,
         source_regs: &[u16],
+        placement: otter_gc::SitePlacement,
     ) -> Result<(), VmError> {
         let mut elements: Vec<Value> = Vec::with_capacity(source_regs.len());
         {
@@ -946,7 +980,8 @@ impl Interpreter {
                 elements.push(*read_register(frame, r)?);
             }
         }
-        let value = self.allocate_array_literal_value(stack[top_idx].function_id, elements)?;
+        let value =
+            self.allocate_array_literal_value(stack[top_idx].function_id, elements, placement)?;
         let frame = &mut stack[top_idx];
         write_register(frame, dst, value)?;
         frame.advance_pc()?;
@@ -998,9 +1033,11 @@ impl Interpreter {
                     crate::deopt::VirtualObjectKind::PlainObject if fields.is_empty() => {
                         interp.allocate_object_in_active_realm()?
                     }
-                    crate::deopt::VirtualObjectKind::FixedArray => {
-                        interp.allocate_array_in_active_realm(fields)?
-                    }
+                    crate::deopt::VirtualObjectKind::FixedArray => interp
+                        .allocate_array_in_active_realm(
+                            fields,
+                            otter_gc::SitePlacement::Young(0),
+                        )?,
                     crate::deopt::VirtualObjectKind::PlainObject => {
                         return Err(VmError::InvalidOperand);
                     }

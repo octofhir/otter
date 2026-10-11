@@ -764,7 +764,12 @@ pub(crate) fn from_elements_old_for_fixture(
 ) -> Result<JsArray, otter_gc::OutOfMemory> {
     let mut collected: Vec<Value> = values.into_iter().collect();
     let length = collected.len();
-    let slab = slab_from_values(heap, &mut collected, &mut |_| {})?;
+    let slab = slab_from_values(
+        heap,
+        &mut collected,
+        otter_gc::SitePlacement::Young(0),
+        &mut |_| {},
+    )?;
     let mut body = ArrayBody {
         length,
         ..Default::default()
@@ -788,11 +793,17 @@ pub(crate) fn from_elements_with_roots(
     external_visit: &mut RootSlotVisitor<'_>,
 ) -> Result<JsArray, otter_gc::OutOfMemory> {
     let mut collected: smallvec::SmallVec<[Value; 8]> = values.into_iter().collect();
-    from_values_with_roots(heap, &mut collected, external_visit)
+    from_values_with_roots(
+        heap,
+        &mut collected,
+        otter_gc::SitePlacement::Young(0),
+        external_visit,
+    )
 }
 
-/// Construct an array from an already materialized element vector through the
-/// young-generation allocation path.
+/// Construct an array from an already materialized element vector at
+/// `placement`: the shell carries a tracking site, and a tenured site's slab
+/// and shell are both born old.
 ///
 /// This is the array-literal fast boundary: bytecode/JIT callers have already
 /// copied source registers into owned storage, so taking the vector directly
@@ -800,10 +811,16 @@ pub(crate) fn from_elements_with_roots(
 pub(crate) fn from_values_with_roots(
     heap: &mut GcHeap,
     collected: &mut [Value],
+    placement: otter_gc::SitePlacement,
     external_visit: &mut RootSlotVisitor<'_>,
 ) -> Result<JsArray, otter_gc::OutOfMemory> {
     let length = collected.len();
-    let slab = slab_from_values(heap, collected, external_visit)?;
+    let slab_placement = if placement == otter_gc::SitePlacement::Old {
+        otter_gc::SitePlacement::Old
+    } else {
+        otter_gc::SitePlacement::Young(0)
+    };
+    let slab = slab_from_values(heap, collected, slab_placement, external_visit)?;
     let mut body = ArrayBody {
         length,
         ..Default::default()
@@ -811,7 +828,7 @@ pub(crate) fn from_values_with_roots(
     body.adopt_slab(slab, 0);
     copy_values_into(&mut body, collected);
     record_slab_contents(heap, slab, length);
-    alloc_body_with_adopted_elements(heap, body, external_visit)
+    alloc_body_with_adopted_elements(heap, body, placement, external_visit)
 }
 
 /// Allocate a slab sized to `values` and copy them in.
@@ -822,6 +839,7 @@ pub(crate) fn from_values_with_roots(
 fn slab_from_values(
     heap: &mut GcHeap,
     values: &mut [Value],
+    placement: otter_gc::SitePlacement,
     external_visit: &mut RootSlotVisitor<'_>,
 ) -> Result<elements::ElementSlabHandle, otter_gc::OutOfMemory> {
     if values.is_empty() {
@@ -839,7 +857,7 @@ fn slab_from_values(
         }
     };
     let kind = initial_dense_kind(values);
-    elements::alloc_element_slab(heap, count, kind, &mut visit)
+    elements::alloc_element_slab(heap, count, kind, placement, &mut visit)
 }
 
 fn initial_dense_kind(values: &[Value]) -> DenseElementKind {
@@ -888,10 +906,20 @@ fn copy_values_into(body: &mut ArrayBody, values: &[Value]) {
 fn alloc_body_with_adopted_elements(
     heap: &mut GcHeap,
     body: ArrayBody,
+    placement: otter_gc::SitePlacement,
     external_visit: &mut RootSlotVisitor<'_>,
 ) -> Result<JsArray, otter_gc::OutOfMemory> {
     // The elements are a GC body of their own now, so they were counted
     // when they were allocated. All that is left is the array shell.
+    if placement != otter_gc::SitePlacement::Young(0) {
+        return heap.alloc_trailing_at_site_with_roots_initialized(
+            body,
+            0,
+            placement,
+            external_visit,
+            |_| {},
+        );
+    }
     match heap.try_alloc_no_collect_or_return(body) {
         Ok(array) => Ok(array),
         Err(returned) => heap.alloc_with_roots(returned, external_visit),
@@ -925,7 +953,12 @@ fn from_elements_with_source_old_for_fixture(
     let mut visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
         visitor(sidecar_slot.cast::<RawGc>());
     };
-    let slab = slab_from_values(heap, &mut collected, &mut visit)?;
+    let slab = slab_from_values(
+        heap,
+        &mut collected,
+        otter_gc::SitePlacement::Young(0),
+        &mut visit,
+    )?;
     let mut body = ArrayBody {
         length,
         exotic: sidecar,
@@ -987,7 +1020,12 @@ pub(crate) fn from_elements_with_source_and_roots(
         external_visit(visitor);
         visitor(sidecar_slot.cast::<RawGc>());
     };
-    let slab = slab_from_values(heap, &mut collected, &mut visit)?;
+    let slab = slab_from_values(
+        heap,
+        &mut collected,
+        otter_gc::SitePlacement::Young(0),
+        &mut visit,
+    )?;
     let mut body = ArrayBody {
         length,
         exotic: sidecar,
@@ -996,7 +1034,7 @@ pub(crate) fn from_elements_with_source_and_roots(
     body.adopt_slab(slab, 0);
     copy_values_into(&mut body, &collected);
     record_slab_contents(heap, slab, length);
-    alloc_body_with_adopted_elements(heap, body, &mut visit)
+    alloc_body_with_adopted_elements(heap, body, otter_gc::SitePlacement::Young(0), &mut visit)
 }
 
 /// Length in elements (O(1)).
@@ -2420,7 +2458,13 @@ fn reserve_dense_capacity(
         external_visit(visitor);
         visitor(owner_slot.cast::<RawGc>());
     };
-    let slab = elements::alloc_element_slab(heap, grown, target_kind, &mut visit)?;
+    let slab = elements::alloc_element_slab(
+        heap,
+        grown,
+        target_kind,
+        otter_gc::SitePlacement::Young(0),
+        &mut visit,
+    )?;
 
     let owner = *arr;
     heap.with_payload(owner, |body| {
@@ -2501,6 +2545,7 @@ mod tests {
                 Value::number_i32(4),
                 Value::number_i32(5),
             ],
+            otter_gc::SitePlacement::Young(0),
             &mut external_visit,
         )
         .unwrap();

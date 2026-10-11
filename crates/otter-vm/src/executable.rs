@@ -705,6 +705,12 @@ impl CodeBlock {
         self.feedback.cell(index)
     }
 
+    /// Allocation-site cell of the object or array literal at `index`.
+    #[must_use]
+    pub(crate) fn allocation_site_at(&self, index: usize) -> Option<&std::sync::atomic::AtomicU16> {
+        self.feedback.allocation_site(index)
+    }
+
     /// CodeBlock-wide version of material feedback transitions.
     ///
     /// The baseline tier ignores this telemetry; optimizing promotion samples

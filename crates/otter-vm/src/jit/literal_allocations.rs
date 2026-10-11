@@ -3,6 +3,7 @@
 //! # Contents
 //! - Empty and static nonempty literal plans used by the graph tier.
 //! - The ordinary-object header calculation shared with receiver allocation.
+//! - [`JitAllocationSite`]: the placement a literal site had when compiled.
 //!
 //! # Invariants
 //! Plans contain scalar geometry and an old shape offset rooted by the compile
@@ -13,6 +14,9 @@
 //! every initialized field's defining owner and captured membership.
 //! Empty array payload fields all have zero representations; Rust field order
 //! and padding are never serialized across this boundary.
+//! A tracking site's young header carries its id and the code counts each
+//! birth in the site's address-stable record; a tenured site's header is old.
+//! Generated tracking code must leave once the record's decision is final.
 //!
 //! # See also
 //! `crate::literal_allocation` owns the matching source-realm slow semantics.
@@ -35,7 +39,56 @@ pub struct JitLiteralAllocationPlans {
     pub objects: rustc_hash::FxHashMap<u32, JitObjectLiteralAllocationPlan>,
     /// Dense array layouts by own logical instruction PC.
     pub arrays: rustc_hash::FxHashMap<u32, JitArrayLiteralAllocationPlan>,
+    /// Allocation sites of object and array literals by own logical PC.
+    pub sites: rustc_hash::FxHashMap<u32, JitAllocationSite>,
 }
+
+/// Placement generated code bakes for one literal allocation site.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum JitSiteMode {
+    /// Plain young cells: no site, or a site the collector declined.
+    #[default]
+    Young,
+    /// Young cells tagged with the site and counted until it decides.
+    Track,
+    /// Cells born old in the old-space buffer.
+    Old,
+}
+
+/// One literal allocation site as a generation sees it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct JitAllocationSite {
+    /// Isolate site id; zero names no site.
+    pub id: u16,
+    /// Address of the site's record, stable for the heap's lifetime.
+    pub record: u64,
+    /// Placement at compilation.
+    pub mode: JitSiteMode,
+}
+
+impl JitAllocationSite {
+    /// The header word a cell of this site is born with, from the plain
+    /// young header the geometry computed.
+    #[must_use]
+    pub fn header_word(self, young: u64) -> u64 {
+        let young_flag =
+            u64::from(super::JIT_GC_YOUNG_FLAG) << (8 * otter_gc::header::HEADER_FLAGS_BYTE_OFFSET);
+        match self.mode {
+            JitSiteMode::Young => young,
+            JitSiteMode::Track => {
+                young | (u64::from(self.id) << (8 * otter_gc::header::HEADER_BODY_BYTES_OFFSET))
+            }
+            JitSiteMode::Old => young & !young_flag,
+        }
+    }
+}
+
+/// Byte offset of a site record's created counter.
+pub const JIT_SITE_CREATED_OFFSET: u32 = otter_gc::pretenuring::SITE_CREATED_OFFSET as u32;
+/// Byte offset of a site record's decision byte.
+pub const JIT_SITE_DECISION_OFFSET: u32 = otter_gc::pretenuring::SITE_DECISION_OFFSET as u32;
+/// Decision bit only final decisions carry.
+pub const JIT_SITE_DECIDED_BIT: u8 = otter_gc::pretenuring::DECIDED_BIT;
 
 /// Rooted final shape and its inline initialization geometry at one site.
 #[derive(Debug, Clone, PartialEq, Eq)]

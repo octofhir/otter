@@ -3,26 +3,92 @@
 //! # Contents
 //! - Representation-neutral literal allocation selected by exact source fid.
 //! - Active-realm cell creation shared with deopt materialization.
+//! - Allocation-site placement: each literal instruction's feedback cell names
+//!   one isolate site, registered on its first allocation.
 //!
 //! # Invariants
 //! Interpreter and compiled/inlined instructions use the same source-function
 //! realm. A realm switch precedes allocation and is restored on completion.
 //! Owned array elements are copied before collection and rooted by the existing
 //! allocator; native frames remain published throughout the slow transition.
+//! A tracking site tags its young cells, a tenured site allocates old, and a
+//! site the collector declined allocates plain young cells. Placement never
+//! changes a literal's realm, shape or element representation.
 //!
 //! # See also
 //! `allocation_ops` decodes bytecode operands; `runtime_activation::semantic_source`
 //! resolves inlined source ownership without materializing a frame.
 
+use std::sync::atomic::{AtomicU16, Ordering};
+
+use otter_gc::SitePlacement;
+use otter_gc::pretenuring::PretenureDecision;
+
 use crate::{Interpreter, Value, VmError};
 
 impl Interpreter {
+    /// The isolate site of one literal instruction's cell, registered on its
+    /// first use; zero without a cell or once every id is taken.
+    fn literal_site(&mut self, cell: Option<&AtomicU16>) -> u16 {
+        let Some(cell) = cell else {
+            return 0;
+        };
+        let sites = self.gc_heap.allocation_sites_mut();
+        let site = cell.load(Ordering::Relaxed);
+        if sites.contains(site) {
+            return site;
+        }
+        let site = sites.register();
+        cell.store(site, Ordering::Relaxed);
+        site
+    }
+
+    /// Placement of one literal allocation through its site cell: the site's
+    /// current decision, registering the site on its first allocation.
+    pub(crate) fn literal_site_placement(&mut self, cell: Option<&AtomicU16>) -> SitePlacement {
+        let site = self.literal_site(cell);
+        if site == 0 {
+            return SitePlacement::Young(0);
+        }
+        match self.gc_heap.allocation_sites().decision(site) {
+            PretenureDecision::Tenure => SitePlacement::Old,
+            PretenureDecision::DontTenure => SitePlacement::Young(0),
+            PretenureDecision::Undecided | PretenureDecision::MaybeTenure => {
+                SitePlacement::Young(site)
+            }
+        }
+    }
+
+    /// The site one generation bakes for a literal instruction's cell.
+    pub(crate) fn jit_allocation_site(
+        &mut self,
+        cell: Option<&AtomicU16>,
+    ) -> crate::jit::JitAllocationSite {
+        let id = self.literal_site(cell);
+        if id == 0 {
+            return crate::jit::JitAllocationSite::default();
+        }
+        let sites = self.gc_heap.allocation_sites();
+        crate::jit::JitAllocationSite {
+            id,
+            record: sites.record_address(id),
+            mode: match sites.decision(id) {
+                PretenureDecision::Tenure => crate::jit::JitSiteMode::Old,
+                PretenureDecision::DontTenure => crate::jit::JitSiteMode::Young,
+                PretenureDecision::Undecided | PretenureDecision::MaybeTenure => {
+                    crate::jit::JitSiteMode::Track
+                }
+            },
+        }
+    }
+
     pub(crate) fn allocate_static_object_literal(
         &mut self,
         context: &crate::ExecutionContext,
         function_id: u32,
         first_key: u32,
         values: &[Value],
+        placement: SitePlacement,
     ) -> Result<Value, VmError> {
         self.with_handle_scope(|vm, scope| {
             let handles = values
@@ -36,7 +102,7 @@ impl Interpreter {
                     .iter()
                     .map(|local| vm.handle_arena.get(local.index()))
                     .collect::<Vec<_>>();
-                vm.allocate_object_with_layout(layout, &mut values)
+                vm.allocate_object_with_layout(layout, &mut values, placement)
             };
             match vm.foreign_function_realm(function_id) {
                 Some(realm) => vm.with_host_realm_id(realm, allocate),
@@ -59,16 +125,24 @@ impl Interpreter {
         &mut self,
         function_id: u32,
         elements: I,
+        placement: SitePlacement,
     ) -> Result<Value, VmError>
     where
         I: IntoIterator<Item = Value>,
     {
         let elements: Vec<Value> = elements.into_iter().collect();
+        // An empty literal is a bare shell the generated tiers never attribute.
+        let placement = if elements.is_empty() {
+            SitePlacement::Young(0)
+        } else {
+            placement
+        };
         if let Some(realm) = self.foreign_function_realm(function_id) {
-            return self
-                .with_host_realm_id(realm, move |vm| vm.allocate_array_in_active_realm(elements));
+            return self.with_host_realm_id(realm, move |vm| {
+                vm.allocate_array_in_active_realm(elements, placement)
+            });
         }
-        self.allocate_array_in_active_realm(elements)
+        self.allocate_array_in_active_realm(elements, placement)
     }
 
     pub(crate) fn allocate_object_in_active_realm(&mut self) -> Result<Value, VmError> {
@@ -96,11 +170,12 @@ impl Interpreter {
     pub(crate) fn allocate_array_in_active_realm<I>(
         &mut self,
         elements: I,
+        placement: SitePlacement,
     ) -> Result<Value, VmError>
     where
         I: IntoIterator<Item = Value>,
     {
-        let array = self.alloc_runtime_rooted_array_from_values(elements, &[], &[])?;
+        let array = self.alloc_runtime_rooted_array_at_site(elements, placement, &[], &[])?;
         Ok(Value::array(array))
     }
 }
@@ -108,6 +183,76 @@ impl Interpreter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn literal_sites_register_once_tag_tracking_births_and_follow_decisions() {
+        let mut vm = Interpreter::new().expect("fixture interpreter bootstrap");
+        vm.gc_heap.set_gc_stress(0, false);
+        let cell = AtomicU16::new(0);
+        let placement = vm.literal_site_placement(Some(&cell));
+        let site = cell.load(Ordering::Relaxed);
+        assert_ne!(site, 0);
+        assert_eq!(placement, SitePlacement::Young(site));
+        assert_eq!(
+            vm.literal_site_placement(Some(&cell)),
+            placement,
+            "one site"
+        );
+        assert_eq!(vm.literal_site_placement(None), SitePlacement::Young(0));
+        let header = |value: Value| value.as_array().expect("array literal").as_header_ptr();
+        let young = vm
+            .allocate_array_literal_value(0, [Value::number_i32(1)], placement)
+            .expect("tracked birth");
+        // SAFETY: the array was just allocated and no collection ran since.
+        unsafe {
+            assert!((*header(young)).is_young());
+            assert_eq!((*header(young)).allocation_site(), site);
+        }
+        let tracked = vm.jit_allocation_site(Some(&cell));
+        assert_eq!(tracked.id, site);
+        assert_eq!(tracked.mode, crate::jit::JitSiteMode::Track);
+        assert_eq!(
+            tracked.record,
+            vm.gc_heap.allocation_sites().record_address(site)
+        );
+
+        vm.gc_heap
+            .allocation_sites_mut()
+            .set_decision_for_test(site, PretenureDecision::Tenure);
+        assert_eq!(vm.literal_site_placement(Some(&cell)), SitePlacement::Old);
+        assert_eq!(
+            vm.jit_allocation_site(Some(&cell)).mode,
+            crate::jit::JitSiteMode::Old
+        );
+        let old = vm
+            .allocate_array_literal_value(0, [Value::number_i32(2)], SitePlacement::Old)
+            .expect("tenured birth");
+        // SAFETY: the array was just allocated and no collection ran since.
+        unsafe {
+            assert!(!(*header(old)).is_young());
+            assert_eq!((*header(old)).allocation_site(), 0);
+        }
+        let empty = vm
+            .allocate_array_literal_value(0, [], SitePlacement::Old)
+            .expect("empty shell");
+        // SAFETY: as above.
+        unsafe { assert!((*header(empty)).is_young(), "empty shells stay untracked") };
+
+        let declined = AtomicU16::new(0);
+        vm.literal_site_placement(Some(&declined));
+        let other = declined.load(Ordering::Relaxed);
+        vm.gc_heap
+            .allocation_sites_mut()
+            .set_decision_for_test(other, PretenureDecision::DontTenure);
+        assert_eq!(
+            vm.literal_site_placement(Some(&declined)),
+            SitePlacement::Young(0)
+        );
+        assert_eq!(
+            vm.jit_allocation_site(Some(&declined)).mode,
+            crate::jit::JitSiteMode::Young
+        );
+    }
 
     struct LiteralChild {
         marker: u64,
@@ -160,8 +305,13 @@ mod tests {
                     "priming must leave the pending input unmoved"
                 );
                 let before_updates = vm.gc_heap.gc_stats().minor_slot_updates;
-                let result =
-                    vm.allocate_static_object_literal(&context, function_id, 0, &values)?;
+                let result = vm.allocate_static_object_literal(
+                    &context,
+                    function_id,
+                    0,
+                    &values,
+                    SitePlacement::Young(0),
+                )?;
                 assert!(
                     vm.gc_heap.gc_stats().minor_gc_cycles > before_minor,
                     "stride {stride} must evacuate pending young inputs inside the literal call"
@@ -274,7 +424,7 @@ mod tests {
                     .expect("foreign-source object");
                 let object = vm.scoped_value(scope, object);
                 let array = vm
-                    .allocate_array_literal_value(42, [])
+                    .allocate_array_literal_value(42, [], SitePlacement::Young(0))
                     .expect("foreign-source array");
                 let array = vm.scoped_value(scope, array);
                 assert_eq!(vm.active_realm_id, 0);
@@ -297,7 +447,8 @@ mod tests {
                         crate::array::prototype_override(array, &vm.gc_heap),
                         vm.current_array_prototype_override()
                     );
-                    let default = vm.allocate_array_literal_value(0, [])?;
+                    let default =
+                        vm.allocate_array_literal_value(0, [], SitePlacement::Young(0))?;
                     assert!(
                         crate::array::prototype_override(default.as_array().unwrap(), &vm.gc_heap)
                             .is_none()

@@ -19,16 +19,28 @@
 //! `otter_vm::jit::JitLiteralAllocationPlans` owns geometry and source semantics.
 
 use super::empty::emit_source_realm_guard;
-use super::{emit_bump_probe, emit_publish};
+use super::{emit_bump_probe_in, emit_publish};
 use crate::allocation::{AllocationValue, LabRegisters};
 use crate::artifact::relocation::{RelocationCapture, RelocationTarget};
-use crate::entry::{ALLOC_WINDOW_LAB_OFFSET, VALUE_HOLE, VALUE_UNDEFINED};
+use crate::entry::{
+    ALLOC_WINDOW_LAB_OFFSET, ALLOC_WINDOW_OLD_LAB_OFFSET, VALUE_HOLE, VALUE_UNDEFINED,
+};
 use crate::field_store::FieldStoreOwner;
 use crate::template::arm64::values::{emit_load_symbol_u64, emit_load_u64};
 use dynasmrt::{DynamicLabel, DynasmApi, DynasmLabelApi, aarch64::Assembler, dynasm};
 use otter_vm::jit::{
-    JitArrayLiteralAllocationPlan, JitDenseArrayAllocationPlan, JitObjectLiteralAllocationPlan,
+    JitAllocationSite, JitArrayLiteralAllocationPlan, JitDenseArrayAllocationPlan,
+    JitObjectLiteralAllocationPlan, JitSiteMode,
 };
+
+/// The window offset of the buffer a site's cells are carved from.
+fn lab_offset(site: JitAllocationSite) -> u32 {
+    if site.mode == JitSiteMode::Old {
+        ALLOC_WINDOW_OLD_LAB_OFFSET
+    } else {
+        ALLOC_WINDOW_LAB_OFFSET
+    }
+}
 use otter_vm::value::tag;
 
 fn emit_load_input(ops: &mut Assembler, input: AllocationValue) {
@@ -54,6 +66,7 @@ pub(crate) fn emit_object_literal(
     context: u8,
     realm: u32,
     plan: &JitObjectLiteralAllocationPlan,
+    site: JitAllocationSite,
     fields: &[FieldStoreOwner],
     inputs: &[AllocationValue],
     regs: LabRegisters,
@@ -63,9 +76,9 @@ pub(crate) fn emit_object_literal(
     assert_eq!(inputs.len(), fields.len());
     emit_source_realm_guard(ops, context, realm, regs.scratch, slow);
     emit_load_u64(ops, regs.size, u64::from(plan.cell_bytes));
-    emit_bump_probe(ops, context, regs, slow);
+    emit_bump_probe_in(ops, context, lab_offset(site), regs, slow);
     let candidate = regs.candidate;
-    emit_load_u64(ops, 16, plan.header_word);
+    emit_load_u64(ops, 16, site.header_word(plan.header_word));
     dynasm!(ops ; .arch aarch64 ; str x16, [X(candidate)]);
     let start = plan
         .fields
@@ -105,7 +118,7 @@ pub(crate) fn emit_object_literal(
         observed = true;
     }
     if observed {
-        dynasm!(ops ; .arch aarch64 ; ldr X(regs.buffer), [X(context), ALLOC_WINDOW_LAB_OFFSET]);
+        dynasm!(ops ; .arch aarch64 ; ldr X(regs.buffer), [X(context), lab_offset(site)]);
     }
     emit_publish(ops, regs);
 }
@@ -117,6 +130,7 @@ pub(crate) fn emit_array_literal(
     realm: u32,
     cage_base: u64,
     plan: JitArrayLiteralAllocationPlan,
+    site: JitAllocationSite,
     inputs: &[AllocationValue],
     regs: LabRegisters,
     slow: DynamicLabel,
@@ -127,7 +141,13 @@ pub(crate) fn emit_array_literal(
         return;
     }
     emit_source_realm_guard(ops, context, realm, regs.scratch, slow);
-    let tagged = ops.new_dynamic_label();
+    // A tenured array is carved only numeric: tagged elements would need
+    // their old slab remembered, which the committed allocation owns.
+    let tagged = if site.mode == JitSiteMode::Old {
+        slow
+    } else {
+        ops.new_dynamic_label()
+    };
     let done = ops.new_dynamic_label();
     // Match the canonical allocator's number-or-hole classification before
     // either reservation; classification itself cannot alter the heap.
@@ -145,21 +165,25 @@ pub(crate) fn emit_array_literal(
         context,
         cage_base,
         plan.numeric,
+        site,
         inputs,
         regs,
         slow,
     );
-    dynasm!(ops ; .arch aarch64 ; b =>done ; =>tagged);
-    emit_dense_array(
-        ops,
-        relocations,
-        context,
-        cage_base,
-        plan.tagged,
-        inputs,
-        regs,
-        slow,
-    );
+    if site.mode != JitSiteMode::Old {
+        dynasm!(ops ; .arch aarch64 ; b =>done ; =>tagged);
+        emit_dense_array(
+            ops,
+            relocations,
+            context,
+            cage_base,
+            plan.tagged,
+            site,
+            inputs,
+            regs,
+            slow,
+        );
+    }
     dynasm!(ops ; .arch aarch64 ; =>done);
 }
 
@@ -169,6 +193,7 @@ fn emit_dense_array(
     context: u8,
     cage_base: u64,
     plan: JitDenseArrayAllocationPlan,
+    site: JitAllocationSite,
     inputs: &[AllocationValue],
     regs: LabRegisters,
     slow: DynamicLabel,
@@ -176,19 +201,28 @@ fn emit_dense_array(
     let shell = regs.candidate;
     let slab = regs.scratch;
     let count = inputs.len() as u32;
+    // The shell carries the site; the slab is born where the shell is.
+    let slab_site = JitAllocationSite {
+        mode: if site.mode == JitSiteMode::Old {
+            JitSiteMode::Old
+        } else {
+            JitSiteMode::Young
+        },
+        ..site
+    };
     emit_load_u64(
         ops,
         regs.size,
         u64::from(plan.shell.cell_bytes + plan.slab_bytes),
     );
-    emit_bump_probe(ops, context, regs, slow);
+    emit_bump_probe_in(ops, context, lab_offset(site), regs, slow);
     dynasm!(ops ; .arch aarch64 ; add XSP(slab), XSP(shell), plan.shell.cell_bytes);
-    emit_load_u64(ops, 16, plan.shell.header_word);
+    emit_load_u64(ops, 16, site.header_word(plan.shell.header_word));
     dynasm!(ops ; .arch aarch64 ; str x16, [X(shell)]);
     for byte in (8..plan.shell.cell_bytes).step_by(8) {
         dynasm!(ops ; .arch aarch64 ; str xzr, [X(shell), byte]);
     }
-    emit_load_u64(ops, 16, plan.slab_header_word);
+    emit_load_u64(ops, 16, slab_site.header_word(plan.slab_header_word));
     dynasm!(ops ; .arch aarch64 ; str x16, [X(slab)]);
     for byte in (8..plan.slab_bytes).step_by(8) {
         dynasm!(ops ; .arch aarch64 ; str xzr, [X(slab), byte]);
@@ -265,7 +299,7 @@ fn emit_dense_array(
         ; str x16, [X(shell), plan.shell_data_byte]
         ; ldrb w16, [X(slab), plan.kind_byte]
         ; strb w16, [X(shell), plan.shell_kind_byte]
-        ; ldr X(regs.buffer), [X(context), crate::entry::ALLOC_WINDOW_LAB_OFFSET]
+        ; ldr X(regs.buffer), [X(context), lab_offset(site)]
         ; str X(regs.end), [X(regs.buffer), crate::entry::LAB_TOP_OFFSET]
     );
 }

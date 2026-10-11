@@ -46,7 +46,7 @@
 //! - [`crate::CodeBlock`] — owner of the live [`FeedbackVector`].
 
 use std::hint::spin_loop;
-use std::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering, fence};
+use std::sync::atomic::{AtomicU8, AtomicU16, AtomicU32, AtomicU64, Ordering, fence};
 
 use otter_bytecode::Op;
 use smallvec::SmallVec;
@@ -375,6 +375,9 @@ enum TypedFeedbackSlot {
     Property(Box<PropertyIcSlot>),
     Method(Box<PropertyIcSlot>, Box<AtomicCallFeedback>),
     Call(Box<AtomicCallFeedback>),
+    /// The isolate's allocation site of an object or array literal; zero
+    /// until the site's first allocation registers it.
+    AllocationSite(AtomicU16),
 }
 
 impl TypedFeedbackSlot {
@@ -399,6 +402,7 @@ impl TypedFeedbackSlot {
             | Op::NewSpread
             | Op::SuperConstruct
             | Op::SuperConstructSpread => Self::Call(Box::default()),
+            Op::NewObjectLiteral | Op::NewArray => Self::AllocationSite(AtomicU16::new(0)),
             _ => Self::None,
         }
     }
@@ -904,7 +908,7 @@ impl FeedbackVector {
             .saturating_add(std::mem::size_of_val::<[TypedFeedbackSlot]>(&self.typed_slots) as u64);
         for slot in &self.typed_slots {
             total = total.saturating_add(match slot {
-                TypedFeedbackSlot::None => 0,
+                TypedFeedbackSlot::None | TypedFeedbackSlot::AllocationSite(_) => 0,
                 TypedFeedbackSlot::Property(payload) => {
                     std::mem::size_of_val::<PropertyIcSlot>(payload) as u64
                 }
@@ -1030,6 +1034,15 @@ impl FeedbackVector {
             self.typed_slots.get(index),
             Some(TypedFeedbackSlot::Method(..))
         )
+    }
+
+    /// Allocation-site cell of one object or array literal instruction.
+    #[must_use]
+    pub(crate) fn allocation_site(&self, index: usize) -> Option<&AtomicU16> {
+        let TypedFeedbackSlot::AllocationSite(site) = self.typed_slots.get(index)? else {
+            return None;
+        };
+        Some(site)
     }
 
     /// Ordinary-call payload for one `Call`, `New`, or `SuperConstruct`

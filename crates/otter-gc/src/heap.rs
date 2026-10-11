@@ -10,8 +10,11 @@
 //! - [`GcHeap::embedder_root`] — strong handles the embedder keeps at fixed
 //!   indices for code that holds only the heap.
 //! - [`MachineAllocationWindow`] — the audited nursery/accounting view exposed
-//!   to generated-code allocators: the heap's linear allocation buffer plus
-//!   the per-type counters.
+//!   to generated-code allocators: the heap's linear allocation buffer, the
+//!   old-space buffer of tenured allocation sites, and the per-type counters.
+//! - Allocation-site placement ([`SitePlacement`]): tagged young cells and
+//!   tenured old cells, with survival digested after every scavenge (see
+//!   [`crate::pretenuring`]).
 //! - Linear-allocation-buffer refill, retire and publication (see
 //!   [`crate::lab`]).
 //! - Ephemeron registry and split mark/sweep hooks used by weak
@@ -41,7 +44,8 @@
 //! - Young allocation bumps the linear allocation buffer first. The buffer
 //!   is retired before every collection, heap walk publication and direct
 //!   nursery bump, and is refilled only when a plain young cell is legal, so
-//!   the bump itself needs no policy test.
+//!   the bump itself needs no policy test. The old-space buffer follows the
+//!   same policy and is retired with it at every collection boundary.
 //! - Successful collection refunds exactly reclaimed physical cells and
 //!   released backing stores before publishing the surviving cap ledger. Minor
 //!   collection uses its existing nursery counters; full collection sums bytes
@@ -220,6 +224,10 @@ pub struct HeapStats {
 pub struct MachineAllocationWindow {
     /// The heap's linear allocation buffer, or the permanently empty one.
     pub lab: *mut LinearAllocationArea,
+    /// The old-space buffer tenured allocation sites carve from, or the
+    /// permanently empty one. Its cells are born old and initialized
+    /// children are remembered by the carver.
+    pub old_lab: *mut LinearAllocationArea,
 }
 
 /// Buffer a disabled window points at. Every bump misses, so generated code
@@ -233,6 +241,7 @@ impl MachineAllocationWindow {
     pub const fn disabled() -> Self {
         Self {
             lab: std::ptr::addr_of!(EMPTY_LAB).cast_mut(),
+            old_lab: std::ptr::addr_of!(EMPTY_LAB).cast_mut(),
         }
     }
 }
@@ -278,6 +287,12 @@ pub struct GcHeap {
     /// Cap bytes charged for the whole buffer at refill; the unused tail is
     /// refunded at retire. `0` without a cap.
     lab_charged: u64,
+    /// Old-space buffer of tenured allocation sites; see [`tenured`].
+    old_lab: LinearAllocationArea,
+    /// Cap bytes charged for the whole old buffer at refill. `0` without a cap.
+    old_lab_charged: u64,
+    /// Survival feedback and decisions of the isolate's allocation sites.
+    allocation_sites: crate::pretenuring::AllocationSites,
     /// Configured per-heap soft cap (`0` = disabled). Front-of-
     /// struct so the alloc fast-path's "is the cap enabled?"
     /// check shares a cache line with [`Self::new_space`].
@@ -536,6 +551,9 @@ impl GcHeap {
             lab_consumed_bytes: 0,
             runtime_lab_bytes: 0,
             lab_charged: 0,
+            old_lab: LinearAllocationArea::EMPTY,
+            old_lab_charged: 0,
+            allocation_sites: crate::pretenuring::AllocationSites::default(),
             new_space,
             tenure_all: false,
             old_space: OldSpace::new(),
@@ -681,6 +699,10 @@ impl GcHeap {
             0
         } else {
             self.lab.remaining() as u64
+        } + if self.old_lab_charged == 0 {
+            0
+        } else {
+            self.old_lab.remaining() as u64
         };
         self.tracked_bytes
             .saturating_sub(self.pending_shared_external_releases())
@@ -936,7 +958,7 @@ impl GcHeap {
         if self.tracked_bytes.saturating_add(bytes) > self.max_heap_bytes
             && self.effective_tracked_bytes().saturating_add(bytes) <= self.max_heap_bytes
         {
-            self.retire_lab();
+            self.retire_machine_labs();
         }
         let projected = self.tracked_bytes.saturating_add(bytes);
         if projected > self.max_heap_bytes {
@@ -988,7 +1010,7 @@ impl GcHeap {
         if self.tracked_bytes.saturating_add(bytes) > cap
             && self.effective_tracked_bytes().saturating_add(bytes) <= cap
         {
-            self.retire_lab();
+            self.retire_machine_labs();
         }
         if self.tracked_bytes.saturating_add(bytes) <= cap {
             return Ok(true);
@@ -1362,7 +1384,7 @@ impl GcHeap {
     /// whole set and every later one trace it again, for objects that were
     /// never going to die.
     pub fn set_tenure_all(&mut self, tenure_all: bool) {
-        self.retire_lab();
+        self.retire_machine_labs();
         self.tenure_all = tenure_all;
     }
 
@@ -1378,6 +1400,7 @@ impl GcHeap {
     pub fn machine_allocation_window(&mut self) -> MachineAllocationWindow {
         MachineAllocationWindow {
             lab: std::ptr::addr_of_mut!(self.lab),
+            old_lab: std::ptr::addr_of_mut!(self.old_lab),
         }
     }
 
@@ -1389,9 +1412,10 @@ impl GcHeap {
         !self.tenure_all && self.gc_stress_stride == 0 && !self.marking.is_marking()
     }
 
-    /// Publish the buffer's progress into its page, so a page walk sees
-    /// every cell handed out so far. Idempotent; the buffer stays live.
+    /// Publish both buffers' progress into their pages, so a page walk sees
+    /// every cell handed out so far. Idempotent; the buffers stay live.
     fn sync_lab(&self) {
+        self.sync_old_lab();
         if self.lab_page == 0 {
             return;
         }
@@ -1402,6 +1426,12 @@ impl GcHeap {
             (*header).bump_cursor = self.lab.top - self.lab_page;
             (*header).allocated_bytes = self.lab_page_allocated + (self.lab.top - self.lab_start);
         }
+    }
+
+    /// Retire both machine buffers at a collection or policy boundary.
+    fn retire_machine_labs(&mut self) {
+        self.retire_lab();
+        self.retire_old_lab();
     }
 
     /// Publish the buffer into its page and drop it, refunding the unused
@@ -2330,7 +2360,7 @@ impl GcHeap {
         &mut self,
         external_visit: &mut RootSlotVisitor<'_>,
     ) -> Result<(), OutOfMemory> {
-        self.retire_lab();
+        self.retire_machine_labs();
         self.prepare_collection_observations();
         // Combine the caller's external_visit with the heap's
         // own handle-stack and global-handles walk.
@@ -2360,6 +2390,7 @@ impl GcHeap {
         // SAFETY: STW pause for the duration of the call;
         // every type tag in from-space is registered.
         let scavenge_start = Instant::now();
+        let nursery_at_maximum = self.new_space.at_maximum();
         let mut stats = unsafe {
             crate::scavenger::scavenge(
                 &mut self.new_space,
@@ -2371,8 +2402,10 @@ impl GcHeap {
                 &weak_registry_slots,
                 &mut self.remembered_parents,
                 &mut self.host_refs,
+                &mut self.allocation_sites,
             )
         }?;
+        self.allocation_sites.digest(nursery_at_maximum);
         stats.minor_pause_ns = scavenge_start.elapsed().as_nanos() as u64;
         self.ephemerons.retain_non_null();
         self.weak_finalization.retain_non_null();
@@ -2549,7 +2582,7 @@ impl GcHeap {
     /// in-process counterpart of `OTTER_GC_STRESS`, for tests that drive one
     /// heap without touching the process environment.
     pub fn set_gc_stress(&mut self, stride: u32, full: bool) {
-        self.retire_lab();
+        self.retire_machine_labs();
         self.gc_stress_stride = stride;
         self.gc_stress_full = full;
         self.gc_stress_counter = 0;
@@ -2899,7 +2932,7 @@ impl GcHeap {
     }
 
     fn sweep_phase_with_pause_start(&mut self, pause_start: Instant) {
-        self.retire_lab();
+        self.retire_machine_labs();
         self.prepare_collection_observations();
         self.prune_ephemeron_registry_to_marked();
         self.prune_weak_finalization_registry_to_marked();
@@ -3446,7 +3479,7 @@ impl std::fmt::Debug for GcHeap {
 
 impl Drop for GcHeap {
     fn drop(&mut self) {
-        self.retire_lab();
+        self.retire_machine_labs();
         // Runtime disposal is a terminal STW boundary. Page ownership alone
         // returns cage memory, but Rust payloads may own external resources
         // (host data, strings, buffers, reservation tokens) that must be
@@ -3495,6 +3528,10 @@ fn raw_is_marked(raw: RawGc) -> bool {
     // SAFETY: registries only hold heap-issued raw handles.
     unsafe { (*raw.as_header_ptr()).is_marked() }
 }
+
+#[path = "heap/tenured.rs"]
+mod tenured;
+pub use tenured::{OLD_LAB_BYTES, SitePlacement};
 
 #[cfg(test)]
 #[path = "heap/allocation_group_tests.rs"]

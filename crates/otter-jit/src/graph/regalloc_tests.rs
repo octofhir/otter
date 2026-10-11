@@ -281,7 +281,7 @@ fn bulk_literal_inputs_use_canonical_homes_without_exhausting_either_register_fi
         let object = append(
             &mut graph,
             block,
-            Kind::NewObjectLiteral,
+            Kind::NewObjectLiteral { fields: None },
             &values,
             Repr::Tagged,
         );

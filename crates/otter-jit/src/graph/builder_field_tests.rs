@@ -253,7 +253,14 @@ fn overflow_appends_keep_a_collecting_completion_inside_the_graph() {
             .iter()
             .find(|node| matches!(node.kind, Kind::StorePropertyCached { .. }))
             .expect("suffix append keeps its committed allocating miss");
-        assert_eq!(store.kind, Kind::StorePropertyCached { pc: 0, atom: None });
+        assert_eq!(
+            store.kind,
+            Kind::StorePropertyCached {
+                pc: 0,
+                atom: None,
+                barrier: true,
+            }
+        );
         assert!(store.kind.properties().may_collect);
         assert!(store.kind.properties().can_throw);
         assert!(
@@ -271,7 +278,7 @@ fn overflow_appends_keep_a_collecting_completion_inside_the_graph() {
                 .graph
                 .nodes
                 .iter()
-                .any(|node| matches!(node.kind, Kind::StoreNamedProperty(_) | Kind::Deopt(_))),
+                .any(|node| matches!(node.kind, Kind::StoreNamedProperty { .. } | Kind::Deopt(_))),
             "an allocation-required append completes without an eager shape miss"
         );
         assert!(
@@ -295,7 +302,7 @@ fn inline_appends_and_existing_suffix_overwrites_still_specialize() {
         .graph
         .nodes
         .iter()
-        .find(|node| matches!(node.kind, Kind::StoreNamedProperty(_)))
+        .find(|node| matches!(node.kind, Kind::StoreNamedProperty { .. }))
         .expect("shape capacity proves the nonallocating inline append");
     assert!(!append.kind.properties().may_collect);
     assert!(!built.graph.nodes.iter().any(|node| matches!(
@@ -355,7 +362,7 @@ fn overflow_append_preserves_the_strict_store_boundary() {
     assert!(
         !built.graph.nodes.iter().any(|node| matches!(
             node.kind,
-            Kind::StoreNamedProperty(_) | Kind::StorePropertyCached { .. } | Kind::Deopt(_)
+            Kind::StoreNamedProperty { .. } | Kind::StorePropertyCached { .. } | Kind::Deopt(_)
         )),
         "the ordinary cached-store contract cannot replace an explicit strict store"
     );

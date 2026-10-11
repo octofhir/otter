@@ -1192,8 +1192,23 @@ fn nonempty_setup(collecting_calls: usize) -> String {
     source
 }
 
+/// The input list of one dumped node: the first bracketed list outside the
+/// kind's own payload braces and parentheses.
 fn ir_inputs(body: &str) -> Vec<u32> {
-    let inputs = body.split_once('[').unwrap().1.split_once(']').unwrap().0;
+    let mut depth = 0usize;
+    let start = body
+        .char_indices()
+        .find_map(|(index, character)| {
+            match character {
+                '{' | '(' => depth += 1,
+                '}' | ')' => depth -= 1,
+                '[' if depth == 0 => return Some(index + 1),
+                _ => {}
+            }
+            None
+        })
+        .unwrap();
+    let inputs = body[start..].split_once(']').unwrap().0;
     if inputs.trim().is_empty() {
         return Vec::new();
     }
@@ -1227,7 +1242,8 @@ fn assert_element_bases_refresh_around_instanceof(regions: &[Json], nodes: &BTre
             .find(|(_, body)| {
                 let inputs = ir_inputs(body);
                 if representation == "Boxed" {
-                    inputs.len() == 4 && nodes[&inputs[0]].starts_with("NewObjectLiteral [")
+                    inputs.len() == 4
+                        && nodes[&inputs[0]].starts_with("NewObjectLiteral { fields: Some([")
                 } else {
                     inputs.len() == 5
                 }
@@ -1301,7 +1317,7 @@ fn assert_native_nonempty_artifact(bundle: &JitArtifactBundle, extra_realm: bool
             region["kind"] == "instruction"
                 && region["logicalPc"].as_u64().unwrap() <= u64::from(last_loop_pc)
                 && region["operation"].as_str().is_some_and(|operation| {
-                    operation.ends_with(" NewObjectLiteral")
+                    operation.contains(" NewObjectLiteral { fields: Some([")
                         || operation.ends_with(" NewArrayLiteral")
                 })
         })
@@ -1334,7 +1350,7 @@ fn assert_native_nonempty_artifact(bundle: &JitArtifactBundle, extra_realm: bool
     for region in literals {
         let id = region["operationIndex"].as_u64().unwrap() as u32;
         let body = nodes[&id];
-        let object = body.starts_with("NewObjectLiteral [");
+        let object = body.starts_with("NewObjectLiteral { fields: Some([");
         assert!(object || body.starts_with("NewArrayLiteral ["));
         let inputs = ir_inputs(body);
         counts.push(inputs.len());

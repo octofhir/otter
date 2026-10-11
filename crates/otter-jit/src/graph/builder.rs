@@ -77,6 +77,7 @@ use super::ir::{
     BlockId, BranchKind, Condition, DeoptReason, FrameState, FrameStateId, Graph, InlineCaller,
     InlinedBody, Kind, NodeId, Repr,
 };
+use crate::field_store::{FieldStoreOwner, StoreValueBound};
 
 #[cfg(test)]
 #[path = "builder_feedback_tests.rs"]
@@ -1969,7 +1970,9 @@ impl<'a> Builder<'a> {
                     .map(|value| self.tagged(value))
                     .collect::<Vec<_>>();
                 let kind = if op == Op::NewObjectLiteral {
-                    Kind::NewObjectLiteral
+                    Kind::NewObjectLiteral {
+                        fields: self.literal_field_owners(&inputs),
+                    }
                 } else {
                     Kind::NewArrayLiteral
                 };
@@ -2909,6 +2912,7 @@ impl<'a> Builder<'a> {
         if !self.exited_for(ExitReason::ShapeGuard)
             && let Some((projection, programs)) =
                 super::feedback::named_store_programs(self.view, byte_pc)
+            && let Some(owners) = self.named_store_owners(programs, projection, instruction)
         {
             use otter_vm::JitCacheIrOp as Op;
             let object = self.read(instruction.reads[0]);
@@ -2917,7 +2921,7 @@ impl<'a> Builder<'a> {
             let value = self.read(instruction.reads[1]);
             let value = self.tagged(value);
             self.add(
-                Kind::StoreNamedProperty(byte_pc),
+                Kind::StoreNamedProperty { byte_pc, owners },
                 &[object, value],
                 Repr::None,
             );
@@ -3005,11 +3009,70 @@ impl<'a> Builder<'a> {
         let object = self.tagged(object);
         let value = self.read(instruction.reads[1]);
         let value = self.tagged(value);
+        let barrier = self.owes_barrier(object, value);
         self.add(
-            Kind::StorePropertyCached { pc: self.pc, atom },
+            Kind::StorePropertyCached {
+                pc: self.pc,
+                atom,
+                barrier,
+            },
             &[object, value],
             Repr::None,
         );
+    }
+
+    /// One selected record per program of a named store site, in program
+    /// order, judged on the stored value after that program's own effects.
+    /// An append `S→T` leaves a receiver-aliased value with shape `T`: the
+    /// same SSA value is exactly `{T}`, a bound holding `S` may alias it and
+    /// gains `T`, and a bound without `S` cannot be the receiver. Distinct
+    /// nodes prove no non-alias. `None` when a program has no field authority.
+    fn named_store_owners(
+        &mut self,
+        programs: &[otter_vm::JitCacheIrProgram],
+        projection: otter_vm::jit::PropertyStorageProjection,
+        instruction: &Instruction,
+    ) -> Option<SmallVec<[FieldStoreOwner; 4]>> {
+        use otter_vm::JitCacheIrOp as Op;
+        let operand =
+            u8::from(projection == otter_vm::jit::PropertyStorageProjection::ArrayExpando);
+        let receiver = self.read(instruction.reads[0]);
+        let value = self.read(instruction.reads[1]);
+        let aliased = receiver == value;
+        let bound = self.store_value_bound(value);
+        programs
+            .iter()
+            .map(|program| {
+                let guarded = program.ops.iter().find_map(|op| match *op {
+                    Op::GuardShape { object, shape } if object == operand => Some(shape),
+                    _ => None,
+                })?;
+                let published = program.ops.iter().find_map(|op| match *op {
+                    Op::PublishShape { shape, .. } => Some(shape),
+                    _ => None,
+                });
+                let field = program.ops.iter().find_map(|op| match *op {
+                    Op::StoreField { field, .. } => Some(field),
+                    _ => None,
+                })?;
+                let record = self
+                    .view
+                    .field_types
+                    .get(&(published.unwrap_or(guarded), field))?;
+                let after = match published {
+                    None => bound.clone(),
+                    Some(target) if aliased => Some(StoreValueBound::exact(target)),
+                    Some(target) => bound.as_ref().and_then(|bound| {
+                        if bound.shapes.contains(&guarded) {
+                            bound.with_shape(target)
+                        } else {
+                            Some(bound.clone())
+                        }
+                    }),
+                };
+                Some(FieldStoreOwner::select(record, after.as_ref()))
+            })
+            .collect()
     }
 
     /// Materialize a tagged storage owner while source state retains its receiver.
@@ -3040,16 +3103,21 @@ impl<'a> Builder<'a> {
     /// `value` can never be a cell: an immediate constant, a boxed number or
     /// a boolean result; or unless `object` is a cell this path just bumped.
     fn write_barrier(&mut self, object: NodeId, value: NodeId) {
-        if self.known.fresh.contains(&object) {
-            return;
+        if self.owes_barrier(object, value) {
+            self.add(Kind::WriteBarrier, &[object, value], Repr::None);
         }
-        let never_cell = match self.graph.node(value).kind {
+    }
+
+    /// Whether storing `value` into `object` may need a value barrier: a
+    /// fresh cell is young and unmarked, and a never-cell value owes none.
+    fn owes_barrier(&self, object: NodeId, value: NodeId) -> bool {
+        if self.known.fresh.contains(&object) {
+            return false;
+        }
+        !match self.graph.node(value).kind {
             Kind::ConstTagged(bits) => !tag::is_cell_bits(bits),
             Kind::Int32ToTagged | Kind::Float64ToTagged => true,
             ref kind => kind.produces_boolean(),
-        };
-        if !never_cell {
-            self.add(Kind::WriteBarrier, &[object, value], Repr::None);
         }
     }
 

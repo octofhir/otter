@@ -4,6 +4,7 @@
 //! - [`FieldValueBound`] describes an SSA value's nullish and ordinary arms.
 //! - Builder helpers guard owner summaries, revalidate targets and refine edges.
 //! - Nullish comparisons reuse owner guards already demanded by other consumers.
+//! - Store selection forms each native store's one observation record.
 //!
 //! # Invariants
 //! - Owner summaries authorize value categories, not a field's current value.
@@ -11,13 +12,17 @@
 //! - Owner guards stay at their source loads and survive only when consumed.
 //! - Nullable bounds never enter ordinary layout facts before refinement.
 //! - Every admitted store receiver selects its own defining field owner.
+//! - Named and literal stores select records from proofs the path already
+//!   owns: current exact layouts, nullish constants, or a field bound whose
+//!   guards other consumers demand and whose targets this path rechecked.
+//!   They never add a guard to elide an observation.
 //!
 //! # See also
 //! - [`super::Known`] for path facts and effect invalidation.
 //! - `otter_vm::object::field_type` for the monotone runtime summary.
 
 use super::{BranchKind, Builder, Graph, Kind, Known, NodeId, Repr, SmallVec};
-use crate::graph::ir::FieldStoreOwner;
+use crate::field_store::{FieldStoreOwner, StoreValueBound};
 use otter_vm::object::FieldLocation;
 use otter_vm::object::field_type;
 use otter_vm::value::tag;
@@ -257,7 +262,7 @@ impl Builder<'_> {
         receivers: &[u32],
         field: FieldLocation,
         value: NodeId,
-    ) -> Option<SmallVec<[FieldStoreOwner; 4]>> {
+    ) -> Option<SmallVec<[(u32, FieldStoreOwner); 4]>> {
         let records: Option<Vec<_>> = receivers
             .iter()
             .map(|&shape| {
@@ -290,35 +295,22 @@ impl Builder<'_> {
             .or_else(|| {
                 FieldValueBound::of(&self.graph, value, &self.known, &self.root.stable_shapes)
             });
-        let mut owners: SmallVec<[FieldStoreOwner; 4]> = SmallVec::new();
+        let bound = rhs.as_ref().map(|rhs| StoreValueBound {
+            shapes: rhs.shapes.clone(),
+            nullish: rhs.nullish,
+        });
+        let mut owners: SmallVec<[(u32, FieldStoreOwner); 4]> = SmallVec::new();
         let mut uses_bound = false;
         for (receiver_shape, record) in records {
-            let subset = rhs.as_ref().is_some_and(|rhs| {
-                u64::from(rhs.nullish) & !record.guard.expected == 0
-                    && (rhs.shapes.is_empty()
-                        || !record.stored_shapes.is_empty()
-                            && rhs
-                                .shapes
-                                .iter()
-                                .all(|shape| record.stored_shapes.contains(shape)))
-            });
-            let owner_shape = if record.guard.expected & TOP != 0 {
-                0
-            } else if subset {
-                uses_bound = true;
-                0
-            } else {
+            let owner = FieldStoreOwner::select(&record, bound.as_ref());
+            if owner.observes() {
                 self.known
                     .checked_field_types
                     .remove(&record.guard.owner_shape);
-                record.guard.owner_shape
-            };
-            owners.push(FieldStoreOwner {
-                receiver_shape,
-                owner_shape,
-                stored_shapes: record.stored_shapes,
-                nullish_mask: record.nullish_mask,
-            });
+            } else if record.guard.expected & TOP == 0 {
+                uses_bound = true;
+            }
+            owners.push((receiver_shape, owner));
         }
         if uses_bound && let Some(rhs) = rhs {
             self.required_field_guards.extend(rhs.guards);
@@ -326,10 +318,86 @@ impl Builder<'_> {
                 self.check_field_targets(&rhs.shapes);
             }
         }
-        if owners.iter().all(|owner| owner.owner_shape == 0) {
+        if owners.iter().all(|(_, owner)| !owner.observes()) {
             owners.clear();
         }
         Some(owners)
+    }
+
+    /// One selected record per literal input, in source order, for the fit of
+    /// this source body's prepared geometry. The candidate is born after
+    /// every input, so no input aliases it, and the fit neither collects nor
+    /// reenters: each input keeps its current bound. `None` leaves only the
+    /// committed allocation: no geometry, or a field without authority.
+    pub(super) fn literal_field_owners(
+        &self,
+        inputs: &[NodeId],
+    ) -> Option<SmallVec<[FieldStoreOwner; 4]>> {
+        let plan = self.view.literal_allocations.objects.get(&self.pc)?;
+        if plan.value_count as usize != inputs.len() {
+            return None;
+        }
+        inputs
+            .iter()
+            .enumerate()
+            .map(|(index, &value)| {
+                let record = self
+                    .view
+                    .field_types
+                    .get(&(plan.shape, FieldLocation::inline(index as u32)))?;
+                Some(FieldStoreOwner::select(
+                    record,
+                    self.store_value_bound(value).as_ref(),
+                ))
+            })
+            .collect()
+    }
+
+    /// The bound `value` has at a native store, from proofs this path already
+    /// owns: a current exact layout, a nullish constant, or a field bound
+    /// whose owner guards other consumers demand and whose ordinary targets
+    /// this path already rechecked. Adds no node and demands no guard.
+    pub(super) fn store_value_bound(&self, value: NodeId) -> Option<StoreValueBound> {
+        if let Some(shapes) = self
+            .known
+            .layout(value)
+            .and_then(|layout| layout.shapes.as_ref())
+            && !shapes.is_empty()
+            && shapes.len() <= 2
+        {
+            return Some(StoreValueBound {
+                shapes: shapes.iter().copied().collect(),
+                nullish: 0,
+            });
+        }
+        match self.graph.node(value).kind {
+            Kind::ConstTagged(bits) if bits == tag::VALUE_UNDEFINED => {
+                return Some(StoreValueBound {
+                    shapes: SmallVec::new(),
+                    nullish: UNDEFINED,
+                });
+            }
+            Kind::ConstTagged(bits) if bits == tag::VALUE_NULL => {
+                return Some(StoreValueBound {
+                    shapes: SmallVec::new(),
+                    nullish: NULL,
+                });
+            }
+            _ => {}
+        }
+        let bound = self.known.field_values.get(&value)?;
+        (bound
+            .guards
+            .iter()
+            .all(|guard| self.required_field_guards.contains(guard))
+            && bound
+                .shapes
+                .iter()
+                .all(|shape| self.known.stable_checked.contains(shape)))
+        .then(|| StoreValueBound {
+            shapes: bound.shapes.clone(),
+            nullish: bound.nullish,
+        })
     }
 
     pub(super) fn refine_field_branch(&mut self, kind: BranchKind, inputs: &[NodeId], truth: bool) {

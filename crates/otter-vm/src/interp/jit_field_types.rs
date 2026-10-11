@@ -4,6 +4,7 @@
 //! - `bake_field_type_tree` captures defining words and rooted ordinary targets
 //!   after the complete bounded source tree's allocation plans are prepared.
 //! - Own property programs and literal births share one field-record bank.
+//!   Literal geometry names no owner; this bank is the only field authority.
 //!
 //! # Invariants
 //! - Only ordinary own data fields receive result bounds; inherited and
@@ -287,8 +288,6 @@ mod tests {
             let receiver_shape = object::shape(receiver_object, interpreter.gc_heap());
             let plan = crate::jit::JitObjectLiteralAllocationPlan::new(receiver_shape, 2)
                 .expect("inline literal plan");
-            assert_ne!(plan.field_owners[0], 0);
-            assert_eq!(plan.field_owners[1], 0);
             let mut view = JitCompileSnapshot::without_feedback(
                 90,
                 0,
@@ -305,6 +304,10 @@ mod tests {
             interpreter.bake_field_types(&mut view);
             assert_eq!(view.field_types.len(), 2);
             let link = &view.field_types[&(receiver_shape.offset(), FieldLocation::inline(0))];
+            assert_eq!(
+                link.guard.owner_shape,
+                field_type::owner(receiver_shape, 0).unwrap().offset()
+            );
             assert_eq!(link.stored_shapes.as_slice(), &[target_shape.offset()]);
             assert_eq!(link.shapes, link.stored_shapes);
             assert_eq!(
@@ -312,6 +315,10 @@ mod tests {
                 1 << field_type::SHAPE_COUNT_SHIFT
             );
             let count = &view.field_types[&(receiver_shape.offset(), FieldLocation::inline(1))];
+            assert_eq!(
+                count.guard.owner_shape,
+                field_type::owner(receiver_shape, 1).unwrap().offset()
+            );
             assert_eq!(count.guard.expected, field_type::TOP);
             assert!(count.shapes.is_empty() && count.stored_shapes.is_empty());
         });

@@ -51,15 +51,7 @@ use smallvec::SmallVec;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct NodeId(pub(crate) u32);
 
-/// The defining field cell selected by an admitted store receiver shape.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub(crate) struct FieldStoreOwner {
-    pub(crate) receiver_shape: u32,
-    pub(crate) owner_shape: u32,
-    /// Rooted historical targets whose current membership needs no widening.
-    pub(crate) stored_shapes: SmallVec<[u32; 2]>,
-    pub(crate) nullish_mask: u8,
-}
+pub(crate) use crate::field_store::FieldStoreOwner;
 
 /// Dense block index; block order is emission order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -207,7 +199,12 @@ pub(crate) enum Kind {
     /// Fresh empty array shell; extra realms use the committed sidecar allocator.
     NewArrayEmpty,
     /// Static own-property values initialized from canonical tagged homes.
-    NewObjectLiteral,
+    /// `fields` holds one selected record per input in source order when the
+    /// source body's geometry admits the native fit; otherwise only the
+    /// committed allocation runs.
+    NewObjectLiteral {
+        fields: Option<SmallVec<[FieldStoreOwner; 4]>>,
+    },
     /// Dense source-order elements initialized from canonical tagged homes.
     NewArrayLiteral,
     /// Fresh lexical environment for this source function's scope.
@@ -386,9 +383,11 @@ pub(crate) enum Kind {
     /// Tagged live named storage of actual Array input0; miss before effects.
     LoadArrayExpando(otter_vm::jit::JitArrayLayout),
     /// Store input1 into input0's shape-owned field; a separate node owns its barrier.
+    /// `owners` pairs each admitted receiver shape with its selected record;
+    /// it is empty when no arm observes.
     StoreOwnField {
         field: otter_vm::object::FieldLocation,
-        owners: SmallVec<[FieldStoreOwner; 4]>,
+        owners: SmallVec<[(u32, FieldStoreOwner); 4]>,
     },
     /// Read a named property of input0 through the selected feedback programs
     /// at `byte_pc`. Indices refer to the original source programs in their
@@ -401,11 +400,15 @@ pub(crate) enum Kind {
         receiver_shape: Option<u32>,
     },
     /// Store input1 into the named property of receiver input0 through the
-    /// feedback programs of the store site at this byte PC: an existing
+    /// feedback programs of the store site at `byte_pc`: an existing
     /// writable slot, or an appended slot with the child shape published and
-    /// its edge barriered. Eager deopt when no program matches; the value's
-    /// own barrier is a separate node.
-    StoreNamedProperty(u32),
+    /// its edge barriered. `owners` holds one selected record per source
+    /// program, in program order. Eager deopt when no program matches; the
+    /// value's own barrier is a separate node.
+    StoreNamedProperty {
+        byte_pc: u32,
+        owners: SmallVec<[FieldStoreOwner; 4]>,
+    },
     /// `[[Get]]` of the named property at the load site `pc` from receiver
     /// input0: an own or prototype data slot proved by the load fact in the
     /// isolate's shared property action table for `atom`, else the committed
@@ -420,10 +423,13 @@ pub(crate) enum Kind {
     /// store site `pc`: an existing writable own slot or an addition proved
     /// by the independent store fact in the shared property action table for
     /// `atom`; else the committed source operation in the runtime.
-    /// The source receiver remains input0; each hit barriers its selected storage.
+    /// The source receiver remains input0; each hit barriers its selected
+    /// storage unless `barrier` is false: the value is never a cell, or the
+    /// receiver is a fresh ordinary cell, which is its own storage.
     StorePropertyCached {
         pc: u32,
         atom: Option<u32>,
+        barrier: bool,
     },
     /// `[[Set]]` of input2 at key input1 of receiver input0 at the element
     /// store site `pc` as a generic keyed store: an in-bounds store into
@@ -817,7 +823,7 @@ impl Kind {
                 may_collect: true,
                 ..Properties::default()
             },
-            Self::StoreNamedProperty(_) => Properties {
+            Self::StoreNamedProperty { .. } => Properties {
                 eager_deopt: true,
                 writes: true,
                 effectful: true,
@@ -831,7 +837,7 @@ impl Kind {
             | Self::LooseEqual { .. }
             | Self::NewObject
             | Self::NewArrayEmpty
-            | Self::NewObjectLiteral
+            | Self::NewObjectLiteral { .. }
             | Self::NewArrayLiteral => Properties {
                 eager_deopt: true,
                 can_throw: true,
@@ -925,7 +931,7 @@ impl Kind {
                 fp_temps: 0,
                 fixed_gp_clobbers: SmallVec::new(),
             },
-            Self::NewObjectLiteral
+            Self::NewObjectLiteral { .. }
             | Self::NewArrayLiteral
             | Self::NativeNewContext(_)
             | Self::CopyContext
@@ -1057,7 +1063,7 @@ impl Kind {
                 fp_temps: 0,
                 fixed_gp_clobbers: SmallVec::new(),
             },
-            Self::StoreNamedProperty(_) => Constraints {
+            Self::StoreNamedProperty { .. } => Constraints {
                 inputs: registers(2),
                 result: ResultPolicy::None,
                 gp_temps: 2,

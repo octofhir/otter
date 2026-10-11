@@ -8,7 +8,8 @@
 //! The candidate never aliases the result; the result's previous occupant stays
 //! intact until cold canonical saves. The own source realm guards the fit, and
 //! the existing VM allocator selects that same source realm on a miss.
-//! Literal plans and captured field membership come from that same source.
+//! Literal geometry comes from that same source; each field's observation
+//! record comes from the node, selected before any collecting clobber.
 //!
 //! # See also
 //! `crate::arm64::allocation` owns the one LAB probe/init/publish implementation.
@@ -61,8 +62,8 @@ impl Codegen<'_> {
         let slow = self.ops.new_dynamic_label();
         let done = self.ops.new_dynamic_label();
         let stub = match kind {
-            Kind::NewObjectLiteral => {
-                if let Some(plan) = object {
+            Kind::NewObjectLiteral { fields } => {
+                if let Some((plan, fields)) = object.zip(fields) {
                     emit_object_literal(
                         &mut self.ops,
                         &mut self.relocations,
@@ -70,6 +71,7 @@ impl Codegen<'_> {
                         20,
                         realm,
                         &plan,
+                        &fields,
                         &inputs,
                         regs,
                         slow,

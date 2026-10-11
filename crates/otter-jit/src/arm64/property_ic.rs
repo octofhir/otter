@@ -91,6 +91,7 @@ pub(crate) fn emit_select_entry(
     let scan = ops.new_dynamic_label();
     let found = ops.new_dynamic_label();
     let keyed = ops.new_dynamic_label();
+    let projected = ops.new_dynamic_label();
     emit_cell_test(ops, receiver, CellTest::IsNotCell, miss);
     dynasm!(ops ; .arch aarch64
         ; cbz X(receiver), =>miss
@@ -102,67 +103,13 @@ pub(crate) fn emit_select_entry(
             ; b.ne =>miss
             ; ldr w17, [X(receiver), view.object_shape_byte]
         ),
-        Some(start) => {
-            let function = ops.new_dynamic_label();
-            let array = ops.new_dynamic_label();
-            let native = ops.new_dynamic_label();
-            let bag = ops.new_dynamic_label();
-            let layout = view.closure_call_layout;
-            let native_layout = view.native_call_layout;
-            let qualifying = u32::from(
-                otter_vm::closure::CLOSURE_LOOKUP_OWN_PROPS
-                    | otter_vm::closure::CLOSURE_LOOKUP_PROTO_OVERRIDE,
-            );
-            dynasm!(ops ; .arch aarch64
-                ; b.ne =>function
-                ; ldr w17, [X(receiver), view.object_shape_byte]
-                ; mov X(start), X(receiver)
-                ; b =>keyed
-                ; =>function
-                ; cmp w16, u32::from(view.array_layout.type_tag)
-                ; b.eq =>array
-                ; cmp w16, u32::from(otter_vm::native_function::NATIVE_FUNCTION_BODY_TYPE_TAG)
-                ; b.eq =>native
-                ; cmp w16, u32::from(otter_vm::closure::JS_CLOSURE_BODY_TYPE_TAG)
-                ; b.ne =>miss
-                ; ldrb w16, [X(receiver), otter_vm::closure::CLOSURE_NAMED_LOOKUP_BYTE]
-                ; and w16, w16, #qualifying
-                ; cmp w16, u32::from(otter_vm::closure::CLOSURE_LOOKUP_OWN_PROPS)
-                ; b.ne =>miss
-                ; ldr w16, [X(receiver), layout.rare_byte]
-                ; cbz w16, =>miss
-                ; and x17, X(receiver), #0xffff_ffff_0000_0000
-                ; add x16, x17, x16
-                ; ldr W(start), [x16, layout.own_props_byte]
-                ; b =>bag
-                ; =>native
-                ; ldrb w16, [X(receiver), native_layout.flags_byte]
-                ; tst w16, u32::from(native_layout.prototype_override_flag)
-                ; b.ne =>miss
-                ; ldr W(start), [X(receiver), native_layout.own_props_byte]
-                // The bag of either function kind: present, in the default
-                // realm, keyed by its shape.
-                ; =>bag
-                ; cbz W(start), =>miss
-                ; ldr x16, [x20, THREAD_OFFSET]
-                ; ldr x16, [x16, VM_THREAD_ACTIVE_REALM_CELL_OFFSET]
-                ; cbz x16, =>miss
-                ; ldr w16, [x16]
-                ; cbnz w16, =>miss
-                ; and x17, X(receiver), #0xffff_ffff_0000_0000
-                ; add X(start), x17, X(start)
-                ; ldr w17, [X(start), view.object_shape_byte]
-                ; orr w17, w17, #Projection::LookupStart as u32
-                ; b =>keyed
-                ; =>array
-                ; ldr W(start), [X(receiver), view.array_layout.expando_byte]
-                ; cbz W(start), =>miss
-                ; and x17, X(receiver), #0xffff_ffff_0000_0000
-                ; add X(start), x17, X(start)
-                ; ldr w17, [X(start), view.object_shape_byte]
-                ; orr w17, w17, #Projection::ArrayExpando as u32
-            );
-        }
+        // An ordinary object is its own storage and falls through to the scan;
+        // every projected receiver kind selects out of line.
+        Some(start) => dynasm!(ops ; .arch aarch64
+            ; b.ne =>projected
+            ; ldr w17, [X(receiver), view.object_shape_byte]
+            ; mov X(start), X(receiver)
+        ),
     }
     dynasm!(ops ; .arch aarch64
         ; =>keyed
@@ -179,8 +126,65 @@ pub(crate) fn emit_select_entry(
         ; b.eq =>miss
         ; add XSP(entry), XSP(entry), #IC.entry_bytes
         ; b =>scan
-        ; =>found
     );
+    if let Some(start) = start {
+        let array = ops.new_dynamic_label();
+        let native = ops.new_dynamic_label();
+        let bag = ops.new_dynamic_label();
+        let layout = view.closure_call_layout;
+        let native_layout = view.native_call_layout;
+        let qualifying = u32::from(
+            otter_vm::closure::CLOSURE_LOOKUP_OWN_PROPS
+                | otter_vm::closure::CLOSURE_LOOKUP_PROTO_OVERRIDE,
+        );
+        dynasm!(ops ; .arch aarch64
+            ; =>projected
+            ; cmp w16, u32::from(view.array_layout.type_tag)
+            ; b.eq =>array
+            ; cmp w16, u32::from(otter_vm::native_function::NATIVE_FUNCTION_BODY_TYPE_TAG)
+            ; b.eq =>native
+            ; cmp w16, u32::from(otter_vm::closure::JS_CLOSURE_BODY_TYPE_TAG)
+            ; b.ne =>miss
+            ; ldrb w16, [X(receiver), otter_vm::closure::CLOSURE_NAMED_LOOKUP_BYTE]
+            ; and w16, w16, #qualifying
+            ; cmp w16, u32::from(otter_vm::closure::CLOSURE_LOOKUP_OWN_PROPS)
+            ; b.ne =>miss
+            ; ldr w16, [X(receiver), layout.rare_byte]
+            ; cbz w16, =>miss
+            ; and x17, X(receiver), #0xffff_ffff_0000_0000
+            ; add x16, x17, x16
+            ; ldr W(start), [x16, layout.own_props_byte]
+            ; b =>bag
+            ; =>native
+            ; ldrb w16, [X(receiver), native_layout.flags_byte]
+            ; tst w16, u32::from(native_layout.prototype_override_flag)
+            ; b.ne =>miss
+            ; ldr W(start), [X(receiver), native_layout.own_props_byte]
+            // The bag of either function kind: present, in the default
+            // realm, keyed by its shape.
+            ; =>bag
+            ; cbz W(start), =>miss
+            ; ldr x16, [x20, THREAD_OFFSET]
+            ; ldr x16, [x16, VM_THREAD_ACTIVE_REALM_CELL_OFFSET]
+            ; cbz x16, =>miss
+            ; ldr w16, [x16]
+            ; cbnz w16, =>miss
+            ; and x17, X(receiver), #0xffff_ffff_0000_0000
+            ; add X(start), x17, X(start)
+            ; ldr w17, [X(start), view.object_shape_byte]
+            ; orr w17, w17, #Projection::LookupStart as u32
+            ; b =>keyed
+            ; =>array
+            ; ldr W(start), [X(receiver), view.array_layout.expando_byte]
+            ; cbz W(start), =>miss
+            ; and x17, X(receiver), #0xffff_ffff_0000_0000
+            ; add X(start), x17, X(start)
+            ; ldr w17, [X(start), view.object_shape_byte]
+            ; orr w17, w17, #Projection::ArrayExpando as u32
+            ; b =>keyed
+        );
+    }
+    dynasm!(ops ; .arch aarch64 ; =>found);
 }
 
 /// Branch to `miss` unless the entry at `X(entry)` carries no proof (when

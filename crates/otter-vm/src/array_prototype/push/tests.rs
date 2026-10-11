@@ -99,7 +99,7 @@ fn prepare_inputs(
                         );
                         let receiver = interp.escape_scoped(receiver).as_array().unwrap();
                         assert_eq!(crate::array::len(receiver, interp.gc_heap()), 0);
-                        assert!(crate::array::get_accessor(receiver, interp.gc_heap(), "0").is_none());
+                        assert!(crate::array::get_index_accessor(receiver, interp.gc_heap(), 0).is_none());
                         assert!(interp.array_index_accessor_protector);
                     });
                 }
@@ -157,11 +157,19 @@ fn assert_contents(
     }
     let first = if setter {
         assert_eq!(
-            crate::array::get_named_property(array, interp.gc_heap(), "setterCalls"),
+            crate::object::get(
+                crate::array::expando_object(array, interp.gc_heap()).unwrap(),
+                interp.gc_heap(),
+                "setterCalls"
+            ),
             Some(Value::number_i32(1))
         );
-        crate::array::get_named_property(array, interp.gc_heap(), "seen")
-            .expect("setter stored its argument")
+        crate::object::get(
+            crate::array::expando_object(array, interp.gc_heap()).unwrap(),
+            interp.gc_heap(),
+            "seen",
+        )
+        .expect("setter stored its argument")
     } else {
         crate::array::get(array, interp.gc_heap(), 0)
     };

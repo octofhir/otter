@@ -7,6 +7,7 @@
 //! # Contents
 //! - Built-in static calls for Math, JSON, Date, BigInt, binary buffers,
 //!   iterators, Proxy, Object, globals, Symbol, and Temporal.
+//! - Scoped descriptor batches shared by Object.create and defineProperties.
 //!
 //! # Invariants
 //! - The opcode passed to `run_static_call_operands` must be one of the
@@ -17,12 +18,16 @@
 //!   re-entry, coercion, or allocation are held in canonical scope handles;
 //!   builders never continue mutating a copied pre-collection receiver.
 //!
+//! - Object descriptor batches collect every own enumerable String/Symbol
+//!   descriptor before the first definition, with keys and payloads scoped.
 //! - Object iterator consumers preserve typed step/close and completed
 //!   callback failures. Local construction/coercion errors remain source
 //!   failures; mixed ordinary Get retains its existing separate contract.
 //!
 //! # See also
 //! - [`crate::executable`]
+
+mod define_properties;
 
 use crate::activation_stack::ActivationStack;
 use crate::runtime_activation::CommittedValueError;
@@ -32,7 +37,7 @@ use smallvec::SmallVec;
 
 use crate::{
     ActiveFrameMut, ExecutionContext, Frame, Interpreter, Local, Value, VmError, VmPropertyKey,
-    array, bigint, binary, object,
+    bigint, binary, object,
     operand_decode::{const_operand, register_operand},
     read_register, write_register,
 };
@@ -202,12 +207,9 @@ impl Interpreter {
         let top_idx = stack.len() - 1;
         let (dst, target) = {
             let frame = &stack[top_idx];
-            let dst = register_operand(operands.first())
-                .map_err(CommittedValueError::Fatal)?;
-            let src = register_operand(operands.get(1))
-                .map_err(CommittedValueError::Fatal)?;
-            let target = *read_register(frame, src)
-                .map_err(CommittedValueError::Fatal)?;
+            let dst = register_operand(operands.first()).map_err(CommittedValueError::Fatal)?;
+            let src = register_operand(operands.get(1)).map_err(CommittedValueError::Fatal)?;
+            let target = *read_register(frame, src).map_err(CommittedValueError::Fatal)?;
             (dst, target)
         };
         if let Some(keys) = self
@@ -239,19 +241,15 @@ impl Interpreter {
         let top_idx = stack.len() - 1;
         let (target, src, excluded_value) = {
             let frame = &stack[top_idx];
-            let target_reg = register_operand(operands.first())
-                .map_err(CommittedValueError::Fatal)?;
-            let src_reg = register_operand(operands.get(1))
-                .map_err(CommittedValueError::Fatal)?;
-            let excluded_reg = register_operand(operands.get(2))
-                .map_err(CommittedValueError::Fatal)?;
+            let target_reg =
+                register_operand(operands.first()).map_err(CommittedValueError::Fatal)?;
+            let src_reg = register_operand(operands.get(1)).map_err(CommittedValueError::Fatal)?;
+            let excluded_reg =
+                register_operand(operands.get(2)).map_err(CommittedValueError::Fatal)?;
             (
-                *read_register(frame, target_reg)
-                    .map_err(CommittedValueError::Fatal)?,
-                *read_register(frame, src_reg)
-                    .map_err(CommittedValueError::Fatal)?,
-                *read_register(frame, excluded_reg)
-                    .map_err(CommittedValueError::Fatal)?,
+                *read_register(frame, target_reg).map_err(CommittedValueError::Fatal)?,
+                *read_register(frame, src_reg).map_err(CommittedValueError::Fatal)?,
+                *read_register(frame, excluded_reg).map_err(CommittedValueError::Fatal)?,
             )
         };
         let excluded: Vec<Value> = match excluded_value.as_array() {
@@ -266,9 +264,7 @@ impl Interpreter {
         let args = [target, src];
         let _ = self.do_object_assign_excluding(context, stack, &args, &excluded)?;
         let frame = &mut stack[top_idx];
-        frame
-            .advance_pc()
-            .map_err(CommittedValueError::Fatal)?;
+        frame.advance_pc().map_err(CommittedValueError::Fatal)?;
         Ok(())
     }
 
@@ -287,10 +283,8 @@ impl Interpreter {
         operands: impl crate::executable::OperandSource,
     ) -> Result<(), CommittedValueError> {
         let top_idx = stack.len() - 1;
-        let target_reg = register_operand(operands.first())
-            .map_err(CommittedValueError::Fatal)?;
-        let src_reg = register_operand(operands.get(1))
-            .map_err(CommittedValueError::Fatal)?;
+        let target_reg = register_operand(operands.first()).map_err(CommittedValueError::Fatal)?;
+        let src_reg = register_operand(operands.get(1)).map_err(CommittedValueError::Fatal)?;
         self.run_star_reexport_regs(context, stack, top_idx, target_reg, src_reg)
     }
 
@@ -302,15 +296,15 @@ impl Interpreter {
         target_reg: u16,
         src_reg: u16,
     ) -> Result<(), CommittedValueError> {
-        let target = *read_register(&stack[frame_index], target_reg)
-            .map_err(CommittedValueError::Fatal)?;
+        let target =
+            *read_register(&stack[frame_index], target_reg).map_err(CommittedValueError::Fatal)?;
         if target.is_object() {
             let existing: std::collections::HashSet<String> = self
                 .enumerable_own_string_keys_for_value(stack, context, target, 0)?
                 .into_iter()
                 .collect();
-            let src = *read_register(&stack[frame_index], src_reg)
-                .map_err(CommittedValueError::Fatal)?;
+            let src =
+                *read_register(&stack[frame_index], src_reg).map_err(CommittedValueError::Fatal)?;
             if !src.is_object() {
                 stack[frame_index]
                     .advance_pc()
@@ -339,9 +333,7 @@ impl Interpreter {
             }
         }
         let frame = &mut stack[frame_index];
-        frame
-            .advance_pc()
-            .map_err(CommittedValueError::Fatal)?;
+        frame.advance_pc().map_err(CommittedValueError::Fatal)?;
         Ok(())
     }
 
@@ -355,12 +347,10 @@ impl Interpreter {
         stack: &mut ActivationStack,
         operands: impl crate::executable::OperandSource,
     ) -> Result<(), CommittedValueError> {
-        let target_reg = register_operand(operands.first())
-            .map_err(CommittedValueError::Fatal)?;
-        let key_reg = register_operand(operands.get(1))
-            .map_err(CommittedValueError::Fatal)?;
-        let descriptor_reg = register_operand(operands.get(2))
-            .map_err(CommittedValueError::Fatal)?;
+        let target_reg = register_operand(operands.first()).map_err(CommittedValueError::Fatal)?;
+        let key_reg = register_operand(operands.get(1)).map_err(CommittedValueError::Fatal)?;
+        let descriptor_reg =
+            register_operand(operands.get(2)).map_err(CommittedValueError::Fatal)?;
         let top_idx = stack
             .len()
             .checked_sub(1)
@@ -389,12 +379,10 @@ impl Interpreter {
             .get(frame_index)
             .ok_or(VmError::InvalidOperand)
             .map_err(CommittedValueError::Fatal)?;
-        let target = *read_register(frame, target_reg)
-            .map_err(CommittedValueError::Fatal)?;
-        let key_value = *read_register(frame, key_reg)
-            .map_err(CommittedValueError::Fatal)?;
-        let desc_value = *read_register(frame, descriptor_reg)
-            .map_err(CommittedValueError::Fatal)?;
+        let target = *read_register(frame, target_reg).map_err(CommittedValueError::Fatal)?;
+        let key_value = *read_register(frame, key_reg).map_err(CommittedValueError::Fatal)?;
+        let desc_value =
+            *read_register(frame, descriptor_reg).map_err(CommittedValueError::Fatal)?;
         self.define_own_property_values(stack, context, target, key_value, desc_value)?;
         stack[frame_index]
             .advance_pc()
@@ -419,12 +407,9 @@ impl Interpreter {
             .get(frame_index)
             .ok_or(VmError::InvalidOperand)
             .map_err(CommittedValueError::Fatal)?;
-        let target = *read_register(frame, target_reg)
-            .map_err(CommittedValueError::Fatal)?;
-        let key_value = *read_register(frame, key_reg)
-            .map_err(CommittedValueError::Fatal)?;
-        let value = *read_register(frame, value_reg)
-            .map_err(CommittedValueError::Fatal)?;
+        let target = *read_register(frame, target_reg).map_err(CommittedValueError::Fatal)?;
+        let key_value = *read_register(frame, key_reg).map_err(CommittedValueError::Fatal)?;
+        let value = *read_register(frame, value_reg).map_err(CommittedValueError::Fatal)?;
         if !target.is_object_type() {
             return Err(CommittedValueError::Fatal(VmError::InvalidOperand));
         }
@@ -604,71 +589,13 @@ impl Interpreter {
             return self.with_handle_scope(|interp, scope| {
                 let obj_handle = interp.scoped_value(scope, Value::object(obj));
                 let props_handle = interp.scoped_value(scope, props_owned);
-                let props_now = interp.escape_scoped(props_handle);
-                let keys = own_enumerable_keys_for_define(interp, stack, context, &props_now)?;
-                for (key, needs_enumerable_check) in keys {
-                    if needs_enumerable_check {
-                        let props_now = interp.escape_scoped(props_handle);
-                        let desc = interp.ordinary_get_own_property_descriptor_value(
-                            stack,
-                            Some(context),
-                            props_now,
-                            &key,
-                            0,
-                        )?;
-                        if !desc.is_some_and(|desc| desc.enumerable()) {
-                            continue;
-                        }
-                    }
-                    let props_now = interp.escape_scoped(props_handle);
-                    let outcome = interp.ordinary_get_value(
-                        stack,
-                        Some(context),
-                        props_now,
-                        props_now,
-                        &key,
-                        0,
-                    )?;
-                    let desc_value = match outcome {
-                        crate::VmGetOutcome::Value(v) => v,
-                        crate::VmGetOutcome::InvokeGetter { getter } => {
-                            let args: SmallVec<[Value; 8]> = SmallVec::new();
-                            let props_now = interp.escape_scoped(props_handle);
-                            interp
-                                .run_callable_sync_rooted(
-                                    stack,
-                                    Some(context),
-                                    &getter,
-                                    props_now,
-                                    args,
-                                )
-                                .map_err(CommittedValueError::completed_call)?
-                        }
-                    };
-                    let descriptor = interp.evaluate_to_property_descriptor(
-                        stack,
-                        Some(context),
-                        &desc_value,
-                    )?;
-                    let target_now = interp.escape_scoped(obj_handle);
-                    if !interp.define_own_property_value(
-                        stack,
-                        context,
-                        &target_now,
-                        &key,
-                        descriptor,
-                    )? {
-                        return Err(CommittedValueError::JavaScript(
-                            interp.err_type(
-                                (format!(
-                                    "Cannot define property '{}'",
-                                    property_key_label(&key, &interp.gc_heap)
-                                ))
-                                .into(),
-                            ),
-                        ));
-                    }
-                }
+                interp.define_properties_from_source(
+                    stack,
+                    context,
+                    scope,
+                    obj_handle,
+                    props_handle,
+                )?;
                 Ok(interp.escape_scoped(obj_handle))
             });
         }
@@ -699,12 +626,9 @@ impl Interpreter {
             )));
         }
         // §20.1.2.3 step 2 — `props = ToObject(Properties)`; the
-        // resulting object is then enumerated for own enumerable
-        // string-keyed names. We accept any Object-typed source and
-        // route the key probe through the unified
-        // `own_enumerable_string_keyed_property_entries` helper so
-        // arrays / functions / class constructors / native functions
-        // behave like ordinary objects here.
+        // resulting object's own keys are filtered by their live enumerable
+        // descriptors. String and Symbol keys share the same semantic owner;
+        // Array holes and non-enumerable length never become descriptors.
         let props_value = args.get(1).cloned().unwrap_or(Value::undefined());
         // §7.1.18 ToObject — `null` / `undefined` throw a
         // TypeError. Other primitives wrap into their boxed
@@ -724,77 +648,13 @@ impl Interpreter {
         self.with_handle_scope(|interp, scope| {
             let target_handle = interp.scoped_value(scope, target_value);
             let props_handle = interp.scoped_value(scope, props_value);
-            let props_now = interp.escape_scoped(props_handle);
-            let keys = own_enumerable_keys_for_define(interp, stack, context, &props_now)?;
-            for (key, needs_enumerable_check) in keys {
-                // §20.1.2.3.1 step 5 — the per-key [[GetOwnProperty]]
-                // enumerable filter runs right before this key's [[Get]]
-                // (observable proxy trap order).
-                if needs_enumerable_check {
-                    let props_now = interp.escape_scoped(props_handle);
-                    let desc = interp.ordinary_get_own_property_descriptor_value(
-                        stack,
-                        Some(context),
-                        props_now,
-                        &key,
-                        0,
-                    )?;
-                    if !desc.is_some_and(|desc| desc.enumerable()) {
-                        continue;
-                    }
-                }
-                // §6.2.5.5 step 4 — `Get(props, key)` is accessor-aware,
-                // and step 5 — `ToPropertyDescriptor(descObj)` reads the
-                // accessor / data fields off the resolved value. Thread
-                // both through the interpreter so user getters fire and
-                // any abrupt completion propagates.
-                let props_now = interp.escape_scoped(props_handle);
-                let outcome = interp.ordinary_get_value(
-                    stack,
-                    Some(context),
-                    props_now,
-                    props_now,
-                    &key,
-                    0,
-                )?;
-                let desc_value = match outcome {
-                    crate::VmGetOutcome::Value(v) => v,
-                    crate::VmGetOutcome::InvokeGetter { getter } => {
-                        let args: smallvec::SmallVec<[Value; 8]> = smallvec::SmallVec::new();
-                        let props_now = interp.escape_scoped(props_handle);
-                        interp
-                            .run_callable_sync_rooted(
-                                stack,
-                                Some(context),
-                                &getter,
-                                props_now,
-                                args,
-                            )
-                            .map_err(CommittedValueError::completed_call)?
-                    }
-                };
-                let descriptor =
-                    interp.evaluate_to_property_descriptor(stack, Some(context), &desc_value)?;
-                let target_now = interp.escape_scoped(target_handle);
-                let ok = interp.define_own_property_value(
-                    stack,
-                    context,
-                    &target_now,
-                    &key,
-                    descriptor,
-                )?;
-                if !ok {
-                    return Err(CommittedValueError::JavaScript(
-                        interp.err_type(
-                            (format!(
-                                "Object.defineProperties: cannot define '{}'",
-                                property_key_label(&key, &interp.gc_heap)
-                            ))
-                            .into(),
-                        ),
-                    ));
-                }
-            }
+            interp.define_properties_from_source(
+                stack,
+                context,
+                scope,
+                target_handle,
+                props_handle,
+            )?;
             Ok(interp.escape_scoped(target_handle))
         })
     }
@@ -923,9 +783,10 @@ impl Interpreter {
             M::ForInKeys => {
                 let target = args.first().cloned().unwrap_or(Value::undefined());
                 let keys = self.enumerable_for_in_string_keys_for_value(stack, context, target)?;
-                Ok(Some(self.scoped_key_strings(&keys).map_err(|error| {
-                    CommittedValueError::JavaScript(error)
-                })?))
+                Ok(Some(
+                    self.scoped_key_strings(&keys)
+                        .map_err(CommittedValueError::JavaScript)?,
+                ))
             }
             M::Keys => {
                 let owned: Vec<String> = match args.first() {
@@ -961,9 +822,10 @@ impl Interpreter {
                     }
                     _ => return Err(CommittedValueError::JavaScript(VmError::TypeMismatch)),
                 };
-                Ok(Some(self.scoped_key_strings(&owned).map_err(|error| {
-                    CommittedValueError::JavaScript(error)
-                })?))
+                Ok(Some(
+                    self.scoped_key_strings(&owned)
+                        .map_err(CommittedValueError::JavaScript)?,
+                ))
             }
             M::Values => {
                 let values: Vec<Value> = match args.first() {
@@ -1520,15 +1382,11 @@ impl Interpreter {
                                 let key_string = s.to_key_spelling(&interp.gc_heap);
                                 interp
                                     .scoped_set(scope, result, &key_string, desc_h)
-                                    .map_err(|error| {
-                                        CommittedValueError::JavaScript(error)
-                                    })?;
+                                    .map_err(CommittedValueError::JavaScript)?;
                             } else if let Some(sym) = key.as_symbol(&interp.gc_heap) {
                                 interp
                                     .scoped_set_symbol(scope, result, sym, desc_h)
-                                    .map_err(|error| {
-                                        CommittedValueError::JavaScript(error)
-                                    })?;
+                                    .map_err(CommittedValueError::JavaScript)?;
                             }
                         }
                     } else {
@@ -1575,9 +1433,10 @@ impl Interpreter {
                 } else {
                     return Err(CommittedValueError::JavaScript(VmError::TypeMismatch));
                 };
-                Ok(Some(self.scoped_key_strings(&owned).map_err(|error| {
-                    CommittedValueError::JavaScript(error)
-                })?))
+                Ok(Some(
+                    self.scoped_key_strings(&owned)
+                        .map_err(CommittedValueError::JavaScript)?,
+                ))
             }
             M::GetOwnPropertySymbols => {
                 let Some(target) = args.first() else {
@@ -1866,94 +1725,6 @@ impl Interpreter {
             Ok(interp.escape_scoped(result))
         })
     }
-}
-
-/// §6.2.5.5 + §20.1.2.3 — enumerate the own enumerable property keys
-/// of a `properties` argument supplied to `Object.defineProperties`
-/// / `Object.create`. Includes accessor-shaped own keys so the
-/// caller can `Get` the descriptor value through the spec's
-/// accessor-aware path.
-/// Own keys of a `defineProperties` / `Object.create` source, paired
-/// with `needs_enumerable_check`: `true` when the caller must run the
-/// per-key observable [[GetOwnProperty]] enumerable filter itself
-/// (observable sources — proxies and other trap-bearing objects);
-/// `false` when the key list is already the enumerable set.
-fn own_enumerable_keys_for_define(
-    interp: &mut Interpreter,
-    stack: &mut ActivationStack,
-    context: &ExecutionContext,
-    props: &Value,
-) -> Result<Vec<(VmPropertyKey<'static>, bool)>, CommittedValueError> {
-    if props.is_nullish() {
-        return Err(CommittedValueError::JavaScript(VmError::TypeMismatch));
-    }
-    if props.is_object()
-        || props.is_class_constructor()
-        || props.is_function()
-        || props.is_closure()
-        || props.is_native_function()
-        || props.is_bound_function()
-        || props.is_regexp()
-        || props.is_proxy()
-    {
-        // §20.1.2.3.1 step 3 — [[OwnPropertyKeys]] only; the per-key
-        // [[GetOwnProperty]] enumerable check runs INTERLEAVED with the
-        // per-key [[Get]] in the caller's loop (observable trap order:
-        // ownKeys, then getOwnPropertyDescriptor + get per key).
-        return interp.with_handle_scope(|interp, scope| {
-            let keys = interp.own_property_keys_value(stack, context, props)?;
-            let key_handles: Vec<_> = keys
-                .into_iter()
-                .map(|key| interp.scoped_value(scope, key))
-                .collect();
-            let mut out = Vec::new();
-            for key_handle in key_handles {
-                let key = interp.escape_scoped(key_handle);
-                let vm_key = value_to_static_property_key(interp, &key, interp.gc_heap())
-                    .map_err(CommittedValueError::JavaScript)?;
-                out.push((vm_key, true));
-            }
-            Ok(out)
-        });
-    }
-    if let Some(arr) = props.as_array() {
-        // §22.1.3.3 EnumerableOwnPropertyNames for Array.
-        let mut out: Vec<String> = Vec::new();
-        let dense_len = array::with_elements(arr, interp.gc_heap(), |els| els.len());
-        for idx in 0..dense_len {
-            out.push(idx.to_string());
-        }
-        for key in array::own_non_index_string_keys(arr, interp.gc_heap()) {
-            if !out.contains(&key) {
-                out.push(key);
-            }
-        }
-        return Ok(out
-            .into_iter()
-            .map(|key| (VmPropertyKey::OwnedString(key), false))
-            .collect());
-    }
-    if let Some(s) = props.as_string(interp.gc_heap()) {
-        let units = s.to_utf16_vec(interp.gc_heap());
-        return Ok((0..units.len())
-            .map(|i| (VmPropertyKey::OwnedString(i.to_string()), false))
-            .collect());
-    }
-    Ok(Vec::new())
-}
-
-fn value_to_static_property_key(
-    interp: &Interpreter,
-    value: &Value,
-    heap: &otter_gc::GcHeap,
-) -> Result<VmPropertyKey<'static>, VmError> {
-    if let Some(s) = value.as_string(heap) {
-        return Ok(VmPropertyKey::OwnedString(s.to_key_spelling(heap)));
-    }
-    if let Some(sym) = value.as_symbol(heap) {
-        return Ok(VmPropertyKey::Symbol(sym));
-    }
-    Err(interp.err_type(("property key must be a string or symbol".to_string()).into()))
 }
 
 fn property_key_label(key: &VmPropertyKey<'_>, heap: &otter_gc::GcHeap) -> String {

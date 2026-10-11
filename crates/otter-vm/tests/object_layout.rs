@@ -1,4 +1,15 @@
 //! Building an object from a known key list, rather than one `set` at a time.
+//!
+//! # Contents
+//! - Slot/name parity, ordered signatures and complete object birth.
+//! - Reusable layout lifetime across turns and full collection.
+//!
+//! # Invariants
+//! Every allocated value remains in a native handle scope. An owned layout
+//! token retains its shape even when no instance or native scope remains.
+//!
+//! # See also
+//! - `otter_vm::NativeScope` provides scoped object construction.
 
 use otter_vm::{Interpreter, NativeCallInfo, NativeCtx, Value};
 
@@ -120,6 +131,49 @@ fn the_same_key_list_gives_the_same_layout() {
     });
     assert_eq!(first, second, "one hidden class per key list");
     assert_ne!(first, other, "order is part of the layout");
+}
+
+#[test]
+fn layouts_without_instances_survive_turns_and_full_collection() {
+    let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
+    let (plain, atomized, tag, left, right) =
+        NativeCtx::with_host_context(&mut interp, NativeCallInfo::default_call(), None, |ctx| {
+            ctx.scope(|mut scope| {
+                let plain = scope.object_layout(&["left", "right"]).unwrap();
+                let tag = scope.atom("retained-layout");
+                let left = scope.atom("left");
+                let right = scope.atom("right");
+                let atomized = scope
+                    .object_layout_for_atoms(&tag, &[&left, &right])
+                    .unwrap();
+                (plain, atomized, tag, left, right)
+            })
+        });
+    interp
+        .force_gc()
+        .expect("collect layouts with no instances");
+    NativeCtx::with_host_context(&mut interp, NativeCallInfo::default_call(), None, |ctx| {
+        ctx.scope(|mut scope| {
+            assert_eq!(scope.object_layout(&["left", "right"]).unwrap(), plain);
+            assert_eq!(
+                scope
+                    .object_layout_for_atoms(&tag, &[&left, &right])
+                    .unwrap(),
+                atomized
+            );
+            for layout in [plain, atomized] {
+                let values = [
+                    scope.string("retained-left").unwrap(),
+                    scope.string("retained-right").unwrap(),
+                ];
+                let object = scope.object_with_layout(layout, &values).unwrap();
+                let left_value = scope.get(object, "left").unwrap();
+                let right_value = scope.get(object, "right").unwrap();
+                assert_eq!(scope.string_value(left_value).unwrap(), "retained-left");
+                assert_eq!(scope.string_value(right_value).unwrap(), "retained-right");
+            }
+        });
+    });
 }
 
 #[test]

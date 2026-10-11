@@ -1719,17 +1719,23 @@ fn emit_intrinsic_loads(
             dynasm!(ops ; .arch x64 ; jmp =>done ; =>next);
             continue;
         }
-        let Some((
+        let Some((projection, rest)) = program.ops.split_first() else {
+            continue;
+        };
+        if !matches!(
+            projection,
             Op::LoadIntrinsicPrototype {
                 object: 0,
                 result: 1,
-                target,
-            },
-            rest,
-        )) = program.ops.split_first()
-        else {
+                ..
+            } | Op::LoadArrayExpando {
+                object: 0,
+                result: 1,
+                ..
+            }
+        ) {
             continue;
-        };
+        }
         let Some((&Op::LoadField { object: 1, field }, guards)) = rest.split_last() else {
             continue;
         };
@@ -1750,7 +1756,15 @@ fn emit_intrinsic_loads(
         }
         let next = ops.new_dynamic_label();
         emit_load_reg(ops, 0, object);
-        intrinsic_prototype::emit(ops, relocations, view, *target, byte_pc, 0, next);
+        match *projection {
+            Op::LoadIntrinsicPrototype { target, .. } => {
+                intrinsic_prototype::emit(ops, relocations, view, target, byte_pc, 0, next)
+            }
+            Op::LoadArrayExpando { layout, .. } => {
+                crate::x86_64::property_ic::emit_array_expando(ops, layout, 0, 8, next)
+            }
+            _ => unreachable!("validated storage projection"),
+        }
         dynasm!(ops ; .arch x64
             ; cmp BYTE [r8], OBJECT_BODY_TYPE_TAG as i8
             ; jne =>next);

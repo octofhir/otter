@@ -181,6 +181,20 @@ fn execute(
     } else {
         assert_eq!(lab.top, start + bytes as usize);
         let body = &words[1..words.len() - 1];
+        if matches!(layout, Layout::Array(_)) {
+            let byte = otter_vm::jit::JitArrayStorage::current().exotic_byte as usize;
+            assert_eq!(
+                byte + 4,
+                otter_vm::jit::JitArrayLayout::current().expando_byte as usize
+            );
+            assert!(byte.is_multiple_of(8));
+            assert_eq!(
+                body[byte / 8],
+                0,
+                "native shell publishes both rare and expando edges null"
+            );
+        }
+
         let mut expected = vec![0; body.len()];
         match layout {
             Layout::Empty(EmptyLiteralLayout::Object(plan)) => {

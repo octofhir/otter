@@ -45,7 +45,7 @@ impl Interpreter {
         let value = match self.template_objects.get(&key) {
             Some(value) => *value,
             None => {
-                let built = self.build_template_object(context, stack, function_id, site_idx)?;
+                let built = self.build_template_object(context, function_id, site_idx)?;
                 self.template_objects.insert(key, built);
                 built
             }

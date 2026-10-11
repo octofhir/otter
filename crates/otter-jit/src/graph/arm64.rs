@@ -1759,6 +1759,16 @@ impl<'a> Codegen<'a> {
                 self.load_immediate(destination, VALUE_UNDEFINED);
                 dynasm!(self.ops ; .arch aarch64 ; =>done);
             }
+            Kind::LoadArrayExpando(layout) => {
+                let exit = self.eager_exit(node, DeoptReason::WrongShape);
+                crate::arm64::property_ic::emit_array_expando(
+                    &mut self.ops,
+                    *layout,
+                    Self::gp(input(0)),
+                    Self::gp(result.expect("array storage result")),
+                    exit,
+                );
+            }
             Kind::LoadNamedProperty { .. } => {
                 let receiver = Self::gp(input(0));
                 let destination = Self::gp(result.expect("a result"));
@@ -2501,8 +2511,16 @@ impl<'a> Codegen<'a> {
             ; tst w16, u32::from(ShapeState::PROTOTYPE_MASK)
             ; b.ne =>exit);
         for program in programs.iter() {
+            let expando = matches!(
+                program.ops.first(),
+                Some(Op::LoadArrayExpando {
+                    object: 0,
+                    result: 1,
+                    ..
+                })
+            );
             let receiver_shape = program.ops.iter().rev().find_map(|op| match *op {
-                Op::PublishShape { shape, .. } | Op::GuardShape { object: 0, shape } => Some(shape),
+                Op::PublishShape { shape, .. } | Op::GuardShape { shape, .. } => Some(shape),
                 _ => None,
             });
             let field = program.ops.iter().find_map(|op| match *op {
@@ -2523,8 +2541,15 @@ impl<'a> Codegen<'a> {
             let next = self.ops.new_dynamic_label();
             let mut stored_byte = None;
             for op in program.ops.iter() {
-                let object = |operand: u8| if operand == 0 { receiver } else { holder };
+                let object = |operand: u8| {
+                    if operand == 0 || expando {
+                        receiver
+                    } else {
+                        holder
+                    }
+                };
                 match *op {
+                    Op::LoadArrayExpando { .. } if expando => {}
                     Op::LoadPrototypeHolder { root, .. } => {
                         self.load_immediate(17, u64::from(root));
                         dynasm!(self.ops
@@ -2834,8 +2859,9 @@ impl<'a> Codegen<'a> {
     }
 
     /// Store actions are independent of the read fact under the shared key.
-    /// The probe commits only after all guards; its optional child edge and
-    /// the following WriteBarrier node retain the existing barrier owners.
+    /// The probe commits only after all guards. Its hit returns the actual
+    /// storage object for the value barrier, while append children remain
+    /// owned by the original ordinary receiver.
     fn emit_store_property_cached(
         &mut self,
         node: NodeId,
@@ -2891,11 +2917,17 @@ impl<'a> Codegen<'a> {
         } else {
             dynasm!(self.ops ; .arch aarch64 ; b =>slow);
         }
+        if atom.is_some() {
+            dynasm!(self.ops ; .arch aarch64 ; mov X(holder), X(receiver));
+        }
         if atom.is_some() || slot.is_some() {
             let overwritten = self.ops.new_dynamic_label();
             dynasm!(self.ops ; .arch aarch64 ; =>stored ; cbz W(child_shape), =>overwritten);
-            self.emit_dynamic_shape_child_barrier(node, receiver, child_shape, holder);
-            dynasm!(self.ops ; .arch aarch64 ; =>overwritten ; b =>done);
+            self.emit_dynamic_shape_child_barrier(node, receiver, child_shape, entry);
+            dynasm!(self.ops ; .arch aarch64 ; mov X(holder), X(receiver));
+            dynasm!(self.ops ; .arch aarch64 ; =>overwritten);
+            self.emit_write_barrier(node, holder, value);
+            dynasm!(self.ops ; .arch aarch64 ; b =>done);
         }
         dynasm!(self.ops ; .arch aarch64 ; =>slow);
         self.emit_property_runtime(
@@ -3340,6 +3372,19 @@ impl<'a> Codegen<'a> {
             for op in program.ops.iter() {
                 let object = |operand: u8| if operand == 0 { receiver } else { holder };
                 match *op {
+                    Op::LoadArrayExpando {
+                        object: 0,
+                        result: 1,
+                        layout,
+                    } => {
+                        crate::arm64::property_ic::emit_array_expando(
+                            &mut self.ops,
+                            layout,
+                            receiver,
+                            holder,
+                            next,
+                        );
+                    }
                     Op::LoadIntrinsicPrototype { target, .. } => {
                         dynasm!(self.ops
                             ; .arch aarch64
@@ -3506,7 +3551,7 @@ impl<'a> Codegen<'a> {
             }
         }
         if guard.expect == 0 {
-            dynasm!(self.ops ; .arch aarch64 ; cmp x17, #0 ; b.ne =>exit);
+            dynasm!(self.ops ; .arch aarch64 ; cbnz x17, =>exit);
         } else if guard.expect < 4096 {
             dynasm!(self.ops ; .arch aarch64 ; cmp x17, guard.expect ; b.ne =>exit);
         } else {

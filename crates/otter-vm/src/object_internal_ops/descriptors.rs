@@ -8,11 +8,19 @@
 //!
 //! # Invariants
 //! - Proxy descriptor operations dispatch through their canonical traps.
+//!   Captured targets and descriptor fields remain rooted through nested
+//!   GetOwnProperty, IsExtensible, and descriptor conversion in spec order.
 //! - GetOwnProperty and IsExtensible retain the actual optional source; each
 //!   bytecode function resolves its admitted owner without an ambient context.
 //!   Only actual unpopulated deferred namespace evaluation requires a source.
 //! - The receiver phase of `[[Set]]` roots receiver and value across the
 //!   potentially reentrant `[[GetOwnProperty]]` before defining the property.
+//! - Array descriptors use one indexed/expando reader; an expando is storage
+//!   and never the semantic receiver or the extensibility authority.
+//!
+//! # See also
+//! - `super::array_define` owns Array descriptors and publication.
+//! - [crate::object] owns ordinary descriptors and their storage.
 
 use crate::activation_stack::ActivationStack;
 use crate::native_abi::CommittedValueError;
@@ -78,76 +86,144 @@ impl Interpreter {
             };
         }
         if let Some(proxy) = target.as_proxy() {
-            let key_value = self
-                .vm_property_key_to_value(key)
-                .map_err(CommittedValueError::JavaScript)?;
-            let trap_args: SmallVec<[Value; 8]> =
-                smallvec::smallvec![proxy.target(&self.gc_heap), key_value];
-            return match self.invoke_proxy_trap(
-                stack,
-                context,
-                &proxy,
-                "getOwnPropertyDescriptor",
-                trap_args,
-            )? {
-                crate::object_internal_ops::ProxyTrap::Trapped(v) if v.is_nullish() => {
-                    let target_desc = self.ordinary_get_own_property_descriptor_value(
-                        stack,
-                        context,
-                        proxy.target(&self.gc_heap),
-                        key,
-                        hops + 1,
-                    )?;
-                    self.validate_proxy_get_own_property_descriptor(
-                        &proxy.target(&self.gc_heap),
-                        target_desc.as_ref(),
-                        None,
-                    )
+            return self.with_handle_scope(|interp, scope| {
+                if proxy.is_revoked(&interp.gc_heap) {
+                    return Err(CommittedValueError::JavaScript(VmError::TypeMismatch));
+                }
+                let proxy_handle = interp.scoped_value(scope, Value::proxy(proxy));
+                let target_handle = interp.scoped_value(scope, proxy.target(&interp.gc_heap));
+                let key_value = interp
+                    .vm_property_key_to_value(key)
                     .map_err(CommittedValueError::JavaScript)?;
-                    Ok(None)
-                }
-                crate::object_internal_ops::ProxyTrap::Trapped(v)
-                    if v.is_object() || v.is_proxy() =>
-                {
-                    // §10.5.5 step 9-ish ToPropertyDescriptor through
-                    // ordinary [[Get]]s so a Proxy descriptor object
-                    // dispatches its own traps.
-                    let partial = self.evaluate_to_property_descriptor(stack, context, &v)?;
-                    let desc = partial.complete_for_new_property();
-                    let target_desc = self.ordinary_get_own_property_descriptor_value(
-                        stack,
-                        context,
-                        proxy.target(&self.gc_heap),
-                        key,
-                        hops + 1,
-                    )?;
-                    self.validate_proxy_get_own_property_descriptor(
-                        &proxy.target(&self.gc_heap),
-                        target_desc.as_ref(),
-                        Some(&desc),
-                    )
-                    .map_err(CommittedValueError::JavaScript)?;
-                    Ok(Some(desc))
-                }
-                crate::object_internal_ops::ProxyTrap::Trapped(_) => {
-                    Err(CommittedValueError::JavaScript(
-                        self.err_type(
-                            ("Proxy getOwnPropertyDescriptor trap returned non-object descriptor"
-                                .to_string())
-                            .into(),
-                        ),
-                    ))
-                }
-                crate::object_internal_ops::ProxyTrap::NoTrap {
-                    target: fallthrough_target,
-                } => self.ordinary_get_own_property_descriptor_value(
+                let key_handle = interp.scoped_value(scope, key_value);
+                let current_key = |interp: &Self| -> Result<VmPropertyKey<'static>, VmError> {
+                    let value = interp.escape_scoped(key_handle);
+                    if let Some(string) = value.as_string(&interp.gc_heap) {
+                        Ok(VmPropertyKey::OwnedString(
+                            string.to_key_spelling(&interp.gc_heap),
+                        ))
+                    } else {
+                        value
+                            .as_symbol(&interp.gc_heap)
+                            .map(VmPropertyKey::Symbol)
+                            .ok_or(VmError::InvalidOperand)
+                    }
+                };
+                let proxy = interp
+                    .escape_scoped(proxy_handle)
+                    .as_proxy()
+                    .ok_or(CommittedValueError::Fatal(VmError::InvalidOperand))?;
+                let trap_args: SmallVec<[Value; 8]> = smallvec::smallvec![
+                    interp.escape_scoped(target_handle),
+                    interp.escape_scoped(key_handle)
+                ];
+                let result = match interp.invoke_proxy_trap(
                     stack,
                     context,
-                    fallthrough_target,
-                    key,
+                    &proxy,
+                    "getOwnPropertyDescriptor",
+                    trap_args,
+                )? {
+                    crate::object_internal_ops::ProxyTrap::Trapped(value) => value,
+                    crate::object_internal_ops::ProxyTrap::NoTrap {
+                        target: fallthrough_target,
+                    } => {
+                        let key = current_key(interp).map_err(CommittedValueError::Fatal)?;
+                        return interp.ordinary_get_own_property_descriptor_value(
+                            stack,
+                            context,
+                            fallthrough_target,
+                            &key,
+                            hops + 1,
+                        );
+                    }
+                };
+                if !result.is_undefined() && !result.is_object_type() {
+                    return Err(CommittedValueError::JavaScript(interp.err_type(
+                        "Proxy getOwnPropertyDescriptor trap returned non-object descriptor".into(),
+                    )));
+                }
+                let result_handle = interp.scoped_value(scope, result);
+                let key = current_key(interp).map_err(CommittedValueError::Fatal)?;
+                let mut target_desc = interp.ordinary_get_own_property_descriptor_value(
+                    stack,
+                    context,
+                    interp.escape_scoped(target_handle),
+                    &key,
                     hops + 1,
-                ),
-            };
+                )?;
+                if interp.escape_scoped(result_handle).is_undefined() {
+                    let Some(descriptor) = target_desc.as_ref() else {
+                        return Ok(None);
+                    };
+                    if !descriptor.configurable() {
+                        return interp
+                            .validate_proxy_get_own_property_descriptor(
+                                true,
+                                target_desc.as_ref(),
+                                None,
+                            )
+                            .map(|()| None)
+                            .map_err(CommittedValueError::JavaScript);
+                    }
+                }
+                let (target_value, target_getter, target_setter) = match target_desc.as_mut() {
+                    Some(object::PropertyDescriptor {
+                        kind: object::DescriptorKind::Data { value },
+                        ..
+                    }) => {
+                        let handle = interp.scoped_value(scope, *value);
+                        *value = Value::undefined();
+                        (Some(handle), None, None)
+                    }
+                    Some(object::PropertyDescriptor {
+                        kind: object::DescriptorKind::Accessor { getter, setter },
+                        ..
+                    }) => (
+                        None,
+                        getter.take().map(|value| interp.scoped_value(scope, value)),
+                        setter.take().map(|value| interp.scoped_value(scope, value)),
+                    ),
+                    None => (None, None, None),
+                };
+                let extensible_target = interp.is_extensible_value(
+                    stack,
+                    context,
+                    &interp.escape_scoped(target_handle),
+                )?;
+                let descriptor = if interp.escape_scoped(result_handle).is_undefined() {
+                    None
+                } else {
+                    Some(
+                        interp
+                            .evaluate_to_property_descriptor(
+                                stack,
+                                context,
+                                &interp.escape_scoped(result_handle),
+                            )?
+                            .complete_for_new_property(),
+                    )
+                };
+                if let Some(target_desc) = target_desc.as_mut() {
+                    match &mut target_desc.kind {
+                        object::DescriptorKind::Data { value } => {
+                            *value = interp.escape_scoped(target_value.expect("target data value"));
+                        }
+                        object::DescriptorKind::Accessor { getter, setter } => {
+                            *getter = target_getter.map(|value| interp.escape_scoped(value));
+                            *setter = target_setter.map(|value| interp.escape_scoped(value));
+                        }
+                    }
+                }
+                interp
+                    .validate_proxy_get_own_property_descriptor(
+                        extensible_target,
+                        target_desc.as_ref(),
+                        descriptor.as_ref(),
+                    )
+                    .map_err(CommittedValueError::JavaScript)?;
+                Ok(descriptor)
+            });
         }
         if let Some(obj) = target.as_object() {
             if let Some(desc) = self
@@ -169,66 +245,7 @@ impl Interpreter {
                 .map_err(CommittedValueError::JavaScript);
         }
         if let Some(arr) = target.as_array() {
-            // §10.4.2 — own symbol-keyed properties live in a
-            // dedicated side table; surface their data
-            // descriptor before the string-keyed paths so
-            // `Object.getOwnPropertyDescriptor(arr, sym)` and
-            // `hasOwnProperty(sym)` observe the spec shape.
-            if let VmPropertyKey::Symbol(sym) = key {
-                return Ok(array::get_symbol_descriptor(arr, &self.gc_heap, *sym));
-            }
-            let Some(key) = key.string_name() else {
-                return Ok(None);
-            };
-            if key == "length" {
-                let flags = array::length_flags(arr, &self.gc_heap);
-                return Ok(Some(object::PropertyDescriptor::data(
-                    Value::number_f64(array::len(arr, &self.gc_heap) as f64),
-                    flags.writable(),
-                    flags.enumerable(),
-                    flags.configurable(),
-                )));
-            }
-            // §10.4.2 — own accessor installed via
-            // `Object.defineProperty` lives in the per-array
-            // accessor side-table. Consult it before the
-            // dense / named slots so reflective probes
-            // (`Object.getOwnPropertyDescriptor(arr, "p")`) see
-            // the user-installed getter / setter.
-            if let Some((getter, setter)) = array::get_accessor(arr, &self.gc_heap, key) {
-                let flags = array::get_property_flags(arr, &self.gc_heap, key)
-                    .unwrap_or_else(|| object::PropertyFlags::new(false, true, true));
-                return Ok(Some(object::PropertyDescriptor {
-                    kind: object::DescriptorKind::Accessor { getter, setter },
-                    flags,
-                }));
-            }
-            if let Some(idx) = object::array_index_property_name(key) {
-                let idx = idx as usize;
-                if array::has_own_element(arr, &self.gc_heap, idx) {
-                    let flags = array::get_property_flags(arr, &self.gc_heap, key)
-                        .unwrap_or_else(object::PropertyFlags::data_default);
-                    return Ok(Some(object::PropertyDescriptor {
-                        kind: object::DescriptorKind::Data {
-                            value: array::get(arr, &self.gc_heap, idx),
-                        },
-                        flags,
-                    }));
-                }
-                return Ok(None);
-            }
-            // §10.4.2 — named own properties (`arr.foo = 1`)
-            // live in the per-array `named_properties` side
-            // table.
-            if let Some(value) = array::get_own_named_data_property(arr, &self.gc_heap, key) {
-                let flags = array::get_property_flags(arr, &self.gc_heap, key)
-                    .unwrap_or_else(object::PropertyFlags::data_default);
-                return Ok(Some(object::PropertyDescriptor {
-                    kind: object::DescriptorKind::Data { value },
-                    flags,
-                }));
-            }
-            return Ok(None);
+            return Ok(self.array_own_property_descriptor(arr, key));
         }
         // §10.4.5.1 TypedArray [[GetOwnProperty]] — canonical numeric
         // keys resolve to an element data descriptor (or None when
@@ -614,33 +631,44 @@ impl Interpreter {
                     ),
                 ));
             }
-            let trap_args: SmallVec<[Value; 8]> = smallvec::smallvec![proxy.target(&self.gc_heap)];
-            return match self.invoke_proxy_trap(
-                stack,
-                context,
-                &proxy,
-                "isExtensible",
-                trap_args,
-            )? {
-                crate::object_internal_ops::ProxyTrap::Trapped(result) => {
-                    let trap = result.to_boolean(&self.gc_heap);
-                    let target_ext =
-                        self.is_extensible_value(stack, context, &proxy.target(&self.gc_heap))?;
-                    if trap != target_ext {
-                        return Err(CommittedValueError::JavaScript(
-                            self.err_type(
-                                ("Proxy isExtensible trap returned value inconsistent with target"
-                                    .to_string())
-                                .into(),
-                            ),
-                        ));
+            return self.with_handle_scope(|interp, scope| {
+                let proxy_handle = interp.scoped_value(scope, Value::proxy(proxy));
+                let target_handle = interp.scoped_value(scope, proxy.target(&interp.gc_heap));
+                let proxy = interp
+                    .escape_scoped(proxy_handle)
+                    .as_proxy()
+                    .ok_or(CommittedValueError::Fatal(VmError::InvalidOperand))?;
+                let trap_args: SmallVec<[Value; 8]> =
+                    smallvec::smallvec![interp.escape_scoped(target_handle)];
+                match interp.invoke_proxy_trap(
+                    stack,
+                    context,
+                    &proxy,
+                    "isExtensible",
+                    trap_args,
+                )? {
+                    crate::object_internal_ops::ProxyTrap::Trapped(result) => {
+                        let trap = result.to_boolean(&interp.gc_heap);
+                        let target_ext = interp.is_extensible_value(
+                            stack,
+                            context,
+                            &interp.escape_scoped(target_handle),
+                        )?;
+                        if trap != target_ext {
+                            return Err(CommittedValueError::JavaScript(
+                                interp.err_type(
+                                    "Proxy isExtensible trap returned value inconsistent with target"
+                                        .into(),
+                                ),
+                            ));
+                        }
+                        Ok(trap)
                     }
-                    Ok(trap)
+                    crate::object_internal_ops::ProxyTrap::NoTrap {
+                        target: fallthrough_target,
+                    } => interp.is_extensible_value(stack, context, &fallthrough_target),
                 }
-                crate::object_internal_ops::ProxyTrap::NoTrap {
-                    target: fallthrough_target,
-                } => self.is_extensible_value(stack, context, &fallthrough_target),
-            };
+            });
         }
         Ok(self.is_extensible_non_proxy(value))
     }

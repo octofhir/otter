@@ -221,9 +221,11 @@ pub struct IcEntrySnapshot {
     /// Whether the cache record fires on an own slot, a direct
     /// prototype slot, or a hidden-class transition.
     pub variant: IcEntryVariant,
-    /// Guarded receiver shape id rendered as `u64`. Distinct between
+    /// How the original receiver selects this entry's storage object.
+    pub storage_projection: crate::property_ic::PropertyStorageProjection,
+    /// Guarded storage shape id rendered as `u64`. Distinct between
     /// any two shape histories.
-    pub receiver_shape_id: u64,
+    pub storage_shape_id: u64,
     /// Guarded property key when known. Resolved through the cached
     /// constant pool / shape key table; rendered as UTF-8.
     pub key: Option<String>,

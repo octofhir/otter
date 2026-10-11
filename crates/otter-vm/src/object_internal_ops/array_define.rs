@@ -1,7 +1,10 @@
-//! Array length and canonical Array prototype indexed definitions.
+//! Array own descriptors, expando publication and canonical length definitions.
 //!
 //! # Contents
 //! - One `ArraySetLength` algorithm for dense bodies and branded prototypes.
+//! - One own-descriptor reader for indexed storage and shaped expandos.
+//! - Scoped expando definitions through the ordinary Object descriptor owner.
+//! - Integrity publication over indexed authority and ordinary bag attributes.
 //! - Storage publication and descending deletion at each physical layout.
 //! - Prototype index definitions with the same length preconditions.
 //!
@@ -11,6 +14,8 @@
 //! - A failed shrink restores length above the highest undeletable index and
 //!   still applies a requested transition to non-writable length.
 //! - Indexed publication checks length writability before adding a property.
+//! - The Array owns extensibility and the original receiver; its expando owns
+//!   only ordinary property storage and field write barriers.
 //! - The intrinsic brand owns classification; existing prototype shape role
 //!   excludes generated stores that would bypass Array definition semantics.
 //!
@@ -21,9 +26,220 @@
 
 use crate::activation_stack::ActivationStack;
 use crate::native_abi::CommittedValueError;
-use crate::{ExecutionContext, Interpreter, Value, VmError, array, object};
+use crate::{ExecutionContext, Interpreter, Value, VmError, VmPropertyKey, array, object};
 
 impl Interpreter {
+    pub(super) fn array_own_index_descriptor(
+        &self,
+        target: array::JsArray,
+        index: u32,
+    ) -> Option<object::PropertyDescriptor> {
+        if let Some((getter, setter)) = array::get_index_accessor(target, &self.gc_heap, index) {
+            return Some(object::PropertyDescriptor {
+                kind: object::DescriptorKind::Accessor { getter, setter },
+                flags: array::get_index_flags(target, &self.gc_heap, index)
+                    .unwrap_or_else(|| object::PropertyFlags::new(false, true, true)),
+            });
+        }
+        array::has_own_element(target, &self.gc_heap, index as usize).then(|| {
+            object::PropertyDescriptor {
+                kind: object::DescriptorKind::Data {
+                    value: array::get(target, &self.gc_heap, index as usize),
+                },
+                flags: array::get_index_flags(target, &self.gc_heap, index)
+                    .unwrap_or_else(object::PropertyFlags::data_default),
+            }
+        })
+    }
+
+    pub(crate) fn array_own_property_descriptor(
+        &self,
+        target: array::JsArray,
+        key: &VmPropertyKey<'_>,
+    ) -> Option<object::PropertyDescriptor> {
+        match array::classify_property_key(key) {
+            array::ArrayPropertyKey::Length => Some(object::PropertyDescriptor {
+                kind: object::DescriptorKind::Data {
+                    value: Value::number_u32(array::len(target, &self.gc_heap) as u32),
+                },
+                flags: array::length_flags(target, &self.gc_heap),
+            }),
+            array::ArrayPropertyKey::Index(index) => self.array_own_index_descriptor(target, index),
+            array::ArrayPropertyKey::Expando => {
+                let bag = array::expando_object(target, &self.gc_heap)?;
+                match key {
+                    VmPropertyKey::Symbol(symbol) => {
+                        object::get_own_symbol_descriptor(bag, &self.gc_heap, *symbol)
+                    }
+                    _ => object::get_own_descriptor(bag, &self.gc_heap, key.string_name()?),
+                }
+            }
+        }
+    }
+
+    pub(crate) fn define_array_expando_property(
+        &mut self,
+        target: array::JsArray,
+        key: &VmPropertyKey<'_>,
+        descriptor: object::PartialPropertyDescriptor,
+    ) -> Result<bool, VmError> {
+        debug_assert!(matches!(
+            array::classify_property_key(key),
+            array::ArrayPropertyKey::Expando
+        ));
+        if self.array_own_property_descriptor(target, key).is_none()
+            && !array::is_extensible(target, &self.gc_heap)
+        {
+            return Ok(false);
+        }
+        self.with_handle_scope(|interp, scope| {
+            let target = interp.scoped_value(scope, Value::array(target));
+            let value = descriptor
+                .value
+                .map(|value| interp.scoped_value(scope, value));
+            let getter = descriptor
+                .get
+                .map(|value| interp.scoped_value(scope, value));
+            let setter = descriptor
+                .set
+                .map(|value| interp.scoped_value(scope, value));
+            let symbol = match key {
+                VmPropertyKey::Symbol(symbol) => {
+                    Some(interp.scoped_value(scope, Value::symbol(*symbol)))
+                }
+                _ => None,
+            };
+            let bag = interp.ensure_array_expando(scope, target)?;
+            let descriptor = object::PartialPropertyDescriptor {
+                value: value.map(|value| interp.escape_scoped(value)),
+                get: getter.map(|value| interp.escape_scoped(value)),
+                set: setter.map(|value| interp.escape_scoped(value)),
+                ..descriptor
+            };
+            let mut bag = interp
+                .escape_scoped(bag)
+                .as_object()
+                .ok_or(VmError::InvalidOperand)?;
+            let accepted = if let Some(symbol) = symbol {
+                let symbol = interp
+                    .escape_scoped(symbol)
+                    .as_symbol(&interp.gc_heap)
+                    .ok_or(VmError::InvalidOperand)?;
+                object::define_own_symbol_property_partial(
+                    &mut bag,
+                    &mut interp.gc_heap,
+                    symbol,
+                    descriptor,
+                )
+                .map_err(VmError::from)?
+            } else {
+                interp.define_own_property_partial(
+                    &mut bag,
+                    key.string_name().ok_or(VmError::InvalidOperand)?,
+                    descriptor,
+                )?
+            };
+
+            Ok(accepted)
+        })
+    }
+
+    pub(crate) fn delete_array_own_property(
+        &mut self,
+        target: array::JsArray,
+        key: &VmPropertyKey<'_>,
+    ) -> Result<bool, VmError> {
+        match array::classify_property_key(key) {
+            array::ArrayPropertyKey::Length => Ok(false),
+            array::ArrayPropertyKey::Index(index) => Ok(array::delete_index_property(
+                target,
+                &mut self.gc_heap,
+                index,
+            )),
+            array::ArrayPropertyKey::Expando => {
+                if self.array_own_property_descriptor(target, key).is_none() {
+                    return Ok(true);
+                }
+                self.with_handle_scope(|interp, scope| {
+                    let target = interp.scoped_value(scope, Value::array(target));
+                    let array = interp
+                        .escape_scoped(target)
+                        .as_array()
+                        .ok_or(VmError::InvalidOperand)?;
+                    let mut bag = array::expando_object(array, &interp.gc_heap)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let deleted = match key {
+                        VmPropertyKey::Symbol(symbol) => {
+                            object::delete_symbol(bag, &mut interp.gc_heap, *symbol)
+                        }
+                        _ => object::delete(
+                            &mut bag,
+                            &mut interp.gc_heap,
+                            key.string_name().ok_or(VmError::InvalidOperand)?,
+                        )?,
+                    };
+
+                    Ok(deleted)
+                })
+            }
+        }
+    }
+
+    pub(crate) fn set_array_integrity_level(
+        &mut self,
+        target: array::JsArray,
+        frozen: bool,
+    ) -> Result<array::JsArray, VmError> {
+        self.with_handle_scope(|interp, scope| {
+            let target = interp.scoped_value(scope, Value::array(target));
+            let array = interp
+                .escape_scoped(target)
+                .as_array()
+                .ok_or(VmError::InvalidOperand)?;
+            array::set_indexed_integrity_level(array, &mut interp.gc_heap, frozen)?;
+            let array = interp
+                .escape_scoped(target)
+                .as_array()
+                .ok_or(VmError::InvalidOperand)?;
+            if let Some(bag) = array::expando_object(array, &interp.gc_heap) {
+                if frozen {
+                    interp.freeze_object(bag)?;
+                } else {
+                    interp.seal_object(bag)?;
+                }
+            }
+            interp
+                .escape_scoped(target)
+                .as_array()
+                .ok_or(VmError::InvalidOperand)
+        })
+    }
+
+    pub(crate) fn test_array_integrity_level(&self, target: array::JsArray, frozen: bool) -> bool {
+        if !array::test_indexed_integrity_level(target, &self.gc_heap, frozen) {
+            return false;
+        }
+        let Some(bag) = array::expando_object(target, &self.gc_heap) else {
+            return true;
+        };
+        let valid = |descriptor: object::PropertyDescriptor| {
+            !descriptor.configurable()
+                && (!frozen || !descriptor.is_data() || !descriptor.writable())
+        };
+        object::with_properties(bag, &self.gc_heap, |properties| {
+            properties
+                .keys()
+                .all(|key| object::get_own_descriptor(bag, &self.gc_heap, key).is_some_and(valid))
+                && properties
+                    .symbol_keys()
+                    .filter(|key| !key.is_private_name())
+                    .all(|key| {
+                        object::get_own_symbol_descriptor(bag, &self.gc_heap, key)
+                            .is_some_and(valid)
+                    })
+        })
+    }
+
     pub(super) fn define_array_length_value(
         &mut self,
         stack: &mut ActivationStack,
@@ -106,7 +322,7 @@ impl Interpreter {
         writable: bool,
     ) -> Result<(), VmError> {
         if let Some(array) = target.as_array() {
-            array::set_length_writable(array, &mut self.gc_heap, writable);
+            array::set_length_writable(array, &mut self.gc_heap, writable)?;
             return Ok(());
         }
         let mut object = target.as_object().expect("canonical Array prototype");

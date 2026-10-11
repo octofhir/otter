@@ -143,17 +143,23 @@ fn emit_intrinsic_loads(
                 ; =>next);
             continue;
         }
-        let Some((
+        let Some((projection, rest)) = program.ops.split_first() else {
+            continue;
+        };
+        if !matches!(
+            projection,
             Op::LoadIntrinsicPrototype {
                 object: 0,
                 result: 1,
-                target,
-            },
-            rest,
-        )) = program.ops.split_first()
-        else {
+                ..
+            } | Op::LoadArrayExpando {
+                object: 0,
+                result: 1,
+                ..
+            }
+        ) {
             continue;
-        };
+        }
         let Some((Op::LoadField { object: 1, .. }, guards)) = rest.split_last() else {
             continue;
         };
@@ -174,15 +180,21 @@ fn emit_intrinsic_loads(
         }
         let next = ops.new_dynamic_label();
         dynasm!(ops ; .arch aarch64 ; ldr x9, [x19, obj_off]);
-        ic_probe::emit_intrinsic_prototype_header(
-            ops,
-            relocations,
-            view,
-            *target,
-            byte_pc,
-            20,
-            next,
-        );
+        match *projection {
+            Op::LoadIntrinsicPrototype { target, .. } => ic_probe::emit_intrinsic_prototype_header(
+                ops,
+                relocations,
+                view,
+                target,
+                byte_pc,
+                20,
+                next,
+            ),
+            Op::LoadArrayExpando { layout, .. } => {
+                crate::arm64::property_ic::emit_array_expando(ops, layout, 9, 15, next)
+            }
+            _ => unreachable!("validated storage projection"),
+        }
         for op in rest {
             match *op {
                 Op::GuardShape { shape, .. } => {

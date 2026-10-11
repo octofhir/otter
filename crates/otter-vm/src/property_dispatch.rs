@@ -19,7 +19,8 @@
 //!   helpers are called.
 //! - Inputs are already decoded from the executable instruction format.
 //! - A dense hole bypasses prototype lookup only while the one-shot indexed
-//!   accessor protector remains intact; arrays with sidecars stay generic.
+//!   accessor protector remains intact; named and symbol properties use the
+//!   ordinary shaped expando without changing the original receiver.
 //!
 //! # See also
 //! - [`crate::executable`]
@@ -34,8 +35,8 @@ use otter_gc::raw::RawGc;
 
 use crate::{
     ExecutionContext, Frame, Interpreter, JsObject, JsString, SuperReadKey, Value, VmError,
-    VmGetOutcome, VmPropertyKey, abstract_ops, array::JsArray, function_metadata, object,
-    property_atom::AtomizedPropertyKey, read_register, value_kind_name, write_register,
+    VmGetOutcome, VmPropertyKey, function_metadata, object, property_atom::AtomizedPropertyKey,
+    read_register, value_kind_name, write_register,
 };
 
 mod drivers;
@@ -58,42 +59,6 @@ pub(crate) enum MetadataProtoSet {
 }
 
 impl Interpreter {
-    fn store_array_accessor_property(
-        &mut self,
-        stack: &mut ActivationStack,
-        context: &ExecutionContext,
-        arr: JsArray,
-        key: &str,
-        value: &Value,
-        strict: bool,
-    ) -> Result<bool, CommittedValueError> {
-        let Some((_getter, setter)) = crate::array::get_accessor(arr, &self.gc_heap, key) else {
-            return Ok(false);
-        };
-        match setter {
-            Some(setter) if abstract_ops::is_callable(&setter) => {
-                let mut args: SmallVec<[Value; 8]> = SmallVec::new();
-                args.push(*value);
-                self.run_callable_sync_rooted(
-                    stack,
-                    Some(context),
-                    &setter,
-                    Value::array(arr),
-                    args,
-                )
-                .map_err(CommittedValueError::completed_call)?;
-            }
-            _ => {
-                self.failed_set_result(
-                    strict,
-                    format!("Cannot assign to accessor property '{key}' without a setter"),
-                )
-                .map_err(CommittedValueError::JavaScript)?;
-            }
-        }
-        Ok(true)
-    }
-
     pub(crate) fn capture_store_property_transition_with_stack_roots(
         &mut self,
         stack: &ActivationStack,
@@ -324,7 +289,7 @@ impl Interpreter {
                 crate::object::delete(&mut { o }, &mut self.gc_heap, name)?
             }
         } else if let Some(arr) = receiver.as_array() {
-            crate::array::delete_named_property(arr, &mut self.gc_heap, name)
+            self.delete_array_own_property(arr, &VmPropertyKey::String(name))?
         } else if let Some(class) = receiver.as_class_constructor() {
             let statics = class.statics(&self.gc_heap);
             if crate::object::get_own_descriptor(statics, &self.gc_heap, name).is_some() {
@@ -528,25 +493,17 @@ impl Interpreter {
                 return Err(CommittedValueError::JavaScript(VmError::TypeMismatch));
             }
         } else if let Some(arr) = receiver.as_array() {
-            if let Some(n) = idx.as_number() {
-                match n.as_smi() {
-                    Some(v) if v >= 0 => {
-                        crate::array::delete_named_property(arr, &mut self.gc_heap, &v.to_string())
-                    }
-                    _ => crate::array::delete_named_property(
-                        arr,
-                        &mut self.gc_heap,
-                        &n.to_display_string(),
-                    ),
-                }
-            } else if let Some(s) = idx.as_string(&self.gc_heap) {
-                let name = s.to_key_spelling(&self.gc_heap);
-                crate::array::delete_named_property(arr, &mut self.gc_heap, &name)
-            } else if let Some(sym) = idx.as_symbol(&self.gc_heap) {
-                crate::array::delete_symbol_property(arr, &mut self.gc_heap, sym)
+            let key = if let Some(symbol) = idx.as_symbol(&self.gc_heap) {
+                VmPropertyKey::Symbol(symbol)
+            } else if let Some(string) = idx.as_string(&self.gc_heap) {
+                VmPropertyKey::OwnedString(string.to_key_spelling(&self.gc_heap))
+            } else if let Some(number) = idx.as_number() {
+                VmPropertyKey::OwnedString(number.to_display_string())
             } else {
                 return Err(CommittedValueError::JavaScript(VmError::TypeMismatch));
-            }
+            };
+            self.delete_array_own_property(arr, &key)
+                .map_err(CommittedValueError::JavaScript)?
         } else if let Some(class) = receiver.as_class_constructor() {
             let statics = class.statics(&self.gc_heap);
             if let Some(sym) = idx.as_symbol(&self.gc_heap) {

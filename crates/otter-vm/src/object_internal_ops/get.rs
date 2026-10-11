@@ -14,13 +14,21 @@
 //! - Get and Has take the actual optional source owner. Native-only lookup
 //!   invents no context; bytecode callbacks/functions resolve their own admitted
 //!   FunctionID, while deferred namespace evaluation requires a real source.
+//! - Array expando misses continue through the actual Array prototype with
+//!   the original receiver; bag storage never supplies a prototype or receiver.
+//! - Proxy Has retains its target and property key before trap lookup; false
+//!   results validate the captured target after reentry or revocation.
+//!
+//! # See also
+//! - `super::array_define` owns Array own descriptors.
+//! - `super::descriptors` owns prototypes and extensibility.
 
 use super::*;
 use crate::activation_stack::ActivationStack;
 use crate::native_abi::CommittedValueError;
 use crate::{
     ExecutionContext, Interpreter, Local, Value, VmError, VmGetOutcome, VmPropertyKey,
-    abstract_ops, array, descriptor_value, function_metadata, object, regexp_prototype, symbol,
+    abstract_ops, descriptor_value, function_metadata, object, regexp_prototype,
 };
 use smallvec::SmallVec;
 
@@ -152,18 +160,28 @@ impl Interpreter {
                 .escape_scoped(base_handle)
                 .as_proxy()
                 .ok_or(CommittedValueError::Fatal(VmError::InvalidOperand))?;
+            let target_handle = self.scoped_value(scope, proxy.target(&self.gc_heap));
             let trap_args: SmallVec<[Value; 8]> = smallvec::smallvec![
-                proxy.target(&self.gc_heap),
+                self.escape_scoped(target_handle),
                 self.escape_scoped(key_handle),
                 self.escape_scoped(receiver_handle)
             ];
             return match self.invoke_proxy_trap(stack, context, &proxy, "get", trap_args)? {
                 crate::object_internal_ops::ProxyTrap::Trapped(value) => {
-                    let proxy = self
-                        .escape_scoped(base_handle)
-                        .as_proxy()
-                        .ok_or(CommittedValueError::Fatal(VmError::InvalidOperand))?;
-                    self.validate_proxy_get_invariants(&proxy.target(&self.gc_heap), key, &value)
+                    let value = self.scoped_value(scope, value);
+                    let target = self.escape_scoped(target_handle);
+                    let key_value = self.escape_scoped(key_handle);
+                    let key = property_key_value_to_vm_key(self, &key_value, &self.gc_heap)
+                        .map_err(CommittedValueError::JavaScript)?;
+                    let descriptor = self.ordinary_get_own_property_descriptor_value(
+                        stack,
+                        context,
+                        target,
+                        &key,
+                        hops + 1,
+                    )?;
+                    let value = self.escape_scoped(value);
+                    self.validate_proxy_get_invariants(descriptor.as_ref(), &value)
                         .map_err(CommittedValueError::JavaScript)?;
                     Ok(VmGetOutcome::Value(value))
                 }
@@ -182,89 +200,32 @@ impl Interpreter {
             };
         }
         if let Some(arr) = base.as_array() {
-            let value = match key {
-                VmPropertyKey::Symbol(sym) => {
-                    if let Some((getter, _)) =
-                        crate::array::get_symbol_accessor(arr, &self.gc_heap, *sym)
-                    {
-                        match getter {
-                            Some(callable) if abstract_ops::is_callable(&callable) => {
-                                return Ok(VmGetOutcome::InvokeGetter { getter: callable });
-                            }
-                            _ => return Ok(VmGetOutcome::Value(Value::undefined())),
-                        }
-                    }
-                    if let Some(v) = crate::array::get_symbol_property(arr, &self.gc_heap, *sym) {
-                        v
-                    } else {
-                        let proto = self
-                            .array_get_prototype_value(arr)
-                            .map_err(CommittedValueError::JavaScript)?;
-                        if proto.is_object_type() {
-                            return self.continue_ordinary_get_value_scoped(
-                                stack,
-                                context,
-                                scope,
-                                base_handle,
-                                receiver_handle,
-                                proto,
-                                key,
-                                hops + 1,
-                            );
-                        }
-                        Value::undefined()
-                    }
-                }
-                _ => {
-                    let key_str = key
-                        .string_name()
-                        .expect("non-symbol key has string spelling");
-                    if key_str == "length" {
-                        return Ok(VmGetOutcome::Value(Value::number_f64(crate::array::len(
-                            arr,
-                            &self.gc_heap,
-                        )
-                            as f64)));
-                    }
-                    if let Some((getter, _)) =
-                        crate::array::get_accessor(arr, &self.gc_heap, key_str)
-                    {
-                        match getter {
-                            Some(callable) if abstract_ops::is_callable(&callable) => {
-                                return Ok(VmGetOutcome::InvokeGetter { getter: callable });
-                            }
-                            _ => return Ok(VmGetOutcome::Value(Value::undefined())),
-                        }
-                    }
-                    match crate::array::get_named_property(arr, &self.gc_heap, key_str) {
-                        Some(v) => v,
-                        None => {
-                            // §10.4.2.4 — walk the array's *actual*
-                            // [[Prototype]] so a `class X extends Array`
-                            // instance observes the subclass prototype's
-                            // inherited accessors / data properties, not
-                            // just %Array.prototype%.
-                            let proto = self
-                                .array_get_prototype_value(arr)
-                                .map_err(CommittedValueError::JavaScript)?;
-                            if proto.is_object_type() {
-                                return self.continue_ordinary_get_value_scoped(
-                                    stack,
-                                    context,
-                                    scope,
-                                    base_handle,
-                                    receiver_handle,
-                                    proto,
-                                    key,
-                                    hops + 1,
-                                );
-                            }
-                            Value::undefined()
-                        }
-                    }
-                }
+            if let Some(descriptor) = self.array_own_property_descriptor(arr, key) {
+                return Ok(match descriptor.kind {
+                    object::DescriptorKind::Data { value } => VmGetOutcome::Value(value),
+                    object::DescriptorKind::Accessor { getter, .. } => match getter {
+                        Some(getter) => VmGetOutcome::InvokeGetter { getter },
+                        None => VmGetOutcome::Value(Value::undefined()),
+                    },
+                });
+            }
+            let prototype = self
+                .array_get_prototype_value(arr)
+                .map_err(CommittedValueError::JavaScript)?;
+            return if prototype.is_object_type() {
+                self.continue_ordinary_get_value_scoped(
+                    stack,
+                    context,
+                    scope,
+                    base_handle,
+                    receiver_handle,
+                    prototype,
+                    key,
+                    hops + 1,
+                )
+            } else {
+                Ok(VmGetOutcome::Value(Value::undefined()))
             };
-            return Ok(VmGetOutcome::Value(value));
         }
         let fid = base
             .as_function()
@@ -1446,40 +1407,46 @@ impl Interpreter {
                 None => Ok(false),
             };
         }
-        if base.as_proxy().is_some() {
+        if let Some(proxy) = base.as_proxy() {
+            if proxy.is_revoked(&self.gc_heap) {
+                return Err(CommittedValueError::JavaScript(VmError::TypeMismatch));
+            }
+            let target_handle = self.scoped_value(scope, proxy.target(&self.gc_heap));
             let key_value = self
                 .vm_property_key_to_value(key)
                 .map_err(CommittedValueError::JavaScript)?;
+            let key_handle = self.scoped_value(scope, key_value);
             let proxy = self
                 .escape_scoped(base_handle)
                 .as_proxy()
                 .ok_or(CommittedValueError::Fatal(VmError::InvalidOperand))?;
-            let trap_args: SmallVec<[Value; 8]> =
-                smallvec::smallvec![proxy.target(&self.gc_heap), key_value];
+            let trap_args: SmallVec<[Value; 8]> = smallvec::smallvec![
+                self.escape_scoped(target_handle),
+                self.escape_scoped(key_handle)
+            ];
             return match self.invoke_proxy_trap(stack, context, &proxy, "has", trap_args)? {
                 crate::object_internal_ops::ProxyTrap::Trapped(value) => {
                     let result = value.to_boolean(&self.gc_heap);
                     if !result {
-                        let proxy = self
-                            .escape_scoped(base_handle)
-                            .as_proxy()
-                            .ok_or(CommittedValueError::Fatal(VmError::InvalidOperand))?;
-                        self.set_scoped(base_handle, proxy.target(&self.gc_heap));
-                        let target_value = self.escape_scoped(base_handle);
-                        let target_desc = self.ordinary_get_own_property_descriptor_value(
-                            stack,
-                            context,
-                            target_value,
-                            key,
-                            hops + 1,
-                        )?;
-                        if let Some(desc) = target_desc {
-                            if !desc.configurable() {
+                        let key_value = self.escape_scoped(key_handle);
+                        let key = property_key_value_to_vm_key(self, &key_value, &self.gc_heap)
+                            .map_err(CommittedValueError::JavaScript)?;
+                        let configurable = self
+                            .ordinary_get_own_property_descriptor_value(
+                                stack,
+                                context,
+                                self.escape_scoped(target_handle),
+                                &key,
+                                hops + 1,
+                            )?
+                            .map(|descriptor| descriptor.configurable());
+                        if let Some(configurable) = configurable {
+                            if !configurable {
                                 return Err(CommittedValueError::JavaScript(self.err_type((
                                         "Proxy has trap returned false but target has the property as non-configurable"
                                             .to_string()).into())));
                             }
-                            let target_value = self.escape_scoped(base_handle);
+                            let target_value = self.escape_scoped(target_handle);
                             let target_extensible =
                                 self.is_extensible_value(stack, context, &target_value)?;
                             if !target_extensible {
@@ -1493,84 +1460,41 @@ impl Interpreter {
                 }
                 crate::object_internal_ops::ProxyTrap::NoTrap {
                     target: fallthrough_target,
-                } => self.continue_ordinary_has_property_value_scoped(
+                } => {
+                    let key_value = self.escape_scoped(key_handle);
+                    let key = property_key_value_to_vm_key(self, &key_value, &self.gc_heap)
+                        .map_err(CommittedValueError::JavaScript)?;
+                    self.continue_ordinary_has_property_value_scoped(
+                        stack,
+                        context,
+                        scope,
+                        base_handle,
+                        fallthrough_target,
+                        &key,
+                        hops + 1,
+                    )
+                }
+            };
+        }
+        if let Some(arr) = base.as_array() {
+            if self.array_own_property_descriptor(arr, key).is_some() {
+                return Ok(true);
+            }
+            let prototype = self
+                .array_get_prototype_value(arr)
+                .map_err(CommittedValueError::JavaScript)?;
+            return if prototype.is_object_type() {
+                self.continue_ordinary_has_property_value_scoped(
                     stack,
                     context,
                     scope,
                     base_handle,
-                    fallthrough_target,
+                    prototype,
                     key,
                     hops + 1,
-                ),
-            };
-        }
-        if let Some(arr) = base.as_array() {
-            return match key {
-                VmPropertyKey::Symbol(sym)
-                    if sym.well_known_tag() == Some(symbol::WellKnown::Iterator) =>
-                {
-                    Ok(true)
-                }
-                VmPropertyKey::Symbol(sym) => {
-                    if array::get_symbol_property(arr, &self.gc_heap, *sym).is_some()
-                        || array::get_symbol_accessor(arr, &self.gc_heap, *sym).is_some()
-                    {
-                        return Ok(true);
-                    }
-                    let base_value = Value::array(arr);
-                    let proto = self
-                        .get_prototype_for_op(&base_value)
-                        .map_err(CommittedValueError::JavaScript)?;
-                    if proto.is_null() || proto.is_undefined() {
-                        return Ok(false);
-                    }
-                    self.continue_ordinary_has_property_value_scoped(
-                        stack,
-                        context,
-                        scope,
-                        base_handle,
-                        proto,
-                        key,
-                        hops + 1,
-                    )
-                }
-                _ if key.string_name().is_some_and(|k| k == "length") => Ok(true),
-                _ => {
-                    let k = key
-                        .string_name()
-                        .expect("non-symbol key has string spelling");
-                    if let Some(idx) = object::array_index_property_name(k).map(|idx| idx as usize)
-                        && array::has_own_element(arr, &self.gc_heap, idx)
-                    {
-                        return Ok(true);
-                    }
-                    // §10.4.2.1 [[HasProperty]] over own properties — an
-                    // indexed or named accessor installed via
-                    // `Object.defineProperty` holes its dense / named data
-                    // slot, so it is only visible through the accessor table.
-                    if array::get_accessor(arr, &self.gc_heap, k).is_some() {
-                        return Ok(true);
-                    }
-                    if array::get_named_property(arr, &self.gc_heap, k).is_some() {
-                        return Ok(true);
-                    }
-                    let base_value = Value::array(arr);
-                    let proto = self
-                        .get_prototype_for_op(&base_value)
-                        .map_err(CommittedValueError::JavaScript)?;
-                    if proto.is_null() || proto.is_undefined() {
-                        return Ok(false);
-                    }
-                    self.continue_ordinary_has_property_value_scoped(
-                        stack,
-                        context,
-                        scope,
-                        base_handle,
-                        proto,
-                        key,
-                        hops + 1,
-                    )
-                }
+                )
+            } else {
+                Ok(false)
             };
         }
         if let Some(function_id) = base

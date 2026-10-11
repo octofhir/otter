@@ -297,7 +297,11 @@ fn emit_table_store(
         miss,
     );
     // Both paths leave the compressed child (zero for an overwrite) in w11.
-    dynasm!(ops ; .arch aarch64 ; =>stored ; mov w16, w11);
+    dynasm!(ops ; .arch aarch64
+        ; mov X(STORE_SLOT), X(STORE_RECEIVER)
+        ; =>stored
+        ; mov X(STORE_RECEIVER), X(STORE_SLOT)
+        ; mov w16, w11);
     super::ic_probe::emit_property_transition_shape_barrier(ops, relocations, view, 20);
     emit_cell_test(ops, STORE_VALUE, CellTest::IsNotCell, primitive);
     super::values::emit_write_barrier(ops, relocations, view, STORE_RECEIVER, STORE_VALUE);

@@ -6,7 +6,7 @@
 //!
 //! # Contents
 //! - [`validate_and_apply_partial`] — field-presence-aware slot validation.
-//! - [`validate_descriptor_partial`] — the same validation for array symbols.
+//! - [`validate_descriptor_partial`] — the same validation for Array indices.
 //!
 //! # Invariants
 //! - Validation preserves every absent incoming field.
@@ -200,7 +200,7 @@ pub(super) fn validate_descriptor_update(
 }
 
 /// Validate a present partial descriptor against one stored descriptor.
-/// Array symbol properties share this exact ordinary validation authority.
+/// Array indexed properties share this ordinary validation authority.
 pub(crate) fn validate_descriptor_partial(
     existing: &PropertyDescriptor,
     incoming: &PartialPropertyDescriptor,

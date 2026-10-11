@@ -150,7 +150,7 @@ pub(crate) fn emit_intrinsic_prototype_header(
         ; b.ne =>miss
     );
     if let Some(guard) = target.guard {
-        emit_body_guard(ops, guard, miss);
+        emit_body_guard(ops, 13, guard, miss);
     }
     if let Some(realm) = target.active_realm {
         emit_active_realm_guard(ops, context, realm, miss);
@@ -367,7 +367,7 @@ where
         ; b.ne =>miss
     );
     for guard in access.guards.iter().flatten() {
-        emit_body_guard(ops, *guard, miss);
+        emit_body_guard(ops, 13, *guard, miss);
     }
     match access.length_width {
         JitGuardWidth::Byte => dynasm!(ops
@@ -420,7 +420,7 @@ where
         ; b.ne =>miss
     );
     for guard in access.guards.iter().flatten() {
-        emit_body_guard(ops, *guard, miss);
+        emit_body_guard(ops, 13, *guard, miss);
     }
     match access.length_width {
         JitGuardWidth::Byte => dynasm!(ops ; .arch aarch64 ; ldrb w14, [x13, access.length_byte]),
@@ -1402,7 +1402,7 @@ fn emit_guarded_method_guard_impl(
                 dynasm!(ops ; .arch aarch64 ; mov x8, x13);
             }
             if let Some(guard) = guard {
-                emit_body_guard(ops, guard, miss);
+                emit_body_guard(ops, 13, guard, miss);
             }
             if let Some(realm) = active_realm {
                 emit_active_realm_guard(ops, 20, realm, miss);
@@ -1461,16 +1461,22 @@ fn emit_receiver_type_guard_impl(
 
 /// Prove one declared body word still holds the value the layout depends on.
 ///
-/// Expects the body header in `x13`. There is one sequence per declared
-/// *width*, never one per receiver family: a collection's flags word, an
-/// array's exotic sidecar and a typed view's kind discriminant are the same
-/// two instructions at different offsets. Clobbers `x14`.
-fn emit_body_guard(ops: &mut Assembler, guard: JitBodyGuard, miss: DynamicLabel) {
+/// The receiver names the body header and avoids `x12`/`x14` scratch. There is
+/// one reader per declared width: flags, an Array's aligned handle pair and a
+/// typed view's kind use the same exact-word predicate. Clobbers `x14`, and
+/// `x12` when materializing a nonzero expectation.
+pub(super) fn emit_body_guard(
+    ops: &mut Assembler,
+    receiver: u8,
+    guard: JitBodyGuard,
+    miss: DynamicLabel,
+) {
+    debug_assert!(![12, 14].contains(&receiver));
     let byte = guard.byte;
     match guard.width {
-        JitGuardWidth::Byte => dynasm!(ops ; .arch aarch64 ; ldrb w14, [x13, byte]),
-        JitGuardWidth::Word32 => dynasm!(ops ; .arch aarch64 ; ldr w14, [x13, byte]),
-        JitGuardWidth::Word64 => dynasm!(ops ; .arch aarch64 ; ldr x14, [x13, byte]),
+        JitGuardWidth::Byte => dynasm!(ops ; .arch aarch64 ; ldrb w14, [X(receiver), byte]),
+        JitGuardWidth::Word32 => dynasm!(ops ; .arch aarch64 ; ldr w14, [X(receiver), byte]),
+        JitGuardWidth::Word64 => dynasm!(ops ; .arch aarch64 ; ldr x14, [X(receiver), byte]),
     }
     if guard.expect == 0 {
         dynasm!(ops ; .arch aarch64 ; cbnz x14, =>miss);
@@ -1661,3 +1667,7 @@ fn emit_native_ref_compare(ops: &mut Assembler, native_ref: u32) {
         ; cmp w14, w15
     );
 }
+
+#[cfg(test)]
+#[path = "body_guard_tests.rs"]
+mod body_guard_tests;

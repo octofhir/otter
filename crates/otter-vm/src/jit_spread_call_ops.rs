@@ -128,7 +128,7 @@ impl Interpreter {
                 && let Some(slot) = property_slot
                 && let Some(key) = context.property_atom_for_function(function_id, name_index)
             {
-                if let Some(found) = interp.lookup_start_load(slot, receiver, key)
+                if let Some(found) = interp.projected_load(slot, receiver, key)
                     && interp.is_callable_runtime(&found)
                 {
                     method = found;

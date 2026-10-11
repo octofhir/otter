@@ -1363,10 +1363,7 @@ impl Interpreter {
     /// stores remain behind runtime stubs and are deliberately absent here.
     pub(crate) fn bake_typed_array_layout(view: &mut jit::JitCompileSnapshot) {
         let header = otter_gc::header::HEADER_SIZE as u32;
-        view.array_layout = jit::JitArrayLayout {
-            type_tag: crate::array::ARRAY_BODY_TYPE_TAG,
-            length_byte: header + crate::array::ARRAY_BODY_LENGTH_OFFSET as u32,
-        };
+        view.array_layout = jit::JitArrayLayout::current();
         {
             use crate::binary::typed_array as typed;
             view.typed_array_length = jit::JitTypedArrayLengthLayout {
@@ -1545,9 +1542,7 @@ impl Interpreter {
             close: cells.close,
             realm: self.active_realm_id,
             array_type_tag: crate::array::ARRAY_BODY_TYPE_TAG,
-            array_exotic_byte: (otter_gc::header::HEADER_SIZE
-                + std::mem::offset_of!(crate::array::ArrayBody, exotic))
-                as u32,
+            receiver_guard: crate::method_ops::array_named_lookup_guard(),
         });
     }
 

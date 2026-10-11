@@ -21,8 +21,8 @@ use crate::rooting::RootScopeExt;
 
 use crate::activation_stack::ActivationStack;
 use crate::{
-    ExecutionContext, Interpreter, Value, VmError, VmPropertyKey, abstract_ops, array,
-    function_metadata, object, regexp_prototype,
+    ExecutionContext, Interpreter, Value, VmError, VmPropertyKey, abstract_ops, function_metadata,
+    object, regexp_prototype,
 };
 use smallvec::SmallVec;
 
@@ -136,13 +136,9 @@ impl Interpreter {
             });
         }
         if let Some(arr) = target.as_array() {
-            return Ok(if let VmPropertyKey::Symbol(sym) = key {
-                array::delete_symbol_property(arr, &mut self.gc_heap, *sym)
-            } else if let Some(k) = key.string_name() {
-                array::delete_named_property(arr, &mut self.gc_heap, k)
-            } else {
-                true
-            });
+            return self
+                .delete_array_own_property(arr, key)
+                .map_err(CommittedValueError::JavaScript);
         }
         let fid = target.as_function().or_else(|| {
             target

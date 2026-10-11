@@ -36,18 +36,12 @@ pub(crate) fn collection_guard() -> JitBodyGuard {
     )
 }
 
-/// An array body's exotic sidecar. A null sidecar means the default realm's
-/// retained `%Array.prototype%` is the receiver's `[[Prototype]]` and nothing on
-/// the instance can shadow the method or override an element's attributes,
-/// which is what makes the prototype-slot guard sufficient.
-pub(crate) fn dense_array_guard() -> JitBodyGuard {
-    // The sidecar is a 4-byte GC handle; a wider read would take the
-    // neighbouring field with it and can land on a byte offset a 64-bit
-    // load cannot encode.
+/// The aligned rare/expando pair. Both compressed handles must be null before
+/// the default realm's retained `%Array.prototype%` can answer an inherited key.
+pub(crate) fn array_named_lookup_guard() -> JitBodyGuard {
     JitBodyGuard::clear(
-        otter_gc::header::HEADER_SIZE as u32
-            + std::mem::offset_of!(crate::array::ArrayBody, exotic) as u32,
-        JitGuardWidth::Word32,
+        otter_gc::header::HEADER_SIZE as u32 + crate::array::ARRAY_BODY_EXOTIC_OFFSET as u32,
+        JitGuardWidth::Word64,
     )
 }
 
@@ -100,7 +94,7 @@ impl Interpreter {
         Some(JitGuardedMethodCall {
             receiver: JitGuardedReceiver::Exotic(JitIntrinsicPrototype {
                 type_tag: crate::array::ARRAY_BODY_TYPE_TAG,
-                guard: Some(dense_array_guard()),
+                guard: Some(array_named_lookup_guard()),
                 proto_offset: proto.offset(),
                 active_realm: None,
             }),

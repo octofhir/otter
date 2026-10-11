@@ -102,7 +102,7 @@ impl Interpreter {
         // complete through the full resolution cascade below; the IC layers
         // only serve cache-representable ordinary-object loads.
         let Some(obj) = receiver.as_object() else {
-            if let Some(value) = self.lookup_start_load(slot, receiver, atomized_key) {
+            if let Some(value) = self.projected_load(slot, receiver, atomized_key) {
                 return Ok(value);
             }
             let receiver = self.escape_scoped(receiver_root);
@@ -225,7 +225,7 @@ impl Interpreter {
             let receiver_root = self.scoped_value(&scope, receiver);
             let value_root = self.scoped_value(&scope, value);
             let Some(obj) = receiver.as_object() else {
-                if self.lookup_start_store(slot, receiver, atomized_key, value) {
+                if self.projected_store(slot, receiver, atomized_key, value) {
                     path = Path::Cached;
                     return Ok(());
                 }

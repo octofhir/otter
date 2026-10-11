@@ -16,9 +16,13 @@
 //!   / configurable / get / set` slots use direct own-data reads
 //!   ([`crate::object::lookup_own`]). User-installed accessors / inherited
 //!   descriptor fields require the context-aware native descriptor owner.
+//! - Array integrity combines indexed state with ordinary expando attributes;
+//!   the Array remains the extensibility authority.
 //! - String conversion uses the shared rooted interpreter driver. Its builtin
 //!   tag uses canonical IsArray before the observable symbol getter, preserving
 //!   enduring Array prototype identity and revoked-Proxy exceptions.
+//! - Object.setPrototypeOf roots both operands through the shared mutation
+//!   owner and returns the collector-forwarded target.
 //!
 //! # See also
 //! - <https://tc39.es/ecma262/#sec-properties-of-the-object-constructor>
@@ -35,6 +39,9 @@ use crate::object::{
 use crate::string::JsString;
 use crate::symbol::JsSymbol;
 use crate::{Local, NativeCtx, NativeError, Value, VmError};
+
+#[cfg(test)]
+mod prototype_tests;
 
 enum PropertyKey {
     String(String),
@@ -527,17 +534,25 @@ fn native_set_prototype_of(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Va
             name: "Object.setPrototypeOf",
             reason: "missing execution context".to_string(),
         })?;
-    let set_result = ctx.with_turn_parts(|interp, stack| {
-        interp.set_prototype_value_proxy_aware(stack, &exec_ctx, &target, &proto)
-    });
-    let ok = set_result.map_err(|err| err.into_native(ctx.cx.interp, "Object.setPrototypeOf"))?;
-    if !ok {
-        return Err(NativeError::TypeError {
-            name: "Object.setPrototypeOf",
-            reason: "Object.setPrototypeOf failed".to_string(),
+    ctx.scope(|mut scope| {
+        let target = scope.argument(args, 0);
+        let proto = scope.argument(args, 1);
+        let target_value = scope.raw(target);
+        let proto_value = scope.raw(proto);
+        let set_result = scope.with_turn_parts(|interp, stack| {
+            interp.set_prototype_value_proxy_aware(stack, &exec_ctx, &target_value, &proto_value)
         });
-    }
-    Ok(target)
+        let ok = set_result.map_err(|error| {
+            error.into_native(scope.context().interp_mut(), "Object.setPrototypeOf")
+        })?;
+        if !ok {
+            return Err(NativeError::TypeError {
+                name: "Object.setPrototypeOf",
+                reason: "Object.setPrototypeOf failed".to_string(),
+            });
+        }
+        Ok(scope.finish(target))
+    })
 }
 
 pub(crate) fn native_prototype_to_string(
@@ -1922,33 +1937,31 @@ fn call(
         // §20.1.2.6 Object.freeze(O)
         // <https://tc39.es/ecma262/#sec-object.freeze>
         M::Freeze => {
-            let mut arg = args.first().cloned().unwrap_or(Value::undefined());
-            let mut roots = otter_gc::RootScope::new(gc_heap);
-            // SAFETY: the returned value slot stays stationary through the
-            // integrity owner's allocating preparation and publication.
-            unsafe { roots.add_value(&mut arg) };
-            if let Some(mut o) = arg.as_object() {
-                crate::object::freeze(&mut o, gc_heap)?;
-            } else if let Some(a) = arg.as_array() {
-                crate::array::set_integrity_level(a, gc_heap, true);
-            }
-            // Spec: returns the argument unchanged (non-objects pass
-            // through).
-            Ok(arg)
+            let arg = args.first().cloned().unwrap_or(Value::undefined());
+            interp.with_handle_scope(|interp, scope| {
+                let arg = interp.scoped_value(scope, arg);
+                let current = interp.escape_scoped(arg);
+                if let Some(object) = current.as_object() {
+                    interp.freeze_object(object)?;
+                } else if let Some(array) = current.as_array() {
+                    interp.set_array_integrity_level(array, true)?;
+                }
+                Ok(interp.escape_scoped(arg))
+            })
         }
         // §20.1.2.20 Object.seal(O)
         M::Seal => {
-            let mut arg = args.first().cloned().unwrap_or(Value::undefined());
-            let mut roots = otter_gc::RootScope::new(gc_heap);
-            // SAFETY: the returned value slot stays stationary through the
-            // integrity owner's allocating preparation and publication.
-            unsafe { roots.add_value(&mut arg) };
-            if let Some(mut o) = arg.as_object() {
-                crate::object::seal(&mut o, gc_heap)?;
-            } else if let Some(a) = arg.as_array() {
-                crate::array::set_integrity_level(a, gc_heap, false);
-            }
-            Ok(arg)
+            let arg = args.first().cloned().unwrap_or(Value::undefined());
+            interp.with_handle_scope(|interp, scope| {
+                let arg = interp.scoped_value(scope, arg);
+                let current = interp.escape_scoped(arg);
+                if let Some(object) = current.as_object() {
+                    interp.seal_object(object)?;
+                } else if let Some(array) = current.as_array() {
+                    interp.set_array_integrity_level(array, false)?;
+                }
+                Ok(interp.escape_scoped(arg))
+            })
         }
         // §20.1.2.18 Object.preventExtensions(O)
         M::PreventExtensions => {
@@ -1963,14 +1976,13 @@ fn call(
         // §20.1.2.15 Object.isFrozen(O)
         M::IsFrozen => {
             let arg = args.first().cloned().unwrap_or(Value::undefined());
-            // Per spec, `Object.isFrozen(non_object) === true`. Heap
-            // exotics default to extensible+configurable so they are
-            // not frozen unless the foundation explicitly toggles
-            // their `[[Extensible]]` slot.
+            // Per spec, Object.isFrozen(non_object) is true. Array authority
+            // comes from its own indexed state; its bag contributes only
+            // ordinary property attributes.
             let result = if let Some(o) = arg.as_object() {
                 crate::object::is_frozen(o, gc_heap)
             } else if let Some(a) = arg.as_array() {
-                crate::array::test_integrity_level(a, gc_heap, true)
+                interp.test_array_integrity_level(a, true)
             } else if let Some(native) = arg.as_native_function() {
                 native.is_frozen(gc_heap)
             } else {
@@ -1984,19 +1996,12 @@ fn call(
         // §20.1.2.16 Object.isSealed(O)
         M::IsSealed => {
             let arg = args.first().cloned().unwrap_or(Value::undefined());
-            // §20.1.2.16 — `Object.isSealed(non_object) === true`. For
-            // ordinary objects, `is_sealed` walks the property table
-            // checking that nothing is configurable and that the
-            // object is non-extensible. Heap-allocated exotics that
-            // do not yet carry per-instance attribute tracking
-            // (Array indexed slots, RegExp expando, …) default to
-            // `false` because their elements / lazy expando bags
-            // remain configurable until `preventExtensions` is
-            // applied through the foundation surface.
+            // Every Array index and expando descriptor contributes, while
+            // Array extensibility remains independent of its storage object.
             let result = if let Some(o) = arg.as_object() {
                 crate::object::is_sealed(o, gc_heap)
             } else if let Some(a) = arg.as_array() {
-                crate::array::test_integrity_level(a, gc_heap, false)
+                interp.test_array_integrity_level(a, false)
             } else if let Some(native) = arg.as_native_function() {
                 native.is_sealed(gc_heap)
             } else {

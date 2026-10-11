@@ -72,7 +72,7 @@ pub use crate::property_cache::{PropertyLoadAction, PropertyStoreAction};
 
 pub use crate::property_ic::{
     EMPTY_SHAPE as PROPERTY_IC_EMPTY_SHAPE, IcHandlerKind as PropertyIcHandlerKind,
-    LOOKUP_START_KEY_BIT as PROPERTY_IC_LOOKUP_START_KEY_BIT, PropertyIcLayout,
+    PropertyIcLayout, PropertyStorageProjection,
 };
 
 /// Native layout of every named-property IC slot generated code reads.
@@ -442,9 +442,9 @@ pub struct JitArrayIteration {
     pub realm: u32,
     /// Array cell `GcHeader::type_tag`.
     pub array_type_tag: u8,
-    /// Byte offset of the array's exotic sidecar handle: zero for an ordinary
-    /// array with no own symbol property and no prototype override.
-    pub array_exotic_byte: u32,
+    /// The canonical whole-lookup proof over the aligned rare/expando pair.
+    /// Both handles must be null before opening an inherited iterator record.
+    pub receiver_guard: JitBodyGuard,
 }
 
 /// One GC-movement-stable receiver allocation program.
@@ -897,7 +897,7 @@ pub enum JitGuardWidth {
     /// A 32-bit word, as a flags word or a `#[repr(u32)]` discriminant.
     #[default]
     Word32,
-    /// A pointer-width word, as an optional sidecar handle.
+    /// A 64-bit body word, including an aligned pair of compressed handles.
     Word64,
 }
 
@@ -905,7 +905,7 @@ pub enum JitGuardWidth {
 ///
 /// Body state that can make a layout the wrong answer is all the same shape —
 /// read a word at a fixed offset, require an exact value, otherwise leave the
-/// fast path. A collection's no-expando flags word, an array's exotic sidecar,
+/// fast path. A collection's no-expando flags word, an Array's whole-lookup pair,
 /// a typed array's element kind and its length-tracking flag are that one guard
 /// with different offsets, widths and expected values, so generated code has
 /// one lowering per *width* and never one per family.
@@ -957,13 +957,14 @@ pub enum JitGuardedReceiver {
 /// Shared receiver proof for lookup through a pinned realm intrinsic prototype.
 ///
 /// Primitive strings carry no own named fields except length and indices.
-/// Collection receivers additionally require the existing clean-instance latch.
+/// Collections require their clean-instance latch. Arrays require the aligned
+/// rare/expando word clear before the prototype can answer a name.
 /// The prototype is pinned; its shape, descriptor state and fields stay live.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct JitIntrinsicPrototype {
     /// Exact receiver `GcHeader::type_tag`.
     pub type_tag: u8,
-    /// Instance state required before the canonical prototype may be used.
+    /// Body state required before the canonical prototype may be used.
     pub guard: Option<JitBodyGuard>,
     /// Compressed offset of the pinned realm prototype.
     pub proto_offset: u32,
@@ -980,13 +981,15 @@ impl JitIntrinsicPrototype {
     ///
     /// A latched `Map`/`Set` body has no instance override. A primitive string
     /// body owns only `length` and its indices, so every other name resolves on
-    /// `%String.prototype%`. An array body without an exotic sidecar likewise
-    /// owns only `length` and its elements, and its `[[Prototype]]` is still the
-    /// default realm's retained `%Array.prototype%`. A closure whose named-lookup byte reads
+    /// `%String.prototype%`. An array body without an exotic sidecar or named
+    /// bag owns only `length` and its elements, and its `[[Prototype]]` is still
+    /// the default realm's retained `%Array.prototype%`. A closure whose
+    /// named-lookup byte reads
     /// exactly ordinary has no own bag and no prototype override, and its
     /// kind resolves every non-virtual name on the active realm's
-    /// `%Function.prototype%`, so its proof also pins that realm. The proof establishes only the receiver; the
-    /// following holder guards decide which names that prototype answers. A
+    /// `%Function.prototype%`, so its proof also pins that realm. The proof
+    /// establishes only the receiver; following holder guards decide which
+    /// names that prototype answers. A
     /// String wrapper prototype stays opaque to ordinary lookup guards, so no
     /// `length`/index load can be answered from its shape.
     #[must_use]
@@ -997,7 +1000,7 @@ impl JitIntrinsicPrototype {
             }
             crate::string::JS_STRING_BODY_TYPE_TAG => self.guard.is_none(),
             crate::array::ARRAY_BODY_TYPE_TAG => {
-                self.guard == Some(crate::method_ops::dense_array_guard())
+                self.guard == Some(crate::method_ops::array_named_lookup_guard())
             }
             crate::closure::JS_CLOSURE_BODY_TYPE_TAG => {
                 self.guard == Some(crate::closure::ordinary_named_lookup_guard())
@@ -1344,6 +1347,16 @@ pub enum JitCacheIrOp {
         /// Whether the terminal operation requires a writable data slot.
         writable: bool,
     },
+    /// Read the actual array's live own named storage. A missing bag misses
+    /// before effects; its null prototype grants no array-chain absence proof.
+    LoadArrayExpando {
+        /// Original array receiver operand.
+        object: u8,
+        /// Tagged ordinary storage operand receiving the live bag.
+        result: u8,
+        /// VM-owned shell geometry used by both native targets.
+        layout: JitArrayLayout,
+    },
     /// Prove an exotic receiver and read its pinned canonical prototype.
     /// Subsequent ordinary guards validate the prototype's live data slot.
     LoadIntrinsicPrototype {
@@ -1587,14 +1600,29 @@ pub struct JitTypedArrayLengthLayout {
 
 /// Current static offsets needed by native Array guards.
 ///
-/// Dense element storage remains behind runtime stubs because Rust container
-/// layout is not part of the native ABI.
-#[derive(Debug, Clone, Copy, Default)]
+/// Logical length and named-storage projection use this view. Indexed native
+/// accesses use `JitArrayStorage` / `JitElementAccess` derived from the same body;
+/// generated code never infers Rust container geometry.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct JitArrayLayout {
     /// `GcHeader::type_tag` of an ordinary `ArrayBody`.
     pub type_tag: u8,
     /// Offset to `ArrayBody.length`, the logical `length` property.
     pub length_byte: u32,
+    /// Header-inclusive offset of the nullable compressed named-property bag.
+    pub expando_byte: u32,
+}
+
+impl JitArrayLayout {
+    /// Canonical physical shell offsets; native encoders consume this view.
+    pub fn current() -> Self {
+        let header = otter_gc::header::HEADER_SIZE as u32;
+        Self {
+            type_tag: crate::array::ARRAY_BODY_TYPE_TAG,
+            length_byte: header + crate::array::ARRAY_BODY_LENGTH_OFFSET as u32,
+            expando_byte: header + crate::array::ARRAY_BODY_EXPANDO_OFFSET as u32,
+        }
+    }
 }
 
 /// Where a receiver family keeps the base of its element storage.
@@ -2707,6 +2735,50 @@ pub trait JitCompilerHook: Send + Sync {
 #[cfg(test)]
 mod layout_tests {
     use super::*;
+
+    #[test]
+    fn array_whole_lookup_has_one_complete_aligned_null_word() {
+        let guard = crate::method_ops::array_named_lookup_guard();
+        assert_eq!(guard.width, JitGuardWidth::Word64);
+        assert_eq!(guard.expect, 0);
+        assert!(guard.byte.is_multiple_of(8));
+        assert_eq!(guard.byte + 4, JitArrayLayout::current().expando_byte);
+        assert_eq!(std::mem::size_of::<crate::array::ArrayBody>(), 40);
+        assert_eq!(std::mem::align_of::<crate::array::ArrayBody>(), 8);
+        assert_eq!(JitEmptyArrayAllocationPlan::default().cell_bytes, 48);
+        let header = otter_gc::header::HEADER_SIZE;
+        assert_eq!(header + crate::array::ARRAY_BODY_LENGTH_OFFSET, 8);
+        assert_eq!(header + crate::array::ARRAY_BODY_ELEMENTS_PTR_OFFSET, 16);
+        assert_eq!(header + crate::array::ARRAY_BODY_EXOTIC_OFFSET, 24);
+        assert_eq!(header + crate::array::ARRAY_BODY_EXPANDO_OFFSET, 28);
+        assert_eq!(header + crate::array::ARRAY_BODY_SLAB_OFFSET, 32);
+        assert_eq!(header + crate::array::ARRAY_BODY_DENSE_LEN_OFFSET, 36);
+        assert_eq!(header + crate::array::ARRAY_BODY_DENSE_CAP_OFFSET, 40);
+        assert_eq!(header + crate::array::ARRAY_BODY_DENSE_KIND_OFFSET, 44);
+        assert_eq!(header + crate::array::ARRAY_BODY_DENSE_OWN_GUARD_OFFSET, 45);
+        assert_eq!(JitArrayStorage::current().exotic_byte, guard.byte);
+        let proof = JitIntrinsicPrototype {
+            type_tag: crate::array::ARRAY_BODY_TYPE_TAG,
+            guard: Some(guard),
+            proto_offset: 128,
+            active_realm: None,
+        };
+        assert!(proof.is_generated_receiver());
+        for guard in [
+            None,
+            Some(JitBodyGuard {
+                width: JitGuardWidth::Word32,
+                ..guard
+            }),
+            Some(JitBodyGuard {
+                byte: guard.byte + 4,
+                ..guard
+            }),
+            Some(JitBodyGuard { expect: 1, ..guard }),
+        ] {
+            assert!(!JitIntrinsicPrototype { guard, ..proof }.is_generated_receiver());
+        }
+    }
 
     #[test]
     fn closure_call_layout_has_stable_c_field_offsets() {

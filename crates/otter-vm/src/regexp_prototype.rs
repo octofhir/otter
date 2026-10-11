@@ -9,10 +9,17 @@
 //! - Native helpers shared by the bootstrap `RegExp.prototype`
 //!   methods and string regex overloads.
 //! - [`load_property`] — getter dispatch for non-method members.
+//! - Final-shape managed metadata bags for match and indices arrays.
 //!
 //! # Invariants
 //! - Receivers are validated as `Value::RegExp`; non-regex native
 //!   method receivers raise `TypeError`.
+//! - Match metadata is born once in a null-prototype shaped bag; every
+//!   substring, group and array remains rooted until attachment.
+//!   Three isolate-owned layout slots retain its final signatures across
+//!   realms and collection; a repeated match performs no schema discovery.
+//! - Named indices share the numbered capture's pair array; capture indices,
+//!   rather than range equality, choose the shared value.
 //! - `exec` and `test` honour the `g` and `y` flag semantics — both
 //!   read and update `lastIndex`.
 //! - `lastIndex` is clamped to `[0, len]` before any match attempt
@@ -24,6 +31,7 @@
 //! # See also
 //! - <https://tc39.es/ecma262/#sec-regexp.prototype.exec>
 
+use crate::object_layout_cache::RegExpRecordLayout;
 use crate::regexp::JsRegExp;
 use crate::runtime_cx::{NativeCtx, NativeScope};
 use crate::string::JsString;
@@ -162,7 +170,11 @@ pub(crate) fn exec_once_native(
                 return Ok(scope.null());
             }
             if flags.global || flags.sticky {
-                set_exec_last_index(&mut scope, receiver, Value::number_f64(matched.range.end as f64))?;
+                set_exec_last_index(
+                    &mut scope,
+                    receiver,
+                    Value::number_f64(matched.range.end as f64),
+                )?;
             }
 
             // §B.2.4 — a legacy-enabled instance publishes the match into
@@ -257,48 +269,31 @@ fn build_match_result_native<'scope>(
         scope.undefined()
     };
 
-    // Re-read the array and every stored value only after all group
-    // allocations. The arena is the sole authority; no raw JsArray/JsObject
-    // survives a collection point.
-    let result_array = scope
-        .raw(result)
-        .as_array()
-        .ok_or_else(|| native_type_error(REGEXP_EXEC_NAME, "result root is not an array"))?;
-    let input_value = scope.raw(input);
-    let groups_value = scope.raw(groups);
-    crate::array::set_match_result_props(
-        result_array,
-        scope.context().heap_mut(),
-        Value::number_i32(m.range.start as i32),
-        input_value,
-        groups_value,
-    )?;
-
-    if has_indices {
-        let indices = scope.array(1 + m.captures.len())?;
-        let pair = pair_array_native(scope, m.range.start, m.range.end)?;
-        scope.set_index(indices, 0, pair)?;
-        for (index, capture) in m.captures.iter().enumerate() {
-            let value = match capture {
+    let indices = if has_indices {
+        let mut elements: smallvec::SmallVec<[Local<'_>; 8]> =
+            smallvec::SmallVec::with_capacity(1 + m.captures.len());
+        elements.push(pair_array_native(scope, m.range.start, m.range.end)?);
+        for capture in &m.captures {
+            elements.push(match capture {
                 Some(range) => pair_array_native(scope, range.start, range.end)?,
                 None => scope.undefined(),
-            };
-            scope.set_index(indices, index + 1, value)?;
+            });
         }
+        let indices = scope.array_from(&elements)?;
 
         let mut named = m.named_groups();
-        let index_groups = if let Some((name, range)) = named.next() {
+        let index_groups = if let Some((name, _)) = named.next() {
             let groups = scope.bare_object()?;
-            let value = match range {
-                Some(range) => pair_array_native(scope, range.start, range.end)?,
-                None => scope.undefined(),
-            };
+            let capture_index = m
+                .named_group_index(name)
+                .expect("named group iterator yields declared capture names");
+            let value = elements[capture_index];
             scope.set(groups, name, value)?;
-            for (name, range) in named {
-                let value = match range {
-                    Some(range) => pair_array_native(scope, range.start, range.end)?,
-                    None => scope.undefined(),
-                };
+            for (name, _) in named {
+                let capture_index = m
+                    .named_group_index(name)
+                    .expect("named group iterator yields declared capture names");
+                let value = elements[capture_index];
                 scope.set(groups, name, value)?;
             }
             groups
@@ -306,29 +301,23 @@ fn build_match_result_native<'scope>(
             scope.undefined()
         };
 
-        let indices_array = scope
-            .raw(indices)
-            .as_array()
-            .ok_or_else(|| native_type_error(REGEXP_EXEC_NAME, "indices root is not an array"))?;
-        let index_groups = scope.raw(index_groups);
-        crate::array::set_named_property(
-            indices_array,
-            scope.context().heap_mut(),
-            "groups",
-            index_groups,
-        )?;
-        let result_array = scope
-            .raw(result)
-            .as_array()
-            .ok_or_else(|| native_type_error(REGEXP_EXEC_NAME, "result root is not an array"))?;
-        let indices = scope.raw(indices);
-        crate::array::set_named_property(
-            result_array,
-            scope.context().heap_mut(),
-            "indices",
-            indices,
-        )?;
-    }
+        let layout = scope.regexp_record_layout(RegExpRecordLayout::Indices)?;
+        let bag = scope.object_with_layout(layout, &[index_groups])?;
+        scope.attach_array_expando(indices, bag)?;
+        Some(indices)
+    } else {
+        None
+    };
+
+    let index = scope.number(m.range.start as f64);
+    let bag = if let Some(indices) = indices {
+        let layout = scope.regexp_record_layout(RegExpRecordLayout::MatchWithIndices)?;
+        scope.object_with_layout(layout, &[index, input, groups, indices])?
+    } else {
+        let layout = scope.regexp_record_layout(RegExpRecordLayout::Match)?;
+        scope.object_with_layout(layout, &[index, input, groups])?
+    };
+    scope.attach_array_expando(result, bag)?;
     Ok(result)
 }
 
@@ -337,12 +326,9 @@ fn pair_array_native<'scope>(
     start: usize,
     end: usize,
 ) -> Result<Local<'scope>, NativeError> {
-    let pair = scope.array(2)?;
     let start = scope.number(start as f64);
     let end = scope.number(end as f64);
-    scope.set_index(pair, 0, start)?;
-    scope.set_index(pair, 1, end)?;
-    Ok(pair)
+    scope.array_from(&[start, end])
 }
 
 /// §22.2.6.8 `RegExp.prototype[@@match](string)` — invoked by
@@ -2615,12 +2601,20 @@ mod tests {
             panic!("expected RegExp exec result array");
         };
         assert!(
-            crate::array::get_named_property(arr, interp.gc_heap(), "indices")
-                .is_some_and(|v| v.is_array())
+            crate::object::get(
+                crate::array::expando_object(arr, interp.gc_heap()).unwrap(),
+                interp.gc_heap(),
+                "indices"
+            )
+            .is_some_and(|v| v.is_array())
         );
         assert!(
-            crate::array::get_named_property(arr, interp.gc_heap(), "groups")
-                .is_some_and(|v| v.is_object())
+            crate::object::get(
+                crate::array::expando_object(arr, interp.gc_heap()).unwrap(),
+                interp.gc_heap(),
+                "groups"
+            )
+            .is_some_and(|v| v.is_object())
         );
     }
 

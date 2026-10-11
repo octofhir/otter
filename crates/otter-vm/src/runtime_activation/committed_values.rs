@@ -21,6 +21,8 @@
 //! - A compiled object operation is explicit; its source/root record owns
 //!   tracing and reconstruction. Scalar operations retain source decoding.
 //!   Neither boxed-value family receives a destination or register index.
+//! - Prototype changes preserve the actual object identity of both operands;
+//!   the canonical internal-method owner handles every object family.
 //! - Once a kernel begins it returns only a normal value or an error. Compiled
 //!   entries turn source errors into rooted JavaScript exception values and
 //!   retain an already completed terminal native/allocator/control failure;
@@ -397,55 +399,13 @@ impl Interpreter {
                 }
             }
             ObjectProtocolValueOp::SetPrototype => {
-                // Preserve the bytecode's current receiver/prototype matrix.
-                // A Proxy receiver historically takes the trap-aware driver,
-                // whose accepted prototype kinds are deliberately narrower
-                // than the class-linking path used for ordinary objects.
-                value1 = if value0.is_proxy() {
-                    if value1.is_object() || value1.is_proxy() || value1.is_null() {
-                        value1
-                    } else if let Some(class) = value1.as_class_constructor() {
-                        Value::object(class.statics(&self.gc_heap))
-                    } else {
-                        return Err(CommittedValueError::JavaScript(VmError::TypeMismatch));
-                    }
-                } else if value1.is_object()
-                    || value1.is_proxy()
-                    || value1.is_iterator()
-                    || value1.is_null()
-                    || value1.is_native_function()
-                    || value1.is_function()
-                    || value1.is_closure()
-                    || value1.is_bound_function()
-                {
-                    value1
-                } else if let Some(class) = value1.as_class_constructor() {
-                    Value::object(class.statics(&self.gc_heap))
-                } else {
+                if !value0.is_object_type() || (!value1.is_object_type() && !value1.is_null()) {
                     return Err(CommittedValueError::JavaScript(VmError::TypeMismatch));
-                };
-
-                if value0.is_proxy() || value0.is_object() {
-                    if !self.set_prototype_value_proxy_aware(stack, context, &value0, &value1)? {
-                        return Err(CommittedValueError::JavaScript(
-                            self.err_type(("Object.setPrototypeOf failed".to_string()).into()),
-                        ));
-                    }
-                } else if value0.is_function()
-                    || value0.is_closure()
-                    || value0.is_bound_function()
-                    || value0.is_native_function()
-                    || value0.is_boolean()
-                    || value0.is_number()
-                    || value0.is_string()
-                    || value0.is_symbol()
-                    || value0.is_big_int()
-                {
-                    // Callable receiver metadata and primitive wrapper
-                    // prototypes are intentionally unaffected by this
-                    // internal bytecode operation.
-                } else {
-                    return Err(CommittedValueError::JavaScript(VmError::TypeMismatch));
+                }
+                if !self.set_prototype_value_proxy_aware(stack, context, &value0, &value1)? {
+                    return Err(CommittedValueError::JavaScript(
+                        self.err_type(("Object.setPrototypeOf failed".to_string()).into()),
+                    ));
                 }
                 Value::undefined()
             }
@@ -666,6 +626,83 @@ impl RuntimeCall<'_> {
 #[cfg(test)]
 mod tests {
     use super::{BinaryOperator, ObjectProtocolValueOp, VmError};
+
+    #[test]
+    fn prototype_operation_preserves_actual_array_and_class_values() {
+        use crate::{ActivationStack, Interpreter, Value, class_constructor::ClassConstructor};
+
+        let mut vm = Interpreter::new().expect("prototype operation fixture");
+        let context = vm
+            .link_module(
+                crate::test_support::minimal_bytecode_module("prototype-operation.js"),
+                crate::source_registry::SourceRegistry::default(),
+            )
+            .expect("valid prototype source");
+        let mut stack = ActivationStack::new();
+        vm.with_runtime_turn(&mut stack, |turn| {
+            let (vm, stack) = turn.into_parts();
+            vm.with_handle_scope(|vm, scope| {
+                let object = vm.scoped_object(scope).unwrap();
+                let array = vm.scoped_array(scope, 0).unwrap();
+                let prototype = vm.scoped_object(scope).unwrap();
+                let statics = vm.scoped_object(scope).unwrap();
+                let _runtime_roots = vm.scope_runtime_roots_guard();
+                let prototype_object = vm.escape_scoped(prototype).as_object().unwrap();
+                let statics_object = vm.escape_scoped(statics).as_object().unwrap();
+                let class = ClassConstructor::new_with_roots(
+                    &mut vm.gc_heap,
+                    Value::function(0),
+                    prototype_object,
+                    statics_object,
+                    &mut |_| {},
+                )
+                .unwrap();
+                let class = vm.scoped_value(scope, Value::class_constructor(class));
+                let function = vm.scoped_value(scope, Value::function(0));
+                let null = vm.scoped_value(scope, Value::null());
+                for (target, requested) in [
+                    (object, array),
+                    (object, class),
+                    (array, class),
+                    (function, array),
+                    (object, null),
+                ] {
+                    let result = vm
+                        .object_protocol_value(
+                            stack,
+                            &context,
+                            ObjectProtocolValueOp::SetPrototype,
+                            vm.escape_scoped(target),
+                            vm.escape_scoped(requested),
+                        )
+                        .expect("object-family prototype completion");
+                    assert_eq!(result, Value::undefined());
+                    assert_eq!(
+                        vm.get_prototype_for_op(&vm.escape_scoped(target)).unwrap(),
+                        vm.escape_scoped(requested),
+                        "the requested object is the published prototype"
+                    );
+                }
+                assert!(matches!(
+                    vm.object_protocol_value(
+                        stack,
+                        &context,
+                        ObjectProtocolValueOp::SetPrototype,
+                        vm.escape_scoped(object),
+                        Value::number_i32(17),
+                    ),
+                    Err(super::CommittedValueError::JavaScript(
+                        VmError::TypeMismatch
+                    ))
+                ));
+                assert_eq!(
+                    vm.get_prototype_for_op(&vm.escape_scoped(object)).unwrap(),
+                    Value::null(),
+                    "invalid prototypes do not mutate the receiver"
+                );
+            });
+        });
+    }
 
     #[test]
     fn object_operation_words_roundtrip_without_truncation_or_aliases() {

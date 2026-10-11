@@ -95,9 +95,9 @@ pub struct IsolateSnapshot {
     /// Per-body regexp pattern records in live-walk order. These rebuild the
     /// compiled matcher and foreign-owned text after page relocation.
     pub(crate) regexp_payloads: Vec<(Vec<u16>, String)>,
-    /// Per-body array-sidecar descriptor-flag records in live-walk
-    /// order: `(key, writable, enumerable, configurable)` per entry.
-    pub(crate) array_sidecar_flags: Vec<Vec<(String, bool, bool, bool)>>,
+    /// Per-body indexed Array descriptor records in live-walk order.
+    /// Managed named-property bags remain in the relocated page image.
+    pub(crate) array_indexed_records: Vec<crate::array::ArrayIndexedSnapshot>,
     /// The source isolate's next shape id. A restoring isolate bumps
     /// the process counter past this so freshly minted shape ids never
     /// collide with the image's — shape ids key the property caches.
@@ -183,7 +183,7 @@ impl crate::Interpreter {
                 ));
             });
         let mut array_sidecar_with_content = false;
-        let mut array_sidecar_flags: Vec<Vec<(String, bool, bool, bool)>> = Vec::new();
+        let mut array_indexed_records: Vec<crate::array::ArrayIndexedSnapshot> = Vec::new();
         self.gc_heap()
             .for_each_live_payload::<crate::array::ArrayExoticSlots, _>(|_space, body| {
                 if !body.is_empty_for_snapshot() {
@@ -193,7 +193,7 @@ impl crate::Interpreter {
                         body.snapshot_content_summary()
                     );
                 }
-                array_sidecar_flags.push(body.snapshot_property_flags());
+                array_indexed_records.push(body.indexed_snapshot());
             });
         if array_sidecar_with_content {
             return Err(otter_gc::ImageError::ForeignPayloadNotCapturable {
@@ -219,7 +219,7 @@ impl crate::Interpreter {
             atom_names,
             global_lexicals,
             regexp_payloads,
-            array_sidecar_flags,
+            array_indexed_records,
             next_shape_id,
         })
     }

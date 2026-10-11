@@ -8,9 +8,8 @@
 //! # Invariants
 //! - A zero byte proves default own data semantics only for a present slot.
 //!   It never permits a hole to bypass a prototype lookup.
-//! - Named state — string-keyed data properties, their creation order,
-//!   symbol-keyed properties, and accessors or descriptor flags on non-index
-//!   keys — never aliases an index, so it leaves the byte zero. A RegExp match
+//! - Managed named state never aliases an index, so the expando leaves the
+//!   byte zero. A RegExp match
 //!   result (`index`, `input`, `groups`) keeps native element access.
 //! - Mutable sidecar exposure invalidates the byte before a write; completed
 //!   mutations and traced relocation recompute it from the current sidecar.
@@ -29,20 +28,19 @@ impl ArrayExoticSlots {
     /// semantics: no sparse or JSON-source state, extensible, and no accessor
     /// or descriptor on an index key.
     fn leaves_dense_slots_ordinary(&self) -> bool {
-        let index_key = |key: &String| crate::object::array_index_property_name(key).is_some();
         self.sparse_elements.is_none()
             && self.source_bytes.is_none()
             && self.extensible.0
             && self
                 .accessors
                 .as_ref()
-                .is_none_or(|accessors| !accessors.keys().any(index_key))
+                .is_none_or(|accessors| accessors.is_empty())
             && self
                 .property_flags
                 .as_ref()
-                .is_none_or(|flags| !flags.keys().any(index_key))
+                .is_none_or(|flags| flags.is_empty())
         // `prototype_override` cannot affect a proved present own element.
-        // Named data, key order and symbol properties never alias an index.
+        // The managed expando never aliases an index.
         // `dirty` is bookkeeping, not a property or descriptor.
     }
 }

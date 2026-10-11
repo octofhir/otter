@@ -515,6 +515,7 @@ fn emit_store(
     );
     dynasm!(ops ; .arch x64
         ; =>slot_stored
+        ; mov Rq(STORE_RECEIVER), Rq(STORE_SLOT)
         ; test edi, edi
         ; jz =>stored
         ; =>appended);

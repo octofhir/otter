@@ -1,20 +1,25 @@
-//! Isolate-owned layouts for atomized host record signatures.
+//! Isolate-owned layouts for fixed and atomized host records.
 //!
 //! Native parsers and marshallers often see the same record signature many
 //! times: one record-kind atom followed by the same ordered property atoms.
-//! This module retains complete [`ObjectLayout`] tokens keyed by the ordered
-//! host atom identities and the owning realm's root shape.
+//! This module retains complete [`ObjectLayout`] tokens. Fixed null-prototype
+//! RegExp records use typed slots; dynamic signatures use the ordered host
+//! atom identities and the selected prototype root shape.
 //!
 //! # Contents
-//! - [`ObjectLayoutCache`] — signature-to-layout table.
+//! - [`RegExpRecordLayout`] — the three fixed null-prototype signatures.
+//! - [`ObjectLayoutCache`] — their slots and the dynamic signature table.
 //!
 //! # Invariants
 //! - Every cached shape belongs to the owning isolate and enters its root walk.
 //! - Property order is part of the signature; tag identity partitions records
-//!   that happen to expose the same keys, and the root shape of the realm's
-//!   `%Object.prototype%` — which a layout's shape fixes — partitions realms.
+//!   that happen to expose the same keys. The root partitions ordinary realm
+//!   prototypes and null-prototype bags without a second cache.
 //! - Cache keys contain no GC handles and need no root tracing.
-//! - A hit borrows the caller's atom slice and performs no allocation.
+//! - A dynamic hit borrows the caller's atom slice without allocation. A fixed
+//!   hit copies its retained token without atoms, root preparation or hashing.
+//! - Fixed slots contain no realm prototype or dynamic signature entry. Their
+//!   final shapes enter the same root walk as dynamic layouts.
 //!
 //! # See also
 //! - [`crate::handles::ObjectLayout`] — stable hidden-class token.
@@ -23,6 +28,29 @@
 use crate::handles::ObjectLayout;
 use crate::host_strings::{HostAtom, HostAtomId};
 use rustc_hash::FxHashMap;
+
+/// Fixed null-prototype records owned by the isolate's RegExp result builder.
+#[derive(Clone, Copy, Debug)]
+#[repr(usize)]
+pub(crate) enum RegExpRecordLayout {
+    /// Match metadata without an indices array.
+    Match,
+    /// Match metadata with an indices array.
+    MatchWithIndices,
+    /// The named-group property of an indices array.
+    Indices,
+}
+
+impl RegExpRecordLayout {
+    /// Final property order, with default writable/enumerable/configurable data attributes.
+    pub(crate) const fn keys(self) -> &'static [&'static str] {
+        match self {
+            Self::Match => &["index", "input", "groups"],
+            Self::MatchWithIndices => &["index", "input", "groups", "indices"],
+            Self::Indices => &["groups"],
+        }
+    }
+}
 
 #[derive(Debug)]
 struct LayoutEntry {
@@ -35,6 +63,7 @@ struct LayoutEntry {
 #[derive(Debug, Default)]
 pub(crate) struct ObjectLayoutCache {
     layouts: FxHashMap<HostAtomId, Vec<LayoutEntry>>,
+    regexp: [Option<ObjectLayout>; 3],
 }
 
 impl ObjectLayoutCache {
@@ -44,6 +73,20 @@ impl ObjectLayoutCache {
         self.layouts
             .values()
             .flat_map(|entries| entries.iter().map(|entry| entry.layout.shape_id()))
+            .chain(self.regexp.iter().flatten().map(ObjectLayout::shape_id))
+    }
+
+    /// Read a fixed token before any root preparation or name lookup.
+    #[must_use]
+    pub(crate) fn regexp(&self, kind: RegExpRecordLayout) -> Option<ObjectLayout> {
+        self.regexp[kind as usize]
+    }
+
+    /// Publish one completed null-prototype lineage solely in its typed slot.
+    pub(crate) fn insert_regexp(&mut self, kind: RegExpRecordLayout, layout: ObjectLayout) {
+        debug_assert!(self.regexp[kind as usize].is_none());
+        debug_assert_eq!(layout.len(), kind.keys().len());
+        self.regexp[kind as usize] = Some(layout);
     }
 
     /// Return the complete layout for `tag + keys`, if already learned.
@@ -87,3 +130,6 @@ impl ObjectLayoutCache {
         entries.push(LayoutEntry { root, keys, layout });
     }
 }
+
+#[cfg(test)]
+mod tests;

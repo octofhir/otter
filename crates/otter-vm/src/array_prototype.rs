@@ -20,6 +20,8 @@
 //! # Invariants
 //! - Generic methods begin with `ToObject(this)` and
 //!   `LengthOfArrayLike` in the driver path.
+//! - Named and symbol properties use ordinary shaped expando descriptors;
+//!   lookup and setters retain the actual Array receiver.
 //! - Live drivers use VM property operations so accessors, inherited
 //!   indices, proxies, callbacks, and comparator calls re-enter through
 //!   the active [`ExecutionContext`].
@@ -2654,33 +2656,6 @@ impl Interpreter {
         key: &str,
         value: Value,
     ) -> Result<(), CommittedValueError> {
-        if let Some(arr) = o.as_array()
-            && crate::object::array_index_property_name(key).is_some()
-            && crate::array::get_named_property(arr, self.gc_heap(), key).is_none()
-        {
-            let proto = self
-                .constructor_prototype_value("Array")
-                .map_err(CommittedValueError::Fatal)?;
-            if let Some(proto) = proto.as_object() {
-                match crate::object::resolve_set(proto, self.gc_heap(), key) {
-                    crate::object::SetOutcome::InvokeSetter { setter } => {
-                        let args: SmallVec<[Value; 8]> = smallvec::smallvec![value];
-                        self.run_callable_sync_rooted(stack, Some(context), &setter, o, args)
-                            .map_err(CommittedValueError::completed_call)?;
-                        return Ok(());
-                    }
-                    crate::object::SetOutcome::Reject { .. } => {
-                        return Err(CommittedValueError::JavaScript(
-                            self.err_type((format!("Cannot assign to property '{key}'")).into()),
-                        ));
-                    }
-                    crate::object::SetOutcome::AssignData => {}
-                    // ordinary_set_data_value below dispatches
-                    // exotic [[Set]] overrides itself.
-                    crate::object::SetOutcome::ExoticParent { .. } => {}
-                }
-            }
-        }
         if let Some(obj) = o.as_object() {
             match crate::object::resolve_set(obj, self.gc_heap(), key) {
                 crate::object::SetOutcome::InvokeSetter { setter } => {
@@ -2798,71 +2773,16 @@ impl Interpreter {
         key: &str,
         value: Value,
     ) -> Result<bool, CommittedValueError> {
-        if let Some((_getter, setter)) = crate::array::get_accessor(arr, self.gc_heap(), key) {
-            return match setter {
-                Some(s) if crate::abstract_ops::is_callable(&s) => {
-                    let mut a: SmallVec<[Value; 8]> = SmallVec::new();
-                    a.push(value);
-                    self.run_callable_sync_rooted(stack, Some(context), &s, Value::array(arr), a)
-                        .map_err(CommittedValueError::completed_call)?;
-                    Ok(true)
-                }
-                _ => Ok(false),
-            };
-        }
-        let idx = object::array_index_property_name(key).map(|i| i as usize);
-        let has_own = match idx {
-            Some(i) => crate::array::has_own_element(arr, self.gc_heap(), i),
-            None => crate::array::get_named_property(arr, self.gc_heap(), key).is_some(),
-        };
-        if has_own {
-            let writable = crate::array::get_property_flags(arr, self.gc_heap(), key)
-                .is_none_or(|f| f.writable());
-            if !writable {
-                return Ok(false);
-            }
-        } else {
-            // Absent own — consult the prototype chain for an inherited
-            // setter or non-writable shadow before installing a new slot.
-            let proto = self
-                .constructor_prototype_value("Array")
-                .map_err(CommittedValueError::Fatal)?;
-            if let Some(proto_obj) = proto.as_object() {
-                match crate::object::resolve_set(proto_obj, self.gc_heap(), key) {
-                    crate::object::SetOutcome::InvokeSetter { setter } => {
-                        let mut a: SmallVec<[Value; 8]> = SmallVec::new();
-                        a.push(value);
-                        self.run_callable_sync_rooted(
-                            stack,
-                            Some(context),
-                            &setter,
-                            Value::array(arr),
-                            a,
-                        )
-                        .map_err(CommittedValueError::completed_call)?;
-                        return Ok(true);
-                    }
-                    crate::object::SetOutcome::Reject { .. } => return Ok(false),
-                    crate::object::SetOutcome::AssignData => {}
-                    // %Array.prototype% chains stay ordinary.
-                    crate::object::SetOutcome::ExoticParent { .. } => {}
-                }
-            }
-            if !crate::array::is_extensible(arr, self.gc_heap()) {
-                return Ok(false);
-            }
-        }
-        match idx {
-            Some(i) => crate::array::define_index_value(arr, self.gc_heap_mut(), i, value)
-                .map_err(crate::oom_to_vm)
-                .map_err(CommittedValueError::JavaScript)?,
-            None => {
-                crate::array::set_named_property(arr, self.gc_heap_mut(), key, value)
-                    .map_err(crate::oom_to_vm)
-                    .map_err(CommittedValueError::JavaScript)?;
-            }
-        }
-        Ok(true)
+        let receiver = Value::array(arr);
+        self.ordinary_set_data_value(
+            stack,
+            context,
+            receiver,
+            &crate::VmPropertyKey::String(key),
+            value,
+            receiver,
+            0,
+        )
     }
 
     /// §23.1.3.21 live `Array.prototype.pop` over a generic array-like receiver.
@@ -3210,25 +3130,13 @@ impl Interpreter {
         o: Value,
         key: &str,
     ) -> Result<bool, CommittedValueError> {
-        let property_key = crate::VmPropertyKey::String(key);
-        if self.ordinary_has_property_value(stack, Some(context), o, &property_key, 0)? {
-            return Ok(true);
-        }
-        if o.is_array() {
-            let proto = self
-                .get_prototype_for_op(&o)
-                .map_err(CommittedValueError::JavaScript)?;
-            if !proto.is_nullish() {
-                return self.ordinary_has_property_value(
-                    stack,
-                    Some(context),
-                    proto,
-                    &property_key,
-                    0,
-                );
-            }
-        }
-        Ok(false)
+        self.ordinary_has_property_value(
+            stack,
+            Some(context),
+            o,
+            &crate::VmPropertyKey::String(key),
+            0,
+        )
     }
 
     fn array_method_get_property(
@@ -3238,40 +3146,6 @@ impl Interpreter {
         o: Value,
         key: &str,
     ) -> Result<Value, CommittedValueError> {
-        if let Some(arr) = o.as_array() {
-            if let Some((getter, _setter)) = crate::array::get_accessor(arr, self.gc_heap(), key) {
-                return match getter {
-                    Some(getter) if crate::abstract_ops::is_callable(&getter) => {
-                        let args: SmallVec<[Value; 8]> = SmallVec::new();
-                        self.run_callable_sync_rooted(stack, Some(context), &getter, o, args)
-                            .map_err(CommittedValueError::completed_call)
-                    }
-                    _ => Ok(Value::undefined()),
-                };
-            }
-            if let Some(idx) = crate::object::array_index_property_name(key)
-                && crate::array::has_own_element(arr, self.gc_heap(), idx as usize)
-            {
-                return Ok(crate::array::get(arr, self.gc_heap(), idx as usize));
-            }
-            if let Some(value) = crate::array::get_named_property(arr, self.gc_heap(), key) {
-                return Ok(value);
-            }
-            let proto = self
-                .get_prototype_for_op(&o)
-                .map_err(CommittedValueError::JavaScript)?;
-            if !proto.is_nullish()
-                && self.ordinary_has_property_value(
-                    stack,
-                    Some(context),
-                    proto,
-                    &crate::VmPropertyKey::String(key),
-                    0,
-                )?
-            {
-                return self.get_property_value_for_call(stack, context, proto, key);
-            }
-        }
         self.get_property_value_for_call(stack, context, o, key)
     }
 
@@ -3557,7 +3431,7 @@ impl Interpreter {
         // index property) must go through `[[DefineOwnProperty]]`, which rejects
         // the redefinition exactly as `CreateDataProperty` requires.
         if let Some(arr) = target.as_array()
-            && !crate::array::has_accessors(arr, self.gc_heap())
+            && !crate::array::has_index_accessors(arr, self.gc_heap())
             && crate::array::is_extensible(arr, self.gc_heap())
             && !crate::array::has_own_element(arr, self.gc_heap(), idx)
         {
@@ -4728,7 +4602,8 @@ pub(crate) fn array_callback_native_dispatch(
                         // no inherited value reads as absent.
                         let key = idx.to_string();
                         let present = crate::array::has_own_element(arr, interp.gc_heap(), idx)
-                            || crate::array::get_accessor(arr, interp.gc_heap(), &key).is_some()
+                            || crate::array::get_index_accessor(arr, interp.gc_heap(), idx as u32)
+                                .is_some()
                             || {
                                 let has_result = interp.ordinary_has_property_value(
                                     stack,

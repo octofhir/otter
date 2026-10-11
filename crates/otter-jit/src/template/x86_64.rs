@@ -407,6 +407,7 @@ pub(super) fn compile(
             view,
             shape,
             activation_exits,
+            SpillArea::NONE,
             cold,
         );
     }

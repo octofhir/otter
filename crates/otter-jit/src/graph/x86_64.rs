@@ -11,6 +11,9 @@
 //! - Collecting transitions preserve values only in traced canonical homes.
 //! - Stack staging is aligned and every slot access includes its current delta.
 //! - Private JS entries and platform C calls retain their distinct shared ABIs.
+//! - The shared frame admission proof may defer publication across a
+//!   nonobserving body. Cold entry helpers and eager reconstruction publish
+//!   the complete reserved record before accessing the VM.
 //!
 //! # See also
 //! - `super::registers::X86_64` owns physical allocation constraints.
@@ -72,6 +75,7 @@ struct Codegen<'a> {
     fatal: DynamicLabel,
     activation: crate::frame::ActivationExits,
     spill: crate::frame::SpillArea,
+    entry_shape: crate::call_linkage::EntryShape,
     transitions: &'a crate::entry::TransitionTable,
     deopt_runtime: u64,
     plan: &'a crate::template::TemplatePlan,
@@ -138,14 +142,6 @@ pub(crate) fn emit(
     let committed_throw = ops.new_dynamic_label();
     let propagate = ops.new_dynamic_label();
     let materialize = ops.new_dynamic_label();
-    // Both entries zero the exception scratch, the only tagged word the
-    // entry record roots; every other home is rooted only once written.
-    let spill = crate::frame::SpillArea {
-        bytes: slots.bytes(),
-        scratch_slot: Some(slots.spill_tagged),
-        safepoint: FIRST_SITE_SAFEPOINT,
-        saved_pairs: 0,
-    };
     let lazy_window = !built
         .graph
         .nodes
@@ -158,6 +154,15 @@ pub(crate) fn emit(
         true,
     )?
     .with_lazy_window(lazy_window);
+    // Publication initializes the exception scratch. Every other home is
+    // rooted only by a boundary that wrote it.
+    let spill = crate::frame::SpillArea {
+        bytes: slots.bytes(),
+        scratch_slot: Some(slots.spill_tagged),
+        safepoint: FIRST_SITE_SAFEPOINT,
+        saved_pairs: 0,
+        deferred_frame: super::frame::can_defer_frame(shape, &built.graph, allocation),
+    };
     let mut codegen = Codegen {
         ops,
         relocations: RelocationCapture::new(capture_relocations),
@@ -176,6 +181,7 @@ pub(crate) fn emit(
         fatal,
         activation,
         spill,
+        entry_shape: shape,
         transitions,
         deopt_runtime: deopt_runtime as u64,
         plan,
@@ -219,6 +225,7 @@ pub(crate) fn emit(
         view,
         shape,
         activation,
+        spill,
         cold,
     );
     let (call_entry, receiver_entry) = crate::x86_64::frame::emit_call_entry(

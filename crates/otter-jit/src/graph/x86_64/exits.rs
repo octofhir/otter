@@ -189,6 +189,12 @@ impl<'a> Codegen<'a> {
     /// With `dump`, the register dump starts at `rsp`.
     pub(super) fn emit_writeback_call(&mut self, homes_delta: i32, dump: bool) {
         dynasm!(self.ops ; .arch x64 ; mov esi, r11d);
+        crate::x86_64::frame::emit_publish_deferred_frame(
+            &mut self.ops,
+            &mut self.relocations,
+            self.entry_shape,
+            self.spill,
+        );
         crate::x86_64::frame::emit_publish_lazy_window(
             &mut self.ops,
             self.view.code_block.register_count,

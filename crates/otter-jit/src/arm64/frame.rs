@@ -34,6 +34,10 @@
 //!   Underarity initializes and publishes the reserved window before any
 //!   allocating helper; an exit that rebuilds an unpublished interpreter
 //!   frame also publishes the reserved window.
+//! - A nonobserving Graph body may leave its reserved record unpublished.
+//!   Only input words and the transferred caller anchor exist in that extent;
+//!   bit one of the return word marks it. A cold boundary initializes and
+//!   publishes the same record before any VM access or collecting operation.
 //! - Only a baseline generation counts its entries toward promotion.
 //! - The native stack limit alone bounds call depth; it rejects entry before
 //!   the reservation, accounting, receiver preparation or frame publication.
@@ -263,10 +267,7 @@ pub(crate) fn emit_call_entry(
         overflow,
         staged,
         break_even,
-        promote,
-        construct,
-        prepare,
-        underarity,
+        ..
     } = cold;
     let bytes = reservation(shape, spill);
     emit_save(ops);
@@ -300,7 +301,9 @@ pub(crate) fn emit_call_entry(
     }
     dynasm!(ops ; .arch aarch64 ; mov sp, x9 ; sub x21, x29, RECORD_SLOT);
     emit_store_saved(ops, spill.saved_pairs);
-    emit_zero_scratch(ops, spill);
+    if !spill.deferred_frame {
+        emit_zero_scratch(ops, spill);
+    }
     if !shape.lazy_window {
         // The lazy window, below the record and the pairs, is published only
         // by an exit; the body's x19 is set once the record is built.
@@ -324,6 +327,21 @@ pub(crate) fn emit_call_entry(
         ; tbnz x8, 0, =>staged.0
         ; =>staged.1
     );
+    if spill.deferred_frame {
+        debug_assert!(shape.lazy_window && !shape.derived && !shape.counts_entries());
+        if shape.lexical_this {
+            emit_lexical_this(ops, view);
+        }
+        dynasm!(ops ; .arch aarch64
+            ; stp x2, x3, [x21, NATIVE_FRAME_THIS_OFFSET as i32]
+            ; stp x1, x4, [x21, NATIVE_FRAME_SELF_OFFSET as i32]
+            ; movz x16, crate::frame::UNPUBLISHED_FRAME as u32
+            ; str x16, [x29, RETURN_FRAME]
+            ; add x19, x29, 48
+        );
+        emit_entry_continuations(ops, shape, cold);
+        return (start, receiver_entry);
+    }
     if let Some((check, back)) = break_even {
         // Entry diagnostics and canonical source-work admission for promotion.
         dynasm!(ops
@@ -442,7 +460,13 @@ pub(crate) fn emit_call_entry(
         emit_fill_window(ops, shape);
     }
     dynasm!(ops ; .arch aarch64 ; str x21, [x20, NATIVE_FRAME_OFFSET]);
-    if let Some((cold, back)) = underarity {
+    emit_entry_continuations(ops, shape, cold);
+    (start, receiver_entry)
+}
+
+/// Select the semantic entry continuations after input words are available.
+fn emit_entry_continuations(ops: &mut Assembler, shape: EntryShape, cold: CallEntryCold) {
+    if let Some((cold, back)) = cold.underarity {
         if shape.param_count < 4096 {
             dynasm!(ops ; .arch aarch64 ; cmp w4, u32::from(shape.param_count));
         } else {
@@ -451,19 +475,68 @@ pub(crate) fn emit_call_entry(
         }
         dynasm!(ops ; .arch aarch64 ; b.lo =>cold ; =>back);
     }
-    if let Some((cold, _)) = construct {
+    if let Some((cold, _)) = cold.construct {
         dynasm!(ops ; .arch aarch64 ; cmp x3, VALUE_UNDEFINED as u32 ; b.ne =>cold);
     }
-    if let Some((cold, back)) = prepare {
+    if let Some((cold, back)) = cold.prepare {
         dynasm!(ops ; .arch aarch64 ; cbnz x5, =>cold ; =>back);
     }
-    if let Some((_, back)) = construct {
+    if let Some((_, back)) = cold.construct {
         dynasm!(ops ; .arch aarch64 ; =>back);
     }
-    if let Some((promote, promoted)) = promote {
+    if let Some((promote, promoted)) = cold.promote {
         dynasm!(ops ; .arch aarch64 ; cbnz x6, =>promote ; =>promoted);
     }
-    (start, receiver_entry)
+}
+
+/// Complete and publish a reserved nonobserving record before its first VM
+/// boundary. The stable frame pointer locates homes even inside a register
+/// dump. Only scratch registers are clobbered; tier or published entries keep
+/// their current record and root words.
+pub(crate) fn emit_publish_deferred_frame(
+    ops: &mut Assembler,
+    relocations: &mut RelocationCapture,
+    shape: EntryShape,
+    spill: SpillArea,
+) {
+    if !spill.deferred_frame {
+        return;
+    }
+    let published = ops.new_dynamic_label();
+    dynasm!(ops ; .arch aarch64
+        ; ldr x16, [x29, RETURN_FRAME]
+        ; tbz x16, 1, =>published
+        ; ldr x16, [x20, NATIVE_FRAME_OFFSET]
+        ; str x16, [x21, abi::NATIVE_FRAME_CALLER_OFFSET]
+        ; str x16, [x29, RETURN_FRAME]
+    );
+    emit_load_u64(ops, 16, u64::from(shape.function_id));
+    if !relocations.emit_constant_load(ops, 17, shape.header_word(0)) {
+        emit_load_u64(ops, 17, shape.header_word(0));
+    }
+    dynasm!(ops ; .arch aarch64
+        ; stp x16, x17, [x21]
+        ; stp xzr, xzr, [x21, NATIVE_FRAME_REGISTER_BASE_OFFSET as i32]
+        ; add x16, x29, 48
+        ; str x16, [x21, abi::NATIVE_FRAME_ACTUALS_OFFSET]
+    );
+    emit_load_u64(ops, 16, u64::from(reservation(shape, spill)));
+    dynasm!(ops ; .arch aarch64 ; sub x17, x29, x16);
+    if let Some(slot) = spill.scratch_slot {
+        let offset = slot * 8;
+        if offset <= 32760 {
+            dynasm!(ops ; .arch aarch64 ; str xzr, [x17, offset]);
+        } else {
+            emit_load_u64(ops, 16, u64::from(offset));
+            dynasm!(ops ; .arch aarch64 ; str xzr, [x17, x16]);
+        }
+    }
+    emit_load_u64(ops, 16, u64::from(spill.safepoint) << 32);
+    dynasm!(ops ; .arch aarch64
+        ; stp x16, x17, [x21, abi::NATIVE_FRAME_DEPTH_OFFSET as i32]
+        ; str x21, [x20, NATIVE_FRAME_OFFSET]
+        ; =>published
+    );
 }
 
 /// Publish the register window of a record whose entry left it
@@ -623,7 +696,7 @@ pub(crate) fn emit_call_entry_cold(
     view: &JitCompileSnapshot,
     exits: ActivationExits,
     shape: EntryShape,
-    saved_pairs: u8,
+    spill: SpillArea,
     cold: CallEntryCold,
 ) {
     // A trampoline-staged entry: its caller anchor travels in the request.
@@ -640,7 +713,8 @@ pub(crate) fn emit_call_entry_cold(
     );
     if let Some((missing, ready)) = cold.underarity {
         dynasm!(ops ; .arch aarch64 ; =>missing);
-        emit_window_base(ops, shape.register_count, saved_pairs);
+        emit_publish_deferred_frame(ops, relocations, shape, spill);
+        emit_window_base(ops, shape.register_count, spill.saved_pairs);
         emit_fill_underarity_window(ops, u32::from(shape.register_count));
         emit_load_u64(ops, 16, u64::from(shape.register_count));
         // Publish every initialized register before receiver conversion or
@@ -670,6 +744,7 @@ pub(crate) fn emit_call_entry_cold(
     if let Some((construct, constructed)) = cold.construct {
         let created = ops.new_dynamic_label();
         dynasm!(ops ; .arch aarch64 ; =>construct);
+        emit_publish_deferred_frame(ops, relocations, shape, spill);
         emit_take_construct_request(ops);
         dynasm!(ops
             ; .arch aarch64
@@ -717,7 +792,9 @@ pub(crate) fn emit_call_entry_cold(
         );
     }
     if let Some((prepare, prepared)) = cold.prepare {
-        dynasm!(ops ; .arch aarch64 ; =>prepare ; mov x0, x20);
+        dynasm!(ops ; .arch aarch64 ; =>prepare);
+        emit_publish_deferred_frame(ops, relocations, shape, spill);
+        dynasm!(ops ; .arch aarch64 ; mov x0, x20);
         emit_stub(
             ops,
             relocations,
@@ -770,13 +847,21 @@ fn emit_restore(ops: &mut Assembler, pairs: u8) {
 /// Return `x0`/`x1`: constructor completion when the record owes it, then
 /// publish the return frame and release this native frame.
 pub(crate) fn emit_epilogue(ops: &mut Assembler, exits: ActivationExits, spill: SpillArea) {
+    let restore = ops.new_dynamic_label();
     dynasm!(ops
         ; .arch aarch64
         ; ldr x9, [x29, RETURN_FRAME]
+    );
+    if spill.deferred_frame {
+        dynasm!(ops ; .arch aarch64 ; tbnz x9, 1, =>restore);
+    }
+    dynasm!(ops
+        ; .arch aarch64
         ; tbnz x9, 0, =>exits.construct
     );
     emit_restore_tier_roots(ops, spill);
     dynasm!(ops ; .arch aarch64 ; str x9, [x20, NATIVE_FRAME_OFFSET]);
+    dynasm!(ops ; .arch aarch64 ; =>restore);
     emit_restore(ops, spill.saved_pairs);
 }
 
@@ -811,6 +896,8 @@ pub(crate) fn emit_exits(
     dynasm!(ops
         ; .arch aarch64
         ; =>done
+        ; ldrb w9, [x21, crate::entry::NATIVE_FRAME_FLAGS_OFFSET]
+        ; tbz w9, abi::NativeFrameFlags::CONSTRUCT.trailing_zeros(), =>no_ticket
         ; ldr w9, [x21, abi::NATIVE_FRAME_CONSTRUCT_LAYOUT_OFFSET]
         ; ldr x10, [x21, abi::NATIVE_FRAME_SUPER_ORIGIN_OFFSET]
         ; orr x9, x9, x10

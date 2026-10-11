@@ -8,6 +8,8 @@
 //!   interpreter frame (function-entry tier transfer and loop OSR).
 //! - [`emit_publish_lazy_window`] — initialized register-window publication
 //!   for an actual-only entry's interpreter continuation.
+//! - [`emit_publish_deferred_frame`] — complete publication when a bounded
+//!   body first needs its reserved record for reconstruction or preparation.
 //! - [`emit_epilogue`] / [`emit_exits`] — constructor completion,
 //!   unpublication, and side exits that resume the interpreter in place.
 //! - [`emit_tail_admission`], [`emit_tail_span_check`],
@@ -21,12 +23,17 @@
 //!   window, `rbp` this native frame.
 //! - `[rbp - 40]` holds the frame to publish on return: the caller of a
 //!   called record, or the published interpreter frame itself under a tier
-//!   entry. Bit 0 marks a record that owes constructor completion.
+//!   entry. Bit 0 marks a record that owes constructor completion. The
+//!   unpublished marker names a reserved call record that has not joined the
+//!   frame chain; returning from it restores only the machine extent.
 //! - A call entry builds its record directly below the fixed 48-byte save
 //!   area, then the window and the spill area (lowest, at `rsp`), and
 //!   publishes only initialized roots. The record's return address is the
 //!   one saved at `[rbp + 8]`. Adequate actual-only entries leave the window absent;
 //!   underarity initializes and publishes it before any collecting helper.
+//!   A deferred record initially contains only incoming values and its caller
+//!   return anchor. It joins the chain before any allocating or reentrant step;
+//!   a hit executes and returns with the caller remaining published throughout.
 //! - The native stack limit alone bounds call depth; it rejects entry before
 //!   the reservation, accounting, receiver preparation or frame publication.
 //!   Records carry no depth: the runtime derives it on first use.
@@ -61,7 +68,7 @@ use crate::{
         NATIVE_FRAME_THIS_OFFSET, NATIVE_STACK_LIMIT_OFFSET, THREAD_OFFSET, TransitionTable,
         VALUE_UNDEFINED, VM_THREAD_INTERRUPT_CELL_OFFSET,
     },
-    frame::{ActivationExits, CallEntryCold, SpillArea},
+    frame::{ActivationExits, CallEntryCold, SpillArea, UNPUBLISHED_FRAME},
     x86_64::{
         activation::{emit_lexical_this, emit_object_test},
         values::{emit_load_runtime_stub, emit_load_symbol_u64},
@@ -284,24 +291,33 @@ pub(crate) fn emit_call_entry(
         ; .arch x64
         ; mov rsp, r11
     );
-    emit_zero_scratch(ops, spill);
-    if spill.bytes == 0 {
-        dynasm!(ops ; .arch x64 ; mov r13, rsp);
+    if spill.deferred_frame {
+        debug_assert!(shape.lazy_window && !shape.derived);
+        dynasm!(ops ; .arch x64
+            ; lea r14, [rbp + RECORD]
+            ; mov QWORD [rbp + RETURN_FRAME], UNPUBLISHED_FRAME as i32
+            ; lea r13, [rbp + 16]
+        );
     } else {
-        dynasm!(ops ; .arch x64 ; lea r13, [rsp + spill.bytes as i32]);
-    }
-    // The depth stays zero: the runtime derives it on first use. No helper
-    // or collection precedes the final initialized-frame publication below.
-    dynasm!(ops ; .arch x64
-        ; lea r14, [rbp + RECORD]
-        ; mov DWORD [r14 + abi::NATIVE_FRAME_DEPTH_OFFSET as i32], 0
-        ; mov r10, [r15 + NATIVE_FRAME_OFFSET as i32]
-        ; mov [r14 + abi::NATIVE_FRAME_CALLER_OFFSET as i32], r10
-    );
-    if shape.derived {
-        dynasm!(ops ; .arch x64 ; lea r11, [r10 + 1] ; mov [rbp + RETURN_FRAME], r11);
-    } else {
-        dynasm!(ops ; .arch x64 ; mov [rbp + RETURN_FRAME], r10);
+        emit_zero_scratch(ops, spill);
+        if spill.bytes == 0 {
+            dynasm!(ops ; .arch x64 ; mov r13, rsp);
+        } else {
+            dynasm!(ops ; .arch x64 ; lea r13, [rsp + spill.bytes as i32]);
+        }
+        // The depth stays zero: the runtime derives it on first use. No
+        // helper or collection precedes initialized-frame publication.
+        dynasm!(ops ; .arch x64
+            ; lea r14, [rbp + RECORD]
+            ; mov DWORD [r14 + abi::NATIVE_FRAME_DEPTH_OFFSET as i32], 0
+            ; mov r10, [r15 + NATIVE_FRAME_OFFSET as i32]
+            ; mov [r14 + abi::NATIVE_FRAME_CALLER_OFFSET as i32], r10
+        );
+        if shape.derived {
+            dynasm!(ops ; .arch x64 ; lea r11, [r10 + 1] ; mov [rbp + RETURN_FRAME], r11);
+        } else {
+            dynasm!(ops ; .arch x64 ; mov [rbp + RETURN_FRAME], r10);
+        }
     }
     // The continuation word (ABI return, no cold state), then the caller
     // return address. A direct entry's return address is the one saved at
@@ -356,30 +372,32 @@ pub(crate) fn emit_call_entry(
     if shape.derived {
         dynasm!(ops ; .arch x64 ; mov edx, otter_vm::value::tag::VALUE_HOLE as i32);
     }
-    let window_slots = if shape.lazy_window {
-        0
-    } else {
-        shape.register_count
-    };
-    dynasm!(ops
-        ; .arch x64
-        ; mov r11d, shape.function_id as i32
-        ; mov [r14], r11
-        ; mov r11, QWORD shape.header_word(window_slots) as i64
-        ; mov [r14 + 8], r11
-    );
-    if shape.lazy_window {
+    if !spill.deferred_frame {
+        let window_slots = if shape.lazy_window {
+            0
+        } else {
+            shape.register_count
+        };
         dynasm!(ops
             ; .arch x64
-            ; mov QWORD [r14 + NATIVE_FRAME_REGISTER_BASE_OFFSET as i32], 0
-            ; mov QWORD [r14 + NATIVE_FRAME_REGISTER_BASE_OFFSET as i32 + 8], 0
+            ; mov r11d, shape.function_id as i32
+            ; mov [r14], r11
+            ; mov r11, QWORD shape.header_word(window_slots) as i64
+            ; mov [r14 + 8], r11
         );
-    } else {
-        dynasm!(ops
-            ; .arch x64
-            ; mov [r14 + NATIVE_FRAME_REGISTER_BASE_OFFSET as i32], r13
-            ; mov QWORD [r14 + NATIVE_FRAME_REGISTER_BASE_OFFSET as i32 + 8], i32::from(shape.register_count)
-        );
+        if shape.lazy_window {
+            dynasm!(ops
+                ; .arch x64
+                ; mov QWORD [r14 + NATIVE_FRAME_REGISTER_BASE_OFFSET as i32], 0
+                ; mov QWORD [r14 + NATIVE_FRAME_REGISTER_BASE_OFFSET as i32 + 8], 0
+            );
+        } else {
+            dynasm!(ops
+                ; .arch x64
+                ; mov [r14 + NATIVE_FRAME_REGISTER_BASE_OFFSET as i32], r13
+                ; mov QWORD [r14 + NATIVE_FRAME_REGISTER_BASE_OFFSET as i32 + 8], i32::from(shape.register_count)
+            );
+        }
     }
     // A derived constructor is entered only by `[[Construct]]`; a base
     // constructor takes the request on its construct path, and any other
@@ -393,21 +411,29 @@ pub(crate) fn emit_call_entry(
         ; mov [r14 + NATIVE_FRAME_THIS_OFFSET as i32 + 8], rcx
         ; mov [r14 + NATIVE_FRAME_SELF_OFFSET as i32], rsi
         ; mov [r14 + NATIVE_FRAME_SELF_OFFSET as i32 + 8], r8
-        ; lea r11, [rbp + 16]
-        ; mov [r14 + abi::NATIVE_FRAME_ACTUALS_OFFSET as i32], r11
-        ; mov DWORD [r14 + abi::NATIVE_FRAME_DEPTH_OFFSET as i32 + 4], spill.safepoint as i32
     );
-    if spill.bytes == 0 {
-        dynasm!(ops ; .arch x64 ; mov QWORD [r14 + abi::NATIVE_FRAME_MACHINE_ROOTS_OFFSET as i32], 0);
-    } else {
-        dynasm!(ops ; .arch x64 ; mov [r14 + abi::NATIVE_FRAME_MACHINE_ROOTS_OFFSET as i32], rsp);
+    if !spill.deferred_frame {
+        dynasm!(ops ; .arch x64
+            ; lea r11, [rbp + 16]
+            ; mov [r14 + abi::NATIVE_FRAME_ACTUALS_OFFSET as i32], r11
+            ; mov DWORD [r14 + abi::NATIVE_FRAME_DEPTH_OFFSET as i32 + 4], spill.safepoint as i32
+        );
+        if spill.bytes == 0 {
+            dynasm!(ops ; .arch x64 ; mov QWORD [r14 + abi::NATIVE_FRAME_MACHINE_ROOTS_OFFSET as i32], 0);
+        } else {
+            dynasm!(ops ; .arch x64 ; mov [r14 + abi::NATIVE_FRAME_MACHINE_ROOTS_OFFSET as i32], rsp);
+        }
     }
     if shape.lazy_window {
-        dynasm!(ops ; .arch x64 ; lea r13, [rbp + 16]);
+        if !spill.deferred_frame {
+            dynasm!(ops ; .arch x64 ; lea r13, [rbp + 16]);
+        }
     } else {
         emit_fill_window(ops, shape);
     }
-    dynasm!(ops ; .arch x64 ; mov [r15 + NATIVE_FRAME_OFFSET as i32], r14);
+    if !spill.deferred_frame {
+        dynasm!(ops ; .arch x64 ; mov [r15 + NATIVE_FRAME_OFFSET as i32], r14);
+    }
     if let Some((underarity, back)) = cold.underarity {
         dynasm!(ops ; .arch x64 ; cmp r8d, i32::from(shape.param_count) ; jb =>underarity ; =>back);
     }
@@ -475,6 +501,60 @@ fn emit_window_publication(ops: &mut Assembler, register_count: u16) {
     );
 }
 
+/// Complete the reserved record before a helper may observe or collect it.
+/// Tier entries and records already published keep their roots and window.
+/// The canonical homes are frame-relative, so a register dump or private
+/// materialization call below them does not change their address. Only
+/// `r10`/`r11` and flags are clobbered; incoming values remain in their homes.
+pub(crate) fn emit_publish_deferred_frame(
+    ops: &mut Assembler,
+    _relocations: &mut RelocationCapture,
+    shape: EntryShape,
+    spill: SpillArea,
+) {
+    if !spill.deferred_frame {
+        return;
+    }
+    debug_assert!(shape.lazy_window && !shape.derived);
+    let published = ops.new_dynamic_label();
+    let window = (i32::from(shape.register_count) * 8 + 15) & !15;
+    let homes = RECORD - window - spill.bytes as i32;
+    dynasm!(ops ; .arch x64
+        ; test BYTE [rbp + RETURN_FRAME], UNPUBLISHED_FRAME as i8
+        ; jz =>published
+        ; mov r11d, shape.function_id as i32
+        ; mov [r14], r11
+        ; mov r11, QWORD shape.header_word(0) as i64
+        ; mov [r14 + 8], r11
+        ; mov QWORD [r14 + NATIVE_FRAME_REGISTER_BASE_OFFSET as i32], 0
+        ; mov QWORD [r14 + NATIVE_FRAME_REGISTER_BASE_OFFSET as i32 + 8], 0
+        ; lea r11, [rbp + 16]
+        ; mov [r14 + abi::NATIVE_FRAME_ACTUALS_OFFSET as i32], r11
+        ; mov r10, [r15 + NATIVE_FRAME_OFFSET as i32]
+        ; mov [r14 + abi::NATIVE_FRAME_CALLER_OFFSET as i32], r10
+        ; mov DWORD [r14 + abi::NATIVE_FRAME_DEPTH_OFFSET as i32], 0
+        ; mov DWORD [r14 + abi::NATIVE_FRAME_CALL_SITE_OFFSET as i32], spill.safepoint as i32
+    );
+    if spill.bytes == 0 {
+        dynasm!(ops ; .arch x64
+            ; mov QWORD [r14 + abi::NATIVE_FRAME_MACHINE_ROOTS_OFFSET as i32], 0
+        );
+    } else {
+        dynasm!(ops ; .arch x64
+            ; lea r11, [rbp + homes]
+            ; mov [r14 + abi::NATIVE_FRAME_MACHINE_ROOTS_OFFSET as i32], r11
+        );
+    }
+    if let Some(slot) = spill.scratch_slot {
+        dynasm!(ops ; .arch x64 ; mov QWORD [rbp + homes + (slot * 8) as i32], 0);
+    }
+    dynasm!(ops ; .arch x64
+        ; mov [rbp + RETURN_FRAME], r10
+        ; mov [r15 + NATIVE_FRAME_OFFSET as i32], r14
+        ; =>published
+    );
+}
+
 /// Emit the cold continuations of the call entry.
 pub(crate) fn emit_call_entry_cold(
     ops: &mut Assembler,
@@ -483,6 +563,7 @@ pub(crate) fn emit_call_entry_cold(
     view: &JitCompileSnapshot,
     shape: EntryShape,
     exits: ActivationExits,
+    spill: SpillArea,
     cold: CallEntryCold,
 ) {
     // A trampoline-staged entry: its caller anchor travels in the request.
@@ -513,7 +594,9 @@ pub(crate) fn emit_call_entry_cold(
     }
     if let Some((underarity, back)) = cold.underarity {
         let window = (i32::from(shape.register_count) * 8 + 15) & !15;
-        dynasm!(ops ; .arch x64 ; =>underarity ; lea r13, [r14 - window]);
+        dynasm!(ops ; .arch x64 ; =>underarity);
+        emit_publish_deferred_frame(ops, relocations, shape, spill);
+        dynasm!(ops ; .arch x64 ; lea r13, [r14 - window]);
         emit_fill_window(ops, shape);
         emit_window_publication(ops, shape.register_count);
         dynasm!(ops ; .arch x64 ; jmp =>back);
@@ -523,6 +606,7 @@ pub(crate) fn emit_call_entry_cold(
     // conversion does not apply to the created receiver.
     if let Some((construct, constructed)) = cold.construct {
         dynasm!(ops ; .arch x64 ; =>construct);
+        emit_publish_deferred_frame(ops, relocations, shape, spill);
         emit_take_construct_request(ops);
         dynasm!(ops
             ; .arch x64
@@ -551,7 +635,9 @@ pub(crate) fn emit_call_entry_cold(
         dynasm!(ops ; .arch x64 ; =>complete ; test rdx, rdx ; jnz =>exits.construct ; jmp =>constructed);
     }
     if let Some((prepare, prepared)) = cold.prepare {
-        dynasm!(ops ; .arch x64 ; =>prepare ; mov rdi, r15);
+        dynasm!(ops ; .arch x64 ; =>prepare);
+        emit_publish_deferred_frame(ops, relocations, shape, spill);
+        dynasm!(ops ; .arch x64 ; mov rdi, r15);
         emit_stub(
             ops,
             relocations,
@@ -594,6 +680,15 @@ fn emit_epilogue_to(
     spill: SpillArea,
     restore: Option<DynamicLabel>,
 ) {
+    let dormant = spill
+        .deferred_frame
+        .then(|| restore.unwrap_or_else(|| ops.new_dynamic_label()));
+    if let Some(dormant) = dormant {
+        dynasm!(ops ; .arch x64
+            ; test BYTE [rbp + RETURN_FRAME], UNPUBLISHED_FRAME as i8
+            ; jnz =>dormant
+        );
+    }
     dynasm!(ops
         ; .arch x64
         ; mov r11, [rbp + RETURN_FRAME]
@@ -605,6 +700,9 @@ fn emit_epilogue_to(
     if let Some(restore) = restore {
         dynasm!(ops ; .arch x64 ; jmp =>restore);
     } else {
+        if let Some(dormant) = dormant {
+            dynasm!(ops ; .arch x64 ; =>dormant);
+        }
         emit_restore(ops, kind);
     }
 }
@@ -641,6 +739,8 @@ pub(crate) fn emit_exits(
     dynasm!(ops
         ; .arch x64
         ; =>done
+        ; test BYTE [r14 + crate::entry::NATIVE_FRAME_FLAGS_OFFSET as i32], abi::NativeFrameFlags::CONSTRUCT as i8
+        ; jz =>no_ticket
         ; mov r11d, [r14 + abi::NATIVE_FRAME_CONSTRUCT_LAYOUT_OFFSET as i32]
         ; or r11, [r14 + abi::NATIVE_FRAME_SUPER_ORIGIN_OFFSET as i32]
         ; jz =>no_ticket

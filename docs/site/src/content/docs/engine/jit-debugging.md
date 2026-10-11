@@ -46,6 +46,18 @@ optimizing tier emits native code for AArch64 and x86_64 from the same Graph,
 allocation plans and frame reconstruction recipes. Each target owns instruction
 encoding and its register contract.
 
+Private JavaScript entries reserve the VM's one `Frame` carrier. A Graph body
+whose emitted operations cannot collect, reenter JavaScript, throw or poll a
+loop keeps only the incoming value words and caller return anchor initialized.
+It publishes the complete record at its first cold semantic boundary: eager
+deoptimization, receiver preparation, underarity or construction. Its ordinary
+return restores machine registers without publishing or unlinking a frame.
+The source owner and canonical root base are initialized together, before
+reconstruction or any collecting helper can observe them. Tier entry and OSR
+reuse the already published interpreter record and restore its previous root
+words on exit. Both native encoders consume the same admission proof; the
+platform C boundary remains separate from private JavaScript calls.
+
 Own-field Graph operations carry a `FieldLocation` with its storage bank and
 relative index. `LoadOwnField` and `StoreOwnField` keep address resolution inside
 the emitted access: inline fields use a direct receiver-relative instruction;

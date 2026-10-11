@@ -149,7 +149,15 @@ fn fixture(kind: Kind) -> crate::CompiledCode {
             scratch_slot: Some(slots.spill_tagged),
             safepoint: FIRST_SITE_SAFEPOINT,
             saved_pairs: 0,
+            deferred_frame: false,
         },
+        entry_shape: crate::call_linkage::EntryShape::of(
+            &view,
+            0,
+            otter_vm::native_abi::NativeFrameKind::Optimizing,
+            true,
+        )
+        .unwrap(),
         transitions: &transitions,
         deopt_runtime: 0,
         plan: &plan,

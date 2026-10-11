@@ -26,6 +26,10 @@
 //!   records the live frame set: collectors, stack snapshots and deopt walk it.
 //!   The innermost frame of the live compiled entry is the entry's
 //!   `JitCtx::native_frame`; [`VmThread::frame_cell`] names that cell.
+//!   A generated extent proved unable to collect, reenter, throw or poll may
+//!   reserve its record without initializing a Rust `Frame`. Its first cold
+//!   semantic boundary completes and publishes that same record before any
+//!   VM observer runs; an ordinary hit returns without publishing a frame.
 //! - Tagged values are frame-homed at safepoints; derived movable pointers are
 //!   recomputed after any allocating or reentrant call. Suspended compiled
 //!   callers resolve the exact return address owned by their immediate child

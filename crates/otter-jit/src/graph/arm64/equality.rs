@@ -19,8 +19,8 @@
 //! - Loose equality reaches the runtime only for an operand pair whose
 //!   comparison may run `ToPrimitive`/`ToNumber`, or for `null`/`undefined`
 //!   against a native function (the only cell that can be `[[IsHTMLDDA]]`).
-//!   The runtime completes the published `==`/`!=` itself, negation
-//!   included.
+//!   The runtime completes the explicit `==`/`!=` operation, negation
+//!   included; source records retain root and reconstruction ownership.
 //!
 //! # See also
 //! - `otter_vm::Interpreter::loose_equal_with_context` — the runtime case.
@@ -33,6 +33,7 @@ use super::{
 };
 use crate::Unsupported;
 use dynasmrt::{DynasmApi, DynasmLabelApi, dynasm};
+use otter_vm::ObjectProtocolValueOp;
 
 /// `null | NULLISH_BIT == undefined | NULLISH_BIT == NULLISH`; no other
 /// value maps there (cells never carry the immediate tag bit).
@@ -234,7 +235,18 @@ impl Codegen<'_> {
         self.emit_committed_call(
             node,
             abi::STUB_JIT_OBJECT_PROTOCOL_VALUE,
-            &[CommittedArgument::Value(a), CommittedArgument::Value(b)],
+            &[
+                CommittedArgument::Value(a),
+                CommittedArgument::Value(b),
+                CommittedArgument::Scalar(
+                    if negate {
+                        ObjectProtocolValueOp::LooseNotEqual
+                    } else {
+                        ObjectProtocolValueOp::LooseEqual
+                    }
+                    .encode_abi(),
+                ),
+            ],
             Some(destination),
         )?;
         dynasm!(self.ops ; .arch aarch64 ; =>done);
@@ -296,7 +308,18 @@ impl Codegen<'_> {
         self.emit_committed_call(
             node,
             abi::STUB_JIT_OBJECT_PROTOCOL_VALUE,
-            &[CommittedArgument::Value(a), CommittedArgument::Value(b)],
+            &[
+                CommittedArgument::Value(a),
+                CommittedArgument::Value(b),
+                CommittedArgument::Scalar(
+                    if condition == Condition::NotEqual {
+                        ObjectProtocolValueOp::LooseNotEqual
+                    } else {
+                        ObjectProtocolValueOp::LooseEqual
+                    }
+                    .encode_abi(),
+                ),
+            ],
             Some(destination),
         )?;
         dynasm!(self.ops ; .arch aarch64 ; =>done);

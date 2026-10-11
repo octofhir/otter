@@ -346,10 +346,19 @@ pub(crate) fn runtime_stub_bindings() -> Vec<otter_vm::JitRuntimeStubBinding> {
             abi::STUB_JIT_GLOBAL_DECLARATION_VALUE,
             jit_global_declaration_value_stub
         ),
-        binding(
-            abi::STUB_JIT_OBJECT_PROTOCOL_VALUE,
-            jit_object_protocol_value_stub as *const () as usize,
-        ),
+        {
+            const _: () = assert!(abi::STUB_JIT_OBJECT_PROTOCOL_VALUE.argument_count == 3);
+            const _: () = assert!(matches!(
+                abi::STUB_JIT_OBJECT_PROTOCOL_VALUE.signature,
+                abi::RuntimeStubSignature::ContextWords
+            ));
+            let entry: extern "C" fn(*mut JitCtx, u64, u64, u64) -> abi::NativeResultPair =
+                jit_object_protocol_value_stub;
+            binding(
+                abi::STUB_JIT_OBJECT_PROTOCOL_VALUE,
+                entry as *const () as usize,
+            )
+        },
         binding(
             abi::STUB_JIT_DELETE_OP,
             jit_delete_op_stub as *const () as usize,

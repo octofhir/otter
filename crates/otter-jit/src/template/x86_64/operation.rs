@@ -768,17 +768,17 @@ pub(crate) fn emit_operation(
             );
         }
         TemplateOp::ObjectProtocolValue {
-            operation: _,
+            operation,
             result,
             value0,
             value1,
-        } => emit_committed_value2(
+        } => protocol::emit_object_protocol_value(
             ops,
             relocations,
             transitions,
-            abi::STUB_JIT_OBJECT_PROTOCOL_VALUE,
+            operation,
             result,
-            Some(value0),
+            value0,
             value1,
             committed_throw,
             fatal,

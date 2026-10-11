@@ -222,6 +222,15 @@ use no packet storage, and literal allocation cannot deopt/replay after
 entering the canonical boundary. Source register indices and array-operand
 metadata addresses do not cross this ABI.
 
+Object-protocol committed calls pass two boxed operands and the VM-owned
+semantic operation word. Template and Graph choose that operation during
+lowering on both native targets. The runtime checks the complete word before
+binding or effects; it does not look up a safepoint or decode bytecode to choose
+semantics. Published source/root records still own collecting roots, throw
+routing and inline reconstruction. A successful result or rooted JavaScript
+throw completes the operation once, including coercions, Proxy traps and
+`@@hasInstance`; structural failure returns `Fatal`.
+
 Lexical allocations use the existing VM-owned `allocValue3` ABI and its Probe
 result domain on both native targets. `MakeFunction` passes three `undefined`
 words; `MakeClosure` passes context, lexical `this` and lexical `new.target`.

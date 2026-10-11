@@ -60,7 +60,7 @@ use dynasmrt::{DynamicLabel, DynasmApi, DynasmLabelApi, aarch64::Assembler, dyna
 use otter_vm::jit::{JitBodyGuard, JitElementRepr, JitGuardWidth, JitHoleBitmap};
 use otter_vm::native_abi::{self as abi, ExitAction, ExitReason, NativeResultStatus};
 use otter_vm::value::tag;
-use otter_vm::{JitCompileSnapshot, object::ShapeState};
+use otter_vm::{JitCompileSnapshot, ObjectProtocolValueOp, object::ShapeState};
 use rustc_hash::FxHashMap;
 
 use super::INSTANCEOF_CHAIN_BOUND;
@@ -3183,6 +3183,7 @@ impl<'a> Codegen<'a> {
             &[
                 CommittedArgument::Value(value),
                 CommittedArgument::Value(target),
+                CommittedArgument::Scalar(ObjectProtocolValueOp::Instanceof.encode_abi()),
             ],
             Some(destination),
         )?;

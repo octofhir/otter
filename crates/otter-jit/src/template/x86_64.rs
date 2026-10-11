@@ -16,6 +16,7 @@
 //!   slots ([`binding`]) with one committed cold owner for binding misses.
 //! - Iterator lifecycle, descriptor definitions, and class-value transitions
 //!   through shared VM descriptors.
+//! - Committed object-protocol values and explicit semantic words ([`protocol`]).
 //! - Actual-argument collection and intrinsic-apply forwarding through the
 //!   shared activation-window descriptors.
 //! - Canonical indexed loads and stores through committed element descriptors.
@@ -82,6 +83,8 @@ mod native_leaf;
 #[path = "x86_64/operation.rs"]
 pub(crate) mod operation;
 mod primitive_strings;
+#[path = "x86_64/protocol.rs"]
+mod protocol;
 pub(crate) mod shared_property;
 
 use dynasmrt::{DynamicLabel, DynasmApi, DynasmLabelApi, dynasm, x64::Assembler};

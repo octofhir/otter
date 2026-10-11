@@ -16,9 +16,9 @@
 //! # Invariants
 //! Every entry receives a live JIT context whose canonical
 //! [`Frame`](otter_vm::native_abi::Frame) publishes frame/register
-//! roots for the entire call. Binding/declaration/object-protocol/scalar entries
-//! receive only boxed values; the published function/PC selects a typed
-//! operation before semantics begin. Their JavaScript throws return as pure
+//! roots for the entire call. Object-protocol entries receive boxed values and
+//! an explicit typed operation word. Binding/declaration/scalar entries select
+//! their operation from the published function/PC. JavaScript throws return as pure
 //! exception values, while structural and completed terminal failures remain
 //! parked as `Fatal` results.
 //! Inlined operations keep their logical sources in code-owned safepoint
@@ -39,7 +39,7 @@ use otter_vm::{
     JitExceptionOutcome, NumericRuntimeOp, UnaryCoercionOp, Value, VmError,
     native_abi::{
         ClassRuntimeOp, CommittedValueError, ExitAction, ExitReason, IteratorRuntimeOutcome,
-        NativeResultPair, NativeResultStatus, SideExit, ValueLoadRuntimeOp,
+        NativeResultPair, NativeResultStatus, ObjectProtocolValueOp, SideExit, ValueLoadRuntimeOp,
     },
 };
 
@@ -800,21 +800,23 @@ pub(crate) extern "C" fn jit_delete_op_stub(
     super::park_result(ctx, result)
 }
 
-/// Complete the exact published object-protocol operation from two boxed
+/// Complete the producer's object-protocol operation from two boxed
 /// values. Proxy traps and `@@hasInstance` either commit one result or return
 /// one rooted JavaScript exception; no materialized fallback can replay them.
 pub(crate) extern "C" fn jit_object_protocol_value_stub(
     ctx: *mut JitCtx,
     value0_bits: u64,
     value1_bits: u64,
+    operation_word: u64,
 ) -> NativeResultPair {
     // SAFETY: the live `JitCtx` reentry contract.
     let ctx = unsafe { &mut *ctx };
-    let result = ctx
-        .runtime_call()
+    let result = ObjectProtocolValueOp::decode_abi(operation_word)
         .map_err(CommittedValueError::Fatal)
-        .and_then(|mut runtime| {
+        .and_then(|operation| {
+            let mut runtime = ctx.runtime_call().map_err(CommittedValueError::Fatal)?;
             runtime.object_protocol_values(
+                operation,
                 Value::from_bits(value0_bits),
                 Value::from_bits(value1_bits),
             )
@@ -1285,6 +1287,41 @@ mod tests {
             );
             assert!(matches!(ctx_error(ctx), Some(VmError::InvalidOperand)));
         });
+        with_frameless_ctx(|ctx| {
+            let result = jit_object_protocol_value_stub(
+                ctx,
+                Value::undefined().to_bits(),
+                Value::undefined().to_bits(),
+                ObjectProtocolValueOp::LooseEqual.encode_abi(),
+            );
+            assert_eq!(
+                result.validate(NativeResultDomain::Committed),
+                Some(NativeResultStatus::Fatal)
+            );
+            assert!(matches!(ctx_error(ctx), Some(VmError::InvalidOperand)));
+        });
+    }
+
+    #[test]
+    fn object_protocol_rejects_invalid_words_before_binding_or_semantics() {
+        for word in [22, 256, u64::MAX, 1u64 << 32, 1u64 << 63] {
+            with_frameless_ctx(|ctx| {
+                let original = unsafe { *((*ctx.native_frame).register_base() as *const Value) };
+                let result = jit_object_protocol_value_stub(
+                    ctx,
+                    Value::number_i32(1).to_bits(),
+                    Value::number_i32(1).to_bits(),
+                    word,
+                );
+                assert_eq!(
+                    result.validate(NativeResultDomain::Committed),
+                    Some(NativeResultStatus::Fatal)
+                );
+                assert!(matches!(ctx_error(ctx), Some(VmError::InvalidOperand)));
+                let current = unsafe { *((*ctx.native_frame).register_base() as *const Value) };
+                assert_eq!(current, original);
+            });
+        }
     }
 
     #[test]

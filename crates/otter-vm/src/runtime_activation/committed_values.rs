@@ -8,7 +8,8 @@
 //! - Generic binary arithmetic and relational operators for compiled sites
 //!   whose feedback is not numeric ([`BinaryOperator`]).
 //! - Rooted value kernels shared by interpreter and compiled callers.
-//! - [`RuntimeCall`] site decoding with no opcode/register ABI.
+//! - [`ObjectProtocolValueOp`] owns the checked compiled operation word.
+//! - [`RuntimeCall`] typed object operations and source-decoded scalar sites.
 //! - Side-channel-free JavaScript exception materialization for the committed
 //!   `NativeResultPair` domain.
 //!
@@ -17,8 +18,9 @@
 //!   collection, Proxy trap, getter, coercion, or nested JavaScript call. The
 //!   binary-operator kernels are the interpreter's and root both operands in
 //!   their own handle scope before the first coercion.
-//! - Function/PC identity is authoritative for the semantic operation; the
-//!   native ABI never receives an opcode, destination, or register index.
+//! - A compiled object operation is explicit; its source/root record owns
+//!   tracing and reconstruction. Scalar operations retain source decoding.
+//!   Neither boxed-value family receives a destination or register index.
 //! - Once a kernel begins it returns only a normal value or an error. Compiled
 //!   entries turn source errors into rooted JavaScript exception values and
 //!   retain an already completed terminal native/allocator/control failure;
@@ -26,6 +28,7 @@
 //! - No native-frame or register-window borrow survives JavaScript reentry.
 //!
 //! # See also
+//! - `crate::native_abi::RuntimeStubSignature::ContextWords`
 //! - `crate::native_abi::RuntimeStubSignature::CommittedValue2`
 //! - `crate::function_ops::Interpreter::instanceof_operator`
 //! - `crate::object_internal_ops::Interpreter::ordinary_has_property_value`
@@ -41,7 +44,7 @@ use super::RuntimeCall;
 
 /// Failure domain for a fixed committed value entry.
 ///
-/// Site decoding and activation validation cannot be caught by JavaScript.
+/// ABI/source decoding and activation validation cannot be caught by JavaScript.
 /// Source semantic failures retain ordinary throwable materialization. A
 /// completed native execution failure, or refusal while materializing its
 /// exception, is terminal even after operation entry and is never projected
@@ -109,7 +112,10 @@ impl CommittedValueError {
     }
 }
 
-/// Object-protocol semantics selected by one published bytecode site.
+/// Object-protocol semantics shared by interpreter and compiled callers.
+///
+/// Compiled entries pass the checked operation word explicitly. Published
+/// source/root records retain tracing and reconstruction ownership.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ObjectProtocolValueOp {
     /// ECMAScript `InstanceofOperator(value, target)`.
@@ -125,10 +131,10 @@ pub enum ObjectProtocolValueOp {
     LooseEqual,
     /// The negation of [`Self::LooseEqual`].
     LooseNotEqual,
-    /// A binary arithmetic or relational operator (`+ - * / % **`,
-    /// `< <= > >=`) over operands whose feedback is not numeric, including
-    /// every observable `ToPrimitive` / `ToNumeric` coercion and `+` string
-    /// concatenation.
+    /// A binary arithmetic, relational or bitwise operator (`+ - * / % **`,
+    /// `< <= > >= & | ^ << >> >>>`) over operands whose feedback is not
+    /// numeric, including every observable `ToPrimitive` / `ToNumeric`
+    /// coercion and `+` string concatenation.
     Binary(BinaryOperator),
 }
 
@@ -196,18 +202,63 @@ impl BinaryOperator {
 }
 
 impl ObjectProtocolValueOp {
-    fn from_opcode(op: Op) -> Result<Self, VmError> {
-        match op {
-            Op::Instanceof => Ok(Self::Instanceof),
-            Op::HasProperty => Ok(Self::HasProperty),
-            Op::GetPrototype => Ok(Self::GetPrototype),
-            Op::SetPrototype => Ok(Self::SetPrototype),
-            Op::LooseEqual => Ok(Self::LooseEqual),
-            Op::LooseNotEqual => Ok(Self::LooseNotEqual),
-            _ => BinaryOperator::from_opcode(op)
-                .map(Self::Binary)
-                .ok_or(VmError::InvalidOperand),
+    /// The scalar operation word passed after the two boxed operands.
+    #[must_use]
+    pub const fn encode_abi(self) -> u64 {
+        match self {
+            Self::Instanceof => 0,
+            Self::HasProperty => 1,
+            Self::GetPrototype => 2,
+            Self::SetPrototype => 3,
+            Self::LooseEqual => 4,
+            Self::LooseNotEqual => 5,
+            Self::Binary(BinaryOperator::Add) => 6,
+            Self::Binary(BinaryOperator::Sub) => 7,
+            Self::Binary(BinaryOperator::Mul) => 8,
+            Self::Binary(BinaryOperator::Div) => 9,
+            Self::Binary(BinaryOperator::Rem) => 10,
+            Self::Binary(BinaryOperator::Pow) => 11,
+            Self::Binary(BinaryOperator::LessThan) => 12,
+            Self::Binary(BinaryOperator::LessEq) => 13,
+            Self::Binary(BinaryOperator::GreaterThan) => 14,
+            Self::Binary(BinaryOperator::GreaterEq) => 15,
+            Self::Binary(BinaryOperator::BitwiseAnd) => 16,
+            Self::Binary(BinaryOperator::BitwiseOr) => 17,
+            Self::Binary(BinaryOperator::BitwiseXor) => 18,
+            Self::Binary(BinaryOperator::Shl) => 19,
+            Self::Binary(BinaryOperator::Shr) => 20,
+            Self::Binary(BinaryOperator::Ushr) => 21,
         }
+    }
+
+    /// Validate the complete operation word at the compiled ABI boundary.
+    /// No bytecode lookup or low-byte truncation selects the operation.
+    pub const fn decode_abi(word: u64) -> Result<Self, VmError> {
+        Ok(match word {
+            0 => Self::Instanceof,
+            1 => Self::HasProperty,
+            2 => Self::GetPrototype,
+            3 => Self::SetPrototype,
+            4 => Self::LooseEqual,
+            5 => Self::LooseNotEqual,
+            6 => Self::Binary(BinaryOperator::Add),
+            7 => Self::Binary(BinaryOperator::Sub),
+            8 => Self::Binary(BinaryOperator::Mul),
+            9 => Self::Binary(BinaryOperator::Div),
+            10 => Self::Binary(BinaryOperator::Rem),
+            11 => Self::Binary(BinaryOperator::Pow),
+            12 => Self::Binary(BinaryOperator::LessThan),
+            13 => Self::Binary(BinaryOperator::LessEq),
+            14 => Self::Binary(BinaryOperator::GreaterThan),
+            15 => Self::Binary(BinaryOperator::GreaterEq),
+            16 => Self::Binary(BinaryOperator::BitwiseAnd),
+            17 => Self::Binary(BinaryOperator::BitwiseOr),
+            18 => Self::Binary(BinaryOperator::BitwiseXor),
+            19 => Self::Binary(BinaryOperator::Shl),
+            20 => Self::Binary(BinaryOperator::Shr),
+            21 => Self::Binary(BinaryOperator::Ushr),
+            _ => return Err(VmError::InvalidOperand),
+        })
     }
 }
 
@@ -499,16 +550,15 @@ impl Interpreter {
 }
 
 impl RuntimeCall<'_> {
-    /// Complete the exact published object-protocol site over boxed values.
+    /// Complete the supplied object operation over boxed values.
+    ///
+    /// The published source/root record remains available to tracing and recovery.
     pub fn object_protocol_values(
         &mut self,
+        operation: ObjectProtocolValueOp,
         value0: Value,
         value1: Value,
     ) -> Result<Value, CommittedValueError> {
-        let operation = self
-            .published_opcode()
-            .and_then(ObjectProtocolValueOp::from_opcode)
-            .map_err(CommittedValueError::Fatal)?;
         let vm = unsafe { &mut *self.vm.as_ptr() };
         vm.record_jit_runtime_stub_class(crate::native_abi::RuntimeStubClass::Reentrant);
         vm.object_protocol_value(
@@ -647,5 +697,57 @@ impl RuntimeCall<'_> {
         )?;
         let _ = vm.take_error_detail();
         Ok(exception)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{BinaryOperator, ObjectProtocolValueOp, VmError};
+
+    #[test]
+    fn object_operation_words_roundtrip_without_truncation_or_aliases() {
+        use BinaryOperator as B;
+        use ObjectProtocolValueOp as O;
+
+        let operations = [
+            O::Instanceof,
+            O::HasProperty,
+            O::GetPrototype,
+            O::SetPrototype,
+            O::LooseEqual,
+            O::LooseNotEqual,
+            O::Binary(B::Add),
+            O::Binary(B::Sub),
+            O::Binary(B::Mul),
+            O::Binary(B::Div),
+            O::Binary(B::Rem),
+            O::Binary(B::Pow),
+            O::Binary(B::LessThan),
+            O::Binary(B::LessEq),
+            O::Binary(B::GreaterThan),
+            O::Binary(B::GreaterEq),
+            O::Binary(B::BitwiseAnd),
+            O::Binary(B::BitwiseOr),
+            O::Binary(B::BitwiseXor),
+            O::Binary(B::Shl),
+            O::Binary(B::Shr),
+            O::Binary(B::Ushr),
+        ];
+        let mut words = std::collections::BTreeSet::new();
+        for operation in operations {
+            let word = operation.encode_abi();
+            assert!(words.insert(word), "operation words must be unique");
+            assert_eq!(O::decode_abi(word).unwrap(), operation);
+            for high_bit in [1 << 8, 1 << 32, 1 << 63] {
+                assert!(matches!(
+                    O::decode_abi(word | high_bit),
+                    Err(VmError::InvalidOperand)
+                ));
+            }
+        }
+        assert_eq!(words.len(), 22);
+        for word in [22, 255, u64::MAX] {
+            assert!(matches!(O::decode_abi(word), Err(VmError::InvalidOperand)));
+        }
     }
 }

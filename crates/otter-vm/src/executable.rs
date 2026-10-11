@@ -342,28 +342,31 @@ impl CodeBlock {
     /// A body spliced without that window cannot represent these operations.
     #[must_use]
     pub fn requires_argument_frame(&self) -> bool {
-        self.needs_arguments
-            || self.has_rest
-            || self
-                .code
-                .iter()
-                .any(|instruction| self.op(instruction) == Op::CallForwardArguments)
+        self.needs_arguments || self.has_rest || self.forwards_arguments()
+    }
+
+    /// Whether the body forwards its actual arguments to a call
+    /// (`f.apply(thisArg, arguments)`).
+    #[must_use]
+    pub fn forwards_arguments(&self) -> bool {
+        self.code
+            .iter()
+            .any(|instruction| self.op(instruction) == Op::CallForwardArguments)
     }
 
     /// Whether a body spliced into its caller still serves every read of its
-    /// actual arguments: it has no rest list, never materializes or
-    /// forwards `arguments`, and reads it only as an elided
-    /// `arguments.length` or `arguments[i]`, which the splice answers from
-    /// the call's argument values (and a deopt from the recorded actuals).
+    /// actual arguments: it has no rest list, never materializes
+    /// `arguments`, and reads it only as an elided `arguments.length` or
+    /// `arguments[i]`, or forwards it to a call, which the splice answers
+    /// from the call's argument values (and a deopt from the recorded
+    /// actuals).
     #[must_use]
     pub fn splices_without_argument_frame(&self) -> bool {
         !self.has_rest
-            && !self.code.iter().any(|instruction| {
-                matches!(
-                    self.op(instruction),
-                    Op::CallForwardArguments | Op::CollectArguments
-                )
-            })
+            && !self
+                .code
+                .iter()
+                .any(|instruction| self.op(instruction) == Op::CollectArguments)
     }
 
     /// Build JIT feedback/layout metadata over this exact immutable CodeBlock.

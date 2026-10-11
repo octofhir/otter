@@ -1121,8 +1121,10 @@ impl<'a> Builder<'a> {
                     this,
                     closure,
                     new_target,
-                    arguments: (code.exposes_legacy_arguments() || code.needs_arguments())
-                        .then(|| arguments.iter().copied().collect()),
+                    arguments: (code.exposes_legacy_arguments()
+                        || code.needs_arguments()
+                        || code.forwards_arguments())
+                    .then(|| arguments.iter().copied().collect()),
                 },
                 depth,
                 continuation,
@@ -2717,7 +2719,7 @@ impl<'a> Builder<'a> {
     // ------------------------------------------------------------------
 
     fn visit_load_property(&mut self, instruction: &Instruction) {
-        if self.try_accessor_call(instruction, None) {
+        if self.try_accessor_call(instruction, None) || self.load_receiver_method(instruction) {
             return;
         }
         let byte_pc = instruction.byte_pc;
@@ -3490,12 +3492,62 @@ impl<'a> Builder<'a> {
         true
     }
 
+    /// A named read of the method the site's receiver inherits, once the
+    /// receiver is proved to have the hidden class the method's guard names:
+    /// the guarded holder slot, which a call of the read value then enters
+    /// directly or splices.
+    fn load_receiver_method(&mut self, instruction: &Instruction) -> bool {
+        let byte_pc = instruction.byte_pc;
+        if self.exited_for(ExitReason::ShapeGuard) || self.exited_for(ExitReason::IdentityGuard) {
+            return false;
+        }
+        let view: &'a JitCompileSnapshot = self.view;
+        let Some([method]) = view.direct_methods.get(&byte_pc).map(Vec::as_slice) else {
+            return false;
+        };
+        if method.guard.accessor_byte.is_some() {
+            return false;
+        }
+        let object = self.read(instruction.reads[0]);
+        let object = self.tagged(object);
+        if self.known_shapes(object).as_deref() != Some(&[method.guard.recv_shape][..]) {
+            return false;
+        }
+        let value = self.add(
+            Kind::LoadGuardedMethod {
+                byte_pc,
+                target: 0,
+                receiver_proved: true,
+            },
+            &[object],
+            Repr::Tagged,
+        );
+        self.write(instruction.writes[0], value);
+        true
+    }
+
+    /// The direct method a read of this body's guarded method `node` names.
+    fn loaded_method(&self, node: NodeId) -> Option<&'a otter_vm::jit::JitDirectMethod> {
+        let data = self.graph.node(node);
+        let Kind::LoadGuardedMethod {
+            byte_pc, target, ..
+        } = data.kind
+        else {
+            return None;
+        };
+        if data.origin != self.graph.origin {
+            return None;
+        }
+        let view: &'a JitCompileSnapshot = self.view;
+        view.direct_methods.get(&byte_pc)?.get(usize::from(target))
+    }
+
     /// `dst = callee.apply(this, arguments)` over the activation's own
     /// `arguments`, never materialized: once the method is proved to be
     /// `%Function.prototype.apply%` and no arguments object exists, a call
     /// of `callee` with the activation's actual arguments, each mapped
-    /// formal read from where it lives now. An inlined body has no
-    /// activation whose actuals it could pass.
+    /// formal read from where it lives now. A spliced body passes its
+    /// call's argument values.
     fn visit_call_forward(&mut self, instruction: &Instruction) {
         let (Some(method), Some(callee), Some(this)) = (
             instruction.register(1),
@@ -3507,11 +3559,21 @@ impl<'a> Builder<'a> {
         let Some(apply) = self.view.forward_apply_native_ref else {
             return self.generic(instruction);
         };
-        if self.inline.is_some() || self.exited_for(ExitReason::IdentityGuard) {
+        if self.exited_for(ExitReason::IdentityGuard) {
             return self.generic(instruction);
         }
         if !self.view.instructions[self.pc as usize].call_attempted {
             return self.deopt(DeoptReason::InsufficientFeedback);
+        }
+        if let Some(actuals) = self
+            .inline
+            .as_ref()
+            .and_then(|inline| inline.caller.arguments.clone())
+        {
+            return self.emit_spliced_forward(instruction, (method, callee, this), apply, &actuals);
+        }
+        if self.inline.is_some() {
+            return self.generic(instruction);
         }
         let method = self.read(method);
         let method = self.tagged(method);
@@ -3560,6 +3622,76 @@ impl<'a> Builder<'a> {
         let lazy = self.lazy_state(Some((destination, node)));
         self.graph.node_mut(node).lazy = Some(lazy);
         self.write(destination, node);
+    }
+
+    /// `callee.apply(this, arguments)` in a spliced body, whose actual
+    /// arguments are the call's `actuals`: once `apply` is proved, the call
+    /// of `callee` with those values, each mapped formal's current value in
+    /// place of its actual, which a known target may splice in turn.
+    fn emit_spliced_forward(
+        &mut self,
+        instruction: &Instruction,
+        (method, callee, this): (u16, u16, u16),
+        apply: u32,
+        actuals: &[NodeId],
+    ) {
+        let method = self.read(method);
+        let method = self.tagged(method);
+        self.add(Kind::CheckNative(apply), &[method], Repr::None);
+        let callee = self.read(callee);
+        let callee = self.tagged(callee);
+        let this = self.read(this);
+        let this = self.tagged(this);
+        let mut arguments: SmallVec<[NodeId; 8]> = actuals.iter().copied().collect();
+        let slots_byte = self.view.context_layout.slots_byte as i32;
+        let view = self.view;
+        for (argument_index, storage) in view.code_block.forwarded_argument_bindings() {
+            let index = usize::from(argument_index);
+            if index >= arguments.len() {
+                continue;
+            }
+            arguments[index] = match storage {
+                otter_bytecode::ArgumentBindingStorage::Register { reg } => {
+                    let value = self.read(reg);
+                    self.tagged(value)
+                }
+                otter_bytecode::ArgumentBindingStorage::Context { reg, slot } => {
+                    let context = self.read(reg);
+                    let context = self.tagged(context);
+                    let offset = slots_byte + i32::from(slot) * 8;
+                    self.add(Kind::LoadTaggedField(offset), &[context], Repr::Tagged)
+                }
+            };
+        }
+        for argument in &mut arguments {
+            *argument = self.tagged(*argument);
+        }
+        // A method read through its holder slot names its target.
+        if let Some(method) = self.loaded_method(callee) {
+            let plan = method.callee.plan;
+            if let Some(body) = method.body.as_ref()
+                && self.binds_this_as_is(body, plan, this)
+                && self.inline_call(instruction, body, plan, callee, this, &arguments)
+            {
+                return;
+            }
+            let destination = Some(instruction.writes[0]);
+            return self.emit_receiver_call(
+                instruction,
+                callee,
+                this,
+                &arguments,
+                Some(plan),
+                destination,
+            );
+        }
+        let plan = self
+            .view
+            .direct_callees
+            .get(&instruction.byte_pc)
+            .filter(|targets| targets.len() == 1)
+            .map(|targets| targets[0].plan);
+        self.emit_call_with_receiver(instruction, callee, this, &arguments, plan);
     }
 
     /// `f.call(thisArg, ...args)` once `%Function.prototype.call%` is proved:

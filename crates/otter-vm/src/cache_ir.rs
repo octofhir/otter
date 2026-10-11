@@ -9,6 +9,8 @@
 //!
 //! - [`ResolvedDataSlot`] / [`resolve_atom_data_slot`] — where a named data
 //!   property lives and what it holds.
+//! - [`resolve_inherited_atom_data_slot`] — the same answer for a receiver
+//!   known only by its prototype, before it owns the key.
 //! - [`resolve_absent_atom`] — a key no link of an ordinary chain owns.
 //! - [`ResolvedAccessorSlot`] / [`resolve_atom_inherited_accessor`] — an
 //!   accessor a prototype owns, and the getter and setter its cell holds.
@@ -79,7 +81,18 @@ pub(crate) fn resolve_atom_data_slot(
     if own.hit.is_some() || object::state(obj, heap).is_opaque() {
         return None;
     }
-    let first = object::prototype(obj, heap)?;
+    resolve_inherited_atom_data_slot(object::prototype(obj, heap)?, heap, key)
+}
+
+/// Resolve ordinary data that a receiver without the key inherits from the
+/// chain starting at `first`, its prototype, with that chain's proof.
+/// Accessors, absent properties and opaque lookup state return `None`.
+#[must_use]
+pub(crate) fn resolve_inherited_atom_data_slot(
+    first: JsObject,
+    heap: &otter_gc::GcHeap,
+    key: AtomizedPropertyKey<'_>,
+) -> Option<ResolvedDataSlot> {
     let validity = chain_validity(first, heap)?;
     let mut proto = first;
     for _ in 0..object::PROTO_CHAIN_HARD_CAP {

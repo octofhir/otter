@@ -48,6 +48,10 @@ use inline_snapshot_budget::InlineSnapshotBudget;
 #[path = "jit_field_types.rs"]
 mod field_types;
 
+#[path = "jit_receiver_methods.rs"]
+mod receiver_methods;
+use receiver_methods::ConstructReceiver;
+
 /// Counted calls past which a hot loop's function is optimized for its entry
 /// before any of its loops is entered through OSR.
 const OSR_ENTRY_TIER_MIN_ENTRIES: u64 = 16;
@@ -2307,6 +2311,7 @@ impl Interpreter {
         fid: u32,
         tier: jit_debug::JitDebugTier,
         budget: &mut InlineSnapshotBudget,
+        receiver: Option<ConstructReceiver>,
     ) -> Option<std::sync::Arc<jit::JitCompileSnapshot>> {
         // An inline body shares the physical caller's active-global cells.
         // Source identity alone does not make a foreign realm's globals active.
@@ -2331,6 +2336,9 @@ impl Interpreter {
             self.bake_binding_hit_proofs(&mut body, context, fid);
             self.bake_property_cache_ir(&mut body, context);
             self.bake_call_site_plans(&mut body, context, fid, tier, budget);
+            if let Some(receiver) = receiver {
+                self.bake_receiver_methods(&mut body, context, receiver, tier, budget);
+            }
             self.bake_guarded_method_calls(&mut body);
             self.bake_instanceof_cells(&mut body);
             self.bake_forward_apply(&mut body);
@@ -2620,10 +2628,10 @@ impl Interpreter {
                     continue;
                 };
                 let direct_ineligible = !callee.admits_generated_call(unresolved_call_kind);
-                // A body that materializes or forwards `arguments`, or takes a
-                // rest list, reads the actual-argument window its generated
-                // caller publishes, so it keeps direct linkage; elided
-                // `arguments` reads are served from the call's values.
+                // A body that materializes `arguments`, or takes a rest list,
+                // reads the actual-argument window its generated caller
+                // publishes, so it keeps direct linkage; elided `arguments`
+                // reads and forwarding are served from the call's values.
                 let inline_ineligible =
                     direct_ineligible || !callee.splices_without_argument_frame();
                 if inline_ineligible {
@@ -2659,6 +2667,7 @@ impl Interpreter {
                     );
                     continue;
                 }
+                let mut construct_receiver = None;
                 let direct_call_outcome = if let Some(mut plan) =
                     self.current_direct_callee_plan(callee)
                 {
@@ -2669,6 +2678,10 @@ impl Interpreter {
                             .construct_family_at(instruction_pc as usize)
                             .and_then(|family| {
                                 self.bake_receiver_allocation_plan(callee_fid, family)
+                            })
+                            .map(|(allocation, receiver)| {
+                                construct_receiver = Some(receiver);
+                                allocation
                             })
                     } else {
                         None
@@ -2761,8 +2774,13 @@ impl Interpreter {
                 {
                     continue;
                 }
-                let Some(body) = self.bake_inline_body(&callee_context, callee_fid, tier, budget)
-                else {
+                let Some(body) = self.bake_inline_body(
+                    &callee_context,
+                    callee_fid,
+                    tier,
+                    budget,
+                    construct_receiver,
+                ) else {
                     self.record_jit_inline_candidate(
                         fid,
                         instruction_pc,
@@ -3045,7 +3063,7 @@ impl Interpreter {
         let body = (tier == jit_debug::JitDebugTier::Optimizing
             && !method.requires_argument_frame()
             && method.admits_graph_inlining())
-        .then(|| self.bake_inline_body(&method_context, target.method_fid, tier, budget))
+        .then(|| self.bake_inline_body(&method_context, target.method_fid, tier, budget, None))
         .flatten();
         Ok(jit::JitDirectMethod {
             target_index,
@@ -3065,7 +3083,7 @@ impl Interpreter {
         &self,
         base_function_id: u32,
         family_id: u64,
-    ) -> Option<jit::JitReceiverAllocationPlan> {
+    ) -> Option<(jit::JitReceiverAllocationPlan, ConstructReceiver)> {
         let (layout, new_target_function_id, new_target_is_class) =
             self.finalized_constructor_layout_for_id(family_id, base_function_id)?;
         let (root_handle, prototype) = self
@@ -3088,6 +3106,7 @@ impl Interpreter {
             .gc_heap
             .read_payload(layout, |body| body.preparation_validity())?;
         let prototype_validity = self.bake_prototype_validity(&cell)?;
+        let mut initial_shape = root_handle;
         let (receiver_shape, initial_field_count) = match (
             self.simple_constructor_init_cache
                 .get(&base_function_id)
@@ -3113,6 +3132,7 @@ impl Interpreter {
                     let owner = crate::object::field_type::owner(shape, slot as u32)?;
                     crate::object::field_type::observe_owner(owner, Value::undefined());
                 }
+                initial_shape = shape;
                 (
                     self.bake_shape(shape)?,
                     u8::try_from(init.fields.len()).ok()?,
@@ -3123,7 +3143,7 @@ impl Interpreter {
         self.jit_compile_roots
             .borrow_mut()
             .push(crate::jit_roots::CompilationRoot::Family(layout));
-        Some(jit::JitReceiverAllocationPlan {
+        let plan = jit::JitReceiverAllocationPlan {
             new_target_function_id,
             new_target_is_class,
             family_id,
@@ -3133,7 +3153,13 @@ impl Interpreter {
             inline_capacity: u8::try_from(inline_capacity).ok()?,
             prototype_validity: Some(prototype_validity),
             prototype_root,
-        })
+        };
+        self.shape_runtime
+            .register_shape(&self.gc_heap, initial_shape);
+        let receiver = ConstructReceiver {
+            shape: crate::object::shape_body::id_of(initial_shape),
+        };
+        Some((plan, receiver))
     }
 
     /// Bake one inline-method candidate body for a `(method, receiver shape)`
@@ -3166,7 +3192,7 @@ impl Interpreter {
         }
         let method_view = match body {
             Some(body) => body,
-            None => self.bake_inline_body(context, target.method_fid, tier, budget)?,
+            None => self.bake_inline_body(context, target.method_fid, tier, budget, None)?,
         };
         // Resolve every body `LoadProperty`/`StoreProperty` to a logical own
         // field; bail out if a property is absent or an accessor. The shape
@@ -3368,7 +3394,8 @@ mod tests {
                     &context,
                     0,
                     crate::jit_debug::JitDebugTier::Optimizing,
-                    &mut budget
+                    &mut budget,
+                    None
                 )
                 .is_none()
         );

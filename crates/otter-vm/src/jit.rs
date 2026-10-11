@@ -1778,6 +1778,15 @@ pub struct JitArrayStorage {
     pub slab_dirty_end_from_base: i32,
     /// Signed offset of the slab's `GcHeader` from the element base.
     pub slab_header_from_base: i32,
+    /// `u32` compressed handle of the element slab.
+    pub slab_byte: u32,
+    /// GC header word of a young tagged element slab with a zero size;
+    /// generated code ORs the cell size in at
+    /// [`JIT_GC_HEADER_SIZE_BYTES_OFFSET`].
+    pub young_slab_header_word: u64,
+    /// Largest capacity of a slab allocated young: a bigger cell is a large
+    /// object.
+    pub max_young_capacity: u32,
     /// Element base pointer.
     pub base_byte: u32,
     /// Kind byte of tagged storage, whose holes are the hole sentinel.
@@ -1802,6 +1811,12 @@ impl JitArrayStorage {
             slab_dirty_start_from_base: crate::array::elements::DIRTY_START_FROM_DATA_BYTE,
             slab_dirty_end_from_base: crate::array::elements::DIRTY_END_FROM_DATA_BYTE,
             slab_header_from_base: crate::array::elements::HEADER_FROM_DATA_BYTE,
+            slab_byte: header + crate::array::ARRAY_BODY_SLAB_OFFSET as u32,
+            young_slab_header_word: crate::array::elements::ELEMENT_SLAB_BODY_TYPE_TAG as u64
+                | ((JIT_GC_YOUNG_FLAG as u64) << (8 * otter_gc::header::HEADER_FLAGS_BYTE_OFFSET)),
+            max_young_capacity: ((otter_gc::page::LARGE_OBJECT_THRESHOLD
+                - crate::array::elements::HEADER_FROM_DATA_BYTE.unsigned_abs() as usize)
+                / 8) as u32,
             base_byte: header + crate::array::ARRAY_BODY_ELEMENTS_PTR_OFFSET as u32,
             tagged_kind: crate::array::DENSE_ELEMENT_KIND_TAGGED as u8,
             numeric: JitHoleBitmap {

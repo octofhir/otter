@@ -7,6 +7,7 @@
 //! - [`emit_closure`]: `MakeClosure` / `MakeFunction` carved from a
 //!   [`otter_vm::jit::JitClosureAllocationPlan`].
 //! - [`emit_bigint64`]: a one-digit BigInt carved from an `i64`.
+//! - [`emit_grow_tagged_slab`]: an Array's grown tagged element storage.
 //! - Empty/static literal shells and dense slabs use the same LAB probe.
 //! - Constructor receivers prove their live finalized family and current
 //!   prototype, then use the shared LAB owner before callee publication.
@@ -55,6 +56,8 @@ pub(crate) use bigint::{emit_bigint64, emit_unbox_bigint64};
 
 mod empty;
 pub(crate) use empty::emit_empty_literal;
+mod slab;
+pub(crate) use slab::emit_grow_tagged_slab;
 mod literal;
 pub(crate) use literal::{emit_array_literal, emit_object_literal};
 mod receiver;

@@ -7,7 +7,9 @@
 //! - strict assignment-target validation
 //!
 //! # Invariants
-//! - Stores go through the same binding paths as declarations.
+//! - Assignment leaves use checked PutValue; declaration leaves initialize.
+//! - Identifier assignment saves the selected with/eval/global reference
+//!   before value extraction or a default initializer can change its base.
 //! - §13.15.2 — when a sloppy direct eval's extension may intercept an
 //!   identifier target, its reference is resolved (`ResolveLookupRef`)
 //!   before the right-hand side runs and stored through (`StoreRef`) after.
@@ -15,11 +17,15 @@
 //! # See also
 //! - `destructuring` and `expr`
 
+use crate::assignment_reference::{
+    PreparedIdentifierTarget, load_prepared_identifier, prepare_identifier_target,
+    store_prepared_identifier,
+};
 use crate::compiler::NameRef;
 use crate::*;
 
 enum PreparedAssignmentTarget {
-    Identifier(String),
+    Identifier(PreparedIdentifierTarget),
     StaticMember { obj_reg: u16, name_idx: u32 },
     ComputedMember { obj_reg: u16, key_reg: u16 },
     PrivateField { obj_reg: u16, key_reg: u16 },
@@ -401,32 +407,8 @@ pub(crate) fn compile_assignment_with(
             }
         });
     }
-    let active_with_envs = cx.active_with_envs.clone();
-    let with_ref = emit_with_binding_probe(cx, &name, &active_with_envs, span)?;
-    // An eval extension may intercept the name: pin the reference's base
-    // before the RHS runs, so a binding the RHS's eval creates is not the
-    // store target (§13.15.2, §9.1.2.1).
-    let eval_ref = cx.emit_resolve_ref(&name, &reference, span);
-    // §6.2.5.6 — a strict assignment to an unresolvable identifier
-    // throws off the reference resolved BEFORE the RHS runs: snapshot
-    // the global binding's existence now so a RHS side effect that
-    // creates the property cannot legitimize the store.
-    let strict_global_probe = if matches!(reference, NameRef::Global(None))
-        && cx.is_strict
-        && with_ref.is_none()
-        && compound_op.is_none()
-    {
-        let exists = cx.alloc_scratch();
-        let name_idx = cx.intern_string_constant(&name);
-        cx.emit(
-            Op::GlobalBindingExists,
-            [Operand::Register(exists), Operand::ConstIndex(name_idx)],
-            span,
-        );
-        Some(exists)
-    } else {
-        None
-    };
+    let target =
+        prepare_identifier_target(cx, name.clone(), reference, compound_op.is_none(), span)?;
     let value = match compound_op {
         // §13.15.2 — plain `IdentifierRef = AnonymousFunctionDefinition`
         // performs NamedEvaluation, inferring the target's name.
@@ -436,26 +418,9 @@ pub(crate) fn compile_assignment_with(
         None => compile_expr(cx, &a.right, span)?,
         Some(op) => {
             let current = cx.alloc_scratch();
-            let mut with_done = None;
-            if let Some(probe) = &with_ref {
-                let fallback =
-                    cx.emit_branch_placeholder(Op::JumpIfFalse, Some(probe.found_reg), span);
-                crate::with_statement::emit_with_get_binding_value(
-                    cx,
-                    current,
-                    probe.object_reg,
-                    &name,
-                    span,
-                );
-                with_done = Some(cx.emit_branch_placeholder(Op::Jump, None, span));
-                cx.patch_branch_to_here(fallback);
-            }
             // §13.15.2 compound assignment reads the target via GetValue
             // first, so a TDZ access throws before the RHS evaluates.
-            cx.emit_name_load(current, &name, &reference, false, span);
-            if let Some(done) = with_done {
-                cx.patch_branch_to_here(done);
-            }
+            load_prepared_identifier(cx, &target, current, span);
             let rhs = compile_expr(cx, &a.right, span)?;
             let dst = cx.alloc_scratch();
             cx.emit(
@@ -470,41 +435,7 @@ pub(crate) fn compile_assignment_with(
             dst
         }
     };
-    let mut with_store_done = None;
-    if let Some(probe) = &with_ref {
-        let fallback = cx.emit_branch_placeholder(Op::JumpIfFalse, Some(probe.found_reg), span);
-        crate::with_statement::emit_with_set_mutable_binding(
-            cx,
-            probe.object_reg,
-            &name,
-            value,
-            span,
-        );
-        with_store_done = Some(cx.emit_branch_placeholder(Op::Jump, None, span));
-        cx.patch_branch_to_here(fallback);
-    }
-    match (eval_ref, strict_global_probe) {
-        (Some(ref_reg), _) => cx.emit_store_ref(value, ref_reg, &name, &reference, span),
-        (None, Some(exists)) => {
-            // §9.1.1.4 global SetMutableBinding; the strict store re-checks
-            // the binding the pre-RHS snapshot saw.
-            let name_idx = cx.intern_string_constant(&name);
-            cx.emit(
-                Op::StoreGlobalChecked,
-                [
-                    Operand::Register(value),
-                    Operand::ConstIndex(name_idx),
-                    Operand::Register(exists),
-                ],
-                span,
-            );
-        }
-        (None, None) => cx.emit_name_assign(value, &name, &reference, span),
-    }
-    cx.emit_module_export_mirror(&name, value, span);
-    if let Some(done) = with_store_done {
-        cx.patch_branch_to_here(done);
-    }
+    store_prepared_identifier(cx, target, value, span);
     Ok(value)
 }
 
@@ -520,15 +451,11 @@ pub(crate) fn compile_logical_assignment(
     // so `base[key()] ||= rhs` never re-runs `key()`.
     enum LogicalTarget {
         Ident {
-            name: String,
+            target: PreparedIdentifierTarget,
             /// §13.15.2 NamedEvaluation applies only to a DIRECT
             /// IdentifierReference target — a parenthesized cover
             /// (`(x) ||= fn`) must not name the function.
             direct_identifier: bool,
-            reference: NameRef,
-            /// Reference pinned before the RHS when an eval extension
-            /// may intercept the name (§13.15.2).
-            eval_ref: Option<u16>,
         },
         Prepared(PreparedAssignmentTarget),
     }
@@ -538,33 +465,12 @@ pub(crate) fn compile_logical_assignment(
             let load = cx.alloc_scratch();
             let reference = cx.resolve_ref(&name);
             // §13.15.2 — the reference resolves once, before the RHS.
-            let eval_ref = cx.emit_resolve_ref(&name, &reference, span);
-            match reference {
-                // §13.15.2 step 2 — `GetValue(lref)` runs before the
-                // short-circuit test, so a TDZ binding raises here.
-                NameRef::Binding(_) | NameRef::Global(Some(_)) => {
-                    cx.emit_name_load(load, &name, &reference, false, span);
-                }
-                NameRef::Global(None) => {
-                    let name_idx = cx.intern_string_constant(&name);
-                    let op = if cx.is_strict {
-                        Op::LoadGlobalOrThrow
-                    } else {
-                        Op::LoadGlobalOrUndefined
-                    };
-                    cx.emit(
-                        op,
-                        [Operand::Register(load), Operand::ConstIndex(name_idx)],
-                        span,
-                    );
-                }
-            }
+            let target = prepare_identifier_target(cx, name, reference, false, span)?;
+            load_prepared_identifier(cx, &target, load, span);
             (
                 LogicalTarget::Ident {
-                    name,
+                    target,
                     direct_identifier: id.span.start == a.span.start,
-                    reference,
-                    eval_ref,
                 },
                 load,
             )
@@ -782,26 +688,17 @@ pub(crate) fn compile_logical_assignment(
     // ALREADY-EVALUATED Reference.
     let new_value = match &target {
         LogicalTarget::Ident {
-            name,
+            target,
             direct_identifier: true,
             ..
-        } => crate::expr::compile_expr_with_inferred_name(cx, &a.right, name, span)?,
+        } => crate::expr::compile_expr_with_inferred_name(cx, &a.right, &target.name, span)?,
         LogicalTarget::Ident { .. } | LogicalTarget::Prepared(_) => {
             compile_expr(cx, &a.right, span)?
         }
     };
     match target {
-        LogicalTarget::Ident {
-            name,
-            reference,
-            eval_ref,
-            ..
-        } => {
-            match eval_ref {
-                Some(ref_reg) => cx.emit_store_ref(new_value, ref_reg, &name, &reference, span),
-                None => cx.emit_name_assign(new_value, &name, &reference, span),
-            }
-            cx.emit_module_export_mirror(&name, new_value, span);
+        LogicalTarget::Ident { target, .. } => {
+            store_prepared_identifier(cx, target, new_value, span);
         }
         LogicalTarget::Prepared(prepared) => {
             assign_prepared_target(cx, prepared, new_value, span)?;
@@ -841,7 +738,10 @@ pub(crate) fn assign_to_target(
         }
         AssignmentTarget::AssignmentTargetIdentifier(id) => {
             let name = id.name.as_str().to_string();
-            store_identifier_checked(cx, &name, value_reg, span)
+            let reference = cx.resolve_ref(&name);
+            let target = prepare_identifier_target(cx, name, reference, true, span)?;
+            store_prepared_identifier(cx, target, value_reg, span);
+            Ok(())
         }
         AssignmentTarget::StaticMemberExpression(member) => {
             // §13.15.1 — the web-compat call-target exemption never
@@ -945,9 +845,12 @@ fn prepare_assignment_target(
 ) -> Result<Option<PreparedAssignmentTarget>, CompileError> {
     use oxc_ast::ast::AssignmentTarget;
     match target {
-        AssignmentTarget::AssignmentTargetIdentifier(id) => Ok(Some(
-            PreparedAssignmentTarget::Identifier(id.name.as_str().to_string()),
-        )),
+        AssignmentTarget::AssignmentTargetIdentifier(id) => {
+            let name = id.name.as_str().to_string();
+            let reference = cx.resolve_ref(&name);
+            let target = prepare_identifier_target(cx, name, reference, true, span)?;
+            Ok(Some(PreparedAssignmentTarget::Identifier(target)))
+        }
         AssignmentTarget::StaticMemberExpression(member) => {
             // §13.15.1 — a destructuring pattern position: the
             // web-compat call-target exemption is an early SyntaxError.
@@ -1022,8 +925,9 @@ fn assign_prepared_target(
     span: (u32, u32),
 ) -> Result<(), CompileError> {
     match target {
-        PreparedAssignmentTarget::Identifier(name) => {
-            store_identifier_checked(cx, &name, value_reg, span)
+        PreparedAssignmentTarget::Identifier(target) => {
+            store_prepared_identifier(cx, target, value_reg, span);
+            Ok(())
         }
         PreparedAssignmentTarget::StaticMember { obj_reg, name_idx } => {
             let scratch = cx.alloc_scratch();
@@ -1242,6 +1146,8 @@ pub(crate) fn assign_object_pattern(
             AssignmentTargetProperty::AssignmentTargetPropertyIdentifier(p) => {
                 let pspan = span;
                 let name = p.binding.name.as_str().to_string();
+                let reference = cx.resolve_ref(&name);
+                let target = prepare_identifier_target(cx, name.clone(), reference, true, pspan)?;
                 let val = cx.alloc_scratch();
                 cx.emit_load_property(val, value_reg, &name, pspan);
                 // §13.15.5.5 — `{ x = anonymousFn }` applies
@@ -1251,7 +1157,7 @@ pub(crate) fn assign_object_pattern(
                     Some(default) => apply_default_with_name(cx, val, default, Some(&name), pspan)?,
                     None => val,
                 };
-                store_identifier_checked(cx, &name, final_val, pspan)?;
+                store_prepared_identifier(cx, target, final_val, pspan);
                 extracted_keys.push(ExtractedKey::Static(name));
             }
             AssignmentTargetProperty::AssignmentTargetPropertyProperty(p) => {
@@ -1352,6 +1258,7 @@ pub(crate) fn assign_object_pattern(
         // BindingPattern variant: the previously-extracted keys are
         // excluded inside the copy (§7.3.31), so a Proxy source never
         // sees a [[GetOwnProperty]] trap for them.
+        let prepared_rest = prepare_assignment_target(cx, &rest.target, span)?;
         let rest_obj = cx.alloc_scratch();
         cx.emit(Op::NewObject, [Operand::Register(rest_obj)], span);
         let excluded = cx.alloc_scratch();
@@ -1389,7 +1296,10 @@ pub(crate) fn assign_object_pattern(
             ],
             span,
         );
-        assign_to_target(cx, &rest.target, rest_obj, span)?;
+        match prepared_rest {
+            Some(target) => assign_prepared_target(cx, target, rest_obj, span)?,
+            None => assign_to_target(cx, &rest.target, rest_obj, span)?,
+        }
     }
     Ok(())
 }
@@ -1438,34 +1348,6 @@ pub(crate) fn apply_default_with_name(
     );
     cx.patch_branch_to_here(jump_to_end);
     Ok(result)
-}
-
-/// Store `value_reg` into the binding (or globalThis) for `name`.
-/// Mirrors the identifier-store branch of `compile_assignment` but
-/// without the compound-op handling.
-/// [`store_identifier`] with the §6.2.5.5 PutValue TDZ check for
-/// destructuring-ASSIGNMENT leaves: a binding still uninitialized at
-/// this compile point (`let y = [y] = []`) raises ReferenceError
-/// before the const / immutable-binding checks. Declaration
-/// initialization paths call [`store_identifier`] directly — their
-/// leaves are legitimately uninitialized.
-pub(crate) fn store_identifier_checked(
-    cx: &mut Compiler,
-    name: &str,
-    value_reg: u16,
-    span: (u32, u32),
-) -> Result<(), CompileError> {
-    if let Some(info) = cx.lookup_binding(name)
-        && !info.initialized
-    {
-        cx.emit(
-            Op::TdzError,
-            [Operand::Imm32(info.storage.diagnostic_index())],
-            span,
-        );
-        return Ok(());
-    }
-    store_identifier(cx, name, value_reg, span)
 }
 
 /// Store `value_reg` into the binding (or the global environment) for
@@ -1527,7 +1409,7 @@ pub(crate) fn emit_assignment_type_error(
     let error_reg = cx.alloc_scratch();
     let kind = cx.intern_string_constant("TypeError");
     cx.emit(
-        Op::NewBuiltinError,
+        Op::NewError,
         [
             Operand::Register(error_reg),
             Operand::ConstIndex(kind),
@@ -1552,7 +1434,7 @@ pub(crate) fn emit_reference_error(cx: &mut Compiler, name: &str, span: (u32, u3
     let error_reg = cx.alloc_scratch();
     let kind = cx.intern_string_constant("ReferenceError");
     cx.emit(
-        Op::NewBuiltinError,
+        Op::NewError,
         [
             Operand::Register(error_reg),
             Operand::ConstIndex(kind),
@@ -1593,7 +1475,7 @@ pub(crate) fn compile_invalid_assignment_target(
     let error_reg = cx.alloc_scratch();
     let kind = cx.intern_string_constant("ReferenceError");
     cx.emit(
-        Op::NewBuiltinError,
+        Op::NewError,
         [
             Operand::Register(error_reg),
             Operand::ConstIndex(kind),

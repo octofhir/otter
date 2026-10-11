@@ -531,7 +531,7 @@ impl FunctionContext {
         }
     }
 
-    /// Read an own binding with the TDZ check a slot can carry.
+    /// Read an own hole-bearing binding through its checked context slot.
     pub(crate) fn emit_load_storage_checked(
         &mut self,
         dst: u16,
@@ -539,7 +539,9 @@ impl FunctionContext {
         span: (u32, u32),
     ) {
         match storage {
-            BindingStorage::Register { .. } => self.emit_load_storage(dst, storage, span),
+            BindingStorage::Register { .. } => {
+                unreachable!("a dynamically checked binding uses context storage")
+            }
             BindingStorage::Slot { ctx, slot } => self.emit_ctx(
                 Op::LoadContextSlotChecked,
                 vec![
@@ -586,8 +588,7 @@ impl FunctionContext {
         }
     }
 
-    /// Assignment to an own binding whose initialization does not dominate
-    /// this point: a slot store checks the TDZ hole.
+    /// Assign an own hole-bearing binding through its checked context slot.
     pub(crate) fn emit_store_storage_checked(
         &mut self,
         src: u16,
@@ -595,7 +596,9 @@ impl FunctionContext {
         span: (u32, u32),
     ) {
         match storage {
-            BindingStorage::Register { .. } => self.emit_store_storage(src, storage, span),
+            BindingStorage::Register { .. } => {
+                unreachable!("a dynamically checked binding uses context storage")
+            }
             BindingStorage::Slot { ctx, slot } => self.emit_ctx(
                 Op::StoreContextSlotChecked,
                 vec![
@@ -616,6 +619,7 @@ impl FunctionContext {
     /// clauses' declarations.
     pub(crate) fn own_access_needs_check(&self, info: &BindingInfo, scope_index: usize) -> bool {
         info.kind.initial_hole()
+            && matches!(info.storage, BindingStorage::Slot { .. })
             && self
                 .scopes
                 .get(scope_index)

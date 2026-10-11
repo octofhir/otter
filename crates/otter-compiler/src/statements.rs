@@ -17,6 +17,8 @@
 //! - A `for (let …;;)` head's context is copied (§14.7.4.4
 //!   CreatePerIterationEnvironment) after the initializer and before each
 //!   increment, so each iteration's closures keep their own bindings.
+//! - Switch lexical references across clauses use checked context storage;
+//!   an unrelated clause entry cannot bypass their TDZ.
 //!
 //! # See also
 //! - `for_loops` and `try_catch`
@@ -1367,7 +1369,8 @@ pub(crate) fn compile_switch_statement(
     if nested_eval {
         case_captured.extend(case_lex.iter().map(|(name, _)| name.clone()));
     }
-    pre_declare_block_lexical_bindings(cx, &case_lex, &case_captured, span)?;
+    let case_checked = crate::switch_bindings::checked_lexical_names(&cx.capture, &s.cases);
+    pre_declare_block_lexical_bindings(cx, &case_lex, &case_captured, &case_checked, span)?;
     hoist_function_declarations_from(cx, &case_stmts)?;
     cx.push_loop_frame(LoopFrame::switch_body());
 

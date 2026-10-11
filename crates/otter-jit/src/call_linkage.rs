@@ -19,7 +19,8 @@
 //! - A caller that proved its callee enters the current generation through
 //!   the target's permanent `FunctionEntryCell`. A proved NativeFunction enters
 //!   the canonical Host native kernel through its selected kind convention;
-//!   every other callee is classified in the call trampoline.
+//!   intrinsic proofs whose forms remain calls keep that native convention.
+//!   Every other callee is classified in the call trampoline.
 //! - Receiver binding belongs to the callee: an arrow's lexical `this`, a
 //!   strict or unobserved receiver as given, a sloppy object as given and any
 //!   other sloppy receiver through activation preparation; a base
@@ -87,7 +88,7 @@ impl CallPlan {
             Self::Bytecode(plan)
         } else if matches!(
             view.native_calls.get(&byte_pc),
-            Some(otter_vm::JitNativeCall::Native)
+            Some(otter_vm::JitNativeCall::Native | otter_vm::JitNativeCall::Intrinsic(_))
         ) {
             Self::Native
         } else {

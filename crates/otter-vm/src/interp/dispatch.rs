@@ -1790,19 +1790,6 @@ impl Interpreter {
                     self.run_eval_operands(context, stack, operands)?;
                     continue;
                 }
-                // §20.2.1.1 — `new Function(args, body)` recurses
-                // into the eval hook with a synthesised wrapper.
-                Op::NewFunction => {
-                    let operands = function.operand_view(instr);
-                    (match self.run_new_function_operands(context, stack, operands) {
-                        Ok(value) => value,
-                        Err(CommittedValueError::JavaScript(error)) => return Err(error),
-                        Err(CommittedValueError::Fatal(error)) => {
-                            return Ok(DispatchOutcome::Fatal(error));
-                        }
-                    });
-                    continue;
-                }
                 Op::LoadArgumentsLength | Op::LoadArgumentsElement => {
                     let dst = instr.reg(0);
                     let key = (op == Op::LoadArgumentsElement)
@@ -2140,21 +2127,9 @@ impl Interpreter {
                 }
                 Op::NewError => {
                     let dst = instr.reg(0);
-                    let msg_reg = instr.reg(1);
-                    (match self.run_new_error_regs(context, &mut *stack, top_idx, dst, msg_reg) {
-                        Ok(value) => value,
-                        Err(CommittedValueError::JavaScript(error)) => return Err(error),
-                        Err(CommittedValueError::Fatal(error)) => {
-                            return Ok(DispatchOutcome::Fatal(error));
-                        }
-                    });
-                    continue;
-                }
-                Op::NewBuiltinError => {
-                    let dst = instr.reg(0);
                     let kind_idx = instr.const_word(1);
                     let msg_reg = instr.reg(2);
-                    (match self.run_new_builtin_error_regs(
+                    (match self.run_new_error_regs(
                         context,
                         &mut *stack,
                         top_idx,
@@ -2168,13 +2143,6 @@ impl Interpreter {
                             return Ok(DispatchOutcome::Fatal(error));
                         }
                     });
-                    continue;
-                }
-                Op::LoadBuiltinError => {
-                    let dst = instr.reg(0);
-                    let kind_idx = instr.const_word(1);
-                    let frame = &mut stack[top_idx];
-                    self.run_load_builtin_error_reg(context, frame, dst, kind_idx)?;
                     continue;
                 }
                 Op::LoadGlobalThis => {
@@ -2777,13 +2745,6 @@ impl Interpreter {
                     )?;
                     continue;
                 }
-                Op::MathLoad => {
-                    let dst = instr.reg(0);
-                    let name_idx = instr.const_word(1);
-                    let frame = &mut stack[top_idx];
-                    self.run_math_load_reg(context, frame, dst, name_idx)?;
-                    continue;
-                }
                 Op::SymbolLoad => {
                     let dst = instr.reg(0);
                     let name_idx = instr.const_word(1);
@@ -3319,29 +3280,6 @@ impl Interpreter {
                     frame.advance_pc()?;
                     continue;
                 }
-                Op::IsArray => {
-                    let dst = instr.reg(0);
-                    let src = instr.reg(1);
-                    let source = *read_register(&stack[top_idx], src)?;
-                    let result = match self.scalar_value(
-                        stack,
-                        context,
-                        crate::ScalarValueOp::IsArray,
-                        source,
-                        Value::undefined(),
-                        Value::undefined(),
-                    ) {
-                        Ok(value) => value,
-                        Err(CommittedValueError::JavaScript(error)) => return Err(error),
-                        Err(CommittedValueError::Fatal(error)) => {
-                            return Ok(DispatchOutcome::Fatal(error));
-                        }
-                    };
-                    let frame = &mut stack[top_idx];
-                    write_register(frame, dst, result)?;
-                    frame.advance_pc()?;
-                    continue;
-                }
                 Op::IsEvalIntrinsic => {
                     let dst = instr.reg(0);
                     let src = instr.reg(1);
@@ -3370,17 +3308,6 @@ impl Interpreter {
                     let operands = function.operand_view(instr);
                     let frame = &mut stack[top_idx];
                     self.run_static_call_operands(op, context, frame, operands)?;
-                    continue;
-                }
-                Op::ArrayConstruct | Op::ArrayFrom | Op::ArrayOf => {
-                    let operands = function.operand_view(instr);
-                    match self.run_array_static_operands(op, context, stack, operands) {
-                        Ok(()) => {}
-                        Err(CommittedValueError::JavaScript(error)) => return Err(error),
-                        Err(CommittedValueError::Fatal(error)) => {
-                            return Ok(DispatchOutcome::Fatal(error));
-                        }
-                    }
                     continue;
                 }
                 Op::ForInKeys => {
@@ -3447,12 +3374,6 @@ impl Interpreter {
                             return Ok(DispatchOutcome::Fatal(error));
                         }
                     });
-                    continue;
-                }
-                Op::QueueMicrotask => {
-                    let operands = function.operand_view(instr);
-                    let frame = &mut stack[top_idx];
-                    self.run_queue_microtask_operands(context, frame, operands)?;
                     continue;
                 }
                 Op::PromiseNew => {

@@ -119,15 +119,11 @@ impl Interpreter {
         dst: u16,
         src: u16,
     ) -> Result<(), CommittedValueError> {
-        let input = *read_register(&stack[frame_index], src)
-            .map_err(CommittedValueError::Fatal)?;
+        let input = *read_register(&stack[frame_index], src).map_err(CommittedValueError::Fatal)?;
         let value = self.coerce_to_number(stack, context, &input)?;
         let frame = &mut stack[frame_index];
-        write_register(frame, dst, Value::number(value))
-            .map_err(CommittedValueError::Fatal)?;
-        frame
-            .advance_pc()
-            .map_err(CommittedValueError::Fatal)?;
+        write_register(frame, dst, Value::number(value)).map_err(CommittedValueError::Fatal)?;
+        frame.advance_pc().map_err(CommittedValueError::Fatal)?;
         Ok(())
     }
 
@@ -167,12 +163,9 @@ impl Interpreter {
         context: &ExecutionContext,
         operands: impl crate::executable::OperandSource,
     ) -> Result<bool, CommittedValueError> {
-        let dst = register_operand(operands.first())
-            .map_err(CommittedValueError::Fatal)?;
-        let src = register_operand(operands.get(1))
-            .map_err(CommittedValueError::Fatal)?;
-        let hint_idx = const_operand(operands.get(2))
-            .map_err(CommittedValueError::Fatal)?;
+        let dst = register_operand(operands.first()).map_err(CommittedValueError::Fatal)?;
+        let src = register_operand(operands.get(1)).map_err(CommittedValueError::Fatal)?;
+        let hint_idx = const_operand(operands.get(2)).map_err(CommittedValueError::Fatal)?;
         let hint_token = context
             .string_constant_str(hint_idx)
             .ok_or(VmError::InvalidOperand)
@@ -193,8 +186,8 @@ impl Interpreter {
             .filter(|s| s.pc == pc && s.dst == dst)
             .cloned();
         if let Some(state) = resume {
-            let produced = *read_register(&stack[top_idx], dst)
-                .map_err(CommittedValueError::Fatal)?;
+            let produced =
+                *read_register(&stack[top_idx], dst).map_err(CommittedValueError::Fatal)?;
             if abstract_ops::is_primitive(&produced) {
                 if let Some(cold) = self.frame_cold_mut(&mut stack[top_idx]) {
                     cold.pending_to_primitive = None;
@@ -224,11 +217,9 @@ impl Interpreter {
         }
 
         // 2. Fresh entry — primitive fast path.
-        let recv = *read_register(&stack[top_idx], src)
-            .map_err(CommittedValueError::Fatal)?;
+        let recv = *read_register(&stack[top_idx], src).map_err(CommittedValueError::Fatal)?;
         if abstract_ops::is_primitive(&recv) {
-            write_register(&mut stack[top_idx], dst, recv)
-                .map_err(CommittedValueError::Fatal)?;
+            write_register(&mut stack[top_idx], dst, recv).map_err(CommittedValueError::Fatal)?;
             stack[top_idx]
                 .advance_pc()
                 .map_err(CommittedValueError::Fatal)?;
@@ -335,12 +326,7 @@ impl Interpreter {
             return None;
         }
         let constructor_name = if let Some(arr) = value.as_array() {
-            if let Some(proto) =
-                crate::array::prototype_override(arr, &self.gc_heap).and_then(|v| v.as_object())
-            {
-                return Some(proto);
-            }
-            "Array"
+            return self.array_prototype_value(arr).as_object();
         } else if let Some(regexp) = value.as_regexp() {
             if let Some(proto) = regexp
                 .prototype_override(&self.gc_heap)
@@ -613,9 +599,7 @@ impl Interpreter {
                                         interp.escape_scoped(receiver_root),
                                         args,
                                     )
-                                    .map_err(|error| {
-                                        CommittedValueError::JavaScript(error)
-                                    });
+                                    .map_err(CommittedValueError::JavaScript);
                             }
                             Some(_) => {
                                 return Err(CommittedValueError::JavaScript(

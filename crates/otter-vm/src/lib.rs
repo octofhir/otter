@@ -173,7 +173,6 @@ mod jit_static_call_ops;
 pub mod jit_static_native;
 mod jit_structural_ops;
 mod jit_super_ops;
-mod jit_variadic_ops;
 pub mod js_surface;
 pub mod json;
 pub mod marshal;
@@ -301,14 +300,14 @@ pub use handles::{HandleArena, Local, ObjectLayout, PendingValue, PendingValues}
 pub use host_strings::{HostAtom, HostAtomId, HostAtomInterner};
 pub use intl::{IntlKind, IntlPayload, JsIntl};
 pub use jit::{
-    JitArrayLayout, JitBodyGuard, JitCacheIrOp, JitCacheIrProgram, JitClosureCallLayout,
+    IntrinsicCallKind, JitArrayLayout, JitBodyGuard, JitCacheIrOp, JitCacheIrProgram, JitClosureCallLayout,
     JitCodeGenerationSnapshot, JitCodeResidency, JitCollectionLayout, JitCompileError,
     JitCompileRequest, JitCompileSnapshot, JitCompileStatus, JitCompilerHook, JitDirectCallKind,
     JitDirectCallThisMode, JitDirectCallee, JitElementAccess, JitElementBase, JitElementFamily,
     JitElementRepr, JitFunctionCallLookup, JitFunctionCode, JitFunctionPrototypeCall,
     JitFunctionPrototypeCallSite, JitGuardWidth, JitGuardedMethodCall, JitGuardedReceiver,
     JitInlineCallee, JitInlineMethod, JitInstructionMetadata, JitMapTableLayout, JitMethodHolder,
-    JitNativeCall, JitParameterWidening, JitRuntimeStubBinding, JitStaticNativeCall,
+    JitIntrinsicCallProof, JitNativeCall, JitParameterWidening, JitRuntimeStubBinding, JitStaticNativeCall,
     JitStringLayout, VmRuntimeActivation,
 };
 pub use jit_artifact::{
@@ -953,13 +952,9 @@ pub struct Interpreter {
     /// count from the innermost frame's depth. Each (native address,
     /// Whether synchronous `Atomics.wait` may block this isolate's host thread.
     allow_blocking_atomics_wait: bool,
-    /// Per-interpreter microtask queue. Plain field — accessed
-    /// only through `&mut self`. The dispatch loop threads
-    /// `&mut self.microtasks` alongside `&mut stack` (split-borrow)
-    /// so `Op::QueueMicrotask` writes the deque without going
-    /// through interior mutability. See `microtask::MicrotaskQueue`
-    /// for the full contract; task 33 ships the sync side and
-    /// reserves the async-inbox slot for task 35.
+    /// Isolate-local job queue with traced pending and in-flight records.
+    /// Native enqueue and reaction owners mutate it on the active runtime turn.
+    /// See `microtask::MicrotaskQueue` for the source and drain contract.
     microtasks: MicrotaskQueue,
     /// Per-run module-environment registry: module URL →
     /// `module_env` JsObject populated by that module's
@@ -1192,8 +1187,7 @@ pub struct Interpreter {
     /// Per-interpreter registry of the seven canonical error
     /// classes (`Error`, `TypeError`, `RangeError`, `SyntaxError`,
     /// `ReferenceError`, `URIError`, `EvalError`) — ECMA-262 §19.3.
-    /// Allocated once at startup; every `Op::NewError` /
-    /// `Op::NewBuiltinError` / `Op::LoadBuiltinError` dispatch reads
+    /// Allocated once at startup; intrinsic error creation reads
     /// from this table so prototype identity (and therefore
     /// `instanceof`) stays stable across the interpreter's lifetime.
     error_classes: ErrorClassRegistry,
@@ -1224,10 +1218,10 @@ pub struct Interpreter {
     /// stamping every array would materialize the exotic sidecar that
     /// disqualifies it from the dense fast paths.
     active_realm_is_extra: bool,
-    /// Optional embedder hook for `Op::Eval` / `Op::NewFunction`.
+    /// Optional embedder hook for eval and native Function constructors.
     /// Wired by the runtime layer at construction time to parse +
     /// compile a source string into a fresh [`BytecodeModule`].
-    /// When `None`, both opcodes raise a SyntaxError so embedders
+    /// When `None`, dynamic code raises a SyntaxError so embedders
     /// can opt out of dynamic code.
     #[allow(clippy::type_complexity)]
     eval_hook: Option<EvalHook>,
@@ -1822,7 +1816,7 @@ impl CompiledEvalSource {
 }
 
 /// Embedder-supplied parse + compile callback used by
-/// [`Op::Eval`] / [`Op::NewFunction`] and CommonJS wrappers. Returns the
+/// eval, native Function constructors, and CommonJS wrappers. Returns the
 /// module whose `<main>` completion value becomes the dispatch result.
 pub type EvalHook = std::sync::Arc<
     dyn Fn(&str, EvalCompileOptions) -> Result<CompiledEvalSource, String> + Send + Sync,

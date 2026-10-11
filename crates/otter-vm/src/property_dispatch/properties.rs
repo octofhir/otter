@@ -9,6 +9,12 @@
 //! # Invariants
 //! - Coercion order stays observable-identical to the spec: a receiver or key
 //!   that can run user code does so before any cache is consulted.
+//! - Branded Array prototypes enter canonical Set before ordinary field
+//!   caches, preserving length/index checks and foreign receiver behavior.
+//!
+//! # See also
+//! - `crate::object_internal_ops` owns committed object internal methods.
+//! - `super::jit_runtime` shares their generated miss completions.
 
 use crate::native_abi::CommittedValueError;
 use smallvec::SmallVec;
@@ -37,15 +43,12 @@ impl Interpreter {
         key: AtomizedPropertyKey<'_>,
     ) -> Result<(), CommittedValueError> {
         let name = key.name();
-        let receiver = *read_register(&stack[top_idx], obj_reg)
-            .map_err(CommittedValueError::Fatal)?;
+        let receiver =
+            *read_register(&stack[top_idx], obj_reg).map_err(CommittedValueError::Fatal)?;
         let value = self.load_property_value(context, stack, receiver, name)?;
         let frame = &mut stack[top_idx];
-        write_register(frame, dst, value)
-            .map_err(CommittedValueError::Fatal)?;
-        frame
-            .advance_pc()
-            .map_err(CommittedValueError::Fatal)?;
+        write_register(frame, dst, value).map_err(CommittedValueError::Fatal)?;
+        frame.advance_pc().map_err(CommittedValueError::Fatal)?;
         Ok(())
     }
 
@@ -65,8 +68,8 @@ impl Interpreter {
         key: AtomizedPropertyKey<'_>,
         slot: Option<crate::feedback::PropertyFeedbackSlot<'_>>,
     ) -> Result<(), CommittedValueError> {
-        let receiver = *read_register(&stack[frame_index], obj_reg)
-            .map_err(CommittedValueError::Fatal)?;
+        let receiver =
+            *read_register(&stack[frame_index], obj_reg).map_err(CommittedValueError::Fatal)?;
         if !receiver.is_object_type() {
             return Err(CommittedValueError::JavaScript(
                 crate::VmError::TypeMismatch,
@@ -101,11 +104,8 @@ impl Interpreter {
             )?,
         };
         let frame = &mut stack[frame_index];
-        write_register(frame, dst, Value::boolean(found))
-            .map_err(CommittedValueError::Fatal)?;
-        frame
-            .advance_pc()
-            .map_err(CommittedValueError::Fatal)
+        write_register(frame, dst, Value::boolean(found)).map_err(CommittedValueError::Fatal)?;
+        frame.advance_pc().map_err(CommittedValueError::Fatal)
     }
 
     /// Full string-keyed `[[Get]]` over any receiver value: the complete
@@ -722,15 +722,15 @@ impl Interpreter {
         }
         let key = VmPropertyKey::String(name);
         let wrapper_name = if receiver.is_boolean() {
-            Some("Boolean")
+            Some(crate::realm_intrinsics::Intrinsic::BooleanPrototype)
         } else if receiver.is_number() {
-            Some("Number")
+            Some(crate::realm_intrinsics::Intrinsic::NumberPrototype)
         } else if receiver.is_string() {
-            Some("String")
+            Some(crate::realm_intrinsics::Intrinsic::StringPrototype)
         } else if receiver.is_symbol() {
-            Some("Symbol")
+            Some(crate::realm_intrinsics::Intrinsic::SymbolPrototype)
         } else if receiver.is_big_int() {
-            Some("BigInt")
+            Some(crate::realm_intrinsics::Intrinsic::BigIntPrototype)
         } else {
             None
         };
@@ -828,13 +828,21 @@ impl Interpreter {
     ) -> Result<(), CommittedValueError> {
         let name = key.name();
         let frame = &stack[top_idx];
-        let value =
-            *read_register(frame, src).map_err(CommittedValueError::Fatal)?;
+        let value = *read_register(frame, src).map_err(CommittedValueError::Fatal)?;
         // §15.7.1 — Op::StorePropertyStrict: class heritage / computed
         // keys are strict code even inside a sloppy function's frame.
         let strict = force_strict || context.function_is_strict(frame.function_id);
-        let receiver = *read_register(frame, obj_reg)
-            .map_err(CommittedValueError::Fatal)?;
+        let receiver = *read_register(frame, obj_reg).map_err(CommittedValueError::Fatal)?;
+        if receiver
+            .as_object()
+            .is_some_and(|object| self.is_array_prototype_object(object))
+        {
+            self.store_property_value(context, stack, receiver, name, value, strict)?;
+            stack[top_idx]
+                .advance_pc()
+                .map_err(CommittedValueError::Fatal)?;
+            return Ok(());
+        }
         if let Some(o) = receiver.as_object()
             && object::deferred_namespace_target(o, &self.gc_heap).is_some()
         {
@@ -953,8 +961,8 @@ impl Interpreter {
                 } else {
                     let bag = regexp_ensure_expando(self, &r, &receiver)
                         .map_err(CommittedValueError::JavaScript)?;
-                    let value = *read_register(&stack[top_idx], src)
-                        .map_err(CommittedValueError::Fatal)?;
+                    let value =
+                        *read_register(&stack[top_idx], src).map_err(CommittedValueError::Fatal)?;
                     if !self
                         .ordinary_set_data_property(bag, name, value)
                         .map_err(CommittedValueError::JavaScript)?
@@ -1096,8 +1104,8 @@ impl Interpreter {
                 && let Some((_, writable)) = self.function_prototype_slot(context, owner, fid)
             {
                 if writable {
-                    let value = *read_register(&stack[top_idx], src)
-                        .map_err(CommittedValueError::Fatal)?;
+                    let value =
+                        *read_register(&stack[top_idx], src).map_err(CommittedValueError::Fatal)?;
                     self.store_function_prototype(Some(stack), owner, fid, value)
                         .map_err(CommittedValueError::JavaScript)?;
                 } else {
@@ -1535,10 +1543,9 @@ impl Interpreter {
         if let Some(target) = target {
             // Branches above may have allocated (lazy expando bags); the
             // stored value is re-read from its traced register slot.
-            let value = *read_register(&stack[top_idx], src)
-                .map_err(CommittedValueError::Fatal)?;
-            let receiver = *read_register(&stack[top_idx], obj_reg)
-                .map_err(CommittedValueError::Fatal)?;
+            let value = *read_register(&stack[top_idx], src).map_err(CommittedValueError::Fatal)?;
+            let receiver =
+                *read_register(&stack[top_idx], obj_reg).map_err(CommittedValueError::Fatal)?;
             let vm_key = VmPropertyKey::OwnedString(name.to_owned());
             if !self.ordinary_set_data_value(
                 stack,

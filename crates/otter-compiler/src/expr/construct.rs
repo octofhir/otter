@@ -1,7 +1,12 @@
 //! Constructor expression lowering.
 //!
 //! # Contents
-//! - [`compile_new`] — lowers `new` expressions and constructor fast paths.
+//! - [`compile_new`] — evaluates the constructor reference and its arguments.
+//! - Dense construction enforces the shared encoded argument bound.
+//!
+//! # Invariants
+//! - Constructor references are resolved before arguments; callable identity
+//!   and intrinsic specialization belong to runtime feedback, never spelling.
 //!
 //! # See also
 //! - [`super`] — expression dispatch and shared helpers.
@@ -23,9 +28,7 @@ pub(crate) fn compile_new(
     let callee = unwrap_ts_expr(&new_expr.callee);
     // §13.3.5 — a `new C(...args)` whose arguments include a SpreadElement
     // must build its argument list dynamically. Route it straight to the
-    // general `Op::NewSpread` path; the special-case constructor fast paths
-    // below (Object / Array / Function / Intl, …) only accept positional
-    // arguments and would otherwise reject the spread.
+    // `Op::NewSpread` path, preserving the resolved constructor reference.
     if new_expr
         .arguments
         .iter()
@@ -46,149 +49,11 @@ pub(crate) fn compile_new(
         );
         return Ok(dst);
     }
-    // ECMA-262 §19.3 / §20.5 native error constructors —
-    // every one of `Error`, `TypeError`, `RangeError`,
-    // `SyntaxError`, `ReferenceError`, `URIError`,
-    // `EvalError` lowers to a dedicated opcode that
-    // consults the per-interpreter [`ErrorClassRegistry`]
-    // for the right prototype linkage.
-    //
-    // <https://tc39.es/ecma262/#sec-native-error-types-used-in-this-standard>
-    // The lowering is valid only when the name statically resolves to the
-    // global: a same-named binding in ANY enclosing scope, a `with`
-    // object, or a live sloppy direct-eval extension must win.
-    if let Expression::Identifier(id) = callee
-        && find_module_import_binding(cx, id.name.as_str()).is_none()
-        && cx.resolves_to_plain_global(id.name.as_str())
-        && is_builtin_error_class_name(id.name.as_str())
-        && builtin_error_construct_fast_path_applies(id.name.as_str(), &new_expr.arguments)
-    {
-        return compile_builtin_error_construct(
-            cx,
-            id.name.as_str(),
-            &new_expr.arguments,
-            new_span,
-        );
-    }
-    // §20.1.1 `new Object()` — empty-args shortcut to
-    // `Op::NewObject`. One-arg / multi-arg forms fall through
-    // to the general construct path so the runtime
-    // `OrdinaryCreateFromConstructor` + `ToObject` (§20.1.1.1)
-    // logic in `object_ctor_call` runs, including the
-    // null/undefined → fresh-object coercion.
-    if let Expression::Identifier(id) = callee
-        && id.name.as_str() == "Object"
-        && cx.lookup_binding("Object").is_none()
-        && find_module_import_binding(cx, "Object").is_none()
-        && new_expr.arguments.is_empty()
-    {
-        let dst = cx.alloc_scratch();
-        cx.emit(Op::NewObject, [Operand::Register(dst)], new_span);
-        return Ok(dst);
-    }
-    // §23.1.1.1 `new Array(...)` — typed
-    // [`Op::ArrayConstruct`]. Single-numeric form reserves
-    // a sparse array of that length; everything else
-    // collects values like `Array.of`.
-    if let Expression::Identifier(id) = callee
-        && id.name.as_str() == "Array"
-        && cx.lookup_binding("Array").is_none()
-        && find_module_import_binding(cx, "Array").is_none()
-    {
-        let arg_regs = compile_call_args(cx, &new_expr.arguments, new_span)?;
-        cx.reset_scratch(mark);
-        let dst = cx.alloc_scratch();
-        let mut operands: Vec<Operand> = Vec::with_capacity(2 + arg_regs.len());
-        operands.push(Operand::Register(dst));
-        operands.push(Operand::ConstIndex(arg_regs.len() as u32));
-        operands.extend(arg_regs.into_iter().map(Operand::Register));
-        cx.emit(Op::ArrayConstruct, operands, new_span);
-        return Ok(dst);
-    }
-    // §22.1.1 `new String(value)` falls through to the
-    // general constructor path so runtime bootstrap can
-    // produce a String wrapper object with [[StringData]].
-    // §21.1.1 `new Number(value)` no longer aliases here —
-    // the `Number` global is now a real `ClassConstructor`
-    // (see `bootstrap::install_number`) and the construct
-    // form must produce a `NumberObject` wrapper with the
-    // `[[NumberData]]` slot set, not a primitive Number.
-    // Falls through to the general `NewExpression` path.
-    // §20.3.1 `new Boolean(value)` falls through to the
-    // general constructor path so runtime bootstrap can
-    // produce a Boolean wrapper object with [[BooleanData]].
-    // `new SharedArrayBuffer(length, options?)` routes
-    // through the real `NativeFunction` installed by
-    // `bootstrap_array_buffer` — `Op::SharedArrayBufferCall`
-    // is no longer emitted from the compiler.
-    // `new ArrayBuffer(length, options?)` routes through the
-    // real `NativeFunction` installed by
-    // `bootstrap_array_buffer` — `Op::ArrayBufferCall` is no
-    // longer emitted from the compiler.
-    // `new DataView(buffer, ...)` routes through the real
-    // `NativeFunction` ctor installed by
-    // `bootstrap_data_view` — `Op::DataViewCall` is no
-    // longer emitted from the compiler.
-    // `new <T>(...)` for each of the 11 concrete TypedArray
-    // ctors routes through the real `NativeFunction`
-    // installed by `bootstrap_typed_array` — the typed
-    // `Op::TypedArrayCall` shortcut for the construct path
-    // is no longer emitted. (Static-side `<T>.from(...)` /
-    // `<T>.of(...)` shortcuts elsewhere stay in place until
-    // the static methods are wired through the real ctor.)
-    // §21.4.2 `new Date(...)` resolves against the real
-    // `NativeFunction` constructor installed by the `Date`
-    // bootstrap, so the dedicated `Op::DateCall` `Construct`
-    // shortcut is no longer emitted.
-    // §20.2.1.1 `new Function(arg0, …, body)` — every
-    // argument coerces to a string at runtime; the leading
-    // ones become parameter names and the last one is the
-    // function body. Foundation lowers `Function(...)`
-    // (without `new`) to the same shape per spec.
-    // <https://tc39.es/ecma262/#sec-function-p1-p2-pn-body>
-    if let Expression::Identifier(id) = callee
-        && id.name.as_str() == "Function"
-        && cx.lookup_binding("Function").is_none()
-        && find_module_import_binding(cx, "Function").is_none()
-    {
-        let arg_regs = compile_call_args(cx, &new_expr.arguments, new_span)?;
-        cx.reset_scratch(mark);
-        let dst = cx.alloc_scratch();
-        let mut operands: Vec<Operand> = Vec::with_capacity(2 + arg_regs.len());
-        operands.push(Operand::Register(dst));
-        operands.push(Operand::ConstIndex(arg_regs.len() as u32));
-        operands.extend(arg_regs.into_iter().map(Operand::Register));
-        cx.emit(Op::NewFunction, operands, new_span);
-        return Ok(dst);
-    }
-    // `new Map(iter?)` / `new Set(iter?)` /
-    // `new WeakMap(iter?)` / `new WeakSet(iter?)` go through
-    // the ordinary `Op::New` dispatch path now that the
-    // bootstrap installs real `[[Construct]]` slots for each
-    // global. The legacy dedicated `Op::NewCollection`
-    // lowering bypassed `Map.prototype.set` / `Set.prototype.add`
-    // and skipped the §7.4 iterator-protocol path, which is
-    // observable through test262 `iterable-calls-set.js`.
-    // `new WeakRef(target)` / `new FinalizationRegistry(cb)`
-    // route through real `NativeFunction` ctors installed by
-    // `bootstrap_weak_refs` — the dedicated `Op::NewWeakRef` /
-    // `Op::NewFinalizationRegistry` lowering is no longer
-    // needed.
-    // §28.2.1 `new Proxy(target, handler)` resolves through the real
-    // `NativeFunction` constructor installed by the `Proxy`
-    // bootstrap, so the dedicated `Op::ProxyCall` `Construct`
-    // shortcut is no longer emitted.
-    // `new Promise(executor)` previously lowered to a
-    // dedicated `Op::PromiseNew` that bypassed the real
-    // `Promise` constructor. With the bootstrap installer
-    // building a real callable + constructible
-    // `NativeFunction`, the constructor flows through the
-    // ordinary `Op::New` dispatch like every other
-    // builtin (§27.2.3.1).
     // §13.3.5 NewExpression — positional arguments (spread is handled by the
     // early-return path above).
     let callee_reg = compile_expr(cx, callee, new_span)?;
     let arg_regs = compile_call_args(cx, &new_expr.arguments, new_span)?;
+    check_call_arity(arg_regs.len(), "Op::New", new_span)?;
     cx.reset_scratch(mark);
     let dst = cx.alloc_scratch();
     let mut operands: Vec<Operand> = Vec::with_capacity(3 + arg_regs.len());
@@ -198,4 +63,26 @@ pub(crate) fn compile_new(
     operands.extend(arg_regs.into_iter().map(Operand::Register));
     cx.emit(Op::New, operands, new_span);
     Ok(dst)
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{CompileError, SyntaxSourceKind, compile_script_source};
+
+    #[test]
+    fn dense_construction_checks_its_wire_argument_bound() {
+        for count in [crate::MAX_DENSE_CALL_ARGS, crate::MAX_DENSE_CALL_ARGS + 1] {
+            let arguments = vec!["0"; count].join(",");
+            let source = format!("new C({arguments});");
+            let result =
+                compile_script_source(&source, SyntaxSourceKind::JavaScript, "wide-new.js");
+            if count == crate::MAX_DENSE_CALL_ARGS {
+                crate::context_tests::assert_verified(&result.expect("encoded construction"));
+            } else {
+                assert!(
+                    matches!(result, Err(CompileError::Unsupported { node, .. }) if node.contains("Op::New") && node.contains("arg limit"))
+                );
+            }
+        }
+    }
 }

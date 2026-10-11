@@ -91,7 +91,7 @@ impl Interpreter {
         if !self.chain_reaches_unshadowed(receiver, keys) {
             return Ok(None);
         }
-        let tag = crate::object_statics::builtin_to_string_tag_value(input, self);
+        let tag = crate::object_statics::builtin_to_string_tag_value(input, self)?;
         let text = JsString::from_str(&format!("[object {tag}]"), &mut self.gc_heap)?;
         Ok(Some(Value::string(text)))
     }

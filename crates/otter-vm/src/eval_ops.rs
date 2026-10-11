@@ -1,8 +1,7 @@
-//! Eval and dynamic function constructor opcode helpers.
+//! Eval execution and canonical native Function construction.
 //!
-//! `eval` and `new Function(...)` recurse through the VM compiler/runtime path,
-//! so their dispatch has to run before the dense in-frame match borrows the
-//! current frame.
+//! Eval dispatch and the resolved native Function constructor recurse through
+//! the VM compiler/runtime path while retaining their caller's roots.
 //!
 //! # Contents
 //! - Indirect eval execution and writeback.
@@ -12,7 +11,8 @@
 //!   product build time.
 //!
 //! # Invariants
-//! - Helpers advance the current frame PC exactly once on success.
+//! - Eval helpers advance the current frame PC exactly once on success; native
+//!   Function construction completes through the ordinary native call owner.
 //! - Compiled eval / `new Function` modules link into the
 //!   interpreter's code space, so escaping closures and classes keep
 //!   resolvable global function ids.
@@ -240,47 +240,6 @@ impl Interpreter {
         result
     }
 
-    pub(crate) fn run_new_function_operands(
-        &mut self,
-        context: &ExecutionContext,
-        stack: &mut ActivationStack,
-        operands: impl crate::executable::OperandSource,
-    ) -> Result<(), CommittedValueError> {
-        let dst = register_operand(operands.first())
-            .map_err(CommittedValueError::Fatal)?;
-        let argc = match operands.get(1) {
-            Some(Operand::ConstIndex(n)) => n as usize,
-            _ => return Err(CommittedValueError::Fatal(VmError::InvalidOperand)),
-        };
-        // Coerce one argument at a time, re-reading each value from
-        // its frame register right before coercion: user `toString`
-        // can trigger a moving collection, and registers are the
-        // GC-traced (and rewritten) home of these values — a Rust-side
-        // snapshot of the whole argument list would go stale.
-        let mut parts: Vec<String> = Vec::with_capacity(argc);
-        for i in 0..argc {
-            let r = register_operand(operands.get(2 + i))
-                .map_err(CommittedValueError::Fatal)?;
-            let top_idx = stack.len() - 1;
-            let value = *read_register(&stack[top_idx], r)
-                .map_err(CommittedValueError::Fatal)?;
-            parts.push(self.function_constructor_arg_to_string(stack, context, &value)?);
-        }
-        let result = self
-            .build_function_constructor_from_parts(stack, parts)
-            .map_err(CommittedValueError::JavaScript)?;
-        let frame = stack
-            .last_mut()
-            .ok_or(VmError::InvalidOperand)
-            .map_err(CommittedValueError::Fatal)?;
-        write_register(frame, dst, result)
-            .map_err(CommittedValueError::Fatal)?;
-        frame
-            .advance_pc()
-            .map_err(CommittedValueError::Fatal)?;
-        Ok(())
-    }
-
     /// Execute `source` as an ECMAScript *Script* in the current
     /// realm (§16.1.6 ScriptEvaluation) — the host API behind
     /// `$262.evalScript`. Differs from indirect eval only in GDI
@@ -430,15 +389,6 @@ impl Interpreter {
                 .build_dynamic_function_from_parts(stack, parts, kind)
                 .map_err(CommittedValueError::JavaScript)
         })
-    }
-
-    /// §20.2.1.1 steps 2+ over already-coerced argument strings.
-    pub(crate) fn build_function_constructor_from_parts(
-        &mut self,
-        stack: &mut ActivationStack,
-        parts: Vec<String>,
-    ) -> Result<Value, VmError> {
-        self.build_dynamic_function_from_parts(stack, parts, DynamicFunctionKind::Normal)
     }
 
     /// Build a CommonJS module wrapper function and return it as a callable

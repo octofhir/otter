@@ -937,8 +937,8 @@ impl Interpreter {
         array: crate::array::JsArray,
     ) -> Result<crate::array::JsArray, otter_gc::OutOfMemory> {
         // Stamp the per-instance `[[Prototype]]` only for arrays minted while
-        // a non-default realm is active. A default-realm array resolves
-        // through the active realm's %Array.prototype% anyway, and stamping
+        // a non-default realm is active. A bare default-realm array resolves
+        // through the default realm's retained %Array.prototype%, and stamping
         // it would materialize the exotic sidecar that permanently
         // disqualifies the array from every dense fast path (method ICs,
         // builtin dispatch) — one boxed side-table per array, traced on every

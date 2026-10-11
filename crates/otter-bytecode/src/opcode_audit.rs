@@ -225,7 +225,6 @@ pub fn opcode_inventory() -> Vec<OpcodeAudit> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::encoding::OP_BYTE_TABLE;
 
     fn row<'a>(inventory: &'a [OpcodeAudit], opcode: &str) -> &'a OpcodeAudit {
         inventory
@@ -235,13 +234,12 @@ mod tests {
     }
 
     #[test]
-    fn inventory_covers_schema_and_compatibility_table_once() {
+    fn inventory_covers_canonical_schema_once() {
         let inventory = opcode_inventory();
         assert_eq!(inventory.len(), OPCODE_SCHEMA.len());
-        assert_eq!(inventory.len(), OP_BYTE_TABLE.len());
         for (index, row) in inventory.iter().enumerate() {
             assert_eq!(row.opcode_byte as usize, index);
-            assert_eq!(row.opcode_byte, OP_BYTE_TABLE[index].1);
+            assert_eq!(row.opcode_byte, OPCODE_SCHEMA[index].byte);
             assert_eq!(row.authority.identity, MetadataStatus::SchemaAuthoritative);
             assert!(!row.opcode.is_empty());
             assert!(!row.registers_read.is_empty());

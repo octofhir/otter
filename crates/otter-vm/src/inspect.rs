@@ -608,7 +608,7 @@ mod tests {
     }
 
     /// Schema guard: every Op variant resolves to a non-empty,
-    /// unique mnemonic. Walks [`otter_bytecode::encoding::OP_BYTE_TABLE`]
+    /// unique mnemonic. Walks [`otter_bytecode::opcode_schema::OPCODE_SCHEMA`]
     /// which is the authoritative dense table for the bytecode wire
     /// format — adding, removing, or renaming an opcode shows up
     /// here on the same change that updates the wire format, so
@@ -618,7 +618,8 @@ mod tests {
     fn every_table_op_has_unique_mnemonic() {
         use std::collections::HashSet;
         let mut seen: HashSet<&'static str> = HashSet::new();
-        for (op, _byte) in otter_bytecode::encoding::OP_BYTE_TABLE {
+        for schema in otter_bytecode::opcode_schema::OPCODE_SCHEMA {
+            let op = schema.op;
             let m = op.mnemonic();
             assert!(!m.is_empty(), "{op:?} has empty mnemonic");
             assert!(seen.insert(m), "duplicate mnemonic {m} on {op:?}");
@@ -626,7 +627,7 @@ mod tests {
     }
 
     /// Per-call schema gate: every value reachable through
-    /// [`otter_bytecode::encoding::OP_BYTE_TABLE`] is also enumerable
+    /// [`otter_bytecode::opcode_schema::OPCODE_SCHEMA`] is also enumerable
     /// from this fixed reference list. Adding a new Op variant to
     /// the wire format without listing it here fails the round-trip
     /// — the goldens then point at the missing variant before they
@@ -634,9 +635,9 @@ mod tests {
     #[test]
     fn op_table_matches_reference_list() {
         use std::collections::HashSet;
-        let table: HashSet<Op> = otter_bytecode::encoding::OP_BYTE_TABLE
+        let table: HashSet<Op> = otter_bytecode::opcode_schema::OPCODE_SCHEMA
             .iter()
-            .map(|(op, _)| *op)
+            .map(|schema| schema.op)
             .collect();
         let reference: HashSet<Op> = ALL_OPS.iter().copied().collect();
         let missing_in_reference: Vec<_> = table.difference(&reference).copied().collect();
@@ -648,7 +649,7 @@ mod tests {
     }
 
     // Reference Op list. Any new Op variant must be added here AND
-    // to `OP_BYTE_TABLE`. This dual-listing keeps the trace schema
+    // to `OPCODE_SCHEMA`. This dual-listing keeps the trace schema
     // visible in the inspect module so a future reviewer cannot
     // ship a new opcode without revisiting the trace surface.
     const ALL_OPS: &[Op] = &[
@@ -661,7 +662,6 @@ mod tests {
         Op::LoadInt32,
         Op::LoadBigInt,
         Op::LoadRegExp,
-        Op::QueueMicrotask,
         Op::PromiseNew,
         Op::PromiseCall,
         Op::LoadTrue,
@@ -750,7 +750,6 @@ mod tests {
         Op::EqualImm,
         Op::NotEqualImm,
         Op::MakeClass,
-        Op::MathLoad,
         Op::CollectRest,
         Op::ReturnValue,
         Op::ReturnUndefined,
@@ -770,7 +769,6 @@ mod tests {
         Op::HasProperty,
         Op::Instanceof,
         Op::Eval,
-        Op::NewFunction,
         Op::LoadGlobalThis,
         Op::LoadGlobalOrThrow,
         Op::CollectArguments,
@@ -794,15 +792,9 @@ mod tests {
         Op::DeleteElement,
         Op::Await,
         Op::SameValue,
-        Op::IsArray,
         Op::LooseEqual,
         Op::LooseNotEqual,
-        Op::NewBuiltinError,
-        Op::LoadBuiltinError,
         Op::BigIntCall,
-        Op::ArrayConstruct,
-        Op::ArrayFrom,
-        Op::ArrayOf,
         Op::ArrayBufferCall,
         Op::DataViewCall,
         Op::Yield,

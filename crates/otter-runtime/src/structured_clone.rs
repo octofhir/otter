@@ -11,13 +11,16 @@
 //! - [`StructuredCloneTransferList`] — owned transfer-list metadata.
 //! - [`StructuredCloneError`] — deterministic failure surface for
 //!   unsupported values, cycles, and depth limits.
-//! - VM-to-payload cloning helpers used by future worker APIs.
+//! - Private native-context conversion from VM values to owned payloads.
 //!
 //! # Invariants
 //!
 //! - Public clone payloads contain no `otter_vm::Value`,
 //!   `otter_gc::Gc<T>`, `Local<'gc, T>`, or borrowed VM state.
-//! - VM heap access is explicit: clone helpers take `&GcHeap`.
+//! - Clone walkers use the native context's one exact-array classifier, so
+//!   canonical Array prototypes retain their category after realm disposal.
+//! - Traversal reads only data descriptors and never allocates in the VM or
+//!   re-enters JavaScript; active raw identities cannot move during the walk.
 //! - Recursive traversal is depth-limited and tracks the active GC
 //!   handle stack so cyclic input fails predictably instead of
 //!   recursing without bound.
@@ -33,7 +36,7 @@ use otter_gc::GcHeap;
 use otter_gc::raw::RawGc;
 use otter_vm::error_classes::ErrorKind;
 use otter_vm::number::NumberValue;
-use otter_vm::{Value, array, collections, object};
+use otter_vm::{NativeCtx, Value, array, collections, object};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -115,7 +118,7 @@ pub struct StructuredCloneMapEntry {
 ///
 /// The id is host-assigned metadata, not a pointer and not a VM/GC
 /// handle. Message-port and ArrayBuffer transfer plumbing can use
-/// this before the JS-visible worker API exists.
+/// this owned metadata across isolate boundaries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct StructuredCloneTransferId(u64);
 
@@ -327,41 +330,41 @@ pub enum StructuredCloneTransferListError {
 
 /// Clone a VM value into an owned worker-boundary payload.
 ///
-/// This stays crate-visible until the worker API lands; exposing it
-/// publicly would leak the internal VM `Value` type through the
-/// runtime boundary.
+/// The conversion stays crate-visible because the input is an internal VM
+/// value. Public runtime boundaries carry only the owned payload.
 #[allow(
     dead_code,
-    reason = "worker postMessage plumbing will call this VM-to-owned-payload boundary"
+    reason = "private native-context conversion for owned isolate payloads"
 )]
 pub(crate) fn clone_vm_value(
     value: &Value,
-    heap: &GcHeap,
+    ctx: &NativeCtx<'_>,
 ) -> Result<StructuredCloneValue, StructuredCloneError> {
-    clone_vm_value_with_options(value, heap, StructuredCloneOptions::default())
+    clone_vm_value_with_options(value, ctx, StructuredCloneOptions::default())
 }
 
 #[allow(
     dead_code,
-    reason = "worker postMessage plumbing will call this VM-to-owned-payload boundary"
+    reason = "private native-context conversion for owned isolate payloads"
 )]
 pub(crate) fn clone_vm_value_with_options(
     value: &Value,
-    heap: &GcHeap,
+    ctx: &NativeCtx<'_>,
     options: StructuredCloneOptions,
 ) -> Result<StructuredCloneValue, StructuredCloneError> {
     let mut active = HashSet::new();
-    clone_value(value, heap, &options, 0, "$".to_string(), &mut active)
+    clone_value(value, ctx, &options, 0, "$".to_string(), &mut active)
 }
 
 fn clone_value(
     value: &Value,
-    heap: &GcHeap,
+    ctx: &NativeCtx<'_>,
     options: &StructuredCloneOptions,
     depth: usize,
     path: String,
     active: &mut HashSet<RawGc>,
 ) -> Result<StructuredCloneValue, StructuredCloneError> {
+    let heap = ctx.heap();
     if depth > options.max_depth {
         return Err(StructuredCloneError::DepthLimitExceeded {
             path,
@@ -387,17 +390,17 @@ fn clone_value(
     if let Some(s) = value.as_string(heap) {
         return Ok(StructuredCloneValue::String(s.to_lossy_string(heap)));
     }
-    if let Some(arr) = value.as_array() {
-        return clone_array(arr, heap, options, depth, path, active);
+    if let Some(len) = ctx.array_length(*value) {
+        return clone_array(*value, len, ctx, options, depth, path, active);
     }
     if let Some(map) = value.as_map() {
-        return clone_map(map, heap, options, depth, path, active);
+        return clone_map(map, ctx, options, depth, path, active);
     }
     if let Some(set) = value.as_set() {
-        return clone_set(set, heap, options, depth, path, active);
+        return clone_set(set, ctx, options, depth, path, active);
     }
     if let Some(obj) = value.as_object() {
-        return clone_object(obj, heap, options, depth, path, active);
+        return clone_object(obj, ctx, options, depth, path, active);
     }
     if let Some(proxy) = value.as_proxy() {
         // `process.env` is implemented as a Proxy over a plain backing
@@ -408,7 +411,7 @@ fn clone_value(
         if let Some(target) = target.as_object()
             && object::get(target, heap, "__otter_env_target__").is_some()
         {
-            return clone_object(target, heap, options, depth, path, active);
+            return clone_object(target, ctx, options, depth, path, active);
         }
     }
     Err(StructuredCloneError::UnsupportedValue {
@@ -418,39 +421,57 @@ fn clone_value(
 }
 
 fn clone_array(
-    array: otter_vm::array::JsArray,
-    heap: &GcHeap,
+    value: Value,
+    len: usize,
+    ctx: &NativeCtx<'_>,
     options: &StructuredCloneOptions,
     depth: usize,
     path: String,
     active: &mut HashSet<RawGc>,
 ) -> Result<StructuredCloneValue, StructuredCloneError> {
-    enter_container(array.raw(), &path, active)?;
-    let len = array::len(array, heap);
-    let values: Vec<Value> = (0..len).map(|idx| array::get(array, heap, idx)).collect();
+    let heap = ctx.heap();
+    let raw = value
+        .as_array()
+        .map(|array| array.raw())
+        .or_else(|| value.as_object().map(|object| object.raw()))
+        .expect("exact array has an array or branded object carrier");
+    enter_container(raw, &path, active)?;
+    let values: Vec<Value> = if let Some(array) = value.as_array() {
+        (0..len)
+            .map(|index| array::get(array, heap, index))
+            .collect()
+    } else {
+        let object = value.as_object().expect("branded array prototype");
+        (0..len)
+            .map(|index| {
+                object::get_own(object, heap, &index.to_string()).unwrap_or_else(Value::undefined)
+            })
+            .collect()
+    };
     let mut cloned = Vec::with_capacity(values.len());
     for (idx, value) in values.iter().enumerate() {
         cloned.push(clone_value(
             value,
-            heap,
+            ctx,
             options,
             depth + 1,
             format!("{path}[{idx}]"),
             active,
         )?);
     }
-    active.remove(&array.raw());
+    active.remove(&raw);
     Ok(StructuredCloneValue::Array(cloned))
 }
 
 fn clone_object(
     object: otter_vm::object::JsObject,
-    heap: &GcHeap,
+    ctx: &NativeCtx<'_>,
     options: &StructuredCloneOptions,
     depth: usize,
     path: String,
     active: &mut HashSet<RawGc>,
 ) -> Result<StructuredCloneValue, StructuredCloneError> {
+    let heap = ctx.heap();
     if let Some(error) = clone_error_object(object, heap) {
         return Ok(error);
     }
@@ -466,7 +487,7 @@ fn clone_object(
         let child_path = object_property_path(&path, &key);
         cloned.push(StructuredCloneProperty {
             key,
-            value: clone_value(&value, heap, options, depth + 1, child_path, active)?,
+            value: clone_value(&value, ctx, options, depth + 1, child_path, active)?,
         });
     }
     active.remove(&object.raw());
@@ -515,12 +536,13 @@ fn clone_error_object(
 
 fn clone_map(
     map: otter_vm::collections::JsMap,
-    heap: &GcHeap,
+    ctx: &NativeCtx<'_>,
     options: &StructuredCloneOptions,
     depth: usize,
     path: String,
     active: &mut HashSet<RawGc>,
 ) -> Result<StructuredCloneValue, StructuredCloneError> {
+    let heap = ctx.heap();
     enter_container(map.raw(), &path, active)?;
     let entries = collections::map_entries(map, heap);
     let mut cloned = Vec::with_capacity(entries.len());
@@ -528,7 +550,7 @@ fn clone_map(
         cloned.push(StructuredCloneMapEntry {
             key: clone_value(
                 key,
-                heap,
+                ctx,
                 options,
                 depth + 1,
                 format!("{path}<map-key:{idx}>"),
@@ -536,7 +558,7 @@ fn clone_map(
             )?,
             value: clone_value(
                 value,
-                heap,
+                ctx,
                 options,
                 depth + 1,
                 format!("{path}<map-value:{idx}>"),
@@ -550,19 +572,20 @@ fn clone_map(
 
 fn clone_set(
     set: otter_vm::collections::JsSet,
-    heap: &GcHeap,
+    ctx: &NativeCtx<'_>,
     options: &StructuredCloneOptions,
     depth: usize,
     path: String,
     active: &mut HashSet<RawGc>,
 ) -> Result<StructuredCloneValue, StructuredCloneError> {
+    let heap = ctx.heap();
     enter_container(set.raw(), &path, active)?;
     let values = collections::set_values(set, heap);
     let mut cloned = Vec::with_capacity(values.len());
     for (idx, value) in values.iter().enumerate() {
         cloned.push(clone_value(
             value,
-            heap,
+            ctx,
             options,
             depth + 1,
             format!("{path}<set-value:{idx}>"),
@@ -684,7 +707,12 @@ mod tests {
             .link_module(compiled.bytecode, sources)
             .expect("valid bytecode fixture");
         let value = interp.run(&context).expect("run fixture");
-        clone_vm_value_with_options(&value, interp.gc_heap(), options)
+        NativeCtx::with_host_context(
+            &mut interp,
+            otter_vm::NativeCallInfo::default_call(),
+            Some(&context),
+            |ctx| clone_vm_value_with_options(&value, ctx, options),
+        )
     }
 
     #[test]
@@ -731,6 +759,50 @@ mod tests {
                 },
             ])
         );
+    }
+
+    #[test]
+    fn clones_array_prototype_data_with_the_array_payload_category() {
+        let cloned = clone_js_value(
+            "Object.prototype[1] = 99; Array.prototype[0] = 7; Array.prototype.length = 2; Array.prototype;",
+        )
+        .unwrap();
+        assert_eq!(
+            cloned,
+            StructuredCloneValue::Array(vec![
+                StructuredCloneValue::Number(StructuredCloneNumber::from_f64(7.0)),
+                StructuredCloneValue::Undefined,
+            ])
+        );
+    }
+
+    #[test]
+    fn array_prototype_payload_keeps_data_only_and_proxy_rejection() {
+        let cloned = clone_js_value(
+            r#"
+            Object.defineProperty(Array.prototype, "0", {
+                get() { throw "getter must not run"; }, configurable: true
+            });
+            Array.prototype.length = 1;
+            Array.prototype;
+            "#,
+        )
+        .unwrap();
+        assert_eq!(
+            cloned,
+            StructuredCloneValue::Array(vec![StructuredCloneValue::Undefined])
+        );
+        assert_eq!(
+            clone_js_value("new Proxy(Array.prototype, {});").unwrap_err(),
+            StructuredCloneError::UnsupportedValue {
+                path: "$".to_string(),
+                type_name: "proxy",
+            }
+        );
+        assert!(matches!(
+            clone_js_value("Object.create(Array.prototype);").unwrap(),
+            StructuredCloneValue::Object(properties) if properties.is_empty()
+        ));
     }
 
     #[test]

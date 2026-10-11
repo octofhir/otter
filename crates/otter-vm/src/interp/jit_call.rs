@@ -10,6 +10,8 @@
 //! reconciled once after the outer native activation returns. That outer
 //! boundary owns one post-entry transaction which roots and collector-rewrites
 //! a validated compiled Return/Throw payload across the cold reconciliation.
+//! Allocation-exit diagnostics follow the emitted operation's typed reason,
+//! not the source opcode shared by receiver and intrinsic value construction.
 //!
 //! # Invariants
 //! Bail diagnostics resolve the defining function owner across script boundaries.
@@ -89,33 +91,10 @@ impl Interpreter {
         )
     }
 
-    /// Count a generated receiver-allocation miss that left compiled code
-    /// through an exact `AllocationMiss` exit instead of the cold allocation
-    /// sibling, so every counted probe miss has exactly one completion.
-    pub(crate) fn note_receiver_allocation_exit(
-        &mut self,
-        context: &ExecutionContext,
-        fid: u32,
-        pc: u32,
-        exit: SideExit,
-    ) {
-        if exit.reason() != native_abi::ExitReason::AllocationMiss {
-            return;
-        }
-        let construct = context
-            .exec_function(fid)
-            .and_then(|function| {
-                function
-                    .instr_at_index(pc as usize)
-                    .map(|instruction| function.op(instruction))
-            })
-            .is_some_and(|op| {
-                matches!(
-                    op,
-                    Op::New | Op::NewSpread | Op::SuperConstruct | Op::SuperConstructSpread
-                )
-            });
-        if construct {
+    /// Count an exact emitted receiver-allocation exit. Value allocation from
+    /// the same ordinary `New` opcode carries a different semantic reason.
+    pub(crate) fn note_receiver_allocation_exit(&mut self, exit: SideExit) {
+        if exit.reason() == native_abi::ExitReason::ReceiverAllocationMiss {
             self.jit_runtime_stats.receiver_alloc_deopts = self
                 .jit_runtime_stats
                 .receiver_alloc_deopts
@@ -134,7 +113,7 @@ impl Interpreter {
         let pc = exit.logical_pc();
         // Optimizing exits are counted by their site-aware owner.
         if tier == jit_debug::JitDebugTier::Template {
-            self.note_receiver_allocation_exit(context, fid, pc, exit);
+            self.note_receiver_allocation_exit(exit);
         }
         self.record_jit_debug_event(|| {
             let owner = context.for_function(fid).ok();
@@ -365,7 +344,7 @@ impl Interpreter {
         // marked disabled by `prepare_osr`, so it should not keep counting) and
         // attempt OSR.
         self.jit_runtime_stats.osr_attempts = self.jit_runtime_stats.osr_attempts.saturating_add(1);
-        
+
         self.prepare_osr(stack, context, top_idx, optimizing_enabled)
     }
 
@@ -720,7 +699,7 @@ impl Interpreter {
             .is_current_generation(exited_code_object_id);
         self.jit_runtime_stats.optimized_deopts =
             self.jit_runtime_stats.optimized_deopts.saturating_add(1);
-        self.note_receiver_allocation_exit(context, site_fid, site_pc, exit);
+        self.note_receiver_allocation_exit(exit);
         let population = (exit.reason() == native_abi::ExitReason::ShapeGuard)
             .then(|| {
                 context
@@ -1539,6 +1518,56 @@ mod tests {
             crate::source_registry::SourceRegistry::default(),
         )
         .expect("valid bytecode fixture")
+    }
+
+    #[test]
+    fn ordinary_new_value_miss_does_not_count_as_receiver_allocation() {
+        let mut code = FunctionCodeBuilder::new();
+        code.push(
+            Op::New,
+            &[
+                Operand::Register(2),
+                Operand::Register(0),
+                Operand::ConstIndex(1),
+                Operand::Register(1),
+            ],
+        );
+        code.push(Op::ReturnValue, &[Operand::Register(2)]);
+        let mut module = crate::test_support::minimal_bytecode_module("allocation-exit-owner.js");
+        module.functions[0].locals = 3;
+        module.functions[0].code = code.finish();
+        let context = ExecutionContext::from_module(
+            module,
+            crate::source_registry::SourceRegistry::default(),
+        )
+        .expect("ordinary construction source");
+        let mut vm = Interpreter::new().expect("fixture interpreter bootstrap");
+        vm.jit_code_registry
+            .register(
+                91,
+                selective_code(91, 0, native_abi::NativeFrameKind::Optimizing, &[], &[]),
+            )
+            .unwrap();
+
+        let value_miss = SideExit::new(
+            0,
+            native_abi::ExitReason::AllocationMiss,
+            native_abi::ExitAction::Resume,
+        );
+        vm.note_jit_optimized_bail(&context, 0, 91, value_miss, false);
+        assert_eq!(vm.jit_runtime_stats.receiver_alloc_deopts, 0);
+
+        let receiver_miss = SideExit::new(
+            0,
+            native_abi::ExitReason::ReceiverAllocationMiss,
+            native_abi::ExitAction::Resume,
+        );
+        vm.note_jit_optimized_bail(&context, 0, 91, receiver_miss, false);
+        assert_eq!(vm.jit_runtime_stats.receiver_alloc_deopts, 1);
+        assert_eq!(vm.jit_runtime_stats.optimized_deopts, 2);
+        assert_eq!(vm.jit_optimized_exit_profiles.len(), 2);
+        assert!(vm.jit_code_registry.is_current_generation(91));
+        assert!(!vm.jit_retraining_blocks(0));
     }
 
     #[derive(Debug)]

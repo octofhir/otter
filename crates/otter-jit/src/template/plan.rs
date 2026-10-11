@@ -60,6 +60,7 @@ use crate::entry::{
     BaselinePlan, PACKED_REGISTER_LANES, Unsupported, pack_register_lanes, unpack_register_lanes,
     value_tag,
 };
+use crate::intrinsic_calls::{IntrinsicCallForm, proof_form};
 
 /// Numeric binary operators lowered to the shared int32/double template plus
 /// the common VM numeric completion. `+` has its own operation
@@ -300,8 +301,6 @@ pub(crate) enum TemplateOp {
         value0: Option<u16>,
         value1: Option<u16>,
     },
-    /// `r<dst>` = builtin error constructor for `constant`.
-    LoadBuiltinError { dst: u16, constant: u32 },
     /// `r<dst> = {}`.
     NewObject { dst: u16 },
     /// `r<dst> = arguments` built from the activation's actual arguments.
@@ -515,7 +514,7 @@ pub(crate) enum TemplateOp {
         arg1: u64,
         arg2: u64,
     },
-    /// Complete one static value-load opcode (`MathLoad`, `SymbolLoad`,
+    /// Complete one static value-load opcode (`SymbolLoad`,
     /// `TemporalLoad`, `GetStringIndex`) through the shared
     /// reentrant value-load transition. `arg0`/`arg1`/`arg2` name the
     /// destination plus a constant name index or receiver/index registers.
@@ -551,23 +550,15 @@ pub(crate) enum TemplateOp {
         arg1: u64,
         arg2: u64,
     },
-    /// Allocate `Array()` or `Array(Int32)` through the VM-owned rooted
-    /// allocating ABI. `None` is the zero-argument form; every guarded miss
-    /// exits at the original opcode before construction begins.
-    ArrayConstruct {
+    /// Execute an intrinsic operation after proving the already evaluated
+    /// callable against its source-realm identity cell. A miss resumes the
+    /// ordinary call or construction with the evaluated arguments intact.
+    IntrinsicCall {
         dst: u16,
-        length: Option<u16>,
-        safepoint: SafepointId,
-    },
-    /// Complete one variadic construction opcode (`ArrayConstruct`, `ArrayFrom`,
-    /// `ArrayOf`, `QueueMicrotask`) through the shared reentrant variadic
-    /// transition. `prefix` is the destination/callee register, `argc` the
-    /// argument count, and `packed_args` the argument registers.
-    VariadicOp {
-        opcode: u8,
-        prefix: u16,
-        argc: u16,
-        packed_args: u64,
+        callee: u16,
+        argument: Option<u16>,
+        proof: otter_vm::JitIntrinsicCallProof,
+        form: IntrinsicCallForm,
     },
     /// Complete one static intrinsic-call opcode (`ArrayBufferCall`,
     /// `SharedArrayBufferCall`, `BigIntCall`, `DataViewCall`) through the shared
@@ -665,6 +656,33 @@ pub(crate) struct TemplatePlan {
     /// `true` when at least one opcode outside the subset was lowered to an
     /// exact side exit; such code serves loop OSR only.
     pub(crate) osr_only: bool,
+}
+
+/// Select a native operation from the evaluated callable's source-owned proof.
+fn intrinsic_call(
+    view: &JitCompileSnapshot,
+    byte_pc: u32,
+    dst: u16,
+    callee: u16,
+    arguments: &[u16],
+    construct: bool,
+) -> Option<TemplateOp> {
+    let otter_vm::JitNativeCall::Intrinsic(proof) = *view.native_calls.get(&byte_pc)? else {
+        return None;
+    };
+    let form = proof_form(
+        proof,
+        view.literal_allocations.realm_id,
+        construct,
+        arguments.len(),
+    )?;
+    Some(TemplateOp::IntrinsicCall {
+        dst,
+        callee,
+        argument: arguments.first().copied(),
+        proof,
+        form,
+    })
 }
 
 /// Pack a call's argument registers inline (up to [`PACKED_REGISTER_LANES`] u16
@@ -1078,13 +1096,6 @@ impl TemplatePlan {
                         constant: operands.constant,
                     }
                 }
-                Op::LoadBuiltinError => {
-                    let operands = lowered.constant_operands()?;
-                    TemplateOp::LoadBuiltinError {
-                        dst: operands.dst,
-                        constant: operands.constant,
-                    }
-                }
                 Op::NewObject => TemplateOp::NewObject {
                     dst: lowered.destination_operands()?.dst,
                 },
@@ -1174,13 +1185,21 @@ impl TemplatePlan {
                 Op::Call => {
                     let operands = lowered.call_operands()?;
                     let arguments = lowering.register_tail(operands.arguments)?;
-                    TemplateOp::Call {
+                    intrinsic_call(
+                        view,
+                        meta.byte_pc,
+                        operands.dst,
+                        operands.callee,
+                        arguments,
+                        false,
+                    )
+                    .unwrap_or_else(|| TemplateOp::Call {
                         dst: operands.dst,
                         callee: operands.callee,
                         argc: arguments.len() as u16,
                         packed_args: pack_or_spill_arg_regs(arguments, &mut register_operands),
                         byte_pc: meta.byte_pc,
-                    }
+                    })
                 }
                 Op::TailCall => {
                     let operands = lowered.call_operands()?;
@@ -1241,14 +1260,22 @@ impl TemplatePlan {
                 Op::New => {
                     let operands = lowered.call_operands()?;
                     let arguments = lowering.register_tail(operands.arguments)?;
-                    TemplateOp::Construct {
+                    intrinsic_call(
+                        view,
+                        meta.byte_pc,
+                        operands.dst,
+                        operands.callee,
+                        arguments,
+                        true,
+                    )
+                    .unwrap_or_else(|| TemplateOp::Construct {
                         dst: operands.dst,
                         callee: operands.callee,
                         argc: arguments.len() as u16,
                         packed_args: pack_or_spill_arg_regs(arguments, &mut register_operands),
                         super_construct: false,
                         byte_pc: lowered.byte_pc,
-                    }
+                    })
                 }
                 Op::SuperConstruct => {
                     let operands = lowered.call_operands()?;
@@ -1380,7 +1407,7 @@ impl TemplatePlan {
                         arg2: 0,
                     }
                 }
-                Op::MathLoad | Op::SymbolLoad | Op::TemporalLoad => {
+                Op::SymbolLoad | Op::TemporalLoad => {
                     let operands = lowered.constant_operands()?;
                     TemplateOp::ValueLoadOp {
                         opcode: lowered.op as u8,
@@ -1446,59 +1473,6 @@ impl TemplatePlan {
                         arg2: u64::from(operands.value),
                     }
                 }
-                Op::ArrayConstruct => {
-                    let operands = lowered.new_array_operands()?;
-                    let arguments = lowering.register_tail(operands.elements)?;
-                    if arguments.len() <= 1 {
-                        let safepoint = lowering
-                            .array_construct_alloc_safepoints
-                            .get(&lowered.byte_pc)
-                            .copied()
-                            .ok_or(Unsupported::OperandShape(
-                                "ArrayConstruct without a safepoint",
-                            ))?;
-                        TemplateOp::ArrayConstruct {
-                            dst: operands.dst,
-                            length: arguments.first().copied(),
-                            safepoint,
-                        }
-                    } else {
-                        if arguments.len() > PACKED_REGISTER_LANES {
-                            osr_only = true;
-                            instructions.push(TemplateInstr {
-                                pc,
-                                byte_pc: lowered.byte_pc,
-                                op: TemplateOp::UnsupportedBail,
-                            });
-                            continue;
-                        }
-                        TemplateOp::VariadicOp {
-                            opcode: lowered.op as u8,
-                            prefix: operands.dst,
-                            argc: arguments.len() as u16,
-                            packed_args: pack_register_lanes(arguments),
-                        }
-                    }
-                }
-                Op::ArrayFrom | Op::ArrayOf | Op::QueueMicrotask => {
-                    let operands = lowered.new_array_operands()?;
-                    let arguments = lowering.register_tail(operands.elements)?;
-                    if arguments.len() > PACKED_REGISTER_LANES {
-                        osr_only = true;
-                        instructions.push(TemplateInstr {
-                            pc,
-                            byte_pc: lowered.byte_pc,
-                            op: TemplateOp::UnsupportedBail,
-                        });
-                        continue;
-                    }
-                    TemplateOp::VariadicOp {
-                        opcode: lowered.op as u8,
-                        prefix: operands.dst,
-                        argc: arguments.len() as u16,
-                        packed_args: pack_register_lanes(arguments),
-                    }
-                }
                 Op::ArrayBufferCall
                 | Op::SharedArrayBufferCall
                 | Op::BigIntCall
@@ -1522,18 +1496,9 @@ impl TemplatePlan {
                     }
                 }
                 Op::NewError => {
-                    let operands = lowered.unary_operands()?;
-                    TemplateOp::ScalarValue {
-                        operation: ScalarValueOp::NewError,
-                        result: operands.dst,
-                        value0: Some(operands.src),
-                        value1: None,
-                    }
-                }
-                Op::NewBuiltinError => {
                     let operands = lowered.global_store_operands()?;
                     TemplateOp::ScalarValue {
-                        operation: ScalarValueOp::NewBuiltinError,
+                        operation: ScalarValueOp::NewError,
                         result: operands.value,
                         value0: Some(u16::try_from(operands.extra).map_err(|_| {
                             Unsupported::OperandShape("native error message register")
@@ -1568,25 +1533,6 @@ impl TemplatePlan {
                             | (u64::from(operands.prototype) << 32)
                             | (u64::from(operands.statics) << 48),
                         arg1: u64::from(operands.parent),
-                        arg2: 0,
-                    }
-                }
-                Op::NewFunction => {
-                    let operands = lowered.new_array_operands()?;
-                    let arguments = lowering.register_tail(operands.elements)?;
-                    if arguments.len() > PACKED_REGISTER_LANES {
-                        osr_only = true;
-                        instructions.push(TemplateInstr {
-                            pc,
-                            byte_pc: lowered.byte_pc,
-                            op: TemplateOp::UnsupportedBail,
-                        });
-                        continue;
-                    }
-                    TemplateOp::ClassValueOp {
-                        opcode: Op::NewFunction as u8,
-                        arg0: u64::from(operands.dst) | ((arguments.len() as u64) << 16),
-                        arg1: pack_register_lanes(arguments),
                         arg2: 0,
                     }
                 }
@@ -1734,7 +1680,6 @@ impl TemplatePlan {
                 Op::ToObject
                 | Op::ToPropertyKey
                 | Op::TypeOf
-                | Op::IsArray
                 | Op::ArrayLength
                 | Op::LoadLength
                 | Op::LoadArgumentsElement => {
@@ -1743,7 +1688,6 @@ impl TemplatePlan {
                         Op::ToObject => ScalarValueOp::ToObject,
                         Op::ToPropertyKey => ScalarValueOp::ToPropertyKey,
                         Op::TypeOf => ScalarValueOp::TypeOf,
-                        Op::IsArray => ScalarValueOp::IsArray,
                         Op::ArrayLength => ScalarValueOp::ArrayLength,
                         Op::LoadLength => ScalarValueOp::LoadLength,
                         Op::LoadArgumentsElement => ScalarValueOp::LoadArgumentsElement,
@@ -3071,44 +3015,94 @@ mod tests {
     }
 
     #[test]
-    fn plan_uses_typed_array_construct_for_zero_and_one_argument() {
-        let v = view(&[
+    fn intrinsic_plans_retain_evaluated_operands_and_the_call_source_record() {
+        let mut v = view(&[
             (
-                Op::ArrayConstruct,
-                vec![Operand::Register(0), Operand::ConstIndex(0)],
+                Op::New,
+                vec![
+                    Operand::Register(0),
+                    Operand::Register(3),
+                    Operand::ConstIndex(0),
+                ],
             ),
             (
-                Op::ArrayConstruct,
+                Op::Call,
                 vec![
                     Operand::Register(1),
+                    Operand::Register(4),
                     Operand::ConstIndex(1),
                     Operand::Register(2),
                 ],
             ),
             (Op::ReturnValue, vec![Operand::Register(1)]),
         ]);
+        let proof = otter_vm::JitIntrinsicCallProof {
+            kind: otter_vm::IntrinsicCallKind::Array,
+            identity_cell: 16,
+            realm_id: v.literal_allocations.realm_id,
+        };
+        for instruction in &v.instructions[..2] {
+            v.native_calls.insert(
+                instruction.byte_pc,
+                otter_vm::JitNativeCall::Intrinsic(proof),
+            );
+        }
         let plan = TemplatePlan::build(&v).expect("plan");
-        let TemplateOp::ArrayConstruct {
+        let TemplateOp::IntrinsicCall {
             dst: 0,
-            length: None,
-            safepoint: zero_safepoint,
+            callee: 3,
+            argument: None,
+            form: IntrinsicCallForm::ArrayEmpty,
+            proof: empty_proof,
         } = plan.instructions[0].op
         else {
-            panic!("expected zero-argument typed ArrayConstruct");
+            panic!("expected proven empty array operation");
         };
-        let TemplateOp::ArrayConstruct {
+        let TemplateOp::IntrinsicCall {
             dst: 1,
-            length: Some(2),
-            safepoint: length_safepoint,
+            callee: 4,
+            argument: Some(2),
+            form: IntrinsicCallForm::ArrayLength,
+            proof: length_proof,
         } = plan.instructions[1].op
         else {
-            panic!("expected one-argument typed ArrayConstruct");
+            panic!("expected proven length array operation");
         };
-        assert_ne!(zero_safepoint, length_safepoint);
-        for id in [zero_safepoint, length_safepoint] {
-            assert!(plan.safepoint_records.iter().any(|record| record.id == id));
-        }
+        assert_eq!(empty_proof, proof);
+        assert_eq!(length_proof, proof);
+        assert_eq!(plan.safepoint_records.len(), v.safepoints.len());
         assert!(!plan.osr_only);
+    }
+
+    #[test]
+    fn intrinsic_plans_decline_unheld_foreign_and_wrapping_calls() {
+        let mut v = view(&[(
+            Op::New,
+            vec![
+                Operand::Register(0),
+                Operand::Register(1),
+                Operand::ConstIndex(0),
+            ],
+        )]);
+        for (kind, identity_cell, realm_id) in [
+            (otter_vm::IntrinsicCallKind::Array, 0, 0),
+            (otter_vm::IntrinsicCallKind::Array, 16, 1),
+            (otter_vm::IntrinsicCallKind::Boolean, 16, 0),
+            (otter_vm::IntrinsicCallKind::Number, 16, 0),
+        ] {
+            v.native_calls.insert(
+                0,
+                otter_vm::JitNativeCall::Intrinsic(otter_vm::JitIntrinsicCallProof {
+                    kind,
+                    identity_cell,
+                    realm_id,
+                }),
+            );
+            assert!(matches!(
+                TemplatePlan::build(&v).unwrap().instructions[0].op,
+                TemplateOp::Construct { .. }
+            ));
+        }
     }
 
     #[test]

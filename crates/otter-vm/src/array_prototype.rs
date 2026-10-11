@@ -27,6 +27,8 @@
 //!   slab growth, length coercions, and reentrant setters.
 //! - Species-created arrays and their receivers stay in the interpreter handle
 //!   arena across every allocating property operation.
+//! - String conversion roots its receiver across `join` and tag getters;
+//!   fallback builtin classification precedes the observable tag read.
 //! - Callback and comparator paths append above the current activation floor;
 //!   sort operands live in traced anchors while merge buffers store only stable
 //!   anchor indices.
@@ -989,8 +991,7 @@ pub(crate) fn length_of_array_like(
     } else {
         len_val
     };
-    crate::to_length(&len_val, interp.gc_heap())
-        .map_err(CommittedValueError::JavaScript)
+    crate::to_length(&len_val, interp.gc_heap()).map_err(CommittedValueError::JavaScript)
 }
 
 /// §23.1.3.17 / §23.1.3.22 live search for `indexOf` and `lastIndexOf`.
@@ -1596,29 +1597,6 @@ impl Interpreter {
         })
     }
 
-    /// §7.2.2 `IsArray`: an Array exotic object, or a non-revoked
-    /// Proxy whose target chain bottoms out in one. A revoked Proxy is
-    /// an abrupt TypeError.
-    pub(crate) fn is_array_spec(&self, value: &Value) -> Result<bool, VmError> {
-        let mut current = *value;
-        for _ in 0..=object::PROTO_CHAIN_HARD_CAP {
-            if current.is_array() {
-                return Ok(true);
-            }
-            let Some(proxy) = current.as_proxy() else {
-                return Ok(false);
-            };
-            if proxy.is_revoked(&self.gc_heap) {
-                return Err(self.err_type(
-                    ("Cannot perform 'IsArray' on a proxy that has been revoked".to_string())
-                        .into(),
-                ));
-            }
-            current = proxy.target(&self.gc_heap);
-        }
-        Ok(false)
-    }
-
     /// §23.1.3.13.1 FlattenIntoArray. Recurses into nested arrays while
     /// `depth > 0`, applying `mapper` (the `flatMap` callback) only at
     /// the top level. Reads each source index through the observable
@@ -1691,7 +1669,7 @@ impl Interpreter {
                     let element = this.iteration_anchor(element_slot);
                     if depth > 0
                         && this
-                            .is_array_spec(&element)
+                            .is_array(&element)
                             .map_err(CommittedValueError::JavaScript)?
                     {
                         let element = this.iteration_anchor(element_slot);
@@ -1964,63 +1942,79 @@ impl Interpreter {
         receiver: Value,
         roots: &[&[Value]],
     ) -> Result<Value, CommittedValueError> {
-        let o = if receiver.is_object_type() {
-            receiver
-        } else {
-            self.box_sloppy_this_primitive_runtime_rooted(receiver, roots)
-                .map_err(CommittedValueError::JavaScript)?
-        };
-        let func = self.get_property_value_for_call(stack, context, o, "join")?;
-        if self.is_callable_runtime(&func) {
-            return self
-                .run_callable_sync_rooted(stack, Some(context), &func, o, SmallVec::new())
-                .map_err(CommittedValueError::completed_call);
-        }
-        self.ordinary_object_to_string(stack, context, o)
+        self.with_handle_scope(|interp, scope| {
+            let receiver_root = interp.scoped_value(scope, receiver);
+            let receiver = interp.escape_scoped(receiver_root);
+            let o = if receiver.is_object_type() {
+                receiver
+            } else {
+                interp
+                    .box_sloppy_this_primitive_runtime_rooted(receiver, roots)
+                    .map_err(CommittedValueError::JavaScript)?
+            };
+            let object_root = interp.scoped_value(scope, o);
+            let func = interp.get_property_value_for_call(stack, context, o, "join")?;
+            let o = interp.escape_scoped(object_root);
+            if interp.is_callable_runtime(&func) {
+                return interp
+                    .run_callable_sync_rooted(stack, Some(context), &func, o, SmallVec::new())
+                    .map_err(CommittedValueError::completed_call);
+            }
+            interp.ordinary_object_to_string(stack, context, o)
+        })
     }
 
-    /// §20.1.3.6 `%Object.prototype.toString%` applied to `o`: a string
-    /// `@@toStringTag` overrides the builtin tag, yielding
-    /// `"[object <tag>]"`. Shared fallback for `Array.prototype.toString`.
-    fn ordinary_object_to_string(
+    /// §20.1.3.6 `%Object.prototype.toString%`: root and box the receiver,
+    /// classify its builtin tag, then read its observable `@@toStringTag`.
+    /// Shared by the native entry and `Array.prototype.toString` fallback.
+    pub(crate) fn ordinary_object_to_string(
         &mut self,
         stack: &mut ActivationStack,
         context: &ExecutionContext,
         o: Value,
     ) -> Result<Value, CommittedValueError> {
         self.with_handle_scope(|interp, scope| {
-            let receiver_root = interp.scoped_value(scope, o);
+            let input_root = interp.scoped_value(scope, o);
+            let input = interp.escape_scoped(input_root);
+            let receiver = if input.is_nullish() || input.is_hole() || input.is_object_type() {
+                input
+            } else {
+                interp
+                    .box_sloppy_this_primitive_runtime_rooted(input, &[])
+                    .map_err(CommittedValueError::JavaScript)?
+            };
+            let receiver_root = interp.scoped_value(scope, receiver);
+            let builtin_tag = crate::object_statics::builtin_to_string_tag_value(receiver, interp)
+                .map_err(CommittedValueError::JavaScript)?;
 
             let tag_sym = interp.well_known_symbols().get(WellKnown::ToStringTag);
-            let explicit = match interp.ordinary_get_value(
-                stack,
-                Some(context),
-                o,
-                o,
-                &crate::VmPropertyKey::Symbol(tag_sym),
-                0,
-            )? {
-                crate::VmGetOutcome::Value(v) => v,
-                crate::VmGetOutcome::InvokeGetter { getter } => interp
-                    .run_callable_sync_rooted(
-                        stack,
-                        Some(context),
-                        &getter,
-                        interp.escape_scoped(receiver_root),
-                        SmallVec::new(),
-                    )
-                    .map_err(CommittedValueError::completed_call)?,
+            let explicit = if receiver.is_nullish() || receiver.is_hole() {
+                Value::undefined()
+            } else {
+                match interp.ordinary_get_value(
+                    stack,
+                    Some(context),
+                    receiver,
+                    receiver,
+                    &crate::VmPropertyKey::Symbol(tag_sym),
+                    0,
+                )? {
+                    crate::VmGetOutcome::Value(v) => v,
+                    crate::VmGetOutcome::InvokeGetter { getter } => interp
+                        .run_callable_sync_rooted(
+                            stack,
+                            Some(context),
+                            &getter,
+                            interp.escape_scoped(receiver_root),
+                            SmallVec::new(),
+                        )
+                        .map_err(CommittedValueError::completed_call)?,
+                }
             };
             let tag = explicit
                 .as_string(interp.gc_heap())
-                .map(|s| s.to_lossy_string(interp.gc_heap()))
-                .unwrap_or_else(|| {
-                    crate::object_statics::builtin_to_string_tag_value(
-                        interp.escape_scoped(receiver_root),
-                        interp,
-                    )
-                });
-            let display = format!("[object {tag}]");
+                .map(|s| s.to_lossy_string(interp.gc_heap()));
+            let display = format!("[object {}]", tag.as_deref().unwrap_or(builtin_tag));
             Ok(Value::string(
                 JsString::from_str(&display, interp.gc_heap_mut())
                     .map_err(|error| CommittedValueError::JavaScript(error.into()))?,
@@ -2184,7 +2178,7 @@ impl Interpreter {
                 // §7.2.2 unwraps a Proxy to its target (throwing for a
                 // revoked proxy) rather than only matching a bare Array.
                 interp
-                    .is_array_spec(&interp.escape_scoped(receiver_root))
+                    .is_array(&interp.escape_scoped(receiver_root))
                     .map_err(CommittedValueError::JavaScript)
             } else {
                 Ok(spread.to_boolean(interp.gc_heap()))
@@ -3424,7 +3418,7 @@ impl Interpreter {
             }
 
             if !interp
-                .array_species_is_array(context, interp.escape_scoped(original_root))
+                .is_array(&interp.escape_scoped(original_root))
                 .map_err(CommittedValueError::JavaScript)?
             {
                 return interp
@@ -3537,33 +3531,6 @@ impl Interpreter {
             let array = interp.scoped_array(scope, length)?;
             Ok(interp.escape_scoped(array))
         })
-    }
-
-    fn array_species_is_array(
-        &self,
-        _context: &ExecutionContext,
-        original: Value,
-    ) -> Result<bool, VmError> {
-        let mut current = original;
-        let mut hops = 0usize;
-        loop {
-            if current.is_array() {
-                return Ok(true);
-            }
-            let Some(proxy) = current.as_proxy() else {
-                return Ok(false);
-            };
-            if proxy.is_revoked(&self.gc_heap) {
-                return Err(self.err_type(
-                    ("Cannot perform IsArray on a proxy that has been revoked".to_string()).into(),
-                ));
-            }
-            if hops >= object::PROTO_CHAIN_HARD_CAP {
-                return Ok(false);
-            }
-            current = proxy.target(&self.gc_heap);
-            hops += 1;
-        }
     }
 
     /// `CreateDataProperty(target, idx, value)` specialised for an integer

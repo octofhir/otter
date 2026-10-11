@@ -129,43 +129,12 @@ impl Interpreter {
             && self.shape_offset_of(shape, key).is_none()
     }
 
-    pub(crate) fn update_array_prototype_length_after_index_store(
-        &mut self,
-        mut obj: object::JsObject,
-        key: &str,
-    ) -> Result<(), VmError> {
-        let Some(index) = object::array_index_property_name(key) else {
-            return Ok(());
-        };
-        // An indexed property on a realm prototype becomes visible through
-        // every ordinary dense array's holes, so the element fast paths that
-        // answer a hole as `undefined` have to stop taking their shortcut.
-        // Assignment reaches the object through this shape-advancing store
-        // rather than through `define_own_property`, so the latch is tripped
-        // from both places.
-        if self.realm_intrinsics.array_prototype() == Some(obj)
-            || self.realm_intrinsics.object_prototype() == Some(obj)
+    fn observe_element_prototype_store(&mut self, object: object::JsObject, key: &str) {
+        if object::array_index_property_name(key).is_some()
+            && self.is_realm_element_prototype(Value::object(object))
         {
             self.activate_array_index_accessor_protector();
         }
-        if self.realm_intrinsics.array_prototype() != Some(obj) {
-            return Ok(());
-        }
-        let new_len = f64::from(index) + 1.0;
-        let current = object::get(obj, &self.gc_heap, "length")
-            .and_then(|value| value.as_number())
-            .map(|number| number.as_f64())
-            .unwrap_or(0.0);
-        if new_len > current
-            && !object::ordinary_set_data_property(
-                &mut obj,
-                &mut self.gc_heap,
-                "length",
-                Value::number(NumberValue::from_f64(new_len)),
-            )? {
-                return Err(VmError::TypeMismatch);
-            }
-        Ok(())
     }
 
     /// Descriptor-aware data assignment that advances the object's GC-managed
@@ -203,7 +172,7 @@ impl Interpreter {
             object::ordinary_set_data_property(&mut obj, &mut self.gc_heap, key, value)?
         };
         if ok {
-            self.update_array_prototype_length_after_index_store(obj, key)?;
+            self.observe_element_prototype_store(obj, key);
         }
         Ok(ok)
     }
@@ -244,7 +213,7 @@ impl Interpreter {
         if !accepted {
             return Err(VmError::TypeMismatch);
         }
-        self.update_array_prototype_length_after_index_store(*obj, key)?;
+        self.observe_element_prototype_store(*obj, key);
         Ok(())
     }
 

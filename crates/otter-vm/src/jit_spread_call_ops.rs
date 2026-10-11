@@ -145,6 +145,7 @@ impl Interpreter {
                 method = interp
                     .get_method_value_for_call(context, stack, receiver, method_key)?
                     .unwrap_or_else(Value::undefined);
+                receiver = interp.iteration_anchor(receiver_anchor);
             }
             if !interp.is_callable_runtime(&method) {
                 return Err(CommittedValueError::JavaScript(VmError::NotCallable));

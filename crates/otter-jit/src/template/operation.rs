@@ -83,7 +83,6 @@ pub(crate) struct AllocPacket {
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct OperationExits {
     pub(crate) type_mismatch_exit: DynamicLabel,
-    #[cfg(target_arch = "aarch64")]
     pub(crate) identity_guard_exit: DynamicLabel,
     pub(crate) allocation_miss_exit: DynamicLabel,
     pub(crate) unsupported_exit: DynamicLabel,

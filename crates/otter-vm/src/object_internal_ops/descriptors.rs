@@ -254,9 +254,7 @@ impl Interpreter {
                                 Some(idx) => Some(object::PropertyDescriptor::data(
                                     t.get(&mut self.gc_heap, idx)
                                         .map_err(crate::oom_to_vm)
-                                        .map_err(|error| {
-                                            CommittedValueError::JavaScript(error)
-                                        })?,
+                                        .map_err(CommittedValueError::JavaScript)?,
                                     true,
                                     true,
                                     true,
@@ -1077,6 +1075,15 @@ impl Interpreter {
         .into_iter()
         .flatten()
         .any(|prototype| prototype == object)
+            || self.extra_realms.iter().any(|realm| {
+                [
+                    realm.realm_intrinsics.array_prototype(),
+                    realm.realm_intrinsics.object_prototype(),
+                ]
+                .into_iter()
+                .flatten()
+                .any(|prototype| prototype == object)
+            })
     }
 
     /// Flip the existing array-index accessor protector latch and publish its

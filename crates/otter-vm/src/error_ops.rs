@@ -1,21 +1,19 @@
 //! Error-object opcode helpers.
 //!
-//! Error constructors are fixed-width bytecodes and should stay on the compact
+//! Intrinsic error creation is fixed-width bytecode and stays on the compact
 //! executable operand path instead of the fallback operand-slice path.
 //!
 //! # Contents
-//! - `new Error(message)` object allocation.
-//! - Native error constructor allocation (`TypeError`, `RangeError`, ...).
-//! - Native error constructor loading for identifier reads.
+//! - Intrinsic error allocation for implicit language failures.
 //! - One-shot native completion projection for direct semantic opcodes.
 //!
 //! # Invariants
 //! - Error kind names are compiler-emitted string constants.
 //! - Allocated instances come from the interpreter's `ErrorClassRegistry` so
 //!   prototype identity matches `instanceof`.
-//! - VM-raised errors use the top bytecode frame's `[[Realm]]`; linked
-//!   function metadata carries only scalar realm ids, and the existing traced
-//!   realm swap owns all moving-GC state.
+//! - Implicit error kind constants and intrinsic prototypes use the same source
+//!   function, including logical inline descendants. Linked metadata carries
+//!   scalar realm ids; the existing traced realm swap owns all moving-GC state.
 //! - Message coercion and error allocation share one rooted value kernel.
 //!   Construction stacks include published native frames and deopt owners once.
 //! - Native failures synthesized inside a runtime turn retain that turn's
@@ -44,33 +42,12 @@ use crate::native_abi::CommittedValueError;
 use crate::rooting::RootScopeExt;
 
 use crate::{
-    ActiveFrameMut, ErrorKind, ExecutionContext, Frame, Interpreter, JsString, NativeError, Value,
-    VmError, error_classes, object, read_register, symbol_dispatch, write_register,
+    ErrorKind, ExecutionContext, Interpreter, JsString, NativeError, Value, VmError, error_classes,
+    object, read_register, symbol_dispatch, write_register,
 };
 
 impl Interpreter {
     pub(crate) fn run_new_error_regs(
-        &mut self,
-        context: &ExecutionContext,
-        stack: &mut ActivationStack,
-        top_idx: usize,
-        dst: u16,
-        msg_reg: u16,
-    ) -> Result<(), CommittedValueError> {
-        let frame = &stack[top_idx];
-        let value = *read_register(frame, msg_reg)
-            .map_err(CommittedValueError::Fatal)?;
-        let value = self.new_error_value(context, stack, ErrorKind::Error, value)?;
-        let frame = &mut stack[top_idx];
-        write_register(frame, dst, value)
-            .map_err(CommittedValueError::Fatal)?;
-        frame
-            .advance_pc()
-            .map_err(CommittedValueError::Fatal)?;
-        Ok(())
-    }
-
-    pub(crate) fn run_new_builtin_error_regs(
         &mut self,
         context: &ExecutionContext,
         stack: &mut ActivationStack,
@@ -90,39 +67,46 @@ impl Interpreter {
             .ok_or(VmError::InvalidOperand)
             .map_err(CommittedValueError::Fatal)?;
         let frame = &stack[top_idx];
-        let value = *read_register(frame, msg_reg)
-            .map_err(CommittedValueError::Fatal)?;
-        let value = self.new_error_value(context, stack, kind, value)?;
+        let value = *read_register(frame, msg_reg).map_err(CommittedValueError::Fatal)?;
+        let function_id = stack[top_idx].function_id;
+        let value = self.new_error_value(context, stack, function_id, kind, value)?;
         let frame = &mut stack[top_idx];
-        write_register(frame, dst, value)
-            .map_err(CommittedValueError::Fatal)?;
-        frame
-            .advance_pc()
-            .map_err(CommittedValueError::Fatal)?;
+        write_register(frame, dst, value).map_err(CommittedValueError::Fatal)?;
+        frame.advance_pc().map_err(CommittedValueError::Fatal)?;
         Ok(())
     }
 
-    /// Construct an intrinsic Error from a current boxed message. The message
+    /// Construct an intrinsic Error in the source function's realm. The message
     /// stays rooted through observable ToString and the canonical allocation.
     pub(crate) fn new_error_value(
         &mut self,
         context: &ExecutionContext,
         stack: &mut ActivationStack,
+        function_id: u32,
         kind: ErrorKind,
-        mut message: Value,
+        message: Value,
     ) -> Result<Value, CommittedValueError> {
-        let mut roots = otter_gc::RootScope::new(&mut self.gc_heap);
-        // SAFETY: message predates the scope and stays stationary until return.
-        unsafe {
-            roots.add_value(&mut message);
+        let mut build = |vm: &mut Self| {
+            let mut message = message;
+            let mut roots = otter_gc::RootScope::new(&mut vm.gc_heap);
+            // SAFETY: message predates the scope and stays stationary until return.
+            unsafe {
+                roots.add_value(&mut message);
+            }
+            let owned_message = vm.coerce_error_message(stack, context, &message)?;
+            let mut obj = vm
+                .make_error_instance_with_stack_roots(stack, kind, owned_message, &message)
+                .map_err(CommittedValueError::JavaScript)?;
+            vm.capture_error_stack_frames(context, &mut obj)
+                .map_err(CommittedValueError::JavaScript)?;
+            Ok(Value::object(obj))
+        };
+        match self.foreign_function_realm(function_id) {
+            Some(realm) => self
+                .with_host_realm_id(realm, |vm| Ok(build(vm)))
+                .map_err(CommittedValueError::Fatal)?,
+            None => build(self),
         }
-        let owned_message = self.coerce_error_message(stack, context, &message)?;
-        let mut obj = self
-            .make_error_instance_with_stack_roots(stack, kind, owned_message, &message)
-            .map_err(CommittedValueError::JavaScript)?;
-        self.capture_error_stack_frames(context, &mut obj)
-            .map_err(CommittedValueError::JavaScript)?;
-        Ok(Value::object(obj))
     }
 
     /// Record the construction-site JS call stack (top-of-stack first,
@@ -216,35 +200,6 @@ impl Interpreter {
         Ok(obj)
     }
 
-    pub(crate) fn run_load_builtin_error_reg(
-        &self,
-        context: &ExecutionContext,
-        frame: &mut Frame,
-        dst: u16,
-        kind_idx: u32,
-    ) -> Result<(), VmError> {
-        let mut frame = ActiveFrameMut::from_frame(frame);
-        self.run_load_builtin_error_active(context, &mut frame, dst, kind_idx)
-    }
-
-    /// Load one realm error constructor through a representation-neutral
-    /// activation. No cold frame state or allocation is required.
-    pub(crate) fn run_load_builtin_error_active(
-        &self,
-        context: &ExecutionContext,
-        frame: &mut ActiveFrameMut<'_>,
-        dst: u16,
-        kind_idx: u32,
-    ) -> Result<(), VmError> {
-        let kind_name = context
-            .string_constant_str(kind_idx)
-            .ok_or(VmError::InvalidOperand)?;
-        let kind = ErrorKind::from_class_name(kind_name).ok_or(VmError::InvalidOperand)?;
-        let ctor = self.error_classes.constructor(kind);
-        frame.write(dst, Value::object(ctor))?;
-        frame.advance_pc()?;
-        Ok(())
-    }
     /// Build a freshly-allocated `TypeError` instance through the live frame
     /// stack. Mirrors the shape produced by
     /// [`Self::vm_error_to_throwable_with_stack_roots`] for `VmError::TypeError`

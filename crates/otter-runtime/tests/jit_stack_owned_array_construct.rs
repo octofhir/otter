@@ -1,7 +1,7 @@
-//! Stack-owned generated-callee `ArrayConstruct` coverage.
+//! Stack-owned generated-callee intrinsic Array construction coverage.
 //!
 //! # Contents
-//! - Zero-argument and one-Int32-length Array construction at callee entry.
+//! - Evaluated-callable guards, empty LAB fits and one-Int32-length construction.
 //! - Invalid-length exact deoptimization and canonical `RangeError` without replay.
 //! - Moving-GC preservation of live arguments and an earlier Array result.
 //! - Independently admitted Graph caller entries, exact call-cell artifacts,
@@ -15,6 +15,8 @@
 //! - Successful callee-entry cases allocate before any effectful body work.
 //!   The invalid-length callee records one preceding effect to detect replay.
 //! - Every probe enters that callee through generated stack-owned linkage.
+//!   An arguments identity check or cold forwarding branch retains its
+//!   argument-frame ownership, proven by the exact current bytecode artifact.
 //! - A successful allocation returns once; pre-effect misses deopt exactly once.
 //! - Completed calls unlink their native roots and leave the caller reusable.
 //! - Template generations count their entries and returns; graph generations
@@ -53,12 +55,15 @@ const GRAPH_IR_HEADER: &[u8] = b"; otter graph\n";
 const NORMAL_SETUP: &str = r#"
 function arrayZeroAtEntry() {
   const result = new Array();
+  if (result.length < 0) return arrayZeroAtEntry.apply(null, arguments);
   if (typeof result !== "object") throw "bad-array";
   return result.length;
 }
 
 function arrayLengthAtEntry(length) {
-  return new Array(length).length;
+  const result = new Array(length);
+  if (result.length < 0) return arrayLengthAtEntry.apply(null, arguments);
+  return result.length;
 }
 
 function callArrayZero(fn) {
@@ -90,6 +95,8 @@ const INVALID_LENGTH_SETUP: &str = r#"
 globalThis.__stackArrayLengthEffects = [0];
 
 function invalidArrayLength(length, effects) {
+  "use strict";
+  if (arguments === effects) throw "arguments must own a distinct identity";
   effects[0] = effects[0] + 1;
   return new Array(length).length;
 }
@@ -98,6 +105,9 @@ function callInvalidArrayLength(fn, length, effects) {
   return fn(length, effects);
 }
 
+// Prepare named global storage before native compilation, so the setup reset
+// preserves the global binding layout guarded by the callee's Array load.
+globalThis.__stackArrayLengthEffects[0] = 0;
 for (let warm = 0; warm < 5000; warm++) {
   invalidArrayLength(4, __stackArrayLengthEffects);
   callInvalidArrayLength(invalidArrayLength, 4, __stackArrayLengthEffects);
@@ -135,6 +145,7 @@ const GC_SETUP: &str = r#"
 function gcArrayZeroAtEntry(marker) {
   const result = new Array();
   const trigger = new Array(1);
+  if (result.length < 0) return gcArrayZeroAtEntry.apply(null, arguments);
   if (typeof result !== "object" || marker.value < 0 || trigger.length !== 1) {
     throw "bad-zero-root";
   }
@@ -144,6 +155,7 @@ function gcArrayZeroAtEntry(marker) {
 function gcArrayLengthAtEntry(marker, length) {
   const result = new Array(length);
   const trigger = new Array();
+  if (result.length < 0) return gcArrayLengthAtEntry.apply(null, arguments);
   if (marker.value < 0 || trigger.length !== 0) throw "bad-length-root";
   return result.length;
 }
@@ -169,8 +181,8 @@ for (let warm = 0; warm < 5000; warm++) {
 // (one per 4,096 compiled back-edges); these warm loops span several polls.
 const ORDINARY_CONSTRUCTOR_SETUP: &str = r#"
 function OrdinaryArrayField() {
-  // Reading its actual arguments keeps the constructor out of its caller's
-  // body, so the probe enters its own generation.
+  // Object identity requires this activation's actual arguments object.
+  if (arguments === this) throw "arguments must differ from the receiver";
   if (arguments.length !== 0) throw "ordinary arity";
   this.elms = new Array();
 }
@@ -197,8 +209,7 @@ function lockOrdinaryReceiver(receiver) {
 }
 
 function NonExtensibleOrdinaryField(lock) {
-  // Reading its actual arguments keeps the constructor out of its caller's
-  // body, so the caller enters it through its entry cell.
+  // Validate the actual arity before mutating the receiver.
   if (arguments.length !== 1) throw "non-extensible arity";
   lock(this);
   this.x = 1;
@@ -242,8 +253,7 @@ const NON_EXTENSIBLE_CONSTRUCTOR_PROBE: &str = r#"
 
 const WIDE_ORDINARY_CONSTRUCTOR_SETUP: &str = r#"
 function WideOrdinaryFields(value) {
-  // Reading its actual arguments keeps the constructor out of its caller's
-  // body, so the caller enters it through its entry cell.
+  // Validate the actual arity before mutating the receiver.
   if (arguments.length !== 1) throw "wide arity";
   const adjusted = value + 0;
   this.a = adjusted;
@@ -356,7 +366,7 @@ fn runtime() -> Runtime {
         .jit_selection(JitSelection::ProductionTiered)
         .jit_debug(JitDebugRequest::artifacts().with_events(true))
         .build()
-        .expect("stack-owned ArrayConstruct runtime")
+        .expect("stack-owned Array construction runtime")
 }
 
 fn interpreter_runtime() -> Runtime {
@@ -369,7 +379,9 @@ fn interpreter_runtime() -> Runtime {
 fn run(runtime: &mut Runtime, source: impl Into<String>, module: &str) -> String {
     runtime
         .run_script(SourceInput::from_javascript(source.into()), module)
-        .unwrap_or_else(|error| panic!("stack-owned ArrayConstruct fixture {module}: {error:?}"))
+        .unwrap_or_else(|error| {
+            panic!("stack-owned Array construction fixture {module}: {error:?}")
+        })
         .completion_string()
         .to_owned()
 }
@@ -484,7 +496,7 @@ fn admit_graph_entries(
                 SourceInput::from_javascript(calls.repeat(PAIRS_PER_BATCH)),
                 &format!("{module_prefix}-{batch}.js"),
             )
-            .expect("independent ordinary ArrayConstruct wrapper admission");
+            .expect("independent ordinary Array construction wrapper admission");
         artifacts = artifacts.merged(admission.take_jit_artifacts().unwrap());
     }
     let generations: Vec<_> = runtime
@@ -512,6 +524,62 @@ fn current_graph_entry<'a>(
     assert_eq!(bundle.manifest().entry(), JitDebugTarget::Entry);
     assert!(is_graph_bundle(bundle));
     bundle
+}
+
+fn assert_argument_frame_opcode(bundle: &JitArtifactBundle, opcode: &str) {
+    let bytecode = std::str::from_utf8(
+        bundle
+            .file(JitArtifactFileName::Bytecode)
+            .expect("current argument-frame bytecode")
+            .contents(),
+    )
+    .unwrap();
+    assert_eq!(
+        bytecode
+            .lines()
+            .filter(|line| line.split_whitespace().nth(2) == Some(opcode))
+            .count(),
+        1,
+        "the exact callee keeps its actual-argument frame through {opcode}: {bytecode}"
+    );
+}
+
+fn assert_array_allocation_nodes(bundle: &JitArtifactBundle, empty: usize, length: usize) {
+    let ir = std::str::from_utf8(
+        bundle
+            .file(JitArtifactFileName::OptimizedIr)
+            .expect("current Array construction Graph")
+            .contents(),
+    )
+    .unwrap();
+    let map = artifact_json(bundle, JitArtifactFileName::CodeMap);
+    for (kind, expected) in [("NewArrayEmpty", empty), ("NewArrayWithLength", length)] {
+        assert_eq!(
+            ir.lines()
+                .filter(|line| line.contains(&format!(" = {kind} ")))
+                .count(),
+            expected,
+            "the exact current Graph owns its specialized Array allocations: {ir}"
+        );
+        let regions: Vec<_> = map["regions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|region| {
+                region["operation"]
+                    .as_str()
+                    .and_then(|operation| operation.split_whitespace().nth(1))
+                    == Some(kind)
+            })
+            .collect();
+        assert_eq!(regions.len(), expected, "emitted {kind}: {map}");
+        for region in regions {
+            assert!(
+                region["startOffset"].as_u64().unwrap() < region["endOffset"].as_u64().unwrap(),
+                "the allocation owns emitted instructions: {region}"
+            );
+        }
+    }
 }
 
 fn assert_current_graph_call(
@@ -690,7 +758,7 @@ fn array_construct_location(
     module: &str,
     function_name: &str,
 ) -> (u32, u32) {
-    instruction_location(artifacts, module, function_name, "ArrayConstruct")
+    instruction_location(artifacts, module, function_name, "New")
 }
 
 fn assert_array_construct_at_entry(
@@ -698,10 +766,52 @@ fn assert_array_construct_at_entry(
     module: &str,
     function_name: &str,
 ) {
-    let construct_pc = array_construct_location(artifacts, module, function_name).0;
+    let bundle = artifacts
+        .bundles()
+        .iter()
+        .find(|bundle| {
+            let manifest = bundle.manifest();
+            manifest.module() == module
+                && manifest.function_name() == function_name
+                && manifest.entry() == JitDebugTarget::Entry
+        })
+        .unwrap_or_else(|| panic!("missing entry bundle for {module}:{function_name}"));
+    let bytecode = std::str::from_utf8(
+        bundle
+            .file(JitArtifactFileName::Bytecode)
+            .unwrap()
+            .contents(),
+    )
+    .unwrap();
+    let prefix: Vec<_> = bytecode
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace();
+            fields.next()?.parse::<u32>().ok()?;
+            fields.next()?;
+            fields.next()
+        })
+        .take_while(|op| *op != "New")
+        .collect();
+    array_construct_location(artifacts, module, function_name);
+    // Canonical context/parameter setup precedes ordinary evaluated-callee and
+    // argument loads. No body call, property effect or arithmetic precedes New.
     assert!(
-        construct_pc <= 1,
-        "{module}:{function_name} must hit ArrayConstruct before any effectful body work; pc={construct_pc}"
+        prefix.iter().all(|op| matches!(
+            *op,
+            "LoadClosureContext"
+                | "CreateContext"
+                | "LoadContextSlot"
+                | "LoadContextSlotChecked"
+                | "StoreContextSlot"
+                | "LoadGlobalOrThrow"
+                | "LoadLookupGlobal"
+                | "LoadSelf"
+                | "LoadLocal"
+                | "StoreLocal"
+                | "LoadUndefined"
+        )),
+        "{module}:{function_name} must reach New after only entry setup, callee and argument loads: {prefix:?}\n{bytecode}"
     );
 }
 
@@ -874,7 +984,7 @@ fn zero_and_int32_length_constructs_stay_in_stack_owned_generated_callees() {
     runtime.set_tracer(Some(Box::new(ArrayProbeTracer(trace.clone()))));
     let mut setup = runtime
         .run_script(SourceInput::from_javascript(NORMAL_SETUP), MODULE)
-        .expect("normal ArrayConstruct setup");
+        .expect("normal Array construction setup");
     let names = traced_function_names(
         &trace.lock().unwrap(),
         &[
@@ -892,9 +1002,17 @@ fn zero_and_int32_length_constructs_stay_in_stack_owned_generated_callees() {
         .collect();
     assert_current_graph_call(&artifacts, &generations[0], &generations[1]);
     assert_current_graph_call(&artifacts, &generations[2], &generations[3]);
+    for (callee, empty, length) in [(&generations[1], 1, 0), (&generations[3], 0, 1)] {
+        let bundle = current_graph_entry(&artifacts, callee);
+        assert_argument_frame_opcode(bundle, "CallForwardArguments");
+        assert_array_allocation_nodes(bundle, empty, length);
+    }
     assert_array_construct_at_entry(&artifacts, MODULE, "arrayZeroAtEntry");
     assert_array_construct_at_entry(&artifacts, MODULE, "arrayLengthAtEntry");
-    for callee in [&generations[1], &generations[3]] {
+    for (callee, stub) in [
+        (&generations[1], "jit_new_array"),
+        (&generations[3], "array_construct_alloc"),
+    ] {
         let relocations = artifact_json(
             current_graph_entry(&artifacts, callee),
             JitArtifactFileName::Relocations,
@@ -906,7 +1024,7 @@ fn zero_and_int32_length_constructs_stay_in_stack_owned_generated_callees() {
                 .iter()
                 .any(|relocation| {
                     relocation["target"]["kind"] == "runtimeStub"
-                        && relocation["target"]["name"] == "array_construct_alloc"
+                        && relocation["target"]["name"] == stub
                 })
         );
     }
@@ -919,7 +1037,7 @@ fn zero_and_int32_length_constructs_stay_in_stack_owned_generated_callees() {
             SourceInput::from_javascript(NORMAL_PROBE),
             "jit-stack-owned-array-probe.js",
         )
-        .expect("normal ArrayConstruct probe");
+        .expect("normal Array construction probe");
     let delta = CounterDelta::between(before, runtime.execution_stats());
     assert_eq!(probe.completion_string(), "[0,4,0,7]");
     let trace = trace.lock().unwrap();
@@ -968,8 +1086,8 @@ fn zero_and_int32_length_constructs_stay_in_stack_owned_generated_callees() {
     assert_eq!(delta.code_generations, 0, "{delta:?}");
     assert_eq!(delta.optimized_osr_entries, 0, "{delta:?}");
     assert_eq!(
-        delta.alloc_value_stub_ok, 4,
-        "one typed allocation per native callee: {delta:?}"
+        delta.alloc_value_stub_ok, 2,
+        "only the two length allocations use the typed allocation Probe: {delta:?}"
     );
     assert_eq!(delta.alloc_value_stub_miss, 0, "{delta:?}");
     assert_eq!(delta.alloc_value_stub_out_of_memory, 0, "{delta:?}");
@@ -984,7 +1102,7 @@ fn invalid_length_throws_once_reuses_graph_caller_and_reconciles_generated_deopt
     runtime.set_tracer(Some(Box::new(ArrayProbeTracer(trace.clone()))));
     let setup = runtime
         .run_script(SourceInput::from_javascript(INVALID_LENGTH_SETUP), MODULE)
-        .expect("Graph-only ArrayConstruct setup");
+        .expect("Graph-only Array construction setup");
     let names = traced_function_names(
         &trace.lock().unwrap(),
         &["callInvalidArrayLength", "invalidArrayLength"],
@@ -998,6 +1116,9 @@ fn invalid_length_throws_once_reuses_graph_caller_and_reconciles_generated_deopt
     let artifacts = setup.jit_artifacts().unwrap();
     assert!(!artifacts.truncated());
     assert_current_graph_call(artifacts, &caller, &callee);
+    let callee_bundle = current_graph_entry(artifacts, &callee);
+    assert_argument_frame_opcode(callee_bundle, "CollectArguments");
+    assert_array_allocation_nodes(callee_bundle, 0, 1);
     let (construct_pc, construct_byte_pc) =
         array_construct_location(artifacts, MODULE, "invalidArrayLength");
     drop(setup);
@@ -1009,10 +1130,10 @@ fn invalid_length_throws_once_reuses_graph_caller_and_reconciles_generated_deopt
             SourceInput::from_javascript(INVALID_LENGTH_PROBE),
             "jit-graph-only-array-exit-probe.js",
         )
-        .expect("Graph-only ArrayConstruct probe");
+        .expect("Graph-only Array construction probe");
     assert_eq!(
         probe.completion_string(),
-        r#"["RangeError","Invalid array length",1,3,2]"#
+        r#"["RangeError","Array: Invalid array length",1,3,2]"#
     );
     let delta = CounterDelta::between(before, runtime.execution_stats());
     let trace = trace.lock().unwrap();
@@ -1029,7 +1150,7 @@ fn invalid_length_throws_once_reuses_graph_caller_and_reconciles_generated_deopt
         "only the pre-effect throwing opcode replays; recovery stays native"
     );
     assert_eq!(replay[0].2, construct_byte_pc);
-    assert_eq!(replay[0].3, Op::ArrayConstruct);
+    assert_eq!(replay[0].3, Op::New);
     drop(trace);
     let report = probe.jit_debug_report().unwrap();
     assert!(!report.truncated());
@@ -1103,24 +1224,36 @@ fn invalid_length_throws_once_reuses_graph_caller_and_reconciles_generated_deopt
 fn ordinary_constructor_array_and_field_transition_stay_generated() {
     const MODULE: &str = "jit-stack-owned-array-ordinary-constructor.js";
     let mut runtime = runtime();
-    let setup = runtime
+    let trace = Arc::new(Mutex::new(ArrayProbeTrace::default()));
+    runtime.set_tracer(Some(Box::new(ArrayProbeTracer(trace.clone()))));
+    let mut setup = runtime
         .run_script(
             SourceInput::from_javascript(ORDINARY_CONSTRUCTOR_SETUP),
             MODULE,
         )
-        .expect("ordinary ArrayConstruct constructor setup");
-    let artifacts = setup
-        .jit_artifacts()
-        .expect("ordinary ArrayConstruct constructor artifacts");
-    assert_direct_edge(
-        artifacts,
-        MODULE,
-        "constructOrdinaryArrayField",
-        "OrdinaryArrayField",
+        .expect("ordinary Array construction constructor setup");
+    let names = traced_function_names(
+        &trace.lock().unwrap(),
+        &["constructOrdinaryArrayField", "OrdinaryArrayField"],
     );
-    assert_graph_entry(artifacts, MODULE, "OrdinaryArrayField");
+    let artifacts = admit_graph_entries(
+        &mut runtime,
+        setup.take_jit_artifacts().unwrap(),
+        &names,
+        "constructOrdinaryArrayField(OrdinaryArrayField);\n",
+        "jit-stack-owned-array-ordinary-admission",
+    );
+    let generations: Vec<_> = names
+        .iter()
+        .map(|(_, fid)| current_graph(&runtime, *fid))
+        .collect();
+    assert_current_graph_call(&artifacts, &generations[0], &generations[1]);
+    let callee = current_graph_entry(&artifacts, &generations[1]);
+    assert_argument_frame_opcode(callee, "CollectArguments");
+    assert_array_allocation_nodes(callee, 1, 0);
     drop(setup);
 
+    trace.lock().unwrap().recording = true;
     let before = runtime.execution_stats();
     let completion = run(
         &mut runtime,
@@ -1129,9 +1262,26 @@ fn ordinary_constructor_array_and_field_transition_stay_generated() {
     );
     let delta = CounterDelta::between(before, runtime.execution_stats());
     assert_eq!(completion, "[0,0]");
-    // The callee may run in either native tier; no call leaves native code.
+    let trace = trace.lock().unwrap();
+    assert_complete_probe_trace(&trace);
+    for generation in &generations {
+        assert!(
+            !trace
+                .ticks
+                .iter()
+                .any(|(fid, _, _, _)| { *fid == generation.function_id })
+        );
+        let after = current_graph(&runtime, generation.function_id);
+        assert_eq!(after.code_object_id, generation.code_object_id);
+        assert_eq!(after.generated_deopts, generation.generated_deopts);
+        assert_eq!(after.active_count, 0);
+    }
     assert_no_exits(delta);
-    assert_eq!(delta.alloc_value_stub_ok, 2, "{delta:?}");
+    assert_eq!(delta.code_generations, 0, "{delta:?}");
+    assert_eq!(
+        delta.alloc_value_stub_ok, 0,
+        "empty Arrays use their LAB/empty boundary: {delta:?}"
+    );
     assert_eq!(delta.property_store_misses, 0, "{delta:?}");
 }
 
@@ -1274,13 +1424,46 @@ JSON.stringify([value.items.length, Object.keys(value).join(",")]);
 fn array_results_and_live_arguments_survive_moving_gc_and_full_gc_reuse() {
     const MODULE: &str = "jit-stack-owned-array-gc.js";
     let mut runtime = runtime();
-    let setup = runtime
+    let trace = Arc::new(Mutex::new(ArrayProbeTrace::default()));
+    runtime.set_tracer(Some(Box::new(ArrayProbeTracer(trace.clone()))));
+    let mut setup = runtime
         .run_script(SourceInput::from_javascript(GC_SETUP), MODULE)
-        .expect("ArrayConstruct GC setup");
-    let artifacts = setup.jit_artifacts().expect("ArrayConstruct GC artifacts");
-    assert_stack_owned_array_entry_edge(artifacts, MODULE, "gcCallArrayZero", "gcArrayZeroAtEntry");
+        .expect("Array construction GC setup");
+    let names = traced_function_names(
+        &trace.lock().unwrap(),
+        &[
+            "gcCallArrayZero",
+            "gcArrayZeroAtEntry",
+            "gcCallArrayLength",
+            "gcArrayLengthAtEntry",
+        ],
+    );
+    let artifacts = admit_graph_entries(
+        &mut runtime,
+        setup.take_jit_artifacts().unwrap(),
+        &names,
+        "gcCallArrayZero(gcArrayZeroAtEntry, __stackArrayWarmMarker);\ngcCallArrayLength(gcArrayLengthAtEntry, __stackArrayWarmMarker, 4);\n",
+        "jit-stack-owned-array-gc-admission",
+    );
+    let generations: Vec<_> = names
+        .iter()
+        .map(|(_, fid)| current_graph(&runtime, *fid))
+        .collect();
+    assert_current_graph_call(&artifacts, &generations[0], &generations[1]);
+    assert_current_graph_call(&artifacts, &generations[2], &generations[3]);
+    for callee in [&generations[1], &generations[3]] {
+        let bundle = current_graph_entry(&artifacts, callee);
+        assert_argument_frame_opcode(bundle, "CallForwardArguments");
+        assert_array_allocation_nodes(bundle, 1, 1);
+    }
     assert_stack_owned_array_entry_edge(
-        artifacts,
+        &artifacts,
+        MODULE,
+        "gcCallArrayZero",
+        "gcArrayZeroAtEntry",
+    );
+    assert_stack_owned_array_entry_edge(
+        &artifacts,
         MODULE,
         "gcCallArrayLength",
         "gcArrayLengthAtEntry",
@@ -1300,7 +1483,7 @@ for (let i = 0; i < {iterations}; i++) {{
   const zeroLength = gcCallArrayZero(gcArrayZeroAtEntry, marker);
   const sizedLength = gcCallArrayLength(gcArrayLengthAtEntry, marker, 4);
   if (zeroLength !== 0 || sizedLength !== 4 || marker.value !== i) {{
-    throw "corrupt ArrayConstruct root";
+    throw "corrupt Array construction root";
   }}
   checksum += marker.value + zeroLength + sizedLength;
 }}
@@ -1315,33 +1498,34 @@ checksum;
             SourceInput::from_javascript(probe),
             "jit-stack-owned-array-gc-probe.js",
         )
-        .expect("ArrayConstruct GC probe");
+        .expect("Array construction GC probe");
     let delta = CounterDelta::between(before, runtime.execution_stats());
 
     assert_eq!(result.completion_string(), expected_checksum.to_string());
     // The probe ends on the plain `checksum` completion: an unprofiled call
     // after the OSR-compiled loop would soft-deopt its first execution, which
-    // says nothing about the ArrayConstruct edges this test covers. Once the
-    // probe loop enters OSR code, its callers and their ArrayConstruct callees
-    // run inside it or in graph generations, which count no entries; every
-    // Array still allocates through the generated allocation stub.
+    // says nothing about the Array construction edges this test covers. Once the
+    // probe loop enters OSR code, its callers and their Array construction callees
+    // run in their own graph generations, which count no entries. The two
+    // length allocations per iteration use the typed Probe; the two empty
+    // Arrays use the emitted LAB/empty boundary proved above.
     assert_eq!(
         delta.generated_template_entries, delta.generated_template_returns,
         "{delta:?}"
     );
     assert_no_exits_except_checksum_overflow(&result, delta);
     assert!(
-        delta.alloc_value_stub_ok >= u64::from(iterations) * 4,
+        delta.alloc_value_stub_ok >= u64::from(iterations) * 2,
         "both Array results must remain rooted across a second allocation: {delta:?}"
     );
     assert!(
         delta.minor_gc_cycles > 0,
-        "ArrayConstruct must collect while stack-owned values are live: {delta:?}"
+        "Array construction must collect while stack-owned values are live: {delta:?}"
     );
 
     runtime
         .force_gc()
-        .expect("completed ArrayConstruct calls must leave only live call-site roots");
+        .expect("completed Array construction calls must leave only live call-site roots");
     let before_reuse = runtime.execution_stats();
     let reused = run(
         &mut runtime,
@@ -1363,11 +1547,17 @@ JSON.stringify([
     );
     assert_no_exits(reuse_delta);
     assert_eq!(reuse_delta.code_generations, 0, "{reuse_delta:?}");
-    assert!(reuse_delta.alloc_value_stub_ok >= 4, "{reuse_delta:?}");
+    assert!(reuse_delta.alloc_value_stub_ok >= 2, "{reuse_delta:?}");
+    for generation in &generations {
+        let after = current_graph(&runtime, generation.function_id);
+        assert_eq!(after.code_object_id, generation.code_object_id);
+        assert_eq!(after.generated_deopts, generation.generated_deopts);
+        assert_eq!(after.active_count, 0);
+    }
 }
 
 /// The only exit a GC probe may take is the script body's checksum add
-/// leaving int32 once; no ArrayConstruct callee or caller exits.
+/// leaving int32 once; no Array construction callee or caller exits.
 fn assert_no_exits_except_checksum_overflow(
     result: &otter_runtime::ExecutionResult,
     delta: CounterDelta,

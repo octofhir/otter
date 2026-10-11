@@ -208,27 +208,6 @@ impl Interpreter {
         self.frame_copy_context(frame, dst, src)
     }
 
-    /// Load one realm builtin error constructor from a decoded constant index.
-    pub fn jit_runtime_load_builtin_error(
-        &self,
-        context: &ExecutionContext,
-        frame: &mut ActiveFrameMut<'_>,
-        dst: u16,
-        kind_index: u32,
-    ) -> Result<(), VmError> {
-        // `kind_index` is a constant-pool index of the COMPILED function's
-        // chunk; in a multi-script runtime the ambient context may belong to
-        // a different chunk, so resolve the owner before decoding.
-        let function_id = frame.function_id();
-        let resolved = context
-            .for_function(function_id)
-            .map_err(|_| VmError::InvalidOperand)?;
-        let saved_pc = frame.pc();
-        let result = self.run_load_builtin_error_active(&resolved, frame, dst, kind_index);
-        frame.set_pc(saved_pc);
-        result
-    }
-
     /// Apply a descriptor object through `OrdinaryDefineOwnProperty`.
     pub fn jit_runtime_define_own_property(
         &mut self,

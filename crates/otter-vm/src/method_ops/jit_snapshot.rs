@@ -15,6 +15,10 @@
 //!   only side-exit, never miscompile.
 //! - Collection prototypes are prepared before capturing their live own-name,
 //!   shape and slot proof; dictionary observations never become installed guards.
+//!
+//! # See also
+//! - [`crate::realm_intrinsics`] owns retained canonical prototype roots.
+//! - [`super`] validates and records the method-cache observations.
 
 use super::MethodCallIc;
 use crate::Interpreter;
@@ -32,8 +36,8 @@ pub(crate) fn collection_guard() -> JitBodyGuard {
     )
 }
 
-/// An array body's exotic sidecar. A null sidecar means the realm
-/// `%Array.prototype%` is still the receiver's `[[Prototype]]` and nothing on
+/// An array body's exotic sidecar. A null sidecar means the default realm's
+/// retained `%Array.prototype%` is the receiver's `[[Prototype]]` and nothing on
 /// the instance can shadow the method or override an element's attributes,
 /// which is what makes the prototype-slot guard sufficient.
 pub(crate) fn dense_array_guard() -> JitBodyGuard {
@@ -82,7 +86,10 @@ impl Interpreter {
             Tag::Unshift => (STUB_ARRAY_UNSHIFT_ALLOC.id, alloc_safepoint_id, 1),
             _ => return None,
         };
-        let proto = self.realm_intrinsics.array_prototype()?;
+        let proto = self.default_array_prototype()?;
+        if crate::object::shape_id(proto, &self.gc_heap) != ic.proto_shape {
+            return None;
+        }
         let method = crate::object::data_slot_value_at(proto, &self.gc_heap, ic.proto_slot)?;
         if !ic.tag.matches_builtin(method, &self.gc_heap) {
             return None;
@@ -254,5 +261,113 @@ impl Interpreter {
             argument_count: ic.op.argument_count(),
             grow: None,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::method_ops::ArrayMethodCallIc;
+    use crate::{ExecutionContext, Value, object};
+    use otter_bytecode::{
+        BytecodeModule, Constant, Function, Instruction, Op, Operand, SourceKind,
+    };
+
+    #[test]
+    fn array_method_snapshot_rejects_deleted_name_even_when_slot_reuses_builtin() {
+        let context = ExecutionContext::from_module(
+            BytecodeModule {
+                module: "array-method-snapshot.js".into(),
+                template_sites: Vec::new(),
+                source_kind: SourceKind::JavaScript,
+                functions: vec![Function {
+                    id: 0,
+                    name: "<main>".into(),
+                    locals: 3,
+                    code: vec![
+                        Instruction {
+                            pc: 0,
+                            op: Op::CallMethodValue,
+                            operands: vec![
+                                Operand::Register(0),
+                                Operand::Register(1),
+                                Operand::ConstIndex(0),
+                                Operand::ConstIndex(1),
+                                Operand::Register(2),
+                            ],
+                        },
+                        Instruction {
+                            pc: 1,
+                            op: Op::ReturnUndefined,
+                            operands: Vec::new(),
+                        },
+                    ]
+                    .into(),
+                    ..Function::default()
+                }],
+                constants: vec![Constant::String {
+                    utf16: "push".encode_utf16().collect(),
+                }],
+                module_resolutions: Vec::new(),
+                module_inits: Vec::new(),
+                function_source: None,
+            },
+            crate::source_registry::SourceRegistry::default(),
+        )
+        .expect("valid method-site fixture");
+        let mut vm = Interpreter::new().expect("fixture interpreter bootstrap");
+        vm.gc_heap.set_gc_stress(0, false);
+        vm.ensure_method_feedback_context(&context);
+        let site = context
+            .feedback_slot_addresses()
+            .into_iter()
+            .find(|(_, address)| address.is_method())
+            .unwrap()
+            .0;
+        vm.with_handle_scope(|vm, scope| {
+            let prototype =
+                vm.scoped_value(scope, Value::object(vm.default_array_prototype().unwrap()));
+            let proto = vm.escape_scoped(prototype).as_object().unwrap();
+            let keys = object::with_properties(proto, &vm.gc_heap, |properties| {
+                properties.keys().map(str::to_owned).collect::<Vec<_>>()
+            });
+            let position = keys.iter().position(|key| key == "push").unwrap();
+            let next_name = &keys[position + 1];
+            let method = vm.scoped_value(scope, object::get(proto, &vm.gc_heap, "push").unwrap());
+            let mut proto = vm.escape_scoped(prototype).as_object().unwrap();
+            let descriptor =
+                object::PropertyDescriptor::data(vm.escape_scoped(method), true, false, true);
+            assert!(
+                object::define_own_property_in_place(
+                    &mut proto,
+                    &mut vm.gc_heap,
+                    next_name,
+                    descriptor,
+                )
+                .unwrap()
+            );
+            let proto = vm.escape_scoped(prototype).as_object().unwrap();
+            let (hit, _) = object::lookup_own_slot(proto, &vm.gc_heap, "push");
+            let hit = hit.unwrap();
+            assert!(vm.method_feedback.install_method_ic(
+                site,
+                MethodCallIc::Array(ArrayMethodCallIc {
+                    proto_shape: hit.shape_id,
+                    proto_slot: hit.slot,
+                    tag: crate::array_prototype::ArrayMethodTag::Push,
+                })
+            ));
+            assert!(vm.jit_array_method_call(site, 1).is_some());
+            let mut proto = vm.escape_scoped(prototype).as_object().unwrap();
+            assert!(object::delete(&mut proto, &mut vm.gc_heap, "push").unwrap());
+            let proto = vm.escape_scoped(prototype).as_object().unwrap();
+            assert!(object::get(proto, &vm.gc_heap, "push").is_none());
+            assert_eq!(
+                object::data_slot_value_at(proto, &vm.gc_heap, hit.slot),
+                Some(vm.escape_scoped(method))
+            );
+            assert_ne!(object::shape_id(proto, &vm.gc_heap), hit.shape_id);
+            assert!(vm.jit_array_method_call(site, 1).is_none());
+        });
     }
 }

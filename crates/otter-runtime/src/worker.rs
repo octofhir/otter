@@ -34,7 +34,9 @@
 //!   [`crate::ExecutionResult`] / [`crate::OtterError`].
 //! - Owned JavaScript message payloads materialize entirely inside one traced
 //!   [`NativeScope`]. A transferable detaches only after its destination queue
-//!   accepts the corresponding payload.
+//!   accepts the corresponding payload. Read-only measurement and clone use
+//!   the native context's exact Array category, including escaped canonical
+//!   prototypes, and never collect or re-enter JavaScript.
 //!
 //! # See also
 //!
@@ -600,14 +602,14 @@ fn build_worker_object(
         let transfers = parse_worker_transfer_list(args.get(1), ctx)?;
         // Validate/measure, admit, clone, enqueue, then detach: a rejected or
         // failed message never detaches the sender's transferables.
-        let measured = measure_worker_message(&value, ctx.heap(), &transfers)?;
+        let measured = measure_worker_message(&value, ctx, &transfers)?;
         let leases = admit_worker_message(
             &post_host.family,
             &post_host.config.resource_account,
             measured,
             "Worker.postMessage",
         )?;
-        let payload = clone_worker_value(&value, ctx.heap(), &transfers)?;
+        let payload = clone_worker_value(&value, ctx, &transfers)?;
         record
             .child_spawner
             .enqueue(
@@ -1217,14 +1219,14 @@ fn install_worker_scope_natives(
         }
         let value = args.first().copied().unwrap_or_else(Value::undefined);
         let transfers = parse_worker_transfer_list(args.get(1), ctx)?;
-        let measured = measure_worker_message(&value, ctx.heap(), &transfers)?;
+        let measured = measure_worker_message(&value, ctx, &transfers)?;
         let leases = admit_worker_message(
             &post_shared.family,
             &post_shared.account,
             measured,
             "postMessage",
         )?;
-        let payload = clone_worker_value(&value, ctx.heap(), &transfers)?;
+        let payload = clone_worker_value(&value, ctx, &transfers)?;
         let Some(host) = post_shared.host.upgrade() else {
             return Err(type_err(
                 "postMessage",
@@ -1270,11 +1272,11 @@ fn install_worker_scope_natives(
 /// a cycle fails here, before any resource effect. All arithmetic is checked.
 fn measure_worker_message(
     value: &Value,
-    heap: &otter_gc::GcHeap,
+    ctx: &NativeCtx<'_>,
     transfers: &WorkerTransferList,
 ) -> Result<u64, NativeError> {
     let mut active = HashSet::new();
-    let body = measure_worker_value(value, heap, "$".to_string(), 0, &mut active)?;
+    let body = measure_worker_value(value, ctx, "$".to_string(), 0, &mut active)?;
     let transfer_entries =
         u64::try_from(transfers.buffers.len()).map_err(|_| measure_overflow())?;
     let transfer_cost = transfer_entries
@@ -1296,11 +1298,12 @@ fn measure_checked_sum(total: u64, add: u64) -> Result<u64, NativeError> {
 
 fn measure_worker_value(
     value: &Value,
-    heap: &otter_gc::GcHeap,
+    ctx: &NativeCtx<'_>,
     path: String,
     depth: usize,
     active: &mut HashSet<RawGc>,
 ) -> Result<u64, NativeError> {
+    let heap = ctx.heap();
     if depth > crate::structured_clone::DEFAULT_STRUCTURED_CLONE_MAX_DEPTH {
         return Err(type_err(
             "structuredClone",
@@ -1328,13 +1331,13 @@ fn measure_worker_value(
     if let Some(view) = value.as_typed_array(heap) {
         let buffer = Value::array_buffer(view.buffer(heap));
         let buffer =
-            measure_worker_value(&buffer, heap, format!("{path}.buffer"), depth + 1, active)?;
+            measure_worker_value(&buffer, ctx, format!("{path}.buffer"), depth + 1, active)?;
         return measure_checked_sum(WORKER_MESSAGE_NODE_BYTES, buffer);
     }
     if let Some(view) = value.as_data_view() {
         let buffer = Value::array_buffer(view.buffer(heap));
         let buffer =
-            measure_worker_value(&buffer, heap, format!("{path}.buffer"), depth + 1, active)?;
+            measure_worker_value(&buffer, ctx, format!("{path}.buffer"), depth + 1, active)?;
         return measure_checked_sum(WORKER_MESSAGE_NODE_BYTES, buffer);
     }
     if let Some(buf) = value.as_array_buffer() {
@@ -1345,22 +1348,31 @@ fn measure_worker_value(
         let bytes = u64::try_from(bytes).map_err(|_| measure_overflow())?;
         return measure_checked_sum(WORKER_MESSAGE_NODE_BYTES, bytes);
     }
-    if let Some(arr) = value.as_array() {
-        if !active.insert(arr.raw()) {
+    if let Some(len) = ctx.array_length(*value) {
+        let raw = value
+            .as_array()
+            .map(|array| array.raw())
+            .or_else(|| value.as_object().map(|object| object.raw()))
+            .expect("exact array has an array or branded object carrier");
+        if !active.insert(raw) {
             return Err(type_err(
                 "structuredClone",
                 format!("cycle detected at {path}"),
             ));
         }
-        let len = array::len(arr, heap);
         let mut total = WORKER_MESSAGE_NODE_BYTES;
         for idx in 0..len {
-            let element = array::get(arr, heap, idx);
+            let element = if let Some(array) = value.as_array() {
+                array::get(array, heap, idx)
+            } else {
+                let object = value.as_object().expect("branded array prototype");
+                object::get_own(object, heap, &idx.to_string()).unwrap_or_else(Value::undefined)
+            };
             let child =
-                measure_worker_value(&element, heap, format!("{path}[{idx}]"), depth + 1, active)?;
+                measure_worker_value(&element, ctx, format!("{path}[{idx}]"), depth + 1, active)?;
             total = measure_checked_sum(total, child)?;
         }
-        active.remove(&arr.raw());
+        active.remove(&raw);
         return Ok(total);
     }
     if let Some(map) = value.as_map() {
@@ -1375,7 +1387,7 @@ fn measure_worker_value(
         for (idx, (key, entry)) in entries.iter().enumerate() {
             let key_bytes = measure_worker_value(
                 key,
-                heap,
+                ctx,
                 format!("{path}<map-key:{idx}>"),
                 depth + 1,
                 active,
@@ -1383,7 +1395,7 @@ fn measure_worker_value(
             total = measure_checked_sum(total, key_bytes)?;
             let value_bytes = measure_worker_value(
                 entry,
-                heap,
+                ctx,
                 format!("{path}<map-value:{idx}>"),
                 depth + 1,
                 active,
@@ -1405,7 +1417,7 @@ fn measure_worker_value(
         for (idx, element) in values.iter().enumerate() {
             let child = measure_worker_value(
                 element,
-                heap,
+                ctx,
                 format!("{path}<set-value:{idx}>"),
                 depth + 1,
                 active,
@@ -1434,7 +1446,7 @@ fn measure_worker_value(
             total = measure_checked_sum(total, key_bytes)?;
             total = measure_checked_sum(total, WORKER_MESSAGE_NODE_BYTES)?;
             let child =
-                measure_worker_value(&entry, heap, format!("{path}.{key}"), depth + 1, active)?;
+                measure_worker_value(&entry, ctx, format!("{path}.{key}"), depth + 1, active)?;
             total = measure_checked_sum(total, child)?;
         }
         active.remove(&obj.raw());
@@ -1547,21 +1559,22 @@ fn detach_worker_transfers(transfers: &WorkerTransferList, interp: &mut otter_vm
 
 fn clone_worker_value(
     value: &Value,
-    heap: &otter_gc::GcHeap,
+    ctx: &NativeCtx<'_>,
     transfers: &WorkerTransferList,
 ) -> Result<WorkerPayload, NativeError> {
     let mut active = HashSet::new();
-    clone_worker_value_inner(value, heap, transfers, "$".to_string(), 0, &mut active)
+    clone_worker_value_inner(value, ctx, transfers, "$".to_string(), 0, &mut active)
 }
 
 fn clone_worker_value_inner(
     value: &Value,
-    heap: &otter_gc::GcHeap,
+    ctx: &NativeCtx<'_>,
     transfers: &WorkerTransferList,
     path: String,
     depth: usize,
     active: &mut HashSet<RawGc>,
 ) -> Result<WorkerPayload, NativeError> {
+    let heap = ctx.heap();
     if depth > crate::structured_clone::DEFAULT_STRUCTURED_CLONE_MAX_DEPTH {
         return Err(type_err(
             "structuredClone",
@@ -1589,7 +1602,7 @@ fn clone_worker_value_inner(
     if let Some(view) = value.as_typed_array(heap) {
         let buffer = clone_worker_value_inner(
             &Value::array_buffer(view.buffer(heap)),
-            heap,
+            ctx,
             transfers,
             format!("{path}.buffer"),
             depth + 1,
@@ -1605,7 +1618,7 @@ fn clone_worker_value_inner(
     if let Some(view) = value.as_data_view() {
         let buffer = clone_worker_value_inner(
             &Value::array_buffer(view.buffer(heap)),
-            heap,
+            ctx,
             transfers,
             format!("{path}.buffer"),
             depth + 1,
@@ -1631,27 +1644,40 @@ fn clone_worker_value_inner(
             buf.with_bytes(heap, |bytes| bytes.to_vec()),
         ));
     }
-    if let Some(arr) = value.as_array() {
-        if !active.insert(arr.raw()) {
+    if let Some(len) = ctx.array_length(*value) {
+        let raw = value
+            .as_array()
+            .map(|array| array.raw())
+            .or_else(|| value.as_object().map(|object| object.raw()))
+            .expect("exact array has an array or branded object carrier");
+        if !active.insert(raw) {
             return Err(type_err(
                 "structuredClone",
                 format!("cycle detected at {path}"),
             ));
         }
-        let len = array::len(arr, heap);
-        let values: Vec<Value> = (0..len).map(|idx| array::get(arr, heap, idx)).collect();
+        let values: Vec<Value> = if let Some(array) = value.as_array() {
+            (0..len).map(|index| array::get(array, heap, index)).collect()
+        } else {
+            let object = value.as_object().expect("branded array prototype");
+            (0..len)
+                .map(|index| {
+                    object::get_own(object, heap, &index.to_string()).unwrap_or_else(Value::undefined)
+                })
+                .collect()
+        };
         let mut cloned = Vec::with_capacity(values.len());
         for (idx, value) in values.iter().enumerate() {
             cloned.push(clone_worker_value_inner(
                 value,
-                heap,
+                ctx,
                 transfers,
                 format!("{path}[{idx}]"),
                 depth + 1,
                 active,
             )?);
         }
-        active.remove(&arr.raw());
+        active.remove(&raw);
         return Ok(WorkerPayload::Array(cloned));
     }
     if let Some(map) = value.as_map() {
@@ -1667,7 +1693,7 @@ fn clone_worker_value_inner(
             cloned.push((
                 clone_worker_value_inner(
                     key,
-                    heap,
+                    ctx,
                     transfers,
                     format!("{path}<map-key:{idx}>"),
                     depth + 1,
@@ -1675,7 +1701,7 @@ fn clone_worker_value_inner(
                 )?,
                 clone_worker_value_inner(
                     value,
-                    heap,
+                    ctx,
                     transfers,
                     format!("{path}<map-value:{idx}>"),
                     depth + 1,
@@ -1698,7 +1724,7 @@ fn clone_worker_value_inner(
         for (idx, value) in values.iter().enumerate() {
             cloned.push(clone_worker_value_inner(
                 value,
-                heap,
+                ctx,
                 transfers,
                 format!("{path}<set-value:{idx}>"),
                 depth + 1,
@@ -1727,7 +1753,7 @@ fn clone_worker_value_inner(
                 key.clone(),
                 clone_worker_value_inner(
                     &value,
-                    heap,
+                    ctx,
                     transfers,
                     format!("{path}.{key}"),
                     depth + 1,
@@ -2306,6 +2332,10 @@ impl OtterPoolBuilder {
 fn worker_specifier(id: WorkerId) -> String {
     format!("<worker:{}>", id.get())
 }
+
+#[cfg(test)]
+#[path = "worker/array_brand_tests.rs"]
+mod array_brand_tests;
 
 #[cfg(test)]
 mod tests {

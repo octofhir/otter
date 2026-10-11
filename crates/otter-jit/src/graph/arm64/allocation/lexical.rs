@@ -11,6 +11,8 @@
 //! - GC-updated registers are restored before every Miss/OOM deopt; a cold
 //!   exit must never spill stale pre-call registers over canonical homes.
 //! - A Probe cannot throw/reenter; illegal statuses leave through fatal.
+//! - The node owns the semantic allocation-miss reason; receiver refills do
+//!   not share value-allocation diagnostics with the source's ordinary `New`.
 //!
 //! # See also
 //! - `crate::runtime_stubs` owns semantic allocation and root publication.
@@ -186,7 +188,7 @@ impl Codegen<'_> {
             ))?;
         let miss = self.typed_exit(
             node,
-            abi::ExitReason::AllocationMiss,
+            crate::graph::frame::allocation_exit_reason(&self.graph.node(node).kind),
             abi::ExitAction::Resume,
         );
         let bytes = ALLOC_CTX_STACK_SIZE + 16;

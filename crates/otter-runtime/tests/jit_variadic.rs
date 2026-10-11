@@ -1,14 +1,15 @@
-//! Production template-tier variadic-construction coverage.
+//! Ordinary intrinsic calls and construction across Template loop OSR.
 //!
 //! # Contents
 //! - `Array.of`, `Array.from`, `new Array`, and `queueMicrotask` from loop OSR.
 //!
 //! # Invariants
-//! - The variadic opcodes complete in machine code through the shared reentrant
-//!   transition; every result matches the interpreter oracle.
+//! - The compiler resolves actual callables before arguments; admitted intrinsic
+//!   forms use their identity proof and other calls keep ordinary completion.
+//! - Every result matches the interpreter oracle after loop OSR.
 //!
 //! # See also
-//! - `otter_vm::Interpreter::jit_runtime_variadic_op`
+//! - `otter_vm::JitNativeCall` and the source-owned intrinsic proof.
 
 use otter_runtime::{JitSelection, Runtime, SourceInput};
 
@@ -49,7 +50,7 @@ fn run(selection: JitSelection) -> (String, u64) {
 }
 
 #[test]
-fn variadic_ops_match_oracle() {
+fn ordinary_intrinsic_calls_match_oracle_after_osr() {
     let (oracle, _) = run(JitSelection::InterpreterOnly);
     let (compiled, osr_attempts) = run(JitSelection::Template);
     assert_eq!(compiled, oracle);

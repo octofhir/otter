@@ -30,6 +30,10 @@
 //! - Facts are keyed by AST node address and valid while the unit's AST lives;
 //!   every function body and static block the compiler lowers belongs to the
 //!   analyzed unit.
+//!
+//! # See also
+//! - `switch_bindings` uses reference positions to prove clause-local storage.
+//! - `hoist` chooses context storage from capture and branch-entry facts.
 
 use std::collections::HashSet;
 
@@ -203,10 +207,16 @@ impl CaptureFacts {
     /// Whether the scope's parameters or body name `name` at any depth,
     /// shadowed or not.
     pub(crate) fn references(&self, scope: &ScopeFacts, name: &str) -> bool {
+        self.references_in_range(name, scope.range)
+    }
+
+    /// Whether an AST region references `name`, including assignments and
+    /// nested functions. Shadowed names conservatively count as references.
+    pub(crate) fn references_in_range(&self, name: &str, range: (u32, u32)) -> bool {
         self.ids
             .get(name)
             .and_then(|id| self.references.get(id))
-            .is_some_and(|positions| any_within(positions, scope.range))
+            .is_some_and(|positions| any_within(positions, range))
     }
 
     /// Whether the scope contains a direct eval at any depth.

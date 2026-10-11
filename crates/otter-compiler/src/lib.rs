@@ -29,8 +29,7 @@
 //! # Invariants
 //! - The function table starts with `<main>` at index 0.
 //! - Every emitted instruction has a matching `SpanEntry` so source
-//!   spans survive into diagnostics and stack traces (foundation
-//!   plan §M2).
+//!   spans survive into diagnostics and stack traces.
 //! - TypeScript erasure preserves the **original** spans — we never
 //!   re-emit JS source and re-parse.
 //! - Binding bytecode is emitted from the canonical typed opcode schema.
@@ -46,9 +45,8 @@
 mod annex_b;
 mod arguments_elision;
 mod assignment;
+mod assignment_reference;
 mod binding_emit;
-mod builtins_call;
-mod builtins_table;
 mod calls;
 pub(crate) mod capture;
 mod chain;
@@ -69,6 +67,7 @@ mod params;
 mod scope;
 mod statements;
 pub(crate) mod strict_validation;
+mod switch_bindings;
 mod synthetic;
 mod template;
 mod try_catch;
@@ -96,8 +95,6 @@ pub(crate) use std::collections::{HashMap, HashSet};
 pub(crate) use std::rc::Rc;
 
 pub(crate) use assignment::*;
-pub(crate) use builtins_call::*;
-pub(crate) use builtins_table::*;
 pub(crate) use calls::*;
 pub(crate) use chain::*;
 pub(crate) use class::*;
@@ -678,14 +675,10 @@ mod tests {
     }
 
     #[test]
-    fn math_namespace_inlines_constants_and_calls_methods_ordinarily() {
-        // `Math.PI` keeps its dedicated [`Op::MathLoad`] inlining; a
-        // `Math.<method>(...)` call is an ordinary method call, so a user
-        // shadow of either the namespace or the method stays observable
-        // through the same guards every other method call uses.
+    fn math_namespace_resolves_constants_and_calls_methods_ordinarily() {
         let module = compile_script_src("Math.PI; Math.abs(-1); Math.max(1, 2, 3);");
         let main = module.main();
-        assert!(main.code.iter().any(|i| i.op == Op::MathLoad));
+        assert!(main.code.iter().any(|i| i.op == Op::LoadProperty));
         let calls = main
             .code
             .iter()
@@ -775,7 +768,7 @@ mod tests {
     fn throw_statement_emits_throw_op() {
         let module = compile_script_src("throw new Error(\"x\");");
         let main = module.main();
-        assert!(main.code.iter().any(|i| i.op == Op::NewError));
+        assert!(main.code.iter().any(|i| i.op == Op::New));
         assert!(main.code.iter().any(|i| i.op == Op::Throw));
     }
 

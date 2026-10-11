@@ -11,6 +11,9 @@
 //!   the shared entry-cell, frame, deopt, and feedback contracts.
 //! - Generated base/super constructor linkage with fixed or spread arguments
 //!   and receiver-allocation fast paths.
+//! - [`intrinsic_calls`] guards the resolved canonical callable and lowers
+//!   admitted value operations and allocation LAB fits without call activation;
+//!   allocation misses retain the existing collecting source/root boundary.
 //! - SELF context reads, unchecked context-slot access, and context
 //!   allocation ([`context`]); stable lexical cells and guarded global-object
 //!   slots ([`binding`]) with one committed cold owner for binding misses.
@@ -29,9 +32,9 @@
 //! - Structured try/catch/finally operations through the VM-owned exception
 //!   transition protocol.
 //! - Cooperative interrupt/work-budget polling on every generated backedge.
-//! - Delete, super, private, value-load, structural, module, variadic and
-//!   static-call opcodes, `bind`, RegExp/built-in error literals and
-//!   `Array()` allocation through their shared typed runtime boundaries.
+//! - Delete, super, private, value-load, structural, module and static-call
+//!   opcodes, `bind`, RegExp literals and implicit language errors through their
+//!   shared typed runtime boundaries.
 //!
 //! # Invariants
 //! - Emission covers the whole [`TemplateOp`] vocabulary: a function the plan
@@ -76,6 +79,8 @@ mod context;
 mod exceptions;
 #[path = "x86_64/forward_call.rs"]
 mod forward_call;
+#[path = "x86_64/intrinsic_calls.rs"]
+mod intrinsic_calls;
 #[path = "x86_64/intrinsic_prototype.rs"]
 pub(crate) mod intrinsic_prototype;
 #[path = "x86_64/native_leaf.rs"]
@@ -152,6 +157,7 @@ pub(super) fn compile(
     let mut direct_call_events = capture_events.then(|| super::seed_direct_call_events(view));
     let mut shared_property = shared_property::SharedPropertyProbes::default();
     let type_mismatch = ops.new_dynamic_label();
+    let identity_guard = ops.new_dynamic_label();
     let unsupported = ops.new_dynamic_label();
     let runtime_transition = ops.new_dynamic_label();
     let allocation_miss = ops.new_dynamic_label();
@@ -218,15 +224,16 @@ pub(super) fn compile(
             committed_throw,
             threw,
             fatal,
+            identity_guard,
         ];
         // A JS-call operation's abrupt exits publish its call source on a
         // cold relay before reaching the shared exit.
         let current = if !super::operation_is_js_call(instruction.op) {
             targets
         } else {
-            let labels: [DynamicLabel; 9] = std::array::from_fn(|_| ops.new_dynamic_label());
+            let labels: [DynamicLabel; 10] = std::array::from_fn(|_| ops.new_dynamic_label());
             call_source_exits.push((
-                std::array::from_fn::<_, 9, _>(|index| (labels[index], targets[index])),
+                std::array::from_fn::<_, 10, _>(|index| (labels[index], targets[index])),
                 instruction.pc,
                 call_safepoints[&instruction.pc],
             ));
@@ -242,6 +249,7 @@ pub(super) fn compile(
             committed_throw,
             threw,
             fatal,
+            identity_guard,
         ] = current;
         if requires_pc_stamp(instruction.op) {
             emit_stamp_pc(&mut ops, instruction.pc);
@@ -259,6 +267,7 @@ pub(super) fn compile(
                 labels: &labels,
                 exits: crate::template::operation::OperationExits {
                     type_mismatch_exit: type_mismatch,
+                    identity_guard_exit: identity_guard,
                     allocation_miss_exit: allocation_miss,
                     unsupported_exit: unsupported,
                     runtime_transition_exit: runtime_transition,
@@ -291,7 +300,7 @@ pub(super) fn compile(
     }
 
     if !call_source_exits.is_empty() {
-        // Each relay names all nine shared destinations, so all must exist.
+        // Each relay names every shared destination, so all must exist.
         required_exits = cold_exits::ALL;
         dynasm!(ops ; .arch x64 ; jmp =>unsupported);
         for (labels, pc, safepoint_id) in call_source_exits {
@@ -334,6 +343,12 @@ pub(super) fn compile(
             cold_exits::TYPE_MISMATCH,
             type_mismatch,
             abi::ExitReason::TypeMismatch,
+            abi::ExitAction::Recompile,
+        ),
+        (
+            cold_exits::IDENTITY_GUARD,
+            identity_guard,
+            abi::ExitReason::IdentityGuard,
             abi::ExitAction::Recompile,
         ),
         (
@@ -1461,16 +1476,16 @@ fn emit_constant_transition(
     emit_status_word_result(ops, threw, fatal);
 }
 
-/// Allocates `Array()` or `Array(Int32)` through the shared `AllocValue3`
+/// Allocates a proven `Array(Int32)` through the shared `AllocValue3`
 /// boundary. The VM stub rejects a non-Int32 or negative length before any
 /// allocation, so every non-success status exits at the original
-/// `ArrayConstruct` and the interpreter owns wide lengths, `RangeError`, and
+/// call or construction and the interpreter owns wide lengths, `RangeError`, and
 /// OOM reporting.
-fn emit_array_construct_alloc_call(
+fn emit_array_length_alloc_call(
     ops: &mut Assembler,
     relocations: &mut RelocationCapture,
     dst: u16,
-    length: Option<u16>,
+    length: u16,
     packet: crate::template::operation::AllocPacket,
     miss: DynamicLabel,
 ) -> Result<(), Unsupported> {
@@ -1478,14 +1493,10 @@ fn emit_array_construct_alloc_call(
     let stub_addr = alloc_value_stub_by_id(descriptor.id)
         .and_then(|stub| stub.entry_addr())
         .ok_or(Unsupported::OperandShape(
-            "ArrayConstruct allocating stub entry",
+            "array length allocating stub entry",
         ))?;
     emit_alloc_packet(ops, packet);
-    if let Some(length) = length {
-        emit_load_reg(ops, 2, length);
-    } else {
-        emit_load_u64(ops, 2, otter_vm::Value::number_i32(0).to_bits());
-    }
+    emit_load_reg(ops, 2, length);
     emit_load_u64(ops, 1, VALUE_UNDEFINED);
     emit_load_u64(ops, 8, VALUE_UNDEFINED);
     emit_load_runtime_stub(ops, relocations, stub_addr as u64, descriptor);

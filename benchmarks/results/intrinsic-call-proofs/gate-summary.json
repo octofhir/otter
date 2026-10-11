@@ -1,0 +1,2085 @@
+{
+  "status": "passed",
+  "parent": "a9b41e7436d6647b9622d8c146bcd1988def8e91",
+  "collected_at": "2026-10-11T13:22:57.909966+00:00",
+  "selected_records": {
+    "clippy-host": "clippy-host-final-10",
+    "clippy-compiler": "clippy-compiler-final-2",
+    "bytecode-lib": "bytecode-compiler-lib-final-1",
+    "compiler-lib": "compiler-lib-final-2",
+    "vm-lib": "vm-lib-final-13",
+    "jit-lib": "jit-lib-final-13",
+    "runtime-array-construct": "runtime-array-construct-final-13",
+    "runtime-empty-allocations": "runtime-empty-allocations-final-13",
+    "runtime-clone": "runtime-clone-final-13",
+    "runtime-worker-brand": "runtime-worker-brand-final-13",
+    "build-host": "build-host-final-13",
+    "build-x86": "build-x86-final-5",
+    "jit-lib-x86": "jit-lib-x86-final-5",
+    "clippy-x86": "clippy-x86-final-5",
+    "difftest-x86": "difftest-x86-final-5",
+    "difftest-host": "difftest-host-final-final-1",
+    "test262": "test262-full"
+  },
+  "commands": [
+    {
+      "role": "clippy-host",
+      "name": "clippy-host-final-10",
+      "command": [
+        "cargo",
+        "clippy",
+        "-p",
+        "otter-vm",
+        "-p",
+        "otter-jit",
+        "-p",
+        "otter-runtime",
+        "-p",
+        "otter-cli",
+        "-p",
+        "otter-difftest",
+        "--all-targets",
+        "--",
+        "-D",
+        "warnings"
+      ],
+      "exit_code": 0,
+      "elapsed_seconds": 5.150616916944273,
+      "source_freeze_sha256": "6d01ab0d5b43c6b998fe49ef03ce03344f7e3ecd5705ef4951008a8d0f377ead",
+      "source_freeze": "unchanged",
+      "record_sha256": "aa2af618a578d17c663102f10cc9511856c7e014ffa9a046c13fe3ad957f7e98",
+      "log_sha256": "386dce79a1bf96245a8d924bacc42386533464c942201a687659ae9eb8e05dde",
+      "source_provenance": "recorded-final-freeze-digest"
+    },
+    {
+      "role": "clippy-compiler",
+      "name": "clippy-compiler-final-2",
+      "command": [
+        "cargo",
+        "clippy",
+        "-p",
+        "otter-compiler",
+        "--all-targets",
+        "--",
+        "-D",
+        "warnings"
+      ],
+      "exit_code": 0,
+      "elapsed_seconds": 10.17144237505272,
+      "source_freeze": "unchanged",
+      "record_sha256": "f10dad25b24949a2f8f3f5cb4360e185f52e886506086a44d3c93c48b429a04f",
+      "log_sha256": "155e7cfecfd1b5d4fac0d018cb74f9867b3dea647e032b33bfc9cee741d97579",
+      "source_provenance": "parent-reviewed selection; marker has no freeze digest"
+    },
+    {
+      "role": "bytecode-lib",
+      "name": "bytecode-compiler-lib-final-1",
+      "command": [
+        "cargo",
+        "test",
+        "-p",
+        "otter-bytecode",
+        "-p",
+        "otter-compiler",
+        "--lib",
+        "--release"
+      ],
+      "exit_code": 101,
+      "elapsed_seconds": 50.54478937503882,
+      "source_freeze": "unchanged",
+      "record_sha256": "a8a2da4b237e864f93166a9e63e9304a1c913e0bfaec65e20bc590c1d4881526",
+      "log_sha256": "0ebff92503fa05f79e51327bf7d65f2e45d9b5c536f551d84c64cbcb1aa244d3",
+      "source_provenance": "parent-reviewed selection; marker has no freeze digest",
+      "accepted_scope": "completed otter-bytecode unit section only; bundled compiler failure is preserved"
+    },
+    {
+      "role": "compiler-lib",
+      "name": "compiler-lib-final-2",
+      "command": [
+        "cargo",
+        "test",
+        "-p",
+        "otter-compiler",
+        "--lib",
+        "--release"
+      ],
+      "exit_code": 0,
+      "elapsed_seconds": 44.61530295899138,
+      "source_freeze": "unchanged",
+      "record_sha256": "75eb8ae216849abdf26632c4867b98c9cd2a2b1c1c206ba8fa267fe003d8fa86",
+      "log_sha256": "c2e22345b9c3d416552523567d0ae358ff1755c586afc84b3f2e47818aa4be98",
+      "source_provenance": "parent-reviewed selection; marker has no freeze digest"
+    },
+    {
+      "role": "vm-lib",
+      "name": "vm-lib-final-13",
+      "command": [
+        "cargo",
+        "test",
+        "-p",
+        "otter-vm",
+        "--lib",
+        "--release"
+      ],
+      "exit_code": 0,
+      "elapsed_seconds": 93.80510887503624,
+      "source_freeze_sha256": "6d01ab0d5b43c6b998fe49ef03ce03344f7e3ecd5705ef4951008a8d0f377ead",
+      "source_freeze": "unchanged",
+      "record_sha256": "4438577e7609d4b0c9548b73a5a21627b75df3f3e34e1eb2f907940102557277",
+      "log_sha256": "147cb28a2c13080e561c8ebc42b54ccda3f52cfa3a6039727cee4946857a5ead",
+      "source_provenance": "recorded-final-freeze-digest"
+    },
+    {
+      "role": "jit-lib",
+      "name": "jit-lib-final-13",
+      "command": [
+        "cargo",
+        "test",
+        "-p",
+        "otter-jit",
+        "--lib",
+        "--release"
+      ],
+      "exit_code": 0,
+      "elapsed_seconds": 0.3211082499474287,
+      "source_freeze_sha256": "6d01ab0d5b43c6b998fe49ef03ce03344f7e3ecd5705ef4951008a8d0f377ead",
+      "source_freeze": "unchanged",
+      "record_sha256": "4b5516837b907f28a8621e37508ad29617c8a9002d4a0e4ec83b06c3eb7fa97a",
+      "log_sha256": "de219e02250fd6cab54588dc1ea2ead906dbaf512d91dd574b62a6a5d05facbf",
+      "source_provenance": "recorded-final-freeze-digest"
+    },
+    {
+      "role": "runtime-array-construct",
+      "name": "runtime-array-construct-final-13",
+      "command": [
+        "cargo",
+        "test",
+        "-p",
+        "otter-runtime",
+        "--test",
+        "jit_stack_owned_array_construct",
+        "--release"
+      ],
+      "exit_code": 0,
+      "elapsed_seconds": 0.8860225420212373,
+      "source_freeze_sha256": "6d01ab0d5b43c6b998fe49ef03ce03344f7e3ecd5705ef4951008a8d0f377ead",
+      "source_freeze": "unchanged",
+      "record_sha256": "192445b3bbe666f9a173bf5662a34d960c7865a7f9637e8982a6457824ff65a4",
+      "log_sha256": "09adb99b1d24ac8127ac403c13774aed4020cb47cd1e3fe7ecc968ad0392bb52",
+      "source_provenance": "recorded-final-freeze-digest"
+    },
+    {
+      "role": "runtime-empty-allocations",
+      "name": "runtime-empty-allocations-final-13",
+      "command": [
+        "cargo",
+        "test",
+        "-p",
+        "otter-runtime",
+        "--test",
+        "jit_empty_allocations",
+        "--release"
+      ],
+      "exit_code": 0,
+      "elapsed_seconds": 0.7559655419318005,
+      "source_freeze_sha256": "6d01ab0d5b43c6b998fe49ef03ce03344f7e3ecd5705ef4951008a8d0f377ead",
+      "source_freeze": "unchanged",
+      "record_sha256": "f3fa6da331d161790c0fe485dad1333562b5f798ff0018aaf2f79d98ecc53740",
+      "log_sha256": "28f51942fbac00cca30f9c6841dc4ca5ff74edc53b85d8bc7b8cccbb48e640f9",
+      "source_provenance": "recorded-final-freeze-digest"
+    },
+    {
+      "role": "runtime-clone",
+      "name": "runtime-clone-final-13",
+      "command": [
+        "cargo",
+        "test",
+        "-p",
+        "otter-runtime",
+        "--lib",
+        "--release",
+        "structured_clone::tests::"
+      ],
+      "exit_code": 0,
+      "elapsed_seconds": 97.75554833293427,
+      "source_freeze_sha256": "6d01ab0d5b43c6b998fe49ef03ce03344f7e3ecd5705ef4951008a8d0f377ead",
+      "source_freeze": "unchanged",
+      "record_sha256": "8ae24ae507fe9106a74054fc2eff9cc4fb6d6c935d90b083915b4027602316b8",
+      "log_sha256": "9332d74081784356de8146cd5c20187fc878366b98aa469d0747332d21e082f8",
+      "source_provenance": "recorded-final-freeze-digest"
+    },
+    {
+      "role": "runtime-worker-brand",
+      "name": "runtime-worker-brand-final-13",
+      "command": [
+        "cargo",
+        "test",
+        "-p",
+        "otter-runtime",
+        "--lib",
+        "--release",
+        "worker::array_brand_tests::"
+      ],
+      "exit_code": 0,
+      "elapsed_seconds": 0.9630537080811337,
+      "source_freeze_sha256": "6d01ab0d5b43c6b998fe49ef03ce03344f7e3ecd5705ef4951008a8d0f377ead",
+      "source_freeze": "unchanged",
+      "record_sha256": "cb3948c302d5f8d1d730e90843906e6dd64d63c085a126c470d751868c05f344",
+      "log_sha256": "6fa80baa35da79c20271ea97de5a880d996137ea612025effa107ccf83b14372",
+      "source_provenance": "recorded-final-freeze-digest"
+    },
+    {
+      "role": "build-host",
+      "name": "build-host-final-13",
+      "command": [
+        "cargo",
+        "build",
+        "--release",
+        "-p",
+        "otter-cli",
+        "-p",
+        "otter-difftest",
+        "-p",
+        "otter-test262"
+      ],
+      "exit_code": 0,
+      "elapsed_seconds": 236.30732304195408,
+      "source_freeze_sha256": "6d01ab0d5b43c6b998fe49ef03ce03344f7e3ecd5705ef4951008a8d0f377ead",
+      "source_freeze": "unchanged",
+      "record_sha256": "7932387c38b1b3b5e8c567565f35745149f83d60eaa58c1069fc488ad1a1441d",
+      "log_sha256": "be58738628b2d2148c27d2feb63c897527ff6a3c19fdad36cb6d4f67554efe94",
+      "source_provenance": "recorded-final-freeze-digest"
+    },
+    {
+      "role": "build-x86",
+      "name": "build-x86-final-5",
+      "command": [
+        "cargo",
+        "build",
+        "--release",
+        "-p",
+        "otter-cli",
+        "-p",
+        "otter-difftest",
+        "--target",
+        "x86_64-apple-darwin"
+      ],
+      "exit_code": 0,
+      "elapsed_seconds": 92.66429137508385,
+      "source_freeze_sha256": "6d01ab0d5b43c6b998fe49ef03ce03344f7e3ecd5705ef4951008a8d0f377ead",
+      "source_freeze": "unchanged",
+      "record_sha256": "cf4b53f7362274d317d16bb6181075bb0d2e9f30bc13fa2cbdeef6b5c3707052",
+      "log_sha256": "88a18ede095d712f9ac3ba8a81527c778627e6634781bb0f370fb35208f62f04",
+      "source_provenance": "recorded-final-freeze-digest"
+    },
+    {
+      "role": "jit-lib-x86",
+      "name": "jit-lib-x86-final-5",
+      "command": [
+        "cargo",
+        "test",
+        "-p",
+        "otter-jit",
+        "--lib",
+        "--release",
+        "--target",
+        "x86_64-apple-darwin"
+      ],
+      "exit_code": 0,
+      "elapsed_seconds": 1.8835560000734404,
+      "source_freeze_sha256": "6d01ab0d5b43c6b998fe49ef03ce03344f7e3ecd5705ef4951008a8d0f377ead",
+      "source_freeze": "unchanged",
+      "record_sha256": "53c36e470a2f929c0c4b63ea3f5e384adbc8c588609fbf5504007914e58943bf",
+      "log_sha256": "9d96660b47482216100427cce498d589c83b7c0065a23ddd74c3fd4b499b7eef",
+      "source_provenance": "recorded-final-freeze-digest"
+    },
+    {
+      "role": "clippy-x86",
+      "name": "clippy-x86-final-5",
+      "command": [
+        "cargo",
+        "clippy",
+        "-p",
+        "otter-vm",
+        "-p",
+        "otter-jit",
+        "-p",
+        "otter-runtime",
+        "-p",
+        "otter-cli",
+        "-p",
+        "otter-difftest",
+        "--all-targets",
+        "--target",
+        "x86_64-apple-darwin",
+        "--",
+        "-D",
+        "warnings"
+      ],
+      "exit_code": 0,
+      "elapsed_seconds": 4.941384874982759,
+      "source_freeze_sha256": "6d01ab0d5b43c6b998fe49ef03ce03344f7e3ecd5705ef4951008a8d0f377ead",
+      "source_freeze": "unchanged",
+      "record_sha256": "da381507c5b2235763f2265666a7859611b530b2f21ea7b100c4877ce3107139",
+      "log_sha256": "3081cef1eb47c1f68f7d17b3ddd702c961142f7c056e97e3f826f6c3ca71747f",
+      "source_provenance": "recorded-final-freeze-digest"
+    },
+    {
+      "role": "difftest-x86",
+      "name": "difftest-x86-final-5",
+      "command": [
+        "target/x86_64-apple-darwin/release/otter-difftest",
+        "--otter",
+        "target/x86_64-apple-darwin/release/otter",
+        "--timeout-ms",
+        "120000"
+      ],
+      "exit_code": 0,
+      "elapsed_seconds": 657.7997493329458,
+      "source_freeze_sha256": "6d01ab0d5b43c6b998fe49ef03ce03344f7e3ecd5705ef4951008a8d0f377ead",
+      "source_freeze": "unchanged",
+      "record_sha256": "2ce2f7f2d380b77f528eafc3afd5519cb32f06c2349b9bffb9d0213515c51f5a",
+      "log_sha256": "bc407f1d171c1ece2cd8b29cd6c52f6777c66a416366e16d41141bce88f8400f",
+      "source_provenance": "recorded-final-freeze-digest"
+    },
+    {
+      "role": "difftest-host",
+      "name": "difftest-host-final-final-1",
+      "command": [
+        "target/release/otter-difftest",
+        "--otter",
+        "target/release/otter",
+        "--timeout-ms",
+        "120000"
+      ],
+      "exit_code": 0,
+      "elapsed_seconds": 374.57709054101724,
+      "source_freeze_sha256": "6d01ab0d5b43c6b998fe49ef03ce03344f7e3ecd5705ef4951008a8d0f377ead",
+      "source_freeze": "unchanged",
+      "record_sha256": "bfa91f63041e68ac32741137bf9389540241f27d1f012c2bffbc611ddb2b4fb6",
+      "log_sha256": "a32d141acafd5773fe1b97a254536b8063a5f746f1abe49152f6f09445c2dc99",
+      "source_provenance": "recorded-final-freeze-digest"
+    },
+    {
+      "role": "test262",
+      "name": "test262-full",
+      "command": [
+        "bash",
+        "scripts/test262-safe.sh",
+        "--output",
+        "benchmarks/results/t262/full-2026-10-11e.json"
+      ],
+      "exit_code": 0,
+      "elapsed_seconds": 511.8889315830311,
+      "source_freeze_sha256": "6d01ab0d5b43c6b998fe49ef03ce03344f7e3ecd5705ef4951008a8d0f377ead",
+      "source_freeze": "unchanged",
+      "record_sha256": "43108a73000836fa853cef3d709c13b46ac1dd7cc944c514b277ee36621fd9a1",
+      "log_sha256": "37ae50b4638eaa284e72fbf7f363f395bfe6d02930ed01f703501e51a8cf2c7b",
+      "source_provenance": "recorded-final-freeze-digest"
+    }
+  ],
+  "units": {
+    "bytecode-lib": {
+      "passed": 99,
+      "failed": 0,
+      "ignored": 0,
+      "measured": 0,
+      "filtered_out": 0
+    },
+    "compiler-lib": {
+      "passed": 129,
+      "failed": 0,
+      "ignored": 0,
+      "measured": 0,
+      "filtered_out": 0
+    },
+    "vm-lib": {
+      "passed": 1236,
+      "failed": 0,
+      "ignored": 0,
+      "measured": 0,
+      "filtered_out": 0
+    },
+    "jit-lib": {
+      "passed": 260,
+      "failed": 0,
+      "ignored": 0,
+      "measured": 0,
+      "filtered_out": 0
+    },
+    "runtime-array-construct": {
+      "passed": 9,
+      "failed": 0,
+      "ignored": 0,
+      "measured": 0,
+      "filtered_out": 0
+    },
+    "runtime-empty-allocations": {
+      "passed": 10,
+      "failed": 0,
+      "ignored": 0,
+      "measured": 0,
+      "filtered_out": 0
+    },
+    "runtime-clone": {
+      "passed": 9,
+      "failed": 0,
+      "ignored": 0,
+      "measured": 0,
+      "filtered_out": 288
+    },
+    "runtime-worker-brand": {
+      "passed": 3,
+      "failed": 0,
+      "ignored": 0,
+      "measured": 0,
+      "filtered_out": 294
+    },
+    "jit-lib-x86": {
+      "passed": 282,
+      "failed": 0,
+      "ignored": 0,
+      "measured": 0,
+      "filtered_out": 0
+    }
+  },
+  "difftest": {
+    "x86": {
+      "seed": 340717225298,
+      "passed": 145,
+      "failed": 0,
+      "record": "difftest-x86-final-5",
+      "log_sha256": "bc407f1d171c1ece2cd8b29cd6c52f6777c66a416366e16d41141bce88f8400f"
+    },
+    "host": {
+      "seed": 340717225298,
+      "passed": 145,
+      "failed": 0,
+      "record": "difftest-host-final-final-1",
+      "log_sha256": "a32d141acafd5773fe1b97a254536b8063a5f746f1abe49152f6f09445c2dc99"
+    }
+  },
+  "test262": {
+    "status": "passed",
+    "started_at": "2026-10-11T13:09:31.089041+00:00",
+    "full_report": "benchmarks/results/t262/full-2026-10-11e.json",
+    "runner_sha256": "60e9db994e23a99358ea688235da5bb00346bf0ce818452137beba02437d3be8",
+    "timeout_rechecks": [],
+    "binary_identity_before": {
+      "runner_sha256": "60e9db994e23a99358ea688235da5bb00346bf0ce818452137beba02437d3be8",
+      "cli_sha256": "f5efe0120122a19c425defddf6a3a221d3970065b77e12dc48566d9a90962140"
+    },
+    "full_report_sha256_before": "bdbeacc819aa497019c8700c431d38f0f6c9a12ef07befb0bc125a630f7862a5",
+    "full_totals": {
+      "total": 53575,
+      "passed": 52463,
+      "failed": 12,
+      "skipped": 1100,
+      "crashed": 0,
+      "timed_out": 0,
+      "oom": 0
+    },
+    "runner_provenance": {
+      "executable_sha256": "60e9db994e23a99358ea688235da5bb00346bf0ce818452137beba02437d3be8",
+      "target": "aarch64-apple-darwin",
+      "debug_assertions": false,
+      "semantic_config": {
+        "timeout_ms": 5000,
+        "max_heap_bytes": 536870912,
+        "jit_tier": "production-tiered",
+        "snapshot_isolates": false,
+        "skip_features": [
+          "import-assertions",
+          "import-bytes",
+          "json-modules",
+          "source-phase-imports",
+          "source-phase-imports-module-source",
+          "ShadowRealm",
+          "cross-realm",
+          "explicit-resource-management",
+          "immutable-arraybuffer",
+          "decorators"
+        ],
+        "skip_flags": [],
+        "ignored_tests": [],
+        "known_panics": [],
+        "engine_environment": {}
+      }
+    },
+    "test262_commit": "be13516fb6441b950ba8a3df97eb34062c186972",
+    "canonical_rows_and_rollups_valid": true,
+    "coverage_matches_d": true,
+    "failure_paths": [
+      "intl402/DateTimeFormat/prototype/formatRange/en-US.js",
+      "intl402/DateTimeFormat/prototype/formatRangeToParts/chinese-calendar-dates.js",
+      "intl402/DateTimeFormat/prototype/formatRangeToParts/dangi-calendar-dates.js",
+      "intl402/DateTimeFormat/prototype/formatRangeToParts/en-US.js",
+      "intl402/DateTimeFormat/prototype/formatToParts/chinese-calendar-dates.js",
+      "intl402/DateTimeFormat/prototype/formatToParts/compare-to-temporal-lunisolar.js",
+      "intl402/DateTimeFormat/prototype/formatToParts/compare-to-temporal.js",
+      "intl402/DateTimeFormat/prototype/formatToParts/dangi-calendar-dates.js",
+      "intl402/DateTimeFormat/prototype/formatToParts/era.js",
+      "staging/sm/String/internalUsage.js",
+      "staging/sm/lexical-environment/block-scoped-functions-annex-b-arguments.js",
+      "staging/sm/regress/regress-602621.js"
+    ],
+    "baseline_comparisons": {
+      "benchmarks/results/t262/full-2026-10-11d.md": {
+        "sha256": "d7c189764b9170eb5f29bace2f62311ec08892c2005712785176e3a99b99e01b",
+        "identical_failure_set": true,
+        "missing": [],
+        "unexpected": []
+      },
+      "benchmarks/results/t262/full-2026-10-11b.md": {
+        "sha256": "9575881448061f0bdc584e5e901f1fbf3d5dcda514f8febd7becc684a95b0571",
+        "identical_failure_set": true,
+        "missing": [],
+        "unexpected": []
+      }
+    },
+    "identical_failure_set": true,
+    "timeout_paths": [],
+    "timeout_rechecks_passed": 0,
+    "rechecks_directory": "benchmarks/results/intrinsic-call-proofs/test262-rechecks-znxkmwdo",
+    "effective_totals": {
+      "total": 53575,
+      "passed": 52463,
+      "failed": 12,
+      "skipped": 1100,
+      "crashed": 0,
+      "timed_out": 0,
+      "oom": 0
+    },
+    "full_report_sha256_after": "bdbeacc819aa497019c8700c431d38f0f6c9a12ef07befb0bc125a630f7862a5",
+    "binary_identity_after": {
+      "runner_sha256": "60e9db994e23a99358ea688235da5bb00346bf0ce818452137beba02437d3be8",
+      "cli_sha256": "f5efe0120122a19c425defddf6a3a221d3970065b77e12dc48566d9a90962140"
+    },
+    "binary_identity_unchanged": true,
+    "finished_at": "2026-10-11T13:09:31.776501+00:00",
+    "full_report_sha256": "bdbeacc819aa497019c8700c431d38f0f6c9a12ef07befb0bc125a630f7862a5",
+    "step_timeout_ms": 7200000
+  },
+  "corpus_oracles": {
+    "cli_sha256": "f5efe0120122a19c425defddf6a3a221d3970065b77e12dc48566d9a90962140",
+    "expected_binary_sha256": "f5efe0120122a19c425defddf6a3a221d3970065b77e12dc48566d9a90962140",
+    "runs": [
+      {
+        "name": "oracle-final-intrinsic_call_proofs-node",
+        "command": [
+          "node",
+          "crates/otter-difftest/corpus/intrinsic_call_proofs.js"
+        ],
+        "stress": null,
+        "exit_code": 0,
+        "elapsed_seconds": 0.05828574998304248,
+        "stdout_sha256": "11e98e72c46ade77aa4e7e61f15e56e7dfd5d22e3b68937b2ef2a957fef04248",
+        "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "corpus_sha256": "e016f58a76025fae990c7ded2e47a50304136cb3b1472d34bdc9b404edfaf40e"
+      },
+      {
+        "name": "oracle-final-intrinsic_call_proofs-interpreter",
+        "command": [
+          "/Users/alexanderstreltsov/work/octofhir/otter/target/release/otter",
+          "--interpreter",
+          "run",
+          "crates/otter-difftest/corpus/intrinsic_call_proofs.js"
+        ],
+        "stress": null,
+        "exit_code": 0,
+        "elapsed_seconds": 0.10912495898082852,
+        "stdout_sha256": "11e98e72c46ade77aa4e7e61f15e56e7dfd5d22e3b68937b2ef2a957fef04248",
+        "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "matches_node": true
+      },
+      {
+        "name": "oracle-final-intrinsic_call_proofs-native",
+        "command": [
+          "/Users/alexanderstreltsov/work/octofhir/otter/target/release/otter",
+          "run",
+          "crates/otter-difftest/corpus/intrinsic_call_proofs.js"
+        ],
+        "stress": null,
+        "exit_code": 0,
+        "elapsed_seconds": 0.0737829590216279,
+        "stdout_sha256": "11e98e72c46ade77aa4e7e61f15e56e7dfd5d22e3b68937b2ef2a957fef04248",
+        "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "matches_node": true
+      },
+      {
+        "name": "oracle-final-intrinsic_call_proofs-template",
+        "command": [
+          "/Users/alexanderstreltsov/work/octofhir/otter/target/release/otter",
+          "--jitless",
+          "run",
+          "crates/otter-difftest/corpus/intrinsic_call_proofs.js"
+        ],
+        "stress": null,
+        "exit_code": 0,
+        "elapsed_seconds": 0.051381084020249546,
+        "stdout_sha256": "11e98e72c46ade77aa4e7e61f15e56e7dfd5d22e3b68937b2ef2a957fef04248",
+        "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "matches_node": true
+      },
+      {
+        "name": "oracle-final-intrinsic_call_proofs-native-stress256",
+        "command": [
+          "/Users/alexanderstreltsov/work/octofhir/otter/target/release/otter",
+          "run",
+          "crates/otter-difftest/corpus/intrinsic_call_proofs.js"
+        ],
+        "stress": 256,
+        "exit_code": 0,
+        "elapsed_seconds": 0.11061550001613796,
+        "stdout_sha256": "11e98e72c46ade77aa4e7e61f15e56e7dfd5d22e3b68937b2ef2a957fef04248",
+        "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "matches_node": true
+      },
+      {
+        "name": "oracle-final-intrinsic_call_proofs-interpreter-stress256",
+        "command": [
+          "/Users/alexanderstreltsov/work/octofhir/otter/target/release/otter",
+          "--interpreter",
+          "run",
+          "crates/otter-difftest/corpus/intrinsic_call_proofs.js"
+        ],
+        "stress": 256,
+        "exit_code": 0,
+        "elapsed_seconds": 0.12945649994071573,
+        "stdout_sha256": "11e98e72c46ade77aa4e7e61f15e56e7dfd5d22e3b68937b2ef2a957fef04248",
+        "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "matches_node": true
+      },
+      {
+        "name": "oracle-final-intrinsic_call_proofs-native-stress1",
+        "command": [
+          "/Users/alexanderstreltsov/work/octofhir/otter/target/release/otter",
+          "run",
+          "crates/otter-difftest/corpus/intrinsic_call_proofs.js"
+        ],
+        "stress": 1,
+        "exit_code": 0,
+        "elapsed_seconds": 4.57008550001774,
+        "stdout_sha256": "11e98e72c46ade77aa4e7e61f15e56e7dfd5d22e3b68937b2ef2a957fef04248",
+        "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "matches_node": true
+      },
+      {
+        "name": "oracle-final-intrinsic_call_proofs-template-stress1",
+        "command": [
+          "/Users/alexanderstreltsov/work/octofhir/otter/target/release/otter",
+          "--jitless",
+          "run",
+          "crates/otter-difftest/corpus/intrinsic_call_proofs.js"
+        ],
+        "stress": 1,
+        "exit_code": 0,
+        "elapsed_seconds": 4.797760250046849,
+        "stdout_sha256": "11e98e72c46ade77aa4e7e61f15e56e7dfd5d22e3b68937b2ef2a957fef04248",
+        "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "matches_node": true
+      },
+      {
+        "name": "oracle-final-method_argument_order-node",
+        "command": [
+          "node",
+          "crates/otter-difftest/corpus/method_argument_order.js"
+        ],
+        "stress": null,
+        "exit_code": 0,
+        "elapsed_seconds": 0.18317249999381602,
+        "stdout_sha256": "ed6bbf34b6f5175e3461e9ffa736afad1c4a4c58ae779d08a26844f232897ab2",
+        "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "corpus_sha256": "f46e4031fd2ffc55d79b0eeb2e6b62c6d794520d08faddd2ee9a90b905cb8efc"
+      },
+      {
+        "name": "oracle-final-method_argument_order-interpreter",
+        "command": [
+          "/Users/alexanderstreltsov/work/octofhir/otter/target/release/otter",
+          "--interpreter",
+          "run",
+          "crates/otter-difftest/corpus/method_argument_order.js"
+        ],
+        "stress": null,
+        "exit_code": 0,
+        "elapsed_seconds": 0.26149508403614163,
+        "stdout_sha256": "ed6bbf34b6f5175e3461e9ffa736afad1c4a4c58ae779d08a26844f232897ab2",
+        "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "matches_node": true
+      },
+      {
+        "name": "oracle-final-method_argument_order-native",
+        "command": [
+          "/Users/alexanderstreltsov/work/octofhir/otter/target/release/otter",
+          "run",
+          "crates/otter-difftest/corpus/method_argument_order.js"
+        ],
+        "stress": null,
+        "exit_code": 0,
+        "elapsed_seconds": 0.20348704198841006,
+        "stdout_sha256": "ed6bbf34b6f5175e3461e9ffa736afad1c4a4c58ae779d08a26844f232897ab2",
+        "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "matches_node": true
+      },
+      {
+        "name": "oracle-final-method_argument_order-template",
+        "command": [
+          "/Users/alexanderstreltsov/work/octofhir/otter/target/release/otter",
+          "--jitless",
+          "run",
+          "crates/otter-difftest/corpus/method_argument_order.js"
+        ],
+        "stress": null,
+        "exit_code": 0,
+        "elapsed_seconds": 0.22861904208548367,
+        "stdout_sha256": "ed6bbf34b6f5175e3461e9ffa736afad1c4a4c58ae779d08a26844f232897ab2",
+        "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "matches_node": true
+      },
+      {
+        "name": "oracle-final-method_argument_order-native-stress256",
+        "command": [
+          "/Users/alexanderstreltsov/work/octofhir/otter/target/release/otter",
+          "run",
+          "crates/otter-difftest/corpus/method_argument_order.js"
+        ],
+        "stress": 256,
+        "exit_code": 0,
+        "elapsed_seconds": 0.30667612503748387,
+        "stdout_sha256": "ed6bbf34b6f5175e3461e9ffa736afad1c4a4c58ae779d08a26844f232897ab2",
+        "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "matches_node": true
+      },
+      {
+        "name": "oracle-final-method_argument_order-interpreter-stress256",
+        "command": [
+          "/Users/alexanderstreltsov/work/octofhir/otter/target/release/otter",
+          "--interpreter",
+          "run",
+          "crates/otter-difftest/corpus/method_argument_order.js"
+        ],
+        "stress": 256,
+        "exit_code": 0,
+        "elapsed_seconds": 0.3740247080568224,
+        "stdout_sha256": "ed6bbf34b6f5175e3461e9ffa736afad1c4a4c58ae779d08a26844f232897ab2",
+        "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "matches_node": true
+      },
+      {
+        "name": "oracle-final-method_argument_order-native-stress1",
+        "command": [
+          "/Users/alexanderstreltsov/work/octofhir/otter/target/release/otter",
+          "run",
+          "crates/otter-difftest/corpus/method_argument_order.js"
+        ],
+        "stress": 1,
+        "exit_code": 0,
+        "elapsed_seconds": 21.905329583096318,
+        "stdout_sha256": "ed6bbf34b6f5175e3461e9ffa736afad1c4a4c58ae779d08a26844f232897ab2",
+        "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "matches_node": true
+      },
+      {
+        "name": "oracle-final-method_argument_order-template-stress1",
+        "command": [
+          "/Users/alexanderstreltsov/work/octofhir/otter/target/release/otter",
+          "--jitless",
+          "run",
+          "crates/otter-difftest/corpus/method_argument_order.js"
+        ],
+        "stress": 1,
+        "exit_code": 0,
+        "elapsed_seconds": 22.120476457988843,
+        "stdout_sha256": "ed6bbf34b6f5175e3461e9ffa736afad1c4a4c58ae779d08a26844f232897ab2",
+        "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "matches_node": true
+      },
+      {
+        "name": "oracle-final-restored_inline_completion-node",
+        "command": [
+          "node",
+          "crates/otter-difftest/corpus/restored_inline_completion.js"
+        ],
+        "stress": null,
+        "exit_code": 0,
+        "elapsed_seconds": 0.05938674998469651,
+        "stdout_sha256": "72b665ee64ef84be23722bd7bc502c69725f57f193f324d9d793fb3926eec48b",
+        "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "corpus_sha256": "e4ab03d227378ddce49bac959d54587b253b15f2b822b4a2b8a661e12f2abcb4"
+      },
+      {
+        "name": "oracle-final-restored_inline_completion-interpreter",
+        "command": [
+          "/Users/alexanderstreltsov/work/octofhir/otter/target/release/otter",
+          "--interpreter",
+          "run",
+          "crates/otter-difftest/corpus/restored_inline_completion.js"
+        ],
+        "stress": null,
+        "exit_code": 0,
+        "elapsed_seconds": 0.08122712501790375,
+        "stdout_sha256": "72b665ee64ef84be23722bd7bc502c69725f57f193f324d9d793fb3926eec48b",
+        "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "matches_node": true
+      },
+      {
+        "name": "oracle-final-restored_inline_completion-native",
+        "command": [
+          "/Users/alexanderstreltsov/work/octofhir/otter/target/release/otter",
+          "run",
+          "crates/otter-difftest/corpus/restored_inline_completion.js"
+        ],
+        "stress": null,
+        "exit_code": 0,
+        "elapsed_seconds": 0.0444931669626385,
+        "stdout_sha256": "72b665ee64ef84be23722bd7bc502c69725f57f193f324d9d793fb3926eec48b",
+        "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "matches_node": true
+      },
+      {
+        "name": "oracle-final-restored_inline_completion-template",
+        "command": [
+          "/Users/alexanderstreltsov/work/octofhir/otter/target/release/otter",
+          "--jitless",
+          "run",
+          "crates/otter-difftest/corpus/restored_inline_completion.js"
+        ],
+        "stress": null,
+        "exit_code": 0,
+        "elapsed_seconds": 0.04030045901890844,
+        "stdout_sha256": "72b665ee64ef84be23722bd7bc502c69725f57f193f324d9d793fb3926eec48b",
+        "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "matches_node": true
+      },
+      {
+        "name": "oracle-final-restored_inline_completion-native-stress256",
+        "command": [
+          "/Users/alexanderstreltsov/work/octofhir/otter/target/release/otter",
+          "run",
+          "crates/otter-difftest/corpus/restored_inline_completion.js"
+        ],
+        "stress": 256,
+        "exit_code": 0,
+        "elapsed_seconds": 0.047537207952700555,
+        "stdout_sha256": "72b665ee64ef84be23722bd7bc502c69725f57f193f324d9d793fb3926eec48b",
+        "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "matches_node": true
+      },
+      {
+        "name": "oracle-final-restored_inline_completion-interpreter-stress256",
+        "command": [
+          "/Users/alexanderstreltsov/work/octofhir/otter/target/release/otter",
+          "--interpreter",
+          "run",
+          "crates/otter-difftest/corpus/restored_inline_completion.js"
+        ],
+        "stress": 256,
+        "exit_code": 0,
+        "elapsed_seconds": 0.08612399990670383,
+        "stdout_sha256": "72b665ee64ef84be23722bd7bc502c69725f57f193f324d9d793fb3926eec48b",
+        "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "matches_node": true
+      },
+      {
+        "name": "oracle-final-restored_inline_completion-native-stress1",
+        "command": [
+          "/Users/alexanderstreltsov/work/octofhir/otter/target/release/otter",
+          "run",
+          "crates/otter-difftest/corpus/restored_inline_completion.js"
+        ],
+        "stress": 1,
+        "exit_code": 0,
+        "elapsed_seconds": 1.675894541083835,
+        "stdout_sha256": "72b665ee64ef84be23722bd7bc502c69725f57f193f324d9d793fb3926eec48b",
+        "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "matches_node": true
+      },
+      {
+        "name": "oracle-final-restored_inline_completion-template-stress1",
+        "command": [
+          "/Users/alexanderstreltsov/work/octofhir/otter/target/release/otter",
+          "--jitless",
+          "run",
+          "crates/otter-difftest/corpus/restored_inline_completion.js"
+        ],
+        "stress": 1,
+        "exit_code": 0,
+        "elapsed_seconds": 1.6122947500552982,
+        "stdout_sha256": "72b665ee64ef84be23722bd7bc502c69725f57f193f324d9d793fb3926eec48b",
+        "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "matches_node": true
+      },
+      {
+        "name": "oracle-final-switch_tdz_method_order-node",
+        "command": [
+          "node",
+          "crates/otter-difftest/corpus/switch_tdz_method_order.js"
+        ],
+        "stress": null,
+        "exit_code": 0,
+        "elapsed_seconds": 0.28198520897421986,
+        "stdout_sha256": "d01d8fe8f1eb64d7c8b47bf9cf2e41ad218d6244bd14bc6ef7b7c4c24494b303",
+        "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "corpus_sha256": "09d65cbca0a57347920cce182f56f4a14bd7f04db866fd97bf03ce4a0189ef11"
+      },
+      {
+        "name": "oracle-final-switch_tdz_method_order-interpreter",
+        "command": [
+          "/Users/alexanderstreltsov/work/octofhir/otter/target/release/otter",
+          "--interpreter",
+          "run",
+          "crates/otter-difftest/corpus/switch_tdz_method_order.js"
+        ],
+        "stress": null,
+        "exit_code": 0,
+        "elapsed_seconds": 0.4621145840501413,
+        "stdout_sha256": "d01d8fe8f1eb64d7c8b47bf9cf2e41ad218d6244bd14bc6ef7b7c4c24494b303",
+        "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "matches_node": true
+      },
+      {
+        "name": "oracle-final-switch_tdz_method_order-native",
+        "command": [
+          "/Users/alexanderstreltsov/work/octofhir/otter/target/release/otter",
+          "run",
+          "crates/otter-difftest/corpus/switch_tdz_method_order.js"
+        ],
+        "stress": null,
+        "exit_code": 0,
+        "elapsed_seconds": 0.39931570808403194,
+        "stdout_sha256": "d01d8fe8f1eb64d7c8b47bf9cf2e41ad218d6244bd14bc6ef7b7c4c24494b303",
+        "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "matches_node": true
+      },
+      {
+        "name": "oracle-final-switch_tdz_method_order-template",
+        "command": [
+          "/Users/alexanderstreltsov/work/octofhir/otter/target/release/otter",
+          "--jitless",
+          "run",
+          "crates/otter-difftest/corpus/switch_tdz_method_order.js"
+        ],
+        "stress": null,
+        "exit_code": 0,
+        "elapsed_seconds": 0.32154179201461375,
+        "stdout_sha256": "d01d8fe8f1eb64d7c8b47bf9cf2e41ad218d6244bd14bc6ef7b7c4c24494b303",
+        "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "matches_node": true
+      },
+      {
+        "name": "oracle-final-switch_tdz_method_order-native-stress256",
+        "command": [
+          "/Users/alexanderstreltsov/work/octofhir/otter/target/release/otter",
+          "run",
+          "crates/otter-difftest/corpus/switch_tdz_method_order.js"
+        ],
+        "stress": 256,
+        "exit_code": 0,
+        "elapsed_seconds": 0.5910917919827625,
+        "stdout_sha256": "d01d8fe8f1eb64d7c8b47bf9cf2e41ad218d6244bd14bc6ef7b7c4c24494b303",
+        "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "matches_node": true
+      },
+      {
+        "name": "oracle-final-switch_tdz_method_order-interpreter-stress256",
+        "command": [
+          "/Users/alexanderstreltsov/work/octofhir/otter/target/release/otter",
+          "--interpreter",
+          "run",
+          "crates/otter-difftest/corpus/switch_tdz_method_order.js"
+        ],
+        "stress": 256,
+        "exit_code": 0,
+        "elapsed_seconds": 0.6485744169913232,
+        "stdout_sha256": "d01d8fe8f1eb64d7c8b47bf9cf2e41ad218d6244bd14bc6ef7b7c4c24494b303",
+        "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "matches_node": true
+      },
+      {
+        "name": "oracle-final-switch_tdz_method_order-native-stress1",
+        "command": [
+          "/Users/alexanderstreltsov/work/octofhir/otter/target/release/otter",
+          "run",
+          "crates/otter-difftest/corpus/switch_tdz_method_order.js"
+        ],
+        "stress": 1,
+        "exit_code": 0,
+        "elapsed_seconds": 29.985727999941446,
+        "stdout_sha256": "d01d8fe8f1eb64d7c8b47bf9cf2e41ad218d6244bd14bc6ef7b7c4c24494b303",
+        "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "matches_node": true
+      },
+      {
+        "name": "oracle-final-switch_tdz_method_order-template-stress1",
+        "command": [
+          "/Users/alexanderstreltsov/work/octofhir/otter/target/release/otter",
+          "--jitless",
+          "run",
+          "crates/otter-difftest/corpus/switch_tdz_method_order.js"
+        ],
+        "stress": 1,
+        "exit_code": 0,
+        "elapsed_seconds": 37.82174170901999,
+        "stdout_sha256": "d01d8fe8f1eb64d7c8b47bf9cf2e41ad218d6244bd14bc6ef7b7c4c24494b303",
+        "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "matches_node": true
+      },
+      {
+        "name": "oracle-final-array_brand_to_string-node",
+        "command": [
+          "node",
+          "crates/otter-difftest/corpus/array_brand_to_string.js"
+        ],
+        "stress": null,
+        "exit_code": 0,
+        "elapsed_seconds": 0.04955158301163465,
+        "stdout_sha256": "0b6e0e44841d607c5a7401955a46502a34f8578779f9bb8f7526cb35599d04c1",
+        "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "corpus_sha256": "e0d1e14bb49a7f1c3157bc4317558266b5737089e27625c87f00f6bc37a14c70"
+      },
+      {
+        "name": "oracle-final-array_brand_to_string-interpreter",
+        "command": [
+          "/Users/alexanderstreltsov/work/octofhir/otter/target/release/otter",
+          "--interpreter",
+          "run",
+          "crates/otter-difftest/corpus/array_brand_to_string.js"
+        ],
+        "stress": null,
+        "exit_code": 0,
+        "elapsed_seconds": 0.03646579198539257,
+        "stdout_sha256": "0b6e0e44841d607c5a7401955a46502a34f8578779f9bb8f7526cb35599d04c1",
+        "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "matches_node": true
+      },
+      {
+        "name": "oracle-final-array_brand_to_string-native",
+        "command": [
+          "/Users/alexanderstreltsov/work/octofhir/otter/target/release/otter",
+          "run",
+          "crates/otter-difftest/corpus/array_brand_to_string.js"
+        ],
+        "stress": null,
+        "exit_code": 0,
+        "elapsed_seconds": 0.03845608304254711,
+        "stdout_sha256": "0b6e0e44841d607c5a7401955a46502a34f8578779f9bb8f7526cb35599d04c1",
+        "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "matches_node": true
+      },
+      {
+        "name": "oracle-final-array_brand_to_string-template",
+        "command": [
+          "/Users/alexanderstreltsov/work/octofhir/otter/target/release/otter",
+          "--jitless",
+          "run",
+          "crates/otter-difftest/corpus/array_brand_to_string.js"
+        ],
+        "stress": null,
+        "exit_code": 0,
+        "elapsed_seconds": 0.0404029170749709,
+        "stdout_sha256": "0b6e0e44841d607c5a7401955a46502a34f8578779f9bb8f7526cb35599d04c1",
+        "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "matches_node": true
+      },
+      {
+        "name": "oracle-final-array_brand_to_string-native-stress256",
+        "command": [
+          "/Users/alexanderstreltsov/work/octofhir/otter/target/release/otter",
+          "run",
+          "crates/otter-difftest/corpus/array_brand_to_string.js"
+        ],
+        "stress": 256,
+        "exit_code": 0,
+        "elapsed_seconds": 0.03692516696173698,
+        "stdout_sha256": "0b6e0e44841d607c5a7401955a46502a34f8578779f9bb8f7526cb35599d04c1",
+        "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "matches_node": true
+      },
+      {
+        "name": "oracle-final-array_brand_to_string-interpreter-stress256",
+        "command": [
+          "/Users/alexanderstreltsov/work/octofhir/otter/target/release/otter",
+          "--interpreter",
+          "run",
+          "crates/otter-difftest/corpus/array_brand_to_string.js"
+        ],
+        "stress": 256,
+        "exit_code": 0,
+        "elapsed_seconds": 0.04943783301860094,
+        "stdout_sha256": "0b6e0e44841d607c5a7401955a46502a34f8578779f9bb8f7526cb35599d04c1",
+        "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "matches_node": true
+      },
+      {
+        "name": "oracle-final-array_brand_to_string-native-stress1",
+        "command": [
+          "/Users/alexanderstreltsov/work/octofhir/otter/target/release/otter",
+          "run",
+          "crates/otter-difftest/corpus/array_brand_to_string.js"
+        ],
+        "stress": 1,
+        "exit_code": 0,
+        "elapsed_seconds": 1.4410245830658823,
+        "stdout_sha256": "0b6e0e44841d607c5a7401955a46502a34f8578779f9bb8f7526cb35599d04c1",
+        "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "matches_node": true
+      },
+      {
+        "name": "oracle-final-array_brand_to_string-template-stress1",
+        "command": [
+          "/Users/alexanderstreltsov/work/octofhir/otter/target/release/otter",
+          "--jitless",
+          "run",
+          "crates/otter-difftest/corpus/array_brand_to_string.js"
+        ],
+        "stress": 1,
+        "exit_code": 0,
+        "elapsed_seconds": 1.5154997499193996,
+        "stdout_sha256": "0b6e0e44841d607c5a7401955a46502a34f8578779f9bb8f7526cb35599d04c1",
+        "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "matches_node": true
+      }
+    ],
+    "binary_unchanged": true,
+    "status": "passed"
+  },
+  "gc_stress": {
+    "cli_sha256": "f5efe0120122a19c425defddf6a3a221d3970065b77e12dc48566d9a90962140",
+    "expected_binary_sha256": "f5efe0120122a19c425defddf6a3a221d3970065b77e12dc48566d9a90962140",
+    "runs": [
+      {
+        "name": "gc-final-richards-normal",
+        "command": [
+          "/Users/alexanderstreltsov/work/octofhir/otter/target/release/otter",
+          "run",
+          "benchmarks/fixtures/fixed-work/richards.js"
+        ],
+        "stress": null,
+        "exit_code": 0,
+        "elapsed_seconds": 2.0646216250024736,
+        "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      {
+        "name": "gc-final-richards-256",
+        "command": [
+          "/Users/alexanderstreltsov/work/octofhir/otter/target/release/otter",
+          "run",
+          "benchmarks/fixtures/fixed-work/richards.js"
+        ],
+        "stress": 256,
+        "exit_code": 0,
+        "elapsed_seconds": 2.1045467499643564,
+        "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "matches_normal": true
+      },
+      {
+        "name": "gc-final-deltablue-normal",
+        "command": [
+          "/Users/alexanderstreltsov/work/octofhir/otter/target/release/otter",
+          "run",
+          "benchmarks/fixtures/fixed-work/deltablue.js"
+        ],
+        "stress": null,
+        "exit_code": 0,
+        "elapsed_seconds": 3.4261373329209164,
+        "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      {
+        "name": "gc-final-deltablue-256",
+        "command": [
+          "/Users/alexanderstreltsov/work/octofhir/otter/target/release/otter",
+          "run",
+          "benchmarks/fixtures/fixed-work/deltablue.js"
+        ],
+        "stress": 256,
+        "exit_code": 0,
+        "elapsed_seconds": 10.394627625006251,
+        "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "matches_normal": true
+      },
+      {
+        "name": "gc-final-crypto-normal",
+        "command": [
+          "/Users/alexanderstreltsov/work/octofhir/otter/target/release/otter",
+          "run",
+          "benchmarks/fixtures/fixed-work/crypto.js"
+        ],
+        "stress": null,
+        "exit_code": 0,
+        "elapsed_seconds": 0.41757462499663234,
+        "stdout_sha256": "9f98c7df675c3271e22de845dee97e4be3c15c21947ef644adf39c05853b8756",
+        "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      {
+        "name": "gc-final-crypto-256",
+        "command": [
+          "/Users/alexanderstreltsov/work/octofhir/otter/target/release/otter",
+          "run",
+          "benchmarks/fixtures/fixed-work/crypto.js"
+        ],
+        "stress": 256,
+        "exit_code": 0,
+        "elapsed_seconds": 0.4354937910102308,
+        "stdout_sha256": "9f98c7df675c3271e22de845dee97e4be3c15c21947ef644adf39c05853b8756",
+        "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "matches_normal": true
+      },
+      {
+        "name": "gc-final-raytrace-normal",
+        "command": [
+          "/Users/alexanderstreltsov/work/octofhir/otter/target/release/otter",
+          "run",
+          "benchmarks/fixtures/fixed-work/raytrace.js"
+        ],
+        "stress": null,
+        "exit_code": 0,
+        "elapsed_seconds": 3.5458438330097124,
+        "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      {
+        "name": "gc-final-raytrace-256",
+        "command": [
+          "/Users/alexanderstreltsov/work/octofhir/otter/target/release/otter",
+          "run",
+          "benchmarks/fixtures/fixed-work/raytrace.js"
+        ],
+        "stress": 256,
+        "exit_code": 0,
+        "elapsed_seconds": 26.963960667024367,
+        "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "matches_normal": true
+      },
+      {
+        "name": "gc-final-earley-boyer-normal",
+        "command": [
+          "/Users/alexanderstreltsov/work/octofhir/otter/target/release/otter",
+          "run",
+          "benchmarks/fixtures/fixed-work/earley-boyer.js"
+        ],
+        "stress": null,
+        "exit_code": 0,
+        "elapsed_seconds": 3.2956534170079976,
+        "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      {
+        "name": "gc-final-earley-boyer-256",
+        "command": [
+          "/Users/alexanderstreltsov/work/octofhir/otter/target/release/otter",
+          "run",
+          "benchmarks/fixtures/fixed-work/earley-boyer.js"
+        ],
+        "stress": 256,
+        "exit_code": 0,
+        "elapsed_seconds": 61.48927837505471,
+        "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "matches_normal": true
+      },
+      {
+        "name": "gc-final-regexp-normal",
+        "command": [
+          "/Users/alexanderstreltsov/work/octofhir/otter/target/release/otter",
+          "run",
+          "benchmarks/fixtures/fixed-work/regexp.js"
+        ],
+        "stress": null,
+        "exit_code": 0,
+        "elapsed_seconds": 10.145539207966067,
+        "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      {
+        "name": "gc-final-regexp-256",
+        "command": [
+          "/Users/alexanderstreltsov/work/octofhir/otter/target/release/otter",
+          "run",
+          "benchmarks/fixtures/fixed-work/regexp.js"
+        ],
+        "stress": 256,
+        "exit_code": 0,
+        "elapsed_seconds": 15.502523416071199,
+        "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "matches_normal": true
+      },
+      {
+        "name": "gc-final-splay-normal",
+        "command": [
+          "/Users/alexanderstreltsov/work/octofhir/otter/target/release/otter",
+          "run",
+          "benchmarks/fixtures/fixed-work/splay.js"
+        ],
+        "stress": null,
+        "exit_code": 0,
+        "elapsed_seconds": 2.849054415943101,
+        "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      {
+        "name": "gc-final-splay-256",
+        "command": [
+          "/Users/alexanderstreltsov/work/octofhir/otter/target/release/otter",
+          "run",
+          "benchmarks/fixtures/fixed-work/splay.js"
+        ],
+        "stress": 256,
+        "exit_code": 0,
+        "elapsed_seconds": 17.699925291002728,
+        "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "matches_normal": true
+      },
+      {
+        "name": "gc-final-navier-stokes-normal",
+        "command": [
+          "/Users/alexanderstreltsov/work/octofhir/otter/target/release/otter",
+          "run",
+          "benchmarks/fixtures/fixed-work/navier-stokes.js"
+        ],
+        "stress": null,
+        "exit_code": 0,
+        "elapsed_seconds": 3.0293764589587227,
+        "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      {
+        "name": "gc-final-navier-stokes-256",
+        "command": [
+          "/Users/alexanderstreltsov/work/octofhir/otter/target/release/otter",
+          "run",
+          "benchmarks/fixtures/fixed-work/navier-stokes.js"
+        ],
+        "stress": 256,
+        "exit_code": 0,
+        "elapsed_seconds": 1.1909330830676481,
+        "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "matches_normal": true
+      },
+      {
+        "name": "gc-final-box2d-normal",
+        "command": [
+          "/Users/alexanderstreltsov/work/octofhir/otter/target/release/otter",
+          "run",
+          "benchmarks/fixtures/fixed-work/box2d.js"
+        ],
+        "stress": null,
+        "exit_code": 0,
+        "elapsed_seconds": 1.179292333079502,
+        "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      {
+        "name": "gc-final-box2d-256",
+        "command": [
+          "/Users/alexanderstreltsov/work/octofhir/otter/target/release/otter",
+          "run",
+          "benchmarks/fixtures/fixed-work/box2d.js"
+        ],
+        "stress": 256,
+        "exit_code": 0,
+        "elapsed_seconds": 2.3128560000332072,
+        "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "matches_normal": true
+      },
+      {
+        "name": "gc-final-gbemu-normal",
+        "command": [
+          "/Users/alexanderstreltsov/work/octofhir/otter/target/release/otter",
+          "run",
+          "benchmarks/fixtures/fixed-work/gbemu.js"
+        ],
+        "stress": null,
+        "exit_code": 0,
+        "elapsed_seconds": 2.262027082964778,
+        "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      {
+        "name": "gc-final-gbemu-256",
+        "command": [
+          "/Users/alexanderstreltsov/work/octofhir/otter/target/release/otter",
+          "run",
+          "benchmarks/fixtures/fixed-work/gbemu.js"
+        ],
+        "stress": 256,
+        "exit_code": 0,
+        "elapsed_seconds": 2.322427041013725,
+        "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "matches_normal": true
+      },
+      {
+        "name": "gc-final-mandreel-normal",
+        "command": [
+          "/Users/alexanderstreltsov/work/octofhir/otter/target/release/otter",
+          "run",
+          "benchmarks/fixtures/fixed-work/mandreel.js"
+        ],
+        "stress": null,
+        "exit_code": 0,
+        "elapsed_seconds": 1.896497166948393,
+        "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      {
+        "name": "gc-final-mandreel-256",
+        "command": [
+          "/Users/alexanderstreltsov/work/octofhir/otter/target/release/otter",
+          "run",
+          "benchmarks/fixtures/fixed-work/mandreel.js"
+        ],
+        "stress": 256,
+        "exit_code": 0,
+        "elapsed_seconds": 1.8798222090117633,
+        "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "matches_normal": true
+      },
+      {
+        "name": "gc-final-zlib-normal",
+        "command": [
+          "/Users/alexanderstreltsov/work/octofhir/otter/target/release/otter",
+          "run",
+          "benchmarks/fixtures/fixed-work/zlib.js"
+        ],
+        "stress": null,
+        "exit_code": 0,
+        "elapsed_seconds": 2.5787614580476657,
+        "stdout_sha256": "6ce676148eb0ea63eb473ac8dcf56ecf0e4597a8d4d3c360aab3f6da1fed2354",
+        "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      {
+        "name": "gc-final-zlib-256",
+        "command": [
+          "/Users/alexanderstreltsov/work/octofhir/otter/target/release/otter",
+          "run",
+          "benchmarks/fixtures/fixed-work/zlib.js"
+        ],
+        "stress": 256,
+        "exit_code": 0,
+        "elapsed_seconds": 2.473711874918081,
+        "stdout_sha256": "6ce676148eb0ea63eb473ac8dcf56ecf0e4597a8d4d3c360aab3f6da1fed2354",
+        "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "matches_normal": true
+      },
+      {
+        "name": "gc-final-ts-normal",
+        "command": [
+          "/Users/alexanderstreltsov/work/octofhir/otter/target/release/otter",
+          "run",
+          "benchmarks/fixtures/fixed-work/ts.js"
+        ],
+        "stress": null,
+        "exit_code": 0,
+        "elapsed_seconds": 6.365010415902361,
+        "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      {
+        "name": "gc-final-ts-256",
+        "command": [
+          "/Users/alexanderstreltsov/work/octofhir/otter/target/release/otter",
+          "run",
+          "benchmarks/fixtures/fixed-work/ts.js"
+        ],
+        "stress": 256,
+        "exit_code": 0,
+        "elapsed_seconds": 45.37810083304066,
+        "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "matches_normal": true
+      }
+    ],
+    "binary_unchanged": true,
+    "status": "passed"
+  },
+  "performance": {
+    "measurements": {
+      "richards": {
+        "otter": 28516738340,
+        "node": 11559753905,
+        "ratio": 2.4668983937162805,
+        "delta_percent": 0.0705829349693543
+      },
+      "deltablue": {
+        "otter": 38693536617,
+        "node": 5590907366,
+        "ratio": 6.920797302474927,
+        "delta_percent": -3.0282824147774168
+      },
+      "crypto": {
+        "otter": 4669431285,
+        "node": 2918126968,
+        "ratio": 1.6001467160972414,
+        "delta_percent": -0.26052419898143775
+      },
+      "raytrace": {
+        "otter": 34646837461,
+        "node": 8371358844,
+        "ratio": 4.138735193012591,
+        "delta_percent": -0.03925198603523805
+      },
+      "earley-boyer": {
+        "otter": 29687727933,
+        "node": 18688380783,
+        "ratio": 1.5885660870098293,
+        "delta_percent": 0.05376489284831809
+      },
+      "regexp": {
+        "otter": 51086763242,
+        "node": 7302024402,
+        "ratio": 6.996246578963432,
+        "delta_percent": 0.009217614734002844
+      },
+      "splay": {
+        "otter": 12215981301,
+        "node": 4396614120,
+        "ratio": 2.7784974909283147,
+        "delta_percent": 0.042920222836762
+      },
+      "navier-stokes": {
+        "otter": 8889045597,
+        "node": 8095275899,
+        "ratio": 1.098053445973108,
+        "delta_percent": 0.005371438816492713
+      },
+      "box2d": {
+        "otter": 13678336900,
+        "node": 5062573423,
+        "ratio": 2.7018545228119253,
+        "delta_percent": 0.9220713686664217
+      },
+      "gbemu": {
+        "otter": 26277633096,
+        "node": 8221150072,
+        "ratio": 3.196345142207982,
+        "delta_percent": -0.1893860258294855
+      },
+      "mandreel": {
+        "otter": 19041246285,
+        "node": 13823039865,
+        "ratio": 1.377500641751929,
+        "delta_percent": -0.8181547160020064
+      },
+      "zlib": {
+        "otter": 24357335472,
+        "node": 24749906421,
+        "ratio": 0.9841384875432536,
+        "delta_percent": -0.612385593659226
+      },
+      "ts": {
+        "otter": 37357651462,
+        "node": 20854641072,
+        "ratio": 1.7913351437228706,
+        "delta_percent": -0.6928833737770645
+      }
+    },
+    "identity": {
+      "command": [
+        "bash",
+        "scripts/dev/fw_vs_node.sh",
+        "target/release/otter",
+        "richards",
+        "deltablue",
+        "crypto",
+        "raytrace",
+        "earley-boyer",
+        "regexp",
+        "splay",
+        "navier-stokes",
+        "box2d",
+        "gbemu",
+        "mandreel",
+        "zlib",
+        "ts"
+      ],
+      "cli_sha256": "f5efe0120122a19c425defddf6a3a221d3970065b77e12dc48566d9a90962140",
+      "captured_at": "2026-10-11T13:22:27.454458+00:00",
+      "fixtures": {
+        "richards": "00cc9bfb210436af51dd94dfa25d754017dbd5700888cb69af6f89c25a2ac1de",
+        "deltablue": "0ea9fcf227e65b5aaee406ecbba7f86d7775d8c25ce14221483361b0931b9627",
+        "crypto": "01757736b2baa369b03c27a912e17e76209ed915f6c625ff0ab31090146d88c8",
+        "raytrace": "f7e0c11bcf431f124a40f543522792a94e93d60f7f09bee008457afab1cea5c9",
+        "earley-boyer": "401dfa05435e2ea7be4716ead24e93627485b363592ec92f860cc6248153b5e3",
+        "regexp": "ea6a9c7680ffd560e9dcc3008cde7f6435729dab426c1397a4da0bfb07f6d0f1",
+        "splay": "32f14b6a59842e1717c6e93f1e8b17e1f3967953dc0311a4f9b471500bd963e8",
+        "navier-stokes": "cc079f5aff2d665b7b2da6cd58c86b5f4b14181581053f024c748d0279da25cb",
+        "box2d": "5fe03ec493d188fa2ef6749cf70de906abd37ff14292755b59e820c2530ebd84",
+        "gbemu": "f48b2b2b56d80a73f49691909629f522a27703606b9b3e8cf4f5d0df933906f5",
+        "mandreel": "85bbfb1676b651e83b48f3ae5d63c4e9d869e6386ecbe3447243036e1af31fa7",
+        "zlib": "a7061b7ee56180d0a7fe9ea630e60cda43ed0e366113b12678e86257e5435130",
+        "ts": "09a383b31c016cf303bfd0ec220c75efb35f8183a97cf1540ed0eda5913e2203"
+      },
+      "node_counts_sha256": "4d7d237dd8b08b10bf80fb53d9bbfe55430348ae3450d69490d40b9609672ce3",
+      "binary_unchanged": true,
+      "status": "passed",
+      "before_geomean": 2.392569906614916,
+      "after_geomean": 2.3841258185276977,
+      "geomean_delta_percent": -0.3529296286755246,
+      "regressions": {
+        "richards": 0.0705829349693543,
+        "earley-boyer": 0.05376489284831809,
+        "regexp": 0.009217614734002844,
+        "splay": 0.042920222836762,
+        "navier-stokes": 0.005371438816492713,
+        "box2d": 0.9220713686664217
+      }
+    },
+    "baseline": "benchmarks/results/object-protocol-operation/performance.json",
+    "regressions_percent": {
+      "richards": 0.0705829349693543,
+      "earley-boyer": 0.05376489284831809,
+      "regexp": 0.009217614734002844,
+      "splay": 0.042920222836762,
+      "navier-stokes": 0.005371438816492713,
+      "box2d": 0.9220713686664217
+    }
+  },
+  "profile": {
+    "capture_identities": [
+      {
+        "phase": "pure",
+        "label": "after-runtime-profile",
+        "binary": "/Users/alexanderstreltsov/work/octofhir/otter/target/release/otter",
+        "binaryShaBefore": "f5efe0120122a19c425defddf6a3a221d3970065b77e12dc48566d9a90962140",
+        "fixture": "/Users/alexanderstreltsov/work/octofhir/otter/benchmarks/fixtures/fixed-work/deltablue.js",
+        "fixtureSha": "0ea9fcf227e65b5aaee406ecbba7f86d7775d8c25ce14221483361b0931b9627",
+        "command": [
+          "/opt/homebrew/opt/python@3.14/bin/python3.14",
+          "-c",
+          "import runpy,subprocess,sys\ntry:\n script=sys.argv.pop(1)\n runpy.run_path(script,run_name=\"__main__\")\nexcept subprocess.CalledProcessError as error:\n print(\"RECORDER STDOUT:\",error.stdout,file=sys.stderr)\n print(\"RECORDER STDERR:\",error.stderr,file=sys.stderr)\n raise\n",
+          "/Users/alexanderstreltsov/work/octofhir/otter/scripts/dev/launchprof.py",
+          "/Users/alexanderstreltsov/work/octofhir/otter/benchmarks/results/intrinsic-call-proofs/after-runtime-profile",
+          "3",
+          "--",
+          "/Users/alexanderstreltsov/work/octofhir/otter/target/release/otter",
+          "--perf-basic-prof",
+          "run",
+          "/Users/alexanderstreltsov/work/octofhir/otter/benchmarks/fixtures/fixed-work/deltablue.js"
+        ],
+        "profileOptions": {
+          "TOP": "100000",
+          "OFFSETS": "1",
+          "BOUNDARY": "5",
+          "BOUNDARY_CALLER": "1"
+        },
+        "startedUtc": "2026-10-11T13:09:47.049935+00:00",
+        "runs": 3,
+        "status": "complete",
+        "returnCode": 0,
+        "elapsedSeconds": 39.97544329194352,
+        "binaryShaAfter": "f5efe0120122a19c425defddf6a3a221d3970065b77e12dc48566d9a90962140",
+        "finishedUtc": "2026-10-11T13:10:27.064508+00:00",
+        "binaryUnchanged": true
+      },
+      {
+        "phase": "artifact",
+        "label": "after-profile",
+        "binary": "/Users/alexanderstreltsov/work/octofhir/otter/target/release/otter",
+        "binaryShaBefore": "f5efe0120122a19c425defddf6a3a221d3970065b77e12dc48566d9a90962140",
+        "fixture": "/Users/alexanderstreltsov/work/octofhir/otter/benchmarks/fixtures/fixed-work/deltablue.js",
+        "fixtureSha": "0ea9fcf227e65b5aaee406ecbba7f86d7775d8c25ce14221483361b0931b9627",
+        "command": [
+          "/opt/homebrew/opt/python@3.14/bin/python3.14",
+          "-c",
+          "import runpy,subprocess,sys\ntry:\n script=sys.argv.pop(1)\n runpy.run_path(script,run_name=\"__main__\")\nexcept subprocess.CalledProcessError as error:\n print(\"RECORDER STDOUT:\",error.stdout,file=sys.stderr)\n print(\"RECORDER STDERR:\",error.stderr,file=sys.stderr)\n raise\n",
+          "/Users/alexanderstreltsov/work/octofhir/otter/scripts/dev/launchprof.py",
+          "/Users/alexanderstreltsov/work/octofhir/otter/benchmarks/results/intrinsic-call-proofs/after-profile",
+          "1",
+          "--",
+          "/Users/alexanderstreltsov/work/octofhir/otter/target/release/otter",
+          "--perf-basic-prof",
+          "--jit-events=/Users/alexanderstreltsov/work/octofhir/otter/benchmarks/results/intrinsic-call-proofs/after-events.json",
+          "--jit-artifacts=/Users/alexanderstreltsov/work/octofhir/otter/benchmarks/results/intrinsic-call-proofs/after-artifacts",
+          "run",
+          "/Users/alexanderstreltsov/work/octofhir/otter/benchmarks/fixtures/fixed-work/deltablue.js"
+        ],
+        "profileOptions": {
+          "TOP": "100000",
+          "OFFSETS": "1",
+          "BOUNDARY": "5",
+          "BOUNDARY_CALLER": "1"
+        },
+        "startedUtc": "2026-10-11T13:11:14.139144+00:00",
+        "runs": 1,
+        "status": "complete",
+        "returnCode": 0,
+        "elapsedSeconds": 11.45117991603911,
+        "binaryShaAfter": "f5efe0120122a19c425defddf6a3a221d3970065b77e12dc48566d9a90962140",
+        "finishedUtc": "2026-10-11T13:11:25.631016+00:00",
+        "binaryUnchanged": true
+      }
+    ],
+    "comparison_sha256": "24e44a62fbd2294ec8ee042833e94ef70e0cfb55547d05350dd4308ceb6ad1ad",
+    "comparison": "benchmarks/results/intrinsic-call-proofs/after-comparison.json",
+    "before": {
+      "listedSelfSamples": 2449,
+      "generatedSelfSamples": 1642,
+      "nativeSelfSamples": 807,
+      "completeSelfListing": true,
+      "spanTotals": [
+        {
+          "kind": "body",
+          "samples": 1375,
+          "percent": 83.739
+        },
+        {
+          "kind": "call-entry",
+          "samples": 202,
+          "percent": 12.302
+        },
+        {
+          "kind": "return",
+          "samples": 38,
+          "percent": 2.314
+        },
+        {
+          "kind": "cold",
+          "samples": 14,
+          "percent": 0.853
+        },
+        {
+          "kind": "construct-return",
+          "samples": 10,
+          "percent": 0.609
+        },
+        {
+          "kind": "entry-cold:construct",
+          "samples": 3,
+          "percent": 0.183
+        }
+      ],
+      "callEntryCauseSamples": [
+        {
+          "kind": "receiver-checks",
+          "samples": 40,
+          "percent": 2.436
+        },
+        {
+          "kind": "stack-check",
+          "samples": 30,
+          "percent": 1.827
+        },
+        {
+          "kind": "root-record",
+          "samples": 29,
+          "percent": 1.766
+        },
+        {
+          "kind": "frame-save",
+          "samples": 24,
+          "percent": 1.462
+        },
+        {
+          "kind": "publication",
+          "samples": 21,
+          "percent": 1.279
+        },
+        {
+          "kind": "continuation",
+          "samples": 20,
+          "percent": 1.218
+        },
+        {
+          "kind": "deferred-marker",
+          "samples": 16,
+          "percent": 0.974
+        },
+        {
+          "kind": "call-input",
+          "samples": 9,
+          "percent": 0.548
+        },
+        {
+          "kind": "source-owner",
+          "samples": 6,
+          "percent": 0.365
+        },
+        {
+          "kind": "window",
+          "samples": 6,
+          "percent": 0.365
+        },
+        {
+          "kind": "construct-check",
+          "samples": 1,
+          "percent": 0.061
+        }
+      ],
+      "deferredPublicationSubset": [],
+      "missingCodeObjects": []
+    },
+    "after": {
+      "listedSelfSamples": 2242,
+      "generatedSelfSamples": 1511,
+      "nativeSelfSamples": 731,
+      "completeSelfListing": true,
+      "spanTotals": [
+        {
+          "kind": "body",
+          "samples": 1278,
+          "percent": 84.58
+        },
+        {
+          "kind": "call-entry",
+          "samples": 162,
+          "percent": 10.721
+        },
+        {
+          "kind": "return",
+          "samples": 46,
+          "percent": 3.044
+        },
+        {
+          "kind": "cold",
+          "samples": 22,
+          "percent": 1.456
+        },
+        {
+          "kind": "construct-return",
+          "samples": 2,
+          "percent": 0.132
+        },
+        {
+          "kind": "entry-cold:construct",
+          "samples": 1,
+          "percent": 0.066
+        }
+      ],
+      "callEntryCauseSamples": [
+        {
+          "kind": "stack-check",
+          "samples": 35,
+          "percent": 2.316
+        },
+        {
+          "kind": "receiver-checks",
+          "samples": 32,
+          "percent": 2.118
+        },
+        {
+          "kind": "publication",
+          "samples": 20,
+          "percent": 1.324
+        },
+        {
+          "kind": "continuation",
+          "samples": 17,
+          "percent": 1.125
+        },
+        {
+          "kind": "deferred-marker",
+          "samples": 14,
+          "percent": 0.927
+        },
+        {
+          "kind": "root-record",
+          "samples": 14,
+          "percent": 0.927
+        },
+        {
+          "kind": "window",
+          "samples": 10,
+          "percent": 0.662
+        },
+        {
+          "kind": "frame-save",
+          "samples": 9,
+          "percent": 0.596
+        },
+        {
+          "kind": "call-input",
+          "samples": 6,
+          "percent": 0.397
+        },
+        {
+          "kind": "underarity-check",
+          "samples": 2,
+          "percent": 0.132
+        },
+        {
+          "kind": "construct-check",
+          "samples": 2,
+          "percent": 0.132
+        },
+        {
+          "kind": "source-owner",
+          "samples": 1,
+          "percent": 0.066
+        }
+      ],
+      "deferredPublicationSubset": [],
+      "missingCodeObjects": []
+    }
+  },
+  "source_freeze_sha256": "6d01ab0d5b43c6b998fe49ef03ce03344f7e3ecd5705ef4951008a8d0f377ead",
+  "source_file_count": 148,
+  "source_fingerprints": {
+    "crates/otter-bytecode/src/binary.rs": "1ce8010850a5ead4e5528104c595cc665235777c421bec583f3c2e04bb87ba8f",
+    "crates/otter-bytecode/src/disasm.rs": "1e5cc62ebb74bde9efed21d3b9d6f9df216e609f3c20a2ea4fc011133877f376",
+    "crates/otter-bytecode/src/encoding.rs": "98f3f0f003b1dd42c39244282227fb949496afa5a04b1d146cae64729161beaf",
+    "crates/otter-bytecode/src/lib.rs": "61b2c1ded0f5d820c85ab2f47fdc03b2e7784bfa02902a35202b2d8a808d502c",
+    "crates/otter-bytecode/src/method_id.rs": "081051b61419030287c88b07247e79860b117e2a3af77020ee192e43573cb72e",
+    "crates/otter-bytecode/src/opcode_audit.rs": "2c3320b14bf90fb7fba1a547e08ce100473405b5b2dcfe9e666e4a7394ef3a58",
+    "crates/otter-bytecode/src/opcode_schema.rs": "c667d121362b1810bf7731c0c529720d222b8fcb9b2a0ab9a7b32e29c1244761",
+    "crates/otter-compiler/src/assignment.rs": "a853d24a24e9fc56dec62037d64e3f2bb660209433e3ab562b5389307e878735",
+    "crates/otter-compiler/src/assignment_reference.rs": "bf4c9526fdf9d9879cd3fb40eac7b2e3d51fec82a390720e7267f45079fdfb08",
+    "crates/otter-compiler/src/binding_emit.rs": "d276aff28f4f90e01656826da99087a687edce9cbc89af6c9b2040d95ec2b523",
+    "crates/otter-compiler/src/builtins_call.rs": null,
+    "crates/otter-compiler/src/builtins_table.rs": null,
+    "crates/otter-compiler/src/calls.rs": "92db801b7ee064bd5ec8f25892420e65a0713cc850b18c7daf4879a3cfb8ca7d",
+    "crates/otter-compiler/src/calls_tests.rs": "c3aa0a247fbd204d1a15d2bf708c5468cb900ca60460418b02b56ef6ddfb6a8d",
+    "crates/otter-compiler/src/capture.rs": "9d350d5f2dfe57239f35843ecdb540cdedcd3cb4da9668fc838455b4197136f1",
+    "crates/otter-compiler/src/class/constructor.rs": "9d386abb88e5867b12eb3430382ba54e7c47e265ffb53d6559a368e86b632a6f",
+    "crates/otter-compiler/src/compiler.rs": "9668468a457e8a55b1c7795d8f5a8af88ca83f451e92d7d572e8b40ae16ce3ec",
+    "crates/otter-compiler/src/destructuring.rs": "ca3ae2610b97f0b9e6798226a4b72df702076acb78e0fd981e36787beba0c4de",
+    "crates/otter-compiler/src/expr/async_ops.rs": "9a5b8f06abaefce0059629606c366daaa42944784f0084e69f2b7f29b9f6c61f",
+    "crates/otter-compiler/src/expr/construct.rs": "b04b3609e570b2fd9539762af6cd877b695cb5099bb60c57910d50d4e5240ff5",
+    "crates/otter-compiler/src/expr/identifier.rs": "8058dffe97430d2d2b515c5d3df515bc40bc937933a246493a514eb1b29fa726",
+    "crates/otter-compiler/src/expr/member.rs": "e9d419dad98c9442494e51b8094672cdf9f7d4c7a54d04dd852e78c0564343b8",
+    "crates/otter-compiler/src/expr/unary.rs": "625265f448fbe767d808f1dd1e4f7fec413e065dab2dad781c51281e98a14ff0",
+    "crates/otter-compiler/src/hoist.rs": "0fb79e29ab4bf9a90f39541bd65e70499381dac059952c8d425cca078427df6e",
+    "crates/otter-compiler/src/lib.rs": "43a27f7d5272266924d7d417e4644c75b91b76a5d870bfe852fcbe457dc7a6e8",
+    "crates/otter-compiler/src/params.rs": "eaebdf4e0db3f72efd1e191be3adb40aca753606873227c05b6b77d6cca1346f",
+    "crates/otter-compiler/src/scope.rs": "7259e996da3cede73a238158eb654095323f7492380c5e4407de37212353636c",
+    "crates/otter-compiler/src/statements.rs": "b821a5abb392cc4bac4b9d3260619841d9191e8770096a5761fbcf7947ed42f6",
+    "crates/otter-compiler/src/switch_bindings.rs": "c39c4e31943e32fbf138548a10c1411773c074db91bd3a4f576876abffeefa7f",
+    "crates/otter-compiler/src/with_statement.rs": "253b74712bb1f17116fd1a887ddadba1b463e1c8aff5a9f1fd8152a3f1100855",
+    "crates/otter-difftest/corpus/array_brand_to_string.js": "e0d1e14bb49a7f1c3157bc4317558266b5737089e27625c87f00f6bc37a14c70",
+    "crates/otter-difftest/corpus/intrinsic_call_proofs.js": "e016f58a76025fae990c7ded2e47a50304136cb3b1472d34bdc9b404edfaf40e",
+    "crates/otter-difftest/corpus/method_argument_order.js": "f46e4031fd2ffc55d79b0eeb2e6b62c6d794520d08faddd2ee9a90b905cb8efc",
+    "crates/otter-difftest/corpus/restored_inline_completion.js": "e4ab03d227378ddce49bac959d54587b253b15f2b822b4a2b8a661e12f2abcb4",
+    "crates/otter-difftest/corpus/switch_tdz_method_order.js": "09d65cbca0a57347920cce182f56f4a14bd7f04db866fd97bf03ce4a0189ef11",
+    "crates/otter-jit/src/artifact/relocation.rs": "209a2b08d1411aefe95fa0d88c75ab3bceb88889607700375e814cc62948c5da",
+    "crates/otter-jit/src/call_linkage.rs": "8932a5d39031bb8749d30159cddd8861735b923e32a3360c20cc030370bd0352",
+    "crates/otter-jit/src/entry.rs": "710a4d3222827ddd8c9c9bd6ecd87e2eadc47ebe450af2f0874ae69697bcefa6",
+    "crates/otter-jit/src/entry/lowering.rs": "fc7934c77278591cc6888410e689ad853a1f4eb2788334b6aebc09d1055a50ae",
+    "crates/otter-jit/src/entry/runtime_ops.rs": "b769452381e039370b68504456d08eb87c7cca1c3e7c61039604bc1b0878ff69",
+    "crates/otter-jit/src/entry/runtime_ops/reentry.rs": "575d9533edfd53d1eb72d4149743b777de098737c2a59602810a6ad85b593708",
+    "crates/otter-jit/src/graph/arm64/allocation/lexical.rs": "50be93d7d57c05a2d3fdd414ce1c3a20214b33cbb70229959a801b7f1e4865cd",
+    "crates/otter-jit/src/graph/arm64/allocation/receiver.rs": "8a6e51ec4ebd83bbd1274628aa8a24e3bdeac61ccc5cfb28ead40ebe734baf37",
+    "crates/otter-jit/src/graph/builder.rs": "bd6db768e019dabe18fd10a94477f586ae9874569f0358b3a69e1572e6eb3fb8",
+    "crates/otter-jit/src/graph/builder_intrinsic_call_tests.rs": "396e077b5275bf3af07fe2e4496f4f5efee644207bdb8b015cf99ed2e4f00df8",
+    "crates/otter-jit/src/graph/builder_intrinsic_calls.rs": "37637626ff003e92362df4442bc965d997087753d673a978d53a34961bda44b9",
+    "crates/otter-jit/src/graph/frame.rs": "890ad6512ada76666747bb825df5b2b89ef2d9f0aee6cbbc08a6d230ab35f402",
+    "crates/otter-jit/src/graph/source_map_tests.rs": "e6e2d517ea1d36e834de975b19f34388eb17e00c30e2ea066878ed4efed5ca7e",
+    "crates/otter-jit/src/graph/x86_64/allocation/lexical.rs": "a768882b379f2efca23e45e8594bd8ae41ae2e2de69059937dc9f92c003eca39",
+    "crates/otter-jit/src/graph/x86_64/allocation/receiver.rs": "8376d30ba8bb35f321097e3ab7b6778a0f17a5e1a5974645fd55f67d6fbe8b02",
+    "crates/otter-jit/src/graph/x86_64/calls.rs": "8789e96977bdaa1029a028556fc0f7699302c98d87c47c0ae216fe599383e163",
+    "crates/otter-jit/src/intrinsic_calls.rs": "25c2309166c91aa805c89e20650ff6b146f611ccab9b68e45c9c99efc085f87c",
+    "crates/otter-jit/src/lib.rs": "17912d4553408f4394b5530acd8e45aef8995484fecba0cdb5c36923ab579744",
+    "crates/otter-jit/src/template.rs": "7b87ac013fd502f0c7bb15d3d7f4dd44328675477091be7e0626a76a808d00b5",
+    "crates/otter-jit/src/template/arm64.rs": "7ca07fc3bba03516997b60aa575b97ead3d6b9a7ac27527c4f3729555f7f2ffe",
+    "crates/otter-jit/src/template/arm64/calls.rs": "83f6d55035f01fba50b8336a5195a98a4ba2e8304426b063b9783db28cf35c4b",
+    "crates/otter-jit/src/template/arm64/intrinsic_calls.rs": "5e5e038f5b4492204ad63042eb72a27fb633c1cb47650eae1a6a98a9c6ea4870",
+    "crates/otter-jit/src/template/arm64/scalar.rs": "f875f565a533c44e251b006f432f20545e08dbc8f4cf9bfdd5d18021fe04a487",
+    "crates/otter-jit/src/template/arm64/transitions.rs": "72bdac3fcb24d8549e0e0b8887c13ce36eace92a2823d3bf621249988eeea7ec",
+    "crates/otter-jit/src/template/arm64/variadic.rs": null,
+    "crates/otter-jit/src/template/intrinsic_calls_tests.rs": "db1611952a08c5f3f25509077a25fe5fbfd838b3e38ffcd206cf7cd4b9b70c11",
+    "crates/otter-jit/src/template/operation.rs": "3731c540c7eb8f058288405f4723a57d969c1e5e1143dba23454939afa070bcb",
+    "crates/otter-jit/src/template/plan.rs": "288d29ebff89e1d60089cec64a06e0fa670c86230fce4f922cf599458cbdbd83",
+    "crates/otter-jit/src/template/x86_64.rs": "101d95f3c35959293d07a7f1b3a043ca2ff9ba7d0cbdd4b9de376bf2413b61f6",
+    "crates/otter-jit/src/template/x86_64/calls.rs": "5439a8063831451936ab7b0989182bd9edd1ddefab29342e9500be8af5ceef82",
+    "crates/otter-jit/src/template/x86_64/cold_exits.rs": "1b5e92c0a486c180b280a7ab32c968859ca3fc237e0a086a59f7cc8cb237e144",
+    "crates/otter-jit/src/template/x86_64/cold_exits/tests.rs": "c1d61e0075aed110f5549b032e4c6dd4e3008f48cab6e48c3d988c1b2192ef9c",
+    "crates/otter-jit/src/template/x86_64/intrinsic_calls.rs": "cdaa9c5a897a7aee9f7aeebb5e67e0d2e9ee9d71fb1dcaf90151c5da1bed8510",
+    "crates/otter-jit/src/template/x86_64/operation.rs": "6406e6eaead9f63097709aea6c3f46f9f6e78ca2660e772ed7ad0435059065d2",
+    "crates/otter-runtime/src/structured_clone.rs": "33fa702442e5ef3126f253a4bb6eaa601d87f5a9b690f1be3e1357afd79fac98",
+    "crates/otter-runtime/src/worker.rs": "c5d977b1cb7096fe0bcbadb74f71f2bbbc7802392e10882561dd124494f4421d",
+    "crates/otter-runtime/src/worker/array_brand_tests.rs": "a9d55cf702468f61aaf76840ac9ab18818bb6119086753d06bbe7d35a3bd3a6f",
+    "crates/otter-runtime/tests/jit_empty_allocations.rs": "523d05edb06db71023d9dbfab466bd2f318d5e5d71fc29b04543b1f94ab68a7a",
+    "crates/otter-runtime/tests/jit_empty_allocations/intrinsic.rs": "f8e1d90f01f8f70570dfb4583788b24f45b1f7ea968291879d9439c421d6204b",
+    "crates/otter-runtime/tests/jit_intrinsic_calls.rs": "86e951458c22c1243be64d423b5f9c4dd7fbdc834e29bf71ea1426e7ecf607c1",
+    "crates/otter-runtime/tests/jit_stack_owned_array_construct.rs": "d3b000bfa781a23dbe734851f8e5d3ca7d56e8a1b7e6fb90772d81b95d385fdc",
+    "crates/otter-runtime/tests/jit_stack_owned_array_construct/receiver.rs": "43e8d70c7129606c4e967259630f7cb0a94ee35107f1c626718ad9470d672c8e",
+    "crates/otter-runtime/tests/jit_variadic.rs": "c09321508faac906f29261de85fcf19d31fc17e91fa2743e85a0fcd0ca66be73",
+    "crates/otter-vm/src/abstract_ops.rs": "d680b787daa6b907c1ece117de1c82b6702995008a8d781de59a9a5a31a49f0c",
+    "crates/otter-vm/src/allocation_ops.rs": "54a425a4c09b293b830a9fa85df4d423aa1f07325115cb3c02abf7d0a37937ca",
+    "crates/otter-vm/src/array_ops.rs": "274847f1cd2b97fe4fd82cbf19fee99620ef590475349bd5e33f443d42aabede",
+    "crates/otter-vm/src/array_prototype.rs": "ba120eeaf3761d04f84bce4564dd8877575db7d2c542928f86249a4f42586004",
+    "crates/otter-vm/src/array_statics.rs": "fb82f0d9c3a7412a6ddb4fed8a9adb1d5a7882a70f97af6b5a115f847c18c285",
+    "crates/otter-vm/src/call_feedback.rs": "19fd3610686d747c0b38e40366b44677041aa69ea36b9bbd41f33f2130321341",
+    "crates/otter-vm/src/conversion.rs": "99940fa7b816ffc4cda22e0c9098be9240549440048b93ea23280a86f233d7c1",
+    "crates/otter-vm/src/conversion_protocol.rs": "5cf387f29a3f1d754a292ad7ca1488ee90808d37b141550d87ed6383aef6df69",
+    "crates/otter-vm/src/error_classes.rs": "d98a337402112c76b913732833f44fc3b3c420618e8fe968c8701e0d8b2e5909",
+    "crates/otter-vm/src/error_ops.rs": "d9bf6d312e043b04ea470c5ac50914ea65718fc4d7e53787a9d9bce13855041b",
+    "crates/otter-vm/src/eval_ops.rs": "6b601c7adef459d1e2bacd702123b9b24125534f8eacab3cca557b482b0513c3",
+    "crates/otter-vm/src/executable.rs": "f8cd8018dabe8a041e7d122ddf1829936256dea0a78d646a0bb886c3763cd674",
+    "crates/otter-vm/src/handles.rs": "3dbf1d19af141bc8e4a0158874abd0fea3b483e5b09c3998c9810ce4a166fd3e",
+    "crates/otter-vm/src/inspect.rs": "f3f4e15e57135e5710d5d90b2b74cae486dde33a70b4ffbbcf819b23a93b7b8a",
+    "crates/otter-vm/src/interp/call_dispatch.rs": "35f66ad82f8880887badcc358f4d2327b8ec013fd7e462b1f0194b2f5562b4b5",
+    "crates/otter-vm/src/interp/call_dispatch_tests.rs": "7e59316e8cba089c4bd7c569aa6630b707ae1e4a399c36276b2b2e0ce0a2e237",
+    "crates/otter-vm/src/interp/dispatch.rs": "7bbd27e10d3fa8953cc7d486a3ffe70d24f40fdd4412bce612022dbdb3ffdde9",
+    "crates/otter-vm/src/interp/host.rs": "2eaf65b14d1bca75b8490ff9bc596df8532777d0067b8c3c1e1cb6428adbdf13",
+    "crates/otter-vm/src/interp/init.rs": "ddcf097709c1c3c26d804f9688411855de89f6a83c9e6d1177bcdd1869a7d5e9",
+    "crates/otter-vm/src/interp/jit_call.rs": "e6640f0ae62865659e557153660c580efbe42a5a3e01d2329021b0541483df9f",
+    "crates/otter-vm/src/interp/jit_calls/generated.rs": "ce81e7899dd1e0dc0ac099794af9190cdfba2313dd20ad166f62620cb0dc1a84",
+    "crates/otter-vm/src/interp/jit_compile.rs": "0c5d5874399896dc153ffe7620753f3de27eb35e58bdbd18592b9b93bcf2cf03",
+    "crates/otter-vm/src/interp/protos.rs": "269c58a2a07a0b8aace40f4106bad5264839b0966934fbb7aaf18f373b59f5a2",
+    "crates/otter-vm/src/interp/shapes.rs": "db575816586ed351d4faa72bce34167a45ea94f7df54af68906660fec4319cd8",
+    "crates/otter-vm/src/interp/tests.rs": "6b79aa096069e233a197a40e3d7978d44b699109c0a1d08b836112556f91613e",
+    "crates/otter-vm/src/intrinsics/array.rs": "8e6385eec485457d1b9d80be48f9efac49d1eaecd91a5b1ad728d0e3a936fd14",
+    "crates/otter-vm/src/intrinsics/object.rs": "380bb543c7905102e0ee59d5d9577e42bc95333eb0c0087820d8ed50dcfd5142",
+    "crates/otter-vm/src/iteration_protocol.rs": "ed195e8c3a40cf69b0149a99a0aa96d50b8cd0fa92a52c526b3729a78a965fee",
+    "crates/otter-vm/src/jit.rs": "91ec92cccfb955b873528d67db748549ae85ed5845ae56fec3a426812fcc7946",
+    "crates/otter-vm/src/jit/intrinsic_calls.rs": "e3cc88462d7463983b9687f4467f0cfdfa1f1dccbe163a4b2ff7a0256f07ac4e",
+    "crates/otter-vm/src/jit_class_value_ops.rs": "cdff74759e16e37445f2744f0b4502b89ab3e8c8a9103b6f41d045eeef5a25b1",
+    "crates/otter-vm/src/jit_feedback.rs": "9551fca4e89ec855b6209567fc587eb704a80d60eafc366b39e6996d77f0d392",
+    "crates/otter-vm/src/jit_runtime_ops.rs": "8ab2bf736328c2c492da7458cee952f30261a618b3bfceada3ef5b40287d0a71",
+    "crates/otter-vm/src/jit_spread_call_ops.rs": "c85d7277b3a2924d22ac55527ad5f3ce9182364a4d9fc2d379bcbac716e66b23",
+    "crates/otter-vm/src/jit_variadic_ops.rs": null,
+    "crates/otter-vm/src/json/serialize.rs": "cc4bf268ccc119fda29292365fb0e36d2c91cc0269c66729e5eb3d72bebe9da5",
+    "crates/otter-vm/src/lib.rs": "860d08efa4d4bfaf6a7a016dccca035e3d5019fe2b7c3664ee9fd46e08d570ae",
+    "crates/otter-vm/src/math/mod.rs": "37a00f5a0e18699370eea8300962748c0f9d064b3e683bccc366c492ff8d0b9c",
+    "crates/otter-vm/src/method_ops/callable_get_tests.rs": "b86945ca5c8464eaf34c7b4d1c5462586c9d90456799a5945c15ed3225a43da7",
+    "crates/otter-vm/src/method_ops/jit_snapshot.rs": "1bd352149381bf2f1d15ed81fe387e4f191fc0b0555435a07336d8bb09516cf3",
+    "crates/otter-vm/src/method_ops/mod.rs": "5968851fea049be352cf2d734e057fcdae03e7784dce0a9cef0ffb8677b50c19",
+    "crates/otter-vm/src/microtask.rs": "89b4cfd85fcb62850f9bc72515a0ad7d041ef986ecacdea76db90c40c1b36c26",
+    "crates/otter-vm/src/native_abi/dispatch.rs": "5019e43ed79059a4b53c9a9fd2cee5def282589476c08328b45fa8dc92799d58",
+    "crates/otter-vm/src/native_abi/runtime_stubs.rs": "728a930cbf85456dc1ede01280f4c6f22211881a0bc8fbc66d96756183bd7728",
+    "crates/otter-vm/src/object.rs": "13bb8f1501b9a956b83effc780cb10866a1f4336d2dcebbf2ebba8046963f36c",
+    "crates/otter-vm/src/object/intrinsic_brand.rs": "db27e02f8c1e64924e9682ff07528b26f27005058454fd57768fd19f9dcf4867",
+    "crates/otter-vm/src/object_internal_ops.rs": "7a6201d88f4223aad62eedf256440c0bcfab2353bf5e1ab6118b56eed00b1bbf",
+    "crates/otter-vm/src/object_internal_ops/array_define.rs": "7f1eacf41537ed0b67136693373cfd5550cdc012bd37d864003890748edf06ad",
+    "crates/otter-vm/src/object_internal_ops/define.rs": "206596a43a320e1345f56ceb9ed88681bd0789db62457cae40199cb5b578f000",
+    "crates/otter-vm/src/object_internal_ops/descriptors.rs": "a9a0374c65515044e2bbccea43cccefcc62bbd14008b1b0d21833876702684bc",
+    "crates/otter-vm/src/object_internal_ops/set_delete.rs": "99c121581996251b36685bf6cda8635a0355f20aeac8399595a60986b072fcf0",
+    "crates/otter-vm/src/object_statics.rs": "ccf091e35633c656da7d43af62d362957d954b79df516171e7dbef8d1d526421",
+    "crates/otter-vm/src/promise_ops.rs": "4352f029126ce1ba30dc9d1d26035bbb5a35c9c892443db27939085d3669aa42",
+    "crates/otter-vm/src/property_cache.rs": "d0d5fa728d9f2bc5c1951eecbe07400cdcec8636d525ed50231c20a2fcf8cf4b",
+    "crates/otter-vm/src/property_dispatch.rs": "4a50d6cdafc8c2ae03ba2a08fbbd2c0c152f1f4b55c54075ac2d9a90780b2a14",
+    "crates/otter-vm/src/property_dispatch/drivers.rs": "d945b99db8f5fd184d12400a5bbad630985a35c209c37cf17852cd3ced9f1d9d",
+    "crates/otter-vm/src/property_dispatch/jit_runtime.rs": "3ffd96840534b24853e049da344bc886e3e8bbedb413a7605f43b8dae150a94f",
+    "crates/otter-vm/src/property_dispatch/properties.rs": "7a438ae169cbcfd800928261f3cb1229e560966da08d0f4024a0f19cc5a9bfb2",
+    "crates/otter-vm/src/realm_intrinsics.rs": "ab27539a55cfbf06f648b8e47749283caf39add075f4131389d3f769ed36dfde",
+    "crates/otter-vm/src/runtime_activation/committed_values.rs": "d0fa5f691cd54d5f5f0a527c2866ef411515002f77a6038bbdf21e70ff2473ed",
+    "crates/otter-vm/src/runtime_activation/mod.rs": "b6ef9f495a6f44cb7930c4d06dce327620e40cc188bdc00f7ee30a70ec40b355",
+    "crates/otter-vm/src/runtime_activation/new_error_tests.rs": "79afdf9858a57a96f48e142d1216f8614e45689e99ee6cba8d5234c02bb210d7",
+    "crates/otter-vm/src/runtime_activation/value_loads.rs": "efe114349e54d5f7c456f79d50f11dd17eb0af3c44ea382489ba3f07ee56232a",
+    "crates/otter-vm/src/runtime_activation/value_ops.rs": "5033e6e28dbb32b81d6589fe41cf37e256b6daf39d49a65ee7dd34f6bb658238",
+    "crates/otter-vm/src/runtime_cx.rs": "993278b2257e9cb71f585e838abda671597cac2e10fd88d3c6a3b79b1d07b8b5",
+    "crates/otter-vm/src/runtime_stubs.rs": "1823f4477847c32c2c112f022cac6b757088bea4074110a2e871c11a46ecacdc",
+    "crates/otter-vm/src/static_load_ops.rs": "2cc9561133369614f46112abf797a7e146f57a47320cf36f0c245b66582d8a09",
+    "crates/otter-vm/src/work_budget.rs": "94d1fcfbf616287f67bb079550f9cd921109bedb3007dbac6f82f2e2e19b3bb4",
+    "docs/site/src/content/docs/engine/jit-debugging.md": "23b3c9d18c4dbec57dd1e8fe9382fef90fa591552078be6aeb2e4b15791c96ff",
+    "docs/site/src/content/docs/engine/step-trace.md": "977a825f7cae2c104ff6fd017177ed10fc9c7a413fd5c3970737f11587476f14"
+  },
+  "binary_fingerprints": {
+    "target/release/otter": "f5efe0120122a19c425defddf6a3a221d3970065b77e12dc48566d9a90962140",
+    "target/release/otter-difftest": "ca552e3c7159789c77753277a7e0d1407960d044c474bea8e45bd135c0ed8b7b",
+    "target/release/otter-test262": "60e9db994e23a99358ea688235da5bb00346bf0ce818452137beba02437d3be8",
+    "target/x86_64-apple-darwin/release/otter": "4643fdadf111c9c041e6293f4de8f27c76db4eed7110d20b23104891800a10b8",
+    "target/x86_64-apple-darwin/release/otter-difftest": "76f449933803519813dabffcb0a7b001798c9eb37b095532fac4d1d641ee7d5f"
+  },
+  "source_provenance_limit": "Records without source_freeze_sha256 prove only their then-current unchanged marker and explicit parent-reviewed selection, not the final freeze identity. VM/JIT host/x86 unit records must carry the exact final production freeze digest; previous VM3/JIT4 are historical evidence only. No failed historical command was replaced automatically. Source-current identities are checked independently here.",
+  "fixture_repair": "Compiler fixtures retain exact loaded-callee/source/message/pc+1 CFG assertions; their passing compiler run is selected separately from the failed bundled run. The NewError publication fixture uses outer.for_function for the actual physical frame context while retaining the distinct inline source pool. Runtime receiver ownership is retained by the cold forwarding branch after observe(1); compiler-hoisted CollectArguments is absent, and the measured Call0<New<Call1 region remains Array-only. Repairs are cfg test setup, not production semantic substitutes."
+}

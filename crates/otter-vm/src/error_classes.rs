@@ -271,9 +271,7 @@ fn native_constructor_static_with_roots(
 /// Per-realm registry of canonical ECMAScript and WebAssembly error classes.
 ///
 /// Constructed once at interpreter startup and threaded through
-/// the dispatch loop so [`Op::NewBuiltinError`] /
-/// [`Op::LoadBuiltinError`] / [`Op::NewError`] all see the same
-/// prototype chain.
+/// intrinsic error creation so implicit failures use the same prototype chain.
 #[derive(Debug, Clone)]
 pub struct ErrorClassRegistry {
     error: ClassEntry,
@@ -1680,9 +1678,7 @@ impl ErrorClassRegistry {
         Ok(())
     }
 
-    /// Borrow the constructor `JsObject` for `kind`. Used to back
-    /// `Op::LoadBuiltinError` so `e instanceof TypeError` finds a
-    /// real constructor with a `prototype` own property.
+    /// Borrow the canonical constructor `JsObject` for `kind`.
     #[must_use]
     pub fn constructor(&self, kind: ErrorKind) -> JsObject {
         self.entry(kind).constructor

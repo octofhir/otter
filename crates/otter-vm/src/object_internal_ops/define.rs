@@ -10,6 +10,10 @@
 //!   reports success, so no partially applied descriptor is observable.
 //! - Proxy defines keep the proxy, target, key value, and both descriptors
 //!   rooted across trap argument construction, reentry, and invariant checks.
+//!
+//! # See also
+//! - `super::array_define` owns the shared Array length policy.
+//! - `super::set_delete` owns assignment and receiver definition.
 
 use super::*;
 use crate::activation_stack::ActivationStack;
@@ -325,6 +329,20 @@ impl Interpreter {
                     )
                 }
             };
+        }
+        if target
+            .as_object()
+            .is_some_and(|object| self.is_array_prototype_object(object))
+            && let Some(name) = key.string_name()
+        {
+            if name == "length" {
+                return self.define_array_length_value(stack, context, *target, descriptor);
+            }
+            if let Some(index) = object::array_index_property_name(name) {
+                return self
+                    .define_array_prototype_index(*target, name, index, descriptor)
+                    .map_err(CommittedValueError::JavaScript);
+            }
         }
         if let Some(mut obj) = target.as_object() {
             if object::deferred_namespace_target(obj, &self.gc_heap).is_some()
@@ -702,101 +720,7 @@ impl Interpreter {
                 return Ok(false);
             };
             if k == "length" {
-                // §10.4.2.4 ArraySetLength. Steps 3-5 coerce the candidate
-                // length BEFORE any property validation: `newLen` runs
-                // `ToUint32` (whose inner `ToNumber` is the first observable
-                // coercion) and `numberLen` runs `ToNumber` again (the
-                // second), so an object value's `valueOf` / `@@toPrimitive`
-                // fires exactly twice and a non-integer / negative / overflow
-                // length raises `RangeError` ahead of the configurable /
-                // enumerable / writable checks.
-                // Both coercions can run user code that moves the array: it
-                // rides an anchor and is re-read after them.
-                let array_slot = self.push_iteration_anchor(Value::array(arr)) - 1;
-                let new_len = if let Some(v) = descriptor.value {
-                    // Both coercions can run user code; the candidate value
-                    // rides an anchor slot so the second read is not stale.
-                    let v_slot = self.push_iteration_anchor(v) - 1;
-                    let outcome = (|this: &mut Self| {
-                        let v = this.iteration_anchor(v_slot);
-                        let number_for_uint =
-                            crate::coerce::to_number_or_throw(this, stack, context, &v)?;
-                        let new_len = crate::number::bitwise::to_uint32(number_for_uint);
-                        let v = this.iteration_anchor(v_slot);
-                        let number_len =
-                            crate::coerce::to_number_or_throw(this, stack, context, &v)?;
-                        if (new_len as f64) != number_len.as_f64() {
-                            return Err(CommittedValueError::JavaScript(
-                                this.err_range(("Invalid array length".to_string()).into()),
-                            ));
-                        }
-                        Ok(new_len as usize)
-                    })(self);
-                    self.pop_iteration_anchors_to(v_slot);
-                    match outcome {
-                        Ok(new_len) => Some(new_len),
-                        Err(error) => {
-                            self.pop_iteration_anchors_to(array_slot);
-                            return Err(error);
-                        }
-                    }
-                } else {
-                    None
-                };
-                let array_value = self.iteration_anchor(array_slot);
-                self.pop_iteration_anchors_to(array_slot);
-                let arr = array_value
-                    .as_array()
-                    .ok_or(VmError::TypeMismatch)
-                    .map_err(CommittedValueError::JavaScript)?;
-                // OrdinaryDefineOwnProperty validation against length's fixed
-                // shape — a non-configurable, non-enumerable data property.
-                if descriptor.is_accessor()
-                    || matches!(descriptor.configurable, Some(true))
-                    || matches!(descriptor.enumerable, Some(true))
-                {
-                    return Ok(false);
-                }
-                let old_len = array::len(arr, &self.gc_heap);
-                let length_writable = array::length_writable(arr, &self.gc_heap);
-                let want_writable_false = matches!(descriptor.writable, Some(false));
-                let want_writable_true = matches!(descriptor.writable, Some(true));
-                let Some(new_len) = new_len else {
-                    // No [[Value]]: only a writable transition is possible.
-                    if !length_writable {
-                        return Ok(!want_writable_true);
-                    }
-                    if want_writable_false {
-                        array::set_length_writable(arr, &mut self.gc_heap, false);
-                    }
-                    return Ok(true);
-                };
-                if new_len >= old_len {
-                    // §10.4.2.4 step 9 — grow / no-op. A non-writable length
-                    // forbids a value change or a writable→true promotion
-                    // (the property is non-configurable).
-                    if !length_writable {
-                        return Ok(new_len == old_len && !want_writable_true);
-                    }
-                    array::set_length_checked(arr, &mut self.gc_heap, new_len)
-                        .map_err(|_| VmError::TypeMismatch)
-                        .map_err(CommittedValueError::JavaScript)?;
-                    if want_writable_false {
-                        array::set_length_writable(arr, &mut self.gc_heap, false);
-                    }
-                    return Ok(true);
-                }
-                // §10.4.2.4 step 10 — shrink requires a writable length.
-                if !length_writable {
-                    return Ok(false);
-                }
-                let delete_ok = array::set_length_checked(arr, &mut self.gc_heap, new_len)
-                    .map_err(|_| VmError::TypeMismatch)
-                    .map_err(CommittedValueError::JavaScript)?;
-                if want_writable_false {
-                    array::set_length_writable(arr, &mut self.gc_heap, false);
-                }
-                return Ok(delete_ok);
+                return self.define_array_length_value(stack, context, *target, descriptor);
             }
             if let Some(idx) = object::array_index_property_name(k) {
                 return self

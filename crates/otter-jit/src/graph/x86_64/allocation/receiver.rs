@@ -9,6 +9,7 @@
 //! proof is not repeated after the refill: the collector changes no family,
 //! prototype or shape, and the fit reads only the plan and the context.
 //! The cell is completely initialized before the buffer bump publishes it.
+//! Refill and retry misses carry the receiver operation's exact exit reason.
 //!
 //! # See also
 //! - `crate::x86_64::allocation::receiver` owns the proof and fit encoders.
@@ -52,7 +53,7 @@ impl Codegen<'_> {
         )?;
         let miss = self.typed_exit(
             node,
-            abi::ExitReason::AllocationMiss,
+            crate::graph::frame::allocation_exit_reason(&self.graph.node(node).kind),
             abi::ExitAction::Resume,
         );
         crate::x86_64::allocation::emit_receiver_fit(&mut self.ops, view, plan, 15, miss);

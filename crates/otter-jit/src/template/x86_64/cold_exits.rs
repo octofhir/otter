@@ -29,7 +29,8 @@ pub(super) const RETURNED: u16 = 1 << 5;
 pub(super) const COMMITTED_THROW: u16 = 1 << 6;
 pub(super) const THREW: u16 = 1 << 7;
 pub(super) const FATAL: u16 = 1 << 8;
-pub(super) const ALL: u16 = (1 << 9) - 1;
+pub(super) const IDENTITY_GUARD: u16 = 1 << 9;
+pub(super) const ALL: u16 = (1 << 10) - 1;
 const POLL: u16 = BACKEDGE_RELINK | THREW | FATAL;
 
 /// Every external exit label referenced by this operation's actual encoder.

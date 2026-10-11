@@ -10,6 +10,7 @@
 //! - VM property-key conversion and own-property lookup helpers.
 //! - The value-level `[[Set]]` funnel shared by interpreter and JIT property
 //!   stores, including ordinary and exotic receiver phases.
+//! - Shared Array length policy for physical arrays and canonical prototypes.
 //! - String exotic property reads/descriptors.
 //! - Proxy invariant validation helpers.
 //! - Realm constructor prototype lookup.
@@ -50,6 +51,7 @@ use crate::{
     VmPropertyKey, abstract_ops, array, descriptor_value, function_metadata, object, string,
 };
 
+mod array_define;
 mod define;
 mod descriptors;
 mod for_in;
@@ -845,10 +847,7 @@ impl Interpreter {
     /// at `X.prototype`) when present, otherwise the realm's
     /// %Array.prototype%. `null` for `extends null` is preserved.
     fn array_get_prototype_value(&mut self, arr: crate::array::JsArray) -> Result<Value, VmError> {
-        match crate::array::prototype_override(arr, &self.gc_heap) {
-            Some(proto) => Ok(proto),
-            None => self.constructor_prototype_value("Array"),
-        }
+        Ok(self.array_prototype_value(arr))
     }
 
     pub(crate) fn get_own_property_descriptor_for_value(
@@ -893,8 +892,7 @@ impl Interpreter {
         }
         let primitive =
             self.to_primitive_sync(stack, context, value, abstract_ops::ToPrimitiveHint::String)?;
-        primitive_to_property_key(primitive, &self.gc_heap)
-            .map_err(CommittedValueError::JavaScript)
+        primitive_to_property_key(primitive, &self.gc_heap).map_err(CommittedValueError::JavaScript)
     }
 
     /// §7.1.1 `ToPrimitive(value, hint)` — synchronous variant. See

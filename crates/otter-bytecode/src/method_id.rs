@@ -86,8 +86,7 @@ method_id_enum! {
     /// The compiler emits no dedicated opcode for them — calls flow through
     /// ordinary method dispatch — but the VM-side implementations key off this
     /// enum to keep one switch per method instead of a string compare.
-    /// Namespace constants (`PI`, `E`, …) load through
-    /// [`Op::MathLoad`](crate::Op::MathLoad).
+    /// Namespace constants (`PI`, `E`, …) use ordinary property lookup.
     MathMethod {
         Abs = 0 => "abs",
         Acos = 1 => "acos",

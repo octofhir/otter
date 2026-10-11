@@ -1,7 +1,11 @@
 //! Identifier expression lowering.
 //!
 //! # Contents
-//! - [`compile_identifier`] — lowers ordinary identifier reads after inline fast paths.
+//! - [`compile_identifier`] — resolves identifier reads through their environments.
+//!
+//! # Invariants
+//! - Mutable global references use ordinary binding lookup; names never stand
+//!   in for a canonical callable or constructor identity.
 //!
 //! # See also
 //! - [`super`] — expression dispatch and shared helpers.
@@ -16,11 +20,16 @@ pub(crate) fn compile_identifier(
 ) -> Result<u16, CompileError> {
     let _ = span;
     let span = (id.span.start, id.span.end);
-    // Foundation pseudo-globals before falling back to
-    // local resolution. An enclosing `with` suppresses the constant
-    // fold — §9.1.1.2.1 lets `with ({NaN: 'x'})` shadow the global.
+    // Immutable global value properties may fold only after proving that no
+    // lexical, imported, eval-extension, or `with` binding intercepts the name.
+    let immutable_global = cx.active_with_envs.is_empty()
+        && matches!(
+            cx.resolve_ref(id.name.as_str()),
+            crate::compiler::NameRef::Global(None)
+        )
+        && find_module_import_binding(cx, id.name.as_str()).is_none();
     match id.name.as_str() {
-        _ if !cx.active_with_envs.is_empty() => {}
+        _ if !immutable_global => {}
         "NaN" => {
             let dst = cx.alloc_scratch();
             let const_idx = cx.intern_number_constant(f64::NAN);
@@ -116,31 +125,6 @@ pub(crate) fn compile_identifier_without_with(
     name: &str,
     span: (u32, u32),
 ) -> Result<u16, CompileError> {
-    // ECMA-262 §19.3 / §20.5 native error constructors
-    // (`Error`, `TypeError`, `RangeError`, `SyntaxError`,
-    // `ReferenceError`, `URIError`, `EvalError`). Bare
-    // identifier reads — e.g. `e instanceof TypeError` —
-    // lower to `Op::LoadBuiltinError` so the runtime hands
-    // back the per-interpreter constructor object whose
-    // `prototype` own property feeds `Op::Instanceof`.
-    // Local bindings of the same name still take precedence
-    // (checked below via `lookup_binding`), so user code
-    // can shadow the global if it really needs to.
-    //
-    // <https://tc39.es/ecma262/#sec-error-objects>
-    if find_module_import_binding(cx, name).is_none()
-        && is_builtin_error_class_name(name)
-        && cx.resolves_to_plain_global(name)
-    {
-        let dst = cx.alloc_scratch();
-        let kind_idx = cx.intern_string_constant(name);
-        cx.emit(
-            Op::LoadBuiltinError,
-            [Operand::Register(dst), Operand::ConstIndex(kind_idx)],
-            span,
-        );
-        return Ok(dst);
-    }
     // Module-mode identifier resolution: imported aliases
     // resolve to a live read of the source module's binding.
     //

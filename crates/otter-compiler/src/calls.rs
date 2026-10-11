@@ -8,12 +8,19 @@
 //! - array spreading
 //!
 //! # Invariants
+//! - Callee lookup precedes observable argument evaluation. Fused calls require
+//!   a proof that argument reads and nonthrowing operations commute with it.
 //! - Argument registers are emitted in source order.
+//! - Mutable builtin names use the same resolution as ordinary callables.
 //!
 //! # See also
-//! - `builtins_call` and `chain`
+//! - `chain` and environment-aware identifier lowering
 
 use crate::*;
+
+#[cfg(test)]
+#[path = "calls_tests.rs"]
+mod tests;
 
 /// Maximum argument count for dense `Op::Call` / `Op::CallWithThis`
 /// / `Op::CallMethodValue` / `Op::BindFunction` lowering. The
@@ -48,23 +55,13 @@ pub(crate) fn check_call_arity(
     Ok(())
 }
 
-/// Lower a call expression. Three forms are supported:
+/// Lower calls with their resolved callable, receiver and evaluated arguments.
 ///
-/// - `receiver.method(args...)` — emits [`Op::CallMethodValue`].
-///   The runtime branches by receiver kind (string / array
-///   intrinsics, plain object property dispatch, or
-///   `Function.prototype.{call, apply, bind}` for callables).
-/// - `callee.{call, apply, bind}(...)` with a syntactically obvious
-///   call shape — lowered directly to [`Op::CallWithThis`] /
-///   [`Op::BindFunction`] when the argument list can be flattened at
-///   compile time. Dynamic `apply` argument lists stay on
-///   [`Op::CallMethodValue`] so the VM performs the spec
-///   `CreateListFromArrayLike` coercion.
-/// - `callee(args...)` (free call) — emits [`Op::Call`]; the callee
-///   receives `this = undefined`.
+/// A static method uses the fused [`Op::CallMethodValue`] only when its
+/// arguments commute with lookup. Other members load the callable first and
+/// use [`Op::CallWithThis`]. Free calls use [`Op::Call`]. A proved forwarding
+/// shape retains the live `apply` lookup and the existing argument-frame path.
 ///
-/// Computed-method access, `new`, and spread arguments are
-/// deferred to later tasks.
 /// §13.3.6.1 — parenthesizing the callee of a call does NOT make an
 /// `eval` call indirect: `(eval)(x)` and `((eval))(x)` are direct eval,
 /// only `(1, eval)(x)` (a non-trivial CoverParenthesizedExpression) is
@@ -161,20 +158,6 @@ pub(crate) fn compile_method_call(
         );
         return Ok(dst);
     }
-    // Bare `Error("msg")` / `TypeError("msg")` / etc. without
-    // `new` is treated like the matching `new <Kind>("msg")` per
-    // ES spec §20.5.1.1 — same lowering.
-    // Same static-resolution guard as the `new` form: any enclosing
-    // binding, `with` object, or live sloppy direct-eval scope wins over
-    // the global error class.
-    if let Expression::Identifier(id) = callee
-        && find_module_import_binding(cx, id.name.as_str()).is_none()
-        && cx.resolves_to_plain_global(id.name.as_str())
-        && is_builtin_error_class_name(id.name.as_str())
-        && builtin_error_construct_fast_path_applies(id.name.as_str(), &call.arguments)
-    {
-        return compile_builtin_error_construct(cx, id.name.as_str(), &call.arguments, span);
-    }
     let has_spread = call
         .arguments
         .iter()
@@ -192,13 +175,8 @@ pub(crate) fn compile_method_call(
     if has_spread && !is_bare_eval {
         return compile_spread_call(cx, callee, &call.arguments, span);
     }
-    // §9.1.1.2 — an enclosing `with` object environment may intercept
-    // any free identifier, so the bare-name fast paths below
-    // (`Object()`, `Boolean()`, `Array()`, …) would bypass its
-    // HasBinding / @@unscopables / Get traps. Route such callees
-    // through the generic path, whose `compile_expr` emits the
-    // with-binding probe. `eval` keeps its fast path — losing it
-    // would silently demote direct eval to indirect.
+    // §9.1.1.2 — a call through a `with` binding carries the binding
+    // object's receiver. Direct eval retains its independent identity probe.
     if let Expression::Identifier(id) = callee
         && id.name.as_str() != "eval"
         && !cx.active_with_envs.is_empty()
@@ -260,255 +238,6 @@ pub(crate) fn compile_method_call(
         operands.push(Operand::ConstIndex(arg_regs.len() as u32));
         operands.extend(arg_regs.into_iter().map(Operand::Register));
         cx.emit(Op::CallWithThis, operands, span);
-        return Ok(dst);
-    }
-    if let Expression::StaticMemberExpression(member) = callee {
-        // `ArrayBuffer.isView(arg)` routes through the real
-        // `NativeFunction` installed by `bootstrap_array_buffer` —
-        // `Op::ArrayBufferCall` for the static-method shape is no
-        // longer emitted from the compiler.
-        // §28.2.2 `Proxy.revocable(...)` flows through the real
-        // `NativeFunction` installed by the `Proxy` bootstrap, so
-        // the dedicated `Op::ProxyCall` shortcut is no longer
-        // emitted.
-        // §25.4 `Atomics.<method>(args)` — routed through the
-        // namespace native function table installed by
-        // `bootstrap::install_atomics`. The dedicated
-        // `Op::AtomicsCall` shortcut was retired because it
-        // bypassed the spec-required ToIndex coercion and
-        // arraytype-before-value-coercion ordering. The opcode
-        // handler in `crates/otter-vm/src/lib.rs` remains for
-        // backwards-compatibility with older bytecode.
-        // <https://tc39.es/ecma262/#sec-atomics-object>
-        //
-        // §28.1 `Reflect.<method>(args)` flows through the real
-        // `NativeFunction` entries installed by the `Reflect`
-        // namespace bootstrap, so the dedicated `Op::ReflectCall`
-        // shortcut is no longer emitted. User shadowing of
-        // `Reflect.<method>` is therefore observable.
-        // Iterator-helpers proposal — `Iterator.from(...)` flows
-        // through the real `NativeFunction` installed by the
-        // `Iterator` bootstrap, so the dedicated `Op::IteratorCall`
-        // shortcut is no longer emitted.
-        // §23.2.2 TypedArray statics — `<T>.from(...)` / `<T>.of(...)`
-        // flow through the real `NativeFunction` entries installed by
-        // the per-TypedArray bootstrap, so the dedicated
-        // `Op::TypedArrayCall` shortcut is no longer emitted.
-        // §20.1.2 `Object.<method>(args)` — every static flows
-        // through the real `NativeFunction` table installed by
-        // `OBJECT_SPEC`. User shadowing of `Object.<method>` is
-        // therefore observable per spec. No compile-time fast path:
-        // the runtime IC caches the resolved callee.
-        // §23.1.2 Array static surface. `Array.isArray` keeps a
-        // dedicated [`Op::IsArray`] for the §7.2.2 fast path;
-        // `Array.from` / `Array.of` lower to dedicated
-        // [`Op::ArrayFrom`] / [`Op::ArrayOf`] opcodes.
-        // <https://tc39.es/ecma262/#sec-properties-of-the-array-constructor>
-        if let Expression::Identifier(id) = &member.object
-            && id.name.as_str() == "Array"
-        {
-            let method = member.property.name.as_str();
-            if method == "isArray" {
-                let arg_regs = compile_call_args(cx, &call.arguments, span)?;
-                let src = arg_regs.first().copied().unwrap_or_else(|| {
-                    let undefined = cx.alloc_scratch();
-                    cx.emit(Op::LoadUndefined, [Operand::Register(undefined)], span);
-                    undefined
-                });
-                let dst = cx.alloc_scratch();
-                cx.emit(
-                    Op::IsArray,
-                    [Operand::Register(dst), Operand::Register(src)],
-                    span,
-                );
-                return Ok(dst);
-            }
-            if matches!(method, "from" | "of") {
-                let arg_regs = compile_call_args(cx, &call.arguments, span)?;
-                let dst = cx.alloc_scratch();
-                let mut operands: Vec<Operand> = Vec::with_capacity(2 + arg_regs.len());
-                operands.push(Operand::Register(dst));
-                operands.push(Operand::ConstIndex(arg_regs.len() as u32));
-                operands.extend(arg_regs.iter().copied().map(Operand::Register));
-                let opcode = if method == "from" {
-                    Op::ArrayFrom
-                } else {
-                    Op::ArrayOf
-                };
-                cx.emit(opcode, operands, span);
-                return Ok(dst);
-            }
-        }
-        // §21.3 `Math.<method>(args)` flows through the real `NativeFunction`
-        // entries installed by the `Math` namespace bootstrap, so the dedicated
-        // `Op::MathCall` shortcut is no longer emitted. The namespace object
-        // carries an ordinary hidden class, so the call site caches its receiver
-        // shape, the method slot and the declared leaf entry like any other
-        // method call, and user shadowing of `Math.<method>` stays observable
-        // through the same guards.
-        // `JSON.<name>(args)` flows through the real `NativeFunction`
-        // installed by the `JSON` namespace bootstrap, so the dedicated
-        // `Op::JsonCall` shortcut is no longer emitted. User shadowing
-        // of `JSON.parse` / `JSON.stringify` is therefore observable.
-        // `Promise.<name>(args)` previously routed through
-        // `Op::PromiseCall` for the typed dispatcher. With the
-        // bootstrap installer placing real statics on the
-        // `NativeFunction` constructor, the call flows through
-        // ordinary method dispatch so user-installed shadows on
-        // `Promise.<name>` are observable.
-        // `Temporal.<Class>.<method>(args)` previously routed through
-        // the dedicated `Op::TemporalCall` shortcut. The opcode is
-        // gone; the call now falls through to ordinary dynamic
-        // dispatch. The `Temporal` global bootstrap currently exposes
-        // no concrete class statics, so most `Temporal.*` calls will
-        // throw at runtime until that bootstrap is fleshed out.
-        // `Symbol.<method>(args)` flows through the real `NativeFunction`
-        // entries installed by the `Symbol` bootstrap, so the dedicated
-        // `Op::SymbolCall` shortcut is no longer emitted. User shadowing
-        // of `Symbol.for` / `Symbol.keyFor` is therefore observable.
-        // §21.1.2 Number static surface — `Number.parseInt` /
-        // `Number.parseFloat` / `Number.isNaN` / `Number.isFinite`
-        // / `Number.isInteger` / `Number.isSafeInteger` flow through
-        // the real `NativeFunction` entries installed by the
-        // `Number` bootstrap, so the dedicated `Op::GlobalCall`
-        // shortcut is no longer emitted.
-    }
-    // Bare `Symbol(desc)` resolves against the `NativeFunction`
-    // installed by the `Symbol` bootstrap, so the dedicated
-    // `Op::SymbolCall` `Construct` shortcut is no longer emitted.
-    // User shadowing of `globalThis.Symbol` is therefore observable.
-    // §20.3.1 `Boolean(value)` — coerces to boolean. The foundation
-    // ships primitive-only Booleans (no wrapper object), so the
-    // bare-call form is identical to `!!value`.
-    // <https://tc39.es/ecma262/#sec-boolean-constructor>
-    if let Expression::Identifier(id) = callee
-        && id.name.as_str() == "Boolean"
-        && cx.lookup_binding("Boolean").is_none()
-        && find_module_import_binding(cx, "Boolean").is_none()
-    {
-        let arg_regs = compile_call_args(cx, &call.arguments, span)?;
-        let dst = cx.alloc_scratch();
-        match arg_regs.first().copied() {
-            Some(src) => {
-                cx.emit(
-                    Op::ToBoolean,
-                    [Operand::Register(dst), Operand::Register(src)],
-                    span,
-                );
-            }
-            None => {
-                cx.emit(Op::LoadFalse, [Operand::Register(dst)], span);
-            }
-        }
-        return Ok(dst);
-    }
-    // §22.1.1 / §22.1.2 — bare-call `String(value)` and the
-    // `String.<method>(args)` statics route through the
-    // `Value::NativeFunction` table installed at bootstrap. The
-    // dedicated `Op::StringCall` shortcut was retired because it
-    // bypassed §7.1.17 ToString's ToPrimitive step (user classes
-    // with an overridden `toString` / `Symbol.toPrimitive` did
-    // not fire), and because spec-shaped dispatch through
-    // ordinary property lookup is the simpler invariant to keep.
-    // The opcode handler in `crates/otter-vm/src/lib.rs` remains
-    // for backwards-compatibility with older bytecode.
-    // <https://tc39.es/ecma262/#sec-string-constructor>
-    // §21.1.1 `Number(value)` fast path — folds to `Op::LoadInt32 0`
-    // for the bare zero-arg form, or to `Op::ToNumber` for a single
-    // primitive arg. The BigInt arm of §21.1.1.1 step 5 takes a
-    // different shape than generic §7.1.4 ToNumber (which throws on
-    // BigInt — see `language/expressions/unary-plus/bigint-throws.js`).
-    // BigInt arity can't be observed at compile time, so callers with
-    // any argument fall through to the ordinary call dispatch which
-    // routes to `number_ctor_call` and the spec-correct BigInt arm.
-    if let Expression::Identifier(id) = callee
-        && id.name.as_str() == "Number"
-        && cx.lookup_binding("Number").is_none()
-        && find_module_import_binding(cx, "Number").is_none()
-        && call.arguments.is_empty()
-    {
-        let dst = cx.alloc_scratch();
-        cx.emit(
-            Op::LoadInt32,
-            [Operand::Register(dst), Operand::Imm32(0)],
-            span,
-        );
-        return Ok(dst);
-    }
-    // §20.3.1 `Boolean(value)` — primitive ToBoolean.
-    if let Expression::Identifier(id) = callee
-        && id.name.as_str() == "Boolean"
-        && cx.lookup_binding("Boolean").is_none()
-        && find_module_import_binding(cx, "Boolean").is_none()
-    {
-        let arg_regs = compile_call_args(cx, &call.arguments, span)?;
-        let dst = cx.alloc_scratch();
-        match arg_regs.first().copied() {
-            Some(src) => cx.emit(
-                Op::ToBoolean,
-                [Operand::Register(dst), Operand::Register(src)],
-                span,
-            ),
-            None => cx.emit(Op::LoadFalse, [Operand::Register(dst)], span),
-        }
-        return Ok(dst);
-    }
-    // §23.1.1.1 `Array(...)` — bare-call form has the same spec
-    // body as `new Array(...)`. Both lower to [`Op::ArrayConstruct`]
-    // so the single-numeric-length form produces a sparse array.
-    if let Expression::Identifier(id) = callee
-        && id.name.as_str() == "Array"
-        && cx.lookup_binding("Array").is_none()
-        && find_module_import_binding(cx, "Array").is_none()
-    {
-        let arg_regs = compile_call_args(cx, &call.arguments, span)?;
-        let dst = cx.alloc_scratch();
-        let mut operands: Vec<Operand> = Vec::with_capacity(2 + arg_regs.len());
-        operands.push(Operand::Register(dst));
-        operands.push(Operand::ConstIndex(arg_regs.len() as u32));
-        operands.extend(arg_regs.into_iter().map(Operand::Register));
-        cx.emit(Op::ArrayConstruct, operands, span);
-        return Ok(dst);
-    }
-    // §20.1.1 `Object()` — empty-args shortcut to `Op::NewObject`.
-    // One-arg form falls through to the general call path so the
-    // runtime `object_ctor_call` (§20.1.1.1) handles null/undefined
-    // → fresh-object coercion and primitive → wrapper coercion.
-    if let Expression::Identifier(id) = callee
-        && id.name.as_str() == "Object"
-        && cx.lookup_binding("Object").is_none()
-        && find_module_import_binding(cx, "Object").is_none()
-        && call.arguments.is_empty()
-    {
-        let dst = cx.alloc_scratch();
-        cx.emit(Op::NewObject, [Operand::Register(dst)], span);
-        return Ok(dst);
-    }
-    // §21.4.3 `Date.<method>(args)` — `Date.now` / `Date.parse` /
-    // `Date.UTC` flow through the real `NativeFunction` entries
-    // installed by the `Date` bootstrap. The dedicated `Op::DateCall`
-    // shortcut for the static surface is no longer emitted, so user
-    // shadows of `Date.<method>` are observable per ECMA-262.
-    // `BigInt(value)` and `BigInt.asIntN/asUintN(args)` route
-    // through the real `NativeFunction` installed by
-    // `bootstrap_bigint` — the dedicated `Op::BigIntCall` shortcut
-    // is no longer emitted.
-    // §20.2.1.1 — bare `Function(arg0, …, body)` is the same as
-    // `new Function(...)` per spec; lower both shapes through one
-    // path.
-    // <https://tc39.es/ecma262/#sec-function-p1-p2-pn-body>
-    if let Expression::Identifier(id) = callee
-        && id.name.as_str() == "Function"
-        && cx.lookup_binding("Function").is_none()
-        && find_module_import_binding(cx, "Function").is_none()
-    {
-        let arg_regs = compile_call_args(cx, &call.arguments, span)?;
-        let dst = cx.alloc_scratch();
-        let mut operands: Vec<Operand> = Vec::with_capacity(2 + arg_regs.len());
-        operands.push(Operand::Register(dst));
-        operands.push(Operand::ConstIndex(arg_regs.len() as u32));
-        operands.extend(arg_regs.into_iter().map(Operand::Register));
-        cx.emit(Op::NewFunction, operands, span);
         return Ok(dst);
     }
     // §19.4.1 `eval(source)` — bare-identifier interception.
@@ -579,53 +308,14 @@ pub(crate) fn compile_method_call(
             return emit_guarded_eval(cx, call, callee, span, false);
         }
     }
-    // §19.2 global function bare-identifier calls like
-    // `parseInt(...)` / `isNaN(x)` / `encodeURIComponent(s)` flow
-    // through the real `NativeFunction` entries installed on
-    // `globalThis`, so the dedicated `Op::GlobalCall` shortcut is
-    // no longer emitted.
-    // Bare-identifier interceptions — `queueMicrotask(fn, ...args)`
-    // is the only one today. Lives at the call-site layer (not
-    // inside the StaticMember branch) because the syntax is a
-    // direct call, not a method call.
-    if let Expression::Identifier(id) = callee
-        && id.name.as_str() == "queueMicrotask"
-    {
-        // Compile arguments first so any side effects in the args
-        // run before the enqueue, matching JS evaluation order.
-        let arg_regs = compile_call_args(cx, &call.arguments, span)?;
-        if arg_regs.is_empty() {
-            return Err(CompileError::Unsupported {
-                node: "queueMicrotask requires a callback argument".to_string(),
-                span,
-            });
-        }
-        let mut iter = arg_regs.into_iter();
-        let callee_reg = iter.next().expect("checked non-empty");
-        let trailing: Vec<u16> = iter.collect();
-        let mut operands: Vec<Operand> = Vec::with_capacity(2 + trailing.len());
-        operands.push(Operand::Register(callee_reg));
-        operands.push(Operand::ConstIndex(trailing.len() as u32));
-        operands.extend(trailing.into_iter().map(Operand::Register));
-        cx.emit(Op::QueueMicrotask, operands, span);
-        // queueMicrotask returns `undefined` synchronously.
-        let dst = cx.alloc_scratch();
-        cx.emit(Op::LoadUndefined, [Operand::Register(dst)], span);
-        return Ok(dst);
-    }
     if let Expression::StaticMemberExpression(member) = callee {
         let method_name = member.property.name.as_str();
         if let Some(dst) = try_compile_forwarded_apply(cx, call, member, span)? {
             return Ok(dst);
         }
-        if let Some(dst) =
-            try_compile_function_method(cx, &member.object, method_name, &call.arguments, span)?
-        {
-            return Ok(dst);
-        }
         let receiver_reg = compile_expr(cx, &member.object, span)?;
         let name_idx = cx.intern_string_constant(method_name);
-        if !call_arguments_are_effect_free(cx, &call.arguments) {
+        if !call_arguments_commute_with_method_lookup(cx, &call.arguments) {
             // §13.3.6.1 — GetValue on the callee reference precedes
             // ArgumentListEvaluation, so the method read is its own
             // instruction here: a getter runs, and a nullish base throws,
@@ -705,7 +395,7 @@ pub(crate) fn compile_method_call(
         let receiver_reg = compile_expr(cx, &member.object, span)?;
         if let Expression::StringLiteral(lit) = unwrap_ts_expr(&member.expression)
             && !lit.lone_surrogates
-            && call_arguments_are_effect_free(cx, &call.arguments)
+            && call_arguments_commute_with_method_lookup(cx, &call.arguments)
         {
             let name_idx = cx.intern_string_constant(lit.value.as_str());
             let arg_regs = compile_call_args(cx, &call.arguments, span)?;
@@ -1107,44 +797,23 @@ fn try_compile_forwarded_apply(
     Ok(Some(dst))
 }
 
-/// Legacy hook for syntactic `<expr>.call/apply/bind(...)` lowering.
+/// Prove that these arguments commute with the callee's property lookup.
 ///
-/// These shapes are intentionally routed through [`Op::CallMethodValue`]:
-/// the property access is observable, and a receiver may install an own
-/// non-callable `call`, `apply`, or `bind` property that shadows
-/// `%Function.prototype%`. Runtime dispatch may still fast-path after
-/// ordinary `GetMethod` proves the resolved value is the intrinsic.
-pub(crate) fn try_compile_function_method(
-    _cx: &mut Compiler,
-    _receiver: &Expression<'_>,
-    _method_name: &str,
-    _arguments: &oxc_allocator::Vec<'_, oxc_ast::ast::Argument<'_>>,
-    _span: (u32, u32),
-) -> Result<Option<u16>, CompileError> {
-    Ok(None)
-}
-
-/// Whether evaluating this argument list can be observed relative to the
-/// callee's own property read.
-///
-/// §13.3.6.1 EvaluateCall reads the callee — `GetValue` on the member
-/// reference, which runs a getter and throws on a nullish base — BEFORE
-/// ArgumentListEvaluation. The fused `Op::CallMethodValue` performs that
-/// read after its operand registers are filled, so it is only admissible
-/// when no argument can run user code, throw, or otherwise be ordered
-/// against the read: literals, `this`, and reads of an already
-/// initialized local binding.
-pub(crate) fn call_arguments_are_effect_free(
+/// The fused opcode reads its method after filling argument registers. Every
+/// argument must be nonthrowing and independent of getter writes: an immutable
+/// initialized binding or a private register suffices; mutable context slots,
+/// dynamic lookup and coercion of unknown values do not.
+pub(crate) fn call_arguments_commute_with_method_lookup(
     cx: &Compiler,
     args: &oxc_allocator::Vec<'_, oxc_ast::ast::Argument<'_>>,
 ) -> bool {
     args.iter().all(|arg| match arg {
         oxc_ast::ast::Argument::SpreadElement(_) => false,
-        other => expression_is_effect_free(cx, other.to_expression()),
+        other => expression_commutes_with_method_lookup(cx, other.to_expression()),
     })
 }
 
-fn expression_is_effect_free(cx: &Compiler, expr: &Expression<'_>) -> bool {
+fn expression_commutes_with_method_lookup(cx: &Compiler, expr: &Expression<'_>) -> bool {
     use oxc_ast::ast::{ObjectPropertyKind, PropertyKey, UnaryOperator};
 
     match unwrap_ts_expr(expr) {
@@ -1155,24 +824,30 @@ fn expression_is_effect_free(cx: &Compiler, expr: &Expression<'_>) -> bool {
         | Expression::BigIntLiteral(_)
         | Expression::RegExpLiteral(_)
         | Expression::FunctionExpression(_)
-        | Expression::ArrowFunctionExpression(_)
-        | Expression::ThisExpression(_) => true,
-        Expression::Identifier(id) => cx
-            .lookup_binding(id.name.as_str())
-            .is_some_and(|info| info.initialized && !info.fn_self_name),
-        Expression::ParenthesizedExpression(p) => expression_is_effect_free(cx, &p.expression),
-        // `void 0`, `-1`, `!flag` — the operator itself runs no user code
-        // once its operand cannot. `typeof` and `delete` are excluded:
-        // both reach the environment / object protocol.
+        | Expression::ArrowFunctionExpression(_) => true,
+        Expression::ThisExpression(_) => cx
+            .stack
+            .iter()
+            .rev()
+            .find(|frame| !frame.is_arrow)
+            .is_none_or(|frame| !frame.is_derived_ctor && !frame.eval_this_from_chain),
+        Expression::Identifier(id) => binding_commutes_with_method_lookup(cx, id.name.as_str()),
+        Expression::ParenthesizedExpression(p) => {
+            expression_commutes_with_method_lookup(cx, &p.expression)
+        }
         Expression::UnaryExpression(unary) => {
-            matches!(
-                unary.operator,
-                UnaryOperator::Void
-                    | UnaryOperator::UnaryNegation
-                    | UnaryOperator::UnaryPlus
-                    | UnaryOperator::LogicalNot
-                    | UnaryOperator::BitwiseNot
-            ) && expression_is_effect_free(cx, &unary.argument)
+            expression_commutes_with_method_lookup(cx, &unary.argument)
+                && match unary.operator {
+                    UnaryOperator::Void | UnaryOperator::LogicalNot => true,
+                    UnaryOperator::UnaryPlus => {
+                        numeric_primitive_kind(&unary.argument)
+                            == Some(NumericPrimitiveKind::Number)
+                    }
+                    UnaryOperator::UnaryNegation | UnaryOperator::BitwiseNot => {
+                        numeric_primitive_kind(&unary.argument).is_some()
+                    }
+                    _ => false,
+                }
         }
         // An array literal with no spread allocates and stores; an object
         // literal additionally needs every key settled at compile time,
@@ -1182,7 +857,7 @@ fn expression_is_effect_free(cx: &Compiler, expr: &Expression<'_>) -> bool {
             oxc_ast::ast::ArrayExpressionElement::Elision(_) => true,
             other => other
                 .as_expression()
-                .is_some_and(|expr| expression_is_effect_free(cx, expr)),
+                .is_some_and(|expr| expression_commutes_with_method_lookup(cx, expr)),
         }),
         Expression::ObjectExpression(object) => {
             object.properties.iter().all(|property| match property {
@@ -1195,11 +870,75 @@ fn expression_is_effect_free(cx: &Compiler, expr: &Expression<'_>) -> bool {
                                 | PropertyKey::StringLiteral(_)
                                 | PropertyKey::NumericLiteral(_)
                         )
-                        && expression_is_effect_free(cx, &entry.value)
+                        && expression_commutes_with_method_lookup(cx, &entry.value)
                 }
             })
         }
         _ => false,
+    }
+}
+
+/// A getter cannot mutate an initialized immutable binding or an unexposed
+/// register. Capture, direct eval and mapped arguments move mutable bindings
+/// into context slots; legacy function arguments expose a snapshot instead.
+fn binding_commutes_with_method_lookup(cx: &Compiler, name: &str) -> bool {
+    use crate::compiler::{Access, NameRef, ScopeLocation};
+
+    if !cx.active_with_envs.is_empty() || find_module_import_binding(cx, name).is_some() {
+        return false;
+    }
+    let NameRef::Binding(resolved) = cx.resolve_ref(name) else {
+        return false;
+    };
+    let info = resolved.info;
+    if resolved.lookup.is_some() || !info.initialized || info.fn_self_name {
+        return false;
+    }
+    let may_be_uninitialized = match resolved.location {
+        ScopeLocation::Frame { frame, scope } => {
+            cx.stack[frame].own_access_needs_check(&info, scope)
+        }
+        // A descriptor names the cell but carries no current-value proof.
+        ScopeLocation::Chain { .. } => info.kind.initial_hole(),
+    };
+    if may_be_uninitialized {
+        return false;
+    }
+    info.is_const
+        || (resolved.access == Access::Own
+            && matches!(info.storage, BindingStorage::Register { .. })
+            && !cx.name_needs_slot(name)
+            && !cx.contains_direct_eval)
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum NumericPrimitiveKind {
+    Number,
+    BigInt,
+}
+
+/// Static value-kind proof only; advisory type annotations cannot establish
+/// that numeric coercion skips user code or avoids the BigInt unary-plus throw.
+fn numeric_primitive_kind(expr: &Expression<'_>) -> Option<NumericPrimitiveKind> {
+    use oxc_ast::ast::UnaryOperator;
+
+    match unwrap_ts_expr(expr) {
+        Expression::NumericLiteral(_)
+        | Expression::StringLiteral(_)
+        | Expression::BooleanLiteral(_)
+        | Expression::NullLiteral(_) => Some(NumericPrimitiveKind::Number),
+        Expression::BigIntLiteral(_) => Some(NumericPrimitiveKind::BigInt),
+        Expression::ParenthesizedExpression(p) => numeric_primitive_kind(&p.expression),
+        Expression::UnaryExpression(unary) => match unary.operator {
+            UnaryOperator::Void | UnaryOperator::LogicalNot => Some(NumericPrimitiveKind::Number),
+            UnaryOperator::UnaryNegation | UnaryOperator::BitwiseNot => {
+                numeric_primitive_kind(&unary.argument)
+            }
+            UnaryOperator::UnaryPlus => numeric_primitive_kind(&unary.argument)
+                .filter(|kind| *kind == NumericPrimitiveKind::Number),
+            _ => None,
+        },
+        _ => None,
     }
 }
 

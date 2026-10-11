@@ -1,37 +1,30 @@
-//! `Object.<static>` dispatcher — handles the descriptor-shaped
-//! surface (`defineProperty`, `getOwnPropertyDescriptor`, `freeze`,
-//! `seal`, `preventExtensions`, the `is*` predicates) wired through
-//! [`crate::otter_bytecode::Op::ObjectCall`]. Routed by name; unknown
-//! names raise [`VmError::UnknownIntrinsic`].
-//!
-//! Construction-time built-ins (`create`, `getPrototypeOf`,
-//! `setPrototypeOf`, `is`) keep their own dedicated opcodes so this
-//! file only owns the descriptor / integrity ladder.
+//! Object constructor and prototype entries with typed descriptor dispatch.
 //!
 //! # Contents
-//! - `native_call` — context-aware JS builtin entry.
+//! - Context-aware Object constructor and prototype native entries.
 //! - `call` — private heap-only descriptor/integrity dispatch.
 //! - [`coerce_to_descriptor`] — implements §6.2.5.5
 //!   `ToPropertyDescriptor` against a JS-side descriptor object.
+//! - Shared fallible builtin-tag classification for string conversion.
 //!
 //! # Invariants
-//! - All names match ECMA-262 spelling exactly.
+//! - Native specifications own JavaScript names; internal dispatch uses the
+//!   bytecode's typed Object method identifier.
 //! - Object.assign enters the sole full [[Get]]/[[Set]] owner with the actual
 //!   execution context; the heap dispatcher rejects a missing context.
 //! - Reads of the descriptor object's `value / writable / enumerable
 //!   / configurable / get / set` slots use direct own-data reads
 //!   ([`crate::object::lookup_own`]). User-installed accessors / inherited
-//!   descriptor fields are intentionally ignored in this slice; the
-//!   spec uses the full `[[Get]]` ladder, but the ergonomic surface
-//!   (`Object.defineProperty(o, 'k', { value: 1 })`) doesn't depend
-//!   on it. Filed against task 60 for full faithfulness.
+//!   descriptor fields require the context-aware native descriptor owner.
+//! - String conversion uses the shared rooted interpreter driver. Its builtin
+//!   tag uses canonical IsArray before the observable symbol getter, preserving
+//!   enduring Array prototype identity and revoked-Proxy exceptions.
 //!
 //! # See also
 //! - <https://tc39.es/ecma262/#sec-properties-of-the-object-constructor>
 //! - <https://tc39.es/ecma262/#sec-topropertydescriptor>
 //! - <https://tc39.es/ecma262/#sec-setintegritylevel>
 
-use crate::native_abi::CommittedValueError;
 use crate::rooting::RootScopeExt;
 
 use crate::js_surface::{Attr, MethodSpec, NamespaceSpec};
@@ -558,24 +551,11 @@ pub(crate) fn native_prototype_to_string(
             name: "toString",
             reason: "missing execution context".to_string(),
         })?;
-    // §20.1.3.6 computes `builtinTag` before the observable
-    // `Get(O, @@toStringTag)` call, so proxy revocation triggered by
-    // the tag getter cannot retroactively change the builtin tag.
-    let builtin_tag = builtin_to_string_tag(ctx);
-    let tag_result = explicit_to_string_tag_with_context(ctx, &exec_ctx);
-    let explicit_tag = tag_result.map_err(|err| err.into_native(ctx.cx.interp, "toString"))?;
-    let tag = match explicit_tag {
-        Some(t) => t,
-        None => builtin_tag,
-    };
-    let display = format!("[object {tag}]");
-
-    Ok(Value::string(
-        JsString::from_str(&display, ctx.heap_mut()).map_err(|_| NativeError::TypeError {
-            name: "toString",
-            reason: "out of memory while allocating string".to_string(),
-        })?,
-    ))
+    let receiver = *ctx.this_value();
+    ctx.with_turn_parts(|interp, stack| {
+        interp.ordinary_object_to_string(stack, &exec_ctx, receiver)
+    })
+    .map_err(|error| error.into_native(ctx.cx.interp, "toString"))
 }
 
 pub(crate) fn native_prototype_value_of(
@@ -1280,138 +1260,59 @@ fn property_key_to_vm_key(key: &PropertyKey) -> crate::VmPropertyKey<'static> {
     }
 }
 
-/// §20.1.3.6 step 14 — `builtinTag` table. Only the internal-slot
-/// driven tags surface here (Array / Arguments / Function / Error /
-/// Boolean / Number / String / Date / RegExp); every other kind
-/// (Map, Set, Promise, BigInt, Symbol, TypedArray, …) falls back to
-/// `"Object"` and relies on a prototype-installed `@@toStringTag`
-/// for its kind-specific string.
-fn builtin_to_string_tag(ctx: &NativeCtx<'_>) -> String {
-    builtin_to_string_tag_value(*ctx.this_value(), ctx.cx.interp)
-}
-
-/// §20.1.3.6 builtinTag classification for an arbitrary value, shared
-/// by `Object.prototype.toString` and `Array.prototype.toString`'s
-/// `%Object.prototype.toString%` fallback (which must work even after
-/// the `toString` property is deleted, so it cannot route through a
-/// property lookup).
-pub(crate) fn builtin_to_string_tag_value(v: Value, interp: &crate::Interpreter) -> String {
-    let v = &v;
+/// §20.1.3.6 builtinTag classification shared by ordinary string conversion
+/// and its proven non-observable form. Canonical IsArray validates Proxy
+/// targets before any observable tag getter; other tags read only the
+/// receiver's own internal slots or callable identity.
+pub(crate) fn builtin_to_string_tag_value(
+    v: Value,
+    interp: &crate::Interpreter,
+) -> Result<&'static str, VmError> {
     if v.is_undefined() || v.is_hole() {
-        return "Undefined".to_string();
+        return Ok("Undefined");
     }
     if v.is_null() {
-        return "Null".to_string();
+        return Ok("Null");
     }
     if v.is_boolean() {
-        return "Boolean".to_string();
+        return Ok("Boolean");
     }
     if v.is_number() {
-        return "Number".to_string();
+        return Ok("Number");
     }
     if v.is_string() {
-        return "String".to_string();
+        return Ok("String");
     }
-    if v.is_big_int() || v.is_symbol() {
-        return "Object".to_string();
+    if interp.is_array(&v)? {
+        return Ok("Array");
     }
-    if v.is_function()
-        || v.is_closure()
-        || v.is_bound_function()
-        || v.is_native_function()
-        || v.is_class_constructor()
-    {
-        return "Function".to_string();
-    }
-    if v.is_array() {
-        return "Array".to_string();
-    }
-    if let Some(obj) = v.as_object()
-        && interp.realm_intrinsics.array_prototype() == Some(obj)
-    {
-        return "Array".to_string();
+    if crate::abstract_ops::is_callable_in_heap(&v, interp.gc_heap()) {
+        return Ok("Function");
     }
     if v.is_regexp() {
-        return "RegExp".to_string();
-    }
-    if v.is_promise()
-        || v.is_map()
-        || v.is_set()
-        || v.is_weak_map()
-        || v.is_weak_set()
-        || v.is_weak_ref()
-        || v.is_finalization_registry()
-        || v.is_generator()
-        || v.is_iterator()
-        || v.is_temporal()
-        || v.is_intl()
-        || v.is_array_buffer()
-        || v.is_data_view()
-        || v.is_typed_array()
-    {
-        return "Object".to_string();
-    }
-    if v.is_proxy() {
-        return proxy_builtin_tag(v, interp.gc_heap());
+        return Ok("RegExp");
     }
     if let Some(obj) = v.as_object() {
         if crate::object::is_arguments_object(obj, interp.gc_heap()) {
-            return "Arguments".to_string();
-        }
-        if crate::object::date_data(obj, interp.gc_heap()).is_some() {
-            return "Date".to_string();
-        }
-        if crate::object::call_native(obj, interp.gc_heap()).is_some() {
-            return "Function".to_string();
+            return Ok("Arguments");
         }
         if crate::object::boolean_data(obj, interp.gc_heap()).is_some() {
-            return "Boolean".to_string();
+            return Ok("Boolean");
         }
         if crate::object::number_data(obj, interp.gc_heap()).is_some() {
-            return "Number".to_string();
+            return Ok("Number");
         }
         if crate::object::string_data(obj, interp.gc_heap()).is_some() {
-            return "String".to_string();
+            return Ok("String");
+        }
+        if crate::object::date_data(obj, interp.gc_heap()).is_some() {
+            return Ok("Date");
         }
         if object_has_error_data_value(obj, interp) {
-            return "Error".to_string();
+            return Ok("Error");
         }
-        return "Object".to_string();
     }
-    "Object".to_string()
-}
-
-/// §7.2.2 IsArray + §7.2.4 IsCallable for a Proxy target. Walks the
-/// `[[ProxyTarget]]` chain until reaching a non-proxy value and
-/// returns the builtin tag of that underlying value.
-fn proxy_builtin_tag(value: &Value, heap: &otter_gc::GcHeap) -> String {
-    let mut current = *value;
-    let mut hops = 0_usize;
-    loop {
-        if hops >= crate::object::PROTO_CHAIN_HARD_CAP {
-            return "Object".to_string();
-        }
-        hops += 1;
-        if let Some(p) = current.as_proxy() {
-            if p.is_revoked(heap) {
-                return "Object".to_string();
-            }
-            current = p.target(heap);
-            continue;
-        }
-        if current.is_array() {
-            return "Array".to_string();
-        }
-        if current.is_function()
-            || current.is_closure()
-            || current.is_bound_function()
-            || current.is_native_function()
-            || current.is_class_constructor()
-        {
-            return "Function".to_string();
-        }
-        return "Object".to_string();
-    }
+    Ok("Object")
 }
 
 /// Walk `obj`'s `[[Prototype]]` chain and return `true` when any
@@ -1450,72 +1351,6 @@ pub(crate) fn object_has_error_data_value(
         current = crate::object::prototype(o, heap);
     }
     false
-}
-
-/// §20.1.3.6 step 15 — `Get(O, @@toStringTag)` through the full
-/// `[[Get]]` ladder, so accessor getters fire and the realm
-/// prototype's tag (`Map.prototype[@@toStringTag]`, etc.) is
-/// observed. Non-string results return `None` so the caller falls
-/// back to the builtin tag.
-fn explicit_to_string_tag_with_context(
-    ctx: &mut NativeCtx<'_>,
-    exec_ctx: &crate::ExecutionContext,
-) -> Result<Option<String>, CommittedValueError> {
-    // §20.1.3.6 steps 1-2 — `undefined` and `null` resolve to their
-    // builtin tags before ToObject and never enter the `[[Get]]`
-    // ladder. The `Hole` sentinel never reaches user code, but if it
-    // somehow does, behave like `undefined`.
-    let this_value = *ctx.this_value();
-    if this_value.is_nullish() || this_value.is_hole() {
-        return Ok(None);
-    }
-    let tag_symbol = ctx
-        .cx
-        .interp
-        .well_known_symbols()
-        .get(crate::symbol::WellKnown::ToStringTag);
-    // string primitive doesn't have its own arm in
-    // `ordinary_get_value`; route the lookup through
-    // `String.prototype` explicitly so user-installed
-    // `String.prototype[@@toStringTag]` overrides surface.
-    let base: Value = if this_value.is_string() {
-        match ctx.cx.interp.constructor_prototype_value("String").ok() {
-            Some(p) => p,
-            None => return Ok(None),
-        }
-    } else {
-        this_value
-    };
-    let outcome = ctx.with_turn_parts(|interp, stack| {
-        interp.ordinary_get_value(
-            stack,
-            Some(exec_ctx),
-            base,
-            this_value,
-            &crate::VmPropertyKey::Symbol(tag_symbol),
-            0,
-        )
-    })?;
-    let value = match outcome {
-        crate::VmGetOutcome::Value(v) => v,
-        crate::VmGetOutcome::InvokeGetter { getter } => {
-            let receiver = *ctx.this_value();
-            ctx.cx.with_parts(|interp, stack| {
-                interp
-                    .run_callable_sync_rooted(
-                        stack,
-                        Some(exec_ctx),
-                        &getter,
-                        receiver,
-                        smallvec::SmallVec::new(),
-                    )
-                    .map_err(CommittedValueError::completed_call)
-            })?
-        }
-    };
-    Ok(value
-        .as_string(ctx.heap())
-        .map(|s| s.to_lossy_string(ctx.heap())))
 }
 
 fn native_function_has_own(

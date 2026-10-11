@@ -5,13 +5,20 @@
 //! - Default and additional source realms, exact interpreter parity.
 //! - Typed Graph regions, direct cold span entries and canonical home proof.
 //! - Boxed/numeric element bases reloaded after collecting literal/instanceof nodes.
+//! - Canonical callable proofs, source-realm prototypes and late identity misses.
 //! - Optional raw probe artifacts preserved before assertions for gate diagnosis.
 //!
 //! # Invariants
 //! Only the measured function loops during each probe, so actual optimizing
 //! OSR belongs to that function. Allocating `Symbol.hasInstance` calls start
 //! late in its loop, after warmup; relocation counters are sampled around the
-//! probe. Empty literal nodes have no register-window inputs; nonempty nodes
+//! probe. A realm-installed callback arms allocation-driven minor collection
+//! only in that late phase; existing heap stress settings remain active.
+//! Its owned event batch separates pre-arm native execution from policy
+//! refusal after arming; source PCs alone do not identify a loop iteration.
+//! A refused group resumes only its first original allocation and retains
+//! the same installed OSR generation.
+//! Empty literal nodes have no register-window inputs; nonempty nodes
 //! consume initialized canonical tagged homes. Array allocation recipes owe
 //! earlier live object and array definitions in their exact traced homes.
 //! Pre-collection element reads retain child aliases and numeric bit patterns;
@@ -22,6 +29,9 @@
 //! `otter-jit/src/arm64/allocation/empty_tests.rs` executes fit/miss geometry.
 
 #![cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+
+#[path = "jit_empty_allocations/intrinsic.rs"]
+mod intrinsic;
 
 #[cfg(target_arch = "x86_64")]
 #[path = "support/native_code.rs"]
@@ -34,28 +44,83 @@ use yaxpeax_x86::amd64::{Opcode, Operand, RegSpec};
 
 use std::collections::BTreeMap;
 use std::fmt::Write;
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicUsize, Ordering},
+};
 
 use otter_runtime::{
-    JitArtifactBundle, JitArtifactFileName, JitDebugEvent, JitDebugRequest, JitDebugTarget,
-    JitDebugTier, JitSelection, Runtime, RuntimeRealmId, SourceInput,
+    JitArtifactBundle, JitArtifactFileName, JitDebugEvent, JitDebugReport, JitDebugRequest,
+    JitDebugTarget, JitDebugTier, JitSelection, Runtime, RuntimeExtensionInstaller,
+    RuntimeNativeCall, RuntimeNativeCtx, RuntimeRealmId, RuntimeValue, SourceInput,
 };
 use otter_vm::native_abi::{
-    ExitReason, STUB_ALLOC_GROUP_ENSURE, STUB_JIT_NEW_ARRAY, STUB_JIT_NEW_OBJECT,
-    STUB_JIT_NEW_OBJECT_LITERAL,
+    CodeLifetimeState, ExitAction, ExitReason, NativeFrameKind, STUB_ALLOC_GROUP_ENSURE,
+    STUB_JIT_NEW_ARRAY, STUB_JIT_NEW_OBJECT, STUB_JIT_NEW_OBJECT_LITERAL,
 };
 use serde_json::Value as Json;
 
 const FUNCTION: &str = "emptyAllocationsOnce";
 const MODULE: &str = "native-empty-setup.js";
 const ITERATIONS: usize = 8 * 4096;
+const COLLECTING_CALLS: usize = 512;
 const PROBE: &str = "JSON.stringify([emptyAllocationsOnce(input, target), calls, allocations]);";
+
+#[derive(Debug)]
+struct CollectionArm {
+    report: JitDebugReport,
+    generations: Vec<otter_vm::JitCodeGenerationSnapshot>,
+    optimized_deopts: u64,
+}
+
+fn collection_installer(
+    collecting: bool,
+    invocations: Arc<AtomicUsize>,
+    arm: Arc<Mutex<Option<CollectionArm>>>,
+) -> RuntimeExtensionInstaller {
+    RuntimeExtensionInstaller::new(move |realm| {
+        let invocations = invocations.clone();
+        let arm = arm.clone();
+        realm.install_native_global_call(
+            "literalCollect",
+            0,
+            RuntimeNativeCall::Dynamic(Arc::new(
+                move |ctx: &mut RuntimeNativeCtx<'_>,
+                      _args: &[RuntimeValue],
+                      _state: &[RuntimeValue]| {
+                    invocations.fetch_add(1, Ordering::Relaxed);
+                    if collecting {
+                        let vm = ctx.interp_mut();
+                        // Owned diagnostics mark the phase before allocation
+                        // policy changes and cannot move collector roots.
+                        let phase = CollectionArm {
+                            report: vm.take_jit_debug_report().expect("enabled native events"),
+                            generations: vm.jit_code_generation_snapshot(),
+                            optimized_deopts: vm.jit_runtime_stats().optimized_deopts,
+                        };
+                        *arm.lock().unwrap() = Some(phase);
+                        let heap = vm.gc_heap_mut();
+                        if !heap.gc_stress_enabled() {
+                            // Retire the LAB before the late callback's allocations.
+                            // The live Graph roots then move through ordinary
+                            // allocating helpers, rather than an explicit full GC.
+                            heap.set_gc_stress(256, false);
+                        }
+                    }
+                    Ok(RuntimeValue::undefined())
+                },
+            )),
+        )
+    })
+}
 
 fn setup(collecting_calls: usize) -> String {
     let mut source = format!(
         "const input = {{tag: 7}};\nconst sink = new Array(16);\n\
          let calls = 0, allocations = 0;\nconst allocationGate = {};\n\
          const target = {{ [Symbol.hasInstance](value) {{\n\
-         calls++;\nif (calls > allocationGate) {{\n",
+         calls++;\nif (calls === allocationGate + 1) literalCollect();\n\
+         if (calls > allocationGate) {{\n",
         ITERATIONS - collecting_calls,
     );
     // No helper loop can claim an OSR entry during the measured probe.
@@ -104,9 +169,122 @@ fn json(bundle: &JitArtifactBundle, name: JitArtifactFileName) -> Json {
         .expect("artifact JSON")
 }
 
+fn deopt_register_slot(frame: &Json, register: usize) -> &Json {
+    assert!(register < frame["registerCount"].as_u64().unwrap() as usize);
+    let mut entries = frame["slots"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|entry| entry[0].as_u64() == Some(register as u64));
+    let entry = entries.next().expect("explicit live register recipe");
+    assert!(entries.next().is_none(), "one recipe per source register");
+    assert_eq!(entry.as_array().unwrap().len(), 2);
+    &entry[1]
+}
+
+fn emitted_helper_roots(
+    bundle: &JitArtifactBundle,
+    region: &Json,
+    stub: otter_vm::native_abi::RuntimeStubDescriptor,
+) -> Vec<u32> {
+    let start = region["startOffset"].as_u64().unwrap() as usize;
+    let end = region["endOffset"].as_u64().unwrap() as usize;
+    let relocations = json(bundle, JitArtifactFileName::Relocations);
+    let mut helpers = relocations["relocations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|relocation| {
+            relocation["target"]["kind"] == "runtimeStub"
+                && relocation["target"]["id"] == stub.id
+                && relocation["startOffset"]
+                    .as_u64()
+                    .is_some_and(|offset| start as u64 <= offset && offset < end as u64)
+        });
+    let helper = helpers.next().expect("own canonical collecting helper");
+    assert!(helpers.next().is_none(), "one committed helper per node");
+    let helper = helper["startOffset"].as_u64().unwrap() as usize;
+    let code = bundle.file(JitArtifactFileName::Code).unwrap().contents();
+    #[cfg(target_arch = "aarch64")]
+    let stamps: Vec<_> = code[start..helper]
+        .chunks_exact(4)
+        .map(|word| u32::from_le_bytes(word.try_into().unwrap()))
+        .collect::<Vec<_>>()
+        .windows(2)
+        .filter_map(|pair| {
+            let register = pair[0] & 31;
+            let movz = pair[0] & 0xffe0_0000 == 0x5280_0000;
+            let movn = pair[0] & 0xffe0_0000 == 0x1280_0000;
+            let store = pair[1] & 0xffc0_03ff == (0xb900_02a0 | register);
+            let offset = ((pair[1] >> 10) & 0xfff) * 4;
+            ((movz || movn) && store).then(|| {
+                let value = (pair[0] >> 5) & 0xffff;
+                (offset, if movn { !value } else { value })
+            })
+        })
+        .collect();
+    #[cfg(target_arch = "x86_64")]
+    let stamps: Vec<_> = native_code::decode(code, start, helper)
+        .iter()
+        .filter_map(|instruction| {
+            let value = match instruction.operand(1) {
+                Operand::ImmediateI32 { imm } => imm as u32,
+                Operand::ImmediateU32 { imm } => imm,
+                _ => return None,
+            };
+            let (base, offset) = native_code::base_offset(instruction.operand(0))?;
+            (instruction.opcode() == Opcode::MOV
+                && instruction.mem_size().and_then(|size| size.bytes_size()) == Some(4)
+                && base == RegSpec::r14())
+            .then_some((offset as u32, value))
+        })
+        .collect();
+    let stamped = |offset| {
+        stamps
+            .iter()
+            .rev()
+            .find_map(|&(at, value)| (at == offset).then_some(value))
+            .expect("canonical source/root word stamped before collection")
+    };
+    let pc_offset = (std::mem::offset_of!(otter_vm::native_abi::Frame, header)
+        + std::mem::offset_of!(otter_vm::native_abi::VmFrameHeader, pc)) as u32;
+    assert_eq!(
+        u64::from(stamped(pc_offset)),
+        region["logicalPc"].as_u64().unwrap(),
+        "the collecting helper publishes its exact source operation"
+    );
+    let id = stamped(otter_vm::native_abi::NATIVE_FRAME_CALL_SITE_OFFSET);
+    let safepoints = json(bundle, JitArtifactFileName::Safepoints);
+    let mut records = safepoints["records"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|record| record["id"].as_u64() == Some(u64::from(id)));
+    let record = records.next().expect("the published root record exists");
+    assert!(records.next().is_none(), "one root record per id");
+    assert!(record["callPc"].is_null());
+    assert!(record["inlineFrames"].as_array().unwrap().is_empty());
+    let roots: Vec<u32> = record["taggedLocations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|root| {
+            assert_eq!(root["kind"], "spillSlot");
+            u32::try_from(root["index"].as_u64().unwrap()).unwrap()
+        })
+        .collect();
+    assert!(roots.windows(2).all(|pair| pair[0] < pair[1]));
+    roots
+}
+
 /// Preserve every captured generation before a proof can panic. Gate runners
 /// provide a fresh output directory; ordinary test runs perform no file I/O.
-fn preserve_probe(result: &otter_runtime::ExecutionResult, case: &str, extra_realm: bool) {
+fn preserve_probe(
+    result: &otter_runtime::ExecutionResult,
+    pre_arm: &JitDebugReport,
+    case: &str,
+    extra_realm: bool,
+) {
     let Some(root) = std::env::var_os("OTTER_LITERAL_PROOF_ARTIFACTS") else {
         return;
     };
@@ -116,12 +294,18 @@ fn preserve_probe(result: &otter_runtime::ExecutionResult, case: &str, extra_rea
     std::fs::create_dir(&directory).expect("fresh probe evidence directory");
     std::fs::write(directory.join("completion.txt"), result.completion_string()).unwrap();
     if let Some(report) = result.jit_debug_report() {
+        let report = pre_arm.clone().merged(report.clone());
         std::fs::write(
             directory.join("events.json"),
-            serde_json::to_vec_pretty(report).unwrap(),
+            serde_json::to_vec_pretty(&report).unwrap(),
         )
         .unwrap();
     }
+    std::fs::write(
+        directory.join("pre-arm-events.json"),
+        serde_json::to_vec_pretty(pre_arm).unwrap(),
+    )
+    .unwrap();
     let batch = result.jit_artifacts().expect("captured probe artifacts");
     std::fs::write(
         directory.join("capture.json"),
@@ -266,17 +450,18 @@ fn assert_native_empty_artifact(bundle: &JitArtifactBundle, extra_realm: bool) -
         frames[0]["functionId"].as_u64(),
         Some(u64::from(bundle.manifest().function_id()))
     );
-    let slots = frames[0]["slots"].as_array().unwrap();
-    let home = slots[registers[0]]["locationValue"]
+    let frame = &frames[0];
+    let home = deopt_register_slot(frame, registers[0])["locationValue"]
         .as_str()
         .unwrap()
         .parse::<u32>()
         .unwrap();
     for register in registers {
-        assert_eq!(slots[register]["representation"], "tagged");
-        assert_eq!(slots[register]["locationKind"], "stackSlot");
+        let slot = deopt_register_slot(frame, register);
+        assert_eq!(slot["representation"], "tagged");
+        assert_eq!(slot["locationKind"], "stackSlot");
         assert_eq!(
-            slots[register]["locationValue"]
+            slot["locationValue"]
                 .as_str()
                 .unwrap()
                 .parse::<u32>()
@@ -284,22 +469,8 @@ fn assert_native_empty_artifact(bundle: &JitArtifactBundle, extra_realm: bool) -
             home
         );
     }
-    let points = json(bundle, JitArtifactFileName::Safepoints);
-    let roots = points["records"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|point| point["id"].as_u64() == Some(u64::from(u32::MAX - 1)))
-        .expect("canonical initialized body roots");
-    let tagged = roots["taggedLocations"].as_array().unwrap();
-    assert!(
-        tagged
-            .iter()
-            .enumerate()
-            .all(|(index, root)| root["kind"] == "spillSlot"
-                && root["index"].as_u64() == Some(index as u64))
-    );
-    assert!(home.is_multiple_of(8) && (home as usize / 8) < tagged.len());
+    let roots = emitted_helper_roots(bundle, array, STUB_JIT_NEW_ARRAY);
+    assert!(home.is_multiple_of(8) && roots.contains(&(home / 8)));
     let code = bundle
         .file(JitArtifactFileName::Code)
         .expect("native code")
@@ -454,17 +625,18 @@ fn assert_native_empty_group_artifact(bundle: &JitArtifactBundle) -> u32 {
     let frames = state["frames"].as_array().unwrap();
     assert_eq!(frames.len(), 1);
     assert_eq!(frames[0]["functionId"], bundle.manifest().function_id());
-    let slots = frames[0]["slots"].as_array().unwrap();
-    let home = slots[registers[0]]["locationValue"]
+    let frame = &frames[0];
+    let home = deopt_register_slot(frame, registers[0])["locationValue"]
         .as_str()
         .unwrap()
         .parse::<u32>()
         .unwrap();
     for register in registers {
-        assert_eq!(slots[register]["representation"], "tagged");
-        assert_eq!(slots[register]["locationKind"], "stackSlot");
+        let slot = deopt_register_slot(frame, register);
+        assert_eq!(slot["representation"], "tagged");
+        assert_eq!(slot["locationKind"], "stackSlot");
         assert_eq!(
-            slots[register]["locationValue"]
+            slot["locationValue"]
                 .as_str()
                 .unwrap()
                 .parse::<u32>()
@@ -472,21 +644,12 @@ fn assert_native_empty_group_artifact(bundle: &JitArtifactBundle) -> u32 {
             home
         );
     }
-    let points = json(bundle, JitArtifactFileName::Safepoints);
-    let body = points["records"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|p| p["id"] == u32::MAX - 1)
-        .unwrap();
-    let tagged = body["taggedLocations"].as_array().unwrap();
-    assert!(
-        tagged
-            .iter()
-            .enumerate()
-            .all(|(i, r)| r["kind"] == "spillSlot" && r["index"] == i as u64)
+    let roots = emitted_helper_roots(
+        bundle,
+        collecting,
+        otter_vm::native_abi::STUB_JIT_OBJECT_PROTOCOL_VALUE,
     );
-    assert!(home.is_multiple_of(8) && (home as usize / 8) < tagged.len());
+    assert!(home.is_multiple_of(8) && roots.contains(&(home / 8)));
     let code = bundle.file(JitArtifactFileName::Code).unwrap().contents();
     let [object_init, array_init] = split_group_cell_initializers(code, group, object_bytes);
     assert_empty_native_bytes(code, [&object_init, &array_init], collecting, home, false);
@@ -528,7 +691,8 @@ fn split_group_cell_initializers(code: &[u8], region: &Json, object_bytes: u32) 
     let (first, candidate) = headers[0];
     let second = headers[1].0;
     assert!(
-        words[first + 1..second].contains(&(0x9100_0000 | (object_bytes << 10) | (candidate << 5) | candidate)),
+        words[first + 1..second]
+            .contains(&(0x9100_0000 | (object_bytes << 10) | (candidate << 5) | candidate)),
         "the array candidate advances by the exact first physical cell before its header"
     );
     let mut first_region = region.clone();
@@ -661,9 +825,12 @@ fn assert_empty_native_bytes(
                 .collect()
         };
         assert!(
-            offsets.iter().all(|&byte| words.contains(&(0xf900_0000
+            offsets.iter().all(|&byte| words.contains(
+                &(0xf900_0000
                     | ((byte / 8) << 10)
-                    | (candidate << 5) | if index == 0 { 16 } else { 31 }))),
+                    | (candidate << 5)
+                    | if index == 0 { 16 } else { 31 })
+            )),
             "every VM-owned initial Value/payload word is emitted into the fit candidate"
         );
     }
@@ -761,34 +928,111 @@ fn assert_empty_native_bytes(
     }
 }
 
+fn own_optimized_exit(
+    event: &JitDebugEvent,
+    function_id: u32,
+) -> Option<(u32, ExitReason, ExitAction)> {
+    match event {
+        JitDebugEvent::Bail {
+            function_id: exited,
+            tier: JitDebugTier::Optimizing,
+            resume_pc,
+            exit_reason,
+            exit_action,
+            ..
+        } if *exited == function_id => Some((*resume_pc, *exit_reason, *exit_action)),
+        JitDebugEvent::EnteredGenerationDeopt {
+            callee_function_id,
+            callee_tier: JitDebugTier::Optimizing,
+            callee_resume_pc,
+            exit_reason,
+            exit_action,
+            ..
+        } if *callee_function_id == function_id => {
+            Some((*callee_resume_pc, *exit_reason, *exit_action))
+        }
+        _ => None,
+    }
+}
+
+fn assert_pre_arm_execution<'a>(
+    arm: &'a CollectionArm,
+    function_id: u32,
+    own: &[&JitArtifactBundle],
+) -> &'a otter_vm::JitCodeGenerationSnapshot {
+    assert!(!arm.report.truncated());
+    for event in arm.report.events() {
+        assert!(
+            own_optimized_exit(event, function_id).is_none()
+                && !matches!(event, JitDebugEvent::InlineDeoptFrame {
+                    function_id: source, ..
+                } if *source == function_id),
+            "own Graph execution must reach the late arm without leaving: {event:?}"
+        );
+    }
+    let mut active = arm.generations.iter().filter(|generation| {
+        generation.function_id == function_id
+            && generation.tier == NativeFrameKind::Optimizing
+            && generation.active_count > 0
+    });
+    let generation = active.next().expect("own Graph remains active at the arm");
+    assert!(active.next().is_none(), "one physical own Graph activation");
+    assert_eq!(generation.lifecycle, CodeLifetimeState::Installed);
+    assert!(generation.linked);
+    let bundle = own
+        .iter()
+        .find(|bundle| bundle.manifest().code_object_id() == generation.code_object_id)
+        .expect("the active OSR generation has its exact emitted artifact");
+    assert_eq!(
+        generation.call_entry_offset.map(u64::from),
+        json(bundle, JitArtifactFileName::CodeMap)["callEntryOffset"].as_u64(),
+    );
+    generation
+}
+
 fn probe(extra_realm: bool) {
-    let stress = std::env::var("OTTER_GC_STRESS").is_ok_and(|value| value.trim() != "0");
-    let collecting_calls = if stress { 512 } else { 24_576 };
+    let collecting_calls = COLLECTING_CALLS;
     let source = setup(collecting_calls);
     let expected = format!("[[32768,32768],32768,{}]", collecting_calls * 16);
+    let oracle_invocations = Arc::new(AtomicUsize::new(0));
+    let oracle_arm = Arc::new(Mutex::new(None));
     let mut oracle = Runtime::builder()
         .jit_selection(JitSelection::InterpreterOnly)
+        .extension_installer(collection_installer(
+            false,
+            oracle_invocations.clone(),
+            oracle_arm.clone(),
+        ))
         .build()
         .unwrap();
     let oracle_realm = extra_realm.then(|| oracle.create_realm().unwrap());
     run(&mut oracle, oracle_realm, &source, MODULE);
+    assert_eq!(oracle_invocations.load(Ordering::Relaxed), 0);
     let expected_actual = run(&mut oracle, oracle_realm, PROBE, "native-empty-probe.js")
         .completion_string()
         .to_owned();
     assert_eq!(expected_actual, expected);
+    assert_eq!(oracle_invocations.load(Ordering::Relaxed), 1);
+    assert!(oracle_arm.lock().unwrap().is_none());
 
+    let invocations = Arc::new(AtomicUsize::new(0));
+    let arm = Arc::new(Mutex::new(None));
     let mut runtime = Runtime::builder()
         .jit_selection(JitSelection::ProductionTiered)
         .jit_debug(JitDebugRequest::artifacts().with_events(true))
+        .extension_installer(collection_installer(true, invocations.clone(), arm.clone()))
         .build()
         .unwrap();
     let realm = extra_realm.then(|| runtime.create_realm().unwrap());
     run(&mut runtime, realm, &source, MODULE);
+    assert_eq!(invocations.load(Ordering::Relaxed), 0);
     let before = runtime.execution_stats();
     let result = run(&mut runtime, realm, PROBE, "native-empty-probe.js");
     let after = runtime.execution_stats();
-    preserve_probe(&result, "empty", extra_realm);
+    let arm = arm.lock().unwrap().take().expect("the late native arm");
+    preserve_probe(&result, &arm.report, "empty", extra_realm);
     assert_eq!(result.completion_string(), expected_actual);
+    assert_eq!(invocations.load(Ordering::Relaxed), 1);
     assert!(after.jit_optimized_osr_entries > before.jit_optimized_osr_entries);
     assert!(after.gc_minor_cycles > before.gc_minor_cycles);
     assert!(after.gc_minor_slot_updates - before.gc_minor_slot_updates >= 2);
@@ -817,30 +1061,61 @@ fn probe(extra_realm: bool) {
         .map(|bundle| assert_native_empty_artifact(bundle, extra_realm))
         .max()
         .unwrap();
+    let active = assert_pre_arm_execution(&arm, function_id, &own);
+    assert!(after.jit_optimized_deopts >= arm.optimized_deopts);
+    let active_bundle = own
+        .iter()
+        .find(|bundle| bundle.manifest().code_object_id() == active.code_object_id)
+        .unwrap();
+    let active_map = json(active_bundle, JitArtifactFileName::CodeMap);
+    let groups: Vec<_> = active_map["regions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|region| {
+            region["kind"] == "instruction"
+                && region["functionId"].as_u64() == Some(u64::from(function_id))
+                && region["operation"]
+                    .as_str()
+                    .is_some_and(|op| op.contains(" AllocationGroup("))
+        })
+        .collect();
+    assert!(groups.len() <= 1);
+    let group_pc = groups
+        .first()
+        .map(|group| group["logicalPc"].as_u64().unwrap() as u32);
     let report = result.jit_debug_report().expect("native execution events");
     assert!(!report.truncated());
     for event in report.events() {
-        let exit = match event {
-            JitDebugEvent::Bail {
-                function_id: exited,
-                tier: JitDebugTier::Optimizing,
-                resume_pc,
-                exit_reason,
-                ..
-            } if *exited == function_id => Some((*resume_pc, *exit_reason)),
-            JitDebugEvent::EnteredGenerationDeopt {
-                callee_function_id,
-                callee_tier: JitDebugTier::Optimizing,
-                callee_resume_pc,
-                exit_reason,
-                ..
-            } if *callee_function_id == function_id => Some((*callee_resume_pc, *exit_reason)),
-            _ => None,
-        };
-        if let Some((pc, reason)) = exit {
+        if let Some((pc, reason, action)) = own_optimized_exit(event, function_id) {
+            if reason == ExitReason::AllocationMiss {
+                assert!(!extra_realm, "only a default-realm group can refuse");
+                assert_eq!(Some(pc), group_pc, "exact first member recovery: {event:?}");
+                assert_eq!(action, ExitAction::Resume, "{event:?}");
+                assert!(after.jit_optimized_deopts > arm.optimized_deopts);
+                let generations = runtime.jit_code_generation_snapshot();
+                let retained = generations
+                    .iter()
+                    .find(|generation| generation.code_object_id == active.code_object_id)
+                    .expect("the same generation remains retained after the policy miss");
+                assert_eq!(retained.lifecycle, CodeLifetimeState::Installed);
+                assert!(retained.linked);
+                assert_eq!(retained.function_id, function_id);
+                assert_eq!(retained.tier, NativeFrameKind::Optimizing);
+                assert_eq!(retained.current_entry, active.current_entry);
+                assert_eq!(retained.call_entry_offset, active.call_entry_offset);
+                assert_eq!(retained.dependencies, active.dependencies);
+                assert!(
+                    matches!(event, JitDebugEvent::Bail {
+                        op_debug: Some(op), ..
+                    } if op == "NewObject"),
+                    "the first original source allocation: {event:?}"
+                );
+                continue;
+            }
             assert!(
                 pc > last_loop_pc,
-                "own Graph loop left before collecting phase: {event:?}"
+                "only the return epilogue may otherwise leave own Graph: {event:?}"
             );
             assert_eq!(reason, ExitReason::InsufficientFeedback, "{event:?}");
         }
@@ -877,7 +1152,8 @@ fn nonempty_setup(collecting_calls: usize) -> String {
         "const input = {{tag: 7}};\nconst sink = new Array(16);\n\
          let calls = 0, allocations = 0;\nconst allocationGate = {};\n\
          const target = {{ [Symbol.hasInstance](value) {{\n\
-         calls++;\nif (calls > allocationGate) {{\n",
+         calls++;\nif (calls === allocationGate + 1) literalCollect();\n\
+         if (calls > allocationGate) {{\n",
         ITERATIONS - collecting_calls,
     );
     for index in 0..16 {
@@ -956,7 +1232,7 @@ fn assert_element_bases_refresh_around_instanceof(regions: &[Json], nodes: &BTre
             .expect("own boxed/packed literal array");
         let bases: Vec<_> = nodes
             .iter()
-            .filter(|(_, body)| body.starts_with("LoadElementsBase("))
+            .filter(|(_, body)| body.starts_with("LoadElementsBase {"))
             .filter(|(_, body)| ir_inputs(body) == [owner])
             .map(|(&id, _)| id)
             .collect();
@@ -1049,14 +1325,6 @@ fn assert_native_nonempty_artifact(bundle: &JitArtifactBundle, extra_realm: bool
     let relocations = json(bundle, JitArtifactFileName::Relocations);
     let relocations = relocations["relocations"].as_array().unwrap();
     let deopt = json(bundle, JitArtifactFileName::Deopt);
-    let points = json(bundle, JitArtifactFileName::Safepoints);
-    let roots = points["records"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|point| point["id"].as_u64() == Some(u64::from(u32::MAX - 1)))
-        .expect("canonical initialized body roots");
-    let roots = roots["taggedLocations"].as_array().unwrap();
     let code = bundle.file(JitArtifactFileName::Code).unwrap().contents();
     let mut counts = Vec::new();
     for region in literals {
@@ -1074,6 +1342,7 @@ fn assert_native_nonempty_artifact(bundle: &JitArtifactBundle, extra_realm: bool
         } else {
             STUB_JIT_NEW_ARRAY
         };
+        let roots = emitted_helper_roots(bundle, region, stub);
         assert!(
             relocations.iter().any(|row| {
                 row["target"]["id"].as_u64() == Some(u64::from(stub.id))
@@ -1106,7 +1375,7 @@ fn assert_native_nonempty_artifact(bundle: &JitArtifactBundle, extra_realm: bool
             frames[0]["functionId"].as_u64(),
             Some(u64::from(bundle.manifest().function_id()))
         );
-        let slots = frames[0]["slots"].as_array().unwrap();
+        let frame = &frames[0];
         let eager = body.split_once(" eager=").unwrap().1;
         let mut dynamic_inputs = 0;
         for input in inputs {
@@ -1135,14 +1404,12 @@ fn assert_native_nonempty_artifact(bundle: &JitArtifactBundle, extra_realm: bool
                 );
             }
             for register in registers {
-                let slot = &slots[register];
+                let slot = deopt_register_slot(frame, register);
                 assert_eq!(slot["representation"], "tagged", "bulk input v{input}");
                 assert_eq!(slot["locationKind"], "stackSlot", "bulk input v{input}");
                 let home: u32 = slot["locationValue"].as_str().unwrap().parse().unwrap();
                 assert!(home.is_multiple_of(8));
-                let root = &roots[home as usize / 8];
-                assert_eq!(root["kind"], "spillSlot");
-                assert_eq!(root["index"].as_u64(), Some(u64::from(home / 8)));
+                assert!(roots.contains(&(home / 8)), "bulk input v{input}");
             }
         }
         if object || !extra_realm {
@@ -1151,8 +1418,7 @@ fn assert_native_nonempty_artifact(bundle: &JitArtifactBundle, extra_realm: bool
             // but every dynamic native read belongs to the initialized roots.
             assert!(operand_homes.len() >= dynamic_inputs);
             for home in operand_homes {
-                assert_eq!(roots[home]["kind"], "spillSlot");
-                assert_eq!(roots[home]["index"].as_u64(), Some(home as u64));
+                assert!(roots.contains(&u32::try_from(home).unwrap()));
             }
         }
         if !object && !extra_realm {
@@ -1251,19 +1517,26 @@ fn native_literal_operand_homes(code: &[u8], start: usize, end: usize) -> Vec<us
 }
 
 fn nonempty_probe(extra_realm: bool) {
-    let stress = std::env::var("OTTER_GC_STRESS").is_ok_and(|value| value.trim() != "0");
-    let collecting_calls = if stress { 512 } else { 24_576 };
+    let collecting_calls = COLLECTING_CALLS;
     let source = nonempty_setup(collecting_calls);
     let expected = format!(
         "[[32768,32768,32768,32768],32768,{}]",
         collecting_calls * 16
     );
+    let oracle_invocations = Arc::new(AtomicUsize::new(0));
+    let oracle_arm = Arc::new(Mutex::new(None));
     let mut oracle = Runtime::builder()
         .jit_selection(JitSelection::InterpreterOnly)
+        .extension_installer(collection_installer(
+            false,
+            oracle_invocations.clone(),
+            oracle_arm.clone(),
+        ))
         .build()
         .unwrap();
     let oracle_realm = extra_realm.then(|| oracle.create_realm().unwrap());
     run(&mut oracle, oracle_realm, &source, NONEMPTY_MODULE);
+    assert_eq!(oracle_invocations.load(Ordering::Relaxed), 0);
     let oracle_result = run(
         &mut oracle,
         oracle_realm,
@@ -1271,13 +1544,19 @@ fn nonempty_probe(extra_realm: bool) {
         "native-nonempty-probe.js",
     );
     assert_eq!(oracle_result.completion_string(), expected);
+    assert_eq!(oracle_invocations.load(Ordering::Relaxed), 1);
+    assert!(oracle_arm.lock().unwrap().is_none());
+    let invocations = Arc::new(AtomicUsize::new(0));
+    let arm = Arc::new(Mutex::new(None));
     let mut runtime = Runtime::builder()
         .jit_selection(JitSelection::ProductionTiered)
         .jit_debug(JitDebugRequest::artifacts().with_events(true))
+        .extension_installer(collection_installer(true, invocations.clone(), arm.clone()))
         .build()
         .unwrap();
     let realm = extra_realm.then(|| runtime.create_realm().unwrap());
     run(&mut runtime, realm, &source, NONEMPTY_MODULE);
+    assert_eq!(invocations.load(Ordering::Relaxed), 0);
     let before = runtime.execution_stats();
     let result = run(
         &mut runtime,
@@ -1286,11 +1565,13 @@ fn nonempty_probe(extra_realm: bool) {
         "native-nonempty-probe.js",
     );
     let after = runtime.execution_stats();
-    preserve_probe(&result, "nonempty", extra_realm);
+    let arm = arm.lock().unwrap().take().expect("the late native arm");
+    preserve_probe(&result, &arm.report, "nonempty", extra_realm);
     assert_eq!(
         result.completion_string(),
         oracle_result.completion_string()
     );
+    assert_eq!(invocations.load(Ordering::Relaxed), 1);
     assert!(after.jit_optimized_osr_entries > before.jit_optimized_osr_entries);
     assert!(after.gc_minor_cycles > before.gc_minor_cycles);
     assert!(after.gc_minor_slot_updates - before.gc_minor_slot_updates >= 2);
@@ -1318,27 +1599,12 @@ fn nonempty_probe(extra_realm: bool) {
         .map(|bundle| assert_native_nonempty_artifact(bundle, extra_realm))
         .max()
         .unwrap();
+    assert_pre_arm_execution(&arm, function_id, &own);
+    assert!(after.jit_optimized_deopts >= arm.optimized_deopts);
     let report = result.jit_debug_report().unwrap();
     assert!(!report.truncated());
     for event in report.events() {
-        let exit = match event {
-            JitDebugEvent::Bail {
-                function_id: exited,
-                tier: JitDebugTier::Optimizing,
-                resume_pc,
-                exit_reason,
-                ..
-            } if *exited == function_id => Some((*resume_pc, *exit_reason)),
-            JitDebugEvent::EnteredGenerationDeopt {
-                callee_function_id,
-                callee_tier: JitDebugTier::Optimizing,
-                callee_resume_pc,
-                exit_reason,
-                ..
-            } if *callee_function_id == function_id => Some((*callee_resume_pc, *exit_reason)),
-            _ => None,
-        };
-        if let Some((pc, reason)) = exit {
+        if let Some((pc, reason, _action)) = own_optimized_exit(event, function_id) {
             assert!(
                 pc > last_loop_pc,
                 "own literal Graph leaves before collecting phase: {event:?}"

@@ -8,6 +8,7 @@
 //! # Contents
 //! - `CallMethodValue` typed execution-operand decoding.
 //! - Callback-driven Array and TypedArray prototype methods.
+//! - Canonical callable property and accessor lookup before method invocation.
 //!
 //! # Invariants
 //! - Stack-modifying callback paths run before the dense in-frame match.
@@ -18,6 +19,8 @@
 //! - Generator resumption keeps the completed-body disposition through
 //!   direct method dispatch; local decode/preparation errors still throw.
 //! - Ordinary method lookup still funnels into `Interpreter::invoke`.
+//! - Native and bound callable receivers use ordinary `[[Get]]`; accessors
+//!   receive the original receiver, and their returned callable is used once.
 //! - Composite root scopes forward pre-collection observation flushing before
 //!   any receiver, argument or interpreter root can move.
 //!
@@ -37,11 +40,10 @@ use crate::{
     CodeBlock, CodeBlockInstruction, ExecutionContext, GeneratorResumeKind, Interpreter, JsString,
     NumberValue, PendingBindFunction, PendingBindStage, Value, VmError, VmGetOutcome,
     VmPropertyKey, bigint, boolean::prototype as boolean_prototype, bootstrap_collections,
-    collections_prototype, date, descriptor_value, function_metadata,
-    native_function::VmIntrinsicFunction, number, promise_dispatch,
-    property_atom::AtomizedPropertyKey, property_ic::PropertyIcKind, read_register,
-    regexp_prototype, require_callable, string::prototype as string_prototype, symbol_prototype,
-    weak_refs, write_register,
+    collections_prototype, date, function_metadata, native_function::VmIntrinsicFunction, number,
+    promise_dispatch, property_atom::AtomizedPropertyKey, property_ic::PropertyIcKind,
+    read_register, regexp_prototype, require_callable, string::prototype as string_prototype,
+    symbol_prototype, weak_refs, write_register,
 };
 
 /// Root set for the fast `Array.prototype.*` dispatch path: the live
@@ -113,6 +115,8 @@ fn prototype_override_is(override_value: Option<Value>, expected: crate::object:
     }
 }
 
+#[cfg(test)]
+mod callable_get_tests;
 mod ic;
 mod jit_snapshot;
 pub(crate) use ic::{
@@ -1292,6 +1296,8 @@ impl Interpreter {
         if let Some(method) =
             self.get_method_value_for_call(context, stack, recv_value, method_key)?
         {
+            let recv_value =
+                *read_register(&stack[top_idx], recv_reg).map_err(CommittedValueError::Fatal)?;
             if !self.is_callable_runtime(&method) {
                 return Err(CommittedValueError::JavaScript(VmError::NotCallable));
             }
@@ -1431,7 +1437,10 @@ impl Interpreter {
         if !crate::array::is_ordinary_dense(arr, &self.gc_heap) {
             return None;
         }
-        let proto = self.realm_intrinsics.array_prototype()?;
+        if self.active_realm_id != 0 {
+            return None;
+        }
+        let proto = self.default_array_prototype()?;
         let (hit, lookup) = crate::object::lookup_own_slot(proto, &self.gc_heap, name);
         let method = match lookup {
             crate::object::PropertyLookup::Data { value, .. } => value,
@@ -1489,7 +1498,10 @@ impl Interpreter {
         if !crate::array::is_ordinary_dense(arr, &self.gc_heap) {
             return None;
         }
-        let proto = self.realm_intrinsics.array_prototype()?;
+        if self.active_realm_id != 0 {
+            return None;
+        }
+        let proto = self.default_array_prototype()?;
         if crate::object::shape_id(proto, &self.gc_heap) != ic.proto_shape {
             return None;
         }
@@ -1811,8 +1823,8 @@ impl Interpreter {
         recv_reg: u16,
         value_bits: u64,
     ) -> Result<(), CommittedValueError> {
-        let recv = *read_register(&stack[frame_index], recv_reg)
-            .map_err(CommittedValueError::Fatal)?;
+        let recv =
+            *read_register(&stack[frame_index], recv_reg).map_err(CommittedValueError::Fatal)?;
         let value = Value::from_bits(value_bits);
         let result = self.dispatch_array_builtin_rooted(
             stack,
@@ -1821,8 +1833,7 @@ impl Interpreter {
             recv,
             &[value],
         )?;
-        write_register(&mut stack[frame_index], dst, result)
-            .map_err(CommittedValueError::Fatal)?;
+        write_register(&mut stack[frame_index], dst, result).map_err(CommittedValueError::Fatal)?;
         Ok(())
     }
 
@@ -2095,12 +2106,12 @@ impl Interpreter {
             let receiver_root = interp.scoped_value(scope, recv_value);
 
             let name = method_key.name();
-            // A bound function is an exotic object whose ordinary `[[Get]]`
-            // resolves own metadata first and then walks `%Function.prototype%`
-            // (§10.4.1.3); `ordinary_get_value` owns that walk, so it routes with
-            // the property-bearing receivers below.
+            // Ordinary `[[Get]]` owns native and bound callable metadata,
+            // accessors, and their real prototype chain as it does for other
+            // property-bearing receivers.
             let is_property_bearing = recv_value.is_object()
                 || recv_value.as_bound_function().is_some()
+                || recv_value.is_native_function()
                 || recv_value.is_proxy()
                 || recv_value.is_array()
                 || recv_value.is_regexp()
@@ -2204,54 +2215,6 @@ impl Interpreter {
                     Some(recv_value),
                     name,
                 )?));
-            }
-            if let Some(native) = recv_value.as_native_function() {
-                // Native callable receiver — own properties first, then the
-                // §10.1.8 OrdinaryGet walk up `%Function.prototype%` /
-                // `%Object.prototype%` so a user-installed method (e.g.
-                // `Function.prototype.slice = String.prototype.slice`)
-                // resolves for calls exactly as it does for property reads.
-                let value = match native
-                    .own_property_descriptor(&mut interp.gc_heap, name)
-                    .map_err(|error| CommittedValueError::JavaScript(error.into()))?
-                    .map(|desc| descriptor_value(&desc))
-                {
-                    Some(value) => value,
-                    // §10.1.8 — the walk continues at the callable's
-                    // [[Prototype]]: an explicit one (per-kind TypedArray
-                    // ctor → %TypedArray%, or null), else
-                    // %Function.prototype%.
-                    None => {
-                        let parent = interp
-                            .get_prototype_for_op(&recv_value)
-                            .map_err(CommittedValueError::JavaScript)?;
-                        if parent.is_null() {
-                            Value::undefined()
-                        } else {
-                            let key = VmPropertyKey::String(name);
-                            match interp.ordinary_get_value(
-                                stack,
-                                Some(context),
-                                parent,
-                                recv_value,
-                                &key,
-                                0,
-                            )? {
-                                VmGetOutcome::Value(value) => value,
-                                VmGetOutcome::InvokeGetter { getter } => interp
-                                    .run_callable_sync_rooted(
-                                        stack,
-                                        Some(context),
-                                        &getter,
-                                        interp.escape_scoped(receiver_root),
-                                        SmallVec::new(),
-                                    )
-                                    .map_err(CommittedValueError::completed_call)?,
-                            }
-                        }
-                    }
-                };
-                return Ok(Some(value));
             }
             if recv_value.is_boolean()
                 || recv_value.is_number()
@@ -2491,8 +2454,7 @@ impl Interpreter {
         }
         let len = t.length(&self.gc_heap);
         let this_arg = args.get(1).cloned().unwrap_or(Value::undefined());
-        let callee = require_callable(args.first())
-            .map_err(CommittedValueError::JavaScript)?;
+        let callee = require_callable(args.first()).map_err(CommittedValueError::JavaScript)?;
 
         // Every value reused after a callback lives in the collector-traced
         // iteration-anchor range. Callback execution may move the receiver,
@@ -3384,11 +3346,8 @@ impl Interpreter {
                     .map_err(|_| VmError::TypeMismatch)
                     .map_err(CommittedValueError::JavaScript)?;
                 let frame = &mut stack[top_idx];
-                write_register(frame, dst, Value::string(s))
-                    .map_err(CommittedValueError::Fatal)?;
-                frame
-                    .advance_pc()
-                    .map_err(CommittedValueError::Fatal)?;
+                write_register(frame, dst, Value::string(s)).map_err(CommittedValueError::Fatal)?;
+                frame.advance_pc().map_err(CommittedValueError::Fatal)?;
                 Ok(())
             }
             _ => Err(CommittedValueError::JavaScript(

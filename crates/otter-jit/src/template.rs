@@ -18,6 +18,7 @@
 //! - [`arm64`] — the AArch64 dynasm backend (first machine target).
 //! - [`x86_64`] — the x86-64 dynasm backend with platform C calls.
 //! - [`operation`] — one exit carrier for reusable operations in both tiers.
+//! - Identity-proven intrinsic calls use the shared native operation admission.
 //! - [`code`] — finalized [`TemplateCode`] objects and VM entry publication.
 //! - [`compile`] — the whole-function compile entry point.
 //!
@@ -30,6 +31,8 @@
 //! - The VM is reached only through `otter_vm::native_abi` records and the
 //!   shared runtime-stub inventory; no template-private frame or status shape
 //!   exists.
+//! - Intrinsic operations guard an already evaluated callable's held identity;
+//!   a miss resumes the ordinary call with its evaluated operands intact.
 //!
 //! # See also
 //! - [`crate::entry`] — the shared entry ABI, typed lowering, and runtime
@@ -72,6 +75,7 @@ pub(crate) fn operation_is_js_call(op: TemplateOp) -> bool {
             | TemplateOp::MethodCall { .. }
             | TemplateOp::CallForwardArguments { .. }
             | TemplateOp::SpreadCallOp { .. }
+            | TemplateOp::IntrinsicCall { .. }
     )
 }
 

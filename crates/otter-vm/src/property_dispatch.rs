@@ -473,8 +473,8 @@ impl Interpreter {
         idx_reg: u16,
         strict: bool,
     ) -> Result<(), CommittedValueError> {
-        let mut idx = *read_register(&stack[top_idx], idx_reg)
-            .map_err(CommittedValueError::Fatal)?;
+        let mut idx =
+            *read_register(&stack[top_idx], idx_reg).map_err(CommittedValueError::Fatal)?;
         if idx.as_symbol(&self.gc_heap).is_none()
             && idx.as_string(&self.gc_heap).is_none()
             && idx.as_number().is_none()
@@ -495,8 +495,8 @@ impl Interpreter {
                 }
             };
         }
-        let receiver = *read_register(&stack[top_idx], obj_reg)
-            .map_err(CommittedValueError::Fatal)?;
+        let receiver =
+            *read_register(&stack[top_idx], obj_reg).map_err(CommittedValueError::Fatal)?;
         let frame = &mut stack[top_idx];
         let removed = if let Some(obj) = receiver.as_object() {
             // §10.4.6.10 [[Delete]] — a Module Namespace Exotic Object
@@ -741,11 +741,8 @@ impl Interpreter {
                 self.err_type(("Cannot delete property".to_string()).into()),
             ));
         }
-        write_register(frame, dst, Value::boolean(removed))
-            .map_err(CommittedValueError::Fatal)?;
-        frame
-            .advance_pc()
-            .map_err(CommittedValueError::Fatal)?;
+        write_register(frame, dst, Value::boolean(removed)).map_err(CommittedValueError::Fatal)?;
+        frame.advance_pc().map_err(CommittedValueError::Fatal)?;
         Ok(())
     }
 
@@ -1183,14 +1180,13 @@ impl Interpreter {
         }
     }
 
-    /// A collection receiver's per-instance `[[Prototype]]` override
-    /// (`class Q extends Map` stores `Q.prototype` here at construct),
-    /// or `None` for every other shape. Property loads must consult
-    /// this before the canonical constructor-name walk, or subclass
-    /// instance methods become invisible.
+    /// An Array's actual prototype, or another collection's explicit override.
+    /// Bare Arrays resolve through the retained default realm; subclass and
+    /// foreign-realm collections carry their creation-side override. Other
+    /// shapes continue through the canonical constructor-name lookup.
     pub(crate) fn collection_prototype_override_value(&self, receiver: &Value) -> Option<Value> {
         if let Some(arr) = receiver.as_array() {
-            crate::array::prototype_override(arr, &self.gc_heap)
+            Some(self.array_prototype_value(arr))
         } else if let Some(map) = receiver.as_map() {
             crate::collections::map_prototype_override(map, &self.gc_heap)
         } else if let Some(set) = receiver.as_set() {

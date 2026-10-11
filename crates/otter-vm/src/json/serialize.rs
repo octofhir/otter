@@ -142,7 +142,7 @@ impl Interpreter {
                 if replacer.is_callable() {
                     state.replacer_root = Some(self.json_root_push(replacer));
                 } else if self
-                    .json_is_array(&replacer)
+                    .is_array(&replacer)
                     .map_err(CommittedValueError::JavaScript)?
                 {
                     state.property_list =
@@ -246,7 +246,7 @@ impl Interpreter {
 
             if self.json_root_get(value_root).is_object_type() {
                 if self
-                    .json_is_array(&self.json_root_get(value_root))
+                    .is_array(&self.json_root_get(value_root))
                     .map_err(CommittedValueError::JavaScript)?
                 {
                     let len = self.json_length(stack, context, &self.json_root_get(value_root))?;
@@ -608,7 +608,7 @@ impl Interpreter {
         // step 11 — Object that is not callable.
         if value.is_object_type() && !value.is_callable() {
             if self
-                .json_is_array(&value)
+                .is_array(&value)
                 .map_err(CommittedValueError::JavaScript)?
             {
                 self.serialize_json_array_into(stack, context, state, value, out)?;
@@ -854,30 +854,6 @@ impl Interpreter {
             proxy.as_header_ptr() as *const ()
         } else {
             core::ptr::null()
-        }
-    }
-
-    /// §7.2.2 IsArray, resolving proxy `[[ProxyTarget]]` chains. A
-    /// revoked proxy raises a `TypeError`.
-    fn json_is_array(&self, value: &Value) -> Result<bool, VmError> {
-        let mut current = *value;
-        let mut hops = 0usize;
-        loop {
-            if hops >= object::PROTO_CHAIN_HARD_CAP {
-                return Ok(false);
-            }
-            hops += 1;
-            if let Some(proxy) = current.as_proxy() {
-                if proxy.is_revoked(self.gc_heap()) {
-                    return Err(self.err_type(
-                        ("Cannot perform IsArray on a proxy that has been revoked".to_string())
-                            .into(),
-                    ));
-                }
-                current = proxy.target(self.gc_heap());
-                continue;
-            }
-            return Ok(current.is_array());
         }
     }
 

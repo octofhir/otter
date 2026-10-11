@@ -10,9 +10,8 @@
 //! cross-thread `Sender<Microtask>` surface.
 //!
 //! The hot path is a plain `VecDeque<Microtask>` mutated through
-//! `&mut self` from inside the dispatch loop. No `RefCell`, no
-//! `UnsafeCell`, no atomics — just a field write. This is the path
-//! `Op::QueueMicrotask` takes 100% of the time today.
+//! `&mut self` on the active runtime turn. Native callback enqueue and
+//! promise reaction publication share this queue and its traced ownership.
 //!
 //! # Drain semantics
 //!
@@ -187,8 +186,8 @@ pub struct MicrotaskCapability {
 /// `UnsafeCell`.
 #[derive(Debug, Default)]
 pub struct MicrotaskQueue {
-    /// Sync side: pushed by `Op::QueueMicrotask` and host-side
-    /// `enqueue` calls running on the interpreter thread.
+    /// Pending jobs admitted by native calls and reaction publication on the
+    /// active interpreter turn.
     pending: VecDeque<Microtask>,
     /// Tasks of the generation currently being drained. Owned by the
     /// queue — not handed to the driver by value — so tasks waiting

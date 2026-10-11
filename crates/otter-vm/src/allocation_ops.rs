@@ -723,30 +723,6 @@ impl Interpreter {
             .map_err(VmError::from)
     }
 
-    pub(crate) fn alloc_stack_rooted_array(
-        &mut self,
-        stack: &ActivationStack,
-        value_roots: &[&Value],
-        slice_roots: &[&[Value]],
-    ) -> Result<crate::array::JsArray, VmError> {
-        let roots = self.collect_allocation_roots(stack);
-        let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
-            for &slot in &roots {
-                visitor(slot);
-            }
-            for value in value_roots {
-                value.trace_value_slots(visitor);
-            }
-            for slice in slice_roots {
-                for value in *slice {
-                    value.trace_value_slots(visitor);
-                }
-            }
-        };
-        crate::array::alloc_array_with_roots(&mut self.gc_heap, &mut external_visit)
-            .map_err(VmError::from)
-    }
-
     pub(crate) fn alloc_stack_rooted_array_from_values<I>(
         &mut self,
         stack: &ActivationStack,

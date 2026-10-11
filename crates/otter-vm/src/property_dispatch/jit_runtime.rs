@@ -240,7 +240,9 @@ impl Interpreter {
                 )?;
                 return Ok(());
             };
-            if !object::supports_fast_property_ic(obj, &self.gc_heap) {
+            if self.is_array_prototype_object(obj)
+                || !object::supports_fast_property_ic(obj, &self.gc_heap)
+            {
                 path = Path::UnsupportedReceiver;
                 self.store_property_value(
                     context,
@@ -510,7 +512,9 @@ impl Interpreter {
                 interp.to_property_key_sync(stack, context, interp.escape_scoped(key_value))?;
             let target = interp.escape_scoped(target);
             let value = interp.escape_scoped(value);
-            if let Some(mut obj) = target.as_object() {
+            if let Some(mut obj) = target.as_object()
+                && !interp.is_array_prototype_object(obj)
+            {
                 match &key {
                     VmPropertyKey::Symbol(sym) => {
                         let descriptor = object::PartialPropertyDescriptor::from_full(
@@ -748,15 +752,15 @@ impl Interpreter {
                 .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
         }
         let wrapper_name = if receiver.is_boolean() {
-            Some("Boolean")
+            Some(crate::realm_intrinsics::Intrinsic::BooleanPrototype)
         } else if receiver.is_number() {
-            Some("Number")
+            Some(crate::realm_intrinsics::Intrinsic::NumberPrototype)
         } else if receiver.is_string() {
-            Some("String")
+            Some(crate::realm_intrinsics::Intrinsic::StringPrototype)
         } else if receiver.is_symbol() {
-            Some("Symbol")
+            Some(crate::realm_intrinsics::Intrinsic::SymbolPrototype)
         } else if receiver.is_big_int() {
-            Some("BigInt")
+            Some(crate::realm_intrinsics::Intrinsic::BigIntPrototype)
         } else {
             None
         };

@@ -5,7 +5,6 @@
 //! constant.
 //!
 //! # Contents
-//! - `Math.<constant>` loads.
 //! - `Symbol.<static>` loads.
 //! - `Temporal.<static>` loads.
 //!
@@ -17,28 +16,11 @@
 //! - [`crate::execution_context`]
 
 use crate::{
-    ExecutionContext, Frame, Interpreter, VmError, math, symbol_dispatch, symbol_to_vm_error,
+    ExecutionContext, Frame, Interpreter, VmError, symbol_dispatch, symbol_to_vm_error,
     write_register,
 };
 
 impl Interpreter {
-    pub(crate) fn run_math_load_reg(
-        &self,
-        context: &ExecutionContext,
-        frame: &mut Frame,
-        dst: u16,
-        name_idx: u32,
-    ) -> Result<(), VmError> {
-        let name = context
-            .string_constant_str(name_idx)
-            .ok_or(VmError::InvalidOperand)?;
-        let value = math::load_constant(name)
-            .ok_or_else(|| self.err_unknown_intrinsic(format!("Math.{name}").into()))?;
-        write_register(frame, dst, value)?;
-        frame.advance_pc()?;
-        Ok(())
-    }
-
     pub(crate) fn run_symbol_load_reg(
         &mut self,
         context: &ExecutionContext,

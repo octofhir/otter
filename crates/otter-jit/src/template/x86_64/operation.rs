@@ -73,6 +73,7 @@ pub(crate) fn emit_operation(
     );
     let OperationExits {
         type_mismatch_exit: type_mismatch,
+        identity_guard_exit: _,
         allocation_miss_exit: allocation_miss,
         unsupported_exit: unsupported,
         runtime_transition_exit: runtime_transition,
@@ -604,24 +605,6 @@ pub(crate) fn emit_operation(
             threw,
             fatal,
         ),
-        TemplateOp::VariadicOp {
-            opcode,
-            prefix,
-            argc,
-            packed_args,
-        } => emit_opcode_transition(
-            ops,
-            relocations,
-            transitions,
-            abi::STUB_JIT_VARIADIC_OP,
-            opcode,
-            u64::from(prefix),
-            u64::from(argc),
-            packed_args,
-            runtime_transition,
-            threw,
-            fatal,
-        ),
         TemplateOp::StaticCallOp {
             opcode,
             packed_head,
@@ -673,27 +656,14 @@ pub(crate) fn emit_operation(
             threw,
             fatal,
         ),
-        TemplateOp::LoadBuiltinError { dst, constant } => emit_constant_transition(
+        TemplateOp::IntrinsicCall { .. } => intrinsic_calls::emit_intrinsic_call(
             ops,
             relocations,
             transitions,
-            abi::STUB_JIT_LOAD_BUILTIN_ERROR,
-            dst,
-            constant,
-            threw,
-            fatal,
-        ),
-        TemplateOp::ArrayConstruct {
-            dst,
-            length,
-            safepoint,
-        } => emit_array_construct_alloc_call(
-            ops,
-            relocations,
-            dst,
-            length,
-            alloc_roots.packet(safepoint),
-            allocation_miss,
+            view,
+            instruction,
+            alloc_roots.packet(call_safepoint),
+            exits,
         )?,
         TemplateOp::ClassValueOp {
             opcode,

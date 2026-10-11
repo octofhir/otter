@@ -9,6 +9,12 @@
 //!   is re-read from its rooted slot after any such call.
 //! - Proxy key materialization and trap reentry keep target, value, receiver,
 //!   and symbol keys in one handle scope until invariant checks complete.
+//! - Both Array bodies and branded Array prototypes use the receiver phase
+//!   of OrdinarySet, so foreign receivers never mutate the target's length.
+//!
+//! # See also
+//! - `super::descriptors` owns receiver descriptor definition.
+//! - `super::array_define` owns Array length and index publication.
 
 use crate::native_abi::CommittedValueError;
 use crate::rooting::RootScopeExt;
@@ -533,12 +539,16 @@ impl Interpreter {
                 }
             });
         }
-        if let Some(arr) = target.as_array() {
+        if target.as_array().is_some()
+            || target
+                .as_object()
+                .is_some_and(|object| self.is_array_prototype_object(object))
+        {
             // §10.4.2 arrays inherit OrdinarySet but their receiver
             // phase must route through Array [[DefineOwnProperty]].
             // A raw element/named store would skip extensibility,
             // length, accessor, prototype, and Proxy receiver rules.
-            let target_value = Value::array(arr);
+            let target_value = target;
             let desc = self.ordinary_get_own_property_descriptor_value(
                 stack,
                 Some(context),

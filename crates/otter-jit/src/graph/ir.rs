@@ -574,9 +574,10 @@ pub(crate) enum Kind {
     /// `@@hasInstance` inline, every other case in the runtime.
     Instanceof,
     /// `input0.push(input1)` at the guarded method call at this byte PC,
-    /// whose callee is `%Array.prototype.push%`: an append into spare tagged
-    /// capacity of an Array whose dense prefix is its whole length inline,
-    /// every other Array state through the builtin in the runtime. Eager
+    /// whose callee is `%Array.prototype.push%`: an append to tagged or
+    /// absent storage of an Array whose dense prefix is its whole length
+    /// inline, growing full storage into a nursery slab, every other Array
+    /// state through the builtin in the runtime. Eager
     /// deopt unless the receiver is an Array that reads the builtin from its
     /// pinned prototype and no indexed accessor exists in the realm.
     ArrayPush(u32),
@@ -1097,7 +1098,13 @@ impl Kind {
             Self::ArrayPush(_) | Self::ArrayPop(_) => Constraints {
                 inputs: registers(input_count),
                 result: ResultPolicy::Register,
-                gp_temps: 3,
+                // An append that grows its storage carves the new slab with
+                // three more.
+                gp_temps: if matches!(self, Self::ArrayPush(_)) {
+                    6
+                } else {
+                    3
+                },
                 fp_temps: 0,
                 fixed_gp_clobbers: SmallVec::new(),
             },

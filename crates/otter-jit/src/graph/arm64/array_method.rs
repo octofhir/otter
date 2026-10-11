@@ -1,7 +1,8 @@
 //! Inline `Array.prototype.push` and `pop` at a guarded method call.
 //!
 //! # Contents
-//! - [`Codegen::emit_array_push`] appends into spare tagged capacity.
+//! - [`Codegen::emit_array_push`] appends to tagged storage, growing it when
+//!   full.
 //! - [`Codegen::emit_array_pop`] removes a present tagged last element.
 //!
 //! # Invariants
@@ -9,10 +10,13 @@
 //!   pinned `%Array.prototype%` before any effect; a failed proof, or for an
 //!   append an indexed accessor anywhere in the realm, leaves through the
 //!   eager deopt.
-//! - The inline paths cover an Array whose tagged dense prefix is its whole
-//!   length: an append within capacity and the removal of a present last
-//!   element. Every other state the proof admits completes in the builtin
-//!   through the committed object-protocol entry, which grows storage.
+//! - The inline paths cover an Array whose dense prefix is its whole length:
+//!   an append to tagged storage, which grows full or absent storage into a
+//!   nursery slab while no marking runs, and the removal of a present tagged
+//!   last element. Every other state the proof admits completes in the
+//!   builtin through the committed object-protocol entry.
+//! - Grown storage is young, so its copied words owe no barrier; the Array
+//!   takes the barrier for the slab it now holds.
 //! - The appended value takes the element write barrier before the lengths
 //!   publish it; the removed slot is cleared to `undefined`, which needs none.
 //! - The Array's dense length, its slab's length and its `length` move
@@ -24,22 +28,26 @@
 
 use super::{
     ARRAY_INDEX_PROTECTOR, Codegen, CommittedArgument, DeoptReason, DynamicLabel, IntrinsicMethod,
-    NUMBER_TAG, NodeId, THREAD_OFFSET, VALUE_HOLE, VALUE_UNDEFINED, abi,
+    NUMBER_TAG, NodeId, THREAD_OFFSET, VALUE_HOLE, VALUE_UNDEFINED,
+    VM_THREAD_MARKING_FLAG_CELL_OFFSET, abi,
 };
 use crate::Unsupported;
+use crate::allocation::LabRegisters;
+use crate::arm64::allocation::emit_grow_tagged_slab;
 use dynasmrt::{DynasmApi, DynasmLabelApi, dynasm};
 use otter_vm::ObjectProtocolValueOp;
 use otter_vm::jit::{JitArrayStorage, JitGuardedReceiver, JitMethodHolder};
 
 impl Codegen<'_> {
     /// `X(destination) = X(receiver).push(X(value))` at the guarded method
-    /// call `byte_pc`; `length`, `base` and `temp` are temporaries.
+    /// call `byte_pc`; `length`, `base` and `temp` are temporaries, and the
+    /// last three carve grown storage with them.
     pub(super) fn emit_array_push(
         &mut self,
         node: NodeId,
         byte_pc: u32,
         [receiver, value]: [u8; 2],
-        [length, base, temp]: [u8; 3],
+        [length, base, temp, buffer, end, scratch]: [u8; 6],
         destination: u8,
     ) -> Result<(), Unsupported> {
         let storage = JitArrayStorage::current();
@@ -53,13 +61,16 @@ impl Codegen<'_> {
             ; cbnz w16, =>exit
         );
         let runtime = self.ops.new_dynamic_label();
+        let grow = self.ops.new_dynamic_label();
         let done = self.ops.new_dynamic_label();
-        self.emit_whole_tagged_prefix(storage, receiver, length, runtime);
+        // Absent storage reads the empty kind, zero capacity and an empty
+        // prefix, so its first append grows it.
+        self.emit_whole_prefix(storage, receiver, length, true, runtime);
         dynasm!(self.ops
             ; .arch aarch64
             ; ldr w16, [X(receiver), storage.capacity_byte]
             ; cmp W(length), w16
-            ; b.hs =>runtime
+            ; b.hs =>grow
             ; ldr X(base), [X(receiver), storage.base_byte]
             ; str X(value), [X(base), X(length), lsl #3]
         );
@@ -70,8 +81,54 @@ impl Codegen<'_> {
             ; str w16, [X(receiver), storage.length_byte]
             ; stur w16, [X(base), storage.slab_length_from_base]
             ; str x16, [X(receiver), storage.logical_length_byte]
-            ; mov W(destination), w16
-            ; orr XSP(destination), X(destination), NUMBER_TAG
+            ; b =>done
+            ; =>grow
+            // The copied words would owe marking barriers.
+            ; ldr x17, [x20, THREAD_OFFSET]
+            ; ldr x17, [x17, VM_THREAD_MARKING_FLAG_CELL_OFFSET]
+            ; ldrb w17, [x17]
+            ; cbnz w17, =>runtime
+            // Double the capacity, and at least four words.
+            ; lsl W(base), w16, #1
+            ; mov w17, #4
+            ; cmp W(base), w17
+            ; csel W(base), W(base), w17, hs
+        );
+        let regs = LabRegisters {
+            buffer,
+            candidate: temp,
+            end,
+            scratch,
+            size: base,
+        };
+        emit_grow_tagged_slab(
+            &mut self.ops,
+            20,
+            storage,
+            [receiver, length],
+            regs,
+            runtime,
+        );
+        // The new storage is young and no marking runs, so its words owe no
+        // barrier; the Array owes one for the slab it now holds.
+        dynasm!(self.ops
+            ; .arch aarch64
+            ; str X(value), [X(base), X(length), lsl #3]
+            ; add w16, WSP(length), #1
+            ; stur w16, [X(base), storage.slab_length_from_base]
+            ; str W(temp), [X(receiver), storage.slab_byte]
+            ; str X(base), [X(receiver), storage.base_byte]
+            ; ldur w17, [X(base), storage.numeric.capacity_byte]
+            ; str w17, [X(receiver), storage.capacity_byte]
+            ; mov w17, u32::from(storage.tagged_kind)
+            ; strb w17, [X(receiver), storage.numeric.kind_byte]
+            ; str w16, [X(receiver), storage.length_byte]
+            ; str x16, [X(receiver), storage.logical_length_byte]
+        );
+        self.emit_write_barrier_keeping(node, receiver, temp, &[length]);
+        dynasm!(self.ops
+            ; .arch aarch64
+            ; add w16, WSP(length), #1
             ; b =>done
             ; =>runtime
         );
@@ -85,7 +142,15 @@ impl Codegen<'_> {
             ],
             Some(destination),
         )?;
-        dynasm!(self.ops ; .arch aarch64 ; =>done);
+        let committed = self.ops.new_dynamic_label();
+        dynasm!(self.ops
+            ; .arch aarch64
+            ; b =>committed
+            ; =>done
+            ; mov W(destination), w16
+            ; orr XSP(destination), X(destination), NUMBER_TAG
+            ; =>committed
+        );
         Ok(())
     }
 
@@ -105,7 +170,7 @@ impl Codegen<'_> {
         let runtime = self.ops.new_dynamic_label();
         let empty = self.ops.new_dynamic_label();
         let done = self.ops.new_dynamic_label();
-        self.emit_whole_tagged_prefix(storage, receiver, length, runtime);
+        self.emit_whole_prefix(storage, receiver, length, false, runtime);
         dynasm!(self.ops
             ; .arch aarch64
             ; cbz W(length), =>empty
@@ -176,20 +241,29 @@ impl Codegen<'_> {
     }
 
     /// Load the Array `X(receiver)`'s dense length into `W(length)` and
-    /// branch to `other` unless its storage is tagged and that dense prefix
-    /// is its whole `length`.
-    fn emit_whole_tagged_prefix(
+    /// branch to `other` unless its storage is tagged, or absent when
+    /// `absent` admits it, and that dense prefix is its whole `length`.
+    fn emit_whole_prefix(
         &mut self,
         storage: JitArrayStorage,
         receiver: u8,
         length: u8,
+        absent: bool,
         other: DynamicLabel,
     ) {
+        let tagged = self.ops.new_dynamic_label();
         dynasm!(self.ops
             ; .arch aarch64
             ; ldrb w16, [X(receiver), storage.numeric.kind_byte]
             ; cmp w16, u32::from(storage.tagged_kind)
-            ; b.ne =>other
+        );
+        if absent {
+            dynasm!(self.ops ; .arch aarch64 ; b.eq =>tagged ; cbnz w16, =>other ; =>tagged);
+        } else {
+            dynasm!(self.ops ; .arch aarch64 ; b.ne =>other);
+        }
+        dynasm!(self.ops
+            ; .arch aarch64
             ; ldr W(length), [X(receiver), storage.length_byte]
             ; ldr x16, [X(receiver), storage.logical_length_byte]
             ; cmp x16, X(length)

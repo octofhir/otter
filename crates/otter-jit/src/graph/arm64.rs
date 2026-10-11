@@ -1986,11 +1986,9 @@ impl<'a> Codegen<'a> {
             Kind::ArrayPush(byte_pc) => {
                 let (receiver, value) = (Self::gp(input(0)), Self::gp(input(1)));
                 let destination = Self::gp(result.expect("a result"));
-                let temps = [
-                    allocation.gp_temps[0],
-                    allocation.gp_temps[1],
-                    allocation.gp_temps[2],
-                ];
+                let temps: [u8; 6] = allocation.gp_temps[..6]
+                    .try_into()
+                    .expect("six append temporaries");
                 self.emit_array_push(node, *byte_pc, [receiver, value], temps, destination)?;
             }
             Kind::ArrayPop(byte_pc) => {
@@ -3859,15 +3857,7 @@ impl<'a> Codegen<'a> {
             ; b.eq =>slow
             ; =>done
         );
-        let mut live = self.allocation.node(node).live_registers.clone();
-        for &register in keep {
-            if !live
-                .iter()
-                .any(|&(location, _)| location == Location::Gp(register))
-            {
-                live.push((Location::Gp(register), Repr::Word));
-            }
-        }
+        let live = self.slow_path_registers(node, keep);
         self.deferred
             .push(Box::new(move |codegen: &mut Codegen<'a>| {
                 dynasm!(codegen.ops ; .arch aarch64 ; =>slow);
@@ -3898,6 +3888,12 @@ impl<'a> Codegen<'a> {
     }
 
     fn emit_write_barrier(&mut self, node: NodeId, object: u8, value: u8) {
+        self.emit_write_barrier_keeping(node, object, value, &[]);
+    }
+
+    /// [`Self::emit_write_barrier`] whose slow path also preserves the
+    /// registers in `keep`.
+    fn emit_write_barrier_keeping(&mut self, node: NodeId, object: u8, value: u8, keep: &[u8]) {
         let flags_byte = self.view.gc_barrier.header_flags_byte;
         let young = self.view.gc_barrier.young_flag;
         let settled = young | self.view.gc_barrier.remembered_flag;
@@ -3930,7 +3926,7 @@ impl<'a> Codegen<'a> {
                 ; b.ne =>slow);
         }
         dynasm!(self.ops ; .arch aarch64 ; =>done);
-        let live = self.allocation.node(node).live_registers.clone();
+        let live = self.slow_path_registers(node, keep);
         self.deferred
             .push(Box::new(move |codegen: &mut Codegen<'a>| {
                 dynasm!(codegen.ops ; .arch aarch64 ; =>slow);
@@ -3957,6 +3953,25 @@ impl<'a> Codegen<'a> {
                 codegen.emit_restore_registers(&live, saved);
                 dynasm!(codegen.ops ; .arch aarch64 ; b =>done);
             }));
+    }
+
+    /// The registers a non-collecting slow path of `node` saves: the values
+    /// live across it and the operands in `keep` the node still reads.
+    fn slow_path_registers(
+        &self,
+        node: NodeId,
+        keep: &[u8],
+    ) -> smallvec::SmallVec<[(Location, Repr); 8]> {
+        let mut live = self.allocation.node(node).live_registers.clone();
+        for &register in keep {
+            if !live
+                .iter()
+                .any(|&(location, _)| location == Location::Gp(register))
+            {
+                live.push((Location::Gp(register), Repr::Word));
+            }
+        }
+        live
     }
 
     /// Push every live caller-saved register; returns the bytes pushed.

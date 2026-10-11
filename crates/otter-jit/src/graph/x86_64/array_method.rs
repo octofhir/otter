@@ -1,18 +1,21 @@
 //! x86-64 inline `Array.prototype.push` and `pop` at a guarded method call.
 //!
 //! # Contents
-//! - [`Codegen::emit_array_method`] appends into spare tagged capacity or
-//!   removes a present tagged last element.
+//! - [`Codegen::emit_array_method`] appends to tagged storage, growing it
+//!   when full, or removes a present tagged last element.
 //!
 //! # Invariants
 //! - The receiver is proved an Array that reads the site's builtin from its
 //!   pinned `%Array.prototype%` before any effect; a failed proof, or for an
 //!   append an indexed accessor anywhere in the realm, leaves through the
 //!   eager deopt.
-//! - The inline paths cover an Array whose tagged dense prefix is its whole
-//!   length: an append within capacity and the removal of a present last
-//!   element. Every other state the proof admits completes in the builtin
-//!   through the committed object-protocol entry, which grows storage.
+//! - The inline paths cover an Array whose dense prefix is its whole length:
+//!   an append to tagged storage, which grows full or absent storage into a
+//!   nursery slab while no marking runs, and the removal of a present tagged
+//!   last element. Every other state the proof admits completes in the
+//!   builtin through the committed object-protocol entry.
+//! - Grown storage is young, so its copied words owe no barrier; the Array
+//!   takes the barrier for the slab it now holds.
 //! - The appended value takes the element write barrier before the lengths
 //!   publish it; the removed slot is cleared to `undefined`, which needs none.
 //! - The Array's dense length, its slab's length and its `length` move
@@ -28,6 +31,8 @@ use otter_vm::jit::{JitArrayStorage, JitGuardedReceiver, JitMethodHolder};
 use otter_vm::value::tag;
 
 use super::{Codegen, CommittedArgument, abi};
+use crate::allocation::LabRegisters;
+use crate::x86_64::allocation::emit_grow_tagged_slab;
 use crate::{
     Unsupported,
     graph::{
@@ -58,13 +63,18 @@ impl Codegen<'_> {
         let done = self.ops.new_dynamic_label();
         if push {
             let value = Self::gp(assigned.inputs[1]);
+            let grow = self.ops.new_dynamic_label();
+            let appended = self.ops.new_dynamic_label();
             dynasm!(self.ops ; .arch x64
                 ; mov r10, [r15 + crate::entry::THREAD_OFFSET as i32]
                 ; mov r10, [r10 + crate::entry::VM_THREAD_ARRAY_INDEX_PROTECTOR_CELL_OFFSET as i32]
                 ; cmp BYTE [r10], 0 ; jne =>exit);
-            self.emit_whole_tagged_prefix(storage, receiver, length, runtime);
+            // Absent storage reads the empty kind, zero capacity and an empty
+            // prefix, so its first append grows it.
+            self.emit_whole_prefix(storage, receiver, length, true, runtime);
             dynasm!(self.ops ; .arch x64
-                ; cmp Rd(length), [Rq(receiver) + storage.capacity_byte as i32] ; jae =>runtime
+                ; mov r11d, [Rq(receiver) + storage.capacity_byte as i32]
+                ; cmp Rd(length), r11d ; jae =>grow
                 ; mov Rq(base), [Rq(receiver) + storage.base_byte as i32]
                 ; mov [Rq(base) + Rq(length) * 8], Rq(value));
             self.emit_element_write_barrier(node, base, length, value, &[receiver, length, base]);
@@ -72,7 +82,47 @@ impl Codegen<'_> {
                 ; lea r10d, [Rq(length) + 1]
                 ; mov [Rq(receiver) + storage.length_byte as i32], r10d
                 ; mov [Rq(base) + storage.slab_length_from_base], r10d
+                ; mov [Rq(receiver) + storage.logical_length_byte as i32], r10
+                ; jmp =>appended
+                ; =>grow
+                // The copied words would owe marking barriers.
+                ; mov r10, [r15 + crate::entry::THREAD_OFFSET as i32]
+                ; mov r10, [r10 + crate::entry::VM_THREAD_MARKING_FLAG_CELL_OFFSET as i32]
+                ; cmp BYTE [r10], 0 ; jne =>runtime
+                // Double the capacity, and at least four words.
+                ; lea Rd(base), [r11 + r11] ; mov r10d, 4 ; cmp Rd(base), r10d ; cmovb Rd(base), r10d);
+            let regs = LabRegisters {
+                buffer: assigned.gp_temps[3],
+                candidate: temp,
+                end: assigned.gp_temps[4],
+                scratch: assigned.gp_temps[5],
+                size: base,
+            };
+            emit_grow_tagged_slab(
+                &mut self.ops,
+                15,
+                storage,
+                [receiver, length],
+                regs,
+                runtime,
+            );
+            // The new storage is young and no marking runs, so its words owe
+            // no barrier; the Array owes one for the slab it now holds.
+            dynasm!(self.ops ; .arch x64
+                ; mov [Rq(base) + Rq(length) * 8], Rq(value)
+                ; lea r10d, [Rq(length) + 1]
+                ; mov [Rq(base) + storage.slab_length_from_base], r10d
+                ; mov [Rq(receiver) + storage.slab_byte as i32], Rd(temp)
+                ; mov [Rq(receiver) + storage.base_byte as i32], Rq(base)
+                ; mov r11d, [Rq(base) + storage.numeric.capacity_byte]
+                ; mov [Rq(receiver) + storage.capacity_byte as i32], r11d
+                ; mov BYTE [Rq(receiver) + storage.numeric.kind_byte as i32], storage.tagged_kind as i8
+                ; mov [Rq(receiver) + storage.length_byte as i32], r10d
                 ; mov [Rq(receiver) + storage.logical_length_byte as i32], r10);
+            self.emit_cell_edge_barrier(node, receiver, temp, &[length]);
+            dynasm!(self.ops ; .arch x64
+                ; =>appended
+                ; lea r10d, [Rq(length) + 1]);
             crate::x86_64::values::emit_box_int32(&mut self.ops, 10, destination, 11);
             dynasm!(self.ops ; .arch x64 ; jmp =>done ; =>runtime);
             self.emit_committed_call(
@@ -87,7 +137,7 @@ impl Codegen<'_> {
             )?;
         } else {
             let empty = self.ops.new_dynamic_label();
-            self.emit_whole_tagged_prefix(storage, receiver, length, runtime);
+            self.emit_whole_prefix(storage, receiver, length, false, runtime);
             dynasm!(self.ops ; .arch x64
                 ; test Rd(length), Rd(length) ; jz =>empty
                 ; sub Rd(length), 1
@@ -155,18 +205,26 @@ impl Codegen<'_> {
     }
 
     /// Load the Array `receiver`'s dense length into `length` and branch to
-    /// `other` unless its storage is tagged and that dense prefix is its
-    /// whole `length`.
-    fn emit_whole_tagged_prefix(
+    /// `other` unless its storage is tagged, or absent when `absent` admits
+    /// it, and that dense prefix is its whole `length`.
+    fn emit_whole_prefix(
         &mut self,
         storage: JitArrayStorage,
         receiver: u8,
         length: u8,
+        absent: bool,
         other: DynamicLabel,
     ) {
+        let tagged = self.ops.new_dynamic_label();
         dynasm!(self.ops ; .arch x64
-            ; cmp BYTE [Rq(receiver) + storage.numeric.kind_byte as i32], storage.tagged_kind as i8
-            ; jne =>other
+            ; movzx r10d, BYTE [Rq(receiver) + storage.numeric.kind_byte as i32]
+            ; cmp r10d, i32::from(storage.tagged_kind));
+        if absent {
+            dynasm!(self.ops ; .arch x64 ; je =>tagged ; test r10d, r10d ; jnz =>other ; =>tagged);
+        } else {
+            dynasm!(self.ops ; .arch x64 ; jne =>other);
+        }
+        dynasm!(self.ops ; .arch x64
             ; mov Rd(length), [Rq(receiver) + storage.length_byte as i32]
             ; cmp [Rq(receiver) + storage.logical_length_byte as i32], Rq(length)
             ; jne =>other);

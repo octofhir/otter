@@ -27,11 +27,19 @@ impl Codegen<'_> {
         let done = self.ops.new_dynamic_label();
         self.load_immediate(10, tag::NOT_CELL_MASK);
         dynasm!(self.ops ; .arch x64 ; test Rq(value), r10 ; jnz =>done ; test Rq(value), Rq(value) ; jz =>done);
-        self.emit_cell_edge_barrier(node, parent, value);
+        self.emit_cell_edge_barrier(node, parent, value, &[]);
         dynasm!(self.ops ; .arch x64 ; =>done);
     }
 
-    fn emit_cell_edge_barrier(&mut self, node: NodeId, parent: u8, child: u8) {
+    /// The barrier for the cell `child` just stored into `parent`, whose slow
+    /// path also preserves the registers in `keep`.
+    pub(super) fn emit_cell_edge_barrier(
+        &mut self,
+        node: NodeId,
+        parent: u8,
+        child: u8,
+        keep: &[u8],
+    ) {
         let slow = self.ops.new_dynamic_label();
         let done = self.ops.new_dynamic_label();
         let layout = self.view.gc_barrier;
@@ -43,7 +51,7 @@ impl Codegen<'_> {
             ; test BYTE [Rq(parent) + layout.header_flags_byte as i32], settled as i8 ; jnz =>done
             ; test BYTE [Rq(child) + layout.header_flags_byte as i32], layout.young_flag as i8 ; jnz =>slow
             ; =>done);
-        let live = self.allocation.node(node).live_registers.clone();
+        let live = self.slow_path_registers(node, keep);
         self.deferred.push(Box::new(move |codegen| {
             dynasm!(codegen.ops ; .arch x64 ; =>slow);
             let saved = codegen.emit_save_registers(&live);
@@ -88,7 +96,7 @@ impl Codegen<'_> {
         self.load_immediate(10, 0xffff_ffff_0000_0000);
         dynasm!(self.ops ; .arch x64 ; and r10, Rq(receiver)
             ; mov Rd(child), Rd(shape) ; add Rq(child), r10);
-        self.emit_cell_edge_barrier(node, receiver, child);
+        self.emit_cell_edge_barrier(node, receiver, child, &[]);
     }
 
     /// The barrier after storing `value` at `index` of the tagged slab whose
@@ -131,15 +139,7 @@ impl Codegen<'_> {
             ; cmovb r10d, r11d ; mov [Rq(base) + dirty_end], r10d
             ; test BYTE [Rq(base) + slab_flags], settled as i8 ; jz =>slow
             ; =>done);
-        let mut live = self.allocation.node(node).live_registers.clone();
-        for &register in keep {
-            if !live
-                .iter()
-                .any(|&(location, _)| location == Location::Gp(register))
-            {
-                live.push((Location::Gp(register), Repr::Word));
-            }
-        }
+        let live = self.slow_path_registers(node, keep);
         self.deferred.push(Box::new(move |codegen| {
             dynasm!(codegen.ops ; .arch x64 ; =>slow);
             let saved = codegen.emit_save_registers(&live);
@@ -165,5 +165,24 @@ impl Codegen<'_> {
             codegen.emit_restore_registers(&live, saved);
             dynasm!(codegen.ops ; .arch x64 ; jmp =>done);
         }));
+    }
+
+    /// The registers a non-collecting slow path of `node` saves: the values
+    /// live across it and the operands in `keep` the node still reads.
+    fn slow_path_registers(
+        &self,
+        node: NodeId,
+        keep: &[u8],
+    ) -> smallvec::SmallVec<[(Location, Repr); 8]> {
+        let mut live = self.allocation.node(node).live_registers.clone();
+        for &register in keep {
+            if !live
+                .iter()
+                .any(|&(location, _)| location == Location::Gp(register))
+            {
+                live.push((Location::Gp(register), Repr::Word));
+            }
+        }
+        live
     }
 }

@@ -262,7 +262,7 @@ fn compile_with_reach(
             view,
             activation_exits,
             shape,
-            0,
+            crate::frame::SpillArea::NONE,
             cold,
         );
         crate::arm64::frame::emit_call_entry(

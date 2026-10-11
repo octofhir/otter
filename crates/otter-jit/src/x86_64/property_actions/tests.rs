@@ -10,6 +10,7 @@
 //! - Owned aligned fixture words model the VM DTO's physical offsets; no raw
 //!   fixture pointer crosses a VM allocation, C call or collector boundary.
 //! - Each probe invokes the production shared emitter consumed by both tiers.
+//! - Refusal mutations select their proof field through the current cache DTO.
 //! - These tests prove encoding and effects. Runtime moving-GC and cache root
 //!   lifetime proofs remain the responsibility of the complete VM/native gate.
 //!
@@ -500,11 +501,17 @@ fn every_miss_finishes_before_any_slot_or_shape_effect() {
                 ShapeState::ORDINARY.with_extensible(false).bits(),
             ),
             7 => {
-                f.table_u64(f.entry + 56, f.validity.as_ref() as *const u32 as u64);
+                f.table_u64(
+                    f.entry + f.cache.store_validity_byte as usize,
+                    f.validity.as_ref() as *const u32 as u64,
+                );
                 *f.validity = 0;
             }
             8 => f.table_u32(f.entry + 28, 0),
-            9 => f.table_u64(f.entry + 40, TARGET_ID ^ (1_u64 << 32)),
+            9 => f.table_u64(
+                f.entry + f.cache.target_shape_id_byte as usize,
+                TARGET_ID ^ (1_u64 << 32),
+            ),
             10 => f.cell_u32(f.view.field_layout.slab_handle_byte as usize, 0),
             11 => f.cell_u32(SLAB + f.view.field_layout.slab_capacity_byte as usize, 1),
             12 => f.cell_u8(0, 0xff),
@@ -530,12 +537,15 @@ fn every_miss_finishes_before_any_slot_or_shape_effect() {
             0 => *f.validity = 0,
             1 => f.table_u32(f.entry + 24, 0),
             2 => f.table_u32(f.entry + 20, f.address(SHAPE) as u32),
-            3 => f.table_u64(f.entry + 32, HOLDER_ID ^ (1_u64 << 32)),
+            3 => f.table_u64(
+                f.entry + f.cache.holder_shape_id_byte as usize,
+                HOLDER_ID ^ (1_u64 << 32),
+            ),
             4 => f.table_u8(
                 f.entry + 12,
                 otter_vm::jit::PropertyLoadAction::Unresolvable as u8,
             ),
-            5 => f.table_u64(f.entry + 48, 0),
+            5 => f.table_u64(f.entry + f.cache.load_validity_byte as usize, 0),
             _ => unreachable!(),
         }
         let before = f.cells.clone();

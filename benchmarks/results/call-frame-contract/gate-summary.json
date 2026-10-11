@@ -1,0 +1,554 @@
+{
+  "status": "passed",
+  "parent": "5186cffedb52cd5b37986cb13f65c570095b8563",
+  "commands": [
+    {
+      "name": "vm-lib",
+      "command": [
+        "cargo",
+        "test",
+        "-p",
+        "otter-vm",
+        "--lib",
+        "--release"
+      ],
+      "exit_code": 0,
+      "elapsed_seconds": 499.4181671142578
+    },
+    {
+      "name": "jit-lib",
+      "command": [
+        "cargo",
+        "test",
+        "-p",
+        "otter-jit",
+        "--lib",
+        "--release"
+      ],
+      "exit_code": 0,
+      "elapsed_seconds": 471.2157349586487
+    },
+    {
+      "name": "clippy-host",
+      "command": [
+        "cargo",
+        "clippy",
+        "-p",
+        "otter-vm",
+        "-p",
+        "otter-jit",
+        "-p",
+        "otter-runtime",
+        "-p",
+        "otter-cli",
+        "-p",
+        "otter-difftest",
+        "--all-targets",
+        "--",
+        "-D",
+        "warnings"
+      ],
+      "exit_code": 0,
+      "elapsed_seconds": 38.50347089767456
+    },
+    {
+      "name": "difftest-host",
+      "command": [
+        "target/release/otter-difftest",
+        "--otter",
+        "target/release/otter",
+        "--timeout-ms",
+        "120000"
+      ],
+      "exit_code": 0,
+      "elapsed_seconds": 199.94620895385742
+    },
+    {
+      "name": "jit-lib-x86",
+      "command": [
+        "cargo",
+        "test",
+        "-p",
+        "otter-jit",
+        "--lib",
+        "--release",
+        "--target",
+        "x86_64-apple-darwin"
+      ],
+      "exit_code": 0,
+      "elapsed_seconds": 87.72974491119385
+    },
+    {
+      "name": "clippy-x86",
+      "command": [
+        "cargo",
+        "clippy",
+        "-p",
+        "otter-vm",
+        "-p",
+        "otter-jit",
+        "-p",
+        "otter-runtime",
+        "-p",
+        "otter-cli",
+        "-p",
+        "otter-difftest",
+        "--all-targets",
+        "--target",
+        "x86_64-apple-darwin",
+        "--",
+        "-D",
+        "warnings"
+      ],
+      "exit_code": 0,
+      "elapsed_seconds": 97.81252694129944
+    },
+    {
+      "name": "difftest-x86",
+      "command": [
+        "target/x86_64-apple-darwin/release/otter-difftest",
+        "--otter",
+        "target/x86_64-apple-darwin/release/otter",
+        "--timeout-ms",
+        "120000"
+      ],
+      "exit_code": 0,
+      "elapsed_seconds": 339.5110721588135
+    },
+    {
+      "name": "build-x86",
+      "command": [
+        "cargo",
+        "build",
+        "--release",
+        "-p",
+        "otter-cli",
+        "-p",
+        "otter-difftest",
+        "--target",
+        "x86_64-apple-darwin"
+      ],
+      "exit_code": 0,
+      "elapsed_seconds": 829.0968239307404
+    }
+  ],
+  "test262": {
+    "totals": {
+      "total": 53575,
+      "passed": 52463,
+      "failed": 12,
+      "skipped": 1100,
+      "crashed": 0,
+      "timed_out": 0,
+      "oom": 0
+    },
+    "failure_paths": [
+      "intl402/DateTimeFormat/prototype/formatRange/en-US.js",
+      "intl402/DateTimeFormat/prototype/formatRangeToParts/chinese-calendar-dates.js",
+      "intl402/DateTimeFormat/prototype/formatRangeToParts/dangi-calendar-dates.js",
+      "intl402/DateTimeFormat/prototype/formatRangeToParts/en-US.js",
+      "intl402/DateTimeFormat/prototype/formatToParts/chinese-calendar-dates.js",
+      "intl402/DateTimeFormat/prototype/formatToParts/compare-to-temporal-lunisolar.js",
+      "intl402/DateTimeFormat/prototype/formatToParts/compare-to-temporal.js",
+      "intl402/DateTimeFormat/prototype/formatToParts/dangi-calendar-dates.js",
+      "intl402/DateTimeFormat/prototype/formatToParts/era.js",
+      "staging/sm/String/internalUsage.js",
+      "staging/sm/lexical-environment/block-scoped-functions-annex-b-arguments.js",
+      "staging/sm/regress/regress-602621.js"
+    ],
+    "baseline": "benchmarks/results/t262/full-2026-10-11b.md",
+    "report": "benchmarks/results/t262/full-2026-10-11c.json",
+    "same_failure_set": true
+  },
+  "units": {
+    "vm-lib": {
+      "passed": 1223,
+      "failed": 0
+    },
+    "jit-lib": {
+      "passed": 248,
+      "failed": 0
+    },
+    "jit-lib-x86": {
+      "passed": 270,
+      "failed": 0
+    }
+  },
+  "difftest": {
+    "host": {
+      "seed": 340717225298,
+      "passed": 139,
+      "failed": 0
+    },
+    "x86": {
+      "seed": 340717225298,
+      "passed": 139,
+      "failed": 0
+    }
+  },
+  "gc_stress": [
+    {
+      "benchmark": "richards",
+      "stride": 256,
+      "cases": {
+        "normal": {
+          "exit_code": 0,
+          "elapsed_seconds": 1.8182260990142822,
+          "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "stress": {
+          "exit_code": 0,
+          "elapsed_seconds": 1.8532898426055908,
+          "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        }
+      },
+      "stdout_equal": true
+    },
+    {
+      "benchmark": "deltablue",
+      "stride": 256,
+      "cases": {
+        "normal": {
+          "exit_code": 0,
+          "elapsed_seconds": 2.869826078414917,
+          "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "stress": {
+          "exit_code": 0,
+          "elapsed_seconds": 9.380189180374146,
+          "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        }
+      },
+      "stdout_equal": true
+    },
+    {
+      "benchmark": "crypto",
+      "stride": 256,
+      "cases": {
+        "normal": {
+          "exit_code": 0,
+          "elapsed_seconds": 0.36818695068359375,
+          "stdout_sha256": "9f98c7df675c3271e22de845dee97e4be3c15c21947ef644adf39c05853b8756"
+        },
+        "stress": {
+          "exit_code": 0,
+          "elapsed_seconds": 0.4238417148590088,
+          "stdout_sha256": "9f98c7df675c3271e22de845dee97e4be3c15c21947ef644adf39c05853b8756"
+        }
+      },
+      "stdout_equal": true
+    },
+    {
+      "benchmark": "raytrace",
+      "stride": 256,
+      "cases": {
+        "normal": {
+          "exit_code": 0,
+          "elapsed_seconds": 2.743583917617798,
+          "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "stress": {
+          "exit_code": 0,
+          "elapsed_seconds": 17.05401873588562,
+          "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        }
+      },
+      "stdout_equal": true
+    },
+    {
+      "benchmark": "earley-boyer",
+      "stride": 256,
+      "cases": {
+        "normal": {
+          "exit_code": 0,
+          "elapsed_seconds": 1.7865381240844727,
+          "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "stress": {
+          "exit_code": 0,
+          "elapsed_seconds": 60.41618013381958,
+          "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        }
+      },
+      "stdout_equal": true
+    },
+    {
+      "benchmark": "regexp",
+      "stride": 256,
+      "cases": {
+        "normal": {
+          "exit_code": 0,
+          "elapsed_seconds": 8.708968877792358,
+          "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "stress": {
+          "exit_code": 0,
+          "elapsed_seconds": 5.445651054382324,
+          "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        }
+      },
+      "stdout_equal": true
+    },
+    {
+      "benchmark": "splay",
+      "stride": 256,
+      "cases": {
+        "normal": {
+          "exit_code": 0,
+          "elapsed_seconds": 1.1856539249420166,
+          "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "stress": {
+          "exit_code": 0,
+          "elapsed_seconds": 6.208637952804565,
+          "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        }
+      },
+      "stdout_equal": true
+    },
+    {
+      "benchmark": "navier-stokes",
+      "stride": 256,
+      "cases": {
+        "normal": {
+          "exit_code": 0,
+          "elapsed_seconds": 0.9911973476409912,
+          "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "stress": {
+          "exit_code": 0,
+          "elapsed_seconds": 0.9794349670410156,
+          "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        }
+      },
+      "stdout_equal": true
+    },
+    {
+      "benchmark": "box2d",
+      "stride": 256,
+      "cases": {
+        "normal": {
+          "exit_code": 0,
+          "elapsed_seconds": 1.062925100326538,
+          "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "stress": {
+          "exit_code": 0,
+          "elapsed_seconds": 1.8051340579986572,
+          "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        }
+      },
+      "stdout_equal": true
+    },
+    {
+      "benchmark": "gbemu",
+      "stride": 256,
+      "cases": {
+        "normal": {
+          "exit_code": 0,
+          "elapsed_seconds": 1.8093750476837158,
+          "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "stress": {
+          "exit_code": 0,
+          "elapsed_seconds": 1.8325510025024414,
+          "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        }
+      },
+      "stdout_equal": true
+    },
+    {
+      "benchmark": "mandreel",
+      "stride": 256,
+      "cases": {
+        "normal": {
+          "exit_code": 0,
+          "elapsed_seconds": 1.2962620258331299,
+          "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "stress": {
+          "exit_code": 0,
+          "elapsed_seconds": 1.2881789207458496,
+          "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        }
+      },
+      "stdout_equal": true
+    },
+    {
+      "benchmark": "zlib",
+      "stride": 256,
+      "cases": {
+        "normal": {
+          "exit_code": 0,
+          "elapsed_seconds": 2.0574121475219727,
+          "stdout_sha256": "6ce676148eb0ea63eb473ac8dcf56ecf0e4597a8d4d3c360aab3f6da1fed2354"
+        },
+        "stress": {
+          "exit_code": 0,
+          "elapsed_seconds": 2.0031847953796387,
+          "stdout_sha256": "6ce676148eb0ea63eb473ac8dcf56ecf0e4597a8d4d3c360aab3f6da1fed2354"
+        }
+      },
+      "stdout_equal": true
+    },
+    {
+      "benchmark": "ts",
+      "stride": 256,
+      "cases": {
+        "normal": {
+          "exit_code": 0,
+          "elapsed_seconds": 4.371352910995483,
+          "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "stress": {
+          "exit_code": 0,
+          "elapsed_seconds": 48.74099802970886,
+          "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        }
+      },
+      "stdout_equal": true
+    }
+  ],
+  "corpus_oracles": {
+    "node": {
+      "command": [
+        "node",
+        "crates/otter-difftest/corpus/deferred_frame_publication.js"
+      ],
+      "exit_code": 0,
+      "stdout_sha256": "e32a758b381774802967ec4bab5db63057a67de2c8d16265e2a00bfa814b062c",
+      "stderr_bytes": 0
+    },
+    "interpreter": {
+      "command": [
+        "target/release/otter",
+        "--interpreter",
+        "crates/otter-difftest/corpus/deferred_frame_publication.js"
+      ],
+      "exit_code": 0,
+      "stdout_sha256": "e32a758b381774802967ec4bab5db63057a67de2c8d16265e2a00bfa814b062c",
+      "stderr_bytes": 0
+    },
+    "native": {
+      "command": [
+        "target/release/otter",
+        "crates/otter-difftest/corpus/deferred_frame_publication.js"
+      ],
+      "exit_code": 0,
+      "stdout_sha256": "e32a758b381774802967ec4bab5db63057a67de2c8d16265e2a00bfa814b062c",
+      "stderr_bytes": 0
+    },
+    "stress": {
+      "command": [
+        "target/release/otter",
+        "crates/otter-difftest/corpus/deferred_frame_publication.js"
+      ],
+      "exit_code": 0,
+      "stdout_sha256": "e32a758b381774802967ec4bab5db63057a67de2c8d16265e2a00bfa814b062c",
+      "stderr_bytes": 0
+    },
+    "stdout_equal": true
+  },
+  "performance": {
+    "measurements": {
+      "richards": {
+        "otter": 28505771952,
+        "node": 11559753905,
+        "ratio": 2.4659497240395623
+      },
+      "deltablue": {
+        "otter": 39906448842,
+        "node": 5590907366,
+        "ratio": 7.137741019406473
+      },
+      "crypto": {
+        "otter": 4675851245,
+        "node": 2918126968,
+        "ratio": 1.6023467437418233
+      },
+      "raytrace": {
+        "otter": 34647650980,
+        "node": 8371358844,
+        "ratio": 4.138832371859557
+      },
+      "earley-boyer": {
+        "otter": 29688018173,
+        "node": 18688380783,
+        "ratio": 1.5885816175153007
+      },
+      "regexp": {
+        "otter": 51043297533,
+        "node": 7302024402,
+        "ratio": 6.990294022986203
+      },
+      "splay": {
+        "otter": 12188773105,
+        "node": 4396614120,
+        "ratio": 2.772309047899796
+      },
+      "navier-stokes": {
+        "otter": 8885239853,
+        "node": 8095275899,
+        "ratio": 1.0975833268508592
+      },
+      "box2d": {
+        "otter": 14191408781,
+        "node": 5062573423,
+        "ratio": 2.803200585008088
+      },
+      "gbemu": {
+        "otter": 26320144851,
+        "node": 8221150072,
+        "ratio": 3.2015161650731145
+      },
+      "mandreel": {
+        "otter": 19187702634,
+        "node": 13823039865,
+        "ratio": 1.3880957315751763
+      },
+      "zlib": {
+        "otter": 24501507106,
+        "node": 24749906421,
+        "ratio": 0.9899636260931785
+      },
+      "ts": {
+        "otter": 37805494870,
+        "node": 20854641072,
+        "ratio": 1.812809663780724
+      }
+    },
+    "geomean": 2.4011131757370605,
+    "baseline": "benchmarks/results/field-shape-tracking/gate-summary.json",
+    "regressions_percent": {
+      "earley-boyer": 0.0014716389182822809
+    }
+  },
+  "source_fingerprints": {
+    "crates/otter-jit/src/arm64/frame.rs": "d51116be43c2e34a66db4e4038b7bf00b5d2c0d961e40b6ba00533ab1ee94281",
+    "crates/otter-jit/src/call_linkage.rs": "c196a990a1b3a77ef4d599aff360bcee603e5b4b2f2bfb6ca2d6073a89eb106f",
+    "crates/otter-jit/src/frame.rs": "44a38cfffc290e880b846b39d5ca5b49e19b5314f192f44ceaff2c9b2f0a4de2",
+    "crates/otter-jit/src/graph/arm64.rs": "90d645bbd3d7c5ac6b0d0d0fef18e2c3282f557c092b9c3b8b69f845d2e65e71",
+    "crates/otter-jit/src/graph/frame.rs": "7707e3fe1ccdc40a52fcb4568459a3e6bde9ec9c70acf1e39353583dbcdfea06",
+    "crates/otter-jit/src/graph/x86_64.rs": "eb0a3fe0ba0b197c0094e21270929dc2b378af8d41d3af688c2363df61018e5f",
+    "crates/otter-jit/src/graph/x86_64/exits.rs": "20462b355b0b3ffd2e73fe6440e790f1e861951dea7f407a8d598c66216e0e3d",
+    "crates/otter-jit/src/graph/x86_64/memory_tests.rs": "edf8b26e71c94f02d4fad009672891302033c65c9cf1255c4c497ea8015fc7f7",
+    "crates/otter-jit/src/template/arm64.rs": "2ed4569912d5bbdff7ac197e971c622bed688857a9d04eb59cd37afbd5b69fd3",
+    "crates/otter-jit/src/template/x86_64.rs": "dc2b86e5fb61bfbb8825d102098b08a2521aad09e4cc05c6874f975648f4f184",
+    "crates/otter-jit/src/x86_64/frame.rs": "2c49c4bba8e729920904ae8635ea6d6482eeab07cf648810c0f04fb18bf34b5e",
+    "crates/otter-jit/src/x86_64/frame_tests.rs": "ab05e74b6d6f227203880dacf2e648ef56889d7edd5289bdf659bfd53c10a6f1",
+    "crates/otter-vm/src/native_abi/frame.rs": "1fba5fddbcbfd95cd6140acd3516d94e97e1a646cdd8267b20370da54c3e574b",
+    "docs/site/src/content/docs/engine/jit-debugging.md": "93381ac421da168b886f3b3e04bdcc0bf97a6edcd85006b9c7c4c1da5f2ebbed",
+    "crates/otter-difftest/corpus/deferred_frame_publication.js": "63fb361efe157536f73af3a8b0075849a611a75ed45a7fd950b177bdb0a80e5b",
+    "scripts/dev/frame_profile.py": "d884e3b706b8a6c1b31cd69a344e5b8fae67654afa2b0746d633f96d20f8d745",
+    "crates/otter-jit/src/graph/x86_64/scalar/tests/leaves.rs": "e0c558a2425248ac20b1fd4f195529d28abeb49c483b57f04eeb3cf0d19bf57f",
+    "crates/otter-jit/src/x86_64/property_actions/tests.rs": "d7ef07c86244218c5d1491b017089ca2deedf78fd73ca5a7f1dbe84f41682c74"
+  },
+  "binary_fingerprints": {
+    "target/release/otter": "d54541be3994c9466432916448a9a41e9122cca6aed5cf26c895538b5d161233",
+    "target/release/otter-difftest": "ca552e3c7159789c77753277a7e0d1407960d044c474bea8e45bd135c0ed8b7b",
+    "target/release/otter-test262": "77db01ea041b5bbbb5859815b87ee6aed41e5e8a5845790084401ef9260ab843",
+    "target/x86_64-apple-darwin/release/otter": "7c91bdfceabb3199299e2225f49abce0abf54a8704dee54c597abfce43059913",
+    "target/x86_64-apple-darwin/release/otter-difftest": "76f449933803519813dabffcb0a7b001798c9eb37b095532fac4d1d641ee7d5f"
+  },
+  "fixture_repairs": "Two x86 cfg(test)-only retries fixed missing shape fields and four stale hardcoded offsets in current property-action DTO; production binaries unchanged."
+}

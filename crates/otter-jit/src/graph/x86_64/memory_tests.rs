@@ -100,7 +100,15 @@ fn codegen<'a>(
             scratch_slot: Some(slots.spill_tagged),
             safepoint: FIRST_SITE_SAFEPOINT,
             saved_pairs: 0,
+            deferred_frame: false,
         },
+        entry_shape: crate::call_linkage::EntryShape::of(
+            view,
+            0,
+            abi::NativeFrameKind::Optimizing,
+            true,
+        )
+        .unwrap(),
         transitions,
         deopt_runtime: 0,
         plan,

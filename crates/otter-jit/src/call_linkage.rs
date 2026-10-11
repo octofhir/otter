@@ -13,8 +13,9 @@
 //!   `[[Call]]`), the actual count and the actual span on the caller's stack,
 //!   containing exactly the actual arguments with alignment slack unread.
 //!   The callee initializes its missing formals to `undefined`. A compiled
-//!   generation's entry builds, publishes and retires its one native frame;
-//!   the caller pops the span.
+//!   generation owns one reserved native frame. A proved nonobserving body
+//!   initializes and publishes it only before a cold semantic boundary;
+//!   all other bodies publish it on entry. The caller pops the span.
 //! - A caller that proved its callee enters the current generation through
 //!   the target's permanent `FunctionEntryCell`. A proved NativeFunction enters
 //!   the canonical Host native kernel through its selected kind convention;

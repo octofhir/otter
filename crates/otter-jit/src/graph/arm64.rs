@@ -15,14 +15,15 @@
 //!   and control nodes.
 //!
 //! # Invariants
-//! - Pinned registers: `x19` register window, `x20` context, `x21` published
+//! - Pinned registers: `x19` register window, `x20` context, `x21` reserved
 //!   frame record, `x29` frame pointer. The only emitter scratch is `x16`,
 //!   `x17` and `d31`; no node writes an allocatable register other than its
 //!   result and declared temporaries.
 //! - Spill slots live at `sp`: tagged homes first, then untagged homes. Each
 //!   safepoint record roots exactly the tagged homes written for live values
 //!   at its boundary ([`metadata::SitePlan`]), plus the exception scratch both
-//!   entry forms zero before publishing the frame. No home is ever cleared.
+//!   entry forms zero before publishing the frame. A proved nonobserving body
+//!   defers that publication until an eager exit or semantic entry helper.
 //! - Memory spills are stored at definitions. Register-only values populate
 //!   canonical homes in collecting slow paths or cold exits.
 //! - Actual collecting calls expire tagged homes no live value or frame
@@ -133,6 +134,7 @@ struct Codegen<'a> {
     fatal: DynamicLabel,
     activation: crate::frame::ActivationExits,
     spill: crate::frame::SpillArea,
+    entry_shape: crate::call_linkage::EntryShape,
     transitions: &'a crate::entry::TransitionTable,
     deopt_runtime: u64,
     /// The baseline operations generic nodes run, one sequence per PC.
@@ -265,16 +267,6 @@ pub(crate) fn emit(
     let committed_throw = ops.new_dynamic_label();
     let propagate = ops.new_dynamic_label();
     let materialize = ops.new_dynamic_label();
-    // Both entries zero the exception scratch, the only tagged word the
-    // entry record roots; every other home is rooted only once written.
-    let spill = crate::frame::SpillArea {
-        bytes: slots.bytes(),
-        scratch_slot: Some(slots.spill_tagged),
-        safepoint: FIRST_SITE_SAFEPOINT,
-        saved_pairs: crate::frame::SpillArea::saved_pairs_for(allocation.used_gp()),
-    };
-    // A body that never runs a baseline operation on the window leaves it
-    // to the exits that rebuild the interpreter frame.
     let lazy_window = !built
         .graph
         .nodes
@@ -287,6 +279,17 @@ pub(crate) fn emit(
         true,
     )?
     .with_lazy_window(lazy_window);
+    // Publication initializes the exception scratch. Every other home is
+    // rooted only by a boundary that wrote it.
+    let spill = crate::frame::SpillArea {
+        bytes: slots.bytes(),
+        scratch_slot: Some(slots.spill_tagged),
+        safepoint: FIRST_SITE_SAFEPOINT,
+        saved_pairs: crate::frame::SpillArea::saved_pairs_for(allocation.used_gp()),
+        deferred_frame: super::frame::can_defer_frame(shape, &built.graph, allocation),
+    };
+    // A body that never runs a baseline operation on the window leaves it
+    // to the exits that rebuild the interpreter frame.
     let mut codegen = Codegen {
         ops,
         relocations: crate::arm64::literal_pool_capture(capture_relocations, view),
@@ -305,6 +308,7 @@ pub(crate) fn emit(
         fatal,
         activation,
         spill,
+        entry_shape: shape,
         transitions,
         deopt_runtime: deopt_runtime as u64,
         plan,
@@ -361,7 +365,7 @@ pub(crate) fn emit(
         view,
         activation,
         shape,
-        spill.saved_pairs,
+        spill,
         call_entry_cold,
     );
     let (call_entry, receiver_entry) = crate::arm64::frame::emit_call_entry(
@@ -5040,6 +5044,12 @@ impl<'a> Codegen<'a> {
             ; str x30, [sp, #-16]!
             ; mov w1, w17
         );
+        crate::arm64::frame::emit_publish_deferred_frame(
+            &mut self.ops,
+            &mut self.relocations,
+            self.entry_shape,
+            self.spill,
+        );
         crate::arm64::frame::emit_publish_lazy_window(
             &mut self.ops,
             self.view.code_block.register_count,
@@ -5091,6 +5101,12 @@ impl<'a> Codegen<'a> {
             otter_vm::deopt::DEOPT_FLOAT_REGISTER_BASE,
         );
         dynasm!(self.ops ; .arch aarch64 ; mov w1, w17);
+        crate::arm64::frame::emit_publish_deferred_frame(
+            &mut self.ops,
+            &mut self.relocations,
+            self.entry_shape,
+            self.spill,
+        );
         crate::arm64::frame::emit_publish_lazy_window(
             &mut self.ops,
             self.view.code_block.register_count,

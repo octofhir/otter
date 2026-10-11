@@ -10,6 +10,9 @@
 //!   the interpreter's previous root words during a tier entry.
 //! - Labels describe the same VM frame protocol on every architecture.
 //! - Only baseline entries account source work toward promotion.
+//! - A proved nonobserving Graph body may retain an unpublished record. Its
+//!   return word carries `UNPUBLISHED_FRAME` until a cold boundary initializes
+//!   and publishes the same VM-owned frame; no Rust code sees a partial record.
 //!
 //! # See also
 //! - [`crate::call_linkage::EntryShape`] owns static call semantics.
@@ -19,6 +22,10 @@ use dynasmrt::{DynamicLabel, relocations::Relocation};
 use otter_vm::native_abi as abi;
 
 use crate::call_linkage::EntryShape;
+
+/// Machine return-word marker for a reserved record that is not published.
+/// Published return words use only bit zero for constructor completion.
+pub(crate) const UNPUBLISHED_FRAME: u64 = 2;
 
 /// Source work one entered Template activation charges on entry: its opcode
 /// count, the interrupt-budget weight of one pass. Loops charge at polls.
@@ -41,6 +48,9 @@ pub(crate) struct SpillArea {
     /// `x(22 + 2i)`/`x(23 + 2i)`; saved below the frame pointer at entry and
     /// restored when the frame is released.
     pub(crate) saved_pairs: u8,
+    /// The body cannot observe a frame chain before an eager exit. Entry keeps
+    /// only its input words; a cold boundary publishes the complete record.
+    pub(crate) deferred_frame: bool,
 }
 
 impl SpillArea {
@@ -50,6 +60,7 @@ impl SpillArea {
         scratch_slot: None,
         safepoint: abi::NO_SAFEPOINT,
         saved_pairs: 0,
+        deferred_frame: false,
     };
 
     /// The callee-saved pairs covering the general registers in `used`.

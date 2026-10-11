@@ -13,6 +13,9 @@
 //!   every other register resumes `undefined`.
 //! - Byte offsets fit the signed VM recipe and the native frame's root indices.
 //! - Backend encoders consume this geometry without owning a second frame map.
+//! - Frame publication may be deferred only across emitted operations with no
+//!   collecting, reentrant, throwing or loop-poll boundary. Eager exits publish
+//!   the one reserved record before any runtime reconstruction.
 //!
 //! # See also
 //! - [`super::regalloc`] for final physical homes and representation ownership.
@@ -27,6 +30,45 @@ use otter_vm::{
 use super::ir::{DeoptReason, FrameStateId, Graph, Kind, NodeId, Repr};
 use super::regalloc::{Allocation, Location};
 use crate::Unsupported;
+
+/// Whether every emitted operation can execute without observing the frame
+/// chain. The window and actual-cache consumers require a complete record;
+/// loop backedges own a runtime poll independently of node call properties.
+pub(crate) fn can_defer_frame(
+    shape: crate::call_linkage::EntryShape,
+    graph: &Graph,
+    allocation: &Allocation,
+) -> bool {
+    shape.lazy_window
+        && !shape.derived
+        && graph.blocks.iter().all(|block| {
+            block
+                .phis
+                .iter()
+                .chain(&block.body)
+                .chain(&block.control)
+                .all(|&id| {
+                    if allocation.node(id).skipped {
+                        return true;
+                    }
+                    let kind = &graph.node(id).kind;
+                    let properties = kind.properties();
+                    !properties.call
+                        && !properties.may_collect
+                        && !properties.can_throw
+                        && !properties.lazy_deopt
+                        && !matches!(
+                            kind,
+                            Kind::JumpLoop(_)
+                                | Kind::Generic { .. }
+                                | Kind::LoadWindow(_)
+                                | Kind::CheckArgumentsElided
+                                | Kind::LoadActualArgument
+                                | Kind::SelectArgument { .. }
+                        )
+                })
+        })
+}
 
 /// Frame-slot geometry shared by ordinary call and OSR entry.
 #[derive(Debug, Clone, Copy)]

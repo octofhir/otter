@@ -3,7 +3,10 @@
 //! # Contents
 //! - Tier-root restoration on normal and side-exit returns.
 //! - Actual-only entry, underarity, called deopt and overflow publication.
+//! - Deferred publication retains the parent on a hit and publishes canonical
+//!   homes independently of the cold path's temporary stack reservation.
 //! - Graph RBX preservation on return and physical tail replacement.
+//! - Abrupt sloppy-receiver preparation ignores inactive constructor state.
 //!
 //! # Invariants
 //! - Owned VM records, actual spans, cells and mappings outlive each call.
@@ -31,6 +34,7 @@ const SPILL: SpillArea = SpillArea {
     scratch_slot: Some(1),
     safepoint: SAFEPOINT,
     saved_pairs: 0,
+    deferred_frame: false,
 };
 
 #[derive(Default, Debug)]
@@ -49,6 +53,9 @@ struct Observation {
     roots: Vec<u64>,
     rbx_after: u64,
     incoming_count: u64,
+    preparation_calls: usize,
+    preparation_flags: u8,
+    terminal_calls: usize,
 }
 
 unsafe fn observe(ctx: *mut JitCtx) {
@@ -106,6 +113,17 @@ unsafe extern "C" fn inspect_deopt(ctx: *mut JitCtx, _exit: u64) -> NativeResult
 unsafe extern "C" fn inspect_overflow(ctx: *mut JitCtx) -> NativeResultPair {
     unsafe { observe(ctx) };
     NativeResultPair::throw_value(Value::number_i32(919))
+}
+
+unsafe extern "C" fn inspect_constructor_terminal(
+    ctx: *mut JitCtx,
+    pair: *const NativeResultPair,
+) -> NativeResultPair {
+    // SAFETY: the emitted terminal boundary keeps the context, observation
+    // and its parked pair alive for this noncollecting callback.
+    let observation = unsafe { &mut *((*(*ctx).thread).runtime_context as *mut Observation) };
+    observation.terminal_calls += 1;
+    unsafe { pair.read() }
 }
 
 fn transitions() -> TransitionTable {
@@ -279,17 +297,22 @@ fn tier_returns_restore_both_interpreter_root_words() {
         abi::ExitReason::RuntimeTransition,
         abi::ExitAction::Resume,
     );
-    for side_exit in [false, true] {
+    for (side_exit, deferred_frame) in [(false, false), (true, false), (false, true), (true, true)]
+    {
+        let spill = SpillArea {
+            deferred_frame,
+            ..SPILL
+        };
         let mut ops = Assembler::new().unwrap();
         let mut relocations = RelocationCapture::default();
         let exits = exits(&mut ops);
-        emit_tier_prologue(&mut ops, shape.kind, SPILL);
+        emit_tier_prologue(&mut ops, shape.kind, spill);
         emit_inspect(&mut ops, &mut relocations, &transitions);
         dynasm!(ops ; .arch x64 ; mov rbx, QWORD 0x1155);
         if side_exit {
             dynasm!(ops ; .arch x64 ; mov rax, QWORD exit.to_bits() as i64 ; jmp =>exits.side_exit);
         } else {
-            emit_epilogue(&mut ops, exits, shape.kind, SPILL);
+            emit_epilogue(&mut ops, exits, shape.kind, spill);
         }
         emit_exits(
             &mut ops,
@@ -298,7 +321,7 @@ fn tier_returns_restore_both_interpreter_root_words() {
             &view,
             shape,
             exits,
-            SPILL,
+            spill,
         );
         let mapping = ops.finalize().unwrap();
         let mut registers = [Value::number_i32(17); 4];
@@ -399,6 +422,7 @@ fn lazy_called_entries_publish_only_initialized_roots_and_preserve_rbx() {
             &view,
             shape,
             exits,
+            SPILL,
             cold,
         );
         let mapping = ops.finalize().unwrap();
@@ -478,6 +502,266 @@ fn lazy_called_entries_publish_only_initialized_roots_and_preserve_rbx() {
 }
 
 #[test]
+fn deferred_called_entries_publish_only_when_their_record_is_observed() {
+    let view = snapshot();
+    let shape = shape(&view, true);
+    let transitions = transitions();
+    let spill = SpillArea {
+        deferred_frame: true,
+        ..SPILL
+    };
+    for publish in [false, true] {
+        let mut ops = Assembler::new().unwrap();
+        let mut relocations = RelocationCapture::default();
+        let exits = exits(&mut ops);
+        let cold = CallEntryCold::new(&mut ops, shape);
+        let (start, receiver_entry) =
+            emit_call_entry(&mut ops, &mut relocations, &view, shape, spill, cold);
+        dynasm!(ops ; .arch x64 ; mov rbx, QWORD 0x2288);
+        if publish {
+            // Reconstruction may have placed its register dump below the
+            // canonical homes. Publication must still name those homes.
+            dynasm!(ops ; .arch x64 ; sub rsp, 32);
+            emit_publish_deferred_frame(&mut ops, &mut relocations, shape, spill);
+            dynasm!(ops ; .arch x64 ; add rsp, 32);
+        }
+        let unobserved = ops.new_dynamic_label();
+        dynasm!(ops ; .arch x64
+            ; cmp QWORD [r15 + NATIVE_FRAME_OFFSET as i32], 0
+            ; je =>unobserved
+        );
+        emit_inspect(&mut ops, &mut relocations, &transitions);
+        dynasm!(ops ; .arch x64
+            ; =>unobserved
+            ; mov rax, [r13 + 16]
+            ; xor edx, edx
+        );
+        emit_epilogue(&mut ops, exits, shape.kind, spill);
+        emit_exits(
+            &mut ops,
+            &mut relocations,
+            &transitions,
+            &view,
+            shape,
+            exits,
+            spill,
+        );
+        emit_call_entry_cold(
+            &mut ops,
+            &mut relocations,
+            &transitions,
+            &view,
+            shape,
+            exits,
+            spill,
+            cold,
+        );
+        let mapping = ops.finalize().unwrap();
+        let code = CodeEntryCell::new(
+            mapping.ptr(start) as usize,
+            mapping.ptr(receiver_entry) as usize,
+            11,
+            1,
+            4,
+            abi::CODE_ENTRY_HAS_SAFEPOINTS | abi::CODE_ENTRY_OPTIMIZING_TIER,
+            None,
+        );
+        let function = FunctionEntryCell::new(1, 3, 4, view.code_block.call_flags(), 0);
+        function.publish(std::ptr::from_ref(&code) as u64);
+        for parent in [false, true] {
+            for argc in 0..=4 {
+                let actuals: Vec<_> = (0..argc).map(|i| Value::number_i32(100 + i)).collect();
+                let caller = caller(&transitions, &function, &actuals);
+                let mut registers = [Value::number_i32(17); 4];
+                let mut frame = owned_frame(&mut registers);
+                let frame_pointer = if parent {
+                    std::ptr::from_mut(&mut frame)
+                } else {
+                    std::ptr::null_mut()
+                };
+                let mut observation = Observation::default();
+                let mut thread = VmThread::empty();
+                thread.runtime_context = std::ptr::from_mut(&mut observation) as u64;
+                let mut error = None;
+                let mut ctx = context(&mut thread, &mut error, frame_pointer);
+                thread.frame_cell = std::ptr::from_mut(&mut ctx.native_frame) as u64;
+                // SAFETY: both records and all mappings outlive the private
+                // call; the observer allocates no VM values and cannot collect.
+                let entry: unsafe extern "sysv64" fn(*mut JitCtx) -> NativeResultPair =
+                    unsafe { std::mem::transmute(caller.ptr(AssemblyOffset(0))) };
+                let result = unsafe { entry(&mut ctx) };
+                assert_eq!(
+                    result,
+                    NativeResultPair::success(actuals.get(2).copied().unwrap_or(Value::UNDEFINED)),
+                    "publish={publish} parent={parent} argc={argc}"
+                );
+                assert_eq!(ctx.native_frame, frame_pointer);
+                assert_eq!(observation.rbx_after, CANARY);
+                let observed_child = publish || argc < 3;
+                assert_eq!(observation.calls, usize::from(observed_child || parent));
+                if observed_child {
+                    assert_ne!(observation.frame, frame_pointer as usize);
+                    assert_eq!(observation.caller, frame_pointer as u64);
+                    assert_eq!(observation.depth, if parent { 8 } else { 1 });
+                    assert_eq!(observation.call_site, SAFEPOINT);
+                    assert_ne!(observation.machine_roots, 0);
+                    assert_eq!(observation.roots[1], 0);
+                    assert_eq!(observation.actuals, actuals);
+                    if argc < 3 {
+                        let mut initialized = actuals.clone();
+                        initialized.resize(4, Value::UNDEFINED);
+                        assert_eq!(observation.registers, initialized);
+                    } else {
+                        assert_eq!(observation.register_count, 0);
+                        assert_eq!(observation.register_base, 0);
+                    }
+                } else if parent {
+                    assert_eq!(observation.frame, frame_pointer as usize);
+                    assert_eq!(observation.registers, registers);
+                    assert_eq!(observation.call_site, abi::NO_SAFEPOINT);
+                    assert_eq!(observation.machine_roots, 0);
+                }
+                assert_eq!(registers, [Value::number_i32(17); 4]);
+                assert!(error.is_none());
+            }
+        }
+    }
+}
+
+#[test]
+fn abrupt_sloppy_preparation_ignores_inactive_constructor_tickets() {
+    let mut view = snapshot();
+    std::sync::Arc::get_mut(&mut view.code_block)
+        .unwrap()
+        .is_strict = false;
+    let mut shape = shape(&view, true);
+    shape.converts_receiver = true;
+    for pair in [
+        NativeResultPair::throw_value(Value::number_i32(919)),
+        NativeResultPair::fatal_internal(),
+    ] {
+        let mut prepare = Assembler::new().unwrap();
+        if cfg!(target_os = "windows") {
+            dynasm!(prepare ; .arch x64 ; mov r10, rdx);
+        } else {
+            dynasm!(prepare ; .arch x64 ; mov r10, rdi);
+        }
+        dynasm!(prepare ; .arch x64
+            ; mov r11, [r10 + NATIVE_FRAME_OFFSET as i32]
+            ; mov r10, [r10 + THREAD_OFFSET as i32]
+            ; mov r10, [r10 + std::mem::offset_of!(VmThread, runtime_context) as i32]
+            ; inc QWORD [r10 + std::mem::offset_of!(Observation, preparation_calls) as i32]
+            ; mov [r10 + std::mem::offset_of!(Observation, frame) as i32], r11
+            ; movzx eax, BYTE [r11 + crate::entry::NATIVE_FRAME_FLAGS_OFFSET as i32]
+            ; mov BYTE [r10 + std::mem::offset_of!(Observation, preparation_flags) as i32], al
+            ; mov DWORD [r11 + abi::NATIVE_FRAME_CONSTRUCT_LAYOUT_OFFSET as i32], 0x5678
+            ; mov QWORD [r11 + abi::NATIVE_FRAME_SUPER_ORIGIN_OFFSET as i32], 0x1234
+        );
+        // The canonical pair follows the platform C result convention,
+        // including the hidden result pointer on Microsoft targets.
+        let words: [u64; 2] = unsafe { std::mem::transmute(pair) };
+        if cfg!(target_os = "windows") {
+            dynasm!(prepare ; .arch x64
+                ; mov rax, QWORD words[0] as i64
+                ; mov [rcx], rax
+                ; mov rax, QWORD words[1] as i64
+                ; mov [rcx + 8], rax
+                ; mov rax, rcx
+                ; ret
+            );
+        } else {
+            dynasm!(prepare ; .arch x64
+                ; mov rax, QWORD words[0] as i64
+                ; mov rdx, QWORD words[1] as i64
+                ; ret
+            );
+        }
+        let prepare = prepare.finalize().unwrap();
+        let mut transitions = transitions();
+        transitions.replace_entry_for_test(
+            abi::STUB_JIT_PREPARE_ACTIVATION,
+            prepare.ptr(AssemblyOffset(0)) as usize,
+        );
+        transitions.replace_entry_for_test(
+            abi::STUB_JIT_CONSTRUCTOR_TERMINAL,
+            inspect_constructor_terminal as *const () as usize,
+        );
+        for deferred_frame in [false, true] {
+            let spill = SpillArea {
+                deferred_frame,
+                ..SPILL
+            };
+            let mut ops = Assembler::new().unwrap();
+            let mut relocations = RelocationCapture::default();
+            let exits = exits(&mut ops);
+            let cold = CallEntryCold::new(&mut ops, shape);
+            let (start, receiver_entry) =
+                emit_call_entry(&mut ops, &mut relocations, &view, shape, spill, cold);
+            dynasm!(ops ; .arch x64 ; mov eax, VALUE_UNDEFINED as i32 ; xor edx, edx);
+            emit_epilogue(&mut ops, exits, shape.kind, spill);
+            emit_exits(
+                &mut ops,
+                &mut relocations,
+                &transitions,
+                &view,
+                shape,
+                exits,
+                spill,
+            );
+            emit_call_entry_cold(
+                &mut ops,
+                &mut relocations,
+                &transitions,
+                &view,
+                shape,
+                exits,
+                spill,
+                cold,
+            );
+            let mapping = ops.finalize().unwrap();
+            let code = CodeEntryCell::new(
+                mapping.ptr(start) as usize,
+                mapping.ptr(receiver_entry) as usize,
+                11,
+                1,
+                4,
+                abi::CODE_ENTRY_HAS_SAFEPOINTS | abi::CODE_ENTRY_OPTIMIZING_TIER,
+                None,
+            );
+            let function = FunctionEntryCell::new(1, 3, 4, view.code_block.call_flags(), 0);
+            function.publish(std::ptr::from_ref(&code) as u64);
+            let caller = caller(&transitions, &function, &[Value::UNDEFINED; 3]);
+            let mut registers = [Value::number_i32(17); 4];
+            let mut frame = owned_frame(&mut registers);
+            let frame_pointer = std::ptr::from_mut(&mut frame);
+            let mut observation = Observation::default();
+            let mut thread = VmThread::empty();
+            thread.runtime_context = std::ptr::from_mut(&mut observation) as u64;
+            let mut error = None;
+            let mut ctx = context(&mut thread, &mut error, frame_pointer);
+            thread.frame_cell = std::ptr::from_mut(&mut ctx.native_frame) as u64;
+            // SAFETY: all permanent targets, records and platform callbacks
+            // outlive the private call; its poisoned inactive state is never
+            // dereferenced or visited by a collector.
+            let entry: unsafe extern "sysv64" fn(*mut JitCtx) -> NativeResultPair =
+                unsafe { std::mem::transmute(caller.ptr(AssemblyOffset(0))) };
+            let result = unsafe { entry(&mut ctx) };
+            assert_eq!(result, pair, "deferred_frame={deferred_frame}");
+            assert_eq!(observation.preparation_calls, 1);
+            assert_ne!(observation.frame, frame_pointer as usize);
+            assert_eq!(
+                observation.preparation_flags & abi::NativeFrameFlags::CONSTRUCT,
+                0
+            );
+            assert_eq!(observation.terminal_calls, 0);
+            assert_eq!(ctx.native_frame, frame_pointer);
+            assert_eq!(observation.rbx_after, CANARY);
+            assert!(error.is_none());
+        }
+    }
+}
+
+#[test]
 fn overflow_never_publishes_reserved_record_or_spill_roots() {
     let view = snapshot();
     let shape = shape(&view, true);
@@ -506,6 +790,7 @@ fn overflow_never_publishes_reserved_record_or_spill_roots() {
         &view,
         shape,
         exits,
+        SPILL,
         cold,
     );
     let mapping = ops.finalize().unwrap();
@@ -646,6 +931,7 @@ fn physical_tail_replacement_restores_graph_rbx_and_reuses_the_actual_span() {
         &view,
         shape,
         exits,
+        SPILL,
         cold,
     );
     let mapping = ops.finalize().unwrap();

@@ -175,6 +175,17 @@ impl Codegen<'_> {
             Kind::WriteBarrier => {
                 self.emit_write_barrier(node, Self::gp(input(0)), Self::gp(input(1)))
             }
+            Kind::LoadArrayLength => {
+                let (receiver, destination) = (Self::gp(input(0)), output());
+                let exit = self.eager_exit(node, crate::graph::ir::DeoptReason::WrongShape);
+                let storage = otter_vm::jit::JitArrayStorage::current();
+                self.emit_cell_guard(receiver, exit);
+                dynasm!(self.ops ; .arch x64
+                    ; cmp BYTE [Rq(receiver)], storage.type_tag as i8 ; jne =>exit
+                    ; mov r10, [Rq(receiver) + storage.logical_length_byte as i32]
+                    ; mov r11, r10 ; shr r11, 31 ; jnz =>exit
+                    ; mov Rd(destination), r10d);
+            }
             Kind::ElementWriteBarrier => self.emit_element_write_barrier(
                 node,
                 Self::gp(input(0)),

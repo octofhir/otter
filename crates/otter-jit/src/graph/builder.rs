@@ -2945,6 +2945,15 @@ impl<'a> Builder<'a> {
                 .property_accesses
                 .get(&byte_pc)
                 .filter(|site| site.shared);
+            let site = &self.view.instructions[self.pc as usize];
+            // A site that has read only Arrays reads the length word.
+            if site.load_array_length
+                && site.length_reads_arrays_only
+                && !self.exited_for(ExitReason::ShapeGuard)
+            {
+                let value = self.add(Kind::LoadArrayLength, &[object], Repr::Int32);
+                return self.write(instruction.writes[0], value);
+            }
             if self.view.instructions[self.pc as usize].load_array_length {
                 let value = self.add(
                     Kind::LoadPropertyCached {

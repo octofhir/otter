@@ -22,7 +22,9 @@
 //!   the value entering the loop.
 //! - The pre-header merges every entering edge, the OSR entry included,
 //!   with a phi wherever the edges bring different values; the header's
-//!   back edges stay its last predecessors.
+//!   back edges stay its last predecessors. Nothing moves out of the blocks
+//!   of a loop that an entry, such as the OSR entry into an inner loop,
+//!   reaches without passing its header.
 //! - A moved check leaves to the loop header with the values entering the
 //!   loop, so the interpreter runs the iteration the check guarded. A
 //!   header that already left optimized code for a shape or layout mismatch
@@ -86,6 +88,37 @@ fn loop_body(graph: &Graph, header: BlockId) -> FxHashSet<BlockId> {
     body
 }
 
+/// The blocks of `body` an entry reaches without passing `header`: every
+/// block forward of a body block with no predecessor, such as the OSR entry.
+fn bypassed_blocks(
+    graph: &Graph,
+    header: BlockId,
+    body: &FxHashSet<BlockId>,
+) -> FxHashSet<BlockId> {
+    let mut reached = FxHashSet::default();
+    let mut work: Vec<BlockId> = body
+        .iter()
+        .copied()
+        .filter(|&block| block != header && graph.block(block).predecessors.is_empty())
+        .collect();
+    while let Some(block) = work.pop() {
+        if block == header || !body.contains(&block) || !reached.insert(block) {
+            continue;
+        }
+        let Some(control) = graph.block(block).control else {
+            continue;
+        };
+        match graph.node(control).kind {
+            Kind::Jump(target) | Kind::JumpLoop(target) => work.push(target),
+            Kind::Branch {
+                if_true, if_false, ..
+            } => work.extend([if_true, if_false]),
+            _ => {}
+        }
+    }
+    reached
+}
+
 /// What the loop body may change.
 struct Clobbers {
     shapes: bool,
@@ -135,6 +168,10 @@ fn hoist_loop(
     header: &LoopHeader,
     body: &FxHashSet<BlockId>,
 ) {
+    // An entry into the body that bypasses the header, the OSR entry into an
+    // inner loop among them, reaches the blocks after it without the
+    // pre-header: nothing there moves.
+    let bypassed = bypassed_blocks(graph, header.block, body);
     let Some(clobbers) = clobbers(graph, body) else {
         return;
     };
@@ -165,6 +202,9 @@ fn hoist_loop(
     let mut moved_set: FxHashSet<NodeId> = FxHashSet::default();
     let mut checks: Vec<(Kind, SmallVec<[NodeId; 3]>)> = Vec::new();
     for &block in &ordered {
+        if bypassed.contains(&block) {
+            continue;
+        }
         let nodes = graph.block(block).body.clone();
         let mut kept = Vec::with_capacity(nodes.len());
         for node in nodes {

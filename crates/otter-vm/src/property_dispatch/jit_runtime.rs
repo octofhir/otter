@@ -94,6 +94,7 @@ impl Interpreter {
             named_property_site(context, function_id, instruction_pc, PropertyIcKind::Load)
                 .map_err(CommittedValueError::Fatal)?;
         slot.record_attempt();
+        slot.record_length_receiver(atomized_key.name(), receiver);
         self.record_jit_runtime_property_stub();
         let scope_frame = crate::handles::HandleScopeFrame::enter(self);
         let scope = scope_frame.token();

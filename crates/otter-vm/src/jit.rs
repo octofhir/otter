@@ -2005,6 +2005,8 @@ pub struct JitInstructionMetadata {
     /// Whether this named-property site reached semantic dispatch, independently
     /// of whether its receivers admit an attached CacheIR program.
     pub property_attempted: bool,
+    /// Whether this `length` read has run and read only Arrays.
+    pub length_reads_arrays_only: bool,
     /// Arithmetic representation observations frozen for this canonical PC.
     pub(crate) arith_feedback: ArithFeedback,
     /// Address of the live arithmetic observation byte baseline code
@@ -2022,6 +2024,7 @@ impl JitInstructionMetadata {
             load_number: None,
             call_attempted: false,
             property_attempted: false,
+            length_reads_arrays_only: false,
             arith_feedback: ArithFeedback::default(),
             arith_cell: 0,
         }

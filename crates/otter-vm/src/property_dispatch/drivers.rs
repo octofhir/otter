@@ -72,6 +72,7 @@ impl Interpreter {
         let top_idx = stack.len() - 1;
         let receiver =
             *read_register(&stack[top_idx], obj_reg).map_err(CommittedValueError::Fatal)?;
+        slot.record_length_receiver(name, receiver);
         if let Some(value) = self.projected_load(slot, receiver, atomized_key) {
             Self::finish_property_fast_path_value(&mut stack[top_idx], dst, value)
                 .map_err(CommittedValueError::Fatal)?;

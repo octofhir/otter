@@ -366,6 +366,12 @@ impl ExecutionContext {
                     .is_some_and(|name| name == "length")
             {
                 instr.load_array_length = true;
+                instr.length_reads_arrays_only = code_block
+                    .property_feedback_at(
+                        instr.instruction_pc(&code_block) as usize,
+                        crate::property_ic::PropertyIcKind::Load,
+                    )
+                    .is_some_and(crate::feedback::PropertyFeedbackSlot::length_reads_arrays_only);
             }
             if instr.op(&code_block) == otter_bytecode::Op::CallMethodValue
                 && let Some(otter_bytecode::Operand::ConstIndex(idx)) =

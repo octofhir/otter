@@ -38,6 +38,7 @@ pub(crate) struct CliExecutionConfig {
     warning_options: WarningOptions,
     process_title: Option<String>,
     expose_gc: bool,
+    gc_trace: bool,
     perf_map: bool,
     expose_internals: bool,
     /// How much stack a call may use, in kilobytes, as `--stack-size` named it.
@@ -57,6 +58,7 @@ impl Default for CliExecutionConfig {
             warning_options: WarningOptions::default(),
             process_title: None,
             expose_gc: false,
+            gc_trace: false,
             perf_map: false,
             expose_internals: false,
             stack_size: None,
@@ -84,6 +86,7 @@ impl CliExecutionConfig {
             warning_options: WarningOptions::default(),
             process_title: None,
             expose_gc: false,
+            gc_trace: false,
             perf_map: false,
             expose_internals: false,
             stack_size: None,
@@ -106,6 +109,11 @@ impl CliExecutionConfig {
     /// Enable the global `gc()` captured from `--expose-gc`.
     pub(crate) fn set_expose_gc(&mut self, expose: bool) {
         self.expose_gc = expose;
+    }
+
+    /// Report every collection pause, captured from `--trace-gc`.
+    pub(crate) fn set_gc_trace(&mut self, trace: bool) {
+        self.gc_trace = trace;
     }
 
     /// Name installed compiled code in the perf map.
@@ -212,7 +220,8 @@ impl CliExecutionConfig {
             // Node lets the main thread park in `Atomics.wait`; the CLI owns a
             // watchdog and an interrupt handle, so the park is cancellable.
             .allow_blocking_atomics_wait(true)
-            .expose_gc(self.expose_gc);
+            .expose_gc(self.expose_gc)
+            .gc_trace(self.gc_trace);
         if let Some(depth) = self.stack_depth() {
             builder = builder.max_stack_depth(depth);
         }
@@ -428,6 +437,7 @@ mod tests {
             warning_options: WarningOptions::default(),
             process_title: None,
             expose_gc: false,
+            gc_trace: false,
             perf_map: false,
             expose_internals: false,
             stack_size: None,
@@ -453,6 +463,7 @@ mod tests {
             warning_options: WarningOptions::default(),
             process_title: None,
             expose_gc: false,
+            gc_trace: false,
             perf_map: false,
             expose_internals: false,
             stack_size: None,
@@ -482,6 +493,7 @@ mod tests {
             warning_options: WarningOptions::default(),
             process_title: None,
             expose_gc: false,
+            gc_trace: false,
             perf_map: false,
             expose_internals: false,
             stack_size: None,
@@ -502,6 +514,7 @@ mod tests {
             warning_options: WarningOptions::default(),
             process_title: None,
             expose_gc: false,
+            gc_trace: false,
             perf_map: false,
             expose_internals: false,
             stack_size: None,

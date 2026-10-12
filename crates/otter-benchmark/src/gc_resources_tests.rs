@@ -15,6 +15,8 @@ fn record(sequence: u64, duration: u64) -> GcPauseRecord {
         full_cycles_after: 0,
         minor_cycles_before: sequence - 1,
         minor_cycles_after: sequence,
+        before: otter_runtime::HeapOccupancy::default(),
+        after: otter_runtime::HeapOccupancy::default(),
     }
 }
 
@@ -80,6 +82,8 @@ fn complete_full_record_covers_its_nested_minor_before_next_outer_minor() {
         full_cycles_after: 5,
         minor_cycles_before: 10,
         minor_cycles_after: 12,
+        before: otter_runtime::HeapOccupancy::default(),
+        after: otter_runtime::HeapOccupancy::default(),
         ..record(1, 5_000)
     };
     let minor = GcPauseRecord {
@@ -87,6 +91,8 @@ fn complete_full_record_covers_its_nested_minor_before_next_outer_minor() {
         full_cycles_after: 5,
         minor_cycles_before: 12,
         minor_cycles_after: 13,
+        before: otter_runtime::HeapOccupancy::default(),
+        after: otter_runtime::HeapOccupancy::default(),
         ..record(2, 7_000)
     };
     let trace = trace_document(
@@ -129,6 +135,8 @@ fn omitted_cycles_cannot_become_a_complete_or_available_tail_sample() {
     let second = GcPauseRecord {
         minor_cycles_before: 2,
         minor_cycles_after: 3,
+        before: otter_runtime::HeapOccupancy::default(),
+        after: otter_runtime::HeapOccupancy::default(),
         ..record(2, 101)
     };
     let trace = trace_document(
@@ -163,6 +171,8 @@ fn malformed_sequence_time_kind_and_regressing_counts_retain_raw_events() {
         GcPauseRecord {
             minor_cycles_before: 2,
             minor_cycles_after: 1,
+            before: otter_runtime::HeapOccupancy::default(),
+            after: otter_runtime::HeapOccupancy::default(),
             ..valid
         },
         GcPauseRecord {
@@ -224,6 +234,8 @@ fn incomplete_failed_and_dropped_records_remain_visible_and_unscoreable() {
     let event = GcPauseRecord {
         outcome: GcPauseOutcome::CollectionFailed,
         minor_cycles_after: 0,
+        before: otter_runtime::HeapOccupancy::default(),
+        after: otter_runtime::HeapOccupancy::default(),
         ..record(1, 51)
     };
     let trace = trace_document(

@@ -12,7 +12,13 @@ use super::*;
 fn incomplete_transfer_cannot_restart_until_the_original_envelope_closes() {
     let mut recorder = GcPauseRecorder::default();
     recorder.start(2).unwrap();
-    let token = recorder.begin(GcPauseKind::Full, GcPauseTrigger::Explicit, 0, 0);
+    let token = recorder.begin(
+        GcPauseKind::Full,
+        GcPauseTrigger::Explicit,
+        0,
+        0,
+        HeapOccupancy::default(),
+    );
     let capture = recorder.take().unwrap();
     assert!(capture.incomplete);
     assert!(capture.records.is_empty());
@@ -20,10 +26,28 @@ fn incomplete_transfer_cannot_restart_until_the_original_envelope_closes() {
         recorder.start(2),
         Err(GcPauseCaptureError::CollectionInProgress)
     );
-    recorder.end(token, GcPauseOutcome::Completed, 1, 1);
+    recorder.end(
+        token,
+        GcPauseOutcome::Completed,
+        1,
+        1,
+        HeapOccupancy::default(),
+    );
     recorder.start(2).unwrap();
-    let token = recorder.begin(GcPauseKind::Minor, GcPauseTrigger::Explicit, 1, 1);
-    recorder.end(token, GcPauseOutcome::Completed, 1, 2);
+    let token = recorder.begin(
+        GcPauseKind::Minor,
+        GcPauseTrigger::Explicit,
+        1,
+        1,
+        HeapOccupancy::default(),
+    );
+    recorder.end(
+        token,
+        GcPauseOutcome::Completed,
+        1,
+        2,
+        HeapOccupancy::default(),
+    );
     let capture = recorder.take().unwrap();
     assert!(!capture.incomplete);
     assert_eq!(capture.records.len(), 1);
@@ -41,10 +65,34 @@ fn admission_limits_and_reserved_storage_are_stable_across_nested_service() {
     recorder.start(2).unwrap();
     let buffer = recorder.capture.as_ref().unwrap().records.as_ptr();
     let capacity = recorder.capture.as_ref().unwrap().records.capacity();
-    let outer = recorder.begin(GcPauseKind::Full, GcPauseTrigger::Explicit, 0, 0);
-    let inner = recorder.begin(GcPauseKind::SplitMark, GcPauseTrigger::Explicit, 0, 1);
-    recorder.end(inner, GcPauseOutcome::Completed, 0, 1);
-    recorder.end(outer, GcPauseOutcome::Completed, 1, 1);
+    let outer = recorder.begin(
+        GcPauseKind::Full,
+        GcPauseTrigger::Explicit,
+        0,
+        0,
+        HeapOccupancy::default(),
+    );
+    let inner = recorder.begin(
+        GcPauseKind::SplitMark,
+        GcPauseTrigger::Explicit,
+        0,
+        1,
+        HeapOccupancy::default(),
+    );
+    recorder.end(
+        inner,
+        GcPauseOutcome::Completed,
+        0,
+        1,
+        HeapOccupancy::default(),
+    );
+    recorder.end(
+        outer,
+        GcPauseOutcome::Completed,
+        1,
+        1,
+        HeapOccupancy::default(),
+    );
     assert_eq!(recorder.capture.as_ref().unwrap().records.as_ptr(), buffer);
     assert_eq!(
         recorder.capture.as_ref().unwrap().records.capacity(),

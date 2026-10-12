@@ -52,6 +52,7 @@ use semver::{Version, VersionReq};
 mod dlx;
 mod error_render;
 mod execution_config;
+mod gc_trace;
 mod watch;
 
 use dlx::DlxArgs;
@@ -193,6 +194,13 @@ struct Cli {
     /// (Node's `--expose-gc`).
     #[arg(long = "expose-gc", alias = "expose_gc", global = true)]
     expose_gc: bool,
+
+    /// Report every garbage collection on stderr when the run ends: kind,
+    /// trigger, pause and heap occupancy, then pause percentiles per kind and
+    /// the old generation retained after the last full collection (Node's
+    /// `--trace-gc`).
+    #[arg(long = "trace-gc", alias = "trace_gc", global = true)]
+    trace_gc: bool,
 
     /// Write every installed compiled function to `/tmp/perf-<pid>.map` so
     /// profilers can name generated code (Node's `--perf-basic-prof`).
@@ -965,6 +973,7 @@ async fn main() -> ExitCode {
     });
     execution.set_process_title(cli.title.clone());
     execution.set_expose_gc(cli.expose_gc);
+    execution.set_gc_trace(cli.trace_gc);
     execution.set_perf_map(cli.perf_basic_prof);
     execution.set_expose_internals(cli.expose_internals);
     execution.set_stack_size(cli.stack_size);
@@ -1242,6 +1251,7 @@ async fn run_file_with_cwd(
     };
     startup_timer.mark("runtime_run_file");
     emit_otter_stats_if_requested(&result);
+    emit_gc_trace(&result);
     let profile_artifacts = match cpu_profile {
         Some(options) => Some(report_cpu_profile(path, &result, options)?),
         None => None,
@@ -1476,6 +1486,13 @@ fn folded_frame_name(function_name: &str, module: &str) -> String {
         name.push(']');
     }
     name
+}
+
+/// Print the run's collection pauses, when `--trace-gc` asked for them.
+fn emit_gc_trace(result: &otter_runtime::ExecutionResult) {
+    if let Some(pauses) = result.gc_pauses() {
+        eprint!("{}", gc_trace::render(pauses));
+    }
 }
 
 fn emit_otter_stats_if_requested(result: &otter_runtime::ExecutionResult) {
@@ -1902,6 +1919,7 @@ async fn run_script_file_sequence(
         )?;
         startup_timer.mark("runtime_run_script_file");
         emit_otter_stats_if_requested(&result);
+        emit_gc_trace(&result);
         let exit_code = result.exit_code();
         final_result = Some(result);
         if exit_code != 0 {

@@ -271,6 +271,9 @@ pub struct OldSpace {
     /// than split and re-inserted per object. Its unused part always starts
     /// with a free filler header, keeping the page walkable.
     lab: Option<FreeEntry>,
+    /// Sum of every page's `allocated_bytes`: the bytes cells occupy,
+    /// maintained by every allocation and return and recounted after a sweep.
+    allocated: usize,
 }
 
 /// Bump room below which an old page closes: its tail becomes one free-list
@@ -287,12 +290,19 @@ impl OldSpace {
             standby: Vec::new(),
             open: Vec::new(),
             lab: None,
+            allocated: 0,
         }
     }
 
     /// Allocate `size_aligned` bytes in old-space: reuse a swept free
     /// range when one fits, otherwise bump, otherwise grow by one page.
     pub fn alloc(&mut self, size_aligned: usize) -> Result<u32, OutOfMemory> {
+        let offset = self.alloc_inner(size_aligned)?;
+        self.allocated += size_aligned;
+        Ok(offset)
+    }
+
+    fn alloc_inner(&mut self, size_aligned: usize) -> Result<u32, OutOfMemory> {
         if size_aligned > PAGE_PAYLOAD_SIZE {
             return Err(OutOfMemory::AllocationTooLarge {
                 requested_bytes: size_aligned as u64,
@@ -383,31 +393,62 @@ impl OldSpace {
         Ok(offset)
     }
 
-    /// A linear area for one scavenger thread to promote into, at least
-    /// `min` bytes. Swept holes come first, as for [`Self::alloc`]: one of at
-    /// least `want` bytes, else one that fits `min`; then the newest open
-    /// page's whole bump tail; then a fresh page. A taken range is handed out
-    /// whole and its bytes count as allocated until [`Self::return_lab`]
-    /// gives back the unused rest. Nothing here walks the page list.
+    /// A linear area of at least `min` and at most `max` bytes. Swept holes
+    /// come first, as for [`Self::alloc`]: one of at least `want` bytes,
+    /// else one that fits `min`; then the newest open page's bump tail; then
+    /// a fresh page. A hole, tail or page larger than `max` gives `max` and
+    /// keeps the rest for later requests. The bytes count as allocated until
+    /// [`Self::return_lab`] gives back the unused rest. Nothing here walks
+    /// the page list.
     pub(crate) fn take_lab(
         &mut self,
         min: usize,
         want: usize,
+        max: usize,
     ) -> Result<(u32, usize), OutOfMemory> {
-        debug_assert!(min <= want && want <= PAGE_PAYLOAD_SIZE);
+        debug_assert!(min <= want && want <= max && max <= PAGE_PAYLOAD_SIZE);
+        let (offset, len) = self.take_lab_inner(min, want, max)?;
+        self.allocated += len;
+        Ok((offset, len))
+    }
+
+    fn take_lab_inner(
+        &mut self,
+        min: usize,
+        want: usize,
+        max: usize,
+    ) -> Result<(u32, usize), OutOfMemory> {
         if let Some(entry) = self
             .free_list
             .take(want)
             .or_else(|| self.free_list.take(min))
         {
-            // SAFETY: the entry names a filler-capped range of a live page
-            // of this space; account the handed-out bytes on that page.
+            let len = (entry.size as usize).min(max);
+            let rest = entry.size as usize - len;
+            if rest != 0 {
+                let rest_offset = entry.offset + len as u32;
+                let in_page = rest_offset as usize & (PAGE_SIZE - 1);
+                // SAFETY: the rest lies inside the same filler-capped range
+                // of a live page of this space; capping it keeps the page
+                // walkable and lists it again.
+                unsafe {
+                    std::ptr::write(
+                        crate::page::page_base_from_offset(rest_offset)
+                            .add(in_page)
+                            .cast::<crate::header::GcHeader>(),
+                        crate::header::GcHeader::new_free(rest as u32),
+                    );
+                    self.free_list.push(rest_offset, rest);
+                }
+            }
+            // SAFETY: the entry names a range of a live page of this space;
+            // account the handed-out bytes on that page.
             let page_header = unsafe {
                 &mut *(crate::page::page_base_from_offset(entry.offset)
                     as *mut crate::page::PageHeader)
             };
-            page_header.allocated_bytes += entry.size as usize;
-            return Ok((entry.offset, entry.size as usize));
+            page_header.allocated_bytes += len;
+            return Ok((entry.offset, len));
         }
         while let Some(&page_offset) = self.open.last() {
             // SAFETY: `open` names only live old pages owned by this space.
@@ -418,10 +459,14 @@ impl OldSpace {
             let cursor = header.bump_cursor;
             let room = header.span_bytes() - cursor;
             if room >= min {
-                header.bump_cursor = cursor + room;
-                header.allocated_bytes += room;
-                self.open.pop();
-                return Ok((page_offset + cursor as u32, room));
+                let len = room.min(max);
+                header.bump_cursor = cursor + len;
+                header.allocated_bytes += len;
+                if header.span_bytes() - header.bump_cursor < OPEN_PAGE_MIN_ROOM {
+                    Self::retire_bump_tail(&mut self.free_list, page_offset, header);
+                    self.open.pop();
+                }
+                return Ok((page_offset + cursor as u32, len));
             }
             Self::retire_bump_tail(&mut self.free_list, page_offset, header);
             self.open.pop();
@@ -430,20 +475,23 @@ impl OldSpace {
             Some(reserved) => reserved,
             None => Page::new(SpaceKind::Old).ok_or(OutOfMemory::CageExhausted)?,
         };
-        let room = page.header().bump_remaining();
+        let len = page.header().bump_remaining().min(max);
         let offset = page
-            .bump_alloc(room)
+            .bump_alloc(len)
             .ok_or(OutOfMemory::AllocationTooLarge {
                 requested_bytes: min as u64,
                 max_bytes: PAGE_PAYLOAD_SIZE as u64,
             })?;
+        if page.header().bump_remaining() >= OPEN_PAGE_MIN_ROOM {
+            self.open.push(page.cage_offset());
+        }
         self.pages.push(page);
-        Ok((offset, room))
+        Ok((offset, len))
     }
 
     /// Return the unused `size` bytes at `offset` of an area
-    /// [`Self::take_lab`] handed out: cap them with a free filler so the page
-    /// stays walkable and list them for reuse.
+    /// [`Self::take_lab`] or [`Self::alloc`] handed out: cap them with a free
+    /// filler so the page stays walkable and list them for reuse.
     pub(crate) fn return_lab(&mut self, offset: u32, size: usize) {
         if size == 0 {
             return;
@@ -461,6 +509,7 @@ impl OldSpace {
             page_header.allocated_bytes -= size;
             self.free_list.push(offset, size);
         }
+        self.allocated -= size;
     }
 
     /// Close a page's bump area: cap the unused tail with a free filler so the
@@ -571,6 +620,7 @@ impl OldSpace {
     /// byte image and relocates its pointers before handing it over. The
     /// free list is untouched: the page arrives fully bump-allocated.
     pub(crate) fn adopt_page(&mut self, page: Page) {
+        self.allocated += page.header().allocated_bytes;
         self.pages.push(page);
     }
 
@@ -589,9 +639,26 @@ impl OldSpace {
         &mut self.pages
     }
 
-    /// Bytes allocated in old-space (sum of per-page).
+    /// Bytes allocated in old-space: the sum of every page's allocated bytes.
     pub fn allocated_bytes(&self) -> usize {
-        self.pages.iter().map(|p| p.header().allocated_bytes).sum()
+        debug_assert_eq!(
+            self.allocated,
+            self.pages
+                .iter()
+                .map(|p| p.header().allocated_bytes)
+                .sum::<usize>()
+        );
+        self.allocated
+    }
+
+    /// Recount [`Self::allocated_bytes`] from the pages a reap kept, whose
+    /// allocated bytes a sweep set to what survived.
+    fn recount_allocated(&mut self) {
+        self.allocated = self
+            .pages
+            .iter()
+            .map(|page| page.header().allocated_bytes)
+            .sum();
     }
 
     /// Clear the live-bytes counter on every page so a fresh
@@ -616,6 +683,7 @@ impl OldSpace {
         let pages = &self.pages;
         self.open
             .retain(|offset| pages.iter().any(|page| page.cage_offset() == *offset));
+        self.recount_allocated();
         before - self.pages.len()
     }
 }

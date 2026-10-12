@@ -24,9 +24,18 @@
 //! - Initialized trailing allocation
 //!   ([`GcHeap::alloc_trailing_with_roots_initialized`]): a young body whose
 //!   variable tail is filled before any collection can observe it.
+//! - Stop-the-world mark drains and old-space sweeps of a large old
+//!   generation run on the heap's helper threads (see `sweep`).
 //!
 //! # Invariants
 //!
+//! - Outside a marking cycle every cell is white: the sweep whitens each
+//!   survivor, and only a cycle shades or allocates black. A cycle skips the
+//!   whole-heap color reset unless an unswept cycle or a restored image left
+//!   colors behind.
+//! - The old generation is measured by the bytes its cells occupy, not the
+//!   pages they span: the mark-sweep trigger and the limits it recomputes use
+//!   the same measure, so swept holes count as free space.
 //! - Every public `alloc<T>` records `T::TYPE_TAG` on the
 //!   [`crate::header::GcHeader`]; full GC dispatches through the
 //!   trace table by tag.
@@ -119,11 +128,17 @@ pub fn empty() -> EmptyRoots {
 /// Number of [`GcHeap::embedder_root`] slots.
 pub const EMBEDDER_ROOT_SLOTS: usize = 2;
 
-/// Old-generation allocation limit before the first mark-compact: 256 MiB
-/// times the heap-limit multiplier (system pointer size / 4 = 2 on 64-bit
-/// targets). The heap grows freely up to it; collections before then would
-/// re-mark a young, mostly-live old generation for little reclamation.
-const INITIAL_OLD_GENERATION_SIZE: u64 = 512 * 1024 * 1024;
+/// Old-generation cell bytes before the first mark-sweep. The heap grows
+/// freely up to it; collections before then would re-mark a young, mostly
+/// live old generation for little reclamation. Every page this limit lets
+/// the old generation touch stays resident after the collection, so it
+/// bounds the peak footprint of a program that promotes garbage steadily.
+const INITIAL_OLD_GENERATION_SIZE: u64 = 256 * 1024 * 1024;
+/// Old-generation size from which a stop-the-world mark drain runs on the
+/// helper threads too.
+const PARALLEL_MARK_MIN_OLD_BYTES: u64 = 8 * 1024 * 1024;
+/// Old-space pages from which a sweep runs on the helper threads too.
+const PARALLEL_SWEEP_MIN_PAGES: usize = 32;
 /// Lower bound of every recomputed old-generation limit.
 const MIN_OLD_GENERATION_SIZE: u64 = 16 * 1024 * 1024;
 /// The growing-factor bounds and the mutator utilization the limit targets
@@ -371,6 +386,10 @@ pub struct GcHeap {
     /// Helper threads that trace and copy alongside the collecting thread,
     /// started at the first scavenge large enough to share.
     gc_threads: crate::gc_threads::GcThreads,
+    /// Every cell is white: no marking cycle has run since the last sweep
+    /// whitened its survivors, and no restored page brought colors in. A
+    /// cycle starting while this holds skips the whole-heap color reset.
+    marks_white: bool,
     /// External reservation bytes that force a mark-compact: the surviving
     /// reservations plus [`EXTERNAL_ALLOCATION_SOFT_LIMIT`].
     external_limit: u64,
@@ -585,6 +604,7 @@ impl GcHeap {
             reserved_bytes: 0,
             old_generation_limit: INITIAL_OLD_GENERATION_SIZE.min(cage_hardcap_bytes()),
             gc_threads: crate::gc_threads::GcThreads::default(),
+            marks_white: true,
             external_limit: EXTERNAL_ALLOCATION_SOFT_LIMIT,
             old_generation_bytes_at_last_gc: 0,
             last_major_gc_end: Instant::now(),
@@ -2284,15 +2304,38 @@ impl GcHeap {
             trigger,
             self.gc_stats.gc_cycles,
             self.gc_stats.minor_gc_cycles,
+            self.observed_occupancy(),
         );
         let (result, outcome) = work(self);
+        let occupancy = self.observed_occupancy();
         self.pause_recorder.end(
             token,
             outcome,
             self.gc_stats.gc_cycles,
             self.gc_stats.minor_gc_cycles,
+            occupancy,
         );
         result
+    }
+
+    /// Occupancy for a captured pause record; nothing is read while no
+    /// capture runs.
+    fn observed_occupancy(&self) -> crate::observation::HeapOccupancy {
+        if !self.pause_recorder.is_capturing() {
+            return crate::observation::HeapOccupancy::default();
+        }
+        crate::observation::HeapOccupancy {
+            old_bytes: self.old_generation_page_bytes(),
+            old_allocated_bytes: (self.old_space.allocated_bytes()
+                + self.large_space.allocated_bytes()) as u64,
+            young_bytes: self.new_space.allocated_bytes() as u64,
+        }
+    }
+
+    /// Hand over the pause records captured so far and keep capturing.
+    /// `None` when no capture runs or a collection is in progress.
+    pub fn drain_gc_pause_capture(&mut self) -> Option<GcPauseCapture> {
+        self.pause_recorder.drain()
     }
 
     fn with_gc_pause_result<R>(
@@ -2464,7 +2507,7 @@ impl GcHeap {
         external_visit: &mut RootSlotVisitor<'_>,
     ) -> Result<(), OutOfMemory> {
         let pause_start = Instant::now();
-        let old_generation_before = self.old_generation_page_bytes();
+        let old_generation_before = self.old_generation_consumed_bytes();
         self.mark_phase(external_visit)?;
         self.run_post_mark_processing();
         self.sweep_phase_with_pause_start(pause_start);
@@ -2478,15 +2521,15 @@ impl GcHeap {
     /// The collection speed is the old generation it processed per
     /// millisecond of this pause; the mutator speed is the old generation
     /// allocated since the previous mark-compact per millisecond of mutator
-    /// time, scavenge pauses excluded. The limit is the surviving pages
-    /// times their growing factor, at least the minimum growing step above
-    /// them, plus the nursery's capacity, bounded below by
+    /// time, scavenge pauses excluded. The limit is the surviving cells'
+    /// bytes times their growing factor, at least the minimum growing step
+    /// above them, plus the nursery's capacity, bounded below by
     /// [`MIN_OLD_GENERATION_SIZE`] and above by the cage ceiling, where a
     /// legitimately large live set settles instead of collecting on every
     /// allocation.
     fn recompute_allocation_limits(&mut self, pause_start: Instant, old_generation_before: u64) {
         let now = Instant::now();
-        let live = self.old_generation_page_bytes();
+        let live = self.old_generation_consumed_bytes();
         let pause_ms = now.duration_since(pause_start).as_secs_f64() * 1000.0;
         let minor_ms = self
             .gc_stats
@@ -2637,14 +2680,21 @@ impl GcHeap {
         if self.in_major_gc {
             return false;
         }
-        // O(1) occupancy: page counts × page size (over-counts slack,
-        // which only makes the trigger fire slightly early — fine).
-        // Summing per-page allocated_bytes here would make every
-        // allocation O(pages). The limit is itself clamped below the cage
-        // ceiling, so a large live set settles just under it instead of
-        // collecting on every allocation.
-        self.old_generation_page_bytes() >= self.old_generation_limit
+        // The bytes old cells occupy, not the pages they span: swept holes
+        // are reusable space, so a fragmented generation is measured by
+        // what it holds. The limit is itself clamped below the cage ceiling,
+        // so a large live set settles just under it instead of collecting
+        // on every allocation.
+        self.old_generation_consumed_bytes() >= self.old_generation_limit
             || self.reserved_bytes >= self.external_limit
+    }
+
+    /// Bytes the old generation's cells occupy: old-space cells, live or not
+    /// yet swept, plus whole large-object pages. O(1).
+    fn old_generation_consumed_bytes(&self) -> u64 {
+        (self.old_space.allocated_bytes() as u64).saturating_add(
+            (self.large_space.page_count() as u64).saturating_mul(crate::page::PAGE_SIZE as u64),
+        )
     }
 
     /// Old/large page bytes: the old generation's occupancy.
@@ -2682,10 +2732,28 @@ impl GcHeap {
     ) -> Result<(), OutOfMemory> {
         self.start_incremental_mark_phase(external_visit)?;
         // SAFETY: STW pause; all pushed headers alive.
-        unsafe {
-            self.marking.drain_full(&self.trace_table);
-        }
+        unsafe { self.drain_marking_stopped() };
         Ok(())
+    }
+
+    /// Drain the marking worklist under a stop-the-world pause, on the
+    /// helper threads as well once the old generation is large enough to
+    /// share.
+    ///
+    /// # Safety
+    ///
+    /// STW pause; every header on the worklist is alive.
+    unsafe fn drain_marking_stopped(&mut self) {
+        // SAFETY: forwarded from the caller; trace callbacks are
+        // object-local.
+        unsafe {
+            if self.old_generation_page_bytes() >= PARALLEL_MARK_MIN_OLD_BYTES {
+                self.marking
+                    .drain_parallel(&self.trace_table, &mut self.gc_threads);
+            } else {
+                self.marking.drain_full(&self.trace_table);
+            }
+        }
     }
 
     /// Begin an incremental old-gen mark cycle.
@@ -2732,28 +2800,34 @@ impl GcHeap {
         // Reset old-space + LOS live counters; mark cycle.
         self.old_space.reset_live_bytes();
         self.large_space.reset_live_bytes();
-        // Reset every header's mark to white before we begin.
-        // SAFETY: STW pause + we own the spaces.
-        unsafe {
-            for page in self.old_space.pages() {
-                page.for_each_object(|h, _| {
-                    (*h).clear_mark();
-                });
-            }
-            for page in self.large_space.pages() {
-                page.for_each_object(|h, _| {
-                    (*h).clear_mark();
-                });
-            }
-            // Young-gen survivors after scavenge live in
-            // to-space — but the scavenger has flipped, so they
-            // now live in from-space. Clear marks there too.
-            for page in self.new_space.from_pages() {
-                page.for_each_object(|h, _| {
-                    (*h).clear_mark();
-                });
+        // Every header must be white before we begin. The previous cycle's
+        // sweep whitened its survivors and nothing shades outside a cycle,
+        // so the whole-heap reset runs only after an unswept cycle or a
+        // restored image.
+        if !self.marks_white {
+            // SAFETY: STW pause + we own the spaces.
+            unsafe {
+                for page in self.old_space.pages() {
+                    page.for_each_object(|h, _| {
+                        (*h).clear_mark();
+                    });
+                }
+                for page in self.large_space.pages() {
+                    page.for_each_object(|h, _| {
+                        (*h).clear_mark();
+                    });
+                }
+                // Young-gen survivors after scavenge live in
+                // to-space — but the scavenger has flipped, so they
+                // now live in from-space. Clear marks there too.
+                for page in self.new_space.from_pages() {
+                    page.for_each_object(|h, _| {
+                        (*h).clear_mark();
+                    });
+                }
             }
         }
+        self.marks_white = false;
 
         self.marking.start_cycle();
         self.shade_roots(external_visit);
@@ -2820,9 +2894,7 @@ impl GcHeap {
         // into a root slot (where no barrier fires).
         self.shade_roots(external_visit);
         // SAFETY: STW pause covers the final drain.
-        unsafe {
-            self.marking.drain_full(&self.trace_table);
-        }
+        unsafe { self.drain_marking_stopped() };
     }
 
     fn shade_roots(&mut self, external_visit: &mut RootSlotVisitor<'_>) {
@@ -2964,105 +3036,65 @@ impl GcHeap {
         let mut per_tag_live_count = [0u64; TYPE_TAG_COUNT];
         let mut per_tag_live_bytes = [0usize; TYPE_TAG_COUNT];
         // Free ranges recovered from partially-live old pages this sweep
-        // (page-absolute cage offset + byte length). Collected locally and
-        // published to the old-space free list after the walk borrows end.
-        let mut free_ranges: Vec<(u32, usize)> = Vec::new();
+        // (page-absolute cage offset + byte length), published to the
+        // old-space free list after the walk and the reclamation hooks.
+        let free_ranges: Vec<(u32, usize)>;
         self.old_space.clear_free_list();
+        // Prune the remembered set to parents that survived this full GC.
+        // The embedded pre-mark scavenge (`start_incremental_mark_phase`)
+        // repopulated the buffer with the live old→young edges among
+        // survivors, but mark-sweep may then free some of those parents as
+        // unreachable. A dead parent left in the buffer would dangle once
+        // `reap_dead_pages` frees its page and the cage offset is reused, so
+        // drop every entry whose header did not survive the mark (and clear
+        // its now-meaningless remembered bit). Runs before the sweep below
+        // whitens the survivors, while every header still shows its color.
+        self.remembered_parents.retain(|raw| {
+            // SAFETY: STW pause; `raw` is an in-cage old/large parent offset
+            // recorded by the barrier; its header is live until the reap below.
+            let header = unsafe { cage_base().add(raw.0 as usize) as *const GcHeader };
+            if unsafe { (*header).is_marked() } {
+                true
+            } else {
+                unsafe { (*header).clear_remembered() };
+                false
+            }
+        });
         unsafe {
-            // Old-space sweep: drop dead objects in place, then cover every
-            // maximal dead run with a `FREE_TAG` filler so the page's linear
-            // header walk stays intact and the range becomes reusable
-            // through the free list. A run that ends at the bump cursor is
-            // returned to bump space instead. Live counts accumulate in the
-            // same pass.
-            for page in self.old_space.pages() {
-                // A fully-dead page is reaped whole below — recording its
-                // ranges would leave dangling free-list entries — but its
-                // corpses still need their one finalize/drop pass (backing
-                // stores, external-memory tokens) before the page memory
-                // returns to the cage.
-                if page.header().live_bytes == 0 {
-                    page.for_each_object(|h, _| {
-                        let tag_u8 = (*h).type_tag();
-                        if tag_u8 != crate::header::FREE_TAG && !(*h).is_swept() {
-                            if let Some(release_fn) = self.trace_table.get_host_release(tag_u8) {
-                                release_fn(h, &mut self.host_refs);
-                            }
-                            if let Some(finalize_fn) = self.trace_table.get_finalize(tag_u8) {
-                                finalize_fn(h);
-                            }
-                            if let Some(drop_fn) = self.trace_table.get_drop(tag_u8) {
-                                drop_fn(h);
-                            }
-                            (*h).set_swept();
-                            reclaimed += (*h).size_bytes() as usize;
-                        }
-                    });
-                    continue;
+            // Old-space sweep, on the helper threads too for a large old
+            // space; see `sweep::sweep_old_pages`. The dead cells with
+            // reclamation hooks it recorded are reclaimed here, before any
+            // recovered range is listed.
+            let parallel = self.old_space.page_count() >= PARALLEL_SWEEP_MIN_PAGES;
+            let old = sweep::sweep_old_pages(
+                self.old_space.pages(),
+                &self.trace_table,
+                &mut self.gc_threads,
+                parallel,
+            );
+            for &(header, tag) in &old.reclaim {
+                let h = header as *mut GcHeader;
+                if let Some(release_fn) = self.trace_table.get_host_release(tag) {
+                    release_fn(h, &mut self.host_refs);
                 }
-                let page_base_offset = page.cage_offset();
-                let base = page.base_ptr();
-                let mut live_allocated = 0usize;
-                let mut run_start: Option<usize> = None;
-                let mut run_bytes = 0usize;
-                let mut close_run = |run_start: &mut Option<usize>, run_bytes: &mut usize| {
-                    if let Some(start) = run_start.take() {
-                        let bytes = std::mem::take(run_bytes);
-                        // SAFETY: the run lies inside this page's payload
-                        // area; every byte of it belonged to swept objects.
-                        let header_ptr = base.add(start) as *mut GcHeader;
-                        std::ptr::write(header_ptr, GcHeader::new_free(bytes as u32));
-                        free_ranges.push((page_base_offset + start as u32, bytes));
-                    }
-                };
-                page.for_each_object(|h, offset| {
-                    let tag = (*h).type_tag() as usize;
-                    let size = (*h).size_bytes() as usize;
-                    let aligned = crate::page::align_up(size, crate::page::CELL_SIZE);
-                    let is_free_filler = tag == crate::header::FREE_TAG as usize;
-                    if is_free_filler || !(*h).is_marked() {
-                        // Drop exactly once — a second `drop_in_place`
-                        // would double-free any buffer the payload owns
-                        // (e.g. a string `Vec<u16>`). Fillers own nothing.
-                        if !is_free_filler && !(*h).is_swept() {
-                            let tag_u8 = (*h).type_tag();
-                            if let Some(release_fn) = self.trace_table.get_host_release(tag_u8) {
-                                release_fn(h, &mut self.host_refs);
-                            }
-                            if let Some(finalize_fn) = self.trace_table.get_finalize(tag_u8) {
-                                finalize_fn(h);
-                            }
-                            if let Some(drop_fn) = self.trace_table.get_drop(tag_u8) {
-                                drop_fn(h);
-                            }
-                            (*h).set_swept();
-                            reclaimed += size;
-                        }
-                        if run_start.is_none() {
-                            run_start = Some(offset);
-                        }
-                        run_bytes += aligned;
-                    } else {
-                        per_tag_live_count[tag] = per_tag_live_count[tag].wrapping_add(1);
-                        per_tag_live_bytes[tag] = per_tag_live_bytes[tag].wrapping_add(size);
-                        live_allocated += aligned;
-                        close_run(&mut run_start, &mut run_bytes);
-                    }
-                });
-                let header = page.header_mut();
-                if let Some(start) = run_start {
-                    // The final dead run touches the bump cursor: hand it
-                    // straight back to bump allocation.
-                    debug_assert_eq!(start + run_bytes, header.bump_cursor);
-                    header.bump_cursor = start;
-                } else {
-                    close_run(&mut run_start, &mut run_bytes);
+                if let Some(finalize_fn) = self.trace_table.get_finalize(tag) {
+                    finalize_fn(h);
                 }
-                header.allocated_bytes = live_allocated;
-                if track_cap {
-                    retained_bytes = retained_bytes.saturating_add(live_allocated as u64);
+                if let Some(drop_fn) = self.trace_table.get_drop(tag) {
+                    drop_fn(h);
                 }
             }
+            reclaimed += old.reclaimed;
+            for tag in 0..TYPE_TAG_COUNT {
+                per_tag_live_count[tag] =
+                    per_tag_live_count[tag].wrapping_add(old.live_count[tag]);
+                per_tag_live_bytes[tag] =
+                    per_tag_live_bytes[tag].wrapping_add(old.live_bytes[tag]);
+            }
+            if track_cap {
+                retained_bytes = retained_bytes.saturating_add(old.retained);
+            }
+            free_ranges = old.free_ranges;
             for page in self.large_space.pages() {
                 page.for_each_object(|h, _| {
                     let tag = (*h).type_tag() as usize;
@@ -3086,6 +3118,7 @@ impl GcHeap {
                             reclaimed += size;
                         }
                     } else {
+                        (*h).clear_mark();
                         per_tag_live_count[tag] = per_tag_live_count[tag].wrapping_add(1);
                         per_tag_live_bytes[tag] = per_tag_live_bytes[tag].wrapping_add(size);
                     }
@@ -3109,6 +3142,7 @@ impl GcHeap {
                 }
                 page.for_each_object(|h, _| {
                     if (*h).is_marked() {
+                        (*h).clear_mark();
                         let tag = (*h).type_tag() as usize;
                         let size = (*h).size_bytes() as usize;
                         per_tag_live_count[tag] = per_tag_live_count[tag].wrapping_add(1);
@@ -3117,26 +3151,6 @@ impl GcHeap {
                 });
             }
         }
-        // Prune the remembered set to parents that survived this full GC.
-        // The embedded pre-mark scavenge (`start_incremental_mark_phase`)
-        // repopulated the buffer with the live old→young edges among
-        // survivors, but mark-sweep may then free some of those parents as
-        // unreachable. A dead parent left in the buffer would dangle once
-        // `reap_dead_pages` frees its page and the cage offset is reused, so
-        // drop every entry whose header did not survive the mark (and clear
-        // its now-meaningless remembered bit). Runs before the reap, while
-        // every header is still walkable.
-        self.remembered_parents.retain(|raw| {
-            // SAFETY: STW pause; `raw` is an in-cage old/large parent offset
-            // recorded by the barrier; its header is live until the reap below.
-            let header = unsafe { cage_base().add(raw.0 as usize) as *const GcHeader };
-            if unsafe { (*header).is_marked() } {
-                true
-            } else {
-                unsafe { (*header).clear_remembered() };
-                false
-            }
-        });
         // Reap pages whose live bytes is zero, then publish the free
         // ranges recovered from the surviving pages.
         let _ = self.old_space.reap_dead_pages();
@@ -3149,6 +3163,8 @@ impl GcHeap {
         }
 
         self.marking.finish_cycle();
+        // The walks above whitened every surviving cell.
+        self.marks_white = true;
         // All dead-cell and backing-store finalizers have completed. This is
         // the sole ledger commit shared by full, split and incremental sweep.
         self.drain_shared_external_releases();
@@ -3411,6 +3427,7 @@ impl GcHeap {
     /// like any other old page from here.
     pub(crate) fn adopt_restored_old_page(&mut self, page: crate::page::Page) {
         self.old_space.adopt_page(page);
+        self.marks_white = false;
     }
 
     /// Book the bytes a restored image brought in against the heap cap and
@@ -3536,6 +3553,9 @@ fn raw_is_marked(raw: RawGc) -> bool {
 
 #[path = "heap/tenured.rs"]
 mod tenured;
+
+#[path = "heap/sweep.rs"]
+mod sweep;
 pub use tenured::{OLD_LAB_BYTES, SitePlacement};
 
 #[cfg(test)]

@@ -120,6 +120,7 @@ pub use heap_image::{HeapImage, ImageError, Relocation};
 pub use lab::{LAB_LIMIT_OFFSET, LAB_TOP_OFFSET, LinearAllocationArea};
 pub use observation::{
     GcPauseCapture, GcPauseCaptureError, GcPauseKind, GcPauseOutcome, GcPauseRecord, GcPauseTrigger,
+    HeapOccupancy,
 };
 pub use oom::OutOfMemory;
 pub use page::{CARD_SIZE, PAGE_SIZE, Page, SpaceKind};

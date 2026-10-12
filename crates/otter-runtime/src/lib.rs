@@ -157,7 +157,7 @@ pub use diagnostics::{Diagnostic, DiagnosticCategory, DiagnosticCode, Diagnostic
 pub use error::{ConfigError, IoErrorKind, OtterError, RealmError};
 pub use event_loop::{RuntimeLiveness, TokioRuntimeHost};
 pub use gc_observation::{
-    GcPauseCapture, GcPauseKind, GcPauseOutcome, GcPauseRecord, GcPauseTrigger,
+    GcPauseCapture, GcPauseKind, GcPauseOutcome, GcPauseRecord, GcPauseTrigger, HeapOccupancy,
 };
 pub use handle::{RuntimeActivityStats, RuntimeHandle};
 pub use heap_config::{
@@ -584,6 +584,9 @@ pub const DEFAULT_MAX_STACK_DEPTH: u32 = 1024;
 /// Default number of threads an isolate compiles optimized code on.
 pub const DEFAULT_JIT_COMPILE_THREADS: usize = 1;
 
+/// Pause records a traced runtime holds between two runs' results.
+const GC_TRACE_RECORDS: usize = 65_536;
+
 /// Source bundle accepted by the runtime.
 #[derive(Debug, Clone)]
 pub struct SourceInput {
@@ -688,6 +691,8 @@ pub struct ExecutionResult {
     jit_artifacts: Option<Box<JitArtifactBatch>>,
     /// Owned, opt-in VM stack samples collected during this run.
     cpu_profile: Option<Box<otter_vm::CpuProfile>>,
+    /// Owned, opt-in collection pauses observed during this run.
+    gc_pauses: Option<Box<GcPauseCapture>>,
 }
 
 impl ExecutionResult {
@@ -707,6 +712,7 @@ impl ExecutionResult {
             jit_debug_report: None,
             jit_artifacts: None,
             cpu_profile: None,
+            gc_pauses: None,
         }
     }
 
@@ -722,6 +728,7 @@ impl ExecutionResult {
             jit_debug_report: None,
             jit_artifacts: None,
             cpu_profile: None,
+            gc_pauses: None,
         }
     }
 
@@ -756,6 +763,28 @@ impl ExecutionResult {
             None => self.cpu_profile = Some(Box::new(profile)),
         }
         self
+    }
+
+    fn with_gc_pauses(mut self, pauses: GcPauseCapture) -> Self {
+        match self.gc_pauses.take() {
+            Some(mut existing) => {
+                existing.records.extend(pauses.records);
+                existing.dropped_records = existing
+                    .dropped_records
+                    .saturating_add(pauses.dropped_records);
+                existing.contains_split_phases |= pauses.contains_split_phases;
+                self.gc_pauses = Some(existing);
+            }
+            None => self.gc_pauses = Some(Box::new(pauses)),
+        }
+        self
+    }
+
+    /// Collection pauses observed during the run, when it asked for them
+    /// through [`RuntimeBuilder::gc_trace`].
+    #[must_use]
+    pub fn gc_pauses(&self) -> Option<&GcPauseCapture> {
+        self.gc_pauses.as_deref()
     }
 
     /// Owned VM stack samples, when the run asked for a CPU profile through
@@ -1984,6 +2013,7 @@ pub(crate) struct RuntimeConfig {
     jit_selection: JitSelection,
     jit_compile_threads: usize,
     jit_debug: JitDebugRequest,
+    gc_trace: bool,
 }
 
 /// Which execution tiers a runtime installs at construction.
@@ -2328,6 +2358,7 @@ impl Default for RuntimeConfig {
             jit_selection: JitSelection::default(),
             jit_compile_threads: DEFAULT_JIT_COMPILE_THREADS,
             jit_debug: JitDebugRequest::default(),
+            gc_trace: false,
         }
     }
 }
@@ -2788,6 +2819,15 @@ impl RuntimeBuilder {
         self
     }
 
+    /// Observe every collection pause of the runtime's runs, with the heap
+    /// occupancy before and after it; each result carries its run's pauses
+    /// ([`ExecutionResult::gc_pauses`]). Off by default.
+    #[must_use]
+    pub fn gc_trace(mut self, trace: bool) -> Self {
+        self.config.gc_trace = trace;
+        self
+    }
+
     /// Threads the isolate compiles optimized code on, started at its first
     /// optimizing compilation; [`DEFAULT_JIT_COMPILE_THREADS`] by default.
     /// A function keeps running its current tier while it compiles. Zero
@@ -3024,6 +3064,9 @@ impl Runtime {
         // requests. Reinstall them without re-running any realm installer.
         interp.set_jit_debug_request(config.jit_debug);
         interp.set_jit_compiler_threads(config.jit_compile_threads);
+        if config.gc_trace {
+            let _ = interp.gc_heap_mut().start_gc_pause_capture(GC_TRACE_RECORDS);
+        }
         match config.jit_selection {
             JitSelection::ProductionTiered => {
                 interp.set_jit_compiler(Some(std::sync::Arc::new(
@@ -3304,6 +3347,12 @@ impl Runtime {
         runtime
             .interp
             .set_jit_compiler_threads(runtime.config.jit_compile_threads);
+        if runtime.config.gc_trace {
+            let _ = runtime
+                .interp
+                .gc_heap_mut()
+                .start_gc_pause_capture(GC_TRACE_RECORDS);
+        }
         match runtime.config.jit_selection {
             JitSelection::ProductionTiered => {
                 runtime.interp.set_jit_compiler(Some(std::sync::Arc::new(
@@ -4979,8 +5028,12 @@ impl Runtime {
     /// after entry evaluation returned, so the loop driver attaches again on
     /// the way out.
     pub(crate) fn attach_cpu_profile(&mut self, result: ExecutionResult) -> ExecutionResult {
-        match self.interp.drain_cpu_profile() {
+        let result = match self.interp.drain_cpu_profile() {
             Some(profile) => result.with_cpu_profile(profile),
+            None => result,
+        };
+        match self.interp.gc_heap_mut().drain_gc_pause_capture() {
+            Some(pauses) => result.with_gc_pauses(pauses),
             None => result,
         }
     }
@@ -6960,6 +7013,13 @@ impl OtterBuilder {
     #[must_use]
     pub fn jit_compile_threads(mut self, threads: usize) -> Self {
         self.runtime = self.runtime.jit_compile_threads(threads);
+        self
+    }
+
+    /// [`RuntimeBuilder::gc_trace`].
+    #[must_use]
+    pub fn gc_trace(mut self, trace: bool) -> Self {
+        self.runtime = self.runtime.gc_trace(trace);
         self
     }
 

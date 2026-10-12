@@ -3,6 +3,8 @@
 //! # Contents
 //! - [`GcThreads`] — the heap's helper threads and [`GcThreads::run`], which
 //!   runs one job on every helper and on the calling thread at once.
+//! - [`WorkPool`] — chunks of work the workers of one job hand each other,
+//!   and the termination test of a job that ends when all of them run dry.
 //!
 //! # Invariants
 //! - The threads belong to one heap: they start at its first parallel job and
@@ -12,10 +14,14 @@
 //!   job may borrow the caller's stack.
 //! - A panic on any thread inside a job aborts the process: the heap is
 //!   partially collected and cannot be resumed or unwound safely.
+//! - [`WorkPool::take`] reports the end of a job only when every worker is
+//!   waiting in it with nothing shared and no other source of work left, so
+//!   no worker can still produce a chunk.
 //!
 //! # See also
 //! - [`crate::scavenger`] — the parallel copying collection that uses them.
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 
 /// Stack reserved for each helper: collection work is iterative.
@@ -172,5 +178,80 @@ fn help(shared: &Shared, index: usize) {
 fn abort_on_panic(work: impl FnOnce()) {
     if std::panic::catch_unwind(std::panic::AssertUnwindSafe(work)).is_err() {
         std::process::abort();
+    }
+}
+
+/// Chunks of work the workers of one parallel job hand each other.
+pub(crate) struct WorkPool<T> {
+    state: Mutex<PoolState<T>>,
+    wake: Condvar,
+    /// Workers waiting in [`Self::take`]; read without the lock as a hint.
+    idle: AtomicUsize,
+    workers: usize,
+}
+
+struct PoolState<T> {
+    chunks: Vec<Vec<T>>,
+    idle: usize,
+    done: bool,
+}
+
+impl<T> WorkPool<T> {
+    /// A pool shared by `workers` workers.
+    pub(crate) fn new(workers: usize) -> Self {
+        Self {
+            state: Mutex::new(PoolState {
+                chunks: Vec::new(),
+                idle: 0,
+                done: false,
+            }),
+            wake: Condvar::new(),
+            idle: AtomicUsize::new(0),
+            workers,
+        }
+    }
+
+    fn lock(&self) -> MutexGuard<'_, PoolState<T>> {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Whether some worker waits for work.
+    #[inline]
+    pub(crate) fn has_idle(&self) -> bool {
+        self.idle.load(Ordering::Relaxed) != 0
+    }
+
+    /// Hand `chunk` to a waiting worker.
+    pub(crate) fn share(&self, chunk: Vec<T>) {
+        self.lock().chunks.push(chunk);
+        self.wake.notify_one();
+    }
+
+    /// Take a shared chunk, waiting while another worker may still share
+    /// one. `None` once every worker waits here with nothing shared and
+    /// `exhausted` reports no other source of work.
+    pub(crate) fn take(&self, exhausted: impl Fn() -> bool) -> Option<Vec<T>> {
+        let mut state = self.lock();
+        loop {
+            if let Some(chunk) = state.chunks.pop() {
+                return Some(chunk);
+            }
+            if state.done {
+                return None;
+            }
+            if state.idle + 1 == self.workers && exhausted() {
+                state.done = true;
+                self.wake.notify_all();
+                return None;
+            }
+            state.idle += 1;
+            self.idle.store(state.idle, Ordering::Relaxed);
+            state = self
+                .wake
+                .wait(state)
+                .unwrap_or_else(PoisonError::into_inner);
+            state.idle -= 1;
+            self.idle.store(state.idle, Ordering::Relaxed);
+        }
     }
 }

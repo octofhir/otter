@@ -1836,6 +1836,25 @@ impl<'a> Codegen<'a> {
                 let double = allocation.fp_temps[0];
                 self.emit_load_keyed_cached(node, [receiver, key], temps, double, destination)?;
             }
+            Kind::LoadArrayLength => {
+                let receiver = Self::gp(input(0));
+                let destination = Self::gp(result.expect("a result"));
+                let exit = self.eager_exit(node, DeoptReason::WrongShape);
+                let storage = otter_vm::jit::JitArrayStorage::current();
+                dynasm!(self.ops
+                    ; .arch aarch64
+                    ; tst X(receiver), #0xfffe_0000_0000_0007
+                    ; b.ne =>exit
+                    ; cbz X(receiver), =>exit
+                    ; ldrb w16, [X(receiver)]
+                    ; cmp w16, u32::from(storage.type_tag)
+                    ; b.ne =>exit
+                    ; ldr x16, [X(receiver), storage.logical_length_byte]
+                    ; lsr x17, x16, #31
+                    ; cbnz x17, =>exit
+                    ; mov W(destination), w16
+                );
+            }
             Kind::LoadContextParent => {
                 let context = Self::gp(input(0));
                 let destination = Self::gp(result.expect("a result"));

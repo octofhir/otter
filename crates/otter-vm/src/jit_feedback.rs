@@ -438,6 +438,20 @@ impl<'a> PropertyFeedbackSlot<'a> {
         self.slot.attempted()
     }
 
+    /// Record the read of `key` from `receiver`: a `length` read of anything
+    /// but an Array marks the site, once.
+    pub(crate) fn record_length_receiver(self, key: &str, receiver: crate::Value) {
+        if receiver.as_array().is_none() && key == "length" && self.slot.record_length_non_array() {
+            self.vector.bump_epoch();
+        }
+    }
+
+    /// Whether a `length` site has read only Arrays since it first ran.
+    #[must_use]
+    pub(crate) fn length_reads_arrays_only(self) -> bool {
+        self.slot.attempted() && !self.slot.length_read_non_array()
+    }
+
     #[must_use]
     pub(crate) fn snapshot_state(self) -> crate::inspect::IcSiteState {
         self.slot.snapshot_state()

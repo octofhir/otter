@@ -270,6 +270,11 @@ pub(crate) fn finish_execution<T>(
 /// Reserved [`otter_gc::Traceable::TYPE_TAG`] for [`JsRegExpBody`].
 pub const REGEXP_BODY_TYPE_TAG: u8 = 0x1e;
 
+/// [`JsRegExpBody::jit_guard_flags`] bit: an expando bag exists.
+pub(crate) const REGEXP_JIT_FLAG_EXPANDO: u32 = 1;
+/// [`JsRegExpBody::jit_guard_flags`] bit: the `[[Prototype]]` is overridden.
+pub(crate) const REGEXP_JIT_FLAG_PROTO_OVERRIDE: u32 = 2;
+
 /// Outcome of a fallible regex compile.
 #[derive(Debug, Clone, thiserror::Error)]
 #[non_exhaustive]
@@ -441,6 +446,13 @@ pub struct JsRegExpBody {
     /// Per-instance `[[Prototype]]` override for RegExp subclass
     /// construction.
     pub prototype_override: Option<Value>,
+    /// Machine-readable lookup flags for generated property reads:
+    /// [`REGEXP_JIT_FLAG_EXPANDO`] once an expando bag may shadow a
+    /// prototype property, [`REGEXP_JIT_FLAG_PROTO_OVERRIDE`] while the
+    /// `[[Prototype]]` is overridden. Zero means every name but `lastIndex`
+    /// resolves on the realm's `%RegExp.prototype%`.
+    #[pelt(skip)]
+    pub(crate) jit_guard_flags: u32,
     /// §B.2.4 `[[LegacyFeaturesEnabled]]` — set when `RegExpAlloc` ran
     /// with `%RegExp%` itself as `new.target`, which is every literal
     /// and every plain `new RegExp(…)`. A subclass instance leaves the
@@ -448,6 +460,12 @@ pub struct JsRegExpBody {
     #[pelt(skip)]
     pub legacy_features_enabled: bool,
 }
+
+/// Byte offset of [`JsRegExpBody::jit_guard_flags`] in the payload.
+pub(crate) const REGEXP_BODY_JIT_GUARD_FLAGS_OFFSET: usize =
+    std::mem::offset_of!(JsRegExpBody, jit_guard_flags);
+
+const _: () = assert!(REGEXP_BODY_JIT_GUARD_FLAGS_OFFSET.is_multiple_of(4));
 
 impl JsRegExpBody {
     pub(crate) fn visit_function_ids(&self, visitor: &mut dyn FnMut(u32)) {
@@ -526,6 +544,7 @@ impl JsRegExp {
                 expando: None,
                 extensible: true,
                 prototype_override: None,
+                jit_guard_flags: 0,
                 legacy_features_enabled: true,
             })?,
         })
@@ -561,6 +580,7 @@ impl JsRegExp {
                 expando: None,
                 extensible: true,
                 prototype_override: None,
+                jit_guard_flags: 0,
                 legacy_features_enabled: true,
             })?,
         })
@@ -593,6 +613,7 @@ impl JsRegExp {
             body.flags = flags;
             *body.last_index.borrow_mut() = Value::number(NumberValue::from_i32(0));
             body.prototype_override = None;
+            body.jit_guard_flags &= !REGEXP_JIT_FLAG_PROTO_OVERRIDE;
         });
         Ok(())
     }
@@ -659,6 +680,7 @@ impl JsRegExp {
         let barrier = Value::object(expando);
         heap.with_payload(self.inner, |body| {
             body.expando = Some(expando);
+            body.jit_guard_flags |= REGEXP_JIT_FLAG_EXPANDO;
         });
         heap.record_write(self.inner, &barrier);
     }
@@ -688,6 +710,11 @@ impl JsRegExp {
         let barrier_value = proto;
         heap.with_payload(self.inner, |body| {
             body.prototype_override = proto;
+            if proto.is_some() {
+                body.jit_guard_flags |= REGEXP_JIT_FLAG_PROTO_OVERRIDE;
+            } else {
+                body.jit_guard_flags &= !REGEXP_JIT_FLAG_PROTO_OVERRIDE;
+            }
         });
         if let Some(value) = &barrier_value {
             heap.record_write(self.inner, value);

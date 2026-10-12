@@ -1694,24 +1694,54 @@ pub(crate) fn emit_closure_prototype_load(
         ; mov Rq(destination), r10);
 }
 
+/// Whether `ops` read a method for a receiver whose committed resolution
+/// records no call feedback: a primitive string or a RegExp.
+fn feedback_free_method_program(ops: &[otter_vm::JitCacheIrOp]) -> bool {
+    matches!(
+        ops.first(),
+        Some(otter_vm::JitCacheIrOp::LoadIntrinsicPrototype { target, .. })
+            if target.type_tag == otter_vm::string::JS_STRING_BODY_TYPE_TAG
+                || target.type_tag == otter_vm::regexp::REGEXP_BODY_TYPE_TAG
+    )
+}
+
 /// Static intrinsic-prototype reads: a receiver of an intrinsic body type
-/// (primitive string, closure, collection) reading a data slot of its pinned
-/// realm prototype, or a closure's own `prototype` slot. These programs
-/// describe realm intrinsics, not site feedback; a miss falls through to the
-/// site's IC. A hit leaves the value in `rax` and jumps to `done`.
+/// (primitive string, RegExp, closure, collection) reading a data slot of its
+/// pinned realm prototype, or a closure's own `prototype` slot. These
+/// programs describe realm intrinsics, not site feedback; a miss falls
+/// through to the site's IC. A hit leaves the value in `rax` and jumps to
+/// `done`.
 fn emit_intrinsic_loads(
     ops: &mut Assembler,
     relocations: &mut RelocationCapture,
     view: &JitCompileSnapshot,
     byte_pc: u32,
     object: u16,
+    method_lookup: bool,
     done: DynamicLabel,
 ) {
     use otter_vm::JitCacheIrOp as Op;
     let Some(programs) = view.property_programs.get(&byte_pc) else {
         return;
     };
+    // Every program proves a receiver that is not an ordinary object: an
+    // immediate or an ordinary object skips them all at once.
+    let skip = ops.new_dynamic_label();
+    emit_load_reg(ops, 0, object);
+    emit_load_u64(ops, 10, NOT_CELL_MASK);
+    dynasm!(ops ; .arch x64
+        ; test rax, r10
+        ; jnz =>skip
+        ; cmp BYTE [rax], OBJECT_BODY_TYPE_TAG as i8
+        ; je =>skip
+    );
     for program in programs {
+        // A method lookup reads only for a primitive string or a RegExp: the
+        // committed resolution of any other receiver records call feedback
+        // the optimizer consumes.
+        if method_lookup && !feedback_free_method_program(&program.ops) {
+            continue;
+        }
         if let [Op::LoadClosurePrototype { object: 0 }] = *program.ops {
             let next = ops.new_dynamic_label();
             emit_load_reg(ops, 0, object);
@@ -1814,6 +1844,7 @@ fn emit_intrinsic_loads(
             ; jmp =>done
             ; =>next);
     }
+    dynasm!(ops ; .arch x64 ; =>skip);
 }
 
 /// Emit `dst = obj.name`: inline own field, then the shared `LoadIC`.
@@ -1832,7 +1863,7 @@ fn emit_load_property(
     use shared_property::{LOAD_RECEIVER, LOAD_SLOT};
     let shared = ops.new_dynamic_label();
     let done = ops.new_dynamic_label();
-    emit_intrinsic_loads(ops, relocations, view, byte_pc, object, done);
+    emit_intrinsic_loads(ops, relocations, view, byte_pc, object, false, done);
     emit_slot_address(ops, relocations, view, byte_pc, LOAD_SLOT)?;
     emit_load_reg(ops, LOAD_RECEIVER, object);
     emit_inline_own_field(ops, view, LOAD_RECEIVER, LOAD_SLOT, shared);

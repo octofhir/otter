@@ -988,7 +988,10 @@ impl JitIntrinsicPrototype {
     /// named-lookup byte reads
     /// exactly ordinary has no own bag and no prototype override, and its
     /// kind resolves every non-virtual name on the active realm's
-    /// `%Function.prototype%`, so its proof also pins that realm. The proof
+    /// `%Function.prototype%`, so its proof also pins that realm. A RegExp
+    /// whose lookup flags read clear has no expando bag and no prototype
+    /// override, so every name but its own `lastIndex` resolves on the active
+    /// realm's `%RegExp.prototype%`; its proof pins that realm too. The proof
     /// establishes only the receiver; following holder guards decide which
     /// names that prototype answers. A
     /// String wrapper prototype stays opaque to ordinary lookup guards, so no
@@ -1006,6 +1009,9 @@ impl JitIntrinsicPrototype {
             crate::closure::JS_CLOSURE_BODY_TYPE_TAG => {
                 self.guard == Some(crate::closure::ordinary_named_lookup_guard())
                     && self.active_realm.is_some()
+            }
+            crate::regexp::REGEXP_BODY_TYPE_TAG => {
+                self.guard == Some(crate::method_ops::regexp_guard()) && self.active_realm.is_some()
             }
             _ => false,
         };

@@ -2,6 +2,9 @@
 //!
 //! # Contents
 //! - Collection receiver proofs composed with ordinary slot guards.
+//! - RegExp receiver proofs (no expando bag, no `[[Prototype]]` override)
+//!   composed with `%RegExp.prototype%` slot guards, for every name but the
+//!   own `lastIndex`.
 //! - Primitive string receiver proofs composed with the `%String.prototype%`
 //!   dictionary-layout guard, for every name a primitive string cannot own.
 //! - Ordinary closure proofs (no bag, no prototype override, plain kind, the
@@ -53,6 +56,26 @@ impl Interpreter {
             })
         })
         .collect::<Vec<_>>();
+        // A RegExp owns `lastIndex`; every other name resolves on the active
+        // realm's `%RegExp.prototype%` while no expando bag or `[[Prototype]]`
+        // override exists — the reads behind `re.exec(…)` and `re.test(…)`.
+        // A RegExp made while another realm was active carries an override,
+        // so the realm id pins which prototype the program read.
+        if key.name() != "lastIndex"
+            && let Some(prototype) = self.realm_intrinsics.regexp_prototype()
+        {
+            let active_realm = self.active_realm_id;
+            programs.extend(
+                self.shaped_prototype_program(prototype, key, |proto_offset| {
+                    JitIntrinsicPrototype {
+                        type_tag: crate::regexp::REGEXP_BODY_TYPE_TAG,
+                        guard: Some(crate::method_ops::regexp_guard()),
+                        proto_offset,
+                        active_realm: Some(active_realm),
+                    }
+                }),
+            );
+        }
         programs.extend(self.string_property_program(key));
         programs.extend(self.closure_property_program(key));
         if key.name() == "prototype" {
@@ -263,6 +286,53 @@ mod tests {
             string_program.ops.get(1),
             Some(JitCacheIrOp::GuardDictionaryLayout { .. })
         ));
+    }
+
+    #[test]
+    fn regexp_programs_prove_generated_receivers_in_the_active_realm() {
+        let mut interpreter = Interpreter::new().expect("fixture interpreter bootstrap");
+        let key = |interpreter: &mut Interpreter, name: &'static str| {
+            AtomizedPropertyKey::new(
+                PropertyAtom::new(interpreter.shape_runtime.names_mut().intern(name)),
+                name,
+            )
+        };
+        let exec = key(&mut interpreter, "exec");
+        let programs = interpreter.jit_intrinsic_property_programs(exec);
+        let target = programs
+            .iter()
+            .find_map(|program| match program.ops.first() {
+                Some(JitCacheIrOp::LoadIntrinsicPrototype { target, .. })
+                    if target.type_tag == crate::regexp::REGEXP_BODY_TYPE_TAG =>
+                {
+                    Some(*target)
+                }
+                _ => None,
+            })
+            .expect("%RegExp.prototype%.exec admits a receiver program");
+        assert!(target.is_generated_receiver());
+        assert_eq!(target.active_realm, Some(interpreter.active_realm_id));
+        assert!(
+            !crate::jit::JitIntrinsicPrototype {
+                active_realm: None,
+                ..target
+            }
+            .is_generated_receiver(),
+            "an unpinned realm would read another realm's prototype"
+        );
+
+        let last_index = key(&mut interpreter, "lastIndex");
+        assert!(
+            interpreter
+                .jit_intrinsic_property_programs(last_index)
+                .iter()
+                .all(|program| !matches!(
+                    program.ops.first(),
+                    Some(JitCacheIrOp::LoadIntrinsicPrototype { target, .. })
+                        if target.type_tag == crate::regexp::REGEXP_BODY_TYPE_TAG
+                )),
+            "a RegExp owns `lastIndex`"
+        );
     }
 
     #[test]

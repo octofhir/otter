@@ -1831,6 +1831,37 @@ impl JitArrayStorage {
     }
 }
 
+/// A typed view's storage as a generic keyed store reads it, whatever its
+/// element kind. Offsets count from the view's `GcHeader`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct JitTypedArrayStorage {
+    /// The typed view cell tag.
+    pub type_tag: u8,
+    /// `u32` [`crate::binary::TypedArrayKind`] of the view.
+    pub kind_byte: u32,
+    /// `u64` element count.
+    pub length_byte: u32,
+    /// Cached element base: non-null only for a view over a fixed-length
+    /// local buffer, and trusted only while the isolate's detach protector
+    /// holds.
+    pub data_byte: u32,
+}
+
+impl JitTypedArrayStorage {
+    /// The VM's current typed view layout.
+    #[must_use]
+    pub const fn current() -> Self {
+        use crate::binary::typed_array as view;
+        let header = std::mem::size_of::<otter_gc::GcHeader>() as u32;
+        Self {
+            type_tag: view::TYPED_ARRAY_BODY_TYPE_TAG,
+            kind_byte: header + view::TYPED_ARRAY_BODY_KIND_OFFSET as u32,
+            length_byte: header + view::TYPED_ARRAY_BODY_LENGTH_OFFSET as u32,
+            data_byte: header + view::TYPED_ARRAY_BODY_DATA_OFFSET as u32,
+        }
+    }
+}
+
 /// One receiver family's indexed-element storage, as the guard program reads it.
 ///
 /// Every element-bearing body answers the same questions — which cell tag it

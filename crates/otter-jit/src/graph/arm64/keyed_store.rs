@@ -3,8 +3,9 @@
 //! # Contents
 //! - [`Codegen::emit_store_keyed_cached`] stores into an Array's dense
 //!   storage of any kind inline, appends at its length through the VM's
-//!   push leaf, a name key through the code object's keyed table routine,
-//!   and every other store in the runtime.
+//!   push leaf, stores a Number into a typed view of any non-BigInt kind
+//!   inline, a name key through the code object's keyed table routine, and
+//!   every other store in the runtime.
 //!
 //! # Invariants
 //! - Every guard precedes the one store; a failed guard has written nothing
@@ -18,6 +19,10 @@
 //! - An append is an ordinary own addition under the same permit as a
 //!   hole store; the push leaf completes it only within the storage's
 //!   capacity and its own dense-range guards, so it never allocates.
+//! - A typed view is stored into inline only through its cached element
+//!   base while the detach protector holds, at an int32 index below its
+//!   length, and with a value that is already a Number: the conversion to
+//!   the element runs no user code, and the store is the whole effect.
 //! - The keyed table routine neither allocates nor collects; the runtime
 //!   operation grows storage and records the site's feedback.
 //!
@@ -26,13 +31,15 @@
 //! - `otter_vm::jit::JitArrayStorage` for the storage this reads.
 
 use super::{
-    Codegen, CommittedArgument, DynamicLabel, NodeId, RelocationTarget, THREAD_OFFSET, VALUE_HOLE,
-    VM_THREAD_GC_HEAP_OFFSET, abi, emit_load_symbol_u64,
+    Codegen, CommittedArgument, DETACH_PROTECTOR, DOUBLE_OFFSET, DynamicLabel, INT32_TAG_SHIFT,
+    NUMBER_TAG, NodeId, RelocationTarget, THREAD_OFFSET, VALUE_HOLE, VM_THREAD_GC_HEAP_OFFSET, abi,
+    emit_load_symbol_u64,
 };
 use crate::Unsupported;
 use crate::entry::VM_THREAD_ARRAY_INDEX_PROTECTOR_CELL_OFFSET;
 use dynasmrt::{DynasmApi, DynasmLabelApi, dynasm};
-use otter_vm::jit::{JitArrayStorage, JitHoleBitmap};
+use otter_vm::binary::TypedArrayKind;
+use otter_vm::jit::{JitArrayStorage, JitHoleBitmap, JitTypedArrayStorage};
 
 /// Bytes the slow path parks the three operands in.
 const PARKED_BYTES: u32 = 32;
@@ -55,13 +62,14 @@ impl Codegen<'_> {
         let store_double = self.ops.new_dynamic_label();
         let store_tagged = self.ops.new_dynamic_label();
         let in_bounds = self.ops.new_dynamic_label();
+        let not_array = self.ops.new_dynamic_label();
         dynasm!(self.ops
             ; .arch aarch64
             ; tst X(receiver), #0xfffe_0000_0000_0007
             ; b.ne =>other
             ; ldrb w17, [X(receiver)]
             ; cmp w17, u32::from(storage.type_tag)
-            ; b.ne =>other
+            ; b.ne =>not_array
             ; ldrb w17, [X(receiver), storage.own_guard_byte]
             ; cbnz w17, =>runtime
             // A non-negative int32 key below the live dense length.
@@ -119,7 +127,15 @@ impl Codegen<'_> {
             ; str X(value), [X(base), W(key), uxtw #3]
         );
         self.emit_element_write_barrier(node, base, key, value, &[]);
-        dynasm!(self.ops ; .arch aarch64 ; b =>done ; =>other);
+        dynasm!(self.ops
+            ; .arch aarch64
+            ; b =>done
+            ; =>not_array
+            ; cmp w17, u32::from(JitTypedArrayStorage::current().type_tag)
+            ; b.ne =>other
+        );
+        self.emit_typed_view_store([receiver, key, value], [length, base], runtime, done);
+        dynasm!(self.ops ; .arch aarch64 ; =>other);
         self.emit_keyed_table_store(node, [receiver, key, value], runtime, done);
         dynasm!(self.ops ; .arch aarch64 ; =>runtime);
         self.emit_committed_call(
@@ -134,6 +150,126 @@ impl Codegen<'_> {
         )?;
         dynasm!(self.ops ; .arch aarch64 ; =>done);
         Ok(())
+    }
+
+    /// Store the Number in `X(value)` at int32 `X(key)` of the typed view in
+    /// `X(receiver)`, converted to its element kind: to `stored` when it
+    /// stored, else to `refused` with nothing written. `kind` and `base` are
+    /// temporaries; `x16`, `x17` and `d31` are clobbered.
+    fn emit_typed_view_store(
+        &mut self,
+        [receiver, key, value]: [u8; 3],
+        [kind, base]: [u8; 2],
+        refused: DynamicLabel,
+        stored: DynamicLabel,
+    ) {
+        let view = JitTypedArrayStorage::current();
+        let code = |kind: TypedArrayKind| kind as u32;
+        let double = self.ops.new_dynamic_label();
+        let widen = self.ops.new_dynamic_label();
+        let clamped = self.ops.new_dynamic_label();
+        let integer = self.ops.new_dynamic_label();
+        let half = self.ops.new_dynamic_label();
+        let word = self.ops.new_dynamic_label();
+        let float = self.ops.new_dynamic_label();
+        let float64 = self.ops.new_dynamic_label();
+        dynasm!(self.ops
+            ; .arch aarch64
+            ; asr x16, X(key), INT32_TAG_SHIFT
+            ; cmn x16, 1
+            ; b.ne =>refused
+            ; tbnz W(key), 31, =>refused
+            // The cached base stands for the buffer's liveness and extent
+            // only while no buffer was ever detached.
+            ; ldr X(base), [X(receiver), view.data_byte]
+            ; cbz X(base), =>refused
+            ; ldr x16, [x20, THREAD_OFFSET]
+            ; ldr x16, [x16, DETACH_PROTECTOR]
+            ; cbz x16, =>refused
+            ; ldrb w16, [x16]
+            ; cbnz w16, =>refused
+            ; ldr X(kind), [X(receiver), view.length_byte]
+            ; cmp XSP(kind), W(key), uxtw
+            ; b.ls =>refused
+            ; ldr W(kind), [X(receiver), view.kind_byte]
+            ; asr x16, X(value), INT32_TAG_SHIFT
+            ; cmn x16, 1
+            ; b.ne =>double
+            // An int32: an integer element keeps its low bits.
+            ; mov w16, W(value)
+            ; cmp WSP(kind), code(TypedArrayKind::Uint32)
+            ; b.hi =>widen
+            ; cmp WSP(kind), code(TypedArrayKind::Uint8Clamped)
+            ; b.ne =>integer
+            ; cmp w16, #0
+            ; csel w16, wzr, w16, lt
+            ; mov w17, #255
+            ; cmp w16, w17
+            ; csel w16, w17, w16, gt
+            ; b =>clamped
+            ; =>widen
+            ; scvtf d31, W(value)
+            ; b =>float
+            ; =>double
+            ; tst X(value), NUMBER_TAG
+            ; b.eq =>refused
+        );
+        self.load_immediate(17, DOUBLE_OFFSET);
+        dynasm!(self.ops
+            ; .arch aarch64
+            ; sub x16, X(value), x17
+            ; fmov d31, x16
+            ; cmp WSP(kind), code(TypedArrayKind::Uint32)
+            ; b.hi =>float
+            ; cmp WSP(kind), code(TypedArrayKind::Uint8Clamped)
+            ; b.ne >modular
+            // §7.1.12 ToUint8Clamp of a double: round half to even, NaN and
+            // negatives to 0, saturated to 255.
+            ; fcvtnu w16, d31
+            ; mov w17, #255
+            ; cmp w16, w17
+            ; csel w16, w17, w16, hi
+            ; b =>clamped
+            ; modular:
+        );
+        if crate::arm64::has_javascript_conversion() {
+            crate::arm64::emit_fjcvtzs(&mut self.ops, 31, 16);
+            dynasm!(self.ops ; .arch aarch64 ; b =>integer);
+        } else {
+            dynasm!(self.ops ; .arch aarch64 ; b =>refused);
+        }
+        dynasm!(self.ops
+            ; .arch aarch64
+            ; =>clamped
+            ; strb w16, [X(base), W(key), uxtw]
+            ; b =>stored
+            // `w16` holds the int32 whose low bits the element keeps.
+            ; =>integer
+            ; cmp WSP(kind), code(TypedArrayKind::Uint8)
+            ; b.hi =>half
+            ; strb w16, [X(base), W(key), uxtw]
+            ; b =>stored
+            ; =>half
+            ; cmp WSP(kind), code(TypedArrayKind::Uint16)
+            ; b.hi =>word
+            ; strh w16, [X(base), W(key), uxtw #1]
+            ; b =>stored
+            ; =>word
+            ; str w16, [X(base), W(key), uxtw #2]
+            ; b =>stored
+            // `d31` holds the Number; BigInt and half-precision views refuse.
+            ; =>float
+            ; cmp WSP(kind), code(TypedArrayKind::Float32)
+            ; b.ne =>float64
+            ; fcvt s31, d31
+            ; str s31, [X(base), W(key), uxtw #2]
+            ; b =>stored
+            ; =>float64
+            ; cmp WSP(kind), code(TypedArrayKind::Float64)
+            ; b.ne =>refused
+            ; str d31, [X(base), W(key), uxtw #3]
+            ; b =>stored
+        );
     }
 
     /// A name key's store through the code object's keyed table routine:

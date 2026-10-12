@@ -18,8 +18,8 @@
 //!   resumes the interpreter at the loop header with that edge's values; a
 //!   header that already left optimized code for a type mismatch speculates
 //!   on no entry value.
-//! - A tagged phi never takes an untagged phi as input: such a phi is not
-//!   untagged.
+//! - A tagged phi reads an untagged phi as the box of its value, placed at
+//!   the end of that input's predecessor.
 //! - Every check that unboxed an untagged phi (to an int32 or an element
 //!   index) is replaced by the phi itself, in node inputs and frame states
 //!   alike; every direct use of the phi read it tagged and receives a box
@@ -167,8 +167,6 @@ fn untag(graph: &mut Graph, layout: &[BlockId], loop_headers: &[LoopHeader], tar
             }
         }
     }
-    // Phi uses by other phis, to keep a tagged phi from reading an untagged
-    // one.
     let mut candidates: FxHashSet<NodeId> = phis.iter().copied().collect();
     loop {
         let mut changed = false;
@@ -188,23 +186,6 @@ fn untag(graph: &mut Graph, layout: &[BlockId], loop_headers: &[LoopHeader], tar
                 });
             if !qualifies {
                 candidates.remove(&phi);
-                changed = true;
-            }
-        }
-        for &phi in &phis {
-            if candidates.contains(&phi) {
-                continue;
-            }
-            // A remaining tagged phi must not read an untagged one.
-            let readers: Vec<NodeId> = graph
-                .node(phi)
-                .inputs
-                .iter()
-                .copied()
-                .filter(|input| candidates.contains(input))
-                .collect();
-            for input in readers {
-                candidates.remove(&input);
                 changed = true;
             }
         }
@@ -330,6 +311,27 @@ fn untag(graph: &mut Graph, layout: &[BlockId], loop_headers: &[LoopHeader], tar
             })
             .collect();
         graph.block_mut(block).body = kept;
+    }
+    // A phi left tagged reads an untagged one boxed at the end of that
+    // input's predecessor.
+    for &phi in &phis {
+        if candidates.contains(&phi) {
+            continue;
+        }
+        let block = graph.node(phi).block.expect("a placed phi");
+        let inputs = graph.node(phi).inputs.clone();
+        let mut rewired = inputs.clone();
+        for (index, &input) in inputs.iter().enumerate() {
+            if !candidates.contains(&input) {
+                continue;
+            }
+            let predecessor = graph.block(block).predecessors[index];
+            let boxed = graph.add_node(target.box_kind(), &[input], Repr::Tagged);
+            graph.node_mut(boxed).block = Some(predecessor);
+            graph.block_mut(predecessor).body.push(boxed);
+            rewired[index] = boxed;
+        }
+        graph.node_mut(phi).inputs = rewired;
     }
 }
 

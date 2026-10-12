@@ -109,6 +109,10 @@ mod intrinsic_calls;
 #[path = "builder_array_methods.rs"]
 mod array_methods;
 
+#[path = "builder_peel.rs"]
+mod peel;
+use peel::PeelPass;
+
 const UNDEFINED: u64 = tag::VALUE_UNDEFINED;
 
 /// What is known about one value along the current path that no heap write
@@ -279,6 +283,27 @@ impl Known {
             info.ordinary_object &= theirs.ordinary_object;
             *info != NodeInfo::default()
         });
+        // A stale proof of stable shapes holds where the other edge proves
+        // the same shapes outright.
+        let fresh = |known: &Known, node: &NodeId| {
+            known
+                .layouts
+                .get(node)
+                .and_then(|layout| layout.shapes.clone())
+        };
+        let mut stale: FxHashMap<NodeId, SmallVec<[u32; 4]>> = FxHashMap::default();
+        for (node, shapes) in &self.stale_shapes {
+            if other.stale_shapes.get(node) == Some(shapes)
+                || fresh(other, node).as_ref() == Some(shapes)
+            {
+                stale.insert(*node, shapes.clone());
+            }
+        }
+        for (node, shapes) in &other.stale_shapes {
+            if fresh(self, node).as_ref() == Some(shapes) {
+                stale.insert(*node, shapes.clone());
+            }
+        }
         self.layouts.retain(|node, layout| {
             let Some(theirs) = other.layouts.get(node) else {
                 return false;
@@ -305,8 +330,7 @@ impl Known {
             self.this = None;
         }
         self.fresh.retain(|cell| other.fresh.contains(cell));
-        self.stale_shapes
-            .retain(|node, shapes| other.stale_shapes.get(node) == Some(shapes));
+        self.stale_shapes = stale;
         self.stable_checked
             .retain(|shape| other.stable_checked.contains(shape));
         self.field_values.retain(|node, bound| {
@@ -415,6 +439,27 @@ impl Known {
         self.storage.clear();
         self.elements_read.clear();
         self.fresh.clear();
+    }
+
+    /// Keep only the heap facts about `roots` and the values their known
+    /// fields hold, transitively.
+    fn retain_reachable(&mut self, roots: impl Iterator<Item = NodeId>) {
+        let mut reachable: FxHashSet<NodeId> = roots.collect();
+        loop {
+            let before = reachable.len();
+            for (key, &value) in &self.fields {
+                if reachable.contains(&key.object) {
+                    reachable.insert(value);
+                }
+            }
+            if reachable.len() == before {
+                break;
+            }
+        }
+        self.layouts.retain(|node, _| reachable.contains(node));
+        self.storage.retain(|node, _| reachable.contains(node));
+        self.fields.retain(|key, _| reachable.contains(&key.object));
+        self.stale_shapes.retain(|node, _| reachable.contains(node));
     }
 
     /// The heap facts on this path.
@@ -538,6 +583,13 @@ struct Builder<'a> {
     loop_phis: FxHashMap<usize, Vec<(u16, NodeId)>>,
     current: Option<BlockId>,
     current_bytecode_block: usize,
+    /// The slot of `block_map`/`incoming`/`trailing` the current block
+    /// occupies: its bytecode block, or that block's peeled copy.
+    current_slot: usize,
+    /// The loop whose first iteration is being built ahead of it.
+    peel: Option<PeelPass>,
+    /// The loops of this body built with a peeled first iteration, by header.
+    peel_plans: Rc<FxHashMap<usize, peel::PeelPlan>>,
     frame: Vec<NodeId>,
     known: Known,
     /// The bytecode loop header the OSR entry block feeds.
@@ -619,6 +671,9 @@ struct Scope<'a> {
     incoming: Vec<Vec<Incoming>>,
     loop_phis: FxHashMap<usize, Vec<(u16, NodeId)>>,
     current_bytecode_block: usize,
+    current_slot: usize,
+    peel: Option<PeelPass>,
+    peel_plans: Rc<FxHashMap<usize, peel::PeelPlan>>,
     frame: Vec<NodeId>,
     eager_states: FxHashMap<u32, FrameStateId>,
     enclosing: Vec<SmallVec<[LoopKey; 2]>>,
@@ -684,9 +739,17 @@ fn build_once(
     let mut graph = Graph::default();
     let undefined = graph.constant(Kind::ConstTagged(UNDEFINED));
     let block_count = analysis.blocks.len();
-    let mut block_map = vec![BlockId(u32::MAX); block_count];
+    let peel_plans = peel::plans(view, analysis);
+    // Each block has its own slot; a peeled loop's blocks also have a
+    // second one, offset by the block count, for their first iteration.
+    let mut block_map = vec![BlockId(u32::MAX); 2 * block_count];
     for &block in &analysis.order {
         block_map[block] = graph.new_block();
+    }
+    for plan in peel_plans.values() {
+        for &block in plan.body.iter() {
+            block_map[block + block_count] = graph.new_block();
+        }
     }
     let mut builder = Builder {
         root: view,
@@ -697,11 +760,14 @@ fn build_once(
         function_id: code.id,
         register_count,
         block_map,
-        trailing: vec![Vec::new(); block_count],
-        incoming: vec![Vec::new(); block_count],
+        trailing: vec![Vec::new(); 2 * block_count],
+        incoming: vec![Vec::new(); 2 * block_count],
         loop_phis: FxHashMap::default(),
         current: None,
         current_bytecode_block: 0,
+        current_slot: usize::MAX,
+        peel: None,
+        peel_plans: Rc::new(peel_plans),
         frame: vec![undefined; usize::from(register_count)],
         known: Known::default(),
         osr_header: osr_pc.and_then(|pc| analysis.block_of.get(pc as usize).copied()),
@@ -889,31 +955,41 @@ impl<'a> Builder<'a> {
             if self.inline.as_ref().is_some_and(|inline| inline.abandoned) {
                 break;
             }
-            if !self.start_block(block) {
-                continue;
+            if let Some(plan) = self.peel_plans.get(&block).cloned() {
+                self.build_peeled_iteration(block, &plan, &mut layout);
             }
-            layout.push(self.block_map[block]);
-            let range = analysis.blocks[block].start..analysis.blocks[block].end;
-            for pc in range.clone() {
-                self.pc = pc;
-                self.graph.position = pc;
-                self.visit(&analysis.instructions[pc as usize]);
-                if self.current.is_none() {
-                    break;
-                }
-            }
-            if self.current.is_some() {
-                // Fell off the end of the block into its single successor.
-                let last = &analysis.instructions[range.end as usize - 1];
-                self.pc = last.pc;
-                match analysis.blocks[block].successors.first() {
-                    Some(&successor) => self.goto(successor),
-                    None => self.deopt(DeoptReason::Unsupported),
-                }
-            }
-            layout.extend(self.trailing[block].iter().copied());
+            self.build_block(block, block, &mut layout);
         }
         layout
+    }
+
+    /// Build bytecode block `block` into `slot`, appending its graph
+    /// blocks to `layout`; nothing when no edge reaches it.
+    fn build_block(&mut self, block: usize, slot: usize, layout: &mut Vec<BlockId>) {
+        let analysis = self.analysis.clone();
+        if !self.start_block(block, slot) {
+            return;
+        }
+        layout.push(self.block_map[slot]);
+        let range = analysis.blocks[block].start..analysis.blocks[block].end;
+        for pc in range.clone() {
+            self.pc = pc;
+            self.graph.position = pc;
+            self.visit(&analysis.instructions[pc as usize]);
+            if self.current.is_none() {
+                break;
+            }
+        }
+        if self.current.is_some() {
+            // Fell off the end of the block into its single successor.
+            let last = &analysis.instructions[range.end as usize - 1];
+            self.pc = last.pc;
+            match analysis.blocks[block].successors.first() {
+                Some(&successor) => self.goto(successor),
+                None => self.deopt(DeoptReason::Unsupported),
+            }
+        }
+        layout.extend(self.trailing[slot].iter().copied());
     }
 
     fn swap_scope(&mut self, scope: &mut Scope<'a>) {
@@ -930,6 +1006,9 @@ impl<'a> Builder<'a> {
             &mut self.current_bytecode_block,
             &mut scope.current_bytecode_block,
         );
+        swap(&mut self.current_slot, &mut scope.current_slot);
+        swap(&mut self.peel, &mut scope.peel);
+        swap(&mut self.peel_plans, &mut scope.peel_plans);
         swap(&mut self.frame, &mut scope.frame);
         swap(&mut self.eager_states, &mut scope.eager_states);
         swap(&mut self.enclosing, &mut scope.enclosing);
@@ -1128,6 +1207,9 @@ impl<'a> Builder<'a> {
             incoming: vec![Vec::new(); block_count],
             loop_phis: FxHashMap::default(),
             current_bytecode_block: usize::MAX,
+            current_slot: usize::MAX,
+            peel: None,
+            peel_plans: Rc::default(),
             frame,
             eager_states: FxHashMap::default(),
             enclosing,
@@ -1191,7 +1273,7 @@ impl<'a> Builder<'a> {
             self.current = Some(block);
             return false;
         }
-        let owner = self.current_bytecode_block;
+        let owner = self.current_slot;
         self.trailing[owner].extend(layout);
         let mut returns = frame.returns;
         if returns.is_empty() {
@@ -1333,6 +1415,7 @@ impl<'a> Builder<'a> {
             };
         }
         self.current_bytecode_block = usize::MAX;
+        self.current_slot = usize::MAX;
         self.goto(0);
     }
 
@@ -1342,6 +1425,7 @@ impl<'a> Builder<'a> {
     fn start_osr_entry(&mut self, block: BlockId, header: usize) {
         self.current = Some(block);
         self.current_bytecode_block = usize::MAX;
+        self.current_slot = usize::MAX;
         self.known = Known::default();
         let live = self
             .analysis
@@ -1358,16 +1442,18 @@ impl<'a> Builder<'a> {
         self.goto(header);
     }
 
-    /// Begin bytecode block `block`; `false` when nothing reaches it.
-    fn start_block(&mut self, block: usize) -> bool {
-        let mut incoming = std::mem::take(&mut self.incoming[block]);
+    /// Begin bytecode block `block` in `slot`; `false` when nothing
+    /// reaches it. The peeled copy of a loop header is no loop.
+    fn start_block(&mut self, block: usize, slot: usize) -> bool {
+        let mut incoming = std::mem::take(&mut self.incoming[slot]);
         if incoming.is_empty() {
             return false;
         }
-        let graph_block = self.block_map[block];
+        let graph_block = self.block_map[slot];
         self.current = Some(graph_block);
         self.current_bytecode_block = block;
-        let is_loop = self.analysis.loops.contains_key(&block);
+        self.current_slot = slot;
+        let is_loop = self.analysis.loops.contains_key(&block) && slot == block;
         let start_pc = self.analysis.blocks[block].start;
         let live = self.analysis.live_at(start_pc).clone();
         self.graph.block_mut(graph_block).predecessors =
@@ -1444,6 +1530,9 @@ impl<'a> Builder<'a> {
             known.forget_storage();
             known.checked_field_types.clear();
             known.stable_checked.clear();
+            // The body reaches only the values its registers and `this`
+            // hold: facts about any other node can only fail on a back edge.
+            known.retain_reachable(frame.iter().copied().chain(known.this));
             let key = self.loop_key(block);
             match self.policies.get(&key) {
                 Some(policy) if policy.clobber => known.clobber_heap(&self.root.stable_shapes),
@@ -1494,9 +1583,11 @@ impl<'a> Builder<'a> {
             && self.analysis.loops.contains_key(&target)
             && self.analysis.blocks[target].start <= self.analysis.blocks[from].start
             && self.loop_phis.contains_key(&target);
+        // A peeled iteration's latch enters the loop it precedes forward.
+        let enters_loop = self.peel.as_ref().is_some_and(|peel| peel.header == target);
         let retreating = from != usize::MAX
             && self.analysis.blocks[target].start <= self.analysis.blocks[from].start;
-        if retreating && !back_edge {
+        if retreating && !back_edge && !enters_loop {
             // An edge into a block already built that is not a natural
             // loop's back edge: resume the interpreter at the jump.
             self.deopt(DeoptReason::Unsupported);
@@ -1505,7 +1596,8 @@ impl<'a> Builder<'a> {
         let target_start = self.analysis.blocks[target].start;
         let live = self.analysis.live_at(target_start).clone();
         self.box_live_registers(&live);
-        let target_block = self.block_map[target];
+        let slot = self.edge_slot(target, back_edge);
+        let target_block = self.block_map[slot];
         if back_edge {
             let key = self.loop_key(target);
             if let Some(assumed) = self.assumptions.get(&key) {
@@ -1533,7 +1625,7 @@ impl<'a> Builder<'a> {
         }
         // The block ends here: its state moves onto the edge, and the next
         // block or the inline caller installs its own.
-        self.incoming[target].push(Incoming {
+        self.incoming[slot].push(Incoming {
             block: current,
             frame: std::mem::take(&mut self.frame),
             known: std::mem::take(&mut self.known),
@@ -1615,7 +1707,7 @@ impl<'a> Builder<'a> {
     /// A fresh block for one branch edge; it jumps on to `target`.
     fn edge_block(&mut self, _target: usize) -> BlockId {
         let block = self.graph.new_block();
-        let owner = self.current_bytecode_block;
+        let owner = self.current_slot;
         if owner == usize::MAX {
             unreachable!("the entry block never branches");
         }
@@ -4049,7 +4141,7 @@ impl<'a> Builder<'a> {
         let byte_pc = instruction.byte_pc;
         let destination = instruction.writes[0];
         let before = self.frame[usize::from(destination)];
-        let owner = self.current_bytecode_block;
+        let owner = self.current_slot;
         let shape = self.add(Kind::LoadReceiverShape, &[receiver], Repr::Word);
         let join = self.graph.new_block();
         let entry_known = self.known.clone();

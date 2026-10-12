@@ -36,6 +36,16 @@ pub(crate) fn collection_guard() -> JitBodyGuard {
     )
 }
 
+/// The RegExp lookup flags: zero while no expando bag can shadow a
+/// `%RegExp.prototype%` name and the `[[Prototype]]` is not overridden.
+pub(crate) fn regexp_guard() -> JitBodyGuard {
+    JitBodyGuard::clear(
+        otter_gc::header::HEADER_SIZE as u32
+            + crate::regexp::REGEXP_BODY_JIT_GUARD_FLAGS_OFFSET as u32,
+        JitGuardWidth::Word32,
+    )
+}
+
 /// The aligned rare/expando pair. Both compressed handles must be null before
 /// the default realm's retained `%Array.prototype%` can answer an inherited key.
 pub(crate) fn array_named_lookup_guard() -> JitBodyGuard {

@@ -114,31 +114,78 @@ fn emit_inline_own_field(
     );
 }
 
+/// Where a static intrinsic read leaves its value.
+#[derive(Clone, Copy)]
+pub(super) enum IntrinsicLoadOutput {
+    /// The register-window slot at this frame offset.
+    Slot(u32),
+    /// `x0`, as a method lookup hands its callee to the call. Only primitive
+    /// string and RegExp receivers read here: the committed resolution of
+    /// any other receiver records call feedback the optimizer consumes.
+    Result,
+}
+
+impl IntrinsicLoadOutput {
+    fn emit(self, ops: &mut Assembler) {
+        match self {
+            Self::Slot(offset) => dynasm!(ops ; .arch aarch64 ; str x9, [x19, offset]),
+            Self::Result => dynasm!(ops ; .arch aarch64 ; mov x0, x9),
+        }
+    }
+}
+
+/// Whether `ops` read a method for a receiver whose committed resolution
+/// records no call feedback: a primitive string or a RegExp.
+pub(crate) fn feedback_free_method_program(ops: &[otter_vm::JitCacheIrOp]) -> bool {
+    matches!(
+        ops.first(),
+        Some(otter_vm::JitCacheIrOp::LoadIntrinsicPrototype { target, .. })
+            if target.type_tag == otter_vm::string::JS_STRING_BODY_TYPE_TAG
+                || target.type_tag == otter_vm::regexp::REGEXP_BODY_TYPE_TAG
+    )
+}
+
 /// Static intrinsic-prototype reads: a receiver of an intrinsic body type
-/// (primitive string, closure, collection) reading a data slot of its pinned
-/// realm prototype, or a closure's own `prototype` slot. These programs
-/// describe realm intrinsics, not site feedback; a miss falls through to the
-/// site's IC.
-fn emit_intrinsic_loads(
+/// (primitive string, RegExp, closure, collection) reading a data slot of its
+/// pinned realm prototype, or a closure's own `prototype` slot. These
+/// programs describe realm intrinsics, not site feedback; a miss falls
+/// through to the site's IC. A hit leaves the value at `output` and branches
+/// to `done`.
+pub(super) fn emit_intrinsic_loads(
     ops: &mut Assembler,
     relocations: &mut RelocationCapture,
     view: &JitCompileSnapshot,
     byte_pc: u32,
     obj_off: u32,
-    dst_off: u32,
+    output: IntrinsicLoadOutput,
     done: DynamicLabel,
 ) {
     use otter_vm::JitCacheIrOp as Op;
     let Some(programs) = view.property_programs.get(&byte_pc) else {
         return;
     };
+    // Every program proves a receiver that is not an ordinary object: an
+    // immediate or an ordinary object skips them all at once.
+    let skip = ops.new_dynamic_label();
+    dynasm!(ops ; .arch aarch64 ; ldr x9, [x19, obj_off]);
+    super::values::emit_cell_test(ops, 9, super::values::CellTest::IsNotCell, skip);
+    dynasm!(ops ; .arch aarch64
+        ; ldrb w16, [x9]
+        ; cmp w16, OBJECT_BODY_TYPE_TAG
+        ; b.eq =>skip
+    );
     for program in programs {
+        if matches!(output, IntrinsicLoadOutput::Result)
+            && !feedback_free_method_program(&program.ops)
+        {
+            continue;
+        }
         if let [Op::LoadClosurePrototype { object: 0 }] = *program.ops {
             let next = ops.new_dynamic_label();
             dynasm!(ops ; .arch aarch64 ; ldr x9, [x19, obj_off]);
             ic_probe::emit_closure_prototype_load(ops, view, 9, 9, next);
+            output.emit(ops);
             dynasm!(ops ; .arch aarch64
-                ; str x9, [x19, dst_off]
                 ; b =>done
                 ; =>next);
             continue;
@@ -221,15 +268,15 @@ fn emit_intrinsic_loads(
                 }
                 Op::LoadField { field, .. } => {
                     ic_probe::emit_load_field(ops, relocations, view, 15, field, next);
-                    dynasm!(ops ; .arch aarch64
-                        ; str x9, [x19, dst_off]
-                        ; b =>done);
+                    output.emit(ops);
+                    dynasm!(ops ; .arch aarch64 ; b =>done);
                 }
                 _ => {}
             }
         }
         dynasm!(ops ; .arch aarch64 ; =>next);
     }
+    dynasm!(ops ; .arch aarch64 ; =>skip);
 }
 
 /// Emit `dst = obj.name`: inline own field, then the shared `LoadIC`.
@@ -272,7 +319,15 @@ pub(super) fn emit_load_property(
         );
     }
 
-    emit_intrinsic_loads(ops, relocations, view, byte_pc, obj_off, dst_off, done);
+    emit_intrinsic_loads(
+        ops,
+        relocations,
+        view,
+        byte_pc,
+        obj_off,
+        IntrinsicLoadOutput::Slot(dst_off),
+        done,
+    );
     emit_slot_address(ops, relocations, view, byte_pc, ic_slot, LOAD_SLOT);
     dynasm!(ops ; .arch aarch64 ; ldr X(LOAD_RECEIVER), [x19, obj_off]);
     emit_inline_own_field(ops, view, LOAD_RECEIVER, LOAD_SLOT, shared);

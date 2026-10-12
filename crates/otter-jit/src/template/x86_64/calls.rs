@@ -509,11 +509,14 @@ pub(super) fn emit_method_call(
         }
     }
     let resolved = ops.new_dynamic_label();
-    // Every other receiver runs the site's load IC (its handlers, then the
+    // Every receiver first runs the site's load IC (its handlers, then the
     // isolate's shared action table as a megamorphic stub cache); a
-    // closure or native hit is called generically. A miss resolves through
-    // the committed method resolution, which also records call feedback and
-    // updates the slot.
+    // closure or native hit is called generically. On a miss, a receiver of
+    // an intrinsic body type (a primitive string, a RegExp, a closure, a
+    // collection) reads its method from the pinned realm prototype's slot
+    // through the site's static programs, leaving it in `rax`. Any other
+    // miss resolves through the committed method resolution, which also
+    // records call feedback and updates the slot.
     let resolve = ops.new_dynamic_label();
     if let Some(ic_slot) = view
         .property_accesses
@@ -540,6 +543,7 @@ pub(super) fn emit_method_call(
             ; jz =>resolved);
     }
     dynasm!(ops ; .arch x64 ; =>resolve);
+    super::emit_intrinsic_loads(ops, relocations, view, byte_pc, receiver, true, resolved);
     emit_load_reg(ops, 0, receiver);
     dynasm!(ops
         ; .arch x64

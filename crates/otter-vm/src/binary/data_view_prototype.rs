@@ -347,12 +347,10 @@ fn coerce_number(value: &Value, heap: &otter_gc::GcHeap) -> NumberValue {
     NumberValue::from_f64(f64::NAN)
 }
 
-fn coerce_int(value: &Value, heap: &otter_gc::GcHeap) -> i64 {
-    let n = coerce_number(value, heap).as_f64();
-    if !n.is_finite() {
-        return 0;
-    }
-    n.trunc() as i64
+/// §7.1.6 `ToInt32`; the 8- and 16-bit setters keep its low bits, since
+/// their moduli divide 2^32.
+fn coerce_int(value: &Value, heap: &otter_gc::GcHeap) -> i32 {
+    crate::number::bitwise::to_int32(coerce_number(value, heap))
 }
 
 fn coerce_bigint64(value: &Value, heap: &otter_gc::GcHeap) -> i64 {

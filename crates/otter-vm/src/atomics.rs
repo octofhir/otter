@@ -409,8 +409,12 @@ fn modify_op(
         let handle = BigIntValue::from_num(heap, &new_b).map_err(NativeError::from)?;
         ta.set(heap, idx, &Value::big_int(handle));
     } else {
+        // An integer element keeps the low bits of the operand's ToInt32.
         let prev_n = prev.as_number().map(|n| n.as_f64() as i64).unwrap_or(0);
-        let v_n = coerced.as_number().map(|n| n.as_f64() as i64).unwrap_or(0);
+        let v_n = coerced
+            .as_number()
+            .map(|n| i64::from(crate::number::bitwise::to_int32(n)))
+            .unwrap_or(0);
         let new_n = op(prev_n, v_n);
         ta.set(
             heap,

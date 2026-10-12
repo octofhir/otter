@@ -234,11 +234,11 @@ impl TypedArrayKind {
         }
         match self {
             Self::Int8 => {
-                let n = number_to_int_truncated(value, heap);
+                let n = number_to_int32(value, heap);
                 bytes[offset] = (n as i8) as u8;
             }
             Self::Uint8 => {
-                let n = number_to_int_truncated(value, heap);
+                let n = number_to_int32(value, heap);
                 bytes[offset] = n as u8;
             }
             Self::Uint8Clamped => {
@@ -246,11 +246,11 @@ impl TypedArrayKind {
                 bytes[offset] = n;
             }
             Self::Int16 => {
-                let n = number_to_int_truncated(value, heap) as i16;
+                let n = number_to_int32(value, heap) as i16;
                 bytes[offset..offset + 2].copy_from_slice(&n.to_le_bytes());
             }
             Self::Uint16 => {
-                let n = number_to_int_truncated(value, heap) as u16;
+                let n = number_to_int32(value, heap) as u16;
                 bytes[offset..offset + 2].copy_from_slice(&n.to_le_bytes());
             }
             Self::Int32 => {
@@ -370,14 +370,10 @@ pub fn f64_to_f16_bits(value: f64) -> u16 {
     }
 }
 
-/// §6.1.6.1.5 `Number::ToInt(value)` — truncate toward zero. NaN and
-/// infinities map to `0`.
-fn number_to_int_truncated(value: &Value, heap: &otter_gc::GcHeap) -> i64 {
-    let n = value_to_number(value, heap).as_f64();
-    if !n.is_finite() {
-        return 0;
-    }
-    n.trunc() as i64
+/// §7.1.6 `ToInt32(value)`. The 8- and 16-bit conversions (§7.1.8–§7.1.11)
+/// keep its low bits: their moduli divide 2^32.
+fn number_to_int32(value: &Value, heap: &otter_gc::GcHeap) -> i32 {
+    bitwise::to_int32(value_to_number(value, heap))
 }
 
 /// §6.1.6.1 `ToUint8Clamp(value)`.
@@ -860,7 +856,7 @@ impl JsTypedArray {
         {
             return false;
         }
-        let n = number_to_int_truncated(value, heap) as u8;
+        let n = number_to_int32(value, heap) as u8;
         let (buffer, off) = heap.read_payload(self.handle, |body| (body.buffer, body.byte_offset));
         let offset = off + index;
         buffer.with_bytes_mut(heap, |bytes| {
@@ -884,12 +880,7 @@ impl JsTypedArray {
         {
             return false;
         }
-        let raw = number.as_f64();
-        let n = if raw.is_finite() {
-            raw.trunc() as i64
-        } else {
-            0
-        } as u8;
+        let n = bitwise::to_int32(number) as u8;
         let (buffer, off) = heap.read_payload(self.handle, |body| (body.buffer, body.byte_offset));
         let offset = off + index;
         buffer.with_bytes_mut(heap, |bytes| {

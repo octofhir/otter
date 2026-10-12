@@ -213,6 +213,7 @@ fn recursive_splices_keep_distinct_frames_and_move_recovered_aliases_once() {
             let observations = Arc::new(Mutex::new(Vec::new()));
             let install = installer(observations.clone());
             let mut oracle = Runtime::builder()
+                .jit_compile_threads(0)
                 .jit_selection(JitSelection::InterpreterOnly)
                 .extension_installer(install.clone())
                 .build()
@@ -232,6 +233,7 @@ fn recursive_splices_keep_distinct_frames_and_move_recovered_aliases_once() {
             observations.lock().unwrap().clear();
 
             let mut runtime = Runtime::builder()
+                .jit_compile_threads(0)
                 .jit_selection(JitSelection::ProductionTiered)
                 .jit_debug(JitDebugRequest::artifacts().with_events(true))
                 .extension_installer(install)

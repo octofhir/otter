@@ -91,6 +91,7 @@ JSON.stringify([
 
 fn run(selection: JitSelection) -> (String, u64) {
     let mut runtime = Runtime::builder()
+        .jit_compile_threads(0)
         .jit_selection(selection)
         .build()
         .expect("string intrinsic runtime");
@@ -127,6 +128,7 @@ fn optimizing_string_intrinsics_match_oracle_and_preserve_fallbacks() {
 #[test]
 fn optimized_literal_cell_survives_cache_rehash_and_full_gc() {
     let mut runtime = Runtime::builder()
+        .jit_compile_threads(0)
         .jit_selection(JitSelection::ProductionTiered)
         .build()
         .expect("literal-cell runtime");
@@ -187,6 +189,7 @@ fn nested_target_eager_literal_prewarm_survives_snapshot_gc_and_executes() {
     use otter_runtime::{JitArtifactFileName, JitDebugRequest};
 
     let mut runtime = Runtime::builder()
+        .jit_compile_threads(0)
         .jit_selection(JitSelection::ProductionTiered)
         .jit_debug(JitDebugRequest::artifacts())
         .build()

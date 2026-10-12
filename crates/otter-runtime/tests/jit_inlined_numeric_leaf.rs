@@ -128,7 +128,9 @@ fn force_full_gc(runtime: &mut Runtime) {
 
 fn run(selection: JitSelection) -> RunResult {
     let capture_events = matches!(&selection, JitSelection::ProductionTiered);
-    let builder = Runtime::builder().jit_selection(selection);
+    let builder = Runtime::builder()
+        .jit_compile_threads(0)
+        .jit_selection(selection);
     let mut runtime = if capture_events {
         builder.jit_debug(JitDebugRequest::events()).build()
     } else {

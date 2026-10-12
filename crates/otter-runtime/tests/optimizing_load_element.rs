@@ -510,6 +510,7 @@ fn several_live_arrays_enter_optimized_code() {
 #[test]
 fn source_element_load_enters_optimized_code() {
     let mut runtime = Runtime::builder()
+        .jit_compile_threads(0)
         .jit_selection(JitSelection::ProductionTiered)
         .build()
         .expect("runtime");
@@ -558,6 +559,7 @@ fn source_element_load_enters_optimized_code() {
 #[test]
 fn source_tagged_array_chain_enters_optimized_code() {
     let mut runtime = Runtime::builder()
+        .jit_compile_threads(0)
         .jit_selection(JitSelection::ProductionTiered)
         .build()
         .expect("runtime");

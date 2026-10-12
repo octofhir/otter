@@ -28,6 +28,7 @@ struct RunResult {
 
 fn run(selection: JitSelection, source: &str, name: &str) -> String {
     let mut runtime = Runtime::builder()
+        .jit_compile_threads(0)
         .jit_selection(selection)
         .build()
         .expect("runtime");
@@ -45,6 +46,7 @@ fn run_warmed_probe(
     name: &str,
 ) -> RunResult {
     let mut runtime = Runtime::builder()
+        .jit_compile_threads(0)
         .jit_selection(selection)
         .build()
         .expect("runtime");

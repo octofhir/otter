@@ -357,6 +357,7 @@ impl Harness {
             decline: policy == Policy::DeclinedInterpreter,
         });
         let mut runtime = Runtime::builder()
+            .jit_compile_threads(0)
             .jit_selection(match policy {
                 Policy::Oracle => JitSelection::InterpreterOnly,
                 Policy::Production => JitSelection::ProductionTiered,

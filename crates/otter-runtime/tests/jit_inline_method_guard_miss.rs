@@ -38,6 +38,7 @@ acc;
 
 fn run(selection: JitSelection) -> (String, usize) {
     let mut runtime = Runtime::builder()
+        .jit_compile_threads(0)
         .jit_selection(selection)
         .jit_debug(JitDebugRequest::events())
         .build()

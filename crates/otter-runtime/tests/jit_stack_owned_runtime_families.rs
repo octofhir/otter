@@ -53,6 +53,7 @@ run(1000);
 
 fn run(source: &str, selection: JitSelection) -> (String, RuntimeExecutionStats) {
     let mut runtime = Runtime::builder()
+        .jit_compile_threads(0)
         .jit_selection(selection)
         .build()
         .expect("runtime");
@@ -69,6 +70,7 @@ fn run(source: &str, selection: JitSelection) -> (String, RuntimeExecutionStats)
 /// Generic call transitions of one more `run(1000)` after the script warmed.
 fn steady_generic_calls(source: &str, selection: JitSelection) -> u64 {
     let mut runtime = Runtime::builder()
+        .jit_compile_threads(0)
         .jit_selection(selection)
         .build()
         .expect("runtime");
@@ -90,6 +92,7 @@ fn steady_generic_calls(source: &str, selection: JitSelection) -> u64 {
 
 fn run_with_events(source: &str, selection: JitSelection) -> (String, Vec<JitDebugEvent>) {
     let mut runtime = Runtime::builder()
+        .jit_compile_threads(0)
         .jit_selection(selection)
         .jit_debug(JitDebugRequest::events())
         .build()
@@ -274,6 +277,7 @@ fn generated_plain_method_and_construct_calls_create_callee_contexts() {
 #[test]
 fn direct_call_artifacts_link_every_family_to_context_allocating_callees() {
     let mut runtime = Runtime::builder()
+        .jit_compile_threads(0)
         .jit_selection(JitSelection::Template)
         .jit_debug(JitDebugRequest::artifacts())
         .build()

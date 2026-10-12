@@ -458,6 +458,7 @@ fn actual_sloppy_object_splices_keep_loaded_intrinsics_source_recipes_and_moving
         records.clone(),
     );
     let mut oracle = Runtime::builder()
+        .jit_compile_threads(0)
         .jit_selection(JitSelection::InterpreterOnly)
         .extension_installer(install.clone())
         .build()
@@ -489,6 +490,7 @@ fn actual_sloppy_object_splices_keep_loaded_intrinsics_source_recipes_and_moving
     assert_eq!(expected_moving, "[true,731,17,19,23,true,1]");
     assert_eq!(expected_recovery, "[true,731,41,19,23,2]");
     let mut runtime = Runtime::builder()
+        .jit_compile_threads(0)
         .jit_selection(JitSelection::ProductionTiered)
         .jit_debug(JitDebugRequest::artifacts().with_events(true))
         .extension_installer(install)

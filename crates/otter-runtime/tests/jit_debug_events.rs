@@ -56,6 +56,7 @@ outer(48);
 
 fn runtime_with_events() -> Runtime {
     Runtime::builder()
+        .jit_compile_threads(0)
         .jit_selection(JitSelection::Template)
         .jit_debug(JitDebugRequest::events())
         .build()
@@ -100,6 +101,7 @@ fn assert_ordered_template_compile(events: &[JitDebugEvent]) {
 #[test]
 fn jit_debug_reports_are_default_off() {
     let mut runtime = Runtime::builder()
+        .jit_compile_threads(0)
         .jit_selection(JitSelection::Template)
         .build()
         .expect("default runtime");
@@ -201,6 +203,7 @@ fn template_osr_emits_ordered_compile_events() {
 #[test]
 fn extracted_int32_math_call_publishes_one_stable_optimizing_body() {
     let mut runtime = Runtime::builder()
+        .jit_compile_threads(0)
         .jit_selection(JitSelection::ProductionTiered)
         .jit_debug(JitDebugRequest::events())
         .build()
@@ -284,6 +287,7 @@ fn extracted_int32_math_call_publishes_one_stable_optimizing_body() {
 #[test]
 fn numeric_method_candidate_splices_into_optimizing_backend() {
     let mut runtime = Runtime::builder()
+        .jit_compile_threads(0)
         .jit_selection(JitSelection::ProductionTiered)
         .jit_debug(JitDebugRequest::events())
         .build()
@@ -362,6 +366,7 @@ engineKernel(4000);
 #[test]
 fn optimized_method_deopt_preserves_this_overflow_invalidation_and_abrupt_completion() {
     let mut runtime = Runtime::builder()
+        .jit_compile_threads(0)
         .jit_selection(JitSelection::ProductionTiered)
         .jit_debug(JitDebugRequest::events())
         .build()
@@ -506,6 +511,7 @@ allocated.length;
 #[tokio::test(flavor = "current_thread")]
 async fn async_otter_success_carries_owned_report() {
     let otter = Otter::builder()
+        .jit_compile_threads(0)
         .jit_selection(JitSelection::Template)
         .jit_debug(JitDebugRequest::events())
         .build()
@@ -522,6 +528,7 @@ async fn async_otter_success_carries_owned_report() {
 #[tokio::test(flavor = "current_thread")]
 async fn async_otter_report_includes_jit_from_event_loop_callbacks() {
     let otter = Otter::builder()
+        .jit_compile_threads(0)
         .jit_selection(JitSelection::Template)
         .jit_debug(JitDebugRequest::events())
         .build()
@@ -556,6 +563,7 @@ setTimeout(() => {
 #[tokio::test(flavor = "current_thread")]
 async fn async_otter_abrupt_failure_carries_partial_report() {
     let otter = Otter::builder()
+        .jit_compile_threads(0)
         .jit_selection(JitSelection::Template)
         .jit_debug(JitDebugRequest::events())
         .build()
@@ -579,6 +587,7 @@ async fn async_otter_abrupt_failure_carries_partial_report() {
 #[tokio::test(flavor = "current_thread")]
 async fn concurrent_handle_commands_keep_jit_event_batches_isolated() {
     let otter = Otter::builder()
+        .jit_compile_threads(0)
         .jit_selection(JitSelection::Template)
         .jit_debug(JitDebugRequest::events())
         .build()

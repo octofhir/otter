@@ -133,6 +133,7 @@ JSON.stringify([
 
 fn run(selection: JitSelection) -> (String, FinalStats) {
     let mut runtime = Runtime::builder()
+        .jit_compile_threads(0)
         .jit_selection(selection)
         .build()
         .expect("runtime");

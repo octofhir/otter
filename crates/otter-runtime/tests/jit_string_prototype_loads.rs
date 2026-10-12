@@ -55,6 +55,7 @@ for (let warm = 0; warm < 40; warm++) {
 
 fn warmed(selection: JitSelection) -> Runtime {
     let mut runtime = Runtime::builder()
+        .jit_compile_threads(0)
         .jit_selection(selection)
         .build()
         .expect("string prototype load runtime");

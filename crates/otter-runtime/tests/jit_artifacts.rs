@@ -99,6 +99,7 @@ JSON.stringify(callMethod(receiver, 9));
 
 fn runtime_with_artifacts(selection: JitSelection) -> Runtime {
     Runtime::builder()
+        .jit_compile_threads(0)
         .jit_selection(selection)
         .jit_debug(JitDebugRequest::artifacts())
         .build()
@@ -836,6 +837,7 @@ allocated.length;
 #[tokio::test(flavor = "current_thread")]
 async fn async_success_and_abrupt_failure_transport_owned_artifacts() {
     let otter = Otter::builder()
+        .jit_compile_threads(0)
         .jit_selection(JitSelection::Template)
         .jit_debug(JitDebugRequest::artifacts())
         .build()

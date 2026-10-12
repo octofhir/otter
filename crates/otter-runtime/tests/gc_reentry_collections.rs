@@ -33,6 +33,7 @@ struct RunResult {
 
 fn run_after_full_gc(selection: JitSelection, setup: &str, probe: &str, name: &str) -> RunResult {
     let mut runtime = Runtime::builder()
+        .jit_compile_threads(0)
         .jit_selection(selection)
         .build()
         .expect("runtime");

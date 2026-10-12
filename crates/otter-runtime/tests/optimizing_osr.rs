@@ -112,6 +112,7 @@ struct Observation {
 
 fn run(setup: &str, probe: &str, selection: JitSelection, url: &str) -> Observation {
     let mut runtime = Runtime::builder()
+        .jit_compile_threads(0)
         .jit_selection(selection)
         .jit_debug(JitDebugRequest::artifacts().with_events(true))
         .build()

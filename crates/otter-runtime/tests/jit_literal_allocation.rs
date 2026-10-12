@@ -36,6 +36,7 @@ JSON.stringify([
         JitSelection::ProductionTiered,
     ] {
         let mut runtime = Runtime::builder()
+            .jit_compile_threads(0)
             .jit_selection(selection)
             .build()
             .expect("optimizing literal runtime");
@@ -85,6 +86,7 @@ JSON.stringify([
         let mut oracle = None;
         for selection in [JitSelection::InterpreterOnly, JitSelection::Template] {
             let mut runtime = Runtime::builder()
+                .jit_compile_threads(0)
                 .jit_selection(selection)
                 .jit_debug(JitDebugRequest::artifacts())
                 .build()

@@ -173,6 +173,9 @@ impl JitFunctionCode for OptimizedCode {
     fn native_code_address(&self) -> Option<u64> {
         Some(unsafe { self.code.ptr_at(0) as u64 })
     }
+    fn prepare_for_execution(&self) {
+        self.code.prepare_for_execution();
+    }
     fn return_sites(&self) -> &[otter_vm::native_abi::SafepointEntry] {
         &self.return_sites
     }

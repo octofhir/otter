@@ -2558,6 +2558,11 @@ pub trait JitFunctionCode: std::fmt::Debug + Send + Sync {
         None
     }
 
+    /// Make these instructions safe to run on the calling thread. Code a
+    /// compiler thread finished is prepared on the isolate thread before it
+    /// is installed.
+    fn prepare_for_execution(&self) {}
+
     /// Exact sorted associations of real machine returns to source/root records.
     fn return_sites(&self) -> &[crate::native_abi::SafepointEntry] {
         &[]

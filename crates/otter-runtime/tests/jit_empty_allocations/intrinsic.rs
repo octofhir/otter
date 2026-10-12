@@ -48,6 +48,7 @@ intrinsicEffects = 0;
 
 fn probe(extra_realm: bool) {
     let mut runtime = Runtime::builder()
+        .jit_compile_threads(0)
         .jit_selection(JitSelection::ProductionTiered)
         .jit_debug(JitDebugRequest::artifacts().with_events(true))
         .build()
@@ -224,6 +225,7 @@ fn default_source_arrays_keep_their_prototype_in_a_foreign_caller() {
     ] {
         let slot = Arc::new(Mutex::new(None));
         let mut runtime = Runtime::builder()
+            .jit_compile_threads(0)
             .jit_selection(selection)
             .jit_debug(JitDebugRequest::artifacts().with_events(true))
             .extension_installer(exchange_installer(slot))
@@ -297,6 +299,7 @@ fn escaped_array_prototypes_keep_their_brand_after_realm_disposal() {
     ] {
         let slot = Arc::new(Mutex::new(None));
         let mut runtime = Runtime::builder()
+            .jit_compile_threads(0)
             .jit_selection(selection)
             .extension_installer(exchange_installer(slot))
             .build()
@@ -355,6 +358,7 @@ fn array_prototype_length_rollback_and_clone_preserve_exotic_semantics() {
     ] {
         let slot = Arc::new(Mutex::new(None));
         let mut runtime = Runtime::builder()
+            .jit_compile_threads(0)
             .jit_selection(selection)
             .extension_installer(exchange_installer(slot))
             .build()
@@ -576,6 +580,7 @@ saveIntrinsicBundle([implicitTypeErrorFactory, TypeError.prototype]);
         for default_source in [true, false] {
             let slot = Arc::new(Mutex::new(None));
             let mut runtime = Runtime::builder()
+                .jit_compile_threads(0)
                 .jit_selection(selection)
                 .jit_debug(JitDebugRequest::artifacts().with_events(true))
                 .extension_installer(exchange_installer(slot))

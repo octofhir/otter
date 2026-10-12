@@ -21,6 +21,7 @@ use otter_vm::native_abi::{CodeLifetimeState, NativeFrameKind};
 /// select an installed optimizing generation once it finishes.
 fn run(source: &str, selection: JitSelection) -> (String, RuntimeExecutionStats, usize) {
     let mut runtime = Runtime::builder()
+        .jit_compile_threads(0)
         .jit_selection(selection)
         .build()
         .expect("arithmetic repair runtime");

@@ -31,6 +31,7 @@ structural(180);
 
 fn run(selection: JitSelection) -> (String, u64) {
     let mut runtime = Runtime::builder()
+        .jit_compile_threads(0)
         .jit_selection(selection)
         .build()
         .expect("runtime");

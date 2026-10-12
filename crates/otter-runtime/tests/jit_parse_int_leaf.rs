@@ -137,6 +137,7 @@ fn run(
     selection: JitSelection,
 ) -> (String, otter_runtime::RuntimeExecutionStats) {
     let mut runtime = Runtime::builder()
+        .jit_compile_threads(0)
         .jit_selection(selection)
         // Warm the called function itself instead of inlining it into top-level OSR.
         .build()
@@ -222,6 +223,7 @@ fn artifacts_and_events_expose_one_leaf_and_reject_explicit_radix() {
     // The leaf call region is a Template lowering; the optimizing tier keeps
     // the call as the baseline operation and reports no lowering of its own.
     let mut runtime = Runtime::builder()
+        .jit_compile_threads(0)
         .jit_selection(JitSelection::Template)
         .jit_debug(JitDebugRequest::artifacts().with_events(true))
         .build()

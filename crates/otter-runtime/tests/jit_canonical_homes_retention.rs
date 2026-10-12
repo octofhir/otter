@@ -457,6 +457,7 @@ fn measure(last_length: usize) -> Vec<Sample> {
     let osr_before_probe = Arc::new(AtomicU64::new(u64::MAX));
     let large_payloads = Arc::new(AtomicUsize::new(0));
     let mut runtime = Runtime::builder()
+        .jit_compile_threads(0)
         .jit_selection(JitSelection::ProductionTiered)
         .jit_debug(JitDebugRequest::artifacts().with_events(true))
         .extension_installer(RuntimeExtensionInstaller::new({

@@ -68,6 +68,13 @@ impl CompiledCode {
         self.buf.ptr(AssemblyOffset(offset))
     }
 
+    /// Discard instructions the calling thread may have fetched before this
+    /// mapping was finalized on another thread. Finalization already made
+    /// the bytes visible to every core's instruction cache.
+    pub fn prepare_for_execution(&self) {
+        dynasmrt::cache_control::prepare_for_execution(&self.buf);
+    }
+
     /// Number of finalized instruction bytes, excluding unused mapping capacity.
     #[must_use]
     pub fn len(&self) -> usize {

@@ -15,7 +15,11 @@ use otter_runtime::{JitSelection, Runtime, SourceInput};
 #[test]
 fn ordinary_receivers_use_live_prototypes_and_per_closure_capacity() {
     for selection in [JitSelection::Template, JitSelection::ProductionTiered] {
-        let mut runtime = Runtime::builder().jit_selection(selection).build().unwrap();
+        let mut runtime = Runtime::builder()
+            .jit_compile_threads(0)
+            .jit_selection(selection)
+            .build()
+            .unwrap();
         let warm = runtime.run_script(SourceInput::from_javascript(r#"
 function factory(init) { return function(value) { init(this, value); }; }
 var grow = false;

@@ -21,6 +21,7 @@ struct RunResult {
 
 fn run(selection: JitSelection, warm_source: &str, final_source: &str, name: &str) -> RunResult {
     let mut runtime = Runtime::builder()
+        .jit_compile_threads(0)
         .jit_selection(selection)
         .build()
         .expect("runtime");

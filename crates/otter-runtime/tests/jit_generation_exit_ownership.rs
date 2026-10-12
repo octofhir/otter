@@ -115,7 +115,8 @@ impl CaptureCompiler {
             .snapshot
             .instructions
             .iter()
-            .enumerate().rfind(|(pc, _)| source.op_at(*pc) == Some(Op::LoadProperty))
+            .enumerate()
+            .rfind(|(pc, _)| source.op_at(*pc) == Some(Op::LoadProperty))
             .expect("reader ends by loading the receiver's x property");
         let mut observed = self.observed.lock().unwrap();
         if let Some(previous) = &observed.source {
@@ -197,6 +198,7 @@ fn old_graph_guard_exit_preserves_the_reentrant_current_replacement() {
         observed: observed.clone(),
     });
     let mut runtime = Runtime::builder()
+        .jit_compile_threads(0)
         .jit_selection(JitSelection::ProductionTiered)
         .jit_debug(JitDebugRequest::artifacts().with_events(true))
         .extension_installer(RuntimeExtensionInstaller::new({

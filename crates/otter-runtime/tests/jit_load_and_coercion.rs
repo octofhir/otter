@@ -368,6 +368,7 @@ JSON.stringify([getCalls, callCalls, errorName]);
 
 fn run(source: &str, selection: JitSelection) -> (String, u64, u64, u64) {
     let mut runtime = Runtime::builder()
+        .jit_compile_threads(0)
         .jit_selection(selection)
         .build()
         .expect("runtime");
@@ -390,6 +391,7 @@ fn run(source: &str, selection: JitSelection) -> (String, u64, u64, u64) {
 
 fn run_boxed_properties(selection: JitSelection) -> (String, RuntimeExecutionStats) {
     let mut runtime = Runtime::builder()
+        .jit_compile_threads(0)
         .jit_selection(selection)
         .build()
         .expect("runtime");
@@ -406,6 +408,7 @@ fn run_boxed_properties(selection: JitSelection) -> (String, RuntimeExecutionSta
 
 fn run_global_lexicals(selection: JitSelection) -> (String, RuntimeExecutionStats) {
     let mut runtime = Runtime::builder()
+        .jit_compile_threads(0)
         .jit_selection(selection)
         .build()
         .expect("runtime");

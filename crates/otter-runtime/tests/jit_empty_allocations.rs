@@ -1001,6 +1001,7 @@ fn probe(extra_realm: bool) {
     let oracle_invocations = Arc::new(AtomicUsize::new(0));
     let oracle_arm = Arc::new(Mutex::new(None));
     let mut oracle = Runtime::builder()
+        .jit_compile_threads(0)
         .jit_selection(JitSelection::InterpreterOnly)
         .extension_installer(collection_installer(
             false,
@@ -1022,6 +1023,7 @@ fn probe(extra_realm: bool) {
     let invocations = Arc::new(AtomicUsize::new(0));
     let arm = Arc::new(Mutex::new(None));
     let mut runtime = Runtime::builder()
+        .jit_compile_threads(0)
         .jit_selection(JitSelection::ProductionTiered)
         .jit_debug(JitDebugRequest::artifacts().with_events(true))
         .extension_installer(collection_installer(true, invocations.clone(), arm.clone()))
@@ -1546,6 +1548,7 @@ fn nonempty_probe(extra_realm: bool) {
     let oracle_invocations = Arc::new(AtomicUsize::new(0));
     let oracle_arm = Arc::new(Mutex::new(None));
     let mut oracle = Runtime::builder()
+        .jit_compile_threads(0)
         .jit_selection(JitSelection::InterpreterOnly)
         .extension_installer(collection_installer(
             false,
@@ -1569,6 +1572,7 @@ fn nonempty_probe(extra_realm: bool) {
     let invocations = Arc::new(AtomicUsize::new(0));
     let arm = Arc::new(Mutex::new(None));
     let mut runtime = Runtime::builder()
+        .jit_compile_threads(0)
         .jit_selection(JitSelection::ProductionTiered)
         .jit_debug(JitDebugRequest::artifacts().with_events(true))
         .extension_installer(collection_installer(true, invocations.clone(), arm.clone()))

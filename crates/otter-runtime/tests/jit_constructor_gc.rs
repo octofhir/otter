@@ -505,6 +505,7 @@ fn run_at_selection(fixture: AllocationFixture, selection: JitSelection) {
     let records = Arc::new(Mutex::new(Vec::new()));
     let trace = Arc::new(Mutex::new(DispatchTrace::default()));
     let mut runtime = Runtime::builder()
+        .jit_compile_threads(0)
         .jit_selection(selection)
         .jit_debug(JitDebugRequest::artifacts().with_events(true))
         .extension_installer(observer(records.clone()))
@@ -682,6 +683,7 @@ fn run_probe(fixture: AllocationFixture) {
     // scalar observation must not alter its completion or retained result.
     let allocations = if stress_stride() == 0 { 200_000 } else { 2_048 };
     let mut oracle = Runtime::builder()
+        .jit_compile_threads(0)
         .jit_selection(JitSelection::InterpreterOnly)
         .build()
         .expect("independent constructor interpreter");

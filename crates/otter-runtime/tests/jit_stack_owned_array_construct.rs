@@ -363,6 +363,7 @@ impl CounterDelta {
 
 fn runtime() -> Runtime {
     Runtime::builder()
+        .jit_compile_threads(0)
         .jit_selection(JitSelection::ProductionTiered)
         .jit_debug(JitDebugRequest::artifacts().with_events(true))
         .build()
@@ -371,6 +372,7 @@ fn runtime() -> Runtime {
 
 fn interpreter_runtime() -> Runtime {
     Runtime::builder()
+        .jit_compile_threads(0)
         .jit_selection(JitSelection::InterpreterOnly)
         .build()
         .expect("interpreter-only constructor transition runtime")

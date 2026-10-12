@@ -230,6 +230,7 @@ fn run_fixture(
 ) -> Run {
     let is_production = matches!(&selection, JitSelection::ProductionTiered);
     let mut runtime = Runtime::builder()
+        .jit_compile_threads(0)
         .jit_selection(selection)
         .jit_debug(JitDebugRequest::artifacts().with_events(true))
         .build()

@@ -70,6 +70,7 @@ struct SplitRunResult {
 
 fn run(source: &str, name: &str, selection: JitSelection) -> RunResult {
     let mut runtime = Runtime::builder()
+        .jit_compile_threads(0)
         .jit_selection(selection)
         .build()
         .expect("runtime");
@@ -95,6 +96,7 @@ fn run_after_warmup(
     selection: JitSelection,
 ) -> SplitRunResult {
     let mut runtime = Runtime::builder()
+        .jit_compile_threads(0)
         .jit_selection(selection)
         .build()
         .expect("runtime");

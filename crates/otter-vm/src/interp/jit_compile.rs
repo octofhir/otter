@@ -5,6 +5,9 @@
 //!   whole-isolate executable ownership and generation snapshots.
 //! - `compile_jit_function` and cold feedback baking into the instruction view
 //!   (property/object-literal/global-lexical/inline-callee tables).
+//! - `compile_optimized_jit_function` hands an optimizing snapshot to the
+//!   isolate's compiler threads; `install_finished_optimized_compiles`
+//!   installs their results at loop polls and tier decisions.
 //! - Call plans snapshot permanent function entry cells independently of
 //!   callee tier.
 //! - Call/method target profiling and reoptimization eviction.
@@ -24,7 +27,9 @@
 //! require the linked source realm to be active; foreign calls retain their
 //! source-aware committed operations instead of baking the caller's cells.
 //! Compiled code is published only after the registry accepts its metadata and
-//! exact isolate-epoch dependency snapshot.
+//! exact isolate-epoch dependency snapshot. An optimizing snapshot owns its
+//! roots until its result is installed or dropped; a result whose function was
+//! invalidated or entered retraining after the snapshot is dropped.
 //! Caller compilation never recursively compiles its generated-call targets.
 //! Property shape preparation precedes nested body and method snapshots, so
 //! metadata migration cannot immediately stale a freshly captured method guard.
@@ -38,6 +43,7 @@
 //! - [`crate::jit::JitCompileSnapshot`] owns the native compile input.
 //! - `field_types` resolves defining words and retained ordinary targets.
 //! - [`crate::jit_roots`] owns compile-session and generation lifetimes.
+//! - [`crate::jit_compile_queue`] owns the compiler threads.
 #![allow(unused_imports)]
 use crate::*;
 
@@ -518,24 +524,30 @@ impl Interpreter {
         });
     }
 
-    /// Replace `fid`'s current native generation with one optimizing-tier body
-    /// compiled from the latest feedback snapshot.
+    /// Prepare `fid`'s optimizing compilation from its latest feedback and
+    /// hand it to the compiler, to replace the function's current native
+    /// generation.
     ///
-    /// Compilation leaves the current baseline generation installed. A
-    /// successful entry-capable optimizer is published through the function's
-    /// stable entry cell; generated callers observe it on their next entry
-    /// without recompilation. A declined optimizer leaves the baseline target
+    /// Compilation leaves the current baseline generation installed. With
+    /// compiler threads the request returns `None` at once and the isolate
+    /// installs the result later
+    /// ([`Self::install_finished_optimized_compiles`]); without them the body
+    /// compiles here and is returned installed. A successful entry-capable
+    /// optimizer is published through the function's stable entry cell;
+    /// generated callers observe it on their next entry without
+    /// recompilation. A declined optimizer leaves the baseline target
     /// untouched.
     ///
     /// Unsupported functions return `None`; a retraining function stays in the
-    /// interpreter before any compile preparation or allocation begins.
+    /// interpreter before any compile preparation or allocation begins, and a
+    /// function with a compilation in flight is not prepared again.
     pub(crate) fn compile_optimized_jit_function(
         &mut self,
         context: &ExecutionContext,
         fid: u32,
         osr_pc: Option<u32>,
     ) -> Option<std::sync::Arc<dyn jit::JitFunctionCode>> {
-        if self.jit_retraining_blocks(fid) {
+        if self.jit_retraining_blocks(fid) || self.jit_compile_queue.is_pending(fid) {
             return None;
         }
         let available_code_bytes = self.jit_code_registry.available_code_bytes();
@@ -633,88 +645,176 @@ impl Interpreter {
                     module: snapshot.code_block.module_url().to_string(),
                 });
         let function = snapshot.code_block.clone();
+        // Compilations may be in flight together, so the identity is reserved
+        // before the compiler stamps it into the code.
         let code_object_id = self.jit_next_code_object_id;
-        let capture_timing = self.jit_debug.request().events_enabled();
-        let queued_ns = if capture_timing {
+        self.jit_next_code_object_id += 1;
+        let queued_ns = if self.jit_debug.request().events_enabled() {
             self.jit_debug.monotonic_ns()
         } else {
             0
         };
-        let compile_started_ns = if capture_timing {
-            self.jit_debug.monotonic_ns()
-        } else {
-            0
-        };
-        let compile_started = capture_timing.then(std::time::Instant::now);
         self.jit_runtime_stats.compile_attempts =
             self.jit_runtime_stats.compile_attempts.saturating_add(1);
         self.optimizing_tier_policy
             .record_compile_attempt(fid, crate::tier_policy::CostedTier::Optimizing);
-        let status = hook.compile_optimized_function(jit::JitCompileRequest {
+        let perf_name = self.jit_debug.request().perf_map_enabled().then(|| {
+            context
+                .function(fid)
+                .map_or_else(|| "<unknown>".to_string(), |function| function.name.clone())
+        });
+        let pending = crate::jit_compile_queue::PendingCompile {
+            function_id: fid,
+            osr_pc,
+            function,
+            roots: self.finalized_compile_roots(roots_start),
+            feedback_epoch: self.code_space.feedback_epoch(fid),
+            queued_ns,
+            perf_name,
+            stale: false,
+        };
+        let request = jit::JitCompileRequest {
             snapshot,
             debug: self.jit_debug.request(),
             artifact_identity,
             osr_pc,
             code_object_id,
+        };
+        let (pending, finished) = self.jit_compile_queue.submit(hook, request, pending)?;
+        self.finish_optimized_compile(pending, finished)
+    }
+
+    /// Install every optimized body the compiler threads finished since the
+    /// last collection.
+    #[inline]
+    pub(crate) fn install_finished_optimized_compiles(&mut self) {
+        if self.jit_compile_queue.has_finished() {
+            for (pending, finished) in self.jit_compile_queue.take_finished() {
+                let _ = self.finish_optimized_compile(pending, finished);
+            }
+        }
+    }
+
+    /// Install one finished optimizing compilation and record its outcome:
+    /// the installed body, a decline that waits for new feedback, or nothing
+    /// when only code memory refused it.
+    ///
+    /// A compilation whose function was invalidated or entered retraining
+    /// after its snapshot is dropped, and the function's generated callers may
+    /// request a fresh one.
+    fn finish_optimized_compile(
+        &mut self,
+        pending: crate::jit_compile_queue::PendingCompile,
+        finished: crate::jit_compile_queue::FinishedCompile,
+    ) -> Option<std::sync::Arc<dyn jit::JitFunctionCode>> {
+        let crate::jit_compile_queue::PendingCompile {
+            function_id: fid,
+            osr_pc,
+            function,
+            roots,
+            feedback_epoch,
+            queued_ns,
+            perf_name,
+            stale,
+        } = pending;
+        let nanos =
+            |duration: std::time::Duration| duration.as_nanos().min(u128::from(u64::MAX)) as u64;
+        let queue_delay_ns = nanos(finished.queue_delay);
+        let target = osr_pc.map_or(jit_debug::JitDebugTarget::Entry, |pc| {
+            jit_debug::JitDebugTarget::Osr { pc }
         });
-        let compile_duration_ns = compile_started.map_or(0, |started| {
-            started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64
-        });
+        let code_object_id = finished.code_object_id;
         self.record_jit_compile_finished(
             fid,
             jit_debug::JitDebugTier::Optimizing,
             target,
             code_object_id,
-            compile_started_ns,
-            compile_started_ns.saturating_sub(queued_ns),
-            compile_duration_ns,
-            &status,
+            queued_ns.saturating_add(queue_delay_ns),
+            queue_delay_ns,
+            nanos(finished.duration),
+            &finished.status,
         );
-        match status {
+        if self.jit_retraining_blocks(fid) {
+            return None;
+        }
+        if stale {
+            let decision = self.optimizing_tier_policy.decide(
+                &function,
+                crate::tier_policy::CostedTier::Optimizing,
+                self.jit_code_registry.available_code_bytes(),
+            );
+            self.jit_code_registry
+                .defer_generated_tiering(fid, decision.work_target);
+            return None;
+        }
+        let declined = match finished.status {
             Ok(jit::JitCompileStatus::Compiled { code, artifact, .. }) => {
                 if let Some(artifact) = artifact {
                     self.record_jit_artifact(*artifact);
                 }
-                self.jit_next_code_object_id += 1;
+                code.prepare_for_execution();
                 // Generated callers take no per-call executable lease; the
                 // published frame chain names every executing generation.
                 self.retire_unreferenced_jit_code();
-                let roots = self.finalized_compile_roots(roots_start);
-                let admission = self.jit_code_registry.install_compiled(
+                match self.jit_code_registry.install_compiled(
                     code_object_id,
                     code.clone(),
                     &function,
                     None,
                     roots,
-                );
-                if let Err(crate::jit_registry::JitInstallError::ResourceBudget {
-                    required_bytes,
-                }) = admission
-                {
-                    self.optimizing_tier_policy.record_resource_refusal(
-                        &function,
-                        crate::tier_policy::CostedTier::Optimizing,
-                        required_bytes,
-                    );
+                ) {
+                    Ok(()) => {
+                        self.jit_runtime_stats.code_generations =
+                            self.jit_runtime_stats.code_generations.saturating_add(1);
+                        if let Some(name) = &perf_name {
+                            self.record_jit_perf_map(name, code.as_ref(), "optimizing");
+                        }
+                        self.jit_optimized_code.insert(fid, Some(code.clone()));
+                        self.jit_optimized_declined_epoch.remove(&fid);
+                        self.jit_optimized_code_cache = self
+                            .jit_code_registry
+                            .is_current_for_entry(code.as_ref())
+                            .then(|| (fid, code.clone()));
+                        return Some(code);
+                    }
+                    Err(error) => {
+                        if let crate::jit_registry::JitInstallError::ResourceBudget {
+                            required_bytes,
+                        } = error
+                        {
+                            self.optimizing_tier_policy.record_resource_refusal(
+                                &function,
+                                crate::tier_policy::CostedTier::Optimizing,
+                                required_bytes,
+                            );
+                        }
+                        self.record_jit_install_declined(
+                            fid,
+                            code_object_id,
+                            jit_debug::JitDebugTier::Optimizing,
+                            error,
+                        );
+                        error == crate::jit_registry::JitInstallError::InvalidCode
+                    }
                 }
-                if let Err(error) = admission {
-                    self.record_jit_install_declined(
-                        fid,
-                        code_object_id,
-                        jit_debug::JitDebugTier::Optimizing,
-                        error,
-                    );
-                }
-                let installed = admission.is_ok();
-                if installed {
-                    self.jit_runtime_stats.code_generations =
-                        self.jit_runtime_stats.code_generations.saturating_add(1);
-                    self.record_jit_perf_map(context, fid, code.as_ref(), "optimizing");
-                }
-                installed.then_some(code)
             }
-            _ => None,
+            _ => true,
+        };
+        self.jit_optimized_code_cache = None;
+        // A declined entry compile is final for this feedback; a declined
+        // loop compile waits for the feedback epoch to advance.
+        if declined {
+            match osr_pc {
+                None => {
+                    self.jit_optimized_code.insert(fid, None);
+                }
+                Some(_) => {
+                    self.jit_optimized_declined_epoch
+                        .insert(fid, feedback_epoch);
+                }
+            }
         }
+        None
     }
 
     /// Resolve or compile one whole-body optimizer object for loop OSR.
@@ -740,6 +840,7 @@ impl Interpreter {
         fid: u32,
         osr_pc: u32,
     ) -> Option<std::sync::Arc<dyn jit::JitFunctionCode>> {
+        self.install_finished_optimized_compiles();
         if self.jit_retraining_blocks(fid)
             || !self
                 .jit_hook
@@ -768,45 +869,15 @@ impl Interpreter {
         // A declined compile is retried at a back-edge only when the feedback
         // epoch has advanced since the last failed attempt: on unchanged
         // feedback the optimizer declines again, and would recompile on every
-        // hot iteration.
-        let epoch = self.code_space.feedback_epoch(fid);
-        if self.jit_optimized_declined_epoch.get(&fid) == Some(&epoch) {
+        // hot iteration. A compilation in flight serves this header when it
+        // finishes.
+        if self.jit_compile_queue.is_pending(fid)
+            || self.jit_optimized_declined_epoch.get(&fid)
+                == Some(&self.code_space.feedback_epoch(fid))
+        {
             return None;
         }
-        let prior_attempts = self
-            .optimizing_tier_policy
-            .compile_attempts(fid, crate::tier_policy::CostedTier::Optimizing);
-        let compiled = self.compile_optimized_jit_function(context, fid, Some(osr_pc));
-        let attempted = self
-            .optimizing_tier_policy
-            .compile_attempts(fid, crate::tier_policy::CostedTier::Optimizing)
-            > prior_attempts;
-        // Actual compiler attempts increase the sole owner's required work;
-        // subsequent dispatch/Template paths must fund replacement admission.
-        match compiled {
-            Some(compiled) => {
-                self.jit_optimized_code.insert(fid, Some(compiled.clone()));
-                self.jit_optimized_declined_epoch.remove(&fid);
-                self.jit_optimized_code_cache = Some((fid, compiled.clone()));
-                Some(compiled)
-            }
-            None => {
-                if let Some(function) = context.exec_function(fid) {
-                    let blocked = self
-                        .optimizing_tier_policy
-                        .decide(
-                            function,
-                            crate::tier_policy::CostedTier::Optimizing,
-                            self.jit_code_registry.available_code_bytes(),
-                        )
-                        .resource_blocked();
-                    if attempted && !blocked {
-                        self.jit_optimized_declined_epoch.insert(fid, epoch);
-                    }
-                }
-                None
-            }
-        }
+        self.compile_optimized_jit_function(context, fid, Some(osr_pc))
     }
 
     /// Build a compile request for `fid` and run the installed hook. Returns the
@@ -1006,7 +1077,13 @@ impl Interpreter {
                         self.jit_runtime_stats.code_generations.saturating_add(1);
                     self.optimizing_tier_policy
                         .observe_template_generation(&function);
-                    self.record_jit_perf_map(context, fid, code.as_ref(), "template");
+                    if self.jit_debug.request().perf_map_enabled() {
+                        let name = context.function(fid).map_or_else(
+                            || "<unknown>".to_string(),
+                            |function| function.name.clone(),
+                        );
+                        self.record_jit_perf_map(&name, code.as_ref(), "template");
+                    }
                 }
                 if installed {
                     TemplateCompileOutcome::Installed(code)
@@ -1019,23 +1096,11 @@ impl Interpreter {
         }
     }
 
-    /// Name one installed code object in the perf map, when requested.
-    fn record_jit_perf_map(
-        &mut self,
-        context: &ExecutionContext,
-        fid: u32,
-        code: &dyn jit::JitFunctionCode,
-        tier: &str,
-    ) {
-        if !self.jit_debug.request().perf_map_enabled() {
-            return;
-        }
+    /// Name one installed code object of function `name` in the perf map.
+    fn record_jit_perf_map(&mut self, name: &str, code: &dyn jit::JitFunctionCode, tier: &str) {
         let Some(address) = code.native_code_address() else {
             return;
         };
-        let name = context
-            .function(fid)
-            .map_or_else(|| "<unknown>".to_string(), |function| function.name.clone());
         let id = code.metadata().id;
         self.jit_debug.record_perf_map(
             address,

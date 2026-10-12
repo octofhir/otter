@@ -368,6 +368,9 @@ pub struct GcHeap {
     /// nursery-overflow path — grows unbounded until the cage or the cap is
     /// exhausted even when most of it is garbage.
     old_generation_limit: u64,
+    /// Helper threads that trace and copy alongside the collecting thread,
+    /// started at the first scavenge large enough to share.
+    gc_threads: crate::gc_threads::GcThreads,
     /// External reservation bytes that force a mark-compact: the surviving
     /// reservations plus [`EXTERNAL_ALLOCATION_SOFT_LIMIT`].
     external_limit: u64,
@@ -581,6 +584,7 @@ impl GcHeap {
             tracked_bytes: 0,
             reserved_bytes: 0,
             old_generation_limit: INITIAL_OLD_GENERATION_SIZE.min(cage_hardcap_bytes()),
+            gc_threads: crate::gc_threads::GcThreads::default(),
             external_limit: EXTERNAL_ALLOCATION_SOFT_LIMIT,
             old_generation_bytes_at_last_gc: 0,
             last_major_gc_end: Instant::now(),
@@ -2403,6 +2407,7 @@ impl GcHeap {
                 &mut self.remembered_parents,
                 &mut self.host_refs,
                 &mut self.allocation_sites,
+                &mut self.gc_threads,
             )
         }?;
         self.allocation_sites.digest(nursery_at_maximum);

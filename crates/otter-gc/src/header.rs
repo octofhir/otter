@@ -3,7 +3,8 @@
 //! Every GC-managed allocation in the cage starts with a
 //! [`GcHeader`]. The header is 8 bytes — a u8 type tag, an atomic
 //! u8 flag byte (mark color, young flag, forwarded flag, pinned
-//! flag, swept flag, remembered flag), a young cell's u16 allocation
+//! flag, swept flag, remembered flag, scavenger copying flag), a young
+//! cell's u16 allocation
 //! site, and a u32
 //! size — chosen to fit in a single cache-line fetch alongside the
 //! object's first field.
@@ -19,14 +20,18 @@
 //! - `size_of::<GcHeader>() == 8` (static assertion).
 //! - `align_of::<GcHeader>() <= 8` so it fits at the start of a
 //!   cell-aligned allocation.
-//! - `flags` is `AtomicU8` so the marker and mutator can race on
-//!   mark transitions once incremental marking is enabled; today the
-//!   GC is STW so atomics serve as a forward-compatible capability.
+//! - `flags` is `AtomicU8`: scavenger threads claim cells through it,
+//!   and the marker and mutator race on mark transitions.
 //! - When the forwarded flag is set the first 8 bytes after the
 //!   header carry a forwarding offset (`u32`) — this is enforced by
 //!   [`crate::scavenger`] during evacuation, which in turn
 //!   guarantees the minimum payload size on every alloc that ever
 //!   reaches young-gen.
+//! - Scavenger threads claim a young cell by setting the forwarded and
+//!   copying bits in one compare-and-swap of the flag byte; the claimer
+//!   copies the cell, writes the forwarding offset and clears the copying
+//!   bit with release ordering. Any other thread reads the offset only after
+//!   an acquire load sees the copying bit clear.
 //!
 //! # See also
 //!
@@ -112,11 +117,30 @@ const _: () = assert!(
 // staying recorded across an old-gen mark reset.
 const _: () = assert!(FLAG_SWEPT & MARK_COLOR_MASK == 0);
 const _: () = assert!(FLAG_REMEMBERED & MARK_COLOR_MASK == 0);
-// The top bit stays free for a future flag.
+/// Set together with the forwarded bit while one scavenger thread copies a
+/// claimed young cell: its forwarding offset is not written yet. Never set
+/// outside a scavenge.
+const FLAG_COPYING: u8 = 0b1000_0000;
 const _: () = assert!(
-    (MARK_COLOR_MASK | FLAG_YOUNG | FLAG_FORWARDED | FLAG_PINNED | FLAG_SWEPT | FLAG_REMEMBERED)
-        == 0b0111_1111
+    (MARK_COLOR_MASK
+        | FLAG_YOUNG
+        | FLAG_FORWARDED
+        | FLAG_PINNED
+        | FLAG_SWEPT
+        | FLAG_REMEMBERED
+        | FLAG_COPYING)
+        == 0b1111_1111
 );
+const _: () = assert!(FLAG_COPYING & (MARK_COLOR_MASK | FLAG_REMEMBERED | FLAG_FORWARDED) == 0);
+
+/// Outcome of claiming a young cell for evacuation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ForwardingClaim {
+    /// This thread copies the cell; the flag byte it had before the claim.
+    Claimed(u8),
+    /// The cell already lives at this offset.
+    Forwarded(u32),
+}
 
 /// Tri-color marker state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -369,6 +393,68 @@ impl GcHeader {
     #[inline]
     pub fn is_pinned(&self) -> bool {
         self.flags.load(Ordering::Relaxed) & FLAG_PINNED != 0
+    }
+
+    /// Claim a young cell for evacuation, or wait until the thread that
+    /// claimed it has published where it went.
+    ///
+    /// # Safety
+    /// `this` must address a young cell in from-space during a scavenge.
+    #[inline]
+    pub(crate) unsafe fn claim_forwarding(this: *const Self) -> ForwardingClaim {
+        // SAFETY: caller contract; the flag byte is atomic.
+        let flags = unsafe { &(*this).flags };
+        let mut current = flags.load(Ordering::Acquire);
+        loop {
+            if current & FLAG_FORWARDED != 0 {
+                if current & FLAG_COPYING == 0 {
+                    // SAFETY: the acquire load above saw the publishing store.
+                    return ForwardingClaim::Forwarded(unsafe {
+                        Self::read_forwarding_offset(this)
+                    });
+                }
+                std::hint::spin_loop();
+                current = flags.load(Ordering::Acquire);
+                continue;
+            }
+            match flags.compare_exchange_weak(
+                current,
+                current | FLAG_FORWARDED | FLAG_COPYING,
+                Ordering::Acquire,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return ForwardingClaim::Claimed(current),
+                Err(actual) => current = actual,
+            }
+        }
+    }
+
+    /// Publish where a cell this thread claimed went.
+    ///
+    /// # Safety
+    /// `this` must be a cell this thread claimed with
+    /// [`Self::claim_forwarding`], already copied; `claimed` is the flag
+    /// byte the claim returned.
+    #[inline]
+    pub(crate) unsafe fn publish_forwarding(this: *mut Self, target_offset: u32, claimed: u8) {
+        // SAFETY: caller contract; the claimed cell's payload is at least
+        // one word and no other thread reads it before the release below.
+        unsafe {
+            (this.add(1) as *mut u32).write(target_offset);
+            (*this)
+                .flags
+                .store(claimed | FLAG_FORWARDED, Ordering::Release);
+        }
+    }
+
+    /// Give an evacuated copy the flag byte its source had before the claim.
+    ///
+    /// # Safety
+    /// `this` must address a copy no other thread can reach yet.
+    #[inline]
+    pub(crate) unsafe fn restore_flags(this: *mut Self, claimed: u8) {
+        // SAFETY: caller contract.
+        unsafe { (*this).flags.store(claimed, Ordering::Relaxed) };
     }
 
     /// Read the forwarding offset from the first u32 of the

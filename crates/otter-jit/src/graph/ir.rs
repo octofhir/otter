@@ -149,6 +149,8 @@ pub(crate) enum BranchKind {
     Int32(Condition),
     /// `input0 cond input1` on float64 operands; unordered satisfies only `!=`.
     Float64(Condition),
+    /// `ToBoolean` of the float64 `input0`: neither zero nor NaN.
+    Float64Truthy,
     /// `input0` and `input1` are the same tagged word.
     TaggedEqual,
     /// `input0` is `undefined` or `null`.
@@ -405,11 +407,14 @@ pub(crate) enum Kind {
     /// feedback programs of the store site at `byte_pc`: an existing
     /// writable slot, or an appended slot with the child shape published and
     /// its edge barriered. `owners` holds one selected record per source
-    /// program, in program order. Eager deopt when no program matches; the
-    /// value's own barrier is a separate node.
+    /// program, in program order. A live exact `receiver_shape` proves the
+    /// receiver an ordinary object of that shape: only the programs that
+    /// guard it run, without that guard. Eager deopt when no program
+    /// matches; the value's own barrier is a separate node.
     StoreNamedProperty {
         byte_pc: u32,
         owners: SmallVec<[FieldStoreOwner; 4]>,
+        receiver_shape: Option<u32>,
     },
     /// `[[Get]]` of the named property at the load site `pc` from receiver
     /// input0: an own or prototype data slot proved by the load fact in the

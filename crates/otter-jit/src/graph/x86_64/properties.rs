@@ -239,9 +239,24 @@ impl Codegen<'_> {
                 receiver_shape,
                 ..
             } => (programs, receiver_shape, smallvec::SmallVec::new()),
-            Kind::StoreNamedProperty { owners, .. } if owners.len() == programs.len() => (
-                (0..programs.len()).map(|index| index as u32).collect(),
-                None,
+            Kind::StoreNamedProperty {
+                owners,
+                receiver_shape,
+                ..
+            } if owners.len() == programs.len() => (
+                // A proved receiver matches only the programs that guard its
+                // shape.
+                (0..programs.len())
+                    .filter(|&index| {
+                        receiver_shape.is_none()
+                            || programs[index].ops.iter().find_map(|op| match *op {
+                                Op::GuardShape { object: 0, shape } => Some(shape),
+                                _ => None,
+                            }) == receiver_shape
+                    })
+                    .map(|index| index as u32)
+                    .collect(),
+                receiver_shape,
                 owners,
             ),
             _ => return Err(Unsupported::OperandShape("x86 graph named program plan")),
@@ -253,7 +268,9 @@ impl Codegen<'_> {
             // Every successful static path proves an eligible receiver shape
             // before its field/effect. Prototype writes additionally need the
             // canonical invalidation owner and cannot commit this direct hit.
-            self.emit_object_receiver(receiver, exit);
+            if receiver_shape.is_none() {
+                self.emit_object_receiver(receiver, exit);
+            }
             self.emit_shape_state(receiver);
             dynasm!(self.ops ; .arch x64 ; test r10b, ShapeState::PROTOTYPE_MASK as i8 ; jnz =>exit);
         }

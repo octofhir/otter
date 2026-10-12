@@ -118,6 +118,16 @@ impl<'a> Codegen<'a> {
                         dynasm!(self.ops ; .arch x64 ; ucomisd Rx(a), Rx(b));
                         self.emit_branch_condition(condition, true, true_label);
                     }
+                    BranchKind::Float64Truthy => {
+                        // Zero compares equal and NaN unordered: both falsy.
+                        let a = Self::fp(allocation.inputs[0]);
+                        dynasm!(self.ops ; .arch x64
+                            ; xorpd xmm15, xmm15
+                            ; ucomisd Rx(a), xmm15
+                            ; jp =>false_label
+                            ; je =>false_label
+                            ; jmp =>true_label);
+                    }
                     BranchKind::TaggedEqual => {
                         let a = Self::gp(allocation.inputs[0]);
                         let b = Self::gp(allocation.inputs[1]);

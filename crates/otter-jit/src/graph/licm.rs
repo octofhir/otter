@@ -26,7 +26,9 @@
 //! - A moved check leaves to the loop header with the values entering the
 //!   loop, so the interpreter runs the iteration the check guarded. A
 //!   header that already left optimized code for a shape or layout mismatch
-//!   moves nothing: its next compile checks where the value is used.
+//!   moves nothing: its next compile checks where the value is used. A
+//!   number conversion of an invariant value moves only from a header that
+//!   never left for a type mismatch.
 //!
 //! # See also
 //! - [`super::phi_repr`] — checks entry values of untagged phis on their
@@ -176,6 +178,11 @@ fn hoist_loop(
                 // stays valid across it.
                 Kind::LoadElementsBase { .. } => !clobbers.lengths,
                 Kind::LoadGlobalBinding(_) => !clobbers.properties,
+                // A value every iteration sees unchanged converts once.
+                Kind::CheckedTaggedToInt32
+                | Kind::CheckedTaggedToFloat64
+                | Kind::CheckedTaggedToIndex
+                | Kind::CheckNumber => header.speculate,
                 Kind::LoadTaggedField(offset) => {
                     data.inputs
                         .first()

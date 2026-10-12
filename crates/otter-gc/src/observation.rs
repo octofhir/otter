@@ -1,11 +1,13 @@
 //! Bounded observations of synchronous collection service on one heap.
 //!
 //! # Contents
-//! - Owned request, pause records, completion and trigger metadata.
+//! - Owned request, pause records, completion and trigger metadata, and the
+//!   heap occupancy at each service boundary.
 //! - A private recorder with one outer envelope for nested collections.
 //!
 //! # Invariants
-//! - Capture is explicit; disabled collection entry never reads a clock.
+//! - Capture is explicit; disabled collection entry never reads a clock or
+//!   the heap occupancy.
 //! - Storage is reserved before capture. Collection never grows it, formats
 //!   output, walks heap objects or invokes an observation callback.
 //! - Nested minors belong to their enclosing full collection or accounting
@@ -90,6 +92,21 @@ pub struct GcPauseRecord {
     pub minor_cycles_before: u64,
     /// Minor-cycle counter afterward, including full service's nested minors.
     pub minor_cycles_after: u64,
+    /// Heap occupancy when the service began.
+    pub before: HeapOccupancy,
+    /// Heap occupancy when the service ended.
+    pub after: HeapOccupancy,
+}
+
+/// Collector occupancy at one service boundary, read only while capturing.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct HeapOccupancy {
+    /// Old and large page bytes: the old generation's occupancy.
+    pub old_bytes: u64,
+    /// Of those, bytes allocated to cells, live or not yet swept.
+    pub old_allocated_bytes: u64,
+    /// Bytes allocated in the young generation's from-space.
+    pub young_bytes: u64,
 }
 
 /// Complete owned transfer of one bounded capture, including coverage gaps.
@@ -179,6 +196,25 @@ impl GcPauseRecorder {
         Ok(())
     }
 
+    /// Hand over the records captured so far and keep capturing into the
+    /// same reserved buffer. `None` when not capturing or inside a service.
+    pub(crate) fn drain(&mut self) -> Option<GcPauseCapture> {
+        if self.depth != 0 {
+            return None;
+        }
+        let capture = self.capture.as_mut()?;
+        let mut records = Vec::new();
+        records.try_reserve_exact(capture.capacity).ok()?;
+        let records = std::mem::replace(&mut capture.records, records);
+        let drained = GcPauseCapture {
+            records,
+            dropped_records: std::mem::take(&mut capture.dropped_records),
+            incomplete: false,
+            contains_split_phases: std::mem::take(&mut capture.contains_split_phases),
+        };
+        Some(drained)
+    }
+
     pub(crate) fn take(&mut self) -> Result<GcPauseCapture, GcPauseCaptureError> {
         let capture = self
             .capture
@@ -198,6 +234,7 @@ impl GcPauseRecorder {
         trigger: GcPauseTrigger,
         full_cycles: u64,
         minor_cycles: u64,
+        occupancy: HeapOccupancy,
     ) -> PauseToken {
         let outermost = self.depth == 0;
         self.depth = self
@@ -240,6 +277,8 @@ impl GcPauseRecorder {
                         full_cycles_after: full_cycles,
                         minor_cycles_before: minor_cycles,
                         minor_cycles_after: minor_cycles,
+                        before: occupancy,
+                        after: occupancy,
                     },
                 ))
             }
@@ -256,6 +295,7 @@ impl GcPauseRecorder {
         outcome: GcPauseOutcome,
         full_cycles: u64,
         minor_cycles: u64,
+        occupancy: HeapOccupancy,
     ) {
         if !token.entered {
             return;
@@ -268,6 +308,7 @@ impl GcPauseRecorder {
             record.outcome = outcome;
             record.full_cycles_after = full_cycles;
             record.minor_cycles_after = minor_cycles;
+            record.after = occupancy;
             // The outer token owns a reserved slot; nested envelopes never
             // append and capture cannot restart while a token is active.
             debug_assert!(capture.records.len() < capture.capacity);

@@ -82,10 +82,10 @@
 //! - [`crate::gc_threads`] — the helper threads.
 
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
-use std::sync::{Condvar, Mutex, MutexGuard, PoisonError};
+use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use crate::compressed::{RawGc, cage_base};
-use crate::gc_threads::GcThreads;
+use crate::gc_threads::{GcThreads, WorkPool};
 use crate::header::{ForwardingClaim, GcHeader};
 use crate::heap::RootSlotVisitor;
 use crate::oom::OutOfMemory;
@@ -174,11 +174,7 @@ struct Shared {
     remembered: Vec<RawGc>,
     next_remembered: AtomicUsize,
     sites: crate::pretenuring::FoundCounters,
-    pool: Mutex<Pool>,
-    wake: Condvar,
-    /// Workers waiting for shared work; read without the lock as a hint.
-    idle: AtomicUsize,
-    workers: usize,
+    pool: WorkPool<Entry>,
     /// What each helper hands back when its part ends.
     finished: Mutex<Vec<WorkerOutput>>,
 }
@@ -190,10 +186,6 @@ struct Shared {
 unsafe impl Sync for Shared {}
 
 impl Shared {
-    fn pool(&self) -> MutexGuard<'_, Pool> {
-        self.pool.lock().unwrap_or_else(PoisonError::into_inner)
-    }
-
     fn old_space(&self) -> MutexGuard<'_, OldSpaceRef> {
         self.old_space
             .lock()
@@ -203,13 +195,6 @@ impl Shared {
     fn remembered_exhausted(&self) -> bool {
         self.next_remembered.load(Ordering::Relaxed) >= self.remembered.len()
     }
-}
-
-#[derive(Default)]
-struct Pool {
-    chunks: Vec<Vec<Entry>>,
-    idle: usize,
-    done: bool,
 }
 
 /// What a worker leaves behind for the collecting thread to merge.
@@ -356,10 +341,7 @@ pub unsafe fn scavenge(
         remembered: snapshot_remembered,
         next_remembered: AtomicUsize::new(0),
         sites: sites.found_counters(),
-        pool: Mutex::new(Pool::default()),
-        wake: Condvar::new(),
-        idle: AtomicUsize::new(0),
-        workers,
+        pool: WorkPool::new(workers),
         finished: Mutex::new(Vec::new()),
     };
     let mut main = Worker::new(&shared);
@@ -884,7 +866,7 @@ impl<'s> Worker<'s> {
                 let unused = (self.lab_end - self.lab_cursor) as usize;
                 (*old_space.0).return_lab(self.lab_cursor, unused);
                 let (offset, len) = (*old_space.0)
-                    .take_lab(size, LAB_BYTES)
+                    .take_lab(size, LAB_BYTES, crate::page::PAGE_PAYLOAD_SIZE)
                     .expect("old-space linear area during scavenge");
                 self.lab_cursor = offset + size as u32;
                 self.lab_end = offset + len as u32;
@@ -911,9 +893,7 @@ impl<'s> Worker<'s> {
             while let Some(entry) = self.local.pop() {
                 // SAFETY: entries name live copies this scavenge made.
                 unsafe { self.trace_entry(entry) };
-                if self.local.len() > SHARE_THRESHOLD
-                    && self.shared.idle.load(Ordering::Relaxed) != 0
-                {
+                if self.local.len() > SHARE_THRESHOLD && self.shared.pool.has_idle() {
                     self.share();
                 }
             }
@@ -921,8 +901,10 @@ impl<'s> Worker<'s> {
             if unsafe { self.trace_next_remembered() } {
                 continue;
             }
-            if !self.take_shared_work() {
-                return;
+            let shared = self.shared;
+            match shared.pool.take(|| shared.remembered_exhausted()) {
+                Some(chunk) => self.local = chunk,
+                None => return,
             }
         }
     }
@@ -943,37 +925,7 @@ impl<'s> Worker<'s> {
     fn share(&mut self) {
         let half = self.local.len() / 2;
         let chunk: Vec<Entry> = self.local.drain(..half).collect();
-        self.shared.pool().chunks.push(chunk);
-        self.shared.wake.notify_one();
-    }
-
-    /// Take a shared chunk, waiting while other workers may still produce
-    /// one. `false` once every worker is idle with nothing left to share.
-    fn take_shared_work(&mut self) -> bool {
-        let mut pool = self.shared.pool();
-        loop {
-            if let Some(chunk) = pool.chunks.pop() {
-                self.local = chunk;
-                return true;
-            }
-            if pool.done {
-                return false;
-            }
-            if pool.idle + 1 == self.shared.workers && self.shared.remembered_exhausted() {
-                pool.done = true;
-                self.shared.wake.notify_all();
-                return false;
-            }
-            pool.idle += 1;
-            self.shared.idle.store(pool.idle, Ordering::Relaxed);
-            pool = self
-                .shared
-                .wake
-                .wait(pool)
-                .unwrap_or_else(PoisonError::into_inner);
-            pool.idle -= 1;
-            self.shared.idle.store(pool.idle, Ordering::Relaxed);
-        }
+        self.shared.pool.share(chunk);
     }
 
     /// Re-trace one claimed chunk of remembered parents — the old/large

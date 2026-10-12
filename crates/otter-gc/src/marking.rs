@@ -9,6 +9,12 @@
 //! 3. After drain, every reachable object is black; everything
 //!    still white is garbage.
 //!
+//! A stop-the-world drain of a large heap runs on the heap's helper threads
+//! together with the collecting thread: each keeps its own worklist, hands
+//! half of a long one to idle threads, and shades a child by a
+//! compare-and-swap from white to gray, so exactly one thread traces each
+//! object.
+//!
 //! # Contents
 //!
 //! - [`MarkingState`] — the worklist + the `is_marking` flag the
@@ -22,6 +28,9 @@
 //!   barrier when this flag is true.
 //! - The worklist contains only gray headers. Black and white
 //!   never appear in the queue.
+//! - A parallel drain adds each traced object's size to its page's live
+//!   bytes atomically, and merges the cycle's live bytes once at the end.
+//!   Trace callbacks are object-local; marking only reads slots.
 //! - `drain_with_budget` is dormant in Phase 1 (the STW path uses
 //!   `drain_full`); the API exists so Phase 2 / task 86 can
 //!   adopt incremental marking without an audit sweep.
@@ -31,11 +40,17 @@
 //! - GC architecture plan §2.3 (MarkingState row), §5 (barriers).
 
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Mutex, PoisonError};
 
 use crate::compressed::{RawGc, cage_base};
+use crate::gc_threads::{GcThreads, WorkPool};
 use crate::header::{GcHeader, MarkColor};
-use crate::page::Page;
+use crate::page::{Page, PageHeader};
 use crate::trace::TraceTable;
+
+/// Worklist length past which a marking thread hands half to idle threads.
+const SHARE_THRESHOLD: usize = 128;
 
 /// Worklist + book-keeping for a marking cycle.
 pub struct MarkingState {
@@ -211,8 +226,113 @@ impl MarkingState {
         }
     }
 
+    /// Drain the worklist completely on the heap's helper threads and the
+    /// calling thread. Used by stop-the-world mark phases on large heaps.
+    ///
+    /// # Safety
+    ///
+    /// Same as [`Self::drain_full`]; the trace table's callbacks must be
+    /// object-local.
+    pub unsafe fn drain_parallel(&mut self, trace_table: &TraceTable, threads: &mut GcThreads) {
+        let workers = threads.workers();
+        if workers <= 1 {
+            // SAFETY: forwarded from the caller.
+            unsafe { self.drain_full(trace_table) };
+            return;
+        }
+        let job = ParallelMark {
+            trace_table,
+            initial: Mutex::new(self.worklist.drain(..).map(|h| h as usize).collect()),
+            pool: WorkPool::new(workers),
+            live_bytes: AtomicUsize::new(0),
+        };
+        // SAFETY: `mark_worker` keeps workers apart through the pool and the
+        // atomic shading; `job` outlives the call.
+        unsafe { threads.run(mark_worker, (&raw const job).cast()) };
+        self.live_bytes += job.live_bytes.into_inner();
+    }
+
     /// Number of gray headers waiting on the worklist.
     pub fn pending(&self) -> usize {
         self.worklist.len()
+    }
+}
+
+/// One parallel drain.
+struct ParallelMark {
+    trace_table: *const TraceTable,
+    /// The collecting thread's worklist, taken by worker 0.
+    initial: Mutex<Vec<usize>>,
+    pool: WorkPool<usize>,
+    live_bytes: AtomicUsize,
+}
+
+// SAFETY: the trace table is only read; everything else is locked or atomic.
+unsafe impl Sync for ParallelMark {}
+
+/// One worker of a parallel drain.
+///
+/// # Safety
+///
+/// `context` is a live [`ParallelMark`] whose worklist holds gray headers of
+/// live objects; the mutator is stopped.
+unsafe fn mark_worker(context: *const (), index: usize) {
+    // SAFETY: per docstring.
+    let job = unsafe { &*context.cast::<ParallelMark>() };
+    let mut local: Vec<usize> = if index == 0 {
+        std::mem::take(&mut *job.initial.lock().unwrap_or_else(PoisonError::into_inner))
+    } else {
+        Vec::new()
+    };
+    let mut live = 0usize;
+    loop {
+        while let Some(header) = local.pop() {
+            // SAFETY: entries are gray headers of live objects.
+            live += unsafe { mark_one(header as *mut GcHeader, &*job.trace_table, &mut local) };
+            if local.len() > SHARE_THRESHOLD && job.pool.has_idle() {
+                let half = local.len() / 2;
+                job.pool.share(local.drain(..half).collect());
+            }
+        }
+        match job.pool.take(|| true) {
+            Some(chunk) => local = chunk,
+            None => break,
+        }
+    }
+    job.live_bytes.fetch_add(live, Ordering::Relaxed);
+}
+
+/// Trace one gray header, shade its white children onto `local`, paint it
+/// black and return its size.
+///
+/// # Safety
+///
+/// `header` is a gray header of a live object only this thread traces.
+unsafe fn mark_one(
+    header: *mut GcHeader,
+    trace_table: &TraceTable,
+    local: &mut Vec<usize>,
+) -> usize {
+    // SAFETY: per docstring.
+    unsafe {
+        let h = &*header;
+        let size = h.size_bytes() as usize;
+        let page = Page::page_base_of(header as *const u8).cast::<PageHeader>();
+        AtomicUsize::from_ptr(std::ptr::addr_of_mut!((*page).live_bytes))
+            .fetch_add(size, Ordering::Relaxed);
+        let base = cage_base();
+        let mut visitor = |slot: *mut RawGc| {
+            let raw = (*slot).0;
+            if raw == 0 {
+                return;
+            }
+            let child = base.add(raw as usize) as *mut GcHeader;
+            if (*child).try_shade_gray() {
+                local.push(child as usize);
+            }
+        };
+        trace_table.trace(header, &mut visitor);
+        h.set_mark_color(MarkColor::Black);
+        size
     }
 }

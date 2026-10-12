@@ -206,7 +206,9 @@ impl GcHeap {
                 return false;
             }
         }
-        let Ok(offset) = self.old_space.alloc(extent) else {
+        // Any swept hole the request fits serves as the buffer, as it would
+        // for a direct old allocation.
+        let Ok((offset, extent)) = self.old_space.take_lab(aligned, extent, extent) else {
             return false;
         };
         if self.max_heap_bytes != 0 {
@@ -253,14 +255,8 @@ impl GcHeap {
         let unused = limit - top;
         if unused != 0 {
             let offset = (top - cage_base() as usize) as u32;
-            // SAFETY: the tail lies in a live old page this space owns; the
-            // page booked the whole buffer at refill.
-            unsafe {
-                let page = &mut *(crate::page::page_base_from_offset(offset)
-                    as *mut crate::page::PageHeader);
-                page.allocated_bytes -= unused;
-            }
-            self.old_space.push_free_range(offset, unused);
+            // The page booked the whole buffer at refill.
+            self.old_space.return_lab(offset, unused);
         }
         if self.old_lab_charged != 0 {
             self.tracked_bytes = self.tracked_bytes.saturating_sub(unused as u64);

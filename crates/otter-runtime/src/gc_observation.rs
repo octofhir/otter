@@ -12,7 +12,9 @@
 //! # See also
 //! - `otter_gc::observation` defines the observed service boundaries.
 
-pub use otter_gc::{GcPauseCapture, GcPauseKind, GcPauseOutcome, GcPauseRecord, GcPauseTrigger};
+pub use otter_gc::{
+    GcPauseCapture, GcPauseKind, GcPauseOutcome, GcPauseRecord, GcPauseTrigger, HeapOccupancy,
+};
 
 use crate::{OtterError, Runtime};
 

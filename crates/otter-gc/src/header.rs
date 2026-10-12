@@ -299,6 +299,27 @@ impl GcHeader {
         }
     }
 
+    /// Paint a white header gray; `false` when it was already gray or
+    /// black. Of several threads shading one header, exactly one wins.
+    #[inline]
+    pub fn try_shade_gray(&self) -> bool {
+        let mut current = self.flags.load(Ordering::Relaxed);
+        loop {
+            if current & MARK_COLOR_MASK != MarkColor::White as u8 {
+                return false;
+            }
+            match self.flags.compare_exchange_weak(
+                current,
+                current | MarkColor::Gray as u8,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return true,
+                Err(actual) => current = actual,
+            }
+        }
+    }
+
     /// Returns true iff the mark color is gray or black.
     #[inline]
     pub fn is_marked(&self) -> bool {

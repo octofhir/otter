@@ -82,6 +82,7 @@ fn promotion_preflight_oom_leaves_heap_unmodified() {
             &mut remembered,
             &mut otter_gc::host_refs::HostRefTable::default(),
             &mut otter_gc::pretenuring::AllocationSites::default(),
+            &mut otter_gc::gc_threads::GcThreads::default(),
         )
     };
 

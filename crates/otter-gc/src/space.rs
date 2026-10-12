@@ -383,6 +383,86 @@ impl OldSpace {
         Ok(offset)
     }
 
+    /// A linear area for one scavenger thread to promote into, at least
+    /// `min` bytes. Swept holes come first, as for [`Self::alloc`]: one of at
+    /// least `want` bytes, else one that fits `min`; then the newest open
+    /// page's whole bump tail; then a fresh page. A taken range is handed out
+    /// whole and its bytes count as allocated until [`Self::return_lab`]
+    /// gives back the unused rest. Nothing here walks the page list.
+    pub(crate) fn take_lab(
+        &mut self,
+        min: usize,
+        want: usize,
+    ) -> Result<(u32, usize), OutOfMemory> {
+        debug_assert!(min <= want && want <= PAGE_PAYLOAD_SIZE);
+        if let Some(entry) = self
+            .free_list
+            .take(want)
+            .or_else(|| self.free_list.take(min))
+        {
+            // SAFETY: the entry names a filler-capped range of a live page
+            // of this space; account the handed-out bytes on that page.
+            let page_header = unsafe {
+                &mut *(crate::page::page_base_from_offset(entry.offset)
+                    as *mut crate::page::PageHeader)
+            };
+            page_header.allocated_bytes += entry.size as usize;
+            return Ok((entry.offset, entry.size as usize));
+        }
+        while let Some(&page_offset) = self.open.last() {
+            // SAFETY: `open` names only live old pages owned by this space.
+            let header = unsafe {
+                &mut *(crate::page::page_base_from_offset(page_offset)
+                    as *mut crate::page::PageHeader)
+            };
+            let cursor = header.bump_cursor;
+            let room = header.span_bytes() - cursor;
+            if room >= min {
+                header.bump_cursor = cursor + room;
+                header.allocated_bytes += room;
+                self.open.pop();
+                return Ok((page_offset + cursor as u32, room));
+            }
+            Self::retire_bump_tail(&mut self.free_list, page_offset, header);
+            self.open.pop();
+        }
+        let page = match self.standby.pop() {
+            Some(reserved) => reserved,
+            None => Page::new(SpaceKind::Old).ok_or(OutOfMemory::CageExhausted)?,
+        };
+        let room = page.header().bump_remaining();
+        let offset = page
+            .bump_alloc(room)
+            .ok_or(OutOfMemory::AllocationTooLarge {
+                requested_bytes: min as u64,
+                max_bytes: PAGE_PAYLOAD_SIZE as u64,
+            })?;
+        self.pages.push(page);
+        Ok((offset, room))
+    }
+
+    /// Return the unused `size` bytes at `offset` of an area
+    /// [`Self::take_lab`] handed out: cap them with a free filler so the page
+    /// stays walkable and list them for reuse.
+    pub(crate) fn return_lab(&mut self, offset: u32, size: usize) {
+        if size == 0 {
+            return;
+        }
+        let in_page = offset as usize & (PAGE_SIZE - 1);
+        let base = crate::page::page_base_from_offset(offset);
+        // SAFETY: the range is the unallocated tail of an area this space
+        // carved from one of its live pages; no object was written there.
+        unsafe {
+            std::ptr::write(
+                base.add(in_page).cast::<crate::header::GcHeader>(),
+                crate::header::GcHeader::new_free(size as u32),
+            );
+            let page_header = &mut *(base as *mut crate::page::PageHeader);
+            page_header.allocated_bytes -= size;
+            self.free_list.push(offset, size);
+        }
+    }
+
     /// Close a page's bump area: cap the unused tail with a free filler so the
     /// page's linear header walk stays intact, hand the tail to the free
     /// list, and move the cursor to the end.

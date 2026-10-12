@@ -84,6 +84,36 @@ pub const SITE_CREATED_OFFSET: usize = std::mem::offset_of!(SiteRecord, created)
 /// Byte offset of [`SiteRecord::decision`].
 pub const SITE_DECISION_OFFSET: usize = std::mem::offset_of!(SiteRecord, decision);
 
+/// Concurrent access to the found counters of an [`AllocationSites`] table
+/// during one scavenge, which keeps the table borrowed.
+pub(crate) struct FoundCounters {
+    chunks: Vec<*mut SiteRecord>,
+    len: u16,
+}
+
+// SAFETY: the chunk pointers name records that never move while the table
+// is borrowed for the scavenge, and `record_found` touches only their
+// `found` words, atomically.
+unsafe impl Sync for FoundCounters {}
+
+impl FoundCounters {
+    /// Count one cell of `site` found alive.
+    pub(crate) fn record_found(&self, site: u16) {
+        if site == 0 || site > self.len {
+            return;
+        }
+        let index = usize::from(site);
+        // SAFETY: `site` is registered, so its chunk exists; the record stays
+        // in place for the borrow, and its `found` word is 4-aligned.
+        unsafe {
+            let record = self.chunks[index / CHUNK].add(index % CHUNK);
+            let found = std::ptr::addr_of_mut!((*record).found);
+            std::sync::atomic::AtomicU32::from_ptr(found)
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+}
+
 /// The isolate's allocation sites.
 #[derive(Debug, Default)]
 pub struct AllocationSites {
@@ -147,6 +177,19 @@ impl AllocationSites {
         if self.contains(site) {
             let record = self.record_mut(site);
             record.found = record.found.saturating_add(1);
+        }
+    }
+
+    /// The found counters of every registered site, for scavenger threads
+    /// that count evacuated cells concurrently.
+    pub(crate) fn found_counters(&mut self) -> FoundCounters {
+        FoundCounters {
+            chunks: self
+                .chunks
+                .iter_mut()
+                .map(|chunk| chunk.as_mut_ptr())
+                .collect(),
+            len: self.len,
         }
     }
 

@@ -1,26 +1,25 @@
-//! Cheney young-generation scavenger.
+//! Parallel young-generation scavenger.
 //!
-//! BFS copying collector. Roots and dirty cards point into
-//! from-space. Each from-space pointer is followed: if already
-//! forwarded, the slot is rewritten to the existing forwarding
-//! offset; otherwise the object is copied to to-space (or
-//! promoted to old-space) and the slot is rewritten to the new
-//! offset. After all roots and dirty cards are processed a
-//! Cheney scan walks freshly-copied objects in to-space (and
-//! freshly-promoted objects in old-space), evacuating any
-//! children that still point into from-space.
+//! A copying collector over the semispace nursery. Roots and the remembered
+//! old parents point into from-space; each from-space target is copied to
+//! to-space (or promoted to old space) once, its slot rewritten to the copy,
+//! and the copy traced in turn until no from-space target remains reachable.
+//! The tracing after the roots runs on the heap's helper threads together
+//! with the collecting thread.
 //!
 //! # Algorithm
 //!
-//! 1. Walk root slots — evacuate any from-space target.
-//! 2. Re-trace the remembered parents — the old/large objects the
-//!    write barrier recorded as holding an old→young edge — and
-//!    evacuate their young children. The parents are held directly
-//!    (object-granular remembered set), so there is no dirty-page
-//!    header walk to re-derive owners.
-//! 3. Cheney scan: walk to-space pages and freshly-promoted
-//!    bytes in old-space pages; trace each newly-copied object
-//!    and evacuate children. Iterate until convergence.
+//! 1. The collecting thread evacuates every root slot's target. Root
+//!    visitors run exactly as they always did, one slot at a time.
+//! 2. Every worker — the collecting thread and the heap's helpers — claims
+//!    chunks of the remembered old parents (the old/large objects the write
+//!    barrier recorded as holding an old→young edge) and re-traces them,
+//!    then drains worklists of freshly copied bodies, tracing each and
+//!    evacuating its from-space children. A worker with a long worklist hands
+//!    half to idle workers; the phase ends when every worker is idle and no
+//!    work is shared.
+//! 3. The collecting thread runs the ephemeron fixpoint and rewrites weak
+//!    registry slots.
 //! 4. Finalize and drop the unforwarded bodies the new space tracks for
 //!    reclamation; untracked dead cells are never visited.
 //! 5. Set every to-space page's `age_mark` to its bump top: everything
@@ -28,6 +27,17 @@
 //! 6. Flip from↔to. Survivor pages become the new from-space; the
 //!    mutator allocates above their age marks. Prior from-space becomes
 //!    the new to-space, whose evacuated/dead input storage is recycled.
+//!
+//! # Evacuation
+//!
+//! A worker claims a from-space cell by setting its forwarded and copying
+//! flag bits in one compare-and-swap, copies it, writes the forwarding offset
+//! and clears the copying bit with release ordering; a worker that loses the
+//! claim waits for that and rewrites its slot to the published copy. Each
+//! worker copies into to-space pages it claims by index and promotes small
+//! cells into old-space linear areas of its own; larger promotions and
+//! area refills take the old space's lock. A copied body enters exactly one
+//! worklist, so every body is traced by exactly one worker.
 //!
 //! # Allocation-site feedback
 //!
@@ -41,17 +51,8 @@
 //! old space on its second (the semispace age mark). The to-space pages
 //! that received survivors become the next from-space and the mutator keeps
 //! bump-allocating above their `age_mark`, so a fresh object never inherits
-//! its page's age. Children of remembered old parents are promoted at once.
-//!
-//! # Design
-//!
-//! Every Cheney implementation in Rust hits the same closure /
-//! borrow conflict — the visitor mutates two spaces and the
-//! scan loop iterates pages of one of them. We sidestep this by
-//! holding the spaces through raw pointers (`NonNull`) inside a
-//! [`ScavCtx`] struct that never aliases through `&mut Self`.
-//! The mutator is paused (STW) for the duration, so single-
-//! threaded uniqueness is upheld manually at the call site.
+//! its page's age. Children of remembered old parents and of freshly promoted
+//! bodies are promoted at once.
 //!
 //! # Contents
 //!
@@ -65,19 +66,27 @@
 //!   remaining young edge is retained for the following collection.
 //! - Promotion space is admitted before the first forwarding write. A failed
 //!   preflight makes no forwarding write and publishes no reclamation commit.
+//!   The reservation covers every worker's partly used page and linear area.
 //! - Exact aligned nursery input equals copied + promoted + reclaimed bytes.
 //!   The input byte total uses maintained physical allocation counters; the
 //!   promotion page reservation is a separate capacity upper bound.
+//! - Slots are read and written with relaxed atomic accesses: a root slot may
+//!   be visited twice, and both visits write the same copy.
+//! - Trace callbacks are object-local: a worker tracing one body touches only
+//!   that body's slots and the headers of their targets.
 //!
 //! # See also
 //!
 //! - [`crate::barrier`] — the generational barrier that feeds the
 //!   object-granular remembered set this scavenger drains.
+//! - [`crate::gc_threads`] — the helper threads.
 
-use std::ptr::NonNull;
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use std::sync::{Condvar, Mutex, MutexGuard, PoisonError};
 
 use crate::compressed::{RawGc, cage_base};
-use crate::header::GcHeader;
+use crate::gc_threads::GcThreads;
+use crate::header::{ForwardingClaim, GcHeader};
 use crate::heap::RootSlotVisitor;
 use crate::oom::OutOfMemory;
 use crate::page::{CELL_SIZE, PAGE_HEADER_SIZE, Page, SpaceKind, align_up};
@@ -101,7 +110,7 @@ pub struct ScavengeStats {
     /// caller around the [`scavenge`] call, not by the scavenge
     /// itself (the pause spans more than the inner work).
     pub minor_pause_ns: u64,
-    /// Root slots visited, excluding remembered-parent and Cheney body slots.
+    /// Root slots visited, excluding remembered-parent and copied-body slots.
     pub root_slots_scanned: usize,
     /// Remembered-set entries scanned this scavenge — the count of old/large
     /// parents recorded by the barrier as holding an old→young edge.
@@ -114,65 +123,139 @@ pub struct ScavengeStats {
     pub objects_retraced: usize,
     /// Slots visited while tracing remembered parents and freshly promoted bodies.
     pub slots_scanned: usize,
+    /// Threads that traced this scavenge, the collecting thread included.
+    pub workers: usize,
 }
 
-/// Internal scavenge context — raw-pointer state under STW.
-struct ScavCtx {
-    new_space: NonNull<NewSpace>,
-    old_space: NonNull<OldSpace>,
-    trace_table: NonNull<TraceTable>,
-    stats: ScavengeStats,
-    /// True while remembered parents or freshly promoted bodies are traced.
-    /// Their young children promote immediately, and their slots contribute
-    /// to the remembered/promoted work counter. This policy does not select
-    /// the trace callback: newly promoted bodies always receive a full walk.
-    in_dirty_scan: bool,
-    /// The live remembered-set store buffer (the heap's
-    /// `remembered_parents`). Drained at the start of the scavenge into a
-    /// local snapshot; [`remember_parent`] pushes fresh old→young parents
-    /// here so they survive to the next scavenge.
-    remembered: NonNull<Vec<RawGc>>,
-    /// The heap's host-ref table, for sweep-time release of dead young
-    /// bodies that name owned host payloads.
-    host_refs: NonNull<crate::host_refs::HostRefTable>,
-    /// The isolate's allocation sites; each evacuated tagged cell is found once.
-    sites: NonNull<crate::pretenuring::AllocationSites>,
-    /// Cage offsets of objects promoted to old-space this scavenge and not
-    /// yet Cheney-scanned. An explicit worklist — not a bump-cursor
-    /// watermark — because promotion allocates through the old-space free
-    /// list, which can place a survivor below any page's bump cursor.
-    promoted_unscanned: Vec<u32>,
-    /// The cage base, read once for the pause instead of per slot.
+impl ScavengeStats {
+    fn absorb(&mut self, other: &Self) {
+        self.copied_bytes += other.copied_bytes;
+        self.promoted_bytes += other.promoted_bytes;
+        self.slot_updates += other.slot_updates;
+        self.root_slots_scanned += other.root_slots_scanned;
+        self.dirty_cards_scanned += other.dirty_cards_scanned;
+        self.old_headers_walked += other.old_headers_walked;
+        self.objects_retraced += other.objects_retraced;
+        self.slots_scanned += other.slots_scanned;
+    }
+}
+
+/// Nursery input below which the collecting thread traces alone: waking the
+/// helpers would cost more than the copying.
+const PARALLEL_MIN_NURSERY_BYTES: usize = 1024 * 1024;
+/// Promotions at most this large go through a worker's own linear area.
+const LAB_OBJECT_MAX: usize = 2048;
+/// Bytes one promotion linear area asks the old space for.
+const LAB_BYTES: usize = 32 * 1024;
+/// Worklist length past which a worker hands half to idle workers.
+const SHARE_THRESHOLD: usize = 64;
+/// Remembered parents one worker claims at a time.
+const REMEMBERED_CHUNK: usize = 32;
+
+/// A worklist entry: the cage offset of a copied body, with
+/// [`PROMOTED_ENTRY`] set when it was promoted, so that its young children
+/// are promoted too.
+type Entry = u32;
+const PROMOTED_ENTRY: u32 = 1;
+const _: () = assert!(CELL_SIZE > 1);
+
+/// The old space, reachable from every worker under one lock.
+struct OldSpaceRef(*mut OldSpace);
+
+/// State every worker of one scavenge shares.
+struct Shared {
     cage: *mut u8,
-    /// Whether debug child-slot verification runs, read once for the pause.
     verify: bool,
+    trace_table: *const TraceTable,
+    to_pages: *const Page,
+    to_page_count: usize,
+    next_to_page: AtomicUsize,
+    old_space: Mutex<OldSpaceRef>,
+    remembered: Vec<RawGc>,
+    next_remembered: AtomicUsize,
+    sites: crate::pretenuring::FoundCounters,
+    pool: Mutex<Pool>,
+    wake: Condvar,
+    /// Workers waiting for shared work; read without the lock as a hint.
+    idle: AtomicUsize,
+    workers: usize,
+    /// What each helper hands back when its part ends.
+    finished: Mutex<Vec<WorkerOutput>>,
+}
+
+// SAFETY: the raw pointers name the heap's spaces and trace table for the
+// duration of one scavenge, during which the mutator is stopped; mutable
+// state behind them is reached only under `old_space`'s lock, through pages
+// a single worker owns, or through atomics.
+unsafe impl Sync for Shared {}
+
+impl Shared {
+    fn pool(&self) -> MutexGuard<'_, Pool> {
+        self.pool.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn old_space(&self) -> MutexGuard<'_, OldSpaceRef> {
+        self.old_space
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn remembered_exhausted(&self) -> bool {
+        self.next_remembered.load(Ordering::Relaxed) >= self.remembered.len()
+    }
+}
+
+#[derive(Default)]
+struct Pool {
+    chunks: Vec<Vec<Entry>>,
+    idle: usize,
+    done: bool,
+}
+
+/// What a worker leaves behind for the collecting thread to merge.
+struct WorkerOutput {
+    remembered: Vec<RawGc>,
+    stats: ScavengeStats,
+}
+
+/// One thread's part of a scavenge.
+struct Worker<'s> {
+    shared: &'s Shared,
+    local: Vec<Entry>,
+    /// Base of the to-space page this worker copies into; null for none.
+    to_page: *mut u8,
+    /// Old-space linear area `[cursor, end)` this worker promotes into.
+    lab_cursor: u32,
+    lab_end: u32,
+    /// Old/large parents found still pointing young.
+    remembered: Vec<RawGc>,
+    stats: ScavengeStats,
+    /// True while a remembered parent or a freshly promoted body is traced:
+    /// its young children promote immediately, and its slots count toward
+    /// the remembered/promoted work counter. This policy does not select the
+    /// trace callback: newly promoted bodies always receive a full walk.
+    in_dirty_scan: bool,
     /// Whether the body being traced lives in old or large space, so a young
     /// child it keeps must enter the remembered set. Classified once per
     /// traced body rather than per slot.
     parent_old: bool,
 }
 
-impl ScavCtx {
-    #[inline]
-    fn new_space(&mut self) -> &mut NewSpace {
-        // SAFETY: STW pause + single-mutator invariant.
-        unsafe { self.new_space.as_mut() }
-    }
-
-    #[inline]
-    fn remembered(&mut self) -> &mut Vec<RawGc> {
-        // SAFETY: STW pause; the heap owns the buffer for the scavenge.
-        unsafe { self.remembered.as_mut() }
-    }
-
-    #[inline]
-    fn old_space(&mut self) -> &mut OldSpace {
-        // SAFETY: STW pause + single-mutator invariant.
-        unsafe { self.old_space.as_mut() }
-    }
+/// Read one slot. A root slot may be visited by two workers.
+#[inline(always)]
+unsafe fn load_slot(slot: *mut RawGc) -> u32 {
+    // SAFETY: caller passes a dereferenceable, 4-aligned slot.
+    unsafe { AtomicU32::from_ptr(slot.cast::<u32>()).load(Ordering::Relaxed) }
 }
 
-/// Run a full Cheney scavenge.
+/// Write one slot; see [`load_slot`].
+#[inline(always)]
+unsafe fn store_slot(slot: *mut RawGc, offset: u32) {
+    // SAFETY: caller passes a dereferenceable, 4-aligned slot.
+    unsafe { AtomicU32::from_ptr(slot.cast::<u32>()).store(offset, Ordering::Relaxed) }
+}
+
+/// Run a full scavenge.
 ///
 /// `root_slots` is a list of `*mut RawGc` slot addresses. The
 /// scavenger may rewrite each in place. `external_visit` is a
@@ -183,7 +266,7 @@ impl ScavCtx {
 /// their keys are updated only if already live, and their values become strong
 /// only for such live keys. Remaining weak registry slots are rewritten only
 /// when their target was already forwarded; otherwise they are nulled for later
-/// pruning.
+/// pruning. `threads` are the heap's helper threads.
 ///
 /// # Safety
 ///
@@ -191,7 +274,7 @@ impl ScavCtx {
 /// - Every `*mut RawGc` from `root_slots` and `external_visit`
 ///   must address a valid slot inside the cage (or null).
 /// - The trace table must register every type tag occurring in
-///   from-space and old-space.
+///   from-space and old-space, and its trace callbacks must be object-local.
 #[allow(clippy::too_many_arguments)]
 pub unsafe fn scavenge(
     new_space: &mut NewSpace,
@@ -204,7 +287,21 @@ pub unsafe fn scavenge(
     remembered_parents: &mut Vec<RawGc>,
     host_refs: &mut crate::host_refs::HostRefTable,
     sites: &mut crate::pretenuring::AllocationSites,
+    threads: &mut GcThreads,
 ) -> Result<ScavengeStats, OutOfMemory> {
+    let (active_pages, allocated_nursery_bytes) =
+        new_space
+            .from_pages()
+            .iter()
+            .fold((0usize, 0usize), |(pages, bytes), page| {
+                let allocated = page.header().allocated_bytes;
+                (pages + usize::from(allocated != 0), bytes + allocated)
+            });
+    let workers = if allocated_nursery_bytes >= PARALLEL_MIN_NURSERY_BYTES {
+        threads.workers()
+    } else {
+        1
+    };
     // Reserve every page promotion/fallback can need before forwarding the
     // first object. After a forwarding write, cage exhaustion cannot be
     // reported safely because roots and semispaces would already be partially
@@ -215,15 +312,8 @@ pub unsafe fn scavenge(
     // page can finish half-empty. Pages selected by age (or all active pages
     // when a remembered parent can reach any nursery page) need that 2× bound
     // in old space. Non-promoted pages use to-space first; reserve only their
-    // possible overflow beyond the existing to-space page count.
-    let (active_pages, allocated_nursery_bytes) =
-        new_space
-            .from_pages()
-            .iter()
-            .fold((0usize, 0usize), |(pages, bytes), page| {
-                let allocated = page.header().allocated_bytes;
-                (pages + usize::from(allocated != 0), bytes + allocated)
-            });
+    // possible overflow beyond the existing to-space page count. Each worker
+    // can leave one more to-space page and one linear area partly used.
     let promotion_pages = if remembered_parents.is_empty() {
         new_space
             .from_pages()
@@ -238,102 +328,158 @@ pub unsafe fn scavenge(
     let copy_pages = active_pages.saturating_sub(promotion_pages);
     let copy_overflow = copy_pages
         .saturating_mul(2)
+        .saturating_add(workers)
         .saturating_sub(new_space.to_pages().len());
     let reserve_count = promotion_pages
         .saturating_mul(2)
-        .saturating_add(copy_overflow);
-    old_space.reserve_promotion_pages(reserve_count, allocated_nursery_bytes)?;
+        .saturating_add(copy_overflow)
+        .saturating_add(workers);
+    old_space.reserve_promotion_pages(
+        reserve_count,
+        allocated_nursery_bytes.saturating_add(workers.saturating_mul(2 * LAB_BYTES)),
+    )?;
 
     // Snapshot the remembered parents recorded by the mutator since the last
-    // scavenge, then leave the live buffer empty so `remember_parent` can
-    // re-fill it with the parents that still hold an old→young edge after
-    // this scavenge — exactly the card model's "snapshot dirty cards, clear
-    // them, re-dirty survivors", but object-granular and find-cost-free.
+    // scavenge, then leave the live buffer empty so `remember` can re-fill it
+    // with the parents that still hold an old→young edge after this scavenge
+    // — the card model's "snapshot dirty cards, clear them, re-dirty
+    // survivors", object-granular and find-cost-free.
     let snapshot_remembered: Vec<RawGc> = std::mem::take(remembered_parents);
-    let mut ctx = ScavCtx {
+    let shared = Shared {
         cage: cage_base(),
         verify: gc_verify_enabled(),
-        // SAFETY: borrows are valid for the duration of this fn.
-        new_space: unsafe { NonNull::new_unchecked(new_space as *mut _) },
-        old_space: unsafe { NonNull::new_unchecked(old_space as *mut _) },
-        trace_table: unsafe { NonNull::new_unchecked(trace_table as *const _ as *mut _) },
-        stats: ScavengeStats::default(),
-        in_dirty_scan: false,
-        parent_old: false,
-        remembered: unsafe { NonNull::new_unchecked(remembered_parents as *mut _) },
-        host_refs: unsafe { NonNull::new_unchecked(host_refs as *mut _) },
-        sites: unsafe { NonNull::new_unchecked(sites as *mut _) },
-        promoted_unscanned: Vec::new(),
+        trace_table,
+        to_pages: new_space.to_pages().as_ptr(),
+        to_page_count: new_space.to_pages().len(),
+        next_to_page: AtomicUsize::new(0),
+        old_space: Mutex::new(OldSpaceRef(old_space)),
+        remembered: snapshot_remembered,
+        next_remembered: AtomicUsize::new(0),
+        sites: sites.found_counters(),
+        pool: Mutex::new(Pool::default()),
+        wake: Condvar::new(),
+        idle: AtomicUsize::new(0),
+        workers,
+        finished: Mutex::new(Vec::new()),
     };
+    let mut main = Worker::new(&shared);
 
-    // 1) Explicit root slots.
+    // 1) Root slots, explicit and external (handle stack, global handles).
     for &slot in root_slots {
-        ctx.stats.root_slots_scanned += 1;
+        main.stats.root_slots_scanned += 1;
         // SAFETY: caller guarantees slot is a valid pointer.
-        unsafe { process_slot(&mut ctx, slot, None) };
+        unsafe { main.visit(slot, None) };
     }
-
-    // 2) External roots (handle stack, global handles).
-    let ctx_ptr = &mut ctx as *mut ScavCtx;
+    let main_ptr = &mut main as *mut Worker<'_>;
     external_visit(&mut move |slot: *mut RawGc| {
-        // SAFETY: ctx is alive on the surrounding stack frame.
+        // SAFETY: `main` is alive on the surrounding stack frame and no
+        // other worker runs yet.
         unsafe {
-            (*ctx_ptr).stats.root_slots_scanned += 1;
-            process_slot(&mut *ctx_ptr, slot, None);
+            (*main_ptr).stats.root_slots_scanned += 1;
+            (*main_ptr).visit(slot, None);
         }
     });
 
-    // 3) Re-trace the remembered parents — the old/large objects the
-    // barrier recorded as holding an old→young edge. Replaces the
-    // card-table dirty-page header walk: the parents are in hand, so there
-    // is no O(objects/page) find-cost.
-    // SAFETY: STW + raw-pointer state.
-    unsafe { scan_remembered_parents(&mut ctx, &snapshot_remembered) };
-
-    // 4) Cheney scan to-space (and freshly-promoted bytes in
-    // old-space) until convergence.
-    // SAFETY: STW + raw-pointer state.
-    unsafe { cheney_scan(&mut ctx) };
-
-    // 5) Run minor-GC ephemeron processing. This may evacuate values for
-    // keys that were already kept alive by ordinary reachability.
-    // SAFETY: registry slots are valid non-root slots supplied by the heap.
-    unsafe { process_ephemeron_fixpoint(&mut ctx, ephemeron_registry_slots) };
-
-    // 6) Rewrite non-root weak registry entries after all strong and
-    // ephemeron reachability has been evacuated, but before from-space is
-    // recycled by the flip below.
-    for &slot in weak_registry_slots {
-        // SAFETY: caller guarantees slot is a valid registry slot.
-        unsafe { process_weak_registry_slot(&mut ctx, slot) };
+    // 2) Remembered parents and every copied body, on every worker.
+    if workers > 1 {
+        let phase = Phase {
+            shared: &shared,
+            main: &mut main,
+        };
+        // SAFETY: `trace_phase` keeps distinct workers apart: index 0 is the
+        // collecting thread's `main`, every helper builds its own worker, and
+        // shared state is atomic or locked. `phase` outlives the call.
+        unsafe {
+            threads.run(trace_phase, (&raw const phase).cast());
+        }
+    } else {
+        // SAFETY: STW; the collecting thread is the only worker.
+        unsafe { main.drain() };
     }
 
-    // 7) Finalize and drop dead from-space bodies before recycling their
+    // 3) Minor-GC ephemeron processing. This may evacuate values for keys
+    // that were already kept alive by ordinary reachability. Then rewrite
+    // non-root weak registry entries after all strong and ephemeron
+    // reachability has been evacuated, but before from-space is recycled by
+    // the flip below.
+    // SAFETY: registry slots are valid non-root slots supplied by the heap;
+    // the helpers are idle.
+    unsafe {
+        main.process_ephemeron_fixpoint(ephemeron_registry_slots);
+        for &slot in weak_registry_slots {
+            main.process_weak_registry_slot(slot);
+        }
+    }
+
+    let mut stats = ScavengeStats {
+        workers,
+        ..ScavengeStats::default()
+    };
+    for output in std::iter::once(main.finish()).chain(
+        shared
+            .finished
+            .into_inner()
+            .unwrap_or_else(PoisonError::into_inner),
+    ) {
+        remembered_parents.extend(output.remembered);
+        stats.absorb(&output.stats);
+    }
+
+    // 4) Finalize and drop dead from-space bodies before recycling their
     // pages. Forwarded bodies were byte-moved to to/old space, so their source
     // payload is logically uninitialized and must never be dropped.
     // SAFETY: every unforwarded header still precedes its original live body.
-    unsafe { finalize_and_drop_dead_from_space(&mut ctx) };
+    unsafe { finalize_and_drop_dead_from_space(new_space, trace_table, host_refs) };
 
-    // 8) Mark the survivors on to-space pages. After the flip below these
+    // 5) Mark the survivors on to-space pages. After the flip below these
     // pages become the new from-space; the mutator allocates above the mark
     // and the next scavenge promotes only what lies below it.
-    for page in ctx.new_space().to_pages() {
+    for page in new_space.to_pages() {
         let h = page.header_mut();
         h.age_mark = h.bump_cursor;
     }
 
-    // 9) Flip from↔to. The preflight's allocated-byte total is the exact
+    // 6) Flip from↔to. The preflight's allocated-byte total is the exact
     // physical input, not the larger page-capacity reservation bound. Every
     // survivor contributes its aligned header size to exactly one counter.
-    ctx.new_space().flip();
-    let retained_nursery_bytes = ctx
-        .stats
-        .copied_bytes
-        .saturating_add(ctx.stats.promoted_bytes);
+    new_space.flip();
+    let retained_nursery_bytes = stats.copied_bytes.saturating_add(stats.promoted_bytes);
     debug_assert!(retained_nursery_bytes <= allocated_nursery_bytes);
-    ctx.stats.reclaimed_bytes = allocated_nursery_bytes.saturating_sub(retained_nursery_bytes);
+    stats.reclaimed_bytes = allocated_nursery_bytes.saturating_sub(retained_nursery_bytes);
 
-    Ok(ctx.stats)
+    Ok(stats)
+}
+
+/// Context of the parallel tracing phase.
+struct Phase<'s> {
+    shared: &'s Shared,
+    /// The collecting thread's worker, driven only by index 0.
+    main: *mut Worker<'s>,
+}
+
+/// One worker's part of the parallel tracing phase.
+///
+/// # Safety
+///
+/// `context` is a live [`Phase`]; index 0 runs only on the collecting thread.
+unsafe fn trace_phase(context: *const (), index: usize) {
+    // SAFETY: per docstring; `GcThreads::run` keeps the phase alive.
+    unsafe {
+        let phase = &*context.cast::<Phase<'_>>();
+        if index == 0 {
+            (*phase.main).drain();
+        } else {
+            let mut worker = Worker::new(phase.shared);
+            worker.drain();
+            let output = worker.finish();
+            phase
+                .shared
+                .finished
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(output);
+        }
+    }
 }
 
 /// Run reclamation hooks for every tracked young body that was not
@@ -341,7 +487,7 @@ pub unsafe fn scavenge(
 ///
 /// Only bodies whose type has a hook are tracked, at allocation; the dead
 /// cells around them are never visited. A copying collector transfers
-/// ownership of a survivor's payload with the byte copy in [`evacuate`]; only
+/// ownership of a survivor's payload with the byte copy in evacuation; only
 /// an unforwarded source remains a valid Rust value. Its finalizer follows
 /// the same ordering as old-space sweep, then its `Drop` implementation
 /// releases owned buffers and host resources before the semispace pages are
@@ -351,26 +497,29 @@ pub unsafe fn scavenge(
 ///
 /// Must run under the scavenge STW pause after reachability has converged and
 /// before [`NewSpace::flip`] resets from-space.
-unsafe fn finalize_and_drop_dead_from_space(ctx: &mut ScavCtx) {
+unsafe fn finalize_and_drop_dead_from_space(
+    new_space: &mut NewSpace,
+    trace_table: &TraceTable,
+    host_refs: &mut crate::host_refs::HostRefTable,
+) {
+    let cage = cage_base();
     // SAFETY: per docstring; the trace table matches every allocated tag.
     unsafe {
         #[cfg(debug_assertions)]
-        verify_cleanup_tracked(ctx);
-        let trace_table = &*ctx.trace_table.as_ptr();
-        let mut host_refs = ctx.host_refs;
-        let tracked = ctx.new_space().take_cleanup();
+        verify_cleanup_tracked(new_space, trace_table);
+        let tracked = new_space.take_cleanup();
         for offset in tracked {
-            let header = ctx.cage.add(offset as usize).cast::<GcHeader>();
+            let header = cage.add(offset as usize).cast::<GcHeader>();
             if (*header).is_forwarded() {
                 let target = GcHeader::read_forwarding_offset(header);
-                if (*ctx.cage.add(target as usize).cast::<GcHeader>()).is_young() {
-                    ctx.new_space().track_cleanup(target);
+                if (*cage.add(target as usize).cast::<GcHeader>()).is_young() {
+                    new_space.track_cleanup(target);
                 }
                 continue;
             }
             let tag = (*header).type_tag();
             if let Some(release) = trace_table.get_host_release(tag) {
-                release(header, host_refs.as_mut());
+                release(header, host_refs);
             }
             if let Some(finalize) = trace_table.get_finalize(tag) {
                 finalize(header);
@@ -388,16 +537,15 @@ unsafe fn finalize_and_drop_dead_from_space(ctx: &mut ScavCtx) {
 ///
 /// As [`finalize_and_drop_dead_from_space`], before it takes the list.
 #[cfg(debug_assertions)]
-unsafe fn verify_cleanup_tracked(ctx: &mut ScavCtx) {
+unsafe fn verify_cleanup_tracked(new_space: &NewSpace, trace_table: &TraceTable) {
+    let cage = cage_base();
     // SAFETY: forwarded from the caller.
     unsafe {
-        let trace_table = &*ctx.trace_table.as_ptr();
-        let new_space = &*ctx.new_space.as_ptr();
         for page in new_space.from_pages() {
             page.for_each_object(|header, _| {
                 let tag = (*header).type_tag();
                 if !(*header).is_forwarded() && trace_table.needs_cleanup(tag) {
-                    let offset = (header as usize - ctx.cage as usize) as u32;
+                    let offset = (header as usize - cage as usize) as u32;
                     debug_assert!(
                         new_space.tracks_cleanup(offset),
                         "young {:?} at {offset:#x} has a reclamation hook but is untracked",
@@ -409,11 +557,6 @@ unsafe fn verify_cleanup_tracked(ctx: &mut ScavCtx) {
     }
 }
 
-/// Evacuate the target of a single slot if it is in from-space.
-///
-/// # Safety
-///
-/// `slot` must be a dereferenceable `*mut RawGc`.
 /// `OTTER_GC_VERIFY=1` turns on per-slot scavenge validation: every child a
 /// slot points at is sanity-checked (plausible header size / non-zero type tag)
 /// and every corrupt one is reported with the slot's provenance — in-cage
@@ -487,348 +630,611 @@ unsafe fn verify_child_slot(
     }
 }
 
-/// Visit one slot: the hot part, inlined into every trace visitor. A null,
-/// old or large target returns at once; only a from-space target leaves
-/// through the out-of-line evacuation.
-#[inline(always)]
-unsafe fn process_slot(ctx: &mut ScavCtx, slot: *mut RawGc, parent_header: Option<*mut GcHeader>) {
-    // SAFETY: slot is dereferenceable per precondition.
-    unsafe {
-        if ctx.in_dirty_scan {
-            // Count both remembered-parent scans and the promoted-body closure
-            // whose children use the same immediate-promotion policy.
-            ctx.stats.slots_scanned += 1;
+impl<'s> Worker<'s> {
+    fn new(shared: &'s Shared) -> Self {
+        Self {
+            shared,
+            local: Vec::new(),
+            to_page: std::ptr::null_mut(),
+            lab_cursor: 0,
+            lab_end: 0,
+            remembered: Vec::new(),
+            stats: ScavengeStats::default(),
+            in_dirty_scan: false,
+            parent_old: false,
         }
-        let raw = (*slot).0;
-        if raw == 0 {
-            return;
+    }
+
+    /// Give the unused linear area back and hand over what this worker found.
+    fn finish(mut self) -> WorkerOutput {
+        let unused = (self.lab_end - self.lab_cursor) as usize;
+        if unused != 0 {
+            let mut old_space = self.shared.old_space();
+            // SAFETY: the lock grants exclusive access to the old space; the
+            // range is this worker's untouched area tail.
+            unsafe { (*old_space.0).return_lab(self.lab_cursor, unused) };
+            self.lab_cursor = self.lab_end;
         }
-        // SAFETY: raw is a valid in-cage offset by precondition.
-        let header_ptr = ctx.cage.add(raw as usize) as *mut GcHeader;
-        if ctx.verify {
-            verify_child_slot(
-                ctx.trace_table.as_ref(),
-                slot,
-                raw,
-                header_ptr,
-                parent_header,
-            );
+        WorkerOutput {
+            remembered: std::mem::take(&mut self.remembered),
+            stats: self.stats,
         }
-        // Classify the target by its page: an old or large target is never
-        // touched, so its header stays out of the cache. Objects on
-        // new-space pages are exactly the young ones.
-        match Page::header_of(header_ptr as *const u8).space {
-            SpaceKind::Old | SpaceKind::Large => {}
-            SpaceKind::NewTo => {
-                // Already evacuated during this scavenge: still young.
-                if ctx.parent_old {
-                    remember_parent(ctx, parent_header);
+    }
+
+    /// Visit one slot: the hot part, inlined into every trace visitor. A
+    /// null, old or large target returns at once; only a from-space target
+    /// leaves through the out-of-line evacuation.
+    ///
+    /// # Safety
+    ///
+    /// `slot` must be a dereferenceable `*mut RawGc` under the STW pause.
+    #[inline(always)]
+    unsafe fn visit(&mut self, slot: *mut RawGc, parent_header: Option<*mut GcHeader>) {
+        // SAFETY: slot is dereferenceable per precondition.
+        unsafe {
+            if self.in_dirty_scan {
+                // Count both remembered-parent scans and the promoted-body
+                // closure whose children use the same immediate-promotion
+                // policy.
+                self.stats.slots_scanned += 1;
+            }
+            let raw = load_slot(slot);
+            if raw == 0 {
+                return;
+            }
+            let header_ptr = self.shared.cage.add(raw as usize) as *mut GcHeader;
+            if self.shared.verify {
+                verify_child_slot(
+                    &*self.shared.trace_table,
+                    slot,
+                    raw,
+                    header_ptr,
+                    parent_header,
+                );
+            }
+            // Classify the target by its page: an old or large target is
+            // never touched, so its header stays out of the cache. Objects on
+            // new-space pages are exactly the young ones.
+            match Page::space_of(header_ptr as *const u8) {
+                SpaceKind::Old | SpaceKind::Large => {}
+                SpaceKind::NewTo => {
+                    // Already evacuated during this scavenge: still young.
+                    if self.parent_old {
+                        self.remember(parent_header);
+                    }
+                }
+                SpaceKind::NewFrom => self.evacuate_slot(slot, header_ptr, parent_header),
+            }
+        }
+    }
+
+    /// Evacuate a from-space target and rewrite its slot.
+    ///
+    /// # Safety
+    ///
+    /// `slot` holds `header`, a live from-space object, under the STW pause.
+    #[inline(never)]
+    unsafe fn evacuate_slot(
+        &mut self,
+        slot: *mut RawGc,
+        header: *mut GcHeader,
+        parent_header: Option<*mut GcHeader>,
+    ) {
+        // SAFETY: per docstring.
+        unsafe {
+            let new_offset = self.evacuate(header);
+            store_slot(slot, new_offset);
+            self.stats.slot_updates += 1;
+            // Generational invariant: evacuation itself can mint an
+            // old->young edge — the parent may already be old/promoted
+            // while the child was copied to to-space. Without remembering
+            // the parent the next scavenge never rescans that edge and the
+            // child dangles after it moves again. Record the parent object,
+            // not the slot: traced slots can live in malloc-owned side
+            // storage (Box/Vec/SmallVec) outside the cage, while re-tracing
+            // the whole parent reaches every slot through the refreshed
+            // slab base.
+            if self.parent_old
+                && (*self.shared.cage.add(new_offset as usize).cast::<GcHeader>()).is_young()
+            {
+                self.remember(parent_header);
+            }
+        }
+    }
+
+    /// Record an old/large parent that still points at a young child after
+    /// slot processing, so the next scavenge re-traces it. Deduped by the
+    /// header's remembered bit: a parent is pushed at most once per
+    /// scavenge. Roots have no parent and record nothing. Only the worker
+    /// tracing a parent records it.
+    ///
+    /// # Safety
+    ///
+    /// `parent_header`, when present, must be a live old or large object
+    /// header under the current STW scavenge.
+    #[cold]
+    unsafe fn remember(&mut self, parent_header: Option<*mut GcHeader>) {
+        // SAFETY: preconditions are inherited from `visit`.
+        unsafe {
+            let Some(parent_header) = parent_header else {
+                return;
+            };
+            debug_assert!(matches!(
+                Page::space_of(parent_header as *const u8),
+                SpaceKind::Old | SpaceKind::Large
+            ));
+            if !(*parent_header).is_remembered() {
+                (*parent_header).set_remembered();
+                // Parent is old/large and in-cage; old objects do not move
+                // on a minor GC, so this offset stays valid until the next
+                // scavenge drains it.
+                let offset = (parent_header as usize - self.shared.cage as usize) as u32;
+                self.remembered.push(RawGc(offset));
+            }
+        }
+    }
+
+    /// Evacuate one young-gen object: return its copy if another visit
+    /// already moved it, otherwise claim, copy, publish the forwarding
+    /// offset and queue the copy for tracing.
+    ///
+    /// # Safety
+    ///
+    /// `header` must reference a from-space object.
+    unsafe fn evacuate(&mut self, header: *mut GcHeader) -> u32 {
+        // SAFETY: header is a from-space object per caller. Every
+        // dereference goes through raw pointers so no shared reference
+        // outlives a write through the same allocation.
+        unsafe {
+            let claimed = match GcHeader::claim_forwarding(header) {
+                ForwardingClaim::Forwarded(offset) => return offset,
+                ForwardingClaim::Claimed(flags) => flags,
+            };
+            let size = (*header).size_bytes() as usize;
+            let aligned = align_up(size, CELL_SIZE);
+            // A young object reached from a remembered old parent promotes
+            // immediately: leaving it young re-remembers the parent, and the
+            // parent is then re-traced in full on EVERY scavenge until the
+            // child ages out — for a large promoted graph that made each
+            // scavenge O(old heap) and the run quadratic (the earley-boyer
+            // benchmark spent 20+ minutes inside the scavenger). An object an
+            // old object points at is long-lived with overwhelming likelihood
+            // anyway, so this is the standard generational answer.
+            let promote = self.in_dirty_scan || {
+                let page_base = Page::page_base_of(header as *const u8) as usize;
+                (header as usize) - page_base < Page::age_mark_of(header as *const u8)
+            };
+            let (new_offset, promoted) = if promote {
+                (self.alloc_old(aligned), true)
+            } else {
+                match self.alloc_to(aligned) {
+                    Some(offset) => (offset, false),
+                    None => (self.alloc_old(aligned), true),
+                }
+            };
+
+            // Copy header + payload to the new location, then give the copy
+            // the flags its source had before the claim.
+            let dest_ptr = self.shared.cage.add(new_offset as usize);
+            copy_cell(header as *const u8, dest_ptr, aligned);
+            let dest_header = dest_ptr as *mut GcHeader;
+            GcHeader::restore_flags(dest_header, claimed);
+
+            // A site-tagged cell is found once: its copy drops the tag.
+            let site = (*header).allocation_site();
+            if site != 0 {
+                self.shared.sites.record_found(site);
+                GcHeader::set_allocation_site(dest_header, 0);
+            }
+            if promoted {
+                (*dest_header).promote_to_old();
+                self.stats.promoted_bytes += aligned;
+                self.local.push(new_offset | PROMOTED_ENTRY);
+            } else {
+                self.stats.copied_bytes += aligned;
+                self.local.push(new_offset);
+            }
+            GcHeader::publish_forwarding(header, new_offset, claimed);
+            new_offset
+        }
+    }
+
+    /// Bump-allocate `size` bytes in a to-space page this worker owns,
+    /// claiming the next unclaimed page when the current one is full.
+    /// `None` once to-space has no page left.
+    ///
+    /// # Safety
+    ///
+    /// STW scavenge; the claimed pages belong to this worker alone.
+    unsafe fn alloc_to(&mut self, size: usize) -> Option<u32> {
+        loop {
+            if !self.to_page.is_null() {
+                // SAFETY: this worker claimed the page below.
+                if let Some(offset) = unsafe { Page::bump_alloc_owned(self.to_page, size) } {
+                    return Some(offset);
                 }
             }
-            SpaceKind::NewFrom => evacuate_slot(ctx, slot, header_ptr, parent_header),
+            let index = self.shared.next_to_page.fetch_add(1, Ordering::Relaxed);
+            if index >= self.shared.to_page_count {
+                self.to_page = std::ptr::null_mut();
+                return None;
+            }
+            // SAFETY: `index` is in bounds of the to-space page list, which
+            // does not change during the scavenge.
+            self.to_page = unsafe { (*self.shared.to_pages.add(index)).base_ptr() };
         }
     }
-}
 
-/// Evacuate a from-space target and rewrite its slot.
-///
-/// # Safety
-///
-/// `slot` holds `header`, a live from-space object, under the STW pause.
-#[inline(never)]
-unsafe fn evacuate_slot(
-    ctx: &mut ScavCtx,
-    slot: *mut RawGc,
-    header: *mut GcHeader,
-    parent_header: Option<*mut GcHeader>,
-) {
-    // SAFETY: per docstring.
-    unsafe {
-        debug_assert!((*header).is_young());
-        let new_offset = evacuate(ctx, header);
-        (*slot).0 = new_offset;
-        ctx.stats.slot_updates += 1;
-        // Generational invariant: evacuation itself can mint an
-        // old->young edge — the parent may already be old/promoted
-        // while the child was copied to to-space. Without remembering
-        // the parent the next scavenge never rescans that edge and the
-        // child dangles after it moves again. Record the parent object,
-        // not the slot: traced slots can live in malloc-owned side
-        // storage (Box/Vec/SmallVec) outside the cage, while re-tracing
-        // the whole parent reaches every slot through the refreshed
-        // slab base.
-        if ctx.parent_old && (*ctx.cage.add(new_offset as usize).cast::<GcHeader>()).is_young() {
-            remember_parent(ctx, parent_header);
+    /// Allocate `size` bytes for a promoted cell: small cells bump through
+    /// this worker's linear area, larger ones and refills take the lock.
+    ///
+    /// # Safety
+    ///
+    /// STW scavenge.
+    unsafe fn alloc_old(&mut self, size: usize) -> u32 {
+        if size <= LAB_OBJECT_MAX {
+            if (self.lab_end - self.lab_cursor) as usize >= size {
+                let offset = self.lab_cursor;
+                self.lab_cursor += size as u32;
+                return offset;
+            }
+            let mut old_space = self.shared.old_space();
+            // SAFETY: the lock grants exclusive access to the old space.
+            unsafe {
+                let unused = (self.lab_end - self.lab_cursor) as usize;
+                (*old_space.0).return_lab(self.lab_cursor, unused);
+                let (offset, len) = (*old_space.0)
+                    .take_lab(size, LAB_BYTES)
+                    .expect("old-space linear area during scavenge");
+                self.lab_cursor = offset + size as u32;
+                self.lab_end = offset + len as u32;
+                return offset;
+            }
+        }
+        let mut old_space = self.shared.old_space();
+        // SAFETY: the lock grants exclusive access to the old space.
+        unsafe {
+            (*old_space.0)
+                .alloc(size)
+                .expect("old-space alloc during scavenge")
         }
     }
-}
 
-/// Record an old/large parent that still points at a young child after
-/// slot processing into the remembered set, so the next scavenge re-traces
-/// it. Covers both slots rewritten by this trace and slots already
-/// rewritten to NewTo by an earlier root pass in the same scavenge.
-/// Deduped by `FLAG_REMEMBERED`: a parent is pushed at most once per
-/// scavenge. Roots have no parent and record nothing.
-///
-/// # Safety
-///
-/// `parent_header`, when present, must be a live old or large object
-/// header under the current STW scavenge.
-#[cold]
-unsafe fn remember_parent(ctx: &mut ScavCtx, parent_header: Option<*mut GcHeader>) {
-    // SAFETY: preconditions are inherited from `process_slot`.
-    unsafe {
-        let Some(parent_header) = parent_header else {
-            return;
-        };
-        debug_assert!(matches!(
-            Page::header_of(parent_header as *const u8).space,
-            SpaceKind::Old | SpaceKind::Large
-        ));
-        if !(*parent_header).is_remembered() {
-            (*parent_header).set_remembered();
-            // Parent is old/large and in-cage; old objects do not move on a
-            // minor GC, so this offset stays valid until the next scavenge
-            // drains it.
-            let offset = (parent_header as usize - ctx.cage as usize) as u32;
-            ctx.remembered().push(RawGc(offset));
-        }
-    }
-}
-
-/// Update a non-root registry slot if its young target survived.
-///
-/// # Safety
-///
-/// `slot` must be a dereferenceable registry slot. Unlike
-/// [`process_slot`], this never evacuates the target; it observes whether
-/// ordinary strong tracing already forwarded the object.
-unsafe fn process_weak_registry_slot(ctx: &mut ScavCtx, slot: *mut RawGc) {
-    // SAFETY: slot is dereferenceable per precondition.
-    unsafe {
-        let raw = (*slot).0;
-        if raw == 0 {
-            return;
-        }
-        let header_ptr = ctx.cage.add(raw as usize) as *mut GcHeader;
-        if !(*header_ptr).is_young() {
-            return;
-        }
-        if Page::header_of(header_ptr as *const u8).space == SpaceKind::NewTo {
-            return;
-        }
-        if (*header_ptr).is_forwarded() {
-            (*slot).0 = GcHeader::read_forwarding_offset(header_ptr);
-            ctx.stats.slot_updates += 1;
-        } else {
-            *slot = RawGc::NULL;
-        }
-    }
-}
-
-/// Update a non-root registry slot if it is currently known live.
-///
-/// Returns `true` when the slot points at an old object or a forwarded young
-/// object. Young objects that have not been forwarded are left untouched here
-/// because an ephemeron value discovered later in the same fixpoint may still
-/// make the table reachable.
-unsafe fn update_registry_slot_if_forwarded(ctx: &mut ScavCtx, slot: *mut RawGc) -> bool {
-    // SAFETY: slot is dereferenceable per precondition.
-    unsafe {
-        let raw = (*slot).0;
-        if raw == 0 {
-            return false;
-        }
-        let header_ptr = ctx.cage.add(raw as usize) as *mut GcHeader;
-        if !(*header_ptr).is_young() {
-            return true;
-        }
-        if Page::header_of(header_ptr as *const u8).space == SpaceKind::NewTo {
-            return true;
-        }
-        if (*header_ptr).is_forwarded() {
-            (*slot).0 = GcHeader::read_forwarding_offset(header_ptr);
-            ctx.stats.slot_updates += 1;
-            return true;
-        }
-        false
-    }
-}
-
-/// Update a weak ephemeron key slot.
-///
-/// Returns `true` when the key is live for this minor collection. Dead young
-/// keys are nulled in place so VM weak-table lookups stop observing them.
-unsafe fn process_ephemeron_key_slot(ctx: &mut ScavCtx, slot: *mut RawGc) -> bool {
-    // SAFETY: slot is dereferenceable per precondition.
-    unsafe {
-        let raw = (*slot).0;
-        if raw == 0 {
-            return false;
-        }
-        let header_ptr = ctx.cage.add(raw as usize) as *mut GcHeader;
-        if !(*header_ptr).is_young() {
-            return true;
-        }
-        if Page::header_of(header_ptr as *const u8).space == SpaceKind::NewTo {
-            return true;
-        }
-        if (*header_ptr).is_forwarded() {
-            (*slot).0 = GcHeader::read_forwarding_offset(header_ptr);
-            ctx.stats.slot_updates += 1;
-            return true;
-        }
-        *slot = RawGc::NULL;
-        ctx.stats.slot_updates += 1;
-        false
-    }
-}
-
-/// Process ephemeron tables until no more young keys/tables/values are
-/// forwarded. This is a young-generation analogue of the old-generation
-/// ephemeron fixpoint: keys are weak, values become strong only for keys
-/// already proven live.
-///
-/// # Safety
-///
-/// `ephemeron_registry_slots` must address valid non-root registry slots.
-unsafe fn process_ephemeron_fixpoint(ctx: &mut ScavCtx, ephemeron_registry_slots: &[*mut RawGc]) {
-    // SAFETY: caller guarantees slot validity under STW.
-    unsafe {
+    /// Trace every queued copy, every remembered parent and every chunk other
+    /// workers share until all workers run dry.
+    ///
+    /// # Safety
+    ///
+    /// STW scavenge.
+    unsafe fn drain(&mut self) {
         loop {
-            // Fixpoint progress = NEW EVACUATIONS only. Comparing the whole
-            // stats struct also captured `slot_updates`, which increments
-            // when a re-scanned slot merely rewrites to an existing
-            // forwarding target — that made the loop believe it progressed
-            // every pass and re-run a full to-space re-scan (fresh cheney
-            // cursors each call) millions of times: one first scavenge ran
-            // for minutes on the raytrace benchmark with ZERO ephemeron
-            // tables.
-            let before = (ctx.stats.copied_bytes, ctx.stats.promoted_bytes);
+            while let Some(entry) = self.local.pop() {
+                // SAFETY: entries name live copies this scavenge made.
+                unsafe { self.trace_entry(entry) };
+                if self.local.len() > SHARE_THRESHOLD
+                    && self.shared.idle.load(Ordering::Relaxed) != 0
+                {
+                    self.share();
+                }
+            }
+            // SAFETY: STW scavenge.
+            if unsafe { self.trace_next_remembered() } {
+                continue;
+            }
+            if !self.take_shared_work() {
+                return;
+            }
+        }
+    }
+
+    /// Trace only this worker's own queue, for the single-threaded phases.
+    ///
+    /// # Safety
+    ///
+    /// STW scavenge; no other worker runs.
+    unsafe fn drain_local(&mut self) {
+        while let Some(entry) = self.local.pop() {
+            // SAFETY: entries name live copies this scavenge made.
+            unsafe { self.trace_entry(entry) };
+        }
+    }
+
+    /// Hand the older half of this worker's queue to idle workers.
+    fn share(&mut self) {
+        let half = self.local.len() / 2;
+        let chunk: Vec<Entry> = self.local.drain(..half).collect();
+        self.shared.pool().chunks.push(chunk);
+        self.shared.wake.notify_one();
+    }
+
+    /// Take a shared chunk, waiting while other workers may still produce
+    /// one. `false` once every worker is idle with nothing left to share.
+    fn take_shared_work(&mut self) -> bool {
+        let mut pool = self.shared.pool();
+        loop {
+            if let Some(chunk) = pool.chunks.pop() {
+                self.local = chunk;
+                return true;
+            }
+            if pool.done {
+                return false;
+            }
+            if pool.idle + 1 == self.shared.workers && self.shared.remembered_exhausted() {
+                pool.done = true;
+                self.shared.wake.notify_all();
+                return false;
+            }
+            pool.idle += 1;
+            self.shared.idle.store(pool.idle, Ordering::Relaxed);
+            pool = self
+                .shared
+                .wake
+                .wait(pool)
+                .unwrap_or_else(PoisonError::into_inner);
+            pool.idle -= 1;
+            self.shared.idle.store(pool.idle, Ordering::Relaxed);
+        }
+    }
+
+    /// Re-trace one claimed chunk of remembered parents — the old/large
+    /// objects the write barrier (and the prior scavenge's re-dirty path)
+    /// recorded as holding an old→young edge. Each is a root for the young
+    /// collection: re-tracing it reaches every young edge through the
+    /// current body. Type-owned dirty ranges may skip clean old edges
+    /// without retaining raw slot addresses. A parent's remembered bit is
+    /// cleared just before it is traced, so the re-dirty path re-records
+    /// (and re-sets the bit on) a parent that still points young; only the
+    /// worker tracing a parent reads or sets its bit. `false` once every
+    /// chunk is claimed.
+    ///
+    /// # Safety
+    ///
+    /// STW scavenge; the snapshot holds in-cage old/large parent offsets.
+    unsafe fn trace_next_remembered(&mut self) -> bool {
+        let total = self.shared.remembered.len();
+        let start = self
+            .shared
+            .next_remembered
+            .fetch_add(REMEMBERED_CHUNK, Ordering::Relaxed);
+        if start >= total {
+            return false;
+        }
+        let end = (start + REMEMBERED_CHUNK).min(total);
+        self.in_dirty_scan = true;
+        for index in start..end {
+            let parent = self.shared.remembered[index];
+            self.stats.dirty_cards_scanned += 1; // remembered-set entries scanned
+            // SAFETY: per docstring.
+            unsafe {
+                let header = self.shared.cage.add(parent.0 as usize) as *mut GcHeader;
+                (*header).clear_remembered();
+                // Skip swept corpses: a full-GC sweep drops dead old/large
+                // objects in place (freeing their payload buffers, e.g. a
+                // string `Vec<u16>`) but leaves the header walkable. Tracing
+                // such a corpse would read its freed — and possibly reused —
+                // backing as live GC slots (use-after-free). A full GC also
+                // prunes dead parents from the buffer, so this is
+                // belt-and-suspenders.
+                if (*header).size_bytes() != 0 && !(*header).is_swept() {
+                    self.stats.objects_retraced += 1;
+                    self.trace_one(header, TraceKind::Remembered);
+                }
+            }
+        }
+        self.in_dirty_scan = false;
+        true
+    }
+
+    /// Trace one queued copy. Children of a freshly promoted body promote
+    /// too (same policy as the remembered re-trace): leaving them young
+    /// would re-remember every promoted parent and re-trace it on all later
+    /// scavenges — the transitive closure of an old graph must reach old
+    /// space within this scavenge.
+    ///
+    /// # Safety
+    ///
+    /// `entry` names a live copy this scavenge made.
+    unsafe fn trace_entry(&mut self, entry: Entry) {
+        let promoted = entry & PROMOTED_ENTRY != 0;
+        let offset = entry & !PROMOTED_ENTRY;
+        self.in_dirty_scan = promoted;
+        // SAFETY: per docstring.
+        unsafe {
+            let header = self.shared.cage.add(offset as usize) as *mut GcHeader;
+            self.trace_one(header, TraceKind::Full);
+        }
+        self.in_dirty_scan = false;
+    }
+
+    /// Trace one header — the visitor evacuates any from-space child. The
+    /// tracing scope is independent of the policy that promotes an old
+    /// body's children: newly promoted bodies require full tracing even
+    /// under that policy.
+    ///
+    /// # Safety
+    ///
+    /// `header` is a live, valid GcHeader this worker alone traces.
+    unsafe fn trace_one(&mut self, header: *mut GcHeader, kind: TraceKind) {
+        // SAFETY: per docstring; the trace table registers the type tag.
+        unsafe {
+            self.parent_old = is_old_body(header);
+            let table = self.shared.trace_table;
+            let this = self as *mut Self;
+            let mut visitor = move |slot: *mut RawGc| {
+                (*this).visit(slot, Some(header));
+            };
+            match kind {
+                TraceKind::Full => (*table).trace(header, &mut visitor),
+                TraceKind::Remembered => (*table).trace_remembered(header, &mut visitor),
+            }
+        }
+    }
+
+    /// Update a non-root registry slot if its young target survived.
+    ///
+    /// # Safety
+    ///
+    /// `slot` must be a dereferenceable registry slot; no other worker
+    /// runs. Unlike [`Self::visit`], this never evacuates the target; it
+    /// observes whether ordinary strong tracing already forwarded the object.
+    unsafe fn process_weak_registry_slot(&mut self, slot: *mut RawGc) {
+        // SAFETY: slot is dereferenceable per precondition.
+        unsafe {
+            let raw = (*slot).0;
+            if raw == 0 {
+                return;
+            }
+            let header_ptr = self.shared.cage.add(raw as usize) as *mut GcHeader;
+            if !(*header_ptr).is_young() {
+                return;
+            }
+            if Page::space_of(header_ptr as *const u8) == SpaceKind::NewTo {
+                return;
+            }
+            if (*header_ptr).is_forwarded() {
+                (*slot).0 = GcHeader::read_forwarding_offset(header_ptr);
+                self.stats.slot_updates += 1;
+            } else {
+                *slot = RawGc::NULL;
+            }
+        }
+    }
+
+    /// Update a non-root registry slot if it is currently known live.
+    ///
+    /// Returns `true` when the slot points at an old object or a forwarded
+    /// young object. Young objects that have not been forwarded are left
+    /// untouched here because an ephemeron value discovered later in the same
+    /// fixpoint may still make the table reachable.
+    ///
+    /// # Safety
+    ///
+    /// As [`Self::process_weak_registry_slot`].
+    unsafe fn update_registry_slot_if_forwarded(&mut self, slot: *mut RawGc) -> bool {
+        // SAFETY: slot is dereferenceable per precondition.
+        unsafe {
+            let raw = (*slot).0;
+            if raw == 0 {
+                return false;
+            }
+            let header_ptr = self.shared.cage.add(raw as usize) as *mut GcHeader;
+            if !(*header_ptr).is_young() {
+                return true;
+            }
+            if Page::space_of(header_ptr as *const u8) == SpaceKind::NewTo {
+                return true;
+            }
+            if (*header_ptr).is_forwarded() {
+                (*slot).0 = GcHeader::read_forwarding_offset(header_ptr);
+                self.stats.slot_updates += 1;
+                return true;
+            }
+            false
+        }
+    }
+
+    /// Update a weak ephemeron key slot.
+    ///
+    /// Returns `true` when the key is live for this minor collection. Dead
+    /// young keys are nulled in place so VM weak-table lookups stop
+    /// observing them.
+    ///
+    /// # Safety
+    ///
+    /// As [`Self::process_weak_registry_slot`].
+    unsafe fn process_ephemeron_key_slot(&mut self, slot: *mut RawGc) -> bool {
+        // SAFETY: slot is dereferenceable per precondition.
+        unsafe {
+            let raw = (*slot).0;
+            if raw == 0 {
+                return false;
+            }
+            let header_ptr = self.shared.cage.add(raw as usize) as *mut GcHeader;
+            if !(*header_ptr).is_young() {
+                return true;
+            }
+            if Page::space_of(header_ptr as *const u8) == SpaceKind::NewTo {
+                return true;
+            }
+            if (*header_ptr).is_forwarded() {
+                (*slot).0 = GcHeader::read_forwarding_offset(header_ptr);
+                self.stats.slot_updates += 1;
+                return true;
+            }
+            *slot = RawGc::NULL;
+            self.stats.slot_updates += 1;
+            false
+        }
+    }
+
+    /// Process ephemeron tables until no more young keys/tables/values are
+    /// forwarded. This is a young-generation analogue of the old-generation
+    /// ephemeron fixpoint: keys are weak, values become strong only for keys
+    /// already proven live.
+    ///
+    /// # Safety
+    ///
+    /// `ephemeron_registry_slots` must address valid non-root registry
+    /// slots; no other worker runs.
+    unsafe fn process_ephemeron_fixpoint(&mut self, ephemeron_registry_slots: &[*mut RawGc]) {
+        // SAFETY: caller guarantees slot validity under STW.
+        unsafe {
+            loop {
+                // Fixpoint progress = new evacuations only: a re-scanned slot
+                // that merely rewrites to an existing forwarding target is
+                // not progress.
+                let before = (self.stats.copied_bytes, self.stats.promoted_bytes);
+
+                for &slot in ephemeron_registry_slots {
+                    if !self.update_registry_slot_if_forwarded(slot) {
+                        continue;
+                    }
+                    let raw = (*slot).0;
+                    if raw == 0 {
+                        continue;
+                    }
+                    let header_ptr = self.shared.cage.add(raw as usize) as *mut GcHeader;
+                    self.trace_ephemeron_table(header_ptr);
+                }
+
+                self.drain_local();
+
+                if (self.stats.copied_bytes, self.stats.promoted_bytes) == before {
+                    break;
+                }
+            }
 
             for &slot in ephemeron_registry_slots {
-                if !update_registry_slot_if_forwarded(ctx, slot) {
-                    continue;
-                }
-                let raw = (*slot).0;
-                if raw == 0 {
-                    continue;
-                }
-                let header_ptr = ctx.cage.add(raw as usize) as *mut GcHeader;
-                trace_ephemeron_table(ctx, header_ptr);
+                self.process_weak_registry_slot(slot);
             }
-
-            cheney_scan(ctx);
-
-            if (ctx.stats.copied_bytes, ctx.stats.promoted_bytes) == before {
-                break;
-            }
-        }
-
-        for &slot in ephemeron_registry_slots {
-            process_weak_registry_slot(ctx, slot);
         }
     }
-}
 
-/// Trace one live ephemeron table.
-///
-/// # Safety
-///
-/// `header` is a live table header whose type tag is registered.
-unsafe fn trace_ephemeron_table(ctx: &mut ScavCtx, header: *mut GcHeader) {
-    // SAFETY: per docstring.
-    unsafe {
-        let table_ptr = ctx.trace_table.as_ptr();
-        ctx.parent_old = is_old_body(header);
-        let ctx_ptr = ctx as *mut ScavCtx;
-        let mut visitor =
-            move |key_slot: *mut RawGc,
-                  visit_value_slots: &mut crate::trace::EphemeronValueVisitor<'_>| {
-                if process_ephemeron_key_slot(&mut *ctx_ptr, key_slot) {
+    /// Trace one live ephemeron table.
+    ///
+    /// # Safety
+    ///
+    /// `header` is a live table header whose type tag is registered; no
+    /// other worker runs.
+    unsafe fn trace_ephemeron_table(&mut self, header: *mut GcHeader) {
+        // SAFETY: per docstring.
+        unsafe {
+            let table = self.shared.trace_table;
+            self.parent_old = is_old_body(header);
+            let this = self as *mut Self;
+            let mut visitor = move |key_slot: *mut RawGc,
+                                    visit_value_slots: &mut crate::trace::EphemeronValueVisitor<
+                '_,
+            >| {
+                if (*this).process_ephemeron_key_slot(key_slot) {
                     let mut strong_visitor = |slot: *mut RawGc| {
-                        process_slot(&mut *ctx_ptr, slot, Some(header));
+                        (*this).visit(slot, Some(header));
                     };
                     visit_value_slots(&mut strong_visitor);
                 }
             };
-        (*table_ptr).trace_ephemerons(header, &mut visitor);
-    }
-}
-
-/// Evacuate one young-gen object: forward if already evacuated,
-/// otherwise copy + install forwarding pointer.
-///
-/// # Safety
-///
-/// `header` must reference a from-space object.
-unsafe fn evacuate(ctx: &mut ScavCtx, header: *mut GcHeader) -> u32 {
-    // SAFETY: header is a from-space object per caller. Every
-    // dereference goes through raw pointers so no shared
-    // reference outlives a write through the same allocation.
-    unsafe {
-        if (*header).is_forwarded() {
-            return GcHeader::read_forwarding_offset(header);
+            (*table).trace_ephemerons(header, &mut visitor);
         }
-        let size = (*header).size_bytes() as usize;
-        let aligned = align_up(size, CELL_SIZE);
-        // A young object reached from a remembered old parent promotes
-        // immediately: leaving it young re-remembers the parent, and the
-        // parent is then re-traced in full on EVERY scavenge until the
-        // child ages out — for a large promoted graph that made each
-        // scavenge O(old heap) and the run quadratic (the earley-boyer
-        // benchmark spent 20+ minutes inside the scavenger). An object an old
-        // object points at is long-lived with overwhelming likelihood
-        // anyway, so this is the standard generational answer.
-        let promote = ctx.in_dirty_scan || {
-            let page_header = Page::header_of(header as *const u8);
-            let page_base = std::ptr::from_ref(page_header) as usize;
-            (header as usize) - page_base < page_header.age_mark
-        };
-
-        let (new_offset, promoted) = if promote {
-            (
-                ctx.old_space()
-                    .alloc(aligned)
-                    .expect("old-space alloc during scavenge"),
-                true,
-            )
-        } else {
-            match ctx.new_space().alloc_in_to(aligned) {
-                Some(off) => (off, false),
-                None => (
-                    ctx.old_space()
-                        .alloc(aligned)
-                        .expect("old-space alloc during scavenge fallback"),
-                    true,
-                ),
-            }
-        };
-
-        // Copy header + payload to the new location.
-        let dest_ptr = ctx.cage.add(new_offset as usize);
-        copy_cell(header as *const u8, dest_ptr, aligned);
-
-        // Promote / re-flag the destination header. A site-tagged cell is
-        // found once: its copy drops the tag.
-        let dest_header = dest_ptr as *mut GcHeader;
-        let site = (*header).allocation_site();
-        if site != 0 {
-            ctx.sites.as_mut().record_found(site);
-            GcHeader::set_allocation_site(dest_header, 0);
-        }
-        if promoted {
-            (*dest_header).promote_to_old();
-            ctx.stats.promoted_bytes += aligned;
-            ctx.promoted_unscanned.push(new_offset);
-        } else {
-            ctx.stats.copied_bytes += aligned;
-        }
-
-        // Install forwarding pointer at the original location.
-        GcHeader::write_forwarding_offset(header, new_offset);
-
-        new_offset
     }
 }
 
@@ -877,139 +1283,6 @@ unsafe fn copy_cell(src: *const u8, dst: *mut u8, bytes: usize) {
     }
 }
 
-/// Re-trace the remembered parents — the old/large objects the write
-/// barrier (and the prior scavenge's re-dirty path) recorded as holding an
-/// old→young edge. Each is a root for the young collection: re-tracing it
-/// reaches every young edge through the current body. Type-owned dirty ranges
-/// may skip clean old edges without retaining raw slot addresses.
-///
-/// This replaces the card-table dirty-page header walk. The parents are
-/// held directly (object-granular), so there is no O(objects/page)
-/// find-cost — `old_headers_walked` stays zero. The bit is
-/// cleared before re-tracing so a parent that still points young after
-/// evacuation is re-pushed by [`remember_parent`] and survives to the next
-/// scavenge (the object-granular analog of re-dirtying a card).
-///
-/// # Safety
-///
-/// STW pause + valid pages; `snapshot` holds in-cage old/large parent
-/// offsets recorded by the barrier since the last scavenge.
-unsafe fn scan_remembered_parents(ctx: &mut ScavCtx, snapshot: &[RawGc]) {
-    // SAFETY: per docstring.
-    unsafe {
-        ctx.in_dirty_scan = true;
-        // Clear the remembered bit on every snapshot parent up front so the
-        // re-dirty path during the trace below re-records (and re-sets the
-        // bit on) any parent that still holds an old→young edge.
-        for &parent in snapshot {
-            let header = ctx.cage.add(parent.0 as usize) as *mut GcHeader;
-            (*header).clear_remembered();
-        }
-        for &parent in snapshot {
-            ctx.stats.dirty_cards_scanned += 1; // remembered-set entries scanned
-            let header = ctx.cage.add(parent.0 as usize) as *mut GcHeader;
-            // Skip swept corpses: a full-GC sweep drops dead old/large
-            // objects in place (freeing their payload buffers, e.g. a string
-            // `Vec<u16>`) but leaves the header walkable. Tracing such a
-            // corpse would read its freed — and possibly reused — backing as
-            // live GC slots (use-after-free). A full GC also prunes dead
-            // parents from the buffer, so this is belt-and-suspenders.
-            if (*header).size_bytes() != 0 && !(*header).is_swept() {
-                ctx.stats.objects_retraced += 1;
-                trace_one(ctx, header, TraceKind::Remembered);
-            }
-        }
-        ctx.in_dirty_scan = false;
-    }
-}
-
-/// Cheney scan to convergence. Walks to-space pages and drains the
-/// promoted-object worklist, tracing every new object and evacuating any
-/// from-space children. Iterates until a pass neither advances a to-space
-/// bump cursor nor pops a promoted entry — that's when all reachable
-/// objects have been copied.
-///
-/// # Safety
-///
-/// STW pause + valid pages.
-unsafe fn cheney_scan(ctx: &mut ScavCtx) {
-    // Per-page scan cursors.
-    let to_count = ctx.new_space().to_pages().len();
-    let mut to_cursors: smallvec::SmallVec<[usize; 16]> =
-        std::iter::repeat_n(PAGE_HEADER_SIZE, to_count).collect();
-    // SAFETY: STW pause; raw page walk on owned spaces.
-    unsafe {
-        loop {
-            let mut progress = false;
-
-            // To-space scan.
-            for idx in 0..ctx.new_space().to_pages().len() {
-                let (base, limit) = {
-                    let page = &ctx.new_space().to_pages()[idx];
-                    (page.base_ptr(), page.header().bump_cursor)
-                };
-                let scan_from = if idx < to_cursors.len() {
-                    to_cursors[idx]
-                } else {
-                    PAGE_HEADER_SIZE
-                };
-                if scan_from >= limit {
-                    continue;
-                }
-                progress = true;
-                scan_range_raw(ctx, base, scan_from, limit);
-                if idx < to_cursors.len() {
-                    to_cursors[idx] = limit;
-                } else {
-                    to_cursors.push(limit);
-                }
-            }
-
-            // Promoted-object scan: drain the explicit worklist. Children
-            // of freshly-promoted objects promote too (same policy as the
-            // dirty re-trace): leaving them young would re-remember every
-            // promoted parent and re-trace it on all later scavenges — the
-            // transitive closure of an old graph must reach old space
-            // within THIS scavenge.
-            while let Some(offset) = ctx.promoted_unscanned.pop() {
-                progress = true;
-                let header_ptr = ctx.cage.add(offset as usize) as *mut GcHeader;
-                let was_dirty = ctx.in_dirty_scan;
-                ctx.in_dirty_scan = true;
-                trace_one(ctx, header_ptr, TraceKind::Full);
-                ctx.in_dirty_scan = was_dirty;
-            }
-
-            if !progress {
-                break;
-            }
-        }
-    }
-}
-
-/// Trace every header in `[from, to)` on the page rooted at
-/// `base`.
-///
-/// # Safety
-///
-/// `base` is a live page; the bytes between `from` and `to` are
-/// initialised GcHeaders with valid `size_bytes`.
-unsafe fn scan_range_raw(ctx: &mut ScavCtx, base: *mut u8, from: usize, to: usize) {
-    // SAFETY: per docstring.
-    unsafe {
-        let mut offset = from;
-        while offset < to {
-            let header_ptr = base.add(offset) as *mut GcHeader;
-            let size = (*header_ptr).size_bytes() as usize;
-            if size == 0 {
-                break;
-            }
-            trace_one(ctx, header_ptr, TraceKind::Full);
-            offset += align_up(size, CELL_SIZE);
-        }
-    }
-}
-
 /// Whether `header` lives on an old or large page.
 ///
 /// # Safety
@@ -1019,39 +1292,15 @@ unsafe fn scan_range_raw(ctx: &mut ScavCtx, base: *mut u8, from: usize, to: usiz
 unsafe fn is_old_body(header: *const GcHeader) -> bool {
     // SAFETY: per docstring, the page header precedes the object.
     matches!(
-        unsafe { Page::header_of(header.cast::<u8>()) }.space,
+        unsafe { Page::space_of(header.cast::<u8>()) },
         SpaceKind::Old | SpaceKind::Large
     )
 }
 
-/// Whether this body came from the old remembered set or the Cheney worklist.
+/// Whether a body came from the old remembered set or a worklist.
 enum TraceKind {
     Full,
     Remembered,
-}
-
-/// Trace one header — visitor evacuates any from-space child. The tracing
-/// scope is independent of the policy that promotes an old body's children:
-/// newly promoted bodies require full tracing even under that policy.
-///
-/// # Safety
-///
-/// `header` is a live, valid GcHeader.
-unsafe fn trace_one(ctx: &mut ScavCtx, header: *mut GcHeader, kind: TraceKind) {
-    // SAFETY: per docstring; trace table guaranteed to register
-    // the type tag.
-    unsafe {
-        let table_ptr = ctx.trace_table.as_ptr();
-        ctx.parent_old = is_old_body(header);
-        let ctx_ptr = ctx as *mut ScavCtx;
-        let mut visitor = move |slot: *mut RawGc| {
-            process_slot(&mut *ctx_ptr, slot, Some(header));
-        };
-        match kind {
-            TraceKind::Full => (*table_ptr).trace(header, &mut visitor),
-            TraceKind::Remembered => (*table_ptr).trace_remembered(header, &mut visitor),
-        }
-    }
 }
 
 #[cfg(test)]
@@ -1170,6 +1419,7 @@ mod tests {
                 &mut remembered,
                 &mut crate::host_refs::HostRefTable::default(),
                 &mut crate::pretenuring::AllocationSites::default(),
+                &mut crate::gc_threads::GcThreads::default(),
             )
         }
         .expect("promotion preflight");

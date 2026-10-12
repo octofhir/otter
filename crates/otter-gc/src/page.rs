@@ -437,6 +437,59 @@ impl Page {
         unsafe { &*(base as *const PageHeader) }
     }
 
+    /// The space owning the page that contains `ptr`, read without forming
+    /// a reference to its header: during a parallel scavenge another thread
+    /// may be bumping that page.
+    ///
+    /// # Safety
+    ///
+    /// `ptr` must point inside a live cage page.
+    #[inline]
+    pub unsafe fn space_of(ptr: *const u8) -> SpaceKind {
+        let base = Self::page_base_of(ptr).cast::<PageHeader>();
+        // SAFETY: caller guarantees a live page; `space` is written only
+        // outside a scavenge.
+        unsafe { std::ptr::addr_of!((*base).space).read() }
+    }
+
+    /// The young-generation age mark of the page that contains `ptr`.
+    ///
+    /// # Safety
+    ///
+    /// `ptr` must point inside a live from-space page during a scavenge.
+    #[inline]
+    pub unsafe fn age_mark_of(ptr: *const u8) -> usize {
+        let base = Self::page_base_of(ptr).cast::<PageHeader>();
+        // SAFETY: caller contract; from-space headers are not written during
+        // a scavenge.
+        unsafe { std::ptr::addr_of!((*base).age_mark).read() }
+    }
+
+    /// [`Self::bump_alloc`] on the page at `base` through raw field accesses,
+    /// for the one scavenger thread that owns the page while it copies.
+    ///
+    /// # Safety
+    ///
+    /// `base` must be a live page that no other thread allocates in.
+    #[inline]
+    pub unsafe fn bump_alloc_owned(base: *mut u8, size: usize) -> Option<u32> {
+        debug_assert!(size.is_multiple_of(CELL_SIZE), "size must be cell-aligned");
+        let header = base.cast::<PageHeader>();
+        // SAFETY: caller contract; only this thread writes these fields.
+        unsafe {
+            let cursor = std::ptr::addr_of!((*header).bump_cursor).read();
+            let span = std::ptr::addr_of!((*header).span_pages).read() as usize * PAGE_SIZE;
+            let new_cursor = cursor + size;
+            if new_cursor > span {
+                return None;
+            }
+            std::ptr::addr_of_mut!((*header).bump_cursor).write(new_cursor);
+            let allocated = std::ptr::addr_of_mut!((*header).allocated_bytes);
+            allocated.write(allocated.read() + size);
+            Some(std::ptr::addr_of!((*header).cage_offset).read() + cursor as u32)
+        }
+    }
+
     /// Return a mutable reference to the page header containing
     /// the given pointer.
     ///

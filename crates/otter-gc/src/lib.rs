@@ -2,7 +2,7 @@
 //! new-engine VM.
 //!
 //! Page-based heap with a 4 GiB pointer-compression cage, semispace
-//! young-gen scavenger (Cheney BFS), tri-color mark-sweep old-gen,
+//! young-gen scavenger (parallel copying), tri-color mark-sweep old-gen,
 //! generational + Dijkstra-insertion write barriers, type-tag
 //! function-pointer trace dispatch, RAII handle scopes, Chrome
 //! DevTools `.heapsnapshot` export.
@@ -16,7 +16,8 @@
 //! - [`trace`] — `TraceTable`, `Traceable` trait.
 //! - [`store`] — safe write-barrier child enumeration for VM stores.
 //! - [`marking`] — tri-color worklist.
-//! - [`scavenger`] — Cheney BFS scavenger.
+//! - [`scavenger`] — parallel copying young-generation scavenger.
+//! - `gc_threads` — the heap's collection helper threads.
 //! - [`barrier`] — write barriers.
 //! - [`handle`] — `Local`, `HandleScope`, and internal persistent
 //!   roots.
@@ -76,6 +77,8 @@ pub mod extra_roots;
 #[doc(hidden)]
 pub mod finalize;
 pub mod frame_roots;
+#[doc(hidden)]
+pub mod gc_threads;
 pub mod handle;
 pub mod header;
 pub mod heap;

@@ -369,6 +369,24 @@ impl Known {
         });
     }
 
+    /// Forget the shape proofs that name any shape in `left`, which a
+    /// published transition took an object out of: a node proved to have
+    /// another shape names another object.
+    fn forget_shapes_from(&mut self, left: &[u32]) {
+        for layout in self.layouts.values_mut() {
+            if layout
+                .shapes
+                .as_ref()
+                .is_some_and(|shapes| shapes.iter().any(|shape| left.contains(shape)))
+            {
+                layout.shapes = None;
+                layout.writable = false;
+            }
+        }
+        self.stale_shapes
+            .retain(|_, shapes| !shapes.iter().any(|shape| left.contains(shape)));
+    }
+
     /// Forget every known value at `offset`: a store through any node may
     /// write it.
     fn forget_field_offset(&mut self, property: bool, offset: i32) {
@@ -1216,6 +1234,19 @@ impl<'a> Builder<'a> {
 
     /// Whether `value` is an ECMAScript Object along this path, when the
     /// graph proves it either way.
+    /// Whether `value` is proved an ordinary object, whose cell kind no
+    /// write changes.
+    fn is_ordinary_object(&self, value: NodeId) -> bool {
+        self.known
+            .get(value)
+            .is_some_and(|info| info.ordinary_object)
+            || self
+                .known
+                .layout(value)
+                .is_some_and(|layout| layout.shapes.is_some())
+            || self.known.stale_shapes.contains_key(&value)
+    }
+
     fn is_object(&self, value: NodeId) -> Option<bool> {
         if self.known.get(value).is_some_and(|info| info.heap_object) {
             return Some(true);
@@ -2697,10 +2728,40 @@ impl<'a> Builder<'a> {
         let Flow::Branch { target } = instruction.flow else {
             unreachable!("a conditional jump has a target");
         };
-        let value = self.read(instruction.reads[0]);
-        let value = self.tagged(value);
+        let raw = self.read(instruction.reads[0]);
         let taken = self.analysis.block_of[target as usize];
         let fallthrough = self.analysis.block_of[self.pc as usize + 1];
+        // An ordinary object is truthy, and a Number already unboxed tests
+        // its value.
+        if let Some((if_truthy, if_falsy)) = match instruction.op {
+            Op::JumpIfTrue => Some((taken, fallthrough)),
+            Op::JumpIfFalse => Some((fallthrough, taken)),
+            _ => None,
+        } && !self.graph.node(raw).kind.is_constant()
+        {
+            if self.is_ordinary_object(raw) {
+                self.goto(if_truthy);
+                return;
+            }
+            let info = self.known.get(raw).copied().unwrap_or_default();
+            let int32 = (self.graph.node(raw).repr == Repr::Int32)
+                .then_some(raw)
+                .or(info.int32);
+            let float64 = (self.graph.node(raw).repr == Repr::Float64)
+                .then_some(raw)
+                .or(info.float64);
+            if let Some(value) = int32 {
+                let zero = self.constant_int32(0);
+                let kind = BranchKind::Int32(Condition::NotEqual);
+                self.branch(kind, &[value, zero], if_truthy, if_falsy);
+                return;
+            }
+            if let Some(value) = float64 {
+                self.branch(BranchKind::Float64Truthy, &[value], if_truthy, if_falsy);
+                return;
+            }
+        }
+        let value = self.tagged(raw);
         // A condition known while building selects its edge now; the other
         // successor gets no incoming edge from here.
         if let Some(jumps) = self.constant_condition(instruction.op, value) {
@@ -2939,39 +3000,66 @@ impl<'a> Builder<'a> {
             let object = self.property_storage(object, projection);
             let value = self.read(instruction.reads[1]);
             let value = self.tagged(value);
+            let receiver_operand =
+                if projection == otter_vm::jit::PropertyStorageProjection::ArrayExpando {
+                    1
+                } else {
+                    0
+                };
+            let guarded = |program: &otter_vm::jit::JitCacheIrProgram| {
+                program.ops.iter().find_map(|op| match *op {
+                    Op::GuardShape {
+                        object: operand,
+                        shape,
+                    } if operand == receiver_operand => Some(shape),
+                    _ => None,
+                })
+            };
+            // A receiver proved to have one shape runs only the programs
+            // that guard it.
+            let receiver_shape = match self.known_shapes(object).as_deref() {
+                Some(&[shape])
+                    if receiver_operand == 0
+                        && programs
+                            .iter()
+                            .any(|program| guarded(program) == Some(shape)) =>
+                {
+                    Some(shape)
+                }
+                _ => None,
+            };
             self.add(
-                Kind::StoreNamedProperty { byte_pc, owners },
+                Kind::StoreNamedProperty {
+                    byte_pc,
+                    owners,
+                    receiver_shape,
+                },
                 &[object, value],
                 Repr::None,
             );
             self.write_barrier(object, value);
             // The receiver now has the shape each matching program leaves it
-            // with; a published transition may leave any other node's shape
-            // fact describing the old shape.
+            // with; a published transition changes the shape of an object of
+            // its old shape, which any node proved to have that shape may name.
             let mut shapes: SmallVec<[u32; 4]> = SmallVec::new();
             let mut offsets: SmallVec<[i32; 4]> = SmallVec::new();
-            let mut transition = false;
+            let mut left: SmallVec<[u32; 4]> = SmallVec::new();
             for program in programs {
-                let mut shape = None;
+                let from = guarded(program);
+                if receiver_shape.is_some() && from != receiver_shape {
+                    continue;
+                }
+                let mut shape = from;
                 for op in program.ops.iter() {
                     match *op {
-                        Op::GuardShape {
-                            object: operand,
-                            shape: guarded,
-                        } if operand
-                            == if projection
-                                == otter_vm::jit::PropertyStorageProjection::ArrayExpando
-                            {
-                                1
-                            } else {
-                                0
-                            } =>
-                        {
-                            shape = Some(guarded)
-                        }
                         Op::PublishShape { shape: child, .. } => {
                             shape = Some(child);
-                            transition = true;
+                            match from {
+                                Some(from) if !left.contains(&from) => left.push(from),
+                                Some(_) => {}
+                                // An unguarded transition may leave any shape.
+                                None => left.push(u32::MAX),
+                            }
                         }
                         Op::StoreField { field, .. } => {
                             offsets.push(field.cache_key() as i32);
@@ -2985,9 +3073,11 @@ impl<'a> Builder<'a> {
                     shapes.push(shape);
                 }
             }
-            if transition {
+            if left.contains(&u32::MAX) {
                 let root = self.root;
                 self.known.forget_shapes(&root.stable_shapes);
+            } else if !left.is_empty() {
+                self.known.forget_shapes_from(&left);
             }
             for &offset in &offsets {
                 self.known.forget_field_offset(true, offset);

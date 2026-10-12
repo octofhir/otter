@@ -1779,13 +1779,17 @@ impl<'a> Codegen<'a> {
                 let [holder, scratch] = [allocation.gp_temps[0], allocation.gp_temps[1]];
                 self.emit_load_named_property(node, receiver, [holder, scratch], destination)?;
             }
-            Kind::StoreNamedProperty { byte_pc, owners } => {
+            Kind::StoreNamedProperty {
+                byte_pc,
+                owners,
+                receiver_shape,
+            } => {
                 let (receiver, value) = (Self::gp(input(0)), Self::gp(input(1)));
                 let [holder, scratch] = [allocation.gp_temps[0], allocation.gp_temps[1]];
-                let (byte_pc, owners) = (*byte_pc, owners.clone());
+                let (byte_pc, owners, receiver_shape) = (*byte_pc, owners.clone(), *receiver_shape);
                 self.emit_store_named_property(
                     node,
-                    byte_pc,
+                    (byte_pc, receiver_shape),
                     &owners,
                     [receiver, value],
                     [holder, scratch],
@@ -2535,7 +2539,7 @@ impl<'a> Codegen<'a> {
     fn emit_store_named_property(
         &mut self,
         node: NodeId,
-        byte_pc: u32,
+        (byte_pc, receiver_shape): (u32, Option<u32>),
         owners: &[FieldStoreOwner],
         [receiver, value]: [u8; 2],
         [holder, scratch]: [u8; 2],
@@ -2551,9 +2555,12 @@ impl<'a> Codegen<'a> {
         let done = self.ops.new_dynamic_label();
         let view = self.view;
         // Each successful ordinary program proves its exact finalized shape
-        // before its field/effect. Prototype-role writes require the canonical
-        // invalidation owner and cannot commit this direct store.
-        self.emit_object_receiver(receiver, exit);
+        // before its field/effect, unless the receiver is already proved to
+        // have it. Prototype-role writes require the canonical invalidation
+        // owner and cannot commit this direct store.
+        if receiver_shape.is_none() {
+            self.emit_object_receiver(receiver, exit);
+        }
         self.emit_shape_state(receiver);
         dynasm!(self.ops ; .arch aarch64
             ; tst w16, u32::from(ShapeState::PROTOTYPE_MASK)
@@ -2562,6 +2569,14 @@ impl<'a> Codegen<'a> {
             return Err(Unsupported::OperandShape("graph named store owner records"));
         }
         for (program, authority) in programs.iter().zip(owners) {
+            // A proved receiver matches only the programs that guard its shape.
+            let receiver_guard = program.ops.iter().find_map(|op| match *op {
+                Op::GuardShape { object: 0, shape } => Some(shape),
+                _ => None,
+            });
+            if receiver_shape.is_some() && receiver_guard != receiver_shape {
+                continue;
+            }
             let expando = matches!(
                 program.ops.first(),
                 Some(Op::LoadArrayExpando {
@@ -2606,6 +2621,9 @@ impl<'a> Codegen<'a> {
                         object: operand,
                         shape,
                     } => {
+                        if operand == 0 && receiver_shape == Some(shape) {
+                            continue;
+                        }
                         let header = object(operand);
                         // The central baker validated this immutable shape's
                         // ordinary finalized state before publishing the program.
@@ -4725,6 +4743,18 @@ impl<'a> Codegen<'a> {
                         );
                         dynasm!(self.ops ; .arch aarch64 ; fcmp D(a), D(b));
                         self.emit_branch_condition(condition, true, true_target);
+                    }
+                    BranchKind::Float64Truthy => {
+                        // Zero compares equal and NaN unordered: both falsy.
+                        let a = Self::fp(allocation.inputs[0]);
+                        let false_target = self.cond_target(false_label);
+                        dynasm!(self.ops
+                            ; .arch aarch64
+                            ; fcmp D(a), 0.0
+                            ; b.eq =>false_target
+                            ; b.vs =>false_target
+                            ; b =>true_label
+                        );
                     }
                     BranchKind::TaggedEqual => {
                         let (a, b) = (

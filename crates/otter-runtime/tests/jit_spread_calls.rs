@@ -68,6 +68,7 @@ matrix(180);
 
 fn run(selection: JitSelection) -> (String, u64, u64) {
     let mut runtime = Runtime::builder()
+        .jit_compile_threads(0)
         .jit_selection(selection)
         .build()
         .expect("runtime");
@@ -117,6 +118,7 @@ String(stackOwnedCaller(5000));
 
 fn run_stack_owned_array_spread() -> (String, RuntimeExecutionStats, Vec<JitDebugEvent>) {
     let mut runtime = Runtime::builder()
+        .jit_compile_threads(0)
         .jit_selection(JitSelection::ProductionTiered)
         .jit_debug(JitDebugRequest::events())
         .build()
@@ -189,6 +191,7 @@ JSON.stringify([observableSpread(observableTarget, observableArgs), iteratorEffe
 #[test]
 fn custom_array_iterator_bails_before_observable_effects() {
     let mut oracle = Runtime::builder()
+        .jit_compile_threads(0)
         .jit_selection(JitSelection::InterpreterOnly)
         .build()
         .expect("iterator oracle runtime");
@@ -202,6 +205,7 @@ fn custom_array_iterator_bails_before_observable_effects() {
         .to_owned();
 
     let mut runtime = Runtime::builder()
+        .jit_compile_threads(0)
         .jit_selection(JitSelection::ProductionTiered)
         .build()
         .expect("observable iterator runtime");
@@ -239,6 +243,7 @@ String(count(200000, 0));
 
 fn run_deep_tail(selection: JitSelection) -> String {
     let mut runtime = Runtime::builder()
+        .jit_compile_threads(0)
         .jit_selection(selection)
         .build()
         .expect("runtime");

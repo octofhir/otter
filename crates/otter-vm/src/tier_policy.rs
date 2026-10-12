@@ -98,6 +98,7 @@ impl TierWorkDecision {
     pub(crate) const fn should_compile(self) -> bool {
         matches!(self.reason, TierWorkReason::Affordable)
     }
+    #[cfg(test)]
     pub(crate) const fn resource_blocked(self) -> bool {
         matches!(self.reason, TierWorkReason::CodeMemoryBudget)
     }
@@ -314,6 +315,7 @@ impl TierPolicy {
             state.refused_code_bytes[tier.index()].max(retained_bytes);
     }
 
+    #[cfg(test)]
     pub(crate) fn compile_attempts(&self, fid: u32, tier: CostedTier) -> u64 {
         self.functions
             .get(&fid)

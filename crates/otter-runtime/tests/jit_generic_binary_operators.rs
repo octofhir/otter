@@ -31,6 +31,7 @@ struct Run {
 
 fn run(source: &str, selection: JitSelection) -> Run {
     let mut runtime = Runtime::builder()
+        .jit_compile_threads(0)
         .jit_selection(selection)
         .jit_debug(JitDebugRequest::events())
         .build()

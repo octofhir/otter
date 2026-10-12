@@ -24,6 +24,7 @@ fn rejecting_budget(max_work_units: u64) -> WorkBudget {
 #[test]
 fn a_configured_budget_is_in_force_before_the_first_turn() {
     let mut rt = Runtime::builder()
+        .jit_compile_threads(0)
         .work_budget(rejecting_budget(1))
         .build()
         .expect("bootstrap is host work and is not metered against the policy");
@@ -50,6 +51,7 @@ fn a_configured_budget_is_in_force_before_the_first_turn() {
 #[test]
 fn bootstrap_work_is_not_charged_to_the_first_turn() {
     let rt = Runtime::builder()
+        .jit_compile_threads(0)
         .work_budget(WorkBudget {
             max_work_units_per_turn: Some(1),
             ..WorkBudget::default()
@@ -74,6 +76,7 @@ fn one_report_carries_the_cpu_counters_and_the_resource_ledger() {
             .build(),
     );
     let mut rt = Runtime::builder()
+        .jit_compile_threads(0)
         .resource_account(account)
         .build()
         .expect("runtime");
@@ -101,7 +104,10 @@ fn one_report_carries_the_cpu_counters_and_the_resource_ledger() {
 
 #[test]
 fn regexp_backtracking_is_charged_to_the_shared_work_ledger() {
-    let mut rt = Runtime::builder().build().expect("runtime");
+    let mut rt = Runtime::builder()
+        .jit_compile_threads(0)
+        .build()
+        .expect("runtime");
     rt.run_script(
         SourceInput::from_javascript(r#"/(a+)+$/.test("aaaaaaaaaaaaaaaa!");"#),
         "<regexp-budget-accounting>",
@@ -117,6 +123,7 @@ fn regexp_backtracking_is_charged_to_the_shared_work_ledger() {
 fn regexp_work_budget_surfaces_the_runtime_resource_error() {
     // A search runs to its answer unless a configured work budget ends it.
     let mut rt = Runtime::builder()
+        .jit_compile_threads(0)
         .work_budget(WorkBudget {
             on_exceeded: WorkBudgetExceededAction::Reject,
             max_work_units_per_turn: Some(2_000_000),
@@ -154,6 +161,7 @@ fn cooperative_yields_preserve_results_in_every_tier() {
         JitSelection::ProductionTiered,
     ] {
         let mut rt = Runtime::builder()
+            .jit_compile_threads(0)
             .jit_selection(selection)
             .work_budget(WorkBudget {
                 on_exceeded: WorkBudgetExceededAction::Yield,
@@ -185,6 +193,7 @@ fn cooperative_yields_preserve_results_in_every_tier() {
 #[test]
 fn yielding_microtask_chain_keeps_generation_order() {
     let mut rt = Runtime::builder()
+        .jit_compile_threads(0)
         .work_budget(WorkBudget {
             on_exceeded: WorkBudgetExceededAction::Yield,
             max_work_units_per_turn: Some(4),
@@ -221,6 +230,7 @@ fn yielding_microtask_chain_keeps_generation_order() {
 #[test]
 fn regexp_and_gc_charge_the_same_work_counter() {
     let mut rt = Runtime::builder()
+        .jit_compile_threads(0)
         .max_heap_bytes(16 * 1024 * 1024)
         .work_budget(WorkBudget {
             on_exceeded: WorkBudgetExceededAction::Yield,
@@ -256,7 +266,10 @@ fn regexp_and_gc_charge_the_same_work_counter() {
 
 #[test]
 fn telemetry_outlives_a_borrow_of_the_runtime() {
-    let mut rt = Runtime::builder().build().expect("runtime");
+    let mut rt = Runtime::builder()
+        .jit_compile_threads(0)
+        .build()
+        .expect("runtime");
     let telemetry = rt.budget_telemetry();
     assert_eq!(telemetry.snapshot().turns_finished, 0);
 
@@ -274,6 +287,7 @@ fn telemetry_outlives_a_borrow_of_the_runtime() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_handle_reports_its_isolate_budget_without_a_command() {
     let otter = Otter::builder()
+        .jit_compile_threads(0)
         .jit_selection(JitSelection::InterpreterOnly)
         .work_budget(WorkBudget {
             max_work_units_per_turn: Some(4),

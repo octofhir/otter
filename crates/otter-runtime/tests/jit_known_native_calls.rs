@@ -195,6 +195,7 @@ impl Fixture {
         let records = Arc::new(Mutex::new(Vec::new()));
         let trace = Arc::new(Mutex::new(Trace::default()));
         let mut builder = Runtime::builder()
+            .jit_compile_threads(0)
             .jit_selection(selection)
             .jit_debug(JitDebugRequest::artifacts().with_events(true))
             .extension_installer(installer(collect.clone(), records.clone(), cap.is_some()));

@@ -38,6 +38,7 @@ for (let warm = 0; warm < 10000; warm++) {
 
 fn probe(extra_realm: bool) {
     let mut runtime = Runtime::builder()
+        .jit_compile_threads(0)
         .jit_selection(JitSelection::ProductionTiered)
         .jit_debug(JitDebugRequest::artifacts().with_events(true))
         .build()

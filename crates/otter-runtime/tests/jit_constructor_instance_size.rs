@@ -40,6 +40,7 @@ drive(6000);
 
 fn run(selection: JitSelection) -> (String, RuntimeExecutionStats) {
     let mut runtime = Runtime::builder()
+        .jit_compile_threads(0)
         .jit_selection(selection)
         .build()
         .expect("runtime");
@@ -74,6 +75,7 @@ fn receivers_are_reserved_for_the_fields_a_callee_adds() {
 fn learned_capacity_survives_collection_after_samples_are_discarded() {
     for selection in [JitSelection::Template, JitSelection::ProductionTiered] {
         let mut runtime = Runtime::builder()
+            .jit_compile_threads(0)
             .jit_selection(selection)
             .build()
             .expect("profile runtime");
@@ -107,6 +109,7 @@ fn sibling_constructor_profiles_preserve_live_instances() {
         JitSelection::ProductionTiered,
     ] {
         let mut runtime = Runtime::builder()
+            .jit_compile_threads(0)
             .jit_selection(selection)
             .build()
             .expect("runtime");
@@ -146,6 +149,7 @@ undefined;
 "#
             );
             let mut runtime = Runtime::builder()
+                .jit_compile_threads(0)
                 .jit_selection(selection)
                 .build()
                 .expect("profile runtime");

@@ -285,6 +285,7 @@ for (let i = 0; i < 5000; i++) persistentMoveFields(persistentChildren);
         let frames = Arc::new(Mutex::new(CollectionFrames::default()));
         let trace = Arc::new(Mutex::new(Trace::default()));
         let mut runtime = Runtime::builder()
+            .jit_compile_threads(0)
             .jit_selection(selection)
             .jit_debug(JitDebugRequest::artifacts().with_events(true))
             .extension_installer(RuntimeExtensionInstaller::new({
@@ -432,6 +433,7 @@ for (let i = 0; i < 5000; i++) persistentMoveFields(persistentChildren);
             "actual native suffix field"
         );
         let mut oracle = Runtime::builder()
+            .jit_compile_threads(0)
             .jit_selection(JitSelection::InterpreterOnly)
             .extension_installer(RuntimeExtensionInstaller::new(|realm| {
                 realm.install_native_global_call(
@@ -618,6 +620,7 @@ fn native_fields_keep_bank_identity_after_suffix_growth() {
     for selection in selections {
         let trace = Arc::new(Mutex::new(Trace::default()));
         let mut runtime = Runtime::builder()
+            .jit_compile_threads(0)
             .jit_selection(selection)
             .jit_debug(JitDebugRequest::events())
             .build()
@@ -683,6 +686,7 @@ fn native_fields_keep_bank_identity_after_suffix_growth() {
             "native suffix p4 proof"
         );
         let mut oracle = Runtime::builder()
+            .jit_compile_threads(0)
             .jit_selection(JitSelection::InterpreterOnly)
             .build()
             .unwrap();

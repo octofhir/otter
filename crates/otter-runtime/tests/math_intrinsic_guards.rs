@@ -120,6 +120,7 @@ JSON.stringify([beforeReplacement, afterReplacement]);
 
 fn run_int32_math(selection: JitSelection) -> (String, u64) {
     let mut runtime = Runtime::builder()
+        .jit_compile_threads(0)
         .jit_selection(selection)
         .build()
         .expect("runtime");
@@ -221,6 +222,7 @@ fn math_completion(runtime: &mut Runtime, source: &str, module: &str) -> String 
 #[test]
 fn guarded_math_method_hits_stay_in_optimized_code() {
     let mut runtime = Runtime::builder()
+        .jit_compile_threads(0)
         .jit_selection(JitSelection::ProductionTiered)
         .jit_debug(JitDebugRequest::artifacts().with_events(true))
         .build()
@@ -261,6 +263,7 @@ fn guarded_math_method_hits_stay_in_optimized_code() {
 
 fn warmed_math_runtime(selection: JitSelection) -> Runtime {
     let mut runtime = Runtime::builder()
+        .jit_compile_threads(0)
         .jit_selection(selection)
         .jit_debug(JitDebugRequest::artifacts().with_events(true))
         .build()
@@ -502,6 +505,7 @@ fn guarded_math_method_mapped_arguments_observe_current_parameter() {
         JitSelection::ProductionTiered,
     ] {
         let mut runtime = Runtime::builder()
+            .jit_compile_threads(0)
             .jit_selection(selection)
             .jit_debug(JitDebugRequest::artifacts().with_events(true))
             .build()
@@ -568,6 +572,7 @@ fn math_argument_coercion_roots_pending_objects_and_returned_strings() {
         JitSelection::ProductionTiered,
     ] {
         let mut runtime = Runtime::builder()
+            .jit_compile_threads(0)
             .jit_selection(selection)
             .build()
             .expect("Math coercion rooting runtime");
@@ -610,6 +615,7 @@ fn math_argument_coercion_preserves_error_order_and_ignores_extra_operands() {
         JitSelection::ProductionTiered,
     ] {
         let mut runtime = Runtime::builder()
+            .jit_compile_threads(0)
             .jit_selection(selection)
             .build()
             .expect("Math coercion ordering runtime");

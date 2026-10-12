@@ -214,6 +214,7 @@ fn own_compiled_property_helper_keeps_zero_rust_origin_through_collecting_getter
     ] {
         let records = Arc::new(Mutex::new(Vec::new()));
         let mut runtime = Runtime::builder()
+            .jit_compile_threads(0)
             .jit_selection(selection)
             .jit_debug(JitDebugRequest::artifacts().with_events(true))
             .extension_installer(installer(records.clone()))

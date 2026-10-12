@@ -618,6 +618,7 @@ impl Harness {
         };
         let trace = Arc::new(Mutex::new(TraceLog::default()));
         let mut builder = Runtime::builder()
+            .jit_compile_threads(0)
             .jit_selection(selection)
             .jit_debug(JitDebugRequest::artifacts().with_events(true));
         if let Some(installer) = installer.clone() {
@@ -625,7 +626,9 @@ impl Harness {
         }
         let mut runtime = builder.build().unwrap();
         runtime.set_tracer(Some(Box::new(Trace(trace.clone()))));
-        let mut oracle_builder = Runtime::builder().jit_selection(JitSelection::InterpreterOnly);
+        let mut oracle_builder = Runtime::builder()
+            .jit_compile_threads(0)
+            .jit_selection(JitSelection::InterpreterOnly);
         if let Some(installer) = installer {
             oracle_builder = oracle_builder.extension_installer(installer);
         }
@@ -1047,6 +1050,7 @@ function globalAccessorLoop(rounds) {
 globalAccessorLoop(4096);
 "#;
     let mut oracle = Runtime::builder()
+        .jit_compile_threads(0)
         .jit_selection(JitSelection::InterpreterOnly)
         .build()
         .unwrap();
@@ -1054,6 +1058,7 @@ globalAccessorLoop(4096);
         .run_script(SourceInput::from_javascript(source), MODULE)
         .unwrap();
     let mut runtime = Runtime::builder()
+        .jit_compile_threads(0)
         .jit_selection(JitSelection::Template)
         .jit_debug(JitDebugRequest::artifacts())
         .build()

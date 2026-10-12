@@ -360,7 +360,9 @@ impl Interpreter {
     /// OSR. Baseline code cannot enter an optimized body mid-loop itself, so a
     /// hot header leaves to the interpreter, whose next back-edge at that
     /// header crosses the same threshold and enters the optimized OSR entry.
-    /// This is the baseline tier's OSR urgency check at `JumpLoop`.
+    /// This is the baseline tier's OSR urgency check at `JumpLoop`. An
+    /// installed optimized body that enters this header takes the loop over
+    /// at once; while a compilation is in flight the loop stays in baseline.
     pub(crate) fn baseline_backedges_reach_osr(
         &mut self,
         context: &ExecutionContext,
@@ -368,6 +370,7 @@ impl Interpreter {
         header_pc: u32,
         _batch: u64,
     ) -> bool {
+        self.install_finished_optimized_compiles();
         let key = (fid, header_pc);
         if self.jit_retraining_blocks(fid)
             || self.jit_osr_disabled.contains(&key)
@@ -376,8 +379,20 @@ impl Interpreter {
                 .jit_hook
                 .as_ref()
                 .is_some_and(|hook| hook.optimizing_tier_enabled())
-            || matches!(self.jit_optimized_code.get(&fid), Some(None))
         {
+            return false;
+        }
+        match self.jit_optimized_code.get(&fid) {
+            Some(None) => return false,
+            Some(Some(code))
+                if code.enters_optimized_osr_header(header_pc)
+                    && self.jit_code_registry.is_current_for_entry(code.as_ref()) =>
+            {
+                return true;
+            }
+            _ => {}
+        }
+        if self.jit_compile_queue.is_pending(fid) {
             return false;
         }
         // Native source segments were charged before the poll. Fuel and
@@ -763,6 +778,7 @@ impl Interpreter {
         self.jit_optimized_declined_epoch
             .insert(fid, self.code_space.feedback_epoch(fid));
         self.jit_optimized_code_cache = None;
+        self.jit_compile_queue.invalidate(&[fid]);
         let dependents: Vec<u32> = dependents
             .into_iter()
             .filter(|&dependent| dependent != fid)
@@ -775,11 +791,13 @@ impl Interpreter {
     /// Hotness and lifetime exit evidence survive; a deopt replacement still
     /// waits for the tier policy's independent interpreted retraining boundary.
     /// Another tier can remain installed for the same function; the registry
-    /// alone decides whether that exact map owner stays current.
+    /// alone decides whether that exact map owner stays current. A compilation
+    /// of an affected function still in flight is dropped when it finishes.
     pub(crate) fn discard_invalidated_jit_state(&mut self, affected: &[u32]) {
         if affected.is_empty() {
             return;
         }
+        self.jit_compile_queue.invalidate(affected);
         let mut retired_template_fids = rustc_hash::FxHashSet::default();
         for &fid in affected {
             let template_current = self
@@ -866,7 +884,10 @@ impl Interpreter {
             return;
         };
         let _ = self.resolve_optimized_code_for_fid(&owner, fid);
+        // A compilation in flight publishes its body through the same cell;
+        // until then this generation stops asking.
         if self.jit_optimized_code.contains_key(&fid)
+            || self.jit_compile_queue.is_pending(fid)
             || !self
                 .jit_hook
                 .as_ref()
@@ -894,6 +915,7 @@ impl Interpreter {
         context: &ExecutionContext,
         fid: u32,
     ) -> Option<std::sync::Arc<dyn jit::JitFunctionCode>> {
+        self.install_finished_optimized_compiles();
         if self.jit_retraining_blocks(fid)
             || !self
                 .jit_hook
@@ -911,6 +933,9 @@ impl Interpreter {
         let code = if let Some(slot) = self.jit_optimized_code.get(&fid) {
             slot.clone()
         } else {
+            if self.jit_compile_queue.is_pending(fid) {
+                return None;
+            }
             let function = context.exec_function(fid)?;
             let available_code_bytes = self.jit_code_registry.available_code_bytes();
             if self.optimizing_tier_decision_for(function, available_code_bytes)
@@ -918,27 +943,7 @@ impl Interpreter {
             {
                 return None;
             }
-            let prior_attempts = self
-                .optimizing_tier_policy
-                .compile_attempts(fid, crate::tier_policy::CostedTier::Optimizing);
-            let compiled = self.compile_optimized_jit_function(context, fid, None);
-            let attempted = self
-                .optimizing_tier_policy
-                .compile_attempts(fid, crate::tier_policy::CostedTier::Optimizing)
-                > prior_attempts;
-            let resource_blocked = self
-                .optimizing_tier_policy
-                .decide(
-                    function,
-                    crate::tier_policy::CostedTier::Optimizing,
-                    self.jit_code_registry.available_code_bytes(),
-                )
-                .resource_blocked();
-            if compiled.is_some() || (attempted && !resource_blocked) {
-                self.jit_optimized_code.insert(fid, compiled.clone());
-            }
-            self.jit_optimized_code_cache = None;
-            compiled
+            self.compile_optimized_jit_function(context, fid, None)
         };
         let code = code.filter(|code| self.jit_code_registry.is_current_for_entry(code.as_ref()));
         if let Some(code) = &code {
@@ -1723,6 +1728,60 @@ mod tests {
                 .is_some()
         );
         assert_eq!(hook.requests.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn compiler_thread_result_installs_at_a_tier_decision_unless_invalidated() {
+        let (context, headers) = multi_loop_context(1);
+        for invalidate in [false, true] {
+            let mut vm = Interpreter::new().expect("fixture interpreter bootstrap");
+            vm.set_jit_compiler_threads(1);
+            let hook = Arc::new(SingleHeaderOptimizingHook {
+                requests: AtomicUsize::new(0),
+                decline_replacement: false,
+            });
+            vm.jit_hook = Some(hook.clone());
+            fund_compile_work(
+                &mut vm,
+                &context,
+                0,
+                crate::tier_policy::CostedTier::Optimizing,
+            );
+            assert!(
+                vm.resolve_optimized_osr_code(&context, 0, headers[0])
+                    .is_none(),
+                "the compiler thread owns the request"
+            );
+            assert!(vm.jit_compile_queue.is_pending(0));
+            assert!(
+                vm.resolve_optimized_osr_code(&context, 0, headers[0])
+                    .is_none(),
+                "one compilation in flight per function"
+            );
+            if invalidate {
+                vm.discard_invalidated_jit_state(&[0]);
+            }
+            while !vm.jit_compile_queue.has_finished() {
+                std::thread::yield_now();
+            }
+            vm.install_finished_optimized_compiles();
+            assert!(!vm.jit_compile_queue.is_pending(0));
+            assert_eq!(hook.requests.load(Ordering::Relaxed), 1);
+            if invalidate {
+                assert!(
+                    !vm.jit_optimized_code.contains_key(&0),
+                    "code compiled from an invalidated snapshot is dropped"
+                );
+                assert!(!vm.jit_optimized_declined_epoch.contains_key(&0));
+            } else {
+                let code = vm.jit_optimized_code[&0].clone().unwrap();
+                assert!(vm.jit_code_registry.is_current_for_entry(code.as_ref()));
+                let entered = vm
+                    .resolve_optimized_osr_code(&context, 0, headers[0])
+                    .unwrap();
+                assert!(Arc::ptr_eq(&entered, &code));
+            }
+        }
     }
 
     #[test]

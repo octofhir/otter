@@ -232,6 +232,9 @@ impl Interpreter {
             .record_work(self.jit_backedge_fuel_window);
         self.interrupt.arm_fuel(Self::JIT_BACKEDGE_POLL_BATCH);
         self.jit_backedge_fuel_window = Self::JIT_BACKEDGE_POLL_BATCH;
+        // Optimized bodies the compiler threads finished are installed at the
+        // isolate's loop polls and tier decisions.
+        self.install_finished_optimized_compiles();
         let checkpoint = self.poll_work_budget_checkpoint()?;
         if checkpoint == WorkBudgetCheckpoint::Yield {
             self.rotate_work_budget_slice();

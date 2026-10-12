@@ -62,6 +62,7 @@ struct Run {
 
 fn run(selection: JitSelection) -> Run {
     let mut runtime = Runtime::builder()
+        .jit_compile_threads(0)
         .jit_selection(selection)
         .jit_debug(JitDebugRequest::events())
         .build()
@@ -162,6 +163,7 @@ reads + "|" + result;
         JitSelection::ProductionTiered,
     ] {
         let mut runtime = Runtime::builder()
+            .jit_compile_threads(0)
             .jit_selection(selection)
             .build()
             .expect("runtime");
@@ -198,6 +200,7 @@ reads + "|" + calls + "|" + sum;
         JitSelection::ProductionTiered,
     ] {
         let mut runtime = Runtime::builder()
+            .jit_compile_threads(0)
             .jit_selection(selection)
             .build()
             .expect("runtime");
@@ -224,6 +227,7 @@ fn forwarded_arguments_read_live_mappings_and_materialized_objects() {
         JitSelection::ProductionTiered,
     ] {
         let mut runtime = Runtime::builder()
+            .jit_compile_threads(0)
             .jit_selection(selection)
             .build()
             .expect("runtime");
@@ -253,6 +257,7 @@ sum;
 "#;
     for selection in [JitSelection::Template, JitSelection::ProductionTiered] {
         let mut runtime = Runtime::builder()
+            .jit_compile_threads(0)
             .jit_selection(selection)
             .jit_debug(JitDebugRequest::events())
             .build()
@@ -308,6 +313,7 @@ fn native_forwarding_copies_full_live_windows_and_preserves_hot_throws() {
         JitSelection::ProductionTiered,
     ] {
         let mut runtime = Runtime::builder()
+            .jit_compile_threads(0)
             .jit_selection(selection)
             .build()
             .expect("runtime");
@@ -359,6 +365,7 @@ checksum;
 "#;
     for selection in [JitSelection::Template, JitSelection::ProductionTiered] {
         let mut runtime = Runtime::builder()
+            .jit_compile_threads(0)
             .jit_selection(selection)
             .build()
             .expect("runtime");
@@ -405,6 +412,7 @@ siblingSum;
 "#;
     for selection in [JitSelection::Template, JitSelection::ProductionTiered] {
         let mut runtime = Runtime::builder()
+            .jit_compile_threads(0)
             .jit_selection(selection)
             .build()
             .expect("runtime");
@@ -444,6 +452,7 @@ fn saturated_forwarding_preserves_live_arguments() {
         JitSelection::ProductionTiered,
     ] {
         let mut runtime = Runtime::builder()
+            .jit_compile_threads(0)
             .jit_selection(selection)
             .build()
             .expect("runtime");
@@ -471,6 +480,7 @@ nativeSum;
 "#;
     for selection in [JitSelection::Template, JitSelection::ProductionTiered] {
         let mut runtime = Runtime::builder()
+            .jit_compile_threads(0)
             .jit_selection(selection)
             .build()
             .expect("runtime");
@@ -502,6 +512,7 @@ nativeSum;
 #[test]
 fn optimizing_forwarding_keeps_saturated_native_hits_and_live_bindings() {
     let mut runtime = Runtime::builder()
+        .jit_compile_threads(0)
         .jit_selection(JitSelection::ProductionTiered)
         .jit_debug(JitDebugRequest::artifacts().with_events(true))
         .build()
@@ -602,6 +613,7 @@ JSON.stringify([customSum, customApplyCalls]);
 #[test]
 fn optimizing_forwarding_commits_native_and_cold_throws_into_optimized_caller() {
     let mut runtime = Runtime::builder()
+        .jit_compile_threads(0)
         .jit_selection(JitSelection::ProductionTiered)
         .jit_debug(JitDebugRequest::artifacts().with_events(true))
         .build()

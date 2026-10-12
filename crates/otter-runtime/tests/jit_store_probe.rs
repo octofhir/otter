@@ -26,6 +26,7 @@ fn runtime_store_probe_preserves_invalidations_and_exact_effects() {
         JitSelection::ProductionTiered,
     ] {
         let mut runtime = Runtime::builder()
+            .jit_compile_threads(0)
             .jit_selection(selection)
             .build()
             .expect("runtime");
@@ -49,6 +50,7 @@ fn property_handles_survive_nested_and_abrupt_reentry() {
         JitSelection::ProductionTiered,
     ] {
         let mut runtime = Runtime::builder()
+            .jit_compile_threads(0)
             .jit_selection(selection)
             .build()
             .expect("runtime");
@@ -71,6 +73,7 @@ fn store_diagnostics_count_paths_without_replaying_effects() {
 
     let source = include_str!("../../otter-difftest/corpus/property_handle_reentry.js");
     let mut runtime = Runtime::builder()
+        .jit_compile_threads(0)
         .jit_selection(JitSelection::Template)
         .jit_debug(JitDebugRequest::events())
         .build()
@@ -135,6 +138,7 @@ fn inherited_writable_data_fills_and_reuses_native_store_way() {
 
     for selection in [JitSelection::Template, JitSelection::ProductionTiered] {
         let mut runtime = Runtime::builder()
+            .jit_compile_threads(0)
             .jit_selection(selection)
             .jit_debug(JitDebugRequest::events())
             .build()
@@ -254,6 +258,7 @@ fn proxy_receiver_define_preserves_relocated_descriptors() {
         JitSelection::ProductionTiered,
     ] {
         let mut runtime = Runtime::builder()
+            .jit_compile_threads(0)
             .jit_selection(selection)
             .build()
             .expect("runtime");

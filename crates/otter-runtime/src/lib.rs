@@ -581,6 +581,9 @@ pub const DEFAULT_TIMEOUT: Duration = Duration::ZERO;
 /// Default JS call-stack limit.
 pub const DEFAULT_MAX_STACK_DEPTH: u32 = 1024;
 
+/// Default number of threads an isolate compiles optimized code on.
+pub const DEFAULT_JIT_COMPILE_THREADS: usize = 1;
+
 /// Source bundle accepted by the runtime.
 #[derive(Debug, Clone)]
 pub struct SourceInput {
@@ -1979,6 +1982,7 @@ pub(crate) struct RuntimeConfig {
     /// profiler uninstalled.
     cpu_profile_interval: Option<u64>,
     jit_selection: JitSelection,
+    jit_compile_threads: usize,
     jit_debug: JitDebugRequest,
 }
 
@@ -2322,6 +2326,7 @@ impl Default for RuntimeConfig {
             tracer_factory: None,
             cpu_profile_interval: None,
             jit_selection: JitSelection::default(),
+            jit_compile_threads: DEFAULT_JIT_COMPILE_THREADS,
             jit_debug: JitDebugRequest::default(),
         }
     }
@@ -2783,6 +2788,18 @@ impl RuntimeBuilder {
         self
     }
 
+    /// Threads the isolate compiles optimized code on, started at its first
+    /// optimizing compilation; [`DEFAULT_JIT_COMPILE_THREADS`] by default.
+    /// A function keeps running its current tier while it compiles. Zero
+    /// compiles on the isolate thread, which installs the result before it
+    /// continues: tier transitions then happen at fixed points of execution,
+    /// which harnesses asserting them rely on.
+    #[must_use]
+    pub fn jit_compile_threads(mut self, threads: usize) -> Self {
+        self.config.jit_compile_threads = threads;
+        self
+    }
+
     /// Configure default-off structured JIT diagnostics.
     #[must_use]
     pub fn jit_debug(mut self, request: JitDebugRequest) -> Self {
@@ -3006,6 +3023,7 @@ impl Runtime {
         // while the donor configuration carries tracing and JIT-diagnostics
         // requests. Reinstall them without re-running any realm installer.
         interp.set_jit_debug_request(config.jit_debug);
+        interp.set_jit_compiler_threads(config.jit_compile_threads);
         match config.jit_selection {
             JitSelection::ProductionTiered => {
                 interp.set_jit_compiler(Some(std::sync::Arc::new(
@@ -3283,6 +3301,9 @@ impl Runtime {
         // tier policy is installed. Bootstrap therefore avoids compiler tier
         // decisions; calls made after the runtime is returned use the
         // configured compiler.
+        runtime
+            .interp
+            .set_jit_compiler_threads(runtime.config.jit_compile_threads);
         match runtime.config.jit_selection {
             JitSelection::ProductionTiered => {
                 runtime.interp.set_jit_compiler(Some(std::sync::Arc::new(
@@ -6932,6 +6953,13 @@ impl OtterBuilder {
     #[must_use]
     pub fn jit_selection(mut self, selection: JitSelection) -> Self {
         self.runtime = self.runtime.jit_selection(selection);
+        self
+    }
+
+    /// [`RuntimeBuilder::jit_compile_threads`].
+    #[must_use]
+    pub fn jit_compile_threads(mut self, threads: usize) -> Self {
+        self.runtime = self.runtime.jit_compile_threads(threads);
         self
     }
 

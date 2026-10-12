@@ -14,6 +14,7 @@ use otter_vm::native_abi::{CodeLifetimeState, NativeFrameKind};
 #[test]
 fn boxed_immediates_accept_numbers_without_repeated_deopts() {
     let mut runtime = Runtime::builder()
+        .jit_compile_threads(0)
         .jit_selection(JitSelection::ProductionTiered)
         .jit_debug(JitDebugRequest::artifacts().with_events(true))
         .build()
@@ -113,7 +114,11 @@ JSON.stringify([matches, gets, conversions, concatenated, subtracted, integer(pl
 #[test]
 fn multiplication_preserves_signed_zero_in_every_compiled_tier() {
     for selection in [JitSelection::Template, JitSelection::ProductionTiered] {
-        let mut runtime = Runtime::builder().jit_selection(selection).build().unwrap();
+        let mut runtime = Runtime::builder()
+            .jit_compile_threads(0)
+            .jit_selection(selection)
+            .build()
+            .unwrap();
         let result = runtime
             .run_script(
                 SourceInput::from_javascript(

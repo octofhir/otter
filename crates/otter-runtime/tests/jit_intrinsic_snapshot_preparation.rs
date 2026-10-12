@@ -22,6 +22,7 @@ const TIERS: [JitSelection; 3] = [
 
 fn runtime(selection: JitSelection) -> Runtime {
     Runtime::builder()
+        .jit_compile_threads(0)
         .jit_selection(selection)
         .jit_debug(JitDebugRequest::artifacts())
         .build()

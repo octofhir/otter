@@ -53,6 +53,7 @@ fn extra_actuals_remain_observable_without_an_arguments_binding() {
         JitSelection::ProductionTiered,
     ] {
         let mut runtime = Runtime::builder()
+            .jit_compile_threads(0)
             .jit_selection(selection)
             .build()
             .expect("actual-argument runtime");

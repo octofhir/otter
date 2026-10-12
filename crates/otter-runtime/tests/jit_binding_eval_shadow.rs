@@ -20,6 +20,7 @@ use otter_runtime::{JitSelection, Runtime, RuntimeExecutionStats, SourceInput};
 
 fn run(source: &str, selection: JitSelection) -> (String, RuntimeExecutionStats) {
     let mut runtime = Runtime::builder()
+        .jit_compile_threads(0)
         .jit_selection(selection)
         .build()
         .expect("binding-shadow runtime");

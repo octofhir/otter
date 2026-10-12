@@ -24,6 +24,7 @@ use otter_runtime::{
 fn deep_prototype_load_uses_validity_cell() {
     for selection in [JitSelection::Template, JitSelection::ProductionTiered] {
         let mut runtime = Runtime::builder()
+            .jit_compile_threads(0)
             .jit_selection(selection)
             .jit_debug(JitDebugRequest::artifacts())
             .build()
@@ -105,7 +106,11 @@ sum
 #[test]
 fn inlined_deep_method_miss_uses_its_source_call() {
     for selection in [JitSelection::Template, JitSelection::ProductionTiered] {
-        let mut runtime = Runtime::builder().jit_selection(selection).build().unwrap();
+        let mut runtime = Runtime::builder()
+            .jit_compile_threads(0)
+            .jit_selection(selection)
+            .build()
+            .unwrap();
         let result = runtime
             .run_script(
                 SourceInput::from_javascript(
@@ -144,7 +149,11 @@ fn prototype_validity_corpus_completes_in_every_tier() {
         JitSelection::Template,
         JitSelection::ProductionTiered,
     ] {
-        let mut runtime = Runtime::builder().jit_selection(selection).build().unwrap();
+        let mut runtime = Runtime::builder()
+            .jit_compile_threads(0)
+            .jit_selection(selection)
+            .build()
+            .unwrap();
         runtime
             .run_script(
                 SourceInput::from_javascript(include_str!(
@@ -159,6 +168,7 @@ fn prototype_validity_corpus_completes_in_every_tier() {
 #[test]
 fn constructor_closures_allocate_on_their_live_prototype_roots() {
     let mut runtime = Runtime::builder()
+        .jit_compile_threads(0)
         .jit_selection(JitSelection::ProductionTiered)
         .build()
         .unwrap();
@@ -227,6 +237,7 @@ constructMany()
 fn restored_code_does_not_retain_donor_property_feedback() {
     let snapshot = {
         let donor = Runtime::builder()
+            .jit_compile_threads(0)
             .extension_installer(otter_runtime::RuntimeExtensionInstaller::new(|ctx| {
                 ctx.install_script(SourceInput::from_javascript(
                     r#"

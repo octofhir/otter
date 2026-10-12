@@ -39,6 +39,7 @@ struct RunResult {
 
 fn run(selection: JitSelection) -> RunResult {
     let mut runtime = Runtime::builder()
+        .jit_compile_threads(0)
         .jit_selection(selection)
         .build()
         .expect("runtime");
@@ -181,7 +182,10 @@ fn native_scope_call_reuses_the_current_activation_stack() {
 
 #[test]
 fn promise_executor_rejection_preserves_the_thrown_value() {
-    let mut runtime = Runtime::builder().build().expect("runtime");
+    let mut runtime = Runtime::builder()
+        .jit_compile_threads(0)
+        .build()
+        .expect("runtime");
     runtime
         .run_script(
             SourceInput::from_javascript(

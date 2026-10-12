@@ -16,7 +16,10 @@ use otter_runtime::{
 fn runtime_transfers_owned_capture_after_real_rooted_collection() {
     fn send_sync<T: Send + Sync>() {}
     send_sync::<GcPauseCapture>();
-    let mut runtime = Runtime::builder().build().expect("runtime");
+    let mut runtime = Runtime::builder()
+        .jit_compile_threads(0)
+        .build()
+        .expect("runtime");
     let setup = runtime
         .run_script(
             SourceInput::from_javascript("globalThis.retainedProbe = {child: {value: 42}}; 42;"),
@@ -73,7 +76,10 @@ fn runtime_transfers_owned_capture_after_real_rooted_collection() {
 
 #[test]
 fn runtime_keeps_admission_and_overflow_distinct_from_complete_capture() {
-    let mut runtime = Runtime::builder().build().expect("runtime");
+    let mut runtime = Runtime::builder()
+        .jit_compile_threads(0)
+        .build()
+        .expect("runtime");
     assert!(matches!(
         runtime.start_gc_pause_capture(0),
         Err(OtterError::Usage { .. })

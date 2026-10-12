@@ -243,6 +243,7 @@ fn alternating_constructor_families_keep_one_body_native_without_recompilation()
         observations.clone(),
     );
     let mut oracle_runtime = Runtime::builder()
+        .jit_compile_threads(0)
         .jit_selection(JitSelection::InterpreterOnly)
         .extension_installer(install.clone())
         .build()
@@ -264,6 +265,7 @@ fn alternating_constructor_families_keep_one_body_native_without_recompilation()
 
     for selection in [JitSelection::Template, JitSelection::ProductionTiered] {
         let mut runtime = Runtime::builder()
+            .jit_compile_threads(0)
             .jit_selection(selection)
             .jit_debug(JitDebugRequest::artifacts().with_events(true))
             .extension_installer(install.clone())
@@ -578,6 +580,7 @@ fn actual_owner_records_fit_split_classes_and_super_selected_before_argument_mut
         observations.clone(),
     );
     let mut oracle = Runtime::builder()
+        .jit_compile_threads(0)
         .jit_selection(JitSelection::InterpreterOnly)
         .extension_installer(install.clone())
         .build()
@@ -607,6 +610,7 @@ fn actual_owner_records_fit_split_classes_and_super_selected_before_argument_mut
 
     for selection in [JitSelection::Template, JitSelection::ProductionTiered] {
         let mut runtime = Runtime::builder()
+            .jit_compile_threads(0)
             .jit_selection(selection)
             .jit_debug(JitDebugRequest::artifacts().with_events(true))
             .extension_installer(install.clone())

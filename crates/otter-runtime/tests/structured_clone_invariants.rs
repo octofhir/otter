@@ -37,6 +37,7 @@ fn install_structured_clone(runtime: &mut RuntimeExtensionContext<'_>) -> Result
 
 fn runtime(selection: JitSelection) -> Runtime {
     Runtime::builder()
+        .jit_compile_threads(0)
         .jit_selection(selection)
         .extension_installer(RuntimeExtensionInstaller::new(install_structured_clone))
         .build()

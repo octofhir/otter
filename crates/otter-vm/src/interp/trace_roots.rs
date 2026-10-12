@@ -282,13 +282,15 @@ impl Interpreter {
     }
 
     /// Keep alive the hidden classes compiled code embeds: those of every
-    /// registered code object and of the compilations in progress.
+    /// registered code object, of the snapshots being prepared and of the
+    /// compilations in flight on compiler threads.
     pub(crate) fn trace_compiled_shapes(&self, visitor: &mut otter_gc::raw::SlotVisitor<'_>) {
         self.jit_code_registry.trace_retained_roots(visitor);
         let compiling = self.jit_compile_roots.borrow();
         for root in compiling.iter() {
             root.trace(visitor);
         }
+        self.jit_compile_queue.trace_roots(visitor);
     }
 
     /// Keep the shapes the object-layout caches name alive. Hidden classes are

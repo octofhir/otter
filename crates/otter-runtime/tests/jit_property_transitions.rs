@@ -49,6 +49,7 @@ widen(2400);
 
 fn run(selection: JitSelection) -> (String, u64, u64) {
     let mut runtime = Runtime::builder()
+        .jit_compile_threads(0)
         .jit_selection(selection)
         .build()
         .expect("runtime");
@@ -118,6 +119,7 @@ run(400);
 
 fn run_reserved_receiver(selection: JitSelection) -> String {
     let mut runtime = Runtime::builder()
+        .jit_compile_threads(0)
         .jit_selection(selection)
         .build()
         .expect("runtime");
@@ -179,6 +181,7 @@ warm(6000) + ";" + foreign(400) + ";" + runtime(400);
 
 fn run_unreserved_receiver(selection: JitSelection) -> (String, u64) {
     let mut runtime = Runtime::builder()
+        .jit_compile_threads(0)
         .jit_selection(selection)
         .build()
         .expect("runtime");

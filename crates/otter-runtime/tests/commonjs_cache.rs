@@ -43,6 +43,7 @@ fn canonical_js_string(path: &Path) -> String {
 
 fn commonjs_runtime(selection: JitSelection) -> Runtime {
     Runtime::builder()
+        .jit_compile_threads(0)
         .capabilities(CapabilitySet::allow_all())
         .with_nodejs_modules()
         .jit_selection(selection)
@@ -166,6 +167,7 @@ fn abrupt_hosted_install_rolls_back_its_record_and_retries() {
         "#,
     );
     let mut runtime = Runtime::builder()
+        .jit_compile_threads(0)
         .capabilities(CapabilitySet::allow_all())
         .with_nodejs_modules()
         .hosted_module(HostedModule::cjs_only("test:flaky", flaky_cjs_install))

@@ -111,6 +111,7 @@ fn retained_first_seven_cells_keep_geometry_while_current_native_calls_use_final
         })
     };
     let mut runtime = Runtime::builder()
+        .jit_compile_threads(0)
         .jit_selection(JitSelection::ProductionTiered)
         .jit_debug(JitDebugRequest::artifacts().with_events(true))
         .extension_installer(installer)

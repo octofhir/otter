@@ -146,6 +146,7 @@ pub mod iterator_state;
 pub mod jit;
 pub mod jit_artifact;
 mod jit_class_value_ops;
+mod jit_compile_queue;
 mod jit_construct_ops;
 pub mod jit_debug;
 mod jit_delete_ops;
@@ -1141,6 +1142,9 @@ pub struct Interpreter {
     /// compile can start a nested one). A root until the code object that
     /// embeds them is registered and takes them over.
     jit_compile_roots: std::cell::RefCell<Vec<jit_roots::CompilationRoot>>,
+    /// Optimizing compilations handed to the isolate's compiler threads,
+    /// with the roots each snapshot embeds until its result is installed.
+    jit_compile_queue: jit_compile_queue::OptimizingCompileQueue,
     /// Every `instanceof` cell a compilation baked, emptied together by
     /// [`Self::retire_instanceof_proofs`]; compilations and installed code
     /// own the cells.

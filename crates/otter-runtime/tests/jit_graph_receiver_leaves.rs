@@ -461,6 +461,7 @@ fn case(extra: bool) {
     let moving = Arc::new(AtomicBool::new(false));
     let records = Arc::new(Mutex::new(Records::default()));
     let mut runtime = Runtime::builder()
+        .jit_compile_threads(0)
         .jit_selection(JitSelection::ProductionTiered)
         .jit_debug(JitDebugRequest::artifacts().with_events(true))
         .extension_installer(installer(
@@ -586,6 +587,7 @@ fn case(extra: bool) {
     }));
     let oracle_moving = Arc::new(AtomicBool::new(false));
     let mut oracle = Runtime::builder()
+        .jit_compile_threads(0)
         .jit_selection(JitSelection::InterpreterOnly)
         .extension_installer(installer(
             Arc::new(AtomicBool::new(false)),

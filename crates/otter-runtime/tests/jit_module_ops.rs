@@ -92,6 +92,7 @@ console.log(JSON.stringify([
 
     let capture = Arc::new(LogCapture::default());
     let mut runtime = Runtime::builder()
+        .jit_compile_threads(0)
         .console_sink(capture.clone())
         .jit_selection(selection)
         .build()

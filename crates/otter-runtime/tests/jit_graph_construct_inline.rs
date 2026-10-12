@@ -43,6 +43,7 @@ log.join("\n");
 
 fn run(selection: JitSelection) -> (String, Vec<String>) {
     let mut runtime = Runtime::builder()
+        .jit_compile_threads(0)
         .jit_selection(selection)
         .jit_debug(JitDebugRequest::events())
         .build()

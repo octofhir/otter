@@ -254,6 +254,7 @@ impl Interpreter {
             jit_runtime_stats: JitRuntimeStats::default(),
             jit_code_registry: crate::jit_registry::JitCodeRegistry::new_boxed(),
             jit_compile_roots: std::cell::RefCell::default(),
+            jit_compile_queue: jit_compile_queue::OptimizingCompileQueue::default(),
             jit_instanceof_cells: std::cell::RefCell::default(),
             runtime_turn_depth: 0,
             jit_generated_feedback_pending: false,
@@ -1423,6 +1424,16 @@ impl Interpreter {
             crate::runtime_stubs::validate_jit_runtime_stub_bindings(&bindings);
         }
         self.jit_hook = hook;
+    }
+
+    /// Compile optimized code on `threads` threads owned by this isolate,
+    /// started at its first optimizing compilation. A function keeps running
+    /// its current tier while it compiles, and the isolate installs the
+    /// result at its next tier decision or loop poll. Zero compiles on the
+    /// isolate thread, which installs the result before continuing; that is
+    /// also the state of a new interpreter.
+    pub fn set_jit_compiler_threads(&mut self, threads: usize) {
+        self.jit_compile_queue.set_threads(threads);
     }
 
     /// Address of the published isolate code-registry view. The boxed registry

@@ -337,6 +337,7 @@ fn canonical_float_homes_and_young_carrier_survive_nested_osr_moving_gc() {
         collecting_calls * 16
     );
     let mut oracle = Runtime::builder()
+        .jit_compile_threads(0)
         .jit_selection(JitSelection::InterpreterOnly)
         .build()
         .expect("interpreter oracle");
@@ -354,6 +355,7 @@ fn canonical_float_homes_and_young_carrier_survive_nested_osr_moving_gc() {
     assert_eq!(oracle, expected);
 
     let mut runtime = Runtime::builder()
+        .jit_compile_threads(0)
         .jit_selection(JitSelection::ProductionTiered)
         .jit_debug(JitDebugRequest::artifacts().with_events(true))
         .build()

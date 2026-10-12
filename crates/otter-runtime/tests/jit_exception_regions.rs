@@ -110,6 +110,7 @@ JSON.stringify([
 
 fn run(selection: JitSelection) -> (String, u64, u64, u64, u64) {
     let mut runtime = Runtime::builder()
+        .jit_compile_threads(0)
         .jit_selection(selection)
         .build()
         .expect("runtime");
@@ -173,6 +174,7 @@ JSON.stringify([callCatch(catchProperty, bad), entered - before, inner, outer, g
 "#;
     let execute = |selection| {
         let mut runtime = Runtime::builder()
+            .jit_compile_threads(0)
             .jit_selection(selection)
             .build()
             .expect("catch runtime");

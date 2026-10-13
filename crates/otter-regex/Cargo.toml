@@ -29,6 +29,10 @@ smallvec = { workspace = true }
 # Vectorized byte and substring search for the scan prefilters over one-byte
 # subjects; already present elsewhere in the workspace dependency graph.
 memchr = "2"
+# Machine-code assembly and executable mappings for the native matcher tier;
+# already present elsewhere in the workspace dependency graph.
+dynasm = "5"
+dynasmrt = "5"
 
 [features]
 # `unicode` pulls in the property-escape data path. Default-on; a future slim
@@ -36,5 +40,15 @@ memchr = "2"
 default = ["unicode"]
 unicode = []
 
-[lints]
-workspace = true
+# The workspace `forbid(unsafe_code)` is lifted for this crate: the native
+# matcher tier emits machine code and calls into it. Everything else follows
+# the workspace lint set.
+[lints.rust]
+missing_docs = "deny"
+
+[lints.clippy]
+all = { level = "deny", priority = -1 }
+result_large_err = "allow"
+too_many_arguments = "allow"
+type_complexity = "allow"
+arc_with_non_send_sync = "allow"

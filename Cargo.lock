@@ -2865,6 +2865,8 @@ dependencies = [
 name = "otter-regex"
 version = "0.0.0"
 dependencies = [
+ "dynasm",
+ "dynasmrt",
  "icu_casemap",
  "icu_properties",
  "memchr",

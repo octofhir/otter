@@ -271,26 +271,19 @@ impl ClassSet {
         }
     }
 
-    /// Fold ASCII case into the member set: for every ASCII letter present, add
-    /// its opposite case. After this the plain membership test equals the
-    /// non-Unicode `ignore_case` membership test (which consults only
-    /// `ascii_other_case`), so the executor can drop the per-character
-    /// other-case probe and take the fast bitmap path for `/i` patterns.
-    ///
-    /// Only sound for non-Unicode mode: Unicode `ignore_case` additionally folds
-    /// via the full Unicode simple-fold table, which this does not expand.
-    pub(crate) fn fold_ascii_case(&mut self) {
+    /// Close the set under non-unicode case equivalence: add every BMP code
+    /// unit whose canonical form ([`crate::casefold::canonicalize`]) is that
+    /// of a member. A plain membership test is then §22.2.2.9
+    /// CharacterSetMatcher's `i` test: some member canonicalizes like the
+    /// input.
+    pub(crate) fn fold_canonical_case(&mut self) {
         let mut adds: Vec<u32> = Vec::new();
-        for r in self.code_points.ranges() {
-            let lo = *r.start();
-            if lo >= 128 {
-                continue;
-            }
-            for cp in lo..=(*r.end()).min(127) {
-                let other = crate::casefold::ascii_other_case(cp);
-                if other != cp {
-                    adds.push(other);
-                }
+        for group in crate::casefold::canonical_groups() {
+            if group
+                .iter()
+                .any(|&unit| self.code_points.contains(u32::from(unit)))
+            {
+                adds.extend(group.iter().map(|&unit| u32::from(unit)));
             }
         }
         for cp in adds {

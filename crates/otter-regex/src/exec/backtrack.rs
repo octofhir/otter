@@ -706,35 +706,15 @@ impl<U: Unit> Matcher<'_, '_, U> {
 
     /// Case-fold canonical form for the current flags.
     fn canon(&self, cp: u32) -> u32 {
-        if self.program.unicode {
-            fold_unicode(cp)
-        } else {
-            canonicalize(cp)
-        }
+        canon(cp, self.program.unicode)
     }
 
     fn char_eq(&self, target: u32, cp: u32, ignore_case: bool) -> bool {
-        cp == target || (ignore_case && self.canon(cp) == self.canon(target))
+        char_eq(target, cp, ignore_case, self.program.unicode)
     }
 
     fn class_member(&self, set: &ClassSet, negate: bool, cp: u32, ignore_case: bool) -> bool {
-        let inside = if cp < 128 {
-            // ASCII fast path: an O(1) bitmap check. Both case-fold directions
-            // for ASCII letters stay in ASCII, so the opposite-case probe covers
-            // the unicode fold here too (a non-ASCII member can never fold into
-            // the ASCII range).
-            set.ascii_contains(cp) || (ignore_case && set.ascii_contains(ascii_other_case(cp)))
-        } else {
-            let mut m = set.code_points.contains(cp);
-            if !m && ignore_case {
-                m = set.code_points.contains(ascii_other_case(cp));
-                if !m && self.program.unicode {
-                    m = set.code_points.contains(fold_unicode(cp));
-                }
-            }
-            m
-        };
-        inside != negate
+        class_member(set, negate, cp, ignore_case, self.program.unicode)
     }
 
     fn at_start(&self, pos: usize, multiline: bool) -> bool {
@@ -842,11 +822,53 @@ fn step(pos: usize, width: usize, backward: bool) -> usize {
     if backward { pos - width } else { pos + width }
 }
 
-fn is_line_terminator(cp: u32) -> bool {
+/// Case-fold canonical form of `cp` under the `unicode` rule.
+fn canon(cp: u32, unicode: bool) -> u32 {
+    if unicode {
+        fold_unicode(cp)
+    } else {
+        canonicalize(cp)
+    }
+}
+
+/// Whether code point `cp` matches the literal `target`, case-folded under
+/// `ignore_case` by the `unicode` rule.
+pub(crate) fn char_eq(target: u32, cp: u32, ignore_case: bool, unicode: bool) -> bool {
+    cp == target || (ignore_case && canon(cp, unicode) == canon(target, unicode))
+}
+
+/// Whether code point `cp` matches a class test against `set`.
+pub(crate) fn class_member(
+    set: &ClassSet,
+    negate: bool,
+    cp: u32,
+    ignore_case: bool,
+    unicode: bool,
+) -> bool {
+    let inside = if cp < 128 {
+        // ASCII fast path: an O(1) bitmap check. Both case-fold directions
+        // for ASCII letters stay in ASCII, so the opposite-case probe covers
+        // the unicode fold here too (a non-ASCII member can never fold into
+        // the ASCII range).
+        set.ascii_contains(cp) || (ignore_case && set.ascii_contains(ascii_other_case(cp)))
+    } else {
+        let mut m = set.code_points.contains(cp);
+        if !m && ignore_case {
+            m = set.code_points.contains(ascii_other_case(cp));
+            if !m && unicode {
+                m = set.code_points.contains(fold_unicode(cp));
+            }
+        }
+        m
+    };
+    inside != negate
+}
+
+pub(crate) fn is_line_terminator(cp: u32) -> bool {
     matches!(cp, 0x0A | 0x0D | 0x2028 | 0x2029)
 }
 
-fn is_word(cp: u32) -> bool {
+pub(crate) fn is_word(cp: u32) -> bool {
     matches!(cp,
         0x30..=0x39 | 0x41..=0x5A | 0x61..=0x7A | 0x5F)
 }

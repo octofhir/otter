@@ -34,6 +34,9 @@ mod sealed {
 ///
 /// Sealed: the matcher is monomorphized for exactly these two widths.
 pub trait Unit: sealed::Sealed + Copy + Eq + core::fmt::Debug + Into<u32> + 'static {
+    /// `true` for the two-byte UTF-16 width.
+    const WIDE: bool;
+
     /// The unit as a UTF-16 code unit.
     fn widen(self) -> u16;
 
@@ -51,9 +54,15 @@ pub trait Unit: sealed::Sealed + Copy + Eq + core::fmt::Debug + Into<u32> + 'sta
 
     /// The units as bytes, for a one-byte subject.
     fn as_latin1(units: &[Self]) -> Option<&[u8]>;
+
+    /// The units' memory as bytes, little-endian per two-byte unit on the
+    /// targets the engine runs on.
+    fn as_bytes(units: &[Self]) -> &[u8];
 }
 
 impl Unit for u8 {
+    const WIDE: bool = false;
+
     #[inline]
     fn widen(self) -> u16 {
         u16::from(self)
@@ -79,9 +88,16 @@ impl Unit for u8 {
     fn as_latin1(units: &[Self]) -> Option<&[u8]> {
         Some(units)
     }
+
+    #[inline]
+    fn as_bytes(units: &[Self]) -> &[u8] {
+        units
+    }
 }
 
 impl Unit for u16 {
+    const WIDE: bool = true;
+
     #[inline]
     fn widen(self) -> u16 {
         self
@@ -143,6 +159,14 @@ impl Unit for u16 {
     #[inline]
     fn as_latin1(_units: &[Self]) -> Option<&[u8]> {
         None
+    }
+
+    #[inline]
+    fn as_bytes(units: &[Self]) -> &[u8] {
+        // SAFETY: every byte of a `u16` slice is initialized, `u8` has no
+        // alignment requirement, and the byte view covers exactly the
+        // slice's memory for the slice's lifetime.
+        unsafe { core::slice::from_raw_parts(units.as_ptr().cast::<u8>(), units.len() * 2) }
     }
 }
 

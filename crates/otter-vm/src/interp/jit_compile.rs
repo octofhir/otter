@@ -615,17 +615,16 @@ impl Interpreter {
         self.bake_field_type_tree(&mut snapshot);
         // Every shape baked so far that no object has left yet: a value
         // proven to have one survives calls on a read of its stable byte.
-        snapshot.stable_shapes = self.jit_compile_roots.borrow()[roots_start..]
-            .iter()
-            .filter_map(|root| match root {
-                crate::jit_roots::CompilationRoot::Shape(shape)
-                    if crate::object::shape_body::is_stable(*shape) =>
-                {
-                    Some(shape.offset())
+        // The rest have been left already, and stay so.
+        for root in &self.jit_compile_roots.borrow()[roots_start..] {
+            if let crate::jit_roots::CompilationRoot::Shape(shape) = root {
+                if crate::object::shape_body::is_stable(*shape) {
+                    snapshot.stable_shapes.insert(shape.offset());
+                } else {
+                    snapshot.left_shapes.insert(shape.offset());
                 }
-                _ => None,
-            })
-            .collect();
+            }
+        }
         let target = osr_pc.map_or(jit_debug::JitDebugTarget::Entry, |pc| {
             jit_debug::JitDebugTarget::Osr { pc }
         });

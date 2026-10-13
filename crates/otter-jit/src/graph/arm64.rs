@@ -1783,13 +1783,15 @@ impl<'a> Codegen<'a> {
                 byte_pc,
                 owners,
                 receiver_shape,
+                fresh,
             } => {
                 let (receiver, value) = (Self::gp(input(0)), Self::gp(input(1)));
                 let [holder, scratch] = [allocation.gp_temps[0], allocation.gp_temps[1]];
-                let (byte_pc, owners, receiver_shape) = (*byte_pc, owners.clone(), *receiver_shape);
+                let (byte_pc, owners, receiver_shape, fresh) =
+                    (*byte_pc, owners.clone(), *receiver_shape, *fresh);
                 self.emit_store_named_property(
                     node,
-                    (byte_pc, receiver_shape),
+                    (byte_pc, receiver_shape, fresh),
                     &owners,
                     [receiver, value],
                     [holder, scratch],
@@ -2584,7 +2586,7 @@ impl<'a> Codegen<'a> {
     fn emit_store_named_property(
         &mut self,
         node: NodeId,
-        (byte_pc, receiver_shape): (u32, Option<u32>),
+        (byte_pc, receiver_shape, fresh): (u32, Option<u32>, bool),
         owners: &[FieldStoreOwner],
         [receiver, value]: [u8; 2],
         [holder, scratch]: [u8; 2],
@@ -2599,6 +2601,13 @@ impl<'a> Codegen<'a> {
         let exit = self.eager_exit(node, DeoptReason::WrongShape);
         let done = self.ops.new_dynamic_label();
         let view = self.view;
+        // The validity cell a fresh receiver's allocation checked still holds:
+        // no code ran since.
+        let allocation = self.graph.node(node).inputs[0];
+        let allocation_validity = match &self.graph.node(allocation).kind {
+            Kind::NewReceiver(plan) if fresh => plan.prototype_validity.map(|cell| cell.address),
+            _ => None,
+        };
         // Each successful ordinary program proves its exact finalized shape
         // before its field/effect, unless the receiver is already proved to
         // have it. Prototype-role writes require the canonical invalidation
@@ -2606,10 +2615,14 @@ impl<'a> Codegen<'a> {
         if receiver_shape.is_none() {
             self.emit_object_receiver(receiver, exit);
         }
-        self.emit_shape_state(receiver);
-        dynasm!(self.ops ; .arch aarch64
-            ; tst w16, u32::from(ShapeState::PROTOTYPE_MASK)
-            ; b.ne =>exit);
+        // A fresh receiver ran no code since its allocation, so it has no
+        // prototype role.
+        if !fresh {
+            self.emit_shape_state(receiver);
+            dynasm!(self.ops ; .arch aarch64
+                ; tst w16, u32::from(ShapeState::PROTOTYPE_MASK)
+                ; b.ne =>exit);
+        }
         if owners.len() != programs.len() {
             return Err(Unsupported::OperandShape("graph named store owner records"));
         }
@@ -2653,7 +2666,9 @@ impl<'a> Codegen<'a> {
                             ; add X(holder), x16, X(holder)
                         );
                     }
-                    Op::GuardPrototypeValidity { validity } => {
+                    Op::GuardPrototypeValidity { validity }
+                        if allocation_validity != Some(validity.address) =>
+                    {
                         crate::template::arm64::values::emit_prototype_validity_guard(
                             &mut self.ops,
                             &mut self.relocations,
@@ -2662,6 +2677,7 @@ impl<'a> Codegen<'a> {
                             next,
                         );
                     }
+                    Op::GuardPrototypeValidity { .. } => {}
                     Op::GuardShape {
                         object: operand,
                         shape,
@@ -2708,10 +2724,14 @@ impl<'a> Codegen<'a> {
                             self.load_immediate(17, u64::from(field.index()));
                             dynasm!(self.ops ; .arch aarch64 ; cmp w17, w16 ; b.hs =>next);
                         }
-                        self.emit_shape_state(receiver);
-                        dynasm!(self.ops ; .arch aarch64
-                            ; tst w16, u32::from(ShapeState::EXTENSIBLE_MASK)
-                            ; b.eq =>next);
+                        // A fresh receiver ran no code since its allocation,
+                        // so it is still extensible.
+                        if !fresh {
+                            self.emit_shape_state(receiver);
+                            dynasm!(self.ops ; .arch aarch64
+                                ; tst w16, u32::from(ShapeState::EXTENSIBLE_MASK)
+                                ; b.eq =>next);
+                        }
                     }
                     Op::StoreField { field, .. } => {
                         let value_byte = field.byte_offset();
@@ -2727,13 +2747,19 @@ impl<'a> Codegen<'a> {
                         stored_byte = Some(value_byte);
                     }
                     Op::PublishShape { shape, .. } => {
-                        dynasm!(self.ops
-                            ; .arch aarch64
-                            ; and x17, X(receiver), #0xffff_ffff_0000_0000
-                            ; ldr w16, [X(receiver), view.object_shape_byte]
-                            ; add x16, x17, x16
-                            ; strb wzr, [x16, view.shape_stable_byte]
-                        );
+                        // The object leaves its shape. One some object had
+                        // already left when the generation compiled stays
+                        // unstable; any other is retired here.
+                        if !receiver_guard.is_some_and(|parent| view.left_shapes.contains(&parent))
+                        {
+                            dynasm!(self.ops
+                                ; .arch aarch64
+                                ; and x17, X(receiver), #0xffff_ffff_0000_0000
+                                ; ldr w16, [X(receiver), view.object_shape_byte]
+                                ; add x16, x17, x16
+                                ; strb wzr, [x16, view.shape_stable_byte]
+                            );
+                        }
                         self.load_immediate(16, u64::from(shape));
                         dynasm!(self.ops
                             ; .arch aarch64
@@ -2751,7 +2777,12 @@ impl<'a> Codegen<'a> {
                             );
                             owner = 0;
                         }
-                        self.emit_shape_child_barrier(node, receiver, shape, scratch);
+                        // A fresh receiver is a young, unmarked buffer cell and
+                        // no marking can have started since: the edge to its
+                        // new shape owes no barrier.
+                        if !fresh {
+                            self.emit_shape_child_barrier(node, receiver, shape, scratch);
+                        }
                     }
                     _ => return Err(Unsupported::OperandShape("graph named store operation")),
                 }

@@ -741,6 +741,10 @@ pub struct JitCompileSnapshot {
     /// operation that may run code is re-proven afterwards by reading the
     /// shapes' stable bytes instead of the value.
     pub stable_shapes: rustc_hash::FxHashSet<u32>,
+    /// Compressed handles of baked shapes some object had already left when
+    /// the generation compiled. Stability only ever goes from set to clear,
+    /// so a transition out of one of them has nothing left to retire.
+    pub left_shapes: rustc_hash::FxHashSet<u32>,
     /// Header-inclusive offset of the sole immutable [`crate::object::ShapeState`]
     /// byte on a decompressed shape. Exact eligible baked shape identity fixes
     /// these facts; only dynamic/shared and dictionary probes read them live.
@@ -2230,6 +2234,7 @@ impl JitCompileSnapshot {
             shape_id_byte: 0,
             field_types: rustc_hash::FxHashMap::default(),
             stable_shapes: rustc_hash::FxHashSet::default(),
+            left_shapes: rustc_hash::FxHashSet::default(),
             shape_state_byte: 0,
             shape_inline_capacity_byte: 0,
             closure_call_layout: JitClosureCallLayout::default(),

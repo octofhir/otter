@@ -273,15 +273,16 @@ impl Codegen<'_> {
             .get(&pc)
             .ok_or(Unsupported::OperandShape("x86 graph named programs"))?
             .clone();
-        let (selected, receiver_shape, owners) = match self.graph.node(node).kind.clone() {
+        let (selected, receiver_shape, owners, fresh) = match self.graph.node(node).kind.clone() {
             Kind::LoadNamedProperty {
                 programs,
                 receiver_shape,
                 ..
-            } => (programs, receiver_shape, smallvec::SmallVec::new()),
+            } => (programs, receiver_shape, smallvec::SmallVec::new(), false),
             Kind::StoreNamedProperty {
                 owners,
                 receiver_shape,
+                fresh,
                 ..
             } if owners.len() == programs.len() => (
                 // A proved receiver matches only the programs that guard its
@@ -298,12 +299,20 @@ impl Codegen<'_> {
                     .collect(),
                 receiver_shape,
                 owners,
+                fresh,
             ),
             _ => return Err(Unsupported::OperandShape("x86 graph named program plan")),
         };
         let exit = self.eager_exit(node, DeoptReason::WrongShape);
         let done = self.ops.new_dynamic_label();
         let view = self.view;
+        // The validity cell a fresh receiver's allocation checked still holds:
+        // no code ran since.
+        let allocation = self.graph.node(node).inputs[0];
+        let allocation_validity = match &self.graph.node(allocation).kind {
+            Kind::NewReceiver(plan) if fresh => plan.prototype_validity.map(|cell| cell.address),
+            _ => None,
+        };
         if value.is_some() {
             // Every successful static path proves an eligible receiver shape
             // before its field/effect. Prototype writes additionally need the
@@ -311,8 +320,12 @@ impl Codegen<'_> {
             if receiver_shape.is_none() {
                 self.emit_object_receiver(receiver, exit);
             }
-            self.emit_shape_state(receiver);
-            dynasm!(self.ops ; .arch x64 ; test r10b, ShapeState::PROTOTYPE_MASK as i8 ; jnz =>exit);
+            // A fresh receiver ran no code since its allocation, so it has no
+            // prototype role.
+            if !fresh {
+                self.emit_shape_state(receiver);
+                dynasm!(self.ops ; .arch x64 ; test r10b, ShapeState::PROTOTYPE_MASK as i8 ; jnz =>exit);
+            }
         }
         for index in selected {
             let program = programs
@@ -382,9 +395,12 @@ impl Codegen<'_> {
                     Op::LoadPrototypeHolder { root, .. } => {
                         self.emit_prototype_holder(receiver, holder, root, next)
                     }
-                    Op::GuardPrototypeValidity { validity } => {
+                    Op::GuardPrototypeValidity { validity }
+                        if allocation_validity != Some(validity.address) =>
+                    {
                         self.emit_validity_guard(validity, next)
                     }
+                    Op::GuardPrototypeValidity { .. } => {}
                     Op::GuardShape {
                         object: operand,
                         shape,
@@ -433,8 +449,12 @@ impl Codegen<'_> {
                                 ; test r10d, r10d ; jz =>next ; add r10, r11
                                 ; cmp DWORD [r10 + view.field_layout.slab_capacity_byte as i32], field.index() as i32 ; jbe =>next);
                         }
-                        self.emit_shape_state(receiver);
-                        dynasm!(self.ops ; .arch x64 ; test r10b, ShapeState::EXTENSIBLE_MASK as i8 ; jz =>next);
+                        // A fresh receiver ran no code since its allocation,
+                        // so it is still extensible.
+                        if !fresh {
+                            self.emit_shape_state(receiver);
+                            dynasm!(self.ops ; .arch x64 ; test r10b, ShapeState::EXTENSIBLE_MASK as i8 ; jz =>next);
+                        }
                     }
                     Op::LoadField {
                         object: operand,
@@ -463,12 +483,22 @@ impl Codegen<'_> {
                         committed = true;
                     }
                     Op::PublishShape { shape, .. } if value.is_some() => {
-                        self.load_immediate(11, 0xffff_ffff_0000_0000);
+                        // The object leaves its shape. One some object had
+                        // already left when the generation compiled stays
+                        // unstable; any other is retired here.
+                        let parent = program.ops.iter().find_map(|op| match *op {
+                            Op::GuardShape { object: 0, shape } => Some(shape),
+                            _ => None,
+                        });
+                        if !parent.is_some_and(|parent| view.left_shapes.contains(&parent)) {
+                            self.load_immediate(11, 0xffff_ffff_0000_0000);
+                            dynasm!(self.ops ; .arch x64
+                                ; and r11, Rq(receiver)
+                                ; mov r10d, [Rq(receiver) + view.object_shape_byte as i32]
+                                ; add r10, r11
+                                ; mov BYTE [r10 + view.shape_stable_byte as i32], 0);
+                        }
                         dynasm!(self.ops ; .arch x64
-                            ; and r11, Rq(receiver)
-                            ; mov r10d, [Rq(receiver) + view.object_shape_byte as i32]
-                            ; add r10, r11
-                            ; mov BYTE [r10 + view.shape_stable_byte as i32], 0
                             ; mov DWORD [Rq(receiver) + view.object_shape_byte as i32], shape as i32);
                         if let Some(record) = known.filter(|_| owner != 0) {
                             self.load_immediate(holder, u64::from(owner));
@@ -482,7 +512,12 @@ impl Codegen<'_> {
                             );
                             owner = 0;
                         }
-                        self.emit_shape_child_barrier(node, receiver, shape, scratch);
+                        // A fresh receiver is a young, unmarked buffer cell
+                        // and no marking can have started since: the edge to
+                        // its new shape owes no barrier.
+                        if !fresh {
+                            self.emit_shape_child_barrier(node, receiver, shape, scratch);
+                        }
                     }
                     _ => {
                         return Err(Unsupported::OperandShape(

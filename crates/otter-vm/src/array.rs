@@ -891,10 +891,15 @@ fn dense_kind_for_value(value: Value) -> DenseElementKind {
 /// for them.
 fn copy_values_into(body: &mut ArrayBody, values: &[Value]) {
     debug_assert!(body.dense_capacity() >= values.len());
-    for (index, value) in values.iter().copied().enumerate() {
-        body.write_dense_value(index, value);
+    if let Some(slab) = body.slab_body_mut() {
+        for (index, value) in values.iter().copied().enumerate() {
+            slab.set(index, value);
+        }
     }
     body.set_dense_len(values.len());
+    // One refresh for the whole copy: a numeric slab that took a tagged value
+    // changed kind in place.
+    body.refresh_element_cache();
 }
 
 /// Allocate an [`ArrayBody`] whose dense element slab has already been

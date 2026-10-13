@@ -53,6 +53,7 @@ impl<'a> RuntimeState<'a> {
     /// Per §4.2, roots are:
     /// - shared `globalThis` object;
     /// - realm intrinsic prototypes;
+    /// - the active realm's legacy RegExp statics;
     /// - module-environment registry;
     /// - active call frames (locals + register window +
     ///   accumulator + `this` + bytecode-module reference);
@@ -69,6 +70,9 @@ impl<'a> RuntimeState<'a> {
         interp.global_this().trace_gc_roots(visitor);
         // 1b) Cached realm intrinsic prototypes.
         interp.realm_intrinsics().trace_roots(visitor);
+        // 1c) The active realm's legacy RegExp statics hold the last subject;
+        // a parked realm's copy is traced with the rest of that realm.
+        interp.regexp_legacy.trace_roots(visitor);
         for realm in interp.extra_realms_for_trace() {
             realm.trace_roots(visitor);
         }

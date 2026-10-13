@@ -722,7 +722,10 @@ fn latin1_subjects_match_like_their_utf16_form() {
         let re = Regex::compile_str(pattern, Flags::from_str_lossy(flags)).expect("compile");
         for subject in subjects {
             let wide: Vec<u16> = subject.encode_utf16().collect();
-            let narrow: Vec<u8> = wide.iter().map(|&u| u8::try_from(u).expect("one-byte")).collect();
+            let narrow: Vec<u8> = wide
+                .iter()
+                .map(|&u| u8::try_from(u).expect("one-byte"))
+                .collect();
             let collect = |found: Vec<Result<otter_regex::Match, otter_regex::ExecError>>| {
                 found
                     .into_iter()
@@ -734,7 +737,10 @@ fn latin1_subjects_match_like_their_utf16_form() {
             };
             let wide_found = collect(re.find_utf16(&wide, 0, ExecConfig::default()).collect());
             let narrow_found = collect(re.find_latin1(&narrow, 0, ExecConfig::default()).collect());
-            assert_eq!(narrow_found, wide_found, "/{pattern}/{flags} on {subject:?}");
+            assert_eq!(
+                narrow_found, wide_found,
+                "/{pattern}/{flags} on {subject:?}"
+            );
         }
     }
 }
@@ -759,12 +765,41 @@ fn scratch_carries_between_searches() {
 
         let latin: Vec<u8> = b"xy".to_vec();
         let mut found = anchored.find_latin1_with(&latin, 0, ExecConfig::default(), scratch);
-        assert_eq!(found.next().expect("a match").expect("within budget").range, 0..2);
+        assert_eq!(
+            found.next().expect("a match").expect("within budget").range,
+            0..2
+        );
         scratch = found.into_scratch();
 
         let deep: Vec<u16> = format!("{}b", "a".repeat(5000)).encode_utf16().collect();
         let mut found = nested.find_utf16_with(&deep, 0, ExecConfig::default(), scratch);
-        assert_eq!(found.next().expect("a match").expect("within budget").range, 0..5001);
+        assert_eq!(
+            found.next().expect("a match").expect("within budget").range,
+            0..5001
+        );
         scratch = found.into_scratch();
     }
+}
+
+/// A start-anchored pattern rejects a subject whose first code point cannot
+/// begin a match before running the matcher, and still matches every subject
+/// that can: case folding, alternation, an empty subject and a surrogate pair.
+#[test]
+fn anchored_patterns_check_the_first_code_point() {
+    assert_eq!(first_match("^ba", "", "pyvpx"), None);
+    assert_eq!(first_match("^ba", "", "bax"), Some((0, 2, vec![])));
+    assert_eq!(first_match("^ba", "", ""), None);
+    assert_eq!(first_match("^b", "i", "Bz"), Some((0, 1, vec![])));
+    assert_eq!(first_match("^\u{17F}", "iu", "s"), Some((0, 1, vec![])));
+    assert_eq!(first_match("^(?:b|c)", "", "cb"), Some((0, 1, vec![])));
+    assert_eq!(first_match("^(?:b|c)", "", "ab"), None);
+    assert_eq!(
+        first_match("^\u{1F600}x", "u", "\u{1F600}x"),
+        Some((0, 3, vec![]))
+    );
+    assert_eq!(first_match("^\u{1F600}x", "u", "\u{1F601}x"), None);
+    // An empty-matching pattern keeps no prefilter and still matches nothing.
+    assert_eq!(first_match("^a*", "", "bbb"), Some((0, 0, vec![])));
+    // Multiline `^` is not start-anchored: later lines still match.
+    assert_eq!(first_match("^ba", "m", "x\nba"), Some((2, 4, vec![])));
 }

@@ -924,7 +924,7 @@ impl Interpreter {
         elements: &[Local<'_>],
     ) -> Result<Local<'s>, VmError> {
         let _runtime_roots_guard = self.scope_runtime_roots_guard();
-        let mut values: smallvec::SmallVec<[Value; 8]> = elements
+        let mut values: smallvec::SmallVec<[Value; 16]> = elements
             .iter()
             .map(|element| self.handle_arena.get(element.index()))
             .collect();

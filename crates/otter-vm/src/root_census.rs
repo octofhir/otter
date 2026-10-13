@@ -128,6 +128,10 @@ impl Interpreter {
             count(|v| self.realm_intrinsics().trace_roots(v)),
         );
         push(
+            "regexp_legacy",
+            count(|v| self.regexp_legacy.trace_roots(v)),
+        );
+        push(
             "extra_realms",
             count(|v| {
                 for realm in self.extra_realms_for_trace() {

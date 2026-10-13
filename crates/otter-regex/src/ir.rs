@@ -41,13 +41,13 @@ pub(crate) fn lower(parsed: Parsed, flags: Flags) -> Program {
     e.compile(&parsed.root);
     e.emit(Insn::Match);
 
-    // Non-Unicode case-insensitive classes: fold ASCII case into the class set
-    // and clear the per-instruction `ignore_case` flag. The non-Unicode
-    // `ignore_case` membership test consults only `ascii_other_case`, so a class
-    // carrying both cases matches identically with a plain (case-sensitive)
-    // test — which lets the executor take the fast ASCII-bitmap path instead of
-    // a per-character case-fold probe. This is the hot path for `/i` patterns
-    // such as `[a-z]{4,}` under the `i` flag.
+    // Non-Unicode case-insensitive classes: close the class set under case
+    // equivalence and clear the per-instruction `ignore_case` flag. A member
+    // set holding every unit that canonicalizes like one of its members
+    // matches exactly as §22.2.2.9 requires with a plain (case-sensitive)
+    // test — which lets the executor take the fast ASCII-bitmap path instead
+    // of a per-character case-fold probe. This is the hot path for `/i`
+    // patterns such as `[a-z]{4,}` under the `i` flag.
     if !flags.is_unicode_mode() {
         let Emitter { insns, classes, .. } = &mut e;
         for insn in insns.iter_mut() {
@@ -55,7 +55,7 @@ pub(crate) fn lower(parsed: Parsed, flags: Flags) -> Program {
                 Insn::Class {
                     class, ignore_case, ..
                 } if *ignore_case => {
-                    classes[*class as usize].fold_ascii_case();
+                    classes[*class as usize].fold_canonical_case();
                     *ignore_case = false;
                 }
                 Insn::Repeat {
@@ -65,7 +65,7 @@ pub(crate) fn lower(parsed: Parsed, flags: Flags) -> Program {
                         },
                     ..
                 } if *ignore_case => {
-                    classes[*class as usize].fold_ascii_case();
+                    classes[*class as usize].fold_canonical_case();
                     *ignore_case = false;
                 }
                 _ => {}

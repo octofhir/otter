@@ -23,6 +23,9 @@
 //!   ranges do not make distinct capture groups interchangeable.
 //! - A successful scan always advances `next_start` past the current match, so
 //!   the iterator terminates even on zero-width matches.
+//! - A regex searched often enough runs its searches as machine code
+//!   ([`crate::exec::native`]) when the emitter covers its program; matches,
+//!   capture ranges and step counts are exactly the interpreter's.
 //! - A search owns its matcher buffers; a host that passes a
 //!   [`MatchScratch`] in gets it back from [`Matches::into_scratch`], so
 //!   sharing a [`Regex`] never serializes matching.
@@ -36,6 +39,7 @@ use crate::cursor::{Input, Unit};
 use crate::error::{ExecError, RegexError};
 use crate::exec::ExecConfig;
 use crate::exec::backtrack;
+use crate::exec::native::{self, NativeCode, NativeTier, Outcome, Window};
 use crate::flags::Flags;
 use crate::program::Program;
 
@@ -48,6 +52,7 @@ use crate::program::Program;
 pub struct Regex {
     program: Program,
     flags: Flags,
+    native: NativeTier,
 }
 
 /// Matcher buffers a host keeps between searches.
@@ -57,8 +62,18 @@ pub struct Regex {
 /// [`Matches::into_scratch`], so a hot `exec`/`test` loop reuses one backtrack
 /// stack, undo log and capture array instead of allocating and growing fresh
 /// ones per call. Buffers a search grew past a small bound come back empty.
+///
+/// The buffers live behind one box, so handing them between a host and a
+/// search moves a pointer.
 #[derive(Debug, Default)]
-pub struct MatchScratch(backtrack::Scratch);
+pub struct MatchScratch(Option<Box<Buffers>>);
+
+/// The buffers of both tiers.
+#[derive(Debug, Default)]
+struct Buffers {
+    interpreter: backtrack::Scratch,
+    native: native::Scratch,
+}
 
 impl Regex {
     /// Compile a pattern given as UTF-16 code units. This is the primary entry
@@ -67,7 +82,11 @@ impl Regex {
     pub fn compile_utf16(pattern: &[u16], flags: Flags) -> Result<Self, RegexError> {
         let parsed = crate::parser::parse(pattern, flags)?;
         let program = crate::ir::lower(parsed, flags);
-        Ok(Self { program, flags })
+        Ok(Self {
+            program,
+            flags,
+            native: NativeTier::default(),
+        })
     }
 
     /// Compile a pattern given as a `&str`. Convenience for callers that only
@@ -153,6 +172,10 @@ impl Regex {
         config: ExecConfig,
         scratch: MatchScratch,
     ) -> Matches<'r, 't, U> {
+        let native = self.native.code::<U>(&self.program);
+        if let Some(code) = native {
+            code.prepare();
+        }
         Matches {
             regex: self,
             text,
@@ -160,8 +183,40 @@ impl Regex {
             config,
             done: false,
             steps_executed: 0,
-            scratch: scratch.0,
+            scratch: scratch.0.unwrap_or_default(),
+            native,
         }
+    }
+
+    /// A search pinned to one tier: the interpreter (`code: None`) or the
+    /// given machine code of this regex's program.
+    #[cfg(test)]
+    pub(crate) fn find_on_tier<'r, 't, U: Unit>(
+        &'r self,
+        text: &'t [U],
+        start: usize,
+        config: ExecConfig,
+        code: Option<&'r NativeCode>,
+    ) -> Matches<'r, 't, U> {
+        if let Some(code) = code {
+            code.prepare();
+        }
+        Matches {
+            regex: self,
+            text,
+            next_start: start,
+            config,
+            done: false,
+            steps_executed: 0,
+            scratch: Box::default(),
+            native: code,
+        }
+    }
+
+    /// The lowered program.
+    #[cfg(test)]
+    pub(crate) fn program(&self) -> &Program {
+        &self.program
     }
 
     /// Render the lowered program as a human-readable listing.
@@ -217,7 +272,9 @@ pub struct Matches<'r, 't, U: Unit = u16> {
     config: ExecConfig,
     done: bool,
     steps_executed: u64,
-    scratch: backtrack::Scratch,
+    scratch: Box<Buffers>,
+    /// The program's machine code for this width, once it has compiled.
+    native: Option<&'r NativeCode>,
 }
 
 impl<U: Unit> Matches<'_, '_, U> {
@@ -230,11 +287,131 @@ impl<U: Unit> Matches<'_, '_, U> {
     /// End the search and hand its matcher buffers back for the next one.
     #[must_use]
     pub fn into_scratch(self) -> MatchScratch {
-        if self.scratch.is_oversized() {
+        if self.scratch.interpreter.is_oversized() || self.scratch.native.is_oversized() {
             MatchScratch::default()
         } else {
-            MatchScratch(self.scratch)
+            MatchScratch(Some(self.scratch))
         }
+    }
+
+    /// The next match by the program's machine code: the leftmost search
+    /// picks candidate windows exactly as the interpreter's loop picks
+    /// candidates, and the code runs each window.
+    #[inline(never)]
+    fn next_native(&mut self, code: &NativeCode) -> Option<Result<Match, ExecError>> {
+        let program = &self.regex.program;
+        let len = self.text.len();
+        let mut pos = self.next_start;
+        loop {
+            let window = if program.start_anchored {
+                if pos > 0 {
+                    break;
+                }
+                if let Some(pf) = &program.prefilter
+                    && !(pos < len && pf.cp_may_start(self.text[pos].into()))
+                {
+                    break;
+                }
+                Window {
+                    start: 0,
+                    end: 0,
+                    filter: false,
+                }
+            } else if let Some(lit) = &program.required_literal {
+                // Every start from the earliest the occurrence admits up to
+                // the last one it admits; later starts need a later
+                // occurrence.
+                let Some(at) = lit.find(self.text, pos.saturating_add(lit.min_offset)) else {
+                    break;
+                };
+                pos = pos.max(at - lit.max_offset.min(at));
+                Window {
+                    start: pos,
+                    end: at - lit.min_offset,
+                    filter: false,
+                }
+            } else if let Some(pf) = &program.prefilter {
+                // The vectorized scans find the first candidate; the code's
+                // start filter, which admits exactly the same units, finds
+                // the rest. A single-unit scan never tries the subject's end,
+                // so neither does its window.
+                if let Some(unit) = pf.single() {
+                    match U::narrow(unit)
+                        .and_then(|unit| self.text.get(pos..).and_then(|t| U::position(t, unit)))
+                    {
+                        Some(offset) => pos += offset,
+                        None => break,
+                    }
+                    Window {
+                        start: pos,
+                        end: len - 1,
+                        filter: true,
+                    }
+                } else if let (Some(bytes), Some(few)) = (U::as_latin1(self.text), pf.few_latin1())
+                {
+                    let rest = bytes.get(pos..).unwrap_or(&[]);
+                    let found = match *few {
+                        [a] => memchr::memchr(a, rest),
+                        [a, b] => memchr::memchr2(a, b, rest),
+                        [a, b, c] => memchr::memchr3(a, b, c, rest),
+                        _ => unreachable!("a prefilter holds one to three bytes"),
+                    };
+                    pos = found.map_or(pos.max(len), |offset| pos + offset);
+                    Window {
+                        start: pos,
+                        end: len,
+                        filter: true,
+                    }
+                } else {
+                    Window {
+                        start: pos,
+                        end: len,
+                        filter: true,
+                    }
+                }
+            } else {
+                Window {
+                    start: pos,
+                    end: len,
+                    filter: false,
+                }
+            };
+            if window.start > len {
+                break;
+            }
+            let remaining = self.config.step_limit.saturating_sub(self.steps_executed);
+            let mut budget = remaining;
+            let outcome = native::search(
+                code,
+                program,
+                self.text,
+                window,
+                &mut budget,
+                &mut self.scratch.native,
+            );
+            self.steps_executed = self.steps_executed.saturating_add(remaining - budget);
+            match outcome {
+                Outcome::Match => {
+                    let caps = self.scratch.native.captures();
+                    let mat = build_native_match(program, caps);
+                    let (start, end) = (mat.range.start, mat.range.end);
+                    self.next_start = if end > start { end } else { start + 1 };
+                    return Some(Ok(mat));
+                }
+                Outcome::Exhausted(next) => pos = next,
+                // The interpreter counts the step that overran the budget.
+                Outcome::StepLimit => {
+                    self.steps_executed = self.steps_executed.saturating_add(1);
+                    self.done = true;
+                    return Some(Err(ExecError::StepLimitExceeded));
+                }
+            }
+            if pos > len {
+                break;
+            }
+        }
+        self.done = true;
+        None
     }
 }
 
@@ -245,6 +422,17 @@ impl<U: Unit> Iterator for Matches<'_, '_, U> {
         if self.done {
             return None;
         }
+        match self.native {
+            Some(code) => self.next_native(code),
+            None => self.next_interpreted(),
+        }
+    }
+}
+
+impl<U: Unit> Matches<'_, '_, U> {
+    /// The next match by the interpreter.
+    #[inline(never)]
+    fn next_interpreted(&mut self) -> Option<Result<Match, ExecError>> {
         let program = &self.regex.program;
         let unicode = program.unicode;
         let input = Input::new(self.text, unicode);
@@ -372,7 +560,7 @@ impl<U: Unit> Iterator for Matches<'_, '_, U> {
                 ExecConfig {
                     step_limit: remaining,
                 },
-                &mut self.scratch,
+                &mut self.scratch.interpreter,
             );
             self.steps_executed = self.steps_executed.saturating_add(steps);
             match attempt {
@@ -381,7 +569,7 @@ impl<U: Unit> Iterator for Matches<'_, '_, U> {
                     return Some(Err(e));
                 }
                 Ok(true) => {
-                    let mat = build_match(&self.regex.program, self.scratch.captures());
+                    let mat = build_match(&self.regex.program, self.scratch.interpreter.captures());
                     let end = mat.range.end;
                     self.next_start = if end > pos {
                         end
@@ -463,6 +651,24 @@ fn build_match(program: &Program, caps: &[Option<usize>]) -> Match {
         };
         captures.push(entry);
     }
+    Match {
+        range,
+        captures,
+        group_names: program.names.clone(),
+    }
+}
+
+/// Build a [`Match`] from capture slots native code filled, [`native::NONE`]
+/// where unset.
+fn build_native_match(program: &Program, caps: &[u64]) -> Match {
+    let slot = |index: usize| caps.get(index).copied().filter(|&at| at != native::NONE);
+    let range = slot(0).unwrap_or(0) as usize..slot(1).unwrap_or(0) as usize;
+    let captures = (1..=program.group_count as usize)
+        .map(|g| match (slot(2 * g), slot(2 * g + 1)) {
+            (Some(s), Some(e)) => Some(s as usize..e as usize),
+            _ => None,
+        })
+        .collect();
     Match {
         range,
         captures,

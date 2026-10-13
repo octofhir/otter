@@ -11,6 +11,7 @@
 //!
 //! # Contents
 //! - [`canonicalize`] — non-unicode `i` canonical form.
+//! - [`canonical_groups`] — the BMP units sharing each canonical form.
 //! - [`fold_unicode`] — Unicode Simple Case Folding (`i`+`u`/`v`).
 //! - [`ascii_other_case`] — the opposite-case ASCII letter, used to widen class
 //!   membership under `i`.
@@ -61,6 +62,17 @@ pub(crate) fn canonicalize(cp: u32) -> u32 {
         return cp;
     }
     cu
+}
+
+mod generated {
+    include!(concat!(env!("OUT_DIR"), "/canon_groups.rs"));
+}
+
+/// Every group of two or more BMP code units that share one non-unicode
+/// canonical form ([`canonicalize`]), each sorted, generated at build time.
+#[must_use]
+pub(crate) fn canonical_groups() -> &'static [&'static [u16]] {
+    generated::CANON_GROUPS
 }
 
 /// Unicode Simple Case Folding of one code point (`i`+`u`/`v`).
@@ -122,5 +134,32 @@ mod tests {
         assert_eq!(ascii_other_case(b'A' as u32), b'a' as u32);
         assert_eq!(ascii_other_case(b'a' as u32), b'A' as u32);
         assert_eq!(ascii_other_case(b'5' as u32), b'5' as u32);
+    }
+
+    #[test]
+    fn canonical_groups_partition_the_bmp_by_canonical_form() {
+        let mut group_of = vec![None; 0x1_0000];
+        for (index, group) in canonical_groups().iter().enumerate() {
+            assert!(group.len() > 1);
+            let canon = canonicalize(u32::from(group[0]));
+            for &unit in *group {
+                assert_eq!(canonicalize(u32::from(unit)), canon, "{unit:#x}");
+                assert!(group_of[usize::from(unit)].replace(index).is_none());
+            }
+        }
+        // Units outside every group share their canonical form with no other.
+        let mut lone = std::collections::HashMap::new();
+        for unit in 0..=0xFFFF_u32 {
+            if group_of[unit as usize].is_none() {
+                assert!(lone.insert(canonicalize(unit), unit).is_none(), "{unit:#x}");
+            }
+        }
+        // `é` and `É` share a form, `ÿ` and `Ÿ` too; `ſ` stays apart from `s`.
+        let together = |a: u32, b: u32| {
+            group_of[a as usize].is_some() && group_of[a as usize] == group_of[b as usize]
+        };
+        assert!(together(0xE9, 0xC9));
+        assert!(together(0xFF, 0x178));
+        assert!(!together(0x17F, u32::from(b's')));
     }
 }

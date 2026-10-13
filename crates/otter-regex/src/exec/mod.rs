@@ -2,8 +2,9 @@
 //!
 //! # Contents
 //! - [`ExecConfig`] — the host's step budget for one search.
-//! - [`backtrack`] — the matcher backend; every ECMAScript feature is matched
+//! - [`backtrack`] — the interpreter; every ECMAScript feature is matched
 //!   here.
+//! - [`native`] — the machine-code tier hot programs it covers move to.
 //!
 //! # Invariants
 //! - A search explores until it decides whether a match exists, as ECMAScript
@@ -15,6 +16,7 @@
 //! - <https://tc39.es/ecma262/#sec-pattern-matching> (§22.2.2)
 
 pub(crate) mod backtrack;
+pub(crate) mod native;
 
 /// Per-execution tuning for one search, shared across all candidate starts.
 #[derive(Debug, Clone, Copy)]

@@ -321,6 +321,13 @@ impl Prefilter {
         (!self.few_latin1.is_empty()).then_some(self.few_latin1.as_slice())
     }
 
+    /// Whether a code unit at or above `0x100` can ever begin a match, so a
+    /// scan must look past the low table for it.
+    #[must_use]
+    pub(crate) fn may_start_above_latin1(&self) -> bool {
+        self.has_high || self.canon.is_some()
+    }
+
     /// The single-literal code unit, when the prefilter is one BMP literal.
     #[must_use]
     pub(crate) fn single(&self) -> Option<u16> {
@@ -349,17 +356,13 @@ impl Prefilter {
     }
 }
 
-/// A literal code-unit sequence every match must contain, the window of
-/// distances from the match start at which it can sit, and the offset of its
-/// rarest unit.
+/// A literal code-unit sequence every match must contain and the window of
+/// distances from the match start at which it can sit.
 ///
-/// A one-byte subject searches for the whole literal with a vectorized
-/// substring search. Otherwise the scan searches for that one unit rather than
-/// the first, then confirms the whole literal. Searching a single unit keeps the inner loop a plain equality
-/// scan the compiler vectorizes, while picking the *rarest* unit is what makes
-/// the candidate rate low: in ordinary text the leading unit of a word is a
-/// common letter, so a first-unit scan stops constantly, whereas the `q` of
-/// `unquestionable` almost never fires.
+/// The scan is a vectorized substring search for the whole literal over the
+/// subject's bytes: the literal's bytes for a one-byte subject, its
+/// little-endian unit bytes for a two-byte one, where a hit at an odd byte
+/// offset straddles two units and is skipped.
 ///
 /// A literal the pattern begins with has a window of `0..=0`. One behind a
 /// bounded-width head — `(^|[^\\])"Date(` — sits `min_offset..=max_offset`
@@ -369,15 +372,15 @@ impl Prefilter {
 pub(crate) struct RequiredLiteral {
     /// The required units, in subject order.
     units: Box<[u16]>,
-    /// Index into `units` of the unit the scan searches for.
-    rare: usize,
     /// Fewest code units any match consumes before the literal begins.
     pub(crate) min_offset: usize,
     /// Most code units any match consumes before the literal begins.
     pub(crate) max_offset: usize,
-    /// The whole-literal searcher a one-byte subject uses, when every unit of
-    /// the literal fits one byte.
-    latin1: Option<memchr::memmem::Finder<'static>>,
+    /// The searcher a one-byte subject uses, when every unit of the literal
+    /// fits one byte; otherwise the literal never occurs in such a subject.
+    narrow: Option<memchr::memmem::Finder<'static>>,
+    /// The searcher over a two-byte subject's bytes.
+    wide: memchr::memmem::Finder<'static>,
 }
 
 impl RequiredLiteral {
@@ -391,22 +394,19 @@ impl RequiredLiteral {
         units.truncate(Self::MAX_UNITS);
         debug_assert!(units.len() >= 2);
         debug_assert!(min_offset <= max_offset);
-        let rare = units
-            .iter()
-            .enumerate()
-            .min_by_key(|(_, u)| unit_commonness(**u))
-            .map_or(0, |(i, _)| i);
-        let latin1 = units
+        let narrow = units
             .iter()
             .map(|&unit| u8::try_from(unit).ok())
             .collect::<Option<Vec<u8>>>()
             .map(|bytes| memchr::memmem::Finder::new(&bytes).into_owned());
+        let wide_bytes: Vec<u8> = units.iter().flat_map(|unit| unit.to_le_bytes()).collect();
+        let wide = memchr::memmem::Finder::new(&wide_bytes).into_owned();
         Self {
             units: units.into_boxed_slice(),
-            rare,
             min_offset,
             max_offset,
-            latin1,
+            narrow,
+            wide,
         }
     }
 
@@ -419,80 +419,19 @@ impl RequiredLiteral {
     /// when the subject holds no further occurrence.
     #[must_use]
     pub(crate) fn find<U: crate::cursor::Unit>(&self, text: &[U], from: usize) -> Option<usize> {
-        if let (Some(bytes), Some(finder)) = (U::as_latin1(text), &self.latin1) {
-            return finder.find(bytes.get(from..)?).map(|at| from + at);
+        let bytes = U::as_bytes(text.get(from..)?);
+        if !U::WIDE {
+            return self.narrow.as_ref()?.find(bytes).map(|at| from + at);
         }
-        let n = self.units.len();
-        // A unit too wide for the subject means the literal never occurs.
-        let target = U::narrow(self.units[self.rare])?;
-        let mut i = from;
+        let mut at = 0;
         loop {
-            if i + n > text.len() {
-                return None;
+            let hit = at + self.wide.find(&bytes[at..])?;
+            if hit % 2 == 0 {
+                return Some(from + hit / 2);
             }
-            // The searched unit sits `rare` units into the window, so a hit at
-            // `i + rare + off` corresponds to a window starting at `i + off`.
-            let off = U::position(&text[i + self.rare..], target)?;
-            let start = i + off;
-            if start + n > text.len() {
-                return None;
-            }
-            if U::eq_units(&text[start..start + n], &self.units) {
-                return Some(start);
-            }
-            i = start + 1;
+            at = hit + 1;
         }
     }
-}
-
-/// A rough relative frequency for a code unit in ordinary text, used only to
-/// pick which unit of a literal the scan searches for. Lower is rarer.
-///
-/// The exact numbers matter little — what matters is that letters and spaces
-/// rank far above punctuation, digits, and everything outside ASCII, so a
-/// literal containing an unusual unit searches on that one.
-fn unit_commonness(u: u16) -> u8 {
-    const TABLE: [u8; 128] = {
-        let mut t = [8u8; 128];
-        // Punctuation and control units are rarer than letters but not rare
-        // enough to beat a genuinely unusual unit.
-        let mut i = 0;
-        while i < 128 {
-            t[i] = if i >= b'a' as usize && i <= b'z' as usize {
-                40
-            } else if i >= b'A' as usize && i <= b'Z' as usize {
-                20
-            } else if i >= b'0' as usize && i <= b'9' as usize {
-                16
-            } else {
-                6
-            };
-            i += 1;
-        }
-        // The most common English letters, plus the separators that dominate
-        // any real subject.
-        t[b' ' as usize] = 100;
-        t[b'\n' as usize] = 60;
-        t[b'e' as usize] = 90;
-        t[b't' as usize] = 85;
-        t[b'a' as usize] = 82;
-        t[b'o' as usize] = 80;
-        t[b'i' as usize] = 78;
-        t[b'n' as usize] = 76;
-        t[b's' as usize] = 74;
-        t[b'r' as usize] = 72;
-        t[b'h' as usize] = 70;
-        t[b'l' as usize] = 65;
-        t[b'd' as usize] = 62;
-        t[b'u' as usize] = 58;
-        t[b'c' as usize] = 55;
-        t[b'm' as usize] = 52;
-        t
-    };
-    let i = usize::from(u);
-    // Outside ASCII a unit is rare enough that searching it is always the best
-    // choice available.
-    if i < TABLE.len() { TABLE[i] } else { 1 }
 }
 
 impl Program {
@@ -695,6 +634,13 @@ mod scan_tests {
                 assert_eq!(scan.find(&wide, from), expected, "{literal} from {from}");
             }
         }
+        // Unit bytes that line up only across a unit boundary are no
+        // occurrence: `AB` is `41 00 42 00`, which `[0x4100, 0x4200, 0]`
+        // holds from its second byte.
+        let straddle = RequiredLiteral::new(vec![0x41, 0x42], 0, 0);
+        let shifted: [u16; 5] = [0x4100, 0x4200, 0x0000, 0x0041, 0x0042];
+        assert_eq!(straddle.find(&shifted, 0), Some(3));
+        assert_eq!(straddle.find(&shifted[..3], 0), None);
         // A literal wider than one byte never occurs in a one-byte subject.
         let wide_literal = RequiredLiteral::new(vec![0x4e00, 0x4e8c], 0, 0);
         assert_eq!(wide_literal.find(&narrow, 0), None);

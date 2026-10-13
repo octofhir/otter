@@ -1828,6 +1828,24 @@ impl<'a> Codegen<'a> {
                 let temps = [allocation.gp_temps[0], allocation.gp_temps[1]];
                 self.emit_store_keyed_cached(node, [receiver, key, value], temps)?;
             }
+            Kind::RegExpMethod { test } => {
+                let (receiver, argument) = (Self::gp(input(0)), Self::gp(input(1)));
+                let destination = Self::gp(result.expect("a result"));
+                let stub = if *test {
+                    abi::STUB_JIT_REGEXP_TEST
+                } else {
+                    abi::STUB_JIT_REGEXP_EXEC
+                };
+                self.emit_committed_call(
+                    node,
+                    stub,
+                    &[
+                        CommittedArgument::Value(receiver),
+                        CommittedArgument::Value(argument),
+                    ],
+                    Some(destination),
+                )?;
+            }
             Kind::LoadKeyedCached { .. } => {
                 let (receiver, key) = (Self::gp(input(0)), Self::gp(input(1)));
                 let destination = Self::gp(result.expect("a result"));

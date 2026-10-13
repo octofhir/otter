@@ -466,6 +466,13 @@ pub(crate) enum Kind {
     LoadKeyedCached {
         pc: u32,
     },
+    /// `input0.exec(input1)` (or `.test` when `test`) of the realm's
+    /// original RegExp method, whose identity a preceding check proved: the
+    /// method's complete semantics through its runtime entry, without a
+    /// native call frame. May run code (a `lastIndex` coercion) and throw.
+    RegExpMethod {
+        test: bool,
+    },
     /// Tagged word at `[input0 + offset]` (input0 a `Word` base or a tagged
     /// cell address).
     LoadTaggedField(i32),
@@ -874,6 +881,7 @@ impl Kind {
             | Self::StorePropertyCached { .. }
             | Self::StoreKeyedCached { .. }
             | Self::LoadKeyedCached { .. }
+            | Self::RegExpMethod { .. }
             | Self::Instanceof
             | Self::ArrayPush(_)
             | Self::ArrayPop(_)
@@ -1165,6 +1173,7 @@ impl Kind {
                 fp_temps: 1,
                 fixed_gp_clobbers: SmallVec::new(),
             },
+            Self::RegExpMethod { .. } => simple(2, ResultPolicy::Register),
             Self::Int32Div | Self::Int32Mod => {
                 if let Some(pair) = target.integer_division {
                     Constraints {

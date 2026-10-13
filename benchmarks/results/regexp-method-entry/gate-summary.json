@@ -1,0 +1,241 @@
+{
+ "status": "passed",
+ "parent": "d027fccd6520bec73d7cd872373110ae8149aeb9",
+ "source_freeze_sha256": "65888f57380f668a4ba504dbd523e4829687c2e666d23a4c14ddf3eabb433b6d",
+ "cli_sha256": "99ffe60cda4229a08df8f6df208ba22315255e0e5533440c0a6a3d92e819a388",
+ "runner_sha256": "aa7be670c8602afdafc532a9bd23b3f47afd76c2570670b511a87f008a28f52b",
+ "commands": {
+  "clippy-host-1": {
+   "command": [
+    "cargo",
+    "clippy",
+    "-p",
+    "otter-gc",
+    "-p",
+    "otter-vm",
+    "-p",
+    "otter-jit",
+    "-p",
+    "otter-runtime",
+    "-p",
+    "otter-cli",
+    "-p",
+    "otter-difftest",
+    "-p",
+    "otter-compiler",
+    "-p",
+    "otter-bytecode",
+    "-p",
+    "otter-regex",
+    "--all-targets",
+    "--",
+    "-D",
+    "warnings"
+   ],
+   "exit_code": 0,
+   "source_freeze": "unchanged",
+   "log_sha256": "0ddbe11e60ababed3d7bda34b48aad0f6c7aa1262928733e4b995c81e368ec7b"
+  },
+  "vm-lib-1": {
+   "command": [
+    "cargo",
+    "test",
+    "-p",
+    "otter-vm",
+    "--lib",
+    "--release"
+   ],
+   "exit_code": 0,
+   "source_freeze": "unchanged",
+   "log_sha256": "5f914e7fd9c15c7d69001990d875c460425cef0e8a00800001689f686820f5bc",
+   "units": [
+    {
+     "passed": 1256,
+     "failed": 0
+    }
+   ]
+  },
+  "jit-lib-1": {
+   "command": [
+    "cargo",
+    "test",
+    "-p",
+    "otter-jit",
+    "--lib",
+    "--release"
+   ],
+   "exit_code": 0,
+   "source_freeze": "unchanged",
+   "log_sha256": "3e993a1783f154c3dcac3f5065f3445ead7f0eee15886f0880a7865989995d74",
+   "units": [
+    {
+     "passed": 276,
+     "failed": 0
+    }
+   ]
+  },
+  "build-host-1": {
+   "command": [
+    "cargo",
+    "build",
+    "--release",
+    "-p",
+    "otter-cli",
+    "-p",
+    "otter-difftest",
+    "-p",
+    "otter-test262"
+   ],
+   "exit_code": 0,
+   "source_freeze": "unchanged",
+   "log_sha256": "dd2b1f3597e585858de6c757cf78872143ba59ddfa25ee2e43f84bd758ce3164"
+  },
+  "test262-full-1": {
+   "command": [
+    "bash",
+    "scripts/test262-safe.sh",
+    "--output",
+    "benchmarks/results/t262/full-2026-10-13l.json"
+   ],
+   "exit_code": 0,
+   "source_freeze": "unchanged",
+   "log_sha256": "a03f80c0cf14eb395982f7d5f14f43303f081a9eb2f8950346ba3afbf4a3aa27"
+  },
+  "difftest-host-1": {
+   "command": [
+    "target/release/otter-difftest",
+    "--otter",
+    "target/release/otter",
+    "--timeout-ms",
+    "120000"
+   ],
+   "exit_code": 0,
+   "source_freeze": "unchanged",
+   "log_sha256": "91d2fe2ee7b868247bbb4cf752a20e4c3c67ac44137f474b15acedf891990e50",
+   "corpus": {
+    "passed": 166,
+    "failed": 0
+   }
+  },
+  "build-x86-1": {
+   "command": [
+    "cargo",
+    "build",
+    "--release",
+    "-p",
+    "otter-cli",
+    "-p",
+    "otter-difftest",
+    "--target",
+    "x86_64-apple-darwin"
+   ],
+   "exit_code": 0,
+   "source_freeze": "unchanged",
+   "log_sha256": "2f842d76345e60b685ec424bf2bb83cf9b6b7ca62f173c1c1d43cce90ebf4c19"
+  },
+  "jit-lib-x86-1": {
+   "command": [
+    "cargo",
+    "test",
+    "-p",
+    "otter-jit",
+    "--lib",
+    "--release",
+    "--target",
+    "x86_64-apple-darwin"
+   ],
+   "exit_code": 0,
+   "source_freeze": "unchanged",
+   "log_sha256": "4a6ccbeedc0826dff51afac8ee505f9155e24e49b447ca657e711da864cd8b89",
+   "units": [
+    {
+     "passed": 299,
+     "failed": 0
+    }
+   ]
+  },
+  "clippy-x86-1": {
+   "command": [
+    "cargo",
+    "clippy",
+    "-p",
+    "otter-gc",
+    "-p",
+    "otter-vm",
+    "-p",
+    "otter-jit",
+    "-p",
+    "otter-runtime",
+    "-p",
+    "otter-cli",
+    "-p",
+    "otter-difftest",
+    "-p",
+    "otter-compiler",
+    "-p",
+    "otter-bytecode",
+    "-p",
+    "otter-regex",
+    "--all-targets",
+    "--target",
+    "x86_64-apple-darwin",
+    "--",
+    "-D",
+    "warnings"
+   ],
+   "exit_code": 0,
+   "source_freeze": "unchanged",
+   "log_sha256": "012a1d2cbd6b82c7dca2706fc715cea0d5a28ac40f0f0e90c9f2604328250e49"
+  },
+  "difftest-x86-1": {
+   "command": [
+    "target/x86_64-apple-darwin/release/otter-difftest",
+    "--otter",
+    "target/x86_64-apple-darwin/release/otter",
+    "--timeout-ms",
+    "120000"
+   ],
+   "exit_code": 0,
+   "source_freeze": "unchanged",
+   "log_sha256": "b7ac33e643171ac9c2e939924260c5e454bba1e22d7381d8ba6faa611236c2ad",
+   "corpus": {
+    "passed": 166,
+    "failed": 0
+   }
+  }
+ },
+ "test262": {
+  "report": "benchmarks/results/t262/full-2026-10-13l.json",
+  "totals": {
+   "total": 53575,
+   "passed": 52463,
+   "failed": 12,
+   "skipped": 1100,
+   "crashed": 0,
+   "timed_out": 0,
+   "oom": 0
+  },
+  "status": "passed",
+  "baselines": [
+   "benchmarks/results/t262/full-2026-10-13k.md",
+   "benchmarks/results/t262/full-2026-10-11e.md"
+  ]
+ },
+ "oracle": {
+  "runs": 16,
+  "binary_unchanged": true,
+  "status": "passed"
+ },
+ "gc": {
+  "runs": 26,
+  "binary_unchanged": true,
+  "status": "passed"
+ },
+ "gcfull": {
+  "runs": 32,
+  "binary_unchanged": true,
+  "status": "passed"
+ },
+ "fixed_work": "performance.json",
+ "wall_clock": "wall-final/"
+}

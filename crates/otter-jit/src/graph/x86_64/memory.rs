@@ -22,6 +22,7 @@ use otter_vm::{jit::JitGuardWidth, native_abi as abi, value::tag};
 use super::Codegen;
 use crate::{
     Unsupported,
+    graph::call::CommittedArgument,
     graph::ir::{Kind, NodeId},
 };
 
@@ -39,6 +40,22 @@ impl Codegen<'_> {
         let input = |index| allocation.inputs[index];
         let output = || Self::gp(allocation.result.expect("memory result"));
         match self.graph.node(node).kind.clone() {
+            Kind::RegExpMethod { test } => {
+                let stub = if test {
+                    abi::STUB_JIT_REGEXP_TEST
+                } else {
+                    abi::STUB_JIT_REGEXP_EXEC
+                };
+                self.emit_committed_call(
+                    node,
+                    stub,
+                    &[
+                        CommittedArgument::Value(Self::gp(input(0))),
+                        CommittedArgument::Value(Self::gp(input(1))),
+                    ],
+                    Some(output()),
+                )?;
+            }
             Kind::LoadOwnField(field) => crate::x86_64::fields::emit_own_field(
                 &mut self.ops,
                 self.view.field_layout,

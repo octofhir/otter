@@ -29,10 +29,21 @@ pub enum IntrinsicCallKind {
     Number,
     /// The realm's original Object constructor and ordinary-call entry.
     Object,
+    /// The realm's original `%RegExp.prototype.exec%`, called as a method.
+    RegExpExec,
+    /// The realm's original `%RegExp.prototype.test%`, called as a method.
+    RegExpTest,
 }
 
 impl IntrinsicCallKind {
-    pub(crate) const ALL: [Self; 4] = [Self::Array, Self::Boolean, Self::Number, Self::Object];
+    pub(crate) const ALL: [Self; 6] = [
+        Self::Array,
+        Self::Boolean,
+        Self::Number,
+        Self::Object,
+        Self::RegExpExec,
+        Self::RegExpTest,
+    ];
 
     pub(crate) const fn feedback_payload(self) -> u32 {
         match self {
@@ -40,6 +51,8 @@ impl IntrinsicCallKind {
             Self::Boolean => 1,
             Self::Number => 2,
             Self::Object => 3,
+            Self::RegExpExec => 4,
+            Self::RegExpTest => 5,
         }
     }
 
@@ -49,8 +62,17 @@ impl IntrinsicCallKind {
             1 => Some(Self::Boolean),
             2 => Some(Self::Number),
             3 => Some(Self::Object),
+            4 => Some(Self::RegExpExec),
+            5 => Some(Self::RegExpTest),
             _ => None,
         }
+    }
+
+    /// Whether a method call (`receiver.method(...)`) is this callable's
+    /// specialized form, rather than a plain call or construction.
+    #[must_use]
+    pub const fn is_method(self) -> bool {
+        matches!(self, Self::RegExpExec | Self::RegExpTest)
     }
 }
 
@@ -99,7 +121,7 @@ mod tests {
                 Some(kind)
             );
         }
-        for invalid in [4, 256, u32::MAX] {
+        for invalid in [6, 256, u32::MAX] {
             assert_eq!(IntrinsicCallKind::from_feedback_payload(invalid), None);
         }
     }

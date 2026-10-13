@@ -280,6 +280,8 @@ pub(crate) struct RealmIntrinsics {
     boolean_constructor: crate::native_function::NativeFunction,
     number_constructor: crate::native_function::NativeFunction,
     object_constructor: crate::native_function::NativeFunction,
+    regexp_exec: crate::native_function::NativeFunction,
+    regexp_test: crate::native_function::NativeFunction,
     /// Whether this realm's `%RegExp.prototype%` is built-in, while proven.
     pub(crate) regexp_protocol: Option<crate::regexp_fast::RegExpProtocolProof>,
     /// Which iteration reads have built-in answers in this realm, while proven.
@@ -307,6 +309,8 @@ impl Default for RealmIntrinsics {
             object_constructor: crate::native_function::NativeFunction::from_gc(
                 otter_gc::Gc::null(),
             ),
+            regexp_exec: crate::native_function::NativeFunction::from_gc(otter_gc::Gc::null()),
+            regexp_test: crate::native_function::NativeFunction::from_gc(otter_gc::Gc::null()),
             regexp_protocol: None,
             iteration: crate::iteration_protocol::IterationProofs::default(),
             object_conversion: None,
@@ -359,6 +363,8 @@ impl RealmIntrinsics {
             crate::IntrinsicCallKind::Boolean => &self.boolean_constructor,
             crate::IntrinsicCallKind::Number => &self.number_constructor,
             crate::IntrinsicCallKind::Object => &self.object_constructor,
+            crate::IntrinsicCallKind::RegExpExec => &self.regexp_exec,
+            crate::IntrinsicCallKind::RegExpTest => &self.regexp_test,
         }
     }
 
@@ -404,6 +410,17 @@ impl RealmIntrinsics {
         self.boolean_constructor = callable(heap, "Boolean");
         self.number_constructor = callable(heap, "Number");
         self.object_constructor = callable(heap, "Object");
+        let method = |heap: &mut otter_gc::GcHeap, prototype: Option<JsObject>, name| {
+            prototype
+                .and_then(|prototype| object::get(prototype, heap, name))
+                .and_then(|value| value.as_native_function())
+                .unwrap_or_else(|| {
+                    crate::native_function::NativeFunction::from_gc(otter_gc::Gc::null())
+                })
+        };
+        let regexp_prototype = self.regexp_prototype();
+        self.regexp_exec = method(heap, regexp_prototype, "exec");
+        self.regexp_test = method(heap, regexp_prototype, "test");
     }
 
     /// Visit every slot address, filled or not.
@@ -422,6 +439,8 @@ impl RealmIntrinsics {
         self.boolean_constructor.trace_gc_roots(visitor);
         self.number_constructor.trace_gc_roots(visitor);
         self.object_constructor.trace_gc_roots(visitor);
+        self.regexp_exec.trace_gc_roots(visitor);
+        self.regexp_test.trace_gc_roots(visitor);
     }
 
     /// Trace cached prototype handles as root slots.
@@ -531,7 +550,7 @@ mod tests {
         empty.visit_slots(&mut |_| visited += 1);
         assert_eq!(
             visited,
-            Intrinsic::COUNT + 5,
+            Intrinsic::COUNT + 1 + crate::IntrinsicCallKind::ALL.len(),
             "a fixed-shape walk must not depend on which slots are filled"
         );
         let mut traced = 0usize;
@@ -631,6 +650,8 @@ mod tests {
                 "boolean-root",
                 "number-root",
                 "object-root",
+                "regexp-exec-root",
+                "regexp-test-root",
             ]) {
                 let callable = crate::native_function::NativeFunction::new_static(
                     &mut vm.gc_heap,
@@ -650,6 +671,12 @@ mod tests {
                     }
                     crate::IntrinsicCallKind::Object => {
                         vm.realm_intrinsics.object_constructor = callable
+                    }
+                    crate::IntrinsicCallKind::RegExpExec => {
+                        vm.realm_intrinsics.regexp_exec = callable
+                    }
+                    crate::IntrinsicCallKind::RegExpTest => {
+                        vm.realm_intrinsics.regexp_test = callable
                     }
                 }
             }

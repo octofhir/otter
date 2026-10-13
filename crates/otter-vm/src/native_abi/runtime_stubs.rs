@@ -1902,6 +1902,8 @@ pub const fn runtime_stub_name(id: super::RuntimeStubId) -> &'static str {
         id if id == STUB_MATH_POW_LEAF.id => "math_pow_leaf",
         id if id == STUB_FIELD_TYPE_OBSERVE.id => "field_type_observe",
         id if id == STUB_SHAPE_LEFT.id => "shape_left",
+        id if id == STUB_JIT_REGEXP_EXEC.id => "jit_regexp_exec",
+        id if id == STUB_JIT_REGEXP_TEST.id => "jit_regexp_test",
         _ => "unknown_runtime_stub",
     }
 }
@@ -2091,6 +2093,33 @@ pub const STUB_SHAPE_LEFT: RuntimeStubDescriptor = descriptor(
     NativeResultDomain::Probe,
 );
 
+/// `%RegExp.prototype.exec%` of the realm's original method on `(receiver,
+/// argument)`, whose identity generated code proved: the method's complete
+/// semantics without a native call frame. The `lastIndex` coercion may run
+/// JavaScript; once entered it completes or returns a pure exception value.
+pub const STUB_JIT_REGEXP_EXEC: RuntimeStubDescriptor = descriptor(
+    115,
+    RuntimeStubClass::Reentrant,
+    RuntimeStubSignature::CommittedValue2,
+    2,
+    RuntimeStubEffects::reentrant(true),
+    RuntimeStubException::Status,
+    RuntimeStubResultAbi::NativePair,
+    NativeResultDomain::Committed,
+);
+
+/// `%RegExp.prototype.test%` counterpart of [`STUB_JIT_REGEXP_EXEC`].
+pub const STUB_JIT_REGEXP_TEST: RuntimeStubDescriptor = descriptor(
+    116,
+    RuntimeStubClass::Reentrant,
+    RuntimeStubSignature::CommittedValue2,
+    2,
+    RuntimeStubEffects::reentrant(true),
+    RuntimeStubException::Status,
+    RuntimeStubResultAbi::NativePair,
+    NativeResultDomain::Committed,
+);
+
 /// Dense inventory of every current machine-callable runtime-stub contract.
 pub const RUNTIME_STUB_DESCRIPTORS: &[RuntimeStubDescriptor] = &[
     STUB_JIT_BACKEDGE_POLL,
@@ -2207,6 +2236,8 @@ pub const RUNTIME_STUB_DESCRIPTORS: &[RuntimeStubDescriptor] = &[
     STUB_MATH_POW_LEAF,
     STUB_FIELD_TYPE_OBSERVE,
     STUB_SHAPE_LEFT,
+    STUB_JIT_REGEXP_EXEC,
+    STUB_JIT_REGEXP_TEST,
 ];
 
 // Descriptor ids are the sole slot authority for bindings and symbol lookup.

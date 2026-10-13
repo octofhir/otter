@@ -230,7 +230,7 @@ fn slice_subject_string<'scope>(
     Ok(scope.value(Value::string(string)))
 }
 
-fn build_match_result_native<'scope>(
+pub(crate) fn build_match_result_native<'scope>(
     m: &crate::regexp::engine::Match,
     input: Local<'_>,
     has_indices: bool,

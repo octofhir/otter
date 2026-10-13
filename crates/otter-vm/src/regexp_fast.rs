@@ -11,6 +11,8 @@
 //! - [`Interpreter::is_pristine_regexp`] — a receiver qualifies.
 //! - [`Interpreter::regexp_species_is_builtin`] — `@@split`'s species read.
 //! - [`exec_without_result`] — `RegExpBuiltinExec` reporting only success.
+//! - [`exec_direct`] — `RegExpBuiltinExec` of a directly called original
+//!   `exec` or `test`, without a frame, allocating nothing before a hit.
 //! - [`split`] — `@@split` with the receiver's own matcher as the splitter.
 //! - [`replace`] — `@@replace` over match records, substituting by range.
 //!
@@ -202,6 +204,82 @@ pub(crate) fn exec_without_result(
         });
     }
     Ok(true)
+}
+
+/// What a direct `exec` or `test` produced without a native frame.
+pub(crate) enum DirectExec {
+    /// The call completed with this value.
+    Done(Value),
+    /// `exec` matched: the match array remains to be built from the record.
+    Matched(crate::regexp::engine::Match),
+}
+
+/// `RegExpBuiltinExec(R, S)` for a RegExp `receiver` whose `lastIndex` is a
+/// writable non-negative int32 (so reading, coercing and writing it run no
+/// user code) and a string `input`, as far as it goes without allocating.
+/// A miss and every `test` complete; an `exec` hit returns its record after
+/// the `lastIndex` write and the legacy statics. `None` when either operand
+/// needs the general ladder. The match neither allocates nor collects.
+pub(crate) fn exec_direct(
+    interp: &mut Interpreter,
+    receiver: Value,
+    input: Value,
+    test: bool,
+) -> Option<Result<DirectExec, crate::VmError>> {
+    let regexp = receiver.as_regexp()?;
+    let heap = &interp.gc_heap;
+    let text = input.as_string(heap)?;
+    let last_index = regexp.last_index_value(heap).as_i32()?;
+    if last_index < 0 || !regexp.last_index_writable(heap) {
+        return None;
+    }
+    let flags = regexp.flags(heap);
+    let tracks_last_index = flags.global || flags.sticky;
+    let start = if tracks_last_index {
+        last_index as usize
+    } else {
+        0
+    };
+    let missed = if test {
+        Value::boolean(false)
+    } else {
+        Value::NULL
+    };
+    if start > text.len() as usize {
+        regexp.set_last_index(heap, 0);
+        return Some(Ok(DirectExec::Done(missed)));
+    }
+    let search = interp.regex_search();
+    let execution =
+        text.with_code_units(heap, |units| regexp.find_one(heap, units, start, &search));
+    if let Err(error) = interp.charge_regex_backtrack_steps(execution.steps) {
+        return Some(Err(error));
+    }
+    let Ok(matched) = execution.result else {
+        return Some(Err(interp.err_budget(
+            "work budget exceeded in a regular expression search".into(),
+        )));
+    };
+    let heap = &interp.gc_heap;
+    let Some(matched) = matched.filter(|m| !flags.sticky || m.range.start == start) else {
+        if tracks_last_index {
+            regexp.set_last_index(heap, 0);
+        }
+        return Some(Ok(DirectExec::Done(missed)));
+    };
+    if tracks_last_index {
+        regexp.set_last_index(heap, matched.range.end as u32);
+    }
+    if regexp.legacy_features_enabled(heap) {
+        interp
+            .regexp_legacy
+            .record_match(input, matched.range.clone(), &matched.captures);
+    }
+    Some(Ok(if test {
+        DirectExec::Done(Value::boolean(true))
+    } else {
+        DirectExec::Matched(matched)
+    }))
 }
 
 /// `ToUint32(limit)` for a limit whose conversion runs no user code.
@@ -697,4 +775,82 @@ fn expand_template(
         }
     }
     out.len() <= MAX_STRING_UNITS
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::string::JsString;
+
+    fn regexp(vm: &mut Interpreter, pattern: &str, flags: &str) -> Value {
+        let units: Vec<u16> = pattern.encode_utf16().collect();
+        let regexp = crate::regexp::JsRegExp::compile_cached(
+            &mut vm.gc_heap,
+            &mut vm.regex_compile_cache,
+            &units,
+            flags,
+        )
+        .expect("fixture pattern");
+        Value::regexp(regexp)
+    }
+
+    fn done(result: Option<Result<DirectExec, crate::VmError>>) -> Option<Value> {
+        match result {
+            Some(Ok(DirectExec::Done(value))) => Some(value),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn direct_exec_completes_misses_tests_and_global_last_index_without_allocating() {
+        let mut vm = Interpreter::new().expect("fixture interpreter");
+        vm.gc_heap.set_gc_stress(0, false);
+        let subject = Value::string(JsString::from_str("xbaxba", &mut vm.gc_heap).unwrap());
+        let plain = regexp(&mut vm, "^ba", "");
+        assert_eq!(
+            done(exec_direct(&mut vm, plain, subject, false)),
+            Some(Value::NULL)
+        );
+        assert_eq!(
+            done(exec_direct(&mut vm, plain, subject, true)),
+            Some(Value::boolean(false))
+        );
+        let global = regexp(&mut vm, "ba", "g");
+        assert_eq!(
+            done(exec_direct(&mut vm, global, subject, true)),
+            Some(Value::boolean(true))
+        );
+        assert_eq!(global.as_regexp().unwrap().last_index(&vm.gc_heap), 3);
+        // An exec hit leaves the array to its caller, after the lastIndex write.
+        match exec_direct(&mut vm, global, subject, false) {
+            Some(Ok(DirectExec::Matched(matched))) => assert_eq!(matched.range, 4..6),
+            _ => panic!("a hit returns its record"),
+        }
+        assert_eq!(global.as_regexp().unwrap().last_index(&vm.gc_heap), 6);
+        assert_eq!(
+            done(exec_direct(&mut vm, global, subject, false)),
+            Some(Value::NULL)
+        );
+        assert_eq!(global.as_regexp().unwrap().last_index(&vm.gc_heap), 0);
+    }
+
+    #[test]
+    fn direct_exec_declines_operands_that_need_the_general_ladder() {
+        let mut vm = Interpreter::new().expect("fixture interpreter");
+        vm.gc_heap.set_gc_stress(0, false);
+        let subject = Value::string(JsString::from_str("aaa", &mut vm.gc_heap).unwrap());
+        let re = regexp(&mut vm, "a", "g");
+        // A non-string subject and a non-RegExp receiver.
+        assert!(exec_direct(&mut vm, re, Value::number_i32(1), false).is_none());
+        assert!(exec_direct(&mut vm, subject, subject, false).is_none());
+        // A lastIndex that is not a non-negative int32 needs its coercion.
+        re.as_regexp()
+            .unwrap()
+            .set_last_index_value(&mut vm.gc_heap, Value::number_f64(1.5));
+        assert!(exec_direct(&mut vm, re, subject, false).is_none());
+        re.as_regexp()
+            .unwrap()
+            .set_last_index_value(&mut vm.gc_heap, Value::number_i32(-1));
+        assert!(exec_direct(&mut vm, re, subject, false).is_none());
+    }
 }

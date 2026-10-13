@@ -151,10 +151,11 @@ pub(crate) fn exec_once_native(
             let text = input_value
                 .as_string(scope.context().heap())
                 .ok_or_else(|| native_type_error(REGEXP_EXEC_NAME, "input is not a string"))?;
-            let step_limit = scope.context().regex_step_limit();
-            let heap = scope.context().heap();
+            let context = scope.context();
+            let search = context.regex_search();
+            let heap = context.heap();
             let execution =
-                text.with_code_units(heap, |units| re.find_one(heap, units, start, step_limit));
+                text.with_code_units(heap, |units| re.find_one(heap, units, start, &search));
             let matched = crate::regexp::finish_execution(scope.context(), execution)?;
             let matched = match matched {
                 Some(matched) => matched,
@@ -442,12 +443,13 @@ pub fn native_regexp_symbol_match(
                         scope.context().heap(),
                     )
                 {
-                    let step_limit = scope.context().regex_step_limit();
+                    let context = scope.context();
+                    let search = context.regex_search();
                     let execution = re.find_all(
-                        scope.context().heap(),
+                        context.heap(),
                         crate::string::CodeUnits::Utf16(&input_units),
                         0,
-                        step_limit,
+                        &search,
                     );
                     let found = crate::regexp::finish_execution(scope.context(), execution)?;
                     if found.is_empty() {

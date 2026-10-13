@@ -738,3 +738,33 @@ fn latin1_subjects_match_like_their_utf16_form() {
         }
     }
 }
+
+/// Buffers handed back by one search serve the next one, across patterns and
+/// subject widths, without changing a result; buffers a pathological search
+/// grew past the retained bound come back empty and still work.
+#[test]
+fn scratch_carries_between_searches() {
+    use otter_regex::MatchScratch;
+    let captures = Regex::compile_str("(a+)(b)?(c|d)", Flags::default()).expect("compile");
+    let anchored = Regex::compile_str("^x(y)", Flags::default()).expect("compile");
+    let nested = Regex::compile_str("(a|aa)*b", Flags::default()).expect("compile");
+    let mut scratch = MatchScratch::default();
+    for round in 0..3 {
+        let subject: Vec<u16> = format!("zzaaac{round}aad").encode_utf16().collect();
+        let mut found = captures.find_utf16_with(&subject, 0, ExecConfig::default(), scratch);
+        let first = found.next().expect("a match").expect("within budget");
+        assert_eq!(first.range, 2..6);
+        assert_eq!(first.captures, vec![Some(2..5), None, Some(5..6)]);
+        scratch = found.into_scratch();
+
+        let latin: Vec<u8> = b"xy".to_vec();
+        let mut found = anchored.find_latin1_with(&latin, 0, ExecConfig::default(), scratch);
+        assert_eq!(found.next().expect("a match").expect("within budget").range, 0..2);
+        scratch = found.into_scratch();
+
+        let deep: Vec<u16> = format!("{}b", "a".repeat(5000)).encode_utf16().collect();
+        let mut found = nested.find_utf16_with(&deep, 0, ExecConfig::default(), scratch);
+        assert_eq!(found.next().expect("a match").expect("within budget").range, 0..5001);
+        scratch = found.into_scratch();
+    }
+}

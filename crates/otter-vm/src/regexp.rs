@@ -31,7 +31,7 @@
 //! # See also
 //! - <https://tc39.es/ecma262/#sec-regexp-regular-expression-objects>
 
-use std::cell::RefCell;
+use std::cell::Cell;
 
 use engine::Regex;
 use otter_gc::raw::{RawGc, SlotVisitor};
@@ -74,27 +74,31 @@ pub(crate) mod engine {
     }
 
     /// Collect every successful match from `start` with exact work accounting,
-    /// exploring at most `step_limit` backtrack points. The subject is
-    /// searched at its stored width.
+    /// exploring at most the search's step limit of backtrack points. The
+    /// subject is searched at its stored width.
     pub(crate) fn find(
         re: &Regex,
         text: crate::string::CodeUnits<'_>,
         start: usize,
-        step_limit: u64,
+        search: &super::RegexSearch<'_>,
     ) -> Execution<Vec<Match>> {
-        let config = otter_regex::ExecConfig { step_limit };
+        let config = otter_regex::ExecConfig {
+            step_limit: search.step_limit,
+        };
+        let scratch = search.scratch.take();
         match text {
             crate::string::CodeUnits::Latin1(bytes) => {
-                collect_all(re.find_latin1(bytes, start, config))
+                collect_all(re.find_latin1_with(bytes, start, config, scratch), search)
             }
             crate::string::CodeUnits::Utf16(units) => {
-                collect_all(re.find_utf16(units, start, config))
+                collect_all(re.find_utf16_with(units, start, config, scratch), search)
             }
         }
     }
 
     fn collect_all<U: otter_regex::Unit>(
         mut matches: otter_regex::Matches<'_, '_, U>,
+        search: &super::RegexSearch<'_>,
     ) -> Execution<Vec<Match>> {
         let mut found = Vec::new();
         let result = loop {
@@ -104,40 +108,64 @@ pub(crate) mod engine {
                 None => break Ok(found),
             }
         };
-        Execution {
-            result,
-            steps: matches.steps_executed(),
-        }
+        let steps = matches.steps_executed();
+        search.scratch.set(matches.into_scratch());
+        Execution { result, steps }
     }
 
     /// Find only the first match from `start` — the single-match path for
     /// `exec`/`test`. The iterator is lazy, so this computes one match instead
-    /// of the whole remaining set. Exceeding `step_limit` remains an explicit
+    /// of the whole remaining set. Exceeding the step limit remains an explicit
     /// resource error for the VM boundary to surface.
     pub(crate) fn find_one(
         re: &Regex,
         text: crate::string::CodeUnits<'_>,
         start: usize,
-        step_limit: u64,
+        search: &super::RegexSearch<'_>,
     ) -> Execution<Option<Match>> {
-        let config = otter_regex::ExecConfig { step_limit };
+        let config = otter_regex::ExecConfig {
+            step_limit: search.step_limit,
+        };
+        let scratch = search.scratch.take();
         match text {
             crate::string::CodeUnits::Latin1(bytes) => {
-                first_match(re.find_latin1(bytes, start, config))
+                first_match(re.find_latin1_with(bytes, start, config, scratch), search)
             }
             crate::string::CodeUnits::Utf16(units) => {
-                first_match(re.find_utf16(units, start, config))
+                first_match(re.find_utf16_with(units, start, config, scratch), search)
             }
         }
     }
 
     fn first_match<U: otter_regex::Unit>(
         mut matches: otter_regex::Matches<'_, '_, U>,
+        search: &super::RegexSearch<'_>,
     ) -> Execution<Option<Match>> {
         let result = matches.next().transpose();
-        Execution {
-            result,
-            steps: matches.steps_executed(),
+        let steps = matches.steps_executed();
+        search.scratch.set(matches.into_scratch());
+        Execution { result, steps }
+    }
+}
+
+/// What one RegExp search takes from its isolate: the backtrack points it may
+/// explore and the matcher buffers every search of the isolate reuses.
+///
+/// The buffers sit in a cell the search empties while it runs and refills
+/// when it ends, so a search needs only a shared borrow next to the heap's.
+pub(crate) struct RegexSearch<'a> {
+    step_limit: u64,
+    scratch: &'a std::cell::Cell<otter_regex::MatchScratch>,
+}
+
+impl<'a> RegexSearch<'a> {
+    pub(crate) fn new(
+        step_limit: u64,
+        scratch: &'a std::cell::Cell<otter_regex::MatchScratch>,
+    ) -> Self {
+        Self {
+            step_limit,
+            scratch,
         }
     }
 }
@@ -426,8 +454,10 @@ pub struct JsRegExpBody {
     pub flags: RegExpFlags,
     /// `RegExp.prototype.lastIndex` — a writable own data property.
     /// RegExp execution coerces it numerically, but ordinary JS
-    /// reads/writes observe the exact stored value.
-    pub last_index: RefCell<Value>,
+    /// reads/writes observe the exact stored value. A plain cell, so
+    /// generated code reads and writes it at
+    /// [`REGEXP_BODY_LAST_INDEX_OFFSET`].
+    pub last_index: Cell<Value>,
     /// Writable bit for the `lastIndex` own data property. Its
     /// enumerable/configurable bits are spec-fixed at `false`.
     #[pelt(skip)]
@@ -465,11 +495,21 @@ pub struct JsRegExpBody {
 pub(crate) const REGEXP_BODY_JIT_GUARD_FLAGS_OFFSET: usize =
     std::mem::offset_of!(JsRegExpBody, jit_guard_flags);
 
+/// Byte offset of the [`JsRegExpBody::last_index`] value in the payload.
+pub(crate) const REGEXP_BODY_LAST_INDEX_OFFSET: usize =
+    std::mem::offset_of!(JsRegExpBody, last_index);
+
+/// Byte offset of [`JsRegExpBody::last_index_writable`] in the payload.
+pub(crate) const REGEXP_BODY_LAST_INDEX_WRITABLE_OFFSET: usize =
+    std::mem::offset_of!(JsRegExpBody, last_index_writable);
+
 const _: () = assert!(REGEXP_BODY_JIT_GUARD_FLAGS_OFFSET.is_multiple_of(4));
+const _: () = assert!(REGEXP_BODY_LAST_INDEX_OFFSET.is_multiple_of(8));
+const _: () = assert!(std::mem::size_of::<Cell<Value>>() == 8);
 
 impl JsRegExpBody {
     pub(crate) fn visit_function_ids(&self, visitor: &mut dyn FnMut(u32)) {
-        crate::code_liveness::visit_value(&self.last_index.borrow(), visitor);
+        crate::code_liveness::visit_value(&self.last_index.get(), visitor);
         if let Some(value) = &self.prototype_override {
             crate::code_liveness::visit_value(value, visitor);
         }
@@ -539,7 +579,7 @@ impl JsRegExp {
             inner: heap.alloc_old(JsRegExpBody {
                 pattern: std::sync::Arc::new(RegExpPattern::new(regex, pattern_utf16)),
                 flags,
-                last_index: RefCell::new(Value::number_i32(0)),
+                last_index: Cell::new(Value::number_i32(0)),
                 last_index_writable: true,
                 expando: None,
                 extensible: true,
@@ -575,7 +615,7 @@ impl JsRegExp {
             inner: heap.alloc_old(JsRegExpBody {
                 pattern,
                 flags,
-                last_index: RefCell::new(Value::number_i32(0)),
+                last_index: Cell::new(Value::number_i32(0)),
                 last_index_writable: true,
                 expando: None,
                 extensible: true,
@@ -611,7 +651,7 @@ impl JsRegExp {
         heap.with_payload(self.inner, |body| {
             body.pattern = pattern;
             body.flags = flags;
-            *body.last_index.borrow_mut() = Value::number(NumberValue::from_i32(0));
+            body.last_index.set(Value::number(NumberValue::from_i32(0)));
             body.prototype_override = None;
             body.jit_guard_flags &= !REGEXP_JIT_FLAG_PROTO_OVERRIDE;
         });
@@ -646,25 +686,25 @@ impl JsRegExp {
         heap: &otter_gc::GcHeap,
         text_units: crate::string::CodeUnits<'_>,
         start: usize,
-        step_limit: u64,
+        search: &RegexSearch<'_>,
     ) -> engine::Execution<Option<engine::Match>> {
         heap.read_payload(self.inner, |body| {
-            engine::find_one(&body.pattern.regex, text_units, start, step_limit)
+            engine::find_one(&body.pattern.regex, text_units, start, search)
         })
     }
 
     /// Run the compiled engine from a code-unit offset and collect owned
-    /// matches, exploring at most `step_limit` backtrack points; the returned
-    /// work count is charged at the runtime boundary.
+    /// matches, exploring at most the search's step limit of backtrack
+    /// points; the returned work count is charged at the runtime boundary.
     pub(crate) fn find_all(
         &self,
         heap: &otter_gc::GcHeap,
         text_units: crate::string::CodeUnits<'_>,
         start: usize,
-        step_limit: u64,
+        search: &RegexSearch<'_>,
     ) -> engine::Execution<Vec<engine::Match>> {
         heap.read_payload(self.inner, |body| {
-            engine::find(&body.pattern.regex, text_units, start, step_limit)
+            engine::find(&body.pattern.regex, text_units, start, search)
         })
     }
 
@@ -766,14 +806,14 @@ impl JsRegExp {
         // `read_payload` holds a shared borrow on the heap for the
         // duration of the closure; route the helper through it so the
         // nested `to_lossy_string(heap)` reborrows shared.
-        let raw = heap.read_payload(self.inner, |body| *body.last_index.borrow());
+        let raw = heap.read_payload(self.inner, |body| body.last_index.get());
         last_index_to_u32(&raw, heap)
     }
 
     /// Read the JS-visible `lastIndex` data-property value.
     #[must_use]
     pub fn last_index_value(&self, heap: &otter_gc::GcHeap) -> Value {
-        heap.read_payload(self.inner, |body| *body.last_index.borrow())
+        heap.read_payload(self.inner, |body| body.last_index.get())
     }
 
     /// Read the writable bit of the JS-visible `lastIndex` data property.
@@ -793,7 +833,8 @@ impl JsRegExp {
     /// through successive `g` / `y` matches.
     pub fn set_last_index(&self, heap: &otter_gc::GcHeap, value: u32) {
         heap.read_payload(self.inner, |body| {
-            *body.last_index.borrow_mut() = Value::number(NumberValue::from_f64(value as f64));
+            body.last_index
+                .set(Value::number(NumberValue::from_f64(value as f64)));
         });
     }
 
@@ -801,7 +842,7 @@ impl JsRegExp {
     pub fn set_last_index_value(&self, heap: &mut otter_gc::GcHeap, value: Value) {
         let barrier_value = value;
         heap.read_payload(self.inner, |body| {
-            *body.last_index.borrow_mut() = value;
+            body.last_index.set(value);
         });
         heap.record_write(self.inner, &barrier_value);
     }
@@ -904,7 +945,12 @@ mod tests {
         assert!(r.flags(&heap).ignore_case);
         let utf16: Vec<u16> = "abbbcXabbbbc".encode_utf16().collect();
         let m = r
-            .find_all(&heap, crate::string::CodeUnits::Utf16(&utf16), 0, u64::MAX)
+            .find_all(
+                &heap,
+                crate::string::CodeUnits::Utf16(&utf16),
+                0,
+                &RegexSearch::new(u64::MAX, &std::cell::Cell::default()),
+            )
             .result
             .expect("within matcher budget")
             .into_iter()

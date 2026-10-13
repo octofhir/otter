@@ -318,6 +318,7 @@ impl Interpreter {
             realm_intrinsics: realm_intrinsics::RealmIntrinsics::default(),
             regexp_legacy: crate::regexp_legacy::RegExpLegacyState::default(),
             regex_compile_cache: regexp::RegexCompileCache::default(),
+            regex_scratch: std::cell::Cell::default(),
             tracer: None,
             cpu_profiler: None,
         };

@@ -1795,6 +1795,16 @@ impl<'a> Codegen<'a> {
                     [holder, scratch],
                 )?;
             }
+            Kind::StoreBodySlot(slot) => {
+                let (receiver, value) = (Self::gp(input(0)), Self::gp(input(1)));
+                let slot = *slot;
+                if !slot.is_generated(true) {
+                    return Err(Unsupported::OperandShape("graph body slot store"));
+                }
+                let exit = self.eager_exit(node, DeoptReason::WrongShape);
+                self.emit_body_slot_receiver(receiver, slot, exit);
+                dynasm!(self.ops ; .arch aarch64 ; str X(value), [X(receiver), slot.byte]);
+            }
             Kind::LoadPropertyCached { pc, atom, length } => {
                 let receiver = Self::gp(input(0));
                 let destination = Self::gp(result.expect("a result"));
@@ -3604,6 +3614,14 @@ impl<'a> Codegen<'a> {
                         );
                         dynasm!(self.ops ; .arch aarch64 ; b =>done);
                     }
+                    Op::LoadBodySlot { object: 0, slot } if slot.is_generated(false) => {
+                        self.emit_body_slot_receiver(receiver, slot, next);
+                        dynasm!(self.ops
+                            ; .arch aarch64
+                            ; ldr X(destination), [X(receiver), slot.byte]
+                            ; b =>done
+                        );
+                    }
                     _ => return Err(Unsupported::OperandShape("graph named load operation")),
                 }
             }
@@ -3611,6 +3629,28 @@ impl<'a> Codegen<'a> {
         }
         dynasm!(self.ops ; .arch aarch64 ; b =>exit ; =>done);
         Ok(())
+    }
+
+    /// Branch to `miss` unless `receiver` is a cell of the slot's type whose
+    /// guard word holds.
+    fn emit_body_slot_receiver(
+        &mut self,
+        receiver: u8,
+        slot: otter_vm::jit::JitBodySlot,
+        miss: DynamicLabel,
+    ) {
+        dynasm!(self.ops
+            ; .arch aarch64
+            ; tst X(receiver), #0xfffe_0000_0000_0007
+            ; b.ne =>miss
+            ; cbz X(receiver), =>miss
+            ; ldrb w16, [X(receiver)]
+            ; cmp w16, u32::from(slot.type_tag)
+            ; b.ne =>miss
+        );
+        if let Some(guard) = slot.guard {
+            self.emit_body_guard(receiver, guard, miss);
+        }
     }
 
     /// Branch to `exit` unless the body word `guard` names holds its

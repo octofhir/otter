@@ -288,10 +288,13 @@ impl Interpreter {
                 return;
             }
             let access = if programs.iter().any(|program| {
-                program
-                    .ops
-                    .iter()
-                    .any(|op| matches!(op, jit::JitCacheIrOp::StoreField { .. }))
+                program.ops.iter().any(|op| {
+                    matches!(
+                        op,
+                        jit::JitCacheIrOp::StoreField { .. }
+                            | jit::JitCacheIrOp::StoreBodySlot { .. }
+                    )
+                })
             }) {
                 jit_debug::JitDebugPropertyAccess::Store
             } else {
@@ -1532,8 +1535,23 @@ impl Interpreter {
                     |cell| self.bake_prototype_validity(cell),
                 )
                 .unwrap_or_default();
-            if op != Op::StoreProperty {
-                programs.extend(self.jit_intrinsic_property_programs(key));
+            match op {
+                // A body-slot write stands alone: a site that also wrote
+                // ordinary objects keeps its shape programs.
+                Op::StoreProperty => {
+                    if programs.is_empty() {
+                        programs.extend(super::jit_intrinsic_properties::body_slot_program(
+                            key, true,
+                        ));
+                    }
+                }
+                Op::LoadProperty => {
+                    programs.extend(self.jit_intrinsic_property_programs(key));
+                    programs.extend(super::jit_intrinsic_properties::body_slot_program(
+                        key, false,
+                    ));
+                }
+                _ => programs.extend(self.jit_intrinsic_property_programs(key)),
             }
             if !programs.is_empty() {
                 view.property_programs.insert(byte_pc, programs);

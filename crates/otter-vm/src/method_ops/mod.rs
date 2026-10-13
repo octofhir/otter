@@ -122,7 +122,9 @@ mod jit_snapshot;
 pub(crate) use ic::{
     ArrayMethodCallIc, CollectionFastOp, CollectionFastTarget, CollectionMethodCallIc, MethodCallIc,
 };
-pub(crate) use jit_snapshot::{array_named_lookup_guard, collection_guard, regexp_guard};
+pub(crate) use jit_snapshot::{
+    array_named_lookup_guard, collection_guard, regexp_guard, regexp_last_index_slot,
+};
 
 /// Clamp a `ToIntegerOrInfinity` result to an absolute index within
 /// `[0, len]` per the relative-index convention shared by §23.2.3

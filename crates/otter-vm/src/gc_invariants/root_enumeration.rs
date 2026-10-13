@@ -733,7 +733,7 @@ fn regexp_root_survives_force_gc() {
             interp.gc_heap(),
             crate::string::CodeUnits::Utf16(&text),
             0,
-            u64::MAX,
+            &interp.regex_search(),
         )
         .result
         .expect("within matcher budget")

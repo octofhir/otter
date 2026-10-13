@@ -9,6 +9,7 @@
 //!
 //! # Contents
 //! - [`Regex`] — a compiled pattern; the public entry point.
+//! - [`MatchScratch`] — matcher buffers a host reuses across searches.
 //! - [`Flags`] — engine-relevant flag bits (`i m s u v`). The stateful JS flags
 //!   `g`/`y`/`d` live *above* the matcher in the host and are not modelled here.
 //! - [`ExecConfig`] — per-execution tuning (the ReDoS step budget).
@@ -41,7 +42,7 @@ mod parser;
 mod program;
 mod unicode;
 
-pub use api::{Match, Matches, NamedGroups, Regex};
+pub use api::{Match, MatchScratch, Matches, NamedGroups, Regex};
 pub use cursor::Unit;
 pub use error::{ExecError, RegexError};
 pub use exec::ExecConfig;

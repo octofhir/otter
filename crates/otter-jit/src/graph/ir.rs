@@ -416,6 +416,11 @@ pub(crate) enum Kind {
         owners: SmallVec<[FieldStoreOwner; 4]>,
         receiver_shape: Option<u32>,
     },
+    /// Store input1 into the own data property receiver input0 keeps in an
+    /// exotic body slot (a RegExp's `lastIndex`). Eager deopt unless input0
+    /// is a cell of the slot's type whose guard holds; the value's own
+    /// barrier is a separate node.
+    StoreBodySlot(otter_vm::jit::JitBodySlot),
     /// `[[Get]]` of the named property at the load site `pc` from receiver
     /// input0: an own or prototype data slot proved by the load fact in the
     /// isolate's shared property action table for `atom`, else the committed
@@ -848,7 +853,7 @@ impl Kind {
                 may_collect: true,
                 ..Properties::default()
             },
-            Self::StoreNamedProperty { .. } => Properties {
+            Self::StoreNamedProperty { .. } | Self::StoreBodySlot(_) => Properties {
                 eager_deopt: true,
                 writes: true,
                 effectful: true,
@@ -1097,6 +1102,7 @@ impl Kind {
                 fp_temps: 0,
                 fixed_gp_clobbers: SmallVec::new(),
             },
+            Self::StoreBodySlot(_) => simple(2, ResultPolicy::None),
             Self::Instanceof => Constraints {
                 inputs: registers(2),
                 result: ResultPolicy::Register,

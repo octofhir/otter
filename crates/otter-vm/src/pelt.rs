@@ -11,7 +11,7 @@
 //!
 //! - [`PeltField`] — single-method trait.
 //! - Blanket impls for `Value`, `Gc<T>`, `Option<T>`, `Vec<T>`,
-//!   `[T; N]`, `Box<T>`, `RefCell<T>`, and the integer / float /
+//!   `[T; N]`, `Box<T>`, `RefCell<T>`, `Cell<T>`, and the integer / float /
 //!   `bool` / `String` / `()` primitives every body uses for
 //!   non-traced bookkeeping.
 //!
@@ -23,11 +23,10 @@
 //! - Primitive leaf types implement `PeltField` as no-ops so the
 //!   derive can call uniformly without per-field carve-outs at the
 //!   AST level.
-//! - Types that wrap GC handles inside interior-mutability shapes
-//!   (`Cell<Value>`, `UnsafeCell<…>`) are intentionally not covered
-//!   by a blanket impl — taking the visitor through `Cell::get()`
-//!   would visit a value copy, not the cell slot, breaking
-//!   relocation. Fields with that shape stay on a hand-rolled
+//! - Interior-mutability wrappers are traced through `RefCell::borrow_mut`
+//!   and `Cell::get_mut`, which reach the cell's own storage; the
+//!   visitor never sees a `Cell::get` copy, which would break
+//!   relocation. `UnsafeCell<…>` fields stay on a hand-rolled
 //!   `SafeTraceable` impl or use `#[pelt(skip)]` plus a manual
 //!   `trace_slots_safe` body.
 //!
@@ -37,7 +36,7 @@
 //! - [`otter_gc::SafeTraceable`] — trait the derive implements on
 //!   the body type.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 
 use otter_gc::raw::{RawGc, SlotVisitor};
 
@@ -178,6 +177,15 @@ impl<T: PeltField> PeltField for RefCell<T> {
     #[inline]
     fn pelt_trace(&mut self, visitor: &mut SlotVisitor<'_>) {
         self.borrow_mut().pelt_trace(visitor);
+    }
+}
+
+impl<T: PeltField> PeltField for Cell<T> {
+    /// `Cell::get_mut` is the cell's own storage, so slot pointers handed
+    /// to the visitor reach the live heap word.
+    #[inline]
+    fn pelt_trace(&mut self, visitor: &mut SlotVisitor<'_>) {
+        self.get_mut().pelt_trace(visitor);
     }
 }
 

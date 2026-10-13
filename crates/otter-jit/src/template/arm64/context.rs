@@ -19,6 +19,9 @@
 //!   never throws and never publishes a PC.
 //! - A slot store of a cell value runs the canonical write barrier: contexts
 //!   are young and movable, and incremental marking needs the insertion half.
+//!   A store within the watchable range first tests the context's watch and,
+//!   for a watched slot, fires its subscribers through the VM, then walks to
+//!   the context again: no register survives the call.
 //! - An inline carve cannot collect. The slow path publishes a full-window
 //!   safepoint; a refused allocation exits before any effect at the original
 //!   opcode, which the interpreter re-executes (and which owns the
@@ -42,7 +45,8 @@ use super::values::{
 };
 use crate::artifact::relocation::RelocationCapture;
 use crate::entry::{
-    ALLOC_CTX_STACK_SIZE, NATIVE_FRAME_SELF_OFFSET, Unsupported, VALUE_HOLE, VALUE_UNDEFINED,
+    ALLOC_CTX_STACK_SIZE, NATIVE_FRAME_SELF_OFFSET, THREAD_OFFSET, Unsupported, VALUE_HOLE,
+    VALUE_UNDEFINED, VM_THREAD_GC_HEAP_OFFSET,
 };
 
 /// Largest scaled unsigned 64-bit `ldr`/`str` displacement.
@@ -163,8 +167,8 @@ pub(super) fn emit_load_context_slot(
 }
 
 /// Unchecked, write-barriered `r<context>.parent^depth.slots[slot] = r<src>`.
-/// The fast path clobbers `x9`–`x16`; the barrier's slow path is an AAPCS
-/// leaf call.
+/// The fast path clobbers `x9`–`x16`; the watch's and the barrier's slow
+/// paths are AAPCS leaf calls.
 pub(super) fn emit_store_context_slot(
     ops: &mut Assembler,
     relocations: &mut RelocationCapture,
@@ -178,13 +182,14 @@ pub(super) fn emit_store_context_slot(
     let done = ops.new_dynamic_label();
     emit_load_reg(ops, 13, context)?;
     emit_parent_hops(ops, view, 13, depth)?;
+    emit_context_slot_watch(ops, relocations, view, context, depth, slot)?;
     emit_store_into_target(ops, relocations, view, src, offset, done)?;
     dynasm!(ops ; .arch aarch64 ; =>done);
     Ok(())
 }
 
 /// `[x13 + offset] = r<src>` with the canonical write barrier, then branch
-/// to `done`. Clobbers `x9`, `x11`, `x12` and the barrier's scratch.
+/// to `done`. Clobbers `x9`, `x12` and the barrier's scratch.
 fn emit_store_into_target(
     ops: &mut Assembler,
     relocations: &mut RelocationCapture,
@@ -203,6 +208,50 @@ fn emit_store_into_target(
     emit_cell_test(ops, 9, CellTest::IsNotCell, done);
     emit_write_barrier(ops, relocations, view, 13, 9);
     dynasm!(ops ; .arch aarch64 ; b =>done);
+    Ok(())
+}
+
+/// A store is about to write slot `slot` of the context in `x13`, reached
+/// from `r<context>` through `depth` hops: when generated code watches the
+/// slot, fire its subscribers through the VM first — an AAPCS leaf call; the
+/// store that follows runs no code in between — and walk to the context
+/// again after the call. Clobbers `x10`–`x12` and the call's scratch.
+fn emit_context_slot_watch(
+    ops: &mut Assembler,
+    relocations: &mut RelocationCapture,
+    view: &JitCompileSnapshot,
+    context: u16,
+    depth: u16,
+    slot: u16,
+) -> Result<(), Unsupported> {
+    if slot >= otter_vm::code_dependencies::WATCHABLE_CONTEXT_SLOTS {
+        return Ok(());
+    }
+    let watch = aligned(view.context_layout.watch_byte)?;
+    let bit = u32::from(slot);
+    let unwatched = ops.new_dynamic_label();
+    dynasm!(ops
+        ; .arch aarch64
+        ; ldr x12, [x13, watch]
+        ; cbz x12, =>unwatched
+        ; ldr x11, [x12]
+        ; tbz x11, bit, =>unwatched
+        ; mov x1, x12
+        ; movz x2, bit
+        ; ldr x0, [x20, THREAD_OFFSET]
+        ; ldr x0, [x0, VM_THREAD_GC_HEAP_OFFSET]
+    );
+    emit_load_runtime_stub(
+        ops,
+        relocations,
+        16,
+        otter_vm::runtime_stubs::CONTEXT_SLOT_WRITTEN.entry_addr() as u64,
+        abi::STUB_CONTEXT_SLOT_WRITTEN,
+    );
+    dynasm!(ops ; .arch aarch64 ; blr x16);
+    emit_load_reg(ops, 13, context)?;
+    emit_parent_hops(ops, view, 13, depth)?;
+    dynasm!(ops ; .arch aarch64 ; =>unwatched);
     Ok(())
 }
 
@@ -244,6 +293,7 @@ pub(super) fn emit_checked_context_slot(
             dynasm!(ops ; .arch aarch64 ; b =>done);
         }
         CheckedContextAccess::Store { src } => {
+            emit_context_slot_watch(ops, relocations, view, context, depth, slot)?;
             emit_store_into_target(ops, relocations, view, src, offset, done)?;
         }
     }

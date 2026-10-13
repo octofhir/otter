@@ -10,9 +10,9 @@
 //! binding its body reaches is a hop from there.
 //!
 //! # Contents
-//! - [`ContextBody`] — the GC body: scope identity and parent, then the
-//!   trailing slot array and, for a scope that can receive one, the eval
-//!   extension word after the last slot.
+//! - [`ContextBody`] — the GC body: scope identity, parent and watch word,
+//!   then the trailing slot array and, for a scope that can receive one, the
+//!   eval extension word after the last slot.
 //! - [`ContextHandle`] — its compressed handle.
 //! - Byte offsets of every field, published to generated code through
 //!   [`crate::jit::JitContextLayout`].
@@ -43,6 +43,12 @@
 //! - A context is an internal value: never an ECMAScript Object, never
 //!   `typeof`-observable, never recorded by type feedback.
 //! - A slot holding [`Value::hole`] is a binding in its temporal dead zone.
+//! - `watch` is zero unless some compile read constants from the context;
+//!   then it names the context's registry-owned
+//!   [`crate::code_dependencies::ContextWatch`] for the context's whole life,
+//!   moving with the body. Every slot write tests the watch's bit for its
+//!   slot and fires the slot's subscribers. A new or copied context starts
+//!   unwatched.
 //!
 //! # See also
 //! - `crate::eval_env` — the eval extension a sloppy direct eval adds.
@@ -76,6 +82,10 @@ pub struct ContextBody {
     pub(crate) slot_count: u16,
     /// Enclosing context, or `undefined` for the outermost.
     pub(crate) parent: Value,
+    /// Address of the registry-owned [`crate::code_dependencies::ContextWatch`]
+    /// of a context some compile has read constants from; zero for every
+    /// other context.
+    pub(crate) watch: u64,
 }
 
 /// [`ContextBody::scope_index`] bit marking a context with an eval-extension
@@ -94,6 +104,8 @@ pub const CONTEXT_BODY_SCOPE_INDEX_OFFSET: usize = std::mem::offset_of!(ContextB
 pub const CONTEXT_BODY_SLOT_COUNT_OFFSET: usize = std::mem::offset_of!(ContextBody, slot_count);
 /// Byte offset of `parent` in the payload.
 pub const CONTEXT_BODY_PARENT_OFFSET: usize = std::mem::offset_of!(ContextBody, parent);
+/// Byte offset of the `watch` word in the payload.
+pub const CONTEXT_BODY_WATCH_OFFSET: usize = std::mem::offset_of!(ContextBody, watch);
 /// Byte offset of slot 0 in the payload; slot `i` is `8 * i` further.
 pub const CONTEXT_BODY_SLOTS_OFFSET: usize = std::mem::size_of::<ContextBody>();
 
@@ -101,7 +113,8 @@ const _: [(); 0] = [(); CONTEXT_BODY_SCOPE_FUNCTION_ID_OFFSET];
 const _: [(); 4] = [(); CONTEXT_BODY_SCOPE_INDEX_OFFSET];
 const _: [(); 6] = [(); CONTEXT_BODY_SLOT_COUNT_OFFSET];
 const _: [(); 8] = [(); CONTEXT_BODY_PARENT_OFFSET];
-const _: [(); 16] = [(); CONTEXT_BODY_SLOTS_OFFSET];
+const _: [(); 16] = [(); CONTEXT_BODY_WATCH_OFFSET];
+const _: [(); 24] = [(); CONTEXT_BODY_SLOTS_OFFSET];
 const _: [(); 8] = [(); std::mem::align_of::<ContextBody>()];
 
 impl otter_gc::SafeTraceable for ContextBody {
@@ -252,6 +265,7 @@ pub(crate) fn alloc_context_with_roots(
         scope_index: shape.scope_index_word(),
         slot_count: shape.slot_count,
         parent,
+        watch: 0,
     };
     heap.alloc_trailing_with_roots_initialized(
         body,
@@ -313,6 +327,7 @@ pub(crate) unsafe fn copy_context_with_roots(
         scope_index: shape.scope_index_word(),
         slot_count: shape.slot_count,
         parent,
+        watch: 0,
     };
     heap.alloc_trailing_with_roots_initialized(
         body,
@@ -375,8 +390,9 @@ pub(crate) fn read_slot(heap: &GcHeap, context: ContextHandle, slot: u16) -> Opt
     heap.read_payload(context, |body| body.slots().get(slot as usize).copied())
 }
 
-/// Store `value` into slot `slot` of `context` and record the write barrier.
-/// Returns `false` for an out-of-range slot.
+/// Store `value` into slot `slot` of `context` and record the write barrier;
+/// a watched slot fires its subscribers. Returns `false` for an out-of-range
+/// slot.
 pub(crate) fn write_slot(
     heap: &mut GcHeap,
     context: ContextHandle,
@@ -387,15 +403,30 @@ pub(crate) fn write_slot(
         match body.slots_mut().get_mut(slot as usize) {
             Some(target) => {
                 *target = value;
-                true
+                Some(body.watch)
             }
-            None => false,
+            None => None,
         }
     });
-    if stored {
-        heap.record_write(context, &value);
+    let Some(watch) = stored else {
+        return false;
+    };
+    heap.record_write(context, &value);
+    if watch != 0 {
+        crate::code_dependencies::context_slot_written(watch, slot);
     }
-    stored
+    true
+}
+
+/// The watch word of `context`.
+#[must_use]
+pub(crate) fn watch(heap: &GcHeap, context: ContextHandle) -> u64 {
+    heap.read_payload(context, |body| body.watch)
+}
+
+/// Point `context`'s watch word at its registry-owned watch.
+pub(crate) fn set_watch(heap: &mut GcHeap, context: ContextHandle, watch: u64) {
+    heap.with_payload(context, |body| body.watch = watch);
 }
 
 /// The eval extension of `context`, if any.
@@ -467,9 +498,10 @@ mod tests {
 
     #[test]
     fn layout_matches_the_published_offsets() {
-        assert_eq!(std::mem::size_of::<ContextBody>(), 16);
+        assert_eq!(std::mem::size_of::<ContextBody>(), 24);
         assert_eq!(CONTEXT_BODY_PARENT_OFFSET, 8);
-        assert_eq!(CONTEXT_BODY_SLOTS_OFFSET, 16);
+        assert_eq!(CONTEXT_BODY_WATCH_OFFSET, 16);
+        assert_eq!(CONTEXT_BODY_SLOTS_OFFSET, 24);
         assert_eq!(
             <ContextBody as otter_gc::SafeTraceable>::TYPE_TAG,
             CONTEXT_BODY_TYPE_TAG

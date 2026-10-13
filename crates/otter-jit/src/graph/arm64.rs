@@ -930,10 +930,31 @@ impl<'a> Codegen<'a> {
                 dynasm!(self.ops ; .arch aarch64 ; ldr X(destination), [x19, offset]);
             }
             Kind::CheckDependencies => self.emit_dependency_check(node),
-            Kind::CheckStableShapes(_) | Kind::CheckFieldTypes(_) => {
+            Kind::CheckStableShapes(_)
+            | Kind::CheckFieldTypes(_)
+            | Kind::CheckContextSlot { .. } => {
                 return Err(Unsupported::OperandShape(
                     "graph shape-fact proof outside a dependency test",
                 ));
+            }
+            Kind::LoadCellValue(cell) => {
+                let destination = Self::gp(result.expect("a result"));
+                let target = RelocationTarget::CalleeIdentityCell {
+                    function_id: self.view_of(node).code_block.id,
+                    call_pc: self.graph.node(node).pc,
+                };
+                emit_load_symbol_u64(
+                    &mut self.ops,
+                    &mut self.relocations,
+                    destination,
+                    *cell,
+                    target,
+                );
+                dynasm!(self.ops ; .arch aarch64 ; ldr X(destination), [X(destination)]);
+            }
+            Kind::NoteContextWrite(slot) => {
+                let context = Self::gp(input(0));
+                self.emit_note_context_write(node, context, *slot);
             }
             Kind::CheckNotNullish { mask } => {
                 self.emit_not_nullish(node, *mask);
@@ -3444,6 +3465,47 @@ impl<'a> Codegen<'a> {
                     16,
                     otter_vm::runtime_stubs::SHAPE_LEFT.entry_addr() as u64,
                     RelocationTarget::runtime_stub(abi::STUB_SHAPE_LEFT),
+                );
+                dynasm!(codegen.ops ; .arch aarch64 ; blr x16);
+                codegen.emit_restore_registers(&live, saved);
+                dynasm!(codegen.ops ; .arch aarch64 ; b =>done);
+            }));
+    }
+
+    /// A store just wrote slot `slot` of `context`: when the context's watch
+    /// covers the slot, fire its subscribers through the VM. `context`
+    /// survives the cold call.
+    fn emit_note_context_write(&mut self, node: NodeId, context: u8, slot: u16) {
+        let watched = self.ops.new_dynamic_label();
+        let done = self.ops.new_dynamic_label();
+        let watch = self.view.context_layout.watch_byte;
+        let bit = u32::from(slot);
+        dynasm!(self.ops
+            ; .arch aarch64
+            ; ldr x16, [X(context), watch]
+            ; cbz x16, =>done
+            ; ldr x17, [x16]
+            ; tbnz x17, bit, =>watched
+            ; =>done
+        );
+        let live = self.slow_path_registers(node, &[context]);
+        self.deferred
+            .push(Box::new(move |codegen: &mut Codegen<'a>| {
+                dynasm!(codegen.ops ; .arch aarch64 ; =>watched);
+                let saved = codegen.emit_save_registers(&live);
+                dynasm!(codegen.ops
+                    ; .arch aarch64
+                    ; mov x1, x16
+                    ; movz x2, bit
+                    ; ldr x0, [x20, THREAD_OFFSET]
+                    ; ldr x0, [x0, VM_THREAD_GC_HEAP_OFFSET]
+                );
+                emit_load_symbol_u64(
+                    &mut codegen.ops,
+                    &mut codegen.relocations,
+                    16,
+                    otter_vm::runtime_stubs::CONTEXT_SLOT_WRITTEN.entry_addr() as u64,
+                    RelocationTarget::runtime_stub(abi::STUB_CONTEXT_SLOT_WRITTEN),
                 );
                 dynasm!(codegen.ops ; .arch aarch64 ; blr x16);
                 codegen.emit_restore_registers(&live, saved);

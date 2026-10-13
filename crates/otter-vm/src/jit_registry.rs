@@ -169,6 +169,8 @@ pub struct JitCodeRegistry {
     epochs: rustc_hash::FxHashMap<(CodeDependencyKind, u32), u64>,
     /// Installed generations' subscriptions to monotone shape facts.
     subscriptions: crate::code_dependencies::ShapeSubscriptions,
+    /// Watched slots of live contexts and their subscribers.
+    contexts: crate::code_dependencies::ContextSubscriptions,
     /// Flags of this registry's generations set since the last drain.
     fired: Arc<std::sync::atomic::AtomicU32>,
 }
@@ -195,6 +197,7 @@ impl JitCodeRegistry {
             generated_feedback_seen: rustc_hash::FxHashMap::default(),
             epochs: rustc_hash::FxHashMap::default(),
             subscriptions: crate::code_dependencies::ShapeSubscriptions::default(),
+            contexts: crate::code_dependencies::ContextSubscriptions::default(),
             fired: Arc::default(),
         });
         registry.view.context = std::ptr::addr_of!(*registry) as u64;
@@ -548,10 +551,24 @@ impl JitCodeRegistry {
                     self.subscriptions.watch(shape, fact, flag);
                 } else if let Some(cell) = validity_cell(dependency, &registered.roots) {
                     cell.subscribe(flag);
+                } else if let Some((context, slot)) = context_slot(dependency) {
+                    self.contexts.subscribe(context, slot, flag);
                 }
             }
         }
         Ok(())
+    }
+
+    /// Watch slot `slot` of the live `context` for a compile that reads it as
+    /// a constant. Returns the identity of the context's watch when the slot
+    /// is watched.
+    pub(crate) fn watch_context_slot(
+        &mut self,
+        heap: &mut otter_gc::GcHeap,
+        context: crate::context::ContextHandle,
+        slot: u16,
+    ) -> Option<u32> {
+        self.contexts.watch_slot(heap, context, slot)
     }
 
     /// Whether this exact installed generation remains current for entry.
@@ -856,6 +873,7 @@ impl JitCodeRegistry {
         let entry_cells = &self.entry_cells;
         let retained_bytes = &mut self.retained_bytes;
         let subscriptions = &mut self.subscriptions;
+        let contexts = &mut self.contexts;
         self.codes.retain(|code_object_id, registered| {
             let keep = registered.state != CodeLifetimeState::Invalid
                 || Arc::strong_count(&registered.code) > 1
@@ -872,6 +890,8 @@ impl JitCodeRegistry {
                             subscriptions.unwatch(shape, flag);
                         } else if let Some(cell) = validity_cell(dependency, &registered.roots) {
                             cell.unsubscribe(flag);
+                        } else if let Some((context, _)) = context_slot(dependency) {
+                            contexts.unsubscribe(context, flag);
                         }
                     }
                 }
@@ -1098,6 +1118,10 @@ impl JitCodeRegistry {
                 None if dependency.kind == CodeDependencyKind::PrototypeValidity => {
                     validity_cell(dependency, roots).is_some_and(|cell| cell.is_valid())
                 }
+                None if dependency.kind == CodeDependencyKind::ContextSlot => {
+                    context_slot(dependency)
+                        .is_some_and(|(context, slot)| self.contexts.holds(context, slot))
+                }
                 None => {
                     dependency.expected
                         == self
@@ -1228,6 +1252,14 @@ fn validity_cell<'roots>(
         }
         _ => None,
     })
+}
+
+/// The context watch and slot a context-slot dependency names.
+fn context_slot(dependency: &CodeDependency) -> Option<(u32, u16)> {
+    (dependency.kind == CodeDependencyKind::ContextSlot && dependency.identity != 0)
+        .then(|| u16::try_from(dependency.expected).ok())
+        .flatten()
+        .map(|slot| (dependency.identity, slot))
 }
 
 /// The shape and fact a shape-fact dependency names. A registered

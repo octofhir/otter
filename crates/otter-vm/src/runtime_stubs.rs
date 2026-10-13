@@ -573,6 +573,12 @@ pub const SHAPE_LEFT: MutatingLeafStub2 = MutatingLeafStub2 {
     entry: crate::code_dependencies::note_left_native,
 };
 
+/// Callable entry for a store into a watched context slot.
+pub const CONTEXT_SLOT_WRITTEN: MutatingLeafStub2 = MutatingLeafStub2 {
+    descriptor: crate::native_abi::STUB_CONTEXT_SLOT_WRITTEN,
+    entry: crate::code_dependencies::context_slot_written_native,
+};
+
 /// Callable ABI entry for the generated tagged element-store barrier.
 pub const ELEMENT_WRITE_BARRIER_MUTATING: MutatingLeafStub3 = MutatingLeafStub3 {
     descriptor: crate::native_abi::STUB_ELEMENT_WRITE_BARRIER,
@@ -988,6 +994,7 @@ pub const fn mutating_leaf_stub2_by_id(id: RuntimeStubId) -> Option<MutatingLeaf
         id if id == crate::native_abi::STUB_WRITE_BARRIER.id => Some(WRITE_BARRIER_MUTATING),
         id if id == crate::native_abi::STUB_FIELD_TYPE_OBSERVE.id => Some(FIELD_TYPE_OBSERVE),
         id if id == crate::native_abi::STUB_SHAPE_LEFT.id => Some(SHAPE_LEFT),
+        id if id == crate::native_abi::STUB_CONTEXT_SLOT_WRITTEN.id => Some(CONTEXT_SLOT_WRITTEN),
         _ => None,
     }
 }

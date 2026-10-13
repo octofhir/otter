@@ -192,6 +192,9 @@ impl Codegen<'_> {
             Kind::WriteBarrier => {
                 self.emit_write_barrier(node, Self::gp(input(0)), Self::gp(input(1)))
             }
+            Kind::NoteContextWrite(slot) => {
+                self.emit_note_context_write(node, Self::gp(input(0)), slot);
+            }
             Kind::LoadArrayLength => {
                 let (receiver, destination) = (Self::gp(input(0)), output());
                 let exit = self.eager_exit(node, crate::graph::ir::DeoptReason::WrongShape);

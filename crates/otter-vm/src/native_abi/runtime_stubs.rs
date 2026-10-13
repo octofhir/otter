@@ -1904,6 +1904,7 @@ pub const fn runtime_stub_name(id: super::RuntimeStubId) -> &'static str {
         id if id == STUB_SHAPE_LEFT.id => "shape_left",
         id if id == STUB_JIT_REGEXP_EXEC.id => "jit_regexp_exec",
         id if id == STUB_JIT_REGEXP_TEST.id => "jit_regexp_test",
+        id if id == STUB_CONTEXT_SLOT_WRITTEN.id => "context_slot_written",
         _ => "unknown_runtime_stub",
     }
 }
@@ -2120,6 +2121,20 @@ pub const STUB_JIT_REGEXP_TEST: RuntimeStubDescriptor = descriptor(
     NativeResultDomain::Committed,
 );
 
+/// A store wrote a watched context slot: `(heap_mut, watch_word, slot)`
+/// fires the slot's subscribers and marks it volatile. Only code flags and
+/// watch metadata change.
+pub const STUB_CONTEXT_SLOT_WRITTEN: RuntimeStubDescriptor = descriptor(
+    117,
+    RuntimeStubClass::LeafNoAlloc,
+    RuntimeStubSignature::MutatingLeafValue2,
+    2,
+    RuntimeStubEffects::leaf(false, true),
+    RuntimeStubException::Never,
+    RuntimeStubResultAbi::NativePair,
+    NativeResultDomain::Probe,
+);
+
 /// Dense inventory of every current machine-callable runtime-stub contract.
 pub const RUNTIME_STUB_DESCRIPTORS: &[RuntimeStubDescriptor] = &[
     STUB_JIT_BACKEDGE_POLL,
@@ -2238,6 +2253,7 @@ pub const RUNTIME_STUB_DESCRIPTORS: &[RuntimeStubDescriptor] = &[
     STUB_SHAPE_LEFT,
     STUB_JIT_REGEXP_EXEC,
     STUB_JIT_REGEXP_TEST,
+    STUB_CONTEXT_SLOT_WRITTEN,
 ];
 
 // Descriptor ids are the sole slot authority for bindings and symbol lookup.

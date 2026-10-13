@@ -438,7 +438,9 @@ impl<'a> Codegen<'a> {
                 dynasm!(self.ops ; .arch x64 ; mov Rq(dst), [r13 + i32::from(*register) * 8]);
             }
             Kind::CheckDependencies => self.emit_dependency_check(node),
-            Kind::CheckStableShapes(_) | Kind::CheckFieldTypes(_) => {
+            Kind::CheckStableShapes(_)
+            | Kind::CheckFieldTypes(_)
+            | Kind::CheckContextSlot { .. } => {
                 return Err(Unsupported::OperandShape(
                     "graph shape-fact proof outside a dependency test",
                 ));

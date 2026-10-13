@@ -1566,7 +1566,8 @@ impl Interpreter {
     /// The family comes from what the site observed, so a typed view and a
     /// dense array are the same program over different declared offsets. A
     /// store additionally guards that the value already has the view's
-    /// representation, because coercing it could run user code.
+    /// representation, because coercing it could run user code. A site that
+    /// reached past its receiver's dense elements is listed as such.
     pub(crate) fn bake_element_accesses(&mut self, view: &mut jit::JitCompileSnapshot) {
         self.bake_array_iteration(view);
         let sites: Vec<_> = view
@@ -1582,10 +1583,11 @@ impl Interpreter {
             })
             .collect();
         for (byte_pc, pc) in sites {
-            let family = view
-                .code_block
-                .feedback_at(pc as usize)
-                .map_or(jit::JitElementFamily::Unseen, |cell| cell.element_family());
+            let cell = view.code_block.feedback_at(pc as usize);
+            if cell.is_some_and(|cell| cell.element_out_of_bounds()) {
+                view.out_of_bounds_element_sites.insert(byte_pc);
+            }
+            let family = cell.map_or(jit::JitElementFamily::Unseen, |cell| cell.element_family());
             let access = match family {
                 jit::JitElementFamily::Typed(kind) => {
                     let Some(element) = jit::JitElementRepr::for_typed_kind(kind) else {

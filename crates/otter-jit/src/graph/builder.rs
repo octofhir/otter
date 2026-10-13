@@ -4261,8 +4261,9 @@ impl<'a> Builder<'a> {
 
     /// The element layout this site speculates on, or why it has none:
     /// `Err(true)` for a site that never ran, `Err(false)` for one whose
-    /// receivers have no single layout, or whose receiver, bounds or key
-    /// speculation already failed.
+    /// receivers have no single layout, a store site that reached past its
+    /// receiver's elements, or one whose receiver, bounds or key speculation
+    /// already failed.
     fn element_access(&self, instruction: &Instruction) -> Result<JitElementAccess, bool> {
         let byte_pc = instruction.byte_pc;
         if self.view.cage_base == 0 {
@@ -4276,6 +4277,7 @@ impl<'a> Builder<'a> {
         };
         if access.type_tag == 0
             || matches!(access.base, JitElementBase::None)
+            || self.view.out_of_bounds_element_sites.contains(&byte_pc)
             || self.exited_for(ExitReason::ShapeGuard)
             || self.exited_for(ExitReason::BoundsGuard)
             || self.exited_for(ExitReason::InvalidElementIndex)

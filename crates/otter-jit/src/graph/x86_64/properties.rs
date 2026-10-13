@@ -79,6 +79,15 @@ impl Codegen<'_> {
                 [assigned.gp_temps[0], assigned.gp_temps[1]],
                 None,
             )?,
+            Kind::StoreBodySlot(slot) => {
+                if !slot.is_generated(true) {
+                    return Err(Unsupported::OperandShape("x86 graph body slot store"));
+                }
+                let exit = self.eager_exit(node, DeoptReason::WrongShape);
+                let (receiver, value) = (input(0), input(1));
+                self.emit_body_slot_receiver(receiver, slot, exit);
+                dynasm!(self.ops ; .arch x64 ; mov [Rq(receiver) + slot.byte as i32], Rq(value));
+            }
             Kind::LoadPropertyCached { pc, atom, length } => {
                 let have_length = length.then(|| self.emit_exotic_length(node, input(0), result()));
                 self.emit_load_property_cached(
@@ -152,6 +161,21 @@ impl Codegen<'_> {
             _ => return Ok(false),
         }
         Ok(true)
+    }
+
+    /// Jump to `miss` unless `receiver` is a cell of the slot's type whose
+    /// guard word holds.
+    fn emit_body_slot_receiver(
+        &mut self,
+        receiver: u8,
+        slot: otter_vm::jit::JitBodySlot,
+        miss: DynamicLabel,
+    ) {
+        self.emit_cell_guard(receiver, miss);
+        dynasm!(self.ops ; .arch x64 ; cmp BYTE [Rq(receiver)], slot.type_tag as i8 ; jne =>miss);
+        if let Some(guard) = slot.guard {
+            self.emit_body_guard(receiver, guard, miss);
+        }
     }
 
     pub(super) fn emit_intrinsic_prototype(
@@ -318,6 +342,16 @@ impl Codegen<'_> {
                             next,
                         );
                         dynasm!(self.ops ; .arch x64 ; jmp =>done);
+                        committed = true;
+                    }
+                    Op::LoadBodySlot { object: 0, slot }
+                        if value.is_none() && slot.is_generated(false) =>
+                    {
+                        let destination = destination.expect("named load result");
+                        self.emit_body_slot_receiver(receiver, slot, next);
+                        dynasm!(self.ops ; .arch x64
+                            ; mov Rq(destination), [Rq(receiver) + slot.byte as i32]
+                            ; jmp =>done);
                         committed = true;
                     }
                     Op::LoadIntrinsicPrototype { target, .. } if value.is_none() => self

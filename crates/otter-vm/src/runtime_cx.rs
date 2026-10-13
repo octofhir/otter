@@ -1608,12 +1608,13 @@ impl<'rt> NativeCtx<'rt> {
         self.cx.interp
     }
 
-    /// Charge completed RegExp matcher work through the shared runtime ledger.
-    /// Backtrack points one RegExp search may explore under the work budget.
-    pub(crate) fn regex_step_limit(&self) -> u64 {
-        self.cx.interp.regex_step_limit()
+    /// One RegExp search's step limit under the work budget and the
+    /// isolate's reusable matcher buffers.
+    pub(crate) fn regex_search(&self) -> crate::regexp::RegexSearch<'_> {
+        self.cx.interp.regex_search()
     }
 
+    /// Charge completed RegExp matcher work through the shared runtime ledger.
     pub(crate) fn charge_regex_backtrack_steps(&mut self, steps: u64) -> Result<(), NativeError> {
         self.cx
             .interp

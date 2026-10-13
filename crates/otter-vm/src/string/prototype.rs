@@ -370,7 +370,7 @@ fn collect_regex_matches(
         ctx.heap(),
         crate::string::CodeUnits::Utf16(text_units),
         0,
-        ctx.regex_step_limit(),
+        &ctx.regex_search(),
     );
     let mut out = crate::regexp::finish_execution(ctx, execution)?;
     if !global {
@@ -2395,7 +2395,7 @@ fn regex_split(
         ctx.heap(),
         crate::string::CodeUnits::Utf16(&recv_units),
         0,
-        ctx.regex_step_limit(),
+        &ctx.regex_search(),
     );
     let mut iter = crate::regexp::finish_execution(ctx, execution)?.into_iter();
     while (out.len() as u32) < limit {
@@ -2417,7 +2417,7 @@ fn regex_split(
                 ctx.heap(),
                 crate::string::CodeUnits::Utf16(&recv_units),
                 cursor,
-                ctx.regex_step_limit(),
+                &ctx.regex_search(),
             );
             iter = crate::regexp::finish_execution(ctx, execution)?.into_iter();
             continue;

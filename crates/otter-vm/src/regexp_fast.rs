@@ -172,11 +172,11 @@ pub(crate) fn exec_without_result(
         .raw(input)
         .as_string(scope.context().heap())
         .expect("subject root stays a string");
-    let step_limit = scope.context().regex_step_limit();
-    let heap = scope.context().heap();
-    let execution = text.with_code_units(heap, |units| {
-        regexp.find_one(heap, units, start, step_limit)
-    });
+    let context = scope.context();
+    let search = context.regex_search();
+    let heap = context.heap();
+    let execution =
+        text.with_code_units(heap, |units| regexp.find_one(heap, units, start, &search));
     let matched = crate::regexp::finish_execution(scope.context(), execution)?;
     // Charging the work cannot run JavaScript but re-reads the roots anyway.
     let regexp = scope
@@ -245,14 +245,14 @@ pub(crate) fn split(
         let mut pieces: Vec<Local<'_>> = Vec::new();
         let mut last_match = None;
         let search = |scope: &mut NativeScope<'_, '_>, at: usize| {
-            let step_limit = scope.context().regex_step_limit();
             let regexp = scope.raw(receiver).as_regexp().expect("pristine RegExp");
-            let heap = scope.context().heap();
+            let context = scope.context();
+            let search = context.regex_search();
             let execution = regexp.find_one(
-                heap,
+                context.heap(),
                 crate::string::CodeUnits::Utf16(&units),
                 at,
-                step_limit,
+                &search,
             );
             crate::regexp::finish_execution(scope.context(), execution)
         };
@@ -370,16 +370,17 @@ pub(crate) fn replace(
             .as_string(scope.context().heap())
             .expect("replace subject is a string");
         let flags = regexp.flags(scope.context().heap());
-        let step_limit = scope.context().regex_step_limit();
-        let heap = scope.context().heap();
+        let context = scope.context();
+        let search = context.regex_search();
+        let heap = context.heap();
         if flags.global {
             regexp.set_last_index(heap, 0);
         }
         let execution = subject.with_code_units(heap, |units| {
             if flags.global {
-                regexp.find_all(heap, units, 0, step_limit)
+                regexp.find_all(heap, units, 0, &search)
             } else {
-                let execution = regexp.find_one(heap, units, 0, step_limit);
+                let execution = regexp.find_one(heap, units, 0, &search);
                 crate::regexp::engine::Execution {
                     result: execution.result.map(|found| found.into_iter().collect()),
                     steps: execution.steps,

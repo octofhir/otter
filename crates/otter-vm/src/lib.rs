@@ -1422,6 +1422,10 @@ pub struct Interpreter {
     /// `new RegExp` over a repeated pattern) reuses the lowered program
     /// instead of re-parsing it. See [`crate::regexp::RegexCompileCache`].
     regex_compile_cache: regexp::RegexCompileCache,
+    /// Matcher buffers every RegExp search of this isolate reuses: a search
+    /// takes them and puts them back when it ends. See
+    /// [`crate::regexp::RegexSearch`].
+    regex_scratch: std::cell::Cell<otter_regex::MatchScratch>,
     /// Optional step-trace observer. When `Some`, the dispatch loop
     /// emits one [`inspect::StepEvent`] per instruction. When `None`,
     /// the hot path pays a single `Option` discriminant check and

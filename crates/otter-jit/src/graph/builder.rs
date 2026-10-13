@@ -3090,6 +3090,20 @@ impl<'a> Builder<'a> {
     fn visit_named_store(&mut self, instruction: &Instruction) {
         self.known.checked_field_types.clear();
         let byte_pc = instruction.byte_pc;
+        // An exotic body's own data slot: the write keeps every ordinary
+        // object's shape and fields.
+        if !self.exited_for(ExitReason::ShapeGuard)
+            && let Some(slot) = super::feedback::body_slot_store(self.view, byte_pc)
+        {
+            let object = self.read(instruction.reads[0]);
+            let object = self.tagged(object);
+            let value = self.read(instruction.reads[1]);
+            let value = self.tagged(value);
+            self.add(Kind::StoreBodySlot(slot), &[object, value], Repr::None);
+            self.write_barrier(object, value);
+            self.known.entry(object).heap_object = true;
+            return;
+        }
         if !self.exited_for(ExitReason::ShapeGuard)
             && let Some((projection, programs)) =
                 super::feedback::named_store_programs(self.view, byte_pc)

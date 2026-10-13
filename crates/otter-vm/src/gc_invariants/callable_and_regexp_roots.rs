@@ -145,7 +145,7 @@ fn regexp_body_survives_force_gc_when_rooted() {
             interp.gc_heap(),
             crate::string::CodeUnits::Utf16(&haystack),
             0,
-            u64::MAX,
+            &interp.regex_search(),
         )
         .result
         .expect("within matcher budget")

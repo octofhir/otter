@@ -6,6 +6,8 @@
 //! # Contents
 //! - Collection reads and writes, dense-array mutations and primitive-string
 //!   builtins, each described as one [`crate::jit::JitGuardedMethodCall`].
+//! - Body-word guards and the RegExp `lastIndex` body slot shared with the
+//!   intrinsic property programs.
 //!
 //! # Invariants
 //! - A snapshot names a receiver, a latch, a pinned prototype and a declared
@@ -23,8 +25,8 @@
 use super::MethodCallIc;
 use crate::Interpreter;
 use crate::jit::{
-    JitBodyGuard, JitGuardWidth, JitGuardedMethodCall, JitGuardedReceiver, JitIntrinsicPrototype,
-    JitMethodHolder,
+    JitBodyGuard, JitBodySlot, JitGuardWidth, JitGuardedMethodCall, JitGuardedReceiver,
+    JitIntrinsicPrototype, JitMethodHolder,
 };
 
 /// The 32-bit no-expando/no-override word every `Map` and `Set` body carries.
@@ -44,6 +46,21 @@ pub(crate) fn regexp_guard() -> JitBodyGuard {
             + crate::regexp::REGEXP_BODY_JIT_GUARD_FLAGS_OFFSET as u32,
         JitGuardWidth::Word32,
     )
+}
+
+/// A RegExp's own `lastIndex` slot. A write also requires the property's
+/// writable bit, which `Object.defineProperty` and `Object.freeze` clear.
+pub(crate) fn regexp_last_index_slot(store: bool) -> JitBodySlot {
+    let header = otter_gc::header::HEADER_SIZE as u32;
+    JitBodySlot {
+        type_tag: crate::regexp::REGEXP_BODY_TYPE_TAG,
+        guard: store.then_some(JitBodyGuard {
+            byte: header + crate::regexp::REGEXP_BODY_LAST_INDEX_WRITABLE_OFFSET as u32,
+            width: JitGuardWidth::Byte,
+            expect: 1,
+        }),
+        byte: header + crate::regexp::REGEXP_BODY_LAST_INDEX_OFFSET as u32,
+    }
 }
 
 /// The aligned rare/expando pair. Both compressed handles must be null before

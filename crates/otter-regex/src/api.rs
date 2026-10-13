@@ -11,6 +11,7 @@
 //! - [`Match`] — overall range, capture ranges, named-group access.
 //! - [`Matches`] — iterator of `Result<Match, ExecError>` over a subject.
 //! - [`NamedGroups`] — deterministic, deduplicated named-group iterator.
+//! - [`MatchScratch`] — matcher buffers a host reuses across searches.
 //!
 //! # Invariants
 //! - All [`Match`] offsets are UTF-16 code-unit indices.
@@ -22,6 +23,9 @@
 //!   ranges do not make distinct capture groups interchangeable.
 //! - A successful scan always advances `next_start` past the current match, so
 //!   the iterator terminates even on zero-width matches.
+//! - A search owns its matcher buffers; a host that passes a
+//!   [`MatchScratch`] in gets it back from [`Matches::into_scratch`], so
+//!   sharing a [`Regex`] never serializes matching.
 //!
 //! # See also
 //! - <https://tc39.es/ecma262/#sec-regexp.prototype.exec> (§22.2.7.2)
@@ -45,6 +49,16 @@ pub struct Regex {
     program: Program,
     flags: Flags,
 }
+
+/// Matcher buffers a host keeps between searches.
+///
+/// A search takes them by value ([`Regex::find_utf16_with`],
+/// [`Regex::find_latin1_with`]) and hands them back with
+/// [`Matches::into_scratch`], so a hot `exec`/`test` loop reuses one backtrack
+/// stack, undo log and capture array instead of allocating and growing fresh
+/// ones per call. Buffers a search grew past a small bound come back empty.
+#[derive(Debug, Default)]
+pub struct MatchScratch(backtrack::Scratch);
 
 impl Regex {
     /// Compile a pattern given as UTF-16 code units. This is the primary entry
@@ -92,7 +106,7 @@ impl Regex {
         start: usize,
         config: ExecConfig,
     ) -> Matches<'r, 't> {
-        self.find_units(text, start, config)
+        self.find_units(text, start, config, MatchScratch::default())
     }
 
     /// Search a one-byte subject — every code unit below `0x100`, one byte
@@ -105,7 +119,31 @@ impl Regex {
         start: usize,
         config: ExecConfig,
     ) -> Matches<'r, 't, u8> {
-        self.find_units(text, start, config)
+        self.find_units(text, start, config, MatchScratch::default())
+    }
+
+    /// [`Regex::find_utf16`] over buffers a previous search handed back.
+    #[must_use]
+    pub fn find_utf16_with<'r, 't>(
+        &'r self,
+        text: &'t [u16],
+        start: usize,
+        config: ExecConfig,
+        scratch: MatchScratch,
+    ) -> Matches<'r, 't> {
+        self.find_units(text, start, config, scratch)
+    }
+
+    /// [`Regex::find_latin1`] over buffers a previous search handed back.
+    #[must_use]
+    pub fn find_latin1_with<'r, 't>(
+        &'r self,
+        text: &'t [u8],
+        start: usize,
+        config: ExecConfig,
+        scratch: MatchScratch,
+    ) -> Matches<'r, 't, u8> {
+        self.find_units(text, start, config, scratch)
     }
 
     fn find_units<'r, 't, U: Unit>(
@@ -113,6 +151,7 @@ impl Regex {
         text: &'t [U],
         start: usize,
         config: ExecConfig,
+        scratch: MatchScratch,
     ) -> Matches<'r, 't, U> {
         Matches {
             regex: self,
@@ -121,7 +160,7 @@ impl Regex {
             config,
             done: false,
             steps_executed: 0,
-            scratch: backtrack::Scratch::new(),
+            scratch: scratch.0,
         }
     }
 
@@ -186,6 +225,16 @@ impl<U: Unit> Matches<'_, '_, U> {
     #[must_use]
     pub fn steps_executed(&self) -> u64 {
         self.steps_executed
+    }
+
+    /// End the search and hand its matcher buffers back for the next one.
+    #[must_use]
+    pub fn into_scratch(self) -> MatchScratch {
+        if self.scratch.is_oversized() {
+            MatchScratch::default()
+        } else {
+            MatchScratch(self.scratch)
+        }
     }
 }
 

@@ -57,8 +57,9 @@ type UndoEntry = (usize, Option<usize>);
 /// The backtrack stack, undo log and capture slots are the same shape for
 /// every match attempt, so a search that probes many start offsets keeps one
 /// of each and resets them per attempt instead of allocating fresh buffers at
-/// every offset. Nested lookaround evaluation still uses its own transient
-/// buffers.
+/// every offset, and a host keeps them for its next search
+/// ([`crate::MatchScratch`]). Nested lookaround evaluation still uses its own
+/// transient buffers.
 #[derive(Debug, Default)]
 pub(crate) struct Scratch {
     stack: Vec<Frame>,
@@ -66,10 +67,14 @@ pub(crate) struct Scratch {
     caps: Caps,
 }
 
+/// Backtrack frames and undo entries a host keeps between searches; a search
+/// that grew past this many hands back empty buffers instead.
+const RETAINED_ENTRIES: usize = 1024;
+
 impl Scratch {
-    /// Fresh, empty scratch buffer.
-    pub(crate) fn new() -> Self {
-        Self::default()
+    /// Whether these buffers grew past what a host keeps between searches.
+    pub(crate) fn is_oversized(&self) -> bool {
+        self.stack.capacity() > RETAINED_ENTRIES || self.log.capacity() > RETAINED_ENTRIES
     }
 
     /// The capture slots of the last successful [`attempt`].

@@ -177,6 +177,12 @@ impl Interpreter {
         self.enforce_work_budget_checkpoint()
     }
 
+    /// One RegExp search's step limit and the isolate's reusable matcher
+    /// buffers.
+    pub(crate) fn regex_search(&self) -> crate::regexp::RegexSearch<'_> {
+        crate::regexp::RegexSearch::new(self.regex_step_limit(), &self.regex_scratch)
+    }
+
     /// Backtrack points one RegExp search may explore before a rejecting work
     /// budget would end the slice; unbounded under any other policy, since a
     /// search cannot yield midway and an unbudgeted search runs to its answer.

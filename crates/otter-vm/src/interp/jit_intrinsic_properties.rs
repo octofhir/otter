@@ -10,11 +10,14 @@
 //! - Ordinary closure proofs (no bag, no prototype override, plain kind, the
 //!   compiling realm active) composed with `%Function.prototype%` slot guards.
 //! - A closure's own `prototype`, read from its rare record's slot.
+//! - A RegExp's own `lastIndex`, read and written in its body slot.
 //!
 //! # Invariants
 //! - Only own data slots of pinned realm prototypes are captured.
 //! - Existing rooted shape preparation precedes every published shape guard;
 //!   an unprepared or allocation-failed holder never contributes a program.
+//!   A prototype holder takes its prototype role before its shape is read, so
+//!   a later instance root cannot retire the guarded shape.
 //! - Collection instance overrides cannot bypass their canonical lookup semantics.
 //! - The `size` property remains on its existing specialized path; string
 //!   `length` and canonical numeric names never produce a prototype program.
@@ -26,7 +29,29 @@
 //! - `crate::method_ops::jit_snapshot` — the shared intrinsic receiver proof.
 
 use crate::jit::{JitCacheIrOp, JitCacheIrProgram, JitIntrinsicPrototype};
-use crate::{Interpreter, object, property_atom::AtomizedPropertyKey};
+use crate::object::ShapeState;
+use crate::{Interpreter, Value, object, property_atom::AtomizedPropertyKey};
+
+/// A RegExp's own `lastIndex`, read or written in its body slot. Every RegExp
+/// owns it as a non-configurable data property, so the cell type proves a
+/// read; a write also checks the writable bit.
+pub(crate) fn body_slot_program(
+    key: AtomizedPropertyKey<'_>,
+    store: bool,
+) -> Option<JitCacheIrProgram> {
+    if key.name() != "lastIndex" {
+        return None;
+    }
+    let slot = crate::method_ops::regexp_last_index_slot(store);
+    let op = if store {
+        JitCacheIrOp::StoreBodySlot { object: 0, slot }
+    } else {
+        JitCacheIrOp::LoadBodySlot { object: 0, slot }
+    };
+    Some(JitCacheIrProgram {
+        ops: Box::new([op]),
+    })
+}
 
 impl Interpreter {
     pub(crate) fn jit_intrinsic_property_programs(
@@ -135,6 +160,20 @@ impl Interpreter {
             return None;
         }
         self.migrate_slow_to_fast(&mut prototype);
+        // The first instance root over a prototype gives it the prototype
+        // role, which is a new hidden class. Take the role before reading the
+        // shape the program guards, so a later root (a builtin fast-path
+        // proof, `Object.create`) leaves the guarded shape in place.
+        let prototype = self.with_handle_scope(|this, scope| {
+            let rooted = this.scoped_value(scope, Value::object(prototype));
+            this.object_root(
+                Some(prototype),
+                object::DEFAULT_INLINE_CAPACITY,
+                ShapeState::ORDINARY,
+            )
+            .ok()?;
+            this.escape_scoped(rooted).as_object()
+        })?;
         if !object::supports_fast_property_ic(prototype, &self.gc_heap) {
             return None;
         }
@@ -247,16 +286,20 @@ mod tests {
             ),
         ] {
             // Bootstrap gives every intrinsic prototype its hidden class.
-            let shape = object::keyed_shape(prototype, &interpreter.gc_heap);
-            assert!(!shape.is_null());
+            assert!(!object::keyed_shape(prototype, &interpreter.gc_heap).is_null());
             assert!(object::supports_fast_property_ic(
                 prototype,
                 &interpreter.gc_heap
             ));
             let key = key(&mut interpreter, name);
             let programs = interpreter.jit_intrinsic_property_programs(key);
-            assert_eq!(object::keyed_shape(prototype, &interpreter.gc_heap), shape);
+            // Baking takes the prototype role; the program guards the live
+            // hidden class, which a second bake keeps.
+            let shape = object::keyed_shape(prototype, &interpreter.gc_heap);
+            assert!(object::state(prototype, &interpreter.gc_heap).is_prototype());
             assert!(!object::state(prototype, &interpreter.gc_heap).is_provisional());
+            let _ = interpreter.jit_intrinsic_property_programs(key);
+            assert_eq!(object::keyed_shape(prototype, &interpreter.gc_heap), shape);
             assert!(
                 programs.iter().any(|program| matches!(
                     program.ops.first(),
@@ -321,7 +364,50 @@ mod tests {
             "an unpinned realm would read another realm's prototype"
         );
 
+        // A later instance root over %RegExp.prototype% (the builtin
+        // protocol proof takes one) keeps the hidden class the program guards.
+        let guarded = programs
+            .iter()
+            .find(|program| {
+                matches!(
+                    program.ops.first(),
+                    Some(JitCacheIrOp::LoadIntrinsicPrototype { target, .. })
+                        if target.type_tag == crate::regexp::REGEXP_BODY_TYPE_TAG
+                )
+            })
+            .and_then(|program| {
+                program.ops.iter().find_map(|op| match op {
+                    JitCacheIrOp::GuardShape { object: 1, shape } => Some(*shape),
+                    _ => None,
+                })
+            })
+            .expect("the RegExp program guards its holder's shape");
+        let prototype = interpreter.realm_intrinsics.regexp_prototype().unwrap();
+        interpreter
+            .object_root(
+                Some(prototype),
+                object::DEFAULT_INLINE_CAPACITY,
+                ShapeState::ORDINARY,
+            )
+            .expect("instance root");
+        assert_eq!(
+            object::keyed_shape(prototype, &interpreter.gc_heap).offset(),
+            guarded,
+            "the prototype took its role before the program read its shape"
+        );
+
         let last_index = key(&mut interpreter, "lastIndex");
+        let load = body_slot_program(last_index, false).expect("lastIndex load program");
+        let store = body_slot_program(last_index, true).expect("lastIndex store program");
+        assert!(matches!(
+            *load.ops,
+            [JitCacheIrOp::LoadBodySlot { object: 0, slot }] if slot.is_generated(false) && slot.guard.is_none()
+        ));
+        assert!(matches!(
+            *store.ops,
+            [JitCacheIrOp::StoreBodySlot { object: 0, slot }] if slot.is_generated(true) && slot.guard.is_some()
+        ));
+        assert!(body_slot_program(exec, false).is_none());
         assert!(
             interpreter
                 .jit_intrinsic_property_programs(last_index)

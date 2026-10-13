@@ -9,7 +9,10 @@
 //! - [`NamedLoadPrograms`] / [`named_load_programs`] — source-owned indices
 //!   of load programs compatible with the receiver's known ordinary shapes.
 //!   Each reads the receiver, a guarded holder, a pinned intrinsic prototype,
-//!   a live Array expando, or a closure's own `prototype` slot.
+//!   a live Array expando, a closure's own `prototype` slot, or an exotic
+//!   body's own data slot.
+//! - [`body_slot_store`] — a store site whose only program writes an exotic
+//!   body's own data slot.
 //! - [`named_store_programs`] — any store whose every program writes an
 //!   existing writable slot of ordinary storage or appends one through
 //!   a guarded shape transition into its persistent inline capacity.
@@ -91,9 +94,10 @@ fn load_program_indices(
                     // but never compare those shapes to the bag's shape token.
                     continue;
                 }
-                Some(JitCacheIrOp::LoadClosurePrototype { object: 0 })
-                    if program.ops.len() == 1 =>
-                {
+                Some(
+                    JitCacheIrOp::LoadClosurePrototype { object: 0 }
+                    | JitCacheIrOp::LoadBodySlot { object: 0, .. },
+                ) if program.ops.len() == 1 => {
                     continue;
                 }
                 _ => {}
@@ -295,6 +299,13 @@ pub(crate) fn named_load_programs(
         if let [JitCacheIrOp::LoadClosurePrototype { object: 0 }] = *program.ops {
             continue;
         }
+        // So does an exotic body's own data slot read.
+        if let [JitCacheIrOp::LoadBodySlot { object: 0, slot }] = *program.ops {
+            if !slot.is_generated(false) {
+                return None;
+            }
+            continue;
+        }
         let mut holder = false;
         let (last, guards) = program.ops.split_last()?;
         let JitCacheIrOp::LoadField { object, .. } = *last else {
@@ -355,6 +366,23 @@ pub(crate) fn named_load_programs(
         programs: selected,
         receiver_shapes,
     })
+}
+
+/// The exotic body slot the store site at `byte_pc` writes, when its only
+/// program is that write: the site saw no ordinary receiver.
+pub(crate) fn body_slot_store(
+    view: &JitCompileSnapshot,
+    byte_pc: u32,
+) -> Option<otter_vm::jit::JitBodySlot> {
+    match view.property_programs.get(&byte_pc)?.as_slice() {
+        [program] => match *program.ops {
+            [JitCacheIrOp::StoreBodySlot { object: 0, slot }] if slot.is_generated(true) => {
+                Some(slot)
+            }
+            _ => None,
+        },
+        _ => None,
+    }
 }
 
 /// The store programs of the site at `byte_pc`, when every one proves an

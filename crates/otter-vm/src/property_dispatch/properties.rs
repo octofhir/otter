@@ -30,8 +30,8 @@ use super::{
 use crate::activation_stack::ActivationStack;
 use crate::{
     ExecutionContext, Interpreter, Value, VmGetOutcome, VmPropertyKey, abstract_ops, binary,
-    function_metadata, object, property_atom::AtomizedPropertyKey, read_register, regexp_prototype,
-    symbol_prototype, temporal, value_kind_name, write_register,
+    function_metadata, object, property_atom::AtomizedPropertyKey, read_register, symbol_prototype,
+    temporal, value_kind_name, write_register,
 };
 
 impl Interpreter {
@@ -830,7 +830,18 @@ impl Interpreter {
             // `re.global = false` / `re.exec = fn` survive
             // observability checks.
             if name == "lastIndex" {
-                regexp_prototype::store_property(&r, &mut self.gc_heap, name, value);
+                // §10.1.9.2 OrdinarySetWithOwnDescriptor: a non-writable
+                // own data property rejects the write, which strict code
+                // reports.
+                if r.last_index_writable(&self.gc_heap) {
+                    r.set_last_index_value(&mut self.gc_heap, value);
+                } else {
+                    self.failed_set_result(
+                        strict,
+                        format!("Cannot assign to read-only property '{name}'"),
+                    )
+                    .map_err(CommittedValueError::JavaScript)?;
+                }
                 None
             } else {
                 let absent = r.expando(&self.gc_heap).is_none_or(|bag| {

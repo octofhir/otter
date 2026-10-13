@@ -147,7 +147,8 @@ pub(crate) fn feedback_free_method_program(ops: &[otter_vm::JitCacheIrOp]) -> bo
 
 /// Static intrinsic-prototype reads: a receiver of an intrinsic body type
 /// (primitive string, RegExp, closure, collection) reading a data slot of its
-/// pinned realm prototype, or a closure's own `prototype` slot. These
+/// pinned realm prototype, a closure's own `prototype` slot, or a RegExp's
+/// own `lastIndex` body slot. These
 /// programs describe realm intrinsics, not site feedback; a miss falls
 /// through to the site's IC. A hit leaves the value at `output` and branches
 /// to `done`.
@@ -188,6 +189,24 @@ pub(super) fn emit_intrinsic_loads(
             dynasm!(ops ; .arch aarch64
                 ; b =>done
                 ; =>next);
+            continue;
+        }
+        // An exotic body's own data slot; the prefix above proved a cell.
+        if let [Op::LoadBodySlot { object: 0, slot }] = *program.ops {
+            if slot.is_generated(false) && slot.guard.is_none() {
+                let next = ops.new_dynamic_label();
+                dynasm!(ops ; .arch aarch64
+                    ; ldr x9, [x19, obj_off]
+                    ; ldrb w16, [x9]
+                    ; cmp w16, u32::from(slot.type_tag)
+                    ; b.ne =>next
+                    ; ldr x9, [x9, slot.byte]
+                );
+                output.emit(ops);
+                dynasm!(ops ; .arch aarch64
+                    ; b =>done
+                    ; =>next);
+            }
             continue;
         }
         let Some((projection, rest)) = program.ops.split_first() else {

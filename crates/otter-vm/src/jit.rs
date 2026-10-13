@@ -1019,6 +1019,32 @@ impl JitIntrinsicPrototype {
     }
 }
 
+/// An own data property an exotic body keeps as one tagged value at a fixed
+/// offset, for every receiver of its cell type: a RegExp's `lastIndex`.
+///
+/// The property exists on every such receiver and is never an accessor, so
+/// the cell type alone proves a read; a write also requires the guard word
+/// that holds the property's writable bit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct JitBodySlot {
+    /// Exact receiver `GcHeader::type_tag`.
+    pub type_tag: u8,
+    /// Body state the access requires: the writable bit for a write.
+    pub guard: Option<JitBodyGuard>,
+    /// Byte offset of the tagged value from the body's `GcHeader`.
+    pub byte: u32,
+}
+
+impl JitBodySlot {
+    /// Whether generated code may read (`store == false`) or write this
+    /// slot: exactly a declared body slot with the guard its access needs.
+    #[must_use]
+    pub fn is_generated(self, store: bool) -> bool {
+        self.type_tag == crate::regexp::REGEXP_BODY_TYPE_TAG
+            && self == crate::method_ops::regexp_last_index_slot(store)
+    }
+}
+
 /// Layout proof for the object owning a guarded method slot.
 ///
 /// Either form pins which key the slot at
@@ -1383,6 +1409,25 @@ pub enum JitCacheIrOp {
     LoadClosurePrototype {
         /// CacheIR receiver operand to read.
         object: u8,
+    },
+    /// Read an exotic body's own data property from its tagged slot (see
+    /// [`JitBodySlot`]). A receiver of another cell type misses. Terminal:
+    /// the slot value is the load's result.
+    LoadBodySlot {
+        /// CacheIR receiver operand to read.
+        object: u8,
+        /// The slot and the receiver it belongs to.
+        slot: JitBodySlot,
+    },
+    /// Write an exotic body's own data property into its tagged slot once
+    /// the slot's guard proves it writable. A receiver of another cell type
+    /// or a failed guard misses before any effect. Terminal; the value's
+    /// barrier belongs to the consumer.
+    StoreBodySlot {
+        /// CacheIR receiver operand to write.
+        object: u8,
+        /// The slot and the receiver it belongs to.
+        slot: JitBodySlot,
     },
     /// Prove that an object's direct prototype is null.
     GuardPrototypeNull {
@@ -2860,6 +2905,36 @@ mod layout_tests {
         ] {
             assert!(!JitIntrinsicPrototype { guard, ..proof }.is_generated_receiver());
         }
+    }
+
+    #[test]
+    fn body_slots_admit_only_the_declared_regexp_last_index() {
+        let load = crate::method_ops::regexp_last_index_slot(false);
+        let store = crate::method_ops::regexp_last_index_slot(true);
+        let header = otter_gc::header::HEADER_SIZE as u32;
+        assert_eq!(
+            load.byte,
+            header + crate::regexp::REGEXP_BODY_LAST_INDEX_OFFSET as u32
+        );
+        assert!(load.byte.is_multiple_of(8));
+        assert!(load.is_generated(false) && store.is_generated(true));
+        // A write without the writable guard, or a read that demands one,
+        // is not the declared access.
+        assert!(!load.is_generated(true) && !store.is_generated(false));
+        assert!(
+            !JitBodySlot {
+                byte: load.byte + 8,
+                ..load
+            }
+            .is_generated(false)
+        );
+        assert!(
+            !JitBodySlot {
+                type_tag: crate::closure::JS_CLOSURE_BODY_TYPE_TAG,
+                ..load
+            }
+            .is_generated(false)
+        );
     }
 
     #[test]

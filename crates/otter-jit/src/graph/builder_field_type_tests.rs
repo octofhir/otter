@@ -1169,3 +1169,63 @@ fn literal_fields_select_records_before_the_collecting_birth() {
     view.field_types.remove(&(shape, FieldLocation::inline(2)));
     assert_eq!(literal(&view), None);
 }
+
+#[test]
+fn an_own_store_reuses_a_load_proof_within_its_store_shapes() {
+    let field = FieldLocation::inline(0);
+    let mut view = field_type_view(
+        vec![
+            field_load(2, 0),
+            (
+                Op::StoreProperty,
+                vec![
+                    Operand::Register(0),
+                    Operand::ConstIndex(0),
+                    Operand::Register(1),
+                    Operand::Register(3),
+                ],
+            ),
+            (Op::ReturnUndefined, vec![]),
+        ],
+        0,
+    );
+    view.property_programs
+        .insert(0, vec![load_program(128, field, false)]);
+    view.property_programs.insert(
+        4,
+        vec![JitCacheIrProgram {
+            ops: vec![
+                JitCacheIrOp::GuardShape {
+                    object: 0,
+                    shape: 128,
+                },
+                JitCacheIrOp::GuardAtomSlot {
+                    object: 0,
+                    atom: 1,
+                    field,
+                    writable: true,
+                },
+                JitCacheIrOp::StoreField { object: 0, field },
+            ]
+            .into_boxed_slice(),
+        }],
+    );
+    let built = load_graph(&view);
+    let placed = |kind: fn(&Kind) -> bool| {
+        built
+            .graph
+            .blocks
+            .iter()
+            .flat_map(|block| block.body.iter())
+            .filter(|&&node| kind(&built.graph.node(node).kind))
+            .count()
+    };
+    // Store handlers never receive a prototype shape: the load's proof of
+    // shape 128 already proves the receiver writable.
+    assert_eq!(placed(|kind| matches!(kind, Kind::CheckShapes { .. })), 1);
+    assert_eq!(
+        placed(|kind| matches!(kind, Kind::CheckShapes { writable: true, .. })),
+        0
+    );
+    assert_eq!(placed(|kind| matches!(kind, Kind::StoreOwnField { .. })), 1);
+}

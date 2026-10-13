@@ -318,9 +318,7 @@ impl<U: Unit> Iterator for Matches<'_, '_, U> {
                         // the one code unit that can begin a match. A unit too
                         // wide for the subject never occurs in it.
                         match U::narrow(unit).and_then(|unit| {
-                            self.text
-                                .get(pos..)
-                                .and_then(|t| t.iter().position(|&u| u == unit))
+                            self.text.get(pos..).and_then(|t| U::position(t, unit))
                         }) {
                             Some(off) => pos += off,
                             // No further occurrence: a single-literal prefilter means
@@ -338,6 +336,21 @@ impl<U: Unit> Iterator for Matches<'_, '_, U> {
                             }
                             pos = advance_scan(self.text, pos, unicode);
                         }
+                    } else if let (Some(bytes), Some(few)) =
+                        (U::as_latin1(self.text), pf.few_latin1())
+                    {
+                        // A one-byte subject and at most three bytes that can
+                        // start a match: a vectorized search for any of them.
+                        let rest = bytes.get(pos..).unwrap_or(&[]);
+                        let found = match *few {
+                            [a] => memchr::memchr(a, rest),
+                            [a, b] => memchr::memchr2(a, b, rest),
+                            [a, b, c] => memchr::memchr3(a, b, c, rest),
+                            _ => unreachable!("a prefilter holds one to three bytes"),
+                        };
+                        // No further candidate: like the loop below, stop at
+                        // the end, never moving back from past it.
+                        pos = found.map_or(pos.max(self.text.len()), |offset| pos + offset);
                     } else {
                         // Non-Unicode: a code unit is a code point, so the scan is a
                         // tight single-step loop with no surrogate decode.

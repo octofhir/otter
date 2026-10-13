@@ -60,6 +60,7 @@ fn snapshot() -> JitCompileSnapshot {
     view.shape_state_byte = 8;
     view.shape_inline_capacity_byte = 9;
     view.shape_stable_byte = 10;
+    view.shape_watched_byte = 11;
     view.shape_prototype_byte = 12;
     assert_ne!(view.object_shape_byte, 0, "object tag cannot alias shape");
     assert_ne!(view.shape_state_byte, view.shape_inline_capacity_byte);
@@ -153,6 +154,7 @@ impl Fixture {
                 capacity,
             );
             fixture.cell_u8(shape + fixture.view.shape_stable_byte as usize, 1);
+            fixture.cell_u8(shape + fixture.view.shape_watched_byte as usize, 0);
             fixture.cell_u32(shape + fixture.view.shape_prototype_byte as usize, 0);
         }
         fixture.cell_u32(
@@ -472,7 +474,7 @@ fn own_data_reads_readonly_and_current_suffix_while_store_requires_its_action() 
 
 #[test]
 fn every_miss_finishes_before_any_slot_or_shape_effect() {
-    for refusal in 0..13 {
+    for refusal in 0..14 {
         let mut f = Fixture::new(4);
         f.append(5, false);
         match refusal {
@@ -515,6 +517,12 @@ fn every_miss_finishes_before_any_slot_or_shape_effect() {
             10 => f.cell_u32(f.view.field_layout.slab_handle_byte as usize, 0),
             11 => f.cell_u32(SLAB + f.view.field_layout.slab_capacity_byte as usize, 1),
             12 => f.cell_u8(0, 0xff),
+            // Code relies on the shape staying stable: the runtime store
+            // fires it.
+            13 => f.cell_u8(
+                SHAPE + f.view.shape_watched_byte as usize,
+                otter_vm::code_dependencies::ShapeFact::Stable as u8,
+            ),
             _ => unreachable!(),
         }
         let before = f.cells.clone();

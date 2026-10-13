@@ -3,7 +3,8 @@
 //! # Contents
 //! - Captured historical targets bypass observation for unchanged membership.
 //! - Inline Top and exact-shape membership probes with scalar widening.
-//! - A cold noncollecting VM leaf through the platform C boundary.
+//! - A cold noncollecting VM leaf through the platform C boundary, also for
+//!   every widening of a summary code subscribed to.
 //!
 //! # Invariants
 //! - Every store guard precedes observation. A store whose selected record has
@@ -97,6 +98,9 @@ pub(crate) fn emit_observe(
     owner: u8,
     value: u8,
 ) {
+    // Code subscribed to the summary: every widening goes through the VM,
+    // which fires it.
+    const WATCHED: i8 = otter_vm::code_dependencies::ShapeFact::FieldType as i8;
     debug_assert!(owner != value && !matches!(owner, 4 | 5 | 10 | 11 | 13 | 14 | 15));
     debug_assert!(!matches!(value, 10 | 11));
     let done = ops.new_dynamic_label();
@@ -141,12 +145,16 @@ pub(crate) fn emit_observe(
     dynasm!(ops ; .arch x64
         ; cmp Rq(value), r10 ; je =>undefined ; jmp =>top
         ; =>null ; test BYTE [Rq(owner) + view.shape_field_type_byte as i32], NULL as i8 ; jnz =>done
+        ; test BYTE [Rq(owner) + view.shape_watched_byte as i32], WATCHED ; jnz =>slow
         ; mov r11, [Rq(owner) + view.shape_field_type_byte as i32] ; or r11, NULL as i32
         ; mov [Rq(owner) + view.shape_field_type_byte as i32], r11 ; jmp =>done
         ; =>undefined ; test BYTE [Rq(owner) + view.shape_field_type_byte as i32], UNDEFINED as i8 ; jnz =>done
+        ; test BYTE [Rq(owner) + view.shape_watched_byte as i32], WATCHED ; jnz =>slow
         ; mov r11, [Rq(owner) + view.shape_field_type_byte as i32] ; or r11, UNDEFINED as i32
         ; mov [Rq(owner) + view.shape_field_type_byte as i32], r11 ; jmp =>done
-        ; =>top ; mov QWORD [Rq(owner) + view.shape_field_type_byte as i32], TOP as i32 ; jmp =>done
+        ; =>top
+        ; test BYTE [Rq(owner) + view.shape_watched_byte as i32], WATCHED ; jnz =>slow
+        ; mov QWORD [Rq(owner) + view.shape_field_type_byte as i32], TOP as i32 ; jmp =>done
         ; =>slow ; sub rsp, 208);
     let registers = [0u8, 1, 2, 6, 7, 8, 9, 10, 11];
     for (index, register) in registers.iter().copied().enumerate() {

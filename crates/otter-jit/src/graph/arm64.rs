@@ -41,9 +41,11 @@
 //!   guards read the sole current ShapeState byte and permit provisional
 //!   runtime feedback; stores reject prototype role before any effect.
 //! - Shape transitions clear the source shape's stability byte before
-//!   publishing the child shape; allocation stores establish the initial shape.
+//!   publishing the child shape, through the VM when code subscribed to it;
+//!   allocation stores establish the initial shape.
 //! - Named loads omit only a receiver shape guard matching their live exact
-//!   proof. Holder, prototype-validity and dictionary guards remain intact.
+//!   proof. Holder, prototype-validity and dictionary guards remain intact;
+//!   an inherited method load relies on its chain proof as a code dependency.
 //! - A far body places an island of veneers, slow paths and exit stubs
 //!   after every 16 KiB segment, so a `tbz`/`tbnz` of a cell test reaches
 //!   the exit it names; `b.cond` and `cbz` reach ±1 MiB.
@@ -927,26 +929,11 @@ impl<'a> Codegen<'a> {
                 let offset = u32::from(*register) * 8;
                 dynasm!(self.ops ; .arch aarch64 ; ldr X(destination), [x19, offset]);
             }
-            Kind::CheckStableShapes(shapes) => {
-                let shapes = shapes.clone();
-                let exit = self.eager_exit(node, DeoptReason::StabilityChanged);
-                let view = self.view;
-                for shape in shapes {
-                    emit_load_symbol_u64(
-                        &mut self.ops,
-                        &mut self.relocations,
-                        16,
-                        view.cage_base as u64
-                            + u64::from(shape)
-                            + u64::from(view.shape_stable_byte),
-                        RelocationTarget::ShapeStableByte { shape },
-                    );
-                    dynasm!(self.ops ; .arch aarch64 ; ldrb w16, [x16] ; cbz w16, =>exit);
-                }
-            }
-            Kind::CheckFieldTypes(guards) => {
-                let guards = guards.clone();
-                self.emit_field_type_guards(node, &guards);
+            Kind::CheckDependencies => self.emit_dependency_check(node),
+            Kind::CheckStableShapes(_) | Kind::CheckFieldTypes(_) => {
+                return Err(Unsupported::OperandShape(
+                    "graph shape-fact proof outside a dependency test",
+                ));
             }
             Kind::CheckNotNullish { mask } => {
                 self.emit_not_nullish(node, *mask);
@@ -2513,9 +2500,9 @@ impl<'a> Codegen<'a> {
             .and_then(|methods| methods.get(usize::from(target)))
             .map(|method| method.guard.clone())
             .ok_or(Unsupported::OperandShape("graph guarded method"))?;
-        let exit = self.eager_exit(node, DeoptReason::WrongShape);
         let view = self.view;
         if !receiver_proved {
+            let exit = self.eager_exit(node, DeoptReason::WrongShape);
             self.emit_object_receiver(receiver, exit);
             dynasm!(self.ops
                 ; .arch aarch64
@@ -2524,17 +2511,9 @@ impl<'a> Codegen<'a> {
             self.load_immediate(17, u64::from(guard.recv_shape));
             dynasm!(self.ops ; .arch aarch64 ; cmp w16, w17 ; b.ne =>exit);
         }
-        if let Some(validity) = guard.prototype_validity {
-            crate::template::arm64::values::emit_prototype_validity_guard(
-                &mut self.ops,
-                &mut self.relocations,
-                validity,
-                holder,
-                exit,
-            );
-        }
-        // A valid proof fixes the holder slot: the code-retained cell holds
-        // the closure read there when the guard was baked.
+        // The chain proof is a code dependency, tested before this load: it
+        // fixes the holder slot, and the code-retained cell holds the closure
+        // read there when the guard was baked.
         if guard.method_cell != 0 && guard.accessor_byte.is_none() {
             emit_load_symbol_u64(
                 &mut self.ops,
@@ -2752,13 +2731,7 @@ impl<'a> Codegen<'a> {
                         // unstable; any other is retired here.
                         if !receiver_guard.is_some_and(|parent| view.left_shapes.contains(&parent))
                         {
-                            dynasm!(self.ops
-                                ; .arch aarch64
-                                ; and x17, X(receiver), #0xffff_ffff_0000_0000
-                                ; ldr w16, [X(receiver), view.object_shape_byte]
-                                ; add x16, x17, x16
-                                ; strb wzr, [x16, view.shape_stable_byte]
-                            );
+                            self.emit_leave_receiver_shape(node, receiver, value);
                         }
                         self.load_immediate(16, u64::from(shape));
                         dynasm!(self.ops
@@ -3411,6 +3384,48 @@ impl<'a> Codegen<'a> {
                     16,
                     otter_vm::runtime_stubs::WRITE_BARRIER_MUTATING.entry_addr() as u64,
                     RelocationTarget::runtime_stub(abi::STUB_WRITE_BARRIER),
+                );
+                dynasm!(codegen.ops ; .arch aarch64 ; blr x16);
+                codegen.emit_restore_registers(&live, saved);
+                dynasm!(codegen.ops ; .arch aarch64 ; b =>done);
+            }));
+    }
+
+    /// The receiver is leaving its current shape: clear the shape's stable
+    /// byte, or, when generations subscribe to the shape, have the VM clear
+    /// it and fire them. `receiver` and `value` survive the cold call.
+    fn emit_leave_receiver_shape(&mut self, node: NodeId, receiver: u8, value: u8) {
+        let watched = self.ops.new_dynamic_label();
+        let done = self.ops.new_dynamic_label();
+        let view = self.view;
+        dynasm!(self.ops
+            ; .arch aarch64
+            ; and x17, X(receiver), #0xffff_ffff_0000_0000
+            ; ldr w16, [X(receiver), view.object_shape_byte]
+            ; add x16, x17, x16
+            ; ldrb w17, [x16, view.shape_watched_byte]
+            ; tbnz w17, otter_vm::code_dependencies::ShapeFact::Stable.bit(), =>watched
+            ; strb wzr, [x16, view.shape_stable_byte]
+            ; =>done
+        );
+        let live = self.slow_path_registers(node, &[receiver, value]);
+        self.deferred
+            .push(Box::new(move |codegen: &mut Codegen<'a>| {
+                dynasm!(codegen.ops ; .arch aarch64 ; =>watched);
+                let saved = codegen.emit_save_registers(&live);
+                dynasm!(codegen.ops
+                    ; .arch aarch64
+                    ; mov x1, x16
+                    ; mov x2, xzr
+                    ; ldr x0, [x20, THREAD_OFFSET]
+                    ; ldr x0, [x0, VM_THREAD_GC_HEAP_OFFSET]
+                );
+                emit_load_symbol_u64(
+                    &mut codegen.ops,
+                    &mut codegen.relocations,
+                    16,
+                    otter_vm::runtime_stubs::SHAPE_LEFT.entry_addr() as u64,
+                    RelocationTarget::runtime_stub(abi::STUB_SHAPE_LEFT),
                 );
                 dynasm!(codegen.ops ; .arch aarch64 ; blr x16);
                 codegen.emit_restore_registers(&live, saved);

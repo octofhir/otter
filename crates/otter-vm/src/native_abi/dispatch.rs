@@ -57,16 +57,17 @@ pub enum ExitReason {
     /// Generated code reached a site that had no feedback when it was
     /// compiled. The exit collects feedback; it is not a failed speculation.
     InsufficientFeedback = 12,
-    /// An object left a shape the generation relied on no object leaving.
-    StabilityChanged = 13,
-    /// A defining field's observed value bound widened after compilation.
-    FieldTypeChanged = 14,
+    /// A shape fact the generation subscribed to at installation changed:
+    /// an object left a stable shape or a defining field summary widened.
+    /// The exit recompiles under the current facts; it is not a failed
+    /// speculation.
+    DependencyChanged = 13,
     /// A pre-effect constructor receiver allocation probe missed.
-    ReceiverAllocationMiss = 15,
+    ReceiverAllocationMiss = 14,
     /// A literal allocation site the generation tracked has decided its
     /// placement. The exit recompiles with the decision; it is not a failed
     /// speculation.
-    AllocationSiteDecided = 16,
+    AllocationSiteDecided = 15,
 }
 
 impl ExitReason {
@@ -84,10 +85,9 @@ impl ExitReason {
             10 => Some(Self::UnsupportedOperation),
             11 => Some(Self::RuntimeTransition),
             12 => Some(Self::InsufficientFeedback),
-            13 => Some(Self::StabilityChanged),
-            14 => Some(Self::FieldTypeChanged),
-            15 => Some(Self::ReceiverAllocationMiss),
-            16 => Some(Self::AllocationSiteDecided),
+            13 => Some(Self::DependencyChanged),
+            14 => Some(Self::ReceiverAllocationMiss),
+            15 => Some(Self::AllocationSiteDecided),
             _ => None,
         }
     }
@@ -502,8 +502,7 @@ mod tests {
             ExitReason::UnsupportedOperation,
             ExitReason::RuntimeTransition,
             ExitReason::InsufficientFeedback,
-            ExitReason::StabilityChanged,
-            ExitReason::FieldTypeChanged,
+            ExitReason::DependencyChanged,
             ExitReason::ReceiverAllocationMiss,
             ExitReason::AllocationSiteDecided,
         ];

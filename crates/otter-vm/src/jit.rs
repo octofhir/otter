@@ -731,6 +731,14 @@ pub struct JitCompileSnapshot {
     pub shape_stable_byte: u32,
     /// Header-inclusive offset of a shape's monotone field-value word.
     pub shape_field_type_byte: u32,
+    /// Header-inclusive offset of a shape's watch bits: generated writers
+    /// that clear its stable byte or widen its field word read them and
+    /// fire the shape's code subscriptions through the VM when set.
+    pub shape_watched_byte: u32,
+    /// This compile's set-once flag: installation subscribes it to the shape
+    /// facts the generated code relies on without re-reading them, and the
+    /// code tests it where it first relies on one.
+    pub dependency_flag: std::sync::Arc<crate::code_dependencies::DependencyFlag>,
     /// Header-inclusive offset of the immutable u64 shape identity.
     pub shape_id_byte: u32,
     /// Defining-cell words and result bounds for ordinary own data locations.
@@ -738,8 +746,8 @@ pub struct JitCompileSnapshot {
     pub field_types: rustc_hash::FxHashMap<(u32, crate::object::FieldLocation), JitFieldType>,
     /// Compressed handles of baked shapes no object had left when the
     /// generation compiled. A value proven to have one of them before an
-    /// operation that may run code is re-proven afterwards by reading the
-    /// shapes' stable bytes instead of the value.
+    /// operation that may run code keeps it afterwards while the
+    /// generation's subscription to their stability holds.
     pub stable_shapes: rustc_hash::FxHashSet<u32>,
     /// Compressed handles of baked shapes some object had already left when
     /// the generation compiled. Stability only ever goes from set to clear,
@@ -2231,6 +2239,8 @@ impl JitCompileSnapshot {
             shape_prototype_byte: 0,
             shape_stable_byte: 0,
             shape_field_type_byte: 0,
+            shape_watched_byte: 0,
+            dependency_flag: crate::code_dependencies::DependencyFlag::new(),
             shape_id_byte: 0,
             field_types: rustc_hash::FxHashMap::default(),
             stable_shapes: rustc_hash::FxHashSet::default(),
@@ -2610,6 +2620,12 @@ pub trait JitFunctionCode: std::fmt::Debug + Send + Sync {
     /// exact slice length. Baseline/template code uses the empty default.
     fn dependencies(&self) -> &[crate::native_abi::CodeDependency] {
         &[]
+    }
+
+    /// The flag this code tests before relying on its shape-fact
+    /// dependencies; required when it declares any.
+    fn dependency_flag(&self) -> Option<&std::sync::Arc<crate::code_dependencies::DependencyFlag>> {
+        None
     }
 
     /// Source functions whose bodies were actually spliced into this code.

@@ -65,6 +65,7 @@ fn snapshot() -> JitCompileSnapshot {
         view.shape_state_byte = 8;
         view.shape_inline_capacity_byte = 9;
         view.shape_stable_byte = 10;
+        view.shape_watched_byte = 11;
         view.shape_prototype_byte = 16;
         // The real layout: shape, slab handle, exotic handle, then inline words.
         assert!(view.field_layout.slab_handle_byte >= view.object_shape_byte + 4);
@@ -137,6 +138,7 @@ fn prepare(arena: &mut [u64], view: &mut JitCompileSnapshot, proof: &AtomicU32) 
         put(arena, shape + SHAPE_ID_BYTE as usize, id);
         put(arena, shape + view.shape_inline_capacity_byte as usize, 2u8);
         put(arena, shape + view.shape_stable_byte as usize, 1u8);
+        put(arena, shape + view.shape_watched_byte as usize, 0u8);
         put(
             arena,
             shape + view.shape_state_byte as usize,
@@ -340,7 +342,7 @@ fn emitted_actions_keep_inherited_reads_append_slots_and_pre_effect_misses_indep
     );
     assert_stability(&arena, &view, 0);
 
-    for failure in 0..9 {
+    for failure in 0..10 {
         prepare(&mut arena, &mut view, &proof);
         match failure {
             0 => put(&mut arena, 152, 10u32), // full key mismatch
@@ -370,6 +372,13 @@ fn emitted_actions_keep_inherited_reads_append_slots_and_pre_effect_misses_indep
                 &mut arena,
                 RECEIVER_SHAPE + view.shape_state_byte as usize,
                 ShapeState::OPAQUE_LOOKUP_MASK | ShapeState::EXTENSIBLE_MASK,
+            ),
+            // Code relies on the shape staying stable: the runtime store
+            // fires it.
+            9 => put(
+                &mut arena,
+                RECEIVER_SHAPE + view.shape_watched_byte as usize,
+                otter_vm::code_dependencies::ShapeFact::Stable as u8,
             ),
             _ => unreachable!(),
         }

@@ -74,6 +74,7 @@ mod call_feedback;
 mod call_ops;
 pub mod closure;
 mod closure_construct;
+pub mod code_dependencies;
 mod code_liveness;
 mod code_space;
 mod coerce;

@@ -26,6 +26,8 @@
 //!   [`super::shape_keys::SHAPE_KEYS_MIN`] keys, the parent chain below.
 //! - [`shape_keys_ordered`] — parent-chain reader.
 //! - [`note_left`] / [`is_stable`] — monotone membership-stability tracking.
+//! - [`set_watchers`] / [`watchers`] — the code subscriptions a writer of
+//!   either monotone fact fires (see [`crate::code_dependencies`]).
 //! - `field_owner` / `field_type_snapshot` — defining-slot summary ownership.
 //!
 //! # Invariants
@@ -45,8 +47,9 @@
 //! - `property_count` is the number of string-keyed own slots represented by
 //!   the full parent chain.
 //! - Every change of an existing object's shape clears its former shape's
-//!   stability byte before publication. The byte never returns to one;
-//!   generated code can revalidate a prior membership proof from that byte.
+//!   stability byte before publication. The byte never returns to one.
+//! - A writer that clears a watched stability byte or widens a watched field
+//!   summary fires the shape's subscribers of that kind before returning.
 //! - Append descendants share each ancestor's data-field summary. Its scalar
 //!   shape identities are historical and require stable targets for a proof.
 //! - Transition/cache mutation belongs to interpreter-owned side tables.
@@ -67,12 +70,13 @@
 //! - <https://tc39.es/ecma262/#sec-ordinary-object-internal-methods-and-internal-slots-ownpropertykeys>
 //! - Architecture plan §4.1 (hidden classes).
 
-use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicPtr, AtomicU8, AtomicU64, Ordering};
 
 use otter_gc::GcHeap;
 use otter_gc::heap::RootSlotVisitor;
 use otter_gc::raw::{RawGc, SlotVisitor};
 
+use crate::code_dependencies::{ShapeFact, ShapeWatchers};
 use crate::property_atom::AtomId;
 use crate::string::{JsStringHandle, eq_str};
 
@@ -160,11 +164,20 @@ pub struct ShapeBody {
     /// that may run code still has it afterwards, which generated code
     /// confirms by reading this byte instead of the object.
     stable: AtomicU8,
+    /// [`ShapeFact`] bits some installed generation subscribed to: a writer
+    /// that changes a watched fact fires its subscribers.
+    watched: AtomicU8,
+    /// The registry-owned subscription list behind `watched`, or null.
+    watchers: AtomicPtr<ShapeWatchers>,
 }
 
 /// Byte generated code reads to confirm a shape still has every object it
 /// had (see [`ShapeBody`]'s `stable`).
 pub(crate) const SHAPE_BODY_STABLE_OFFSET: usize = std::mem::offset_of!(ShapeBody, stable);
+
+/// Watch bits generated writers read before clearing the stable byte or
+/// widening the field summary (see [`ShapeBody`]'s `watched`).
+pub(crate) const SHAPE_BODY_WATCHED_OFFSET: usize = std::mem::offset_of!(ShapeBody, watched);
 
 /// Atomic summary word for the data field introduced by this shape.
 pub(crate) const SHAPE_BODY_FIELD_TYPE_OFFSET: usize = std::mem::offset_of!(ShapeBody, field_type);
@@ -222,6 +235,8 @@ impl ShapeBody {
             enum_cache: crate::Value::undefined(),
             keys: super::shape_keys::ShapeKeysHandle::null(),
             stable: AtomicU8::new(1),
+            watched: AtomicU8::new(0),
+            watchers: AtomicPtr::new(std::ptr::null_mut()),
         }
     }
 
@@ -276,6 +291,8 @@ impl ShapeBody {
             enum_cache: crate::Value::undefined(),
             keys,
             stable: AtomicU8::new(1),
+            watched: AtomicU8::new(0),
+            watchers: AtomicPtr::new(std::ptr::null_mut()),
         }
     }
 
@@ -644,13 +661,47 @@ pub(super) fn set_field_type_snapshot(shape: ShapeHandle, value: u64) {
     let body = body_of(shape);
     debug_assert!(!body.is_root() && !body.own_is_accessor && !body.is_dictionary());
     body.field_type.store(value, Ordering::Relaxed);
+    if body.watched.load(Ordering::Relaxed) & ShapeFact::FieldType as u8 != 0 {
+        crate::code_dependencies::fire(shape, ShapeFact::FieldType);
+    }
 }
 
 /// An object is leaving `shape` for another: `shape` is stable no more.
 pub(crate) fn note_left(shape: ShapeHandle) {
     if !shape.is_null() {
-        body_of(shape).stable.store(0, Ordering::Relaxed);
+        // Only the mutator clears the byte, so a plain load decides whether
+        // this is the shape's first departure.
+        let body = body_of(shape);
+        if body.stable.load(Ordering::Relaxed) != 0 {
+            body.stable.store(0, Ordering::Relaxed);
+            if body.watched.load(Ordering::Relaxed) & ShapeFact::Stable as u8 != 0 {
+                crate::code_dependencies::fire(shape, ShapeFact::Stable);
+            }
+        }
     }
+}
+
+/// Publish `shape`'s subscriptions: their kinds and their list.
+pub(crate) fn set_watchers(shape: ShapeHandle, bits: u8, list: *const ShapeWatchers) {
+    let body = body_of(shape);
+    body.watchers.store(list.cast_mut(), Ordering::Relaxed);
+    body.watched.store(bits, Ordering::Relaxed);
+}
+
+/// The kinds `shape`'s remaining subscriptions name, after a fire.
+pub(crate) fn set_watch_bits(shape: ShapeHandle, bits: u8) {
+    body_of(shape).watched.store(bits, Ordering::Relaxed);
+}
+
+/// `shape`'s subscription list, or null.
+pub(crate) fn watchers(shape: ShapeHandle) -> *const ShapeWatchers {
+    body_of(shape).watchers.load(Ordering::Relaxed)
+}
+
+/// Whether `shape`'s defining field summary still has the low byte a
+/// generation captured.
+pub(crate) fn field_type_low_byte_is(shape: ShapeHandle, expected: u8) -> bool {
+    !shape.is_null() && body_of(shape).field_type.load(Ordering::Relaxed) as u8 == expected
 }
 
 /// Whether no object has ever left `shape`.

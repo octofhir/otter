@@ -24,7 +24,7 @@
 //!   (lazy) the instruction; dead registers resume as `undefined`.
 //! - A fact in [`Known`] never outlives the path it was proved on: joins keep
 //!   only facts every predecessor agrees on, calls drop heap facts except
-//!   shape memberships revalidated by monotone stability bytes, and
+//!   shape memberships of stable shapes, which the generation subscribes to, and
 //!   a store forgets every known value at its offset. A loop header keeps the
 //!   heap facts of its entry only when every back edge arrives with them;
 //!   otherwise the graph is rebuilt with the facts a back edge lost forgotten
@@ -237,7 +237,7 @@ pub(crate) struct Known {
     /// compiled: still true for as long as those shapes stay stable, which
     /// a use confirms from the shapes before relying on them.
     stale_shapes: FxHashMap<NodeId, SmallVec<[u32; 4]>>,
-    /// Shapes whose stable byte this path already read since its last such
+    /// Shapes whose stability this path already proved since its last such
     /// operation.
     stable_checked: FxHashSet<u32>,
     /// Nullable value bounds; their target layouts require stability checks.
@@ -3369,8 +3369,8 @@ impl<'a> Builder<'a> {
     }
 
     /// The shapes `object` is proved to have on this path: a current proof,
-    /// or a stale proof of stable shapes, re-proved here by reading the
-    /// shapes' stable bytes (each once per overtaking operation).
+    /// or a stale proof of stable shapes, re-proved here as a stability
+    /// dependency (each once per overtaking operation).
     fn known_shapes(&mut self, object: NodeId) -> Option<SmallVec<[u32; 4]>> {
         if let Some(shapes) = self
             .known

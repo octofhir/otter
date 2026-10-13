@@ -367,6 +367,12 @@ impl JitFunctionCode for ObservedJitCode {
         self.code.dependencies()
     }
 
+    fn dependency_flag(
+        &self,
+    ) -> Option<&std::sync::Arc<otter_vm::code_dependencies::DependencyFlag>> {
+        self.code.dependency_flag()
+    }
+
     fn code_len(&self) -> usize {
         self.code.code_len()
     }

@@ -125,15 +125,13 @@ impl Codegen<'_> {
                     .clone();
                 let receiver = input(0);
                 let holder = assigned.gp_temps[0];
-                let exit = self.eager_exit(node, DeoptReason::WrongShape);
                 if !receiver_proved {
+                    let exit = self.eager_exit(node, DeoptReason::WrongShape);
                     self.emit_object_receiver(receiver, exit);
                     dynasm!(self.ops ; .arch x64 ; cmp DWORD [Rq(receiver) + self.view.object_shape_byte as i32], guard.recv_shape as i32 ; jne =>exit);
                 }
-                if let Some(validity) = guard.prototype_validity {
-                    self.emit_validity_guard(validity, exit);
-                }
-                // A valid proof fixes the holder slot: the code-retained cell
+                // The chain proof is a code dependency, tested before this
+                // load: it fixes the holder slot, and the code-retained cell
                 // holds the closure read there when the guard was baked.
                 if guard.method_cell != 0 && guard.accessor_byte.is_none() {
                     emit_load_symbol_u64(
@@ -152,6 +150,7 @@ impl Codegen<'_> {
                 if guard.holder_root == 0 {
                     dynasm!(self.ops ; .arch x64 ; mov Rq(holder), Rq(receiver));
                 } else {
+                    let exit = self.eager_exit(node, DeoptReason::WrongShape);
                     self.emit_prototype_holder(receiver, holder, guard.holder_root, exit);
                 }
                 crate::x86_64::fields::emit_own_field(
@@ -491,12 +490,11 @@ impl Codegen<'_> {
                             _ => None,
                         });
                         if !parent.is_some_and(|parent| view.left_shapes.contains(&parent)) {
-                            self.load_immediate(11, 0xffff_ffff_0000_0000);
-                            dynasm!(self.ops ; .arch x64
-                                ; and r11, Rq(receiver)
-                                ; mov r10d, [Rq(receiver) + view.object_shape_byte as i32]
-                                ; add r10, r11
-                                ; mov BYTE [r10 + view.shape_stable_byte as i32], 0);
+                            self.emit_leave_receiver_shape(
+                                node,
+                                receiver,
+                                value.expect("named store value"),
+                            );
                         }
                         dynasm!(self.ops ; .arch x64
                             ; mov DWORD [Rq(receiver) + view.object_shape_byte as i32], shape as i32);

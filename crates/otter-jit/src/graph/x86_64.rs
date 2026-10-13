@@ -437,26 +437,11 @@ impl<'a> Codegen<'a> {
                 let dst = Self::gp(self.loc(node).result.expect("result"));
                 dynasm!(self.ops ; .arch x64 ; mov Rq(dst), [r13 + i32::from(*register) * 8]);
             }
-            Kind::CheckStableShapes(shapes) => {
-                let shapes = shapes.clone();
-                let exit = self.eager_exit(node, DeoptReason::StabilityChanged);
-                let view = self.view;
-                for shape in shapes {
-                    emit_load_symbol_u64(
-                        &mut self.ops,
-                        &mut self.relocations,
-                        10,
-                        view.cage_base as u64
-                            + u64::from(shape)
-                            + u64::from(view.shape_stable_byte),
-                        RelocationTarget::ShapeStableByte { shape },
-                    );
-                    dynasm!(self.ops ; .arch x64 ; cmp BYTE [r10], 0 ; je =>exit);
-                }
-            }
-            Kind::CheckFieldTypes(guards) => {
-                let guards = guards.clone();
-                self.emit_field_type_guards(node, &guards);
+            Kind::CheckDependencies => self.emit_dependency_check(node),
+            Kind::CheckStableShapes(_) | Kind::CheckFieldTypes(_) => {
+                return Err(Unsupported::OperandShape(
+                    "graph shape-fact proof outside a dependency test",
+                ));
             }
             Kind::CheckNotNullish { mask } => {
                 self.emit_not_nullish(node, *mask);

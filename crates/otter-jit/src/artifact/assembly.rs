@@ -520,10 +520,7 @@ fn symbolic_target(target: &RelocationTarget) -> String {
             format!("sourceWorkCell(function={function_id})")
         }
         RelocationTarget::BackedgeFuelCell => "backedgeFuelCell".to_string(),
-        RelocationTarget::ShapeStableByte { shape } => format!("shapeStableByte(shape={shape})"),
-        RelocationTarget::FieldTypeWord { owner_shape } => {
-            format!("fieldTypeWord(ownerShape={owner_shape})")
-        }
+        RelocationTarget::DependencyFlag => "dependencyFlag".to_string(),
     }
 }
 

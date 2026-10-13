@@ -567,6 +567,9 @@ pub struct JitContextLayout {
     pub slot_count_byte: u32,
     /// Byte offset of the 8-byte parent word (context value or `undefined`).
     pub parent_byte: u32,
+    /// Byte offset of the 8-byte watch word: zero, or the address of the
+    /// context's [`crate::code_dependencies::ContextWatch`].
+    pub watch_byte: u32,
     /// Byte offset of slot 0.
     pub slots_byte: u32,
 }
@@ -583,9 +586,45 @@ impl JitContextLayout {
             scope_index_byte: header + crate::context::CONTEXT_BODY_SCOPE_INDEX_OFFSET as u32,
             slot_count_byte: header + crate::context::CONTEXT_BODY_SLOT_COUNT_OFFSET as u32,
             parent_byte: header + crate::context::CONTEXT_BODY_PARENT_OFFSET as u32,
+            watch_byte: header + crate::context::CONTEXT_BODY_WATCH_OFFSET as u32,
             slots_byte: header + crate::context::CONTEXT_BODY_SLOTS_OFFSET as u32,
         }
     }
+}
+
+/// A context slot an inlined body reads, fixed while the slot's watch holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct JitContextConstant {
+    /// Parent hops from the closure's context to the slot's context.
+    pub depth: u16,
+    /// Slot index.
+    pub slot: u16,
+    /// Identity of the watch of the context holding the slot.
+    pub watch: u32,
+    /// The slot's value.
+    pub value: JitConstantValue,
+}
+
+/// A value generated code may use in place of reading it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JitConstantValue {
+    /// An int32 number.
+    Int32(i32),
+    /// The boxed bits of a value that is not a cell: a double, a boolean,
+    /// `null`, `undefined` or a closure-less function id.
+    Bits(u64),
+    /// A cell, read from a code-retained identity cell the collector
+    /// rewrites.
+    Cell {
+        /// Address of the identity cell.
+        cell: u64,
+        /// The value is an ECMAScript Object, so sloppy receiver binding
+        /// preserves it. Heap-backed primitives do not carry this proof.
+        object: bool,
+        /// Compressed shape handle of an ordinary object whose shape was
+        /// stable at the bake, or zero.
+        shape: u32,
+    },
 }
 
 /// Owned, moving-GC-stable snapshot of one executable function body.
@@ -692,6 +731,11 @@ pub struct JitCompileSnapshot {
     /// Byte offsets of [`crate::context::ContextBody`] for inline
     /// context-slot access, parent hops, and the extension probe.
     pub context_layout: JitContextLayout,
+    /// For a body baked against one exact closure — an inlined method whose
+    /// holder slot is proven — the slots of that closure's context chain the
+    /// body reads, each watched and holding the value recorded here. Empty
+    /// for every other snapshot.
+    pub closure_constants: Vec<JitContextConstant>,
     /// Byte offset from a decompressed object pointer to its shape handle
     /// (`HEADER_SIZE + OBJECT_BODY_SHAPE_OFFSET`). A `#[repr(C)]` constant; the
     /// emitter reads `[obj_ptr + object_shape_byte]` for CacheIR shape guards
@@ -2253,6 +2297,7 @@ impl JitCompileSnapshot {
             primitive_cell_type_tags: [0; 3],
             global_lexical_value_byte: 0,
             context_layout: JitContextLayout::current(),
+            closure_constants: Vec::new(),
             collection_layout: JitCollectionLayout::default(),
             native_call_layout: JitNativeCallLayout::default(),
             instructions,
@@ -3006,7 +3051,8 @@ mod layout_tests {
         assert_eq!(layout.scope_index_byte, header + 4);
         assert_eq!(layout.slot_count_byte, header + 6);
         assert_eq!(layout.parent_byte, header + 8);
-        assert_eq!(layout.slots_byte, header + 16);
+        assert_eq!(layout.watch_byte, header + 16);
+        assert_eq!(layout.slots_byte, header + 24);
     }
 
     #[test]

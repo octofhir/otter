@@ -112,6 +112,46 @@ impl Codegen<'_> {
         }));
     }
 
+    /// A store just wrote slot `slot` of `context`: when the context's watch
+    /// covers the slot, fire its subscribers through the VM. `context`
+    /// survives the cold call.
+    pub(super) fn emit_note_context_write(&mut self, node: NodeId, context: u8, slot: u16) {
+        let watched = self.ops.new_dynamic_label();
+        let done = self.ops.new_dynamic_label();
+        let watch = self.view.context_layout.watch_byte as i32;
+        let bit = slot as i8;
+        dynasm!(self.ops ; .arch x64
+            ; mov r10, [Rq(context) + watch]
+            ; test r10, r10
+            ; jz =>done
+            ; mov r11, [r10]
+            ; bt r11, bit
+            ; jc =>watched
+            ; =>done);
+        let live = self.slow_path_registers(node, &[context]);
+        self.deferred.push(Box::new(move |codegen| {
+            dynasm!(codegen.ops ; .arch x64 ; =>watched);
+            let saved = codegen.emit_save_registers(&live);
+            dynasm!(codegen.ops ; .arch x64
+                ; mov rsi, r10
+                ; mov edx, i32::from(slot)
+                ; mov rdi, [r15 + crate::entry::THREAD_OFFSET as i32]
+                ; mov rdi, [rdi + crate::entry::VM_THREAD_GC_HEAP_OFFSET as i32]);
+            crate::x86_64::values::emit_load_runtime_stub(
+                &mut codegen.ops,
+                &mut codegen.relocations,
+                otter_vm::runtime_stubs::CONTEXT_SLOT_WRITTEN.entry_addr() as u64,
+                abi::STUB_CONTEXT_SLOT_WRITTEN,
+            );
+            crate::x86_64::call_abi::emit_runtime_call(
+                &mut codegen.ops,
+                abi::STUB_CONTEXT_SLOT_WRITTEN,
+            );
+            codegen.emit_restore_registers(&live, saved);
+            dynasm!(codegen.ops ; .arch x64 ; jmp =>done);
+        }));
+    }
+
     pub(super) fn emit_shape_child_barrier(
         &mut self,
         node: NodeId,

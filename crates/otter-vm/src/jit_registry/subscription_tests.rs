@@ -119,3 +119,83 @@ fn installation_verifies_subscribes_and_retirement_unsubscribes() {
         assert!(crate::object::shape_body::watchers(shape).is_null());
     });
 }
+
+#[test]
+fn context_slot_dependencies_install_while_watched_and_retire_their_subscriptions() {
+    let mut heap = otter_gc::GcHeap::new().expect("heap");
+    let context = crate::context::alloc_context_with_roots(
+        &mut heap,
+        crate::context::ContextShape {
+            scope_function_id: 9,
+            scope_index: 0,
+            slot_count: 2,
+            has_extension: false,
+        },
+        Value::undefined(),
+        |_| false,
+        &mut |_| {},
+    )
+    .expect("context");
+    let mut registry = JitCodeRegistry::new_boxed();
+    let watch = registry
+        .watch_context_slot(&mut heap, context, 0)
+        .expect("slot 0 watched");
+    assert_eq!(
+        registry.watch_context_slot(&mut heap, context, 1),
+        Some(watch)
+    );
+    let slot = |slot: u16| CodeDependency {
+        kind: CodeDependencyKind::ContextSlot,
+        identity: watch,
+        expected: u64::from(slot),
+    };
+    let code = |id, dependency, flag| {
+        Arc::new(SubscribedCode {
+            id,
+            dependencies: Box::new([dependency]),
+            flag: Some(flag),
+        })
+    };
+
+    let flag = registry.dependency_flag();
+    let installed = code(310, slot(0), flag.clone());
+    registry
+        .register(310, installed.clone())
+        .expect("a watched slot installs");
+    assert!(registry.is_current_for_entry(installed.as_ref()));
+
+    // Writing the slot fires the generation and stales it for entry.
+    assert!(crate::context::write_slot(
+        &mut heap,
+        context,
+        0,
+        Value::number_i32(4)
+    ));
+    assert!(flag.is_set());
+    assert!(!registry.is_current_for_entry(installed.as_ref()));
+    assert_eq!(registry.invalidate_fired(), [0]);
+
+    // A compile that read the slot before the write installs stale.
+    let late = code(311, slot(0), registry.dependency_flag());
+    assert_eq!(
+        registry.register(311, late),
+        Err(JitInstallError::DependencyChanged)
+    );
+
+    // An invalidated generation's subscription goes with its retirement.
+    let other = registry.dependency_flag();
+    let retired = code(312, slot(1), other.clone());
+    registry
+        .register(312, retired.clone())
+        .expect("slot 1 is still watched");
+    registry.invalidate_code_object(312);
+    drop((installed, retired));
+    assert_eq!(registry.retire_unreferenced(), 2);
+    assert!(crate::context::write_slot(
+        &mut heap,
+        context,
+        1,
+        Value::number_i32(5)
+    ));
+    assert!(!other.is_set());
+}

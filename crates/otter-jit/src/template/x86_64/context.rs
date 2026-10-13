@@ -16,7 +16,9 @@
 //! - An unchecked access is proven well-formed by the bytecode verifier: the
 //!   register holds a context whose chain is at least `depth` hops deep. It
 //!   never throws and never publishes a PC.
-//! - A slot store of a cell value runs the canonical write barrier.
+//! - A slot store of a cell value runs the canonical write barrier. A store
+//!   within the watchable range first tests the context's watch and, for a
+//!   watched slot, fires its subscribers through the VM.
 //! - An inline carve cannot collect. The slow path publishes a full-window
 //!   safepoint; a refused allocation exits before any effect at the original
 //!   opcode, which the interpreter re-executes (and which owns the
@@ -151,9 +153,55 @@ pub(super) fn emit_store_context_slot(
     let offset = slot_offset(view, slot)?;
     emit_load_reg(ops, 10, context);
     emit_parent_hops(ops, view, 10, depth)?;
+    emit_context_slot_watch(ops, relocations, view, context, depth, slot)?;
     emit_load_reg(ops, 2, src);
     dynasm!(ops ; .arch x64 ; mov [r10 + offset], rdx);
     emit_template_value_barrier(ops, relocations, view, 10, 2);
+    Ok(())
+}
+
+/// A store is about to write slot `slot` of the context in `r10`, reached
+/// from `r<context>` through `depth` hops: when generated code watches the
+/// slot, fire its subscribers through the VM first — the store that follows
+/// runs no code in between — and walk to the context again after the call.
+/// Clobbers `rax`, `r11` and the call's scratch.
+fn emit_context_slot_watch(
+    ops: &mut Assembler,
+    relocations: &mut RelocationCapture,
+    view: &JitCompileSnapshot,
+    context: u16,
+    depth: u16,
+    slot: u16,
+) -> Result<(), Unsupported> {
+    if slot >= otter_vm::code_dependencies::WATCHABLE_CONTEXT_SLOTS {
+        return Ok(());
+    }
+    let watch = view.context_layout.watch_byte as i32;
+    let bit = slot as i8;
+    let done = ops.new_dynamic_label();
+    dynasm!(ops
+        ; .arch x64
+        ; mov r11, [r10 + watch]
+        ; test r11, r11
+        ; jz =>done
+        ; mov rax, [r11]
+        ; bt rax, bit
+        ; jnc =>done
+        ; mov rdi, [r15 + THREAD_OFFSET as i32]
+        ; mov rdi, [rdi + VM_THREAD_GC_HEAP_OFFSET as i32]
+        ; mov rsi, r11
+        ; mov edx, i32::from(slot)
+    );
+    emit_load_runtime_stub(
+        ops,
+        relocations,
+        otter_vm::runtime_stubs::CONTEXT_SLOT_WRITTEN.entry_addr() as u64,
+        abi::STUB_CONTEXT_SLOT_WRITTEN,
+    );
+    emit_runtime_call(ops, abi::STUB_CONTEXT_SLOT_WRITTEN);
+    emit_load_reg(ops, 10, context);
+    emit_parent_hops(ops, view, 10, depth)?;
+    dynasm!(ops ; .arch x64 ; =>done);
     Ok(())
 }
 
@@ -191,6 +239,7 @@ pub(super) fn emit_checked_context_slot(
     match access {
         CheckedContextAccess::Load { dst } => emit_store_reg(ops, 0, dst),
         CheckedContextAccess::Store { src } => {
+            emit_context_slot_watch(ops, relocations, view, context, depth, slot)?;
             emit_load_reg(ops, 2, src);
             dynasm!(ops ; .arch x64 ; mov [r10 + offset], rdx);
             emit_template_value_barrier(ops, relocations, view, 10, 2);

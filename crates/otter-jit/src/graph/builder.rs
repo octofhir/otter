@@ -56,6 +56,9 @@
 //!   Calls forget owner-word checks while retaining the loaded value bounds.
 //!   Owner guards keep their original load's eager frame and remain only
 //!   when a consumer relies on the bound, including through a non-loop phi.
+//! - Only an inlined method whose holder fixes its exact heap closure may
+//!   fold that closure's context slots. Every folded read carries a slot
+//!   dependency, and each slot store notifies its context's watch.
 //!
 //! # See also
 //! - [`super::bytecode`] — blocks, loops and liveness.
@@ -98,6 +101,10 @@ mod receiver_inline_tests;
 #[cfg(test)]
 #[path = "builder_binding_tests.rs"]
 mod binding_tests;
+
+#[cfg(test)]
+#[path = "builder_context_constant_tests.rs"]
+mod context_constant_tests;
 
 #[path = "builder_field_type.rs"]
 mod field_type;
@@ -622,6 +629,9 @@ struct Builder<'a> {
     required_field_guards: FxHashSet<NodeId>,
     /// Nullish comparisons whose ordinary arms depend on owner guards.
     field_nullish_candidates: FxHashMap<NodeId, SmallVec<[NodeId; 4]>>,
+    /// Contexts of the closure an inlined body was baked against, by node:
+    /// that body's snapshot and the parent hops from the closure's context.
+    closure_contexts: FxHashMap<NodeId, (*const JitCompileSnapshot, u16)>,
 }
 
 /// The most bytecode bytes inlined into one compilation by bodies that are
@@ -657,6 +667,9 @@ struct InlineFrame {
     receiver: Option<NodeId>,
     /// The body needs something only an activation of its own provides.
     abandoned: bool,
+    /// The callee is a heap closure a proven method slot fixes, never a
+    /// bare function id.
+    heap_closure: bool,
 }
 
 /// The half of the builder that describes the body being visited. Inlining
@@ -785,6 +798,7 @@ fn build_once(
         inline_views: Vec::new(),
         required_field_guards: FxHashSet::default(),
         field_nullish_candidates: FxHashMap::default(),
+        closure_contexts: FxHashMap::default(),
     };
     let entry = builder.graph.new_block();
     builder.start_entry(entry);
@@ -1081,6 +1095,26 @@ impl<'a> Builder<'a> {
         self.inline_frame(instruction, body, plan, closure, this, arguments)
     }
 
+    /// Whether `closure` is a guarded method read of this body whose holder
+    /// slot the prototype proof fixes to one heap closure.
+    fn proven_heap_closure(&self, closure: NodeId) -> bool {
+        let Kind::LoadGuardedMethod {
+            byte_pc, target, ..
+        } = self.graph.node(closure).kind
+        else {
+            return false;
+        };
+        self.view
+            .direct_methods
+            .get(&byte_pc)
+            .and_then(|methods| methods.get(usize::from(target)))
+            .is_some_and(|method| {
+                method.guard.slot_proven
+                    && method.guard.prototype_validity.is_some()
+                    && method.guard.method_cell != 0
+            })
+    }
+
     /// Whether `closure` is a guarded method read whose target's prototype
     /// proof fixes the holder slot to a closure of `function_id` (see
     /// [`otter_vm::jit::JitMethodGuard::slot_proven`]): the read's own guard
@@ -1115,6 +1149,7 @@ impl<'a> Builder<'a> {
         arguments: &[NodeId],
     ) -> bool {
         let cell = plan.callee_cell;
+        let heap_closure = self.proven_heap_closure(closure);
         let Some(block) = self.current else {
             return false;
         };
@@ -1231,6 +1266,7 @@ impl<'a> Builder<'a> {
                 returns: Vec::new(),
                 receiver,
                 abandoned: false,
+                heap_closure,
             })),
         };
         let caller_position = self.graph.position;
@@ -2168,7 +2204,20 @@ impl<'a> Builder<'a> {
             }
             Op::LoadClosureContext => {
                 let closure = self.closure();
-                let value = self.add(Kind::LoadClosureContext, &[closure], Repr::Tagged);
+                // A proven method slot holds one heap closure, never a bare
+                // function id: its context is one field away, and a body
+                // baked against that closure reads its constants through it.
+                let proven = self.inline.as_ref().is_some_and(|frame| frame.heap_closure);
+                let value = if proven {
+                    let byte = self.view.closure_call_layout.context_byte as i32;
+                    self.add(Kind::LoadTaggedField(byte), &[closure], Repr::Tagged)
+                } else {
+                    self.add(Kind::LoadClosureContext, &[closure], Repr::Tagged)
+                };
+                if proven && !self.view.closure_constants.is_empty() {
+                    self.closure_contexts
+                        .insert(value, (std::ptr::from_ref(self.view), 0));
+                }
                 self.write(instruction.writes[0], value);
             }
             Op::LoadThis if !self.view.derived_constructor => {
@@ -4687,6 +4736,7 @@ impl<'a> Builder<'a> {
     fn context_at_depth(&mut self, context: NodeId, depth: u16) -> NodeId {
         let mut context = context;
         for _ in 0..depth {
+            let origin = self.closure_contexts.get(&context).copied();
             context = match self.known.parents.get(&context) {
                 Some(&parent) => parent,
                 None => {
@@ -4695,8 +4745,69 @@ impl<'a> Builder<'a> {
                     parent
                 }
             };
+            if let Some((view, hops)) = origin {
+                self.closure_contexts.insert(context, (view, hops + 1));
+            }
         }
         context
+    }
+
+    /// The constant the body's baked closure fixes in `slot` of `context`,
+    /// when `context` is that closure's context or an ancestor of it.
+    fn closure_constant(
+        &self,
+        context: NodeId,
+        slot: u16,
+    ) -> Option<otter_vm::jit::JitContextConstant> {
+        let &(view, depth) = self.closure_contexts.get(&context)?;
+        if !std::ptr::eq(view, self.view) {
+            return None;
+        }
+        self.view
+            .closure_constants
+            .iter()
+            .find(|constant| constant.depth == depth && constant.slot == slot)
+            .copied()
+    }
+
+    /// The node for a context slot's constant value, under a proof of the
+    /// slot's dependency. An ordinary object of a stable shape carries that
+    /// shape as a stale proof each use confirms.
+    fn constant_slot_value(&mut self, constant: otter_vm::jit::JitContextConstant) -> NodeId {
+        self.add(
+            Kind::CheckContextSlot {
+                watch: constant.watch,
+                slot: constant.slot,
+            },
+            &[],
+            Repr::None,
+        );
+        match constant.value {
+            otter_vm::jit::JitConstantValue::Int32(value) => self.constant_int32(value),
+            otter_vm::jit::JitConstantValue::Bits(bits) => {
+                let value = self.constant_tagged(bits);
+                self.known.entry(value).heap_object =
+                    otter_vm::Value::from_bits(bits).is_object_type();
+                value
+            }
+            otter_vm::jit::JitConstantValue::Cell {
+                cell,
+                object,
+                shape,
+            } => {
+                let value = self.add(Kind::LoadCellValue(cell), &[], Repr::Tagged);
+                let info = self.known.entry(value);
+                info.heap_object = object;
+                if shape != 0 {
+                    debug_assert!(object);
+                    info.ordinary_object = true;
+                    self.known
+                        .stale_shapes
+                        .insert(value, smallvec::smallvec![shape]);
+                }
+                value
+            }
+        }
     }
 
     /// A context slot read; a `checked` read of a binding in its temporal
@@ -4711,6 +4822,12 @@ impl<'a> Builder<'a> {
         let context = self.read(instruction.reads[0]);
         let context = self.tagged(context);
         let context = self.context_at_depth(context, coord.depth);
+        if let Some(constant) = self.closure_constant(context, coord.slot) {
+            // A watched slot holds a value, never the hole.
+            let value = self.constant_slot_value(constant);
+            self.write(instruction.writes[0], value);
+            return;
+        }
         let offset = self.view.context_layout.slots_byte as i32 + i32::from(coord.slot) * 8;
         let key = FieldKey {
             object: context,
@@ -4751,6 +4868,9 @@ impl<'a> Builder<'a> {
             Repr::None,
         );
         self.write_barrier(context, value);
+        if coord.slot < otter_vm::code_dependencies::WATCHABLE_CONTEXT_SLOTS {
+            self.add(Kind::NoteContextWrite(coord.slot), &[context], Repr::None);
+        }
         self.known.store_field(
             FieldKey {
                 object: context,

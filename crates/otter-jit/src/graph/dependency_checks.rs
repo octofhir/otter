@@ -1,23 +1,24 @@
 //! Monotone facts as code dependencies: one flag test per effect region.
 //!
-//! The builder places a stability or field-summary proof before every use of
-//! such a fact, as if each re-read its shape word after any operation that
-//! may have run code, and an inherited method load names the prototype-chain
-//! validity cell it relies on. The generation instead subscribes to those
-//! facts at installation, and a writer that breaks one sets its dependency
-//! flag. This pass collects the facts as the generation's dependencies and
-//! keeps one flag test where a fact is first relied on since entry or since a
-//! node that can break one; every other proof goes, and method loads read no
-//! validity cell.
+//! The builder places a stability, field-summary or context-slot proof
+//! before every use of such a fact, as if each re-read its word after any
+//! operation that may have run code, and an inherited method load names the
+//! prototype-chain validity cell it relies on. The generation instead
+//! subscribes to those facts at installation, and a writer that breaks one
+//! sets its dependency flag. This pass collects the facts as the
+//! generation's dependencies and keeps one flag test where a fact is first
+//! relied on since entry or since a node that can break one; every other
+//! proof goes, and method loads read no validity cell.
 //!
 //! # Contents
 //! - [`place`] — rewrite proofs into flag tests and return the dependencies.
 //!
 //! # Invariants
 //! - A fact can break only through a node that runs code or collects, a named
-//!   store (its transitions leave shapes and observe field summaries) or an
-//!   own-field store that observes a summary. Everything else, including an
-//!   interrupt poll, leaves every fact as it was.
+//!   store (its transitions leave shapes and observe field summaries), an
+//!   own-field store that observes a summary, or a context-slot store whose
+//!   watch may fire. Everything else, including an interrupt poll, leaves
+//!   every fact as it was.
 //! - A block entered from outside the graph (function or OSR entry) or with
 //!   no predecessor starts unchecked; a join is checked only when every
 //!   predecessor leaves checked.
@@ -45,14 +46,17 @@ fn breaks_facts(graph: &Graph, node: NodeId) -> bool {
         return true;
     }
     match kind {
-        Kind::StoreNamedProperty { .. } => true,
+        Kind::StoreNamedProperty { .. } | Kind::NoteContextWrite(_) => true,
         Kind::StoreOwnField { owners, .. } => !owners.is_empty(),
         _ => false,
     }
 }
 
 fn is_proof(kind: &Kind) -> bool {
-    matches!(kind, Kind::CheckStableShapes(_) | Kind::CheckFieldTypes(_))
+    matches!(
+        kind,
+        Kind::CheckStableShapes(_) | Kind::CheckFieldTypes(_) | Kind::CheckContextSlot { .. }
+    )
 }
 
 /// The validity cell an inherited method load relies on.
@@ -114,6 +118,13 @@ pub(crate) fn place(
                             u64::from(guard.expected as u8),
                         )
                     }));
+                }
+                &Kind::CheckContextSlot { watch, slot } => {
+                    facts.insert((
+                        CodeDependencyKind::ContextSlot as u16,
+                        watch,
+                        u64::from(slot),
+                    ));
                 }
                 _ => {}
             }
@@ -218,6 +229,9 @@ pub(crate) fn place(
                 }
                 kind if kind == CodeDependencyKind::FieldType as u16 => {
                     CodeDependencyKind::FieldType
+                }
+                kind if kind == CodeDependencyKind::ContextSlot as u16 => {
+                    CodeDependencyKind::ContextSlot
                 }
                 _ => CodeDependencyKind::PrototypeValidity,
             },
@@ -363,6 +377,40 @@ mod tests {
         );
         place(&mut graph, &view(), &[]);
         assert!(kinds(&graph, header).is_empty());
+    }
+
+    #[test]
+    fn a_context_slot_store_reopens_the_region_of_a_slot_constant() {
+        let mut graph = Graph::default();
+        let entry = graph.new_block();
+        let constant = Kind::CheckContextSlot { watch: 5, slot: 2 };
+        append(&mut graph, entry, constant.clone());
+        append(
+            &mut graph,
+            entry,
+            Kind::CheckContextSlot { watch: 5, slot: 3 },
+        );
+        append(&mut graph, entry, Kind::NoteContextWrite(2));
+        append(&mut graph, entry, constant);
+        let dependencies = place(&mut graph, &view(), &[]);
+        assert_eq!(
+            kinds(&graph, entry),
+            [
+                &Kind::CheckDependencies,
+                &Kind::NoteContextWrite(2),
+                &Kind::CheckDependencies
+            ]
+        );
+        assert_eq!(
+            dependencies
+                .iter()
+                .map(|dependency| (dependency.kind, dependency.identity, dependency.expected))
+                .collect::<Vec<_>>(),
+            [
+                (CodeDependencyKind::ContextSlot, 5, 2),
+                (CodeDependencyKind::ContextSlot, 5, 3),
+            ]
+        );
     }
 
     #[test]

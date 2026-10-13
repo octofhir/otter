@@ -593,6 +593,21 @@ pub(crate) enum Kind {
     /// Eager deopt unless input0 is the value the identity cell at this
     /// address holds; the collector keeps the cell's value current.
     CheckCellValue(u64),
+    /// The value the code-retained identity cell at this address holds; the
+    /// collector keeps the cell's value current.
+    LoadCellValue(u64),
+    /// The builder's proof that this slot of the context whose watch has this
+    /// identity still holds the value the generation read as a constant. The
+    /// generation subscribes to the slot; [`super::dependency_checks`] turns
+    /// the node into a [`Kind::CheckDependencies`] or removes it before
+    /// allocation.
+    CheckContextSlot {
+        watch: u32,
+        slot: u16,
+    },
+    /// A store just wrote this slot of context input0: when the context's
+    /// watch covers the slot, fire the slot's subscribers through the VM.
+    NoteContextWrite(u16),
     /// Eager deopt when input0 is the hole of a binding still in its
     /// temporal dead zone.
     CheckNotHole,
@@ -761,6 +776,7 @@ impl Kind {
             | Self::LoadClosure
             | Self::LoadArgumentCount
             | Self::LoadLiteral(_)
+            | Self::LoadCellValue(_)
             | Self::LoadWindow(_)
             | Self::Phi
             | Self::AllocationProjection(_)
@@ -901,7 +917,8 @@ impl Kind {
             | Self::StoreTaggedField(_)
             | Self::StoreElement(_)
             | Self::WriteBarrier
-            | Self::ElementWriteBarrier => Properties {
+            | Self::ElementWriteBarrier
+            | Self::NoteContextWrite(_) => Properties {
                 writes: true,
                 effectful: true,
                 ..Properties::default()
@@ -928,6 +945,7 @@ impl Kind {
             Self::Deopt(_)
             | Self::CheckStableShapes(_)
             | Self::CheckFieldTypes(_)
+            | Self::CheckContextSlot { .. }
             | Self::CheckDependencies => Properties {
                 eager_deopt: true,
                 effectful: true,
@@ -1019,6 +1037,7 @@ impl Kind {
             | Self::LoadNewTarget
             | Self::LoadClosure
             | Self::LoadLiteral(_)
+            | Self::LoadCellValue(_)
             | Self::LoadGlobalThis
             | Self::LoadWindow(_) => simple(0, ResultPolicy::Register),
             // The right operand may be a constant, encoded in the
@@ -1258,6 +1277,7 @@ impl Kind {
             },
             Self::StoreTaggedField(_) => simple(2, ResultPolicy::None),
             Self::WriteBarrier => simple(2, ResultPolicy::None),
+            Self::NoteContextWrite(_) => simple(1, ResultPolicy::None),
             Self::NativeLeaf(_) => Constraints {
                 inputs: (0..input_count).map(|_| InputPolicy::Home).collect(),
                 result: ResultPolicy::FixedGp(target.call_result),
@@ -1306,6 +1326,7 @@ impl Kind {
             | Self::Deopt(_)
             | Self::CheckStableShapes(_)
             | Self::CheckFieldTypes(_)
+            | Self::CheckContextSlot { .. }
             | Self::CheckDependencies => simple(0, ResultPolicy::None),
             Self::Branch {
                 kind: BranchKind::Int32(_),

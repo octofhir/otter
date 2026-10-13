@@ -470,6 +470,7 @@ impl CodeBlock {
             global_lexical_value_byte: otter_gc::header::HEADER_SIZE as u32
                 + std::mem::offset_of!(crate::upvalue::UpvalueCellBody, value) as u32,
             context_layout: crate::jit::JitContextLayout::current(),
+            closure_constants: Vec::new(),
             collection_layout: crate::jit::JitCollectionLayout {
                 map_type_tag: crate::collections::MAP_BODY_TYPE_TAG,
                 set_type_tag: crate::collections::SET_BODY_TYPE_TAG,

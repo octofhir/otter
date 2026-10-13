@@ -709,6 +709,11 @@ impl Interpreter {
         parameters_widened: bool,
     ) {
         let (site_fid, site_pc) = site;
+        // A broken dependency left this generation: retire every fired one
+        // now, so no caller enters it again through its entry cell.
+        if exit.reason() == native_abi::ExitReason::DependencyChanged {
+            self.retire_fired_jit_code();
+        }
         let current = self
             .jit_code_registry
             .is_current_generation(exited_code_object_id);

@@ -694,7 +694,7 @@ impl Interpreter {
     /// Retire the generations whose subscribed facts fired, and re-arm their
     /// functions' optimizing work window: they compile again from the
     /// current facts instead of staying in baseline code.
-    fn retire_fired_jit_code(&mut self) {
+    pub(super) fn retire_fired_jit_code(&mut self) {
         let fired = self.jit_code_registry.invalidate_fired();
         if fired.is_empty() {
             return;
@@ -3199,11 +3199,18 @@ impl Interpreter {
         plan.callee_cell = self.bake_callee_identity_cell();
         // An optimizing caller may build the method in place of the call;
         // one that reads its actual arguments needs a frame of its own.
-        let body = (tier == jit_debug::JitDebugTier::Optimizing
+        let mut body = (tier == jit_debug::JitDebugTier::Optimizing
             && !method.requires_argument_frame()
             && method.admits_graph_inlining())
         .then(|| self.bake_inline_body(&method_context, target.method_fid, tier, budget, None))
         .flatten();
+        // A proven holder slot fixes the closure the body runs as, so the
+        // body may read that closure's watched context slots as constants.
+        if let Some(closure) = self.proven_method(target)
+            && let Some(body) = body.as_mut().and_then(std::sync::Arc::get_mut)
+        {
+            body.closure_constants = self.bake_closure_constants(closure, &body.code_block);
+        }
         Ok(jit::JitDirectMethod {
             target_index,
             target_count,
@@ -3214,6 +3221,103 @@ impl Interpreter {
             },
             body,
         })
+    }
+
+    /// The slots of `closure`'s context chain that `code` reads, each now
+    /// watched, with the value it holds. A slot qualifies within the
+    /// watchable range, never written since an earlier watch, at a
+    /// coordinate the body itself never writes, and holding neither the
+    /// hole nor `undefined` — a binding still awaiting its initialization,
+    /// like one the body assigns, would only fire its watch.
+    fn bake_closure_constants(
+        &mut self,
+        closure: Value,
+        code: &crate::executable::CodeBlock,
+    ) -> Vec<jit::JitContextConstant> {
+        use otter_bytecode::Op;
+        let Some(base) = closure
+            .as_closure(&self.gc_heap)
+            .and_then(|closure| closure.context(&self.gc_heap).as_context())
+        else {
+            return Vec::new();
+        };
+        let mut seen: rustc_hash::FxHashSet<(u16, u16)> = code
+            .code
+            .iter()
+            .filter_map(|instruction| {
+                let position = match code.op(instruction) {
+                    Op::StoreContextSlot
+                    | Op::StoreContextSlotChecked
+                    | Op::BindThisContextSlot => 2,
+                    Op::StoreLookupSlot => 3,
+                    _ => return None,
+                };
+                let Some(otter_bytecode::Operand::Imm32(word)) =
+                    code.operand(instruction, position)
+                else {
+                    return None;
+                };
+                otter_bytecode::ContextCoord::from_imm32(word)
+                    .map(|coord| (coord.depth, coord.slot))
+            })
+            .collect();
+        let mut constants = Vec::new();
+        for instruction in code.code.iter() {
+            if !matches!(
+                code.op(instruction),
+                Op::LoadContextSlot | Op::LoadContextSlotChecked
+            ) {
+                continue;
+            }
+            let Some(otter_bytecode::Operand::Imm32(word)) = code.operand(instruction, 2) else {
+                continue;
+            };
+            let Some(coord) = otter_bytecode::ContextCoord::from_imm32(word) else {
+                continue;
+            };
+            if !seen.insert((coord.depth, coord.slot)) {
+                continue;
+            }
+            let Some(context) = crate::context::walk(&self.gc_heap, base, coord.depth) else {
+                continue;
+            };
+            let Some(value) = crate::context::read_slot(&self.gc_heap, context, coord.slot) else {
+                continue;
+            };
+            if value.is_hole() || value.is_undefined() {
+                continue;
+            }
+            let Some(watch) =
+                self.jit_code_registry
+                    .watch_context_slot(&mut self.gc_heap, context, coord.slot)
+            else {
+                continue;
+            };
+            let constant = if let Some(int) = value.as_i32() {
+                jit::JitConstantValue::Int32(int)
+            } else if value.is_cell() {
+                let shape = value
+                    .as_object()
+                    .map(|object| crate::object::shape(object, &self.gc_heap))
+                    .filter(|&shape| crate::object::shape_body::is_stable(shape))
+                    .and_then(|shape| self.bake_shape(shape))
+                    .unwrap_or(0);
+                jit::JitConstantValue::Cell {
+                    cell: self.bake_held_identity_cell(value),
+                    object: value.is_object_type(),
+                    shape,
+                }
+            } else {
+                jit::JitConstantValue::Bits(value.to_bits())
+            };
+            constants.push(jit::JitContextConstant {
+                depth: coord.depth,
+                slot: coord.slot,
+                watch,
+                value: constant,
+            });
+        }
+        constants
     }
 
     /// Bake the finalized actual new.target family observed at this source

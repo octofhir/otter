@@ -63,6 +63,9 @@ pub enum CodeDependencyKind {
     /// The prototype-chain validity cell whose word is at the address in
     /// `expected`, retained by the code, stays valid.
     PrototypeValidity = 5,
+    /// Slot `expected` of the context whose watch has this identity keeps
+    /// the value the compile read from it.
+    ContextSlot = 6,
 }
 
 /// Explicit validity dependency owned by a code object.
@@ -87,6 +90,7 @@ impl CodeDependency {
             CodeDependencyKind::ShapeStable
                 | CodeDependencyKind::FieldType
                 | CodeDependencyKind::PrototypeValidity
+                | CodeDependencyKind::ContextSlot
         )
     }
 

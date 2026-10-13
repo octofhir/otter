@@ -6,7 +6,8 @@
 //!
 //! # Invariants
 //! - Type/extension/size/limit misses precede writes; fits cannot collect.
-//! - Parent, scope identity and every slot precede the single publication.
+//! - Parent, scope identity, a clear watch word and every slot precede the
+//!   single publication.
 //! - Copy source is reloaded after the probe, consumed locally, and never
 //!   survives a collecting boundary as an interior pointer.
 //!
@@ -54,7 +55,10 @@ pub(crate) fn emit_create_context(
     emit_load_u64(ops, regs.scratch, plan.body_word);
     dynasm!(ops ; .arch aarch64 ; str X(regs.scratch), [X(regs.candidate), layout.scope_function_id_byte]);
     emit_value(ops, regs.scratch, parent);
-    dynasm!(ops ; .arch aarch64 ; str X(regs.scratch), [X(regs.candidate), layout.parent_byte]);
+    dynasm!(ops ; .arch aarch64
+        ; str X(regs.scratch), [X(regs.candidate), layout.parent_byte]
+        ; str xzr, [X(regs.candidate), layout.watch_byte]
+    );
     for (index, &word) in plan.initial_words.iter().enumerate() {
         emit_load_u64(ops, regs.scratch, word);
         let byte = layout.slots_byte + 8 * index as u32;
@@ -94,6 +98,7 @@ pub(crate) fn emit_copy_context(
         ; str X(regs.size), [X(regs.candidate), layout.scope_function_id_byte]
         ; ldr X(regs.size), [X(regs.buffer), layout.parent_byte]
         ; str X(regs.size), [X(regs.candidate), layout.parent_byte]
+        ; str xzr, [X(regs.candidate), layout.watch_byte]
         ; ldrh W(regs.scratch), [X(regs.buffer), layout.slot_count_byte]
         ; cbz W(regs.scratch), =>copied
         ; lsl X(regs.scratch), X(regs.scratch), 3

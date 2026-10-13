@@ -1,0 +1,231 @@
+{
+  "richards": {
+    "otter": 19783029775,
+    "node": 11559753905,
+    "ratio": 1.7113711881394935,
+    "delta_percent": -9.326026361516904,
+    "wall": {
+      "otter_seconds": 1.028125625,
+      "node_seconds": 0.647557959,
+      "bun_seconds": 0.544658709,
+      "node_ratio": 1.5876966852321552,
+      "bun_ratio": 1.8876511253949304,
+      "parent_otter_seconds": 1.1478285,
+      "delta_percent": -10.42863764055344,
+      "parent_node_seconds": 0.634712958,
+      "parent_bun_seconds": 0.536778292,
+      "parent_node_ratio": 1.8084214061374178,
+      "parent_bun_ratio": 2.138366094730224,
+      "node_ratio_delta_percent": -12.205380900500696
+    }
+  },
+  "deltablue": {
+    "otter": 21309685942,
+    "node": 5590907366,
+    "ratio": 3.811489718393592,
+    "delta_percent": -6.834383152025958,
+    "wall": {
+      "otter_seconds": 1.120155083,
+      "node_seconds": 0.280813292,
+      "bun_seconds": 0.39163904200000005,
+      "node_ratio": 3.988967455999198,
+      "bun_ratio": 2.860172155665726,
+      "parent_otter_seconds": 1.1832888750000001,
+      "delta_percent": -5.335450483298098,
+      "parent_node_seconds": 0.284991875,
+      "parent_bun_seconds": 0.398005459,
+      "parent_node_ratio": 4.152009158155825,
+      "parent_bun_ratio": 2.9730468470785474,
+      "node_ratio_delta_percent": -3.9268146082087174
+    }
+  },
+  "crypto": {
+    "otter": 4606526214,
+    "node": 2918126968,
+    "ratio": 1.5785900560581776,
+    "delta_percent": -0.8796466765211619,
+    "wall": {
+      "otter_seconds": 0.23999620900000002,
+      "node_seconds": 0.155470792,
+      "bun_seconds": null,
+      "node_ratio": 1.5436739333006035,
+      "bun_ratio": null,
+      "parent_otter_seconds": 0.237739417,
+      "delta_percent": 0.9492712771311362
+    }
+  },
+  "raytrace": {
+    "otter": 18267571570,
+    "node": 8371358844,
+    "ratio": 2.182151298303609,
+    "delta_percent": -0.68836725630117,
+    "wall": {
+      "otter_seconds": 1.260862125,
+      "node_seconds": 0.536046208,
+      "bun_seconds": 0.288831875,
+      "node_ratio": 2.352151934260115,
+      "bun_ratio": 4.365384274156029,
+      "parent_otter_seconds": 1.227652833,
+      "delta_percent": 2.7051044975676675,
+      "parent_node_seconds": 0.528665375,
+      "parent_bun_seconds": 0.286935167,
+      "parent_node_ratio": 2.3221737058153282,
+      "parent_bun_ratio": 4.278502512729644,
+      "node_ratio_delta_percent": 1.2909554685643698
+    }
+  },
+  "earley-boyer": {
+    "otter": 29470515984,
+    "node": 18688380783,
+    "ratio": 1.5769432529332896,
+    "delta_percent": 0.9078558881297827,
+    "wall": {
+      "otter_seconds": 1.659529958,
+      "node_seconds": 1.047394166,
+      "bun_seconds": 1.085855167,
+      "node_ratio": 1.5844368928822161,
+      "bun_ratio": 1.5283161221076549,
+      "parent_otter_seconds": 1.625506625,
+      "delta_percent": 2.093091007857306,
+      "parent_node_seconds": 1.028434458,
+      "parent_bun_seconds": 1.0489983330000001,
+      "parent_node_ratio": 1.580564140335329,
+      "parent_bun_ratio": 1.5495797980453034,
+      "node_ratio_delta_percent": 0.24502343486456635
+    }
+  },
+  "regexp": {
+    "otter": 22864077304,
+    "node": 7302024402,
+    "ratio": 3.131197055125919,
+    "delta_percent": 0.0032009488781126194,
+    "wall": {
+      "otter_seconds": 1.5892358340000001,
+      "node_seconds": 0.406997584,
+      "bun_seconds": 0.350235833,
+      "node_ratio": 3.9047795281261424,
+      "bun_ratio": 4.5376163266538185,
+      "parent_otter_seconds": 1.583161916,
+      "delta_percent": 0.38365740980850216
+    }
+  },
+  "splay": {
+    "otter": 9993101303,
+    "node": 4396614120,
+    "ratio": 2.2729084314090318,
+    "delta_percent": 0.04733768935152316,
+    "wall": {
+      "otter_seconds": 0.743216416,
+      "node_seconds": 0.312809958,
+      "bun_seconds": 0.188731541,
+      "node_ratio": 2.3759359220910734,
+      "bun_ratio": 3.9379555322975928,
+      "parent_otter_seconds": 0.703855458,
+      "delta_percent": 5.592193333535245,
+      "parent_node_seconds": 0.29670741700000003,
+      "parent_bun_seconds": 0.178486792,
+      "parent_node_ratio": 2.3722206378143893,
+      "parent_bun_ratio": 3.9434596258528756,
+      "node_ratio_delta_percent": 0.15661630362120427
+    }
+  },
+  "navier-stokes": {
+    "otter": 7874752754,
+    "node": 8095275899,
+    "ratio": 0.9727590328295986,
+    "delta_percent": -0.06607128165079246,
+    "wall": {
+      "otter_seconds": 0.914577041,
+      "node_seconds": 0.707327542,
+      "bun_seconds": null,
+      "node_ratio": 1.2930035757041114,
+      "bun_ratio": null,
+      "parent_otter_seconds": 0.9091659590000001,
+      "delta_percent": 0.5951698858095877
+    }
+  },
+  "box2d": {
+    "otter": 12914041843,
+    "node": 5062573423,
+    "ratio": 2.5508848492605853,
+    "delta_percent": 0.005092538010109671,
+    "wall": {
+      "otter_seconds": 0.8216372500000001,
+      "node_seconds": 0.297605917,
+      "bun_seconds": 0.271461084,
+      "node_ratio": 2.7608229644170685,
+      "bun_ratio": 3.026722054937348,
+      "parent_otter_seconds": 0.833781709,
+      "delta_percent": -1.456551381364013
+    }
+  },
+  "gbemu": {
+    "otter": 18802745825,
+    "node": 8221150072,
+    "ratio": 2.2871186707854076,
+    "delta_percent": 0.07427851476993208,
+    "wall": {
+      "otter_seconds": 1.23020425,
+      "node_seconds": 0.47575379100000004,
+      "bun_seconds": null,
+      "node_ratio": 2.58580020437504,
+      "bun_ratio": null,
+      "parent_otter_seconds": 1.224978042,
+      "delta_percent": 0.42663687191220045
+    }
+  },
+  "mandreel": {
+    "otter": 19147242664,
+    "node": 13823039865,
+    "ratio": 1.385168736471701,
+    "delta_percent": -0.220607398321071,
+    "wall": {
+      "otter_seconds": 1.210214291,
+      "node_seconds": 0.688079875,
+      "bun_seconds": 0.493466375,
+      "node_ratio": 1.758828204356362,
+      "bun_ratio": 2.452475695025826,
+      "parent_otter_seconds": 1.203199209,
+      "delta_percent": 0.5830357888807258
+    }
+  },
+  "zlib": {
+    "otter": 24330513685,
+    "node": 24749906421,
+    "ratio": 0.9830547748801123,
+    "delta_percent": 0.07413653458574476,
+    "wall": {
+      "otter_seconds": 1.9255485,
+      "node_seconds": 1.612358541,
+      "bun_seconds": null,
+      "node_ratio": 1.1942433714561753,
+      "bun_ratio": null,
+      "parent_otter_seconds": 1.922362041,
+      "delta_percent": 0.16575748646923127
+    }
+  },
+  "ts": {
+    "otter": 37235423113,
+    "node": 20854641072,
+    "ratio": 1.7854741773999303,
+    "delta_percent": 0.5612973321621251,
+    "wall": {
+      "otter_seconds": 3.286087959,
+      "node_seconds": 1.148142,
+      "bun_seconds": 1.004225791,
+      "node_ratio": 2.8620919354923,
+      "bun_ratio": 3.272260071838764,
+      "parent_otter_seconds": 3.297983959,
+      "delta_percent": -0.3607052110589204
+    }
+  },
+  "geomean": {
+    "ratio": 1.8725121552827384,
+    "parent_ratio": 1.897251438742013,
+    "wall_node_ratio": 2.131605286107904,
+    "parent_wall_node_ratio": 2.1552599197894295,
+    "wall_bun_ratio": 2.92420716032415,
+    "parent_wall_bun_ratio": 3.007790904296795,
+    "wall_delta_percent": -0.38764999450483506
+  }
+}

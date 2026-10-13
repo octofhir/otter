@@ -1563,7 +1563,14 @@ impl Interpreter {
                     }
                     if jit_installed {
                         let recv = *read_register(&stack[top_idx], recv_reg)?;
+                        let key = *read_register(&stack[top_idx], idx_reg)?;
                         self.record_element_family_feedback(function, instr.instruction_pc, recv);
+                        self.record_element_bounds_feedback(
+                            function,
+                            instr.instruction_pc,
+                            recv,
+                            key,
+                        );
                     }
                     // Copy the operands through a short representation-neutral
                     // view, then end the frame borrow before `[[Set]]` can

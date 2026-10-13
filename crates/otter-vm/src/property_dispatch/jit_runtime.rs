@@ -582,6 +582,7 @@ impl Interpreter {
         self.record_jit_runtime_property_stub();
         if let Some(code_block) = context.exec_function(function_id) {
             self.record_element_family_feedback(code_block, instruction_pc, receiver);
+            self.record_element_bounds_feedback(code_block, instruction_pc, receiver, key_value);
         }
         self.store_element_values(
             stack,

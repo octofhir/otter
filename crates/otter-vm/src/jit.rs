@@ -678,6 +678,12 @@ pub struct JitCompileSnapshot {
     /// compile deoptimizes when it reaches one ("insufficient feedback"), so
     /// the next generation specializes it instead of calling cold forever.
     pub unseen_element_sites: rustc_hash::FxHashSet<u32>,
+    /// Byte-PCs of indexed store sites where a store reached past its
+    /// receiver's dense elements (an append or a gap). The optimizing tier
+    /// keeps their generic store instead of an in-bounds speculation that
+    /// would leave generated code at each one; the baseline keeps its
+    /// in-bounds fast path and completes the rest in the runtime.
+    pub out_of_bounds_element_sites: rustc_hash::FxHashSet<u32>,
     /// Static heap-layout offsets for inline primitive string `.length`.
     pub string_layout: JitStringLayout,
     /// Byte offset from a decompressed global-lexical cell pointer to its
@@ -2209,6 +2215,7 @@ impl JitCompileSnapshot {
             element_accesses: rustc_hash::FxHashMap::default(),
             array_iteration: None,
             unseen_element_sites: rustc_hash::FxHashSet::default(),
+            out_of_bounds_element_sites: rustc_hash::FxHashSet::default(),
             string_layout: JitStringLayout::default(),
             object_shape_byte: 0,
             exotic_dictionary_layout_byte: 0,

@@ -44,6 +44,23 @@ impl Interpreter {
         }
     }
 
+    /// Whether an indexed store to `recv` at `key` reaches past the
+    /// receiver's dense elements: an append or a gap. Only Array and
+    /// typed-array receivers under an int32 index qualify; every other store
+    /// is not an element-bounds question.
+    pub(crate) fn element_index_out_of_bounds(&self, recv: Value, key: Value) -> bool {
+        let Some(index) = key.as_i32().and_then(|index| usize::try_from(index).ok()) else {
+            return false;
+        };
+        if let Some(array) = recv.as_array() {
+            return self
+                .gc_heap
+                .read_payload(array, |body| index >= body.dense_len());
+        }
+        recv.as_typed_array(&self.gc_heap)
+            .is_some_and(|view| index >= view.length(&self.gc_heap))
+    }
+
     pub(crate) fn run_load_element_regs(
         &mut self,
         context: &ExecutionContext,

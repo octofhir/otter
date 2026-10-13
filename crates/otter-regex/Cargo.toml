@@ -26,6 +26,9 @@ unicode-ident = "1"
 # Inline capture-slot storage so the backtracker snapshots small capture
 # arrays on its stack without a heap allocation per alternation/quantifier.
 smallvec = { workspace = true }
+# Vectorized byte and substring search for the scan prefilters over one-byte
+# subjects; already present elsewhere in the workspace dependency graph.
+memchr = "2"
 
 [features]
 # `unicode` pulls in the property-escape data path. Default-on; a future slim

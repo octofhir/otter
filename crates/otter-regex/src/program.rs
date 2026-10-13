@@ -236,6 +236,9 @@ pub(crate) struct Prefilter {
     /// membership test — the stored set already holds canonicalized members, so
     /// this mirrors `char_eq` exactly. `None` for case-sensitive prefilters.
     canon: Option<bool>,
+    /// The bytes that can start a match in a one-byte subject, when there
+    /// are at most three of them: the table's members.
+    few_latin1: smallvec::SmallVec<[u8; 3]>,
 }
 
 impl Prefilter {
@@ -294,13 +297,28 @@ impl Prefilter {
             }
             _ => None,
         };
+        let members = table.iter().filter(|&&member| member).count();
+        let few_latin1 = if (1..=3).contains(&members) {
+            (0..=u8::MAX)
+                .filter(|&unit| table[usize::from(unit)])
+                .collect()
+        } else {
+            smallvec::SmallVec::new()
+        };
         Self {
             table,
             has_high,
             high: set.clone(),
             single,
             canon,
+            few_latin1,
         }
+    }
+
+    /// The one to three bytes that can start a match in a one-byte subject.
+    #[must_use]
+    pub(crate) fn few_latin1(&self) -> Option<&[u8]> {
+        (!self.few_latin1.is_empty()).then_some(self.few_latin1.as_slice())
     }
 
     /// The single-literal code unit, when the prefilter is one BMP literal.
@@ -335,8 +353,9 @@ impl Prefilter {
 /// distances from the match start at which it can sit, and the offset of its
 /// rarest unit.
 ///
-/// The scan searches for that one unit rather than the first, then confirms the
-/// whole literal. Searching a single unit keeps the inner loop a plain equality
+/// A one-byte subject searches for the whole literal with a vectorized
+/// substring search. Otherwise the scan searches for that one unit rather than
+/// the first, then confirms the whole literal. Searching a single unit keeps the inner loop a plain equality
 /// scan the compiler vectorizes, while picking the *rarest* unit is what makes
 /// the candidate rate low: in ordinary text the leading unit of a word is a
 /// common letter, so a first-unit scan stops constantly, whereas the `q` of
@@ -356,6 +375,9 @@ pub(crate) struct RequiredLiteral {
     pub(crate) min_offset: usize,
     /// Most code units any match consumes before the literal begins.
     pub(crate) max_offset: usize,
+    /// The whole-literal searcher a one-byte subject uses, when every unit of
+    /// the literal fits one byte.
+    latin1: Option<memchr::memmem::Finder<'static>>,
 }
 
 impl RequiredLiteral {
@@ -374,11 +396,17 @@ impl RequiredLiteral {
             .enumerate()
             .min_by_key(|(_, u)| unit_commonness(**u))
             .map_or(0, |(i, _)| i);
+        let latin1 = units
+            .iter()
+            .map(|&unit| u8::try_from(unit).ok())
+            .collect::<Option<Vec<u8>>>()
+            .map(|bytes| memchr::memmem::Finder::new(&bytes).into_owned());
         Self {
             units: units.into_boxed_slice(),
             rare,
             min_offset,
             max_offset,
+            latin1,
         }
     }
 
@@ -391,6 +419,9 @@ impl RequiredLiteral {
     /// when the subject holds no further occurrence.
     #[must_use]
     pub(crate) fn find<U: crate::cursor::Unit>(&self, text: &[U], from: usize) -> Option<usize> {
+        if let (Some(bytes), Some(finder)) = (U::as_latin1(text), &self.latin1) {
+            return finder.find(bytes.get(from..)?).map(|at| from + at);
+        }
         let n = self.units.len();
         // A unit too wide for the subject means the literal never occurs.
         let target = U::narrow(self.units[self.rare])?;
@@ -401,7 +432,7 @@ impl RequiredLiteral {
             }
             // The searched unit sits `rare` units into the window, so a hit at
             // `i + rare + off` corresponds to a window starting at `i + off`.
-            let off = text[i + self.rare..].iter().position(|&u| u == target)?;
+            let off = U::position(&text[i + self.rare..], target)?;
             let start = i + off;
             if start + n > text.len() {
                 return None;
@@ -637,5 +668,35 @@ fn describe_insn(insn: &Insn) -> String {
         ),
         Insn::LookMatch => "lookmatch".to_string(),
         Insn::Match => "match".to_string(),
+    }
+}
+
+#[cfg(test)]
+mod scan_tests {
+    use super::RequiredLiteral;
+
+    fn naive(text: &[u16], literal: &[u16], from: usize) -> Option<usize> {
+        (from..=text.len().saturating_sub(literal.len())).find(|&at| {
+            at + literal.len() <= text.len() && &text[at..at + literal.len()] == literal
+        })
+    }
+
+    #[test]
+    fn literal_search_agrees_with_a_naive_scan_at_both_widths() {
+        let subject = "xNQ_VQyy-NQ_VQ--NQ_V-NQ_VQ";
+        let narrow: Vec<u8> = subject.bytes().collect();
+        let wide: Vec<u16> = subject.encode_utf16().collect();
+        for literal in ["NQ_VQ", "Q-", "zz", "VQ"] {
+            let units: Vec<u16> = literal.encode_utf16().collect();
+            let scan = RequiredLiteral::new(units.clone(), 0, 0);
+            for from in 0..=wide.len() {
+                let expected = naive(&wide, &units, from);
+                assert_eq!(scan.find(&narrow, from), expected, "{literal} from {from}");
+                assert_eq!(scan.find(&wide, from), expected, "{literal} from {from}");
+            }
+        }
+        // A literal wider than one byte never occurs in a one-byte subject.
+        let wide_literal = RequiredLiteral::new(vec![0x4e00, 0x4e8c], 0, 0);
+        assert_eq!(wide_literal.find(&narrow, 0), None);
     }
 }

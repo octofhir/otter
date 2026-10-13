@@ -44,6 +44,13 @@ pub trait Unit: sealed::Sealed + Copy + Eq + core::fmt::Debug + Into<u32> + 'sta
     /// Whether `window` holds exactly the UTF-16 units of `seq`, which has the
     /// same length.
     fn eq_units(window: &[Self], seq: &[u16]) -> bool;
+
+    /// Offset of the first `needle` in `haystack`, scanned several units at a
+    /// time.
+    fn position(haystack: &[Self], needle: Self) -> Option<usize>;
+
+    /// The units as bytes, for a one-byte subject.
+    fn as_latin1(units: &[Self]) -> Option<&[u8]>;
 }
 
 impl Unit for u8 {
@@ -61,6 +68,16 @@ impl Unit for u8 {
     fn eq_units(window: &[Self], seq: &[u16]) -> bool {
         debug_assert_eq!(window.len(), seq.len());
         window.iter().zip(seq).all(|(&a, &b)| u16::from(a) == b)
+    }
+
+    #[inline]
+    fn position(haystack: &[Self], needle: Self) -> Option<usize> {
+        memchr::memchr(needle, haystack)
+    }
+
+    #[inline]
+    fn as_latin1(units: &[Self]) -> Option<&[u8]> {
+        Some(units)
     }
 }
 
@@ -93,6 +110,40 @@ impl Unit for u16 {
             _ => window == seq,
         }
     }
+
+    /// Four units per 64-bit word: a lane equal to `needle` is a zero lane of
+    /// `word ^ pattern`, and the lowest set high bit of the borrow trick
+    /// marks the first one exactly.
+    #[inline]
+    fn position(haystack: &[Self], needle: Self) -> Option<usize> {
+        const LOW: u64 = 0x0001_0001_0001_0001;
+        const HIGH: u64 = 0x8000_8000_8000_8000;
+        let pattern = LOW * u64::from(needle);
+        let mut chunks = haystack.chunks_exact(4);
+        let mut base = 0;
+        for chunk in &mut chunks {
+            let word = u64::from(chunk[0])
+                | (u64::from(chunk[1]) << 16)
+                | (u64::from(chunk[2]) << 32)
+                | (u64::from(chunk[3]) << 48);
+            let lanes = word ^ pattern;
+            let zero = lanes.wrapping_sub(LOW) & !lanes & HIGH;
+            if zero != 0 {
+                return Some(base + (zero.trailing_zeros() / 16) as usize);
+            }
+            base += 4;
+        }
+        chunks
+            .remainder()
+            .iter()
+            .position(|&unit| unit == needle)
+            .map(|offset| base + offset)
+    }
+
+    #[inline]
+    fn as_latin1(_units: &[Self]) -> Option<&[u8]> {
+        None
+    }
 }
 
 /// A borrowed subject and the traversal mode for one execution.
@@ -124,5 +175,40 @@ impl<'t, U: Unit> Input<'t, U> {
     #[must_use]
     pub(crate) fn units(&self) -> &'t [U] {
         self.units
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Unit;
+
+    fn naive<U: Unit>(haystack: &[U], needle: U) -> Option<usize> {
+        haystack.iter().position(|&unit| unit == needle)
+    }
+
+    #[test]
+    fn word_scans_find_the_first_unit_at_every_lane_and_remainder() {
+        for len in 0..23 {
+            for at in 0..=len {
+                let mut wide: Vec<u16> = (0..len).map(|i| 0x4100 + i as u16).collect();
+                let mut narrow: Vec<u8> = (0..len).map(|i| b'a' + i as u8).collect();
+                if at < len {
+                    wide[at] = 0x00ff;
+                    narrow[at] = b'#';
+                    // A later duplicate never hides the first.
+                    if at + 2 < len {
+                        wide[at + 2] = 0x00ff;
+                        narrow[at + 2] = b'#';
+                    }
+                }
+                assert_eq!(u16::position(&wide, 0x00ff), naive(&wide, 0x00ff));
+                assert_eq!(u8::position(&narrow, b'#'), naive(&narrow, b'#'));
+            }
+        }
+        // Lanes that differ from the needle only by a borrow are not matches.
+        let tricky = [0x0001, 0x0000, 0x8000, 0x7fff, 0x0100, 0x0001];
+        for needle in [0x0000, 0x0001, 0x8000, 0x7fff, 0x0100, 0xffff] {
+            assert_eq!(u16::position(&tricky, needle), naive(&tricky, needle));
+        }
     }
 }

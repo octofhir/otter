@@ -82,7 +82,10 @@ pub struct OptimizedCode {
     /// Loop-header logical PCs the entry dispatch can enter through an OSR
     /// block: the compile's OSR target, or nothing for an entry compile.
     osr_headers: Box<[u32]>,
-    /// Exact installed callee generations entered by emitted direct edges.
+    /// The flag the code tests before relying on its shape-fact
+    /// dependencies; present exactly when it has some.
+    dependency_flag: Option<std::sync::Arc<otter_vm::code_dependencies::DependencyFlag>>,
+    /// Shape facts the code relies on without re-reading them.
     dependencies: Box<[CodeDependency]>,
     spliced_functions: Box<[u32]>,
     /// Operand registers of generic baseline operations whose addresses the
@@ -106,6 +109,7 @@ impl OptimizedCode {
         safepoint_records: Box<[SafepointRecord]>,
         return_sites: Box<[otter_vm::native_abi::SafepointEntry]>,
         osr_headers: BTreeSet<u32>,
+        dependency_flag: Option<std::sync::Arc<otter_vm::code_dependencies::DependencyFlag>>,
         dependencies: Box<[CodeDependency]>,
         spliced_functions: Box<[u32]>,
         register_operands: Box<[u16]>,
@@ -129,6 +133,7 @@ impl OptimizedCode {
             safepoint_records,
             return_sites,
             osr_headers: osr_headers.into_iter().collect(),
+            dependency_flag,
             dependencies,
             spliced_functions,
             _register_operands: register_operands,
@@ -222,6 +227,12 @@ impl JitFunctionCode for OptimizedCode {
         &self.dependencies
     }
 
+    fn dependency_flag(
+        &self,
+    ) -> Option<&std::sync::Arc<otter_vm::code_dependencies::DependencyFlag>> {
+        self.dependency_flag.as_ref()
+    }
+
     fn spliced_functions(&self) -> &[u32] {
         &self.spliced_functions
     }
@@ -310,6 +321,7 @@ mod tests {
             Box::new([roots]),
             Box::new([]),
             [3, 17].into_iter().collect(),
+            None,
             Box::default(),
             Box::default(),
             Box::new([0; 11]),

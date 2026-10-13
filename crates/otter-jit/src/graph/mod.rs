@@ -16,6 +16,8 @@
 //!   ToBoolean.
 //! - `branch_thread` — branches on a merged boolean take the merged edges
 //!   directly.
+//! - `dependency_checks` — stability and field-summary proofs become code
+//!   dependencies with one flag test per effect region.
 //! - [`regalloc`] — live intervals, canonical homes and register assignment.
 //! - [`registers`] — backend-supplied physical ownership and fixed call words.
 //! - [`frame`] / [`emission`] — shared canonical geometry and finalized output.
@@ -53,6 +55,7 @@ mod branch_thread;
 pub(crate) mod builder;
 pub(crate) mod bytecode;
 pub(crate) mod call;
+mod dependency_checks;
 mod dump;
 pub(crate) mod emission;
 pub(crate) mod feedback;
@@ -121,6 +124,8 @@ pub(crate) struct Compiled {
     /// The baseline plan generic nodes run; its operand buffers are baked
     /// into the code and live as long as it.
     pub(crate) plan: crate::template::TemplatePlan,
+    /// Shape facts the code relies on without re-reading them.
+    pub(crate) dependencies: Box<[otter_vm::native_abi::CodeDependency]>,
 }
 
 /// Compile `view` to machine code; `capture` keeps the relocation records an
@@ -155,6 +160,7 @@ pub(crate) fn compile(
     branch_fold::fold_branch_negations(&mut built.graph);
     branch_thread::thread_boolean_phis(&mut built.graph, &mut built.layout);
     allocation_groups::fold(&mut built.graph, &built.layout, view, &built.inline_views);
+    let dependencies = dependency_checks::place(&mut built.graph, view, &built.inline_views);
     #[cfg(target_arch = "aarch64")]
     let registers = registers::AARCH64;
     #[cfg(target_arch = "x86_64")]
@@ -219,6 +225,7 @@ pub(crate) fn compile(
         allocation,
         deopt,
         plan,
+        dependencies,
     })
 }
 
@@ -318,7 +325,7 @@ pub(crate) fn compile_optimized(
         allocation,
         deopt,
         plan,
-        ..
+        dependencies,
     } = compiled;
     let mut safepoints = plan.safepoint_records.clone();
     safepoints.extend(emission.site_records.iter().cloned());
@@ -416,7 +423,8 @@ pub(crate) fn compile_optimized(
             safepoints.into_boxed_slice(),
             emission.return_sites.into_boxed_slice(),
             osr_pc.into_iter().collect(),
-            Box::new([]),
+            (!dependencies.is_empty()).then(|| view.dependency_flag.clone()),
+            dependencies,
             spliced_functions,
             plan.register_operands,
             metadata,

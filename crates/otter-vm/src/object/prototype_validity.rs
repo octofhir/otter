@@ -1,7 +1,8 @@
 //! Shared proofs of ordinary prototype chains.
 //!
 //! # Contents
-//! - [`PrototypeValidity`] owns one address-stable validity word.
+//! - [`PrototypeValidity`] owns one address-stable validity word and the
+//!   flags of the generations subscribed to it.
 //! - [`PrototypeWatchpoints`] records a prototype's current chain proof and
 //!   weak subscriptions to proofs which depend on that prototype.
 //! - [`chain_validity`] captures or reuses a complete ordinary-chain proof.
@@ -9,6 +10,7 @@
 //! # Invariants
 //! - Invalid cells never become valid again. Rebuilding a proof allocates a
 //!   different cell, and every compiled consumer retains its own cell.
+//! - Invalidation sets every subscribed generation's dependency flag once.
 //! - Registrations contain no GC pointers. Moving objects retain their
 //!   sidecars, and weak subscriptions cannot keep a dead proof alive.
 //! - Capture and mutation run on the mutator. The atomic validity word is the
@@ -27,6 +29,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
 use super::{JsObject, ObjectPrototype, ShapeId};
+use crate::code_dependencies::DependencyFlag;
 
 /// Address-stable proof retained by ICs and code generations.
 ///
@@ -37,6 +40,9 @@ use super::{JsObject, ObjectPrototype, ShapeId};
 pub(crate) struct PrototypeValidity {
     valid: AtomicU32,
     identity: ShapeId,
+    /// Flags of installed generations that rely on this proof without
+    /// reading `valid`; invalidation sets each one.
+    subscribers: Mutex<Vec<Arc<DependencyFlag>>>,
 }
 
 impl PartialEq for PrototypeValidity {
@@ -73,6 +79,7 @@ impl PrototypeValidity {
         Arc::new(Self {
             valid: AtomicU32::new(1),
             identity,
+            subscribers: Mutex::new(Vec::new()),
         })
     }
 
@@ -81,7 +88,32 @@ impl PrototypeValidity {
     }
 
     fn invalidate(&self) {
-        self.valid.store(0, Ordering::Release);
+        if self.valid.swap(0, Ordering::Release) != 0 {
+            for flag in self
+                .subscribers
+                .lock()
+                .expect("prototype validity subscribers")
+                .drain(..)
+            {
+                flag.set();
+            }
+        }
+    }
+
+    /// Subscribe `flag` to this proof's invalidation.
+    pub(crate) fn subscribe(&self, flag: &Arc<DependencyFlag>) {
+        self.subscribers
+            .lock()
+            .expect("prototype validity subscribers")
+            .push(Arc::clone(flag));
+    }
+
+    /// Drop every subscription of `flag`.
+    pub(crate) fn unsubscribe(&self, flag: &Arc<DependencyFlag>) {
+        self.subscribers
+            .lock()
+            .expect("prototype validity subscribers")
+            .retain(|subscriber| !Arc::ptr_eq(subscriber, flag));
     }
 
     pub(crate) fn address(&self) -> usize {
@@ -250,6 +282,22 @@ mod tests {
         assert!(rebuilt.is_valid());
         assert!(!left.is_valid());
         assert_ne!(left.address(), rebuilt.address());
+    }
+
+    #[test]
+    fn invalidation_sets_subscribed_dependency_flags_once() {
+        let watches = PrototypeWatchpoints::default();
+        let proof = PrototypeValidity::new(ShapeId::UNASSIGNED);
+        watches.subscribe(&proof);
+        let subscribed = DependencyFlag::new();
+        let retired = DependencyFlag::new();
+        proof.subscribe(&subscribed);
+        proof.subscribe(&retired);
+        proof.unsubscribe(&retired);
+        watches.invalidate();
+        assert!(subscribed.is_set());
+        assert!(!retired.is_set());
+        assert!(proof.subscribers.lock().unwrap().is_empty());
     }
 
     #[test]

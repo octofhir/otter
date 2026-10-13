@@ -3,7 +3,8 @@
 //! # Contents
 //! - Captured historical targets bypass observation for unchanged membership.
 //! - Inline Top and exact-shape membership probes with scalar widening.
-//! - A cold noncollecting VM leaf that monotonically widens the owner word.
+//! - A cold noncollecting VM leaf that monotonically widens the owner word,
+//!   and every widening of a summary code subscribed to.
 //!
 //! # Invariants
 //! - The caller has completed every store guard and supplies the defining owner.
@@ -97,6 +98,9 @@ pub(crate) fn emit_observe(
     owner: u8,
     value: u8,
 ) {
+    // Code subscribed to the summary: every widening goes through the VM,
+    // which fires it.
+    const WATCHED: u32 = otter_vm::code_dependencies::ShapeFact::FieldType.bit();
     debug_assert!(owner != value && !matches!(owner, 16 | 17 | 19 | 20 | 21 | 29 | 30 | 31));
     debug_assert!(!matches!(value, 16 | 17));
     let done = ops.new_dynamic_label();
@@ -140,12 +144,15 @@ pub(crate) fn emit_observe(
     dynasm!(ops ; .arch aarch64
         ; cmp X(value), x16 ; b.eq =>undefined ; b =>top
         ; =>null ; tbnz x17, NULL.trailing_zeros(), =>done
+        ; ldrb w16, [X(owner), view.shape_watched_byte] ; tbnz w16, WATCHED, =>slow
         ; orr x17, x17, NULL
         ; str x17, [X(owner), view.shape_field_type_byte] ; b =>done
         ; =>undefined ; tbnz x17, UNDEFINED.trailing_zeros(), =>done
+        ; ldrb w16, [X(owner), view.shape_watched_byte] ; tbnz w16, WATCHED, =>slow
         ; orr x17, x17, UNDEFINED
         ; str x17, [X(owner), view.shape_field_type_byte] ; b =>done
-        ; =>top);
+        ; =>top
+        ; ldrb w16, [X(owner), view.shape_watched_byte] ; tbnz w16, WATCHED, =>slow);
     emit_load_u64(ops, 17, TOP);
     dynasm!(ops ; .arch aarch64
         ; str x17, [X(owner), view.shape_field_type_byte] ; b =>done

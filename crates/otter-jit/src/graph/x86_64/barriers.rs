@@ -3,6 +3,7 @@
 //! # Contents
 //! - Object/value and array-element barrier fast paths.
 //! - Published child-shape barriers for named and shared-cache transitions.
+//! - Leaving a shape: its stable byte, or a VM call when code watches it.
 //! - Deferred NoAlloc calls with complete live-register preservation.
 //!
 //! # Invariants
@@ -70,6 +71,42 @@ impl Codegen<'_> {
             crate::x86_64::call_abi::emit_runtime_call(&mut codegen.ops, abi::STUB_WRITE_BARRIER);
             dynasm!(codegen.ops ; .arch x64 ; add rsp, 16);
             codegen.sp_delta -= 16;
+            codegen.emit_restore_registers(&live, saved);
+            dynasm!(codegen.ops ; .arch x64 ; jmp =>done);
+        }));
+    }
+
+    /// The receiver is leaving its current shape: clear the shape's stable
+    /// byte, or, when generations subscribe to the shape, have the VM clear
+    /// it and fire them. `receiver` and `value` survive the cold call.
+    pub(super) fn emit_leave_receiver_shape(&mut self, node: NodeId, receiver: u8, value: u8) {
+        let watched = self.ops.new_dynamic_label();
+        let done = self.ops.new_dynamic_label();
+        let view = self.view;
+        self.load_immediate(11, 0xffff_ffff_0000_0000);
+        dynasm!(self.ops ; .arch x64
+            ; and r11, Rq(receiver)
+            ; mov r10d, [Rq(receiver) + view.object_shape_byte as i32]
+            ; add r10, r11
+            ; test BYTE [r10 + view.shape_watched_byte as i32], otter_vm::code_dependencies::ShapeFact::Stable as i8 ; jnz =>watched
+            ; mov BYTE [r10 + view.shape_stable_byte as i32], 0
+            ; =>done);
+        let live = self.slow_path_registers(node, &[receiver, value]);
+        self.deferred.push(Box::new(move |codegen| {
+            dynasm!(codegen.ops ; .arch x64 ; =>watched);
+            let saved = codegen.emit_save_registers(&live);
+            dynasm!(codegen.ops ; .arch x64
+                ; mov rsi, r10
+                ; xor edx, edx
+                ; mov rdi, [r15 + crate::entry::THREAD_OFFSET as i32]
+                ; mov rdi, [rdi + crate::entry::VM_THREAD_GC_HEAP_OFFSET as i32]);
+            crate::x86_64::values::emit_load_runtime_stub(
+                &mut codegen.ops,
+                &mut codegen.relocations,
+                otter_vm::runtime_stubs::SHAPE_LEFT.entry_addr() as u64,
+                abi::STUB_SHAPE_LEFT,
+            );
+            crate::x86_64::call_abi::emit_runtime_call(&mut codegen.ops, abi::STUB_SHAPE_LEFT);
             codegen.emit_restore_registers(&live, saved);
             dynasm!(codegen.ops ; .arch x64 ; jmp =>done);
         }));

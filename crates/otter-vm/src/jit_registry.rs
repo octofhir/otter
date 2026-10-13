@@ -78,13 +78,22 @@ use std::sync::Arc;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum JitInstallError {
     InvalidCode,
-    ResourceBudget { required_bytes: u64 },
+    /// A fact the code was compiled under no longer holds: the compile is
+    /// stale, not refused, and the function compiles again from current state.
+    DependencyChanged,
+    ResourceBudget {
+        required_bytes: u64,
+    },
 }
 
 /// One registered code object with its lifecycle state.
 struct RegisteredCode {
     code: Arc<dyn JitFunctionCode>,
     dependencies: Box<[CodeDependency]>,
+    /// The epoch dependencies among `dependencies`, compared on every entry.
+    epoch_dependencies: Box<[CodeDependency]>,
+    /// The flag subscribed to the rest, tested on every entry.
+    dependency_flag: Option<Arc<crate::code_dependencies::DependencyFlag>>,
     state: CodeLifetimeState,
     /// Shapes and validity cells embedded by this generation. Invalidated
     /// code may still execute, so these live until physical retirement.
@@ -158,6 +167,10 @@ pub struct JitCodeRegistry {
     generated_feedback_seen: rustc_hash::FxHashMap<u64, GeneratedFeedbackSeen>,
     /// Latest isolate-local epoch by dependency family and stable identity.
     epochs: rustc_hash::FxHashMap<(CodeDependencyKind, u32), u64>,
+    /// Installed generations' subscriptions to monotone shape facts.
+    subscriptions: crate::code_dependencies::ShapeSubscriptions,
+    /// Flags of this registry's generations set since the last drain.
+    fired: Arc<std::sync::atomic::AtomicU32>,
 }
 
 impl JitCodeRegistry {
@@ -181,6 +194,8 @@ impl JitCodeRegistry {
             function_entries: Vec::new(),
             generated_feedback_seen: rustc_hash::FxHashMap::default(),
             epochs: rustc_hash::FxHashMap::default(),
+            subscriptions: crate::code_dependencies::ShapeSubscriptions::default(),
+            fired: Arc::default(),
         });
         registry.view.context = std::ptr::addr_of!(*registry) as u64;
         registry
@@ -427,12 +442,16 @@ impl JitCodeRegistry {
             || metadata.id != code_object_id
             || metadata.code_size == 0
             || metadata.dependency_count as usize != dependencies.len()
-            || !self.dependencies_are_current(&dependencies)
+            || (dependencies.iter().any(CodeDependency::is_subscribed)
+                && code.dependency_flag().is_none())
             || spliced.binary_search(&metadata.code_block_id).is_ok()
             || !spliced.windows(2).all(|pair| pair[0] < pair[1])
             || !crate::native_abi::valid_return_sites(code.as_ref())
         {
             return Err(JitInstallError::InvalidCode);
+        }
+        if !self.dependencies_hold(&dependencies, &roots) {
+            return Err(JitInstallError::DependencyChanged);
         }
         if self.codes.contains_key(&code_object_id)
             || self.entry_cells.contains_key(&code_object_id)
@@ -478,6 +497,12 @@ impl JitCodeRegistry {
         let replaced = self.codes.insert(
             code_object_id,
             RegisteredCode {
+                epoch_dependencies: dependencies
+                    .iter()
+                    .filter(|dependency| !dependency.is_subscribed())
+                    .copied()
+                    .collect(),
+                dependency_flag: code.dependency_flag().cloned(),
                 code,
                 dependencies,
                 state: CodeLifetimeState::Installed,
@@ -514,6 +539,18 @@ impl JitCodeRegistry {
             self.retained_bytes += entry_bytes;
             self.refresh_function_entry(function_id);
         }
+        // Every fact held when it was verified above; from here a writer that
+        // breaks one sets the generation's flag.
+        let registered = &self.codes[&code_object_id];
+        if let Some(flag) = &registered.dependency_flag {
+            for dependency in registered.dependencies.iter() {
+                if let Some((shape, fact)) = shape_fact(dependency) {
+                    self.subscriptions.watch(shape, fact, flag);
+                } else if let Some(cell) = validity_cell(dependency, &registered.roots) {
+                    cell.subscribe(flag);
+                }
+            }
+        }
         Ok(())
     }
 
@@ -528,7 +565,7 @@ impl JitCodeRegistry {
             registered.state == CodeLifetimeState::Installed
                 && std::ptr::eq::<dyn JitFunctionCode>(registered.code.as_ref(), code)
                 && metadata.dependency_count as usize == registered.dependencies.len()
-                && self.dependencies_are_current(&registered.dependencies)
+                && Self::registered_is_current(&self.epochs, registered)
                 && self.entry_cells.get(&metadata.id).is_none_or(|entry| {
                     let cell = &entry.cell;
                     cell.entry_addr.load(std::sync::atomic::Ordering::Acquire) != 0
@@ -589,7 +626,7 @@ impl JitCodeRegistry {
         if generation.code_object_id != 0 {
             let registered = self.codes.get(&generation.code_object_id)?;
             if registered.state != CodeLifetimeState::Installed
-                || !self.dependencies_are_current(&registered.dependencies)
+                || !Self::registered_is_current(&self.epochs, registered)
             {
                 return None;
             }
@@ -708,6 +745,33 @@ impl JitCodeRegistry {
         }
     }
 
+    /// A clear dependency flag for one compile of this registry: setting it
+    /// counts toward [`Self::invalidate_fired`].
+    pub(crate) fn dependency_flag(&self) -> Arc<crate::code_dependencies::DependencyFlag> {
+        crate::code_dependencies::DependencyFlag::counted(&self.fired)
+    }
+
+    /// Unlink the installed generations whose dependency flags were set since
+    /// the last drain. Their active frames leave at their next flag test.
+    pub(crate) fn invalidate_fired(&mut self) -> Vec<u32> {
+        if self.fired.swap(0, std::sync::atomic::Ordering::Relaxed) == 0 {
+            return Vec::new();
+        }
+        let seeds = self
+            .codes
+            .iter()
+            .filter_map(|(&code_object_id, registered)| {
+                (registered.state == CodeLifetimeState::Installed
+                    && registered
+                        .dependency_flag
+                        .as_ref()
+                        .is_some_and(|flag| flag.is_set()))
+                .then_some(code_object_id)
+            })
+            .collect::<Vec<_>>();
+        self.invalidate_code_objects(seeds)
+    }
+
     /// Unlink every installed generation. Chunk reclamation uses this
     /// conservative boundary because an installed caller may have inlined a
     /// function from the retiring chunk even when its own id lies elsewhere.
@@ -791,6 +855,7 @@ impl JitCodeRegistry {
         let before = self.codes.len();
         let entry_cells = &self.entry_cells;
         let retained_bytes = &mut self.retained_bytes;
+        let subscriptions = &mut self.subscriptions;
         self.codes.retain(|code_object_id, registered| {
             let keep = registered.state != CodeLifetimeState::Invalid
                 || Arc::strong_count(&registered.code) > 1
@@ -799,6 +864,17 @@ impl JitCodeRegistry {
                     .is_some_and(|entry| !entry.cell.can_retire());
             if !keep {
                 *retained_bytes -= registered.generated_code_lease.amount();
+                // The roots dropped with this entry keep the shapes alive
+                // until here.
+                if let Some(flag) = &registered.dependency_flag {
+                    for dependency in registered.dependencies.iter() {
+                        if let Some((shape, _)) = shape_fact(dependency) {
+                            subscriptions.unwatch(shape, flag);
+                        } else if let Some(cell) = validity_cell(dependency, &registered.roots) {
+                            cell.unsubscribe(flag);
+                        }
+                    }
+                }
             }
             keep
         });
@@ -981,15 +1057,56 @@ impl JitCodeRegistry {
         std::ptr::addr_of!(self.view) as u64
     }
 
-    fn dependencies_are_current(&self, dependencies: &[CodeDependency]) -> bool {
-        dependencies.iter().all(|dependency| {
-            dependency.expected
-                == self
-                    .epochs
-                    .get(&(dependency.kind, dependency.identity))
-                    .copied()
-                    .unwrap_or(0)
-        })
+    /// Whether a registered generation's dependencies all still hold: no
+    /// subscribed shape fact has fired, and every epoch is current.
+    fn registered_is_current(
+        epochs: &rustc_hash::FxHashMap<(CodeDependencyKind, u32), u64>,
+        registered: &RegisteredCode,
+    ) -> bool {
+        !registered
+            .dependency_flag
+            .as_ref()
+            .is_some_and(|flag| flag.is_set())
+            && registered.epoch_dependencies.iter().all(|dependency| {
+                dependency.expected
+                    == epochs
+                        .get(&(dependency.kind, dependency.identity))
+                        .copied()
+                        .unwrap_or(0)
+            })
+    }
+
+    /// Whether every dependency of a generation not yet subscribed holds,
+    /// reading each subscribed fact from its shape or retained cell.
+    fn dependencies_hold(
+        &self,
+        dependencies: &[CodeDependency],
+        roots: &[crate::jit_roots::CompilationRoot],
+    ) -> bool {
+        dependencies
+            .iter()
+            .all(|dependency| match shape_fact(dependency) {
+                Some((shape, crate::code_dependencies::ShapeFact::Stable)) => {
+                    crate::object::shape_body::is_stable(shape)
+                }
+                Some((shape, crate::code_dependencies::ShapeFact::FieldType)) => {
+                    crate::object::shape_body::field_type_low_byte_is(
+                        shape,
+                        dependency.expected as u8,
+                    )
+                }
+                None if dependency.kind == CodeDependencyKind::PrototypeValidity => {
+                    validity_cell(dependency, roots).is_some_and(|cell| cell.is_valid())
+                }
+                None => {
+                    dependency.expected
+                        == self
+                            .epochs
+                            .get(&(dependency.kind, dependency.identity))
+                            .copied()
+                            .unwrap_or(0)
+                }
+            })
     }
 
     /// Select the best entry-capable installed generation for one function and
@@ -1008,7 +1125,7 @@ impl JitCodeRegistry {
                 if registered.state != CodeLifetimeState::Installed
                     || registered.code.metadata().code_block_id != function_id
                     || registered.code.osr_only()
-                    || !self.dependencies_are_current(&registered.dependencies)
+                    || !Self::registered_is_current(&self.epochs, registered)
                 {
                     return None;
                 }
@@ -1094,6 +1211,49 @@ impl std::fmt::Debug for JitCodeRegistry {
     }
 }
 
+/// The validity cell a prototype-validity dependency names, among the roots
+/// its generation retains.
+fn validity_cell<'roots>(
+    dependency: &CodeDependency,
+    roots: &'roots [crate::jit_roots::CompilationRoot],
+) -> Option<&'roots Arc<crate::object::prototype_validity::PrototypeValidity>> {
+    if dependency.kind != CodeDependencyKind::PrototypeValidity {
+        return None;
+    }
+    roots.iter().find_map(|root| match root {
+        crate::jit_roots::CompilationRoot::Prototype(cell)
+            if cell.address() as u64 == dependency.expected =>
+        {
+            Some(cell)
+        }
+        _ => None,
+    })
+}
+
+/// The shape and fact a shape-fact dependency names. A registered
+/// generation roots every shape its dependencies name.
+fn shape_fact(
+    dependency: &CodeDependency,
+) -> Option<(
+    crate::object::ShapeHandle,
+    crate::code_dependencies::ShapeFact,
+)> {
+    let fact = match dependency.kind {
+        CodeDependencyKind::ShapeStable => crate::code_dependencies::ShapeFact::Stable,
+        CodeDependencyKind::FieldType => crate::code_dependencies::ShapeFact::FieldType,
+        _ => return None,
+    };
+    if dependency.identity == 0 {
+        return None;
+    }
+    // SAFETY: a nonzero identity of a shape-fact dependency is the compressed
+    // handle of a shape the generation roots.
+    Some((
+        unsafe { otter_gc::Gc::from_offset(dependency.identity) },
+        fact,
+    ))
+}
+
 /// Machine-visible resolver behind the registry's published view.
 ///
 /// # Safety
@@ -1145,6 +1305,10 @@ fn retained_call_entry_offset(code: &dyn JitFunctionCode) -> Option<u32> {
 #[cfg(test)]
 #[path = "jit_registry/entry_capability_tests.rs"]
 mod entry_capability_tests;
+
+#[cfg(test)]
+#[path = "jit_registry/subscription_tests.rs"]
+mod subscription_tests;
 
 #[cfg(test)]
 mod tests {

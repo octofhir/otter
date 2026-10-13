@@ -236,8 +236,11 @@ pub enum JitInlineRejectionReason {
     rename_all_fields = "camelCase"
 )]
 pub enum JitInstallDeclineReason {
-    /// Identity, dependency or finalized layout did not satisfy installation.
+    /// Identity or finalized layout did not satisfy installation.
     InvalidCode,
+    /// A fact the code was compiled under changed before installation; the
+    /// function compiles again.
+    DependencyChanged,
     /// Exact finalized mapping and metadata exceeded canonical headroom.
     ResourceBudget {
         /// Entire finalized admission requirement, including registry payload.
@@ -1161,6 +1164,10 @@ mod tests {
             (
                 JitInstallDeclineReason::InvalidCode,
                 json!({"kind": "invalidCode"}),
+            ),
+            (
+                JitInstallDeclineReason::DependencyChanged,
+                json!({"kind": "dependencyChanged"}),
             ),
             (
                 JitInstallDeclineReason::ResourceBudget {

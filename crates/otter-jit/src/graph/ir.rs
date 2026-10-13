@@ -132,10 +132,9 @@ pub(crate) enum DeoptReason {
     /// The operation has no optimized form and resumes in the interpreter
     /// (suspension, irreducible entry).
     Unsupported,
-    /// An object left a shape a fact relied on no object leaving.
-    StabilityChanged,
-    /// A shaped field's monotone value bound has widened.
-    FieldTypeChanged,
+    /// A shape fact the generation subscribed to changed: its dependency
+    /// flag is set.
+    DependencyChanged,
     /// A tracked literal allocation site has decided its placement.
     AllocationSiteDecided,
 }
@@ -344,7 +343,10 @@ pub(crate) enum Kind {
     CheckNotNullish {
         mask: u8,
     },
-    /// Eager deopt unless every shape-owned field summary matches its snapshot.
+    /// The builder's proof that every shape-owned field summary still
+    /// matches its snapshot. The generation subscribes to these summaries;
+    /// [`super::dependency_checks`] turns the node into a
+    /// [`Kind::CheckDependencies`] or removes it before allocation.
     CheckFieldTypes(SmallVec<[JitFieldTypeGuard; 4]>),
     /// Eager deopt unless input0 is an ordinary object with one of the
     /// shape handles (compressed offsets) and no object-local state
@@ -642,10 +644,15 @@ pub(crate) enum Kind {
     Return,
     /// Unconditional eager deopt.
     Deopt(DeoptReason),
-    /// Re-prove an earlier shape fact after an operation that may have run
-    /// code: every one of these shapes still has each object it ever had,
-    /// read from the shapes' stable bytes; eager deopt otherwise.
+    /// The builder's proof, after an operation that may have run code, that
+    /// every one of these shapes still has each object it ever had. The
+    /// generation subscribes to their stability;
+    /// [`super::dependency_checks`] turns the node into a
+    /// [`Kind::CheckDependencies`] or removes it before allocation.
     CheckStableShapes(SmallVec<[u32; 4]>),
+    /// Eager deopt when the generation's dependency flag is set: a shape fact
+    /// it subscribed to has changed since installation.
+    CheckDependencies,
 }
 
 /// What a node may do.
@@ -910,7 +917,10 @@ impl Kind {
                 effectful: true,
                 ..Properties::default()
             },
-            Self::Deopt(_) | Self::CheckStableShapes(_) | Self::CheckFieldTypes(_) => Properties {
+            Self::Deopt(_)
+            | Self::CheckStableShapes(_)
+            | Self::CheckFieldTypes(_)
+            | Self::CheckDependencies => Properties {
                 eager_deopt: true,
                 effectful: true,
                 ..Properties::default()
@@ -1286,7 +1296,8 @@ impl Kind {
             | Self::JumpLoop(_)
             | Self::Deopt(_)
             | Self::CheckStableShapes(_)
-            | Self::CheckFieldTypes(_) => simple(0, ResultPolicy::None),
+            | Self::CheckFieldTypes(_)
+            | Self::CheckDependencies => simple(0, ResultPolicy::None),
             Self::Branch {
                 kind: BranchKind::Int32(_),
                 ..

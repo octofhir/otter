@@ -348,6 +348,9 @@ pub(crate) fn emit_store(
         ; ldr w16, [x16] ; cbz w16, =>miss
         ; =>chain ; ldrb w16, [X(holder), view.shape_state_byte]
         ; tst w16, #u32::from(ShapeState::EXTENSIBLE_MASK) ; b.eq =>miss
+        // Code subscribed to the shape the receiver leaves: the runtime
+        // store fires it, before anything is written.
+        ; ldrb w16, [X(holder), view.shape_watched_byte] ; tbnz w16, otter_vm::code_dependencies::ShapeFact::Stable.bit(), =>miss
         ; and x17, X(receiver), #0xffff_ffff_0000_0000
         ; ldr w16, [X(entry), cache.target_shape_byte] ; add x16, x17, x16
         ; ldr x16, [x16, cache.shape_id_byte]

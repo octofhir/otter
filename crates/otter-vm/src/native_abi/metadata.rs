@@ -55,6 +55,14 @@ pub enum CodeDependencyKind {
     Protector = 1,
     /// Builtin identity epoch.
     BuiltinIdentity = 2,
+    /// No object has left the shape named by the compressed handle.
+    ShapeStable = 3,
+    /// The defining field summary of the shape named by the compressed
+    /// handle keeps the low byte in `expected`.
+    FieldType = 4,
+    /// The prototype-chain validity cell whose word is at the address in
+    /// `expected`, retained by the code, stays valid.
+    PrototypeValidity = 5,
 }
 
 /// Explicit validity dependency owned by a code object.
@@ -70,6 +78,18 @@ pub struct CodeDependency {
 }
 
 impl CodeDependency {
+    /// Whether this names a monotone fact the code subscribes to, rather
+    /// than an epoch the registry compares.
+    #[must_use]
+    pub const fn is_subscribed(&self) -> bool {
+        matches!(
+            self.kind,
+            CodeDependencyKind::ShapeStable
+                | CodeDependencyKind::FieldType
+                | CodeDependencyKind::PrototypeValidity
+        )
+    }
+
     /// Construct one exact-match epoch dependency.
     #[must_use]
     pub const fn epoch(kind: CodeDependencyKind, identity: u32, expected: u64) -> Self {

@@ -331,7 +331,14 @@ pub(crate) fn emit_slot_store(
     // receiver shape fixes), a resident target layout and storage, then the
     // write and the target shape's publication.
     emit_entry_proof(ops, entry, false, miss);
+    // Code subscribed to the shape the receiver leaves: the runtime store
+    // fires it, before anything is written.
+    emit_load_u64(ops, 11, CAGE_MASK);
     dynasm!(ops ; .arch x64
+        ; and r11, Rq(receiver)
+        ; mov r10d, [Rq(receiver) + view.object_shape_byte as i32]
+        ; add r10, r11
+        ; test BYTE [r10 + view.shape_watched_byte as i32], otter_vm::code_dependencies::ShapeFact::Stable as i8 ; jnz =>miss
         ; mov Rd(child), [Rq(entry) + IC.entry_aux_byte as i32]
         ; test Rd(child), Rd(child) ; jz =>miss
         ; mov Rd(index), [Rq(entry) + IC.entry_field_byte as i32]);

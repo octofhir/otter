@@ -338,6 +338,9 @@ impl Interpreter {
             crate::jit_registry::JitInstallError::InvalidCode => {
                 jit_debug::JitInstallDeclineReason::InvalidCode
             }
+            crate::jit_registry::JitInstallError::DependencyChanged => {
+                jit_debug::JitInstallDeclineReason::DependencyChanged
+            }
             crate::jit_registry::JitInstallError::ResourceBudget { required_bytes } => {
                 jit_debug::JitInstallDeclineReason::ResourceBudget {
                     required_bytes,
@@ -588,6 +591,7 @@ impl Interpreter {
         let context = &*owner;
         self.prewarm_literal_cells(context, fid)?;
         let mut snapshot = context.jit_compile_snapshot(fid)?;
+        snapshot.dependency_flag = self.jit_code_registry.dependency_flag();
         self.bake_literal_allocations(&mut snapshot, context, fid)?;
         // The optimizing tier consumes the same baked compile inputs as the
         // template tier: without the cage base and body offsets no inline access
@@ -614,8 +618,9 @@ impl Interpreter {
         self.bake_optimized_exit_profile(&mut snapshot, fid);
         self.bake_field_type_tree(&mut snapshot);
         // Every shape baked so far that no object has left yet: a value
-        // proven to have one survives calls on a read of its stable byte.
-        // The rest have been left already, and stay so.
+        // proven to have one survives calls while the generation's
+        // subscription to the shape's stability holds. The rest have been
+        // left already, and stay so.
         for root in &self.jit_compile_roots.borrow()[roots_start..] {
             if let crate::jit_roots::CompilationRoot::Shape(shape) = root {
                 if crate::object::shape_body::is_stable(*shape) {
@@ -686,10 +691,36 @@ impl Interpreter {
         self.finish_optimized_compile(pending, finished)
     }
 
-    /// Install every optimized body the compiler threads finished since the
-    /// last collection.
+    /// Retire the generations whose subscribed facts fired, and re-arm their
+    /// functions' optimizing work window: they compile again from the
+    /// current facts instead of staying in baseline code.
+    fn retire_fired_jit_code(&mut self) {
+        let fired = self.jit_code_registry.invalidate_fired();
+        if fired.is_empty() {
+            return;
+        }
+        self.discard_invalidated_jit_state(&fired);
+        for &fid in &fired {
+            if let Ok(context) = self.function_context(None, fid)
+                && let Some(function) = context.exec_function(fid)
+            {
+                let decision = self.optimizing_tier_policy.decide(
+                    function,
+                    crate::tier_policy::CostedTier::Optimizing,
+                    self.jit_code_registry.available_code_bytes(),
+                );
+                self.jit_code_registry
+                    .defer_generated_tiering(fid, decision.work_target);
+            }
+        }
+    }
+
+    /// Retire the generations whose subscribed facts fired, then install
+    /// every optimized body the compiler threads finished since the last
+    /// collection.
     #[inline]
     pub(crate) fn install_finished_optimized_compiles(&mut self) {
+        self.retire_fired_jit_code();
         if self.jit_compile_queue.has_finished() {
             for (pending, finished) in self.jit_compile_queue.take_finished() {
                 let _ = self.finish_optimized_compile(pending, finished);
@@ -739,14 +770,17 @@ impl Interpreter {
         if self.jit_retraining_blocks(fid) {
             return None;
         }
-        if stale {
-            let decision = self.optimizing_tier_policy.decide(
+        let rearm = |vm: &mut Self| {
+            let decision = vm.optimizing_tier_policy.decide(
                 &function,
                 crate::tier_policy::CostedTier::Optimizing,
-                self.jit_code_registry.available_code_bytes(),
+                vm.jit_code_registry.available_code_bytes(),
             );
-            self.jit_code_registry
+            vm.jit_code_registry
                 .defer_generated_tiering(fid, decision.work_target);
+        };
+        if stale {
+            rearm(self);
             return None;
         }
         let declined = match finished.status {
@@ -778,6 +812,19 @@ impl Interpreter {
                             .is_current_for_entry(code.as_ref())
                             .then(|| (fid, code.clone()));
                         return Some(code);
+                    }
+                    Err(crate::jit_registry::JitInstallError::DependencyChanged) => {
+                        // Stale like an invalidated compile: the next tier-up
+                        // compiles from the current facts.
+                        self.record_jit_install_declined(
+                            fid,
+                            code_object_id,
+                            jit_debug::JitDebugTier::Optimizing,
+                            crate::jit_registry::JitInstallError::DependencyChanged,
+                        );
+                        self.jit_optimized_code_cache = None;
+                        rearm(self);
+                        return None;
                     }
                     Err(error) => {
                         if let crate::jit_registry::JitInstallError::ResourceBudget {
@@ -2487,8 +2534,7 @@ impl Interpreter {
                         reason,
                         native_abi::ExitReason::InsufficientFeedback
                             | native_abi::ExitReason::RuntimeTransition
-                            | native_abi::ExitReason::StabilityChanged
-                            | native_abi::ExitReason::FieldTypeChanged
+                            | native_abi::ExitReason::DependencyChanged
                             | native_abi::ExitReason::AllocationSiteDecided
                     ))
                 .then_some((pc, reason))

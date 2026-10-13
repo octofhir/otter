@@ -242,6 +242,9 @@ pub(crate) fn emit_action_probe(
                 ; cmp BYTE [Rq(entry) + cache.store_action_byte as i32], PropertyStoreAction::OwnWritable as i8 ; je =>own
                 ; cmp BYTE [Rq(entry) + cache.store_action_byte as i32], PropertyStoreAction::AddOwn as i8 ; jne =>miss
                 ; test BYTE [Rq(shape) + view.shape_state_byte as i32], ShapeState::EXTENSIBLE_MASK as i8 ; jz =>miss
+                // Code subscribed to the shape the receiver leaves: the
+                // runtime store fires it, before anything is written.
+                ; test BYTE [Rq(shape) + view.shape_watched_byte as i32], otter_vm::code_dependencies::ShapeFact::Stable as i8 ; jnz =>miss
                 ; mov r10, [Rq(entry) + cache.store_validity_byte as i32]
                 // A zero proof belongs only to canonical OwnAdd: the exact
                 // immutable receiver shape key already fixes its null chain.

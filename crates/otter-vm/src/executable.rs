@@ -415,6 +415,9 @@ impl CodeBlock {
                 + crate::object::shape_body::SHAPE_BODY_STABLE_OFFSET as u32,
             shape_field_type_byte: otter_gc::header::HEADER_SIZE as u32
                 + crate::object::shape_body::SHAPE_BODY_FIELD_TYPE_OFFSET as u32,
+            shape_watched_byte: otter_gc::header::HEADER_SIZE as u32
+                + crate::object::shape_body::SHAPE_BODY_WATCHED_OFFSET as u32,
+            dependency_flag: crate::code_dependencies::DependencyFlag::new(),
             shape_id_byte: otter_gc::header::HEADER_SIZE as u32
                 + crate::object::shape_body::SHAPE_BODY_ID_OFFSET as u32,
             field_types: rustc_hash::FxHashMap::default(),

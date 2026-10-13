@@ -1901,6 +1901,7 @@ pub const fn runtime_stub_name(id: super::RuntimeStubId) -> &'static str {
         id if id == STUB_MATH_ATAN2_LEAF.id => "math_atan2_leaf",
         id if id == STUB_MATH_POW_LEAF.id => "math_pow_leaf",
         id if id == STUB_FIELD_TYPE_OBSERVE.id => "field_type_observe",
+        id if id == STUB_SHAPE_LEFT.id => "shape_left",
         _ => "unknown_runtime_stub",
     }
 }
@@ -2076,6 +2077,20 @@ pub const STUB_FIELD_TYPE_OBSERVE: RuntimeStubDescriptor = descriptor(
     NativeResultDomain::Probe,
 );
 
+/// An object left a watched shape: `(heap_mut, shape_header_address,
+/// unused)` clears the shape's stable byte and fires its stability
+/// subscribers. Only scalar metadata and code flags change.
+pub const STUB_SHAPE_LEFT: RuntimeStubDescriptor = descriptor(
+    114,
+    RuntimeStubClass::LeafNoAlloc,
+    RuntimeStubSignature::MutatingLeafValue2,
+    2,
+    RuntimeStubEffects::leaf(false, true),
+    RuntimeStubException::Never,
+    RuntimeStubResultAbi::NativePair,
+    NativeResultDomain::Probe,
+);
+
 /// Dense inventory of every current machine-callable runtime-stub contract.
 pub const RUNTIME_STUB_DESCRIPTORS: &[RuntimeStubDescriptor] = &[
     STUB_JIT_BACKEDGE_POLL,
@@ -2191,6 +2206,7 @@ pub const RUNTIME_STUB_DESCRIPTORS: &[RuntimeStubDescriptor] = &[
     STUB_MATH_ATAN2_LEAF,
     STUB_MATH_POW_LEAF,
     STUB_FIELD_TYPE_OBSERVE,
+    STUB_SHAPE_LEFT,
 ];
 
 // Descriptor ids are the sole slot authority for bindings and symbol lookup.

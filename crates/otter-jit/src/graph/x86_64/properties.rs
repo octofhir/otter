@@ -133,6 +133,22 @@ impl Codegen<'_> {
                 if let Some(validity) = guard.prototype_validity {
                     self.emit_validity_guard(validity, exit);
                 }
+                // A valid proof fixes the holder slot: the code-retained cell
+                // holds the closure read there when the guard was baked.
+                if guard.method_cell != 0 && guard.accessor_byte.is_none() {
+                    emit_load_symbol_u64(
+                        &mut self.ops,
+                        &mut self.relocations,
+                        result(),
+                        guard.method_cell,
+                        RelocationTarget::CalleeIdentityCell {
+                            function_id: guard.method_fid,
+                            call_pc: byte_pc,
+                        },
+                    );
+                    dynasm!(self.ops ; .arch x64 ; mov Rq(result()), [Rq(result())]);
+                    return Ok(true);
+                }
                 if guard.holder_root == 0 {
                     dynasm!(self.ops ; .arch x64 ; mov Rq(holder), Rq(receiver));
                 } else {

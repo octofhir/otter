@@ -1235,6 +1235,12 @@ pub struct JitMethodGuard {
     /// of `method_fid` when this guard was baked, so while the proof holds
     /// the method read here is a closure of that function.
     pub slot_proven: bool,
+    /// Address of a code-retained cell holding the closure the proof fixes
+    /// in the holder slot ([`Self::slot_proven`]): generated code reads the
+    /// method from it instead of walking to the holder. The collector
+    /// rewrites the cell when the closure moves. Zero when the slot is not
+    /// proven.
+    pub method_cell: u64,
     /// The holder slot holds an accessor's cell rather than the method
     /// itself: the method is the cell's getter or setter, at this byte offset
     /// from the cell value.

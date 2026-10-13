@@ -2973,6 +2973,7 @@ impl Interpreter {
                         if snap.accessor_byte.is_some() {
                             method.guard.accessor_byte = snap.accessor_byte;
                             method.guard.slot_proven = false;
+                            method.guard.method_cell = 0;
                             method.body = None;
                         }
                         let plan = method.callee.plan;
@@ -3063,6 +3064,7 @@ impl Interpreter {
     /// knowledge on the VM side.
     fn bake_method_guard(&self, target: &PolyMethodTarget) -> Option<jit::JitMethodGuard> {
         let recv_shape = self.bake_shape_id(target.recv_shape)?;
+        let proven = self.proven_method(target);
         let (prototype_validity, holder_root) = match &target.prototype.validity {
             Some(cell) => (
                 Some(self.bake_prototype_validity(cell)?),
@@ -3076,36 +3078,36 @@ impl Interpreter {
             prototype_validity,
             holder_root,
             method_field: target.method_field,
-            slot_proven: self.method_slot_proven(target),
+            slot_proven: proven.is_some(),
+            method_cell: proven.map_or(0, |method| self.bake_held_identity_cell(method)),
             accessor_byte: None,
         })
     }
 
-    /// Whether `target`'s prototype proof fixes its holder slot: the proof
-    /// still holds, and the slot it names holds a closure of the target's
-    /// function now. Every write to a watched prototype retires the proof, so
-    /// the slot cannot change while generated code finds it valid.
-    fn method_slot_proven(&self, target: &PolyMethodTarget) -> bool {
-        let Some(cell) = &target.prototype.validity else {
-            return false;
-        };
+    /// The method `target`'s prototype proof fixes in its holder slot: the
+    /// proof still holds, and the slot it names holds a closure of the
+    /// target's function now. Every write to a watched prototype retires the
+    /// proof, so the slot cannot change while generated code finds it valid.
+    fn proven_method(&self, target: &PolyMethodTarget) -> Option<Value> {
+        let cell = target.prototype.validity.as_ref()?;
         if !cell.is_valid() {
-            return false;
+            return None;
         }
-        let Some(root) = self
+        let root = self
             .shape_runtime
-            .handle_for_id(target.prototype.holder_root)
-        else {
-            return false;
-        };
+            .handle_for_id(target.prototype.holder_root)?;
         let crate::object::shape_body::ShapePrototype::Object(holder) =
             crate::object::shape_body::prototype_of(root)
         else {
-            return false;
+            return None;
         };
-        crate::object::load_slot_at_field(holder, &self.gc_heap, target.method_field)
-            .and_then(|value| value.as_closure(&self.gc_heap))
-            .is_some_and(|closure| closure.function_id() == target.method_fid)
+        crate::object::load_slot_at_field(holder, &self.gc_heap, target.method_field).filter(
+            |value| {
+                value
+                    .as_closure(&self.gc_heap)
+                    .is_some_and(|closure| closure.function_id() == target.method_fid)
+            },
+        )
     }
 
     /// Bake one compiler-generated method call independently of leaf inlining.

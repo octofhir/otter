@@ -2531,6 +2531,22 @@ impl<'a> Codegen<'a> {
                 exit,
             );
         }
+        // A valid proof fixes the holder slot: the code-retained cell holds
+        // the closure read there when the guard was baked.
+        if guard.method_cell != 0 && guard.accessor_byte.is_none() {
+            emit_load_symbol_u64(
+                &mut self.ops,
+                &mut self.relocations,
+                destination,
+                guard.method_cell,
+                RelocationTarget::CalleeIdentityCell {
+                    function_id: guard.method_fid,
+                    call_pc: byte_pc,
+                },
+            );
+            dynasm!(self.ops ; .arch aarch64 ; ldr X(destination), [X(destination)]);
+            return Ok(());
+        }
         if guard.holder_root == 0 {
             dynasm!(self.ops ; .arch aarch64 ; mov X(holder), X(receiver));
         } else {

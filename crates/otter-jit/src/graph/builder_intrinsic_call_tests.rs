@@ -310,3 +310,93 @@ fn an_inlined_intrinsic_keeps_its_source_identity_and_evaluated_arguments() {
         Kind::CallJs { .. } | Kind::Generic { .. } | Kind::LoadWindow(_)
     )));
 }
+
+/// `r2 = r0.exec(r1)` (or `.test`) whose method load has one own-data
+/// program and whose callee feedback proved the realm's original method.
+fn regexp_method_call(kind: IntrinsicCallKind, realm: u32) -> JitCompileSnapshot {
+    use otter_vm::{JitCacheIrOp, JitCacheIrProgram, object::FieldLocation};
+    let mut view = snapshot(
+        90,
+        2,
+        3,
+        vec![
+            (
+                Op::CallMethodValue,
+                vec![
+                    Operand::Register(2),
+                    Operand::Register(0),
+                    Operand::ConstIndex(0),
+                    Operand::ConstIndex(1),
+                    Operand::Register(1),
+                ],
+            ),
+            (Op::ReturnValue, vec![Operand::Register(2)]),
+        ],
+    );
+    prove(&mut view, kind);
+    view.native_calls.insert(
+        0,
+        JitNativeCall::Intrinsic(JitIntrinsicCallProof {
+            kind,
+            identity_cell: 32,
+            realm_id: realm,
+        }),
+    );
+    let field = FieldLocation::inline(0);
+    view.property_programs.insert(
+        0,
+        vec![JitCacheIrProgram {
+            ops: vec![
+                JitCacheIrOp::GuardShape {
+                    object: 0,
+                    shape: 128,
+                },
+                JitCacheIrOp::GuardAtomSlot {
+                    object: 0,
+                    atom: 1,
+                    field,
+                    writable: false,
+                },
+                JitCacheIrOp::LoadField { object: 0, field },
+            ]
+            .into_boxed_slice(),
+        }],
+    );
+    view
+}
+
+#[test]
+fn proved_regexp_methods_run_without_a_call_activation() {
+    for (kind, test) in [
+        (IntrinsicCallKind::RegExpExec, false),
+        (IntrinsicCallKind::RegExpTest, true),
+    ] {
+        let built = graph(&regexp_method_call(kind, 7));
+        let kinds: Vec<&Kind> = built
+            .graph
+            .blocks
+            .iter()
+            .flat_map(|block| block.body.iter())
+            .map(|&node| &built.graph.node(node).kind)
+            .collect();
+        assert!(kinds.contains(&&Kind::CheckCellValue(32)));
+        assert!(kinds.contains(&&Kind::RegExpMethod { test }));
+        assert!(!kinds.iter().any(|kind| matches!(kind, Kind::CallJs { .. })));
+        // A proof from another realm keeps the ordinary native call.
+        let foreign = graph(&regexp_method_call(kind, 8));
+        assert!(
+            foreign
+                .graph
+                .nodes
+                .iter()
+                .all(|node| { !matches!(node.kind, Kind::RegExpMethod { .. }) })
+        );
+        assert!(
+            foreign
+                .graph
+                .nodes
+                .iter()
+                .any(|node| { matches!(node.kind, Kind::CallJs { .. }) })
+        );
+    }
+}

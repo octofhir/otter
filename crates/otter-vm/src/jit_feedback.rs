@@ -1576,9 +1576,9 @@ mod tests {
             let Some(CallSiteDistribution::Poly(targets)) =
                 vector.call_slot(index).and_then(|slot| slot.distribution())
             else {
-                panic!("four canonical kinds remain a typed target population");
+                panic!("every canonical kind remains a typed target population");
             };
-            assert_eq!(targets.len(), 4);
+            assert_eq!(targets.len(), crate::IntrinsicCallKind::ALL.len());
             for kind in crate::IntrinsicCallKind::ALL {
                 assert!(targets.contains(&CallTargetCount {
                     target: OrdinaryCallTarget::Intrinsic(kind),
@@ -1586,7 +1586,10 @@ mod tests {
                 }));
             }
         }
-        assert_eq!(vector.epoch(), 8);
+        assert_eq!(
+            vector.epoch(),
+            2 * crate::IntrinsicCallKind::ALL.len() as u32
+        );
     }
 
     #[test]

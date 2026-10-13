@@ -2662,7 +2662,14 @@ impl Interpreter {
                         continue;
                     }
                     feedback::OrdinaryCallTarget::Intrinsic(kind) => {
-                        let native = if matches!(op, Op::Call | Op::New)
+                        // A method intrinsic specializes `receiver.method(...)`;
+                        // the others, a plain call or construction.
+                        let form_site = if kind.is_method() {
+                            op == Op::CallMethodValue
+                        } else {
+                            matches!(op, Op::Call | Op::New)
+                        };
+                        let native = if form_site
                             && self.foreign_function_realm(fid).is_none()
                             && let Some(callable) = self.realm_intrinsics.callable(kind)
                         {

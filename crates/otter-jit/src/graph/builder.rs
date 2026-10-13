@@ -3622,6 +3622,35 @@ impl<'a> Builder<'a> {
         plan: Option<otter_vm::jit::JitDirectCallPlan>,
         destination: Option<u16>,
     ) {
+        // The realm's own RegExp `exec` or `test`, its identity proved, runs
+        // through its runtime entry without a native call frame.
+        if let [argument] = arguments
+            && !self.exited_for(ExitReason::IdentityGuard)
+            && let Some(&otter_vm::JitNativeCall::Intrinsic(proof)) =
+                self.view.native_calls.get(&instruction.byte_pc)
+            && let Some(form) = crate::intrinsic_calls::method_form(
+                proof,
+                self.view.literal_allocations.realm_id,
+                arguments.len(),
+            )
+        {
+            self.add(
+                Kind::CheckCellValue(proof.identity_cell),
+                &[callee],
+                Repr::None,
+            );
+            let node = self.add(
+                Kind::RegExpMethod {
+                    test: form == crate::intrinsic_calls::IntrinsicMethodForm::RegExpTest,
+                },
+                &[receiver, *argument],
+                Repr::Tagged,
+            );
+            if let Some(destination) = destination {
+                self.write(destination, node);
+            }
+            return;
+        }
         let mut inputs: SmallVec<[NodeId; 4]> = SmallVec::new();
         inputs.push(callee);
         inputs.push(receiver);

@@ -236,6 +236,20 @@ pub(crate) fn invoke_frame_native_call(
     this_value: Value,
     args: &[Value],
 ) -> Result<Value, crate::NativeError> {
+    with_frame_native_ctx(interp, stack, context, this_value, |ctx| {
+        call.invoke(ctx, args)
+    })
+}
+
+/// Run `body` on the native view of the current turn that a native call
+/// with receiver `this_value` sees, rooted the same way.
+pub(crate) fn with_frame_native_ctx<R>(
+    interp: &mut Interpreter,
+    stack: &mut ActivationStack,
+    context: crate::runtime_cx::NativeContext<'_>,
+    this_value: Value,
+    body: impl FnOnce(&mut NativeCtx<'_>) -> R,
+) -> R {
     let call_info = NativeCallInfo::call(this_value);
     let roots = NativeCallRoots::new(&call_info, &[], &[]);
     // Pushed (not installed) so any outer scope's value/slice roots
@@ -246,7 +260,7 @@ pub(crate) fn invoke_frame_native_call(
     debug_assert!(interp.gc_heap.has_frame_root_providers());
     let turn = crate::runtime_cx::RuntimeTurn::from_rooted_parts(interp, stack);
     let mut ctx = NativeCtx::with_native_context(turn, &call_info, context);
-    call.invoke(&mut ctx, args)
+    body(&mut ctx)
 }
 
 impl Interpreter {

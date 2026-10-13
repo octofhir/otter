@@ -27,6 +27,7 @@ mod forward_arguments;
 mod iterators;
 #[cfg(test)]
 mod new_error_tests;
+mod regexp_values;
 pub(crate) mod semantic_source;
 mod value_loads;
 mod value_ops;

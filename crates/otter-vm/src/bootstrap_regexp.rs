@@ -957,7 +957,7 @@ pub(crate) fn proto_exec(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Valu
     })
 }
 
-fn proto_test(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+pub(crate) fn proto_test(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     // §22.2.6.16 — `this` need only be an Object; the match runs through
     // the abstract RegExpExec, which dispatches on the `exec` property,
     // so a non-RegExp object carrying its own `exec` is honoured.

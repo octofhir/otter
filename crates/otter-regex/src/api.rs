@@ -272,6 +272,18 @@ impl<U: Unit> Iterator for Matches<'_, '_, U> {
                         self.done = true;
                         return None;
                     }
+                    // The one candidate must still begin with a code point
+                    // that can start a match; a prefilter exists only for a
+                    // pattern that cannot match the empty string, so an empty
+                    // subject fails too.
+                    if let Some(pf) = &program.prefilter {
+                        let starts = pos < self.text.len()
+                            && pf.cp_may_start(decode_at(self.text, pos, unicode).0);
+                        if !starts {
+                            self.done = true;
+                            return None;
+                        }
+                    }
                 }
                 // A match starting at `pos` or later holds the literal at
                 // `pos + min_offset` or later, so the first such occurrence `at`

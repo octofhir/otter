@@ -925,6 +925,14 @@ fn regexp_constructor_matches(
 // ---------------------------------------------------------------
 
 pub(crate) fn proto_exec(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    // A RegExp receiver and a string subject need no coercion: the match
+    // roots both before it allocates.
+    let receiver = *ctx.this_value();
+    if receiver.as_regexp().is_some()
+        && let Some(input) = args.first().and_then(|input| input.as_string(ctx.heap()))
+    {
+        return crate::regexp_prototype::exec_once_native(&receiver, input, ctx);
+    }
     ctx.scope(|mut scope| {
         let receiver = scope.this();
         if scope.raw(receiver).as_regexp().is_none() {

@@ -188,11 +188,10 @@ pub(crate) fn exec_once_native(
             {
                 let subject = scope.raw(input);
                 let matched_range = matched.range.clone();
-                let captures = matched.captures.clone();
                 scope.with_turn_parts(|interp, _| {
                     interp
                         .regexp_legacy
-                        .record_match(subject, matched_range, &captures);
+                        .record_match(subject, matched_range, &matched.captures);
                     Ok::<(), NativeError>(())
                 })?;
             }
@@ -239,7 +238,7 @@ fn build_match_result_native<'scope>(
 ) -> Result<Local<'scope>, NativeError> {
     // Every element is produced before the array exists, so the array is
     // allocated once at its final length with its contents in place.
-    let mut elements: smallvec::SmallVec<[Local<'_>; 8]> =
+    let mut elements: smallvec::SmallVec<[Local<'_>; 16]> =
         smallvec::SmallVec::with_capacity(1 + m.captures.len());
     elements.push(slice_subject_string(scope, input, m.range.clone())?);
     for capture in &m.captures {
@@ -822,6 +821,10 @@ pub(crate) fn coerce_to_jsstring_runtime(
     value: &Value,
     name: &'static str,
 ) -> Result<JsString, crate::NativeError> {
+    // A string is its own ToString and needs no handle frame.
+    if let Some(string) = value.as_string(ctx.heap()) {
+        return Ok(string);
+    }
     ctx.scope(|mut scope| {
         let value = scope.value(*value);
         let current = scope.raw(value);
@@ -879,6 +882,10 @@ fn to_length_runtime(
     // [0, 2^53-1]. ToNumber throws for a Symbol / BigInt and runs (and so
     // can re-throw from) a `valueOf`, so the fallible coercion is required —
     // an infallible NaN cast would silently swallow those abrupt completions.
+    // A Number runs no code and needs no handle frame.
+    if let Some(n) = value.as_f64() {
+        return Ok(length_of_number(n));
+    }
     ctx.scope(|mut scope| {
         let value = scope.value(*value);
         let current = scope.raw(value);
@@ -912,16 +919,19 @@ fn to_length_runtime(
                     .map_err(vm_err_to_native(interp, name))
             })?
             .as_f64();
-        if n.is_nan() || n <= 0.0 {
-            return Ok(0);
-        }
-        if n.is_infinite() {
-            return Ok(9_007_199_254_740_991);
-        }
-        let trunc = n.trunc();
-        let clamped = trunc.min(9_007_199_254_740_991.0);
-        Ok(clamped as u64)
+        Ok(length_of_number(n))
     })
+}
+
+/// ToLength's clamp of an already-numeric value to `[0, 2^53 - 1]`.
+fn length_of_number(n: f64) -> u64 {
+    if n.is_nan() || n <= 0.0 {
+        return 0;
+    }
+    if n.is_infinite() {
+        return 9_007_199_254_740_991;
+    }
+    n.trunc().min(9_007_199_254_740_991.0) as u64
 }
 
 /// §7.1.5 `ToIntegerOrInfinity`. `NaN` / `+0` / `-0` → 0; ±Infinity

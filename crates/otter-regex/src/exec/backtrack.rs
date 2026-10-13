@@ -101,8 +101,13 @@ pub(crate) fn attempt<U: Unit>(
         step_limit: config.step_limit,
     };
     let Scratch { stack, log, caps } = scratch;
-    caps.clear();
-    caps.resize(program.slot_count(), None);
+    let slots = program.slot_count();
+    if caps.len() == slots {
+        caps.fill(None);
+    } else {
+        caps.clear();
+        caps.resize(slots, None);
+    }
     // Seed the overall-match start; the lowering no longer emits a `Save(0)`.
     caps[0] = Some(at);
     let result = m.run(0, at, false, caps, stack, log);

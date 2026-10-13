@@ -147,7 +147,9 @@ pub(crate) fn emit_prototype_validity_guard(
             identity: validity.identity,
         },
     );
-    dynasm!(ops ; .arch aarch64 ; ldar W(scratch), [X(scratch)] ; cbz W(scratch), =>miss);
+    // The mutator both retires validity words and runs generated code, so a
+    // plain load observes every retirement that precedes it in program order.
+    dynasm!(ops ; .arch aarch64 ; ldr W(scratch), [X(scratch)] ; cbz W(scratch), =>miss);
 }
 
 /// Materialize a validated runtime-stub entry and attach its descriptor.

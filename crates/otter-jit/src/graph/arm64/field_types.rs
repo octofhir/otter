@@ -37,8 +37,10 @@ impl Codegen<'_> {
                     owner_shape: guard.owner_shape,
                 },
             );
+            // Field summaries widen only on the mutator, which also runs this
+            // code: a plain load sees every widening before it.
             dynasm!(self.ops ; .arch aarch64
-                ; ldarb w16, [x16]
+                ; ldrb w16, [x16]
                 ; cmp w16, u32::from(guard.expected as u8)
                 ; b.ne =>exit
             );

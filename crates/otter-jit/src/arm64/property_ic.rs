@@ -197,8 +197,10 @@ fn emit_entry_proof(ops: &mut Assembler, entry: u8, required: bool, miss: Dynami
     } else {
         dynasm!(ops ; .arch aarch64 ; cbz x16, =>held);
     }
+    // Proofs retire on the mutator, which also runs this code: a plain load
+    // sees every retirement before it.
     dynasm!(ops ; .arch aarch64
-        ; ldar w16, [x16]
+        ; ldr w16, [x16]
         ; cbz w16, =>miss
         ; =>held
     );

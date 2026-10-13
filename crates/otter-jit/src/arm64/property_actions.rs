@@ -264,7 +264,7 @@ pub(crate) fn emit_load(
         ; cmp w16, #PropertyLoadAction::NonExistent as u32 ; b.eq =>absent
         ; cmp w16, #PropertyLoadAction::InheritedData as u32 ; b.ne =>miss
         ; ldr x16, [X(entry), cache.load_validity_byte] ; cbz x16, =>miss
-        ; ldar w16, [x16] ; cbz w16, =>miss
+        ; ldr w16, [x16] ; cbz w16, =>miss
         ; and x17, X(receiver), #0xffff_ffff_0000_0000
         ; ldr w16, [X(entry), cache.holder_root_byte] ; cbz w16, =>miss
         ; add x16, x17, x16
@@ -296,7 +296,7 @@ pub(crate) fn emit_load(
         // prototype the receiver shape fixes) authorizes `undefined`.
         ; =>absent
         ; ldr x16, [X(entry), cache.load_validity_byte] ; cbz x16, =>undefined
-        ; ldar w16, [x16] ; cbz w16, =>miss
+        ; ldr w16, [x16] ; cbz w16, =>miss
         ; =>undefined);
     emit_load_u64(ops, destination, crate::entry::VALUE_UNDEFINED);
     dynasm!(ops ; .arch aarch64 ; =>done);
@@ -345,7 +345,7 @@ pub(crate) fn emit_store(
         ; cmp w16, #PropertyStoreAction::AddOwn as u32 ; b.ne =>miss
         ; ldr w16, [X(entry), cache.target_shape_byte] ; cbz w16, =>miss
         ; ldr x16, [X(entry), cache.store_validity_byte] ; cbz x16, =>chain
-        ; ldar w16, [x16] ; cbz w16, =>miss
+        ; ldr w16, [x16] ; cbz w16, =>miss
         ; =>chain ; ldrb w16, [X(holder), view.shape_state_byte]
         ; tst w16, #u32::from(ShapeState::EXTENSIBLE_MASK) ; b.eq =>miss
         ; and x17, X(receiver), #0xffff_ffff_0000_0000

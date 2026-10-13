@@ -3143,11 +3143,13 @@ impl<'a> Builder<'a> {
                 }
                 _ => None,
             };
+            let fresh = self.known.fresh.contains(&object);
             self.add(
                 Kind::StoreNamedProperty {
                     byte_pc,
                     owners,
                     receiver_shape,
+                    fresh,
                 },
                 &[object, value],
                 Repr::None,

@@ -410,11 +410,15 @@ pub(crate) enum Kind {
     /// program, in program order. A live exact `receiver_shape` proves the
     /// receiver an ordinary object of that shape: only the programs that
     /// guard it run, without that guard. Eager deopt when no program
-    /// matches; the value's own barrier is a separate node.
+    /// matches; the value's own barrier is a separate node. A `fresh`
+    /// receiver was bump-allocated on this path with no call, collection or
+    /// poll since, so no code can have given it a prototype role or made it
+    /// non-extensible: neither is re-checked.
     StoreNamedProperty {
         byte_pc: u32,
         owners: SmallVec<[FieldStoreOwner; 4]>,
         receiver_shape: Option<u32>,
+        fresh: bool,
     },
     /// Store input1 into the own data property receiver input0 keeps in an
     /// exotic body slot (a RegExp's `lastIndex`). Eager deopt unless input0

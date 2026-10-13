@@ -3398,15 +3398,16 @@ impl<'a> Builder<'a> {
         Some(shapes)
     }
 
+    /// Prove `object` has one of `shapes`. A writable site's shapes come from
+    /// store handlers, which no prototype shape receives, so a proof within
+    /// them also excludes prototypes.
     fn check_shapes(&mut self, object: NodeId, shapes: &SmallVec<[u32; 4]>, writable: bool) {
         if let Some(known) = self.known_shapes(object)
             && known.iter().all(|shape| shapes.contains(shape))
-            && (!writable
-                || self
-                    .known
-                    .layout(object)
-                    .is_some_and(|layout| layout.writable))
         {
+            if writable {
+                self.known.layout_entry(object).writable = true;
+            }
             return;
         }
         let object_proved = self

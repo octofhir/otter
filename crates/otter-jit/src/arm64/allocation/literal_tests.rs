@@ -115,6 +115,7 @@ fn execute(
                     stored_shapes: smallvec::SmallVec::new(),
                     nullish_mask: 0,
                     int32: false,
+                    int32_constant: None,
                 };
                 inputs.len()
             ],
@@ -358,6 +359,7 @@ fn zero_records_emit_no_observation_and_keep_the_buffer_live() {
                 stored_shapes: smallvec::smallvec![4096],
                 nullish_mask: 0,
                 int32: false,
+                int32_constant: None,
             })
             .collect();
         let mut ops = Assembler::new().unwrap();

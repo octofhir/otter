@@ -1,7 +1,7 @@
 //! Shape-owned summaries of values stored in ordinary data fields.
 //!
 //! # Contents
-//! - Int32 and nullish bits, an exact-shape count and two identities describe a field.
+//! - Int32 constants, category unions and two exact shapes describe a field.
 //! - `owner` finds the shape which introduced a logical slot.
 //! - `snapshot` and `observe_owner` read and widen its scalar summary.
 //! - `seed` accounts for initialized fields at birth and shape adoption.
@@ -13,7 +13,9 @@
 //! - Other primitives, opaque objects and wider unions produce `TOP`, which
 //!   never narrows. Int32 denotes the stored representation, not integer-valued
 //!   doubles. Shape identities are range-checked before packing.
-//! - The count matches the canonical sorted identities. Every widening changes
+//! - An exact Int32 word retains the first value until a different observation
+//!   permanently replaces it with a category union. Its payload is not a shape.
+//! - Union counts match their canonical sorted identities. Every widening changes
 //!   the low byte, which cannot return to a former value in one owner's history.
 //!   Comparing that byte with a captured byte proves the whole word unchanged.
 //! - Shape identities describe values at observation time. A loaded-value
@@ -36,12 +38,14 @@ pub const UNDEFINED: u64 = 1;
 pub const NULL: u64 = 1 << 1;
 /// An int32-tagged number belongs to this field's stored-value union.
 pub const INT32: u64 = 1 << 4;
+/// The word contains one exact Int32 payload instead of shape identities.
+pub const CONST_INT32: u64 = 1 << 5;
 /// Bit position of the count of packed exact identities.
 pub const SHAPE_COUNT_SHIFT: u32 = 2;
 /// Two count bits encode zero, one or two exact identities.
 pub const SHAPE_COUNT_MASK: u64 = 3 << SHAPE_COUNT_SHIFT;
 /// Low bits present in a constrained canonical summary.
-pub const VALID_LOW_BITS: u64 = UNDEFINED | NULL | INT32 | SHAPE_COUNT_MASK;
+pub const VALID_LOW_BITS: u64 = UNDEFINED | NULL | INT32 | CONST_INT32 | SHAPE_COUNT_MASK;
 /// Any value can belong to this field's stored-value union.
 pub const TOP: u64 = 1 << 7;
 /// Largest exact identity which fits a packed shape slot.
@@ -53,6 +57,28 @@ pub const SECOND_SHAPE_SHIFT: u32 = 36;
 
 const SCALAR_BITS: u64 = UNDEFINED | NULL | INT32;
 const LOW_MASK: u64 = (1 << FIRST_SHAPE_SHIFT) - 1;
+
+/// First observation of one Int32-tagged value.
+#[must_use]
+pub const fn int32_sample(value: i32) -> u64 {
+    INT32 | CONST_INT32 | ((value as u32 as u64) << FIRST_SHAPE_SHIFT)
+}
+
+/// The exact Int32 value of a canonical constant word.
+#[must_use]
+pub const fn int32_constant(word: u64) -> Option<i32> {
+    if word & LOW_MASK == INT32 | CONST_INT32 && word >> (FIRST_SHAPE_SHIFT + 32) == 0 {
+        Some((word >> FIRST_SHAPE_SHIFT) as u32 as i32)
+    } else {
+        None
+    }
+}
+
+/// Whether the entire stored-value bound has an Int32 representation.
+#[must_use]
+pub const fn is_int32_only(word: u64) -> bool {
+    word == INT32 || int32_constant(word).is_some()
+}
 
 /// Encode one exact shape identity, saturating identities outside the range.
 #[must_use]
@@ -69,6 +95,9 @@ pub const fn shape_id_sample(id: u64) -> u64 {
 pub(crate) const fn is_canonical(word: u64) -> bool {
     if word == TOP {
         return true;
+    }
+    if word & CONST_INT32 != 0 {
+        return int32_constant(word).is_some();
     }
     if word & LOW_MASK & !VALID_LOW_BITS != 0 {
         return false;
@@ -89,6 +118,20 @@ pub fn merge(left: u64, right: u64) -> u64 {
     if left == TOP || right == TOP || !is_canonical(left) || !is_canonical(right) {
         return TOP;
     }
+    if left == 0 {
+        return right;
+    }
+    if right == 0 || left == right {
+        return left;
+    }
+    // Only the first observation or an identical write retains constness.
+    // Category unions never become constants again, even after equal stores.
+    let left = if left & CONST_INT32 != 0 { INT32 } else { left };
+    let right = if right & CONST_INT32 != 0 {
+        INT32
+    } else {
+        right
+    };
     let mut first = 0;
     let mut second = 0;
     for id in [
@@ -203,8 +246,8 @@ pub(super) fn seed(shape: ShapeHandle, count: usize, mut read: impl FnMut(u32) -
 }
 
 fn classify(value: Value) -> u64 {
-    if value.as_i32().is_some() {
-        return INT32;
+    if let Some(value) = value.as_i32() {
+        return int32_sample(value);
     }
     if value.is_undefined() {
         return UNDEFINED;

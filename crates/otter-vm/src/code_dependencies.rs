@@ -498,6 +498,60 @@ mod tests {
         });
     }
 
+    #[test]
+    fn an_unequal_int32_write_fires_constness_without_rearming_it() {
+        let mut interpreter = Interpreter::new().expect("fixture interpreter");
+        interpreter.with_handle_scope(|interpreter, scope| {
+            let handle = interpreter.scoped_object_bare(scope).expect("object");
+            let mut target = interpreter.escape_scoped(handle).as_object().unwrap();
+            interpreter
+                .create_data_property(&mut target, "value", Value::number_i32(7))
+                .unwrap();
+            let shape = object::shape(target, interpreter.gc_heap());
+            assert_eq!(
+                object::field_type::snapshot(shape),
+                object::field_type::int32_sample(7)
+            );
+            let exact = DependencyFlag::new();
+            let stable = DependencyFlag::new();
+            let mut subscriptions = ShapeSubscriptions::default();
+            subscriptions.watch(shape, ShapeFact::FieldType, &exact);
+            subscriptions.watch(shape, ShapeFact::Stable, &stable);
+            interpreter
+                .create_data_property(&mut target, "value", Value::number_i32(7))
+                .unwrap();
+            assert!(!exact.is_set());
+            interpreter
+                .create_data_property(&mut target, "value", Value::number_i32(8))
+                .unwrap();
+            assert!(exact.is_set());
+            assert!(!stable.is_set());
+            assert_eq!(
+                object::field_type::snapshot(shape),
+                object::field_type::INT32
+            );
+            let category = DependencyFlag::new();
+            subscriptions.watch(shape, ShapeFact::FieldType, &category);
+            interpreter
+                .create_data_property(&mut target, "value", Value::number_i32(7))
+                .unwrap();
+            assert!(!category.is_set());
+            assert_eq!(
+                object::field_type::snapshot(shape),
+                object::field_type::INT32
+            );
+            interpreter
+                .create_data_property(&mut target, "value", Value::number_f64(3.5))
+                .unwrap();
+            assert!(category.is_set());
+            assert_eq!(object::field_type::snapshot(shape), object::field_type::TOP);
+            for flag in [&exact, &category, &stable] {
+                subscriptions.unwatch(shape, flag);
+            }
+            assert!(shape_body::watchers(shape).is_null());
+        });
+    }
+
     fn context(
         heap: &mut otter_gc::GcHeap,
         scope_index: u16,

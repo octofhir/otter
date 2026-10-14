@@ -10,6 +10,7 @@
 //! - The callee is the evaluated SSA value; its guard precedes every effect and
 //!   retains the eager call state, including ignored evaluated arguments.
 //! - Allocation nodes keep their source's canonical root/reconstruction contract.
+//! - Admitted allocation forms prove their exact physical body kind.
 //! - A refused proof or form leaves the existing native-kind call path intact.
 //!
 //! # See also
@@ -62,14 +63,18 @@ impl Builder<'_> {
                     Kind::NewObject
                 };
                 let result = self.add(kind, &[], Repr::Tagged);
-                self.known.entry(result).heap_object = true;
+                if form == IntrinsicCallForm::ArrayEmpty {
+                    self.prove_array_body(result);
+                } else {
+                    self.prove_ordinary_object(result);
+                }
                 result
             }
             IntrinsicCallForm::ArrayLength => {
                 let value = self.read(arguments[0]);
                 let value = self.tagged(value);
                 let result = self.add(Kind::NewArrayWithLength, &[value], Repr::Tagged);
-                self.known.entry(result).heap_object = true;
+                self.prove_array_body(result);
                 result
             }
             IntrinsicCallForm::Boolean => {

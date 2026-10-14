@@ -7,6 +7,7 @@
 //! - Known ordinary receivers select load programs across body splices.
 //! - Uncovered known shapes keep guards and exact eager source chains.
 //! - Field summaries retain nullable distinctions and recheck metadata after effects.
+//! - Physical body proofs survive effects without preserving mutable layouts.
 //!
 //! # Invariants
 //! Fake shape offsets are compile-time geometry only; no fake object executes.
@@ -35,6 +36,9 @@ use crate::graph::{BaselineSupport, bytecode::Analysis};
 
 #[path = "builder_field_type_tests.rs"]
 mod field_type_tests;
+
+#[path = "builder_body_kind_tests.rs"]
+mod body_kind_tests;
 
 fn seed_top_fields(view: &mut JitCompileSnapshot) {
     for programs in view.property_programs.values() {

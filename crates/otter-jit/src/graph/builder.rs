@@ -37,6 +37,9 @@
 //!   conversion. The proof belongs to its SSA value, survives heap mutation,
 //!   and is intersected at joins. An inlined LoadThis inherits the actual
 //!   caller binding instead of assuming its callee has already converted it.
+//! - Physical object/array body kinds are immutable facts of SSA values,
+//!   proved by their allocation or a successful kind check. They survive
+//!   calls and moving collection; layouts and array lengths remain mutable.
 //! - Empty property programs do not prove a cold branch. Only a site whose
 //!   source-owned attempt state is unset can leave for insufficient feedback.
 //! - A proven global read keeps its actual source snapshot and byte PC.
@@ -56,9 +59,9 @@
 //!   Calls forget owner-word checks while retaining the loaded value bounds.
 //!   Owner guards keep their original load's eager frame and remain only
 //!   when a consumer relies on the bound, including through a non-loop phi.
-//! - Only an inlined method whose holder fixes its exact heap closure may
-//!   fold that closure's context slots. Every folded read carries a slot
-//!   dependency, and each slot store notifies its context's watch.
+//! - A held method or a source with one closure context may fold watched
+//!   context slots. Source and slot dependencies guard the respective facts;
+//!   each slot store notifies its context's watch.
 //!
 //! # See also
 //! - [`super::bytecode`] — blocks, loops and liveness.
@@ -137,9 +140,12 @@ pub(crate) struct NodeInfo {
     pub(crate) heap_object: bool,
     /// The value is proved to be a Number.
     pub(crate) number: bool,
-    /// The value is proved to be an ordinary object cell by an earlier
-    /// shape check; what kind of cell a value is never changes.
+    /// The value has an ordinary object body, by birth or a shape check.
+    /// Its physical kind never changes, independently of mutable layout.
     pub(crate) ordinary_object: bool,
+    /// The value has an Array body, by birth or a successful length check.
+    /// Semantic Array proofs alone do not exclude Proxy bodies.
+    pub(crate) array_body: bool,
 }
 
 /// What is known about one object's layout along the current path, until a
@@ -288,6 +294,7 @@ impl Known {
             info.heap_object &= theirs.heap_object;
             info.number &= theirs.number;
             info.ordinary_object &= theirs.ordinary_object;
+            info.array_body &= theirs.array_body;
             *info != NodeInfo::default()
         });
         // A stale proof of stable shapes holds where the other edge proves
@@ -2102,7 +2109,7 @@ impl<'a> Builder<'a> {
                 if self.view.cage_base != 0 && !self.exited_for(ExitReason::IdentityGuard) =>
             {
                 let value = self.add(Kind::LoadGlobalThis, &[], Repr::Tagged);
-                self.known.entry(value).heap_object = true;
+                self.prove_ordinary_object(value);
                 self.write(instruction.writes[0], value);
             }
             Op::LoadLocal | Op::StoreLocal => {
@@ -2115,12 +2122,12 @@ impl<'a> Builder<'a> {
             }
             Op::NewObject => {
                 let value = self.add(Kind::NewObject, &[], Repr::Tagged);
-                self.known.entry(value).heap_object = true;
+                self.prove_ordinary_object(value);
                 self.write(instruction.writes[0], value);
             }
             Op::NewArray if instruction.const_index(1) == Some(0) => {
                 let value = self.add(Kind::NewArrayEmpty, &[], Repr::Tagged);
-                self.known.entry(value).heap_object = true;
+                self.prove_array_body(value);
                 self.write(instruction.writes[0], value);
             }
             Op::NewObjectLiteral | Op::NewArray => {
@@ -2148,7 +2155,11 @@ impl<'a> Builder<'a> {
                     .is_some_and(|site| site.mode == otter_vm::jit::JitSiteMode::Old);
                 let object = matches!(kind, Kind::NewObjectLiteral { .. });
                 let value = self.add(kind, &inputs, Repr::Tagged);
-                self.known.entry(value).heap_object = true;
+                if object {
+                    self.prove_ordinary_object(value);
+                } else {
+                    self.prove_array_body(value);
+                }
                 if tenured && object {
                     // A tenured object is born old: each young input it holds
                     // is an edge the next scavenge finds only if remembered.
@@ -2929,12 +2940,22 @@ impl<'a> Builder<'a> {
     // ------------------------------------------------------------------
 
     fn visit_load_property(&mut self, instruction: &Instruction) {
-        if self.try_accessor_call(instruction, None) || self.load_receiver_method(instruction) {
-            return;
-        }
         let byte_pc = instruction.byte_pc;
         let object = self.read(instruction.reads[0]);
         let object = self.tagged(object);
+        let site = &self.view.instructions[self.pc as usize];
+        let array_proved = self.known.get(object).is_some_and(|info| info.array_body);
+        if site.load_array_length && array_proved && !self.exited_for(ExitReason::ShapeGuard) {
+            let value = self.add(
+                Kind::LoadArrayLength { array_proved: true },
+                &[object],
+                Repr::Int32,
+            );
+            return self.write(instruction.writes[0], value);
+        }
+        if self.try_accessor_call(instruction, None) || self.load_receiver_method(instruction) {
+            return;
+        }
         let receivers = (!self.exited_for(ExitReason::ShapeGuard))
             .then(|| self.known_shapes(object))
             .flatten();
@@ -3018,7 +3039,14 @@ impl<'a> Builder<'a> {
                 && site.length_reads_arrays_only
                 && !self.exited_for(ExitReason::ShapeGuard)
             {
-                let value = self.add(Kind::LoadArrayLength, &[object], Repr::Int32);
+                let value = self.add(
+                    Kind::LoadArrayLength {
+                        array_proved: false,
+                    },
+                    &[object],
+                    Repr::Int32,
+                );
+                self.prove_array_body(object);
                 return self.write(instruction.writes[0], value);
             }
             if self.view.instructions[self.pc as usize].load_array_length {
@@ -3414,12 +3442,18 @@ impl<'a> Builder<'a> {
         }
     }
 
-    /// `object` passed a guard on one ordinary object shape; what kind of
-    /// cell a value is never changes.
+    /// An ordinary object birth or shape check proves an immutable body kind.
     fn prove_ordinary_object(&mut self, object: NodeId) {
         let info = self.known.entry(object);
         info.heap_object = true;
         info.ordinary_object = true;
+    }
+
+    /// Array body kind is immutable; this proves no current length or layout.
+    fn prove_array_body(&mut self, array: NodeId) {
+        let info = self.known.entry(array);
+        info.heap_object = true;
+        info.array_body = true;
     }
 
     /// `receiver` passed a method guard on its exact `shape`, which holds

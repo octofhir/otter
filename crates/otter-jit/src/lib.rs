@@ -53,6 +53,8 @@ mod call_linkage;
 mod code;
 mod entry;
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+mod field_access;
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 mod field_store;
 mod frame;
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]

@@ -325,7 +325,7 @@ impl Codegen<'_> {
             holder,
             holder,
             method.field,
-            false,
+            crate::field_access::FieldAccess::LoadTagged,
         );
         self.emit_native_identity(holder, method.native_ref, miss);
     }

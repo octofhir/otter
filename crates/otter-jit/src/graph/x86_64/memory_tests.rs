@@ -2,6 +2,7 @@
 //!
 //! # Contents
 //! - Persistent banks for capacities zero, four and sixty-four under GP pressure.
+//! - Int32 field loads discard the tag in either persistent bank.
 //! - All indexed representations, index normalization and numeric hole words.
 //! - Float64 Uint8Clamp under every MXCSR rounding-control setting.
 //!
@@ -250,6 +251,58 @@ fn graph_own_fields_keep_both_banks_and_allocatable_registers() {
                 );
             }
         }
+    }
+}
+
+#[test]
+fn graph_int32_fields_load_only_the_payload_from_both_banks() {
+    let view = snapshot();
+    let layout = view.field_layout;
+    let plan = crate::template::TemplatePlan::build_unfused(&view).unwrap();
+    let transitions = crate::entry::TransitionTable::resolve();
+    let mut storage = vec![0u64; 6200];
+    let object = storage.as_mut_ptr() as u64;
+    // SAFETY: both raw banks remain inside this owned, aligned storage.
+    let slab = unsafe { storage.as_mut_ptr().add(80) } as u64;
+    assert_eq!(object >> 32, slab >> 32);
+    // SAFETY: the header handle lies inside the owned fixture.
+    unsafe { ((object + u64::from(layout.slab_handle_byte)) as *mut u32).write(slab as u32) };
+    for field in [
+        FieldLocation::inline(0),
+        FieldLocation::inline(63),
+        FieldLocation::overflow(0),
+        FieldLocation::overflow(5000),
+    ] {
+        let address = if field.is_inline() {
+            object + u64::from(layout.inline_byte(field))
+        } else {
+            slab + u64::from(layout.slab_words_byte + field.byte_offset())
+        };
+        // SAFETY: the selected word is aligned and within this fixture.
+        unsafe { (address as *mut u64).write(otter_vm::Value::number_i32(-7).to_bits()) };
+        let mut graph = Graph::default();
+        let mut allocation = Allocation::default();
+        let load = node(
+            &mut graph,
+            &mut allocation,
+            Kind::LoadOwnField(field),
+            &[Location::Gp(7)],
+            Some(Location::Gp(0)),
+        );
+        graph.node_mut(load).repr = Repr::Int32;
+        let mut cg = codegen(&view, &graph, &allocation, &plan, &transitions);
+        assert!(cg.emit_memory(load).unwrap());
+        dynasm!(cg.ops ; .arch x64 ; ret);
+        let buffer = cg.ops.finalize().unwrap();
+        // SAFETY: this SysV probe only reads the live fixture, without calls or GC.
+        let probe: unsafe extern "sysv64" fn(u64) -> u64 =
+            unsafe { std::mem::transmute(buffer.ptr(AssemblyOffset(0))) };
+        // SAFETY: object and its selected bank are initialized above.
+        assert_eq!(
+            unsafe { probe(object) },
+            u64::from((-7_i32) as u32),
+            "{field:?}"
+        );
     }
 }
 

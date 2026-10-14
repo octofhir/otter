@@ -8,6 +8,7 @@
 //! - Receivers name decompressed GC headers; VM layouts include the header.
 //! - A proved shape fixes the bank and index, including the persistent prefix.
 //! - Suffix handles are reread for each access and never retained across calls.
+//! - Int32 loads read only the proved numeric payload and clear high GP bits.
 //! - Symbol addresses keep their full-width artifact relocation identity.
 //!
 //! # See also
@@ -22,6 +23,7 @@ use otter_vm::{
 
 use super::values::{emit_load_symbol_u64, emit_load_u64};
 use crate::artifact::relocation::{RelocationCapture, RelocationTarget};
+use crate::field_access::FieldAccess;
 
 /// Materialize the first word of a shape-proven bank in `destination`.
 pub(crate) fn emit_field_base(
@@ -72,7 +74,7 @@ pub(crate) fn emit_own_field(
     object: u8,
     value: u8,
     field: FieldLocation,
-    store: bool,
+    access: FieldAccess,
 ) {
     let (base, offset) = if field.is_inline() {
         (object, u64::from(layout.inline_byte(field)))
@@ -86,17 +88,19 @@ pub(crate) fn emit_own_field(
         )
     };
     if let Ok(offset) = i32::try_from(offset) {
-        if store {
-            dynasm!(ops ; .arch x64 ; mov [Rq(base) + offset], Rq(value));
-        } else {
-            dynasm!(ops ; .arch x64 ; mov Rq(value), [Rq(base) + offset]);
+        match access {
+            FieldAccess::Store => dynasm!(ops ; .arch x64 ; mov [Rq(base) + offset], Rq(value)),
+            FieldAccess::LoadTagged => {
+                dynasm!(ops ; .arch x64 ; mov Rq(value), [Rq(base) + offset])
+            }
+            FieldAccess::LoadInt32 => dynasm!(ops ; .arch x64 ; mov Rd(value), [Rq(base) + offset]),
         }
     } else {
         emit_load_u64(ops, 10, offset);
-        if store {
-            dynasm!(ops ; .arch x64 ; mov [Rq(base) + r10], Rq(value));
-        } else {
-            dynasm!(ops ; .arch x64 ; mov Rq(value), [Rq(base) + r10]);
+        match access {
+            FieldAccess::Store => dynasm!(ops ; .arch x64 ; mov [Rq(base) + r10], Rq(value)),
+            FieldAccess::LoadTagged => dynasm!(ops ; .arch x64 ; mov Rq(value), [Rq(base) + r10]),
+            FieldAccess::LoadInt32 => dynasm!(ops ; .arch x64 ; mov Rd(value), [Rq(base) + r10]),
         }
     }
 }

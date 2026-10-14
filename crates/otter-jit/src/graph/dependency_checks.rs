@@ -289,6 +289,7 @@ mod tests {
                     owner_shape: 48,
                     stored_shapes: SmallVec::new(),
                     nullish_mask: 0,
+                    int32: false,
                 }
             )],
         }

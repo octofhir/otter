@@ -2949,8 +2949,12 @@ impl<'a> Builder<'a> {
             self.write(instruction.writes[0], value);
             return;
         }
-        let bound = self.field_load_bound(&access.shapes, access.field);
-        let value = self.add(Kind::LoadOwnField(access.field), &[object], Repr::Tagged);
+        let int32 = self.field_load_is_int32(&access.shapes, access.field);
+        let bound = (!int32)
+            .then(|| self.field_load_bound(&access.shapes, access.field))
+            .flatten();
+        let repr = if int32 { Repr::Int32 } else { Repr::Tagged };
+        let value = self.add(Kind::LoadOwnField(access.field), &[object], repr);
         if let Some(bound) = bound {
             self.known.field_values.insert(value, bound);
         }

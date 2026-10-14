@@ -159,7 +159,7 @@ impl Codegen<'_> {
                     holder,
                     result(),
                     guard.method_field,
-                    false,
+                    crate::field_access::FieldAccess::LoadTagged,
                 );
                 // An accessor's slot holds its cell; the method is the cell's
                 // getter or setter. A cell value is its header's full address.
@@ -465,7 +465,7 @@ impl Codegen<'_> {
                             object(operand),
                             destination.expect("named load result"),
                             field,
-                            false,
+                            crate::field_access::FieldAccess::LoadTagged,
                         );
                         committed = true;
                         dynasm!(self.ops ; .arch x64 ; jmp =>done);
@@ -477,7 +477,7 @@ impl Codegen<'_> {
                             receiver,
                             value.unwrap(),
                             field,
-                            true,
+                            crate::field_access::FieldAccess::Store,
                         );
                         committed = true;
                     }

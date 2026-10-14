@@ -1,7 +1,7 @@
 //! Shape-owned summaries of values stored in ordinary data fields.
 //!
 //! # Contents
-//! - Packed nullish bits, an exact-shape count and two identities describe a field.
+//! - Int32 and nullish bits, an exact-shape count and two identities describe a field.
 //! - `owner` finds the shape which introduced a logical slot.
 //! - `snapshot` and `observe_owner` read and widen its scalar summary.
 //! - `seed` accounts for initialized fields at birth and shape adoption.
@@ -10,8 +10,9 @@
 //! - Every live field is observed before another mutator operation can read it.
 //! - Append descendants share the defining shape's summary; independent
 //!   lineages observe their retained values when adopted.
-//! - Non-nullish primitives, opaque objects and wider unions produce `TOP`,
-//!   which never narrows. Shape identities are range-checked before packing.
+//! - Other primitives, opaque objects and wider unions produce `TOP`, which
+//!   never narrows. Int32 denotes the stored representation, not integer-valued
+//!   doubles. Shape identities are range-checked before packing.
 //! - The count matches the canonical sorted identities. Every widening changes
 //!   the low byte, which cannot return to a former value in one owner's history.
 //!   Comparing that byte with a captured byte proves the whole word unchanged.
@@ -33,12 +34,14 @@ use super::{ObjectBody, ShapeHandle, shape_body};
 pub const UNDEFINED: u64 = 1;
 /// Null belongs to this field's stored-value union.
 pub const NULL: u64 = 1 << 1;
+/// An int32-tagged number belongs to this field's stored-value union.
+pub const INT32: u64 = 1 << 4;
 /// Bit position of the count of packed exact identities.
 pub const SHAPE_COUNT_SHIFT: u32 = 2;
 /// Two count bits encode zero, one or two exact identities.
 pub const SHAPE_COUNT_MASK: u64 = 3 << SHAPE_COUNT_SHIFT;
 /// Low bits present in a constrained canonical summary.
-pub const VALID_LOW_BITS: u64 = UNDEFINED | NULL | SHAPE_COUNT_MASK;
+pub const VALID_LOW_BITS: u64 = UNDEFINED | NULL | INT32 | SHAPE_COUNT_MASK;
 /// Any value can belong to this field's stored-value union.
 pub const TOP: u64 = 1 << 7;
 /// Largest exact identity which fits a packed shape slot.
@@ -48,7 +51,7 @@ pub const FIRST_SHAPE_SHIFT: u32 = 8;
 /// Bit position of the second packed shape identity.
 pub const SECOND_SHAPE_SHIFT: u32 = 36;
 
-const NULLISH: u64 = UNDEFINED | NULL;
+const SCALAR_BITS: u64 = UNDEFINED | NULL | INT32;
 const LOW_MASK: u64 = (1 << FIRST_SHAPE_SHIFT) - 1;
 
 /// Encode one exact shape identity, saturating identities outside the range.
@@ -109,7 +112,7 @@ pub fn merge(left: u64, right: u64) -> u64 {
         std::mem::swap(&mut first, &mut second);
     }
     let count = u64::from(first != 0) + u64::from(second != 0);
-    (left | right) & NULLISH
+    (left | right) & SCALAR_BITS
         | (count << SHAPE_COUNT_SHIFT)
         | (first << FIRST_SHAPE_SHIFT)
         | (second << SECOND_SHAPE_SHIFT)
@@ -200,6 +203,9 @@ pub(super) fn seed(shape: ShapeHandle, count: usize, mut read: impl FnMut(u32) -
 }
 
 fn classify(value: Value) -> u64 {
+    if value.as_i32().is_some() {
+        return INT32;
+    }
     if value.is_undefined() {
         return UNDEFINED;
     }

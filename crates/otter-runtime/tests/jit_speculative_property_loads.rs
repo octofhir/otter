@@ -6,6 +6,8 @@
 //! - A receiver of another shape exits a bounded number of times, and the
 //!   function is compiled again by the optimizing tier and stops exiting.
 //! - An accessor installed over the slot runs its getter exactly once per read.
+//! - Retrained Template method inlines preserve own receiver accessors.
+//! - Callee retraining retains spliced callers until their own guards fail.
 //! - A loop that rewrites the receiver's shape keeps exact results.
 //! - A callee spliced into its caller exits at its own site.
 //! - Warm accessor and mapped-arguments sites without cache programs keep the
@@ -544,6 +546,44 @@ JSON.stringify([warmed, total, calls]);
 }
 
 #[test]
+fn retrained_template_method_inline_keeps_receiver_accessor_invocation() {
+    const SOURCE: &str = r#"
+function Descriptor() { this.field = 4; }
+Descriptor.prototype.read = function readField() { return this.field; };
+const descriptor = new Descriptor();
+function readDescriptor(cell, rounds) {
+    let total = 0;
+    for (let index = 0; index < rounds; index++) total += cell.read();
+    return total;
+}
+const results = [];
+results.push(readDescriptor(descriptor, 10000));
+Reflect.set(descriptor, "field", -1.75);
+results.push(readDescriptor(descriptor, 10000));
+Object.defineProperty(descriptor, "field", { value: 6, writable: true });
+results.push(readDescriptor(descriptor, 10000));
+let calls = 0;
+Object.defineProperty(descriptor, "field", {
+    configurable: true,
+    get: function fieldGetter() { calls++; return 9; }
+});
+results.push(readDescriptor(descriptor, 100000), calls);
+const getter = Object.getOwnPropertyDescriptor(descriptor, "field").get;
+JSON.stringify(results);
+"#;
+    let run = compare_with_entry_probes(
+        "",
+        SOURCE,
+        "[40000,-17500,60000,900000,100000]",
+        &[],
+        &[entry_probe("fieldGetter", "String(getter());", "9")],
+    );
+    run.assert_optimized("readDescriptor");
+    run.assert_optimized("fieldGetter");
+    run.assert_spliced("readDescriptor", "readField", None);
+}
+
+#[test]
 fn loop_rewriting_the_receiver_shape_keeps_exact_results() {
     const SOURCE: &str = r#"
 function churn(record, count) {
@@ -792,7 +832,7 @@ JSON.stringify([warmed, total]);
 }
 
 #[test]
-fn retraining_callee_invalidates_both_spliced_callers_without_stale_inline_entry() {
+fn retraining_callee_keeps_spliced_callers_until_their_own_guards_fail() {
     const SETUP: &str = r#"
 function leaf(record) { return record.value + 1; }
 function left(record) { return leaf(record) + arguments.length; }
@@ -808,7 +848,7 @@ const changed = { extra: 0, value: 5 };
 const first = leaf(changed);
 let total = 0;
 let retrained = 0;
-for (let call = 0; call < 2000; call++) {
+for (let call = 0; call < 10000; call++) {
     total += left(changed) + right(changed);
     retrained += leaf(changed);
 }
@@ -817,12 +857,15 @@ JSON.stringify([direct, warmed, first, total, retrained]);
     let run = compare_with_entry_probes(
         SETUP,
         SOURCE,
-        "[4000,14000,6,30000,12000]",
+        "[4000,14000,6,150000,60000]",
         &[
             entry_probe("left", "String(left(original));", "3"),
             entry_probe("right", "String(right(original));", "4"),
         ],
-        &[],
+        &[
+            entry_probe("left", "String(left(changed));", "7"),
+            entry_probe("right", "String(right(changed));", "8"),
+        ],
     );
     for caller in ["left", "right"] {
         run.assert_optimized(caller);
@@ -832,18 +875,32 @@ JSON.stringify([direct, warmed, first, total, retrained]);
             .find_map(|(name, id)| (name == caller).then_some(*id))
             .expect("caller warmup must enter its exact installed generation");
         run.assert_spliced(caller, "leaf", Some(generation));
-        assert!(
-            run.optimizing_exits(caller).is_empty(),
-            "invalidated inline callers must not enter stale shape guards: {:?}",
-            run.optimizing_exits(caller)
+        let exits = run.optimizing_exits(caller);
+        assert_eq!(
+            exits.len(),
+            1,
+            "each caller retrains only its failed guard: {exits:?}"
         );
+        assert_eq!(exits[0].1, ExitReason::ShapeGuard);
+        assert!(
+            matches!(&run.events[exits[0].0],
+                JitDebugEvent::EnteredGenerationDeopt { callee_code_object_id, .. }
+                    if *callee_code_object_id == generation
+            ),
+            "the retained caller generation must leave through its own guard"
+        );
+        run.assert_recompiled_after_last_exit(caller);
     }
     let exits = run.optimizing_exits("leaf");
     assert_eq!(exits.len(), 1, "the callee must retrain once: {exits:?}");
     assert_eq!(exits[0].1, ExitReason::ShapeGuard);
-    assert!(run.stats.jit_caller_invalidations >= 2, "{:?}", run.stats);
-    // Retraining ends after one interpreted path; the new shape then reaches
-    // generated code through re-optimized callers that splice `leaf` again.
+    assert_eq!(run.stats.jit_caller_invalidations, 0, "{:?}", run.stats);
+    for caller in ["left", "right"] {
+        assert!(run.optimizing_exits(caller)[0].0 > exits[0].0);
+    }
+    // The exact warmup generations leave only when their own guard fails,
+    // after the leaf already retrained. Their replacements splice updated
+    // leaf feedback and pass isolated native entry probes.
     let names = run.function_names();
     assert!(
         run.events[exits[0].0..].iter().any(|event| matches!(event,

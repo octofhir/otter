@@ -10,7 +10,7 @@
 //!   retained by the installed generation; no raw moving value crosses here.
 //! - The expected word contains VM-local shape identities, not cage offsets.
 //!   Target offsets are resolved separately and never truncated from identities.
-//! - Exact-identity counts and nullish bits occupy the low byte. Each widening
+//! - Exact-identity counts, int32 and nullish bits occupy the low byte. Each widening
 //!   changes it permanently in one owner's history, so comparing the captured
 //!   byte proves the complete word unchanged without a separate generation tag.
 //! - Nonempty load targets describe the entire bound: stable ordinary targets
@@ -20,6 +20,7 @@
 //!   proof and never describe the current value of a loaded field.
 //! - An empty load target list grants no result shape proof but retains the
 //!   store's defining-cell authority and each resolvable historical target.
+//!   An exact int32 word separately proves the stored numeric representation.
 //!
 //! # See also
 //! - [`crate::object::field_type`] owns observation and the scalar lattice.

@@ -8,6 +8,8 @@
 //! - An accessor installed over the slot runs its getter exactly once per read.
 //! - Retrained Template method inlines preserve own receiver accessors.
 //! - Callee retraining retains spliced callers until their own guards fail.
+//! - A source context stays constant across native sibling births and retires
+//!   when the same native factory receives a different lexical context.
 //! - Numeric field constants retire on a same-tag write and reload the payload.
 //! - A loop that rewrites the receiver's shape keeps exact results.
 //! - A callee spliced into its caller exits at its own site.
@@ -1040,4 +1042,61 @@ JSON.stringify([warmed, total]);
         "the sole final loop must actually enter replacement optimizing OSR: {:?}",
         run.stats
     );
+}
+
+#[test]
+fn one_source_context_survives_sibling_births_and_retires_for_a_second_context() {
+    const SOURCE: &str = r#"
+function makeSpawner(seed) {
+    return function spawnReader() {
+        return function readCaptured() { return seed + arguments.length; };
+    };
+}
+const spawnFirst = makeSpawner(7);
+const first = spawnFirst();
+let before = 0;
+for (let call = 0; call < 20000; call++) {
+    const sibling = spawnFirst();
+    before += sibling(1);
+}
+const spawnSecond = makeSpawner(11);
+const second = spawnSecond();
+let after = 0;
+for (let call = 0; call < 20000; call++) after += first(1) + second(1);
+JSON.stringify([before, after]);
+"#;
+    let run = compare_with_entry_probes(
+        "",
+        SOURCE,
+        "[160000,400000]",
+        &[],
+        &[
+            entry_probe("readCaptured", "String(first(1));", "8"),
+            entry_probe("spawnReader", "String(spawnSecond()(1));", "12"),
+        ],
+    );
+    run.assert_optimized("readCaptured");
+    run.assert_optimized("spawnReader");
+    let exits = run.optimizing_exits("readCaptured");
+    assert_eq!(exits.len(), 1, "one context change: {exits:?}");
+    assert_eq!(exits[0].1, ExitReason::DependencyChanged);
+    let constant = run
+        .optimized_ir
+        .iter()
+        .find_map(|((name, _), ir)| {
+            (name == "readCaptured" && ir.contains("ConstInt32(7)")).then_some(ir)
+        })
+        .expect("first source context must actually fold");
+    assert!(constant.contains("CheckDependencies"), "{constant}");
+    assert!(!constant.contains("LoadClosureContext"), "{constant}");
+    assert!(!constant.contains("CheckCellValue"), "{constant}");
+    let replacement = run
+        .entry_probes
+        .iter()
+        .find_map(|(name, generation)| (name == "readCaptured").then_some(*generation))
+        .expect("replacement current native generation");
+    let current = &run.optimized_ir[&("readCaptured".to_owned(), replacement)];
+    assert!(current.contains("LoadClosureContext"), "{current}");
+    assert!(!current.contains("ConstInt32(7)"), "{current}");
+    run.assert_recompiled_after_last_exit("readCaptured");
 }

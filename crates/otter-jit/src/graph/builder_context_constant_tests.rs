@@ -312,3 +312,38 @@ fn only_object_cells_bypass_sloppy_receiver_conversion() {
         }
     }
 }
+
+#[test]
+fn own_source_constants_use_a_dependency_without_a_context_identity_check() {
+    let mut view = body();
+    view.unique_closure_context = Some(0x6000);
+    let analysis = Rc::new(Analysis::build(&view).unwrap());
+    let built = build(
+        &view,
+        &analysis,
+        &BaselineSupport {
+            supported: vec![true; view.instructions.len()],
+        },
+        None,
+    )
+    .unwrap();
+    let kinds = placed(&built.graph);
+    assert!(kinds.contains(&&Kind::CheckClosureContext(METHOD_FID)));
+    assert!(kinds.contains(&&Kind::LoadCellValue(0x6000)));
+    assert!(
+        built
+            .graph
+            .nodes
+            .iter()
+            .any(|node| node.kind == Kind::ConstInt32(7))
+    );
+    assert!(!kinds.contains(&&Kind::LoadClosureContext));
+    assert!(
+        !kinds
+            .iter()
+            .any(|kind| matches!(kind, Kind::CheckCellValue(_)))
+    );
+    assert!(!kinds.contains(&&Kind::LoadTaggedField(
+        view.context_layout.slots_byte as i32 + 8
+    )));
+}

@@ -328,6 +328,21 @@ site followed by a recompile. Repeated identical `negativeZero` or
 `int32Overflow` bails at one site indicate a missing repair. The
 `arith-exit-repair` kernel pins this contract.
 
+Sources whose closures all share one lexical context can fold watched context
+slots in their own Graph bodies and inlines. `closureContextCell` relocations
+name the permanent collector-rewritten context word by source function id;
+`CheckDependencies` protects its use without comparing context identity at
+calls. Creating a closure over a second context fires those generations,
+releases the first context from the source fact, and permanently disables that
+specialization. Both native allocation encoders prove the birth context before
+carving: a first or different context takes the existing pre-effect allocating
+path, which observes the rewritten context before publishing the callable.
+Before a dynamic-code reclamation census, candidate sources also release their
+optimization-owned context roots and retire their dependent code, so an unused
+eval capture cannot pin its source chunk.
+Context-slot writes keep their independent watched-slot invalidation. Lexical
+`this` and `new.target` remain the actual bindings of each closure.
+
 Every `LoadString` site exposes a `stringConstantCell` relocation keyed by
 function id and byte PC. The process address is redacted. The cell is rooted,
 address-stable across cell-table growth, and rewritten in place by moving GC;

@@ -58,12 +58,12 @@ mod allocation_ops;
 mod argument_window;
 mod arguments_access;
 pub mod arguments_object;
-pub mod asm_stdlib;
 mod arithmetic_dispatch;
 pub mod array;
 mod array_ops;
 pub mod array_prototype;
 pub mod array_statics;
+pub mod asm_stdlib;
 mod async_ops;
 pub mod atomics;
 pub mod atomics_wait;
@@ -74,6 +74,7 @@ mod call_feedback;
 mod call_ops;
 pub mod closure;
 mod closure_construct;
+mod closure_contexts;
 pub mod code_dependencies;
 mod code_liveness;
 mod code_space;
@@ -158,9 +159,9 @@ mod jit_exception_ops;
 pub use feedback as jit_feedback;
 mod array_from_async;
 mod async_from_sync_iterator;
+mod conversion_protocol;
 mod forward_arguments;
 pub(crate) mod iteration_protocol;
-mod conversion_protocol;
 mod jit_call_admission;
 mod jit_forward_call;
 mod jit_global_ops;
@@ -234,12 +235,12 @@ pub mod snapshot;
 pub mod source_registry;
 mod static_call_ops;
 mod static_load_ops;
-mod template_objects;
 pub mod string;
 pub mod swar;
 pub mod symbol;
 pub mod symbol_dispatch;
 pub mod symbol_prototype;
+mod template_objects;
 pub mod temporal;
 pub mod tier_policy;
 pub mod timers;
@@ -303,15 +304,15 @@ pub use handles::{HandleArena, Local, ObjectLayout, PendingValue, PendingValues}
 pub use host_strings::{HostAtom, HostAtomId, HostAtomInterner};
 pub use intl::{IntlKind, IntlPayload, JsIntl};
 pub use jit::{
-    IntrinsicCallKind, JitArrayLayout, JitBodyGuard, JitCacheIrOp, JitCacheIrProgram, JitClosureCallLayout,
-    JitCodeGenerationSnapshot, JitCodeResidency, JitCollectionLayout, JitCompileError,
-    JitCompileRequest, JitCompileSnapshot, JitCompileStatus, JitCompilerHook, JitDirectCallKind,
-    JitDirectCallThisMode, JitDirectCallee, JitElementAccess, JitElementBase, JitElementFamily,
-    JitElementRepr, JitFunctionCallLookup, JitFunctionCode, JitFunctionPrototypeCall,
-    JitFunctionPrototypeCallSite, JitGuardWidth, JitGuardedMethodCall, JitGuardedReceiver,
-    JitInlineCallee, JitInlineMethod, JitInstructionMetadata, JitMapTableLayout, JitMethodHolder,
-    JitIntrinsicCallProof, JitNativeCall, JitParameterWidening, JitRuntimeStubBinding, JitStaticNativeCall,
-    JitStringLayout, VmRuntimeActivation,
+    IntrinsicCallKind, JitArrayLayout, JitBodyGuard, JitCacheIrOp, JitCacheIrProgram,
+    JitClosureCallLayout, JitCodeGenerationSnapshot, JitCodeResidency, JitCollectionLayout,
+    JitCompileError, JitCompileRequest, JitCompileSnapshot, JitCompileStatus, JitCompilerHook,
+    JitDirectCallKind, JitDirectCallThisMode, JitDirectCallee, JitElementAccess, JitElementBase,
+    JitElementFamily, JitElementRepr, JitFunctionCallLookup, JitFunctionCode,
+    JitFunctionPrototypeCall, JitFunctionPrototypeCallSite, JitGuardWidth, JitGuardedMethodCall,
+    JitGuardedReceiver, JitInlineCallee, JitInlineMethod, JitInstructionMetadata,
+    JitIntrinsicCallProof, JitMapTableLayout, JitMethodHolder, JitNativeCall, JitParameterWidening,
+    JitRuntimeStubBinding, JitStaticNativeCall, JitStringLayout, VmRuntimeActivation,
 };
 pub use jit_artifact::{
     JIT_ARTIFACT_BUNDLE_LIMIT, JIT_ARTIFACT_BYTE_LIMIT, JitArtifactBatch, JitArtifactBuildError,
@@ -1590,8 +1591,6 @@ impl Interpreter {
     pub(crate) fn json_root_pop_to(&mut self, idx: usize) {
         self.handle_arena.truncate(idx);
     }
-
-
 }
 
 impl otter_gc::ExtraRootSource for Interpreter {

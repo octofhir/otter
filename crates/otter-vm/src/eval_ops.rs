@@ -173,11 +173,17 @@ impl Interpreter {
 
     /// The SELF closure a compiled `<main>` runs as, over `context` (the
     /// caller's innermost context for a direct eval, `undefined` otherwise).
-    fn main_self_closure(&mut self, main_id: u32, context: Value) -> Result<Value, VmError> {
+    fn main_self_closure(
+        &mut self,
+        source: &ExecutionContext,
+        main_id: u32,
+        context: Value,
+    ) -> Result<Value, VmError> {
         // The context rides in the pending closure body.
         let closure =
             crate::closure::alloc_closure(&mut self.gc_heap, main_id, context, None, None)
                 .map_err(crate::oom_to_vm)?;
+        self.note_closure_context(source, closure);
         Ok(Value::closure(closure))
     }
 
@@ -212,7 +218,7 @@ impl Interpreter {
         // traced register only now.
         let caller_context = *read_register(&stack[top_idx], ctx_reg)?;
         crate::context_ops::context_operand(caller_context)?;
-        let self_value = self.main_self_closure(main.id, caller_context)?;
+        let self_value = self.main_self_closure(&context, main.id, caller_context)?;
         let entry_this = stack[top_idx].this_value;
         // §13.3.3 — `new.target` in the eval body reads the caller
         // frame's value (direct eval is contained in function code).
@@ -299,7 +305,7 @@ impl Interpreter {
             .link_evictable_module(module, sources)
             .map_err(|error| self.err_link(error))?;
         let main = context.exec_main();
-        let self_value = self.main_self_closure(main.id, Value::undefined())?;
+        let self_value = self.main_self_closure(&context, main.id, Value::undefined())?;
         // §19.2.1.3 — eval code evaluated at global scope (direct at
         // the top level or indirect) binds `this` to globalThis even
         // when the eval source itself is strict; only module code gets
@@ -483,7 +489,7 @@ impl Interpreter {
         // function value (the parenthesised expression is the program's
         // completion).
         let main = context.exec_main();
-        let self_value = self.main_self_closure(main.id, Value::undefined())?;
+        let self_value = self.main_self_closure(&context, main.id, Value::undefined())?;
         let floor = stack.floor();
         stack.push(crate::PreparedCall::for_code_block(
             main,
@@ -547,7 +553,7 @@ impl Interpreter {
         // function value (the parenthesised expression is the
         // program's completion).
         let main = context.exec_main();
-        let self_value = self.main_self_closure(main.id, Value::undefined())?;
+        let self_value = self.main_self_closure(&context, main.id, Value::undefined())?;
         let floor = stack.floor();
         stack.push(crate::PreparedCall::for_code_block(
             main,

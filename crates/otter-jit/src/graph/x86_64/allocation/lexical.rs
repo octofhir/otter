@@ -134,6 +134,7 @@ impl Codegen<'_> {
                 if let Some(&plan) = source.closure_allocations.get(&byte_pc) {
                     crate::x86_64::allocation::emit_closure(
                         &mut self.ops,
+                        &mut self.relocations,
                         source,
                         plan,
                         15,

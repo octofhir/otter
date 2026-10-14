@@ -94,6 +94,7 @@ fn prepare(view: &mut JitCompileSnapshot) {
                                 },
                         ) << 32),
                     arrow,
+                    context_cell: 0,
                 },
             );
         }

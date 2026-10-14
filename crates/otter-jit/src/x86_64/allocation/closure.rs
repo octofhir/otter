@@ -5,6 +5,8 @@
 //!
 //! # Invariants
 //! - The encoder never reads physical-frame lexical bindings.
+//! - Source context identity is proved before carving; a new identity enters
+//!   the common VM allocation owner and fires subscribers before publication.
 //! - All misses precede effects; every payload word precedes publication.
 //! - Only declared LAB temporaries change; the caller commits the result late.
 //!
@@ -14,8 +16,10 @@
 
 use super::*;
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn emit_closure(
     ops: &mut Assembler,
+    relocations: &mut crate::artifact::relocation::RelocationCapture,
     view: &JitCompileSnapshot,
     plan: JitClosureAllocationPlan,
     context: u8,
@@ -25,6 +29,24 @@ pub(crate) fn emit_closure(
 ) {
     validate_inputs(regs, &values);
     super::context::emit_context_guard(ops, view, values[0], regs, true, slow);
+    if plan.context_cell != 0 {
+        let accepted = ops.new_dynamic_label();
+        let target = crate::artifact::relocation::RelocationTarget::ClosureContextCell {
+            function_id: plan.call_word as u32,
+        };
+        crate::x86_64::values::emit_load_symbol_u64(
+            ops,
+            relocations,
+            regs.scratch,
+            plan.context_cell,
+            target,
+        );
+        dynasm!(ops ; .arch x64 ; mov Rq(regs.scratch), [Rq(regs.scratch)]);
+        crate::x86_64::values::emit_load_u64(ops, regs.buffer, VALUE_UNDEFINED);
+        dynasm!(ops ; .arch x64 ; cmp Rq(regs.scratch), Rq(regs.buffer) ; je =>accepted);
+        emit_value(ops, regs.buffer, values[0]);
+        dynasm!(ops ; .arch x64 ; cmp Rq(regs.scratch), Rq(regs.buffer) ; jne =>slow ; =>accepted);
+    }
     let layout = view.closure_call_layout;
     let base_bytes = JIT_CLOSURE_CELL_BYTES + if plan.arrow { 8 } else { 0 };
     crate::x86_64::values::emit_load_u64(ops, regs.size, u64::from(base_bytes));

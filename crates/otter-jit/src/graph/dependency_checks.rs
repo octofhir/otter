@@ -17,7 +17,8 @@
 //! - A fact can break only through a node that runs code or collects, a named
 //!   store (its transitions leave shapes and observe field summaries), an
 //!   own-field store that observes a summary, or a context-slot store whose
-//!   watch may fire. Everything else, including an interrupt poll, leaves
+//!   watch may fire, or a closure birth that can break source-context identity.
+//!   Everything else, including an interrupt poll, leaves
 //!   every fact as it was.
 //! - A block entered from outside the graph (function or OSR entry) or with
 //!   no predecessor starts unchecked; a join is checked only when every
@@ -55,7 +56,10 @@ fn breaks_facts(graph: &Graph, node: NodeId) -> bool {
 fn is_proof(kind: &Kind) -> bool {
     matches!(
         kind,
-        Kind::CheckStableShapes(_) | Kind::CheckFieldTypes(_) | Kind::CheckContextSlot { .. }
+        Kind::CheckStableShapes(_)
+            | Kind::CheckFieldTypes(_)
+            | Kind::CheckContextSlot { .. }
+            | Kind::CheckClosureContext(_)
     )
 }
 
@@ -118,6 +122,9 @@ pub(crate) fn place(
                             u64::from(guard.expected as u8),
                         )
                     }));
+                }
+                &Kind::CheckClosureContext(function_id) => {
+                    facts.insert((CodeDependencyKind::ClosureContext as u16, function_id, 0));
                 }
                 &Kind::CheckContextSlot { watch, slot } => {
                     facts.insert((
@@ -232,6 +239,9 @@ pub(crate) fn place(
                 }
                 kind if kind == CodeDependencyKind::ContextSlot as u16 => {
                     CodeDependencyKind::ContextSlot
+                }
+                kind if kind == CodeDependencyKind::ClosureContext as u16 => {
+                    CodeDependencyKind::ClosureContext
                 }
                 _ => CodeDependencyKind::PrototypeValidity,
             },
@@ -413,6 +423,34 @@ mod tests {
                 (CodeDependencyKind::ContextSlot, 5, 3),
             ]
         );
+    }
+
+    #[test]
+    fn a_closure_birth_reopens_the_source_context_fact_region() {
+        let mut graph = Graph::default();
+        let entry = graph.new_block();
+        append(&mut graph, entry, Kind::CheckClosureContext(7));
+        append(
+            &mut graph,
+            entry,
+            Kind::CheckContextSlot { watch: 5, slot: 2 },
+        );
+        append(&mut graph, entry, Kind::NewClosure);
+        append(&mut graph, entry, Kind::CheckClosureContext(7));
+        let dependencies = place(&mut graph, &view(), &[]);
+        assert_eq!(
+            kinds(&graph, entry),
+            [
+                &Kind::CheckDependencies,
+                &Kind::NewClosure,
+                &Kind::CheckDependencies,
+            ]
+        );
+        assert!(dependencies.contains(&CodeDependency {
+            kind: CodeDependencyKind::ClosureContext,
+            identity: 7,
+            expected: 0,
+        }));
     }
 
     #[test]

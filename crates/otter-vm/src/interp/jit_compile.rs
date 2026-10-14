@@ -613,12 +613,13 @@ impl Interpreter {
             fid,
             jit_debug::JitDebugTier::Optimizing,
         );
+        self.bake_unique_closure_context(&mut snapshot);
         self.bake_guarded_method_calls(&mut snapshot);
         self.bake_instanceof_cells(&mut snapshot);
         self.bake_forward_apply(&mut snapshot);
         self.bake_element_accesses(&mut snapshot);
         Self::bake_context_allocations(&mut snapshot);
-        Self::bake_closure_allocations(&mut snapshot, context);
+        self.bake_closure_allocations(&mut snapshot, context);
         self.bake_optimized_exit_profile(&mut snapshot, fid);
         self.bake_field_type_tree(&mut snapshot);
         // Every shape baked so far that no object has left yet: a value
@@ -1012,7 +1013,7 @@ impl Interpreter {
         self.bake_forward_apply(&mut view);
         self.bake_element_accesses(&mut view);
         Self::bake_context_allocations(&mut view);
-        Self::bake_closure_allocations(&mut view, context);
+        self.bake_closure_allocations(&mut view, context);
         self.bake_field_type_tree(&mut view);
         let target = osr_pc.map_or(jit_debug::JitDebugTarget::Entry, |pc| {
             jit_debug::JitDebugTarget::Osr { pc }
@@ -1443,6 +1444,7 @@ impl Interpreter {
     /// Plan inline closure allocation for every `MakeClosure` and
     /// `MakeFunction` site of this function. `context` owns the function.
     pub(crate) fn bake_closure_allocations(
+        &mut self,
         view: &mut jit::JitCompileSnapshot,
         context: &ExecutionContext,
     ) {
@@ -1485,6 +1487,9 @@ impl Interpreter {
                 jit::JitClosureAllocationPlan {
                     call_word: u64::from(function_id) | (u64::from(flags) << 32),
                     arrow,
+                    context_cell: owner.function(function_id).map_or(0, |function| {
+                        self.jit_code_registry.closure_contexts.prepare(function)
+                    }),
                 },
             );
         }
@@ -2479,7 +2484,10 @@ impl Interpreter {
             self.bake_forward_apply(&mut body);
             self.bake_element_accesses(&mut body);
             Self::bake_context_allocations(&mut body);
-            Self::bake_closure_allocations(&mut body, context);
+            self.bake_closure_allocations(&mut body, context);
+            if tier == jit_debug::JitDebugTier::Optimizing {
+                self.bake_unique_closure_context(&mut body);
+            }
             self.bake_optimized_exit_profile(&mut body, fid);
             Some(std::sync::Arc::new(body))
         })();
@@ -3211,9 +3219,13 @@ impl Interpreter {
         // A proven holder slot fixes the closure the body runs as, so the
         // body may read that closure's watched context slots as constants.
         if let Some(closure) = self.proven_method(target)
+            && let Some(context) = closure
+                .as_closure(&self.gc_heap)
+                .map(|closure| closure.context(&self.gc_heap))
             && let Some(body) = body.as_mut().and_then(std::sync::Arc::get_mut)
         {
-            body.closure_constants = self.bake_closure_constants(closure, &body.code_block);
+            body.closure_constants = self.bake_closure_constants(context, &body.code_block);
+            body.unique_closure_context = None;
         }
         Ok(jit::JitDirectMethod {
             target_index,
@@ -3227,7 +3239,22 @@ impl Interpreter {
         })
     }
 
-    /// The slots of `closure`'s context chain that `code` reads, each now
+    fn bake_unique_closure_context(&mut self, view: &mut jit::JitCompileSnapshot) {
+        let Some((cell, context)) = self
+            .jit_code_registry
+            .closure_contexts
+            .single(view.code_block.id)
+        else {
+            return;
+        };
+        let constants = self.bake_closure_constants(context, &view.code_block);
+        if !constants.is_empty() {
+            view.unique_closure_context = Some(cell);
+            view.closure_constants = constants;
+        }
+    }
+
+    /// The slots of `context`'s chain that `code` reads, each now
     /// watched, with the value it holds. A slot qualifies within the
     /// watchable range, never written since an earlier watch, at a
     /// coordinate the body itself never writes, and holding neither the
@@ -3235,14 +3262,11 @@ impl Interpreter {
     /// like one the body assigns, would only fire its watch.
     fn bake_closure_constants(
         &mut self,
-        closure: Value,
+        context: Value,
         code: &crate::executable::CodeBlock,
     ) -> Vec<jit::JitContextConstant> {
         use otter_bytecode::Op;
-        let Some(base) = closure
-            .as_closure(&self.gc_heap)
-            .and_then(|closure| closure.context(&self.gc_heap).as_context())
-        else {
+        let Some(base) = context.as_context() else {
             return Vec::new();
         };
         let mut seen: rustc_hash::FxHashSet<(u16, u16)> = code

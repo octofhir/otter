@@ -440,7 +440,8 @@ impl<'a> Codegen<'a> {
             Kind::CheckDependencies => self.emit_dependency_check(node),
             Kind::CheckStableShapes(_)
             | Kind::CheckFieldTypes(_)
-            | Kind::CheckContextSlot { .. } => {
+            | Kind::CheckContextSlot { .. }
+            | Kind::CheckClosureContext(_) => {
                 return Err(Unsupported::OperandShape(
                     "graph shape-fact proof outside a dependency test",
                 ));

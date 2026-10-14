@@ -66,6 +66,8 @@ pub enum CodeDependencyKind {
     /// Slot `expected` of the context whose watch has this identity keeps
     /// the value the compile read from it.
     ContextSlot = 6,
+    /// Every closure of source function `identity` has the same context.
+    ClosureContext = 7,
 }
 
 /// Explicit validity dependency owned by a code object.
@@ -91,6 +93,7 @@ impl CodeDependency {
                 | CodeDependencyKind::FieldType
                 | CodeDependencyKind::PrototypeValidity
                 | CodeDependencyKind::ContextSlot
+                | CodeDependencyKind::ClosureContext
         )
     }
 

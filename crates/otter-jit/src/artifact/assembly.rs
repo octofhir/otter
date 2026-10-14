@@ -502,6 +502,9 @@ fn symbolic_target(target: &RelocationTarget) -> String {
             "guardedHeapReference(component={},bytePc={byte_pc},runtimeStubId={runtime_stub_id})",
             heap_component_name(*component)
         ),
+        RelocationTarget::ClosureContextCell { function_id } => {
+            format!("closureContextCell(function={function_id})")
+        }
         RelocationTarget::FunctionEntryCell { function_id } => {
             format!("functionEntryCell(function={function_id})")
         }

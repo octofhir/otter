@@ -11,6 +11,7 @@
 //! - JIT-visible dense base/length caches plus allocation-free plain-slot
 //!   completion used after guarded native element misses.
 //! - Cached eligibility for present own dense slots with source-realm prototypes.
+//! - Allocation-free ordinary tail appends with one length/kind publication.
 //!
 //! # Invariants
 //!
@@ -39,11 +40,13 @@
 //! - [GC API](../../../docs/book/src/engine/gc-api.md)
 
 mod dense_guard;
+mod dense_push;
 pub(crate) mod elements;
 mod expando;
 mod indexed_snapshot;
 
 pub(crate) use dense_guard::element_family as dense_element_family;
+pub(crate) use dense_push::try_push_spare;
 pub(crate) use elements::DenseElementKind;
 pub(crate) use expando::{ArrayPropertyKey, classify_property_key, expando_object, own_indices};
 pub(crate) use indexed_snapshot::ArrayIndexedSnapshot;
@@ -282,24 +285,6 @@ impl ArrayBody {
             .set(u32::try_from(len).expect("dense length exceeds u32"));
         self.dense_kind.set(elements::kind_of(self.slab) as u8);
     }
-}
-
-/// Push one dense element. The slab must already have room — growth
-/// allocates, and a payload borrow has no heap to allocate from, so every
-/// caller reserves before it mutates.
-#[inline]
-fn body_elements_push(body: &mut ArrayBody, value: Value) {
-    let len = body.dense_len();
-    debug_assert!(
-        len < body.dense_capacity(),
-        "dense push without a reservation: len={len} cap={}",
-        body.dense_capacity(),
-    );
-    if len >= body.dense_capacity() {
-        return;
-    }
-    body.write_dense_value(len, value);
-    body.set_dense_len(len + 1);
 }
 
 /// Truncate dense elements, clearing the values that leave the live
@@ -1048,12 +1033,6 @@ pub fn len(arr: JsArray, heap: &otter_gc::GcHeap) -> usize {
     heap.read_payload(arr, |body| body.length)
 }
 
-/// Elements the dense buffer holds without growing (O(1)).
-#[must_use]
-pub(crate) fn dense_capacity(arr: JsArray, heap: &otter_gc::GcHeap) -> usize {
-    heap.read_payload(arr, |body| body.dense_capacity())
-}
-
 /// `true` for an empty array.
 #[must_use]
 pub fn is_empty(arr: JsArray, heap: &otter_gc::GcHeap) -> bool {
@@ -1277,9 +1256,9 @@ fn set_index_value(
         }
         body.refresh_element_cache();
         while body.dense_len() < idx {
-            body_elements_push(body, Value::hole());
+            body.push_dense(Value::hole());
         }
-        body_elements_push(body, value);
+        body.push_dense(value);
         body.length = body.length.max(target_len);
         body.mark_dirty();
     });
@@ -1349,9 +1328,9 @@ pub(crate) fn set_with_roots(
         }
         body.refresh_element_cache();
         while body.dense_len() < idx {
-            body_elements_push(body, Value::hole());
+            body.push_dense(Value::hole());
         }
-        body_elements_push(body, value);
+        body.push_dense(value);
         body.length = body.length.max(target_len);
         body.mark_dirty();
     });
@@ -1431,14 +1410,14 @@ pub(crate) fn fill_dense_range_with_roots(
     heap.with_payload(arr, |body| {
         body.refresh_element_cache();
         while body.dense_len() < start {
-            body_elements_push(body, Value::hole());
+            body.push_dense(Value::hole());
         }
         let existing_end = end.min(body.dense_len());
         for idx in start..existing_end {
             body.write_dense_value(idx, value);
         }
         while body.dense_len() < end {
-            body_elements_push(body, value);
+            body.push_dense(value);
         }
         body.length = body.length.max(end);
         body.mark_dirty();
@@ -1468,11 +1447,10 @@ pub fn push(
         &mut |_| {},
     )?;
     let new_len = heap.with_payload(arr, |body| {
-        body.refresh_element_cache();
         while body.dense_len() + 1 < target_len {
-            body_elements_push(body, Value::hole());
+            body.push_dense(Value::hole());
         }
-        body_elements_push(body, value);
+        body.push_dense(value);
         body.length = target_len;
         body.mark_dirty();
         body.length
@@ -1509,11 +1487,10 @@ pub(crate) fn push_with_roots(
         )?;
     }
     let new_len = heap.with_payload(arr, |body| {
-        body.refresh_element_cache();
         while body.dense_len() + 1 < target_len {
-            body_elements_push(body, Value::hole());
+            body.push_dense(Value::hole());
         }
-        body_elements_push(body, value);
+        body.push_dense(value);
         body.length = target_len;
         body.mark_dirty();
         body.length
@@ -1549,10 +1526,10 @@ pub(crate) fn extend_with_roots(
     heap.with_payload(arr, |body| {
         body.refresh_element_cache();
         while body.dense_len() < start {
-            body_elements_push(body, Value::hole());
+            body.push_dense(Value::hole());
         }
         for value in values {
-            body_elements_push(body, *value);
+            body.push_dense(*value);
         }
         body.length = target_len;
         body.mark_dirty();
@@ -1627,7 +1604,7 @@ pub fn set_length(
         if new_len <= MAX_DENSE_LENGTH_GROWTH {
             body.refresh_element_cache();
             while body.dense_len() < new_len {
-                body_elements_push(body, Value::hole());
+                body.push_dense(Value::hole());
             }
         }
         body.length = new_len;
@@ -2224,10 +2201,10 @@ pub(crate) fn append_plain_dense(
         heap.with_payload(dst, |body| {
             body.refresh_element_cache();
             while body.dense_len() < start {
-                body_elements_push(body, Value::hole());
+                body.push_dense(Value::hole());
             }
             for value in &chunk[..n] {
-                body_elements_push(body, *value);
+                body.push_dense(*value);
             }
         });
         for value in &chunk[..n] {
@@ -2274,7 +2251,7 @@ pub(crate) fn write_dense_range_with_roots(
     heap.with_payload(arr, |body| {
         body.refresh_element_cache();
         while body.dense_len() < start {
-            body_elements_push(body, Value::hole());
+            body.push_dense(Value::hole());
         }
         let existing_end = end.min(body.dense_len());
         for (index, value) in values
@@ -2286,7 +2263,7 @@ pub(crate) fn write_dense_range_with_roots(
             body.write_dense_value(start + index, value);
         }
         for value in &values[existing_end.saturating_sub(start)..] {
-            body_elements_push(body, *value);
+            body.push_dense(*value);
         }
         body.length = body.length.max(end);
         body.mark_dirty();

@@ -1,0 +1,883 @@
+{
+  "richards": {
+    "otter": 18277270979,
+    "node": 11559753905,
+    "ratio": 1.5811124639162464,
+    "delta_percent": -0.05319906092187132,
+    "wall": {
+      "otter_seconds": 0.960488458,
+      "node_seconds": 0.643843958,
+      "bun_seconds": 0.549674208,
+      "node_ratio": 1.4918031707303836,
+      "bun_ratio": 1.7473777085061994,
+      "parent_otter_seconds": 0.9830283340000001,
+      "delta_percent": -2.29290196634353,
+      "parent_node_seconds": 0.6481022080000001,
+      "parent_bun_seconds": 0.5447762500000001,
+      "node_control_delta_percent": -0.6570337128059878,
+      "bun_control_delta_percent": 0.899077006385629
+    }
+  },
+  "deltablue": {
+    "otter": 19822383180,
+    "node": 5590907366,
+    "ratio": 3.545468004092844,
+    "delta_percent": 0.03139668083660396,
+    "wall": {
+      "otter_seconds": 1.065695125,
+      "node_seconds": 0.29453033300000003,
+      "bun_seconds": 0.41518875000000005,
+      "node_ratio": 3.618286490716051,
+      "bun_ratio": 2.5667726425631714,
+      "parent_otter_seconds": 1.072654,
+      "delta_percent": -0.6487529995692909,
+      "parent_node_seconds": 0.291903833,
+      "parent_bun_seconds": 0.41962237500000005,
+      "node_control_delta_percent": 0.8997826349200544,
+      "bun_control_delta_percent": -1.0565749741061836
+    }
+  },
+  "crypto": {
+    "otter": 4556122448,
+    "node": 2918126968,
+    "ratio": 1.5613174128343823,
+    "delta_percent": -0.13934250908906876,
+    "wall": {
+      "otter_seconds": 0.241183,
+      "node_seconds": 0.157850458,
+      "bun_seconds": null,
+      "node_ratio": 1.5279208122411656,
+      "bun_ratio": null,
+      "parent_otter_seconds": 0.241768791,
+      "delta_percent": -0.24229388647603045,
+      "parent_node_seconds": 0.15902954200000002,
+      "parent_bun_seconds": null,
+      "node_control_delta_percent": -0.7414245084099047,
+      "bun_control_delta_percent": null
+    }
+  },
+  "raytrace": {
+    "otter": 17894908313,
+    "node": 8371358844,
+    "ratio": 2.1376348387963096,
+    "delta_percent": 0.18766177374345272,
+    "wall": {
+      "otter_seconds": 1.266580125,
+      "node_seconds": 0.5462602080000001,
+      "bun_seconds": 0.296212167,
+      "node_ratio": 2.318638821665736,
+      "bun_ratio": 4.275922011670776,
+      "parent_otter_seconds": 1.264181667,
+      "delta_percent": 0.18972415615643445,
+      "parent_node_seconds": 0.546860166,
+      "parent_bun_seconds": 0.308033167,
+      "node_control_delta_percent": -0.10970958158980082,
+      "bun_control_delta_percent": -3.8375737636070717
+    }
+  },
+  "earley-boyer": {
+    "otter": 29382463682,
+    "node": 18688380783,
+    "ratio": 1.5722316461321217,
+    "delta_percent": -0.38794819160343774,
+    "wall": {
+      "otter_seconds": 1.685175667,
+      "node_seconds": 1.068150375,
+      "bun_seconds": 1.136630708,
+      "node_ratio": 1.5776577029240848,
+      "bun_ratio": 1.4826061403577704,
+      "parent_otter_seconds": 1.7019275,
+      "delta_percent": -0.9842859346241295,
+      "parent_node_seconds": 1.07458725,
+      "parent_bun_seconds": 1.399044167,
+      "node_control_delta_percent": -0.5990090613861132,
+      "bun_control_delta_percent": -18.75662435752109
+    }
+  },
+  "regexp": {
+    "otter": 22829859982,
+    "node": 7302024402,
+    "ratio": 3.126511050243406,
+    "delta_percent": -0.09041109154244165,
+    "wall": {
+      "otter_seconds": 1.652846542,
+      "node_seconds": 0.42363425000000005,
+      "bun_seconds": 0.362760709,
+      "node_ratio": 3.9015885566381847,
+      "bun_ratio": 4.556299789346811,
+      "parent_otter_seconds": 1.657078583,
+      "delta_percent": -0.25539169013567564,
+      "parent_node_seconds": 0.422472875,
+      "parent_bun_seconds": 0.36264645900000003,
+      "node_control_delta_percent": 0.27489930566548804,
+      "bun_control_delta_percent": 0.031504512773961046
+    }
+  },
+  "splay": {
+    "otter": 10005677454,
+    "node": 4396614120,
+    "ratio": 2.2757688486884993,
+    "delta_percent": -0.2879846091888738,
+    "wall": {
+      "otter_seconds": 0.752858125,
+      "node_seconds": 0.323413667,
+      "bun_seconds": 0.201013291,
+      "node_ratio": 2.3278488258815604,
+      "bun_ratio": 3.745315154309871,
+      "parent_otter_seconds": 0.751594583,
+      "delta_percent": 0.16811483592078513,
+      "parent_node_seconds": 0.31885441600000003,
+      "parent_bun_seconds": 0.262743167,
+      "node_control_delta_percent": 1.429884853782304,
+      "bun_control_delta_percent": -23.494379208727434
+    }
+  },
+  "navier-stokes": {
+    "otter": 8083926793,
+    "node": 8095275899,
+    "ratio": 0.9985980581586599,
+    "delta_percent": 2.424257641430838,
+    "wall": {
+      "otter_seconds": 0.949277958,
+      "node_seconds": 0.716678292,
+      "bun_seconds": null,
+      "node_ratio": 1.3245524087954377,
+      "bun_ratio": null,
+      "parent_otter_seconds": 0.924692625,
+      "delta_percent": 2.6587573357146566,
+      "parent_node_seconds": 0.716440209,
+      "parent_bun_seconds": null,
+      "node_control_delta_percent": 0.03323138442108409,
+      "bun_control_delta_percent": null
+    }
+  },
+  "box2d": {
+    "otter": 12937772076,
+    "node": 5062573423,
+    "ratio": 2.555572234710086,
+    "delta_percent": -0.2110607261134434,
+    "wall": {
+      "otter_seconds": 0.9163485840000001,
+      "node_seconds": 0.33111091600000003,
+      "bun_seconds": 0.311588792,
+      "node_ratio": 2.7674973542702532,
+      "bun_ratio": 2.9408907108571483,
+      "parent_otter_seconds": 0.8645223750000001,
+      "delta_percent": 5.994779371673298,
+      "parent_node_seconds": 0.30796650000000003,
+      "parent_bun_seconds": 0.280225917,
+      "node_control_delta_percent": 7.515238183373851,
+      "bun_control_delta_percent": 11.191996563258645
+    }
+  },
+  "gbemu": {
+    "otter": 17277272246,
+    "node": 8221150072,
+    "ratio": 2.1015639046468437,
+    "delta_percent": -7.068603025040199,
+    "wall": {
+      "otter_seconds": 1.180593375,
+      "node_seconds": 0.48989758400000005,
+      "bun_seconds": null,
+      "node_ratio": 2.4098779286896828,
+      "bun_ratio": null,
+      "parent_otter_seconds": 1.25305025,
+      "delta_percent": -5.782439690666841,
+      "parent_node_seconds": 0.49313725,
+      "parent_bun_seconds": null,
+      "node_control_delta_percent": -0.656950169552184,
+      "bun_control_delta_percent": null
+    }
+  },
+  "mandreel": {
+    "otter": 19262803044,
+    "node": 13823039865,
+    "ratio": 1.3935287195961508,
+    "delta_percent": 0.19724342433828923,
+    "wall": {
+      "otter_seconds": 1.421375458,
+      "node_seconds": 0.703582417,
+      "bun_seconds": 0.5073367080000001,
+      "node_ratio": 2.020197525771881,
+      "bun_ratio": 2.801641268189093,
+      "parent_otter_seconds": 1.3197043750000002,
+      "delta_percent": 7.7040801656810265,
+      "parent_node_seconds": 0.70790275,
+      "parent_bun_seconds": 0.512732708,
+      "node_control_delta_percent": -0.6103003555219977,
+      "bun_control_delta_percent": -1.0524001913293057
+    }
+  },
+  "zlib": {
+    "otter": 24360360433,
+    "node": 24749906421,
+    "ratio": 0.9842607086518326,
+    "delta_percent": 0.09261725801485987,
+    "wall": {
+      "otter_seconds": 1.9547931250000001,
+      "node_seconds": 1.640932375,
+      "bun_seconds": null,
+      "node_ratio": 1.1912697651540942,
+      "bun_ratio": null,
+      "parent_otter_seconds": 1.9619625,
+      "delta_percent": -0.36541855412628443,
+      "parent_node_seconds": 1.641209458,
+      "parent_bun_seconds": null,
+      "node_control_delta_percent": -0.016882854205446662,
+      "bun_control_delta_percent": null
+    }
+  },
+  "ts": {
+    "otter": 36265887149,
+    "node": 20854641072,
+    "ratio": 1.738983999954406,
+    "delta_percent": 0.5097241027596233,
+    "wall": {
+      "otter_seconds": 3.434311583,
+      "node_seconds": 1.226405834,
+      "bun_seconds": 1.06236025,
+      "node_ratio": 2.8003059735934035,
+      "bun_ratio": 3.232718452144647,
+      "parent_otter_seconds": 3.4311501250000003,
+      "delta_percent": 0.09213989143070922,
+      "parent_node_seconds": 1.221333167,
+      "parent_bun_seconds": 1.052286542,
+      "node_control_delta_percent": 0.41533851180510784,
+      "bun_control_delta_percent": 0.9573160539384729
+    }
+  },
+  "geomean": {
+    "ratio": 1.8351429976998594,
+    "parent_ratio": 1.84234249381852,
+    "wall_node_ratio": 2.108821734532987,
+    "parent_wall_node_ratio": 2.11100450152271,
+    "wall_bun_ratio": 2.8629982300955192,
+    "parent_wall_bun_ratio": 2.706548051973105,
+    "wall_delta_percent": 0.4268279250632334,
+    "wall_comparison_scoreable": false,
+    "wall_node_fixture_count": 13,
+    "wall_bun_fixture_count": 9,
+    "bun_preexisting_failures": [
+      "crypto",
+      "navier-stokes",
+      "gbemu",
+      "zlib"
+    ]
+  },
+  "wall_quality": {
+    "status": "inconclusive",
+    "scoreable": false,
+    "baseline_eligible": false,
+    "criterion": "max absolute Node/Bun control drift <=5%, absolute Node control geomean drift <=2%",
+    "reference_control_min_delta_percent": -23.494379208727434,
+    "reference_control_max_delta_percent": 11.191996563258645,
+    "node_control_geomean_delta_percent": 0.5307761921394816
+  },
+  "push_micro": {
+    "status": "passed",
+    "stage": "final",
+    "binary_sha256": {
+      "parent": "5a9f645ba313ebd6b9278eee7eecb36c7323139a8c6f6ac065f3926caea4ead0",
+      "current": "03aa491cce7ef034238638ee5fd07526d87a2cddbde1132bccce67d740989fa7"
+    },
+    "cases": {
+      "numeric": {
+        "source": "const a = [1,2,3,4]; a.pop(); const value = 7;\nfunction pushLoop(a, value, count) { let total=0; for (let i=0;i<count;i++) { total += a.push(value); a.pop(); } return total; }\nfor (let i=0;i<20;i++) pushLoop(a, value, 10000);\nconsole.log(pushLoop(a, value, 20000000), a.length);\n",
+        "source_sha256": "5aeb3ae38f75c5c5146b72f9d53f4e1ce95d37059e1d3090fca8ee3529efa9ec",
+        "rounds": [
+          {
+            "parent": {
+              "median_seconds": 1.66426125,
+              "samples_seconds": [
+                1.6625042090000002,
+                1.668662291,
+                1.66426125,
+                1.661548583,
+                1.665405625
+              ]
+            },
+            "current": {
+              "median_seconds": 1.63277175,
+              "samples_seconds": [
+                1.63277175,
+                1.6561426250000002,
+                1.627380541,
+                1.627921541,
+                1.636548958
+              ]
+            },
+            "wall_delta_percent": -1.8921007744427065
+          },
+          {
+            "current": {
+              "median_seconds": 1.7377116670000001,
+              "samples_seconds": [
+                1.639215792,
+                1.724608292,
+                1.903044208,
+                1.7377116670000001,
+                1.967495208
+              ]
+            },
+            "parent": {
+              "median_seconds": 1.698160792,
+              "samples_seconds": [
+                1.784200958,
+                1.7297550830000001,
+                1.698160792,
+                1.665226417,
+                1.6690082080000002
+              ]
+            },
+            "wall_delta_percent": 2.329041819027
+          },
+          {
+            "parent": {
+              "median_seconds": 1.662831541,
+              "samples_seconds": [
+                1.663390625,
+                1.65921525,
+                1.664725,
+                1.662831541,
+                1.662525375
+              ]
+            },
+            "current": {
+              "median_seconds": 1.563732,
+              "samples_seconds": [
+                1.5659379580000001,
+                1.563732,
+                1.565315042,
+                1.5625564170000001,
+                1.55687
+              ]
+            },
+            "wall_delta_percent": -5.9596861471850175
+          }
+        ],
+        "parent_instructions": 30305065621,
+        "current_instructions": 28865544049,
+        "matches_node": true,
+        "instruction_delta_percent": -4.75010214464765,
+        "wall_quality": {
+          "status": "inconclusive",
+          "scoreable": false,
+          "baseline_eligible": false,
+          "reason": "Alternating repeated wall deltas cross zero; no established improvement"
+        }
+      },
+      "tagged": {
+        "source": "const a = [1,2,3,{}]; a.pop(); const value = ({marker:7});\nfunction pushLoop(a, value, count) { let total=0; for (let i=0;i<count;i++) { total += a.push(value); a.pop(); } return total; }\nfor (let i=0;i<20;i++) pushLoop(a, value, 10000);\nconsole.log(pushLoop(a, value, 20000000), a.length);\n",
+        "source_sha256": "3d0058f3f59c08357c5889652cc539e433f283daffacd50f6f7e27f47860f974",
+        "rounds": [
+          {
+            "parent": {
+              "median_seconds": 0.142217,
+              "samples_seconds": [
+                0.152043375,
+                0.142217,
+                0.141569667,
+                0.142244916,
+                0.141783541
+              ]
+            },
+            "current": {
+              "median_seconds": 0.14151216600000002,
+              "samples_seconds": [
+                0.14151216600000002,
+                0.146104584,
+                0.144943458,
+                0.1411395,
+                0.141489208
+              ]
+            },
+            "wall_delta_percent": -0.4956046042315476
+          },
+          {
+            "current": {
+              "median_seconds": 0.141525209,
+              "samples_seconds": [
+                0.1417995,
+                0.14100025000000002,
+                0.1415905,
+                0.141525209,
+                0.140328916
+              ]
+            },
+            "parent": {
+              "median_seconds": 0.141988583,
+              "samples_seconds": [
+                0.142429958,
+                0.14417458300000002,
+                0.141668333,
+                0.14146962500000002,
+                0.141988583
+              ]
+            },
+            "wall_delta_percent": -0.3263459569844307
+          },
+          {
+            "parent": {
+              "median_seconds": 0.14101875,
+              "samples_seconds": [
+                0.140754334,
+                0.14101875,
+                0.141387541,
+                0.140428291,
+                0.14116583300000002
+              ]
+            },
+            "current": {
+              "median_seconds": 0.14214895800000002,
+              "samples_seconds": [
+                0.14214895800000002,
+                0.14633141700000002,
+                0.142728125,
+                0.141094208,
+                0.141588667
+              ]
+            },
+            "wall_delta_percent": 0.801459380401548
+          }
+        ],
+        "parent_instructions": 2952399054,
+        "current_instructions": 2949318676,
+        "matches_node": true,
+        "instruction_delta_percent": -0.10433474417446131,
+        "wall_quality": {
+          "status": "inconclusive",
+          "scoreable": false,
+          "baseline_eligible": false,
+          "reason": "Alternating repeated wall deltas cross zero; no established improvement"
+        }
+      },
+      "indexed": {
+        "source": "const a = [1,2,3,4]; a.pop(); const value = 7;\nfunction pushLoop(a, value, count) { let total=0; for (let i=0;i<count;i++) { total += (a[a.length] = value, a.length); a.pop(); } return total; }\nfor (let i=0;i<20;i++) pushLoop(a, value, 10000);\nconsole.log(pushLoop(a, value, 20000000), a.length);\n",
+        "source_sha256": "191db7fff60cc71ee35ae35c5bf45b02701f540ad9562a6a7a835a842f3187ba",
+        "rounds": [
+          {
+            "parent": {
+              "median_seconds": 1.06177825,
+              "samples_seconds": [
+                1.061687875,
+                1.06177825,
+                1.057498459,
+                1.073852166,
+                1.062936833
+              ]
+            },
+            "current": {
+              "median_seconds": 0.8057645830000001,
+              "samples_seconds": [
+                0.808290583,
+                0.8024024580000001,
+                0.801,
+                0.810968875,
+                0.8057645830000001
+              ]
+            },
+            "wall_delta_percent": -24.11178294526186
+          },
+          {
+            "current": {
+              "median_seconds": 0.806138,
+              "samples_seconds": [
+                0.807172875,
+                0.8003595840000001,
+                0.81019775,
+                0.806138,
+                0.804930416
+              ]
+            },
+            "parent": {
+              "median_seconds": 1.059809292,
+              "samples_seconds": [
+                1.067496667,
+                1.053982,
+                1.059809292,
+                1.06206875,
+                1.05961875
+              ]
+            },
+            "wall_delta_percent": -23.935560285689583
+          },
+          {
+            "parent": {
+              "median_seconds": 1.064486167,
+              "samples_seconds": [
+                1.056612917,
+                1.057456291,
+                1.065621833,
+                1.065285375,
+                1.064486167
+              ]
+            },
+            "current": {
+              "median_seconds": 0.80585925,
+              "samples_seconds": [
+                0.804426041,
+                0.8108195420000001,
+                0.80585925,
+                0.814269291,
+                0.805198458
+              ]
+            },
+            "wall_delta_percent": -24.29593967659328
+          }
+        ],
+        "parent_instructions": 20972702889,
+        "current_instructions": 17070481757,
+        "matches_node": true,
+        "instruction_delta_percent": -18.606190878938555
+      }
+    }
+  },
+  "references": {
+    "node": "v24.16.0",
+    "bun": "1.4.3"
+  },
+  "gbemu_repeat": {
+    "status": "passed",
+    "source": "benchmarks/fixtures/fixed-work/gbemu.js",
+    "source_sha256": "f48b2b2b56d80a73f49691909629f522a27703606b9b3e8cf4f5d0df933906f5",
+    "binary_sha256": {
+      "parent": "5a9f645ba313ebd6b9278eee7eecb36c7323139a8c6f6ac065f3926caea4ead0",
+      "current": "03aa491cce7ef034238638ee5fd07526d87a2cddbde1132bccce67d740989fa7"
+    },
+    "rounds": [
+      {
+        "parent": {
+          "median_seconds": 1.25825725,
+          "samples_seconds": [
+            1.25825725,
+            1.256468875,
+            1.303835291,
+            1.247290584,
+            1.265160125
+          ]
+        },
+        "current": {
+          "median_seconds": 1.179414,
+          "samples_seconds": [
+            1.156492375,
+            1.195472,
+            1.18679725,
+            1.179414,
+            1.160844833
+          ]
+        },
+        "node": {
+          "median_seconds": 0.487116125,
+          "samples_seconds": [
+            0.49166237500000004,
+            0.487116125,
+            0.49997300000000006,
+            0.482375959,
+            0.47436116700000003
+          ]
+        },
+        "wall_delta_percent": -6.266067610578041
+      },
+      {
+        "node": {
+          "median_seconds": 0.477357458,
+          "samples_seconds": [
+            0.476378083,
+            0.480121,
+            0.47479225,
+            0.477357458,
+            0.481232667
+          ]
+        },
+        "current": {
+          "median_seconds": 1.1831903750000001,
+          "samples_seconds": [
+            1.191707625,
+            1.178538,
+            1.152657958,
+            1.198038333,
+            1.1831903750000001
+          ]
+        },
+        "parent": {
+          "median_seconds": 1.260599083,
+          "samples_seconds": [
+            1.258486083,
+            1.265973,
+            1.260599083,
+            1.232237875,
+            1.275131875
+          ]
+        },
+        "wall_delta_percent": -6.140628614117427
+      },
+      {
+        "parent": {
+          "median_seconds": 1.27476375,
+          "samples_seconds": [
+            1.3012435,
+            1.24298275,
+            1.241684542,
+            1.284118708,
+            1.27476375
+          ]
+        },
+        "current": {
+          "median_seconds": 1.182978917,
+          "samples_seconds": [
+            1.197319542,
+            1.182978917,
+            1.20799375,
+            1.157938417,
+            1.154133708
+          ]
+        },
+        "node": {
+          "median_seconds": 0.487387,
+          "samples_seconds": [
+            0.49467029100000004,
+            0.487387,
+            0.47755270800000005,
+            0.48395654200000005,
+            0.494985375
+          ]
+        },
+        "wall_delta_percent": -7.200144575808654
+      }
+    ],
+    "matches_node": true,
+    "node_control_spread_percent": 2.1010548451512845,
+    "comparison_quality": {
+      "status": "local_observation",
+      "scoreable": true,
+      "baseline_eligible": false,
+      "criterion": "Node median spread across three alternating rounds <=5%"
+    }
+  },
+  "wide_regression_rechecks": {
+    "box2d": {
+      "status": "passed",
+      "source": "benchmarks/fixtures/fixed-work/box2d.js",
+      "source_sha256": "5fe03ec493d188fa2ef6749cf70de906abd37ff14292755b59e820c2530ebd84",
+      "binary_sha256": {
+        "parent": "5a9f645ba313ebd6b9278eee7eecb36c7323139a8c6f6ac065f3926caea4ead0",
+        "current": "03aa491cce7ef034238638ee5fd07526d87a2cddbde1132bccce67d740989fa7"
+      },
+      "rounds": [
+        {
+          "parent": {
+            "median_seconds": 0.8855664590000001,
+            "samples_seconds": [
+              0.868552375,
+              1.1269895,
+              1.00127525,
+              0.8855664590000001,
+              0.85990275
+            ]
+          },
+          "current": {
+            "median_seconds": 0.879075708,
+            "samples_seconds": [
+              0.8772050410000001,
+              0.8945924580000001,
+              0.910931625,
+              0.879075708,
+              0.8789374590000001
+            ]
+          },
+          "node": {
+            "median_seconds": 0.320738625,
+            "samples_seconds": [
+              0.320359167,
+              0.32512195800000004,
+              0.317118875,
+              0.320738625,
+              0.323017
+            ]
+          },
+          "wall_delta_percent": -0.7329490558314
+        },
+        {
+          "node": {
+            "median_seconds": 0.346378042,
+            "samples_seconds": [
+              0.319779083,
+              0.432860666,
+              0.520927875,
+              0.346378042,
+              0.31986891700000003
+            ]
+          },
+          "current": {
+            "median_seconds": 0.9059187500000001,
+            "samples_seconds": [
+              0.9142547910000001,
+              0.893133625,
+              0.912343875,
+              0.9059187500000001,
+              0.877476875
+            ]
+          },
+          "parent": {
+            "median_seconds": 0.8879276660000001,
+            "samples_seconds": [
+              0.8841277080000001,
+              0.8774237090000001,
+              0.9133803330000001,
+              0.8879276660000001,
+              0.890104541
+            ]
+          },
+          "wall_delta_percent": 2.0261880205904026
+        },
+        {
+          "parent": {
+            "median_seconds": 0.8892973750000001,
+            "samples_seconds": [
+              0.888660042,
+              0.8892973750000001,
+              0.8880681250000001,
+              0.910887458,
+              0.8913131660000001
+            ]
+          },
+          "current": {
+            "median_seconds": 0.89278725,
+            "samples_seconds": [
+              0.8756282910000001,
+              0.915926584,
+              0.89934325,
+              0.89278725,
+              0.879865125
+            ]
+          },
+          "node": {
+            "median_seconds": 0.31194675,
+            "samples_seconds": [
+              0.31194675,
+              0.31025108300000004,
+              0.310779417,
+              0.314617125,
+              0.315736
+            ]
+          },
+          "wall_delta_percent": 0.39243059724538565
+        }
+      ],
+      "matches_node": true,
+      "node_control_spread_percent": 11.037554326179077
+    },
+    "mandreel": {
+      "status": "passed",
+      "source": "benchmarks/fixtures/fixed-work/mandreel.js",
+      "source_sha256": "85bbfb1676b651e83b48f3ae5d63c4e9d869e6386ecbe3447243036e1af31fa7",
+      "binary_sha256": {
+        "parent": "5a9f645ba313ebd6b9278eee7eecb36c7323139a8c6f6ac065f3926caea4ead0",
+        "current": "03aa491cce7ef034238638ee5fd07526d87a2cddbde1132bccce67d740989fa7"
+      },
+      "rounds": [
+        {
+          "parent": {
+            "median_seconds": 1.266721584,
+            "samples_seconds": [
+              1.280273292,
+              1.266721584,
+              1.245111584,
+              1.238946083,
+              1.267694083
+            ]
+          },
+          "current": {
+            "median_seconds": 1.233643167,
+            "samples_seconds": [
+              1.233643167,
+              1.231030708,
+              1.230272125,
+              1.237638416,
+              1.23760125
+            ]
+          },
+          "node": {
+            "median_seconds": 0.7024771670000001,
+            "samples_seconds": [
+              0.698009041,
+              0.704219959,
+              0.698790959,
+              0.7039968750000001,
+              0.7024771670000001
+            ]
+          },
+          "wall_delta_percent": -2.6113407569440916
+        },
+        {
+          "node": {
+            "median_seconds": 0.701745917,
+            "samples_seconds": [
+              0.701745917,
+              0.6978293750000001,
+              0.7021622500000001,
+              0.6992971250000001,
+              0.710309458
+            ]
+          },
+          "current": {
+            "median_seconds": 1.237976208,
+            "samples_seconds": [
+              1.239206291,
+              1.237976208,
+              1.234494459,
+              1.236489625,
+              1.241959917
+            ]
+          },
+          "parent": {
+            "median_seconds": 1.237486875,
+            "samples_seconds": [
+              1.237470042,
+              1.243408584,
+              1.237486875,
+              1.239390666,
+              1.231214958
+            ]
+          },
+          "wall_delta_percent": 0.03954247999600202
+        },
+        {
+          "parent": {
+            "median_seconds": 1.233730708,
+            "samples_seconds": [
+              1.234472917,
+              1.243539666,
+              1.228090833,
+              1.2302794160000001,
+              1.233730708
+            ]
+          },
+          "current": {
+            "median_seconds": 1.235062625,
+            "samples_seconds": [
+              1.225071917,
+              1.235062625,
+              1.233651708,
+              1.249183584,
+              1.2376268750000001
+            ]
+          },
+          "node": {
+            "median_seconds": 0.699447416,
+            "samples_seconds": [
+              0.699447416,
+              0.701187334,
+              0.6951379590000001,
+              0.695039625,
+              0.7142072500000001
+            ]
+          },
+          "wall_delta_percent": 0.1079584865127714
+        }
+      ],
+      "matches_node": true,
+      "node_control_spread_percent": 0.4331635131811007
+    }
+  }
+}

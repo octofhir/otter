@@ -11,6 +11,7 @@
 //! - Own stores select their receiver's defining field owner after the write;
 //!   membership misses use a noncollecting leaf preserving live registers.
 //! - Every frame word uses the root Codegen's canonical home geometry.
+//! - Array body proofs skip receiver guards, never the full-width length guard.
 //!
 //! # See also
 //! - `crate::x86_64::fields` owns physical field and prototype geometry.
@@ -199,13 +200,16 @@ impl Codegen<'_> {
             Kind::NoteContextWrite(slot) => {
                 self.emit_note_context_write(node, Self::gp(input(0)), slot);
             }
-            Kind::LoadArrayLength => {
+            Kind::LoadArrayLength { array_proved } => {
                 let (receiver, destination) = (Self::gp(input(0)), output());
                 let exit = self.eager_exit(node, crate::graph::ir::DeoptReason::WrongShape);
                 let storage = otter_vm::jit::JitArrayStorage::current();
-                self.emit_cell_guard(receiver, exit);
+                if !array_proved {
+                    self.emit_cell_guard(receiver, exit);
+                    dynasm!(self.ops ; .arch x64
+                        ; cmp BYTE [Rq(receiver)], storage.type_tag as i8 ; jne =>exit);
+                }
                 dynasm!(self.ops ; .arch x64
-                    ; cmp BYTE [Rq(receiver)], storage.type_tag as i8 ; jne =>exit
                     ; mov r10, [Rq(receiver) + storage.logical_length_byte as i32]
                     ; mov r11, r10 ; shr r11, 31 ; jnz =>exit
                     ; mov Rd(destination), r10d);

@@ -9,6 +9,8 @@
 //!   assignments in [`super::moves`].
 //! - Source-owned global binding reads with eager guards shared with Template.
 //! - Named loads through selected source-program indices and live shape proofs.
+//! - Array lengths skip receiver guards only with an immutable body proof;
+//!   every length retains its full-width int32-range guard.
 //! - Defining field-summary observation after own stores and shape publication.
 //! - Non-converting nullish comparisons preserve shape and field facts.
 //! - Node emitters for frame, arithmetic, conversion, check, memory, generic
@@ -1886,19 +1888,24 @@ impl<'a> Codegen<'a> {
                 let double = allocation.fp_temps[0];
                 self.emit_load_keyed_cached(node, [receiver, key], temps, double, destination)?;
             }
-            Kind::LoadArrayLength => {
+            Kind::LoadArrayLength { array_proved } => {
                 let receiver = Self::gp(input(0));
                 let destination = Self::gp(result.expect("a result"));
                 let exit = self.eager_exit(node, DeoptReason::WrongShape);
                 let storage = otter_vm::jit::JitArrayStorage::current();
+                if !array_proved {
+                    dynasm!(self.ops
+                        ; .arch aarch64
+                        ; tst X(receiver), #0xfffe_0000_0000_0007
+                        ; b.ne =>exit
+                        ; cbz X(receiver), =>exit
+                        ; ldrb w16, [X(receiver)]
+                        ; cmp w16, u32::from(storage.type_tag)
+                        ; b.ne =>exit
+                    );
+                }
                 dynasm!(self.ops
                     ; .arch aarch64
-                    ; tst X(receiver), #0xfffe_0000_0000_0007
-                    ; b.ne =>exit
-                    ; cbz X(receiver), =>exit
-                    ; ldrb w16, [X(receiver)]
-                    ; cmp w16, u32::from(storage.type_tag)
-                    ; b.ne =>exit
                     ; ldr x16, [X(receiver), storage.logical_length_byte]
                     ; lsr x17, x16, #31
                     ; cbnz x17, =>exit

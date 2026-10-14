@@ -4,6 +4,7 @@
 //! - Fixed intrinsic forms remove call/window nodes after an identity guard.
 //! - Unsupported forms and refused proofs retain native-kind linkage.
 //! - Ignored actuals and nested inline sources survive eager reconstruction.
+//! - Admitted Array births prove length receivers without feedback.
 //!
 //! # Invariants
 //! Synthetic cell addresses describe graph geometry and are never dereferenced.
@@ -149,6 +150,49 @@ fn admitted_forms_remove_activation_and_window_operations() {
             .iter()
             .any(|node| node.kind == Kind::CheckCellValue(32))
     );
+}
+
+#[test]
+fn intrinsic_array_births_remove_the_first_length_receiver_guard() {
+    for (construct, argc) in [(false, 0), (true, 0), (false, 1), (true, 1)] {
+        let mut operands = vec![
+            Operand::Register(2),
+            Operand::Register(0),
+            Operand::ConstIndex(argc),
+        ];
+        if argc == 1 {
+            operands.push(Operand::Register(1));
+        }
+        let mut view = snapshot(
+            90,
+            2,
+            4,
+            vec![
+                (if construct { Op::New } else { Op::Call }, operands),
+                (
+                    Op::LoadProperty,
+                    vec![
+                        Operand::Register(3),
+                        Operand::Register(2),
+                        Operand::ConstIndex(0),
+                    ],
+                ),
+                (Op::ReturnValue, vec![Operand::Register(3)]),
+            ],
+        );
+        prove(&mut view, IntrinsicCallKind::Array);
+        view.instructions[1].load_array_length = true;
+        let built = graph(&view);
+        let length = built
+            .graph
+            .nodes
+            .iter()
+            .find(|node| matches!(node.kind, Kind::LoadArrayLength { .. }))
+            .unwrap();
+        assert_eq!(length.kind, Kind::LoadArrayLength { array_proved: true });
+        let state = built.graph.frame_state(length.eager.unwrap());
+        assert_eq!((state.function_id, state.pc), (90, 1));
+    }
 }
 
 #[test]

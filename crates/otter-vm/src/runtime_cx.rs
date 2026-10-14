@@ -2927,9 +2927,10 @@ impl<'scope, 'rt> NativeScope<'scope, 'rt> {
     /// Store a string-keyed property through the rooted object path.
     ///
     /// Ordinary objects and Array bodies keep the direct scoped store and a
-    /// native function its own property bag. A branded Array prototype and
-    /// every other receiver kind (RegExp,
-    /// functions, collections, Proxies, ...) performs the canonical
+    /// native function its own property bag. Array `length` uses canonical
+    /// assignment with its range and writability rules. A branded Array
+    /// prototype and every other receiver kind (RegExp, functions, collections,
+    /// Proxies, ...) performs the canonical
     /// `Set(receiver, key, value, true)` under the active execution context.
     pub fn set(
         &mut self,
@@ -2941,6 +2942,7 @@ impl<'scope, 'rt> NativeScope<'scope, 'rt> {
         if receiver
             .as_object()
             .is_some_and(|object| self.ctx.cx.interp.is_array_prototype_object(object))
+            || receiver.as_array().is_some() && key == "length"
         {
             return self.ctx.set_value_property(receiver, key, self.raw(value));
         }
@@ -2985,6 +2987,7 @@ impl<'scope, 'rt> NativeScope<'scope, 'rt> {
             .raw(object)
             .as_object()
             .is_some_and(|object| self.ctx.cx.interp.is_array_prototype_object(object))
+            || self.raw(object).as_array().is_some() && atom.as_str() == "length"
         {
             return self.set(object, atom.as_str(), value);
         }

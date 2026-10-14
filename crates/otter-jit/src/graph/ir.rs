@@ -490,8 +490,11 @@ pub(crate) enum Kind {
     /// function value.
     LoadClosureContext,
     /// The `length` of the Array input0 as an int32. Eager deopt when input0
-    /// is not an Array or its length exceeds the int32 range.
-    LoadArrayLength,
+    /// is not an Array or its length exceeds the int32 range. A physical
+    /// body proof skips only the receiver check, never the length-range check.
+    LoadArrayLength {
+        array_proved: bool,
+    },
     /// The live element count of a proved indexed receiver input0, as a
     /// `Word`.
     LoadElementsLength {
@@ -856,7 +859,7 @@ impl Kind {
             | Self::CheckElementPresent
             | Self::CheckHoleyElementPresent(_)
             | Self::LoadHoleyFloat64Element(_)
-            | Self::LoadArrayLength => eager,
+            | Self::LoadArrayLength { .. } => eager,
             // A derived constructor changes its physical this binding at
             // super(); lexical capture must read the current binding here.
             Self::LoadThis => Properties {
@@ -1259,7 +1262,7 @@ impl Kind {
             | Self::LoadElementsLength { .. }
             | Self::LoadElementsBase { .. }
             | Self::LoadReceiverShape
-            | Self::LoadArrayLength
+            | Self::LoadArrayLength { .. }
             | Self::BooleanToInt32 => simple(1, ResultPolicy::Register),
             Self::CheckedTaggedToFloat64 | Self::Float64ToTagged | Self::CheckedTaggedToIndex => {
                 Constraints {

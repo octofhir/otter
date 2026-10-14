@@ -120,7 +120,10 @@ impl Interpreter {
         }
         let mut shapes = smallvec::SmallVec::new();
         let mut stored_shapes = smallvec::SmallVec::new();
-        if expected != 0 && expected != field_type::TOP {
+        if expected != 0
+            && expected != field_type::TOP
+            && field_type::int32_constant(expected).is_none()
+        {
             let mut complete_stable_bound = expected & field_type::INT32 == 0;
             for shift in [
                 field_type::FIRST_SHAPE_SHIFT,
@@ -319,7 +322,7 @@ mod tests {
                 count.guard.owner_shape,
                 field_type::owner(receiver_shape, 1).unwrap().offset()
             );
-            assert_eq!(count.guard.expected, field_type::INT32);
+            assert_eq!(count.guard.expected, field_type::int32_sample(7));
             assert!(count.shapes.is_empty() && count.stored_shapes.is_empty());
 
             interpreter

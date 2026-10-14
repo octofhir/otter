@@ -7,7 +7,7 @@
 //! - Store selection forms each native store's one observation record.
 //!
 //! # Invariants
-//! - Owner summaries authorize value categories, not a field's current value.
+//! - Owner summaries authorize category unions or an exact Int32 constant.
 //! - Exact target shapes require a live stability check before layout use.
 //! - Owner guards stay at their source loads and survive only when consumed.
 //! - Nullable bounds never enter ordinary layout facts before refinement.
@@ -32,6 +32,13 @@ const UNDEFINED: u8 = field_type::UNDEFINED as u8;
 const NULL: u8 = field_type::NULL as u8;
 const NULLISH: u8 = UNDEFINED | NULL;
 const TOP: u64 = field_type::TOP;
+
+/// A numeric field's exact value, or its unboxed payload, behind owner guards.
+#[derive(Debug, Clone, Copy)]
+pub(super) enum FieldInt32 {
+    Constant(i32),
+    Payload,
+}
 
 /// A value bound whose exact ordinary targets are contingent on stability.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -152,25 +159,36 @@ impl Builder<'_> {
 
     /// Every receiver's defining cell contains only int32-tagged values.
     /// Demand the owner proof before the load replaces its tagged value.
-    pub(super) fn field_load_is_int32(&mut self, receivers: &[u32], field: FieldLocation) -> bool {
+    pub(super) fn field_load_int32(
+        &mut self,
+        receivers: &[u32],
+        field: FieldLocation,
+    ) -> Option<FieldInt32> {
         if receivers.is_empty() {
-            return false;
+            return None;
         }
         let mut guards = SmallVec::new();
+        let mut constant = None;
+        let mut all_constant = true;
         for &receiver in receivers {
-            let Some(record) = self.view.field_types.get(&(receiver, field)) else {
-                return false;
-            };
-            if record.guard.expected != field_type::INT32 {
-                return false;
+            let record = self.view.field_types.get(&(receiver, field))?;
+            if !field_type::is_int32_only(record.guard.expected) {
+                return None;
             }
+            let value = field_type::int32_constant(record.guard.expected);
+            all_constant &= value.is_some() && constant.is_none_or(|old| Some(old) == value);
+            constant = constant.or(value);
             if !guards.contains(&record.guard) {
                 guards.push(record.guard);
             }
         }
         let proofs = self.guard_field_owners(guards);
         self.required_field_guards.extend(proofs);
-        true
+        Some(if all_constant {
+            FieldInt32::Constant(constant.expect("every owner has the same constant"))
+        } else {
+            FieldInt32::Payload
+        })
     }
 
     fn guard_field_owners(
@@ -334,6 +352,7 @@ impl Builder<'_> {
                 shapes: rhs.shapes.clone(),
                 nullish: rhs.nullish,
                 int32: false,
+                int32_constant: None,
             })
         });
         let mut owners: SmallVec<[(u32, FieldStoreOwner); 4]> = SmallVec::new();
@@ -408,6 +427,7 @@ impl Builder<'_> {
                 shapes: SmallVec::new(),
                 nullish: 0,
                 int32: true,
+                int32_constant: self.store_int32_constant(value),
             });
         }
         if let Some(shapes) = self
@@ -421,6 +441,7 @@ impl Builder<'_> {
                 shapes: shapes.iter().copied().collect(),
                 nullish: 0,
                 int32: false,
+                int32_constant: None,
             });
         }
         match self.graph.node(value).kind {
@@ -429,6 +450,7 @@ impl Builder<'_> {
                     shapes: SmallVec::new(),
                     nullish: UNDEFINED,
                     int32: false,
+                    int32_constant: None,
                 });
             }
             Kind::ConstTagged(bits) if bits == tag::VALUE_NULL => {
@@ -436,6 +458,7 @@ impl Builder<'_> {
                     shapes: SmallVec::new(),
                     nullish: NULL,
                     int32: false,
+                    int32_constant: None,
                 });
             }
             _ => {}
@@ -453,7 +476,18 @@ impl Builder<'_> {
             shapes: bound.shapes.clone(),
             nullish: bound.nullish,
             int32: false,
+            int32_constant: None,
         })
+    }
+
+    fn store_int32_constant(&self, value: NodeId) -> Option<i32> {
+        let node = self.graph.node(value);
+        match node.kind {
+            Kind::ConstInt32(value) => Some(value),
+            Kind::ConstTagged(bits) => otter_vm::Value::from_bits(bits).as_i32(),
+            Kind::Int32ToTagged => self.int32_constant(node.inputs[0]),
+            _ => None,
+        }
     }
 
     pub(super) fn refine_field_branch(&mut self, kind: BranchKind, inputs: &[NodeId], truth: bool) {

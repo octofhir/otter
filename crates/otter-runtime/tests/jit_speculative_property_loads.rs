@@ -8,6 +8,7 @@
 //! - An accessor installed over the slot runs its getter exactly once per read.
 //! - Retrained Template method inlines preserve own receiver accessors.
 //! - Callee retraining retains spliced callers until their own guards fail.
+//! - Numeric field constants retire on a same-tag write and reload the payload.
 //! - A loop that rewrites the receiver's shape keeps exact results.
 //! - A callee spliced into its caller exits at its own site.
 //! - Warm accessor and mapped-arguments sites without cache programs keep the
@@ -33,8 +34,8 @@ use std::sync::{Arc, Mutex};
 
 use otter_bytecode::Op;
 use otter_runtime::{
-    JitDebugCompileOutcome, JitDebugEvent, JitDebugRequest, JitDebugTier, JitSelection, Runtime,
-    RuntimeExecutionStats, SourceInput,
+    JitArtifactFileName, JitDebugCompileOutcome, JitDebugEvent, JitDebugRequest, JitDebugTier,
+    JitSelection, Runtime, RuntimeExecutionStats, SourceInput,
     inspect::{StepEvent, StepTracer},
 };
 use otter_vm::native_abi::ExitReason;
@@ -75,6 +76,8 @@ struct Run {
     events: Vec<JitDebugEvent>,
     /// Functions owning at least one optimizing-tier artifact bundle.
     optimized: Vec<String>,
+    /// Owned optimizing IR keyed by the source function and exact generation.
+    optimized_ir: BTreeMap<(String, u64), String>,
     /// Exact installed generations entered by isolated probes, including
     /// copies of warmup-generation identities that may retire in the run.
     entry_probes: Vec<(String, u64)>,
@@ -280,6 +283,23 @@ fn run_fixture(
         &mut entry_probes,
     );
     let reports = setup_result.iter().chain(std::iter::once(&result));
+    let optimized_ir = reports
+        .clone()
+        .filter_map(|result| result.jit_artifacts())
+        .flat_map(|artifacts| artifacts.bundles())
+        .filter_map(|bundle| {
+            let ir = bundle.file(JitArtifactFileName::OptimizedIr)?;
+            Some((
+                (
+                    bundle.manifest().function_name().to_owned(),
+                    bundle.manifest().code_object_id(),
+                ),
+                std::str::from_utf8(ir.contents())
+                    .expect("owned optimizing IR")
+                    .to_owned(),
+            ))
+        })
+        .collect();
     let optimized = reports
         .filter_map(|result| result.jit_artifacts())
         .flat_map(|artifacts| {
@@ -295,6 +315,7 @@ fn run_fixture(
         stats,
         events,
         optimized,
+        optimized_ir,
         entry_probes,
         osr_entries_after_setup: (!setup.is_empty()).then_some(
             stats
@@ -556,6 +577,7 @@ function readDescriptor(cell, rounds) {
     for (let index = 0; index < rounds; index++) total += cell.read();
     return total;
 }
+
 const results = [];
 results.push(readDescriptor(descriptor, 10000));
 Reflect.set(descriptor, "field", -1.75);
@@ -581,6 +603,67 @@ JSON.stringify(results);
     run.assert_optimized("readDescriptor");
     run.assert_optimized("fieldGetter");
     run.assert_spliced("readDescriptor", "readField", None);
+}
+
+#[test]
+fn constant_integer_fields_retire_on_a_different_integer_without_a_tag_change() {
+    const SOURCE: &str = r#"
+const direction = { FORWARD: 1 };
+function readDirection(value) { return value.FORWARD + arguments.length; }
+let before = 0;
+for (let index = 0; index < 20000; index++) before += readDirection(direction);
+direction.FORWARD = 1;
+for (let index = 0; index < 12000; index++) before += readDirection(direction);
+direction.FORWARD = 2;
+let after = 0;
+for (let index = 0; index < 20000; index++) after += readDirection(direction);
+JSON.stringify([before, after]);
+"#;
+    let run = compare_with_entry_probes(
+        "",
+        SOURCE,
+        "[64000,60000]",
+        &[],
+        &[entry_probe(
+            "readDirection",
+            "String(readDirection(direction));",
+            "3",
+        )],
+    );
+    run.assert_optimized("readDirection");
+    let exits = run.optimizing_exits("readDirection");
+    assert_eq!(
+        exits.len(),
+        1,
+        "only the unequal write retires constness: {exits:?}"
+    );
+    assert_eq!(exits[0].1, ExitReason::DependencyChanged);
+    let generation = match &run.events[exits[0].0] {
+        JitDebugEvent::EnteredGenerationDeopt {
+            callee_code_object_id,
+            ..
+        } => *callee_code_object_id,
+        event => panic!("constant generation must actually exit: {event:?}"),
+    };
+    let original = &run.optimized_ir[&("readDirection".to_owned(), generation)];
+    assert!(original.contains("ConstInt32(1)"), "{original}");
+    assert!(
+        !original.contains("LoadOwnField"),
+        "the constant has no storage read: {original}"
+    );
+    assert!(original.contains("CheckDependencies"), "{original}");
+    let replacement = run
+        .entry_probes
+        .iter()
+        .find_map(|(name, generation)| (name == "readDirection").then_some(*generation))
+        .expect("replacement must pass its isolated native entry probe");
+    assert_ne!(replacement, generation);
+    let current = &run.optimized_ir[&("readDirection".to_owned(), replacement)];
+    assert!(
+        current.contains("LoadOwnField"),
+        "widened owner uses its payload: {current}"
+    );
+    run.assert_recompiled_after_last_exit("readDirection");
 }
 
 #[test]

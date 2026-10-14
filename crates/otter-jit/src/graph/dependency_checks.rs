@@ -290,6 +290,7 @@ mod tests {
                     stored_shapes: SmallVec::new(),
                     nullish_mask: 0,
                     int32: false,
+                    int32_constant: None,
                 }
             )],
         }

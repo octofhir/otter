@@ -2949,12 +2949,18 @@ impl<'a> Builder<'a> {
             self.write(instruction.writes[0], value);
             return;
         }
-        let int32 = self.field_load_is_int32(&access.shapes, access.field);
-        let bound = (!int32)
+        let int32 = self.field_load_int32(&access.shapes, access.field);
+        let bound = int32
+            .is_none()
             .then(|| self.field_load_bound(&access.shapes, access.field))
             .flatten();
-        let repr = if int32 { Repr::Int32 } else { Repr::Tagged };
-        let value = self.add(Kind::LoadOwnField(access.field), &[object], repr);
+        let value = match int32 {
+            Some(field_type::FieldInt32::Constant(value)) => self.constant_int32(value),
+            Some(field_type::FieldInt32::Payload) => {
+                self.add(Kind::LoadOwnField(access.field), &[object], Repr::Int32)
+            }
+            None => self.add(Kind::LoadOwnField(access.field), &[object], Repr::Tagged),
+        };
         if let Some(bound) = bound {
             self.known.field_values.insert(value, bound);
         }

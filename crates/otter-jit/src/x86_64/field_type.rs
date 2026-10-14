@@ -2,7 +2,7 @@
 //!
 //! # Contents
 //! - Captured historical targets bypass observation for unchanged membership.
-//! - Inline Top, int32 and exact-shape membership probes with scalar widening.
+//! - Inline Top, exact Int32 and category membership with scalar widening.
 //! - A cold noncollecting VM leaf through the platform C boundary, also for
 //!   every widening of a summary code subscribed to.
 //!
@@ -13,6 +13,8 @@
 //! - Rooted captured shapes already belong to the monotone owner word, even
 //!   after losing stability. Their offsets prove only current RHS membership,
 //!   never the shape of a value read from a field.
+//! - Constant payloads never participate in shape membership. Any unequal
+//!   observation permanently replaces the constant with a category union.
 //! - The owner temporary is consumed; the RHS and other registers survive.
 //! - Only r10/r11 and flags are scratch on a hit. Cold calls save every
 //!   volatile GP and scalar FP register without a collecting root recipe.
@@ -25,7 +27,7 @@
 
 use dynasmrt::{DynasmApi, DynasmLabelApi, dynasm, x64::Assembler};
 use otter_vm::object::field_type::{
-    FIRST_SHAPE_SHIFT, INT32, NULL, SECOND_SHAPE_SHIFT, SHAPE_MASK, TOP, UNDEFINED,
+    CONST_INT32, FIRST_SHAPE_SHIFT, INT32, NULL, SECOND_SHAPE_SHIFT, SHAPE_MASK, TOP, UNDEFINED,
 };
 use otter_vm::value::tag;
 use otter_vm::{JitCompileSnapshot, native_abi as abi, object::ShapeState};
@@ -77,7 +79,13 @@ pub(crate) fn emit_observe_known(
     if record.int32 {
         dynasm!(ops ; .arch x64
             ; mov r10, Rq(value) ; sar r10, tag::NUMBER_TAG.trailing_zeros() as i8
-            ; cmp r10, -1 ; je =>done);
+            ; cmp r10, -1);
+        if let Some(constant) = record.int32_constant {
+            dynasm!(ops ; .arch x64
+                ; jne =>fallback ; cmp Rd(value), constant ; je =>done);
+        } else {
+            dynasm!(ops ; .arch x64 ; je =>done);
+        }
     }
     if nullish_mask == NULL | UNDEFINED {
         dynasm!(ops ; .arch x64
@@ -114,6 +122,11 @@ pub(crate) fn emit_observe(
     let null = ops.new_dynamic_label();
     let undefined = ops.new_dynamic_label();
     let int32 = ops.new_dynamic_label();
+    let int32_constant = ops.new_dynamic_label();
+    let int32_union = ops.new_dynamic_label();
+    let int32_store = ops.new_dynamic_label();
+    let null_union = ops.new_dynamic_label();
+    let undefined_union = ops.new_dynamic_label();
     let slow = ops.new_dynamic_label();
     dynasm!(ops ; .arch x64 ; test Rd(owner), Rd(owner) ; jz =>done);
     emit_load_symbol_u64(
@@ -129,6 +142,7 @@ pub(crate) fn emit_observe(
     emit_load_u64(ops, 10, 0xfffe_0000_0000_0007);
     dynasm!(ops ; .arch x64
         ; test Rq(value), r10 ; jnz =>scalar ; test Rq(value), Rq(value) ; jz =>top
+        ; test BYTE [Rq(owner) + view.shape_field_type_byte as i32], CONST_INT32 as i8 ; jnz =>slow
         ; cmp BYTE [Rq(value)], OBJECT_BODY_TYPE_TAG as i8 ; jne =>top
         ; mov r10d, [Rq(value) + view.object_shape_byte as i32] ; test r10d, r10d ; jz =>top);
     emit_load_u64(ops, 11, 0xffff_ffff_0000_0000);
@@ -155,16 +169,35 @@ pub(crate) fn emit_observe(
         ; cmp Rq(value), r10 ; je =>undefined ; jmp =>top
         ; =>null ; test BYTE [Rq(owner) + view.shape_field_type_byte as i32], NULL as i8 ; jnz =>done
         ; test BYTE [Rq(owner) + view.shape_watched_byte as i32], WATCHED ; jnz =>slow
-        ; mov r11, [Rq(owner) + view.shape_field_type_byte as i32] ; or r11, NULL as i32
+        ; mov r11, [Rq(owner) + view.shape_field_type_byte as i32]
+        ; test r11b, CONST_INT32 as i8 ; jz =>null_union
+        ; mov r11, INT32 as i32
+        ; =>null_union ; or r11, NULL as i32
         ; mov [Rq(owner) + view.shape_field_type_byte as i32], r11 ; jmp =>done
         ; =>undefined ; test BYTE [Rq(owner) + view.shape_field_type_byte as i32], UNDEFINED as i8 ; jnz =>done
         ; test BYTE [Rq(owner) + view.shape_watched_byte as i32], WATCHED ; jnz =>slow
-        ; mov r11, [Rq(owner) + view.shape_field_type_byte as i32] ; or r11, UNDEFINED as i32
+        ; mov r11, [Rq(owner) + view.shape_field_type_byte as i32]
+        ; test r11b, CONST_INT32 as i8 ; jz =>undefined_union
+        ; mov r11, INT32 as i32
+        ; =>undefined_union ; or r11, UNDEFINED as i32
         ; mov [Rq(owner) + view.shape_field_type_byte as i32], r11 ; jmp =>done
-        ; =>int32 ; test BYTE [Rq(owner) + view.shape_field_type_byte as i32], INT32 as i8 ; jnz =>done
+        ; =>int32
+        ; test BYTE [Rq(owner) + view.shape_field_type_byte as i32], CONST_INT32 as i8 ; jnz =>int32_constant
+        ; test BYTE [Rq(owner) + view.shape_field_type_byte as i32], INT32 as i8 ; jnz =>done
         ; test BYTE [Rq(owner) + view.shape_watched_byte as i32], WATCHED ; jnz =>slow
-        ; mov r11, [Rq(owner) + view.shape_field_type_byte as i32] ; or r11, INT32 as i32
+        ; mov r11, [Rq(owner) + view.shape_field_type_byte as i32]
+        ; test r11, r11 ; jnz =>int32_union
+        ; mov r11d, Rd(value) ; shl r11, FIRST_SHAPE_SHIFT as i8
+        ; or r11, (INT32 | CONST_INT32) as i32 ; jmp =>int32_store
+        ; =>int32_union ; or r11, INT32 as i32
+        ; =>int32_store
         ; mov [Rq(owner) + view.shape_field_type_byte as i32], r11 ; jmp =>done
+        ; =>int32_constant
+        ; mov r11, [Rq(owner) + view.shape_field_type_byte as i32]
+        ; shr r11, FIRST_SHAPE_SHIFT as i8
+        ; cmp r11d, Rd(value) ; je =>done
+        ; test BYTE [Rq(owner) + view.shape_watched_byte as i32], WATCHED ; jnz =>slow
+        ; mov QWORD [Rq(owner) + view.shape_field_type_byte as i32], INT32 as i32 ; jmp =>done
         ; =>top
         ; test BYTE [Rq(owner) + view.shape_watched_byte as i32], WATCHED ; jnz =>slow
         ; mov QWORD [Rq(owner) + view.shape_field_type_byte as i32], TOP as i32 ; jmp =>done

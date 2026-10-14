@@ -2,7 +2,7 @@
 //!
 //! # Contents
 //! - Captured historical targets bypass observation for unchanged membership.
-//! - Inline Top, int32 and exact-shape membership probes with scalar widening.
+//! - Inline Top, exact Int32 and category membership with scalar widening.
 //! - A cold noncollecting VM leaf that monotonically widens the owner word,
 //!   and every widening of a summary code subscribed to.
 //!
@@ -14,6 +14,8 @@
 //! - Captured targets are rooted ordinary shapes whose identities already
 //!   belong to the monotone owner word. They need not remain stable: the probe
 //!   compares the RHS's current shape and never infers a loaded value's shape.
+//! - A constant payload never participates in shape membership; an unequal
+//!   observation permanently replaces it with a category union.
 //! - The boxed RHS and all other registers survive the observer. Only x16/x17
 //!   are scratch; the cold leaf saves volatile GP/FP registers and the link.
 //! - One VM thread owns widening. Scalar stores match relaxed atomic writes;
@@ -25,7 +27,7 @@
 
 use dynasmrt::{DynasmApi, DynasmLabelApi, aarch64::Assembler, dynasm};
 use otter_vm::object::field_type::{
-    FIRST_SHAPE_SHIFT, INT32, NULL, SECOND_SHAPE_SHIFT, SHAPE_MASK, TOP, UNDEFINED,
+    CONST_INT32, FIRST_SHAPE_SHIFT, INT32, NULL, SECOND_SHAPE_SHIFT, SHAPE_MASK, TOP, UNDEFINED,
 };
 use otter_vm::value::tag;
 use otter_vm::{JitCompileSnapshot, native_abi as abi, object::ShapeState};
@@ -77,7 +79,14 @@ pub(crate) fn emit_observe_known(
     if record.int32 {
         dynasm!(ops ; .arch aarch64
             ; asr x16, X(value), tag::NUMBER_TAG.trailing_zeros()
-            ; cmn x16, 1 ; b.eq =>done);
+            ; cmn x16, 1);
+        if let Some(constant) = record.int32_constant {
+            dynasm!(ops ; .arch aarch64 ; b.ne =>fallback);
+            emit_load_u64(ops, 17, u64::from(constant as u32));
+            dynasm!(ops ; .arch aarch64 ; cmp W(value), w17 ; b.eq =>done);
+        } else {
+            dynasm!(ops ; .arch aarch64 ; b.eq =>done);
+        }
     }
     if nullish_mask == NULL | UNDEFINED {
         dynasm!(ops ; .arch aarch64
@@ -114,6 +123,11 @@ pub(crate) fn emit_observe(
     let null = ops.new_dynamic_label();
     let undefined = ops.new_dynamic_label();
     let int32 = ops.new_dynamic_label();
+    let int32_category = ops.new_dynamic_label();
+    let int32_union = ops.new_dynamic_label();
+    let int32_store = ops.new_dynamic_label();
+    let null_union = ops.new_dynamic_label();
+    let undefined_union = ops.new_dynamic_label();
     let slow = ops.new_dynamic_label();
     dynasm!(ops ; .arch aarch64 ; cbz W(owner), =>done);
     emit_load_symbol_u64(
@@ -129,6 +143,7 @@ pub(crate) fn emit_observe(
         ; tbnz x17, TOP.trailing_zeros(), =>done);
     dynasm!(ops ; .arch aarch64
         ; tst X(value), #0xfffe_0000_0000_0007 ; b.ne =>scalar ; cbz X(value), =>top
+        ; tbnz x17, CONST_INT32.trailing_zeros(), =>slow
         ; ldrb w16, [X(value)] ; cmp w16, OBJECT_BODY_TYPE_TAG ; b.ne =>top
         ; ldr w16, [X(value), view.object_shape_byte] ; cbz w16, =>top
         ; and x17, X(value), #0xffff_ffff_0000_0000 ; add x16, x17, x16
@@ -154,15 +169,32 @@ pub(crate) fn emit_observe(
         ; cmp X(value), x16 ; b.eq =>undefined ; b =>top
         ; =>null ; tbnz x17, NULL.trailing_zeros(), =>done
         ; ldrb w16, [X(owner), view.shape_watched_byte] ; tbnz w16, WATCHED, =>slow
+        ; tbz x17, CONST_INT32.trailing_zeros(), =>null_union
+        ; mov x17, INT32
+        ; =>null_union
         ; orr x17, x17, NULL
         ; str x17, [X(owner), view.shape_field_type_byte] ; b =>done
         ; =>undefined ; tbnz x17, UNDEFINED.trailing_zeros(), =>done
         ; ldrb w16, [X(owner), view.shape_watched_byte] ; tbnz w16, WATCHED, =>slow
+        ; tbz x17, CONST_INT32.trailing_zeros(), =>undefined_union
+        ; mov x17, INT32
+        ; =>undefined_union
         ; orr x17, x17, UNDEFINED
         ; str x17, [X(owner), view.shape_field_type_byte] ; b =>done
-        ; =>int32 ; tbnz x17, INT32.trailing_zeros(), =>done
+        ; =>int32 ; tbz x17, CONST_INT32.trailing_zeros(), =>int32_category
+        ; ubfx x16, x17, FIRST_SHAPE_SHIFT, 32
+        ; cmp W(value), w16 ; b.eq =>done
         ; ldrb w16, [X(owner), view.shape_watched_byte] ; tbnz w16, WATCHED, =>slow
+        ; mov x17, INT32 ; b =>int32_store
+        ; =>int32_category ; tbnz x17, INT32.trailing_zeros(), =>done
+        ; ldrb w16, [X(owner), view.shape_watched_byte] ; tbnz w16, WATCHED, =>slow
+        ; cbnz x17, =>int32_union
+        ; ubfx x17, X(value), 0, 32
+        ; lsl x17, x17, FIRST_SHAPE_SHIFT
+        ; orr x17, x17, INT32 | CONST_INT32 ; b =>int32_store
+        ; =>int32_union
         ; orr x17, x17, INT32
+        ; =>int32_store
         ; str x17, [X(owner), view.shape_field_type_byte] ; b =>done
         ; =>top
         ; ldrb w16, [X(owner), view.shape_watched_byte] ; tbnz w16, WATCHED, =>slow);

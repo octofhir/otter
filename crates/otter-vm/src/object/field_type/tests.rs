@@ -1,7 +1,7 @@
 //! Field-summary publication through births, mutations and relocation.
 //!
 //! # Contents
-//! - Canonical packed unions saturate without losing nullish observations.
+//! - Exact Int32 values irreversibly widen into canonical packed unions.
 //! - Low-byte comparisons identify unchanged words within monotone histories.
 //! - Defining shapes share summaries across append descendants.
 //! - Independent lineages and native scoped writes observe live values.
@@ -102,6 +102,9 @@ fn malformed_counts_and_identity_order_saturate() {
         two | (3 << FIRST_SHAPE_SHIFT) | (3 << SECOND_SHAPE_SHIFT),
         TOP | NULL,
         1 << 5,
+        CONST_INT32 | NULL,
+        int32_sample(3) | NULL,
+        int32_sample(3) | (1 << 40),
     ] {
         assert!(!is_canonical(malformed));
         assert_eq!(merge(malformed, NULL), TOP);
@@ -114,6 +117,9 @@ fn malformed_counts_and_identity_order_saturate() {
         NULL | UNDEFINED,
         INT32,
         INT32 | NULL | UNDEFINED,
+        int32_sample(0),
+        int32_sample(i32::MIN),
+        int32_sample(i32::MAX),
         shape_id_sample(3),
         TOP,
     ] {
@@ -128,6 +134,10 @@ fn low_byte_equality_identifies_the_full_word_within_one_history() {
         NULL,
         UNDEFINED,
         INT32,
+        int32_sample(0),
+        int32_sample(-7),
+        int32_sample(i32::MIN),
+        int32_sample(i32::MAX),
         shape_id_sample(7),
         shape_id_sample(3),
         shape_id_sample(11),
@@ -146,7 +156,7 @@ fn low_byte_equality_identifies_the_full_word_within_one_history() {
             }
         }
     }
-    assert_eq!(states.len(), 57);
+    assert_eq!(states.len(), 61);
     for captured in states {
         let mut history = vec![captured];
         let mut cursor = 0;
@@ -167,6 +177,28 @@ fn low_byte_equality_identifies_the_full_word_within_one_history() {
             }
         }
     }
+}
+
+#[test]
+fn constant_int32_values_widen_once_without_confusing_shape_payloads() {
+    for value in [0, 7, -7, i32::MIN, i32::MAX] {
+        let exact = int32_sample(value);
+        assert!(is_canonical(exact));
+        assert_eq!(int32_constant(exact), Some(value));
+        assert!(is_int32_only(exact));
+        assert_eq!(merge(0, exact), exact);
+        assert_eq!(merge(exact, exact), exact);
+        assert_eq!(merge(exact, int32_sample(value.wrapping_add(1))), INT32);
+        assert_eq!(merge(INT32, exact), INT32);
+        assert_eq!(merge(exact, NULL), INT32 | NULL);
+        assert_eq!(merge(UNDEFINED, exact), INT32 | UNDEFINED);
+        assert_eq!(merge(exact, shape_id_sample(7)), INT32 | shape_id_sample(7));
+        assert_eq!(merge(shape_id_sample(7), exact), INT32 | shape_id_sample(7));
+        assert_ne!(exact as u8, INT32 as u8);
+    }
+    assert_eq!(int32_constant(INT32), None);
+    assert_eq!(int32_constant(shape_id_sample(7)), None);
+    assert!(!is_int32_only(INT32 | NULL));
 }
 
 #[test]

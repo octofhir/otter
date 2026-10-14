@@ -13,6 +13,8 @@
 //!   is the absorbing Top, carries owner zero and emits no observation.
 //! - A nonzero owner keeps both captured and live membership: the live word
 //!   may have grown after the generation captured it.
+//! - An exact Int32 owner admits only its captured value. After constness
+//!   collapses, every Int32 value belongs to its permanent category union.
 //! - Object membership compares rooted retained target offsets
 //!   (`stored_shapes`), never loaded-value shapes or packed identities.
 //! - Selection is pure: it neither demands guards nor records path facts.
@@ -34,6 +36,7 @@ pub(crate) struct FieldStoreOwner {
     pub(crate) stored_shapes: SmallVec<[u32; 2]>,
     pub(crate) nullish_mask: u8,
     pub(crate) int32: bool,
+    pub(crate) int32_constant: Option<i32>,
 }
 
 /// Every category a stored value can have once its store completes: at most
@@ -43,6 +46,7 @@ pub(crate) struct StoreValueBound {
     pub(crate) shapes: SmallVec<[u32; 2]>,
     pub(crate) nullish: u8,
     pub(crate) int32: bool,
+    pub(crate) int32_constant: Option<i32>,
 }
 
 impl StoreValueBound {
@@ -52,6 +56,7 @@ impl StoreValueBound {
             shapes: smallvec::smallvec![shape],
             nullish: 0,
             int32: false,
+            int32_constant: None,
         }
     }
 
@@ -68,6 +73,7 @@ impl StoreValueBound {
             shapes,
             nullish: self.nullish,
             int32: self.int32,
+            int32_constant: self.int32_constant,
         })
     }
 }
@@ -87,13 +93,17 @@ impl FieldStoreOwner {
             stored_shapes: record.stored_shapes.clone(),
             nullish_mask: record.nullish_mask,
             int32: record.guard.expected & field_type::INT32 != 0,
+            int32_constant: field_type::int32_constant(record.guard.expected),
         }
     }
 
     /// Whether the captured categories already contain every category of `bound`.
     pub(crate) fn captures(record: &JitFieldType, bound: &StoreValueBound) -> bool {
         u64::from(bound.nullish) & !record.guard.expected == 0
-            && (!bound.int32 || record.guard.expected & field_type::INT32 != 0)
+            && (!bound.int32
+                || (record.guard.expected & field_type::INT32 != 0
+                    && field_type::int32_constant(record.guard.expected)
+                        .is_none_or(|value| bound.int32_constant == Some(value))))
             && bound
                 .shapes
                 .iter()
@@ -105,3 +115,7 @@ impl FieldStoreOwner {
         self.owner_shape != 0
     }
 }
+
+#[cfg(test)]
+#[path = "field_store_probe_tests.rs"]
+mod probe_tests;

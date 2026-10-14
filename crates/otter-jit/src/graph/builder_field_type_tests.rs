@@ -6,6 +6,7 @@
 //! - Demand for owner guards across SSA merges and distinct receivers.
 //! - Nullish comparisons specialize only under independently consumed bounds.
 //! - Exact int32 summaries keep payload loads unboxed under owner guards.
+//! - Exact numeric values fold only when every receiver owner agrees.
 //!
 //! # Invariants
 //! - Synthetic summaries authorize only the explicit target shapes.
@@ -16,6 +17,8 @@
 //! - `super::super::field_type` for the production value-bound helpers.
 
 use super::*;
+use crate::field_store::{FieldStoreOwner, StoreValueBound};
+use smallvec::SmallVec;
 
 fn field_type_view(ops: Vec<(Op, Vec<Operand>)>, nullish_mask: u8) -> JitCompileSnapshot {
     let instructions = ops
@@ -58,6 +61,10 @@ fn field_load(destination: u16, receiver: u16) -> (Op, Vec<Operand>) {
 fn exact_int32_fields_load_the_payload_under_their_owner_proof() {
     for expected in [
         field_type::INT32,
+        field_type::int32_sample(0),
+        field_type::int32_sample(-7),
+        field_type::int32_sample(i32::MIN),
+        field_type::int32_sample(i32::MAX),
         field_type::INT32 | field_type::NULL,
         field_type::TOP,
     ] {
@@ -83,10 +90,23 @@ fn exact_int32_fields_load_the_payload_under_their_owner_proof() {
             .graph
             .nodes
             .iter()
-            .find(|node| matches!(node.kind, Kind::LoadOwnField(_)))
-            .unwrap();
-        let int32 = expected == field_type::INT32;
-        assert_eq!(load.repr, if int32 { Repr::Int32 } else { Repr::Tagged });
+            .find(|node| matches!(node.kind, Kind::LoadOwnField(_)));
+        let int32 = field_type::is_int32_only(expected);
+        if let Some(constant) = field_type::int32_constant(expected) {
+            assert!(load.is_none(), "constant fields need no storage load");
+            assert!(
+                built
+                    .graph
+                    .nodes
+                    .iter()
+                    .any(|node| node.kind == Kind::ConstInt32(constant))
+            );
+        } else {
+            assert_eq!(
+                load.unwrap().repr,
+                if int32 { Repr::Int32 } else { Repr::Tagged }
+            );
+        }
         assert!(
             !built
                 .graph
@@ -106,6 +126,106 @@ fn exact_int32_fields_load_the_payload_under_their_owner_proof() {
             assert_eq!((state.function_id, state.pc), (90, 0));
         }
     }
+}
+
+#[test]
+fn numeric_field_constants_require_agreement_from_every_receiver_owner() {
+    for other in [
+        field_type::int32_sample(7),
+        field_type::int32_sample(8),
+        field_type::INT32,
+    ] {
+        let mut view = field_type_view(
+            vec![
+                field_load(2, 0),
+                (Op::ReturnValue, vec![Operand::Register(2)]),
+            ],
+            0,
+        );
+        for (receiver, expected) in [(128, field_type::int32_sample(7)), (256, other)] {
+            view.field_types.insert(
+                (receiver, FieldLocation::inline(0)),
+                JitFieldType {
+                    guard: JitFieldTypeGuard {
+                        owner_shape: receiver,
+                        expected,
+                    },
+                    shapes: SmallVec::new(),
+                    stored_shapes: SmallVec::new(),
+                    nullish_mask: 0,
+                },
+            );
+        }
+        view.property_programs.insert(
+            0,
+            vec![
+                load_program(128, FieldLocation::inline(0), false),
+                load_program(256, FieldLocation::inline(0), false),
+            ],
+        );
+        let built = load_graph(&view);
+        let load = built
+            .graph
+            .nodes
+            .iter()
+            .find(|node| matches!(node.kind, Kind::LoadOwnField(_)));
+        if other == field_type::int32_sample(7) {
+            assert!(load.is_none());
+            assert!(
+                built
+                    .graph
+                    .nodes
+                    .iter()
+                    .any(|node| node.kind == Kind::ConstInt32(7))
+            );
+        } else {
+            assert_eq!(load.unwrap().repr, Repr::Int32);
+        }
+        let guards: Vec<_> = built
+            .graph
+            .nodes
+            .iter()
+            .filter_map(|node| match &node.kind {
+                Kind::CheckFieldTypes(guards) if node.block.is_some() => Some(guards),
+                _ => None,
+            })
+            .flatten()
+            .collect();
+        assert_eq!(guards.len(), 2);
+    }
+}
+
+#[test]
+fn a_constant_numeric_owner_elides_only_proven_equal_stores() {
+    let mut record = JitFieldType {
+        guard: JitFieldTypeGuard {
+            owner_shape: 128,
+            expected: field_type::int32_sample(7),
+        },
+        shapes: SmallVec::new(),
+        stored_shapes: SmallVec::new(),
+        nullish_mask: 0,
+    };
+    for constant in [Some(7), Some(8), None] {
+        let bound = StoreValueBound {
+            shapes: SmallVec::new(),
+            nullish: 0,
+            int32: true,
+            int32_constant: constant,
+        };
+        assert_eq!(
+            FieldStoreOwner::select(&record, Some(&bound)).observes(),
+            constant != Some(7)
+        );
+    }
+    record.guard.expected = field_type::INT32;
+    let bound = StoreValueBound {
+        shapes: SmallVec::new(),
+        nullish: 0,
+        int32: true,
+        int32_constant: None,
+    };
+    assert!(!FieldStoreOwner::select(&record, Some(&bound)).observes());
 }
 
 #[test]
@@ -762,6 +882,7 @@ fn polymorphic_own_stores_select_each_defining_owner() {
                     stored_shapes: smallvec::smallvec![640],
                     nullish_mask: 1,
                     int32: false,
+                    int32_constant: None,
                 },
             ),
             (
@@ -771,6 +892,7 @@ fn polymorphic_own_stores_select_each_defining_owner() {
                     stored_shapes: smallvec::smallvec![768],
                     nullish_mask: 2,
                     int32: false,
+                    int32_constant: None,
                 },
             ),
         ]
@@ -853,6 +975,7 @@ fn partially_elided_stores_retain_every_admitted_receiver_arm() {
                             stored_shapes: smallvec::SmallVec::new(),
                             nullish_mask: 2,
                             int32: false,
+                            int32_constant: None,
                         },
                     ),
                     (
@@ -862,6 +985,7 @@ fn partially_elided_stores_retain_every_admitted_receiver_arm() {
                             stored_shapes: smallvec::SmallVec::new(),
                             nullish_mask: 0,
                             int32: false,
+                            int32_constant: None,
                         },
                     ),
                 ]
@@ -1063,6 +1187,7 @@ fn named_store_owner(
                     stored_shapes: record_stored.clone(),
                     nullish_mask: record_nullish,
                     int32: false,
+                    int32_constant: None,
                 },
                 [(_, owner)] => owner.clone(),
                 _ => panic!("one admitted receiver"),

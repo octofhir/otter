@@ -1,4 +1,4 @@
-//! Native lexical allocation across actual moving collection and inline capture.
+//! Native lexical allocation and array storage through actual moving collection.
 //!
 //! # Contents
 //! - Own current Graph constructor with an accepted ordinary factory splice.
@@ -18,6 +18,7 @@
 //! - Warmup and the first measured phase use stress0; the next phase arms
 //!   stress1 immediately before the tested native closure allocation.
 //! - `body_kind` verifies immutable storage proofs across native collecting calls.
+//! - `array_push` verifies native spare-capacity writes and collecting growth.
 //!
 //! # See also
 //! - `otter-jit/src/allocation/lexical_tests.rs` for complete native cell bytes.
@@ -49,6 +50,9 @@ use serde_json::Value as Json;
 
 #[path = "jit_native_context_closure/body_kind.rs"]
 mod body_kind;
+
+#[path = "jit_native_context_closure/array_push.rs"]
+mod array_push;
 
 const SETUP: &str = r#"
 lexicalStress(0);

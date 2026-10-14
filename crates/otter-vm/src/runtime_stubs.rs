@@ -2907,19 +2907,9 @@ fn array_push_leaf_inner(
     let Some(arr) = Value::from_abi_bits(recv_bits).as_array() else {
         return NativeResultPair::miss();
     };
-    let len = crate::array::len(arr, heap);
-    if len >= crate::array::dense_capacity(arr, heap)
-        || !dense_range_is_fast(arr, heap, len, len + 1)
-    {
-        return NativeResultPair::miss();
-    }
-    // The capacity check above makes the reservation inside `push` a no-op,
-    // so this cannot allocate.
-    match crate::array::push(arr, heap, Value::from_abi_bits(value_bits)) {
-        Ok(new_len) => {
-            NativeResultPair::success(Value::number(crate::NumberValue::from_f64(new_len as f64)))
-        }
-        Err(_) => NativeResultPair::miss(),
+    match crate::array::try_push_spare(arr, heap, Value::from_abi_bits(value_bits)) {
+        Some(new_len) => NativeResultPair::success(Value::number_i32(new_len as i32)),
+        None => NativeResultPair::miss(),
     }
 }
 

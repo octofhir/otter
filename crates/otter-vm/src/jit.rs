@@ -293,6 +293,9 @@ pub struct JitClosureAllocationPlan {
     /// when defined (a `MakeClosure` of an arrow). A defined `new.target`
     /// adds [`Self::bound_new_target_word`] to the call word.
     pub arrow: bool,
+    /// Permanent traced source-context word. Zero needs no birth proof;
+    /// an identity mismatch uses the ordinary pre-effect allocation miss.
+    pub context_cell: u64,
 }
 
 impl JitClosureAllocationPlan {
@@ -731,11 +734,11 @@ pub struct JitCompileSnapshot {
     /// Byte offsets of [`crate::context::ContextBody`] for inline
     /// context-slot access, parent hops, and the extension probe.
     pub context_layout: JitContextLayout,
-    /// For a body baked against one exact closure — an inlined method whose
-    /// holder slot is proven — the slots of that closure's context chain the
-    /// body reads, each watched and holding the value recorded here. Empty
-    /// for every other snapshot.
+    /// Watched slots of a proven method closure or a source with one context.
     pub closure_constants: Vec<JitContextConstant>,
+    /// Address of the permanent traced context word when this source has
+    /// exactly one observed context. Uses a ClosureContext dependency.
+    pub unique_closure_context: Option<u64>,
     /// Byte offset from a decompressed object pointer to its shape handle
     /// (`HEADER_SIZE + OBJECT_BODY_SHAPE_OFFSET`). A `#[repr(C)]` constant; the
     /// emitter reads `[obj_ptr + object_shape_byte]` for CacheIR shape guards
@@ -2298,6 +2301,7 @@ impl JitCompileSnapshot {
             global_lexical_value_byte: 0,
             context_layout: JitContextLayout::current(),
             closure_constants: Vec::new(),
+            unique_closure_context: None,
             collection_layout: JitCollectionLayout::default(),
             native_call_layout: JitNativeCallLayout::default(),
             instructions,

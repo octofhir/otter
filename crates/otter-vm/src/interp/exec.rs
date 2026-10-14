@@ -15,6 +15,8 @@
 //! downstream settlement.
 //! Linked bytecode chunks retain the scalar identity of their creation realm;
 //! no moving-GC handle is stored in function metadata.
+//! Source-context optimization roots of candidates are released before the
+//! collection, so they cannot turn a dead chunk into a live census result.
 //! Dynamic-code reclamation runs only with no active native/materialized
 //! activation, completes a full collection, retires generated code, and only
 //! then tombstones a payload proven free of ids and retained contexts.
@@ -63,10 +65,20 @@ impl Interpreter {
 
         self.code_eviction_stats.census_passes =
             self.code_eviction_stats.census_passes.saturating_add(1);
+        let mut released_contexts = false;
+        for candidate in self.code_space.eviction_candidates() {
+            released_contexts |= self
+                .jit_code_registry
+                .closure_contexts
+                .release_range(candidate.function_base, candidate.function_end());
+        }
+        if released_contexts {
+            self.retire_jit_for_code_eviction();
+        }
         self.force_gc_with_trigger(otter_gc::GcPauseTrigger::CodeReclamation)?;
         let candidates = self.code_space.eviction_candidates();
         let liveness = crate::code_liveness::census_candidate_ids(self, candidates.clone());
-        let mut retired_jit = false;
+        let mut retired_jit = released_contexts;
         for candidate in candidates {
             if retained <= target_bytes {
                 break;
@@ -790,7 +802,10 @@ impl Interpreter {
             None,
             None,
         )
-        .map(Value::closure)
+        .map(|closure| {
+            self.note_closure_context(context, closure);
+            Value::closure(closure)
+        })
         .map_err(|oom| (VmError::from(oom), Vec::new()))?;
         let entry_this = if main.is_module {
             Value::undefined()

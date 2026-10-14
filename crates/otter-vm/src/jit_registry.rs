@@ -55,9 +55,9 @@
 //!   new generation never invalidates or recompiles dependent callers.
 //! - A code object's immutable spliced-function list covers actual inlines,
 //!   including ones without safepoints or exits. A deopt unlinks the source
-//!   function's optimizing generations and every optimizing caller that
-//!   spliced it; its baseline generation stays installed, and its stable cell
-//!   selects the interpreter until retraining completes.
+//!   function's optimizing generations; spliced callers retain their code
+//!   until their own guards fail. Its baseline generation stays installed,
+//!   and its stable cell selects the interpreter until retraining completes.
 //! - Invalidating a generation unlinks its entry cell before executable
 //!   retirement. The cell address remains valid and is never reused.
 //!
@@ -171,6 +171,8 @@ pub struct JitCodeRegistry {
     subscriptions: crate::code_dependencies::ShapeSubscriptions,
     /// Watched slots of live contexts and their subscribers.
     contexts: crate::code_dependencies::ContextSubscriptions,
+    /// Permanent source context facts, also owning their moving roots.
+    pub(crate) closure_contexts: crate::closure_contexts::ClosureContexts,
     /// Flags of this registry's generations set since the last drain.
     fired: Arc<std::sync::atomic::AtomicU32>,
 }
@@ -198,6 +200,7 @@ impl JitCodeRegistry {
             epochs: rustc_hash::FxHashMap::default(),
             subscriptions: crate::code_dependencies::ShapeSubscriptions::default(),
             contexts: crate::code_dependencies::ContextSubscriptions::default(),
+            closure_contexts: crate::closure_contexts::ClosureContexts::default(),
             fired: Arc::default(),
         });
         registry.view.context = std::ptr::addr_of!(*registry) as u64;
@@ -553,6 +556,8 @@ impl JitCodeRegistry {
                     cell.subscribe(flag);
                 } else if let Some((context, slot)) = context_slot(dependency) {
                     self.contexts.subscribe(context, slot, flag);
+                } else if dependency.kind == CodeDependencyKind::ClosureContext {
+                    self.closure_contexts.subscribe(dependency.identity, flag);
                 }
             }
         }
@@ -855,6 +860,7 @@ impl JitCodeRegistry {
     /// Visit every hidden class a registered (not yet retired) code object
     /// embeds, as strong roots.
     pub(crate) fn trace_retained_roots(&self, visitor: &mut otter_gc::raw::SlotVisitor<'_>) {
+        self.closure_contexts.trace(visitor);
         for registered in self.codes.values() {
             for shape in &*registered.roots {
                 shape.trace(visitor);
@@ -874,6 +880,7 @@ impl JitCodeRegistry {
         let retained_bytes = &mut self.retained_bytes;
         let subscriptions = &mut self.subscriptions;
         let contexts = &mut self.contexts;
+        let closure_contexts = &mut self.closure_contexts;
         self.codes.retain(|code_object_id, registered| {
             let keep = registered.state != CodeLifetimeState::Invalid
                 || Arc::strong_count(&registered.code) > 1
@@ -892,6 +899,8 @@ impl JitCodeRegistry {
                             cell.unsubscribe(flag);
                         } else if let Some((context, _)) = context_slot(dependency) {
                             contexts.unsubscribe(context, flag);
+                        } else if dependency.kind == CodeDependencyKind::ClosureContext {
+                            closure_contexts.unsubscribe(dependency.identity, flag);
                         }
                     }
                 }
@@ -1117,6 +1126,9 @@ impl JitCodeRegistry {
                 }
                 None if dependency.kind == CodeDependencyKind::PrototypeValidity => {
                     validity_cell(dependency, roots).is_some_and(|cell| cell.is_valid())
+                }
+                None if dependency.kind == CodeDependencyKind::ClosureContext => {
+                    self.closure_contexts.single(dependency.identity).is_some()
                 }
                 None if dependency.kind == CodeDependencyKind::ContextSlot => {
                     context_slot(dependency)

@@ -93,4 +93,34 @@ let hits = 0;
 for (let i = 0; i < 50; i++) hits += wideText.replace(/NQ_VQ/g, '').length + (wideText.match(/um NQ/g) || []).length;
 results.push(hits);
 
+// Flatten fresh ropes through direct and coerced native receivers. Coercion
+// runs once even when flattening moves the string and its search operand.
+let coercions = 0;
+let ropeDigest = 0;
+for (let i = 0; i < 64; i++) {
+  const rope = 'x'.repeat(80) + 'Ā' + i;
+  const receiver = { toString() { coercions++; return 'x'.repeat(80) + 'Ā' + i; } };
+  ropeDigest += rope.charCodeAt(80);
+  ropeDigest += String.prototype.charCodeAt.call(receiver, 80);
+  ropeDigest += rope.includes('x'.repeat(40) + 'Ā') ? 1 : 0;
+  ropeDigest += String.prototype.includes.call(receiver, 'x'.repeat(40) + 'Ā') ? 1 : 0;
+}
+results.push([ropeDigest, coercions]);
+
+const includesOrder = [];
+const includesSearch = {
+  get [Symbol.match]() { includesOrder.push('match'); return false; },
+  toString() { includesOrder.push('string'); return 'Ā'; }
+};
+results.push(('x'.repeat(80) + 'Ā').includes(includesSearch), includesOrder);
+const nonRegExp = /x/;
+nonRegExp[Symbol.match] = false;
+results.push('/x/'.includes(nonRegExp));
+const marker = {};
+try {
+  ''.includes({ toString() { throw marker; } });
+} catch (error) {
+  results.push(error === marker);
+}
+
 console.log(JSON.stringify(results));

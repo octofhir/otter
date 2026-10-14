@@ -36,6 +36,15 @@ const POISON: u64 = 0xcafe_1357_2468_abcd;
 const OLD_RESULT: u64 = 0x1357;
 const CANARY: u64 = 0x51a7_6d9b_2468_1357;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BirthFact {
+    Disabled,
+    Single,
+    Many,
+    Unseen,
+    Different,
+}
+
 #[derive(Clone, Copy, Debug)]
 enum Construction {
     Create {
@@ -49,6 +58,7 @@ enum Construction {
         arrow: bool,
         new_target: bool,
         invalid_context: bool,
+        fact: BirthFact,
     },
 }
 
@@ -113,6 +123,16 @@ fn execute(view: &JitCompileSnapshot, case: Construction, regs: LabRegisters, fi
         Value::number_i32(17).to_bits(),
         Value::undefined().to_bits(),
     ]);
+    let fact = match case {
+        Construction::Closure { fact, .. } => fact,
+        _ => BirthFact::Disabled,
+    };
+    let fact_word = std::sync::atomic::AtomicU64::new(match fact {
+        BirthFact::Single => source.as_ptr() as u64,
+        BirthFact::Many => Value::undefined().to_bits(),
+        BirthFact::Unseen => u64::MAX,
+        BirthFact::Different | BirthFact::Disabled => 0x1234,
+    });
     let mut expected;
     let mut allowed = true;
     let context_plan;
@@ -173,6 +193,7 @@ fn execute(view: &JitCompileSnapshot, case: Construction, regs: LabRegisters, fi
             arrow,
             new_target,
             invalid_context,
+            fact,
         } => {
             // Synthetic expected header: the public named-lookup summary
             // occupies the flags word's top byte. The real VM producer owns
@@ -186,6 +207,11 @@ fn execute(view: &JitCompileSnapshot, case: Construction, regs: LabRegisters, fi
             let plan = JitClosureAllocationPlan {
                 call_word: 78 | (u64::from(flags) << 32),
                 arrow,
+                context_cell: if fact == BirthFact::Disabled {
+                    0
+                } else {
+                    fact_word.as_ptr() as u64
+                },
             };
             let bytes = JIT_CLOSURE_CELL_BYTES
                 + if arrow {
@@ -224,7 +250,11 @@ fn execute(view: &JitCompileSnapshot, case: Construction, regs: LabRegisters, fi
             }
             context_plan = None;
             closure_plan = Some(plan);
-            allowed = !invalid_context;
+            allowed = !invalid_context
+                && matches!(
+                    fact,
+                    BirthFact::Disabled | BirthFact::Single | BirthFact::Many
+                );
         }
     }
     let bytes = expected.len() * 8;
@@ -316,7 +346,16 @@ fn execute(view: &JitCompileSnapshot, case: Construction, regs: LabRegisters, fi
                 &mut ops, view, plan, 20, input[0], regs, slow,
             );
         } else if let Some(plan) = closure_plan {
-            crate::arm64::allocation::emit_closure(&mut ops, view, plan, 20, input, regs, slow);
+            crate::arm64::allocation::emit_closure(
+                &mut ops,
+                &mut crate::artifact::relocation::RelocationCapture::new(false),
+                view,
+                plan,
+                20,
+                input,
+                regs,
+                slow,
+            );
         } else {
             crate::arm64::allocation::emit_copy_context(&mut ops, view, 20, input[0], regs, slow);
         }
@@ -356,7 +395,16 @@ fn execute(view: &JitCompileSnapshot, case: Construction, regs: LabRegisters, fi
                 &mut ops, view, plan, 15, input[0], regs, slow,
             );
         } else if let Some(plan) = closure_plan {
-            crate::x86_64::allocation::emit_closure(&mut ops, view, plan, 15, input, regs, slow);
+            crate::x86_64::allocation::emit_closure(
+                &mut ops,
+                &mut crate::artifact::relocation::RelocationCapture::new(false),
+                view,
+                plan,
+                15,
+                input,
+                regs,
+                slow,
+            );
         } else {
             crate::x86_64::allocation::emit_copy_context(&mut ops, view, 15, input[0], regs, slow);
         }
@@ -495,16 +543,25 @@ fn lexical_native_fits_and_pre_effect_misses_keep_complete_payloads_and_canaries
             for arrow in [false, true] {
                 for new_target in [false, true] {
                     for invalid_context in [false, true] {
-                        execute(
-                            &view,
-                            Construction::Closure {
-                                arrow,
-                                new_target,
-                                invalid_context,
-                            },
-                            regs,
-                            fits,
-                        );
+                        for fact in [
+                            BirthFact::Disabled,
+                            BirthFact::Single,
+                            BirthFact::Many,
+                            BirthFact::Unseen,
+                            BirthFact::Different,
+                        ] {
+                            execute(
+                                &view,
+                                Construction::Closure {
+                                    arrow,
+                                    new_target,
+                                    invalid_context,
+                                    fact,
+                                },
+                                regs,
+                                fits,
+                            );
+                        }
                     }
                 }
             }

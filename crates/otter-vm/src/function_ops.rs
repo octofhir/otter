@@ -18,6 +18,8 @@
 //!   operands. A closure keeps exactly the context in its `ctx` register; the
 //!   pending closure body carries it through the allocation, so a collection
 //!   rewrites it before the copy into the cell.
+//! - Eligible source context facts observe every birth after allocation has
+//!   rewritten its operands, before the callable escapes to JavaScript.
 //! - Arrow closures snapshot the enclosing activation's `this` and
 //!   `new.target` values from their exact lexical source at construction.
 //! - Function property-descriptor results remain in a handle-arena slot across
@@ -210,6 +212,7 @@ impl Interpreter {
             bound_new_target,
         )
         .map_err(crate::oom_to_vm)?;
+        self.note_closure_context(context, closure);
         self.mark_closure_lookup(context, closure);
         Ok(Value::closure(closure))
     }
@@ -378,37 +381,31 @@ impl Interpreter {
         context: &ExecutionContext,
         operands: impl crate::executable::OperandSource,
     ) -> Result<(), CommittedValueError> {
-        let dst = register_operand(operands.first())
-            .map_err(CommittedValueError::Fatal)?;
+        let dst = register_operand(operands.first()).map_err(CommittedValueError::Fatal)?;
         if let Some(result) = self.continue_pending_bind_function(stack, context, dst) {
             return result;
         }
 
         let top_idx = stack.len() - 1;
         let pc = stack[top_idx].pc;
-        let callee_reg = register_operand(operands.get(1))
-            .map_err(CommittedValueError::Fatal)?;
-        let this_reg = register_operand(operands.get(2))
-            .map_err(CommittedValueError::Fatal)?;
+        let callee_reg = register_operand(operands.get(1)).map_err(CommittedValueError::Fatal)?;
+        let this_reg = register_operand(operands.get(2)).map_err(CommittedValueError::Fatal)?;
         let argc = match operands.get(3) {
             Some(Operand::ConstIndex(n)) => n as usize,
             _ => return Err(CommittedValueError::Fatal(VmError::InvalidOperand)),
         };
-        let target = *read_register(&stack[top_idx], callee_reg)
-            .map_err(CommittedValueError::Fatal)?;
+        let target =
+            *read_register(&stack[top_idx], callee_reg).map_err(CommittedValueError::Fatal)?;
         if !self.is_callable_runtime(&target) {
             return Err(CommittedValueError::JavaScript(VmError::NotCallable));
         }
-        let bound_this = *read_register(&stack[top_idx], this_reg)
-            .map_err(CommittedValueError::Fatal)?;
+        let bound_this =
+            *read_register(&stack[top_idx], this_reg).map_err(CommittedValueError::Fatal)?;
         let mut bound_args: SmallVec<[Value; 4]> = SmallVec::with_capacity(argc);
         for i in 0..argc {
-            let r = register_operand(operands.get(4 + i))
-                .map_err(CommittedValueError::Fatal)?;
-            bound_args.push(
-                *read_register(&stack[top_idx], r)
-                    .map_err(CommittedValueError::Fatal)?,
-            );
+            let r = register_operand(operands.get(4 + i)).map_err(CommittedValueError::Fatal)?;
+            bound_args
+                .push(*read_register(&stack[top_idx], r).map_err(CommittedValueError::Fatal)?);
         }
         // §20.2.3.2 — `length` is read (HasOwnProperty + Get) BEFORE
         // `name`.
@@ -679,8 +676,8 @@ impl Interpreter {
         this_reg: u16,
         arg_regs: &[u16],
     ) -> Result<(), CommittedValueError> {
-        let target = *read_register(&stack[top_idx], callee_reg)
-            .map_err(CommittedValueError::Fatal)?;
+        let target =
+            *read_register(&stack[top_idx], callee_reg).map_err(CommittedValueError::Fatal)?;
         if !self.is_callable_runtime(&target) {
             return Err(CommittedValueError::JavaScript(VmError::NotCallable));
         }
@@ -698,8 +695,8 @@ impl Interpreter {
         // §20.2.3.2 — read `length`, then `name`. Each may be an accessor whose
         // getter runs `this = target`; the frame source registers stay live
         // roots, so re-read the target after every reentrant call.
-        let target = *read_register(&stack[top_idx], callee_reg)
-            .map_err(CommittedValueError::Fatal)?;
+        let target =
+            *read_register(&stack[top_idx], callee_reg).map_err(CommittedValueError::Fatal)?;
         let target_length = match self
             .callable_bind_metadata_get(context, &target, "length")
             .map_err(CommittedValueError::JavaScript)?
@@ -723,8 +720,8 @@ impl Interpreter {
         // function allocation so a moving collection cannot strand it.
         let length_anchor = self.push_iteration_anchor(target_length) - 1;
 
-        let target = *read_register(&stack[top_idx], callee_reg)
-            .map_err(CommittedValueError::Fatal)?;
+        let target =
+            *read_register(&stack[top_idx], callee_reg).map_err(CommittedValueError::Fatal)?;
         let target_name = match self
             .callable_bind_metadata_get(context, &target, "name")
             .map_err(CommittedValueError::JavaScript)?
@@ -748,16 +745,14 @@ impl Interpreter {
         let target_proto = self.iteration_anchor(proto_anchor);
         let target_name = self.iteration_anchor(name_anchor);
         let target_length = self.iteration_anchor(length_anchor);
-        let target = *read_register(&stack[top_idx], callee_reg)
-            .map_err(CommittedValueError::Fatal)?;
-        let bound_this = *read_register(&stack[top_idx], this_reg)
-            .map_err(CommittedValueError::Fatal)?;
+        let target =
+            *read_register(&stack[top_idx], callee_reg).map_err(CommittedValueError::Fatal)?;
+        let bound_this =
+            *read_register(&stack[top_idx], this_reg).map_err(CommittedValueError::Fatal)?;
         let mut bound_args: SmallVec<[Value; 4]> = SmallVec::with_capacity(arg_regs.len());
         for &reg in arg_regs {
-            bound_args.push(
-                *read_register(&stack[top_idx], reg)
-                    .map_err(CommittedValueError::Fatal)?,
-            );
+            bound_args
+                .push(*read_register(&stack[top_idx], reg).map_err(CommittedValueError::Fatal)?);
         }
         let result = self.finish_bind_function(
             stack,
@@ -2266,9 +2261,7 @@ impl Interpreter {
                                 .map_err(CommittedValueError::JavaScript)?;
                             let descriptor =
                                 object_statics::coerce_to_descriptor(&desc_obj, &this.gc_heap)
-                                    .map_err(|error| {
-                                        CommittedValueError::JavaScript(error)
-                                    })?;
+                                    .map_err(CommittedValueError::JavaScript)?;
                             crate::object::define_own_symbol_property_partial(
                                 &mut bag,
                                 &mut this.gc_heap,

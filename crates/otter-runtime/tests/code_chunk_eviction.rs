@@ -3,14 +3,16 @@
 //! # Contents
 //!
 //! - Dead, live, and mixed eval-chunk liveness cases.
-//! - Exact source-byte ledger release.
+//! - Exact payload-byte release and the separate aggregate source ledger.
+//! - Source context optimization roots release before the actual dead-code census.
 //! - Bounded repeated-eval pressure and interpreter/JIT agreement.
 //!
 //! # Invariants
 //!
 //! - Reclamation runs only between top-level turns.
 //! - A reachable function id or retained execution context keeps its payload.
-//! - Reclaimed payload bytes and `SourceModuleBytes` accounting fall together.
+//! - Reclaimed payload bytes are exact; aggregate `SourceModuleBytes` also
+//!   includes immutable source text/index leases released with their last owner.
 //!
 //! # See also
 //!
@@ -49,6 +51,7 @@ fn dead_eval_chunk_releases_its_exact_source_ledger_charge() {
         )
         .expect("eval script");
     let charged_before = source_module_bytes(&account);
+    let payload_before = runtime.code_eviction_stats().retained_bytes;
 
     runtime.reclaim_dynamic_code().expect("reclaim dead eval");
 
@@ -57,7 +60,11 @@ fn dead_eval_chunk_releases_its_exact_source_ledger_charge() {
     assert_eq!(stats.evicted_chunks, 1);
     assert!(stats.evicted_bytes > 0);
     assert!(stats.peak_retained_bytes >= stats.evicted_bytes);
-    assert_eq!(charged_before - charged_after, stats.evicted_bytes);
+    assert_eq!(stats.evicted_bytes, payload_before);
+    assert!(
+        charged_before - charged_after >= stats.evicted_bytes,
+        "aggregate source release also includes immutable text/index leases"
+    );
     assert_eq!(stats.retained_bytes, 0);
 }
 
@@ -113,9 +120,12 @@ fn escaped_eval_closure_blocks_eviction_until_the_reference_is_removed() {
         stats_after_drop.evicted_chunks,
         stats_before_drop.evicted_chunks + 1
     );
-    assert_eq!(
-        charged_before_drop - source_module_bytes(&account),
-        stats_after_drop.evicted_bytes - stats_before_drop.evicted_bytes
+    let released_payload = stats_after_drop.evicted_bytes - stats_before_drop.evicted_bytes;
+    assert_eq!(released_payload, stats_before_drop.retained_bytes);
+    assert_eq!(stats_after_drop.retained_bytes, 0);
+    assert!(
+        charged_before_drop - source_module_bytes(&account) >= released_payload,
+        "aggregate source release also includes immutable text/index leases"
     );
 }
 
@@ -223,4 +233,53 @@ fn interpreter_and_jit_agree_after_hot_eval_code_is_evicted() {
         completions.push(result.completion_string().to_string());
     }
     assert_eq!(completions, ["42", "42"]);
+}
+
+#[test]
+fn captured_eval_contexts_do_not_keep_dead_source_chunks_alive() {
+    for selection in [
+        JitSelection::InterpreterOnly,
+        JitSelection::ProductionTiered,
+    ] {
+        let mut runtime = Runtime::builder().jit_selection(selection).build().unwrap();
+        let result = runtime
+            .run_script(
+                SourceInput::from_javascript(
+                    r#"
+            globalThis.__contextKeeper = eval(`(function captureSource() {
+                const seed = 7;
+                const read = function readEvalContext() { return seed + arguments.length; };
+                let total = 0;
+                for (let call = 0; call < 12000; call++) total += read();
+                if (total !== 84000) throw new Error('context result');
+                return read;
+            })()`);
+            String(__contextKeeper());
+        "#,
+                ),
+                "<captured-eval>",
+            )
+            .unwrap();
+        assert_eq!(result.completion_string(), "7");
+        runtime.set_code_eviction_high_water_bytes(0);
+        runtime.reclaim_dynamic_code().unwrap();
+        assert_eq!(runtime.code_eviction_stats().evicted_chunks, 0);
+        assert!(runtime.code_eviction_stats().retained_bytes > 0);
+        let result = runtime
+            .run_script(
+                SourceInput::from_javascript("String(__contextKeeper());"),
+                "<live-context-call>",
+            )
+            .unwrap();
+        assert_eq!(result.completion_string(), "7");
+        runtime
+            .run_script(
+                SourceInput::from_javascript("globalThis.__contextKeeper = undefined;"),
+                "<drop-context>",
+            )
+            .unwrap();
+        runtime.reclaim_dynamic_code().unwrap();
+        assert_eq!(runtime.code_eviction_stats().evicted_chunks, 1);
+        assert_eq!(runtime.code_eviction_stats().retained_bytes, 0);
+    }
 }

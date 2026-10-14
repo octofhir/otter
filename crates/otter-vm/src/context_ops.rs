@@ -269,6 +269,7 @@ impl Interpreter {
             None,
         )
         .map_err(crate::oom_to_vm)?;
+        self.note_closure_context(context, closure);
         Ok(Value::closure(closure))
     }
 

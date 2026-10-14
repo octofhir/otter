@@ -13,10 +13,11 @@
 //! - Every method validates the receiver as a primitive string or a
 //!   String wrapper with `[[StringData]]`; a non-string raises
 //!   `TypeError`.
-//! - Numeric arguments accept `Value::Number` and (for foundation-era
-//!   ergonomics on a few methods) string-encoded indices.
+//! - Numeric arguments follow each method's coercion and index-range rules.
 //! - `indexOf` polls the runtime interrupt flag every
 //!   [`crate::string::INDEX_OF_INTERRUPT_BUDGET`] iterations.
+//! - Collecting rope flattening keeps operands in handle scopes and reads
+//!   their updated handles before scanning; contiguous scans do not allocate.
 //! - `toLowerCase` / `toUpperCase` use Unicode default case mappings
 //!   plus Final_Sigma; locale variants validate the requested locale
 //!   list and apply the Turkic/Lithuanian SpecialCasing rules covered
@@ -481,9 +482,20 @@ fn impl_char_code_at(
     }
     // Indexing a rope descends it per call; flatten it once, so a scan over a
     // concatenated string is linear.
-    // Flattening allocates, so the receiver is re-read from its rooted slot.
-    recv.flatten_in_place(ctx.heap_mut())?;
-    let recv = receiver_string(ctx, receiver)?;
+    let recv = if recv.is_contiguous(ctx.heap()) {
+        recv
+    } else {
+        ctx.scope(|mut scope| {
+            let receiver = scope.value(Value::string(recv));
+            recv.flatten_in_place(scope.context().heap_mut())?;
+            Ok::<_, NativeError>(
+                scope
+                    .raw(receiver)
+                    .as_string(scope.context().heap())
+                    .expect("flattened receiver is a string"),
+            )
+        })?
+    };
     let value = match recv.char_code_at(pos as u32, ctx.heap_mut()) {
         Some(unit) => NumberValue::from_i32(i32::from(unit)),
         None => NumberValue::Double(f64::NAN),
@@ -744,26 +756,54 @@ fn impl_includes(
     receiver: &Value,
     args: &[Value],
 ) -> Result<Value, NativeError> {
-    let recv = receiver_string(ctx, receiver)?;
-    let search = args.first().copied().unwrap_or(Value::undefined());
-    // §22.1.3.7 step 4-6 — a RegExp searchString throws before its ToString.
-    if is_reg_exp(ctx, search, "String.prototype.includes")? {
-        return Err(type_error(
-            "String.prototype.includes",
-            "searchString must not be a RegExp",
-        ));
+    let heap = ctx.heap();
+    if let (Some(recv), Some(needle)) = (
+        receiver.as_string(heap),
+        args.first().and_then(|value| value.as_string(heap)),
+    ) && recv.is_contiguous(heap)
+        && needle.is_contiguous(heap)
+    {
+        let from = arg_u32_or(ctx, args, 1, 0)?;
+        let pos = recv
+            .index_of(needle, from, None, ctx.heap_mut())
+            .map_err(|Interrupted| type_error("String.prototype", "interrupted"))?;
+        return Ok(Value::boolean(pos.is_some()));
     }
-    let needle = value_to_string(ctx, search, "String.prototype.includes")?;
-    let from = arg_u32_or(ctx, args, 1, 0)?;
-    recv.flatten_in_place(ctx.heap_mut())
-        .map_err(|_| type_error("String.prototype", "out of memory"))?;
-    needle
-        .flatten_in_place(ctx.heap_mut())
-        .map_err(|_| type_error("String.prototype", "out of memory"))?;
-    let pos = recv
-        .index_of(needle, from, None, ctx.heap_mut())
-        .map_err(|Interrupted| type_error("String.prototype", "interrupted"))?;
-    Ok(Value::boolean(pos.is_some()))
+    ctx.scope(|mut scope| {
+        let receiver = scope.value(*receiver);
+        let search = scope.value(args.first().copied().unwrap_or_else(Value::undefined));
+        let position = scope.value(args.get(1).copied().unwrap_or_else(Value::undefined));
+        let receiver_value = scope.raw(receiver);
+        let recv = receiver_string(scope.context(), &receiver_value)?;
+        let recv = scope.value(Value::string(recv));
+        // IsRegExp precedes ToString(search), including observable @@match.
+        let search_value = scope.raw(search);
+        if is_reg_exp(scope.context(), search_value, "String.prototype.includes")? {
+            return Err(type_error(
+                "String.prototype.includes",
+                "searchString must not be a RegExp",
+            ));
+        }
+        let search_value = scope.raw(search);
+        let needle = value_to_string(scope.context(), search_value, "String.prototype.includes")?;
+        let needle = scope.value(Value::string(needle));
+        let position_value = scope.raw(position);
+        let from = arg_u32_or(scope.context(), std::slice::from_ref(&position_value), 0, 0)?;
+        for operand in [recv, needle] {
+            scope
+                .raw(operand)
+                .as_string(scope.context().heap())
+                .expect("includes operand is a string")
+                .flatten_in_place(scope.context().heap_mut())
+                .map_err(|_| type_error("String.prototype", "out of memory"))?;
+        }
+        let recv = scope.raw(recv).as_string(scope.context().heap()).unwrap();
+        let needle = scope.raw(needle).as_string(scope.context().heap()).unwrap();
+        let pos = recv
+            .index_of(needle, from, None, scope.context().heap_mut())
+            .map_err(|Interrupted| type_error("String.prototype", "interrupted"))?;
+        Ok(Value::boolean(pos.is_some()))
+    })
 }
 
 fn impl_concat(
@@ -1924,7 +1964,10 @@ fn string_replace_spec(
             // it runs no code: call its body without the lookup and the call.
             let search_value = scope.raw(search);
             if search_value.as_regexp().is_some()
-                && scope.context().interp_mut().is_pristine_regexp(search_value)
+                && scope
+                    .context()
+                    .interp_mut()
+                    .is_pristine_regexp(search_value)
             {
                 let call_args = [scope.raw(this), scope.raw(replace_value)];
                 let search_value = scope.raw(search);

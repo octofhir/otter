@@ -2208,13 +2208,21 @@ impl<'a> Builder<'a> {
                 // function id: its context is one field away, and a body
                 // baked against that closure reads its constants through it.
                 let proven = self.inline.as_ref().is_some_and(|frame| frame.heap_closure);
-                let value = if proven {
+                let unique = self.view.unique_closure_context;
+                let value = if let Some(cell) = unique.filter(|_| !proven) {
+                    self.add(
+                        Kind::CheckClosureContext(self.view.code_block.id),
+                        &[],
+                        Repr::None,
+                    );
+                    self.add(Kind::LoadCellValue(cell), &[], Repr::Tagged)
+                } else if proven {
                     let byte = self.view.closure_call_layout.context_byte as i32;
                     self.add(Kind::LoadTaggedField(byte), &[closure], Repr::Tagged)
                 } else {
                     self.add(Kind::LoadClosureContext, &[closure], Repr::Tagged)
                 };
-                if proven && !self.view.closure_constants.is_empty() {
+                if (proven || unique.is_some()) && !self.view.closure_constants.is_empty() {
                     self.closure_contexts
                         .insert(value, (std::ptr::from_ref(self.view), 0));
                 }

@@ -932,16 +932,24 @@ impl<'a> Codegen<'a> {
             Kind::CheckDependencies => self.emit_dependency_check(node),
             Kind::CheckStableShapes(_)
             | Kind::CheckFieldTypes(_)
-            | Kind::CheckContextSlot { .. } => {
+            | Kind::CheckContextSlot { .. }
+            | Kind::CheckClosureContext(_) => {
                 return Err(Unsupported::OperandShape(
                     "graph shape-fact proof outside a dependency test",
                 ));
             }
             Kind::LoadCellValue(cell) => {
                 let destination = Self::gp(result.expect("a result"));
-                let target = RelocationTarget::CalleeIdentityCell {
-                    function_id: self.view_of(node).code_block.id,
-                    call_pc: self.graph.node(node).pc,
+                let source = self.view_of(node);
+                let target = if source.unique_closure_context == Some(*cell) {
+                    RelocationTarget::ClosureContextCell {
+                        function_id: source.code_block.id,
+                    }
+                } else {
+                    RelocationTarget::CalleeIdentityCell {
+                        function_id: source.code_block.id,
+                        call_pc: self.graph.node(node).pc,
+                    }
                 };
                 emit_load_symbol_u64(
                     &mut self.ops,

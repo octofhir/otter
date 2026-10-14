@@ -396,6 +396,7 @@ pub(super) fn emit_context_allocation(
                 };
                 crate::arm64::allocation::emit_closure(
                     ops,
+                    relocations,
                     view,
                     plan,
                     context_register,

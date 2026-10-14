@@ -1,0 +1,225 @@
+{
+  "richards": {
+    "otter": 18281786153,
+    "node": 11559753905,
+    "ratio": 1.5815030582175702,
+    "delta_percent": -2.2267842211872835,
+    "wall": {
+      "otter_seconds": 0.9454842090000001,
+      "node_seconds": 0.639729375,
+      "bun_seconds": 0.535908041,
+      "node_ratio": 1.4779440275038176,
+      "bun_ratio": 1.7642657632748602,
+      "parent_otter_seconds": 0.9577905000000001,
+      "delta_percent": -1.284862503856532
+    }
+  },
+  "deltablue": {
+    "otter": 19790437762,
+    "node": 5590907366,
+    "ratio": 3.5397541877283896,
+    "delta_percent": -2.004489703590373,
+    "wall": {
+      "otter_seconds": 1.0366015,
+      "node_seconds": 0.286676292,
+      "bun_seconds": 0.40120420900000003,
+      "node_ratio": 3.61593033301826,
+      "bun_ratio": 2.5837253865898497,
+      "parent_otter_seconds": 1.088572625,
+      "delta_percent": -4.774245080800199
+    }
+  },
+  "crypto": {
+    "otter": 4551954503,
+    "node": 2918126968,
+    "ratio": 1.5598891182311296,
+    "delta_percent": -0.3402240323712724,
+    "wall": {
+      "otter_seconds": 0.235872417,
+      "node_seconds": 0.15383825,
+      "bun_seconds": null,
+      "node_ratio": 1.5332494811920963,
+      "bun_ratio": null,
+      "parent_otter_seconds": 0.24102916700000002,
+      "delta_percent": -2.139471361156886
+    }
+  },
+  "raytrace": {
+    "otter": 17867790274,
+    "node": 8371358844,
+    "ratio": 2.1343954556202513,
+    "delta_percent": -2.2782720251401267,
+    "wall": {
+      "otter_seconds": 1.231728875,
+      "node_seconds": 0.532116125,
+      "bun_seconds": 0.286953375,
+      "node_ratio": 2.31477457105815,
+      "bun_ratio": 4.292435574246165,
+      "parent_otter_seconds": 1.2696092079999999,
+      "delta_percent": -2.983621476696152
+    }
+  },
+  "earley-boyer": {
+    "otter": 29476710152,
+    "node": 18688380783,
+    "ratio": 1.5772746978065466,
+    "delta_percent": -0.002730623656821418,
+    "wall": {
+      "otter_seconds": 1.669895917,
+      "node_seconds": 1.040740875,
+      "bun_seconds": 1.063345042,
+      "node_ratio": 1.6045261189534812,
+      "bun_ratio": 1.5704177393437269,
+      "parent_otter_seconds": 1.651518333,
+      "delta_percent": 1.1127689976421218
+    }
+  },
+  "regexp": {
+    "otter": 22984016093,
+    "node": 7302024402,
+    "ratio": 3.147622471201925,
+    "delta_percent": 0.04482083185441965,
+    "wall": {
+      "otter_seconds": 1.599842,
+      "node_seconds": 0.40570262500000004,
+      "bun_seconds": 0.34405004100000003,
+      "node_ratio": 3.9433858728422075,
+      "bun_ratio": 4.65002705812786,
+      "parent_otter_seconds": 1.590068167,
+      "delta_percent": 0.6146801252200573
+    }
+  },
+  "splay": {
+    "otter": 10004915858,
+    "node": 4396614120,
+    "ratio": 2.2755956253900216,
+    "delta_percent": 0.12694328727640425,
+    "wall": {
+      "otter_seconds": 0.7292428750000001,
+      "node_seconds": 0.30939070900000004,
+      "bun_seconds": 0.181679,
+      "node_ratio": 2.3570290050306584,
+      "bun_ratio": 4.01390845942569,
+      "parent_otter_seconds": 0.7616423750000001,
+      "delta_percent": -4.253899344820466
+    }
+  },
+  "navier-stokes": {
+    "otter": 7881542035,
+    "node": 8095275899,
+    "ratio": 0.9735977048013394,
+    "delta_percent": 0.0061105482251466725,
+    "wall": {
+      "otter_seconds": 0.9127161250000001,
+      "node_seconds": 0.706447084,
+      "bun_seconds": null,
+      "node_ratio": 1.2919808796323096,
+      "bun_ratio": null,
+      "parent_otter_seconds": 0.9119505830000001,
+      "delta_percent": 0.08394555738773235
+    }
+  },
+  "box2d": {
+    "otter": 12955998489,
+    "node": 5062573423,
+    "ratio": 2.5591724616059954,
+    "delta_percent": 0.3349205672712463,
+    "wall": {
+      "otter_seconds": 0.8389949170000001,
+      "node_seconds": 0.296472208,
+      "bun_seconds": 0.276254084,
+      "node_ratio": 2.829927711133045,
+      "bun_ratio": 3.0370407736668974,
+      "parent_otter_seconds": 0.845308625,
+      "delta_percent": -0.7469115791880143
+    }
+  },
+  "gbemu": {
+    "otter": 18572831990,
+    "node": 8221150072,
+    "ratio": 2.2591525306485125,
+    "delta_percent": 0.2806546047428693,
+    "wall": {
+      "otter_seconds": 1.222840416,
+      "node_seconds": 0.47047425000000004,
+      "bun_seconds": null,
+      "node_ratio": 2.5991654506064887,
+      "bun_ratio": null,
+      "parent_otter_seconds": 1.226680791,
+      "delta_percent": -0.3130704440940435
+    }
+  },
+  "mandreel": {
+    "otter": 19151956644,
+    "node": 13823039865,
+    "ratio": 1.3855097598678596,
+    "delta_percent": -0.14509615657346542,
+    "wall": {
+      "otter_seconds": 1.207370334,
+      "node_seconds": 0.6868562920000001,
+      "bun_seconds": 0.49167712500000005,
+      "node_ratio": 1.7578208834403453,
+      "bun_ratio": 2.4556162420612915,
+      "parent_otter_seconds": 1.211673458,
+      "delta_percent": -0.3551389173039099
+    }
+  },
+  "zlib": {
+    "otter": 24324225492,
+    "node": 24749906421,
+    "ratio": 0.9828007055154433,
+    "delta_percent": -0.001267983185104793,
+    "wall": {
+      "otter_seconds": 1.9235975,
+      "node_seconds": 1.611951292,
+      "bun_seconds": null,
+      "node_ratio": 1.1933347549312923,
+      "bun_ratio": null,
+      "parent_otter_seconds": 1.927862625,
+      "delta_percent": -0.22123593998301105
+    }
+  },
+  "ts": {
+    "otter": 36124622162,
+    "node": 20854641072,
+    "ratio": 1.732210208618833,
+    "delta_percent": -1.2299418877243284,
+    "wall": {
+      "otter_seconds": 3.250522458,
+      "node_seconds": 1.143672959,
+      "bun_seconds": 0.972073375,
+      "node_ratio": 2.842178292684456,
+      "bun_ratio": 3.343906480310707,
+      "parent_otter_seconds": 3.366410042,
+      "delta_percent": -3.442467867971033
+    }
+  },
+  "geomean": {
+    "ratio": 1.8412601862790279,
+    "parent_ratio": 1.85193718357408,
+    "wall_node_ratio": 2.1059535136673313,
+    "parent_wall_node_ratio": 2.1198683797645983,
+    "wall_bun_ratio": 2.8954299217742623,
+    "parent_wall_bun_ratio": 2.9007207894684073,
+    "wall_delta_percent": -1.4557788730636956,
+    "wall_node_fixture_count": 13,
+    "wall_bun_fixture_count": 9,
+    "wall_bun_fixtures": [
+      "richards",
+      "deltablue",
+      "raytrace",
+      "earley-boyer",
+      "regexp",
+      "splay",
+      "box2d",
+      "mandreel",
+      "ts"
+    ],
+    "wall_bun_unavailable": [
+      "crypto",
+      "navier-stokes",
+      "gbemu",
+      "zlib"
+    ]
+  }
+}

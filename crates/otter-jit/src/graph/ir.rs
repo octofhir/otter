@@ -596,6 +596,8 @@ pub(crate) enum Kind {
     /// The value the code-retained identity cell at this address holds; the
     /// collector keeps the cell's value current.
     LoadCellValue(u64),
+    /// Every closure of this source has the one context baked by the VM.
+    CheckClosureContext(u32),
     /// The builder's proof that this slot of the context whose watch has this
     /// identity still holds the value the generation read as a constant. The
     /// generation subscribes to the slot; [`super::dependency_checks`] turns
@@ -945,6 +947,7 @@ impl Kind {
             Self::Deopt(_)
             | Self::CheckStableShapes(_)
             | Self::CheckFieldTypes(_)
+            | Self::CheckClosureContext(_)
             | Self::CheckContextSlot { .. }
             | Self::CheckDependencies => Properties {
                 eager_deopt: true,
@@ -1327,6 +1330,7 @@ impl Kind {
             | Self::CheckStableShapes(_)
             | Self::CheckFieldTypes(_)
             | Self::CheckContextSlot { .. }
+            | Self::CheckClosureContext(_)
             | Self::CheckDependencies => simple(0, ResultPolicy::None),
             Self::Branch {
                 kind: BranchKind::Int32(_),

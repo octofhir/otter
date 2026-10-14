@@ -67,6 +67,7 @@ const TARGET_INSTANCEOF_CELL: u8 = 19;
 const TARGET_BACKEDGE_FUEL_CELL: u8 = 20;
 const TARGET_DEPENDENCY_FLAG: u8 = 21;
 const TARGET_PROTOTYPE_VALIDITY_CELL: u8 = 15;
+const TARGET_CLOSURE_CONTEXT_CELL: u8 = 22;
 
 /// Whether a named-property probe serves a load or a store site.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -145,6 +146,10 @@ pub(crate) enum RelocationTarget {
     /// a generated call enters the target's current generation. The process
     /// address is absent; the function id is the portable identity.
     FunctionEntryCell {
+        function_id: u32,
+    },
+    /// Permanent source-context fact word, rewritten by moving collection.
+    ClosureContextCell {
         function_id: u32,
     },
     /// Code-owned traced callable word used by an identity proof. It either
@@ -1549,6 +1554,10 @@ fn encode_target(target: &RelocationTarget, output: &mut Vec<u8>) -> Result<(), 
             });
             put_u32(output, *byte_pc);
             put_u32(output, *runtime_stub_id);
+        }
+        RelocationTarget::ClosureContextCell { function_id } => {
+            output.push(TARGET_CLOSURE_CONTEXT_CELL);
+            put_u32(output, *function_id);
         }
         RelocationTarget::FunctionEntryCell { function_id } => {
             output.push(TARGET_FUNCTION_ENTRY_CELL);

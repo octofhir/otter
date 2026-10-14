@@ -13,6 +13,8 @@
 //! - The only allocation between the factory observations is its new arrow.
 //! - Current entry artifacts, complete dispatch traces and unchanged generations
 //!   prove execution; no fabricated host LAB or forced collection substitutes.
+//! - A quiescent full collection and repeated actual warm operations settle
+//!   allocation-site decisions before freezing the measured generations.
 //! - Warmup and the first measured phase use stress0; the next phase arms
 //!   stress1 immediately before the tested native closure allocation.
 //!
@@ -376,8 +378,10 @@ fn assert_native(
     {
         assert!(
             !trace.ticks.contains(&fid),
-            "own/inlined source fid={fid} left native execution: {:?}",
-            trace.ticks
+            "own/inlined source fid={fid} ({:?}) left native execution: {:?}; events: {:?}",
+            trace.names.get(&fid),
+            trace.ticks,
+            result.jit_debug_report().unwrap().events()
         );
     }
     for generation in generations {
@@ -443,27 +447,55 @@ fn case(extra: bool) {
     ];
     let factory = fid("lexicalFactory");
     let mut batch = setup.take_jit_artifacts().unwrap();
+    runtime
+        .force_gc()
+        .expect("settle allocation-site observations");
     for index in 0..=128 {
-        let generations = runtime.jit_code_generation_snapshot();
-        if subjects.iter().all(|fid| {
-            generations.iter().any(|g| {
-                g.function_id == *fid
-                    && g.tier == NativeFrameKind::Optimizing
-                    && g.lifecycle == CodeLifetimeState::Installed
-                    && g.linked
-            })
-        }) {
-            break;
+        let source = r#"{
+            const own = buildLexical(LexicalOwner, lexicalWarmChild, lexicalObserve, lexicalWarmReceiver);
+            own.pair[0](); own.pair[1](); own.pair[2](); own.local();
+            const retained = iterationClosures(lexicalWarmChild);
+            retained[0](); retained[1](); retained[2](); retained[3]();
         }
-        assert!(index < 128, "bounded own entry admission: {generations:?}");
-        let source = "buildLexical(LexicalOwner, lexicalWarmChild, lexicalObserve, lexicalWarmReceiver); iterationClosures(lexicalWarmChild);\n".repeat(16);
+"#.repeat(16);
         let mut admission = run(
             &mut runtime,
             realm,
             &source,
             &format!("native-lexical-admission-{index}.js"),
         );
+        let settled = !admission
+            .jit_debug_report()
+            .unwrap()
+            .events()
+            .iter()
+            .any(|event| {
+                matches!(
+                    event,
+                    JitDebugEvent::Bail { .. }
+                        | JitDebugEvent::EnteredGenerationDeopt { .. }
+                        | JitDebugEvent::InlineDeoptFrame { .. }
+                        | JitDebugEvent::CompilePrepared { .. }
+                )
+            });
         batch = batch.merged(admission.take_jit_artifacts().unwrap());
+        let generations = runtime.jit_code_generation_snapshot();
+        if settled
+            && subjects.iter().all(|fid| {
+                generations.iter().any(|g| {
+                    g.function_id == *fid
+                        && g.tier == NativeFrameKind::Optimizing
+                        && g.lifecycle == CodeLifetimeState::Installed
+                        && g.linked
+                })
+            })
+        {
+            break;
+        }
+        assert!(
+            index < 128,
+            "bounded settled own entry admission: {generations:?}"
+        );
     }
     assert!(!batch.truncated(), "complete current native artifact bank");
     let generations: Vec<_> = subjects

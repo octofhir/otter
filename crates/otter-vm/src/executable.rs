@@ -471,6 +471,7 @@ impl CodeBlock {
                 + std::mem::offset_of!(crate::upvalue::UpvalueCellBody, value) as u32,
             context_layout: crate::jit::JitContextLayout::current(),
             closure_constants: Vec::new(),
+            unique_closure_context: None,
             collection_layout: crate::jit::JitCollectionLayout {
                 map_type_tag: crate::collections::MAP_BODY_TYPE_TAG,
                 set_type_tag: crate::collections::SET_BODY_TYPE_TAG,

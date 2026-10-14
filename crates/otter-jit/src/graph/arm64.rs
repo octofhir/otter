@@ -1677,7 +1677,11 @@ impl<'a> Codegen<'a> {
                     object,
                     destination,
                     *field,
-                    false,
+                    if data.repr == Repr::Int32 {
+                        crate::field_access::FieldAccess::LoadInt32
+                    } else {
+                        crate::field_access::FieldAccess::LoadTagged
+                    },
                 );
             }
             Kind::StoreOwnField { field, owners } => {
@@ -1689,7 +1693,7 @@ impl<'a> Codegen<'a> {
                     object,
                     value,
                     *field,
-                    true,
+                    crate::field_access::FieldAccess::Store,
                 );
                 if !owners.is_empty() {
                     let owner = allocation.gp_temps[0];

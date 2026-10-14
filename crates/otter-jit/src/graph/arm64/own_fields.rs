@@ -8,12 +8,14 @@
 //! - The caller proves the receiver shape and owns the store's write barrier.
 //! - No storage address becomes an SSA value or survives a collecting call.
 //! - Inline access needs one instruction; suffix access rereads its live handle.
+//! - Int32 loads read four bytes under the defining field's summary proof.
 //! - Only the caller's value register and reserved x16/x17 may be overwritten.
 //!
 //! # See also
 //! - `otter_vm::object::FieldLocation` for bank and relative index ownership.
 //! - [`super::Codegen`] for shape guards, canonical homes and GC boundaries.
 
+use crate::field_access::FieldAccess;
 use dynasmrt::{DynasmApi, aarch64::Assembler, dynasm};
 use otter_vm::object::{FieldLayout, FieldLocation};
 
@@ -23,7 +25,7 @@ pub(super) fn emit(
     object: u8,
     value: u8,
     field: FieldLocation,
-    store: bool,
+    access: FieldAccess,
 ) {
     let (base, offset) = if field.is_inline() {
         (object, layout.inline_byte(field))
@@ -40,18 +42,27 @@ pub(super) fn emit(
                 .expect("field offset fits VM layout"),
         )
     };
-    if offset <= 32760 && offset % 8 == 0 {
-        if store {
-            dynasm!(ops ; .arch aarch64 ; str X(value), [X(base), offset]);
-        } else {
-            dynasm!(ops ; .arch aarch64 ; ldr X(value), [X(base), offset]);
+    let limit = if access == FieldAccess::LoadInt32 {
+        16380
+    } else {
+        32760
+    };
+    if offset <= limit && offset % 8 == 0 {
+        match access {
+            FieldAccess::Store => dynasm!(ops ; .arch aarch64 ; str X(value), [X(base), offset]),
+            FieldAccess::LoadTagged => {
+                dynasm!(ops ; .arch aarch64 ; ldr X(value), [X(base), offset])
+            }
+            FieldAccess::LoadInt32 => {
+                dynasm!(ops ; .arch aarch64 ; ldr W(value), [X(base), offset])
+            }
         }
     } else {
         crate::template::arm64::values::emit_load_u64(ops, 16, u64::from(offset));
-        if store {
-            dynasm!(ops ; .arch aarch64 ; str X(value), [X(base), x16]);
-        } else {
-            dynasm!(ops ; .arch aarch64 ; ldr X(value), [X(base), x16]);
+        match access {
+            FieldAccess::Store => dynasm!(ops ; .arch aarch64 ; str X(value), [X(base), x16]),
+            FieldAccess::LoadTagged => dynasm!(ops ; .arch aarch64 ; ldr X(value), [X(base), x16]),
+            FieldAccess::LoadInt32 => dynasm!(ops ; .arch aarch64 ; ldr W(value), [X(base), x16]),
         }
     }
 }
@@ -60,6 +71,47 @@ pub(super) fn emit(
 mod tests {
     use super::*;
     use dynasmrt::{AssemblyOffset, DynasmApi};
+
+    #[test]
+    fn int32_loads_clear_the_tag_in_both_banks_and_across_scaled_boundaries() {
+        let layout = FieldLayout::current();
+        let mut storage = vec![0u64; 6200];
+        let object = storage.as_mut_ptr() as u64;
+        // SAFETY: the fixture owns both raw cells in this live storage.
+        let slab = unsafe { storage.as_mut_ptr().add(80) } as u64;
+        assert_eq!(object >> 32, slab >> 32);
+        // SAFETY: the aligned header word lies within the owned fixture.
+        unsafe { ((object + u64::from(layout.slab_handle_byte)) as *mut u32).write(slab as u32) };
+        for field in [
+            FieldLocation::inline(0),
+            FieldLocation::inline(63),
+            FieldLocation::overflow(0),
+            FieldLocation::overflow(2045),
+            FieldLocation::overflow(2046),
+            FieldLocation::overflow(5000),
+        ] {
+            let address = if field.is_inline() {
+                object + u64::from(layout.inline_byte(field))
+            } else {
+                slab + u64::from(layout.slab_words_byte + field.byte_offset())
+            };
+            // SAFETY: every selected word is inside the owned fixture.
+            unsafe { (address as *mut u64).write(otter_vm::Value::number_i32(-7).to_bits()) };
+            let mut ops = Assembler::new().unwrap();
+            emit(&mut ops, layout, 0, 0, field, FieldAccess::LoadInt32);
+            dynasm!(ops ; .arch aarch64 ; ret);
+            let buffer = ops.finalize().unwrap();
+            // SAFETY: this noncollecting probe only reads the fixture's live field.
+            let probe: unsafe extern "C" fn(u64) -> u64 =
+                unsafe { std::mem::transmute(buffer.ptr(AssemblyOffset(0))) };
+            // SAFETY: object points into the fixture and its bank is initialized.
+            assert_eq!(
+                unsafe { probe(object) },
+                u64::from((-7_i32) as u32),
+                "{field:?}"
+            );
+        }
+    }
 
     #[test]
     fn own_field_native_access_uses_the_live_bank_without_an_ssa_storage_pointer() {
@@ -85,9 +137,9 @@ mod tests {
             FieldLocation::overflow(5000),
         ] {
             let mut ops = Assembler::new().unwrap();
-            emit(&mut ops, layout, 0, 1, field, true);
+            emit(&mut ops, layout, 0, 1, field, FieldAccess::Store);
             let store_end = ops.offset().0;
-            emit(&mut ops, layout, 0, 0, field, false);
+            emit(&mut ops, layout, 0, 0, field, FieldAccess::LoadTagged);
             let load_end = ops.offset().0;
             dynasm!(ops ; .arch aarch64 ; ret);
             let buffer = ops.finalize().unwrap();

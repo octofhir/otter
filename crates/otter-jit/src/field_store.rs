@@ -33,14 +33,16 @@ pub(crate) struct FieldStoreOwner {
     /// Rooted historical targets whose current membership needs no widening.
     pub(crate) stored_shapes: SmallVec<[u32; 2]>,
     pub(crate) nullish_mask: u8,
+    pub(crate) int32: bool,
 }
 
 /// Every category a stored value can have once its store completes: at most
-/// two exact ordinary shapes and the nullish bits of the scalar encoding.
+/// two exact ordinary shapes, int32 numbers and nullish alternatives.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct StoreValueBound {
     pub(crate) shapes: SmallVec<[u32; 2]>,
     pub(crate) nullish: u8,
+    pub(crate) int32: bool,
 }
 
 impl StoreValueBound {
@@ -49,6 +51,7 @@ impl StoreValueBound {
         Self {
             shapes: smallvec::smallvec![shape],
             nullish: 0,
+            int32: false,
         }
     }
 
@@ -64,6 +67,7 @@ impl StoreValueBound {
         Some(Self {
             shapes,
             nullish: self.nullish,
+            int32: self.int32,
         })
     }
 }
@@ -82,12 +86,14 @@ impl FieldStoreOwner {
             },
             stored_shapes: record.stored_shapes.clone(),
             nullish_mask: record.nullish_mask,
+            int32: record.guard.expected & field_type::INT32 != 0,
         }
     }
 
     /// Whether the captured categories already contain every category of `bound`.
     pub(crate) fn captures(record: &JitFieldType, bound: &StoreValueBound) -> bool {
         u64::from(bound.nullish) & !record.guard.expected == 0
+            && (!bound.int32 || record.guard.expected & field_type::INT32 != 0)
             && bound
                 .shapes
                 .iter()

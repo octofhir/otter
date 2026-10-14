@@ -5,9 +5,11 @@
 //! - Receiver-specific store authority and loop guard cache lifetime.
 //! - Demand for owner guards across SSA merges and distinct receivers.
 //! - Nullish comparisons specialize only under independently consumed bounds.
+//! - Exact int32 summaries keep payload loads unboxed under owner guards.
 //!
 //! # Invariants
 //! - Synthetic summaries authorize only the explicit target shapes.
+//!   Numeric summaries authorize only their exact stored representation.
 //! - Graph checks retain their original eager source instruction.
 //!
 //! # See also
@@ -50,6 +52,60 @@ fn field_load(destination: u16, receiver: u16) -> (Op, Vec<Operand>) {
             Operand::ConstIndex(0),
         ],
     )
+}
+
+#[test]
+fn exact_int32_fields_load_the_payload_under_their_owner_proof() {
+    for expected in [
+        field_type::INT32,
+        field_type::INT32 | field_type::NULL,
+        field_type::TOP,
+    ] {
+        let mut view = field_type_view(
+            vec![
+                field_load(2, 0),
+                (Op::ReturnValue, vec![Operand::Register(2)]),
+            ],
+            0,
+        );
+        let record = view
+            .field_types
+            .get_mut(&(128, FieldLocation::inline(0)))
+            .unwrap();
+        record.guard.expected = expected;
+        record.shapes.clear();
+        record.stored_shapes.clear();
+        record.nullish_mask = (expected & field_type::NULL) as u8;
+        view.property_programs
+            .insert(0, vec![load_program(128, FieldLocation::inline(0), false)]);
+        let built = load_graph(&view);
+        let load = built
+            .graph
+            .nodes
+            .iter()
+            .find(|node| matches!(node.kind, Kind::LoadOwnField(_)))
+            .unwrap();
+        let int32 = expected == field_type::INT32;
+        assert_eq!(load.repr, if int32 { Repr::Int32 } else { Repr::Tagged });
+        assert!(
+            !built
+                .graph
+                .nodes
+                .iter()
+                .any(|node| node.kind == Kind::CheckedTaggedToInt32)
+        );
+        let guards: Vec<_> = built
+            .graph
+            .nodes
+            .iter()
+            .filter(|node| node.block.is_some() && matches!(node.kind, Kind::CheckFieldTypes(_)))
+            .collect();
+        assert_eq!(guards.len(), usize::from(int32));
+        if let [guard] = guards.as_slice() {
+            let state = built.graph.frame_state(guard.eager.unwrap());
+            assert_eq!((state.function_id, state.pc), (90, 0));
+        }
+    }
 }
 
 #[test]
@@ -705,6 +761,7 @@ fn polymorphic_own_stores_select_each_defining_owner() {
                     owner_shape: 384,
                     stored_shapes: smallvec::smallvec![640],
                     nullish_mask: 1,
+                    int32: false,
                 },
             ),
             (
@@ -713,6 +770,7 @@ fn polymorphic_own_stores_select_each_defining_owner() {
                     owner_shape: 512,
                     stored_shapes: smallvec::smallvec![768],
                     nullish_mask: 2,
+                    int32: false,
                 },
             ),
         ]
@@ -794,6 +852,7 @@ fn partially_elided_stores_retain_every_admitted_receiver_arm() {
                             owner_shape: 0,
                             stored_shapes: smallvec::SmallVec::new(),
                             nullish_mask: 2,
+                            int32: false,
                         },
                     ),
                     (
@@ -802,6 +861,7 @@ fn partially_elided_stores_retain_every_admitted_receiver_arm() {
                             owner_shape: 512,
                             stored_shapes: smallvec::SmallVec::new(),
                             nullish_mask: 0,
+                            int32: false,
                         },
                     ),
                 ]
@@ -1002,6 +1062,7 @@ fn named_store_owner(
                     owner_shape: 0,
                     stored_shapes: record_stored.clone(),
                     nullish_mask: record_nullish,
+                    int32: false,
                 },
                 [(_, owner)] => owner.clone(),
                 _ => panic!("one admitted receiver"),

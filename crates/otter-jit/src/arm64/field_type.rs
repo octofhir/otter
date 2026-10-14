@@ -2,7 +2,7 @@
 //!
 //! # Contents
 //! - Captured historical targets bypass observation for unchanged membership.
-//! - Inline Top and exact-shape membership probes with scalar widening.
+//! - Inline Top, int32 and exact-shape membership probes with scalar widening.
 //! - A cold noncollecting VM leaf that monotonically widens the owner word,
 //!   and every widening of a summary code subscribed to.
 //!
@@ -25,7 +25,7 @@
 
 use dynasmrt::{DynasmApi, DynasmLabelApi, aarch64::Assembler, dynasm};
 use otter_vm::object::field_type::{
-    FIRST_SHAPE_SHIFT, NULL, SECOND_SHAPE_SHIFT, SHAPE_MASK, TOP, UNDEFINED,
+    FIRST_SHAPE_SHIFT, INT32, NULL, SECOND_SHAPE_SHIFT, SHAPE_MASK, TOP, UNDEFINED,
 };
 use otter_vm::value::tag;
 use otter_vm::{JitCompileSnapshot, native_abi as abi, object::ShapeState};
@@ -54,7 +54,7 @@ pub(crate) fn emit_observe_known(
     debug_assert!(stored_shapes.len() <= 2 && stored_shapes.iter().all(|shape| *shape != 0));
     let nullish_mask = u64::from(nullish_mask);
     debug_assert!(nullish_mask & !(NULL | UNDEFINED) == 0);
-    if stored_shapes.is_empty() && nullish_mask == 0 {
+    if stored_shapes.is_empty() && nullish_mask == 0 && !record.int32 {
         emit_observe(ops, relocations, view, owner, value);
         return;
     }
@@ -74,6 +74,11 @@ pub(crate) fn emit_observe_known(
         dynasm!(ops ; .arch aarch64 ; b =>fallback);
     }
     dynasm!(ops ; .arch aarch64 ; =>scalar);
+    if record.int32 {
+        dynasm!(ops ; .arch aarch64
+            ; asr x16, X(value), tag::NUMBER_TAG.trailing_zeros()
+            ; cmn x16, 1 ; b.eq =>done);
+    }
     if nullish_mask == NULL | UNDEFINED {
         dynasm!(ops ; .arch aarch64
             ; orr x16, X(value), tag::UNDEFINED_TAG
@@ -108,6 +113,7 @@ pub(crate) fn emit_observe(
     let top = ops.new_dynamic_label();
     let null = ops.new_dynamic_label();
     let undefined = ops.new_dynamic_label();
+    let int32 = ops.new_dynamic_label();
     let slow = ops.new_dynamic_label();
     dynasm!(ops ; .arch aarch64 ; cbz W(owner), =>done);
     emit_load_symbol_u64(
@@ -138,6 +144,9 @@ pub(crate) fn emit_observe(
         ; lsr x17, x17, SECOND_SHAPE_SHIFT
         ; cmp x16, x17 ; b.eq =>done ; b =>slow
         ; =>scalar);
+    dynasm!(ops ; .arch aarch64
+        ; asr x16, X(value), tag::NUMBER_TAG.trailing_zeros()
+        ; cmn x16, 1 ; b.eq =>int32);
     emit_load_u64(ops, 16, VALUE_NULL);
     dynasm!(ops ; .arch aarch64 ; cmp X(value), x16 ; b.eq =>null);
     emit_load_u64(ops, 16, VALUE_UNDEFINED);
@@ -150,6 +159,10 @@ pub(crate) fn emit_observe(
         ; =>undefined ; tbnz x17, UNDEFINED.trailing_zeros(), =>done
         ; ldrb w16, [X(owner), view.shape_watched_byte] ; tbnz w16, WATCHED, =>slow
         ; orr x17, x17, UNDEFINED
+        ; str x17, [X(owner), view.shape_field_type_byte] ; b =>done
+        ; =>int32 ; tbnz x17, INT32.trailing_zeros(), =>done
+        ; ldrb w16, [X(owner), view.shape_watched_byte] ; tbnz w16, WATCHED, =>slow
+        ; orr x17, x17, INT32
         ; str x17, [X(owner), view.shape_field_type_byte] ; b =>done
         ; =>top
         ; ldrb w16, [X(owner), view.shape_watched_byte] ; tbnz w16, WATCHED, =>slow);

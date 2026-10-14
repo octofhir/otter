@@ -148,6 +148,7 @@ fn execute(
                     owner_shape: 0,
                     stored_shapes: smallvec::SmallVec::new(),
                     nullish_mask: 0,
+                    int32: false,
                 };
                 inputs.len()
             ],
@@ -440,6 +441,7 @@ fn zero_records_emit_no_observation_and_keep_the_buffer_live() {
                 owner_shape: if observed && index == 1 { 8192 } else { 0 },
                 stored_shapes: smallvec::smallvec![4096],
                 nullish_mask: 0,
+                int32: false,
             })
             .collect();
         let mut ops = Assembler::new().unwrap();

@@ -121,7 +121,7 @@ impl Interpreter {
         let mut shapes = smallvec::SmallVec::new();
         let mut stored_shapes = smallvec::SmallVec::new();
         if expected != 0 && expected != field_type::TOP {
-            let mut complete_stable_bound = true;
+            let mut complete_stable_bound = expected & field_type::INT32 == 0;
             for shift in [
                 field_type::FIRST_SHAPE_SHIFT,
                 field_type::SECOND_SHAPE_SHIFT,
@@ -319,8 +319,20 @@ mod tests {
                 count.guard.owner_shape,
                 field_type::owner(receiver_shape, 1).unwrap().offset()
             );
-            assert_eq!(count.guard.expected, field_type::TOP);
+            assert_eq!(count.guard.expected, field_type::INT32);
             assert!(count.shapes.is_empty() && count.stored_shapes.is_empty());
+
+            interpreter
+                .create_data_property(&mut receiver_object, "link", Value::number_i32(3))
+                .unwrap();
+            interpreter.bake_field_types(&mut view);
+            let mixed = &view.field_types[&(receiver_shape.offset(), FieldLocation::inline(0))];
+            assert_eq!(mixed.guard.expected & field_type::INT32, field_type::INT32);
+            assert!(
+                mixed.shapes.is_empty(),
+                "numeric arm denies object load proof"
+            );
+            assert_eq!(mixed.stored_shapes.as_slice(), &[target_shape.offset()]);
         });
     }
 }

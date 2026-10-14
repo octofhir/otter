@@ -62,7 +62,11 @@ impl Codegen<'_> {
                 Self::gp(input(0)),
                 output(),
                 field,
-                false,
+                if self.graph.node(node).repr == crate::graph::ir::Repr::Int32 {
+                    crate::field_access::FieldAccess::LoadInt32
+                } else {
+                    crate::field_access::FieldAccess::LoadTagged
+                },
             ),
             Kind::StoreOwnField { field, owners } => {
                 let object = Self::gp(input(0));
@@ -73,7 +77,7 @@ impl Codegen<'_> {
                     object,
                     value,
                     field,
-                    true,
+                    crate::field_access::FieldAccess::Store,
                 );
                 if !owners.is_empty() {
                     let owner = allocation.gp_temps[0];

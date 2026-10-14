@@ -79,7 +79,12 @@ fn packed_unions_are_canonical_and_saturate() {
     );
     assert_eq!(merge(expected, TOP), TOP);
     assert_eq!(merge(TOP, 0), TOP);
-    assert_eq!(merge(NULL, 1 << 4), TOP);
+    assert_eq!(merge(NULL, 1 << 5), TOP);
+    assert_eq!(merge(expected, INT32), expected | INT32);
+    assert_eq!(
+        merge(INT32 | NULL, INT32 | UNDEFINED),
+        INT32 | NULL | UNDEFINED
+    );
     assert!(is_canonical(expected));
 }
 
@@ -96,7 +101,7 @@ fn malformed_counts_and_identity_order_saturate() {
         two | (7 << FIRST_SHAPE_SHIFT) | (3 << SECOND_SHAPE_SHIFT),
         two | (3 << FIRST_SHAPE_SHIFT) | (3 << SECOND_SHAPE_SHIFT),
         TOP | NULL,
-        1 << 4,
+        1 << 5,
     ] {
         assert!(!is_canonical(malformed));
         assert_eq!(merge(malformed, NULL), TOP);
@@ -107,6 +112,8 @@ fn malformed_counts_and_identity_order_saturate() {
         NULL,
         UNDEFINED,
         NULL | UNDEFINED,
+        INT32,
+        INT32 | NULL | UNDEFINED,
         shape_id_sample(3),
         TOP,
     ] {
@@ -120,6 +127,7 @@ fn low_byte_equality_identifies_the_full_word_within_one_history() {
         0,
         NULL,
         UNDEFINED,
+        INT32,
         shape_id_sample(7),
         shape_id_sample(3),
         shape_id_sample(11),
@@ -138,7 +146,7 @@ fn low_byte_equality_identifies_the_full_word_within_one_history() {
             }
         }
     }
-    assert_eq!(states.len(), 29);
+    assert_eq!(states.len(), 57);
     for captured in states {
         let mut history = vec![captured];
         let mut cursor = 0;
@@ -182,6 +190,9 @@ fn append_descendants_share_only_defining_data_cells() {
     assert_eq!(snapshot(owner(second.get(), 0).unwrap()), NULL | UNDEFINED);
     assert_eq!(observer_owner(second.get(), 0), Some(first.get()));
     observe_owner(first.get(), Value::number_i32(3));
+    assert_eq!(snapshot(first.get()), INT32 | NULL | UNDEFINED);
+    assert_eq!(observer_owner(second.get(), 0), Some(first.get()));
+    observe_owner(first.get(), Value::number_f64(3.5));
     assert_eq!(snapshot(first.get()), TOP);
     assert_eq!(observer_owner(second.get(), 0), Some(ShapeHandle::null()));
     assert_eq!(observer_owner(second.get(), 99), None);

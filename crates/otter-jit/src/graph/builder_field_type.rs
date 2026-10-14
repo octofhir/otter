@@ -2,7 +2,7 @@
 //!
 //! # Contents
 //! - [`FieldValueBound`] describes an SSA value's nullish and ordinary arms.
-//! - Builder helpers guard owner summaries, revalidate targets and refine edges.
+//! - Builder helpers guard owner summaries, prove int32 payloads and refine edges.
 //! - Nullish comparisons reuse owner guards already demanded by other consumers.
 //! - Store selection forms each native store's one observation record.
 //!
@@ -11,6 +11,7 @@
 //! - Exact target shapes require a live stability check before layout use.
 //! - Owner guards stay at their source loads and survive only when consumed.
 //! - Nullable bounds never enter ordinary layout facts before refinement.
+//! - Only an exact int32 summary authorizes an untagged field load.
 //! - Every admitted store receiver selects its own defining field owner.
 //! - Named and literal stores select records from proofs the path already
 //!   owns: current exact layouts, nullish constants, or a field bound whose
@@ -125,7 +126,6 @@ impl Builder<'_> {
     ) -> Option<FieldValueBound> {
         let mut bound: Option<FieldValueBound> = None;
         let mut guards = SmallVec::new();
-        let mut existing = SmallVec::new();
         for &receiver in receivers {
             let record = self.view.field_types.get(&(receiver, field))?;
             if record.shapes.is_empty() {
@@ -140,17 +140,54 @@ impl Builder<'_> {
                 Some(ref old) => old.union(&next)?,
                 None => next,
             });
-            if let Some(&(expected, node)) = self
-                .known
-                .checked_field_types
-                .get(&record.guard.owner_shape)
-                && expected == record.guard.expected
+            if !guards.contains(&record.guard) {
+                guards.push(record.guard);
+            }
+        }
+        if let Some(bound) = &mut bound {
+            bound.guards = self.guard_field_owners(guards);
+        }
+        bound
+    }
+
+    /// Every receiver's defining cell contains only int32-tagged values.
+    /// Demand the owner proof before the load replaces its tagged value.
+    pub(super) fn field_load_is_int32(&mut self, receivers: &[u32], field: FieldLocation) -> bool {
+        if receivers.is_empty() {
+            return false;
+        }
+        let mut guards = SmallVec::new();
+        for &receiver in receivers {
+            let Some(record) = self.view.field_types.get(&(receiver, field)) else {
+                return false;
+            };
+            if record.guard.expected != field_type::INT32 {
+                return false;
+            }
+            if !guards.contains(&record.guard) {
+                guards.push(record.guard);
+            }
+        }
+        let proofs = self.guard_field_owners(guards);
+        self.required_field_guards.extend(proofs);
+        true
+    }
+
+    fn guard_field_owners(
+        &mut self,
+        owners: SmallVec<[otter_vm::jit::JitFieldTypeGuard; 4]>,
+    ) -> SmallVec<[NodeId; 4]> {
+        let mut guards = SmallVec::new();
+        let mut existing = SmallVec::new();
+        for guard in owners {
+            if let Some(&(expected, node)) = self.known.checked_field_types.get(&guard.owner_shape)
+                && expected == guard.expected
             {
                 if !existing.contains(&node) {
                     existing.push(node);
                 }
-            } else if !guards.contains(&record.guard) {
-                guards.push(record.guard);
+            } else {
+                guards.push(guard);
             }
         }
         if !guards.is_empty() {
@@ -162,10 +199,7 @@ impl Builder<'_> {
                     .insert(guard.owner_shape, (guard.expected, node));
             }
         }
-        if let Some(bound) = &mut bound {
-            bound.guards = existing;
-        }
-        bound
+        existing
     }
 
     pub(super) fn prune_field_guards(&mut self) {
@@ -295,9 +329,12 @@ impl Builder<'_> {
             .or_else(|| {
                 FieldValueBound::of(&self.graph, value, &self.known, &self.root.stable_shapes)
             });
-        let bound = rhs.as_ref().map(|rhs| StoreValueBound {
-            shapes: rhs.shapes.clone(),
-            nullish: rhs.nullish,
+        let bound = self.store_value_bound(value).or_else(|| {
+            rhs.as_ref().map(|rhs| StoreValueBound {
+                shapes: rhs.shapes.clone(),
+                nullish: rhs.nullish,
+                int32: false,
+            })
         });
         let mut owners: SmallVec<[(u32, FieldStoreOwner); 4]> = SmallVec::new();
         let mut uses_bound = false;
@@ -354,10 +391,25 @@ impl Builder<'_> {
     }
 
     /// The bound `value` has at a native store, from proofs this path already
-    /// owns: a current exact layout, a nullish constant, or a field bound
+    /// owns: an int32 representation, a current exact layout, a nullish constant, or a field bound
     /// whose owner guards other consumers demand and whose ordinary targets
     /// this path already rechecked. Adds no node and demands no guard.
     pub(super) fn store_value_bound(&self, value: NodeId) -> Option<StoreValueBound> {
+        if self.graph.node(value).repr == Repr::Int32
+            || matches!(self.graph.node(value).kind, Kind::Int32ToTagged)
+            || self
+                .known
+                .get(value)
+                .is_some_and(|info| info.int32.is_some())
+            || matches!(self.graph.node(value).kind, Kind::ConstTagged(bits)
+                if otter_vm::Value::from_bits(bits).as_i32().is_some())
+        {
+            return Some(StoreValueBound {
+                shapes: SmallVec::new(),
+                nullish: 0,
+                int32: true,
+            });
+        }
         if let Some(shapes) = self
             .known
             .layout(value)
@@ -368,6 +420,7 @@ impl Builder<'_> {
             return Some(StoreValueBound {
                 shapes: shapes.iter().copied().collect(),
                 nullish: 0,
+                int32: false,
             });
         }
         match self.graph.node(value).kind {
@@ -375,12 +428,14 @@ impl Builder<'_> {
                 return Some(StoreValueBound {
                     shapes: SmallVec::new(),
                     nullish: UNDEFINED,
+                    int32: false,
                 });
             }
             Kind::ConstTagged(bits) if bits == tag::VALUE_NULL => {
                 return Some(StoreValueBound {
                     shapes: SmallVec::new(),
                     nullish: NULL,
+                    int32: false,
                 });
             }
             _ => {}
@@ -397,6 +452,7 @@ impl Builder<'_> {
         .then(|| StoreValueBound {
             shapes: bound.shapes.clone(),
             nullish: bound.nullish,
+            int32: false,
         })
     }
 

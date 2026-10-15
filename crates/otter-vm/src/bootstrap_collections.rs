@@ -202,9 +202,10 @@ pub fn install_collection_well_knowns_post_bootstrap(
                     configurable: Some(true),
                     ..Default::default()
                 },
-            )? {
-                return Err(JsSurfaceError::DefinePropertyFailed("[[SymbolProperty]]"));
-            };
+            )?
+        {
+            return Err(JsSurfaceError::DefinePropertyFailed("[[SymbolProperty]]"));
+        };
         // §24.2.3.6 — `Set.prototype.keys` is the same function
         // object as `Set.prototype.values`. The individual `method`
         // builder allocates a fresh NativeFunction per name; overwrite
@@ -223,9 +224,10 @@ pub fn install_collection_well_knowns_post_bootstrap(
                     configurable: Some(true),
                     ..Default::default()
                 },
-            )? {
-                return Err(JsSurfaceError::DefinePropertyFailed("[[BuiltinProperty]]"));
-            };
+            )?
+        {
+            return Err(JsSurfaceError::DefinePropertyFailed("[[BuiltinProperty]]"));
+        };
     }
     Ok(())
 }
@@ -707,14 +709,10 @@ fn build_adder_args<'s>(
         Ok(v) => v,
         Err(err) => {
             if let Some(iterator_h) = iterator_for_close
-                && matches!(&err, CommittedValueError::JavaScript(_)) {
-                    iterator_close::preserving_completion(
-                        scope,
-                        Some(context),
-                        iterator_h,
-                        ctor_name,
-                    )?;
-                }
+                && matches!(&err, CommittedValueError::JavaScript(_))
+            {
+                iterator_close::preserving_completion(scope, Some(context), iterator_h, ctor_name)?;
+            }
             return Err(err.into_native(scope.context().interp_mut(), ctor_name));
         }
     };
@@ -725,14 +723,10 @@ fn build_adder_args<'s>(
         Ok(v) => v,
         Err(err) => {
             if let Some(iterator_h) = iterator_for_close
-                && matches!(&err, CommittedValueError::JavaScript(_)) {
-                    iterator_close::preserving_completion(
-                        scope,
-                        Some(context),
-                        iterator_h,
-                        ctor_name,
-                    )?;
-                }
+                && matches!(&err, CommittedValueError::JavaScript(_))
+            {
+                iterator_close::preserving_completion(scope, Some(context), iterator_h, ctor_name)?;
+            }
             return Err(err.into_native(scope.context().interp_mut(), ctor_name));
         }
     };

@@ -182,8 +182,7 @@ impl Interpreter {
         src: u16,
     ) -> Result<(), CommittedValueError> {
         self.with_handle_scope(|interp, scope| {
-            let value = *read_register(&stack[top_idx], src)
-                .map_err(CommittedValueError::Fatal)?;
+            let value = *read_register(&stack[top_idx], src).map_err(CommittedValueError::Fatal)?;
             let value_root = interp.scoped_value(scope, value);
             if let Some(handle) = value.as_generator()
                 && handle.is_async(&interp.gc_heap)
@@ -448,8 +447,7 @@ impl Interpreter {
             {
                 return Ok(());
             }
-            let value = *read_register(&stack[top_idx], src)
-                .map_err(CommittedValueError::Fatal)?;
+            let value = *read_register(&stack[top_idx], src).map_err(CommittedValueError::Fatal)?;
             let value_root = interp.scoped_value(scope, value);
             let primordial = interp.frame_iterates_primordially(context, stack, top_idx);
             if let Some(record) = interp
@@ -3009,10 +3007,8 @@ impl Interpreter {
         let operands = |stack: &ActivationStack| -> Result<(Value, Value), CommittedValueError> {
             let frame = &stack[frame_index];
             Ok((
-                *read_register(frame, array_reg)
-                    .map_err(CommittedValueError::Fatal)?,
-                *read_register(frame, iterable_reg)
-                    .map_err(CommittedValueError::Fatal)?,
+                *read_register(frame, array_reg).map_err(CommittedValueError::Fatal)?,
+                *read_register(frame, iterable_reg).map_err(CommittedValueError::Fatal)?,
             ))
         };
         // A proven plain dense array copies straight across. Proving may
@@ -4056,10 +4052,8 @@ impl Interpreter {
         operands: impl crate::executable::OperandSource,
     ) -> Result<(), CommittedValueError> {
         self.with_handle_scope(|interp, scope| {
-            let dst = register_operand(operands.first())
-                .map_err(CommittedValueError::Fatal)?;
-            let src = register_operand(operands.get(1))
-                .map_err(CommittedValueError::Fatal)?;
+            let dst = register_operand(operands.first()).map_err(CommittedValueError::Fatal)?;
+            let src = register_operand(operands.get(1)).map_err(CommittedValueError::Fatal)?;
             let top_idx = stack.len() - 1;
             let pc = stack[top_idx].pc;
 
@@ -4070,8 +4064,8 @@ impl Interpreter {
                 .filter(|s| s.pc == pc && s.dst == dst)
                 .cloned();
             if let Some(_state) = resume {
-                let produced = *read_register(&stack[top_idx], dst)
-                    .map_err(CommittedValueError::Fatal)?;
+                let produced =
+                    *read_register(&stack[top_idx], dst).map_err(CommittedValueError::Fatal)?;
                 // §7.4.3 step 2 — `[@@iterator]()` must return an
                 // Object; GetIteratorDirect then reads `next` once. Both
                 // are owned by the shared wrap helper. A failure here must
@@ -4110,8 +4104,7 @@ impl Interpreter {
                     .map_err(CommittedValueError::Fatal)?;
                 return Ok(());
             }
-            let value = *read_register(&stack[top_idx], src)
-                .map_err(CommittedValueError::Fatal)?;
+            let value = *read_register(&stack[top_idx], src).map_err(CommittedValueError::Fatal)?;
             let value_root = interp.scoped_value(scope, value);
             let primordial = interp.frame_iterates_primordially(context, stack, top_idx);
             if let Some(record) = interp

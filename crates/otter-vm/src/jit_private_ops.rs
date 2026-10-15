@@ -35,10 +35,9 @@ impl Interpreter {
         obj_reg: u16,
         key_reg: u16,
     ) -> Result<(), CommittedValueError> {
-        let receiver = *read_register(&stack[top_idx], obj_reg)
-            .map_err(CommittedValueError::Fatal)?;
-        let key = *read_register(&stack[top_idx], key_reg)
-            .map_err(CommittedValueError::Fatal)?;
+        let receiver =
+            *read_register(&stack[top_idx], obj_reg).map_err(CommittedValueError::Fatal)?;
+        let key = *read_register(&stack[top_idx], key_reg).map_err(CommittedValueError::Fatal)?;
         let Some(sym) = key.as_symbol(&self.gc_heap) else {
             return Err(CommittedValueError::JavaScript(
                 self.err_type(
@@ -81,11 +80,8 @@ impl Interpreter {
             },
         };
         let frame = &mut stack[top_idx];
-        write_register(frame, dst, result)
-            .map_err(CommittedValueError::Fatal)?;
-        frame
-            .advance_pc()
-            .map_err(CommittedValueError::Fatal)?;
+        write_register(frame, dst, result).map_err(CommittedValueError::Fatal)?;
+        frame.advance_pc().map_err(CommittedValueError::Fatal)?;
         Ok(())
     }
 
@@ -99,10 +95,9 @@ impl Interpreter {
         key_reg: u16,
         value_reg: u16,
     ) -> Result<(), CommittedValueError> {
-        let receiver = *read_register(&stack[top_idx], obj_reg)
-            .map_err(CommittedValueError::Fatal)?;
-        let key = *read_register(&stack[top_idx], key_reg)
-            .map_err(CommittedValueError::Fatal)?;
+        let receiver =
+            *read_register(&stack[top_idx], obj_reg).map_err(CommittedValueError::Fatal)?;
+        let key = *read_register(&stack[top_idx], key_reg).map_err(CommittedValueError::Fatal)?;
         let Some(sym) = key.as_symbol(&self.gc_heap) else {
             return Err(CommittedValueError::JavaScript(
                 self.err_type(
@@ -180,10 +175,10 @@ impl Interpreter {
         obj_reg: u16,
         brand_reg: u16,
     ) -> Result<(), CommittedValueError> {
-        let receiver = *read_register(&stack[top_idx], obj_reg)
-            .map_err(CommittedValueError::Fatal)?;
-        let brand = *read_register(&stack[top_idx], brand_reg)
-            .map_err(CommittedValueError::Fatal)?;
+        let receiver =
+            *read_register(&stack[top_idx], obj_reg).map_err(CommittedValueError::Fatal)?;
+        let brand =
+            *read_register(&stack[top_idx], brand_reg).map_err(CommittedValueError::Fatal)?;
         let Some(sym) = brand.as_symbol(&self.gc_heap) else {
             return Err(CommittedValueError::JavaScript(
                 self.err_type(

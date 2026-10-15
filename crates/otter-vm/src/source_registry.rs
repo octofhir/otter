@@ -457,9 +457,7 @@ mod tests {
         );
         let retained =
             SharedSource::admit(&account, text.to_owned()).expect("exact text admission");
-        let before = *account
-            .snapshot()
-            .get(ResourceClass::SourceModuleBytes);
+        let before = *account.snapshot().get(ResourceClass::SourceModuleBytes);
         let error = SourceRegistry::new(
             BTreeMap::from([("same.js".to_owned(), retained.clone())]),
             &account,
@@ -468,9 +466,7 @@ mod tests {
         assert!(matches!(error, ResourceError::Exhausted {
             class: ResourceClass::SourceModuleBytes, requested, in_use, limit: actual_limit,
         } if requested > 0 && in_use == limit && actual_limit == limit));
-        let after = *account
-            .snapshot()
-            .get(ResourceClass::SourceModuleBytes);
+        let after = *account.snapshot().get(ResourceClass::SourceModuleBytes);
         assert_eq!(after.current(), before.current());
         assert_eq!(after.peak(), before.peak());
         assert_eq!(after.rejections(), before.rejections() + 1);

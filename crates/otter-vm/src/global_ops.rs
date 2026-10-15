@@ -98,11 +98,8 @@ impl Interpreter {
     ) -> Result<(), CommittedValueError> {
         let value = self.load_global_or_throw_value(stack, context, function_id, name_idx)?;
         let frame = &mut stack[top_idx];
-        write_register(frame, dst, value)
-            .map_err(CommittedValueError::Fatal)?;
-        frame
-            .advance_pc()
-            .map_err(CommittedValueError::Fatal)?;
+        write_register(frame, dst, value).map_err(CommittedValueError::Fatal)?;
+        frame.advance_pc().map_err(CommittedValueError::Fatal)?;
         Ok(())
     }
 
@@ -185,11 +182,8 @@ impl Interpreter {
         let function_id = stack[top_idx].function_id;
         let value = self.load_global_or_undefined_value(context, stack, function_id, name_idx)?;
         let frame = &mut stack[top_idx];
-        write_register(frame, dst, value)
-            .map_err(CommittedValueError::Fatal)?;
-        frame
-            .advance_pc()
-            .map_err(CommittedValueError::Fatal)?;
+        write_register(frame, dst, value).map_err(CommittedValueError::Fatal)?;
+        frame.advance_pc().map_err(CommittedValueError::Fatal)?;
         Ok(())
     }
 
@@ -329,8 +323,7 @@ impl Interpreter {
     ) -> Result<(), CommittedValueError> {
         let frame = &stack[frame_index];
         let function_id = frame.function_id;
-        let value = *crate::read_register(frame, value_reg)
-            .map_err(CommittedValueError::Fatal)?;
+        let value = *crate::read_register(frame, value_reg).map_err(CommittedValueError::Fatal)?;
         self.define_global_var_value(context, stack, function_id, name_idx, value)?;
         stack[frame_index]
             .advance_pc()
@@ -713,11 +706,8 @@ impl Interpreter {
         let function_id = stack[top_idx].function_id;
         let exists = self.global_binding_exists_value(stack, context, function_id, name_idx)?;
         let frame = &mut stack[top_idx];
-        crate::write_register(frame, dst, exists)
-            .map_err(CommittedValueError::Fatal)?;
-        frame
-            .advance_pc()
-            .map_err(CommittedValueError::Fatal)?;
+        crate::write_register(frame, dst, exists).map_err(CommittedValueError::Fatal)?;
+        frame.advance_pc().map_err(CommittedValueError::Fatal)?;
         Ok(())
     }
 

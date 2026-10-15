@@ -2276,13 +2276,14 @@ pub unsafe extern "C" fn call_stack_overflow(ctx: *mut JitCtx) -> NativeResultPa
     ctx.pending_call.caller = 0;
     ctx.pending_call.caller_return_pc = 0;
     if !ctx.pending_call.construct_layout.is_null()
-        && let Some(activation) = ctx.checked_activation().copied() {
-            // SAFETY: the failed entry retains its published VM activation. No
-            // allocation/GC occurs while taking and sampling this incoming ticket.
-            if let Some(vm) = unsafe { activation.vm.as_mut() } {
-                vm.complete_unentered_constructor_layout(&mut ctx.pending_call);
-            }
+        && let Some(activation) = ctx.checked_activation().copied()
+    {
+        // SAFETY: the failed entry retains its published VM activation. No
+        // allocation/GC occurs while taking and sampling this incoming ticket.
+        if let Some(vm) = unsafe { activation.vm.as_mut() } {
+            vm.complete_unentered_constructor_layout(&mut ctx.pending_call);
         }
+    }
     if let Some(error) = unsafe { ctx.error.as_mut() } {
         *error = Some(VmError::StackOverflow {
             limit: ctx.generated_depth_limit.min(u64::from(u32::MAX)) as u32,
@@ -2298,13 +2299,14 @@ extern "C" fn invalid_call_request(ctx: *mut JitCtx) -> NativeResultPair {
     ctx.pending_call.caller = 0;
     ctx.pending_call.caller_return_pc = 0;
     if !ctx.pending_call.construct_layout.is_null()
-        && let Some(activation) = ctx.checked_activation().copied() {
-            // SAFETY: the failed entry retains its published VM activation. No
-            // allocation/GC occurs while taking and sampling this incoming ticket.
-            if let Some(vm) = unsafe { activation.vm.as_mut() } {
-                vm.complete_unentered_constructor_layout(&mut ctx.pending_call);
-            }
+        && let Some(activation) = ctx.checked_activation().copied()
+    {
+        // SAFETY: the failed entry retains its published VM activation. No
+        // allocation/GC occurs while taking and sampling this incoming ticket.
+        if let Some(vm) = unsafe { activation.vm.as_mut() } {
+            vm.complete_unentered_constructor_layout(&mut ctx.pending_call);
         }
+    }
     if let Some(error) = unsafe { ctx.error.as_mut() } {
         *error = Some(VmError::InvalidOperand);
     }

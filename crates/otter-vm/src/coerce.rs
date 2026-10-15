@@ -127,8 +127,7 @@ pub(crate) fn to_string_or_throw(
     } else {
         interp.evaluate_to_primitive(stack, context, input, ToPrimitiveHint::String)?
     };
-    primitive_to_string_lossy(interp, &primitive)
-        .map_err(CommittedValueError::JavaScript)
+    primitive_to_string_lossy(interp, &primitive).map_err(CommittedValueError::JavaScript)
 }
 
 /// §7.1.17 `ToString` restricted to primitive operands — the re-entry-free
@@ -192,8 +191,8 @@ pub(crate) fn to_js_string_units(
     if let Some(s) = primitive.as_string(&interp.gc_heap) {
         return Ok(s.with_utf16(&interp.gc_heap, <[u16]>::to_vec));
     }
-    let rendered = primitive_to_string_lossy(interp, &primitive)
-        .map_err(CommittedValueError::JavaScript)?;
+    let rendered =
+        primitive_to_string_lossy(interp, &primitive).map_err(CommittedValueError::JavaScript)?;
     Ok(rendered.encode_utf16().collect())
 }
 
@@ -251,8 +250,7 @@ pub(crate) fn to_number_or_throw(
     } else {
         interp.evaluate_to_primitive(stack, context, input, ToPrimitiveHint::Number)?
     };
-    primitive_to_number(interp, &primitive)
-        .map_err(CommittedValueError::JavaScript)
+    primitive_to_number(interp, &primitive).map_err(CommittedValueError::JavaScript)
 }
 
 /// §7.1.3 `ToNumeric(value)`: a Number or BigInt value. Objects flow

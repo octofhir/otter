@@ -191,9 +191,10 @@ pub fn install_typed_array_well_knowns_post_bootstrap(
                 heap,
                 "toString",
                 PropertyDescriptor::data(fun, true, false, true),
-            )? {
-                return Err(JsSurfaceError::DefinePropertyFailed("[[BuiltinProperty]]"));
-            };
+            )?
+        {
+            return Err(JsSurfaceError::DefinePropertyFailed("[[BuiltinProperty]]"));
+        };
         let abstract_proto_root = Value::object(abstract_proto);
         let getter = crate::bootstrap::native_static_with_value_roots(
             heap,

@@ -491,11 +491,12 @@ fn build_global_this_impl(
             None
         };
         if let Some(object_proto) = object_proto
-            && !object::set_prototype(&mut global, heap, Some(object_proto))? {
-                return Err(JsSurfaceError::DefinePropertyFailed(
-                    "globalThis.[[Prototype]]",
-                ));
-            }
+            && !object::set_prototype(&mut global, heap, Some(object_proto))?
+        {
+            return Err(JsSurfaceError::DefinePropertyFailed(
+                "globalThis.[[Prototype]]",
+            ));
+        }
     }
     if let (Some(t), Some(before)) = (telemetry, before) {
         let after = allocation_snapshot(heap);

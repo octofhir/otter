@@ -57,11 +57,10 @@ impl Interpreter {
                 let arguments = if let Some(object) = existing {
                     self.create_list_from_array_like(stack, context, object)?
                 } else {
-                    let count = self
-                        .elided_forward_argument_count(source)
-                        .ok_or(VmError::InvalidOperand)
-                        .map_err(CommittedValueError::Fatal)?
-                        as usize;
+                    let count =
+                        self.elided_forward_argument_count(source)
+                            .ok_or(VmError::InvalidOperand)
+                            .map_err(CommittedValueError::Fatal)? as usize;
                     let mut arguments = SmallVec::<[Value; 8]>::with_capacity(count);
                     for index in 0..count {
                         let value = source
@@ -128,8 +127,7 @@ impl Interpreter {
                             .registers
                             .get_mut(usize::from(reg))
                             .ok_or(VmError::InvalidOperand)
-                            .map_err(CommittedValueError::Fatal)? =
-                            self.iteration_anchor(word);
+                            .map_err(CommittedValueError::Fatal)? = self.iteration_anchor(word);
                         word += 1;
                     }
                 }
@@ -138,8 +136,7 @@ impl Interpreter {
                         .registers
                         .get_mut(usize::from(register))
                         .ok_or(VmError::InvalidOperand)
-                        .map_err(CommittedValueError::Fatal)? =
-                        self.iteration_anchor(word);
+                        .map_err(CommittedValueError::Fatal)? = self.iteration_anchor(word);
                 }
                 let object = self
                     .materialize_frame_arguments_object(context, stack, index)

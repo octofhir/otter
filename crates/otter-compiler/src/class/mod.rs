@@ -1069,6 +1069,24 @@ pub(crate) fn is_top_level_super_call(stmt: &Statement<'_>) -> bool {
     matches!(call.callee, Expression::Super(_))
 }
 
+/// `super(...), rest…` as an expression statement: the leading super call
+/// and the expressions after it.
+pub(crate) fn leading_super_call_in_sequence<'s, 'a>(
+    stmt: &'s Statement<'a>,
+) -> Option<(&'s Expression<'a>, &'s [Expression<'a>])> {
+    let Statement::ExpressionStatement(es) = stmt else {
+        return None;
+    };
+    let Expression::SequenceExpression(sequence) = &es.expression else {
+        return None;
+    };
+    let (first, rest) = sequence.expressions.split_first()?;
+    let Expression::CallExpression(call) = first else {
+        return None;
+    };
+    matches!(call.callee, Expression::Super(_)).then_some((first, rest))
+}
+
 /// Class-scope slot holding the prototype object instance methods belong
 /// to — their [[HomeObject]]; `super.x` walks one hop up its
 /// `[[Prototype]]` chain.

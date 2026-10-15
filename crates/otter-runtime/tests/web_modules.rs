@@ -477,3 +477,20 @@ fn a_parameter_shadows_an_import_binding_of_the_same_name() {
     );
     assert_eq!(log(&mut runtime), "function:string,number,string,object,1");
 }
+
+#[test]
+fn private_fields_are_installed_by_super_inside_an_expression() {
+    let (mut runtime, map) = page();
+    run_inline(
+        &mut runtime,
+        &map,
+        0,
+        r#"
+        class Base { constructor() { this.base = true; } }
+        const comma = new class extends Base { #a; constructor() { super(), this.#a = 1; } get a() { return this.#a; } };
+        const longer = new class extends Base { #b = 2; constructor() { super(), this.#b += 1, this.seen = this.#b; } };
+        log.push(comma.a, longer.seen, comma.base);
+        "#,
+    );
+    assert_eq!(log(&mut runtime), "1,3,true");
+}

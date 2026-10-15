@@ -94,6 +94,7 @@ pub mod handle;
 mod heap_config;
 pub mod hooks;
 mod hosted_completion;
+pub mod import_map;
 pub mod ipc;
 pub mod module_graph;
 pub mod module_loader;
@@ -116,6 +117,7 @@ pub use static_bootstrap::ExtensionJs;
 pub mod structured_clone;
 pub mod surface;
 pub mod web_fetch_host;
+pub mod web_modules;
 pub mod web_structured_clone;
 pub mod worker;
 
@@ -2525,6 +2527,26 @@ impl RuntimeBuilder {
         self
     }
 
+    /// Serve ES modules the way a browser does, from `map`.
+    ///
+    /// Specifiers resolve by the HTML rules through the map's import map,
+    /// module sources come only from what the embedder delivered into the
+    /// map, and dynamic `import()` parks until its graph is delivered (see
+    /// [`Runtime::web_module_fetches`] and
+    /// [`Runtime::resume_web_dynamic_imports`]). The rest of an existing
+    /// loader configuration is kept.
+    #[must_use]
+    pub fn web_modules(mut self, map: web_modules::WebModuleMap) -> Self {
+        let mut loader = self
+            .config
+            .loader
+            .take()
+            .unwrap_or_else(|| module_loader::LoaderConfig::new(PathBuf::from("/")));
+        loader.web_modules = Some(map);
+        self.config.loader = Some(loader);
+        self
+    }
+
     /// Install an embedder-owned asynchronous http(s) module provider.
     ///
     /// The provider receives owned requests and runs outside the isolate.
@@ -3065,7 +3087,9 @@ impl Runtime {
         interp.set_jit_debug_request(config.jit_debug);
         interp.set_jit_compiler_threads(config.jit_compile_threads);
         if config.gc_trace {
-            let _ = interp.gc_heap_mut().start_gc_pause_capture(GC_TRACE_RECORDS);
+            let _ = interp
+                .gc_heap_mut()
+                .start_gc_pause_capture(GC_TRACE_RECORDS);
         }
         match config.jit_selection {
             JitSelection::ProductionTiered => {
@@ -3103,6 +3127,7 @@ impl Runtime {
             diagnostics: RuntimeDiagnosticsSink::default(),
             package_manager,
             layer_a_dynamic_imports,
+            web_dynamic_imports: Vec::new(),
             runtime_task_spawner,
             commonjs,
             pending_exit_code: None,
@@ -3279,6 +3304,7 @@ impl Runtime {
             diagnostics: RuntimeDiagnosticsSink::default(),
             package_manager,
             layer_a_dynamic_imports,
+            web_dynamic_imports: Vec::new(),
             runtime_task_spawner,
             commonjs,
             pending_exit_code: None,
@@ -3435,6 +3461,9 @@ pub struct Runtime {
     /// between microtask drains. The isolate runner replaces the
     /// loader at spawn, so this queue stays empty under Layer B.
     layer_a_dynamic_imports: LayerADynamicImportQueue,
+    /// Dynamic imports in a web-module runtime whose graph the embedder has
+    /// not delivered yet, in the order they were made.
+    web_dynamic_imports: Vec<ParkedWebImport>,
     /// Sender for owned tasks that must run on the isolate event loop.
     runtime_task_spawner: Option<RuntimeTaskSpawner>,
     /// The CommonJS configuration every `require` of this runtime shares.
@@ -3506,6 +3535,16 @@ struct LayerADynamicImportRequest {
     specifier: String,
     referrer: String,
     attr_type: Option<String>,
+}
+
+/// A web-module dynamic import waiting for the embedder to deliver its graph.
+/// The admission stays held, so the import's completion credit is not
+/// released while the promise is pending.
+#[derive(Debug)]
+struct ParkedWebImport {
+    admission: completion_admission::CompletionAdmission,
+    token: u64,
+    target_url: String,
 }
 
 /// Shared physically bounded FIFO of dynamic-import requests awaiting the
@@ -4238,6 +4277,11 @@ impl Runtime {
             return Ok(DynamicModuleLoad::Loaded(otter_vm::Value::object(
                 namespace,
             )));
+        }
+        // A web page's modules come from its embedder, which fetches on its
+        // own schedule: park the import until the graph is delivered.
+        if loader.web_modules().is_some() && !module_loader::is_data_url(&target_url) {
+            return Ok(DynamicModuleLoad::FetchHttps { target_url });
         }
         // HTTPS / HTTP targets take a separate fetch path because
         // `module_graph::load_program` only walks file:// URLs.
@@ -5536,14 +5580,21 @@ impl Runtime {
                     referrer,
                     attr_type,
                 } = request;
+                let begun =
+                    self.begin_dynamic_import(token, &specifier, &referrer, attr_type.as_deref());
+                if let Ok(DynamicImportBegin::FetchHttps { target_url }) = &begun
+                    && self.web_module_map().is_some()
+                {
+                    self.web_dynamic_imports.push(ParkedWebImport {
+                        admission,
+                        token,
+                        target_url: target_url.clone(),
+                    });
+                    continue;
+                }
                 let active = admission.begin_dispatch();
                 let result = (|| -> Result<(), OtterError> {
-                    match self.begin_dynamic_import(
-                        token,
-                        &specifier,
-                        &referrer,
-                        attr_type.as_deref(),
-                    )? {
+                    match begun? {
                         DynamicImportBegin::Settled => {}
                         DynamicImportBegin::FetchHttps { target_url } => {
                             let message = format!(
@@ -5593,10 +5644,105 @@ impl Runtime {
                 .lock()
                 .expect("layer-a dynamic import queue poisoned")
                 .is_empty()
+                && !self.settle_delivered_web_dynamic_imports()?
             {
                 return Ok(());
             }
         }
+    }
+
+    /// The embedder's module map, when this runtime serves web modules.
+    #[must_use]
+    pub fn web_module_map(&self) -> Option<&web_modules::WebModuleMap> {
+        self.module_loader
+            .configured
+            .as_ref()
+            .and_then(|config| config.web_modules.as_ref())
+    }
+
+    /// Whether a dynamic `import()` is waiting for the embedder.
+    #[must_use]
+    pub fn has_pending_web_imports(&self) -> bool {
+        !self.web_dynamic_imports.is_empty()
+    }
+
+    /// Module URLs the parked dynamic imports need that nobody has asked
+    /// for yet. Each URL is reported once; the embedder fetches it and
+    /// delivers the result into [`Self::web_module_map`].
+    #[must_use]
+    pub fn web_module_fetches(&self) -> Vec<String> {
+        let Some(map) = self.web_module_map() else {
+            return Vec::new();
+        };
+        let mut fetch = Vec::new();
+        for parked in &self.web_dynamic_imports {
+            if let Ok(web_modules::WebModuleGraph::Pending { fetch: more }) =
+                map.graph_status(&parked.target_url)
+            {
+                fetch.extend(more);
+            }
+        }
+        fetch
+    }
+
+    /// Settle every parked dynamic import whose graph is now delivered (or
+    /// failed), evaluate what they imported, and run the microtasks and any
+    /// further imports that follow.
+    ///
+    /// # Errors
+    /// A fatal runtime failure while evaluating an imported graph. A failed
+    /// fetch, parse or evaluation rejects the import's promise instead.
+    pub fn resume_web_dynamic_imports(&mut self) -> Result<(), OtterError> {
+        self.with_direct_timeout(|runtime| {
+            if runtime.settle_delivered_web_dynamic_imports()? {
+                runtime.pump_layer_a_dynamic_imports()?;
+            }
+            Ok(())
+        })
+    }
+
+    /// One pass over the parked web imports; `true` when any settled.
+    fn settle_delivered_web_dynamic_imports(&mut self) -> Result<bool, OtterError> {
+        let Some(map) = self.web_module_map().cloned() else {
+            return Ok(false);
+        };
+        let mut settled = false;
+        let mut index = 0;
+        while index < self.web_dynamic_imports.len() {
+            let target_url = self.web_dynamic_imports[index].target_url.clone();
+            let (entry_url, linked) = match map.peek_graph(&target_url) {
+                Ok(web_modules::WebModuleGraph::Pending { .. }) => {
+                    index += 1;
+                    continue;
+                }
+                Ok(web_modules::WebModuleGraph::Ready) => {
+                    let loader = self.module_loader_for_entry(Path::new("."));
+                    match loader.load_resolved(target_url.clone()) {
+                        Ok(entry) => (
+                            entry.url.clone(),
+                            module_graph::load_program_source(&loader, entry),
+                        ),
+                        Err(error) => (target_url, Err(module_graph::GraphError::Loader(error))),
+                    }
+                }
+                Err(error) => (
+                    target_url.clone(),
+                    Err(module_graph::GraphError::Loader(
+                        module_loader::LoaderError::Load {
+                            url: target_url,
+                            message: error.to_string(),
+                        },
+                    )),
+                ),
+            };
+            let parked = self.web_dynamic_imports.remove(index);
+            let active = parked.admission.begin_dispatch();
+            let completed = self.complete_dynamic_import_prepared(parked.token, &entry_url, linked);
+            drop(active);
+            completed?;
+            settled = true;
+        }
+        Ok(settled)
     }
 
     /// Fatal Layer A pumping errors cannot leave a registry root after the
@@ -5633,14 +5779,24 @@ impl Runtime {
     }
 
     fn run_microtasks_unbounded(&mut self) -> Result<(), OtterError> {
-        if !self.interp.microtasks().has_any_pending() {
-            return Ok(());
+        if self.interp.microtasks().has_any_pending() {
+            // The host loop drains between turns, and a task that throws here
+            // is as uncaught as one thrown during evaluation: it gets the same
+            // offer to `process` and to any active domain.
+            self.drain_microtasks_dispatching_uncaught()
+                .map_err(map_vm_error)?;
         }
-        // The host loop drains between turns, and a task that throws here is
-        // as uncaught as one thrown during evaluation: it gets the same offer
-        // to `process` and to any active domain.
-        self.drain_microtasks_dispatching_uncaught()
-            .map_err(map_vm_error)
+        // An `import()` made by a timer or an event the host dispatched is
+        // owed the same pump a script turn gives it.
+        if !self
+            .layer_a_dynamic_imports
+            .lock()
+            .expect("layer-a dynamic import queue poisoned")
+            .is_empty()
+        {
+            self.pump_layer_a_dynamic_imports()?;
+        }
+        Ok(())
     }
 
     /// Convenience: run an expression for tooling.

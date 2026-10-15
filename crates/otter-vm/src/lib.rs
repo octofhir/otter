@@ -269,6 +269,7 @@ pub use frame_state::{
 };
 pub use jit_exception_ops::JitExceptionOutcome;
 pub use jit_runtime_ops::{UnaryCoercionOp, UnaryPrimitiveHint};
+pub use module_ops::{INLINE_MODULE_MARKER, strip_inline_module_marker};
 pub use property_ic::PropertyIcStats;
 pub use run_control::{
     DEFAULT_MAX_STACK_DEPTH, DEFAULT_MAX_SYNC_REENTRY_DEPTH, ErrorDetail, InterruptFlag, RunError,

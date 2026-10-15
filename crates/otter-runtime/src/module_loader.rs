@@ -783,6 +783,12 @@ pub struct LoaderConfig {
     /// Runtime construction replaces this together with `capabilities`, so
     /// module resolution and host APIs use one policy boundary.
     pub(crate) capability_hooks: RuntimeHooks,
+    /// Browser mode. When set, every specifier resolves by the HTML rules
+    /// through the map's import map, every module source comes from what
+    /// the embedder delivered into the map, and every module is an ES module
+    /// in JavaScript. The filesystem, `node_modules` and the network are
+    /// never consulted; the embedder owns fetch policy.
+    pub web_modules: Option<crate::web_modules::WebModuleMap>,
 }
 
 impl LoaderConfig {
@@ -815,6 +821,7 @@ impl LoaderConfig {
             resource_account: otter_resource::ResourceAccount::default(),
             capabilities: CapabilitySet::sandbox(),
             capability_hooks: RuntimeHooks::default(),
+            web_modules: None,
         }
     }
 }
@@ -930,6 +937,12 @@ impl ModuleLoader {
         &self.config
     }
 
+    /// The embedder's module map, when this loader serves a browser page.
+    #[must_use]
+    pub fn web_modules(&self) -> Option<&crate::web_modules::WebModuleMap> {
+        self.config.web_modules.as_ref()
+    }
+
     /// `true` when `url` names a runtime-hosted module.
     #[must_use]
     pub fn is_hosted_url(&self, url: &str) -> bool {
@@ -989,6 +1002,15 @@ impl ModuleLoader {
         referrer: Option<&str>,
         kind: ImportKind,
     ) -> Result<String, LoaderError> {
+        if let Some(web) = &self.config.web_modules {
+            return web
+                .resolve(specifier, referrer)
+                .map_err(|error| LoaderError::Resolve {
+                    specifier: specifier.to_string(),
+                    referrer: referrer.unwrap_or("<document>").to_string(),
+                    message: error.message,
+                });
+        }
         if self.is_hosted_url(specifier) {
             return Ok(specifier.to_string());
         }
@@ -1216,6 +1238,21 @@ impl ModuleLoader {
         let account = self.config.resource_account.clone();
         if is_data_url(&url) {
             return decode_data_url(&url, &account);
+        }
+        if let Some(web) = &self.config.web_modules {
+            let Some(source) = web.source(&url) else {
+                let message = web
+                    .failure(&url)
+                    .unwrap_or_else(|| "the module was not delivered".to_string());
+                return Err(LoaderError::Load { url, message });
+            };
+            let text = admit_source(&account, &source.final_url, source.text)?;
+            return Ok(ResolvedSource {
+                url: source.final_url,
+                kind: SourceKind::JavaScript,
+                jsx: None,
+                text,
+            });
         }
         if self.is_hosted_url(&url) {
             let text = admit_source(&account, &url, String::new())?;

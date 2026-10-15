@@ -1,0 +1,150 @@
+{
+  "method": "3 rounds x 5 balanced repetitions, rotated parent/current/Node order, wall clock of the whole process",
+  "binaries": {
+    "parent": "7e2b27e06b1f86e558d0e10b377cfb1dc1509aacfff6a66f48da43e1371a9207",
+    "current": "9a3250b1d7b8fece2b895f097f52ea5c780a2503607cb6d51ee1adb532ab8699"
+  },
+  "caveat": "parent binary was built with the previous stable rustc; current with rustc 1.99, so deltas include the compiler change",
+  "wall": {
+    "raytrace": {
+      "median_seconds": {
+        "parent": 1.3060035829839762,
+        "current": 1.2369637500087265,
+        "node": 0.5591601659834851
+      },
+      "round_medians_seconds": {
+        "parent": [
+          1.3504848330048844,
+          1.3390382500074338,
+          1.2687857919954695
+        ],
+        "current": [
+          1.2498097500065342,
+          1.2369637500087265,
+          1.2308342499891296
+        ],
+        "node": [
+          0.5691595840035006,
+          0.5649150420213118,
+          0.5573158749903087
+        ]
+      },
+      "current_vs_parent_pct": [
+        -7.454736294545716,
+        -7.622971188324201,
+        -2.9911701601459395
+      ],
+      "node_drift_pct": 2.125133976023541
+    },
+    "box2d": {
+      "median_seconds": {
+        "parent": 0.8568319590121973,
+        "current": 0.8486014579830226,
+        "node": 0.31172258299193345
+      },
+      "round_medians_seconds": {
+        "parent": [
+          0.8954544589796569,
+          0.8380871249828488,
+          0.8390351659909356
+        ],
+        "current": [
+          0.8671572089951951,
+          0.8242979159986135,
+          0.8354972499946598
+        ],
+        "node": [
+          0.3153316249954514,
+          0.31123541700071655,
+          0.3011005829903297
+        ]
+      },
+      "current_vs_parent_pct": [
+        -3.1600992882101053,
+        -1.645319272088508,
+        -0.42166480496648173
+      ],
+      "node_drift_pct": 4.726341564598946
+    },
+    "navier-stokes": {
+      "median_seconds": {
+        "parent": 0.9135017920052633,
+        "current": 0.9241020000190474,
+        "node": 0.7185315839888062
+      },
+      "round_medians_seconds": {
+        "parent": [
+          0.9127074170100968,
+          0.9135017920052633,
+          0.9203444170125294
+        ],
+        "current": [
+          0.9265949170221575,
+          0.9250170000013895,
+          0.9125555840146262
+        ],
+        "node": [
+          0.7132405830197968,
+          0.7185315839888062,
+          0.71877370798029
+        ]
+      },
+      "current_vs_parent_pct": [
+        1.521571946632605,
+        1.2605566947875069,
+        -0.8462954578663084
+      ],
+      "node_drift_pct": 0.7757725923371428
+    },
+    "boxing-micro": {
+      "median_seconds": {
+        "parent": 0.0355562079930678,
+        "current": 0.03543879199423827,
+        "node": 0.037505125015741214
+      },
+      "round_medians_seconds": {
+        "parent": [
+          0.03547775000333786,
+          0.0355562079930678,
+          0.03592879098141566
+        ],
+        "current": [
+          0.03532841699779965,
+          0.03528062498662621,
+          0.03606099999160506
+        ],
+        "node": [
+          0.037359291018219665,
+          0.037649374979082495,
+          0.03866479199496098
+        ]
+      },
+      "current_vs_parent_pct": [
+        -0.42092016975191493,
+        -0.7750629833623512,
+        0.3679751157164901
+      ],
+      "node_drift_pct": 3.4944479436310516
+    }
+  },
+  "rejected": {
+    "boxing-micro": "about 35 ms per process, dominated by startup; no conclusion drawn"
+  },
+  "instructions_diagnostic": {
+    "raytrace": {
+      "parent": 17854924817,
+      "current": 17576400645,
+      "delta_pct": -1.5599291223831524
+    },
+    "box2d": {
+      "parent": 12930043998,
+      "current": 12735350112,
+      "delta_pct": -1.5057480549185653
+    },
+    "navier-stokes": {
+      "parent": 7869121617,
+      "current": 7857460369,
+      "delta_pct": -0.1481899577559953
+    }
+  }
+}

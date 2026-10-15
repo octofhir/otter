@@ -15,6 +15,8 @@
 //! - Non-converting nullish comparisons preserve shape and field facts.
 //! - Node emitters for frame, arithmetic, conversion, check, memory, generic
 //!   and control nodes.
+//! - Number boxing proves the Int32 encoding with one `FJCVTZS` where the CPU
+//!   implements it, a convert-and-compare otherwise.
 //!
 //! # Invariants
 //! - Pinned registers: `x19` register window, `x20` context, `x21` reserved
@@ -2263,28 +2265,35 @@ impl<'a> Codegen<'a> {
         );
     }
 
-    /// Box `D(source)` into `X(destination)` in the canonical encoding.
+    /// Box `D(source)` into `X(destination)` in the canonical encoding: an
+    /// int32 other than -0 as Int32, NaN as the one canonical pattern, every
+    /// other double offset.
     fn emit_box_float64(&mut self, source: u8, destination: u8) {
         let double = self.ops.new_dynamic_label();
         let done = self.ops.new_dynamic_label();
-        let boxed = self.ops.new_dynamic_label();
+        if crate::arm64::has_javascript_conversion() {
+            // FJCVTZS sets Z exactly for an int32 that is not -0.
+            crate::arm64::emit_fjcvtzs(&mut self.ops, source, 16);
+            dynasm!(self.ops ; .arch aarch64 ; b.ne =>double);
+        } else {
+            let boxed = self.ops.new_dynamic_label();
+            dynasm!(self.ops
+                ; .arch aarch64
+                ; fcvtzs w16, D(source)
+                ; scvtf d31, w16
+                ; fcmp D(source), d31
+                ; b.ne =>double
+                ; cbnz w16, =>boxed
+                ; fmov x17, D(source)
+                ; cmp x17, #0
+                ; b.lt =>double
+                ; =>boxed
+            );
+        }
+        // Both conversions write `w16`, clearing its upper half.
         dynasm!(self.ops
             ; .arch aarch64
-            ; fcvtzs w16, D(source)
-            ; scvtf d31, w16
-            ; fcmp D(source), d31
-            ; b.ne =>double
-            ; cbnz w16, =>boxed
-            ; fmov x17, D(source)
-            ; cmp x17, #0
-            ; b.lt =>double
-            ; =>boxed
-        );
-        self.load_immediate(17, NUMBER_TAG);
-        dynasm!(self.ops
-            ; .arch aarch64
-            ; mov w16, w16
-            ; orr X(destination), x16, x17
+            ; orr XSP(destination), x16, #NUMBER_TAG
             ; b =>done
             ; =>double
             ; fmov x16, D(source)

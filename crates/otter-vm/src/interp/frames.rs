@@ -462,9 +462,9 @@ impl Interpreter {
             && let Some(pc) = record
                 .map(|record| record.call_pc)
                 .filter(|pc| *pc != native_abi::NO_CALL_PC)
-            {
-                return pc;
-            }
+        {
+            return pc;
+        }
         frame.header.pc
     }
 

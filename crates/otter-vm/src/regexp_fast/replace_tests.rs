@@ -30,7 +30,9 @@ fn render(
     .unwrap();
     let config = otter_regex::ExecConfig::default();
     let matches = match subject {
-        CodeUnits::Latin1(bytes) => regex.find_latin1(bytes, 0, config).collect_batch(usize::MAX),
+        CodeUnits::Latin1(bytes) => regex
+            .find_latin1(bytes, 0, config)
+            .collect_batch(usize::MAX),
         CodeUnits::Utf16(units) => regex.find_utf16(units, 0, config).collect_batch(usize::MAX),
     }
     .unwrap();

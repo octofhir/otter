@@ -72,9 +72,10 @@ pub fn install_date_well_knowns_post_bootstrap(
                 configurable: Some(true),
                 ..Default::default()
             },
-        )? {
-            return Err(JsSurfaceError::DefinePropertyFailed("[[BuiltinProperty]]"));
-        };
+        )?
+    {
+        return Err(JsSurfaceError::DefinePropertyFailed("[[BuiltinProperty]]"));
+    };
 
     let global_root = Value::object(global);
     let date_ctor_root = date_ctor_value;

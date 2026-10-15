@@ -978,10 +978,10 @@ impl Interpreter {
             .ok_or(VmError::InvalidOperand)
             .map_err(CommittedValueError::Fatal)?;
         let top_idx = stack.len() - 1;
-        let method = *read_register(&stack[top_idx], method_reg)
-            .map_err(CommittedValueError::Fatal)?;
-        let callee = *read_register(&stack[top_idx], callee_reg)
-            .map_err(CommittedValueError::Fatal)?;
+        let method =
+            *read_register(&stack[top_idx], method_reg).map_err(CommittedValueError::Fatal)?;
+        let callee =
+            *read_register(&stack[top_idx], callee_reg).map_err(CommittedValueError::Fatal)?;
         if crate::method_ops::is_function_prototype_intrinsic_value(
             method,
             &self.gc_heap,
@@ -1008,10 +1008,10 @@ impl Interpreter {
                 .map_err(CommittedValueError::JavaScript)?;
                 forwarded
             };
-            let callee = *read_register(&stack[top_idx], callee_reg)
-                .map_err(CommittedValueError::Fatal)?;
-            let this_value = *read_register(&stack[top_idx], this_reg)
-                .map_err(CommittedValueError::Fatal)?;
+            let callee =
+                *read_register(&stack[top_idx], callee_reg).map_err(CommittedValueError::Fatal)?;
+            let this_value =
+                *read_register(&stack[top_idx], this_reg).map_err(CommittedValueError::Fatal)?;
             stack[top_idx]
                 .advance_pc()
                 .map_err(CommittedValueError::Fatal)?;
@@ -1024,12 +1024,12 @@ impl Interpreter {
             .map_err(CommittedValueError::JavaScript)?;
         // Materialization can move a getter-produced method and both operands.
         // Their register slots retain the committed lookup without replaying it.
-        let method = *read_register(&stack[top_idx], method_reg)
-            .map_err(CommittedValueError::Fatal)?;
-        let callee = *read_register(&stack[top_idx], callee_reg)
-            .map_err(CommittedValueError::Fatal)?;
-        let this_value = *read_register(&stack[top_idx], this_reg)
-            .map_err(CommittedValueError::Fatal)?;
+        let method =
+            *read_register(&stack[top_idx], method_reg).map_err(CommittedValueError::Fatal)?;
+        let callee =
+            *read_register(&stack[top_idx], callee_reg).map_err(CommittedValueError::Fatal)?;
+        let this_value =
+            *read_register(&stack[top_idx], this_reg).map_err(CommittedValueError::Fatal)?;
         stack[top_idx]
             .advance_pc()
             .map_err(CommittedValueError::Fatal)?;

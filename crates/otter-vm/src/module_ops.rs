@@ -1486,14 +1486,11 @@ impl Interpreter {
         top_idx: usize,
         operands: impl crate::executable::OperandSource,
     ) -> Result<(), CommittedValueError> {
-        let dst = register_operand(operands.first())
-            .map_err(CommittedValueError::Fatal)?;
-        let spec_reg = register_operand(operands.get(1))
-            .map_err(CommittedValueError::Fatal)?;
-        let options_reg = register_operand(operands.get(2))
-            .map_err(CommittedValueError::Fatal)?;
-        let spec_value = *read_register(&stack[top_idx], spec_reg)
-            .map_err(CommittedValueError::Fatal)?;
+        let dst = register_operand(operands.first()).map_err(CommittedValueError::Fatal)?;
+        let spec_reg = register_operand(operands.get(1)).map_err(CommittedValueError::Fatal)?;
+        let options_reg = register_operand(operands.get(2)).map_err(CommittedValueError::Fatal)?;
+        let spec_value =
+            *read_register(&stack[top_idx], spec_reg).map_err(CommittedValueError::Fatal)?;
         // §13.3.10 step 1 / GetActiveScriptOrModule — eval-compiled chunks
         // carry no module URL of their own, so walk the live activations
         // down to the nearest frame whose owning chunk supplies one.
@@ -1536,9 +1533,7 @@ impl Interpreter {
                             let frame = &mut stack[top_idx];
                             write_register(frame, dst, Value::promise(promise))
                                 .map_err(CommittedValueError::Fatal)?;
-                            frame
-                                .advance_pc()
-                                .map_err(CommittedValueError::Fatal)?;
+                            frame.advance_pc().map_err(CommittedValueError::Fatal)?;
                             return Ok(());
                         }
                     };
@@ -1571,9 +1566,7 @@ impl Interpreter {
                         let frame = &mut stack[top_idx];
                         write_register(frame, dst, Value::promise(pending))
                             .map_err(CommittedValueError::Fatal)?;
-                        frame
-                            .advance_pc()
-                            .map_err(CommittedValueError::Fatal)?;
+                        frame.advance_pc().map_err(CommittedValueError::Fatal)?;
                         return Ok(());
                     }
                     match self

@@ -90,8 +90,16 @@ pub(crate) fn compile_condition(
         }
         expr => {
             let value = compile_expr(cx, expr, enclosing_span)?;
-            let op = if jump_if { Op::JumpIfTrue } else { Op::JumpIfFalse };
-            Ok(vec![cx.emit_branch_placeholder(op, Some(value), enclosing_span)])
+            let op = if jump_if {
+                Op::JumpIfTrue
+            } else {
+                Op::JumpIfFalse
+            };
+            Ok(vec![cx.emit_branch_placeholder(
+                op,
+                Some(value),
+                enclosing_span,
+            )])
         }
     }
 }

@@ -219,6 +219,14 @@ fn constant_hash(constant: &Constant) -> u64 {
 
 /// The import binding `name` names in the enclosing module, if any.
 pub(crate) fn find_module_import_binding(cx: &Compiler, name: &str) -> Option<ImportBinding> {
+    // An import binding lives in the module environment, the outermost
+    // scope a module's code sees: any declaration of the same name between
+    // here and there — a parameter, a `let`, a nested function's `var` —
+    // shadows it (§9.1.2.1 GetIdentifierReference). Minified modules reuse
+    // one-letter names for both all the time.
+    if cx.resolve_name(name).is_some() {
+        return None;
+    }
     for frame in cx.stack.iter().rev() {
         if let Some(state) = &frame.module_state
             && let Some(binding) = state.imported_names.get(name)

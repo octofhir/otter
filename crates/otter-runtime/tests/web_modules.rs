@@ -457,3 +457,23 @@ fn a_dynamic_import_queued_by_a_microtask_settles_in_the_same_turn() {
     eval(&mut runtime, "Promise.resolve().then(later); undefined");
     assert_eq!(log(&mut runtime), "later");
 }
+
+#[test]
+fn a_parameter_shadows_an_import_binding_of_the_same_name() {
+    let (mut runtime, map) = page();
+    deliver(&map, "https://site.test/app/ns.js", "export const x = 1;");
+    run_inline(
+        &mut runtime,
+        &map,
+        0,
+        r#"
+        import * as s from './ns.js';
+        import { x as t } from './ns.js';
+        const methods = { m(e, t, s) { return typeof s + ':' + typeof t; } };
+        function plain(s) { return typeof s; }
+        const arrow = (s) => typeof s;
+        log.push(methods.m(1, 'two', () => 0), plain(3), arrow('x'), typeof s, t);
+        "#,
+    );
+    assert_eq!(log(&mut runtime), "function:string,number,string,object,1");
+}

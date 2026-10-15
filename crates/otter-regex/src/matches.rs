@@ -203,14 +203,18 @@ impl MatchRecord {
     pub(crate) fn new(slots: Slots<'_>, names: &Arc<[String]>) -> Self {
         let captures = match slots {
             Slots::Encoded(slots) => slots[2..]
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .map(|pair| {
                     (pair[0] != NONE && pair[1] != NONE)
                         .then_some(pair[0] as usize..pair[1] as usize)
                 })
                 .collect(),
             Slots::Interpreted(slots) => slots[2..]
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .map(|pair| Some(pair[0]?..pair[1]?))
                 .collect(),
         };

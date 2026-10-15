@@ -211,7 +211,10 @@ fn emitted_helper_roots(
     let code = bundle.file(JitArtifactFileName::Code).unwrap().contents();
     #[cfg(target_arch = "aarch64")]
     let stamps: Vec<_> = code[start..helper]
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(<[u8; 4]>::as_slice)
         .map(|word| u32::from_le_bytes(word.try_into().unwrap()))
         .collect::<Vec<_>>()
         .windows(2)
@@ -674,7 +677,10 @@ fn split_group_cell_initializers(code: &[u8], region: &Json, object_bytes: u32) 
     let start = region["startOffset"].as_u64().unwrap() as usize;
     let end = region["endOffset"].as_u64().unwrap() as usize;
     let words: Vec<_> = code[start..end]
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(<[u8; 4]>::as_slice)
         .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
         .collect();
     let headers: Vec<_> = words
@@ -790,14 +796,20 @@ fn assert_empty_native_bytes(
         let start = region["startOffset"].as_u64().unwrap() as usize;
         let end = region["endOffset"].as_u64().unwrap() as usize;
         code[start..end]
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(<[u8; 4]>::as_slice)
             .map(|word| u32::from_le_bytes(word.try_into().unwrap()))
             .collect::<Vec<_>>()
     });
     assert!(
         code[home_region["startOffset"].as_u64().unwrap() as usize
             ..home_region["endOffset"].as_u64().unwrap() as usize]
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(<[u8; 4]>::as_slice)
             .map(|word| u32::from_le_bytes(word.try_into().unwrap()))
             .any(|word| word & 0xffc0_03e0 == 0xf900_03e0
                 && ((word >> 10) & 4095) * 8 == home
@@ -1467,7 +1479,10 @@ fn assert_native_nonempty_artifact(bundle: &JitArtifactBundle, extra_realm: bool
 #[cfg(target_arch = "aarch64")]
 fn native_literal_operand_homes(code: &[u8], start: usize, end: usize) -> Vec<usize> {
     let words: Vec<_> = code[start..end]
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(<[u8; 4]>::as_slice)
         .map(|word| u32::from_le_bytes(word.try_into().unwrap()))
         .collect();
     assert!(

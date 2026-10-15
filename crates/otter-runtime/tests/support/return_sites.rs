@@ -210,7 +210,12 @@ pub(super) fn assert_plain_hot_source_unstamped(code: &[u8], start: usize, end: 
     #[cfg(target_arch = "aarch64")]
     {
         assert!(start.is_multiple_of(4) && end.is_multiple_of(4));
-        for word in code[start..end].chunks_exact(4) {
+        for word in code[start..end]
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(<[u8; 4]>::as_slice)
+        {
             let word = u32::from_le_bytes(word.try_into().unwrap());
             // STR Wt,[x21,#imm12*4] is the actual shared caller-stamp form.
             let is_frame_store = word & 0xffc0_03e0 == 0xb900_02a0;

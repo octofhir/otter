@@ -149,33 +149,36 @@ fn typed_array_bytes_equal(kind: TypedArrayKind, left: &[u8], right: &[u8]) -> b
         return false;
     }
     match kind {
-        TypedArrayKind::Float16 => {
-            left.chunks_exact(2)
-                .zip(right.chunks_exact(2))
-                .all(|(left, right)| {
-                    let left = u16::from_le_bytes([left[0], left[1]]);
-                    let right = u16::from_le_bytes([right[0], right[1]]);
-                    left == right || (float16_is_nan(left) && float16_is_nan(right))
-                })
-        }
-        TypedArrayKind::Float32 => {
-            left.chunks_exact(4)
-                .zip(right.chunks_exact(4))
-                .all(|(left, right)| {
-                    let left = f32::from_le_bytes(left.try_into().expect("four-byte chunk"));
-                    let right = f32::from_le_bytes(right.try_into().expect("four-byte chunk"));
-                    left.to_bits() == right.to_bits() || (left.is_nan() && right.is_nan())
-                })
-        }
-        TypedArrayKind::Float64 => {
-            left.chunks_exact(8)
-                .zip(right.chunks_exact(8))
-                .all(|(left, right)| {
-                    let left = f64::from_le_bytes(left.try_into().expect("eight-byte chunk"));
-                    let right = f64::from_le_bytes(right.try_into().expect("eight-byte chunk"));
-                    left.to_bits() == right.to_bits() || (left.is_nan() && right.is_nan())
-                })
-        }
+        TypedArrayKind::Float16 => left
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .zip(right.as_chunks::<2>().0)
+            .all(|(left, right)| {
+                let left = u16::from_le_bytes([left[0], left[1]]);
+                let right = u16::from_le_bytes([right[0], right[1]]);
+                left == right || (float16_is_nan(left) && float16_is_nan(right))
+            }),
+        TypedArrayKind::Float32 => left
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .zip(right.as_chunks::<4>().0)
+            .all(|(left, right)| {
+                let left = f32::from_le_bytes(*left);
+                let right = f32::from_le_bytes(*right);
+                left.to_bits() == right.to_bits() || (left.is_nan() && right.is_nan())
+            }),
+        TypedArrayKind::Float64 => left
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .zip(right.as_chunks::<8>().0)
+            .all(|(left, right)| {
+                let left = f64::from_le_bytes(*left);
+                let right = f64::from_le_bytes(*right);
+                left.to_bits() == right.to_bits() || (left.is_nan() && right.is_nan())
+            }),
         _ => left == right,
     }
 }

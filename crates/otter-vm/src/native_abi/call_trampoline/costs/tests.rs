@@ -254,8 +254,8 @@ fn arm64_branches_stay_with_their_body(code: &[u8], start: u64, tail_targets: &[
     let end = start.checked_add(code.len() as u64).unwrap();
     let mut branches = 0;
     let mut tails = 0;
-    for (index, bytes) in code.chunks_exact(4).enumerate() {
-        let word = u32::from_le_bytes(bytes.try_into().unwrap());
+    for (index, bytes) in code.as_chunks::<4>().0.iter().enumerate() {
+        let word = u32::from_le_bytes(*bytes);
         let branch = if word & 0xfc00_0000 == 0x1400_0000 {
             Some((word & 0x03ff_ffff, 26, true)) // B, excluding BL.
         } else if word & 0xff00_0010 == 0x5400_0000 || word & 0x7e00_0000 == 0x3400_0000 {

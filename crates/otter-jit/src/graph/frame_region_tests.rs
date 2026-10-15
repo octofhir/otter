@@ -192,7 +192,10 @@ fn guard_exit_reads_registers_in_place_and_roots_pure_throws_in_the_scratch() {
     .expect("cold exit emission");
     let words: Vec<u32> = emission
         .buffer
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(<[u8; 4]>::as_slice)
         .map(|word| u32::from_le_bytes(word.try_into().expect("ARM word")))
         .collect();
     let store = |register: u8, home: Location| {

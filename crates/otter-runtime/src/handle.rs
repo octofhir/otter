@@ -2080,7 +2080,7 @@ impl RuntimeHandle {
             self.inner
                 .counters
                 .pending_dynamic_module_jobs
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| v.checked_sub(1))
+                .try_update(Ordering::Relaxed, Ordering::Relaxed, |v| v.checked_sub(1))
                 .ok();
         }
     }
@@ -2286,7 +2286,7 @@ impl RuntimeHandle {
             .inner
             .counters
             .queued_commands
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |queued| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |queued| {
                 (queued < self.inner.command_capacity).then_some(queued + 1)
             })
             .is_err()
@@ -3174,7 +3174,7 @@ impl IsolateRunner {
             RuntimeMessage::DynamicModuleReady(_id) => {
                 self.counters
                     .pending_dynamic_module_jobs
-                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| v.checked_sub(1))
+                    .try_update(Ordering::Relaxed, Ordering::Relaxed, |v| v.checked_sub(1))
                     .ok();
                 self.counters
                     .completed_dynamic_module_jobs
@@ -3803,7 +3803,7 @@ fn decrement_liveness(
         RuntimeLiveness::Ref => ref_counter,
         RuntimeLiveness::Unref => unref_counter,
     };
-    let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| v.checked_sub(1));
+    let _ = counter.try_update(Ordering::Relaxed, Ordering::Relaxed, |v| v.checked_sub(1));
 }
 
 fn cancel_completion_accounting(counters: &RuntimeCounters, accounting: CompletionAccounting) {
@@ -3859,7 +3859,7 @@ fn decrement_queued_commands(counters: &RuntimeCounters, amount: usize) {
     }
     let _ = counters
         .queued_commands
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |queued| {
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |queued| {
             Some(queued.saturating_sub(amount))
         });
 }
@@ -3884,7 +3884,7 @@ fn cancel_runtime_message(message: RuntimeMessage, counters: &RuntimeCounters) {
         }
         #[cfg(test)]
         RuntimeMessage::DynamicModuleReady(_) => {
-            let _ = counters.pending_dynamic_module_jobs.fetch_update(
+            let _ = counters.pending_dynamic_module_jobs.try_update(
                 Ordering::Relaxed,
                 Ordering::Relaxed,
                 |pending| pending.checked_sub(1),

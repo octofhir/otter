@@ -279,7 +279,10 @@ fn assert_pressure_artifact(bundle: &JitArtifactBundle) -> u32 {
         // AArch64 unsigned-offset STR/LDR D. These are the canonical-home
         // stores and reloads in this operation; its fast path uses only GP words.
         let words: Vec<u32> = code[start..end]
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(<[u8; 4]>::as_slice)
             .map(|word| u32::from_le_bytes(word.try_into().unwrap()))
             .collect();
         assert!(words.iter().any(|word| word & 0xffc0_0000 == 0xfd00_0000));

@@ -271,7 +271,7 @@ impl CodeEntryCell {
         }
         if self
             .active_count
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |count| {
                 count.checked_add(1)
             })
             .is_err()

@@ -768,13 +768,13 @@ impl InstructionFeedback {
     /// hit counters continue saturating independently on every observation.
     pub fn record_branch(&self, taken: bool) -> bool {
         let saturating_increment = |value: u8| Some(value.saturating_add(1));
-        let _ = self.branch_total.fetch_update(
+        let _ = self.branch_total.try_update(
             Ordering::Relaxed,
             Ordering::Relaxed,
             saturating_increment,
         );
         if taken {
-            let _ = self.branch_taken.fetch_update(
+            let _ = self.branch_taken.try_update(
                 Ordering::Relaxed,
                 Ordering::Relaxed,
                 saturating_increment,
@@ -1153,7 +1153,7 @@ impl FeedbackVector {
     pub(crate) fn bump_epoch(&self) {
         let _ = self
             .epoch
-            .fetch_update(Ordering::Release, Ordering::Relaxed, |epoch| {
+            .try_update(Ordering::Release, Ordering::Relaxed, |epoch| {
                 epoch.checked_add(1)
             });
     }

@@ -10,6 +10,7 @@
 //! call retains inputs only through its declared safepoint/ABI roots. Callback
 //! observations own no moving handle after their synchronous extent.
 //! Pure probes preserve managed allocation/collection/cache state exactly.
+//! Published slot windows are read only through their published pointer.
 //!
 //! # See also
 //! - `super` owns the current primitive VM entries.
@@ -50,11 +51,26 @@ unsafe extern "C" fn resolve(context: u64, code: u64, id: SafepointId) -> *const
         std::ptr::null()
     }
 }
+/// The published register window of a fixture frame. The collector rewrites
+/// its slots through the frame, so every read goes through the published
+/// pointer rather than a Rust borrow the compiler may cache across a call.
+struct FixtureWindow(*mut Value);
+
+impl FixtureWindow {
+    fn get(&self, index: usize) -> Value {
+        assert!(index < 5);
+        // SAFETY: the window spans five initialized slots that outlive the
+        // fixture action, and nothing borrows them while it runs.
+        unsafe { self.0.add(index).read() }
+    }
+}
+
 fn call_fixture(
     vm: &mut Interpreter,
     mut slots: [Value; 5],
-    action: impl FnOnce(&mut Interpreter, &mut RuntimeStubAllocContext, &mut [Value; 5]),
+    action: impl FnOnce(&mut Interpreter, &mut RuntimeStubAllocContext, &FixtureWindow),
 ) {
+    let window = FixtureWindow(slots.as_mut_ptr());
     let source = source();
     let mut frame = Frame::new(
         VmFrameHeader {
@@ -64,7 +80,7 @@ fn call_fixture(
             kind: NativeFrameKind::Baseline,
             flags: NativeFrameFlags::from_bits(NativeFrameFlags::HAS_SAFEPOINTS),
         },
-        slots.as_mut_ptr() as u64,
+        window.0 as u64,
         Value::function(0),
         Value::undefined(),
     );
@@ -91,7 +107,7 @@ fn call_fixture(
     thread.runtime_context = std::ptr::from_ref(&activation) as u64;
     thread.code_registry = std::ptr::from_ref(&registry) as u64;
     let mut packet = RuntimeStubAllocContext::new(&mut thread, record.id);
-    action(vm, &mut packet, &mut slots);
+    action(vm, &mut packet, &window);
     vm.jit_pop_native_frame();
 }
 
@@ -163,8 +179,8 @@ fn scoped_concat_rewrites_all_published_aliases_inside_the_actual_call_at_every_
                 let pair = string_concat_alloc(
                     packet,
                     41,
-                    slots[1].to_abi_bits(),
-                    slots[2].to_abi_bits(),
+                    slots.get(1).to_abi_bits(),
+                    slots.get(2).to_abi_bits(),
                     Value::undefined().to_abi_bits(),
                 );
                 assert_eq!(
@@ -181,10 +197,10 @@ fn scoped_concat_rewrites_all_published_aliases_inside_the_actual_call_at_every_
                 );
                 assert!(vm.gc_heap.gc_stats().minor_gc_cycles > before.minor_gc_cycles);
                 assert!(vm.gc_heap.gc_stats().minor_slot_updates > before.minor_slot_updates);
-                assert_ne!(slots[1].to_abi_bits(), originals[0]);
-                assert_ne!(slots[2].to_abi_bits(), originals[1]);
-                assert_eq!(slots[1], slots[3]);
-                assert_eq!(slots[2], slots[4]);
+                assert_ne!(slots.get(1).to_abi_bits(), originals[0]);
+                assert_ne!(slots.get(2).to_abi_bits(), originals[1]);
+                assert_eq!(slots.get(1), slots.get(3));
+                assert_eq!(slots.get(2), slots.get(4));
                 vm.with_handle_scope(|vm, scope| {
                     let result = vm.scoped_value(scope, result);
                     vm.gc_heap.set_gc_stress(0, false);

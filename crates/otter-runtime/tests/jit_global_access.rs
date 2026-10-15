@@ -62,7 +62,10 @@ fn calls(code: &[u8], start: usize, end: usize) -> usize {
         assert_eq!(start % 4, 0);
         assert_eq!(end % 4, 0);
         code[start..end]
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(<[u8; 4]>::as_slice)
             .filter(|bytes| {
                 let word = u32::from_le_bytes((*bytes).try_into().unwrap());
                 word & 0xfffffc1f == 0xd63f0000 || word & 0xfc000000 == 0x94000000
@@ -255,7 +258,10 @@ fn assert_dictionary_store_guard(code: &[u8], start: usize, end: usize) {
     #[cfg(target_arch = "aarch64")]
     {
         let words = code[start..end]
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(<[u8; 4]>::as_slice)
             .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
             .collect::<Vec<_>>();
         assert!(
@@ -325,7 +331,10 @@ fn assert_ordinary_store_guard(code: &[u8], start: usize, end: usize) {
     #[cfg(target_arch = "aarch64")]
     {
         let words = code[start..end]
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(<[u8; 4]>::as_slice)
             .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
             .collect::<Vec<_>>();
         let shape_load = words

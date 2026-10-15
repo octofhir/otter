@@ -128,7 +128,7 @@ pub fn native_fetch(
             .iterate_to_handles(headers_handle)
             .map_err(|err| err.into_native("fetch"))?;
         let mut headers = Vec::with_capacity(header_handles.len() / 2);
-        for pair in header_handles.chunks_exact(2) {
+        for pair in header_handles.as_chunks::<2>().0 {
             let name = cx.as_string_lossy(pair[0]).unwrap_or_default();
             let value = cx.as_string_lossy(pair[1]).unwrap_or_default();
             headers.push((name, value));

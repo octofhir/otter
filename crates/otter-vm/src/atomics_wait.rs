@@ -70,7 +70,7 @@ impl WaitAgent {
     #[must_use]
     pub fn new() -> Self {
         let id = NEXT_WAIT_AGENT_ID
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
                 current.checked_add(1)
             })
             .expect("Atomics wait agent id space exhausted");

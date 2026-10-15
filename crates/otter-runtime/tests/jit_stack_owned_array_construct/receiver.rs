@@ -388,7 +388,7 @@ fn own_generated_receiver_fits_and_collecting_array_construct_keep_exact_roots()
     );
     let observations = observations.lock().unwrap();
     assert_eq!(observations.len(), 4);
-    for pair in observations.chunks_exact(2) {
+    for pair in observations.as_chunks::<2>().0 {
         assert_eq!(pair[0].phase, 0);
         assert_eq!(pair[1].phase, 1);
         assert_ne!(

@@ -311,7 +311,13 @@ impl<'a> ModuleGraphBuilder<'a> {
             timings: None,
             interrupt: None,
             entry_is_program: true,
-            cache: crate::compile_cache::CompileCache::user_default(),
+            // A page's modules are not written to the user's compile cache:
+            // what a person browsed must not outlive the page on disk.
+            cache: if loader.web_modules().is_some() {
+                None
+            } else {
+                crate::compile_cache::CompileCache::user_default()
+            },
         }
     }
 
@@ -403,7 +409,7 @@ impl<'a> ModuleGraphBuilder<'a> {
     /// Read a data file's bytes, whose encoding is the format's business
     /// rather than the loader's.
     fn read_data_file(&mut self, url: &str) -> Result<Vec<u8>, LoaderError> {
-        if crate::module_loader::is_http_url(url) {
+        if crate::module_loader::is_http_url(url) || self.loader.web_modules().is_some() {
             return self
                 .loader
                 .load_resolved(url.to_string())
@@ -482,17 +488,19 @@ impl<'a> ModuleGraphBuilder<'a> {
         // `package.json#type: module` makes a `.js` file in that scope an ES
         // module regardless of what syntax it happens to use, which is how a
         // module with neither imports nor exports still loads as one.
-        let in_module_package = crate::url_to_path(&url).is_some_and(|path: std::path::PathBuf| {
-            matches!(
-                self.loader.package_type_for_path(&path),
-                Some(crate::module_loader::LoaderPackageType::Module)
-            )
-        });
+        let is_web = self.loader.web_modules().is_some();
+        let in_module_package = !is_web
+            && crate::url_to_path(&url).is_some_and(|path: std::path::PathBuf| {
+                matches!(
+                    self.loader.package_type_for_path(&path),
+                    Some(crate::module_loader::LoaderPackageType::Module)
+                )
+            });
         // A `data:` module is an ES module whatever its body looks like:
         // there is no file for a package scope to speak for, and no
         // CommonJS resolution that could reach it.
         let is_data = crate::module_loader::is_data_url(&url);
-        let text = if url.ends_with(".mjs") || is_entry || in_module_package || is_data {
+        let text = if url.ends_with(".mjs") || is_entry || in_module_package || is_data || is_web {
             text
         } else {
             match self.commonjs_exports(&url, &text, kind)? {
@@ -544,7 +552,12 @@ impl<'a> ModuleGraphBuilder<'a> {
 
         let timing_enabled = self.timings.is_some();
         let compile_program = |program: &Program<'_>| {
-            let requests = collect_module_requests(program);
+            let mut requests = collect_module_requests(program);
+            // A browser fetches an `import()` target when the call runs, not
+            // with the graph that contains it.
+            if is_web {
+                requests.retain(|request| !request.dynamic);
+            }
             let ResolvedRequests {
                 imports: resolved_imports,
                 deps,
@@ -872,6 +885,8 @@ fn collect_module_requests(program: &Program<'_>) -> Vec<ModuleRequest> {
 #[derive(Debug, Clone)]
 pub(crate) struct PrefetchRequest {
     pub(crate) specifier: String,
+    /// A literal `import("…")` target rather than a static request.
+    pub(crate) dynamic: bool,
     /// Whether an import attribute made this a data file, which has no
     /// imports of its own to follow.
     pub(crate) data: bool,
@@ -888,6 +903,7 @@ pub(crate) fn scan_module_requests(
             .into_iter()
             .map(|request| PrefetchRequest {
                 specifier: request.specifier,
+                dynamic: request.dynamic,
                 data: request.attr_type.is_some(),
             })
             .collect())

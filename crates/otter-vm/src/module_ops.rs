@@ -1182,6 +1182,7 @@ impl Interpreter {
 
     /// Build a module's `import.meta` object with its `url` property.
     fn build_import_meta(&mut self, url: &str) -> Result<Value, VmError> {
+        let url = strip_inline_module_marker(url);
         self.with_handle_scope(|interp, scope| {
             // `import.meta` is created with a null prototype. Keep its shell in
             // the canonical handle arena before allocating the URL string:
@@ -1696,5 +1697,23 @@ impl Interpreter {
             .advance_pc()
             .map_err(CommittedValueError::Fatal)?;
         Ok(())
+    }
+}
+
+/// Fragment prefix a browser host appends to a document's base URL to give
+/// each inline module script its own module-map key.
+///
+/// Every inline `<script type="module">` of a document has the document's
+/// base URL as its URL, yet each is a separate module record. The host keys
+/// them `<base>#otter-inline-module=<n>`; `import.meta.url` reports the base
+/// URL without the marker.
+pub const INLINE_MODULE_MARKER: &str = "otter-inline-module=";
+
+/// `url` without a trailing inline-module marker fragment, if it has one.
+#[must_use]
+pub fn strip_inline_module_marker(url: &str) -> &str {
+    match url.rfind(INLINE_MODULE_MARKER) {
+        Some(at) if at > 0 && url.as_bytes()[at - 1] == b'#' => &url[..at - 1],
+        _ => url,
     }
 }

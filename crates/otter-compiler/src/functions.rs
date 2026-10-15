@@ -686,6 +686,34 @@ fn compile_function_scopes(
         let derived_fields = f.fields.as_ref().filter(|injection| injection.is_derived);
         let mut fields_emitted = derived_fields.is_none();
         for stmt in &body.statements {
+            // `super(), this.#x = …` — the shape minifiers join a
+            // constructor's statements into. The fields are initialized as
+            // the `super(...)` returns (§13.3.7.1 step 11), before the rest
+            // of the sequence touches them.
+            if !fields_emitted
+                && let Some((call, rest)) = crate::class::leading_super_call_in_sequence(stmt)
+            {
+                let mark = parent.scratch;
+                crate::expr::compile_expr(parent, call, {
+                    let s = oxc_span::GetSpan::span(call);
+                    (s.start, s.end)
+                })?;
+                parent.scratch = mark;
+                crate::class::emit_instance_field_inits(
+                    parent,
+                    derived_fields.expect("derived field injection").fields,
+                )?;
+                fields_emitted = true;
+                for expr in rest {
+                    let mark = parent.scratch;
+                    crate::expr::compile_expr(parent, expr, {
+                        let s = oxc_span::GetSpan::span(expr);
+                        (s.start, s.end)
+                    })?;
+                    parent.scratch = mark;
+                }
+                continue;
+            }
             compile_discarded_statement(parent, stmt)?;
             // Derived classes initialize fields once the constructor's
             // statement-level `super(...)` returns.

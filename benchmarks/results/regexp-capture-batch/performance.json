@@ -1,0 +1,1024 @@
+{
+  "richards": {
+    "otter": 18279218714,
+    "node": 11559753905,
+    "ratio": 1.581280956690055,
+    "delta_percent": 0.010656596393610052,
+    "wall": {
+      "otter_seconds": 1.0505145,
+      "node_seconds": 0.692935708,
+      "bun_seconds": 0.58289775,
+      "node_ratio": 1.5160345871510492,
+      "bun_ratio": 1.8022277492064431,
+      "parent_otter_seconds": 1.163108209,
+      "delta_percent": -9.68041564222164,
+      "reference_control_deltas_percent": {
+        "node": -10.899976553590063,
+        "bun": 1.9304013804923414
+      },
+      "scoreable": false
+    }
+  },
+  "deltablue": {
+    "otter": 19843606186,
+    "node": 5590907366,
+    "ratio": 3.549263990076991,
+    "delta_percent": 0.10706586492290615,
+    "wall": {
+      "otter_seconds": 1.068490292,
+      "node_seconds": 0.2956665,
+      "bun_seconds": 0.41626479200000005,
+      "node_ratio": 3.613836170144402,
+      "bun_ratio": 2.56685242791324,
+      "parent_otter_seconds": 1.090910875,
+      "delta_percent": -2.05521674719763,
+      "reference_control_deltas_percent": {
+        "node": -1.2298672337585526,
+        "bun": 0.994308895731133
+      },
+      "scoreable": false
+    }
+  },
+  "crypto": {
+    "otter": 4572064158,
+    "node": 2918126968,
+    "ratio": 1.5667804067941433,
+    "delta_percent": 0.34989643456571073,
+    "wall": {
+      "otter_seconds": 0.241180042,
+      "node_seconds": 0.158323708,
+      "bun_seconds": null,
+      "node_ratio": 1.5233349764648008,
+      "bun_ratio": null,
+      "parent_otter_seconds": 0.246791333,
+      "delta_percent": -2.2736985662296316,
+      "reference_control_deltas_percent": {
+        "node": -2.00105361255537
+      },
+      "scoreable": false
+    }
+  },
+  "raytrace": {
+    "otter": 17915152132,
+    "node": 8371358844,
+    "ratio": 2.1400530625730276,
+    "delta_percent": 0.11312613982656927,
+    "wall": {
+      "otter_seconds": 1.309270291,
+      "node_seconds": 0.59958025,
+      "bun_seconds": 0.407321833,
+      "node_ratio": 2.183644793169888,
+      "bun_ratio": 3.2143386013879596,
+      "parent_otter_seconds": 1.30772125,
+      "delta_percent": 0.11845345481693581,
+      "reference_control_deltas_percent": {
+        "node": 8.486164663394113,
+        "bun": 35.35408363595931
+      },
+      "scoreable": false
+    }
+  },
+  "earley-boyer": {
+    "otter": 29426616386,
+    "node": 18688380783,
+    "ratio": 1.574594221280428,
+    "delta_percent": 0.1502688967060628,
+    "wall": {
+      "otter_seconds": 1.6738935000000001,
+      "node_seconds": 1.0748805,
+      "bun_seconds": 1.137627167,
+      "node_ratio": 1.5572833445206238,
+      "bun_ratio": 1.4713902309613183,
+      "parent_otter_seconds": 1.680964542,
+      "delta_percent": -0.4206538462486975,
+      "reference_control_deltas_percent": {
+        "node": 0.7201509934991357,
+        "bun": -1.086313186829646
+      },
+      "scoreable": false
+    }
+  },
+  "regexp": {
+    "otter": 23194259266,
+    "node": 7302024402,
+    "ratio": 3.176414921271308,
+    "delta_percent": 1.596152075778412,
+    "wall": {
+      "otter_seconds": 2.074049667,
+      "node_seconds": 0.43946737500000005,
+      "bun_seconds": 0.390744833,
+      "node_ratio": 4.719462205812206,
+      "bun_ratio": 5.307938817965125,
+      "parent_otter_seconds": 1.667337459,
+      "delta_percent": 24.392914931805663,
+      "reference_control_deltas_percent": {
+        "node": 4.199703971678903,
+        "bun": -24.140817487182442
+      },
+      "scoreable": false
+    }
+  },
+  "splay": {
+    "otter": 10013011266,
+    "node": 4396614120,
+    "ratio": 2.277436907744817,
+    "delta_percent": 0.0732965062457458,
+    "wall": {
+      "otter_seconds": 0.7621062500000001,
+      "node_seconds": 0.324826875,
+      "bun_seconds": 0.199375458,
+      "node_ratio": 2.3461921061796382,
+      "bun_ratio": 3.8224677081368763,
+      "parent_otter_seconds": 0.759910375,
+      "delta_percent": 0.2889649980104547,
+      "reference_control_deltas_percent": {
+        "node": -1.562468038102005,
+        "bun": -6.165178575714791
+      },
+      "scoreable": false
+    }
+  },
+  "navier-stokes": {
+    "otter": 7871213458,
+    "node": 8095275899,
+    "ratio": 0.9723218277183514,
+    "delta_percent": -2.6313119904078253,
+    "wall": {
+      "otter_seconds": 0.9233820410000001,
+      "node_seconds": 0.715737625,
+      "bun_seconds": null,
+      "node_ratio": 1.2901124780187434,
+      "bun_ratio": null,
+      "parent_otter_seconds": 0.9233458330000001,
+      "delta_percent": 0.003921390957328796,
+      "reference_control_deltas_percent": {
+        "node": -0.1461618997617542
+      },
+      "scoreable": false
+    }
+  },
+  "box2d": {
+    "otter": 12963221362,
+    "node": 5062573423,
+    "ratio": 2.560599181259519,
+    "delta_percent": 0.196705320286239,
+    "wall": {
+      "otter_seconds": 0.8696457500000001,
+      "node_seconds": 0.31946470800000004,
+      "bun_seconds": 0.281555792,
+      "node_ratio": 2.722196625237239,
+      "bun_ratio": 3.088715539547487,
+      "parent_otter_seconds": 0.8689021250000001,
+      "delta_percent": 0.08558213619285215,
+      "reference_control_deltas_percent": {
+        "node": 3.414805546726374,
+        "bun": 0.050829964171827946
+      },
+      "scoreable": false
+    }
+  },
+  "gbemu": {
+    "otter": 17594098266,
+    "node": 8221150072,
+    "ratio": 2.140101824186722,
+    "delta_percent": 1.8337733844146165,
+    "wall": {
+      "otter_seconds": 1.172743542,
+      "node_seconds": 0.483778125,
+      "bun_seconds": null,
+      "node_ratio": 2.4241351177257138,
+      "bun_ratio": null,
+      "parent_otter_seconds": 1.178262917,
+      "delta_percent": -0.4684332266055691,
+      "reference_control_deltas_percent": {
+        "node": 0.24687271252266108
+      },
+      "scoreable": false
+    }
+  },
+  "mandreel": {
+    "otter": 19284328844,
+    "node": 13823039865,
+    "ratio": 1.3950859602762202,
+    "delta_percent": 0.11174801481814711,
+    "wall": {
+      "otter_seconds": 1.233371958,
+      "node_seconds": 0.702569458,
+      "bun_seconds": 0.504492041,
+      "node_ratio": 1.7555160474966163,
+      "bun_ratio": 2.4447798136819365,
+      "parent_otter_seconds": 1.236043666,
+      "delta_percent": -0.21614996892836968,
+      "reference_control_deltas_percent": {
+        "node": 0.5690955238262463,
+        "bun": -0.13753999448224974
+      },
+      "scoreable": false
+    }
+  },
+  "zlib": {
+    "otter": 24386682631,
+    "node": 24749906421,
+    "ratio": 0.9853242358245117,
+    "delta_percent": 0.10805340123105633,
+    "wall": {
+      "otter_seconds": 2.078641292,
+      "node_seconds": 1.73495875,
+      "bun_seconds": null,
+      "node_ratio": 1.1980926301561923,
+      "bun_ratio": null,
+      "parent_otter_seconds": 1.958865958,
+      "delta_percent": 6.114524248626507,
+      "reference_control_deltas_percent": {
+        "node": 5.7062364799765675
+      },
+      "scoreable": false
+    }
+  },
+  "ts": {
+    "otter": 36038932669,
+    "node": 20854641072,
+    "ratio": 1.728101315413519,
+    "delta_percent": -0.625807054071359,
+    "wall": {
+      "otter_seconds": 3.430125958,
+      "node_seconds": 1.221328834,
+      "bun_seconds": 1.08024575,
+      "node_ratio": 2.8085195915386048,
+      "bun_ratio": 3.17532002139328,
+      "parent_otter_seconds": 3.431754542,
+      "delta_percent": -0.04745630784686039,
+      "reference_control_deltas_percent": {
+        "node": 0.07414095429130185,
+        "bun": -12.223419395755098
+      },
+      "scoreable": false
+    }
+  },
+  "geomean": {
+    "ratio": 1.8370158227870785,
+    "parent_ratio": 1.8351429976998594,
+    "wall_node_ratio": 2.1036872405704496,
+    "parent_wall_node_ratio": 2.0935258080762007,
+    "wall_bun_ratio": 2.801922425817684,
+    "parent_wall_bun_ratio": 2.7269440832294567,
+    "wall_delta_percent": 0.9697245349184591,
+    "wall_scoreable": false
+  },
+  "wall_quality": {
+    "status": "inconclusive",
+    "scoreable": false,
+    "baseline_eligible": false,
+    "criterion": "max absolute Node/Bun control drift <=5%, absolute Node control geomean drift <=2%, no watched compiler activity overlapping wall window; idle Cargo CPU<5% excluded",
+    "reference_control_min_delta_percent": -24.140817487182442,
+    "reference_control_max_delta_percent": 35.35408363595931,
+    "node_control_geomean_delta_percent": 0.4820108576960802,
+    "compiler_activity_overlap": true
+  },
+  "capture_micro": {
+    "status": "passed",
+    "stage": "final",
+    "binary_sha256": {
+      "parent": "03aa491cce7ef034238638ee5fd07526d87a2cddbde1132bccce67d740989fa7",
+      "current": "7e2b27e06b1f86e558d0e10b377cfb1dc1509aacfff6a66f48da43e1371a9207",
+      "node": "1ee75375e33b94fc34b3b19aede049e11dae90efb63b374dc96d6bdace70c4b8"
+    },
+    "cases": {
+      "many-captures": {
+        "source": "const text=\"a\".repeat(8192); const re=/(?<first>a)(a)?/g; let checksum=0; for(let i=0;i<20;i++)text.replace(re,\"$<first>$2\"); for(let i=0;i<2000;i++)checksum+=text.replace(re,\"$<first>$2\").length; console.log(checksum);\n",
+        "source_sha256": "758c6d83ec20314820c26cf66bada6fe015e3a9ccdf890a977b717b9afdf0a33",
+        "rounds": [
+          {
+            "parent": {
+              "median_seconds": 0.753893708,
+              "samples_seconds": [
+                0.757280791,
+                0.750833375,
+                0.752355,
+                0.753893708,
+                0.7700778340000001
+              ]
+            },
+            "current": {
+              "median_seconds": 0.634175083,
+              "samples_seconds": [
+                0.6287192500000001,
+                0.632758625,
+                0.634175083,
+                0.6355572500000001,
+                0.634225
+              ]
+            },
+            "node": {
+              "median_seconds": 0.254567708,
+              "samples_seconds": [
+                0.254601542,
+                0.25305679200000003,
+                0.251275833,
+                0.254567708,
+                0.256788542
+              ]
+            },
+            "wall_delta_percent": -15.880040346483426
+          },
+          {
+            "node": {
+              "median_seconds": 0.252825166,
+              "samples_seconds": [
+                0.252825166,
+                0.24924941700000003,
+                0.253818792,
+                0.252437209,
+                0.253275833
+              ]
+            },
+            "current": {
+              "median_seconds": 0.631265458,
+              "samples_seconds": [
+                0.629786833,
+                0.6388868750000001,
+                0.630889416,
+                0.633011666,
+                0.631265458
+              ]
+            },
+            "parent": {
+              "median_seconds": 0.7473031670000001,
+              "samples_seconds": [
+                0.7455217500000001,
+                0.7530611660000001,
+                0.7667980000000001,
+                0.7473031670000001,
+                0.745907583
+              ]
+            },
+            "wall_delta_percent": -15.527528066798634
+          },
+          {
+            "current": {
+              "median_seconds": 0.632173084,
+              "samples_seconds": [
+                0.630581917,
+                0.632173084,
+                0.6396841670000001,
+                0.623430209,
+                0.638318417
+              ]
+            },
+            "node": {
+              "median_seconds": 0.253184416,
+              "samples_seconds": [
+                0.25263687500000004,
+                0.251718583,
+                0.253624917,
+                0.264734042,
+                0.253184416
+              ]
+            },
+            "parent": {
+              "median_seconds": 0.752205875,
+              "samples_seconds": [
+                0.7494256250000001,
+                0.757894791,
+                0.763374709,
+                0.752205875,
+                0.7475102920000001
+              ]
+            },
+            "wall_delta_percent": -15.957438646700272
+          }
+        ],
+        "parent_instructions": 12519937350,
+        "current_instructions": 11670702250,
+        "matches_node": true,
+        "instruction_delta_percent": -6.7830618976699615,
+        "node_control_spread_percent": 0.6892280652156302,
+        "compiler_activity_overlap": false,
+        "scoreable": true,
+        "status": "local_observation"
+      },
+      "no-captures": {
+        "source": "const text=\"a\".repeat(8192); const re=/a/g; let checksum=0; for(let i=0;i<20;i++)text.replace(re,\"x\"); for(let i=0;i<2000;i++)checksum+=text.replace(re,\"x\").length; console.log(checksum);\n",
+        "source_sha256": "5d2126ead18670446d87e0daaa8f40cfb3fafd03b91bbc2fcc29ec1f0ae931b7",
+        "rounds": [
+          {
+            "parent": {
+              "median_seconds": 0.5570393330000001,
+              "samples_seconds": [
+                0.5550581250000001,
+                0.5570393330000001,
+                0.5679972080000001,
+                0.558914125,
+                0.5553125830000001
+              ]
+            },
+            "current": {
+              "median_seconds": 0.45185391700000005,
+              "samples_seconds": [
+                0.44402,
+                0.45301325000000003,
+                0.44845116700000004,
+                0.45185391700000005,
+                0.455451292
+              ]
+            },
+            "node": {
+              "median_seconds": 0.31578612500000003,
+              "samples_seconds": [
+                0.309797458,
+                0.307907625,
+                0.338623667,
+                0.341030333,
+                0.31578612500000003
+              ]
+            },
+            "wall_delta_percent": -18.882942328957586
+          },
+          {
+            "node": {
+              "median_seconds": 0.307765708,
+              "samples_seconds": [
+                0.307765708,
+                0.30506075,
+                0.30860975,
+                0.30929825,
+                0.30635204200000005
+              ]
+            },
+            "current": {
+              "median_seconds": 0.456672167,
+              "samples_seconds": [
+                0.456672167,
+                0.449699667,
+                0.450264875,
+                0.463613125,
+                0.46225183400000003
+              ]
+            },
+            "parent": {
+              "median_seconds": 0.579030167,
+              "samples_seconds": [
+                0.579030167,
+                0.578706,
+                0.576481459,
+                0.6038257920000001,
+                0.611526208
+              ]
+            },
+            "wall_delta_percent": -21.131541493588536
+          },
+          {
+            "current": {
+              "median_seconds": 0.529144084,
+              "samples_seconds": [
+                0.6647506670000001,
+                0.562926791,
+                0.529144084,
+                0.45518866700000005,
+                0.441968
+              ]
+            },
+            "node": {
+              "median_seconds": 0.301321875,
+              "samples_seconds": [
+                0.30457491600000003,
+                0.301321875,
+                0.300132334,
+                0.300938708,
+                0.30252475
+              ]
+            },
+            "parent": {
+              "median_seconds": 0.5583237080000001,
+              "samples_seconds": [
+                0.5583237080000001,
+                0.554890334,
+                0.570271584,
+                0.5641407500000001,
+                0.552703791
+              ]
+            },
+            "wall_delta_percent": -5.226291411576611
+          }
+        ],
+        "parent_instructions": 7366517995,
+        "current_instructions": 8009353668,
+        "matches_node": true,
+        "instruction_delta_percent": 8.726452218488067,
+        "node_control_spread_percent": 4.80026549682131,
+        "compiler_activity_overlap": true,
+        "scoreable": false,
+        "status": "inconclusive"
+      },
+      "test-hit": {
+        "source": "const re=/a/; const text=\"prefix-a\"; function testLoop(re,text,n){let count=0;for(let i=0;i<n;i++)if(re.test(text))count++;return count;} testLoop(re,text,10000); console.log(testLoop(re,text,20000000));\n",
+        "source_sha256": "186cc7225276f9457bc9dd7c43b23222931a172d153f6033b4d01140d8dd7a00",
+        "rounds": [
+          {
+            "parent": {
+              "median_seconds": 1.0264845,
+              "samples_seconds": [
+                1.031621041,
+                1.032939916,
+                1.017134292,
+                1.0264845,
+                1.019313292
+              ]
+            },
+            "current": {
+              "median_seconds": 1.031086834,
+              "samples_seconds": [
+                1.003898041,
+                1.011170542,
+                1.031086834,
+                1.043225667,
+                1.065597
+              ]
+            },
+            "node": {
+              "median_seconds": 0.36806770800000005,
+              "samples_seconds": [
+                0.365943709,
+                0.366756167,
+                0.36882883400000005,
+                0.36908612500000004,
+                0.36806770800000005
+              ]
+            },
+            "wall_delta_percent": 0.44835884029421624
+          },
+          {
+            "node": {
+              "median_seconds": 0.37087925000000005,
+              "samples_seconds": [
+                0.385925709,
+                0.45190041700000005,
+                0.370270083,
+                0.369036792,
+                0.37087925000000005
+              ]
+            },
+            "current": {
+              "median_seconds": 1.056039292,
+              "samples_seconds": [
+                1.177630125,
+                1.048222083,
+                1.0312175,
+                1.056039292,
+                1.108988958
+              ]
+            },
+            "parent": {
+              "median_seconds": 1.183759791,
+              "samples_seconds": [
+                1.073306291,
+                1.2164777500000001,
+                1.111962292,
+                1.183759791,
+                1.2703132080000001
+              ]
+            },
+            "wall_delta_percent": -10.78939325115158
+          },
+          {
+            "current": {
+              "median_seconds": 1.083074,
+              "samples_seconds": [
+                1.052116875,
+                1.083074,
+                1.053955458,
+                1.234488208,
+                1.261461375
+              ]
+            },
+            "node": {
+              "median_seconds": 0.42632170900000005,
+              "samples_seconds": [
+                0.416952833,
+                0.45941350000000003,
+                0.410241791,
+                0.437810209,
+                0.42632170900000005
+              ]
+            },
+            "parent": {
+              "median_seconds": 1.081818875,
+              "samples_seconds": [
+                1.3716175000000002,
+                1.2454886250000001,
+                1.081818875,
+                1.064736667,
+                1.055931167
+              ]
+            },
+            "wall_delta_percent": 0.1160198836427373
+          }
+        ],
+        "parent_instructions": 18740173992,
+        "current_instructions": 19459553512,
+        "matches_node": true,
+        "instruction_delta_percent": 3.838702459790899,
+        "node_control_spread_percent": 15.82697958387591,
+        "compiler_activity_overlap": true,
+        "scoreable": false,
+        "status": "inconclusive"
+      },
+      "test-miss": {
+        "source": "const re=/z/; const text=\"prefix-a\"; function testLoop(re,text,n){let count=0;for(let i=0;i<n;i++)if(re.test(text))count++;return count;} testLoop(re,text,10000); console.log(testLoop(re,text,20000000));\n",
+        "source_sha256": "ce04d65779ebf3968bd9e3f57705af7dbc24e5014c422d7233b5c6d5f72140fb",
+        "rounds": [
+          {
+            "parent": {
+              "median_seconds": 0.681853,
+              "samples_seconds": [
+                0.683735042,
+                0.685884708,
+                0.6794373330000001,
+                0.681853,
+                0.6803790000000001
+              ]
+            },
+            "current": {
+              "median_seconds": 0.683413,
+              "samples_seconds": [
+                0.683413,
+                0.687675125,
+                0.689720875,
+                0.682264167,
+                0.681854916
+              ]
+            },
+            "node": {
+              "median_seconds": 0.295050042,
+              "samples_seconds": [
+                0.294241625,
+                0.295050042,
+                0.29441475,
+                0.296174833,
+                0.29733916600000004
+              ]
+            },
+            "wall_delta_percent": 0.22878831654329357
+          },
+          {
+            "node": {
+              "median_seconds": 0.297325334,
+              "samples_seconds": [
+                0.294676541,
+                0.30167225000000003,
+                0.297325334,
+                0.301427125,
+                0.295355083
+              ]
+            },
+            "current": {
+              "median_seconds": 0.6824027920000001,
+              "samples_seconds": [
+                0.685124791,
+                0.6805793330000001,
+                0.681117584,
+                0.685546792,
+                0.6824027920000001
+              ]
+            },
+            "parent": {
+              "median_seconds": 0.68297575,
+              "samples_seconds": [
+                0.6819317500000001,
+                0.693582958,
+                0.6870885830000001,
+                0.68297575,
+                0.679778333
+              ]
+            },
+            "wall_delta_percent": -0.08389141195714878
+          },
+          {
+            "current": {
+              "median_seconds": 0.6832371660000001,
+              "samples_seconds": [
+                0.690953416,
+                0.691553916,
+                0.681177708,
+                0.6832371660000001,
+                0.6790537090000001
+              ]
+            },
+            "node": {
+              "median_seconds": 0.295619417,
+              "samples_seconds": [
+                0.294834625,
+                0.29440841700000003,
+                0.295619417,
+                0.299455792,
+                0.295830292
+              ]
+            },
+            "parent": {
+              "median_seconds": 0.685451208,
+              "samples_seconds": [
+                0.687786917,
+                0.6879400830000001,
+                0.681568166,
+                0.685451208,
+                0.683823375
+              ]
+            },
+            "wall_delta_percent": -0.32300504750149006
+          }
+        ],
+        "parent_instructions": 13754940202,
+        "current_instructions": 13657301252,
+        "matches_node": true,
+        "instruction_delta_percent": -0.7098464156594653,
+        "node_control_spread_percent": 0.7711546097661559,
+        "compiler_activity_overlap": false,
+        "scoreable": true,
+        "status": "local_observation"
+      },
+      "exec-captures": {
+        "source": "const re=/(?<scheme>https?):\\/\\/([^/:]+)(?::([0-9]+))?(\\/[^?#]*)(?:\\?([^#]*))?(?:#(.*))?/; const text=\"https://example.com:8080/a/b?q=7#part\"; function execLoop(re,text,n){let total=0;for(let i=0;i<n;i++){const m=re.exec(text);total+=m.length+m[1].length+m[4].length;}return total;}execLoop(re,text,1000);console.log(execLoop(re,text,2000000));\n",
+        "source_sha256": "ef996e573790120e1126791568394ff6c5a8003f1974942ba6f8af969a6c97fa",
+        "rounds": [
+          {
+            "parent": {
+              "median_seconds": 1.084036291,
+              "samples_seconds": [
+                1.080330709,
+                1.084036291,
+                1.19200825,
+                1.223743,
+                1.074772375
+              ]
+            },
+            "current": {
+              "median_seconds": 1.064490583,
+              "samples_seconds": [
+                1.087408333,
+                1.064490583,
+                1.066683,
+                1.057611167,
+                1.059487791
+              ]
+            },
+            "node": {
+              "median_seconds": 0.25141545800000004,
+              "samples_seconds": [
+                0.25141545800000004,
+                0.25303041600000004,
+                0.256628042,
+                0.24964287500000001,
+                0.2507125
+              ]
+            },
+            "wall_delta_percent": -1.803049230203313
+          },
+          {
+            "node": {
+              "median_seconds": 0.251607375,
+              "samples_seconds": [
+                0.253380667,
+                0.257963459,
+                0.249536791,
+                0.249869208,
+                0.251607375
+              ]
+            },
+            "current": {
+              "median_seconds": 1.054896375,
+              "samples_seconds": [
+                1.053235792,
+                1.064901458,
+                1.054896375,
+                1.065324042,
+                1.052694375
+              ]
+            },
+            "parent": {
+              "median_seconds": 1.033528833,
+              "samples_seconds": [
+                1.03750325,
+                1.033528833,
+                1.040880083,
+                1.032290166,
+                1.032733167
+              ]
+            },
+            "wall_delta_percent": 2.0674355003698297
+          },
+          {
+            "current": {
+              "median_seconds": 1.060677666,
+              "samples_seconds": [
+                1.060677666,
+                1.065284125,
+                1.0558821250000001,
+                1.064274959,
+                1.0562520420000001
+              ]
+            },
+            "node": {
+              "median_seconds": 0.254063458,
+              "samples_seconds": [
+                0.253502167,
+                0.254294625,
+                0.26033937500000004,
+                0.25158275,
+                0.254063458
+              ]
+            },
+            "parent": {
+              "median_seconds": 1.033719917,
+              "samples_seconds": [
+                1.033719917,
+                1.042378584,
+                1.033235708,
+                1.039389042,
+                1.028964833
+              ]
+            },
+            "wall_delta_percent": 2.6078387923718305
+          }
+        ],
+        "parent_instructions": 18015113957,
+        "current_instructions": 18478270240,
+        "matches_node": true,
+        "instruction_delta_percent": 2.5709317415671062,
+        "node_control_spread_percent": 1.0532367504626494,
+        "compiler_activity_overlap": true,
+        "scoreable": false,
+        "status": "inconclusive"
+      }
+    }
+  },
+  "references": {
+    "fresh_parent_wall": "wall-parent/",
+    "fresh_candidate_wall": "wall-final/",
+    "full_measurements": [
+      {
+        "name": "fw-1",
+        "command": [
+          "bash",
+          "scripts/dev/fw_vs_node.sh",
+          "benchmarks/results/regexp-capture-batch/otter-gate"
+        ],
+        "exit_code": 0,
+        "elapsed_seconds": 21.291126333002467,
+        "executed_cli_sha256": "7e2b27e06b1f86e558d0e10b377cfb1dc1509aacfff6a66f48da43e1371a9207",
+        "captured_candidate_cli_sha256": "7e2b27e06b1f86e558d0e10b377cfb1dc1509aacfff6a66f48da43e1371a9207"
+      },
+      {
+        "name": "wall-parent-1",
+        "command": [
+          "bash",
+          "scripts/dev/wallclock_matrix.sh",
+          "benchmarks/results/array-spare-push/otter-gate",
+          "benchmarks/results/regexp-capture-batch/wall-parent",
+          "5"
+        ],
+        "exit_code": 0,
+        "elapsed_seconds": 255.58063816599315,
+        "executed_cli_sha256": "03aa491cce7ef034238638ee5fd07526d87a2cddbde1132bccce67d740989fa7",
+        "captured_candidate_cli_sha256": "7e2b27e06b1f86e558d0e10b377cfb1dc1509aacfff6a66f48da43e1371a9207"
+      },
+      {
+        "name": "wall-1",
+        "command": [
+          "bash",
+          "scripts/dev/wallclock_matrix.sh",
+          "benchmarks/results/regexp-capture-batch/otter-gate",
+          "benchmarks/results/regexp-capture-batch/wall-final",
+          "5"
+        ],
+        "exit_code": 0,
+        "elapsed_seconds": 256.34737754100934,
+        "executed_cli_sha256": "7e2b27e06b1f86e558d0e10b377cfb1dc1509aacfff6a66f48da43e1371a9207",
+        "captured_candidate_cli_sha256": "7e2b27e06b1f86e558d0e10b377cfb1dc1509aacfff6a66f48da43e1371a9207"
+      }
+    ],
+    "full_wall_samples_per_engine": 5,
+    "micro_samples_per_engine_per_case": 15,
+    "timing_supervision": {
+      "report_sha256": "d8167fd9311061c51a100471a41d571d88fbe7d5c86bdbe0ef999b4a51ae2562",
+      "raw_status": "ambient_build_observed",
+      "material_compiler_events": 18,
+      "prestart_wait_snapshots": 27
+    }
+  },
+  "no_groups_repeat": {
+    "status": "passed",
+    "source": "const text=\"a\".repeat(8192); const re=/a/g; let checksum=0; for(let i=0;i<20;i++)text.replace(re,\"x\"); for(let i=0;i<2000;i++)checksum+=text.replace(re,\"x\").length; console.log(checksum);\n",
+    "source_sha256": "5d2126ead18670446d87e0daaa8f40cfb3fafd03b91bbc2fcc29ec1f0ae931b7",
+    "binary_sha256": {
+      "parent": "03aa491cce7ef034238638ee5fd07526d87a2cddbde1132bccce67d740989fa7",
+      "current": "7e2b27e06b1f86e558d0e10b377cfb1dc1509aacfff6a66f48da43e1371a9207"
+    },
+    "rounds": [
+      {
+        "parent": {
+          "median_seconds": 0.5735148330000001,
+          "samples_seconds": [
+            0.5735148330000001,
+            0.570765166,
+            0.585895375,
+            0.576615458,
+            0.571624958
+          ]
+        },
+        "current": {
+          "median_seconds": 0.447724416,
+          "samples_seconds": [
+            0.462622458,
+            0.447724416,
+            0.45339204200000005,
+            0.44575487500000005,
+            0.44389675
+          ]
+        },
+        "node": {
+          "median_seconds": 0.30227600000000004,
+          "samples_seconds": [
+            0.301114125,
+            0.299976458,
+            0.30374612500000003,
+            0.319364625,
+            0.30227600000000004
+          ]
+        },
+        "wall_delta_percent": -21.933245621914022,
+        "compiler_activity": []
+      },
+      {
+        "node": {
+          "median_seconds": 0.307078917,
+          "samples_seconds": [
+            0.30005895800000004,
+            0.30664658300000003,
+            0.315702209,
+            0.307078917,
+            0.30872345900000003
+          ]
+        },
+        "current": {
+          "median_seconds": 0.4480945,
+          "samples_seconds": [
+            0.44789166700000005,
+            0.447826708,
+            0.4480945,
+            0.45006025000000005,
+            0.45060758300000003
+          ]
+        },
+        "parent": {
+          "median_seconds": 0.573534834,
+          "samples_seconds": [
+            0.572995208,
+            0.5876385000000001,
+            0.5735036250000001,
+            0.579174458,
+            0.573534834
+          ]
+        },
+        "wall_delta_percent": -21.871441203517207,
+        "compiler_activity": []
+      },
+      {
+        "current": {
+          "median_seconds": 0.44817337500000004,
+          "samples_seconds": [
+            0.44688312500000005,
+            0.452721584,
+            0.486685833,
+            0.44411008300000004,
+            0.44817337500000004
+          ]
+        },
+        "node": {
+          "median_seconds": 0.303985208,
+          "samples_seconds": [
+            0.30973479200000004,
+            0.303985208,
+            0.307147875,
+            0.30058358300000004,
+            0.298275542
+          ]
+        },
+        "parent": {
+          "median_seconds": 0.575498666,
+          "samples_seconds": [
+            0.575498666,
+            0.5734812920000001,
+            0.5733233750000001,
+            0.595228375,
+            0.5790063750000001
+          ]
+        },
+        "wall_delta_percent": -22.124341640089906,
+        "compiler_activity": []
+      }
+    ],
+    "matches_node": true,
+    "node_control_spread_percent": 1.5889177440484792,
+    "scoreable": true
+  }
+}

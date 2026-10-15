@@ -29,11 +29,11 @@ fn render(
     )
     .unwrap();
     let config = otter_regex::ExecConfig::default();
-    let matches: Vec<_> = match subject {
-        CodeUnits::Latin1(bytes) => regex.find_latin1(bytes, 0, config).collect(),
-        CodeUnits::Utf16(units) => regex.find_utf16(units, 0, config).collect(),
-    };
-    let matches: Vec<_> = matches.into_iter().collect::<Result<_, _>>().unwrap();
+    let matches = match subject {
+        CodeUnits::Latin1(bytes) => regex.find_latin1(bytes, 0, config).collect_batch(usize::MAX),
+        CodeUnits::Utf16(units) => regex.find_utf16(units, 0, config).collect_batch(usize::MAX),
+    }
+    .unwrap();
     let named = matches
         .first()
         .is_some_and(|m| m.named_groups().next().is_some());

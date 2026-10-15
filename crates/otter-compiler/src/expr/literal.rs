@@ -162,7 +162,7 @@ pub(crate) fn compile_regexp_literal_into(
             span,
         });
     }
-    if let Err(e) = otter_regex::Regex::with_flags(pattern_text, engine_flags) {
+    if let Err(e) = otter_regex::Regex::compile_str(pattern_text, engine_flags) {
         return Err(CompileError::Unsupported {
             node: format!("RegExpLiteral `/{pattern_text}/{flags_str}` rejected: {e}"),
             span,

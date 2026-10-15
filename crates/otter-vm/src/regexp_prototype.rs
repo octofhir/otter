@@ -189,14 +189,16 @@ pub(crate) fn exec_once_native(
                 let subject = scope.raw(input);
                 let matched_range = matched.range.clone();
                 scope.with_turn_parts(|interp, _| {
-                    interp
-                        .regexp_legacy
-                        .record_match(subject, matched_range, &matched.captures);
+                    interp.regexp_legacy.record_match(
+                        subject,
+                        matched_range,
+                        matched.captures().iter(),
+                    );
                     Ok::<(), NativeError>(())
                 })?;
             }
 
-            build_match_result_native(&matched, input, flags.has_indices, &mut scope)
+            build_match_result_native(&matched.as_match(), input, flags.has_indices, &mut scope)
         })()?;
         Ok(scope.finish(result))
     })
@@ -231,7 +233,7 @@ fn slice_subject_string<'scope>(
 }
 
 pub(crate) fn build_match_result_native<'scope>(
-    m: &crate::regexp::engine::Match,
+    m: &crate::regexp::engine::Match<'_>,
     input: Local<'_>,
     has_indices: bool,
     scope: &mut NativeScope<'scope, '_>,
@@ -241,7 +243,7 @@ pub(crate) fn build_match_result_native<'scope>(
     let mut elements: smallvec::SmallVec<[Local<'_>; 16]> =
         smallvec::SmallVec::with_capacity(1 + m.captures.len());
     elements.push(slice_subject_string(scope, input, m.range.clone())?);
-    for capture in &m.captures {
+    for capture in m.captures.iter() {
         elements.push(match capture {
             Some(range) => slice_subject_string(scope, input, range.clone())?,
             None => scope.undefined(),
@@ -273,7 +275,7 @@ pub(crate) fn build_match_result_native<'scope>(
         let mut elements: smallvec::SmallVec<[Local<'_>; 8]> =
             smallvec::SmallVec::with_capacity(1 + m.captures.len());
         elements.push(pair_array_native(scope, m.range.start, m.range.end)?);
-        for capture in &m.captures {
+        for capture in m.captures.iter() {
             elements.push(match capture {
                 Some(range) => pair_array_native(scope, range.start, range.end)?,
                 None => scope.undefined(),
@@ -344,7 +346,7 @@ fn pair_array_native<'scope>(
 /// 5. Otherwise return `? RegExpExec(rx, S)`.
 ///
 /// The foundation drives the engine directly via
-/// [`JsRegExp::find_all`] so the spec-mandated `lastIndex`
+/// [`JsRegExp::find_batch`] so the spec-mandated `lastIndex`
 /// updates and `AdvanceStringIndex` semantics fire correctly for
 /// both global and non-global receivers. Unicode awareness is keyed
 /// off the `u` and `v` flags per §22.2.5.2 step 18.
@@ -444,10 +446,11 @@ pub fn native_regexp_symbol_match(
                 {
                     let context = scope.context();
                     let search = context.regex_search();
-                    let execution = re.find_all(
+                    let execution = re.find_batch(
                         context.heap(),
                         crate::string::CodeUnits::Utf16(&input_units),
                         0,
+                        usize::MAX,
                         &search,
                     );
                     let found = crate::regexp::finish_execution(scope.context(), execution)?;
@@ -455,7 +458,7 @@ pub fn native_regexp_symbol_match(
                         return Ok(Value::null());
                     }
                     let mut output = Vec::with_capacity(found.len());
-                    for matched in &found {
+                    for matched in found.iter() {
                         output.push(slice_subject_string(
                             &mut scope,
                             input,

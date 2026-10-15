@@ -728,17 +728,18 @@ fn regexp_root_survives_force_gc() {
         panic!("expected Value::RegExp after force_gc, got {rooted:?}");
     };
     let text: Vec<u16> = "aaab".encode_utf16().collect();
-    let first = re
-        .find_all(
+    let matches = re
+        .find_batch(
             interp.gc_heap(),
             crate::string::CodeUnits::Utf16(&text),
             0,
+            usize::MAX,
             &interp.regex_search(),
         )
         .result
-        .expect("within matcher budget")
-        .into_iter()
-        .next()
+        .expect("within matcher budget");
+    let first = matches
+        .first()
         .expect("regexp remains executable after force_gc");
     assert_eq!(first.range, 0..3);
 }

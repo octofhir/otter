@@ -36,117 +36,8 @@ use std::cell::Cell;
 use engine::Regex;
 use otter_gc::raw::{RawGc, SlotVisitor};
 
-/// RegExp matcher backend — the in-repo `otter-regex` engine.
-///
-/// The rest of the VM depends only on this surface (`Regex`, `Match`,
-/// [`compile`](engine::compile), [`find`](engine::find)). The dependency edge is
-/// one-way: the VM consumes the engine; the engine never reaches back into it.
-pub(crate) mod engine {
-    pub use otter_regex::{ExecError, Match, Regex};
-
-    /// One matcher result plus the exact work charged to the VM ledger.
-    pub(crate) struct Execution<T> {
-        pub(crate) result: Result<T, ExecError>,
-        pub(crate) steps: u64,
-    }
-
-    /// Compile a pattern (lossy UTF-8 view) under the engine-relevant flags.
-    /// `g`/`y`/`d` are spec state above the matcher and are not passed here.
-    pub(crate) fn compile(
-        pattern_utf16: &[u16],
-        ignore_case: bool,
-        multiline: bool,
-        dot_all: bool,
-        unicode: bool,
-        unicode_sets: bool,
-    ) -> Result<Regex, String> {
-        let flags = otter_regex::Flags {
-            ignore_case,
-            multiline,
-            dot_all,
-            unicode,
-            unicode_sets,
-        };
-        // Compile straight from code units: a lone surrogate in the
-        // pattern is a legal non-`u` literal (§22.2.1) and must not be
-        // smoothed to U+FFFD by a UTF-8 round-trip.
-        Regex::compile_utf16(pattern_utf16, flags).map_err(|e| format!("{e}"))
-    }
-
-    /// Collect every successful match from `start` with exact work accounting,
-    /// exploring at most the search's step limit of backtrack points. The
-    /// subject is searched at its stored width.
-    pub(crate) fn find(
-        re: &Regex,
-        text: crate::string::CodeUnits<'_>,
-        start: usize,
-        search: &super::RegexSearch<'_>,
-    ) -> Execution<Vec<Match>> {
-        let config = otter_regex::ExecConfig {
-            step_limit: search.step_limit,
-        };
-        let scratch = search.scratch.take();
-        match text {
-            crate::string::CodeUnits::Latin1(bytes) => {
-                collect_all(re.find_latin1_with(bytes, start, config, scratch), search)
-            }
-            crate::string::CodeUnits::Utf16(units) => {
-                collect_all(re.find_utf16_with(units, start, config, scratch), search)
-            }
-        }
-    }
-
-    fn collect_all<U: otter_regex::Unit>(
-        mut matches: otter_regex::Matches<'_, '_, U>,
-        search: &super::RegexSearch<'_>,
-    ) -> Execution<Vec<Match>> {
-        let mut found = Vec::new();
-        let result = loop {
-            match matches.next() {
-                Some(Ok(matched)) => found.push(matched),
-                Some(Err(error)) => break Err(error),
-                None => break Ok(found),
-            }
-        };
-        let steps = matches.steps_executed();
-        search.scratch.set(matches.into_scratch());
-        Execution { result, steps }
-    }
-
-    /// Find only the first match from `start` — the single-match path for
-    /// `exec`/`test`. The iterator is lazy, so this computes one match instead
-    /// of the whole remaining set. Exceeding the step limit remains an explicit
-    /// resource error for the VM boundary to surface.
-    pub(crate) fn find_one(
-        re: &Regex,
-        text: crate::string::CodeUnits<'_>,
-        start: usize,
-        search: &super::RegexSearch<'_>,
-    ) -> Execution<Option<Match>> {
-        let config = otter_regex::ExecConfig {
-            step_limit: search.step_limit,
-        };
-        let scratch = search.scratch.take();
-        match text {
-            crate::string::CodeUnits::Latin1(bytes) => {
-                first_match(re.find_latin1_with(bytes, start, config, scratch), search)
-            }
-            crate::string::CodeUnits::Utf16(units) => {
-                first_match(re.find_utf16_with(units, start, config, scratch), search)
-            }
-        }
-    }
-
-    fn first_match<U: otter_regex::Unit>(
-        mut matches: otter_regex::Matches<'_, '_, U>,
-        search: &super::RegexSearch<'_>,
-    ) -> Execution<Option<Match>> {
-        let result = matches.next().transpose();
-        let steps = matches.steps_executed();
-        search.scratch.set(matches.into_scratch());
-        Execution { result, steps }
-    }
-}
+/// VM-agnostic matching with owned result batches and exact work accounting.
+pub(crate) mod engine;
 
 /// What one RegExp search takes from its isolate: the backtrack points it may
 /// explore and the matcher buffers every search of the isolate reuses.
@@ -677,7 +568,7 @@ impl JsRegExp {
     /// Find only the **first** match from a code-unit offset, without
     /// collecting the rest. `RegExp.prototype.exec`/`test` returns a single
     /// match and advances `lastIndex`, so a `/g` loop calls this once per
-    /// match; using the collecting [`Self::find_all`] there is quadratic (each
+    /// match; using the collecting [`Self::find_batch`] there is quadratic (each
     /// call would re-find every remaining match and discard all but the
     /// first). Step-limit aborts remain explicit so the runtime can surface one
     /// resource error.
@@ -687,7 +578,7 @@ impl JsRegExp {
         text_units: crate::string::CodeUnits<'_>,
         start: usize,
         search: &RegexSearch<'_>,
-    ) -> engine::Execution<Option<engine::Match>> {
+    ) -> engine::Execution<Option<engine::MatchRecord>> {
         heap.read_payload(self.inner, |body| {
             engine::find_one(&body.pattern.regex, text_units, start, search)
         })
@@ -696,15 +587,16 @@ impl JsRegExp {
     /// Run the compiled engine from a code-unit offset and collect owned
     /// matches, exploring at most the search's step limit of backtrack
     /// points; the returned work count is charged at the runtime boundary.
-    pub(crate) fn find_all(
+    pub(crate) fn find_batch(
         &self,
         heap: &otter_gc::GcHeap,
         text_units: crate::string::CodeUnits<'_>,
         start: usize,
+        max_matches: usize,
         search: &RegexSearch<'_>,
-    ) -> engine::Execution<Vec<engine::Match>> {
+    ) -> engine::Execution<engine::MatchBatch> {
         heap.read_payload(self.inner, |body| {
-            engine::find(&body.pattern.regex, text_units, start, search)
+            engine::find_batch(&body.pattern.regex, text_units, start, max_matches, search)
         })
     }
 
@@ -944,18 +836,17 @@ mod tests {
         assert_eq!(r.source(&heap), "ab+c");
         assert!(r.flags(&heap).ignore_case);
         let utf16: Vec<u16> = "abbbcXabbbbc".encode_utf16().collect();
-        let m = r
-            .find_all(
+        let matches = r
+            .find_batch(
                 &heap,
                 crate::string::CodeUnits::Utf16(&utf16),
                 0,
+                usize::MAX,
                 &RegexSearch::new(u64::MAX, &std::cell::Cell::default()),
             )
             .result
-            .expect("within matcher budget")
-            .into_iter()
-            .next()
-            .unwrap();
+            .expect("within matcher budget");
+        let m = matches.first().unwrap();
         assert_eq!(m.range, 0..5);
     }
 

@@ -357,20 +357,20 @@ fn is_ws_code_unit(u: u16) -> bool {
 
 /// Run a regex over `text_units` and collect every match. Honours
 /// the `g` flag — without it we stop after the first match. We
-/// collect each match record directly: it is already owned (owned
-/// `Range<usize>` ranges, owned capture vec, owned group-name table)
-/// so we can release the iterator's borrow on `text_units` before
+/// collect offsets into one owned batch, sharing names once,
+/// so we can release the search's borrow on `text_units` before
 /// allocating replacement strings or building result arrays.
 fn collect_regex_matches(
     ctx: &mut NativeCtx<'_>,
     re: &JsRegExp,
     text_units: &[u16],
-) -> Result<Vec<crate::regexp::engine::Match>, NativeError> {
+) -> Result<crate::regexp::engine::MatchBatch, NativeError> {
     let global = re.flags(ctx.heap()).global;
-    let execution = re.find_all(
+    let execution = re.find_batch(
         ctx.heap(),
         crate::string::CodeUnits::Utf16(text_units),
         0,
+        usize::MAX,
         &ctx.regex_search(),
     );
     let mut out = crate::regexp::finish_execution(ctx, execution)?;
@@ -385,7 +385,7 @@ fn collect_regex_matches(
 fn apply_substitution(
     template: &[u16],
     text_units: &[u16],
-    m: &crate::regexp::engine::Match,
+    m: &crate::regexp::engine::Match<'_>,
 ) -> Vec<u16> {
     let mut out = Vec::with_capacity(template.len());
     let mut i = 0;
@@ -409,7 +409,7 @@ fn apply_substitution(
             n if (b'1' as u16..=b'9' as u16).contains(&n) => {
                 let idx = (n - b'0' as u16) as usize;
                 if idx <= m.captures.len() {
-                    if let Some(range) = &m.captures[idx - 1] {
+                    if let Some(range) = m.captures.get(idx - 1) {
                         out.extend_from_slice(&text_units[range.clone()]);
                     }
                 } else {
@@ -2405,9 +2405,9 @@ fn regex_replace(
     }
     let mut buf = Vec::with_capacity(recv_units.len());
     let mut cursor = 0;
-    for m in &matches {
+    for m in matches.iter() {
         buf.extend_from_slice(&recv_units[cursor..m.range.start]);
-        let rendered = apply_substitution(replacement_template, recv_units, m);
+        let rendered = apply_substitution(replacement_template, recv_units, &m);
         buf.extend_from_slice(&rendered);
         cursor = m.range.end;
     }
@@ -2434,18 +2434,21 @@ fn regex_split(
     let recv_units = recv.to_utf16_vec(ctx.heap_mut());
     let mut out: Vec<Value> = Vec::new();
     let mut cursor: usize = 0;
-    let execution = re.find_all(
+    let execution = re.find_batch(
         ctx.heap(),
         crate::string::CodeUnits::Utf16(&recv_units),
         0,
+        usize::MAX,
         &ctx.regex_search(),
     );
-    let mut iter = crate::regexp::finish_execution(ctx, execution)?.into_iter();
+    let mut matches = crate::regexp::finish_execution(ctx, execution)?;
+    let mut match_index = 0;
     while (out.len() as u32) < limit {
-        let m = match iter.next() {
+        let m = match matches.get(match_index) {
             Some(m) => m,
             None => break,
         };
+        match_index += 1;
         // Spec quirk: zero-width match at the cursor is skipped to
         // prevent an infinite loop. We advance by one code unit and
         // try again.
@@ -2453,16 +2456,17 @@ fn regex_split(
             if cursor >= recv_units.len() {
                 break;
             }
-            // Drop the iterator and resume after the cursor advance.
-            drop(iter);
+            // Resume a fresh batch after the cursor advance.
             cursor += 1;
-            let execution = re.find_all(
+            let execution = re.find_batch(
                 ctx.heap(),
                 crate::string::CodeUnits::Utf16(&recv_units),
                 cursor,
+                usize::MAX,
                 &ctx.regex_search(),
             );
-            iter = crate::regexp::finish_execution(ctx, execution)?.into_iter();
+            matches = crate::regexp::finish_execution(ctx, execution)?;
+            match_index = 0;
             continue;
         }
         let part = JsString::from_utf16_units(&recv_units[cursor..m.range.start], ctx.heap_mut())?;

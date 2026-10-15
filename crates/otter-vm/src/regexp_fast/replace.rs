@@ -60,15 +60,13 @@ pub(crate) fn replace(
             regexp.set_last_index(heap, 0);
         }
         let execution = subject.with_code_units(heap, |units| {
-            if flags.global {
-                regexp.find_all(heap, units, 0, &search)
-            } else {
-                let execution = regexp.find_one(heap, units, 0, &search);
-                crate::regexp::engine::Execution {
-                    result: execution.result.map(|found| found.into_iter().collect()),
-                    steps: execution.steps,
-                }
-            }
+            regexp.find_batch(
+                heap,
+                units,
+                0,
+                if flags.global { usize::MAX } else { 1 },
+                &search,
+            )
         });
         let matches = crate::regexp::finish_execution(scope.context(), execution)?;
         if matches.is_empty() {
@@ -77,9 +75,11 @@ pub(crate) fn replace(
         if let Some(last) = matches.last() {
             let subject = scope.raw(input);
             scope.with_turn_parts(|interp, _| {
-                interp
-                    .regexp_legacy
-                    .record_match(subject, last.range.clone(), &last.captures);
+                interp.regexp_legacy.record_match(
+                    subject,
+                    last.range.clone(),
+                    last.captures.iter(),
+                );
             });
         }
         let named = matches
@@ -113,18 +113,18 @@ pub(crate) fn replace(
 fn build_template(
     subject: CodeUnits<'_>,
     template: CodeUnits<'_>,
-    matches: &[crate::regexp::engine::Match],
+    matches: &crate::regexp::engine::MatchBatch,
     named: bool,
 ) -> Result<UnitSink, NativeError> {
     let mut out = UnitSink::with_capacity(subject.len());
     let mut next = 0;
-    for matched in matches {
+    for matched in matches.iter() {
         let position = matched.range.start;
         if position >= next {
             out.extend(subject.slice(next..position));
         }
         let start = out.len();
-        if !expand_template(&mut out, template, subject, matched, named) {
+        if !expand_template(&mut out, template, subject, &matched, named) {
             return Err(invalid_length());
         }
         if position >= next {
@@ -148,7 +148,7 @@ fn build_functional(
     scope: &mut NativeScope<'_, '_>,
     replacement: Local<'_>,
     input: Local<'_>,
-    matches: &[crate::regexp::engine::Match],
+    matches: &crate::regexp::engine::MatchBatch,
     named: bool,
 ) -> Result<UnitSink, NativeError> {
     let size = scope
@@ -158,13 +158,13 @@ fn build_functional(
         .len() as usize;
     let mut out = UnitSink::with_capacity(size);
     let mut next = 0;
-    for matched in matches {
+    for matched in matches.iter() {
         let position = matched.range.start;
         if position >= next {
             extend_subject(scope, input, next..position, &mut out);
         }
         let start = out.len();
-        let result = call_replacer(scope, replacement, input, matched, named)?;
+        let result = call_replacer(scope, replacement, input, &matched, named)?;
         let result = scope.raw(result);
         let result =
             crate::regexp_prototype::coerce_to_jsstring_runtime(scope.context(), &result, NAME)?;
@@ -283,12 +283,12 @@ fn call_replacer<'scope>(
     scope: &mut NativeScope<'scope, '_>,
     replacer: Local<'_>,
     input: Local<'_>,
-    matched: &crate::regexp::engine::Match,
+    matched: &crate::regexp::engine::Match<'_>,
     named: bool,
 ) -> Result<Local<'scope>, NativeError> {
     let mut args = Vec::with_capacity(matched.captures.len() + 4);
     args.push(slice(scope, input, matched.range.clone())?);
-    for capture in &matched.captures {
+    for capture in matched.captures.iter() {
         let value = match capture {
             Some(range) => slice(scope, input, range.clone())?,
             None => scope.undefined(),
@@ -318,7 +318,7 @@ fn expand_template(
     out: &mut UnitSink,
     template: CodeUnits<'_>,
     subject: CodeUnits<'_>,
-    matched: &crate::regexp::engine::Match,
+    matched: &crate::regexp::engine::Match<'_>,
     named: bool,
 ) -> bool {
     const DOLLAR: u16 = b'$' as u16;
@@ -366,7 +366,7 @@ fn expand_template(
                 };
                 match index {
                     Some(index) => {
-                        if let Some(range) = &matched.captures[index - 1] {
+                        if let Some(range) = matched.captures.get(index - 1) {
                             out.extend(subject.slice(range.clone()));
                         }
                     }

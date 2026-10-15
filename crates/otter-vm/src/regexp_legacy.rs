@@ -46,18 +46,21 @@ impl RegExpLegacyState {
         &mut self,
         input: Value,
         matched: std::ops::Range<usize>,
-        captures: &[Option<std::ops::Range<usize>>],
+        captures: impl Iterator<Item = Option<std::ops::Range<usize>>>,
     ) {
         self.input = Some(input);
         self.matched = Some((matched.start, matched.end));
         self.captures = [None; LEGACY_CAPTURE_SLOTS];
-        for (slot, capture) in self.captures.iter_mut().zip(captures) {
-            *slot = capture.as_ref().map(|range| (range.start, range.end));
+        self.last_paren = None;
+        for (index, capture) in captures.enumerate() {
+            let range = capture.map(|range| (range.start, range.end));
+            if index < LEGACY_CAPTURE_SLOTS {
+                self.captures[index] = range;
+            }
+            if range.is_some() {
+                self.last_paren = range;
+            }
         }
-        self.last_paren = captures
-            .iter()
-            .rev()
-            .find_map(|capture| capture.as_ref().map(|range| (range.start, range.end)));
     }
 
     /// Replace the subject without disturbing the recorded ranges, per

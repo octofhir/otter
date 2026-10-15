@@ -1,4 +1,4 @@
-//! The public API surface — [`Regex`], [`Match`], and the match iterator.
+//! The public API surface — [`Regex`], [`Match`], and lending match searches.
 //!
 //! This is the exact surface a host VM consumes. A
 //! [`Regex`] is compiled once from a UTF-16 (or `&str`) pattern plus [`Flags`];
@@ -9,8 +9,8 @@
 //! # Contents
 //! - [`Regex`] — a compiled pattern.
 //! - [`Match`] — overall range, capture ranges, named-group access.
-//! - [`Matches`] — iterator of `Result<Match, ExecError>` over a subject.
-//! - [`NamedGroups`] — deterministic, deduplicated named-group iterator.
+//! - [`Matches`] — lending search with borrowed views and owned collection.
+//! - [`crate::NamedGroups`] — deterministic, deduplicated named-group iterator.
 //! - [`MatchScratch`] — matcher buffers a host reuses across searches.
 //!
 //! # Invariants
@@ -22,7 +22,7 @@
 //! - [`Match::named_group_index`] owns named-capture selection; equal capture
 //!   ranges do not make distinct capture groups interchangeable.
 //! - A successful scan always advances `next_start` past the current match, so
-//!   the iterator terminates even on zero-width matches.
+//!   the search terminates even on zero-width matches.
 //! - A regex searched often enough runs its searches as machine code
 //!   ([`crate::exec::native`]) when the emitter covers its program; matches,
 //!   capture ranges and step counts are exactly the interpreter's.
@@ -33,7 +33,7 @@
 //! # See also
 //! - <https://tc39.es/ecma262/#sec-regexp.prototype.exec> (§22.2.7.2)
 
-use core::ops::Range;
+use crate::matches::{Match, MatchBatch, MatchRecord, Slots};
 
 use crate::cursor::{Input, Unit};
 use crate::error::{ExecError, RegexError};
@@ -94,12 +94,6 @@ impl Regex {
     pub fn compile_str(pattern: &str, flags: Flags) -> Result<Self, RegexError> {
         let units: Vec<u16> = pattern.encode_utf16().collect();
         Self::compile_utf16(&units, flags)
-    }
-
-    /// Compile a `&str` pattern. Drop-in name for hosts migrating off an
-    /// engine with a `with_flags` constructor; equivalent to [`Regex::compile_str`].
-    pub fn with_flags(pattern: &str, flags: Flags) -> Result<Self, RegexError> {
-        Self::compile_str(pattern, flags)
     }
 
     /// The flags this regex was compiled under.
@@ -228,18 +222,6 @@ impl Regex {
     pub fn describe(&self) -> String {
         self.program.describe()
     }
-
-    /// Drop-in alias for [`Regex::find_utf16`] matching the migrated host's
-    /// existing call site.
-    #[must_use]
-    pub fn find_from_utf16_with_config<'r, 't>(
-        &'r self,
-        text: &'t [u16],
-        start: usize,
-        config: ExecConfig,
-    ) -> Matches<'r, 't> {
-        self.find_utf16(text, start, config)
-    }
 }
 
 /// How the leftmost search advances between candidate start positions.
@@ -258,12 +240,11 @@ enum Scan<'p> {
     FirstSet(&'p crate::program::Prefilter),
 }
 
-/// Iterator over successive matches of a [`Regex`] in a subject of UTF-16
+/// Lending search over successive matches of a [`Regex`] in a subject of UTF-16
 /// units or Latin-1 bytes.
 ///
-/// Mirrors the host's existing consumption: it collects `Result<Match,
-/// ExecError>` and stops on the first error. The host preserves that error as
-/// resource exhaustion rather than converting it into a semantic no-match.
+/// Each next result borrows matcher scratch. Collection owns offsets before
+/// the host allocates or reenters. Resource exhaustion stays an explicit error.
 #[derive(Debug)]
 pub struct Matches<'r, 't, U: Unit = u16> {
     regex: &'r Regex,
@@ -284,6 +265,31 @@ impl<U: Unit> Matches<'_, '_, U> {
         self.steps_executed
     }
 
+    /// Collect at most `max_matches` remaining matches into one capture arena.
+    pub fn collect_batch(&mut self, mut max_matches: usize) -> Result<MatchBatch, ExecError> {
+        let regex = self.regex;
+        let mut batch = MatchBatch::new(regex.program.capture_slot_count());
+        while max_matches > 0 {
+            let Some(found) = self.advance() else { break };
+            found?;
+            batch.push(self.current_slots(), &regex.program.names);
+            max_matches -= 1;
+        }
+        Ok(batch)
+    }
+
+    /// Collect only the next match, retaining no names or arena on a miss.
+    #[inline]
+    pub fn collect_first(&mut self) -> Result<Option<MatchRecord>, ExecError> {
+        let regex = self.regex;
+        self.advance()
+            .map(|found| {
+                found?;
+                Ok(MatchRecord::new(self.current_slots(), &regex.program.names))
+            })
+            .transpose()
+    }
+
     /// End the search and hand its matcher buffers back for the next one.
     #[must_use]
     pub fn into_scratch(self) -> MatchScratch {
@@ -298,7 +304,7 @@ impl<U: Unit> Matches<'_, '_, U> {
     /// picks candidate windows exactly as the interpreter's loop picks
     /// candidates, and the code runs each window.
     #[inline(never)]
-    fn next_native(&mut self, code: &NativeCode) -> Option<Result<Match, ExecError>> {
+    fn advance_native(&mut self, code: &NativeCode) -> Option<Result<(), ExecError>> {
         let program = &self.regex.program;
         let len = self.text.len();
         let mut pos = self.next_start;
@@ -392,11 +398,10 @@ impl<U: Unit> Matches<'_, '_, U> {
             self.steps_executed = self.steps_executed.saturating_add(remaining - budget);
             match outcome {
                 Outcome::Match => {
-                    let caps = self.scratch.native.captures();
-                    let mat = build_native_match(program, caps);
-                    let (start, end) = (mat.range.start, mat.range.end);
+                    let range = self.current_slots().range();
+                    let (start, end) = (range.start, range.end);
                     self.next_start = if end > start { end } else { start + 1 };
-                    return Some(Ok(mat));
+                    return Some(Ok(()));
                 }
                 Outcome::Exhausted(next) => pos = next,
                 // The interpreter counts the step that overran the budget.
@@ -415,16 +420,39 @@ impl<U: Unit> Matches<'_, '_, U> {
     }
 }
 
-impl<U: Unit> Iterator for Matches<'_, '_, U> {
-    type Item = Result<Match, ExecError>;
+impl<U: Unit> Matches<'_, '_, U> {
+    /// Advance one match. Its borrowed capture view expires before the next call.
+    #[allow(
+        clippy::should_implement_trait,
+        reason = "Each result borrows the search until its next attempt."
+    )]
+    pub fn next(&mut self) -> Option<Result<Match<'_>, ExecError>> {
+        match self.advance()? {
+            Ok(()) => Some(Ok(Match::from_slots(
+                &self.regex.program.names,
+                self.current_slots(),
+            ))),
+            Err(error) => Some(Err(error)),
+        }
+    }
 
-    fn next(&mut self) -> Option<Self::Item> {
+    #[inline]
+    fn current_slots(&self) -> Slots<'_> {
+        let count = self.regex.program.capture_slot_count();
+        if self.native.is_some() {
+            Slots::Encoded(&self.scratch.native.captures()[..count])
+        } else {
+            Slots::Interpreted(&self.scratch.interpreter.captures()[..count])
+        }
+    }
+
+    fn advance(&mut self) -> Option<Result<(), ExecError>> {
         if self.done {
             return None;
         }
         match self.native {
-            Some(code) => self.next_native(code),
-            None => self.next_interpreted(),
+            Some(code) => self.advance_native(code),
+            None => self.advance_interpreted(),
         }
     }
 }
@@ -432,7 +460,7 @@ impl<U: Unit> Iterator for Matches<'_, '_, U> {
 impl<U: Unit> Matches<'_, '_, U> {
     /// The next match by the interpreter.
     #[inline(never)]
-    fn next_interpreted(&mut self) -> Option<Result<Match, ExecError>> {
+    fn advance_interpreted(&mut self) -> Option<Result<(), ExecError>> {
         let program = &self.regex.program;
         let unicode = program.unicode;
         let input = Input::new(self.text, unicode);
@@ -569,14 +597,13 @@ impl<U: Unit> Matches<'_, '_, U> {
                     return Some(Err(e));
                 }
                 Ok(true) => {
-                    let mat = build_match(&self.regex.program, self.scratch.interpreter.captures());
-                    let end = mat.range.end;
+                    let end = self.current_slots().range().end;
                     self.next_start = if end > pos {
                         end
                     } else {
                         advance_scan(self.text, pos, unicode)
                     };
-                    return Some(Ok(mat));
+                    return Some(Ok(()));
                 }
                 Ok(false) => {
                     // When the unique leading consumer is a possessive `min >= 1`
@@ -637,211 +664,6 @@ fn advance_scan<U: Unit>(text: &[U], pos: usize, unicode: bool) -> usize {
     pos + 1
 }
 
-/// Build a [`Match`] from filled capture slots.
-fn build_match(program: &Program, caps: &[Option<usize>]) -> Match {
-    let range = caps[0].unwrap_or(0)..caps[1].unwrap_or(0);
-    let mut captures = Vec::with_capacity(program.group_count as usize);
-    for g in 1..=program.group_count as usize {
-        let entry = match (
-            caps.get(2 * g).copied().flatten(),
-            caps.get(2 * g + 1).copied().flatten(),
-        ) {
-            (Some(s), Some(e)) => Some(s..e),
-            _ => None,
-        };
-        captures.push(entry);
-    }
-    Match {
-        range,
-        captures,
-        group_names: program.names.clone(),
-    }
-}
-
-/// Build a [`Match`] from capture slots native code filled, [`native::NONE`]
-/// where unset.
-fn build_native_match(program: &Program, caps: &[u64]) -> Match {
-    let slot = |index: usize| caps.get(index).copied().filter(|&at| at != native::NONE);
-    let range = slot(0).unwrap_or(0) as usize..slot(1).unwrap_or(0) as usize;
-    let captures = (1..=program.group_count as usize)
-        .map(|g| match (slot(2 * g), slot(2 * g + 1)) {
-            (Some(s), Some(e)) => Some(s as usize..e as usize),
-            _ => None,
-        })
-        .collect();
-    Match {
-        range,
-        captures,
-        group_names: program.names.clone(),
-    }
-}
-
-/// A single successful match.
-///
-/// All ranges are UTF-16 code-unit offsets into the searched subject.
-#[derive(Debug, Clone)]
-pub struct Match {
-    /// The overall match extent (group 0). May be empty for a zero-width match.
-    pub range: Range<usize>,
-    /// Per-capture-group ranges, 1-based: index 0 is group 1. `None` for a
-    /// group that did not participate in the match.
-    pub captures: Vec<Option<Range<usize>>>,
-    /// Capture-group names in source order, parallel to a notional `group N`;
-    /// the empty string marks an unnamed group. Shared with the compiled
-    /// program (`Arc`), so producing a match clones a pointer, not the names.
-    /// Used by [`Match::named_groups`] and [`Match::named_group_index`].
-    pub(crate) group_names: std::sync::Arc<[String]>,
-}
-
-impl Match {
-    /// Access a group by index, group 0 being the overall match.
-    #[must_use]
-    pub fn group(&self, index: usize) -> Option<Range<usize>> {
-        if index == 0 {
-            Some(self.range.clone())
-        } else {
-            self.captures.get(index - 1).and_then(Clone::clone)
-        }
-    }
-
-    /// Select a named capture's 1-based group index, preferring a matched
-    /// alternative when a name appears more than once. If every alternative
-    /// is unmatched, return the first declared group with that name.
-    #[must_use]
-    pub fn named_group_index(&self, name: &str) -> Option<usize> {
-        if name.is_empty() {
-            return None;
-        }
-        let mut first = None;
-        for (idx, gname) in self.group_names.iter().enumerate() {
-            if gname == name {
-                if self.captures.get(idx).is_some_and(Option::is_some) {
-                    return Some(idx + 1);
-                }
-                first.get_or_insert(idx + 1);
-            }
-        }
-        first
-    }
-
-    /// Access a named group's range, deduplicating duplicate names and
-    /// preferring the alternative that matched.
-    #[must_use]
-    pub fn named_group(&self, name: &str) -> Option<Range<usize>> {
-        self.named_group_index(name)
-            .and_then(|index| self.group(index))
-    }
-
-    /// Iterate the named groups in deterministic source order, each name once.
-    #[must_use]
-    pub fn named_groups(&self) -> NamedGroups<'_> {
-        NamedGroups { mat: self, next: 0 }
-    }
-}
-
-/// Deterministic, deduplicated iterator over a [`Match`]'s named groups.
-///
-/// Yields `(name, Option<range>)` in pattern source order, each distinct name
-/// exactly once, preferring the matched alternative for duplicate names.
-#[derive(Debug)]
-pub struct NamedGroups<'m> {
-    mat: &'m Match,
-    next: usize,
-}
-
-impl<'m> Iterator for NamedGroups<'m> {
-    type Item = (&'m str, Option<Range<usize>>);
-
-    fn next(&mut self) -> Option<Self::Item> {
-        let names = &self.mat.group_names;
-        while self.next < names.len() {
-            let idx = self.next;
-            self.next += 1;
-            let name = names[idx].as_str();
-            if name.is_empty() {
-                continue;
-            }
-            if names[..idx].iter().any(|n| n == name) {
-                continue;
-            }
-            let range = self.mat.named_group(name);
-            return Some((name, range));
-        }
-        None
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn mk(range: Range<usize>, caps: Vec<Option<Range<usize>>>, names: &[&str]) -> Match {
-        Match {
-            range,
-            captures: caps,
-            group_names: names.iter().map(|s| (*s).to_string()).collect(),
-        }
-    }
-
-    #[test]
-    fn group_zero_is_overall_match() {
-        let m = mk(2..5, vec![Some(2..3)], &["a"]);
-        assert_eq!(m.group(0), Some(2..5));
-        assert_eq!(m.group(1), Some(2..3));
-        assert_eq!(m.group(2), None);
-    }
-
-    #[test]
-    fn named_group_lookup() {
-        let m = mk(0..3, vec![Some(0..1), None], &["x", "y"]);
-        assert_eq!(m.named_group("x"), Some(0..1));
-        assert_eq!(m.named_group("y"), None);
-        assert_eq!(m.named_group("z"), None);
-        assert_eq!(m.named_group(""), None);
-    }
-
-    /// ES2025 duplicate named groups: the same name appears in two
-    /// alternatives; the matched alternative's range wins.
-    #[test]
-    fn duplicate_named_group_prefers_match() {
-        let m = mk(0..1, vec![None, Some(0..1)], &["dup", "dup"]);
-        assert_eq!(m.named_group_index("dup"), Some(2));
-        assert_eq!(m.named_group("dup"), Some(0..1));
-    }
-
-    #[test]
-    fn unmatched_named_group_retains_its_declared_index() {
-        let m = mk(0..0, vec![None, None, None], &["dup", "other", "dup"]);
-        assert_eq!(m.named_group_index("dup"), Some(1));
-        assert_eq!(m.named_group_index("other"), Some(2));
-        assert_eq!(m.named_group_index("missing"), None);
-        assert_eq!(m.named_group_index(""), None);
-        assert_eq!(m.named_group("dup"), None);
-        assert_eq!(
-            m.named_groups().collect::<Vec<_>>(),
-            vec![("dup", None), ("other", None)]
-        );
-    }
-
-    #[test]
-    fn equal_ranges_preserve_distinct_capture_indices() {
-        let m = mk(0..1, vec![Some(0..1), Some(0..1)], &["outer", "inner"]);
-        assert_eq!(m.named_group_index("outer"), Some(1));
-        assert_eq!(m.named_group_index("inner"), Some(2));
-        assert_eq!(m.named_group("outer"), m.named_group("inner"));
-    }
-
-    #[test]
-    fn named_groups_iter_is_deduped_and_ordered() {
-        let m = mk(0..1, vec![Some(0..1), None, None], &["dup", "dup", "other"]);
-        let collected: Vec<_> = m.named_groups().map(|(n, r)| (n.to_string(), r)).collect();
-        assert_eq!(
-            collected,
-            vec![("dup".to_string(), Some(0..1)), ("other".to_string(), None)]
-        );
-    }
-}
-
 #[cfg(test)]
 mod iu_word_tests {
     use super::*;
@@ -862,10 +684,14 @@ mod iu_word_tests {
             let units: Vec<u16> = pat.encode_utf16().collect();
             let re = Regex::compile_utf16(&units, f).unwrap();
             let m = re
-                .find_from_utf16_with_config(&text, 0, ExecConfig::default())
+                .find_utf16(&text, 0, ExecConfig::default())
                 .next()
                 .is_some();
             assert_eq!(m, expect, "{pat}");
         }
     }
 }
+
+#[cfg(test)]
+#[path = "api/buffer_tests.rs"]
+mod buffer_tests;

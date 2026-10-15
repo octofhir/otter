@@ -202,9 +202,11 @@ pub(crate) fn exec_without_result(
     if regexp.legacy_features_enabled(heap) {
         let subject = scope.raw(input);
         scope.with_turn_parts(|interp, _| {
-            interp
-                .regexp_legacy
-                .record_match(subject, matched.range.clone(), &matched.captures);
+            interp.regexp_legacy.record_match(
+                subject,
+                matched.range.clone(),
+                matched.captures().iter(),
+            );
         });
     }
     Ok(true)
@@ -215,7 +217,7 @@ pub(crate) enum DirectExec {
     /// The call completed with this value.
     Done(Value),
     /// `exec` matched: the match array remains to be built from the record.
-    Matched(crate::regexp::engine::Match),
+    Matched(crate::regexp::engine::MatchRecord),
 }
 
 /// `RegExpBuiltinExec(R, S)` for a RegExp `receiver` whose `lastIndex` is a
@@ -277,7 +279,7 @@ pub(crate) fn exec_direct(
     if regexp.legacy_features_enabled(heap) {
         interp
             .regexp_legacy
-            .record_match(input, matched.range.clone(), &matched.captures);
+            .record_match(input, matched.range.clone(), matched.captures().iter());
     }
     Some(Ok(if test {
         DirectExec::Done(Value::boolean(true))
@@ -371,18 +373,20 @@ pub(crate) fn split(
                     break 'pieces;
                 }
                 p = end;
-                for capture in &matched.captures {
+                for capture in matched.captures().iter() {
                     let piece = match capture {
                         Some(range) => slice(&mut scope, input, range.clone())?,
                         None => scope.undefined(),
                     };
                     pieces.push(piece);
                     if pieces.len() as u32 == limit {
-                        last_match = Some(matched);
-                        break 'pieces;
+                        break;
                     }
                 }
                 last_match = Some(matched);
+                if pieces.len() as u32 == limit {
+                    break 'pieces;
+                }
                 q = p;
             }
             if (pieces.len() as u32) < limit {
@@ -395,7 +399,7 @@ pub(crate) fn split(
                 interp.regexp_legacy.record_match(
                     subject,
                     matched.range.clone(),
-                    &matched.captures,
+                    matched.captures().iter(),
                 );
             });
         }
@@ -468,7 +472,9 @@ mod tests {
         assert_eq!(global.as_regexp().unwrap().last_index(&vm.gc_heap), 3);
         // An exec hit leaves the array to its caller, after the lastIndex write.
         match exec_direct(&mut vm, global, subject, false) {
-            Some(Ok(DirectExec::Matched(matched))) => assert_eq!(matched.range, 4..6),
+            Some(Ok(DirectExec::Matched(matched))) => {
+                assert_eq!(matched.range, 4..6)
+            }
             _ => panic!("a hit returns its record"),
         }
         assert_eq!(global.as_regexp().unwrap().last_index(&vm.gc_heap), 6);

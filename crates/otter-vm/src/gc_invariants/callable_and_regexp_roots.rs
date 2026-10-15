@@ -140,18 +140,17 @@ fn regexp_body_survives_force_gc_when_rooted() {
         panic!("expected regexp root");
     };
     let haystack: Vec<u16> = "abbbc".encode_utf16().collect();
-    let m = re
-        .find_all(
+    let matches = re
+        .find_batch(
             interp.gc_heap(),
             crate::string::CodeUnits::Utf16(&haystack),
             0,
+            usize::MAX,
             &interp.regex_search(),
         )
         .result
-        .expect("within matcher budget")
-        .into_iter()
-        .next()
-        .expect("match after force_gc");
+        .expect("within matcher budget");
+    let m = matches.first().expect("match after force_gc");
     assert_eq!(m.range, 0..5);
 }
 

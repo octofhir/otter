@@ -13,7 +13,9 @@
 //! - [`Flags`] — engine-relevant flag bits (`i m s u v`). The stateful JS flags
 //!   `g`/`y`/`d` live *above* the matcher in the host and are not modelled here.
 //! - [`ExecConfig`] — per-execution tuning (the ReDoS step budget).
-//! - [`Match`] — a single match: overall range, capture ranges, named groups.
+//! - [`Match`] — a borrowed match view with capture ranges and named groups.
+//! - [`MatchBatch`] — owned flat offsets, independent of search scratch.
+//! - [`MatchRecord`] — one owned result with direct access to its overall range.
 //! - [`RegexError`] — pattern compile / early-error failure.
 //! - [`ExecError`] — execution aborted under an [`ExecConfig`] constraint.
 //!
@@ -21,7 +23,7 @@
 //! - All offsets in a [`Match`] are **UTF-16 code-unit** indices, even in
 //!   Unicode (`u`/`v`) mode where matching is code-point-aware. The host slices
 //!   its `&[u16]` subject directly with these ranges.
-//! - Capturing groups are 1-based in [`Match::captures`] (index 0 of the vector
+//! - Capturing groups are 1-based in [`Match::captures`] (index 0 of the view
 //!   is group 1); the overall match (group 0) is [`Match::range`].
 //! - Named-group iteration is deterministic (pattern source order).
 //! - The parser enforces an explicit recursion depth limit; pathological nested
@@ -38,12 +40,14 @@ mod error;
 mod exec;
 mod flags;
 mod ir;
+mod matches;
 mod parser;
 mod program;
 mod unicode;
 
-pub use api::{Match, MatchScratch, Matches, NamedGroups, Regex};
+pub use api::{MatchScratch, Matches, Regex};
 pub use cursor::Unit;
 pub use error::{ExecError, RegexError};
 pub use exec::ExecConfig;
 pub use flags::Flags;
+pub use matches::{Captures, Match, MatchBatch, MatchRecord, NamedGroups};

@@ -24,6 +24,8 @@
 //!   matcher.
 //! - Capture slots number `2 * (group_count + 1)`: slots `2*g` / `2*g+1` hold
 //!   the start / end of group `g`, with group `0` the overall match.
+//! - Scratch appends unbounded-loop progress marks after the capture prefix;
+//!   these slots never belong to a returned match.
 //! - A lookaround body is a contiguous region beginning at [`Insn::Look`]'s
 //!   `entry` and terminated by [`Insn::LookMatch`]; normal control flow never
 //!   falls into it (a [`Insn::Jump`] hops over it).
@@ -435,11 +437,17 @@ impl RequiredLiteral {
 }
 
 impl Program {
+    /// Number of result slots, including the overall match's two endpoints.
+    #[must_use]
+    pub(crate) fn capture_slot_count(&self) -> usize {
+        2 * (self.group_count as usize + 1)
+    }
+
     /// Number of slots: capture slots `2 * (group_count + 1)` plus one per
     /// unbounded-quantifier progress mark.
     #[must_use]
     pub(crate) fn slot_count(&self) -> usize {
-        2 * (self.group_count as usize + 1) + self.loop_marks
+        self.capture_slot_count() + self.loop_marks
     }
 }
 

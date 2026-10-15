@@ -29,9 +29,9 @@ fn run<U: Unit>(
     let mut matches = regex.find_on_tier(text, start, ExecConfig { step_limit: limit }, code);
     let mut found = Vec::new();
     let mut error = None;
-    for item in matches.by_ref() {
+    while let Some(item) = matches.next() {
         match item {
-            Ok(m) => found.push((m.range.clone(), m.captures.clone())),
+            Ok(m) => found.push((m.range.clone(), m.captures.iter().collect())),
             Err(e) => error = Some(e),
         }
     }

@@ -341,7 +341,8 @@ impl Measurement {
 /// Scan `text` end to end, returning the match count.
 fn scan(re: &Regex, text: &[u16]) -> usize {
     let mut n = 0;
-    for m in re.find_utf16(text, 0, ExecConfig::default()) {
+    let mut matches = re.find_utf16(text, 0, ExecConfig::default());
+    while let Some(m) = matches.next() {
         match m {
             Ok(_) => n += 1,
             Err(_) => break,

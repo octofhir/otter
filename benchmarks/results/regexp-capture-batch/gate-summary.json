@@ -1,0 +1,776 @@
+{
+  "status": "passed",
+  "parent": "7d1f3c36cc43f9d361650819847e98ca0b8c6614",
+  "source_freeze_sha256": "044e0ebaa895c3f67d356114e617b0f2166eb10db8f0366374633d9f6d9ac440",
+  "cli_sha256": "7e2b27e06b1f86e558d0e10b377cfb1dc1509aacfff6a66f48da43e1371a9207",
+  "runner_sha256": "4a8d735d6faf69e3bdc41e343fd2a8915aacdd10e59caa23aa0b6b3247feb296",
+  "commands": {
+    "clippy-host-1": {
+      "command": [
+        "cargo",
+        "clippy",
+        "-p",
+        "otter-gc",
+        "-p",
+        "otter-vm",
+        "-p",
+        "otter-jit",
+        "-p",
+        "otter-runtime",
+        "-p",
+        "otter-cli",
+        "-p",
+        "otter-difftest",
+        "-p",
+        "otter-compiler",
+        "-p",
+        "otter-bytecode",
+        "-p",
+        "otter-regex",
+        "--all-targets",
+        "--release",
+        "--",
+        "-D",
+        "warnings"
+      ],
+      "exit_code": 0,
+      "source_freeze": "unchanged",
+      "log_sha256": "bc3210535f2e4ef0c511e0f86e51e5420095ffc81f62f8d1acfe5619a8e881f6"
+    },
+    "vm-lib-1": {
+      "command": [
+        "cargo",
+        "test",
+        "-p",
+        "otter-vm",
+        "--lib",
+        "--release"
+      ],
+      "exit_code": 0,
+      "source_freeze": "unchanged",
+      "log_sha256": "a82450caa4f9872263da4afebddbe7f6be5c20b7eea967bd782d5762a897596d",
+      "units": [
+        {
+          "passed": 1272,
+          "failed": 0
+        }
+      ]
+    },
+    "jit-lib-1": {
+      "command": [
+        "cargo",
+        "test",
+        "-p",
+        "otter-jit",
+        "--lib",
+        "--release"
+      ],
+      "exit_code": 0,
+      "source_freeze": "unchanged",
+      "log_sha256": "84e97b816fbd0f98540f9145191f122847ab4b8721bc2936d3e3ab4198e992e0",
+      "units": [
+        {
+          "passed": 292,
+          "failed": 0
+        }
+      ]
+    },
+    "runtime-field-loads-1": {
+      "command": [
+        "cargo",
+        "test",
+        "-p",
+        "otter-runtime",
+        "--test",
+        "jit_speculative_property_loads",
+        "--release"
+      ],
+      "exit_code": 0,
+      "source_freeze": "unchanged",
+      "log_sha256": "a4d5b27df3bb55314d6fe70b856021b62fc8d9cfb65a97b32d52cf0d232db17a",
+      "units": [
+        {
+          "passed": 16,
+          "failed": 0
+        }
+      ]
+    },
+    "runtime-lexical-alloc-1": {
+      "command": [
+        "cargo",
+        "test",
+        "-p",
+        "otter-runtime",
+        "--test",
+        "jit_native_context_closure",
+        "--release"
+      ],
+      "exit_code": 0,
+      "source_freeze": "unchanged",
+      "log_sha256": "a948ae2ea698f1aa77216f2af69b246b4259990e0d355d10b760f1c520f18636",
+      "units": [
+        {
+          "passed": 6,
+          "failed": 0
+        }
+      ]
+    },
+    "runtime-code-eviction-1": {
+      "command": [
+        "cargo",
+        "test",
+        "-p",
+        "otter-runtime",
+        "--test",
+        "code_chunk_eviction",
+        "--release"
+      ],
+      "exit_code": 0,
+      "source_freeze": "unchanged",
+      "log_sha256": "0b32048f099b675db8f8f15c01d096e30ae626501c0cc041035eb3998c33b9e5",
+      "units": [
+        {
+          "passed": 6,
+          "failed": 0
+        }
+      ]
+    },
+    "regex-lib-1": {
+      "command": [
+        "cargo",
+        "test",
+        "-p",
+        "otter-regex",
+        "--release"
+      ],
+      "exit_code": 0,
+      "source_freeze": "unchanged",
+      "log_sha256": "4cb82d827ee4f067cd07ec9a5366c9e1711a03eb75090833700c39d0ec0e3a90",
+      "units": [
+        {
+          "passed": 39,
+          "failed": 0
+        },
+        {
+          "passed": 0,
+          "failed": 0
+        },
+        {
+          "passed": 47,
+          "failed": 0
+        },
+        {
+          "passed": 0,
+          "failed": 0
+        }
+      ]
+    },
+    "build-host-1": {
+      "command": [
+        "cargo",
+        "build",
+        "--release",
+        "-p",
+        "otter-cli",
+        "-p",
+        "otter-difftest",
+        "-p",
+        "otter-test262"
+      ],
+      "exit_code": 0,
+      "source_freeze": "unchanged",
+      "log_sha256": "cbe217414136f2368dfb85c091fe0fdbe80acfa8cdc56f477d8be4de02be3884"
+    },
+    "test262-full-1": {
+      "command": [
+        "bash",
+        "scripts/test262-safe.sh",
+        "--output",
+        "benchmarks/results/t262/full-2026-10-15c.json"
+      ],
+      "exit_code": 0,
+      "source_freeze": "unchanged",
+      "log_sha256": "b896c0fdf36a2773c4f308f31207b38800460b093513e1290d98a06f83602d63"
+    },
+    "difftest-host-1": {
+      "command": [
+        "target/release/otter-difftest",
+        "--otter",
+        "target/release/otter",
+        "--timeout-ms",
+        "120000"
+      ],
+      "exit_code": 0,
+      "source_freeze": "unchanged",
+      "log_sha256": "881e0cccf9733584477afc69906d106f13a2289ea4d575f0eb20bf3f3c313393",
+      "corpus": {
+        "passed": 175,
+        "failed": 0
+      }
+    },
+    "build-x86-1": {
+      "command": [
+        "cargo",
+        "build",
+        "--release",
+        "-p",
+        "otter-cli",
+        "-p",
+        "otter-difftest",
+        "--target",
+        "x86_64-apple-darwin"
+      ],
+      "exit_code": 0,
+      "source_freeze": "unchanged",
+      "log_sha256": "814e4b9cbc9c175fb78567841fac2074833d49b17e335aaaaa738a400557b003"
+    },
+    "jit-lib-x86-1": {
+      "command": [
+        "cargo",
+        "test",
+        "-p",
+        "otter-jit",
+        "--lib",
+        "--release",
+        "--target",
+        "x86_64-apple-darwin"
+      ],
+      "exit_code": 0,
+      "source_freeze": "unchanged",
+      "log_sha256": "19b3e8747db6271e76b3db4184566f43253e321ab16e154bad4f3abd6a3a4573",
+      "units": [
+        {
+          "passed": 315,
+          "failed": 0
+        }
+      ]
+    },
+    "runtime-field-loads-x86-1": {
+      "command": [
+        "cargo",
+        "test",
+        "-p",
+        "otter-runtime",
+        "--test",
+        "jit_speculative_property_loads",
+        "--release",
+        "--target",
+        "x86_64-apple-darwin"
+      ],
+      "exit_code": 0,
+      "source_freeze": "unchanged",
+      "log_sha256": "7e105a04cca39368bdfbcd5c1214fcef7d4294dd180176d8c0916f655d23a310",
+      "units": [
+        {
+          "passed": 16,
+          "failed": 0
+        }
+      ]
+    },
+    "runtime-lexical-alloc-x86-1": {
+      "command": [
+        "cargo",
+        "test",
+        "-p",
+        "otter-runtime",
+        "--test",
+        "jit_native_context_closure",
+        "--release",
+        "--target",
+        "x86_64-apple-darwin"
+      ],
+      "exit_code": 0,
+      "source_freeze": "unchanged",
+      "log_sha256": "06179e7155ac5e5584f82ff51e02fc05d9adb560f5de570ff1e80bd7fe74f6d8",
+      "units": [
+        {
+          "passed": 6,
+          "failed": 0
+        }
+      ]
+    },
+    "runtime-code-eviction-x86-1": {
+      "command": [
+        "cargo",
+        "test",
+        "-p",
+        "otter-runtime",
+        "--test",
+        "code_chunk_eviction",
+        "--release",
+        "--target",
+        "x86_64-apple-darwin"
+      ],
+      "exit_code": 0,
+      "source_freeze": "unchanged",
+      "log_sha256": "b197cb9a196ed35f6709957c35042c4852f48bba7b3c772b96fbaa1880fbd501",
+      "units": [
+        {
+          "passed": 6,
+          "failed": 0
+        }
+      ]
+    },
+    "regex-lib-x86-1": {
+      "command": [
+        "cargo",
+        "test",
+        "-p",
+        "otter-regex",
+        "--release",
+        "--target",
+        "x86_64-apple-darwin"
+      ],
+      "exit_code": 0,
+      "source_freeze": "unchanged",
+      "log_sha256": "bd845ad21d3abbbe7f76cae1aa7a02d8215abdc74db4dd68b5e36cf3c2e2eef7",
+      "units": [
+        {
+          "passed": 39,
+          "failed": 0
+        },
+        {
+          "passed": 0,
+          "failed": 0
+        },
+        {
+          "passed": 47,
+          "failed": 0
+        },
+        {
+          "passed": 0,
+          "failed": 0
+        }
+      ]
+    },
+    "clippy-x86-1": {
+      "command": [
+        "cargo",
+        "clippy",
+        "-p",
+        "otter-gc",
+        "-p",
+        "otter-vm",
+        "-p",
+        "otter-jit",
+        "-p",
+        "otter-runtime",
+        "-p",
+        "otter-cli",
+        "-p",
+        "otter-difftest",
+        "-p",
+        "otter-compiler",
+        "-p",
+        "otter-bytecode",
+        "-p",
+        "otter-regex",
+        "--all-targets",
+        "--release",
+        "--target",
+        "x86_64-apple-darwin",
+        "--",
+        "-D",
+        "warnings"
+      ],
+      "exit_code": 0,
+      "source_freeze": "unchanged",
+      "log_sha256": "722a8efcf34284ed12274c417345fa7ccdba1cf3f35fa91f081b7e5cb8a451b2"
+    },
+    "difftest-x86-1": {
+      "command": [
+        "target/x86_64-apple-darwin/release/otter-difftest",
+        "--otter",
+        "target/x86_64-apple-darwin/release/otter",
+        "--timeout-ms",
+        "120000"
+      ],
+      "exit_code": 0,
+      "source_freeze": "unchanged",
+      "log_sha256": "3a8795dfa78e0b5ae53f72691949929f690ac80b5bb5dfb995f2e91d77ffa78c",
+      "corpus": {
+        "passed": 175,
+        "failed": 0
+      }
+    }
+  },
+  "test262": {
+    "report": "benchmarks/results/t262/full-2026-10-15c.json",
+    "totals": {
+      "total": 53575,
+      "passed": 52463,
+      "failed": 12,
+      "skipped": 1100,
+      "crashed": 0,
+      "timed_out": 0,
+      "oom": 0
+    },
+    "status": "passed",
+    "baselines": [
+      "benchmarks/results/t262/full-2026-10-15a.md",
+      "benchmarks/results/t262/full-2026-10-14h.md",
+      "benchmarks/results/t262/full-2026-10-11e.md"
+    ],
+    "raw_totals": {
+      "total": 53575,
+      "passed": 52459,
+      "failed": 12,
+      "skipped": 1100,
+      "crashed": 0,
+      "timed_out": 4,
+      "oom": 0
+    },
+    "validation_sha256": "53effa310345293be1f7c3678291f89fdc6b923a002ab18dfed4310c2e00f178",
+    "isolated_rechecks": {
+      "timeout_rechecks": [
+        {
+          "path": "built-ins/decodeURI/S15.1.3.1_A2.5_T1.js",
+          "command": [
+            "/Users/alexanderstreltsov/work/octofhir/otter/target/release/otter-test262",
+            "run",
+            "--filter",
+            "built-ins/decodeURI/S15.1.3.1_A2.5_T1.js",
+            "--timeout",
+            "30000",
+            "--jobs",
+            "1",
+            "--max-heap-bytes",
+            "536870912",
+            "--output",
+            "/Users/alexanderstreltsov/work/octofhir/otter/benchmarks/results/regexp-capture-batch/test262-rechecks-0w369nw1/001-S15.1.3.1_A2.5_T1.json"
+          ],
+          "output": "benchmarks/results/regexp-capture-batch/test262-rechecks-0w369nw1/001-S15.1.3.1_A2.5_T1.json",
+          "log": "benchmarks/results/regexp-capture-batch/test262-rechecks-0w369nw1/001-S15.1.3.1_A2.5_T1.log",
+          "status": "passed",
+          "exit_code": 0,
+          "elapsed_seconds": 7.27949412498856,
+          "watchdog_expired": false,
+          "totals": {
+            "total": 1,
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "crashed": 0,
+            "timed_out": 0,
+            "oom": 0
+          },
+          "report_sha256": "d101177e5916c5ee578be356a7bcb80b6adc06d669b5760aeabaa704daebd858"
+        },
+        {
+          "path": "built-ins/decodeURIComponent/S15.1.3.2_A2.5_T1.js",
+          "command": [
+            "/Users/alexanderstreltsov/work/octofhir/otter/target/release/otter-test262",
+            "run",
+            "--filter",
+            "built-ins/decodeURIComponent/S15.1.3.2_A2.5_T1.js",
+            "--timeout",
+            "30000",
+            "--jobs",
+            "1",
+            "--max-heap-bytes",
+            "536870912",
+            "--output",
+            "/Users/alexanderstreltsov/work/octofhir/otter/benchmarks/results/regexp-capture-batch/test262-rechecks-0w369nw1/002-S15.1.3.2_A2.5_T1.json"
+          ],
+          "output": "benchmarks/results/regexp-capture-batch/test262-rechecks-0w369nw1/002-S15.1.3.2_A2.5_T1.json",
+          "log": "benchmarks/results/regexp-capture-batch/test262-rechecks-0w369nw1/002-S15.1.3.2_A2.5_T1.log",
+          "status": "passed",
+          "exit_code": 0,
+          "elapsed_seconds": 4.663470333995065,
+          "watchdog_expired": false,
+          "totals": {
+            "total": 1,
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "crashed": 0,
+            "timed_out": 0,
+            "oom": 0
+          },
+          "report_sha256": "c92409e5cbdddba8cb6c9f64f49532fda77f9a8aefb79556a2dc68b231b78284"
+        },
+        {
+          "path": "language/comments/S7.4_A5.js",
+          "command": [
+            "/Users/alexanderstreltsov/work/octofhir/otter/target/release/otter-test262",
+            "run",
+            "--filter",
+            "language/comments/S7.4_A5.js",
+            "--timeout",
+            "30000",
+            "--jobs",
+            "1",
+            "--max-heap-bytes",
+            "536870912",
+            "--output",
+            "/Users/alexanderstreltsov/work/octofhir/otter/benchmarks/results/regexp-capture-batch/test262-rechecks-0w369nw1/003-S7.4_A5.json"
+          ],
+          "output": "benchmarks/results/regexp-capture-batch/test262-rechecks-0w369nw1/003-S7.4_A5.json",
+          "log": "benchmarks/results/regexp-capture-batch/test262-rechecks-0w369nw1/003-S7.4_A5.log",
+          "status": "passed",
+          "exit_code": 0,
+          "elapsed_seconds": 2.2596691669896245,
+          "watchdog_expired": false,
+          "totals": {
+            "total": 1,
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "crashed": 0,
+            "timed_out": 0,
+            "oom": 0
+          },
+          "report_sha256": "00af8091dc342e8246017d790c6010859ecdf15e727aeb99377e77ec3a421da3"
+        },
+        {
+          "path": "staging/sm/Date/dst-offset-caching-8-of-8.js",
+          "command": [
+            "/Users/alexanderstreltsov/work/octofhir/otter/target/release/otter-test262",
+            "run",
+            "--filter",
+            "staging/sm/Date/dst-offset-caching-8-of-8.js",
+            "--timeout",
+            "30000",
+            "--jobs",
+            "1",
+            "--max-heap-bytes",
+            "536870912",
+            "--output",
+            "/Users/alexanderstreltsov/work/octofhir/otter/benchmarks/results/regexp-capture-batch/test262-rechecks-0w369nw1/004-dst-offset-caching-8-of-8.json"
+          ],
+          "output": "benchmarks/results/regexp-capture-batch/test262-rechecks-0w369nw1/004-dst-offset-caching-8-of-8.json",
+          "log": "benchmarks/results/regexp-capture-batch/test262-rechecks-0w369nw1/004-dst-offset-caching-8-of-8.log",
+          "status": "passed",
+          "exit_code": 0,
+          "elapsed_seconds": 7.516743457992561,
+          "watchdog_expired": false,
+          "totals": {
+            "total": 1,
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "crashed": 0,
+            "timed_out": 0,
+            "oom": 0
+          },
+          "report_sha256": "a8c5ab3501ea1373bcc4ff537245b95e00084dc24e2cf770e6e55fa88212a7f6"
+        }
+      ],
+      "timeout_rechecks_passed": 4,
+      "rechecks_directory": "benchmarks/results/regexp-capture-batch/test262-rechecks-0w369nw1"
+    }
+  },
+  "oracle": {
+    "runs": 88,
+    "binary_unchanged": true,
+    "status": "passed"
+  },
+  "gc": {
+    "runs": 26,
+    "binary_unchanged": true,
+    "status": "passed"
+  },
+  "gcfull": {
+    "runs": 52,
+    "binary_unchanged": true,
+    "status": "passed"
+  },
+  "checked_gc": {
+    "status": "passed",
+    "runs": 8400,
+    "sources": 175,
+    "binary_sha256": "146682cdc07922d76140688e5cd70237170b58bad9aa3b334d6210a1d5c332e3",
+    "source_freeze": "unchanged",
+    "concurrency": 4,
+    "resumedCompletedRuns": 8400,
+    "sequentialRechecks": 3,
+    "closing_report_sha256": "c93b6403e190326aeb98dc564f970429adf5a19a9ced52863cdda71d301603aa",
+    "strides": [
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      16
+    ],
+    "report_sha256": "c93b6403e190326aeb98dc564f970429adf5a19a9ced52863cdda71d301603aa"
+  },
+  "capture_batch_gc_regression": {
+    "runs": 48,
+    "status": "passed"
+  },
+  "fixed_work": "performance.json",
+  "wall_clock": "wall-final/",
+  "corpus_precheck": {
+    "runs": 6,
+    "status": "passed",
+    "cli_sha256": "7e2b27e06b1f86e558d0e10b377cfb1dc1509aacfff6a66f48da43e1371a9207",
+    "source_sha256": "626247fb77a55486aa44042bf6062fa2e40d7e1ac4151950cf3abae35520578a",
+    "recorded_after_precheck": true,
+    "host_build_complete": true
+  },
+  "targeted_regexp_test262": {
+    "baseline_totals": {
+      "total": 1962,
+      "passed": 1943,
+      "failed": 0,
+      "skipped": 19,
+      "crashed": 0,
+      "timed_out": 0,
+      "oom": 0
+    },
+    "current_totals": {
+      "total": 1962,
+      "passed": 1943,
+      "failed": 0,
+      "skipped": 19,
+      "crashed": 0,
+      "timed_out": 0,
+      "oom": 0
+    },
+    "baseline_report_sha256": "899934b1079e5b92359eb40b50dcb24e19f2b2e158d4418c62b865a7844734bd",
+    "current_report_sha256": "3450a42ec54e69b6b9a9490014e44f95cf4abf94d9eb1aec89bf90e95c638176",
+    "current_runner_identity": {
+      "runner_sha256": "099c261111d6c597ba71e1d164ba9226f474cfbfaaf579ed4bfda4a432c1ea04",
+      "binary_mtime_utc": "2026-10-15T01:14:42.865944+00:00",
+      "report_ran_at": "2026-10-15T01:16:52.764939+00:00",
+      "recorded_before_safe_wrapper_relink": true
+    },
+    "baseline_runner_identity": {
+      "command": [
+        "target/release/otter-test262",
+        "run",
+        "--filter",
+        "built-ins/RegExp",
+        "--timeout",
+        "10000",
+        "--output",
+        "benchmarks/results/regexp-capture-batch/baseline-regexp.json"
+      ],
+      "runner_sha256": "b1a204a9ba38ba44665dae868ddad4f6f58e1f77a6b46d6105485430efe3536c",
+      "exit_code": 0,
+      "elapsed_seconds": 28.972690333001083
+    }
+  },
+  "rejected_attempts": [
+    {
+      "status": "failed",
+      "reason": "matcher scratch loop-progress marks were included in result capture slots",
+      "cli_sha256": "3700909fd34ed61a4d63e05c7be9052b526bf0cf5fa69d1f16d0558258954a9d",
+      "checked_sha256": "2ba45cfdeb021783d786e76ffeb859ad112fc67abf3c8c712f053aff7d909d3e",
+      "full_runner_interrupted": true,
+      "source_freeze_sha256": "786e27ee461dfc8d270c56d06ced11004a8437bdd738c2191461d64ef9b8aeb7",
+      "evidence_directory": "failed-1/"
+    }
+  ],
+  "rejected_timing_attempts": [
+    {
+      "status": "rejected",
+      "reason": "own Rust CPU-feature probe overlapped the first fixed-work/wall series; unrelated external Cargo build also observed afterward",
+      "probe_completed_utc": "2026-10-15T02:31:02.509531+00:00",
+      "first_fw_started_utc": "2026-10-15T02:30:37.657288+00:00",
+      "evidence_directory": "timing-rejected-1/"
+    }
+  ],
+  "focused_debug_regression": {
+    "status": "passed",
+    "command": [
+      "cargo",
+      "test",
+      "-p",
+      "otter-regex",
+      "loop_progress_slots_never_become_captures_in_any_result_storage"
+    ]
+  },
+  "checked_gc_watchdog_closure": {
+    "status": "passed",
+    "initial_report_sha256": "49dfd1320e6ba2aa404632d3091a3c1a06069256ccc02f0438cb15ac45d1d063",
+    "initial_status": "failed",
+    "initial_runs": 8400,
+    "initial_timeouts": 3,
+    "closing_report_sha256": "c93b6403e190326aeb98dc564f970429adf5a19a9ced52863cdda71d301603aa",
+    "resumed_completed_runs": 8400,
+    "rechecks": [
+      {
+        "source": "regexp_method_entry",
+        "stride": 1,
+        "tier": "interpreter",
+        "repetition": 0,
+        "commandPrefix": [
+          "/Users/alexanderstreltsov/work/octofhir/otter/target/checked/otter",
+          "--interpreter",
+          "--timeout",
+          "0",
+          "-p"
+        ],
+        "sourceArgumentFile": "regexp_method_entry.source.js",
+        "exit": 0,
+        "matchesInterpreter": true,
+        "stdoutSha256": "28e668d68f0a38d8ee733e8b387a00ae4c86ca6ebc2dff4aeb1ce0a1e142990f",
+        "elapsedSeconds": 26.184333540993975
+      },
+      {
+        "source": "regexp_method_entry",
+        "stride": 1,
+        "tier": "production",
+        "repetition": 0,
+        "commandPrefix": [
+          "/Users/alexanderstreltsov/work/octofhir/otter/target/checked/otter",
+          "--timeout",
+          "0",
+          "-p"
+        ],
+        "sourceArgumentFile": "regexp_method_entry.source.js",
+        "exit": 0,
+        "matchesInterpreter": true,
+        "stdoutSha256": "28e668d68f0a38d8ee733e8b387a00ae4c86ca6ebc2dff4aeb1ce0a1e142990f",
+        "elapsedSeconds": 24.80863912499626
+      },
+      {
+        "source": "regexp_method_entry",
+        "stride": 1,
+        "tier": "template",
+        "repetition": 0,
+        "commandPrefix": [
+          "/Users/alexanderstreltsov/work/octofhir/otter/target/checked/otter",
+          "--jitless",
+          "--timeout",
+          "0",
+          "-p"
+        ],
+        "sourceArgumentFile": "regexp_method_entry.source.js",
+        "exit": 0,
+        "matchesInterpreter": true,
+        "stdoutSha256": "28e668d68f0a38d8ee733e8b387a00ae4c86ca6ebc2dff4aeb1ce0a1e142990f",
+        "elapsedSeconds": 24.270671915990533
+      }
+    ],
+    "binary_sha256": "146682cdc07922d76140688e5cd70237170b58bad9aa3b334d6210a1d5c332e3",
+    "source_freeze": "unchanged",
+    "watchdog_seconds": 120
+  },
+  "baseline_final_corpus": {
+    "cli_sha256": "03aa491cce7ef034238638ee5fd07526d87a2cddbde1132bccce67d740989fa7",
+    "source_sha256": "626247fb77a55486aa44042bf6062fa2e40d7e1ac4151950cf3abae35520578a",
+    "exit_code": 0,
+    "matches_node": true,
+    "stress": "1",
+    "verify": true
+  },
+  "no_groups_repeat": {
+    "runs": 45,
+    "status": "passed",
+    "scoreable": true,
+    "manifest_sha256": "0447cb0808a27fd73b953b2ad3201b9b7888bbd2a0814443e44ccae22d45c92f"
+  }
+}

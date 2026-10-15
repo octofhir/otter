@@ -55,7 +55,7 @@ impl RuntimeCall<'_> {
                         ctx.scope(|mut scope| {
                             let input = scope.value(argument);
                             let result = crate::regexp_prototype::build_match_result_native(
-                                &matched,
+                                &matched.as_match(),
                                 input,
                                 has_indices,
                                 &mut scope,

@@ -1,6 +1,14 @@
-//! End-to-end matching tests for the Phase-1 engine: pattern string in, match
-//! semantics out, exercised through the public `Regex` API exactly as a host VM
-//! would drive it. Each test names the §22.2 feature it covers.
+//! End-to-end pattern semantics at the public matcher boundary.
+//!
+//! # Contents
+//! - ECMAScript captures, assertions, character classes and Unicode matching.
+//! - Width parity, work limits and reusable scratch with borrowed match views.
+//!
+//! # Invariants
+//! - Owned test observations never retain a view across the next attempt.
+//!
+//! # See also
+//! - `src/exec/native/tests.rs` compares both execution tiers and exact work.
 
 use otter_regex::{ExecConfig, Flags, Regex};
 
@@ -138,11 +146,12 @@ fn named_group_and_backref() {
     let flags = Flags::default();
     let re = Regex::compile_str("(?<pair>ab)\\k<pair>", flags).unwrap();
     let units: Vec<u16> = "abab".encode_utf16().collect();
-    let m = re
+    let m_owned = re
         .find_utf16(&units, 0, ExecConfig::default())
-        .next()
+        .collect_first()
         .unwrap()
         .unwrap();
+    let m = m_owned.as_match();
     assert_eq!(m.named_group("pair"), Some(0..2));
 }
 
@@ -151,11 +160,12 @@ fn quantified_duplicate_named_group_clears_previous_iteration_capture() {
     let flags = Flags::default();
     let re = Regex::compile_str("(?:(?:(?<x>a)|(?<x>b)|c)\\k<x>){2}", flags).unwrap();
     let units: Vec<u16> = "aac".encode_utf16().collect();
-    let m = re
+    let m_owned = re
         .find_utf16(&units, 0, ExecConfig::default())
-        .next()
+        .collect_first()
         .unwrap()
         .unwrap();
+    let m = m_owned.as_match();
     assert_eq!(m.range, 0..3);
     assert_eq!(m.named_group("x"), None);
 }
@@ -166,21 +176,29 @@ fn duplicate_named_backreference_uses_participating_capture() {
     let re = Regex::compile_str("(?:(?<x>a)|(?<x>b))\\k<x>", flags).unwrap();
 
     let aa: Vec<u16> = "aa".encode_utf16().collect();
-    let aa_match = re
+    let aa_match_owned = re
         .find_utf16(&aa, 0, ExecConfig::default())
-        .next()
+        .collect_first()
         .unwrap()
         .unwrap();
-    assert_eq!(aa_match.captures, vec![Some(0..1), None]);
+    let aa_match = aa_match_owned.as_match();
+    assert_eq!(
+        aa_match.captures.iter().collect::<Vec<_>>(),
+        vec![Some(0..1), None]
+    );
     assert_eq!(aa_match.named_group("x"), Some(0..1));
 
     let bb: Vec<u16> = "bb".encode_utf16().collect();
-    let bb_match = re
+    let bb_match_owned = re
         .find_utf16(&bb, 0, ExecConfig::default())
-        .next()
+        .collect_first()
         .unwrap()
         .unwrap();
-    assert_eq!(bb_match.captures, vec![None, Some(0..1)]);
+    let bb_match = bb_match_owned.as_match();
+    assert_eq!(
+        bb_match.captures.iter().collect::<Vec<_>>(),
+        vec![None, Some(0..1)]
+    );
     assert_eq!(bb_match.named_group("x"), Some(0..1));
 }
 
@@ -189,13 +207,14 @@ fn duplicate_named_backreference_is_empty_when_no_candidate_participates() {
     let flags = Flags::default();
     let re = Regex::compile_str("^(?:(?<a>x)|(?<a>y)|z)\\k<a>$", flags).unwrap();
     let units: Vec<u16> = "z".encode_utf16().collect();
-    let m = re
+    let m_owned = re
         .find_utf16(&units, 0, ExecConfig::default())
-        .next()
+        .collect_first()
         .unwrap()
         .unwrap();
+    let m = m_owned.as_match();
     assert_eq!(m.range, 0..1);
-    assert_eq!(m.captures, vec![None, None]);
+    assert_eq!(m.captures.iter().collect::<Vec<_>>(), vec![None, None]);
     assert_eq!(m.named_group("a"), None);
 }
 
@@ -267,7 +286,10 @@ fn global_iteration_yields_all_matches() {
     let units: Vec<u16> = "a1b22c333".encode_utf16().collect();
     let found: Vec<String> = re
         .find_utf16(&units, 0, ExecConfig::default())
-        .map(|m| String::from_utf16_lossy(&units[m.unwrap().range]))
+        .collect_batch(usize::MAX)
+        .unwrap()
+        .iter()
+        .map(|m| String::from_utf16_lossy(&units[m.range]))
         .collect();
     assert_eq!(found, vec!["1", "22", "333"]);
 }
@@ -278,7 +300,11 @@ fn empty_match_terminates() {
     let flags = Flags::default();
     let re = Regex::compile_str("a*", flags).unwrap();
     let units: Vec<u16> = "bb".encode_utf16().collect();
-    let count = re.find_utf16(&units, 0, ExecConfig::default()).count();
+    let count = re
+        .find_utf16(&units, 0, ExecConfig::default())
+        .collect_batch(usize::MAX)
+        .unwrap()
+        .len();
     assert_eq!(count, 3); // positions 0, 1, 2
 }
 
@@ -406,7 +432,8 @@ fn step_budget_aborts_catastrophic_backtracking() {
     let cfg = ExecConfig {
         step_limit: 100_000,
     };
-    let result = re.find_utf16(&units, 0, cfg).next();
+    let mut search = re.find_utf16(&units, 0, cfg);
+    let result = search.next();
     assert!(matches!(result, Some(Err(_))));
 }
 
@@ -537,10 +564,10 @@ fn all_matches(pattern: &str, flag_str: &str, subject: &str) -> Vec<(usize, usiz
     let re = Regex::compile_str(pattern, flags).expect("compile");
     let units: Vec<u16> = subject.encode_utf16().collect();
     re.find_utf16(&units, 0, ExecConfig::default())
-        .map(|m| {
-            let m = m.expect("match");
-            (m.range.start, m.range.end)
-        })
+        .collect_batch(usize::MAX)
+        .unwrap()
+        .iter()
+        .map(|m| (m.range.start, m.range.end))
         .collect()
 }
 
@@ -726,17 +753,22 @@ fn latin1_subjects_match_like_their_utf16_form() {
                 .iter()
                 .map(|&u| u8::try_from(u).expect("one-byte"))
                 .collect();
-            let collect = |found: Vec<Result<otter_regex::Match, otter_regex::ExecError>>| {
+            let collect = |found: otter_regex::MatchBatch| {
                 found
-                    .into_iter()
-                    .map(|m| {
-                        let m = m.expect("match");
-                        (m.range, m.captures)
-                    })
+                    .iter()
+                    .map(|m| (m.range, m.captures.iter().collect::<Vec<_>>()))
                     .collect::<Vec<_>>()
             };
-            let wide_found = collect(re.find_utf16(&wide, 0, ExecConfig::default()).collect());
-            let narrow_found = collect(re.find_latin1(&narrow, 0, ExecConfig::default()).collect());
+            let wide_found = collect(
+                re.find_utf16(&wide, 0, ExecConfig::default())
+                    .collect_batch(usize::MAX)
+                    .unwrap(),
+            );
+            let narrow_found = collect(
+                re.find_latin1(&narrow, 0, ExecConfig::default())
+                    .collect_batch(usize::MAX)
+                    .unwrap(),
+            );
             assert_eq!(
                 narrow_found, wide_found,
                 "/{pattern}/{flags} on {subject:?}"
@@ -760,7 +792,10 @@ fn scratch_carries_between_searches() {
         let mut found = captures.find_utf16_with(&subject, 0, ExecConfig::default(), scratch);
         let first = found.next().expect("a match").expect("within budget");
         assert_eq!(first.range, 2..6);
-        assert_eq!(first.captures, vec![Some(2..5), None, Some(5..6)]);
+        assert_eq!(
+            first.captures.iter().collect::<Vec<_>>(),
+            vec![Some(2..5), None, Some(5..6)]
+        );
         scratch = found.into_scratch();
 
         let latin: Vec<u8> = b"xy".to_vec();

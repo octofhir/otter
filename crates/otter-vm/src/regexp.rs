@@ -570,8 +570,8 @@ impl JsRegExp {
     /// match and advances `lastIndex`, so a `/g` loop calls this once per
     /// match; using the collecting [`Self::find_batch`] there is quadratic (each
     /// call would re-find every remaining match and discard all but the
-    /// first). Step-limit aborts remain explicit so the runtime can surface one
-    /// resource error.
+    /// first). A sticky RegExp tries `start` alone. Step-limit aborts remain
+    /// explicit so the runtime can surface one resource error.
     pub(crate) fn find_one(
         &self,
         heap: &otter_gc::GcHeap,
@@ -580,7 +580,13 @@ impl JsRegExp {
         search: &RegexSearch<'_>,
     ) -> engine::Execution<Option<engine::MatchRecord>> {
         heap.read_payload(self.inner, |body| {
-            engine::find_one(&body.pattern.regex, text_units, start, search)
+            engine::find_one(
+                &body.pattern.regex,
+                text_units,
+                start,
+                body.flags.sticky,
+                search,
+            )
         })
     }
 
@@ -596,7 +602,14 @@ impl JsRegExp {
         search: &RegexSearch<'_>,
     ) -> engine::Execution<engine::MatchBatch> {
         heap.read_payload(self.inner, |body| {
-            engine::find_batch(&body.pattern.regex, text_units, start, max_matches, search)
+            engine::find_batch(
+                &body.pattern.regex,
+                text_units,
+                start,
+                body.flags.sticky,
+                max_matches,
+                search,
+            )
         })
     }
 

@@ -190,7 +190,7 @@ pub(crate) fn exec_without_result(
         .as_regexp()
         .expect("pristine receiver stays a RegExp");
     let heap = scope.context().heap();
-    let Some(matched) = matched.filter(|m| !flags.sticky || m.range.start == start) else {
+    let Some(matched) = matched else {
         if tracks_last_index {
             regexp.set_last_index(heap, 0);
         }
@@ -267,7 +267,7 @@ pub(crate) fn exec_direct(
         )));
     };
     let heap = &interp.gc_heap;
-    let Some(matched) = matched.filter(|m| !flags.sticky || m.range.start == start) else {
+    let Some(matched) = matched else {
         if tracks_last_index {
             regexp.set_last_index(heap, 0);
         }

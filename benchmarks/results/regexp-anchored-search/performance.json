@@ -1,0 +1,162 @@
+{
+  "method": "3 rounds x 5 balanced repetitions, rotated parent/current/Node order, wall clock of the whole process",
+  "binaries": {
+    "parent": "9a3250b1d7b8fece2b895f097f52ea5c780a2503607cb6d51ee1adb532ab8699",
+    "current": "8d727a915d6e2cd2f15e395a8fa544f4c184d413a13331e1add5ff3ffda8a6e1"
+  },
+  "wall": {
+    "sticky-lexer": {
+      "median_seconds": {
+        "parent": 0.03646945799118839,
+        "current": 0.03391087500494905,
+        "node": 0.0338935419858899
+      },
+      "round_medians_seconds": {
+        "parent": [
+          0.03645366698037833,
+          0.03646945799118839,
+          0.036641749989939854
+        ],
+        "current": [
+          0.03374454099684954,
+          0.0339279159961734,
+          0.03391087500494905
+        ],
+        "node": [
+          0.0338935419858899,
+          0.033707584021613,
+          0.034638874989468604
+        ]
+      },
+      "current_vs_parent_pct": [
+        -7.431696748058336,
+        -6.968960151886749,
+        -7.452905458228876
+      ],
+      "node_drift_pct": 2.762852915410563
+    },
+    "nonsticky-control": {
+      "median_seconds": {
+        "parent": 0.6453310000069905,
+        "current": 0.6346825000073295,
+        "node": 0.17413712499546818
+      },
+      "round_medians_seconds": {
+        "parent": [
+          0.6439854170021135,
+          0.6495280420058407,
+          0.6453310000069905
+        ],
+        "current": [
+          0.6388550419942476,
+          0.6364293330116197,
+          0.6264560830022674
+        ],
+        "node": [
+          0.17318991699721664,
+          0.1744620829995256,
+          0.17413712499546818
+        ]
+      },
+      "current_vs_parent_pct": [
+        -0.7966601218625247,
+        -2.0166502671339903,
+        -2.9248427558134726
+      ],
+      "node_drift_pct": 0.734549692248776
+    },
+    "regexp": {
+      "median_seconds": {
+        "parent": 1.5919765410071705,
+        "current": 1.5953272909973748,
+        "node": 0.40534324999316595
+      },
+      "round_medians_seconds": {
+        "parent": [
+          1.5824925000197254,
+          1.5919765410071705,
+          1.6550014579843264
+        ],
+        "current": [
+          1.6020749580056872,
+          1.5857275839953218,
+          1.6352788750082254
+        ],
+        "node": [
+          0.4048982080130372,
+          0.4032974579895381,
+          0.42151016599382274
+        ]
+      },
+      "current_vs_parent_pct": [
+        1.2374439680262528,
+        -0.39252820948575406,
+        -1.1916958067288763
+      ],
+      "node_drift_pct": 4.5159491198075274
+    }
+  },
+  "catastrophic_sticky_miss": {
+    "pattern": "/x(a+)+b/y on \"zx\"+\"a\".repeat(32), lastIndex 0",
+    "timeout_seconds": 10,
+    "runs": {
+      "parent-native": {
+        "result": [
+          "timeout",
+          null
+        ],
+        "seconds": 10.004
+      },
+      "parent-template": {
+        "result": [
+          "timeout",
+          null
+        ],
+        "seconds": 10.005
+      },
+      "parent-interpreter": {
+        "result": [
+          "timeout",
+          null
+        ],
+        "seconds": 10.004
+      },
+      "current-native": {
+        "result": [
+          0,
+          "false 0"
+        ],
+        "seconds": 0.023
+      },
+      "current-template": {
+        "result": [
+          0,
+          "false 0"
+        ],
+        "seconds": 0.017
+      },
+      "current-interpreter": {
+        "result": [
+          0,
+          "false 0"
+        ],
+        "seconds": 0.017
+      },
+      "node": {
+        "result": [
+          0,
+          "false 0"
+        ],
+        "seconds": 0.032
+      }
+    }
+  },
+  "unicode_split_pair_start": {
+    "cases": 63,
+    "matches_node": true,
+    "note": "lastIndex inside a surrogate pair under u/v starts at the pair lead, as Node and Bun do; the normative wording is debated in tc39/ecma262#128"
+  },
+  "caveats": {
+    "sticky-lexer": "about 35 ms per process, so startup dominates the absolute time; the delta is consistent across rounds"
+  }
+}

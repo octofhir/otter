@@ -166,10 +166,6 @@ pub(crate) fn exec_once_native(
                     return Ok(scope.null());
                 }
             };
-            if flags.sticky && matched.range.start != start {
-                set_exec_last_index(&mut scope, receiver, Value::number_i32(0))?;
-                return Ok(scope.null());
-            }
             if flags.global || flags.sticky {
                 set_exec_last_index(
                     &mut scope,

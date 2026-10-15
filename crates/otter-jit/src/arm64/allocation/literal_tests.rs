@@ -384,7 +384,10 @@ fn zero_records_emit_no_observation_and_keep_the_buffer_live() {
         dynasm!(ops ; .arch aarch64 ; =>slow ; ret);
         let code = ops.finalize().unwrap();
         let reloads = code
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(<[u8; 4]>::as_slice)
             .filter(|word| *word == reload.as_slice())
             .count();
         assert_eq!(

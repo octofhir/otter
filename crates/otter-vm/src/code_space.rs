@@ -912,7 +912,7 @@ impl CodeSpace {
         let retained_bytes = live.retained_bytes();
         let dropped = payload.take();
         self.evictable_retained_bytes
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
                 current.checked_sub(retained_bytes)
             })
             .expect("live evictable byte accounting covers its payload");

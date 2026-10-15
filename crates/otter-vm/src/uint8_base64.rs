@@ -196,15 +196,14 @@ fn decode_base64(
 fn encode_base64(bytes: &[u8], url: bool, omit_padding: bool) -> String {
     let table = if url { B64_URL } else { B64_STD };
     let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
-    let mut chunks = bytes.chunks_exact(3);
-    for c in &mut chunks {
+    let (chunks, rem) = bytes.as_chunks::<3>();
+    for c in chunks {
         let n = (u32::from(c[0]) << 16) | (u32::from(c[1]) << 8) | u32::from(c[2]);
         out.push(table[(n >> 18 & 0x3F) as usize] as char);
         out.push(table[(n >> 12 & 0x3F) as usize] as char);
         out.push(table[(n >> 6 & 0x3F) as usize] as char);
         out.push(table[(n & 0x3F) as usize] as char);
     }
-    let rem = chunks.remainder();
     match rem.len() {
         1 => {
             let n = u32::from(rem[0]) << 16;

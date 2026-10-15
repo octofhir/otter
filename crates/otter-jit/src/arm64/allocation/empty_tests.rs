@@ -38,7 +38,10 @@ fn executable(layout: EmptyLiteralLayout, realm_id: u32, regs: LabRegisters) -> 
     if !matches!(layout, EmptyLiteralLayout::Array(_)) || realm_id == 0 {
         let words: Vec<u32> = code
             .bytes()
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(<[u8; 4]>::as_slice)
             .map(|word| u32::from_le_bytes(word.try_into().unwrap()))
             .collect();
         let publication = 0xf900_0000 | (u32::from(regs.buffer) << 5) | u32::from(regs.end);

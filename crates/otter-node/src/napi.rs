@@ -2633,12 +2633,11 @@ pub unsafe extern "C" fn napi_call_threadsafe_function(
         return NAPI_CLOSING;
     }
     if function.max_queue_size != 0 {
-        let reserved =
-            function
-                .queued
-                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |queued| {
-                    (queued < function.max_queue_size).then_some(queued + 1)
-                });
+        let reserved = function
+            .queued
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |queued| {
+                (queued < function.max_queue_size).then_some(queued + 1)
+            });
         if reserved.is_err() {
             return NAPI_QUEUE_FULL;
         }

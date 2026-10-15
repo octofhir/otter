@@ -368,7 +368,10 @@ mod tests {
         s.insert_range(b'a' as u32, b'c' as u32);
         s.insert_range(b'd' as u32, b'f' as u32); // adjacent -> merge
         s.insert_range(b'b' as u32, b'b' as u32); // inside -> no change
-        assert_eq!(s.ranges(), &[(b'a' as u32)..=(b'f' as u32)]);
+        assert_eq!(
+            s.ranges(),
+            std::slice::from_ref(&((b'a' as u32)..=(b'f' as u32)))
+        );
     }
 
     #[test]
@@ -396,8 +399,14 @@ mod tests {
         let mut b = CodePointSet::new();
         b.insert_range(b'h' as u32, b'z' as u32);
         let i = a.intersection(&b);
-        assert_eq!(i.ranges(), &[(b'h' as u32)..=(b'm' as u32)]);
+        assert_eq!(
+            i.ranges(),
+            std::slice::from_ref(&((b'h' as u32)..=(b'm' as u32)))
+        );
         let d = a.difference(&b);
-        assert_eq!(d.ranges(), &[(b'a' as u32)..=(b'g' as u32)]);
+        assert_eq!(
+            d.ranges(),
+            std::slice::from_ref(&((b'a' as u32)..=(b'g' as u32)))
+        );
     }
 }

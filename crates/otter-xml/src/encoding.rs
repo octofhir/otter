@@ -345,7 +345,7 @@ fn marked_utf8(rest: &[u8]) -> Result<Sniffed> {
 fn marked_utf16(rest: &[u8], charset: Charset) -> Result<Sniffed> {
     let big_endian = charset == Charset::Utf16Be;
     let mut ascii = Vec::new();
-    for pair in rest.chunks_exact(2).take(256) {
+    for pair in rest.as_chunks::<2>().0.iter().take(256) {
         let (high, low) = if big_endian {
             (pair[0], pair[1])
         } else {
@@ -414,7 +414,9 @@ pub fn decode_utf16(bytes: &[u8], big_endian: bool) -> Result<Vec<u16>> {
         return Err(Error::new(ErrorKind::MalformedEncoding, bytes.len() - 1));
     }
     Ok(bytes
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|pair| {
             let (hi, lo) = if big_endian {
                 (pair[0], pair[1])

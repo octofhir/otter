@@ -436,7 +436,7 @@ fn alternating_constructor_families_keep_one_body_native_without_recompilation()
             192,
             "all 96 actual constructors observed before/after child allocation"
         );
-        for pair in recorded.chunks_exact(2) {
+        for pair in recorded.as_chunks::<2>().0 {
             assert_eq!((pair[0].phase, pair[1].phase), (0, 1));
             assert!(pair[0].child.is_none());
             assert!(pair[1].child.is_some());
@@ -736,7 +736,7 @@ fn actual_owner_records_fit_split_classes_and_super_selected_before_argument_mut
             );
             let observed = observations.lock().unwrap();
             assert_eq!(observed.len(), 256, "all 128 receiver/body observations");
-            for pair in observed.chunks_exact(2) {
+            for pair in observed.as_chunks::<2>().0 {
                 assert_eq!((pair[0].phase, pair[1].phase), (0, 1));
                 assert!(pair[0].child.is_none() && pair[1].child.is_some());
                 assert_eq!(pair[0].active_code, generation.code_object_id);

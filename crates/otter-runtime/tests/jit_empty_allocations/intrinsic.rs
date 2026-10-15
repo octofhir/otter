@@ -494,7 +494,10 @@ fn assert_implicit_error_source(bundle: &JitArtifactBundle) {
         + std::mem::offset_of!(otter_vm::native_abi::VmFrameHeader, pc)) as u32;
     #[cfg(target_arch = "aarch64")]
     let stamps: Vec<_> = code[start..helper]
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(<[u8; 4]>::as_slice)
         .map(|word| u32::from_le_bytes(word.try_into().unwrap()))
         .collect::<Vec<_>>()
         .windows(2)

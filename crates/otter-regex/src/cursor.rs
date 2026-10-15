@@ -135,9 +135,9 @@ impl Unit for u16 {
         const LOW: u64 = 0x0001_0001_0001_0001;
         const HIGH: u64 = 0x8000_8000_8000_8000;
         let pattern = LOW * u64::from(needle);
-        let mut chunks = haystack.chunks_exact(4);
+        let (chunks, remainder) = haystack.as_chunks::<4>();
         let mut base = 0;
-        for chunk in &mut chunks {
+        for chunk in chunks {
             let word = u64::from(chunk[0])
                 | (u64::from(chunk[1]) << 16)
                 | (u64::from(chunk[2]) << 32)
@@ -149,8 +149,7 @@ impl Unit for u16 {
             }
             base += 4;
         }
-        chunks
-            .remainder()
+        remainder
             .iter()
             .position(|&unit| unit == needle)
             .map(|offset| base + offset)

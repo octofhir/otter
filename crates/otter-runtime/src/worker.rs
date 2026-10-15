@@ -75,7 +75,7 @@ const MAX_JAVASCRIPT_WORKER_ID: u64 = (1_u64 << 53) - 1;
 
 fn next_worker_id() -> Option<WorkerId> {
     NEXT_WORKER_ID
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
             if next <= MAX_JAVASCRIPT_WORKER_ID {
                 next.checked_add(1)
             } else {
@@ -1657,12 +1657,15 @@ fn clone_worker_value_inner(
             ));
         }
         let values: Vec<Value> = if let Some(array) = value.as_array() {
-            (0..len).map(|index| array::get(array, heap, index)).collect()
+            (0..len)
+                .map(|index| array::get(array, heap, index))
+                .collect()
         } else {
             let object = value.as_object().expect("branded array prototype");
             (0..len)
                 .map(|index| {
-                    object::get_own(object, heap, &index.to_string()).unwrap_or_else(Value::undefined)
+                    object::get_own(object, heap, &index.to_string())
+                        .unwrap_or_else(Value::undefined)
                 })
                 .collect()
         };

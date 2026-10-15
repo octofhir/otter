@@ -39,7 +39,7 @@ static NEXT_REALM_OWNER_ID: AtomicU64 = AtomicU64::new(1);
 
 pub(crate) fn next_realm_owner_id() -> u64 {
     NEXT_REALM_OWNER_ID
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
         .expect("runtime realm owner id space exhausted")
 }
 

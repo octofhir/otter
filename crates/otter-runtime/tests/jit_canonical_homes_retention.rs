@@ -372,7 +372,10 @@ fn assert_native_home_lifetimes(code: &[u8], points: &[&Json], home: u32) -> BTr
         let start = point["startOffset"].as_u64().unwrap() as usize;
         let end = point["endOffset"].as_u64().unwrap() as usize;
         let words: Vec<_> = code[start..end]
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(<[u8; 4]>::as_slice)
             .map(|word| u32::from_le_bytes(word.try_into().unwrap()))
             .collect();
         let id = words
@@ -388,10 +391,17 @@ fn assert_native_home_lifetimes(code: &[u8], points: &[&Json], home: u32) -> BTr
     }
     // STR Xn, [sp, #home] in the actual collecting operation, before its
     // committed runtime call. This value is still needed by the marker read.
-    assert!(code[start..end].chunks_exact(4).any(|word| {
-        let word = u32::from_le_bytes(word.try_into().unwrap());
-        word & 0xffc0_03e0 == 0xf900_03e0 && ((word >> 10) & 0xfff) * 8 == home
-    }));
+    assert!(
+        code[start..end]
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(<[u8; 4]>::as_slice)
+            .any(|word| {
+                let word = u32::from_le_bytes(word.try_into().unwrap());
+                word & 0xffc0_03e0 == 0xf900_03e0 && ((word >> 10) & 0xfff) * 8 == home
+            })
+    );
     published
 }
 

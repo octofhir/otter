@@ -3,13 +3,15 @@
 //! This is the exact surface a host VM consumes. A
 //! [`Regex`] is compiled once from a UTF-16 (or `&str`) pattern plus [`Flags`];
 //! [`Regex::find_utf16`] runs it against a UTF-16 subject from a start offset,
-//! yielding [`Match`]es. The stateful JS flags `g`/`y`/`d` are handled by the
-//! host *above* this API.
+//! yielding [`Match`]es. The stateful JS flags `g`/`d` are handled by the
+//! host *above* this API; the host selects `y` per search with
+//! [`Matches::anchored`].
 //!
 //! # Contents
 //! - [`Regex`] — a compiled pattern.
 //! - [`Match`] — overall range, capture ranges, named-group access.
-//! - [`Matches`] — lending search with borrowed views and owned collection.
+//! - [`Matches`] — lending search with borrowed views and owned collection,
+//!   leftmost or anchored at its position.
 //! - [`crate::NamedGroups`] — deterministic, deduplicated named-group iterator.
 //! - [`MatchScratch`] — matcher buffers a host reuses across searches.
 //!
@@ -23,6 +25,10 @@
 //!   ranges do not make distinct capture groups interchangeable.
 //! - A successful scan always advances `next_start` past the current match, so
 //!   the search terminates even on zero-width matches.
+//! - An anchored search tries only its own position; its first failure ends
+//!   it, so it never pays for a later candidate.
+//! - Under Unicode semantics a start between the halves of a surrogate pair
+//!   searches from the pair's lead.
 //! - A regex searched often enough runs its searches as machine code
 //!   ([`crate::exec::native`]) when the emitter covers its program; matches,
 //!   capture ranges and step counts are exactly the interpreter's.
@@ -173,8 +179,9 @@ impl Regex {
         Matches {
             regex: self,
             text,
-            next_start: start,
+            next_start: search_start(text, start, self.program.unicode),
             config,
+            anchored: false,
             done: false,
             steps_executed: 0,
             scratch: scratch.0.unwrap_or_default(),
@@ -198,8 +205,9 @@ impl Regex {
         Matches {
             regex: self,
             text,
-            next_start: start,
+            next_start: search_start(text, start, self.program.unicode),
             config,
+            anchored: false,
             done: false,
             steps_executed: 0,
             scratch: Box::default(),
@@ -229,6 +237,8 @@ impl Regex {
 /// Resolved once from the compiled program, so the per-candidate path is a
 /// single dispatch rather than a chain of option tests.
 enum Scan<'p> {
+    /// Only the search's own position is a candidate: an anchored search.
+    Exact,
     /// Every position is a candidate; the matcher decides.
     Unfiltered,
     /// Only offset 0 can match.
@@ -251,6 +261,8 @@ pub struct Matches<'r, 't, U: Unit = u16> {
     text: &'t [U],
     next_start: usize,
     config: ExecConfig,
+    /// Every match begins exactly where the search stands.
+    anchored: bool,
     done: bool,
     steps_executed: u64,
     scratch: Box<Buffers>,
@@ -259,6 +271,30 @@ pub struct Matches<'r, 't, U: Unit = u16> {
 }
 
 impl<U: Unit> Matches<'_, '_, U> {
+    /// Restrict every match to begin exactly where the search stands, as a
+    /// sticky (`y`) RegExp requires: each result tries that one candidate,
+    /// and the first failing candidate ends the search without scanning
+    /// ahead for a later start.
+    #[must_use]
+    pub fn anchored(mut self, anchored: bool) -> Self {
+        self.anchored = anchored;
+        self
+    }
+
+    /// Whether a match may begin at `pos`: within the subject, nowhere a
+    /// start anchor rules out, and under a prefilter at a code point that
+    /// can begin one. A prefilter exists only for a pattern that cannot
+    /// match the empty string, so the subject's end never qualifies then.
+    fn may_start_at(&self, pos: usize) -> bool {
+        let program = &self.regex.program;
+        if pos > self.text.len() || (program.start_anchored && pos > 0) {
+            return false;
+        }
+        program.prefilter.as_ref().is_none_or(|pf| {
+            pos < self.text.len() && pf.cp_may_start(decode_at(self.text, pos, program.unicode).0)
+        })
+    }
+
     /// Number of backtrack points explored by this search so far.
     #[must_use]
     pub fn steps_executed(&self) -> u64 {
@@ -309,7 +345,16 @@ impl<U: Unit> Matches<'_, '_, U> {
         let len = self.text.len();
         let mut pos = self.next_start;
         loop {
-            let window = if program.start_anchored {
+            let window = if self.anchored {
+                if !self.may_start_at(pos) {
+                    break;
+                }
+                Window {
+                    start: pos,
+                    end: pos,
+                    filter: false,
+                }
+            } else if program.start_anchored {
                 if pos > 0 {
                     break;
                 }
@@ -403,6 +448,7 @@ impl<U: Unit> Matches<'_, '_, U> {
                     self.next_start = if end > start { end } else { start + 1 };
                     return Some(Ok(()));
                 }
+                Outcome::Exhausted(_) if self.anchored => break,
                 Outcome::Exhausted(next) => pos = next,
                 // The interpreter counts the step that overran the budget.
                 Outcome::StepLimit => {
@@ -467,7 +513,9 @@ impl<U: Unit> Matches<'_, '_, U> {
         let mut pos = self.next_start;
         // Resolve the scan strategy once per call rather than re-testing it at
         // every candidate position.
-        let scan = if program.start_anchored {
+        let scan = if self.anchored {
+            Scan::Exact
+        } else if program.start_anchored {
             Scan::Anchored
         } else if let Some(lit) = &program.required_literal {
             Scan::Literal(lit)
@@ -478,6 +526,12 @@ impl<U: Unit> Matches<'_, '_, U> {
         };
         loop {
             match scan {
+                Scan::Exact => {
+                    if !self.may_start_at(pos) {
+                        self.done = true;
+                        return None;
+                    }
+                }
                 Scan::Unfiltered => {}
                 // A start-anchored pattern (`^` outside multiline) can only
                 // match at offset 0: every later position fails the assertion
@@ -510,16 +564,7 @@ impl<U: Unit> Matches<'_, '_, U> {
                         Some(at) => {
                             let earliest = at - lit.max_offset.min(at);
                             if earliest > pos {
-                                pos = earliest;
-                                // The leftmost search never starts between the
-                                // halves of a surrogate pair; the pair's lead is
-                                // the position it would try instead.
-                                if unicode
-                                    && (0xDC00..=0xDFFF).contains(&self.text[pos].widen())
-                                    && (0xD800..=0xDBFF).contains(&self.text[pos - 1].widen())
-                                {
-                                    pos -= 1;
-                                }
+                                pos = search_start(self.text, earliest, unicode);
                             }
                         }
                         // No further occurrence, so no further match. Step past
@@ -605,6 +650,10 @@ impl<U: Unit> Matches<'_, '_, U> {
                     };
                     return Some(Ok(()));
                 }
+                Ok(false) if self.anchored => {
+                    self.done = true;
+                    return None;
+                }
                 Ok(false) => {
                     // When the unique leading consumer is a possessive `min >= 1`
                     // repeat, every prefilter-positive position in the current run
@@ -632,6 +681,22 @@ impl<U: Unit> Matches<'_, '_, U> {
                 }
             }
         }
+    }
+}
+
+/// The candidate a search from `start` tries first. Under Unicode semantics
+/// an offset between the halves of a surrogate pair names the character the
+/// pair encodes, so the search begins at the pair's lead.
+fn search_start<U: Unit>(text: &[U], start: usize, unicode: bool) -> usize {
+    if unicode
+        && start > 0
+        && start < text.len()
+        && (0xDC00..=0xDFFF).contains(&text[start].widen())
+        && (0xD800..=0xDBFF).contains(&text[start - 1].widen())
+    {
+        start - 1
+    } else {
+        start
     }
 }
 
@@ -695,3 +760,7 @@ mod iu_word_tests {
 #[cfg(test)]
 #[path = "api/buffer_tests.rs"]
 mod buffer_tests;
+
+#[cfg(test)]
+#[path = "api/anchored_tests.rs"]
+mod anchored_tests;

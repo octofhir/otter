@@ -2,6 +2,7 @@
 //!
 //! # Contents
 //! - Pattern compilation and width-preserving first/all searches.
+//! - Sticky searches anchored at their start, one candidate per match.
 //! - Scratch handoff and backtrack work transferred to the VM ledger.
 //!
 //! # Invariants
@@ -45,11 +46,13 @@ pub(crate) fn compile(
 
 /// Collect at most `max_matches` successful matches from `start` with exact work accounting,
 /// exploring at most the search's step limit of backtrack points. The
-/// subject is searched at its stored width.
+/// subject is searched at its stored width; a sticky search admits only
+/// matches that begin where the previous one ended.
 pub(crate) fn find_batch(
     re: &Regex,
     text: crate::string::CodeUnits<'_>,
     start: usize,
+    sticky: bool,
     max_matches: usize,
     search: &super::RegexSearch<'_>,
 ) -> Execution<MatchBatch> {
@@ -59,12 +62,14 @@ pub(crate) fn find_batch(
     let scratch = search.scratch.take();
     match text {
         crate::string::CodeUnits::Latin1(bytes) => collect_batch(
-            re.find_latin1_with(bytes, start, config, scratch),
+            re.find_latin1_with(bytes, start, config, scratch)
+                .anchored(sticky),
             max_matches,
             search,
         ),
         crate::string::CodeUnits::Utf16(units) => collect_batch(
-            re.find_utf16_with(units, start, config, scratch),
+            re.find_utf16_with(units, start, config, scratch)
+                .anchored(sticky),
             max_matches,
             search,
         ),
@@ -84,12 +89,14 @@ fn collect_batch<U: otter_regex::Unit>(
 
 /// Find only the first match from `start` — the single-match path for
 /// `exec`/`test`. The iterator is lazy, so this computes one match instead
-/// of the whole remaining set. Exceeding the step limit remains an explicit
-/// resource error for the VM boundary to surface.
+/// of the whole remaining set; a sticky search tries `start` alone.
+/// Exceeding the step limit remains an explicit resource error for the VM
+/// boundary to surface.
 pub(crate) fn find_one(
     re: &Regex,
     text: crate::string::CodeUnits<'_>,
     start: usize,
+    sticky: bool,
     search: &super::RegexSearch<'_>,
 ) -> Execution<Option<MatchRecord>> {
     let config = otter_regex::ExecConfig {
@@ -97,12 +104,16 @@ pub(crate) fn find_one(
     };
     let scratch = search.scratch.take();
     match text {
-        crate::string::CodeUnits::Latin1(bytes) => {
-            first_match(re.find_latin1_with(bytes, start, config, scratch), search)
-        }
-        crate::string::CodeUnits::Utf16(units) => {
-            first_match(re.find_utf16_with(units, start, config, scratch), search)
-        }
+        crate::string::CodeUnits::Latin1(bytes) => first_match(
+            re.find_latin1_with(bytes, start, config, scratch)
+                .anchored(sticky),
+            search,
+        ),
+        crate::string::CodeUnits::Utf16(units) => first_match(
+            re.find_utf16_with(units, start, config, scratch)
+                .anchored(sticky),
+            search,
+        ),
     }
 }
 

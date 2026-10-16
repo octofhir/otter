@@ -1118,9 +1118,11 @@ impl Interpreter {
             .into_iter()
             .collect());
         }
-        if target.is_temporal() {
+        if target.is_temporal() || self.existing_expando(&target).is_some() {
             // Enumerable own string keys are exactly the enumerable
-            // entries of the lazy expando bag.
+            // entries of the lazy expando bag, on a Temporal value and on
+            // any other kind that keeps one (a collection, a promise, a
+            // buffer, an Intl object…).
             let own_keys = self.own_property_keys_value(stack, context, &target)?;
             let mut out = Vec::new();
             for key_value in own_keys {

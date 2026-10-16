@@ -394,7 +394,7 @@ impl Interpreter {
             // §13.5.1.2 — a fresh primitive wrapper has no own
             // configurable-relevant slots; the delete is vacuous.
             true
-        } else {
+        } else if receiver.is_nullish() {
             return Err(self.err_type(
                 (format!(
                     "Cannot delete property '{name}' of {}",
@@ -402,6 +402,11 @@ impl Interpreter {
                 ))
                 .into(),
             ));
+        } else if let Some(bag) = self.existing_expando(&receiver) {
+            crate::object::delete(&mut { bag }, &mut self.gc_heap, name)?
+        } else {
+            // §10.1.10 OrdinaryDelete — no own property by this name.
+            true
         };
         // §13.5.1.2 step 5.c — when the result of `[[Delete]]` is
         // `false` in strict mode, throw a TypeError. The receiver renders in
@@ -690,8 +695,35 @@ impl Interpreter {
             } else {
                 return Err(CommittedValueError::JavaScript(VmError::TypeMismatch));
             }
+        } else if receiver.is_nullish() {
+            // §13.5.1.2 step 5.a — ToObject throws on undefined and null.
+            return Err(CommittedValueError::JavaScript(self.err_type(
+                ("Cannot convert undefined or null to object".to_string()).into(),
+            )));
+        } else if let Some(bag) = self.existing_expando(&receiver) {
+            // Any other object keeps its ordinary own properties in its
+            // expando: delete from there.
+            if let Some(sym) = idx.as_symbol(&self.gc_heap) {
+                crate::object::delete_symbol(bag, &mut self.gc_heap, sym)
+            } else {
+                let name = match (idx.as_string(&self.gc_heap), idx.as_number()) {
+                    (Some(s), _) => s.to_key_spelling(&self.gc_heap),
+                    (None, Some(n)) => match n.as_smi() {
+                        Some(v) if v >= 0 => v.to_string(),
+                        _ => n.to_display_string(),
+                    },
+                    (None, None) => {
+                        return Err(CommittedValueError::JavaScript(VmError::TypeMismatch));
+                    }
+                };
+                crate::object::delete(&mut { bag }, &mut self.gc_heap, &name)
+                    .map_err(|error| CommittedValueError::JavaScript(error.into()))?
+            }
         } else {
-            return Err(CommittedValueError::JavaScript(VmError::TypeMismatch));
+            // §10.1.10 OrdinaryDelete — a primitive's fresh wrapper, or an
+            // object of a kind with no own property by this key, deletes
+            // vacuously.
+            true
         };
         if !removed && strict {
             return Err(CommittedValueError::JavaScript(

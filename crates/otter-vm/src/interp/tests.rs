@@ -1335,7 +1335,7 @@ fn call_method_on_nullish_receiver_reports_type_error() {
     assert_eq!(
         interp.error_detail(),
         Some(run_control::ErrorDetail::Message(
-            "Cannot read properties of undefined".into()
+            "Cannot read properties of undefined (reading 'foo')".into()
         ))
     );
 }

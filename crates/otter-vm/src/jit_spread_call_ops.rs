@@ -63,13 +63,11 @@ impl Interpreter {
         let resolve = |interp: &mut Self, stack: &mut ActivationStack| {
             let mut receiver = interp.iteration_anchor(receiver_anchor);
             if receiver.is_nullish() {
-                let label = if receiver.is_null() {
-                    "null"
-                } else {
-                    "undefined"
-                };
+                let name = context
+                    .string_constant_str_for_function(function_id, name_index)
+                    .map(str::to_owned);
                 return Err(CommittedValueError::JavaScript(
-                    interp.err_type((format!("Cannot read properties of {label}")).into()),
+                    interp.nullish_read_error(&receiver, name.as_deref()),
                 ));
             }
             let feedback_site = context.property_ic_site(function_id, call_pc);

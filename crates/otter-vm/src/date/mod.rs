@@ -86,6 +86,13 @@ impl LocalTimeZone {
             .get_or_insert_with(|| temporal_rs::Temporal::local_now().time_zone().ok())
             .as_ref()
     }
+
+    /// The host zone's identifier (`"Europe/Berlin"`, or an offset for a
+    /// host that only knows one): ECMA-402 DefaultTimeZone, which `Intl`
+    /// formats in when no `timeZone` is asked for.
+    pub(crate) fn identifier(&mut self) -> Option<String> {
+        self.zone()?.identifier().ok()
+    }
 }
 
 /// Minutes the host local time zone sits ahead of UTC at `time_ms`.

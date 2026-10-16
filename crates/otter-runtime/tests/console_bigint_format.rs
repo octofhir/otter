@@ -57,3 +57,35 @@ async fn console_keeps_the_bigint_suffix_without_changing_to_string() -> Result<
     );
     Ok(())
 }
+
+/// An error passed to `console` prints its stack, as browsers and Node do; an
+/// object that only looks like one prints its name and message.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn console_prints_an_errors_stack() -> Result<(), OtterError> {
+    let capture = Arc::new(LogCapture::default());
+    let otter = Otter::builder()
+        .console_sink(capture.clone())
+        .build()
+        .expect("otter");
+
+    otter
+        .handle()
+        .eval(SourceInput::from_javascript(
+            r#"
+            function thrower() { return null.field; }
+            try { thrower(); } catch (error) { console.log("caught", error); }
+            console.log({ name: "Shaped", message: "only looks like one" });
+            "#,
+        ))
+        .await?;
+
+    let events = capture.events.lock().expect("log mutex").clone();
+    assert!(
+        events[0]
+            .starts_with("caught TypeError: Cannot read properties of null (reading 'field')\n"),
+        "{events:?}"
+    );
+    assert!(events[0].contains("at thrower"), "{events:?}");
+    assert_eq!(events[1], "Shaped: only looks like one");
+    Ok(())
+}

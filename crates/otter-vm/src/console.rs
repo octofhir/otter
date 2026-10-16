@@ -169,9 +169,27 @@ fn write(ctx: &mut NativeCtx<'_>, level: ConsoleLevel, args: &[Value]) {
 }
 
 fn format_args(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Vec<String> {
+    // A real error prints its stack, as browser consoles and Node's inspector
+    // do: the message alone does not say where it was thrown. Rendered first,
+    // through the interpreter, which owns the frames captured at construction.
+    let stacks: Vec<Option<String>> = args
+        .iter()
+        .map(|value| {
+            let obj = value.as_object()?;
+            if !object::has_error_data(obj, ctx.heap()) {
+                return None;
+            }
+            let thrown = ctx.interp_mut().render_thrown(value);
+            (!thrown.is_empty()).then_some(thrown)
+        })
+        .collect();
     let heap = ctx.heap();
     args.iter()
-        .map(|value| {
+        .zip(stacks)
+        .map(|(value, stack)| {
+            if let Some(stack) = stack {
+                return stack;
+            }
             // A console argument is inspected, not coerced with `ToString`:
             // a BigInt keeps the `n` suffix that distinguishes it from the
             // Number with the same digits.
@@ -184,12 +202,12 @@ fn format_args(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Vec<String> {
             {
                 let rendered = error_classes::render_error_to_string(value, heap);
                 if rendered.is_empty() {
-                    value.display_string(ctx.heap())
+                    value.display_string(heap)
                 } else {
                     rendered
                 }
             } else {
-                value.display_string(ctx.heap())
+                value.display_string(heap)
             }
         })
         .collect()

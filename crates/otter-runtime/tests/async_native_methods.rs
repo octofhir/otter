@@ -187,6 +187,16 @@ fn hostless_factory_probe(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Va
     })
 }
 
+fn hostless_ready_probe(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+    ctx.scope(|scope| {
+        let mut cx = MarshalCx::new(scope);
+        let promise = cx
+            .promise_from_future(|| std::future::ready(Ok::<f64, JsError>(7.0)))
+            .map_err(|error| error.into_native("hostlessReadyProbe"))?;
+        Ok(cx.escape(promise))
+    })
+}
+
 /// Host class whose async body records whether completion admission happened first.
 #[derive(Debug, Clone, HostClass)]
 pub struct AdmissionProbe {
@@ -343,8 +353,10 @@ async fn exhausted_host_capacity_rejects_before_the_future_is_polled() -> Result
     Ok(())
 }
 
+/// With no executor a future that would wait cannot be driven: the call
+/// throws, and the future is dropped after its one poll.
 #[test]
-fn hostless_embedding_rejects_before_constructing_the_future() {
+fn hostless_embedding_rejects_a_future_that_would_wait() {
     HOSTLESS_FACTORY_CALLED.store(false, Ordering::Release);
     let mut runtime = Runtime::builder().build().expect("hostless runtime");
     runtime
@@ -367,7 +379,26 @@ fn hostless_embedding_rejects_before_constructing_the_future() {
         .expect("hostless admission failure is catchable");
 
     assert_eq!(result.completion_string(), "TypeError:true");
-    assert!(!HOSTLESS_FACTORY_CALLED.load(Ordering::Acquire));
+    assert!(HOSTLESS_FACTORY_CALLED.load(Ordering::Acquire));
+}
+
+/// With no executor a future that is ready at once still settles — the
+/// data-only methods a browser embedding has (`Blob.text()`, a digest).
+#[test]
+fn hostless_embedding_settles_a_future_that_is_ready_at_once() {
+    let mut runtime = Runtime::builder().build().expect("hostless runtime");
+    runtime
+        .install_native_global("hostlessReadyProbe", 0, hostless_ready_probe)
+        .expect("probe installs");
+    runtime
+        .eval(SourceInput::from_javascript(
+            "globalThis.out = 'pending'; hostlessReadyProbe().then(v => { out = 'ready:' + v; });",
+        ))
+        .expect("a ready future settles");
+    let result = runtime
+        .eval(SourceInput::from_javascript("out"))
+        .expect("reads");
+    assert_eq!(result.completion_string(), "ready:7");
 }
 
 /// Immediately-ready future: settles through the pre-settled promise

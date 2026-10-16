@@ -301,7 +301,8 @@ impl<'rt, 'cx, 's> MarshalCx<'rt, 'cx, 's> {
     /// Variant of [`Self::promise_from_future`] whose admitted factory also
     /// returns an isolate-local sidecar, such as a cancellation handle.
     /// Admission still precedes both values' construction. An embedding with
-    /// no completion sink fails before the factory is invoked.
+    /// no completion sink polls the future once: one ready at once settles,
+    /// and one that would wait fails with a `TypeError`.
     pub fn promise_from_future_with<R, F, Sidecar, Make>(
         &mut self,
         make: Make,
@@ -311,15 +312,21 @@ impl<'rt, 'cx, 's> MarshalCx<'rt, 'cx, 's> {
         F: Future<Output = Result<R, JsError>> + Send + 'static,
         Make: FnOnce() -> (Sidecar, F),
     {
-        let sink = self
-            .ctx()
-            .interp_mut()
-            .host_completion_sink()
-            .ok_or_else(|| {
-                JsError::Type(
+        let Some(sink) = self.ctx().interp_mut().host_completion_sink() else {
+            // With no executor a future can still be polled once: one that is
+            // ready at once — a data-only method such as `Blob.text()` or a
+            // digest — settles as it would with a sink. One that would wait
+            // cannot be driven, and is dropped unpolled-again.
+            let (sidecar, future) = make();
+            let mut pinned = std::pin::pin!(future);
+            let mut poll_cx = Context::from_waker(Waker::noop());
+            return match pinned.as_mut().poll(&mut poll_cx) {
+                Poll::Ready(result) => self.settled(result).map(|promise| (promise, sidecar)),
+                Poll::Pending => Err(JsError::Type(
                     "async host completions are not available in this embedding".to_string(),
-                )
-            })?;
+                )),
+            };
+        };
         // Constructing or polling a future may start I/O or register reactor
         // state. Reserve its terminal completion before either operation.
         let admission = sink.admit().map_err(JsError::Type)?;
@@ -341,15 +348,7 @@ impl<'rt, 'cx, 's> MarshalCx<'rt, 'cx, 's> {
             sink.with_executor_context(&mut poll_once);
         }
         if let Some(result) = ready {
-            let promise = match result {
-                Ok(value) => value
-                    .into_js(self)
-                    .and_then(|out| self.promise_fulfilled(out)),
-                Err(error) if error.is_out_of_memory() => Err(error),
-                Err(error) => self
-                    .error_value(error)
-                    .and_then(|reason| self.promise_rejected(reason)),
-            };
+            let promise = self.settled(result);
             let outcome = if promise.is_ok() {
                 HostCompletionOutcome::Completed
             } else {
@@ -363,6 +362,20 @@ impl<'rt, 'cx, 's> MarshalCx<'rt, 'cx, 's> {
         let (promise, completer) = self.promise_pending_admitted(sink.clone(), admission)?;
         sink.spawn(Box::pin(drive(pinned, completer)));
         Ok((promise, sidecar))
+    }
+
+    /// A promise already settled with `result`, for a future that finished
+    /// on its first poll.
+    fn settled<R: IntoJs>(&mut self, result: Result<R, JsError>) -> Result<Local<'s>, JsError> {
+        match result {
+            Ok(value) => value
+                .into_js(self)
+                .and_then(|out| self.promise_fulfilled(out)),
+            Err(error) if error.is_out_of_memory() => Err(error),
+            Err(error) => self
+                .error_value(error)
+                .and_then(|reason| self.promise_rejected(reason)),
+        }
     }
 }
 

@@ -289,6 +289,41 @@ fn compile_chain_call_into(
                     _ => unreachable!("guarded by matches!"),
                 }
             }
+            // §13.3.9.1 — `o.#m()` heading a chain calls with this = o, as
+            // a static member does.
+            expr if matches!(
+                expression_as_chain_element(expr),
+                Some(ChainObjectRef::Private(_))
+            ) =>
+            {
+                let Some(ChainObjectRef::Private(m)) = expression_as_chain_element(expr) else {
+                    unreachable!("guarded by matches!");
+                };
+                let mspan = (m.span.start, m.span.end);
+                let obj_reg = compile_chain_object(cx, &m.object, &mut exits)?;
+                if m.optional {
+                    let pc = cx.emit_branch_placeholder(Op::JumpIfNullish, Some(obj_reg), mspan);
+                    exits.push(pc);
+                }
+                crate::class::emit_private_method_brand_check(
+                    cx,
+                    obj_reg,
+                    m.field.name.as_str(),
+                    mspan,
+                )?;
+                let key_reg = crate::class::load_private_key(cx, m.field.name.as_str(), mspan)?;
+                let callee = cx.alloc_scratch();
+                cx.emit(
+                    Op::PrivateGet,
+                    vec![
+                        Operand::Register(callee),
+                        Operand::Register(obj_reg),
+                        Operand::Register(key_reg),
+                    ],
+                    mspan,
+                );
+                (callee, Some(obj_reg))
+            }
             expr => (compile_chain_callee(cx, expr, &mut exits)?, None),
         }
     };

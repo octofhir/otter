@@ -639,7 +639,11 @@ pub(crate) fn resolve_ctx_with_mode(
                 reason: format!("invalid time zone: {tz}"),
             })?)
         }
-        None => None,
+        // §11.1.2 step 32 — no timeZone is DefaultTimeZone(): the host's,
+        // the same one `Date` reads local time in. Left unresolved, the
+        // formatter computed wall-clock time in the host zone but named it
+        // UTC, and resolvedOptions() said UTC.
+        None => ctx.interp_mut().local_time_zone.identifier(),
     };
 
     let weekday = enum_opt!("weekday", TEXT, parse_text_width);

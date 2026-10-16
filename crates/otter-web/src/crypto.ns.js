@@ -21,6 +21,10 @@
   const nativePbkdf2 = natives.pbkdf2;
   const nativeAesGcmEncrypt = natives.aesGcmEncrypt;
   const nativeAesGcmDecrypt = natives.aesGcmDecrypt;
+  const nativeAesCbc = natives.aesCbc;
+  const nativeAesCtr = natives.aesCtr;
+  // The AES modes a key may be made for, which share key handling.
+  const AES_MODES = new Set(['AES-GCM', 'AES-CBC', 'AES-CTR']);
   const nativeRandomUUID = crypto.randomUUID;
 
   function tagged(proto, tag) {
@@ -117,6 +121,24 @@
     return key;
   }
 
+  // AES-CBC (§27) and AES-CTR (§26): the key must have been made for the
+  // mode asked for, and a failure is an OperationError.
+  function aesBlockMode(encrypt, algo, key, data) {
+    if (!(key instanceof CryptoKey)) throw new TypeError('key must be a CryptoKey');
+    if (key[kAlgorithm].name !== algo.name) {
+      throw new DOMException(`the key is not an ${algo.name} key`, 'InvalidAccessError');
+    }
+    const input = requireBufferSource(data, 'data');
+    try {
+      if (algo.name === 'AES-CBC') {
+        return nativeAesCbc(encrypt, key[kMaterial], requireBufferSource(algo.iv, 'iv'), input);
+      }
+      return nativeAesCtr(key[kMaterial], requireBufferSource(algo.counter, 'counter'), Number(algo.length), input);
+    } catch (err) {
+      throw new DOMException(String(err && err.message || err), 'OperationError');
+    }
+  }
+
   class SubtleCrypto {
     constructor() { throw new TypeError('Illegal constructor'); }
 
@@ -138,13 +160,13 @@
         return makeKey(material, { name: 'HMAC', hash: { name: hash }, length: length * 8 },
           'secret', extractable, usages);
       }
-      if (algo.name === 'AES-GCM') {
+      if (AES_MODES.has(algo.name)) {
         const length = Number(algo.length);
-        if (length !== 128 && length !== 256) {
-          throw new DOMException('AES-GCM key length must be 128 or 256', 'OperationError');
+        if (length !== 128 && length !== 192 && length !== 256) {
+          throw new DOMException(`${algo.name} key length must be 128, 192 or 256`, 'OperationError');
         }
         const material = crypto.getRandomValues(new Uint8Array(length / 8));
-        return makeKey(material, { name: 'AES-GCM', length }, 'secret', extractable, usages);
+        return makeKey(material, { name: algo.name, length }, 'secret', extractable, usages);
       }
       throw new DOMException(`generateKey: unsupported algorithm ${algo.name}`, 'NotSupportedError');
     }
@@ -164,8 +186,11 @@
         return makeKey(bytes, { name: 'HMAC', hash: { name: hash }, length: bytes.length * 8 },
           'secret', extractable, usages);
       }
-      if (algo.name === 'AES-GCM') {
-        return makeKey(bytes, { name: 'AES-GCM', length: bytes.length * 8 }, 'secret', extractable, usages);
+      if (AES_MODES.has(algo.name)) {
+        if (![16, 24, 32].includes(bytes.length)) {
+          throw new DOMException(`${algo.name} key data must be 128, 192 or 256 bits`, 'DataError');
+        }
+        return makeKey(bytes, { name: algo.name, length: bytes.length * 8 }, 'secret', extractable, usages);
       }
       if (algo.name === 'PBKDF2') {
         return makeKey(bytes, { name: 'PBKDF2' }, 'secret', false, usages);
@@ -206,6 +231,9 @@
 
     async encrypt(algorithm, key, data) {
       const algo = normalizeAlgorithm(algorithm);
+      if (algo.name === 'AES-CBC' || algo.name === 'AES-CTR') {
+        return aesBlockMode(true, algo, key, data);
+      }
       if (algo.name !== 'AES-GCM') {
         throw new DOMException(`encrypt: unsupported algorithm ${algo.name}`, 'NotSupportedError');
       }
@@ -217,6 +245,9 @@
 
     async decrypt(algorithm, key, data) {
       const algo = normalizeAlgorithm(algorithm);
+      if (algo.name === 'AES-CBC' || algo.name === 'AES-CTR') {
+        return aesBlockMode(false, algo, key, data);
+      }
       if (algo.name !== 'AES-GCM') {
         throw new DOMException(`decrypt: unsupported algorithm ${algo.name}`, 'NotSupportedError');
       }

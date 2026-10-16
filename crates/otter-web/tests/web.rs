@@ -198,6 +198,44 @@ fn subtle_crypto_hmac_aes_gcm_and_pbkdf2() {
     assert_eq!(after, "32:true:false:secret|true:message|32");
 }
 
+/// AES-CBC and AES-CTR against the NIST SP 800-38A vectors (F.2.1, F.5.1),
+/// with WebCrypto's PKCS #7 padding on CBC.
+#[test]
+fn subtle_crypto_aes_cbc_and_ctr() {
+    let mut runtime = Runtime::builder().with_web_apis().build().unwrap();
+    let result = eval_string(
+        &mut runtime,
+        r#"
+        globalThis.out = "pending";
+        const hex = (s) => new Uint8Array(s.match(/../g).map((b) => parseInt(b, 16)));
+        const show = (buffer) => Array.from(new Uint8Array(buffer), (b) => b.toString(16).padStart(2, "0")).join("");
+        (async () => {
+          const raw = hex("2b7e151628aed2a6abf7158809cf4f3c");
+          const plain = hex("6bc1bee22e409f96e93d7e117393172a");
+          const cbc = await crypto.subtle.importKey("raw", raw, "AES-CBC", false, ["encrypt", "decrypt"]);
+          const iv = hex("000102030405060708090a0b0c0d0e0f");
+          const sealed = await crypto.subtle.encrypt({ name: "AES-CBC", iv }, cbc, plain);
+          const opened = await crypto.subtle.decrypt({ name: "AES-CBC", iv }, cbc, sealed);
+          const ctr = await crypto.subtle.importKey("raw", raw, "AES-CTR", false, ["encrypt", "decrypt"]);
+          const counter = hex("f0f1f2f3f4f5f6f7f8f9fafbfcfdfeff");
+          const streamed = await crypto.subtle.encrypt({ name: "AES-CTR", counter, length: 64 }, ctr, plain);
+          const back = await crypto.subtle.decrypt({ name: "AES-CTR", counter, length: 64 }, ctr, streamed);
+          let wrongKey = "accepted";
+          try { await crypto.subtle.encrypt({ name: "AES-CBC", iv }, ctr, plain); } catch (e) { wrongKey = e.name; }
+          let badPadding = "accepted";
+          try { await crypto.subtle.decrypt({ name: "AES-CBC", iv }, cbc, sealed.slice(0, 16)); } catch (e) { badPadding = e.name; }
+          globalThis.out = [show(sealed).slice(0, 32), sealed.byteLength, show(opened), show(streamed), show(back), wrongKey, badPadding].join("|");
+        })().catch((e) => { globalThis.out = "ERR:" + e.name + ":" + e.message; });
+        "pending"
+        "#,
+    );
+    assert_eq!(result, "pending");
+    assert_eq!(
+        eval_string(&mut runtime, "out"),
+        "7649abac8119b246cee98e9b12e9197d|32|6bc1bee22e409f96e93d7e117393172a|874d6191b620e3261bef6864990db6ce|6bc1bee22e409f96e93d7e117393172a|InvalidAccessError|OperationError"
+    );
+}
+
 #[test]
 fn byte_stream_serves_default_and_byob_reads() {
     let mut runtime = Runtime::builder().with_web_apis().build().unwrap();

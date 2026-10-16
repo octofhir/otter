@@ -31,8 +31,6 @@
 
 pub(crate) mod ast;
 
-use std::collections::BTreeSet;
-
 use crate::classes::{ClassSet, CodePointSet};
 use crate::error::RegexError;
 use crate::flags::Flags;
@@ -102,54 +100,81 @@ pub(crate) fn parse(pattern: &[u16], flags: Flags) -> Result<Parsed, RegexError>
     })
 }
 
+/// §22.2.1.1 — two groups may share a name only when no match can take part
+/// in both: some disjunction holds them in different alternatives
+/// (MightBothParticipate is false).
+///
+/// Each named group is described by the alternatives it sits in, outermost
+/// first: `(disjunction, alternative)` pairs. Two groups are kept apart
+/// exactly when, where their descriptions first differ, they name the same
+/// disjunction and different alternatives of it. Comparing descriptions
+/// pairwise per name is linear in the pattern for the common case of no
+/// shared names, where enumerating every path through the pattern doubled
+/// with each alternation in a row — `(a|b)(c|d)…` — and never finished on
+/// a pattern of a few dozen of them.
 fn validate_duplicate_named_groups_by_path(root: &Node) -> Result<(), RegexError> {
-    let initial = vec![BTreeSet::new()];
-    validate_names(root, initial).map(|_| ())
+    let mut named: Vec<(&str, Vec<(usize, usize)>)> = Vec::new();
+    let mut path = Vec::new();
+    let mut disjunctions = 0;
+    collect_named_groups(root, &mut path, &mut disjunctions, &mut named);
+    for (index, (name, place)) in named.iter().enumerate() {
+        for (other, other_place) in &named[index + 1..] {
+            if name != other {
+                continue;
+            }
+            let apart = place
+                .iter()
+                .zip(other_place)
+                .find(|(one, two)| one != two)
+                .is_some_and(|(one, two)| one.0 == two.0);
+            if !apart {
+                return Err(RegexError::Syntax {
+                    message: "duplicate named capturing group in the same alternative".to_string(),
+                    offset: 0,
+                });
+            }
+        }
+    }
+    Ok(())
 }
 
-fn validate_names(
-    node: &Node,
-    states: Vec<BTreeSet<String>>,
-) -> Result<Vec<BTreeSet<String>>, RegexError> {
+/// Every named group under `node`, with the alternatives it sits in.
+fn collect_named_groups<'n>(
+    node: &'n Node,
+    path: &mut Vec<(usize, usize)>,
+    disjunctions: &mut usize,
+    named: &mut Vec<(&'n str, Vec<(usize, usize)>)>,
+) {
     match node {
         Node::Empty
         | Node::Char { .. }
         | Node::AnyChar { .. }
         | Node::Class { .. }
         | Node::Assert(_)
-        | Node::BackRef { .. } => Ok(states),
+        | Node::BackRef { .. } => {}
         Node::Concat(nodes) => {
-            let mut current = states;
             for node in nodes {
-                current = validate_names(node, current)?;
+                collect_named_groups(node, path, disjunctions, named);
             }
-            Ok(current)
         }
         Node::Alternate(alts) => {
-            let mut out = Vec::new();
-            for alt in alts {
-                out.extend(validate_names(alt, states.clone())?);
+            let id = *disjunctions;
+            *disjunctions += 1;
+            for (branch, alt) in alts.iter().enumerate() {
+                path.push((id, branch));
+                collect_named_groups(alt, path, disjunctions, named);
+                path.pop();
             }
-            Ok(out)
         }
-        Node::Repeat { node, .. } => validate_names(node, states),
+        Node::Repeat { node, .. } => collect_named_groups(node, path, disjunctions, named),
         Node::Group { kind, body } => {
-            let mut states = states;
             if let GroupKind::Capturing {
                 name: Some(name), ..
             } = kind
             {
-                for state in &mut states {
-                    if !state.insert(name.clone()) {
-                        return Err(RegexError::Syntax {
-                            message: "duplicate named capturing group in the same alternative"
-                                .to_string(),
-                            offset: 0,
-                        });
-                    }
-                }
+                named.push((name.as_str(), path.clone()));
             }
-            validate_names(body, states)
+            collect_named_groups(body, path, disjunctions, named);
         }
     }
 }

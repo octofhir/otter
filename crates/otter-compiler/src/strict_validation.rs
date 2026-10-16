@@ -2414,7 +2414,16 @@ impl<'a> Visit<'a> for BlockLexicalValidator {
         let inner_strict = self.strict() || body_strict;
         self.strict_stack.push(inner_strict);
         let saved_labels = std::mem::take(&mut self.label_stack);
+        // An async arrow's `await` is its own, whatever block the arrow sits
+        // in: a static block's restriction stops at the arrow (§15.7.1
+        // ContainsAwait does not look into an AsyncArrowFunction).
+        let saved_static = if it.r#async {
+            std::mem::replace(&mut self.in_static_block, false)
+        } else {
+            self.in_static_block
+        };
         walk::walk_arrow_function_expression(self, it);
+        self.in_static_block = saved_static;
         self.label_stack = saved_labels;
         self.strict_stack.pop();
     }

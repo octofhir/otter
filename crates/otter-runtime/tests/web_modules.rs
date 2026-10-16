@@ -517,3 +517,22 @@ fn tagged_templates_work_in_inline_and_delivered_modules() {
     );
     assert_eq!(log(&mut runtime), "a|b|c:1,2,x|z:y,true");
 }
+
+#[test]
+fn calling_something_that_is_not_a_function_names_it() {
+    let (mut runtime, map) = page();
+    run_inline(
+        &mut runtime,
+        &map,
+        0,
+        r#"
+        const api = {};
+        try { api.missing(1, (x) => x); } catch (error) { log.push(error.message); }
+        try { (0, api.other)(); } catch (error) { log.push(error.message); }
+        "#,
+    );
+    assert_eq!(
+        log(&mut runtime),
+        "api.missing is not a function,(0, api.other) is not a function"
+    );
+}

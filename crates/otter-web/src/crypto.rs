@@ -80,6 +80,129 @@ fn pbkdf2_derive(
 
 /// AES-GCM encrypt/decrypt. `key` is 16 or 32 bytes (AES-128/256); `iv` is the
 /// 12-byte nonce. Decrypt returns an error on tag mismatch.
+/// One AES block cipher, of the key's size.
+enum AesBlock {
+    A128(aes_gcm::aes::Aes128),
+    A192(aes_gcm::aes::Aes192),
+    A256(aes_gcm::aes::Aes256),
+}
+
+impl AesBlock {
+    fn new(key: &[u8], algorithm: &str) -> Result<Self, JsError> {
+        use aes_gcm::aes::cipher::KeyInit as _;
+        let wrong = || JsError::Type(format!("{algorithm}: the key must be 16, 24 or 32 bytes"));
+        Ok(match key.len() {
+            16 => Self::A128(aes_gcm::aes::Aes128::new_from_slice(key).map_err(|_| wrong())?),
+            24 => Self::A192(aes_gcm::aes::Aes192::new_from_slice(key).map_err(|_| wrong())?),
+            32 => Self::A256(aes_gcm::aes::Aes256::new_from_slice(key).map_err(|_| wrong())?),
+            _ => return Err(wrong()),
+        })
+    }
+
+    fn encrypt(&self, block: &mut [u8; 16]) {
+        use aes_gcm::aes::cipher::BlockEncrypt as _;
+        let block = aes_gcm::aes::Block::from_mut_slice(block);
+        match self {
+            Self::A128(cipher) => cipher.encrypt_block(block),
+            Self::A192(cipher) => cipher.encrypt_block(block),
+            Self::A256(cipher) => cipher.encrypt_block(block),
+        }
+    }
+
+    fn decrypt(&self, block: &mut [u8; 16]) {
+        use aes_gcm::aes::cipher::BlockDecrypt as _;
+        let block = aes_gcm::aes::Block::from_mut_slice(block);
+        match self {
+            Self::A128(cipher) => cipher.decrypt_block(block),
+            Self::A192(cipher) => cipher.decrypt_block(block),
+            Self::A256(cipher) => cipher.decrypt_block(block),
+        }
+    }
+}
+
+/// AES-CBC with PKCS #7 padding (WebCrypto §27).
+fn aes_cbc(encrypt: bool, key: &[u8], iv: &[u8], input: &[u8]) -> Result<Vec<u8>, JsError> {
+    let cipher = AesBlock::new(key, "AES-CBC")?;
+    let mut previous: [u8; 16] = iv
+        .try_into()
+        .map_err(|_| JsError::Type("AES-CBC: the iv must be 16 bytes".to_string()))?;
+    let mut out = Vec::with_capacity(input.len() + 16);
+    if encrypt {
+        let pad = 16 - input.len() % 16;
+        let mut padded = input.to_vec();
+        padded.resize(input.len() + pad, pad as u8);
+        for chunk in padded.as_chunks::<16>().0 {
+            let mut block = [0u8; 16];
+            for (at, byte) in block.iter_mut().enumerate() {
+                *byte = chunk[at] ^ previous[at];
+            }
+            cipher.encrypt(&mut block);
+            out.extend_from_slice(&block);
+            previous = block;
+        }
+        return Ok(out);
+    }
+    let failed = || JsError::Type("AES-CBC decryption failed (bad key, iv or padding)".to_string());
+    if input.is_empty() || !input.len().is_multiple_of(16) {
+        return Err(failed());
+    }
+    for chunk in input.as_chunks::<16>().0 {
+        let mut block = *chunk;
+        cipher.decrypt(&mut block);
+        for (at, byte) in block.iter_mut().enumerate() {
+            *byte ^= previous[at];
+        }
+        out.extend_from_slice(&block);
+        previous.copy_from_slice(chunk);
+    }
+    let pad = usize::from(*out.last().expect("at least one block"));
+    if pad == 0
+        || pad > 16
+        || !out[out.len() - pad..]
+            .iter()
+            .all(|byte| usize::from(*byte) == pad)
+    {
+        return Err(failed());
+    }
+    out.truncate(out.len() - pad);
+    Ok(out)
+}
+
+/// AES-CTR (WebCrypto §26): the rightmost `length` bits of `counter` count
+/// blocks, wrapping within those bits; the rest is a fixed nonce. The same
+/// operation encrypts and decrypts.
+fn aes_ctr(key: &[u8], counter: &[u8], length: u32, input: &[u8]) -> Result<Vec<u8>, JsError> {
+    let cipher = AesBlock::new(key, "AES-CTR")?;
+    let start: [u8; 16] = counter
+        .try_into()
+        .map_err(|_| JsError::Type("AES-CTR: the counter must be 16 bytes".to_string()))?;
+    if !(1..=128).contains(&length) {
+        return Err(JsError::Type(
+            "AES-CTR: the counter length must be 1 to 128 bits".to_string(),
+        ));
+    }
+    let blocks = input.len().div_ceil(16) as u128;
+    if length < 128 && blocks > 1u128 << length {
+        return Err(JsError::Type(
+            "AES-CTR: the data is longer than the counter can count".to_string(),
+        ));
+    }
+    let whole = u128::from_be_bytes(start);
+    let mask = if length == 128 {
+        u128::MAX
+    } else {
+        (1u128 << length) - 1
+    };
+    let mut out = Vec::with_capacity(input.len());
+    for (index, chunk) in input.chunks(16).enumerate() {
+        let count = (whole & mask).wrapping_add(index as u128) & mask;
+        let mut block = ((whole & !mask) | count).to_be_bytes();
+        cipher.encrypt(&mut block);
+        out.extend(chunk.iter().zip(block).map(|(byte, key)| byte ^ key));
+    }
+    Ok(out)
+}
+
 fn aes_gcm(
     encrypt: bool,
     key: &[u8],
@@ -252,6 +375,28 @@ impl WebCrypto {
         data: BufferSource,
     ) -> Result<ArrayBuffer, JsError> {
         aes_gcm(true, key.as_ref(), iv.as_ref(), aad.as_ref(), data.as_ref()).map(ArrayBuffer)
+    }
+
+    /// AES-CBC encrypt (`encrypt` true) or decrypt with PKCS #7 padding.
+    #[method(name = "__aesCbc")]
+    fn native_aes_cbc(
+        encrypt: bool,
+        key: BufferSource,
+        iv: BufferSource,
+        data: BufferSource,
+    ) -> Result<ArrayBuffer, JsError> {
+        aes_cbc(encrypt, key.as_ref(), iv.as_ref(), data.as_ref()).map(ArrayBuffer)
+    }
+
+    /// AES-CTR over `data`, counting in the rightmost `length` bits.
+    #[method(name = "__aesCtr")]
+    fn native_aes_ctr(
+        key: BufferSource,
+        counter: BufferSource,
+        length: f64,
+        data: BufferSource,
+    ) -> Result<ArrayBuffer, JsError> {
+        aes_ctr(key.as_ref(), counter.as_ref(), length as u32, data.as_ref()).map(ArrayBuffer)
     }
 
     /// AES-GCM decrypt: the inverse of [`Self::native_aes_gcm_encrypt`]; errors

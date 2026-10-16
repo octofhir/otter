@@ -38,8 +38,9 @@ use crate::{CompileError, ImportRequest, ModuleHostInfo, module_export_name_to_s
 /// This is deliberately below the decoded bytecode admission ceiling. A
 /// hostile cache entry or generated source cannot use otherwise-valid span
 /// records to trigger an unbounded second materialization at the runtime
-/// boundary.
-pub const MAX_COMPILED_METADATA_BYTES: usize = 32 * 1024 * 1024;
+/// boundary. Real pages need room: a 10.9 MB bundle (YouTube's main script)
+/// maps about 1.8 million program counters, some 22 MB of spans.
+pub const MAX_COMPILED_METADATA_BYTES: usize = 64 * 1024 * 1024;
 
 /// Frozen compiler/runtime boundary product for one source module.
 ///
@@ -239,7 +240,7 @@ impl CompiledModuleMetadata {
         Ok(Self {
             source_url: try_clone_metadata_string(source_url, materialized_bytes)?,
             source_kind,
-            function_spans: compiled_spans_from_bytecode(bytecode, materialized_bytes)?,
+            function_spans: compiled_spans_from_bytecode(bytecode, source_url, materialized_bytes)?,
             imports: Vec::new(),
             exports: Vec::new(),
             live_binding_slots: Vec::new(),
@@ -260,11 +261,27 @@ pub struct CompiledFunctionSpans {
     pub function_id: u32,
     /// Function name for diagnostics and dumps.
     pub function_name: String,
-    /// Module URL carried by the function, falling back to the top-level
-    /// bytecode module name when the function is script-local.
+    /// Module URL carried by the function, or empty when it is the
+    /// metadata's own `source_url` — which it is for nearly every function,
+    /// and a long URL copied into each of a bundle's tens of thousands of
+    /// functions costs more than their spans. Read it through
+    /// [`Self::module_url_in`].
     pub module_url: String,
     /// Compact program-counter/source-range entries for this function.
     pub spans: Vec<SpanEntry>,
+}
+
+impl CompiledFunctionSpans {
+    /// The module URL these spans belong to, given the `source_url` of the
+    /// metadata that holds them.
+    #[must_use]
+    pub fn module_url_in<'a>(&'a self, source_url: &'a str) -> &'a str {
+        if self.module_url.is_empty() {
+            source_url
+        } else {
+            &self.module_url
+        }
+    }
 }
 
 /// Import metadata emitted by the compiler.
@@ -383,7 +400,13 @@ fn compiled_metadata_materialized_bytes(
         bytes = bytes
             .checked_add(std::mem::size_of::<CompiledFunctionSpans>())
             .and_then(|bytes| bytes.checked_add(function.name.len()))
-            .and_then(|bytes| bytes.checked_add(module_url.len()))
+            .and_then(|bytes| {
+                bytes.checked_add(if module_url == source_url {
+                    0
+                } else {
+                    module_url.len()
+                })
+            })
             .and_then(|bytes| {
                 function
                     .spans
@@ -401,6 +424,7 @@ fn compiled_metadata_materialized_bytes(
 
 fn compiled_spans_from_bytecode(
     bytecode: &BytecodeModule,
+    source_url: &str,
     materialized_bytes: usize,
 ) -> Result<Vec<CompiledFunctionSpans>, CompileError> {
     let function_count = bytecode
@@ -435,7 +459,11 @@ fn compiled_spans_from_bytecode(
         function_spans.push(CompiledFunctionSpans {
             function_id: function.id,
             function_name: try_clone_metadata_string(&function.name, materialized_bytes)?,
-            module_url: try_clone_metadata_string(module_url, materialized_bytes)?,
+            module_url: if module_url == source_url {
+                String::new()
+            } else {
+                try_clone_metadata_string(module_url, materialized_bytes)?
+            },
             spans,
         });
     }
@@ -800,7 +828,7 @@ mod tests {
                 (
                     function.function_id,
                     function.function_name.as_str(),
-                    function.module_url.as_str(),
+                    function.module_url_in(&metadata.source_url),
                     function.spans.clone(),
                 )
             })
@@ -862,6 +890,37 @@ mod tests {
         let decoded: CompiledModuleMetadata =
             serde_json::from_value(encoded).expect("grouped metadata deserializes");
         assert_eq!(decoded, metadata);
+    }
+
+    #[test]
+    fn functions_of_the_source_itself_do_not_repeat_its_url() {
+        let url = format!("https://example.com/{}.js", "long".repeat(64));
+        let bytecode = compile_script_source(
+            "function a() { return 1; } function b() { return a(); } b();",
+            SyntaxSourceKind::JavaScript,
+            &url,
+        )
+        .expect("script compiles");
+        let metadata = CompiledModuleMetadata::span_only_from_bytecode(&bytecode)
+            .expect("metadata fits its budget");
+
+        assert!(metadata.function_spans.len() >= 3);
+        for function in &metadata.function_spans {
+            assert!(function.module_url.is_empty());
+            assert_eq!(function.module_url_in(&metadata.source_url), url);
+        }
+        let bytes = compiled_metadata_materialized_bytes(&bytecode, &bytecode.module)
+            .expect("size is countable");
+        let per_function: usize = metadata
+            .function_spans
+            .iter()
+            .map(|function| {
+                std::mem::size_of::<CompiledFunctionSpans>()
+                    + function.function_name.len()
+                    + function.spans.len() * std::mem::size_of::<SpanEntry>()
+            })
+            .sum();
+        assert_eq!(bytes, url.len() + per_function, "the URL is counted once");
     }
 
     #[test]

@@ -2229,7 +2229,7 @@ impl RuntimeSourceMapTable {
         }
         for function in &metadata.function_spans {
             replacements
-                .entry(function.module_url.clone())
+                .entry(function.module_url_in(&metadata.source_url).to_owned())
                 .or_default()
                 .entry(function.function_id)
                 .or_default()

@@ -104,7 +104,10 @@ fn blob_constructor_assembles_parts_and_async_reads() {
 #[test]
 fn blob_backing_bytes_are_charged_against_the_heap_cap() {
     // 8 MiB heap cap; a 32 MiB Blob's backing store must be rejected as a
-    // typed error before the host object exists, while a small Blob fits.
+    // catchable error before the host object exists, while a small Blob fits.
+    // Heap exhaustion keeps its canonical class across the binding: the
+    // RangeError every other refused allocation throws, not a TypeError the
+    // binding used to flatten it to.
     let mut runtime = Runtime::builder()
         .with_web_apis()
         .max_heap_bytes(8 * 1024 * 1024)
@@ -123,7 +126,9 @@ fn blob_backing_bytes_are_charged_against_the_heap_cap() {
           try {
             retained.push(new Blob([payload]));
           } catch (error) {
-            outcome = error instanceof TypeError ? "rejected@" + (i < 16) : "wrong: " + error;
+            outcome = error instanceof RangeError && /out of memory/.test(error.message)
+              ? "rejected@" + (i < 16)
+              : "wrong: " + error;
             break;
           }
         }

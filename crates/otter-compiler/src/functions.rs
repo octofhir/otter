@@ -197,6 +197,7 @@ pub(crate) fn compile_function_impl(
     let is_method = std::mem::take(&mut parent.next_fn_is_method);
     let hinted_home = std::mem::take(&mut parent.next_fn_has_home);
     let hinted_derived_ctor = std::mem::take(&mut parent.next_fn_derived_ctor);
+    let class_ctor = std::mem::take(&mut parent.next_fn_class_ctor);
     let static_home = std::mem::take(&mut parent.next_fn_static_home);
     let source_text_span = std::mem::take(&mut parent.next_fn_source_text_span);
     let module = Rc::clone(&parent.top_mut().module);
@@ -287,7 +288,7 @@ pub(crate) fn compile_function_impl(
     child.dot_arguments_observed = parent.dot_arguments_observed;
     child.active_with_envs = active_with_envs;
     child.is_async_generator = is_async_generator;
-    child.proper_tail_calls = !is_async && !is_generator;
+    child.proper_tail_calls = !is_async && !is_generator && !class_ctor;
     let formal_names: Vec<String> = formal_parameter_bound_names(params);
     let mut self_name_referenced = false;
     if let Some(facts) = facts {

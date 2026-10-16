@@ -165,6 +165,7 @@ pub(crate) fn compile_class_constructor(
         .is_some_and(|methods| !methods.is_empty());
     parent.next_fn_has_home = true;
     parent.next_fn_derived_ctor = is_derived;
+    parent.next_fn_class_ctor = true;
     let fields = (!instance_fields.is_empty() || needs_brand).then_some(FieldInjection {
         fields: instance_fields,
         is_derived,

@@ -25,6 +25,30 @@ use crate::{ActivationStack, ExecutionContext, Interpreter, Value, VmError};
 use crate::{error_classes, object};
 
 impl Interpreter {
+    /// "`callee` is not a function", naming the callee as the source spells
+    /// it at the innermost call site — what a reader needs to find the call —
+    /// or the generic wording when there is no source or no call to name.
+    fn not_callable_message(&self, context: Option<&ExecutionContext>) -> String {
+        let mut callee = None;
+        if let Some(context) = context {
+            self.visit_active_frame_snapshots(context, 1, |frame| {
+                callee = frame
+                    .source
+                    .and_then(|source| {
+                        source
+                            .text()
+                            .get(frame.span.0 as usize..frame.span.1 as usize)
+                    })
+                    .and_then(callee_of_call);
+                false
+            });
+        }
+        match callee {
+            Some(callee) => format!("{callee} is not a function"),
+            None => "value is not a function".to_string(),
+        }
+    }
+
     /// Project one VM failure to its exact JavaScript exception value.
     /// Structural/control failures return unchanged; materialization failure
     /// returns its actual typed cause. A pending user throw is consumed only
@@ -172,10 +196,16 @@ impl Interpreter {
                 dynamic_message = msg_detail();
                 (error_classes::ErrorKind::URIError, dynamic_message.as_str())
             }
-            VmError::NotCallable => (
-                error_classes::ErrorKind::TypeError,
-                "value is not a function",
-            ),
+            VmError::NotCallable => {
+                dynamic_message = match &detail {
+                    Some(ErrorDetail::Name(name)) => format!("{name} is not a function"),
+                    _ => self.not_callable_message(context),
+                };
+                (
+                    error_classes::ErrorKind::TypeError,
+                    dynamic_message.as_str(),
+                )
+            }
             VmError::TemporalDeadZone { .. } => (
                 error_classes::ErrorKind::ReferenceError,
                 "cannot access binding before initialization",
@@ -397,5 +427,52 @@ impl Interpreter {
             self.capture_error_stack_frames(context, &mut obj)?;
         }
         Ok(Value::object(obj))
+    }
+}
+
+/// The callee of a call expression's source text: what comes before the
+/// argument list that closes the call. `None` for text that is not a plain
+/// call, or a callee too long to be worth quoting.
+fn callee_of_call(call: &str) -> Option<String> {
+    const LONGEST: usize = 120;
+    let call = call.trim();
+    let call = call.strip_prefix("new ").unwrap_or(call).trim_start();
+    let inner = call.strip_suffix(')')?;
+    let mut depth = 0usize;
+    for (index, byte) in inner.bytes().enumerate().rev() {
+        match byte {
+            b')' => depth += 1,
+            b'(' if depth == 0 => {
+                let callee = inner[..index].trim_end();
+                let callee = callee.strip_suffix("?.").unwrap_or(callee).trim_end();
+                if callee.is_empty() || callee.len() > LONGEST || callee.contains('\n') {
+                    return None;
+                }
+                return Some(callee.to_string());
+            }
+            b'(' => depth -= 1,
+            _ => {}
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod callee_tests {
+    use super::callee_of_call;
+
+    #[test]
+    fn a_call_names_its_callee() {
+        assert_eq!(
+            callee_of_call("window.requestIdleCallback(() => { f(1) })").as_deref(),
+            Some("window.requestIdleCallback")
+        );
+        assert_eq!(
+            callee_of_call("(0, t.Vy)(\"x\")").as_deref(),
+            Some("(0, t.Vy)")
+        );
+        assert_eq!(callee_of_call("a.b?.(c)").as_deref(), Some("a.b"));
+        assert_eq!(callee_of_call("new Foo(1)").as_deref(), Some("Foo"));
+        assert_eq!(callee_of_call("x + 1"), None);
     }
 }

@@ -1608,6 +1608,7 @@ impl Interpreter {
             || base.is_weak_map()
             || base.is_weak_set()
             || base.is_iterator()
+            || base.is_generator()
             || base.is_promise()
             || base.is_array_buffer()
             || base.is_data_view()

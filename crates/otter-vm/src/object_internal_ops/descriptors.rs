@@ -360,6 +360,21 @@ impl Interpreter {
             }
             return Ok(None);
         }
+        if target.is_promise() || target.is_array_buffer() {
+            // Ordinary own properties live in the lazy expando.
+            if let Some(bag) = self.existing_expando(&target) {
+                if let Some(name) = key.string_name() {
+                    if let Some(desc) = object::get_own_descriptor(bag, &self.gc_heap, name) {
+                        return Ok(Some(desc));
+                    }
+                } else if let VmPropertyKey::Symbol(sym) = key
+                    && let Some(desc) = object::get_own_symbol_descriptor(bag, &self.gc_heap, *sym)
+                {
+                    return Ok(Some(desc));
+                }
+            }
+            return Ok(None);
+        }
         if target.is_intl() || target.is_iterator() {
             if let Some(bag) = self.non_gc_exotic_user_props(&target) {
                 if let Some(name) = key.string_name() {
@@ -746,6 +761,37 @@ impl Interpreter {
             return g.expando(&self.gc_heap);
         }
         None
+    }
+
+    /// The bag holding the ordinary own properties of an object kept in a
+    /// heap kind of its own (a collection, a promise, a buffer, a view, a
+    /// regular expression, a typed array, a Temporal value), if one was ever
+    /// made. `None` for such an object with no own properties yet, and for
+    /// any other value.
+    pub(crate) fn existing_expando(&self, value: &Value) -> Option<object::JsObject> {
+        if let Some(bag) = self.collection_expando(value) {
+            return Some(bag);
+        }
+        if let Some(promise) = value.as_promise() {
+            return promise.expando(&self.gc_heap);
+        }
+        if let Some(buffer) = value.as_array_buffer() {
+            return buffer.expando(&self.gc_heap);
+        }
+        if let Some(view) = value.as_data_view() {
+            return view.expando(&self.gc_heap);
+        }
+        if let Some(regexp) = value.as_regexp() {
+            return regexp.expando(&self.gc_heap);
+        }
+        if let Some(typed) = value.as_typed_array(&self.gc_heap) {
+            return typed.expando(&self.gc_heap);
+        }
+        if let Some(temporal) = value.as_temporal(&self.gc_heap) {
+            return temporal.expando(&self.gc_heap);
+        }
+        // Intl service objects and iterators keep theirs in a side table.
+        self.non_gc_exotic_user_props(value)
     }
 
     /// Materialise (or fetch) the expando bag for a Map, Set, or

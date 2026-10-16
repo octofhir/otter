@@ -229,6 +229,16 @@ impl Interpreter {
             }
             return Ok(true);
         }
+        if let Some(bag) = self.existing_expando(&target) {
+            return Ok(if let Some(name) = key.string_name() {
+                object::delete(&mut { bag }, &mut self.gc_heap, name)
+                    .map_err(|error| CommittedValueError::JavaScript(error.into()))?
+            } else if let VmPropertyKey::Symbol(sym) = key {
+                object::delete_symbol(bag, &mut self.gc_heap, *sym)
+            } else {
+                true
+            });
+        }
         Ok(true)
     }
 

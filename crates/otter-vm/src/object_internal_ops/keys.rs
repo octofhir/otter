@@ -757,11 +757,19 @@ impl Interpreter {
             }
             return Ok(keys);
         }
-        if target.is_map() || target.is_set() || target.is_generator() {
-            // Own keys on a Map/Set/Generator are exactly the lazy expando entries;
-            // size and the iterator methods are prototype properties.
+        if target.is_map()
+            || target.is_set()
+            || target.is_weak_map()
+            || target.is_weak_set()
+            || target.is_generator()
+            || target.is_promise()
+            || target.is_array_buffer()
+        {
+            // Own keys on a collection, generator, promise or buffer are
+            // exactly the lazy expando entries; size, byteLength and the
+            // methods are prototype properties.
             let mut keys = Vec::new();
-            if let Some(expando) = self.collection_expando(&target) {
+            if let Some(expando) = self.existing_expando(&target) {
                 let (strings, mut symbols): (Vec<String>, Vec<Value>) =
                     object::with_properties(expando, &self.gc_heap, |p| {
                         (

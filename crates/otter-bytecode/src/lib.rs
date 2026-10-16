@@ -1713,10 +1713,16 @@ impl Op {
             Op::MarkModuleEvaluated => pos == 0,
             // [gate_dst, url_const]
             Op::EvaluateModule => pos == 1,
-            // [reg, reg, const]
-            Op::LoadProperty | Op::HasNamedProperty | Op::DeleteProperty | Op::ToPrimitive => {
-                pos == 2
-            }
+            // [reg, reg, const]; `LoadSuperProperty` is [dst, home, name].
+            Op::LoadProperty
+            | Op::HasNamedProperty
+            | Op::DeleteProperty
+            | Op::ToPrimitive
+            | Op::LoadSuperProperty => pos == 2,
+            // [home, name_const, value]
+            Op::SetSuperProperty => pos == 1,
+            // [dst, name_const] / [value, name_const, exists]
+            Op::GlobalBindingExists | Op::StoreGlobalChecked => pos == 1,
             // [dst, url_const, name_const]
             Op::LoadImportBinding => pos == 1 || pos == 2,
             // [reg, kind_const, reg]

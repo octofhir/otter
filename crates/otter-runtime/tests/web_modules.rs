@@ -519,6 +519,40 @@ fn tagged_templates_work_in_inline_and_delivered_modules() {
 }
 
 #[test]
+fn super_property_names_survive_linking() {
+    let (mut runtime, map) = page();
+    deliver(
+        &map,
+        "https://site.test/app/base.js",
+        "const padding = ['p0', 'p1', 'p2', 'p3', 'p4', 'p5'];\n\
+         export class Base { get kind() { return 'base' + padding.length; } hello() { return 'hi'; } set value(v) { this._value = v; } }\n\
+         export class Derived extends Base {\n\
+           hello() { return super.hello && super.hello() + '!'; }\n\
+           get kind() { return super.kind + '+derived'; }\n\
+           set value(v) { super.value = v * 2; }\n\
+         }",
+    );
+    run_inline(
+        &mut runtime,
+        &map,
+        0,
+        r#"
+        const unrelated = ['u0', 'u1', 'u2', 'u3', 'u4', 'u5', 'u6', 'u7'];
+        import { Derived } from './base.js';
+        class Local extends Derived {
+          hello() { const own = super.hello; return own.call(this) + unrelated.length; }
+          get kind() { return super.kind + '+local'; }
+          set value(v) { super.value = v + 1; }
+        }
+        const local = new Local();
+        local.value = 4;
+        log.push(local.hello(), local.kind, local._value);
+        "#,
+    );
+    assert_eq!(log(&mut runtime), "hi!8,base6+derived+local,10");
+}
+
+#[test]
 fn calling_something_that_is_not_a_function_names_it() {
     let (mut runtime, map) = page();
     run_inline(

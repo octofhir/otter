@@ -1912,7 +1912,7 @@ fn compile_eval_with_options(
     otter_compiler::compile_eval_source(
         source,
         SourceKind::JavaScript,
-        "<eval>",
+        source_url_comment(source).unwrap_or("<eval>"),
         options.force_strict,
         options.forbid_var_arguments,
         options.caller_chain.as_ref(),
@@ -1922,6 +1922,32 @@ fn compile_eval_with_options(
         options.super_call_allowed,
         options.function_constructor,
     )
+}
+
+/// The name eval-goal code gives itself with a `//# sourceURL=` comment (or
+/// the older `//@ sourceURL=`), the last one when there are several.
+///
+/// Bundlers and script loaders that run fetched text through `eval` name it
+/// this way, so its functions are reported — in stacks and to a dynamic
+/// `import()` resolving a relative specifier — as the file it came from rather
+/// than as anonymous eval code. Only a name with no whitespace in it counts.
+fn source_url_comment(source: &str) -> Option<&str> {
+    let mut found = None;
+    for marker in ["//# sourceURL=", "//@ sourceURL="] {
+        if let Some(at) = source.rfind(marker)
+            && found.is_none_or(|(previous, _)| at > previous)
+        {
+            found = Some((at, at + marker.len()));
+        }
+    }
+    let (_, start) = found?;
+    let rest = &source[start..];
+    let end = rest
+        .find(['\n', '\r', '\u{2028}', '\u{2029}'])
+        .unwrap_or(rest.len());
+    let name = rest[..end].trim();
+    (!name.is_empty() && !name.contains(char::is_whitespace) && !name.contains(['"', '\'']))
+        .then_some(name)
 }
 
 /// One reading of an isolate's complete budget.

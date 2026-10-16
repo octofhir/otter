@@ -838,3 +838,45 @@ fn anchored_patterns_check_the_first_code_point() {
     // Multiline `^` is not start-anchored: later lines still match.
     assert_eq!(first_match("^ba", "m", "x\nba"), Some((2, 4, vec![])));
 }
+
+/// §22.2.1.1: a name may repeat only across alternatives of one
+/// disjunction, at any depth.
+#[test]
+fn duplicate_names_are_allowed_only_in_different_alternatives() {
+    for pattern in [
+        "(?<a>x)|(?<a>y)",
+        "(?:(?<a>x)|(?<a>y))z",
+        "((?<a>x)|y)|(?<a>z)",
+        "(?:(?<a>x)|(?<b>y))(?:(?<c>x)|(?<d>y))",
+    ] {
+        assert!(
+            Regex::compile_str(pattern, Flags::default()).is_ok(),
+            "{pattern}"
+        );
+    }
+    for pattern in [
+        "(?<a>x)(?<a>y)",
+        "(?<a>x(?<a>y))",
+        "(?:(?<a>x)|y)(?<a>z)",
+        "(?:(?<a>x)|y)(?:(?<a>z)|w)",
+    ] {
+        assert!(
+            Regex::compile_str(pattern, Flags::default()).is_err(),
+            "{pattern}"
+        );
+    }
+}
+
+/// Alternations in a row are checked in linear time. Enumerating the paths
+/// through them doubled with each, and a pattern of forty never compiled.
+#[test]
+fn many_alternations_in_a_row_compile_quickly() {
+    let pattern = "(?:a|b)".repeat(40) + "(?<n>c)";
+    let started = std::time::Instant::now();
+    assert!(Regex::compile_str(&pattern, Flags::default()).is_ok());
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(1),
+        "{:?}",
+        started.elapsed()
+    );
+}

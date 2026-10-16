@@ -513,13 +513,14 @@ impl Interpreter {
         let (recv_value, arg_values) = read_method_call_values(stack, top_idx, operands, argc)
             .map_err(CommittedValueError::Fatal)?;
         if recv_value.is_nullish() {
-            let label = if recv_value.is_null() {
-                "null"
-            } else {
-                "undefined"
-            };
+            // The method's name is the call site's own constant, so it is
+            // known without running anything: `x.y()` on an undefined `x`
+            // says it was reading `y`.
+            let name = context
+                .string_constant_str_for_function(stack[top_idx].function_id, name_idx)
+                .map(str::to_owned);
             return Err(CommittedValueError::JavaScript(
-                self.err_type((format!("Cannot read properties of {label}")).into()),
+                self.nullish_read_error(&recv_value, name.as_deref()),
             ));
         }
         // Resolving the call-site IC id here installs the same cache the JIT

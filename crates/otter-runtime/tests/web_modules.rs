@@ -536,3 +536,22 @@ fn calling_something_that_is_not_a_function_names_it() {
         "api.missing is not a function,(0, api.other) is not a function"
     );
 }
+
+#[test]
+fn a_method_called_on_nothing_names_what_was_read() {
+    let (mut runtime, map) = page();
+    run_inline(
+        &mut runtime,
+        &map,
+        0,
+        r#"
+        const holder = {};
+        try { holder.missing.run(1); } catch (error) { log.push(error.message); }
+        try { null.go(); } catch (error) { log.push(error.message); }
+        "#,
+    );
+    assert_eq!(
+        log(&mut runtime),
+        "Cannot read properties of undefined (reading 'run'),Cannot read properties of null (reading 'go')"
+    );
+}

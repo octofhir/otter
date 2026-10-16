@@ -53,6 +53,10 @@ pub(crate) struct Compiler {
     /// paired with `next_fn_derived_ctor`) is a derived constructor.
     pub(crate) next_fn_has_home: bool,
     pub(crate) next_fn_derived_ctor: bool,
+    /// Set before compiling a class constructor: one is only ever run by
+    /// `[[Construct]]`, which owes constructor completion after its body, so
+    /// no call in it is a proper tail call (§10.2.2).
+    pub(crate) next_fn_class_ctor: bool,
     /// One-shot: the next NAMED FunctionExpression lowering skips its
     /// §10.2.11 self-name funcEnv binding — §20.2.1.1
     /// CreateDynamicFunction's `function anonymous(...)` binds nothing.
@@ -227,6 +231,7 @@ impl Compiler {
             eval_chain: None,
             next_fn_has_home: false,
             next_fn_derived_ctor: false,
+            next_fn_class_ctor: false,
             next_fn_expr_no_self_binding: false,
             next_fn_is_method: false,
             next_fn_static_home: false,

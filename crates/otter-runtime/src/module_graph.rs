@@ -1941,6 +1941,9 @@ fn link(nodes: &BTreeMap<String, ModuleNode>, order: &[String], entry_url: &str)
     let mut module_function_offset: HashMap<String, u32> = HashMap::new();
     let mut module_inits: Vec<ModuleInit> = Vec::new();
     let mut module_resolutions: Vec<ModuleResolution> = Vec::new();
+    // §13.2.8.4 template sites, concatenated like the constants: each
+    // fragment's `GetTemplateObject` operands index its own table.
+    let mut template_sites: Vec<otter_bytecode::TemplateSite> = Vec::new();
 
     // Placeholder `<entry>`; we'll fill in `code` + `spans`
     // after we know each fragment's offsets.
@@ -1958,7 +1961,9 @@ fn link(nodes: &BTreeMap<String, ModuleNode>, order: &[String], entry_url: &str)
         };
         let fn_offset = functions.len() as u32;
         let const_offset = constants.len() as u32;
+        let template_offset = template_sites.len() as u32;
         module_function_offset.insert(url.clone(), fn_offset);
+        template_sites.extend(node.fragment.template_sites.iter().cloned());
 
         // Append constants, rewriting `FunctionId` indices.
         for c in &node.fragment.constants {
@@ -1982,7 +1987,7 @@ fn link(nodes: &BTreeMap<String, ModuleNode>, order: &[String], entry_url: &str)
             for site in &mut new_fn.class_hint_sites {
                 site.class_function_id += fn_offset;
             }
-            new_fn.code = rewrite_const_indices(&f.code, const_offset);
+            new_fn.code = rewrite_const_indices(&f.code, const_offset, template_offset);
             functions.push(new_fn);
         }
 
@@ -2016,7 +2021,7 @@ fn link(nodes: &BTreeMap<String, ModuleNode>, order: &[String], entry_url: &str)
 
     BytecodeModule {
         module: entry_url.to_string(),
-        template_sites: Vec::new(),
+        template_sites,
         source_kind: BytecodeSourceKind::TypeScript,
         functions,
         constants,
@@ -2032,8 +2037,10 @@ fn link(nodes: &BTreeMap<String, ModuleNode>, order: &[String], entry_url: &str)
 /// actually indexes the constant pool, per
 /// [`Op::is_const_pool_operand`]. Other [`Operand::ConstIndex`]
 /// uses (`argc`, method-id enums, typed-array
-/// kind enums, …) are intentionally left untouched.
-fn rewrite_const_indices(code: &FunctionCode, offset: u32) -> FunctionCode {
+/// kind enums, …) are intentionally left untouched. A `GetTemplateObject`
+/// site index moves by `template_offset` instead, since the linked module's
+/// template-site table is the fragments' tables one after another.
+fn rewrite_const_indices(code: &FunctionCode, offset: u32, template_offset: u32) -> FunctionCode {
     let mut rewritten = FunctionCodeBuilder::new();
     for instr in code {
         let operands = code
@@ -2043,6 +2050,9 @@ fn rewrite_const_indices(code: &FunctionCode, offset: u32) -> FunctionCode {
             .map(|(pos, operand)| match operand {
                 Operand::ConstIndex(k) if instr.op.is_const_pool_operand(pos) => {
                     Operand::ConstIndex(k + offset)
+                }
+                Operand::ConstIndex(k) if instr.op == Op::GetTemplateObject && pos == 1 => {
+                    Operand::ConstIndex(k + template_offset)
                 }
                 other => other,
             })

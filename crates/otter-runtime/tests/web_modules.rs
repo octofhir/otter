@@ -494,3 +494,26 @@ fn private_fields_are_installed_by_super_inside_an_expression() {
     );
     assert_eq!(log(&mut runtime), "1,3,true");
 }
+
+#[test]
+fn tagged_templates_work_in_inline_and_delivered_modules() {
+    let (mut runtime, map) = page();
+    deliver(
+        &map,
+        "https://site.test/app/tag.js",
+        "export const tag = (strings, ...values) => strings.raw.join('|') + ':' + values.join(',');\n\
+         export const own = tag`a${1}b${2}c`;",
+    );
+    run_inline(
+        &mut runtime,
+        &map,
+        0,
+        r#"
+        import { tag, own } from './tag.js';
+        const site = (s) => s;
+        const once = () => site`same`;
+        log.push(own, tag`x${'y'}z`, once() === once());
+        "#,
+    );
+    assert_eq!(log(&mut runtime), "a|b|c:1,2,x|z:y,true");
+}

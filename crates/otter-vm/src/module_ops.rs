@@ -836,6 +836,12 @@ impl Interpreter {
                 // §16.2.1.9.4 step 9.b — its own init reactions
                 // continue the walk when it settles.
                 if let Err(err) = self.execute_async_module(stack, context, &module) {
+                    // A fatal failure or heap exhaustion leaves the turn: it
+                    // is not the module's to reject with, and a rejection
+                    // reason cannot be made out of memory that is not there.
+                    if err.is_fatal() || matches!(err, VmError::OutOfMemory { .. }) {
+                        return Err(err);
+                    }
                     let reason =
                         self.vm_error_to_throwable_with_stack_roots(Some(context), stack, &err)?;
                     self.async_module_execution_rejected(&module, reason);
@@ -855,6 +861,9 @@ impl Interpreter {
                     self.fulfill_module_gate(&module);
                 }
                 Err(err) => {
+                    if err.is_fatal() || matches!(err, VmError::OutOfMemory { .. }) {
+                        return Err(err);
+                    }
                     let reason =
                         self.vm_error_to_throwable_with_stack_roots(Some(context), stack, &err)?;
                     self.async_module_execution_rejected(&module, reason);

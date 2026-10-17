@@ -946,6 +946,87 @@ pub(crate) struct WebModuleScan {
     pub(crate) compiled: Option<PrecompiledModule>,
 }
 
+/// First bytes of every web-module code cache.
+const WEB_MODULE_CACHE_MAGIC: &[u8; 8] = b"ottermc\0";
+
+/// The key a web module's code cache is valid for: the compiler, the
+/// engine, the exact text and the URL it was compiled as.
+fn web_module_cache_key(text: &str, url: &str) -> crate::compile_cache::CompileCacheKey {
+    crate::compile_cache::cache_key(text, SourceKind::JavaScript, &format!("<web-module>{url}"))
+}
+
+/// Code-cache bytes of a web module's compile: the magic, the key, then the
+/// entry the compile cache keeps for a module (its requests, the compiler
+/// metadata, and the module without its source). `None` when the module is
+/// too large to encode.
+pub(crate) fn encode_web_module_cache(
+    text: &str,
+    url: &str,
+    precompiled: &PrecompiledModule,
+) -> Option<Vec<u8>> {
+    let key = web_module_cache_key(text, url);
+    let mut metadata = precompiled.compiled.metadata.clone();
+    metadata.function_spans = Vec::new();
+    let aux = serde_json::to_vec(&CachedModule {
+        requests: precompiled.requests.clone(),
+        metadata,
+    })
+    .ok()?;
+    let len = u32::try_from(aux.len()).ok()?;
+    let module = otter_bytecode::binary::encode_module_bounded_detached(
+        &precompiled.compiled.bytecode,
+        crate::compile_cache::MAX_COMPILE_CACHE_ENTRY_BYTES,
+    )
+    .ok()?;
+    let mut bytes = Vec::with_capacity(
+        WEB_MODULE_CACHE_MAGIC.len() + key.as_str().len() + 4 + aux.len() + module.len(),
+    );
+    bytes.extend_from_slice(WEB_MODULE_CACHE_MAGIC);
+    bytes.extend_from_slice(key.as_str().as_bytes());
+    bytes.extend_from_slice(&len.to_le_bytes());
+    bytes.extend_from_slice(&aux);
+    bytes.extend_from_slice(&module);
+    Some(bytes)
+}
+
+/// The web module `bytes` hold for exactly this text and URL, decoded and
+/// verified; `None` for bytes of another compile, engine or text.
+pub(crate) fn decode_web_module_cache(
+    bytes: &[u8],
+    text: &str,
+    url: &str,
+) -> Option<WebModuleScan> {
+    let key = web_module_cache_key(text, url);
+    let rest = bytes.strip_prefix(WEB_MODULE_CACHE_MAGIC.as_slice())?;
+    let rest = rest.strip_prefix(key.as_str().as_bytes())?;
+    let (len, rest) = rest.split_first_chunk::<4>()?;
+    let (aux, module) = rest.split_at_checked(u32::from_le_bytes(*len) as usize)?;
+    let cached: CachedModule = serde_json::from_slice(aux).ok()?;
+    let bytecode = otter_bytecode::binary::decode_module_with_source(module, text)
+        .ok()?
+        .into_module();
+    let mut metadata = cached.metadata;
+    metadata.function_spans = CompiledModuleMetadata::span_only_from_bytecode(&bytecode)
+        .ok()?
+        .function_spans;
+    let requests = cached
+        .requests
+        .iter()
+        .map(|request| PrefetchRequest {
+            specifier: request.specifier.clone(),
+            dynamic: request.dynamic,
+            data: request.attr_type.is_some(),
+        })
+        .collect();
+    Some(WebModuleScan {
+        requests,
+        compiled: Some(PrecompiledModule {
+            compiled: otter_compiler::CompiledModule::new(bytecode, metadata),
+            requests: cached.requests,
+        }),
+    })
+}
+
 /// Parse the web module `url` once: collect its requests and compile it
 /// against the targets `resolve` gives its static imports.
 ///

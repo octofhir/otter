@@ -90,29 +90,18 @@ impl Interpreter {
                 )));
             }
         }
-        // Array index protector, tripped by either of two observations and
-        // never reset:
-        //
-        // 1. An accessor landing on an array-index key *anywhere* (most
-        //    relevantly %Array.prototype% / %Object.prototype%) forces array
-        //    element writes onto the OrdinarySet prototype-walk slow path.
-        // 2. Any indexed property — data included — landing on %Array.prototype%
-        //    or %Object.prototype%. An ordinary dense array inherits from
-        //    exactly those two objects, so an in-bounds hole can then resolve
-        //    to an inherited value instead of `undefined`, and the fast
-        //    hole-read shortcut must stop taking it.
-        //
-        // The second condition is deliberately restricted to the two realm
-        // prototypes: an indexed data property on some unrelated plain object
-        // cannot be reached from a dense array with no per-instance prototype
-        // override, and tripping on those would latch the protector for
-        // ordinary object use.
+        // Array index protector, tripped by any indexed property, data or
+        // accessor, landing on %Array.prototype% or %Object.prototype% of a
+        // realm, and never reset. Every fast element path it guards takes
+        // only an array without a sidecar, whose [[Prototype]] is its realm's
+        // %Array.prototype%: that object and %Object.prototype% are the whole
+        // chain such an array can inherit an index from. An accessor on any
+        // other object is unreachable from those arrays, so tripping on it
+        // would latch the protector for every array of the page.
         if key
             .string_name()
             .is_some_and(|name| crate::object::array_index_property_name(name).is_some())
-            && (descriptor.get.is_some()
-                || descriptor.set.is_some()
-                || self.is_realm_element_prototype(*target))
+            && self.is_realm_element_prototype(*target)
         {
             self.activate_array_index_accessor_protector();
         }

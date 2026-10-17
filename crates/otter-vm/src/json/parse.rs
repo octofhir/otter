@@ -958,14 +958,13 @@ fn read_string_with_escapes(
     stack: &[Builder],
     external_visit: &mut RootSlotVisitor<'_>,
 ) -> Result<JsString, ParseError> {
-    // Lift the plain prefix into a UTF-16 buffer. Bytes between
-    // `plain_start` and `cursor.pos` are guaranteed ASCII (we'd
-    // have errored on control chars earlier), so the cast is
-    // lossless.
-    let mut buf: Vec<u16> = cursor.bytes[plain_start..cursor.pos]
-        .iter()
-        .map(|&b| u16::from(b))
-        .collect();
+    // Lift the plain prefix into a UTF-16 buffer. It holds no quote,
+    // backslash or control character, but it may hold any other
+    // character, so it is decoded as the UTF-8 it is: a byte-per-unit
+    // cast turned `— \u003c` into `â\u{80}\u{94} <`.
+    let prefix = std::str::from_utf8(&cursor.bytes[plain_start..cursor.pos])
+        .map_err(|_| ParseError::at(plain_start, "invalid utf-8 in string"))?;
+    let mut buf: Vec<u16> = prefix.encode_utf16().collect();
 
     while let Some(b) = cursor.peek() {
         match b {

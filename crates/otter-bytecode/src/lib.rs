@@ -2024,6 +2024,11 @@ pub struct Function {
     /// the source range this names (see [`LazyFunction`]).
     #[serde(default)]
     pub lazy: Option<LazyFunction>,
+    /// For a lazy record: what the analysis of the unit that parsed this
+    /// function whole found about the functions inside it. The body compile
+    /// leaves their bodies unparsed and takes these facts instead.
+    #[serde(default)]
+    pub preparse: Option<Box<Preparse>>,
     /// Authoritative execution wordcode.
     pub code: FunctionCode,
     /// Exception handlers, innermost first: a throw at instruction `pc`
@@ -2090,6 +2095,42 @@ pub struct LazyFunction {
     pub typescript: bool,
     /// The source is JSX.
     pub jsx: bool,
+}
+
+/// What a lazily compiled function's body compile needs to know about the
+/// functions inside it without parsing their bodies: the names they reach
+/// outside themselves and whether a direct eval in them does, as the
+/// analysis of the whole unit found them.
+///
+/// The body compile blanks each skipped function's statements and lowers
+/// the function to a lazy record of its own, carrying the facts of the
+/// functions inside it in turn.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Preparse {
+    /// Spellings the skipped functions' name lists index.
+    pub names: Vec<String>,
+    /// The outermost skipped functions, in source order.
+    pub skipped: Vec<SkippedFunction>,
+}
+
+/// One function a body compile leaves unparsed.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SkippedFunction {
+    /// Source span of the function node.
+    pub span: (u32, u32),
+    /// Source range of the body statements a body compile blanks.
+    pub blank: (u32, u32),
+    /// Names it references and does not bind, indices into
+    /// [`Preparse::names`].
+    pub escape: Vec<u32>,
+    /// Names it assigns and does not bind.
+    pub escape_writes: Vec<u32>,
+    /// A direct eval inside it reaches the scopes around it.
+    pub escape_eval: bool,
+    /// A direct eval appears anywhere inside it.
+    pub contains_eval: bool,
+    /// The skipped functions inside it, in source order.
+    pub children: Vec<SkippedFunction>,
 }
 
 /// Syntactic form of a [`LazyFunction`]'s source range.

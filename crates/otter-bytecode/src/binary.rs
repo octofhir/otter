@@ -46,8 +46,9 @@ use crate::wordcode::{FunctionCode, INLINE_OPERAND_WORDS, Instruction};
 use crate::{
     ArgumentBindingStorage, ArgumentsObjectKind, BytecodeModule, ClassHintSite, Constant,
     ExceptionHandler, Function, LazyEnvironment, LazyForm, LazyFunction, LazyImport,
-    LazyMethodKind, MappedArgumentBinding, ModuleInit, ModuleResolution, ScopeDescriptor,
-    ScopeFlags, ScopeKind, SlotDescriptor, SlotKind, SourceKind, SpanTable, TemplateSite,
+    LazyMethodKind, MappedArgumentBinding, ModuleInit, ModuleResolution, Preparse, ScopeDescriptor,
+    ScopeFlags, ScopeKind, SkippedFunction, SlotDescriptor, SlotKind, SourceKind, SpanTable,
+    TemplateSite,
     encoding::{op_from_byte, op_to_byte},
     verifier::{BytecodeVerifyError, VerifiedBytecodeModule},
 };
@@ -660,6 +661,14 @@ impl Writer {
             }
             None => self.bool(false),
         }
+        match &function.preparse {
+            Some(preparse) => {
+                self.bool(true);
+                self.seq(&preparse.names, |out, name| out.string(name));
+                self.seq(&preparse.skipped, Self::skipped_function);
+            }
+            None => self.bool(false),
+        }
         self.function_code(&function.code);
         self.seq(&function.handlers, Self::exception_handler);
         self.spans(&function.spans);
@@ -669,6 +678,16 @@ impl Writer {
 }
 
 impl Writer {
+    fn skipped_function(&mut self, skipped: &SkippedFunction) {
+        self.span(skipped.span);
+        self.span(skipped.blank);
+        self.u32_seq(&skipped.escape);
+        self.u32_seq(&skipped.escape_writes);
+        self.bool(skipped.escape_eval);
+        self.bool(skipped.contains_eval);
+        self.seq(&skipped.children, Self::skipped_function);
+    }
+
     fn lazy_function(&mut self, lazy: &LazyFunction) {
         self.span(lazy.range);
         match lazy.form {
@@ -1108,6 +1127,14 @@ impl<'a> Reader<'a> {
         } else {
             None
         };
+        let preparse = if self.bool()? {
+            Some(Box::new(Preparse {
+                names: self.seq(Reader::string)?,
+                skipped: self.seq(Self::skipped_function)?,
+            }))
+        } else {
+            None
+        };
         let code = self.function_code()?;
         let handlers = self.seq(Self::exception_handler)?;
         let spans = self.spans()?;
@@ -1143,11 +1170,24 @@ impl<'a> Reader<'a> {
             source_text_range,
             source_text_span,
             lazy,
+            preparse,
             code,
             handlers,
             spans,
             number_hint_sites,
             class_hint_sites,
+        })
+    }
+
+    fn skipped_function(&mut self) -> Option<SkippedFunction> {
+        Some(SkippedFunction {
+            span: self.span()?,
+            blank: self.span()?,
+            escape: self.u32_seq()?,
+            escape_writes: self.u32_seq()?,
+            escape_eval: self.bool()?,
+            contains_eval: self.bool()?,
+            children: self.seq(Self::skipped_function)?,
         })
     }
 
@@ -1418,6 +1458,7 @@ mod tests {
                 source_text_range: Some((0, 18)),
                 source_text_span: Some((0, 18)),
                 lazy: None,
+                preparse: None,
                 code: code.finish(),
                 handlers: vec![ExceptionHandler {
                     start: 0,
@@ -1580,6 +1621,35 @@ mod tests {
         let restored = decode_unverified_module(&encode_module(&module)).expect("round trip");
         assert_eq!(restored.functions[0].lazy, module.functions[0].lazy);
         assert_eq!(restored.lazy_environments, module.lazy_environments);
+        // A record's preparse tree survives with its nesting.
+        let mut with_preparse = module.clone();
+        let leaf = SkippedFunction {
+            span: (40, 90),
+            blank: (55, 89),
+            escape: vec![1],
+            escape_writes: vec![],
+            escape_eval: false,
+            contains_eval: true,
+            children: Vec::new(),
+        };
+        with_preparse.functions[0].preparse = Some(Box::new(Preparse {
+            names: vec!["inner".to_string(), "outer".to_string()],
+            skipped: vec![SkippedFunction {
+                span: (10, 120),
+                blank: (20, 119),
+                escape: vec![1],
+                escape_writes: vec![1],
+                escape_eval: true,
+                contains_eval: true,
+                children: vec![leaf],
+            }],
+        }));
+        let encoded = encode_module(&with_preparse);
+        let restored = decode_module(&encoded).unwrap().into_module();
+        assert_eq!(
+            restored.functions[0].preparse,
+            with_preparse.functions[0].preparse
+        );
     }
 
     #[test]

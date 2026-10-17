@@ -217,10 +217,15 @@ pub(crate) fn compile_function_impl(
     let top_level_eager = parent
         .lazy_unit
         .is_some_and(|unit| unit.top_level_eager && parent.stack.len() == 1);
+    // A function this body compile left unparsed has only its recorded
+    // facts here: it compiles lazily whatever the heuristics would choose.
+    let skipped = parent
+        .skips
+        .as_ref()
+        .is_some_and(|skips| skips.contains(span.0));
     let lazy_form = match parent.lazy_unit {
         Some(_)
-            if !eager
-                && !top_level_eager
+            if (skipped || (!eager && !top_level_eager))
                 && body.is_some()
                 && fields.is_none()
                 && !hinted_home
@@ -248,8 +253,18 @@ pub(crate) fn compile_function_impl(
         }
         _ => None,
     };
+    if skipped && lazy_form.is_none() {
+        return Err(CompileError::Unsupported {
+            node: "internal: a skipped function body cannot compile lazily".to_string(),
+            span,
+        });
+    }
     if let (Some((form, range)), Some(unit)) = (lazy_form, parent.lazy_unit) {
         validate_formal_parameter_names(params, function_is_strict, allow_duplicate_formals, span)?;
+        let preparse = match &parent.skips {
+            Some(skips) if skipped => crate::preparse::of_skipped(skips, span.0),
+            skips => crate::preparse::collect(&parent.capture, skips.as_deref(), span.0),
+        };
         let lazy = otter_bytecode::LazyFunction {
             range,
             form,
@@ -290,6 +305,7 @@ pub(crate) fn compile_function_impl(
                 is_method,
                 is_arrow,
                 lazy,
+                preparse,
             },
         ));
     }
@@ -539,6 +555,7 @@ struct LazyRecord<'r, 'a> {
     is_method: bool,
     is_arrow: bool,
     lazy: otter_bytecode::LazyFunction,
+    preparse: Option<Box<otter_bytecode::Preparse>>,
 }
 
 /// Register a lazily compiled function: its call-visible shape and a
@@ -570,6 +587,7 @@ fn push_lazy_function(parent: &mut Compiler, record: LazyRecord<'_, '_>) -> Clos
         is_method: record.is_method,
         is_arrow: record.is_arrow,
         lazy: Some(record.lazy),
+        preparse: record.preparse,
         code: finished,
         spans: otter_bytecode::SpanTable::new(&spans),
         ..Default::default()

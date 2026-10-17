@@ -79,6 +79,9 @@ pub(crate) struct ScopeFacts {
     /// Names assigned in the scope's code or in a nested scope that does not
     /// bind them, by spelling (block shadowing only over-reports).
     assigned: FxHashSet<NameId>,
+    /// The part of `assigned` the scope does not bind: what it hands its
+    /// ancestors.
+    escape_writes: FxHashSet<NameId>,
     /// Source range of the parameters and body.
     range: (u32, u32),
 }
@@ -104,6 +107,21 @@ impl ScopeFacts {
     pub(crate) fn arguments_escapes(&self) -> bool {
         self.arguments_escapes
     }
+
+    /// Names referenced inside the scope that it does not bind.
+    pub(crate) fn escape(&self) -> impl Iterator<Item = NameId> + '_ {
+        self.escape.iter().copied()
+    }
+
+    /// Names assigned inside the scope that it does not bind.
+    pub(crate) fn escape_writes(&self) -> impl Iterator<Item = NameId> + '_ {
+        self.escape_writes.iter().copied()
+    }
+
+    /// A direct eval in the scope reaches its ancestors.
+    pub(crate) fn escape_eval(&self) -> bool {
+        self.escape_eval
+    }
 }
 
 /// Capture facts of one compile unit.
@@ -118,13 +136,49 @@ pub(crate) struct CaptureFacts {
     /// Start offsets of every direct-eval call, ascending.
     evals: Vec<u32>,
     reads_dot_arguments: bool,
+    /// Every function and arrow of the unit, parents before children.
+    functions: Vec<FunctionNode>,
+    /// Function nodes by span start.
+    function_by_start: FxHashMap<u32, u32>,
+}
+
+/// One function or arrow of the unit, for the preparse facts a lazy record
+/// carries about the functions inside it.
+#[derive(Debug)]
+pub(crate) struct FunctionNode {
+    /// Span of the function node.
+    pub(crate) span: (u32, u32),
+    /// The body statements a body compile may leave unparsed: `Some` for a
+    /// plain function, not a method value, not run where it stands, with
+    /// statements long enough to be worth it.
+    pub(crate) blank: Option<(u32, u32)>,
+    /// This compile already left the body unparsed: its facts are recorded.
+    pub(crate) recorded: bool,
+    /// Key of the body's [`ScopeFacts`].
+    pub(crate) key: usize,
+    /// Functions and arrows directly inside it.
+    pub(crate) children: Vec<u32>,
 }
 
 impl CaptureFacts {
     /// Analyze the top-level statements of one compile unit.
     #[must_use]
     pub(crate) fn of_unit(stmts: &[Statement<'_>]) -> Self {
-        let mut builder = Builder::default();
+        Self::of_unit_skipping(stmts, None)
+    }
+
+    /// Analyze a unit whose skipped functions' bodies were left out of its
+    /// text: each one hands its ancestors what `skips` recorded for it, as
+    /// if its body had been walked.
+    #[must_use]
+    pub(crate) fn of_unit_skipping(
+        stmts: &[Statement<'_>],
+        skips: Option<&crate::preparse::SkipTable>,
+    ) -> Self {
+        let mut builder = Builder {
+            skips,
+            ..Builder::default()
+        };
         builder.facts.intern("arguments");
         builder.facts.intern("eval");
         builder.frames.push(Frame::new(FrameKind::Unit, 0));
@@ -154,6 +208,27 @@ impl CaptureFacts {
     /// Facts of the unit's top level.
     pub(crate) fn unit(&self) -> &ScopeFacts {
         &self.unit
+    }
+
+    /// The spelling of a name id.
+    pub(crate) fn name(&self, id: NameId) -> &str {
+        &self.names[id as usize]
+    }
+
+    /// The function or arrow whose span starts at `start`.
+    pub(crate) fn function_node(&self, start: u32) -> Option<&FunctionNode> {
+        let index = *self.function_by_start.get(&start)?;
+        Some(&self.functions[index as usize])
+    }
+
+    /// A function node by index.
+    pub(crate) fn function_at(&self, index: u32) -> &FunctionNode {
+        &self.functions[index as usize]
+    }
+
+    /// The facts of a function node's body.
+    pub(crate) fn node_scope(&self, node: &FunctionNode) -> &ScopeFacts {
+        self.scope(node.key)
     }
 
     fn scope(&self, key: usize) -> &ScopeFacts {
@@ -323,15 +398,23 @@ impl Frame {
 }
 
 #[derive(Default)]
-struct Builder {
+struct Builder<'s> {
     facts: CaptureFacts,
     frames: Vec<Frame>,
     /// Start of the `arguments` reference that is the object of the member
     /// read being visited.
     arguments_read: Option<u32>,
+    /// Functions whose bodies were left out of the text, by span start.
+    skips: Option<&'s crate::preparse::SkipTable>,
+    /// The function node being walked, innermost last.
+    function_stack: Vec<u32>,
+    /// Span starts of functions that are method or accessor values.
+    method_values: FxHashSet<u32>,
+    /// Span starts of function expressions run where they stand.
+    immediate: FxHashSet<u32>,
 }
 
-impl Builder {
+impl Builder<'_> {
     fn top(&mut self) -> &mut Frame {
         self.frames.last_mut().expect("scope frame")
     }
@@ -356,8 +439,30 @@ impl Builder {
         params: &FormalParameters<'_>,
         body: &FunctionBody<'_>,
     ) {
+        self.enter_function_with(kind, params, body, None);
+    }
+
+    fn enter_function_with(
+        &mut self,
+        kind: FrameKind,
+        params: &FormalParameters<'_>,
+        body: &FunctionBody<'_>,
+        skipped: Option<(u32, crate::preparse::SkippedFacts<'_>)>,
+    ) {
         self.frames
             .push(Frame::new(kind, std::ptr::from_ref(body) as usize));
+        // A skipped body's references to names around it sit at the
+        // function's start: every range query that covers the function
+        // covers them.
+        if let Some((at, facts)) = &skipped {
+            for name in facts.escape() {
+                let id = self.facts.intern(name);
+                self.facts.references.entry(id).or_default().push(*at);
+            }
+            if facts.contains_eval() {
+                self.facts.evals.push(*at);
+            }
+        }
         self.top().in_params = true;
         self.visit_formal_parameters(params);
         self.top().in_params = false;
@@ -393,8 +498,44 @@ impl Builder {
             }
         }
         self.visit_function_body(body);
+        if let Some((_, facts)) = skipped {
+            for name in facts.escape() {
+                let id = self.facts.intern(name);
+                self.top().refs.insert(id);
+            }
+            for name in facts.escape_writes() {
+                let id = self.facts.intern(name);
+                self.top().writes.insert(id);
+            }
+            if facts.escape_eval() {
+                self.top().facts.nested_eval = true;
+            }
+        }
         let start = params.span.start.min(body.span.start);
         self.exit((start, body.span.end));
+    }
+
+    /// Open the node of a function or arrow spanning `span`.
+    fn open_function_node(
+        &mut self,
+        span: (u32, u32),
+        blank: Option<(u32, u32)>,
+        recorded: bool,
+        key: usize,
+    ) {
+        let index = u32::try_from(self.facts.functions.len()).expect("function count fits u32");
+        if let Some(&parent) = self.function_stack.last() {
+            self.facts.functions[parent as usize].children.push(index);
+        }
+        self.facts.functions.push(FunctionNode {
+            span,
+            blank,
+            recorded,
+            key,
+            children: Vec::new(),
+        });
+        self.facts.function_by_start.insert(span.0, index);
+        self.function_stack.push(index);
     }
 
     fn exit(&mut self, range: (u32, u32)) {
@@ -406,13 +547,15 @@ impl Builder {
             frame.bound.extend(frame.vars.iter().copied());
         }
         frame.refs.retain(|id| !frame.bound.contains(id));
-        parent.writes.extend(
-            frame
-                .writes
-                .iter()
-                .copied()
-                .filter(|id| !frame.bound.contains(id)),
-        );
+        frame.facts.escape_writes = frame
+            .writes
+            .iter()
+            .copied()
+            .filter(|id| !frame.bound.contains(id))
+            .collect();
+        parent
+            .writes
+            .extend(frame.facts.escape_writes.iter().copied());
         frame.facts.assigned = std::mem::take(&mut frame.writes);
         let escape_eval = frame.facts.nested_eval && !frame.bound.contains(&EVAL);
         parent.refs.extend(frame.refs.iter().copied());
@@ -461,7 +604,7 @@ impl Builder {
     }
 }
 
-impl<'a> Visit<'a> for Builder {
+impl<'a> Visit<'a> for Builder<'_> {
     fn visit_function(&mut self, it: &Function<'a>, _flags: oxc_syntax::scope::ScopeFlags) {
         if let Some(id) = &it.id {
             self.own(&id.name);
@@ -471,12 +614,65 @@ impl<'a> Visit<'a> for Builder {
         }
         // A body-less declaration (an overload signature) has no runtime scope.
         if let Some(body) = it.body.as_deref() {
-            self.enter_function(FrameKind::Function, &it.params, body);
+            let skipped = self
+                .skips
+                .and_then(|skips| skips.get(it.span.start))
+                .map(|facts| (it.span.start, facts));
+            let blank = if self.method_values.contains(&it.span.start)
+                || self.immediate.contains(&it.span.start)
+            {
+                None
+            } else {
+                crate::preparse::blank_range(body)
+            };
+            self.open_function_node(
+                (it.span.start, it.span.end),
+                blank,
+                skipped.is_some(),
+                std::ptr::from_ref(body) as usize,
+            );
+            self.enter_function_with(FrameKind::Function, &it.params, body, skipped);
+            self.function_stack.pop();
         }
     }
 
     fn visit_arrow_function_expression(&mut self, it: &ArrowFunctionExpression<'a>) {
+        self.open_function_node(
+            (it.span.start, it.span.end),
+            None,
+            false,
+            std::ptr::from_ref(&*it.body) as usize,
+        );
         self.enter_function(FrameKind::Arrow, &it.params, &it.body);
+        self.function_stack.pop();
+    }
+
+    fn visit_method_definition(&mut self, it: &oxc_ast::ast::MethodDefinition<'a>) {
+        self.method_values.insert(it.value.span.start);
+        walk::walk_method_definition(self, it);
+    }
+
+    fn visit_object_property(&mut self, it: &oxc_ast::ast::ObjectProperty<'a>) {
+        if (it.method || it.kind != oxc_ast::ast::PropertyKind::Init)
+            && let Expression::FunctionExpression(function) = &it.value
+        {
+            self.method_values.insert(function.span.start);
+        }
+        walk::walk_object_property(self, it);
+    }
+
+    fn visit_new_expression(&mut self, it: &oxc_ast::ast::NewExpression<'a>) {
+        if let Some(start) = immediate_function(&it.callee) {
+            self.immediate.insert(start);
+        }
+        walk::walk_new_expression(self, it);
+    }
+
+    fn visit_parenthesized_expression(&mut self, it: &oxc_ast::ast::ParenthesizedExpression<'a>) {
+        if let Some(start) = immediate_function(&it.expression) {
+            self.immediate.insert(start);
+        }
+        walk::walk_parenthesized_expression(self, it);
     }
 
     fn visit_static_block(&mut self, it: &oxc_ast::ast::StaticBlock<'a>) {
@@ -631,6 +827,9 @@ impl<'a> Visit<'a> for Builder {
     }
 
     fn visit_call_expression(&mut self, it: &oxc_ast::ast::CallExpression<'a>) {
+        if let Some(start) = immediate_function(&it.callee) {
+            self.immediate.insert(start);
+        }
         // A method called on `arguments` receives it as `this`.
         if member_of_arguments(&it.callee) {
             self.note_arguments_escape();
@@ -918,6 +1117,16 @@ struct DirectEvalFinder {
 /// wrapped in parentheses (`(eval)`, `((eval))`), is a direct eval. A
 /// non-trivial parenthesized callee such as `(1, eval)` is indirect.
 /// `arguments`, possibly parenthesized.
+/// The span start of a function expression the compiler runs eagerly where
+/// it stands (called, constructed or parenthesized), looking through
+/// parentheses and TypeScript wrappers.
+fn immediate_function(expr: &Expression<'_>) -> Option<u32> {
+    match expr.get_inner_expression() {
+        Expression::FunctionExpression(function) => Some(function.span.start),
+        _ => None,
+    }
+}
+
 fn is_arguments(expr: &Expression<'_>) -> bool {
     matches!(expr.without_parentheses(), Expression::Identifier(id) if id.name == "arguments")
 }

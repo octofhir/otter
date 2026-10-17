@@ -253,3 +253,174 @@ fn a_body_compile_names_its_functions_after_the_module_the_vm_found() {
     assert!(inner.lazy.is_some());
     assert_eq!(inner.module_url, "https://example.test/page.js");
 }
+
+/// A preparse tree with its names spelled and its lists sorted, so trees
+/// built by different routes compare by content.
+fn spelled(preparse: Option<&otter_bytecode::Preparse>) -> String {
+    fn function(names: &[String], f: &otter_bytecode::SkippedFunction, out: &mut String) {
+        let spell = |ids: &[u32]| {
+            let mut v: Vec<&str> = ids.iter().map(|&id| names[id as usize].as_str()).collect();
+            v.sort_unstable();
+            v.join(",")
+        };
+        out.push_str(&format!(
+            "[{:?} {:?} esc={} wr={} ee={} ce={} ",
+            f.span,
+            f.blank,
+            spell(&f.escape),
+            spell(&f.escape_writes),
+            f.escape_eval,
+            f.contains_eval
+        ));
+        for child in &f.children {
+            function(names, child, out);
+        }
+        out.push(']');
+    }
+    let mut out = String::new();
+    if let Some(preparse) = preparse {
+        for f in &preparse.skipped {
+            function(&preparse.names, f, &mut out);
+        }
+    }
+    out
+}
+
+/// Compile every lazy record of `source`, at every depth, with its preparse
+/// facts and without them: the bodies must lower identically and hand
+/// their own lazy records identical facts. Returns how many bodies left
+/// functions unparsed.
+fn assert_skipping_changes_nothing(source: &str) -> usize {
+    let unit = compile_script_source_to_module_with_options(
+        source,
+        SyntaxSourceKind::JavaScript,
+        "test.js",
+        LAZY,
+    )
+    .unwrap()
+    .bytecode;
+    let top_chain = EvalCallerChain {
+        scopes: unit.functions[0]
+            .scopes
+            .first()
+            .map(|descriptor| EvalCallerScope {
+                descriptor: descriptor.clone().into(),
+                extension_names: Vec::new(),
+            })
+            .into_iter()
+            .collect(),
+        var_depth: None,
+    };
+    let mut work: Vec<(Function, EvalCallerChain)> = unit
+        .functions
+        .iter()
+        .filter(|function| function.lazy.is_some())
+        .map(|function| (function.clone(), top_chain.clone()))
+        .collect();
+    let mut skipping = 0;
+    while let Some((record, chain)) = work.pop() {
+        let compile = |record: &Function| {
+            compile_lazy_function(LazyCompileRequest {
+                source,
+                module_url: "test.js",
+                function: record,
+                chain: &chain,
+                environment: unit.lazy_environments.first(),
+                resolutions: &unit.module_resolutions,
+            })
+            .unwrap_or_else(|error| panic!("body compile of {}: {error:?}", record.name))
+        };
+        let mut bare = record.clone();
+        bare.preparse = None;
+        skipping += usize::from(record.preparse.is_some());
+        let with = compile(&record);
+        let without = compile(&bare);
+        assert_eq!(
+            render(&with, &with.functions[0]),
+            render(&without, &without.functions[0]),
+            "skipping changes the body of `{}`",
+            record.name
+        );
+        let nested = |module: &BytecodeModule| -> Vec<(String, String)> {
+            module
+                .functions
+                .iter()
+                .filter(|function| function.lazy.is_some())
+                .map(|function| (function.name.clone(), spelled(function.preparse.as_deref())))
+                .collect()
+        };
+        assert_eq!(
+            nested(&with),
+            nested(&without),
+            "skipping changes the facts `{}` hands its functions",
+            record.name
+        );
+        // The body's own scopes stand in for the context its functions close
+        // over; both compiles of each see the same chain.
+        let inner = EvalCallerChain {
+            scopes: with.functions[0]
+                .scopes
+                .iter()
+                .rev()
+                .map(|descriptor| EvalCallerScope {
+                    descriptor: descriptor.clone().into(),
+                    extension_names: Vec::new(),
+                })
+                .chain(chain.scopes.iter().cloned())
+                .collect(),
+            var_depth: None,
+        };
+        for function in with
+            .functions
+            .iter()
+            .filter(|function| function.lazy.is_some())
+        {
+            work.push((function.clone(), inner.clone()));
+        }
+    }
+    skipping
+}
+
+#[test]
+fn a_body_compile_that_skips_inner_functions_lowers_as_if_it_parsed_them() {
+    // Bodies long enough to skip, nested three deep, reaching outward by
+    // read, write, self name, eval, switch and through arrows.
+    let filler = (0..12)
+        .map(|i| format!("  local{i} = local{i} + {i} * shared;\n"))
+        .collect::<String>();
+    let source = format!(
+        r#"
+var shared = 1;
+function outer(a, b) {{
+  let counter = 0, local0 = 0, local1 = 0, local2 = 0, local3 = 0, local4 = 0, local5 = 0;
+  let local6 = 0, local7 = 0, local8 = 0, local9 = 0, local10 = 0, local11 = 0;
+  const named = function self(n) {{
+{filler}    function deeper(k) {{
+{filler}      counter += k;
+      return n ? self(n - 1) : a + k;
+    }}
+    return deeper(n);
+  }};
+  function writer() {{
+{filler}    b = counter;
+    switch (counter) {{ case 1: return local1; default: return shared; }}
+  }}
+  function evaluator(src) {{
+{filler}    return eval(src);
+  }}
+  const arrow = (x) => {{
+    function insideArrow() {{
+{filler}      return x + arguments.length + counter;
+    }}
+    return insideArrow;
+  }};
+  var iife = (function () {{
+{filler}    return counter;
+  }})();
+  return [named, writer, evaluator, arrow, iife];
+}}
+"#
+    );
+    let skipping = assert_skipping_changes_nothing(&source);
+    assert!(skipping >= 2, "bodies that skip: {skipping}");
+}

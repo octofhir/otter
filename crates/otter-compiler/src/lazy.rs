@@ -89,6 +89,14 @@ pub fn compile_lazy_function(
     wrapped.push_str(&prefix);
     wrapped.push_str(text);
     wrapped.push_str(suffix);
+    // Functions inside whose facts the record carries are left unparsed.
+    let delta =
+        i64::from(u32::try_from(prefix.len()).expect("wrapper prefix is short")) - i64::from(start);
+    let skips = function.preparse.as_deref().map(|preparse| {
+        let (table, blanks) = crate::preparse::SkipTable::new(preparse, delta);
+        crate::preparse::blank(&mut wrapped, &blanks);
+        table
+    });
     let kind = match (lazy.typescript, lazy.jsx) {
         (false, false) => SyntaxSourceKind::JavaScript,
         (false, true) => SyntaxSourceKind::JavaScriptJsx,
@@ -108,7 +116,7 @@ pub fn compile_lazy_function(
         to: start,
     };
     let mut module = otter_syntax::with_program_goal(&wrapped, kind, goal, |program| {
-        lower(program, &request, lazy, kind)
+        lower(program, &request, lazy, kind, skips)
     })
     .map_err(CompileError::from)??;
     shift.module(&mut module);
@@ -172,6 +180,12 @@ impl Shift {
             function.source_text_span = function.source_text_span.map(|span| self.span(span));
             if let Some(lazy) = &mut function.lazy {
                 lazy.range = self.span(lazy.range);
+            }
+            if let Some(preparse) = &mut function.preparse {
+                crate::preparse::shift_all(
+                    &mut preparse.skipped,
+                    i64::from(self.to) - i64::from(self.from),
+                );
             }
             function.spans = function
                 .spans
@@ -314,6 +328,7 @@ fn lower(
     request: &LazyCompileRequest<'_>,
     lazy: LazyFunction,
     kind: SyntaxSourceKind,
+    skips: Option<crate::preparse::SkipTable>,
 ) -> Result<BytecodeModule, CompileError> {
     let function = request.function;
     let target = find_target(program, lazy.form).ok_or_else(|| CompileError::Unsupported {
@@ -346,8 +361,9 @@ fn lower(
     top.module_state = request
         .environment
         .map(|environment| module_state_from(environment, request.resolutions, request.module_url));
-    let capture = capture::CaptureFacts::of_unit(&program.body);
+    let capture = capture::CaptureFacts::of_unit_skipping(&program.body, skips.as_ref());
     let mut cx = Compiler::new(top, capture);
+    cx.skips = skips.map(Rc::new);
     cx.eval_chain = Some(request.chain.clone());
     crate::entry::inherit_eval_chain_state(&mut cx);
     cx.lazy_unit = Some(LazyUnit {

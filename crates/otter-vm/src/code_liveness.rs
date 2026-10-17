@@ -19,6 +19,7 @@
 //! - Every candidate range is disjoint and ranges are sorted by base before a
 //!   visitor runs.
 //! - Census callbacks do not allocate, execute JavaScript, or mutate the heap.
+//! - The heap is walked once: each live body is dispatched by its type tag.
 //! - Retained [`crate::ExecutionContext`] ownership is proved separately by
 //!   the code-space payload `Arc`; timers, realm contexts, parked dynamic
 //!   imports, and other queued work therefore block physical reclamation even
@@ -109,134 +110,65 @@ pub(crate) fn census_candidate_ids(
     let mut liveness = CandidateLiveness::new(candidates);
     {
         let mut visit = |function_id| liveness.mark(function_id);
-        let heap = &interpreter.gc_heap;
-
-        heap.for_each_live_payload::<crate::value_slab::ValueSlabBody, _>(|_, body| {
-            body.visit_function_ids(&mut visit);
-        });
-        heap.for_each_live_payload::<crate::array::elements::ElementSlabBody, _>(|_, body| {
-            body.visit_function_ids(&mut visit);
-        });
-        heap.for_each_live_payload::<crate::object::slot_slab::SlotSlabBody, _>(|_, body| {
-            body.visit_function_ids(&mut visit);
-        });
-        heap.for_each_live_payload::<crate::object::ObjectBody, _>(|_, body| {
-            body.visit_function_ids(&mut visit);
-        });
-        heap.for_each_live_payload::<crate::object::ShapeBody, _>(|_, body| {
-            body.visit_function_ids(&mut visit);
-        });
-        heap.for_each_live_payload::<crate::object::ExoticSlots, _>(|_, body| {
-            body.visit_function_ids(&mut visit);
-        });
-        heap.for_each_live_payload::<crate::object::symbol_table::SymbolPropsBody, _>(|_, body| {
-            body.visit_function_ids(&mut visit);
-        });
-        heap.for_each_live_payload::<crate::object::AccessorCellBody, _>(|_, body| {
-            body.visit_function_ids(&mut visit);
-        });
-        heap.for_each_live_payload::<crate::closure_construct::ClosureRareBody, _>(|_, body| {
-            body.visit_function_ids(&mut visit);
-        });
-        heap.for_each_live_payload::<crate::constructor_layout::ConstructorLayoutBody, _>(
-            |_, body| {
-                // Layout keys are not JS callables. Real prototype values still
-                // participate in the same semantic census as immutable shapes.
-                body.visit_function_ids(&mut visit);
-            },
-        );
-        heap.for_each_live_payload::<crate::array::ArrayExoticSlots, _>(|_, body| {
-            body.visit_function_ids(&mut visit);
-        });
-        heap.for_each_live_payload::<crate::collections::table::OrderedTableBody<
-        crate::collections::MapEntry,
-    >, _>(|_, body| body.visit_function_ids(&mut visit));
-        heap.for_each_live_payload::<crate::collections::table::OrderedTableBody<
-        crate::collections::SetEntry,
-    >, _>(|_, body| body.visit_function_ids(&mut visit));
-        heap.for_each_live_payload::<crate::collections::MapBody, _>(|_, body| {
-            body.visit_function_ids(&mut visit);
-        });
-        heap.for_each_live_payload::<crate::collections::SetBody, _>(|_, body| {
-            body.visit_function_ids(&mut visit);
-        });
-        heap.for_each_live_payload::<crate::collections::WeakMapBody, _>(|_, body| {
-            body.visit_function_ids(&mut visit);
-        });
-        heap.for_each_live_payload::<crate::collections::WeakSetBody, _>(|_, body| {
-            body.visit_function_ids(&mut visit);
-        });
-        heap.for_each_live_payload::<crate::collections::weak_table::WeakTableBody<
-        crate::collections::weak_table::MapKind,
-    >, _>(|_, body| body.visit_function_ids(&mut visit));
-        heap.for_each_live_payload::<crate::collections::weak_table::WeakTableBody<
-        crate::collections::weak_table::SetKind,
-    >, _>(|_, body| body.visit_function_ids(&mut visit));
-        heap.for_each_live_payload::<crate::upvalue::UpvalueCellBody, _>(|_, body| {
-            body.visit_function_ids(&mut visit);
-        });
-        heap.for_each_live_payload::<crate::closure::JsClosureBody, _>(|_, body| {
-            body.visit_function_ids(&mut visit);
-        });
-        // A live context pins the chunk whose scope table describes it.
-        heap.for_each_live_payload::<crate::context::ContextBody, _>(|_, body| {
-            body.visit_function_ids(&mut visit);
-        });
-        heap.for_each_live_payload::<crate::eval_env::EvalExtensionBody, _>(|_, body| {
-            body.visit_function_ids(&mut visit);
-        });
-        heap.for_each_live_payload::<crate::bound_function::BoundFunctionBody, _>(|_, body| {
-            body.visit_function_ids(&mut visit);
-        });
-        heap.for_each_live_payload::<crate::class_constructor::ClassConstructorBody, _>(
-            |_, body| {
-                body.visit_function_ids(&mut visit);
-            },
-        );
-        heap.for_each_live_payload::<crate::generator::GeneratorBody, _>(|_, body| {
-            body.visit_function_ids(&mut visit);
-        });
-        heap.for_each_live_payload::<crate::generator::ParkedFrameBody, _>(|_, body| {
-            body.visit_function_ids(&mut visit);
-        });
-        heap.for_each_live_payload::<crate::promise::PurePromiseBody, _>(|_, body| {
-            body.visit_function_ids(&mut visit);
-        });
-        heap.for_each_live_payload::<crate::proxy::ProxyBodyGc, _>(|_, body| {
-            body.visit_function_ids(&mut visit);
-        });
-        heap.for_each_live_payload::<crate::proxy::PrivateSlotsBody, _>(|_, body| {
-            body.visit_function_ids(&mut visit);
-        });
-        heap.for_each_live_payload::<crate::iterator_state::IteratorState, _>(|_, body| {
-            body.visit_function_ids(&mut visit);
-        });
-        heap.for_each_live_payload::<crate::native_function::NativeFunctionBody, _>(|_, body| {
-            body.visit_function_ids(&mut visit);
-        });
-        heap.for_each_live_payload::<crate::regexp::JsRegExpBody, _>(|_, body| {
-            body.visit_function_ids(&mut visit);
-        });
-        heap.for_each_live_payload::<crate::weak_refs::WeakRefBody, _>(|_, body| {
-            body.visit_function_ids(&mut visit);
-        });
-        heap.for_each_live_payload::<crate::weak_refs::FinalizationRegistryBody, _>(|_, body| {
-            body.visit_function_ids(&mut visit);
-        });
-        heap.for_each_live_payload::<crate::binary::array_buffer::LocalArrayBufferBodyGc, _>(
-            |_, body| body.visit_function_ids(&mut visit),
-        );
-        heap.for_each_live_payload::<crate::binary::array_buffer::SharedArrayBufferBodyGc, _>(
-            |_, body| body.visit_function_ids(&mut visit),
-        );
-        heap.for_each_live_payload::<crate::binary::data_view::DataViewBodyGc, _>(|_, body| {
-            body.visit_function_ids(&mut visit);
-        });
-        heap.for_each_live_payload::<crate::binary::typed_array::TypedArrayBodyGc, _>(|_, body| {
-            body.visit_function_ids(&mut visit);
-        });
-        heap.for_each_live_payload::<crate::intl::payload::IntlBody, _>(|_, body| {
-            body.visit_function_ids(&mut visit);
+        // One walk of the pages; every body that can carry a function id is
+        // dispatched by its type tag.
+        interpreter.gc_heap.for_each_live_body(|_, body| {
+            macro_rules! dispatch {
+                ($($body:ty),* $(,)?) => {
+                    $(
+                        if let Some(body) = body.downcast::<$body>() {
+                            body.visit_function_ids(&mut visit);
+                            return;
+                        }
+                    )*
+                };
+            }
+            dispatch!(
+                crate::object::ObjectBody,
+                crate::object::slot_slab::SlotSlabBody,
+                crate::value_slab::ValueSlabBody,
+                crate::array::elements::ElementSlabBody,
+                crate::object::ShapeBody,
+                crate::closure::JsClosureBody,
+                crate::context::ContextBody,
+                crate::object::ExoticSlots,
+                crate::object::symbol_table::SymbolPropsBody,
+                crate::object::AccessorCellBody,
+                crate::closure_construct::ClosureRareBody,
+                crate::constructor_layout::ConstructorLayoutBody,
+                crate::array::ArrayExoticSlots,
+                crate::collections::table::OrderedTableBody<crate::collections::MapEntry>,
+                crate::collections::table::OrderedTableBody<crate::collections::SetEntry>,
+                crate::collections::MapBody,
+                crate::collections::SetBody,
+                crate::collections::WeakMapBody,
+                crate::collections::WeakSetBody,
+                crate::collections::weak_table::WeakTableBody<
+                    crate::collections::weak_table::MapKind,
+                >,
+                crate::collections::weak_table::WeakTableBody<
+                    crate::collections::weak_table::SetKind,
+                >,
+                crate::upvalue::UpvalueCellBody,
+                crate::eval_env::EvalExtensionBody,
+                crate::bound_function::BoundFunctionBody,
+                crate::class_constructor::ClassConstructorBody,
+                crate::generator::GeneratorBody,
+                crate::generator::ParkedFrameBody,
+                crate::promise::PurePromiseBody,
+                crate::proxy::ProxyBodyGc,
+                crate::proxy::PrivateSlotsBody,
+                crate::iterator_state::IteratorState,
+                crate::native_function::NativeFunctionBody,
+                crate::regexp::JsRegExpBody,
+                crate::weak_refs::WeakRefBody,
+                crate::weak_refs::FinalizationRegistryBody,
+                crate::binary::array_buffer::LocalArrayBufferBodyGc,
+                crate::binary::array_buffer::SharedArrayBufferBodyGc,
+                crate::binary::data_view::DataViewBodyGc,
+                crate::binary::typed_array::TypedArrayBodyGc,
+                crate::intl::payload::IntlBody,
+            );
         });
 
         interpreter.visit_root_function_ids(&mut visit);

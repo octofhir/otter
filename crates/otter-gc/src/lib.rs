@@ -104,7 +104,7 @@ pub mod test_support;
 pub mod trace;
 
 pub use branded::{GcSession, MutationSession, Root, Weak, with_gc_session};
-pub use census::{HeapCensus, SpaceCensus, TagRow};
+pub use census::{HeapCensus, LivePayload, SpaceCensus, TagRow};
 pub use compressed::{CageStats, Gc, cage_base, cage_size, cage_stats, init_cage_with_size};
 pub use external::{ExternalMemory, SharedExternalMemory};
 pub use external_refs::{ExternalRefTable, NO_EXTERNAL_REF};
@@ -119,8 +119,8 @@ pub use heap::{
 pub use heap_image::{HeapImage, ImageError, Relocation};
 pub use lab::{LAB_LIMIT_OFFSET, LAB_TOP_OFFSET, LinearAllocationArea};
 pub use observation::{
-    GcPauseCapture, GcPauseCaptureError, GcPauseKind, GcPauseOutcome, GcPauseRecord, GcPauseTrigger,
-    HeapOccupancy,
+    GcPauseCapture, GcPauseCaptureError, GcPauseKind, GcPauseOutcome, GcPauseRecord,
+    GcPauseTrigger, HeapOccupancy,
 };
 pub use oom::OutOfMemory;
 pub use page::{CARD_SIZE, PAGE_SIZE, Page, SpaceKind};

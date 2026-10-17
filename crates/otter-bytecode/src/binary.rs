@@ -45,9 +45,9 @@
 use crate::wordcode::{FunctionCode, INLINE_OPERAND_WORDS, Instruction};
 use crate::{
     ArgumentBindingStorage, ArgumentsObjectKind, BytecodeModule, ClassHintSite, Constant,
-    ExceptionHandler, Function, MappedArgumentBinding, ModuleInit, ModuleResolution,
-    ScopeDescriptor, ScopeFlags, ScopeKind, SlotDescriptor, SlotKind, SourceKind, SpanTable,
-    TemplateSite,
+    ExceptionHandler, Function, LazyEnvironment, LazyForm, LazyFunction, LazyImport,
+    LazyMethodKind, MappedArgumentBinding, ModuleInit, ModuleResolution, ScopeDescriptor,
+    ScopeFlags, ScopeKind, SlotDescriptor, SlotKind, SourceKind, SpanTable, TemplateSite,
     encoding::{op_from_byte, op_to_byte},
     verifier::{BytecodeVerifyError, VerifiedBytecodeModule},
 };
@@ -128,6 +128,7 @@ fn encode_module_into(
         Some(_) if detach_source => out.u8(DETACHED_FUNCTION_SOURCE),
         source => out.optional_string(source.as_ref()),
     }
+    out.seq(&module.lazy_environments, Writer::lazy_environment);
     out.finish()
 }
 
@@ -249,6 +250,7 @@ fn decode_module_parts(bytes: &[u8], detached_source: Option<&str>) -> Option<By
         }
         _ => return None,
     };
+    let lazy_environments = input.seq(Reader::lazy_environment)?;
     if !input.is_at_end() {
         return None;
     }
@@ -261,6 +263,7 @@ fn decode_module_parts(bytes: &[u8], detached_source: Option<&str>) -> Option<By
         constants,
         module_resolutions,
         module_inits,
+        lazy_environments,
     })
 }
 
@@ -652,12 +655,95 @@ impl Writer {
             }
             None => self.bool(false),
         }
+        match &function.lazy {
+            Some(lazy) => {
+                self.bool(true);
+                self.lazy_function(lazy);
+            }
+            None => self.bool(false),
+        }
         self.function_code(&function.code);
         self.seq(&function.handlers, Self::exception_handler);
         self.spans(&function.spans);
         self.u32_seq(&function.number_hint_sites);
         self.seq(&function.class_hint_sites, Self::class_hint_site);
     }
+}
+
+impl Writer {
+    fn lazy_function(&mut self, lazy: &LazyFunction) {
+        self.span(lazy.range);
+        match lazy.form {
+            LazyForm::Function => self.u8(0),
+            LazyForm::Arrow {
+                enclosing_async,
+                enclosing_generator,
+                derived_constructor,
+            } => {
+                self.u8(1);
+                self.bool(enclosing_async);
+                self.bool(enclosing_generator);
+                self.bool(derived_constructor);
+            }
+            LazyForm::FunctionDeclaration => self.u8(4),
+            LazyForm::ObjectMethod(kind) => {
+                self.u8(2);
+                self.u8(lazy_method_kind_tag(kind));
+            }
+            LazyForm::ClassMethod(kind) => {
+                self.u8(3);
+                self.u8(lazy_method_kind_tag(kind));
+            }
+        }
+        for flag in [
+            lazy.outer_strict,
+            lazy.has_home_object,
+            lazy.static_home,
+            lazy.self_binding,
+            lazy.dot_arguments_observed,
+            lazy.in_field_initializer,
+            lazy.module_goal,
+            lazy.typescript,
+            lazy.jsx,
+        ] {
+            self.bool(flag);
+        }
+    }
+
+    fn lazy_environment(&mut self, environment: &LazyEnvironment) {
+        self.string(&environment.module_url);
+        self.seq(&environment.imports, |out, import| {
+            out.string(&import.alias);
+            out.u16(import.record);
+            out.string(&import.source_name);
+            out.bool(import.is_namespace);
+            out.bool(import.is_deferred);
+            out.string(&import.specifier);
+            out.optional_string(import.attr_type.as_ref());
+        });
+        self.seq(&environment.reexports, |out, (local, exported)| {
+            out.string(local);
+            out.seq(exported, |out, name| out.string(name));
+        });
+        self.seq(&environment.script_lexicals, |out, name| out.string(name));
+    }
+}
+
+const fn lazy_method_kind_tag(kind: LazyMethodKind) -> u8 {
+    match kind {
+        LazyMethodKind::Method => 0,
+        LazyMethodKind::Getter => 1,
+        LazyMethodKind::Setter => 2,
+    }
+}
+
+fn lazy_method_kind_from_tag(tag: u8) -> Option<LazyMethodKind> {
+    Some(match tag {
+        0 => LazyMethodKind::Method,
+        1 => LazyMethodKind::Getter,
+        2 => LazyMethodKind::Setter,
+        _ => return None,
+    })
 }
 
 struct Reader<'a> {
@@ -1019,6 +1105,11 @@ impl<'a> Reader<'a> {
         } else {
             None
         };
+        let lazy = if self.bool()? {
+            Some(self.lazy_function()?)
+        } else {
+            None
+        };
         let code = self.function_code()?;
         let handlers = self.seq(Self::exception_handler)?;
         let spans = self.spans()?;
@@ -1053,11 +1144,68 @@ impl<'a> Reader<'a> {
             asm_module,
             source_text_range,
             source_text_span,
+            lazy,
             code,
             handlers,
             spans,
             number_hint_sites,
             class_hint_sites,
+        })
+    }
+
+    fn lazy_function(&mut self) -> Option<LazyFunction> {
+        let range = self.span()?;
+        let form = match self.u8()? {
+            0 => LazyForm::Function,
+            1 => LazyForm::Arrow {
+                enclosing_async: self.bool()?,
+                enclosing_generator: self.bool()?,
+                derived_constructor: self.bool()?,
+            },
+            4 => LazyForm::FunctionDeclaration,
+            2 => LazyForm::ObjectMethod(lazy_method_kind_from_tag(self.u8()?)?),
+            3 => LazyForm::ClassMethod(lazy_method_kind_from_tag(self.u8()?)?),
+            _ => return None,
+        };
+        Some(LazyFunction {
+            range,
+            form,
+            outer_strict: self.bool()?,
+            has_home_object: self.bool()?,
+            static_home: self.bool()?,
+            self_binding: self.bool()?,
+            dot_arguments_observed: self.bool()?,
+            in_field_initializer: self.bool()?,
+            module_goal: self.bool()?,
+            typescript: self.bool()?,
+            jsx: self.bool()?,
+        })
+    }
+
+    fn lazy_environment(&mut self) -> Option<LazyEnvironment> {
+        let module_url = self.string()?;
+        let imports = self.seq(|input| {
+            Some(LazyImport {
+                alias: input.string()?,
+                record: input.u16()?,
+                source_name: input.string()?,
+                is_namespace: input.bool()?,
+                is_deferred: input.bool()?,
+                specifier: input.string()?,
+                attr_type: input.optional_string()?,
+            })
+        })?;
+        let reexports = self.seq(|input| {
+            let local = input.string()?;
+            let exported = input.seq(Reader::string)?;
+            Some((local, exported))
+        })?;
+        let script_lexicals = self.seq(Reader::string)?;
+        Some(LazyEnvironment {
+            module_url,
+            imports,
+            reexports,
+            script_lexicals,
         })
     }
 }
@@ -1126,6 +1274,7 @@ const fn slot_kind_tag(kind: SlotKind) -> (u8, Option<bool>) {
         SlotKind::ModuleEnv => (17, None),
         SlotKind::ImportMeta => (18, None),
         SlotKind::Synthetic => (19, None),
+        SlotKind::PrivateMethod => (20, None),
     }
 }
 
@@ -1154,6 +1303,7 @@ const fn slot_kind_from_tag(tag: u8, payload: Option<bool>) -> Option<SlotKind> 
         (16, None) => SlotKind::ClassSelf,
         (17, None) => SlotKind::ModuleEnv,
         (18, None) => SlotKind::ImportMeta,
+        (20, None) => SlotKind::PrivateMethod,
         (19, None) => SlotKind::Synthetic,
         _ => return None,
     })
@@ -1269,6 +1419,7 @@ mod tests {
                 asm_module: false,
                 source_text_range: Some((0, 18)),
                 source_text_span: Some((0, 18)),
+                lazy: None,
                 code: code.finish(),
                 handlers: vec![ExceptionHandler {
                     start: 0,
@@ -1316,6 +1467,7 @@ mod tests {
                 url: "file:///entry.ts".to_string(),
                 function_id: 0,
             }],
+            lazy_environments: Vec::new(),
         }
     }
 
@@ -1361,7 +1513,60 @@ mod tests {
         assert_eq!(scope_kind_from_tag(15), None);
         assert_eq!(slot_kind_from_tag(3, None), None);
         assert_eq!(slot_kind_from_tag(0, Some(true)), None);
-        assert_eq!(slot_kind_from_tag(20, None), None);
+        assert_eq!(slot_kind_from_tag(20, None), Some(SlotKind::PrivateMethod));
+        assert_eq!(slot_kind_from_tag(21, None), None);
+    }
+
+    #[test]
+    fn lazy_records_and_environments_round_trip() {
+        let mut module = sample_module();
+        module.functions[0].lazy = Some(LazyFunction {
+            range: (3, 17),
+            form: LazyForm::Arrow {
+                enclosing_async: true,
+                enclosing_generator: false,
+                derived_constructor: true,
+            },
+            outer_strict: true,
+            has_home_object: true,
+            static_home: false,
+            self_binding: false,
+            dot_arguments_observed: true,
+            in_field_initializer: false,
+            module_goal: true,
+            typescript: false,
+            jsx: true,
+        });
+        module.lazy_environments = vec![LazyEnvironment {
+            module_url: "file:///entry.ts".to_string(),
+            imports: vec![LazyImport {
+                alias: "a".to_string(),
+                record: 2,
+                source_name: "b".to_string(),
+                is_namespace: false,
+                is_deferred: true,
+                specifier: "./c.js".to_string(),
+                attr_type: Some("json".to_string()),
+            }],
+            reexports: vec![("x".to_string(), vec!["y".to_string()])],
+            script_lexicals: vec!["z".to_string()],
+        }];
+        for form in [
+            LazyForm::Function,
+            LazyForm::FunctionDeclaration,
+            LazyForm::ObjectMethod(LazyMethodKind::Getter),
+            LazyForm::ClassMethod(LazyMethodKind::Setter),
+        ] {
+            let mut variant = module.clone();
+            if let Some(lazy) = &mut variant.functions[0].lazy {
+                lazy.form = form;
+            }
+            let restored = decode_unverified_module(&encode_module(&variant)).expect("round trip");
+            assert_eq!(restored.functions[0].lazy, variant.functions[0].lazy);
+        }
+        let restored = decode_unverified_module(&encode_module(&module)).expect("round trip");
+        assert_eq!(restored.functions[0].lazy, module.functions[0].lazy);
+        assert_eq!(restored.lazy_environments, module.lazy_environments);
     }
 
     #[test]

@@ -91,6 +91,7 @@ pub(crate) fn compile_method_call(
     // (`with`-probe, guarded `eval`) keep their temps and are skipped.
     let call_mark = cx.scratch;
     let callee = peel_paren_eval(unwrap_ts_expr(&call.callee));
+    crate::expr::mark_eager_if_function(cx, callee);
     // `super(args...)` — direct super-constructor call. Only valid
     // inside a derived-class constructor; resolving the class-scope
     // parent slot surfaces a clear diagnostic when used elsewhere.

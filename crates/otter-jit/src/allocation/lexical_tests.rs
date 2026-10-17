@@ -80,6 +80,7 @@ fn fixture_view() -> JitCompileSnapshot {
             constants: Vec::new(),
             module_resolutions: Vec::new(),
             module_inits: Vec::new(),
+            lazy_environments: Vec::new(),
             function_source: None,
         },
         otter_vm::source_registry::SourceRegistry::default(),

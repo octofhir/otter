@@ -86,6 +86,7 @@ fn views() -> Vec<JitCompileSnapshot> {
             template_sites: vec![],
             module_resolutions: vec![],
             module_inits: vec![],
+            lazy_environments: Vec::new(),
         },
         Default::default(),
     )

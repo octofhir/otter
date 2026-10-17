@@ -479,8 +479,13 @@ pub fn default_compile_source(
     source: &SourceInput,
     specifier: &str,
 ) -> Result<CompiledModule, OtterError> {
-    otter_compiler::compile_script_source_to_module(&source.text, source.kind, specifier)
-        .map_err(|err| crate::map_compile_error(err, specifier))
+    otter_compiler::compile_script_source_to_module_with_options(
+        &source.text,
+        source.kind,
+        specifier,
+        crate::LAZY_FUNCTIONS,
+    )
+    .map_err(|err| crate::map_compile_error(err, specifier))
 }
 
 #[cfg(test)]

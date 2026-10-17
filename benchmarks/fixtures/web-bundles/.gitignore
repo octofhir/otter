@@ -1,0 +1,4 @@
+# Third-party page bundles: fetched locally by scripts/dev/fetch_web_bundles.py,
+# never committed. The manifests record what was fetched.
+*.js
+*.mjs

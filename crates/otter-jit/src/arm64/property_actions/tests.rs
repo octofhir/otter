@@ -51,6 +51,7 @@ fn snapshot() -> JitCompileSnapshot {
             constants: vec![],
             module_resolutions: vec![],
             module_inits: vec![],
+            lazy_environments: Vec::new(),
             function_source: None,
         },
         Default::default(),

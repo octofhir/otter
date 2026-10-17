@@ -58,6 +58,9 @@
 //!   Dropping the final table/source owner releases its physical data and charge.
 //!   Persistent tombstone nodes and actual vector capacity remain charged until
 //!   their directory drops; eviction totals describe live payload bytes only.
+//! - A lazily compiled body links as an ordinary pinned chunk; only its
+//!   executable view knows the id of the record it replaces
+//!   ([`CodeSpace::link_lazy_body`]).
 //! - IC-site bases keep dense property-IC ids globally unique, so two
 //!   chunks never alias one interpreter IC slot.
 //! - Snapshot restore owns a new directory and fresh mutable execution state.
@@ -463,17 +466,18 @@ fn build_chunk(
     function_count: u32,
     property_ic_base: u32,
     retention: ChunkRetention,
+    alias: Option<u32>,
     account: &ResourceAccount,
 ) -> Result<Arc<CodeChunk>, BytecodeLinkError> {
     // `<main>` runs as soon as the chunk links, so its proof is established
     // here; every other function is verified when it is first built.
     verified.function(0)?;
     let module = LinkedBytecode::new(verified, account)?;
-    let executable = Arc::new(ExecutableModule::lazy(
-        Arc::clone(&module),
-        property_ic_base,
-        account,
-    )?);
+    let mut executable = ExecutableModule::lazy(Arc::clone(&module), property_ic_base, account)?;
+    if let Some(alias) = alias {
+        executable = executable.with_alias(alias);
+    }
+    let executable = Arc::new(executable);
     let metadata_bytes = (std::mem::size_of::<ChunkPayload>() as u64)
         .saturating_add(std::mem::size_of::<AtomTable>() as u64)
         .saturating_add(AtomTable::allocation_bytes(&module.constants));
@@ -575,12 +579,42 @@ impl CodeSpace {
         self.link_module_with_retention(module, sources, account, ChunkRetention::Evictable)
     }
 
+    /// Link the body compiled for lazy record `alias` as its own chunk:
+    /// function 0 runs under `alias`, and the creating chunk forwards that
+    /// id to this chunk once [`ExecutableModule::set_forward`] records it.
+    pub(crate) fn link_lazy_body(
+        self: &Arc<Self>,
+        module: BytecodeModule,
+        sources: SourceRegistry,
+        account: &ResourceAccount,
+        alias: u32,
+    ) -> Result<ExecutionContext, BytecodeLinkError> {
+        self.link_module_with_alias(
+            module,
+            sources,
+            account,
+            ChunkRetention::Pinned,
+            Some(alias),
+        )
+    }
+
     fn link_module_with_retention(
+        self: &Arc<Self>,
+        module: BytecodeModule,
+        sources: SourceRegistry,
+        account: &ResourceAccount,
+        retention: ChunkRetention,
+    ) -> Result<ExecutionContext, BytecodeLinkError> {
+        self.link_module_with_alias(module, sources, account, retention, None)
+    }
+
+    fn link_module_with_alias(
         self: &Arc<Self>,
         mut module: BytecodeModule,
         sources: SourceRegistry,
         account: &ResourceAccount,
         retention: ChunkRetention,
+        alias: Option<u32>,
     ) -> Result<ExecutionContext, BytecodeLinkError> {
         let _link = self
             .link
@@ -600,6 +634,7 @@ impl CodeSpace {
             function_count,
             property_ic_base,
             retention,
+            alias,
             account,
         )?;
         publish_chunk(self, Arc::clone(&chunk), account)?;
@@ -667,6 +702,7 @@ impl CodeSpace {
             function_count,
             property_ic_base,
             retention,
+            None,
             account,
         )?;
         publish_chunk(self, Arc::clone(&chunk), account)?;
@@ -1039,6 +1075,7 @@ mod tests {
                 url: "test:mod".to_string(),
                 function_id: 1,
             }],
+            lazy_environments: Vec::new(),
             function_source: None,
         }
     }

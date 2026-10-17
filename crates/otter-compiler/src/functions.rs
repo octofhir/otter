@@ -200,6 +200,9 @@ pub(crate) fn compile_function_impl(
     let class_ctor = std::mem::take(&mut parent.next_fn_class_ctor);
     let static_home = std::mem::take(&mut parent.next_fn_static_home);
     let source_text_span = std::mem::take(&mut parent.next_fn_source_text_span);
+    let lazy_method = std::mem::take(&mut parent.next_fn_lazy_method);
+    let eager = std::mem::take(&mut parent.next_fn_eager);
+    let declaration = std::mem::take(&mut parent.next_fn_declaration);
     let module = Rc::clone(&parent.top_mut().module);
     let body_has_strict_directive = body.is_some_and(|b| b.has_use_strict_directive());
     let function_is_strict = force_strict || parent.is_strict || body_has_strict_directive;
@@ -208,6 +211,88 @@ pub(crate) fn compile_function_impl(
     // §15.4.1 — MethodDefinition uses UniqueFormalParameters even in
     // sloppy code; arrows never allow duplicates.
     let allow_duplicate_formals = !function_is_strict && simple_params && !is_method && !is_arrow;
+    // A body that may wait for its first call: the unit compiles lazily, the
+    // function is not run as soon as it is created, and nothing about it
+    // needs the creating frame (constructors and their field initializers).
+    let top_level_eager = parent
+        .lazy_unit
+        .is_some_and(|unit| unit.top_level_eager && parent.stack.len() == 1);
+    let lazy_form = match parent.lazy_unit {
+        Some(_)
+            if !eager
+                && !top_level_eager
+                && body.is_some()
+                && fields.is_none()
+                && !hinted_home
+                && !hinted_derived_ctor
+                && !class_ctor =>
+        {
+            if is_arrow {
+                let (enclosing_async, enclosing_generator, derived_constructor) =
+                    parent.enclosing_function_kind();
+                Some((
+                    otter_bytecode::LazyForm::Arrow {
+                        enclosing_async,
+                        enclosing_generator,
+                        derived_constructor,
+                    },
+                    span,
+                ))
+            } else if is_method {
+                lazy_method
+            } else if declaration {
+                Some((otter_bytecode::LazyForm::FunctionDeclaration, span))
+            } else {
+                Some((otter_bytecode::LazyForm::Function, span))
+            }
+        }
+        _ => None,
+    };
+    if let (Some((form, range)), Some(unit)) = (lazy_form, parent.lazy_unit) {
+        validate_formal_parameter_names(params, function_is_strict, allow_duplicate_formals, span)?;
+        let lazy = otter_bytecode::LazyFunction {
+            range,
+            form,
+            outer_strict: parent.is_strict,
+            // An arrow's `super` is its enclosing method's.
+            has_home_object: if is_arrow {
+                parent
+                    .stack
+                    .iter()
+                    .rev()
+                    .find(|frame| !frame.is_arrow)
+                    .is_some_and(|frame| frame.has_home_object)
+            } else {
+                is_method
+            },
+            static_home: if is_arrow {
+                parent.super_home_static
+            } else {
+                static_home
+            },
+            self_binding: nfe_self,
+            dot_arguments_observed: parent.dot_arguments_observed,
+            in_field_initializer: parent.in_field_initializer,
+            module_goal: unit.module_goal,
+            typescript: unit.typescript,
+            jsx: unit.jsx,
+        };
+        return Ok(push_lazy_function(
+            parent,
+            LazyRecord {
+                name,
+                span,
+                source_text_span,
+                is_strict: function_is_strict,
+                params,
+                is_async,
+                is_generator,
+                is_method,
+                is_arrow,
+                lazy,
+            },
+        ));
+    }
     let fields_contain_eval = fields.as_ref().is_some_and(|injection| {
         injection.fields.iter().any(|field| {
             field
@@ -288,6 +373,8 @@ pub(crate) fn compile_function_impl(
     child.dot_arguments_observed = parent.dot_arguments_observed;
     child.active_with_envs = active_with_envs;
     child.is_async_generator = is_async_generator;
+    child.is_async = is_async;
+    child.is_generator = is_generator;
     child.proper_tail_calls = !is_async && !is_generator && !class_ctor;
     let formal_names: Vec<String> = formal_parameter_bound_names(params);
     let mut self_name_referenced = false;
@@ -438,6 +525,61 @@ pub(crate) fn compile_function_impl(
         needs_context: record,
         is_arrow,
     })
+}
+
+/// The call-visible shape of a function whose body compiles on first call.
+struct LazyRecord<'r, 'a> {
+    name: &'r str,
+    span: (u32, u32),
+    source_text_span: Option<(u32, u32)>,
+    is_strict: bool,
+    params: &'r oxc_ast::ast::FormalParameters<'a>,
+    is_async: bool,
+    is_generator: bool,
+    is_method: bool,
+    is_arrow: bool,
+    lazy: otter_bytecode::LazyFunction,
+}
+
+/// Register a lazily compiled function: its call-visible shape and a
+/// placeholder body the first call replaces. Its closure captures the
+/// creator's innermost context whatever the body turns out to read.
+fn push_lazy_function(parent: &mut Compiler, record: LazyRecord<'_, '_>) -> ClosureRecord {
+    let module = Rc::clone(&parent.top_mut().module);
+    let function_id = module.borrow().functions.len() as u32;
+    let mut code = FunctionCodeBuilder::new();
+    code.push(Op::ReturnUndefined, &[]);
+    let finished = code.finish();
+    let spans = vec![SpanEntry {
+        pc: 0,
+        span: record.span,
+    }];
+    module.borrow_mut().functions.push(Function {
+        id: function_id,
+        name: record.name.to_string(),
+        span: record.span,
+        source_text_span: record.source_text_span,
+        is_strict: record.is_strict,
+        module_url: parent.module_url.clone(),
+        param_count: u16::try_from(record.params.items.len()).expect("too many parameters"),
+        length: formal_parameter_length(record.params),
+        has_rest: record.params.rest.is_some(),
+        is_async: record.is_async,
+        is_generator: record.is_generator,
+        is_async_generator: record.is_async && record.is_generator,
+        is_method: record.is_method,
+        is_arrow: record.is_arrow,
+        lazy: Some(record.lazy),
+        code: finished,
+        spans: otter_bytecode::SpanTable::new(&spans),
+        ..Default::default()
+    });
+    ClosureRecord {
+        function_id,
+        ctx: parent.innermost_ctx(),
+        needs_context: true,
+        is_arrow: record.is_arrow,
+    }
 }
 
 struct FunctionScopes<'r, 'a> {

@@ -60,6 +60,7 @@ fn views(caller: Function, middle: Function, base: Function) -> Vec<JitCompileSn
             template_sites: vec![],
             module_resolutions: vec![],
             module_inits: vec![],
+            lazy_environments: Vec::new(),
         },
         Default::default(),
     )

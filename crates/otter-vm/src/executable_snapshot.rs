@@ -42,6 +42,18 @@ impl ExecutableModule {
             bytecode: Arc::clone(&self.bytecode),
             ic_bases: self.ic_bases.clone(),
             property_ic_site_end: self.property_ic_site_end,
+            forwards: self
+                .forwards
+                .iter()
+                .map(|forward| {
+                    let copy = OnceLock::new();
+                    if let Some(base) = forward.get() {
+                        let _ = copy.set(*base);
+                    }
+                    copy
+                })
+                .collect(),
+            alias: self.alias,
             account: account.clone(),
             _table_lease: table_lease,
         })

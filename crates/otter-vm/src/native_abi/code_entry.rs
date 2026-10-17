@@ -123,6 +123,17 @@ impl FunctionEntryCell {
         self.publish(std::ptr::from_ref(&self.interpreter) as u64);
     }
 
+    /// Give a lazy record's entry the layout of the body its first call
+    /// compiled. The record has run no generation but its placeholder, so
+    /// the interpreter destination is rebuilt in place, at the address
+    /// native linkage already holds.
+    pub(crate) fn relayout_lazy_body(&mut self, register_count: u16, call_flags: u32) {
+        self.register_count = register_count;
+        self.call_flags = call_flags;
+        self.interpreter = CodeEntryCell::interpreter(self.function_id, register_count);
+        self.restore_interpreter();
+    }
+
     /// Registry-owned interpreter destination, including its generated feedback.
     pub(crate) fn interpreter_destination(&self) -> &CodeEntryCell {
         &self.interpreter

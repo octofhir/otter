@@ -143,8 +143,7 @@ use std::time::Duration;
 
 use otter_bytecode::{BytecodeModule, SpanEntry};
 use otter_compiler::{
-    compile_script_program, compile_script_source, compile_script_source_to_module,
-    compile_script_source_with_top_level_await,
+    compile_script_program, compile_script_source, compile_script_source_with_top_level_await,
 };
 use otter_gc::GcStats;
 use otter_syntax::{SourceKind, SyntaxDiagnostic, SyntaxError, detect_source_kind, with_program};
@@ -3118,6 +3117,7 @@ impl Runtime {
         // §19.4.1 / §20.2.1.1 — the eval hook is host machinery, not
         // heap state, so a restored isolate wires it fresh.
         interp.set_eval_hook(Some(standard_eval_hook(config.hooks.shared_compile_hook())));
+        interp.set_lazy_compile_hook(Some(lazy_compile_hook()));
         if let Some(hook) = config.promise_rejection_hook.clone() {
             interp.set_promise_rejection_hook(hook);
         }
@@ -3318,6 +3318,7 @@ impl Runtime {
                 // §19.4.1 / §20.2.1.1 — wire the eval hook so `eval(src)` /
                 // `new Function(...)` reach a real parse + compile path.
                 interp.set_eval_hook(Some(standard_eval_hook(config.hooks.shared_compile_hook())));
+                interp.set_lazy_compile_hook(Some(lazy_compile_hook()));
                 interp.set_jit_debug_request(config.jit_debug);
                 if let Some(factory) = &config.tracer_factory {
                     interp.set_tracer(Some(factory.build()));
@@ -3740,6 +3741,16 @@ impl Runtime {
     #[must_use]
     pub fn resource_snapshot(&self) -> ResourceSnapshot {
         self.config.resource_account.snapshot()
+    }
+
+    /// How many functions this runtime compiled on their first call.
+    ///
+    /// Scripts and modules compile only the code that runs as soon as it
+    /// is created; every other function body compiles when it is first
+    /// called, once.
+    #[must_use]
+    pub fn lazy_function_bodies_compiled(&self) -> u64 {
+        self.interp.lazy_bodies_compiled()
     }
 
     /// Cooperative cancellation handle.
@@ -6064,8 +6075,13 @@ impl Runtime {
             CompiledModule::from_bytecode(bytecode)
                 .map_err(|err| map_compile_error(err, specifier))?
         } else {
-            compile_script_source_to_module(&source.text, source.kind, specifier)
-                .map_err(|err| map_compile_error(err, specifier))?
+            otter_compiler::compile_script_source_to_module_with_options(
+                &source.text,
+                source.kind,
+                specifier,
+                LAZY_FUNCTIONS,
+            )
+            .map_err(|err| map_compile_error(err, specifier))?
         };
         self.source_maps
             .record_compiled_metadata(&compiled.metadata);
@@ -6449,7 +6465,7 @@ impl Runtime {
                 if program_looks_like_module(program) {
                     return Ok(None);
                 }
-                compile_script_program(program, source.kind, &specifier)
+                compile_script_program(program, source.kind, &specifier, LAZY_FUNCTIONS)
                     .map(Some)
                     .map_err(|err| map_compile_error(err, &specifier))
             })
@@ -7446,6 +7462,30 @@ fn map_syntax_diagnostic(diagnostic: &SyntaxDiagnostic, source_url: &str) -> Dia
     )
 }
 
+/// Compile policy of the scripts and modules a runtime loads: a function
+/// that does not run as soon as it is created compiles its body on its
+/// first call.
+pub(crate) const LAZY_FUNCTIONS: otter_compiler::CompileOptions = otter_compiler::CompileOptions {
+    lazy_functions: true,
+};
+
+/// The compiler of lazily compiled function bodies.
+pub(crate) fn lazy_compile_hook() -> otter_vm::LazyCompileHook {
+    std::sync::Arc::new(|input: otter_vm::LazyCompileInput<'_>| {
+        otter_compiler::compile_lazy_function(otter_compiler::LazyCompileRequest {
+            source: input.source,
+            function: input.function,
+            chain: input.chain,
+            environment: input.environment,
+            resolutions: input.resolutions,
+        })
+        .map_err(|error| match error {
+            otter_compiler::CompileError::Syntax { messages, .. } => messages.join("; "),
+            other => other.to_string(),
+        })
+    })
+}
+
 pub(crate) fn map_compile_error(err: otter_compiler::CompileError, source_url: &str) -> OtterError {
     use otter_compiler::CompileError;
     match err {
@@ -8143,8 +8183,12 @@ mod tests {
                 format!("globalThis.__otterCompileHookCacheMarker = {marker};")
             });
             let text = replacement.as_deref().unwrap_or(&request.source.text);
-            compile_script_source_to_module(text, request.source.kind, &request.source.url)
-                .map_err(|error| map_compile_error(error, &request.source.url))
+            otter_compiler::compile_script_source_to_module(
+                text,
+                request.source.kind,
+                &request.source.url,
+            )
+            .map_err(|error| map_compile_error(error, &request.source.url))
         }
     }
 
@@ -8152,9 +8196,10 @@ mod tests {
         source_url: &str,
         spans: &[(u32, u32, (u32, u32))],
     ) -> CompiledModuleMetadata {
-        let mut metadata = compile_script_source_to_module("", SourceKind::JavaScript, source_url)
-            .expect("empty source compiles")
-            .metadata;
+        let mut metadata =
+            otter_compiler::compile_script_source_to_module("", SourceKind::JavaScript, source_url)
+                .expect("empty source compiles")
+                .metadata;
         metadata.source_url = source_url.to_string();
         let mut by_function = BTreeMap::<u32, Vec<SpanEntry>>::new();
         for &(function_id, pc, span) in spans {
@@ -8322,8 +8367,12 @@ mod tests {
         let source = "globalThis.__otterCompileHookCacheMarker = 0;";
         let specifier = format!("<bootstrap:{COMPILE_HOOK_CACHE_TEST_NAME}>");
         let key = compile_cache::cache_key(source, SourceKind::JavaScript, &specifier);
-        let seed = compile_script_source_to_module(source, SourceKind::JavaScript, &specifier)
-            .expect("default compiler seed");
+        let seed = otter_compiler::compile_script_source_to_module(
+            source,
+            SourceKind::JavaScript,
+            &specifier,
+        )
+        .expect("default compiler seed");
         cache.store(&key, &seed.bytecode);
         assert!(cache.load(&key, "").is_some());
 
@@ -8410,7 +8459,7 @@ mod tests {
         let specifier = format!("<bootstrap:{name}>");
         let key = compile_cache::cache_key(source, SourceKind::JavaScript, &specifier);
 
-        let mut hostile = compile_script_source_to_module(
+        let mut hostile = otter_compiler::compile_script_source_to_module(
             "globalThis.__cacheMetadataFallback = 99;",
             SourceKind::JavaScript,
             &specifier,

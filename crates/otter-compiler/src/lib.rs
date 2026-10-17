@@ -62,6 +62,7 @@ mod for_loops;
 mod function_context;
 mod functions;
 mod hoist;
+mod lazy;
 mod module_state;
 mod params;
 mod scope;
@@ -84,9 +85,11 @@ pub use compiled_module::{
 pub use entry::{
     compile_eval_source, compile_module_program, compile_module_program_to_module,
     compile_script_program, compile_script_source, compile_script_source_to_module,
-    compile_script_source_with_forced_strict, compile_script_source_with_top_level_await,
+    compile_script_source_to_module_with_options, compile_script_source_with_forced_strict,
+    compile_script_source_with_top_level_await,
 };
 pub use errors::CompileError;
+pub use lazy::{CompileOptions, LazyCompileRequest, compile_lazy_function};
 pub use module_state::{ImportRequest, ModuleHostInfo};
 pub use ts_erasure::unwrap_ts_expr;
 
@@ -156,7 +159,12 @@ mod tests {
 
     fn compile_module_src(src: &str, host: &ModuleHostInfo) -> BytecodeModule {
         let module = with_program(src, SyntaxSourceKind::TypeScript, |program| {
-            compile_module_program(program, SyntaxSourceKind::TypeScript, host)
+            compile_module_program(
+                program,
+                SyntaxSourceKind::TypeScript,
+                host,
+                CompileOptions::default(),
+            )
         })
         .unwrap()
         .unwrap();
@@ -171,7 +179,12 @@ mod tests {
         // parse-level case into `CompileError::Syntax` so both are reported the
         // same way, matching the script entry points.
         match with_program(src, SyntaxSourceKind::TypeScript, |program| {
-            compile_module_program(program, SyntaxSourceKind::TypeScript, host)
+            compile_module_program(
+                program,
+                SyntaxSourceKind::TypeScript,
+                host,
+                CompileOptions::default(),
+            )
         }) {
             Ok(result) => result.unwrap_err(),
             Err(syntax) => CompileError::from(syntax),

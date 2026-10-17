@@ -135,6 +135,17 @@ fn interpreter_turn(ctx: *mut JitCtx, entering: bool) -> NativeResultPair {
     ctx.completion_destination = u32::MAX;
     ctx.completion_generation = 0;
     let tier_completion = destination == crate::native_abi::TIER_COMPLETION_DESTINATION;
+    // The first entry of a lazy record compiles its body, then enters the
+    // body in this activation's place.
+    if fresh_entry
+        && !tier_completion
+        && matches!(resume, crate::prepared_call::ResumeInput::Normal)
+        && unsafe { (*frame).header.pc } == 0
+        && unsafe { (*frame).header.kind } == crate::native_abi::NativeFrameKind::Interpreter
+        && context.lazy_pending(unsafe { (*frame).header.function_id })
+    {
+        return enter_lazy_body(ctx, vm, stack, context, frame);
+    }
     if tier_completion && let Some(status) = completion.validate(NativeResultDomain::Compiled) {
         vm.jit_code_registry
             .note_completion(u64::from(generation), status);
@@ -319,6 +330,83 @@ fn interpreter_turn(ctx: *mut JitCtx, entering: bool) -> NativeResultPair {
             }
             NativeResultPair::fatal_internal()
         }
+    }
+}
+
+/// Compile the body of the lazy record the published `frame` was entered
+/// for, then re-enter the same call — callee, receiver, `new.target`,
+/// actual arguments and construction state — as a tail call, so the
+/// trampoline builds the body's own frame in this one's place.
+fn enter_lazy_body(
+    ctx: &mut JitCtx,
+    vm: &mut Interpreter,
+    stack: &mut ActivationStack,
+    context: &ExecutionContext,
+    frame: *mut crate::native_abi::Frame,
+) -> NativeResultPair {
+    // SAFETY: the trampoline published this frame for the whole entry.
+    let record = unsafe { &mut *frame };
+    let function_id = record.header.function_id;
+    let callee = record.self_value;
+    let closure_context = callee
+        .as_closure(&vm.gc_heap)
+        .map_or(Value::undefined(), |closure| closure.context(&vm.gc_heap));
+    if let Err(error) = vm.compile_lazy_body(context, function_id, closure_context) {
+        vm.frame_release_cold(record);
+        return match error {
+            VmError::Uncaught => match vm.pending_uncaught_throw.take() {
+                Some(exception) => NativeResultPair::throw_value(exception),
+                None => NativeResultPair::fatal_internal(),
+            },
+            error => {
+                if let Some(slot) = unsafe { ctx.error.as_mut() } {
+                    *slot = Some(error);
+                }
+                NativeResultPair::fatal_internal()
+            }
+        };
+    }
+    let construct = record.is_construct();
+    let arguments: smallvec::SmallVec<[Value; 8]> = if record.argument_count == 0 {
+        smallvec::SmallVec::new()
+    } else {
+        // SAFETY: the actual window holds `argument_count` initialized
+        // values for the frame's whole extent.
+        unsafe { std::slice::from_raw_parts(record.actuals, record.argument_count as usize) }
+            .iter()
+            .copied()
+            .collect()
+    };
+    stack.stage_call(
+        callee,
+        record.this_value,
+        construct.then_some(record.new_target_value),
+        arguments,
+        None,
+    );
+    // SAFETY: the published record is anchored at its live machine frame.
+    let caller_return_pc = unsafe { record.return_pc_into_caller() };
+    let Some(request) = stack.staged_request_mut() else {
+        return NativeResultPair::fatal_internal();
+    };
+    request.return_destination = record.return_destination;
+    request.caller = record.caller;
+    request.caller_return_pc = caller_return_pc;
+    request.construct_layout = record.construct_layout;
+    request.construct_receiver = record.construct_receiver;
+    request.super_origin = record.super_origin;
+    let inherited =
+        record.header.flags.bits() & crate::native_abi::NativeFrameFlags::DERIVED_CONSTRUCTOR;
+    request.header.flags = crate::native_abi::NativeFrameFlags::from_bits(
+        request.header.flags.bits() | inherited | crate::native_abi::NativeFrameFlags::TAIL_CALL,
+    );
+    vm.frame_release_cold(record);
+    match stack.take_request() {
+        Some(packet) => {
+            ctx.pending_call = packet;
+            NativeResultPair::continue_execution()
+        }
+        None => NativeResultPair::fatal_internal(),
     }
 }
 

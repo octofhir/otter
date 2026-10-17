@@ -160,18 +160,22 @@ fn compile_class_strict(
     let private_bound = collect_class_private_bound(&class.body);
     cx.class_private_names
         .push(private_bound.iter().cloned().collect());
+    let instance_methods = collect_class_private_instance_methods(&class.body);
     for name in &private_bound {
         let scratch_mark = cx.scratch;
         let binding = private_name_binding(name);
-        let storage =
-            declare_class_slot(cx, &binding, otter_bytecode::SlotKind::PrivateName, span)?;
+        let kind = if instance_methods.contains(name) {
+            otter_bytecode::SlotKind::PrivateMethod
+        } else {
+            otter_bytecode::SlotKind::PrivateName
+        };
+        let storage = declare_class_slot(cx, &binding, kind, span)?;
         let key_reg = emit_private_symbol_key(cx, name, span)?;
         cx.emit_store_storage(key_reg, storage, span);
         cx.mark_initialized(&binding);
         cx.reset_scratch(scratch_mark);
     }
-    cx.class_private_instance_methods
-        .push(collect_class_private_instance_methods(&class.body));
+    cx.class_private_instance_methods.push(instance_methods);
 
     // §7.3.29 PrivateMethodOrAccessorAdd — instance private methods
     // brand the receiver. Methods live on the prototype side in this
@@ -660,6 +664,14 @@ fn compile_class_strict(
         };
         cx.next_fn_is_method = true;
         cx.next_fn_static_home = m.r#static;
+        cx.next_fn_lazy_method = Some((
+            otter_bytecode::LazyForm::ClassMethod(match m.kind {
+                oxc_ast::ast::MethodDefinitionKind::Get => otter_bytecode::LazyMethodKind::Getter,
+                oxc_ast::ast::MethodDefinitionKind::Set => otter_bytecode::LazyMethodKind::Setter,
+                _ => otter_bytecode::LazyMethodKind::Method,
+            }),
+            (m.value.span.start, m.value.span.end),
+        ));
         // §20.2.3.5 — a method's [[SourceText]] is its `MethodDefinition`.
         // `method_span` matches that for an instance method; for a
         // static one it would also span the `static` ClassElement

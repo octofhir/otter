@@ -21,6 +21,7 @@ fn retained_module_counts_spare_rows_nested_strings_and_exception_capacity() {
         constants: Vec::new(),
         module_resolutions: Vec::new(),
         module_inits: Vec::new(),
+        lazy_environments: Vec::new(),
     };
     assert_eq!(module.retained_bytes(), 0);
     module.module.try_reserve_exact(129).unwrap();

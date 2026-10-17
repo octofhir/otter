@@ -257,6 +257,15 @@ pub(crate) fn compile_object_literal(
                         });
                     }
                     cx.next_fn_is_method = true;
+                    hint_lazy_object_method(
+                        cx,
+                        &p.value,
+                        if matches!(p.kind, oxc_ast::ast::PropertyKind::Get) {
+                            otter_bytecode::LazyMethodKind::Getter
+                        } else {
+                            otter_bytecode::LazyMethodKind::Setter
+                        },
+                    );
                     // §20.2.3.5 — an accessor reports its whole property
                     // definition (`get`/`set` prefix and key included).
                     cx.next_fn_source_text_span = Some(key_span);
@@ -340,6 +349,13 @@ pub(crate) fn compile_object_literal(
                         key_span,
                     );
                     cx.next_fn_is_method = p.method;
+                    if p.method {
+                        hint_lazy_object_method(
+                            cx,
+                            &p.value,
+                            otter_bytecode::LazyMethodKind::Method,
+                        );
+                    }
                     // §20.2.3.5 — a concise method reports its whole
                     // definition; a plain `key: function(){}` value keeps
                     // its own function-expression source.
@@ -465,6 +481,9 @@ pub(crate) fn compile_object_literal(
                 // §13.2.5.5 step — `PropertyName: AnonymousFunctionDefinition`
                 // infers the function's name from the property key.
                 cx.next_fn_is_method = p.method;
+                if p.method {
+                    hint_lazy_object_method(cx, &p.value, otter_bytecode::LazyMethodKind::Method);
+                }
                 // §20.2.3.5 — a concise method reports its whole
                 // definition; a plain `key: function(){}` value keeps
                 // its own function-expression source.
@@ -576,6 +595,9 @@ fn compile_static_object_literal(
         };
         let key_span = (p.span.start, p.span.end);
         cx.next_fn_is_method = p.method;
+        if p.method {
+            hint_lazy_object_method(cx, &p.value, otter_bytecode::LazyMethodKind::Method);
+        }
         if p.method {
             cx.next_fn_source_text_span = Some(key_span);
         }
@@ -692,5 +714,20 @@ pub(crate) fn expression_is_anonymous_function(expr: &Expression<'_>) -> bool {
         Expression::ArrowFunctionExpression(_) => true,
         Expression::ClassExpression(c) => c.id.is_none(),
         _ => false,
+    }
+}
+
+/// Offer the method about to be compiled from `value` a body compiled on
+/// first call: its range is the parameters and body of the method.
+fn hint_lazy_object_method(
+    cx: &mut Compiler,
+    value: &oxc_ast::ast::Expression<'_>,
+    kind: otter_bytecode::LazyMethodKind,
+) {
+    if let oxc_ast::ast::Expression::FunctionExpression(function) = value {
+        cx.next_fn_lazy_method = Some((
+            otter_bytecode::LazyForm::ObjectMethod(kind),
+            (function.span.start, function.span.end),
+        ));
     }
 }

@@ -56,13 +56,17 @@ use crate::CompileError;
 pub fn validate_strict_mode_early_errors(
     directives: &[oxc_ast::ast::Directive<'_>],
     body: &[oxc_ast::ast::Statement<'_>],
-    source_strict: bool,
-    super_allowed: bool,
+    context: EarlyErrorContext,
 ) -> Result<(), CompileError> {
+    let source_strict = context.source_strict;
     let mut visitor = StrictValidator {
-        strict_stack: vec![source_strict],
-        super_stack: vec![super_allowed],
+        strict_stack: vec![context.source_strict],
+        super_stack: vec![context.super_property_allowed],
+        super_call_stack: vec![context.super_call_allowed],
         next_function_super_allowed: None,
+        next_function_super_call: None,
+        private_names: context.private_names.map(|names| vec![names]),
+        class_is_derived: Vec::new(),
         diagnostics: Vec::new(),
     };
     visitor.check_directive_prologue(directives, source_strict);
@@ -149,10 +153,34 @@ pub fn validate_module_early_errors(program: &Program<'_>) -> Result<(), Compile
     })
 }
 
+/// What the code around a validated body allows.
+#[derive(Debug, Clone, Default)]
+pub struct EarlyErrorContext {
+    /// The body is strict from its first token.
+    pub source_strict: bool,
+    /// `super.x` is valid at the top level (a direct eval in a method).
+    pub super_property_allowed: bool,
+    /// `super()` is valid at the top level (a direct eval in a derived
+    /// constructor).
+    pub super_call_allowed: bool,
+    /// Private names of the enclosing classes; `None` skips the
+    /// AllPrivateNamesValid check.
+    pub private_names: Option<std::collections::HashSet<String>>,
+}
+
 struct StrictValidator {
     strict_stack: Vec<bool>,
     super_stack: Vec<bool>,
+    /// Whether `super()` is valid: inside a derived class constructor and
+    /// the arrows within it.
+    super_call_stack: Vec<bool>,
     next_function_super_allowed: Option<bool>,
+    next_function_super_call: Option<bool>,
+    /// Private names each enclosing class declares, outermost first; `None`
+    /// when the code's private environment is not known here.
+    private_names: Option<Vec<std::collections::HashSet<String>>>,
+    /// Whether each enclosing class has a heritage, innermost last.
+    class_is_derived: Vec<bool>,
     diagnostics: Vec<SyntaxDiagnostic>,
 }
 
@@ -195,6 +223,52 @@ impl StrictValidator {
                 ),
             });
         }
+    }
+
+    /// §15.2.1 / §15.3.1 / §15.4.1 — a parameter list that may not bind
+    /// a name twice, and strict code's `eval` / `arguments` formals.
+    fn check_duplicate_formals(&mut self, params: &FormalParameters<'_>, unique: bool) {
+        let strict = self.is_strict();
+        let mut seen: BTreeMap<&str, Span> = BTreeMap::new();
+        collect_param_bound_names(params, &mut |name, span| {
+            if strict && (name == "eval" || name == "arguments") {
+                self.diagnostics.push(SyntaxDiagnostic {
+                    code: "STRICT_RESTRICTED_FORMAL".to_string(),
+                    message: format!(
+                        "SyntaxError: `{name}` may not be a parameter name in strict mode (§15.2.1)"
+                    ),
+                    range: Some((span.start, span.end)),
+                    help: None,
+                });
+            }
+            if seen.insert(name, span).is_some() && unique {
+                self.diagnostics.push(SyntaxDiagnostic {
+                    code: "DUPLICATE_FORMAL".to_string(),
+                    message: format!("SyntaxError: duplicate parameter name `{name}` (§15.2.1)"),
+                    range: Some((span.start, span.end)),
+                    help: None,
+                });
+            }
+        });
+    }
+
+    /// §15.7.1 AllPrivateNamesValid — `#name` must be declared by an
+    /// enclosing class.
+    fn check_private_name(&mut self, name: &str, span: Span) {
+        let Some(stack) = &self.private_names else {
+            return;
+        };
+        if stack.iter().any(|names| names.contains(name)) {
+            return;
+        }
+        self.diagnostics.push(SyntaxDiagnostic {
+            code: "UNDECLARED_PRIVATE_NAME".to_string(),
+            message: format!(
+                "SyntaxError: private name `#{name}` is not declared by an enclosing class (§15.7.1)"
+            ),
+            range: Some((span.start, span.end)),
+            help: None,
+        });
     }
 
     fn super_allowed(&self) -> bool {
@@ -1139,6 +1213,7 @@ fn labelled_function_body_span(body: &Statement<'_>) -> Option<Span> {
 impl<'a> Visit<'a> for StrictValidator {
     fn visit_function(&mut self, it: &Function<'a>, flags: ScopeFlags) {
         let function_super_allowed = self.next_function_super_allowed.take().unwrap_or(false);
+        let function_super_call = self.next_function_super_call.take().unwrap_or(false);
         let body_strict = it
             .body
             .as_ref()
@@ -1178,19 +1253,26 @@ impl<'a> Visit<'a> for StrictValidator {
                 });
             }
         }
-        if it.r#async
-            && let Some(body) = it.body.as_ref()
-        {
+        let inner_strict = self.is_strict() || body_strict;
+        // §15.2.1 / §15.4.1 — duplicate formals are an early error in
+        // strict code, in methods, and with a non-simple parameter list.
+        self.check_duplicate_formals(
+            &it.params,
+            inner_strict || function_super_allowed || !is_simple_parameter_list(&it.params),
+        );
+        if let Some(body) = it.body.as_ref() {
             let mut param_names: BTreeMap<&str, Span> = BTreeMap::new();
             collect_param_bound_names(&it.params, &mut |name, span| {
                 param_names.entry(name).or_insert(span);
             });
-            collect_lex_decl_names(&body.statements, &mut |name, span, _is_fn| {
-                if param_names.contains_key(name) {
+            // A function body's top-level function declarations are
+            // var-scoped (§10.2.11), so only `let` / `const` / `class` clash.
+            collect_lex_decl_names(&body.statements, &mut |name, span, is_fn| {
+                if !is_fn && param_names.contains_key(name) {
                     self.diagnostics.push(SyntaxDiagnostic {
-                        code: "ASYNC_FUNCTION_PARAM_LEXICAL_REDECLARATION".to_string(),
+                        code: "FUNCTION_PARAM_LEXICAL_REDECLARATION".to_string(),
                         message: format!(
-                            "SyntaxError: async function parameter `{name}` conflicts with a lexical declaration in the body (§15.8.1)"
+                            "SyntaxError: function parameter `{name}` conflicts with a lexical declaration in the body (§15.2.1)"
                         ),
                         range: Some((span.start, span.end)),
                         help: Some(
@@ -1200,14 +1282,15 @@ impl<'a> Visit<'a> for StrictValidator {
                 }
             });
         }
-        let inner_strict = self.is_strict() || body_strict;
         if let Some(body) = it.body.as_deref() {
             let outer_strict = self.is_strict();
             self.check_directive_prologue(&body.directives, outer_strict);
         }
         self.strict_stack.push(inner_strict);
         self.super_stack.push(function_super_allowed);
+        self.super_call_stack.push(function_super_call);
         walk::walk_function(self, it, flags);
+        self.super_call_stack.pop();
         self.super_stack.pop();
         self.strict_stack.pop();
     }
@@ -1248,8 +1331,8 @@ impl<'a> Visit<'a> for StrictValidator {
         collect_param_bound_names(&it.params, &mut |name, span| {
             param_names.entry(name).or_insert(span);
         });
-        collect_lex_decl_names(&it.body.statements, &mut |name, span, _is_fn| {
-            if param_names.contains_key(name) {
+        collect_lex_decl_names(&it.body.statements, &mut |name, span, is_fn| {
+            if !is_fn && param_names.contains_key(name) {
                 self.diagnostics.push(SyntaxDiagnostic {
                     code: "ARROW_PARAM_LEXICAL_REDECLARATION".to_string(),
                     message: format!(
@@ -1262,6 +1345,8 @@ impl<'a> Visit<'a> for StrictValidator {
                 });
             }
         });
+        // §15.3.1 — ArrowParameters never allow duplicates.
+        self.check_duplicate_formals(&it.params, true);
         let inner_strict = self.is_strict() || body_strict;
         self.strict_stack.push(inner_strict);
         walk::walk_arrow_function_expression(self, it);
@@ -1270,8 +1355,13 @@ impl<'a> Visit<'a> for StrictValidator {
 
     fn visit_method_definition(&mut self, it: &MethodDefinition<'a>) {
         self.next_function_super_allowed = Some(true);
+        self.next_function_super_call = Some(
+            it.kind == MethodDefinitionKind::Constructor
+                && self.class_is_derived.last() == Some(&true),
+        );
         walk::walk_method_definition(self, it);
         self.next_function_super_allowed = None;
+        self.next_function_super_call = None;
     }
 
     fn visit_object_property(&mut self, it: &ObjectProperty<'a>) {
@@ -1290,7 +1380,9 @@ impl<'a> Visit<'a> for StrictValidator {
         if let Some(value) = &it.value {
             self.visit_property_key(&it.key);
             self.super_stack.push(true);
+            self.super_call_stack.push(false);
             self.visit_expression(value);
+            self.super_call_stack.pop();
             self.super_stack.pop();
             return;
         }
@@ -1326,8 +1418,70 @@ impl<'a> Visit<'a> for StrictValidator {
                 _ => {}
             }
         }
-        walk::walk_class(self, it);
+        for decorator in &it.decorators {
+            self.visit_decorator(decorator);
+        }
+        if let Some(id) = &it.id {
+            self.visit_binding_identifier(id);
+        }
+        // §15.7.1 — the heritage is evaluated in the outer private
+        // environment; the body sees the class's own names too.
+        if let Some(heritage) = &it.super_class {
+            self.visit_expression(heritage);
+        }
+        if let Some(stack) = &mut self.private_names {
+            stack.push(class_private_bound_names(it));
+        }
+        self.class_is_derived.push(it.super_class.is_some());
+        self.visit_class_body(&it.body);
+        self.class_is_derived.pop();
+        if let Some(stack) = &mut self.private_names {
+            stack.pop();
+        }
         self.strict_stack.pop();
+    }
+
+    fn visit_call_expression(&mut self, it: &oxc_ast::ast::CallExpression<'a>) {
+        if let Expression::Super(sup) = &it.callee {
+            if !self.super_call_stack.last().copied().unwrap_or(false) {
+                self.diagnostics.push(SyntaxDiagnostic {
+                    code: "SUPER_CALL_OUTSIDE_DERIVED_CONSTRUCTOR".to_string(),
+                    message: "SyntaxError: `super()` is only valid in a derived class constructor (§15.7.1)"
+                        .to_string(),
+                    range: Some((sup.span.start, sup.span.end)),
+                    help: None,
+                });
+            }
+            for argument in &it.arguments {
+                self.visit_argument(argument);
+            }
+            return;
+        }
+        walk::walk_call_expression(self, it);
+    }
+
+    fn visit_private_field_expression(&mut self, it: &oxc_ast::ast::PrivateFieldExpression<'a>) {
+        self.check_private_name(it.field.name.as_str(), it.field.span);
+        walk::walk_private_field_expression(self, it);
+    }
+
+    fn visit_private_in_expression(&mut self, it: &oxc_ast::ast::PrivateInExpression<'a>) {
+        self.check_private_name(it.left.name.as_str(), it.left.span);
+        walk::walk_private_in_expression(self, it);
+    }
+
+    fn visit_with_statement(&mut self, it: &oxc_ast::ast::WithStatement<'a>) {
+        // §14.11.1 — `with` is an early error in strict code.
+        if self.is_strict() {
+            self.diagnostics.push(SyntaxDiagnostic {
+                code: "STRICT_MODE_WITH".to_string(),
+                message: "SyntaxError: `with` statements are not allowed in strict mode (§14.13)"
+                    .to_string(),
+                range: Some((it.span.start, it.span.end)),
+                help: None,
+            });
+        }
+        walk::walk_with_statement(self, it);
     }
 
     fn visit_static_block(&mut self, it: &StaticBlock<'a>) {
@@ -1362,7 +1516,9 @@ impl<'a> Visit<'a> for StrictValidator {
             });
         }
         self.super_stack.push(true);
+        self.super_call_stack.push(false);
         walk::walk_static_block(self, it);
+        self.super_call_stack.pop();
         self.super_stack.pop();
     }
 
@@ -2436,6 +2592,30 @@ impl<'a> Visit<'a> for BlockLexicalValidator {
     }
 }
 
+/// Private names a class body declares (without the `#`).
+fn class_private_bound_names(class: &Class<'_>) -> std::collections::HashSet<String> {
+    class
+        .body
+        .body
+        .iter()
+        .filter_map(|element| match element {
+            ClassElement::MethodDefinition(m) => match &m.key {
+                PropertyKey::PrivateIdentifier(id) => Some(id.name.as_str().to_string()),
+                _ => None,
+            },
+            ClassElement::PropertyDefinition(p) => match &p.key {
+                PropertyKey::PrivateIdentifier(id) => Some(id.name.as_str().to_string()),
+                _ => None,
+            },
+            ClassElement::AccessorProperty(a) => match &a.key {
+                PropertyKey::PrivateIdentifier(id) => Some(id.name.as_str().to_string()),
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2500,3 +2680,4 @@ mod tests {
         assert!(find_legacy_string_escape("''").is_none());
     }
 }
+

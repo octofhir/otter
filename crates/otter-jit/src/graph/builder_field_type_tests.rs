@@ -478,6 +478,7 @@ fn caller_consumption_keeps_an_inlined_loads_original_eager_chain() {
             template_sites: vec![],
             module_resolutions: vec![],
             module_inits: vec![],
+            lazy_environments: Vec::new(),
         },
         Default::default(),
     )

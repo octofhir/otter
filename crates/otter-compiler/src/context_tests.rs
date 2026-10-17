@@ -777,7 +777,14 @@ fn module_exports_mirror_only_the_module_binding() {
         "export let x = 1; export function f() { let x = 2; x = 3; return x; } \
          export function g() { x = 5; }",
         SyntaxSourceKind::JavaScript,
-        |program| compile_module_program(program, SyntaxSourceKind::JavaScript, &host),
+        |program| {
+            compile_module_program(
+                program,
+                SyntaxSourceKind::JavaScript,
+                &host,
+                crate::CompileOptions::default(),
+            )
+        },
     )
     .unwrap()
     .unwrap();

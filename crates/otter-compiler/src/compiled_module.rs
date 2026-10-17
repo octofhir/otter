@@ -699,7 +699,12 @@ mod tests {
             ("./lazy.ts", "file:///test/lazy.ts"),
         ]);
         let compiled = with_program(src, SyntaxSourceKind::TypeScript, |program| {
-            compile_module_program_to_module(program, SyntaxSourceKind::TypeScript, &host)
+            compile_module_program_to_module(
+                program,
+                SyntaxSourceKind::TypeScript,
+                &host,
+                crate::CompileOptions::default(),
+            )
         })
         .unwrap()
         .unwrap();
@@ -764,7 +769,12 @@ mod tests {
             ("./lazy.ts", "file:///test/lazy.ts"),
         ]);
         let compiled = with_program(src, SyntaxSourceKind::TypeScript, |program| {
-            compile_module_program_to_module(program, SyntaxSourceKind::TypeScript, &host)
+            compile_module_program_to_module(
+                program,
+                SyntaxSourceKind::TypeScript,
+                &host,
+                crate::CompileOptions::default(),
+            )
         })
         .unwrap()
         .unwrap();

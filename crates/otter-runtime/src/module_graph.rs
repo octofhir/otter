@@ -570,7 +570,8 @@ impl<'a> ModuleGraphBuilder<'a> {
                 resolved_imports,
             };
             let compile_started = timing_enabled.then(Instant::now);
-            let compiled = compile_module_program_to_module(program, kind, &host);
+            let compiled =
+                compile_module_program_to_module(program, kind, &host, crate::LAZY_FUNCTIONS);
             if let Some(started) = compile_started {
                 self.add_compile_time(started.elapsed());
             }
@@ -831,11 +832,15 @@ fn dynamic_failure_fragment(url: &str, err: &GraphError) -> Result<BytecodeModul
             module_url: url.to_string(),
             resolved_imports: HashMap::new(),
         };
-        compile_module_program_to_module(program, SourceKind::JavaScript, &host).map_err(|error| {
-            GraphError::Compile {
-                url: url.to_string(),
-                error,
-            }
+        compile_module_program_to_module(
+            program,
+            SourceKind::JavaScript,
+            &host,
+            otter_compiler::CompileOptions::default(),
+        )
+        .map_err(|error| GraphError::Compile {
+            url: url.to_string(),
+            error,
         })
     })
     .map_err(|error| GraphError::Parse {
@@ -1252,6 +1257,7 @@ fn hosted_module_fragment(url: &str) -> BytecodeModule {
         constants: Vec::new(),
         module_resolutions: Vec::new(),
         module_inits: Vec::new(),
+        lazy_environments: Vec::new(),
         function_source: None,
     }
 }
@@ -1944,6 +1950,7 @@ fn link(nodes: &BTreeMap<String, ModuleNode>, order: &[String], entry_url: &str)
     // §13.2.8.4 template sites, concatenated like the constants: each
     // fragment's `GetTemplateObject` operands index its own table.
     let mut template_sites: Vec<otter_bytecode::TemplateSite> = Vec::new();
+    let mut lazy_environments: Vec<otter_bytecode::LazyEnvironment> = Vec::new();
 
     // Placeholder `<entry>`; we'll fill in `code` + `spans`
     // after we know each fragment's offsets.
@@ -2003,6 +2010,7 @@ fn link(nodes: &BTreeMap<String, ModuleNode>, order: &[String], entry_url: &str)
         for edge in &node.fragment.module_resolutions {
             module_resolutions.push(edge.clone());
         }
+        lazy_environments.extend(node.fragment.lazy_environments.iter().cloned());
     }
 
     // Synthesise <entry>'s body: one `Op::EvaluateModule` per
@@ -2028,6 +2036,7 @@ fn link(nodes: &BTreeMap<String, ModuleNode>, order: &[String], entry_url: &str)
         module_resolutions,
         module_inits,
         function_source: None,
+        lazy_environments,
     }
 }
 

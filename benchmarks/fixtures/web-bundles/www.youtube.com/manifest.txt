@@ -1,0 +1,9 @@
+00-web-animations-next-lite.min.js	https://www.youtube.com/s/desktop/5d669aa8/jsbin/web-animations-next-lite.min.vflset/web-animations-next-lite.min.js	50871
+01-custom-elements-es5-adapter.js	https://www.youtube.com/s/desktop/5d669aa8/jsbin/custom-elements-es5-adapter.vflset/custom-elements-es5-adapter.js	2047
+02-webcomponents-sd.js	https://www.youtube.com/s/desktop/5d669aa8/jsbin/webcomponents-sd.vflset/webcomponents-sd.js	78940
+03-intersection-observer.min.js	https://www.youtube.com/s/desktop/5d669aa8/jsbin/intersection-observer.min.vflset/intersection-observer.min.js	5559
+04-scheduler.js	https://www.youtube.com/s/desktop/5d669aa8/jsbin/scheduler.vflset/scheduler.js	8197
+05-www-i18n-constants.js	https://www.youtube.com/s/desktop/5d669aa8/jsbin/www-i18n-constants-fi_FI.vflset/www-i18n-constants.js	8495
+06-spf.js	https://www.youtube.com/s/desktop/5d669aa8/jsbin/spf.vflset/spf.js	38448
+07-network.js	https://www.youtube.com/s/desktop/5d669aa8/jsbin/network.vflset/network.js	14351
+08-m=kevlar_base_module,kevlar_main_module,kevlar_base_sync_mod	https://www.youtube.com/s/_/ytmainappweb/_/js/k=ytmainappweb.kevlar_base.en_US.VRNYTIAj20w.es5.O/am=AAAAAAgACEBK/d=1/rs=AGKMywE2CwXnYBA7UeNL-YqRHxSyLivf2Q/m=kevlar_base_module,kevlar_main_module,kevlar_base_sync_mod_chunk	10880994

@@ -734,6 +734,7 @@ fn compile_statement_body(
                 None => cx.declare_binding(&name, otter_bytecode::SlotKind::FunctionDecl, span)?,
             };
             cx.mark_initialized(&name);
+            cx.next_fn_declaration = true;
             let record = compile_function_full(
                 cx,
                 &name,
@@ -1019,6 +1020,7 @@ fn compile_statement_body(
                         f.id.as_ref()
                             .map(|id| id.name.as_str().to_string())
                             .unwrap_or_else(|| "default".to_string());
+                    cx.next_fn_declaration = f.id.is_some();
                     let record = compile_function_full(
                         cx,
                         &name,

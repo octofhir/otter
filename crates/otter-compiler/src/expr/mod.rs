@@ -128,6 +128,7 @@ pub(crate) fn compile_effect(
             }
         }
         Expression::ParenthesizedExpression(p) => {
+            mark_eager_if_function(cx, &p.expression);
             compile_effect(cx, &p.expression, (p.span.start, p.span.end))?;
         }
         expr => {
@@ -284,6 +285,7 @@ pub(crate) fn compile_expr(
         Expression::NewExpression(new_expr) => construct::compile_new(cx, new_expr, enclosing_span),
 
         Expression::ParenthesizedExpression(p) => {
+            mark_eager_if_function(cx, &p.expression);
             compile_expr(cx, &p.expression, (p.span.start, p.span.end))
         }
 
@@ -391,12 +393,15 @@ pub(crate) fn compile_expr_with_inferred_name(
 ) -> Result<u16, CompileError> {
     let expr = unwrap_ts_expr(expr);
     match expr {
-        Expression::ParenthesizedExpression(p) => compile_expr_with_inferred_name(
-            cx,
-            &p.expression,
-            inferred_name,
-            (p.span.start, p.span.end),
-        ),
+        Expression::ParenthesizedExpression(p) => {
+            mark_eager_if_function(cx, &p.expression);
+            compile_expr_with_inferred_name(
+                cx,
+                &p.expression,
+                inferred_name,
+                (p.span.start, p.span.end),
+            )
+        }
         Expression::FunctionExpression(f) if f.id.is_none() => {
             let span = (f.span.start, f.span.end);
             let record = compile_function_full(
@@ -482,13 +487,16 @@ pub(crate) fn compile_expr_into_with_inferred_name(
             cx.emit_load_this(destination, (this.span.start, this.span.end));
             Ok(destination)
         }
-        Expression::ParenthesizedExpression(parenthesized) => compile_expr_into_with_inferred_name(
-            cx,
-            &parenthesized.expression,
-            inferred_name,
-            destination,
-            (parenthesized.span.start, parenthesized.span.end),
-        ),
+        Expression::ParenthesizedExpression(parenthesized) => {
+            mark_eager_if_function(cx, &parenthesized.expression);
+            compile_expr_into_with_inferred_name(
+                cx,
+                &parenthesized.expression,
+                inferred_name,
+                destination,
+                (parenthesized.span.start, parenthesized.span.end),
+            )
+        }
         Expression::BinaryExpression(binary) => {
             binary::compile_binary_into(cx, binary, enclosing_span, destination)
         }
@@ -631,4 +639,16 @@ pub(crate) fn emit_to_primitive(
         span,
     );
     dst
+}
+
+/// A function expression that is called or parenthesized where it is
+/// created runs right away (the V8 IIFE / PIFE heuristic): compile its
+/// body now rather than at its first call.
+pub(crate) fn mark_eager_if_function(cx: &mut Compiler, expr: &Expression<'_>) {
+    if matches!(
+        unwrap_ts_expr(expr),
+        Expression::FunctionExpression(_) | Expression::ArrowFunctionExpression(_)
+    ) {
+        cx.next_fn_eager = true;
+    }
 }

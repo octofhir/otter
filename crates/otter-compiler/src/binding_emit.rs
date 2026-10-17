@@ -695,7 +695,15 @@ impl Compiler {
                     .slots
                     .iter()
                     .any(|slot| slot.name == name && slot.exported);
-                (exported, Vec::new(), resolved.location)
+                // A lazily compiled body carries its module's renamed
+                // exports; a direct eval body has none.
+                let aliases = self
+                    .stack
+                    .iter()
+                    .find_map(|frame| frame.module_state.as_ref())
+                    .and_then(|state| state.reexport_local_targets.get(name).cloned())
+                    .unwrap_or_default();
+                (exported, aliases, resolved.location)
             }
             ScopeLocation::Frame { .. } => return,
         };

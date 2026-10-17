@@ -392,6 +392,7 @@ impl Interpreter {
                     Value::boolean(self.proxy_private_find(&proxy, symbol).is_some())
                 } else {
                     let name: std::sync::Arc<str>;
+                    let mut digits = itoa::Buffer::new();
                     let key = if let Some(symbol) = result.as_symbol(&self.gc_heap) {
                         VmPropertyKey::Symbol(symbol)
                     } else if let Some(string) = result.as_string(&self.gc_heap) {
@@ -406,6 +407,9 @@ impl Interpreter {
                         } else {
                             VmPropertyKey::OwnedString(string.to_key_spelling(&self.gc_heap))
                         }
+                    } else if let Some(index) = result.as_i32() {
+                        // An integer key is spelled on the stack, not allocated.
+                        VmPropertyKey::Atom(self.atomized_key(digits.format(index)))
                     } else if let Some(number) = result.as_number() {
                         VmPropertyKey::OwnedString(number.to_display_string())
                     } else {

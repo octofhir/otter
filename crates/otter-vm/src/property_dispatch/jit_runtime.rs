@@ -717,6 +717,7 @@ impl Interpreter {
         property_key = self.coerce_property_key_value(stack, context, key_value)?;
 
         let name: std::sync::Arc<str>;
+        let mut digits = itoa::Buffer::new();
         let key = if let Some(symbol) = property_key.as_symbol(&self.gc_heap) {
             VmPropertyKey::Symbol(symbol)
         } else if let Some((atom, spelling)) = property_key
@@ -730,6 +731,9 @@ impl Interpreter {
             ))
         } else if let Some(string) = property_key.as_string(&self.gc_heap) {
             VmPropertyKey::OwnedString(string.to_key_spelling(&self.gc_heap))
+        } else if let Some(index) = property_key.as_i32() {
+            // An integer key is spelled on the stack, not allocated.
+            VmPropertyKey::Atom(self.atomized_key(digits.format(index)))
         } else if let Some(number) = property_key.as_number() {
             VmPropertyKey::OwnedString(number.to_display_string())
         } else {

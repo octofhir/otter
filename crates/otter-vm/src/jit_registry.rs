@@ -891,6 +891,21 @@ impl JitCodeRegistry {
         self.invalidate_code_objects(seeds)
     }
 
+    /// Empty every callee identity cell of a registered code object that
+    /// holds a value `release` names. Returns whether any was emptied.
+    pub(crate) fn release_callee_identities(
+        &self,
+        release: &mut dyn FnMut(crate::Value) -> bool,
+    ) -> bool {
+        let mut released = false;
+        for registered in self.codes.values() {
+            for root in &*registered.roots {
+                released |= root.release_callee_if(release);
+            }
+        }
+        released
+    }
+
     /// Visit every hidden class a registered (not yet retired) code object
     /// embeds, as strong roots.
     pub(crate) fn trace_retained_roots(&self, visitor: &mut otter_gc::raw::SlotVisitor<'_>) {

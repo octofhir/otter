@@ -236,6 +236,9 @@ pub(crate) struct ChunkEvictionCandidate {
     pub(crate) property_ic_site_end: u32,
     pub(crate) module_identity: usize,
     pub(crate) retained_bytes: u64,
+    /// The lazy record this chunk is the compiled body of: the chunk owning
+    /// that id keeps this one alive.
+    pub(crate) alias: Option<u32>,
 }
 
 impl ChunkEvictionCandidate {
@@ -402,6 +405,8 @@ struct CodeChunk {
     property_ic_site_base: u32,
     property_ic_site_end: u32,
     retention: ChunkRetention,
+    /// The lazy record whose body this chunk is, if it is one.
+    alias: Option<u32>,
     payload: RwLock<Option<Arc<ChunkPayload>>>,
     _directory_node_lease: ResourceLease,
 }
@@ -509,6 +514,7 @@ fn build_chunk(
         property_ic_site_base: property_ic_base,
         property_ic_site_end,
         retention,
+        alias,
         payload: RwLock::new(Some(payload)),
         _directory_node_lease: account.reserve_exact(
             ResourceClass::SourceModuleBytes,
@@ -582,6 +588,10 @@ impl CodeSpace {
     /// Link the body compiled for lazy record `alias` as its own chunk:
     /// function 0 runs under `alias`, and the creating chunk forwards that
     /// id to this chunk once [`ExecutableModule::set_forward`] records it.
+    ///
+    /// The body is retained as its creating chunk is: an eval's function
+    /// bodies are reclaimable with the eval, and while the creating chunk is
+    /// live the body is too.
     pub(crate) fn link_lazy_body(
         self: &Arc<Self>,
         module: BytecodeModule,
@@ -589,13 +599,9 @@ impl CodeSpace {
         account: &ResourceAccount,
         alias: u32,
     ) -> Result<ExecutionContext, BytecodeLinkError> {
-        self.link_module_with_alias(
-            module,
-            sources,
-            account,
-            ChunkRetention::Pinned,
-            Some(alias),
-        )
+        let retention = Self::chunk_for(&self.chunks(), alias)
+            .map_or(ChunkRetention::Pinned, |creator| creator.retention);
+        self.link_module_with_alias(module, sources, account, retention, Some(alias))
     }
 
     fn link_module_with_retention(
@@ -908,6 +914,7 @@ impl CodeSpace {
                         property_ic_site_end: current.property_ic_site_end,
                         module_identity: Arc::as_ptr(&payload.module) as usize,
                         retained_bytes: payload.retained_bytes(),
+                        alias: current.alias,
                     });
                 }
             }

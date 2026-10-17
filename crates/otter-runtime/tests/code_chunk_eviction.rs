@@ -80,7 +80,7 @@ fn escaped_eval_closure_blocks_eviction_until_the_reference_is_removed() {
     runtime
         .run_script(
             SourceInput::from_javascript(
-                "globalThis.__chunkKeeper = eval('(function kept() { return 42; })');",
+                "globalThis.__chunkKeeper = eval('(() => { function kept() { return 42; } return kept; })()');",
             ),
             "<live-eval>",
         )
@@ -103,6 +103,19 @@ fn escaped_eval_closure_blocks_eviction_until_the_reference_is_removed() {
         )
         .expect("escaped closure remains callable");
     assert_eq!(result.completion_string(), "42");
+    // The call compiled `kept`'s body as a chunk of its own; the eval's
+    // chunk, still reachable, keeps it.
+    runtime
+        .reclaim_dynamic_code()
+        .expect("census the compiled body");
+    assert_eq!(runtime.code_eviction_stats().evicted_chunks, 0);
+    let again = runtime
+        .run_script(
+            SourceInput::from_javascript("__chunkKeeper();"),
+            "<call-live-eval-again>",
+        )
+        .expect("compiled body survives with its eval");
+    assert_eq!(again.completion_string(), "42");
 
     runtime
         .run_script(
@@ -116,9 +129,10 @@ fn escaped_eval_closure_blocks_eviction_until_the_reference_is_removed() {
         .reclaim_dynamic_code()
         .expect("reclaim formerly live eval");
     let stats_after_drop = runtime.code_eviction_stats();
+    // The eval's chunk and the body chunk of `kept` go together.
     assert_eq!(
         stats_after_drop.evicted_chunks,
-        stats_before_drop.evicted_chunks + 1
+        stats_before_drop.evicted_chunks + 2
     );
     let released_payload = stats_after_drop.evicted_bytes - stats_before_drop.evicted_bytes;
     assert_eq!(released_payload, stats_before_drop.retained_bytes);
@@ -279,7 +293,9 @@ fn captured_eval_contexts_do_not_keep_dead_source_chunks_alive() {
             )
             .unwrap();
         runtime.reclaim_dynamic_code().unwrap();
-        assert_eq!(runtime.code_eviction_stats().evicted_chunks, 1);
+        // The eval's chunk and the body chunk `readEvalContext` compiled on
+        // its first call.
+        assert_eq!(runtime.code_eviction_stats().evicted_chunks, 2);
         assert_eq!(runtime.code_eviction_stats().retained_bytes, 0);
     }
 }

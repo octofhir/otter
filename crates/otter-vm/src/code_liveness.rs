@@ -66,6 +66,33 @@ impl CandidateLiveness {
         }
     }
 
+    /// Keep every lazy body alive whose creating chunk is: live as a
+    /// candidate, or not a candidate at all and still linked (`linked`).
+    ///
+    /// A body's function 0 runs under its record's id, so closures and
+    /// contexts of it mark the creating chunk, not the body. A record's id
+    /// lies below its body's range, so one pass in base order sees each
+    /// creator settled before its bodies.
+    pub(crate) fn keep_bodies_of_live_creators(&mut self, linked: impl Fn(u32) -> bool) {
+        for index in 0..self.candidates.len() {
+            let Some(alias) = self.candidates[index].alias else {
+                continue;
+            };
+            let creator = self
+                .candidates
+                .partition_point(|candidate| candidate.function_base <= alias)
+                .checked_sub(1)
+                .filter(|&creator| alias < self.candidates[creator].function_end());
+            let creator_live = match creator {
+                Some(creator) => self.live[creator],
+                None => linked(alias),
+            };
+            if creator_live {
+                self.live[index] = true;
+            }
+        }
+    }
+
     #[must_use]
     pub(crate) fn is_live(&self, candidate: ChunkEvictionCandidate) -> bool {
         self.candidates
@@ -173,5 +200,11 @@ pub(crate) fn census_candidate_ids(
 
         interpreter.visit_root_function_ids(&mut visit);
     }
+    liveness.keep_bodies_of_live_creators(|function_id| {
+        matches!(
+            interpreter.code_space.resolve_chunk(function_id),
+            crate::code_space::ChunkResolution::Live { .. }
+        )
+    });
     liveness
 }

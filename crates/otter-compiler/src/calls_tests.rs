@@ -229,6 +229,7 @@ fn caller_chain_const_metadata_does_not_prove_a_live_initialized_value() {
         false,
         false,
         false,
+        crate::CompileOptions::default(),
     )
     .expect("caller-chain method fixture");
     crate::context_tests::assert_verified_with_caller(&module, Some(&chain));

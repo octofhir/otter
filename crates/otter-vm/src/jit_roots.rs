@@ -15,7 +15,9 @@
 //!   allocations containing no GC references.
 //! - A callee identity cell is an address-stable strong root the collector
 //!   rewrites in place. Generated code writes it without a barrier: roots are
-//!   rescanned when a marking cycle finishes. An `instanceof` cell is the
+//!   rescanned when a marking cycle finishes. Its value is a cache, not an
+//!   owner: a dynamic-code census empties every cell holding a function of
+//!   a chunk it may reclaim. An `instanceof` cell is the
 //!   same kind of root; the VM empties every one whenever a closure that
 //!   ever filled one changes its `prototype`, own properties or
 //!   `[[Prototype]]` (see `Interpreter::retire_instanceof_proofs`).
@@ -51,6 +53,18 @@ impl CalleeIdentityCell {
     /// Address generated code reads and writes.
     pub(crate) fn address(&self) -> u64 {
         self.0.as_ptr() as u64
+    }
+
+    /// Empty the cell when it holds a value `release` names. A call through
+    /// an empty cell misses and takes the full proof, as for any other
+    /// callee.
+    fn release_if(&self, release: &mut dyn FnMut(crate::Value) -> bool) -> bool {
+        let bits = self.0.load(Ordering::Relaxed);
+        if bits == Self::EMPTY || !release(crate::Value::from_bits(bits)) {
+            return false;
+        }
+        self.0.store(Self::EMPTY, Ordering::Relaxed);
+        true
     }
 
     fn trace(&self, visitor: &mut otter_gc::raw::SlotVisitor<'_>) {
@@ -130,6 +144,14 @@ impl CompilationRoot {
             Self::Prototype(cell) => (1, cell.address()),
             Self::CalleeIdentity(cell) => (2, cell.address() as usize),
             Self::Instanceof(cell) => (3, cell.address() as usize),
+        }
+    }
+
+    /// Empty a callee identity cell holding a value `release` names.
+    pub(crate) fn release_callee_if(&self, release: &mut dyn FnMut(crate::Value) -> bool) -> bool {
+        match self {
+            Self::CalleeIdentity(cell) => cell.release_if(release),
+            Self::Shape(_) | Self::Family(_) | Self::Prototype(_) | Self::Instanceof(_) => false,
         }
     }
 

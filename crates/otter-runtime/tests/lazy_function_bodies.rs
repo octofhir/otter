@@ -36,6 +36,22 @@ fn a_body_compiles_on_its_first_call_and_only_once() {
     // An immediately called function compiles with its script.
     assert_eq!(run(&mut runtime, "(function () { return 7; })()"), "7");
     assert_eq!(runtime.lazy_function_bodies_compiled(), before + 2);
+    // Eval code defers its functions the same way, closing over the eval's
+    // own lexicals, a direct eval's caller and strictness alike.
+    let evaled = run(
+        &mut runtime,
+        r#"
+const indirect = (0, eval)("let hidden = 4; function get() { return hidden; } get");
+function host(x) {
+  return eval("'use strict'; function g(y) { return x + y + (this === undefined); } g")(1);
+}
+const made = new Function("a", "function inner(b) { return a * b; } return inner;")(6);
+[indirect(), host(2), made(7), typeof hidden].join()
+"#,
+    );
+    assert_eq!(evaled, "4,4,42,undefined");
+    // `host`, `get`, `g`, the `Function` body and `inner`.
+    assert_eq!(runtime.lazy_function_bodies_compiled(), before + 7);
 }
 
 #[test]

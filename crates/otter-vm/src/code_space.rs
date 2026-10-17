@@ -728,6 +728,11 @@ impl CodeSpace {
         }
     }
 
+    /// Chunks ever linked into this space, evicted ones included.
+    pub(crate) fn chunk_count(&self) -> usize {
+        self.chunks().len()
+    }
+
     fn chunks(&self) -> RwLockReadGuard<'_, CodeDirectory> {
         self.chunks
             .read()

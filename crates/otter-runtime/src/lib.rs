@@ -667,6 +667,29 @@ impl SourceInput {
     }
 }
 
+/// A JavaScript function an embedder keeps to [`Runtime::call`] it without
+/// compiling source: returned by [`Runtime::global_function`], rooted until
+/// [`Runtime::release_function`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RuntimeFunction {
+    root: otter_vm::PersistentRootId,
+}
+
+/// One argument of a [`Runtime::call`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum CallArgument<'a> {
+    /// `undefined`.
+    Undefined,
+    /// `null`.
+    Null,
+    /// A boolean.
+    Bool(bool),
+    /// A number.
+    Number(f64),
+    /// A string.
+    String(&'a str),
+}
+
 /// Successful run output.
 #[derive(Debug, Clone)]
 pub struct ExecutionResult {
@@ -4699,6 +4722,155 @@ impl Runtime {
             })
     }
 
+    /// Keep the function bound to the global name `name` for
+    /// [`Self::call`]: an embedder that calls the same function on every
+    /// event, timer or observer turn calls it directly instead of compiling
+    /// a source string that names it each time.
+    ///
+    /// # Errors
+    /// [`OtterError::Internal`] when `name` is not a callable global.
+    pub fn global_function(&mut self, name: &str) -> Result<RuntimeFunction, OtterError> {
+        let global = otter_vm::Value::object(*self.interp.global_this());
+        let context = self.interp.realm_execution_context();
+        let root = otter_vm::NativeCtx::with_host_context(
+            &mut self.interp,
+            otter_vm::NativeCallInfo::call(global),
+            context.as_ref(),
+            |ctx| {
+                Ok(ctx.scope(|mut scope| {
+                    scope
+                        .global(name)
+                        .filter(|value| scope.is_callable(*value))
+                        .map(|value| scope.persistent_root_insert(value))
+                }))
+            },
+        )
+        .map_err(map_native_error)?;
+        root.map(|root| RuntimeFunction { root })
+            .ok_or_else(|| OtterError::Internal {
+                code: DiagnosticCode::NotCallable.as_str().to_string(),
+                message: format!("`{name}` is not a callable global"),
+            })
+    }
+
+    /// Stop keeping a function [`Self::global_function`] returned.
+    pub fn release_function(&mut self, function: RuntimeFunction) {
+        self.interp.persistent_root_remove(function.root);
+    }
+
+    /// Call a kept function with `this` undefined and `arguments`, as one
+    /// turn: the same guarantees a [`Self::run_script`] of the source
+    /// `name(...arguments)` gives — the microtask checkpoint runs after the
+    /// call whether or not it threw, an exception nothing caught is offered
+    /// to the uncaught-exception handlers and otherwise returned as the
+    /// error, and an interrupt stops the call — without parsing, compiling
+    /// or linking anything.
+    ///
+    /// # Errors
+    /// An uncaught exception, a microtask that failed, or an interrupt.
+    pub fn call(
+        &mut self,
+        function: RuntimeFunction,
+        arguments: &[CallArgument<'_>],
+    ) -> Result<ExecutionResult, OtterError> {
+        self.with_direct_timeout(move |runtime| runtime.call_unbounded(function, arguments))
+    }
+
+    fn call_unbounded(
+        &mut self,
+        function: RuntimeFunction,
+        arguments: &[CallArgument<'_>],
+    ) -> Result<ExecutionResult, OtterError> {
+        let start = std::time::Instant::now();
+        let global = otter_vm::Value::object(*self.interp.global_this());
+        let context = self.interp.realm_execution_context();
+        let called: Result<otter_vm::PersistentRootId, otter_vm::NativeError> =
+            otter_vm::NativeCtx::with_host_context(
+                &mut self.interp,
+                otter_vm::NativeCallInfo::call(global),
+                context.as_ref(),
+                |ctx| {
+                    let target = ctx.persistent_root_get(function.root).ok_or_else(|| {
+                        otter_vm::NativeError::Error {
+                            message: "the kept function was released".into(),
+                        }
+                    })?;
+                    ctx.scope(|mut scope| {
+                        let target = scope.value(target);
+                        let receiver = scope.undefined();
+                        let mut locals = Vec::with_capacity(arguments.len());
+                        for argument in arguments {
+                            locals.push(match *argument {
+                                CallArgument::Undefined => scope.undefined(),
+                                CallArgument::Null => scope.null(),
+                                CallArgument::Bool(value) => scope.boolean(value),
+                                CallArgument::Number(value) => scope.number(value),
+                                CallArgument::String(text) => scope.string(text)?,
+                            });
+                        }
+                        let result = scope.call(target, receiver, &locals)?;
+                        Ok(scope.persistent_root_insert(result))
+                    })
+                },
+            );
+        let completion_root = match called {
+            Ok(root) => Some(root),
+            Err(error) if error.exit_code().is_some() => {
+                self.pending_exit_code = error.exit_code();
+                return Ok(ExecutionResult::from_exit_code(
+                    error.exit_code().unwrap_or_default(),
+                    start.elapsed(),
+                ));
+            }
+            Err(error)
+                if error.is_fatal()
+                    || matches!(error, otter_vm::NativeError::OutOfMemory { .. }) =>
+            {
+                return Err(map_native_error(error));
+            }
+            Err(error) => {
+                // The checkpoint still runs: a call can settle a promise and
+                // then throw, and the reactions are owed their turn.
+                let handled = self.dispatch_uncaught_exception(context.as_ref());
+                let drained = self.drain_microtasks_dispatching_uncaught();
+                if let Err(drain) = drained
+                    && !self.absorb_termination(&drain)
+                {
+                    return Err(enrich_runtime_diagnostic_with_cause(
+                        &mut self.interp,
+                        map_vm_error(drain),
+                    ));
+                }
+                return match handled {
+                    Ok(true) => Ok(ExecutionResult::from_vm_value(
+                        otter_vm::Value::undefined(),
+                        start.elapsed(),
+                        self.interp.gc_heap_mut(),
+                    )),
+                    Ok(false) => Err(map_native_error(error)),
+                    Err(handler) => Err(handler),
+                };
+            }
+        };
+        let drained = self.drain_microtasks_dispatching_uncaught();
+        let completion = completion_root
+            .and_then(|root| self.interp.persistent_root_remove(root))
+            .unwrap_or_else(otter_vm::Value::undefined);
+        if let Err(drain) = drained
+            && !self.absorb_termination(&drain)
+        {
+            return Err(enrich_runtime_diagnostic_with_cause(
+                &mut self.interp,
+                map_vm_error(drain),
+            ));
+        }
+        Ok(ExecutionResult::from_vm_value(
+            completion,
+            start.elapsed(),
+            self.interp.gc_heap_mut(),
+        ))
+    }
+
     /// Run one host event on the isolate thread through a fresh native context.
     ///
     /// The closure must materialize any JS values from owned host data while it
@@ -5318,6 +5490,13 @@ impl Runtime {
     /// owns the heap and does the split-borrow internally.
     pub fn force_gc(&mut self) -> Result<(), OtterError> {
         self.interp.force_gc().map_err(Into::into)
+    }
+
+    /// Code chunks ever linked into this runtime: each script, eval body,
+    /// module graph and lazily compiled function body is one.
+    #[must_use]
+    pub fn linked_code_chunks(&self) -> usize {
+        self.interp.linked_code_chunks()
     }
 
     /// Current per-isolate dynamic-code reclamation counters.

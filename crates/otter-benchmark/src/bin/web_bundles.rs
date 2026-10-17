@@ -25,7 +25,7 @@ use std::time::{Duration, Instant};
 
 use clap::{Parser, Subcommand};
 use otter_compiler::{CompileOptions, ModuleHostInfo, compile_module_program_to_module};
-use otter_runtime::{Runtime, SourceInput};
+use otter_runtime::{CallArgument, Runtime, SourceInput};
 use otter_syntax::{SourceGoal, SourceKind};
 
 #[derive(Debug, Parser)]
@@ -58,6 +58,9 @@ enum Command {
         turns: usize,
         #[arg(long, default_value_t = 3)]
         samples: usize,
+        /// Run each turn through `Runtime::call` instead of a source string.
+        #[arg(long)]
+        call: bool,
     },
     /// As `turns`, after compiling the scripts again through `eval`.
     EvalTurns {
@@ -278,7 +281,20 @@ fn page_runtime(scripts: &[Script], eval_copies: usize) -> (Runtime, Duration) {
     (runtime, started.elapsed())
 }
 
-fn time_turns(runtime: &mut Runtime, turns: usize) -> Duration {
+fn time_turns(runtime: &mut Runtime, turns: usize, call: bool) -> Duration {
+    if call {
+        let tick = runtime.global_function("__benchTick").expect("a callable");
+        let started = Instant::now();
+        for turn in 0..turns {
+            let step = if turn % 2 == 0 { 1.0 } else { 2.0 };
+            runtime
+                .call(tick, &[CallArgument::Number(step)])
+                .expect("turn runs");
+        }
+        let elapsed = started.elapsed();
+        runtime.release_function(tick);
+        return elapsed;
+    }
     let started = Instant::now();
     for turn in 0..turns {
         let source = if turn % 2 == 0 {
@@ -294,7 +310,7 @@ fn time_turns(runtime: &mut Runtime, turns: usize) -> Duration {
     started.elapsed()
 }
 
-fn run_turns(sites: &[String], turns: usize, samples: usize, eval_copies: usize) {
+fn run_turns(sites: &[String], turns: usize, samples: usize, eval_copies: usize, call: bool) {
     for site in sites {
         let scripts = load_site(site);
         let mut loads = Vec::with_capacity(samples);
@@ -302,7 +318,7 @@ fn run_turns(sites: &[String], turns: usize, samples: usize, eval_copies: usize)
         for _ in 0..samples {
             let (mut runtime, load) = page_runtime(&scripts, eval_copies);
             loads.push(load);
-            times.push(time_turns(&mut runtime, turns));
+            times.push(time_turns(&mut runtime, turns, call));
         }
         let (load, time) = (median(loads), median(times));
         println!(
@@ -327,12 +343,13 @@ fn main() {
             sites,
             turns,
             samples,
-        } => run_turns(&sites, turns, samples, 0),
+            call,
+        } => run_turns(&sites, turns, samples, 0, call),
         Command::EvalTurns {
             sites,
             turns,
             samples,
             copies,
-        } => run_turns(&sites, turns, samples, copies),
+        } => run_turns(&sites, turns, samples, copies, false),
     }
 }

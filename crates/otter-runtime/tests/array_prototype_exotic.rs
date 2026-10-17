@@ -42,7 +42,7 @@ fn array_prototype_exposes_array_exotic_observables() {
 }
 
 #[test]
-fn an_inherited_index_setter_reaches_exactly_the_arrays_whose_chain_holds_it() {
+fn an_inherited_index_reaches_exactly_the_arrays_whose_chain_holds_it() {
     let completion = run(r#"
         const log = [];
         // An index accessor on an unrelated object is not in any array's chain.
@@ -57,21 +57,27 @@ fn an_inherited_index_setter_reaches_exactly_the_arrays_whose_chain_holds_it() {
         sub[0] = "a";
         sub[1] = "b";
         sub.push("c");
+        // `in` answers from the array's own storage only while no index can
+        // be inherited.
+        const holey = [, 1];
+        const inBefore = [0 in plain, 3 in plain, 0 in holey, 1 in holey, 1 in sub, 6 in holey];
         // A new [[Prototype]] for %Array.prototype% reaches every plain array,
         // including writes from code that already ran hot.
         Object.setPrototypeOf(Array.prototype, {
             set 5(v) { log.push("proto" + v); },
         });
         const late = fill([], 7);
+        const inAfter = 5 in holey;
         [
             plain.join(),
             sub.length, sub.hasOwnProperty(1), sub[0],
             late.length, late.hasOwnProperty(5),
+            inBefore.join(), inAfter,
             log.join(),
         ].join("|");
         "#);
     assert_eq!(
         completion,
-        "0,1,2|2|false|a|7|false|subb,subc,proto5"
+        "0,1,2|2|false|a|7|false|true,false,false,true,true,false|true|subb,subc,proto5"
     );
 }

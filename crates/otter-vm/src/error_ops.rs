@@ -339,7 +339,7 @@ pub(crate) fn native_error_to_throwable_with_stack(
         return Err(restore_execution_failure(interp, failure));
     }
     let original_oom = matches!(error, NativeError::OutOfMemory { .. });
-    let error = native_to_vm_error_with_stack(interp, stack, error);
+    let error = native_to_vm_error_in(interp, stack, context, error);
     if error.is_fatal() || (!original_oom && matches!(error, VmError::OutOfMemory { .. })) {
         return Err(error);
     }
@@ -388,18 +388,34 @@ pub(crate) fn native_to_vm_error_with_stack(
     stack: &ActivationStack,
     err: NativeError,
 ) -> VmError {
-    fn native_spec_error(
-        interp: &mut crate::Interpreter,
-        stack: &ActivationStack,
-        kind: ErrorKind,
-        message: String,
-    ) -> VmError {
-        match interp.make_error_instance_with_stack_roots(
-            stack,
-            kind,
-            Some(message.clone()),
-            &Value::undefined(),
-        ) {
+    native_to_vm_error_in(interp, stack, None, err)
+}
+
+/// [`native_to_vm_error_with_stack`] inside the execution context of the
+/// script that called the native: an error it synthesizes records that
+/// script's call stack, as one the script constructed itself would, so
+/// `stack` names the frames that reached `Array.prototype.push` and not only
+/// the message.
+pub(crate) fn native_to_vm_error_in(
+    interp: &mut crate::Interpreter,
+    stack: &ActivationStack,
+    context: Option<&ExecutionContext>,
+    err: NativeError,
+) -> VmError {
+    let native_spec_error = |interp: &mut crate::Interpreter,
+                             stack: &ActivationStack,
+                             kind: ErrorKind,
+                             message: String|
+     -> VmError {
+        let made = interp
+            .make_error_instance_with_stack_roots(stack, kind, Some(message), &Value::undefined())
+            .and_then(|mut obj| {
+                if let Some(context) = context {
+                    interp.capture_error_stack_frames(context, &mut obj)?;
+                }
+                Ok(obj)
+            });
+        match made {
             Ok(obj) => {
                 let thrown = Value::object(obj);
                 interp.set_pending_uncaught_throw(thrown);
@@ -410,7 +426,7 @@ pub(crate) fn native_to_vm_error_with_stack(
             }
             Err(err) => err,
         }
-    }
+    };
 
     match err {
         NativeError::Resource { error } => interp.err_resource(error),

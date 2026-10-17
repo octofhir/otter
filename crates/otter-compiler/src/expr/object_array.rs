@@ -630,28 +630,29 @@ fn object_literal_uses_super_in_methods(
 ) -> bool {
     use oxc_ast_visit::Visit;
 
+    // `super` in a nested function or method names that function's own
+    // home, so the walk stops at both; arrows are transparent to `super`.
     struct SuperFinder {
         found: bool,
-        nested_function_depth: u32,
     }
     impl<'a> Visit<'a> for SuperFinder {
         fn visit_function(
             &mut self,
-            it: &oxc_ast::ast::Function<'a>,
-            flags: oxc_syntax::scope::ScopeFlags,
+            _: &oxc_ast::ast::Function<'a>,
+            _: oxc_syntax::scope::ScopeFlags,
         ) {
-            self.nested_function_depth += 1;
-            oxc_ast_visit::walk::walk_function(self, it, flags);
-            self.nested_function_depth -= 1;
         }
         fn visit_method_definition(&mut self, it: &oxc_ast::ast::MethodDefinition<'a>) {
-            self.nested_function_depth += 1;
-            oxc_ast_visit::walk::walk_method_definition(self, it);
-            self.nested_function_depth -= 1;
+            if it.computed {
+                self.visit_property_key(&it.key);
+            }
         }
         fn visit_super(&mut self, _it: &oxc_ast::ast::Super) {
-            if self.nested_function_depth == 0 && !self.found {
-                self.found = true;
+            self.found = true;
+        }
+        fn visit_statement(&mut self, it: &oxc_ast::ast::Statement<'a>) {
+            if !self.found {
+                oxc_ast_visit::walk::walk_statement(self, it);
             }
         }
     }
@@ -671,10 +672,7 @@ fn object_literal_uses_super_in_methods(
         let oxc_ast::ast::Expression::FunctionExpression(func) = &p.value else {
             continue;
         };
-        let mut finder = SuperFinder {
-            found: false,
-            nested_function_depth: 0,
-        };
+        let mut finder = SuperFinder { found: false };
         if let Some(body) = func.body.as_deref() {
             for stmt in &body.statements {
                 finder.visit_statement(stmt);

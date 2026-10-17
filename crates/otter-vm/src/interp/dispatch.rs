@@ -313,7 +313,7 @@ impl Interpreter {
             match op {
                 Op::ReturnValue | Op::Return => {
                     let src = instr.reg(0);
-                    let value = (*top_frame!())
+                    let value = top_frame!()
                         .registers
                         .get(src as usize)
                         .cloned()
@@ -414,7 +414,7 @@ impl Interpreter {
                             function
                                 .register(instr, 1)
                                 .and_then(|register| {
-                                    (*top_frame!()).registers.get(register as usize).copied()
+                                    top_frame!().registers.get(register as usize).copied()
                                 })
                                 .and_then(|callee| self.native_call_target(callee))
                         })
@@ -621,7 +621,7 @@ impl Interpreter {
                             function
                                 .register(instr, 1)
                                 .and_then(|register| {
-                                    (*top_frame!()).registers.get(register as usize).copied()
+                                    top_frame!().registers.get(register as usize).copied()
                                 })
                                 .and_then(|callee| self.native_call_target(callee))
                         })
@@ -648,7 +648,7 @@ impl Interpreter {
                             function
                                 .register(instr, 1)
                                 .and_then(|register| {
-                                    (*top_frame!()).registers.get(register as usize).copied()
+                                    top_frame!().registers.get(register as usize).copied()
                                 })
                                 .and_then(|callee| self.native_construct_target(callee))
                         })
@@ -715,7 +715,7 @@ impl Interpreter {
                             function
                                 .register(instr, 1)
                                 .and_then(|register| {
-                                    (*top_frame!()).registers.get(register as usize).copied()
+                                    top_frame!().registers.get(register as usize).copied()
                                 })
                                 .and_then(|callee| {
                                     callee
@@ -781,7 +781,7 @@ impl Interpreter {
                             function
                                 .register(instr, 1)
                                 .and_then(|register| {
-                                    (*top_frame!()).registers.get(register as usize).copied()
+                                    top_frame!().registers.get(register as usize).copied()
                                 })
                                 .and_then(|callee| {
                                     callee
@@ -793,7 +793,7 @@ impl Interpreter {
                     let direct_construct_fid = if jit_installed {
                         register_operand(function.operand(instr, 1))
                             .ok()
-                            .and_then(|register| (*top_frame!()).registers.get(register as usize))
+                            .and_then(|register| top_frame!().registers.get(register as usize))
                             .copied()
                             .and_then(|value| {
                                 value
@@ -844,7 +844,7 @@ impl Interpreter {
                             function
                                 .register(instr, 1)
                                 .and_then(|register| {
-                                    (*top_frame!()).registers.get(register as usize).copied()
+                                    top_frame!().registers.get(register as usize).copied()
                                 })
                                 .and_then(|callee| {
                                     callee
@@ -856,7 +856,7 @@ impl Interpreter {
                     let direct_construct_fid = if jit_installed {
                         register_operand(function.operand(instr, 1))
                             .ok()
-                            .and_then(|register| (*top_frame!()).registers.get(register as usize))
+                            .and_then(|register| top_frame!().registers.get(register as usize))
                             .copied()
                             .and_then(|value| {
                                 value
@@ -908,7 +908,7 @@ impl Interpreter {
                 }
                 Op::Throw => {
                     let src = instr.reg(0);
-                    let value = (*top_frame!())
+                    let value = top_frame!()
                         .registers
                         .get(src as usize)
                         .cloned()
@@ -1063,7 +1063,7 @@ impl Interpreter {
                     let owner = self
                         .frame_generator_owner(&(*top_frame!()))
                         .ok_or(VmError::TypeMismatch)?;
-                    let callee = (*top_frame!()).self_value;
+                    let callee = top_frame!().self_value;
                     let frame = stack.last_mut().ok_or_else(|| VmError::InvalidOperand)?;
                     frame.advance_pc()?;
                     let popped = stack.pop().expect("frame present");
@@ -1123,7 +1123,7 @@ impl Interpreter {
                     let recv = *read_register(&(*top_frame!()), src)?;
                     if recv.is_primitive() {
                         write_register(&mut (*top_frame!()), dst, recv)?;
-                        (*top_frame!()).advance_pc()?;
+                        top_frame!().advance_pc()?;
                         continue;
                     }
                     (match self.drive_to_primitive(stack, context, function.operand_view(instr)) {
@@ -1233,7 +1233,7 @@ impl Interpreter {
                             return Ok(DispatchOutcome::Fatal(error));
                         }
                     }
-                    (*top_frame!()).advance_pc()?;
+                    top_frame!().advance_pc()?;
                     continue;
                 }
                 // §7.4.11 IteratorClose for a throw completion: the handler
@@ -1246,7 +1246,7 @@ impl Interpreter {
                             return Ok(DispatchOutcome::Fatal(error));
                         }
                     }
-                    (*top_frame!()).advance_pc()?;
+                    top_frame!().advance_pc()?;
                     continue;
                 }
                 Op::AsyncIteratorReturn => {
@@ -1287,7 +1287,7 @@ impl Interpreter {
                             ("iterator `return` did not yield an object".to_string()).into(),
                         ));
                     }
-                    (*top_frame!()).advance_pc()?;
+                    top_frame!().advance_pc()?;
                     continue;
                 }
                 // §10.1.8 [[Get]] — when the resolved property is an
@@ -1445,7 +1445,7 @@ impl Interpreter {
                         .name();
                     let home = *read_register(&(*top_frame!()), home_reg)?;
                     let value = *read_register(&(*top_frame!()), value_reg)?;
-                    let strict = context.function_is_strict((*top_frame!()).function_id);
+                    let strict = context.function_is_strict(top_frame!().function_id);
                     (match self.run_store_super_property(
                         context,
                         stack,
@@ -1468,7 +1468,7 @@ impl Interpreter {
                     let home = *read_register(&(*top_frame!()), home_reg)?;
                     let key_raw = *read_register(&(*top_frame!()), key_reg)?;
                     let value = *read_register(&(*top_frame!()), value_reg)?;
-                    let strict = context.function_is_strict((*top_frame!()).function_id);
+                    let strict = context.function_is_strict(top_frame!().function_id);
                     (match self.run_store_super_property(
                         context,
                         stack,
@@ -1612,7 +1612,7 @@ impl Interpreter {
                     });
                     // The synchronous helper completed the full effect (or
                     // threw), so publish exactly one resume increment.
-                    (*top_frame!()).advance_pc()?;
+                    top_frame!().advance_pc()?;
                     continue;
                 }
                 Op::Instanceof => {
@@ -1679,7 +1679,7 @@ impl Interpreter {
                     let key = context
                         .property_atom(name_idx)
                         .ok_or_else(|| VmError::InvalidOperand)?;
-                    let strict = context.function_is_strict((*top_frame!()).function_id);
+                    let strict = context.function_is_strict(top_frame!().function_id);
                     // `delete` has an object fast path that bypasses the
                     // §28.3 MOP funnel; trigger deferred-namespace
                     // evaluation here (named delete is never symbol-like
@@ -1717,7 +1717,7 @@ impl Interpreter {
                         continue;
                     }
                     let (dst, obj_reg, idx_reg) = instr.reg3();
-                    let strict = context.function_is_strict((*top_frame!()).function_id);
+                    let strict = context.function_is_strict(top_frame!().function_id);
                     let receiver = *read_register(&(*top_frame!()), obj_reg)?;
                     if receiver.as_object().is_some_and(|o| {
                         crate::object::deferred_namespace_target(o, &self.gc_heap).is_some()
@@ -1795,7 +1795,7 @@ impl Interpreter {
                             return Ok(DispatchOutcome::Fatal(error));
                         }
                     };
-                    (*top_frame!()).advance_pc()?;
+                    top_frame!().advance_pc()?;
                     continue;
                 }
                 // §19.4.1 indirect eval — recursively dispatches a
@@ -1821,7 +1821,7 @@ impl Interpreter {
                         }
                     };
                     write_register(&mut (*top_frame!()), dst, value)?;
-                    (*top_frame!()).advance_pc()?;
+                    top_frame!().advance_pc()?;
                     continue;
                 }
                 Op::CollectArguments => {
@@ -1830,7 +1830,7 @@ impl Interpreter {
                     continue;
                 }
                 Op::Nop => {
-                    (*top_frame!()).advance_pc()?;
+                    top_frame!().advance_pc()?;
                     continue;
                 }
                 Op::LoadUndefined => {
@@ -1993,7 +1993,7 @@ impl Interpreter {
                 }
                 Op::LoadNewTarget => {
                     let dst = instr.reg(0);
-                    let new_target = (*top_frame!()).new_target();
+                    let new_target = top_frame!().new_target();
                     let result = match self.scalar_value(
                         stack,
                         context,
@@ -2106,7 +2106,7 @@ impl Interpreter {
                         value,
                         op == Op::StoreContextSlotChecked,
                     )?;
-                    (*top_frame!()).advance_pc()?;
+                    top_frame!().advance_pc()?;
                     continue;
                 }
                 Op::BindThisContextSlot => {
@@ -2116,13 +2116,13 @@ impl Interpreter {
                     let (value, target) =
                         (*read_register(frame, src)?, *read_register(frame, ctx)?);
                     self.bind_this_context_slot_value(target, coord, value)?;
-                    (*top_frame!()).advance_pc()?;
+                    top_frame!().advance_pc()?;
                     continue;
                 }
                 Op::CollectRest => {
                     let dst = instr.reg(0);
                     self.collect_rest(&mut *stack, top_idx, function.param_count, dst)?;
-                    (*top_frame!()).advance_pc()?;
+                    top_frame!().advance_pc()?;
                     continue;
                 }
                 Op::MakeFunction => {
@@ -2260,7 +2260,7 @@ impl Interpreter {
                         fallback,
                         value,
                     )?;
-                    (*top_frame!()).advance_pc()?;
+                    top_frame!().advance_pc()?;
                     continue;
                 }
                 Op::DeleteLookupSlot => {
@@ -2331,7 +2331,7 @@ impl Interpreter {
                             return Ok(DispatchOutcome::Fatal(error));
                         }
                     });
-                    (*top_frame!()).advance_pc()?;
+                    top_frame!().advance_pc()?;
                     continue;
                 }
                 Op::DeleteLookupGlobal => {
@@ -2390,7 +2390,7 @@ impl Interpreter {
                             return Ok(DispatchOutcome::Fatal(error));
                         }
                     });
-                    (*top_frame!()).advance_pc()?;
+                    top_frame!().advance_pc()?;
                     continue;
                 }
                 // §19.2.1.3 step 16 — a sloppy eval's `var` with no static
@@ -2400,7 +2400,7 @@ impl Interpreter {
                     let (name_idx, var_depth) = (instr.const_word(1), instr.imm(2));
                     let target = *read_register(&(*top_frame!()), ctx)?;
                     self.declare_eval_var_value(context, function_id, target, name_idx, var_depth)?;
-                    (*top_frame!()).advance_pc()?;
+                    top_frame!().advance_pc()?;
                     continue;
                 }
                 Op::StoreVarScope => {
@@ -2419,7 +2419,7 @@ impl Interpreter {
                         var_depth,
                         value,
                     )?;
-                    (*top_frame!()).advance_pc()?;
+                    top_frame!().advance_pc()?;
                     continue;
                 }
                 // §6.2.12 — mint a Private Name carrier; the marker
@@ -2492,7 +2492,7 @@ impl Interpreter {
                             return Ok(DispatchOutcome::Fatal(error));
                         }
                     });
-                    (*top_frame!()).advance_pc()?;
+                    top_frame!().advance_pc()?;
                     continue;
                 }
                 // §10.2.10 SetFunctionName — names an anonymous
@@ -2736,7 +2736,7 @@ impl Interpreter {
                             return Ok(DispatchOutcome::Fatal(error));
                         }
                     }
-                    (*top_frame!()).advance_pc()?;
+                    top_frame!().advance_pc()?;
                     continue;
                 }
                 Op::NewWeakRef => {

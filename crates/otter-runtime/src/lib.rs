@@ -1944,6 +1944,7 @@ fn compile_eval_with_options(
         options.super_property_allowed,
         options.super_call_allowed,
         options.function_constructor,
+        LAZY_FUNCTIONS,
     )
 }
 

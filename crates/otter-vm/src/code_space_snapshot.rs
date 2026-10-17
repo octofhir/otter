@@ -29,6 +29,7 @@ struct CapturedChunk {
     property_ic_site_base: u32,
     property_ic_site_end: u32,
     retention: ChunkRetention,
+    alias: Option<u32>,
     payload: Option<CapturedPayload>,
 }
 
@@ -70,6 +71,7 @@ impl CodeSpace {
                 property_ic_site_base: chunk.property_ic_site_base,
                 property_ic_site_end: chunk.property_ic_site_end,
                 retention: chunk.retention,
+                alias: chunk.alias,
                 payload,
             });
         }
@@ -125,6 +127,7 @@ impl CodeSpaceSnapshot {
                 property_ic_site_base: chunk.property_ic_site_base,
                 property_ic_site_end: chunk.property_ic_site_end,
                 retention: chunk.retention,
+                alias: chunk.alias,
                 payload: RwLock::new(payload),
                 _directory_node_lease: account.reserve_exact(
                     ResourceClass::SourceModuleBytes,

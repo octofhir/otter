@@ -97,6 +97,10 @@ pub fn compile_script_source_with_forced_strict(
 /// `None` compiles an indirect eval or a `Function` constructor body:
 /// global code with no caller context.
 ///
+/// `options` may leave the body's functions lazy; a body that only parses
+/// inside the `super` / `new.target` wrapper compiles them eagerly, since
+/// its spans index the wrapper rather than the text the VM keeps.
+///
 /// # Errors
 /// Returns [`CompileError`] when parsing fails or lowering rejects the AST.
 #[allow(clippy::too_many_arguments)]
@@ -112,6 +116,7 @@ pub fn compile_eval_source(
     super_property_allowed: bool,
     super_call_allowed: bool,
     function_constructor: bool,
+    options: CompileOptions,
 ) -> Result<BytecodeModule, CompileError> {
     // §19.2.1.1 PerformEval parses the body with the Script goal.
     // A `super` reference parses cleanly and is rejected by our own
@@ -123,6 +128,13 @@ pub fn compile_eval_source(
         kind,
         otter_syntax::SourceGoal::Script,
         |program| {
+            // A parse the §13.15.1 call-target retry had to patch indexes
+            // the patched text, which a body compile cannot reparse.
+            let lazy = if program.source_text.len() == source.len() {
+                lazy_unit(options, kind, false)
+            } else {
+                None
+            };
             compile_eval_parts(
                 ProgramParts::of(program),
                 kind,
@@ -135,6 +147,7 @@ pub fn compile_eval_source(
                 super_property_allowed,
                 super_call_allowed,
                 function_constructor,
+                lazy,
             )
         },
     ) {
@@ -201,6 +214,7 @@ pub fn compile_eval_source(
                         super_property_allowed,
                         super_call_allowed,
                         function_constructor,
+                        None,
                     )
                 },
             )
@@ -343,6 +357,7 @@ fn compile_eval_parts(
     super_property_allowed: bool,
     super_call_allowed: bool,
     function_constructor: bool,
+    lazy: Option<crate::compiler::LazyUnit>,
 ) -> Result<BytecodeModule, CompileError> {
     if !super_call_allowed && super_property_allowed && statements_contain_super_call(program.body)
     {
@@ -394,6 +409,7 @@ fn compile_eval_parts(
             super_property_allowed,
             super_call_allowed,
             function_constructor,
+            lazy,
         )
     }
 }
@@ -508,6 +524,7 @@ pub(crate) fn compile_program_for_eval(
     super_property_allowed: bool,
     super_call_allowed: bool,
     function_constructor: bool,
+    lazy: Option<crate::compiler::LazyUnit>,
 ) -> Result<BytecodeModule, CompileError> {
     compile_program_parts(
         program,
@@ -521,7 +538,7 @@ pub(crate) fn compile_program_for_eval(
             super_property_allowed,
             super_call_allowed,
             function_constructor,
-            lazy: None,
+            lazy,
         },
     )
 }

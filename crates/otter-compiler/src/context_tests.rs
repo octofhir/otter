@@ -853,6 +853,7 @@ fn compile_eval(
         false,
         false,
         false,
+        crate::CompileOptions::default(),
     )?;
     assert_verified_with_caller(&module, chain);
     Ok(module)
@@ -968,6 +969,7 @@ fn eval_in_a_derived_constructor_reads_the_this_slot() {
         true,
         true,
         false,
+        crate::CompileOptions::default(),
     )
     .unwrap();
     assert_verified_with_caller(&module, Some(&chain));

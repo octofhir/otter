@@ -95,12 +95,25 @@ impl Interpreter {
         self.code_eviction_stats.census_passes =
             self.code_eviction_stats.census_passes.saturating_add(1);
         let mut released_contexts = false;
-        for candidate in self.code_space.eviction_candidates() {
+        let candidates = self.code_space.eviction_candidates();
+        for candidate in &candidates {
             released_contexts |= self
                 .jit_code_registry
                 .closure_contexts
                 .release_range(candidate.function_base, candidate.function_end());
         }
+        // A call site's cached callee is a cache, not an owner: a cell
+        // holding a function of a candidate chunk would keep that chunk.
+        let heap = &self.gc_heap;
+        self.jit_code_registry
+            .release_callee_identities(&mut |value| {
+                value.as_closure(heap).is_some_and(|closure| {
+                    let id = closure.function_id();
+                    candidates.iter().any(|candidate| {
+                        (candidate.function_base..candidate.function_end()).contains(&id)
+                    })
+                })
+            });
         if released_contexts {
             self.retire_jit_for_code_eviction();
         }

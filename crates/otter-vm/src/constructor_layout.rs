@@ -40,6 +40,7 @@
 //! - [`crate::object::ShapeState`] for lineage bakeability.
 
 mod code_eviction;
+pub(crate) use code_eviction::EvictedRanges;
 mod compile;
 mod completion;
 mod lexical;

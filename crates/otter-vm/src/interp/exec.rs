@@ -32,6 +32,13 @@ impl Interpreter {
     /// Default retained-byte high-water mark for reclaimable dynamic code.
     pub const DEFAULT_CODE_EVICTION_HIGH_WATER_BYTES: u64 = 16 * 1024 * 1024;
 
+    /// Code chunks ever linked into this isolate's code space: each script,
+    /// eval body, module graph and lazily compiled function body is one.
+    #[must_use]
+    pub fn linked_code_chunks(&self) -> usize {
+        self.code_space.chunk_count()
+    }
+
     /// Current code-chunk reclamation counters.
     #[must_use]
     pub fn code_eviction_stats(&self) -> CodeEvictionStats {

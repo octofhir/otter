@@ -1242,6 +1242,8 @@ pub struct Interpreter {
     lazy_compile_hook: Option<LazyCompileHook>,
     /// Lazy records whose bodies this isolate compiled.
     lazy_bodies_compiled: u64,
+    /// Owners of function ids outside an ambient chunk.
+    owner_cache: std::cell::RefCell<crate::execution_context::OwnerCache>,
     /// Side-channel for an unhandled JS-level throw escaping a
     /// synchronous sub-dispatch such as a Proxy trap or callback
     /// invoked via [`Self::run_callable_sync`]. The sub-stack can

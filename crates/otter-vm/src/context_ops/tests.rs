@@ -1062,9 +1062,9 @@ fn the_eval_caller_chain_lists_descriptors_extensions_and_the_var_scope() {
         .eval_caller_chain(&context, inner)
         .expect("caller chain");
     assert_eq!(chain.scopes.len(), 2);
-    assert_eq!(chain.scopes[0].descriptor, scopes[1]);
+    assert_eq!(*chain.scopes[0].descriptor.descriptor(), scopes[1]);
     assert!(chain.scopes[0].extension_names.is_empty());
-    assert_eq!(chain.scopes[1].descriptor, scopes[0]);
+    assert_eq!(*chain.scopes[1].descriptor.descriptor(), scopes[0]);
     assert_eq!(chain.scopes[1].extension_names, vec!["e".to_string()]);
     assert_eq!(chain.var_depth, Some(1));
 

@@ -71,10 +71,10 @@ pub(crate) fn try_string(source: &str, lease: &mut ResourceLease) -> Result<Stri
     Ok(buffer)
 }
 
-pub(crate) fn try_scopes(
-    source: &[otter_bytecode::ScopeDescriptor],
+pub(crate) fn try_scopes<'a>(
+    source: impl ExactSizeIterator<Item = &'a otter_bytecode::ScopeDescriptor>,
     lease: &mut ResourceLease,
-) -> Result<Box<[otter_bytecode::ScopeDescriptor]>, ResourceError> {
+) -> Result<Box<[std::sync::Arc<otter_bytecode::SharedScope>]>, ResourceError> {
     let mut scopes = try_vec(source.len(), lease)?;
     for scope in source {
         let mut slots = try_vec(scope.slots.len(), lease)?;
@@ -85,11 +85,13 @@ pub(crate) fn try_scopes(
                 exported: slot.exported,
             });
         }
-        scopes.push(otter_bytecode::ScopeDescriptor {
-            kind: scope.kind,
-            flags: scope.flags,
-            slots,
-        });
+        scopes.push(std::sync::Arc::new(otter_bytecode::SharedScope::new(
+            otter_bytecode::ScopeDescriptor {
+                kind: scope.kind,
+                flags: scope.flags,
+                slots,
+            },
+        )));
     }
     Ok(scopes.into_boxed_slice())
 }

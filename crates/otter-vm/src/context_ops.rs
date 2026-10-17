@@ -91,7 +91,20 @@ pub(crate) fn with_scope<R>(
         .scopes
         .get(scope_index as usize)
         .ok_or(VmError::InvalidOperand)?;
-    Ok(f(scope))
+    Ok(f(scope.descriptor()))
+}
+
+/// The shared descriptor of scope `scope_index` of `function_id`.
+fn shared_scope(
+    owner: &ExecutionContext,
+    function_id: u32,
+    scope_index: u16,
+) -> Result<std::sync::Arc<otter_bytecode::SharedScope>, VmError> {
+    owner
+        .exec_function(function_id)
+        .and_then(|function| function.scopes.get(scope_index as usize))
+        .cloned()
+        .ok_or(VmError::InvalidOperand)
 }
 
 /// Exact DerivedThis slot from an immutable verified scope descriptor.
@@ -760,7 +773,8 @@ impl Interpreter {
         let mut current = context_operand(ctx)?;
         while let Some(handle) = current {
             let (function_id, scope_index) = context::scope_identity(&self.gc_heap, handle);
-            let descriptor = with_scope(context, function_id, scope_index, Clone::clone)?;
+            let owner = self.function_context(Some(context), function_id)?;
+            let descriptor = shared_scope(&owner, function_id, scope_index)?;
             if chain.var_depth.is_none() && descriptor.flags.var_scope {
                 chain.var_depth =
                     Some(u32::try_from(chain.scopes.len()).map_err(|_| VmError::InvalidOperand)?);

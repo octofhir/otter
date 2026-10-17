@@ -395,7 +395,8 @@ impl CodeBlock {
             as u64)
             .saturating_add(self.module_url.len() as u64)
             .saturating_add(
-                std::mem::size_of_val::<[otter_bytecode::ScopeDescriptor]>(&self.scopes) as u64,
+                std::mem::size_of_val::<[std::sync::Arc<otter_bytecode::SharedScope>]>(&self.scopes)
+                    as u64,
             )
             .saturating_add(self.scopes.iter().fold(0u64, |total, scope| {
                 total.saturating_add(scope.retained_bytes())
@@ -1309,7 +1310,7 @@ pub struct CodeBlock {
     /// `Op::CreateContext`'s scope operand. A live context names one entry by
     /// `(id, scope index)`; run-time TDZ messages and direct eval read slot
     /// names and kinds from here.
-    pub(crate) scopes: Box<[otter_bytecode::ScopeDescriptor]>,
+    pub(crate) scopes: Box<[std::sync::Arc<otter_bytecode::SharedScope>]>,
     /// `true` when this function's own code contains a direct eval call
     /// site, so its activation stays materialized.
     pub(crate) contains_direct_eval: bool,
@@ -1556,7 +1557,7 @@ impl CodeBlock {
         }));
         let byte_spans = byte_spans.into_boxed_slice();
         let module_url = allocation::try_string(module_url, &mut lease)?.into_boxed_str();
-        let scopes = allocation::try_scopes(&function.scopes, &mut lease)?;
+        let scopes = allocation::try_scopes(function.scopes.iter(), &mut lease)?;
         let makes_function = function
             .code
             .iter()

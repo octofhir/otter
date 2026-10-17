@@ -72,3 +72,27 @@ fn retained_module_counts_spare_rows_nested_strings_and_exception_capacity() {
     module.functions[0].handlers.shrink_to_fit();
     assert_eq!(module.retained_bytes(), base + expected - handler_bytes);
 }
+
+#[test]
+fn a_shared_scope_finds_every_slot_by_name_at_any_size() {
+    for count in [0usize, 3, 8, 9, 5000] {
+        let descriptor = crate::ScopeDescriptor {
+            kind: crate::ScopeKind::Body,
+            flags: crate::ScopeFlags::default(),
+            slots: (0..count)
+                .map(|index| crate::SlotDescriptor {
+                    name: format!("v{index}"),
+                    kind: crate::SlotKind::Var,
+                    exported: false,
+                })
+                .collect(),
+        };
+        let shared = crate::SharedScope::new(descriptor);
+        for index in 0..count {
+            assert_eq!(shared.slot_index(&format!("v{index}")), Some(index));
+        }
+        assert_eq!(shared.slot_index("absent"), None);
+        // A clone shares nothing mutable and answers the same.
+        assert_eq!(shared.clone().slot_index("v1"), (count > 1).then_some(1));
+    }
+}

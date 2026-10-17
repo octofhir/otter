@@ -211,7 +211,8 @@ fn caller_chain_const_metadata_does_not_prove_a_live_initialized_value() {
                         exported: false,
                     },
                 ],
-            },
+            }
+            .into(),
             extension_names: Vec::new(),
         }],
         var_depth: Some(0),

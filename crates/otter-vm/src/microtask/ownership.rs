@@ -28,12 +28,24 @@ impl Interpreter {
         function_id: u32,
     ) -> Result<ExecutionContext, VmError> {
         match admitted {
-            Some(context) => context
-                .for_function(function_id)
-                .map(|owner| (*owner).clone()),
-            None => ExecutionContext::for_function_in(&self.code_space, function_id),
+            Some(context) if context.resolves_locally(function_id) => Ok(context.clone()),
+            _ => self.foreign_owner(function_id),
         }
-        .map_err(|_| VmError::InvalidOperand)
+    }
+
+    /// The owner of a function id outside the ambient chunk, through the
+    /// isolate's owner cache: a call into another chunk — a lazily compiled
+    /// body is one — resolves its owner without searching the code space.
+    pub(crate) fn foreign_owner(&self, function_id: u32) -> Result<ExecutionContext, VmError> {
+        if let Some(owner) = self.owner_cache.borrow().get(function_id) {
+            return Ok(owner);
+        }
+        let owner = ExecutionContext::for_function_in(&self.code_space, function_id)
+            .map_err(|_| VmError::InvalidOperand)?;
+        self.owner_cache
+            .borrow_mut()
+            .insert(function_id, owner.clone());
+        Ok(owner)
     }
 
     /// Admit the defining bytecode chunk when present. Native-only work keeps

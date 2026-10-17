@@ -114,3 +114,21 @@ fn an_error_in_a_lazily_compiled_body_is_an_early_error() {
         );
     }
 }
+
+#[test]
+fn a_body_called_from_another_chunk_runs_compiled_after_its_first_call() {
+    // `inc` lives in the first script's chunk; native callbacks from the
+    // second resolve its owner across chunks, before and after its body
+    // compiles.
+    let mut runtime = Runtime::builder().build().expect("runtime");
+    run(&mut runtime, "function inc(x) { return x + 1; }");
+    assert_eq!(run(&mut runtime, "[1, 2, 3].map(inc).join()"), "2,3,4");
+    assert_eq!(run(&mut runtime, "[4, 5].map(inc).join()"), "5,6");
+    assert_eq!(
+        run(
+            &mut runtime,
+            "function twice(f, x) { return f(f(x)); } [twice(inc, 1), twice(inc, 2)].join()"
+        ),
+        "3,4"
+    );
+}

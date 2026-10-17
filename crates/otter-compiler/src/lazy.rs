@@ -51,6 +51,8 @@ pub struct CompileOptions {
 pub struct LazyCompileRequest<'a> {
     /// The whole source text of the module the function belongs to.
     pub source: &'a str,
+    /// URL of that module.
+    pub module_url: &'a str,
     /// The function's lazy record.
     pub function: &'a Function,
     /// The closure's context chain, innermost first.
@@ -324,7 +326,7 @@ fn lower(
     // code) the import bindings. It owns no scope and emits nothing.
     let mut top = FunctionContext::new(Rc::clone(&module))
         .with_strict(lazy.outer_strict)
-        .with_module_url(function.module_url.clone());
+        .with_module_url(request.module_url);
     top.dot_arguments_observed = lazy.dot_arguments_observed;
     top.super_home_static = lazy.static_home;
     top.closure_context_empty = request.chain.scopes.is_empty();
@@ -341,9 +343,9 @@ fn lower(
         top.is_derived_ctor = true;
         top.eval_this_from_chain = true;
     }
-    top.module_state = request.environment.map(|environment| {
-        module_state_from(environment, request.resolutions, &function.module_url)
-    });
+    top.module_state = request
+        .environment
+        .map(|environment| module_state_from(environment, request.resolutions, request.module_url));
     let capture = capture::CaptureFacts::of_unit(&program.body);
     let mut cx = Compiler::new(top, capture);
     cx.eval_chain = Some(request.chain.clone());
@@ -409,7 +411,7 @@ fn lower(
         .expect("module builder should be uniquely owned at finalize")
         .into_inner();
     Ok(BytecodeModule {
-        module: function.module_url.clone(),
+        module: request.module_url.to_string(),
         template_sites,
         source_kind: bytecode_source_kind(kind),
         functions,

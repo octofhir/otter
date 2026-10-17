@@ -10,5 +10,6 @@ description = "Otter foundation bytecode container, opcode set, disassembler, an
 workspace = true
 
 [dependencies]
+rustc-hash = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

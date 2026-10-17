@@ -2583,10 +2583,12 @@ impl VmRuntimeActivation {
         // SAFETY: forwarded from the caller's liveness contract; the admitted
         // context outlives every transition of this activation.
         match unsafe { self.context.as_ref() } {
-            Some(context) => context.for_function(function_id).ok(),
-            None => {
+            Some(context) if context.resolves_locally(function_id) => {
+                Some(crate::code_space::ResolvedCtx::Ambient(context))
+            }
+            _ => {
                 let vm = unsafe { self.vm.as_ref() }?;
-                vm.function_context(None, function_id)
+                vm.foreign_owner(function_id)
                     .ok()
                     .map(crate::code_space::ResolvedCtx::Owned)
             }

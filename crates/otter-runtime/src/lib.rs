@@ -7462,18 +7462,14 @@ fn map_syntax_diagnostic(diagnostic: &SyntaxDiagnostic, source_url: &str) -> Dia
     )
 }
 
-/// Compile policy of the scripts and modules a runtime loads: a function
-/// that does not run as soon as it is created compiles its body on its
-/// first call.
-pub(crate) const LAZY_FUNCTIONS: otter_compiler::CompileOptions = otter_compiler::CompileOptions {
-    lazy_functions: true,
-};
+pub(crate) use compile_cache::LAZY_FUNCTIONS;
 
 /// The compiler of lazily compiled function bodies.
 pub(crate) fn lazy_compile_hook() -> otter_vm::LazyCompileHook {
     std::sync::Arc::new(|input: otter_vm::LazyCompileInput<'_>| {
         otter_compiler::compile_lazy_function(otter_compiler::LazyCompileRequest {
             source: input.source,
+            module_url: input.module_url,
             function: input.function,
             chain: input.chain,
             environment: input.environment,

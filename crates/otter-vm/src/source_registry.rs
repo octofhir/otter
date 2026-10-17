@@ -2,7 +2,9 @@
 //!
 //! # Contents
 //! - [`ModuleSource`] owns admitted text and the line-start index its first
-//!   position query builds.
+//!   position query builds; a non-ASCII text's index also marks UTF-16
+//!   offsets at a fixed byte stride, so a column on a minified line of a
+//!   megabyte costs one stride of counting, not the line.
 //! - [`SourceRegistry`] shares the exact source/index owner with linked code
 //!   contexts and frozen code-space snapshots.
 //!
@@ -52,10 +54,25 @@ struct LineIndex {
     /// `\n`. Sorted ascending, so a byte offset maps to a line by
     /// `partition_point`.
     starts: Box<[u32]>,
-    /// Every byte is ASCII, so a column is a byte distance.
-    ascii: bool,
+    /// UTF-16 units before byte `k * UTF16_MARK_STRIDE`, for each `k`;
+    /// empty when every byte is ASCII and a column is a byte distance.
+    utf16_marks: Box<[u32]>,
     /// `None` for a transient index the ledger refused to retain.
     _lease: Option<ResourceLease>,
+}
+
+/// Bytes between two UTF-16 marks of a non-ASCII line index.
+const UTF16_MARK_STRIDE: usize = 4096;
+
+/// UTF-16 units encoded by `bytes`, counted per byte: a lead byte stands
+/// for its whole character (two units from a four-byte lead), a
+/// continuation byte for nothing. Additive over any split of the bytes,
+/// so prefix counts need not end on a character boundary.
+fn utf16_units(bytes: &[u8]) -> u32 {
+    bytes
+        .iter()
+        .map(|&byte| u32::from((byte & 0xC0) != 0x80) + u32::from(byte >= 0xF0))
+        .sum()
 }
 
 impl LineIndex {
@@ -67,11 +84,28 @@ impl LineIndex {
                 .filter(|&(_, byte)| byte == b'\n')
                 .map(|(idx, _)| (idx + 1) as u32),
         );
+        let utf16_marks = if text.is_ascii() {
+            Box::default()
+        } else {
+            let mut units = 0;
+            std::iter::once(0)
+                .chain(text.as_bytes().chunks(UTF16_MARK_STRIDE).map(|chunk| {
+                    units += utf16_units(chunk);
+                    units
+                }))
+                .collect()
+        };
         Self {
             starts: starts.into_boxed_slice(),
-            ascii: text.is_ascii(),
+            utf16_marks,
             _lease: None,
         }
+    }
+
+    /// UTF-16 units of `text` before byte `offset`.
+    fn utf16_offset(&self, text: &str, offset: usize) -> u32 {
+        let mark = offset / UTF16_MARK_STRIDE;
+        self.utf16_marks[mark] + utf16_units(&text.as_bytes()[mark * UTF16_MARK_STRIDE..offset])
     }
 }
 
@@ -94,7 +128,8 @@ impl ModuleSource {
             return f(lines);
         }
         let mut lines = LineIndex::build(&self.text, self.prologue);
-        let bytes = std::mem::size_of_val(&*lines.starts) as u64;
+        let bytes = (std::mem::size_of_val(&*lines.starts)
+            + std::mem::size_of_val(&*lines.utf16_marks)) as u64;
         match self
             .account
             .reserve_exact(ResourceClass::SourceModuleBytes, bytes)
@@ -125,15 +160,13 @@ impl ModuleSource {
             let line_start = lines.starts[line - 1] as usize;
             // An offset inside the host prologue reports the start of line 1.
             let clamped = clamped.max(line_start as u32);
-            let col_units = if lines.ascii {
-                clamped as usize - line_start
+            let col_units = if lines.utf16_marks.is_empty() {
+                clamped - line_start as u32
             } else {
-                self.text[line_start..clamped as usize]
-                    .chars()
-                    .map(char::len_utf16)
-                    .sum::<usize>()
+                lines.utf16_offset(&self.text, clamped as usize)
+                    - lines.utf16_offset(&self.text, line_start)
             };
-            (line as u32, (col_units as u32) + 1)
+            (line as u32, col_units + 1)
         })
     }
 
@@ -326,6 +359,36 @@ mod tests {
         let src = module_source(source("é x"));
         // byte offset 2 is the space (after the 2-byte 'é')
         assert_eq!(src.line_col(2), (1, 2));
+    }
+
+    #[test]
+    fn columns_on_a_long_non_ascii_line_count_utf16_units() {
+        // One minified line spanning many marks, with two- and four-byte
+        // characters straddling the mark boundaries.
+        let mut text = String::from("ab\n");
+        for index in 0..5000 {
+            text.push_str(match index % 3 {
+                0 => "é",
+                1 => "𝄞x",
+                _ => "abc",
+            });
+        }
+        text.push_str("\ntail");
+        let src = module_source(source(&text));
+        let line_start = 3;
+        let line_end = text.rfind('\n').unwrap();
+        for (offset, _) in text[..=line_end].char_indices().skip(line_start) {
+            let expected = text[line_start..offset]
+                .chars()
+                .map(char::len_utf16)
+                .sum::<usize>() as u32;
+            assert_eq!(
+                src.line_col(offset as u32),
+                (2, expected + 1),
+                "offset {offset}"
+            );
+        }
+        assert_eq!(src.line_col(text.len() as u32 - 1), (3, 4));
     }
 
     #[test]

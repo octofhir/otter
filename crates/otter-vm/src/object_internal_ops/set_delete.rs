@@ -647,6 +647,16 @@ impl Interpreter {
                         .map_err(CommittedValueError::completed_call)?;
                     Ok(true)
                 }
+                // `resolve_set` takes `obj` for the receiver, and only a
+                // receiver's extensibility matters (§10.1.9.2): reached here
+                // as a prototype of another receiver, as an array's [[Set]]
+                // walk does, a frozen `obj` with nothing for the key lets the
+                // write land on that receiver.
+                object::SetOutcome::Reject {
+                    reason: object::SetRejectReason::NonExtensible,
+                } if receiver.as_object().is_none_or(|r| r != obj) => {
+                    self.ordinary_set_on_receiver(stack, context, key, value, &receiver)
+                }
                 object::SetOutcome::Reject { .. } => Ok(false),
                 object::SetOutcome::ExoticParent { parent } => self.ordinary_set_data_value(
                     stack,

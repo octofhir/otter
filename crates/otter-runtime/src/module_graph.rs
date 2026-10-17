@@ -550,6 +550,34 @@ impl<'a> ModuleGraphBuilder<'a> {
             }
         }
 
+        // A web module was parsed and compiled once already, when its map
+        // walked the graph; it stands for this graph when the imports it
+        // was compiled against still resolve to the same targets.
+        if is_web
+            && let Some(web) = self.loader.web_modules()
+            && let Some(precompiled) = web.take_compiled(&url, &text)
+        {
+            let resolved = self.resolve_requests(&url, &precompiled.requests, optional_dynamic)?;
+            if resolutions_match(
+                &precompiled.compiled.bytecode.module_resolutions,
+                &resolved.imports,
+            ) {
+                self.queue.extend(resolved.queued);
+                self.nodes.insert(
+                    nodes_key_for(&precompiled.compiled.bytecode),
+                    ModuleNode {
+                        fragment: precompiled.compiled.bytecode,
+                        metadata: precompiled.compiled.metadata,
+                        deps: resolved.deps,
+                    },
+                );
+                return Ok(());
+            }
+        }
+        if let Some(web) = self.loader.web_modules() {
+            web.note_parse();
+        }
+
         let timing_enabled = self.timings.is_some();
         let compile_program = |program: &Program<'_>| {
             let mut requests = collect_module_requests(program);
@@ -591,23 +619,7 @@ impl<'a> ModuleGraphBuilder<'a> {
                     edge.dynamic = true;
                 }
             }
-            // §16.2.1.5 InnerModuleEvaluation walks `[[RequestedModules]]`
-            // in source order. The compiler assembles `module_resolutions`
-            // from a hash map, losing that order; restore it from the
-            // source-ordered request list so eager evaluation (which roots
-            // its DFS at the entry and recurses dependencies in this order)
-            // matches the spec's deterministic evaluation order.
-            let request_order: HashMap<&str, usize> = requests
-                .iter()
-                .enumerate()
-                .map(|(idx, request)| (request.specifier.as_str(), idx))
-                .collect();
-            compiled.bytecode.module_resolutions.sort_by_key(|edge| {
-                request_order
-                    .get(edge.specifier.as_str())
-                    .copied()
-                    .unwrap_or(usize::MAX)
-            });
+            order_resolutions(&mut compiled.bytecode, &requests);
             Ok::<_, GraphError>((compiled, deps, queued, requests))
         };
         let parsed = if timing_enabled {
@@ -895,6 +907,103 @@ pub(crate) struct PrefetchRequest {
     /// Whether an import attribute made this a data file, which has no
     /// imports of its own to follow.
     pub(crate) data: bool,
+}
+
+/// Restore source order to a compiled module's import edges.
+///
+/// §16.2.1.5 InnerModuleEvaluation walks `[[RequestedModules]]` in source
+/// order. The compiler assembles `module_resolutions` from a hash map,
+/// losing that order; restore it from the source-ordered request list so
+/// eager evaluation (which roots its DFS at the entry and recurses
+/// dependencies in this order) matches the spec's deterministic evaluation
+/// order.
+fn order_resolutions(module: &mut BytecodeModule, requests: &[ModuleRequest]) {
+    let request_order: HashMap<&str, usize> = requests
+        .iter()
+        .enumerate()
+        .map(|(idx, request)| (request.specifier.as_str(), idx))
+        .collect();
+    module.module_resolutions.sort_by_key(|edge| {
+        request_order
+            .get(edge.specifier.as_str())
+            .copied()
+            .unwrap_or(usize::MAX)
+    });
+}
+
+/// A web module compiled by its map's walk, for the graph that runs it.
+pub(crate) struct PrecompiledModule {
+    compiled: otter_compiler::CompiledModule,
+    /// The static requests it was compiled against, in source order.
+    requests: Vec<ModuleRequest>,
+}
+
+/// What one parse of a delivered web module yields: the requests the walk
+/// follows and, when every static import resolved and the module compiled,
+/// the compile its graph takes instead of parsing again.
+pub(crate) struct WebModuleScan {
+    pub(crate) requests: Vec<PrefetchRequest>,
+    pub(crate) compiled: Option<PrecompiledModule>,
+}
+
+/// Parse the web module `url` once: collect its requests and compile it
+/// against the targets `resolve` gives its static imports.
+///
+/// A request with an import attribute, an unresolved specifier or a compile
+/// error leaves the module uncompiled; the graph then compiles it itself and
+/// reports what went wrong.
+pub(crate) fn scan_web_module(
+    text: &str,
+    url: &str,
+    resolve: impl Fn(&str) -> Option<String>,
+) -> Result<WebModuleScan, String> {
+    with_program(text, SourceKind::JavaScript, |program| {
+        let requests = collect_module_requests(program);
+        let prefetch = requests
+            .iter()
+            .map(|request| PrefetchRequest {
+                specifier: request.specifier.clone(),
+                dynamic: request.dynamic,
+                data: request.attr_type.is_some(),
+            })
+            .collect();
+        // A browser fetches an `import()` target when the call runs, not
+        // with the graph that contains it.
+        let requests: Vec<ModuleRequest> = requests
+            .into_iter()
+            .filter(|request| !request.dynamic)
+            .collect();
+        let compiled = (|| {
+            let mut resolved_imports = std::collections::HashMap::new();
+            for request in &requests {
+                if request.attr_type.is_some() {
+                    return None;
+                }
+                resolved_imports.insert(
+                    ImportRequest::new(request.specifier.clone(), None),
+                    resolve(&request.specifier)?,
+                );
+            }
+            let host = ModuleHostInfo {
+                module_url: url.to_owned(),
+                resolved_imports,
+            };
+            let mut compiled = compile_module_program_to_module(
+                program,
+                SourceKind::JavaScript,
+                &host,
+                crate::LAZY_FUNCTIONS,
+            )
+            .ok()?;
+            order_resolutions(&mut compiled.bytecode, &requests);
+            Some(PrecompiledModule { compiled, requests })
+        })();
+        WebModuleScan {
+            requests: prefetch,
+            compiled,
+        }
+    })
+    .map_err(|error| error.to_string())
 }
 
 /// Parse one module off the async executor and return its literal dependency

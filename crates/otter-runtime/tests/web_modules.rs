@@ -108,6 +108,43 @@ fn an_inline_module_with_relative_and_absolute_imports_runs_from_delivered_sourc
         .run_module_source(SourceInput::from_javascript(text), entry)
         .expect("module runs");
     assert_eq!(log(&mut runtime), "a,b,c");
+    // The walk's parse of each module is the one its graph runs.
+    assert_eq!(map.parses(), 4);
+}
+
+#[test]
+fn a_module_whose_imports_resolve_elsewhere_by_run_time_is_compiled_again() {
+    let (mut runtime, map) = page();
+    map.register_import_map(r#"{"imports": {"lib": "/vendor/lib.js"}}"#, PAGE)
+        .expect("import map");
+    let entry = WebModuleMap::inline_url(PAGE, 0);
+    let text = "import lib from 'lib'; log.push(lib);";
+    deliver(&map, &entry, text);
+    load_graph(
+        &map,
+        &entry,
+        &[(
+            "https://site.test/vendor/lib.js",
+            "export default 'vendor';",
+        )],
+    );
+    assert_eq!(map.parses(), 2);
+    // A later map scopes `lib` differently for the page's own modules: the
+    // walk's compile names the old target, so the graph compiles anew.
+    map.register_import_map(
+        r#"{"scopes": {"https://site.test/app/": {"lib": "/scoped/lib.js"}}}"#,
+        PAGE,
+    )
+    .expect("second import map");
+    deliver(
+        &map,
+        "https://site.test/scoped/lib.js",
+        "export default 'scoped';",
+    );
+    runtime
+        .run_module_source(SourceInput::from_javascript(text), entry)
+        .expect("module runs");
+    assert_eq!(log(&mut runtime), "scoped");
 }
 
 #[test]
@@ -159,6 +196,11 @@ fn a_redirected_module_resolves_its_imports_from_where_it_landed() {
         .run_module_source(SourceInput::from_javascript(text), entry)
         .expect("module runs");
     assert_eq!(log(&mut runtime), "https://site.test/v2/new.js,v2");
+    // The entry was compiled before anyone knew where `./old.js` lands:
+    // its import names the requested URL, so the graph compiles it again
+    // against the redirect. The redirected module and its dependency run
+    // from their first parse.
+    assert_eq!(map.parses(), 4);
 }
 
 #[test]

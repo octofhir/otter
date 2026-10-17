@@ -37,7 +37,10 @@
 //! - The map is keyed by request URL and holds each response once, so two
 //!   graphs, or two `import()` calls, that request the same URL share one
 //!   fetch and one source (the HTML module map).
-//! - A delivered module is parsed for its requests at most once.
+//! - A delivered module is parsed once. The walk that finds its requests
+//!   also compiles it against the targets they resolve to; the graph that
+//!   runs it takes that compile while its imports still resolve the same,
+//!   and parses again only when they do not.
 //! - Every module in a web graph is an ES module in JavaScript, whatever its
 //!   URL looks like: there is no CommonJS detection and no TypeScript.
 //! - Literal `import("…")` targets are not part of a static graph: they are
@@ -54,7 +57,7 @@ use std::sync::{Arc, RwLock};
 use url::Url;
 
 use crate::import_map::{ImportMap, ImportMapResolveError};
-use crate::module_graph::PrefetchRequest;
+use crate::module_graph::{PrecompiledModule, PrefetchRequest, scan_web_module};
 
 /// The fragment that keeps inline module scripts apart in the module map.
 ///
@@ -136,6 +139,8 @@ struct WebModuleState {
     /// from code with no module behind it, resolves against.
     document_base: Option<Url>,
     slots: HashMap<String, Slot>,
+    /// Parses of delivered sources, by walks and by graphs.
+    parses: u64,
 }
 
 enum Slot {
@@ -149,6 +154,8 @@ struct Delivered {
     /// Static requests, parsed once on first need. `Err` holds the parse
     /// diagnostic.
     requests: Option<Result<Vec<PrefetchRequest>, String>>,
+    /// The compile made by that parse, until a graph takes it.
+    compiled: Option<PrecompiledModule>,
 }
 
 impl std::fmt::Debug for WebModuleMap {
@@ -248,6 +255,7 @@ impl WebModuleMap {
             Ok(source) => Slot::Delivered(Box::new(Delivered {
                 source,
                 requests: None,
+                compiled: None,
             })),
             Err(message) => Slot::Failed(message),
         };
@@ -302,8 +310,42 @@ impl WebModuleMap {
         self.walk(entry_url, false)
     }
 
-    fn walk(&self, entry_url: &str, request: bool) -> Result<WebModuleGraph, WebModuleError> {
+    /// How many times a delivered module source was parsed, by the walks
+    /// that discover graphs and by the graphs that run them.
+    #[must_use]
+    pub fn parses(&self) -> u64 {
+        self.read().parses
+    }
+
+    pub(crate) fn note_parse(&self) {
+        self.write().parses += 1;
+    }
+
+    /// The walk's compile of the module delivered as `final_url` with
+    /// exactly `text`, handed over once.
+    pub(crate) fn take_compiled(&self, final_url: &str, text: &str) -> Option<PrecompiledModule> {
         let mut state = self.write();
+        let delivered = match state.slots.get_mut(final_url) {
+            Some(Slot::Delivered(delivered)) if delivered.source.final_url == final_url => {
+                delivered
+            }
+            // A redirect keys the slot by the URL that was requested.
+            _ => state.slots.values_mut().find_map(|slot| match slot {
+                Slot::Delivered(delivered) if delivered.source.final_url == final_url => {
+                    Some(delivered)
+                }
+                Slot::Requested | Slot::Delivered(_) | Slot::Failed(_) => None,
+            })?,
+        };
+        if delivered.source.text != text {
+            return None;
+        }
+        delivered.compiled.take()
+    }
+
+    fn walk(&self, entry_url: &str, request: bool) -> Result<WebModuleGraph, WebModuleError> {
+        let mut guard = self.write();
+        let state = &mut *guard;
         let mut fetch = Vec::new();
         let mut pending = false;
         let mut visited: HashSet<String> = HashSet::new();
@@ -334,14 +376,30 @@ impl WebModuleMap {
                 Some(Slot::Delivered(delivered)) => delivered,
             };
             let final_url = delivered.source.final_url.clone();
-            let requests = delivered
-                .requests
-                .get_or_insert_with(|| scan_requests(&delivered.source))
-                .clone()
-                .map_err(|message| WebModuleError::Parse {
-                    url: final_url.clone(),
-                    message,
-                })?;
+            if delivered.requests.is_none() {
+                state.parses += 1;
+                let import_map = &state.import_map;
+                let scan = scan_requests(&delivered.source, |specifier| {
+                    let base = Url::parse(strip_inline_marker(&final_url)).ok()?;
+                    import_map
+                        .resolve(specifier, &base)
+                        .ok()
+                        .map(|url| url.to_string())
+                });
+                delivered.requests = Some(scan.map(|scan| {
+                    delivered.compiled = scan.compiled;
+                    scan.requests
+                }));
+            }
+            let requests =
+                delivered
+                    .requests
+                    .clone()
+                    .expect("scanned above")
+                    .map_err(|message| WebModuleError::Parse {
+                        url: final_url.clone(),
+                        message,
+                    })?;
             for request in requests.iter().filter(|request| !request.dynamic) {
                 let target = Url::parse(strip_inline_marker(&final_url))
                     .map_err(|error| ImportMapResolveError {
@@ -363,18 +421,16 @@ impl WebModuleMap {
     }
 }
 
-fn scan_requests(source: &WebModuleSource) -> Result<Vec<PrefetchRequest>, String> {
+fn scan_requests(
+    source: &WebModuleSource,
+    resolve: impl Fn(&str) -> Option<String>,
+) -> Result<crate::module_graph::WebModuleScan, String> {
     let text = otter_resource::SharedSource::admit(
         &otter_resource::ResourceAccount::default(),
         source.text.clone(),
     )
     .map_err(|error| error.to_string())?;
-    crate::module_graph::scan_module_requests(text, otter_syntax::SourceKind::JavaScript).map_err(
-        |error| match error {
-            crate::module_graph::GraphError::Parse { error, .. } => error.to_string(),
-            other => other.to_string(),
-        },
-    )
+    scan_web_module(&text, &source.final_url, resolve)
 }
 
 /// `url` without the inline-module marker fragment, if it carries one.

@@ -1144,6 +1144,30 @@ pub(crate) fn is_plain_dense_absent(arr: JsArray, heap: &otter_gc::GcHeap, idx: 
     })
 }
 
+/// `HasProperty(arr, idx)` from a plain array's own storage, when that
+/// settles it: `Some(true)` for a present element; `Some(false)` for a hole
+/// or an index past the end when `no_inherited_indices` proves neither
+/// %Array.prototype% nor %Object.prototype% holds an index. `None` leaves
+/// the ordinary prototype walk authoritative.
+#[must_use]
+pub(crate) fn plain_dense_has(
+    arr: JsArray,
+    heap: &otter_gc::GcHeap,
+    idx: usize,
+    no_inherited_indices: bool,
+) -> Option<bool> {
+    heap.read_payload(arr, |body| {
+        if !body.exotic.is_null() {
+            return None;
+        }
+        match body.dense_value(idx) {
+            Some(value) if !value.is_hole() => Some(true),
+            _ if no_inherited_indices => Some(false),
+            _ => None,
+        }
+    })
+}
+
 /// Replace one slot in a plain dense array without allocation or key creation.
 ///
 /// Existing data slots are always eligible. A hole is eligible only when the

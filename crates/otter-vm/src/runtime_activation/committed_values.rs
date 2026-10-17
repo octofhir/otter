@@ -341,6 +341,20 @@ impl Interpreter {
         if let ObjectProtocolValueOp::Binary(operator) = operation {
             return self.binary_operator_value(stack, context, operator, value0, value1);
         }
+        // `index in array` on a plain array is its own storage's answer: no
+        // key to spell, no prototype walk.
+        if let ObjectProtocolValueOp::HasProperty = operation
+            && let Some(arr) = value1.as_array()
+            && let Some(index) = value0.as_i32().and_then(|i| usize::try_from(i).ok())
+            && let Some(has) = crate::array::plain_dense_has(
+                arr,
+                &self.gc_heap,
+                index,
+                !self.array_index_accessor_protector,
+            )
+        {
+            return Ok(Value::boolean(has));
+        }
         let mut result = Value::undefined();
         let mut roots = otter_gc::RootScope::new(&mut self.gc_heap);
         // SAFETY: all three locals precede `roots` and remain stationary until

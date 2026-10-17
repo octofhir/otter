@@ -15,6 +15,8 @@
 //! - [`HeapCensus`] — old / young / large censuses and the text
 //!   renderer.
 //! - [`GcHeap::census`] — build one.
+//! - [`GcHeap::for_each_live_body`] / [`LivePayload`] — every live body in
+//!   one walk, cast safely by type on request.
 //! - [`GcHeap::for_each_live_payload`] — safe typed iteration over
 //!   every live body of one type, for callers outside this crate
 //!   that need to inspect payload fields (they keep
@@ -276,6 +278,80 @@ impl GcHeap {
     }
 }
 
+/// One live body met by [`GcHeap::for_each_live_body`].
+///
+/// The page walk and the payload cast stay inside the GC: a caller asks for
+/// the body as a concrete type and gets it only when the header's tag is
+/// that type's.
+#[derive(Clone, Copy)]
+pub struct LivePayload<'h> {
+    header: *const crate::header::GcHeader,
+    _heap: std::marker::PhantomData<&'h GcHeap>,
+}
+
+impl<'h> LivePayload<'h> {
+    /// `Traceable::TYPE_TAG` of the body.
+    #[must_use]
+    pub fn type_tag(self) -> u8 {
+        // SAFETY: the walk hands out only valid live headers.
+        unsafe { (*self.header).type_tag() }
+    }
+
+    /// The body as `T`, when it is one.
+    #[must_use]
+    pub fn downcast<T: Traceable>(self) -> Option<&'h T> {
+        if self.type_tag() != T::TYPE_TAG {
+            return None;
+        }
+        // SAFETY: a header tagged `T::TYPE_TAG` precedes exactly one `T`
+        // payload — `TraceTable::register` rejects a second type claiming a
+        // live tag — and the heap outlives `'h`.
+        unsafe {
+            let payload = (self.header as *const u8)
+                .add(std::mem::size_of::<crate::header::GcHeader>())
+                .cast::<T>();
+            Some(&*payload)
+        }
+    }
+}
+
+impl GcHeap {
+    /// Visit every live body once, in one walk of the pages, whatever its
+    /// type. [`Self::for_each_live_payload`] walks the heap once per type;
+    /// a caller interested in many types dispatches on
+    /// [`LivePayload::type_tag`] here instead. Same STW-equivalent contract
+    /// as [`Self::census`] — `visit` must not allocate in this heap.
+    pub fn for_each_live_body<F>(&self, mut visit: F)
+    where
+        F: FnMut(SpaceKind, LivePayload<'_>),
+    {
+        for (space, pages) in self.census_spaces() {
+            for page in pages {
+                // SAFETY: headers up to `bump_cursor` are valid (see
+                // `census`); swept, forwarded and filler headers carry no
+                // live body.
+                unsafe {
+                    page.for_each_object(|header, _| {
+                        if (*header).is_swept()
+                            || (*header).is_forwarded()
+                            || (*header).type_tag() == FREE_TAG
+                        {
+                            return;
+                        }
+                        visit(
+                            space,
+                            LivePayload {
+                                header,
+                                _heap: std::marker::PhantomData,
+                            },
+                        );
+                    });
+                }
+            }
+        }
+    }
+}
+
 fn empty_space(space: SpaceKind) -> SpaceCensus {
     SpaceCensus {
         space,
@@ -311,6 +387,26 @@ mod tests {
             .expect("OpaqueLeaf row");
         assert_eq!(row.object_count, 16);
         assert!(row.type_name.ends_with("OpaqueLeaf"), "{}", row.type_name);
+    }
+
+    #[test]
+    fn one_walk_meets_every_live_body_once_and_casts_by_tag() {
+        let _guard = CAGE_TEST_LOCK.lock().expect("cage test lock");
+        let mut heap = GcHeap::new().expect("heap");
+        for payload in 0..32u64 {
+            heap.alloc(OpaqueLeaf { payload }).expect("alloc");
+        }
+        let mut seen = Vec::new();
+        heap.for_each_live_body(|_, body| {
+            if let Some(leaf) = body.downcast::<OpaqueLeaf>() {
+                seen.push(leaf.payload);
+            }
+        });
+        seen.sort_unstable();
+        assert_eq!(seen, (0..32).collect::<Vec<_>>());
+        let mut typed = 0;
+        heap.for_each_live_payload::<OpaqueLeaf, _>(|_, _| typed += 1);
+        assert_eq!(typed, 32);
     }
 
     #[test]

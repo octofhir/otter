@@ -342,13 +342,38 @@ impl<'rt, 'cx, 's> MarshalCx<'rt, 'cx, 's> {
 
     // ---- object access ------------------------------------------------------
 
-    /// Read property `key` from the object handle `obj` (absent reads
-    /// as `undefined`).
+    /// `obj[key]` as JavaScript reads it (§7.3.2 Get): along the prototype
+    /// chain, running a getter it finds, and absent reads as `undefined`.
+    /// WebIDL reads dictionary members and callback interfaces this way, so
+    /// an import object whose `env` is a getter runs it, and what it throws
+    /// is what the binding throws. With no execution context to run script
+    /// in, the data properties alone answer.
     pub fn get(&mut self, obj: Local<'_>, key: &str) -> Result<Local<'s>, JsError> {
         let scope = self.scope;
-        self.interp()
-            .scoped_get(scope, obj, key)
-            .map_err(|err| self.vm_err(err))
+        let Some(context) = self.context() else {
+            return self
+                .interp()
+                .scoped_get(scope, obj, key)
+                .map_err(|err| self.vm_err(err));
+        };
+        let receiver = self.escape(obj);
+        if receiver.as_object().is_none() {
+            return self
+                .interp()
+                .scoped_get(scope, obj, key)
+                .map_err(|err| self.vm_err(err));
+        }
+        // No allocation between reading the receiver out of its handle and
+        // the getter path rooting it.
+        let value = self
+            .ctx
+            .with_turn_parts(|interp, stack| interp.get_property(stack, context, receiver, key));
+        match value {
+            Ok(value) => Ok(self.park(value)),
+            Err(err) => Err(JsError::from_native(
+                err.into_native(self.ctx.interp_mut(), "marshal"),
+            )),
+        }
     }
 
     /// Side-effect-free `obj[key]` on an ordinary object: the data value

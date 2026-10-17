@@ -15,7 +15,7 @@
 //! - `hoist` chooses storage at lexical-scope birth.
 //! - `scope` owns checked loads and stores.
 
-use std::collections::HashSet;
+use crate::HashSet;
 
 use oxc_ast::ast::SwitchCase;
 
@@ -25,7 +25,7 @@ pub(crate) fn checked_lexical_names(
     capture: &CaptureFacts,
     cases: &[SwitchCase<'_>],
 ) -> HashSet<String> {
-    let mut checked = HashSet::new();
+    let mut checked = HashSet::default();
     for (declaration_case, case) in cases.iter().enumerate() {
         let mut names = Vec::new();
         hoist_lexical_names(&case.consequent, &mut names);

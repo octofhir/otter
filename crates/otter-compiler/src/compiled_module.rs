@@ -360,7 +360,7 @@ pub(crate) fn collect_module_metadata(
         exports: Vec::new(),
         named_imports: Vec::new(),
         live_binding_names: BTreeSet::new(),
-        seen_imports: HashSet::new(),
+        seen_imports: HashSet::default(),
     };
     for stmt in &program.body {
         visitor.visit_statement(stmt);

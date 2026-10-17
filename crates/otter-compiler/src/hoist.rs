@@ -191,7 +191,7 @@ pub(crate) fn pre_declare_var_bindings(
     names: &[String],
     span: (u32, u32),
 ) -> Result<(), CompileError> {
-    let mut seen: HashSet<String> = HashSet::new();
+    let mut seen: HashSet<String> = HashSet::default();
     for name in names {
         if !seen.insert(name.clone()) {
             continue;
@@ -356,8 +356,8 @@ pub(crate) fn lexical_kind(is_const: bool) -> otter_bytecode::SlotKind {
 pub(crate) fn pre_declare_block_lexical_bindings(
     cx: &mut Compiler,
     names: &[(String, bool)],
-    captured_names: &std::collections::HashSet<String>,
-    checked_names: &std::collections::HashSet<String>,
+    captured_names: &crate::HashSet<String>,
+    checked_names: &crate::HashSet<String>,
     span: (u32, u32),
 ) -> Result<(), CompileError> {
     for (name, is_const) in names {
@@ -403,7 +403,7 @@ pub(crate) fn compile_block_statements(
     if nested_eval {
         block_captured.extend(block_lex.iter().map(|(name, _)| name.clone()));
     }
-    pre_declare_block_lexical_bindings(cx, &block_lex, &block_captured, &HashSet::new(), span)?;
+    pre_declare_block_lexical_bindings(cx, &block_lex, &block_captured, &HashSet::default(), span)?;
     let saved_hoisted = cx.hoisted_function_names.clone();
     let result = (|| {
         hoist_function_declarations(cx, stmts)?;
@@ -458,7 +458,7 @@ pub(crate) fn hoist_function_declarations_from(
     cx: &mut Compiler,
     stmts: &[&Statement<'_>],
 ) -> Result<(), CompileError> {
-    use std::collections::HashMap;
+    use crate::HashMap;
     // Resolve each statement to its hoistable `FunctionDeclaration`
     // payload, including the export-wrapped forms `export function`
     // and `export default function`. Returns `None` for other
@@ -503,7 +503,7 @@ pub(crate) fn hoist_function_declarations_from(
 
     // Pass 1 — last-occurrence-wins: identify the surviving
     // declaration index per name.
-    let mut last_idx: HashMap<String, usize> = HashMap::new();
+    let mut last_idx: HashMap<String, usize> = HashMap::default();
     for (idx, stmt) in stmts.iter().enumerate() {
         if let Some(f) = hoistable_function(stmt)
             && let Some(id) = &f.id
@@ -892,28 +892,23 @@ pub(crate) fn body_uses_arguments_callee(
 /// §16.2.1.7 `top-level-await` modules.
 pub(crate) fn module_body_uses_top_level_await(stmts: &[Statement<'_>]) -> bool {
     use oxc_ast_visit::Visit;
+    // A function body is never top level, so the walk stops at every
+    // function and arrow: it reads the module's own statements only.
     #[derive(Default)]
     struct AwaitFinder {
-        depth: u32,
         found: bool,
     }
     impl<'a> Visit<'a> for AwaitFinder {
         fn visit_function(
             &mut self,
-            it: &oxc_ast::ast::Function<'a>,
-            flags: oxc_syntax::scope::ScopeFlags,
+            _: &oxc_ast::ast::Function<'a>,
+            _: oxc_syntax::scope::ScopeFlags,
         ) {
-            self.depth += 1;
-            oxc_ast_visit::walk::walk_function(self, it, flags);
-            self.depth -= 1;
         }
         fn visit_arrow_function_expression(
             &mut self,
-            it: &oxc_ast::ast::ArrowFunctionExpression<'a>,
+            _: &oxc_ast::ast::ArrowFunctionExpression<'a>,
         ) {
-            self.depth += 1;
-            oxc_ast_visit::walk::walk_arrow_function_expression(self, it);
-            self.depth -= 1;
         }
         fn visit_class(&mut self, it: &oxc_ast::ast::Class<'a>) {
             // Class heritage and computed property names are evaluated in the
@@ -939,31 +934,33 @@ pub(crate) fn module_body_uses_top_level_await(stmts: &[Statement<'_>]) -> bool 
                 }
             }
         }
-        fn visit_await_expression(&mut self, it: &oxc_ast::ast::AwaitExpression<'a>) {
-            if self.depth == 0 {
-                self.found = true;
-            }
-            oxc_ast_visit::walk::walk_await_expression(self, it);
+        fn visit_await_expression(&mut self, _: &oxc_ast::ast::AwaitExpression<'a>) {
+            self.found = true;
         }
         fn visit_for_of_statement(&mut self, it: &oxc_ast::ast::ForOfStatement<'a>) {
             // `for await (… of …)` awaits every step of the iteration, so a
             // module whose top level writes one is asynchronous for the same
             // reason a bare `await` makes it one.
-            if self.depth == 0 && it.r#await {
+            if it.r#await {
                 self.found = true;
+                return;
             }
             oxc_ast_visit::walk::walk_for_of_statement(self, it);
         }
         fn visit_variable_declaration(&mut self, it: &oxc_ast::ast::VariableDeclaration<'a>) {
             // `await using x = …` awaits the disposal it registers.
-            if self.depth == 0 && it.kind == oxc_ast::ast::VariableDeclarationKind::AwaitUsing {
+            if it.kind == oxc_ast::ast::VariableDeclarationKind::AwaitUsing {
                 self.found = true;
+                return;
             }
             oxc_ast_visit::walk::walk_variable_declaration(self, it);
         }
     }
     let mut finder = AwaitFinder::default();
     for stmt in stmts {
+        if finder.found {
+            break;
+        }
         finder.visit_statement(stmt);
     }
     finder.found

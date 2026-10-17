@@ -792,7 +792,7 @@ fn compile_function_scopes(
         hoist_var_names(&body.statements, &mut var_names);
         // §B.3.3.1 — parameter names and "arguments" block the sloppy
         // block-level function var-scope extension.
-        let mut annex_blocked: std::collections::HashSet<String> =
+        let mut annex_blocked: crate::HashSet<String> =
             formal_parameter_bound_names(f.params).into_iter().collect();
         annex_blocked.insert("arguments".to_string());
         pre_declare_annex_b_functions(parent, &body.statements, &annex_blocked, span)?;
@@ -801,7 +801,7 @@ fn compile_function_scopes(
         // naming a parameter-environment binding starts with that
         // binding's current value.
         if f.has_param_expressions {
-            let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+            let mut seen: crate::HashSet<&str> = crate::HashSet::default();
             for name in &var_names {
                 if !seen.insert(name.as_str()) {
                     continue;
@@ -999,7 +999,7 @@ pub(crate) fn validate_no_param_lexical_conflict(
     if lex_names.is_empty() {
         return Ok(());
     }
-    let param_names: std::collections::HashSet<String> =
+    let param_names: crate::HashSet<String> =
         formal_parameter_bound_names(params).into_iter().collect();
     for (name, _) in lex_names {
         if param_names.contains(name) {

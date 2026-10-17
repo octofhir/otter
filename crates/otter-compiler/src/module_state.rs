@@ -142,7 +142,7 @@ pub struct ModuleHostInfo {
     /// Request → target URL pairs — every request the module makes
     /// in a static `import` or literal-string `import("./x")` must be
     /// present.
-    pub resolved_imports: HashMap<ImportRequest, String>,
+    pub resolved_imports: std::collections::HashMap<ImportRequest, String>,
 }
 
 /// Module-level mutable state shared across nested function
@@ -224,17 +224,17 @@ pub(crate) fn find_module_import_binding(cx: &Compiler, name: &str) -> Option<Im
     // here and there — a parameter, a `let`, a nested function's `var` —
     // shadows it (§9.1.2.1 GetIdentifierReference). Minified modules reuse
     // one-letter names for both all the time.
+    // Most names are not imports: look the name up in the import table
+    // first, and only then prove no nearer declaration shadows it.
+    let binding = cx
+        .stack
+        .iter()
+        .rev()
+        .find_map(|frame| frame.module_state.as_ref()?.imported_names.get(name))?;
     if cx.resolve_name(name).is_some() {
         return None;
     }
-    for frame in cx.stack.iter().rev() {
-        if let Some(state) = &frame.module_state
-            && let Some(binding) = state.imported_names.get(name)
-        {
-            return Some(binding.clone());
-        }
-    }
-    None
+    Some(binding.clone())
 }
 
 /// The module URL an import op names at run time. The host resolved the

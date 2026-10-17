@@ -35,7 +35,7 @@
 //! - `switch_bindings` uses reference positions to prove clause-local storage.
 //! - `hoist` chooses context storage from capture and branch-entry facts.
 
-use std::collections::HashSet;
+use crate::HashSet;
 
 use oxc_ast::ast::{
     ArrowFunctionExpression, BindingPattern, Class, Expression, FormalParameters, Function,

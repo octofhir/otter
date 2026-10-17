@@ -165,7 +165,7 @@ pub struct EarlyErrorContext {
     pub super_call_allowed: bool,
     /// Private names of the enclosing classes; `None` skips the
     /// AllPrivateNamesValid check.
-    pub private_names: Option<std::collections::HashSet<String>>,
+    pub private_names: Option<crate::HashSet<String>>,
 }
 
 struct StrictValidator {
@@ -178,7 +178,7 @@ struct StrictValidator {
     next_function_super_call: Option<bool>,
     /// Private names each enclosing class declares, outermost first; `None`
     /// when the code's private environment is not known here.
-    private_names: Option<Vec<std::collections::HashSet<String>>>,
+    private_names: Option<Vec<crate::HashSet<String>>>,
     /// Whether each enclosing class has a heritage, innermost last.
     class_is_derived: Vec<bool>,
     diagnostics: Vec<SyntaxDiagnostic>,
@@ -2593,7 +2593,7 @@ impl<'a> Visit<'a> for BlockLexicalValidator {
 }
 
 /// Private names a class body declares (without the `#`).
-fn class_private_bound_names(class: &Class<'_>) -> std::collections::HashSet<String> {
+fn class_private_bound_names(class: &Class<'_>) -> crate::HashSet<String> {
     class
         .body
         .body

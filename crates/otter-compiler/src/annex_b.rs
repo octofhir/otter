@@ -22,7 +22,7 @@
 //! # See also
 //! - <https://tc39.es/ecma262/#sec-block-level-function-declarations-web-legacy-compatibility-semantics>
 
-use std::collections::HashSet;
+use crate::HashSet;
 
 use oxc_ast::ast::Statement;
 
@@ -41,8 +41,8 @@ pub(crate) fn collect_annex_b_candidates_spanned(
     blocked: &HashSet<String>,
 ) -> (Vec<String>, HashSet<u32>) {
     let mut out = Vec::new();
-    let mut seen = HashSet::new();
-    let mut spans = HashSet::new();
+    let mut seen = HashSet::default();
+    let mut spans = HashSet::default();
     for stmt in stmts {
         walk_statement(stmt, blocked, &mut out, &mut seen, &mut spans);
     }

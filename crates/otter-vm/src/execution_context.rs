@@ -837,6 +837,7 @@ mod tests {
                 ignores_this: false,
                 asm_module: false,
                 lazy: None,
+                preparse: None,
                 code: code.into(),
                 spans: otter_bytecode::SpanTable::default(),
                 handlers: Vec::new(),

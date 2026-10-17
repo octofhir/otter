@@ -65,6 +65,7 @@ mod hoist;
 mod lazy;
 mod module_state;
 mod params;
+mod preparse;
 mod scope;
 mod statements;
 pub(crate) mod strict_validation;

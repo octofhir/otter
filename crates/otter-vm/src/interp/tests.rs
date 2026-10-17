@@ -77,6 +77,7 @@ fn test_function(
         ignores_this: false,
         asm_module: false,
         lazy: None,
+        preparse: None,
         code: code.into(),
         spans: otter_bytecode::SpanTable::new(&spans),
         handlers: Vec::new(),
@@ -5500,6 +5501,7 @@ fn unwind_throw_pops_frames_until_handler_or_uncaught() {
         ignores_this: false,
         asm_module: false,
         lazy: None,
+        preparse: None,
         code: vec![Instruction {
             pc: 0,
             op: Op::ReturnUndefined,
@@ -5583,6 +5585,7 @@ fn unwind_throw_lands_in_catch_handler() {
         ignores_this: false,
         asm_module: false,
         lazy: None,
+        preparse: None,
         code: vec![Instruction {
             pc: 0,
             op: Op::ReturnUndefined,
@@ -6218,6 +6221,7 @@ fn arrow_closure_overrides_call_site_this() {
         ignores_this: false,
         asm_module: false,
         lazy: None,
+        preparse: None,
         code: vec![Instruction {
             pc: 0,
             op: Op::ReturnUndefined,
@@ -6262,6 +6266,7 @@ fn arrow_closure_overrides_call_site_this() {
         ignores_this: false,
         asm_module: false,
         lazy: None,
+        preparse: None,
         code: vec![
             Instruction {
                 pc: 0,

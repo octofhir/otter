@@ -129,6 +129,8 @@ pub(crate) struct Compiler {
     pub(crate) pending_class_hint_sites: Vec<PendingClassHintSite>,
     /// Capture facts of the unit being compiled.
     pub(crate) capture: Rc<crate::capture::CaptureFacts>,
+    /// Functions this body compile left unparsed, with their recorded facts.
+    pub(crate) skips: Option<Rc<crate::preparse::SkipTable>>,
 }
 
 /// How a compile unit's source parses, for the body compiles of its lazily
@@ -282,6 +284,7 @@ impl Compiler {
             declared_classes: HashMap::default(),
             pending_class_hint_sites: Vec::new(),
             capture: Rc::new(capture),
+            skips: None,
         }
     }
 

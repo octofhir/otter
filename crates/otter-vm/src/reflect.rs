@@ -660,6 +660,7 @@ mod tests {
                     ignores_this: false,
                     asm_module: false,
                     lazy: None,
+                    preparse: None,
                     code: vec![Instruction {
                         pc: 0,
                         op: otter_bytecode::Op::ReturnUndefined,

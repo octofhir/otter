@@ -243,11 +243,9 @@ fn decode_module_parts(bytes: &[u8], detached_source: Option<&str>) -> Option<By
     let function_source = match input.u8()? {
         0 => None,
         1 => Some(input.string()?),
-        DETACHED_FUNCTION_SOURCE => {
-            let source = detached_source?;
-            input.charge_allocation(source.len())?;
-            Some(source.to_owned())
-        }
+        // The caller supplies a detached source; its copy is bounded by
+        // that source, not by the encoded bytes the budget guards.
+        DETACHED_FUNCTION_SOURCE => Some(detached_source?.to_owned()),
         _ => return None,
     };
     let lazy_environments = input.seq(Reader::lazy_environment)?;
@@ -1515,6 +1513,21 @@ mod tests {
         assert_eq!(slot_kind_from_tag(0, Some(true)), None);
         assert_eq!(slot_kind_from_tag(20, None), Some(SlotKind::PrivateMethod));
         assert_eq!(slot_kind_from_tag(21, None), None);
+    }
+
+    #[test]
+    fn a_small_module_decodes_with_a_large_detached_source() {
+        // A lazily compiled bundle encodes far fewer bytes than its source.
+        let mut module = sample_module();
+        let source = "x".repeat(4 * 1024 * 1024);
+        module.function_source = Some(source.clone());
+        let bytes = encode_module_bounded_detached(&module, usize::MAX).expect("encodes");
+        assert!(bytes.len() < source.len() / 16);
+        let restored = decode_module_with_source(&bytes, &source).expect("decodes");
+        assert_eq!(
+            restored.module().function_source.as_deref(),
+            Some(source.as_str())
+        );
     }
 
     #[test]

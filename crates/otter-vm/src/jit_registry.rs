@@ -165,6 +165,12 @@ pub struct JitCodeRegistry {
     function_entries: Vec<u64>,
     /// Last cumulative generated-call counters merged into VM tier policy.
     generated_feedback_seen: rustc_hash::FxHashMap<u64, GeneratedFeedbackSeen>,
+    /// Generations whose counters can still move: installed generations
+    /// whose prologue counts entries, and any generation that took a side
+    /// exit since the last drain. A drain reads only these.
+    counting_generations: Vec<u64>,
+    /// Membership of [`Self::counting_generations`].
+    counting_members: rustc_hash::FxHashSet<u64>,
     /// Latest isolate-local epoch by dependency family and stable identity.
     epochs: rustc_hash::FxHashMap<(CodeDependencyKind, u32), u64>,
     /// Installed generations' subscriptions to monotone shape facts.
@@ -192,6 +198,8 @@ impl JitCodeRegistry {
             account: otter_resource::ResourceAccount::default(),
             codes: rustc_hash::FxHashMap::default(),
             entry_cells: rustc_hash::FxHashMap::default(),
+            counting_generations: Vec::new(),
+            counting_members: rustc_hash::FxHashSet::default(),
             retained_bytes: 0,
             function_entry_cells: rustc_hash::FxHashMap::default(),
             retraining: rustc_hash::FxHashSet::default(),
@@ -561,6 +569,14 @@ impl JitCodeRegistry {
             );
             debug_assert!(replaced.is_none(), "entry-cell ids are never reused");
             self.retained_bytes += entry_bytes;
+            if self.entry_cells[&code_object_id]
+                .cell
+                .native_frame_header
+                .kind
+                == NativeFrameKind::Baseline
+            {
+                self.watch_generated_feedback(code_object_id);
+            }
             self.refresh_function_entry(function_id);
         }
         // Every fact held when it was verified above; from here a writer that
@@ -1016,16 +1032,26 @@ impl JitCodeRegistry {
     /// remains available after invalidation and executable retirement.
     pub(crate) fn take_generated_feedback(&mut self) -> Vec<GeneratedCallFeedback> {
         let mut feedback = Vec::new();
-        for cell in self
-            .entry_cells
-            .values()
-            .map(|entry| entry.cell.as_ref())
-            .chain(
-                self.function_entry_cells
-                    .values()
-                    .map(|function| function.interpreter_destination()),
-            )
-        {
+        let mut index = 0;
+        while index < self.counting_generations.len() {
+            let id = self.counting_generations[index];
+            let Some(cell) = self.entry_cells.get(&id).map(|entry| entry.cell.as_ref()) else {
+                self.counting_members.remove(&id);
+                self.counting_generations.swap_remove(index);
+                continue;
+            };
+            // An unlinked generation is entered no more: once drained, only
+            // a side exit of a frame still running it brings it back.
+            if self
+                .codes
+                .get(&id)
+                .is_none_or(|code| code.state != CodeLifetimeState::Installed)
+            {
+                self.counting_members.remove(&id);
+                self.counting_generations.swap_remove(index);
+            } else {
+                index += 1;
+            }
             let code_object_id = cell.code_object_id;
             let (entries, returns, deopts) = cell.generated_feedback();
             let seen = self
@@ -1053,11 +1079,18 @@ impl JitCodeRegistry {
         feedback
     }
 
+    /// Make the next drain read `code_object_id`'s counters.
+    fn watch_generated_feedback(&mut self, code_object_id: u64) {
+        if self.counting_members.insert(code_object_id) {
+            self.counting_generations.push(code_object_id);
+        }
+    }
+
     /// Current generated-call health for one exact generation.
     /// The generation's state as it takes one side exit, counted in its
     /// feedback.
     pub(crate) fn generated_deopt_state(
-        &self,
+        &mut self,
         code_object_id: u64,
         function_id: u32,
         frame_kind: NativeFrameKind,
@@ -1073,11 +1106,13 @@ impl JitCodeRegistry {
         }
         cell.generated_deopts
             .set(cell.generated_deopts.get().saturating_add(1));
-        Some(GeneratedDeoptState {
+        let state = GeneratedDeoptState {
             function_id: cell.native_frame_header.function_id,
             tier,
             linked: cell.entry_addr.load(std::sync::atomic::Ordering::Acquire) != 0,
-        })
+        };
+        self.watch_generated_feedback(code_object_id);
+        Some(state)
     }
 
     /// Function identity retained for one exact generated-code generation.
@@ -1678,41 +1713,60 @@ mod tests {
     }
 
     #[test]
-    fn interpreter_feedback_is_distinct_per_function_and_drains_once() {
+    fn a_drain_reads_only_generations_whose_counters_can_move() {
         let mut registry = JitCodeRegistry::new_boxed();
-        for (id, entries, deopts) in [(7, 3, 1), (8, 5, 2)] {
+        // Linked functions with no generation: their interpreter routes
+        // never count, and a drain does not read them.
+        for id in 0..1000 {
             registry.ensure_function_entry(id, 1, 4, 0, 0);
-            let cell = registry.function_entry_cells[&id].interpreter_destination();
-            cell.generated_entries.set(entries);
-            cell.generated_deopts.set(deopts);
         }
-        let feedback = registry.take_generated_feedback();
-        let observed: Vec<_> = feedback
-            .iter()
-            .map(|delta| {
-                assert_eq!(delta.code_object_id, 0);
-                assert_eq!(delta.tier, NativeFrameKind::Interpreter);
-                (
-                    delta.function_id,
-                    delta.entries,
-                    delta.returns,
-                    delta.deopts,
-                )
-            })
-            .collect();
-        assert_eq!(observed, [(7, 3, 2, 1), (8, 5, 3, 2)]);
-        assert!(registry.take_generated_feedback().is_empty());
-        registry.function_entry_cells[&7]
-            .interpreter_destination()
-            .generated_entries
-            .set(4);
-        let next = registry.take_generated_feedback();
-        assert_eq!(next.len(), 1);
-        assert_eq!(next[0].function_id, 7);
-        assert_eq!(
-            (next[0].entries, next[0].returns, next[0].deopts),
-            (1, 1, 0)
+        let baseline: Arc<dyn JitFunctionCode> = Arc::new(GeneratedFakeCode {
+            id: 301,
+            function_id: 7,
+            tier: NativeFrameKind::Baseline,
+        });
+        let optimizing: Arc<dyn JitFunctionCode> = Arc::new(GeneratedFakeCode {
+            id: 302,
+            function_id: 8,
+            tier: NativeFrameKind::Optimizing,
+        });
+        assert!(
+            registry
+                .register_generation(301, baseline, 1, 4, Some(1), Box::new([]))
+                .is_ok()
         );
+        assert!(
+            registry
+                .register_generation(302, optimizing, 1, 4, Some(1), Box::new([]))
+                .is_ok()
+        );
+        // The counting baseline is watched; the optimizing one only once it
+        // takes a side exit.
+        assert_eq!(registry.counting_generations, [301]);
+        registry.entry_cells[&301].cell.generated_entries.set(3);
+        let feedback = registry.take_generated_feedback();
+        assert_eq!(feedback.len(), 1);
+        assert_eq!(
+            (
+                feedback[0].function_id,
+                feedback[0].entries,
+                feedback[0].returns
+            ),
+            (7, 3, 3)
+        );
+        assert!(registry.take_generated_feedback().is_empty());
+        assert!(
+            registry
+                .generated_deopt_state(302, 8, NativeFrameKind::Optimizing)
+                .is_some()
+        );
+        let feedback = registry.take_generated_feedback();
+        assert_eq!(feedback.len(), 1);
+        assert_eq!((feedback[0].function_id, feedback[0].deopts), (8, 1));
+        // Unlinked generations leave the watch list once drained.
+        let _ = registry.invalidate_all();
+        let _ = registry.take_generated_feedback();
+        assert!(registry.counting_generations.is_empty());
     }
 
     #[test]

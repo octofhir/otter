@@ -167,9 +167,9 @@ fn to_string_radix(
             let f = number.as_f64();
             let trunc = if f.is_nan() { 0.0 } else { f.trunc() };
             if !trunc.is_finite() || !(2.0..=36.0).contains(&trunc) {
-                return Err(NativeError::RangeError {
-                    name,
-                    reason: "must be an integer in 2..=36".to_string(),
+                return Err(NativeError::SpecError {
+                    kind: crate::error_classes::ErrorKind::RangeError,
+                    message: "toString() radix argument must be between 2 and 36".to_string(),
                 });
             }
             trunc as u32
@@ -256,9 +256,9 @@ fn number_to_fixed(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Nat
     // §21.1.3.3 step 3: `f` outside `[0, 100]` (or `±Infinity`)
     // raises `RangeError`.
     if !f_arg.is_finite() || !(0.0..=100.0).contains(&f_arg) {
-        return Err(NativeError::RangeError {
-            name: NAME,
-            reason: "must be an integer in 0..=100".to_string(),
+        return Err(NativeError::SpecError {
+            kind: crate::error_classes::ErrorKind::RangeError,
+            message: "toFixed() digits argument must be between 0 and 100".to_string(),
         });
     }
     let digits = f_arg as u32;
@@ -299,9 +299,9 @@ fn number_to_exponential(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Valu
         None => None,
         Some(f) => {
             if !f.is_finite() || !(0.0..=100.0).contains(&f) {
-                return Err(NativeError::RangeError {
-                    name: NAME,
-                    reason: "must be an integer in 0..=100".to_string(),
+                return Err(NativeError::SpecError {
+                    kind: crate::error_classes::ErrorKind::RangeError,
+                    message: "toExponential() argument must be between 0 and 100".to_string(),
                 });
             }
             Some(f as u32)
@@ -340,9 +340,9 @@ fn number_to_precision(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value,
     }
     // §21.1.3.5 step 5: out-of-range raises `RangeError`.
     if !p.is_finite() || !(1.0..=100.0).contains(&p) {
-        return Err(NativeError::RangeError {
-            name: NAME,
-            reason: "must be an integer in 1..=100".to_string(),
+        return Err(NativeError::SpecError {
+            kind: crate::error_classes::ErrorKind::RangeError,
+            message: "toPrecision() argument must be between 1 and 100".to_string(),
         });
     }
     let precision = p as u32;

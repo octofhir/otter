@@ -268,6 +268,17 @@ impl ActivationStack {
         }
         std::ptr::null_mut()
     }
+    /// The innermost live frame and the logical depth of the chain, resolved
+    /// once: a null frame and depth `0` when the chain is empty. The frame
+    /// keeps its address while it stays live, whatever is pushed above it.
+    pub(crate) fn top_with_depth(&self) -> (*mut Frame, usize) {
+        let top = self.top_pointer();
+        if top.is_null() {
+            return (top, 0);
+        }
+        // SAFETY: the bound chain is live for this execution turn.
+        (top, unsafe { Frame::logical_depth(top) as usize })
+    }
     /// Total live logical depth in the published chain.
     pub fn len(&self) -> usize {
         let top = self.top_pointer();

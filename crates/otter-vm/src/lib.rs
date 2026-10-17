@@ -899,6 +899,9 @@ pub struct Interpreter {
     code_space: std::sync::Arc<code_space::CodeSpace>,
     /// Byte-driven high-water mark for eval and on-demand module payloads.
     code_eviction_high_water_bytes: u64,
+    /// Retained bytes past which the between-turn check runs a census: the
+    /// high-water mark, raised after a census that could not get under it.
+    code_eviction_trigger_bytes: u64,
     code_eviction_stats: CodeEvictionStats,
     /// Shared `(receiver shape, property atom)` answers. A per-site inline
     /// cache stops answering once its site goes megamorphic; this table does

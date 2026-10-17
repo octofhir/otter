@@ -493,14 +493,27 @@
       Object.defineProperty(this, '_encoding', { value: enc, enumerable: false });
       Object.defineProperty(this, '_fatal', { value: Boolean(opts.fatal), enumerable: false });
       Object.defineProperty(this, '_ignoreBOM', { value: Boolean(opts.ignoreBOM), enumerable: false });
+      // Streaming state (Encoding §7.2 decode): bytes of a character split
+      // across calls, and whether the stream has started, which is where a
+      // byte order mark is.
+      Object.defineProperty(this, '_pending', { value: new Uint8Array(0), writable: true, enumerable: false });
+      Object.defineProperty(this, '_started', { value: false, writable: true, enumerable: false });
     }
     get encoding() { return this._encoding; }
     get fatal() { return this._fatal; }
     get ignoreBOM() { return this._ignoreBOM; }
     decode(input, options) {
-      let bytes = bytesOf(input);
-      // BOM handling (default: strip).
-      if (!this._ignoreBOM) {
+      const stream = Boolean(options && options.stream);
+      let bytes = input === undefined ? new Uint8Array(0) : bytesOf(input);
+      if (this._pending.length) {
+        const joined = new Uint8Array(this._pending.length + bytes.length);
+        joined.set(this._pending, 0);
+        joined.set(bytes, this._pending.length);
+        bytes = joined;
+        this._pending = new Uint8Array(0);
+      }
+      // BOM handling (default: strip), at the start of the stream only.
+      if (!this._ignoreBOM && !this._started) {
         if (this._encoding === 'utf-8' && bytes.length >= 3 &&
             bytes[0] === 0xEF && bytes[1] === 0xBB && bytes[2] === 0xBF) {
           bytes = bytes.subarray(3);
@@ -510,8 +523,39 @@
         } else if (this._encoding === 'utf-16be' && bytes.length >= 2 &&
                    bytes[0] === 0xFE && bytes[1] === 0xFF) {
           bytes = bytes.subarray(2);
+        } else if (stream && bytes.length < 3 && (this._encoding === 'utf-8' ? bytes[0] === 0xEF : bytes.length < 2)) {
+          // Too few bytes yet to tell whether they start a mark.
+          this._pending = bytes.slice();
+          return '';
         }
       }
+      if (stream) {
+        // Keep back the bytes of a character not finished in this chunk.
+        let keep = 0;
+        if (this._encoding === 'utf-8') {
+          for (let back = 1; back <= Math.min(3, bytes.length); back++) {
+            const byte = bytes[bytes.length - back];
+            if ((byte & 0xC0) === 0x80) continue;
+            const need = byte >= 0xF0 ? 4 : byte >= 0xE0 ? 3 : byte >= 0xC0 ? 2 : 1;
+            if (need > back) keep = back;
+            break;
+          }
+        } else if (this._encoding === 'utf-16le' || this._encoding === 'utf-16be') {
+          keep = bytes.length % 2;
+          const end = bytes.length - keep;
+          if (end >= 2) {
+            const unit = this._encoding === 'utf-16le'
+              ? bytes[end - 2] | (bytes[end - 1] << 8)
+              : (bytes[end - 2] << 8) | bytes[end - 1];
+            if (unit >= 0xD800 && unit <= 0xDBFF) keep += 2;
+          }
+        }
+        if (keep) {
+          this._pending = bytes.slice(bytes.length - keep);
+          bytes = bytes.subarray(0, bytes.length - keep);
+        }
+      }
+      this._started = stream ? (this._started || bytes.length > 0) : false;
       switch (this._encoding) {
         case 'utf-8': return decodeUtf8(bytes, this._fatal);
         case 'windows-1252': return decodeCp1252(bytes);

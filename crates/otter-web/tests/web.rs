@@ -1463,3 +1463,31 @@ fn console_extras_count_time_group_and_construct() {
     );
     assert_eq!(result, "ok");
 }
+
+#[test]
+fn text_decoder_streams_a_character_split_across_chunks() {
+    // `decode(chunk, { stream: true })` keeps a character's leading bytes
+    // for the next call (Encoding §7.2), and a byte order mark is stripped
+    // at the start of the stream only. React's Flight client decodes its
+    // payload this way, a chunk at a time.
+    let mut runtime = Runtime::builder().with_web_apis().build().unwrap();
+    let result = eval_string(
+        &mut runtime,
+        r#"
+        const bytes = new TextEncoder().encode("A—B\u{1F600}C");
+        const out = [];
+        for (let split = 0; split <= bytes.length; split++) {
+          const decoder = new TextDecoder();
+          out.push(decoder.decode(bytes.subarray(0, split), { stream: true })
+            + decoder.decode(bytes.subarray(split), { stream: true })
+            + decoder.decode());
+        }
+        const bom = new TextDecoder();
+        const marked = bom.decode(new Uint8Array([0xEF, 0xBB]), { stream: true })
+          + bom.decode(new Uint8Array([0xBF, 0x41, 0xEF, 0xBB, 0xBF]), { stream: true }) + bom.decode();
+        const cut = new TextDecoder().decode(new Uint8Array([0x41, 0xE2, 0x80]));
+        [out.every((text) => text === "A—B\u{1F600}C"), marked === "A﻿", cut === "A�"].join(",")
+        "#,
+    );
+    assert_eq!(result, "true,true,true");
+}

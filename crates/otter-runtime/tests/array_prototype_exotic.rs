@@ -40,3 +40,38 @@ fn array_prototype_exposes_array_exotic_observables() {
         "#);
     assert_eq!(completion, "true|3|true|true|42|[object Array]");
 }
+
+#[test]
+fn an_inherited_index_setter_reaches_exactly_the_arrays_whose_chain_holds_it() {
+    let completion = run(r#"
+        const log = [];
+        // An index accessor on an unrelated object is not in any array's chain.
+        Object.defineProperty({}, "0", { get() { return 1; }, set(v) { log.push("stray" + v); } });
+        function fill(target, n) { for (let i = 0; i < n; i++) target[i] = i; return target; }
+        for (let round = 0; round < 200; round++) fill([], 50);
+        const plain = fill([], 3);
+        // A subclass prototype's setter sees writes to its instances' holes.
+        class Sub extends Array {}
+        Object.defineProperty(Sub.prototype, "1", { set(v) { log.push("sub" + v); }, configurable: true });
+        const sub = new Sub();
+        sub[0] = "a";
+        sub[1] = "b";
+        sub.push("c");
+        // A new [[Prototype]] for %Array.prototype% reaches every plain array,
+        // including writes from code that already ran hot.
+        Object.setPrototypeOf(Array.prototype, {
+            set 5(v) { log.push("proto" + v); },
+        });
+        const late = fill([], 7);
+        [
+            plain.join(),
+            sub.length, sub.hasOwnProperty(1), sub[0],
+            late.length, late.hasOwnProperty(5),
+            log.join(),
+        ].join("|");
+        "#);
+    assert_eq!(
+        completion,
+        "0,1,2|2|false|a|7|false|subb,subc,proto5"
+    );
+}

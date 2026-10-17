@@ -76,6 +76,11 @@ impl Interpreter {
         target: &Value,
         proto: &Value,
     ) -> Result<bool, CommittedValueError> {
+        // A new [[Prototype]] for %Array.prototype% puts objects the array
+        // index protector never watched into every plain array's chain.
+        if self.is_realm_element_prototype(*target) {
+            self.activate_array_index_accessor_protector();
+        }
         self.with_handle_scope(|interp, scope| {
             let target = interp.scoped_value(scope, *target);
             let proto = interp.scoped_value(scope, *proto);

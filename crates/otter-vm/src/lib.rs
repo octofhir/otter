@@ -863,11 +863,11 @@ pub struct Interpreter {
     /// token is declared before `gc_heap` so Rust drops it first, while its
     /// owning heap is still live.
     external_memory_adjustment: Option<otter_gc::ExternalMemory>,
-    /// Protector for the array element store fast path: flips to
-    /// `true` once any accessor descriptor lands on an array-index
-    /// key anywhere (e.g. `Array.prototype[1] = {set}`); array index
-    /// writes then re-check the prototype chain per OrdinarySet
-    /// before creating an own element. Stays `false` for the
+    /// Protector for the array element fast paths: flips to `true` once an
+    /// array-index property lands on a realm's %Array.prototype% or
+    /// %Object.prototype%, or %Array.prototype% takes a new [[Prototype]];
+    /// index writes to plain arrays then re-check the prototype chain per
+    /// OrdinarySet before creating an own element. Stays `false` for the
     /// overwhelmingly common unpolluted heap, keeping appends cheap.
     array_index_accessor_protector: bool,
     /// Monotonic version of `array_index_accessor_protector`. Advances exactly

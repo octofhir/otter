@@ -62,6 +62,13 @@ enum Command {
         #[arg(long)]
         call: bool,
     },
+    /// Time reading each script's compiled form back from a code cache
+    /// (decode + verify) against compiling it.
+    Cache {
+        sites: Vec<String>,
+        #[arg(long, default_value_t = 5)]
+        samples: usize,
+    },
     /// As `turns`, after compiling the scripts again through `eval`.
     EvalTurns {
         sites: Vec<String>,
@@ -330,6 +337,59 @@ fn run_turns(sites: &[String], turns: usize, samples: usize, eval_copies: usize,
     }
 }
 
+fn run_cache(sites: &[String], samples: usize) {
+    for site in sites {
+        let scripts = load_site(site);
+        let mut compile_total = Duration::ZERO;
+        let mut decode_total = Duration::ZERO;
+        let mut bytes_total = 0usize;
+        for script in &scripts {
+            let compile = || {
+                otter_compiler::compile_script_source_to_module_with_options(
+                    &script.text,
+                    SourceKind::JavaScript,
+                    &script.name,
+                    CompileOptions {
+                        lazy_functions: true,
+                    },
+                )
+            };
+            let Ok(compiled) = compile() else {
+                continue;
+            };
+            let Ok(bytes) = otter_bytecode::binary::encode_module_bounded_detached(
+                &compiled.bytecode,
+                usize::MAX,
+            ) else {
+                continue;
+            };
+            bytes_total += bytes.len();
+            let mut compiles = Vec::with_capacity(samples);
+            let mut decodes = Vec::with_capacity(samples);
+            for _ in 0..samples {
+                let started = Instant::now();
+                let _ = compile();
+                compiles.push(started.elapsed());
+                let started = Instant::now();
+                let decoded =
+                    otter_bytecode::binary::decode_module_with_source(&bytes, &script.text);
+                decodes.push(started.elapsed());
+                if let Err(error) = &decoded {
+                    panic!("{} decodes: {error:?}", script.name);
+                }
+            }
+            compile_total += median(compiles);
+            decode_total += median(decodes);
+        }
+        println!(
+            "{site}: compile {:.1} ms, from cache {:.1} ms ({:.2} MB of cache)",
+            ms(compile_total),
+            ms(decode_total),
+            bytes_total as f64 / 1e6
+        );
+    }
+}
+
 fn main() {
     let cli = Cli::parse();
     match cli.command {
@@ -345,6 +405,7 @@ fn main() {
             samples,
             call,
         } => run_turns(&sites, turns, samples, 0, call),
+        Command::Cache { sites, samples } => run_cache(&sites, samples),
         Command::EvalTurns {
             sites,
             turns,

@@ -75,6 +75,7 @@
 
 mod admission;
 mod checkpoint;
+mod code_cache;
 mod commonjs;
 mod completion_admission;
 mod entry_file;
@@ -3180,6 +3181,7 @@ impl Runtime {
         }));
         Ok(Runtime {
             interp,
+            scripts_compiled: std::cell::Cell::new(0),
             restored_from_snapshot: true,
             realm_owner_id: realm::next_realm_owner_id(),
             config,
@@ -3359,6 +3361,7 @@ impl Runtime {
         let enforce_direct_timeout = runtime_task_spawner.is_none();
         let mut runtime = Runtime {
             interp,
+            scripts_compiled: std::cell::Cell::new(0),
             realm_owner_id: realm::next_realm_owner_id(),
             config,
             enforce_direct_timeout,
@@ -3504,6 +3507,8 @@ impl Runtime {
 #[derive(Debug)]
 pub struct Runtime {
     interp: Interpreter,
+    /// Script sources compiled by this runtime's classic-script path.
+    scripts_compiled: std::cell::Cell<u64>,
     /// Whether this runtime came from a snapshot restore rather than a
     /// bootstrap — observable for tests and startup diagnostics.
     restored_from_snapshot: bool,
@@ -5492,6 +5497,14 @@ impl Runtime {
         self.interp.force_gc().map_err(Into::into)
     }
 
+    /// Classic-script sources this runtime compiled: every
+    /// [`Self::run_script`] compiles one, and a
+    /// [`Self::run_script_cached`] that its cache served compiles none.
+    #[must_use]
+    pub fn scripts_compiled(&self) -> u64 {
+        self.scripts_compiled.get()
+    }
+
     /// Code chunks ever linked into this runtime: each script, eval body,
     /// module graph and lazily compiled function body is one.
     #[must_use]
@@ -6231,6 +6244,7 @@ impl Runtime {
         source: &SourceInput,
         specifier: &str,
     ) -> Result<CompiledModule, OtterError> {
+        self.scripts_compiled.set(self.scripts_compiled.get() + 1);
         let compiled = if let Some(hook) = self.config.hooks.compile_hook() {
             let text = module_loader::admit_source(
                 &self.config.resource_account,

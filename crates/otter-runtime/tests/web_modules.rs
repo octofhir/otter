@@ -113,6 +113,73 @@ fn an_inline_module_with_relative_and_absolute_imports_runs_from_delivered_sourc
 }
 
 #[test]
+fn a_code_cache_from_one_load_runs_the_next_without_parsing() {
+    let entry = WebModuleMap::inline_url(PAGE, 0);
+    let text = "import { a } from './lib/a.js'; import b from '/b.js'; log.push(a, b);";
+    let files = [
+        (
+            "https://site.test/app/lib/a.js",
+            "export const a = 'a' + 1;",
+        ),
+        (
+            "https://site.test/b.js",
+            "export default (function () { return 2; })();",
+        ),
+    ];
+    // The first load parses everything and hands back each module's cache.
+    let (mut runtime, map) = page();
+    map.produce_code_caches();
+    deliver(&map, &entry, text);
+    load_graph(&map, &entry, &files);
+    runtime
+        .run_module_source(SourceInput::from_javascript(text), entry.clone())
+        .expect("first load runs");
+    assert_eq!(log(&mut runtime), "a1,2");
+    let caches = map.take_code_caches();
+    assert_eq!(caches.len(), 3);
+    assert!(map.take_code_caches().is_empty());
+    let cache_of = |url: &str| {
+        caches
+            .iter()
+            .find(|cache| cache.request_url == url)
+            .map(|cache| cache.bytes.clone())
+    };
+    // The next load delivers the same responses with their caches.
+    let (mut runtime, map) = page();
+    let respond = |map: &WebModuleMap, url: &str, text: &str| {
+        map.deliver_cached(
+            url,
+            Ok(WebModuleSource {
+                final_url: url.to_owned(),
+                content_type: Some("text/javascript".to_owned()),
+                text: text.to_owned(),
+            }),
+            cache_of(url),
+        );
+    };
+    respond(&map, &entry, text);
+    respond(&map, files[0].0, files[0].1);
+    respond(&map, files[1].0, files[1].1);
+    assert_eq!(map.graph_status(&entry).unwrap(), WebModuleGraph::Ready);
+    runtime
+        .run_module_source(SourceInput::from_javascript(text), entry.clone())
+        .expect("cached load runs");
+    assert_eq!(log(&mut runtime), "a1,2");
+    assert_eq!(map.parses(), 0);
+    // A cache for other text is ignored: the edited module parses.
+    let (mut runtime, map) = page();
+    respond(&map, &entry, text);
+    respond(&map, files[0].0, "export const a = 'edited';");
+    respond(&map, files[1].0, files[1].1);
+    assert_eq!(map.graph_status(&entry).unwrap(), WebModuleGraph::Ready);
+    runtime
+        .run_module_source(SourceInput::from_javascript(text), entry)
+        .expect("edited load runs");
+    assert_eq!(log(&mut runtime), "edited,2");
+    assert_eq!(map.parses(), 1);
+}
+
+#[test]
 fn a_module_whose_imports_resolve_elsewhere_by_run_time_is_compiled_again() {
     let (mut runtime, map) = page();
     map.register_import_map(r#"{"imports": {"lib": "/vendor/lib.js"}}"#, PAGE)

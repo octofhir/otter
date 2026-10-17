@@ -32,6 +32,9 @@
 //! - [`WebModuleSource`] — one delivered response.
 //! - [`WebModuleGraph`] — the answer of the prepare phase.
 //! - [`WebModuleError`] — a fetch, parse or resolution failure in a graph.
+//! - [`WebModuleCodeCache`] — a module's compiled form, for the embedder to
+//!   keep beside the response ([`WebModuleMap::produce_code_caches`],
+//!   [`WebModuleMap::take_code_caches`], [`WebModuleMap::deliver_cached`]).
 //!
 //! # Invariants
 //! - The map is keyed by request URL and holds each response once, so two
@@ -41,6 +44,10 @@
 //!   also compiles it against the targets they resolve to; the graph that
 //!   runs it takes that compile while its imports still resolve the same,
 //!   and parses again only when they do not.
+//! - A module delivered with a code cache for its exact text, URL and this
+//!   engine build is not parsed at all: the walk reads its requests and its
+//!   compile from the bytes, which pass the bytecode verifier. Bytes that do
+//!   not match are ignored and the module compiles as without them.
 //! - Every module in a web graph is an ES module in JavaScript, whatever its
 //!   URL looks like: there is no CommonJS detection and no TypeScript.
 //! - Literal `import("…")` targets are not part of a static graph: they are
@@ -141,6 +148,22 @@ struct WebModuleState {
     slots: HashMap<String, Slot>,
     /// Parses of delivered sources, by walks and by graphs.
     parses: u64,
+    /// The embedder keeps code caches: fresh compiles are encoded for it.
+    produce_code_caches: bool,
+    /// Code caches encoded since the embedder last took them.
+    fresh_code_caches: Vec<WebModuleCodeCache>,
+}
+
+/// The compiled form of one delivered module, for the embedder to keep
+/// beside the response and hand back with it on a later load.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WebModuleCodeCache {
+    /// The URL the module was requested as.
+    pub request_url: String,
+    /// The bytes [`WebModuleMap::deliver_cached`] takes back. They are this
+    /// engine's own: valid only for the same engine build, module text and
+    /// URL, and checked for exactly that before use.
+    pub bytes: Vec<u8>,
 }
 
 enum Slot {
@@ -156,6 +179,9 @@ struct Delivered {
     requests: Option<Result<Vec<PrefetchRequest>, String>>,
     /// The compile made by that parse, until a graph takes it.
     compiled: Option<PrecompiledModule>,
+    /// Code cache the embedder delivered with the response, until a walk
+    /// uses or rejects it.
+    code_cache: Option<Vec<u8>>,
 }
 
 impl std::fmt::Debug for WebModuleMap {
@@ -244,6 +270,19 @@ impl WebModuleMap {
     /// Record the result of fetching `request_url`. A second delivery for the
     /// same URL replaces nothing: the first response is the module.
     pub fn deliver(&self, request_url: &str, response: Result<WebModuleSource, String>) {
+        self.deliver_cached(request_url, response, None);
+    }
+
+    /// [`Self::deliver`] with the code cache an earlier load produced for
+    /// the same response ([`Self::take_code_caches`]). The module is then
+    /// neither parsed nor compiled, provided the bytes match this engine
+    /// build, the module text and its URL; otherwise they are ignored.
+    pub fn deliver_cached(
+        &self,
+        request_url: &str,
+        response: Result<WebModuleSource, String>,
+        code_cache: Option<Vec<u8>>,
+    ) {
         let mut state = self.write();
         if matches!(
             state.slots.get(request_url),
@@ -256,10 +295,24 @@ impl WebModuleMap {
                 source,
                 requests: None,
                 compiled: None,
+                code_cache,
             })),
             Err(message) => Slot::Failed(message),
         };
         state.slots.insert(request_url.to_owned(), slot);
+    }
+
+    /// Encode the compile of every module delivered without a usable code
+    /// cache from now on, for [`Self::take_code_caches`].
+    pub fn produce_code_caches(&self) {
+        self.write().produce_code_caches = true;
+    }
+
+    /// The code caches encoded since the last call, for the embedder to
+    /// keep beside each response.
+    #[must_use]
+    pub fn take_code_caches(&self) -> Vec<WebModuleCodeCache> {
+        std::mem::take(&mut self.write().fresh_code_caches)
     }
 
     /// Whether `url` was delivered, successfully or not.
@@ -376,6 +429,17 @@ impl WebModuleMap {
                 Some(Slot::Delivered(delivered)) => delivered,
             };
             let final_url = delivered.source.final_url.clone();
+            if delivered.requests.is_none()
+                && let Some(bytes) = delivered.code_cache.take()
+                && let Some(cached) = crate::module_graph::decode_web_module_cache(
+                    &bytes,
+                    &delivered.source.text,
+                    &final_url,
+                )
+            {
+                delivered.compiled = cached.compiled;
+                delivered.requests = Some(Ok(cached.requests));
+            }
             if delivered.requests.is_none() {
                 state.parses += 1;
                 let import_map = &state.import_map;
@@ -390,6 +454,19 @@ impl WebModuleMap {
                     delivered.compiled = scan.compiled;
                     scan.requests
                 }));
+                if state.produce_code_caches
+                    && let Some(compiled) = &delivered.compiled
+                    && let Some(bytes) = crate::module_graph::encode_web_module_cache(
+                        &delivered.source.text,
+                        &final_url,
+                        compiled,
+                    )
+                {
+                    state.fresh_code_caches.push(WebModuleCodeCache {
+                        request_url: url.clone(),
+                        bytes,
+                    });
+                }
             }
             let requests =
                 delivered

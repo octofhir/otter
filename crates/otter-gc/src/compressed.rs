@@ -122,15 +122,22 @@ pub fn init_cage_with_size(size_bytes: usize) -> Result<(), CageError> {
 }
 
 /// Returns the cage base pointer. Returns `null_mut()` before the
-/// cage has been initialised. Reads with `Acquire` ordering — the
-/// matching `Release` store happens inside [`Cage::ensure_inner`].
+/// cage has been initialised.
+///
+/// Every decompression reads it, so the load is `Relaxed`: a plain load
+/// rather than an ordering one on the hottest path of the VM. That is
+/// enough because the base is written once, inside
+/// [`Cage::ensure_inner`] under the cage mutex, before any page exists.
+/// Whoever holds a compressed offset reached it through a heap whose
+/// pages came out of that mutex after the store, so the store happens
+/// before this load and coherence makes the load see it.
 ///
 /// Decompression of a `Gc<T>` offset goes through
 /// `cage_base().add(offset as usize)` so pointer provenance is
 /// preserved (Stacked / Tree Borrows clean).
 #[inline]
 pub fn cage_base() -> *mut u8 {
-    CAGE_BASE.load(Ordering::Acquire)
+    CAGE_BASE.load(Ordering::Relaxed)
 }
 
 /// Compatibility helper: returns the cage base address as a

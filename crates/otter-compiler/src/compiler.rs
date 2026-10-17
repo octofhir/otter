@@ -441,7 +441,7 @@ impl Compiler {
             }
             ScopeLocation::Chain { hop } => {
                 let descriptor = &self.eval_chain.as_ref()?.scopes.get(hop)?.descriptor;
-                let slot = descriptor.slots.iter().position(|slot| slot.name == name)?;
+                let slot = descriptor.slot_index(name)?;
                 let kind = descriptor.slots[slot].kind;
                 let mut info = BindingInfo::new(
                     BindingStorage::Slot {

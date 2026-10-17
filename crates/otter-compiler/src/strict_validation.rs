@@ -2680,4 +2680,3 @@ mod tests {
         assert!(find_legacy_string_escape("''").is_none());
     }
 }
-

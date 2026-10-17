@@ -96,7 +96,7 @@ fn assert_lazy_matches_eager(source: &str) -> usize {
             .scopes
             .first()
             .map(|descriptor| EvalCallerScope {
-                descriptor: descriptor.clone(),
+                descriptor: descriptor.clone().into(),
                 extension_names: Vec::new(),
             })
             .into_iter()
@@ -111,6 +111,7 @@ fn assert_lazy_matches_eager(source: &str) -> usize {
     {
         let body = compile_lazy_function(LazyCompileRequest {
             source,
+            module_url: "test.js",
             function: record,
             chain: &chain,
             environment: lazy.lazy_environments.first(),
@@ -211,4 +212,44 @@ globalThis.__coercible = { valueOf() { return 0; } };
 "#,
     );
     assert_eq!(compared, 3);
+}
+
+#[test]
+fn a_body_compile_names_its_functions_after_the_module_the_vm_found() {
+    // A script compiled under a non-file specifier leaves its functions'
+    // URL empty until it links; a body compiled from such a record must
+    // still name its nested records after the module, or their own body
+    // compiles cannot find the source.
+    let source = "function outer() { return function inner() { return 1; }; }";
+    let lazy = compile_script_source_to_module_with_options(
+        source,
+        SyntaxSourceKind::JavaScript,
+        "https://example.test/page.js",
+        LAZY,
+    )
+    .unwrap()
+    .bytecode;
+    let record = lazy
+        .functions
+        .iter()
+        .find(|function| function.name == "outer")
+        .unwrap();
+    assert_eq!(record.module_url, "");
+    let body = compile_lazy_function(LazyCompileRequest {
+        source,
+        module_url: "https://example.test/page.js",
+        function: record,
+        chain: &EvalCallerChain::default(),
+        environment: None,
+        resolutions: &[],
+    })
+    .unwrap();
+    assert_eq!(body.module, "https://example.test/page.js");
+    let inner = body
+        .functions
+        .iter()
+        .find(|function| function.name == "inner")
+        .unwrap();
+    assert!(inner.lazy.is_some());
+    assert_eq!(inner.module_url, "https://example.test/page.js");
 }

@@ -73,6 +73,8 @@ impl Interpreter {
     }
 
     fn reclaim_dynamic_code_to(&mut self, target_bytes: u64) -> Result<(), otter_gc::OutOfMemory> {
+        // Cached owners hold their chunks alive; a census must not see them.
+        self.owner_cache.borrow_mut().clear();
         let mut retained = self.code_space.evictable_retained_bytes();
         self.code_eviction_stats.retained_bytes = retained;
         self.code_eviction_stats.peak_retained_bytes =
@@ -417,6 +419,7 @@ impl Interpreter {
         // whole space so every atom id this run compares — against shape
         // nodes, IC guards, transition records — comes from this isolate.
         if !std::sync::Arc::ptr_eq(&self.code_space, context.space()) {
+            self.owner_cache.borrow_mut().clear();
             self.code_space = std::sync::Arc::clone(context.space());
             self.code_space
                 .resolve_atoms(self.shape_runtime.names_mut());

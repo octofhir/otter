@@ -69,7 +69,10 @@ impl CodeBlock {
         let mapped_argument_bindings =
             allocation::try_copy(&self.mapped_argument_bindings, &mut lease)?;
         let module_url = allocation::try_string(&self.module_url, &mut lease)?.into_boxed_str();
-        let scopes = allocation::try_scopes(&self.scopes, &mut lease)?;
+        let scopes = allocation::try_scopes(
+            self.scopes.iter().map(|scope| scope.descriptor()),
+            &mut lease,
+        )?;
         let code = allocation::try_copy(&self.code, &mut lease)?;
         let overflow_operand_words =
             allocation::try_copy(&self.overflow_operand_words, &mut lease)?;

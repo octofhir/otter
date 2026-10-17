@@ -196,6 +196,15 @@ impl ExecutionContext {
         self.local_function_index(function_id).is_some()
     }
 
+    /// `true` when `function_id` runs in this chunk: it belongs here and is
+    /// not a lazy record forwarded to the chunk of its compiled body.
+    #[inline]
+    #[must_use]
+    pub(crate) fn resolves_locally(&self, function_id: u32) -> bool {
+        self.local_function_index(function_id)
+            .is_some_and(|local| self.payload.executable.forward(local).is_none())
+    }
+
     /// Resolve the context owning `function_id`: this chunk on the hot
     /// in-chunk path, otherwise an owned context for the matching live sibling.
     /// Evicted and never-linked ids remain distinct typed failures.
@@ -1587,5 +1596,62 @@ mod send_probe_tests {
     fn execution_context_is_send_sync() {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<super::ExecutionContext>();
+    }
+}
+
+/// Direct-mapped cache of the owners of function ids outside an ambient
+/// chunk, keyed by id. A lazily compiled body is its own chunk, so calls
+/// into one — and the runtime calls its code makes — resolve here instead of
+/// searching the code space each time.
+///
+/// Entries hold their chunk alive: the cache is cleared before a liveness
+/// census and whenever the isolate adopts another code space.
+pub(crate) struct OwnerCache {
+    entries: Box<[Option<(u32, ExecutionContext)>]>,
+}
+
+impl OwnerCache {
+    const SIZE: usize = 1024;
+
+    pub(crate) fn new() -> Self {
+        Self {
+            entries: (0..Self::SIZE).map(|_| None).collect(),
+        }
+    }
+
+    #[inline]
+    pub(crate) fn get(&self, function_id: u32) -> Option<ExecutionContext> {
+        match &self.entries[function_id as usize % Self::SIZE] {
+            Some((id, owner)) if *id == function_id => Some(owner.clone()),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn insert(&mut self, function_id: u32, owner: ExecutionContext) {
+        self.entries[function_id as usize % Self::SIZE] = Some((function_id, owner));
+    }
+
+    /// Forget `function_id`: its owner changed (a lazy record's body was
+    /// compiled into a chunk of its own).
+    pub(crate) fn forget(&mut self, function_id: u32) {
+        let entry = &mut self.entries[function_id as usize % Self::SIZE];
+        if entry.as_ref().is_some_and(|(id, _)| *id == function_id) {
+            *entry = None;
+        }
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.entries.iter_mut().for_each(|entry| *entry = None);
+    }
+}
+
+impl std::fmt::Debug for OwnerCache {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OwnerCache")
+            .field(
+                "entries",
+                &self.entries.iter().filter(|e| e.is_some()).count(),
+            )
+            .finish()
     }
 }

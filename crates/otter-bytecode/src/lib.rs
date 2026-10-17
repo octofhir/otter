@@ -2440,11 +2440,118 @@ pub struct EvalCallerChain {
     pub var_depth: Option<u32>,
 }
 
+/// A scope descriptor shared by everything that reads it by name: the
+/// context chains direct eval and lazily compiled bodies resolve outer
+/// bindings through. One descriptor serves every compile against it; a
+/// large scope builds its name index once, on its first lookup.
+#[derive(Debug)]
+pub struct SharedScope {
+    descriptor: ScopeDescriptor,
+    index: std::sync::OnceLock<rustc_hash::FxHashMap<Box<str>, u32>>,
+}
+
+impl SharedScope {
+    /// Scopes up to this size are searched linearly.
+    const LINEAR_SLOTS: usize = 8;
+
+    /// Share `descriptor`.
+    #[must_use]
+    pub fn new(descriptor: ScopeDescriptor) -> Self {
+        Self {
+            descriptor,
+            index: std::sync::OnceLock::new(),
+        }
+    }
+
+    /// The shared descriptor.
+    #[must_use]
+    pub fn descriptor(&self) -> &ScopeDescriptor {
+        &self.descriptor
+    }
+
+    /// Index of the slot named `name`. Names are unique within a scope.
+    #[must_use]
+    pub fn slot_index(&self, name: &str) -> Option<usize> {
+        let slots = &self.descriptor.slots;
+        if slots.len() <= Self::LINEAR_SLOTS {
+            return slots.iter().position(|slot| slot.name == name);
+        }
+        let index = self.index.get_or_init(|| {
+            slots
+                .iter()
+                .enumerate()
+                .map(|(position, slot)| (slot.name.as_str().into(), position as u32))
+                .collect()
+        });
+        index.get(name).map(|&position| position as usize)
+    }
+}
+
+impl From<ScopeDescriptor> for std::sync::Arc<SharedScope> {
+    fn from(descriptor: ScopeDescriptor) -> Self {
+        std::sync::Arc::new(SharedScope::new(descriptor))
+    }
+}
+
+impl std::ops::Deref for SharedScope {
+    type Target = ScopeDescriptor;
+    fn deref(&self) -> &ScopeDescriptor {
+        &self.descriptor
+    }
+}
+
+impl Clone for SharedScope {
+    fn clone(&self) -> Self {
+        Self::new(self.descriptor.clone())
+    }
+}
+
+impl PartialEq for SharedScope {
+    fn eq(&self, other: &Self) -> bool {
+        self.descriptor == other.descriptor
+    }
+}
+
+impl Eq for SharedScope {}
+
+impl Serialize for SharedScope {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.descriptor.serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for SharedScope {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        ScopeDescriptor::deserialize(deserializer).map(Self::new)
+    }
+}
+
+mod shared_scope_serde {
+    use super::SharedScope;
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+    use std::sync::Arc;
+
+    pub(super) fn serialize<S: Serializer>(
+        scope: &Arc<SharedScope>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        scope.as_ref().serialize(serializer)
+    }
+
+    pub(super) fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Arc<SharedScope>, D::Error> {
+        SharedScope::deserialize(deserializer).map(Arc::new)
+    }
+}
+
 /// One live context on an [`EvalCallerChain`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EvalCallerScope {
-    /// The context's scope descriptor.
-    pub descriptor: ScopeDescriptor,
+    /// The context's scope descriptor, shared with the code that created
+    /// the context.
+    #[serde(with = "shared_scope_serde")]
+    pub descriptor: std::sync::Arc<SharedScope>,
     /// Names currently held by the context's eval extension, in insertion
     /// order; empty when it has none.
     #[serde(default)]

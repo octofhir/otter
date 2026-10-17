@@ -2615,6 +2615,7 @@ dependencies = [
 name = "otter-bytecode"
 version = "0.1.0"
 dependencies = [
+ "rustc-hash",
  "serde",
  "serde_json",
 ]

@@ -47,6 +47,14 @@ use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::OnceLock;
 
+/// Compile policy of the scripts and modules a runtime loads: a function
+/// that does not run as soon as it is created compiles its body on its
+/// first call. It shapes the bytecode the cache stores, so it lives in a
+/// file the cache fingerprint covers.
+pub(crate) const LAZY_FUNCTIONS: otter_compiler::CompileOptions = otter_compiler::CompileOptions {
+    lazy_functions: true,
+};
+
 use otter_bytecode::{BytecodeModule, VerifiedBytecodeModule};
 use otter_syntax::SourceKind;
 

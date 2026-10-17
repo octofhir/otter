@@ -93,7 +93,7 @@ mod tests {
 
         let chain = EvalCallerChain {
             scopes: vec![EvalCallerScope {
-                descriptor: scope,
+                descriptor: scope.into(),
                 extension_names: vec!["injected".to_string()],
             }],
             var_depth: Some(0),

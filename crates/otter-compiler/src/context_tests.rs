@@ -828,7 +828,8 @@ fn eval_chain(
                             exported: false,
                         })
                         .collect(),
-                },
+                }
+                .into(),
                 extension_names: Vec::new(),
             })
             .collect(),

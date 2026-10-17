@@ -36,6 +36,9 @@ use crate::{ExecutionContext, Interpreter, Value, VmError};
 pub struct LazyCompileInput<'a> {
     /// Whole source text of the module the function belongs to.
     pub source: &'a str,
+    /// URL of that module: the record's own, or its chunk's when the record
+    /// names none.
+    pub module_url: &'a str,
     /// The function's lazy record.
     pub function: &'a Function,
     /// The closure's context chain, innermost first.
@@ -90,17 +93,30 @@ impl Interpreter {
         };
         let source = match context.sources().get(url) {
             Some(source) => source.text(),
-            None => module
-                .function_source
-                .as_deref()
-                .ok_or_else(|| self.err_syntax("lazy function body without source".into()))?,
+            None => module.function_source.as_deref().ok_or_else(|| {
+                self.err_syntax(
+                    format!(
+                        "no source for the body of `{}` ({url}, chunk {})",
+                        record.name,
+                        context.module_name()
+                    )
+                    .into(),
+                )
+            })?,
         };
+        // A script's records take its URL only when it links; its
+        // environment keeps the name it was compiled under.
         let environment = module
             .lazy_environments
             .iter()
-            .find(|environment| environment.module_url == record.module_url);
+            .find(|environment| environment.module_url == record.module_url)
+            .or(match module.lazy_environments.as_slice() {
+                [only] => Some(only),
+                _ => None,
+            });
         let body = hook(LazyCompileInput {
             source,
+            module_url: url,
             function: record,
             chain: &chain,
             environment,
@@ -128,6 +144,7 @@ impl Interpreter {
         self.jit_code_registry
             .relink_lazy_body(function_id, &linked[0]);
         context.set_lazy_forward(function_id, body_base);
+        self.owner_cache.borrow_mut().forget(function_id);
         self.lazy_bodies_compiled += 1;
         Ok(())
     }

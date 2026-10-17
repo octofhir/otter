@@ -44,6 +44,26 @@ impl Interpreter {
     /// Configure the byte high-water mark checked at between-turn entry.
     pub fn set_code_eviction_high_water_bytes(&mut self, bytes: u64) {
         self.code_eviction_high_water_bytes = bytes;
+        self.code_eviction_trigger_bytes = bytes;
+    }
+
+    /// The between-turn check. A census costs a full collection and a walk
+    /// of the whole heap, and one that finds the retained code live frees
+    /// nothing; so after a census the next is due only once the retained
+    /// bytes have grown by half again, the way a heap's limit grows after a
+    /// collection. Without that, an embedder whose live dynamic code is past
+    /// the mark — a page with many `eval`ed or imported chunks — pays both on
+    /// every turn it runs.
+    fn reclaim_dynamic_code_between_turns(&mut self) -> Result<(), otter_gc::OutOfMemory> {
+        if self.code_space.evictable_retained_bytes() <= self.code_eviction_trigger_bytes {
+            return Ok(());
+        }
+        self.reclaim_dynamic_code()?;
+        let retained = self.code_space.evictable_retained_bytes();
+        self.code_eviction_trigger_bytes = self
+            .code_eviction_high_water_bytes
+            .max(retained.saturating_add(retained / 2));
+        Ok(())
     }
 
     /// Run a full-GC liveness census and reclaim dead dynamic chunks until the
@@ -409,7 +429,7 @@ impl Interpreter {
         // consult this field: they carry source admission or resolve their own
         // bytecode FunctionID through CodeSpace.
         self.realm_context = Some(context.clone());
-        if let Err(error) = self.reclaim_dynamic_code() {
+        if let Err(error) = self.reclaim_dynamic_code_between_turns() {
             return Err(RunError {
                 error: crate::oom_to_vm(error),
                 frames: Vec::new(),

@@ -283,3 +283,46 @@ fn captured_eval_contexts_do_not_keep_dead_source_chunks_alive() {
         assert_eq!(runtime.code_eviction_stats().retained_bytes, 0);
     }
 }
+
+#[test]
+fn live_code_past_the_mark_is_not_censused_on_every_turn() {
+    const TURNS: u64 = 20;
+    let mut runtime = Runtime::builder().build().expect("runtime");
+    runtime
+        .run_script(
+            SourceInput::from_javascript(
+                "globalThis.__kept = eval('(function kept() { return 42; })');",
+            ),
+            "<live-eval>",
+        )
+        .expect("store a live eval closure");
+    runtime.set_code_eviction_high_water_bytes(1);
+    for turn in 0..TURNS {
+        let result = runtime
+            .run_script(SourceInput::from_javascript("__kept();"), "<turn>")
+            .expect("a turn");
+        assert_eq!(result.completion_string(), "42", "turn {turn}");
+    }
+    let stats = runtime.code_eviction_stats();
+    assert_eq!(stats.evicted_chunks, 0, "the chunk is live");
+    assert!(
+        stats.census_passes < 3,
+        "a census that freed nothing is not repeated every turn: {} passes in {TURNS} turns",
+        stats.census_passes
+    );
+
+    // Growth past the raised mark is looked at again.
+    let mut source = String::new();
+    for index in 0..64 {
+        source.push_str(&format!(
+            "eval('(function dead_{index}() {{ return {index}; }})');\n"
+        ));
+    }
+    runtime
+        .run_script(SourceInput::from_javascript(source), "<growth>")
+        .expect("create dead eval chunks");
+    runtime
+        .run_script(SourceInput::from_javascript("0;"), "<reclaim-turn>")
+        .expect("a turn after growth");
+    assert_eq!(runtime.code_eviction_stats().evicted_chunks, 64);
+}

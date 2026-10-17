@@ -2042,6 +2042,8 @@ pub(crate) struct RuntimeConfig {
     jit_compile_threads: usize,
     jit_debug: JitDebugRequest,
     gc_trace: bool,
+    /// Whether each run's result carries the runtime's execution statistics.
+    execution_stats: bool,
 }
 
 /// Which execution tiers a runtime installs at construction.
@@ -2387,6 +2389,7 @@ impl Default for RuntimeConfig {
             jit_compile_threads: DEFAULT_JIT_COMPILE_THREADS,
             jit_debug: JitDebugRequest::default(),
             gc_trace: false,
+            execution_stats: true,
         }
     }
 }
@@ -2864,6 +2867,18 @@ impl RuntimeBuilder {
     #[must_use]
     pub fn jit_selection(mut self, selection: JitSelection) -> Self {
         self.config.jit_selection = selection;
+        self
+    }
+
+    /// Whether each run's result carries the runtime's execution statistics
+    /// ([`ExecutionResult::stats`]). On by default. Gathering them walks every
+    /// linked function's inline caches, so an embedder that runs many small
+    /// scripts into a large heap — a browser dispatching events into a page —
+    /// and never reads them turns this off; [`Runtime::execution_stats`] still
+    /// answers when asked.
+    #[must_use]
+    pub fn execution_stats(mut self, collect: bool) -> Self {
+        self.config.execution_stats = collect;
         self
     }
 
@@ -5088,8 +5103,13 @@ impl Runtime {
     }
 
     fn attach_execution_stats(&mut self, result: ExecutionResult) -> ExecutionResult {
-        let stats = self.execution_stats();
-        self.attach_cpu_profile(result.with_stats(stats))
+        let result = if self.config.execution_stats {
+            let stats = self.execution_stats();
+            result.with_stats(stats)
+        } else {
+            result
+        };
+        self.attach_cpu_profile(result)
     }
 
     /// Hand the samples taken so far to `result`, leaving the profiler running.

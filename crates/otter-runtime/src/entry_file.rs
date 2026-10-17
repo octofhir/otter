@@ -62,7 +62,7 @@ impl Runtime {
                 if program_looks_like_module(program) {
                     return Ok(None);
                 }
-                compile_script_program(program, source.kind, &specifier)
+                compile_script_program(program, source.kind, &specifier, crate::LAZY_FUNCTIONS)
                     .map(Some)
                     .map_err(|err| map_compile_error(err, &specifier))
             })

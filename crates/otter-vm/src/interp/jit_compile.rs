@@ -3663,6 +3663,7 @@ mod tests {
             }],
             module_resolutions: Vec::new(),
             module_inits: Vec::new(),
+            lazy_environments: Vec::new(),
             function_source: None,
         };
         let mut interpreter = Interpreter::new().expect("fixture interpreter bootstrap");
@@ -3765,6 +3766,7 @@ mod tests {
             ],
             module_resolutions: Vec::new(),
             module_inits: Vec::new(),
+            lazy_environments: Vec::new(),
             function_source: None,
         };
         let mut interpreter = Interpreter::new().expect("fixture interpreter bootstrap");

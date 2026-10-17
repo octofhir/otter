@@ -97,6 +97,7 @@ fn module(functions: Vec<Function>, constants: Vec<Constant>) -> BytecodeModule 
         constants,
         module_resolutions: Vec::new(),
         module_inits: Vec::new(),
+        lazy_environments: Vec::new(),
         function_source: None,
     }
 }

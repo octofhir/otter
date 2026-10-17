@@ -2018,6 +2018,12 @@ pub struct Function {
     /// serialized.
     #[serde(skip)]
     pub source_text_span: Option<(u32, u32)>,
+    /// `Some` while the body is not compiled: the record carries the
+    /// function's call-visible shape (name, length, kind, strictness) and
+    /// a placeholder body, and the first call compiles the real one from
+    /// the source range this names (see [`LazyFunction`]).
+    #[serde(default)]
+    pub lazy: Option<LazyFunction>,
     /// Authoritative execution wordcode.
     pub code: FunctionCode,
     /// Exception handlers, innermost first: a throw at instruction `pc`
@@ -2046,6 +2052,120 @@ pub struct Function {
     /// that guard once and the recorded shape supersedes the seed.
     #[serde(default)]
     pub class_hint_sites: Vec<ClassHintSite>,
+}
+
+/// A function whose body is compiled on its first call.
+///
+/// The enclosing compile lowers everything a caller can observe before the
+/// body runs — the closure, its `name`, `length`, constructibility and
+/// [[SourceText]] — and records here what the body compile needs to parse
+/// the function again on its own: the source range and the syntactic form
+/// to parse it in, plus the compile-time facts of the code around it. The
+/// bindings the body reaches outside itself come from the closure's context
+/// chain at that first call, exactly as a direct eval's do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LazyFunction {
+    /// Byte range of the text the body compile parses, in the module's
+    /// source: the whole function or arrow expression, or a method's
+    /// parameter list and body.
+    pub range: (u32, u32),
+    /// How the text is parsed back into one function node.
+    pub form: LazyForm,
+    /// The code around the function is strict.
+    pub outer_strict: bool,
+    /// The function carries a [[HomeObject]] (methods).
+    pub has_home_object: bool,
+    /// `super.x` resolves through the class statics side: a static method,
+    /// or an arrow inside static class code.
+    pub static_home: bool,
+    /// A named function expression binds its own name.
+    pub self_binding: bool,
+    /// The compile unit reads a `.arguments` property somewhere.
+    pub dot_arguments_observed: bool,
+    /// The function lies inside a class field initializer.
+    pub in_field_initializer: bool,
+    /// The source parses with the Module goal.
+    pub module_goal: bool,
+    /// The source is TypeScript.
+    pub typescript: bool,
+    /// The source is JSX.
+    pub jsx: bool,
+}
+
+/// Syntactic form of a [`LazyFunction`]'s source range.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LazyForm {
+    /// A function expression (or an anonymous default-export
+    /// declaration, which parses the same way).
+    Function,
+    /// A named function declaration: its name binds outside the function,
+    /// so it parses as a statement.
+    FunctionDeclaration,
+    /// An arrow function. `await` and `yield` mean what they mean in the
+    /// nearest enclosing non-arrow function.
+    Arrow {
+        /// That function is async.
+        enclosing_async: bool,
+        /// That function is a generator.
+        enclosing_generator: bool,
+        /// That function is a derived class constructor: `this` and
+        /// `super()` are its.
+        derived_constructor: bool,
+    },
+    /// An object literal method; the range is its parameters and body.
+    ObjectMethod(LazyMethodKind),
+    /// A class method; the range is its parameters and body.
+    ClassMethod(LazyMethodKind),
+}
+
+/// Kind of a lazily compiled method.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LazyMethodKind {
+    /// An ordinary method (async and generator from the record).
+    Method,
+    /// A `get` accessor.
+    Getter,
+    /// A `set` accessor.
+    Setter,
+}
+
+/// Compile-time facts of a module's top level that the body compile of a
+/// lazily compiled function needs and its context chain does not carry.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LazyEnvironment {
+    /// URL of the source module these facts describe.
+    pub module_url: String,
+    /// ES-module import bindings, by importer-side name.
+    #[serde(default)]
+    pub imports: Vec<LazyImport>,
+    /// `export { local as exported }` renames: each local binding with the
+    /// exported names a write to it re-mirrors.
+    #[serde(default)]
+    pub reexports: Vec<(String, Vec<String>)>,
+    /// A script's top-level lexical names (the global declarative record).
+    #[serde(default)]
+    pub script_lexicals: Vec<String>,
+}
+
+/// One ES-module import binding a lazily compiled body may read.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LazyImport {
+    /// Importer-side binding name.
+    pub alias: String,
+    /// Import record number; its object lives in the module scope.
+    pub record: u16,
+    /// Exported name the binding reads; empty for a namespace import.
+    pub source_name: String,
+    /// `import * as ns`.
+    pub is_namespace: bool,
+    /// `import defer * as ns`.
+    pub is_deferred: bool,
+    /// Request specifier.
+    pub specifier: String,
+    /// Request `type` attribute.
+    pub attr_type: Option<String>,
 }
 
 /// One entry of a function's exception handler table.
@@ -2208,6 +2328,9 @@ pub enum SlotKind {
     WithObject,
     /// A private name carrier of a class scope.
     PrivateName,
+    /// The private name carrier of an instance private method or accessor:
+    /// an access through it brand-checks the receiver.
+    PrivateMethod,
     /// The private-methods brand of a class scope.
     PrivateBrand,
     /// The home object of instance methods (`super` property base).
@@ -2458,6 +2581,10 @@ pub struct BytecodeModule {
     /// import). Empty for script-mode bytecode.
     #[serde(default)]
     pub module_inits: Vec<ModuleInit>,
+    /// Top-level facts the lazily compiled functions of each source module
+    /// need, one entry per module URL that has any.
+    #[serde(default)]
+    pub lazy_environments: Vec<LazyEnvironment>,
 }
 
 /// One linker-resolved import edge: `(referrer module URL,

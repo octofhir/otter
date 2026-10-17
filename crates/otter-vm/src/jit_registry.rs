@@ -211,6 +211,24 @@ impl JitCodeRegistry {
     ///
     /// The cell is built from the function's admitted header alone, so
     /// linking never verifies or builds a body; the first call does.
+    /// Give the entry of lazy record `function_id` the layout of the body
+    /// its first call compiled.
+    pub(crate) fn relink_lazy_body(
+        &mut self,
+        function_id: u32,
+        function: &otter_bytecode::Function,
+    ) {
+        if let Some(cell) = self.function_entry_cells.get_mut(&function_id) {
+            debug_assert_eq!(cell.param_count, function.param_count);
+            cell.relayout_lazy_body(
+                function
+                    .register_count()
+                    .expect("admitted function header has a register window"),
+                crate::executable::bytecode_call_flags(function),
+            );
+        }
+    }
+
     pub(crate) fn link_function(&mut self, function: &otter_bytecode::Function, realm_id: u32) {
         self.ensure_function_entry(
             function.id,

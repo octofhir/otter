@@ -76,6 +76,7 @@ fn test_function(
         primordial_iteration: false,
         ignores_this: false,
         asm_module: false,
+        lazy: None,
         code: code.into(),
         spans: otter_bytecode::SpanTable::new(&spans),
         handlers: Vec::new(),
@@ -93,6 +94,7 @@ fn module_with(code: Vec<Instruction>, scratch: u16) -> BytecodeModule {
         constants: vec![],
         module_resolutions: Vec::new(),
         module_inits: Vec::new(),
+        lazy_environments: Vec::new(),
         function_source: None,
     }
 }
@@ -243,6 +245,7 @@ fn strict_store_global_binding_rejects_non_writable_global_property() {
         }],
         module_resolutions: Vec::new(),
         module_inits: Vec::new(),
+        lazy_environments: Vec::new(),
         function_source: None,
     };
     let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
@@ -286,6 +289,7 @@ fn load_string_constant_reuses_traced_cache_entry() {
         }],
         module_resolutions: Vec::new(),
         module_inits: Vec::new(),
+        lazy_environments: Vec::new(),
         function_source: None,
     };
     let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
@@ -332,6 +336,7 @@ fn load_literal_cells_distinguish_standalone_contexts() {
             }],
             module_resolutions: Vec::new(),
             module_inits: Vec::new(),
+            lazy_environments: Vec::new(),
             function_source: None,
         }
     }
@@ -385,6 +390,7 @@ fn literal_cell_stays_address_stable_across_growth_and_gc() {
             }],
             module_resolutions: Vec::new(),
             module_inits: Vec::new(),
+            lazy_environments: Vec::new(),
             function_source: None,
         }
     }
@@ -455,6 +461,7 @@ fn load_bigint_constant_reuses_traced_cache_entry() {
         }],
         module_resolutions: Vec::new(),
         module_inits: Vec::new(),
+        lazy_environments: Vec::new(),
         function_source: None,
     };
     let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
@@ -502,6 +509,7 @@ fn load_bigint_literal_cells_distinguish_standalone_contexts() {
             }],
             module_resolutions: Vec::new(),
             module_inits: Vec::new(),
+            lazy_environments: Vec::new(),
             function_source: None,
         }
     }
@@ -634,6 +642,7 @@ fn direct_bytecode_call_binds_arguments_from_register_window() {
         constants: vec![Constant::FunctionId { index: 1 }],
         module_resolutions: Vec::new(),
         module_inits: Vec::new(),
+        lazy_environments: Vec::new(),
         function_source: None,
     };
     let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
@@ -708,6 +717,7 @@ fn direct_bytecode_call_window_populates_arguments_object() {
         constants: vec![Constant::FunctionId { index: 1 }],
         module_resolutions: Vec::new(),
         module_inits: Vec::new(),
+        lazy_environments: Vec::new(),
         function_source: None,
     };
     let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
@@ -799,6 +809,7 @@ fn direct_bytecode_call_window_populates_rest_arguments() {
         constants: vec![Constant::FunctionId { index: 1 }],
         module_resolutions: Vec::new(),
         module_inits: Vec::new(),
+        lazy_environments: Vec::new(),
         function_source: None,
     };
     let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
@@ -867,6 +878,7 @@ fn bytecode_store_property_function_bag_uses_young_allocation_with_frame_roots()
         ],
         module_resolutions: Vec::new(),
         module_inits: Vec::new(),
+        lazy_environments: Vec::new(),
         function_source: None,
     };
     let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
@@ -1073,6 +1085,7 @@ fn new_function_links_eval_chunk_into_shared_code_space() {
         constants: vec![Constant::FunctionId { index: 1 }],
         module_resolutions: Vec::new(),
         module_inits: Vec::new(),
+        lazy_environments: Vec::new(),
         function_source: None,
     };
     let outer = module_with(Vec::new(), 4);
@@ -1228,6 +1241,7 @@ fn array_callback_map_uses_stack_rooted_result_allocation() {
         }],
         module_resolutions: Vec::new(),
         module_inits: Vec::new(),
+        lazy_environments: Vec::new(),
         function_source: None,
     };
     let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
@@ -1296,6 +1310,7 @@ fn call_method_on_nullish_receiver_reports_type_error() {
         }],
         module_resolutions: Vec::new(),
         module_inits: Vec::new(),
+        lazy_environments: Vec::new(),
         function_source: None,
     };
     let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
@@ -1352,6 +1367,7 @@ fn call_method_on_missing_primitive_method_reports_not_callable() {
         }],
         module_resolutions: Vec::new(),
         module_inits: Vec::new(),
+        lazy_environments: Vec::new(),
         function_source: None,
     };
     let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
@@ -1402,6 +1418,7 @@ fn call_method_string_prototype_non_callable_shadows_builtin() {
         }],
         module_resolutions: Vec::new(),
         module_inits: Vec::new(),
+        lazy_environments: Vec::new(),
         function_source: None,
     };
     let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
@@ -1556,6 +1573,7 @@ fn call_char_code_at(
         }],
         module_resolutions: Vec::new(),
         module_inits: Vec::new(),
+        lazy_environments: Vec::new(),
         function_source: None,
     };
     let mut roots = otter_gc::RootScope::new(interp.gc_heap_mut());
@@ -1613,6 +1631,7 @@ fn call_method_number_prototype_non_callable_shadows_builtin() {
         }],
         module_resolutions: Vec::new(),
         module_inits: Vec::new(),
+        lazy_environments: Vec::new(),
         function_source: None,
     };
     let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
@@ -1750,6 +1769,7 @@ fn call_number_to_string(
         }],
         module_resolutions: Vec::new(),
         module_inits: Vec::new(),
+        lazy_environments: Vec::new(),
         function_source: None,
     };
     let context = interp
@@ -1804,6 +1824,7 @@ fn call_method_boolean_prototype_non_callable_shadows_builtin() {
         }],
         module_resolutions: Vec::new(),
         module_inits: Vec::new(),
+        lazy_environments: Vec::new(),
         function_source: None,
     };
     let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
@@ -1869,6 +1890,7 @@ fn call_method_bigint_prototype_non_callable_shadows_builtin() {
         }],
         module_resolutions: Vec::new(),
         module_inits: Vec::new(),
+        lazy_environments: Vec::new(),
         function_source: None,
     };
     let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
@@ -1936,6 +1958,7 @@ fn call_method_symbol_prototype_non_callable_shadows_builtin() {
         }],
         module_resolutions: Vec::new(),
         module_inits: Vec::new(),
+        lazy_environments: Vec::new(),
         function_source: None,
     };
     let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
@@ -2002,6 +2025,7 @@ fn call_method_weak_ref_prototype_non_callable_shadows_builtin() {
         }],
         module_resolutions: Vec::new(),
         module_inits: Vec::new(),
+        lazy_environments: Vec::new(),
         function_source: None,
     };
     let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
@@ -2076,6 +2100,7 @@ fn call_method_finalization_registry_prototype_non_callable_shadows_builtin() {
         }],
         module_resolutions: Vec::new(),
         module_inits: Vec::new(),
+        lazy_environments: Vec::new(),
         function_source: None,
     };
     let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
@@ -2145,6 +2170,7 @@ fn call_method_promise_expando_non_callable_shadows_builtin() {
         }],
         module_resolutions: Vec::new(),
         module_inits: Vec::new(),
+        lazy_environments: Vec::new(),
         function_source: None,
     };
     let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
@@ -2208,6 +2234,7 @@ fn call_method_promise_prototype_non_callable_shadows_builtin() {
         }],
         module_resolutions: Vec::new(),
         module_inits: Vec::new(),
+        lazy_environments: Vec::new(),
         function_source: None,
     };
     let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
@@ -2274,6 +2301,7 @@ fn call_method_array_own_non_callable_shadows_builtin() {
         }],
         module_resolutions: Vec::new(),
         module_inits: Vec::new(),
+        lazy_environments: Vec::new(),
         function_source: None,
     };
     let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
@@ -2330,6 +2358,7 @@ fn call_method_regexp_own_non_callable_shadows_builtin() {
         }],
         module_resolutions: Vec::new(),
         module_inits: Vec::new(),
+        lazy_environments: Vec::new(),
         function_source: None,
     };
     let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
@@ -2394,6 +2423,7 @@ fn call_method_regexp_prototype_non_callable_shadows_builtin() {
         }],
         module_resolutions: Vec::new(),
         module_inits: Vec::new(),
+        lazy_environments: Vec::new(),
         function_source: None,
     };
     let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
@@ -2461,6 +2491,7 @@ fn call_method_date_prototype_non_callable_shadows_builtin() {
         }],
         module_resolutions: Vec::new(),
         module_inits: Vec::new(),
+        lazy_environments: Vec::new(),
         function_source: None,
     };
     let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
@@ -2533,6 +2564,7 @@ fn call_method_date_setter_prototype_non_callable_shadows_builtin() {
         }],
         module_resolutions: Vec::new(),
         module_inits: Vec::new(),
+        lazy_environments: Vec::new(),
         function_source: None,
     };
     let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
@@ -2605,6 +2637,7 @@ fn call_method_typed_array_own_non_callable_shadows_builtin() {
         }],
         module_resolutions: Vec::new(),
         module_inits: Vec::new(),
+        lazy_environments: Vec::new(),
         function_source: None,
     };
     let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
@@ -2679,6 +2712,7 @@ fn call_method_typed_array_callback_prototype_non_callable_shadows_builtin() {
         }],
         module_resolutions: Vec::new(),
         module_inits: Vec::new(),
+        lazy_environments: Vec::new(),
         function_source: None,
     };
     let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
@@ -2755,6 +2789,7 @@ fn call_method_typed_array_slice_prototype_non_callable_shadows_builtin() {
         }],
         module_resolutions: Vec::new(),
         module_inits: Vec::new(),
+        lazy_environments: Vec::new(),
         function_source: None,
     };
     let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
@@ -2831,6 +2866,7 @@ fn call_method_iterator_prototype_non_callable_shadows_helper() {
         }],
         module_resolutions: Vec::new(),
         module_inits: Vec::new(),
+        lazy_environments: Vec::new(),
         function_source: None,
     };
     let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
@@ -2905,6 +2941,7 @@ fn call_method_map_prototype_non_callable_shadows_builtin_for_each() {
         }],
         module_resolutions: Vec::new(),
         module_inits: Vec::new(),
+        lazy_environments: Vec::new(),
         function_source: None,
     };
     let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
@@ -2971,6 +3008,7 @@ fn call_method_set_prototype_non_callable_shadows_builtin_for_each() {
         }],
         module_resolutions: Vec::new(),
         module_inits: Vec::new(),
+        lazy_environments: Vec::new(),
         function_source: None,
     };
     let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
@@ -3037,6 +3075,7 @@ fn call_method_map_prototype_non_callable_shadows_map_method() {
         }],
         module_resolutions: Vec::new(),
         module_inits: Vec::new(),
+        lazy_environments: Vec::new(),
         function_source: None,
     };
     let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
@@ -3103,6 +3142,7 @@ fn call_method_set_prototype_non_callable_shadows_set_add() {
         }],
         module_resolutions: Vec::new(),
         module_inits: Vec::new(),
+        lazy_environments: Vec::new(),
         function_source: None,
     };
     let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
@@ -3169,6 +3209,7 @@ fn call_method_weak_map_prototype_non_callable_shadows_weak_map_method() {
         }],
         module_resolutions: Vec::new(),
         module_inits: Vec::new(),
+        lazy_environments: Vec::new(),
         function_source: None,
     };
     let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
@@ -3235,6 +3276,7 @@ fn call_method_weak_set_prototype_non_callable_shadows_weak_set_method() {
         }],
         module_resolutions: Vec::new(),
         module_inits: Vec::new(),
+        lazy_environments: Vec::new(),
         function_source: None,
     };
     let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
@@ -3301,6 +3343,7 @@ fn call_method_array_buffer_prototype_non_callable_shadows_builtin() {
         }],
         module_resolutions: Vec::new(),
         module_inits: Vec::new(),
+        lazy_environments: Vec::new(),
         function_source: None,
     };
     let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
@@ -3369,6 +3412,7 @@ fn call_method_data_view_prototype_non_callable_shadows_builtin() {
         }],
         module_resolutions: Vec::new(),
         module_inits: Vec::new(),
+        lazy_environments: Vec::new(),
         function_source: None,
     };
     let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
@@ -3439,6 +3483,7 @@ fn call_method_set_prototype_non_callable_shadows_es_set_method() {
         }],
         module_resolutions: Vec::new(),
         module_inits: Vec::new(),
+        lazy_environments: Vec::new(),
         function_source: None,
     };
     let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
@@ -3505,6 +3550,7 @@ fn call_method_function_own_non_callable_shadows_call() {
         }],
         module_resolutions: Vec::new(),
         module_inits: Vec::new(),
+        lazy_environments: Vec::new(),
         function_source: None,
     };
     let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
@@ -3569,6 +3615,7 @@ fn call_method_function_own_non_callable_shadows_object_method() {
         }],
         module_resolutions: Vec::new(),
         module_inits: Vec::new(),
+        lazy_environments: Vec::new(),
         function_source: None,
     };
     let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
@@ -3633,6 +3680,7 @@ fn call_method_null_proto_object_missing_object_method_is_not_callable() {
         }],
         module_resolutions: Vec::new(),
         module_inits: Vec::new(),
+        lazy_environments: Vec::new(),
         function_source: None,
     };
     let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
@@ -3693,6 +3741,7 @@ fn call_method_native_function_object_prototype_non_callable_shadows_builtin() {
         }],
         module_resolutions: Vec::new(),
         module_inits: Vec::new(),
+        lazy_environments: Vec::new(),
         function_source: None,
     };
     let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
@@ -3759,6 +3808,7 @@ fn call_method_primitive_object_prototype_non_callable_shadows_builtin() {
         }],
         module_resolutions: Vec::new(),
         module_inits: Vec::new(),
+        lazy_environments: Vec::new(),
         function_source: None,
     };
     let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
@@ -3828,6 +3878,7 @@ fn call_method_string_wrapper_replace_own_non_callable_shadows_builtin() {
         }],
         module_resolutions: Vec::new(),
         module_inits: Vec::new(),
+        lazy_environments: Vec::new(),
         function_source: None,
     };
     let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
@@ -4042,6 +4093,7 @@ fn new_collection_map_uses_root_aware_allocation_with_frame_roots() {
         }],
         module_resolutions: Vec::new(),
         module_inits: Vec::new(),
+        lazy_environments: Vec::new(),
         function_source: None,
     };
     let context = interp
@@ -4295,6 +4347,7 @@ fn bytecode_new_finalization_registry_uses_young_allocation_with_frame_roots() {
         constants: vec![Constant::FunctionId { index: 1 }],
         module_resolutions: Vec::new(),
         module_inits: Vec::new(),
+        lazy_environments: Vec::new(),
         function_source: None,
     };
     let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
@@ -4359,6 +4412,7 @@ fn direct_bytecode_async_call_window_populates_parameters() {
         constants: vec![Constant::FunctionId { index: 1 }],
         module_resolutions: Vec::new(),
         module_inits: Vec::new(),
+        lazy_environments: Vec::new(),
         function_source: None,
     };
     let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
@@ -4409,6 +4463,7 @@ fn async_generator_method_uses_stack_rooted_capability_allocation() {
         }],
         module_resolutions: Vec::new(),
         module_inits: Vec::new(),
+        lazy_environments: Vec::new(),
         function_source: None,
     };
     let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
@@ -4464,6 +4519,7 @@ fn primitive_wrapper_boxing_uses_stack_rooted_young_allocation() {
         constants: Vec::new(),
         module_resolutions: Vec::new(),
         module_inits: Vec::new(),
+        lazy_environments: Vec::new(),
         function_source: None,
     };
     let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
@@ -4529,6 +4585,7 @@ fn top_level_async_entry_returns_the_awaited_completion() {
         constants: Vec::new(),
         module_resolutions: Vec::new(),
         module_inits: Vec::new(),
+        lazy_environments: Vec::new(),
         function_source: None,
     };
     let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
@@ -4568,6 +4625,7 @@ fn promise_fulfilled_of_allocates_the_body_in_old_space() {
         constants: Vec::new(),
         module_resolutions: Vec::new(),
         module_inits: Vec::new(),
+        lazy_environments: Vec::new(),
         function_source: None,
     };
     let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
@@ -4601,6 +4659,7 @@ fn await_non_promise_uses_stack_rooted_wrapper_allocation() {
         constants: Vec::new(),
         module_resolutions: Vec::new(),
         module_inits: Vec::new(),
+        lazy_environments: Vec::new(),
         function_source: None,
     };
     let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
@@ -4800,6 +4859,7 @@ fn direct_bytecode_construct_window_populates_arguments_object() {
         constants: vec![Constant::FunctionId { index: 1 }],
         module_resolutions: Vec::new(),
         module_inits: Vec::new(),
+        lazy_environments: Vec::new(),
         function_source: None,
     };
     let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
@@ -4868,6 +4928,7 @@ fn direct_bytecode_construct_receiver_uses_young_allocation_with_frame_roots() {
         constants: vec![Constant::FunctionId { index: 1 }],
         module_resolutions: Vec::new(),
         module_inits: Vec::new(),
+        lazy_environments: Vec::new(),
         function_source: None,
     };
     let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
@@ -4947,6 +5008,7 @@ fn bound_bytecode_construct_receiver_uses_young_allocation_with_frame_roots() {
         constants: vec![Constant::FunctionId { index: 1 }],
         module_resolutions: Vec::new(),
         module_inits: Vec::new(),
+        lazy_environments: Vec::new(),
         function_source: None,
     };
     let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
@@ -5437,6 +5499,7 @@ fn unwind_throw_pops_frames_until_handler_or_uncaught() {
         primordial_iteration: false,
         ignores_this: false,
         asm_module: false,
+        lazy: None,
         code: vec![Instruction {
             pc: 0,
             op: Op::ReturnUndefined,
@@ -5519,6 +5582,7 @@ fn unwind_throw_lands_in_catch_handler() {
         primordial_iteration: false,
         ignores_this: false,
         asm_module: false,
+        lazy: None,
         code: vec![Instruction {
             pc: 0,
             op: Op::ReturnUndefined,
@@ -5863,6 +5927,7 @@ fn proxy_construct_argv_array_uses_young_allocation_with_frame_roots() {
         constants: Vec::new(),
         module_resolutions: Vec::new(),
         module_inits: Vec::new(),
+        lazy_environments: Vec::new(),
         function_source: None,
     };
     let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
@@ -6009,6 +6074,7 @@ fn rooted_construct_receiver_uses_shared_turn_young_allocation() {
         constants: Vec::new(),
         module_resolutions: Vec::new(),
         module_inits: Vec::new(),
+        lazy_environments: Vec::new(),
         function_source: None,
     };
     let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
@@ -6064,6 +6130,7 @@ fn rooted_construct_proxy_argv_array_uses_shared_turn_young_allocation() {
         constants: Vec::new(),
         module_resolutions: Vec::new(),
         module_inits: Vec::new(),
+        lazy_environments: Vec::new(),
         function_source: None,
     };
     let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
@@ -6150,6 +6217,7 @@ fn arrow_closure_overrides_call_site_this() {
         primordial_iteration: false,
         ignores_this: false,
         asm_module: false,
+        lazy: None,
         code: vec![Instruction {
             pc: 0,
             op: Op::ReturnUndefined,
@@ -6193,6 +6261,7 @@ fn arrow_closure_overrides_call_site_this() {
         primordial_iteration: false,
         ignores_this: false,
         asm_module: false,
+        lazy: None,
         code: vec![
             Instruction {
                 pc: 0,
@@ -6222,6 +6291,7 @@ fn arrow_closure_overrides_call_site_this() {
         constants: vec![],
         module_resolutions: Vec::new(),
         module_inits: Vec::new(),
+        lazy_environments: Vec::new(),
         function_source: None,
     };
     // Build the closure by hand and dispatch via `invoke`. The

@@ -52,6 +52,7 @@ mod tests {
             constants: vec![],
             module_resolutions: Vec::new(),
             module_inits: Vec::new(),
+            lazy_environments: Vec::new(),
             function_source: None,
         };
         let json = to_json_pretty(&module).unwrap();

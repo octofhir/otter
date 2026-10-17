@@ -579,6 +579,7 @@ fn inlined_named_selection_uses_its_source_bank_and_full_eager_chain() {
             template_sites: vec![],
             module_resolutions: vec![],
             module_inits: vec![],
+            lazy_environments: Vec::new(),
         },
         Default::default(),
     )

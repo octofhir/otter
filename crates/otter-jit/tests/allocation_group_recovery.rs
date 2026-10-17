@@ -151,6 +151,7 @@ fn source() -> (BytecodeModule, Box<[u32]>) {
             constants: Vec::new(),
             module_resolutions: Vec::new(),
             module_inits: Vec::new(),
+            lazy_environments: Vec::new(),
         },
         positions,
     )

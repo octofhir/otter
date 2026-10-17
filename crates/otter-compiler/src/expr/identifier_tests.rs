@@ -186,7 +186,7 @@ fn imported_constant_names_read_the_resolved_export() {
     let module = otter_syntax::with_program(
         "import {value as NaN,other as Infinity} from './constants.js';export function read(){return [NaN,Infinity];}",
         SyntaxSourceKind::JavaScript,
-        |program| crate::compile_module_program(program, SyntaxSourceKind::JavaScript, &host),
+        |program| crate::compile_module_program(program, SyntaxSourceKind::JavaScript, &host, crate::CompileOptions::default()),
     ).expect("module syntax").expect("module lowering");
     crate::context_tests::assert_verified(&module);
     let code = &function(&module, "read").code;

@@ -71,3 +71,8 @@ required-features = ["engine"]
 name = "otter-resource-probe"
 path = "src/bin/resource_probe.rs"
 required-features = ["engine"]
+
+[[bin]]
+name = "otter-web-bundles"
+path = "src/bin/web_bundles.rs"
+required-features = ["engine"]

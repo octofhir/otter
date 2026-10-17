@@ -568,6 +568,7 @@ pub(crate) fn hoist_function_declarations_from(
         // binding: the name inside the body resolves to the enclosing
         // binding pass 2 pre-declared (or the global object property for
         // script globals).
+        cx.next_fn_declaration = true;
         let record = compile_function_full(
             cx,
             &name,

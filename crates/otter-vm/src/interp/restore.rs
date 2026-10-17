@@ -225,6 +225,8 @@ impl Interpreter {
             function_realm_ids: rustc_hash::FxHashMap::default(),
             active_realm_is_extra: false,
             eval_hook: None,
+            lazy_compile_hook: None,
+            lazy_bodies_compiled: 0,
             pending_uncaught_throw: None,
             completed_activation_result: None,
             uncaught_from_promise_rejection: false,

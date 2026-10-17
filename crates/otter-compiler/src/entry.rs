@@ -54,7 +54,7 @@ pub fn compile_script_source_with_top_level_await(
     module_specifier: &str,
 ) -> Result<BytecodeModule, CompileError> {
     with_program(source, kind, |program| {
-        compile_program(program, kind, module_specifier, false)
+        compile_program(program, kind, module_specifier, false, None)
     })
     .map_err(CompileError::from)?
 }
@@ -74,7 +74,7 @@ pub fn compile_script_source_with_forced_strict(
     // §16.1 Script goal: `await` stays a plain identifier and
     // `import` / `export` declarations are early syntax errors.
     otter_syntax::with_program_goal(source, kind, otter_syntax::SourceGoal::Script, |program| {
-        compile_program(program, kind, module_specifier, force_strict)
+        compile_program(program, kind, module_specifier, force_strict, None)
     })
     .map_err(CompileError::from)?
 }
@@ -409,8 +409,58 @@ pub fn compile_script_source_to_module(
     kind: SyntaxSourceKind,
     module_specifier: &str,
 ) -> Result<CompiledModule, CompileError> {
-    let bytecode = compile_script_source(source, kind, module_specifier)?;
+    compile_script_source_to_module_with_options(
+        source,
+        kind,
+        module_specifier,
+        CompileOptions::default(),
+    )
+}
+
+/// [`compile_script_source_to_module`] under an explicit compile policy.
+///
+/// # Errors
+/// Returns [`CompileError`] when parsing or lowering fails.
+pub fn compile_script_source_to_module_with_options(
+    source: &str,
+    kind: SyntaxSourceKind,
+    module_specifier: &str,
+    options: CompileOptions,
+) -> Result<CompiledModule, CompileError> {
+    let bytecode = otter_syntax::with_program_goal(
+        source,
+        kind,
+        otter_syntax::SourceGoal::Script,
+        |program| {
+            // A parse the §13.15.1 call-target retry had to patch indexes
+            // the patched text, which a body compile cannot reparse.
+            let lazy = if program.source_text.len() == source.len() {
+                lazy_unit(options, kind, false)
+            } else {
+                None
+            };
+            compile_program(program, kind, module_specifier, false, lazy)
+        },
+    )
+    .map_err(CompileError::from)??;
     CompiledModule::from_bytecode(bytecode)
+}
+
+/// The lazy-compile facts of a unit `options` lets compile lazily.
+pub(crate) fn lazy_unit(
+    options: CompileOptions,
+    kind: SyntaxSourceKind,
+    module_goal: bool,
+) -> Option<crate::compiler::LazyUnit> {
+    options.lazy_functions.then_some(crate::compiler::LazyUnit {
+        module_goal,
+        typescript: kind.is_typescript(),
+        jsx: matches!(
+            kind,
+            SyntaxSourceKind::JavaScriptJsx | SyntaxSourceKind::TypeScriptJsx
+        ),
+        top_level_eager: false,
+    })
 }
 
 /// Compile an already parsed OXC program as a script.
@@ -426,8 +476,15 @@ pub fn compile_script_program(
     program: &Program<'_>,
     source_kind: SyntaxSourceKind,
     module_specifier: &str,
+    options: CompileOptions,
 ) -> Result<BytecodeModule, CompileError> {
-    compile_program(program, source_kind, module_specifier, false)
+    compile_program(
+        program,
+        source_kind,
+        module_specifier,
+        false,
+        lazy_unit(options, source_kind, false),
+    )
 }
 
 pub(crate) fn compile_program(
@@ -435,8 +492,9 @@ pub(crate) fn compile_program(
     source_kind: SyntaxSourceKind,
     module_specifier: &str,
     force_strict: bool,
+    lazy: Option<crate::compiler::LazyUnit>,
 ) -> Result<BytecodeModule, CompileError> {
-    compile_program_with_mode(program, source_kind, module_specifier, force_strict)
+    compile_program_with_mode(program, source_kind, module_specifier, force_strict, lazy)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -463,6 +521,7 @@ pub(crate) fn compile_program_for_eval(
             super_property_allowed,
             super_call_allowed,
             function_constructor,
+            lazy: None,
         },
     )
 }
@@ -472,6 +531,7 @@ pub(crate) fn compile_program_with_mode(
     source_kind: SyntaxSourceKind,
     module_specifier: &str,
     force_strict: bool,
+    lazy: Option<crate::compiler::LazyUnit>,
 ) -> Result<BytecodeModule, CompileError> {
     compile_program_parts(
         ProgramParts::of(program),
@@ -485,6 +545,7 @@ pub(crate) fn compile_program_with_mode(
             super_property_allowed: false,
             super_call_allowed: false,
             function_constructor: false,
+            lazy,
         },
     )
 }
@@ -576,6 +637,8 @@ pub(crate) struct ProgramMode<'c> {
     pub(crate) super_property_allowed: bool,
     pub(crate) super_call_allowed: bool,
     pub(crate) function_constructor: bool,
+    /// `Some` when the unit's functions compile their bodies on first call.
+    pub(crate) lazy: Option<crate::compiler::LazyUnit>,
 }
 
 /// `true` when `cx` lowers the top level of a sloppy direct eval whose
@@ -707,10 +770,27 @@ pub(crate) fn eval_annex_b_blocked(cx: &Compiler, name: &str) -> bool {
     })
 }
 
+/// Private names the classes around a direct eval declare (§19.2.1.1).
+fn caller_private_names(chain: Option<&EvalCallerChain>) -> std::collections::HashSet<String> {
+    chain
+        .into_iter()
+        .flat_map(|chain| chain.scopes.iter())
+        .filter(|scope| scope.descriptor.kind == otter_bytecode::ScopeKind::Class)
+        .flat_map(|scope| scope.descriptor.slots.iter())
+        .filter(|slot| {
+            matches!(
+                slot.kind,
+                otter_bytecode::SlotKind::PrivateName | otter_bytecode::SlotKind::PrivateMethod
+            )
+        })
+        .filter_map(|slot| slot.name.strip_prefix('#').map(str::to_string))
+        .collect()
+}
+
 /// Rebuild the compile-time state a direct eval inherits from its caller
 /// chain: the `with` object environments (§9.1.1.2.1) and the
 /// PrivateEnvironment (§19.2.1.1) of enclosing classes.
-fn inherit_eval_chain_state(cx: &mut Compiler) {
+pub(crate) fn inherit_eval_chain_state(cx: &mut Compiler) {
     use otter_bytecode::{ScopeKind, SlotKind};
     let Some(chain) = cx.eval_chain.clone() else {
         return;
@@ -724,12 +804,19 @@ fn inherit_eval_chain_state(cx: &mut Compiler) {
                 .active_with_envs
                 .push(crate::with_statement::WithEnv { location }),
             ScopeKind::Class => {
-                let names: std::collections::HashSet<String> = descriptor
-                    .slots
-                    .iter()
-                    .filter(|slot| slot.kind == SlotKind::PrivateName)
-                    .filter_map(|slot| slot.name.strip_prefix('#').map(str::to_string))
-                    .collect();
+                let private_names = |method_only: bool| {
+                    descriptor
+                        .slots
+                        .iter()
+                        .filter(|slot| {
+                            slot.kind == SlotKind::PrivateMethod
+                                || (!method_only && slot.kind == SlotKind::PrivateName)
+                        })
+                        .filter_map(|slot| slot.name.strip_prefix('#').map(str::to_string))
+                        .collect::<std::collections::HashSet<String>>()
+                };
+                let names = private_names(false);
+                let instance_methods = private_names(true);
                 let namespace = {
                     let module = Rc::clone(&cx.top_mut().module);
                     let mut m = module.borrow_mut();
@@ -739,8 +826,7 @@ fn inherit_eval_chain_state(cx: &mut Compiler) {
                 };
                 cx.private_namespaces.push(namespace);
                 cx.class_private_names.push(names);
-                cx.class_private_instance_methods
-                    .push(std::collections::HashSet::new());
+                cx.class_private_instance_methods.push(instance_methods);
                 cx.class_scope_locations.push(location);
             }
             _ => {}
@@ -764,6 +850,7 @@ pub(crate) fn compile_program_parts(
         super_property_allowed,
         super_call_allowed,
         function_constructor,
+        lazy,
     } = mode;
     let source_text = program.source_text;
     let module = Rc::new(RefCell::new(ModuleBuilder::default()));
@@ -777,8 +864,12 @@ pub(crate) fn compile_program_parts(
     strict_validation::validate_strict_mode_early_errors(
         program.directives,
         program.body,
-        force_strict || program.strict_directive,
-        super_property_allowed || super_call_allowed,
+        strict_validation::EarlyErrorContext {
+            source_strict: force_strict || program.strict_directive,
+            super_property_allowed: super_property_allowed || super_call_allowed,
+            super_call_allowed,
+            private_names: Some(caller_private_names(caller_chain)),
+        },
     )?;
     if !new_target_allowed {
         strict_validation::validate_script_new_target_early_errors(program.body)?;
@@ -845,6 +936,7 @@ pub(crate) fn compile_program_parts(
     // A script `<main>` and an indirect eval run with no closure context.
     top.closure_context_empty = caller_chain.is_none();
     let mut cx = Compiler::new(top, unit_capture);
+    cx.lazy_unit = lazy;
     cx.eval_chain = caller_chain.cloned();
     cx.suppress_global_mirror = eval_mode && (main_is_strict || function_var_env);
     cx.in_eval = eval_mode;
@@ -1038,6 +1130,17 @@ pub(crate) fn compile_program_parts(
         m.functions[0].handlers = finished.handlers;
         m.functions[0].spans = otter_bytecode::SpanTable::new(&finished.spans);
     }
+    let lazy_environments = if cx.lazy_unit.is_some() && !cx.script_global_lexicals.is_empty() {
+        let mut script_lexicals: Vec<String> = cx.script_global_lexicals.iter().cloned().collect();
+        script_lexicals.sort();
+        vec![otter_bytecode::LazyEnvironment {
+            module_url: cx.module_url.clone(),
+            script_lexicals,
+            ..Default::default()
+        }]
+    } else {
+        Vec::new()
+    };
     drop(cx);
 
     let kind = bytecode_source_kind(source_kind);
@@ -1059,6 +1162,7 @@ pub(crate) fn compile_program_parts(
         constants,
         module_resolutions: Vec::new(),
         module_inits: Vec::new(),
+        lazy_environments,
         function_source: None,
     };
     finish_bytecode(&mut bytecode, source_text);
@@ -1120,14 +1224,18 @@ pub fn compile_module_program(
     program: &Program<'_>,
     source_kind: SyntaxSourceKind,
     host: &ModuleHostInfo,
+    options: CompileOptions,
 ) -> Result<BytecodeModule, CompileError> {
     // §12.9.3.1 + §15.7 strict-mode early errors. Module bodies are
     // always strict mode code (§10.2.10).
     strict_validation::validate_strict_mode_early_errors(
         &program.directives,
         &program.body,
-        true,
-        false,
+        strict_validation::EarlyErrorContext {
+            source_strict: true,
+            private_names: Some(std::collections::HashSet::new()),
+            ..Default::default()
+        },
     )?;
     // §14.2.1 / §14.12.1 block-level lexical early errors; module
     // code is always strict so no Annex B exemption applies.
@@ -1475,6 +1583,7 @@ pub fn compile_module_program(
     top.module_state = Some(state);
 
     let mut cx = Compiler::new(top, unit_capture);
+    cx.lazy_unit = lazy_unit(options, source_kind, true);
     // The module scope's context (descriptor 0) is allocated by the runtime
     // once per module and handed to both `<module-init>` invocations (link
     // and evaluation) as their closure context.
@@ -1663,6 +1772,10 @@ pub fn compile_module_program(
         })
         .unwrap_or_default()
     };
+    let lazy_environments = match (&cx.lazy_unit, &cx.module_state) {
+        (Some(_), Some(state)) => vec![crate::lazy::lazy_environment_from(state, &host.module_url)],
+        _ => Vec::new(),
+    };
     drop(cx);
 
     let kind = bytecode_source_kind(source_kind);
@@ -1702,6 +1815,7 @@ pub fn compile_module_program(
         constants,
         module_resolutions,
         module_inits: Vec::new(),
+        lazy_environments,
         function_source: None,
     };
     finish_bytecode(&mut bytecode, program.source_text);
@@ -1837,9 +1951,10 @@ pub fn compile_module_program_to_module(
     program: &Program<'_>,
     source_kind: SyntaxSourceKind,
     host: &ModuleHostInfo,
+    options: CompileOptions,
 ) -> Result<CompiledModule, CompileError> {
     let module_metadata = collect_module_metadata(program, host);
-    let bytecode = compile_module_program(program, source_kind, host)?;
+    let bytecode = compile_module_program(program, source_kind, host, options)?;
     let mut metadata = CompiledModuleMetadata::span_only_from_bytecode_with_source(
         &bytecode,
         &host.module_url,
@@ -1946,6 +2061,7 @@ pub(crate) fn compile_export_inner_declaration(
                 Some(info) => info.storage,
                 None => cx.declare_binding(&name, otter_bytecode::SlotKind::FunctionDecl, fspan)?,
             };
+            cx.next_fn_declaration = true;
             let record = compile_function_full(
                 cx,
                 &name,

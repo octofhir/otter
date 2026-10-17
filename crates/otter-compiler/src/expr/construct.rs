@@ -26,6 +26,7 @@ pub(crate) fn compile_new(
     // whole range into `dst`. See `FunctionContext::reset_scratch`.
     let mark = cx.scratch;
     let callee = unwrap_ts_expr(&new_expr.callee);
+    crate::expr::mark_eager_if_function(cx, callee);
     // §13.3.5 — a `new C(...args)` whose arguments include a SpreadElement
     // must build its argument list dynamically. Route it straight to the
     // `Op::NewSpread` path, preserving the resolved constructor reference.

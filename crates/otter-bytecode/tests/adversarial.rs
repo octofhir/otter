@@ -81,6 +81,7 @@ fn seed_minimal() -> BytecodeModule {
         constants: Vec::new(),
         module_resolutions: Vec::new(),
         module_inits: Vec::new(),
+        lazy_environments: Vec::new(),
     }
 }
 
@@ -130,6 +131,7 @@ fn seed_handlers() -> BytecodeModule {
         constants: Vec::new(),
         module_resolutions: Vec::new(),
         module_inits: Vec::new(),
+        lazy_environments: Vec::new(),
     }
 }
 
@@ -210,6 +212,7 @@ fn seed_rich() -> BytecodeModule {
         ],
         module_resolutions: Vec::new(),
         module_inits: Vec::new(),
+        lazy_environments: Vec::new(),
     }
 }
 
@@ -376,6 +379,7 @@ fn seed_calls() -> BytecodeModule {
         ],
         module_resolutions: Vec::new(),
         module_inits: Vec::new(),
+        lazy_environments: Vec::new(),
     }
 }
 
@@ -437,6 +441,7 @@ fn seed_iterators() -> BytecodeModule {
         constants: Vec::new(),
         module_resolutions: Vec::new(),
         module_inits: Vec::new(),
+        lazy_environments: Vec::new(),
     }
 }
 
@@ -558,6 +563,7 @@ fn seed_suspensions() -> BytecodeModule {
         ],
         module_resolutions: Vec::new(),
         module_inits: Vec::new(),
+        lazy_environments: Vec::new(),
     }
 }
 
@@ -756,6 +762,7 @@ fn seed_classes() -> BytecodeModule {
         ],
         module_resolutions: Vec::new(),
         module_inits: Vec::new(),
+        lazy_environments: Vec::new(),
     }
 }
 
@@ -870,6 +877,7 @@ fn seed_modules() -> BytecodeModule {
             url: "file:///dep.js".to_string(),
             function_id: 1,
         }],
+        lazy_environments: Vec::new(),
     }
 }
 
@@ -1066,6 +1074,7 @@ fn seed_contexts() -> BytecodeModule {
         ],
         module_resolutions: Vec::new(),
         module_inits: Vec::new(),
+        lazy_environments: Vec::new(),
     }
 }
 
@@ -1524,6 +1533,7 @@ fn verification_cost_stays_linear_in_handler_nesting() {
             constants: Vec::new(),
             module_resolutions: Vec::new(),
             module_inits: Vec::new(),
+            lazy_environments: Vec::new(),
         }
     }
 

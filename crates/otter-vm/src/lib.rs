@@ -55,6 +55,8 @@ pub mod __macro_support {
 pub(crate) mod abstract_ops;
 pub mod active_frame;
 mod allocation_ops;
+mod lazy_compile;
+pub use lazy_compile::{LazyCompileHook, LazyCompileInput};
 mod argument_window;
 mod arguments_access;
 pub mod arguments_object;
@@ -1236,6 +1238,10 @@ pub struct Interpreter {
     /// can opt out of dynamic code.
     #[allow(clippy::type_complexity)]
     eval_hook: Option<EvalHook>,
+    /// Compiles lazy records' bodies on their first call.
+    lazy_compile_hook: Option<LazyCompileHook>,
+    /// Lazy records whose bodies this isolate compiled.
+    lazy_bodies_compiled: u64,
     /// Side-channel for an unhandled JS-level throw escaping a
     /// synchronous sub-dispatch such as a Proxy trap or callback
     /// invoked via [`Self::run_callable_sync`]. The sub-stack can

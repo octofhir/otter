@@ -11,7 +11,8 @@
 //! - [`CallFeedbackStats`] — owned diagnostic summary of retained call sites.
 //!
 //! # Invariants
-//!
+//! - Resolving a lazy record whose body is compiled reaches the body's
+//!   chunk; that chunk resolves the record's id as its function 0.
 //! - Host schedulers never receive an [`ExecutionContext`]. They
 //!   only see opaque tokens and wake the isolate.
 //! - JS-visible work queued inside the VM carries its context with
@@ -192,9 +193,7 @@ impl ExecutionContext {
     /// `true` when `function_id` falls inside this chunk's table.
     #[must_use]
     pub(crate) fn covers_function(&self, function_id: u32) -> bool {
-        function_id
-            .checked_sub(self.function_base)
-            .is_some_and(|local| (local as usize) < self.payload.module.functions.len())
+        self.local_function_index(function_id).is_some()
     }
 
     /// Resolve the context owning `function_id`: this chunk on the hot
@@ -204,8 +203,11 @@ impl ExecutionContext {
         &self,
         function_id: u32,
     ) -> Result<ResolvedCtx<'_>, FunctionResolutionError> {
-        if self.covers_function(function_id) {
-            return Ok(ResolvedCtx::Ambient(self));
+        if let Some(local) = self.local_function_index(function_id) {
+            return match self.payload.executable.forward(local) {
+                None => Ok(ResolvedCtx::Ambient(self)),
+                Some(body) => Self::for_function_in(&self.space, body).map(ResolvedCtx::Owned),
+            };
         }
         Self::for_function_in(&self.space, function_id).map(ResolvedCtx::Owned)
     }
@@ -220,11 +222,18 @@ impl ExecutionContext {
             ChunkResolution::Live {
                 function_base,
                 payload,
-            } => Ok(Self::from_chunk_payload(
-                payload,
-                function_base,
-                Arc::clone(space),
-            )),
+            } => {
+                // A lazy record whose body is compiled runs in the body's
+                // chunk, which answers to the record's id.
+                if let Some(body) = payload.executable.forward(function_id - function_base) {
+                    return Self::for_function_in(space, body);
+                }
+                Ok(Self::from_chunk_payload(
+                    payload,
+                    function_base,
+                    Arc::clone(space),
+                ))
+            }
             ChunkResolution::Evicted {
                 function_base,
                 function_count,
@@ -239,9 +248,43 @@ impl ExecutionContext {
 
     /// Translate a global function id to this chunk's local table
     /// index.
+    #[inline]
     fn local_function_index(&self, function_id: u32) -> Option<u32> {
-        let local = function_id.checked_sub(self.function_base)?;
-        ((local as usize) < self.payload.module.functions.len()).then_some(local)
+        if let Some(local) = function_id.checked_sub(self.function_base)
+            && (local as usize) < self.payload.module.functions.len()
+        {
+            return Some(local);
+        }
+        (self.payload.executable.alias() == Some(function_id)).then_some(0)
+    }
+
+    /// Whether `function_id` is a lazy record of this chunk whose body has
+    /// not been compiled.
+    #[must_use]
+    pub(crate) fn lazy_pending(&self, function_id: u32) -> bool {
+        function_id
+            .checked_sub(self.function_base)
+            .is_some_and(|local| self.payload.executable.lazy_pending(local))
+    }
+
+    /// Forward lazy record `function_id` to the chunk at `body_base` that
+    /// holds its compiled body.
+    pub(crate) fn set_lazy_forward(&self, function_id: u32, body_base: u32) {
+        if let Some(local) = function_id.checked_sub(self.function_base) {
+            self.payload.executable.set_forward(local, body_base);
+        }
+    }
+
+    /// Source texts of this chunk.
+    #[must_use]
+    pub(crate) fn sources(&self) -> &crate::source_registry::SourceRegistry {
+        &self.payload.sources
+    }
+
+    /// This chunk's admitted bytecode module.
+    #[must_use]
+    pub(crate) fn linked_module(&self) -> &otter_bytecode::BytecodeModule {
+        &self.payload.module
     }
 
     /// Synthetic bytecode module name.
@@ -327,10 +370,21 @@ impl ExecutionContext {
         let module = &self.payload.module;
         let function = module.functions.get(local)?;
         let (start, end) = function.source_text_range?;
-        module
-            .function_source
-            .as_deref()?
-            .get(start as usize..end as usize)
+        let source = match module.function_source.as_deref() {
+            Some(source) => source,
+            // A lazily compiled body indexes the text of the chunk that
+            // created it, which its source registry shares.
+            None if self.payload.executable.alias().is_some() => {
+                let url = if function.module_url.is_empty() {
+                    module.module.as_str()
+                } else {
+                    function.module_url.as_str()
+                };
+                self.payload.sources.get(url)?.text()
+            }
+            None => return None,
+        };
+        source.get(start as usize..end as usize)
     }
 
     /// Executable lookup by global VM function id in this context's chunk.
@@ -773,6 +827,7 @@ mod tests {
                 primordial_iteration: false,
                 ignores_this: false,
                 asm_module: false,
+                lazy: None,
                 code: code.into(),
                 spans: otter_bytecode::SpanTable::default(),
                 handlers: Vec::new(),
@@ -782,6 +837,7 @@ mod tests {
             constants,
             module_resolutions: Vec::new(),
             module_inits: Vec::new(),
+            lazy_environments: Vec::new(),
             function_source: None,
         }
     }

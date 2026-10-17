@@ -57,6 +57,7 @@ pub fn minimal_bytecode_module(name: &str) -> otter_bytecode::BytecodeModule {
         constants: Vec::new(),
         module_resolutions: Vec::new(),
         module_inits: Vec::new(),
+        lazy_environments: Vec::new(),
         function_source: None,
     }
 }

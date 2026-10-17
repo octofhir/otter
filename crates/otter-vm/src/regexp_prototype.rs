@@ -2457,6 +2457,7 @@ mod tests {
                     primordial_iteration: false,
                     ignores_this: false,
                     asm_module: false,
+                    lazy: None,
                     code: vec![Instruction {
                         pc: 0,
                         op: otter_bytecode::Op::ReturnUndefined,
@@ -2474,6 +2475,7 @@ mod tests {
                 constants: Vec::new(),
                 module_resolutions: Vec::new(),
                 module_inits: Vec::new(),
+                lazy_environments: Vec::new(),
                 function_source: None,
             },
             crate::source_registry::SourceRegistry::default(),

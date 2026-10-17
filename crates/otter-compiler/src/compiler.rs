@@ -71,6 +71,19 @@ pub(crate) struct Compiler {
     /// One-shot byte range for the next compiled function's §20.2.3.5
     /// [[SourceText]] when it differs from the function-body span.
     pub(crate) next_fn_source_text_span: Option<(u32, u32)>,
+    /// One-shot: the next compiled function is a method whose body may be
+    /// compiled on first call — its form and the source range of its
+    /// parameters and body.
+    pub(crate) next_fn_lazy_method: Option<(otter_bytecode::LazyForm, (u32, u32))>,
+    /// One-shot: the next compiled function is a named declaration.
+    pub(crate) next_fn_declaration: bool,
+    /// One-shot: the next compiled function runs as soon as it is created
+    /// (an immediately called or parenthesized function expression), so
+    /// its body is compiled now.
+    pub(crate) next_fn_eager: bool,
+    /// `Some` when functions of this unit compile their bodies on first
+    /// call: the source facts their body compile parses with.
+    pub(crate) lazy_unit: Option<LazyUnit>,
     /// Stack of private-name class levels — one per enclosing class
     /// declaration, innermost last. The value is a per-unit class id.
     pub(crate) private_namespaces: Vec<u32>,
@@ -116,6 +129,19 @@ pub(crate) struct Compiler {
     pub(crate) pending_class_hint_sites: Vec<PendingClassHintSite>,
     /// Capture facts of the unit being compiled.
     pub(crate) capture: Rc<crate::capture::CaptureFacts>,
+}
+
+/// How a compile unit's source parses, for the body compiles of its lazily
+/// compiled functions.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct LazyUnit {
+    pub(crate) module_goal: bool,
+    pub(crate) typescript: bool,
+    pub(crate) jsx: bool,
+    /// Functions created by the unit's top level compile now; deeper ones
+    /// stay lazy. Only the differential tests ask for it: it is the eager
+    /// reference a lazily compiled top-level function is checked against.
+    pub(crate) top_level_eager: bool,
 }
 
 /// One class-annotated property site, still holding the interned annotation
@@ -236,6 +262,10 @@ impl Compiler {
             next_fn_is_method: false,
             next_fn_static_home: false,
             next_fn_source_text_span: None,
+            next_fn_lazy_method: None,
+            next_fn_declaration: false,
+            next_fn_eager: false,
+            lazy_unit: None,
             private_namespaces: Vec::new(),
             class_private_names: Vec::new(),
             class_private_instance_methods: Vec::new(),
@@ -286,6 +316,19 @@ impl Compiler {
                 pc,
                 name,
             }));
+    }
+
+    /// `(async, generator, derived constructor)` of the innermost enclosing
+    /// non-arrow function: what `await`, `yield`, `this` and `super()` mean
+    /// inside an arrow created here.
+    pub(crate) fn enclosing_function_kind(&self) -> (bool, bool, bool) {
+        self.stack
+            .iter()
+            .rev()
+            .find(|frame| !frame.is_arrow)
+            .map_or((false, false, false), |frame| {
+                (frame.is_async, frame.is_generator, frame.is_derived_ctor)
+            })
     }
 
     pub(crate) fn top_mut(&mut self) -> &mut FunctionContext {

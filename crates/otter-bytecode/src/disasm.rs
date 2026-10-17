@@ -244,6 +244,7 @@ const fn slot_kind_name(kind: SlotKind) -> &'static str {
         SlotKind::CatchParam { simple: true } => "catch_param(simple)",
         SlotKind::WithObject => "with_object",
         SlotKind::PrivateName => "private_name",
+        SlotKind::PrivateMethod => "private_method",
         SlotKind::PrivateBrand => "private_brand",
         SlotKind::SuperHome => "super_home",
         SlotKind::SuperStaticHome => "super_static_home",
@@ -284,6 +285,7 @@ mod tests {
             constants: vec![],
             module_resolutions: Vec::new(),
             module_inits: Vec::new(),
+            lazy_environments: Vec::new(),
             function_source: None,
         };
         let text = disassemble(&module);
@@ -413,6 +415,7 @@ mod tests {
             constants: vec![],
             module_resolutions: Vec::new(),
             module_inits: Vec::new(),
+            lazy_environments: Vec::new(),
             function_source: None,
         };
         let text = disassemble(&module);
@@ -467,6 +470,7 @@ mod tests {
             constants: vec![],
             module_resolutions: Vec::new(),
             module_inits: Vec::new(),
+            lazy_environments: Vec::new(),
             function_source: None,
         };
 

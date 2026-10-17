@@ -38,6 +38,10 @@
 //!   instruction cells and their monotonic material-transition epoch.
 //! - Execution feedback belongs to one isolate. Snapshot copies preserve
 //!   admitted code while creating empty feedback through `executable_snapshot`.
+//! - A lazy record's slot holds a placeholder body until its first call
+//!   compiles the real one into a chunk of its own; the slot's forward then
+//!   names that chunk, whose function 0 answers to the record's id
+//!   ([`ExecutableModule::alias`]) and builds its CodeBlock under it.
 //! - Each escapable CodeBlock retains its own physical-body lease. The function
 //!   pointer table and independently escapable source-work cell own separate
 //!   leases; no snapshot/JIT handle depends on a donor chunk's aggregate charge.
@@ -73,6 +77,13 @@ pub(crate) struct ExecutableModule {
     /// First dense property-IC site id of each function.
     ic_bases: Box<[u32]>,
     property_ic_site_end: u32,
+    /// For each function linked as a lazy record, the base id of the chunk
+    /// its first call compiled the body into. Empty when the module has no
+    /// lazy record.
+    forwards: Box<[OnceLock<u32>]>,
+    /// In a chunk holding one lazily compiled body: the id the function has
+    /// in the chunk that created it. Function 0 answers to that id too.
+    alias: Option<u32>,
     /// The account every built block's lease is charged to.
     account: ResourceAccount,
     _table_lease: ResourceLease,
@@ -148,14 +159,69 @@ impl ExecutableModule {
                 base
             })
             .collect();
+        let forwards = if bytecode
+            .functions
+            .iter()
+            .any(|function| function.lazy.is_some())
+        {
+            (0..count).map(|_| OnceLock::new()).collect()
+        } else {
+            Box::default()
+        };
         Ok(Self {
             functions: (0..count).map(|_| OnceLock::new()).collect(),
             bytecode,
             ic_bases,
             property_ic_site_end: next,
+            forwards,
+            alias: None,
             account: account.clone(),
             _table_lease: table_lease,
         })
+    }
+
+    /// Make function 0 answer to `alias`, the id its lazy record has in the
+    /// chunk that created it.
+    pub(crate) fn with_alias(mut self, alias: u32) -> Self {
+        self.alias = Some(alias);
+        self
+    }
+
+    /// The id function 0 also answers to, when this chunk holds a lazily
+    /// compiled body.
+    #[must_use]
+    pub(crate) const fn alias(&self) -> Option<u32> {
+        self.alias
+    }
+
+    /// Whether function `local_index` is a lazy record whose body has not
+    /// been compiled.
+    #[must_use]
+    pub(crate) fn lazy_pending(&self, local_index: u32) -> bool {
+        self.forwards
+            .get(local_index as usize)
+            .is_some_and(|forward| forward.get().is_none())
+            && self
+                .bytecode
+                .functions
+                .get(local_index as usize)
+                .is_some_and(|function| function.lazy.is_some())
+    }
+
+    /// Base id of the chunk holding the compiled body of lazy record
+    /// `local_index`, once its first call compiled it.
+    #[inline]
+    #[must_use]
+    pub(crate) fn forward(&self, local_index: u32) -> Option<u32> {
+        self.forwards.get(local_index as usize)?.get().copied()
+    }
+
+    /// Record where the body of lazy record `local_index` was compiled.
+    /// The first recording wins; a later one is ignored.
+    pub(crate) fn set_forward(&self, local_index: u32, base: u32) {
+        if let Some(forward) = self.forwards.get(local_index as usize) {
+            let _ = forward.set(base);
+        }
     }
 
     /// Function-table lookup by chunk-local function index, building the
@@ -180,7 +246,7 @@ impl ExecutableModule {
         let index = local_index as usize;
         let proof = self.bytecode.verified().function(index).ok()?;
         let mut site = self.ic_bases[index];
-        let block = CodeBlock::from_verified_bytecode(
+        let mut block = CodeBlock::from_verified_bytecode(
             &self.bytecode.functions[index],
             proof,
             &self.bytecode.module,
@@ -188,6 +254,12 @@ impl ExecutableModule {
             &self.account,
         )
         .ok()?;
+        // A lazily compiled body runs under the id of the record it replaces.
+        if index == 0
+            && let Some(alias) = self.alias
+        {
+            block.id = alias;
+        }
         Some(slot.get_or_init(|| Arc::new(block)))
     }
 
@@ -1764,6 +1836,7 @@ mod tests {
                 .collect(),
             module_resolutions: Vec::new(),
             module_inits: Vec::new(),
+            lazy_environments: Vec::new(),
             function_source: None,
         }
     }

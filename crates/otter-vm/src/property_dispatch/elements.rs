@@ -238,10 +238,14 @@ impl Interpreter {
             {
                 crate::array::get(arr, &self.gc_heap, index)
             } else {
+                let mut digits = itoa::Buffer::new();
                 let key = if let Some(symbol) = idx_value.as_symbol(&self.gc_heap) {
                     VmPropertyKey::Symbol(symbol)
                 } else if let Some(key) = idx_value.as_string(&self.gc_heap) {
                     VmPropertyKey::OwnedString(key.to_key_spelling(&self.gc_heap))
+                } else if let Some(index) = idx_value.as_i32() {
+                    // An integer key is spelled on the stack, not allocated.
+                    VmPropertyKey::Atom(self.atomized_key(digits.format(index)))
                 } else if let Some(number) = idx_value.as_number() {
                     VmPropertyKey::OwnedString(number.to_display_string())
                 } else {

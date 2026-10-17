@@ -158,7 +158,21 @@ impl Interpreter {
             if stack.has_pending_call() {
                 return Ok(DispatchOutcome::Call);
             }
-            if stack.is_at_floor(floor) {
+            // The top frame is resolved once per instruction. It keeps its
+            // address while it is live, so every handler below reads and
+            // writes it through this pointer, before and after any call that
+            // pushes frames above it.
+            let (top_ptr, depth) = stack.top_with_depth();
+            #[allow(unused_macros)]
+            macro_rules! top_frame {
+                () => {
+                    // SAFETY: `top_ptr` is this tick's live top frame; each
+                    // use is a fresh, short borrow at the same point the
+                    // handler used to index the stack.
+                    unsafe { &mut *top_ptr }
+                };
+            }
+            if depth <= floor.depth() {
                 // Defensive: unwind paths (throw / finally) can
                 // pop the last frame without writing back to a
                 // caller register. Surface `undefined` so
@@ -176,12 +190,9 @@ impl Interpreter {
                     .unwrap_or_else(Value::undefined);
                 return Ok(DispatchOutcome::Returned(result));
             }
-            let depth = stack.len();
             let top_idx = depth - 1;
-            // SAFETY: the `is_empty()` guard above proves a live top frame this
-            // tick; one unchecked read serves both fields.
             let (function_id, pc) = {
-                let top = unsafe { stack.top_unchecked() };
+                let top = top_frame!();
                 (top.function_id, top.pc)
             };
             *tick_pc = pc;
@@ -302,7 +313,7 @@ impl Interpreter {
             match op {
                 Op::ReturnValue | Op::Return => {
                     let src = instr.reg(0);
-                    let value = stack[top_idx]
+                    let value = (*top_frame!())
                         .registers
                         .get(src as usize)
                         .cloned()
@@ -326,7 +337,7 @@ impl Interpreter {
                     let (value_reg, ctx_reg) = (instr.reg(0), instr.reg(1));
                     let coord = otter_bytecode::ContextCoord::from_imm32(instr.imm(2))
                         .ok_or(VmError::InvalidOperand)?;
-                    let frame = &stack[top_idx];
+                    let frame = &(*top_frame!());
                     let value = *read_register(frame, value_reg)?;
                     let ctx = *read_register(frame, ctx_reg)?;
                     let derived_this = self.derived_this_slot_value(ctx, coord)?;
@@ -403,7 +414,7 @@ impl Interpreter {
                             function
                                 .register(instr, 1)
                                 .and_then(|register| {
-                                    stack[top_idx].registers.get(register as usize).copied()
+                                    (*top_frame!()).registers.get(register as usize).copied()
                                 })
                                 .and_then(|callee| self.native_call_target(callee))
                         })
@@ -437,7 +448,7 @@ impl Interpreter {
                 Op::CallForwardArguments => {
                     let native_target = jit_installed
                         .then(|| {
-                            let frame = &stack[top_idx];
+                            let frame = &(*top_frame!());
                             let operand = |index| {
                                 function.register(instr, index).and_then(|register| {
                                     frame.registers.get(register as usize).copied()
@@ -610,7 +621,7 @@ impl Interpreter {
                             function
                                 .register(instr, 1)
                                 .and_then(|register| {
-                                    stack[top_idx].registers.get(register as usize).copied()
+                                    (*top_frame!()).registers.get(register as usize).copied()
                                 })
                                 .and_then(|callee| self.native_call_target(callee))
                         })
@@ -637,7 +648,7 @@ impl Interpreter {
                             function
                                 .register(instr, 1)
                                 .and_then(|register| {
-                                    stack[top_idx].registers.get(register as usize).copied()
+                                    (*top_frame!()).registers.get(register as usize).copied()
                                 })
                                 .and_then(|callee| self.native_construct_target(callee))
                         })
@@ -704,7 +715,7 @@ impl Interpreter {
                             function
                                 .register(instr, 1)
                                 .and_then(|register| {
-                                    stack[top_idx].registers.get(register as usize).copied()
+                                    (*top_frame!()).registers.get(register as usize).copied()
                                 })
                                 .and_then(|callee| {
                                     callee
@@ -770,7 +781,7 @@ impl Interpreter {
                             function
                                 .register(instr, 1)
                                 .and_then(|register| {
-                                    stack[top_idx].registers.get(register as usize).copied()
+                                    (*top_frame!()).registers.get(register as usize).copied()
                                 })
                                 .and_then(|callee| {
                                     callee
@@ -782,7 +793,7 @@ impl Interpreter {
                     let direct_construct_fid = if jit_installed {
                         register_operand(function.operand(instr, 1))
                             .ok()
-                            .and_then(|register| stack[top_idx].registers.get(register as usize))
+                            .and_then(|register| (*top_frame!()).registers.get(register as usize))
                             .copied()
                             .and_then(|value| {
                                 value
@@ -833,7 +844,7 @@ impl Interpreter {
                             function
                                 .register(instr, 1)
                                 .and_then(|register| {
-                                    stack[top_idx].registers.get(register as usize).copied()
+                                    (*top_frame!()).registers.get(register as usize).copied()
                                 })
                                 .and_then(|callee| {
                                     callee
@@ -845,7 +856,7 @@ impl Interpreter {
                     let direct_construct_fid = if jit_installed {
                         register_operand(function.operand(instr, 1))
                             .ok()
-                            .and_then(|register| stack[top_idx].registers.get(register as usize))
+                            .and_then(|register| (*top_frame!()).registers.get(register as usize))
                             .copied()
                             .and_then(|value| {
                                 value
@@ -897,7 +908,7 @@ impl Interpreter {
                 }
                 Op::Throw => {
                     let src = instr.reg(0);
-                    let value = stack[top_idx]
+                    let value = (*top_frame!())
                         .registers
                         .get(src as usize)
                         .cloned()
@@ -924,11 +935,11 @@ impl Interpreter {
                 Op::Await => {
                     let dst = instr.reg(0);
                     let src = instr.reg(1);
-                    let awaited = *read_register(&stack[top_idx], src)?;
+                    let awaited = *read_register(&(*top_frame!()), src)?;
                     // A suspended async activation completes with its result
                     // promise, rooted across the await's allocations.
                     let result = self
-                        .frame_cold(&stack[top_idx])
+                        .frame_cold(&(*top_frame!()))
                         .and_then(|cold| cold.async_state.as_ref())
                         .map_or(Value::undefined(), |state| {
                             Value::promise(state.result_promise)
@@ -964,9 +975,9 @@ impl Interpreter {
                 // two destination registers without unwinding.
                 Op::YieldDelegate => {
                     let (kind_dst, value_dst, src) = instr.reg3();
-                    let yielded = *read_register(&stack[top_idx], src)?;
+                    let yielded = *read_register(&(*top_frame!()), src)?;
                     let owner = self
-                        .frame_generator_owner(&stack[top_idx])
+                        .frame_generator_owner(&(*top_frame!()))
                         .ok_or(VmError::TypeMismatch)?;
                     let frame = stack.last_mut().ok_or_else(|| VmError::InvalidOperand)?;
                     frame.advance_pc()?;
@@ -1011,9 +1022,9 @@ impl Interpreter {
                 }
                 Op::Yield => {
                     let (kind_dst, value_dst, src) = instr.reg3();
-                    let yielded = *read_register(&stack[top_idx], src)?;
+                    let yielded = *read_register(&(*top_frame!()), src)?;
                     let owner = self
-                        .frame_generator_owner(&stack[top_idx])
+                        .frame_generator_owner(&(*top_frame!()))
                         .ok_or(VmError::TypeMismatch)?;
                     let frame = stack.last_mut().ok_or_else(|| VmError::InvalidOperand)?;
                     frame.advance_pc()?;
@@ -1050,9 +1061,9 @@ impl Interpreter {
                 }
                 Op::GeneratorStart => {
                     let owner = self
-                        .frame_generator_owner(&stack[top_idx])
+                        .frame_generator_owner(&(*top_frame!()))
                         .ok_or(VmError::TypeMismatch)?;
-                    let callee = stack[top_idx].self_value;
+                    let callee = (*top_frame!()).self_value;
                     let frame = stack.last_mut().ok_or_else(|| VmError::InvalidOperand)?;
                     frame.advance_pc()?;
                     let popped = stack.pop().expect("frame present");
@@ -1109,10 +1120,10 @@ impl Interpreter {
                     // resume path — where `src` stays non-primitive — intact.
                     let dst = instr.reg(0);
                     let src = instr.reg(1);
-                    let recv = *read_register(&stack[top_idx], src)?;
+                    let recv = *read_register(&(*top_frame!()), src)?;
                     if recv.is_primitive() {
-                        write_register(&mut stack[top_idx], dst, recv)?;
-                        stack[top_idx].advance_pc()?;
+                        write_register(&mut (*top_frame!()), dst, recv)?;
+                        (*top_frame!()).advance_pc()?;
                         continue;
                     }
                     (match self.drive_to_primitive(stack, context, function.operand_view(instr)) {
@@ -1163,10 +1174,10 @@ impl Interpreter {
                     // a handler's IteratorClose leaves it alone.
                     let iter_reg = instr.reg(2);
                     let cursor =
-                        crate::iterator_record::RecordCursor::read(&stack[top_idx], iter_reg)?;
+                        crate::iterator_record::RecordCursor::read(&(*top_frame!()), iter_reg)?;
                     if cursor != crate::iterator_record::RecordCursor::Generic {
                         if let crate::iterator_record::RecordCursor::Fast(_) = cursor {
-                            let array = *read_register(&stack[top_idx], iter_reg)?;
+                            let array = *read_register(&(*top_frame!()), iter_reg)?;
                             self.record_element_family_feedback(
                                 function,
                                 instr.instruction_pc,
@@ -1181,13 +1192,13 @@ impl Interpreter {
                                     return Ok(DispatchOutcome::Fatal(error));
                                 }
                             };
-                        let frame = &mut stack[top_idx];
+                        let frame = &mut (*top_frame!());
                         write_register(frame, instr.reg(0), value)?;
                         write_register(frame, instr.reg(1), Value::boolean(done))?;
                         frame.advance_pc()?;
                         continue;
                     }
-                    let iterator = *read_register(&stack[top_idx], iter_reg)?;
+                    let iterator = *read_register(&(*top_frame!()), iter_reg)?;
                     let operands = function.operand_view(instr);
                     match self.drive_iterator_next(stack, context, operands) {
                         Ok(true) => continue,
@@ -1204,7 +1215,7 @@ impl Interpreter {
                     }
                     let value_dst = instr.reg(0);
                     let done_dst = instr.reg(1);
-                    let frame = &mut stack[top_idx];
+                    let frame = &mut (*top_frame!());
                     if let Err(e) =
                         self.run_iterator_next_regs(frame, value_dst, done_dst, iter_reg)
                     {
@@ -1222,7 +1233,7 @@ impl Interpreter {
                             return Ok(DispatchOutcome::Fatal(error));
                         }
                     }
-                    stack[top_idx].advance_pc()?;
+                    (*top_frame!()).advance_pc()?;
                     continue;
                 }
                 // §7.4.11 IteratorClose for a throw completion: the handler
@@ -1235,14 +1246,14 @@ impl Interpreter {
                             return Ok(DispatchOutcome::Fatal(error));
                         }
                     }
-                    stack[top_idx].advance_pc()?;
+                    (*top_frame!()).advance_pc()?;
                     continue;
                 }
                 Op::AsyncIteratorReturn => {
                     let result_reg = instr.reg(0);
                     let called_reg = instr.reg(1);
                     let iter_reg = instr.reg(2);
-                    let iterator = *read_register(&stack[top_idx], iter_reg)?;
+                    let iterator = *read_register(&(*top_frame!()), iter_reg)?;
                     // §7.4.11 steps 3-5: an iterator without a `return`
                     // is already closed, and the caller skips the await.
                     let outcome = match self.async_iterator_return_call(stack, context, iterator) {
@@ -1252,7 +1263,7 @@ impl Interpreter {
                             return Ok(DispatchOutcome::Fatal(error));
                         }
                     };
-                    let frame = &mut stack[top_idx];
+                    let frame = &mut (*top_frame!());
                     match outcome {
                         Some(result) => {
                             write_register(frame, result_reg, result)?;
@@ -1268,7 +1279,7 @@ impl Interpreter {
                 }
                 Op::CheckIteratorResult => {
                     let value_reg = instr.reg(0);
-                    let value = *read_register(&stack[top_idx], value_reg)?;
+                    let value = *read_register(&(*top_frame!()), value_reg)?;
                     // §7.4.11 step 8 — the awaited `return` result is an
                     // Object or the close is a TypeError.
                     if !value.is_object() && !value.is_proxy() {
@@ -1276,7 +1287,7 @@ impl Interpreter {
                             ("iterator `return` did not yield an object".to_string()).into(),
                         ));
                     }
-                    stack[top_idx].advance_pc()?;
+                    (*top_frame!()).advance_pc()?;
                     continue;
                 }
                 // §10.1.8 [[Get]] — when the resolved property is an
@@ -1353,7 +1364,7 @@ impl Interpreter {
                     let operands = function.operand_view(instr);
                     if jit_installed
                         && let Some(recv_reg) = function.register(instr, 1)
-                        && let Ok(recv) = read_register(&stack[top_idx], recv_reg)
+                        && let Ok(recv) = read_register(&(*top_frame!()), recv_reg)
                     {
                         let recv = *recv;
                         self.record_element_family_feedback(function, instr.instruction_pc, recv);
@@ -1387,7 +1398,7 @@ impl Interpreter {
                         .property_atom(name_idx)
                         .ok_or_else(|| VmError::InvalidOperand)?
                         .name();
-                    let home = *read_register(&stack[top_idx], home_reg)?;
+                    let home = *read_register(&(*top_frame!()), home_reg)?;
                     (match self.run_load_super_property(
                         context,
                         stack,
@@ -1406,8 +1417,8 @@ impl Interpreter {
                 }
                 Op::LoadSuperElement => {
                     let (dst, home_reg, key_reg) = instr.reg3();
-                    let home = *read_register(&stack[top_idx], home_reg)?;
-                    let key_raw = *read_register(&stack[top_idx], key_reg)?;
+                    let home = *read_register(&(*top_frame!()), home_reg)?;
+                    let key_raw = *read_register(&(*top_frame!()), key_reg)?;
                     (match self.run_load_super_property(
                         context,
                         stack,
@@ -1432,9 +1443,9 @@ impl Interpreter {
                         .property_atom(name_idx)
                         .ok_or_else(|| VmError::InvalidOperand)?
                         .name();
-                    let home = *read_register(&stack[top_idx], home_reg)?;
-                    let value = *read_register(&stack[top_idx], value_reg)?;
-                    let strict = context.function_is_strict(stack[top_idx].function_id);
+                    let home = *read_register(&(*top_frame!()), home_reg)?;
+                    let value = *read_register(&(*top_frame!()), value_reg)?;
+                    let strict = context.function_is_strict((*top_frame!()).function_id);
                     (match self.run_store_super_property(
                         context,
                         stack,
@@ -1454,10 +1465,10 @@ impl Interpreter {
                 }
                 Op::SetSuperElement => {
                     let (home_reg, key_reg, value_reg) = instr.reg3();
-                    let home = *read_register(&stack[top_idx], home_reg)?;
-                    let key_raw = *read_register(&stack[top_idx], key_reg)?;
-                    let value = *read_register(&stack[top_idx], value_reg)?;
-                    let strict = context.function_is_strict(stack[top_idx].function_id);
+                    let home = *read_register(&(*top_frame!()), home_reg)?;
+                    let key_raw = *read_register(&(*top_frame!()), key_reg)?;
+                    let value = *read_register(&(*top_frame!()), value_reg)?;
+                    let strict = context.function_is_strict((*top_frame!()).function_id);
                     (match self.run_store_super_property(
                         context,
                         stack,
@@ -1558,12 +1569,12 @@ impl Interpreter {
                     let idx_reg = instr.reg(1);
                     let src_reg = instr.reg(2);
                     if let Some(feedback) = feedback {
-                        let value = *read_register(&stack[top_idx], src_reg)?;
+                        let value = *read_register(&(*top_frame!()), src_reg)?;
                         feedback.record_arith(value, value);
                     }
                     if jit_installed {
-                        let recv = *read_register(&stack[top_idx], recv_reg)?;
-                        let key = *read_register(&stack[top_idx], idx_reg)?;
+                        let recv = *read_register(&(*top_frame!()), recv_reg)?;
+                        let key = *read_register(&(*top_frame!()), idx_reg)?;
                         self.record_element_family_feedback(function, instr.instruction_pc, recv);
                         self.record_element_bounds_feedback(
                             function,
@@ -1576,7 +1587,7 @@ impl Interpreter {
                     // view, then end the frame borrow before `[[Set]]` can
                     // allocate, collect, or synchronously re-enter JavaScript.
                     let (function_id, receiver, key, value) = {
-                        let frame = ActiveFrameRef::from_frame(&stack[top_idx]);
+                        let frame = ActiveFrameRef::from_frame(&(*top_frame!()));
                         (
                             frame.function_id(),
                             frame.read(recv_reg)?,
@@ -1601,13 +1612,13 @@ impl Interpreter {
                     });
                     // The synchronous helper completed the full effect (or
                     // threw), so publish exactly one resume increment.
-                    stack[top_idx].advance_pc()?;
+                    (*top_frame!()).advance_pc()?;
                     continue;
                 }
                 Op::Instanceof => {
                     let (dst, lhs, rhs) = instr.reg3();
-                    let lhs = *read_register(&stack[top_idx], lhs)?;
-                    let rhs = *read_register(&stack[top_idx], rhs)?;
+                    let lhs = *read_register(&(*top_frame!()), lhs)?;
+                    let rhs = *read_register(&(*top_frame!()), rhs)?;
                     let result = match self.object_protocol_value(
                         stack,
                         context,
@@ -1621,7 +1632,7 @@ impl Interpreter {
                             return Ok(DispatchOutcome::Fatal(error));
                         }
                     };
-                    let frame = &mut stack[top_idx];
+                    let frame = &mut (*top_frame!());
                     write_register(frame, dst, result)?;
                     frame.advance_pc()?;
                     continue;
@@ -1631,8 +1642,8 @@ impl Interpreter {
                 // traps when the receiver is a Proxy.
                 Op::HasProperty => {
                     let (dst, lhs, rhs) = instr.reg3();
-                    let lhs = *read_register(&stack[top_idx], lhs)?;
-                    let rhs = *read_register(&stack[top_idx], rhs)?;
+                    let lhs = *read_register(&(*top_frame!()), lhs)?;
+                    let rhs = *read_register(&(*top_frame!()), rhs)?;
                     let result = match self.object_protocol_value(
                         stack,
                         context,
@@ -1646,7 +1657,7 @@ impl Interpreter {
                             return Ok(DispatchOutcome::Fatal(error));
                         }
                     };
-                    let frame = &mut stack[top_idx];
+                    let frame = &mut (*top_frame!());
                     write_register(frame, dst, result)?;
                     frame.advance_pc()?;
                     continue;
@@ -1668,12 +1679,12 @@ impl Interpreter {
                     let key = context
                         .property_atom(name_idx)
                         .ok_or_else(|| VmError::InvalidOperand)?;
-                    let strict = context.function_is_strict(stack[top_idx].function_id);
+                    let strict = context.function_is_strict((*top_frame!()).function_id);
                     // `delete` has an object fast path that bypasses the
                     // §28.3 MOP funnel; trigger deferred-namespace
                     // evaluation here (named delete is never symbol-like
                     // unless the key is "then").
-                    let receiver = *read_register(&stack[top_idx], obj_reg)?;
+                    let receiver = *read_register(&(*top_frame!()), obj_reg)?;
                     if receiver.as_object().is_some_and(|o| {
                         crate::object::deferred_namespace_target(o, &self.gc_heap).is_some()
                     }) {
@@ -1690,7 +1701,7 @@ impl Interpreter {
                             }
                         });
                     }
-                    let frame = &mut stack[top_idx];
+                    let frame = &mut (*top_frame!());
                     self.run_delete_property_reg(context, frame, dst, obj_reg, key, strict)?;
                     continue;
                 }
@@ -1706,12 +1717,12 @@ impl Interpreter {
                         continue;
                     }
                     let (dst, obj_reg, idx_reg) = instr.reg3();
-                    let strict = context.function_is_strict(stack[top_idx].function_id);
-                    let receiver = *read_register(&stack[top_idx], obj_reg)?;
+                    let strict = context.function_is_strict((*top_frame!()).function_id);
+                    let receiver = *read_register(&(*top_frame!()), obj_reg)?;
                     if receiver.as_object().is_some_and(|o| {
                         crate::object::deferred_namespace_target(o, &self.gc_heap).is_some()
                     }) {
-                        let key_val = *read_register(&stack[top_idx], idx_reg)?;
+                        let key_val = *read_register(&(*top_frame!()), idx_reg)?;
                         let symbol_like = key_val.as_symbol(&self.gc_heap).is_some()
                             || key_val
                                 .as_string(&self.gc_heap)
@@ -1747,7 +1758,7 @@ impl Interpreter {
                 Op::GetPrototype => {
                     let dst = instr.reg(0);
                     let src = instr.reg(1);
-                    let source = *read_register(&stack[top_idx], src)?;
+                    let source = *read_register(&(*top_frame!()), src)?;
                     let result = match self.object_protocol_value(
                         stack,
                         context,
@@ -1761,7 +1772,7 @@ impl Interpreter {
                             return Ok(DispatchOutcome::Fatal(error));
                         }
                     };
-                    let frame = &mut stack[top_idx];
+                    let frame = &mut (*top_frame!());
                     write_register(frame, dst, result)?;
                     frame.advance_pc()?;
                     continue;
@@ -1769,8 +1780,8 @@ impl Interpreter {
                 Op::SetPrototype => {
                     let obj_reg = instr.reg(0);
                     let proto_reg = instr.reg(1);
-                    let object = *read_register(&stack[top_idx], obj_reg)?;
-                    let prototype = *read_register(&stack[top_idx], proto_reg)?;
+                    let object = *read_register(&(*top_frame!()), obj_reg)?;
+                    let prototype = *read_register(&(*top_frame!()), proto_reg)?;
                     match self.object_protocol_value(
                         stack,
                         context,
@@ -1784,7 +1795,7 @@ impl Interpreter {
                             return Ok(DispatchOutcome::Fatal(error));
                         }
                     };
-                    stack[top_idx].advance_pc()?;
+                    (*top_frame!()).advance_pc()?;
                     continue;
                 }
                 // §19.4.1 indirect eval — recursively dispatches a
@@ -1800,7 +1811,7 @@ impl Interpreter {
                 Op::LoadArgumentsLength | Op::LoadArgumentsElement => {
                     let dst = instr.reg(0);
                     let key = (op == Op::LoadArgumentsElement)
-                        .then(|| read_register(&stack[top_idx], instr.reg(1)).copied())
+                        .then(|| read_register(&(*top_frame!()), instr.reg(1)).copied())
                         .transpose()?;
                     let value = match self.read_frame_arguments(context, stack, top_idx, key) {
                         Ok(value) => value,
@@ -1809,8 +1820,8 @@ impl Interpreter {
                             return Ok(DispatchOutcome::Fatal(error));
                         }
                     };
-                    write_register(&mut stack[top_idx], dst, value)?;
-                    stack[top_idx].advance_pc()?;
+                    write_register(&mut (*top_frame!()), dst, value)?;
+                    (*top_frame!()).advance_pc()?;
                     continue;
                 }
                 Op::CollectArguments => {
@@ -1819,40 +1830,40 @@ impl Interpreter {
                     continue;
                 }
                 Op::Nop => {
-                    stack[top_idx].advance_pc()?;
+                    (*top_frame!()).advance_pc()?;
                     continue;
                 }
                 Op::LoadUndefined => {
                     let dst = instr.reg(0);
-                    let frame = &mut stack[top_idx];
+                    let frame = &mut (*top_frame!());
                     write_register(frame, dst, Value::undefined())?;
                     frame.advance_pc()?;
                     continue;
                 }
                 Op::LoadHole => {
                     let dst = instr.reg(0);
-                    let frame = &mut stack[top_idx];
+                    let frame = &mut (*top_frame!());
                     write_register(frame, dst, Value::hole())?;
                     frame.advance_pc()?;
                     continue;
                 }
                 Op::LoadTrue => {
                     let dst = instr.reg(0);
-                    let frame = &mut stack[top_idx];
+                    let frame = &mut (*top_frame!());
                     write_register(frame, dst, Value::boolean(true))?;
                     frame.advance_pc()?;
                     continue;
                 }
                 Op::LoadFalse => {
                     let dst = instr.reg(0);
-                    let frame = &mut stack[top_idx];
+                    let frame = &mut (*top_frame!());
                     write_register(frame, dst, Value::boolean(false))?;
                     frame.advance_pc()?;
                     continue;
                 }
                 Op::LoadNull => {
                     let dst = instr.reg(0);
-                    let frame = &mut stack[top_idx];
+                    let frame = &mut (*top_frame!());
                     write_register(frame, dst, Value::null())?;
                     frame.advance_pc()?;
                     continue;
@@ -1860,7 +1871,7 @@ impl Interpreter {
                 Op::LoadInt32 => {
                     let dst = instr.reg(0);
                     let imm = instr.imm(1);
-                    let frame = &mut stack[top_idx];
+                    let frame = &mut (*top_frame!());
                     write_register(frame, dst, Value::number(NumberValue::Smi(imm)))?;
                     frame.advance_pc()?;
                     continue;
@@ -1872,7 +1883,7 @@ impl Interpreter {
                         .number_constant_bits(idx)
                         .ok_or_else(|| VmError::InvalidOperand)?;
                     let value = NumberValue::from_f64(f64::from_bits(bits));
-                    let frame = &mut stack[top_idx];
+                    let frame = &mut (*top_frame!());
                     write_register(frame, dst, Value::number(value))?;
                     frame.advance_pc()?;
                     continue;
@@ -1881,7 +1892,7 @@ impl Interpreter {
                     let dst = instr.reg(0);
                     let idx = instr.const_word(1);
                     let value = self.load_string_constant_value(context, idx)?;
-                    let frame = &mut stack[top_idx];
+                    let frame = &mut (*top_frame!());
                     write_register(frame, dst, value)?;
                     frame.advance_pc()?;
                     continue;
@@ -1889,7 +1900,7 @@ impl Interpreter {
                 Op::LoadLength => {
                     let dst = instr.reg(0);
                     let src = instr.reg(1);
-                    let source = *read_register(&stack[top_idx], src)?;
+                    let source = *read_register(&(*top_frame!()), src)?;
                     let result = match self.scalar_value(
                         stack,
                         context,
@@ -1904,7 +1915,7 @@ impl Interpreter {
                             return Ok(DispatchOutcome::Fatal(error));
                         }
                     };
-                    let frame = &mut stack[top_idx];
+                    let frame = &mut (*top_frame!());
                     write_register(frame, dst, result)?;
                     frame.advance_pc()?;
                     continue;
@@ -1912,7 +1923,7 @@ impl Interpreter {
                 Op::LogicalNot => {
                     let dst = instr.reg(0);
                     let src = instr.reg(1);
-                    let frame = &mut stack[top_idx];
+                    let frame = &mut (*top_frame!());
                     let truthy = read_register(frame, src)?.to_boolean(&self.gc_heap);
                     write_register(frame, dst, Value::boolean(!truthy))?;
                     frame.advance_pc()?;
@@ -1921,7 +1932,7 @@ impl Interpreter {
                 Op::ToBoolean => {
                     let dst = instr.reg(0);
                     let src = instr.reg(1);
-                    let frame = &mut stack[top_idx];
+                    let frame = &mut (*top_frame!());
                     let truthy = read_register(frame, src)?.to_boolean(&self.gc_heap);
                     write_register(frame, dst, Value::boolean(truthy))?;
                     frame.advance_pc()?;
@@ -1929,14 +1940,14 @@ impl Interpreter {
                 }
                 Op::GetStringIndex => {
                     let (dst, recv, idx) = instr.reg3();
-                    let frame = &mut stack[top_idx];
+                    let frame = &mut (*top_frame!());
                     self.run_get_string_index_regs(frame, dst, recv, idx)?;
                     continue;
                 }
                 Op::TypeOf => {
                     let dst = instr.reg(0);
                     let src = instr.reg(1);
-                    let source = *read_register(&stack[top_idx], src)?;
+                    let source = *read_register(&(*top_frame!()), src)?;
                     let result = match self.scalar_value(
                         stack,
                         context,
@@ -1951,7 +1962,7 @@ impl Interpreter {
                             return Ok(DispatchOutcome::Fatal(error));
                         }
                     };
-                    let frame = &mut stack[top_idx];
+                    let frame = &mut (*top_frame!());
                     write_register(frame, dst, result)?;
                     frame.advance_pc()?;
                     continue;
@@ -1963,7 +1974,7 @@ impl Interpreter {
                         .imm32(instr, 2)
                         .and_then(otter_bytecode::TypeOfTest::decode)
                         .ok_or(VmError::InvalidOperand)?;
-                    let frame = &mut stack[top_idx];
+                    let frame = &mut (*top_frame!());
                     let kind = read_register(frame, src)?.typeof_kind_with_heap(&self.gc_heap);
                     write_register(
                         frame,
@@ -1975,14 +1986,14 @@ impl Interpreter {
                 }
                 Op::LoadThis => {
                     let dst = instr.reg(0);
-                    let mut frame = ActiveFrameMut::from_frame(&mut stack[top_idx]);
+                    let mut frame = ActiveFrameMut::from_frame(&mut (*top_frame!()));
                     self.frame_load_this(&mut frame, dst)?;
                     frame.advance_pc()?;
                     continue;
                 }
                 Op::LoadNewTarget => {
                     let dst = instr.reg(0);
-                    let new_target = stack[top_idx].new_target();
+                    let new_target = (*top_frame!()).new_target();
                     let result = match self.scalar_value(
                         stack,
                         context,
@@ -1997,7 +2008,7 @@ impl Interpreter {
                             return Ok(DispatchOutcome::Fatal(error));
                         }
                     };
-                    let frame = &mut stack[top_idx];
+                    let frame = &mut (*top_frame!());
                     write_register(frame, dst, result)?;
                     frame.advance_pc()?;
                     continue;
@@ -2028,27 +2039,27 @@ impl Interpreter {
                 Op::LoadRegExp => {
                     let dst = instr.reg(0);
                     let idx = instr.const_word(1);
-                    let frame = &mut stack[top_idx];
+                    let frame = &mut (*top_frame!());
                     self.run_load_regexp_reg(context, frame, dst, idx)?;
                     continue;
                 }
                 Op::LoadBigInt => {
                     let dst = instr.reg(0);
                     let idx = instr.const_word(1);
-                    let frame = &mut stack[top_idx];
+                    let frame = &mut (*top_frame!());
                     self.run_load_bigint_reg(context, frame, dst, idx)?;
                     continue;
                 }
                 Op::LoadClosureContext => {
                     let dst = instr.reg(0);
-                    let mut frame = ActiveFrameMut::from_frame(&mut stack[top_idx]);
+                    let mut frame = ActiveFrameMut::from_frame(&mut (*top_frame!()));
                     self.frame_load_closure_context(&mut frame, dst)?;
                     frame.advance_pc()?;
                     continue;
                 }
                 Op::LoadSelf => {
                     let dst = instr.reg(0);
-                    let mut frame = ActiveFrameMut::from_frame(&mut stack[top_idx]);
+                    let mut frame = ActiveFrameMut::from_frame(&mut (*top_frame!()));
                     self.frame_load_self(&mut frame, dst)?;
                     frame.advance_pc()?;
                     continue;
@@ -2056,14 +2067,14 @@ impl Interpreter {
                 Op::CreateContext => {
                     let (dst, parent) = (instr.reg(0), instr.reg(1));
                     let scope = instr.imm(2) as u32;
-                    let mut frame = ActiveFrameMut::from_frame(&mut stack[top_idx]);
+                    let mut frame = ActiveFrameMut::from_frame(&mut (*top_frame!()));
                     self.frame_create_context(context, &mut frame, dst, parent, scope)?;
                     frame.advance_pc()?;
                     continue;
                 }
                 Op::CopyContext => {
                     let (dst, src) = (instr.reg(0), instr.reg(1));
-                    let mut frame = ActiveFrameMut::from_frame(&mut stack[top_idx]);
+                    let mut frame = ActiveFrameMut::from_frame(&mut (*top_frame!()));
                     self.frame_copy_context(&mut frame, dst, src)?;
                     frame.advance_pc()?;
                     continue;
@@ -2071,7 +2082,7 @@ impl Interpreter {
                 Op::LoadContextSlot | Op::LoadContextSlotChecked => {
                     let (dst, ctx) = (instr.reg(0), instr.reg(1));
                     let coord = instr.imm(2);
-                    let frame = &mut stack[top_idx];
+                    let frame = &mut (*top_frame!());
                     let value = self.load_context_slot_value(
                         context,
                         *read_register(frame, ctx)?,
@@ -2085,7 +2096,7 @@ impl Interpreter {
                 Op::StoreContextSlot | Op::StoreContextSlotChecked => {
                     let (src, ctx) = (instr.reg(0), instr.reg(1));
                     let coord = instr.imm(2);
-                    let frame = &mut stack[top_idx];
+                    let frame = &mut (*top_frame!());
                     let (value, target) =
                         (*read_register(frame, src)?, *read_register(frame, ctx)?);
                     self.store_context_slot_value(
@@ -2095,29 +2106,29 @@ impl Interpreter {
                         value,
                         op == Op::StoreContextSlotChecked,
                     )?;
-                    stack[top_idx].advance_pc()?;
+                    (*top_frame!()).advance_pc()?;
                     continue;
                 }
                 Op::BindThisContextSlot => {
                     let (src, ctx) = (instr.reg(0), instr.reg(1));
                     let coord = instr.imm(2);
-                    let frame = &mut stack[top_idx];
+                    let frame = &mut (*top_frame!());
                     let (value, target) =
                         (*read_register(frame, src)?, *read_register(frame, ctx)?);
                     self.bind_this_context_slot_value(target, coord, value)?;
-                    stack[top_idx].advance_pc()?;
+                    (*top_frame!()).advance_pc()?;
                     continue;
                 }
                 Op::CollectRest => {
                     let dst = instr.reg(0);
                     self.collect_rest(&mut *stack, top_idx, function.param_count, dst)?;
-                    stack[top_idx].advance_pc()?;
+                    (*top_frame!()).advance_pc()?;
                     continue;
                 }
                 Op::MakeFunction => {
                     let dst = instr.reg(0);
                     let idx = instr.const_word(1);
-                    let frame = &mut stack[top_idx];
+                    let frame = &mut (*top_frame!());
                     self.run_make_function_reg(context, frame, dst, idx)?;
                     continue;
                 }
@@ -2162,7 +2173,7 @@ impl Interpreter {
                 }
                 Op::LoadGlobalThis => {
                     let dst = instr.reg(0);
-                    let frame = &mut stack[top_idx];
+                    let frame = &mut (*top_frame!());
                     self.run_load_global_this_reg(frame, dst)?;
                     continue;
                 }
@@ -2196,7 +2207,7 @@ impl Interpreter {
                 Op::DeclareGlobalVar => {
                     let name_idx = instr.const_word(0);
                     let configurable = function.imm32(instr, 1).unwrap_or(0) != 0;
-                    let frame = &mut stack[top_idx];
+                    let frame = &mut (*top_frame!());
                     self.run_declare_global_var_reg(context, frame, name_idx, configurable)?;
                     continue;
                 }
@@ -2215,7 +2226,7 @@ impl Interpreter {
                 Op::LoadLookupSlot => {
                     let (dst, ctx) = (instr.reg(0), instr.reg(1));
                     let (name_idx, coord) = (instr.const_word(2), instr.imm(3));
-                    let frame = &mut stack[top_idx];
+                    let frame = &mut (*top_frame!());
                     let value = self.load_lookup_slot_value(
                         context,
                         function_id,
@@ -2235,7 +2246,7 @@ impl Interpreter {
                         .ok_or(VmError::InvalidOperand)?;
                     let coord = function.imm32(instr, 3).ok_or(VmError::InvalidOperand)?;
                     let fallback = function.imm32(instr, 4).ok_or(VmError::InvalidOperand)?;
-                    let frame = &stack[top_idx];
+                    let frame = &(*top_frame!());
                     let (value, target) = (
                         *read_register(frame, value_reg)?,
                         *read_register(frame, ctx)?,
@@ -2249,13 +2260,13 @@ impl Interpreter {
                         fallback,
                         value,
                     )?;
-                    stack[top_idx].advance_pc()?;
+                    (*top_frame!()).advance_pc()?;
                     continue;
                 }
                 Op::DeleteLookupSlot => {
                     let (dst, ctx) = (instr.reg(0), instr.reg(1));
                     let (name_idx, depth) = (instr.const_word(2), instr.imm(3));
-                    let target = *read_register(&stack[top_idx], ctx)?;
+                    let target = *read_register(&(*top_frame!()), ctx)?;
                     let value = self.delete_lookup_slot_value(
                         context,
                         function_id,
@@ -2263,7 +2274,7 @@ impl Interpreter {
                         name_idx,
                         depth,
                     )?;
-                    let frame = &mut stack[top_idx];
+                    let frame = &mut (*top_frame!());
                     write_register(frame, dst, value)?;
                     frame.advance_pc()?;
                     continue;
@@ -2271,7 +2282,7 @@ impl Interpreter {
                 Op::LoadLookupGlobal | Op::TypeofLookupGlobal => {
                     let (dst, ctx) = (instr.reg(0), instr.reg(1));
                     let (name_idx, depth) = (instr.const_word(2), instr.imm(3));
-                    let target = *read_register(&stack[top_idx], ctx)?;
+                    let target = *read_register(&(*top_frame!()), ctx)?;
                     let missing = if op == Op::LoadLookupGlobal {
                         otter_bytecode::opcode_schema::BindingMissing::Throw
                     } else {
@@ -2292,7 +2303,7 @@ impl Interpreter {
                             return Ok(DispatchOutcome::Fatal(error));
                         }
                     };
-                    let frame = &mut stack[top_idx];
+                    let frame = &mut (*top_frame!());
                     write_register(frame, dst, value)?;
                     frame.advance_pc()?;
                     continue;
@@ -2300,7 +2311,7 @@ impl Interpreter {
                 Op::StoreLookupGlobal => {
                     let (value_reg, ctx) = (instr.reg(0), instr.reg(1));
                     let (name_idx, mode) = (instr.const_word(2), instr.imm(3));
-                    let frame = &stack[top_idx];
+                    let frame = &(*top_frame!());
                     let (value, target) = (
                         *read_register(frame, value_reg)?,
                         *read_register(frame, ctx)?,
@@ -2320,13 +2331,13 @@ impl Interpreter {
                             return Ok(DispatchOutcome::Fatal(error));
                         }
                     });
-                    stack[top_idx].advance_pc()?;
+                    (*top_frame!()).advance_pc()?;
                     continue;
                 }
                 Op::DeleteLookupGlobal => {
                     let (dst, ctx) = (instr.reg(0), instr.reg(1));
                     let (name_idx, depth) = (instr.const_word(2), instr.imm(3));
-                    let target = *read_register(&stack[top_idx], ctx)?;
+                    let target = *read_register(&(*top_frame!()), ctx)?;
                     let value = self.delete_lookup_global_value(
                         context,
                         function_id,
@@ -2334,7 +2345,7 @@ impl Interpreter {
                         name_idx,
                         depth,
                     )?;
-                    let frame = &mut stack[top_idx];
+                    let frame = &mut (*top_frame!());
                     write_register(frame, dst, value)?;
                     frame.advance_pc()?;
                     continue;
@@ -2344,7 +2355,7 @@ impl Interpreter {
                 Op::ResolveLookupRef => {
                     let (dst, ctx) = (instr.reg(0), instr.reg(1));
                     let (name_idx, target_imm) = (instr.const_word(2), instr.imm(3));
-                    let frame = &mut stack[top_idx];
+                    let frame = &mut (*top_frame!());
                     let reference = self.resolve_lookup_ref_value(
                         context,
                         function_id,
@@ -2359,7 +2370,7 @@ impl Interpreter {
                 Op::StoreRef => {
                     let (value_reg, reference_reg) = (instr.reg(0), instr.reg(1));
                     let (name_idx, mode) = (instr.const_word(2), instr.imm(3));
-                    let frame = &stack[top_idx];
+                    let frame = &(*top_frame!());
                     let (value, reference) = (
                         *read_register(frame, value_reg)?,
                         *read_register(frame, reference_reg)?,
@@ -2379,7 +2390,7 @@ impl Interpreter {
                             return Ok(DispatchOutcome::Fatal(error));
                         }
                     });
-                    stack[top_idx].advance_pc()?;
+                    (*top_frame!()).advance_pc()?;
                     continue;
                 }
                 // §19.2.1.3 step 16 — a sloppy eval's `var` with no static
@@ -2387,15 +2398,15 @@ impl Interpreter {
                 Op::DeclareEvalVar => {
                     let ctx = instr.reg(0);
                     let (name_idx, var_depth) = (instr.const_word(1), instr.imm(2));
-                    let target = *read_register(&stack[top_idx], ctx)?;
+                    let target = *read_register(&(*top_frame!()), ctx)?;
                     self.declare_eval_var_value(context, function_id, target, name_idx, var_depth)?;
-                    stack[top_idx].advance_pc()?;
+                    (*top_frame!()).advance_pc()?;
                     continue;
                 }
                 Op::StoreVarScope => {
                     let (value_reg, ctx) = (instr.reg(0), instr.reg(1));
                     let (name_idx, var_depth) = (instr.const_word(2), instr.imm(3));
-                    let frame = &stack[top_idx];
+                    let frame = &(*top_frame!());
                     let (value, target) = (
                         *read_register(frame, value_reg)?,
                         *read_register(frame, ctx)?,
@@ -2408,7 +2419,7 @@ impl Interpreter {
                         var_depth,
                         value,
                     )?;
-                    stack[top_idx].advance_pc()?;
+                    (*top_frame!()).advance_pc()?;
                     continue;
                 }
                 // §6.2.12 — mint a Private Name carrier; the marker
@@ -2424,7 +2435,7 @@ impl Interpreter {
                     let name_idx = instr.const_word(0);
                     let value_reg = instr.reg(1);
                     let deletable = function.imm32(instr, 2).unwrap_or(0) != 0;
-                    let frame = &mut stack[top_idx];
+                    let frame = &mut (*top_frame!());
                     self.run_define_global_function_reg(
                         context, frame, name_idx, value_reg, deletable,
                     )?;
@@ -2433,7 +2444,7 @@ impl Interpreter {
                 Op::DeclareGlobalLex => {
                     let name_idx = instr.const_word(0);
                     let is_const = function.imm32(instr, 1).unwrap_or(0) != 0;
-                    let frame = &mut stack[top_idx];
+                    let frame = &mut (*top_frame!());
                     self.run_declare_global_lex_reg(context, frame, name_idx, is_const)?;
                     continue;
                 }
@@ -2455,7 +2466,7 @@ impl Interpreter {
                 Op::InitGlobalLex => {
                     let value_reg = instr.reg(0);
                     let name_idx = instr.const_word(1);
-                    let frame = &mut stack[top_idx];
+                    let frame = &mut (*top_frame!());
                     self.run_init_global_lex_reg(context, frame, value_reg, name_idx)?;
                     continue;
                 }
@@ -2481,7 +2492,7 @@ impl Interpreter {
                             return Ok(DispatchOutcome::Fatal(error));
                         }
                     });
-                    stack[top_idx].advance_pc()?;
+                    (*top_frame!()).advance_pc()?;
                     continue;
                 }
                 // §10.2.10 SetFunctionName — names an anonymous
@@ -2533,7 +2544,7 @@ impl Interpreter {
                 Op::ToNumeric => {
                     let dst = instr.reg(0);
                     let src = instr.reg(1);
-                    let value = *read_register(&stack[top_idx], src)?;
+                    let value = *read_register(&(*top_frame!()), src)?;
                     let result = if value.is_number() {
                         value
                     } else {
@@ -2545,7 +2556,7 @@ impl Interpreter {
                             }
                         }
                     };
-                    let frame = &mut stack[top_idx];
+                    let frame = &mut (*top_frame!());
                     write_register(frame, dst, result)?;
                     frame.advance_pc()?;
                     continue;
@@ -2557,7 +2568,7 @@ impl Interpreter {
                 Op::ToObject => {
                     let dst = instr.reg(0);
                     let src = instr.reg(1);
-                    let source = *read_register(&stack[top_idx], src)?;
+                    let source = *read_register(&(*top_frame!()), src)?;
                     let result = match self.scalar_value(
                         stack,
                         context,
@@ -2572,7 +2583,7 @@ impl Interpreter {
                             return Ok(DispatchOutcome::Fatal(error));
                         }
                     };
-                    let frame = &mut stack[top_idx];
+                    let frame = &mut (*top_frame!());
                     write_register(frame, dst, result)?;
                     frame.advance_pc()?;
                     continue;
@@ -2583,7 +2594,7 @@ impl Interpreter {
                 Op::ToPropertyKey => {
                     let dst = instr.reg(0);
                     let src = instr.reg(1);
-                    let source = *read_register(&stack[top_idx], src)?;
+                    let source = *read_register(&(*top_frame!()), src)?;
                     let result = match self.scalar_value(
                         stack,
                         context,
@@ -2598,7 +2609,7 @@ impl Interpreter {
                             return Ok(DispatchOutcome::Fatal(error));
                         }
                     };
-                    let frame = &mut stack[top_idx];
+                    let frame = &mut (*top_frame!());
                     write_register(frame, dst, result)?;
                     frame.advance_pc()?;
                     continue;
@@ -2642,7 +2653,7 @@ impl Interpreter {
                 Op::ValidateGlobalDecl => {
                     let name_idx = instr.const_word(0);
                     let kind = function.imm32(instr, 1).unwrap_or(0);
-                    let frame = &mut stack[top_idx];
+                    let frame = &mut (*top_frame!());
                     self.run_validate_global_decl_reg(context, frame, name_idx, kind)?;
                     continue;
                 }
@@ -2725,7 +2736,7 @@ impl Interpreter {
                             return Ok(DispatchOutcome::Fatal(error));
                         }
                     }
-                    stack[top_idx].advance_pc()?;
+                    (*top_frame!()).advance_pc()?;
                     continue;
                 }
                 Op::NewWeakRef => {
@@ -2763,14 +2774,14 @@ impl Interpreter {
                 Op::SymbolLoad => {
                     let dst = instr.reg(0);
                     let name_idx = instr.const_word(1);
-                    let frame = &mut stack[top_idx];
+                    let frame = &mut (*top_frame!());
                     self.run_symbol_load_reg(context, frame, dst, name_idx)?;
                     continue;
                 }
                 Op::TemporalLoad => {
                     let dst = instr.reg(0);
                     let name_idx = instr.const_word(1);
-                    let frame = &mut stack[top_idx];
+                    let frame = &mut (*top_frame!());
                     self.run_temporal_load_reg(context, frame, dst, name_idx)?;
                     continue;
                 }
@@ -3248,8 +3259,8 @@ impl Interpreter {
                             });
                         }
                         Op::SameValue => {
-                            let lhs = *read_register(&stack[top_idx], lhs)?;
-                            let rhs = *read_register(&stack[top_idx], rhs)?;
+                            let lhs = *read_register(&(*top_frame!()), lhs)?;
+                            let rhs = *read_register(&(*top_frame!()), rhs)?;
                             let result = match self.scalar_value(
                                 stack,
                                 context,
@@ -3264,7 +3275,7 @@ impl Interpreter {
                                     return Ok(DispatchOutcome::Fatal(error));
                                 }
                             };
-                            let frame = &mut stack[top_idx];
+                            let frame = &mut (*top_frame!());
                             write_register(frame, dst, result)?;
                             frame.advance_pc_fast();
                         }
@@ -3275,7 +3286,7 @@ impl Interpreter {
                 Op::ArrayLength => {
                     let dst = instr.reg(0);
                     let src = instr.reg(1);
-                    let source = *read_register(&stack[top_idx], src)?;
+                    let source = *read_register(&(*top_frame!()), src)?;
                     let result = match self.scalar_value(
                         stack,
                         context,
@@ -3290,7 +3301,7 @@ impl Interpreter {
                             return Ok(DispatchOutcome::Fatal(error));
                         }
                     };
-                    let frame = &mut stack[top_idx];
+                    let frame = &mut (*top_frame!());
                     write_register(frame, dst, result)?;
                     frame.advance_pc()?;
                     continue;
@@ -3305,7 +3316,7 @@ impl Interpreter {
                     let dst = instr.reg(0);
                     let function_index = instr.const_word(1);
                     let ctx = instr.reg(2);
-                    let frame = &mut stack[top_idx];
+                    let frame = &mut (*top_frame!());
                     self.run_make_closure_regs(context, frame, dst, function_index, ctx)?;
                     continue;
                 }
@@ -3321,7 +3332,7 @@ impl Interpreter {
                 }
                 Op::BigIntCall | Op::DataViewCall => {
                     let operands = function.operand_view(instr);
-                    let frame = &mut stack[top_idx];
+                    let frame = &mut (*top_frame!());
                     self.run_static_call_operands(op, context, frame, operands)?;
                     continue;
                 }

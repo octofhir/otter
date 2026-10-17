@@ -142,7 +142,7 @@ pub(crate) fn validate_no_direct_super_in_methods(
 pub(crate) fn collect_class_private_bound(body: &oxc_ast::ast::ClassBody<'_>) -> Vec<String> {
     // Declaration order, deduped — the field-init path indexes the
     // per-class private-symbol array by this order.
-    let mut seen = std::collections::HashSet::new();
+    let mut seen = crate::HashSet::default();
     let mut names: Vec<String> = Vec::new();
     let mut push = |n: String| {
         if seen.insert(n.clone()) {
@@ -172,22 +172,19 @@ pub(crate) fn collect_class_private_bound(body: &oxc_ast::ast::ClassBody<'_>) ->
     names
 }
 
-pub(crate) fn private_name_in_scope(
-    scopes: &[std::collections::HashSet<String>],
-    name: &str,
-) -> bool {
+pub(crate) fn private_name_in_scope(scopes: &[crate::HashSet<String>], name: &str) -> bool {
     scopes.iter().rev().any(|s| s.contains(name))
 }
 
 pub(crate) fn validate_private_refs_in_expression(
     expr: &oxc_ast::ast::Expression<'_>,
-    scopes: &mut Vec<std::collections::HashSet<String>>,
+    scopes: &mut Vec<crate::HashSet<String>>,
 ) -> Result<(), CompileError> {
     use oxc_ast_visit::Visit;
     // Custom visitor so we can re-enter nested classes (which mutate
     // the scope stack) without losing the validator's invariants.
     struct PrivateRefFinder<'s> {
-        scopes: &'s mut Vec<std::collections::HashSet<String>>,
+        scopes: &'s mut Vec<crate::HashSet<String>>,
         err: Option<CompileError>,
     }
     impl<'a, 's> Visit<'a> for PrivateRefFinder<'s> {
@@ -241,11 +238,11 @@ pub(crate) fn validate_private_refs_in_expression(
 
 pub(crate) fn validate_private_refs_in_function_body(
     func: &oxc_ast::ast::Function<'_>,
-    scopes: &mut Vec<std::collections::HashSet<String>>,
+    scopes: &mut Vec<crate::HashSet<String>>,
 ) -> Result<(), CompileError> {
     use oxc_ast_visit::Visit;
     struct PrivateRefFinder<'s> {
-        scopes: &'s mut Vec<std::collections::HashSet<String>>,
+        scopes: &'s mut Vec<crate::HashSet<String>>,
         err: Option<CompileError>,
     }
     impl<'a, 's> Visit<'a> for PrivateRefFinder<'s> {
@@ -308,7 +305,7 @@ pub(crate) fn validate_private_refs_in_function_body(
 
 pub(crate) fn validate_class_private_names_inner(
     class: &oxc_ast::ast::Class<'_>,
-    scopes: &mut Vec<std::collections::HashSet<String>>,
+    scopes: &mut Vec<crate::HashSet<String>>,
 ) -> Result<(), CompileError> {
     // Heritage is evaluated under the outer private environment per
     // §15.7.14 step 10.b — push happens after the heritage walk.
@@ -347,7 +344,7 @@ pub(crate) fn validate_class_private_names_inner(
                 oxc_ast::ast::ClassElement::StaticBlock(b) => {
                     use oxc_ast_visit::Visit;
                     struct PrivateRefFinder<'s> {
-                        scopes: &'s mut Vec<std::collections::HashSet<String>>,
+                        scopes: &'s mut Vec<crate::HashSet<String>>,
                         err: Option<CompileError>,
                     }
                     impl<'a, 's> Visit<'a> for PrivateRefFinder<'s> {
@@ -419,8 +416,8 @@ pub(crate) fn validate_class_private_names_inner(
 /// the receiver; fields do not).
 pub(crate) fn collect_class_private_instance_methods(
     body: &oxc_ast::ast::ClassBody<'_>,
-) -> std::collections::HashSet<String> {
-    let mut names = std::collections::HashSet::new();
+) -> crate::HashSet<String> {
+    let mut names = crate::HashSet::default();
     for element in &body.body {
         if let oxc_ast::ast::ClassElement::MethodDefinition(m) = element
             && !m.r#static

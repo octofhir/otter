@@ -170,7 +170,7 @@ pub(crate) fn predeclare_formal_parameters(
     // The last occurrence owns a duplicate simple formal's binding. Mapping
     // that name directly to the last incoming slot gives the specified
     // last-argument value without copying earlier occurrences over it.
-    let mut direct_registers = HashMap::<String, u16>::new();
+    let mut direct_registers = HashMap::<String, u16>::default();
     for (ordinal, param) in params.items.iter().enumerate() {
         if param.initializer.is_none()
             && let oxc_ast::ast::BindingPattern::BindingIdentifier(id) = &param.pattern
@@ -188,7 +188,7 @@ pub(crate) fn predeclare_formal_parameters(
     if let Some(rest) = &params.rest {
         collect_pattern_var_names(&rest.rest.argument, &mut names);
     }
-    let mut seen = HashSet::new();
+    let mut seen = HashSet::default();
     for name in names {
         if allow_duplicate_formals && !seen.insert(name.clone()) {
             continue;
@@ -328,7 +328,7 @@ pub(crate) fn validate_formal_parameter_names(
         collect_pattern_var_names(&rest.rest.argument, &mut names);
     }
 
-    let mut seen = HashSet::new();
+    let mut seen = HashSet::default();
     for name in names {
         if is_strict && (name == "eval" || name == "arguments") {
             return Err(CompileError::Unsupported {
@@ -379,7 +379,7 @@ pub(crate) fn mapped_formal_parameter_bindings(
     params: &oxc_ast::ast::FormalParameters<'_>,
 ) -> Vec<MappedArgumentBinding> {
     let names = simple_formal_names(params);
-    let mut seen = HashSet::new();
+    let mut seen = HashSet::default();
     let mut bindings = Vec::new();
     for (index, name) in names.iter().enumerate().rev() {
         if !seen.insert(name.clone()) {

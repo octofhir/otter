@@ -66,7 +66,7 @@ pub(crate) struct Scope {
 impl Scope {
     pub(crate) fn new(kind: ScopeKind, flags: ScopeFlags) -> Self {
         Self {
-            bindings: HashMap::new(),
+            bindings: HashMap::default(),
             kind,
             flags,
             context: None,

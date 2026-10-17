@@ -159,10 +159,10 @@ pub(crate) struct FunctionContext {
     /// declaration's source position syncs into. The `bool` marks
     /// global-script bindings that also mirror via `DefineGlobalVar`.
     pub(crate) annex_b_var_targets:
-        std::collections::HashMap<String, (Option<crate::compiler::VarTarget>, bool)>,
+        crate::HashMap<String, (Option<crate::compiler::VarTarget>, bool)>,
     /// Source span starts of block-level function declarations whose
     /// own path is Annex B eligible.
-    pub(crate) annex_b_eligible_spans: std::collections::HashSet<u32>,
+    pub(crate) annex_b_eligible_spans: crate::HashSet<u32>,
     /// `true` when an anonymous `export default function/function*` was
     /// already hoisted at instantiation.
     pub(crate) default_function_hoisted: bool,
@@ -230,13 +230,13 @@ impl FunctionContext {
             control: Vec::new(),
             handlers: Vec::new(),
             pending_label: None,
-            hoisted_function_names: HashSet::new(),
-            annex_b_var_targets: std::collections::HashMap::new(),
-            annex_b_eligible_spans: std::collections::HashSet::new(),
+            hoisted_function_names: HashSet::default(),
+            annex_b_var_targets: crate::HashMap::default(),
+            annex_b_eligible_spans: crate::HashSet::default(),
             default_function_hoisted: false,
-            captured_names: HashSet::new(),
+            captured_names: HashSet::default(),
             arguments_forward_only: false,
-            mapped_argument_names: HashSet::new(),
+            mapped_argument_names: HashSet::default(),
             module_state: None,
             active_with_envs: Vec::new(),
             register_overflow: false,

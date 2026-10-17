@@ -89,11 +89,11 @@ pub(crate) struct Compiler {
     pub(crate) private_namespaces: Vec<u32>,
     /// Private names declared by each enclosing class, parallel to
     /// `private_namespaces`.
-    pub(crate) class_private_names: Vec<std::collections::HashSet<String>>,
+    pub(crate) class_private_names: Vec<crate::HashSet<String>>,
     /// Instance private METHOD / ACCESSOR names per enclosing class
     /// (parallel to `private_namespaces`). Access to these emits a
     /// §7.3.31 brand check.
-    pub(crate) class_private_instance_methods: Vec<std::collections::HashSet<String>>,
+    pub(crate) class_private_instance_methods: Vec<crate::HashSet<String>>,
     /// Scope of each enclosing class (parallel to `private_namespaces`):
     /// its private names, brand, and homes are slots of that scope.
     pub(crate) class_scope_locations: Vec<ScopeLocation>,
@@ -107,10 +107,10 @@ pub(crate) struct Compiler {
     /// §16.1.7 — names of script top-level `var` and function
     /// declarations, which live as global-object properties. Empty for
     /// modules and function-caller eval bodies.
-    pub(crate) script_global_vars: std::collections::HashSet<String>,
+    pub(crate) script_global_vars: crate::HashSet<String>,
     /// §9.1.1.4 global declarative record — names of script
     /// top-level `let` / `const` / `class` declarations.
-    pub(crate) script_global_lexicals: std::collections::HashSet<String>,
+    pub(crate) script_global_lexicals: crate::HashSet<String>,
     /// `true` while lowering class instance-field initializers
     /// (which compile into the constructor frame).
     pub(crate) in_field_initializer: bool,
@@ -272,14 +272,14 @@ impl Compiler {
             class_scope_locations: Vec::new(),
             suppress_global_mirror: false,
             in_eval: false,
-            script_global_vars: std::collections::HashSet::new(),
-            script_global_lexicals: std::collections::HashSet::new(),
+            script_global_vars: crate::HashSet::default(),
+            script_global_lexicals: crate::HashSet::default(),
             in_field_initializer: false,
             eval_new_target_allowed: false,
-            number_typed_cache: RefCell::new(HashMap::new()),
+            number_typed_cache: RefCell::new(HashMap::default()),
             class_hint_names: Vec::new(),
-            class_hint_name_ids: HashMap::new(),
-            declared_classes: HashMap::new(),
+            class_hint_name_ids: HashMap::default(),
+            declared_classes: HashMap::default(),
             pending_class_hint_sites: Vec::new(),
             capture: Rc::new(capture),
         }

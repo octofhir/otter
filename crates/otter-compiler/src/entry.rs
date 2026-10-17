@@ -771,7 +771,7 @@ pub(crate) fn eval_annex_b_blocked(cx: &Compiler, name: &str) -> bool {
 }
 
 /// Private names the classes around a direct eval declare (§19.2.1.1).
-fn caller_private_names(chain: Option<&EvalCallerChain>) -> std::collections::HashSet<String> {
+fn caller_private_names(chain: Option<&EvalCallerChain>) -> crate::HashSet<String> {
     chain
         .into_iter()
         .flat_map(|chain| chain.scopes.iter())
@@ -813,7 +813,7 @@ pub(crate) fn inherit_eval_chain_state(cx: &mut Compiler) {
                                 || (!method_only && slot.kind == SlotKind::PrivateName)
                         })
                         .filter_map(|slot| slot.name.strip_prefix('#').map(str::to_string))
-                        .collect::<std::collections::HashSet<String>>()
+                        .collect::<crate::HashSet<String>>()
                 };
                 let names = private_names(false);
                 let instance_methods = private_names(true);
@@ -982,7 +982,7 @@ pub(crate) fn compile_program_parts(
         if !eval_mode {
             hoist_lexical_names(program.body, &mut validate_lex);
         }
-        let mut seen: HashSet<&str> = HashSet::new();
+        let mut seen: HashSet<&str> = HashSet::default();
         let mut validations: Vec<(&str, i32)> = Vec::new();
         for (name, _) in &validate_lex {
             if seen.insert(name.as_str()) {
@@ -1011,7 +1011,7 @@ pub(crate) fn compile_program_parts(
         // §19.2.1.3 steps 16–17 — a name the caller's variable scope does
         // not bind statically becomes a deletable binding of its eval
         // extension; a statically bound one is re-bound in place.
-        let mut seen: HashSet<&str> = HashSet::new();
+        let mut seen: HashSet<&str> = HashSet::default();
         for name in &top_level_vars {
             if seen.insert(name.as_str()) {
                 eval_var_declaration_target(&mut cx, name, program_span);
@@ -1025,7 +1025,7 @@ pub(crate) fn compile_program_parts(
     pre_declare_annex_b_functions(
         &mut cx,
         program.body,
-        &std::collections::HashSet::new(),
+        &crate::HashSet::default(),
         program_span,
     )?;
     // §10.2.11 step 33 — pre-declare top-level `let` / `const` /
@@ -1036,7 +1036,7 @@ pub(crate) fn compile_program_parts(
     hoist_lexical_names(program.body, &mut top_level_lex);
     if !eval_mode {
         cx.script_global_lexicals = top_level_lex.iter().map(|(name, _)| name.clone()).collect();
-        let mut declared: HashSet<&str> = HashSet::new();
+        let mut declared: HashSet<&str> = HashSet::default();
         for (name, is_const) in &top_level_lex {
             if !declared.insert(name.as_str()) {
                 continue;
@@ -1061,7 +1061,7 @@ pub(crate) fn compile_program_parts(
         let function_names: HashSet<String> = top_level_hoistable_function_names(program.body)
             .into_iter()
             .collect();
-        let mut declared: HashSet<&str> = HashSet::new();
+        let mut declared: HashSet<&str> = HashSet::default();
         for name in &top_level_vars {
             if !declared.insert(name.as_str()) || function_names.contains(name.as_str()) {
                 continue;
@@ -1233,7 +1233,7 @@ pub fn compile_module_program(
         &program.body,
         strict_validation::EarlyErrorContext {
             source_strict: true,
-            private_names: Some(std::collections::HashSet::new()),
+            private_names: Some(crate::HashSet::default()),
             ..Default::default()
         },
     )?;
@@ -1280,7 +1280,11 @@ pub fn compile_module_program(
     top.contains_direct_eval = unit_capture.unit_contains_eval();
 
     let mut state = ModuleState {
-        pre_resolved_imports: host.resolved_imports.clone(),
+        pre_resolved_imports: host
+            .resolved_imports
+            .iter()
+            .map(|(request, target)| (request.clone(), target.clone()))
+            .collect(),
         ..ModuleState::default()
     };
     let mut next_record: u16 = 0;
@@ -1674,7 +1678,7 @@ pub fn compile_module_program(
     // start as the hole and are filled when their declaration runs
     // (function hoisting below overwrites its hole with the closure).
     {
-        let mut var_name_set = std::collections::HashSet::new();
+        let mut var_name_set = crate::HashSet::default();
         let mut tmp = Vec::new();
         hoist_var_names(&program.body, &mut tmp);
         var_name_set.extend(tmp);
@@ -1687,7 +1691,7 @@ pub fn compile_module_program(
         }
         if !slots.is_empty() {
             let env_reg = crate::statements::module_env_register(&mut cx, span0)?;
-            let mut seen = std::collections::HashSet::new();
+            let mut seen = crate::HashSet::default();
             for (name, is_var) in slots {
                 if !seen.insert(name.clone()) {
                     continue;

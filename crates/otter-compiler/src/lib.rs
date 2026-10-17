@@ -94,7 +94,10 @@ pub use module_state::{ImportRequest, ModuleHostInfo};
 pub use ts_erasure::unwrap_ts_expr;
 
 pub(crate) use std::cell::RefCell;
-pub(crate) use std::collections::{HashMap, HashSet};
+/// The compiler's maps and sets hash with FxHash: keys are names and node
+/// addresses it produced itself, never adversarial input that needs SipHash.
+pub(crate) type HashMap<K, V> = rustc_hash::FxHashMap<K, V>;
+pub(crate) type HashSet<T> = rustc_hash::FxHashSet<T>;
 pub(crate) use std::rc::Rc;
 
 pub(crate) use assignment::*;

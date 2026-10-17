@@ -121,6 +121,7 @@ impl Interpreter {
         let candidates = self.code_space.eviction_candidates();
         let liveness = crate::code_liveness::census_candidate_ids(self, candidates.clone());
         let mut retired_jit = released_contexts;
+        let mut evicted = Vec::new();
         for candidate in candidates {
             if retained <= target_bytes {
                 break;
@@ -137,7 +138,7 @@ impl Interpreter {
             if let crate::code_space::ChunkEvictionResult::Evicted { retained_bytes } =
                 self.code_space.evict_candidate(candidate)
             {
-                self.purge_chunk_side_tables(candidate);
+                evicted.push(candidate);
                 retained = retained.saturating_sub(retained_bytes);
                 self.code_eviction_stats.evicted_chunks =
                     self.code_eviction_stats.evicted_chunks.saturating_add(1);
@@ -146,6 +147,9 @@ impl Interpreter {
                     .evicted_bytes
                     .saturating_add(retained_bytes);
             }
+        }
+        if !evicted.is_empty() {
+            self.purge_chunk_side_tables(&evicted);
         }
         self.code_eviction_stats.retained_bytes = self.code_space.evictable_retained_bytes();
         Ok(())
@@ -167,27 +171,36 @@ impl Interpreter {
         self.retire_unreferenced_jit_code();
     }
 
-    fn purge_chunk_side_tables(&mut self, candidate: crate::code_space::ChunkEvictionCandidate) {
-        let start = candidate.function_base;
-        let end = candidate.function_end();
-        let outside = |function_id: &u32| *function_id < start || *function_id >= end;
+    /// Forget everything keyed by a function, module or IC site of the
+    /// `evicted` chunks, in one pass over each table for the whole set.
+    fn purge_chunk_side_tables(&mut self, evicted: &[crate::code_space::ChunkEvictionCandidate]) {
+        let ranges = crate::constructor_layout::EvictedRanges::new(evicted);
+        let outside = |function_id: &u32| !ranges.contains(*function_id);
+        let bases: rustc_hash::FxHashSet<u32> = evicted
+            .iter()
+            .map(|candidate| candidate.function_base)
+            .collect();
+        let identities: rustc_hash::FxHashSet<usize> = evicted
+            .iter()
+            .map(|candidate| candidate.module_identity)
+            .collect();
         self.template_objects
-            .retain(|(function_base, _), _| *function_base != start);
+            .retain(|(function_base, _), _| !bases.contains(function_base));
         self.literal_cells
-            .retain(|(identity, _), _| *identity != candidate.module_identity);
+            .retain(|(identity, _), _| !identities.contains(identity));
         self.simple_constructor_init_cache
             .retain(|id, _| outside(id));
         self.simple_constructor_absence.retain(|id, _| outside(id));
         self.simple_constructor_shape_cache
             .retain(|(id, _), _| outside(id));
         self.object_literal_layouts.retain(|(id, _), _| outside(id));
-        self.prune_constructor_layouts_for_evicted_range(start, end);
+        self.prune_constructor_layouts_for_evicted(&ranges);
         self.global_lexical_load_ic.retain(|(id, _), _| outside(id));
         self.global_object_load_ic.retain(|(id, _), _| outside(id));
         for realm in &mut self.extra_realms {
             realm
                 .template_objects
-                .retain(|(function_base, _), _| *function_base != start);
+                .retain(|(function_base, _), _| !bases.contains(function_base));
             realm
                 .global_lexical_load_ic
                 .retain(|(id, _), _| outside(id));
@@ -207,11 +220,14 @@ impl Interpreter {
         self.jit_osr_disabled.retain(|(id, _)| outside(id));
         self.jit_optimized_declined_epoch
             .retain(|id, _| outside(id));
-        self.optimizing_tier_policy.evict_function_range(start, end);
-        self.method_feedback.evict_site_range(
-            candidate.property_ic_site_base,
-            candidate.property_ic_site_end,
-        );
+        self.optimizing_tier_policy
+            .evict_functions(|function_id| ranges.contains(function_id));
+        for candidate in evicted {
+            self.method_feedback.evict_site_range(
+                candidate.property_ic_site_base,
+                candidate.property_ic_site_end,
+            );
+        }
     }
 
     /// Borrow the per-isolate GC heap (read-only).

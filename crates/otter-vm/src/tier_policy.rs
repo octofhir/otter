@@ -290,14 +290,13 @@ impl TierPolicy {
         }
     }
 
-    pub(crate) fn evict_function_range(&mut self, start: u32, end: u32) {
+    pub(crate) fn evict_functions(&mut self, evicted: impl Fn(u32) -> bool) {
         self.retraining_functions -= self
             .functions
             .iter()
-            .filter(|(fid, state)| **fid >= start && **fid < end && state.retraining)
+            .filter(|(fid, state)| evicted(**fid) && state.retraining)
             .count();
-        self.functions
-            .retain(|fid, _| !(*fid >= start && *fid < end));
+        self.functions.retain(|fid, _| !evicted(*fid));
     }
     pub(crate) fn record_compile_attempt(&mut self, fid: u32, tier: CostedTier) {
         let attempts = &mut self.functions.entry(fid).or_default().compile_attempts[tier.index()];
@@ -446,10 +445,10 @@ mod tests {
 
         policy.begin_retraining(7);
         policy.begin_retraining(8);
-        policy.evict_function_range(7, 8);
+        policy.evict_functions(|id| id == 7);
         assert!(policy.has_retraining());
         assert!(policy.retraining_generation(7).is_none());
-        policy.evict_function_range(8, 9);
+        policy.evict_functions(|id| id == 8);
         assert!(!policy.has_retraining());
     }
 
@@ -589,7 +588,7 @@ mod tests {
             assert!(TierWorkModel::calibrated().minimum_required_work(value) > initial);
         }
         policy.record_compile_attempt(8, CostedTier::Template);
-        policy.evict_function_range(7, 8);
+        policy.evict_functions(|id| id == 7);
         assert_eq!(policy.compile_attempts(7, CostedTier::Template), 0);
         assert_eq!(policy.compile_attempts(8, CostedTier::Template), 1);
     }

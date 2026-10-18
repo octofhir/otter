@@ -775,16 +775,7 @@ impl FunctionContext {
                     "closure-context operand is a register"
                 );
             }
-            let mut rebuilt = FunctionCodeBuilder::new();
-            rebuilt.push(Op::LoadClosureContext, &[Operand::Register(reg)]);
-            for pc in 0..code.len() as u32 {
-                let op = code.op(pc).expect("compiler instruction");
-                let operands: Vec<Operand> = (0..code.operand_count(pc).expect("operand count"))
-                    .map(|index| code.operand(pc, index).expect("compiler operand"))
-                    .collect();
-                rebuilt.push(op, &operands);
-            }
-            code = rebuilt;
+            code.insert_first(Op::LoadClosureContext, &[Operand::Register(reg)]);
             for span in &mut spans {
                 span.pc += 1;
             }

@@ -13,8 +13,11 @@
 //!
 //! # Invariants
 //! - Bytes are a magic tag, the compile-cache key of the exact compile
-//!   (compiler fingerprint, engine version, source text, kind, specifier)
-//!   and the module encoding without its source. A run uses them only when
+//!   (compiler fingerprint, engine version, source text, kind) and the
+//!   module encoding without its source. A classic script's specifier is
+//!   not part of the key: its compiled form names the specifier only in the
+//!   URLs a run stamps, so the same bytes served from another address (a
+//!   bundle whose query string changes every load) are the same compile. A run uses them only when
 //!   the key matches the source it is given, and only after the bytecode
 //!   verifier accepts the decoded module.
 //! - Anything that does not match — another engine build, an edited script,
@@ -57,7 +60,7 @@ impl Runtime {
                 .run_script(source, specifier)
                 .map(|result| (result, None));
         }
-        let key = cache_key(&source.text, source.kind, specifier);
+        let key = script_key(&source);
         let cached = cache.and_then(|bytes| decode(bytes, &key, &source.text));
         self.interp.begin_jit_debug_capture();
         let (result, fresh) = self.with_direct_timeout(move |runtime| {
@@ -103,9 +106,14 @@ impl Runtime {
         specifier: &str,
     ) -> Result<Vec<u8>, OtterError> {
         let compiled = self.compile_source(source, specifier)?;
-        let key = cache_key(&source.text, source.kind, specifier);
-        encode(&compiled.bytecode, &key, specifier)
+        encode(&compiled.bytecode, &script_key(source), specifier)
     }
+}
+
+/// The key of a classic script's compile: its text and kind, under no
+/// specifier, which a run stamps on the decoded functions instead.
+fn script_key(source: &SourceInput) -> CompileCacheKey {
+    cache_key(&source.text, source.kind, "")
 }
 
 /// Code-cache bytes of a fresh compile under `key`.

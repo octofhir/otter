@@ -11,7 +11,8 @@
 //!
 //! # Contents
 //! - [`LazyCompileInput`] / [`LazyCompileHook`] — the host compile.
-//! - `Interpreter::compile_lazy_body` — compile, link and forward one record.
+//! - `Interpreter::compile_lazy_body` — compile (or take the body a code
+//!   cache kept, [`crate::lazy_body_cache`]), link and forward one record.
 //!
 //! # Invariants
 //! - A record compiles at most once; afterwards every resolution of its id
@@ -114,15 +115,52 @@ impl Interpreter {
                 [only] => Some(only),
                 _ => None,
             });
-        let body = hook(LazyCompileInput {
-            source,
-            module_url: url,
-            function: record,
-            chain: &chain,
-            environment,
-            resolutions: &module.module_resolutions,
-        })
-        .map_err(|message| self.err_syntax(message.into()))?;
+        // A script the embedder caches keeps each first-call body, and a
+        // body it kept on an earlier load answers this call.
+        let kept = record
+            .lazy
+            .filter(|_| self.lazy_body_store.keeps(url))
+            .map(|lazy| {
+                let fingerprint = crate::lazy_body_cache::fingerprint(
+                    &chain,
+                    environment,
+                    &module.module_resolutions,
+                    url,
+                );
+                (lazy.range, fingerprint)
+            });
+        let reused = kept.and_then(|(range, fingerprint)| {
+            let bytes = self.lazy_body_store.find(url, range, fingerprint)?;
+            crate::lazy_body_cache::decode(bytes, url)
+        });
+        let body = match reused {
+            Some(body) => body,
+            None => {
+                let body = hook(LazyCompileInput {
+                    source,
+                    module_url: url,
+                    function: record,
+                    chain: &chain,
+                    environment,
+                    resolutions: &module.module_resolutions,
+                })
+                .map_err(|message| self.err_syntax(message.into()))?;
+                if let Some((range, fingerprint)) = kept
+                    && let Some(bytes) = crate::lazy_body_cache::encode(&body)
+                {
+                    self.lazy_body_store.record(
+                        url,
+                        crate::lazy_body_cache::LazyBody {
+                            range,
+                            fingerprint,
+                            bytes,
+                        },
+                    );
+                }
+                self.lazy_bodies_compiled += 1;
+                body
+            }
+        };
         let realm_id = self.function_realm_id(function_id);
         let body_context = std::sync::Arc::clone(&self.code_space)
             .link_lazy_body(
@@ -145,7 +183,6 @@ impl Interpreter {
             .relink_lazy_body(function_id, &linked[0]);
         context.set_lazy_forward(function_id, body_base);
         self.owner_cache.borrow_mut().forget(function_id);
-        self.lazy_bodies_compiled += 1;
         Ok(())
     }
 }

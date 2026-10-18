@@ -55,7 +55,9 @@ pub mod __macro_support {
 pub(crate) mod abstract_ops;
 pub mod active_frame;
 mod allocation_ops;
+mod lazy_body_cache;
 mod lazy_compile;
+pub use lazy_body_cache::{KeptScript, LazyBody};
 pub use lazy_compile::{LazyCompileHook, LazyCompileInput};
 mod argument_window;
 mod arguments_access;
@@ -1242,6 +1244,8 @@ pub struct Interpreter {
     lazy_compile_hook: Option<LazyCompileHook>,
     /// Lazy records whose bodies this isolate compiled.
     lazy_bodies_compiled: u64,
+    /// First-call bodies kept for the scripts an embedder caches.
+    lazy_body_store: crate::lazy_body_cache::LazyBodyStore,
     /// Owners of function ids outside an ambient chunk.
     owner_cache: std::cell::RefCell<crate::execution_context::OwnerCache>,
     /// Side-channel for an unhandled JS-level throw escaping a

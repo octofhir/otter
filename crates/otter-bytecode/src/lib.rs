@@ -2191,7 +2191,7 @@ pub struct LazyEnvironment {
 }
 
 /// One ES-module import binding a lazily compiled body may read.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct LazyImport {
     /// Importer-side binding name.
     pub alias: String,
@@ -2481,14 +2481,32 @@ pub struct EvalCallerChain {
     pub var_depth: Option<u32>,
 }
 
+impl EvalCallerChain {
+    /// A hash of everything a compile against this chain reads from it.
+    #[must_use]
+    pub fn fingerprint(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = rustc_hash::FxHasher::default();
+        self.var_depth.hash(&mut hasher);
+        self.scopes.len().hash(&mut hasher);
+        for scope in &self.scopes {
+            scope.descriptor.fingerprint().hash(&mut hasher);
+            scope.extension_names.hash(&mut hasher);
+        }
+        hasher.finish()
+    }
+}
+
 /// A scope descriptor shared by everything that reads it by name: the
 /// context chains direct eval and lazily compiled bodies resolve outer
 /// bindings through. One descriptor serves every compile against it; a
-/// large scope builds its name index once, on its first lookup.
+/// large scope builds its name index once, on its first lookup, and its
+/// fingerprint once, on the first compile that keys a cache by it.
 #[derive(Debug)]
 pub struct SharedScope {
     descriptor: ScopeDescriptor,
     index: std::sync::OnceLock<rustc_hash::FxHashMap<Box<str>, u32>>,
+    fingerprint: std::sync::OnceLock<u64>,
 }
 
 impl SharedScope {
@@ -2501,7 +2519,27 @@ impl SharedScope {
         Self {
             descriptor,
             index: std::sync::OnceLock::new(),
+            fingerprint: std::sync::OnceLock::new(),
         }
+    }
+
+    /// A hash of everything a compile against this scope reads from it:
+    /// kind, flags, and every slot's name, kind and export mark, in order.
+    #[must_use]
+    pub fn fingerprint(&self) -> u64 {
+        *self.fingerprint.get_or_init(|| {
+            use std::hash::{Hash, Hasher};
+            let mut hasher = rustc_hash::FxHasher::default();
+            self.descriptor.kind.hash(&mut hasher);
+            self.descriptor.flags.hash(&mut hasher);
+            self.descriptor.slots.len().hash(&mut hasher);
+            for slot in &self.descriptor.slots {
+                slot.name.hash(&mut hasher);
+                slot.kind.hash(&mut hasher);
+                slot.exported.hash(&mut hasher);
+            }
+            hasher.finish()
+        })
     }
 
     /// The shared descriptor.
@@ -2740,7 +2778,7 @@ pub struct BytecodeModule {
 /// Stored as a flat vector inside [`BytecodeModule`] so the JSON dump
 /// round-trips cleanly; the runtime constructs an in-memory hashmap
 /// from these on first import.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ModuleResolution {
     /// Module URL of the importing source (e.g.
     /// `"file:///path/to/main.ts"`).

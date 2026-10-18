@@ -472,7 +472,7 @@ pub(crate) fn compile_object_literal(
                     cx.patch_branch_to_here(apply);
                     cx.emit(
                         Op::SetPrototype,
-                        vec![Operand::Register(dst), Operand::Register(value_reg)],
+                        [Operand::Register(dst), Operand::Register(value_reg)],
                         key_span,
                     );
                     cx.patch_branch_to_here(skip);
@@ -522,7 +522,7 @@ pub(crate) fn compile_object_literal(
                 cx.emit(Op::LoadUndefined, [Operand::Register(no_excluded)], s_span);
                 cx.emit(
                     Op::CopyDataProperties,
-                    vec![
+                    [
                         Operand::Register(dst),
                         Operand::Register(src),
                         Operand::Register(no_excluded),

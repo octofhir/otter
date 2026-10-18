@@ -41,7 +41,7 @@ pub(crate) fn compile_new(
         let dst = cx.alloc_scratch();
         cx.emit(
             Op::NewSpread,
-            vec![
+            [
                 Operand::Register(dst),
                 Operand::Register(callee_reg),
                 Operand::Register(args_reg),

@@ -842,7 +842,7 @@ fn compile_function_scopes(
         pre_declare_lexical_bindings(parent, &lex_names, span)?;
         hoist_function_declarations(parent, &body.statements)?;
         if f.is_generator {
-            parent.emit(Op::GeneratorStart, vec![], span);
+            parent.emit(Op::GeneratorStart, [], span);
         }
         let derived_fields = f.fields.as_ref().filter(|injection| injection.is_derived);
         let mut fields_emitted = derived_fields.is_none();
@@ -899,7 +899,7 @@ fn compile_function_scopes(
         crate::class::emit_instance_field_inits(parent, injection.fields)?;
     }
     if !ends_with_return {
-        parent.emit(Op::ReturnUndefined, vec![], span);
+        parent.emit(Op::ReturnUndefined, [], span);
     }
     Ok(mapped_argument_bindings)
 }
@@ -976,7 +976,7 @@ fn emit_make_callable_as(
     if record.needs_context && !context_empty {
         cx.emit_ctx(
             Op::MakeClosure,
-            vec![
+            [
                 Operand::Register(dst),
                 Operand::ConstIndex(function_const),
                 Operand::Register(0),

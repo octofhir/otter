@@ -120,7 +120,7 @@ fn apply_default_syntax_error_into(
     let cond_reg = parent.alloc_scratch();
     parent.emit(
         Op::Equal,
-        vec![
+        [
             Operand::Register(cond_reg),
             Operand::Register(value_reg),
             Operand::Register(undef_reg),

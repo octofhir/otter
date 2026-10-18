@@ -104,7 +104,7 @@ pub(crate) fn compile_assignment_with(
                     let dst = cx.alloc_scratch();
                     cx.emit(
                         op,
-                        vec![
+                        [
                             Operand::Register(dst),
                             Operand::Register(current),
                             Operand::Register(rhs),
@@ -116,7 +116,7 @@ pub(crate) fn compile_assignment_with(
             };
             cx.emit(
                 Op::SetSuperProperty,
-                vec![
+                [
                     Operand::Register(base_reg),
                     Operand::ConstIndex(name_idx),
                     Operand::Register(new_value),
@@ -133,7 +133,7 @@ pub(crate) fn compile_assignment_with(
                 let current = cx.alloc_scratch();
                 cx.emit(
                     Op::LoadProperty,
-                    vec![
+                    [
                         Operand::Register(current),
                         Operand::Register(obj_reg),
                         Operand::ConstIndex(name_idx),
@@ -144,7 +144,7 @@ pub(crate) fn compile_assignment_with(
                 let dst = cx.alloc_scratch();
                 cx.emit(
                     op,
-                    vec![
+                    [
                         Operand::Register(dst),
                         Operand::Register(current),
                         Operand::Register(rhs),
@@ -159,7 +159,7 @@ pub(crate) fn compile_assignment_with(
         let store_op = cx.store_property_op();
         cx.emit(
             store_op,
-            vec![
+            [
                 Operand::Register(obj_reg),
                 Operand::ConstIndex(name_idx),
                 Operand::Register(new_value),
@@ -184,7 +184,7 @@ pub(crate) fn compile_assignment_with(
                 let current = cx.alloc_scratch();
                 cx.emit(
                     Op::PrivateGet,
-                    vec![
+                    [
                         Operand::Register(current),
                         Operand::Register(obj_reg),
                         Operand::Register(key_reg),
@@ -195,7 +195,7 @@ pub(crate) fn compile_assignment_with(
                 let dst = cx.alloc_scratch();
                 cx.emit(
                     op,
-                    vec![
+                    [
                         Operand::Register(dst),
                         Operand::Register(current),
                         Operand::Register(rhs),
@@ -207,7 +207,7 @@ pub(crate) fn compile_assignment_with(
         };
         cx.emit(
             Op::PrivateSet,
-            vec![
+            [
                 Operand::Register(obj_reg),
                 Operand::Register(key_reg),
                 Operand::Register(new_value),
@@ -240,7 +240,7 @@ pub(crate) fn compile_assignment_with(
                     let current = cx.alloc_scratch();
                     cx.emit(
                         Op::LoadSuperElement,
-                        vec![
+                        [
                             Operand::Register(current),
                             Operand::Register(home_reg),
                             Operand::Register(idx_reg),
@@ -251,7 +251,7 @@ pub(crate) fn compile_assignment_with(
                     let dst = cx.alloc_scratch();
                     cx.emit(
                         op,
-                        vec![
+                        [
                             Operand::Register(dst),
                             Operand::Register(current),
                             Operand::Register(rhs),
@@ -263,7 +263,7 @@ pub(crate) fn compile_assignment_with(
             };
             cx.emit(
                 Op::SetSuperElement,
-                vec![
+                [
                     Operand::Register(base_reg),
                     Operand::Register(idx_reg),
                     Operand::Register(new_value),
@@ -280,7 +280,7 @@ pub(crate) fn compile_assignment_with(
                 let current = cx.alloc_scratch();
                 cx.emit(
                     Op::LoadElement,
-                    vec![
+                    [
                         Operand::Register(current),
                         Operand::Register(arr_reg),
                         Operand::Register(idx_reg),
@@ -291,7 +291,7 @@ pub(crate) fn compile_assignment_with(
                 let dst = cx.alloc_scratch();
                 cx.emit(
                     op,
-                    vec![
+                    [
                         Operand::Register(dst),
                         Operand::Register(current),
                         Operand::Register(rhs),
@@ -388,7 +388,7 @@ pub(crate) fn compile_assignment_with(
                 };
                 cx.emit(
                     op,
-                    vec![
+                    [
                         Operand::Register(reg),
                         Operand::Register(reg),
                         Operand::Register(rhs),
@@ -431,7 +431,7 @@ pub(crate) fn compile_assignment_with(
             let dst = cx.alloc_scratch();
             cx.emit(
                 op,
-                vec![
+                [
                     Operand::Register(dst),
                     Operand::Register(current),
                     Operand::Register(rhs),
@@ -513,7 +513,7 @@ pub(crate) fn compile_logical_assignment(
                 let load = cx.alloc_scratch();
                 cx.emit(
                     Op::LoadProperty,
-                    vec![
+                    [
                         Operand::Register(load),
                         Operand::Register(obj_reg),
                         Operand::ConstIndex(name_idx),
@@ -542,7 +542,7 @@ pub(crate) fn compile_logical_assignment(
                 let load = cx.alloc_scratch();
                 cx.emit(
                     Op::LoadSuperElement,
-                    vec![
+                    [
                         Operand::Register(load),
                         Operand::Register(home_reg),
                         Operand::Register(idx_reg),
@@ -562,7 +562,7 @@ pub(crate) fn compile_logical_assignment(
                 let load = cx.alloc_scratch();
                 cx.emit(
                     Op::LoadElement,
-                    vec![
+                    [
                         Operand::Register(load),
                         Operand::Register(obj_reg),
                         Operand::Register(key_reg),
@@ -590,7 +590,7 @@ pub(crate) fn compile_logical_assignment(
             let load = cx.alloc_scratch();
             cx.emit(
                 Op::PrivateGet,
-                vec![
+                [
                     Operand::Register(load),
                     Operand::Register(obj_reg),
                     Operand::Register(key_reg),
@@ -648,7 +648,7 @@ pub(crate) fn compile_logical_assignment(
             let eq_undef = cx.alloc_scratch();
             cx.emit(
                 Op::Equal,
-                vec![
+                [
                     Operand::Register(eq_undef),
                     Operand::Register(cur),
                     Operand::Register(undef_r),
@@ -658,7 +658,7 @@ pub(crate) fn compile_logical_assignment(
             let eq_null = cx.alloc_scratch();
             cx.emit(
                 Op::Equal,
-                vec![
+                [
                     Operand::Register(eq_null),
                     Operand::Register(cur),
                     Operand::Register(null_r),
@@ -768,7 +768,7 @@ pub(crate) fn assign_to_target(
                 let name_idx = cx.intern_string_constant(member.property.name.as_str());
                 cx.emit(
                     Op::SetSuperProperty,
-                    vec![
+                    [
                         Operand::Register(base_reg),
                         Operand::ConstIndex(name_idx),
                         Operand::Register(value_reg),
@@ -783,7 +783,7 @@ pub(crate) fn assign_to_target(
             let store_op = cx.store_property_op();
             cx.emit(
                 store_op,
-                vec![
+                [
                     Operand::Register(obj_reg),
                     Operand::ConstIndex(name_idx),
                     Operand::Register(value_reg),
@@ -803,7 +803,7 @@ pub(crate) fn assign_to_target(
                 let base_reg = crate::class::emit_super_base(cx, span)?;
                 cx.emit(
                     Op::SetSuperElement,
-                    vec![
+                    [
                         Operand::Register(base_reg),
                         Operand::Register(idx_reg),
                         Operand::Register(value_reg),
@@ -828,7 +828,7 @@ pub(crate) fn assign_to_target(
             let key_reg = crate::class::load_private_key(cx, member.field.name.as_str(), span)?;
             cx.emit(
                 Op::PrivateSet,
-                vec![
+                [
                     Operand::Register(obj_reg),
                     Operand::Register(key_reg),
                     Operand::Register(value_reg),
@@ -940,7 +940,7 @@ fn assign_prepared_target(
             let store_op = cx.store_property_op();
             cx.emit(
                 store_op,
-                vec![
+                [
                     Operand::Register(obj_reg),
                     Operand::ConstIndex(name_idx),
                     Operand::Register(value_reg),
@@ -953,7 +953,7 @@ fn assign_prepared_target(
         PreparedAssignmentTarget::PrivateField { obj_reg, key_reg } => {
             cx.emit(
                 Op::PrivateSet,
-                vec![
+                [
                     Operand::Register(obj_reg),
                     Operand::Register(key_reg),
                     Operand::Register(value_reg),
@@ -969,7 +969,7 @@ fn assign_prepared_target(
         PreparedAssignmentTarget::SuperProperty { base_reg, name_idx } => {
             cx.emit(
                 Op::SetSuperProperty,
-                vec![
+                [
                     Operand::Register(base_reg),
                     Operand::ConstIndex(name_idx),
                     Operand::Register(value_reg),
@@ -981,7 +981,7 @@ fn assign_prepared_target(
         PreparedAssignmentTarget::SuperElement { base_reg, idx_reg } => {
             cx.emit(
                 Op::SetSuperElement,
-                vec![
+                [
                     Operand::Register(base_reg),
                     Operand::Register(idx_reg),
                     Operand::Register(value_reg),
@@ -1209,7 +1209,7 @@ pub(crate) fn assign_object_pattern(
                 if let Some(key_reg) = computed_key {
                     cx.emit(
                         Op::LoadElement,
-                        vec![
+                        [
                             Operand::Register(val),
                             Operand::Register(value_reg),
                             Operand::Register(key_reg),
@@ -1295,7 +1295,7 @@ pub(crate) fn assign_object_pattern(
         }
         cx.emit(
             Op::CopyDataProperties,
-            vec![
+            [
                 Operand::Register(rest_obj),
                 Operand::Register(value_reg),
                 Operand::Register(excluded),
@@ -1325,7 +1325,7 @@ pub(crate) fn apply_default_with_name(
     let is_undef = cx.alloc_scratch();
     cx.emit(
         Op::Equal,
-        vec![
+        [
             Operand::Register(is_undef),
             Operand::Register(value_reg),
             Operand::Register(undef_reg),

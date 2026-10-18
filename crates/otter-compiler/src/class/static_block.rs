@@ -79,7 +79,7 @@ pub(crate) fn compile_static_block(
         for stmt in body {
             compile_discarded_statement(parent, stmt)?;
         }
-        parent.emit(Op::ReturnUndefined, vec![], span);
+        parent.emit(Op::ReturnUndefined, [], span);
         Ok(())
     })();
     parent.exit_scope();
@@ -149,7 +149,7 @@ pub(crate) fn compile_static_field_initializer(
                 };
                 parent.emit(Op::Return, [Operand::Register(value_reg)], span);
             }
-            None => parent.emit(Op::ReturnUndefined, vec![], span),
+            None => parent.emit(Op::ReturnUndefined, [], span),
         }
         Ok(())
     })();

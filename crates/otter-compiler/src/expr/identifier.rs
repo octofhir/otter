@@ -145,7 +145,7 @@ pub(crate) fn compile_identifier_without_with(
             let target_const = cx.intern_string_constant(&target);
             cx.emit(
                 Op::ModuleNamespaceObject,
-                vec![Operand::Register(dst), Operand::ConstIndex(target_const)],
+                [Operand::Register(dst), Operand::ConstIndex(target_const)],
                 span,
             );
             return Ok(dst);
@@ -163,7 +163,7 @@ pub(crate) fn compile_identifier_without_with(
         let dst = cx.alloc_scratch();
         cx.emit(
             Op::LoadImportBinding,
-            vec![
+            [
                 Operand::Register(dst),
                 Operand::ConstIndex(url_const),
                 Operand::ConstIndex(name_const),

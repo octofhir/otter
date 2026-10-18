@@ -102,7 +102,7 @@ pub(crate) fn compile_synthetic_constructor(
             let dst = parent.alloc_scratch();
             parent.emit(
                 Op::SuperConstructSpread,
-                vec![
+                [
                     Operand::Register(dst),
                     Operand::Register(super_ctor),
                     Operand::Register(args_reg),
@@ -116,7 +116,7 @@ pub(crate) fn compile_synthetic_constructor(
             parent.emit(Op::Return, [Operand::Register(dst)], span);
         } else {
             emit_instance_field_inits(parent, instance_fields)?;
-            parent.emit(Op::ReturnUndefined, vec![], span);
+            parent.emit(Op::ReturnUndefined, [], span);
         }
         Ok(())
     })();

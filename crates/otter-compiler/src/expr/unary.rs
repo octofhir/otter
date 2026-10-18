@@ -73,7 +73,7 @@ pub(crate) fn compile_unary(
             let dst = cx.alloc_scratch();
             cx.emit(
                 Op::DeleteProperty,
-                vec![
+                [
                     Operand::Register(dst),
                     Operand::Register(obj_reg),
                     Operand::ConstIndex(name_idx),
@@ -88,7 +88,7 @@ pub(crate) fn compile_unary(
             let dst = cx.alloc_scratch();
             cx.emit(
                 Op::DeleteElement,
-                vec![
+                [
                     Operand::Register(dst),
                     Operand::Register(obj_reg),
                     Operand::Register(idx_reg),
@@ -115,7 +115,7 @@ pub(crate) fn compile_unary(
                 let name_idx = cx.intern_string_constant(&name);
                 cx.emit(
                     Op::DeleteProperty,
-                    vec![
+                    [
                         Operand::Register(dst),
                         Operand::Register(probe.object_reg),
                         Operand::ConstIndex(name_idx),
@@ -154,7 +154,7 @@ pub(crate) fn compile_unary(
                     let name_idx = cx.intern_string_constant(m.property.name.as_str());
                     cx.emit(
                         Op::DeleteProperty,
-                        vec![
+                        [
                             Operand::Register(dst),
                             Operand::Register(obj),
                             Operand::ConstIndex(name_idx),
@@ -172,7 +172,7 @@ pub(crate) fn compile_unary(
                     let idx_reg = compile_expr(cx, &m.expression, span)?;
                     cx.emit(
                         Op::DeleteElement,
-                        vec![
+                        [
                             Operand::Register(dst),
                             Operand::Register(obj),
                             Operand::Register(idx_reg),
@@ -498,7 +498,7 @@ pub(crate) fn compile_update(
             let name_idx = cx.intern_string_constant(name);
             cx.emit(
                 Op::LoadSuperProperty,
-                vec![
+                [
                     Operand::Register(old),
                     Operand::Register(home_reg),
                     Operand::ConstIndex(name_idx),
@@ -520,7 +520,7 @@ pub(crate) fn compile_update(
             let base_reg = crate::class::emit_super_base(cx, span)?;
             cx.emit(
                 Op::LoadSuperElement,
-                vec![
+                [
                     Operand::Register(old),
                     Operand::Register(home_reg),
                     Operand::Register(key_reg),
@@ -549,7 +549,7 @@ pub(crate) fn compile_update(
             let key_reg = compile_expr(cx, &member.expression, span)?;
             cx.emit(
                 Op::LoadElement,
-                vec![
+                [
                     Operand::Register(old),
                     Operand::Register(obj_reg),
                     Operand::Register(key_reg),
@@ -577,7 +577,7 @@ pub(crate) fn compile_update(
             let key_reg = crate::class::load_private_key(cx, member.field.name.as_str(), span)?;
             cx.emit(
                 Op::PrivateGet,
-                vec![
+                [
                     Operand::Register(old),
                     Operand::Register(obj_reg),
                     Operand::Register(key_reg),
@@ -610,7 +610,7 @@ pub(crate) fn compile_update(
     let next = cx.alloc_scratch();
     cx.emit(
         Op::Increment,
-        vec![
+        [
             Operand::Register(next),
             Operand::Register(postfix_value.unwrap_or(old)),
             Operand::Imm32(delta),
@@ -656,7 +656,7 @@ pub(crate) fn compile_update(
             let store_op = cx.store_property_op();
             cx.emit(
                 store_op,
-                vec![
+                [
                     Operand::Register(obj_reg),
                     Operand::ConstIndex(name_idx),
                     Operand::Register(next),
@@ -673,7 +673,7 @@ pub(crate) fn compile_update(
         UpdateTarget::PrivateField { obj_reg, key_reg } => {
             cx.emit(
                 Op::PrivateSet,
-                vec![
+                [
                     Operand::Register(obj_reg),
                     Operand::Register(key_reg),
                     Operand::Register(next),
@@ -685,7 +685,7 @@ pub(crate) fn compile_update(
             let name_idx = cx.intern_string_constant(name);
             cx.emit(
                 Op::SetSuperProperty,
-                vec![
+                [
                     Operand::Register(base_reg),
                     Operand::ConstIndex(name_idx),
                     Operand::Register(next),
@@ -698,7 +698,7 @@ pub(crate) fn compile_update(
         } => {
             cx.emit(
                 Op::SetSuperElement,
-                vec![
+                [
                     Operand::Register(base_reg),
                     Operand::Register(key_reg),
                     Operand::Register(next),
@@ -729,7 +729,7 @@ fn update_register_binding(
     let increment = |cx: &mut Compiler, src: u16| {
         cx.emit(
             Op::Increment,
-            vec![
+            [
                 Operand::Register(reg),
                 Operand::Register(src),
                 Operand::Imm32(delta),

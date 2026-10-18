@@ -179,7 +179,7 @@ pub(crate) fn emit_with_binding_probe(
         let unscopables = cx.alloc_scratch();
         cx.emit(
             Op::LoadElement,
-            vec![
+            [
                 Operand::Register(unscopables),
                 Operand::Register(env_reg),
                 Operand::Register(unscopables_sym),
@@ -360,7 +360,7 @@ pub(crate) fn emit_with_set_mutable_binding(
     let scratch = cx.alloc_scratch();
     cx.emit(
         Op::StoreProperty,
-        vec![
+        [
             Operand::Register(object_reg),
             Operand::ConstIndex(key_idx),
             Operand::Register(value_reg),

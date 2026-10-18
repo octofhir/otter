@@ -520,20 +520,20 @@ impl FunctionContext {
     pub(crate) fn emit_ctx(
         &mut self,
         op: Op,
-        mut operands: Vec<Operand>,
+        mut operands: impl AsRef<[Operand]> + AsMut<[Operand]>,
         ctx_index: usize,
         ctx: CtxReg,
         span: (u32, u32),
     ) {
         match ctx {
-            CtxReg::Reg(reg) => operands[ctx_index] = Operand::Register(reg),
+            CtxReg::Reg(reg) => operands.as_mut()[ctx_index] = Operand::Register(reg),
             CtxReg::Closure if self.closure_context_empty => {
                 let reg = self.alloc_scratch();
                 self.emit(Op::LoadUndefined, [Operand::Register(reg)], span);
-                operands[ctx_index] = Operand::Register(reg);
+                operands.as_mut()[ctx_index] = Operand::Register(reg);
             }
             CtxReg::Closure => {
-                operands[ctx_index] = Operand::Register(0);
+                operands.as_mut()[ctx_index] = Operand::Register(0);
                 let pc = self.next_pc();
                 self.closure_ctx_patches.push((pc, ctx_index));
             }
@@ -679,7 +679,7 @@ impl FunctionContext {
         let op = self.store_property_op();
         self.emit(
             op,
-            vec![
+            [
                 Operand::Register(obj_reg),
                 Operand::ConstIndex(name_const),
                 Operand::Register(src),
@@ -719,7 +719,7 @@ impl FunctionContext {
         let op = self.store_element_op();
         self.emit(
             op,
-            vec![
+            [
                 Operand::Register(obj_reg),
                 Operand::Register(key_reg),
                 Operand::Register(src),

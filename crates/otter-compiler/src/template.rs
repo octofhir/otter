@@ -80,7 +80,7 @@ pub(crate) fn compile_template_literal(
         let dst = cx.alloc_scratch();
         cx.emit(
             Op::Add,
-            vec![
+            [
                 Operand::Register(dst),
                 Operand::Register(lhs_in),
                 Operand::Register(rhs_in),
@@ -104,7 +104,7 @@ pub(crate) fn compile_template_literal(
             let dst = cx.alloc_scratch();
             cx.emit(
                 Op::Add,
-                vec![
+                [
                     Operand::Register(dst),
                     Operand::Register(lhs_in),
                     Operand::Register(rhs_in),
@@ -166,7 +166,7 @@ pub(crate) fn compile_tagged_template(
             let name_idx = cx.intern_string_constant(m.property.name.as_str());
             cx.emit(
                 Op::LoadProperty,
-                vec![
+                [
                     Operand::Register(callee),
                     Operand::Register(obj_reg),
                     Operand::ConstIndex(name_idx),
@@ -181,7 +181,7 @@ pub(crate) fn compile_tagged_template(
             let callee = cx.alloc_scratch();
             cx.emit(
                 Op::LoadElement,
-                vec![
+                [
                     Operand::Register(callee),
                     Operand::Register(obj_reg),
                     Operand::Register(key_reg),
@@ -252,7 +252,7 @@ pub(crate) fn compile_tagged_template(
         };
         cx.emit(
             Op::CallSpread,
-            vec![
+            [
                 Operand::Register(dst),
                 Operand::Register(tag_reg),
                 Operand::Register(this_value),
@@ -348,7 +348,7 @@ pub(crate) fn compile_string_raw_template(
         let dst = cx.alloc_scratch();
         cx.emit(
             Op::Add,
-            vec![
+            [
                 Operand::Register(dst),
                 Operand::Register(lhs_in),
                 Operand::Register(rhs_in),
@@ -370,7 +370,7 @@ pub(crate) fn compile_string_raw_template(
             let dst = cx.alloc_scratch();
             cx.emit(
                 Op::Add,
-                vec![
+                [
                     Operand::Register(dst),
                     Operand::Register(lhs_in),
                     Operand::Register(rhs_in),

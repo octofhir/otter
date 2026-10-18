@@ -65,7 +65,7 @@ impl Compiler {
                         };
                         self.emit_ctx(
                             op,
-                            vec![
+                            [
                                 Operand::Register(dst),
                                 Operand::Register(0),
                                 Operand::ConstIndex(name_idx),
@@ -115,7 +115,7 @@ impl Compiler {
             let name_idx = self.intern_string_constant(name);
             self.emit_ctx(
                 Op::LoadLookupSlot,
-                vec![
+                [
                     Operand::Register(dst),
                     Operand::Register(0),
                     Operand::ConstIndex(name_idx),
@@ -147,7 +147,7 @@ impl Compiler {
                 };
                 self.emit_ctx(
                     op,
-                    vec![
+                    [
                         Operand::Register(dst),
                         Operand::Register(0),
                         Operand::Imm32(Self::coord(depth, slot)),
@@ -223,7 +223,7 @@ impl Compiler {
                         .to_imm32();
                         self.emit_ctx(
                             Op::StoreLookupGlobal,
-                            vec![
+                            [
                                 Operand::Register(value),
                                 Operand::Register(0),
                                 Operand::ConstIndex(name_idx),
@@ -265,7 +265,7 @@ impl Compiler {
             let name_idx = self.intern_string_constant(name);
             self.emit_ctx(
                 Op::StoreLookupSlot,
-                vec![
+                [
                     Operand::Register(value),
                     Operand::Register(0),
                     Operand::ConstIndex(name_idx),
@@ -304,7 +304,7 @@ impl Compiler {
                         let probe = self.alloc_scratch();
                         self.emit_ctx(
                             Op::LoadContextSlotChecked,
-                            vec![
+                            [
                                 Operand::Register(probe),
                                 Operand::Register(0),
                                 Operand::Imm32(Self::coord(depth, slot)),
@@ -346,7 +346,7 @@ impl Compiler {
                 };
                 self.emit_ctx(
                     op,
-                    vec![
+                    [
                         Operand::Register(value),
                         Operand::Register(0),
                         Operand::Imm32(Self::coord(depth, slot)),
@@ -381,7 +381,7 @@ impl Compiler {
         let reg = self.alloc_scratch();
         self.emit_ctx(
             Op::ResolveLookupRef,
-            vec![
+            [
                 Operand::Register(reg),
                 Operand::Register(0),
                 Operand::ConstIndex(name_idx),
@@ -439,7 +439,7 @@ impl Compiler {
             VarTarget::Own(storage) => self.emit_store_storage(value, storage, span),
             VarTarget::Outer { depth, slot } => self.emit_ctx(
                 Op::StoreContextSlot,
-                vec![
+                [
                     Operand::Register(value),
                     Operand::Register(0),
                     Operand::Imm32(Self::coord(depth, slot)),
@@ -452,7 +452,7 @@ impl Compiler {
                 let name_idx = self.intern_string_constant(name);
                 self.emit_ctx(
                     Op::StoreVarScope,
-                    vec![
+                    [
                         Operand::Register(value),
                         Operand::Register(0),
                         Operand::ConstIndex(name_idx),
@@ -480,7 +480,7 @@ impl Compiler {
             NameRef::Binding(resolved) => match resolved.lookup {
                 Some(site) => self.emit_ctx(
                     Op::DeleteLookupSlot,
-                    vec![
+                    [
                         Operand::Register(dst),
                         Operand::Register(0),
                         Operand::ConstIndex(name_idx),
@@ -494,7 +494,7 @@ impl Compiler {
             },
             NameRef::Global(Some(site)) => self.emit_ctx(
                 Op::DeleteLookupGlobal,
-                vec![
+                [
                     Operand::Register(dst),
                     Operand::Register(0),
                     Operand::ConstIndex(name_idx),
@@ -513,7 +513,7 @@ impl Compiler {
                     self.emit(Op::LoadGlobalThis, [Operand::Register(global_reg)], span);
                     self.emit(
                         Op::DeleteProperty,
-                        vec![
+                        [
                             Operand::Register(dst),
                             Operand::Register(global_reg),
                             Operand::ConstIndex(name_idx),
@@ -599,7 +599,7 @@ impl Compiler {
                 Access::Own => self.emit_load_storage_checked(dst, resolved.info.storage, span),
                 Access::Outer { depth, slot } => self.emit_ctx(
                     Op::LoadContextSlotChecked,
-                    vec![
+                    [
                         Operand::Register(dst),
                         Operand::Register(0),
                         Operand::Imm32(Self::coord(depth, slot)),
@@ -623,7 +623,7 @@ impl Compiler {
                     };
                     self.emit_ctx(
                         Op::BindThisContextSlot,
-                        vec![
+                        [
                             Operand::Register(value),
                             Operand::Register(0),
                             Operand::Imm32(Self::coord(0, slot)),
@@ -638,7 +638,7 @@ impl Compiler {
                 }
                 Access::Outer { depth, slot } => self.emit_ctx(
                     Op::BindThisContextSlot,
-                    vec![
+                    [
                         Operand::Register(value),
                         Operand::Register(0),
                         Operand::Imm32(Self::coord(depth, slot)),

@@ -92,7 +92,7 @@ pub(crate) fn compile_yield(
             let iter_method = cx.alloc_scratch();
             cx.emit(
                 Op::LoadElement,
-                vec![
+                [
                     Operand::Register(iter_method),
                     Operand::Register(arg_reg),
                     Operand::Register(iter_sym),
@@ -106,7 +106,7 @@ pub(crate) fn compile_yield(
             cx.patch_branch_to_here(have_iter);
             cx.emit(
                 Op::CallWithThis,
-                vec![
+                [
                     Operand::Register(iter_reg),
                     Operand::Register(iter_method),
                     Operand::Register(arg_reg),
@@ -169,7 +169,7 @@ pub(crate) fn compile_yield(
         // kind == next: innerResult = Call(nextMethod, iterator, «received»).
         cx.emit(
             Op::CallWithThis,
-            vec![
+            [
                 Operand::Register(inner_reg),
                 Operand::Register(next_m),
                 Operand::Register(iter_reg),
@@ -197,7 +197,7 @@ pub(crate) fn compile_yield(
         let throw_absent = cx.emit_branch_placeholder(Op::JumpIfNullish, Some(throw_m), span);
         cx.emit(
             Op::CallWithThis,
-            vec![
+            [
                 Operand::Register(inner_reg),
                 Operand::Register(throw_m),
                 Operand::Register(iter_reg),
@@ -230,7 +230,7 @@ pub(crate) fn compile_yield(
         let return_absent = cx.emit_branch_placeholder(Op::JumpIfNullish, Some(return_m), span);
         cx.emit(
             Op::CallWithThis,
-            vec![
+            [
                 Operand::Register(inner_reg),
                 Operand::Register(return_m),
                 Operand::Register(iter_reg),

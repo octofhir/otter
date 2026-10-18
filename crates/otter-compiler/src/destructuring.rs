@@ -37,7 +37,7 @@ pub(crate) fn apply_default_into_with_name(
     let cond_reg = parent.alloc_scratch();
     parent.emit(
         Op::Equal,
-        vec![
+        [
             Operand::Register(cond_reg),
             Operand::Register(value_reg),
             Operand::Register(undef_reg),
@@ -54,7 +54,7 @@ pub(crate) fn apply_default_into_with_name(
     };
     parent.emit(
         Op::StoreLocal,
-        vec![
+        [
             Operand::Register(default_value),
             Operand::Imm32(value_reg as i32),
         ],
@@ -245,7 +245,7 @@ pub(crate) fn destructure_array_inner(
             let done_reg = parent.alloc_scratch();
             parent.emit(
                 Op::IteratorNext,
-                vec![
+                [
                     Operand::Register(value_reg),
                     Operand::Register(done_reg),
                     Operand::Register(iter_reg),
@@ -274,7 +274,7 @@ pub(crate) fn destructure_array_inner(
         let loop_top = parent.next_pc();
         parent.emit(
             Op::IteratorNext,
-            vec![
+            [
                 Operand::Register(value_reg),
                 Operand::Register(done_reg),
                 Operand::Register(iter_reg),
@@ -365,7 +365,7 @@ pub(crate) fn destructure_object_inner(
             }
             parent.emit(
                 Op::LoadElement,
-                vec![
+                [
                     Operand::Register(value_reg),
                     Operand::Register(src_reg),
                     Operand::Register(key_reg),
@@ -408,7 +408,7 @@ pub(crate) fn destructure_object_inner(
                     }
                     parent.emit(
                         Op::LoadProperty,
-                        vec![
+                        [
                             Operand::Register(value_reg),
                             Operand::Register(src_reg),
                             Operand::ConstIndex(key_const),
@@ -487,7 +487,7 @@ pub(crate) fn destructure_object_inner(
         }
         parent.emit(
             Op::CopyDataProperties,
-            vec![
+            [
                 Operand::Register(rest_obj),
                 Operand::Register(src_reg),
                 Operand::Register(excluded),

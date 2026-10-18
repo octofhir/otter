@@ -713,7 +713,7 @@ pub(crate) fn eval_var_declaration_target(
         let name_idx = cx.intern_string_constant(name);
         cx.emit_ctx(
             Op::DeclareEvalVar,
-            vec![
+            [
                 Operand::Register(0),
                 Operand::ConstIndex(name_idx),
                 Operand::Imm32(i32::from(depth)),

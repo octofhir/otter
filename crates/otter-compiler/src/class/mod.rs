@@ -353,7 +353,7 @@ fn compile_class_strict(
         let proto_const = cx.intern_string_constant("prototype");
         cx.emit(
             Op::LoadProperty,
-            vec![
+            [
                 Operand::Register(parent_proto),
                 Operand::Register(parent_reg),
                 Operand::ConstIndex(proto_const),
@@ -362,7 +362,7 @@ fn compile_class_strict(
         );
         cx.emit(
             Op::SetPrototype,
-            vec![
+            [
                 Operand::Register(prototype_reg),
                 Operand::Register(parent_proto),
             ],
@@ -370,7 +370,7 @@ fn compile_class_strict(
         );
         cx.emit(
             Op::SetPrototype,
-            vec![
+            [
                 Operand::Register(statics_reg),
                 Operand::Register(parent_reg),
             ],
@@ -382,7 +382,7 @@ fn compile_class_strict(
         cx.emit(Op::LoadNull, [Operand::Register(null_reg)], span);
         cx.emit(
             Op::SetPrototype,
-            vec![
+            [
                 Operand::Register(prototype_reg),
                 Operand::Register(null_reg),
             ],
@@ -891,7 +891,7 @@ fn compile_class_strict(
     };
     cx.emit(
         Op::MakeClass,
-        vec![
+        [
             Operand::Register(class_reg),
             Operand::Register(ctor_reg),
             Operand::Register(prototype_reg),
@@ -994,7 +994,7 @@ fn compile_class_strict(
                 let value_reg = cx.alloc_scratch();
                 cx.emit(
                     Op::CallWithThis,
-                    vec![
+                    [
                         Operand::Register(value_reg),
                         Operand::Register(init_reg),
                         Operand::Register(class_reg),
@@ -1025,7 +1025,7 @@ fn compile_class_strict(
                 let dst = cx.alloc_scratch();
                 cx.emit(
                     Op::CallWithThis,
-                    vec![
+                    [
                         Operand::Register(dst),
                         Operand::Register(fn_reg),
                         Operand::Register(class_reg),

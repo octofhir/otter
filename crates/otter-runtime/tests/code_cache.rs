@@ -5,8 +5,10 @@
 //!
 //! - The first run of a script hands back bytes; a run given them compiles
 //!   nothing and behaves the same, lazily compiled functions included.
-//! - Bytes for another source, another specifier or a damaged copy are a
-//!   miss: the script compiles and fresh bytes come back.
+//! - The same source under another specifier runs from the same bytes, and
+//!   its functions name the specifier it ran under.
+//! - Bytes for another source or a damaged copy are a miss: the script
+//!   compiles and fresh bytes come back.
 
 use otter_runtime::{Runtime, SourceInput};
 
@@ -54,6 +56,24 @@ fn a_kept_cache_runs_the_script_without_compiling_it() {
         .expect("a turn");
     assert_eq!(result.completion_string(), "12");
     assert!(second.lazy_function_bodies_compiled() >= lazily);
+
+    let stack = "function where() { return new Error('here').stack; } where();";
+    let (_, bytes) = run(&mut first, stack, "https://example.test/a.js", None);
+    let mut moved = Runtime::builder().build().expect("runtime");
+    let (completion, fresh) = run(
+        &mut moved,
+        stack,
+        "https://example.test/b.js?v=2",
+        bytes.as_deref(),
+    );
+    assert!(
+        fresh.is_none(),
+        "another address of the same source is a hit"
+    );
+    assert!(
+        completion.contains("b.js?v=2") && !completion.contains("a.js"),
+        "{completion}"
+    );
 }
 
 #[test]
@@ -70,7 +90,6 @@ fn bytes_that_do_not_match_are_a_miss() {
             "https://example.test/a.js",
             &bytes[..],
         ),
-        (SCRIPT, "https://example.test/b.js", &bytes[..]),
         (SCRIPT, "https://example.test/a.js", &damaged[..]),
         (SCRIPT, "https://example.test/a.js", &b"not a cache"[..]),
     ] {

@@ -9,7 +9,7 @@ for r in $(seq 0 "$RUNS"); do
   for bin in "$@"; do
     line=$(OTLYRA_NO_KEYCHAIN=1 OTLYRA_LOG="warn,page.timing=info" "$bin" --url "$URL" \
       --screenshot "$OUT" --no-interface --width 1280 --height 900 --scale-factor 1 2>&1 \
-      | grep "page.timing" | tail -1 | sed 's/\x1b\[[0-9;]*m//g')
+      | grep "page.timing" | head -1 | sed 's/\x1b\[[0-9;]*m//g')
     tag=$([ "$r" = 0 ] && echo warmup || echo "run$r")
     echo "$tag $(basename "$bin") $(echo "$line" | grep -oE '(scripts_ms|load_event_ms|settle_ms|total_ms|[a-z_]+_ms)=[0-9.]+' | tr '\n' ' ')"
   done

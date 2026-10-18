@@ -34,7 +34,7 @@
 //! - [`WebModuleError`] — a fetch, parse or resolution failure in a graph.
 //! - [`WebModuleCodeCache`] — a module's compiled form, for the embedder to
 //!   keep beside the response ([`WebModuleMap::produce_code_caches`],
-//!   [`WebModuleMap::take_code_caches`], [`WebModuleMap::deliver_cached`]).
+//!   `Runtime::web_module_code_caches`, [`WebModuleMap::deliver_cached`]).
 //!
 //! # Invariants
 //! - The map is keyed by request URL and holds each response once, so two
@@ -152,6 +152,12 @@ struct WebModuleState {
     produce_code_caches: bool,
     /// Code caches encoded since the embedder last took them.
     fresh_code_caches: Vec<WebModuleCodeCache>,
+    /// Modules whose first-call bodies the interpreter is to keep, by the
+    /// URL they compiled as, until the runtime hands them over.
+    kept: Vec<(String, otter_vm::KeptScript)>,
+    /// Every module whose bodies are kept: the URL it compiled as and the
+    /// one it was requested as.
+    kept_urls: Vec<(String, String)>,
 }
 
 /// The compiled form of one delivered module, for the embedder to keep
@@ -274,7 +280,7 @@ impl WebModuleMap {
     }
 
     /// [`Self::deliver`] with the code cache an earlier load produced for
-    /// the same response ([`Self::take_code_caches`]). The module is then
+    /// the same response (`Runtime::web_module_code_caches`). The module is then
     /// neither parsed nor compiled, provided the bytes match this engine
     /// build, the module text and its URL; otherwise they are ignored.
     pub fn deliver_cached(
@@ -303,16 +309,28 @@ impl WebModuleMap {
     }
 
     /// Encode the compile of every module delivered without a usable code
-    /// cache from now on, for [`Self::take_code_caches`].
+    /// cache from now on, for `Runtime::web_module_code_caches`.
     pub fn produce_code_caches(&self) {
         self.write().produce_code_caches = true;
     }
 
-    /// The code caches encoded since the last call, for the embedder to
-    /// keep beside each response.
+    /// The code caches encoded since the last call, for
+    /// `Runtime::web_module_code_caches` to hand the embedder.
     #[must_use]
-    pub fn take_code_caches(&self) -> Vec<WebModuleCodeCache> {
+    pub(crate) fn take_code_caches(&self) -> Vec<WebModuleCodeCache> {
         std::mem::take(&mut self.write().fresh_code_caches)
+    }
+
+    /// The modules whose first-call bodies the interpreter is to keep from
+    /// now on, each once.
+    pub(crate) fn take_kept(&self) -> Vec<(String, otter_vm::KeptScript)> {
+        std::mem::take(&mut self.write().kept)
+    }
+
+    /// Every module whose first-call bodies are kept: the URL it compiled
+    /// as and the one it was requested as.
+    pub(crate) fn kept_urls(&self) -> Vec<(String, String)> {
+        self.read().kept_urls.clone()
     }
 
     /// Whether `url` was delivered, successfully or not.
@@ -431,7 +449,7 @@ impl WebModuleMap {
             let final_url = delivered.source.final_url.clone();
             if delivered.requests.is_none()
                 && let Some(bytes) = delivered.code_cache.take()
-                && let Some(cached) = crate::module_graph::decode_web_module_cache(
+                && let Some((cached, kept)) = crate::module_graph::decode_web_module_cache(
                     &bytes,
                     &delivered.source.text,
                     &final_url,
@@ -439,6 +457,8 @@ impl WebModuleMap {
             {
                 delivered.compiled = cached.compiled;
                 delivered.requests = Some(Ok(cached.requests));
+                state.kept.push((final_url.clone(), kept));
+                state.kept_urls.push((final_url.clone(), url.clone()));
             }
             if delivered.requests.is_none() {
                 state.parses += 1;
@@ -464,8 +484,16 @@ impl WebModuleMap {
                 {
                     state.fresh_code_caches.push(WebModuleCodeCache {
                         request_url: url.clone(),
-                        bytes,
+                        bytes: crate::code_cache::with_bodies(bytes.clone(), &[]),
                     });
+                    state.kept.push((
+                        final_url.clone(),
+                        otter_vm::KeptScript {
+                            top: bytes,
+                            bodies: Vec::new(),
+                        },
+                    ));
+                    state.kept_urls.push((final_url.clone(), url.clone()));
                 }
             }
             let requests =

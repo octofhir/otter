@@ -4436,6 +4436,7 @@ impl Runtime {
         target_url: &str,
         linked: module_graph::LinkedProgram,
     ) -> Result<DynamicModuleLoad, DynLoadError> {
+        self.adopt_web_module_bodies();
         for metadata in &linked.metadata {
             self.source_maps.record_compiled_metadata(metadata);
         }
@@ -6524,6 +6525,7 @@ impl Runtime {
         mut timings: Option<&mut module_graph::ModulePhaseTimings>,
     ) -> Result<(ExecutionResult, ExecutionContext), OtterError> {
         let runtime_link_started = timings.is_some().then(std::time::Instant::now);
+        self.adopt_web_module_bodies();
         let mut module = linked.module;
         for metadata in &linked.metadata {
             self.source_maps.record_compiled_metadata(metadata);

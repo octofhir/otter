@@ -957,8 +957,9 @@ fn web_module_cache_key(text: &str, url: &str) -> crate::compile_cache::CompileC
 
 /// Code-cache bytes of a web module's compile: the magic, the key, then the
 /// entry the compile cache keeps for a module (its requests, the compiler
-/// metadata, and the module without its source). `None` when the module is
-/// too large to encode.
+/// metadata, and the length-prefixed module without its source), without
+/// the section of first-call bodies `crate::code_cache::with_bodies`
+/// appends. `None` when the module is too large to encode.
 pub(crate) fn encode_web_module_cache(
     text: &str,
     url: &str,
@@ -978,29 +979,38 @@ pub(crate) fn encode_web_module_cache(
         crate::compile_cache::MAX_COMPILE_CACHE_ENTRY_BYTES,
     )
     .ok()?;
+    let module_len = u32::try_from(module.len()).ok()?;
     let mut bytes = Vec::with_capacity(
-        WEB_MODULE_CACHE_MAGIC.len() + key.as_str().len() + 4 + aux.len() + module.len(),
+        WEB_MODULE_CACHE_MAGIC.len() + key.as_str().len() + 8 + aux.len() + module.len(),
     );
     bytes.extend_from_slice(WEB_MODULE_CACHE_MAGIC);
     bytes.extend_from_slice(key.as_str().as_bytes());
     bytes.extend_from_slice(&len.to_le_bytes());
     bytes.extend_from_slice(&aux);
+    bytes.extend_from_slice(&module_len.to_le_bytes());
     bytes.extend_from_slice(&module);
     Some(bytes)
 }
 
 /// The web module `bytes` hold for exactly this text and URL, decoded and
-/// verified; `None` for bytes of another compile, engine or text.
+/// verified, with its first-call bodies; `None` for bytes of another
+/// compile, engine or text.
 pub(crate) fn decode_web_module_cache(
     bytes: &[u8],
     text: &str,
     url: &str,
-) -> Option<WebModuleScan> {
+) -> Option<(WebModuleScan, otter_vm::KeptScript)> {
     let key = web_module_cache_key(text, url);
     let rest = bytes.strip_prefix(WEB_MODULE_CACHE_MAGIC.as_slice())?;
-    let rest = rest.strip_prefix(key.as_str().as_bytes())?;
-    let (len, rest) = rest.split_first_chunk::<4>()?;
-    let (aux, module) = rest.split_at_checked(u32::from_le_bytes(*len) as usize)?;
+    let mut rest = rest.strip_prefix(key.as_str().as_bytes())?;
+    let aux_len = crate::code_cache::take_u32(&mut rest)? as usize;
+    let (aux, mut rest) = rest.split_at_checked(aux_len)?;
+    let module_len = crate::code_cache::take_u32(&mut rest)? as usize;
+    let (module, rest) = rest.split_at_checked(module_len)?;
+    let kept = otter_vm::KeptScript {
+        top: bytes[..bytes.len() - rest.len()].to_vec(),
+        bodies: crate::code_cache::read_bodies(rest)?,
+    };
     let cached: CachedModule = serde_json::from_slice(aux).ok()?;
     let bytecode = otter_bytecode::binary::decode_module_with_source(module, text)
         .ok()?
@@ -1018,13 +1028,16 @@ pub(crate) fn decode_web_module_cache(
             data: request.attr_type.is_some(),
         })
         .collect();
-    Some(WebModuleScan {
-        requests,
-        compiled: Some(PrecompiledModule {
-            compiled: otter_compiler::CompiledModule::new(bytecode, metadata),
-            requests: cached.requests,
-        }),
-    })
+    Some((
+        WebModuleScan {
+            requests,
+            compiled: Some(PrecompiledModule {
+                compiled: otter_compiler::CompiledModule::new(bytecode, metadata),
+                requests: cached.requests,
+            }),
+        },
+        kept,
+    ))
 }
 
 /// Parse the web module `url` once: collect its requests and compile it

@@ -1600,15 +1600,32 @@ mod send_probe_tests {
     }
 }
 
-/// Direct-mapped cache of the owners of function ids outside an ambient
-/// chunk, keyed by id. A lazily compiled body is its own chunk, so calls
-/// into one — and the runtime calls its code makes — resolve here instead of
-/// searching the code space each time.
+/// Direct-mapped cache of the owners of function ids, keyed by id. A lazily
+/// compiled body is its own chunk, so calls into one — and the runtime calls
+/// its code makes — resolve here instead of searching the code space each
+/// time; an interpreter entry also finds its activation's CodeBlock here.
 ///
 /// Entries hold their chunk alive: the cache is cleared before a liveness
-/// census and whenever the isolate adopts another code space.
+/// census and whenever the isolate adopts another code space. Each owner sits
+/// at a stable address, so an interpreter entry borrows it — and the CodeBlock
+/// its chunk owns — in place, with no clone of the chunk's handles. An owner
+/// an entry no longer names may still be borrowed by a running entry, so it
+/// retires instead of dropping and is released only once no execution is in
+/// progress.
 pub(crate) struct OwnerCache {
-    entries: Box<[Option<(u32, ExecutionContext)>]>,
+    entries: Box<[Option<OwnerEntry>]>,
+    /// Each retired owner keeps the allocation, and so the address, its
+    /// entry handed out; a bare value would move.
+    #[allow(clippy::vec_box)]
+    retired: Vec<Box<ExecutionContext>>,
+}
+
+struct OwnerEntry {
+    function_id: u32,
+    owner: Box<ExecutionContext>,
+    /// The function's CodeBlock in `owner`, once an interpreter entry
+    /// resolved it; null before.
+    code_block: *const crate::CodeBlock,
 }
 
 impl OwnerCache {
@@ -1617,32 +1634,90 @@ impl OwnerCache {
     pub(crate) fn new() -> Self {
         Self {
             entries: (0..Self::SIZE).map(|_| None).collect(),
+            retired: Vec::new(),
         }
     }
 
     #[inline]
-    pub(crate) fn get(&self, function_id: u32) -> Option<ExecutionContext> {
-        match &self.entries[function_id as usize % Self::SIZE] {
-            Some((id, owner)) if *id == function_id => Some(owner.clone()),
-            _ => None,
+    fn slot(&self, function_id: u32) -> Option<&OwnerEntry> {
+        self.entries[function_id as usize % Self::SIZE]
+            .as_ref()
+            .filter(|entry| entry.function_id == function_id)
+    }
+
+    /// The cached owner of `function_id` at its stable address. It stays
+    /// valid until [`Self::release_retired`], whatever the cache does
+    /// meanwhile.
+    #[inline]
+    pub(crate) fn get_stable(&self, function_id: u32) -> Option<*const ExecutionContext> {
+        self.slot(function_id)
+            .map(|entry| &*entry.owner as *const _)
+    }
+
+    /// The cached owner of `function_id` and its CodeBlock there (null until
+    /// [`Self::set_code_block`]), both valid as [`Self::get_stable`] says.
+    #[inline]
+    pub(crate) fn entry(
+        &self,
+        function_id: u32,
+    ) -> Option<(*const ExecutionContext, *const crate::CodeBlock)> {
+        self.slot(function_id)
+            .map(|entry| (&*entry.owner as *const _, entry.code_block))
+    }
+
+    /// Record the CodeBlock `function_id` runs in its cached owner.
+    pub(crate) fn set_code_block(&mut self, function_id: u32, code_block: &crate::CodeBlock) {
+        if let Some(entry) = &mut self.entries[function_id as usize % Self::SIZE]
+            && entry.function_id == function_id
+        {
+            entry.code_block = code_block;
         }
     }
 
-    pub(crate) fn insert(&mut self, function_id: u32, owner: ExecutionContext) {
-        self.entries[function_id as usize % Self::SIZE] = Some((function_id, owner));
+    /// Cache `owner` for `function_id` and return its stable address.
+    pub(crate) fn insert(
+        &mut self,
+        function_id: u32,
+        owner: ExecutionContext,
+    ) -> *const ExecutionContext {
+        let owner = Box::new(owner);
+        let address: *const ExecutionContext = &*owner;
+        let slot = &mut self.entries[function_id as usize % Self::SIZE];
+        if let Some(previous) = slot.replace(OwnerEntry {
+            function_id,
+            owner,
+            code_block: std::ptr::null(),
+        }) {
+            self.retired.push(previous.owner);
+        }
+        address
     }
 
     /// Forget `function_id`: its owner changed (a lazy record's body was
     /// compiled into a chunk of its own).
     pub(crate) fn forget(&mut self, function_id: u32) {
         let entry = &mut self.entries[function_id as usize % Self::SIZE];
-        if entry.as_ref().is_some_and(|(id, _)| *id == function_id) {
-            *entry = None;
+        if entry
+            .as_ref()
+            .is_some_and(|entry| entry.function_id == function_id)
+            && let Some(previous) = entry.take()
+        {
+            self.retired.push(previous.owner);
         }
     }
 
     pub(crate) fn clear(&mut self) {
-        self.entries.iter_mut().for_each(|entry| *entry = None);
+        for entry in self.entries.iter_mut() {
+            if let Some(previous) = entry.take() {
+                self.retired.push(previous.owner);
+            }
+        }
+    }
+
+    /// Drop the owners no entry names any more. Only sound when no
+    /// interpreter entry is running, since one may borrow any of them.
+    pub(crate) fn release_retired(&mut self) {
+        self.retired.clear();
     }
 }
 
@@ -1651,7 +1726,7 @@ impl std::fmt::Debug for OwnerCache {
         f.debug_struct("OwnerCache")
             .field(
                 "entries",
-                &self.entries.iter().filter(|e| e.is_some()).count(),
+                &self.entries.iter().filter(|entry| entry.is_some()).count(),
             )
             .finish()
     }

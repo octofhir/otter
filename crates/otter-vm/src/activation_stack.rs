@@ -167,7 +167,40 @@ impl ActivationStack {
         );
         self.staged.clear();
         self.staged.extend(arguments);
-        let mut request = crate::native_abi::CallRequest::EMPTY;
+        self.stage_request(callee, receiver, new_target, return_register);
+    }
+
+    /// [`Self::stage_call`] whose actual arguments `fill` writes straight
+    /// into the staged span, with no intermediate buffer. A failed fill
+    /// stages nothing.
+    pub(crate) fn stage_call_with<E>(
+        &mut self,
+        callee: crate::Value,
+        receiver: crate::Value,
+        new_target: Option<crate::Value>,
+        return_register: Option<u16>,
+        fill: impl FnOnce(&mut smallvec::SmallVec<[crate::Value; 8]>) -> Result<(), E>,
+    ) -> Result<(), E> {
+        assert!(
+            !self.has_pending_call(),
+            "one pending call per execution boundary"
+        );
+        self.staged.clear();
+        fill(&mut self.staged)?;
+        self.stage_request(callee, receiver, new_target, return_register);
+        Ok(())
+    }
+
+    /// Build the classify request in its slot, field by field.
+    #[inline]
+    fn stage_request(
+        &mut self,
+        callee: crate::Value,
+        receiver: crate::Value,
+        new_target: Option<crate::Value>,
+        return_register: Option<u16>,
+    ) {
+        let request = self.request.insert(crate::native_abi::CallRequest::EMPTY);
         request.callee = callee;
         request.receiver = receiver;
         if let Some(new_target) = new_target {
@@ -177,7 +210,6 @@ impl ActivationStack {
             );
         }
         request.return_destination = return_register.map_or(u32::MAX, u32::from);
-        self.request = Some(request);
     }
 
     /// Stage only the actual span of a request a generated caller writes
@@ -209,9 +241,27 @@ impl ActivationStack {
         Some(request)
     }
 
+    /// [`Self::take_request`] written straight into the trampoline's
+    /// mailbox `slot`: one copy of the request instead of a value moved
+    /// through the caller. `false` when nothing is staged.
+    pub(crate) fn take_request_into(&mut self, slot: &mut crate::native_abi::CallRequest) -> bool {
+        let Some(request) = self.request.as_ref() else {
+            return false;
+        };
+        let Ok(argument_count) = u32::try_from(self.staged.len()) else {
+            return false;
+        };
+        *slot = *request;
+        self.request = None;
+        slot.arguments = self.staged.as_ptr();
+        slot.argument_count = argument_count;
+        true
+    }
+
     /// Drop a consumed request span so it retains no values.
+    #[inline]
     pub(crate) fn clear_staged(&mut self) {
-        if self.request.is_none() {
+        if self.request.is_none() && !self.staged.is_empty() {
             self.staged.clear();
         }
     }
@@ -310,6 +360,20 @@ impl ActivationStack {
             );
         }
         unsafe { frame.as_mut() }
+    }
+    /// [`Self::pop`] of the innermost activation the caller already holds.
+    pub(crate) fn complete(&mut self, frame: *mut Frame) -> &mut Frame {
+        assert_eq!(
+            frame,
+            unsafe { (*self.context).native_frame },
+            "an entry completes only its own activation"
+        );
+        // SAFETY: the published innermost record is live and mutator-owned.
+        let record = unsafe { &mut *frame };
+        record.header.flags = crate::native_abi::NativeFrameFlags::from_bits(
+            record.header.flags.bits() | crate::native_abi::NativeFrameFlags::COMPLETED,
+        );
+        record
     }
     /// Innermost live logical frame.
     pub fn last(&self) -> Option<&Frame> {

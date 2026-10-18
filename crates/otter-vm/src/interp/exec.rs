@@ -81,7 +81,13 @@ impl Interpreter {
 
     fn reclaim_dynamic_code_to(&mut self, target_bytes: u64) -> Result<(), otter_gc::OutOfMemory> {
         // Cached owners hold their chunks alive; a census must not see them.
-        self.owner_cache.borrow_mut().clear();
+        // With no frame left, no entry borrows a retired owner either.
+        let mut owners = self.owner_cache.borrow_mut();
+        owners.clear();
+        if !self.jit_has_native_frames() {
+            owners.release_retired();
+        }
+        drop(owners);
         let mut retained = self.code_space.evictable_retained_bytes();
         self.code_eviction_stats.retained_bytes = retained;
         self.code_eviction_stats.peak_retained_bytes =
@@ -1009,22 +1015,52 @@ impl Interpreter {
     ///
     /// `resume_error` fails the resumption itself; `resume_site` says where
     /// the activation's PC stands for it.
+    #[inline]
     pub(super) fn dispatch_current_activation(
         &mut self,
         context: &ExecutionContext,
+        entered: Option<super::call_dispatch::EnteredActivation<'_>>,
         stack: &mut ActivationStack,
         floor: ActivationFloor,
-        mut resume_error: Option<VmError>,
+        resume_error: Option<VmError>,
         resume_site: ThrowSite,
     ) -> Result<DispatchOutcome, VmError> {
         debug_assert!(stack.is_runtime_rooted_by(self));
         self.ensure_method_feedback_context(context);
+        let (error, site) = match resume_error {
+            Some(error) => (error, resume_site),
+            None => match self.dispatch_loop_inner(context, entered, stack, floor) {
+                // This operation's native failure was projected at its live
+                // source/root boundary. Final failure must not enter the
+                // ordinary source VM error materializer again.
+                Ok(DispatchOutcome::Fatal(error)) => return Err(error),
+                Ok(outcome) => return Ok(outcome),
+                Err(error) => (error, ThrowSite::Instruction),
+            },
+        };
+        self.dispatch_after_error(context, entered, stack, floor, error, site)
+    }
+
+    /// Unwind `error` into the activation's handlers and keep dispatching
+    /// it, until it completes or an error escapes the activation.
+    #[inline(never)]
+    fn dispatch_after_error(
+        &mut self,
+        context: &ExecutionContext,
+        entered: Option<super::call_dispatch::EnteredActivation<'_>>,
+        stack: &mut ActivationStack,
+        floor: ActivationFloor,
+        error: VmError,
+        site: ThrowSite,
+    ) -> Result<DispatchOutcome, VmError> {
+        let mut resume_error = Some(error);
+        let resume_site = site;
         (|| -> Result<DispatchOutcome, VmError> {
             loop {
                 let (step, site) = match resume_error.take() {
                     Some(error) => (Err(error), resume_site),
                     None => (
-                        self.dispatch_loop_inner(context, stack, floor),
+                        self.dispatch_loop_inner(context, entered, stack, floor),
                         ThrowSite::Instruction,
                     ),
                 };

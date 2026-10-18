@@ -57,6 +57,12 @@ pub(crate) struct MethodFeedbackDirectory {
     /// purged with the tombstoned range.
     installed_chunks:
         rustc_hash::FxHashMap<usize, std::sync::Weak<crate::executable::ExecutableModule>>,
+    /// The two most recently installed chunk identities. A call and its
+    /// return alternate between the caller's and the callee's chunk on every
+    /// entry, so these answer nearly every probe without hashing. Each names
+    /// an `installed_chunks` entry, whose `Weak` keeps the address from being
+    /// reused until a purge, which clears them.
+    recent_chunks: [usize; 2],
 }
 
 impl MethodFeedbackDirectory {
@@ -70,11 +76,26 @@ impl MethodFeedbackDirectory {
         }
         self.installed_chunks
             .retain(|_, chunk| chunk.strong_count() != 0);
+        self.recent_chunks = [0; 2];
     }
 
+    #[inline]
     fn install_context(&mut self, context: &ExecutionContext) {
+        let identity = std::sync::Arc::as_ptr(context.executable_module()) as usize;
+        if self.recent_chunks[0] == identity {
+            return;
+        }
+        if self.recent_chunks[1] == identity {
+            self.recent_chunks.swap(0, 1);
+            return;
+        }
+        self.install_new_context(context, identity);
+        self.recent_chunks = [identity, self.recent_chunks[0]];
+    }
+
+    #[inline(never)]
+    fn install_new_context(&mut self, context: &ExecutionContext, identity: usize) {
         let executable = context.executable_module();
-        let identity = std::sync::Arc::as_ptr(executable) as usize;
         match self.installed_chunks.entry(identity) {
             std::collections::hash_map::Entry::Occupied(installed)
                 if installed.get().strong_count() != 0 =>

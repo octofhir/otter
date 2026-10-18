@@ -2588,9 +2588,10 @@ impl VmRuntimeActivation {
             }
             _ => {
                 let vm = unsafe { self.vm.as_ref() }?;
-                vm.foreign_owner(function_id)
-                    .ok()
-                    .map(crate::code_space::ResolvedCtx::Owned)
+                let owner = vm.stable_foreign_owner(function_id).ok()?;
+                // SAFETY: a cached owner keeps its address until no execution
+                // is in progress, which outlives this activation's entry.
+                Some(crate::code_space::ResolvedCtx::Ambient(unsafe { &*owner }))
             }
         }
     }

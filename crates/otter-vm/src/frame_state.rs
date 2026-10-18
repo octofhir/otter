@@ -253,8 +253,10 @@ pub struct AsyncFrameState {
 impl Frame {
     /// Advance the canonical instruction-index program counter by one.
     /// Surfaces [`VmError::InvalidOperand`] on overflow.
+    #[inline]
     pub(crate) fn advance_pc(&mut self) -> Result<(), VmError> {
-        crate::ActiveFrameMut::from_frame(self).advance_pc()
+        self.pc = self.pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
+        Ok(())
     }
 
     /// Advance the canonical PC by one with a direct field write, skipping the

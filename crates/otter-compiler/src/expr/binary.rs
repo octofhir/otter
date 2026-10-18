@@ -67,7 +67,7 @@ fn i32_from_f64(value: f64) -> Option<i32> {
 
 /// The frame register a binary operand already lives in, when reading it needs
 /// no emitted instruction. See [`crate::expr::identifier::borrowed_local_register`].
-fn borrowed_operand(cx: &Compiler, expr: &Expression<'_>) -> Option<u16> {
+pub(crate) fn borrowed_operand(cx: &Compiler, expr: &Expression<'_>) -> Option<u16> {
     match expr {
         Expression::ParenthesizedExpression(p) => borrowed_operand(cx, &p.expression),
         Expression::Identifier(id) => {
@@ -77,7 +77,33 @@ fn borrowed_operand(cx: &Compiler, expr: &Expression<'_>) -> Option<u16> {
     }
 }
 
-fn operand_is_effect_free(expr: &Expression<'_>) -> bool {
+/// [`borrowed_operand`] for an operand whose register is read only after
+/// the expressions in `later` run: a name held in its own frame slot can
+/// change only through an assignment this function itself writes (a
+/// closure or an eval that could reach it would have moved it to a context
+/// slot), so it is read in place when none of them names it.
+pub(crate) fn borrowed_operand_before(
+    cx: &Compiler,
+    expr: &Expression<'_>,
+    later: &[&Expression<'_>],
+) -> Option<u16> {
+    let reg = borrowed_operand(cx, expr)?;
+    let name = borrowed_name(expr)?;
+    later
+        .iter()
+        .all(|later| !crate::capture::expression_mentions_name(later, name))
+        .then_some(reg)
+}
+
+fn borrowed_name<'e>(expr: &'e Expression<'_>) -> Option<&'e str> {
+    match expr {
+        Expression::ParenthesizedExpression(p) => borrowed_name(&p.expression),
+        Expression::Identifier(id) => Some(id.name.as_str()),
+        _ => None,
+    }
+}
+
+pub(crate) fn operand_is_effect_free(expr: &Expression<'_>) -> bool {
     match expr {
         Expression::ParenthesizedExpression(p) => operand_is_effect_free(&p.expression),
         Expression::NumericLiteral(_)
@@ -405,19 +431,16 @@ fn compile_binary_to(
     //
     // The remaining hazard is evaluation order between the operands: the spec
     // reads both before either is coerced, so a borrowed slot is only correct
-    // when the sibling operand cannot run code that reassigns it. Requiring
-    // every operand to be either a borrowable name or an effect-free literal
-    // removes that hazard entirely.
-    let borrow_left = borrowed_operand(cx, &b.left);
-    let borrow_right = borrowed_operand(cx, &b.right);
-    let borrowable = op_reads_operands_up_front(op)
-        && (borrow_left.is_some() || operand_is_effect_free(&b.left))
-        && (borrow_right.is_some() || operand_is_effect_free(&b.right));
-    let lhs = match borrow_left {
+    // when the sibling operand cannot reassign it.
+    // The left operand is read after the right one is evaluated, so it is
+    // borrowed only when the right one cannot assign it; the right operand
+    // is read as soon as it is evaluated.
+    let borrowable = op_reads_operands_up_front(op);
+    let lhs = match borrowed_operand_before(cx, &b.left, &[&b.right]) {
         Some(reg) if borrowable => reg,
         _ => compile_expr(cx, &b.left, span)?,
     };
-    let rhs = match borrow_right {
+    let rhs = match borrowed_operand(cx, &b.right) {
         Some(reg) if borrowable => reg,
         _ => compile_expr(cx, &b.right, span)?,
     };

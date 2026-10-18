@@ -69,7 +69,12 @@ pub(crate) fn compile_tail_return(
             compile_tail_return(cx, &c.alternate, span)
         }
         Expression::LogicalExpression(l) => {
-            let left = compile_expr(cx, &l.left, span)?;
+            // The branch and the return read `left` at once: a name held in
+            // its own frame slot is read in place.
+            let left = match crate::expr::borrowed_operand(cx, &l.left) {
+                Some(left) => left,
+                None => compile_expr(cx, &l.left, span)?,
+            };
             // Branch to the right operand (itself in tail position) when
             // the operator does not short-circuit on `left`; the
             // fall-through path returns `left` directly.
@@ -114,7 +119,10 @@ pub(crate) fn compile_tail_return(
             Ok(())
         }
         _ => {
-            let reg = compile_expr(cx, expr, span)?;
+            let reg = match crate::expr::borrowed_operand(cx, expr) {
+                Some(reg) => reg,
+                None => compile_expr(cx, expr, span)?,
+            };
             cx.emit(Op::ReturnValue, [Operand::Register(reg)], span);
             Ok(())
         }
@@ -783,7 +791,13 @@ fn compile_statement_body(
                     compile_tail_return(cx, arg, span)?;
                 }
                 Some(arg) => {
-                    let mut reg = compile_expr(cx, arg, span)?;
+                    // A name held in its own frame slot is returned in place:
+                    // a return through `finally` copies it out before the
+                    // finally block runs.
+                    let mut reg = match crate::expr::borrowed_operand(cx, arg) {
+                        Some(reg) => reg,
+                        None => compile_expr(cx, arg, span)?,
+                    };
                     // §14.10.1 step 3 — `return <expr>` in an async
                     // generator awaits the value before the return
                     // completion propagates, so an explicit

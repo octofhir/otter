@@ -32,6 +32,7 @@
 
 mod async_ops;
 mod binary;
+pub(crate) use binary::{borrowed_operand, borrowed_operand_before};
 mod construct;
 pub(crate) mod identifier;
 mod import_meta;
@@ -89,7 +90,12 @@ pub(crate) fn compile_condition(
             }
         }
         expr => {
-            let value = compile_expr(cx, expr, enclosing_span)?;
+            // The branch reads the value at once: a name held in its own
+            // frame slot is tested in place.
+            let value = match borrowed_operand(cx, expr) {
+                Some(value) => value,
+                None => compile_expr(cx, expr, enclosing_span)?,
+            };
             let op = if jump_if {
                 Op::JumpIfTrue
             } else {
@@ -536,7 +542,9 @@ pub(crate) fn compile_expr_into_with_inferred_name(
         }
         _ => {
             let result = compile_expr_with_inferred_name(cx, expr, inferred_name, enclosing_span)?;
-            move_result_into(cx, result, destination, enclosing_span);
+            if result != destination && !cx.retarget_last_write(result, destination) {
+                move_result_into(cx, result, destination, enclosing_span);
+            }
             Ok(destination)
         }
     }

@@ -64,6 +64,9 @@ pub(crate) struct FinishedCode {
 pub(crate) struct FunctionContext {
     pub(crate) module: Rc<RefCell<ModuleBuilder>>,
     pub(crate) code: FunctionCodeBuilder,
+    /// The pc the latest patched branch lands on: a value an expression
+    /// leaves there may come from more than its last instruction.
+    branch_landing: Option<u32>,
     pub(crate) spans: Vec<SpanEntry>,
     pub(crate) scratch: u16,
     /// Stack of lexical scopes, outermost first.
@@ -203,6 +206,7 @@ impl FunctionContext {
         Self {
             module,
             code: FunctionCodeBuilder::new(),
+            branch_landing: None,
             spans: Vec::new(),
             scratch: 0,
             scopes: Vec::new(),
@@ -411,6 +415,7 @@ impl FunctionContext {
 
     /// Patch a previously emitted branch to point at `target_pc`.
     pub(crate) fn patch_branch(&mut self, branch_pc: u32, target_pc: u32) {
+        self.branch_landing = Some(target_pc);
         let offset = target_pc as i64 - (branch_pc as i64 + 1);
         let offset = i32::try_from(offset).expect("branch offset out of i32 range");
         assert!(
@@ -539,6 +544,65 @@ impl FunctionContext {
     /// Logical PC assigned to the next emitted instruction.
     pub(crate) fn next_pc(&self) -> u32 {
         self.code.next_pc()
+    }
+
+    /// Make the instruction just emitted, whose one written register is the
+    /// expression result `result`, write `destination` instead. Declined
+    /// (returning `false`) when a branch lands after it, so another path
+    /// could leave the result too, or when it names `destination` at all,
+    /// so a form that writes before it reads cannot see a changed operand.
+    /// The destination is written exactly when the result would have been,
+    /// on the instruction's success, as the copy it replaces would.
+    pub(crate) fn retarget_last_write(&mut self, result: u16, destination: u16) -> bool {
+        use otter_bytecode::opcode_schema::{RegisterAccess, RegisterSource, operand_spec_at};
+        let next = self.next_pc();
+        let Some(pc) = next.checked_sub(1) else {
+            return false;
+        };
+        if self.branch_landing == Some(next) {
+            return false;
+        }
+        let (Some(op), Some(count)) = (self.code.op(pc), self.code.operand_count(pc)) else {
+            return false;
+        };
+        let mut written = None;
+        for index in 0..count {
+            let (Some(operand), Some(spec)) =
+                (self.code.operand(pc, index), operand_spec_at(op, index))
+            else {
+                return false;
+            };
+            let register = match (spec.register_source, operand) {
+                (Some(RegisterSource::RegisterOperand), Operand::Register(reg)) => reg,
+                (Some(RegisterSource::Imm32RegisterIndex), Operand::Imm32(index)) => {
+                    let Ok(reg) = u16::try_from(index) else {
+                        return false;
+                    };
+                    reg
+                }
+                (None, _) => continue,
+                _ => return false,
+            };
+            if register == destination {
+                return false;
+            }
+            if spec.register_access.writes() {
+                if written.is_some()
+                    || spec.register_access != RegisterAccess::Write
+                    || spec.register_source != Some(RegisterSource::RegisterOperand)
+                    || register != result
+                {
+                    return false;
+                }
+                written = Some(index);
+            }
+        }
+        match written {
+            Some(index) => self
+                .code
+                .set_operand(pc, index, Operand::Register(destination)),
+            None => false,
+        }
     }
 
     /// UpdateEmpty(…, undefined) — a composite statement resets the

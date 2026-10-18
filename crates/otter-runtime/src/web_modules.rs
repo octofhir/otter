@@ -35,15 +35,19 @@
 //! - [`WebModuleCodeCache`] — a module's compiled form, for the embedder to
 //!   keep beside the response ([`WebModuleMap::produce_code_caches`],
 //!   `Runtime::web_module_code_caches`, [`WebModuleMap::deliver_cached`]).
+//! - [`PreparedWebModule`] — a response parsed and compiled, or read back from
+//!   its code cache, on any thread ([`WebModuleMap::prepare`]) and delivered
+//!   with that work done ([`WebModuleMap::deliver_prepared`]).
 //!
 //! # Invariants
 //! - The map is keyed by request URL and holds each response once, so two
 //!   graphs, or two `import()` calls, that request the same URL share one
 //!   fetch and one source (the HTML module map).
-//! - A delivered module is parsed once. The walk that finds its requests
-//!   also compiles it against the targets they resolve to; the graph that
-//!   runs it takes that compile while its imports still resolve the same,
-//!   and parses again only when they do not.
+//! - A delivered module is parsed once. The walk that finds its requests —
+//!   or [`WebModuleMap::prepare`], before delivery — also compiles it against
+//!   the targets they resolve to; the graph that runs it takes that compile
+//!   while its imports still resolve the same, and parses again only when
+//!   they do not.
 //! - A module delivered with a code cache for its exact text, URL and this
 //!   engine build is not parsed at all: the walk reads its requests and its
 //!   compile from the bytes, which pass the bytecode verifier. Bytes that do
@@ -171,6 +175,25 @@ pub struct WebModuleCodeCache {
     /// URL, and checked for exactly that before use.
     pub bytes: Vec<u8>,
 }
+
+/// One delivered response parsed and compiled — or read back from the code
+/// cache an earlier load produced for it — by [`WebModuleMap::prepare`] on
+/// any thread, for [`WebModuleMap::deliver_prepared`] to put in the map.
+///
+/// A browser has a module's bytes before its graph runs: preparing it as they
+/// arrive takes the parse and compile off the thread that runs the page.
+pub struct PreparedWebModule {
+    source: WebModuleSource,
+    /// The module's static requests and its compile, or the parse diagnostic.
+    scan: Result<crate::module_graph::WebModuleScan, String>,
+    /// The first-call bodies of a compile read back from a code cache.
+    kept: Option<otter_vm::KeptScript>,
+}
+
+const _: fn() = || {
+    fn send<T: Send>() {}
+    send::<PreparedWebModule>();
+};
 
 enum Slot {
     Requested,
@@ -306,6 +329,86 @@ impl WebModuleMap {
             Err(message) => Slot::Failed(message),
         };
         state.slots.insert(request_url.to_owned(), slot);
+    }
+
+    /// Parse and compile `response`, unless `code_cache` holds its compiled
+    /// form, which is then decoded and verified instead. Runs on any thread;
+    /// its static requests resolve through the import map the document has
+    /// now, and a graph that finds them resolving differently later compiles
+    /// the module again.
+    #[must_use]
+    pub fn prepare(
+        &self,
+        response: WebModuleSource,
+        code_cache: Option<Vec<u8>>,
+    ) -> PreparedWebModule {
+        if let Some(bytes) = code_cache
+            && let Some((cached, kept)) = crate::module_graph::decode_web_module_cache(
+                &bytes,
+                &response.text,
+                &response.final_url,
+            )
+        {
+            return PreparedWebModule {
+                source: response,
+                scan: Ok(cached),
+                kept: Some(kept),
+            };
+        }
+        let import_map = self.read().import_map.clone();
+        let base = Url::parse(strip_inline_marker(&response.final_url)).ok();
+        let scan = scan_requests(&response, |specifier| {
+            import_map
+                .resolve(specifier, base.as_ref()?)
+                .ok()
+                .map(|url| url.to_string())
+        });
+        PreparedWebModule {
+            source: response,
+            scan,
+            kept: None,
+        }
+    }
+
+    /// [`Self::deliver`] of a response [`Self::prepare`] already parsed and
+    /// compiled, or read back from its code cache.
+    pub fn deliver_prepared(&self, request_url: &str, prepared: PreparedWebModule) {
+        let mut guard = self.write();
+        let state = &mut *guard;
+        if matches!(
+            state.slots.get(request_url),
+            Some(Slot::Delivered(_) | Slot::Failed(_))
+        ) {
+            return;
+        }
+        let PreparedWebModule { source, scan, kept } = prepared;
+        let final_url = source.final_url.clone();
+        let mut delivered = Box::new(Delivered {
+            source,
+            requests: None,
+            compiled: None,
+            code_cache: None,
+        });
+        let fresh = kept.is_none();
+        match kept {
+            Some(kept) => {
+                state.kept.push((final_url.clone(), kept));
+                state
+                    .kept_urls
+                    .push((final_url.clone(), request_url.to_owned()));
+            }
+            None => state.parses += 1,
+        }
+        delivered.requests = Some(scan.map(|scan| {
+            delivered.compiled = scan.compiled;
+            scan.requests
+        }));
+        if fresh {
+            produce_code_cache(state, request_url, &final_url, &delivered);
+        }
+        state
+            .slots
+            .insert(request_url.to_owned(), Slot::Delivered(delivered));
     }
 
     /// Encode the compile of every module delivered without a usable code
@@ -474,27 +577,16 @@ impl WebModuleMap {
                     delivered.compiled = scan.compiled;
                     scan.requests
                 }));
-                if state.produce_code_caches
-                    && let Some(compiled) = &delivered.compiled
-                    && let Some(bytes) = crate::module_graph::encode_web_module_cache(
-                        &delivered.source.text,
-                        &final_url,
-                        compiled,
-                    )
-                {
-                    state.fresh_code_caches.push(WebModuleCodeCache {
-                        request_url: url.clone(),
-                        bytes: crate::code_cache::with_bodies(bytes.clone(), &[]),
-                    });
-                    state.kept.push((
-                        final_url.clone(),
-                        otter_vm::KeptScript {
-                            top: bytes,
-                            bodies: Vec::new(),
-                        },
-                    ));
-                    state.kept_urls.push((final_url.clone(), url.clone()));
-                }
+                let delivered = &**delivered;
+                produce_code_cache_parts(
+                    state.produce_code_caches,
+                    &mut state.fresh_code_caches,
+                    &mut state.kept,
+                    &mut state.kept_urls,
+                    &url,
+                    &final_url,
+                    delivered,
+                );
             }
             let requests =
                 delivered
@@ -523,6 +615,57 @@ impl WebModuleMap {
         } else {
             Ok(WebModuleGraph::Ready)
         }
+    }
+}
+
+/// Encode a fresh compile of `delivered` for the embedder's code cache, and
+/// keep its first-call bodies, when the map produces code caches.
+fn produce_code_cache(
+    state: &mut WebModuleState,
+    request_url: &str,
+    final_url: &str,
+    delivered: &Delivered,
+) {
+    produce_code_cache_parts(
+        state.produce_code_caches,
+        &mut state.fresh_code_caches,
+        &mut state.kept,
+        &mut state.kept_urls,
+        request_url,
+        final_url,
+        delivered,
+    );
+}
+
+fn produce_code_cache_parts(
+    produce: bool,
+    fresh_code_caches: &mut Vec<WebModuleCodeCache>,
+    kept: &mut Vec<(String, otter_vm::KeptScript)>,
+    kept_urls: &mut Vec<(String, String)>,
+    request_url: &str,
+    final_url: &str,
+    delivered: &Delivered,
+) {
+    if produce
+        && let Some(compiled) = &delivered.compiled
+        && let Some(bytes) = crate::module_graph::encode_web_module_cache(
+            &delivered.source.text,
+            final_url,
+            compiled,
+        )
+    {
+        fresh_code_caches.push(WebModuleCodeCache {
+            request_url: request_url.to_owned(),
+            bytes: crate::code_cache::with_bodies(bytes.clone(), &[]),
+        });
+        kept.push((
+            final_url.to_owned(),
+            otter_vm::KeptScript {
+                top: bytes,
+                bodies: Vec::new(),
+            },
+        ));
+        kept_urls.push((final_url.to_owned(), request_url.to_owned()));
     }
 }
 

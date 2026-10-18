@@ -105,10 +105,38 @@ fn an_inline_module_with_relative_and_absolute_imports_runs_from_delivered_sourc
     );
     assert_eq!(asked.len(), 3);
     runtime
-        .run_module_source(SourceInput::from_javascript(text), entry)
+        .run_module_source(SourceInput::from_javascript(text), entry.clone())
         .expect("module runs");
     assert_eq!(log(&mut runtime), "a,b,c");
     // The walk's parse of each module is the one its graph runs.
+    assert_eq!(map.parses(), 4);
+
+    // The same graph prepared on another thread as each response arrives:
+    // the walk and the run parse nothing more.
+    let (mut runtime, map) = page();
+    let sources = [
+        (entry.as_str(), text),
+        ("https://site.test/app/lib/a.js", "export const a = 'a';"),
+        ("https://site.test/root/b.js", "export const b = 'b';"),
+        ("https://cdn.test/c.js", "export const c = 'c';"),
+    ];
+    for (url, text) in sources {
+        let response = WebModuleSource {
+            final_url: url.to_owned(),
+            content_type: Some("text/javascript".to_owned()),
+            text: text.to_owned(),
+        };
+        let worker = map.clone();
+        let prepared = std::thread::spawn(move || worker.prepare(response, None))
+            .join()
+            .expect("prepare thread");
+        map.deliver_prepared(url, prepared);
+    }
+    assert_eq!(map.graph_status(&entry).unwrap(), WebModuleGraph::Ready);
+    runtime
+        .run_module_source(SourceInput::from_javascript(text), entry)
+        .expect("prepared graph runs");
+    assert_eq!(log(&mut runtime), "a,b,c");
     assert_eq!(map.parses(), 4);
 }
 
@@ -161,7 +189,16 @@ fn a_code_cache_from_one_load_runs_the_next_without_parsing() {
     };
     respond(&map, &entry, text);
     respond(&map, files[0].0, files[0].1);
-    respond(&map, files[1].0, files[1].1);
+    // A prepared delivery reads its cache back where it is prepared.
+    let prepared = map.prepare(
+        WebModuleSource {
+            final_url: files[1].0.to_owned(),
+            content_type: Some("text/javascript".to_owned()),
+            text: files[1].1.to_owned(),
+        },
+        cache_of(files[1].0),
+    );
+    map.deliver_prepared(files[1].0, prepared);
     assert_eq!(map.graph_status(&entry).unwrap(), WebModuleGraph::Ready);
     let lazily = runtime.lazy_function_bodies_compiled();
     runtime

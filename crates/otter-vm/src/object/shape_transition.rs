@@ -253,23 +253,21 @@ pub(crate) fn replay_store_property_transition(
     #[cfg(debug_assertions)]
     let current_count = heap.read_payload(obj, |body| super::body_property_count(heap, body));
     let guard_matches = heap.read_payload(obj, |body| {
-        if !is_fast_shape_body(body)
-            || current_shape_id != from_shape_id
-            || key.atom().id() != atom_id
-            || !transition_kind_matches_receiver_body(body, kind)
-            || !body.extensible()
-        {
-            return false;
+        let matches = is_fast_shape_body(body)
+            && current_shape_id == from_shape_id
+            && key.atom().id() == atom_id
+            && transition_kind_matches_receiver_body(body, kind)
+            && body.extensible();
+        #[cfg(debug_assertions)]
+        if matches {
+            debug_assert_eq!(existing_offset, None);
+            debug_assert_eq!(
+                current_count,
+                usize::from(slot),
+                "replay count diverged from slot offset"
+            );
         }
-        #[cfg(debug_assertions)]
-        debug_assert_eq!(existing_offset, None);
-        #[cfg(debug_assertions)]
-        debug_assert_eq!(
-            current_count,
-            usize::from(slot),
-            "replay count diverged from slot offset"
-        );
-        true
+        matches
     });
     if !guard_matches {
         return Ok(None);

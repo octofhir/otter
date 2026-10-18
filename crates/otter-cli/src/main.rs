@@ -1786,7 +1786,7 @@ async fn verify_project_dependencies(project_root: &Path) -> Result<(), OtterErr
             stale.len(),
             if stale.len() == 1 { "y" } else { "ies" }
         );
-        run_pm_install(project_root, false).await?;
+        let _installed = run_pm_install(project_root, false).await?;
         return Ok(());
     }
     eprintln!(
@@ -3762,17 +3762,20 @@ integrity = "sha512-test"
     #[tokio::test]
     async fn pm_init_and_install_write_manifest_and_lockfile() {
         let tmp = tempfile::tempdir().unwrap();
-        run_pm_init(
-            InitArgs {
-                root: tmp.path().to_path_buf(),
-                name: Some("app".to_string()),
-                version: "0.1.0".to_string(),
-                yes: true,
-            },
-            true,
-        )
-        .await
-        .unwrap();
+        assert_eq!(
+            run_pm_init(
+                InitArgs {
+                    root: tmp.path().to_path_buf(),
+                    name: Some("app".to_string()),
+                    version: "0.1.0".to_string(),
+                    yes: true,
+                },
+                true,
+            )
+            .await
+            .unwrap(),
+            ExitCode::SUCCESS
+        );
         tokio::fs::create_dir_all(tmp.path().join("tools/file-tool"))
             .await
             .unwrap();
@@ -3782,18 +3785,21 @@ integrity = "sha512-test"
         )
         .await
         .unwrap();
-        run_pm_add(
-            AddArgs {
-                root: tmp.path().to_path_buf(),
-                dev: false,
-                peer: false,
-                optional: false,
-                packages: vec!["file-tool@file:tools/file-tool".to_string()],
-            },
-            true,
-        )
-        .await
-        .unwrap();
+        assert_eq!(
+            run_pm_add(
+                AddArgs {
+                    root: tmp.path().to_path_buf(),
+                    dev: false,
+                    peer: false,
+                    optional: false,
+                    packages: vec!["file-tool@file:tools/file-tool".to_string()],
+                },
+                true,
+            )
+            .await
+            .unwrap(),
+            ExitCode::SUCCESS
+        );
         let manifest = tokio::fs::read_to_string(tmp.path().join(PACKAGE_JSON))
             .await
             .unwrap();
@@ -4306,13 +4312,16 @@ trust = "untrusted"
         .await
         .unwrap();
 
-        run_check(
-            &tmp.path().join("entry.ts"),
-            false,
-            &CapabilitySet::default(),
-        )
-        .await
-        .unwrap();
+        assert_eq!(
+            run_check(
+                &tmp.path().join("entry.ts"),
+                false,
+                &CapabilitySet::default(),
+            )
+            .await
+            .unwrap(),
+            ExitCode::SUCCESS
+        );
     }
 
     #[tokio::test]
@@ -4352,13 +4361,16 @@ if (value !== 23) fail();
             .await
             .unwrap();
 
-        run_check(
-            &tmp.path().join("entry.ts"),
-            false,
-            &CapabilitySet::default(),
-        )
-        .await
-        .unwrap();
+        assert_eq!(
+            run_check(
+                &tmp.path().join("entry.ts"),
+                false,
+                &CapabilitySet::default(),
+            )
+            .await
+            .unwrap(),
+            ExitCode::SUCCESS
+        );
     }
 
     #[tokio::test]
@@ -4438,13 +4450,16 @@ export let value = internal;
         .await
         .unwrap();
 
-        run_check(
-            &tmp.path().join("entry.ts"),
-            false,
-            &CapabilitySet::default(),
-        )
-        .await
-        .unwrap();
+        assert_eq!(
+            run_check(
+                &tmp.path().join("entry.ts"),
+                false,
+                &CapabilitySet::default(),
+            )
+            .await
+            .unwrap(),
+            ExitCode::SUCCESS
+        );
     }
 
     #[tokio::test]
@@ -4645,13 +4660,16 @@ export let value = answer;
         .await
         .unwrap();
 
-        run_check(
-            &tmp.path().join("entry.ts"),
-            false,
-            &CapabilitySet::default(),
-        )
-        .await
-        .unwrap();
+        assert_eq!(
+            run_check(
+                &tmp.path().join("entry.ts"),
+                false,
+                &CapabilitySet::default(),
+            )
+            .await
+            .unwrap(),
+            ExitCode::SUCCESS
+        );
     }
 
     #[tokio::test]
@@ -4715,13 +4733,16 @@ export let value = inner;
         .await
         .unwrap();
 
-        run_check(
-            &tmp.path().join("entry.ts"),
-            false,
-            &CapabilitySet::default(),
-        )
-        .await
-        .unwrap();
+        assert_eq!(
+            run_check(
+                &tmp.path().join("entry.ts"),
+                false,
+                &CapabilitySet::default(),
+            )
+            .await
+            .unwrap(),
+            ExitCode::SUCCESS
+        );
     }
 
     #[test]
@@ -4786,9 +4807,12 @@ export let value = inner;
         write_fixture(&root.join("node_modules/.bin/fixture-tool"), "undefined;\n");
         let entry = root.join("entry.ts");
 
-        run_check(&entry, false, &CapabilitySet::default())
-            .await
-            .unwrap();
+        assert_eq!(
+            run_check(&entry, false, &CapabilitySet::default())
+                .await
+                .unwrap(),
+            ExitCode::SUCCESS
+        );
 
         let args = RunArgs {
             target: "fixture-tool".to_string(),

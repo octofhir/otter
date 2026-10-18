@@ -26,3 +26,5 @@ thiserror = { workspace = true }
 [dev-dependencies]
 otter-web = { workspace = true }
 tempfile = "3"
+
+[lints]

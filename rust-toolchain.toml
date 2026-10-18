@@ -1,0 +1,4 @@
+[toolchain]
+channel = "beta-2026-10-18"
+components = ["clippy", "rustfmt"]
+targets = ["x86_64-apple-darwin"]

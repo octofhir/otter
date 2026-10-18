@@ -40,3 +40,5 @@ otter-syntax = { workspace = true }
 otter-vm = { workspace = true }
 tokio = { workspace = true }
 wat = "1"
+
+[lints]

@@ -17,7 +17,6 @@ all = { level = "deny", priority = -1 }
 [dependencies]
 otter-resource = { workspace = true }
 thiserror = { workspace = true }
-smallvec = { workspace = true }
 static_assertions = "1.1"
 libc = { workspace = true }
 

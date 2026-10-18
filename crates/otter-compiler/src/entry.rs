@@ -876,26 +876,27 @@ pub(crate) fn compile_program_parts(
     } else {
         Default::default()
     };
-    // §12.9.3.1 + §15.7 strict-mode early errors that oxc_parser
-    // does not flag on its own.
-    strict_validation::validate_strict_mode_early_errors(
-        program.directives,
+    // One walk of the unit gathers its capture facts and runs the
+    // §12.9.3.1 + §15.7 strict-mode and §14.2.1 / §14.12.1 block-level
+    // lexical early errors that oxc_parser does not flag on its own.
+    let (unit_capture, mut early) = capture::CaptureFacts::of_checked_unit(
         program.body,
-        strict_validation::EarlyErrorContext {
-            source_strict: force_strict || program.strict_directive,
-            super_property_allowed: super_property_allowed || super_call_allowed,
-            super_call_allowed,
-            private_names: Some(caller_private_names(caller_chain)),
-        },
-    )?;
+        strict_validation::EarlyErrors::new(
+            program.directives,
+            program.body,
+            strict_validation::EarlyErrorContext {
+                source_strict: force_strict || program.strict_directive,
+                super_property_allowed: super_property_allowed || super_call_allowed,
+                super_call_allowed,
+                private_names: Some(caller_private_names(caller_chain)),
+            },
+        ),
+    );
+    early.strict_result()?;
     if !new_target_allowed {
         strict_validation::validate_script_new_target_early_errors(program.body)?;
     }
-    // §14.2.1 / §14.12.1 block-level lexical early errors.
-    strict_validation::validate_block_early_errors(
-        program.body,
-        force_strict || program.strict_directive,
-    )?;
+    early.block_result()?;
     let main_is_async = module_body_uses_top_level_await(program.body);
     let main_is_strict = force_strict || program.strict_directive;
     let caller_chain = if eval_mode { caller_chain } else { None };
@@ -919,7 +920,6 @@ pub(crate) fn compile_program_parts(
         .with_module_url(script_module_url);
     // A nested closure or direct eval reaching a body binding keeps it in
     // a slot (every body binding when the body contains a direct eval).
-    let unit_capture = capture::CaptureFacts::of_unit(program.body);
     top.captured_names = unit_capture.captured(unit_capture.unit(), false);
     top.dot_arguments_observed = unit_capture.reads_dot_arguments();
     top.contains_direct_eval = unit_capture.unit_contains_eval();
@@ -1243,20 +1243,24 @@ pub fn compile_module_program(
     host: &ModuleHostInfo,
     options: CompileOptions,
 ) -> Result<BytecodeModule, CompileError> {
-    // §12.9.3.1 + §15.7 strict-mode early errors. Module bodies are
-    // always strict mode code (§10.2.10).
-    strict_validation::validate_strict_mode_early_errors(
-        &program.directives,
+    // One walk of the body gathers its capture facts and runs the
+    // §12.9.3.1 + §15.7 strict-mode early errors (module bodies are always
+    // strict mode code, §10.2.10) and the §14.2.1 / §14.12.1 block-level
+    // lexical ones, with no Annex B exemption in strict code.
+    let (unit_capture, mut early) = capture::CaptureFacts::of_checked_unit(
         &program.body,
-        strict_validation::EarlyErrorContext {
-            source_strict: true,
-            private_names: Some(crate::HashSet::default()),
-            ..Default::default()
-        },
-    )?;
-    // §14.2.1 / §14.12.1 block-level lexical early errors; module
-    // code is always strict so no Annex B exemption applies.
-    strict_validation::validate_block_early_errors(&program.body, true)?;
+        strict_validation::EarlyErrors::new(
+            &program.directives,
+            &program.body,
+            strict_validation::EarlyErrorContext {
+                source_strict: true,
+                private_names: Some(crate::HashSet::default()),
+                ..Default::default()
+            },
+        ),
+    );
+    early.strict_result()?;
+    early.block_result()?;
     strict_validation::validate_module_early_errors(program)?;
     // §16.2.1 Static Semantics: Early Errors — `ImportDeclaration`
     // and `ExportDeclaration` are `ModuleItem` productions, not
@@ -1285,7 +1289,6 @@ pub fn compile_module_program(
     let mut top = FunctionContext::new(Rc::clone(&module))
         .with_strict(true)
         .with_module_url(host.module_url.clone());
-    let unit_capture = capture::CaptureFacts::of_unit(&program.body);
     top.captured_names = unit_capture.captured(unit_capture.unit(), false);
     // Hoisted function declarations instantiate during the link-phase
     // init invocation; the evaluation-phase invocation (a separate

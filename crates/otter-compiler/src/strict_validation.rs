@@ -1,20 +1,26 @@
-//! Strict-mode early-error validation pass.
+//! Early errors the parser does not raise.
 //!
-//! Walks the parsed program once and rejects ECMA-262 strict-mode
-//! early errors that `oxc_parser` does not flag on its own. The pass
-//! must run before the bytecode lowering pipeline so it can surface a
-//! `SyntaxError` with phase `parse` to the runner.
+//! Rejects the ECMA-262 strict-mode and block-level lexical early errors that
+//! `oxc_parser` does not flag on its own, before the bytecode lowering
+//! pipeline, so they surface as a `SyntaxError` with phase `parse`.
 //!
 //! # Contents
-//! - [`validate_strict_mode_early_errors`] — public entry called from
-//!   `compile_program` / `compile_module_program`.
+//! - [`EarlyErrors`] — the strict-mode ([`StrictValidator`]) and block-lexical
+//!   ([`BlockLexicalValidator`]) passes of one compile unit as node hooks. The
+//!   unit's single analysis walk ([`crate::capture::CaptureFacts::of_checked_unit`])
+//!   feeds them every node, so validating costs no walk of its own.
+//! - Script `new.target`, module-body and `arguments` checks, which walk only
+//!   what they need.
 //!
 //! # Invariants
 //! - Strictness is tracked as a stack: source-level strict (force,
 //!   module mode, or top-level `"use strict"`), function-level strict
 //!   (inherited from outer or own-body directive), and class bodies
 //!   (unconditionally strict per ECMA-262 §10.2.10).
-//! - The walker emits owned [`SyntaxDiagnostic`] entries; no `oxc`
+//! - Each `enter_*` hook runs before its node's children are walked and each
+//!   `leave_*` after; a hook that brackets part of a node (a method value, a
+//!   field initializer, a class body) runs around exactly that part.
+//! - The passes emit owned [`SyntaxDiagnostic`] entries; no `oxc`
 //!   handles cross the crate boundary.
 //!
 //! # See also
@@ -34,56 +40,88 @@ use oxc_ast::ast::{
     BlockStatement, Class, ClassElement, DoWhileStatement, Expression, ForInStatement,
     ForOfStatement, ForStatement, ForStatementLeft, FormalParameters, Function,
     IdentifierReference, IfStatement, LabeledStatement, MethodDefinition, MethodDefinitionKind,
-    NumericLiteral, ObjectProperty, Program, PropertyDefinition, PropertyKey, PropertyKind,
-    SimpleAssignmentTarget, Statement, StaticBlock, StringLiteral, Super, SwitchStatement,
-    UnaryExpression, UnaryOperator, UpdateExpression, UpdateOperator, VariableDeclaration,
-    VariableDeclarationKind, WhileStatement, YieldExpression,
+    NumericLiteral, ObjectProperty, Program, PropertyKey, PropertyKind, SimpleAssignmentTarget,
+    Statement, StaticBlock, StringLiteral, Super, SwitchStatement, UnaryExpression, UnaryOperator,
+    UpdateExpression, UpdateOperator, VariableDeclaration, VariableDeclarationKind, WhileStatement,
+    YieldExpression,
 };
-use oxc_ast_visit::{Visit, walk};
+use oxc_ast_visit::Visit;
 use oxc_span::Span;
 use oxc_syntax::scope::ScopeFlags;
 
 use crate::CompileError;
 
-/// Validate strict-mode early errors that `oxc_parser` does not raise.
+/// The strict-mode and block-lexical early errors of one compile unit that
+/// `oxc_parser` does not raise, collected as hooks of the unit's single
+/// analysis walk ([`crate::capture::CaptureFacts::of_checked_unit`]).
 ///
-/// Returns `Ok(())` when the program is well-formed under strict-mode
-/// early-error rules, or [`CompileError::Syntax`] carrying one
-/// [`SyntaxDiagnostic`] per violation (preserving order of appearance).
-///
-/// `force_strict` lets direct-eval callers inherit the caller's
-/// strictness without rewriting the source.
-pub fn validate_strict_mode_early_errors(
-    directives: &[oxc_ast::ast::Directive<'_>],
-    body: &[oxc_ast::ast::Statement<'_>],
-    context: EarlyErrorContext,
-) -> Result<(), CompileError> {
-    let source_strict = context.source_strict;
-    let mut visitor = StrictValidator {
-        strict_stack: vec![context.source_strict],
-        super_stack: vec![context.super_property_allowed],
-        super_call_stack: vec![context.super_call_allowed],
-        next_function_super_allowed: None,
-        next_function_super_call: None,
-        private_names: context.private_names.map(|names| vec![names]),
-        class_is_derived: Vec::new(),
-        diagnostics: Vec::new(),
-    };
-    visitor.check_directive_prologue(directives, source_strict);
-    for stmt in body {
-        visitor.visit_statement(stmt);
+/// The walk feeds both passes every node; [`Self::finish`] reports them in
+/// the order the language defines no preference for but the compiler keeps
+/// stable: strict-mode errors, then block-level lexical errors.
+pub(crate) struct EarlyErrors {
+    pub(crate) strict: StrictValidator,
+    pub(crate) blocks: BlockLexicalValidator,
+}
+
+impl EarlyErrors {
+    /// Passes over a unit whose prologue is `directives` and whose top-level
+    /// statement list is `body`. `force_strict` in `context` lets direct-eval
+    /// callers inherit the caller's strictness without rewriting the source.
+    pub(crate) fn new(
+        directives: &[oxc_ast::ast::Directive<'_>],
+        body: &[oxc_ast::ast::Statement<'_>],
+        context: EarlyErrorContext,
+    ) -> Self {
+        let source_strict = context.source_strict;
+        let mut strict = StrictValidator {
+            strict_stack: vec![context.source_strict],
+            super_stack: vec![context.super_property_allowed],
+            super_call_stack: vec![context.super_call_allowed],
+            next_function_super_allowed: None,
+            next_function_super_call: None,
+            super_call_callee: None,
+            private_names: context.private_names.map(|names| vec![names]),
+            class_is_derived: Vec::new(),
+            diagnostics: Vec::new(),
+        };
+        strict.check_directive_prologue(directives, source_strict);
+        let mut blocks = BlockLexicalValidator {
+            strict_stack: vec![source_strict],
+            label_stack: Vec::new(),
+            in_static_block: false,
+            label_scopes: Vec::new(),
+            diagnostics: Vec::new(),
+        };
+        // §16.1.1 / §16.2.1 — the top-level StatementList itself obeys
+        // the duplicate-lexical and lexical/var-conflict rules. Function
+        // declarations are VAR-scoped at this level (§8.2.6
+        // TopLevelLexicallyDeclaredNames), not lexical.
+        blocks.check_top_level_statement_list(body.iter());
+        Self { strict, blocks }
     }
-    if visitor.diagnostics.is_empty() {
+
+    /// The strict-mode early errors (§12.9.3.1, §15.7 and the rest that
+    /// `oxc_parser` does not flag), one diagnostic per violation in order of
+    /// appearance.
+    pub(crate) fn strict_result(&mut self) -> Result<(), CompileError> {
+        diagnostics_result(std::mem::take(&mut self.strict.diagnostics))
+    }
+
+    /// The block-level lexical early errors (§14.2.1, §14.12.1): duplicate
+    /// lexical names and lexical/var conflicts of every statement list.
+    pub(crate) fn block_result(&mut self) -> Result<(), CompileError> {
+        diagnostics_result(std::mem::take(&mut self.blocks.diagnostics))
+    }
+}
+
+fn diagnostics_result(diagnostics: Vec<SyntaxDiagnostic>) -> Result<(), CompileError> {
+    if diagnostics.is_empty() {
         return Ok(());
     }
-    let messages = visitor
-        .diagnostics
-        .iter()
-        .map(|d| d.message.clone())
-        .collect();
+    let messages = diagnostics.iter().map(|d| d.message.clone()).collect();
     Err(CompileError::Syntax {
         messages,
-        diagnostics: visitor.diagnostics,
+        diagnostics,
     })
 }
 
@@ -168,7 +206,7 @@ pub struct EarlyErrorContext {
     pub private_names: Option<crate::HashSet<String>>,
 }
 
-struct StrictValidator {
+pub(crate) struct StrictValidator {
     strict_stack: Vec<bool>,
     super_stack: Vec<bool>,
     /// Whether `super()` is valid: inside a derived class constructor and
@@ -176,6 +214,9 @@ struct StrictValidator {
     super_call_stack: Vec<bool>,
     next_function_super_allowed: Option<bool>,
     next_function_super_call: Option<bool>,
+    /// Start of the `super` that is the callee of the `super(...)` call
+    /// being walked: the call's own target, not a SuperProperty.
+    super_call_callee: Option<u32>,
     /// Private names each enclosing class declares, outermost first; `None`
     /// when the code's private environment is not known here.
     private_names: Option<Vec<crate::HashSet<String>>>,
@@ -1222,8 +1263,11 @@ fn labelled_function_body_span(body: &Statement<'_>) -> Option<Span> {
     }
 }
 
-impl<'a> Visit<'a> for StrictValidator {
-    fn visit_object_expression(&mut self, it: &oxc_ast::ast::ObjectExpression<'a>) {
+/// Node hooks of the pass, driven by the unit's one analysis walk
+/// (`crate::capture`): each `enter_*` runs before the node's children are
+/// walked and each `leave_*` after.
+impl StrictValidator {
+    pub(crate) fn enter_object_expression<'a>(&mut self, it: &oxc_ast::ast::ObjectExpression<'a>) {
         // §13.2.5.1 — an object literal (not an assignment pattern) may
         // name at most one `__proto__: value` PropertyDefinition; shorthand,
         // method and computed forms are ordinary properties.
@@ -1255,10 +1299,9 @@ impl<'a> Visit<'a> for StrictValidator {
                 });
             }
         }
-        walk::walk_object_expression(self, it);
     }
 
-    fn visit_function(&mut self, it: &Function<'a>, flags: ScopeFlags) {
+    pub(crate) fn enter_function<'a>(&mut self, it: &Function<'a>) {
         let function_super_allowed = self.next_function_super_allowed.take().unwrap_or(false);
         let function_super_call = self.next_function_super_call.take().unwrap_or(false);
         let body_strict = it
@@ -1336,13 +1379,15 @@ impl<'a> Visit<'a> for StrictValidator {
         self.strict_stack.push(inner_strict);
         self.super_stack.push(function_super_allowed);
         self.super_call_stack.push(function_super_call);
-        walk::walk_function(self, it, flags);
+    }
+
+    pub(crate) fn leave_function<'a>(&mut self, _it: &Function<'a>) {
         self.super_call_stack.pop();
         self.super_stack.pop();
         self.strict_stack.pop();
     }
 
-    fn visit_arrow_function_expression(&mut self, it: &ArrowFunctionExpression<'a>) {
+    pub(crate) fn enter_arrow_function_expression<'a>(&mut self, it: &ArrowFunctionExpression<'a>) {
         let body_strict = it.body.has_use_strict_directive();
         // §15.4.1 ArrowFunction / §15.6.1 AsyncArrowFunction Static
         // Semantics: Early Errors — same `"use strict"` /
@@ -1399,128 +1444,43 @@ impl<'a> Visit<'a> for StrictValidator {
         self.check_duplicate_formals(&it.params, true);
         let inner_strict = self.is_strict() || body_strict;
         self.strict_stack.push(inner_strict);
-        walk::walk_arrow_function_expression(self, it);
+    }
+
+    pub(crate) fn leave_arrow_function_expression<'a>(
+        &mut self,
+        _it: &ArrowFunctionExpression<'a>,
+    ) {
         self.strict_stack.pop();
     }
 
-    fn visit_method_definition(&mut self, it: &MethodDefinition<'a>) {
+    pub(crate) fn enter_method_definition<'a>(&mut self, it: &MethodDefinition<'a>) {
         self.next_function_super_allowed = Some(true);
         self.next_function_super_call = Some(
             it.kind == MethodDefinitionKind::Constructor
                 && self.class_is_derived.last() == Some(&true),
         );
-        walk::walk_method_definition(self, it);
+    }
+
+    pub(crate) fn leave_method_definition<'a>(&mut self, _it: &MethodDefinition<'a>) {
         self.next_function_super_allowed = None;
         self.next_function_super_call = None;
     }
 
-    fn visit_object_property(&mut self, it: &ObjectProperty<'a>) {
-        let is_method = it.method || matches!(it.kind, PropertyKind::Get | PropertyKind::Set);
-        if is_method {
-            walk::walk_property_key(self, &it.key);
-            self.next_function_super_allowed = Some(true);
-            self.visit_expression(&it.value);
-            self.next_function_super_allowed = None;
-            return;
-        }
-        walk::walk_object_property(self, it);
-    }
-
-    fn visit_property_definition(&mut self, it: &PropertyDefinition<'a>) {
-        if let Some(value) = &it.value {
-            self.visit_property_key(&it.key);
-            self.super_stack.push(true);
-            self.super_call_stack.push(false);
-            self.visit_expression(value);
-            self.super_call_stack.pop();
-            self.super_stack.pop();
-            return;
-        }
-        walk::walk_property_definition(self, it);
-    }
-
-    fn visit_class(&mut self, it: &Class<'a>) {
-        // ECMA-262 §10.2.10 — class bodies are always strict mode code.
-        self.strict_stack.push(true);
-        // §15.7.1 ClassBody Static Semantics: Early Errors —
-        // PrivateBoundNames of ClassBody contains no duplicate
-        // entries, except when a name is used exactly once as a
-        // getter and once as a setter (no other entries).
-        self.check_private_bound_names(it);
-        // §15.7.1 FieldDefinition Static Semantics: Early Errors —
-        // It is a Syntax Error if Initializer is present and
-        // ContainsArguments of Initializer is true. Field initializers
-        // (and accessor `value` expressions) execute in the class
-        // scope, which never binds `arguments` even when the class
-        // sits inside a function.
-        for element in &it.body.body {
-            match element {
-                ClassElement::PropertyDefinition(p) => {
-                    if let Some(init) = &p.value {
-                        self.check_initializer_no_arguments(init, "field initializer");
-                    }
-                }
-                ClassElement::AccessorProperty(a) => {
-                    if let Some(init) = &a.value {
-                        self.check_initializer_no_arguments(init, "accessor initializer");
-                    }
-                }
-                _ => {}
-            }
-        }
-        for decorator in &it.decorators {
-            self.visit_decorator(decorator);
-        }
-        if let Some(id) = &it.id {
-            self.visit_binding_identifier(id);
-        }
-        // §15.7.1 — the heritage is evaluated in the outer private
-        // environment; the body sees the class's own names too.
-        if let Some(heritage) = it.heritage.as_ref().map(|heritage| &heritage.expression) {
-            self.visit_expression(heritage);
-        }
-        if let Some(stack) = &mut self.private_names {
-            stack.push(class_private_bound_names(it));
-        }
-        self.class_is_derived.push(it.heritage.is_some());
-        self.visit_class_body(&it.body);
-        self.class_is_derived.pop();
-        if let Some(stack) = &mut self.private_names {
-            stack.pop();
-        }
-        self.strict_stack.pop();
-    }
-
-    fn visit_call_expression(&mut self, it: &oxc_ast::ast::CallExpression<'a>) {
-        if let Expression::Super(sup) = &it.callee {
-            if !self.super_call_stack.last().copied().unwrap_or(false) {
-                self.diagnostics.push(SyntaxDiagnostic {
-                    code: "SUPER_CALL_OUTSIDE_DERIVED_CONSTRUCTOR".to_string(),
-                    message: "SyntaxError: `super()` is only valid in a derived class constructor (§15.7.1)"
-                        .to_string(),
-                    range: Some((sup.span.start, sup.span.end)),
-                    help: None,
-                });
-            }
-            for argument in &it.arguments {
-                self.visit_argument(argument);
-            }
-            return;
-        }
-        walk::walk_call_expression(self, it);
-    }
-
-    fn visit_private_field_expression(&mut self, it: &oxc_ast::ast::PrivateFieldExpression<'a>) {
+    pub(crate) fn enter_private_field_expression<'a>(
+        &mut self,
+        it: &oxc_ast::ast::PrivateFieldExpression<'a>,
+    ) {
         self.check_private_name(it.field.name.as_str(), it.field.span);
-        walk::walk_private_field_expression(self, it);
     }
 
-    fn visit_private_in_expression(&mut self, it: &oxc_ast::ast::PrivateInExpression<'a>) {
+    pub(crate) fn enter_private_in_expression<'a>(
+        &mut self,
+        it: &oxc_ast::ast::PrivateInExpression<'a>,
+    ) {
         self.check_private_name(it.left.name.as_str(), it.left.span);
-        walk::walk_private_in_expression(self, it);
     }
 
-    fn visit_with_statement(&mut self, it: &oxc_ast::ast::WithStatement<'a>) {
+    pub(crate) fn enter_with_statement<'a>(&mut self, it: &oxc_ast::ast::WithStatement<'a>) {
         // §14.11.1 — `with` is an early error in strict code.
         if self.is_strict() {
             self.diagnostics.push(SyntaxDiagnostic {
@@ -1531,10 +1491,9 @@ impl<'a> Visit<'a> for StrictValidator {
                 help: None,
             });
         }
-        walk::walk_with_statement(self, it);
     }
 
-    fn visit_static_block(&mut self, it: &StaticBlock<'a>) {
+    pub(crate) fn enter_static_block<'a>(&mut self, it: &StaticBlock<'a>) {
         // §15.7.1 ClassStaticBlockBody Static Semantics: Early
         // Errors — `arguments` is not in scope inside a class static
         // initialization block, so any IdentifierReference resolving
@@ -1567,12 +1526,18 @@ impl<'a> Visit<'a> for StrictValidator {
         }
         self.super_stack.push(true);
         self.super_call_stack.push(false);
-        walk::walk_static_block(self, it);
+    }
+
+    pub(crate) fn leave_static_block<'a>(&mut self, _it: &StaticBlock<'a>) {
         self.super_call_stack.pop();
         self.super_stack.pop();
     }
 
-    fn visit_super(&mut self, it: &Super) {
+    pub(crate) fn enter_super(&mut self, it: &Super) {
+        if self.super_call_callee == Some(it.span.start) {
+            self.super_call_callee = None;
+            return;
+        }
         if !self.super_allowed() {
             self.diagnostics.push(SyntaxDiagnostic {
                 code: "SUPER_OUTSIDE_METHOD".to_string(),
@@ -1590,7 +1555,7 @@ impl<'a> Visit<'a> for StrictValidator {
         }
     }
 
-    fn visit_numeric_literal(&mut self, it: &NumericLiteral<'a>) {
+    pub(crate) fn enter_numeric_literal<'a>(&mut self, it: &NumericLiteral<'a>) {
         if !self.is_strict() {
             return;
         }
@@ -1612,7 +1577,7 @@ impl<'a> Visit<'a> for StrictValidator {
         }
     }
 
-    fn visit_switch_statement(&mut self, it: &SwitchStatement<'a>) {
+    pub(crate) fn enter_switch_statement<'a>(&mut self, it: &SwitchStatement<'a>) {
         // ECMA-262 §13.12.1 SwitchStatement Static Semantics: Early
         // Errors:
         //   - It is a Syntax Error if the LexicallyDeclaredNames of
@@ -1686,30 +1651,26 @@ impl<'a> Visit<'a> for StrictValidator {
                 ),
             });
         }
-        walk::walk_switch_statement(self, it);
     }
 
-    fn visit_if_statement(&mut self, it: &IfStatement<'a>) {
+    pub(crate) fn enter_if_statement<'a>(&mut self, it: &IfStatement<'a>) {
         self.flag_function_declaration_body(&it.consequent, "if");
         self.flag_labelled_function_branch(&it.consequent, "if");
         if let Some(alt) = &it.alternate {
             self.flag_function_declaration_body(alt, "else");
             self.flag_labelled_function_branch(alt, "else");
         }
-        walk::walk_if_statement(self, it);
     }
 
-    fn visit_while_statement(&mut self, it: &WhileStatement<'a>) {
+    pub(crate) fn enter_while_statement<'a>(&mut self, it: &WhileStatement<'a>) {
         self.flag_iteration_function_body(&it.body, "while");
-        walk::walk_while_statement(self, it);
     }
 
-    fn visit_do_while_statement(&mut self, it: &DoWhileStatement<'a>) {
+    pub(crate) fn enter_do_while_statement<'a>(&mut self, it: &DoWhileStatement<'a>) {
         self.flag_iteration_function_body(&it.body, "do-while");
-        walk::walk_do_while_statement(self, it);
     }
 
-    fn visit_for_statement(&mut self, it: &ForStatement<'a>) {
+    pub(crate) fn enter_for_statement<'a>(&mut self, it: &ForStatement<'a>) {
         self.flag_iteration_function_body(&it.body, "for");
         // §14.7.4.1 — `for (LexicalDeclaration ; ; ) Statement`: the
         // head's BoundNames must not appear in the VarDeclaredNames
@@ -1717,10 +1678,9 @@ impl<'a> Visit<'a> for StrictValidator {
         if let Some(oxc_ast::ast::ForStatementInit::VariableDeclaration(decl)) = &it.init {
             self.flag_head_decl_lexical_var_conflict(decl, &it.body, "for");
         }
-        walk::walk_for_statement(self, it);
     }
 
-    fn visit_for_in_statement(&mut self, it: &ForInStatement<'a>) {
+    pub(crate) fn enter_for_in_statement<'a>(&mut self, it: &ForInStatement<'a>) {
         self.flag_iteration_function_body(&it.body, "for-in");
         self.flag_for_head_lexical_var_conflict(&it.left, &it.body, "for-in");
         // §13.7.5.1 ForIn/OfHeadEvaluation early error: ForBinding
@@ -1730,19 +1690,17 @@ impl<'a> Visit<'a> for StrictValidator {
         // destructuring patterns are always rejected, and `var` with
         // an Initializer is rejected in strict code.
         self.flag_for_head_initializer(&it.left, "for-in");
-        walk::walk_for_in_statement(self, it);
     }
 
-    fn visit_for_of_statement(&mut self, it: &ForOfStatement<'a>) {
+    pub(crate) fn enter_for_of_statement<'a>(&mut self, it: &ForOfStatement<'a>) {
         self.flag_iteration_function_body(&it.body, "for-of");
         self.flag_for_head_lexical_var_conflict(&it.left, &it.body, "for-of");
         // §13.7.5.1 — `for-of` heads never permit Initializer on
         // any variant of ForBinding, regardless of strict mode.
         self.flag_for_head_initializer(&it.left, "for-of");
-        walk::walk_for_of_statement(self, it);
     }
 
-    fn visit_labeled_statement(&mut self, it: &LabeledStatement<'a>) {
+    pub(crate) fn enter_labeled_statement<'a>(&mut self, it: &LabeledStatement<'a>) {
         // §14.13.1 LabelledStatement Static Semantics: Early Errors —
         // IsLabelledFunction(Statement) must not be true. Even in
         // sloppy mode a labelled function declaration as the labelled
@@ -1778,10 +1736,9 @@ impl<'a> Visit<'a> for StrictValidator {
                 });
             }
         }
-        walk::walk_labeled_statement(self, it);
     }
 
-    fn visit_catch_clause(&mut self, it: &oxc_ast::ast::CatchClause<'a>) {
+    pub(crate) fn enter_catch_clause<'a>(&mut self, it: &oxc_ast::ast::CatchClause<'a>) {
         // §14.15.1 Try Statement Static Semantics: Early Errors — it
         // is a Syntax Error if any element of the BoundNames of
         // CatchParameter also occurs in the LexicallyDeclaredNames of
@@ -1809,10 +1766,9 @@ impl<'a> Visit<'a> for StrictValidator {
                 });
             }
         }
-        walk::walk_catch_clause(self, it);
     }
 
-    fn visit_identifier_reference(&mut self, it: &IdentifierReference<'a>) {
+    pub(crate) fn enter_identifier_reference<'a>(&mut self, it: &IdentifierReference<'a>) {
         // ECMA-262 §13.1 Identifiers Static Semantics: Early Errors —
         // in strict-mode code an `IdentifierReference` must not be one
         // of the strict-mode FutureReservedWords or `yield`. The
@@ -1853,7 +1809,7 @@ impl<'a> Visit<'a> for StrictValidator {
         }
     }
 
-    fn visit_variable_declaration(&mut self, it: &VariableDeclaration<'a>) {
+    pub(crate) fn enter_variable_declaration<'a>(&mut self, it: &VariableDeclaration<'a>) {
         // §13.3.1.1 LexicalDeclaration early error — `let` is not a
         // legal BoundName of a `let` / `const` declaration in any mode
         // (`var let` stays legal in sloppy code).
@@ -1883,10 +1839,9 @@ impl<'a> Visit<'a> for StrictValidator {
                 });
             }
         }
-        walk::walk_variable_declaration(self, it);
     }
 
-    fn visit_binding_identifier(&mut self, it: &BindingIdentifier<'a>) {
+    pub(crate) fn enter_binding_identifier<'a>(&mut self, it: &BindingIdentifier<'a>) {
         // ECMA-262 §13.1.1 Static Semantics: Early Errors for
         // BindingIdentifier — in strict mode code, the binding name
         // must not be `eval` or `arguments` (§10.2.1, the strict-mode
@@ -1918,7 +1873,7 @@ impl<'a> Visit<'a> for StrictValidator {
         }
     }
 
-    fn visit_assignment_target_property_identifier(
+    pub(crate) fn enter_assignment_target_property_identifier<'a>(
         &mut self,
         it: &AssignmentTargetPropertyIdentifier<'a>,
     ) {
@@ -1940,10 +1895,9 @@ impl<'a> Visit<'a> for StrictValidator {
                 ),
             });
         }
-        walk::walk_assignment_target_property_identifier(self, it);
     }
 
-    fn visit_simple_assignment_target(&mut self, it: &SimpleAssignmentTarget<'a>) {
+    pub(crate) fn enter_simple_assignment_target<'a>(&mut self, it: &SimpleAssignmentTarget<'a>) {
         // §12.7.1 / §13.7.5.1 — `eval` and `arguments` are not valid
         // simple assignment targets in strict code. Covers
         // destructuring-assignment targets and `for`-head targets
@@ -1967,10 +1921,9 @@ impl<'a> Visit<'a> for StrictValidator {
                 ),
             });
         }
-        walk::walk_simple_assignment_target(self, it);
     }
 
-    fn visit_assignment_expression(&mut self, it: &AssignmentExpression<'a>) {
+    pub(crate) fn enter_assignment_expression<'a>(&mut self, it: &AssignmentExpression<'a>) {
         if self.is_strict()
             && let Some(name) = assignment_target_identifier(&it.left)
             && is_reserved_strict_assignment_target(name)
@@ -1988,10 +1941,9 @@ impl<'a> Visit<'a> for StrictValidator {
                 ),
             });
         }
-        walk::walk_assignment_expression(self, it);
     }
 
-    fn visit_update_expression(&mut self, it: &UpdateExpression<'a>) {
+    pub(crate) fn enter_update_expression<'a>(&mut self, it: &UpdateExpression<'a>) {
         // §13.4 (Update Expressions): ++/-- on `eval` or `arguments`
         // in strict mode is also an early error via the same
         // simple-assignment-target rule.
@@ -2016,10 +1968,9 @@ impl<'a> Visit<'a> for StrictValidator {
                 ),
             });
         }
-        walk::walk_update_expression(self, it);
     }
 
-    fn visit_unary_expression(&mut self, it: &UnaryExpression<'a>) {
+    pub(crate) fn enter_unary_expression<'a>(&mut self, it: &UnaryExpression<'a>) {
         if matches!(it.operator, UnaryOperator::Delete) {
             // §13.5.1.1: `delete <IdentifierReference>` in strict.
             if self.is_strict()
@@ -2060,10 +2011,9 @@ impl<'a> Visit<'a> for StrictValidator {
                 });
             }
         }
-        walk::walk_unary_expression(self, it);
     }
 
-    fn visit_string_literal(&mut self, it: &StringLiteral<'a>) {
+    pub(crate) fn enter_string_literal<'a>(&mut self, it: &StringLiteral<'a>) {
         if !self.is_strict() {
             return;
         }
@@ -2083,6 +2033,100 @@ impl<'a> Visit<'a> for StrictValidator {
                     "use the `\\xNN` or `\\uNNNN` escape forms in strict mode code".to_string(),
                 ),
             });
+        }
+    }
+
+    /// Before the value of a method or accessor property: the value is a
+    /// method, whose body may name `super`.
+    pub(crate) fn enter_object_property_value<'a>(&mut self, it: &ObjectProperty<'a>) {
+        if it.method || matches!(it.kind, PropertyKind::Get | PropertyKind::Set) {
+            self.next_function_super_allowed = Some(true);
+        }
+    }
+
+    pub(crate) fn leave_object_property_value<'a>(&mut self, it: &ObjectProperty<'a>) {
+        if it.method || matches!(it.kind, PropertyKind::Get | PropertyKind::Set) {
+            self.next_function_super_allowed = None;
+        }
+    }
+
+    /// Around a field initializer: it runs as a method of the class, so it
+    /// may name `super` but never call it.
+    pub(crate) fn enter_property_definition_value(&mut self) {
+        self.super_stack.push(true);
+        self.super_call_stack.push(false);
+    }
+
+    pub(crate) fn leave_property_definition_value(&mut self) {
+        self.super_call_stack.pop();
+        self.super_stack.pop();
+    }
+
+    pub(crate) fn enter_class<'a>(&mut self, it: &Class<'a>) {
+        // ECMA-262 §10.2.10 — class bodies are always strict mode code.
+        self.strict_stack.push(true);
+        // §15.7.1 ClassBody Static Semantics: Early Errors —
+        // PrivateBoundNames of ClassBody contains no duplicate
+        // entries, except when a name is used exactly once as a
+        // getter and once as a setter (no other entries).
+        self.check_private_bound_names(it);
+        // §15.7.1 FieldDefinition Static Semantics: Early Errors —
+        // It is a Syntax Error if Initializer is present and
+        // ContainsArguments of Initializer is true. Field initializers
+        // (and accessor `value` expressions) execute in the class
+        // scope, which never binds `arguments` even when the class
+        // sits inside a function.
+        for element in &it.body.body {
+            match element {
+                ClassElement::PropertyDefinition(p) => {
+                    if let Some(init) = &p.value {
+                        self.check_initializer_no_arguments(init, "field initializer");
+                    }
+                }
+                ClassElement::AccessorProperty(a) => {
+                    if let Some(init) = &a.value {
+                        self.check_initializer_no_arguments(init, "accessor initializer");
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Before the class body, after its heritage: §15.7.1 evaluates the
+    /// heritage in the outer private environment; the body sees the
+    /// class's own names too.
+    pub(crate) fn enter_class_body<'a>(&mut self, it: &Class<'a>) {
+        if let Some(stack) = &mut self.private_names {
+            stack.push(class_private_bound_names(it));
+        }
+        self.class_is_derived.push(it.heritage.is_some());
+    }
+
+    pub(crate) fn leave_class_body(&mut self) {
+        self.class_is_derived.pop();
+        if let Some(stack) = &mut self.private_names {
+            stack.pop();
+        }
+    }
+
+    pub(crate) fn leave_class(&mut self) {
+        self.strict_stack.pop();
+    }
+
+    pub(crate) fn enter_call_expression<'a>(&mut self, it: &oxc_ast::ast::CallExpression<'a>) {
+        if let Expression::Super(sup) = &it.callee {
+            if !self.super_call_stack.last().copied().unwrap_or(false) {
+                self.diagnostics.push(SyntaxDiagnostic {
+                    code: "SUPER_CALL_OUTSIDE_DERIVED_CONSTRUCTOR".to_string(),
+                    message: "SyntaxError: `super()` is only valid in a derived class constructor (§15.7.1)"
+                        .to_string(),
+                    range: Some((sup.span.start, sup.span.end)),
+                    help: None,
+                });
+            }
+            // The callee is the call's own `super`, not a SuperProperty.
+            self.super_call_callee = Some(sup.span.start);
         }
     }
 }
@@ -2270,7 +2314,7 @@ fn is_legacy_numeric_form(raw: &str) -> bool {
     bytes[1].is_ascii_digit()
 }
 
-/// Validate block-level lexical early errors (§14.2.1, §14.12.1).
+/// Block-level lexical early errors (§14.2.1, §14.12.1).
 ///
 /// For every `Block` and switch `CaseBlock`, the
 /// `LexicallyDeclaredNames` of its statement list (`let` / `const` /
@@ -2279,39 +2323,7 @@ fn is_legacy_numeric_form(raw: &str) -> bool {
 /// statement list's `VarDeclaredNames`. Annex B §B.3.3.1 relaxes
 /// exactly one case: two plain (non-async, non-generator) function
 /// declarations may share a name in sloppy mode.
-pub fn validate_block_early_errors(
-    body: &[oxc_ast::ast::Statement<'_>],
-    source_strict: bool,
-) -> Result<(), CompileError> {
-    let mut visitor = BlockLexicalValidator {
-        strict_stack: vec![source_strict],
-        label_stack: Vec::new(),
-        in_static_block: false,
-        diagnostics: Vec::new(),
-    };
-    // §16.1.1 / §16.2.1 — the top-level StatementList itself obeys
-    // the duplicate-lexical and lexical/var-conflict rules. Function
-    // declarations are VAR-scoped at this level (§8.2.6
-    // TopLevelLexicallyDeclaredNames), not lexical.
-    visitor.check_top_level_statement_list(body.iter());
-    for stmt in body {
-        visitor.visit_statement(stmt);
-    }
-    if visitor.diagnostics.is_empty() {
-        return Ok(());
-    }
-    let messages = visitor
-        .diagnostics
-        .iter()
-        .map(|d| d.message.clone())
-        .collect();
-    Err(CompileError::Syntax {
-        messages,
-        diagnostics: visitor.diagnostics,
-    })
-}
-
-struct BlockLexicalValidator {
+pub(crate) struct BlockLexicalValidator {
     strict_stack: Vec<bool>,
     /// §8.4.1 ContainsDuplicateLabels — the chain of label names
     /// currently enclosing the visit position. Cleared across
@@ -2321,6 +2333,9 @@ struct BlockLexicalValidator {
     /// nested function boundary) — §15.7.1 makes `await` a Syntax
     /// Error there.
     in_static_block: bool,
+    /// The label chain and static-block state of each enclosing label
+    /// scope, restored when it closes.
+    label_scopes: Vec<(Vec<String>, bool)>,
     diagnostics: Vec<SyntaxDiagnostic>,
 }
 
@@ -2497,8 +2512,11 @@ fn new_callee_reaches_import_call(mut callee: &Expression<'_>) -> Option<(u32, u
     }
 }
 
-impl<'a> Visit<'a> for BlockLexicalValidator {
-    fn visit_new_expression(&mut self, it: &oxc_ast::ast::NewExpression<'a>) {
+/// Node hooks of the pass, driven by the unit's one analysis walk
+/// (`crate::capture`): each `enter_*` runs before the node's children are
+/// walked and each `leave_*` after.
+impl BlockLexicalValidator {
+    pub(crate) fn enter_new_expression<'a>(&mut self, it: &oxc_ast::ast::NewExpression<'a>) {
         if let Some(range) = new_callee_reaches_import_call(&it.callee) {
             self.diagnostics.push(SyntaxDiagnostic {
                 code: "NEW_TARGETS_IMPORT_CALL".to_string(),
@@ -2509,18 +2527,16 @@ impl<'a> Visit<'a> for BlockLexicalValidator {
                 help: Some("wrap the import() call in parentheses".to_string()),
             });
         }
-        walk::walk_new_expression(self, it);
     }
 
-    fn visit_function_body(&mut self, it: &oxc_ast::ast::FunctionBody<'a>) {
+    pub(crate) fn enter_function_body<'a>(&mut self, it: &oxc_ast::ast::FunctionBody<'a>) {
         // §10.2.11 — a function body's top-level StatementList obeys
         // the duplicate-lexical / lexical-var rules with hoistable
         // declarations on the var side (§8.2.6).
         self.check_top_level_statement_list(it.statements.iter());
-        walk::walk_function_body(self, it);
     }
 
-    fn visit_labeled_statement(&mut self, it: &oxc_ast::ast::LabeledStatement<'a>) {
+    pub(crate) fn enter_labeled_statement<'a>(&mut self, it: &oxc_ast::ast::LabeledStatement<'a>) {
         let name = it.label.name.as_str();
         if self.label_stack.iter().any(|l| l == name) {
             self.diagnostics.push(SyntaxDiagnostic {
@@ -2533,11 +2549,13 @@ impl<'a> Visit<'a> for BlockLexicalValidator {
             });
         }
         self.label_stack.push(name.to_string());
-        walk::walk_labeled_statement(self, it);
+    }
+
+    pub(crate) fn leave_labeled_statement<'a>(&mut self, _it: &oxc_ast::ast::LabeledStatement<'a>) {
         self.label_stack.pop();
     }
 
-    fn visit_with_statement(&mut self, it: &oxc_ast::ast::WithStatement<'a>) {
+    pub(crate) fn enter_with_statement<'a>(&mut self, it: &oxc_ast::ast::WithStatement<'a>) {
         // §14.11.1 — the with body cannot be a (labelled) function
         // declaration.
         let mut body = &it.body;
@@ -2560,22 +2578,21 @@ impl<'a> Visit<'a> for BlockLexicalValidator {
                 _ => break,
             }
         }
-        walk::walk_with_statement(self, it);
     }
 
-    fn visit_static_block(&mut self, it: &oxc_ast::ast::StaticBlock<'a>) {
+    pub(crate) fn enter_static_block<'a>(&mut self, it: &oxc_ast::ast::StaticBlock<'a>) {
         // §15.7.4 — the static-block body is its own statement list
         // (duplicate lexicals, lexical/var conflicts) and may not
         // contain `await` outside a nested function.
         self.check_top_level_statement_list(it.body.iter());
-        let saved_labels = std::mem::take(&mut self.label_stack);
-        let saved_static = std::mem::replace(&mut self.in_static_block, true);
-        walk::walk_static_block(self, it);
-        self.in_static_block = saved_static;
-        self.label_stack = saved_labels;
+        self.enter_label_scope(true);
     }
 
-    fn visit_await_expression(&mut self, it: &oxc_ast::ast::AwaitExpression<'a>) {
+    pub(crate) fn leave_static_block<'a>(&mut self, _it: &oxc_ast::ast::StaticBlock<'a>) {
+        self.leave_label_scope();
+    }
+
+    pub(crate) fn enter_await_expression<'a>(&mut self, it: &oxc_ast::ast::AwaitExpression<'a>) {
         if self.in_static_block {
             self.diagnostics.push(SyntaxDiagnostic {
                 code: "STATIC_BLOCK_AWAIT".to_string(),
@@ -2585,60 +2602,74 @@ impl<'a> Visit<'a> for BlockLexicalValidator {
                 help: None,
             });
         }
-        walk::walk_await_expression(self, it);
     }
 
-    fn visit_block_statement(&mut self, it: &BlockStatement<'a>) {
+    pub(crate) fn enter_block_statement<'a>(&mut self, it: &BlockStatement<'a>) {
         self.check_statement_list(it.body.iter());
-        walk::walk_block_statement(self, it);
     }
 
-    fn visit_switch_statement(&mut self, it: &SwitchStatement<'a>) {
+    pub(crate) fn enter_switch_statement<'a>(&mut self, it: &SwitchStatement<'a>) {
         // §14.12.1 — the CaseBlock's LexicallyDeclaredNames are the
         // union across every case consequent.
         self.check_statement_list(it.cases.iter().flat_map(|case| case.consequent.iter()));
-        walk::walk_switch_statement(self, it);
     }
 
-    fn visit_function(&mut self, it: &Function<'a>, flags: ScopeFlags) {
+    pub(crate) fn enter_function<'a>(&mut self, it: &Function<'a>) {
         let body_strict = it
             .body
             .as_ref()
             .is_some_and(|b| b.has_use_strict_directive());
         let inner_strict = self.strict() || body_strict;
         self.strict_stack.push(inner_strict);
-        let saved_labels = std::mem::take(&mut self.label_stack);
-        let saved_static = std::mem::replace(&mut self.in_static_block, false);
-        walk::walk_function(self, it, flags);
-        self.in_static_block = saved_static;
-        self.label_stack = saved_labels;
+        self.enter_label_scope(false);
+    }
+
+    pub(crate) fn leave_function<'a>(&mut self, _it: &Function<'a>) {
+        self.leave_label_scope();
         self.strict_stack.pop();
     }
 
-    fn visit_arrow_function_expression(&mut self, it: &ArrowFunctionExpression<'a>) {
+    pub(crate) fn enter_arrow_function_expression<'a>(&mut self, it: &ArrowFunctionExpression<'a>) {
         let body_strict = crate::body::Body::Arrow(&it.body).has_use_strict_directive();
         let inner_strict = self.strict() || body_strict;
         self.strict_stack.push(inner_strict);
-        let saved_labels = std::mem::take(&mut self.label_stack);
         // An async arrow's `await` is its own, whatever block the arrow sits
         // in: a static block's restriction stops at the arrow (§15.7.1
         // ContainsAwait does not look into an AsyncArrowFunction).
-        let saved_static = if it.r#async {
-            std::mem::replace(&mut self.in_static_block, false)
-        } else {
-            self.in_static_block
-        };
-        walk::walk_arrow_function_expression(self, it);
-        self.in_static_block = saved_static;
-        self.label_stack = saved_labels;
+        let in_static_block = !it.r#async && self.in_static_block;
+        self.enter_label_scope(in_static_block);
+    }
+
+    pub(crate) fn leave_arrow_function_expression<'a>(
+        &mut self,
+        _it: &ArrowFunctionExpression<'a>,
+    ) {
+        self.leave_label_scope();
         self.strict_stack.pop();
     }
 
-    fn visit_class(&mut self, it: &Class<'a>) {
+    pub(crate) fn enter_class<'a>(&mut self, _it: &Class<'a>) {
         // §10.2.10 — class bodies are always strict mode code.
         self.strict_stack.push(true);
-        walk::walk_class(self, it);
+    }
+
+    pub(crate) fn leave_class(&mut self) {
         self.strict_stack.pop();
+    }
+
+    /// Open a scope labels do not cross (a function, arrow or static block),
+    /// whose code is or is not static-block code.
+    fn enter_label_scope(&mut self, in_static_block: bool) {
+        let labels = std::mem::take(&mut self.label_stack);
+        let outer_static = std::mem::replace(&mut self.in_static_block, in_static_block);
+        self.label_scopes.push((labels, outer_static));
+    }
+
+    fn leave_label_scope(&mut self) {
+        if let Some((labels, outer_static)) = self.label_scopes.pop() {
+            self.label_stack = labels;
+            self.in_static_block = outer_static;
+        }
     }
 }
 

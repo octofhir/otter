@@ -161,6 +161,16 @@ impl<'frame, 'code> BytecodeArgumentWindow<'frame, 'code> {
         read_register(self.caller, register)
     }
 
+    /// Number of argument values in the window.
+    pub(crate) fn len(&self) -> usize {
+        self.len
+    }
+
+    /// The window's value at `index`.
+    pub(crate) fn value(&self, index: usize) -> Result<Value, VmError> {
+        self.get(index).copied()
+    }
+
     /// Append the window's values to `out`, in order.
     pub(crate) fn copy_into(&self, out: &mut SmallVec<[Value; 8]>) -> Result<(), VmError> {
         out.reserve(self.len);

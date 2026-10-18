@@ -2220,6 +2220,35 @@ pub(crate) fn plain_dense_prefix_values(
     })
 }
 
+/// Append `arr`'s elements to `out` when it is a plain dense array (no
+/// sidecar, no holes, length equal to its dense prefix): exactly what
+/// CreateListFromArrayLike or IteratorToList over it would read. `false`
+/// leaves `out` untouched.
+pub(crate) fn copy_plain_dense(
+    arr: JsArray,
+    heap: &otter_gc::GcHeap,
+    out: &mut smallvec::SmallVec<[Value; 8]>,
+) -> bool {
+    heap.read_payload(arr, |body| {
+        let len = body.dense_len();
+        if !body.exotic.is_null() || body.length != len {
+            return false;
+        }
+        let start = out.len();
+        out.reserve(len);
+        for index in 0..len {
+            match body.dense_value(index) {
+                Some(value) if !value.is_hole() => out.push(value),
+                _ => {
+                    out.truncate(start);
+                    return false;
+                }
+            }
+        }
+        true
+    })
+}
+
 /// Append `src`'s elements to `dst` when `src` is a plain dense array (no
 /// sidecar, no holes, nothing past its dense prefix): one reservation and no
 /// intermediate list. `Ok(false)` leaves both untouched.

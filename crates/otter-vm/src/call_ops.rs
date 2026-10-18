@@ -707,12 +707,23 @@ impl Interpreter {
         let callee_reg = register_operand(operands.get(1))?;
         let this_reg = register_operand(operands.get(2))?;
         let args_reg = register_operand(operands.get(3))?;
-        let top_idx = stack.len() - 1;
-        let callee = *read_register(&stack[top_idx], callee_reg)?;
-        let this_value = *read_register(&stack[top_idx], this_reg)?;
-        let args = self.spread_call_arguments(*read_register(&stack[top_idx], args_reg)?)?;
-        stack[top_idx].advance_pc()?;
-        stack.stage_call(callee, this_value, None, args, Some(dst));
+        let caller: *mut crate::Frame = stack.last_mut().ok_or(VmError::InvalidOperand)?;
+        // SAFETY: the caller's record is trampoline-owned, live for this whole
+        // instruction, and outside the stack view the staging below mutates.
+        let caller = unsafe { &mut *caller };
+        let callee = *read_register(caller, callee_reg)?;
+        let this_value = *read_register(caller, this_reg)?;
+        let array = read_register(caller, args_reg)?
+            .as_array()
+            .ok_or(VmError::TypeMismatch)?;
+        let heap = &self.gc_heap;
+        stack.stage_call_with(callee, this_value, None, Some(dst), |staged| {
+            crate::array::with_elements(array, heap, |elements| {
+                staged.extend_from_slice(elements);
+            });
+            Ok::<(), VmError>(())
+        })?;
+        caller.advance_pc()?;
         Ok(())
     }
 
@@ -729,14 +740,92 @@ impl Interpreter {
         let callee_reg = operands.register(1)?;
         let this_reg = operands.register(2)?;
         let argc = operands.const_index(3)? as usize;
-        let top_idx = stack.len() - 1;
-        let callee = *read_register(&stack[top_idx], callee_reg)?;
-        let this_value = *read_register(&stack[top_idx], this_reg)?;
-        let args = BytecodeArgumentWindow::from_operands(&stack[top_idx], operands, 4, argc)
-            .to_smallvec8()?;
-        stack[top_idx].advance_pc()?;
-        stack.stage_call(callee, this_value, None, args, Some(dst));
+        let caller: *mut crate::Frame = stack.last_mut().ok_or(VmError::InvalidOperand)?;
+        // SAFETY: the caller's record is trampoline-owned, live for this whole
+        // instruction, and outside the stack view the staging below mutates.
+        let caller = unsafe { &mut *caller };
+        let callee = *read_register(caller, callee_reg)?;
+        let this_value = *read_register(caller, this_reg)?;
+        let window = BytecodeArgumentWindow::from_operands(caller, operands, 4, argc);
+        if self.stage_forwarding_intrinsic(stack, callee, this_value, &window, dst)? {
+            caller.advance_pc()?;
+            return Ok(());
+        }
+        stack.stage_call_with(callee, this_value, None, Some(dst), |staged| {
+            window.copy_into(staged)
+        })?;
+        caller.advance_pc()?;
         Ok(())
+    }
+
+    /// Stage `target(...)` in place of `target.apply(thisArg, argArray)` or
+    /// `target.call(thisArg, ...args)` on the realm's intrinsics, when no step
+    /// of the intrinsic is observable: `target` is callable and, for `apply`,
+    /// `argArray` is nullish or a plain dense array, whose
+    /// CreateListFromArrayLike is its elements. The call then takes one
+    /// trampoline pass instead of a host frame and a second one. `false`
+    /// stages nothing.
+    fn stage_forwarding_intrinsic(
+        &mut self,
+        stack: &mut ActivationStack,
+        callee: Value,
+        target: Value,
+        window: &BytecodeArgumentWindow<'_, '_>,
+        dst: u16,
+    ) -> Result<bool, VmError> {
+        let Some(native) = callee.as_native_function() else {
+            return Ok(false);
+        };
+        let apply = native.is_vm_intrinsic(
+            &self.gc_heap,
+            crate::native_function::VmIntrinsicFunction::FunctionPrototypeApply,
+        );
+        let call = !apply
+            && native.is_vm_intrinsic(
+                &self.gc_heap,
+                crate::native_function::VmIntrinsicFunction::FunctionPrototypeCall,
+            );
+        if !(apply || call) || !self.is_callable_runtime(&target) {
+            return Ok(false);
+        }
+        let this_arg = if window.len() > 0 {
+            window.value(0)?
+        } else {
+            Value::undefined()
+        };
+        if call {
+            stack.stage_call_with(target, this_arg, None, Some(dst), |staged| {
+                for index in 1..window.len() {
+                    staged.push(window.value(index)?);
+                }
+                Ok::<(), VmError>(())
+            })?;
+            return Ok(true);
+        }
+        if window.len() > 2 {
+            return Ok(false);
+        }
+        let array_like = if window.len() > 1 {
+            window.value(1)?
+        } else {
+            Value::undefined()
+        };
+        if array_like.is_nullish() {
+            stack.stage_call(target, this_arg, None, [], Some(dst));
+            return Ok(true);
+        }
+        let Some(array) = array_like.as_array() else {
+            return Ok(false);
+        };
+        let heap = &self.gc_heap;
+        let mut staged_plain = true;
+        stack
+            .stage_call_with(target, this_arg, None, Some(dst), |staged| {
+                staged_plain = crate::array::copy_plain_dense(array, heap, staged);
+                if staged_plain { Ok(()) } else { Err(()) }
+            })
+            .ok();
+        Ok(staged_plain)
     }
 
     /// Synchronously invoke `callee(args)` with the given `this` and return

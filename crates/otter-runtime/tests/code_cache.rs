@@ -6,7 +6,8 @@
 //! - The first run of a script hands back bytes; a run given them compiles
 //!   nothing and behaves the same, lazily compiled functions included.
 //! - Bytes taken after the script's functions ran carry their bodies: a run
-//!   given those compiles none of them either.
+//!   given those compiles none of them either. Two different scripts run
+//!   under one address keep no bodies for it.
 //! - The same source under another specifier runs from the same bytes, and
 //!   its functions name the specifier it ran under.
 //! - Bytes for another source or a damaged copy are a miss: the script
@@ -75,6 +76,15 @@ fn a_kept_cache_runs_the_script_without_compiling_it() {
     assert_eq!(completion, "42:71");
     assert!(fresh.is_none());
     assert_eq!(third.lazy_function_bodies_compiled(), lazily);
+    assert!(
+        third
+            .script_code_cache("https://example.test/a.js")
+            .is_none()
+    );
+    // Another script run under the same address ends keeping bodies there.
+    let other = "function other() { return helper(1); } other();";
+    let (completion, _) = run(&mut third, other, "https://example.test/a.js", None);
+    assert_eq!(completion, "2");
     assert!(
         third
             .script_code_cache("https://example.test/a.js")

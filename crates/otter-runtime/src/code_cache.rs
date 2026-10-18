@@ -11,6 +11,8 @@
 //!   bytes when they still match, and produce fresh ones when they do not.
 //! - [`Runtime::script_code_cache`] — the bytes again once the script's
 //!   functions have run, with the bodies they compiled on their first call.
+//! - [`Runtime::web_module_code_caches`] — the same for delivered web
+//!   modules, whose bytes the module map reads back.
 //! - [`Runtime::compile_script_cache`] — produce the bytes without running.
 //!
 //! # Invariants
@@ -135,6 +137,39 @@ impl Runtime {
         let kept = self.interp.kept_script_cache(specifier)?;
         Some(with_bodies(kept.top, &kept.bodies))
     }
+
+    /// The code caches to keep for delivered web modules (see
+    /// [`crate::web_modules::WebModuleMap::produce_code_caches`]): each module compiled
+    /// since the last call, and each module whose functions compiled a
+    /// body on a first call since, with every body it kept.
+    pub fn web_module_code_caches(&mut self) -> Vec<crate::web_modules::WebModuleCodeCache> {
+        let Some(map) = self.web_module_map().cloned() else {
+            return Vec::new();
+        };
+        let mut caches = map.take_code_caches();
+        for (compiled_as, request_url) in map.kept_urls() {
+            if let Some(kept) = self.interp.kept_script_cache(&compiled_as) {
+                caches.retain(|cache| cache.request_url != request_url);
+                caches.push(crate::web_modules::WebModuleCodeCache {
+                    request_url,
+                    bytes: with_bodies(kept.top, &kept.bodies),
+                });
+            }
+        }
+        caches
+    }
+
+    /// Hand the interpreter the web modules whose first-call bodies it is
+    /// to keep. Runs before a module graph evaluates, so every first call
+    /// of the graph's functions finds them.
+    pub(crate) fn adopt_web_module_bodies(&mut self) {
+        let Some(map) = self.web_module_map().cloned() else {
+            return;
+        };
+        for (compiled_as, kept) in map.take_kept() {
+            self.interp.keep_script_cache(&compiled_as, kept);
+        }
+    }
 }
 
 /// The key of a classic script's compile: its text and kind, under no
@@ -173,7 +208,7 @@ fn encode(
 
 /// `top` followed by the section of first-call `bodies`: their count, then
 /// each one's source range, fingerprint, length and encoding.
-fn with_bodies(mut top: Vec<u8>, bodies: &[LazyBody]) -> Vec<u8> {
+pub(crate) fn with_bodies(mut top: Vec<u8>, bodies: &[LazyBody]) -> Vec<u8> {
     let kept: Vec<&LazyBody> = bodies
         .iter()
         .filter(|body| u32::try_from(body.bytes.len()).is_ok())
@@ -208,6 +243,16 @@ fn decode(bytes: &[u8], key: &CompileCacheKey, source: &str) -> Option<Decoded> 
     let module = rest.get(..length)?;
     rest = &rest[length..];
     let top = bytes[..bytes.len() - rest.len()].to_vec();
+    let bodies = read_bodies(rest)?;
+    let module = otter_bytecode::binary::decode_module_with_source(module, source).ok()?;
+    Some(Decoded {
+        module,
+        kept: KeptScript { top, bodies },
+    })
+}
+
+/// The body section [`with_bodies`] wrote, which must be all of `rest`.
+pub(crate) fn read_bodies(mut rest: &[u8]) -> Option<Vec<LazyBody>> {
     let count = take_u32(&mut rest)?;
     let mut bodies = Vec::with_capacity(count.min(1 << 16) as usize);
     for _ in 0..count {
@@ -223,17 +268,10 @@ fn decode(bytes: &[u8], key: &CompileCacheKey, source: &str) -> Option<Decoded> 
         });
         rest = &rest[length..];
     }
-    if !rest.is_empty() {
-        return None;
-    }
-    let module = otter_bytecode::binary::decode_module_with_source(module, source).ok()?;
-    Some(Decoded {
-        module,
-        kept: KeptScript { top, bodies },
-    })
+    rest.is_empty().then_some(bodies)
 }
 
-fn take_u32(rest: &mut &[u8]) -> Option<u32> {
+pub(crate) fn take_u32(rest: &mut &[u8]) -> Option<u32> {
     let value = u32::from_le_bytes(rest.get(..4)?.try_into().ok()?);
     *rest = &rest[4..];
     Some(value)

@@ -115,11 +115,12 @@ fn an_inline_module_with_relative_and_absolute_imports_runs_from_delivered_sourc
 #[test]
 fn a_code_cache_from_one_load_runs_the_next_without_parsing() {
     let entry = WebModuleMap::inline_url(PAGE, 0);
-    let text = "import { a } from './lib/a.js'; import b from '/b.js'; log.push(a, b);";
+    let text =
+        "import { a, twice } from './lib/a.js'; import b from '/b.js'; log.push(a, b, twice(2));";
     let files = [
         (
             "https://site.test/app/lib/a.js",
-            "export const a = 'a' + 1;",
+            "export const a = 'a' + 1; export function twice(x) { return x * 2; }",
         ),
         (
             "https://site.test/b.js",
@@ -134,10 +135,11 @@ fn a_code_cache_from_one_load_runs_the_next_without_parsing() {
     runtime
         .run_module_source(SourceInput::from_javascript(text), entry.clone())
         .expect("first load runs");
-    assert_eq!(log(&mut runtime), "a1,2");
-    let caches = map.take_code_caches();
+    assert_eq!(log(&mut runtime), "a1,2,4");
+    // With the bodies its functions compiled on their first call.
+    let caches = runtime.web_module_code_caches();
     assert_eq!(caches.len(), 3);
-    assert!(map.take_code_caches().is_empty());
+    assert!(runtime.web_module_code_caches().is_empty());
     let cache_of = |url: &str| {
         caches
             .iter()
@@ -161,21 +163,27 @@ fn a_code_cache_from_one_load_runs_the_next_without_parsing() {
     respond(&map, files[0].0, files[0].1);
     respond(&map, files[1].0, files[1].1);
     assert_eq!(map.graph_status(&entry).unwrap(), WebModuleGraph::Ready);
+    let lazily = runtime.lazy_function_bodies_compiled();
     runtime
         .run_module_source(SourceInput::from_javascript(text), entry.clone())
         .expect("cached load runs");
-    assert_eq!(log(&mut runtime), "a1,2");
+    assert_eq!(log(&mut runtime), "a1,2,4");
     assert_eq!(map.parses(), 0);
+    assert_eq!(runtime.lazy_function_bodies_compiled(), lazily);
     // A cache for other text is ignored: the edited module parses.
     let (mut runtime, map) = page();
     respond(&map, &entry, text);
-    respond(&map, files[0].0, "export const a = 'edited';");
+    respond(
+        &map,
+        files[0].0,
+        "export const a = 'edited'; export function twice(x) { return x * 2; }",
+    );
     respond(&map, files[1].0, files[1].1);
     assert_eq!(map.graph_status(&entry).unwrap(), WebModuleGraph::Ready);
     runtime
         .run_module_source(SourceInput::from_javascript(text), entry)
         .expect("edited load runs");
-    assert_eq!(log(&mut runtime), "edited,2");
+    assert_eq!(log(&mut runtime), "edited,2,4");
     assert_eq!(map.parses(), 1);
 }
 

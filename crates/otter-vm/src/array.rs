@@ -2164,6 +2164,42 @@ pub fn with_elements<R>(arr: JsArray, heap: &otter_gc::GcHeap, f: impl FnOnce(&[
     })
 }
 
+/// Feed a plain array's elements, in order, to `f`.
+///
+/// `None` when the array has exotic state, an indexed accessor, a hole, or
+/// a length past its dense prefix: then reading `length` and every index is
+/// not the whole `CreateListFromArrayLike` answer.
+pub(crate) fn with_plain_dense_values<R>(
+    arr: JsArray,
+    heap: &otter_gc::GcHeap,
+    f: impl FnOnce(&mut dyn Iterator<Item = Value>) -> R,
+) -> Option<R> {
+    heap.read_payload(arr, |body| {
+        let count = body.dense_len();
+        if !body.exotic.is_null() || body.accessors().is_some() || body.length != count {
+            return None;
+        }
+        let Some(slab) = elements::body_of(body.slab) else {
+            return (count == 0).then(|| f(&mut std::iter::empty()));
+        };
+        // SAFETY: the array body keeps the slab reachable for this borrow.
+        let slab = unsafe { &*slab };
+        if let Some(values) = slab.tagged_slice() {
+            let values = values.get(..count)?;
+            if values.iter().any(|value| value.is_hole()) {
+                return None;
+            }
+            return Some(f(&mut values.iter().copied()));
+        }
+        if (0..count).any(|index| slab.get(index).is_none_or(Value::is_hole)) {
+            return None;
+        }
+        Some(f(
+            &mut (0..count).map(|index| slab.get(index).unwrap_or(Value::UNDEFINED))
+        ))
+    })
+}
+
 /// Clone a proven plain dense prefix for builtin fast paths.
 ///
 /// Returns `None` if any observable array exotic state, sparse storage,

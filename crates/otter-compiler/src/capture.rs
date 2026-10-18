@@ -39,7 +39,7 @@ use crate::HashSet;
 
 use oxc_ast::ast::{
     ArrowFunctionExpression, BindingPattern, Class, Expression, FormalParameters, Function,
-    FunctionBody, Statement,
+    Statement,
 };
 use oxc_ast_visit::{Visit, walk};
 use oxc_span::GetSpan;
@@ -218,8 +218,8 @@ impl CaptureFacts {
     }
 
     /// Facts of a function or arrow body of this unit.
-    pub(crate) fn function(&self, body: &FunctionBody<'_>) -> &ScopeFacts {
-        self.scope(std::ptr::from_ref(body) as usize)
+    pub(crate) fn function(&self, body: crate::body::Body<'_, '_>) -> &ScopeFacts {
+        self.scope(body.key())
     }
 
     /// Facts of a class static block of this unit.
@@ -460,23 +460,23 @@ impl Builder<'_> {
         }
     }
 
-    fn enter_function(
+    fn enter_function<'b>(
         &mut self,
         kind: FrameKind,
-        params: &FormalParameters<'_>,
-        body: &FunctionBody<'_>,
+        params: &FormalParameters<'b>,
+        body: crate::body::Body<'_, 'b>,
     ) {
         self.enter_function_with(kind, params, body, None);
     }
 
-    fn enter_function_with(
+    fn enter_function_with<'b>(
         &mut self,
         kind: FrameKind,
-        params: &FormalParameters<'_>,
-        body: &FunctionBody<'_>,
+        params: &FormalParameters<'b>,
+        body: crate::body::Body<'_, 'b>,
         skipped: Option<(u32, crate::preparse::SkippedFacts<'_>)>,
     ) {
-        let frame = self.fresh_frame(kind, std::ptr::from_ref(body) as usize);
+        let frame = self.fresh_frame(kind, body.key());
         self.frames.push(frame);
         // A skipped body's references to names around it sit at the
         // function's start: every range query that covers the function
@@ -499,7 +499,7 @@ impl Builder<'_> {
         if kind == FrameKind::Function {
             frame.bound.insert(ARGUMENTS);
         }
-        for stmt in &body.statements {
+        for stmt in body.statements() {
             match stmt {
                 Statement::VariableDeclaration(declaration) => {
                     for declarator in &declaration.declarations {
@@ -524,7 +524,7 @@ impl Builder<'_> {
                 _ => {}
             }
         }
-        self.visit_function_body(body);
+        body.visit(self);
         if let Some((_, facts)) = skipped {
             for name in facts.escape() {
                 let id = self.facts.intern(name);
@@ -538,8 +538,9 @@ impl Builder<'_> {
                 self.top().facts.nested_eval = true;
             }
         }
-        let start = params.span.start.min(body.span.start);
-        self.exit((start, body.span.end));
+        let span = body.span();
+        let start = params.span.start.min(span.start);
+        self.exit((start, span.end));
     }
 
     /// Open the node of a function or arrow spanning `span`.
@@ -687,9 +688,14 @@ impl<'a> Visit<'a> for Builder<'_> {
                 (it.span.start, it.span.end),
                 blank,
                 skipped.is_some(),
-                std::ptr::from_ref(body) as usize,
+                crate::body::Body::Block(body).key(),
             );
-            self.enter_function_with(FrameKind::Function, &it.params, body, skipped);
+            self.enter_function_with(
+                FrameKind::Function,
+                &it.params,
+                crate::body::Body::Block(body),
+                skipped,
+            );
             self.function_stack.pop();
         }
     }
@@ -699,9 +705,13 @@ impl<'a> Visit<'a> for Builder<'_> {
             (it.span.start, it.span.end),
             None,
             false,
-            std::ptr::from_ref(&*it.body) as usize,
+            crate::body::Body::Arrow(&it.body).key(),
         );
-        self.enter_function(FrameKind::Arrow, &it.params, &it.body);
+        self.enter_function(
+            FrameKind::Arrow,
+            &it.params,
+            crate::body::Body::Arrow(&it.body),
+        );
         self.function_stack.pop();
     }
 
@@ -969,12 +979,12 @@ impl<'f> Region<'f> {
 impl<'a> Visit<'a> for Region<'_> {
     fn visit_function(&mut self, it: &Function<'a>, _flags: oxc_syntax::scope::ScopeFlags) {
         if let Some(body) = it.body.as_deref() {
-            self.absorb(self.facts.function(body));
+            self.absorb(self.facts.function(crate::body::Body::Block(body)));
         }
     }
 
     fn visit_arrow_function_expression(&mut self, it: &ArrowFunctionExpression<'a>) {
-        self.absorb(self.facts.function(&it.body));
+        self.absorb(self.facts.function(crate::body::Body::Arrow(&it.body)));
     }
 
     fn visit_static_block(&mut self, it: &oxc_ast::ast::StaticBlock<'a>) {
@@ -1040,10 +1050,8 @@ pub fn program_references_new_target(stmts: &[Statement<'_>]) -> bool {
         found: bool,
     }
     impl<'a> Visit<'a> for NewTargetFinder {
-        fn visit_meta_property(&mut self, it: &oxc_ast::ast::MetaProperty<'a>) {
-            if it.meta.name == "new" && it.property.name == "target" {
-                self.found = true;
-            }
+        fn visit_new_target(&mut self, _: &oxc_ast::ast::NewTarget) {
+            self.found = true;
         }
         fn visit_function(&mut self, _it: &Function<'a>, _flags: oxc_syntax::scope::ScopeFlags) {
             // Non-arrow function bodies own their `new.target`.
@@ -1062,14 +1070,14 @@ pub fn program_references_new_target(stmts: &[Statement<'_>]) -> bool {
 /// `super` property, or the constructor's own code (arrows included)
 /// contains a direct eval that may do any of these.
 #[must_use]
-pub fn derived_this_observed(
+pub(crate) fn derived_this_observed(
     params: &FormalParameters<'_>,
-    body: Option<&FunctionBody<'_>>,
+    body: Option<crate::body::Body<'_, '_>>,
 ) -> bool {
     let mut finder = DerivedThisFinder::default();
     finder.visit_formal_parameters(params);
     if let Some(body) = body {
-        finder.visit_function_body(body);
+        body.visit(&mut finder);
     }
     finder.found
 }
@@ -1108,7 +1116,7 @@ impl<'a> Visit<'a> for DerivedThisFinder {
     fn visit_class(&mut self, it: &Class<'a>) {
         // Heritage and computed keys evaluate in the surrounding code;
         // member bodies own their `this`.
-        if let Some(super_class) = &it.super_class {
+        if let Some(super_class) = it.heritage.as_ref().map(|heritage| &heritage.expression) {
             self.visit_expression(super_class);
         }
         for element in &it.body.body {
@@ -1229,9 +1237,9 @@ impl<'a> Visit<'a> for DirectEvalFinder {
 /// unrelated `node.arguments` elsewhere in the unit does not pessimize every
 /// function.
 #[must_use]
-pub fn function_body_reads_dot_arguments(
+pub(crate) fn function_body_reads_dot_arguments(
     params: &oxc_ast::ast::FormalParameters<'_>,
-    body: &oxc_ast::ast::FunctionBody<'_>,
+    body: crate::body::Body<'_, '_>,
 ) -> bool {
     let mut finder = DotArgumentsFinder {
         found: false,
@@ -1239,7 +1247,7 @@ pub fn function_body_reads_dot_arguments(
     };
     finder.visit_formal_parameters(params);
     if !finder.found {
-        finder.visit_function_body(body);
+        body.visit(&mut finder);
     }
     finder.found
 }

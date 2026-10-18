@@ -47,6 +47,7 @@ mod arguments_elision;
 mod assignment;
 mod assignment_reference;
 mod binding_emit;
+mod body;
 mod calls;
 pub(crate) mod capture;
 mod chain;

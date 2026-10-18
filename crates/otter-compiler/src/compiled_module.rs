@@ -567,28 +567,38 @@ impl<'a> Visit<'a> for ModuleMetadataVisitor<'_> {
         }
     }
 
+    fn visit_export_declaration(&mut self, decl: &oxc_ast::ast::ExportDeclaration<'a>) {
+        record_exports_from_declaration(self, &decl.declaration, None);
+        oxc_ast_visit::walk::walk_export_declaration(self, decl);
+    }
+
     fn visit_export_named_declaration(&mut self, decl: &oxc_ast::ast::ExportNamedDeclaration<'a>) {
         if decl.export_kind.is_type() {
             return;
         }
-        let from = decl.source.as_ref().map(|src| {
-            ImportRequest::new(
-                src.value.as_str(),
-                crate::import_attribute_type(decl.with_clause.as_deref()),
-            )
-        });
-        if let Some(request) = &from {
-            self.record_import(request.clone(), CompiledImportKind::ReExport);
-        }
-        if let Some(inner) = &decl.declaration {
-            record_exports_from_declaration(self, inner, None);
-        }
         for spec in &decl.specifiers {
             let exported = module_export_name_to_str(&spec.exported);
             let local = Some(module_export_name_to_str(&spec.local));
-            self.record_export(exported, local, from.clone());
+            self.record_export(exported, local, None);
         }
         oxc_ast_visit::walk::walk_export_named_declaration(self, decl);
+    }
+
+    fn visit_export_from_declaration(&mut self, decl: &oxc_ast::ast::ExportFromDeclaration<'a>) {
+        if decl.export_kind.is_type() {
+            return;
+        }
+        let from = ImportRequest::new(
+            decl.source.value.as_str(),
+            crate::import_attribute_type(decl.with_clause.as_deref()),
+        );
+        self.record_import(from.clone(), CompiledImportKind::ReExport);
+        for spec in &decl.specifiers {
+            let exported = module_export_name_to_str(&spec.exported);
+            let local = Some(module_export_name_to_str(&spec.local));
+            self.record_export(exported, local, Some(from.clone()));
+        }
+        oxc_ast_visit::walk::walk_export_from_declaration(self, decl);
     }
 
     fn visit_export_all_declaration(&mut self, decl: &oxc_ast::ast::ExportAllDeclaration<'a>) {

@@ -38,13 +38,13 @@ license = "MIT"
 
 [workspace.dependencies]
 rustc-hash      = "2.1"
-oxc_allocator   = "0.139"
-oxc_span        = "0.139"
-oxc_syntax      = "0.139"
-oxc_ast         = "0.139"
-oxc_parser      = "0.139"
-oxc_ast_visit   = "0.139"
-oxc_diagnostics = "0.139"
+oxc_allocator   = "0.154"
+oxc_span        = "0.154"
+oxc_syntax      = "0.154"
+oxc_ast         = "0.154"
+oxc_parser      = "0.154"
+oxc_ast_visit   = "0.154"
+oxc_diagnostics = "0.154"
 oxc_resolver    = "11.23"
 
 # Errors and serialization.

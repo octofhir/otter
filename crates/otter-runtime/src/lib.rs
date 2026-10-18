@@ -7563,6 +7563,12 @@ pub(crate) fn program_looks_like_module(program: &oxc_ast::ast::Program<'_>) -> 
         fn visit_export_named_declaration(&mut self, _: &oxc_ast::ast::ExportNamedDeclaration<'a>) {
             self.found = true;
         }
+        fn visit_export_declaration(&mut self, _: &oxc_ast::ast::ExportDeclaration<'a>) {
+            self.found = true;
+        }
+        fn visit_export_from_declaration(&mut self, _: &oxc_ast::ast::ExportFromDeclaration<'a>) {
+            self.found = true;
+        }
         fn visit_export_default_declaration(
             &mut self,
             _: &oxc_ast::ast::ExportDefaultDeclaration<'a>,
@@ -7575,10 +7581,8 @@ pub(crate) fn program_looks_like_module(program: &oxc_ast::ast::Program<'_>) -> 
         // Dynamic `import()` is deliberately NOT module syntax: it is legal
         // inside CommonJS, and Node's own detect-module classifier keys only
         // on static import/export and `import.meta`.
-        fn visit_meta_property(&mut self, meta: &oxc_ast::ast::MetaProperty<'a>) {
-            if meta.meta.name.as_str() == "import" && meta.property.name.as_str() == "meta" {
-                self.found = true;
-            }
+        fn visit_import_meta(&mut self, _: &oxc_ast::ast::ImportMeta) {
+            self.found = true;
         }
     }
 

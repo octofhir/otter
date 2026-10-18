@@ -248,7 +248,7 @@ fn compile_class_strict(
         otter_bytecode::SlotKind::SuperStaticHome,
         span,
     )?;
-    let super_storage = if class.super_class.is_some() {
+    let super_storage = if class.heritage.is_some() {
         Some(declare_class_slot(
             cx,
             SUPER_CTOR_NAME,
@@ -262,7 +262,7 @@ fn compile_class_strict(
     // active class's [[GetPrototypeOf]] (observable through
     // Object.setPrototypeOf between definition and `new`). The slot
     // carries the class value; super() reads its live prototype.
-    let class_self_storage = if class.super_class.is_some() {
+    let class_self_storage = if class.heritage.is_some() {
         Some(declare_class_slot(
             cx,
             CLASS_SELF_NAME,
@@ -317,7 +317,7 @@ fn compile_class_strict(
 
     // Evaluate the parent class first so observable side-effects
     // happen exactly once per declaration, in source order.
-    let super_reg = match &class.super_class {
+    let super_reg = match class.heritage.as_ref().map(|heritage| &heritage.expression) {
         Some(expr) => {
             let r = compile_expr(cx, expr, span)?;
             // §15.7.14 step 6.f — the heritage must be null or a

@@ -1449,108 +1449,92 @@ pub fn compile_module_program(
                     }
                 }
             }
-            Statement::ExportNamedDeclaration(decl) if !decl.export_kind.is_type() => {
-                if let Some(inner) = &decl.declaration {
-                    match inner {
-                        oxc_ast::ast::Declaration::VariableDeclaration(var_decl) => {
-                            let is_var =
-                                matches!(var_decl.kind, oxc_ast::ast::VariableDeclarationKind::Var);
-                            // §16.2.3.2 ExportedBindings — BoundNames of the
-                            // declaration, including every leaf of a
-                            // destructuring pattern (`export const { check }
-                            // = …` exports `check`).
-                            for declarator in &var_decl.declarations {
-                                let mut names = Vec::new();
-                                collect_pattern_var_names(&declarator.id, &mut names);
-                                for name in names {
-                                    state.exported_names.insert(name.clone());
-                                    tdz_inline.push((name, is_var));
-                                }
-                            }
+            Statement::ExportDeclaration(decl) => match &decl.declaration {
+                oxc_ast::ast::Declaration::VariableDeclaration(var_decl) => {
+                    let is_var =
+                        matches!(var_decl.kind, oxc_ast::ast::VariableDeclarationKind::Var);
+                    // §16.2.3.2 ExportedBindings — BoundNames of the
+                    // declaration, including every leaf of a destructuring
+                    // pattern (`export const { check } = …` exports `check`).
+                    for declarator in &var_decl.declarations {
+                        let mut names = Vec::new();
+                        collect_pattern_var_names(&declarator.id, &mut names);
+                        for name in names {
+                            state.exported_names.insert(name.clone());
+                            tdz_inline.push((name, is_var));
                         }
-                        oxc_ast::ast::Declaration::FunctionDeclaration(f) => {
-                            if let Some(id) = &f.id {
-                                let name = id.name.as_str().to_string();
-                                state.exported_names.insert(name.clone());
-                                tdz_inline.push((name, false));
-                            }
-                        }
-                        oxc_ast::ast::Declaration::ClassDeclaration(c) => {
-                            if let Some(id) = &c.id {
-                                let name = id.name.as_str().to_string();
-                                state.exported_names.insert(name.clone());
-                                tdz_inline.push((name, false));
-                            }
-                        }
-                        _ => {}
                     }
                 }
-                // §16.2.3 ExportFromClause — `export {x} from "./other"`
-                // also references another module. Register the source
-                // in `import_records` so the body-compile arm can
-                // look it up via `state.import_records.get(src)`.
-                // Without this the body raises
-                // `ExportNamedDeclaration: unresolved re-export
-                // source` even though the AST is well-formed and the
-                // module loader has the target module available.
-                // <https://tc39.es/ecma262/#sec-exports>
-                if let Some(source) = decl.source.as_ref() {
-                    let request = ImportRequest::new(
-                        source.value.as_str(),
-                        import_attribute_type(decl.with_clause.as_deref()),
-                    );
-                    if !state.import_records.contains_key(&request) {
-                        let record = allocate_record();
-                        state.import_records.insert(request.clone(), record);
-                        import_sources_in_order.push(request);
+                oxc_ast::ast::Declaration::FunctionDeclaration(f) => {
+                    if let Some(id) = &f.id {
+                        let name = id.name.as_str().to_string();
+                        state.exported_names.insert(name.clone());
+                        tdz_inline.push((name, false));
                     }
+                }
+                oxc_ast::ast::Declaration::ClassDeclaration(c) => {
+                    if let Some(id) = &c.id {
+                        let name = id.name.as_str().to_string();
+                        state.exported_names.insert(name.clone());
+                        tdz_inline.push((name, false));
+                    }
+                }
+                _ => {}
+            },
+            Statement::ExportFromDeclaration(decl) if !decl.export_kind.is_type() => {
+                // §16.2.3 ExportFromClause — `export {x} from "./other"`
+                // also references another module. Register the source in
+                // `import_records` so the body-compile arm can look it up
+                // via `state.import_records.get(src)`.
+                // <https://tc39.es/ecma262/#sec-exports>
+                let request = ImportRequest::new(
+                    decl.source.value.as_str(),
+                    import_attribute_type(decl.with_clause.as_deref()),
+                );
+                if !state.import_records.contains_key(&request) {
+                    let record = allocate_record();
+                    state.import_records.insert(request.clone(), record);
+                    import_sources_in_order.push(request.clone());
                 }
                 // A re-export whose source resolves to this very module
-                // (`export { x } from "./self"`) is an indirect binding
-                // to our own local `x` — treat it like a local re-export
-                // so it tracks later writes (live binding) rather than
+                // (`export { x } from "./self"`) is an indirect binding to
+                // our own local `x` — treat it like a local re-export so it
+                // tracks later writes (live binding) rather than
                 // snapshotting at the export statement.
-                let self_source = decl
-                    .source
-                    .as_ref()
-                    .map(|s| {
-                        ImportRequest::new(
-                            s.value.as_str(),
-                            import_attribute_type(decl.with_clause.as_deref()),
-                        )
-                    })
-                    .and_then(|request| host.resolved_imports.get(&request))
+                let self_source = host
+                    .resolved_imports
+                    .get(&request)
                     .is_some_and(|target| *target == host.module_url);
-                let has_source = decl.source.is_some();
                 for spec in &decl.specifiers {
                     let exported_name = module_export_name_to_str(&spec.exported);
                     state.exported_names.insert(exported_name.clone());
-                    // `export { local as exported }` (no `from`) mirrors a
-                    // local binding onto the env; its slot must be
-                    // pre-declared. Re-export specs (`export … from`) are
-                    // resolved separately.
-                    if has_source {
-                        if self_source {
-                            // imported name === our local binding name.
-                            let local_name = module_export_name_to_str(&spec.local);
-                            state
-                                .reexport_local_targets
-                                .entry(local_name)
-                                .or_default()
-                                .push(exported_name.clone());
-                        }
-                        reexport_tdz.push(exported_name);
-                    } else {
+                    if self_source {
+                        // imported name === our local binding name.
                         let local_name = module_export_name_to_str(&spec.local);
-                        if local_name != exported_name {
-                            state
-                                .reexport_local_targets
-                                .entry(local_name.clone())
-                                .or_default()
-                                .push(exported_name.clone());
-                        }
-                        local_export_specs.push((exported_name, local_name));
+                        state
+                            .reexport_local_targets
+                            .entry(local_name)
+                            .or_default()
+                            .push(exported_name.clone());
                     }
+                    reexport_tdz.push(exported_name);
+                }
+            }
+            Statement::ExportNamedDeclaration(decl) if !decl.export_kind.is_type() => {
+                // `export { local as exported }` mirrors a local binding
+                // onto the env; its slot must be pre-declared.
+                for spec in &decl.specifiers {
+                    let exported_name = module_export_name_to_str(&spec.exported);
+                    state.exported_names.insert(exported_name.clone());
+                    let local_name = module_export_name_to_str(&spec.local);
+                    if local_name != exported_name {
+                        state
+                            .reexport_local_targets
+                            .entry(local_name.clone())
+                            .or_default()
+                            .push(exported_name.clone());
+                    }
+                    local_export_specs.push((exported_name, local_name));
                 }
             }
             Statement::ExportAllDeclaration(decl) if !decl.export_kind.is_type() => {
@@ -1852,8 +1836,8 @@ fn top_level_hoistable_function_names(stmts: &[Statement<'_>]) -> Vec<String> {
     for stmt in stmts {
         let f = match stmt {
             Statement::FunctionDeclaration(f) if !f.declare => Some(&**f),
-            Statement::ExportNamedDeclaration(decl) if !decl.export_kind.is_type() => {
-                if let Some(oxc_ast::ast::Declaration::FunctionDeclaration(f)) = &decl.declaration
+            Statement::ExportDeclaration(decl) => {
+                if let oxc_ast::ast::Declaration::FunctionDeclaration(f) = &decl.declaration
                     && !f.declare
                 {
                     Some(&**f)
@@ -1911,6 +1895,16 @@ fn validate_module_item_positions(program: &Program<'_>) -> Result<(), CompileEr
                 self.found = Some((it.span.start, it.span.end, "export"));
             }
         }
+        fn visit_export_declaration(&mut self, it: &oxc_ast::ast::ExportDeclaration<'a>) {
+            if self.found.is_none() {
+                self.found = Some((it.span.start, it.span.end, "export"));
+            }
+        }
+        fn visit_export_from_declaration(&mut self, it: &oxc_ast::ast::ExportFromDeclaration<'a>) {
+            if self.found.is_none() {
+                self.found = Some((it.span.start, it.span.end, "export"));
+            }
+        }
         fn visit_export_default_declaration(
             &mut self,
             it: &oxc_ast::ast::ExportDefaultDeclaration<'a>,
@@ -1930,7 +1924,9 @@ fn validate_module_item_positions(program: &Program<'_>) -> Result<(), CompileEr
         if matches!(
             stmt,
             Statement::ImportDeclaration(_)
+                | Statement::ExportDeclaration(_)
                 | Statement::ExportNamedDeclaration(_)
+                | Statement::ExportFromDeclaration(_)
                 | Statement::ExportDefaultDeclaration(_)
                 | Statement::ExportAllDeclaration(_)
         ) {

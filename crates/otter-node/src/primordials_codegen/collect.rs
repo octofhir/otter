@@ -120,6 +120,7 @@ pub(super) fn inspect(
             function: None,
             function_depth: 0,
             block_depth: 0,
+            declaration_kind: None,
             typed_guard: false,
             dynamic_proved: false,
             helper_bindings: BTreeMap::new(),
@@ -153,6 +154,8 @@ struct Uses<'p> {
     function: Option<String>,
     function_depth: usize,
     block_depth: usize,
+    /// Kind of the variable declaration being walked.
+    declaration_kind: Option<VariableDeclarationKind>,
     typed_guard: bool,
     dynamic_proved: bool,
     helper_bindings: BTreeMap<String, Vec<Span>>,
@@ -256,7 +259,7 @@ impl Uses<'_> {
     fn record_imports(&mut self, declaration: &VariableDeclarator<'_>) {
         if self.function_depth != 1
             || self.block_depth != 0
-            || declaration.kind != VariableDeclarationKind::Const
+            || self.declaration_kind != Some(VariableDeclarationKind::Const)
         {
             return;
         }
@@ -342,6 +345,12 @@ impl<'a> Visit<'a> for Uses<'_> {
         if identifier.name == "primordials" {
             self.references.push(identifier.span);
         }
+    }
+
+    fn visit_variable_declaration(&mut self, declaration: &oxc_ast::ast::VariableDeclaration<'a>) {
+        let outer = self.declaration_kind.replace(declaration.kind);
+        walk::walk_variable_declaration(self, declaration);
+        self.declaration_kind = outer;
     }
 
     fn visit_variable_declarator(&mut self, declaration: &VariableDeclarator<'a>) {

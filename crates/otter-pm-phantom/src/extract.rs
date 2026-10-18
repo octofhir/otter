@@ -94,14 +94,12 @@ impl<'a> Visit<'a> for SpecifierVisitor {
         self.record(decl.source.value.as_str());
     }
 
-    fn visit_export_named_declaration(&mut self, decl: &oxc_ast::ast::ExportNamedDeclaration<'a>) {
+    fn visit_export_from_declaration(&mut self, decl: &oxc_ast::ast::ExportFromDeclaration<'a>) {
         if decl.export_kind.is_type() {
             return;
         }
-        if let Some(source) = &decl.source {
-            self.record(source.value.as_str());
-        }
-        walk::walk_export_named_declaration(self, decl);
+        self.record(decl.source.value.as_str());
+        walk::walk_export_from_declaration(self, decl);
     }
 
     fn visit_export_all_declaration(&mut self, decl: &oxc_ast::ast::ExportAllDeclaration<'a>) {

@@ -503,14 +503,16 @@ impl Interpreter {
                         // Record the resolved typed target before a tier-up hook
                         // consumes a newly pushed bytecode frame. Static natives
                         // complete synchronously and therefore leave stack depth
-                        // unchanged.
+                        // unchanged. A native callee is the site's target even when
+                        // it forwarded to the function it staged.
                         if jit_installed
                             && let Some(target) = if function_call_target.is_some() {
                                 function_call_target
-                            } else if let Some(function_id) = self.staged_bytecode_target(stack) {
-                                Some(crate::feedback::OrdinaryCallTarget::Bytecode(function_id))
-                            } else {
+                            } else if native_target.is_some() {
                                 native_target
+                            } else {
+                                self.staged_bytecode_target(stack)
+                                    .map(crate::feedback::OrdinaryCallTarget::Bytecode)
                             }
                         {
                             let _ = self.record_ordinary_call_feedback(

@@ -966,6 +966,11 @@ pub(crate) fn compile_call_args(
     span: (u32, u32),
 ) -> Result<Vec<u16>, CompileError> {
     let mut regs: Vec<u16> = Vec::with_capacity(args.len());
+    // The arguments as expressions; a spread among them fails the call
+    // below, and until it does no argument is passed in place.
+    let arg_exprs: Vec<&Expression<'_>> =
+        args.iter().filter_map(|arg| arg.as_expression()).collect();
+    let all_expressions = arg_exprs.len() == args.len();
     for (index, arg) in args.iter().enumerate() {
         match arg {
             oxc_ast::ast::Argument::SpreadElement(s) => {
@@ -978,16 +983,15 @@ pub(crate) fn compile_call_args(
                 let expr = other.to_expression();
                 // An argument naming a binding held in its own frame slot is
                 // passed in place unless a later argument assigns it.
-                let later: Vec<&Expression<'_>> = args[index + 1..]
-                    .iter()
-                    .filter_map(|later| later.as_expression())
-                    .collect();
-                regs.push(
-                    match crate::expr::borrowed_operand_before(cx, expr, &later) {
-                        Some(reg) => reg,
-                        None => compile_expr(cx, expr, span)?,
-                    },
-                );
+                let borrowed = all_expressions
+                    .then(|| {
+                        crate::expr::borrowed_operand_before(cx, expr, &arg_exprs[index + 1..])
+                    })
+                    .flatten();
+                regs.push(match borrowed {
+                    Some(reg) => reg,
+                    None => compile_expr(cx, expr, span)?,
+                });
             }
         }
     }

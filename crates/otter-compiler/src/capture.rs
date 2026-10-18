@@ -1291,8 +1291,14 @@ impl<'a> Visit<'a> for DotArgumentsFinder {
     }
 }
 
-/// Whether `expr` names `name` anywhere, read or written, nested functions
-/// included.
+/// Whether `expr` names `name`, read or written, outside the functions it
+/// creates.
+///
+/// For a binding held in its own frame slot, which is what every caller
+/// asks about: a function that named it would have captured it, so the
+/// functions `expr` creates (their parameters and bodies) are not searched.
+/// A class is searched whole, since its heritage and computed keys run
+/// where the class stands.
 #[must_use]
 pub fn expression_mentions_name(expr: &oxc_ast::ast::Expression<'_>, name: &str) -> bool {
     struct Finder<'n> {
@@ -1303,6 +1309,25 @@ pub fn expression_mentions_name(expr: &oxc_ast::ast::Expression<'_>, name: &str)
         fn visit_identifier_reference(&mut self, it: &oxc_ast::ast::IdentifierReference<'a>) {
             if it.name.as_str() == self.name {
                 self.found = true;
+            }
+        }
+
+        fn visit_function(
+            &mut self,
+            _: &oxc_ast::ast::Function<'a>,
+            _: oxc_syntax::scope::ScopeFlags,
+        ) {
+        }
+
+        fn visit_arrow_function_expression(
+            &mut self,
+            _: &oxc_ast::ast::ArrowFunctionExpression<'a>,
+        ) {
+        }
+
+        fn visit_expression(&mut self, it: &oxc_ast::ast::Expression<'a>) {
+            if !self.found {
+                walk::walk_expression(self, it);
             }
         }
     }

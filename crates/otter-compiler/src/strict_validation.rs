@@ -535,8 +535,26 @@ impl StrictValidator {
             return;
         }
         let mut lex_names: Vec<&str> = Vec::new();
+        let mut duplicates: Vec<(String, oxc_span::Span)> = Vec::new();
         for declarator in &decl.declarations {
-            for_each_bound_identifier(&declarator.id, &mut |name, _| lex_names.push(name));
+            for_each_bound_identifier(&declarator.id, &mut |name, span| {
+                if lex_names.contains(&name) {
+                    duplicates.push((name.to_string(), span));
+                }
+                lex_names.push(name);
+            });
+        }
+        // §14.7.4.1 / §14.7.5.1 — the head's BoundNames contain no
+        // duplicate entries (`for (let [z, z] = [0, 1]; ; )`).
+        for (name, span) in duplicates {
+            self.diagnostics.push(SyntaxDiagnostic {
+                code: "FOR_HEAD_DUPLICATE_BINDING".to_string(),
+                message: format!(
+                    "SyntaxError: `{name}` is bound twice in a `{context_label}` head (§14.7.4.1)"
+                ),
+                range: Some((span.start, span.end)),
+                help: Some(format!("rename one of the two `{name}` bindings")),
+            });
         }
         if lex_names.is_empty() {
             return;
@@ -1211,6 +1229,41 @@ fn labelled_function_body_span(body: &Statement<'_>) -> Option<Span> {
 }
 
 impl<'a> Visit<'a> for StrictValidator {
+    fn visit_object_expression(&mut self, it: &oxc_ast::ast::ObjectExpression<'a>) {
+        // §13.2.5.1 — an object literal (not an assignment pattern) may
+        // name at most one `__proto__: value` PropertyDefinition; shorthand,
+        // method and computed forms are ordinary properties.
+        let mut seen_proto = false;
+        for property in &it.properties {
+            let oxc_ast::ast::ObjectPropertyKind::ObjectProperty(p) = property else {
+                continue;
+            };
+            let is_proto_key = !p.computed
+                && match &p.key {
+                    oxc_ast::ast::PropertyKey::StaticIdentifier(id) => id.name == "__proto__",
+                    oxc_ast::ast::PropertyKey::StringLiteral(literal) => {
+                        literal.value == "__proto__"
+                    }
+                    _ => false,
+                };
+            if is_proto_key
+                && !p.shorthand
+                && !p.method
+                && matches!(p.kind, oxc_ast::ast::PropertyKind::Init)
+                && std::mem::replace(&mut seen_proto, true)
+            {
+                self.diagnostics.push(SyntaxDiagnostic {
+                    code: "DUPLICATE_PROTO".to_string(),
+                    message: "SyntaxError: duplicate __proto__ property in object literal"
+                        .to_string(),
+                    range: Some((p.span.start, p.span.end)),
+                    help: None,
+                });
+            }
+        }
+        walk::walk_object_expression(self, it);
+    }
+
     fn visit_function(&mut self, it: &Function<'a>, flags: ScopeFlags) {
         let function_super_allowed = self.next_function_super_allowed.take().unwrap_or(false);
         let function_super_call = self.next_function_super_call.take().unwrap_or(false);

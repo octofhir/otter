@@ -513,6 +513,7 @@ impl CodeBlock {
                 bound_new_target_flag: crate::closure::CLOSURE_CALL_FLAG_BOUND_NEW_TARGET,
                 runtime_setup_flags: crate::closure::CLOSURE_CALL_RUNTIME_SETUP_FLAGS,
                 rare_byte: gc_header_bytes + crate::closure::CLOSURE_BODY_RARE_OFFSET as u32,
+                map_byte: gc_header_bytes,
                 own_props_byte: gc_header_bytes
                     + crate::closure_construct::CLOSURE_RARE_OWN_PROPS_OFFSET as u32,
                 prototype_byte: gc_header_bytes
@@ -1908,6 +1909,7 @@ mod tests {
                 bound_new_target_flag: crate::closure::CLOSURE_CALL_FLAG_BOUND_NEW_TARGET,
                 runtime_setup_flags: crate::closure::CLOSURE_CALL_RUNTIME_SETUP_FLAGS,
                 rare_byte: gc_header_bytes + crate::closure::CLOSURE_BODY_RARE_OFFSET as u32,
+                map_byte: gc_header_bytes,
                 own_props_byte: gc_header_bytes
                     + crate::closure_construct::CLOSURE_RARE_OWN_PROPS_OFFSET as u32,
                 prototype_byte: gc_header_bytes

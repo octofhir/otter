@@ -245,7 +245,7 @@ pub(crate) fn emit_exotic_length_fast(
         ; ldrb w14, [x13]
         ; cmp w14, array_tag
         ; b.ne =>try_string
-        ; ldr x9, [x13, array_length_byte]
+        ; ldr w9, [x13, array_length_byte]
     );
     // An array length beyond i32 cannot box as a small integer here.
     emit_load_u64(ops, 12, i32::MAX as u64);

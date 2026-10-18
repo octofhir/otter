@@ -1782,7 +1782,7 @@ fn require_iterator_helper(
     if let Some(h) = this_value.as_iterator() {
         let is_helper = ctx.cx.interp.gc_heap_for_cx().read_payload(h, |state| {
             matches!(
-                state,
+                &**state,
                 crate::IteratorState::Map { .. }
                     | crate::IteratorState::Filter { .. }
                     | crate::IteratorState::Take { .. }
@@ -1839,7 +1839,7 @@ pub(crate) fn wrap_for_valid_iterator_next(
         .cx
         .interp
         .gc_heap_for_cx()
-        .read_payload(handle, |state| match state {
+        .read_payload(handle, |state| match &**state {
             crate::IteratorState::User {
                 iterator,
                 next_method,
@@ -1915,7 +1915,7 @@ pub(crate) fn regexp_string_iterator_proto_next(
         .interp
         .gc_heap_for_cx()
         .read_payload(handle, |state| {
-            matches!(state, crate::IteratorState::RegExpString { .. })
+            matches!(&**state, crate::IteratorState::RegExpString { .. })
         });
     if !is_regexp_string {
         return Err(crate::NativeError::TypeError {
@@ -1966,14 +1966,14 @@ pub(crate) fn iterator_proto_return(
     // §27.1.3.2.2 `%WrapForValidIteratorPrototype%.return` — call the
     // wrapped iterator's own `return` and forward its result verbatim;
     // a missing `return` degrades to `{ value, done: true }`.
-    let wrapped_user = ctx
-        .cx
-        .interp
-        .gc_heap_for_cx()
-        .read_payload(handle, |state| match state {
-            crate::IteratorState::User { iterator, .. } => Some(*iterator),
-            _ => None,
-        });
+    let wrapped_user =
+        ctx.cx
+            .interp
+            .gc_heap_for_cx()
+            .read_payload(handle, |state| match &**state {
+                crate::IteratorState::User { iterator, .. } => Some(*iterator),
+                _ => None,
+            });
     if let Some(target) = wrapped_user {
         let exec_ctx =
             ctx.execution_context()

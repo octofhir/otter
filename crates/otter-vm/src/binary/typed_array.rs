@@ -456,10 +456,12 @@ pub const TYPED_ARRAY_BODY_TYPE_TAG: u8 = 0x2b;
 #[derive(Debug)]
 #[repr(C)]
 pub struct TypedArrayBodyGc {
-    /// Backing buffer.
-    pub buffer: JsArrayBuffer,
+    /// Map word: this value cell's type, at body offset 0.
+    pub(crate) map: otter_gc::cell_map::TypeMap<TYPED_ARRAY_BODY_TYPE_TAG>,
     /// Element-type kind.
     pub kind: TypedArrayKind,
+    /// Backing buffer.
+    pub buffer: JsArrayBuffer,
     /// Byte offset into the backing buffer at construction time.
     pub byte_offset: usize,
     /// Element count at construction time.
@@ -521,8 +523,12 @@ pub const TYPED_ARRAY_BODY_EXPANDO_OFFSET: usize = std::mem::offset_of!(TypedArr
 pub const TYPED_ARRAY_BODY_LENGTH_TRACKING_OFFSET: usize =
     std::mem::offset_of!(TypedArrayBodyGc, length_tracking);
 
+const _: () = assert!(std::mem::offset_of!(TypedArrayBodyGc, map) == 0);
+
 impl otter_gc::SafeTraceable for TypedArrayBodyGc {
     const TYPE_TAG: u8 = TYPED_ARRAY_BODY_TYPE_TAG;
+    const MAP_WORD: otter_gc::cell_map::MapWord =
+        otter_gc::cell_map::MapWord::of_type(TYPED_ARRAY_BODY_TYPE_TAG);
 
     fn trace_slots_safe(&mut self, visitor: &mut otter_gc::raw::SlotVisitor<'_>) {
         // Forward to the buffer's GC handle so the backing ArrayBuffer
@@ -569,6 +575,7 @@ pub fn alloc_typed_array(
             base.add(byte_offset)
         });
     heap.alloc_old(TypedArrayBodyGc {
+        map: otter_gc::cell_map::TypeMap::NEW,
         buffer,
         kind,
         byte_offset,

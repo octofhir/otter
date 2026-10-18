@@ -41,7 +41,66 @@ use crate::string::JsString;
 pub const ITERATOR_STATE_TYPE_TAG: u8 = 0x24;
 
 /// Heap-shared iterator state handle.
-pub type IteratorHandle = otter_gc::Gc<IteratorState>;
+pub type IteratorHandle = otter_gc::Gc<IteratorBody>;
+
+/// GC body of an iterator value: its map word, then its state.
+#[derive(Debug)]
+#[repr(C)]
+pub struct IteratorBody {
+    /// Map word: this value cell's type, at body offset 0.
+    map: otter_gc::cell_map::TypeMap<ITERATOR_STATE_TYPE_TAG>,
+    /// What the iterator walks and how far it got.
+    pub state: IteratorState,
+}
+
+impl IteratorBody {
+    /// A fresh iterator body over `state`.
+    #[must_use]
+    pub fn new(state: IteratorState) -> Self {
+        Self {
+            map: otter_gc::cell_map::TypeMap::NEW,
+            state,
+        }
+    }
+}
+
+impl std::ops::Deref for IteratorBody {
+    type Target = IteratorState;
+
+    fn deref(&self) -> &IteratorState {
+        &self.state
+    }
+}
+
+impl std::ops::DerefMut for IteratorBody {
+    fn deref_mut(&mut self) -> &mut IteratorState {
+        &mut self.state
+    }
+}
+
+const _: () = assert!(std::mem::offset_of!(IteratorBody, map) == 0);
+
+impl otter_gc::SafeTraceable for IteratorBody {
+    const TYPE_TAG: u8 = ITERATOR_STATE_TYPE_TAG;
+    const MAP_WORD: otter_gc::cell_map::MapWord =
+        otter_gc::cell_map::MapWord::of_type(ITERATOR_STATE_TYPE_TAG);
+
+    fn trace_slots_safe(&mut self, visitor: &mut otter_gc::raw::SlotVisitor<'_>) {
+        self.state.trace_slots_safe(visitor);
+    }
+
+    fn trace_remembered_slots_safe(&mut self, visitor: &mut otter_gc::raw::SlotVisitor<'_>) {
+        self.state.trace_remembered_slots_safe(visitor);
+    }
+
+    fn trace_pending_slots_safe(&mut self, visitor: &mut otter_gc::raw::SlotVisitor<'_>) {
+        self.state.trace_pending_slots_safe(visitor);
+    }
+
+    fn trace_ephemeron_slots_safe(&mut self, visitor: &mut otter_gc::trace::EphemeronVisitor<'_>) {
+        self.state.trace_ephemeron_slots_safe(visitor);
+    }
+}
 
 /// Kind discriminator for `Array.prototype.{values, keys, entries}`
 /// iterators, matching `CreateArrayIterator(O, kind)` per §23.1.5.1.

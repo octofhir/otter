@@ -123,7 +123,7 @@ fn emit_array_length_fast(
         ; ldrb w14, [x13]
         ; cmp w14, array_tag
         ; b.ne =>slow
-        ; ldr x9, [x13, length_byte]
+        ; ldr w9, [x13, length_byte]
     );
     emit_load_u64(ops, 11, i32::MAX as u64);
     dynasm!(ops

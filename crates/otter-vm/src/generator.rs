@@ -75,8 +75,11 @@ pub struct AsyncGeneratorRequest {
 
 /// Internal generator storage.
 #[derive(Debug, otter_macros::Pelt)]
-#[pelt(tag = GENERATOR_BODY_TYPE_TAG)]
+#[pelt(tag = GENERATOR_BODY_TYPE_TAG, value_cell)]
+#[repr(C)]
 pub struct GeneratorBody {
+    /// Map word: this value cell's type, at body offset 0.
+    pub(crate) map: otter_gc::cell_map::TypeMap<GENERATOR_BODY_TYPE_TAG>,
     /// `Some(frame)` when the generator can still resume; `None`
     /// once done or while an async-generator await owns the frame.
     #[pelt(via = trace_parked_frame_state)]
@@ -258,6 +261,7 @@ impl JsGenerator {
     ) -> Result<Self, otter_gc::OutOfMemory> {
         Ok(Self {
             inner: heap.alloc_old(GeneratorBody {
+                map: otter_gc::cell_map::TypeMap::NEW,
                 frame: None,
                 cold: None,
                 resume_dst: 0,
@@ -284,6 +288,7 @@ impl JsGenerator {
     ) -> Result<Self, otter_gc::OutOfMemory> {
         Ok(Self {
             inner: heap.alloc_old(GeneratorBody {
+                map: otter_gc::cell_map::TypeMap::NEW,
                 frame: Some(Box::new(frame)),
                 cold,
                 resume_dst: 0,

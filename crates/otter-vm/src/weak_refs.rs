@@ -67,8 +67,11 @@ pub type JsFinalizationRegistry = otter_gc::Gc<FinalizationRegistryBody>;
 /// [`post_mark_processor`] after marking, so the derive
 /// skips it deliberately.
 #[derive(Debug, Clone, otter_macros::Pelt)]
-#[pelt(tag = WEAK_REF_BODY_TYPE_TAG, ephemeron_via = weak_ref_ephemeron_walk)]
+#[pelt(tag = WEAK_REF_BODY_TYPE_TAG, value_cell, ephemeron_via = weak_ref_ephemeron_walk)]
+#[repr(C)]
 pub struct WeakRefBody {
+    /// Map word: this value cell's type, at body offset 0.
+    pub(crate) map: otter_gc::cell_map::TypeMap<WEAK_REF_BODY_TYPE_TAG>,
     #[pelt(skip)]
     target: RawGc,
     prototype_override: Option<Value>,
@@ -168,9 +171,13 @@ impl crate::pelt::PeltField for FinalizerCell {
 #[derive(Debug, Clone, otter_macros::Pelt)]
 #[pelt(
     tag = FINALIZATION_REGISTRY_BODY_TYPE_TAG,
+    value_cell,
     ephemeron_via = finalization_registry_ephemeron_walk
 )]
+#[repr(C)]
 pub struct FinalizationRegistryBody {
+    /// Map word: this value cell's type, at body offset 0.
+    pub(crate) map: otter_gc::cell_map::TypeMap<FINALIZATION_REGISTRY_BODY_TYPE_TAG>,
     cleanup_callback: Value,
     #[pelt(skip)]
     cleanup_context: Option<ExecutionContext>,
@@ -232,6 +239,7 @@ pub(crate) fn alloc_weak_ref_with_roots(
     };
     let weak_ref = heap.alloc_with_roots(
         WeakRefBody {
+            map: otter_gc::cell_map::TypeMap::NEW,
             target: RawGc::NULL,
             prototype_override: None,
         },
@@ -253,6 +261,7 @@ pub(crate) fn alloc_weak_ref_for_mark_sweep_fixture(
 ) -> Result<JsWeakRef, crate::VmError> {
     let target = weak_target_raw(target)?;
     let weak_ref = heap.alloc_old(WeakRefBody {
+        map: otter_gc::cell_map::TypeMap::NEW,
         target,
         prototype_override: None,
     })?;
@@ -314,6 +323,7 @@ pub(crate) fn alloc_finalization_registry_with_context_and_roots(
     };
     let registry = heap.alloc_with_roots(
         FinalizationRegistryBody {
+            map: otter_gc::cell_map::TypeMap::NEW,
             cleanup_callback,
             cleanup_context,
             cleanup_realm_id,
@@ -339,6 +349,7 @@ pub(crate) fn alloc_finalization_registry_for_mark_sweep_fixture(
     }
     let barrier_cleanup_callback = cleanup_callback;
     let registry = heap.alloc_old(FinalizationRegistryBody {
+        map: otter_gc::cell_map::TypeMap::NEW,
         cleanup_callback,
         cleanup_context,
         cleanup_realm_id: 0,

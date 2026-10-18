@@ -574,7 +574,7 @@ impl Interpreter {
     /// value, so a snapshot copy taken before the source's `next` ran is
     /// stale by the time the helper calls it.
     fn iterator_helper_callback(&self, iter: IteratorHandle, fallback: Value) -> Value {
-        self.gc_heap.read_payload(iter, |state| match state {
+        self.gc_heap.read_payload(iter, |state| match &**state {
             IteratorState::Map { mapper, .. } | IteratorState::FlatMap { mapper, .. } => *mapper,
             IteratorState::Filter { predicate, .. } => *predicate,
             _ => fallback,
@@ -607,7 +607,7 @@ impl Interpreter {
             Value(crate::array::JsArray, usize),
             Entry(crate::array::JsArray, usize),
         }
-        let observable = self.gc_heap.read_payload(*iter, |state| match state {
+        let observable = self.gc_heap.read_payload(*iter, |state| match &**state {
             IteratorState::Array { array, index, .. } => {
                 Some(ArrayObservable::Value(*array, *index))
             }
@@ -620,7 +620,7 @@ impl Interpreter {
         // Proxy, anything with a `length`): every step re-reads `length`
         // and the element through the observable [[Get]], so an accessor
         // or a proxy trap runs and its abrupt completion propagates.
-        let array_like = self.gc_heap.read_payload(*iter, |state| match state {
+        let array_like = self.gc_heap.read_payload(*iter, |state| match &**state {
             IteratorState::ArrayLike {
                 object,
                 index,
@@ -641,11 +641,12 @@ impl Interpreter {
             {
                 // Advance before the getter runs so a re-entrant `next`
                 // from inside it observes the post-step index.
-                self.gc_heap.with_payload(*iter, |state| match state {
-                    IteratorState::Array { index, .. }
-                    | IteratorState::ArrayEntry { index, .. } => *index += 1,
-                    _ => {}
-                });
+                self.gc_heap
+                    .with_payload(*iter, |state| match &mut **state {
+                        IteratorState::Array { index, .. }
+                        | IteratorState::ArrayEntry { index, .. } => *index += 1,
+                        _ => {}
+                    });
                 let value = self.load_property_value(
                     context,
                     stack,
@@ -694,7 +695,7 @@ impl Interpreter {
             // Advance before the element read so a re-entrant `next`
             // from inside a getter observes the post-step index.
             interp.gc_heap.with_payload(*iter, |state| {
-                if let IteratorState::ArrayLike { index, .. } = state {
+                if let IteratorState::ArrayLike { index, .. } = &mut **state {
                     *index += 1;
                 }
             });
@@ -723,7 +724,7 @@ impl Interpreter {
         iter: &IteratorHandle,
     ) -> Result<(Value, bool), CommittedValueError> {
         let snapshot: Option<IteratorStateSnapshot> =
-            self.gc_heap.read_payload(*iter, |state| match state {
+            self.gc_heap.read_payload(*iter, |state| match &**state {
                 IteratorState::User {
                     iterator,
                     next_method,
@@ -899,7 +900,7 @@ impl Interpreter {
                 }
                 // A `next` getter can have moved the iterator object; the
                 // state cell is old and traced, so read it from there.
-                let iter_value = self.gc_heap.read_payload(*iter, |state| match state {
+                let iter_value = self.gc_heap.read_payload(*iter, |state| match &**state {
                     IteratorState::User { iterator, .. } => *iterator,
                     _ => iter_value,
                 });
@@ -963,7 +964,7 @@ impl Interpreter {
                 )?;
                 let Some(match_value) = result else {
                     self.gc_heap.with_payload(*iter, |state| {
-                        if let IteratorState::RegExpString { done, .. } = state {
+                        if let IteratorState::RegExpString { done, .. } = &mut **state {
                             *done = true;
                         }
                     });
@@ -971,7 +972,7 @@ impl Interpreter {
                 };
                 if !global {
                     self.gc_heap.with_payload(*iter, |state| {
-                        if let IteratorState::RegExpString { done, .. } = state {
+                        if let IteratorState::RegExpString { done, .. } = &mut **state {
                             *done = true;
                         }
                     });
@@ -1000,7 +1001,7 @@ impl Interpreter {
                 // from the mapper closes the underlying iterator before
                 // propagating.
                 self.gc_heap.with_payload(*iter, |state| {
-                    if let IteratorState::Map { running, .. } = state {
+                    if let IteratorState::Map { running, .. } = &mut **state {
                         *running = true;
                     }
                 });
@@ -1014,7 +1015,7 @@ impl Interpreter {
                 ) {
                     Ok(mapped) => {
                         self.gc_heap.with_payload(*iter, |state| {
-                            if let IteratorState::Map { running, .. } = state {
+                            if let IteratorState::Map { running, .. } = &mut **state {
                                 *running = false;
                             }
                         });
@@ -1031,7 +1032,7 @@ impl Interpreter {
                     }
                 };
                 self.gc_heap.with_payload(*iter, |state| {
-                    if let IteratorState::Map { counter, .. } = state {
+                    if let IteratorState::Map { counter, .. } = &mut **state {
                         *counter += 1;
                     }
                 });
@@ -1060,7 +1061,7 @@ impl Interpreter {
                     // §27.1.4.6 step 5.b.v — IfAbruptCloseIterator on a
                     // throwing predicate.
                     self.gc_heap.with_payload(*iter, |state| {
-                        if let IteratorState::Filter { running, .. } = state {
+                        if let IteratorState::Filter { running, .. } = &mut **state {
                             *running = true;
                         }
                     });
@@ -1080,7 +1081,7 @@ impl Interpreter {
                     let kept = match called {
                         Ok(kept) => {
                             self.gc_heap.with_payload(*iter, |state| {
-                                if let IteratorState::Filter { running, .. } = state {
+                                if let IteratorState::Filter { running, .. } = &mut **state {
                                     *running = false;
                                 }
                             });
@@ -1098,7 +1099,7 @@ impl Interpreter {
                     };
                     counter += 1;
                     self.gc_heap.with_payload(*iter, |state| {
-                        if let IteratorState::Filter { counter: slot, .. } = state {
+                        if let IteratorState::Filter { counter: slot, .. } = &mut **state {
                             *slot = counter;
                         }
                     });
@@ -1129,13 +1130,13 @@ impl Interpreter {
                     return Ok((Value::undefined(), true));
                 }
                 self.gc_heap.with_payload(*iter, |state| {
-                    if let IteratorState::Take { running, .. } = state {
+                    if let IteratorState::Take { running, .. } = &mut **state {
                         *running = true;
                     }
                 });
                 let step = self.iterator_next_full(context, stack, &source);
                 self.gc_heap.with_payload(*iter, |state| {
-                    if let IteratorState::Take { running, .. } = state {
+                    if let IteratorState::Take { running, .. } = &mut **state {
                         *running = false;
                     }
                 });
@@ -1153,7 +1154,7 @@ impl Interpreter {
                     return Ok((Value::undefined(), true));
                 }
                 self.gc_heap.with_payload(*iter, |state| {
-                    if let IteratorState::Take { remaining, .. } = state {
+                    if let IteratorState::Take { remaining, .. } = &mut **state {
                         *remaining = remaining.saturating_sub(1);
                     }
                 });
@@ -1171,7 +1172,7 @@ impl Interpreter {
                     )));
                 }
                 self.gc_heap.with_payload(*iter, |state| {
-                    if let IteratorState::Drop { running, .. } = state {
+                    if let IteratorState::Drop { running, .. } = &mut **state {
                         *running = true;
                     }
                 });
@@ -1183,7 +1184,7 @@ impl Interpreter {
                         }
                     }
                     self.gc_heap.with_payload(*iter, |state| {
-                        if let IteratorState::Drop { to_drop, .. } = state {
+                        if let IteratorState::Drop { to_drop, .. } = &mut **state {
                             *to_drop = 0;
                         }
                     });
@@ -1191,7 +1192,7 @@ impl Interpreter {
                     Ok(if done { None } else { Some(v) })
                 })();
                 self.gc_heap.with_payload(*iter, |state| {
-                    if let IteratorState::Drop { running, .. } = state {
+                    if let IteratorState::Drop { running, .. } = &mut **state {
                         *running = false;
                     }
                 });
@@ -1242,7 +1243,7 @@ impl Interpreter {
                             return Ok((v, false));
                         }
                         self.gc_heap.with_payload(*iter, |state| {
-                            if let IteratorState::FlatMap { inner: slot, .. } = state {
+                            if let IteratorState::FlatMap { inner: slot, .. } = &mut **state {
                                 *slot = None;
                             }
                         });
@@ -1257,7 +1258,7 @@ impl Interpreter {
                     // §27.1.4.5 step 5.b.iv — IfAbruptCloseIterator on a
                     // throwing mapper.
                     self.gc_heap.with_payload(*iter, |state| {
-                        if let IteratorState::FlatMap { running, .. } = state {
+                        if let IteratorState::FlatMap { running, .. } = &mut **state {
                             *running = true;
                         }
                     });
@@ -1271,7 +1272,7 @@ impl Interpreter {
                     ) {
                         Ok(mapped) => {
                             self.gc_heap.with_payload(*iter, |state| {
-                                if let IteratorState::FlatMap { running, .. } = state {
+                                if let IteratorState::FlatMap { running, .. } = &mut **state {
                                     *running = false;
                                 }
                             });
@@ -1289,7 +1290,7 @@ impl Interpreter {
                     };
                     counter += 1;
                     self.gc_heap.with_payload(*iter, |state| {
-                        if let IteratorState::FlatMap { counter: slot, .. } = state {
+                        if let IteratorState::FlatMap { counter: slot, .. } = &mut **state {
                             *slot = counter;
                         }
                     });
@@ -1308,7 +1309,7 @@ impl Interpreter {
                     } else if let Some(rc) = mapped.as_iterator() {
                         let new_inner = rc;
                         self.gc_heap.with_payload(*iter, |state| {
-                            if let IteratorState::FlatMap { inner: slot, .. } = state {
+                            if let IteratorState::FlatMap { inner: slot, .. } = &mut **state {
                                 *slot = Some(new_inner);
                             }
                         });
@@ -1390,7 +1391,7 @@ impl Interpreter {
                         if let Some(rc) = iter_value.as_iterator() {
                             let new_inner = rc;
                             self.gc_heap.with_payload(*iter, |state| {
-                                if let IteratorState::FlatMap { inner: slot, .. } = state {
+                                if let IteratorState::FlatMap { inner: slot, .. } = &mut **state {
                                     *slot = Some(new_inner);
                                 }
                             });
@@ -1478,7 +1479,7 @@ impl Interpreter {
                     };
                     let iter_root = Value::iterator(*iter);
                     let source_root = Value::iterator(source);
-                    let mapper_root = self.gc_heap.read_payload(*iter, |state| match state {
+                    let mapper_root = self.gc_heap.read_payload(*iter, |state| match &**state {
                         IteratorState::FlatMap { mapper, .. } => *mapper,
                         _ => Value::undefined(),
                     });
@@ -1490,7 +1491,7 @@ impl Interpreter {
                         )
                         .map_err(CommittedValueError::JavaScript)?;
                     self.gc_heap.with_payload(*iter, |state| {
-                        if let IteratorState::FlatMap { inner: slot, .. } = state {
+                        if let IteratorState::FlatMap { inner: slot, .. } = &mut **state {
                             *slot = Some(new_inner);
                         }
                     });
@@ -1512,7 +1513,7 @@ impl Interpreter {
                     )));
                 }
                 self.gc_heap.with_payload(*iter, |state| {
-                    if let IteratorState::Chunks { running, .. } = state {
+                    if let IteratorState::Chunks { running, .. } = &mut **state {
                         *running = true;
                     }
                 });
@@ -1536,7 +1537,7 @@ impl Interpreter {
                     }
                 })();
                 self.gc_heap.with_payload(*iter, |state| {
-                    if let IteratorState::Chunks { running, .. } = state {
+                    if let IteratorState::Chunks { running, .. } = &mut **state {
                         *running = false;
                     }
                 });
@@ -1572,7 +1573,7 @@ impl Interpreter {
                     .alloc_runtime_rooted_array_from_values(std::iter::empty(), &[&yielded], &[])
                     .map_err(CommittedValueError::JavaScript)?;
                 self.gc_heap.with_payload(*iter, |state| {
-                    if let IteratorState::Chunks { buffer: slot, .. } = state {
+                    if let IteratorState::Chunks { buffer: slot, .. } = &mut **state {
                         *slot = fresh;
                     }
                 });
@@ -1595,7 +1596,7 @@ impl Interpreter {
                     )));
                 }
                 self.gc_heap.with_payload(*iter, |state| {
-                    if let IteratorState::Windows { running, .. } = state {
+                    if let IteratorState::Windows { running, .. } = &mut **state {
                         *running = true;
                     }
                 });
@@ -1624,7 +1625,7 @@ impl Interpreter {
                     }
                 })();
                 self.gc_heap.with_payload(*iter, |state| {
-                    if let IteratorState::Windows { running, .. } = state {
+                    if let IteratorState::Windows { running, .. } = &mut **state {
                         *running = false;
                     }
                 });
@@ -1679,7 +1680,7 @@ impl Interpreter {
                     )));
                 }
                 self.gc_heap.with_payload(*iter, |state| {
-                    if let IteratorState::Concat { running, .. } = state {
+                    if let IteratorState::Concat { running, .. } = &mut **state {
                         *running = true;
                     }
                 });
@@ -1691,7 +1692,7 @@ impl Interpreter {
                                 return Ok(Some(v));
                             }
                             self.gc_heap.with_payload(*iter, |state| {
-                                if let IteratorState::Concat { inner: slot, .. } = state {
+                                if let IteratorState::Concat { inner: slot, .. } = &mut **state {
                                     *slot = None;
                                 }
                             });
@@ -1712,7 +1713,7 @@ impl Interpreter {
                         let method = array::get(sources, &self.gc_heap, slot + 1);
                         index += 1;
                         self.gc_heap.with_payload(*iter, |state| {
-                            if let IteratorState::Concat { index: slot, .. } = state {
+                            if let IteratorState::Concat { index: slot, .. } = &mut **state {
                                 *slot = index;
                             }
                         });
@@ -1781,7 +1782,7 @@ impl Interpreter {
                             )
                             .map_err(CommittedValueError::JavaScript)?;
                         self.gc_heap.with_payload(*iter, |state| {
-                            if let IteratorState::Concat { inner: slot, .. } = state {
+                            if let IteratorState::Concat { inner: slot, .. } = &mut **state {
                                 *slot = Some(new_inner);
                             }
                         });
@@ -1792,7 +1793,7 @@ impl Interpreter {
                     }
                 })();
                 self.gc_heap.with_payload(*iter, |state| {
-                    if let IteratorState::Concat { running, .. } = state {
+                    if let IteratorState::Concat { running, .. } = &mut **state {
                         *running = false;
                     }
                 });
@@ -1824,7 +1825,7 @@ impl Interpreter {
                 self.gc_heap.with_payload(*iter, |state| {
                     if let IteratorState::Zip {
                         running, started, ..
-                    } = state
+                    } = &mut **state
                     {
                         *running = true;
                         *started = true;
@@ -1832,7 +1833,7 @@ impl Interpreter {
                 });
                 let step = self.iterator_zip_step(stack, context, *iter, mode);
                 self.gc_heap.with_payload(*iter, |state| {
-                    if let IteratorState::Zip { running, .. } = state {
+                    if let IteratorState::Zip { running, .. } = &mut **state {
                         *running = false;
                     }
                 });
@@ -1859,7 +1860,7 @@ impl Interpreter {
     /// sequence. Re-read from the traced state slot at every use for the
     /// same reason as [`Self::iterator_helper_buffer`].
     fn iterator_concat_sources(&self, iter: IteratorHandle) -> Option<array::JsArray> {
-        self.gc_heap.read_payload(iter, |state| match state {
+        self.gc_heap.read_payload(iter, |state| match &**state {
             IteratorState::Concat { sources, .. } => Some(*sources),
             _ => None,
         })
@@ -1871,7 +1872,7 @@ impl Interpreter {
         &self,
         iter: IteratorHandle,
     ) -> Option<(array::JsArray, array::JsArray, array::JsArray)> {
-        self.gc_heap.read_payload(iter, |state| match state {
+        self.gc_heap.read_payload(iter, |state| match &**state {
             IteratorState::Zip {
                 iters,
                 padding,
@@ -1884,7 +1885,7 @@ impl Interpreter {
 
     /// The `results` scratch array of a `Zip` helper.
     fn iterator_zip_results(&self, iter: IteratorHandle) -> Option<array::JsArray> {
-        self.gc_heap.read_payload(iter, |state| match state {
+        self.gc_heap.read_payload(iter, |state| match &**state {
             IteratorState::Zip { results, .. } => Some(*results),
             _ => None,
         })
@@ -1939,7 +1940,7 @@ impl Interpreter {
                 keys,
                 results,
                 ..
-            } = state
+            } = &mut **state
             {
                 *iters = arrays[0];
                 *padding = arrays[1];
@@ -1983,7 +1984,7 @@ impl Interpreter {
     }
 
     fn zip_list(&self, iter: IteratorHandle, list: ZipList) -> Option<array::JsArray> {
-        self.gc_heap.read_payload(iter, |state| match state {
+        self.gc_heap.read_payload(iter, |state| match &**state {
             IteratorState::Zip {
                 iters,
                 padding,
@@ -2307,7 +2308,7 @@ impl Interpreter {
     /// `None` means the helper is no longer collecting (a re-entrant
     /// close folded it to `Exhausted`).
     fn iterator_helper_buffer(&self, iter: IteratorHandle) -> Option<array::JsArray> {
-        self.gc_heap.read_payload(iter, |state| match state {
+        self.gc_heap.read_payload(iter, |state| match &**state {
             IteratorState::Chunks { buffer, .. } | IteratorState::Windows { buffer, .. } => {
                 Some(*buffer)
             }
@@ -2728,11 +2729,13 @@ impl Interpreter {
             Other,
         }
         let record = match iterator.as_iterator() {
-            Some(handle) if !primordial => self.gc_heap.read_payload(handle, |state| match state {
-                IteratorState::User { .. } | IteratorState::Exhausted { .. } => Record::Other,
-                IteratorState::Generator { handle } => Record::Generator(*handle),
-                _ => Record::Builtin,
-            }),
+            Some(handle) if !primordial => {
+                self.gc_heap.read_payload(handle, |state| match &**state {
+                    IteratorState::User { .. } | IteratorState::Exhausted { .. } => Record::Other,
+                    IteratorState::Generator { handle } => Record::Generator(*handle),
+                    _ => Record::Builtin,
+                })
+            }
             _ => Record::Other,
         };
         self.with_handle_scope(|interp, scope| {
@@ -2794,7 +2797,7 @@ impl Interpreter {
                 None,
             }
             let action = if let Some(handle) = interp.escape_scoped(iterator).as_iterator() {
-                let action = interp.gc_heap.read_payload(handle, |state| match state {
+                let action = interp.gc_heap.read_payload(handle, |state| match &**state {
                     IteratorState::User { iterator, .. } => CloseAction::User(*iterator),
                     // §7.4.9 — a generator's `return` resumes the suspended
                     // body with a return completion so its `finally` blocks
@@ -2925,7 +2928,7 @@ impl Interpreter {
                     // silently becoming a no-op.
                     if let Some(handle) = interp.escape_scoped(iterator).as_iterator() {
                         interp.gc_heap.with_payload(handle, |state| {
-                            if let IteratorState::Concat { running, .. } = state {
+                            if let IteratorState::Concat { running, .. } = &mut **state {
                                 *running = true;
                             }
                         });
@@ -2955,7 +2958,7 @@ impl Interpreter {
                     if let Some(handle) = handle {
                         if started {
                             interp.gc_heap.with_payload(handle, |state| {
-                                if let IteratorState::Zip { running, .. } = state {
+                                if let IteratorState::Zip { running, .. } = &mut **state {
                                     *running = true;
                                 }
                             });
@@ -4233,7 +4236,7 @@ impl Interpreter {
         // §27.5 generator-state path — drive the suspended body
         // synchronously and write the unpacked `value` / `done`
         // pair into the caller's destination registers.
-        let gen_handle = self.gc_heap.read_payload(*iter_rc, |state| match state {
+        let gen_handle = self.gc_heap.read_payload(*iter_rc, |state| match &**state {
             IteratorState::Generator { handle } => Some(*handle),
             _ => None,
         });
@@ -4270,7 +4273,7 @@ impl Interpreter {
         // `exec` that the synchronous `step_iterator` cannot call).
         let needs_full_step = self.gc_heap.read_payload(*iter_rc, |state| {
             matches!(
-                state,
+                &**state,
                 IteratorState::Map { .. }
                     | IteratorState::Filter { .. }
                     | IteratorState::Take { .. }
@@ -4300,7 +4303,7 @@ impl Interpreter {
         // sparse slot, a hole the prototype chain answers — must run the
         // observable [[Get]] through the interpreter; the synchronous
         // fast path below reads raw element storage only.
-        let array_step = self.gc_heap.read_payload(*iter_rc, |state| match state {
+        let array_step = self.gc_heap.read_payload(*iter_rc, |state| match &**state {
             IteratorState::Array { array, index, .. }
             | IteratorState::ArrayEntry { array, index } => Some((*array, *index)),
             _ => None,
@@ -4322,7 +4325,7 @@ impl Interpreter {
         // Snapshot the user iterator object out of the inner
         // state so the borrow does not span the `invoke` call
         // below.
-        let user_iter = self.gc_heap.read_payload(*iter_rc, |state| match state {
+        let user_iter = self.gc_heap.read_payload(*iter_rc, |state| match &**state {
             IteratorState::User {
                 iterator,
                 next_method,
@@ -4385,7 +4388,7 @@ impl Interpreter {
             iterator: iter_value,
         });
         let args: SmallVec<[Value; 8]> = SmallVec::new();
-        let user_iter_value = self.gc_heap.read_payload(*iter_rc, |state| match state {
+        let user_iter_value = self.gc_heap.read_payload(*iter_rc, |state| match &**state {
             IteratorState::User { iterator, .. } => *iterator,
             _ => user_iter_value,
         });

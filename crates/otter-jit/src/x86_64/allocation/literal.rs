@@ -229,7 +229,8 @@ fn emit_dense_array(
     dynasm!(ops ; .arch x64 ; lea Rq(slab), [Rq(shell) + plan.shell.cell_bytes as i32]);
     emit_load_u64(ops, 10, site.header_word(plan.shell.header_word));
     dynasm!(ops ; .arch x64 ; mov [Rq(shell)], r10);
-    for byte in (8..plan.shell.cell_bytes).step_by(8) {
+    dynasm!(ops ; .arch x64 ; mov QWORD [Rq(shell) + 8], plan.shell.map_word as i32);
+    for byte in (16..plan.shell.cell_bytes).step_by(8) {
         dynasm!(ops ; .arch x64 ; mov QWORD [Rq(shell) + byte as i32], 0);
     }
     emit_load_u64(ops, 10, slab_site.header_word(plan.slab_header_word));
@@ -241,7 +242,7 @@ fn emit_dense_array(
     dynasm!(ops ; .arch x64
         ; mov [Rq(slab) + plan.capacity_byte as i32], r10d
         ; mov [Rq(slab) + plan.len_byte as i32], r10d
-        ; mov [Rq(shell) + plan.shell_length_byte as i32], r10
+        ; mov [Rq(shell) + plan.shell_length_byte as i32], r10d
         ; mov [Rq(shell) + plan.shell_len_byte as i32], r10d
         ; mov [Rq(shell) + plan.shell_capacity_byte as i32], r10d
         ; mov BYTE [Rq(slab) + plan.kind_byte as i32], plan.initial_kind as i8

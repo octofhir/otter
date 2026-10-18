@@ -213,10 +213,12 @@ const COLLECTION_JIT_FLAG_PROTO_OVERRIDE: u32 = 1 << 0;
 const COLLECTION_JIT_FLAG_EXPANDO: u32 = 1 << 1;
 
 #[derive(Debug, Default, otter_macros::Pelt)]
-#[pelt(tag = MAP_BODY_TYPE_TAG)]
+#[pelt(tag = MAP_BODY_TYPE_TAG, value_cell)]
 #[repr(C)]
 /// GC-allocated storage backing every [`JsMap`] handle.
 pub struct MapBody {
+    /// Map word: this value cell's type, at body offset 0.
+    pub(crate) map: otter_gc::cell_map::TypeMap<MAP_BODY_TYPE_TAG>,
     /// Machine-readable receiver guard flags for baseline method ICs.
     ///
     /// Bit 0 means the Map has an explicit prototype override. Bit 1 means it
@@ -826,10 +828,12 @@ pub fn map_ptr_eq(a: JsMap, b: JsMap) -> bool {
 pub type JsSet = otter_gc::Gc<SetBody>;
 
 #[derive(Debug, Default, otter_macros::Pelt)]
-#[pelt(tag = SET_BODY_TYPE_TAG)]
+#[pelt(tag = SET_BODY_TYPE_TAG, value_cell)]
 #[repr(C)]
 /// GC-allocated storage backing every [`JsSet`] handle.
 pub struct SetBody {
+    /// Map word: this value cell's type, at body offset 0.
+    pub(crate) map: otter_gc::cell_map::TypeMap<SET_BODY_TYPE_TAG>,
     /// Machine-readable receiver guard flags for baseline method ICs. Same bit
     /// layout as [`MapBody::jit_guard_flags`].
     #[pelt(skip)]
@@ -1257,7 +1261,7 @@ impl WeakCollectionKey {
 }
 
 #[derive(Default, otter_macros::Pelt)]
-#[pelt(tag = WEAK_MAP_BODY_TYPE_TAG, ephemeron_via = weak_map_ephemeron_walk)]
+#[pelt(tag = WEAK_MAP_BODY_TYPE_TAG, value_cell, ephemeron_via = weak_map_ephemeron_walk)]
 /// GC-allocated storage backing every [`JsWeakMap`] handle.
 ///
 /// The entries live in a [`weak_table::WeakTableBody`] this body names
@@ -1266,7 +1270,10 @@ impl WeakCollectionKey {
 /// ephemeron entries are not ordinary edges, and the `ephemeron_via`
 /// hook reaches them through the handle so the fixpoint marks a value
 /// only after its key is already live.
+#[repr(C)]
 pub struct WeakMapBody {
+    /// Map word: this value cell's type, at body offset 0.
+    pub(crate) map: otter_gc::cell_map::TypeMap<WEAK_MAP_BODY_TYPE_TAG>,
     table: weak_table::WeakTableHandle<weak_table::MapKind>,
     prototype_override: Option<Value>,
     /// Lazy ordinary own-property bag (see [`MapBody::expando`]).
@@ -1521,13 +1528,16 @@ pub fn weak_map_delete(
 pub type JsWeakSet = otter_gc::Gc<WeakSetBody>;
 
 #[derive(Default, otter_macros::Pelt)]
-#[pelt(tag = WEAK_SET_BODY_TYPE_TAG, ephemeron_via = weak_set_ephemeron_walk)]
+#[pelt(tag = WEAK_SET_BODY_TYPE_TAG, value_cell, ephemeron_via = weak_set_ephemeron_walk)]
 /// GC-allocated storage backing every [`JsWeakSet`] handle.
 ///
 /// The entries live in a [`weak_table::WeakTableBody`] this body names
 /// by handle, exactly as [`WeakMapBody`] does; the value slot of every
 /// entry is `undefined`.
+#[repr(C)]
 pub struct WeakSetBody {
+    /// Map word: this value cell's type, at body offset 0.
+    pub(crate) map: otter_gc::cell_map::TypeMap<WEAK_SET_BODY_TYPE_TAG>,
     table: weak_table::WeakTableHandle<weak_table::SetKind>,
     prototype_override: Option<Value>,
     /// Lazy ordinary own-property bag (see [`MapBody::expando`]).

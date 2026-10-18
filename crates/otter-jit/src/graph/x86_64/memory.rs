@@ -185,11 +185,14 @@ impl Codegen<'_> {
                 let (receiver, destination) = (Self::gp(input(0)), output());
                 let other = self.ops.new_dynamic_label();
                 let done = self.ops.new_dynamic_label();
-                self.emit_ordinary_receiver(receiver, 0, other);
+                // Every compared shape is baked, so neither dictionary nor
+                // opaque, and a shape's state never changes: the map word
+                // alone selects the arm, and no other cell's word matches.
+                self.emit_cell_guard(receiver, other);
                 self.emit_body_load(
                     receiver,
                     destination,
-                    self.view.object_shape_byte,
+                    otter_vm::jit::JIT_MAP_WORD_BYTE,
                     JitGuardWidth::Word32,
                 );
                 dynasm!(self.ops ; .arch x64 ; jmp =>done ; =>other ; xor Rd(destination), Rd(destination) ; =>done);
@@ -210,8 +213,8 @@ impl Codegen<'_> {
                         ; cmp BYTE [Rq(receiver)], storage.type_tag as i8 ; jne =>exit);
                 }
                 dynasm!(self.ops ; .arch x64
-                    ; mov r10, [Rq(receiver) + storage.logical_length_byte as i32]
-                    ; mov r11, r10 ; shr r11, 31 ; jnz =>exit
+                    ; mov r10d, [Rq(receiver) + storage.logical_length_byte as i32]
+                    ; test r10d, r10d ; js =>exit
                     ; mov Rd(destination), r10d);
             }
             Kind::ElementWriteBarrier => self.emit_element_write_barrier(

@@ -528,7 +528,10 @@ impl Interpreter {
         // the cell must never move under a young-space scavenge.
         let handle = self
             .gc_heap
-            .alloc_old_with_roots(state, &mut external_visit)
+            .alloc_old_with_roots(
+                crate::iterator_state::IteratorBody::new(state),
+                &mut external_visit,
+            )
             .map_err(VmError::from)?;
         self.register_iterator_prototype_override(handle, prototype);
         Ok(handle)
@@ -834,7 +837,10 @@ impl Interpreter {
         // call inside Rust locals that a moving scavenge cannot rewrite.
         let handle = self
             .gc_heap
-            .alloc_old_with_roots(state, &mut external_visit)
+            .alloc_old_with_roots(
+                crate::iterator_state::IteratorBody::new(state),
+                &mut external_visit,
+            )
             .map_err(VmError::from)?;
         self.register_iterator_prototype_override(handle, prototype);
         Ok(handle)

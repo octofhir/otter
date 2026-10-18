@@ -229,16 +229,17 @@ pub const JIT_YOUNG_CLOSURE_HEADER_WORD: u64 = crate::closure::JS_CLOSURE_BODY_T
 pub const JIT_CLOSURE_CELL_BYTES: u32 =
     (otter_gc::header::HEADER_SIZE + std::mem::size_of::<crate::closure::JsClosureBody>()) as u32;
 
-// A carve writes the call header as one word (function id, then flags),
-// then clears the rare handle and its required alignment padding with one
-// store. No instance observation occupies the fixed closure cell.
+/// First body word of a fresh closure: its map word, then a null rare handle.
+pub const JIT_CLOSURE_MAP_RARE_WORD: u64 =
+    otter_gc::cell_map::CellMap::of_type(crate::closure::JS_CLOSURE_BODY_TYPE_TAG).word() as u64;
+
+// A carve writes the map word and the null rare handle as one word, then the
+// call header as one word (function id, then flags). No instance observation
+// occupies the fixed closure cell.
 const _: () = {
+    assert!(crate::closure::CLOSURE_BODY_RARE_OFFSET == 4);
     assert!(crate::closure::CLOSURE_CALL_HEADER_FUNCTION_ID_OFFSET == 0);
     assert!(crate::closure::CLOSURE_CALL_HEADER_FLAGS_OFFSET == 4);
-    assert!(
-        crate::closure::CLOSURE_BODY_RARE_OFFSET + 8
-            == std::mem::size_of::<crate::closure::JsClosureBody>()
-    );
 };
 
 /// Inline nesting of one optimizing compilation: any body below this depth,
@@ -269,14 +270,19 @@ pub const JIT_BIGINT_SHAPE_BYTE: u32 =
 /// Cell byte of a BigInt's sign byte.
 pub const JIT_BIGINT_NEGATIVE_BYTE: u32 =
     (otter_gc::header::HEADER_SIZE + crate::bigint::gc_body::BIG_INT_NEGATIVE_OFFSET) as u32;
+/// Cell byte of every value cell's map word (see `otter_gc::cell_map`).
+pub const JIT_MAP_WORD_BYTE: u32 = otter_gc::cell_map::MAP_WORD_OFFSET as u32;
+/// First body word of a carved BigInt: its map word, then zero.
+pub const JIT_BIGINT_MAP_WORD: u64 =
+    otter_gc::cell_map::CellMap::of_type(crate::bigint::BIG_INT_BODY_TYPE_TAG).word() as u64;
 /// Cell byte of a BigInt's least significant digit.
 pub const JIT_BIGINT_DIGIT_BYTE: u32 =
     (otter_gc::header::HEADER_SIZE + std::mem::size_of::<crate::bigint::BigIntBody>()) as u32;
 
 const _: () = {
-    assert!(crate::bigint::gc_body::BIG_INT_LEN_OFFSET == 0);
-    assert!(crate::bigint::gc_body::BIG_INT_NEGATIVE_OFFSET == 4);
-    assert!(std::mem::size_of::<crate::bigint::BigIntBody>() == 8);
+    assert!(crate::bigint::gc_body::BIG_INT_LEN_OFFSET == 8);
+    assert!(crate::bigint::gc_body::BIG_INT_NEGATIVE_OFFSET == 12);
+    assert!(std::mem::size_of::<crate::bigint::BigIntBody>() == 16);
     // The carve's digit is the cell's last word.
     assert!(JIT_BIGINT_DIGIT_BYTE + 8 == JIT_BIGINT64_CELL_BYTES);
 };
@@ -394,6 +400,8 @@ pub struct JitClosureCallLayout {
     /// Byte flag, from the rare record, generated `instanceof` sets when it
     /// caches the closure in a site's cell.
     pub instanceof_cached_byte: u32,
+    /// Map word (with the rare handle in the same word) from the cell start.
+    pub map_byte: u32,
 }
 
 /// Byte offset of the cached target in a generated `instanceof` site's cell.
@@ -534,7 +542,7 @@ pub const JIT_TYPEOF_TAGS: JitTypeOfTags = JitTypeOfTags {
     ],
 };
 
-const _: [(); 56] = [(); std::mem::size_of::<JitClosureCallLayout>()];
+const _: [(); 60] = [(); std::mem::size_of::<JitClosureCallLayout>()];
 const _: [(); 4] = [(); std::mem::align_of::<JitClosureCallLayout>()];
 const _: [(); 0] = [(); std::mem::offset_of!(JitClosureCallLayout, function_id_byte)];
 const _: [(); 4] = [(); std::mem::offset_of!(JitClosureCallLayout, flags_byte)];
@@ -550,6 +558,7 @@ const _: [(); 40] = [(); std::mem::offset_of!(JitClosureCallLayout, prototype_by
 const _: [(); 44] = [(); std::mem::offset_of!(JitClosureCallLayout, constructor_layouts_byte)];
 const _: [(); 48] = [(); std::mem::offset_of!(JitClosureCallLayout, prototype_ordinary_byte)];
 const _: [(); 52] = [(); std::mem::offset_of!(JitClosureCallLayout, instanceof_cached_byte)];
+const _: [(); 56] = [(); std::mem::offset_of!(JitClosureCallLayout, map_byte)];
 
 /// Machine-readable [`crate::context::ContextBody`] layout.
 ///
@@ -2949,6 +2958,63 @@ pub trait JitCompilerHook: Send + Sync {
 mod layout_tests {
     use super::*;
 
+    /// Every cell a program can hold as a value declares its map word, so a
+    /// shape check that loads one word and compares never mistakes another
+    /// cell for an object. Only these bodies never reach generated shape
+    /// checks: collector-side tables, slabs and records, plus the contexts,
+    /// eval extensions, accessor pairs and upvalues the VM wraps in values
+    /// that no property access receives.
+    #[test]
+    fn value_cells_declare_their_map_word() {
+        use otter_gc::cell_map::MapWord;
+        let internal =
+            [
+                crate::upvalue::UPVALUE_CELL_TYPE_TAG,
+                crate::generator::PARKED_FRAME_BODY_TYPE_TAG,
+                crate::context::CONTEXT_BODY_TYPE_TAG,
+                crate::eval_env::EVAL_EXTENSION_BODY_TYPE_TAG,
+                crate::object::ACCESSOR_CELL_TYPE_TAG,
+                crate::closure_construct::CLOSURE_RARE_BODY_TYPE_TAG,
+                crate::proxy::PRIVATE_SLOTS_BODY_TYPE_TAG,
+                crate::collections::MAP_TABLE_BODY_TYPE_TAG,
+                crate::collections::SET_TABLE_BODY_TYPE_TAG,
+                crate::object::EXOTIC_SLOTS_TYPE_TAG,
+                crate::object::DICT_KEYS_BODY_TYPE_TAG,
+                crate::object::ERROR_STACK_BODY_TYPE_TAG,
+                crate::object::SLOT_META_BODY_TYPE_TAG,
+                crate::constructor_layout::CONSTRUCTOR_LAYOUT_BODY_TYPE_TAG,
+                crate::array::elements::ELEMENT_SLAB_BODY_TYPE_TAG,
+                <crate::object::ShapeBody as otter_gc::SafeTraceable>::TYPE_TAG,
+                <crate::object::slot_slab::SlotSlabBody as otter_gc::SafeTraceable>::TYPE_TAG,
+                <crate::value_slab::ValueSlabBody as otter_gc::SafeTraceable>::TYPE_TAG,
+                <crate::array::ArrayExoticSlots as otter_gc::SafeTraceable>::TYPE_TAG,
+                <crate::object::shape_keys::ShapeKeysBody as otter_gc::SafeTraceable>::TYPE_TAG,
+                <crate::object::symbol_table::SymbolPropsBody as otter_gc::SafeTraceable>::TYPE_TAG,
+                <crate::collections::weak_table::WeakTableBody<
+                    crate::collections::weak_table::MapKind,
+                > as otter_gc::SafeTraceable>::TYPE_TAG,
+                <crate::collections::weak_table::WeakTableBody<
+                    crate::collections::weak_table::SetKind,
+                > as otter_gc::SafeTraceable>::TYPE_TAG,
+            ];
+        let mut heap = otter_gc::GcHeap::new().expect("heap");
+        crate::object::register_gc_traceables(&mut heap);
+        let table = heap.trace_table();
+        for tag in 0..=u8::MAX {
+            let Some(name) = table.name(tag) else {
+                continue;
+            };
+            let declared = table.map_word(tag);
+            if tag == crate::object::OBJECT_BODY_TYPE_TAG {
+                assert_eq!(declared, MapWord::Shape);
+            } else if internal.contains(&tag) {
+                assert_eq!(declared, MapWord::Internal, "{name}");
+            } else {
+                assert_eq!(declared, MapWord::of_type(tag), "{name} needs a map word");
+            }
+        }
+    }
+
     #[test]
     fn array_whole_lookup_has_one_complete_aligned_null_word() {
         let guard = crate::method_ops::array_named_lookup_guard();
@@ -2960,7 +3026,7 @@ mod layout_tests {
         assert_eq!(std::mem::align_of::<crate::array::ArrayBody>(), 8);
         assert_eq!(JitEmptyArrayAllocationPlan::default().cell_bytes, 48);
         let header = otter_gc::header::HEADER_SIZE;
-        assert_eq!(header + crate::array::ARRAY_BODY_LENGTH_OFFSET, 8);
+        assert_eq!(header + crate::array::ARRAY_BODY_LENGTH_OFFSET, 12);
         assert_eq!(header + crate::array::ARRAY_BODY_ELEMENTS_PTR_OFFSET, 16);
         assert_eq!(header + crate::array::ARRAY_BODY_EXOTIC_OFFSET, 24);
         assert_eq!(header + crate::array::ARRAY_BODY_EXPANDO_OFFSET, 28);
@@ -3025,7 +3091,7 @@ mod layout_tests {
 
     #[test]
     fn closure_call_layout_has_stable_c_field_offsets() {
-        assert_eq!(std::mem::size_of::<JitClosureCallLayout>(), 56);
+        assert_eq!(std::mem::size_of::<JitClosureCallLayout>(), 60);
         assert_eq!(std::mem::align_of::<JitClosureCallLayout>(), 4);
         let fields = [
             std::mem::offset_of!(JitClosureCallLayout, function_id_byte),

@@ -88,6 +88,9 @@ pub trait Traceable: 'static {
     /// must coordinate to avoid collisions.
     const TYPE_TAG: u8;
 
+    /// What this body keeps in its first word; see [`crate::cell_map`].
+    const MAP_WORD: crate::cell_map::MapWord = crate::cell_map::MapWord::Internal;
+
     /// Walk every outgoing GC reference held by `self`, yielding
     /// the slot's address (`*mut RawGc`) to the visitor.
     ///
@@ -222,6 +225,9 @@ pub trait SafeTraceable: 'static {
     /// must coordinate to avoid collisions.
     const TYPE_TAG: u8;
 
+    /// What this body keeps in its first word; see [`crate::cell_map`].
+    const MAP_WORD: crate::cell_map::MapWord = crate::cell_map::MapWord::Internal;
+
     /// Walk every outgoing GC reference owned by `self`,
     /// yielding the slot's address (`*mut RawGc`) to `visitor`.
     /// Must not allocate or retain the visitor (same contract
@@ -255,6 +261,7 @@ pub trait SafeTraceable: 'static {
 
 impl<T: SafeTraceable> Traceable for T {
     const TYPE_TAG: u8 = <Self as SafeTraceable>::TYPE_TAG;
+    const MAP_WORD: crate::cell_map::MapWord = <Self as SafeTraceable>::MAP_WORD;
 
     /// Bridge from the safe trait to the unsafe-fn `Traceable`.
     ///
@@ -315,6 +322,8 @@ pub struct TraceTable {
     /// Diagnostics only — [`crate::census`] renders it so a heap
     /// table reads as type names rather than bare tag bytes.
     name_table: [Option<&'static str>; 256],
+    /// Each registered tag's [`Traceable::MAP_WORD`] declaration.
+    map_word_table: [crate::cell_map::MapWord; 256],
 }
 
 impl Default for TraceTable {
@@ -336,6 +345,7 @@ impl TraceTable {
             cleanup_table: [false; 256],
             sever_restored_table: [None; 256],
             name_table: [None; 256],
+            map_word_table: [crate::cell_map::MapWord::Internal; 256],
         }
     }
 
@@ -416,6 +426,7 @@ impl TraceTable {
         self.remembered_table[tag] = Some(remembered_wrapper::<T>);
         self.ephemeron_table[tag] = Some(ephemeron_wrapper::<T>);
         self.name_table[tag] = Some(std::any::type_name::<T>());
+        self.map_word_table[tag] = T::MAP_WORD;
         // Only set drop if needed — saves one indirect call per
         // dead object on plain-old-data types.
         if std::mem::needs_drop::<T>() {
@@ -430,6 +441,14 @@ impl TraceTable {
     #[must_use]
     pub fn needs_cleanup(&self, tag: u8) -> bool {
         self.cleanup_table[tag as usize]
+    }
+
+    /// What a cell of `tag` keeps in its first body word;
+    /// [`crate::cell_map::MapWord::Internal`] for an unregistered tag.
+    #[inline]
+    #[must_use]
+    pub fn map_word(&self, tag: u8) -> crate::cell_map::MapWord {
+        self.map_word_table[tag as usize]
     }
 
     /// Look up the trace function for a given type tag.

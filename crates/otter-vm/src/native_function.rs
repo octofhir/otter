@@ -228,13 +228,11 @@ impl std::fmt::Debug for NativeCall {
 
 /// Heap payload for [`Value::NativeFunction`].
 #[derive(otter_macros::Pelt)]
-#[pelt(tag = NATIVE_FUNCTION_BODY_TYPE_TAG)]
+#[pelt(tag = NATIVE_FUNCTION_BODY_TYPE_TAG, value_cell)]
 #[repr(C)]
 pub struct NativeFunctionBody {
-    /// Authoritative machine-readable call target and callable policy.
-    /// Its payload has no GC values; captures live immediately after it.
-    #[pelt(skip)]
-    call_header: NativeCallHeader,
+    /// Map word: this value cell's type, at body offset 0.
+    pub(crate) map: otter_gc::cell_map::TypeMap<NATIVE_FUNCTION_BODY_TYPE_TAG>,
     /// JS values owned by the native payload and therefore traced
     /// strongly while this function is reachable, in a
     /// [`crate::value_slab::ValueSlabBody`] of their own — null when
@@ -243,6 +241,10 @@ pub struct NativeFunctionBody {
     /// shared Rust state behind the closure's `Arc` must hold no
     /// `Value` (a counter is fine), because nothing traces it.
     captures: crate::value_slab::ValueSlabHandle,
+    /// Authoritative machine-readable call target and callable policy.
+    /// Its payload has no GC values; captures live immediately after it.
+    #[pelt(skip)]
+    call_header: NativeCallHeader,
     /// Display name retained and traced by this body.
     name: JsString,
     /// Own property state for the built-in `name` property.
@@ -287,8 +289,8 @@ pub(crate) fn jit_call_layout() -> crate::jit::JitNativeCallLayout {
 }
 
 const _: () = {
-    assert!(std::mem::offset_of!(NativeFunctionBody, call_header) == 0);
-    assert!(std::mem::offset_of!(NativeFunctionBody, captures) == 16);
+    assert!(std::mem::offset_of!(NativeFunctionBody, captures) == 4);
+    assert!(std::mem::offset_of!(NativeFunctionBody, call_header) == 8);
 };
 
 impl NativeFunctionBody {
@@ -513,6 +515,7 @@ impl NativeFunction {
         Ok(Self {
             inner: heap.alloc_with_roots(
                 NativeFunctionBody {
+                    map: otter_gc::cell_map::TypeMap::NEW,
                     call_header,
                     name: name_string,
                     captures: captures_slab,

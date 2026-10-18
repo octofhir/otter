@@ -150,11 +150,13 @@ fn iterator_state_holding_array_object_survives_force_gc() {
             .expect("array");
     let iter = interp
         .gc_heap_mut()
-        .alloc_old(IteratorState::Array {
-            array,
-            index: 0,
-            origin: crate::BuiltinIteratorOrigin::Array,
-        })
+        .alloc_old(crate::iterator_state::IteratorBody::new(
+            IteratorState::Array {
+                array,
+                index: 0,
+                origin: crate::BuiltinIteratorOrigin::Array,
+            },
+        ))
         .expect("iterator");
     let mut global = *interp.global_this();
     interp
@@ -171,7 +173,7 @@ fn iterator_state_holding_array_object_survives_force_gc() {
     let Some(iter) = rooted.as_iterator() else {
         panic!("expected iterator root")
     };
-    let array = interp.gc_heap().read_payload(iter, |state| match state {
+    let array = interp.gc_heap().read_payload(iter, |state| match &**state {
         IteratorState::Array { array, .. } => *array,
         other => panic!("expected array iterator, got {other:?}"),
     });
@@ -267,10 +269,12 @@ fn promise_iterator_generator_cycles_reclaimed_when_unrooted() {
 
     let iter = interp
         .gc_heap_mut()
-        .alloc_old(IteratorState::Exhausted { origin: None })
+        .alloc_old(crate::iterator_state::IteratorBody::new(
+            IteratorState::Exhausted { origin: None },
+        ))
         .expect("iterator");
     interp.gc_heap_mut().with_payload(iter, |state| {
-        *state = IteratorState::FlatMap {
+        **state = IteratorState::FlatMap {
             source: iter,
             mapper: Value::undefined(),
             inner: Some(iter),

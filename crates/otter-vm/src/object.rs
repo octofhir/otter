@@ -2685,6 +2685,7 @@ impl ObjectBody {
 
 impl otter_gc::SafeTraceable for ObjectBody {
     const TYPE_TAG: u8 = OBJECT_BODY_TYPE_TAG;
+    const MAP_WORD: otter_gc::cell_map::MapWord = otter_gc::cell_map::MapWord::Shape;
 
     /// Walk every outgoing GC reference held by `self`:
     /// - the shape, `[[Prototype]]`, slab and sidecar handles;
@@ -2983,7 +2984,7 @@ pub fn register_gc_traceables(heap: &mut otter_gc::GcHeap) {
         crate::generator::GeneratorBody,
         crate::generator::ParkedFrameBody,
         crate::intl::payload::IntlBody,
-        crate::iterator_state::IteratorState,
+        crate::iterator_state::IteratorBody,
         crate::native_function::NativeFunctionBody,
         crate::promise::PurePromiseBody,
         crate::proxy::ProxyBodyGc,

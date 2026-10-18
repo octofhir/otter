@@ -219,7 +219,9 @@ fn emit_dense_array(
     dynasm!(ops ; .arch aarch64 ; add XSP(slab), XSP(shell), plan.shell.cell_bytes);
     emit_load_u64(ops, 16, site.header_word(plan.shell.header_word));
     dynasm!(ops ; .arch aarch64 ; str x16, [X(shell)]);
-    for byte in (8..plan.shell.cell_bytes).step_by(8) {
+    emit_load_u64(ops, 16, plan.shell.map_word);
+    dynasm!(ops ; .arch aarch64 ; str x16, [X(shell), 8]);
+    for byte in (16..plan.shell.cell_bytes).step_by(8) {
         dynasm!(ops ; .arch aarch64 ; str xzr, [X(shell), byte]);
     }
     emit_load_u64(ops, 16, slab_site.header_word(plan.slab_header_word));
@@ -232,7 +234,7 @@ fn emit_dense_array(
         ; .arch aarch64
         ; str w16, [X(slab), plan.capacity_byte]
         ; str w16, [X(slab), plan.len_byte]
-        ; str x16, [X(shell), plan.shell_length_byte]
+        ; str w16, [X(shell), plan.shell_length_byte]
         ; str w16, [X(shell), plan.shell_len_byte]
         ; str w16, [X(shell), plan.shell_capacity_byte]
     );

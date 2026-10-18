@@ -332,8 +332,11 @@ impl RegExpFlags {
 
 /// Inner state shared by every clone of a [`JsRegExp`].
 #[derive(Debug, otter_macros::Pelt)]
-#[pelt(tag = REGEXP_BODY_TYPE_TAG)]
+#[pelt(tag = REGEXP_BODY_TYPE_TAG, value_cell)]
+#[repr(C)]
 pub struct JsRegExpBody {
+    /// Map word: this value cell's type, at body offset 0.
+    pub(crate) map: otter_gc::cell_map::TypeMap<REGEXP_BODY_TYPE_TAG>,
     /// Compiled matcher and pattern text, shared with every other RegExp of
     /// the same pattern and engine-relevant flags. Always present after
     /// construction — errors surface during [`compile`] before the body is
@@ -468,6 +471,7 @@ impl JsRegExp {
         .map_err(|message| RegExpError::InvalidPattern { message })?;
         Ok(Self {
             inner: heap.alloc_old(JsRegExpBody {
+                map: otter_gc::cell_map::TypeMap::NEW,
                 pattern: std::sync::Arc::new(RegExpPattern::new(regex, pattern_utf16)),
                 flags,
                 last_index: Cell::new(Value::number_i32(0)),
@@ -504,6 +508,7 @@ impl JsRegExp {
             .map_err(|message| RegExpError::InvalidPattern { message })?;
         Ok(Self {
             inner: heap.alloc_old(JsRegExpBody {
+                map: otter_gc::cell_map::TypeMap::NEW,
                 pattern,
                 flags,
                 last_index: Cell::new(Value::number_i32(0)),

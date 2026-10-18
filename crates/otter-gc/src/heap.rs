@@ -1607,6 +1607,7 @@ impl GcHeap {
                 );
             }
             initialize(&mut *payload_ptr);
+            crate::cell_map::debug_check_map_word(payload_ptr);
         }
         if self.trace_table.needs_cleanup(T::TYPE_TAG) {
             self.new_space.track_cleanup(offset);
@@ -1987,6 +1988,7 @@ impl GcHeap {
             // The cell is still unreachable: fill any trailing storage at its
             // final address before the barrier scan below reads it.
             initialize(&mut *payload_ptr);
+            crate::cell_map::debug_check_map_word(payload_ptr);
             // When this object was tenured straight into old-space (large
             // object, or the nursery-deadlock overflow), the `ptr::write`
             // bypassed the mutator write barrier. Any young children in the
@@ -2190,6 +2192,7 @@ impl GcHeap {
             // its final address before the scan below records every outgoing
             // edge established by the initializer.
             initialize(&mut *payload_ptr);
+            crate::cell_map::debug_check_map_word(payload_ptr);
             // The payload was installed with `ptr::write`, bypassing the
             // mutator write barrier. Any young children it carries are
             // old→young edges the next scavenge can only discover through
@@ -3086,10 +3089,8 @@ impl GcHeap {
             }
             reclaimed += old.reclaimed;
             for tag in 0..TYPE_TAG_COUNT {
-                per_tag_live_count[tag] =
-                    per_tag_live_count[tag].wrapping_add(old.live_count[tag]);
-                per_tag_live_bytes[tag] =
-                    per_tag_live_bytes[tag].wrapping_add(old.live_bytes[tag]);
+                per_tag_live_count[tag] = per_tag_live_count[tag].wrapping_add(old.live_count[tag]);
+                per_tag_live_bytes[tag] = per_tag_live_bytes[tag].wrapping_add(old.live_bytes[tag]);
             }
             if track_cap {
                 retained_bytes = retained_bytes.saturating_add(old.retained);

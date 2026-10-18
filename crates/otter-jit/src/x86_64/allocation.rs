@@ -36,9 +36,9 @@
 use dynasmrt::{DynamicLabel, DynasmApi, DynasmLabelApi, dynasm, x64::Assembler};
 use otter_vm::JitCompileSnapshot;
 use otter_vm::jit::{
-    JIT_CLOSURE_CELL_BYTES, JIT_CONTEXT_HAS_EXTENSION_BIT, JIT_INLINE_CONTEXT_MAX_WORDS,
-    JIT_YOUNG_CLOSURE_HEADER_WORD, JIT_YOUNG_CONTEXT_HEADER_WORD, JitClosureAllocationPlan,
-    JitContextAllocationPlan,
+    JIT_CLOSURE_CELL_BYTES, JIT_CLOSURE_MAP_RARE_WORD, JIT_CONTEXT_HAS_EXTENSION_BIT,
+    JIT_INLINE_CONTEXT_MAX_WORDS, JIT_YOUNG_CLOSURE_HEADER_WORD, JIT_YOUNG_CONTEXT_HEADER_WORD,
+    JitClosureAllocationPlan, JitContextAllocationPlan,
 };
 
 use crate::allocation::{AllocationValue, LabRegisters};

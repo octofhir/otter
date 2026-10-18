@@ -354,12 +354,14 @@ pub(crate) enum Kind {
     /// not a prototype (whose slot writes must invalidate dependents), which
     /// its shapes already prove: they come from store handlers, which no
     /// prototype shape receives, and a shape's state never changes.
-    /// `object_proved` marks input0 as already proved an ordinary object on
-    /// every path here, leaving only the shape compare.
+    /// The compare reads input0's map word (`otter_gc::cell_map`), which no
+    /// cell other than an object of one of these shapes holds; `cell_proved`
+    /// marks input0 as already proved a heap cell on every path here,
+    /// leaving one load and the compares.
     CheckShapes {
         shapes: SmallVec<[u32; 4]>,
         writable: bool,
-        object_proved: bool,
+        cell_proved: bool,
     },
     /// Eager deopt unless the int32 index input0 lies in `0..input1`, where
     /// input1 is a `Word` element count.

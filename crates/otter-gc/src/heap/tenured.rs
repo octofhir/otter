@@ -173,6 +173,7 @@ impl GcHeap {
                 );
             }
             initialize(&mut *payload_ptr);
+            crate::cell_map::debug_check_map_word(payload_ptr);
             let marking = &mut self.marking;
             let remembered = &mut self.remembered_parents;
             T::trace_slots(payload_ptr, &mut |slot| {

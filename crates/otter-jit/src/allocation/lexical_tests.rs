@@ -91,18 +91,20 @@ fn fixture_view() -> JitCompileSnapshot {
         .expect("snapshot of the actual linked function");
     let layout = view.closure_call_layout;
     // The plain closure initializes exactly four disjoint physical words;
-    // bound words follow them. The flags share the call-header word only.
+    // bound words follow them. The rare handle shares the map word's word
+    // and the flags share the call-header word.
     let ranges = [
         (0, otter_gc::header::HEADER_SIZE as u32),
+        (layout.map_byte, 8),
         (layout.function_id_byte, 8),
         (layout.context_byte, 8),
-        (layout.rare_byte, 8),
     ];
     for pair in ranges.windows(2) {
         assert_eq!(pair[0].0 + pair[0].1, pair[1].0);
     }
+    assert_eq!(layout.rare_byte, layout.map_byte + 4);
     assert_eq!(layout.flags_byte, layout.function_id_byte + 4);
-    assert_eq!(layout.rare_byte + 8, JIT_CLOSURE_CELL_BYTES);
+    assert_eq!(layout.context_byte + 8, JIT_CLOSURE_CELL_BYTES);
     assert_eq!(layout.bound_this_byte, JIT_CLOSURE_CELL_BYTES);
     assert_eq!(layout.bound_new_target_byte, layout.bound_this_byte + 8);
     view
@@ -236,6 +238,7 @@ fn execute(view: &JitCompileSnapshot, case: Construction, regs: LabRegisters, fi
             expected = vec![0; bytes as usize / 8];
             expected[0] = JIT_YOUNG_CLOSURE_HEADER_WORD | (u64::from(bytes) << 32);
             let layout = view.closure_call_layout;
+            expected[layout.map_byte as usize / 8] = otter_vm::jit::JIT_CLOSURE_MAP_RARE_WORD;
             expected[layout.function_id_byte as usize / 8] = plan.call_word
                 | if arrow && new_target {
                     JitClosureAllocationPlan::bound_new_target_word()

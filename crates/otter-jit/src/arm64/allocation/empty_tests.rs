@@ -124,11 +124,14 @@ fn probe(
         assert_eq!(words[1], header);
         let mut expected = vec![0u64; bytes as usize / 8];
         expected[0] = header;
-        if let EmptyLiteralLayout::Object(plan) = layout {
-            expected[plan.shape_byte as usize / 8] = u64::from(plan.shape);
-            for byte in plan.initial_value_bytes {
-                expected[byte as usize / 8] = VALUE_UNDEFINED;
+        match layout {
+            EmptyLiteralLayout::Object(plan) => {
+                expected[plan.shape_byte as usize / 8] = u64::from(plan.shape);
+                for byte in plan.initial_value_bytes {
+                    expected[byte as usize / 8] = VALUE_UNDEFINED;
+                }
             }
+            EmptyLiteralLayout::Array(plan) => expected[1] = plan.map_word,
         }
         assert_eq!(&words[1..words.len() - 1], expected);
     } else {

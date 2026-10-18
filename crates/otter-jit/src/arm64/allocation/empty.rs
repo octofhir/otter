@@ -84,8 +84,10 @@ pub(super) fn emit_initialize_empty(
                 dynasm!(ops ; .arch aarch64 ; str x16, [X(candidate), byte]);
             }
         }
-        EmptyLiteralLayout::Array(_) => {
-            for byte in (8..cell_bytes).step_by(8) {
+        EmptyLiteralLayout::Array(plan) => {
+            emit_load_u64(ops, 16, plan.map_word);
+            dynasm!(ops ; .arch aarch64 ; str x16, [X(candidate), 8]);
+            for byte in (16..cell_bytes).step_by(8) {
                 dynasm!(ops ; .arch aarch64 ; str xzr, [X(candidate), byte]);
             }
         }

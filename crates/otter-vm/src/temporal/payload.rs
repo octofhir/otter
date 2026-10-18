@@ -128,8 +128,11 @@ pub const TEMPORAL_BODY_TYPE_TAG: u8 = 0x27;
 /// `temporal_rs::*` records hold no GC references; the derive emits
 /// an empty `trace_slots_safe` body.
 #[derive(Debug, Clone, otter_macros::Pelt)]
-#[pelt(tag = TEMPORAL_BODY_TYPE_TAG)]
+#[pelt(tag = TEMPORAL_BODY_TYPE_TAG, value_cell)]
+#[repr(C)]
 pub struct TemporalBody {
+    /// Map word: this value cell's type, at body offset 0.
+    pub(crate) map: otter_gc::cell_map::TypeMap<TEMPORAL_BODY_TYPE_TAG>,
     /// Variant-typed Temporal payload.
     ///
     /// Boxed so the body stays 8-byte aligned. `temporal_rs::Instant`
@@ -170,6 +173,7 @@ pub fn alloc_temporal(
     payload: TemporalPayload,
 ) -> Result<TemporalHandle, otter_gc::OutOfMemory> {
     heap.alloc_old(TemporalBody {
+        map: otter_gc::cell_map::TypeMap::NEW,
         payload: Box::new(payload),
         expando: None,
         prototype_override: None,

@@ -32,9 +32,13 @@ pub const CLASS_CONSTRUCTOR_BODY_TYPE_TAG: u8 = 0x1f;
 /// Holds the callable, the instance prototype, and the static-side
 /// object the class exposes.
 #[derive(Debug, Pelt)]
-#[pelt(tag = CLASS_CONSTRUCTOR_BODY_TYPE_TAG)]
+#[pelt(tag = CLASS_CONSTRUCTOR_BODY_TYPE_TAG, value_cell)]
 #[repr(C)]
 pub struct ClassConstructorBody {
+    /// Map word: this value cell's type, at body offset 0.
+    pub(crate) map: otter_gc::cell_map::TypeMap<CLASS_CONSTRUCTOR_BODY_TYPE_TAG>,
+    /// Receiver layouts belong to the wrapper, not its callable template.
+    pub(crate) constructor_layouts: crate::constructor_layout::ConstructorLayout,
     /// The actual callable (`Value::Function` / `Value::Closure` /
     /// `Value::NativeFunction`) the runtime invokes for `new C(...)`
     /// or `super(...)`. Constructed by the compiler's class-lowering
@@ -55,8 +59,6 @@ pub struct ClassConstructorBody {
     /// prototype keeps the parallel walk-able chain; this slot
     /// preserves identity for getPrototypeOf / super-base checks.
     pub ctor_proto: Value,
-    /// Receiver layouts belong to the wrapper, not its callable template.
-    pub(crate) constructor_layouts: crate::constructor_layout::ConstructorLayout,
 }
 
 impl ClassConstructorBody {
@@ -126,6 +128,7 @@ impl ClassConstructor {
         Ok(Self {
             inner: heap.alloc_with_roots(
                 ClassConstructorBody {
+                    map: otter_gc::cell_map::TypeMap::NEW,
                     ctor,
                     prototype,
                     statics,

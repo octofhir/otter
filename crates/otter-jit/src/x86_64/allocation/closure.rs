@@ -75,6 +75,6 @@ pub(crate) fn emit_closure(
         dynasm!(ops ; .arch x64 ; mov [Rq(regs.candidate) + layout.bound_this_byte as i32], Rq(regs.scratch));
     }
     emit_value(ops, regs.scratch, values[0]);
-    dynasm!(ops ; .arch x64 ; mov [Rq(regs.candidate) + layout.context_byte as i32], Rq(regs.scratch) ; mov QWORD [Rq(regs.candidate) + layout.rare_byte as i32], 0);
+    dynasm!(ops ; .arch x64 ; mov [Rq(regs.candidate) + layout.context_byte as i32], Rq(regs.scratch) ; mov QWORD [Rq(regs.candidate) + layout.map_byte as i32], JIT_CLOSURE_MAP_RARE_WORD as i32);
     emit_publish(ops, regs);
 }

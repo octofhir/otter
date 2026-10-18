@@ -71,6 +71,14 @@ pub const SHARED_ARRAY_BUFFER_BODY_TYPE_TAG: u8 = 0x2d;
 #[derive(Debug)]
 #[repr(C)]
 pub struct LocalArrayBufferBodyGc {
+    /// Map word: this value cell's type, at body offset 0.
+    pub(crate) map: otter_gc::cell_map::TypeMap<LOCAL_ARRAY_BUFFER_BODY_TYPE_TAG>,
+    /// `true` after detach / transfer; once set, stays set per spec.
+    pub detached: bool,
+    /// §25.1.3.5 `[[ArrayBufferDetachKey]]` is set: a host owns the storage
+    /// (an asm.js module's heap aliases it as WebAssembly memory), so every
+    /// DetachArrayBuffer throws a `TypeError` and the bytes never move.
+    pub detach_key: bool,
     /// Raw bytes. Empty when detached.
     ///
     /// This Rust container is deliberately not part of any native
@@ -89,12 +97,6 @@ pub struct LocalArrayBufferBodyGc {
     /// Always-current `bytes.len()`, mirrored next to the base pointer
     /// so a compiled bounds check is one load.
     byte_len: std::cell::Cell<usize>,
-    /// `true` after detach / transfer; once set, stays set per spec.
-    pub detached: bool,
-    /// §25.1.3.5 `[[ArrayBufferDetachKey]]` is set: a host owns the storage
-    /// (an asm.js module's heap aliases it as WebAssembly memory), so every
-    /// DetachArrayBuffer throws a `TypeError` and the bytes never move.
-    pub detach_key: bool,
     /// `Some(n)` for a resizable buffer; `None` for a fixed-length
     /// buffer.
     pub max_byte_length: Option<usize>,
@@ -188,8 +190,12 @@ impl LocalArrayBufferBodyGc {
     }
 }
 
+const _: () = assert!(std::mem::offset_of!(LocalArrayBufferBodyGc, map) == 0);
+
 impl otter_gc::SafeTraceable for LocalArrayBufferBodyGc {
     const TYPE_TAG: u8 = LOCAL_ARRAY_BUFFER_BODY_TYPE_TAG;
+    const MAP_WORD: otter_gc::cell_map::MapWord =
+        otter_gc::cell_map::MapWord::of_type(LOCAL_ARRAY_BUFFER_BODY_TYPE_TAG);
 
     fn trace_slots_safe(&mut self, visitor: &mut otter_gc::raw::SlotVisitor<'_>) {
         if let Some(expando) = &mut self.expando {
@@ -242,6 +248,7 @@ fn alloc_local_storage(
     external: Option<otter_gc::ExternalMemory>,
 ) -> Result<LocalArrayBufferHandle, otter_gc::OutOfMemory> {
     let handle = heap.alloc_old(LocalArrayBufferBodyGc {
+        map: otter_gc::cell_map::TypeMap::NEW,
         bytes,
         data: std::cell::Cell::new(std::ptr::null_mut()),
         byte_len: std::cell::Cell::new(0),
@@ -273,7 +280,10 @@ fn fits_heap_cap(heap: &otter_gc::GcHeap, bytes: usize) -> bool {
 /// host threads (`Mutex<Vec<u8>>`). The body owns the
 /// `Arc<SharedBody>` as plain Rust data.
 #[derive(Debug)]
+#[repr(C)]
 pub struct SharedArrayBufferBodyGc {
+    /// Map word: this value cell's type, at body offset 0.
+    pub(crate) map: otter_gc::cell_map::TypeMap<SHARED_ARRAY_BUFFER_BODY_TYPE_TAG>,
     /// Shared backing store. `Arc` survives the GC body's lifetime.
     pub inner: Arc<SharedBody>,
     /// Lazy expando bag for ordinary own properties (`sab.constructor
@@ -286,8 +296,12 @@ pub struct SharedArrayBufferBodyGc {
     pub prototype_override: Option<crate::Value>,
 }
 
+const _: () = assert!(std::mem::offset_of!(SharedArrayBufferBodyGc, map) == 0);
+
 impl otter_gc::SafeTraceable for SharedArrayBufferBodyGc {
     const TYPE_TAG: u8 = SHARED_ARRAY_BUFFER_BODY_TYPE_TAG;
+    const MAP_WORD: otter_gc::cell_map::MapWord =
+        otter_gc::cell_map::MapWord::of_type(SHARED_ARRAY_BUFFER_BODY_TYPE_TAG);
 
     fn trace_slots_safe(&mut self, visitor: &mut otter_gc::raw::SlotVisitor<'_>) {
         if let Some(expando) = &mut self.expando {
@@ -323,6 +337,7 @@ pub fn alloc_shared_array_buffer(
     inner: Arc<SharedBody>,
 ) -> Result<SharedArrayBufferHandle, otter_gc::OutOfMemory> {
     heap.alloc_old(SharedArrayBufferBodyGc {
+        map: otter_gc::cell_map::TypeMap::NEW,
         inner,
         expando: None,
         prototype_override: None,

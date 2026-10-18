@@ -76,6 +76,7 @@
 mod admission;
 mod checkpoint;
 mod code_cache;
+pub use code_cache::PreparedScript;
 mod commonjs;
 mod completion_admission;
 mod entry_file;
@@ -1847,6 +1848,30 @@ pub(crate) enum CommonJsRouting {
 /// A configured compile hook wins over embedded builtin bytecode, exactly as
 /// it does for build-produced bootstrap scripts: it receives the identical
 /// wrapper text under the builtin's URL.
+/// The default compiler's output for the classic script `source`: pure
+/// work over the text, which any thread can do.
+pub(crate) fn compile_classic_script(
+    source: &SourceInput,
+    specifier: &str,
+) -> Result<CompiledModule, OtterError> {
+    if source.allow_top_level_await {
+        // Embedder snippet APIs opt into module-grade top-level `await`
+        // while staying on the classic-script pipeline.
+        let bytecode =
+            compile_script_source_with_top_level_await(&source.text, source.kind, specifier)
+                .map_err(|err| map_compile_error(err, specifier))?;
+        return CompiledModule::from_bytecode(bytecode)
+            .map_err(|err| map_compile_error(err, specifier));
+    }
+    otter_compiler::compile_script_source_to_module_with_options(
+        &source.text,
+        source.kind,
+        specifier,
+        LAZY_FUNCTIONS,
+    )
+    .map_err(|err| map_compile_error(err, specifier))
+}
+
 fn standard_eval_hook(
     compile_hook: Option<std::sync::Arc<dyn RuntimeCompileHook>>,
     code_cache: hooks::CodeCacheSlot,
@@ -6270,6 +6295,14 @@ impl Runtime {
         self.run_bootstrap_module(Err(module), sources, start)
     }
 
+    /// Count a compile made away from this runtime and record its source
+    /// maps, as [`Self::compile_source`] does for its own.
+    pub(crate) fn note_script_compiled(&self, compiled: &CompiledModule) {
+        self.scripts_compiled.set(self.scripts_compiled.get() + 1);
+        self.source_maps
+            .record_compiled_metadata(&compiled.metadata);
+    }
+
     fn compile_source(
         &self,
         source: &SourceInput,
@@ -6290,22 +6323,8 @@ impl Runtime {
                 text,
             };
             hook.compile(RuntimeCompileRequest { source: &resolved })?
-        } else if source.allow_top_level_await {
-            // Embedder snippet APIs opt into module-grade top-level
-            // `await` while staying on the classic-script pipeline.
-            let bytecode =
-                compile_script_source_with_top_level_await(&source.text, source.kind, specifier)
-                    .map_err(|err| map_compile_error(err, specifier))?;
-            CompiledModule::from_bytecode(bytecode)
-                .map_err(|err| map_compile_error(err, specifier))?
         } else {
-            otter_compiler::compile_script_source_to_module_with_options(
-                &source.text,
-                source.kind,
-                specifier,
-                LAZY_FUNCTIONS,
-            )
-            .map_err(|err| map_compile_error(err, specifier))?
+            compile_classic_script(source, specifier)?
         };
         self.source_maps
             .record_compiled_metadata(&compiled.metadata);

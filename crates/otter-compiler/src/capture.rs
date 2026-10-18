@@ -49,6 +49,27 @@ type NameId = u32;
 
 /// Capture-relevant facts of one scope: a function body, a class static
 /// block, or the compile unit's top level.
+/// A finished set of name ids: sorted, searched by bisection. A scope's
+/// facts are written once, when the walk leaves it, and read many times.
+#[derive(Debug, Default)]
+struct IdSet(Box<[NameId]>);
+
+impl IdSet {
+    fn of(ids: impl Iterator<Item = NameId>) -> Self {
+        let mut ids: Vec<NameId> = ids.collect();
+        ids.sort_unstable();
+        Self(ids.into_boxed_slice())
+    }
+
+    fn contains(&self, id: &NameId) -> bool {
+        self.0.binary_search(id).is_ok()
+    }
+
+    fn iter(&self) -> impl Iterator<Item = &NameId> + '_ {
+        self.0.iter()
+    }
+}
+
 #[derive(Debug, Default)]
 pub(crate) struct ScopeFacts {
     /// Names declared at any block depth of the scope's own code (parameters,
@@ -56,12 +77,12 @@ pub(crate) struct ScopeFacts {
     own: Vec<NameId>,
     /// Names referenced from functions nested in the scope (and from class
     /// field initializers and static blocks, which lower to nested frames).
-    inner: FxHashSet<NameId>,
+    inner: IdSet,
     /// A direct eval in the scope or in a nested function that does not
     /// rebind `eval`.
     nested_eval: bool,
     /// Names referenced inside the scope that it does not bind.
-    escape: FxHashSet<NameId>,
+    escape: IdSet,
     /// `nested_eval`, unless the scope binds `eval`.
     escape_eval: bool,
     /// A direct eval in the parameter list's own code.
@@ -78,10 +99,10 @@ pub(crate) struct ScopeFacts {
     arguments_escapes: bool,
     /// Names assigned in the scope's code or in a nested scope that does not
     /// bind them, by spelling (block shadowing only over-reports).
-    assigned: FxHashSet<NameId>,
+    assigned: IdSet,
     /// The part of `assigned` the scope does not bind: what it hands its
     /// ancestors.
-    escape_writes: FxHashSet<NameId>,
+    escape_writes: IdSet,
     /// Source range of the parameters and body.
     range: (u32, u32),
 }
@@ -185,7 +206,8 @@ impl CaptureFacts {
         for stmt in stmts {
             builder.visit_statement(stmt);
         }
-        let unit = builder.frames.pop().expect("unit frame");
+        let mut unit = builder.frames.pop().expect("unit frame");
+        unit.facts.inner = IdSet::of(unit.inner.iter().copied());
         let mut facts = builder.facts;
         facts.unit = unit.facts;
         for positions in facts.references.values_mut() {
@@ -372,6 +394,8 @@ struct Frame {
     vars: FxHashSet<NameId>,
     /// Names assigned in the scope and not bound by a nested scope.
     writes: FxHashSet<NameId>,
+    /// Names nested functions reference, becoming `facts.inner`.
+    inner: FxHashSet<NameId>,
     class_depth: u32,
     class_body_depth: u32,
     /// Inside a class field initializer or computed field key.
@@ -389,6 +413,7 @@ impl Frame {
             bound: FxHashSet::default(),
             vars: FxHashSet::default(),
             writes: FxHashSet::default(),
+            inner: FxHashSet::default(),
             class_depth: 0,
             class_body_depth: 0,
             field_depth: 0,
@@ -406,6 +431,8 @@ struct Builder<'s> {
     arguments_read: Option<u32>,
     /// Functions whose bodies were left out of the text, by span start.
     skips: Option<&'s crate::preparse::SkipTable>,
+    /// Finished frames whose set allocations the next scopes reuse.
+    spare_frames: Vec<Frame>,
     /// The function node being walked, innermost last.
     function_stack: Vec<u32>,
     /// Span starts of functions that are method or accessor values.
@@ -449,8 +476,8 @@ impl Builder<'_> {
         body: &FunctionBody<'_>,
         skipped: Option<(u32, crate::preparse::SkippedFacts<'_>)>,
     ) {
-        self.frames
-            .push(Frame::new(kind, std::ptr::from_ref(body) as usize));
+        let frame = self.fresh_frame(kind, std::ptr::from_ref(body) as usize);
+        self.frames.push(frame);
         // A skipped body's references to names around it sit at the
         // function's start: every range query that covers the function
         // covers them.
@@ -547,24 +574,55 @@ impl Builder<'_> {
             frame.bound.extend(frame.vars.iter().copied());
         }
         frame.refs.retain(|id| !frame.bound.contains(id));
-        frame.facts.escape_writes = frame
-            .writes
-            .iter()
-            .copied()
-            .filter(|id| !frame.bound.contains(id))
-            .collect();
+        frame.facts.escape_writes = IdSet::of(
+            frame
+                .writes
+                .iter()
+                .copied()
+                .filter(|id| !frame.bound.contains(id)),
+        );
         parent
             .writes
             .extend(frame.facts.escape_writes.iter().copied());
-        frame.facts.assigned = std::mem::take(&mut frame.writes);
+        frame.facts.assigned = IdSet::of(frame.writes.iter().copied());
         let escape_eval = frame.facts.nested_eval && !frame.bound.contains(&EVAL);
         parent.refs.extend(frame.refs.iter().copied());
-        parent.facts.inner.extend(frame.refs.iter().copied());
+        parent.inner.extend(frame.refs.iter().copied());
         parent.facts.nested_eval |= escape_eval;
-        frame.facts.escape = frame.refs;
+        frame.facts.escape = IdSet::of(frame.refs.iter().copied());
+        frame.facts.inner = IdSet::of(frame.inner.iter().copied());
         frame.facts.escape_eval = escape_eval;
         frame.facts.range = range;
-        self.facts.scopes.insert(frame.key, frame.facts);
+        self.facts
+            .scopes
+            .insert(frame.key, std::mem::take(&mut frame.facts));
+        self.recycle(frame);
+    }
+
+    /// A frame for a new scope, reusing a finished frame's set allocations.
+    fn fresh_frame(&mut self, kind: FrameKind, key: usize) -> Frame {
+        match self.spare_frames.pop() {
+            Some(mut frame) => {
+                frame.kind = kind;
+                frame.key = key;
+                frame
+            }
+            None => Frame::new(kind, key),
+        }
+    }
+
+    /// Return a finished frame's sets, emptied, for the next scope.
+    fn recycle(&mut self, mut frame: Frame) {
+        frame.refs.clear();
+        frame.bound.clear();
+        frame.vars.clear();
+        frame.writes.clear();
+        frame.inner.clear();
+        frame.class_depth = 0;
+        frame.class_body_depth = 0;
+        frame.field_depth = 0;
+        frame.in_params = false;
+        self.spare_frames.push(frame);
     }
 
     /// `arguments` read in the innermost scope reaches through arrows to the
@@ -676,10 +734,11 @@ impl<'a> Visit<'a> for Builder<'_> {
     }
 
     fn visit_static_block(&mut self, it: &oxc_ast::ast::StaticBlock<'a>) {
-        self.frames.push(Frame::new(
+        let frame = self.fresh_frame(
             FrameKind::StaticBlock,
             std::ptr::from_ref(&it.body) as usize,
-        ));
+        );
+        self.frames.push(frame);
         for stmt in &it.body {
             self.visit_statement(stmt);
         }
@@ -818,7 +877,7 @@ impl<'a> Visit<'a> for Builder<'_> {
         let frame = self.top();
         frame.refs.insert(id);
         if frame.field_depth > 0 {
-            frame.facts.inner.insert(id);
+            frame.inner.insert(id);
         }
         if id == ARGUMENTS {
             let member_read = self.arguments_read.take() == Some(it.span.start);

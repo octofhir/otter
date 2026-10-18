@@ -172,6 +172,50 @@ where
     }
 }
 
+/// Where an embedder keeps the compiled form of code the engine itself
+/// meets at run time: the text a page hands `eval`. The bytes are the
+/// engine's own, checked by it before use, and named by a key the engine
+/// chooses; a key holds one value, replaced by the next store.
+pub trait RuntimeCodeCacheHook: Send + Sync + 'static {
+    /// The bytes last stored under `key`, if any.
+    fn load(&self, key: &str) -> Option<Vec<u8>>;
+    /// Keep `bytes` under `key`.
+    fn store(&self, key: &str, bytes: Vec<u8>);
+}
+
+/// The slot a runtime's code-cache hook lives in: set on a live runtime,
+/// read by its eval compiles.
+#[derive(Clone, Default)]
+pub(crate) struct CodeCacheSlot(
+    std::sync::Arc<std::sync::RwLock<Option<std::sync::Arc<dyn RuntimeCodeCacheHook>>>>,
+);
+
+impl std::fmt::Debug for CodeCacheSlot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("CodeCacheSlot")
+            .field(&self.get().is_some())
+            .finish()
+    }
+}
+
+impl CodeCacheSlot {
+    /// The hook, when one is set.
+    pub(crate) fn get(&self) -> Option<std::sync::Arc<dyn RuntimeCodeCacheHook>> {
+        self.0
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Set or clear the hook.
+    pub(crate) fn set(&self, hook: Option<std::sync::Arc<dyn RuntimeCodeCacheHook>>) {
+        *self
+            .0
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = hook;
+    }
+}
+
 /// Runtime-owned job enqueue hook.
 pub trait RuntimeJobHook: Send + Sync + 'static {
     /// Enqueue a runtime job.

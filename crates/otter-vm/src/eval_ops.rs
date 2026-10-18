@@ -296,7 +296,11 @@ impl Interpreter {
         if is_native_syntax_hint(&source) {
             return Ok(Value::undefined());
         }
-        let module = self.compile_escaped_source(&source, options)?;
+        let (module, kept) = self.compile_escaped_source_kept(&source, options)?;
+        if let Some(kept) = kept {
+            let url = module.module.clone();
+            self.keep_script_cache(&url, kept);
+        }
         // Linking (not a standalone context) keeps the eval chunk's
         // function ids global, so closures and classes escaping the
         // eval stay callable from any later frame.
@@ -467,7 +471,8 @@ impl Interpreter {
         // so frames captured for `Error.prototype.stack` report the file
         // rather than the synthetic eval name.
         let context = match compiled {
-            crate::CompiledEvalSource::Fresh(mut module) => {
+            crate::CompiledEvalSource::Fresh(mut module)
+            | crate::CompiledEvalSource::Kept { mut module, .. } => {
                 module.module = module_url.to_string();
                 for function in &mut module.functions {
                     function.module_url = module_url.to_string();
@@ -618,9 +623,20 @@ impl Interpreter {
         source: &str,
         options: EvalCompileOptions,
     ) -> Result<BytecodeModule, VmError> {
-        let mut module = self.compile_eval_source(source, options)?.into_module();
+        self.compile_escaped_source_kept(source, options)
+            .map(|(module, _)| module)
+    }
+
+    /// [`Self::compile_escaped_source`] with what the host's code cache
+    /// holds for the module, when it keeps one.
+    fn compile_escaped_source_kept(
+        &self,
+        source: &str,
+        options: EvalCompileOptions,
+    ) -> Result<(BytecodeModule, Option<crate::KeptScript>), VmError> {
+        let (mut module, kept) = self.compile_eval_source(source, options)?.into_parts();
         crate::eval_source::decode_module(&mut module);
-        Ok(module)
+        Ok((module, kept))
     }
 
     fn compile_eval_source(

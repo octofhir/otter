@@ -1747,15 +1747,32 @@ pub enum CompiledEvalSource {
     /// A module the host already verified, such as a compile-cache hit. The
     /// VM links it without inspecting its wordcode again.
     Verified(otter_bytecode::VerifiedBytecodeModule),
+    /// A module, fresh or read back, whose code the host keeps in a code
+    /// cache: the VM verifies it when linking, and keeps the bodies its
+    /// functions compile on a first call from `kept` on
+    /// ([`Interpreter::keep_script_cache`]) under the module's name.
+    Kept {
+        /// The module.
+        module: BytecodeModule,
+        /// What the code cache holds for it.
+        kept: KeptScript,
+    },
 }
 
 impl CompiledEvalSource {
     /// The module DTO, giving up any verification proof.
     #[must_use]
     pub fn into_module(self) -> BytecodeModule {
+        self.into_parts().0
+    }
+
+    /// The module DTO and, for a cached module, what its cache holds.
+    #[must_use]
+    pub fn into_parts(self) -> (BytecodeModule, Option<KeptScript>) {
         match self {
-            Self::Fresh(module) => module,
-            Self::Verified(verified) => verified.into_module(),
+            Self::Fresh(module) => (module, None),
+            Self::Verified(verified) => (verified.into_module(), None),
+            Self::Kept { module, kept } => (module, Some(kept)),
         }
     }
 }

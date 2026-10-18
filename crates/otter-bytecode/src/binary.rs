@@ -226,12 +226,17 @@ pub fn decode_module_with_source(
 }
 
 /// [`decode_module`] without the verifier, for a caller that links the
-/// module next: linking verifies it, so it is verified once.
+/// module next: linking verifies it, so it is verified once. `source` is
+/// the text a detached encoding left out, as [`decode_module_with_source`]
+/// takes it.
 ///
 /// # Errors
 /// [`ModuleDecodeError::MalformedEncoding`] when `bytes` hold no module.
-pub fn decode_module_for_link(bytes: &[u8]) -> Result<BytecodeModule, ModuleDecodeError> {
-    decode_unverified_module(bytes).ok_or(ModuleDecodeError::MalformedEncoding)
+pub fn decode_module_for_link(
+    bytes: &[u8],
+    source: Option<&str>,
+) -> Result<BytecodeModule, ModuleDecodeError> {
+    decode_module_parts(bytes, source).ok_or(ModuleDecodeError::MalformedEncoding)
 }
 
 fn decode_unverified_module(bytes: &[u8]) -> Option<BytecodeModule> {

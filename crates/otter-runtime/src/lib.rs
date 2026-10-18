@@ -167,9 +167,10 @@ pub use heap_config::{
 };
 pub use hooks::{
     CapabilityRequest, RuntimeCapability, RuntimeCapabilityEvaluator, RuntimeCapabilityHook,
-    RuntimeCompileHook, RuntimeCompileRequest, RuntimeDiagnosticHook, RuntimeHooks, RuntimeJobHook,
-    RuntimeJobKind, RuntimeJobRequest, RuntimeLoadHook, RuntimeLoadRequest, RuntimeResolveHook,
-    RuntimeResolveRequest, default_check_capability, default_compile_source,
+    RuntimeCodeCacheHook, RuntimeCompileHook, RuntimeCompileRequest, RuntimeDiagnosticHook,
+    RuntimeHooks, RuntimeJobHook, RuntimeJobKind, RuntimeJobRequest, RuntimeLoadHook,
+    RuntimeLoadRequest, RuntimeResolveHook, RuntimeResolveRequest, default_check_capability,
+    default_compile_source,
 };
 pub use ipc::{CarriedHandles, IpcChannel, IpcEvent, IpcSendError};
 pub use otter_compiler::{
@@ -1848,6 +1849,7 @@ pub(crate) enum CommonJsRouting {
 /// wrapper text under the builtin's URL.
 fn standard_eval_hook(
     compile_hook: Option<std::sync::Arc<dyn RuntimeCompileHook>>,
+    code_cache: hooks::CodeCacheSlot,
 ) -> otter_vm::EvalHook {
     std::sync::Arc::new(move |source: &str, options: EvalCompileOptions| {
         if let Some(unit) = options.embedded {
@@ -1867,6 +1869,14 @@ fn standard_eval_hook(
             )
             .map(otter_vm::CompiledEvalSource::Fresh)
             .map_err(compile_error_message);
+        }
+        if compile_hook.is_none()
+            && code_cache::eval_is_cacheable(source, &options)
+            && let Some(cache) = code_cache.get()
+        {
+            return code_cache::cached_eval(&*cache, source, &options, || {
+                compile_eval_with_options(source, &options).map_err(compile_error_message)
+            });
         }
         let module = compile_eval_with_options(source, &options).map_err(compile_error_message)?;
         Ok(otter_vm::CompiledEvalSource::Fresh(module))
@@ -3141,7 +3151,11 @@ impl Runtime {
         interp.set_work_budget(config.work_budget);
         // §19.4.1 / §20.2.1.1 — the eval hook is host machinery, not
         // heap state, so a restored isolate wires it fresh.
-        interp.set_eval_hook(Some(standard_eval_hook(config.hooks.shared_compile_hook())));
+        let code_cache_hook = hooks::CodeCacheSlot::default();
+        interp.set_eval_hook(Some(standard_eval_hook(
+            config.hooks.shared_compile_hook(),
+            code_cache_hook.clone(),
+        )));
         interp.set_lazy_compile_hook(Some(lazy_compile_hook()));
         if let Some(hook) = config.promise_rejection_hook.clone() {
             interp.set_promise_rejection_hook(hook);
@@ -3182,6 +3196,7 @@ impl Runtime {
         }));
         Ok(Runtime {
             interp,
+            code_cache_hook,
             scripts_compiled: std::cell::Cell::new(0),
             restored_from_snapshot: true,
             realm_owner_id: realm::next_realm_owner_id(),
@@ -3235,6 +3250,7 @@ impl Runtime {
             &package_manager,
             runtime_task_spawner.clone(),
         );
+        let code_cache_hook = hooks::CodeCacheSlot::default();
         // The interpreter owns both per-isolate heaps; the string and GC
         // allocators honor the configured cap.
         let mut interp = Interpreter::with_string_heap_cap(config.max_heap_bytes)?;
@@ -3343,7 +3359,10 @@ impl Runtime {
                 }
                 // §19.4.1 / §20.2.1.1 — wire the eval hook so `eval(src)` /
                 // `new Function(...)` reach a real parse + compile path.
-                interp.set_eval_hook(Some(standard_eval_hook(config.hooks.shared_compile_hook())));
+                interp.set_eval_hook(Some(standard_eval_hook(
+                    config.hooks.shared_compile_hook(),
+                    code_cache_hook.clone(),
+                )));
                 interp.set_lazy_compile_hook(Some(lazy_compile_hook()));
                 interp.set_jit_debug_request(config.jit_debug);
                 if let Some(factory) = &config.tracer_factory {
@@ -3362,6 +3381,7 @@ impl Runtime {
         let enforce_direct_timeout = runtime_task_spawner.is_none();
         let mut runtime = Runtime {
             interp,
+            code_cache_hook,
             scripts_compiled: std::cell::Cell::new(0),
             realm_owner_id: realm::next_realm_owner_id(),
             config,
@@ -3508,6 +3528,9 @@ impl Runtime {
 #[derive(Debug)]
 pub struct Runtime {
     interp: Interpreter,
+    /// Where the embedder keeps compiled `eval` text, once it says
+    /// ([`Self::set_code_cache_hook`]).
+    code_cache_hook: hooks::CodeCacheSlot,
     /// Script sources compiled by this runtime's classic-script path.
     scripts_compiled: std::cell::Cell<u64>,
     /// Whether this runtime came from a snapshot restore rather than a

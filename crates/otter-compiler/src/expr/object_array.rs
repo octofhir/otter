@@ -588,6 +588,14 @@ fn compile_static_object_literal(
         }
         keys.push(key);
     }
+    let value_exprs: Vec<&Expression<'_>> = obj
+        .properties
+        .iter()
+        .filter_map(|prop| match prop {
+            oxc_ast::ast::ObjectPropertyKind::ObjectProperty(prop) => Some(&prop.value),
+            oxc_ast::ast::ObjectPropertyKind::SpreadProperty(_) => None,
+        })
+        .collect();
     let mut values = Vec::with_capacity(keys.len());
     for (index, (prop, key)) in obj.properties.iter().zip(&keys).enumerate() {
         let oxc_ast::ast::ObjectPropertyKind::ObjectProperty(p) = prop else {
@@ -596,16 +604,11 @@ fn compile_static_object_literal(
         let key_span = (p.span.start, p.span.end);
         // A value naming a binding held in its own frame slot is read in
         // place when no later value assigns it: the literal reads every
-        // value register once they all are evaluated.
-        let later: Vec<&Expression<'_>> = obj.properties[index + 1..]
-            .iter()
-            .filter_map(|later| match later {
-                oxc_ast::ast::ObjectPropertyKind::ObjectProperty(later) => Some(&later.value),
-                oxc_ast::ast::ObjectPropertyKind::SpreadProperty(_) => None,
-            })
-            .collect();
+        // value register once they all are evaluated. Every property is a
+        // plain one here, so the later values are the rest of the list.
         if !p.method
-            && let Some(reg) = crate::expr::borrowed_operand_before(cx, &p.value, &later)
+            && let Some(reg) =
+                crate::expr::borrowed_operand_before(cx, &p.value, &value_exprs[index + 1..])
         {
             values.push(reg);
             continue;

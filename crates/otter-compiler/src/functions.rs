@@ -66,14 +66,12 @@ pub(crate) struct FieldInjection<'r, 'a> {
 pub(crate) struct FunctionSpec<'r, 'a> {
     pub(crate) name: &'r str,
     pub(crate) params: &'r oxc_ast::ast::FormalParameters<'a>,
-    pub(crate) body: Option<&'r oxc_ast::ast::FunctionBody<'a>>,
+    pub(crate) body: Option<crate::body::Body<'r, 'a>>,
     pub(crate) span: (u32, u32),
     pub(crate) is_async: bool,
     pub(crate) is_generator: bool,
     pub(crate) force_strict: bool,
     pub(crate) is_arrow: bool,
-    /// Arrow with a concise expression body.
-    pub(crate) arrow_expression: bool,
     /// Named function expression: bind the self name (§15.2.5 funcEnv).
     pub(crate) nfe_self: bool,
     pub(crate) fields: Option<FieldInjection<'r, 'a>>,
@@ -95,13 +93,12 @@ pub(crate) fn compile_function_full(
         FunctionSpec {
             name,
             params,
-            body: body.as_deref(),
+            body: body.as_deref().map(crate::body::Body::Block),
             span,
             is_async,
             is_generator,
             force_strict,
             is_arrow: false,
-            arrow_expression: false,
             nfe_self: false,
             fields: None,
         },
@@ -124,13 +121,12 @@ pub(crate) fn compile_named_function_expression(
         FunctionSpec {
             name,
             params,
-            body: body.as_deref(),
+            body: body.as_deref().map(crate::body::Body::Block),
             span,
             is_async,
             is_generator,
             force_strict: false,
             is_arrow: false,
-            arrow_expression: false,
             nfe_self: true,
             fields: None,
         },
@@ -149,13 +145,12 @@ pub(crate) fn compile_arrow_function(
         FunctionSpec {
             name: "<arrow>",
             params: &arrow.params,
-            body: Some(&arrow.body),
+            body: Some(crate::body::Body::Arrow(&arrow.body)),
             span,
             is_async: arrow.r#async,
             is_generator: false,
             force_strict: false,
             is_arrow: true,
-            arrow_expression: arrow.expression,
             nfe_self: false,
             fields: None,
         },
@@ -189,7 +184,6 @@ pub(crate) fn compile_function_impl(
         is_generator,
         force_strict,
         is_arrow,
-        arrow_expression,
         nfe_self,
         fields,
     } = spec;
@@ -341,7 +335,7 @@ pub(crate) fn compile_function_impl(
     let lexical_arguments = !has_param_expressions
         && body.is_some_and(|b| {
             let mut names: Vec<(String, bool)> = Vec::new();
-            hoist_lexical_names(&b.statements, &mut names);
+            hoist_lexical_names(b.statements(), &mut names);
             names.iter().any(|(name, _)| name == "arguments")
         });
     let body_needs_arguments_object = !is_arrow
@@ -462,8 +456,6 @@ pub(crate) fn compile_function_impl(
             body,
             span,
             is_generator,
-            is_arrow,
-            arrow_expression,
             function_is_strict,
             has_param_expressions,
             allow_duplicate_formals,
@@ -520,7 +512,7 @@ pub(crate) fn compile_function_impl(
         slot.is_arrow = is_arrow;
         slot.is_derived_constructor = hinted_derived_ctor;
         slot.needs_arguments = needs_arguments;
-        slot.asm_module = body.is_some_and(|body| {
+        slot.asm_module = body.and_then(crate::body::Body::block).is_some_and(|body| {
             body.directives
                 .iter()
                 .any(|directive| directive.directive.as_str() == "use asm")
@@ -603,11 +595,9 @@ fn push_lazy_function(parent: &mut Compiler, record: LazyRecord<'_, '_>) -> Clos
 struct FunctionScopes<'r, 'a> {
     name: &'r str,
     params: &'r oxc_ast::ast::FormalParameters<'a>,
-    body: Option<&'r oxc_ast::ast::FunctionBody<'a>>,
+    body: Option<crate::body::Body<'r, 'a>>,
     span: (u32, u32),
     is_generator: bool,
-    is_arrow: bool,
-    arrow_expression: bool,
     function_is_strict: bool,
     has_param_expressions: bool,
     allow_duplicate_formals: bool,
@@ -764,24 +754,16 @@ fn compile_function_scopes(
                 ArgumentBindingStorage::Register { .. } => None,
             });
 
-    if f.is_arrow && f.arrow_expression {
-        let body = f.body.expect("arrow body");
-        let stmt = body.statements.first().ok_or(CompileError::Unsupported {
-            node: "ArrowFunction: empty expression body".to_string(),
-            span,
-        })?;
-        let Statement::ExpressionStatement(es) = stmt else {
-            return Err(CompileError::Unsupported {
-                node: "ArrowFunction: malformed expression body".to_string(),
-                span,
-            });
+    if let Some(expression) = f.body.and_then(crate::body::Body::expression) {
+        let inner_span = {
+            let span = oxc_span::GetSpan::span(expression);
+            (span.start, span.end)
         };
-        let inner_span = (es.span.start, es.span.end);
         // §15.10.2 — a strict non-async concise body is in tail position.
         if parent.is_strict && parent.proper_tail_calls {
-            crate::statements::compile_tail_return(parent, &es.expression, inner_span)?;
+            crate::statements::compile_tail_return(parent, expression, inner_span)?;
         } else {
-            let reg = compile_expr(parent, &es.expression, inner_span)?;
+            let reg = compile_expr(parent, expression, inner_span)?;
             parent.emit(Op::ReturnValue, [Operand::Register(reg)], inner_span);
         }
         return Ok(mapped_argument_bindings);
@@ -805,7 +787,8 @@ fn compile_function_scopes(
         }
     }
     let mut ends_with_return = false;
-    if let Some(body) = f.body {
+    // A concise arrow body returned above: what is left is a block.
+    if let Some(body) = f.body.and_then(crate::body::Body::block) {
         let mut var_names: Vec<String> = Vec::new();
         hoist_var_names(&body.statements, &mut var_names);
         // §B.3.3.1 — parameter names and "arguments" block the sloppy

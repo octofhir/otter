@@ -76,8 +76,8 @@ fn hoist_var_names_in_stmt_at<'a>(stmt: &Statement<'a>, out: &mut Vec<String>, t
         // bare `var x`. The export side-effect (mirroring into
         // `module_env`) runs at the source position via the
         // export arm; here we only need to surface the name.
-        Statement::ExportNamedDeclaration(decl) if !decl.export_kind.is_type() => {
-            if let Some(oxc_ast::ast::Declaration::VariableDeclaration(v)) = &decl.declaration
+        Statement::ExportDeclaration(decl) => {
+            if let oxc_ast::ast::Declaration::VariableDeclaration(v) = &decl.declaration
                 && matches!(v.kind, oxc_ast::ast::VariableDeclarationKind::Var)
             {
                 for declarator in v.declarations.iter() {
@@ -242,25 +242,23 @@ pub(crate) fn hoist_lexical_names(stmts: &[Statement<'_>], out: &mut Vec<(String
             // `export var x` is a `var`-scoped binding picked up
             // by [`hoist_var_names_in_stmt`]; we explicitly skip
             // it here so the name doesn't end up double-bound.
-            Statement::ExportNamedDeclaration(decl) if !decl.export_kind.is_type() => {
-                match &decl.declaration {
-                    Some(oxc_ast::ast::Declaration::VariableDeclaration(v))
-                        if matches!(
-                            v.kind,
-                            oxc_ast::ast::VariableDeclarationKind::Let
-                                | oxc_ast::ast::VariableDeclarationKind::Const
-                        ) =>
-                    {
-                        collect_lexical_var_names(v, out);
-                    }
-                    Some(oxc_ast::ast::Declaration::ClassDeclaration(c)) => {
-                        if let Some(id) = &c.id {
-                            out.push((id.name.as_str().to_string(), false));
-                        }
-                    }
-                    _ => {}
+            Statement::ExportDeclaration(decl) => match &decl.declaration {
+                oxc_ast::ast::Declaration::VariableDeclaration(v)
+                    if matches!(
+                        v.kind,
+                        oxc_ast::ast::VariableDeclarationKind::Let
+                            | oxc_ast::ast::VariableDeclarationKind::Const
+                    ) =>
+                {
+                    collect_lexical_var_names(v, out);
                 }
-            }
+                oxc_ast::ast::Declaration::ClassDeclaration(c) => {
+                    if let Some(id) = &c.id {
+                        out.push((id.name.as_str().to_string(), false));
+                    }
+                }
+                _ => {}
+            },
             // `export default class C {}` and `export default
             // expression` do not contribute a top-level lexical
             // name in the foundation slice — the value lives on
@@ -468,8 +466,8 @@ pub(crate) fn hoist_function_declarations_from(
     ) -> Option<&'b oxc_ast::ast::Function<'a>> {
         match stmt {
             Statement::FunctionDeclaration(f) if !f.declare => Some(f),
-            Statement::ExportNamedDeclaration(decl) if !decl.export_kind.is_type() => {
-                if let Some(oxc_ast::ast::Declaration::FunctionDeclaration(f)) = &decl.declaration
+            Statement::ExportDeclaration(decl) => {
+                if let oxc_ast::ast::Declaration::FunctionDeclaration(f) = &decl.declaration
                     && !f.declare
                 {
                     Some(f)
@@ -694,7 +692,7 @@ pub(crate) fn hoist_function_declarations_from(
 /// callee when `apply` resolves to the intrinsic.
 pub(crate) fn arguments_uses_are_forwarded(
     params: &oxc_ast::ast::FormalParameters<'_>,
-    body: Option<&oxc_ast::ast::FunctionBody<'_>>,
+    body: Option<crate::body::Body<'_, '_>>,
 ) -> bool {
     use oxc_ast::ast::{Argument, Expression};
     use oxc_ast_visit::Visit;
@@ -780,9 +778,7 @@ pub(crate) fn arguments_uses_are_forwarded(
         }
     }
     if let Some(b) = body {
-        for stmt in &b.statements {
-            finder.visit_statement(stmt);
-        }
+        b.visit_contents(&mut finder);
     }
     finder.forwarded != 0 && !finder.plain
 }
@@ -793,7 +789,7 @@ pub(crate) fn arguments_uses_are_forwarded(
 /// than to an implicit function-scope binding such as `arguments`.
 pub(crate) fn function_declares_name(
     params: &oxc_ast::ast::FormalParameters<'_>,
-    body: Option<&oxc_ast::ast::FunctionBody<'_>>,
+    body: Option<crate::body::Body<'_, '_>>,
     name: &str,
 ) -> bool {
     let mut names = Vec::new();
@@ -804,11 +800,11 @@ pub(crate) fn function_declares_name(
         collect_pattern_var_names(&rest.rest.argument, &mut names);
     }
     if let Some(body) = body {
-        hoist_var_names(&body.statements, &mut names);
+        hoist_var_names(body.statements(), &mut names);
         let mut lexical = Vec::new();
-        hoist_lexical_names(&body.statements, &mut lexical);
+        hoist_lexical_names(body.statements(), &mut lexical);
         names.extend(lexical.into_iter().map(|(name, _)| name));
-        for stmt in &body.statements {
+        for stmt in body.statements() {
             if let Statement::FunctionDeclaration(function) = stmt
                 && let Some(id) = &function.id
             {
@@ -826,7 +822,7 @@ pub(crate) fn function_declares_name(
 /// skipped, mirroring the capture analysis.
 pub(crate) fn body_uses_arguments_callee(
     params: &oxc_ast::ast::FormalParameters<'_>,
-    body: Option<&oxc_ast::ast::FunctionBody<'_>>,
+    body: Option<crate::body::Body<'_, '_>>,
 ) -> bool {
     use oxc_ast_visit::Visit;
     #[derive(Default)]
@@ -878,9 +874,7 @@ pub(crate) fn body_uses_arguments_callee(
         }
     }
     if let Some(b) = body {
-        for stmt in &b.statements {
-            finder.visit_statement(stmt);
-        }
+        b.visit_contents(&mut finder);
     }
     finder.found
 }
@@ -916,7 +910,7 @@ pub(crate) fn module_body_uses_top_level_await(stmts: &[Statement<'_>]) -> bool 
             // top-level await when the class is a module item. Class element
             // bodies and field/static initializers run in class-created
             // function-like contexts, so await there is not module TLA.
-            if let Some(super_class) = &it.super_class {
+            if let Some(super_class) = it.heritage.as_ref().map(|heritage| &heritage.expression) {
                 self.visit_expression(super_class);
             }
             for element in &it.body.body {

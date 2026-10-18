@@ -712,7 +712,7 @@ fn object_literal_uses_super_in_methods(
         if func
             .body
             .as_deref()
-            .is_some_and(|b| unit.contains_eval(unit.function(b)))
+            .is_some_and(|b| unit.contains_eval(unit.function(crate::body::Body::Block(b))))
         {
             return true;
         }

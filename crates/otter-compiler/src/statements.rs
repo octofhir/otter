@@ -891,21 +891,28 @@ fn compile_statement_body(
             Ok(None)
         }
 
-        Statement::ExportNamedDeclaration(decl) => {
-            // Three shapes:
-            //   1. `export let x = …` / `export function f() {…}` /
-            //      `export class C {…}` — the inner declaration
-            //      compiles via the regular path and the export
-            //      mirror runs because the pre-pass added the name
-            //      to `exported_names`.
-            //   2. `export { a, b as c }` — re-export of names that
-            //      already live in the module body. We synthesise a
-            //      property store on `module_env` for each spec.
-            //   3. `export { x } from "./other.ts"` (re-export from
-            //      another module) — read from the source's import
-            //      record, write to `module_env`.
+        Statement::ExportDeclaration(decl) => {
+            // `export let x = …` / `export function f() {…}` /
+            // `export class C {…}` — the inner declaration compiles via the
+            // regular path and the export mirror runs because the pre-pass
+            // added the name to `exported_names`.
             //
             // Spec: <https://tc39.es/ecma262/#sec-exports>
+            let span = (decl.span.start, decl.span.end);
+            if cx.module_state.is_none() {
+                return Err(CompileError::Unsupported {
+                    node: "ExportDeclaration outside ES-module fragment".to_string(),
+                    span,
+                });
+            }
+            compile_export_inner_declaration(cx, &decl.declaration, span)?;
+            Ok(None)
+        }
+
+        Statement::ExportNamedDeclaration(decl) => {
+            // `export { a, b as c }` — re-export of names that already live
+            // in the module body: a property store on `module_env` for each
+            // spec.
             let span = (decl.span.start, decl.span.end);
             if cx.module_state.is_none() {
                 return Err(CompileError::Unsupported {
@@ -913,86 +920,26 @@ fn compile_statement_body(
                     span,
                 });
             }
-            if let Some(inner) = &decl.declaration {
-                compile_export_inner_declaration(cx, inner, span)?;
+            compile_export_specifiers(cx, &decl.specifiers, None, span)?;
+            Ok(None)
+        }
+
+        Statement::ExportFromDeclaration(decl) => {
+            // `export { x } from "./other.ts"` — read from the source's
+            // import record (present courtesy of the pre-pass), write to
+            // `module_env`.
+            let span = (decl.span.start, decl.span.end);
+            if cx.module_state.is_none() {
+                return Err(CompileError::Unsupported {
+                    node: "ExportFromDeclaration outside ES-module fragment".to_string(),
+                    span,
+                });
             }
-            // Mirror each `export { name as exported_name }` spec
-            // through to module_env. When `decl.source` is set the
-            // source is another module; we read from its import
-            // record (already present courtesy of the pre-pass).
-            let from_source = decl.source.as_ref().map(|s| {
-                ImportRequest::new(
-                    s.value.as_str(),
-                    import_attribute_type(decl.with_clause.as_deref()),
-                )
-            });
-            for spec in &decl.specifiers {
-                let exported = module_export_name_to_str(&spec.exported);
-                let local = module_export_name_to_str(&spec.local);
-                let value_reg = if let Some(src) = &from_source {
-                    let record = cx
-                        .module_state
-                        .as_ref()
-                        .and_then(|s| s.import_records.get(src).copied())
-                        .ok_or(CompileError::Unsupported {
-                            node: format!(
-                                "ExportNamedDeclaration: unresolved re-export source `{}`",
-                                src.specifier
-                            ),
-                            span,
-                        })?;
-                    let record_reg = load_import_record(cx, record, span)?;
-                    let dst = cx.alloc_scratch();
-                    cx.emit_load_property(dst, record_reg, &local, span);
-                    dst
-                } else if decl.declaration.is_some() {
-                    // The declaration arm already mirrored via
-                    // emit_module_export_mirror. Nothing to do.
-                    continue;
-                } else {
-                    // `export { name }` — read from the local
-                    // binding or from an imported alias.
-                    if let Some(binding) = find_module_import_binding(cx, &local) {
-                        if binding.is_namespace && !binding.is_deferred {
-                            // Re-exporting an eager `import * as ns`
-                            // binding forwards the Module Namespace
-                            // Exotic Object (§10.4.6).
-                            let dst = cx.alloc_scratch();
-                            let target = import_target_constant(cx, &binding.request);
-                            let target_const = cx.intern_string_constant(&target);
-                            cx.emit(
-                                Op::ModuleNamespaceObject,
-                                [Operand::Register(dst), Operand::ConstIndex(target_const)],
-                                span,
-                            );
-                            dst
-                        } else {
-                            let record_dst = load_import_record(cx, binding.record, span)?;
-                            // A deferred namespace binding's slot already
-                            // holds the namespace object; forward it.
-                            if binding.is_namespace {
-                                record_dst
-                            } else {
-                                let dst = cx.alloc_scratch();
-                                cx.emit_load_property(dst, record_dst, &binding.source_name, span);
-                                dst
-                            }
-                        }
-                    } else {
-                        let info = cx.lookup_binding(&local).ok_or(CompileError::Unsupported {
-                            node: format!("export of undeclared `{local}`"),
-                            span,
-                        })?;
-                        // An uninitialized lexical carries its TDZ hole
-                        // onto the module environment.
-                        let dst = cx.alloc_scratch();
-                        cx.emit_load_storage(dst, info.storage, span);
-                        dst
-                    }
-                };
-                let env_reg = module_env_register(cx, span)?;
-                cx.emit_store_property(env_reg, &exported, value_reg, span);
-            }
+            let source = ImportRequest::new(
+                decl.source.value.as_str(),
+                import_attribute_type(decl.with_clause.as_deref()),
+            );
+            compile_export_specifiers(cx, &decl.specifiers, Some(&source), span)?;
             Ok(None)
         }
 
@@ -1547,4 +1494,79 @@ pub(crate) fn compile_labeled_statement(
     }
     let _ = span;
     result
+}
+
+/// Mirror each `export { name as exported }` spec onto `module_env`: from
+/// the import record of `from_source` when it re-exports another module,
+/// from the local binding or an imported alias otherwise.
+fn compile_export_specifiers(
+    cx: &mut Compiler,
+    specifiers: &[oxc_ast::ast::ExportSpecifier<'_>],
+    from_source: Option<&ImportRequest>,
+    span: (u32, u32),
+) -> Result<(), CompileError> {
+    for spec in specifiers {
+        let exported = module_export_name_to_str(&spec.exported);
+        let local = module_export_name_to_str(&spec.local);
+        let value_reg = if let Some(src) = from_source {
+            let record = cx
+                .module_state
+                .as_ref()
+                .and_then(|s| s.import_records.get(src).copied())
+                .ok_or(CompileError::Unsupported {
+                    node: format!(
+                        "ExportNamedDeclaration: unresolved re-export source `{}`",
+                        src.specifier
+                    ),
+                    span,
+                })?;
+            let record_reg = load_import_record(cx, record, span)?;
+            let dst = cx.alloc_scratch();
+            cx.emit_load_property(dst, record_reg, &local, span);
+            dst
+        } else {
+            // `export { name }` — read from the local
+            // binding or from an imported alias.
+            if let Some(binding) = find_module_import_binding(cx, &local) {
+                if binding.is_namespace && !binding.is_deferred {
+                    // Re-exporting an eager `import * as ns`
+                    // binding forwards the Module Namespace
+                    // Exotic Object (§10.4.6).
+                    let dst = cx.alloc_scratch();
+                    let target = import_target_constant(cx, &binding.request);
+                    let target_const = cx.intern_string_constant(&target);
+                    cx.emit(
+                        Op::ModuleNamespaceObject,
+                        [Operand::Register(dst), Operand::ConstIndex(target_const)],
+                        span,
+                    );
+                    dst
+                } else {
+                    let record_dst = load_import_record(cx, binding.record, span)?;
+                    // A deferred namespace binding's slot already
+                    // holds the namespace object; forward it.
+                    if binding.is_namespace {
+                        record_dst
+                    } else {
+                        let dst = cx.alloc_scratch();
+                        cx.emit_load_property(dst, record_dst, &binding.source_name, span);
+                        dst
+                    }
+                }
+            } else {
+                let info = cx.lookup_binding(&local).ok_or(CompileError::Unsupported {
+                    node: format!("export of undeclared `{local}`"),
+                    span,
+                })?;
+                // An uninitialized lexical carries its TDZ hole
+                // onto the module environment.
+                let dst = cx.alloc_scratch();
+                cx.emit_load_storage(dst, info.storage, span);
+                dst
+            }
+        };
+        let env_reg = module_env_register(cx, span)?;
+        cx.emit_store_property(env_reg, &exported, value_reg, span);
+    }
+    Ok(())
 }

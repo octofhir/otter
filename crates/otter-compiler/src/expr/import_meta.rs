@@ -1,45 +1,34 @@
 //! Import and meta-property expression lowering.
 //!
 //! # Contents
-//! - [`compile_meta_property`] — lowers `new.target` and `import.meta`.
+//! - [`compile_new_target`] / [`compile_import_meta`] — lower `new.target`
+//!   and `import.meta`.
 //! - [`compile_import`] — lowers dynamic `import()` expressions.
 //!
 //! # See also
 //! - [`super`] — expression dispatch and shared helpers.
 
 use crate::*;
-use oxc_ast::ast::{ImportExpression, MetaProperty};
+use oxc_ast::ast::ImportExpression;
 
-pub(crate) fn compile_meta_property(
+/// `new.target`: the active function's `[[NewTarget]]`.
+pub(crate) fn compile_new_target(cx: &mut Compiler, span: (u32, u32)) -> u16 {
+    let dst = cx.alloc_scratch();
+    cx.emit(Op::LoadNewTarget, [Operand::Register(dst)], span);
+    dst
+}
+
+/// `import.meta`. The runtime materialises it as a JsObject the linker
+/// passes in as param 1; the module prologue stores it into a
+/// module-scope slot, so nested functions reach it through their context
+/// chain.
+///
+/// Spec: <https://tc39.es/ecma262/#prod-ImportMeta>
+///       <https://tc39.es/ecma262/#sec-meta-properties-runtime-semantics-evaluation>
+pub(crate) fn compile_import_meta(
     cx: &mut Compiler,
-    meta: &MetaProperty<'_>,
     span: (u32, u32),
 ) -> Result<u16, CompileError> {
-    let _ = span;
-    let span = (meta.span.start, meta.span.end);
-    if meta.meta.name.as_str() == "new" && meta.property.name.as_str() == "target" {
-        let dst = cx.alloc_scratch();
-        cx.emit(Op::LoadNewTarget, [Operand::Register(dst)], span);
-        return Ok(dst);
-    }
-    // The only legal MetaProperty inside a module is
-    // `import.meta`. The runtime materialises it as a
-    // JsObject the linker passes in as param 1; the module
-    // prologue stores it into a module-scope slot.
-    //
-    // Spec: <https://tc39.es/ecma262/#prod-ImportMeta>
-    //       <https://tc39.es/ecma262/#sec-meta-properties-runtime-semantics-evaluation>
-    if meta.meta.name.as_str() != "import" || meta.property.name.as_str() != "meta" {
-        return Err(CompileError::Unsupported {
-            node: format!(
-                "MetaProperty other than `import.meta` ({}.{})",
-                meta.meta.name, meta.property.name
-            ),
-            span,
-        });
-    }
-    // The module's `import.meta` object lives in a module-scope slot, so
-    // nested functions reach it through their context chain.
     if let Some(dst) = cx.load_internal(crate::compiler::IMPORT_META_BINDING, span) {
         return Ok(dst);
     }

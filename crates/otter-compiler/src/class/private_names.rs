@@ -309,7 +309,7 @@ pub(crate) fn validate_class_private_names_inner(
 ) -> Result<(), CompileError> {
     // Heritage is evaluated under the outer private environment per
     // §15.7.14 step 10.b — push happens after the heritage walk.
-    if let Some(parent) = &class.super_class {
+    if let Some(parent) = class.heritage.as_ref().map(|heritage| &heritage.expression) {
         validate_private_refs_in_expression(parent, scopes)?;
     }
     let own = collect_class_private_bound(&class.body);

@@ -53,12 +53,17 @@ pub(crate) fn is_erased_ts_statement(stmt: &Statement<'_>) -> bool {
         // erased; otherwise this slice does not yet support imports.
         Statement::ImportDeclaration(d) if d.import_kind.is_type() => true,
 
-        // `export type { ... }` / `export type X = ...`
+        // `export type { ... }` / `export type X = ...` / `export interface`
         Statement::ExportNamedDeclaration(d) if d.export_kind.is_type() => true,
+        Statement::ExportFromDeclaration(d) if d.export_kind.is_type() => true,
         Statement::ExportAllDeclaration(d) if d.export_kind.is_type() => true,
+        Statement::ExportDeclaration(d) if declaration_is_type_only(&d.declaration) => true,
 
-        // `declare module "..." { ... }` and `declare namespace N { ... }`.
-        Statement::TSModuleDeclaration(m) if m.declare => true,
+        // `declare module "..." { ... }`, `declare namespace N { ... }` and
+        // `declare global { ... }`.
+        Statement::TSExternalModuleDeclaration(m) if m.declare => true,
+        Statement::TSNamespaceDeclaration(m) if m.declare => true,
+        Statement::TSGlobalDeclaration(m) if m.declare => true,
 
         _ => false,
     }
@@ -71,7 +76,13 @@ pub(crate) fn rejected_ts_statement(stmt: &Statement<'_>) -> Option<(&'static st
     match stmt {
         Statement::TSEnumDeclaration(d) => Some(("TSEnumDeclaration", (d.span.start, d.span.end))),
         // Non-`declare` namespace with a runtime body.
-        Statement::TSModuleDeclaration(d) if !d.declare => {
+        Statement::TSNamespaceDeclaration(d) if !d.declare => {
+            Some(("TSModuleDeclaration", (d.span.start, d.span.end)))
+        }
+        Statement::TSExternalModuleDeclaration(d) if !d.declare => {
+            Some(("TSModuleDeclaration", (d.span.start, d.span.end)))
+        }
+        Statement::TSGlobalDeclaration(d) if !d.declare => {
             Some(("TSModuleDeclaration", (d.span.start, d.span.end)))
         }
         Statement::ClassDeclaration(c) if !c.decorators.is_empty() => {
@@ -127,9 +138,13 @@ pub(crate) fn stmt_kind_name(stmt: &Statement<'_>) -> &'static str {
         Statement::TSEnumDeclaration(_) => "TSEnumDeclaration",
         Statement::TSInterfaceDeclaration(_) => "TSInterfaceDeclaration",
         Statement::TSTypeAliasDeclaration(_) => "TSTypeAliasDeclaration",
-        Statement::TSModuleDeclaration(_) => "TSModuleDeclaration",
+        Statement::TSNamespaceDeclaration(_)
+        | Statement::TSExternalModuleDeclaration(_)
+        | Statement::TSGlobalDeclaration(_) => "TSModuleDeclaration",
         Statement::ImportDeclaration(_) => "ImportDeclaration",
-        Statement::ExportNamedDeclaration(_) => "ExportNamedDeclaration",
+        Statement::ExportDeclaration(_)
+        | Statement::ExportNamedDeclaration(_)
+        | Statement::ExportFromDeclaration(_) => "ExportNamedDeclaration",
         Statement::ExportDefaultDeclaration(_) => "ExportDefaultDeclaration",
         Statement::ExportAllDeclaration(_) => "ExportAllDeclaration",
         _ => "Statement",
@@ -150,4 +165,21 @@ pub(crate) fn init_to_expression<'a, 'b>(
     init: &'a oxc_ast::ast::ForStatementInit<'b>,
 ) -> Option<&'a Expression<'b>> {
     init.as_expression()
+}
+
+/// Whether an exported declaration exists only for the type checker: a type
+/// alias, an interface, or anything `declare`d.
+fn declaration_is_type_only(declaration: &oxc_ast::ast::Declaration<'_>) -> bool {
+    use oxc_ast::ast::Declaration;
+    match declaration {
+        Declaration::TSTypeAliasDeclaration(_) | Declaration::TSInterfaceDeclaration(_) => true,
+        Declaration::VariableDeclaration(d) => d.declare,
+        Declaration::FunctionDeclaration(f) => f.declare,
+        Declaration::ClassDeclaration(c) => c.declare,
+        Declaration::TSExternalModuleDeclaration(m) => m.declare,
+        Declaration::TSNamespaceDeclaration(m) => m.declare,
+        Declaration::TSGlobalDeclaration(m) => m.declare,
+        Declaration::TSEnumDeclaration(e) => e.declare,
+        Declaration::TSImportEqualsDeclaration(_) => false,
+    }
 }

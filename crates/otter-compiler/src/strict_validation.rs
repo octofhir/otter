@@ -33,11 +33,11 @@ use oxc_ast::ast::{
     AssignmentTargetPropertyIdentifier, AwaitExpression, BindingIdentifier, BindingPattern,
     BlockStatement, Class, ClassElement, DoWhileStatement, Expression, ForInStatement,
     ForOfStatement, ForStatement, ForStatementLeft, FormalParameters, Function,
-    IdentifierReference, IfStatement, LabeledStatement, MetaProperty, MethodDefinition,
-    MethodDefinitionKind, NumericLiteral, ObjectProperty, Program, PropertyDefinition, PropertyKey,
-    PropertyKind, SimpleAssignmentTarget, Statement, StaticBlock, StringLiteral, Super,
-    SwitchStatement, UnaryExpression, UnaryOperator, UpdateExpression, UpdateOperator,
-    VariableDeclaration, VariableDeclarationKind, WhileStatement, YieldExpression,
+    IdentifierReference, IfStatement, LabeledStatement, MethodDefinition, MethodDefinitionKind,
+    NumericLiteral, ObjectProperty, Program, PropertyDefinition, PropertyKey, PropertyKind,
+    SimpleAssignmentTarget, Statement, StaticBlock, StringLiteral, Super, SwitchStatement,
+    UnaryExpression, UnaryOperator, UpdateExpression, UpdateOperator, VariableDeclaration,
+    VariableDeclarationKind, WhileStatement, YieldExpression,
 };
 use oxc_ast_visit::{Visit, walk};
 use oxc_span::Span;
@@ -727,10 +727,8 @@ where
                 emit(id.name.as_str(), id.span);
             }
         }
-        Statement::ExportNamedDeclaration(decl) => {
-            if let Some(inner) = &decl.declaration {
-                collect_module_decl_lex_names(inner, emit);
-            }
+        Statement::ExportDeclaration(decl) => {
+            collect_module_decl_lex_names(&decl.declaration, emit);
         }
         Statement::ExportDefaultDeclaration(decl) => match &decl.declaration {
             oxc_ast::ast::ExportDefaultDeclarationKind::FunctionDeclaration(func) => {
@@ -786,8 +784,8 @@ where
     F: FnMut(&'a str, Span),
 {
     match stmt {
-        Statement::ExportNamedDeclaration(decl) => {
-            if let Some(oxc_ast::ast::Declaration::VariableDeclaration(var)) = &decl.declaration
+        Statement::ExportDeclaration(decl) => {
+            if let oxc_ast::ast::Declaration::VariableDeclaration(var) = &decl.declaration
                 && matches!(var.kind, VariableDeclarationKind::Var)
             {
                 for declarator in &var.declarations {
@@ -874,16 +872,14 @@ impl<'a> Visit<'a> for ScriptNewTargetValidator<'_> {
     fn visit_function(&mut self, _: &Function<'a>, _: ScopeFlags) {}
     fn visit_class(&mut self, _: &Class<'a>) {}
 
-    fn visit_meta_property(&mut self, it: &MetaProperty<'a>) {
-        if it.meta.name.as_str() == "new" && it.property.name.as_str() == "target" {
-            self.diagnostics.push(SyntaxDiagnostic {
-                code: "SCRIPT_NEW_TARGET".to_string(),
-                message: "SyntaxError: `new.target` is not valid in this script context (§16.1.1)"
-                    .to_string(),
-                range: Some((it.span.start, it.span.end)),
-                help: Some("use `new.target` inside a function or class constructor".to_string()),
-            });
-        }
+    fn visit_new_target(&mut self, it: &oxc_ast::ast::NewTarget) {
+        self.diagnostics.push(SyntaxDiagnostic {
+            code: "SCRIPT_NEW_TARGET".to_string(),
+            message: "SyntaxError: `new.target` is not valid in this script context (§16.1.1)"
+                .to_string(),
+            range: Some((it.span.start, it.span.end)),
+            help: Some("use `new.target` inside a function or class constructor".to_string()),
+        });
     }
 }
 
@@ -891,16 +887,14 @@ impl<'a> Visit<'a> for ModuleNewTargetValidator<'_> {
     fn visit_function(&mut self, _: &Function<'a>, _: ScopeFlags) {}
     fn visit_arrow_function_expression(&mut self, _: &ArrowFunctionExpression<'a>) {}
 
-    fn visit_meta_property(&mut self, it: &MetaProperty<'a>) {
-        if it.meta.name.as_str() == "new" && it.property.name.as_str() == "target" {
-            self.diagnostics.push(SyntaxDiagnostic {
-                code: "MODULE_NEW_TARGET".to_string(),
-                message: "SyntaxError: `new.target` is not valid directly in module code (§16.2.1)"
-                    .to_string(),
-                range: Some((it.span.start, it.span.end)),
-                help: Some("use `new.target` inside a function or class constructor".to_string()),
-            });
-        }
+    fn visit_new_target(&mut self, it: &oxc_ast::ast::NewTarget) {
+        self.diagnostics.push(SyntaxDiagnostic {
+            code: "MODULE_NEW_TARGET".to_string(),
+            message: "SyntaxError: `new.target` is not valid directly in module code (§16.2.1)"
+                .to_string(),
+            range: Some((it.span.start, it.span.end)),
+            help: Some("use `new.target` inside a function or class constructor".to_string()),
+        });
     }
 }
 
@@ -920,7 +914,7 @@ impl<'a> Visit<'a> for ModuleNewTargetValidator<'_> {
 ///   and inner `StaticBlock`s — but still walks computed property
 ///   keys, which evaluate in the surrounding scope and therefore see
 ///   the outer `arguments` ban.
-/// - Walks `Class.super_class` because the heritage expression is
+/// - Walks `Class.heritage` because the heritage expression is
 ///   evaluated in the surrounding scope.
 struct ContainsArgumentsScanner {
     found: Option<oxc_span::Span>,
@@ -943,7 +937,7 @@ impl<'a> Visit<'a> for ContainsArgumentsScanner {
     // initializers, and inner static blocks each open their own
     // boundary and are skipped by the per-shape visitors above.
     fn visit_class(&mut self, it: &Class<'a>) {
-        if let Some(super_class) = &it.super_class {
+        if let Some(super_class) = it.heritage.as_ref().map(|heritage| &heritage.expression) {
             self.visit_expression(super_class);
         }
         for element in &it.body.body {
@@ -1384,9 +1378,11 @@ impl<'a> Visit<'a> for StrictValidator {
         collect_param_bound_names(&it.params, &mut |name, span| {
             param_names.entry(name).or_insert(span);
         });
-        collect_lex_decl_names(&it.body.statements, &mut |name, span, is_fn| {
-            if !is_fn && param_names.contains_key(name) {
-                self.diagnostics.push(SyntaxDiagnostic {
+        collect_lex_decl_names(
+            crate::body::Body::Arrow(&it.body).statements(),
+            &mut |name, span, is_fn| {
+                if !is_fn && param_names.contains_key(name) {
+                    self.diagnostics.push(SyntaxDiagnostic {
                     code: "ARROW_PARAM_LEXICAL_REDECLARATION".to_string(),
                     message: format!(
                         "SyntaxError: arrow parameter `{name}` conflicts with a lexical declaration in the body (§15.4.1)"
@@ -1396,8 +1392,9 @@ impl<'a> Visit<'a> for StrictValidator {
                         "rename either the parameter or the lexical declaration".to_string(),
                     ),
                 });
-            }
-        });
+                }
+            },
+        );
         // §15.3.1 — ArrowParameters never allow duplicates.
         self.check_duplicate_formals(&it.params, true);
         let inner_strict = self.is_strict() || body_strict;
@@ -1479,13 +1476,13 @@ impl<'a> Visit<'a> for StrictValidator {
         }
         // §15.7.1 — the heritage is evaluated in the outer private
         // environment; the body sees the class's own names too.
-        if let Some(heritage) = &it.super_class {
+        if let Some(heritage) = it.heritage.as_ref().map(|heritage| &heritage.expression) {
             self.visit_expression(heritage);
         }
         if let Some(stack) = &mut self.private_names {
             stack.push(class_private_bound_names(it));
         }
-        self.class_is_derived.push(it.super_class.is_some());
+        self.class_is_derived.push(it.heritage.is_some());
         self.visit_class_body(&it.body);
         self.class_is_derived.pop();
         if let Some(stack) = &mut self.private_names {
@@ -2619,7 +2616,7 @@ impl<'a> Visit<'a> for BlockLexicalValidator {
     }
 
     fn visit_arrow_function_expression(&mut self, it: &ArrowFunctionExpression<'a>) {
-        let body_strict = !it.expression && it.body.has_use_strict_directive();
+        let body_strict = crate::body::Body::Arrow(&it.body).has_use_strict_directive();
         let inner_strict = self.strict() || body_strict;
         self.strict_stack.push(inner_strict);
         let saved_labels = std::mem::take(&mut self.label_stack);

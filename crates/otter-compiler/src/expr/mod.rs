@@ -359,8 +359,12 @@ pub(crate) fn compile_expr(
             compile_class(cx, class, name.as_deref())
         }
 
-        Expression::MetaProperty(meta) => {
-            import_meta::compile_meta_property(cx, meta, enclosing_span)
+        Expression::NewTarget(meta) => Ok(import_meta::compile_new_target(
+            cx,
+            (meta.span.start, meta.span.end),
+        )),
+        Expression::ImportMeta(meta) => {
+            import_meta::compile_import_meta(cx, (meta.span.start, meta.span.end))
         }
 
         Expression::ImportExpression(imp) => import_meta::compile_import(cx, imp, enclosing_span),

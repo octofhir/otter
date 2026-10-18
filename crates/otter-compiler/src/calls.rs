@@ -133,9 +133,7 @@ pub(crate) fn compile_method_call(
     // matches that shape via `Op::ImportMetaResolve`.
     // <https://html.spec.whatwg.org/multipage/webappapis.html#hostmetagetimportmetaproperties>
     if let Expression::StaticMemberExpression(member) = callee
-        && let Expression::MetaProperty(meta) = &member.object
-        && meta.meta.name.as_str() == "import"
-        && meta.property.name.as_str() == "meta"
+        && let Expression::ImportMeta(_) = &member.object
         && member.property.name.as_str() == "resolve"
     {
         if call.arguments.len() != 1 {
@@ -498,7 +496,8 @@ pub(crate) fn tail_eligible_free_callee<'a>(
         | Expression::StaticMemberExpression(_)
         | Expression::ComputedMemberExpression(_)
         | Expression::PrivateFieldExpression(_)
-        | Expression::MetaProperty(_) => None,
+        | Expression::NewTarget(_)
+        | Expression::ImportMeta(_) => None,
         // A direct `eval(...)` keeps its bespoke `Op::Eval` lowering
         // (lexical-scope capture); only a *shadowed* `eval` local is a
         // plain call eligible for tail-call lowering.

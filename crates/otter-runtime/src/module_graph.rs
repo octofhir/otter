@@ -1204,21 +1204,15 @@ impl<'a> Visit<'a> for ModuleRequestVisitor {
         }
     }
 
-    fn visit_export_named_declaration(&mut self, decl: &oxc_ast::ast::ExportNamedDeclaration<'a>) {
-        if !decl.export_kind.is_type()
-            && let Some(src) = &decl.source
-        {
+    fn visit_export_from_declaration(&mut self, decl: &oxc_ast::ast::ExportFromDeclaration<'a>) {
+        if !decl.export_kind.is_type() {
             self.record_with_type(
-                src.value.as_str(),
+                decl.source.value.as_str(),
                 false,
                 false,
                 with_clause_type(decl.with_clause.as_deref()),
             );
         }
-        // Walk into nested declarations / expressions so they
-        // contribute their own dynamic imports (e.g. an exported
-        // function body that calls `import("./x")`).
-        oxc_ast_visit::walk::walk_export_named_declaration(self, decl);
     }
 
     fn visit_export_all_declaration(&mut self, decl: &oxc_ast::ast::ExportAllDeclaration<'a>) {

@@ -24,6 +24,7 @@
 //!   module's top-level facts and its import resolutions. The bytes came
 //!   with a code cache keyed by the exact source text and compiler, so the
 //!   range names the same function.
+//! - A URL two different scripts ran under keeps and answers nothing.
 //! - A kept body links as a fresh compile does, through the verifier, and
 //!   names the URL it runs under, not the one it was compiled under.
 //! - Bodies that are not answered from the store are compiled as before; a
@@ -64,27 +65,43 @@ struct ScriptBodies {
     compiled: usize,
 }
 
+/// What the store holds for one URL.
+#[derive(Debug)]
+enum Kept {
+    Script(ScriptBodies),
+    /// Two different scripts ran under the URL: a source range no longer
+    /// names one function, so nothing is kept or answered for it.
+    Ambiguous,
+}
+
 /// The kept scripts of one isolate, by URL.
 #[derive(Debug, Default)]
 pub(crate) struct LazyBodyStore {
-    scripts: FxHashMap<Box<str>, ScriptBodies>,
+    scripts: FxHashMap<Box<str>, Kept>,
 }
 
 impl LazyBodyStore {
+    fn script(&self, url: &str) -> Option<&ScriptBodies> {
+        match self.scripts.get(url)? {
+            Kept::Script(script) => Some(script),
+            Kept::Ambiguous => None,
+        }
+    }
+
     /// Whether first-call bodies of `url` are kept.
     pub(crate) fn keeps(&self, url: &str) -> bool {
-        self.scripts.contains_key(url)
+        self.script(url).is_some()
     }
 
     /// The kept encoding of `range` in `url`, compiled under `fingerprint`.
     pub(crate) fn find(&self, url: &str, range: (u32, u32), fingerprint: u64) -> Option<&[u8]> {
-        let (kept, bytes) = self.scripts.get(url)?.bodies.get(&range)?;
+        let (kept, bytes) = self.script(url)?.bodies.get(&range)?;
         (*kept == fingerprint).then_some(bytes.as_slice())
     }
 
     /// Keep a body `url`'s function at `range` compiled to.
     pub(crate) fn record(&mut self, url: &str, body: LazyBody) {
-        if let Some(script) = self.scripts.get_mut(url) {
+        if let Some(Kept::Script(script)) = self.scripts.get_mut(url) {
             script
                 .bodies
                 .insert(body.range, (body.fingerprint, body.bytes));
@@ -138,26 +155,36 @@ impl crate::Interpreter {
     /// starting from `script`: its bodies answer those calls, and
     /// [`Self::kept_script_cache`] hands them back with every body compiled
     /// meanwhile.
+    ///
+    /// The same script kept again under its URL keeps what it has; another
+    /// script under the same URL ends keeping for that URL, since a source
+    /// range no longer names one function there.
     pub fn keep_script_cache(&mut self, url: &str, script: KeptScript) {
-        let bodies = script
-            .bodies
-            .into_iter()
-            .map(|body| (body.range, (body.fingerprint, body.bytes)))
-            .collect();
-        self.lazy_body_store.scripts.insert(
-            url.into(),
-            ScriptBodies {
-                top: script.top,
-                bodies,
-                compiled: 0,
-            },
-        );
+        let entry = match self.lazy_body_store.scripts.get(url) {
+            None => {
+                let bodies = script
+                    .bodies
+                    .into_iter()
+                    .map(|body| (body.range, (body.fingerprint, body.bytes)))
+                    .collect();
+                Kept::Script(ScriptBodies {
+                    top: script.top,
+                    bodies,
+                    compiled: 0,
+                })
+            }
+            Some(Kept::Script(kept)) if kept.top == script.top => return,
+            Some(Kept::Script(_) | Kept::Ambiguous) => Kept::Ambiguous,
+        };
+        self.lazy_body_store.scripts.insert(url.into(), entry);
     }
 
     /// `url`'s kept script, when a first call compiled a body since it was
     /// kept or last handed back.
     pub fn kept_script_cache(&mut self, url: &str) -> Option<KeptScript> {
-        let script = self.lazy_body_store.scripts.get_mut(url)?;
+        let Kept::Script(script) = self.lazy_body_store.scripts.get_mut(url)? else {
+            return None;
+        };
         if script.compiled == 0 {
             return None;
         }

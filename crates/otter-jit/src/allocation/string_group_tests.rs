@@ -361,6 +361,7 @@ fn flat(layout: JitStringLayout, units: &[u16], latin: bool, seq: bool) -> Vec<u
         .max(payload + units.len() as u32 * if latin { 1 } else { 2 });
     let mut words = vec![0; (bytes as usize).div_ceil(8)];
     words[0] = layout.header_word;
+    words[1] = layout.map_atom_word;
     put32(&mut words, layout.string_len_byte, units.len() as u32);
     bytes_mut(&mut words)[layout.string_repr_byte as usize] = match (latin, seq) {
         (true, false) => layout.inline_latin1_tag,
@@ -408,6 +409,7 @@ fn strings_execute_exact_flat_cons_identity_and_pre_effect_refusal_payloads() {
             } else {
                 let mut v = vec![0; p.cell_bytes as usize / 8];
                 v[0] = p.header_word;
+                v[1] = p.map_atom_word;
                 put32(&mut v, p.string_len_byte, combined.len() as u32);
                 put32(&mut v, p.cons_left_byte, values[0] as u32);
                 put32(&mut v, p.cons_right_byte, values[1] as u32);
@@ -500,11 +502,14 @@ fn fixed_groups_initialize_every_cell_before_one_publication_and_account_once() 
                 members.push((expected.len() as u32 * 8, layout));
                 let mut cell = vec![0; layout.bytes() as usize / 8];
                 cell[0] = layout.header();
-                if let EmptyLiteralLayout::Object(p) = layout {
-                    cell[p.shape_byte as usize / 8] = u64::from(p.shape);
-                    for byte in p.initial_value_bytes {
-                        cell[byte as usize / 8] = Value::UNDEFINED.to_bits();
+                match layout {
+                    EmptyLiteralLayout::Object(p) => {
+                        cell[p.shape_byte as usize / 8] = u64::from(p.shape);
+                        for byte in p.initial_value_bytes {
+                            cell[byte as usize / 8] = Value::UNDEFINED.to_bits();
+                        }
                     }
+                    EmptyLiteralLayout::Array(p) => cell[1] = p.map_word,
                 }
                 expected.extend(cell);
             }

@@ -70,6 +70,7 @@ pub fn alloc_symbol(
     registered: bool,
 ) -> Result<SymbolHandle, otter_gc::OutOfMemory> {
     let inner = heap.alloc_old(SymbolBody {
+        map: otter_gc::cell_map::TypeMap::NEW,
         description,
         well_known,
         registered,
@@ -91,6 +92,7 @@ pub fn alloc_private_name_symbol(
     description: Option<JsString>,
 ) -> Result<SymbolHandle, otter_gc::OutOfMemory> {
     let inner = heap.alloc_old(SymbolBody {
+        map: otter_gc::cell_map::TypeMap::NEW,
         description,
         well_known: None,
         registered: false,
@@ -109,8 +111,11 @@ pub fn alloc_private_name_symbol(
 /// [`alloc_symbol`]; cloning a [`JsSymbol`] copies the handle but
 /// keeps the same body, so `ptr_eq` is the truth-bearer for `===`.
 #[derive(Debug, Pelt)]
-#[pelt(tag = SYMBOL_BODY_TYPE_TAG)]
+#[pelt(tag = SYMBOL_BODY_TYPE_TAG, value_cell)]
+#[repr(C)]
 pub struct SymbolBody {
+    /// Map word: this value cell's type, at body offset 0.
+    pub(crate) map: otter_gc::cell_map::TypeMap<SYMBOL_BODY_TYPE_TAG>,
     /// Optional human-readable description, exposed through
     /// [`Symbol.prototype.description`] and the `toString` form
     /// `Symbol(<desc>)`. `None` means "no description" — distinct

@@ -80,7 +80,7 @@ impl Codegen<'_> {
             ; add w16, WSP(length), #1
             ; str w16, [X(receiver), storage.length_byte]
             ; stur w16, [X(base), storage.slab_length_from_base]
-            ; str x16, [X(receiver), storage.logical_length_byte]
+            ; str w16, [X(receiver), storage.logical_length_byte]
             ; b =>done
             ; =>grow
             // The copied words would owe marking barriers.
@@ -123,7 +123,7 @@ impl Codegen<'_> {
             ; mov w17, u32::from(storage.tagged_kind)
             ; strb w17, [X(receiver), storage.numeric.kind_byte]
             ; str w16, [X(receiver), storage.length_byte]
-            ; str x16, [X(receiver), storage.logical_length_byte]
+            ; str w16, [X(receiver), storage.logical_length_byte]
         );
         self.emit_write_barrier_keeping(node, receiver, temp, &[length]);
         dynasm!(self.ops
@@ -187,7 +187,7 @@ impl Codegen<'_> {
             ; str x16, [X(base), X(length), lsl #3]
             ; str W(length), [X(receiver), storage.length_byte]
             ; stur W(length), [X(base), storage.slab_length_from_base]
-            ; str X(length), [X(receiver), storage.logical_length_byte]
+            ; str W(length), [X(receiver), storage.logical_length_byte]
             ; mov X(destination), X(temp)
             ; b =>done
             ; =>empty
@@ -265,8 +265,8 @@ impl Codegen<'_> {
         dynasm!(self.ops
             ; .arch aarch64
             ; ldr W(length), [X(receiver), storage.length_byte]
-            ; ldr x16, [X(receiver), storage.logical_length_byte]
-            ; cmp x16, X(length)
+            ; ldr w16, [X(receiver), storage.logical_length_byte]
+            ; cmp w16, W(length)
             ; b.ne =>other
         );
     }

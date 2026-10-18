@@ -82,7 +82,7 @@ impl Codegen<'_> {
                 ; lea r10d, [Rq(length) + 1]
                 ; mov [Rq(receiver) + storage.length_byte as i32], r10d
                 ; mov [Rq(base) + storage.slab_length_from_base], r10d
-                ; mov [Rq(receiver) + storage.logical_length_byte as i32], r10
+                ; mov [Rq(receiver) + storage.logical_length_byte as i32], r10d
                 ; jmp =>appended
                 ; =>grow
                 // The copied words would owe marking barriers.
@@ -118,7 +118,7 @@ impl Codegen<'_> {
                 ; mov [Rq(receiver) + storage.capacity_byte as i32], r11d
                 ; mov BYTE [Rq(receiver) + storage.numeric.kind_byte as i32], storage.tagged_kind as i8
                 ; mov [Rq(receiver) + storage.length_byte as i32], r10d
-                ; mov [Rq(receiver) + storage.logical_length_byte as i32], r10);
+                ; mov [Rq(receiver) + storage.logical_length_byte as i32], r10d);
             self.emit_cell_edge_barrier(node, receiver, temp, &[length]);
             dynasm!(self.ops ; .arch x64
                 ; =>appended
@@ -151,7 +151,7 @@ impl Codegen<'_> {
                 ; mov [Rq(base) + Rq(length) * 8], r10
                 ; mov [Rq(receiver) + storage.length_byte as i32], Rd(length)
                 ; mov [Rq(base) + storage.slab_length_from_base], Rd(length)
-                ; mov [Rq(receiver) + storage.logical_length_byte as i32], Rq(length)
+                ; mov [Rq(receiver) + storage.logical_length_byte as i32], Rd(length)
                 ; mov Rq(destination), Rq(temp)
                 ; jmp =>done
                 ; =>empty);
@@ -226,7 +226,7 @@ impl Codegen<'_> {
         }
         dynasm!(self.ops ; .arch x64
             ; mov Rd(length), [Rq(receiver) + storage.length_byte as i32]
-            ; cmp [Rq(receiver) + storage.logical_length_byte as i32], Rq(length)
+            ; cmp [Rq(receiver) + storage.logical_length_byte as i32], Rd(length)
             ; jne =>other);
     }
 }

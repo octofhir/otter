@@ -1591,9 +1591,10 @@ impl<'rt> NativeCtx<'rt> {
         // Old-space: native callers copy the returned handle into Rust
         // locals across GC-bearing calls, so the cell must never move
         // under a young-space scavenge.
-        let handle = self
-            .heap_mut()
-            .alloc_old_with_roots(state, &mut external_visit)?;
+        let handle = self.heap_mut().alloc_old_with_roots(
+            crate::iterator_state::IteratorBody::new(state),
+            &mut external_visit,
+        )?;
         self.cx
             .interp
             .register_iterator_prototype_override(handle, prototype);

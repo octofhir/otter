@@ -108,12 +108,6 @@ const UNIT_STRINGS_SLOT: usize = 1;
 /// Slab index of the empty string, after the 256 Latin-1 code units.
 const EMPTY_STRING_INDEX: usize = 256;
 
-/// Truncate the body's 64-bit content hash to 32 bits.
-#[inline]
-const fn hash_to_u32(h: u64) -> u32 {
-    ((h ^ (h >> 32)) & 0xFFFF_FFFF) as u32
-}
-
 fn latin1_bytes_from_utf16(units: &[u16]) -> Option<Vec<u8>> {
     let mut bytes = Vec::with_capacity(units.len());
     for &unit in units {
@@ -408,13 +402,13 @@ impl JsString {
     /// cached in the body. Equal content always hashes equal; pair with
     /// [`Self::equals`] before concluding two strings are equal.
     pub fn content_hash(self, heap: &mut GcHeap) -> u32 {
-        hash_to_u32(gc_body::string_hash(heap, self.handle))
+        gc_body::string_hash(heap, self.handle)
     }
 
     /// [`Self::content_hash`] for a caller holding only a shared heap.
     #[must_use]
     pub fn peek_content_hash(self, heap: &GcHeap) -> u32 {
-        hash_to_u32(gc_body::peek_string_hash(heap, self.handle))
+        gc_body::peek_string_hash(heap, self.handle)
     }
 
     /// Concatenate two strings; produces a cons-rope body unless one

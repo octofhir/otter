@@ -212,6 +212,12 @@ pelt_noop! {
     i8, i16, i32, i64, i128, isize,
     f32, f64,
     String,
+    otter_gc::cell_map::CellMap,
+}
+
+impl<const TAG: u8> PeltField for otter_gc::cell_map::TypeMap<TAG> {
+    #[inline]
+    fn pelt_trace(&mut self, _visitor: &mut SlotVisitor<'_>) {}
 }
 
 #[cfg(test)]

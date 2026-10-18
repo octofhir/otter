@@ -63,7 +63,9 @@
 
 use crate::call_linkage::ForwardedBinding;
 use dynasmrt::{DynamicLabel, DynasmApi, DynasmLabelApi, aarch64::Assembler, dynasm};
-use otter_vm::jit::{JitBodyGuard, JitElementRepr, JitGuardWidth, JitHoleBitmap};
+use otter_vm::jit::{
+    JIT_MAP_WORD_BYTE, JitBodyGuard, JitElementRepr, JitGuardWidth, JitHoleBitmap,
+};
 use otter_vm::native_abi::{self as abi, ExitAction, ExitReason, NativeResultStatus};
 use otter_vm::value::tag;
 use otter_vm::{JitCompileSnapshot, ObjectProtocolValueOp, object::ShapeState};
@@ -1553,13 +1555,13 @@ impl<'a> Codegen<'a> {
             // receiver's role too.
             Kind::CheckShapes {
                 shapes,
-                object_proved,
+                cell_proved,
                 ..
             } => {
                 let a = Self::gp(input(0));
                 let exit = self.eager_exit(node, DeoptReason::WrongShape);
-                let (shapes, object_proved) = (shapes.clone(), *object_proved);
-                self.emit_check_shapes(a, &shapes, object_proved, exit);
+                let (shapes, cell_proved) = (shapes.clone(), *cell_proved);
+                self.emit_check_shapes(a, &shapes, cell_proved, exit);
             }
             Kind::CheckBounds => {
                 let (index, length) = (Self::gp(input(0)), Self::gp(input(1)));
@@ -1908,9 +1910,8 @@ impl<'a> Codegen<'a> {
                 }
                 dynasm!(self.ops
                     ; .arch aarch64
-                    ; ldr x16, [X(receiver), storage.logical_length_byte]
-                    ; lsr x17, x16, #31
-                    ; cbnz x17, =>exit
+                    ; ldr w16, [X(receiver), storage.logical_length_byte]
+                    ; tbnz w16, #31, =>exit
                     ; mov W(destination), w16
                 );
             }
@@ -2136,11 +2137,13 @@ impl<'a> Codegen<'a> {
                 let destination = Self::gp(result.expect("a result"));
                 let other = self.ops.new_dynamic_label();
                 let done = self.ops.new_dynamic_label();
-                self.emit_ordinary_receiver(receiver, 0, other);
-                let shape_byte = self.view.object_shape_byte;
+                // Every compared shape is baked, so neither dictionary nor
+                // opaque, and a shape's state never changes: the map word
+                // alone selects the arm, and no other cell's word matches.
+                self.emit_cell_receiver(receiver, other);
                 dynasm!(self.ops
                     ; .arch aarch64
-                    ; ldr W(destination), [X(receiver), shape_byte]
+                    ; ldr W(destination), [X(receiver), JIT_MAP_WORD_BYTE]
                     ; b =>done
                     ; =>other
                     ; mov X(destination), xzr
@@ -2313,20 +2316,20 @@ impl<'a> Codegen<'a> {
 
     /// Prove an eligible baked shape. Shape identity fixes descriptor and
     /// lookup state; writable paths additionally reject prototype role because
-    /// their stores do not enter the semantic invalidation owner.
+    /// their stores do not enter the semantic invalidation owner. The compare
+    /// reads the cell's map word, which only an object of that shape holds.
     fn emit_check_shapes(
         &mut self,
         object: u8,
         shapes: &[u32],
-        object_proved: bool,
+        cell_proved: bool,
         exit: DynamicLabel,
     ) {
         let matched = self.ops.new_dynamic_label();
-        if !object_proved {
-            self.emit_object_receiver(object, exit);
+        if !cell_proved {
+            self.emit_cell_receiver(object, exit);
         }
-        let shape_byte = self.view.object_shape_byte;
-        dynasm!(self.ops ; .arch aarch64 ; ldr w16, [X(object), shape_byte]);
+        dynasm!(self.ops ; .arch aarch64 ; ldr w16, [X(object), JIT_MAP_WORD_BYTE]);
         for (index, &shape) in shapes.iter().enumerate() {
             self.emit_compare_w16(shape);
             if index + 1 == shapes.len() {
@@ -2570,13 +2573,10 @@ impl<'a> Codegen<'a> {
         let view = self.view;
         if !receiver_proved {
             let exit = self.eager_exit(node, DeoptReason::WrongShape);
-            self.emit_object_receiver(receiver, exit);
-            dynasm!(self.ops
-                ; .arch aarch64
-                ; ldr w16, [X(receiver), view.object_shape_byte]
-            );
-            self.load_immediate(17, u64::from(guard.recv_shape));
-            dynasm!(self.ops ; .arch aarch64 ; cmp w16, w17 ; b.ne =>exit);
+            self.emit_cell_receiver(receiver, exit);
+            dynasm!(self.ops ; .arch aarch64 ; ldr w16, [X(receiver), JIT_MAP_WORD_BYTE]);
+            self.emit_compare_w16(guard.recv_shape);
+            dynasm!(self.ops ; .arch aarch64 ; b.ne =>exit);
         }
         // The chain proof is a code dependency, tested before this load: it
         // fixes the holder slot, and the code-retained cell holds the closure
@@ -2849,6 +2849,14 @@ impl<'a> Codegen<'a> {
         Ok(())
     }
 
+    /// Prove a heap cell, whose map word may then be read.
+    fn emit_cell_receiver(&mut self, receiver: u8, miss: DynamicLabel) {
+        const _: () = assert!(CELL_TEST_MASK == 0xfffe_0000_0000_0007);
+        dynasm!(self.ops ; .arch aarch64
+            ; tst X(receiver), #0xfffe_0000_0000_0007 ; b.ne =>miss
+            ; cbz X(receiver), =>miss);
+    }
+
     /// Prove a published ordinary object cell; exact static shape guards
     /// supply its lookup-state proof before any field/effect.
     fn emit_object_receiver(&mut self, receiver: u8, miss: DynamicLabel) {
@@ -2869,17 +2877,6 @@ impl<'a> Codegen<'a> {
             ; ldr w16, [X(receiver), view.object_shape_byte]
             ; add x16, x17, x16
             ; ldrb w16, [x16, view.shape_state_byte]);
-    }
-
-    /// Dynamic ordinary lookup, including provisional runtime feedback.
-    /// Shared tables select live shape identity; they never bake that lineage.
-    fn emit_ordinary_receiver(&mut self, receiver: u8, extra_state: u8, miss: DynamicLabel) {
-        self.emit_object_receiver(receiver, miss);
-        self.emit_shape_state(receiver);
-        let mask = ShapeState::DICTIONARY_MASK | ShapeState::OPAQUE_LOOKUP_MASK | extra_state;
-        // Composite state masks are not necessarily logical immediates.
-        self.load_immediate(17, u64::from(mask));
-        dynasm!(self.ops ; .arch aarch64 ; tst w16, w17 ; b.ne =>miss);
     }
 
     /// Materialize the immutable shape-selected bank of a known field.
@@ -2923,7 +2920,7 @@ impl<'a> Codegen<'a> {
             ; ldrb w17, [X(receiver)]
             ; cmp w17, array_tag
             ; b.ne =>string
-            ; ldr x16, [X(receiver), array_length_byte]
+            ; ldr w16, [X(receiver), array_length_byte]
             ; b =>boxed
             ; =>string
             ; cmp w17, string_tag

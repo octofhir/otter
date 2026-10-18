@@ -18,7 +18,7 @@
 
 use super::*;
 use otter_vm::jit::{
-    JIT_BIGINT_DIGIT_BYTE, JIT_BIGINT_NEGATIVE_BYTE, JIT_BIGINT_SHAPE_BYTE,
+    JIT_BIGINT_DIGIT_BYTE, JIT_BIGINT_MAP_WORD, JIT_BIGINT_NEGATIVE_BYTE, JIT_BIGINT_SHAPE_BYTE,
     JIT_BIGINT64_CELL_BYTES, JIT_YOUNG_BIGINT64_HEADER_WORD,
 };
 
@@ -72,6 +72,11 @@ pub(crate) fn emit_bigint64(
     dynasm!(ops
         ; .arch aarch64
         ; str X(regs.scratch), [X(regs.candidate)]
+    );
+    emit_load_u64(ops, regs.scratch, JIT_BIGINT_MAP_WORD);
+    dynasm!(ops
+        ; .arch aarch64
+        ; str X(regs.scratch), [X(regs.candidate), otter_vm::jit::JIT_MAP_WORD_BYTE]
         // Shape word: digit count (0 for zero, else 1), sign byte at bit 32.
         ; cmp XSP(value), 0
         ; cset W(regs.scratch), ne

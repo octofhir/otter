@@ -209,7 +209,8 @@ fn execute(
                 words[byte as usize / 8] |= u64::from(value) << (byte % 8 * 8);
             };
             put32(&mut expected, p.shell_slab_byte, 4096 + p.shell.cell_bytes);
-            expected[p.shell_length_byte as usize / 8] = values.len() as u64;
+            expected[1] = p.shell.map_word;
+            put32(&mut expected, p.shell_length_byte, values.len() as u32);
             expected[p.shell_data_byte as usize / 8] =
                 start as u64 + u64::from(p.shell.cell_bytes + p.data_byte);
             put32(&mut expected, p.shell_len_byte, values.len() as u32);

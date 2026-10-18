@@ -65,6 +65,7 @@ pub const OBJECT_ALIGNMENT: usize = 8;
 #[doc(hidden)]
 pub mod barrier;
 pub mod branded;
+pub mod cell_map;
 pub mod census;
 #[doc(hidden)]
 pub mod compressed;

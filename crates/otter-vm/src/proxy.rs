@@ -35,8 +35,11 @@ pub const PROXY_BODY_TYPE_TAG: u8 = 0x29;
 /// Mutators flip `revoked` through [`otter_gc::GcHeap::with_payload`]
 /// (no interior mutability in GC bodies).
 #[derive(Debug, Pelt)]
-#[pelt(tag = PROXY_BODY_TYPE_TAG)]
+#[pelt(tag = PROXY_BODY_TYPE_TAG, value_cell)]
+#[repr(C)]
 pub struct ProxyBodyGc {
+    /// Map word: this value cell's type, at body offset 0.
+    pub(crate) map: otter_gc::cell_map::TypeMap<PROXY_BODY_TYPE_TAG>,
     /// Target value trap-less operations fall through to. ECMA-262
     /// §28.2 accepts any object, including callables.
     pub target: Value,
@@ -234,6 +237,7 @@ pub fn alloc_proxy_with_roots(
     let callable = proxy_target_callable(heap, &target);
     heap.alloc_old_with_roots(
         ProxyBodyGc {
+            map: otter_gc::cell_map::TypeMap::NEW,
             target,
             handler,
             revoked: false,

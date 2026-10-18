@@ -134,7 +134,8 @@ fn initialize(
 ) {
     emit_load_u64(ops, r.size, u64::from(p.cell_bytes));
     emit_bump_probe(ops, context, r, slow);
-    for byte in (8..p.cell_bytes).step_by(8) {
+    dynasm!(ops ; .arch x64 ; mov QWORD [Rq(r.candidate)+8],p.map_atom_word as i32);
+    for byte in (16..p.cell_bytes).step_by(8) {
         dynasm!(ops ; .arch x64 ; mov QWORD [Rq(r.candidate)+byte as i32],0);
     }
     emit_load_u64(ops, 10, p.header_word);

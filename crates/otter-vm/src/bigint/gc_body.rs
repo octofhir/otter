@@ -38,6 +38,10 @@ pub const BIG_INT_BODY_TYPE_TAG: u8 = 0x25;
 #[derive(Debug)]
 #[repr(C)]
 pub struct BigIntBody {
+    /// Map word: this value cell's type, at body offset 0.
+    map: otter_gc::cell_map::TypeMap<BIG_INT_BODY_TYPE_TAG>,
+    /// Keeps the length and sign in one aligned word.
+    reserved: u32,
     len: u32,
     negative: bool,
 }
@@ -51,8 +55,12 @@ pub const BIG_INT_NEGATIVE_OFFSET: usize = std::mem::offset_of!(BigIntBody, nega
 /// 4-byte compressed handle to a [`BigIntBody`]. `Copy`.
 pub type BigIntHandle = otter_gc::Gc<BigIntBody>;
 
+const _: () = assert!(std::mem::offset_of!(BigIntBody, map) == 0);
+
 impl otter_gc::SafeTraceable for BigIntBody {
     const TYPE_TAG: u8 = BIG_INT_BODY_TYPE_TAG;
+    const MAP_WORD: otter_gc::cell_map::MapWord =
+        otter_gc::cell_map::MapWord::of_type(BIG_INT_BODY_TYPE_TAG);
 
     fn trace_slots_safe(&mut self, _visitor: &mut SlotVisitor<'_>) {}
 }
@@ -162,6 +170,8 @@ pub(crate) fn alloc_digits(
     let external_visit: &mut RootSlotVisitor<'_> = &mut visit;
     let handle = heap.alloc_trailing_with_roots(
         BigIntBody {
+            map: otter_gc::cell_map::TypeMap::NEW,
+            reserved: 0,
             len: 0,
             negative: false,
         },

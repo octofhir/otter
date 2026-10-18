@@ -483,7 +483,7 @@ fn prior_receiver_proofs_select_own_banks_and_preserve_uncovered_shape_checks() 
         if !covered {
             assert!(matches!(
                 &checks[1].kind,
-                Kind::CheckShapes { shapes, object_proved: true, .. }
+                Kind::CheckShapes { shapes, cell_proved: true, .. }
                     if shapes.as_slice() == [128]
             ));
         }

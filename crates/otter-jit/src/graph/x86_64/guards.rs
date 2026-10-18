@@ -22,7 +22,6 @@ use dynasmrt::{DynamicLabel, DynasmApi, DynasmLabelApi, dynasm};
 use otter_vm::{
     jit::{JitBodyGuard, JitGuardWidth},
     native_abi as abi,
-    object::ShapeState,
     value::tag,
 };
 
@@ -53,18 +52,18 @@ impl Codegen<'_> {
             // receiver's role too.
             Kind::CheckShapes {
                 shapes,
-                object_proved,
+                cell_proved,
                 ..
             } => {
                 let exit = self.eager_exit(node, DeoptReason::WrongShape);
-                if !object_proved {
-                    self.emit_object_receiver(input(0), exit);
+                if !cell_proved {
+                    self.emit_cell_guard(input(0), exit);
                 }
                 let matched = self.ops.new_dynamic_label();
                 self.emit_body_load(
                     input(0),
                     10,
-                    self.view.object_shape_byte,
+                    otter_vm::jit::JIT_MAP_WORD_BYTE,
                     JitGuardWidth::Word32,
                 );
                 for shape in shapes {
@@ -200,20 +199,6 @@ impl Codegen<'_> {
             ; mov r10d, [Rq(receiver) + view.object_shape_byte as i32]
             ; add r10, r11
             ; movzx r10d, BYTE [r10 + view.shape_state_byte as i32]);
-    }
-
-    /// Dynamic/shared lookup may train on provisional ordinary shapes. The
-    /// live table identity, rather than a baked lineage, selects its entry.
-    pub(super) fn emit_ordinary_receiver(
-        &mut self,
-        receiver: u8,
-        extra_state: u8,
-        miss: DynamicLabel,
-    ) {
-        self.emit_object_receiver(receiver, miss);
-        self.emit_shape_state(receiver);
-        let mask = ShapeState::DICTIONARY_MASK | ShapeState::OPAQUE_LOOKUP_MASK | extra_state;
-        dynasm!(self.ops ; .arch x64 ; test r10b, mask as i8 ; jnz =>miss);
     }
 
     pub(super) fn emit_body_guard(

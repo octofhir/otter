@@ -185,7 +185,7 @@ pub(crate) fn census_candidate_ids(
                 crate::promise::PurePromiseBody,
                 crate::proxy::ProxyBodyGc,
                 crate::proxy::PrivateSlotsBody,
-                crate::iterator_state::IteratorState,
+                crate::iterator_state::IteratorBody,
                 crate::native_function::NativeFunctionBody,
                 crate::regexp::JsRegExpBody,
                 crate::weak_refs::WeakRefBody,

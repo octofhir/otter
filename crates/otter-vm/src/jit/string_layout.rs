@@ -32,6 +32,8 @@ pub struct JitStringLayout {
     pub cell_bytes: u32,
     /// Opaque fully sized young GC header word.
     pub header_word: u64,
+    /// First body word of a fresh cell: the map word, then a zero atom.
+    pub map_atom_word: u64,
     /// Recorded-atom word; newly concatenated cells initialize it to zero,
     /// no atom recorded.
     pub atom_byte: u32,
@@ -79,7 +81,9 @@ mod tests {
         assert_eq!(p.header_word as u8, p.string_type_tag);
         assert_eq!((p.header_word >> 32) as u32, p.cell_bytes);
         assert_eq!(p.cell_bytes % otter_gc::page::CELL_SIZE as u32, 0);
+        assert_eq!(p.atom_byte, otter_gc::cell_map::MAP_WORD_OFFSET as u32 + 4);
         let mut ranges = [
+            (otter_gc::cell_map::MAP_WORD_OFFSET as u32, 4),
             (p.atom_byte, 4),
             (p.string_len_byte, 4),
             (p.string_repr_byte, 1),

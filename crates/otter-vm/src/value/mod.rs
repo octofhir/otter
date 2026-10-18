@@ -743,7 +743,8 @@ impl Value {
     #[inline]
     #[must_use]
     pub fn as_iterator(self) -> Option<IteratorHandle> {
-        self.as_raw_gc()?.checked_cast::<IteratorState>()
+        self.as_raw_gc()?
+            .checked_cast::<crate::iterator_state::IteratorBody>()
     }
 
     // -----------------------------------------------------------------------

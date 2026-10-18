@@ -468,8 +468,11 @@ pub const INTL_BODY_TYPE_TAG: u8 = 0x28;
 /// ICU formatter / collator state holds no GC references; only the
 /// prototype-override and user-props slots below are traced.
 #[derive(Debug, otter_macros::Pelt)]
-#[pelt(tag = INTL_BODY_TYPE_TAG)]
+#[pelt(tag = INTL_BODY_TYPE_TAG, value_cell)]
+#[repr(C)]
 pub struct IntlBody {
+    /// Map word: this value cell's type, at body offset 0.
+    pub(crate) map: otter_gc::cell_map::TypeMap<INTL_BODY_TYPE_TAG>,
     /// Variant-typed Intl payload.
     #[pelt(skip)]
     pub payload: IntlPayload,
@@ -506,6 +509,7 @@ pub fn alloc_intl(
     payload: IntlPayload,
 ) -> Result<IntlHandle, otter_gc::OutOfMemory> {
     heap.alloc_old(IntlBody {
+        map: otter_gc::cell_map::TypeMap::NEW,
         payload,
         prototype_override: None,
         user_props: None,

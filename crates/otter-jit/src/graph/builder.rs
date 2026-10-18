@@ -3511,15 +3511,15 @@ impl<'a> Builder<'a> {
             }
             return;
         }
-        let object_proved = self
+        let cell_proved = self
             .known
             .get(object)
-            .is_some_and(|info| info.ordinary_object);
+            .is_some_and(|info| info.heap_object || info.ordinary_object);
         self.add(
             Kind::CheckShapes {
                 shapes: shapes.clone(),
                 writable,
-                object_proved,
+                cell_proved,
             },
             &[object],
             Repr::None,

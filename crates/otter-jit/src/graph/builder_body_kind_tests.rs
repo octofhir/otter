@@ -174,17 +174,19 @@ fn object_births_remove_receiver_checks_but_keep_live_shape_checks() {
             .iter()
             .filter_map(|node| match &node.kind {
                 Kind::CheckShapes {
-                    object_proved,
+                    cell_proved,
                     shapes,
                     ..
                 } => {
                     assert_eq!(shapes.as_slice(), [128]);
-                    Some(*object_proved)
+                    Some(*cell_proved)
                 }
                 _ => None,
             })
             .collect();
-        assert_eq!(guards, [op != Op::NewArray]);
+        // Every birth proves a heap cell; an array's map word then fails the
+        // shape compare like any other cell's.
+        assert_eq!(guards, [true]);
     }
 }
 

@@ -3995,7 +3995,7 @@ fn array_symbol_iterator_factory_uses_native_rooted_iterator_allocation() {
     let Some(iter) = (result).as_iterator() else {
         panic!("factory should return an iterator");
     };
-    let (array, index) = interp.gc_heap().read_payload(iter, |state| match state {
+    let (array, index) = interp.gc_heap().read_payload(iter, |state| match &**state {
         IteratorState::Array { array, index, .. } => (*array, *index),
         _ => panic!("factory should create an array iterator"),
     });

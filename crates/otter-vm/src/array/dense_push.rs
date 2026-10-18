@@ -44,7 +44,7 @@ impl ArrayBody {
 /// The named expando cannot affect indexed writes after callable resolution.
 pub(crate) fn try_push_spare(arr: JsArray, heap: &mut GcHeap, value: Value) -> Option<usize> {
     let length = heap.with_payload(arr, |body| {
-        let len = body.length;
+        let len = body.length();
         if !body.exotic.is_null()
             || len != body.dense_len()
             || len >= body.dense_capacity()
@@ -53,8 +53,8 @@ pub(crate) fn try_push_spare(arr: JsArray, heap: &mut GcHeap, value: Value) -> O
             return None;
         }
         body.push_dense(value);
-        body.length = len + 1;
-        Some(body.length)
+        body.set_length(len + 1);
+        Some(body.length())
     })?;
     record_array_write(heap, arr, &value);
     Some(length)

@@ -133,7 +133,9 @@ fn initialize(
 ) {
     emit_load_u64(ops, r.size, u64::from(p.cell_bytes));
     emit_bump_probe(ops, context, r, slow);
-    for byte in (8..p.cell_bytes).step_by(8) {
+    emit_load_u64(ops, 16, p.map_atom_word);
+    dynasm!(ops ; .arch aarch64 ; str x16,[X(r.candidate),8]);
+    for byte in (16..p.cell_bytes).step_by(8) {
         dynasm!(ops ; .arch aarch64 ; str xzr,[X(r.candidate),byte]);
     }
     emit_load_u64(ops, 16, p.header_word);

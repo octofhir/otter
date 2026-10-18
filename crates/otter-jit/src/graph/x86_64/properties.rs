@@ -127,8 +127,8 @@ impl Codegen<'_> {
                 let holder = assigned.gp_temps[0];
                 if !receiver_proved {
                     let exit = self.eager_exit(node, DeoptReason::WrongShape);
-                    self.emit_object_receiver(receiver, exit);
-                    dynasm!(self.ops ; .arch x64 ; cmp DWORD [Rq(receiver) + self.view.object_shape_byte as i32], guard.recv_shape as i32 ; jne =>exit);
+                    self.emit_cell_guard(receiver, exit);
+                    dynasm!(self.ops ; .arch x64 ; cmp DWORD [Rq(receiver) + otter_vm::jit::JIT_MAP_WORD_BYTE as i32], guard.recv_shape as i32 ; jne =>exit);
                 }
                 // The chain proof is a code dependency, tested before this
                 // load: it fixes the holder slot, and the code-retained cell
@@ -569,7 +569,7 @@ impl Codegen<'_> {
             ; .arch x64
             ; cmp BYTE [Rq(receiver)], array_tag
             ; jne =>string
-            ; mov r10, QWORD [Rq(receiver) + array_length_byte]
+            ; mov r10d, DWORD [Rq(receiver) + array_length_byte]
             ; jmp =>boxed
             ; =>string
             ; cmp BYTE [Rq(receiver)], string_tag

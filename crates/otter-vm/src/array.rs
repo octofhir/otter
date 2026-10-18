@@ -84,10 +84,13 @@ pub type JsArray = otter_gc::Gc<ArrayBody>;
 #[derive(Debug)]
 #[repr(C)]
 pub struct ArrayBody {
+    /// Map word: this value cell's type, at body offset 0.
+    pub(crate) map: otter_gc::cell_map::TypeMap<ARRAY_BODY_TYPE_TAG>,
     /// Logical `length` property. This may be larger than dense
     /// storage when `length` is assigned directly or when sparse
-    /// elements are written.
-    pub(crate) length: usize,
+    /// elements are written. At most `2^32 - 1`, so it fits beside the map
+    /// word; read and write it through [`Self::length`] / [`Self::set_length`].
+    logical_length: u32,
     /// Always-current base of the dense element buffer, kept in a fixed body
     /// field so compiled code can address elements without knowing where the
     /// slab lives. Growth and every traced relocation refresh this address;
@@ -130,8 +133,12 @@ pub struct ArrayBody {
     dense_own_guard: Cell<u8>,
 }
 
+const _: () = assert!(std::mem::offset_of!(ArrayBody, map) == 0);
+
 impl otter_gc::SafeTraceable for ArrayBody {
     const TYPE_TAG: u8 = ARRAY_BODY_TYPE_TAG;
+    const MAP_WORD: otter_gc::cell_map::MapWord =
+        otter_gc::cell_map::MapWord::of_type(ARRAY_BODY_TYPE_TAG);
 
     /// Visit the slab, sidecar and expando handles separately, then republish
     /// the element base. The refresh must follow the visits: a restore relocates
@@ -156,8 +163,9 @@ impl otter_gc::SafeTraceable for ArrayBody {
 impl Default for ArrayBody {
     fn default() -> Self {
         Self {
+            map: otter_gc::cell_map::TypeMap::NEW,
             slab: elements::ElementSlabHandle::null(),
-            length: 0,
+            logical_length: 0,
             exotic: ArrayExoticHandle::null(),
             expando: crate::object::JsObject::null(),
             elements_ptr: Cell::new(std::ptr::null_mut()),
@@ -170,6 +178,20 @@ impl Default for ArrayBody {
 }
 
 impl ArrayBody {
+    /// Logical `length` property.
+    #[inline]
+    #[must_use]
+    pub(crate) fn length(&self) -> usize {
+        self.logical_length as usize
+    }
+
+    /// Store the logical `length`; an array length never exceeds `2^32 - 1`.
+    #[inline]
+    pub(crate) fn set_length(&mut self, length: usize) {
+        debug_assert!(u32::try_from(length).is_ok(), "array length {length}");
+        self.logical_length = length as u32;
+    }
+
     /// Recompute the base and capacity the slab currently provides.
     ///
     /// The live length is not derived here — it is this body's own state,
@@ -422,7 +444,7 @@ pub(crate) struct ArrayExoticSlots {
 /// Byte offset of [`ArrayBody::length`] from the body start (after the GC
 /// header). The baseline JIT reads this for the `arr.length` fast path after
 /// guarding the receiver body tag.
-pub const ARRAY_BODY_LENGTH_OFFSET: usize = std::mem::offset_of!(ArrayBody, length);
+pub const ARRAY_BODY_LENGTH_OFFSET: usize = std::mem::offset_of!(ArrayBody, logical_length);
 
 // Keep the JIT-visible dense array shell small: cold array state must stay in
 // `ArrayExoticSlots`, not creep back into `ArrayBody`. The element base and
@@ -755,10 +777,8 @@ pub(crate) fn from_elements_old_for_fixture(
         otter_gc::SitePlacement::Young(0),
         &mut |_| {},
     )?;
-    let mut body = ArrayBody {
-        length,
-        ..Default::default()
-    };
+    let mut body = ArrayBody::default();
+    body.set_length(length);
     body.adopt_slab(slab, 0);
     copy_values_into(&mut body, &collected);
     record_slab_contents(heap, slab, length);
@@ -807,9 +827,9 @@ pub(crate) fn from_values_with_roots(
     };
     let slab = slab_from_values(heap, collected, slab_placement, external_visit)?;
     let mut body = ArrayBody {
-        length,
         ..Default::default()
     };
+    body.set_length(length);
     body.adopt_slab(slab, 0);
     copy_values_into(&mut body, collected);
     record_slab_contents(heap, slab, length);
@@ -950,10 +970,10 @@ fn from_elements_with_source_old_for_fixture(
         &mut visit,
     )?;
     let mut body = ArrayBody {
-        length,
         exotic: sidecar,
         ..Default::default()
     };
+    body.set_length(length);
     body.adopt_slab(slab, 0);
     copy_values_into(&mut body, &collected);
     record_slab_contents(heap, slab, length);
@@ -1017,10 +1037,10 @@ pub(crate) fn from_elements_with_source_and_roots(
         &mut visit,
     )?;
     let mut body = ArrayBody {
-        length,
         exotic: sidecar,
         ..Default::default()
     };
+    body.set_length(length);
     body.adopt_slab(slab, 0);
     copy_values_into(&mut body, &collected);
     record_slab_contents(heap, slab, length);
@@ -1030,7 +1050,7 @@ pub(crate) fn from_elements_with_source_and_roots(
 /// Length in elements (O(1)).
 #[must_use]
 pub fn len(arr: JsArray, heap: &otter_gc::GcHeap) -> usize {
-    heap.read_payload(arr, |body| body.length)
+    heap.read_payload(arr, |body| body.length())
 }
 
 /// `true` for an empty array.
@@ -1191,7 +1211,7 @@ pub(crate) fn set_plain_dense_slot(
             return false;
         }
         body.write_dense_value(idx, value);
-        body.length = body.length.max(idx.saturating_add(1));
+        body.set_length(body.length().max(idx.saturating_add(1)));
         body.mark_dirty();
         true
     });
@@ -1256,7 +1276,7 @@ fn set_index_value(
                 .sparse_elements
                 .get_or_insert_with(HashMap::new);
             sparse.insert(idx, value);
-            body.length = body.length.max(target_len);
+            body.set_length(body.length().max(target_len));
             body.mark_dirty();
         });
         record_exotic_array_write(heap, arr, &value);
@@ -1274,7 +1294,7 @@ fn set_index_value(
     heap.with_payload(arr, |body| {
         if idx < body.dense_len() {
             body.write_dense_value(idx, value);
-            body.length = body.length.max(target_len);
+            body.set_length(body.length().max(target_len));
             body.mark_dirty();
             return;
         }
@@ -1283,7 +1303,7 @@ fn set_index_value(
             body.push_dense(Value::hole());
         }
         body.push_dense(value);
-        body.length = body.length.max(target_len);
+        body.set_length(body.length().max(target_len));
         body.mark_dirty();
     });
     record_array_write(heap, arr, &value);
@@ -1324,7 +1344,7 @@ pub(crate) fn set_with_roots(
                 .sparse_elements
                 .get_or_insert_with(HashMap::new);
             sparse.insert(idx, value);
-            body.length = body.length.max(target_len);
+            body.set_length(body.length().max(target_len));
             body.mark_dirty();
         });
         record_exotic_array_write(heap, arr, &value);
@@ -1346,7 +1366,7 @@ pub(crate) fn set_with_roots(
     heap.with_payload(arr, |body| {
         if idx < body.dense_len() {
             body.write_dense_value(idx, value);
-            body.length = body.length.max(target_len);
+            body.set_length(body.length().max(target_len));
             body.mark_dirty();
             return;
         }
@@ -1355,7 +1375,7 @@ pub(crate) fn set_with_roots(
             body.push_dense(Value::hole());
         }
         body.push_dense(value);
-        body.length = body.length.max(target_len);
+        body.set_length(body.length().max(target_len));
         body.mark_dirty();
     });
     record_array_write(heap, arr, &value);
@@ -1443,7 +1463,7 @@ pub(crate) fn fill_dense_range_with_roots(
         while body.dense_len() < end {
             body.push_dense(value);
         }
-        body.length = body.length.max(end);
+        body.set_length(body.length().max(end));
         body.mark_dirty();
     });
     record_array_write(heap, arr, &value);
@@ -1475,9 +1495,9 @@ pub fn push(
             body.push_dense(Value::hole());
         }
         body.push_dense(value);
-        body.length = target_len;
+        body.set_length(target_len);
         body.mark_dirty();
-        body.length
+        body.length()
     });
     record_array_write(heap, arr, &barrier_value);
     Ok(new_len)
@@ -1515,9 +1535,9 @@ pub(crate) fn push_with_roots(
             body.push_dense(Value::hole());
         }
         body.push_dense(value);
-        body.length = target_len;
+        body.set_length(target_len);
         body.mark_dirty();
-        body.length
+        body.length()
     });
     record_array_write(heap, arr, &value);
     Ok(new_len)
@@ -1555,7 +1575,7 @@ pub(crate) fn extend_with_roots(
         for value in values {
             body.push_dense(*value);
         }
-        body.length = target_len;
+        body.set_length(target_len);
         body.mark_dirty();
     });
     for value in values {
@@ -1584,7 +1604,7 @@ pub fn set_length(
     }
     if new_len < cur {
         heap.with_payload(arr, |body| {
-            body.length = new_len;
+            body.set_length(new_len);
             body_elements_truncate(body, new_len);
             if let Some(exotic) = body.exotic_opt_mut()
                 && let Some(sparse) = exotic.sparse_elements.as_mut()
@@ -1631,7 +1651,7 @@ pub fn set_length(
                 body.push_dense(Value::hole());
             }
         }
-        body.length = new_len;
+        body.set_length(new_len);
         body.mark_dirty();
     });
     Ok(())
@@ -1762,7 +1782,7 @@ fn delete_array_body_index(body: &mut ArrayBody, idx: usize) {
 }
 
 fn truncate_array_body_to(body: &mut ArrayBody, len: usize) {
-    body.length = len;
+    body.set_length(len);
     body_elements_truncate(body, len);
     if let Some(exotic) = body.exotic_opt_mut()
         && let Some(sparse) = exotic.sparse_elements.as_mut()
@@ -1805,7 +1825,7 @@ pub(crate) fn dense_shift(arr: JsArray, heap: &mut otter_gc::GcHeap) -> Value {
             return Value::undefined();
         }
         let head = body_elements_remove(body, 0);
-        body.length = body.dense_len();
+        body.set_length(body.dense_len());
         body.refresh_element_cache();
         if head.is_hole() {
             Value::undefined()
@@ -1848,9 +1868,9 @@ pub(crate) fn dense_unshift_with_roots(
     let new_len = heap.with_payload(arr, |body| {
         debug_assert!(body.exotic.is_null(), "dense unshift over an exotic array");
         body_elements_insert(body, 0, value);
-        body.length = body.dense_len();
+        body.set_length(body.dense_len());
         body.refresh_element_cache();
-        body.length
+        body.length()
     });
     record_array_write(heap, arr, &barrier_value);
     Ok(new_len)
@@ -1867,7 +1887,7 @@ pub(crate) fn dense_unshift_with_roots(
 pub(crate) fn is_fully_dense(arr: JsArray, heap: &otter_gc::GcHeap) -> bool {
     heap.read_payload(arr, |body| {
         body.exotic.is_null()
-            && body.length == body.dense_len()
+            && body.length() == body.dense_len()
             && match body.dense_kind() {
                 DenseElementKind::Empty | DenseElementKind::PackedDouble => true,
                 DenseElementKind::HoleyDouble => false,
@@ -1882,10 +1902,10 @@ pub(crate) fn is_fully_dense(arr: JsArray, heap: &otter_gc::GcHeap) -> bool {
 #[must_use]
 pub fn pop(arr: JsArray, heap: &mut otter_gc::GcHeap) -> Value {
     heap.with_payload(arr, |body| {
-        if body.length == 0 {
+        if body.length() == 0 {
             return Value::undefined();
         }
-        let idx = body.length - 1;
+        let idx = body.length() - 1;
         let popped = if idx < body.dense_len() {
             body.dense_value(idx)
         } else {
@@ -2176,7 +2196,7 @@ pub(crate) fn with_plain_dense_values<R>(
 ) -> Option<R> {
     heap.read_payload(arr, |body| {
         let count = body.dense_len();
-        if !body.exotic.is_null() || body.accessors().is_some() || body.length != count {
+        if !body.exotic.is_null() || body.accessors().is_some() || body.length() != count {
             return None;
         }
         let Some(slab) = elements::body_of(body.slab) else {
@@ -2211,7 +2231,7 @@ pub(crate) fn plain_dense_prefix_values(
     len: usize,
 ) -> Option<Vec<Value>> {
     heap.read_payload(arr, |body| {
-        if !body.exotic.is_null() || body.length != len || body.dense_len() < len {
+        if !body.exotic.is_null() || body.length() != len || body.dense_len() < len {
             return None;
         }
         (0..len)
@@ -2231,7 +2251,7 @@ pub(crate) fn copy_plain_dense(
 ) -> bool {
     heap.read_payload(arr, |body| {
         let len = body.dense_len();
-        if !body.exotic.is_null() || body.length != len {
+        if !body.exotic.is_null() || body.length() != len {
             return false;
         }
         let start = out.len();
@@ -2261,7 +2281,7 @@ pub(crate) fn append_plain_dense(
     let Some((count, kind)) = heap.read_payload(src, |body| {
         let count = body.dense_len();
         let plain = body.exotic.is_null()
-            && body.length == count
+            && body.length() == count
             && (0..count).all(|index| body.dense_value(index).is_some_and(|v| !v.is_hole()));
         plain.then(|| (count, body.dense_kind()))
     }) else {
@@ -2302,7 +2322,7 @@ pub(crate) fn append_plain_dense(
         copied += n;
     }
     heap.with_payload(dst, |body| {
-        body.length = target_len;
+        body.set_length(target_len);
         body.mark_dirty();
     });
     Ok(true)
@@ -2354,7 +2374,7 @@ pub(crate) fn write_dense_range_with_roots(
         for value in &values[existing_end.saturating_sub(start)..] {
             body.push_dense(*value);
         }
-        body.length = body.length.max(end);
+        body.set_length(body.length().max(end));
         body.mark_dirty();
     });
     for value in values {

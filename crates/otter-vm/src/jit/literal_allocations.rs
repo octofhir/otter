@@ -301,6 +301,9 @@ pub struct JitEmptyArrayAllocationPlan {
     pub cell_bytes: u32,
     /// Complete young/type/size header, with zero body-owned header bytes.
     pub header_word: u64,
+    /// First body word: the array map word, then a zero logical length.
+    /// Every later payload word is zero.
+    pub map_word: u64,
 }
 
 impl Default for JitEmptyArrayAllocationPlan {
@@ -323,6 +326,9 @@ impl Default for JitEmptyArrayAllocationPlan {
                 | (u64::from(super::JIT_GC_YOUNG_FLAG)
                     << (8 * otter_gc::header::HEADER_FLAGS_BYTE_OFFSET))
                 | (u64::from(cell_bytes) << (8 * otter_gc::header::HEADER_SIZE_BYTES_OFFSET)),
+            map_word: u64::from(
+                otter_gc::cell_map::CellMap::of_type(crate::array::ARRAY_BODY_TYPE_TAG).word(),
+            ),
         }
     }
 }
@@ -369,6 +375,6 @@ mod tests {
         let body = crate::array::ArrayBody::default();
         assert!(body.slab.is_null());
         assert!(body.exotic.is_null());
-        assert_eq!(body.length, 0);
+        assert_eq!(body.length(), 0);
     }
 }

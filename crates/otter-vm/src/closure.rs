@@ -165,10 +165,13 @@ impl ClosureCallHeader {
 #[repr(C, align(8))]
 #[derive(Debug)]
 pub struct JsClosureBody {
+    /// Map word: this value cell's type, at body offset 0.
+    pub(crate) map: otter_gc::cell_map::TypeMap<JS_CLOSURE_BODY_TYPE_TAG>,
+    /// Out-of-line state; null until the closure needs it. Shares the first
+    /// body word with the map word, so a carve writes both in one store.
+    rare: ClosureRareHandle,
     /// Fixed-layout metadata read by native linkage.
     pub call_header: ClosureCallHeader,
-    /// Out-of-line state; null until the closure needs it.
-    rare: ClosureRareHandle,
 }
 
 /// [`ClosureCallHeader::flags`] named-lookup bit: the function kind's default
@@ -195,8 +198,12 @@ pub const CLOSURE_LOOKUP_OWN_PROPS: u8 = 1 << 1;
 /// Named-lookup bit: a `[[Prototype]]` override is installed.
 pub const CLOSURE_LOOKUP_PROTO_OVERRIDE: u8 = 1 << 2;
 
+const _: () = assert!(std::mem::offset_of!(JsClosureBody, map) == 0);
+
 impl otter_gc::SafeTraceable for JsClosureBody {
     const TYPE_TAG: u8 = JS_CLOSURE_BODY_TYPE_TAG;
+    const MAP_WORD: otter_gc::cell_map::MapWord =
+        otter_gc::cell_map::MapWord::of_type(JS_CLOSURE_BODY_TYPE_TAG);
 
     fn trace_slots_safe(&mut self, visitor: &mut SlotVisitor<'_>) {
         use crate::pelt::PeltField as _;
@@ -258,8 +265,8 @@ const _: [(); 8] = [(); std::mem::align_of::<ClosureCallHeader>()];
 const _: [(); 0] = [(); CLOSURE_CALL_HEADER_FUNCTION_ID_OFFSET];
 const _: [(); 4] = [(); CLOSURE_CALL_HEADER_FLAGS_OFFSET];
 const _: [(); 8] = [(); CLOSURE_CALL_HEADER_CONTEXT_OFFSET];
-const _: [(); 0] = [(); CLOSURE_BODY_CALL_HEADER_OFFSET];
-const _: [(); 16] = [(); CLOSURE_BODY_RARE_OFFSET];
+const _: [(); 8] = [(); CLOSURE_BODY_CALL_HEADER_OFFSET];
+const _: [(); 4] = [(); CLOSURE_BODY_RARE_OFFSET];
 const _: [(); 24] = [(); CLOSURE_BODY_BOUND_THIS_OFFSET];
 const _: [(); 24] = [(); std::mem::size_of::<JsClosureBody>()];
 // The named-lookup byte is the flags word's top byte on a little-endian host.
@@ -280,6 +287,7 @@ impl JsClosureBody {
     fn new(function_id: u32, context: Value, bound_this: bool, bound_new_target: bool) -> Self {
         debug_assert!(context.is_undefined() || context.as_context().is_some());
         Self {
+            map: otter_gc::cell_map::TypeMap::NEW,
             call_header: ClosureCallHeader::new(function_id, context, bound_this, bound_new_target),
             rare: ClosureRareHandle::null(),
         }
@@ -991,15 +999,11 @@ mod tests {
     fn closure_call_abi_layout_is_stable() {
         assert_eq!(std::mem::size_of::<ClosureCallHeader>(), 16);
         assert_eq!(std::mem::align_of::<ClosureCallHeader>(), 8);
-        assert_eq!(CLOSURE_BODY_FUNCTION_ID_OFFSET, 0);
-        assert_eq!(CLOSURE_BODY_CALL_FLAGS_OFFSET, 4);
-        assert_eq!(CLOSURE_BODY_CONTEXT_OFFSET, 8);
-        assert_eq!(CLOSURE_BODY_RARE_OFFSET, 16);
-        assert_eq!(
-            std::mem::size_of::<JsClosureBody>(),
-            CLOSURE_BODY_RARE_OFFSET + 8,
-            "the rare handle is followed only by immutable alignment padding"
-        );
+        assert_eq!(CLOSURE_BODY_RARE_OFFSET, 4);
+        assert_eq!(CLOSURE_BODY_FUNCTION_ID_OFFSET, 8);
+        assert_eq!(CLOSURE_BODY_CALL_FLAGS_OFFSET, 12);
+        assert_eq!(CLOSURE_BODY_CONTEXT_OFFSET, 16);
+        assert_eq!(std::mem::size_of::<JsClosureBody>(), 24);
         assert_eq!(CLOSURE_BODY_BOUND_THIS_OFFSET, 24);
         assert_eq!(CLOSURE_BODY_BOUND_NEW_TARGET_OFFSET, 32);
     }

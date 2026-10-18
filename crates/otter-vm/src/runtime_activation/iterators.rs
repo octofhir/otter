@@ -170,7 +170,7 @@ impl RuntimeCall<'_> {
         let Some(iterator) = self.read(record)?.as_iterator() else {
             return Ok(IteratorRuntimeOutcome::Bail);
         };
-        let position = vm.gc_heap.read_payload(iterator, |state| match state {
+        let position = vm.gc_heap.read_payload(iterator, |state| match &**state {
             IteratorState::Array {
                 array,
                 index,

@@ -83,8 +83,9 @@ pub(super) fn emit_initialize_empty(
                 dynasm!(ops ; .arch x64 ; mov [Rq(regs.candidate) + byte as i32], r10);
             }
         }
-        EmptyLiteralLayout::Array(_) => {
-            for byte in (8..cell_bytes).step_by(8) {
+        EmptyLiteralLayout::Array(plan) => {
+            dynasm!(ops ; .arch x64 ; mov QWORD [Rq(regs.candidate) + 8], plan.map_word as i32);
+            for byte in (16..cell_bytes).step_by(8) {
                 dynasm!(ops ; .arch x64 ; mov QWORD [Rq(regs.candidate) + byte as i32], 0);
             }
         }

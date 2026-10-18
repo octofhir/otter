@@ -74,6 +74,7 @@ fn execute(case: Case) {
     view.closure_call_layout = JitClosureCallLayout {
         function_id_byte: 8,
         rare_byte: 12,
+        map_byte: 8,
         constructor_layouts_byte: 8,
         prototype_byte: 16,
         ..JitClosureCallLayout::default()

@@ -327,8 +327,11 @@ impl PurePromise {
 
 /// GC-allocated pure promise body.
 #[derive(Debug, otter_macros::Pelt)]
-#[pelt(tag = PURE_PROMISE_BODY_TYPE_TAG)]
+#[pelt(tag = PURE_PROMISE_BODY_TYPE_TAG, value_cell)]
+#[repr(C)]
 pub struct PurePromiseBody {
+    /// Map word: this value cell's type, at body offset 0.
+    pub(crate) map: otter_gc::cell_map::TypeMap<PURE_PROMISE_BODY_TYPE_TAG>,
     state: PromiseState,
     fulfill_reactions: Vec<PromiseReaction>,
     reject_reactions: Vec<PromiseReaction>,
@@ -375,6 +378,7 @@ impl PurePromise {
     pub fn pending(heap: &mut otter_gc::GcHeap) -> Result<Self, otter_gc::OutOfMemory> {
         Ok(Self {
             inner: heap.alloc_old(PurePromiseBody {
+                map: otter_gc::cell_map::TypeMap::NEW,
                 state: PromiseState::Pending,
                 fulfill_reactions: Vec::new(),
                 reject_reactions: Vec::new(),
@@ -393,6 +397,7 @@ impl PurePromise {
         Ok(Self {
             inner: heap.alloc_old_with_roots(
                 PurePromiseBody {
+                    map: otter_gc::cell_map::TypeMap::NEW,
                     state: PromiseState::Pending,
                     fulfill_reactions: Vec::new(),
                     reject_reactions: Vec::new(),
@@ -412,6 +417,7 @@ impl PurePromise {
     ) -> Result<Self, otter_gc::OutOfMemory> {
         Ok(Self {
             inner: heap.alloc_old(PurePromiseBody {
+                map: otter_gc::cell_map::TypeMap::NEW,
                 state: PromiseState::Fulfilled(value),
                 fulfill_reactions: Vec::new(),
                 reject_reactions: Vec::new(),
@@ -431,6 +437,7 @@ impl PurePromise {
         Ok(Self {
             inner: heap.alloc_old_with_roots(
                 PurePromiseBody {
+                    map: otter_gc::cell_map::TypeMap::NEW,
                     state: PromiseState::Fulfilled(value),
                     fulfill_reactions: Vec::new(),
                     reject_reactions: Vec::new(),
@@ -450,6 +457,7 @@ impl PurePromise {
     ) -> Result<Self, otter_gc::OutOfMemory> {
         Ok(Self {
             inner: heap.alloc_old(PurePromiseBody {
+                map: otter_gc::cell_map::TypeMap::NEW,
                 state: PromiseState::Rejected(reason),
                 fulfill_reactions: Vec::new(),
                 reject_reactions: Vec::new(),
@@ -469,6 +477,7 @@ impl PurePromise {
         Ok(Self {
             inner: heap.alloc_old_with_roots(
                 PurePromiseBody {
+                    map: otter_gc::cell_map::TypeMap::NEW,
                     state: PromiseState::Rejected(reason),
                     fulfill_reactions: Vec::new(),
                     reject_reactions: Vec::new(),

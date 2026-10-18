@@ -30,7 +30,10 @@ pub const DATA_VIEW_BODY_TYPE_TAG: u8 = 0x2a;
 
 /// GC body for `Value::DataView` per ECMA-262 §25.3.
 #[derive(Debug)]
+#[repr(C)]
 pub struct DataViewBodyGc {
+    /// Map word: this value cell's type, at body offset 0.
+    pub(crate) map: otter_gc::cell_map::TypeMap<DATA_VIEW_BODY_TYPE_TAG>,
     /// Backing buffer (4-byte tagged handle to the backing buffer
     /// body — already `Copy`).
     pub buffer: JsArrayBuffer,
@@ -53,8 +56,12 @@ pub struct DataViewBodyGc {
     pub custom_proto: Option<crate::Value>,
 }
 
+const _: () = assert!(std::mem::offset_of!(DataViewBodyGc, map) == 0);
+
 impl otter_gc::SafeTraceable for DataViewBodyGc {
     const TYPE_TAG: u8 = DATA_VIEW_BODY_TYPE_TAG;
+    const MAP_WORD: otter_gc::cell_map::MapWord =
+        otter_gc::cell_map::MapWord::of_type(DATA_VIEW_BODY_TYPE_TAG);
 
     fn trace_slots_safe(&mut self, visitor: &mut SlotVisitor<'_>) {
         // The backing `JsArrayBuffer` owns its own GC handles
@@ -97,6 +104,7 @@ pub fn alloc_data_view(
     byte_length: usize,
 ) -> Result<DataViewHandle, otter_gc::OutOfMemory> {
     heap.alloc_old(DataViewBodyGc {
+        map: otter_gc::cell_map::TypeMap::NEW,
         buffer,
         byte_offset,
         byte_length,

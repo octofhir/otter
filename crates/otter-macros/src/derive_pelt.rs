@@ -22,6 +22,9 @@
 //! - The `#[pelt(tag = CONST)]` attribute is required. Reusing the
 //!   already-existing per-body `_TYPE_TAG` const keeps tag
 //!   coordination centralised in the body's own module.
+//! - `#[pelt(value_cell)]` declares a value cell: the body must keep a
+//!   `map` field at offset 0 (checked at compile time) holding
+//!   `CellMap::of_type(tag)`, and the impl declares that map word.
 //! - The expansion never references items outside `::otter_gc::*` and
 //!   `::otter_vm::__macro_support::pelt::*`, so downstream crates do not need to import
 //!   anything beyond the derive itself.
@@ -95,9 +98,26 @@ pub(crate) fn expand(input: TokenStream) -> TokenStream {
         }
     });
 
+    let (map_word, map_offset) = if args.value_cell {
+        (
+            quote! {
+                const MAP_WORD: ::otter_gc::cell_map::MapWord =
+                    ::otter_gc::cell_map::MapWord::of_type(#tag);
+            },
+            quote! {
+                const _: () = assert!(::core::mem::offset_of!(#body_ident, map) == 0);
+            },
+        )
+    } else {
+        (quote! {}, quote! {})
+    };
+
     quote! {
+        #map_offset
+
         impl ::otter_gc::SafeTraceable for #body_ident {
             const TYPE_TAG: u8 = #tag;
+            #map_word
 
             fn trace_slots_safe(
                 &mut self,
@@ -115,6 +135,7 @@ pub(crate) fn expand(input: TokenStream) -> TokenStream {
 fn parse_top_attrs(attrs: &[Attribute]) -> Result<Args> {
     let mut tag: Option<Expr> = None;
     let mut ephemeron_via: Option<Path> = None;
+    let mut value_cell = false;
     for attr in attrs {
         if !attr.path().is_ident("pelt") {
             continue;
@@ -128,6 +149,8 @@ fn parse_top_attrs(attrs: &[Attribute]) -> Result<Args> {
                         return Err(syn::Error::new(key.span(), "duplicate `tag`"));
                     }
                     tag = Some(input.parse()?);
+                } else if key == "value_cell" {
+                    value_cell = true;
                 } else if key == "ephemeron_via" {
                     input.parse::<Token![=]>()?;
                     if ephemeron_via.is_some() {
@@ -147,12 +170,19 @@ fn parse_top_attrs(attrs: &[Attribute]) -> Result<Args> {
             Ok(())
         })?;
     }
-    Ok(Args { tag, ephemeron_via })
+    Ok(Args {
+        tag,
+        ephemeron_via,
+        value_cell,
+    })
 }
 
 struct Args {
     tag: Option<Expr>,
     ephemeron_via: Option<Path>,
+    /// The body is a value cell whose `map` field, at offset 0, holds its
+    /// type map word.
+    value_cell: bool,
 }
 
 /// Build the body of `trace_slots_safe` for an `enum` body. The

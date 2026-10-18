@@ -228,6 +228,7 @@ fn execute(
             }
             Layout::Empty(EmptyLiteralLayout::Array(plan)) => {
                 expected[0] = plan.header_word;
+                expected[1] = plan.map_word;
             }
             Layout::Object(plan) => {
                 expected[0] = site.header_word(plan.header_word);
@@ -264,7 +265,8 @@ fn execute(
                     plan.shell_slab_byte,
                     4096 + plan.shell.cell_bytes,
                 );
-                expected[plan.shell_length_byte as usize / 8] = values.len() as u64;
+                expected[1] = plan.shell.map_word;
+                put32(&mut expected, plan.shell_length_byte, values.len() as u32);
                 expected[plan.shell_data_byte as usize / 8] =
                     start as u64 + u64::from(plan.shell.cell_bytes + plan.data_byte);
                 put32(&mut expected, plan.shell_len_byte, values.len() as u32);

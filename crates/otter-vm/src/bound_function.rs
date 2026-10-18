@@ -60,16 +60,18 @@ impl crate::pelt::PeltField for BoundFunctionMetadataProperty {
 /// path (`Op::Call`, `Op::CallWithThis`, `Op::CallMethodValue`).
 #[repr(C)]
 #[derive(Debug, Clone, otter_macros::Pelt)]
-#[pelt(tag = BOUND_FUNCTION_BODY_TYPE_TAG)]
+#[pelt(tag = BOUND_FUNCTION_BODY_TYPE_TAG, value_cell)]
 pub struct BoundFunctionBody {
+    /// Map word: this value cell's type, at body offset 0.
+    pub(crate) map: otter_gc::cell_map::TypeMap<BOUND_FUNCTION_BODY_TYPE_TAG>,
+    /// Arguments prepended to the caller's argument list at every
+    /// invocation. Null denotes an empty prefix.
+    pub(crate) bound_args: crate::value_slab::ValueSlabHandle,
     /// Underlying callable, including another bound function.
     pub target: Value,
     /// The `this` value the bound call receives. Overrides any
     /// receiver the caller supplies.
     pub bound_this: Value,
-    /// Arguments prepended to the caller's argument list at every
-    /// invocation. Null denotes an empty prefix.
-    pub(crate) bound_args: crate::value_slab::ValueSlabHandle,
     /// Bound function builtin `name`, computed once by `bind`.
     pub(crate) builtin_name: String,
     /// Bound function builtin `length`, computed once by `bind`.
@@ -239,6 +241,7 @@ impl Interpreter {
             let bound_args =
                 crate::value_slab::slab_from_values(&mut interp.gc_heap, &mut values, &mut |_| {})?;
             let body = BoundFunctionBody {
+                map: otter_gc::cell_map::TypeMap::NEW,
                 target: interp.escape_scoped(target),
                 bound_this: interp.escape_scoped(receiver),
                 bound_args,

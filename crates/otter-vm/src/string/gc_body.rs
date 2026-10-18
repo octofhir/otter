@@ -158,15 +158,17 @@ const _: () = assert!(UTF16_CACHE_MIN_LEN as usize > INLINE_FLAT_CAP);
 #[derive(Debug)]
 #[repr(C)]
 pub struct JsStringBody {
+    /// Map word: this value cell's type, at body offset 0.
+    pub(crate) map: otter_gc::cell_map::TypeMap<JS_STRING_BODY_TYPE_TAG>,
     /// The interned atom of this string's content plus one, recorded the
     /// first time a property key or shape transition interned it; zero until
     /// then. Content never changes, so a recorded atom stays exact.
     atom: u32,
     /// Code-unit length (UTF-16). O(1) heap-free at the body level.
     pub len: u32,
-    /// FNV-1a hash of the code units once [`string_hash`] computed it;
-    /// zero until then.
-    pub hash: u64,
+    /// FNV-1a hash of the code units, folded to 32 bits, once
+    /// [`string_hash`] computed it; zero until then.
+    pub hash: u32,
     /// Variant-specific payload.
     pub repr: JsStringBodyRepr,
     /// Lazily-filled widened view of this string, as a flat string body.
@@ -213,6 +215,9 @@ pub(crate) fn jit_layout() -> crate::jit::JitStringLayout {
             | (u64::from(crate::jit::JIT_GC_YOUNG_FLAG)
                 << (8 * otter_gc::header::HEADER_FLAGS_BYTE_OFFSET))
             | (u64::from(cell_bytes) << (8 * otter_gc::header::HEADER_SIZE_BYTES_OFFSET)),
+        map_atom_word: u64::from(
+            otter_gc::cell_map::CellMap::of_type(JS_STRING_BODY_TYPE_TAG).word(),
+        ),
         atom_byte: header + std::mem::offset_of!(JsStringBody, atom) as u32,
         cache_byte: header + std::mem::offset_of!(JsStringBody, utf16_cache) as u32,
         cons_left_byte: repr + (std::ptr::from_ref(left) as usize - base) as u32,
@@ -326,7 +331,12 @@ impl JsStringBody {
     }
 }
 
+const _: () = assert!(std::mem::offset_of!(JsStringBody, map) == 0);
+const _: () = assert!(std::mem::size_of::<JsStringBody>() == 48);
+
 impl otter_gc::SafeTraceable for JsStringBody {
+    const MAP_WORD: otter_gc::cell_map::MapWord =
+        otter_gc::cell_map::MapWord::of_type(JS_STRING_BODY_TYPE_TAG);
     const TYPE_TAG: u8 = JS_STRING_BODY_TYPE_TAG;
 
     fn trace_slots_safe(&mut self, visitor: &mut SlotVisitor<'_>) {
@@ -377,6 +387,7 @@ pub fn alloc_flat_string_body_with_roots(
         inline[..units.len()].copy_from_slice(units);
         return heap.alloc_with_roots(
             JsStringBody {
+                map: otter_gc::cell_map::TypeMap::NEW,
                 atom: 0,
                 len,
                 hash,
@@ -390,6 +401,7 @@ pub fn alloc_flat_string_body_with_roots(
     // the GC allocation and need no separate cap reservation.
     let handle = heap.alloc_trailing_with_roots(
         JsStringBody {
+            map: otter_gc::cell_map::TypeMap::NEW,
             atom: 0,
             len,
             hash,
@@ -422,6 +434,7 @@ pub fn alloc_latin1_string_body_with_roots(
         inline[..bytes.len()].copy_from_slice(bytes);
         return heap.alloc_with_roots(
             JsStringBody {
+                map: otter_gc::cell_map::TypeMap::NEW,
                 atom: 0,
                 len,
                 hash,
@@ -434,6 +447,7 @@ pub fn alloc_latin1_string_body_with_roots(
     // Same as the flat path: the bytes are inside the GC allocation.
     let handle = heap.alloc_trailing_with_roots(
         JsStringBody {
+            map: otter_gc::cell_map::TypeMap::NEW,
             atom: 0,
             len,
             hash,
@@ -467,6 +481,7 @@ pub(crate) fn alloc_latin1_string_body_diagnostic(
         let mut inline = [0u8; INLINE_LATIN1_CAP];
         inline[..bytes.len()].copy_from_slice(bytes);
         return heap.alloc_old_diagnostic(JsStringBody {
+            map: otter_gc::cell_map::TypeMap::NEW,
             atom: 0,
             len,
             hash: 0,
@@ -476,6 +491,7 @@ pub(crate) fn alloc_latin1_string_body_diagnostic(
     }
     let handle = heap.alloc_old_diagnostic_trailing(
         JsStringBody {
+            map: otter_gc::cell_map::TypeMap::NEW,
             atom: 0,
             len,
             hash: 0,
@@ -603,6 +619,7 @@ pub fn concat_string_bodies(
 
     Ok(heap.alloc_with_roots(
         JsStringBody {
+            map: otter_gc::cell_map::TypeMap::NEW,
             atom: 0,
             len: new_len,
             hash: 0,
@@ -705,6 +722,7 @@ fn slice_view(
     });
     heap.alloc_with_roots(
         JsStringBody {
+            map: otter_gc::cell_map::TypeMap::NEW,
             atom: 0,
             len: length,
             hash: 0,
@@ -1598,7 +1616,7 @@ pub fn hash_latin1(bytes: &[u8]) -> u64 {
 
 /// Content hash of `string`, computed on first request and cached in the
 /// body.
-pub fn string_hash(heap: &mut GcHeap, string: JsStringHandle) -> u64 {
+pub fn string_hash(heap: &mut GcHeap, string: JsStringHandle) -> u32 {
     let cached = heap.read_payload(string, |body| body.hash);
     if cached != 0 {
         return cached;
@@ -1611,7 +1629,7 @@ pub fn string_hash(heap: &mut GcHeap, string: JsStringHandle) -> u64 {
 /// [`string_hash`] for a caller holding only a shared heap: the cached hash
 /// when present, otherwise computed without caching.
 #[must_use]
-pub fn peek_string_hash(heap: &GcHeap, string: JsStringHandle) -> u64 {
+pub fn peek_string_hash(heap: &GcHeap, string: JsStringHandle) -> u32 {
     let cached = heap.read_payload(string, |body| body.hash);
     if cached != 0 {
         cached
@@ -1620,9 +1638,9 @@ pub fn peek_string_hash(heap: &GcHeap, string: JsStringHandle) -> u64 {
     }
 }
 
-/// Exact hash of the code units of any representation; never zero, which
-/// marks a hash not yet computed.
-fn content_hash(heap: &GcHeap, string: JsStringHandle) -> u64 {
+/// Exact hash of the code units of any representation, folded to 32 bits;
+/// never zero, which marks a hash not yet computed.
+fn content_hash(heap: &GcHeap, string: JsStringHandle) -> u32 {
     let hash = match contiguous_view(heap, string) {
         Some((target, start, len)) => heap.read_payload(target, |body| {
             match flat_content_range(body, start, len)
@@ -1636,7 +1654,14 @@ fn content_hash(heap: &GcHeap, string: JsStringHandle) -> u64 {
             (hash ^ u64::from(unit)).wrapping_mul(FNV_PRIME)
         }),
     };
-    hash.max(1)
+    fold_hash(hash)
+}
+
+/// A 64-bit code-unit hash folded to the nonzero 32-bit cached form.
+#[must_use]
+pub(crate) const fn fold_hash(hash: u64) -> u32 {
+    let folded = ((hash ^ (hash >> 32)) & 0xFFFF_FFFF) as u32;
+    if folded == 0 { 1 } else { folded }
 }
 
 #[cfg(test)]
@@ -1901,7 +1926,10 @@ mod tests {
                 } if actual == parent
             ));
         });
-        assert_eq!(string_hash(&mut heap, view), hash_latin1(expected).max(1));
+        assert_eq!(
+            string_hash(&mut heap, view),
+            fold_hash(hash_latin1(expected))
+        );
         assert_eq!(
             with_latin1(&heap, view, |slice| slice.to_vec()),
             Some(expected.to_vec())
@@ -1938,7 +1966,10 @@ mod tests {
             with_latin1(&heap, short, |slice| slice.to_vec()),
             Some(b"abcde".to_vec())
         );
-        assert_eq!(peek_string_hash(&heap, short), hash_latin1(b"abcde").max(1));
+        assert_eq!(
+            peek_string_hash(&heap, short),
+            fold_hash(hash_latin1(b"abcde"))
+        );
     }
 
     #[test]
@@ -1975,7 +2006,7 @@ mod tests {
         );
         assert_eq!(
             string_hash(&mut heap, inner),
-            hash_latin1(&bytes[15..45]).max(1)
+            fold_hash(hash_latin1(&bytes[15..45]))
         );
     }
 

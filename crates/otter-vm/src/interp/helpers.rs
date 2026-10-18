@@ -586,7 +586,7 @@ pub(crate) fn step_iterator(
         Slow,
     }
 
-    let snapshot = gc_heap.read_payload(iter, |state| match state {
+    let snapshot = gc_heap.read_payload(iter, |state| match &**state {
         IteratorState::Array { array, index, .. } => FastIteratorSnapshot::Array(*array, *index),
         IteratorState::ArrayKey { array, index } => FastIteratorSnapshot::ArrayKey(*array, *index),
         IteratorState::ArrayEntry { array, index } => {
@@ -631,7 +631,7 @@ pub(crate) fn step_iterator(
             } else {
                 let v = crate::array::get(array, gc_heap, index);
                 gc_heap.with_payload(iter, |state| {
-                    if let IteratorState::Array { index, .. } = state {
+                    if let IteratorState::Array { index, .. } = &mut **state {
                         *index += 1;
                     }
                 });
@@ -643,7 +643,7 @@ pub(crate) fn step_iterator(
                 None
             } else {
                 gc_heap.with_payload(iter, |state| {
-                    if let IteratorState::ArrayKey { index, .. } = state {
+                    if let IteratorState::ArrayKey { index, .. } = &mut **state {
                         *index += 1;
                     }
                 });
@@ -672,7 +672,7 @@ pub(crate) fn step_iterator(
                         .map_err(|_| VmError::TypeMismatch)?
                 };
                 gc_heap.with_payload(iter, |state| {
-                    if let IteratorState::ArrayEntry { index, .. } = state {
+                    if let IteratorState::ArrayEntry { index, .. } = &mut **state {
                         *index += 1;
                     }
                 });
@@ -697,7 +697,7 @@ pub(crate) fn step_iterator(
             } else {
                 let advance = |gc_heap: &mut otter_gc::GcHeap| {
                     gc_heap.with_payload(iter, |state| {
-                        if let IteratorState::ArrayLike { index, .. } = state {
+                        if let IteratorState::ArrayLike { index, .. } = &mut **state {
                             *index += 1;
                         }
                     });
@@ -759,7 +759,7 @@ pub(crate) fn step_iterator(
                     .map_err(|_| VmError::TypeMismatch)?;
                 let advance = |gc_heap: &mut otter_gc::GcHeap| {
                     gc_heap.with_payload(iter, |state| {
-                        if let IteratorState::TypedArray { index, .. } = state {
+                        if let IteratorState::TypedArray { index, .. } = &mut **state {
                             *index += 1;
                         }
                     });
@@ -809,7 +809,7 @@ pub(crate) fn step_iterator(
                     (JsString::from_utf16_units(&[unit], gc_heap)?, 1)
                 };
                 gc_heap.with_payload(iter, |state| {
-                    if let IteratorState::String { index, .. } = state {
+                    if let IteratorState::String { index, .. } = &mut **state {
                         *index += advance;
                     }
                 });
@@ -832,7 +832,7 @@ pub(crate) fn step_iterator(
             }
             if let Some((key, value)) = next_entry {
                 gc_heap.with_payload(iter, |state| {
-                    if let IteratorState::MapCollection { index, .. } = state {
+                    if let IteratorState::MapCollection { index, .. } = &mut **state {
                         *index = next_index;
                     }
                 });
@@ -875,7 +875,7 @@ pub(crate) fn step_iterator(
             }
             if let Some(value) = next_value {
                 gc_heap.with_payload(iter, |state| {
-                    if let IteratorState::SetCollection { index, .. } = state {
+                    if let IteratorState::SetCollection { index, .. } = &mut **state {
                         *index = next_index;
                     }
                 });

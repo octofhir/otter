@@ -472,7 +472,7 @@ impl Interpreter {
             return false;
         };
         let heap = &self.gc_heap;
-        heap.read_payload(handle, IteratorState::builtin_origin)
+        heap.read_payload(handle, |body| body.builtin_origin())
             .is_some_and(|origin| is_static(heap, Some(Some(next)), builtin_next(origin)))
     }
 
@@ -490,7 +490,7 @@ impl Interpreter {
         let handle = iterator.as_iterator()?;
         let origin = self
             .gc_heap
-            .read_payload(handle, IteratorState::builtin_origin)?;
+            .read_payload(handle, |body| body.builtin_origin())?;
         let plain = self.non_gc_exotic_user_props(&iterator).is_none()
             && self.has_realm_prototype(
                 self.non_gc_exotic_prototype_override(&iterator),

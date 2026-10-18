@@ -113,16 +113,29 @@ impl Runtime {
             .map(CompiledProgram::from_compiled_module)
     }
 
-    /// The CommonJS wrapper function exactly as a run compiles it.
+    /// The CommonJS wrapper function as a run compiles it, with every
+    /// function body compiled rather than left to its first call.
     fn dump_commonjs(
         &self,
         source: &SourceInput,
         specifier: &str,
     ) -> Result<CompiledProgram, OtterError> {
         let wrapped = otter_bytecode::commonjs::wrapper_source(&source.text);
-        let mut module =
-            crate::compile_eval_with_options(&wrapped, &otter_vm::EvalCompileOptions::default())
-                .map_err(|err| crate::map_compile_error(err, specifier))?;
+        let mut module = otter_compiler::compile_eval_source(
+            &wrapped,
+            otter_syntax::SourceKind::JavaScript,
+            "<eval>",
+            false,
+            false,
+            None,
+            false,
+            false,
+            false,
+            false,
+            false,
+            otter_compiler::CompileOptions::default(),
+        )
+        .map_err(|err| crate::map_compile_error(err, specifier))?;
         module.module = specifier.to_string();
         for function in &mut module.functions {
             function.module_url = specifier.to_string();

@@ -6149,12 +6149,18 @@ impl Runtime {
         self.compile_source(&source, specifier).map(|_| ())
     }
 
-    /// Compile-and-dump: produce the bytecode module for inspection.
+    /// Compile-and-dump: produce the bytecode module for inspection. Every
+    /// function body is compiled, where a run would leave the bodies of
+    /// functions not yet called to their first call.
     ///
     /// # Errors
     /// See [`OtterError`] variants.
     pub fn dump(&self, source: SourceInput, specifier: &str) -> Result<CompiledModule, OtterError> {
-        self.compile_source(&source, specifier)
+        if self.config.hooks.compile_hook().is_some() || source.allow_top_level_await {
+            return self.compile_source(&source, specifier);
+        }
+        otter_compiler::compile_script_source_to_module(&source.text, source.kind, specifier)
+            .map_err(|err| map_compile_error(err, specifier))
     }
 
     /// Run one trusted bootstrap source under its own specifier, so a stack

@@ -16,12 +16,14 @@ oxc_allocator = { workspace = true }
 oxc_ast = { workspace = true }
 oxc_ast_visit = { workspace = true }
 oxc_span = { workspace = true }
+oxc_str = { workspace = true }
 oxc_syntax = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }
 num-bigint = { workspace = true }
 otter-regex = { workspace = true }
 rustc-hash = { workspace = true }
+hashbrown = { workspace = true }
 
 [dev-dependencies]
 serde_json = { workspace = true }

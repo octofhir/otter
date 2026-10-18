@@ -152,11 +152,14 @@ impl ScopeFacts {
 #[derive(Debug, Default)]
 pub(crate) struct CaptureFacts {
     names: Vec<Box<str>>,
-    ids: FxHashMap<Box<str>, NameId>,
+    /// Name ids by spelling, hashed the way the parser already hashed every
+    /// identifier: an [`oxc_str::Ident`] looks its name up without hashing
+    /// its bytes again.
+    ids: hashbrown::HashTable<NameId>,
     scopes: FxHashMap<usize, ScopeFacts>,
     unit: ScopeFacts,
     /// Start offsets of every identifier reference, per name, ascending.
-    references: FxHashMap<NameId, Vec<u32>>,
+    references: Vec<Vec<u32>>,
     /// Start offsets of every direct-eval call, ascending.
     evals: Vec<u32>,
     reads_dot_arguments: bool,
@@ -227,7 +230,7 @@ impl CaptureFacts {
         unit.facts.inner = IdSet::of(unit.inner.iter().copied());
         let mut facts = builder.facts;
         facts.unit = unit.facts;
-        for positions in facts.references.values_mut() {
+        for positions in &mut facts.references {
             positions.sort_unstable();
         }
         facts.evals.sort_unstable();
@@ -306,16 +309,13 @@ impl CaptureFacts {
     /// Whether the scope's code, or a nested scope not binding it, may assign
     /// `name`.
     pub(crate) fn assigned(&self, scope: &ScopeFacts, name: &str) -> bool {
-        self.ids
-            .get(name)
-            .is_some_and(|id| scope.assigned.contains(id))
+        self.id_of(name)
+            .is_some_and(|id| scope.assigned.contains(&id))
     }
 
     /// Whether a function nested in the scope references `name`.
     pub(crate) fn inner_references(&self, scope: &ScopeFacts, name: &str) -> bool {
-        self.ids
-            .get(name)
-            .is_some_and(|id| scope.inner.contains(id))
+        self.id_of(name).is_some_and(|id| scope.inner.contains(&id))
     }
 
     /// Whether the scope's parameters or body name `name` at any depth,
@@ -327,9 +327,8 @@ impl CaptureFacts {
     /// Whether an AST region references `name`, including assignments and
     /// nested functions. Shadowed names conservatively count as references.
     pub(crate) fn references_in_range(&self, name: &str, range: (u32, u32)) -> bool {
-        self.ids
-            .get(name)
-            .and_then(|id| self.references.get(id))
+        self.id_of(name)
+            .and_then(|id| self.references.get(id as usize))
             .is_some_and(|positions| any_within(positions, range))
     }
 
@@ -371,13 +370,54 @@ impl CaptureFacts {
         region.finish()
     }
 
+    /// Record a reference to `id` at source offset `at`.
+    fn reference(&mut self, id: NameId, at: u32) {
+        let index = id as usize;
+        if self.references.len() <= index {
+            self.references.resize_with(index + 1, Vec::new);
+        }
+        self.references[index].push(at);
+    }
+
+    /// The id of `name`, if the unit names it.
+    fn id_of(&self, name: &str) -> Option<NameId> {
+        self.find(
+            std::hash::BuildHasher::hash_one(&oxc_str::IdentBuildHasher, name),
+            name,
+        )
+    }
+
+    fn find(&self, hash: u64, name: &str) -> Option<NameId> {
+        self.ids
+            .find(hash, |&id| &*self.names[id as usize] == name)
+            .copied()
+    }
+
     fn intern(&mut self, name: &str) -> NameId {
-        if let Some(&id) = self.ids.get(name) {
+        self.intern_hashed(
+            std::hash::BuildHasher::hash_one(&oxc_str::IdentBuildHasher, name),
+            name,
+        )
+    }
+
+    /// [`Self::intern`] of an identifier, by the hash it carries.
+    fn intern_ident(&mut self, name: oxc_str::Ident<'_>) -> NameId {
+        self.intern_hashed(
+            std::hash::BuildHasher::hash_one(&oxc_str::IdentBuildHasher, name),
+            &name,
+        )
+    }
+
+    fn intern_hashed(&mut self, hash: u64, name: &str) -> NameId {
+        if let Some(id) = self.find(hash, name) {
             return id;
         }
         let id = NameId::try_from(self.names.len()).expect("name table exceeds u32");
         self.names.push(name.into());
-        self.ids.insert(name.into(), id);
+        let names = &self.names;
+        self.ids.insert_unique(hash, id, |&id| {
+            std::hash::BuildHasher::hash_one(&oxc_str::IdentBuildHasher, &*names[id as usize])
+        });
         id
     }
 }
@@ -503,7 +543,7 @@ impl Builder<'_> {
         if let Some((at, facts)) = &skipped {
             for name in facts.escape() {
                 let id = self.facts.intern(name);
-                self.facts.references.entry(id).or_default().push(*at);
+                self.facts.reference(id, *at);
             }
             if facts.contains_eval() {
                 self.facts.evals.push(*at);
@@ -1036,12 +1076,8 @@ impl<'a> Visit<'a> for Builder<'_> {
 
     fn visit_identifier_reference(&mut self, it: &oxc_ast::ast::IdentifierReference<'a>) {
         early!(self, strict.enter_identifier_reference(it));
-        let id = self.facts.intern(&it.name);
-        self.facts
-            .references
-            .entry(id)
-            .or_default()
-            .push(it.span.start);
+        let id = self.facts.intern_ident(it.name);
+        self.facts.reference(id, it.span.start);
         let frame = self.top();
         frame.refs.insert(id);
         if frame.field_depth > 0 {
@@ -1180,7 +1216,7 @@ impl<'a> Visit<'a> for Region<'_> {
 
     fn visit_identifier_reference(&mut self, it: &oxc_ast::ast::IdentifierReference<'a>) {
         if self.field_depth > 0
-            && let Some(&id) = self.facts.ids.get(it.name.as_str())
+            && let Some(id) = self.facts.id_of(it.name.as_str())
         {
             self.refs.insert(id);
         }

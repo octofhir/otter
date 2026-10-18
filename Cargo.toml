@@ -45,6 +45,7 @@ oxc_ast         = "0.154"
 oxc_parser      = "0.154"
 oxc_ast_visit   = "0.154"
 oxc_diagnostics = "0.154"
+oxc_str         = "0.154"
 oxc_resolver    = "11.23"
 
 # Errors and serialization.

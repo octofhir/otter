@@ -1116,7 +1116,10 @@ impl Interpreter {
     /// delete, redefine, or attribute change moves or nulls it), no mapped
     /// parameter aliases exist, and the `length` slot still holds the arity.
     /// Value writes through the untouched shape land in the slab this reads.
-    pub(crate) fn arguments_object_direct_list(&self, value: Value) -> Option<SmallVec<[Value; 8]>> {
+    pub(crate) fn arguments_object_direct_list(
+        &self,
+        value: Value,
+    ) -> Option<SmallVec<[Value; 8]>> {
         let obj = value.as_object()?;
         let (shape, argc) = crate::object::arguments_direct_snapshot(obj, &self.gc_heap)?;
         // The cached shapes grow from `%Object.prototype%` roots, which the

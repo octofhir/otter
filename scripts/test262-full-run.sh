@@ -72,6 +72,7 @@ done
 [ -d "$TEST_DIR/annexB" ] && DIRS+=("annexB/")
 [ -d "$TEST_DIR/staging" ] && DIRS+=("staging/")
 [ -d "$TEST_DIR/intl402" ] && DIRS+=("intl402/")
+[ -d "$TEST_DIR/harness" ] && DIRS+=("harness/")
 
 # Full publication cannot exclude paths; use `run --filter` for targeted reports.
 

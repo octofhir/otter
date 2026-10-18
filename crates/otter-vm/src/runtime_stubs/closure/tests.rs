@@ -10,6 +10,7 @@
 //!   frame and typed call roots retain them at the tested allocating boundary.
 //! - Stress priming cannot collect; the closure allocation itself must collect.
 //! - Synthetic resolver metadata is immutable and lives for the whole call.
+//! - Published slot windows are accessed only through their published pointer.
 //!
 //! # See also
 //! - `super` owns the one current compiled closure construction boundary.
@@ -110,13 +111,33 @@ fn inputs(vm: &mut Interpreter, source: &ExecutionContext) -> [Value; 3] {
     })
 }
 
+/// The published register window of a fixture frame. The collector rewrites
+/// its slots through the frame, so every access goes through the published
+/// pointer rather than a Rust borrow the compiler may cache across a call.
+struct FixtureWindow(*mut Value);
+
+impl FixtureWindow {
+    fn get(&self, index: usize) -> Value {
+        assert!(index < 5);
+        // SAFETY: the window spans five initialized slots that outlive the
+        // fixture operation, and nothing borrows them while it runs.
+        unsafe { self.0.add(index).read() }
+    }
+
+    fn set(&self, index: usize, value: Value) {
+        assert!(index < 5);
+        // SAFETY: as for `get`; the slot is a plain `Value` with no drop.
+        unsafe { self.0.add(index).write(value) }
+    }
+}
+
 fn fixture(
     operation: impl FnOnce(
         &mut Interpreter,
         &ExecutionContext,
         &mut Frame,
         &mut RuntimeStubAllocContext,
-        &mut [Value; 5],
+        &FixtureWindow,
     ),
 ) {
     let source = context();
@@ -131,6 +152,7 @@ fn fixture(
         Value::undefined(),
         Value::undefined(),
     ];
+    let window = FixtureWindow(slots.as_mut_ptr());
     let mut frame = Frame::new(
         VmFrameHeader {
             function_id: 0,
@@ -139,7 +161,7 @@ fn fixture(
             kind: NativeFrameKind::Baseline,
             flags: NativeFrameFlags::from_bits(NativeFrameFlags::HAS_SAFEPOINTS),
         },
-        slots.as_mut_ptr() as u64,
+        window.0 as u64,
         Value::function(0),
         Value::undefined(),
     );
@@ -167,7 +189,7 @@ fn fixture(
     thread.runtime_context = std::ptr::from_ref(&activation) as u64;
     thread.code_registry = std::ptr::from_ref(&registry) as u64;
     let mut packet = RuntimeStubAllocContext::new(&mut thread, record.id);
-    operation(&mut vm, &source, &mut frame, &mut packet, &mut slots);
+    operation(&mut vm, &source, &mut frame, &mut packet, &window);
     vm.jit_pop_native_frame();
 }
 
@@ -175,9 +197,8 @@ fn fixture(
 fn typed_closure_allocation_updates_every_explicit_lexical_input_at_strides_1_to_16() {
     for stride in 1..=16 {
         fixture(|vm, _, _, packet, slots| {
-            let before_offsets = slots[..3]
-                .iter()
-                .map(|value| value.as_raw_gc().unwrap().0)
+            let before_offsets = (0..3)
+                .map(|index| slots.get(index).as_raw_gc().unwrap().0)
                 .collect::<Vec<_>>();
             vm.gc_heap.set_gc_stress(stride, false);
             let before = vm.gc_heap.gc_stats().clone();
@@ -193,9 +214,9 @@ fn typed_closure_allocation_updates_every_explicit_lexical_input_at_strides_1_to
                 make_closure_alloc(
                     packet,
                     31,
-                    slots[0].to_bits(),
-                    slots[1].to_bits(),
-                    slots[2].to_bits(),
+                    slots.get(0).to_bits(),
+                    slots.get(1).to_bits(),
+                    slots.get(2).to_bits(),
                 )
             });
             assert_eq!(
@@ -207,11 +228,11 @@ fn typed_closure_allocation_updates_every_explicit_lexical_input_at_strides_1_to
                 .as_closure(&vm.gc_heap)
                 .expect("actual arrow cell");
             assert_eq!(closure.cached_function_id, 2);
-            assert_eq!(closure.context(&vm.gc_heap), slots[0]);
-            assert_eq!(closure.bound_this(&vm.gc_heap), Some(slots[1]));
-            assert_eq!(closure.bound_new_target(&vm.gc_heap), Some(slots[2]));
+            assert_eq!(closure.context(&vm.gc_heap), slots.get(0));
+            assert_eq!(closure.bound_this(&vm.gc_heap), Some(slots.get(1)));
+            assert_eq!(closure.bound_new_target(&vm.gc_heap), Some(slots.get(2)));
             assert_eq!(
-                crate::context::read_slot(&vm.gc_heap, slots[0].as_context().unwrap(), 0),
+                crate::context::read_slot(&vm.gc_heap, slots.get(0).as_context().unwrap(), 0),
                 Some(Value::number_i32(404))
             );
             let after = vm.gc_heap.gc_stats().clone();
@@ -222,7 +243,7 @@ fn typed_closure_allocation_updates_every_explicit_lexical_input_at_strides_1_to
             assert!(after.minor_slot_updates >= before.minor_slot_updates + 3);
             for (index, old) in before_offsets.iter().enumerate() {
                 assert_ne!(
-                    slots[index].as_raw_gc().unwrap().0,
+                    slots.get(index).as_raw_gc().unwrap().0,
                     *old,
                     "stride {stride} input {index} moved inside the typed stub"
                 );
@@ -245,7 +266,7 @@ fn typed_function_registry_constructs_distinct_source_identities_and_refuses_inv
     }
     fixture(|vm, _, frame, packet, slots| {
         frame.header.pc = 0;
-        for slot in &mut slots[3..] {
+        for index in 3..5 {
             let pair = make_function_alloc(
                 packet,
                 31,
@@ -257,15 +278,16 @@ fn typed_function_registry_constructs_distinct_source_identities_and_refuses_inv
                 pair.validate(NativeResultDomain::Probe),
                 Some(NativeResultStatus::Success)
             );
-            *slot = pair.payload_value();
-            let closure = slot.as_closure(&vm.gc_heap).unwrap();
+            slots.set(index, pair.payload_value());
+            let closure = slots.get(index).as_closure(&vm.gc_heap).unwrap();
             assert_eq!(closure.cached_function_id, 1);
             assert!(closure.context(&vm.gc_heap).is_undefined());
             assert_eq!(closure.bound_this(&vm.gc_heap), None);
             assert_eq!(closure.bound_new_target(&vm.gc_heap), None);
         }
         assert_ne!(
-            slots[3], slots[4],
+            slots.get(3),
+            slots.get(4),
             "every evaluation creates a fresh identity"
         );
         let before = vm.gc_heap.gc_stats().alloc_bytes_total;
@@ -273,16 +295,16 @@ fn typed_function_registry_constructs_distinct_source_identities_and_refuses_inv
             make_function_alloc(
                 packet,
                 31,
-                slots[0].to_bits(),
+                slots.get(0).to_bits(),
                 Value::UNDEFINED.to_bits(),
                 Value::UNDEFINED.to_bits(),
             ),
             make_closure_alloc(
                 packet,
                 31,
-                slots[0].to_bits(),
-                slots[1].to_bits(),
-                slots[2].to_bits(),
+                slots.get(0).to_bits(),
+                slots.get(1).to_bits(),
+                slots.get(2).to_bits(),
             ),
             make_function_alloc(
                 packet,
@@ -328,9 +350,9 @@ fn typed_function_registry_constructs_distinct_source_identities_and_refuses_inv
 fn typed_closure_oom_preserves_collector_updated_inputs_before_canonical_resume() {
     fixture(|vm, source, _, packet, slots| {
         let setup_heap = vm.gc_heap.stats();
-        let context = slots[0].as_context().expect("initial scope context");
-        let receiver = slots[1].as_object().expect("initial lexical receiver");
-        let target = slots[2].as_object().expect("initial lexical target");
+        let context = slots.get(0).as_context().expect("initial scope context");
+        let receiver = slots.get(1).as_object().expect("initial lexical receiver");
+        let target = slots.get(2).as_object().expect("initial lexical target");
         // SAFETY: these three actual input cells are live; no allocation or
         // collection occurs before their authoritative header sizes are read.
         let input_bytes = unsafe {
@@ -340,7 +362,9 @@ fn typed_closure_oom_preserves_collector_updated_inputs_before_canonical_resume(
         };
         // Discard setup cells and settle all reclaimable bootstrap garbage
         // before creating the three fresh young inputs of the measured call.
-        slots.fill(Value::undefined());
+        for index in 0..5 {
+            slots.set(index, Value::undefined());
+        }
         vm.gc_heap.set_gc_stress(0, false);
         vm.with_runtime_roots(|vm| vm.gc_heap.collect_full(&mut |_| {}))
             .expect("preflight full collection removes reclaimable setup cells");
@@ -359,7 +383,9 @@ fn typed_closure_oom_preserves_collector_updated_inputs_before_canonical_resume(
             "pressure is based on post-sweep occupied bytes: {admitted_heap:?}"
         );
         let setup_cycles = vm.gc_heap.gc_cycle_counts();
-        slots[..3].copy_from_slice(&inputs(vm, source));
+        for (index, value) in inputs(vm, source).into_iter().enumerate() {
+            slots.set(index, value);
+        }
         let built_heap = vm.gc_heap.stats();
         assert_eq!(
             built_heap.allocated_bytes - admitted_heap.allocated_bytes,
@@ -371,9 +397,8 @@ fn typed_closure_oom_preserves_collector_updated_inputs_before_canonical_resume(
             setup_cycles,
             "no setup collection may age or relocate the fresh inputs"
         );
-        let original: Vec<_> = slots[..3]
-            .iter()
-            .map(|value| value.as_raw_gc().unwrap().0)
+        let original: Vec<_> = (0..3)
+            .map(|index| slots.get(index).as_raw_gc().unwrap().0)
             .collect();
         vm.gc_heap.set_gc_stress(1, false);
         // Retire/refund any LAB before the only measured allocating call.
@@ -385,9 +410,9 @@ fn typed_closure_oom_preserves_collector_updated_inputs_before_canonical_resume(
             make_closure_alloc(
                 packet,
                 31,
-                slots[0].to_bits(),
-                slots[1].to_bits(),
-                slots[2].to_bits(),
+                slots.get(0).to_bits(),
+                slots.get(1).to_bits(),
+                slots.get(2).to_bits(),
             )
         });
         let after_heap = vm.gc_heap.stats();
@@ -415,20 +440,21 @@ fn typed_closure_oom_preserves_collector_updated_inputs_before_canonical_resume(
         assert!(after.minor_gc_cycles > before.minor_gc_cycles);
         assert!(after.minor_root_slots_scanned > before.minor_root_slots_scanned);
         assert!(after.minor_slot_updates >= before.minor_slot_updates + 3);
-        assert!(slots[1].is_object() && slots[2].is_object());
+        assert!(slots.get(1).is_object() && slots.get(2).is_object());
         assert_ne!(
-            slots[1], slots[2],
+            slots.get(1),
+            slots.get(2),
             "lexical receiver and target remain distinct"
         );
         for (index, old) in original.iter().enumerate() {
             assert_ne!(
-                slots[index].as_raw_gc().unwrap().0,
+                slots.get(index).as_raw_gc().unwrap().0,
                 *old,
                 "OOM must leave caller home {index} rewritten before resume"
             );
         }
         assert_eq!(
-            crate::context::read_slot(&vm.gc_heap, slots[0].as_context().unwrap(), 0),
+            crate::context::read_slot(&vm.gc_heap, slots.get(0).as_context().unwrap(), 0),
             Some(Value::number_i32(404))
         );
     });

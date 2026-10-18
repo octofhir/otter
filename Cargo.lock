@@ -2716,7 +2716,6 @@ dependencies = [
  "libc",
  "otter-resource",
  "serde_json",
- "smallvec",
  "static_assertions",
  "thiserror",
 ]
@@ -2781,7 +2780,6 @@ dependencies = [
  "crc32fast",
  "flate2",
  "getrandom 0.3.4",
- "globset",
  "idna",
  "libc",
  "libloading",

@@ -97,6 +97,9 @@ static USER_DEFAULT_CACHE: OnceLock<Option<CompileCache>> = OnceLock::new();
 pub(crate) struct CompileCacheKey(Box<str>);
 
 impl CompileCacheKey {
+    /// Length of every key's spelling.
+    pub(crate) const LEN: usize = 32;
+
     fn from_digest(digest: u128) -> Self {
         Self(format!("{digest:032x}").into())
     }

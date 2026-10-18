@@ -8,6 +8,8 @@
 //! - Bytes taken after the script's functions ran carry their bodies: a run
 //!   given those compiles none of them either. Two different scripts run
 //!   under one address keep no bodies for it.
+//! - A large indirect `eval` is kept through the code-cache hook, and its
+//!   functions' bodies with it once they ran.
 //! - The same source under another specifier runs from the same bytes, and
 //!   its functions name the specifier it ran under.
 //! - Bytes for another source or a damaged copy are a miss: the script
@@ -134,4 +136,60 @@ fn bytes_that_do_not_match_are_a_miss() {
         assert!(fresh.is_some(), "a miss produces fresh bytes");
         assert_eq!(runtime.scripts_compiled(), compiled + 1);
     }
+}
+
+/// A code-cache hook over a map.
+#[derive(Default)]
+struct MapCache {
+    entries: std::sync::Mutex<std::collections::HashMap<String, Vec<u8>>>,
+}
+
+impl otter_runtime::RuntimeCodeCacheHook for MapCache {
+    fn load(&self, key: &str) -> Option<Vec<u8>> {
+        self.entries.lock().unwrap().get(key).cloned()
+    }
+
+    fn store(&self, key: &str, bytes: Vec<u8>) {
+        self.entries.lock().unwrap().insert(key.to_owned(), bytes);
+    }
+}
+
+#[test]
+fn a_large_eval_runs_again_from_the_hook_with_its_bodies() {
+    let library = format!(
+        "{}\nvar lib = {{ twice: function (x) {{ return x * 2; }} }}; lib.twice(1);\n//# sourceURL=https://example.test/lib.js",
+        "/* padding */ ".repeat(2048)
+    );
+    let page = format!(
+        "(0, eval)({}); lib.twice(21)",
+        serde_json::to_string(&library).unwrap()
+    );
+    let cache = std::sync::Arc::new(MapCache::default());
+
+    let mut first = Runtime::builder().build().expect("runtime");
+    first.set_code_cache_hook(Some(cache.clone()));
+    let lazily = first.lazy_function_bodies_compiled();
+    let result = first
+        .run_script(
+            SourceInput::from_javascript(&page),
+            "https://example.test/page.js",
+        )
+        .expect("page runs");
+    assert_eq!(result.completion_string(), "42");
+    assert_eq!(first.lazy_function_bodies_compiled(), lazily + 1);
+    first.keep_eval_code_caches();
+    assert_eq!(cache.entries.lock().unwrap().len(), 1);
+
+    let mut second = Runtime::builder().build().expect("runtime");
+    second.set_code_cache_hook(Some(cache.clone()));
+    let lazily = second.lazy_function_bodies_compiled();
+    let result = second
+        .run_script(
+            SourceInput::from_javascript(&page),
+            "https://example.test/page.js",
+        )
+        .expect("page runs");
+    assert_eq!(result.completion_string(), "42");
+    // Nothing the evaluated library defines compiles again.
+    assert_eq!(second.lazy_function_bodies_compiled(), lazily);
 }

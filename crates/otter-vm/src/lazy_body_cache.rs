@@ -135,7 +135,7 @@ pub(crate) fn fingerprint(
 
 /// The module a kept body encodes, named for `url`.
 pub(crate) fn decode(bytes: &[u8], url: &str) -> Option<BytecodeModule> {
-    let mut module = otter_bytecode::binary::decode_module_for_link(bytes).ok()?;
+    let mut module = otter_bytecode::binary::decode_module_for_link(bytes, None).ok()?;
     url.clone_into(&mut module.module);
     for function in &mut module.functions {
         url.clone_into(&mut function.module_url);
@@ -177,6 +177,28 @@ impl crate::Interpreter {
             Some(Kept::Script(_) | Kept::Ambiguous) => Kept::Ambiguous,
         };
         self.lazy_body_store.scripts.insert(url.into(), entry);
+    }
+
+    /// Every kept script whose bytes `kept_here` claims and whose functions
+    /// compiled a body since it was kept or last handed back, by URL.
+    pub fn kept_script_caches(
+        &mut self,
+        kept_here: impl Fn(&[u8]) -> bool,
+    ) -> Vec<(String, KeptScript)> {
+        let urls: Vec<String> = self
+            .lazy_body_store
+            .scripts
+            .iter()
+            .filter_map(|(url, kept)| match kept {
+                Kept::Script(script) if script.compiled > 0 && kept_here(&script.top) => {
+                    Some(url.to_string())
+                }
+                Kept::Script(_) | Kept::Ambiguous => None,
+            })
+            .collect();
+        urls.into_iter()
+            .filter_map(|url| self.kept_script_cache(&url).map(|kept| (url, kept)))
+            .collect()
     }
 
     /// `url`'s kept script, when a first call compiled a body since it was

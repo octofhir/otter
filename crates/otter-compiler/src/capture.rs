@@ -20,6 +20,9 @@
 //!   for block, `switch` and loop-head predeclaration.
 //! - Single-construct finders: derived `this`, `with` reachability,
 //!   `.arguments` reads, `new.target`.
+//! - [`CaptureFacts::of_checked_unit`] — the same pass feeding the unit's
+//!   early-error passes ([`crate::strict_validation::EarlyErrors`]) every
+//!   node, so a compile unit is walked once for both.
 //!
 //! # Invariants
 //! - Every scope is walked once; a nested scope hands its ancestors only the
@@ -182,12 +185,6 @@ pub(crate) struct FunctionNode {
 }
 
 impl CaptureFacts {
-    /// Analyze the top-level statements of one compile unit.
-    #[must_use]
-    pub(crate) fn of_unit(stmts: &[Statement<'_>]) -> Self {
-        Self::of_unit_skipping(stmts, None)
-    }
-
     /// Analyze a unit whose skipped functions' bodies were left out of its
     /// text: each one hands its ancestors what `skips` recorded for it, as
     /// if its body had been walked.
@@ -196,8 +193,28 @@ impl CaptureFacts {
         stmts: &[Statement<'_>],
         skips: Option<&crate::preparse::SkipTable>,
     ) -> Self {
+        Self::analyze(stmts, skips, None).0
+    }
+
+    /// Analyze the top-level statements of one compile unit and, in the same
+    /// walk, run its early-error passes over every node.
+    #[must_use]
+    pub(crate) fn of_checked_unit(
+        stmts: &[Statement<'_>],
+        early: crate::strict_validation::EarlyErrors,
+    ) -> (Self, crate::strict_validation::EarlyErrors) {
+        let (facts, early) = Self::analyze(stmts, None, Some(early));
+        (facts, early.expect("the walk returns the passes it ran"))
+    }
+
+    fn analyze(
+        stmts: &[Statement<'_>],
+        skips: Option<&crate::preparse::SkipTable>,
+        early: Option<crate::strict_validation::EarlyErrors>,
+    ) -> (Self, Option<crate::strict_validation::EarlyErrors>) {
         let mut builder = Builder {
             skips,
+            early,
             ..Builder::default()
         };
         builder.facts.intern("arguments");
@@ -214,7 +231,7 @@ impl CaptureFacts {
             positions.sort_unstable();
         }
         facts.evals.sort_unstable();
-        facts
+        (facts, builder.early)
     }
 
     /// Facts of a function or arrow body of this unit.
@@ -439,6 +456,8 @@ struct Builder<'s> {
     method_values: FxHashSet<u32>,
     /// Span starts of function expressions run where they stand.
     immediate: FxHashSet<u32>,
+    /// The unit's early-error passes, fed every node of this one walk.
+    early: Option<crate::strict_validation::EarlyErrors>,
 }
 
 impl Builder<'_> {
@@ -663,9 +682,21 @@ impl Builder<'_> {
     }
 }
 
+/// Run a hook of the unit's early-error passes, when the walk carries them.
+macro_rules! early {
+    ($self:ident, $pass:ident . $hook:ident ( $($arg:expr),* )) => {
+        if let Some(early) = $self.early.as_mut() {
+            early.$pass.$hook($($arg),*);
+        }
+    };
+}
+
 impl<'a> Visit<'a> for Builder<'_> {
     fn visit_function(&mut self, it: &Function<'a>, _flags: oxc_syntax::scope::ScopeFlags) {
+        early!(self, strict.enter_function(it));
+        early!(self, blocks.enter_function(it));
         if let Some(id) = &it.id {
+            early!(self, strict.enter_binding_identifier(id));
             self.own(&id.name);
             if it.is_declaration() {
                 self.note_write(&id.name);
@@ -698,9 +729,13 @@ impl<'a> Visit<'a> for Builder<'_> {
             );
             self.function_stack.pop();
         }
+        early!(self, blocks.leave_function(it));
+        early!(self, strict.leave_function(it));
     }
 
     fn visit_arrow_function_expression(&mut self, it: &ArrowFunctionExpression<'a>) {
+        early!(self, strict.enter_arrow_function_expression(it));
+        early!(self, blocks.enter_arrow_function_expression(it));
         self.open_function_node(
             (it.span.start, it.span.end),
             None,
@@ -713,11 +748,25 @@ impl<'a> Visit<'a> for Builder<'_> {
             crate::body::Body::Arrow(&it.body),
         );
         self.function_stack.pop();
+        early!(self, blocks.leave_arrow_function_expression(it));
+        early!(self, strict.leave_arrow_function_expression(it));
+    }
+
+    fn visit_function_body(&mut self, it: &oxc_ast::ast::FunctionBody<'a>) {
+        early!(self, blocks.enter_function_body(it));
+        walk::walk_function_body(self, it);
     }
 
     fn visit_method_definition(&mut self, it: &oxc_ast::ast::MethodDefinition<'a>) {
         self.method_values.insert(it.value.span.start);
+        early!(self, strict.enter_method_definition(it));
         walk::walk_method_definition(self, it);
+        early!(self, strict.leave_method_definition(it));
+    }
+
+    fn visit_object_expression(&mut self, it: &oxc_ast::ast::ObjectExpression<'a>) {
+        early!(self, strict.enter_object_expression(it));
+        walk::walk_object_expression(self, it);
     }
 
     fn visit_object_property(&mut self, it: &oxc_ast::ast::ObjectProperty<'a>) {
@@ -726,13 +775,17 @@ impl<'a> Visit<'a> for Builder<'_> {
         {
             self.method_values.insert(function.span.start);
         }
-        walk::walk_object_property(self, it);
+        self.visit_property_key(&it.key);
+        early!(self, strict.enter_object_property_value(it));
+        self.visit_expression(&it.value);
+        early!(self, strict.leave_object_property_value(it));
     }
 
     fn visit_new_expression(&mut self, it: &oxc_ast::ast::NewExpression<'a>) {
         if let Some(start) = immediate_function(&it.callee) {
             self.immediate.insert(start);
         }
+        early!(self, blocks.enter_new_expression(it));
         walk::walk_new_expression(self, it);
     }
 
@@ -744,6 +797,8 @@ impl<'a> Visit<'a> for Builder<'_> {
     }
 
     fn visit_static_block(&mut self, it: &oxc_ast::ast::StaticBlock<'a>) {
+        early!(self, strict.enter_static_block(it));
+        early!(self, blocks.enter_static_block(it));
         let frame = self.fresh_frame(
             FrameKind::StaticBlock,
             std::ptr::from_ref(&it.body) as usize,
@@ -753,15 +808,34 @@ impl<'a> Visit<'a> for Builder<'_> {
             self.visit_statement(stmt);
         }
         self.exit((it.span.start, it.span.end));
+        early!(self, blocks.leave_static_block(it));
+        early!(self, strict.leave_static_block(it));
     }
 
     fn visit_class(&mut self, it: &Class<'a>) {
+        early!(self, strict.enter_class(it));
+        early!(self, blocks.enter_class(it));
         if let Some(id) = &it.id {
             self.own(&id.name);
         }
         self.top().class_depth += 1;
-        walk::walk_class(self, it);
+        self.visit_decorators(&it.decorators);
+        if let Some(id) = &it.id {
+            self.visit_binding_identifier(id);
+        }
+        if let Some(type_parameters) = &it.type_parameters {
+            self.visit_ts_type_parameter_declaration(type_parameters);
+        }
+        if let Some(heritage) = &it.heritage {
+            self.visit_class_heritage(heritage);
+        }
+        self.visit_ts_class_implements_list(&it.implements);
+        early!(self, strict.enter_class_body(it));
+        self.visit_class_body(&it.body);
+        early!(self, strict.leave_class_body());
         self.top().class_depth -= 1;
+        early!(self, blocks.leave_class());
+        early!(self, strict.leave_class());
     }
 
     fn visit_class_body(&mut self, it: &oxc_ast::ast::ClassBody<'a>) {
@@ -774,7 +848,16 @@ impl<'a> Visit<'a> for Builder<'_> {
         // Field initializers and computed field keys lower into a nested
         // frame (the constructor or the statics initializer).
         self.top().field_depth += 1;
-        walk::walk_property_definition(self, it);
+        self.visit_decorators(&it.decorators);
+        self.visit_property_key(&it.key);
+        if let Some(type_annotation) = &it.type_annotation {
+            self.visit_ts_type_annotation(type_annotation);
+        }
+        if let Some(value) = &it.value {
+            early!(self, strict.enter_property_definition_value());
+            self.visit_expression(value);
+            early!(self, strict.leave_property_definition_value());
+        }
         self.top().field_depth -= 1;
     }
 
@@ -790,6 +873,10 @@ impl<'a> Visit<'a> for Builder<'_> {
         walk::walk_formal_parameter(self, it);
     }
 
+    fn visit_binding_identifier(&mut self, it: &oxc_ast::ast::BindingIdentifier<'a>) {
+        early!(self, strict.enter_binding_identifier(it));
+    }
+
     fn visit_variable_declaration(&mut self, it: &oxc_ast::ast::VariableDeclaration<'a>) {
         if it.kind.is_var() {
             for declarator in &it.declarations {
@@ -799,6 +886,7 @@ impl<'a> Visit<'a> for Builder<'_> {
                 });
             }
         }
+        early!(self, strict.enter_variable_declaration(it));
         walk::walk_variable_declaration(self, it);
     }
 
@@ -810,12 +898,44 @@ impl<'a> Visit<'a> for Builder<'_> {
         walk::walk_variable_declarator(self, it);
     }
 
+    fn visit_block_statement(&mut self, it: &oxc_ast::ast::BlockStatement<'a>) {
+        early!(self, blocks.enter_block_statement(it));
+        walk::walk_block_statement(self, it);
+    }
+
+    fn visit_switch_statement(&mut self, it: &oxc_ast::ast::SwitchStatement<'a>) {
+        early!(self, strict.enter_switch_statement(it));
+        early!(self, blocks.enter_switch_statement(it));
+        walk::walk_switch_statement(self, it);
+    }
+
+    fn visit_if_statement(&mut self, it: &oxc_ast::ast::IfStatement<'a>) {
+        early!(self, strict.enter_if_statement(it));
+        walk::walk_if_statement(self, it);
+    }
+
+    fn visit_while_statement(&mut self, it: &oxc_ast::ast::WhileStatement<'a>) {
+        early!(self, strict.enter_while_statement(it));
+        walk::walk_while_statement(self, it);
+    }
+
+    fn visit_do_while_statement(&mut self, it: &oxc_ast::ast::DoWhileStatement<'a>) {
+        early!(self, strict.enter_do_while_statement(it));
+        walk::walk_do_while_statement(self, it);
+    }
+
+    fn visit_for_statement(&mut self, it: &oxc_ast::ast::ForStatement<'a>) {
+        early!(self, strict.enter_for_statement(it));
+        walk::walk_for_statement(self, it);
+    }
+
     fn visit_for_in_statement(&mut self, it: &oxc_ast::ast::ForInStatement<'a>) {
         if let oxc_ast::ast::ForStatementLeft::VariableDeclaration(declaration) = &it.left {
             for declarator in &declaration.declarations {
                 pattern_leaves(&declarator.id, &mut |name| self.note_write(name));
             }
         }
+        early!(self, strict.enter_for_in_statement(it));
         walk::walk_for_in_statement(self, it);
     }
 
@@ -825,7 +945,26 @@ impl<'a> Visit<'a> for Builder<'_> {
                 pattern_leaves(&declarator.id, &mut |name| self.note_write(name));
             }
         }
+        early!(self, strict.enter_for_of_statement(it));
         walk::walk_for_of_statement(self, it);
+    }
+
+    fn visit_labeled_statement(&mut self, it: &oxc_ast::ast::LabeledStatement<'a>) {
+        early!(self, strict.enter_labeled_statement(it));
+        early!(self, blocks.enter_labeled_statement(it));
+        walk::walk_labeled_statement(self, it);
+        early!(self, blocks.leave_labeled_statement(it));
+    }
+
+    fn visit_with_statement(&mut self, it: &oxc_ast::ast::WithStatement<'a>) {
+        early!(self, strict.enter_with_statement(it));
+        early!(self, blocks.enter_with_statement(it));
+        walk::walk_with_statement(self, it);
+    }
+
+    fn visit_catch_clause(&mut self, it: &oxc_ast::ast::CatchClause<'a>) {
+        early!(self, strict.enter_catch_clause(it));
+        walk::walk_catch_clause(self, it);
     }
 
     fn visit_simple_assignment_target(&mut self, it: &oxc_ast::ast::SimpleAssignmentTarget<'a>) {
@@ -842,6 +981,7 @@ impl<'a> Visit<'a> for Builder<'_> {
                 }
             }
         }
+        early!(self, strict.enter_simple_assignment_target(it));
         walk::walk_simple_assignment_target(self, it);
     }
 
@@ -850,7 +990,18 @@ impl<'a> Visit<'a> for Builder<'_> {
         it: &oxc_ast::ast::AssignmentTargetPropertyIdentifier<'a>,
     ) {
         self.note_write(&it.binding.name);
+        early!(self, strict.enter_assignment_target_property_identifier(it));
         walk::walk_assignment_target_property_identifier(self, it);
+    }
+
+    fn visit_assignment_expression(&mut self, it: &oxc_ast::ast::AssignmentExpression<'a>) {
+        early!(self, strict.enter_assignment_expression(it));
+        walk::walk_assignment_expression(self, it);
+    }
+
+    fn visit_update_expression(&mut self, it: &oxc_ast::ast::UpdateExpression<'a>) {
+        early!(self, strict.enter_update_expression(it));
+        walk::walk_update_expression(self, it);
     }
 
     fn visit_unary_expression(&mut self, it: &oxc_ast::ast::UnaryExpression<'a>) {
@@ -859,7 +1010,13 @@ impl<'a> Visit<'a> for Builder<'_> {
         {
             self.note_arguments_escape();
         }
+        early!(self, strict.enter_unary_expression(it));
         walk::walk_unary_expression(self, it);
+    }
+
+    fn visit_await_expression(&mut self, it: &oxc_ast::ast::AwaitExpression<'a>) {
+        early!(self, blocks.enter_await_expression(it));
+        walk::walk_await_expression(self, it);
     }
 
     fn visit_tagged_template_expression(
@@ -878,6 +1035,7 @@ impl<'a> Visit<'a> for Builder<'_> {
     }
 
     fn visit_identifier_reference(&mut self, it: &oxc_ast::ast::IdentifierReference<'a>) {
+        early!(self, strict.enter_identifier_reference(it));
         let id = self.facts.intern(&it.name);
         self.facts
             .references
@@ -915,7 +1073,30 @@ impl<'a> Visit<'a> for Builder<'_> {
                 }
             }
         }
+        early!(self, strict.enter_call_expression(it));
         walk::walk_call_expression(self, it);
+    }
+
+    fn visit_super(&mut self, it: &oxc_ast::ast::Super) {
+        early!(self, strict.enter_super(it));
+    }
+
+    fn visit_private_field_expression(&mut self, it: &oxc_ast::ast::PrivateFieldExpression<'a>) {
+        early!(self, strict.enter_private_field_expression(it));
+        walk::walk_private_field_expression(self, it);
+    }
+
+    fn visit_private_in_expression(&mut self, it: &oxc_ast::ast::PrivateInExpression<'a>) {
+        early!(self, strict.enter_private_in_expression(it));
+        walk::walk_private_in_expression(self, it);
+    }
+
+    fn visit_numeric_literal(&mut self, it: &oxc_ast::ast::NumericLiteral<'a>) {
+        early!(self, strict.enter_numeric_literal(it));
+    }
+
+    fn visit_string_literal(&mut self, it: &oxc_ast::ast::StringLiteral<'a>) {
+        early!(self, strict.enter_string_literal(it));
     }
 
     fn visit_static_member_expression(&mut self, it: &oxc_ast::ast::StaticMemberExpression<'a>) {

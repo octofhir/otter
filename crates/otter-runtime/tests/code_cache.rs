@@ -10,6 +10,8 @@
 //!   under one address keep no bodies for it.
 //! - A large indirect `eval` is kept through the code-cache hook, and its
 //!   functions' bodies with it once they ran.
+//! - A script prepared on another thread runs as the same script run from
+//!   `run_script_cached` would.
 //! - The same source under another specifier runs from the same bytes, and
 //!   its functions name the specifier it ran under.
 //! - Bytes for another source or a damaged copy are a miss: the script
@@ -192,4 +194,30 @@ fn a_large_eval_runs_again_from_the_hook_with_its_bodies() {
     assert_eq!(result.completion_string(), "42");
     // Nothing the evaluated library defines compiles again.
     assert_eq!(second.lazy_function_bodies_compiled(), lazily);
+}
+
+#[test]
+fn a_script_prepared_on_another_thread_runs_as_a_cached_one() {
+    let prepare = |cache: Option<Vec<u8>>| {
+        std::thread::spawn(move || {
+            otter_runtime::PreparedScript::prepare(
+                SourceInput::from_javascript(SCRIPT),
+                "https://example.test/a.js",
+                cache.as_deref(),
+            )
+        })
+        .join()
+        .expect("prepared")
+    };
+    let mut runtime = Runtime::builder().build().expect("runtime");
+    let compiled = runtime.scripts_compiled();
+    let (result, fresh) = runtime.run_prepared_script(prepare(None)).expect("runs");
+    assert_eq!(result.completion_string(), "42:71");
+    assert_eq!(runtime.scripts_compiled(), compiled + 1);
+    let mut again = Runtime::builder().build().expect("runtime");
+    let compiled = again.scripts_compiled();
+    let (result, fresh) = again.run_prepared_script(prepare(fresh)).expect("runs");
+    assert_eq!(result.completion_string(), "42:71");
+    assert!(fresh.is_none(), "the bytes were used");
+    assert_eq!(again.scripts_compiled(), compiled);
 }

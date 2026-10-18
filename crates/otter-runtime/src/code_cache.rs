@@ -9,6 +9,8 @@
 //! # Contents
 //! - [`Runtime::run_script_cached`] — run a classic script from cached
 //!   bytes when they still match, and produce fresh ones when they do not.
+//! - [`PreparedScript`] / [`Runtime::run_prepared_script`] — the same in two
+//!   steps: compile or decode on any thread, then run.
 //! - [`Runtime::script_code_cache`] — the bytes again once the script's
 //!   functions have run, with the bodies they compiled on their first call.
 //! - [`Runtime::web_module_code_caches`] — the same for delivered web
@@ -79,46 +81,74 @@ impl Runtime {
                 .run_script(source, specifier)
                 .map(|result| (result, None));
         }
-        let key = script_key(&source);
-        let cached = cache.and_then(|bytes| decode(bytes, &key, &source.text));
+        self.run_prepared_script(PreparedScript::prepare(source, specifier, cache))
+    }
+
+    /// Run a script [`PreparedScript::prepare`] compiled or read back,
+    /// possibly on another thread: the same run [`Self::run_script_cached`]
+    /// gives, and the same fresh bytes.
+    ///
+    /// # Errors
+    /// As [`Self::run_script`], the prepared script's syntax errors
+    /// included.
+    pub fn run_prepared_script(
+        &mut self,
+        prepared: PreparedScript,
+    ) -> Result<(ExecutionResult, Option<Vec<u8>>), OtterError> {
+        let PreparedScript {
+            source,
+            specifier,
+            prepared,
+        } = prepared;
+        // A compile hook is another compiler, whose output the prepared
+        // script is not.
+        if self.config.hooks.compile_hook().is_some() {
+            return self
+                .run_script(source, &specifier)
+                .map(|result| (result, None));
+        }
+        let specifier = specifier.as_str();
         self.interp.begin_jit_debug_capture();
         let (result, fresh) = self.with_direct_timeout(move |runtime| {
             let start = std::time::Instant::now();
-            if let Some(Decoded { module, kept }) = cached {
-                runtime.interp.keep_script_cache(specifier, kept);
-                let verified = module.with_module_url(specifier);
-                let text = module_loader::admit_source(
-                    &runtime.config.resource_account,
-                    specifier,
-                    source.text,
-                )
-                .map_err(module_loader::LoaderError::into_otter_error)?;
-                let sources = script_source::script_sources(
-                    verified.module(),
-                    text,
-                    specifier,
-                    &runtime.config.resource_account,
-                )?;
-                let context = runtime.interp.link_verified_module(verified, sources)?;
-                return runtime
-                    .run_linked_script_with_context_since(context, start)
-                    .map(|(result, _)| (result, None));
+            match prepared? {
+                Prepared::Cached(Decoded { module, kept }) => {
+                    runtime.interp.keep_script_cache(specifier, kept);
+                    let verified = module.with_module_url(specifier);
+                    let text = module_loader::admit_source(
+                        &runtime.config.resource_account,
+                        specifier,
+                        source.text,
+                    )
+                    .map_err(module_loader::LoaderError::into_otter_error)?;
+                    let sources = script_source::script_sources(
+                        verified.module(),
+                        text,
+                        specifier,
+                        &runtime.config.resource_account,
+                    )?;
+                    let context = runtime.interp.link_verified_module(verified, sources)?;
+                    runtime
+                        .run_linked_script_with_context_since(context, start)
+                        .map(|(result, _)| (result, None))
+                }
+                Prepared::Fresh { compiled, top } => {
+                    runtime.note_script_compiled(&compiled);
+                    runtime.interp.keep_script_cache(
+                        specifier,
+                        KeptScript {
+                            top: top.clone(),
+                            bodies: Vec::new(),
+                        },
+                    );
+                    let bytes = with_bodies(top, &[]);
+                    let (module, sources) =
+                        runtime.prepare_script_source(compiled.bytecode, source, specifier)?;
+                    runtime
+                        .run_compiled_script_with_context_since(module, sources, start)
+                        .map(|(result, _)| (result, Some(bytes)))
+                }
             }
-            let compiled = runtime.compile_source(&source, specifier)?;
-            let bytes = encode(&compiled.bytecode, &key, specifier)?;
-            runtime.interp.keep_script_cache(
-                specifier,
-                KeptScript {
-                    top: bytes.clone(),
-                    bodies: Vec::new(),
-                },
-            );
-            let bytes = with_bodies(bytes, &[]);
-            let (module, sources) =
-                runtime.prepare_script_source(compiled.bytecode, source, specifier)?;
-            runtime
-                .run_compiled_script_with_context_since(module, sources, start)
-                .map(|(result, _)| (result, Some(bytes)))
         })?;
         Ok((self.attach_jit_debug_report(result), fresh))
     }
@@ -212,6 +242,61 @@ impl Runtime {
 /// specifier, which a run stamps on the decoded functions instead.
 fn script_key(source: &SourceInput) -> CompileCacheKey {
     cache_key(&source.text, source.kind, "")
+}
+
+/// A classic script compiled, or read back from its code-cache bytes, by
+/// [`Self::prepare`] on any thread, for [`Runtime::run_prepared_script`]
+/// to run on the isolate's.
+///
+/// A browser has a script's bytes before it runs the script: preparing it
+/// as they arrive takes the parse and compile (or the decode and verify)
+/// off the thread that runs the page.
+pub struct PreparedScript {
+    source: SourceInput,
+    specifier: String,
+    prepared: Result<Prepared, OtterError>,
+}
+
+enum Prepared {
+    /// The code cache held this compile.
+    Cached(Decoded),
+    /// A fresh compile, and its code-cache bytes besides the body section.
+    Fresh {
+        compiled: otter_compiler::CompiledModule,
+        top: Vec<u8>,
+    },
+}
+
+const _: fn() = || {
+    fn send<T: Send>() {}
+    send::<PreparedScript>();
+};
+
+impl PreparedScript {
+    /// Compile `source`, run as `specifier`, unless `cache` holds its
+    /// compiled form, which is then decoded and verified instead.
+    #[must_use]
+    pub fn prepare(source: SourceInput, specifier: &str, cache: Option<&[u8]>) -> Self {
+        let key = script_key(&source);
+        let prepared = match cache.and_then(|bytes| decode(bytes, &key, &source.text)) {
+            Some(decoded) => Ok(Prepared::Cached(decoded)),
+            None => crate::compile_classic_script(&source, specifier).and_then(|compiled| {
+                let top = encode(&compiled.bytecode, &key, specifier)?;
+                Ok(Prepared::Fresh { compiled, top })
+            }),
+        };
+        Self {
+            source,
+            specifier: specifier.to_owned(),
+            prepared,
+        }
+    }
+
+    /// The specifier the script runs as.
+    #[must_use]
+    pub fn specifier(&self) -> &str {
+        &self.specifier
+    }
 }
 
 /// Whether `eval` of `source` under `options` is kept in the code cache: a

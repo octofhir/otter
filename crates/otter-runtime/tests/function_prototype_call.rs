@@ -836,7 +836,8 @@ fn function_bind_observes_target_metadata_getters() {
         bound.name + ":" + bound.length + ":" + nameReads + ":" +
             lengthReads + ":" + throws;
         "#);
-    assert_eq!(completion, "bound dynamic:7:1:1:true");
+    // §20.2.3.2 reads `length` before `name`, so the throwing bind reads it too.
+    assert_eq!(completion, "bound dynamic:7:1:2:true");
 }
 
 #[test]

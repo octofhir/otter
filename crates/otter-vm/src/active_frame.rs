@@ -131,6 +131,35 @@ fn checked_register_windows(
     Ok((registers, incoming))
 }
 
+/// Windows of a frame a Rust reference already proves initialized: its
+/// register window is the record's own attached slice, and its actual window
+/// is the span its linkage published. Only raw pointers from foreign code
+/// need [`checked_register_windows`].
+#[inline]
+fn frame_windows(frame: &Frame) -> (NativeWindow<Value>, NativeWindow<Value>) {
+    debug_assert!(
+        checked_register_windows(frame).is_ok(),
+        "an initialized frame publishes valid windows"
+    );
+    let register_count = usize::from(frame.header.register_count);
+    let registers = match NonNull::new(frame.registers.as_mut_ptr()) {
+        Some(base) if register_count != 0 => NativeWindow {
+            base,
+            len: register_count,
+        },
+        _ => NativeWindow::empty(),
+    };
+    let incoming_count = frame.incoming_argument_count() as usize;
+    let incoming = match NonNull::new(frame.actuals) {
+        Some(base) if incoming_count != 0 => NativeWindow {
+            base,
+            len: incoming_count,
+        },
+        _ => NativeWindow::empty(),
+    };
+    (registers, incoming)
+}
+
 /// Shared slot-scoped access to one live activation.
 #[derive(Debug)]
 pub struct ActiveFrameRef<'a> {
@@ -153,8 +182,13 @@ impl<'a> ActiveFrameRef<'a> {
     /// Borrow an initialized frame and its published windows.
     #[must_use]
     pub fn from_frame(frame: &'a Frame) -> Self {
-        // SAFETY: the frame owner keeps its initialized windows live.
-        unsafe { Self::from_ptr(frame) }.expect("initialized frame windows")
+        let (registers, incoming) = frame_windows(frame);
+        Self {
+            frame: NonNull::from(frame),
+            registers,
+            incoming,
+            _lifetime: PhantomData,
+        }
     }
 
     /// Open a view over a published frame without retaining Rust references.
@@ -271,8 +305,13 @@ impl<'a> ActiveFrameMut<'a> {
     /// Borrow one initialized activation for logical mutator access.
     #[must_use]
     pub fn from_frame(frame: &'a mut Frame) -> Self {
-        // SAFETY: exclusive frame ownership retains initialized windows.
-        unsafe { Self::from_ptr(frame) }.expect("initialized frame windows")
+        let (registers, incoming) = frame_windows(frame);
+        Self {
+            frame: NonNull::from(frame),
+            registers,
+            incoming,
+            _lifetime: PhantomData,
+        }
     }
 
     /// Open a mutable view over a published frame.

@@ -482,9 +482,25 @@ impl Frame {
     #[must_use]
     #[inline]
     pub unsafe fn logical_depth(frame: *mut Frame) -> u32 {
-        if let Some(depth) = unsafe { frame.as_ref() }.map(|frame| frame.depth)
-            && depth != 0
-        {
+        let Some(record) = (unsafe { frame.as_mut() }) else {
+            return 0;
+        };
+        if record.depth != 0 {
+            return record.depth;
+        }
+        // A freshly linked record sits on a caller that already knows its
+        // depth: one step derives and caches it.
+        let caller = record.caller_frame();
+        let known = if caller.is_null() {
+            Some(0)
+        } else {
+            Some(unsafe { (*caller).depth }).filter(|depth| *depth != 0)
+        };
+        if let Some(known) = known {
+            let depth = known + u32::from(record.header.kind != NativeFrameKind::Host);
+            if depth != 0 {
+                record.depth = depth;
+            }
             return depth;
         }
         unsafe { Self::derive_logical_depth(frame) }

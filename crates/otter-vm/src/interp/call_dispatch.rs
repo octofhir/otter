@@ -38,6 +38,14 @@ pub(crate) enum DispatchOutcome {
     Fatal(VmError),
 }
 
+/// The activation an interpreter entry dispatches: its published record and
+/// the CodeBlock the entry resolved for it in the entry's owner context.
+#[derive(Clone, Copy)]
+pub(crate) struct EnteredActivation<'a> {
+    pub(crate) frame: *mut crate::native_abi::Frame,
+    pub(crate) function: &'a crate::CodeBlock,
+}
+
 /// Realm global holding the host's asm.js linker. A realm without it runs
 /// every `"use asm"` body as ordinary JavaScript.
 const ASM_LINKER_GLOBAL: &str = "__otterAsmLink";
@@ -102,11 +110,32 @@ fn interpreter_turn(ctx: *mut JitCtx, entering: bool) -> NativeResultPair {
     if frame.is_null() {
         return NativeResultPair::fatal_internal();
     }
-    // Resolve the actual published bytecode owner before borrowing the mutator.
-    let Some(context) = (unsafe { activation.owner_context((*frame).header.function_id) }) else {
-        return NativeResultPair::fatal_internal();
+    let function_id = unsafe { (*frame).header.function_id };
+    // The published bytecode owner, and the activation's CodeBlock once an
+    // earlier entry resolved it, from the isolate's owner cache at their
+    // stable addresses; a first entry resolves and caches them.
+    let cached =
+        unsafe { activation.vm.as_ref() }.and_then(|vm| vm.owner_cache.borrow().entry(function_id));
+    let (owner, cached_function) = match cached {
+        Some(entry) => entry,
+        None => {
+            let Some(owner) = (unsafe { activation.owner_context(function_id) }) else {
+                return NativeResultPair::fatal_internal();
+            };
+            let Some(vm) = (unsafe { activation.vm.as_ref() }) else {
+                return NativeResultPair::fatal_internal();
+            };
+            let owner = vm
+                .owner_cache
+                .borrow_mut()
+                .insert(function_id, ExecutionContext::clone(&owner));
+            (owner, std::ptr::null())
+        }
     };
-    let context = &context;
+    // SAFETY: a cached owner keeps its address until no execution is in
+    // progress, which outlives this entry; its chunk owns the CodeBlock.
+    let context: &ExecutionContext = unsafe { &*owner };
+    let cached_function = unsafe { cached_function.as_ref() };
     let Some(vm) = (unsafe { activation.vm.as_mut() }) else {
         return NativeResultPair::fatal_internal();
     };
@@ -142,10 +171,27 @@ fn interpreter_turn(ctx: *mut JitCtx, entering: bool) -> NativeResultPair {
         && matches!(resume, crate::prepared_call::ResumeInput::Normal)
         && unsafe { (*frame).header.pc } == 0
         && unsafe { (*frame).header.kind } == crate::native_abi::NativeFrameKind::Interpreter
-        && context.lazy_pending(unsafe { (*frame).header.function_id })
+        && cached_function.is_none()
+        && context.lazy_pending(function_id)
     {
         return enter_lazy_body(ctx, vm, stack, context, frame);
     }
+    // The activation's CodeBlock, resolved once for every entry decision
+    // below and for the dispatch run itself.
+    let function =
+        if unsafe { (*frame).header.kind } != crate::native_abi::NativeFrameKind::Interpreter {
+            None
+        } else if cached_function.is_some() {
+            cached_function
+        } else {
+            let function = context.exec_function(function_id);
+            if let Some(function) = function {
+                vm.owner_cache
+                    .borrow_mut()
+                    .set_code_block(function_id, function);
+            }
+            function
+        };
     if tier_completion && let Some(status) = completion.validate(NativeResultDomain::Compiled) {
         vm.jit_code_registry
             .note_completion(u64::from(generation), status);
@@ -213,18 +259,13 @@ fn interpreter_turn(ctx: *mut JitCtx, entering: bool) -> NativeResultPair {
         match completion.validate(NativeResultDomain::Execution) {
             Some(NativeResultStatus::Success) => {
                 if destination != u32::MAX {
-                    let Ok(destination) = u16::try_from(destination) else {
+                    // SAFETY: the published record and its register window
+                    // are live for this whole entry.
+                    let registers = unsafe { &mut (*frame).registers };
+                    let Some(slot) = registers.get_mut(destination as usize) else {
                         return NativeResultPair::fatal_internal();
                     };
-                    let Ok(mut active) = (unsafe { crate::ActiveFrameMut::from_ptr(frame) }) else {
-                        return NativeResultPair::fatal_internal();
-                    };
-                    if active
-                        .write(destination, completion.payload_value())
-                        .is_err()
-                    {
-                        return NativeResultPair::fatal_internal();
-                    }
+                    *slot = completion.payload_value();
                 }
                 if advance_on_resume {
                     let header = unsafe { &mut (*frame).header };
@@ -260,36 +301,33 @@ fn interpreter_turn(ctx: *mut JitCtx, entering: bool) -> NativeResultPair {
         resume_site = crate::activation_stack::ThrowSite::AfterCall;
     }
     // A first entry is the only interpreter entry that starts at PC zero:
-    // every resumed caller stands at or past its call.
+    // every resumed caller stands at or past its call. The CodeBlock's entry
+    // shape decides the rest of the first-entry work.
     if fresh_entry && !tier_completion && unsafe { (*frame).header.pc } == 0 {
         vm.record_runtime_bytecode_call();
-    }
-    if fresh_entry
-        && resume_error.is_none()
-        && let Err(error) = vm.begin_suspendable_activation(stack, context)
-    {
-        resume_error = Some(error);
-    }
-    if fresh_entry && !tier_completion && unsafe { (*frame).header.pc } == 0 {
-        vm.begin_interpreted_retraining_activation(unsafe { &mut *frame });
-    }
-    // A `"use asm"` module offers itself to the host linker once per entry:
-    // linked exports replace the body's completion.
-    if fresh_entry
-        && !tier_completion
-        && resume_error.is_none()
-        && unsafe { (*frame).header.pc } == 0
-        && context
-            .exec_function(unsafe { (*frame).header.function_id })
-            .is_some_and(|function| function.asm_module)
-    {
-        match link_asm_module(vm, stack, context, frame) {
-            Ok(Some(exports)) => {
-                vm.frame_release_cold(unsafe { &mut *frame });
-                return NativeResultPair::success(exports);
+        let suspendable =
+            function.is_some_and(|function| function.is_generator || function.is_async);
+        if suspendable
+            && resume_error.is_none()
+            && let Some(function) = function
+            && let Err(error) = vm.begin_suspendable_activation(stack, frame, context, function)
+        {
+            resume_error = Some(error);
+        }
+        if vm.optimizing_tier_policy.has_retraining() {
+            vm.begin_interpreted_retraining_activation(unsafe { &mut *frame });
+        }
+        // A `"use asm"` module offers itself to the host linker once per
+        // entry: linked exports replace the body's completion.
+        if resume_error.is_none() && function.is_some_and(|function| function.asm_module) {
+            match link_asm_module(vm, stack, context, frame) {
+                Ok(Some(exports)) => {
+                    vm.frame_release_cold(unsafe { &mut *frame });
+                    return NativeResultPair::success(exports);
+                }
+                Ok(None) => {}
+                Err(error) => resume_error = Some(error),
             }
-            Ok(None) => {}
-            Err(error) => resume_error = Some(error),
         }
     }
     // A compiled body that side-exited at its entry resumes here at PC zero;
@@ -306,9 +344,18 @@ fn interpreter_turn(ctx: *mut JitCtx, entering: bool) -> NativeResultPair {
             Err(error) => resume_error = Some(error),
         }
     }
-    match vm.dispatch_current_activation(context, stack, floor, resume_error, resume_site) {
+    // A tier completion may have rebuilt the activation; dispatch then finds
+    // it on the chain.
+    let entered = function
+        .filter(|_| !tier_completion)
+        .map(|function| EnteredActivation { frame, function });
+    match vm.dispatch_current_activation(context, entered, stack, floor, resume_error, resume_site)
+    {
         Ok(DispatchOutcome::Call) => {
-            match stack.take_request().or_else(|| stack.pending_packet()) {
+            if stack.take_request_into(&mut ctx.pending_call) {
+                return NativeResultPair::continue_execution();
+            }
+            match stack.pending_packet() {
                 Some(packet) => {
                     ctx.pending_call = packet;
                     NativeResultPair::continue_execution()
@@ -461,6 +508,11 @@ impl Interpreter {
         self.finish_work_budget_turn();
         stack.restore_context(previous);
         self.jit_context = enclosing;
+        // Owners the cache stopped naming while this execution ran may have
+        // been borrowed by its entries; with no execution left they go.
+        if enclosing.is_none() {
+            self.owner_cache.borrow_mut().release_retired();
+        }
         if let Some(call) = stack.take_pending() {
             self.release_prepared_inputs(call);
         }

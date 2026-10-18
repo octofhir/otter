@@ -1235,10 +1235,26 @@ impl Value {
     ///
     /// Everything decidable without heap is delegated to
     /// [`Self::to_boolean_pure`].
-    #[inline]
+    ///
+    /// An immediate (boolean, number, `undefined`, `null`) decides without the
+    /// heap, so a branch on a comparison result never leaves the caller; only
+    /// a cell reaches the out-of-line ladder.
+    #[inline(always)]
     #[must_use]
-    #[allow(dead_code)] // Wired up at Phase-1 swap; ~50 call sites flip over from legacy::Value.
     pub fn to_boolean(self, heap: &otter_gc::GcHeap) -> bool {
+        if let Some(b) = self.as_boolean() {
+            return b;
+        }
+        if !self.is_cell()
+            && let Some(b) = self.to_boolean_pure()
+        {
+            return b;
+        }
+        self.to_boolean_cell(heap)
+    }
+
+    #[inline(never)]
+    fn to_boolean_cell(self, heap: &otter_gc::GcHeap) -> bool {
         if self.is_html_dda(heap) {
             return false;
         }

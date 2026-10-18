@@ -201,6 +201,58 @@ fn record_arith_result(feedback: Option<InstructionFeedbackRecorder<'_>>, result
     }
 }
 
+/// Number × Number result of the binary operator `op`, or `None` when
+/// either operand is not a Number and the operator's full coercion ladder
+/// must run. Two Numbers are already their own `ToNumeric` result and run no
+/// user code, so the dispatch loop commits this fold without leaving its arm.
+#[inline(always)]
+pub(crate) fn fold_numbers(op: Op, lhs: Value, rhs: Value) -> Option<Value> {
+    let (a, b) = (lhs.as_number()?, rhs.as_number()?);
+    Some(Value::number(match op {
+        Op::Add => number::add(a, b),
+        Op::Sub => number::sub(a, b),
+        Op::Mul => number::mul(a, b),
+        Op::Div => number::div(a, b),
+        Op::Rem => number::rem(a, b),
+        Op::Pow => number::pow(a, b),
+        Op::BitwiseAnd => number::bitwise_and(a, b),
+        Op::BitwiseOr => number::bitwise_or(a, b),
+        Op::BitwiseXor => number::bitwise_xor(a, b),
+        Op::Shl => number::shl(a, b),
+        Op::Shr => number::shr_arith(a, b),
+        _ => return None,
+    }))
+}
+
+/// Number × Number answer of the relational operator `op`, or `None` when an
+/// operand needs `ToPrimitive`. IEEE-754 comparison already yields the spec
+/// answer for every operator, including the `false` an unordered NaN operand
+/// produces and the equality of `+0` and `-0`.
+#[inline(always)]
+pub(crate) fn compare_numbers(op: Op, lhs: Value, rhs: Value) -> Option<Value> {
+    let (a, b) = (lhs.as_number()?.as_f64(), rhs.as_number()?.as_f64());
+    Some(Value::boolean(match op {
+        Op::LessThan => a < b,
+        Op::GreaterThan => a > b,
+        Op::LessEq => a <= b,
+        Op::GreaterEq => a >= b,
+        _ => return None,
+    }))
+}
+
+/// Update-expression step of a Number, staying int32 unless the step
+/// overflows; `None` for any other value, which takes `ToNumeric` first.
+#[inline(always)]
+pub(crate) fn step_number(value: Value, delta: i32) -> Option<Value> {
+    Some(match value.as_number()? {
+        NumberValue::Smi(int) => int.checked_add(delta).map_or_else(
+            || Value::number_f64(f64::from(int) + f64::from(delta)),
+            Value::number_i32,
+        ),
+        NumberValue::Double(double) => Value::number_f64(double + f64::from(delta)),
+    })
+}
+
 impl Interpreter {
     /// Execute one shared numeric-binary semantic operation from frame
     /// registers. The operation identity comes from the bytecode-owned scalar
@@ -210,7 +262,7 @@ impl Interpreter {
         &mut self,
         stack: &mut ActivationStack,
         context: &crate::execution_context::ExecutionContext,
-        top_idx: usize,
+        frame: *mut Frame,
         registers: [u16; 3],
         operation: NumericBinaryOp,
         feedback: Option<InstructionFeedbackRecorder<'_>>,
@@ -220,7 +272,7 @@ impl Interpreter {
             NumericBinaryOp::Sub => self.run_numeric_regs(
                 stack,
                 context,
-                top_idx,
+                frame,
                 dst,
                 lhs,
                 rhs,
@@ -231,7 +283,7 @@ impl Interpreter {
             NumericBinaryOp::Mul => self.run_numeric_regs(
                 stack,
                 context,
-                top_idx,
+                frame,
                 dst,
                 lhs,
                 rhs,
@@ -242,7 +294,7 @@ impl Interpreter {
             NumericBinaryOp::Div => self.run_numeric_regs(
                 stack,
                 context,
-                top_idx,
+                frame,
                 dst,
                 lhs,
                 rhs,
@@ -253,7 +305,7 @@ impl Interpreter {
             NumericBinaryOp::Rem => self.run_numeric_regs(
                 stack,
                 context,
-                top_idx,
+                frame,
                 dst,
                 lhs,
                 rhs,
@@ -264,7 +316,7 @@ impl Interpreter {
             NumericBinaryOp::Pow => self.run_numeric_regs(
                 stack,
                 context,
-                top_idx,
+                frame,
                 dst,
                 lhs,
                 rhs,
@@ -360,7 +412,7 @@ impl Interpreter {
         &mut self,
         stack: &mut ActivationStack,
         context: &crate::execution_context::ExecutionContext,
-        top_idx: usize,
+        frame: *mut Frame,
         dst: u16,
         lhs: u16,
         rhs: u16,
@@ -368,10 +420,9 @@ impl Interpreter {
         bigint_op: BigIntBinop,
         feedback: Option<InstructionFeedbackRecorder<'_>>,
     ) -> Result<(), CommittedValueError> {
-        // `top_idx` is the executing (top) frame; access it without the `Index`
-        // bounds check. SAFETY: dispatch runs with a live top frame and passes
-        // `top_idx == stack.len() - 1`.
-        let (dst, lhs, rhs) = binop_values(unsafe { stack.top_unchecked() }, dst, lhs, rhs)
+        // SAFETY: `frame` is the dispatching activation, live for the whole
+        // run at a stable address whatever runs above it.
+        let (dst, lhs, rhs) = binop_values(unsafe { &*frame }, dst, lhs, rhs)
             .map_err(CommittedValueError::JavaScript)?;
         if let Some(feedback) = feedback {
             feedback.record_arith(lhs, rhs);
@@ -381,26 +432,26 @@ impl Interpreter {
         if let (Some(a), Some(b)) = (lhs.as_number(), rhs.as_number()) {
             let result = Value::number(op(a, b));
             record_arith_result(feedback, result);
-            return commit_frame_result(unsafe { stack.top_unchecked_mut() }, dst, result)
+            return commit_frame_result(unsafe { &mut *frame }, dst, result)
                 .map_err(CommittedValueError::Fatal);
         }
         let result = numeric_binary_value(self, stack, context, lhs, rhs, op, bigint_op)?;
         record_arith_result(feedback, result);
-        commit_frame_result(&mut stack[top_idx], dst, result).map_err(CommittedValueError::Fatal)
+        commit_frame_result(unsafe { &mut *frame }, dst, result).map_err(CommittedValueError::Fatal)
     }
 
     pub(crate) fn run_add_regs(
         &mut self,
         stack: &mut ActivationStack,
         context: &crate::execution_context::ExecutionContext,
-        top_idx: usize,
+        frame: *mut Frame,
         dst: u16,
         lhs: u16,
         rhs: u16,
         feedback: Option<InstructionFeedbackRecorder<'_>>,
     ) -> Result<(), CommittedValueError> {
-        // SAFETY: see `run_numeric_regs` — `top_idx` is the live top frame.
-        let (dst, lhs, rhs) = binop_values(unsafe { stack.top_unchecked() }, dst, lhs, rhs)
+        // SAFETY: see `run_numeric_regs` — `frame` is the live activation.
+        let (dst, lhs, rhs) = binop_values(unsafe { &*frame }, dst, lhs, rhs)
             .map_err(CommittedValueError::JavaScript)?;
         if let Some(feedback) = feedback {
             feedback.record_arith(lhs, rhs);
@@ -408,12 +459,12 @@ impl Interpreter {
         if let (Some(a), Some(b)) = (lhs.as_number(), rhs.as_number()) {
             let result = Value::number(number::add(a, b));
             record_arith_result(feedback, result);
-            return commit_frame_result(unsafe { stack.top_unchecked_mut() }, dst, result)
+            return commit_frame_result(unsafe { &mut *frame }, dst, result)
                 .map_err(CommittedValueError::Fatal);
         }
         let result = self.add_value(stack, context, lhs, rhs)?;
         record_arith_result(feedback, result);
-        commit_frame_result(&mut stack[top_idx], dst, result).map_err(CommittedValueError::Fatal)
+        commit_frame_result(unsafe { &mut *frame }, dst, result).map_err(CommittedValueError::Fatal)
     }
 
     /// Immediate-right binary operators. The right operand is the `Number`
@@ -421,40 +472,39 @@ impl Interpreter {
     /// operand (`String` left of `+` concatenates, an object coerces through
     /// `valueOf`), but no right register is read and no separate constant load
     /// runs. The number-vs-number fast path is the same one the register forms
-    /// take. `top_idx` is the live top frame (see `run_numeric_regs`).
+    /// take. `frame` is the live activation (see `run_numeric_regs`).
     pub(crate) fn run_add_imm(
         &mut self,
         stack: &mut ActivationStack,
         context: &crate::execution_context::ExecutionContext,
-        top_idx: usize,
+        frame: *mut Frame,
         dst: u16,
         lhs: u16,
         imm: i32,
         feedback: Option<InstructionFeedbackRecorder<'_>>,
     ) -> Result<(), CommittedValueError> {
-        // SAFETY: `top_idx` is the live top frame; `lhs` is a verified register.
-        let lval =
-            unsafe { crate::interp::helpers::read_register_unchecked(stack.top_unchecked(), lhs) };
+        // SAFETY: `frame` is the live activation; `lhs` is a verified register.
+        let lval = unsafe { crate::interp::helpers::read_register_unchecked(&*frame, lhs) };
         if let Some(feedback) = feedback {
             feedback.record_arith(lval, Value::number_i32(imm));
         }
         if let Some(a) = lval.as_number() {
             return commit_frame_result(
-                unsafe { stack.top_unchecked_mut() },
+                unsafe { &mut *frame },
                 dst,
                 Value::number(number::add(a, NumberValue::from_i32(imm))),
             )
             .map_err(CommittedValueError::Fatal);
         }
         let result = self.add_value(stack, context, lval, Value::number_i32(imm))?;
-        commit_frame_result(&mut stack[top_idx], dst, result).map_err(CommittedValueError::Fatal)
+        commit_frame_result(unsafe { &mut *frame }, dst, result).map_err(CommittedValueError::Fatal)
     }
 
     pub(crate) fn run_numeric_imm(
         &mut self,
         stack: &mut ActivationStack,
         context: &crate::execution_context::ExecutionContext,
-        top_idx: usize,
+        frame: *mut Frame,
         dst: u16,
         lhs: u16,
         imm: i32,
@@ -463,14 +513,13 @@ impl Interpreter {
         feedback: Option<InstructionFeedbackRecorder<'_>>,
     ) -> Result<(), CommittedValueError> {
         // SAFETY: see `run_add_imm`.
-        let lval =
-            unsafe { crate::interp::helpers::read_register_unchecked(stack.top_unchecked(), lhs) };
+        let lval = unsafe { crate::interp::helpers::read_register_unchecked(&*frame, lhs) };
         if let Some(feedback) = feedback {
             feedback.record_arith(lval, Value::number_i32(imm));
         }
         if let Some(a) = lval.as_number() {
             return commit_frame_result(
-                unsafe { stack.top_unchecked_mut() },
+                unsafe { &mut *frame },
                 dst,
                 Value::number(op(a, NumberValue::from_i32(imm))),
             )
@@ -485,33 +534,28 @@ impl Interpreter {
             op,
             bigint_op,
         )?;
-        commit_frame_result(&mut stack[top_idx], dst, result).map_err(CommittedValueError::Fatal)
+        commit_frame_result(unsafe { &mut *frame }, dst, result).map_err(CommittedValueError::Fatal)
     }
 
     pub(crate) fn run_less_than_imm(
         &mut self,
         stack: &mut ActivationStack,
         context: &crate::execution_context::ExecutionContext,
-        top_idx: usize,
+        frame: *mut Frame,
         dst: u16,
         lhs: u16,
         imm: i32,
         feedback: Option<InstructionFeedbackRecorder<'_>>,
     ) -> Result<(), CommittedValueError> {
         // SAFETY: see `run_add_imm`.
-        let lval =
-            unsafe { crate::interp::helpers::read_register_unchecked(stack.top_unchecked(), lhs) };
+        let lval = unsafe { crate::interp::helpers::read_register_unchecked(&*frame, lhs) };
         if let Some(feedback) = feedback {
             feedback.record_arith(lval, Value::number_i32(imm));
         }
         if let Some(a) = lval.as_number() {
             let truthy = a.as_f64() < f64::from(imm);
-            return commit_frame_result(
-                unsafe { stack.top_unchecked_mut() },
-                dst,
-                Value::boolean(truthy),
-            )
-            .map_err(CommittedValueError::Fatal);
+            return commit_frame_result(unsafe { &mut *frame }, dst, Value::boolean(truthy))
+                .map_err(CommittedValueError::Fatal);
         }
         let result = compare_value(
             self,
@@ -521,7 +565,7 @@ impl Interpreter {
             Value::number_i32(imm),
             Op::LessThan,
         )?;
-        commit_frame_result(&mut stack[top_idx], dst, result).map_err(CommittedValueError::Fatal)
+        commit_frame_result(unsafe { &mut *frame }, dst, result).map_err(CommittedValueError::Fatal)
     }
 
     pub(crate) fn run_equal_imm(
@@ -758,15 +802,15 @@ impl Interpreter {
         &mut self,
         stack: &mut ActivationStack,
         context: &crate::execution_context::ExecutionContext,
-        top_idx: usize,
+        frame: *mut Frame,
         dst: u16,
         lhs: u16,
         rhs: u16,
         op: Op,
         feedback: Option<InstructionFeedbackRecorder<'_>>,
     ) -> Result<(), CommittedValueError> {
-        // SAFETY: see `run_numeric_regs` — `top_idx` is the live top frame.
-        let (dst, lhs, rhs) = binop_values(unsafe { stack.top_unchecked() }, dst, lhs, rhs)
+        // SAFETY: see `run_numeric_regs` — `frame` is the live activation.
+        let (dst, lhs, rhs) = binop_values(unsafe { &*frame }, dst, lhs, rhs)
             .map_err(CommittedValueError::JavaScript)?;
         if let Some(feedback) = feedback {
             feedback.record_arith(lhs, rhs);
@@ -785,71 +829,65 @@ impl Interpreter {
                 Op::GreaterEq => a >= b,
                 _ => return Err(CommittedValueError::Fatal(VmError::InvalidOperand)),
             };
-            return commit_frame_result(
-                unsafe { stack.top_unchecked_mut() },
-                dst,
-                Value::boolean(truthy),
-            )
-            .map_err(CommittedValueError::Fatal);
+            return commit_frame_result(unsafe { &mut *frame }, dst, Value::boolean(truthy))
+                .map_err(CommittedValueError::Fatal);
         }
         let result = compare_value(self, stack, context, lhs, rhs, op)?;
-        commit_frame_result(&mut stack[top_idx], dst, result).map_err(CommittedValueError::Fatal)
+        commit_frame_result(unsafe { &mut *frame }, dst, result).map_err(CommittedValueError::Fatal)
     }
 
     pub(crate) fn run_ushr_regs(
         &mut self,
         stack: &mut ActivationStack,
         context: &crate::execution_context::ExecutionContext,
-        top_idx: usize,
+        frame: *mut Frame,
         dst: u16,
         lhs: u16,
         rhs: u16,
         feedback: Option<InstructionFeedbackRecorder<'_>>,
     ) -> Result<(), CommittedValueError> {
-        // SAFETY: see `run_numeric_regs` — `top_idx` is the live top frame.
-        let (dst, lhs, rhs) = binop_values(unsafe { stack.top_unchecked() }, dst, lhs, rhs)
+        // SAFETY: see `run_numeric_regs` — `frame` is the live activation.
+        let (dst, lhs, rhs) = binop_values(unsafe { &*frame }, dst, lhs, rhs)
             .map_err(CommittedValueError::JavaScript)?;
         if let Some(feedback) = feedback {
             feedback.record_arith(lhs, rhs);
         }
         let result = ushr_value(self, stack, context, lhs, rhs)?;
         record_arith_result(feedback, result);
-        commit_frame_result(&mut stack[top_idx], dst, result).map_err(CommittedValueError::Fatal)
+        commit_frame_result(unsafe { &mut *frame }, dst, result).map_err(CommittedValueError::Fatal)
     }
 
     pub(crate) fn run_neg_regs(
         &mut self,
         stack: &mut ActivationStack,
         context: &crate::execution_context::ExecutionContext,
-        top_idx: usize,
+        frame: *mut Frame,
         dst: u16,
         src: u16,
         feedback: Option<InstructionFeedbackRecorder<'_>>,
     ) -> Result<(), CommittedValueError> {
-        // SAFETY: see `run_numeric_regs` — `top_idx` is the live top frame.
-        let value = *read_register(unsafe { stack.top_unchecked() }, src)
-            .map_err(CommittedValueError::Fatal)?;
+        // SAFETY: see `run_numeric_regs` — `frame` is the live activation.
+        let value = *read_register(unsafe { &*frame }, src).map_err(CommittedValueError::Fatal)?;
         if let Some(feedback) = feedback {
             feedback.record_arith(value, value);
         }
         let result = self.neg_value(stack, context, value)?;
         record_arith_result(feedback, result);
-        commit_frame_result(&mut stack[top_idx], dst, result).map_err(CommittedValueError::Fatal)
+        commit_frame_result(unsafe { &mut *frame }, dst, result).map_err(CommittedValueError::Fatal)
     }
 
     pub(crate) fn run_bitwise_not_regs(
         &mut self,
         stack: &mut ActivationStack,
         context: &crate::execution_context::ExecutionContext,
-        top_idx: usize,
+        frame: *mut Frame,
         dst: u16,
         src: u16,
     ) -> Result<(), CommittedValueError> {
-        // SAFETY: see `run_numeric_regs` — `top_idx` is the live top frame.
-        let value = *read_register(unsafe { stack.top_unchecked() }, src)
-            .map_err(CommittedValueError::Fatal)?;
+        // SAFETY: see `run_numeric_regs` — `frame` is the live activation.
+        let value = *read_register(unsafe { &*frame }, src).map_err(CommittedValueError::Fatal)?;
         let result = self.bitwise_not_value(stack, context, value)?;
-        commit_frame_result(&mut stack[top_idx], dst, result).map_err(CommittedValueError::Fatal)
+        commit_frame_result(unsafe { &mut *frame }, dst, result).map_err(CommittedValueError::Fatal)
     }
 
     /// Execute one update-expression numeric step through the same semantic
@@ -859,21 +897,23 @@ impl Interpreter {
         &mut self,
         stack: &mut ActivationStack,
         context: &crate::execution_context::ExecutionContext,
-        top_idx: usize,
+        frame: *mut Frame,
         dst: u16,
         src: u16,
         delta: i32,
         feedback: Option<InstructionFeedbackRecorder<'_>>,
     ) -> Result<(), CommittedValueError> {
-        // SAFETY: see `run_numeric_regs` — `top_idx` is the live top frame.
-        let value = *read_register(unsafe { stack.top_unchecked() }, src)
-            .map_err(CommittedValueError::Fatal)?;
+        // SAFETY: see `run_numeric_regs` — `frame` is the live activation.
+        let value = *read_register(unsafe { &*frame }, src).map_err(CommittedValueError::Fatal)?;
         if let Some(feedback) = feedback {
             feedback.record_arith(value, Value::number_i32(delta));
         }
-        let result = self.increment_value(stack, context, value, delta)?;
+        let result = match step_number(value, delta) {
+            Some(result) => result,
+            None => self.increment_value(stack, context, value, delta)?,
+        };
         record_arith_result(feedback, result);
-        commit_frame_result(&mut stack[top_idx], dst, result).map_err(CommittedValueError::Fatal)
+        commit_frame_result(unsafe { &mut *frame }, dst, result).map_err(CommittedValueError::Fatal)
     }
 
     /// Evaluate one decoded native numeric request from already-read values.
@@ -1100,23 +1140,23 @@ impl Interpreter {
         &mut self,
         stack: &mut ActivationStack,
         context: &crate::execution_context::ExecutionContext,
-        top_idx: usize,
+        frame: *mut Frame,
         dst: u16,
         lhs: u16,
         rhs: u16,
         negate: bool,
         feedback: Option<InstructionFeedbackRecorder<'_>>,
     ) -> Result<(), CommittedValueError> {
-        // SAFETY: see `run_numeric_regs` — `top_idx` is the live top frame.
-        let (dst, lhs, rhs) = binop_values(unsafe { stack.top_unchecked() }, dst, lhs, rhs)
+        // SAFETY: see `run_numeric_regs` — `frame` is the live activation.
+        let (dst, lhs, rhs) = binop_values(unsafe { &*frame }, dst, lhs, rhs)
             .map_err(CommittedValueError::JavaScript)?;
         if let Some(feedback) = feedback {
             feedback.record_arith(lhs, rhs);
         }
         let eq = self.loose_equal_with_context(stack, context, &lhs, &rhs)?;
-        write_register(&mut stack[top_idx], dst, Value::boolean(eq ^ negate))
+        write_register(unsafe { &mut *frame }, dst, Value::boolean(eq ^ negate))
             .map_err(CommittedValueError::Fatal)?;
-        stack[top_idx]
+        unsafe { &mut *frame }
             .advance_pc()
             .map_err(CommittedValueError::Fatal)?;
         Ok(())

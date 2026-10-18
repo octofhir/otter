@@ -444,21 +444,29 @@ impl Interpreter {
         _context: &ExecutionContext,
         operands: impl Into<OperandView<'a>>,
     ) -> Result<(), VmError> {
-        self.do_call_inner(stack, ArgumentOperands::decoded(operands.into()))
+        let caller: *mut crate::Frame = stack.last_mut().ok_or(VmError::InvalidOperand)?;
+        self.do_call_inner(stack, caller, ArgumentOperands::decoded(operands.into()))
     }
 
+    /// `caller` is the executing activation's published record.
     pub(crate) fn do_call_exec(
         &mut self,
         stack: &mut ActivationStack,
+        caller: *mut crate::Frame,
         function: &CodeBlock,
         instruction: &crate::CodeBlockInstruction,
     ) -> Result<(), VmError> {
-        self.do_call_inner(stack, ArgumentOperands::execution(function, instruction))
+        self.do_call_inner(
+            stack,
+            caller,
+            ArgumentOperands::execution(function, instruction),
+        )
     }
 
     fn do_call_inner(
         &mut self,
         stack: &mut ActivationStack,
+        caller: *mut crate::Frame,
         operands: ArgumentOperands<'_>,
     ) -> Result<(), VmError> {
         // The call header (`dst`, callee, argc) reads from one operand-word
@@ -473,13 +481,15 @@ impl Interpreter {
                 operands.const_index(2)?,
             ),
         };
-        let top_idx = stack.len() - 1;
-        let callee = *read_register(&stack[top_idx], callee_reg)?;
-        let args =
-            BytecodeArgumentWindow::from_operands(&stack[top_idx], operands, 3, argc as usize)
-                .to_smallvec8()?;
-        stack[top_idx].advance_pc()?;
-        stack.stage_call(callee, Value::undefined(), None, args, Some(dst));
+        // SAFETY: the caller's record is trampoline-owned, live for this whole
+        // instruction, and outside the stack view the staging below mutates.
+        let caller = unsafe { &mut *caller };
+        let callee = *read_register(caller, callee_reg)?;
+        let window = BytecodeArgumentWindow::from_operands(caller, operands, 3, argc as usize);
+        stack.stage_call_with(callee, Value::undefined(), None, Some(dst), |staged| {
+            window.copy_into(staged)
+        })?;
+        caller.advance_pc()?;
         Ok(())
     }
 
@@ -506,7 +516,12 @@ impl Interpreter {
         // this activation instead.
         let realm_kept = self.calling_realm(Some(frame))
             == self.calling_realm(top_idx.checked_sub(1).map(|below| &stack[below]));
-        self.do_call_inner(stack, ArgumentOperands::execution(function, instruction))?;
+        let caller: *mut crate::Frame = stack.last_mut().ok_or(VmError::InvalidOperand)?;
+        self.do_call_inner(
+            stack,
+            caller,
+            ArgumentOperands::execution(function, instruction),
+        )?;
         if tail_safe
             && let Some(request) = stack.staged_request_mut()
             && (realm_kept || request.callee.as_proxy().is_none())

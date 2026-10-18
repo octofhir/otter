@@ -37,15 +37,30 @@ impl Interpreter {
     /// isolate's owner cache: a call into another chunk — a lazily compiled
     /// body is one — resolves its owner without searching the code space.
     pub(crate) fn foreign_owner(&self, function_id: u32) -> Result<ExecutionContext, VmError> {
-        if let Some(owner) = self.owner_cache.borrow().get(function_id) {
+        // SAFETY: the stable owner is live for this immediate clone.
+        self.stable_foreign_owner(function_id)
+            .map(|owner| unsafe { (*owner).clone() })
+    }
+
+    /// [`Self::foreign_owner`] borrowed in place from the cache: the owner at
+    /// its stable address, valid until the cache releases its retired owners
+    /// once no execution is in progress.
+    #[inline]
+    pub(crate) fn stable_foreign_owner(
+        &self,
+        function_id: u32,
+    ) -> Result<*const ExecutionContext, VmError> {
+        if let Some(owner) = self.owner_cache.borrow().get_stable(function_id) {
             return Ok(owner);
         }
+        self.cache_foreign_owner(function_id)
+    }
+
+    #[inline(never)]
+    fn cache_foreign_owner(&self, function_id: u32) -> Result<*const ExecutionContext, VmError> {
         let owner = ExecutionContext::for_function_in(&self.code_space, function_id)
             .map_err(|_| VmError::InvalidOperand)?;
-        self.owner_cache
-            .borrow_mut()
-            .insert(function_id, owner.clone());
-        Ok(owner)
+        Ok(self.owner_cache.borrow_mut().insert(function_id, owner))
     }
 
     /// Admit the defining bytecode chunk when present. Native-only work keeps

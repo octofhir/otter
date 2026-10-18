@@ -94,38 +94,38 @@ impl Interpreter {
     pub(crate) fn begin_suspendable_activation(
         &mut self,
         stack: &mut ActivationStack,
+        frame: *mut Frame,
         context: &crate::ExecutionContext,
+        function: &crate::CodeBlock,
     ) -> Result<(), VmError> {
-        let Some(frame) = stack.last() else {
+        // An ordinary function owns no suspension: one test of the entered
+        // CodeBlock decides the common call.
+        if !function.is_generator && !function.is_async {
             return Ok(());
-        };
-        if frame.header.pc != 0
-            || frame.header.kind != crate::native_abi::NativeFrameKind::Interpreter
-            || self.frame_has_suspension_owner(frame)
+        }
+        // SAFETY: the trampoline published `frame` for this whole entry.
+        let record = unsafe { &*frame };
+        if record.header.pc != 0
+            || record.header.kind != crate::native_abi::NativeFrameKind::Interpreter
+            || self.frame_has_suspension_owner(record)
         {
             return Ok(());
         }
-        let function_id = frame.header.function_id;
-        let owner = context
-            .for_function(function_id)
-            .map_err(|_| VmError::InvalidOperand)?;
-        let function = owner
-            .exec_function(function_id)
-            .ok_or(VmError::InvalidOperand)?;
         if function.is_generator {
             let generator = crate::generator::JsGenerator::new_for_running_activation(
                 &mut self.gc_heap,
                 function.is_async_generator,
             )?;
-            let frame = stack.last_mut().ok_or(VmError::InvalidOperand)?;
-            self.frame_ensure_cold(frame).generator_owner = Some(generator);
-        } else if function.is_async {
+            // SAFETY: as above; no other borrow of the record is live.
+            self.frame_ensure_cold(unsafe { &mut *frame })
+                .generator_owner = Some(generator);
+        } else {
             let result_promise =
-                crate::promise_dispatch::PromiseBuilder::with_context(Some(owner.clone()))
+                crate::promise_dispatch::PromiseBuilder::with_context(Some(context.clone()))
                     .pending_stack_rooted(self, stack, &[], &[])?;
-            let frame = stack.last_mut().ok_or(VmError::InvalidOperand)?;
+            // SAFETY: as above; the record keeps its address across allocation.
             self.frame_set_async_state(
-                frame,
+                unsafe { &mut *frame },
                 crate::frame_state::AsyncFrameState { result_promise },
             );
         }
@@ -671,6 +671,43 @@ impl Interpreter {
             // caller at the region floor still needs.
             Ok(PoppedCompletion::Promise(promise)) => {
                 Ok(stack.is_at_floor(floor).then_some(promise))
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    /// [`Self::pop_frame_above`] for the dispatching activation itself: its
+    /// published record `frame` at logical `depth`, so completing it walks no
+    /// chain.
+    #[inline]
+    pub(crate) fn complete_activation(
+        &mut self,
+        stack: &mut ActivationStack,
+        frame: *mut Frame,
+        depth: usize,
+        floor: ActivationFloor,
+        value: Value,
+        derived_this: Option<Value>,
+    ) -> Result<Option<Value>, VmError> {
+        if depth <= floor.depth() {
+            return Err(VmError::InvalidOperand);
+        }
+        let popped = stack.complete(frame);
+        // An ordinary call owns no cold record and no construction state: its
+        // completion is the returned value itself.
+        if popped.cold.is_none()
+            && !popped
+                .header
+                .flags
+                .contains(crate::native_abi::NativeFrameFlags::CONSTRUCT)
+            && !popped.is_derived_constructor()
+        {
+            return Ok(Some(value));
+        }
+        match self.complete_popped_frame(popped, value, derived_this) {
+            Ok(PoppedCompletion::Value(value)) => Ok(Some(value)),
+            Ok(PoppedCompletion::Promise(promise)) => {
+                Ok((depth - 1 <= floor.depth()).then_some(promise))
             }
             Err(error) => Err(error),
         }

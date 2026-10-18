@@ -270,10 +270,24 @@ impl FunctionCodeBuilder {
 
     /// Emit one verified-shape candidate and return its logical PC.
     pub fn push(&mut self, op: Op, operands: &[Operand]) -> u32 {
+        let pc = self.next_pc();
+        let instruction = self.instruction(op, operands);
+        self.instructions.push(instruction);
+        pc
+    }
+
+    /// Emit one verified-shape candidate at logical PC 0, ahead of every
+    /// instruction emitted so far: each of those moves one PC later, and a
+    /// relative jump between two of them keeps its offset.
+    pub fn insert_first(&mut self, op: Op, operands: &[Operand]) {
+        let instruction = self.instruction(op, operands);
+        self.instructions.insert(0, instruction);
+    }
+
+    fn instruction(&mut self, op: Op, operands: &[Operand]) -> Instruction {
         if let Err(error) = opcode_schema::verify_operand_shape(op, operands) {
             panic!("invalid {op:?} wordcode operands: {error}");
         }
-        let pc = self.next_pc();
         let operand_count =
             u8::try_from(operands.len()).expect("instruction operand count exceeds u8");
         let mut inline_operand_words = [0; INLINE_OPERAND_WORDS];
@@ -293,13 +307,12 @@ impl FunctionCodeBuilder {
             );
             offset
         };
-        self.instructions.push(Instruction {
+        Instruction {
             op,
             operand_count,
             inline_operand_words,
             overflow_operand_offset,
-        });
-        pc
+        }
     }
 
     /// Opcode at one logical PC.

@@ -362,7 +362,7 @@ fn compile_statement_body(
                                 let scratch = cx.alloc_scratch();
                                 cx.emit(
                                     Op::StoreProperty,
-                                    vec![
+                                    [
                                         Operand::Register(probe.object_reg),
                                         Operand::ConstIndex(name_idx),
                                         Operand::Register(init_reg),
@@ -962,7 +962,7 @@ fn compile_statement_body(
                             let target_const = cx.intern_string_constant(&target);
                             cx.emit(
                                 Op::ModuleNamespaceObject,
-                                vec![Operand::Register(dst), Operand::ConstIndex(target_const)],
+                                [Operand::Register(dst), Operand::ConstIndex(target_const)],
                                 span,
                             );
                             dst
@@ -1114,7 +1114,7 @@ fn compile_statement_body(
                     let target_const = cx.intern_string_constant(&target);
                     cx.emit(
                         Op::ModuleNamespaceObject,
-                        vec![Operand::Register(ns_reg), Operand::ConstIndex(target_const)],
+                        [Operand::Register(ns_reg), Operand::ConstIndex(target_const)],
                         span,
                     );
                     cx.emit_store_property(env_reg, &exported_alias, ns_reg, span);
@@ -1404,7 +1404,7 @@ pub(crate) fn compile_switch_statement(
                 // §13.11.1 strict equality.
                 cx.emit(
                     Op::Equal,
-                    vec![
+                    [
                         Operand::Register(cmp_reg),
                         Operand::Register(disc_reg),
                         Operand::Register(test_reg),

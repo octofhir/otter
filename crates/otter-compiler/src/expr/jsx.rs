@@ -207,7 +207,7 @@ fn compile_jsx_props(
                 );
                 cx.emit(
                     Op::CopyDataProperties,
-                    vec![
+                    [
                         Operand::Register(props),
                         Operand::Register(src),
                         Operand::Register(no_excluded),

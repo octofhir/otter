@@ -52,7 +52,7 @@ pub(crate) fn compile_super_call(
         let args_reg = compile_spread_call_args(cx, arguments, span)?;
         cx.emit(
             Op::SuperConstructSpread,
-            vec![
+            [
                 Operand::Register(dst),
                 Operand::Register(super_ctor),
                 Operand::Register(args_reg),
@@ -94,7 +94,7 @@ pub(crate) fn compile_super_method_call(
         let args_reg = compile_spread_call_args(cx, arguments, span)?;
         cx.emit(
             Op::CallSpread,
-            vec![
+            [
                 Operand::Register(dst),
                 Operand::Register(method_reg),
                 Operand::Register(this_reg),
@@ -137,7 +137,7 @@ pub(crate) fn compile_super_computed_method_call(
     let method_reg = cx.alloc_scratch();
     cx.emit(
         Op::LoadElement,
-        vec![
+        [
             Operand::Register(method_reg),
             Operand::Register(parent_reg),
             Operand::Register(idx),
@@ -154,7 +154,7 @@ pub(crate) fn compile_super_computed_method_call(
         let args_reg = compile_spread_call_args(cx, arguments, span)?;
         cx.emit(
             Op::CallSpread,
-            vec![
+            [
                 Operand::Register(dst),
                 Operand::Register(method_reg),
                 Operand::Register(this_reg),
@@ -210,7 +210,7 @@ pub(crate) fn compile_super_member_load(
     let dst = cx.alloc_scratch();
     cx.emit(
         Op::LoadSuperProperty,
-        vec![
+        [
             Operand::Register(dst),
             Operand::Register(home_reg),
             Operand::ConstIndex(name_idx),
@@ -237,7 +237,7 @@ pub(crate) fn load_super_method(
     let dst = cx.alloc_scratch();
     cx.emit(
         Op::LoadProperty,
-        vec![
+        [
             Operand::Register(dst),
             Operand::Register(parent_reg),
             Operand::ConstIndex(name_idx),

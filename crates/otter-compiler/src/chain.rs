@@ -94,7 +94,7 @@ pub(crate) fn compile_chain_into(
             let name_idx = cx.intern_string_constant(m.property.name.as_str());
             cx.emit(
                 Op::LoadProperty,
-                vec![
+                [
                     Operand::Register(result_reg),
                     Operand::Register(obj_reg),
                     Operand::ConstIndex(name_idx),
@@ -116,7 +116,7 @@ pub(crate) fn compile_chain_into(
                 let key_reg = compile_expr(cx, &m.expression, span)?;
                 cx.emit(
                     Op::LoadSuperElement,
-                    vec![
+                    [
                         Operand::Register(result_reg),
                         Operand::Register(home_reg),
                         Operand::Register(key_reg),
@@ -134,7 +134,7 @@ pub(crate) fn compile_chain_into(
             let key_reg = compile_expr(cx, &m.expression, span)?;
             cx.emit(
                 Op::LoadElement,
-                vec![
+                [
                     Operand::Register(result_reg),
                     Operand::Register(obj_reg),
                     Operand::Register(key_reg),
@@ -160,7 +160,7 @@ pub(crate) fn compile_chain_into(
             let key_reg = crate::class::load_private_key(cx, m.field.name.as_str(), span)?;
             cx.emit(
                 Op::PrivateGet,
-                vec![
+                [
                     Operand::Register(result_reg),
                     Operand::Register(obj_reg),
                     Operand::Register(key_reg),
@@ -230,7 +230,7 @@ fn compile_chain_call_into(
                             let name_idx = cx.intern_string_constant(m.property.name.as_str());
                             cx.emit(
                                 Op::LoadProperty,
-                                vec![
+                                [
                                     Operand::Register(callee),
                                     Operand::Register(obj_reg),
                                     Operand::ConstIndex(name_idx),
@@ -254,7 +254,7 @@ fn compile_chain_call_into(
                             let callee = cx.alloc_scratch();
                             cx.emit(
                                 Op::LoadSuperElement,
-                                vec![
+                                [
                                     Operand::Register(callee),
                                     Operand::Register(home_reg),
                                     Operand::Register(key_reg),
@@ -276,7 +276,7 @@ fn compile_chain_call_into(
                             let callee = cx.alloc_scratch();
                             cx.emit(
                                 Op::LoadElement,
-                                vec![
+                                [
                                     Operand::Register(callee),
                                     Operand::Register(obj_reg),
                                     Operand::Register(key_reg),
@@ -315,7 +315,7 @@ fn compile_chain_call_into(
                 let callee = cx.alloc_scratch();
                 cx.emit(
                     Op::PrivateGet,
-                    vec![
+                    [
                         Operand::Register(callee),
                         Operand::Register(obj_reg),
                         Operand::Register(key_reg),
@@ -350,7 +350,7 @@ fn compile_chain_call_into(
         };
         cx.emit(
             Op::CallSpread,
-            vec![
+            [
                 Operand::Register(result_reg),
                 Operand::Register(callee_reg),
                 Operand::Register(this_value),
@@ -458,7 +458,7 @@ pub(crate) fn compile_chain_into_chain_object(
             let name_idx = cx.intern_string_constant(m.property.name.as_str());
             cx.emit(
                 Op::LoadProperty,
-                vec![
+                [
                     Operand::Register(result_reg),
                     Operand::Register(obj_reg),
                     Operand::ConstIndex(name_idx),
@@ -484,7 +484,7 @@ pub(crate) fn compile_chain_into_chain_object(
             let key_reg = crate::class::load_private_key(cx, m.field.name.as_str(), span)?;
             cx.emit(
                 Op::PrivateGet,
-                vec![
+                [
                     Operand::Register(result_reg),
                     Operand::Register(obj_reg),
                     Operand::Register(key_reg),
@@ -506,7 +506,7 @@ pub(crate) fn compile_chain_into_chain_object(
                 let key_reg = compile_expr(cx, &m.expression, span)?;
                 cx.emit(
                     Op::LoadSuperElement,
-                    vec![
+                    [
                         Operand::Register(result_reg),
                         Operand::Register(home_reg),
                         Operand::Register(key_reg),
@@ -524,7 +524,7 @@ pub(crate) fn compile_chain_into_chain_object(
             let key_reg = compile_expr(cx, &m.expression, span)?;
             cx.emit(
                 Op::LoadElement,
-                vec![
+                [
                     Operand::Register(result_reg),
                     Operand::Register(obj_reg),
                     Operand::Register(key_reg),
@@ -612,7 +612,7 @@ pub(crate) fn try_compile_parenthesized_chain_callee(
             let name_idx = cx.intern_string_constant(m.property.name.as_str());
             cx.emit(
                 Op::LoadProperty,
-                vec![
+                [
                     Operand::Register(callee_reg),
                     Operand::Register(obj_reg),
                     Operand::ConstIndex(name_idx),
@@ -635,7 +635,7 @@ pub(crate) fn try_compile_parenthesized_chain_callee(
             let key_reg = compile_expr(cx, &m.expression, mspan)?;
             cx.emit(
                 Op::LoadElement,
-                vec![
+                [
                     Operand::Register(callee_reg),
                     Operand::Register(obj_reg),
                     Operand::Register(key_reg),
@@ -664,7 +664,7 @@ pub(crate) fn try_compile_parenthesized_chain_callee(
             let key_reg = crate::class::load_private_key(cx, m.field.name.as_str(), mspan)?;
             cx.emit(
                 Op::PrivateGet,
-                vec![
+                [
                     Operand::Register(callee_reg),
                     Operand::Register(obj_reg),
                     Operand::Register(key_reg),

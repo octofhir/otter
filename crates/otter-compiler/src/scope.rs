@@ -271,7 +271,7 @@ impl FunctionContext {
         let reg = self.alloc_scratch();
         self.emit_ctx(
             Op::CreateContext,
-            vec![
+            [
                 Operand::Register(reg),
                 Operand::Register(0),
                 Operand::Imm32(i32::from(descriptor)),
@@ -519,7 +519,7 @@ impl FunctionContext {
             ),
             BindingStorage::Slot { ctx, slot } => self.emit_ctx(
                 Op::LoadContextSlot,
-                vec![
+                [
                     Operand::Register(dst),
                     Operand::Register(0),
                     Operand::Imm32(own_coord(slot)),
@@ -544,7 +544,7 @@ impl FunctionContext {
             }
             BindingStorage::Slot { ctx, slot } => self.emit_ctx(
                 Op::LoadContextSlotChecked,
-                vec![
+                [
                     Operand::Register(dst),
                     Operand::Register(0),
                     Operand::Imm32(own_coord(slot)),
@@ -576,7 +576,7 @@ impl FunctionContext {
             }
             BindingStorage::Slot { ctx, slot } => self.emit_ctx(
                 Op::StoreContextSlot,
-                vec![
+                [
                     Operand::Register(src),
                     Operand::Register(0),
                     Operand::Imm32(own_coord(slot)),
@@ -601,7 +601,7 @@ impl FunctionContext {
             }
             BindingStorage::Slot { ctx, slot } => self.emit_ctx(
                 Op::StoreContextSlotChecked,
-                vec![
+                [
                     Operand::Register(src),
                     Operand::Register(0),
                     Operand::Imm32(own_coord(slot)),

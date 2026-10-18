@@ -91,7 +91,7 @@ pub(crate) fn compile_for_of_statement(
         let next_name = cx.intern_string_constant("next");
         cx.emit(
             Op::CallMethodValue,
-            vec![
+            [
                 Operand::Register(result_reg),
                 Operand::Register(iter_reg),
                 Operand::ConstIndex(next_name),
@@ -112,7 +112,7 @@ pub(crate) fn compile_for_of_statement(
     } else {
         cx.emit(
             Op::IteratorNext,
-            vec![
+            [
                 Operand::Register(value_reg),
                 Operand::Register(done_reg),
                 Operand::Register(iter_reg),
@@ -192,7 +192,7 @@ pub(crate) fn emit_async_iterator_close(
     let awaited_reg = cx.alloc_scratch();
     cx.emit(
         Op::AsyncIteratorReturn,
-        vec![
+        [
             Operand::Register(result_reg),
             Operand::Register(called_reg),
             Operand::Register(iter_reg),
@@ -340,7 +340,7 @@ pub(crate) fn compile_for_in_statement(
     let loop_top = cx.next_pc();
     cx.emit(
         Op::IteratorNext,
-        vec![
+        [
             Operand::Register(value_reg),
             Operand::Register(done_reg),
             Operand::Register(iter_reg),
@@ -354,7 +354,7 @@ pub(crate) fn compile_for_in_statement(
     let present_reg = cx.alloc_scratch();
     cx.emit(
         Op::HasProperty,
-        vec![
+        [
             Operand::Register(present_reg),
             Operand::Register(value_reg),
             Operand::Register(check_obj_reg),
@@ -537,7 +537,7 @@ pub(crate) fn bind_for_in_of_head(
                 let name_idx = cx.intern_string_constant(member.property.name.as_str());
                 cx.emit(
                     Op::SetSuperProperty,
-                    vec![
+                    [
                         Operand::Register(base_reg),
                         Operand::ConstIndex(name_idx),
                         Operand::Register(src_reg),
@@ -552,7 +552,7 @@ pub(crate) fn bind_for_in_of_head(
             let store_op = cx.store_property_op();
             cx.emit(
                 store_op,
-                vec![
+                [
                     Operand::Register(obj_reg),
                     Operand::ConstIndex(name_idx),
                     Operand::Register(src_reg),
@@ -570,7 +570,7 @@ pub(crate) fn bind_for_in_of_head(
                 let base_reg = crate::class::emit_super_base(cx, span)?;
                 cx.emit(
                     Op::SetSuperElement,
-                    vec![
+                    [
                         Operand::Register(base_reg),
                         Operand::Register(key_reg),
                         Operand::Register(src_reg),
@@ -606,7 +606,7 @@ pub(crate) fn bind_for_in_of_head(
             let key_reg = crate::class::load_private_key(cx, member.field.name.as_str(), span)?;
             cx.emit(
                 Op::PrivateSet,
-                vec![
+                [
                     Operand::Register(obj_reg),
                     Operand::Register(key_reg),
                     Operand::Register(src_reg),

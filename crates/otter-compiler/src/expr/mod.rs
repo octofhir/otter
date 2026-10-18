@@ -639,7 +639,7 @@ pub(crate) fn emit_to_primitive(
     let hint_idx = cx.intern_string_constant(hint);
     cx.emit(
         Op::ToPrimitive,
-        vec![
+        [
             Operand::Register(dst),
             Operand::Register(src_reg),
             Operand::ConstIndex(hint_idx),

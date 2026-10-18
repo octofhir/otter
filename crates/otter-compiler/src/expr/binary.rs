@@ -255,7 +255,7 @@ pub(crate) fn compile_private_in(
     let dst = cx.alloc_scratch();
     cx.emit(
         Op::HasProperty,
-        vec![
+        [
             Operand::Register(dst),
             Operand::Register(key_reg),
             Operand::Register(obj_reg),
@@ -413,7 +413,7 @@ fn compile_binary_to(
         };
         cx.emit(
             imm_op,
-            vec![
+            [
                 Operand::Register(dst),
                 Operand::Register(lhs),
                 Operand::Imm32(imm),
@@ -474,7 +474,7 @@ fn compile_binary_to(
     }
     cx.emit(
         op,
-        vec![
+        [
             Operand::Register(dst),
             Operand::Register(lhs_in),
             Operand::Register(rhs_in),

@@ -28,7 +28,7 @@ pub(crate) fn compile_private_field(
     let dst = cx.alloc_scratch();
     cx.emit(
         Op::PrivateGet,
-        vec![
+        [
             Operand::Register(dst),
             Operand::Register(obj_reg),
             Operand::Register(key_reg),
@@ -68,7 +68,7 @@ pub(crate) fn compile_static_member(
     crate::type_hints::mark_class_receiver(cx, &m.object);
     cx.emit(
         Op::LoadProperty,
-        vec![
+        [
             Operand::Register(dst),
             Operand::Register(receiver),
             Operand::ConstIndex(name_idx),
@@ -103,7 +103,7 @@ pub(crate) fn compile_computed_member(
         let dst = cx.alloc_scratch();
         cx.emit(
             Op::LoadSuperElement,
-            vec![
+            [
                 Operand::Register(dst),
                 Operand::Register(home_reg),
                 Operand::Register(idx),
@@ -133,7 +133,7 @@ pub(crate) fn compile_computed_member(
     let dst = cx.alloc_scratch();
     cx.emit(
         Op::LoadElement,
-        vec![
+        [
             Operand::Register(dst),
             Operand::Register(recv),
             Operand::Register(idx),

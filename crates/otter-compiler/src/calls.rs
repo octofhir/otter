@@ -293,7 +293,7 @@ pub(crate) fn compile_method_call(
             let src_reg = cx.alloc_scratch();
             cx.emit(
                 Op::LoadElement,
-                vec![
+                [
                     Operand::Register(src_reg),
                     Operand::Register(arr),
                     Operand::Register(idx),
@@ -341,7 +341,7 @@ pub(crate) fn compile_method_call(
             let callee_reg = cx.alloc_scratch();
             cx.emit(
                 Op::LoadProperty,
-                vec![
+                [
                     Operand::Register(callee_reg),
                     Operand::Register(receiver_reg),
                     Operand::ConstIndex(name_idx),
@@ -433,7 +433,7 @@ pub(crate) fn compile_method_call(
         let callee_reg = cx.alloc_scratch();
         cx.emit(
             Op::LoadElement,
-            vec![
+            [
                 Operand::Register(callee_reg),
                 Operand::Register(receiver_reg),
                 Operand::Register(idx_reg),
@@ -541,7 +541,7 @@ fn emit_direct_eval(cx: &mut Compiler, dst: u16, src_reg: u16, flags: i32, span:
     let ctx = cx.innermost_ctx();
     cx.emit_ctx(
         Op::Eval,
-        vec![
+        [
             Operand::Register(dst),
             Operand::Register(src_reg),
             Operand::Register(0),
@@ -702,7 +702,7 @@ pub(crate) fn compile_spread_call(
             let method_dst = cx.alloc_scratch();
             cx.emit(
                 Op::LoadProperty,
-                vec![
+                [
                     Operand::Register(method_dst),
                     Operand::Register(recv),
                     Operand::ConstIndex(name_idx),
@@ -722,7 +722,7 @@ pub(crate) fn compile_spread_call(
             let method_dst = cx.alloc_scratch();
             cx.emit(
                 Op::LoadElement,
-                vec![
+                [
                     Operand::Register(method_dst),
                     Operand::Register(recv),
                     Operand::Register(idx_reg),
@@ -742,7 +742,7 @@ pub(crate) fn compile_spread_call(
     let dst = cx.alloc_scratch();
     cx.emit(
         Op::CallSpread,
-        vec![
+        [
             Operand::Register(dst),
             Operand::Register(callee_reg),
             Operand::Register(this_reg),
@@ -789,7 +789,7 @@ fn try_compile_forwarded_apply(
     let name_idx = cx.intern_string_constant("apply");
     cx.emit(
         Op::LoadProperty,
-        vec![
+        [
             Operand::Register(method_reg),
             Operand::Register(receiver_reg),
             Operand::ConstIndex(name_idx),
@@ -803,7 +803,7 @@ fn try_compile_forwarded_apply(
     let mapped_ctx = cx.top_mut().mapped_arguments_ctx.unwrap_or(dst);
     cx.emit(
         Op::CallForwardArguments,
-        vec![
+        [
             Operand::Register(dst),
             Operand::Register(method_reg),
             Operand::Register(receiver_reg),

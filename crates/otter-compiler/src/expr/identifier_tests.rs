@@ -58,8 +58,14 @@ fn number_loads(module: &BytecodeModule, name: &str) -> Vec<f64> {
 fn ordinary_names_keep_their_register_and_global_owners() {
     let module =
         compile("function local(value){return value;} function global(){return ordinaryGlobal;}");
+    // A parameter is returned from its own register, without a copy.
     let local = &function(&module, "local").code;
-    assert_eq!(local.iter().filter(|i| i.op == Op::LoadLocal).count(), 1);
+    assert_eq!(local.iter().filter(|i| i.op == Op::LoadLocal).count(), 0);
+    let ret = local
+        .iter()
+        .find(|i| i.op == Op::ReturnValue)
+        .expect("return");
+    assert_eq!(local.operand(ret, 0), Some(Operand::Register(0)));
     let global = &function(&module, "global").code;
     let reads: Vec<_> = global
         .iter()

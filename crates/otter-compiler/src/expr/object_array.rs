@@ -589,11 +589,27 @@ fn compile_static_object_literal(
         keys.push(key);
     }
     let mut values = Vec::with_capacity(keys.len());
-    for (prop, key) in obj.properties.iter().zip(&keys) {
+    for (index, (prop, key)) in obj.properties.iter().zip(&keys).enumerate() {
         let oxc_ast::ast::ObjectPropertyKind::ObjectProperty(p) = prop else {
             unreachable!("checked above");
         };
         let key_span = (p.span.start, p.span.end);
+        // A value naming a binding held in its own frame slot is read in
+        // place when no later value assigns it: the literal reads every
+        // value register once they all are evaluated.
+        let later: Vec<&Expression<'_>> = obj.properties[index + 1..]
+            .iter()
+            .filter_map(|later| match later {
+                oxc_ast::ast::ObjectPropertyKind::ObjectProperty(later) => Some(&later.value),
+                oxc_ast::ast::ObjectPropertyKind::SpreadProperty(_) => None,
+            })
+            .collect();
+        if !p.method
+            && let Some(reg) = crate::expr::borrowed_operand_before(cx, &p.value, &later)
+        {
+            values.push(reg);
+            continue;
+        }
         cx.next_fn_is_method = p.method;
         if p.method {
             hint_lazy_object_method(cx, &p.value, otter_bytecode::LazyMethodKind::Method);

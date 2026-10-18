@@ -379,7 +379,13 @@ pub(crate) fn compile_assignment_with(
                 crate::expr::compile_expr_into_with_inferred_name(cx, &a.right, &name, reg, span)?;
             }
             Some(op) => {
-                let rhs = compile_expr(cx, &a.right, span)?;
+                // The operator reads both operands before it writes, and
+                // nothing runs between the right-hand side and it: a name
+                // held in its own frame slot is read in place.
+                let rhs = match crate::expr::borrowed_operand(cx, &a.right) {
+                    Some(rhs) => rhs,
+                    None => compile_expr(cx, &a.right, span)?,
+                };
                 cx.emit(
                     op,
                     vec![

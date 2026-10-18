@@ -314,7 +314,24 @@ pub(crate) fn compile_method_call(
         if let Some(dst) = try_compile_forwarded_apply(cx, call, member, span)? {
             return Ok(dst);
         }
-        let receiver_reg = compile_expr(cx, &member.object, span)?;
+        // The call reads the receiver after every argument: a binding held in
+        // its own frame slot is passed in place unless an argument assigns it.
+        let later: Vec<&Expression<'_>> = call
+            .arguments
+            .iter()
+            .filter_map(|argument| argument.as_expression())
+            .collect();
+        let receiver_reg = match crate::expr::borrowed_operand_before(cx, &member.object, &later) {
+            Some(reg)
+                if call
+                    .arguments
+                    .iter()
+                    .all(|argument| argument.as_expression().is_some()) =>
+            {
+                reg
+            }
+            _ => compile_expr(cx, &member.object, span)?,
+        };
         let name_idx = cx.intern_string_constant(method_name);
         if !call_arguments_commute_with_method_lookup(cx, &call.arguments) {
             // §13.3.6.1 — GetValue on the callee reference precedes
@@ -949,7 +966,7 @@ pub(crate) fn compile_call_args(
     span: (u32, u32),
 ) -> Result<Vec<u16>, CompileError> {
     let mut regs: Vec<u16> = Vec::with_capacity(args.len());
-    for arg in args {
+    for (index, arg) in args.iter().enumerate() {
         match arg {
             oxc_ast::ast::Argument::SpreadElement(s) => {
                 return Err(CompileError::Unsupported {
@@ -959,7 +976,18 @@ pub(crate) fn compile_call_args(
             }
             other => {
                 let expr = other.to_expression();
-                regs.push(compile_expr(cx, expr, span)?);
+                // An argument naming a binding held in its own frame slot is
+                // passed in place unless a later argument assigns it.
+                let later: Vec<&Expression<'_>> = args[index + 1..]
+                    .iter()
+                    .filter_map(|later| later.as_expression())
+                    .collect();
+                regs.push(
+                    match crate::expr::borrowed_operand_before(cx, expr, &later) {
+                        Some(reg) => reg,
+                        None => compile_expr(cx, expr, span)?,
+                    },
+                );
             }
         }
     }

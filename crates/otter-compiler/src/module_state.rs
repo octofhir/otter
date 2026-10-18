@@ -157,6 +157,9 @@ pub(crate) struct ModuleBuilder {
     pub(crate) constants: Vec<Constant>,
     /// Content hash → index of the first pool entry with that hash.
     constant_index: rustc_hash::FxHashMap<u64, u32>,
+    /// Code units of the string being interned, reused from one string to
+    /// the next so a string already in the pool costs no allocation.
+    string_units: Vec<u16>,
     /// §13.2.8.4 — tagged-template sites, one per Parse Node.
     pub(crate) template_sites: Vec<otter_bytecode::TemplateSite>,
     /// Monotonic counter handed out by `compile_class` so each
@@ -186,6 +189,35 @@ impl ModuleBuilder {
         self.push_constant(constant)
     }
 
+    /// [`Self::intern_constant`] of the string constant `value`, which
+    /// allocates only when `value` is not in the pool yet.
+    pub(crate) fn intern_str_constant(&mut self, value: &str) -> u32 {
+        let mut units = std::mem::take(&mut self.string_units);
+        units.clear();
+        units.extend(value.encode_utf16());
+        let hash = string_hash(&units);
+        let found = match self.constant_index.get(&hash) {
+            Some(&index) => match &self.constants[index as usize] {
+                Constant::String { utf16 } if *utf16 == units => Some(index),
+                _ => self
+                    .constants
+                    .iter()
+                    .position(|constant| {
+                        matches!(constant, Constant::String { utf16 } if *utf16 == units)
+                    })
+                    .map(|index| index as u32),
+            },
+            None => None,
+        };
+        let index = found.unwrap_or_else(|| {
+            self.push_constant(Constant::String {
+                utf16: units.clone(),
+            })
+        });
+        self.string_units = units;
+        index
+    }
+
     /// Append `constant` without deduplication and return its index.
     pub(crate) fn push_constant(&mut self, constant: Constant) -> u32 {
         let index = u32::try_from(self.constants.len()).expect("constant pool exceeds u32");
@@ -197,12 +229,24 @@ impl ModuleBuilder {
     }
 }
 
+/// [`constant_hash`] of a string constant holding `units`.
+fn string_hash(units: &[u16]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = rustc_hash::FxHasher::default();
+    std::mem::discriminant(&Constant::String { utf16: Vec::new() }).hash(&mut hasher);
+    units.hash(&mut hasher);
+    hasher.finish()
+}
+
 fn constant_hash(constant: &Constant) -> u64 {
     use std::hash::{Hash, Hasher};
+    if let Constant::String { utf16 } = constant {
+        return string_hash(utf16);
+    }
     let mut hasher = rustc_hash::FxHasher::default();
     std::mem::discriminant(constant).hash(&mut hasher);
     match constant {
-        Constant::String { utf16 } => utf16.hash(&mut hasher),
+        Constant::String { .. } => unreachable!("hashed above"),
         Constant::Number { bits } => bits.hash(&mut hasher),
         Constant::FunctionId { index } => index.hash(&mut hasher),
         Constant::BigInt { decimal } => decimal.hash(&mut hasher),

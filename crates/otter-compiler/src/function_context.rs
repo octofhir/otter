@@ -438,8 +438,7 @@ impl FunctionContext {
     }
 
     pub(crate) fn intern_string_constant(&mut self, value: &str) -> u32 {
-        let utf16: Vec<u16> = value.encode_utf16().collect();
-        self.intern_utf16_string_constant(utf16)
+        self.module.borrow_mut().intern_str_constant(value)
     }
 
     /// Intern a pre-built WTF-16 unit vector.

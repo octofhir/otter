@@ -227,6 +227,7 @@ impl Interpreter {
             eval_hook: None,
             lazy_compile_hook: None,
             lazy_bodies_compiled: 0,
+            lazy_body_store: crate::lazy_body_cache::LazyBodyStore::default(),
             owner_cache: std::cell::RefCell::new(crate::execution_context::OwnerCache::new()),
             pending_uncaught_throw: None,
             completed_activation_result: None,

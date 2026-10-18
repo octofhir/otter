@@ -5,6 +5,8 @@
 //!
 //! - The first run of a script hands back bytes; a run given them compiles
 //!   nothing and behaves the same, lazily compiled functions included.
+//! - Bytes taken after the script's functions ran carry their bodies: a run
+//!   given those compiles none of them either.
 //! - The same source under another specifier runs from the same bytes, and
 //!   its functions name the specifier it ran under.
 //! - Bytes for another source or a damaged copy are a miss: the script
@@ -56,6 +58,28 @@ fn a_kept_cache_runs_the_script_without_compiling_it() {
         .expect("a turn");
     assert_eq!(result.completion_string(), "12");
     assert!(second.lazy_function_bodies_compiled() >= lazily);
+
+    // Once its functions ran, the script's bytes carry their bodies, and a
+    // run from those compiles none of them.
+    let warm = first
+        .script_code_cache("https://example.test/a.js")
+        .expect("bodies compiled since the first run");
+    assert!(
+        first
+            .script_code_cache("https://example.test/a.js")
+            .is_none()
+    );
+    let mut third = Runtime::builder().build().expect("runtime");
+    let lazily = third.lazy_function_bodies_compiled();
+    let (completion, fresh) = run(&mut third, SCRIPT, "https://example.test/a.js", Some(&warm));
+    assert_eq!(completion, "42:71");
+    assert!(fresh.is_none());
+    assert_eq!(third.lazy_function_bodies_compiled(), lazily);
+    assert!(
+        third
+            .script_code_cache("https://example.test/a.js")
+            .is_none()
+    );
 
     let stack = "function where() { return new Error('here').stack; } where();";
     let (_, bytes) = run(&mut first, stack, "https://example.test/a.js", None);

@@ -160,6 +160,13 @@ pub(crate) struct ModuleBuilder {
     /// Code units of the string being interned, reused from one string to
     /// the next so a string already in the pool costs no allocation.
     string_units: Vec<u16>,
+    /// Instruction and span buffers a finished function left empty, for
+    /// the next function to emit into: a function's buffers grow while it
+    /// compiles and are copied out exactly when it finishes.
+    spare_buffers: Vec<(
+        otter_bytecode::FunctionCodeBuilder,
+        Vec<otter_bytecode::SpanEntry>,
+    )>,
     /// §13.2.8.4 — tagged-template sites, one per Parse Node.
     pub(crate) template_sites: Vec<otter_bytecode::TemplateSite>,
     /// Monotonic counter handed out by `compile_class` so each
@@ -216,6 +223,26 @@ impl ModuleBuilder {
         });
         self.string_units = units;
         index
+    }
+
+    /// Empty instruction and span buffers for a function to emit into.
+    pub(crate) fn code_buffers(
+        &mut self,
+    ) -> (
+        otter_bytecode::FunctionCodeBuilder,
+        Vec<otter_bytecode::SpanEntry>,
+    ) {
+        self.spare_buffers.pop().unwrap_or_default()
+    }
+
+    /// Keep a finished function's emptied buffers for the next one.
+    pub(crate) fn recycle_code_buffers(
+        &mut self,
+        code: otter_bytecode::FunctionCodeBuilder,
+        mut spans: Vec<otter_bytecode::SpanEntry>,
+    ) {
+        spans.clear();
+        self.spare_buffers.push((code, spans));
     }
 
     /// Append `constant` without deduplication and return its index.

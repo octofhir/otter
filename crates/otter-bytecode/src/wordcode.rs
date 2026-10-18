@@ -413,6 +413,18 @@ impl FunctionCodeBuilder {
             overflow_operand_words: self.overflow_operand_words.into_boxed_slice(),
         }
     }
+
+    /// [`Self::finish`] into an exactly sized copy, leaving this builder
+    /// empty with its capacity, for the next function to emit into.
+    pub fn take_code(&mut self) -> FunctionCode {
+        let code = FunctionCode {
+            instructions: self.instructions.as_slice().into(),
+            overflow_operand_words: self.overflow_operand_words.as_slice().into(),
+        };
+        self.instructions.clear();
+        self.overflow_operand_words.clear();
+        code
+    }
 }
 
 /// Borrowed schema-decoded operands over authoritative wordcode.

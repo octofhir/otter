@@ -933,7 +933,7 @@ pub(crate) fn finish_function(
     slot.number_hint_sites = finished.number_hint_sites;
     slot.code = finished.code;
     slot.handlers = finished.handlers;
-    slot.spans = otter_bytecode::SpanTable::new(&finished.spans);
+    slot.spans = finished.spans;
     fill(slot);
     drop(module_mut);
     parent.take_class_hint_sites(function_id, finished.class_hint_sites);

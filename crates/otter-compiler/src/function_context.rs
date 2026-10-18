@@ -49,7 +49,7 @@ pub(crate) struct DerivedThisSlot {
 #[derive(Debug)]
 pub(crate) struct FinishedCode {
     pub(crate) code: otter_bytecode::FunctionCode,
-    pub(crate) spans: Vec<SpanEntry>,
+    pub(crate) spans: otter_bytecode::SpanTable,
     pub(crate) scratch: u16,
     pub(crate) scopes: Vec<ScopeDescriptor>,
     /// The body reads its closure context (`LoadClosureContext` prologue).
@@ -203,11 +203,12 @@ pub(crate) struct FunctionContext {
 
 impl FunctionContext {
     pub(crate) fn new(module: Rc<RefCell<ModuleBuilder>>) -> Self {
+        let (code, spans) = module.borrow_mut().code_buffers();
         Self {
             module,
-            code: FunctionCodeBuilder::new(),
+            code,
             branch_landing: None,
-            spans: Vec::new(),
+            spans,
             scratch: 0,
             scopes: Vec::new(),
             var_scope: 0,
@@ -798,9 +799,12 @@ impl FunctionContext {
             }
             self.closure_ctx_patches.clear();
         }
+        let finished_code = code.take_code();
+        let span_table = otter_bytecode::SpanTable::new(&spans);
+        self.module.borrow_mut().recycle_code_buffers(code, spans);
         FinishedCode {
-            code: code.finish(),
-            spans,
+            code: finished_code,
+            spans: span_table,
             scratch,
             scopes: std::mem::take(&mut self.scope_descriptors),
             uses_closure_context,

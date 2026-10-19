@@ -4,11 +4,15 @@
 //! - A hot loop that compiles early and thereafter calls its callee through
 //!   the generated direct-call edge, so the callee is never entered from the
 //!   interpreter again.
+//! - A recursion with no loop, whose optimizing compilation finishes on a
+//!   compiler thread while baseline code keeps calling itself.
 //!
 //! # Invariants
 //! - The callee's generated entries count toward optimizing-tier hotness, and
 //!   the compiled loop's own poll drains the promotion, so the callee reaches
 //!   the optimizing tier without a single interpreter entry after tier-up.
+//! - A compilation finished while baseline code runs is installed at a later
+//!   baseline entry, so a recursion that never polls still switches tiers.
 //! - Every tier returns the interpreter's completion.
 
 use otter_runtime::{
@@ -106,4 +110,31 @@ fn a_callee_entered_only_through_generated_calls_still_promotes() {
             "{name} is entered only through generated calls and must still reach the optimizing tier: {optimized:?}"
         );
     }
+}
+
+#[test]
+fn a_recursion_without_loops_installs_its_background_compilation() {
+    let mut runtime = Runtime::builder()
+        .jit_compile_threads(1)
+        .jit_selection(JitSelection::ProductionTiered)
+        .execution_stats(true)
+        .build()
+        .expect("runtime");
+    let result = runtime
+        .run_script(
+            SourceInput::from_javascript(
+                "function fib(n) { return n < 2 ? n : fib(n - 1) + fib(n - 2); } fib(27);"
+                    .to_string(),
+            ),
+            "jit-recursive-install.js",
+        )
+        .expect("recursion");
+    assert_eq!(result.completion_string(), "196418");
+    // fib(27) makes 635621 calls; baseline code runs only those before the
+    // optimizing body is installed.
+    let baseline_entries = runtime.execution_stats().jit_generated_template_entries;
+    assert!(
+        baseline_entries < 635_621 / 2,
+        "the finished optimizing body must take over the recursion: {baseline_entries} baseline entries"
+    );
 }

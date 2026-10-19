@@ -889,9 +889,21 @@ impl Interpreter {
             return;
         };
         let _ = self.resolve_optimized_code_for_fid(&owner, fid);
-        // A compilation in flight publishes its body through the same cell;
-        // until then this generation stops asking.
-        if self.jit_optimized_code.contains_key(&fid)
+        // A compilation in flight publishes its body through the same cell
+        // once it is installed, which happens at a tier decision. Code that
+        // never loops reaches one only here, so this generation asks again
+        // after a few more entries.
+        if !self.jit_optimized_code.contains_key(&fid)
+            && self.jit_compile_queue.is_pending(fid)
+            && let Some(function) = owner.exec_function(fid)
+        {
+            let poll = crate::tier_policy::PENDING_INSTALL_POLL_ENTRIES
+                .saturating_mul(function.instruction_count().max(1).into());
+            self.jit_code_registry.defer_generated_tiering(
+                fid,
+                Some(function.source_work().total().saturating_add(poll)),
+            );
+        } else if self.jit_optimized_code.contains_key(&fid)
             || self.jit_compile_queue.is_pending(fid)
             || !self
                 .jit_hook

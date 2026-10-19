@@ -225,7 +225,9 @@ pub(crate) enum DirectExec {
 /// user code) and a string `input`, as far as it goes without allocating.
 /// A miss and every `test` complete; an `exec` hit returns its record after
 /// the `lastIndex` write and the legacy statics. `None` when either operand
-/// needs the general ladder. The match neither allocates nor collects.
+/// needs the general ladder, or the subject is a rope: the general ladder
+/// flattens it in place once, and every later match reads it at its stored
+/// width. The match neither allocates nor collects.
 pub(crate) fn exec_direct(
     interp: &mut Interpreter,
     receiver: Value,
@@ -235,6 +237,9 @@ pub(crate) fn exec_direct(
     let regexp = receiver.as_regexp()?;
     let heap = &interp.gc_heap;
     let text = input.as_string(heap)?;
+    if !text.is_contiguous(heap) {
+        return None;
+    }
     let last_index = regexp.last_index_value(heap).as_i32()?;
     if last_index < 0 || !regexp.last_index_writable(heap) {
         return None;

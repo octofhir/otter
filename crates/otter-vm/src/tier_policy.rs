@@ -47,6 +47,11 @@ pub(crate) const PROFILED_PROPERTY_PIC_CAPACITY: usize = 4;
 /// runtime target-cardinality histogram justifies a smaller allocation.
 pub(crate) const PROFILED_CALL_TARGET_CAPACITY: usize = 8;
 
+/// Entries of a baseline generation between its tier decisions while its
+/// function's optimizing compilation is in flight: each decision installs a
+/// finished result, the way an interrupt check does.
+pub(crate) const PENDING_INSTALL_POLL_ENTRIES: u64 = 64;
+
 /// Native tier whose compiler work is being budgeted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum CostedTier {

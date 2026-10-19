@@ -232,6 +232,11 @@ pub(crate) fn emit_operation(
             lhs,
             rhs,
             alloc_roots.packet(concat_safepoint),
+            view.literal_allocations
+                .sites
+                .get(&instruction.pc)
+                .copied()
+                .unwrap_or_default(),
             threw,
             fatal,
         )?,

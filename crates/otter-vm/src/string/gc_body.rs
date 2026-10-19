@@ -464,41 +464,103 @@ pub fn alloc_latin1_string_body_with_roots(
     bytes: &[u8],
     external_visit: &mut RootSlotVisitor<'_>,
 ) -> Result<JsStringHandle, otter_gc::OutOfMemory> {
+    alloc_latin1_string_body_at(
+        heap,
+        bytes,
+        otter_gc::SitePlacement::Young(0),
+        external_visit,
+    )
+}
+
+/// [`alloc_latin1_string_body_with_roots`] for an allocation site.
+///
+/// # Errors
+/// Surfaces [`otter_gc::OutOfMemory`] verbatim.
+pub(crate) fn alloc_latin1_string_body_at(
+    heap: &mut GcHeap,
+    bytes: &[u8],
+    placement: otter_gc::SitePlacement,
+    external_visit: &mut RootSlotVisitor<'_>,
+) -> Result<JsStringHandle, otter_gc::OutOfMemory> {
     let len = bytes.len() as u32;
-    let hash = 0;
     if bytes.len() <= INLINE_LATIN1_CAP {
         let mut inline = [0u8; INLINE_LATIN1_CAP];
         inline[..bytes.len()].copy_from_slice(bytes);
-        return heap.alloc_with_roots(
+        return heap.alloc_trailing_at_site_with_roots_initialized(
             JsStringBody {
                 map: otter_gc::cell_map::TypeMap::NEW,
                 atom: 0,
                 len,
-                hash,
+                hash: 0,
                 repr: JsStringBodyRepr::InlineLatin1(inline),
                 utf16_cache: JsStringHandle::null(),
             },
+            0,
+            placement,
             external_visit,
+            |_| {},
         );
     }
     // Same as the flat path: the bytes are inside the GC allocation.
-    let handle = heap.alloc_trailing_with_roots(
+    heap.alloc_trailing_at_site_with_roots_initialized(
         JsStringBody {
             map: otter_gc::cell_map::TypeMap::NEW,
             atom: 0,
             len,
-            hash,
+            hash: 0,
             repr: JsStringBodyRepr::SeqLatin1,
             utf16_cache: JsStringHandle::null(),
         },
         JsStringBody::trailing_bytes(true, bytes.len()),
+        placement,
         external_visit,
-    )?;
-    heap.with_payload(handle, |body| {
-        body.init_seq_latin1(bytes);
-        true
-    });
-    Ok(handle)
+        |body| body.init_seq_latin1(bytes),
+    )
+}
+
+/// Allocate a flat WTF-16 string body for an allocation site.
+///
+/// # Errors
+/// Surfaces [`otter_gc::OutOfMemory`] verbatim.
+pub(crate) fn alloc_flat_string_body_at(
+    heap: &mut GcHeap,
+    units: &[u16],
+    placement: otter_gc::SitePlacement,
+    external_visit: &mut RootSlotVisitor<'_>,
+) -> Result<JsStringHandle, otter_gc::OutOfMemory> {
+    let len = units.len() as u32;
+    if units.len() <= INLINE_FLAT_CAP {
+        let mut inline = [0u16; INLINE_FLAT_CAP];
+        inline[..units.len()].copy_from_slice(units);
+        return heap.alloc_trailing_at_site_with_roots_initialized(
+            JsStringBody {
+                map: otter_gc::cell_map::TypeMap::NEW,
+                atom: 0,
+                len,
+                hash: 0,
+                repr: JsStringBodyRepr::InlineFlat(inline),
+                utf16_cache: JsStringHandle::null(),
+            },
+            0,
+            placement,
+            external_visit,
+            |_| {},
+        );
+    }
+    heap.alloc_trailing_at_site_with_roots_initialized(
+        JsStringBody {
+            map: otter_gc::cell_map::TypeMap::NEW,
+            atom: 0,
+            len,
+            hash: 0,
+            repr: JsStringBodyRepr::SeqFlat,
+            utf16_cache: JsStringHandle::null(),
+        },
+        JsStringBody::trailing_bytes(false, units.len()),
+        placement,
+        external_visit,
+        |body| body.init_seq_flat(units),
+    )
 }
 
 /// Allocate a Latin-1 string body directly in old space through the heap's
@@ -558,6 +620,7 @@ pub fn concat_string_bodies(
     heap: &mut GcHeap,
     left: JsStringHandle,
     right: JsStringHandle,
+    placement: otter_gc::SitePlacement,
     external_visit: &mut RootSlotVisitor<'_>,
 ) -> Result<JsStringHandle, StringConcatError> {
     let (left_len, left_depth) = heap.read_payload(left, |b| (b.len, b.depth()));
@@ -619,9 +682,9 @@ pub fn concat_string_bodies(
                 for (dst, &unit) in bytes.iter_mut().zip(units[..n].iter()) {
                     *dst = unit as u8;
                 }
-                alloc_latin1_string_body_with_roots(heap, &bytes[..n], external_visit)?
+                alloc_latin1_string_body_at(heap, &bytes[..n], placement, external_visit)?
             } else {
-                alloc_flat_string_body_with_roots(heap, &units[..n], external_visit)?
+                alloc_flat_string_body_at(heap, &units[..n], placement, external_visit)?
             });
         }
     }
@@ -654,7 +717,7 @@ pub fn concat_string_bodies(
 
     let final_depth = left_depth.max(right_depth).saturating_add(1);
 
-    Ok(heap.alloc_with_roots(
+    Ok(heap.alloc_trailing_at_site_with_roots_initialized(
         JsStringBody {
             map: otter_gc::cell_map::TypeMap::NEW,
             atom: 0,
@@ -667,7 +730,10 @@ pub fn concat_string_bodies(
             },
             utf16_cache: JsStringHandle::null(),
         },
+        0,
+        placement,
         external_visit,
+        |_| {},
     )?)
 }
 
@@ -1824,7 +1890,14 @@ mod tests {
         cons_right =
             alloc_latin1_string_body_with_roots(&mut heap, b"qrstuvwxyz012345", &mut roots)
                 .expect("cons right");
-        cons = concat_string_bodies(&mut heap, cons_left, cons_right, &mut roots).expect("cons");
+        cons = concat_string_bodies(
+            &mut heap,
+            cons_left,
+            cons_right,
+            otter_gc::SitePlacement::Young(0),
+            &mut roots,
+        )
+        .expect("cons");
         sliced =
             slice_string_body(&mut heap, sequential_latin1, 5, 10, &mut roots).expect("sliced");
 
@@ -1927,7 +2000,14 @@ mod tests {
         left = alloc_flat_string_body_with_roots(&mut heap, &left_units, &mut roots).expect("left");
         right =
             alloc_flat_string_body_with_roots(&mut heap, &right_units, &mut roots).expect("right");
-        cons = concat_string_bodies(&mut heap, left, right, &mut roots).expect("cons");
+        cons = concat_string_bodies(
+            &mut heap,
+            left,
+            right,
+            otter_gc::SitePlacement::Young(0),
+            &mut roots,
+        )
+        .expect("cons");
         heap.read_payload(cons, |b| {
             assert_eq!(b.len(), 32);
             assert!(matches!(b.repr, JsStringBodyRepr::Cons { .. }));
@@ -2109,7 +2189,14 @@ mod tests {
                 .expect("left");
         right = alloc_flat_string_body_with_roots(&mut heap, &[b'c' as u16], &mut roots)
             .expect("right");
-        cons = concat_string_bodies(&mut heap, left, right, &mut roots).expect("cons");
+        cons = concat_string_bodies(
+            &mut heap,
+            left,
+            right,
+            otter_gc::SitePlacement::Young(0),
+            &mut roots,
+        )
+        .expect("cons");
         flat = flatten_string_body(&mut heap, cons, &mut roots).expect("flat");
         heap.read_payload(flat, |b| {
             assert!(matches!(b.repr, JsStringBodyRepr::InlineFlat(_)));

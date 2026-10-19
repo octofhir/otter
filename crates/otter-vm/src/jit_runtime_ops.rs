@@ -117,7 +117,10 @@ impl Interpreter {
         let lhs = frame.read(lhs).map_err(CommittedValueError::Fatal)?;
         let rhs = frame.read(rhs).map_err(CommittedValueError::Fatal)?;
         record_completed_arith(context, frame, lhs, rhs);
-        let result = self.add_value(stack, context, lhs, rhs)?;
+        let site = context
+            .exec_function(frame.function_id())
+            .and_then(|function| function.allocation_site_at(frame.pc() as usize));
+        let result = self.add_value(stack, context, lhs, rhs, site)?;
         frame.write(dst, result).map_err(CommittedValueError::Fatal)
     }
 

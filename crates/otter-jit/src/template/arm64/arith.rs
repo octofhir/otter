@@ -373,6 +373,7 @@ pub(super) fn emit_add_generic(
     rhs: u16,
     concat: crate::template::operation::AllocPacket,
     site: Option<ArithSite>,
+    string_site: otter_vm::jit::JitAllocationSite,
     threw: DynamicLabel,
     fatal: DynamicLabel,
 ) -> Result<(), Unsupported> {
@@ -413,9 +414,28 @@ pub(super) fn emit_add_generic(
     // the delegate, whose completion records it.
     emit_record_arith(ops, relocations, site, otter_vm::jit_feedback::ARITH_STRING);
     let collecting = ops.new_dynamic_label();
-    super::primitive_strings::emit_concat_fit(ops, shared, dst, lhs, rhs, collecting, done)?;
+    super::primitive_strings::emit_concat_fit(
+        ops,
+        shared,
+        dst,
+        lhs,
+        rhs,
+        string_site,
+        collecting,
+        done,
+    )?;
     dynasm!(ops ; .arch aarch64 ; =>collecting);
-    emit_string_concat_alloc_call(ops, relocations, dst, lhs, rhs, concat, delegate_path, done)?;
+    emit_string_concat_alloc_call(
+        ops,
+        relocations,
+        dst,
+        lhs,
+        rhs,
+        string_site,
+        concat,
+        delegate_path,
+        done,
+    )?;
     dynasm!(ops ; .arch aarch64 ; =>delegate_path);
     emit_add_delegate(ops, relocations, table, dst, lhs, rhs, threw, fatal);
     dynasm!(ops ; .arch aarch64 ; =>done);

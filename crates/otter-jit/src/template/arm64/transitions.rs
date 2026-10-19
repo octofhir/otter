@@ -458,12 +458,14 @@ pub(crate) fn emit_alloc_packet(
 /// entry: build the frozen call packet on the machine stack, publish
 /// `packet`'s roots, call, and on `Ok` store the result. Any non-`Ok`
 /// status branches to `miss` (the interpreter-completing delegate path).
+/// `site` places the strings the call creates.
 pub(super) fn emit_string_concat_alloc_call(
     ops: &mut Assembler,
     relocations: &mut RelocationCapture,
     dst: u16,
     lhs: u16,
     rhs: u16,
+    site: otter_vm::jit::JitAllocationSite,
     packet: crate::template::operation::AllocPacket,
     miss: DynamicLabel,
     done: DynamicLabel,
@@ -476,7 +478,11 @@ pub(super) fn emit_string_concat_alloc_call(
     emit_alloc_packet(ops, packet);
     emit_load_reg(ops, 2, lhs)?;
     emit_load_reg(ops, 3, rhs)?;
-    emit_load_u64(ops, 4, VALUE_UNDEFINED);
+    emit_load_u64(
+        ops,
+        4,
+        crate::allocation::ConcatPlacement::stub_operand(site),
+    );
     emit_load_runtime_stub(
         ops,
         relocations,

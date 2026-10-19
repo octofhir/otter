@@ -813,6 +813,7 @@ fn emit_add_generic(
     lhs: u16,
     rhs: u16,
     concat: crate::template::operation::AllocPacket,
+    site: otter_vm::jit::JitAllocationSite,
     threw: DynamicLabel,
     fatal: DynamicLabel,
 ) -> Result<(), Unsupported> {
@@ -837,7 +838,7 @@ fn emit_add_generic(
     dynasm!(ops ; .arch x64 ; jmp =>done ; =>runtime_path);
 
     let collecting = ops.new_dynamic_label();
-    primitive_strings::emit_concat_fit(ops, shared, dst, lhs, rhs, collecting, done);
+    primitive_strings::emit_concat_fit(ops, shared, dst, lhs, rhs, site, collecting, done);
     dynasm!(ops ; .arch x64 ; =>collecting);
 
     if let Some(stub_addr) =
@@ -846,7 +847,11 @@ fn emit_add_generic(
         emit_alloc_packet(ops, concat);
         emit_load_reg(ops, 2, lhs);
         emit_load_reg(ops, 1, rhs);
-        emit_load_u64(ops, 8, VALUE_UNDEFINED);
+        emit_load_u64(
+            ops,
+            8,
+            crate::allocation::ConcatPlacement::stub_operand(site),
+        );
         emit_load_runtime_stub(
             ops,
             relocations,

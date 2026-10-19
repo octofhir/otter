@@ -2,7 +2,9 @@
 //!
 //! # Contents
 //! - Empty identity, short width-preserving flat concatenation and bounded Cons.
-//! - VM-owned payload length/hash and complete initialized young cell publication.
+//! - VM-owned payload length/hash and complete initialized cell publication.
+//! - Allocation-site placement: tracked young cells, old cells, or a site
+//!   record read at run time by code many sites share.
 //!
 //! # Invariants
 //! All tag/length/depth/limit misses precede candidate writes. Inputs are explicit
@@ -12,17 +14,34 @@
 //! the single top store; the result is committed late by the tier's caller.
 //! Only four declared GP temporaries plus the target's reserved GP/FP scratch
 //! registers and flags are clobbered. String geometry/hash/header bits are VM data.
+//! An old string is never born pointing at a young child: such a cons misses
+//! to the canonical allocator, which remembers the edge. A tenured site read
+//! at run time misses before any write.
 //!
 //! # See also
 //! - `otter_vm::jit::JitStringLayout` owns the current physical string recipe.
 //! - `super` owns the shared LAB probe, publication and per-type accounting.
 
-use super::{emit_bump_probe, emit_publish, emit_value, validate_inputs};
-use crate::allocation::{AllocationValue, LabRegisters};
-use crate::entry::ALLOC_WINDOW_LAB_OFFSET;
+use super::{emit_bump_probe_in, emit_publish, emit_value, validate_inputs};
+use crate::allocation::{AllocationValue, ConcatPlacement, LabRegisters};
+use crate::entry::{ALLOC_WINDOW_LAB_OFFSET, ALLOC_WINDOW_OLD_LAB_OFFSET};
 use crate::template::arm64::values::emit_load_u64;
 use dynasmrt::{DynamicLabel, DynasmApi, DynasmLabelApi, aarch64::Assembler, dynasm};
-use otter_vm::jit::JitStringLayout;
+use otter_vm::jit::{
+    JIT_GC_YOUNG_FLAG, JIT_HEADER_FLAGS_BYTE, JIT_HEADER_SITE_BYTES, JIT_SITE_CREATED_OFFSET,
+    JIT_SITE_DECIDED_BIT, JIT_SITE_DECISION_OFFSET, JIT_SITE_ID_OFFSET, JitSiteMode,
+    JitStringLayout,
+};
+
+const TENURE: u32 = otter_vm::jit::JIT_SITE_TENURE as u32;
+
+fn lab_offset(placement: ConcatPlacement) -> u32 {
+    if placement.old() {
+        ALLOC_WINDOW_OLD_LAB_OFFSET
+    } else {
+        ALLOC_WINDOW_LAB_OFFSET
+    }
+}
 
 /// Candidate is the result on fit/identity; every miss is pre-effect.
 pub(crate) fn emit_concat(
@@ -31,6 +50,7 @@ pub(crate) fn emit_concat(
     p: JitStringLayout,
     inputs: [AllocationValue; 2],
     r: LabRegisters,
+    placement: ConcatPlacement,
     slow: DynamicLabel,
 ) {
     validate_inputs(r, &inputs);
@@ -40,6 +60,14 @@ pub(crate) fn emit_concat(
             .iter()
             .all(|v| ![16, 17].contains(v))
     );
+    if let ConcatPlacement::Record(record) = placement {
+        debug_assert!(
+            ![r.buffer, r.candidate, r.end, r.scratch, 16, 17, context].contains(&record)
+        );
+        dynasm!(ops ; .arch aarch64 ; cbz X(record), >placed
+            ; ldrb w17, [X(record), JIT_SITE_DECISION_OFFSET]
+            ; cmp w17, TENURE ; b.eq =>slow ; placed:);
+    }
     let [a, b] = inputs;
     let latin = ops.new_dynamic_label();
     let flat = ops.new_dynamic_label();
@@ -68,10 +96,10 @@ pub(crate) fn emit_concat(
     classify(ops, p, r.end, flat, flat, cons);
     dynasm!(ops ; .arch aarch64 ; =>flat
         ; cmp WSP(r.scratch),p.inline_flat_cap as u32 ; b.hi =>cons);
-    emit_flat(ops, context, p, inputs, r, false, slow);
+    emit_flat(ops, context, p, inputs, r, placement, false, slow);
     dynasm!(ops ; .arch aarch64 ; b =>done ; =>latin
         ; cmp WSP(r.scratch),p.inline_latin1_cap as u32 ; b.hi =>cons);
-    emit_flat(ops, context, p, inputs, r, true, slow);
+    emit_flat(ops, context, p, inputs, r, placement, true, slow);
     dynasm!(ops ; .arch aarch64 ; b =>done ; =>cons);
     emit_depth(ops, p, a, r.scratch, r.buffer);
     emit_depth(ops, p, b, r.end, r.buffer);
@@ -79,7 +107,14 @@ pub(crate) fn emit_concat(
         ; csel W(r.scratch),W(r.scratch),W(r.end),hs
         ; add WSP(r.scratch),WSP(r.scratch),1
         ; cmp WSP(r.scratch),p.max_rope_depth as u32 ; b.hi =>slow);
-    initialize(ops, context, p, inputs, r, slow);
+    if placement.old() {
+        for input in inputs {
+            emit_value(ops, 16, input);
+            dynasm!(ops ; .arch aarch64 ; ldrb w17, [x16, JIT_HEADER_FLAGS_BYTE]
+                ; tbnz w17, JIT_GC_YOUNG_FLAG.trailing_zeros(), =>slow);
+        }
+    }
+    initialize(ops, context, p, inputs, r, placement, slow);
     emit_value(ops, 16, a);
     dynasm!(ops ; .arch aarch64 ; str w16,[X(r.candidate),p.cons_left_byte]);
     emit_value(ops, 16, b);
@@ -92,7 +127,7 @@ pub(crate) fn emit_concat(
         ; csel W(r.scratch),W(r.scratch),W(r.buffer),hs
         ; add WSP(r.scratch),WSP(r.scratch),1
         ; strb W(r.scratch),[X(r.candidate),p.cons_depth_byte]);
-    publish(ops, context, p, r);
+    publish(ops, context, p, r, placement);
     dynasm!(ops ; .arch aarch64 ; b =>done ; =>empty_a ; mov X(r.candidate),X(r.end)
         ; b =>done ; =>empty_b ; mov X(r.candidate),X(r.buffer) ; =>done);
 }
@@ -129,16 +164,17 @@ fn initialize(
     p: JitStringLayout,
     inputs: [AllocationValue; 2],
     r: LabRegisters,
+    placement: ConcatPlacement,
     slow: DynamicLabel,
 ) {
     emit_load_u64(ops, r.size, u64::from(p.cell_bytes));
-    emit_bump_probe(ops, context, r, slow);
+    emit_bump_probe_in(ops, context, lab_offset(placement), r, slow);
     emit_load_u64(ops, 16, p.map_atom_word);
     dynasm!(ops ; .arch aarch64 ; str x16,[X(r.candidate),8]);
     for byte in (16..p.cell_bytes).step_by(8) {
         dynasm!(ops ; .arch aarch64 ; str xzr,[X(r.candidate),byte]);
     }
-    emit_load_u64(ops, 16, p.header_word);
+    emit_load_u64(ops, 16, placement.header_word(p.header_word));
     dynasm!(ops ; .arch aarch64 ; str x16,[X(r.candidate)]);
     emit_value(ops, 16, inputs[0]);
     dynasm!(ops ; .arch aarch64 ; ldr W(r.scratch),[x16,p.string_len_byte]);
@@ -146,11 +182,36 @@ fn initialize(
     dynasm!(ops ; .arch aarch64 ; ldr w17,[x16,p.string_len_byte]
         ; add W(r.scratch),W(r.scratch),w17 ; str W(r.scratch),[X(r.candidate),p.string_len_byte]);
 }
-fn publish(ops: &mut Assembler, context: u8, p: JitStringLayout, r: LabRegisters) {
+fn publish(
+    ops: &mut Assembler,
+    context: u8,
+    p: JitStringLayout,
+    r: LabRegisters,
+    placement: ConcatPlacement,
+) {
     emit_load_u64(ops, r.size, u64::from(p.cell_bytes));
-    dynasm!(ops ; .arch aarch64 ; ldr X(r.buffer),[X(context),ALLOC_WINDOW_LAB_OFFSET]
+    dynasm!(ops ; .arch aarch64 ; ldr X(r.buffer),[X(context),lab_offset(placement)]
         ; add XSP(r.end),XSP(r.candidate),p.cell_bytes);
     emit_publish(ops, r);
+    // A tracked birth counts toward the site's survival ratio.
+    match placement {
+        ConcatPlacement::Site(site) if site.mode == JitSiteMode::Track => {
+            emit_load_u64(ops, 16, site.record);
+            dynasm!(ops ; .arch aarch64 ; ldr w17, [x16, JIT_SITE_CREATED_OFFSET]
+                ; add w17, w17, #1 ; str w17, [x16, JIT_SITE_CREATED_OFFSET]);
+        }
+        ConcatPlacement::Site(_) => {}
+        ConcatPlacement::Record(record) => {
+            dynasm!(ops ; .arch aarch64 ; cbz X(record), >counted
+                ; ldrb w17, [X(record), JIT_SITE_DECISION_OFFSET]
+                ; tbnz w17, JIT_SITE_DECIDED_BIT.trailing_zeros(), >counted
+                ; ldrh w17, [X(record), JIT_SITE_ID_OFFSET]
+                ; strh w17, [X(r.candidate), JIT_HEADER_SITE_BYTES]
+                ; ldr w17, [X(record), JIT_SITE_CREATED_OFFSET]
+                ; add w17, w17, #1 ; str w17, [X(record), JIT_SITE_CREATED_OFFSET]
+                ; counted:);
+        }
+    }
 }
 fn emit_flat(
     ops: &mut Assembler,
@@ -158,10 +219,11 @@ fn emit_flat(
     p: JitStringLayout,
     inputs: [AllocationValue; 2],
     r: LabRegisters,
+    placement: ConcatPlacement,
     latin: bool,
     slow: DynamicLabel,
 ) {
-    initialize(ops, context, p, inputs, r, slow);
+    initialize(ops, context, p, inputs, r, placement, slow);
     let tag = if latin {
         p.inline_latin1_tag
     } else {
@@ -185,7 +247,7 @@ fn emit_flat(
         dynasm!(ops ; .arch aarch64 ; =>next);
     }
     dynasm!(ops ; .arch aarch64 ; fmov X(r.candidate),d31);
-    publish(ops, context, p, r);
+    publish(ops, context, p, r, placement);
 }
 fn emit_copy_loop(
     ops: &mut Assembler,

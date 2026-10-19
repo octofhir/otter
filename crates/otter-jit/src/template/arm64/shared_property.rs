@@ -318,8 +318,12 @@ pub(crate) const CONCAT_LHS: u8 = 9;
 pub(crate) const CONCAT_RHS: u8 = 10;
 /// Concat routine result on a fit.
 pub(crate) const CONCAT_RESULT: u8 = 12;
+/// Concat routine input: the calling site's allocation-site record address,
+/// or zero.
+pub(crate) const CONCAT_SITE: u8 = 14;
 
-/// The nursery fit of `CONCAT_LHS + CONCAT_RHS` for two strings: `x1` is
+/// The fit of `CONCAT_LHS + CONCAT_RHS` for two strings, placed by the
+/// `CONCAT_SITE` record: `x1` is
 /// zero with the new string in `CONCAT_RESULT`, or one when it does not fit
 /// and nothing was published. Neither collects nor calls Rust.
 fn emit_concat(ops: &mut Assembler, view: &JitCompileSnapshot, label: DynamicLabel) {
@@ -340,6 +344,7 @@ fn emit_concat(ops: &mut Assembler, view: &JitCompileSnapshot, label: DynamicLab
             scratch: 15,
             size: 17,
         },
+        crate::allocation::ConcatPlacement::Record(CONCAT_SITE),
         miss,
     );
     dynasm!(ops

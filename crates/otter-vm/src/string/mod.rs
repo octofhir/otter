@@ -288,11 +288,29 @@ impl JsString {
         heap: &mut GcHeap,
         external_visit: &mut otter_gc::heap::RootSlotVisitor<'_>,
     ) -> Result<Self, OutOfMemory> {
+        Self::from_latin1_at(
+            bytes,
+            heap,
+            otter_gc::SitePlacement::Young(0),
+            external_visit,
+        )
+    }
+
+    /// [`Self::from_latin1_with_roots`] for an allocation site.
+    ///
+    /// # Errors
+    /// Surfaces [`OutOfMemory`] verbatim.
+    pub(crate) fn from_latin1_at(
+        bytes: &[u8],
+        heap: &mut GcHeap,
+        placement: otter_gc::SitePlacement,
+        external_visit: &mut otter_gc::heap::RootSlotVisitor<'_>,
+    ) -> Result<Self, OutOfMemory> {
         let first = bytes.first().map(|&byte| u16::from(byte));
         if let Some(shared) = Self::shared_unit_string(bytes.len(), first, heap) {
             return Ok(shared);
         }
-        let handle = gc_body::alloc_latin1_string_body_with_roots(heap, bytes, external_visit)?;
+        let handle = gc_body::alloc_latin1_string_body_at(heap, bytes, placement, external_visit)?;
         Ok(Self {
             handle,
             cached_len: bytes.len() as u32,
@@ -423,6 +441,19 @@ impl JsString {
         right: JsString,
         heap: &mut GcHeap,
     ) -> Result<Self, StringConcatError> {
+        Self::concat_at(left, right, heap, otter_gc::SitePlacement::Young(0))
+    }
+
+    /// [`Self::concat`] whose new body is placed for an allocation site.
+    ///
+    /// # Errors
+    /// As [`Self::concat`].
+    pub(crate) fn concat_at(
+        left: JsString,
+        right: JsString,
+        heap: &mut GcHeap,
+        placement: otter_gc::SitePlacement,
+    ) -> Result<Self, StringConcatError> {
         if right.is_empty() {
             return Ok(left);
         }
@@ -443,7 +474,8 @@ impl JsString {
             );
         }
         let mut roots = no_extra_roots;
-        let handle = gc_body::concat_string_bodies(heap, left_handle, right_handle, &mut roots)?;
+        let handle =
+            gc_body::concat_string_bodies(heap, left_handle, right_handle, placement, &mut roots)?;
         let cached_len = heap.read_payload(handle, |b| b.len);
         Ok(Self { handle, cached_len })
     }

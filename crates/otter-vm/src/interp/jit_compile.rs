@@ -1487,9 +1487,7 @@ impl Interpreter {
                 jit::JitClosureAllocationPlan {
                     call_word: u64::from(function_id) | (u64::from(flags) << 32),
                     arrow,
-                    context_cell: owner.function(function_id).map_or(0, |function| {
-                        self.jit_code_registry.closure_contexts.prepare(function)
-                    }),
+                    context_cell: self.prepare_closure_context(&owner, function_id),
                 },
             );
         }

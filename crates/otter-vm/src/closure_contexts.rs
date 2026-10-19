@@ -5,7 +5,10 @@
 //! - Birth observation and a collector-rewritten first-context word.
 //!
 //! # Invariants
-//! - Every eligible source is observed from its first closure birth.
+//! - Every eligible source is observed from its first closure birth. A lazy
+//!   record, whose body is not compiled yet, is tracked: its first births
+//!   precede the body that decides; a compiled body is classified by its
+//!   own code, not by the record's placeholder.
 //! - A source progresses from unseen to one context to permanently unavailable.
 //! - A second context releases the first and fires every subscribed generation.
 //!   Code reclamation also releases candidate sources before its full census.
@@ -93,6 +96,33 @@ impl ClosureContexts {
             .map_or(0, |fact| fact.context.as_ptr() as u64)
     }
 
+    /// The fact cell of an already classified source: `Some(0)` when it is
+    /// untracked or released, `None` before its first classification.
+    pub(crate) fn classified(&self, function_id: u32) -> Option<u64> {
+        let fact = self.facts.get(&function_id)?;
+        Some(
+            fact.as_ref()
+                .filter(|fact| {
+                    fact.context.load(Ordering::Relaxed) != Value::undefined().to_bits()
+                })
+                .map_or(0, |fact| fact.context.as_ptr() as u64),
+        )
+    }
+
+    /// Track a source whose body is not compiled yet: the body that decides
+    /// eligibility does not exist, and its first births precede it.
+    pub(crate) fn prepare_pending(&mut self, function_id: u32) -> u64 {
+        let fact = self.facts.entry(function_id).or_insert_with(|| {
+            Some(Box::new(ContextFact {
+                context: AtomicU64::new(ContextFact::UNSEEN),
+                subscribers: Vec::new(),
+            }))
+        });
+        fact.as_ref()
+            .filter(|fact| fact.context.load(Ordering::Relaxed) != Value::undefined().to_bits())
+            .map_or(0, |fact| fact.context.as_ptr() as u64)
+    }
+
     pub(crate) fn observe(&mut self, function_id: u32, context: Value) {
         if let Some(Some(fact)) = self.facts.get_mut(&function_id) {
             fact.observe(context);
@@ -153,12 +183,41 @@ impl crate::Interpreter {
         closure: crate::closure::JsClosure,
     ) {
         let function_id = closure.function_id();
-        if let Some(function) = source.function(function_id) {
-            self.jit_code_registry.closure_contexts.prepare(function);
+        if self.prepare_closure_context(source, function_id) != 0 {
             self.jit_code_registry
                 .closure_contexts
                 .observe(function_id, closure.context(&self.gc_heap));
         }
+    }
+
+    /// The context fact cell of source `function_id` as `source` names it,
+    /// or zero when the source is not tracked: a lazy record whose body is
+    /// not compiled is tracked, a compiled body is classified by its code
+    /// wherever it lives.
+    pub(crate) fn prepare_closure_context(
+        &mut self,
+        source: &crate::ExecutionContext,
+        function_id: u32,
+    ) -> u64 {
+        if let Some(cell) = self
+            .jit_code_registry
+            .closure_contexts
+            .classified(function_id)
+        {
+            return cell;
+        }
+        if source.lazy_pending(function_id) {
+            return self
+                .jit_code_registry
+                .closure_contexts
+                .prepare_pending(function_id);
+        }
+        let Ok(owner) = source.for_function(function_id) else {
+            return 0;
+        };
+        owner.function(function_id).map_or(0, |function| {
+            self.jit_code_registry.closure_contexts.prepare(function)
+        })
     }
 }
 

@@ -736,16 +736,11 @@ pub(crate) extern "C" fn jit_regexp_exec_stub(
 ) -> NativeResultPair {
     // SAFETY: the live `JitCtx` reentry contract.
     let ctx = unsafe { &mut *ctx };
-    let result = ctx
-        .runtime_call()
-        .map_err(CommittedValueError::Fatal)
-        .and_then(|mut runtime| {
-            runtime.regexp_method(
-                Value::from_bits(receiver_bits),
-                Value::from_bits(argument_bits),
-                false,
-            )
-        });
+    let result = ctx.regexp_method(
+        Value::from_bits(receiver_bits),
+        Value::from_bits(argument_bits),
+        false,
+    );
     committed_value_result(ctx, result)
 }
 
@@ -757,16 +752,11 @@ pub(crate) extern "C" fn jit_regexp_test_stub(
 ) -> NativeResultPair {
     // SAFETY: the live `JitCtx` reentry contract.
     let ctx = unsafe { &mut *ctx };
-    let result = ctx
-        .runtime_call()
-        .map_err(CommittedValueError::Fatal)
-        .and_then(|mut runtime| {
-            runtime.regexp_method(
-                Value::from_bits(receiver_bits),
-                Value::from_bits(argument_bits),
-                true,
-            )
-        });
+    let result = ctx.regexp_method(
+        Value::from_bits(receiver_bits),
+        Value::from_bits(argument_bits),
+        true,
+    );
     committed_value_result(ctx, result)
 }
 

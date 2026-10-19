@@ -188,14 +188,15 @@ fn named_index(names: &[String], captures: Captures<'_>, name: &str) -> Option<u
 
 /// One owned result with decoded ranges for repeated capture reads.
 ///
-/// It is independent of matcher scratch and the subject; captureless matches
-/// allocate no range buffer.
+/// It is independent of matcher scratch and the subject; a match of up to
+/// two groups allocates nothing, and only a pattern with named groups shares
+/// its name table.
 #[derive(Debug, Clone)]
 pub struct MatchRecord {
     /// Overall match extent, group zero; it may be empty.
     pub range: Range<usize>,
-    captures: Vec<Option<Range<usize>>>,
-    names: Arc<[String]>,
+    captures: SmallVec<[Option<Range<usize>>; 2]>,
+    names: Option<Arc<[String]>>,
 }
 
 impl MatchRecord {
@@ -221,7 +222,10 @@ impl MatchRecord {
         Self {
             range: slots.range(),
             captures,
-            names: Arc::clone(names),
+            names: names
+                .iter()
+                .any(|name| !name.is_empty())
+                .then(|| Arc::clone(names)),
         }
     }
 
@@ -239,7 +243,7 @@ impl MatchRecord {
         Match {
             range: self.range.clone(),
             captures: self.captures(),
-            group_names: &self.names,
+            group_names: self.names.as_deref().unwrap_or(&[]),
         }
     }
 }

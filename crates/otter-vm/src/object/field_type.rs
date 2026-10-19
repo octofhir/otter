@@ -196,7 +196,19 @@ pub(crate) fn observe_owner(owner: ShapeHandle, value: Value) {
     if old == TOP {
         return;
     }
-    let next = merge(old, classify(value));
+    let sample = classify(value);
+    // Most stores repeat a category the summary already holds.
+    let covered = match sample {
+        UNDEFINED | NULL => old & CONST_INT32 == 0 && old & sample != 0,
+        _ if sample & CONST_INT32 != 0 => {
+            old == sample || (old & CONST_INT32 == 0 && old & INT32 != 0)
+        }
+        _ => false,
+    };
+    if covered {
+        return;
+    }
+    let next = merge(old, sample);
     if next != old {
         shape_body::set_field_type_snapshot(owner, next);
     }

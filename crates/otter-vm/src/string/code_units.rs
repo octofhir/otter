@@ -78,10 +78,8 @@ impl Iterator for CodeUnits<'_> {
                 let index = self.leaf.start as usize;
                 let unit = self
                     .heap
-                    .read_payload(self.leaf.handle, |body| match &body.repr {
-                        JsStringBodyRepr::InlineFlat(units) => units[index],
+                    .read_payload(self.leaf.handle, |body| match body.repr() {
                         JsStringBodyRepr::SeqFlat => body.seq_flat_units()[index],
-                        JsStringBodyRepr::InlineLatin1(bytes) => u16::from(bytes[index]),
                         JsStringBodyRepr::SeqLatin1 => u16::from(body.seq_latin1_bytes()[index]),
                         _ => unreachable!("cursor leaf was classified contiguously"),
                     });
@@ -107,13 +105,11 @@ impl Iterator for CodeUnits<'_> {
                         .checked_add(segment.len)
                         .is_some_and(|end| end <= body.len)
                 );
-                match &body.repr {
-                    JsStringBodyRepr::Cons { left, right, .. } => Walk::Cons(
-                        *left,
-                        *right,
-                        self.heap.read_payload(*left, |body| body.len),
-                    ),
-                    JsStringBodyRepr::Sliced { parent, start } => Walk::Slice(*parent, *start),
+                match body.repr() {
+                    JsStringBodyRepr::Cons { left, right, .. } => {
+                        Walk::Cons(left, right, self.heap.read_payload(left, |body| body.len))
+                    }
+                    JsStringBodyRepr::Sliced { parent, start } => Walk::Slice(parent, start),
                     _ => Walk::Leaf,
                 }
             });

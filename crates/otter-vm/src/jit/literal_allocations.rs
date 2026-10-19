@@ -98,6 +98,10 @@ pub const JIT_SITE_DECISION_OFFSET: u32 = otter_gc::pretenuring::SITE_DECISION_O
 /// The black mark color in a cell's GC flags byte: an old cell compiled code
 /// carves while marking runs is born with it.
 pub const JIT_GC_BLACK_COLOR: u8 = otter_gc::MarkColor::Black as u8;
+/// Granule every cell size is a multiple of.
+pub const JIT_CELL_SIZE: usize = otter_gc::page::CELL_SIZE;
+/// Header-relative byte of a cell's `u32` size.
+pub const JIT_HEADER_SIZE_BYTE: u32 = otter_gc::header::HEADER_SIZE_BYTES_OFFSET as u32;
 /// Header-relative byte of a cell's GC flags, which hold the young flag.
 pub const JIT_HEADER_FLAGS_BYTE: u32 = otter_gc::header::HEADER_FLAGS_BYTE_OFFSET as u32;
 /// Header-relative bytes of a young cell's `u16` allocation-site tag.

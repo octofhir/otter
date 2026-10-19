@@ -2938,8 +2938,7 @@ impl<'a> Codegen<'a> {
     ) {
         let p = self.view.string_layout;
         let map = p.map_atom_word as u32;
-        let [flat, inline_latin1, seq_latin1, inline_flat, done] =
-            std::array::from_fn(|_| self.ops.new_dynamic_label());
+        let [flat, seq_latin1, done] = std::array::from_fn(|_| self.ops.new_dynamic_label());
         self.emit_cell_receiver(receiver, miss);
         dynasm!(self.ops ; .arch aarch64 ; ldr w16, [X(receiver), JIT_MAP_WORD_BYTE]);
         self.emit_compare_w16(map);
@@ -2961,23 +2960,13 @@ impl<'a> Codegen<'a> {
             ; add X(base), X(base), x16
             ; ldrb w16, [X(base), p.string_repr_byte]
             ; =>flat
-            ; cmp w16, u32::from(p.inline_latin1_tag) ; b.eq =>inline_latin1
             ; cmp w16, u32::from(p.seq_latin1_tag) ; b.eq =>seq_latin1
-            ; cmp w16, u32::from(p.inline_flat_tag) ; b.eq =>inline_flat
             ; cmp w16, u32::from(p.seq_flat_tag) ; b.ne =>miss
             ; add x16, XSP(base), p.string_body_size
             ; ldrh W(destination), [x16, w17, uxtw #1]
             ; b =>done
-            ; =>inline_flat
-            ; add x16, XSP(base), p.string_repr_payload_byte
-            ; ldrh W(destination), [x16, w17, uxtw #1]
-            ; b =>done
             ; =>seq_latin1
             ; add x16, XSP(base), p.string_body_size
-            ; ldrb W(destination), [x16, w17, uxtw]
-            ; b =>done
-            ; =>inline_latin1
-            ; add x16, XSP(base), p.string_repr_payload_byte
             ; ldrb W(destination), [x16, w17, uxtw]
             ; =>done
         );

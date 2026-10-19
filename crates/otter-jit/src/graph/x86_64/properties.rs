@@ -62,9 +62,7 @@ impl Codegen<'_> {
         let p = self.view.string_layout;
         let map = p.map_atom_word as u32;
         let flat = self.ops.new_dynamic_label();
-        let inline_latin1 = self.ops.new_dynamic_label();
         let seq_latin1 = self.ops.new_dynamic_label();
-        let inline_flat = self.ops.new_dynamic_label();
         let done = self.ops.new_dynamic_label();
         self.emit_cell_guard(receiver, miss);
         dynasm!(self.ops ; .arch x64
@@ -82,20 +80,12 @@ impl Codegen<'_> {
             ; and Rq(base), Rq(receiver) ; add Rq(base), r10
             ; movzx r10d, BYTE [Rq(base) + p.string_repr_byte as i32]
             ; =>flat
-            ; cmp r10d, i32::from(p.inline_latin1_tag) ; je =>inline_latin1
             ; cmp r10d, i32::from(p.seq_latin1_tag) ; je =>seq_latin1
-            ; cmp r10d, i32::from(p.inline_flat_tag) ; je =>inline_flat
             ; cmp r10d, i32::from(p.seq_flat_tag) ; jne =>miss
             ; movzx Rd(destination), WORD [Rq(base) + r11 * 2 + p.string_body_size as i32]
             ; jmp =>done
-            ; =>inline_flat
-            ; movzx Rd(destination), WORD [Rq(base) + r11 * 2 + p.string_repr_payload_byte as i32]
-            ; jmp =>done
             ; =>seq_latin1
             ; movzx Rd(destination), BYTE [Rq(base) + r11 + p.string_body_size as i32]
-            ; jmp =>done
-            ; =>inline_latin1
-            ; movzx Rd(destination), BYTE [Rq(base) + r11 + p.string_repr_payload_byte as i32]
             ; =>done);
     }
 

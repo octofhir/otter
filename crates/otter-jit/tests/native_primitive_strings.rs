@@ -604,10 +604,23 @@ fn run(optimizing: bool) {
         let bv = value(&b);
         let mut expected = utf16(&vm, av);
         expected.extend(utf16(&vm, bv));
+        let short = usize::from(if latin {
+            layout.short_concat_latin1
+        } else {
+            layout.short_concat_flat
+        });
+        let cons = expected.len() > short;
+        let cell = otter_vm::jit::JIT_CELL_SIZE as u32;
+        let cell_bytes = if cons {
+            layout.pair_cell_bytes
+        } else {
+            let units = expected.len() as u32 * if latin { 1 } else { 2 };
+            (layout.string_body_size + units).div_ceil(cell) * cell
+        };
         let window = vm.gc_heap_mut().machine_allocation_window();
         // SAFETY: actual stable heap LAB descriptor, read-only premise.
         assert!(
-            unsafe { (*window.lab).remaining() } >= layout.cell_bytes as usize,
+            unsafe { (*window.lab).remaining() } >= cell_bytes as usize,
             "real native fit headroom"
         );
         let before = vm.gc_stats_snapshot();
@@ -618,7 +631,7 @@ fn run(optimizing: bool) {
         assert_eq!(after.minor_gc_cycles, before.minor_gc_cycles);
         assert_eq!(
             generated_bytes(&after) - generated_bytes(&before),
-            u64::from(layout.cell_bytes),
+            u64::from(cell_bytes),
             "the native fit carves exactly one string cell from the buffer"
         );
         assert_eq!(
@@ -634,10 +647,10 @@ fn run(optimizing: bool) {
         let result = scope.local(result.as_string_gc().unwrap());
         vm.gc_heap().read_payload(result.get(),|body| {
             assert_eq!(body.len as usize,expected.len());
-            if expected.len()>(if latin {layout.inline_latin1_cap}else{layout.inline_flat_cap}) as usize {
-                assert!(matches!(body.repr,JsStringBodyRepr::Cons{left,right,depth:1} if left==a.get() && right==b.get()));
-            } else if latin {assert!(matches!(body.repr,JsStringBodyRepr::InlineLatin1(_)));}
-            else {assert!(matches!(body.repr,JsStringBodyRepr::InlineFlat(_)));}
+            if cons {
+                assert!(matches!(body.repr(),JsStringBodyRepr::Cons{left,right,depth:1} if left==a.get() && right==b.get()));
+            } else if latin {assert!(matches!(body.repr(),JsStringBodyRepr::SeqLatin1));}
+            else {assert!(matches!(body.repr(),JsStringBodyRepr::SeqFlat));}
         });
     }
     for stride in 1..=16 {

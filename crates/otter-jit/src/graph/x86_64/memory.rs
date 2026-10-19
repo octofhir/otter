@@ -217,6 +217,30 @@ impl Codegen<'_> {
                     ; test r10d, r10d ; js =>exit
                     ; mov Rd(destination), r10d);
             }
+            Kind::LoadBackedgeFuel => {
+                let destination = output();
+                crate::x86_64::values::emit_load_backedge_fuel_cell(
+                    &mut self.ops,
+                    &mut self.relocations,
+                    10,
+                    self.view.backedge_fuel_cell,
+                );
+                dynasm!(self.ops ; .arch x64 ; mov Rq(destination), [r10]);
+            }
+            Kind::DecrementBackedgeFuel => {
+                let (fuel, destination) = (Self::gp(input(0)), output());
+                dynasm!(self.ops ; .arch x64 ; lea Rq(destination), [Rq(fuel) - 1]);
+            }
+            Kind::StoreBackedgeFuel => {
+                let fuel = Self::gp(input(0));
+                crate::x86_64::values::emit_load_backedge_fuel_cell(
+                    &mut self.ops,
+                    &mut self.relocations,
+                    10,
+                    self.view.backedge_fuel_cell,
+                );
+                dynasm!(self.ops ; .arch x64 ; mov [r10], Rq(fuel));
+            }
             Kind::LoadTypedArrayLength => {
                 let (receiver, destination) = (Self::gp(input(0)), output());
                 let exit = self.eager_exit(node, crate::graph::ir::DeoptReason::WrongShape);

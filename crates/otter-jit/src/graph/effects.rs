@@ -254,8 +254,11 @@ fn heap_effects(kind: &Kind) -> Effects {
         // A receiver plan's proof reads a constructor's family head and its
         // prototype's validity cell, which any heap write may change.
         Kind::CheckReceiverPlan(_) => Effects::reads(&[H::Heap]),
+        // The countdown cell is the polls' own word; no program reads it.
+        Kind::LoadBackedgeFuel | Kind::StoreBackedgeFuel => Effects::default(),
         // Values, conversions and checks of values alone.
-        Kind::ConstTagged(_)
+        Kind::DecrementBackedgeFuel
+        | Kind::ConstTagged(_)
         | Kind::ConstInt32(_)
         | Kind::ConstFloat64(_)
         | Kind::VirtualObject { .. }

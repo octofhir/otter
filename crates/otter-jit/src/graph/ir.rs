@@ -692,9 +692,19 @@ pub(crate) enum Kind {
         registers: Box<[u16]>,
     },
 
+    // ---- Back-edge countdown ----
+    /// The shared back-edge countdown cell's value, as a `Word`.
+    LoadBackedgeFuel,
+    /// Input0 minus one: a loop's register countdown after one back edge.
+    DecrementBackedgeFuel,
+    /// Write the `Word` countdown input0 back to the shared cell.
+    StoreBackedgeFuel,
+
     // ---- Control ----
     Jump(BlockId),
-    /// Back edge to a loop header; carries the interrupt poll.
+    /// Back edge to a loop header; carries the interrupt poll. With an
+    /// input, the loop's back-edge countdown is that `Word` register, which
+    /// the poll tests; otherwise the poll counts in the shared cell.
     JumpLoop(BlockId),
     Branch {
         kind: BranchKind,
@@ -820,6 +830,7 @@ impl Kind {
             | Self::LoadWindow(_)
             | Self::Phi
             | Self::AllocationProjection(_)
+            | Self::DecrementBackedgeFuel
             | Self::Int32AddWrapping
             | Self::Int32SubWrapping
             | Self::Int32MulExact
@@ -986,6 +997,10 @@ impl Kind {
                 may_collect: false,
             },
             Self::Jump(_) | Self::JumpLoop(_) | Self::Branch { .. } | Self::Return => Properties {
+                effectful: true,
+                ..Properties::default()
+            },
+            Self::LoadBackedgeFuel | Self::StoreBackedgeFuel => Properties {
                 effectful: true,
                 ..Properties::default()
             },
@@ -1389,8 +1404,11 @@ impl Kind {
                 fp_temps: 0,
                 fixed_gp_clobbers: SmallVec::new(),
             },
+            Self::JumpLoop(_) => simple(input_count, ResultPolicy::None),
+            Self::LoadBackedgeFuel => simple(0, ResultPolicy::Register),
+            Self::DecrementBackedgeFuel => simple(1, ResultPolicy::Register),
+            Self::StoreBackedgeFuel => simple(1, ResultPolicy::None),
             Self::Jump(_)
-            | Self::JumpLoop(_)
             | Self::Deopt(_)
             | Self::CheckStableShapes(_)
             | Self::CheckFieldTypes(_)

@@ -112,10 +112,20 @@ pub(crate) fn emit_concat(
     dynasm!(ops ; .arch x64 ; cmp Rd(r.scratch),Rd(r.end) ; cmovb Rd(r.scratch),Rd(r.end)
         ; inc Rd(r.scratch) ; cmp Rd(r.scratch),p.max_rope_depth as i32 ; ja =>slow);
     if placement.old() {
+        // An old cons is born black while marking runs, so a white child would
+        // be an edge no visit follows: the canonical allocator shades it.
+        dynasm!(ops ; .arch x64
+            ; mov Rq(r.scratch),[Rq(context)+crate::entry::THREAD_OFFSET as i32]
+            ; mov Rq(r.scratch),[Rq(r.scratch)+crate::entry::VM_THREAD_MARKING_FLAG_CELL_OFFSET as i32]
+            ; movzx Rd(r.scratch),BYTE [Rq(r.scratch)]);
         for input in inputs {
+            let next = ops.new_dynamic_label();
             emit_value(ops, 10, input);
             dynasm!(ops ; .arch x64 ; test BYTE [r10+HEADER_FLAGS_BYTE],JIT_GC_YOUNG_FLAG as i8
-                ; jnz =>slow);
+                ; jnz =>slow
+                ; test Rd(r.scratch),Rd(r.scratch) ; jz =>next
+                ; test BYTE [r10+HEADER_FLAGS_BYTE],3 ; jz =>slow
+                ; =>next);
         }
     }
     initialize(ops, context, p, inputs, r, placement, slow);
@@ -178,6 +188,9 @@ fn initialize(
     }
     emit_load_u64(ops, 10, placement.header_word(p.header_word));
     dynasm!(ops ; .arch x64 ; mov [Rq(r.candidate)],r10);
+    if placement.old() {
+        super::emit_black_when_marking(ops, context, r.candidate);
+    }
     emit_value(ops, 10, inputs[0]);
     dynasm!(ops ; .arch x64 ; mov Rd(r.scratch),[r10+p.string_len_byte as i32]);
     emit_value(ops, 10, inputs[1]);

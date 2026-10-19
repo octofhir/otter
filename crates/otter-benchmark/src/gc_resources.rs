@@ -78,10 +78,12 @@ pub fn trace_document(
         gaps.push("service was incomplete when capture stopped".to_string());
     }
     if capture.contains_split_phases
-        || capture
-            .records
-            .iter()
-            .any(|record| !matches!(record.kind, GcPauseKind::Minor | GcPauseKind::Full))
+        || capture.records.iter().any(|record| {
+            !matches!(
+                record.kind,
+                GcPauseKind::Minor | GcPauseKind::Full | GcPauseKind::MarkStart
+            )
+        })
     {
         gaps.push("split service is not a whole collection pause".to_string());
     }
@@ -144,6 +146,7 @@ pub fn trace_document(
                     let kind_matches = match record.kind {
                         GcPauseKind::Minor => full == 0 && minor == 1,
                         GcPauseKind::Full => full >= 1 && minor >= 1,
+                        GcPauseKind::MarkStart => full == 0 && minor == 0,
                         _ => true,
                     };
                     if !kind_matches {

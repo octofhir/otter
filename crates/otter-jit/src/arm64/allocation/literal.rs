@@ -9,8 +9,10 @@
 //! Inputs are initialized tagged homes or immediate constants. Realm/limit
 //! misses precede effects. All shell/slab fields, element words and hole bits
 //! are initialized before the single cursor publication. Fits cannot collect;
-//! fresh young cells need no initializing write barrier. Only the four declared
-//! GP temporaries, x16/x17 and reserved d31 are clobbered.
+//! fresh young cells need no initializing write barrier. An old cell's
+//! initialization is fenced before any store can publish it to the concurrent
+//! marker. Only the four declared GP temporaries, x16/x17 and reserved d31 are
+//! clobbered.
 //! Each field's selected record comes from the Graph plan; an observing record
 //! updates its defining summary through a noncollecting leaf on an inline
 //! membership miss, before the cell becomes visible. An all-zero literal emits
@@ -81,6 +83,10 @@ pub(crate) fn emit_object_literal(
     let candidate = regs.candidate;
     emit_load_u64(ops, 16, site.header_word(plan.header_word));
     dynasm!(ops ; .arch aarch64 ; str x16, [X(candidate)]);
+    if site.mode == JitSiteMode::Old {
+        // Its fields are barriered by the graph's own nodes.
+        super::emit_black_when_marking(ops, context, candidate);
+    }
     let start = plan
         .fields
         .inline_byte(otter_vm::object::FieldLocation::inline(0));
@@ -122,6 +128,7 @@ pub(crate) fn emit_object_literal(
         dynasm!(ops ; .arch aarch64 ; ldr X(regs.buffer), [X(context), lab_offset(site)]);
     }
     emit_publish(ops, regs);
+    emit_old_publication_fence(ops, site);
 }
 
 pub(crate) fn emit_array_literal(
@@ -211,6 +218,11 @@ pub(crate) fn emit_boilerplate_array(
     let shell = regs.candidate;
     emit_load_u64(ops, 16, site.header_word(plan.shell.header_word));
     dynasm!(ops ; .arch aarch64 ; str x16, [X(shell)]);
+    if site.mode == JitSiteMode::Old {
+        // Its one edge is the boilerplate slab, an old cell the isolate's
+        // boilerplate table roots.
+        super::emit_black_when_marking(ops, context, shell);
+    }
     emit_load_u64(ops, 16, plan.shell.map_word);
     dynasm!(ops ; .arch aarch64 ; str x16, [X(shell), 8]);
     for byte in (16..plan.shell.cell_bytes).step_by(8) {
@@ -242,6 +254,7 @@ pub(crate) fn emit_boilerplate_array(
         ; strb w16, [X(shell), plan.shell_own_guard_byte]
     );
     emit_publish(ops, regs);
+    emit_old_publication_fence(ops, site);
 }
 
 fn emit_dense_array(
@@ -283,6 +296,12 @@ fn emit_dense_array(
     }
     emit_load_u64(ops, 16, slab_site.header_word(plan.slab_header_word));
     dynasm!(ops ; .arch aarch64 ; str x16, [X(slab)]);
+    if site.mode == JitSiteMode::Old {
+        // A tenured literal is carved only numeric: neither cell has an
+        // edge but the shell's to its slab, born black beside it.
+        super::emit_black_when_marking(ops, context, shell);
+        super::emit_black_when_marking(ops, context, slab);
+    }
     for byte in (8..plan.slab_bytes).step_by(8) {
         dynasm!(ops ; .arch aarch64 ; str xzr, [X(slab), byte]);
     }
@@ -361,6 +380,15 @@ fn emit_dense_array(
         ; ldr X(regs.buffer), [X(context), lab_offset(site)]
         ; str X(regs.end), [X(regs.buffer), crate::entry::LAB_TOP_OFFSET]
     );
+    emit_old_publication_fence(ops, site);
+}
+
+/// Order an old cell's initializing stores before any store that publishes
+/// it: the concurrent marker may follow that store to the cell.
+fn emit_old_publication_fence(ops: &mut Assembler, site: JitAllocationSite) {
+    if site.mode == JitSiteMode::Old {
+        dynasm!(ops ; .arch aarch64 ; dmb ishst);
+    }
 }
 
 #[cfg(test)]

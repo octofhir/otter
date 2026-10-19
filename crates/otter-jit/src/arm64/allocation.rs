@@ -97,6 +97,22 @@ fn emit_bump_probe_in(
     );
 }
 
+/// Paint the old cell `cell` black while marking runs: no visit follows a
+/// cell born during a cycle. Its initializing edges are barriered by the
+/// caller or proven marked. Clobbers x16.
+pub(crate) fn emit_black_when_marking(ops: &mut Assembler, context: u8, cell: u8) {
+    use otter_vm::jit::{JIT_GC_BLACK_COLOR, JIT_HEADER_FLAGS_BYTE};
+    dynasm!(ops ; .arch aarch64
+        ; ldr x16, [X(context), crate::entry::THREAD_OFFSET]
+        ; ldr x16, [x16, crate::entry::VM_THREAD_MARKING_FLAG_CELL_OFFSET]
+        ; ldrb w16, [x16]
+        ; cbz w16, >unmarked
+        ; ldrb w16, [X(cell), JIT_HEADER_FLAGS_BYTE]
+        ; orr w16, w16, u32::from(JIT_GC_BLACK_COLOR)
+        ; strb w16, [X(cell), JIT_HEADER_FLAGS_BYTE]
+        ; unmarked:);
+}
+
 /// Publish the fully initialized cell; candidate survives. The heap derives
 /// the allocated bytes from the buffer's progress.
 fn emit_publish(ops: &mut Assembler, regs: LabRegisters) {

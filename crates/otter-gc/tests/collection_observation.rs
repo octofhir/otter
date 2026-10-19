@@ -93,8 +93,15 @@ fn natural_major_pressure_includes_nested_minor_and_accounting_in_one_event() {
     assert!(after > before, "actual page pressure must run major GC");
     assert!(!capture.incomplete && !capture.contains_split_phases);
     assert_eq!(capture.dropped_records, 0);
-    assert_eq!(capture.records.len() as u64, after - before);
-    for event in capture.records {
+    // A concurrent cycle's start is its own event; each full one finishes a
+    // cycle.
+    let full: Vec<_> = capture
+        .records
+        .into_iter()
+        .filter(|event| event.kind != GcPauseKind::MarkStart)
+        .collect();
+    assert_eq!(full.len() as u64, after - before);
+    for event in full {
         assert_eq!(event.kind, GcPauseKind::Full);
         assert_eq!(event.trigger, GcPauseTrigger::GrowthBudget);
         assert_eq!(event.outcome, GcPauseOutcome::Completed);
@@ -141,7 +148,7 @@ fn split_service_is_explicitly_unscoreable_as_whole_collection_pauses() {
     heap.start_incremental_mark_phase(&mut |_| {})
         .expect("start");
     let _ = heap.incremental_mark_step(1);
-    heap.finish_incremental_mark_phase(&mut |_| {});
+    heap.finish_incremental_mark_phase(&mut |_| {}).unwrap();
     heap.run_post_mark_processing();
     heap.sweep_phase();
     let capture = heap.take_gc_pause_capture().expect("take");
@@ -163,7 +170,7 @@ fn capture_cannot_start_inside_an_already_active_incremental_cycle() {
         heap.start_gc_pause_capture(4),
         Err(GcPauseCaptureError::CollectionInProgress)
     );
-    heap.finish_incremental_mark_phase(&mut |_| {});
+    heap.finish_incremental_mark_phase(&mut |_| {}).unwrap();
     heap.run_post_mark_processing();
     heap.sweep_phase();
     heap.start_gc_pause_capture(4)

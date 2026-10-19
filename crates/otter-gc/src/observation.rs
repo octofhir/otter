@@ -31,6 +31,8 @@ pub enum GcPauseKind {
     Minor,
     /// One outer full service, including nested copying collections.
     Full,
+    /// The pause that begins a concurrent marking cycle: the root scan.
+    MarkStart,
     /// A standalone initial/final mark or additional marking operation.
     SplitMark,
     /// One incremental marking step, possibly separated by mutator execution.

@@ -44,9 +44,15 @@
 //! - An initializer passed to an `_initialized` allocator runs at the body's
 //!   final address with no intervening safepoint, before the old-placement
 //!   barrier scan; the body is never traced with an unfilled tail.
-//! - Black allocation: when a marking cycle is in progress
-//!   (`marking.is_marking() == true`), new objects start black so
-//!   the marker doesn't have to re-discover them.
+//! - Black allocation: while a marking cycle is in progress, an old cell is
+//!   born black and counted live (a buffer refilled then counts whole), and
+//!   the edges it is initialized with pass the barrier; young cells are never
+//!   marked. Old-generation marking runs concurrently on the helper threads
+//!   from the cycle's start pause (a scavenge, the young survivors' old
+//!   targets and the roots) to its finishing collection (another scavenge,
+//!   the survivors, the roots again, then the rest of the drain and the
+//!   sweep). A change [`GcHeap::with_payload`] makes to a visited cell while
+//!   the mutator runs re-grays it for that final drain.
 //! - Pages live forever inside the heap or are returned to the
 //!   cage on full-GC sweep. Pages are never leaked across heap
 //!   drops.
@@ -89,7 +95,7 @@ use crate::extra_roots::{ExtraRoots, ExtraRootsGuard, RootSet};
 use crate::finalize::WeakFinalizationRegistry;
 use crate::frame_roots::{FrameRootProviders, FrameRoots, FrameRootsGuard};
 use crate::handle::{GlobalHandleTable, HandleStack};
-use crate::header::{GcHeader, MarkColor};
+use crate::header::GcHeader;
 use crate::lab::LinearAllocationArea;
 use crate::marking::MarkingState;
 
@@ -383,6 +389,9 @@ pub struct GcHeap {
     /// nursery-overflow path — grows unbounded until the cage or the cap is
     /// exhausted even when most of it is garbage.
     old_generation_limit: u64,
+    /// Old-generation occupancy at which a concurrent marking cycle starts,
+    /// so that it can finish before [`Self::old_generation_limit`].
+    concurrent_marking_start: u64,
     /// Helper threads that trace and copy alongside the collecting thread,
     /// started at the first scavenge large enough to share.
     gc_threads: crate::gc_threads::GcThreads,
@@ -546,8 +555,9 @@ impl GcHeap {
         let new_space = NewSpace::new(crate::space::DEFAULT_NEW_SPACE_PAGES)?;
         // GC-stress ("gc-zeal") config from the environment. `OTTER_GC_STRESS=1`
         // scavenges every allocation (maximum use-after-move detection, very
-        // slow); `=<n>` every n allocations; append/set `=full` to also force a
-        // major GC each tick. Unset/`0` → disabled (the production default).
+        // slow); `=<n>` every n allocations; append/set `=full` to make the
+        // ticks alternate between starting a concurrent marking cycle and the
+        // major GC that finishes it. Unset/`0` → disabled (the production default).
         let (gc_stress_stride, gc_stress_full) = match std::env::var("OTTER_GC_STRESS") {
             Ok(v) => {
                 let v = v.trim().to_ascii_lowercase();
@@ -603,6 +613,10 @@ impl GcHeap {
             tracked_bytes: 0,
             reserved_bytes: 0,
             old_generation_limit: INITIAL_OLD_GENERATION_SIZE.min(cage_hardcap_bytes()),
+            concurrent_marking_start: concurrent_marking_start(
+                0,
+                INITIAL_OLD_GENERATION_SIZE.min(cage_hardcap_bytes()),
+            ),
             gc_threads: crate::gc_threads::GcThreads::default(),
             marks_white: true,
             external_limit: EXTERNAL_ALLOCATION_SOFT_LIMIT,
@@ -1428,12 +1442,14 @@ impl GcHeap {
         }
     }
 
-    /// Whether a refilled buffer may serve plain young cells now: not while
-    /// marking (new cells are born black), under GC stress (every
-    /// allocation reaches the stress counter) or during bootstrap tenuring.
+    /// Whether a refilled buffer may serve plain cells now: not under GC
+    /// stress (every allocation reaches the stress counter) or during
+    /// bootstrap tenuring. Both buffers stay live through a marking cycle:
+    /// young cells are never marked, and an old cell carved while marking
+    /// runs is born black, with the edges it starts with barriered.
     #[doc(hidden)]
     pub fn machine_allocation_allowed(&self) -> bool {
-        !self.tenure_all && self.gc_stress_stride == 0 && !self.marking.is_marking()
+        !self.tenure_all && self.gc_stress_stride == 0
     }
 
     /// Publish both buffers' progress into their pages, so a page walk sees
@@ -1582,7 +1598,6 @@ impl GcHeap {
         extra_bytes: usize,
         initialize: impl FnOnce(&mut T),
     ) -> Gc<T> {
-        debug_assert!(!self.marking.is_marking());
         // The cage base is 4 GiB-aligned: the low half of the address is
         // the cage offset.
         let offset = address as u32;
@@ -1867,11 +1882,22 @@ impl GcHeap {
             if self.gc_stress_counter >= self.gc_stress_stride {
                 self.gc_stress_counter = 0;
                 if self.gc_stress_full {
-                    self.in_major_gc = true;
-                    let collect_result =
-                        self.collect_full_observed(&mut allocation_roots, GcPauseTrigger::Stress);
-                    self.in_major_gc = false;
-                    collect_result?;
+                    // Ticks alternate between starting a concurrent cycle,
+                    // which runs beside the next ticks' worth of mutation,
+                    // and finishing it.
+                    if !self.marking.is_marking() && self.gc_threads.workers() > 1 {
+                        self.with_gc_pause_result(
+                            GcPauseKind::MarkStart,
+                            GcPauseTrigger::Stress,
+                            |heap| heap.start_concurrent_marking_work(&mut allocation_roots),
+                        )?;
+                    } else {
+                        self.in_major_gc = true;
+                        let collect_result = self
+                            .collect_full_observed(&mut allocation_roots, GcPauseTrigger::Stress);
+                        self.in_major_gc = false;
+                        collect_result?;
+                    }
                 } else {
                     self.collect_minor_observed(&mut allocation_roots, GcPauseTrigger::Stress)?;
                 }
@@ -1971,13 +1997,7 @@ impl GcHeap {
         // fully initialised below before any read.
         unsafe {
             let header = if placed_in_old {
-                let h = GcHeader::new(T::TYPE_TAG, aligned as u32);
-                if is_marking {
-                    h.set_mark_color(MarkColor::Black);
-                }
-                h
-            } else if is_marking {
-                GcHeader::new_young_black(T::TYPE_TAG, aligned as u32)
+                GcHeader::new(T::TYPE_TAG, aligned as u32)
             } else {
                 GcHeader::new_young(T::TYPE_TAG, aligned as u32)
             };
@@ -1986,6 +2006,9 @@ impl GcHeap {
             }
             std::ptr::write(header_ptr, header);
             std::ptr::write(payload_ptr, value);
+            if placed_in_old {
+                self.marking.record_old_birth(header_ptr);
+            }
             if extra_bytes != 0 {
                 // Trailing storage starts zeroed so a body can treat it as
                 // an array of empty slots without writing every one.
@@ -2013,6 +2036,11 @@ impl GcHeap {
                 T::trace_slots(payload_ptr, &mut |slot| {
                     crate::barrier::write_barrier(header_ptr, *slot, marking, remembered);
                 });
+                if is_marking {
+                    // As in `alloc_old_with_roots_inner`: the header is
+                    // visible before any store can publish the cell.
+                    std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
+                }
             }
         }
         // Counter wiring inlined to keep the alloc fast path
@@ -2227,15 +2255,9 @@ impl GcHeap {
         // own. The header and payload are fully initialised below
         // before any read.
         unsafe {
-            let header = if is_marking {
-                let h = GcHeader::new(T::TYPE_TAG, aligned as u32);
-                h.set_mark_color(MarkColor::Black);
-                h
-            } else {
-                GcHeader::new(T::TYPE_TAG, aligned as u32)
-            };
-            std::ptr::write(header_ptr, header);
+            std::ptr::write(header_ptr, GcHeader::new(T::TYPE_TAG, aligned as u32));
             std::ptr::write(payload_ptr, value);
+            self.marking.record_old_birth(header_ptr);
             if extra_bytes != 0 {
                 // Trailing storage starts zeroed so a body can treat it as
                 // an array of empty slots without writing every one.
@@ -2267,6 +2289,11 @@ impl GcHeap {
                 // parent header.
                 crate::barrier::write_barrier(header_ptr, *slot, marking, remembered);
             });
+        }
+        if is_marking {
+            // The concurrent marker may reach the cell once a store publishes
+            // it: its initialized header must be visible first.
+            std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
         }
         let row = &mut self.gc_stats.by_type[T::TYPE_TAG as usize];
         row.live_bytes = row.live_bytes.wrapping_add(aligned);
@@ -2332,11 +2359,44 @@ impl GcHeap {
         debug_assert_handle_live::<T>(handle, "with_payload");
         // SAFETY: same contract as [`Self::read_payload`]; the
         // exclusive `&mut self` upholds payload uniqueness.
-        unsafe {
+        let result = unsafe {
             let payload =
                 (handle.as_header_ptr() as *mut u8).add(std::mem::size_of::<GcHeader>()) as *mut T;
             f(&mut *payload)
+        };
+        // A change made here may store a pointer no barrier saw: a cell the
+        // concurrent marker already visited is visited again at the end.
+        if self.marking.mutator_phase() {
+            // SAFETY: the handle names a live cell.
+            unsafe { self.marking.regray_changed(handle.as_header_ptr()) };
         }
+        result
+    }
+
+    /// [`Self::with_payload`] for a change that rewrites which words of the
+    /// body hold pointers, on a type that declared
+    /// [`Traceable::LAYOUT_LOCKED`]: while marking runs, an old cell's layout
+    /// lock is held around it, so the concurrent marker never reads a body
+    /// half rewritten.
+    pub fn with_payload_relayout<T: Traceable, R>(
+        &mut self,
+        handle: Gc<T>,
+        f: impl FnOnce(&mut T) -> R,
+    ) -> R {
+        const { assert!(T::LAYOUT_LOCKED, "relayout is for layout-locked types") };
+        let header = handle.as_header_ptr();
+        // SAFETY: the handle names a live cell.
+        let lock = self.marking.is_marking() && unsafe { !(*header).is_young() };
+        if lock {
+            // SAFETY: as above; an old cell is never forwarded.
+            unsafe { (*header).lock_layout() };
+        }
+        let result = self.with_payload(handle, f);
+        if lock {
+            // SAFETY: as above; this thread holds the lock.
+            unsafe { (*header).unlock_layout() };
+        }
+        result
     }
 
     /// Begin a bounded collection-service capture at a quiescent heap boundary.
@@ -2468,6 +2528,12 @@ impl GcHeap {
         &mut self,
         external_visit: &mut RootSlotVisitor<'_>,
     ) -> Result<(), OutOfMemory> {
+        // A concurrent marker never reads young cells, but the scavenge needs
+        // the helpers; it resumes once the nursery is evacuated.
+        let resume_marking = self.marking.is_concurrent();
+        self.marking.stop_concurrent(&mut self.gc_threads);
+        let marking = self.marking.is_marking();
+        let mut promoted_gray = Vec::new();
         self.retire_machine_labs();
         self.prepare_collection_observations();
         // Combine the caller's external_visit with the heap's
@@ -2512,8 +2578,13 @@ impl GcHeap {
                 &mut self.host_refs,
                 &mut self.allocation_sites,
                 &mut self.gc_threads,
+                marking.then_some(&mut promoted_gray),
             )
         }?;
+        for raw in promoted_gray {
+            // SAFETY: the scavenge promoted this cell gray just now.
+            unsafe { self.marking.push_gray(raw.as_header_ptr()) };
+        }
         self.allocation_sites.digest(nursery_at_maximum);
         stats.minor_pause_ns = scavenge_start.elapsed().as_nanos() as u64;
         self.ephemerons.retain_non_null();
@@ -2538,6 +2609,13 @@ impl GcHeap {
         // hot path tight by not walking the live set just for
         // stats — see `bench_scavenge_4mb` for the cost of
         // adding a walk here.
+        if resume_marking {
+            // SAFETY: the cycle is still active; the scavenge is complete.
+            unsafe {
+                self.marking
+                    .start_concurrent(&self.trace_table, &mut self.gc_threads)
+            };
+        }
         Ok(())
     }
 
@@ -2569,7 +2647,13 @@ impl GcHeap {
     ) -> Result<(), OutOfMemory> {
         let pause_start = Instant::now();
         let old_generation_before = self.old_generation_consumed_bytes();
-        self.mark_phase(external_visit)?;
+        // A cycle already marking, concurrently or between incremental
+        // steps, finishes; otherwise the whole mark runs in this pause.
+        if self.marking.is_marking() {
+            self.finish_incremental_mark_phase(external_visit)?;
+        } else {
+            self.mark_phase(external_visit)?;
+        }
         self.run_post_mark_processing();
         self.sweep_phase_with_pause_start(pause_start);
         self.recompute_allocation_limits(pause_start, old_generation_before);
@@ -2622,6 +2706,7 @@ impl GcHeap {
             .max(live.saturating_add(MINIMUM_ALLOCATION_LIMIT_GROWING_STEP))
             .saturating_add(new_space_capacity);
         self.old_generation_limit = limit.max(MIN_OLD_GENERATION_SIZE).min(cage_hardcap_bytes());
+        self.concurrent_marking_start = concurrent_marking_start(live, self.old_generation_limit);
         // The completed sweep has already reconciled released backing
         // stores; only the surviving reservations remain.
         self.external_limit = self
@@ -2683,6 +2768,7 @@ impl GcHeap {
     pub fn set_initial_old_generation_size(&mut self, bytes: u64) {
         if self.gc_stats.gc_cycles == 0 {
             self.old_generation_limit = bytes.min(cage_hardcap_bytes());
+            self.concurrent_marking_start = concurrent_marking_start(0, self.old_generation_limit);
         }
     }
 
@@ -2712,7 +2798,24 @@ impl GcHeap {
         &mut self,
         external_visit: &mut RootSlotVisitor<'_>,
     ) -> Result<(), OutOfMemory> {
-        if self.always_allocate_depth != 0 || !self.major_gc_due() {
+        if self.always_allocate_depth != 0 || self.in_major_gc {
+            return Ok(());
+        }
+        if self.marking.is_concurrent() {
+            // Helpers are marking: hand them what the barrier shaded, and
+            // finish the cycle once they ran dry or the limit arrived.
+            self.marking.publish();
+            if !self.marking.concurrent_done() && !self.major_gc_due() {
+                return Ok(());
+            }
+        } else if !self.major_gc_due() {
+            if self.concurrent_marking_due() {
+                self.with_gc_pause_result(
+                    GcPauseKind::MarkStart,
+                    GcPauseTrigger::GrowthBudget,
+                    |heap| heap.start_concurrent_marking_work(external_visit),
+                )?;
+            }
             return Ok(());
         }
         self.with_gc_pause_result(GcPauseKind::Full, GcPauseTrigger::GrowthBudget, |heap| {
@@ -2720,11 +2823,49 @@ impl GcHeap {
         })
     }
 
+    /// Whether a concurrent marking cycle should start now: the old
+    /// generation reached its start occupancy and helper threads exist.
+    fn concurrent_marking_due(&mut self) -> bool {
+        !self.marking.is_marking()
+            && self.machine_allocation_allowed()
+            && self.old_generation_consumed_bytes() >= self.concurrent_marking_start
+            && self.gc_threads.workers() > 1
+    }
+
+    /// Begin a concurrent marking cycle: shade the roots and hand the drain
+    /// to the helper threads, which run it beside the mutator until the
+    /// collection that finishes the cycle stops them.
+    fn start_concurrent_marking_work(
+        &mut self,
+        external_visit: &mut RootSlotVisitor<'_>,
+    ) -> Result<(), OutOfMemory> {
+        // Much of the old generation may be reachable only through young
+        // cells, which the concurrent marker never enters: a scavenge leaves
+        // the nursery holding only live ones, whose old targets are roots.
+        // Old cells are born black through the canonical allocator while the
+        // cycle runs, so the old buffer stays retired.
+        self.collect_minor_internal(external_visit)?;
+        self.prepare_mark_cycle();
+        self.marking.start_cycle();
+        self.shade_young_edges();
+        self.shade_roots(external_visit);
+        // SAFETY: the cycle is active, the worklist holds gray old headers,
+        // and every collection, heap walk and the heap's drop stop the
+        // drain first.
+        unsafe {
+            self.marking
+                .start_concurrent(&self.trace_table, &mut self.gc_threads)
+        };
+        self.marking.set_mutator_phase(true);
+        Ok(())
+    }
+
     fn collect_major_work(
         &mut self,
         external_visit: &mut RootSlotVisitor<'_>,
     ) -> Result<(), OutOfMemory> {
-        if self.always_allocate_depth != 0 || !self.major_gc_due() {
+        if self.always_allocate_depth != 0 || !(self.major_gc_due() || self.marking.is_concurrent())
+        {
             return Ok(());
         }
         self.in_major_gc = true;
@@ -2792,6 +2933,8 @@ impl GcHeap {
         external_visit: &mut RootSlotVisitor<'_>,
     ) -> Result<(), OutOfMemory> {
         self.start_incremental_mark_phase(external_visit)?;
+        // The whole mark runs in this pause: no mutator runs inside it.
+        self.marking.set_mutator_phase(false);
         // SAFETY: STW pause; all pushed headers alive.
         unsafe { self.drain_marking_stopped() };
         Ok(())
@@ -2855,10 +2998,20 @@ impl GcHeap {
         &mut self,
         external_visit: &mut RootSlotVisitor<'_>,
     ) -> Result<(), OutOfMemory> {
-        // Scavenge first so survivors are in old / to-space.
+        // Scavenge first: the nursery then holds only survivors, which mark
+        // the old generation as roots.
         self.collect_minor_internal(external_visit)?;
+        self.prepare_mark_cycle();
+        self.marking.start_cycle();
+        self.shade_young_edges();
+        self.shade_roots(external_visit);
+        self.marking.set_mutator_phase(true);
+        Ok(())
+    }
 
-        // Reset old-space + LOS live counters; mark cycle.
+    /// Reset the old generation's live counters and make every old cell
+    /// white for a new marking cycle.
+    fn prepare_mark_cycle(&mut self) {
         self.old_space.reset_live_bytes();
         self.large_space.reset_live_bytes();
         // Every header must be white before we begin. The previous cycle's
@@ -2878,21 +3031,28 @@ impl GcHeap {
                         (*h).clear_mark();
                     });
                 }
-                // Young-gen survivors after scavenge live in
-                // to-space — but the scavenger has flipped, so they
-                // now live in from-space. Clear marks there too.
-                for page in self.new_space.from_pages() {
-                    page.for_each_object(|h, _| {
-                        (*h).clear_mark();
-                    });
-                }
             }
         }
         self.marks_white = false;
+    }
 
-        self.marking.start_cycle();
-        self.shade_roots(external_visit);
-        Ok(())
+    /// Shade every old cell a young cell points at: roots of the old
+    /// generation's marking, which never enters young cells. Right after a
+    /// scavenge the nursery holds only the cells it kept alive.
+    fn shade_young_edges(&mut self) {
+        let marking: *mut MarkingState = &mut self.marking;
+        let trace_table = &self.trace_table;
+        for page in self.new_space.from_pages() {
+            // SAFETY: STW pause with the nursery buffer published; every
+            // from-space cell is initialized, with a registered type.
+            unsafe {
+                page.for_each_object(|h, _| {
+                    if (*h).type_tag() != crate::header::FREE_TAG {
+                        trace_table.trace(h, &mut |slot| (*marking).shade_from_slot(slot));
+                    }
+                });
+            }
+        }
     }
 
     /// Drain at most `budget` gray headers from the marking
@@ -2936,14 +3096,29 @@ impl GcHeap {
     /// [`Self::mark_phase`]: `is_marking == true` (cleared inside
     /// [`Self::sweep_phase`]), every reachable old-gen object is
     /// black, and the worklist is empty.
-    pub fn finish_incremental_mark_phase(&mut self, external_visit: &mut RootSlotVisitor<'_>) {
-        self.with_gc_pause(GcPauseKind::SplitMark, GcPauseTrigger::Explicit, |heap| {
-            heap.finish_incremental_mark_phase_work(external_visit);
-            ((), GcPauseOutcome::Completed)
-        });
+    ///
+    /// # Errors
+    ///
+    /// Same as the scavenge it begins with.
+    pub fn finish_incremental_mark_phase(
+        &mut self,
+        external_visit: &mut RootSlotVisitor<'_>,
+    ) -> Result<(), OutOfMemory> {
+        self.with_gc_pause_result(GcPauseKind::SplitMark, GcPauseTrigger::Explicit, |heap| {
+            heap.finish_incremental_mark_phase_work(external_visit)
+        })
     }
 
-    fn finish_incremental_mark_phase_work(&mut self, external_visit: &mut RootSlotVisitor<'_>) {
+    fn finish_incremental_mark_phase_work(
+        &mut self,
+        external_visit: &mut RootSlotVisitor<'_>,
+    ) -> Result<(), OutOfMemory> {
+        self.marking.set_mutator_phase(false);
+        self.marking.stop_concurrent(&mut self.gc_threads);
+        // The scavenge grays what it promotes; the nursery then holds only
+        // survivors, which are roots of the old generation.
+        self.collect_minor_internal(external_visit)?;
+        self.shade_young_edges();
         self.prepare_collection_observations();
         // Re-shade roots — the mutator may have rewritten handles
         // or globals between mark steps. The barrier covered every
@@ -2954,8 +3129,47 @@ impl GcHeap {
         // (idempotent) plus any pointer the mutator stored straight
         // into a root slot (where no barrier fires).
         self.shade_roots(external_visit);
+        self.marking.take_final_visits();
         // SAFETY: STW pause covers the final drain.
         unsafe { self.drain_marking_stopped() };
+        if crate::scavenger::gc_verify_enabled() {
+            self.verify_marking_closed();
+        }
+        Ok(())
+    }
+
+    /// `OTTER_GC_VERIFY`: after the final drain, every marked old cell's old
+    /// children are marked. A miss names a store no barrier saw.
+    fn verify_marking_closed(&self) {
+        let trace_table = &self.trace_table;
+        let check = |page: &crate::page::Page| {
+            // SAFETY: STW pause; every non-filler cell is a registered body.
+            unsafe {
+                page.for_each_object(|h, _| {
+                    if (*h).type_tag() == crate::header::FREE_TAG || !(*h).is_marked() {
+                        return;
+                    }
+                    trace_table.trace(h, &mut |slot| {
+                        let raw = (*slot).0;
+                        if raw == 0 {
+                            return;
+                        }
+                        let child = cage_base().add(raw as usize) as *const GcHeader;
+                        if !(*child).is_young() && !(*child).is_marked() {
+                            panic!(
+                                "OTTER_GC_VERIFY: marked cell {:#x} (tag {:#x}) points at unmarked \
+                                 old cell {raw:#x} (tag {:#x})",
+                                h as usize - cage_base() as usize,
+                                (*h).type_tag(),
+                                (*child).type_tag(),
+                            );
+                        }
+                    });
+                });
+            }
+        };
+        self.old_space.pages().iter().for_each(check);
+        self.large_space.pages().iter().for_each(check);
     }
 
     fn shade_roots(&mut self, external_visit: &mut RootSlotVisitor<'_>) {
@@ -3019,11 +3233,7 @@ impl GcHeap {
     #[doc(hidden)]
     #[must_use]
     pub fn is_marked(&self, raw: RawGc) -> bool {
-        if raw.is_null() {
-            return false;
-        }
-        // SAFETY: caller supplies a heap-issued raw handle.
-        unsafe { (*raw.as_header_ptr()).is_marked() }
+        raw_is_marked(raw)
     }
 
     /// Type tag for a raw heap object.
@@ -3199,9 +3409,9 @@ impl GcHeap {
                     retained_bytes =
                         retained_bytes.saturating_add(page.header().allocated_bytes as u64);
                 }
+                // Every nursery cell is a survivor of the finishing scavenge.
                 page.for_each_object(|h, _| {
-                    if (*h).is_marked() {
-                        (*h).clear_mark();
+                    if (*h).type_tag() != crate::header::FREE_TAG {
                         let tag = (*h).type_tag() as usize;
                         let size = (*h).size_bytes() as usize;
                         per_tag_live_count[tag] = per_tag_live_count[tag].wrapping_add(1);
@@ -3564,6 +3774,7 @@ impl std::fmt::Debug for GcHeap {
 
 impl Drop for GcHeap {
     fn drop(&mut self) {
+        self.marking.stop_concurrent(&mut self.gc_threads);
         self.retire_machine_labs();
         // Runtime disposal is a terminal STW boundary. Page ownership alone
         // returns cage memory, but Rust payloads may own external resources
@@ -3606,12 +3817,25 @@ impl Drop for GcHeap {
 
 /// Header-only mark check for registry pruning: reads the mark bit
 /// straight off the object header without touching heap state.
+/// Whether `raw` survives the old generation's marking: marked, or young,
+/// since a finishing collection's nursery holds only scavenge survivors.
 fn raw_is_marked(raw: RawGc) -> bool {
     if raw.is_null() {
         return false;
     }
     // SAFETY: registries only hold heap-issued raw handles.
-    unsafe { (*raw.as_header_ptr()).is_marked() }
+    unsafe {
+        let header = &*raw.as_header_ptr();
+        header.is_young() || header.is_marked()
+    }
+}
+
+/// Old-generation occupancy at which a concurrent marking cycle starts
+/// between the `live` bytes the last mark-compact kept and the `limit` the
+/// next one runs at: three quarters of the way, leaving the last quarter of
+/// the growth for the mutator to allocate while the helpers mark.
+fn concurrent_marking_start(live: u64, limit: u64) -> u64 {
+    live.saturating_add(limit.saturating_sub(live) / 4 * 3)
 }
 
 #[path = "heap/tenured.rs"]

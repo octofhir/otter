@@ -2728,6 +2728,29 @@ impl otter_gc::SafeTraceable for ObjectBody {
     fn trace_pending_slots_safe(&mut self, v: &mut SlotVisitor<'_>) {
         self.trace_fixed_slots(v);
     }
+
+    const CONCURRENT_MARKING: bool = true;
+
+    /// The handles and the live in-object words, read beside the mutator.
+    /// Every shape of one object keeps its cell's in-object capacity, so the
+    /// live count of whichever shape is read stays inside the cell; overflow
+    /// words are the slab's own visit. A word read before a store lands is
+    /// covered by the store's barrier.
+    fn trace_concurrent_safe(&mut self, v: &mut SlotVisitor<'_>) -> bool {
+        self.trace_fixed_slots(v);
+        // SAFETY: a heap-resident body follows its header.
+        let cell_bytes = unsafe { (*self.cell_header()).size_bytes() } as usize;
+        let physical = cell_bytes
+            .saturating_sub(FieldLayout::current().inline_values_byte as usize)
+            / std::mem::size_of::<Value>();
+        let count = self.slot_count().min(self.inline_capacity()).min(physical);
+        let values = self.inline_values_ptr();
+        for index in 0..count {
+            // SAFETY: `index` is below the cell's reserved in-object capacity.
+            unsafe { (*values.add(index)).trace_value_slot_mut(v) };
+        }
+        true
+    }
 }
 
 /// Heap-shared object handle.

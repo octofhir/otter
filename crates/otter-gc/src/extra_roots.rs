@@ -249,7 +249,7 @@ mod tests {
         source.pending.set(Some(
             heap.alloc(OpaqueLeaf { payload: 33 }).expect("sample"),
         ));
-        heap.finish_incremental_mark_phase(&mut external);
+        heap.finish_incremental_mark_phase(&mut external).unwrap();
         assert_eq!(source.observed.get(), 33);
         source.pending.set(Some(
             heap.alloc_old_diagnostic(OpaqueLeaf { payload: 44 })

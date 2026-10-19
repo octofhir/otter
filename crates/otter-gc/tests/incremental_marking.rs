@@ -77,7 +77,7 @@ fn insertion_barrier_saves_white_child_published_mid_cycle() {
     // Drain whatever the barrier just enqueued.
     let _ = heap.incremental_mark_step(64);
 
-    heap.finish_incremental_mark_phase(&mut |_| {});
+    heap.finish_incremental_mark_phase(&mut |_| {}).unwrap();
 
     // Capture mark colours before sweep clears them — sweep frees
     // `c` and reading its header afterwards would be UB.
@@ -131,7 +131,7 @@ fn incremental_step_respects_budget() {
         "expected at least {CHAIN_LEN} headers processed, got {total_processed}",
     );
 
-    heap.finish_incremental_mark_phase(&mut |_| {});
+    heap.finish_incremental_mark_phase(&mut |_| {}).unwrap();
     heap.sweep_phase();
 }
 

@@ -166,6 +166,9 @@ struct OldSpaceRef(*mut OldSpace);
 struct Shared {
     cage: *mut u8,
     verify: bool,
+    /// An old-generation marking cycle is active: promoted copies are born
+    /// gray and listed for the marker.
+    marking: bool,
     trace_table: *const TraceTable,
     to_pages: *const Page,
     to_page_count: usize,
@@ -200,6 +203,7 @@ impl Shared {
 /// What a worker leaves behind for the collecting thread to merge.
 struct WorkerOutput {
     remembered: Vec<RawGc>,
+    promoted_gray: Vec<RawGc>,
     stats: ScavengeStats,
 }
 
@@ -214,6 +218,8 @@ struct Worker<'s> {
     lab_end: u32,
     /// Old/large parents found still pointing young.
     remembered: Vec<RawGc>,
+    /// Copies promoted gray during a marking cycle.
+    promoted_gray: Vec<RawGc>,
     stats: ScavengeStats,
     /// True while a remembered parent or a freshly promoted body is traced:
     /// its young children promote immediately, and its slots count toward
@@ -251,7 +257,9 @@ unsafe fn store_slot(slot: *mut RawGc, offset: u32) {
 /// their keys are updated only if already live, and their values become strong
 /// only for such live keys. Remaining weak registry slots are rewritten only
 /// when their target was already forwarded; otherwise they are nulled for later
-/// pruning. `threads` are the heap's helper threads.
+/// pruning. `threads` are the heap's helper threads. While an old-generation
+/// marking cycle runs, `promoted_gray` receives every promoted copy, born
+/// gray for the marker to visit.
 ///
 /// # Safety
 ///
@@ -273,6 +281,7 @@ pub unsafe fn scavenge(
     host_refs: &mut crate::host_refs::HostRefTable,
     sites: &mut crate::pretenuring::AllocationSites,
     threads: &mut GcThreads,
+    mut promoted_gray: Option<&mut Vec<RawGc>>,
 ) -> Result<ScavengeStats, OutOfMemory> {
     let (active_pages, allocated_nursery_bytes) =
         new_space
@@ -333,6 +342,7 @@ pub unsafe fn scavenge(
     let shared = Shared {
         cage: cage_base(),
         verify: gc_verify_enabled(),
+        marking: promoted_gray.is_some(),
         trace_table,
         to_pages: new_space.to_pages().as_ptr(),
         to_page_count: new_space.to_pages().len(),
@@ -404,6 +414,9 @@ pub unsafe fn scavenge(
             .unwrap_or_else(PoisonError::into_inner),
     ) {
         remembered_parents.extend(output.remembered);
+        if let Some(promoted_gray) = promoted_gray.as_deref_mut() {
+            promoted_gray.extend(output.promoted_gray);
+        }
         stats.absorb(&output.stats);
     }
 
@@ -546,7 +559,7 @@ unsafe fn verify_cleanup_tracked(new_space: &NewSpace, trace_table: &TraceTable)
 /// handle scope) — plus its parent. A diagnostic for use-after-move / dangling
 /// root regressions; off by default (one relaxed atomic load per slot when on).
 #[inline]
-fn gc_verify_enabled() -> bool {
+pub(crate) fn gc_verify_enabled() -> bool {
     use std::sync::atomic::{AtomicU8, Ordering};
     static STATE: AtomicU8 = AtomicU8::new(0); // 0 = unknown, 1 = off, 2 = on
     match STATE.load(Ordering::Relaxed) {
@@ -621,6 +634,7 @@ impl<'s> Worker<'s> {
             lab_cursor: 0,
             lab_end: 0,
             remembered: Vec::new(),
+            promoted_gray: Vec::new(),
             stats: ScavengeStats::default(),
             in_dirty_scan: false,
             parent_old: false,
@@ -639,6 +653,7 @@ impl<'s> Worker<'s> {
         }
         WorkerOutput {
             remembered: std::mem::take(&mut self.remembered),
+            promoted_gray: std::mem::take(&mut self.promoted_gray),
             stats: self.stats,
         }
     }
@@ -810,6 +825,11 @@ impl<'s> Worker<'s> {
             }
             if promoted {
                 (*dest_header).promote_to_old();
+                if self.shared.marking {
+                    // An old cell born while marking runs: the marker visits it.
+                    (*dest_header).set_mark_color(crate::header::MarkColor::Gray);
+                    self.promoted_gray.push(RawGc(new_offset));
+                }
                 self.stats.promoted_bytes += aligned;
                 self.local.push(new_offset | PROMOTED_ENTRY);
             } else {
@@ -1372,6 +1392,7 @@ mod tests {
                 &mut crate::host_refs::HostRefTable::default(),
                 &mut crate::pretenuring::AllocationSites::default(),
                 &mut crate::gc_threads::GcThreads::default(),
+                None,
             )
         }
         .expect("promotion preflight");

@@ -150,7 +150,6 @@ impl GcHeap {
         extra_bytes: usize,
         initialize: impl FnOnce(&mut T),
     ) -> Gc<T> {
-        debug_assert!(!self.marking.is_marking());
         let offset = address as u32;
         debug_assert_eq!(address - cage_base() as usize, offset as usize);
         // SAFETY: the old buffer handed out `aligned` bytes inside a live old
@@ -174,11 +173,17 @@ impl GcHeap {
             }
             initialize(&mut *payload_ptr);
             crate::cell_map::debug_check_map_word(payload_ptr);
+            self.marking.record_old_lab_birth(header_ptr);
             let marking = &mut self.marking;
             let remembered = &mut self.remembered_parents;
             T::trace_slots(payload_ptr, &mut |slot| {
                 crate::barrier::write_barrier(header_ptr, *slot, marking, remembered);
             });
+            if self.marking.is_marking() {
+                // The concurrent marker may reach the cell once a store
+                // publishes it: its initialized header must be visible first.
+                std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
+            }
         }
         let row = &mut self.gc_stats.by_type[T::TYPE_TAG as usize];
         row.live_bytes = row.live_bytes.wrapping_add(aligned);
@@ -221,6 +226,12 @@ impl GcHeap {
         // page for this buffer alone; a free filler keeps the page walkable.
         unsafe {
             std::ptr::write(start as *mut GcHeader, GcHeader::new_free(extent as u32));
+            // Cells carved from it while marking runs are born black and
+            // never visited: the whole buffer counts toward its page's live
+            // bytes, so the sweep keeps the page and judges each cell.
+            if self.marking.is_marking() {
+                self.marking.count_live_extent(start as *mut GcHeader);
+            }
         }
         self.old_lab = LinearAllocationArea {
             top: start,

@@ -32,6 +32,10 @@
 //!   copies the cell, writes the forwarding offset and clears the copying
 //!   bit with release ordering. Any other thread reads the offset only after
 //!   an acquire load sees the copying bit clear.
+//! - Old and large cells are never forwarded, so they reuse the copying bit
+//!   as a layout lock: the concurrent marker holds it while it reads a body
+//!   whose pointer words the mutator may rewrite in place, and the mutator
+//!   holds it for that rewrite while a marking cycle runs.
 //!
 //! # See also
 //!
@@ -41,6 +45,11 @@
 use std::sync::atomic::{AtomicU8, Ordering};
 
 const MARK_COLOR_MASK: u8 = 0b0000_0011;
+
+/// The mark-color bits within the [`GcHeader`] flag byte: zero for white.
+/// Compiled code's insertion barrier sends only a white old child to the
+/// runtime.
+pub const MARK_COLOR_BITS: u8 = MARK_COLOR_MASK;
 const FLAG_YOUNG: u8 = 0b0000_0100;
 
 /// Byte offset of the [`GcHeader`] flag byte from the header base. The
@@ -121,6 +130,10 @@ const _: () = assert!(FLAG_REMEMBERED & MARK_COLOR_MASK == 0);
 /// claimed young cell: its forwarding offset is not written yet. Never set
 /// outside a scavenge.
 const FLAG_COPYING: u8 = 0b1000_0000;
+/// The same bit on an old or large cell, which is never forwarded: held
+/// while one thread reads or rewrites a body whose pointer words change in
+/// place (see [`GcHeader::lock_layout`]).
+const FLAG_LAYOUT_LOCKED: u8 = FLAG_COPYING;
 const _: () = assert!(
     (MARK_COLOR_MASK
         | FLAG_YOUNG
@@ -152,6 +165,10 @@ pub enum MarkColor {
     Gray = 1,
     /// Fully scanned; all children are gray or black.
     Black = 2,
+    /// Visited once this cycle, then changed by the mutator through a store
+    /// the barrier did not see: it waits for a second visit, which does not
+    /// count its bytes again.
+    Regray = 3,
 }
 
 /// 8-byte GC object header at the start of every cage allocation.
@@ -277,7 +294,7 @@ impl GcHeader {
             0 => MarkColor::White,
             1 => MarkColor::Gray,
             2 => MarkColor::Black,
-            _ => MarkColor::White,
+            _ => MarkColor::Regray,
         }
     }
 
@@ -318,6 +335,83 @@ impl GcHeader {
                 Err(actual) => current = actual,
             }
         }
+    }
+
+    /// Claim a gray or re-grayed header for its visit by painting it black
+    /// first, so a mutator store racing the visit finds it black and re-grays
+    /// it. `Some(true)` for its first visit this cycle, `Some(false)` for a
+    /// re-gray's, `None` when it is not waiting for a visit.
+    #[inline]
+    pub fn try_begin_visit(&self) -> Option<bool> {
+        let mut current = self.flags.load(Ordering::Relaxed);
+        loop {
+            let first = match current & MARK_COLOR_MASK {
+                c if c == MarkColor::Gray as u8 => true,
+                c if c == MarkColor::Regray as u8 => false,
+                _ => return None,
+            };
+            match self.flags.compare_exchange_weak(
+                current,
+                (current & !MARK_COLOR_MASK) | MarkColor::Black as u8,
+                Ordering::SeqCst,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return Some(first),
+                Err(actual) => current = actual,
+            }
+        }
+    }
+
+    /// Paint a black header re-gray; `false` when it was not black.
+    #[inline]
+    pub fn try_regray(&self) -> bool {
+        let mut current = self.flags.load(Ordering::Relaxed);
+        loop {
+            if current & MARK_COLOR_MASK != MarkColor::Black as u8 {
+                return false;
+            }
+            match self.flags.compare_exchange_weak(
+                current,
+                current | MarkColor::Regray as u8,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return true,
+                Err(actual) => current = actual,
+            }
+        }
+    }
+
+    /// Take the layout lock of an old or large cell, waiting while another
+    /// thread holds it. Pairs with [`Self::unlock_layout`]; the acquire
+    /// ordering makes the previous holder's rewrite visible.
+    #[inline]
+    pub fn lock_layout(&self) {
+        debug_assert!(!self.is_young());
+        loop {
+            let current = self.flags.load(Ordering::Relaxed);
+            if current & FLAG_LAYOUT_LOCKED == 0
+                && self
+                    .flags
+                    .compare_exchange_weak(
+                        current,
+                        current | FLAG_LAYOUT_LOCKED,
+                        Ordering::Acquire,
+                        Ordering::Relaxed,
+                    )
+                    .is_ok()
+            {
+                return;
+            }
+            std::hint::spin_loop();
+        }
+    }
+
+    /// Release the layout lock [`Self::lock_layout`] took, publishing every
+    /// write made under it.
+    #[inline]
+    pub fn unlock_layout(&self) {
+        self.flags.fetch_and(!FLAG_LAYOUT_LOCKED, Ordering::Release);
     }
 
     /// Returns true iff the mark color is gray or black.

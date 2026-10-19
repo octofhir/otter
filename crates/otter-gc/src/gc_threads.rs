@@ -2,7 +2,9 @@
 //!
 //! # Contents
 //! - [`GcThreads`] — the heap's helper threads and [`GcThreads::run`], which
-//!   runs one job on every helper and on the calling thread at once.
+//!   runs one job on every helper and on the calling thread at once, or
+//!   [`GcThreads::start_background`] / [`GcThreads::join_background`], which
+//!   run one job on the helpers alone while the calling thread continues.
 //! - [`WorkPool`] — chunks of work the workers of one job hand each other,
 //!   and the termination test of a job that ends when all of them run dry.
 //!
@@ -11,7 +13,9 @@
 //!   are stopped and joined when it drops. No state is shared between heaps.
 //! - A job runs only while the collecting thread is inside
 //!   [`GcThreads::run`]; `run` returns after every helper finished it, so a
-//!   job may borrow the caller's stack.
+//!   job may borrow the caller's stack. A background job runs from
+//!   `start_background` until `join_background` returns; its context must
+//!   outlive that, and no other job starts in between.
 //! - A panic on any thread inside a job aborts the process: the heap is
 //!   partially collected and cannot be resumed or unwound safely.
 //! - [`WorkPool::take`] reports the end of a job only when every worker is
@@ -70,6 +74,8 @@ pub struct GcThreads {
     shared: Arc<Shared>,
     threads: Vec<std::thread::JoinHandle<()>>,
     started: bool,
+    /// A background job runs on the helpers.
+    background: bool,
 }
 
 impl GcThreads {
@@ -103,30 +109,68 @@ impl GcThreads {
     /// indices below [`Self::workers`] over the same `context`, which must
     /// stay valid until this returns.
     pub(crate) unsafe fn run(&mut self, work: unsafe fn(*const (), usize), context: *const ()) {
+        debug_assert!(!self.background, "a background job holds the helpers");
         let helpers = self.threads.len();
         if helpers != 0 {
-            let mut state = self.shared.lock();
-            state.generation += 1;
-            state.job = Some(Job { work, context });
-            state.running = helpers;
-            drop(state);
-            self.shared.start.notify_all();
+            self.post(Job { work, context }, helpers);
         }
         abort_on_panic(|| {
             // SAFETY: forwarded from the caller.
             unsafe { work(context, 0) }
         });
         if helpers != 0 {
-            let mut state = self.shared.lock();
-            while state.running != 0 {
-                state = self
-                    .shared
-                    .done
-                    .wait(state)
-                    .unwrap_or_else(PoisonError::into_inner);
-            }
-            state.job = None;
+            self.wait_helpers();
         }
+    }
+
+    /// Run `work(context, index)` on every helper, indices from 1, and return
+    /// at once; the number of helpers running it, zero when there are none.
+    ///
+    /// # Safety
+    /// As [`Self::run`] for the helpers' indices; `context` must stay valid
+    /// until [`Self::join_background`] returns, and `work` must return once
+    /// the caller asks it to through `context`.
+    pub(crate) unsafe fn start_background(
+        &mut self,
+        work: unsafe fn(*const (), usize),
+        context: *const (),
+    ) -> usize {
+        debug_assert!(!self.background, "one background job at a time");
+        self.workers();
+        let helpers = self.threads.len();
+        if helpers != 0 {
+            self.post(Job { work, context }, helpers);
+            self.background = true;
+        }
+        helpers
+    }
+
+    /// Wait until every helper returned from the background job.
+    pub(crate) fn join_background(&mut self) {
+        if std::mem::take(&mut self.background) {
+            self.wait_helpers();
+        }
+    }
+
+    fn post(&self, job: Job, helpers: usize) {
+        let mut state = self.shared.lock();
+        state.generation += 1;
+        state.job = Some(job);
+        state.running = helpers;
+        drop(state);
+        self.shared.start.notify_all();
+    }
+
+    fn wait_helpers(&self) {
+        let mut state = self.shared.lock();
+        while state.running != 0 {
+            state = self
+                .shared
+                .done
+                .wait(state)
+                .unwrap_or_else(PoisonError::into_inner);
+        }
+        state.job = None;
     }
 }
 

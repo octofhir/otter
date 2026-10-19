@@ -95,6 +95,9 @@ impl JitAllocationSite {
 pub const JIT_SITE_CREATED_OFFSET: u32 = otter_gc::pretenuring::SITE_CREATED_OFFSET as u32;
 /// Byte offset of a site record's decision byte.
 pub const JIT_SITE_DECISION_OFFSET: u32 = otter_gc::pretenuring::SITE_DECISION_OFFSET as u32;
+/// The black mark color in a cell's GC flags byte: an old cell compiled code
+/// carves while marking runs is born with it.
+pub const JIT_GC_BLACK_COLOR: u8 = otter_gc::MarkColor::Black as u8;
 /// Header-relative byte of a cell's GC flags, which hold the young flag.
 pub const JIT_HEADER_FLAGS_BYTE: u32 = otter_gc::header::HEADER_FLAGS_BYTE_OFFSET as u32;
 /// Header-relative bytes of a young cell's `u16` allocation-site tag.

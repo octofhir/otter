@@ -95,13 +95,11 @@ impl Interpreter {
                 .get()
                 .as_object()
                 .ok_or(VmError::InvalidOperand)?;
-            let mut slots = SmallVec::<[Value; 8]>::new();
-            slots.resize(initial_fields, Value::undefined());
-            crate::object::install_fresh_shape_with_slots(
+            crate::object::install_pending_receiver_shape(
                 receiver,
                 &mut self.gc_heap,
                 shape,
-                slots.as_slice(),
+                initial_fields,
                 field_count,
             );
         } else if field_count > crate::object::shape_body::inline_capacity_of(root) {

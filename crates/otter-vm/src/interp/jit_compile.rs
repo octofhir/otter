@@ -3441,13 +3441,9 @@ impl Interpreter {
                     init.fields.len(),
                     "source initial fields and final shape diverged"
                 );
-                // Generated receivers expose these live fields as undefined
-                // before the constructor writes them. Seed the monotone bound
-                // while preparing the plan, before any native receiver exists.
-                for slot in 0..init.fields.len() {
-                    let owner = crate::object::field_type::owner(shape, slot as u32)?;
-                    crate::object::field_type::observe_owner(owner, Value::undefined());
-                }
+                // Generated receivers hold undefined in these fields only
+                // until the store-only body overwrites them, before anything
+                // can read them: the bound records the stored values alone.
                 initial_shape = shape;
                 (
                     self.bake_shape(shape)?,

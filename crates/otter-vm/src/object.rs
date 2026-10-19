@@ -3332,6 +3332,32 @@ pub(crate) fn install_fresh_shape_with_slots(
     values: &[Value],
     capacity: usize,
 ) {
+    install_fresh_shape(obj, heap, shape, values, capacity, true);
+}
+
+/// [`install_fresh_shape_with_slots`] for a constructor receiver whose
+/// store-only body overwrites every slot before anything can read it: the
+/// `undefined` placeholders are never field values, so no field summary
+/// records them.
+pub(crate) fn install_pending_receiver_shape(
+    obj: JsObject,
+    heap: &mut GcHeap,
+    shape: ShapeHandle,
+    slots: usize,
+    capacity: usize,
+) {
+    let placeholders = SmallVec::<[Value; 8]>::from_elem(Value::undefined(), slots);
+    install_fresh_shape(obj, heap, shape, &placeholders, capacity, false);
+}
+
+fn install_fresh_shape(
+    obj: JsObject,
+    heap: &mut GcHeap,
+    shape: ShapeHandle,
+    values: &[Value],
+    capacity: usize,
+    observe: bool,
+) {
     debug_assert_object_shape_handle(shape, "fresh object shape install");
     debug_assert!(!shape.is_null(), "a fresh shape install needs a shape");
     debug_assert_eq!(
@@ -3366,7 +3392,9 @@ pub(crate) fn install_fresh_shape_with_slots(
             "shape transition changed object footprint"
         );
         body.adopt_shape(shape);
-        body.seed_field_types(stored.len());
+        if observe {
+            body.seed_field_types(stored.len());
+        }
     });
     for &value in &stored {
         record_slot_write(heap, obj, value);

@@ -1,10 +1,10 @@
 //! Arithmetic primitives for [`NumberValue`].
 //!
-//! These four operators stay on the integer fast path whenever
-//! both operands are `Smi` and the result is representable in
-//! `i32`. Once either operand requires IEEE-754 arithmetic, the result stays
-//! `Double`; this preserves representation feedback across exact-integer
-//! floating-point results.
+//! These operators stay on the integer fast path whenever both operands are
+//! `Smi` and the result is representable in `i32` (for division: an exact,
+//! non-negative-zero quotient). Once either operand requires IEEE-754
+//! arithmetic, the result stays `Double`; this preserves representation
+//! feedback across exact-integer floating-point results.
 //!
 //! # Contents
 //! - [`add`], [`sub`], [`mul`], [`div`], [`rem`], [`neg`].
@@ -55,9 +55,22 @@ pub fn mul(lhs: NumberValue, rhs: NumberValue) -> NumberValue {
     NumberValue::Double(lhs.as_f64() * rhs.as_f64())
 }
 
-/// `lhs / rhs`. Always returns `Double`.
+/// `lhs / rhs`.
+///
+/// Two `Smi` operands with an exact quotient keep the `Smi` path, so a field
+/// or site that only ever sees integer quotients keeps an Int32
+/// representation. A zero divisor, a remainder, `i32::MIN / -1` (`checked_div`
+/// returns `None` for the first and last) and a zero dividend over a negative
+/// divisor (`-0`) compute in `f64`.
 #[must_use]
 pub fn div(lhs: NumberValue, rhs: NumberValue) -> NumberValue {
+    if let (NumberValue::Smi(a), NumberValue::Smi(b)) = (lhs, rhs)
+        && let Some(q) = a.checked_div(b)
+        && q * b == a
+        && (a != 0 || b > 0)
+    {
+        return NumberValue::Smi(q);
+    }
     NumberValue::Double(lhs.as_f64() / rhs.as_f64())
 }
 
@@ -130,7 +143,7 @@ mod tests {
             NumberValue::Double(5.0)
         ));
         assert!(matches!(
-            div(NumberValue::Smi(8), NumberValue::Smi(2)),
+            div(NumberValue::Double(8.0), NumberValue::Smi(2)),
             NumberValue::Double(4.0)
         ));
         assert!(matches!(
@@ -154,6 +167,23 @@ mod tests {
         assert!(r.is_infinite());
         let r = div(NumberValue::Smi(0), NumberValue::Smi(0));
         assert!(r.is_nan());
+    }
+
+    #[test]
+    fn exact_int_division_stays_smi() {
+        assert!(matches!(
+            div(NumberValue::Smi(8), NumberValue::Smi(2)),
+            NumberValue::Smi(4)
+        ));
+        assert!(matches!(
+            div(NumberValue::Smi(-9), NumberValue::Smi(3)),
+            NumberValue::Smi(-3)
+        ));
+        assert!(div(NumberValue::Smi(0), NumberValue::Smi(-5)).is_negative_zero());
+        assert!(matches!(
+            div(NumberValue::Smi(i32::MIN), NumberValue::Smi(-1)),
+            NumberValue::Double(d) if d == 2_147_483_648.0
+        ));
     }
 
     #[test]

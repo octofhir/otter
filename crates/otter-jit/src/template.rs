@@ -1072,7 +1072,18 @@ mod tests {
             box_i32(100_000),
             10_000_000_000.0,
         );
-        expect_binary_f64(Op::Div, box_i32(6), box_i32(2), 3.0);
+        expect_binary_int(Op::Div, box_i32(6), box_i32(2), 3);
+        expect_binary_int(Op::Div, box_i32(9), box_i32(-3), -3);
+        expect_binary_f64(Op::Div, box_i32(7), box_i32(2), 3.5);
+        expect_binary_f64(Op::Div, box_i32(i32::MIN), box_i32(-1), 2_147_483_648.0);
+        match run_binary(Op::Div, box_i32(0), box_i32(-4)) {
+            Exit::Returned(bits) => assert!(unbox_f64(bits).is_sign_negative(), "-0 quotient"),
+            Exit::Bailed(pc) => panic!("-0 quotient bailed at {pc}"),
+        }
+        match run_binary(Op::Div, box_i32(1), box_i32(0)) {
+            Exit::Returned(bits) => assert_eq!(unbox_f64(bits), f64::INFINITY),
+            Exit::Bailed(pc) => panic!("zero-divisor quotient bailed at {pc}"),
+        }
         expect_binary_f64(Op::Div, box_f64(7.0), box_f64(2.0), 3.5);
         expect_binary_int(Op::Rem, box_i32(7), box_i32(3), 1);
         expect_binary_int(Op::Rem, box_i32(-7), box_i32(3), -1);

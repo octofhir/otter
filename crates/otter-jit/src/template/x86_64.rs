@@ -93,7 +93,7 @@ mod protocol;
 pub(crate) mod shared_property;
 
 use dynasmrt::{DynamicLabel, DynasmApi, DynasmLabelApi, dynasm, x64::Assembler};
-use otter_bytecode::scalar_semantics::{Int32ResultPolicy, NegativeZeroCondition};
+use otter_bytecode::scalar_semantics::NegativeZeroCondition;
 use otter_vm::{JitCompileSnapshot, native_abi as abi, runtime_stubs::alloc_value_stub_by_id};
 
 use super::{ArithKind, BitwiseKind, CompareKind, TemplateCode, TemplateOp, TemplatePlan};
@@ -701,22 +701,37 @@ fn emit_binary_arith(
     }
     emit_load_reg(ops, 0, lhs);
     emit_load_reg(ops, 8, rhs);
-    if kind != ArithKind::Div {
-        let float_path = ops.new_dynamic_label();
-        let done = ops.new_dynamic_label();
-        emit_guard_int32_pair(ops, 0, 8, float_path);
-        dynasm!(ops ; .arch x64 ; mov r10d, eax);
-        match kind {
-            ArithKind::Sub => dynasm!(ops ; .arch x64 ; sub r10d, r8d ; jo =>float_path),
-            ArithKind::Mul => dynasm!(ops ; .arch x64 ; imul r10d, r8d ; jo =>float_path),
-            _ => unreachable!(),
+    let float_path = ops.new_dynamic_label();
+    let done = ops.new_dynamic_label();
+    emit_guard_int32_pair(ops, 0, 8, float_path);
+    match kind {
+        ArithKind::Sub => {
+            dynasm!(ops ; .arch x64 ; mov r10d, eax ; sub r10d, r8d ; jo =>float_path)
         }
-        if matches!(
-            kind.semantics().int32_result,
-            Int32ResultPolicy::PromoteOverflowOrNegativeZero(
-                NegativeZeroCondition::OppositeOperandSigns
-            )
-        ) {
+        ArithKind::Mul => {
+            dynasm!(ops ; .arch x64 ; mov r10d, eax ; imul r10d, r8d ; jo =>float_path)
+        }
+        // A 64-bit `idiv` cannot trap on `i32::MIN / -1`; only an exact
+        // quotient that fits int32 is published.
+        ArithKind::Div => dynasm!(ops
+            ; .arch x64
+            ; test r8d, r8d
+            ; je =>float_path
+            ; movsxd rax, eax
+            ; movsxd r10, r8d
+            ; cqo
+            ; idiv r10
+            ; test rdx, rdx
+            ; jne =>float_path
+            ; movsxd r10, eax
+            ; cmp r10, rax
+            ; jne =>float_path
+            ; mov r10d, eax
+        ),
+        _ => unreachable!(),
+    }
+    match kind.semantics().int32_result.negative_zero_condition() {
+        Some(NegativeZeroCondition::OppositeOperandSigns) => {
             let publish = ops.new_dynamic_label();
             dynasm!(ops
                 ; .arch x64
@@ -728,28 +743,35 @@ fn emit_binary_arith(
                 ; =>publish
             );
         }
-        emit_box_int32(ops, 10, 0, 11);
-        emit_store_reg(ops, 0, dst);
-        dynasm!(ops ; .arch x64 ; jmp =>done ; =>float_path);
-        emit_load_reg(ops, 0, lhs);
-        emit_load_reg(ops, 8, rhs);
-        emit_number_to_double(ops, 0, 0, bail);
-        emit_number_to_double(ops, 8, 1, bail);
-        match kind {
-            ArithKind::Sub => dynasm!(ops ; .arch x64 ; subsd xmm0, xmm1),
-            ArithKind::Mul => dynasm!(ops ; .arch x64 ; mulsd xmm0, xmm1),
-            _ => unreachable!(),
+        Some(NegativeZeroCondition::NegativeRightOperand) => {
+            let publish = ops.new_dynamic_label();
+            dynasm!(ops
+                ; .arch x64
+                ; test r10d, r10d
+                ; jne =>publish
+                ; test r8d, r8d
+                ; js =>float_path
+                ; =>publish
+            );
         }
-        emit_box_double(ops, 0, 0, 11);
-        emit_store_reg(ops, 0, dst);
-        dynasm!(ops ; .arch x64 ; =>done);
-        return;
+        Some(NegativeZeroCondition::NegativeLeftOperand) | None => {}
     }
+    emit_box_int32(ops, 10, 0, 11);
+    emit_store_reg(ops, 0, dst);
+    dynasm!(ops ; .arch x64 ; jmp =>done ; =>float_path);
+    emit_load_reg(ops, 0, lhs);
+    emit_load_reg(ops, 8, rhs);
     emit_number_to_double(ops, 0, 0, bail);
     emit_number_to_double(ops, 8, 1, bail);
-    dynasm!(ops ; .arch x64 ; divsd xmm0, xmm1);
+    match kind {
+        ArithKind::Sub => dynasm!(ops ; .arch x64 ; subsd xmm0, xmm1),
+        ArithKind::Mul => dynasm!(ops ; .arch x64 ; mulsd xmm0, xmm1),
+        ArithKind::Div => dynasm!(ops ; .arch x64 ; divsd xmm0, xmm1),
+        _ => unreachable!(),
+    }
     emit_box_double(ops, 0, 0, 11);
     emit_store_reg(ops, 0, dst);
+    dynasm!(ops ; .arch x64 ; =>done);
 }
 
 /// Reserve an allocating stub's rooting packet on the machine stack and fill

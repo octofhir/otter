@@ -107,7 +107,30 @@ for (let i = 0; i < 4010; i++) { incWarm += "incSum(4);incVoid(4);"; }
 eval(incWarm);
 let incTotal = 0;
 for (let k = 0; k < 2000; k++) { incTotal += incSum(k & 31); incVoid(k & 15); }
+// Int32 quotients stay int32 only while exact: a hot site that only saw exact
+// quotients meets a remainder, a zero divisor, `-0` and `i32::MIN / -1`, and a
+// field written from quotients keeps its integer reads correct when widened.
+function quotient(a, b) { return a / b; }
+function Cell(v) { this.v = v; }
+function scale(cell, a, b) { cell.v = (a - 1000) / b; return cell.v + 1; }
+let quotientSum = 0;
+const cell = new Cell(0);
+for (let i = 0; i < 20000; i++) {
+  quotientSum += quotient(i * 6, 3) + scale(cell, 1000 + 5 * (i & 63), 5);
+}
+const quotientEdges = [
+  quotient(7, 2),
+  quotient(1, 0),
+  quotient(-1, 0),
+  Object.is(quotient(0, -4), -0),
+  quotient(-2147483648, -1),
+  quotient(9, -3),
+  scale(cell, 1001, 2),
+  cell.v,
+];
 JSON.stringify({
+  quotientSum,
+  quotientEdges,
   incTotal,
   floatRemainder,
   remNegativeZero,

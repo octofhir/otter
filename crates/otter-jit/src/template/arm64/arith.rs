@@ -144,15 +144,15 @@ const FUNCTION_ID_TAG_IMM: u32 = FUNCTION_ID_TAG as u32;
 use crate::template::{
     ACCUMULATOR_DREG, ArithKind, BitwiseKind, CompareKind, FusedArithKind, FusedChainStep,
 };
-use otter_bytecode::scalar_semantics::{Int32ResultPolicy, NegativeZeroCondition};
+use otter_bytecode::scalar_semantics::NegativeZeroCondition;
 
 /// Emit `Add`/`Sub`/`Mul`/`Div`/`Rem` over tagged numbers.
 ///
 /// `Add`/`Sub`/`Mul` take an int32 fast path that falls through to the f64
 /// path on a non-int32 operand or an overflowing result (never to the side
 /// exit — an overflowing integer result is just its exact f64 value). `Div`
-/// always computes in f64 (ECMAScript division yields a Number even for exact
-/// integer quotients). `Rem` keeps the truncating int32 remainder inline and
+/// publishes an exact int32 quotient and computes every other quotient in
+/// f64, matching the interpreter's representation. `Rem` keeps the truncating int32 remainder inline and
 /// side-exits the cases int32 cannot represent (zero divisor → NaN, zero
 /// remainder of a negative dividend → `-0`).
 #[allow(clippy::too_many_arguments)]
@@ -172,17 +172,6 @@ pub(super) fn emit_binary_arith(
     emit_load_reg(ops, 9, lhs)?;
     emit_load_reg(ops, 10, rhs)?;
     match kind {
-        ArithKind::Div => {
-            // Division always computes in doubles; its operands are recorded
-            // by the interpreter and the runtime completion.
-            emit_num_to_double(ops, 9, 0, slow);
-            emit_num_to_double(ops, 10, 1, slow);
-            dynasm!(ops ; .arch aarch64 ; fdiv d2, d0, d1);
-            emit_box_double(ops, 2, 13);
-            emit_store_reg(ops, 13, dst)?;
-            dynasm!(ops ; .arch aarch64 ; =>resume);
-            return Ok(());
-        }
         ArithKind::Rem => {
             let store = ops.new_dynamic_label();
             let number_slow = ops.new_dynamic_label();
@@ -233,7 +222,7 @@ pub(super) fn emit_binary_arith(
             dynasm!(ops ; .arch aarch64 ; b =>slow ; =>resume);
             return Ok(());
         }
-        ArithKind::Sub | ArithKind::Mul => {}
+        ArithKind::Sub | ArithKind::Mul | ArithKind::Div => {}
         ArithKind::Add => unreachable!("addition has its own template operation"),
     }
     let float_path = ops.new_dynamic_label();
@@ -262,22 +251,43 @@ pub(super) fn emit_binary_arith(
             ; b.ne =>float_path
             ; mov w13, w13
         ),
-        _ => unreachable!("Div/Rem returned above"),
-    }
-    if matches!(
-        semantics.int32_result,
-        Int32ResultPolicy::PromoteOverflowOrNegativeZero(
-            NegativeZeroCondition::OppositeOperandSigns
-        )
-    ) {
-        let publish_int32 = ops.new_dynamic_label();
-        dynasm!(ops
+        // The quotient is formed in 64 bits, where `i32::MIN / -1` does not
+        // wrap; only an exact quotient that fits int32 is published.
+        ArithKind::Div => dynasm!(ops
             ; .arch aarch64
-            ; cbnz w13, =>publish_int32
-            ; eor w14, w9, w10
-            ; tbnz w14, #31, =>float_path
-            ; =>publish_int32
-        );
+            ; cbz w10, =>float_path
+            ; sxtw x11, w9
+            ; sxtw x12, w10
+            ; sdiv x13, x11, x12
+            ; msub x14, x13, x12, x11
+            ; cbnz x14, =>float_path
+            ; cmp x13, w13, sxtw
+            ; b.ne =>float_path
+            ; mov w13, w13
+        ),
+        _ => unreachable!("Rem returned above"),
+    }
+    match semantics.int32_result.negative_zero_condition() {
+        Some(NegativeZeroCondition::OppositeOperandSigns) => {
+            let publish_int32 = ops.new_dynamic_label();
+            dynasm!(ops
+                ; .arch aarch64
+                ; cbnz w13, =>publish_int32
+                ; eor w14, w9, w10
+                ; tbnz w14, #31, =>float_path
+                ; =>publish_int32
+            );
+        }
+        Some(NegativeZeroCondition::NegativeRightOperand) => {
+            let publish_int32 = ops.new_dynamic_label();
+            dynasm!(ops
+                ; .arch aarch64
+                ; cbnz w13, =>publish_int32
+                ; tbnz w10, #31, =>float_path
+                ; =>publish_int32
+            );
+        }
+        Some(NegativeZeroCondition::NegativeLeftOperand) | None => {}
     }
     emit_box_int32(ops, 13, 12);
     emit_store_reg(ops, 13, dst)?;
@@ -293,8 +303,9 @@ pub(super) fn emit_binary_arith(
     match kind {
         ArithKind::Sub => dynasm!(ops ; .arch aarch64 ; fsub d2, d0, d1),
         ArithKind::Mul => dynasm!(ops ; .arch aarch64 ; fmul d2, d0, d1),
+        ArithKind::Div => dynasm!(ops ; .arch aarch64 ; fdiv d2, d0, d1),
         ArithKind::Add => unreachable!("addition has its own template operation"),
-        _ => unreachable!("Div/Rem returned above"),
+        _ => unreachable!("Rem returned above"),
     }
     emit_box_double(ops, 2, 13);
     emit_store_reg(ops, 13, dst)?;

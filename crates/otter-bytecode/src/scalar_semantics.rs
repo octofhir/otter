@@ -70,6 +70,8 @@ pub enum NegativeZeroCondition {
     OppositeOperandSigns,
     /// A zero remainder is negative when the dividend is negative.
     NegativeLeftOperand,
+    /// A zero quotient is negative when the divisor is negative.
+    NegativeRightOperand,
 }
 
 /// Representation contract for an Int32 arithmetic candidate.
@@ -82,6 +84,9 @@ pub enum Int32ResultPolicy {
     PromoteOverflow,
     /// Promote overflow and any zero satisfying the sign condition to Float64.
     PromoteOverflowOrNegativeZero(NegativeZeroCondition),
+    /// Promote a zero divisor, a nonzero remainder, overflow and a negative
+    /// zero quotient to Float64: only an exact int32 quotient stays Int32.
+    PromoteInexactQuotient,
 }
 
 impl Int32ResultPolicy {
@@ -90,6 +95,7 @@ impl Int32ResultPolicy {
     pub const fn negative_zero_condition(self) -> Option<NegativeZeroCondition> {
         match self {
             Self::PromoteOverflowOrNegativeZero(condition) => Some(condition),
+            Self::PromoteInexactQuotient => Some(NegativeZeroCondition::NegativeRightOperand),
             Self::Unavailable | Self::PromoteOverflow => None,
         }
     }
@@ -129,7 +135,11 @@ pub const fn numeric_binary_semantics(op: Op) -> Option<NumericBinarySemantics> 
                 NegativeZeroCondition::OppositeOperandSigns,
             ),
         ),
-        Op::Div => (NumericBinaryOp::Div, false, Int32ResultPolicy::Unavailable),
+        Op::Div => (
+            NumericBinaryOp::Div,
+            false,
+            Int32ResultPolicy::PromoteInexactQuotient,
+        ),
         Op::Rem => (
             NumericBinaryOp::Rem,
             false,
@@ -169,7 +179,7 @@ mod tests {
     }
 
     #[test]
-    fn multiplication_and_remainder_require_signed_zero_proofs() {
+    fn multiplication_division_and_remainder_require_signed_zero_proofs() {
         assert_eq!(
             NumericBinaryOp::Mul
                 .semantics()
@@ -183,6 +193,13 @@ mod tests {
                 .int32_result
                 .negative_zero_condition(),
             Some(NegativeZeroCondition::NegativeLeftOperand)
+        );
+        assert_eq!(
+            NumericBinaryOp::Div
+                .semantics()
+                .int32_result
+                .negative_zero_condition(),
+            Some(NegativeZeroCondition::NegativeRightOperand)
         );
         assert_eq!(
             NumericBinaryOp::Sub

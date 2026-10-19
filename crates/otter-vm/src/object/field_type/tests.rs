@@ -264,6 +264,26 @@ fn shaped_births_observe_inline_suffix_and_live_undefined() {
             );
             assert_eq!(object::layout_slot(object.get(), &heap, index), *value);
         }
+        // A constructor receiver's placeholders are overwritten before any
+        // read, so installing them records nothing.
+        let pending = scope.local(
+            object::alloc_object_with_roots(&mut heap, root.get(), &mut |_| {})
+                .expect("pending receiver"),
+        );
+        object::install_pending_receiver_shape(
+            pending.get(),
+            &mut heap,
+            layout.get(),
+            count,
+            count,
+        );
+        for index in 0..count {
+            assert_eq!(
+                snapshot(owner(layout.get(), index as u32).unwrap()),
+                sample(root.get())
+            );
+            assert!(object::layout_slot(pending.get(), &heap, index).is_undefined());
+        }
         let _undefined = scope.local(
             object::alloc_object_with_shape_roots(&mut heap, layout.get(), &mut |_| {})
                 .expect("undefined shaped birth"),

@@ -1549,7 +1549,7 @@ mod tests {
             let string = tenured.as_string(interp.gc_heap()).expect("string result");
             interp
                 .gc_heap()
-                .read_payload(string.handle(), |body| match body.repr {
+                .read_payload(string.handle(), |body| match body.repr() {
                     crate::string::gc_body::JsStringBodyRepr::Cons { right, .. } => Some(right),
                     _ => None,
                 })

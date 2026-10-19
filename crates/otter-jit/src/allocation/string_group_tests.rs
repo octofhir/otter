@@ -352,24 +352,21 @@ fn bytes_mut(words: &mut [u64]) -> &mut [u8] {
 fn put32(words: &mut [u64], byte: u32, value: u32) {
     bytes_mut(words)[byte as usize..byte as usize + 4].copy_from_slice(&value.to_le_bytes());
 }
-fn flat(layout: JitStringLayout, units: &[u16], latin: bool, seq: bool) -> Vec<u64> {
-    let payload = if seq {
-        layout.string_body_size
-    } else {
-        layout.string_repr_payload_byte
-    };
-    let bytes = layout
-        .cell_bytes
-        .max(payload + units.len() as u32 * if latin { 1 } else { 2 });
-    let mut words = vec![0; (bytes as usize).div_ceil(8)];
-    words[0] = layout.header_word;
+fn cell_bytes(layout: JitStringLayout, payload: u32) -> u32 {
+    let cell = otter_vm::jit::JIT_CELL_SIZE as u32;
+    (layout.string_body_size + payload).div_ceil(cell) * cell
+}
+fn flat(layout: JitStringLayout, units: &[u16], latin: bool) -> Vec<u64> {
+    let payload = layout.string_body_size;
+    let bytes = cell_bytes(layout, units.len() as u32 * if latin { 1 } else { 2 });
+    let mut words = vec![0; bytes as usize / 8];
+    words[0] = layout.young_header(bytes);
     words[1] = layout.map_atom_word;
     put32(&mut words, layout.string_len_byte, units.len() as u32);
-    bytes_mut(&mut words)[layout.string_repr_byte as usize] = match (latin, seq) {
-        (true, false) => layout.inline_latin1_tag,
-        (true, true) => layout.seq_latin1_tag,
-        (false, false) => layout.inline_flat_tag,
-        (false, true) => layout.seq_flat_tag,
+    bytes_mut(&mut words)[layout.string_repr_byte as usize] = if latin {
+        layout.seq_latin1_tag
+    } else {
+        layout.seq_flat_tag
     };
     for (index, &unit) in units.iter().enumerate() {
         if latin {
@@ -384,15 +381,19 @@ fn flat(layout: JitStringLayout, units: &[u16], latin: bool, seq: bool) -> Vec<u
 #[test]
 fn strings_execute_exact_flat_cons_identity_and_pre_effect_refusal_payloads() {
     let p = JitStringLayout::default();
+    let untouched = vec![0; p.pair_cell_bytes as usize / 8];
     for regs in banks() {
-        for (left, right, left_latin, right_latin, seq) in [
-            (vec![97, 98], vec![99, 100], true, true, false),
-            (vec![65], vec![0x100, 0xd800, 0xdc01], true, false, false),
-            (vec![0x100, 0xd800], vec![66], false, true, false),
-            (vec![97; 25], vec![98], true, true, true),
+        for (left, right, left_latin, right_latin) in [
+            (vec![97, 98], vec![99, 100], true, true),
+            (vec![65], vec![0x100, 0xd800, 0xdc01], true, false),
+            (vec![0x100, 0xd800], vec![66], false, true),
+            (vec![97; 25], vec![98], true, true),
+            (vec![97; 23], vec![98], true, true),
+            (vec![0x100; 11], vec![66], false, true),
+            (vec![0x100; 12], vec![66], false, true),
         ] {
-            let a = flat(p, &left, left_latin, seq);
-            let b = flat(p, &right, right_latin, false);
+            let a = flat(p, &left, left_latin);
+            let b = flat(p, &right, right_latin);
             let values = [
                 a.as_ptr() as u64,
                 b.as_ptr() as u64,
@@ -400,17 +401,16 @@ fn strings_execute_exact_flat_cons_identity_and_pre_effect_refusal_payloads() {
             ];
             let combined = [left.clone(), right.clone()].concat();
             let latin = left_latin && right_latin;
-            let mut expected = if combined.len()
-                <= (if latin {
-                    p.inline_latin1_cap
+            let expected = if combined.len()
+                <= usize::from(if latin {
+                    p.short_concat_latin1
                 } else {
-                    p.inline_flat_cap
-                }) as usize
-            {
-                flat(p, &combined, latin, false)
+                    p.short_concat_flat
+                }) {
+                flat(p, &combined, latin)
             } else {
-                let mut v = vec![0; p.cell_bytes as usize / 8];
-                v[0] = p.header_word;
+                let mut v = vec![0; p.pair_cell_bytes as usize / 8];
+                v[0] = p.young_header(p.pair_cell_bytes);
                 v[1] = p.map_atom_word;
                 put32(&mut v, p.string_len_byte, combined.len() as u32);
                 put32(&mut v, p.cons_left_byte, values[0] as u32);
@@ -419,7 +419,6 @@ fn strings_execute_exact_flat_cons_identity_and_pre_effect_refusal_payloads() {
                 bytes_mut(&mut v)[p.cons_depth_byte as usize] = 1;
                 v
             };
-            expected.resize(p.cell_bytes as usize / 8, 0);
             for fits in [true, false] {
                 run(
                     Recipe::String(p),
@@ -433,8 +432,8 @@ fn strings_execute_exact_flat_cons_identity_and_pre_effect_refusal_payloads() {
                 );
             }
         }
-        let empty = flat(p, &[], true, false);
-        let nonempty = flat(p, &[0x100], false, false);
+        let empty = flat(p, &[], true);
+        let nonempty = flat(p, &[0x100], false);
         for reverse in [false, true] {
             let values = if reverse {
                 [nonempty.as_ptr() as u64, empty.as_ptr() as u64, 0]
@@ -444,7 +443,7 @@ fn strings_execute_exact_flat_cons_identity_and_pre_effect_refusal_payloads() {
             run(
                 Recipe::String(p),
                 values,
-                vec![0; p.cell_bytes as usize / 8],
+                untouched.clone(),
                 regs,
                 false,
                 true,
@@ -452,12 +451,12 @@ fn strings_execute_exact_flat_cons_identity_and_pre_effect_refusal_payloads() {
                 0,
             );
         }
-        let good = flat(p, &[97], true, false);
+        let good = flat(p, &[97], true);
         let values = [Value::boolean(true).to_bits(), good.as_ptr() as u64, 0];
         run(
             Recipe::String(p),
             values,
-            vec![0; p.cell_bytes as usize / 8],
+            untouched.clone(),
             regs,
             true,
             false,
@@ -469,20 +468,23 @@ fn strings_execute_exact_flat_cons_identity_and_pre_effect_refusal_payloads() {
         run(
             Recipe::String(p),
             [too_long.as_ptr() as u64, good.as_ptr() as u64, 0],
-            vec![0; p.cell_bytes as usize / 8],
+            untouched.clone(),
             regs,
             true,
             false,
             None,
             0,
         );
-        let mut deep = good.clone();
+        let mut deep = vec![0; p.pair_cell_bytes as usize / 8];
+        deep[0] = p.young_header(p.pair_cell_bytes);
+        deep[1] = p.map_atom_word;
+        put32(&mut deep, p.string_len_byte, 2);
         bytes_mut(&mut deep)[p.string_repr_byte as usize] = p.cons_tag;
         bytes_mut(&mut deep)[p.cons_depth_byte as usize] = p.max_rope_depth;
         run(
             Recipe::String(p),
             [deep.as_ptr() as u64, good.as_ptr() as u64, 0],
-            vec![0; p.cell_bytes as usize / 8],
+            untouched.clone(),
             regs,
             true,
             false,

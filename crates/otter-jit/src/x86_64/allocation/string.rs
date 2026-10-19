@@ -100,10 +100,10 @@ pub(crate) fn emit_concat(
     dynasm!(ops ; .arch x64 ; =>wide_a);
     classify(ops, p, r.end, flat, flat, cons);
     dynasm!(ops ; .arch x64 ; =>flat
-        ; cmp Rd(r.scratch),p.inline_flat_cap as i32 ; ja =>cons);
+        ; cmp Rd(r.scratch),p.short_concat_flat as i32 ; ja =>cons);
     emit_flat(ops, context, p, inputs, r, placement, false, slow);
     dynasm!(ops ; .arch x64 ; jmp =>done ; =>latin
-        ; cmp Rd(r.scratch),p.inline_latin1_cap as i32 ; ja =>cons);
+        ; cmp Rd(r.scratch),p.short_concat_latin1 as i32 ; ja =>cons);
     emit_flat(ops, context, p, inputs, r, placement, true, slow);
     dynasm!(ops ; .arch x64 ; jmp =>done ; =>cons);
     // Depth refusal precedes all candidate stores; canonical concat may flatten.
@@ -128,17 +128,17 @@ pub(crate) fn emit_concat(
                 ; =>next);
         }
     }
-    initialize(ops, context, p, inputs, r, placement, slow);
+    emit_load_u64(ops, r.size, u64::from(p.pair_cell_bytes));
+    initialize(ops, context, p, inputs, r, placement, p.cons_tag, slow);
     emit_value(ops, 10, a);
     dynasm!(ops ; .arch x64 ; mov [Rq(r.candidate)+p.cons_left_byte as i32],r10d);
     emit_value(ops, 10, b);
-    dynasm!(ops ; .arch x64 ; mov [Rq(r.candidate)+p.cons_right_byte as i32],r10d
-        ; mov BYTE [Rq(r.candidate)+p.string_repr_byte as i32],p.cons_tag as i8);
+    dynasm!(ops ; .arch x64 ; mov [Rq(r.candidate)+p.cons_right_byte as i32],r10d);
     emit_depth(ops, p, a, r.scratch, r.end);
     emit_depth(ops, p, b, r.buffer, r.end);
     dynasm!(ops ; .arch x64 ; cmp Rd(r.scratch),Rd(r.buffer) ; cmovb Rd(r.scratch),Rd(r.buffer)
         ; inc Rd(r.scratch) ; mov [Rq(r.candidate)+p.cons_depth_byte as i32],Rb(r.scratch));
-    publish(ops, context, p, r, placement);
+    publish(ops, context, r, placement);
     dynasm!(ops ; .arch x64 ; jmp =>done ; =>empty_a ; mov Rq(r.candidate),Rq(r.end)
         ; jmp =>done ; =>empty_b ; mov Rq(r.candidate),Rq(r.buffer) ; =>done);
 }
@@ -152,12 +152,11 @@ fn classify(
     other: DynamicLabel,
 ) {
     dynasm!(ops ; .arch x64
-        ; cmp BYTE [Rq(source)+p.string_repr_byte as i32],p.inline_latin1_tag as i8 ; je =>latin
         ; cmp BYTE [Rq(source)+p.string_repr_byte as i32],p.seq_latin1_tag as i8 ; je =>latin
-        ; cmp BYTE [Rq(source)+p.string_repr_byte as i32],p.inline_flat_tag as i8 ; je =>wide
         ; cmp BYTE [Rq(source)+p.string_repr_byte as i32],p.seq_flat_tag as i8 ; je =>wide
         ; jmp =>other);
 }
+
 fn emit_depth(
     ops: &mut Assembler,
     p: JitStringLayout,
@@ -171,6 +170,11 @@ fn emit_depth(
         ; cmp BYTE [Rq(source)+p.string_repr_byte as i32],p.cons_tag as i8 ; jne =>done
         ; movzx Rd(dst),BYTE [Rq(source)+p.cons_depth_byte as i32] ; =>done);
 }
+
+/// Carve a cell of `Rq(r.size)` bytes and write its fixed part: the sized
+/// header, the map and a zero atom, the summed length and a zero hash, and
+/// `kind` with a zero depth. The last word is zeroed first, so trailing
+/// padding is initialized before any payload byte lands.
 fn initialize(
     ops: &mut Assembler,
     context: u8,
@@ -178,35 +182,33 @@ fn initialize(
     inputs: [AllocationValue; 2],
     r: LabRegisters,
     placement: ConcatPlacement,
+    kind: u8,
     slow: DynamicLabel,
 ) {
-    emit_load_u64(ops, r.size, u64::from(p.cell_bytes));
     emit_bump_probe_in(ops, context, lab_offset(placement), r, slow);
-    dynasm!(ops ; .arch x64 ; mov QWORD [Rq(r.candidate)+8],p.map_atom_word as i32);
-    for byte in (16..p.cell_bytes).step_by(8) {
-        dynasm!(ops ; .arch x64 ; mov QWORD [Rq(r.candidate)+byte as i32],0);
-    }
-    emit_load_u64(ops, 10, placement.header_word(p.header_word));
-    dynasm!(ops ; .arch x64 ; mov [Rq(r.candidate)],r10);
+    dynasm!(ops ; .arch x64 ; mov QWORD [Rq(r.candidate)+Rq(r.size)-8],0);
+    emit_load_u64(ops, 10, placement.header_word(p.young_header_word));
+    dynasm!(ops ; .arch x64 ; mov [Rq(r.candidate)],r10
+        ; mov [Rq(r.candidate)+otter_vm::jit::JIT_HEADER_SIZE_BYTE as i32],Rd(r.size));
     if placement.old() {
         super::emit_black_when_marking(ops, context, r.candidate);
     }
+    emit_load_u64(ops, 10, p.map_atom_word);
+    dynasm!(ops ; .arch x64 ; mov [Rq(r.candidate)+8],r10);
     emit_value(ops, 10, inputs[0]);
     dynasm!(ops ; .arch x64 ; mov Rd(r.scratch),[r10+p.string_len_byte as i32]);
     emit_value(ops, 10, inputs[1]);
+    // The length's word also holds the zero hash.
     dynasm!(ops ; .arch x64 ; add Rd(r.scratch),[r10+p.string_len_byte as i32]
-        ; mov [Rq(r.candidate)+p.string_len_byte as i32],Rd(r.scratch));
+        ; mov [Rq(r.candidate)+p.string_len_byte as i32],Rq(r.scratch)
+        ; mov DWORD [Rq(r.candidate)+p.string_repr_byte as i32],i32::from(kind));
 }
-fn publish(
-    ops: &mut Assembler,
-    context: u8,
-    p: JitStringLayout,
-    r: LabRegisters,
-    placement: ConcatPlacement,
-) {
-    emit_load_u64(ops, r.size, u64::from(p.cell_bytes));
+
+fn publish(ops: &mut Assembler, context: u8, r: LabRegisters, placement: ConcatPlacement) {
+    // The cell's size is its header's.
     dynasm!(ops ; .arch x64 ; mov Rq(r.buffer),[Rq(context)+lab_offset(placement) as i32]
-        ; lea Rq(r.end),[Rq(r.candidate)+p.cell_bytes as i32]);
+        ; mov r10d,[Rq(r.candidate)+otter_vm::jit::JIT_HEADER_SIZE_BYTE as i32]
+        ; lea Rq(r.end),[Rq(r.candidate)+r10]);
     emit_publish(ops, r);
     // A tracked birth counts toward the site's survival ratio.
     match placement {
@@ -226,6 +228,9 @@ fn publish(
         }
     }
 }
+
+/// A sequential result of the summed length in `Rd(r.scratch)`: Latin-1
+/// when both sides are, else WTF-16.
 fn emit_flat(
     ops: &mut Assembler,
     context: u8,
@@ -236,49 +241,46 @@ fn emit_flat(
     latin: bool,
     slow: DynamicLabel,
 ) {
-    initialize(ops, context, p, inputs, r, placement, slow);
-    let tag = if latin {
-        p.inline_latin1_tag
+    // Cell size: the fixed part and the units, rounded up to a cell.
+    let align = (otter_vm::jit::JIT_CELL_SIZE - 1) as i32;
+    if latin {
+        dynasm!(ops ; .arch x64 ; lea Rd(r.size),[Rq(r.scratch)+p.string_body_size as i32+align]);
     } else {
-        p.inline_flat_tag
+        dynasm!(ops ; .arch x64
+            ; lea Rd(r.size),[Rq(r.scratch)+Rq(r.scratch)+p.string_body_size as i32+align]);
+    }
+    dynasm!(ops ; .arch x64 ; and Rd(r.size),!align);
+    let tag = if latin {
+        p.seq_latin1_tag
+    } else {
+        p.seq_flat_tag
     };
-    dynasm!(ops ; .arch x64 ; mov BYTE [Rq(r.candidate)+p.string_repr_byte as i32],tag as i8
-        ; movq xmm15,Rq(r.candidate)
-        ; lea Rq(r.buffer),[Rq(r.candidate)+p.string_repr_payload_byte as i32]);
+    initialize(ops, context, p, inputs, r, placement, tag, slow);
+    dynasm!(ops ; .arch x64 ; movq xmm15,Rq(r.candidate)
+        ; lea Rq(r.buffer),[Rq(r.candidate)+p.string_body_size as i32]);
     for input in inputs {
         let wide = ops.new_dynamic_label();
         let next = ops.new_dynamic_label();
         emit_value(ops, r.end, input);
         dynasm!(ops ; .arch x64 ; mov Rd(r.size),[Rq(r.end)+p.string_len_byte as i32]
-            ; cmp BYTE [Rq(r.end)+p.string_repr_byte as i32],p.inline_flat_tag as i8 ; je =>wide
-            ; cmp BYTE [Rq(r.end)+p.string_repr_byte as i32],p.seq_flat_tag as i8 ; je =>wide);
-        emit_copy_loop(ops, p, r, false, latin);
+            ; cmp BYTE [Rq(r.end)+p.string_repr_byte as i32],p.seq_flat_tag as i8
+            ; lea Rq(r.end),[Rq(r.end)+p.string_body_size as i32]
+            ; je =>wide);
+        emit_copy_loop(ops, r, false, latin);
         dynasm!(ops ; .arch x64 ; jmp =>next ; =>wide);
-        emit_copy_loop(ops, p, r, true, latin);
+        emit_copy_loop(ops, r, true, latin);
         dynasm!(ops ; .arch x64 ; =>next);
     }
     dynasm!(ops ; .arch x64 ; movq Rq(r.candidate),xmm15);
-    publish(ops, context, p, r, placement);
+    publish(ops, context, r, placement);
 }
-fn emit_copy_loop(
-    ops: &mut Assembler,
-    p: JitStringLayout,
-    r: LabRegisters,
-    wide: bool,
-    latin: bool,
-) {
-    let inline = ops.new_dynamic_label();
-    let start = ops.new_dynamic_label();
+
+/// Copy `Rd(r.size)` units from `Rq(r.end)` to `Rq(r.buffer)`: one byte or
+/// two per source unit, one or two per destination unit.
+fn emit_copy_loop(ops: &mut Assembler, r: LabRegisters, wide: bool, latin: bool) {
     let copying = ops.new_dynamic_label();
     let done = ops.new_dynamic_label();
-    let tag = if wide {
-        p.inline_flat_tag
-    } else {
-        p.inline_latin1_tag
-    };
-    dynasm!(ops ; .arch x64 ; cmp BYTE [Rq(r.end)+p.string_repr_byte as i32],tag as i8 ; je =>inline
-        ; add Rq(r.end),p.string_body_size as i32 ; jmp =>start
-        ; =>inline ; add Rq(r.end),p.string_repr_payload_byte as i32 ; =>start
+    dynasm!(ops ; .arch x64
         ; test Rd(r.size),Rd(r.size) ; jz =>done ; =>copying
         ; movzx r10d,BYTE [Rq(r.end)] ; mov [Rq(r.buffer)],r10b
         ; inc Rq(r.end) ; inc Rq(r.buffer));

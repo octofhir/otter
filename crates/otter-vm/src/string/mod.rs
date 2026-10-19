@@ -599,27 +599,6 @@ impl JsString {
         gc_body::with_code_units(heap, self.handle, f)
     }
 
-    /// Fill this string's widened cache so later [`Self::with_utf16`] reads
-    /// are in-place.
-    ///
-    /// Callers about to re-scan the same subject — a `/g` regex `exec` loop
-    /// walks it once per match — call this first, while they still hold the
-    /// heap mutably. A no-op for short subjects and for bodies that already
-    /// store their units contiguously.
-    ///
-    /// # Errors
-    /// Surfaces [`otter_gc::OutOfMemory`] verbatim.
-    pub fn ensure_utf16_cache(self, heap: &mut GcHeap) -> Result<(), otter_gc::OutOfMemory> {
-        let mut source = self.handle;
-        let mut scope = otter_gc::RootScope::new(heap);
-        // SAFETY: `source` precedes the scope and remains stationary through
-        // widened-cache allocation and publication.
-        unsafe {
-            scope.add_raw_slot((&mut source as *mut JsStringHandle).cast::<otter_gc::raw::RawGc>());
-        }
-        gc_body::ensure_utf16_cache(heap, source, &mut |_| {})
-    }
-
     /// The content as a property-key spelling: every code unit kept, an
     /// unpaired surrogate escaped rather than replaced (see
     /// [`crate::wtf16_escape`]). Distinct strings spell distinct keys, and
@@ -695,22 +674,18 @@ impl JsString {
         let mut handle = self.handle;
         let mut idx = index;
         loop {
-            let step = heap.read_payload(handle, |body| match &body.repr {
-                JsStringBodyRepr::InlineFlat(units) => Step::Found(units[idx as usize]),
+            let step = heap.read_payload(handle, |body| match body.repr() {
                 JsStringBodyRepr::SeqFlat => Step::Found(body.seq_flat_units()[idx as usize]),
-                JsStringBodyRepr::InlineLatin1(bytes) => {
-                    Step::Found(u16::from(bytes[idx as usize]))
-                }
                 JsStringBodyRepr::SeqLatin1 => {
                     Step::Found(u16::from(body.seq_latin1_bytes()[idx as usize]))
                 }
-                JsStringBodyRepr::Sliced { parent, start } => Step::Descend(*parent, *start + idx),
+                JsStringBodyRepr::Sliced { parent, start } => Step::Descend(parent, start + idx),
                 JsStringBodyRepr::Cons { left, right, .. } => {
-                    let left_len = heap.read_payload(*left, |b| b.len);
+                    let left_len = heap.read_payload(left, |b| b.len);
                     if idx < left_len {
-                        Step::Descend(*left, idx)
+                        Step::Descend(left, idx)
                     } else {
-                        Step::Descend(*right, idx - left_len)
+                        Step::Descend(right, idx - left_len)
                     }
                 }
             });
@@ -1091,9 +1066,9 @@ mod tests {
         let s = JsString::from_str("éÿ", &mut heap).unwrap();
         assert_eq!(s.len(), 2);
         assert_eq!(s.to_lossy_string(&heap), "éÿ");
-        heap.read_payload(s.handle, |body| match &body.repr {
-            JsStringBodyRepr::InlineLatin1(bytes) => assert_eq!(&bytes[..2], &[0xe9, 0xff]),
-            other => panic!("expected inline latin1 body, got {other:?}"),
+        heap.read_payload(s.handle, |body| match body.repr() {
+            JsStringBodyRepr::SeqLatin1 => assert_eq!(body.seq_latin1_bytes(), &[0xe9, 0xff]),
+            other => panic!("expected a latin1 body, got {other:?}"),
         });
     }
 
@@ -1102,9 +1077,9 @@ mod tests {
         let mut heap = h();
         let s = JsString::from_utf16_units(&[0x41, 0x00ff], &mut heap).unwrap();
         assert_eq!(s.to_utf16_vec(&heap), vec![0x41, 0x00ff]);
-        heap.read_payload(s.handle, |body| match &body.repr {
-            JsStringBodyRepr::InlineLatin1(bytes) => assert_eq!(&bytes[..2], &[0x41, 0xff]),
-            other => panic!("expected inline latin1 body, got {other:?}"),
+        heap.read_payload(s.handle, |body| match body.repr() {
+            JsStringBodyRepr::SeqLatin1 => assert_eq!(body.seq_latin1_bytes(), &[0x41, 0xff]),
+            other => panic!("expected a latin1 body, got {other:?}"),
         });
     }
 
@@ -1114,7 +1089,7 @@ mod tests {
         let units = vec![0x00e9; 64];
         let s = JsString::from_utf16_units(&units, &mut heap).unwrap();
         assert_eq!(s.to_utf16_vec(&heap), units);
-        heap.read_payload(s.handle, |body| match &body.repr {
+        heap.read_payload(s.handle, |body| match body.repr() {
             JsStringBodyRepr::SeqLatin1 => {
                 let bytes = body.seq_latin1_bytes();
                 assert_eq!(bytes.len(), 64);
@@ -1200,7 +1175,7 @@ mod tests {
             "aaaaaaaaaaaaaaaabbbbbbbbbbbbbbbb"
         );
         heap.read_payload(ab.handle(), |body| {
-            assert!(matches!(body.repr, JsStringBodyRepr::Cons { .. }));
+            assert!(matches!(body.repr(), JsStringBodyRepr::Cons { .. }));
         });
     }
 
@@ -1275,7 +1250,7 @@ mod tests {
         assert_eq!(sliced.len(), 20);
         assert_eq!(sliced.to_lossy_string(&heap), "abcdefghijklmnopqrst");
         heap.read_payload(sliced.handle(), |body| {
-            assert!(matches!(body.repr, JsStringBodyRepr::Sliced { .. }));
+            assert!(matches!(body.repr(), JsStringBodyRepr::Sliced { .. }));
         });
     }
 

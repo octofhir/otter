@@ -70,8 +70,9 @@ fn child_bytes(capacity: usize) -> u64 {
 }
 
 fn symbol_bytes() -> u64 {
-    // "array-key" is one inline Latin-1 string and one old symbol identity.
-    cell_bytes::<crate::string::JsStringBody>() + cell_bytes::<crate::symbol::SymbolBody>()
+    // "array-key" is one sequential Latin-1 string and one old symbol identity.
+    otter_gc::GcHeap::cell_bytes::<crate::string::JsStringBody>("array-key".len()) as u64
+        + cell_bytes::<crate::symbol::SymbolBody>()
 }
 
 #[test]

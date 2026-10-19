@@ -1,26 +1,34 @@
-//! GC-managed JavaScript string body — unified variant-enum design
-//! covering flat WTF-16, Latin-1, cons (rope), and width-preserving sliced
-//! views
-//! variants in a single GC body type.
+//! GC-managed JavaScript string body: one compact fixed part and a trailing
+//! payload sized for its representation — the code units of a sequential
+//! string, or the two words of a rope or a slice.
 //!
-//! Every string lives in exactly one [`JsStringBody`] on the GC heap. Short flat strings keep
-//! their bytes/code units inside the body; longer strings use `Vec<u16>` /
-//! `Vec<u8>` side storage. Cons / sliced variants reference children through
-//! [`JsStringHandle`] so the collector can trace them transitively.
+//! Every string lives in exactly one [`JsStringBody`] cell on the GC heap.
+//! Sequential strings keep their Latin-1 bytes or WTF-16 units in the cell's
+//! trailing storage, exactly as many as the string has. Cons and sliced
+//! strings keep their child handles in two trailing words, so the collector
+//! traces them transitively.
 //!
 //! # Contents
-//! - [`JsStringBody`] / [`JsStringBodyRepr`] — variant-enum body.
+//! - [`JsStringBody`] — the 20-byte fixed part: map word, recorded atom,
+//!   length, hash, representation kind and rope depth.
+//! - [`JsStringBodyRepr`] — the by-value view of a body's representation.
 //! - Stable representation tags and payload offsets consumed by generated
 //!   code for contiguous string operations.
 //! - `alloc_*` helpers and heap-level
 //!   [`concat`] / [`slice`] / [`flatten`] / [`equals`] / [`to_utf16_vec`].
 //!
 //! # Invariants
-//! - String bytes/code units live on the GC heap (Vec inside body).
-//!   No `Rc` / `Arc` / `Box` / `Cell` / `RefCell` inside the body.
+//! - String bytes/code units live in the cell's trailing storage. No `Rc` /
+//!   `Arc` / `Box` / `Cell` / `RefCell` inside the body, and nothing outside
+//!   the heap.
+//! - A body's trailing size is fixed by its kind at allocation: `len` bytes
+//!   (Latin-1), `2 * len` bytes (WTF-16) or two words (cons, sliced). Only a
+//!   cons is rewritten in place, into a sliced view of its flattened copy,
+//!   which has the same trailing size.
 //! - Ordinary bodies start in the moving young generation. Every handle
 //!   held across an allocation is exposed through a traced slot or scoped VM
-//!   handle; only explicitly stable cells may rely on old-space placement.
+//!   handle; a rope's or slice's children are rooted by its allocator until
+//!   the initializer writes them at the cell's final address.
 //! - `len` is precomputed at construction and is O(1) heap-free at
 //!   the body level (callers read it via `heap.read_payload`).
 //! - A body length is always exact in `u32`. Concatenation rejects a sum beyond
@@ -30,16 +38,16 @@
 //!   of the code units for every representation, so equal content always has
 //!   equal hashes. Allocation, slicing, concatenation and flattening never
 //!   hash; rope equality and ordering stream the immutable code units.
-//! - A slice short enough for an inline body is copied into one: same cell
-//!   size, no parent retention.
+//! - A short slice is copied into a sequential body: no parent retention.
 //! - Cons depth never exceeds [`MAX_ROPE_DEPTH`]; concatenations
 //!   that would exceed it flatten the deeper child eagerly.
 //! - Slicing a flat body is O(1) for either storage width. Slicing a `Cons`
 //!   materialises only the requested span; slicing a `Sliced` collapses into a
 //!   single view (no `Sliced(Sliced(...))`).
-//! - [`JsStringBodyRepr`] uses `repr(C, u8)`: its tag byte and aligned payload
-//!   union are an explicit generated-code contract. Changing either requires
-//!   updating the baked JIT layout and its machine-code consumers together.
+//! - The fixed part's field offsets and the representation tags are an
+//!   explicit generated-code contract ([`jit_layout`]). Changing either
+//!   requires updating the baked JIT layout and its machine-code consumers
+//!   together.
 //!
 //! # See also
 //! - <https://tc39.es/ecma262/#sec-ecmascript-language-types-string-type>
@@ -55,23 +63,24 @@ pub const JS_STRING_BODY_TYPE_TAG: u8 = 0x20;
 /// would exceed this trigger an eager flatten before the new `Cons`
 /// node is built.
 pub const MAX_ROPE_DEPTH: u8 = 254;
-/// UTF-16 code units stored directly inside a flat string body.
-pub const INLINE_FLAT_CAP: usize = 12;
-/// Latin-1 bytes stored directly inside a Latin-1 string body.
-pub const INLINE_LATIN1_CAP: usize = 24;
+/// Longest concatenation of two flat Latin-1 strings that copies into a
+/// sequential result instead of building a rope.
+pub const SHORT_CONCAT_LATIN1: usize = 24;
+/// Longest concatenation of two flat strings, one of them wide, that copies
+/// into a sequential result.
+pub const SHORT_CONCAT_FLAT: usize = 12;
 
-/// Inline UTF-16 representation tag exposed to generated code.
-pub const STRING_REPR_INLINE_FLAT: u8 = 0;
 /// Sequential UTF-16 representation tag exposed to generated code.
 pub const STRING_REPR_SEQ_FLAT: u8 = 1;
-/// Inline Latin-1 representation tag exposed to generated code.
-pub const STRING_REPR_INLINE_LATIN1: u8 = 2;
 /// Sequential Latin-1 representation tag exposed to generated code.
 pub const STRING_REPR_SEQ_LATIN1: u8 = 3;
 /// Rope representation tag; generated code must use the cold path.
 pub const STRING_REPR_CONS: u8 = 4;
 /// Slice representation tag; generated code must use the cold path.
 pub const STRING_REPR_SLICED: u8 = 5;
+
+/// Trailing bytes of a cons or sliced body: its two words.
+const PAIR_BYTES: usize = 8;
 
 /// GC handle to a JavaScript string body. `Copy`. Packs into
 /// [`crate::Value`] under `TAG_PTR_STRING`.
@@ -94,24 +103,15 @@ pub enum StringConcatError {
     OutOfMemory(#[from] otter_gc::OutOfMemory),
 }
 
-/// Internal representation of a [`JsStringBody`].
-#[derive(Debug)]
-#[repr(C, u8)]
+/// The representation of a [`JsStringBody`], read by value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JsStringBodyRepr {
-    /// Small flat WTF-16 code units stored inside the GC body. The live prefix
-    /// length is [`JsStringBody::len`].
-    InlineFlat([u16; INLINE_FLAT_CAP]) = STRING_REPR_INLINE_FLAT,
-    /// Flat WTF-16 code units stored in the body's own trailing storage.
-    /// The live length is [`JsStringBody::len`]; the units start one body
-    /// past the body, in the same GC cell.
-    SeqFlat = STRING_REPR_SEQ_FLAT,
-    /// Small Latin-1 code units stored inside the GC body. The live prefix
-    /// length is [`JsStringBody::len`].
-    InlineLatin1([u8; INLINE_LATIN1_CAP]) = STRING_REPR_INLINE_LATIN1,
-    /// Latin-1 code units stored in the body's own trailing storage. Each
-    /// byte zero-extends to a `u16` on read. The live length is
-    /// [`JsStringBody::len`].
-    SeqLatin1 = STRING_REPR_SEQ_LATIN1,
+    /// Flat WTF-16 code units in the body's trailing storage; the live length
+    /// is [`JsStringBody::len`].
+    SeqFlat,
+    /// Latin-1 code units in the body's trailing storage. Each byte
+    /// zero-extends to a `u16` on read.
+    SeqLatin1,
     /// Rope concatenation node. Tracing visits both children.
     Cons {
         /// Left child.
@@ -121,40 +121,21 @@ pub enum JsStringBodyRepr {
         /// Maximum depth of either child plus one. Bounded by
         /// [`MAX_ROPE_DEPTH`].
         depth: u8,
-    } = STRING_REPR_CONS,
+    },
     /// Slice view over a parent string. Tracing visits the parent.
     Sliced {
         /// Parent body.
         parent: JsStringHandle,
         /// Start offset (code units) into the parent.
         start: u32,
-    } = STRING_REPR_SLICED,
+    },
 }
 
-/// Byte offset from the start of [`JsStringBodyRepr`] to the payload union.
+/// GC-managed JavaScript string body: the fixed part, followed in its cell
+/// by the trailing payload its kind sizes.
 ///
-/// `repr(C, u8)` lays the explicit tag first and aligns the payload to the
-/// enum's alignment. Generated code reads only the four contiguous variants;
-/// cons and sliced bodies retain the Rust walker.
-pub const STRING_REPR_PAYLOAD_BYTE: usize = std::mem::align_of::<JsStringBodyRepr>();
-
-/// Materialising a large rope / Latin-1 body into `Vec<u16>` is O(len).
-/// Subjects re-scanned many times (a `/g` regex `exec` loop re-widens the
-/// same subject on every match) amortise that once via
-/// [`JsStringBody::utf16_cache`]. Below this length the widen is cheap
-/// enough that caching only wastes memory, so small strings stay uncached.
-const UTF16_CACHE_MIN_LEN: u32 = 256;
-
-// A cached widening is only worth taking when the subject is long, and any
-// string that long allocates its units sequentially rather than inline. That
-// is what lets `with_utf16` read a filled cache as `SeqFlat` directly.
-const _: () = assert!(UTF16_CACHE_MIN_LEN as usize > INLINE_FLAT_CAP);
-
-/// GC-managed JavaScript string body.
-///
-/// `repr(C)` because the sequential variants keep their code units in
-/// trailing storage immediately after the body, in the same GC cell, and
-/// that only has a defined address with a fixed layout.
+/// `repr(C)` because the trailing payload starts one body past the body, in
+/// the same GC cell, and that only has a defined address with a fixed layout.
 #[derive(Debug)]
 #[repr(C)]
 pub struct JsStringBody {
@@ -169,76 +150,48 @@ pub struct JsStringBody {
     /// FNV-1a hash of the code units, folded to 32 bits, once
     /// [`string_hash`] computed it; zero until then.
     pub hash: u32,
-    /// Variant-specific payload.
-    pub repr: JsStringBodyRepr,
-    /// Lazily-filled widened view of this string, as a flat string body.
-    /// Null until [`ensure_utf16_cache`] fills it.
-    ///
-    /// The cache is a string rather than a side buffer so it owns nothing
-    /// outside the heap: it is traced, it moves with the collector, and a
-    /// page image carries it like any other body. String content is
-    /// immutable — a representation may collapse rope→flat, but the code
-    /// units never change — so once filled it stays correct for the body's
-    /// lifetime.
-    utf16_cache: JsStringHandle,
+    /// One of the `STRING_REPR_*` tags.
+    kind: u8,
+    /// A cons's rope depth; zero for every other kind.
+    depth: u8,
+    reserved: [u8; 2],
 }
 
-const _: () = assert!(std::mem::size_of::<JsStringBodyRepr>() <= 32);
-const _: () = assert!(std::mem::size_of::<JsStringBody>() <= 64);
+const _: () = assert!(std::mem::offset_of!(JsStringBody, map) == 0);
+const _: () = assert!(std::mem::size_of::<JsStringBody>() == 20);
+const _: () = assert!(std::mem::align_of::<JsStringBody>() == 4);
 
 /// Measure native read/allocation geometry from the sole current VM body.
 /// No engine object allocation or GC occurs while constructing this scalar plan.
 pub(crate) fn jit_layout() -> crate::jit::JitStringLayout {
     let header = otter_gc::header::HEADER_SIZE as u32;
-    let repr = header + std::mem::offset_of!(JsStringBody, repr) as u32;
-    let sample = JsStringBodyRepr::Cons {
-        left: JsStringHandle::null(),
-        right: JsStringHandle::null(),
-        depth: 0,
-    };
-    let base = std::ptr::from_ref(&sample) as usize;
-    let JsStringBodyRepr::Cons { left, right, depth } = &sample else {
-        unreachable!()
-    };
-    let slice = JsStringBodyRepr::Sliced {
-        parent: JsStringHandle::null(),
-        start: 0,
-    };
-    let slice_base = std::ptr::from_ref(&slice) as usize;
-    let JsStringBodyRepr::Sliced { parent, start } = &slice else {
-        unreachable!()
-    };
-    let cell_bytes = otter_gc::page::align_up(
-        otter_gc::header::HEADER_SIZE + std::mem::size_of::<JsStringBody>(),
-        otter_gc::page::CELL_SIZE,
-    ) as u32;
+    let payload = header + std::mem::size_of::<JsStringBody>() as u32;
+    let pair_cell_bytes =
+        otter_gc::page::align_up(payload as usize + PAIR_BYTES, otter_gc::page::CELL_SIZE) as u32;
     crate::jit::JitStringLayout {
         string_type_tag: JS_STRING_BODY_TYPE_TAG,
         string_len_byte: header + std::mem::offset_of!(JsStringBody, len) as u32,
-        string_repr_byte: repr,
-        string_repr_payload_byte: repr + STRING_REPR_PAYLOAD_BYTE as u32,
-        string_body_size: header + std::mem::size_of::<JsStringBody>() as u32,
-        cell_bytes,
-        header_word: u64::from(JS_STRING_BODY_TYPE_TAG)
+        string_repr_byte: header + std::mem::offset_of!(JsStringBody, kind) as u32,
+        string_body_size: payload,
+        pair_cell_bytes,
+        young_header_word: u64::from(JS_STRING_BODY_TYPE_TAG)
             | (u64::from(crate::jit::JIT_GC_YOUNG_FLAG)
-                << (8 * otter_gc::header::HEADER_FLAGS_BYTE_OFFSET))
-            | (u64::from(cell_bytes) << (8 * otter_gc::header::HEADER_SIZE_BYTES_OFFSET)),
+                << (8 * otter_gc::header::HEADER_FLAGS_BYTE_OFFSET)),
+        cell_size_shift: (8 * otter_gc::header::HEADER_SIZE_BYTES_OFFSET) as u8,
         map_atom_word: u64::from(
             otter_gc::cell_map::CellMap::of_type(JS_STRING_BODY_TYPE_TAG).word(),
         ),
         atom_byte: header + std::mem::offset_of!(JsStringBody, atom) as u32,
-        cache_byte: header + std::mem::offset_of!(JsStringBody, utf16_cache) as u32,
-        cons_left_byte: repr + (std::ptr::from_ref(left) as usize - base) as u32,
-        cons_right_byte: repr + (std::ptr::from_ref(right) as usize - base) as u32,
-        cons_depth_byte: repr + (std::ptr::from_ref(depth) as usize - base) as u32,
-        sliced_parent_byte: repr + (std::ptr::from_ref(parent) as usize - slice_base) as u32,
-        sliced_start_byte: repr + (std::ptr::from_ref(start) as usize - slice_base) as u32,
-        inline_flat_cap: INLINE_FLAT_CAP as u8,
-        inline_latin1_cap: INLINE_LATIN1_CAP as u8,
+        hash_byte: header + std::mem::offset_of!(JsStringBody, hash) as u32,
+        cons_left_byte: payload,
+        cons_right_byte: payload + 4,
+        cons_depth_byte: header + std::mem::offset_of!(JsStringBody, depth) as u32,
+        sliced_parent_byte: payload,
+        sliced_start_byte: payload + 4,
+        short_concat_flat: SHORT_CONCAT_FLAT as u8,
+        short_concat_latin1: SHORT_CONCAT_LATIN1 as u8,
         max_rope_depth: MAX_ROPE_DEPTH,
-        inline_flat_tag: STRING_REPR_INLINE_FLAT,
         seq_flat_tag: STRING_REPR_SEQ_FLAT,
-        inline_latin1_tag: STRING_REPR_INLINE_LATIN1,
         seq_latin1_tag: STRING_REPR_SEQ_LATIN1,
         cons_tag: STRING_REPR_CONS,
         sliced_tag: STRING_REPR_SLICED,
@@ -246,6 +199,103 @@ pub(crate) fn jit_layout() -> crate::jit::JitStringLayout {
 }
 
 impl JsStringBody {
+    /// The fixed part of a sequential body of `len` code units.
+    const fn seq(latin1: bool, len: u32) -> Self {
+        Self {
+            map: otter_gc::cell_map::TypeMap::NEW,
+            atom: 0,
+            len,
+            hash: 0,
+            kind: if latin1 {
+                STRING_REPR_SEQ_LATIN1
+            } else {
+                STRING_REPR_SEQ_FLAT
+            },
+            depth: 0,
+            reserved: [0; 2],
+        }
+    }
+
+    /// The fixed part of a cons or sliced body; its initializer writes the
+    /// pair ([`Self::init_pair`]).
+    const fn pair(kind: u8, len: u32, depth: u8) -> Self {
+        Self {
+            map: otter_gc::cell_map::TypeMap::NEW,
+            atom: 0,
+            len,
+            hash: 0,
+            kind,
+            depth,
+            reserved: [0; 2],
+        }
+    }
+
+    /// The representation, read by value.
+    #[must_use]
+    pub fn repr(&self) -> JsStringBodyRepr {
+        match self.kind {
+            STRING_REPR_SEQ_FLAT => JsStringBodyRepr::SeqFlat,
+            STRING_REPR_SEQ_LATIN1 => JsStringBodyRepr::SeqLatin1,
+            STRING_REPR_CONS => {
+                let (left, right) = self.pair_words();
+                JsStringBodyRepr::Cons {
+                    left,
+                    right,
+                    depth: self.depth,
+                }
+            }
+            STRING_REPR_SLICED => {
+                let (parent, _) = self.pair_words();
+                // SAFETY: a sliced body's second word is its start.
+                let start = unsafe { self.trailing_ptr().cast::<u32>().add(1).read() };
+                JsStringBodyRepr::Sliced { parent, start }
+            }
+            kind => unreachable!("string body kind {kind}"),
+        }
+    }
+
+    /// Whether the body is a cons rope.
+    #[must_use]
+    pub fn is_cons(&self) -> bool {
+        self.kind == STRING_REPR_CONS
+    }
+
+    /// The two handle words of a cons or sliced body.
+    fn pair_words(&self) -> (JsStringHandle, JsStringHandle) {
+        debug_assert!(matches!(self.kind, STRING_REPR_CONS | STRING_REPR_SLICED));
+        // SAFETY: a cons or sliced body reserved two words of trailing
+        // storage, and handles are four-byte compressed offsets.
+        unsafe {
+            let words = self.trailing_ptr().cast::<JsStringHandle>();
+            (words.read(), words.add(1).read())
+        }
+    }
+
+    /// The trailing pair's slot addresses, for tracing.
+    fn pair_slots(&mut self) -> *mut RawGc {
+        self.trailing_ptr().cast_mut().cast::<RawGc>()
+    }
+
+    /// Write a fresh cons's children or a fresh slice's parent and start.
+    fn init_pair(&mut self, first: JsStringHandle, second: u32) {
+        // SAFETY: the allocation reserved two trailing words.
+        unsafe {
+            let words = self.trailing_ptr().cast_mut().cast::<u32>();
+            words.cast::<JsStringHandle>().write(first);
+            words.add(1).write(second);
+        }
+    }
+
+    /// Rewrite a cons in place into a view over the whole of `flat`, its
+    /// flattened copy: the same length, hash and identity, the same trailing
+    /// size. The kind is written last.
+    fn become_slice_of(&mut self, flat: JsStringHandle) {
+        debug_assert_eq!(self.kind, STRING_REPR_CONS);
+        self.init_pair(flat, 0);
+        self.depth = 0;
+        self.kind = STRING_REPR_SLICED;
+    }
+
     /// The interned atom of this string's content, when one was recorded.
     #[must_use]
     pub(crate) fn cached_atom(&self) -> Option<crate::property_atom::AtomId> {
@@ -277,28 +327,28 @@ impl JsStringBody {
         if latin1 { len } else { len * 2 }
     }
 
-    /// Base of the trailing code units. Only meaningful for
-    /// [`JsStringBodyRepr::SeqFlat`] / [`JsStringBodyRepr::SeqLatin1`].
+    /// Base of the trailing payload.
     fn trailing_ptr(&self) -> *const u8 {
-        // SAFETY: a sequential body was allocated with
-        // `trailing_bytes(..)` reserved immediately after it, so the
-        // units start one `Self` past `self`.
+        // SAFETY: every body was allocated with its kind's trailing storage
+        // reserved immediately after it, so the payload starts one `Self`
+        // past `self`.
         unsafe { (self as *const Self as *const u8).add(std::mem::size_of::<Self>()) }
     }
 
     /// The WTF-16 units of a [`JsStringBodyRepr::SeqFlat`] body.
     #[must_use]
     pub fn seq_flat_units(&self) -> &[u16] {
-        debug_assert!(matches!(self.repr, JsStringBodyRepr::SeqFlat));
+        debug_assert_eq!(self.kind, STRING_REPR_SEQ_FLAT);
         // SAFETY: the trailing array holds exactly `len` `u16`s, written
-        // at allocation and immutable thereafter.
+        // at allocation and immutable thereafter; the payload is two-byte
+        // aligned (the fixed part is 20 bytes past an eight-aligned cell).
         unsafe { std::slice::from_raw_parts(self.trailing_ptr().cast::<u16>(), self.len as usize) }
     }
 
     /// The Latin-1 bytes of a [`JsStringBodyRepr::SeqLatin1`] body.
     #[must_use]
     pub fn seq_latin1_bytes(&self) -> &[u8] {
-        debug_assert!(matches!(self.repr, JsStringBodyRepr::SeqLatin1));
+        debug_assert_eq!(self.kind, STRING_REPR_SEQ_LATIN1);
         // SAFETY: the trailing array holds exactly `len` bytes.
         unsafe { std::slice::from_raw_parts(self.trailing_ptr(), self.len as usize) }
     }
@@ -334,15 +384,9 @@ impl JsStringBody {
     /// for cons.
     #[must_use]
     pub fn depth(&self) -> u8 {
-        match &self.repr {
-            JsStringBodyRepr::Cons { depth, .. } => *depth,
-            _ => 0,
-        }
+        self.depth
     }
 }
-
-const _: () = assert!(std::mem::offset_of!(JsStringBody, map) == 0);
-const _: () = assert!(std::mem::size_of::<JsStringBody>() == 48);
 
 impl otter_gc::SafeTraceable for JsStringBody {
     const MAP_WORD: otter_gc::cell_map::MapWord =
@@ -350,35 +394,21 @@ impl otter_gc::SafeTraceable for JsStringBody {
     const TYPE_TAG: u8 = JS_STRING_BODY_TYPE_TAG;
 
     fn trace_slots_safe(&mut self, visitor: &mut SlotVisitor<'_>) {
-        // The widened cache is an ordinary string body, so it is traced like
-        // any other outgoing handle regardless of this body's variant.
-        if !self.utf16_cache.is_null() {
-            let p = &mut self.utf16_cache as *mut JsStringHandle as *mut RawGc;
-            visitor(p);
-        }
-        match &mut self.repr {
-            JsStringBodyRepr::InlineFlat(_)
-            | JsStringBodyRepr::SeqFlat
-            | JsStringBodyRepr::InlineLatin1(_)
-            | JsStringBodyRepr::SeqLatin1 => {}
-            JsStringBodyRepr::Cons { left, right, .. } => {
-                if !left.is_null() {
-                    let p = left as *mut JsStringHandle as *mut RawGc;
-                    visitor(p);
-                }
-                if !right.is_null() {
-                    let p = right as *mut JsStringHandle as *mut RawGc;
-                    visitor(p);
-                }
+        match self.kind {
+            STRING_REPR_CONS => {
+                let slots = self.pair_slots();
+                visitor(slots);
+                // SAFETY: a cons reserved two trailing handle words.
+                visitor(unsafe { slots.add(1) });
             }
-            JsStringBodyRepr::Sliced { parent, .. } => {
-                if !parent.is_null() {
-                    let p = parent as *mut JsStringHandle as *mut RawGc;
-                    visitor(p);
-                }
-            }
+            STRING_REPR_SLICED => visitor(self.pair_slots()),
+            _ => {}
         }
     }
+
+    /// A pending body is the fixed part alone: a rope's children are written
+    /// by its initializer, rooted by its allocator until then.
+    fn trace_pending_slots_safe(&mut self, _visitor: &mut SlotVisitor<'_>) {}
 
     /// Visited concurrently under the layout lock: flattening rewrites a
     /// rope's pointer words in place through
@@ -396,7 +426,12 @@ pub fn alloc_flat_string_body_with_roots(
     units: &[u16],
     external_visit: &mut RootSlotVisitor<'_>,
 ) -> Result<JsStringHandle, otter_gc::OutOfMemory> {
-    alloc_flat_string_body_in(heap, units, false, external_visit)
+    alloc_flat_string_body_at(
+        heap,
+        units,
+        otter_gc::SitePlacement::Young(0),
+        external_visit,
+    )
 }
 
 /// Allocate a flat WTF-16 string body directly in old space, for a string
@@ -410,54 +445,12 @@ pub(crate) fn alloc_old_flat_string_body_with_roots(
     units: &[u16],
     external_visit: &mut RootSlotVisitor<'_>,
 ) -> Result<JsStringHandle, otter_gc::OutOfMemory> {
-    alloc_flat_string_body_in(heap, units, true, external_visit)
-}
-
-fn alloc_flat_string_body_in(
-    heap: &mut GcHeap,
-    units: &[u16],
-    old: bool,
-    external_visit: &mut RootSlotVisitor<'_>,
-) -> Result<JsStringHandle, otter_gc::OutOfMemory> {
-    let len = units.len() as u32;
-    let hash = 0;
-    if units.len() <= INLINE_FLAT_CAP {
-        let mut inline = [0u16; INLINE_FLAT_CAP];
-        inline[..units.len()].copy_from_slice(units);
-        let body = JsStringBody {
-            map: otter_gc::cell_map::TypeMap::NEW,
-            atom: 0,
-            len,
-            hash,
-            repr: JsStringBodyRepr::InlineFlat(inline),
-            utf16_cache: JsStringHandle::null(),
-        };
-        return if old {
-            heap.alloc_old_with_roots(body, external_visit)
-        } else {
-            heap.alloc_with_roots(body, external_visit)
-        };
-    }
-    // The code units live in the same cell as the body, so they are part of
-    // the GC allocation and need no separate cap reservation.
-    let body = JsStringBody {
-        map: otter_gc::cell_map::TypeMap::NEW,
-        atom: 0,
-        len,
-        hash,
-        repr: JsStringBodyRepr::SeqFlat,
-        utf16_cache: JsStringHandle::null(),
-    };
-    let trailing = JsStringBody::trailing_bytes(false, units.len());
-    let handle = if old {
-        heap.alloc_old_trailing_with_roots(body, trailing, external_visit)?
-    } else {
-        heap.alloc_trailing_with_roots(body, trailing, external_visit)?
-    };
-    heap.with_payload(handle, |body| {
-        body.init_seq_flat(units);
-        true
-    });
+    let handle = heap.alloc_old_trailing_with_roots(
+        JsStringBody::seq(false, units.len() as u32),
+        JsStringBody::trailing_bytes(false, units.len()),
+        external_visit,
+    )?;
+    heap.with_payload(handle, |body| body.init_seq_flat(units));
     Ok(handle)
 }
 
@@ -488,35 +481,8 @@ pub(crate) fn alloc_latin1_string_body_at(
     placement: otter_gc::SitePlacement,
     external_visit: &mut RootSlotVisitor<'_>,
 ) -> Result<JsStringHandle, otter_gc::OutOfMemory> {
-    let len = bytes.len() as u32;
-    if bytes.len() <= INLINE_LATIN1_CAP {
-        let mut inline = [0u8; INLINE_LATIN1_CAP];
-        inline[..bytes.len()].copy_from_slice(bytes);
-        return heap.alloc_trailing_at_site_with_roots_initialized(
-            JsStringBody {
-                map: otter_gc::cell_map::TypeMap::NEW,
-                atom: 0,
-                len,
-                hash: 0,
-                repr: JsStringBodyRepr::InlineLatin1(inline),
-                utf16_cache: JsStringHandle::null(),
-            },
-            0,
-            placement,
-            external_visit,
-            |_| {},
-        );
-    }
-    // Same as the flat path: the bytes are inside the GC allocation.
     heap.alloc_trailing_at_site_with_roots_initialized(
-        JsStringBody {
-            map: otter_gc::cell_map::TypeMap::NEW,
-            atom: 0,
-            len,
-            hash: 0,
-            repr: JsStringBodyRepr::SeqLatin1,
-            utf16_cache: JsStringHandle::null(),
-        },
+        JsStringBody::seq(true, bytes.len() as u32),
         JsStringBody::trailing_bytes(true, bytes.len()),
         placement,
         external_visit,
@@ -534,39 +500,63 @@ pub(crate) fn alloc_flat_string_body_at(
     placement: otter_gc::SitePlacement,
     external_visit: &mut RootSlotVisitor<'_>,
 ) -> Result<JsStringHandle, otter_gc::OutOfMemory> {
-    let len = units.len() as u32;
-    if units.len() <= INLINE_FLAT_CAP {
-        let mut inline = [0u16; INLINE_FLAT_CAP];
-        inline[..units.len()].copy_from_slice(units);
-        return heap.alloc_trailing_at_site_with_roots_initialized(
-            JsStringBody {
-                map: otter_gc::cell_map::TypeMap::NEW,
-                atom: 0,
-                len,
-                hash: 0,
-                repr: JsStringBodyRepr::InlineFlat(inline),
-                utf16_cache: JsStringHandle::null(),
-            },
-            0,
-            placement,
-            external_visit,
-            |_| {},
-        );
-    }
     heap.alloc_trailing_at_site_with_roots_initialized(
-        JsStringBody {
-            map: otter_gc::cell_map::TypeMap::NEW,
-            atom: 0,
-            len,
-            hash: 0,
-            repr: JsStringBodyRepr::SeqFlat,
-            utf16_cache: JsStringHandle::null(),
-        },
+        JsStringBody::seq(false, units.len() as u32),
         JsStringBody::trailing_bytes(false, units.len()),
         placement,
         external_visit,
         |body| body.init_seq_flat(units),
     )
+}
+
+/// Allocate a cons (`kind` [`STRING_REPR_CONS`], `second` the right child)
+/// or sliced body (`second` the start) whose children the allocation keeps
+/// rooted until its initializer writes them.
+fn alloc_pair_body(
+    heap: &mut GcHeap,
+    body: JsStringBody,
+    first: JsStringHandle,
+    second: PairSecond,
+    placement: otter_gc::SitePlacement,
+    external_visit: &mut RootSlotVisitor<'_>,
+) -> Result<JsStringHandle, otter_gc::OutOfMemory> {
+    let mut first = first;
+    let mut second_handle = match second {
+        PairSecond::Handle(handle) => handle,
+        PairSecond::Word(_) => JsStringHandle::null(),
+    };
+    let first_slot: *mut JsStringHandle = &mut first;
+    let second_slot: *mut JsStringHandle = &mut second_handle;
+    let mut visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
+        visitor(first_slot.cast::<RawGc>());
+        visitor(second_slot.cast::<RawGc>());
+        external_visit(visitor);
+    };
+    heap.alloc_trailing_at_site_with_roots_initialized(
+        body,
+        PAIR_BYTES,
+        placement,
+        &mut visit,
+        |body| {
+            // SAFETY: the slots live on this frame; a collection during the
+            // allocation rewrote them, and none runs between there and here.
+            let (first, second_handle) = unsafe { (*first_slot, *second_slot) };
+            let second = match second {
+                PairSecond::Handle(_) => second_handle.offset(),
+                PairSecond::Word(word) => word,
+            };
+            body.init_pair(first, second);
+        },
+    )
+}
+
+/// The second word of a pair body.
+#[derive(Clone, Copy)]
+enum PairSecond {
+    /// A cons's right child, rooted like the first.
+    Handle(JsStringHandle),
+    /// A slice's start.
+    Word(u32),
 }
 
 /// Allocate a Latin-1 string body directly in old space through the heap's
@@ -581,34 +571,11 @@ pub(crate) fn alloc_latin1_string_body_diagnostic(
     heap: &mut GcHeap,
     bytes: &[u8],
 ) -> Result<JsStringHandle, otter_gc::OutOfMemory> {
-    let len = bytes.len() as u32;
-    if bytes.len() <= INLINE_LATIN1_CAP {
-        let mut inline = [0u8; INLINE_LATIN1_CAP];
-        inline[..bytes.len()].copy_from_slice(bytes);
-        return heap.alloc_old_diagnostic(JsStringBody {
-            map: otter_gc::cell_map::TypeMap::NEW,
-            atom: 0,
-            len,
-            hash: 0,
-            repr: JsStringBodyRepr::InlineLatin1(inline),
-            utf16_cache: JsStringHandle::null(),
-        });
-    }
     let handle = heap.alloc_old_diagnostic_trailing(
-        JsStringBody {
-            map: otter_gc::cell_map::TypeMap::NEW,
-            atom: 0,
-            len,
-            hash: 0,
-            repr: JsStringBodyRepr::SeqLatin1,
-            utf16_cache: JsStringHandle::null(),
-        },
+        JsStringBody::seq(true, bytes.len() as u32),
         JsStringBody::trailing_bytes(true, bytes.len()),
     )?;
-    heap.with_payload(handle, |body| {
-        body.init_seq_latin1(bytes);
-        true
-    });
+    heap.with_payload(handle, |body| body.init_seq_latin1(bytes));
     Ok(handle)
 }
 
@@ -646,15 +613,14 @@ pub fn concat_string_bodies(
             right_len,
         })?;
 
-    // Short-result fast path: when the concatenation fits an inline flat body
-    // and both sides are already materialised (non-cons/non-sliced), build the
-    // flat result directly. A `Cons` node for a tiny result (`"k" + i` keys,
-    // small id/label joins) is pure overhead — it retains both children and
-    // forces a rope walk on every later hash/compare and an eventual flatten.
-    // The inline-flat result needs the same single body allocation but stores
-    // its bytes inline and is read in O(1).
-    if (new_len as usize) <= INLINE_LATIN1_CAP {
-        let mut units = [0u16; INLINE_LATIN1_CAP];
+    // Short-result fast path: when the concatenation is short and both sides
+    // are already materialised (non-cons/non-sliced), build the flat result
+    // directly. A `Cons` node for a tiny result (`"k" + i` keys, small
+    // id/label joins) is pure overhead — it retains both children and forces
+    // a rope walk on every later hash/compare and an eventual flatten. The
+    // sequential result is no larger than the rope and is read in O(1).
+    if (new_len as usize) <= SHORT_CONCAT_LATIN1 {
+        let mut units = [0u16; SHORT_CONCAT_LATIN1];
         let mut n = 0usize;
         let mut all_latin1 = true;
         let mut both_flat = true;
@@ -682,9 +648,9 @@ pub fn concat_string_bodies(
                 break;
             }
         }
-        if both_flat {
+        if both_flat && (all_latin1 || n <= SHORT_CONCAT_FLAT) {
             return Ok(if all_latin1 {
-                let mut bytes = [0u8; INLINE_LATIN1_CAP];
+                let mut bytes = [0u8; SHORT_CONCAT_LATIN1];
                 for (dst, &unit) in bytes.iter_mut().zip(units[..n].iter()) {
                     *dst = unit as u8;
                 }
@@ -723,23 +689,13 @@ pub fn concat_string_bodies(
 
     let final_depth = left_depth.max(right_depth).saturating_add(1);
 
-    Ok(heap.alloc_trailing_at_site_with_roots_initialized(
-        JsStringBody {
-            map: otter_gc::cell_map::TypeMap::NEW,
-            atom: 0,
-            len: new_len,
-            hash: 0,
-            repr: JsStringBodyRepr::Cons {
-                left,
-                right,
-                depth: final_depth,
-            },
-            utf16_cache: JsStringHandle::null(),
-        },
-        0,
+    Ok(alloc_pair_body(
+        heap,
+        JsStringBody::pair(STRING_REPR_CONS, new_len, final_depth),
+        left,
+        PairSecond::Handle(right),
         placement,
         external_visit,
-        |_| {},
     )?)
 }
 
@@ -772,16 +728,13 @@ pub fn slice_string_body(
         },
         Cons,
     }
-    let src = heap.read_payload(string, |b| match &b.repr {
-        JsStringBodyRepr::InlineFlat(_)
-        | JsStringBodyRepr::SeqFlat
-        | JsStringBodyRepr::InlineLatin1(_)
-        | JsStringBodyRepr::SeqLatin1 => SliceSource::Flat,
+    let src = heap.read_payload(string, |b| match b.repr() {
+        JsStringBodyRepr::SeqFlat | JsStringBodyRepr::SeqLatin1 => SliceSource::Flat,
         JsStringBodyRepr::Sliced {
             parent,
             start: pstart,
         } => SliceSource::SlicedCollapse {
-            parent: *parent,
+            parent,
             abs_start: pstart + start,
         },
         JsStringBodyRepr::Cons { .. } => SliceSource::Cons,
@@ -804,13 +757,37 @@ pub fn slice_string_body(
     }
 }
 
-/// Allocation-buffer bytes [`try_substring_no_collect`] takes.
-pub(crate) const SUBSTRING_CELL_BYTES: usize = GcHeap::cell_bytes::<JsStringBody>(0);
+/// Allocation-buffer bytes [`try_substring_no_collect`] takes at most: a
+/// copied short substring's cell, which is at least a view's.
+pub(crate) const SUBSTRING_CELL_BYTES: usize =
+    GcHeap::cell_bytes::<JsStringBody>(SHORT_CONCAT_LATIN1);
+const _: () = assert!(SUBSTRING_CELL_BYTES >= GcHeap::cell_bytes::<JsStringBody>(PAIR_BYTES));
+
+/// How a substring of a contiguous parent is built.
+enum SubstringBody<'a> {
+    /// Copied into a sequential body: short, so it retains no parent.
+    Latin1(&'a [u8]),
+    /// Copied wide units.
+    Wide(&'a [u16]),
+    /// A view sharing the parent.
+    View,
+}
+
+/// The body a substring of `length` units of `content` takes.
+fn substring_body(content: FlatContent<'_>) -> SubstringBody<'_> {
+    match content {
+        FlatContent::Latin1(bytes) if bytes.len() <= SHORT_CONCAT_LATIN1 => {
+            SubstringBody::Latin1(bytes)
+        }
+        FlatContent::Wide(units) if units.len() <= SHORT_CONCAT_FLAT => SubstringBody::Wide(units),
+        _ => SubstringBody::View,
+    }
+}
 
 /// `length` units at `start` of `string`, which reads contiguously, in one
-/// cell taken from the allocation buffer without collecting: the bytes the
-/// caller reserved ([`SUBSTRING_CELL_BYTES`]). Like [`slice_view`], short
-/// units are copied inline and longer ones viewed in place. `None` when the
+/// cell taken from the allocation buffer without collecting, within the
+/// bytes the caller reserved ([`SUBSTRING_CELL_BYTES`]). Like [`slice_view`],
+/// short units are copied and longer ones viewed in place. `None` when the
 /// string does not read contiguously or the buffer has no room.
 pub(crate) fn try_substring_no_collect(
     heap: &mut GcHeap,
@@ -820,33 +797,52 @@ pub(crate) fn try_substring_no_collect(
 ) -> Option<JsStringHandle> {
     let (parent, base, _) = contiguous_view(heap, string)?;
     let start = base.checked_add(start)?;
-    let repr = heap.read_payload(parent, |body| {
-        Some(match flat_content_range(body, start, length)? {
-            FlatContent::Latin1(bytes) if bytes.len() <= INLINE_LATIN1_CAP => {
-                let mut inline = [0u8; INLINE_LATIN1_CAP];
-                inline[..bytes.len()].copy_from_slice(bytes);
-                JsStringBodyRepr::InlineLatin1(inline)
-            }
-            FlatContent::Wide(units) if units.len() <= INLINE_FLAT_CAP => {
-                let mut inline = [0u16; INLINE_FLAT_CAP];
-                inline[..units.len()].copy_from_slice(units);
-                JsStringBodyRepr::InlineFlat(inline)
-            }
-            _ => JsStringBodyRepr::Sliced { parent, start },
-        })
+    let mut latin1 = [0u8; SHORT_CONCAT_LATIN1];
+    let mut wide = [0u16; SHORT_CONCAT_FLAT];
+    let built = heap.read_payload(parent, |body| {
+        Some(
+            match substring_body(flat_content_range(body, start, length)?) {
+                SubstringBody::Latin1(bytes) => {
+                    latin1[..bytes.len()].copy_from_slice(bytes);
+                    (STRING_REPR_SEQ_LATIN1, bytes.len())
+                }
+                SubstringBody::Wide(units) => {
+                    wide[..units.len()].copy_from_slice(units);
+                    (STRING_REPR_SEQ_FLAT, units.len() * 2)
+                }
+                SubstringBody::View => (STRING_REPR_SLICED, PAIR_BYTES),
+            },
+        )
     })?;
-    heap.try_alloc_no_collect(JsStringBody {
-        map: otter_gc::cell_map::TypeMap::NEW,
-        atom: 0,
-        len: length,
-        hash: 0,
-        repr,
-        utf16_cache: JsStringHandle::null(),
-    })
+    match built {
+        (STRING_REPR_SEQ_LATIN1, bytes) => heap
+            .try_alloc_trailing_no_collect_or_return(
+                JsStringBody::seq(true, length),
+                bytes,
+                |body| {
+                    body.init_seq_latin1(&latin1[..bytes]);
+                },
+            )
+            .ok(),
+        (STRING_REPR_SEQ_FLAT, bytes) => heap
+            .try_alloc_trailing_no_collect_or_return(
+                JsStringBody::seq(false, length),
+                bytes,
+                |body| body.init_seq_flat(&wide[..bytes / 2]),
+            )
+            .ok(),
+        _ => heap
+            .try_alloc_trailing_no_collect_or_return(
+                JsStringBody::pair(STRING_REPR_SLICED, length, 0),
+                PAIR_BYTES,
+                |body| body.init_pair(parent, start),
+            )
+            .ok(),
+    }
 }
 
-/// `length` units at `start` of the contiguous `parent`: copied into an
-/// inline body when they fit one, otherwise a view sharing the parent.
+/// `length` units at `start` of the contiguous `parent`: copied into a
+/// sequential body when short, otherwise a view sharing the parent.
 fn slice_view(
     heap: &mut GcHeap,
     parent: JsStringHandle,
@@ -854,33 +850,37 @@ fn slice_view(
     length: u32,
     external_visit: &mut RootSlotVisitor<'_>,
 ) -> Result<JsStringHandle, otter_gc::OutOfMemory> {
-    let repr = heap.read_payload(parent, |body| {
-        match flat_content_range(body, start, length).expect("slice parent has contiguous content")
-        {
-            FlatContent::Latin1(bytes) if bytes.len() <= INLINE_LATIN1_CAP => {
-                let mut inline = [0u8; INLINE_LATIN1_CAP];
-                inline[..bytes.len()].copy_from_slice(bytes);
-                JsStringBodyRepr::InlineLatin1(inline)
+    let mut latin1 = [0u8; SHORT_CONCAT_LATIN1];
+    let mut wide = [0u16; SHORT_CONCAT_FLAT];
+    let built = heap.read_payload(parent, |body| {
+        match substring_body(
+            flat_content_range(body, start, length).expect("slice parent has contiguous content"),
+        ) {
+            SubstringBody::Latin1(bytes) => {
+                latin1[..bytes.len()].copy_from_slice(bytes);
+                Some((true, bytes.len()))
             }
-            FlatContent::Wide(units) if units.len() <= INLINE_FLAT_CAP => {
-                let mut inline = [0u16; INLINE_FLAT_CAP];
-                inline[..units.len()].copy_from_slice(units);
-                JsStringBodyRepr::InlineFlat(inline)
+            SubstringBody::Wide(units) => {
+                wide[..units.len()].copy_from_slice(units);
+                Some((false, units.len()))
             }
-            _ => JsStringBodyRepr::Sliced { parent, start },
+            SubstringBody::View => None,
         }
     });
-    heap.alloc_with_roots(
-        JsStringBody {
-            map: otter_gc::cell_map::TypeMap::NEW,
-            atom: 0,
-            len: length,
-            hash: 0,
-            repr,
-            utf16_cache: JsStringHandle::null(),
-        },
-        external_visit,
-    )
+    match built {
+        Some((true, len)) => {
+            alloc_latin1_string_body_with_roots(heap, &latin1[..len], external_visit)
+        }
+        Some((false, len)) => alloc_flat_string_body_with_roots(heap, &wide[..len], external_visit),
+        None => alloc_pair_body(
+            heap,
+            JsStringBody::pair(STRING_REPR_SLICED, length, 0),
+            parent,
+            PairSecond::Word(start),
+            otter_gc::SitePlacement::Young(0),
+            external_visit,
+        ),
+    }
 }
 
 /// Realise a rope or sliced body into a fresh flat body. O(n) over
@@ -894,12 +894,7 @@ pub fn flatten_string_body(
     external_visit: &mut RootSlotVisitor<'_>,
 ) -> Result<JsStringHandle, otter_gc::OutOfMemory> {
     // Fast path — already flat.
-    let is_flat = heap.read_payload(string, |b| {
-        matches!(
-            b.repr,
-            JsStringBodyRepr::InlineFlat(_) | JsStringBodyRepr::SeqFlat
-        )
-    });
+    let is_flat = heap.read_payload(string, |b| b.repr() == JsStringBodyRepr::SeqFlat);
     if is_flat {
         return Ok(string);
     }
@@ -943,50 +938,18 @@ pub fn flatten_in_place(
         external_visit(visitor);
     };
     // A sequential body sizes its storage at allocation, so the rope cannot
-    // widen itself in place. Allocate the flat string and turn the rope node
-    // into a view over it: same length, same hash, same identity, and every
-    // later access takes the flat fast path through one hop. Short results
-    // still collapse straight into the body's inline array. The content is
-    // unchanged, so a hash computed earlier stays exact.
-    if latin1 {
+    // become one in place. Allocate the flat string and turn the rope node
+    // into a view over it: same length, same hash, same identity, the same
+    // two trailing words, and every later access takes the flat fast path
+    // through one hop. The content is unchanged, so a hash computed earlier
+    // stays exact.
+    let flat = if latin1 {
         let bytes: Vec<u8> = units.iter().map(|&u| u as u8).collect();
-        if bytes.len() <= INLINE_LATIN1_CAP {
-            let mut inline = [0u8; INLINE_LATIN1_CAP];
-            inline[..bytes.len()].copy_from_slice(&bytes);
-            heap.with_payload_relayout(rooted, |b| {
-                b.repr = JsStringBodyRepr::InlineLatin1(inline);
-                true
-            });
-            return Ok(());
-        }
-        let flat = alloc_latin1_string_body_with_roots(heap, &bytes, &mut visit)?;
-        heap.with_payload_relayout(rooted, |b| {
-            b.repr = JsStringBodyRepr::Sliced {
-                parent: flat,
-                start: 0,
-            };
-            true
-        });
-        heap.record_write(rooted, &flat);
-        return Ok(());
-    }
-    if units.len() <= INLINE_FLAT_CAP {
-        let mut inline = [0u16; INLINE_FLAT_CAP];
-        inline[..units.len()].copy_from_slice(&units);
-        heap.with_payload_relayout(rooted, |b| {
-            b.repr = JsStringBodyRepr::InlineFlat(inline);
-            true
-        });
-        return Ok(());
-    }
-    let flat = alloc_flat_string_body_with_roots(heap, &units, &mut visit)?;
-    heap.with_payload_relayout(rooted, |b| {
-        b.repr = JsStringBodyRepr::Sliced {
-            parent: flat,
-            start: 0,
-        };
-        true
-    });
+        alloc_latin1_string_body_with_roots(heap, &bytes, &mut visit)?
+    } else {
+        alloc_flat_string_body_with_roots(heap, &units, &mut visit)?
+    };
+    heap.with_payload_relayout(rooted, |b| b.become_slice_of(flat));
     heap.record_write(rooted, &flat);
     Ok(())
 }
@@ -1011,31 +974,10 @@ pub fn eq_str(heap: &GcHeap, string: JsStringHandle, key: &str) -> bool {
     // per byte: a length mismatch rejects at once, and a Latin-1 body
     // compares with one `memcmp`.
     let ascii = key.is_ascii();
-    let fast = heap.read_payload(string, |b| match &b.repr {
+    let fast = heap.read_payload(string, |b| match b.repr() {
         _ if ascii && b.len as usize != key.len() => Fast::Mismatch,
-        JsStringBodyRepr::InlineLatin1(bytes) if ascii => {
-            if &bytes[..b.len as usize] == key.as_bytes() {
-                Fast::Match
-            } else {
-                Fast::Mismatch
-            }
-        }
         JsStringBodyRepr::SeqLatin1 if ascii => {
             if b.seq_latin1_bytes() == key.as_bytes() {
-                Fast::Match
-            } else {
-                Fast::Mismatch
-            }
-        }
-        JsStringBodyRepr::InlineLatin1(bytes) => {
-            let mut units = crate::wtf16_escape::units(key);
-            for &byte in &bytes[..b.len as usize] {
-                match units.next() {
-                    Some(u) if u == u16::from(byte) => {}
-                    _ => return Fast::Mismatch,
-                }
-            }
-            if units.next().is_none() {
                 Fast::Match
             } else {
                 Fast::Mismatch
@@ -1049,20 +991,6 @@ pub fn eq_str(heap: &GcHeap, string: JsStringHandle, key: &str) -> bool {
             for &byte in bytes {
                 match units.next() {
                     Some(u) if u == u16::from(byte) => {}
-                    _ => return Fast::Mismatch,
-                }
-            }
-            if units.next().is_none() {
-                Fast::Match
-            } else {
-                Fast::Mismatch
-            }
-        }
-        JsStringBodyRepr::InlineFlat(code_units) => {
-            let mut units = crate::wtf16_escape::units(key);
-            for &unit in &code_units[..b.len as usize] {
-                match units.next() {
-                    Some(u) if u == unit => {}
                     _ => return Fast::Mismatch,
                 }
             }
@@ -1294,42 +1222,32 @@ pub fn is_contiguous(heap: &GcHeap, string: JsStringHandle) -> bool {
 /// Resolve `string` to `(body holding the units, start, len)` when its code
 /// units can be read in place, or `None` when they must be materialised.
 ///
-/// Three shapes qualify. The body stores its own units contiguously. It is a
-/// slice view over one — which is what a flattened rope becomes, so the view
-/// is a range of the parent's contiguous units and needs no copy either. Or
-/// it carries a filled widened cache.
+/// Two shapes qualify. The body stores its own units contiguously. Or it is
+/// a slice view over one — which is what a flattened rope becomes, so the
+/// view is a range of the parent's contiguous units and needs no copy either.
 ///
 /// Missing the slice case is expensive in a specific way: since flattening
 /// rewrites a rope into a view, *every* read of an already-flattened rope
 /// would re-materialise the whole string, turning a `/g` regex loop over a
 /// long subject quadratic.
 fn contiguous_view(heap: &GcHeap, string: JsStringHandle) -> Option<(JsStringHandle, u32, u32)> {
-    let (own, len, parent, cache) = heap.read_payload(string, |b| {
-        let parent = match &b.repr {
-            JsStringBodyRepr::Sliced { parent, start } => Some((*parent, *start)),
-            _ => None,
-        };
-        (stores_units_inline(&b.repr), b.len, parent, b.utf16_cache)
-    });
-    if own {
-        return Some((string, 0, len));
+    let (repr, len) = heap.read_payload(string, |b| (b.repr(), b.len));
+    match repr {
+        JsStringBodyRepr::SeqFlat | JsStringBodyRepr::SeqLatin1 => Some((string, 0, len)),
+        JsStringBodyRepr::Sliced { parent, start }
+            if heap.read_payload(parent, |p| stores_units_sequentially(p.repr())) =>
+        {
+            Some((parent, start, len))
+        }
+        _ => None,
     }
-    if let Some((parent, start)) = parent
-        && heap.read_payload(parent, |p| stores_units_inline(&p.repr))
-    {
-        return Some((parent, start, len));
-    }
-    (!cache.is_null()).then_some((cache, 0, len))
 }
 
 /// Whether a body holds its own code units contiguously.
-fn stores_units_inline(repr: &JsStringBodyRepr) -> bool {
+fn stores_units_sequentially(repr: JsStringBodyRepr) -> bool {
     matches!(
         repr,
-        JsStringBodyRepr::InlineFlat(_)
-            | JsStringBodyRepr::SeqFlat
-            | JsStringBodyRepr::InlineLatin1(_)
-            | JsStringBodyRepr::SeqLatin1
+        JsStringBodyRepr::SeqFlat | JsStringBodyRepr::SeqLatin1
     )
 }
 
@@ -1340,59 +1258,6 @@ fn flat_content_range(body: &JsStringBody, start: u32, len: u32) -> Option<FlatC
         FlatContent::Latin1(bytes) => FlatContent::Latin1(&bytes[s..e]),
         FlatContent::Wide(units) => FlatContent::Wide(&units[s..e]),
     })
-}
-
-/// Fill `string`'s widened cache so later [`with_utf16`] reads are in-place.
-///
-/// Materialising a large rope or Latin-1 body into UTF-16 is O(len), and a
-/// subject re-scanned many times — a `/g` regex `exec` loop walks the same
-/// subject once per match — should pay that once. Callers that are about to
-/// re-scan a subject call this first, while they still hold `&mut GcHeap`;
-/// [`with_utf16`] itself stays a read, because widening is an allocation and
-/// its call sites hold the heap shared.
-///
-/// A no-op for short subjects, for bodies that already store their units
-/// contiguously, and for an already-filled cache.
-///
-/// # Errors
-/// Surfaces [`otter_gc::OutOfMemory`] verbatim.
-pub fn ensure_utf16_cache(
-    heap: &mut GcHeap,
-    string: JsStringHandle,
-    external_visit: &mut RootSlotVisitor<'_>,
-) -> Result<(), otter_gc::OutOfMemory> {
-    // Only a body whose wide units cannot already be read in place is worth
-    // caching, and only when it is long enough for the walk to matter.
-    let long_enough = heap.read_payload(string, |b| {
-        b.len >= UTF16_CACHE_MIN_LEN && b.utf16_cache.is_null()
-    });
-    let already_wide = contiguous_view(heap, string).is_some_and(|(target, start, len)| {
-        heap.read_payload(target, |b| {
-            matches!(
-                flat_content_range(b, start, len),
-                Some(FlatContent::Wide(_))
-            )
-        })
-    });
-    if !long_enough || already_wide {
-        return Ok(());
-    }
-    let units = materialize_utf16_vec(heap, string);
-    // Allocating the cache can collect, so the subject travels as a root and
-    // the handle we install into is the forwarded one.
-    let mut rooted = string;
-    let mut visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
-        let p = &mut rooted as *mut JsStringHandle as *mut RawGc;
-        visitor(p);
-        external_visit(visitor);
-    };
-    let widened = alloc_flat_string_body_with_roots(heap, &units, &mut visit)?;
-    heap.with_payload_relayout(rooted, |b| {
-        b.utf16_cache = widened;
-        true
-    });
-    heap.record_write(rooted, &widened);
-    Ok(())
 }
 
 /// Uncached body walk backing [`to_utf16_vec`]. Always re-materialises.
@@ -1415,14 +1280,7 @@ fn materialize_utf16_vec(heap: &GcHeap, string: JsStringHandle) -> Vec<u16> {
                 left_len: u32,
             },
         }
-        let resolved = heap.read_payload(node, |b| match &b.repr {
-            JsStringBodyRepr::InlineFlat(units) => {
-                let live = &units[..b.len as usize];
-                let s = (start as usize).min(live.len());
-                let e = s.saturating_add(length as usize).min(live.len());
-                out.extend_from_slice(&live[s..e]);
-                Resolved::Flat
-            }
+        let resolved = heap.read_payload(node, |b| match b.repr() {
             JsStringBodyRepr::SeqFlat => {
                 let units = b.seq_flat_units();
                 // Clamp the view to the body's actual length. A
@@ -1437,13 +1295,6 @@ fn materialize_utf16_vec(heap: &GcHeap, string: JsStringHandle) -> Vec<u16> {
                 out.extend_from_slice(&units[s..e]);
                 Resolved::Flat
             }
-            JsStringBodyRepr::InlineLatin1(bytes) => {
-                let live = &bytes[..b.len as usize];
-                let s = (start as usize).min(live.len());
-                let e = s.saturating_add(length as usize).min(live.len());
-                out.extend(live[s..e].iter().map(|&b| u16::from(b)));
-                Resolved::Latin1
-            }
             JsStringBodyRepr::SeqLatin1 => {
                 let bytes = b.seq_latin1_bytes();
                 let s = (start as usize).min(bytes.len());
@@ -1455,13 +1306,13 @@ fn materialize_utf16_vec(heap: &GcHeap, string: JsStringHandle) -> Vec<u16> {
                 parent,
                 start: pstart,
             } => Resolved::Sliced {
-                parent: *parent,
+                parent,
                 abs_start: pstart + start,
             },
             JsStringBodyRepr::Cons { left, right, .. } => Resolved::Cons {
-                left: *left,
-                right: *right,
-                left_len: heap.read_payload(*left, |lb| lb.len),
+                left,
+                right,
+                left_len: heap.read_payload(left, |lb| lb.len),
             },
         });
         match resolved {
@@ -1512,26 +1363,12 @@ fn to_utf16_vec_slice(heap: &GcHeap, parent: JsStringHandle, start: u32, length:
                 left_len: u32,
             },
         }
-        let resolved = heap.read_payload(node, |b| match &b.repr {
-            JsStringBodyRepr::InlineFlat(units) => {
-                let units = &units[..b.len as usize];
-                let lo = s as usize;
-                let hi = lo + l as usize;
-                out.extend_from_slice(&units[lo..hi]);
-                Resolved::Done
-            }
+        let resolved = heap.read_payload(node, |b| match b.repr() {
             JsStringBodyRepr::SeqFlat => {
                 let units = b.seq_flat_units();
                 let lo = s as usize;
                 let hi = lo + l as usize;
                 out.extend_from_slice(&units[lo..hi]);
-                Resolved::Done
-            }
-            JsStringBodyRepr::InlineLatin1(bytes) => {
-                let bytes = &bytes[..b.len as usize];
-                let lo = s as usize;
-                let hi = lo + l as usize;
-                out.extend(bytes[lo..hi].iter().map(|&b| u16::from(b)));
                 Resolved::Done
             }
             JsStringBodyRepr::SeqLatin1 => {
@@ -1545,13 +1382,13 @@ fn to_utf16_vec_slice(heap: &GcHeap, parent: JsStringHandle, start: u32, length:
                 parent,
                 start: pstart,
             } => Resolved::Sliced {
-                parent: *parent,
+                parent,
                 abs_start: pstart + s,
             },
             JsStringBodyRepr::Cons { left, right, .. } => Resolved::Cons {
-                left: *left,
-                right: *right,
-                left_len: heap.read_payload(*left, |lb| lb.len),
+                left,
+                right,
+                left_len: heap.read_payload(left, |lb| lb.len),
             },
         });
         match resolved {
@@ -1594,11 +1431,8 @@ enum FlatContent<'a> {
 /// parent body; reading those in place goes through
 /// [`sequential_utf16_view`], which can resolve the hop.
 fn flat_content(body: &JsStringBody) -> Option<FlatContent<'_>> {
-    let len = body.len as usize;
-    match &body.repr {
-        JsStringBodyRepr::InlineLatin1(buf) => Some(FlatContent::Latin1(&buf[..len])),
+    match body.repr() {
         JsStringBodyRepr::SeqLatin1 => Some(FlatContent::Latin1(body.seq_latin1_bytes())),
-        JsStringBodyRepr::InlineFlat(buf) => Some(FlatContent::Wide(&buf[..len])),
         JsStringBodyRepr::SeqFlat => Some(FlatContent::Wide(body.seq_flat_units())),
         JsStringBodyRepr::Cons { .. } | JsStringBodyRepr::Sliced { .. } => None,
     }
@@ -1833,7 +1667,7 @@ mod tests {
             .expect("inline flat");
         assert!(is_young(inline));
 
-        let sequential_units = vec![0x1234; INLINE_FLAT_CAP + 1];
+        let sequential_units = vec![0x1234; SHORT_CONCAT_FLAT + 1];
         let sequential =
             alloc_flat_string_body_with_roots(&mut heap, &sequential_units, &mut roots)
                 .expect("sequential flat");
@@ -1843,7 +1677,7 @@ mod tests {
             .expect("inline latin1");
         assert!(is_young(latin1));
 
-        let sequential_bytes = vec![b'x'; INLINE_LATIN1_CAP + 1];
+        let sequential_bytes = vec![b'x'; SHORT_CONCAT_LATIN1 + 1];
         let sequential_latin1 =
             alloc_latin1_string_body_with_roots(&mut heap, &sequential_bytes, &mut roots)
                 .expect("sequential latin1");
@@ -1882,12 +1716,12 @@ mod tests {
 
         inline_wide = alloc_flat_string_body_with_roots(&mut heap, &[0x1234], &mut roots)
             .expect("inline wide");
-        let wide_units = vec![0x2345; INLINE_FLAT_CAP + 1];
+        let wide_units = vec![0x2345; SHORT_CONCAT_FLAT + 1];
         sequential_wide = alloc_flat_string_body_with_roots(&mut heap, &wide_units, &mut roots)
             .expect("sequential wide");
         inline_latin1 = alloc_latin1_string_body_with_roots(&mut heap, b"latin1", &mut roots)
             .expect("inline latin1");
-        let latin1_bytes = vec![b'x'; INLINE_LATIN1_CAP + 1];
+        let latin1_bytes = vec![b'x'; SHORT_CONCAT_LATIN1 + 1];
         sequential_latin1 =
             alloc_latin1_string_body_with_roots(&mut heap, &latin1_bytes, &mut roots)
                 .expect("sequential latin1");
@@ -1934,27 +1768,31 @@ mod tests {
     }
 
     #[test]
-    fn contiguous_repr_tags_match_generated_code_contract() {
-        fn tag(repr: &JsStringBodyRepr) -> u8 {
-            // SAFETY: `JsStringBodyRepr` is declared `repr(C, u8)`, which
-            // stores its discriminant as the first byte for every variant.
-            unsafe { std::ptr::from_ref(repr).cast::<u8>().read() }
-        }
-
-        assert_eq!(
-            tag(&JsStringBodyRepr::InlineFlat([0; INLINE_FLAT_CAP])),
-            STRING_REPR_INLINE_FLAT
-        );
-        assert_eq!(tag(&JsStringBodyRepr::SeqFlat), STRING_REPR_SEQ_FLAT);
-        assert_eq!(
-            tag(&JsStringBodyRepr::InlineLatin1([0; INLINE_LATIN1_CAP])),
-            STRING_REPR_INLINE_LATIN1
-        );
-        assert_eq!(tag(&JsStringBodyRepr::SeqLatin1), STRING_REPR_SEQ_LATIN1);
-        assert_eq!(
-            STRING_REPR_PAYLOAD_BYTE,
-            std::mem::align_of::<JsStringBodyRepr>()
-        );
+    fn cells_hold_exactly_their_kind_payload() {
+        let mut heap = GcHeap::new().expect("heap");
+        let mut roots = empty_roots;
+        let size = |heap: &GcHeap, handle: JsStringHandle| {
+            heap.read_payload(handle, |_| ());
+            // SAFETY: the handle names a live body.
+            unsafe { (*handle.as_header_ptr()).size_bytes() }
+        };
+        let short = alloc_latin1_string_body_with_roots(&mut heap, b"key", &mut roots).unwrap();
+        assert_eq!(size(&heap, short), 32, "header, fixed part, three bytes");
+        let wide = alloc_flat_string_body_with_roots(&mut heap, &[0x100; 6], &mut roots).unwrap();
+        assert_eq!(size(&heap, wide), 40);
+        let left = alloc_latin1_string_body_with_roots(&mut heap, &[b'a'; 30], &mut roots).unwrap();
+        let cons = concat_string_bodies(
+            &mut heap,
+            left,
+            left,
+            otter_gc::SitePlacement::Young(0),
+            &mut roots,
+        )
+        .unwrap();
+        assert_eq!(size(&heap, cons), 40, "header, fixed part, two child words");
+        heap.read_payload(cons, |b| {
+            assert!(matches!(b.repr(), JsStringBodyRepr::Cons { depth: 1, .. }));
+        });
     }
 
     #[test]
@@ -1966,7 +1804,7 @@ mod tests {
             assert_eq!(b.cached_atom(), None);
             assert_eq!(b.len(), 0);
             assert!(b.is_empty());
-            assert!(matches!(b.repr, JsStringBodyRepr::InlineFlat(_)));
+            assert!(matches!(b.repr(), JsStringBodyRepr::SeqFlat));
         });
         assert!(to_utf16_vec(&heap, s).is_empty());
     }
@@ -1980,7 +1818,7 @@ mod tests {
         heap.read_payload(s, |b| {
             assert_eq!(b.len(), units.len() as u32);
             assert_eq!(b.hash, 0, "allocation never hashes");
-            assert!(matches!(b.repr, JsStringBodyRepr::SeqFlat));
+            assert!(matches!(b.repr(), JsStringBodyRepr::SeqFlat));
         });
         assert_eq!(to_utf16_vec(&heap, s), units);
     }
@@ -2016,7 +1854,7 @@ mod tests {
         .expect("cons");
         heap.read_payload(cons, |b| {
             assert_eq!(b.len(), 32);
-            assert!(matches!(b.repr, JsStringBodyRepr::Cons { .. }));
+            assert!(matches!(b.repr(), JsStringBodyRepr::Cons { .. }));
         });
         let mut expected = left_units.clone();
         expected.extend_from_slice(&right_units);
@@ -2043,7 +1881,7 @@ mod tests {
         view = slice_string_body(&mut heap, flat, 6, 20, &mut roots).expect("slice");
         heap.read_payload(view, |b| {
             assert_eq!(b.len(), 20);
-            assert!(matches!(b.repr, JsStringBodyRepr::Sliced { .. }));
+            assert!(matches!(b.repr(), JsStringBodyRepr::Sliced { .. }));
         });
         assert_eq!(to_utf16_vec(&heap, view), units[6..26]);
     }
@@ -2056,7 +1894,7 @@ mod tests {
             alloc_latin1_string_body_with_roots(&mut heap, b"hello", &mut roots).expect("latin1");
         heap.read_payload(s, |b| {
             assert_eq!(b.len(), 5);
-            assert!(matches!(b.repr, JsStringBodyRepr::InlineLatin1(_)));
+            assert!(matches!(b.repr(), JsStringBodyRepr::SeqLatin1));
         });
         let expected: Vec<u16> = b"hello".iter().map(|&b| b as u16).collect();
         assert_eq!(to_utf16_vec(&heap, s), expected);
@@ -2083,7 +1921,7 @@ mod tests {
             assert_eq!(body.len(), 30);
             assert_eq!(body.hash, 0, "slicing never hashes");
             assert!(matches!(
-                body.repr,
+                body.repr(),
                 JsStringBodyRepr::Sliced {
                     parent: actual,
                     start: 10
@@ -2124,7 +1962,7 @@ mod tests {
         .expect("latin1 parent");
         let short = slice_string_body(&mut heap, parent, 10, 5, &mut roots).expect("slice");
         heap.read_payload(short, |body| {
-            assert!(matches!(body.repr, JsStringBodyRepr::InlineLatin1(_)));
+            assert!(matches!(body.repr(), JsStringBodyRepr::SeqLatin1));
         });
         assert_eq!(
             with_latin1(&heap, short, |slice| slice.to_vec()),
@@ -2157,7 +1995,7 @@ mod tests {
         inner = slice_string_body(&mut heap, outer, 5, 30, &mut roots).expect("inner");
         heap.read_payload(inner, |body| {
             assert!(matches!(
-                body.repr,
+                body.repr(),
                 JsStringBodyRepr::Sliced {
                     parent: actual,
                     start: 15
@@ -2205,7 +2043,7 @@ mod tests {
         .expect("cons");
         flat = flatten_string_body(&mut heap, cons, &mut roots).expect("flat");
         heap.read_payload(flat, |b| {
-            assert!(matches!(b.repr, JsStringBodyRepr::InlineFlat(_)));
+            assert!(matches!(b.repr(), JsStringBodyRepr::SeqFlat));
             assert_eq!(b.len(), 3);
         });
     }

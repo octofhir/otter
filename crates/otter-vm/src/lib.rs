@@ -221,6 +221,7 @@ pub mod regexp;
 pub(crate) mod regexp_fast;
 pub(crate) mod regexp_legacy;
 pub mod regexp_prototype;
+pub(crate) mod regexp_result;
 mod register_window;
 pub mod root_census;
 #[doc(hidden)]

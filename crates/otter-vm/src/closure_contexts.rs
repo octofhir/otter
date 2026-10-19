@@ -102,9 +102,7 @@ impl ClosureContexts {
         let fact = self.facts.get(&function_id)?;
         Some(
             fact.as_ref()
-                .filter(|fact| {
-                    fact.context.load(Ordering::Relaxed) != Value::undefined().to_bits()
-                })
+                .filter(|fact| fact.context.load(Ordering::Relaxed) != Value::undefined().to_bits())
                 .map_or(0, |fact| fact.context.as_ptr() as u64),
         )
     }

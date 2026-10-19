@@ -836,6 +836,49 @@ pub(crate) fn from_values_with_roots(
     alloc_body_with_adopted_elements(heap, body, placement, external_visit)
 }
 
+/// Allocation-buffer bytes [`try_tagged_from_values_no_collect`] takes for
+/// `len` elements.
+pub(crate) fn tagged_array_cell_bytes(len: usize) -> usize {
+    let slab = if len == 0 {
+        0
+    } else {
+        GcHeap::cell_bytes::<elements::ElementSlabBody>(elements::ElementSlabBody::trailing_bytes(
+            len,
+            DenseElementKind::Tagged,
+        ))
+    };
+    GcHeap::cell_bytes::<ArrayBody>(0) + slab
+}
+
+/// A dense array of `values`, none of them a number or a hole, with tagged
+/// storage, built from the allocation buffer without collecting: the bytes
+/// the caller reserved ([`tagged_array_cell_bytes`]). The same cells
+/// [`from_values_with_roots`] makes. `None` when the buffer has no room.
+pub(crate) fn try_tagged_from_values_no_collect(
+    heap: &mut GcHeap,
+    values: &[Value],
+) -> Option<JsArray> {
+    debug_assert!(values.is_empty() || initial_dense_kind(values) == DenseElementKind::Tagged);
+    let slab = if values.is_empty() {
+        elements::ElementSlabHandle::null()
+    } else {
+        heap.try_alloc_trailing_no_collect_or_return(
+            elements::ElementSlabBody::new(values.len(), DenseElementKind::Tagged),
+            elements::ElementSlabBody::trailing_bytes(values.len(), DenseElementKind::Tagged),
+            |_| {},
+        )
+        .ok()?
+    };
+    let mut body = ArrayBody {
+        ..Default::default()
+    };
+    body.set_length(values.len());
+    body.adopt_slab(slab, 0);
+    copy_values_into(&mut body, values);
+    record_slab_contents(heap, slab, values.len());
+    heap.try_alloc_no_collect(body)
+}
+
 /// Allocate a slab sized to `values` and copy them in.
 ///
 /// The values are rooted across the allocation — they are ordinary

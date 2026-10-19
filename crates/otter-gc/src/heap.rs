@@ -1636,6 +1636,17 @@ impl GcHeap {
         self.try_alloc_no_collect_or_return(value).ok()
     }
 
+    /// Bytes a `T` cell with `extra_bytes` of trailing storage takes from an
+    /// allocation buffer: the unit [`Self::ensure_machine_allocation_with_roots`]
+    /// admits, so a group of cells reserved together is the sum of these.
+    #[must_use]
+    pub const fn cell_bytes<T: Traceable>(extra_bytes: usize) -> usize {
+        align_up(
+            std::mem::size_of::<GcHeader>() + std::mem::size_of::<T>() + extra_bytes,
+            CELL_SIZE,
+        )
+    }
+
     /// Try to allocate a `T` in young space without running any collection,
     /// returning the original payload when a safepoint-free allocation is not
     /// possible.

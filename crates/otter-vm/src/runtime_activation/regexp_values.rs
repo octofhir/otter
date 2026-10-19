@@ -10,7 +10,8 @@
 //! - The body is the method's complete semantics: receiver and argument
 //!   coercions and the `lastIndex` protocol, which may run JavaScript. An
 //!   int32 `lastIndex` and a string subject take the direct match instead,
-//!   which runs no user code and allocates only the array of an `exec` hit.
+//!   which runs no user code and allocates only the array of an `exec` hit,
+//!   folded into one reservation when the collector allows it.
 //! - No native call frame is published; a failure projects through the
 //!   calling function's source like any committed operation.
 //!
@@ -26,8 +27,8 @@ impl RuntimeCall<'_> {
     /// `receiver.exec(argument)`, or `receiver.test(argument)` when `test`.
     pub fn regexp_method(
         &mut self,
-        receiver: Value,
-        argument: Value,
+        mut receiver: Value,
+        mut argument: Value,
         test: bool,
     ) -> Result<Value, CommittedValueError> {
         // SAFETY: the bound runtime call owns exclusive access to its VM and
@@ -46,6 +47,22 @@ impl RuntimeCall<'_> {
                 let has_indices = receiver
                     .as_regexp()
                     .is_some_and(|regexp| regexp.flags(&vm.gc_heap).has_indices);
+                if !has_indices {
+                    match crate::regexp_result::build_match_result_folded(
+                        vm,
+                        &mut receiver,
+                        &mut argument,
+                        &matched,
+                    ) {
+                        Ok(Some(result)) => return Ok(result),
+                        Ok(None) => {}
+                        Err(error) => {
+                            let error =
+                                crate::native_function::vm_to_native_error(vm, error, "RegExp");
+                            return Err(project(vm, stack, error));
+                        }
+                    }
+                }
                 let result = crate::call_ops::with_frame_native_ctx(
                     vm,
                     stack,

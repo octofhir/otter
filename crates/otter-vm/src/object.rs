@@ -3279,6 +3279,44 @@ pub(crate) fn alloc_object_with_shape_and_values_roots(
     )
 }
 
+/// An object of `shape` holding `values` in its in-object slots, built from
+/// the allocation buffer without collecting: the bytes the caller reserved
+/// ([`object_cell_bytes`] of the shape's in-object capacity). The cell
+/// [`alloc_object_with_shape_and_values_roots`] makes, its field types seeded
+/// the same way. `None` when the values do not all fit in object or the
+/// buffer has no room.
+pub(crate) fn try_alloc_object_with_values_no_collect(
+    heap: &mut GcHeap,
+    shape: ShapeHandle,
+    values: &[Value],
+) -> Option<JsObject> {
+    debug_assert_eq!(
+        shape_property_count(shape, heap) as usize,
+        values.len(),
+        "shape slot count and initialization values diverged"
+    );
+    let capacity = shape_body::inline_capacity_of(shape);
+    if values.len() > capacity {
+        return None;
+    }
+    let PendingObject { body } = empty_object_body(shape);
+    heap.try_alloc_trailing_no_collect_or_return(
+        body,
+        FieldLocation::words_bytes(capacity),
+        |body| {
+            body.init_cell();
+            for index in 0..capacity {
+                let value = values.get(index).copied().unwrap_or_else(Value::undefined);
+                unsafe {
+                    *FieldLocation::inline(index as u32).word_ptr(body.inline_values_ptr()) = value
+                };
+            }
+            body.seed_field_types(values.len());
+        },
+    )
+    .ok()
+}
+
 /// Install `shape` on a fresh, slotless object together with a value for
 /// every slot it names, in shape order, reserving room for `capacity` slots.
 ///

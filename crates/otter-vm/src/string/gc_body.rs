@@ -705,6 +705,47 @@ pub fn slice_string_body(
     }
 }
 
+/// Allocation-buffer bytes [`try_substring_no_collect`] takes.
+pub(crate) const SUBSTRING_CELL_BYTES: usize = GcHeap::cell_bytes::<JsStringBody>(0);
+
+/// `length` units at `start` of `string`, which reads contiguously, in one
+/// cell taken from the allocation buffer without collecting: the bytes the
+/// caller reserved ([`SUBSTRING_CELL_BYTES`]). Like [`slice_view`], short
+/// units are copied inline and longer ones viewed in place. `None` when the
+/// string does not read contiguously or the buffer has no room.
+pub(crate) fn try_substring_no_collect(
+    heap: &mut GcHeap,
+    string: JsStringHandle,
+    start: u32,
+    length: u32,
+) -> Option<JsStringHandle> {
+    let (parent, base, _) = contiguous_view(heap, string)?;
+    let start = base.checked_add(start)?;
+    let repr = heap.read_payload(parent, |body| {
+        Some(match flat_content_range(body, start, length)? {
+            FlatContent::Latin1(bytes) if bytes.len() <= INLINE_LATIN1_CAP => {
+                let mut inline = [0u8; INLINE_LATIN1_CAP];
+                inline[..bytes.len()].copy_from_slice(bytes);
+                JsStringBodyRepr::InlineLatin1(inline)
+            }
+            FlatContent::Wide(units) if units.len() <= INLINE_FLAT_CAP => {
+                let mut inline = [0u16; INLINE_FLAT_CAP];
+                inline[..units.len()].copy_from_slice(units);
+                JsStringBodyRepr::InlineFlat(inline)
+            }
+            _ => JsStringBodyRepr::Sliced { parent, start },
+        })
+    })?;
+    heap.try_alloc_no_collect(JsStringBody {
+        map: otter_gc::cell_map::TypeMap::NEW,
+        atom: 0,
+        len: length,
+        hash: 0,
+        repr,
+        utf16_cache: JsStringHandle::null(),
+    })
+}
+
 /// `length` units at `start` of the contiguous `parent`: copied into an
 /// inline body when they fit one, otherwise a view sharing the parent.
 fn slice_view(

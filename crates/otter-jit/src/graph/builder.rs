@@ -3840,6 +3840,7 @@ impl<'a> Builder<'a> {
                 byte_pc,
                 target: 0,
                 receiver_proved: false,
+                cell_read: reads_method_cell(method),
             },
             &[receiver],
             Repr::Tagged,
@@ -3883,6 +3884,7 @@ impl<'a> Builder<'a> {
                 byte_pc,
                 target: 0,
                 receiver_proved: true,
+                cell_read: reads_method_cell(method),
             },
             &[object],
             Repr::Tagged,
@@ -4291,6 +4293,7 @@ impl<'a> Builder<'a> {
                     byte_pc,
                     target: 0,
                     receiver_proved,
+                    cell_read: method.is_some_and(reads_method_cell),
                 },
                 &[receiver],
                 Repr::Tagged,
@@ -4374,6 +4377,7 @@ impl<'a> Builder<'a> {
                     byte_pc,
                     target: index as u8,
                     receiver_proved: true,
+                    cell_read: reads_method_cell(method),
                 },
                 &[receiver],
                 Repr::Tagged,
@@ -4977,4 +4981,10 @@ impl<'a> Builder<'a> {
             value,
         );
     }
+}
+
+/// Whether the guarded load of `method` reads its code-retained method cell
+/// rather than the holder's slot.
+fn reads_method_cell(method: &otter_vm::jit::JitDirectMethod) -> bool {
+    method.guard.method_cell != 0 && method.guard.accessor_byte.is_none()
 }

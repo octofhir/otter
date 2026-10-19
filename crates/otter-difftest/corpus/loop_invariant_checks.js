@@ -2,7 +2,9 @@
 // variables read in hot loops, a closure variable that later names another
 // kind of array, a loop that writes the closure variable it reads, plain
 // arrays that turn holey or double, a loop that adds properties to the
-// object it reads, and bitwise operators on comparison results.
+// object it reads, bitwise operators on comparison results, and prototype
+// methods read in loops that store fields, widen a field's type, or replace
+// the method directly or through a call.
 let heap = new Int32Array(256);
 for (let i = 0; i < heap.length; i++) heap[i] = i * 3;
 function sumHeap(n) { let s = 0; for (let i = 0; i < n; i++) s = (s + heap[i & 255]) | 0; return s; }
@@ -40,4 +42,26 @@ function flags(a, b, n) {
 }
 const small = new Uint8Array(16).map((_, i) => i * 7);
 for (let r = 0; r < 300; r++) total = (total + flags(small, r & 31, 64)) | 0;
+function Cell(v) { this.v = v; this.out = 0; }
+Cell.prototype.step = function () { return this.v + 1; };
+function replaceStep() { Cell.prototype.step = function () { return this.v + 2; }; }
+function stepping(cells, n, swap, direct) {
+  let s = 0;
+  for (let i = 0; i < n; i++) {
+    const c = cells[i % cells.length];
+    c.out = c.step();
+    s += c.out;
+    if (i === swap) {
+      if (direct) Cell.prototype.step = function () { return this.v * 3; };
+      else replaceStep();
+    }
+    if (i === swap + 1) c.v = 0.5;
+  }
+  return s;
+}
+for (let r = 0; r < 200; r++) {
+  Cell.prototype.step = function () { return this.v + 1; };
+  const cells = [new Cell(1), new Cell(2), new Cell(3)];
+  total += stepping(cells, 60, r > 150 ? 30 : -1, (r & 1) === 0);
+}
 console.log(total);

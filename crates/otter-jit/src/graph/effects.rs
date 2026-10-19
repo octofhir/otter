@@ -70,6 +70,14 @@ pub(crate) enum AbstractHeap {
     Frame,
     /// The dependency flag of the generation and the facts it subscribes to.
     Dependencies,
+    /// The watched field types of shapes: an own-field store may widen one.
+    FieldTypes,
+    /// Structural facts: prototype chains, holder slots and the stability
+    /// of shapes. Only an appending store or the runtime changes them; an
+    /// in-graph store never writes a prototype-role object.
+    ChainFacts,
+    /// Watched context slots, which a context write may change.
+    ContextFacts,
     /// Where movable storage lives; a collection rewrites it.
     Movement,
 }
@@ -81,6 +89,7 @@ impl AbstractHeap {
         Some(match self {
             Self::World => return None,
             Self::Heap | Self::Frame | Self::Dependencies | Self::Movement => Self::World,
+            Self::FieldTypes | Self::ChainFacts | Self::ContextFacts => Self::Dependencies,
             Self::Field(_) => Self::Fields,
             Self::ContextSlot(_) => Self::ContextSlots,
             Self::Fields
@@ -352,13 +361,21 @@ fn heap_effects(kind: &Kind) -> Effects {
         Kind::LoadFunctionBag => Effects::reads(&[H::FunctionBags]),
         Kind::LoadNamedProperty { .. } => Effects::reads(&[H::Heap, H::Dependencies]),
         Kind::LoadGuardedMethod {
-            receiver_proved, ..
+            receiver_proved,
+            cell_read,
+            ..
         } => {
-            let heaps = [H::Heap, H::Dependencies];
+            // A method a code-retained cell holds is fixed while the chain
+            // facts hold; otherwise the holder's slot is read.
+            let heaps: &[H] = match (*cell_read, *receiver_proved) {
+                (true, true) => &[H::ChainFacts],
+                (true, false) => &[H::MapWords, H::ChainFacts],
+                (false, _) => &[H::Heap, H::ChainFacts],
+            };
             if *receiver_proved {
-                Effects::deref(&heaps)
+                Effects::deref(heaps)
             } else {
-                Effects::reads(&heaps)
+                Effects::reads(heaps)
             }
         }
         Kind::LoadGlobalBinding(_) => Effects::reads(&[H::Fields, H::MapWords]),
@@ -371,22 +388,24 @@ fn heap_effects(kind: &Kind) -> Effects {
         | Kind::LoadActualArgument
         | Kind::SelectArgument { .. }
         | Kind::CheckArgumentsElided => Effects::reads(&[H::Frame]),
-        Kind::CheckFieldTypes(_)
-        | Kind::CheckContextSlot { .. }
-        | Kind::CheckStableShapes(_)
-        | Kind::CheckDependencies => Effects::reads(&[H::Dependencies]),
+        Kind::CheckFieldTypes(_) => Effects::reads(&[H::FieldTypes]),
+        Kind::CheckContextSlot { .. } => Effects::reads(&[H::ContextFacts]),
+        Kind::CheckStableShapes(_) => Effects::reads(&[H::ChainFacts]),
+        Kind::CheckDependencies => Effects::reads(&[H::Dependencies]),
         // Stores. A store into an existing field may change a watched field
-        // type; an appending store also publishes a child shape.
+        // type; an appending store also publishes a child shape and ends the
+        // stability of the shape it leaves.
         Kind::StoreOwnField { atom, .. } => {
-            Effects::writes(&[], &[H::Field(*atom), H::Dependencies])
+            Effects::writes(&[], &[H::Field(*atom), H::FieldTypes])
         }
-        Kind::StoreNamedProperty { .. } => {
-            Effects::writes(&[H::MapWords], &[H::Fields, H::MapWords, H::Dependencies])
-        }
+        Kind::StoreNamedProperty { .. } => Effects::writes(
+            &[H::MapWords],
+            &[H::Fields, H::MapWords, H::FieldTypes, H::ChainFacts],
+        ),
         Kind::StoreTaggedField(offset) => Effects::writes(&[], &[H::ContextSlot(*offset)]),
         Kind::StoreBodySlot(_) => Effects::writes(&[H::MapWords], &[H::BodySlots]),
         Kind::StoreElement(_) => Effects::writes(&[], &[H::Elements]),
-        Kind::NoteContextWrite(_) => Effects::writes(&[], &[H::Dependencies]),
+        Kind::NoteContextWrite(_) => Effects::writes(&[], &[H::ContextFacts]),
         // Remembered-set bookkeeping no program reads.
         Kind::WriteBarrier | Kind::ElementWriteBarrier => Effects::default(),
         // Allocation: a fresh cell no earlier load could have read, and a
@@ -445,5 +464,45 @@ mod tests {
         assert!(!set.overlaps(H::MapWords));
         set.add(H::World);
         assert!(set.is_world());
+    }
+
+    #[test]
+    fn a_cell_method_load_commutes_with_field_stores_but_not_appends() {
+        let method = clobberize(&Kind::LoadGuardedMethod {
+            byte_pc: 0,
+            target: 0,
+            receiver_proved: true,
+            cell_read: true,
+        });
+        let slot_method = clobberize(&Kind::LoadGuardedMethod {
+            byte_pc: 0,
+            target: 0,
+            receiver_proved: true,
+            cell_read: false,
+        });
+        let writes = |kind: &Kind| {
+            let mut set = HeapSet::default();
+            for heap in clobberize(kind).writes {
+                set.add(heap);
+            }
+            set
+        };
+        let overwrite = writes(&Kind::StoreOwnField {
+            field: otter_vm::object::FieldLocation::inline(0),
+            atom: 7,
+            owners: Default::default(),
+        });
+        assert!(!method.reads_overlap(&overwrite));
+        assert!(slot_method.reads_overlap(&overwrite));
+        // A field-type check still sees the overwrite.
+        assert!(clobberize(&Kind::CheckFieldTypes(Default::default())).reads_overlap(&overwrite));
+        let append = writes(&Kind::StoreNamedProperty {
+            byte_pc: 0,
+            owners: Default::default(),
+            receiver_shape: None,
+            fresh: false,
+        });
+        assert!(method.reads_overlap(&append));
+        assert!(clobberize(&Kind::CheckDependencies).reads_overlap(&overwrite));
     }
 }

@@ -27,6 +27,9 @@
 //!   only less fast.
 //! - Recording happens only while a JIT hook is installed; interpreter-only
 //!   execution never touches these cells.
+//! - A call site's executions and its function's interpreted entries are
+//!   counted by the same interpreter, so their ratio is the site's calls per
+//!   entry while the function was interpreted.
 //! - The vector's feedback epoch advances once per material state transition,
 //!   never for an already-recorded observation. Ordinary-call target population
 //!   changes advance that epoch; installed code retains its live identity guards
@@ -930,6 +933,9 @@ pub struct FeedbackVector {
     cells: Box<[InstructionFeedback]>,
     typed_slots: Box<[TypedFeedbackSlot]>,
     epoch: AtomicU32,
+    /// Interpreted entries of the function, the denominator of its call
+    /// sites' frequencies: the interpreter counts both on one mutator.
+    entries: AtomicU32,
 }
 
 impl FeedbackVector {
@@ -971,6 +977,7 @@ impl FeedbackVector {
                 .collect::<Vec<_>>()
                 .into_boxed_slice(),
             epoch: AtomicU32::new(0),
+            entries: AtomicU32::new(0),
         }
     }
 
@@ -992,6 +999,7 @@ impl FeedbackVector {
             cells: cells.into_boxed_slice(),
             typed_slots: typed_slots.into_boxed_slice(),
             epoch: AtomicU32::new(0),
+            entries: AtomicU32::new(0),
         })
     }
 
@@ -1140,6 +1148,31 @@ impl FeedbackVector {
             .construct_family
             .store(next, Ordering::Release);
         self.bump_epoch();
+    }
+
+    /// Count one interpreted entry of the function on the isolate mutator.
+    #[inline]
+    pub(crate) fn note_entry(&self) {
+        let entries = self.entries.load(Ordering::Relaxed);
+        self.entries
+            .store(entries.saturating_add(1), Ordering::Relaxed);
+    }
+
+    /// How many times per interpreted entry of the function the call at
+    /// `index` ran: its observed executions over the function's entries.
+    /// A site without monomorphic or polymorphic call feedback, or a
+    /// function never entered, has none.
+    #[must_use]
+    pub(crate) fn call_frequency(&self, index: usize) -> Option<f32> {
+        let entries = self.entries.load(Ordering::Relaxed);
+        let hits: u64 = match self.call_slot(index)?.distribution()? {
+            CallSiteDistribution::Mono(target) => u64::from(target.hits),
+            CallSiteDistribution::Poly(targets) => {
+                targets.iter().map(|target| u64::from(target.hits)).sum()
+            }
+            CallSiteDistribution::Megamorphic => return None,
+        };
+        (entries != 0).then(|| (hits as f64 / f64::from(entries)) as f32)
     }
 
     /// Current monotonic epoch of material feedback transitions.

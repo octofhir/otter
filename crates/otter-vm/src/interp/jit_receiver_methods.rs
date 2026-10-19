@@ -68,7 +68,15 @@ impl Interpreter {
             })
             .collect();
         for (byte_pc, target) in targets {
-            if let Ok(method) = self.bake_one_direct_method(context, &target, 0, 1, tier, budget) {
+            if let Ok(method) = self.bake_one_direct_method(
+                context,
+                &target,
+                0,
+                1,
+                tier,
+                budget,
+                view.call_frequencies.get(&byte_pc).copied(),
+            ) {
                 view.direct_methods.insert(byte_pc, vec![method]);
             }
         }

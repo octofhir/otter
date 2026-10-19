@@ -50,7 +50,7 @@ impl Interpreter {
         }
         let method_view = match body {
             Some(body) => body,
-            None => self.bake_inline_body(context, target.method_fid, tier, budget, None)?,
+            None => self.bake_inline_body(context, target.method_fid, tier, budget, None, None)?,
         };
         // Resolve every body `LoadProperty`/`StoreProperty` to a logical own
         // field; bail out if a property is absent or an accessor. The shape

@@ -585,8 +585,9 @@ pub const DEFAULT_TIMEOUT: Duration = Duration::ZERO;
 /// Default JS call-stack limit.
 pub const DEFAULT_MAX_STACK_DEPTH: u32 = 1024;
 
-/// Default number of threads an isolate compiles optimized code on.
-pub const DEFAULT_JIT_COMPILE_THREADS: usize = 1;
+/// Default number of threads an isolate compiles optimized code on, at
+/// most: they start as compilations queue up.
+pub const DEFAULT_JIT_COMPILE_THREADS: usize = 4;
 
 /// Pause records a traced runtime holds between two runs' results.
 const GC_TRACE_RECORDS: usize = 65_536;

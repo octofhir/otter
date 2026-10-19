@@ -649,6 +649,8 @@ impl CodeBlock {
             direct_constructs: rustc_hash::FxHashMap::default(),
             direct_methods: rustc_hash::FxHashMap::default(),
             inline_callees: rustc_hash::FxHashMap::default(),
+            call_frequencies: rustc_hash::FxHashMap::default(),
+            optimized_inlined_instructions: 0,
             inline_methods: rustc_hash::FxHashMap::default(),
             inline_poly_methods: rustc_hash::FxHashMap::default(),
             guarded_method_calls: rustc_hash::FxHashMap::default(),
@@ -848,6 +850,18 @@ impl CodeBlock {
         self.feedback.bump_epoch();
     }
 
+    /// Count one interpreted entry of this function.
+    #[inline]
+    pub(crate) fn note_interpreted_entry(&self) {
+        self.feedback.note_entry();
+    }
+
+    /// Calls per interpreted entry of the call at one canonical instruction.
+    #[must_use]
+    pub(crate) fn call_frequency_at(&self, index: usize) -> Option<f32> {
+        self.feedback.call_frequency(index)
+    }
+
     /// Bounded ordinary-call distribution at one canonical instruction.
     #[must_use]
     pub(crate) fn call_distribution_at(
@@ -934,6 +948,13 @@ impl CodeBlock {
         self.bytecode_byte_len
     }
 
+    /// Number of bytecode instructions, the unit of inlining budgets: the
+    /// encoded length weighs operand widths a compiled body does not pay.
+    #[must_use]
+    pub fn instruction_count(&self) -> u32 {
+        u32::try_from(self.code.len()).expect("instruction count fits the schema")
+    }
+
     /// `true` when this function is an arrow function.
     #[must_use]
     pub const fn is_arrow(&self) -> bool {
@@ -973,11 +994,11 @@ impl CodeBlock {
 
     /// Whether an optimizing caller may build this body in place of a call:
     /// without handlers and at most
-    /// [`crate::jit::JIT_MAX_INLINED_BYTECODE_BYTES`] long. Its callers
+    /// [`crate::jit::JIT_MAX_INLINED_INSTRUCTIONS`] long. Its callers
     /// prepare inline snapshots only for such bodies.
     #[must_use]
     pub fn admits_graph_inlining(&self) -> bool {
-        self.bytecode_byte_len <= crate::jit::JIT_MAX_INLINED_BYTECODE_BYTES
+        self.instruction_count() <= crate::jit::JIT_MAX_INLINED_INSTRUCTIONS
             && self.control_flow().handlers().is_empty()
     }
 

@@ -165,7 +165,6 @@ impl Builder<'_> {
         let analysis = self.analysis.clone();
         // States are cached by PC, and the loop revisits these PCs.
         let states = std::mem::take(&mut self.eager_states);
-        let inlined_bytes = self.inlined_bytes;
         self.peel = Some(PeelPass {
             header,
             offset,
@@ -177,7 +176,6 @@ impl Builder<'_> {
             }
         }
         self.peel = None;
-        self.inlined_bytes = inlined_bytes;
         self.eager_states = states;
     }
 

@@ -2092,6 +2092,37 @@ impl GcHeap {
         self.alloc_old_with_roots_inner(value, true, extra_bytes, external_visit, |_| {})
     }
 
+    /// Allocate a `T` followed by `extra_bytes` of zeroed trailing storage
+    /// directly in old space without running any collection, then let
+    /// `initialize` fill it in its final cell.
+    ///
+    /// For mutations that must not move the caller's unrooted handles. The
+    /// cell is booked against the cap without being refused by it; the next
+    /// collecting allocation enforces the cap and the old-generation limit.
+    ///
+    /// # Errors
+    ///
+    /// [`OutOfMemory::CageExhausted`] if no in-cage page can satisfy the
+    /// allocation.
+    pub fn alloc_old_trailing_no_collect<T: Traceable>(
+        &mut self,
+        value: T,
+        extra_bytes: usize,
+        initialize: impl FnOnce(&mut T),
+    ) -> Result<Gc<T>, OutOfMemory> {
+        let mut empty = |_visitor: &mut dyn FnMut(*mut RawGc)| {};
+        let out =
+            self.alloc_old_with_roots_inner(value, false, extra_bytes, &mut empty, initialize)?;
+        if self.max_heap_bytes != 0 {
+            let aligned = align_up(
+                std::mem::size_of::<GcHeader>() + std::mem::size_of::<T>() + extra_bytes,
+                CELL_SIZE,
+            );
+            self.tracked_bytes = self.tracked_bytes.saturating_add(aligned as u64);
+        }
+        Ok(out)
+    }
+
     /// Allocate a diagnostic object directly in old-space without
     /// refusing on [`OutOfMemory::HeapCapExceeded`].
     ///

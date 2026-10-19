@@ -185,6 +185,7 @@ pub(crate) fn ordinary_named_lookup_guard() -> crate::jit::JitBodyGuard {
         byte: CLOSURE_NAMED_LOOKUP_BYTE,
         width: crate::jit::JitGuardWidth::Byte,
         expect: u32::from(CLOSURE_LOOKUP_ORDINARY),
+        mask: crate::jit::JitBodyGuard::WHOLE,
     }
 }
 

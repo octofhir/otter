@@ -145,6 +145,94 @@ impl Interpreter {
         self.allocate_array_in_active_realm(elements, placement)
     }
 
+    /// The shared slab of the array-literal boilerplate constant `idx` in the
+    /// chunk that owns `function_id`, built once: its strings are allocated
+    /// old, so the slab never holds a young edge and is never written.
+    pub(crate) fn array_boilerplate_slab(
+        &mut self,
+        context: &crate::ExecutionContext,
+        function_id: u32,
+        idx: u32,
+    ) -> Result<crate::array::elements::ElementSlabHandle, VmError> {
+        use otter_bytecode::BoilerplateElement;
+        let (key, elements) = context
+            .array_boilerplate_for_function(function_id, idx)
+            .ok_or(VmError::InvalidOperand)?;
+        if let Some(slab) = self.array_boilerplates.get(&key) {
+            return Ok(*slab);
+        }
+        let _roots = self.scope_runtime_roots_guard();
+        let mut values: Vec<Value> = Vec::with_capacity(elements.len());
+        for element in elements {
+            let value = match element {
+                BoilerplateElement::Number { bits } => {
+                    Value::number(crate::number::NumberValue::from_f64(f64::from_bits(*bits)))
+                }
+                BoilerplateElement::String { utf16 } => {
+                    let made = &values;
+                    let mut visit = |visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
+                        for value in made {
+                            value.trace_value_slots(visitor);
+                        }
+                    };
+                    let string = crate::string::gc_body::alloc_old_flat_string_body_with_roots(
+                        &mut self.gc_heap,
+                        utf16,
+                        &mut visit,
+                    )?;
+                    Value::string_gc(string)
+                }
+                BoilerplateElement::Boolean { value } => Value::boolean(*value),
+                BoilerplateElement::Null => Value::null(),
+                BoilerplateElement::Undefined => Value::undefined(),
+                BoilerplateElement::Hole => Value::hole(),
+            };
+            values.push(value);
+        }
+        let kind = crate::array::boilerplate_kind(&values);
+        let made = &values;
+        let mut visit = |visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
+            for value in made {
+                value.trace_value_slots(visitor);
+            }
+        };
+        let slab = crate::array::elements::alloc_shared_slab(
+            &mut self.gc_heap,
+            &values,
+            kind,
+            &mut visit,
+        )?;
+        self.array_boilerplates.insert(key, slab);
+        Ok(slab)
+    }
+
+    /// A fresh array of the boilerplate constant `idx`, sharing its slab.
+    pub(crate) fn allocate_array_boilerplate_value(
+        &mut self,
+        context: &crate::ExecutionContext,
+        function_id: u32,
+        idx: u32,
+        placement: SitePlacement,
+    ) -> Result<Value, VmError> {
+        let slab = self.array_boilerplate_slab(context, function_id, idx)?;
+        let allocate = move |vm: &mut Self| {
+            let _roots = vm.scope_runtime_roots_guard();
+            let prototype = vm.current_array_prototype_override();
+            let mut visit = |visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
+                if let Some(prototype) = &prototype {
+                    prototype.trace_value_slots(visitor);
+                }
+            };
+            let array =
+                crate::array::from_shared_slab(&mut vm.gc_heap, slab, placement, &mut visit)?;
+            Ok(Value::array(vm.register_array_prototype_override(array)?))
+        };
+        match self.foreign_function_realm(function_id) {
+            Some(realm) => self.with_host_realm_id(realm, allocate),
+            None => allocate(self),
+        }
+    }
+
     pub(crate) fn allocate_object_in_active_realm(&mut self) -> Result<Value, VmError> {
         let prototype = self.object_prototype_object_opt();
         let root = self.object_root(

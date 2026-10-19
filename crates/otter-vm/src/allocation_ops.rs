@@ -1091,6 +1091,21 @@ impl Interpreter {
         Ok(Value::object(object))
     }
 
+    pub(crate) fn run_new_array_boilerplate_reg(
+        &mut self,
+        context: &ExecutionContext,
+        frame: &mut Frame,
+        dst: u16,
+        idx: u32,
+        placement: otter_gc::SitePlacement,
+    ) -> Result<(), VmError> {
+        let value =
+            self.allocate_array_boilerplate_value(context, frame.function_id, idx, placement)?;
+        write_register(frame, dst, value)?;
+        frame.advance_pc()?;
+        Ok(())
+    }
+
     pub(crate) fn run_load_regexp_reg(
         &mut self,
         context: &ExecutionContext,

@@ -4011,7 +4011,10 @@ impl<'a> Codegen<'a> {
                 dynasm!(self.ops ; .arch aarch64 ; ldr x17, [X(receiver), byte])
             }
         }
-        if guard.expect == 0 {
+        if let Some(bit) = guard.tested_bit() {
+            debug_assert_eq!(guard.expect, 0);
+            dynasm!(self.ops ; .arch aarch64 ; tbnz x17, bit, =>exit);
+        } else if guard.expect == 0 {
             dynasm!(self.ops ; .arch aarch64 ; cbnz x17, =>exit);
         } else if guard.expect < 4096 {
             dynasm!(self.ops ; .arch aarch64 ; cmp x17, guard.expect ; b.ne =>exit);

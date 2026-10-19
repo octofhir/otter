@@ -2176,6 +2176,21 @@ impl Interpreter {
                         self.run_new_array_operands(&mut *stack, top_idx, placement, operands)?;
                         continue 'activation;
                     }
+                    Op::NewArrayBoilerplate => {
+                        let dst = instr.reg(0);
+                        let boilerplate = instr.const_word(1);
+                        let placement =
+                            self.literal_site_placement(function.allocation_site_at(idx));
+                        let frame = &mut (*top_frame!());
+                        self.run_new_array_boilerplate_reg(
+                            context,
+                            frame,
+                            dst,
+                            boilerplate,
+                            placement,
+                        )?;
+                        continue 'activation;
+                    }
                     Op::NewObjectLiteral => {
                         let operands = function.operand_view(instr);
                         let placement =

@@ -46,6 +46,7 @@ mod expando;
 mod indexed_snapshot;
 
 pub(crate) use dense_guard::element_family as dense_element_family;
+pub(crate) use dense_guard::{DENSE_OWN_GUARD_EXOTIC, DENSE_OWN_GUARD_SHARED};
 pub(crate) use dense_push::try_push_spare;
 pub(crate) use elements::DenseElementKind;
 pub(crate) use expando::{ArrayPropertyKey, classify_property_key, expando_object, own_indices};
@@ -199,10 +200,18 @@ impl ArrayBody {
     #[inline]
     pub(crate) fn refresh_element_cache(&self) {
         self.elements_ptr.set(elements::data_base(self.slab));
-        self.dense_cap
-            .set(u32::try_from(elements::capacity_of(self.slab)).unwrap_or(u32::MAX));
+        self.dense_cap.set(self.writable_capacity());
         self.dense_kind.set(elements::kind_of(self.slab) as u8);
         self.refresh_dense_own_guard();
+    }
+
+    /// Values the slab can hold for this array's writes: none while the slab
+    /// is a shared boilerplate, so every growth check copies it out first.
+    fn writable_capacity(&self) -> u32 {
+        if elements::is_shared(self.slab) {
+            return 0;
+        }
+        u32::try_from(elements::capacity_of(self.slab)).unwrap_or(u32::MAX)
     }
 
     /// Debug verifier for the always-current element cache: the cached
@@ -212,7 +221,7 @@ impl ArrayBody {
     pub(crate) fn element_cache_is_current(&self) -> bool {
         let slab_len = elements::len_of(self.slab);
         self.elements_ptr.get() == elements::data_base(self.slab)
-            && self.dense_cap.get() as usize == elements::capacity_of(self.slab)
+            && self.dense_cap.get() == self.writable_capacity()
             && self.dense_len.get() as usize == slab_len
             && self.dense_kind() == elements::kind_of(self.slab)
             && self.dense_own_guard.get() == self.current_dense_own_guard()
@@ -908,6 +917,11 @@ fn slab_from_values(
     elements::alloc_element_slab(heap, count, kind, placement, &mut visit)
 }
 
+/// Dense kind of a boilerplate slab holding `values`.
+pub(crate) fn boilerplate_kind(values: &[Value]) -> DenseElementKind {
+    initial_dense_kind(values)
+}
+
 fn initial_dense_kind(values: &[Value]) -> DenseElementKind {
     let mut saw_hole = false;
     for value in values {
@@ -1243,6 +1257,9 @@ pub(crate) fn set_plain_dense_slot(
     value: Value,
     allow_hole: bool,
 ) -> bool {
+    if ensure_private_elements(arr, heap).is_err() {
+        return false;
+    }
     let stored = heap.with_payload(arr, |body| {
         if !body.exotic.is_null() {
             return false;
@@ -1646,6 +1663,7 @@ pub fn set_length(
         return Ok(());
     }
     if new_len < cur {
+        ensure_private_elements(arr, heap)?;
         heap.with_payload(arr, |body| {
             body.set_length(new_len);
             body_elements_truncate(body, new_len);
@@ -1716,6 +1734,7 @@ pub(crate) fn set_length_checked(
         set_length(arr, heap, new_len)?;
         return Ok(true);
     }
+    ensure_private_elements(arr, heap)?;
     let ok = heap.with_payload(arr, |body| {
         // §10.4.2.4 deletes from `cur - 1` down to `new_len`, stopping at
         // the highest non-configurable index. Only *present* indices can
@@ -1862,6 +1881,7 @@ fn truncate_array_body_to(body: &mut ArrayBody, len: usize) {
 /// runs. Never allocates: the buffer only shrinks.
 #[must_use]
 pub(crate) fn dense_shift(arr: JsArray, heap: &mut otter_gc::GcHeap) -> Value {
+    ensure_private_elements(arr, heap).expect("copying shared array elements");
     heap.with_payload(arr, |body| {
         debug_assert!(body.exotic.is_null(), "dense shift over an exotic array");
         if body.dense_len() == 0 {
@@ -1944,6 +1964,7 @@ pub(crate) fn is_fully_dense(arr: JsArray, heap: &otter_gc::GcHeap) -> bool {
 /// and for slots that hold the internal hole sentinel.
 #[must_use]
 pub fn pop(arr: JsArray, heap: &mut otter_gc::GcHeap) -> Value {
+    ensure_private_elements(arr, heap).expect("copying shared array elements");
     heap.with_payload(arr, |body| {
         if body.length() == 0 {
             return Value::undefined();
@@ -2099,6 +2120,7 @@ pub(crate) fn set_index_accessor(
         }
     };
     ensure_exotic(&mut arr, heap, &mut roots)?;
+    ensure_private_elements(arr, heap)?;
     heap.with_payload(arr, |body| {
         body.exotic_mut()
             .accessors
@@ -2148,6 +2170,7 @@ pub(crate) fn delete_index_property(arr: JsArray, heap: &mut GcHeap, index: u32)
     if !can_delete_index_property(arr, heap, index) {
         return false;
     }
+    ensure_private_elements(arr, heap).expect("copying shared array elements");
     heap.with_payload(arr, |body| delete_array_body_index(body, index as usize));
     true
 }
@@ -2439,6 +2462,7 @@ pub(crate) fn with_elements_rewrite<R>(
     heap: &mut otter_gc::GcHeap,
     f: impl FnOnce(&mut [Value]) -> R,
 ) -> R {
+    ensure_private_elements(arr, heap).expect("copying shared array elements");
     let (out, children) = heap.with_payload(arr, |body| {
         let (out, children) = if let Some(slab) = body.slab_body_mut() {
             slab.convert_to_tagged();
@@ -2576,7 +2600,11 @@ fn reserve_dense_capacity(
     if target_len <= current_capacity {
         return Ok(());
     }
-    let grown = target_len.max(current_capacity.saturating_mul(2)).max(4);
+    // A shared slab reports no capacity, but its whole live prefix moves.
+    let grown = target_len
+        .max(live_len)
+        .max(current_capacity.saturating_mul(2))
+        .max(4);
     let target_kind = match (current_kind, preferred_kind) {
         (DenseElementKind::Tagged, _) | (_, DenseElementKind::Tagged) => DenseElementKind::Tagged,
         (DenseElementKind::Empty, preferred) => preferred,
@@ -2625,6 +2653,57 @@ fn reserve_dense_capacity(
     heap.record_write(owner, &slab);
     record_slab_contents(heap, slab, live_len);
     Ok(())
+}
+
+/// Give `arr` private dense storage before an in-place write when it still
+/// shares a literal site's boilerplate slab. Never collects: the caller's
+/// handles stay valid.
+///
+/// # Errors
+///
+/// Returns [`otter_gc::OutOfMemory`] when no page can hold the copy.
+pub(crate) fn ensure_private_elements(
+    arr: JsArray,
+    heap: &mut otter_gc::GcHeap,
+) -> Result<(), otter_gc::OutOfMemory> {
+    let (slab, len) = heap.read_payload(arr, |body| (body.slab, body.dense_len()));
+    if !elements::is_shared(slab) {
+        return Ok(());
+    }
+    let copy = elements::copy_private_no_collect(heap, slab)?;
+    heap.with_payload(arr, |body| body.adopt_slab(copy, len));
+    // The handle was installed by a raw payload write.
+    heap.record_write(arr, &copy);
+    Ok(())
+}
+
+/// Whether `arr` still shares a literal site's boilerplate slab.
+#[must_use]
+pub(crate) fn has_shared_elements(arr: JsArray, heap: &otter_gc::GcHeap) -> bool {
+    heap.read_payload(arr, |body| elements::is_shared(body.slab))
+}
+
+/// A fresh array whose dense storage is the shared boilerplate `slab`.
+///
+/// # Errors
+///
+/// Returns [`otter_gc::OutOfMemory`] when the shell cannot be allocated.
+pub(crate) fn from_shared_slab(
+    heap: &mut otter_gc::GcHeap,
+    slab: elements::ElementSlabHandle,
+    placement: otter_gc::SitePlacement,
+    external_visit: &mut RootSlotVisitor<'_>,
+) -> Result<JsArray, otter_gc::OutOfMemory> {
+    debug_assert!(elements::is_shared(slab));
+    let len = elements::len_of_live(slab);
+    let mut body = ArrayBody::default();
+    body.set_length(len);
+    body.slab = slab;
+    body.refresh_element_cache();
+    body.dense_len
+        .set(u32::try_from(len).expect("dense length exceeds u32"));
+    // The old slab is never young, so the shell needs no remembered edge.
+    alloc_body_with_adopted_elements(heap, body, placement, external_visit)
 }
 
 fn should_store_sparse(arr: JsArray, heap: &otter_gc::GcHeap, idx: usize) -> bool {

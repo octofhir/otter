@@ -468,6 +468,15 @@ impl FunctionContext {
         })
     }
 
+    pub(crate) fn intern_array_boilerplate(
+        &mut self,
+        elements: Vec<otter_bytecode::BoilerplateElement>,
+    ) -> u32 {
+        self.module
+            .borrow_mut()
+            .intern_constant(Constant::ArrayBoilerplate { elements })
+    }
+
     pub(crate) fn intern_function_id(&mut self, function_id: u32) -> u32 {
         self.module
             .borrow_mut()

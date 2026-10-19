@@ -701,6 +701,23 @@ impl ExecutionContext {
         }
     }
 
+    /// Resolve an array-literal boilerplate constant in the chunk that owns
+    /// `function_id`, with the key that caches its shared slab.
+    #[must_use]
+    pub(crate) fn array_boilerplate_for_function(
+        &self,
+        function_id: u32,
+        idx: u32,
+    ) -> Option<((usize, u32), &[otter_bytecode::BoilerplateElement])> {
+        self.local_function_index(function_id)?;
+        match self.payload.module.constants.get(idx as usize) {
+            Some(Constant::ArrayBoilerplate { elements }) => {
+                Some((self.constant_cache_key(idx), elements.as_slice()))
+            }
+            _ => None,
+        }
+    }
+
     /// Resolve a RegExp literal constant in the chunk that owns
     /// `function_id`.
     ///

@@ -58,6 +58,7 @@ pub(crate) fn regexp_last_index_slot(store: bool) -> JitBodySlot {
             byte: header + crate::regexp::REGEXP_BODY_LAST_INDEX_WRITABLE_OFFSET as u32,
             width: JitGuardWidth::Byte,
             expect: 1,
+            mask: JitBodyGuard::WHOLE,
         }),
         byte: header + crate::regexp::REGEXP_BODY_LAST_INDEX_OFFSET as u32,
     }

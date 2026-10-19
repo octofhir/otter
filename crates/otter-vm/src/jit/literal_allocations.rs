@@ -2,6 +2,8 @@
 //!
 //! # Contents
 //! - Empty and static nonempty literal plans used by the graph tier.
+//! - [`JitBoilerplateArrayAllocationPlan`]: one array shell over a literal
+//!   boilerplate's shared slab.
 //! - The ordinary-object header calculation shared with receiver allocation.
 //! - [`JitAllocationSite`]: the placement a literal site had when compiled.
 //!
@@ -17,6 +19,9 @@
 //! A tracking site's young header carries its id and the code counts each
 //! birth in the site's address-stable record; a tenured site's header is old.
 //! Generated tracking code must leave once the record's decision is final.
+//! A boilerplate slab is old, immutable and retained by the isolate's
+//! boilerplate cache for as long as its chunk is linked, so generated code may
+//! bake its compressed offset; its shell reports no writable capacity.
 //!
 //! # See also
 //! `crate::literal_allocation` owns the matching source-realm slow semantics.
@@ -39,6 +44,8 @@ pub struct JitLiteralAllocationPlans {
     pub objects: rustc_hash::FxHashMap<u32, JitObjectLiteralAllocationPlan>,
     /// Dense array layouts by own logical instruction PC.
     pub arrays: rustc_hash::FxHashMap<u32, JitArrayLiteralAllocationPlan>,
+    /// Shared-boilerplate array shells by own logical instruction PC.
+    pub boilerplates: rustc_hash::FxHashMap<u32, JitBoilerplateArrayAllocationPlan>,
     /// Allocation sites of object and array literals by own logical PC.
     pub sites: rustc_hash::FxHashMap<u32, JitAllocationSite>,
 }
@@ -247,6 +254,61 @@ impl JitDenseArrayAllocationPlan {
             } else {
                 e::DenseElementKind::Tagged as u8
             },
+        })
+    }
+}
+
+/// One array shell over a literal boilerplate's shared slab: the whole
+/// literal is the shell, since its elements are never copied at birth.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct JitBoilerplateArrayAllocationPlan {
+    /// Array shell geometry.
+    pub shell: JitEmptyArrayAllocationPlan,
+    /// Old compressed offset of the shared slab.
+    pub slab: u32,
+    /// Slab-relative start of its element words.
+    pub data_byte: u32,
+    /// Element count, which is both lengths of every fresh shell.
+    pub len: u32,
+    /// The slab's dense kind, cached by the shell.
+    pub kind: u8,
+    /// The shell's own-guard byte: storage shared, slots ordinary.
+    pub own_guard: u8,
+    /// Header-relative shell slab handle.
+    pub shell_slab_byte: u32,
+    /// Header-relative shell logical length.
+    pub shell_length_byte: u32,
+    /// Header-relative shell cached element address.
+    pub shell_data_byte: u32,
+    /// Header-relative shell cached live length.
+    pub shell_len_byte: u32,
+    /// Header-relative shell cached kind.
+    pub shell_kind_byte: u32,
+    /// Header-relative shell own-guard byte.
+    pub shell_own_guard_byte: u32,
+}
+
+impl JitBoilerplateArrayAllocationPlan {
+    pub(crate) fn new(slab: crate::array::elements::ElementSlabHandle) -> Option<Self> {
+        use crate::array::elements as e;
+        if !e::is_shared(slab) {
+            return None;
+        }
+        let header = otter_gc::header::HEADER_SIZE;
+        let offset = |byte: usize| u32::try_from(header + byte).ok();
+        Some(Self {
+            shell: JitEmptyArrayAllocationPlan::default(),
+            slab: slab.offset(),
+            data_byte: u32::try_from(header + std::mem::size_of::<e::ElementSlabBody>()).ok()?,
+            len: u32::try_from(e::len_of_live(slab)).ok()?,
+            kind: e::kind_of(slab) as u8,
+            own_guard: crate::array::DENSE_OWN_GUARD_SHARED,
+            shell_slab_byte: offset(crate::array::ARRAY_BODY_SLAB_OFFSET)?,
+            shell_length_byte: offset(crate::array::ARRAY_BODY_LENGTH_OFFSET)?,
+            shell_data_byte: offset(crate::array::ARRAY_BODY_ELEMENTS_PTR_OFFSET)?,
+            shell_len_byte: offset(crate::array::ARRAY_BODY_DENSE_LEN_OFFSET)?,
+            shell_kind_byte: offset(crate::array::ARRAY_BODY_DENSE_KIND_OFFSET)?,
+            shell_own_guard_byte: offset(crate::array::ARRAY_BODY_DENSE_OWN_GUARD_OFFSET)?,
         })
     }
 }

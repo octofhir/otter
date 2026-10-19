@@ -2852,7 +2852,10 @@ fn dense_range_is_fast(
     start: usize,
     end: usize,
 ) -> bool {
+    // Shared boilerplate storage is copied out by the ordinary dispatch, so
+    // compiled code never sees a leaf move the element base.
     crate::array::is_ordinary_indexed(arr, heap)
+        && !crate::array::has_shared_elements(arr, heap)
         && crate::array::length_writable(arr, heap)
         && crate::array::can_fast_fill_dense_range(arr, heap, start, end)
 }

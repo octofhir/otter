@@ -181,6 +181,7 @@ impl Interpreter {
             local_time_zone: crate::date::LocalTimeZone::default(),
             template_objects: rustc_hash::FxHashMap::default(),
             literal_cells: rustc_hash::FxHashMap::default(),
+            array_boilerplates: rustc_hash::FxHashMap::default(),
             small_int_string_cache: vec![None; Self::SMALL_INT_STRING_CACHE as usize]
                 .into_boxed_slice(),
             pending_error_detail: std::cell::RefCell::new(None),

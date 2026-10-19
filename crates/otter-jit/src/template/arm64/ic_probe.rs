@@ -1478,7 +1478,10 @@ pub(super) fn emit_body_guard(
         JitGuardWidth::Word32 => dynasm!(ops ; .arch aarch64 ; ldr w14, [X(receiver), byte]),
         JitGuardWidth::Word64 => dynasm!(ops ; .arch aarch64 ; ldr x14, [X(receiver), byte]),
     }
-    if guard.expect == 0 {
+    if let Some(bit) = guard.tested_bit() {
+        debug_assert_eq!(guard.expect, 0);
+        dynasm!(ops ; .arch aarch64 ; tbnz x14, bit, =>miss);
+    } else if guard.expect == 0 {
         dynasm!(ops ; .arch aarch64 ; cbnz x14, =>miss);
     } else {
         emit_load_u64(ops, 12, u64::from(guard.expect));

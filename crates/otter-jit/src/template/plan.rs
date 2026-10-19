@@ -1099,6 +1099,15 @@ impl TemplatePlan {
                 Op::NewObject => TemplateOp::NewObject {
                     dst: lowered.destination_operands()?.dst,
                 },
+                // The allocation stub reads the boilerplate constant from the
+                // published instruction; no element crosses the call.
+                Op::NewArrayBoilerplate => TemplateOp::NewArray {
+                    dst: lowered.constant_operands()?.dst,
+                    elements: TemplateTail {
+                        start: register_operands.len(),
+                        len: 0,
+                    },
+                },
                 Op::NewArray => {
                     let operands = lowered.new_array_operands()?;
                     let slice = lowering.register_tail(operands.elements)?;

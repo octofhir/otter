@@ -284,6 +284,7 @@ fn constant_hash(constant: &Constant) -> u64 {
             pattern_utf16.hash(&mut hasher);
             flags.hash(&mut hasher);
         }
+        Constant::ArrayBoilerplate { elements } => elements.hash(&mut hasher),
     }
     hasher.finish()
 }

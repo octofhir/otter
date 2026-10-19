@@ -74,6 +74,8 @@ pub enum BytecodeConstantKind {
     BigInt,
     /// RegExp pattern and flags.
     RegExp,
+    /// Array literal boilerplate.
+    ArrayBoilerplate,
 }
 
 impl BytecodeConstantKind {
@@ -84,6 +86,7 @@ impl BytecodeConstantKind {
             Constant::FunctionId { .. } => Self::FunctionId,
             Constant::BigInt { .. } => Self::BigInt,
             Constant::RegExp { .. } => Self::RegExp,
+            Constant::ArrayBoilerplate { .. } => Self::ArrayBoilerplate,
         }
     }
 }
@@ -1644,6 +1647,7 @@ const fn expected_constant_kind(op: Op) -> BytecodeConstantKind {
         Op::LoadNumber => BytecodeConstantKind::Number,
         Op::LoadBigInt => BytecodeConstantKind::BigInt,
         Op::LoadRegExp => BytecodeConstantKind::RegExp,
+        Op::NewArrayBoilerplate => BytecodeConstantKind::ArrayBoilerplate,
         Op::MakeFunction | Op::MakeClosure => BytecodeConstantKind::FunctionId,
         _ => BytecodeConstantKind::String,
     }

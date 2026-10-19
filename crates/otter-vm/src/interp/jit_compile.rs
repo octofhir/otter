@@ -1387,6 +1387,19 @@ impl Interpreter {
                             .insert(u32::try_from(pc).ok()?, plan);
                     }
                 }
+                Op::NewArrayBoilerplate => {
+                    let site = self.jit_allocation_site(view.code_block.allocation_site_at(pc));
+                    view.literal_allocations
+                        .sites
+                        .insert(u32::try_from(pc).ok()?, site);
+                    let constant = instruction.const_index(&view.code_block, 1)?;
+                    let slab = self.array_boilerplate_slab(context, fid, constant).ok()?;
+                    if let Some(plan) = jit::JitBoilerplateArrayAllocationPlan::new(slab) {
+                        view.literal_allocations
+                            .boilerplates
+                            .insert(u32::try_from(pc).ok()?, plan);
+                    }
+                }
                 Op::NewArray => {
                     let count = instruction.const_index(&view.code_block, 1)? as usize;
                     if count != 0 {
@@ -1632,10 +1645,14 @@ impl Interpreter {
                     op,
                     Op::LoadElement | Op::StoreElement | Op::StoreElementStrict | Op::IteratorNext
                 )
-                .then_some((instr.byte_pc, instr.instruction_pc(&view.code_block)))
+                .then_some((
+                    instr.byte_pc,
+                    instr.instruction_pc(&view.code_block),
+                    matches!(op, Op::StoreElement | Op::StoreElementStrict),
+                ))
             })
             .collect();
-        for (byte_pc, pc) in sites {
+        for (byte_pc, pc, write) in sites {
             let cell = view.code_block.feedback_at(pc as usize);
             if cell.is_some_and(|cell| cell.element_out_of_bounds()) {
                 view.out_of_bounds_element_sites.insert(byte_pc);
@@ -1651,12 +1668,16 @@ impl Interpreter {
                 jit::JitElementFamily::DenseTagged => Self::dense_element_access(
                     jit::JitElementRepr::Boxed,
                     crate::array::DENSE_ELEMENT_KIND_TAGGED,
+                    write,
                 ),
                 jit::JitElementFamily::DenseFloat64 => Self::dense_element_access(
                     jit::JitElementRepr::Float64,
                     crate::array::DENSE_ELEMENT_KIND_PACKED_DOUBLE,
+                    write,
                 ),
-                jit::JitElementFamily::DenseHoleyFloat64 => Self::holey_double_element_access(),
+                jit::JitElementFamily::DenseHoleyFloat64 => {
+                    Self::holey_double_element_access(write)
+                }
                 jit::JitElementFamily::Unseen => {
                     view.unseen_element_sites.insert(byte_pc);
                     continue;
@@ -1700,28 +1721,33 @@ impl Interpreter {
 
     /// Describe one exact present-own array representation behind the body's
     /// element cache. Prototype-only sidecars are legal; descriptor/accessor
-    /// baggage and a numeric-to-tagged transition leave before access.
+    /// baggage and a numeric-to-tagged transition leave before access. A read
+    /// also accepts storage shared with a literal boilerplate; a write leaves
+    /// for the runtime, which copies it out first.
     fn dense_element_access(
         element: jit::JitElementRepr,
         dense_kind: u32,
+        write: bool,
     ) -> jit::JitElementAccess {
-        if element == jit::JitElementRepr::Float64
-            && dense_kind == crate::array::DENSE_ELEMENT_KIND_PACKED_DOUBLE
-        {
-            return jit::JitElementAccess::packed_double_array();
-        }
         let header = otter_gc::header::HEADER_SIZE as u32;
+        let own = header + crate::array::ARRAY_BODY_DENSE_OWN_GUARD_OFFSET as u32;
         jit::JitElementAccess {
             type_tag: crate::array::ARRAY_BODY_TYPE_TAG,
             guards: [
-                Some(jit::JitBodyGuard::clear(
-                    header + crate::array::ARRAY_BODY_DENSE_OWN_GUARD_OFFSET as u32,
-                    jit::JitGuardWidth::Byte,
-                )),
+                Some(if write {
+                    jit::JitBodyGuard::clear(own, jit::JitGuardWidth::Byte)
+                } else {
+                    jit::JitBodyGuard::clear_bit(
+                        own,
+                        jit::JitGuardWidth::Byte,
+                        crate::array::DENSE_OWN_GUARD_EXOTIC.trailing_zeros(),
+                    )
+                }),
                 Some(jit::JitBodyGuard {
                     byte: header + crate::array::ARRAY_BODY_DENSE_KIND_OFFSET as u32,
                     width: jit::JitGuardWidth::Byte,
                     expect: dense_kind,
+                    mask: jit::JitBodyGuard::WHOLE,
                 }),
             ],
             length_byte: header + crate::array::ARRAY_BODY_DENSE_LEN_OFFSET as u32,
@@ -1737,8 +1763,8 @@ impl Interpreter {
     /// Numeric dense storage of either kind, read through the hole bitmap.
     /// The exotic sidecar is guarded as for every dense family; the storage
     /// kind is proved by the bitmap descriptor, which admits both numeric
-    /// kinds.
-    fn holey_double_element_access() -> jit::JitElementAccess {
+    /// kinds. A write also requires private storage.
+    fn holey_double_element_access(write: bool) -> jit::JitElementAccess {
         let header = otter_gc::header::HEADER_SIZE as u32;
         jit::JitElementAccess {
             guards: [
@@ -1746,12 +1772,18 @@ impl Interpreter {
                     header + std::mem::offset_of!(crate::array::ArrayBody, exotic) as u32,
                     jit::JitGuardWidth::Word32,
                 )),
-                None,
+                write.then(|| {
+                    jit::JitBodyGuard::clear(
+                        header + crate::array::ARRAY_BODY_DENSE_OWN_GUARD_OFFSET as u32,
+                        jit::JitGuardWidth::Byte,
+                    )
+                }),
             ],
             holes: Some(jit::JitArrayStorage::current().numeric),
             ..Self::dense_element_access(
                 jit::JitElementRepr::Float64,
                 crate::array::DENSE_ELEMENT_KIND_HOLEY_DOUBLE,
+                write,
             )
         }
     }
@@ -1777,6 +1809,7 @@ impl Interpreter {
                     byte: header + view::TYPED_ARRAY_BODY_KIND_OFFSET as u32,
                     width: jit::JitGuardWidth::Word32,
                     expect: kind as u32,
+                    mask: jit::JitBodyGuard::WHOLE,
                 }),
                 Some(jit::JitBodyGuard::clear(
                     header + view::TYPED_ARRAY_BODY_LENGTH_TRACKING_OFFSET as u32,

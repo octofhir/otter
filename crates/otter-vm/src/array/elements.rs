@@ -10,6 +10,8 @@
 //! - [`ElementSlabBody`] — fixed header followed by element words and,
 //!   for numeric slabs, a hole bitmap.
 //! - Root-aware allocation and raw-handle accessors used by `array`.
+//! - [`alloc_shared_slab`] and [`copy_private_no_collect`] — copy-on-write
+//!   boilerplate storage and its non-collecting copy-out.
 //!
 //! # Invariants
 //! - Every element word is eight bytes for every kind, so numeric-to-tagged
@@ -24,6 +26,10 @@
 //!   move a GC edge updates the interval; generated primitive stores need not.
 //! - Slabs use the ordinary generational allocation policy and never resize.
 //!   Growth and relocation republish the owning array's cached base.
+//! - A shared slab is a literal site's immutable boilerplate in old space,
+//!   holding only old cells and immediates, and may back many arrays. Every
+//!   mutator asserts it is private; an array copies a shared slab out before
+//!   its first write.
 //!
 //! # See also
 //! - [`crate::array::ArrayBody`]
@@ -86,7 +92,9 @@ pub(crate) struct ElementSlabBody {
     len: u32,
     hole_count: u32,
     kind: DenseElementKind,
-    reserved: [u8; 3],
+    /// Nonzero for a literal site's shared, immutable boilerplate slab.
+    shared: u8,
+    reserved: [u8; 2],
     /// Conservative interval of writes not yet proven free of young edges.
     /// Empty is represented by `dirty_start >= dirty_end`. Keeping indices,
     /// rather than slot addresses, also makes copied heap images self-contained.
@@ -144,7 +152,8 @@ impl ElementSlabBody {
             len: 0,
             hole_count: 0,
             kind,
-            reserved: [0; 3],
+            shared: 0,
+            reserved: [0; 2],
             dirty_start: u32::MAX,
             dirty_end: 0,
         }
@@ -179,6 +188,18 @@ impl ElementSlabBody {
     #[must_use]
     pub(crate) const fn kind(&self) -> DenseElementKind {
         self.kind
+    }
+
+    /// Whether this is a literal site's shared, immutable boilerplate.
+    #[inline]
+    #[must_use]
+    pub(crate) const fn is_shared(&self) -> bool {
+        self.shared != 0
+    }
+
+    #[inline]
+    fn assert_private(&self) {
+        assert!(self.shared == 0, "write into a shared element slab");
     }
 
     #[inline]
@@ -302,6 +323,7 @@ impl ElementSlabBody {
     /// Write one slot, widening numeric storage to tagged in place when the
     /// value is neither a Number nor the internal hole sentinel.
     pub(crate) fn set(&mut self, index: usize, value: Value) {
+        self.assert_private();
         assert!(index < self.capacity(), "dense write exceeds slab capacity");
         if self.kind.is_numeric() {
             if value.is_hole() {
@@ -335,6 +357,7 @@ impl ElementSlabBody {
 
     /// Publish a fully initialized live prefix.
     pub(crate) fn set_len(&mut self, len: usize) {
+        self.assert_private();
         assert!(len <= self.capacity());
         self.len = u32::try_from(len).expect("array dense length exceeds u32");
         if self.kind.is_numeric() && self.hole_count == 0 {
@@ -344,6 +367,7 @@ impl ElementSlabBody {
 
     /// Remove the suffix `[len, old_len)` and stop tracing/marking it live.
     pub(crate) fn truncate(&mut self, len: usize) {
+        self.assert_private();
         let current = self.len();
         if len >= current {
             return;
@@ -377,6 +401,7 @@ impl ElementSlabBody {
         if self.kind == DenseElementKind::Tagged {
             return;
         }
+        self.assert_private();
         debug_assert!(self.kind.is_numeric());
         let was_holey = self.kind == DenseElementKind::HoleyDouble;
         for index in 0..self.len() {
@@ -417,6 +442,7 @@ impl ElementSlabBody {
         if self.kind != DenseElementKind::Tagged {
             return None;
         }
+        self.assert_private();
         // A slice caller can rewrite any slot, including by swapping existing
         // young edges. Publish the complete interval before exposing it.
         self.mark_dirty_range(0, self.len());
@@ -505,6 +531,7 @@ pub(crate) unsafe fn record_generated_write(
         let body = data
             .sub(std::mem::size_of::<ElementSlabBody>())
             .cast::<ElementSlabBody>();
+        (*body).assert_private();
         (*body).mark_dirty_range(index, index + 1);
         let header = body
             .cast::<u8>()
@@ -530,12 +557,30 @@ pub(crate) fn capacity_of(slab: ElementSlabHandle) -> usize {
     })
 }
 
+/// Live length of `slab`; zero for a null handle.
+#[must_use]
+pub(crate) fn len_of_live(slab: ElementSlabHandle) -> usize {
+    body_of(slab).map_or(0, |body| {
+        // SAFETY: `body_of` returned a live payload.
+        unsafe { (*body).len() }
+    })
+}
+
 #[must_use]
 #[cfg(any(debug_assertions, test))]
 pub(crate) fn len_of(slab: ElementSlabHandle) -> usize {
     body_of(slab).map_or(0, |body| {
         // SAFETY: `body_of` returned a live payload.
         unsafe { (*body).len() }
+    })
+}
+
+/// Whether `slab` is a shared boilerplate; false for a null handle.
+#[must_use]
+pub(crate) fn is_shared(slab: ElementSlabHandle) -> bool {
+    body_of(slab).is_some_and(|body| {
+        // SAFETY: `body_of` returned a live payload.
+        unsafe { (*body).is_shared() }
     })
 }
 
@@ -577,6 +622,79 @@ pub(crate) fn alloc_element_slab(
         },
     )?;
     Ok(slab)
+}
+
+/// Allocate a literal site's shared boilerplate slab holding `values`, in
+/// old space. Every cell among `values` must already be old, so the slab
+/// never holds a young edge and is never written again.
+pub(crate) fn alloc_shared_slab(
+    heap: &mut otter_gc::GcHeap,
+    values: &[Value],
+    kind: DenseElementKind,
+    external_visit: &mut RootSlotVisitor<'_>,
+) -> Result<ElementSlabHandle, otter_gc::OutOfMemory> {
+    debug_assert!(values.iter().all(|value| {
+        value.as_raw_gc().is_none_or(|raw| {
+            // SAFETY: a value's cell offset names a live header.
+            unsafe { !(*raw.as_header_ptr()).is_young() }
+        })
+    }));
+    let slab = alloc_element_slab(
+        heap,
+        values.len(),
+        kind,
+        otter_gc::SitePlacement::Old,
+        external_visit,
+    )?;
+    let body = body_of(slab).expect("fresh element slab");
+    // SAFETY: the fresh slab is reachable only through this handle.
+    unsafe {
+        for (index, &value) in values.iter().enumerate() {
+            (*body).set(index, value);
+        }
+        (*body).set_len(values.len());
+        (*body).dirty_start = u32::MAX;
+        (*body).dirty_end = 0;
+        (*body).shared = 1;
+    }
+    Ok(slab)
+}
+
+/// A private copy of the shared slab `source`, with its kind, holes and live
+/// prefix and exactly that much capacity: young when the nursery has room,
+/// else old. Never collects, so the caller's handles stay valid.
+pub(crate) fn copy_private_no_collect(
+    heap: &mut otter_gc::GcHeap,
+    source: ElementSlabHandle,
+) -> Result<ElementSlabHandle, otter_gc::OutOfMemory> {
+    let source = body_of(source).expect("shared slab");
+    // SAFETY: the shared slab is old and immutable; nothing collects below.
+    let (len, kind, hole_count) =
+        unsafe { ((*source).len(), (*source).kind(), (*source).hole_count) };
+    debug_assert!(len != 0);
+    let copy = |body: &mut ElementSlabBody| {
+        // SAFETY: the copy reserves `len` element words and, when numeric,
+        // a bitmap of the same word count as the source's, which has
+        // capacity `len` as well.
+        unsafe {
+            std::ptr::copy_nonoverlapping((*source).data_ptr(), body.data_ptr(), len * 8);
+            if kind.is_numeric() {
+                std::ptr::copy_nonoverlapping(
+                    (*source).bitmap_ptr(),
+                    body.bitmap_ptr(),
+                    ElementSlabBody::bitmap_words_for(len),
+                );
+            }
+        }
+        body.len = len as u32;
+        body.hole_count = hole_count;
+    };
+    let fresh = || ElementSlabBody::new(len, kind);
+    let trailing = ElementSlabBody::trailing_bytes(len, kind);
+    match heap.try_alloc_trailing_no_collect_or_return(fresh(), trailing, copy) {
+        Ok(slab) => Ok(slab),
+        Err(_) => heap.alloc_old_trailing_no_collect(fresh(), trailing, copy),
+    }
 }
 
 #[cfg(test)]

@@ -325,9 +325,12 @@ impl Known {
             if layout.shapes != theirs.shapes {
                 layout.shapes = None;
             }
-            if layout.elements != theirs.elements {
-                layout.elements = None;
-            }
+            // Paths that proved different strengths keep the weaker proof.
+            layout.elements = match (layout.elements, theirs.elements) {
+                (Some(ours), Some(other)) if ours.implies(&other) => Some(other),
+                (Some(ours), Some(other)) if other.implies(&ours) => Some(ours),
+                _ => None,
+            };
             layout.writable &= theirs.writable;
             *layout != LayoutInfo::default()
         });
@@ -517,7 +520,11 @@ impl Known {
                 ) => !self.layouts.get(node).is_some_and(|layout| {
                     (shapes.is_none() || layout.shapes == *shapes)
                         && (!writable || layout.writable)
-                        && (elements.is_none() || layout.elements == *elements)
+                        && elements.is_none_or(|wanted| {
+                            layout
+                                .elements
+                                .is_some_and(|proved| proved.implies(&wanted))
+                        })
                 }),
                 (FactKey::Field(field), HeapFact::Field(value)) => {
                     self.fields.get(field) != Some(value)
@@ -2142,7 +2149,7 @@ impl<'a> Builder<'a> {
                 self.prove_array_body(value);
                 self.write(instruction.writes[0], value);
             }
-            Op::NewObjectLiteral | Op::NewArray => {
+            Op::NewObjectLiteral | Op::NewArray | Op::NewArrayBoilerplate => {
                 let inputs = instruction
                     .reads
                     .iter()
@@ -4479,16 +4486,77 @@ impl<'a> Builder<'a> {
         Ok(access)
     }
 
+    /// Give the current block's check that proved `known` for `receiver`
+    /// the stronger guards of `access`, when no node after it writes memory:
+    /// failing earlier then resumes at a point with nothing committed since.
+    fn strengthen_element_check(
+        &mut self,
+        receiver: NodeId,
+        known: &JitElementAccess,
+        access: &JitElementAccess,
+    ) -> bool {
+        let block = self.current.expect("an open block");
+        let body = self.graph.block(block).body.clone();
+        for &node in body.iter().rev() {
+            let data = self.graph.node(node);
+            if let Kind::CheckElements { guards, .. } = &data.kind
+                && data.inputs.as_slice() == [receiver]
+                && *guards == known.guards
+            {
+                let Kind::CheckElements { guards, .. } = &mut self.graph.node_mut(node).kind else {
+                    unreachable!("matched an element check");
+                };
+                *guards = access.guards;
+                return true;
+            }
+            let properties = data.kind.properties();
+            if properties.call
+                || properties.may_collect
+                || !super::effects::clobberize(&data.kind).writes.is_empty()
+            {
+                return false;
+            }
+        }
+        false
+    }
+
     /// Prove `receiver` has `access`'s layout and read its storage, unless
     /// this path already did. A typed view is proved to keep a cached
     /// element base, which its storage then reads directly.
     fn elements_of(&mut self, receiver: NodeId, access: JitElementAccess) -> ElementStorage {
-        let proved = self
+        let known = self
             .known
             .layout(receiver)
-            .and_then(|layout| layout.elements)
-            == Some(access);
+            .and_then(|layout| layout.elements);
+        let proved = known.is_some_and(|known| known.implies(&access));
         if proved && let Some(&storage) = self.known.storage.get(&receiver) {
+            return storage;
+        }
+        // A weaker proof of the same addressing keeps its storage words;
+        // only the stronger guards still need checking.
+        if let Some(known) = known
+            && known.addresses_like(&access)
+            && access.implies(&known)
+            && let Some(&storage) = self.known.storage.get(&receiver)
+        {
+            if !self.strengthen_element_check(receiver, &known, &access) {
+                self.add(
+                    Kind::CheckElements {
+                        type_tag: access.type_tag,
+                        guards: access.guards,
+                        holes: access.holes,
+                        cached_base: match access.base {
+                            JitElementBase::ThroughLocalBuffer {
+                                cached_data_byte, ..
+                            } => Some(cached_data_byte),
+                            _ => None,
+                        },
+                    },
+                    &[receiver],
+                    Repr::None,
+                );
+            }
+            self.known.layout_entry(receiver).elements = Some(access);
             return storage;
         }
         let (base_byte, cached_base) = match access.base {
@@ -4527,7 +4595,12 @@ impl<'a> Builder<'a> {
             Repr::Word,
         );
         let storage = ElementStorage { length, base };
-        self.known.layout_entry(receiver).elements = Some(access);
+        // A stronger proof already on this path stays: it serves both.
+        self.known.layout_entry(receiver).elements = Some(if proved {
+            known.expect("proved layout")
+        } else {
+            access
+        });
         self.known.storage.insert(receiver, storage);
         self.known.entry(receiver).heap_object = true;
         storage

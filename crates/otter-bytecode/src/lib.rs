@@ -1427,6 +1427,12 @@ pub enum Op {
     /// non-`__proto__` data keys, so the result equals `NewObject` followed by
     /// one `DefineDataProperty` per key.
     NewObjectLiteral,
+    /// Build a fresh array from the constant array boilerplate
+    /// `boilerplate_const`. Operands: `dst, boilerplate_const`. The compiler
+    /// emits it only for literals whose every element is a primitive constant
+    /// or a hole, so the result equals the matching `NewArray`; arrays of one
+    /// site share the boilerplate's element storage until their first write.
+    NewArrayBoilerplate,
 }
 
 impl Op {
@@ -1611,6 +1617,7 @@ impl Op {
             Op::DeclareEvalVar => "DECLARE_EVAL_VAR",
             Op::StoreVarScope => "STORE_VAR_SCOPE",
             Op::NewObjectLiteral => "NEW_OBJECT_LITERAL",
+            Op::NewArrayBoilerplate => "NEW_ARRAY_BOILERPLATE",
             Op::GetTemplateObject => "GET_TEMPLATE_OBJECT",
             Op::CollectArguments => "COLLECT_ARGUMENTS",
             Op::LoadArgumentsLength => "LOAD_ARGUMENTS_LENGTH",
@@ -1678,6 +1685,7 @@ impl Op {
             | Op::LoadNumber
             | Op::LoadBigInt
             | Op::LoadRegExp
+            | Op::NewArrayBoilerplate
             | Op::MakeFunction
             | Op::ImportNamespace
             | Op::ImportNamespaceDeferred
@@ -2721,6 +2729,39 @@ pub enum Constant {
         /// compile time so the runtime can rely on a clean parse.
         flags: String,
     },
+    /// Element list of an array literal whose every element is a primitive
+    /// constant or a hole, read by [`Op::NewArrayBoilerplate`].
+    ArrayBoilerplate {
+        /// Elements in index order.
+        elements: Vec<BoilerplateElement>,
+    },
+}
+
+/// One element of a [`Constant::ArrayBoilerplate`].
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind", content = "value")]
+pub enum BoilerplateElement {
+    /// A Number, as `f64::to_bits`.
+    Number {
+        /// `f64::to_bits` representation.
+        bits: u64,
+    },
+    /// A string, as WTF-16 code units.
+    String {
+        /// WTF-16 code units.
+        utf16: Vec<u16>,
+    },
+    /// `true` or `false`.
+    Boolean {
+        /// The boolean.
+        value: bool,
+    },
+    /// `null`.
+    Null,
+    /// `undefined` (`void 0`).
+    Undefined,
+    /// An elision: no own element at this index.
+    Hole,
 }
 
 /// Top-level bytecode container produced by the compiler.
@@ -3019,6 +3060,16 @@ impl Constant {
             } => ((pattern_utf16.capacity() as u64)
                 .saturating_mul(std::mem::size_of::<u16>() as u64))
             .saturating_add(flags.capacity() as u64),
+            Self::ArrayBoilerplate { elements } => elements.iter().fold(
+                (elements.capacity() as u64)
+                    .saturating_mul(std::mem::size_of::<BoilerplateElement>() as u64),
+                |total, element| match element {
+                    BoilerplateElement::String { utf16 } => total.saturating_add(
+                        (utf16.capacity() as u64).saturating_mul(std::mem::size_of::<u16>() as u64),
+                    ),
+                    _ => total,
+                },
+            ),
         }
     }
 }

@@ -98,7 +98,10 @@ fn emit_body_guard(ops: &mut Assembler, guard: otter_vm::jit::JitBodyGuard, miss
             dynasm!(ops ; .arch x64 ; mov r10, [r8 + guard.byte as i32]);
         }
     }
-    if guard.expect == 0 {
+    if guard.tested_bit().is_some() {
+        debug_assert_eq!(guard.expect, 0);
+        dynasm!(ops ; .arch x64 ; test r10d, guard.mask as i32);
+    } else if guard.expect == 0 {
         dynasm!(ops ; .arch x64 ; test r10, r10);
     } else if guard.width == otter_vm::jit::JitGuardWidth::Word64 {
         dynasm!(ops ; .arch x64 ; mov r11d, guard.expect as i32 ; cmp r10, r11);
@@ -131,6 +134,7 @@ mod tests {
                     byte: 8,
                     width,
                     expect: expected,
+                    mask: JitBodyGuard::WHOLE,
                 },
                 miss,
             );

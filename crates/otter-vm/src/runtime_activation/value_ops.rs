@@ -337,18 +337,41 @@ impl RuntimeCall<'_> {
         self.coerce_unary(dst, src, UnaryCoercionOp::ToPrimitive { hint })
     }
 
-    /// Allocate a literal from boxed values copied before collection.
+    /// Allocate a literal from boxed values copied before collection. At an
+    /// `Op::NewArrayBoilerplate` source the published instruction names the
+    /// constant and the span is empty.
     pub fn new_array_value(&mut self, elements: &[Value]) -> Result<Value, VmError> {
         // SAFETY: the branded runtime call exclusively owns VM access and its
         // published native roots remain active through the shared allocator.
         let (function_id, pc) = self.semantic_source()?;
         let owner = self.owner(function_id)?;
+        let boilerplate = {
+            let function = owner
+                .exec_function(function_id)
+                .ok_or(VmError::InvalidOperand)?;
+            match function.instr_at_index(pc as usize) {
+                Some(instruction)
+                    if function.op(instruction) == otter_bytecode::Op::NewArrayBoilerplate =>
+                {
+                    Some(crate::operand_decode::const_operand(
+                        function.operand_view(instruction).get(1),
+                    )?)
+                }
+                _ => None,
+            }
+        };
         let vm = unsafe { &mut *self.vm.as_ptr() };
         let placement = vm.literal_site_placement(
             owner
                 .exec_function(function_id)
                 .and_then(|function| function.allocation_site_at(pc as usize)),
         );
+        if let Some(constant) = boilerplate {
+            if !elements.is_empty() {
+                return Err(VmError::InvalidOperand);
+            }
+            return vm.allocate_array_boilerplate_value(&owner, function_id, constant, placement);
+        }
         vm.allocate_array_literal_value(function_id, elements.iter().copied(), placement)
     }
 

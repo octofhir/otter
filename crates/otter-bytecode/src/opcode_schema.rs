@@ -1442,6 +1442,7 @@ opcode_schema! {
     Op::StoreElementStrict,
     Op::CallForwardArguments,
     Op::NewObjectLiteral,
+    Op::NewArrayBoilerplate,
     Op::LoadArgumentsLength,
     Op::LoadArgumentsElement,
     Op::LoadClosureContext,
@@ -1668,9 +1669,11 @@ const fn operand_shape(op: Op) -> OperandShape {
         | Op::LoadGlobalThis
         | Op::LoadClosureContext
         | Op::LoadSelf => OperandShape::Fixed(WRITE),
-        Op::LoadString | Op::LoadNumber | Op::LoadBigInt | Op::LoadRegExp => {
-            OperandShape::Fixed(WRITE_CONST)
-        }
+        Op::LoadString
+        | Op::LoadNumber
+        | Op::LoadBigInt
+        | Op::LoadRegExp
+        | Op::NewArrayBoilerplate => OperandShape::Fixed(WRITE_CONST),
         Op::LoadInt32 => OperandShape::Fixed(WRITE_IMM),
         Op::Jump => OperandShape::Fixed(JUMP),
         Op::JumpIfTrue | Op::JumpIfFalse | Op::JumpIfNullish => OperandShape::Fixed(BRANCH),

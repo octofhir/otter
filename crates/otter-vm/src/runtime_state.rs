@@ -183,6 +183,14 @@ impl<'a> RuntimeState<'a> {
                 let p = shape as *const crate::object::ShapeHandle as *mut otter_gc::raw::RawGc;
                 visitor(p);
             }
+            // Array-literal boilerplates are old and hold only old cells.
+            for slab in interp.array_boilerplates_for_trace() {
+                visitor(
+                    std::ptr::from_ref(slab)
+                        .cast_mut()
+                        .cast::<otter_gc::raw::RawGc>(),
+                );
+            }
         }
         for layout in interp.function_constructor_layouts_for_trace() {
             if !layout.is_null() {

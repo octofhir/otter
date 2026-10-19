@@ -18,7 +18,9 @@
 
 use super::{Codegen, CommittedArgument, DeoptReason, Kind, Location, NodeId, abi};
 use crate::allocation::{AllocationValue, EmptyLiteralLayout, LabRegisters};
-use crate::arm64::allocation::{emit_array_literal, emit_empty_literal, emit_object_literal};
+use crate::arm64::allocation::{
+    emit_array_literal, emit_boilerplate_array, emit_empty_literal, emit_object_literal,
+};
 use dynasmrt::{DynasmApi, DynasmLabelApi, dynasm};
 use otter_vm::jit::{
     JIT_SITE_CREATED_OFFSET, JIT_SITE_DECIDED_BIT, JIT_SITE_DECISION_OFFSET, JitSiteMode,
@@ -36,6 +38,11 @@ impl Codegen<'_> {
         let cage_base = source.cage_base as u64;
         let object = source.literal_allocations.objects.get(&data.pc).cloned();
         let array = source.literal_allocations.arrays.get(&data.pc).copied();
+        let boilerplate = source
+            .literal_allocations
+            .boilerplates
+            .get(&data.pc)
+            .copied();
         let site = source
             .literal_allocations
             .sites
@@ -75,7 +82,7 @@ impl Codegen<'_> {
         let fitted = self.ops.new_dynamic_label();
         let fits = match &kind {
             Kind::NewObjectLiteral { fields } => object.is_some() && fields.is_some(),
-            Kind::NewArrayLiteral => array.is_some(),
+            Kind::NewArrayLiteral => array.is_some() || boilerplate.is_some(),
             _ => unreachable!("literal allocation kind"),
         };
         if fits && site.mode == JitSiteMode::Track {
@@ -107,7 +114,20 @@ impl Codegen<'_> {
                 abi::STUB_JIT_NEW_OBJECT_LITERAL
             }
             Kind::NewArrayLiteral => {
-                if let Some(plan) = array {
+                if let Some(plan) = boilerplate {
+                    emit_boilerplate_array(
+                        &mut self.ops,
+                        &mut self.relocations,
+                        20,
+                        realm,
+                        cage_base,
+                        plan,
+                        site,
+                        regs,
+                        slow,
+                    );
+                    dynasm!(self.ops ; .arch aarch64 ; b =>fitted);
+                } else if let Some(plan) = array {
                     emit_array_literal(
                         &mut self.ops,
                         &mut self.relocations,

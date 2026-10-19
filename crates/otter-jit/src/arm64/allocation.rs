@@ -54,7 +54,7 @@ pub(crate) use empty::emit_empty_literal;
 mod slab;
 pub(crate) use slab::emit_grow_tagged_slab;
 mod literal;
-pub(crate) use literal::{emit_array_literal, emit_object_literal};
+pub(crate) use literal::{emit_array_literal, emit_boilerplate_array, emit_object_literal};
 
 /// Probe one bounded aligned cell in the nursery buffer; miss precedes
 /// every write.

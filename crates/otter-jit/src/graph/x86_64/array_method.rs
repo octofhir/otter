@@ -20,6 +20,9 @@
 //!   publish it; the removed slot is cleared to `undefined`, which needs none.
 //! - The Array's dense length, its slab's length and its `length` move
 //!   together, as the VM's own append and truncation do.
+//! - Storage shared with a literal boilerplate reports no capacity, so an
+//!   append grows it into private storage and clears the shared mark; a
+//!   removal from it completes in the builtin, which copies it out.
 //!
 //! # See also
 //! - `crate::graph::arm64::array_method` for the same operations on AArch64.
@@ -117,6 +120,7 @@ impl Codegen<'_> {
                 ; mov r11d, [Rq(base) + storage.numeric.capacity_byte]
                 ; mov [Rq(receiver) + storage.capacity_byte as i32], r11d
                 ; mov BYTE [Rq(receiver) + storage.numeric.kind_byte as i32], storage.tagged_kind as i8
+                ; mov BYTE [Rq(receiver) + storage.own_guard_byte as i32], 0
                 ; mov [Rq(receiver) + storage.length_byte as i32], r10d
                 ; mov [Rq(receiver) + storage.logical_length_byte as i32], r10d);
             self.emit_cell_edge_barrier(node, receiver, temp, &[length]);
@@ -139,6 +143,7 @@ impl Codegen<'_> {
             let empty = self.ops.new_dynamic_label();
             self.emit_whole_prefix(storage, receiver, length, false, runtime);
             dynasm!(self.ops ; .arch x64
+                ; cmp BYTE [Rq(receiver) + storage.own_guard_byte as i32], 0 ; jne =>runtime
                 ; test Rd(length), Rd(length) ; jz =>empty
                 ; sub Rd(length), 1
                 ; mov Rq(base), [Rq(receiver) + storage.base_byte as i32]

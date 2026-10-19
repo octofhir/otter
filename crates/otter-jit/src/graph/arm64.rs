@@ -2133,6 +2133,7 @@ impl<'a> Codegen<'a> {
                 byte_pc,
                 target,
                 receiver_proved,
+                ..
             } => {
                 let receiver = Self::gp(input(0));
                 let destination = Self::gp(result.expect("a result"));

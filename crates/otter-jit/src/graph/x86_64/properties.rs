@@ -223,6 +223,7 @@ impl Codegen<'_> {
                 byte_pc,
                 target,
                 receiver_proved,
+                ..
             } => {
                 let guard = self
                     .view_of(node)

@@ -669,6 +669,9 @@ pub(crate) enum Kind {
         /// The receiver is already proved an ordinary object of the
         /// target's shape.
         receiver_proved: bool,
+        /// The method is read from a code-retained cell the target's chain
+        /// proof fixes, not from the holder's slot.
+        cell_read: bool,
     },
     /// The compressed shape of input0 when it is an ordinary object that
     /// looks its properties up through its shape; zero otherwise.

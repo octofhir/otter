@@ -463,6 +463,7 @@ fn walk(
                     byte_pc,
                     target,
                     receiver_proved,
+                    ..
                 } => {
                     let receiver = node_data.inputs[0];
                     let Some(object) = candidate_object(&state, candidates, receiver, &mut escaped)

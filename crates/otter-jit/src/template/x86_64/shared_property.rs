@@ -165,6 +165,7 @@ fn emit_key_atom(
     key: u8,
     atom: u8,
     aligned: bool,
+    uninterned: DynamicLabel,
     miss: DynamicLabel,
 ) {
     let ready = ops.new_dynamic_label();
@@ -202,6 +203,9 @@ fn emit_key_atom(
     dynasm!(ops ; .arch x64
         ; pop rdx ; pop rcx ; pop rsi
         ; test r10, r10 ; jnz =>miss
+        // Content never interned is no shaped object's property; the
+        // string records nothing.
+        ; cmp Rd(atom), -1 ; je =>uninterned
         ; lea r11d, [Rq(atom) + 1]
         ; mov [Rq(key) + atom_byte], r11d
         ; =>ready
@@ -210,8 +214,8 @@ fn emit_key_atom(
 
 /// `rdx == 0` with the value in `rax`, else `rdx != 0` and nothing observed.
 /// Nothing allocates; the only calls are the interning leaf and, for a
-/// dictionary-mode receiver the table does not hold, the generic own-data
-/// walk.
+/// dictionary-mode receiver the table does not hold or a key the interner
+/// never saw, the generic own-data walk.
 fn emit_keyed_load(
     ops: &mut Assembler,
     relocations: &mut RelocationCapture,
@@ -223,7 +227,16 @@ fn emit_keyed_load(
     let generic = ops.new_dynamic_label();
     dynasm!(ops ; .arch x64 ; =>label);
     // Entered by `call`: `rsp` is eight bytes past alignment.
-    emit_key_atom(ops, relocations, view, KEYED_LOAD_KEY, 9, false, miss);
+    emit_key_atom(
+        ops,
+        relocations,
+        view,
+        KEYED_LOAD_KEY,
+        9,
+        false,
+        generic,
+        miss,
+    );
     emit_action_probe(
         ops,
         relocations,
@@ -280,7 +293,7 @@ fn emit_keyed_store(
     let miss = ops.new_dynamic_label();
     // Realign for the barrier calls.
     dynasm!(ops ; .arch x64 ; =>label ; sub rsp, 8);
-    emit_key_atom(ops, relocations, view, KEYED_STORE_KEY, 9, true, miss);
+    emit_key_atom(ops, relocations, view, KEYED_STORE_KEY, 9, true, miss, miss);
     // The probe's identity temporary (`rdi`) carries an appended child.
     emit_action_probe(
         ops,

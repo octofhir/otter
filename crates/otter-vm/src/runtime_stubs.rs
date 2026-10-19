@@ -1588,9 +1588,11 @@ pub extern "C" fn to_boolean_leaf(
 
 /// String internalization lookup for a keyed access: the atom the isolate's
 /// name interner holds for the content of the flat string `key_bits`, as a
-/// raw atom id. The caller records it in the string's atom word. A rope (its
-/// units are not contiguous), a lone surrogate, content never interned, or a
-/// thread without a published runtime context misses; nothing allocates.
+/// raw atom id. The caller records it in the string's atom word. Flat content
+/// the interner never saw answers [`UNINTERNED_KEY`]: no shaped object has
+/// that property, and the caller records nothing. A rope (its units are not
+/// contiguous), a lone surrogate or a thread without a published runtime
+/// context misses; nothing allocates.
 #[must_use]
 pub extern "C" fn string_key_atom_leaf(
     heap: *const otter_gc::GcHeap,
@@ -1626,9 +1628,14 @@ pub extern "C" fn string_key_atom_leaf(
         Some(atom) if atom != crate::property_atom::AtomId::NONE => {
             NativeResultPair::success_bits(u64::from(atom.raw()))
         }
-        _ => NativeResultPair::miss(),
+        Some(_) => NativeResultPair::success_bits(UNINTERNED_KEY),
+        None => NativeResultPair::miss(),
     }
 }
+
+/// [`string_key_atom_leaf`]'s answer for flat key content the interner never
+/// saw.
+pub const UNINTERNED_KEY: u64 = u32::MAX as u64;
 
 /// The generic property load's dictionary case for a keyed load whose name
 /// key missed the shared property table: the data property of the
@@ -1636,9 +1643,14 @@ pub extern "C" fn string_key_atom_leaf(
 /// string `key_bits`, by the atom the key recorded and its ASCII spelling.
 /// The table never holds a dictionary-mode receiver, so the runtime's miss
 /// could record nothing either; a shaped receiver misses here and completes
-/// through that runtime, which fills the table. An unrecorded or non-ASCII
-/// key, an accessor, an opaque object or a non-object prototype misses;
-/// nothing allocates.
+/// through that runtime, which fills the table.
+///
+/// A key without a recorded atom reaches this leaf only after
+/// [`string_key_atom_leaf`] answered [`UNINTERNED_KEY`]: no shaped object
+/// has the property, so any receiver's chain is walked, dictionary objects by
+/// spelling, and its end yields `undefined`. An index-like spelling, a
+/// non-ASCII key, an accessor, an opaque object or a non-object prototype
+/// misses; nothing allocates.
 #[must_use]
 pub extern "C" fn keyed_named_load_leaf(
     heap: *const otter_gc::GcHeap,
@@ -1655,15 +1667,20 @@ pub extern "C" fn keyed_named_load_leaf(
     ) else {
         return NativeResultPair::miss();
     };
-    if !crate::object::is_dictionary(object, heap) {
-        return NativeResultPair::miss();
-    }
-    let Some(atom) = heap.read_payload(key.handle(), crate::string::JsStringBody::cached_atom)
-    else {
-        return NativeResultPair::miss();
+    let atom = match heap.read_payload(key.handle(), crate::string::JsStringBody::cached_atom) {
+        Some(atom) if crate::object::is_dictionary(object, heap) => atom,
+        Some(_) => return NativeResultPair::miss(),
+        None => crate::property_atom::AtomId::NONE,
     };
     crate::string::gc_body::with_latin1(heap, key.handle(), |bytes| {
         if !bytes.is_ascii() {
+            return None;
+        }
+        // An index-like key names an element, which no spelling lookup sees.
+        if bytes
+            .first()
+            .is_none_or(|byte| byte.is_ascii_digit() || *byte == b'-')
+        {
             return None;
         }
         // SAFETY: ASCII bytes are valid UTF-8.

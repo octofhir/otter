@@ -160,6 +160,7 @@ fn emit_key_atom(
     view: &JitCompileSnapshot,
     key: u8,
     atom: u8,
+    uninterned: DynamicLabel,
     miss: DynamicLabel,
 ) {
     let unrecorded = ops.new_dynamic_label();
@@ -195,6 +196,10 @@ fn emit_key_atom(
         ; ldp x10, x12, [sp, #16]
         ; ldp x30, x9, [sp], #32
         ; cbnz x1, =>miss
+        // Content never interned is no shaped object's property; the
+        // string records nothing.
+        ; cmn w0, #1
+        ; b.eq =>uninterned
         ; mov W(atom), w0
         ; add w16, w0, #1
         ; str w16, [X(key), atom_byte]
@@ -204,8 +209,8 @@ fn emit_key_atom(
 
 /// `x1 == 0` with the value in `x0`, else `x1 != 0` and nothing observed.
 /// Nothing allocates; the only calls are the interning leaf and, for a
-/// dictionary-mode receiver the table does not hold, the generic own-data
-/// walk.
+/// dictionary-mode receiver the table does not hold or a key the interner
+/// never saw, the generic own-data walk.
 fn emit_keyed_load(
     ops: &mut Assembler,
     relocations: &mut RelocationCapture,
@@ -215,7 +220,7 @@ fn emit_keyed_load(
     let miss = ops.new_dynamic_label();
     let generic = ops.new_dynamic_label();
     dynasm!(ops ; .arch aarch64 ; =>label);
-    emit_key_atom(ops, relocations, view, KEYED_LOAD_KEY, 11, miss);
+    emit_key_atom(ops, relocations, view, KEYED_LOAD_KEY, 11, generic, miss);
     property_actions::emit_load(
         ops,
         relocations,
@@ -266,7 +271,7 @@ fn emit_keyed_store(
     let stored = ops.new_dynamic_label();
     let miss = ops.new_dynamic_label();
     dynasm!(ops ; .arch aarch64 ; =>label ; stp x29, x30, [sp, #-16]!);
-    emit_key_atom(ops, relocations, view, KEYED_STORE_KEY, 3, miss);
+    emit_key_atom(ops, relocations, view, KEYED_STORE_KEY, 3, miss, miss);
     emit_table_store(ops, relocations, view, stored, miss);
     dynasm!(ops ; .arch aarch64
         ; =>miss

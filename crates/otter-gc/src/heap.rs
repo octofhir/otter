@@ -3832,10 +3832,10 @@ fn raw_is_marked(raw: RawGc) -> bool {
 
 /// Old-generation occupancy at which a concurrent marking cycle starts
 /// between the `live` bytes the last mark-compact kept and the `limit` the
-/// next one runs at: three quarters of the way, leaving the last quarter of
+/// next one runs at: seven eighths of the way, leaving the last eighth of
 /// the growth for the mutator to allocate while the helpers mark.
 fn concurrent_marking_start(live: u64, limit: u64) -> u64 {
-    live.saturating_add(limit.saturating_sub(live) / 4 * 3)
+    live.saturating_add(limit.saturating_sub(live) / 8 * 7)
 }
 
 #[path = "heap/tenured.rs"]

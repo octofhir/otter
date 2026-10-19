@@ -1470,6 +1470,18 @@ pub enum JitCacheIrOp {
         /// VM-owned shell geometry used by both native targets.
         layout: JitArrayLayout,
     },
+    /// Prove a closure or native function whose named lookup starts at its
+    /// own-property bag — the bag exists, no `[[Prototype]]` override is
+    /// installed and the default realm is active — and read the bag, an
+    /// ordinary object whose prototype mirrors the function's. Any other
+    /// receiver misses before effects; subsequent ordinary guards validate
+    /// the bag's own data slot.
+    LoadFunctionBag {
+        /// Function receiver operand.
+        object: u8,
+        /// Tagged ordinary storage operand receiving the bag.
+        result: u8,
+    },
     /// Prove an exotic receiver and read its pinned canonical prototype.
     /// Subsequent ordinary guards validate the prototype's live data slot.
     LoadIntrinsicPrototype {

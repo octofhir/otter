@@ -48,6 +48,52 @@ use crate::{
 };
 
 impl Codegen<'_> {
+    /// `Rq(destination)` = the own-property bag of the closure or native
+    /// function `Rq(receiver)` whose named lookup starts there: the bag
+    /// exists, no `[[Prototype]]` override is installed and the default realm
+    /// is active. Anything else jumps to `miss` before `Rq(destination)`
+    /// changes. Clobbers r10 and r11.
+    fn emit_function_bag(&mut self, receiver: u8, destination: u8, miss: DynamicLabel) {
+        let layout = self.view.closure_call_layout;
+        let native = self.view.native_call_layout;
+        let qualifying = i32::from(
+            otter_vm::closure::CLOSURE_LOOKUP_OWN_PROPS
+                | otter_vm::closure::CLOSURE_LOOKUP_PROTO_OVERRIDE,
+        );
+        let native_bag = self.ops.new_dynamic_label();
+        let bag = self.ops.new_dynamic_label();
+        self.emit_cell_guard(receiver, miss);
+        dynasm!(self.ops ; .arch x64
+            ; cmp BYTE [Rq(receiver)], otter_vm::native_function::NATIVE_FUNCTION_BODY_TYPE_TAG as i8
+            ; je =>native_bag
+            ; cmp BYTE [Rq(receiver)], otter_vm::closure::JS_CLOSURE_BODY_TYPE_TAG as i8
+            ; jne =>miss
+            ; movzx r10d, BYTE [Rq(receiver) + otter_vm::closure::CLOSURE_NAMED_LOOKUP_BYTE as i32]
+            ; and r10d, qualifying
+            ; cmp r10d, i32::from(otter_vm::closure::CLOSURE_LOOKUP_OWN_PROPS)
+            ; jne =>miss
+            ; mov r10d, [Rq(receiver) + layout.rare_byte as i32]
+            ; test r10d, r10d ; jz =>miss);
+        self.load_immediate(11, 0xffff_ffff_0000_0000);
+        dynasm!(self.ops ; .arch x64
+            ; and r11, Rq(receiver) ; add r10, r11
+            ; mov r10d, [r10 + layout.own_props_byte as i32]
+            ; jmp =>bag
+            ; =>native_bag
+            ; test BYTE [Rq(receiver) + native.flags_byte as i32], native.prototype_override_flag as i8
+            ; jnz =>miss
+            ; mov r10d, [Rq(receiver) + native.own_props_byte as i32]
+            ; =>bag
+            ; test r10d, r10d ; jz =>miss
+            ; mov r11, [r15 + crate::entry::THREAD_OFFSET as i32]
+            ; mov r11, [r11 + crate::entry::VM_THREAD_ACTIVE_REALM_CELL_OFFSET as i32]
+            ; test r11, r11 ; jz =>miss
+            ; cmp DWORD [r11], 0 ; jne =>miss);
+        self.load_immediate(11, 0xffff_ffff_0000_0000);
+        dynasm!(self.ops ; .arch x64
+            ; and r11, Rq(receiver) ; add r11, r10 ; mov Rq(destination), r11);
+    }
+
     pub(super) fn emit_properties(&mut self, node: NodeId) -> Result<bool, Unsupported> {
         let assigned = self.allocation.node(node).clone();
         let input = |i| Self::gp(assigned.inputs[i]);
@@ -62,6 +108,10 @@ impl Codegen<'_> {
                     result(),
                     exit,
                 );
+            }
+            Kind::LoadFunctionBag => {
+                let exit = self.eager_exit(node, DeoptReason::WrongShape);
+                self.emit_function_bag(input(0), result(), exit);
             }
             Kind::LoadNamedProperty { byte_pc, .. } => self.emit_named_program(
                 node,

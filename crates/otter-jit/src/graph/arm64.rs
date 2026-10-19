@@ -1799,6 +1799,14 @@ impl<'a> Codegen<'a> {
                     exit,
                 );
             }
+            Kind::LoadFunctionBag => {
+                let exit = self.eager_exit(node, DeoptReason::WrongShape);
+                self.emit_function_bag(
+                    Self::gp(input(0)),
+                    Self::gp(result.expect("function bag result")),
+                    exit,
+                );
+            }
             Kind::LoadNamedProperty { .. } => {
                 let receiver = Self::gp(input(0));
                 let destination = Self::gp(result.expect("a result"));
@@ -2847,6 +2855,54 @@ impl<'a> Codegen<'a> {
         }
         dynasm!(self.ops ; .arch aarch64 ; b =>exit ; =>done);
         Ok(())
+    }
+
+    /// `X(destination)` = the own-property bag of the closure or native
+    /// function `X(receiver)` whose named lookup starts there: the bag
+    /// exists, no `[[Prototype]]` override is installed and the default realm
+    /// is active. Anything else branches to `miss` before `X(destination)`
+    /// changes. Clobbers x16 and x17.
+    fn emit_function_bag(&mut self, receiver: u8, destination: u8, miss: DynamicLabel) {
+        let layout = self.view.closure_call_layout;
+        let native = self.view.native_call_layout;
+        let qualifying = u32::from(
+            otter_vm::closure::CLOSURE_LOOKUP_OWN_PROPS
+                | otter_vm::closure::CLOSURE_LOOKUP_PROTO_OVERRIDE,
+        );
+        let native_bag = self.ops.new_dynamic_label();
+        let bag = self.ops.new_dynamic_label();
+        self.emit_cell_receiver(receiver, miss);
+        dynasm!(self.ops ; .arch aarch64
+            ; ldrb w16, [X(receiver)]
+            ; cmp w16, u32::from(otter_vm::native_function::NATIVE_FUNCTION_BODY_TYPE_TAG)
+            ; b.eq =>native_bag
+            ; cmp w16, u32::from(otter_vm::closure::JS_CLOSURE_BODY_TYPE_TAG)
+            ; b.ne =>miss
+            ; ldrb w16, [X(receiver), otter_vm::closure::CLOSURE_NAMED_LOOKUP_BYTE]
+            ; and w16, w16, #qualifying
+            ; cmp w16, u32::from(otter_vm::closure::CLOSURE_LOOKUP_OWN_PROPS)
+            ; b.ne =>miss
+            ; ldr w16, [X(receiver), layout.rare_byte]
+            ; cbz w16, =>miss
+            ; and x17, X(receiver), #0xffff_ffff_0000_0000
+            ; add x16, x17, x16
+            ; ldr w16, [x16, layout.own_props_byte]
+            ; b =>bag
+            ; =>native_bag
+            ; ldrb w16, [X(receiver), native.flags_byte]
+            ; tst w16, u32::from(native.prototype_override_flag)
+            ; b.ne =>miss
+            ; ldr w16, [X(receiver), native.own_props_byte]
+            ; =>bag
+            ; cbz w16, =>miss
+            ; ldr x17, [x20, THREAD_OFFSET]
+            ; ldr x17, [x17, crate::entry::VM_THREAD_ACTIVE_REALM_CELL_OFFSET]
+            ; cbz x17, =>miss
+            ; ldr w17, [x17]
+            ; cbnz w17, =>miss
+            ; and x17, X(receiver), #0xffff_ffff_0000_0000
+            ; add X(destination), x17, x16
+        );
     }
 
     /// Prove a heap cell, whose map word may then be read.

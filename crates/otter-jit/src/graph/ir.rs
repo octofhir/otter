@@ -394,6 +394,10 @@ pub(crate) enum Kind {
     },
     /// Tagged live named storage of actual Array input0; miss before effects.
     LoadArrayExpando(otter_vm::jit::JitArrayLayout),
+    /// The own-property bag of the closure or native function input0 whose
+    /// named lookup starts there: the bag exists, no `[[Prototype]]` override
+    /// is installed and the default realm is active. Eager deopt otherwise.
+    LoadFunctionBag,
     /// Store input1 into input0's shape-owned field; a separate node owns its barrier.
     /// `owners` pairs each admitted receiver shape with its selected record;
     /// it is empty when no arm observes.
@@ -873,7 +877,7 @@ impl Kind {
                 effectful: true,
                 ..Properties::default()
             },
-            Self::LoadArrayExpando(_) => Properties {
+            Self::LoadArrayExpando(_) | Self::LoadFunctionBag => Properties {
                 eager_deopt: true,
                 effectful: true,
                 ..Properties::default()
@@ -1141,7 +1145,7 @@ impl Kind {
                 fp_temps: 0,
                 fixed_gp_clobbers: SmallVec::new(),
             },
-            Self::LoadArrayExpando(_) => simple(1, ResultPolicy::Register),
+            Self::LoadArrayExpando(_) | Self::LoadFunctionBag => simple(1, ResultPolicy::Register),
             Self::LoadNamedProperty { .. } => Constraints {
                 inputs: registers(1),
                 result: ResultPolicy::Register,

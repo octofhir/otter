@@ -3434,7 +3434,9 @@ impl<'a> Builder<'a> {
                 bag
             }
             otter_vm::jit::PropertyStorageProjection::LookupStart => {
-                unreachable!("ordinary field programs do not infer lookup-start storage")
+                let bag = self.add(Kind::LoadFunctionBag, &[receiver], Repr::Tagged);
+                self.known.entry(bag).heap_object = true;
+                bag
             }
         }
     }

@@ -213,11 +213,8 @@ fn born_array_length_needs_no_receiver_feedback() {
             .iter()
             .any(|node| node.kind == Kind::LoadArrayLength { array_proved: true })
     );
-    assert!(
-        !built
-            .graph
-            .nodes
-            .iter()
-            .any(|node| matches!(node.kind, Kind::CheckShapes { .. } | Kind::LoadOwnField(_)))
-    );
+    assert!(!built.graph.nodes.iter().any(|node| matches!(
+        node.kind,
+        Kind::CheckShapes { .. } | Kind::LoadOwnField { .. }
+    )));
 }

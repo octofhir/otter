@@ -573,9 +573,12 @@ pub(crate) struct LoopHeader {
     /// Whether an entry value may be speculated to be an int32: no earlier
     /// optimized code left at the header for a type mismatch.
     pub(crate) speculate: bool,
-    /// Whether invariant checks may move out of the loop: no earlier
+    /// Whether invariant shape checks may move out of the loop: no earlier
     /// optimized code left at the header for a shape or layout mismatch.
     pub(crate) hoist: bool,
+    /// Every reason earlier optimized code left at the header for, where a
+    /// check moved out of the loop leaves.
+    pub(crate) exit_reasons: SmallVec<[ExitReason; 4]>,
 }
 
 struct Builder<'a> {
@@ -1838,12 +1841,16 @@ impl<'a> Builder<'a> {
             let speculate =
                 !exits.is_some_and(|reasons| reasons.contains(&ExitReason::TypeMismatch));
             let hoist = !exits.is_some_and(|reasons| reasons.contains(&ExitReason::ShapeGuard));
+            let exit_reasons = exits
+                .map(|reasons| reasons.iter().copied().collect())
+                .unwrap_or_default();
             headers.push(LoopHeader {
                 block,
                 state,
                 phis,
                 speculate,
                 hoist,
+                exit_reasons,
             });
         }
         headers.sort_by_key(|header| header.block);
@@ -2985,10 +2992,22 @@ impl<'a> Builder<'a> {
             .flatten();
         let value = match int32 {
             Some(field_type::FieldInt32::Constant(value)) => self.constant_int32(value),
-            Some(field_type::FieldInt32::Payload) => {
-                self.add(Kind::LoadOwnField(access.field), &[object], Repr::Int32)
-            }
-            None => self.add(Kind::LoadOwnField(access.field), &[object], Repr::Tagged),
+            Some(field_type::FieldInt32::Payload) => self.add(
+                Kind::LoadOwnField {
+                    field: access.field,
+                    atom: access.atom,
+                },
+                &[object],
+                Repr::Int32,
+            ),
+            None => self.add(
+                Kind::LoadOwnField {
+                    field: access.field,
+                    atom: access.atom,
+                },
+                &[object],
+                Repr::Tagged,
+            ),
         };
         if let Some(bound) = bound {
             self.known.field_values.insert(value, bound);
@@ -3159,6 +3178,7 @@ impl<'a> Builder<'a> {
         self.add(
             Kind::StoreOwnField {
                 field: access.field,
+                atom: access.atom,
                 owners,
             },
             &[object, value],
@@ -4284,9 +4304,8 @@ impl<'a> Builder<'a> {
     /// A method call whose receivers had several observed shapes: the
     /// receiver's shape selects one arm per target, which reads that
     /// target's guarded method and runs it inline or calls it directly; a
-    /// receiver of no listed shape reads the method like a named load and
-    /// calls it through the generic entry. The arms meet with the call's
-    /// result in its register.
+    /// receiver of no listed shape leaves optimized code. The arms meet with
+    /// the call's result in its register.
     fn emit_polymorphic_method_call(
         &mut self,
         instruction: &Instruction,
@@ -4359,9 +4378,14 @@ impl<'a> Builder<'a> {
         }
         self.known = entry_known;
         self.frame[usize::from(destination)] = before;
-        let callee = self.named_lookup(byte_pc, receiver);
-        self.emit_call_with_receiver(instruction, callee, receiver, arguments, None);
-        finish_arm(self, &mut arms);
+        // The site's feedback names every receiver shape it saw: one it did
+        // not leaves, like the monomorphic guard, and the recompile after
+        // such an exit reads the method like a named load.
+        self.deopt(DeoptReason::WrongShape);
+        if arms.is_empty() {
+            // Every arm left: nothing reaches the join.
+            return;
+        }
         self.trailing[owner].push(join);
         self.graph.block_mut(join).predecessors = arms.iter().map(|&(block, _, _)| block).collect();
         let mut known = arms[0].2.clone();

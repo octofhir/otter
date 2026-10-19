@@ -386,8 +386,12 @@ pub(crate) enum Kind {
     CheckHoleyElementPresent(JitHoleBitmap),
 
     // ---- Memory ----
-    /// Read input0's shape-owned field without exposing a movable storage address.
-    LoadOwnField(otter_vm::object::FieldLocation),
+    /// Read input0's shape-owned field without exposing a movable storage
+    /// address. `atom` names the property, which is the field's alias class.
+    LoadOwnField {
+        field: otter_vm::object::FieldLocation,
+        atom: u32,
+    },
     /// Tagged live named storage of actual Array input0; miss before effects.
     LoadArrayExpando(otter_vm::jit::JitArrayLayout),
     /// Store input1 into input0's shape-owned field; a separate node owns its barrier.
@@ -395,6 +399,7 @@ pub(crate) enum Kind {
     /// it is empty when no arm observes.
     StoreOwnField {
         field: otter_vm::object::FieldLocation,
+        atom: u32,
         owners: SmallVec<[(u32, FieldStoreOwner); 4]>,
     },
     /// Read a named property of input0 through the selected feedback programs
@@ -813,7 +818,7 @@ impl Kind {
             | Self::ToBoolean
             | Self::LogicalNot
             | Self::TestTypeOf { .. }
-            | Self::LoadOwnField(_)
+            | Self::LoadOwnField { .. }
             | Self::LoadTaggedField(_)
             | Self::LoadContextParent
             | Self::LoadClosureContext
@@ -1257,7 +1262,7 @@ impl Kind {
             | Self::TruncateFloat64ToInt32
             | Self::CheckedFloat64ToInt32
             | Self::CheckedFloat64ToIndex
-            | Self::LoadOwnField(_)
+            | Self::LoadOwnField { .. }
             | Self::LoadTaggedField(_)
             | Self::LoadContextParent
             | Self::LoadClosureContext

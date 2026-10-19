@@ -162,6 +162,7 @@ fn graph_own_fields_keep_both_banks_and_allocatable_registers() {
                 &mut allocation,
                 Kind::StoreOwnField {
                     field,
+                    atom: 0,
                     owners: smallvec::SmallVec::new(),
                 },
                 &[Location::Gp(7), Location::Gp(6)],
@@ -170,7 +171,7 @@ fn graph_own_fields_keep_both_banks_and_allocatable_registers() {
             let load = node(
                 &mut graph,
                 &mut allocation,
-                Kind::LoadOwnField(field),
+                Kind::LoadOwnField { field, atom: 0 },
                 &[Location::Gp(7)],
                 Some(Location::Gp(0)),
             );
@@ -285,7 +286,7 @@ fn graph_int32_fields_load_only_the_payload_from_both_banks() {
         let load = node(
             &mut graph,
             &mut allocation,
-            Kind::LoadOwnField(field),
+            Kind::LoadOwnField { field, atom: 0 },
             &[Location::Gp(7)],
             Some(Location::Gp(0)),
         );

@@ -90,7 +90,7 @@ fn exact_int32_fields_load_the_payload_under_their_owner_proof() {
             .graph
             .nodes
             .iter()
-            .find(|node| matches!(node.kind, Kind::LoadOwnField(_)));
+            .find(|node| matches!(node.kind, Kind::LoadOwnField { .. }));
         let int32 = field_type::is_int32_only(expected);
         if let Some(constant) = field_type::int32_constant(expected) {
             assert!(load.is_none(), "constant fields need no storage load");
@@ -168,7 +168,7 @@ fn numeric_field_constants_require_agreement_from_every_receiver_owner() {
             .graph
             .nodes
             .iter()
-            .find(|node| matches!(node.kind, Kind::LoadOwnField(_)));
+            .find(|node| matches!(node.kind, Kind::LoadOwnField { .. }));
         if other == field_type::int32_sample(7) {
             assert!(load.is_none());
             assert!(

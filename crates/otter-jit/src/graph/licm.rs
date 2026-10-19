@@ -1,25 +1,30 @@
-//! Loop-invariant code motion: a check of a value every iteration sees
-//! unchanged, and a load every iteration reads the same, run once, in a
-//! pre-header every entry into the loop passes.
+//! Loop-invariant code motion: a node every iteration computes from the
+//! same inputs over memory the loop never writes runs once, in a pre-header
+//! every entry into the loop passes.
 //!
 //! # Contents
 //! - [`hoist_invariants`] — per loop, innermost first: the pre-header and
 //!   the nodes moved into it.
 //!
 //! # Invariants
-//! - Code moves only out of a loop whose body neither calls out nor runs a
-//!   slow path that may run JavaScript, so no object's element layout or
-//!   length changes while the loop runs: generated element stores never
-//!   transition a layout or grow storage, they leave instead. A shape check
-//!   also needs a loop that changes no shape; a context slot load needs a
-//!   loop that stores to no slot at its offset; a global binding read needs
-//!   a loop that stores no object property. An element base moves too, a
-//!   raw base into a movable slab included: nothing in the loop collects,
-//!   and the back edge's poll is a no-allocation leaf
-//!   (`STUB_JIT_BACKEDGE_POLL`). Context parents never change.
-//! - A moved node reads only values defined before the loop, values moved
-//!   before it, or a header phi the loop never changes, which it reads as
-//!   the value entering the loop.
+//! - The loop's writes are the union of its nodes' [`effects::clobberize`]
+//!   writes. A loop that writes the world (a call, or a slow path that may
+//!   run JavaScript) moves nothing. A node moves only when it writes
+//!   nothing, reads no heap the loop writes, cannot call, throw or collect,
+//!   and every input is defined before the loop, moved before it, or a header
+//!   phi the loop never changes, which it reads as the value entering the
+//!   loop. A raw element base is read past nothing that collects
+//!   ([`effects::AbstractHeap::Movement`]); the back edge's poll is a
+//!   no-allocation leaf (`STUB_JIT_BACKEDGE_POLL`).
+//! - Reads of the activation record (`this`, window registers, actual
+//!   arguments) stay where the builder put them: an entry that resumes an
+//!   existing record, the OSR entry among them, reaches the pre-header before
+//!   the record holds what the loop reads.
+//! - A node that dereferences an input on the strength of an earlier proof
+//!   moves only when no guard of that input stays in the loop ahead of it,
+//!   and either its block runs on every iteration and before every exit
+//!   from the loop, or each input is proved by a guard moved ahead of it or
+//!   was itself moved: in the pre-header the same proofs precede it.
 //! - The pre-header merges every entering edge, the OSR entry included,
 //!   with a phi wherever the edges bring different values; the header's
 //!   back edges stay its last predecessors. Nothing moves out of the blocks
@@ -27,12 +32,13 @@
 //!   reaches without passing its header.
 //! - A moved check leaves to the loop header with the values entering the
 //!   loop, so the interpreter runs the iteration the check guarded. A
-//!   header that already left optimized code for a shape or layout mismatch
-//!   moves nothing: its next compile checks where the value is used. A
-//!   number conversion of an invariant value moves only from a header that
-//!   never left for a type mismatch.
+//!   header that already left optimized code for a reason a check raises
+//!   keeps that check in the loop: its next compile checks where the value
+//!   is used.
 //!
 //! # See also
+//! - [`super::effects`] — the abstract heaps of reads and writes.
+//! - [`super::dominators`] — which loop blocks run every iteration.
 //! - [`super::phi_repr`] — checks entry values of untagged phis on their
 //!   entering edges.
 //! - [`super::builder::LoopHeader`] — the loop facts this pass reads.
@@ -41,6 +47,8 @@ use rustc_hash::FxHashSet;
 use smallvec::SmallVec;
 
 use super::builder::LoopHeader;
+use super::dominators::{self, Dominators};
+use super::effects::{self, AbstractHeap, HeapSet};
 use super::ir::{BlockId, FrameState, FrameStateId, Graph, Kind, NodeId, Repr};
 
 /// Move the invariant nodes of every loop in `loop_headers` into a
@@ -119,47 +127,100 @@ fn bypassed_blocks(
     reached
 }
 
-/// What the loop body may change.
-struct Clobbers {
-    shapes: bool,
-    lengths: bool,
-    /// Whether the loop stores any object property, the global object's
-    /// included.
-    properties: bool,
-    slot_offsets: FxHashSet<i32>,
+/// Whether a check moved to the pre-header may leave at the loop header: no
+/// earlier optimized code left there for a reason this check raises.
+fn may_leave_at_header(kind: &Kind, header: &LoopHeader) -> bool {
+    use otter_vm::native_abi::ExitReason as R;
+    let reasons: &[R] = match kind {
+        Kind::CheckShapes { .. }
+        | Kind::CheckElements { .. }
+        | Kind::LoadArrayLength { .. }
+        | Kind::LoadGuardedMethod { .. }
+        | Kind::LoadNamedProperty { .. } => return header.hoist,
+        Kind::CheckedTaggedToInt32
+        | Kind::CheckedTaggedToFloat64
+        | Kind::CheckedFloat64ToInt32
+        | Kind::CheckNumber => return header.speculate,
+        Kind::CheckedTaggedToIndex | Kind::CheckedFloat64ToIndex => {
+            if !header.speculate {
+                return false;
+            }
+            &[R::InvalidElementIndex]
+        }
+        Kind::CheckBounds => &[R::BoundsGuard],
+        Kind::Int32Add | Kind::Int32Sub | Kind::Int32Negate => &[R::Int32Overflow, R::NegativeZero],
+        Kind::Int32Mul
+        | Kind::Int32MulIdentifyZeros
+        | Kind::Int32Div
+        | Kind::Int32Mod
+        | Kind::Int32ShiftRightLogical => &[R::Int32Overflow, R::NegativeZero, R::TypeMismatch],
+        Kind::CheckFunction { .. }
+        | Kind::CheckCellValue(_)
+        | Kind::CheckNative(_)
+        | Kind::CheckFunctionPrototypeCall(_)
+        | Kind::CheckClosureContext(_) => &[R::IdentityGuard],
+        Kind::CheckFieldTypes(_)
+        | Kind::CheckContextSlot { .. }
+        | Kind::CheckStableShapes(_)
+        | Kind::CheckDependencies => &[R::DependencyChanged],
+        // A check whose reasons are not listed moves only out of a header
+        // that never left.
+        _ => return header.exit_reasons.is_empty(),
+    };
+    !reasons
+        .iter()
+        .any(|reason| header.exit_reasons.contains(reason))
 }
 
-fn clobbers(graph: &Graph, body: &FxHashSet<BlockId>) -> Option<Clobbers> {
-    let mut clobbers = Clobbers {
-        shapes: false,
-        lengths: false,
-        properties: false,
-        slot_offsets: FxHashSet::default(),
-    };
+/// Every heap a node of the loop body may write.
+fn loop_writes(graph: &Graph, body: &FxHashSet<BlockId>) -> HeapSet {
+    let mut writes = HeapSet::default();
     for &block in body {
         for &node in &graph.block(block).body {
-            let kind = &graph.node(node).kind;
-            let properties = kind.properties();
-            if properties.call || properties.may_collect {
-                return None;
-            }
-            match kind {
-                Kind::StoreNamedProperty { .. }
-                | Kind::StorePropertyCached { .. }
-                | Kind::StoreKeyedCached { .. } => {
-                    clobbers.shapes = true;
-                    clobbers.lengths = true;
-                    clobbers.properties = true;
-                }
-                Kind::StoreOwnField { .. } => clobbers.properties = true,
-                Kind::StoreTaggedField(offset) => {
-                    clobbers.slot_offsets.insert(*offset);
-                }
-                _ => {}
+            for heap in effects::clobberize(&graph.node(node).kind).writes {
+                writes.add(heap);
             }
         }
     }
-    Some(clobbers)
+    writes
+}
+
+/// Whether `block` runs on every iteration that reaches a back edge and on
+/// no path that leaves the loop before it: it dominates every back edge, and
+/// no edge out of the body is reachable from the header around it.
+fn control_equivalent(
+    graph: &Graph,
+    dominators: &Dominators,
+    header: BlockId,
+    body: &FxHashSet<BlockId>,
+    latches: &[BlockId],
+    block: BlockId,
+) -> bool {
+    if !latches
+        .iter()
+        .all(|&latch| dominators.dominates(block, latch))
+    {
+        return false;
+    }
+    if block == header {
+        return true;
+    }
+    let mut seen: FxHashSet<BlockId> = FxHashSet::default();
+    let mut work = vec![header];
+    while let Some(current) = work.pop() {
+        if current == block || !seen.insert(current) {
+            continue;
+        }
+        let next = dominators::successors(graph, current);
+        let leaves = graph.block(current).control.is_some_and(|control| {
+            matches!(graph.node(control).kind, Kind::Return | Kind::Deopt(_))
+        });
+        if leaves || next.iter().any(|successor| !body.contains(successor)) {
+            return false;
+        }
+        work.extend(next.into_iter().filter(|&successor| successor != header));
+    }
+    true
 }
 
 fn hoist_loop(
@@ -172,9 +233,10 @@ fn hoist_loop(
     // inner loop among them, reaches the blocks after it without the
     // pre-header: nothing there moves.
     let bypassed = bypassed_blocks(graph, header.block, body);
-    let Some(clobbers) = clobbers(graph, body) else {
+    let writes = loop_writes(graph, body);
+    if writes.is_world() {
         return;
-    };
+    }
     let predecessors = graph.block(header.block).predecessors.clone();
     let entering: SmallVec<[usize; 2]> = (0..predecessors.len())
         .filter(|&index| !body.contains(&predecessors[index]))
@@ -182,6 +244,12 @@ fn hoist_loop(
     if entering.is_empty() {
         return;
     }
+    let latches: SmallVec<[BlockId; 2]> = predecessors
+        .iter()
+        .copied()
+        .filter(|block| body.contains(block))
+        .collect();
+    let dominators = Dominators::compute(graph, layout);
     // A header phi the loop never changes holds its entering value.
     let unchanged_phi = |graph: &Graph, value: NodeId| -> bool {
         let data = graph.node(value);
@@ -201,36 +269,51 @@ fn hoist_loop(
     let mut moved: Vec<NodeId> = Vec::new();
     let mut moved_set: FxHashSet<NodeId> = FxHashSet::default();
     let mut checks: Vec<(Kind, SmallVec<[NodeId; 3]>)> = Vec::new();
+    // Values a guard that stays in the loop proves: what reads through them
+    // stays behind that guard.
+    let mut guarded_in_loop: FxHashSet<NodeId> = FxHashSet::default();
+    // Values a guard moved to the pre-header proves there.
+    let mut proved: FxHashSet<NodeId> = FxHashSet::default();
     for &block in &ordered {
         if bypassed.contains(&block) {
             continue;
         }
+        let equivalent =
+            control_equivalent(graph, &dominators, header.block, body, &latches, block);
         let nodes = graph.block(block).body.clone();
         let mut kept = Vec::with_capacity(nodes.len());
         for node in nodes {
             let data = graph.node(node);
-            let movable = match &data.kind {
-                Kind::CheckElements { .. } | Kind::LoadContextParent => true,
-                Kind::CheckShapes { .. } => !clobbers.shapes,
-                Kind::LoadElementsLength { .. } => !clobbers.lengths,
-                // The loop runs nothing that collects: its back edge's poll
-                // is a no-allocation leaf, so even a base into a movable slab
-                // stays valid across it.
-                Kind::LoadElementsBase { .. } => !clobbers.lengths,
-                Kind::LoadGlobalBinding(_) => !clobbers.properties,
-                // A value every iteration sees unchanged converts once.
-                Kind::CheckedTaggedToInt32
-                | Kind::CheckedTaggedToFloat64
-                | Kind::CheckedTaggedToIndex
-                | Kind::CheckNumber => header.speculate,
-                Kind::LoadTaggedField(offset) => {
-                    data.inputs
-                        .first()
-                        .is_some_and(|&input| graph.node(input).repr == Repr::Tagged)
-                        && !clobbers.slot_offsets.contains(offset)
-                }
-                _ => false,
-            };
+            let effects = effects::clobberize(&data.kind);
+            let properties = data.kind.properties();
+            // A raw base input names movable storage only while nothing
+            // collects; the move keeps tagged inputs alone.
+            let raw_base = matches!(data.kind, Kind::LoadTaggedField(_))
+                && data
+                    .inputs
+                    .first()
+                    .is_some_and(|&input| graph.node(input).repr != Repr::Tagged);
+            let movable = effects.writes.is_empty()
+                && !properties.call
+                && !properties.lazy_deopt
+                && !properties.can_throw
+                && !properties.may_collect
+                && !raw_base
+                && !matches!(data.kind, Kind::Generic { .. })
+                && !effects.reads_overlap(&writes)
+                && !effects.reads.contains(&AbstractHeap::Frame)
+                && (!properties.eager_deopt || may_leave_at_header(&data.kind, header))
+                && (!effects.derefs
+                    || (data
+                        .inputs
+                        .iter()
+                        .all(|input| !guarded_in_loop.contains(input))
+                        && (equivalent
+                            || data.inputs.iter().all(|input| {
+                                proved.contains(input)
+                                    || moved_set.contains(input)
+                                    || graph.node(*input).block.is_none()
+                            }))));
             let invariant = movable
                 && data.inputs.iter().all(|&input| {
                     let input_data = graph.node(input);
@@ -239,6 +322,9 @@ fn hoist_loop(
                         || unchanged_phi(graph, input)
                 });
             if !invariant {
+                if effects.guard {
+                    guarded_in_loop.extend(data.inputs.iter().copied());
+                }
                 kept.push(node);
                 continue;
             }
@@ -248,6 +334,9 @@ fn hoist_loop(
                     continue;
                 }
                 checks.push(key);
+            }
+            if effects.guard {
+                proved.extend(data.inputs.iter().copied());
             }
             moved_set.insert(node);
             moved.push(node);

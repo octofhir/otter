@@ -43,7 +43,7 @@ use otter_vm::{
     JitCodeGenerationSnapshot,
     native_abi::{
         CodeLifetimeState, NativeFrameKind, STUB_COPY_CONTEXT_ALLOC, STUB_CREATE_CONTEXT_ALLOC,
-        STUB_JIT_MAKE_CLOSURE, STUB_JIT_MAKE_FN,
+        STUB_JIT_MAKE_CLOSURE,
     },
 };
 use serde_json::Value as Json;
@@ -525,7 +525,8 @@ fn case(extra: bool) {
             STUB_JIT_MAKE_CLOSURE,
         );
     }
-    let closures: Vec<_> = regions
+    // In source order: code layout may place the blocks differently.
+    let mut closures: Vec<_> = regions
         .iter()
         .filter(|row| {
             row["functionId"] == factory
@@ -534,12 +535,15 @@ fn case(extra: bool) {
                     .is_some_and(|text| text.contains("NewClosure"))
         })
         .collect();
+    closures.sort_by_key(|row| row["bytePc"].as_u64());
     assert_eq!(
         closures.len(),
         3,
         "actual inline before/after/plain source nodes"
     );
-    assert_typed_edge(constructor, closures[2], STUB_JIT_MAKE_FN);
+    // The factory compiles lazily: its record creates every nested function
+    // with the creating context, the plain one included.
+    assert_typed_edge(constructor, closures[2], STUB_JIT_MAKE_CLOSURE);
     let points = json(constructor, JitArtifactFileName::Safepoints);
     for closure in &closures {
         assert!(

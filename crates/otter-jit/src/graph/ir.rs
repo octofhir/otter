@@ -394,6 +394,11 @@ pub(crate) enum Kind {
     },
     /// Tagged live named storage of actual Array input0; miss before effects.
     LoadArrayExpando(otter_vm::jit::JitArrayLayout),
+    /// The UTF-16 code unit of string input0 at int32 index input1, as an
+    /// int32: the string is flat (inline or sequential, Latin-1 or UTF-16)
+    /// or a slice of a flat string, and the index lies within it. Eager
+    /// deopt otherwise.
+    StringCharCodeAt,
     /// The own-property bag of the closure or native function input0 whose
     /// named lookup starts there: the bag exists, no `[[Prototype]]` override
     /// is installed and the default realm is active. Eager deopt otherwise.
@@ -870,7 +875,8 @@ impl Kind {
             | Self::CheckElementPresent
             | Self::CheckHoleyElementPresent(_)
             | Self::LoadHoleyFloat64Element(_)
-            | Self::LoadArrayLength { .. } => eager,
+            | Self::LoadArrayLength { .. }
+            | Self::StringCharCodeAt => eager,
             // A derived constructor changes its physical this binding at
             // super(); lexical capture must read the current binding here.
             Self::LoadThis => Properties {
@@ -1146,6 +1152,13 @@ impl Kind {
                 fixed_gp_clobbers: SmallVec::new(),
             },
             Self::LoadArrayExpando(_) | Self::LoadFunctionBag => simple(1, ResultPolicy::Register),
+            Self::StringCharCodeAt => Constraints {
+                inputs: registers(2),
+                result: ResultPolicy::Register,
+                gp_temps: 1,
+                fp_temps: 0,
+                fixed_gp_clobbers: SmallVec::new(),
+            },
             Self::LoadNamedProperty { .. } => Constraints {
                 inputs: registers(1),
                 result: ResultPolicy::Register,

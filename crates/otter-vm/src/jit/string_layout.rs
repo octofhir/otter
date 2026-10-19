@@ -45,6 +45,10 @@ pub struct JitStringLayout {
     pub cons_right_byte: u32,
     /// Bounded rope depth byte.
     pub cons_depth_byte: u32,
+    /// A slice's compressed parent, a flat string.
+    pub sliced_parent_byte: u32,
+    /// A slice's first code unit within its parent, a `u32`.
+    pub sliced_start_byte: u32,
     /// Native short-result capacities and maximum rope depth.
     pub inline_flat_cap: u8,
     /// Latin-1 inline byte capacity.

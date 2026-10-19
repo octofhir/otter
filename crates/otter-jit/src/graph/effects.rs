@@ -233,7 +233,7 @@ fn proves_inputs(kind: &Kind) -> bool {
             receiver_proved, ..
         } => !receiver_proved,
         Kind::LoadArrayLength { array_proved } => !array_proved,
-        Kind::LoadArrayExpando(_) | Kind::LoadFunctionBag => true,
+        Kind::LoadArrayExpando(_) | Kind::LoadFunctionBag | Kind::StringCharCodeAt => true,
         _ => false,
     }
 }
@@ -301,7 +301,9 @@ fn heap_effects(kind: &Kind) -> Effects {
         | Kind::CheckClosureContext(_)
         | Kind::CheckNotHole
         | Kind::NativeLeaf(_)
-        | Kind::BooleanToInt32 => Effects::default(),
+        | Kind::BooleanToInt32
+        // String content never changes; the node tests its own receiver.
+        | Kind::StringCharCodeAt => Effects::default(),
         // A cell's map word decides the result. An unproved input is tested
         // for a cell first; a proved one is read directly.
         Kind::CheckShapes { cell_proved, .. } => {

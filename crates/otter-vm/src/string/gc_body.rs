@@ -200,6 +200,14 @@ pub(crate) fn jit_layout() -> crate::jit::JitStringLayout {
     let JsStringBodyRepr::Cons { left, right, depth } = &sample else {
         unreachable!()
     };
+    let slice = JsStringBodyRepr::Sliced {
+        parent: JsStringHandle::null(),
+        start: 0,
+    };
+    let slice_base = std::ptr::from_ref(&slice) as usize;
+    let JsStringBodyRepr::Sliced { parent, start } = &slice else {
+        unreachable!()
+    };
     let cell_bytes = otter_gc::page::align_up(
         otter_gc::header::HEADER_SIZE + std::mem::size_of::<JsStringBody>(),
         otter_gc::page::CELL_SIZE,
@@ -223,6 +231,8 @@ pub(crate) fn jit_layout() -> crate::jit::JitStringLayout {
         cons_left_byte: repr + (std::ptr::from_ref(left) as usize - base) as u32,
         cons_right_byte: repr + (std::ptr::from_ref(right) as usize - base) as u32,
         cons_depth_byte: repr + (std::ptr::from_ref(depth) as usize - base) as u32,
+        sliced_parent_byte: repr + (std::ptr::from_ref(parent) as usize - slice_base) as u32,
+        sliced_start_byte: repr + (std::ptr::from_ref(start) as usize - slice_base) as u32,
         inline_flat_cap: INLINE_FLAT_CAP as u8,
         inline_latin1_cap: INLINE_LATIN1_CAP as u8,
         max_rope_depth: MAX_ROPE_DEPTH,

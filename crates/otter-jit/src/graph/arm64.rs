@@ -1799,6 +1799,18 @@ impl<'a> Codegen<'a> {
                     exit,
                 );
             }
+            Kind::StringCharCodeAt => {
+                let exit = self.eager_exit(node, DeoptReason::WrongType);
+                self.emit_string_char_code_at(
+                    [
+                        Self::gp(input(0)),
+                        Self::gp(input(1)),
+                        allocation.gp_temps[0],
+                    ],
+                    Self::gp(result.expect("code unit result")),
+                    exit,
+                );
+            }
             Kind::LoadFunctionBag => {
                 let exit = self.eager_exit(node, DeoptReason::WrongShape);
                 self.emit_function_bag(
@@ -2855,6 +2867,64 @@ impl<'a> Codegen<'a> {
         }
         dynasm!(self.ops ; .arch aarch64 ; b =>exit ; =>done);
         Ok(())
+    }
+
+    /// `W(destination)` = the code unit of the string `X(receiver)` at the
+    /// int32 index `W(index)`: a flat string (inline or sequential, Latin-1
+    /// or UTF-16) or a slice of one, with the index inside it. Anything else
+    /// branches to `miss` before `W(destination)` changes. Clobbers
+    /// `X(base)`, x16 and x17.
+    fn emit_string_char_code_at(
+        &mut self,
+        [receiver, index, base]: [u8; 3],
+        destination: u8,
+        miss: DynamicLabel,
+    ) {
+        let p = self.view.string_layout;
+        let map = p.map_atom_word as u32;
+        let [flat, inline_latin1, seq_latin1, inline_flat, done] =
+            std::array::from_fn(|_| self.ops.new_dynamic_label());
+        self.emit_cell_receiver(receiver, miss);
+        dynasm!(self.ops ; .arch aarch64 ; ldr w16, [X(receiver), JIT_MAP_WORD_BYTE]);
+        self.emit_compare_w16(map);
+        dynasm!(self.ops ; .arch aarch64
+            ; b.ne =>miss
+            ; ldr w17, [X(receiver), p.string_len_byte]
+            ; cmp W(index), w17
+            ; b.hs =>miss
+            ; mov X(base), X(receiver)
+            ; mov w17, W(index)
+            ; ldrb w16, [X(receiver), p.string_repr_byte]
+            ; cmp w16, u32::from(p.sliced_tag)
+            ; b.ne =>flat
+            // A slice views its flat parent from a start offset.
+            ; ldr w16, [X(receiver), p.sliced_parent_byte]
+            ; ldr w17, [X(receiver), p.sliced_start_byte]
+            ; add w17, w17, W(index)
+            ; and XSP(base), X(receiver), #0xffff_ffff_0000_0000
+            ; add X(base), X(base), x16
+            ; ldrb w16, [X(base), p.string_repr_byte]
+            ; =>flat
+            ; cmp w16, u32::from(p.inline_latin1_tag) ; b.eq =>inline_latin1
+            ; cmp w16, u32::from(p.seq_latin1_tag) ; b.eq =>seq_latin1
+            ; cmp w16, u32::from(p.inline_flat_tag) ; b.eq =>inline_flat
+            ; cmp w16, u32::from(p.seq_flat_tag) ; b.ne =>miss
+            ; add x16, XSP(base), p.string_body_size
+            ; ldrh W(destination), [x16, w17, uxtw #1]
+            ; b =>done
+            ; =>inline_flat
+            ; add x16, XSP(base), p.string_repr_payload_byte
+            ; ldrh W(destination), [x16, w17, uxtw #1]
+            ; b =>done
+            ; =>seq_latin1
+            ; add x16, XSP(base), p.string_body_size
+            ; ldrb W(destination), [x16, w17, uxtw]
+            ; b =>done
+            ; =>inline_latin1
+            ; add x16, XSP(base), p.string_repr_payload_byte
+            ; ldrb W(destination), [x16, w17, uxtw]
+            ; =>done
+        );
     }
 
     /// `X(destination)` = the own-property bag of the closure or native

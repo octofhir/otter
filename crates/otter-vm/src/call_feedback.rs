@@ -44,6 +44,7 @@ impl Interpreter {
         code_block: &CodeBlock,
         instruction_pc: u32,
     ) -> bool {
+        code_block.note_call_execution(instruction_pc as usize);
         let call_changed = code_block
             .feedback_recorder_at(instruction_pc as usize)
             .is_some_and(|feedback| feedback.record_call_attempted());

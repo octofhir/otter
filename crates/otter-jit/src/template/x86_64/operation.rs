@@ -40,6 +40,42 @@ pub(crate) struct OperationContext<'c, 'a> {
     pub(crate) code_map: &'c mut Option<CodeMapCapture>,
 }
 
+/// Count one execution of the call at `pc` into its live feedback, the way
+/// the interpreter counts it: optimizing callers weigh their inline
+/// candidates by these counts. Clobbers `r11`.
+fn emit_count_call(
+    ops: &mut Assembler,
+    relocations: &mut RelocationCapture,
+    view: &otter_vm::JitCompileSnapshot,
+    pc: u32,
+) {
+    let Some(cell) = view
+        .instructions
+        .get(pc as usize)
+        .map(|instruction| instruction.call_count_cell)
+        .filter(|&cell| cell != 0)
+    else {
+        return;
+    };
+    crate::x86_64::values::emit_load_symbol_u64(
+        ops,
+        relocations,
+        11,
+        cell,
+        crate::artifact::relocation::RelocationTarget::CallCountCell {
+            function_id: view.code_block.id,
+            pc,
+        },
+    );
+    let counted = ops.new_dynamic_label();
+    dynasm!(ops ; .arch x64
+        ; add DWORD [r11], 1
+        ; jnc =>counted
+        ; mov DWORD [r11], -1
+        ; =>counted
+    );
+}
+
 /// Emit one operation whose label and required canonical PC the caller bound.
 pub(crate) fn emit_operation(
     context: OperationContext<'_, '_>,
@@ -71,6 +107,7 @@ pub(crate) fn emit_operation(
         direct_call_events.as_mut(),
         instruction.byte_pc,
     );
+    emit_count_call(ops, relocations, view, instruction.pc);
     let OperationExits {
         type_mismatch_exit: type_mismatch,
         identity_guard_exit: _,

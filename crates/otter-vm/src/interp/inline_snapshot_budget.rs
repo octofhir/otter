@@ -92,15 +92,15 @@ mod tests {
     #[test]
     fn rarely_reached_sites_are_not_prepared() {
         let mut budget = InlineSnapshotBudget::new();
-        assert!(!budget.enter(20, Some(0.1)));
+        assert!(!budget.enter(20, Some(0.05)));
         // A small body costs no more inlined than its call.
-        assert!(budget.enter(4, Some(0.1)));
+        assert!(budget.enter(4, Some(0.05)));
         budget.leave();
         assert!(budget.enter(20, Some(0.5)));
         // A site run once per entry of a body reached half the time.
         assert!(budget.enter(20, Some(1.0)));
         budget.leave();
-        assert!(!budget.enter(20, Some(0.2)));
+        assert!(!budget.enter(20, Some(0.15)));
         assert!(budget.enter(20, Some(4.0)));
     }
 }

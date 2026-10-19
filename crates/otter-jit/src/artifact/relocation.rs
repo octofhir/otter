@@ -68,6 +68,7 @@ const TARGET_BACKEDGE_FUEL_CELL: u8 = 20;
 const TARGET_DEPENDENCY_FLAG: u8 = 21;
 const TARGET_PROTOTYPE_VALIDITY_CELL: u8 = 15;
 const TARGET_CLOSURE_CONTEXT_CELL: u8 = 22;
+const TARGET_CALL_COUNT_CELL: u8 = 23;
 
 /// Whether a named-property probe serves a load or a store site.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -172,6 +173,12 @@ pub(crate) enum RelocationTarget {
     /// Live arithmetic observation byte of one instruction, which baseline
     /// code records into.
     ArithFeedbackCell {
+        function_id: u32,
+        pc: u32,
+    },
+    /// Live execution count of one call instruction, which baseline code
+    /// increments.
+    CallCountCell {
         function_id: u32,
         pc: u32,
     },
@@ -1585,6 +1592,11 @@ fn encode_target(target: &RelocationTarget, output: &mut Vec<u8>) -> Result<(), 
         }
         RelocationTarget::ArithFeedbackCell { function_id, pc } => {
             output.push(TARGET_ARITH_FEEDBACK_CELL);
+            put_u32(output, *function_id);
+            put_u32(output, *pc);
+        }
+        RelocationTarget::CallCountCell { function_id, pc } => {
+            output.push(TARGET_CALL_COUNT_CELL);
             put_u32(output, *function_id);
             put_u32(output, *pc);
         }

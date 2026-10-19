@@ -2449,6 +2449,7 @@ impl Interpreter {
         fid: u32,
         tier: jit_debug::JitDebugTier,
         budget: &mut InlineSnapshotBudget,
+        call_byte_pc: Option<u32>,
         site_frequency: Option<f32>,
         receiver: Option<ConstructReceiver>,
     ) -> Option<std::sync::Arc<jit::JitCompileSnapshot>> {
@@ -2460,7 +2461,7 @@ impl Interpreter {
             .map_or(u32::MAX, |function| function.instruction_count());
         if self.jit_retraining_blocks(fid)
             || self.foreign_function_realm(fid).is_some()
-            || !budget.enter(instructions, site_frequency)
+            || !budget.enter(call_byte_pc, fid, instructions, site_frequency)
         {
             return None;
         }
@@ -2599,7 +2600,18 @@ impl Interpreter {
         fid: u32,
         tier: jit_debug::JitDebugTier,
     ) {
-        self.bake_call_site_plans(view, context, fid, tier, &mut InlineSnapshotBudget::new());
+        let mut budget = if tier == jit_debug::JitDebugTier::Optimizing {
+            InlineSnapshotBudget::chosen(crate::jit_inline_plan::choose_inlined(
+                &mut inline_snapshot_budget::FeedbackTree {
+                    interp: self,
+                    context,
+                    root: fid,
+                },
+            ))
+        } else {
+            InlineSnapshotBudget::new()
+        };
+        self.bake_call_site_plans(view, context, fid, tier, &mut budget);
     }
 
     /// Call-site plan baking shared by an outermost body and a spliced one.
@@ -2940,6 +2952,7 @@ impl Interpreter {
                     callee_fid,
                     tier,
                     budget,
+                    Some(call_byte_pc),
                     view.call_frequencies.get(&call_byte_pc).copied(),
                     construct_receiver,
                 ) else {
@@ -3047,6 +3060,7 @@ impl Interpreter {
                     target_count,
                     tier,
                     budget,
+                    Some(snap.call_byte_pc),
                     view.call_frequencies.get(&snap.call_byte_pc).copied(),
                 ) {
                     Ok(mut method) => {
@@ -3114,9 +3128,14 @@ impl Interpreter {
                             .find(|method| method.guard.method_fid == target.method_fid)
                     })
                     .and_then(|method| method.body.clone());
-                if let Some(method) =
-                    self.bake_one_inline_method(context, target, body, tier, budget)
-                {
+                if let Some(method) = self.bake_one_inline_method(
+                    context,
+                    target,
+                    body,
+                    tier,
+                    budget,
+                    snap.call_byte_pc,
+                ) {
                     baked.push(method);
                 }
             }
@@ -3205,6 +3224,7 @@ impl Interpreter {
         target_count: u32,
         tier: jit_debug::JitDebugTier,
         budget: &mut InlineSnapshotBudget,
+        call_byte_pc: Option<u32>,
         site_frequency: Option<f32>,
     ) -> Result<jit::JitDirectMethod, jit_debug::JitDirectCallRejectionReason> {
         let method_context = context
@@ -3235,6 +3255,7 @@ impl Interpreter {
                 target.method_fid,
                 tier,
                 budget,
+                call_byte_pc,
                 site_frequency,
                 None,
             )
@@ -3611,6 +3632,7 @@ mod tests {
                     0,
                     crate::jit_debug::JitDebugTier::Optimizing,
                     &mut budget,
+                    None,
                     None,
                     None
                 )

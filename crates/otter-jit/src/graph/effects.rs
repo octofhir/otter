@@ -241,10 +241,14 @@ fn proves_inputs(kind: &Kind) -> bool {
 fn heap_effects(kind: &Kind) -> Effects {
     use AbstractHeap as H;
     match kind {
+        // A receiver plan's proof reads a constructor's family head and its
+        // prototype's validity cell, which any heap write may change.
+        Kind::CheckReceiverPlan(_) => Effects::reads(&[H::Heap]),
         // Values, conversions and checks of values alone.
         Kind::ConstTagged(_)
         | Kind::ConstInt32(_)
         | Kind::ConstFloat64(_)
+        | Kind::VirtualObject { .. }
         | Kind::Phi
         | Kind::LoadNewTarget
         | Kind::LoadClosure

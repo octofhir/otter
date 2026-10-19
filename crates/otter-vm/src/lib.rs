@@ -157,6 +157,7 @@ mod jit_construct_ops;
 pub mod jit_debug;
 mod jit_delete_ops;
 mod jit_exception_ops;
+pub mod jit_inline_plan;
 /// Compatibility path for JIT consumers while feedback ownership migrates to
 /// the tier-neutral [`feedback`] API.
 #[doc(hidden)]

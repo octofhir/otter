@@ -182,9 +182,17 @@ fn captured_callable_entry_matches_retained_emission_for_template_and_graph() {
             .checked_sub(code.native_code_address().unwrap())
             .unwrap();
         #[cfg(target_arch = "aarch64")]
-        let save = if receiver == offset { offset } else { receiver + 4 } as usize;
+        let save = if receiver == offset {
+            offset
+        } else {
+            receiver + 4
+        } as usize;
         #[cfg(target_arch = "x86_64")]
-        let save = if receiver == offset { offset } else { receiver + 2 } as usize;
+        let save = if receiver == offset {
+            offset
+        } else {
+            receiver + 2
+        } as usize;
         #[cfg(target_arch = "aarch64")]
         assert_eq!(&bytes[save..save + 4], &0xa9bd_7bfdu32.to_le_bytes());
         #[cfg(target_arch = "x86_64")]

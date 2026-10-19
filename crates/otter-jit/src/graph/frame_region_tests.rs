@@ -167,7 +167,7 @@ fn guard_exit_reads_registers_in_place_and_roots_pure_throws_in_the_scratch() {
     let [Location::Gp(kept_register)] = allocation.node(second).eager[..] else {
         panic!("the guard's recipe reads the kept value in its register");
     };
-    let frames = super::super::frame::deopt_frames(
+    let (frames, _) = super::super::frame::deopt_frames(
         &built.graph,
         slots,
         second_state,

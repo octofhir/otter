@@ -450,6 +450,7 @@ fn foreign_linked_source_never_bakes_ambient_global_proofs_or_inline_body() {
                 &mut InlineSnapshotBudget::new(),
                 None,
                 None,
+                None,
             )
             .is_none(),
         "source ownership is not same-realm inline admission"
@@ -506,6 +507,7 @@ fn disposed_source_global_never_substitutes_the_active_global() {
                 fid,
                 jit_debug::JitDebugTier::Optimizing,
                 &mut InlineSnapshotBudget::new(),
+                None,
                 None,
                 None,
             )

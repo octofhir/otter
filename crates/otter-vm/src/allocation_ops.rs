@@ -1047,6 +1047,9 @@ impl Interpreter {
                     crate::deopt::VirtualObjectKind::PlainObject => {
                         return Err(VmError::InvalidOperand);
                     }
+                    crate::deopt::VirtualObjectKind::Shaped { shape } => {
+                        interp.materialize_shaped_object(shape, fields)?
+                    }
                 };
                 roots.push(interp.scoped_value(scope, value));
             }
@@ -1055,6 +1058,37 @@ impl Interpreter {
                 .map(|root| interp.handle_arena.get(root.index()))
                 .collect())
         })
+    }
+
+    /// An ordinary object of the exact hidden class `shape` holding `fields`
+    /// in its slots, as a scalar-replaced allocation is rebuilt at a deopt.
+    fn materialize_shaped_object(
+        &mut self,
+        shape: u32,
+        mut fields: Vec<Value>,
+    ) -> Result<Value, VmError> {
+        if shape == 0 || !shape.is_multiple_of(8) {
+            return Err(VmError::InvalidOperand);
+        }
+        // SAFETY: the deoptimizing code names this hidden class and roots it
+        // for as long as it lives; old-space shapes never move.
+        let mut shape: crate::object::ShapeHandle = unsafe { otter_gc::Gc::from_offset(shape) };
+        if crate::object::shape_body::property_count_of(shape) as usize != fields.len()
+            || crate::object::shape_body::is_dictionary_of(shape)
+        {
+            return Err(VmError::InvalidOperand);
+        }
+        let shape_slot = std::ptr::addr_of_mut!(shape).cast::<otter_gc::raw::RawGc>();
+        let mut roots = |visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| visitor(shape_slot);
+        let object = crate::object::alloc_object_with_shape_and_values_roots(
+            &mut self.gc_heap,
+            shape,
+            &mut fields,
+            otter_gc::SitePlacement::Young(0),
+            &mut roots,
+        )
+        .map_err(VmError::from)?;
+        Ok(Value::object(object))
     }
 
     pub(crate) fn run_load_regexp_reg(

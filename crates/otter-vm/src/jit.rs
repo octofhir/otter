@@ -244,9 +244,12 @@ const _: () = {
 
 /// Inline nesting of one optimizing compilation: any body below this depth,
 /// and a small one down to [`JIT_SMALL_INLINE_DEPTH`].
-pub const JIT_INLINE_DEPTH: u8 = 3;
+pub const JIT_INLINE_DEPTH: u8 = 5;
 /// The deepest nesting a small body is inlined at.
 pub const JIT_SMALL_INLINE_DEPTH: u8 = 8;
+/// How many times one function may run on an inline path, the compiled
+/// function included: a recursion unrolls this far.
+pub const JIT_INLINE_RECURSION: usize = 4;
 /// The longest body inlined at one call, in bytecode instructions.
 pub const JIT_MAX_INLINED_INSTRUCTIONS: u32 = 160;
 /// The longest small body in bytecode instructions: a body of a few

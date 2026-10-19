@@ -494,6 +494,7 @@ impl<'a> Codegen<'a> {
                 self.emit_literal_allocation(node)?
             }
             Kind::NewReceiver(plan) => self.emit_new_receiver(node, *plan)?,
+            Kind::CheckReceiverPlan(plan) => self.emit_check_receiver_plan(node, *plan),
             Kind::NativeNewContext(_)
             | Kind::CopyContext
             | Kind::NewClosure

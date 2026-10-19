@@ -74,7 +74,7 @@ pub(crate) fn hoist_invariants(
 
 /// The blocks of the loop headed by `header`: the header and every block
 /// that reaches one of its back edges without passing the header.
-fn loop_body(graph: &Graph, header: BlockId) -> FxHashSet<BlockId> {
+pub(crate) fn loop_body(graph: &Graph, header: BlockId) -> FxHashSet<BlockId> {
     let mut body = FxHashSet::default();
     body.insert(header);
     let mut work: Vec<BlockId> = graph

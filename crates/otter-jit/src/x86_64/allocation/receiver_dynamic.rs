@@ -24,8 +24,8 @@ use crate::{
     artifact::relocation::{RelocationCapture, RelocationTarget},
     entry::{
         NATIVE_FRAME_THIS_OFFSET, RECEIVER_ALLOC_GUARD_MISSES_OFFSET,
-        RECEIVER_ALLOC_SPACE_MISSES_OFFSET, RUNTIME_STATS_OFFSET, THREAD_OFFSET,
-        TransitionTable, VALUE_UNDEFINED, VM_THREAD_GC_HEAP_OFFSET,
+        RECEIVER_ALLOC_SPACE_MISSES_OFFSET, RUNTIME_STATS_OFFSET, THREAD_OFFSET, TransitionTable,
+        VALUE_UNDEFINED, VM_THREAD_GC_HEAP_OFFSET,
     },
 };
 use dynasmrt::{DynamicLabel, DynasmApi, DynasmLabelApi, dynasm, x64::Assembler};

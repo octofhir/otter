@@ -123,18 +123,18 @@ fn a_recursion_without_loops_installs_its_background_compilation() {
     let result = runtime
         .run_script(
             SourceInput::from_javascript(
-                "function fib(n) { return n < 2 ? n : fib(n - 1) + fib(n - 2); } fib(27);"
+                "function fib(n) { return n < 2 ? n : fib(n - 1) + fib(n - 2); } fib(30);"
                     .to_string(),
             ),
             "jit-recursive-install.js",
         )
         .expect("recursion");
-    assert_eq!(result.completion_string(), "196418");
-    // fib(27) makes 635621 calls; baseline code runs only those before the
+    assert_eq!(result.completion_string(), "832040");
+    // fib(30) makes 2692537 calls; baseline code runs only those before the
     // optimizing body is installed.
     let baseline_entries = runtime.execution_stats().jit_generated_template_entries;
     assert!(
-        baseline_entries < 635_621 / 2,
+        baseline_entries < 2_692_537 / 2,
         "the finished optimizing body must take over the recursion: {baseline_entries} baseline entries"
     );
 }

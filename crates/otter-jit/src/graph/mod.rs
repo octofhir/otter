@@ -62,6 +62,7 @@ pub(crate) mod dominators;
 mod dump;
 pub(crate) mod effects;
 pub(crate) mod emission;
+pub(crate) mod escape;
 pub(crate) mod feedback;
 pub(crate) mod frame;
 mod inline_plan;
@@ -150,6 +151,20 @@ pub(crate) fn compile(
     let baseline = BaselineSupport::of(&plan, view);
     let mut built = builder::build(view, &analysis, &baseline, osr_pc)
         .map_err(|_| Unsupported::OperandShape("graph construction"))?;
+    let loop_states: Vec<_> = built
+        .loop_headers
+        .iter()
+        .map(|header| header.state)
+        .collect();
+    escape::eliminate_allocations(
+        &mut built.graph,
+        &built.layout,
+        &loop_states,
+        view,
+        &built.inline_views,
+    );
+    escape::fold_conversions(&mut built.graph, &built.layout);
+    escape::remove_dead_values(&mut built.graph, &built.layout);
     phi_repr::untag_phis(&mut built.graph, &built.layout, &built.loop_headers);
     // An untagged loop phi whose back edge carried only its own retagged
     // value merges one entry value; drop it before liveness sees it.
@@ -267,9 +282,11 @@ fn deopt_runtime(
         } else {
             &node_allocation.eager
         };
+        let (frames, virtual_objects) =
+            frame::deopt_frames(&built.graph, slots, state_id, locations);
         let recipe = FrameState {
-            frames: frame::deopt_frames(&built.graph, slots, state_id, locations),
-            virtual_objects: Box::new([]),
+            frames,
+            virtual_objects,
         };
         let index = *recipes.entry(recipe).or_insert_with_key(|recipe| {
             states.push(recipe.clone());

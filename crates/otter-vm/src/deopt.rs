@@ -264,6 +264,13 @@ pub enum VirtualObjectKind {
     PlainObject,
     /// Dense fixed-length ordinary Array. Fields are elements in index order.
     FixedArray,
+    /// Ordinary object of an exact hidden class, which fixes its prototype
+    /// and its own data fields. Fields are the shape's slots in order.
+    Shaped {
+        /// Compressed handle of the hidden class; the code that names it
+        /// retains it.
+        shape: u32,
+    },
 }
 
 /// One virtual allocation embedded in the authoritative frame state.

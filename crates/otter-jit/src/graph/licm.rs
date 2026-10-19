@@ -135,6 +135,7 @@ fn may_leave_at_header(kind: &Kind, header: &LoopHeader) -> bool {
         Kind::CheckShapes { .. }
         | Kind::CheckElements { .. }
         | Kind::LoadArrayLength { .. }
+        | Kind::LoadTypedArrayLength
         | Kind::LoadGuardedMethod { .. }
         | Kind::LoadNamedProperty { .. }
         | Kind::LoadArrayExpando(_)

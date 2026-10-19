@@ -97,6 +97,33 @@ function osrOnceFloatRmw(a, b, scale, limit) {
 }
 const osrOnceTotal = osrOnceFloatRmw(osrOnceA, osrOnceB, 0.5, 2048);
 
+// A loop bound by a typed view's `length`, read through a field: the view
+// later turns detached, length-tracking, gains an own `length`, or is
+// replaced by a plain array.
+function viewChecksum(holder) {
+  let sum = 0;
+  for (let i = 0; i < holder.view.length; i++) sum = (sum + i * holder.view[i]) % 1000;
+  return sum;
+}
+const viewHolder = { view: new Uint8Array(64).map((_, i) => i * 3) };
+let viewTotal = 0;
+for (let r = 0; r < 300; r++) viewTotal += viewChecksum(viewHolder);
+const growable = new ArrayBuffer(8, { maxByteLength: 64 });
+viewHolder.view = new Uint8Array(growable);
+growable.resize(32);
+viewTotal += viewChecksum(viewHolder) + viewHolder.view.length;
+const shadowed = new Uint8Array(16).fill(2);
+Object.defineProperty(shadowed, "length", { value: 4 });
+viewHolder.view = shadowed;
+viewTotal += viewChecksum(viewHolder);
+viewHolder.view = [5, 6, 7];
+viewTotal += viewChecksum(viewHolder);
+const detachable = new Uint8Array(new ArrayBuffer(16)).fill(1);
+viewHolder.view = detachable;
+viewTotal += viewChecksum(viewHolder);
+structuredClone(detachable.buffer, { transfer: [detachable.buffer] });
+viewTotal += viewChecksum(viewHolder) + detachable.length;
+
 JSON.stringify({
   dense: dense.length,
   hole: 1 in holey,
@@ -108,6 +135,7 @@ JSON.stringify({
   hotManySum,
   hotChain,
   osrOnceTotal,
+  viewTotal,
   osrOnceFirst: osrOnceA[0],
   osrOnceLast: osrOnceA[2047],
   hotFirst: hotElement(hotValues, 0),

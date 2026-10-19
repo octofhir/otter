@@ -521,6 +521,11 @@ pub(crate) enum Kind {
     LoadArrayLength {
         array_proved: bool,
     },
+    /// The `length` of the typed view input0 as an int32: its element count
+    /// while it owns no named property, its storage is a fixed-length local
+    /// buffer and no buffer was ever detached. Eager deopt otherwise, or when
+    /// the count exceeds the int32 range.
+    LoadTypedArrayLength,
     /// The live element count of a proved indexed receiver input0, as a
     /// `Word`.
     LoadElementsLength {
@@ -890,6 +895,7 @@ impl Kind {
             | Self::CheckHoleyElementPresent(_)
             | Self::LoadHoleyFloat64Element(_)
             | Self::LoadArrayLength { .. }
+            | Self::LoadTypedArrayLength
             | Self::StringCharCodeAt => eager,
             // A derived constructor changes its physical this binding at
             // super(); lexical capture must read the current binding here.
@@ -1318,6 +1324,7 @@ impl Kind {
             | Self::LoadElementsBase { .. }
             | Self::LoadReceiverShape
             | Self::LoadArrayLength { .. }
+            | Self::LoadTypedArrayLength
             | Self::BooleanToInt32 => simple(1, ResultPolicy::Register),
             Self::CheckedTaggedToFloat64 | Self::Float64ToTagged | Self::CheckedTaggedToIndex => {
                 Constraints {

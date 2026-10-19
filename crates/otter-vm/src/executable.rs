@@ -609,6 +609,7 @@ impl CodeBlock {
                     // Resolved with `load_array_length` by
                     // `ExecutionContext::jit_compile_snapshot`.
                     length_reads_arrays_only: false,
+                    length_reads_typed_arrays_only: false,
                     // A site that has never executed falls back to the
                     // compiler's TypeScript annotation, which is enough for the
                     // optimizing tier to pick a guarded numeric lowering

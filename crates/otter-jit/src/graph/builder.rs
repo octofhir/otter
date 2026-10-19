@@ -3073,6 +3073,16 @@ impl<'a> Builder<'a> {
                 self.prove_array_body(object);
                 return self.write(instruction.writes[0], value);
             }
+            // A site that has read only typed views reads the count word.
+            if site.load_array_length
+                && site.length_reads_typed_arrays_only
+                && self.view.typed_array_length.type_tag != 0
+                && !self.exited_for(ExitReason::ShapeGuard)
+            {
+                let value = self.add(Kind::LoadTypedArrayLength, &[object], Repr::Int32);
+                self.known.entry(object).heap_object = true;
+                return self.write(instruction.writes[0], value);
+            }
             if self.view.instructions[self.pc as usize].load_array_length {
                 let value = self.add(
                     Kind::LoadPropertyCached {

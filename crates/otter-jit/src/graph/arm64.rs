@@ -1935,6 +1935,36 @@ impl<'a> Codegen<'a> {
                     ; mov W(destination), w16
                 );
             }
+            Kind::LoadTypedArrayLength => {
+                let receiver = Self::gp(input(0));
+                let destination = Self::gp(result.expect("a result"));
+                let exit = self.eager_exit(node, DeoptReason::WrongShape);
+                let view = metadata::source_view(self.view, self.inline_views, self.graph, node);
+                let typed_tag = u32::from(view.typed_array_length.type_tag);
+                dynasm!(self.ops
+                    ; .arch aarch64
+                    ; tst X(receiver), #0xfffe_0000_0000_0007
+                    ; b.ne =>exit
+                    ; cbz X(receiver), =>exit
+                    ; ldrb w17, [X(receiver)]
+                    ; cmp w17, typed_tag
+                    ; b.ne =>exit
+                );
+                crate::template::arm64::ic_probe::emit_typed_view_length(
+                    &mut self.ops,
+                    view,
+                    receiver,
+                    17,
+                    exit,
+                );
+                self.load_immediate(16, i32::MAX as u64);
+                dynasm!(self.ops
+                    ; .arch aarch64
+                    ; cmp x17, x16
+                    ; b.hi =>exit
+                    ; mov W(destination), w17
+                );
+            }
             Kind::LoadContextParent => {
                 let context = Self::gp(input(0));
                 let destination = Self::gp(result.expect("a result"));
